@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `focusforge-cli`: currently just `info`, the command that makes a claim
-//! about a TIFF file or directory checkable -- byte order, strip layout and
-//! whether the mmap fast path applies, as human text or as `--json`. Reads
-//! headers only: never `TiffStack`, never a tile, never a pixel.
+//! `focusforge-cli`: `info`, the command that makes a claim about a TIFF
+//! file or directory checkable -- byte order, strip layout and whether the
+//! mmap fast path applies, as human text or as `--json`; and `algorithms`,
+//! which lists every registered algorithm or prints one named algorithm's
+//! full parameter schema, validating `--set key=value` against it. `info`
+//! reads headers only: never `TiffStack`, never a tile, never a pixel.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -11,6 +13,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use focusforge_core::io::{ByteOrder, TiffError, TiffHeader, frame_paths};
 use serde::Serialize;
+
+mod algorithms;
+mod set;
 
 /// FocusForge command-line interface.
 #[derive(Parser)]
@@ -34,12 +39,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List every registered algorithm, or print one named algorithm's full
+    /// parameter schema.
+    Algorithms {
+        /// Algorithm id. Omit to list every registered algorithm.
+        id: Option<String>,
+        /// Emit the frozen JSON schema instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        set: set::SetArgs,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Info { path, json } => info(&path, json),
+        Command::Algorithms { id, json, set } => algorithms::run(id.as_deref(), json, &set),
     }
 }
 
