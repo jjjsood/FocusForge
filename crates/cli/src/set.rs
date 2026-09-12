@@ -4,10 +4,8 @@
 //! pairs, and validating those pairs against a resolved algorithm's schema.
 //! This is the only place `--set` text becomes [`ParamValue`]s.
 //!
-//! [`SetArgs`] is `#[command(flatten)]`ed into `focusforge-cli algorithms`
-//! and is meant to flatten unchanged into future subcommands with their own
-//! schema, such as `stack` and `align`: the type is the reusable thing, not
-//! a position on the command line.
+//! [`SetArgs`] is `#[command(flatten)]`ed into `algorithms`, `stack` and
+//! `align`.
 
 use clap::Args;
 use focusforge_core::params::{ParamDesc, ParamValue, ParamValues, ParamViolation};

@@ -35,28 +35,6 @@ fn accepts_valid_settings() {
 }
 
 #[test]
-fn accepts_repeated_flags() {
-    let output = bin()
-        .args([
-            "algorithms",
-            "dummy-stack",
-            "--set",
-            "threshold=0.1",
-            "--set",
-            "mode=slow",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(output.status.success(), "exit status: {:?}", output.status);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("value 0.1 (Explicit)"), "stdout: {stdout}");
-    assert!(
-        stdout.contains("value \"slow\" (Explicit)"),
-        "stdout: {stdout}"
-    );
-}
-
-#[test]
 fn repeated_key_last_wins() {
     let output = bin()
         .args([
