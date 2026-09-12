@@ -1,0 +1,15 @@
+[package]
+name = "focusforge-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+gpu = []
+
+[dependencies]
+wgpu = "29.0.4"

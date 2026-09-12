@@ -1,0 +1,33 @@
+# GPLv3-compatible license allowlist, current SPDX spelling.
+#
+# crates/gui now depends on slint. Its own license expression --
+# `GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR
+# LicenseRef-Slint-Software-3.0` (same for every `i-slint-*` crate) -- is
+# satisfied by the `GPL-3.0-only` arm alone, already allowed below, so no
+# clarify entry was needed for Slint itself. What `tools/check-licenses.sh`
+# actually failed on were three crates two levels further down Slint's tree,
+# each an `[[licenses.exceptions]]` below rather than a global `allow`
+# addition, because the license is right for that one crate's provenance and
+# not a blanket policy: `clipboard-win` and `error-code` (BSL-1.0, via
+# `copypasta` <- `i-slint-backend-winit`'s clipboard support) and
+# `libfuzzer-sys` (MIT/Apache-2.0/NCSA, via `rav1e` <- `ravif` <- `image` <-
+# `i-slint-compiler`/`i-slint-core`; a fuzzing-only dependency of an AV1
+# encoder Slint's image loader pulls in, never linked into this workspace's
+# own code). Boost Software License 1.0 and the NCSA license are both on the
+# FSF's GPL-compatible free-license list.
+[licenses]
+allow = [
+    "GPL-3.0-or-later",
+    "GPL-3.0-only",
+    "LGPL-2.1-or-later",
+    "LGPL-2.1-only",
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",       # foldhash, slotmap (wgpu-hal tree)
+    "ISC",        # libloading (wgpu-hal tree)
+    "CC0-1.0",    # hexf-parse (naga, via wgpu)
+]
