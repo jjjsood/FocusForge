@@ -3,9 +3,9 @@
 # output in a log file, the tail of it inline if it failed.
 #
 # Usage: tools/run-logged.sh [options] <name> [--] <command> [args...]
-#   tools/run-logged.sh "backend pytest" -- uv run pytest
-#   tools/run-logged.sh --tail 80 "e2e" -- npm --prefix frontend run test:e2e
-#   tools/run-logged.sh --tail-ok 5 "build" -- npm --prefix viewer run build
+#   tools/run-logged.sh "build" -- cargo build --workspace --all-targets
+#   tools/run-logged.sh --tail 80 "tests" -- cargo test --workspace
+#   tools/run-logged.sh --tail-ok 5 "info" -- target/debug/focusforge-cli info path/to/frames
 #
 #   --verbose      stream the output as well (unbounded -- defeats the point)
 #   --tail N       lines of the log printed inline on FAILURE (default 40, 0 none)
@@ -13,9 +13,9 @@
 #                  are the result you actually wanted
 #   --log-dir D    write into D instead of a fresh .logs/tool/ run dir
 #
-# This is the front end for the commands this repo runs that live outside
-# tools/ -- `uv run pytest`, `npm run test`, `npm run build`, `npm run test:e2e`.
-# The tools/ scripts that drive a noisy subprocess themselves source
+# This is the front end for the noisy commands that live outside tools/ --
+# `cargo build --workspace`, `cargo test --workspace`, a long `focusforge-cli`
+# run. The tools/ scripts that drive a noisy subprocess themselves source
 # tools/lib/run-logged.sh directly instead of shelling out to this.
 #
 # Exit code: the command's own.

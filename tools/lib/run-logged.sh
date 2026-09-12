@@ -4,7 +4,7 @@
 #
 #   . "$(dirname "$0")/lib/run-logged.sh"
 #   runlog_init                       # optional: names the run directory
-#   run_logged "npm install" npm --prefix frontend install
+#   run_logged "build" cargo build --workspace --all-targets
 #   runlog_summary gate               # optional: table + exit status
 #
 # Output contract: a subprocess's full stdout+stderr goes to its own file and
@@ -64,8 +64,8 @@ RUNLOG_KEEP="${RUNLOG_KEEP:-${FF_TOOL_KEEP:-10}}"
 
 # Internal, not a FF_TOOL_* knob (assigned unconditionally, not with
 # ${...:-}, so a caller that exports the name cannot turn it into one). A
-# fallback for D2: a directory this old is prunable regardless of what its
-# .owner file says, so a wedged or orphaned owner cannot pin the root forever.
+# directory this old is prunable regardless of what its .owner file says, so
+# a wedged or orphaned owner cannot pin the root forever.
 RUNLOG_STALE_AFTER_SECS=86400
 
 RUNLOG_NAMES=()
@@ -113,11 +113,10 @@ runlog_write_owner() {
 }
 
 # A candidate directory counts as live iff it names a real, well-formed
-# .owner file, is not older than the staleness fallback (D2 -- checked before
-# the /proc probe, so a wedged process cannot pin the root forever), and its
-# recorded pid is still running with a matching start time (D1 -- a
-# recycled pid fails this and is treated as finished). No .owner at all
-# (pre-fix directories, an older library copy) also reads as finished.
+# .owner file, is not older than the staleness fallback (checked before the
+# /proc probe, so a wedged process cannot pin the root forever), and its
+# recorded pid is still running with a matching start time (a recycled pid
+# fails this and is treated as finished). No .owner file reads as finished.
 runlog_dir_is_live() {
   local dir="$1" pid starttime now mtime current
   [ -f "$dir/.owner" ] || return 1
@@ -182,7 +181,7 @@ runlog_init() {
   # this library's own root directory, never an argument. A directory that is
   # still being written to -- this process's own, or another one's sharing
   # the root -- is never a deletion candidate and never counts against
-  # RUNLOG_KEEP (D2); only a directory that has actually finished does.
+  # RUNLOG_KEEP; only a directory that has actually finished does.
   if [ "$prune" -eq 1 ]; then
     runlog_write_owner
     local old kept=0
