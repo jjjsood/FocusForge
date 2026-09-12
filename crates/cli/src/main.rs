@@ -36,19 +36,13 @@ fn main() -> ExitCode {
 fn info(path: &std::path::Path) -> ExitCode {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(err) => {
-            eprintln!("error: cannot read {}: {err}", path.display());
-            return ExitCode::FAILURE;
-        }
+        Err(err) => return fail(format!("cannot read {}: {err}", path.display())),
     };
 
     if metadata.is_dir() {
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
-            Err(err) => {
-                eprintln!("error: cannot read directory {}: {err}", path.display());
-                return ExitCode::FAILURE;
-            }
+            Err(err) => return fail(format!("cannot read directory {}: {err}", path.display())),
         };
 
         let mut rows: Vec<(String, u64)> = Vec::new();
@@ -56,17 +50,13 @@ fn info(path: &std::path::Path) -> ExitCode {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
-                    eprintln!("error: cannot read entry in {}: {err}", path.display());
-                    return ExitCode::FAILURE;
+                    return fail(format!("cannot read entry in {}: {err}", path.display()));
                 }
             };
             let name = entry.file_name().to_string_lossy().into_owned();
             let bytes = match entry.metadata() {
                 Ok(meta) => meta.len(),
-                Err(err) => {
-                    eprintln!("error: cannot stat {name}: {err}");
-                    return ExitCode::FAILURE;
-                }
+                Err(err) => return fail(format!("cannot stat {name}: {err}")),
             };
             rows.push((name, bytes));
         }
@@ -87,4 +77,9 @@ fn info(path: &std::path::Path) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn fail(message: impl std::fmt::Display) -> ExitCode {
+    eprintln!("error: {message}");
+    ExitCode::FAILURE
 }
