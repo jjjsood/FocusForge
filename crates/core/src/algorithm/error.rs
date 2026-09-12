@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! Failures a [`super::StackAlgorithm`] or [`super::AlignAlgorithm`] work
+//! method can return.
+//!
+//! Every variant names its offending value. `#[error(transparent)]` on the
+//! wrapped variants forwards `Display` and `source()` straight through, so
+//! a tile failure keeps the source error's own message -- which already
+//! names the file.
+
+/// Everything that can go wrong running a [`super::StackAlgorithm::fuse`] or
+/// [`super::AlignAlgorithm::align_frame`] work method.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AlgorithmError {
+    /// A read through the context's pixel source failed.
+    #[error(transparent)]
+    Tiff(#[from] crate::io::TiffError),
+
+    /// The values handed to the work method fail the algorithm's own
+    /// schema.
+    #[error(transparent)]
+    Params(#[from] crate::params::ParamError),
+
+    /// A context was asked for a frame index it does not hold.
+    #[error("frame {frame} is out of range: the context holds {frame_count} frames")]
+    FrameOutOfRange { frame: usize, frame_count: usize },
+
+    /// The algorithm's own work failed for a reason none of the other
+    /// variants name.
+    #[error("{algorithm}: {detail}")]
+    Failed { algorithm: String, detail: String },
+}

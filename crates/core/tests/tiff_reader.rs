@@ -9,6 +9,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
+use focusforge_core::algorithm::TileReader;
 use focusforge_core::io::{Rect, Refusal, TiffError, TiffHeader, TiffStack};
 
 fn mantis_512_dir() -> PathBuf {
@@ -375,6 +376,29 @@ fn header_probe_reports_refusal_without_error() {
     assert_eq!(header.refusal, Some(Refusal::Compressed(5)));
     assert_eq!(header.width, 64);
     assert_eq!(header.height, 64);
+}
+
+#[test]
+fn tiff_stack_is_a_tile_reader() {
+    let stack = TiffStack::open(mantis_512_dir()).expect("mantis-512 must open");
+    let rect = Rect {
+        x: 100,
+        y: 150,
+        width: 48,
+        height: 48,
+    };
+
+    let inherent = stack
+        .read_tile(0, rect)
+        .expect("inherent read must succeed");
+
+    let mut via_trait = vec![0u16; inherent.samples.len()];
+    TileReader::read_tile_into(&stack, 0, rect, &mut via_trait).expect("trait read must succeed");
+
+    assert_eq!(
+        inherent.samples, via_trait,
+        "&dyn TileReader must read the same bytes as the inherent method"
+    );
 }
 
 #[test]
