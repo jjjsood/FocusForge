@@ -390,18 +390,13 @@ pub fn resolve(
         let (value, provenance) = if let Some(v) = values.get(&desc.id) {
             (v.clone(), Provenance::Explicit)
         } else if let Some(auto) = &desc.auto {
-            let v = auto(ctx);
-            if let Err(violation) = check(desc, &v) {
-                violations.push(ParamViolation::Auto {
-                    id: desc.id.clone(),
-                    source: Box::new(violation),
-                });
-                continue;
-            }
-            (v, Provenance::Auto)
+            (auto(ctx), Provenance::Auto)
         } else {
             (desc.default.clone(), Provenance::Default)
         };
+        // Checked exactly once per parameter: an `Auto` value's own violation
+        // is wrapped so a computed-out-of-range value names the hook, not
+        // just the range.
         match check(desc, &value) {
             Ok(()) => {
                 let normalized = normalize(desc, value);
@@ -413,7 +408,14 @@ pub fn resolve(
                     },
                 );
             }
-            Err(v) => violations.push(v),
+            Err(violation) => violations.push(if provenance == Provenance::Auto {
+                ParamViolation::Auto {
+                    id: desc.id.clone(),
+                    source: Box::new(violation),
+                }
+            } else {
+                violation
+            }),
         }
     }
     if violations.is_empty() {
