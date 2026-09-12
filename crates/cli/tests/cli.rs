@@ -1,10 +1,49 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::path::PathBuf;
+mod common;
+
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+}
+
+fn mantis_512_dir() -> PathBuf {
+    common::fixtures_dir().join("mantis-512")
+}
+
+fn mantis_64_dir() -> PathBuf {
+    common::fixtures_dir().join("mantis-64")
+}
+
+/// Copy `source` (a little-endian, classic-TIFF fixture frame) to `dest`,
+/// patching its `Compression` tag (259) from 1 to 5 in place. Never PIL: it
+/// silently down-converts 16-bit RGB to 8-bit and would test the wrong file.
+fn write_compressed_copy(source: &Path, dest: &Path) {
+    let mut bytes = std::fs::read(source).expect("read fixture frame");
+    assert_eq!(&bytes[0..2], b"II", "fixture frame must be little-endian");
+    let ifd_offset = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let n_entries =
+        u16::from_le_bytes(bytes[ifd_offset..ifd_offset + 2].try_into().unwrap()) as usize;
+    let mut patched = false;
+    for i in 0..n_entries {
+        let entry_off = ifd_offset + 2 + i * 12;
+        let tag = u16::from_le_bytes(bytes[entry_off..entry_off + 2].try_into().unwrap());
+        if tag == 259 {
+            bytes[entry_off + 8..entry_off + 10].copy_from_slice(&5u16.to_le_bytes());
+            patched = true;
+            break;
+        }
+    }
+    assert!(
+        patched,
+        "Compression tag (259) not found in {}",
+        source.display()
+    );
+    std::fs::write(dest, bytes).expect("write compressed copy");
 }
 
 #[test]
@@ -22,21 +61,401 @@ fn version_flag_prints_package_version() {
 }
 
 #[test]
-fn info_lists_fixture_directory() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let fixture_dir = manifest_dir.join("../../fixtures/mantis-512");
+fn info_reports_fixture_directory() {
     let output = bin()
         .arg("info")
-        .arg(&fixture_dir)
+        .arg(mantis_512_dir())
         .output()
         .expect("failed to run binary");
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let has_tif_with_size = stdout
-        .lines()
-        .any(|line| line.contains(".tif") && line.split('\t').nth(1).is_some());
     assert!(
-        has_tif_with_size,
-        "no .tif entry with byte count in stdout: {stdout:?}"
+        stdout.contains("512x512 3ch 16-bit II compression=1 planar=1 photometric=2"),
+        "stdout: {stdout}"
     );
+    assert!(
+        stdout.contains("rows_per_strip=1 strips=512 file_size=1577214"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("mmap fast path: yes"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("8 TIFFs, 12617712 bytes total"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("uniform layout: yes"), "stdout: {stdout}");
+    // frames/ descent: the top-level reference.tif must not be listed.
+    assert!(
+        !stdout.contains("reference.tif"),
+        "top-level reference.tif must not be listed: {stdout}"
+    );
+}
+
+#[test]
+fn info_reports_single_file_fields() {
+    let output = bin()
+        .arg("info")
+        .arg(mantis_512_dir().join("frames").join("00.tif"))
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("512x512 3ch 16-bit II compression=1 planar=1 photometric=2"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("rows_per_strip=1 strips=512 file_size=1577214"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("mmap fast path: yes"), "stdout: {stdout}");
+    // Single-file output has no directory summary.
+    assert!(!stdout.contains("TIFFs,"), "stdout: {stdout}");
+}
+
+#[test]
+fn info_json() {
+    let output = bin()
+        .arg("info")
+        .arg("--json")
+        .arg(mantis_512_dir())
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for needle in [
+        "\"frame_count\": 8",
+        "\"total_bytes\": 12617712",
+        "\"unreadable_count\": 0",
+        "\"uniform_layout\": true",
+        "\"uniform_detail\": null",
+        "\"is_directory\": true",
+        "\"rows_per_strip\": 1",
+        "\"mmap_fast_path\": true",
+        "\"error\": null",
+    ] {
+        assert!(stdout.contains(needle), "missing {needle:?} in: {stdout}");
+    }
+    let fast_path_count = stdout.matches("\"mmap_fast_path\": true").count();
+    assert_eq!(fast_path_count, 8, "expected 8 fast-path entries: {stdout}");
+}
+
+/// `info --json` on a directory holding one valid frame and one broken
+/// member: the broken row must carry all sixteen `FileReport` keys, with
+/// every metadata field explicit `null` (no `skip_serializing_if`) except
+/// `name`, `path` and `error`.
+#[test]
+fn info_json_nulls_every_metadata_field_on_a_broken_member() {
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("info_json_nulls_every_metadata_field_on_a_broken_member");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::copy(
+        mantis_64_dir().join("frames").join("00.tif"),
+        tmp.join("00.tif"),
+    )
+    .unwrap();
+    std::fs::write(tmp.join("broken.tif"), b"junkbyte").unwrap();
+
+    let output = bin()
+        .arg("info")
+        .arg("--json")
+        .arg(&tmp)
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    assert_eq!(report["unreadable_count"], 1, "report: {report}");
+
+    let files = report["files"].as_array().expect("files must be an array");
+    let broken = files
+        .iter()
+        .find(|f| f["name"] == "broken.tif")
+        .expect("broken.tif must be present in files");
+
+    assert!(broken["path"].is_string(), "broken: {broken}");
+    assert!(broken["error"].is_string(), "broken: {broken}");
+    for key in [
+        "width",
+        "height",
+        "bits_per_sample",
+        "samples_per_pixel",
+        "byte_order",
+        "compression",
+        "photometric",
+        "planar_config",
+        "rows_per_strip",
+        "strip_count",
+        "file_size",
+        "mmap_fast_path",
+        "refusal",
+    ] {
+        assert!(
+            broken.get(key).is_some_and(|v| v.is_null()),
+            "expected key {key:?} to be present and null for a broken member, got {:?}",
+            broken.get(key)
+        );
+    }
+}
+
+#[test]
+fn info_reports_non_uniform_directory() {
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("info_reports_non_uniform_directory");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::copy(
+        mantis_64_dir().join("reference.tif"),
+        tmp.join("reference.tif"),
+    )
+    .unwrap();
+    std::fs::copy(
+        mantis_64_dir().join("reference-MM-rps8.tif"),
+        tmp.join("reference-MM-rps8.tif"),
+    )
+    .unwrap();
+
+    let output = bin()
+        .arg("info")
+        .arg(&tmp)
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("uniform layout: no — reference-MM-rps8.tif is MM/rps=8, others II/rps=1"),
+        "stdout: {stdout}"
+    );
+}
+
+/// Two members share byte order and `RowsPerStrip` (the only two fields the
+/// frozen sentence always names) and disagree only on `Compression`: the
+/// detail line must still name the field that actually differs, not repeat
+/// an identical-looking `II/rps=1` on both sides.
+#[test]
+fn info_reports_non_uniform_directory_names_compression() {
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("info_reports_non_uniform_directory_names_compression");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::copy(
+        mantis_64_dir().join("frames").join("00.tif"),
+        tmp.join("00.tif"),
+    )
+    .unwrap();
+    std::fs::copy(
+        mantis_64_dir().join("frames").join("01.tif"),
+        tmp.join("01.tif"),
+    )
+    .unwrap();
+    write_compressed_copy(
+        &mantis_64_dir().join("frames").join("00.tif"),
+        &tmp.join("02-compressed.tif"),
+    );
+
+    let output = bin()
+        .arg("info")
+        .arg(&tmp)
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "uniform layout: no — 02-compressed.tif is II/rps=1/compression=5, others II/rps=1"
+        ),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn info_skips_non_tiff_and_names_a_broken_tiff() {
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("info_skips_non_tiff_and_names_a_broken_tiff");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::copy(
+        mantis_64_dir().join("frames").join("00.tif"),
+        tmp.join("00.tif"),
+    )
+    .unwrap();
+    std::fs::write(tmp.join("README.md"), b"not a frame").unwrap();
+    std::fs::write(tmp.join("broken.tif"), b"junkbyte").unwrap();
+
+    let output = bin()
+        .arg("info")
+        .arg(&tmp)
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("README.md"), "stdout: {stdout}");
+    assert!(stdout.contains("broken.tif"), "stdout: {stdout}");
+    assert!(stdout.contains("error:"), "stdout: {stdout}");
+    assert!(stdout.contains("unreadable: 1"), "stdout: {stdout}");
+}
+
+#[test]
+fn info_reads_headers_only() {
+    // Truncate a copy of mantis-64/frames/00.tif to its 762-byte header:
+    // header, IFD and both strip tables complete, zero pixel bytes.
+    let source = mantis_64_dir().join("frames").join("00.tif");
+    let bytes = std::fs::read(&source).expect("read fixture frame");
+    let truncated = &bytes[..762];
+
+    let file_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("info_reads_headers_only.tif");
+    std::fs::write(&file_path, truncated).unwrap();
+
+    let output = bin()
+        .arg("info")
+        .arg(&file_path)
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("64x64 3ch 16-bit II compression=1 planar=1 photometric=2"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("mmap fast path: yes"), "stdout: {stdout}");
+
+    // Same proof for a directory containing the truncated file.
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("info_reads_headers_only_dir");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("truncated.tif"), truncated).unwrap();
+    let output = bin()
+        .arg("info")
+        .arg(&tmp)
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("64x64 3ch 16-bit II"), "stdout: {stdout}");
+}
+
+#[test]
+fn info_reports_written_file_as_fast_path() {
+    let out_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("info_reports_written_file_as_fast_path.tif");
+    let mut writer = TiffWriter::create(
+        &out_path,
+        TiffSpec {
+            width: 4,
+            height: 4,
+            samples_per_pixel: 3,
+            description: None,
+        },
+    )
+    .expect("create must succeed");
+    writer
+        .write_tile(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            &[0u16; 4 * 4 * 3],
+        )
+        .expect("write_tile must succeed");
+    writer.finish().expect("finish must succeed");
+
+    let output = bin()
+        .arg("info")
+        .arg(&out_path)
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("mmap fast path: yes"), "stdout: {stdout}");
+}
+
+#[test]
+fn info_reports_compressed_file_as_refused() {
+    let dest = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("info_reports_compressed_file_as_refused.tif");
+    write_compressed_copy(&mantis_64_dir().join("frames").join("00.tif"), &dest);
+
+    let output = bin()
+        .arg("info")
+        .arg(&dest)
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("mmap fast path: no — Compression=5, only uncompressed (1) is supported"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn info_exits_1_for_unparseable_single_file() {
+    let dest =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("info_exits_1_for_unparseable_single_file");
+    std::fs::write(&dest, b"not a tiff at all").unwrap();
+
+    let output = bin()
+        .arg("info")
+        .arg(&dest)
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        !output.status.success(),
+        "expected exit 1, got {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error:"), "stderr: {stderr}");
+}
+
+#[test]
+fn info_exits_1_for_empty_directory() {
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("info_exits_1_for_empty_directory");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let output = bin()
+        .arg("info")
+        .arg(&tmp)
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        !output.status.success(),
+        "expected exit 1, got {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error:"), "stderr: {stderr}");
+}
+
+#[test]
+#[ignore = "reads the 16 GB reference stack"]
+fn info_reads_the_reference_stack() {
+    let Some(stack_dir) = common::reference_stack_dir() else {
+        eprintln!("skip: reference stack not found");
+        return;
+    };
+
+    let output = bin()
+        .arg("info")
+        .arg("--json")
+        .arg(&stack_dir)
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("\"frame_count\": 62"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("\"uniform_layout\": false"),
+        "stdout: {stdout}"
+    );
+    let strip_5464 = stdout.matches("\"strip_count\": 5464").count();
+    assert_eq!(
+        strip_5464, 61,
+        "expected 61 frames at strip_count 5464: {stdout}"
+    );
+    assert!(stdout.contains("\"strip_count\": 683"), "stdout: {stdout}");
 }

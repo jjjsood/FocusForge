@@ -43,7 +43,7 @@ impl TiffStack {
     /// [`Self::open_files`] with an explicit list, never `open` on a
     /// directory that holds both.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, TiffError> {
-        let paths = collect_dir(dir.as_ref())?;
+        let paths = frame_paths(dir.as_ref())?;
         Self::open_files(&paths)
     }
 
@@ -235,7 +235,13 @@ fn past_eof(path: &Path) -> TiffError {
     }
 }
 
-fn collect_dir(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
+/// Enumerate the TIFF frames of `dir`: non-recursive, `*.tif`/`*.tiff`
+/// case-insensitively, bytewise-sorted by file name, descending into
+/// `dir/frames` when that subdirectory exists. Zero matches is `NoFrames`.
+/// Shared by [`TiffStack::open`] and `focusforge-cli info` so a directory is
+/// enumerated the same way by both, by construction rather than by a second
+/// copy of the rule.
+pub fn frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
     let frames_sub = dir.join("frames");
     let scan_dir = if frames_sub.is_dir() {
         frames_sub

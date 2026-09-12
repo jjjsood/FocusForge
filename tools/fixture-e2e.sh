@@ -37,4 +37,29 @@ fi
 echo "+ $CLI info fixtures/mantis-512"
 "$CLI" info fixtures/mantis-512
 
+echo "+ $CLI info --json fixtures/mantis-512"
+JSON_OUT="$("$CLI" info --json fixtures/mantis-512)"
+
+printf '%s' "$JSON_OUT" | grep -q '"frame_count": 8' \
+  || { echo "FAIL: fixture e2e -- missing fact: frame_count 8" >&2; exit 1; }
+echo "OK: fact present -- frame_count: 8"
+
+printf '%s' "$JSON_OUT" | grep -q '"uniform_layout": true' \
+  || { echo "FAIL: fixture e2e -- missing fact: uniform_layout true" >&2; exit 1; }
+echo "OK: fact present -- uniform_layout: true"
+
+printf '%s' "$JSON_OUT" | grep -q '"total_bytes": 12617712' \
+  || { echo "FAIL: fixture e2e -- missing fact: total_bytes 12617712" >&2; exit 1; }
+echo "OK: fact present -- total_bytes: 12617712"
+
+printf '%s' "$JSON_OUT" | grep -q '"rows_per_strip": 1' \
+  || { echo "FAIL: fixture e2e -- missing fact: rows_per_strip 1" >&2; exit 1; }
+echo "OK: fact present -- rows_per_strip: 1"
+
+echo "+ $CLI info fixtures/mantis-512/frames/00.tif"
+SINGLE_OUT="$("$CLI" info fixtures/mantis-512/frames/00.tif)"
+printf '%s' "$SINGLE_OUT" | grep -q 'mmap fast path: yes' \
+  || { echo "FAIL: fixture e2e -- missing fact: mmap fast path: yes" >&2; exit 1; }
+echo "OK: fact present -- mmap fast path: yes"
+
 echo "OK: fixture e2e"

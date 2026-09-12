@@ -146,4 +146,18 @@ pub enum TiffError {
     /// `read_tile_into`'s output buffer is the wrong length for the rect.
     #[error("buffer size mismatch: expected {expected} u16 samples, got {got}")]
     BufferSize { expected: usize, got: usize },
+
+    /// `TiffWriter::finish` was called before every pixel of the frame was
+    /// written. Names the first row whose merged coverage is not exactly
+    /// `[(0, width)]`, so a caller can tell a hole from a double write.
+    #[error(
+        "{}: row {row} is covered {covered:?}, expected exactly one interval [(0, {width})]",
+        path.display()
+    )]
+    IncompleteFrame {
+        path: PathBuf,
+        row: u32,
+        covered: Vec<(u32, u32)>,
+        width: u32,
+    },
 }

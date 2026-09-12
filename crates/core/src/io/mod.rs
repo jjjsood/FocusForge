@@ -21,4 +21,5 @@ pub(crate) mod tiff;
 pub use crate::tile::{Rect, Tile};
 pub use error::{Refusal, TiffError};
 pub use tiff::header::{ByteOrder, TiffHeader};
-pub use tiff::stack::TiffStack;
+pub use tiff::stack::{TiffStack, frame_paths};
+pub use tiff::writer::{TiffSpec, TiffWriter};

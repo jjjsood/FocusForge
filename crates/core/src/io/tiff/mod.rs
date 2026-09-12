@@ -2,3 +2,4 @@
 
 pub(crate) mod header;
 pub(crate) mod stack;
+pub(crate) mod writer;
