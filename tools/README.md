@@ -13,6 +13,8 @@ from the reference stack, and the shared build/GPU lock.
 | `run-acceptance.sh` | The manual 16 GB reference-stack run — minutes, so never in a gate. Run it once per item that needs it and record the numbers. Refuses until the CLI has a `stack` subcommand. |
 | `lib/run-logged.sh` | The logging mechanism the gates share: each gate's full output to its own file, two bounded lines to stdout. |
 | `run-logged.sh "<name>" -- <cmd>` | The same treatment for a one-off noisy command. |
+| `make-logo-assets.sh` | Rasterises the brand SVGs in `assets/` into `assets/build/`: the PNG ladder, the hicolor tree, `focusforge.ico`, `focusforge.icns` and the repository page images. Picks the small-size cut at 32 px and under. Skips until `assets/logo.svg` exists. |
+| `lib/write-icns.py` | Packs PNGs into a macOS `.icns` suite and reads its own output back to verify it. Exists because the ImageMagick build here has no ICNS coder. |
 
 Every script skips rather than fails when the thing it checks does not exist
 yet — an empty repository is not a broken one. A skip prints `SKIP: <reason>`
