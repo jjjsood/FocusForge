@@ -8,6 +8,10 @@ pub mod algorithm;
 pub mod align;
 pub mod io;
 pub mod params;
+pub mod registry;
 pub mod tile;
+
+#[cfg(feature = "test-algorithms")]
+pub mod test_algorithms;
 
 pub use io::TiffError;
