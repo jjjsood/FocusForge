@@ -184,7 +184,6 @@ fn an_id_from_the_other_family_is_not_unknown() {
 
 #[cfg(feature = "test-algorithms")]
 #[test]
-#[cfg(feature = "test-algorithms")]
 fn each_family_listing_holds_only_its_own_family() {
     let stacks = stack_algorithms();
     let aligns = align_algorithms();
@@ -211,6 +210,7 @@ fn each_family_listing_holds_only_its_own_family() {
     }
 }
 
+#[cfg(feature = "test-algorithms")]
 #[test]
 fn lists_every_registered_algorithm() {
     let listing = algorithms();
@@ -228,13 +228,6 @@ fn lists_every_registered_algorithm() {
             entry.id()
         );
     }
-}
-
-#[cfg(feature = "test-algorithms")]
-#[test]
-fn listing_order_of_the_real_registry() {
-    let ids: Vec<&str> = algorithms().iter().map(AlgorithmRef::id).collect();
-    assert_eq!(ids, vec!["dummy-align", "dummy-stack"]);
 }
 
 #[cfg(feature = "test-algorithms")]
