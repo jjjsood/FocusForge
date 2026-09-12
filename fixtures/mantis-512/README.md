@@ -4,6 +4,8 @@ Algorithm scale: eight evenly spaced frames, wide enough for a pyramid deep enou
 
 Crop rect (x, y, w, h): **3840,2476,512,512** -- a 512x512 window taken from the same place in every frame.
 
+Why this rect: Centred on the frame, spanning the focus sweep: the reference crop is 3.24x sharper (16-bit Laplacian variance) than the best single frame, with an 8-way per-tile winner map and a 28x max best/worst ratio -- different source frames win different tiles, which is the phenomenon a fusion fixture has to exercise.
+
 ## Frames
 
 | NN | source frame | head64k_sha256 |
