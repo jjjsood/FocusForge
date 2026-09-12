@@ -5,6 +5,7 @@
 //! `crates/core` never depends on `slint`, `wgpu` or `rfd`.
 
 pub mod io;
+pub mod params;
 pub mod tile;
 
 pub use io::TiffError;
