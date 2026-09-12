@@ -15,6 +15,7 @@ from the reference stack, and the shared build/GPU lock.
 | `run-logged.sh "<name>" -- <cmd>` | The same treatment for a one-off noisy command. |
 | `make-logo-assets.sh` | Rasterises the brand SVGs in `assets/` into `assets/build/`: the PNG ladder, the hicolor tree, `focusforge.ico`, `focusforge.icns` and the repository page images. Picks the small-size cut at 32 px and under. Skips until `assets/logo.svg` exists. |
 | `lib/write-icns.py` | Packs PNGs into a macOS `.icns` suite and reads its own output back to verify it. Exists because the ImageMagick build here has no ICNS coder. |
+| `lib/make-wordmark.py` | Authoring step, not part of the build: sets the wordmark in Inter, bakes the text to paths and rewrites the four lockup SVGs in `assets/`. Run it by hand when the type or the proportions change. |
 
 Every script skips rather than fails when the thing it checks does not exist
 yet — an empty repository is not a broken one. A skip prints `SKIP: <reason>`
