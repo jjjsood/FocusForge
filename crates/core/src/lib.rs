@@ -4,6 +4,8 @@
 //! later, the GUI drive, exercisable without a GPU device or a window.
 //! `crates/core` never depends on `slint`, `wgpu` or `rfd`.
 
+pub mod algorithm;
+pub mod align;
 pub mod io;
 pub mod params;
 pub mod tile;
