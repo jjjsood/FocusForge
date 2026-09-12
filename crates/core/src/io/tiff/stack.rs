@@ -11,13 +11,8 @@ use std::sync::OnceLock;
 use memmap2::Mmap;
 
 use super::super::error::TiffError;
-use super::header::{ByteOrder, TiffHeader};
+use super::header::{ByteOrder, TAG_STRIP_OFFSETS, TiffHeader};
 use crate::tile::{Rect, Tile};
-
-/// The tag number of `StripOffsets`, reused only for naming the field
-/// whose value produced an out-of-range read during tile arithmetic (the
-/// header parser already has its own tag constant of the same value).
-const TAG_STRIP_OFFSETS: u16 = 273;
 
 /// A directory of TIFF frames, opened once, mapped lazily per frame.
 ///
@@ -87,10 +82,6 @@ impl TiffStack {
 
     pub fn header(&self, index: usize) -> &TiffHeader {
         &self.headers[index]
-    }
-
-    pub fn headers(&self) -> &[TiffHeader] {
-        &self.headers
     }
 
     /// Frame 0's `(width, height)`. Valid on any non-empty stack: uniformity
