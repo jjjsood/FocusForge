@@ -113,6 +113,39 @@ fn info_reports_single_file_fields() {
 }
 
 #[test]
+fn info_reports_the_description() {
+    let path = mantis_64_dir().join("frames").join("00.tif");
+    let expected = "description: FocusForge fixture mantis-64/00 from 20260829-IMG_9800.tif rect 4064,2700,64,64";
+
+    let output = bin()
+        .arg("info")
+        .arg(&path)
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(expected), "stdout: {stdout}");
+
+    let json_output = bin()
+        .arg("info")
+        .arg("--json")
+        .arg(&path)
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        json_output.status.success(),
+        "exit status: {:?}",
+        json_output.status
+    );
+    let json_stdout = String::from_utf8_lossy(&json_output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&json_stdout).expect("valid JSON");
+    assert_eq!(
+        report["files"][0]["description"],
+        "FocusForge fixture mantis-64/00 from 20260829-IMG_9800.tif rect 4064,2700,64,64"
+    );
+}
+
+#[test]
 fn info_json() {
     let output = bin()
         .arg("info")
@@ -140,7 +173,7 @@ fn info_json() {
 }
 
 /// `info --json` on a directory holding one valid frame and one broken
-/// member: the broken row must carry all sixteen `FileReport` keys, with
+/// member: the broken row must carry all seventeen `FileReport` keys, with
 /// every metadata field explicit `null` (no `skip_serializing_if`) except
 /// `name`, `path` and `error`.
 #[test]
@@ -188,6 +221,7 @@ fn info_json_nulls_every_metadata_field_on_a_broken_member() {
         "rows_per_strip",
         "strip_count",
         "file_size",
+        "description",
         "mmap_fast_path",
         "refusal",
     ] {

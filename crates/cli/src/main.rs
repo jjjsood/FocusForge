@@ -76,6 +76,7 @@ struct FileReport {
     rows_per_strip: Option<u32>,
     strip_count: Option<usize>,
     file_size: Option<u64>,
+    description: Option<String>,
     mmap_fast_path: Option<bool>,
     refusal: Option<String>,
     error: Option<String>,
@@ -192,6 +193,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 rows_per_strip: Some(h.rows_per_strip),
                 strip_count: Some(h.strip_count()),
                 file_size: Some(h.file_size),
+                description: h.image_description.clone(),
                 mmap_fast_path: Some(h.refusal.is_none()),
                 refusal: h.refusal.as_ref().map(|r| r.to_string()),
                 error: None,
@@ -210,6 +212,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 rows_per_strip: None,
                 strip_count: None,
                 file_size: None,
+                description: None,
                 mmap_fast_path: None,
                 refusal: None,
                 error: Some(e.to_string()),
@@ -362,6 +365,9 @@ fn print_human(report: &InfoReport) {
             file.strip_count.unwrap_or(0),
             file.file_size.unwrap_or(0),
         );
+        if let Some(description) = &file.description {
+            println!("  description: {description}");
+        }
         match &file.refusal {
             None => println!("  mmap fast path: yes"),
             Some(refusal) => println!("  mmap fast path: no — {refusal}"),

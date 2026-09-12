@@ -29,10 +29,11 @@ pub use error::AlgorithmError;
 /// usize` -- one index per **pixel**, never per sample. `Tile::samples` is
 /// `width * height * samples_per_pixel` long, but the Z-Map names a source
 /// *frame*, which is a per-pixel fact, not a per-sample one. Fields are
-/// public and there is no validating constructor: the Z-Map as a document
-/// with its own storage and invariants is future work, and a checked
-/// constructor here would need either a fabricated error or a panic for no
-/// caller that exists yet.
+/// public and there is no validating constructor here: the Z-Map as a
+/// document with its own storage and invariants lives in [`crate::zmap`]
+/// (`ZMapInfo`, `crate::zmap::validate_tile`, `crate::zmap::ZMapWriter`) --
+/// a checked constructor on `TileOutput` itself still waits for its first
+/// real caller.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TileOutput {
     pub tile: Tile,

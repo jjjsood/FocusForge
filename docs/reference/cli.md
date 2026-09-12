@@ -40,8 +40,12 @@ One block per file:
 path/to/frame.tif
   64x64 3ch 16-bit II compression=1 planar=1 photometric=2
   rows_per_strip=1 strips=64 file_size=25338
+  description: FocusForge fixture mantis-64/00 from 20260829-IMG_9800.tif rect 4064,2700,64,64
   mmap fast path: yes
 ```
+
+The `description:` line is only printed when the file carries an
+`ImageDescription` tag; a file with none keeps its three-line block.
 
 For a directory, a trailing summary follows every file block:
 
@@ -87,6 +91,7 @@ is added, never renamed or removed, in later versions.
       "rows_per_strip": 1,
       "strip_count": 64,
       "file_size": 25338,
+      "description": "FocusForge fixture mantis-64/00 from 20260829-IMG_9800.tif rect 4064,2700,64,64",
       "mmap_fast_path": true,
       "refusal": null,
       "error": null
@@ -124,6 +129,7 @@ parse as a TIFF at all):
 | `rows_per_strip` | the TIFF `RowsPerStrip` tag value |
 | `strip_count` | number of strips implied by height and `rows_per_strip` |
 | `file_size` | on-disk size in bytes |
+| `description` | the TIFF `ImageDescription` tag, `null` when the file has none — a Z-Map carries its frame count here |
 | `mmap_fast_path` | whether the tile reader's fast path applies to this file |
 | `refusal` | `null` when `mmap_fast_path` is `true`, otherwise the reason it is not (compression, tiling, planar layout, bit depth or sample format) |
 | `error` | `null` on a successful parse, otherwise why the file could not be read as a TIFF at all |

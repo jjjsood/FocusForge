@@ -10,6 +10,7 @@ pub mod io;
 pub mod params;
 pub mod registry;
 pub mod tile;
+pub mod zmap;
 
 #[cfg(feature = "test-algorithms")]
 pub mod test_algorithms;
