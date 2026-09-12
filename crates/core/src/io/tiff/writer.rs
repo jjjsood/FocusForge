@@ -510,9 +510,25 @@ mod tests {
                 )
                 .unwrap();
         }
+        // Capture layout and pixel bytes before `finish` consumes the writer;
+        // there is no reopened stack here (no file on disk), so the pixel
+        // bytes are decoded straight out of the in-memory sink instead.
+        let pixel_start = writer.pixel_start as usize;
+        let row_bytes = writer.row_bytes as usize;
+        let bytes = writer.sink.get_ref().clone();
         writer.finish().unwrap();
-        // Nothing else to assert here without a reopened stack -- covered by
-        // the fixture round-trip integration test instead.
-        let _ = expected;
+
+        let mut actual = Vec::with_capacity(expected.len());
+        for y in 0..height as usize {
+            let row_off = pixel_start + y * row_bytes;
+            for x in 0..width as usize {
+                let off = row_off + x * 2;
+                actual.push(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+            }
+        }
+        assert_eq!(
+            actual, expected,
+            "bytes at each row's computed offset must equal what write_tile wrote"
+        );
     }
 }
