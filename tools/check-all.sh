@@ -100,6 +100,7 @@ run_gate() { run_logged "$@" || true; }
 run_gate "rustfmt"          cargo fmt --all --check
 run_gate "licenses"         tools/check-licenses.sh
 run_gate "fixture manifest" tools/check-fixtures.sh
+run_gate "fixture manifest selftest" tools/check-fixtures-selftest.sh
 
 if [ "$STATIC_ONLY" -eq 0 ]; then
   # Must come first: it produces the binary the background stage runs, and it

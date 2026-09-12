@@ -4,6 +4,8 @@ Unit-test scale: three frames spanning the focus sweep, small enough to assert o
 
 Crop rect (x, y, w, h): **4064,2700,64,64** -- a 64x64 window taken from the same place in every frame.
 
+Why this rect: Centred on the frame, at reader scale: the reference crop is 3.59x sharper (16-bit Laplacian variance) than the best single frame, so the window spans real focus variation. But with only frames 0, 30 and 60 kept, frame 02 is sharpest in 12 of 16 tiles (spread 1.30x) -- this is a reader fixture, not a fusion one.
+
 ## Frames
 
 | NN | source frame | head64k_sha256 |
