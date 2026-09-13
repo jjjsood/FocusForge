@@ -179,7 +179,7 @@ fn peak_live_heap_stays_under_ceiling() {
         algo,
         values,
         &composite_path,
-        &zmap_path,
+        Some(&zmap_path),
         focusforge_core::fuse::FusionGeometry {
             width,
             height,

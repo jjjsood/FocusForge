@@ -56,15 +56,18 @@ pub struct FusionGeometry {
 }
 
 impl FusionConsumer {
-    /// Creates both output files and writes their headers now, ready for
-    /// [`TileConsumer::consume`] calls. `values` must already be fully
-    /// resolved (`crate::params::resolve` plus
+    /// Creates the composite output file, and the Z-Map output file when
+    /// `zmap_path` is `Some`, writing every created file's header now, ready
+    /// for [`TileConsumer::consume`] calls. `zmap_path: None` means no Z-Map
+    /// file is written for this run at all -- never a scratch path created
+    /// and deleted, since that would still pay the write cost. `values`
+    /// must already be fully resolved (`crate::params::resolve` plus
     /// `crate::params::resolved_values` run by the caller).
     pub fn create(
         algorithm: &'static dyn StackAlgorithm,
         values: ParamValues,
         composite_path: &Path,
-        zmap_path: &Path,
+        zmap_path: Option<&Path>,
         geometry: FusionGeometry,
     ) -> Result<Self, AlgorithmError> {
         let FusionGeometry {
@@ -82,26 +85,34 @@ impl FusionConsumer {
                 description: None,
             },
         )?;
-        let zmap_info =
-            ZMapInfo::new(width, height, frame_count).map_err(|source| AlgorithmError::Failed {
-                algorithm: algorithm.id().to_string(),
-                detail: source.to_string(),
-            })?;
-        let zmap =
-            ZMapWriter::create(zmap_path, zmap_info).map_err(|source| AlgorithmError::Failed {
-                algorithm: algorithm.id().to_string(),
-                detail: source.to_string(),
-            })?;
+        let zmap = match zmap_path {
+            Some(zmap_path) => {
+                let zmap_info = ZMapInfo::new(width, height, frame_count).map_err(|source| {
+                    AlgorithmError::Failed {
+                        algorithm: algorithm.id().to_string(),
+                        detail: source.to_string(),
+                    }
+                })?;
+                let writer = ZMapWriter::create(zmap_path, zmap_info).map_err(|source| {
+                    AlgorithmError::Failed {
+                        algorithm: algorithm.id().to_string(),
+                        detail: source.to_string(),
+                    }
+                })?;
+                Some(writer)
+            }
+            None => None,
+        };
         Ok(FusionConsumer {
             algorithm,
             values,
             composite: Mutex::new(Some(composite)),
-            zmap: Mutex::new(Some(zmap)),
+            zmap: Mutex::new(zmap),
         })
     }
 
-    /// Finishes both writers, which already refuse an incompletely covered
-    /// frame.
+    /// Finishes the composite writer, and the Z-Map writer when one was
+    /// created -- both already refuse an incompletely covered frame.
     pub fn finish(self) -> Result<(), AlgorithmError> {
         let composite = self
             .composite
@@ -110,16 +121,12 @@ impl FusionConsumer {
             .take()
             .expect("composite writer present");
         composite.finish()?;
-        let zmap = self
-            .zmap
-            .lock()
-            .unwrap()
-            .take()
-            .expect("zmap writer present");
-        zmap.finish().map_err(|source| AlgorithmError::Failed {
-            algorithm: self.algorithm.id().to_string(),
-            detail: source.to_string(),
-        })?;
+        if let Some(zmap) = self.zmap.lock().unwrap().take() {
+            zmap.finish().map_err(|source| AlgorithmError::Failed {
+                algorithm: self.algorithm.id().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
         Ok(())
     }
 }
@@ -157,25 +164,23 @@ impl TileConsumer for FusionConsumer {
                 detail: source.to_string(),
             })?;
 
-        let mut cropped_zmap = vec![0u16; interior.width as usize * interior.height as usize];
-        crop_zmap_into(&output.zmap, job.read_rect(), interior, &mut cropped_zmap);
-
         self.composite
             .lock()
             .unwrap()
             .as_mut()
             .expect("composite writer present")
             .write_tile(interior, &cropped_composite)?;
-        self.zmap
-            .lock()
-            .unwrap()
-            .as_mut()
-            .expect("zmap writer present")
-            .write_tile(interior, &cropped_zmap)
-            .map_err(|source| AlgorithmError::Failed {
-                algorithm: self.algorithm.id().to_string(),
-                detail: source.to_string(),
-            })?;
+
+        if let Some(zmap_writer) = self.zmap.lock().unwrap().as_mut() {
+            let mut cropped_zmap = vec![0u16; interior.width as usize * interior.height as usize];
+            crop_zmap_into(&output.zmap, job.read_rect(), interior, &mut cropped_zmap);
+            zmap_writer
+                .write_tile(interior, &cropped_zmap)
+                .map_err(|source| AlgorithmError::Failed {
+                    algorithm: self.algorithm.id().to_string(),
+                    detail: source.to_string(),
+                })?;
+        }
 
         Ok(())
     }

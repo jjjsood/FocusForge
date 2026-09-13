@@ -16,6 +16,7 @@ use serde::Serialize;
 
 mod algorithms;
 mod set;
+mod stack;
 
 /// FocusForge command-line interface.
 #[derive(Parser)]
@@ -50,6 +51,32 @@ enum Command {
         #[command(flatten)]
         set: set::SetArgs,
     },
+    /// Fuse every TIFF frame of a directory into one **project** per
+    /// detected stack, through a registered stacking algorithm. A run
+    /// prepares projects for review; it does not export images -- run
+    /// `focusforge-cli export` for that. `--algo` is not marked required in
+    /// clap's sense even though it is required in practice -- see
+    /// `stack::run`'s doc comment for why.
+    Stack {
+        /// Directory of TIFF frames to fuse (non-recursive, descending into
+        /// `<dir>/frames` when that subdirectory exists).
+        dir: PathBuf,
+        /// Composite output path.
+        #[arg(short = 'o', long = "output")]
+        output: PathBuf,
+        /// Registered stacking algorithm id. Required, but never a clap
+        /// `required` field.
+        #[arg(long)]
+        algo: Option<String>,
+        /// Z-Map output path. Omit to write no Z-Map file for this run.
+        #[arg(long)]
+        zmap: Option<PathBuf>,
+        /// Emit the frozen JSON report instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        set: set::SetArgs,
+    },
 }
 
 fn main() -> ExitCode {
@@ -57,6 +84,14 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Info { path, json } => info(&path, json),
         Command::Algorithms { id, json, set } => algorithms::run(id.as_deref(), json, &set),
+        Command::Stack {
+            dir,
+            output,
+            algo,
+            zmap,
+            json,
+            set,
+        } => stack::run(&dir, &output, algo.as_deref(), zmap.as_deref(), json, &set),
     }
 }
 
@@ -234,7 +269,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
 
 /// Base description: byte order and `RowsPerStrip`, the two fields the
 /// frozen sentence always names.
-fn describe_layout(h: &TiffHeader) -> String {
+pub(crate) fn describe_layout(h: &TiffHeader) -> String {
     format!("{}/rps={}", byte_order_str(h.byte_order), h.rows_per_strip)
 }
 
@@ -244,7 +279,7 @@ fn describe_layout(h: &TiffHeader) -> String {
 /// not). Without this, two members that disagree only on, say,
 /// `Compression` render an identical-looking base string on both sides of
 /// "is X, others X".
-fn describe_layout_diff(h: &TiffHeader, other: &TiffHeader) -> String {
+pub(crate) fn describe_layout_diff(h: &TiffHeader, other: &TiffHeader) -> String {
     let mut s = describe_layout(h);
     if h.compression != other.compression {
         s.push_str(&format!("/compression={}", h.compression));
@@ -275,7 +310,7 @@ fn describe_layout_diff(h: &TiffHeader, other: &TiffHeader) -> String {
 /// which is what makes the two required fixture cases (one outlier among a
 /// majority, either direction) name the same outlier a human would point
 /// at.
-fn uniform_check(headers: &[(&str, &TiffHeader)]) -> (bool, Option<String>) {
+pub(crate) fn uniform_check(headers: &[(&str, &TiffHeader)]) -> (bool, Option<String>) {
     type Signature = (u32, u32, Vec<u16>, u32, ByteOrder, u32, u16, u16, u16);
     fn signature(h: &TiffHeader) -> Signature {
         (

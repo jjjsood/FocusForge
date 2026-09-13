@@ -75,7 +75,7 @@ fn run_fusion(
         algo,
         values,
         &composite_path,
-        &zmap_path,
+        Some(&zmap_path),
         FusionGeometry {
             width,
             height,
