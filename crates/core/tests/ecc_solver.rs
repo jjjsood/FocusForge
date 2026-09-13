@@ -36,6 +36,20 @@ fn full_rect(width: u32, height: u32) -> Rect {
     }
 }
 
+/// Opens `fixtures/mantis-512` and reads frame 3's full tile -- the setup
+/// every ground-truth test in this file shares (see the module docs: frame 3
+/// is the only frame registered against itself, since it is the only
+/// configuration where the "known" transform is actually known).
+fn frame_3_tile() -> (Tile, u32, u32) {
+    let stack = open_fixture();
+    let (width, height) = stack.dimensions();
+    let rect = full_rect(width, height);
+    let tile = stack
+        .read_tile(FRAME_3, rect)
+        .expect("reading frame 3's tile");
+    (tile, width, height)
+}
+
 /// Reduces a chunky RGB [`Tile`] to a single-channel luminance [`Plane`],
 /// [`luma`] sample-for-sample -- the same reduction
 /// `crate::align::pyramid::LumaAssembler` performs, done directly here
@@ -147,12 +161,8 @@ const ROTATION_SCALE_TOLERANCE_PX: f64 = 1e-3;
 
 #[test]
 fn recovers_known_translation() {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
+    let (tile, width, height) = frame_3_tile();
     let rect = full_rect(width, height);
-    let tile = stack
-        .read_tile(FRAME_3, rect)
-        .expect("reading frame 3's tile");
 
     let moving_plane = luma_plane(&tile, width, height);
 
@@ -183,12 +193,8 @@ fn recovers_known_translation() {
 
 #[test]
 fn recovers_known_rotation_and_scale() {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
+    let (tile, width, height) = frame_3_tile();
     let rect = full_rect(width, height);
-    let tile = stack
-        .read_tile(FRAME_3, rect)
-        .expect("reading frame 3's tile");
 
     let moving_plane = luma_plane(&tile, width, height);
 
@@ -225,12 +231,7 @@ fn recovers_known_rotation_and_scale() {
 
 #[test]
 fn identity_converges_immediately() {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
-    let rect = full_rect(width, height);
-    let tile = stack
-        .read_tile(FRAME_3, rect)
-        .expect("reading frame 3's tile");
+    let (tile, width, height) = frame_3_tile();
     let plane = luma_plane(&tile, width, height);
     let region = default_region();
 
@@ -259,12 +260,7 @@ fn identity_converges_immediately() {
 
 #[test]
 fn photometric_gain_and_bias_do_not_move_the_estimate() {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
-    let rect = full_rect(width, height);
-    let tile = stack
-        .read_tile(FRAME_3, rect)
-        .expect("reading frame 3's tile");
+    let (tile, width, height) = frame_3_tile();
     let template_plane = luma_plane(&tile, width, height);
     let region = default_region();
     let params = default_params();
@@ -313,12 +309,8 @@ fn photometric_gain_and_bias_do_not_move_the_estimate() {
 
 #[test]
 fn rotation_converges_quadratically() {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
+    let (tile, width, height) = frame_3_tile();
     let rect = full_rect(width, height);
-    let tile = stack
-        .read_tile(FRAME_3, rect)
-        .expect("reading frame 3's tile");
     let moving_plane = luma_plane(&tile, width, height);
 
     // A smaller, well-inset region: a 20 degree rotation's corner
@@ -404,12 +396,7 @@ fn rotation_converges_quadratically() {
 
 #[test]
 fn hopeless_input_reports_failure() {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
-    let rect = full_rect(width, height);
-    let tile = stack
-        .read_tile(FRAME_3, rect)
-        .expect("reading frame 3's tile");
+    let (tile, width, height) = frame_3_tile();
     let template_plane = luma_plane(&tile, width, height);
 
     let mut rng = XorShift32(0x5EED_1234);
@@ -438,12 +425,8 @@ fn hopeless_input_reports_failure() {
 
 #[test]
 fn iteration_cap_is_honored() {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
+    let (tile, width, height) = frame_3_tile();
     let rect = full_rect(width, height);
-    let tile = stack
-        .read_tile(FRAME_3, rect)
-        .expect("reading frame 3's tile");
     let moving_plane = luma_plane(&tile, width, height);
 
     let w_true = Transform::translation(15.0, 15.0);
@@ -473,12 +456,8 @@ fn iteration_cap_is_honored() {
 
 #[test]
 fn result_reports_iterations_and_error() {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
+    let (tile, width, height) = frame_3_tile();
     let rect = full_rect(width, height);
-    let tile = stack
-        .read_tile(FRAME_3, rect)
-        .expect("reading frame 3's tile");
     let moving_plane = luma_plane(&tile, width, height);
 
     let w_true = Transform::translation(3.0, 2.0);
@@ -520,12 +499,8 @@ const SWEEP_MAX_PX: u32 = 100;
 
 #[test]
 fn capture_range_is_measured() {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
+    let (tile, width, height) = frame_3_tile();
     let rect = full_rect(width, height);
-    let tile = stack
-        .read_tile(FRAME_3, rect)
-        .expect("reading frame 3's tile");
     let moving_plane = luma_plane(&tile, width, height);
     let region = default_region();
     let params = default_params();
