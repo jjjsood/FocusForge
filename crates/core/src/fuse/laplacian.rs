@@ -48,7 +48,8 @@
 //! `crate::fuse::pyramid::MEASURED_MARGIN[levels]` directly: the planner
 //! rounds the raw table up to the `2^levels` decimation grid, and that
 //! rounded value is what the tile geometry actually guarantees. See
-//! `score_radius` (private to this module) for the implementation and
+//! `score_radius` (`pub(crate)`, so the Depth Map can derive the same
+//! radii) for the implementation and
 //! `tests::selection_reach_fits_the_measured_margin` for the inequality
 //! pinned at every level count `1..=MAX_LEVELS`.
 //!
