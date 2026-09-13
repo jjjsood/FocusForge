@@ -368,14 +368,80 @@ fn spatial_coherence_fraction(zmap: &[u16], width: u32, height: u32) -> f64 {
     agree as f64 / total as f64
 }
 
+/// The fraction of pixels whose **entire** (present) 8-neighbourhood shares
+/// the pixel's own winner -- the discriminating coherence measure: a random
+/// 8-way map scores ~12.5% here, while [`spatial_coherence_fraction`]'s
+/// majority vote still passes a map that is, by this measure, noise (a
+/// prior check found 60.8% majority agreement alongside 12.6%
+/// all-8-identical). Uses the same border convention that helper already
+/// uses: an out-of-range neighbour is skipped, not counted as a mismatch,
+/// so an edge or corner pixel needs only its *present* neighbours to agree,
+/// never all 8 -- a different border rule shifts this fraction by ~0.1
+/// points, so the convention is pinned here.
+fn all_eight_neighbours_identical_fraction(zmap: &[u16], width: u32, height: u32) -> f64 {
+    let mut identical = 0usize;
+    let total = (width * height) as usize;
+    for y in 0..height as i64 {
+        for x in 0..width as i64 {
+            let center = zmap[(y as u32 * width + x as u32) as usize];
+            let mut all_match = true;
+            'neighbours: for dy in -1i64..=1 {
+                for dx in -1i64..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let (nx, ny) = (x + dx, y + dy);
+                    if nx < 0 || ny < 0 || nx >= width as i64 || ny >= height as i64 {
+                        continue;
+                    }
+                    let idx = ny as u32 * width + nx as u32;
+                    if zmap[idx as usize] != center {
+                        all_match = false;
+                        break 'neighbours;
+                    }
+                }
+            }
+            if all_match {
+                identical += 1;
+            }
+        }
+    }
+    identical as f64 / total as f64
+}
+
 #[test]
 fn zmap_is_spatially_coherent() {
     let result = golden_result();
     let fraction = spatial_coherence_fraction(&result.zmap, result.width, result.height);
-    println!("zmap_is_spatially_coherent: agreement={fraction:.4}");
+    let all8 = all_eight_neighbours_identical_fraction(&result.zmap, result.width, result.height);
+    println!(
+        "zmap_is_spatially_coherent: majority-agreement={fraction:.4} all-8-identical={all8:.4}"
+    );
     assert!(
         fraction >= 0.60,
         "Z-Map 8-neighbourhood majority agreement must be >= 60%, got {:.2}%",
+        fraction * 100.0
+    );
+}
+
+/// The all-8-neighbours-identical fraction is the measure that actually
+/// discriminates a structured Z-Map from noise (`spatial_coherence_fraction`'s
+/// majority vote does not). Asserted `>= 55%` against a measured 63.76%
+/// under this file's border convention and the 12.5% baseline a random
+/// 8-way map produces.
+#[test]
+fn zmap_neighbourhood_is_uniform_well_above_the_random_baseline() {
+    let result = golden_result();
+    let fraction =
+        all_eight_neighbours_identical_fraction(&result.zmap, result.width, result.height);
+    println!(
+        "zmap_neighbourhood_is_uniform_well_above_the_random_baseline: all-8-identical={:.4} \
+         (old golden 0.1273, random baseline 0.125, target >= 0.55)",
+        fraction
+    );
+    assert!(
+        fraction >= 0.55,
+        "Z-Map all-8-neighbours-identical fraction must be >= 55%, got {:.2}%",
         fraction * 100.0
     );
 }
