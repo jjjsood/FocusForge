@@ -446,17 +446,12 @@ fn zmap_neighbourhood_is_uniform_well_above_the_random_baseline() {
     );
 }
 
-/// The composite seam is not boundable: every
-/// level's selection cone sits inside the 96 px margin (70 px at level 0,
-/// worst case 78 px at level 4), so the Z-Map is exactly equal between the
-/// tiled (448/5) and single-tile (704/5) runs -- asserted below. A
-/// composite pixel additionally passes through `collapse`, extending its
-/// worst-case dependency to 78 + 62 = 140 px, outside the margin; a
-/// discrete selection flip there is a full-magnitude difference that no
-/// margin bounds, so the composite's maximum difference is computed and
-/// printed, never asserted against a threshold. See
-/// `crate::fuse::laplacian`'s "Tiling and the composite seam" rustdoc for
-/// the cone arithmetic.
+/// The Z-Map is exactly equal between the tiled (448/5) and single-tile
+/// (704/5) runs: every level's selection cone (at most 78 px) sits inside the
+/// 96 px margin. The composite is not boundable: `collapse` extends a pixel's
+/// dependency to 140 px, outside the margin, where a selection flip is a
+/// full-magnitude difference, so its maximum difference is only printed. Cone
+/// arithmetic: `crate::fuse::laplacian`'s "Tiling and the composite seam".
 #[test]
 fn tiled_zmap_is_exact_and_composite_seam_difference_is_recorded() {
     let tiled = golden_result();
@@ -495,15 +490,11 @@ fn ragged_tiling_zmap_is_exact_and_composite_difference_is_recorded() {
         .map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs())
         .max()
         .unwrap_or(0);
-    // Recorded, not bounded -- the same rule the 448/5 seam test follows,
-    // for the same reason: the composite seam is not boundable. The
-    // observed value here is 0, which is luck rather than a guarantee.
-    // No near-tie happens to fall in this fixture's 96..125 px divergence
-    // band at the ragged 480/5 geometry; a different stack, or the same
-    // stack once aligned, may put one there and shift a composite sample
-    // by a full coefficient. A non-zero number appearing here later is
-    // the predicted behaviour, not a regression, so it must not be able
-    // to fail this test.
+    // Recorded, not bounded, like the 448/5 seam test. The observed 0 is luck:
+    // no near-tie falls in this fixture's 96..140 px band at the ragged 480/5
+    // geometry, but another stack may put one there and shift a composite
+    // sample by a full coefficient. A non-zero value is predicted behaviour,
+    // not a regression, so it must not fail this test.
     //
     // What still guards the ragged path is the Z-Map equality asserted
     // above: selection is inside the margin and therefore exact, so a real

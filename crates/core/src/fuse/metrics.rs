@@ -6,8 +6,8 @@
 //! takes, so a synthetic test buffer, a fixture frame and a fused tile are
 //! all callable with no conversion.
 //!
-//! **Definitions, pinned because they decide the calibration numbers the
-//! floors below are stated against** (`crates/core/tests/laplacian_fusion.rs`'s
+//! **Definitions, pinned because they decide the calibration floors tests
+//! are stated against** (`crates/core/tests/laplacian_fusion.rs`'s
 //! `metrics_reproduce_the_measured_baselines`):
 //!
 //! - [`luma`]: the arithmetic mean of a pixel's samples, in `f64` -- for
@@ -77,18 +77,11 @@ fn population_variance(values: &[f64]) -> f64 {
 /// flips) necessarily removes that part along with them -- a drop here is
 /// not automatically a loss of real sharpness.
 ///
-/// Widening the selection window drops the fused composite's Laplacian
-/// variance by 15.8%; the drop is expected and explained by this
-/// effect, not a defect. **A drop at a Z-Map de-speckling
-/// change is expected; a drop at some later, unrelated change is not, and
-/// the two must not be confused** -- the independent signal that tells
-/// them apart is block-mean SSIM and PSNR against a reference: both moved
-/// *up*, slightly, at every de-speckling candidate measured (0.7758 ->
-/// up to 0.7762, 18.1053 dB -> up to 18.1109 dB), which is the direction
-/// real detail loss would not move them. This
-/// function has no way to separate "speckle" from "detail" itself -- it is
-/// the project's only automated sharpness number, and that separation needs
-/// the similarity metrics beside it, or a human review of the composite.
+/// **A drop at a Z-Map de-speckling change is expected; a drop at some later, unrelated change
+/// is not, and the two must not be confused** -- the independent signal is block-mean SSIM and
+/// PSNR against a reference, which move up (never down) at a genuine de-speckling change. This
+/// is the project's only automated sharpness number and cannot separate "speckle" from "detail"
+/// itself; that needs the similarity metrics beside it, or a human review of the composite.
 pub fn laplacian_variance(samples: &[u16], width: u32, height: u32, spp: u32) -> f64 {
     if width < 3 || height < 3 {
         return 0.0;
