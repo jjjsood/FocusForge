@@ -9,8 +9,31 @@
 
 use std::process::Command;
 
+use focusforge_core::registry;
+
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+}
+
+/// All three real algorithms (`laplacian`, `weighted-average`,
+/// `depth-map`) reach the CLI with no id named in CLI source -- the test
+/// names no id itself, iterating `registry::algorithms()` instead.
+#[test]
+fn lists_every_registered_algorithm() {
+    let output = bin()
+        .arg("algorithms")
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for entry in registry::algorithms() {
+        assert!(
+            stdout.contains(entry.id()),
+            "expected registered id {:?} in `algorithms` output: {stdout}",
+            entry.id()
+        );
+    }
 }
 
 #[test]

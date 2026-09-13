@@ -13,10 +13,13 @@
 //! a GPU twin can be authored from it alone.
 
 pub mod consumer;
+pub mod depth_map;
 mod error;
 pub mod laplacian;
 pub mod metrics;
 pub mod pyramid;
+mod sharpness;
+pub mod weighted_average;
 
 pub use consumer::{FusionConsumer, FusionGeometry};
 pub use error::PyramidError;

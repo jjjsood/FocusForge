@@ -267,7 +267,14 @@ pub(crate) fn score_radius(levels: u32, level: u32) -> u32 {
 /// result. `O(radius)` per pixel, not `O(radius^2)`: at `radius = 8` this is
 /// 68 adds per pixel (three-channel) rather than the nested form's 867. One
 /// `f32` per pixel, never per sample.
-fn score_plane(level: &Plane, radius: u32) -> Vec<f32> {
+///
+/// `pub(crate)`, widened from module-private once it gained a second
+/// caller: `crate::fuse::weighted_average` and `crate::fuse::depth_map`
+/// both call this exact function (at their own radii) rather than
+/// reimplementing a second windowed sum, which is what makes all three
+/// algorithms comparable on the same fixture with the same sharpness
+/// measure.
+pub(crate) fn score_plane(level: &Plane, radius: u32) -> Vec<f32> {
     let width = level.width();
     let height = level.height();
     let spp = level.samples_per_pixel();
