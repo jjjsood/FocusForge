@@ -22,19 +22,18 @@
 //! machine's cores idle even though it has the memory to keep them busy.
 //!
 //! ```text
-//! padded             = tile_size + 2 * margin_for_levels(levels)
-//! bytes_per_tile_set = frames * padded^2 * samples_per_pixel * 2 B
+//! bytes_per_tile_set = frames * tile_size^2 * samples_per_pixel * 2 B
 //! in_flight = clamp(max_bytes_in_flight / bytes_per_tile_set, 1, available_parallelism)
 //! ```
 //!
-//! The `padded` term is load-bearing, not a detail: the scheduler reads
-//! and holds `PlannedTile::read()` rects, which carry the pyramid margin
-//! on every side. Budgeting on the bare `tile_size` undercounts by
-//! `(padded / tile_size)^2`, which is 1.89x at the default geometry and
-//! 4x at 7 levels, so a "1 GiB" budget would permit 1.86 GiB.
+//! `tile_size` is the outer size: `TilePlan` cuts the interior down by
+//! `2 * margin` and then reads it back with `margin` on every side, so a
+//! read rect is `tile_size` and never more. Adding a margin term here
+//! counts the same margin twice and over-reserves by 1.89x against the
+//! real partition.
 //!
-//! Worked example: 61 frames * 704^2 * 3 samples * 2 B/sample is
-//! ~173 MiB per tile set, so a 1 GiB budget bounds `in_flight` to a small,
+//! Worked example: 61 frames * 512^2 * 3 samples * 2 B/sample is
+//! ~91.5 MiB per tile set, so a 1 GiB budget bounds `in_flight` to a small,
 //! fixed number of simultaneously-live frame-tile sets regardless of
 //! whether the host reports 4 cores or 128 -- `ThreadPool::install` blocks
 //! the calling thread without making it a worker, so live tile sets are
@@ -118,29 +117,22 @@ pub struct TileRunReport {
     pub peak_in_flight: usize,
 }
 
-/// `bytes_per_tile_set` for `frame_count` frames at `samples_per_pixel`
-/// samples, `u16` (2 bytes) each.
+/// `bytes_per_tile_set` for `frame_count` frames of `tile_size x tile_size`
+/// read rects at `samples_per_pixel` samples, `u16` (2 bytes) each.
 ///
-/// Sized on the **padded** read rect (`tile_size + 2 * margin` per side),
-/// not on the interior `tile_size`. This is what the scheduler actually
-/// allocates: `run` sizes every frame buffer from `PlannedTile::read()`,
-/// which carries the pyramid margin, so a budget computed from the
-/// interior would undercount real memory by `(padded / interior)^2` --
-/// 1.89x at the default 512 px tile with 5 levels, 4x at 7 levels. The
-/// undercount grows with `levels`, which is exactly where the budget has
-/// to stay honest if the level count is ever raised.
+/// `tile_size` is the **outer** size, and that is the whole subtlety here.
+/// [`TilePlan::new`] derives `raw_interior = tile_size - 2 * margin`, then
+/// gives each tile a read rect of `interior + margin` on every side -- so
+/// the read rect reconstitutes `tile_size` and never exceeds it. A margin
+/// term added here would be counting the same margin twice.
 ///
-/// Interior tiles are the worst case: an edge tile's read rect is clamped
-/// to the frame and is therefore smaller, so this is an upper bound rather
-/// than an average -- the right shape for a budget.
-fn bytes_per_tile_set(
-    frame_count: usize,
-    tile_size: u32,
-    margin: u32,
-    samples_per_pixel: u32,
-) -> u64 {
-    let padded = tile_size as u64 + 2 * margin as u64;
-    frame_count as u64 * padded * padded * samples_per_pixel as u64 * 2
+/// Measured over the reference partition (8192x5464, tile 512, 5 levels:
+/// 442 tiles, interior stride 320) the largest read rect is exactly
+/// 512x512. Ragged strides absorbed into a previous stride are always
+/// terminal, so they are clamped at the frame edge and come out smaller,
+/// not larger.
+fn bytes_per_tile_set(frame_count: usize, tile_size: u32, samples_per_pixel: u32) -> u64 {
+    frame_count as u64 * tile_size as u64 * tile_size as u64 * samples_per_pixel as u64 * 2
 }
 
 /// The pure arithmetic behind the budget: how many tile sets can be live at
@@ -190,12 +182,7 @@ impl<'a> TileScheduler<'a> {
         let available_parallelism = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let bytes = bytes_per_tile_set(
-            stack.frame_count,
-            options.tile_size,
-            plan.margin(),
-            samples_per_pixel,
-        );
+        let bytes = bytes_per_tile_set(stack.frame_count, options.tile_size, samples_per_pixel);
         let in_flight =
             in_flight_for_budget(bytes, options.max_bytes_in_flight, available_parallelism);
 
@@ -340,7 +327,6 @@ impl<'a> TileScheduler<'a> {
 mod tests {
     use super::*;
     use crate::io::TiffStack;
-    use crate::tile::plan::margin_for_levels;
 
     fn _assert_send_sync<T: Send + Sync>() {}
 
@@ -352,23 +338,19 @@ mod tests {
 
     #[test]
     fn budget_arithmetic_at_the_reference_scale() {
-        // 61 frames, 3 samples/pixel, u16, at the phase default geometry:
-        // a 512 px interior tile with 5 levels, whose measured margin is
-        // 96 px, so the read rect is 704x704 and one tile set is ~173 MiB.
-        let bytes = bytes_per_tile_set(61, 512, margin_for_levels(5), 3);
-        assert_eq!(bytes, 181_395_456);
-        // A 1 GiB budget divided by ~173 MiB per tile set floors to 5.
-        // Budgeting on the interior 512 px instead would have said 11 --
-        // and 11 live padded tile sets are 1.86 GiB, not the 1 GiB the
-        // budget promises. The interior figure was the bug; 5 is the
-        // number that keeps `max_bytes_in_flight` a real ceiling.
+        // 61 frames, 512x512 read rects, 3 samples/pixel, u16.
+        let bytes = bytes_per_tile_set(61, 512, 3);
+        assert_eq!(bytes, 95_944_704);
+        // A 1 GiB budget divided by ~91.5 MiB per tile set floors to 11,
+        // and 11 live tile sets are 0.98 GiB -- just under the budget,
+        // which is what a budget is supposed to do.
         let in_flight = in_flight_for_budget(bytes, 1 << 30, 32);
-        assert_eq!(in_flight, 5);
+        assert_eq!(in_flight, 11);
     }
 
     #[test]
     fn budget_below_one_tile_set_floors_at_one_never_zero() {
-        let bytes = bytes_per_tile_set(61, 512, margin_for_levels(5), 3);
+        let bytes = bytes_per_tile_set(61, 512, 3);
         let in_flight = in_flight_for_budget(bytes, 1, 32);
         assert_eq!(in_flight, 1);
     }
@@ -377,7 +359,7 @@ mod tests {
     fn in_flight_never_exceeds_available_parallelism() {
         // A tiny tile set (so the budget alone would allow hundreds live)
         // must still be capped by the host's reported parallelism.
-        let bytes = bytes_per_tile_set(1, 4, 0, 1);
+        let bytes = bytes_per_tile_set(1, 4, 1);
         let in_flight = in_flight_for_budget(bytes, usize::MAX, 4);
         assert_eq!(in_flight, 4);
     }

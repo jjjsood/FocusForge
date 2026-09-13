@@ -125,10 +125,16 @@ fn peak_live_heap_stays_under_ceiling() {
     // a `FusionConsumer` builds per-worker Laplacian pyramids on top of
     // the scheduler's frame-tile buffers, where the old `NoAllocConsumer`
     // added nothing -- NOT because the test was failing and the number
-    // was in the way. The discrimination the test exists for is intact
-    // and asserted just below: 5 MiB is still far under the 12 MiB a
-    // load-every-frame implementation would need, so a full-load
-    // regression still fails this test loudly.
+    // was in the way. That is the whole of it: a first diagnosis blamed
+    // the budget formula instead and was wrong, because `tile_size` is
+    // already the outer size. The consumer's pyramids are the real
+    // reason, and they are why this ceiling stays raised while the
+    // formula went back.
+    //
+    // The discrimination the test exists for is intact and asserted just
+    // below: 5 MiB is still far under the 12 MiB a load-every-frame
+    // implementation would need, so a full-load regression still fails
+    // this test loudly.
     const CEILING: usize = 5 * 1024 * 1024;
     assert!(
         (CEILING as u64) < full_load_bytes,
@@ -141,12 +147,7 @@ fn peak_live_heap_stays_under_ceiling() {
     let options = TileSchedulerOptions {
         tile_size: 128,
         levels: 2,
-        // 3 MiB, not 2: `bytes_per_tile_set` is sized on the padded read
-        // rect (128 + 2 * 12 = 152 px at 2 levels), so one tile set is
-        // ~1.06 MiB and a 2 MiB budget would now floor to a single
-        // in-flight set. Keeping two in flight is the point -- this test
-        // measures peak memory under real concurrency, not in isolation.
-        max_bytes_in_flight: 3 * 1024 * 1024,
+        max_bytes_in_flight: 2 * 1024 * 1024,
         scratch_base,
     };
     let stack_ctx = StackContext::new(frame_count, width, height);
@@ -155,7 +156,7 @@ fn peak_live_heap_stays_under_ceiling() {
     assert_eq!(
         scheduler.in_flight_limit(),
         2,
-        "a 3 MiB budget at this padded tile size must floor to 2 in-flight tile sets"
+        "a 2 MiB budget at this tile size must floor to 2 in-flight tile sets"
     );
 
     // A real fusion consumer, not the pass-through `NoAllocConsumer`, so
@@ -252,14 +253,7 @@ fn in_flight_tiles_respect_the_budget() {
     let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let (width, height) = stack.dimensions();
     let frame_count = stack.len();
-    // The padded read rect, not the 128 px interior: at 2 levels the
-    // measured margin is 12 px, so the scheduler reads and holds
-    // 152x152 tiles and budgets on that. Deriving the budget here from
-    // the interior would ask for a number the scheduler no longer uses,
-    // and every `in_flight_limit` expectation below would be off by the
-    // same 1.41x factor.
-    const PADDED: u64 = 128 + 2 * 12;
-    let bytes_per_tile_set = frame_count as u64 * PADDED * PADDED * 3 * 2;
+    let bytes_per_tile_set = frame_count as u64 * 128 * 128 * 3 * 2;
 
     for &target in &[1usize, 2, 4] {
         if target > available {
