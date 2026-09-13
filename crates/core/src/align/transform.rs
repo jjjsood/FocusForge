@@ -288,26 +288,9 @@ pub enum SourceFootprint {
 mod tests {
     use super::*;
 
-    fn translation(tx: f64, ty: f64) -> Transform {
-        Transform {
-            m: [[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]],
-        }
-    }
-
-    fn rotation_scale(scale: f64, radians: f64) -> Transform {
-        let (s, c) = radians.sin_cos();
-        Transform {
-            m: [
-                [scale * c, -scale * s, 0.0],
-                [scale * s, scale * c, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-        }
-    }
-
     #[test]
     fn identity_is_multiplicative_identity() {
-        let t = translation(3.0, -2.0);
+        let t = Transform::translation(3.0, -2.0);
         assert_eq!(t.compose(&Transform::identity()), t);
         assert_eq!(Transform::identity().compose(&t), t);
     }
@@ -317,8 +300,8 @@ mod tests {
         // Translate then scale: scaling a point translated by (1, 0) by 2
         // moves the origin to (2, 0), not (1, 0) -- proving `other` is
         // applied before `self`.
-        let scale = rotation_scale(2.0, 0.0);
-        let shift = translation(1.0, 0.0);
+        let scale = Transform::similarity(2.0, 0.0, 0.0, 0.0);
+        let shift = Transform::translation(1.0, 0.0);
         let composed = scale.compose(&shift);
         let point = [0.0, 0.0, 1.0];
         let mapped = apply(&composed, point);
@@ -327,9 +310,9 @@ mod tests {
 
     #[test]
     fn composition_is_associative_within_tolerance() {
-        let a = translation(1.0, 2.0);
-        let b = rotation_scale(1.5, 0.3);
-        let c = translation(-4.0, 0.5);
+        let a = Transform::translation(1.0, 2.0);
+        let b = Transform::similarity(1.5, 0.3, 0.0, 0.0);
+        let c = Transform::translation(-4.0, 0.5);
 
         let left = a.compose(&b).compose(&c);
         let right = a.compose(&b.compose(&c));
