@@ -19,7 +19,7 @@ rho = ECC correlation in [-1, 1], not a pixel distance
 ...
 03.tif    tx=+0.00 ty=+0.00 scale=1.000000 rot=+0.0000deg  converged iters=0 rho=1.0000 (reference)
 ...
-auto-crop: 31,40 422x424
+auto-crop: 18,22 476x468
 ```
 
 Every other frame registers against one reference frame (the middle frame of

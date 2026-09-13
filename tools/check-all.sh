@@ -111,9 +111,19 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   # cargo command -- see the header.
   run_logged_bg "fixture e2e" tools/fixture-e2e.sh
 
+  # Foreground and BEFORE `cargo test`, never a background stage: `cargo
+  # test` reads what this writes (.scratch/synth-align/measurement.json), so
+  # a background stage joined at the end would race the test into skipping.
+  run_gate "synthetic alignment truth" tools/synth-align.sh
+
   # --- remaining gates --------------------------------------------------
   run_gate "clippy"         cargo clippy --workspace --all-targets --all-features -- -D warnings
-  run_gate "cargo test"     cargo test --workspace
+
+  # FF_REQUIRE_SYNTH_ALIGN=1 turns the test's skip into a failure when the
+  # artefact exists: a skip inside the gate must read as a bug, not a pass.
+  REQUIRE_SYNTH=0
+  [ -f .scratch/synth-align/measurement.json ] && REQUIRE_SYNTH=1
+  run_gate "cargo test"     env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" cargo test --workspace
   run_gate "rustdoc"        env RUSTDOCFLAGS="-D warnings" \
                               cargo doc --workspace --no-deps --document-private-items
   # Separate from `licenses` on purpose: an advisory is a fact about the world

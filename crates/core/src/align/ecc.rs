@@ -166,11 +166,16 @@
 //! seen**, never the last one tried, so a caller that ignores `status`
 //! still gets the least-wrong answer.
 //!
-//! Sample arithmetic is `f32`; every accumulation (means, dot products, `C`,
-//! reproducible run to run, matching `crate::fuse::pyramid`; speed is not
-//! addressed here.
-//! reproducible run to run, matching `crate::fuse::pyramid`; speed is not
-//! addressed here.
+//! ### What hitting the cap costs (measured, not assumed)
+//!
+//! The shipped default, `max-iterations = 400`, converges all 61
+//! reference frames -- none hits the cap, the slowest needing 332
+//! iterations -- for `+31 s` on a `182 s` alignment pass (`+17%`).
+//!
+//! Sample arithmetic is `f32`; every accumulation (means, dot products,
+//! `C`, `Ḡ^t ·`) and the normal-equation solve are `f64`. The loop is
+//! serial, not rayon: `f64` summation order is what makes a recovered
+//! transform reproducible run to run, matching `crate::fuse::pyramid`.
 
 use crate::align::error::AlignError;
 use crate::align::transform::Transform;
@@ -252,6 +257,11 @@ pub struct EccResult {
     pub correlation: f64,
     pub valid_samples: usize,
     pub valid_fraction: f64,
+    /// The step measure of the iteration that ended the run -- exactly the
+    /// value compared against [`EccParams::epsilon_px`]. `None` when no
+    /// iteration ever reached that comparison (the pre-loop singular return,
+    /// or a divergence on the very first iteration).
+    pub final_step: Option<f64>,
 }
 
 /// The relative pivot threshold [`solve_linear`] treats as singular: a
@@ -424,6 +434,55 @@ pub fn solve_level(
     mode: EccMode,
     params: &EccParams,
 ) -> Result<EccResult, AlignError> {
+    solve_level_dispatch(template, region, moving, initial, mode, params, None)
+}
+
+/// One recorded iteration of [`solve_level_traced`], in that level's own
+/// pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EccIteration {
+    /// 1-based, so the last entry's `iteration` equals
+    /// [`EccResult::iterations`].
+    pub iteration: u32,
+    /// The step measure this iteration produced -- the quantity compared
+    /// against [`EccParams::epsilon_px`].
+    pub step: f64,
+    /// ρ as of this iteration, before its update was applied.
+    pub correlation: f64,
+    pub valid_fraction: f64,
+}
+
+/// [`solve_level`], plus a per-iteration trace of the step measure and ρ,
+/// appended to `trace` -- never cleared, so a caller that wants one trace per
+/// call passes a fresh `Vec`. `trace.len() == result.iterations` holds on
+/// every exit path, including divergence, because the push below sits at the
+/// exact point the step measure is computed, before `iterations_done` is
+/// incremented on that same iteration.
+pub fn solve_level_traced(
+    template: &Plane,
+    region: Rect,
+    moving: &Plane,
+    initial: &Transform,
+    mode: EccMode,
+    params: &EccParams,
+    trace: &mut Vec<EccIteration>,
+) -> Result<EccResult, AlignError> {
+    solve_level_dispatch(template, region, moving, initial, mode, params, Some(trace))
+}
+
+/// The validation and mode dispatch shared by [`solve_level`] and
+/// [`solve_level_traced`]. `trace` is `None` on the plain path, so tracing
+/// costs the untraced caller no allocation and no branch of real work beyond
+/// one `Option` check per iteration inside [`solve_level_generic`].
+fn solve_level_dispatch(
+    template: &Plane,
+    region: Rect,
+    moving: &Plane,
+    initial: &Transform,
+    mode: EccMode,
+    params: &EccParams,
+    trace: Option<&mut Vec<EccIteration>>,
+) -> Result<EccResult, AlignError> {
     if params.max_iterations == 0 {
         return Err(AlignError::InvalidParams {
             detail: "max_iterations must be at least 1".to_string(),
@@ -479,6 +538,7 @@ pub fn solve_level(
             params,
             |gx, gy, _x, _y| [f64::from(gx), f64::from(gy)],
             |dp: &[f64; 2]| Transform::translation(dp[0], dp[1]),
+            trace,
         ),
         EccMode::Similarity => {
             // The Jacobian's `x, y` are centred on `region`'s own centre,
@@ -499,6 +559,7 @@ pub fn solve_level(
                 params,
                 move |gx, gy, x, y| similarity_jacobian_row(gx, gy, x, y, cx, cy),
                 move |dp: &[f64; 4]| similarity_delta(dp, cx, cy),
+                trace,
             )
         }
     }
@@ -589,6 +650,7 @@ fn solve_level_generic<const K: usize>(
     params: &EccParams,
     jacobian_row: impl Fn(f32, f32, f64, f64) -> [f64; K],
     build_delta: impl Fn(&[f64; K]) -> Transform,
+    mut trace: Option<&mut Vec<EccIteration>>,
 ) -> Result<EccResult, AlignError> {
     let region_pixel_count = region.width as usize * region.height as usize;
 
@@ -648,6 +710,7 @@ fn solve_level_generic<const K: usize>(
             correlation: -1.0,
             valid_samples: 0,
             valid_fraction: 0.0,
+            final_step: None,
         });
     }
 
@@ -657,6 +720,13 @@ fn solve_level_generic<const K: usize>(
     let mut best_correlation = -1.0f64;
     let mut iterations_done = 0u32;
     let mut cached: Option<CachedTemplate<K>> = None;
+    // The step measure of the last iteration that reached the termination
+    // comparison -- `None` until then, so a divergence before any iteration
+    // completes reports no step. Declared here, with the other
+    // iteration-state locals, and not after `macro_rules! diverge` below:
+    // the macro's body resolves locals at its *definition* site, so
+    // `last_step` must already be in scope where `diverge!` is defined.
+    let mut last_step: Option<f64> = None;
 
     macro_rules! diverge {
         ($reason:expr, $valid_samples:expr, $valid_fraction:expr) => {
@@ -667,6 +737,7 @@ fn solve_level_generic<const K: usize>(
                 correlation: best_correlation,
                 valid_samples: $valid_samples,
                 valid_fraction: $valid_fraction,
+                final_step: last_step,
             });
         };
     }
@@ -846,6 +917,15 @@ fn solve_level_generic<const K: usize>(
                 step = d;
             }
         }
+        last_step = Some(step);
+        if let Some(t) = trace.as_deref_mut() {
+            t.push(EccIteration {
+                iteration: iterations_done + 1,
+                step,
+                correlation: rho,
+                valid_fraction,
+            });
+        }
 
         w = new_w;
         iterations_done += 1;
@@ -858,6 +938,7 @@ fn solve_level_generic<const K: usize>(
                 correlation: rho,
                 valid_samples: valid_count,
                 valid_fraction,
+                final_step: Some(step),
             });
         }
 
@@ -869,6 +950,7 @@ fn solve_level_generic<const K: usize>(
                 correlation: rho,
                 valid_samples: valid_count,
                 valid_fraction,
+                final_step: Some(step),
             });
         }
     }
@@ -1044,17 +1126,22 @@ mod tests {
     /// This test converges onto a partial overlap (a 16px translation whose
     /// region maps two of 120 columns outside the moving plane's domain),
     /// so the recompute branch produces the returned, checked result.
-    #[test]
-    fn partial_overlap_recomputes_and_still_recovers() {
-        let (width, height) = (140u32, 40u32);
-        // A smooth, non-periodic-within-domain synthetic texture (a sum of
-        // a few incommensurate sinusoids) rather than i.i.d. noise: pixel
-        // noise gives central differences no spatial coherence to
-        // linearize against, so identity-start Newton steps overshoot and
-        // diverge (observed directly: `Diverged(CorrelationDecreased)`
-        // after 2 iterations with i.i.d. noise here). Real images -- what
-        // every other convergence test in this file and `ecc_solver.rs`
-        // uses -- have that coherence; this reproduces it synthetically.
+    const SINUSOID_WIDTH: u32 = 140;
+    const SINUSOID_HEIGHT: u32 = 40;
+
+    /// A smooth, non-periodic-within-domain synthetic texture (a sum of a
+    /// few incommensurate sinusoids) rather than i.i.d. noise -- pixel noise
+    /// gives central differences no spatial coherence to linearize against,
+    /// so identity-start Newton steps overshoot and diverge (observed
+    /// directly: `Diverged(CorrelationDecreased)` after 2 iterations with
+    /// i.i.d. noise here). Real images -- what every other convergence test
+    /// in this file and `ecc_solver.rs` uses -- have that coherence; this
+    /// reproduces it synthetically. `template` is built by sampling
+    /// `moving` through `w_true`; positions `w_true` maps out of `moving`'s
+    /// domain have no real correspondence and are filled with `0.0`, never
+    /// read by a solve whose region stays where `w_true` keeps it in
+    /// domain.
+    fn sinusoid_pair(width: u32, height: u32, w_true: &Transform) -> (Plane, Plane) {
         let mut moving_data = vec![0.0f32; width as usize * height as usize];
         for y in 0..height {
             for x in 0..width {
@@ -1069,23 +1156,27 @@ mod tests {
         }
         let moving = Plane::from_f32(&moving_data, width, height, 1).unwrap();
 
-        // The ground-truth transform: its region maps two columns past the
-        // moving plane's right edge (see the doc comment above), so
-        // `has_full_overlap` reads false once the solver has nearly
-        // converged to it.
-        let w_true = Transform::translation(16.0, 0.0);
         let mut template_data = vec![0.0f32; width as usize * height as usize];
         for y in 0..height {
             for x in 0..width {
-                // Positions `w_true` maps out of `moving`'s domain have no
-                // real correspondence; those template pixels are never
-                // read (`compute_ir_stats` only sums where the *current*
-                // iteration's mask is `Some`), so any placeholder is fine.
-                let sampled = sample_plane(&moving, &w_true, f64::from(x), f64::from(y));
+                let sampled = sample_plane(&moving, w_true, f64::from(x), f64::from(y));
                 template_data[(y * width + x) as usize] = sampled.unwrap_or(0.0);
             }
         }
         let template = Plane::from_f32(&template_data, width, height, 1).unwrap();
+        (template, moving)
+    }
+
+    #[test]
+    fn partial_overlap_recomputes_and_still_recovers() {
+        let (width, height) = (SINUSOID_WIDTH, SINUSOID_HEIGHT);
+
+        // The ground-truth transform: its region maps two columns past the
+        // moving plane's right edge (see `sinusoid_pair`'s doc comment), so
+        // `has_full_overlap` reads false once the solver has nearly
+        // converged to it.
+        let w_true = Transform::translation(16.0, 0.0);
+        let (template, moving) = sinusoid_pair(width, height, &w_true);
 
         let region = Rect {
             x: 4,
@@ -1162,6 +1253,235 @@ mod tests {
             "corner error {error} px exceeds tolerance -- the partial-overlap \
              recompute branch produced a wrong transform"
         );
+    }
+
+    /// A small `max_iterations` and a translation the solver has not fully
+    /// resolved by then -- deliberately generous overlap (`min_valid_fraction`
+    /// at its usual `0.99`, region well inside the plane for this small a
+    /// translation) so nothing here can diverge; only convergence-vs-cap is
+    /// in play.
+    fn hit_cap_setup() -> (Plane, Plane, Rect, Transform) {
+        let (width, height) = (SINUSOID_WIDTH, SINUSOID_HEIGHT);
+        let w_true = Transform::translation(9.0, 3.0);
+        let (template, moving) = sinusoid_pair(width, height, &w_true);
+        let region = Rect {
+            x: 4,
+            y: 4,
+            width: 120,
+            height: 30,
+        };
+        (template, moving, region, w_true)
+    }
+
+    /// The bracketing check: pins [`EccResult::final_step`] as *the operand
+    /// of the convergence test itself*, not merely a number that looks
+    /// plausible. Only the compared quantity can make all three runs below
+    /// hold simultaneously.
+    #[test]
+    fn hit_cap_reports_its_final_step() {
+        let (template, moving, region, _w_true) = hit_cap_setup();
+        let base_params = EccParams {
+            max_iterations: 2,
+            epsilon_px: 1e-12,
+            min_valid_fraction: 0.99,
+        };
+
+        // Run A: a cap so tight the solver cannot possibly satisfy such a
+        // tiny epsilon by then.
+        let a = solve_level(
+            &template,
+            region,
+            &moving,
+            &Transform::identity(),
+            EccMode::Translation,
+            &base_params,
+        )
+        .expect("valid solver inputs");
+        assert_eq!(a.status, EccStatus::HitCap, "run A: {a:?}");
+        let s = a.final_step.expect("HitCap always reports a final_step");
+        eprintln!("hit_cap_reports_its_final_step: max_iterations=2 final_step={s}");
+
+        // Run B: epsilon just above `s` -- the same inputs must now report
+        // Converged, at the same iteration, with the identical transform.
+        let params_b = EccParams {
+            epsilon_px: s * 1.000_001,
+            ..base_params
+        };
+        let b = solve_level(
+            &template,
+            region,
+            &moving,
+            &Transform::identity(),
+            EccMode::Translation,
+            &params_b,
+        )
+        .expect("valid solver inputs");
+        assert_eq!(b.status, EccStatus::Converged, "run B: {b:?}");
+        assert_eq!(b.iterations, a.iterations, "run B iterations: {b:?}");
+        assert_eq!(
+            b.transform, a.transform,
+            "run B transform must match run A's matrix-entry for matrix-entry"
+        );
+
+        // Run C: epsilon just below `s` -- must still report HitCap.
+        let params_c = EccParams {
+            epsilon_px: s * 0.999_999,
+            ..base_params
+        };
+        let c = solve_level(
+            &template,
+            region,
+            &moving,
+            &Transform::identity(),
+            EccMode::Translation,
+            &params_c,
+        )
+        .expect("valid solver inputs");
+        assert_eq!(c.status, EccStatus::HitCap, "run C: {c:?}");
+    }
+
+    /// `trace.len() == result.iterations` and `trace.last().step ==
+    /// result.final_step` on a converged run, a hit-cap run and a diverged
+    /// run; the pre-loop-singular case reports `final_step == None` with an
+    /// empty trace.
+    #[test]
+    fn the_trace_length_matches_the_iteration_count() {
+        let (template, moving, region, _w_true) = hit_cap_setup();
+
+        let converged_params = EccParams {
+            max_iterations: 50,
+            epsilon_px: 1e-4,
+            min_valid_fraction: 0.99,
+        };
+        let mut trace = Vec::new();
+        let converged = solve_level_traced(
+            &template,
+            region,
+            &moving,
+            &Transform::identity(),
+            EccMode::Translation,
+            &converged_params,
+            &mut trace,
+        )
+        .expect("valid solver inputs");
+        assert_eq!(converged.status, EccStatus::Converged, "{converged:?}");
+        assert_eq!(trace.len() as u32, converged.iterations);
+        assert_eq!(trace.last().map(|i| i.step), converged.final_step);
+        for (n, entry) in trace.iter().enumerate() {
+            assert_eq!(entry.iteration, n as u32 + 1);
+        }
+
+        let hit_cap_params = EccParams {
+            max_iterations: 2,
+            epsilon_px: 1e-12,
+            min_valid_fraction: 0.99,
+        };
+        let mut trace = Vec::new();
+        let hit_cap = solve_level_traced(
+            &template,
+            region,
+            &moving,
+            &Transform::identity(),
+            EccMode::Translation,
+            &hit_cap_params,
+            &mut trace,
+        )
+        .expect("valid solver inputs");
+        assert_eq!(hit_cap.status, EccStatus::HitCap, "{hit_cap:?}");
+        assert_eq!(trace.len() as u32, hit_cap.iterations);
+        assert_eq!(trace.last().map(|i| i.step), hit_cap.final_step);
+
+        // Diverged, past the first iteration: `out_of_domain_samples_are_dropped`'s
+        // own setup (a translation large enough to starve the region below
+        // `min_valid_fraction`) reproduced here rather than reused, since
+        // that test's helper is private to its own function body.
+        let diverge_params = EccParams {
+            max_iterations: 50,
+            epsilon_px: 1e-4,
+            min_valid_fraction: 0.999,
+        };
+        let big_shift = Transform::translation(60.0, 0.0);
+        let mut trace = Vec::new();
+        let diverged = solve_level_traced(
+            &template,
+            region,
+            &moving,
+            &big_shift,
+            EccMode::Translation,
+            &diverge_params,
+            &mut trace,
+        )
+        .expect("valid solver inputs");
+        assert!(
+            matches!(diverged.status, EccStatus::Diverged(_)),
+            "{diverged:?}"
+        );
+        assert_eq!(trace.len() as u32, diverged.iterations, "{diverged:?}");
+        assert_eq!(trace.last().map(|i| i.step), diverged.final_step);
+
+        // The pre-loop singular case: a flat template makes `C` the zero
+        // matrix before any iteration runs.
+        let flat = constant_template(20, 20, 1000.0);
+        let singular_region = Rect {
+            x: 4,
+            y: 4,
+            width: 10,
+            height: 10,
+        };
+        let mut trace = Vec::new();
+        let singular = solve_level_traced(
+            &flat,
+            singular_region,
+            &flat,
+            &Transform::identity(),
+            EccMode::Translation,
+            &converged_params,
+            &mut trace,
+        )
+        .expect("valid solver inputs");
+        assert_eq!(
+            singular.status,
+            EccStatus::Diverged(DivergenceReason::SingularHessian)
+        );
+        assert_eq!(singular.final_step, None);
+        assert!(trace.is_empty());
+    }
+
+    /// Instrumenting the solver changes no result: a traced and an untraced
+    /// solve of the same inputs return an `EccResult` that is `==`, field
+    /// for field, including the transform's matrix entries.
+    #[test]
+    fn tracing_does_not_change_the_result() {
+        let (template, moving, region, _w_true) = hit_cap_setup();
+        let params = EccParams {
+            max_iterations: 6,
+            epsilon_px: 1e-12,
+            min_valid_fraction: 0.99,
+        };
+
+        let untraced = solve_level(
+            &template,
+            region,
+            &moving,
+            &Transform::identity(),
+            EccMode::Translation,
+            &params,
+        )
+        .expect("valid solver inputs");
+
+        let mut trace = Vec::new();
+        let traced = solve_level_traced(
+            &template,
+            region,
+            &moving,
+            &Transform::identity(),
+            EccMode::Translation,
+            &params,
+            &mut trace,
+        )
+        .expect("valid solver inputs");
+
+        assert_eq!(untraced, traced);
     }
 
     /// A deterministic xorshift32 PRNG, seeded with a fixed constant --
