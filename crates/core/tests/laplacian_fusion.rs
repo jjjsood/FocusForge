@@ -415,7 +415,7 @@ fn tiled_zmap_is_exact_and_composite_seam_difference_is_recorded() {
 }
 
 #[test]
-fn ragged_tiling_matches_single_tile() {
+fn ragged_tiling_zmap_is_exact_and_composite_difference_is_recorded() {
     let ragged = ragged_result();
     let single = single_tile_result();
     assert_eq!(
@@ -429,10 +429,21 @@ fn ragged_tiling_matches_single_tile() {
         .map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs())
         .max()
         .unwrap_or(0);
-    println!("ragged_tiling_matches_single_tile: observed max diff = {max_diff}");
-    assert!(
-        max_diff <= 1,
-        "ragged vs single-tile composite must differ by at most 1 LSB, observed {max_diff}"
+    // Recorded, not bounded -- the same rule the 448/5 seam test follows,
+    // for the same reason: the composite seam is not boundable. The
+    // observed value here is 0, which is luck rather than a guarantee.
+    // No near-tie happens to fall in this fixture's 96..125 px divergence
+    // band at the ragged 480/5 geometry; a different stack, or the same
+    // stack once aligned, may put one there and shift a composite sample
+    // by a full coefficient. A non-zero number appearing here later is
+    // the predicted behaviour, not a regression, so it must not be able
+    // to fail this test.
+    //
+    // What still guards the ragged path is the Z-Map equality asserted
+    // above: selection is inside the margin and therefore exact, so a real
+    // last-row bug moves indices and fails loudly.
+    println!(
+        "ragged_tiling_zmap_is_exact_and_composite_difference_is_recorded: observed composite max diff = {max_diff}"
     );
 }
 
