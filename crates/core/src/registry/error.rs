@@ -49,7 +49,10 @@ pub enum LookupError {
     Unknown { id: String, known: Vec<String> },
 
     /// The id resolves, but to an algorithm of the other family.
-    #[error("{id:?} is a {actual} algorithm, not a {wanted} algorithm")]
+    // Phrased without an article on purpose: `actual` and `wanted` are
+    // family names ("stacking", "alignment"), and "a alignment" is what a
+    // naive `a {actual}` produces.
+    #[error("{id:?} belongs to the {actual} family, not the {wanted} family")]
     WrongFamily {
         id: String,
         actual: Family,

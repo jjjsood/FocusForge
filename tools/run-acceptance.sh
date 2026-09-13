@@ -1,32 +1,26 @@
 #!/usr/bin/env bash
-# Usage: tools/run-acceptance.sh
+# Usage: tools/run-acceptance.sh              -- the unlimited run
+#        tools/run-acceptance.sh --limit 8G   -- the same run under an
+#                                                 enforced cgroup v2 memory
+#                                                 ceiling with swap disabled
+#        tools/run-acceptance.sh --inside-scope 8G -- internal re-entry only,
+#                                                 never invoked by hand
 #
 # The acceptance run: the whole 61-frame, 16 GB reference stack through the
-# real CLI, end to end. This is not a gate and never runs in check-all.sh --
-# it takes minutes, and a gate that takes minutes stops being run. It is the
-# manual test that answers the question the fixtures cannot: does the output
-# resemble a correctly focus-stacked image at full size? Compared against
-# Mantis_Stacked.tif, which a different stacker produced, so a loose tolerance:
-# it is a similarity floor, not a target.
+# real CLI, end to end, at full size. This is not a gate and never runs in
+# check-all.sh -- it takes minutes, and a gate that takes minutes stops being
+# run. Two things happen here:
 #
 #   1. `focusforge-cli stack` over a 61-entry symlink farm built from the
-#      source frames (never read directly -- see the glob trap below),
+#      reference stack (never read directly -- see the glob trap below),
 #      producing a composite and a Z-Map under .scratch/acceptance/unlimited/.
 #   2. The identical run again under `systemd-run --user --scope
 #      -p MemoryMax=8G -p MemorySwapMax=0`, producing the same two files
-#      under .scratch/acceptance/limited/. Completing without an OOM kill
-#      is the assertion; memory.peak, memory.swap.peak and the anon/file
-#      split are recorded, never thresholded.
+#      under .scratch/acceptance/limited/. Completing without an OOM kill is
+#      the assertion; memory.peak, memory.swap.peak and the anon/file split
+#      are recorded, never thresholded.
 #
-# Both runs use target/release/focusforge-cli, never target/debug. This
-# diverges from tools/fixture-e2e.sh, which deliberately runs the debug
-# binary so that check-all.sh can run it in the background beside the
-# cargo gates (cargo holds an exclusive lock on target/, so a background
-# cargo command would just queue behind the foreground one). This script
-# is outside the gate entirely, its numbers are a GPU-speedup baseline,
-# and the workspace Cargo.toml has no [profile.*] section at all -- dev is
-# opt-level = 0, and unoptimised float loops over ~8.2 G samples plausibly
-# turn a 4-minute run into an hour.
+# Uses the release binary: the dev profile is far too slow at this scale.
 #
 # Why not `ulimit -v` for the memory ceiling: `crates/core/src/io/tiff/stack.rs`
 # holds one mmap per frame for the stack's lifetime, so after the first tile
@@ -35,21 +29,267 @@
 # unrelated to the property under test. `prlimit --rss` is a dead end too:
 # RLIMIT_RSS has been a kernel no-op since Linux 2.4.
 #
-# wrapped in `/usr/bin/time -v` so the run records its wall time alongside the
-# diff numbers. All output under .scratch/.
+# Outputs go under .scratch/; source frames are never modified.
 #
-# Exit: 2 -- refuses, for now.
+# Environment overrides, for driving this exact script end to end against a
+# small fixture instead of the reference stack (so the whole code path --
+# farm build, headers-only check, release run, cgroup dance -- is exercised cheaply
+# and repeatably). None of these change the default, real-run behaviour:
+#   FOCUSFORGE_REFERENCE_STACK source frame directory; a relative value
+#                              resolves against the repo root; unset SKIPs
+#                              the whole run before the release-CLI check
+#   ACCEPTANCE_FRAME_GLOB     glob for source frames within it (default:
+#                              *IMG_*.tif)
+#   ACCEPTANCE_EXPECTED_FRAMES expected farm size (default: 61)
+#   ACCEPTANCE_OUT_DIR        base output directory (default:
+#                              .scratch/acceptance)
+#   ACCEPTANCE_CLI            CLI binary to run (default:
+#                              target/release/focusforge-cli)
+#
+# Exit: 0 on a completed run, or a clean SKIP when
+#       FOCUSFORGE_REFERENCE_STACK is unset.
+#       1 on any refusal (bad ground, not a run failure in the usual sense).
+#       2 on a usage error.
+#       Whatever the CLI itself returned, on a run failure -- that captured
+#       status, not systemd-run's, is the run's verdict.
 
 set -euo pipefail
 
-case "${1:-}" in
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO"
+
+MODE="${1:-}"
+LIMIT="${2:-}"
+
+case "$MODE" in
   "") ;;
-  *) echo "usage: tools/run-acceptance.sh" >&2; exit 2 ;;
+  --limit|--inside-scope)
+    if [ -z "$LIMIT" ]; then
+      echo "usage: tools/run-acceptance.sh [--limit SIZE]" >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "usage: tools/run-acceptance.sh [--limit SIZE]" >&2
+    exit 2
+    ;;
 esac
 
-echo "usage: tools/run-acceptance.sh"
+echo "== tools/run-acceptance.sh ($([ -n "$MODE" ] && echo "${MODE} ${LIMIT}" || echo "unlimited")) =="
+echo "This run reads the reference stack in full, takes minutes, and writes"
+echo "composites under .scratch/."
 echo
-echo "refuses: the CLI has no \`stack\` subcommand."
-echo "Until then the fixtures are the whole of the automated evidence:"
-echo "  tools/check-all.sh"
-exit 2
+
+OUT_DIR="${ACCEPTANCE_OUT_DIR:-.scratch/acceptance}"
+FRAME_GLOB="${ACCEPTANCE_FRAME_GLOB:-*IMG_*.tif}"
+EXPECTED_FRAMES="${ACCEPTANCE_EXPECTED_FRAMES:-61}"
+CLI="${ACCEPTANCE_CLI:-target/release/focusforge-cli}"
+
+# --- resolve the source frame directory ------------------------------------
+#
+# frame_paths + uniform_check make stacking the source frame directory
+# directly impossible rather than merely ill-advised: it holds 62 *.tif
+# files, Mantis_Stacked.tif among them, and the byte-order/rows-per-strip
+# mismatch between it and the 61 source frames trips the strict uniformity
+# guard in crates/cli/src/main.rs before a tile is ever read. So the run
+# never points at that directory directly; it stacks a 61-entry symlink
+# farm built below, which also keeps the source frame directory untouched.
+if [ -n "${ACCEPTANCE_STACK_DIR:-}" ]; then
+  STACK="$ACCEPTANCE_STACK_DIR"
+  if [ ! -d "$STACK" ]; then
+    echo "refuse: ACCEPTANCE_STACK_DIR=$STACK is not a directory" >&2
+    exit 1
+  fi
+  STACK="$(cd "$STACK" && pwd)"
+else
+  HARNESS=""
+  for candidate in "$REPO/../../.." "$REPO/../reference-stack"; do
+    if [ -f "$candidate/tools/lib/rawtiff.py" ]; then
+      HARNESS="$(cd "$candidate" && pwd)"
+      break
+    fi
+  done
+
+  if [ -z "$HARNESS" ] || [ ! -d "$HARNESS/Stack" ]; then
+    echo "SKIP: no reachable reference stack next to this checkout (looked for" \
+         "tools/lib/rawtiff.py under \$REPO/../../.. and \$REPO/../reference-stack)"
+    exit 0
+  fi
+  STACK="$HARNESS/Stack"
+fi
+
+if [ ! -x "$CLI" ]; then
+  echo "refuse: $CLI is not built -- run: cargo build --release -p focusforge-cli" >&2
+  exit 1
+fi
+
+limit_to_bytes() {
+  # systemd's K/M/G/T suffixes are base-1024
+  # (man systemd.resource-control -- MemoryMax=): 8G == 8 * 1024^3 ==
+  # 8589934592. A bare number (no suffix) is already bytes.
+  local v="$1"
+  case "$v" in
+    *K) echo $(( ${v%K} * 1024 )) ;;
+    *M) echo $(( ${v%M} * 1024 * 1024 )) ;;
+    *G) echo $(( ${v%G} * 1024 * 1024 * 1024 )) ;;
+    *T) echo $(( ${v%T} * 1024 * 1024 * 1024 * 1024 )) ;;
+    *) echo "$v" ;;
+  esac
+}
+
+# --- the input farm and its headers-only check, before any long work -------
+#
+# Skipped entirely for --inside-scope: that re-entry runs in the same
+# checkout the --limit invocation already built the farm in (a memory cgroup
+# does not isolate the filesystem), so redoing it here would just cost a
+# second, pointless headers-only CLI call inside the timed scope.
+build_farm() {
+  rm -rf "$OUT_DIR/frames"
+  mkdir -p "$OUT_DIR/frames"
+
+  shopt -s nullglob
+  local candidates=( "$STACK"/$FRAME_GLOB )
+  shopt -u nullglob
+
+  local count=0
+  local f name
+  for f in "${candidates[@]}"; do
+    name="$(basename "$f")"
+    case "$name" in
+      *Stacked*) continue ;;
+    esac
+    ln -s "$f" "$OUT_DIR/frames/$name"
+    count=$((count + 1))
+  done
+
+  if [ "$count" -ne "$EXPECTED_FRAMES" ]; then
+    echo "refuse: expected $EXPECTED_FRAMES symlinks in $OUT_DIR/frames, built $count" >&2
+    exit 1
+  fi
+  if ls "$OUT_DIR/frames" | grep -q Stacked; then
+    echo "refuse: the farm contains an entry matching \"Stacked\"" >&2
+    exit 1
+  fi
+  echo "OK: built $count-entry frame farm at $OUT_DIR/frames"
+
+  "$CLI" info --json "$OUT_DIR/frames" > "$OUT_DIR/info.json"
+  if ! grep -q "\"frame_count\": $EXPECTED_FRAMES" "$OUT_DIR/info.json"; then
+    echo "refuse: $OUT_DIR/info.json does not report frame_count $EXPECTED_FRAMES" >&2
+    exit 1
+  fi
+  if ! grep -q '"uniform_layout": true' "$OUT_DIR/info.json"; then
+    echo "refuse: $OUT_DIR/info.json does not report uniform_layout true" >&2
+    exit 1
+  fi
+  echo "OK: $OUT_DIR/info.json reports frame_count $EXPECTED_FRAMES, uniform_layout true"
+
+  # A missing output parent is refused before any long work starts.
+  mkdir -p "$OUT_DIR/unlimited" "$OUT_DIR/limited"
+}
+
+# --- the run itself: identical command, different OUT ----------------------
+run_stack() {
+  local out="$1"
+  /usr/bin/time -v "$CLI" stack "$OUT_DIR/frames" \
+      -o "$out/out.tif" --zmap "$out/out-zmap.tif" \
+      --algo laplacian --set levels=5 --json \
+      > "$out/stack.json" 2> "$out/time-v.txt"
+}
+
+print_summary() {
+  local out="$1"
+  if [ -f "$out/stack.json" ]; then
+    python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as exc:
+    print("(could not parse " + sys.argv[1] + ": " + str(exc) + ")")
+    sys.exit(0)
+for key in ("wall_seconds", "tiles", "frame_tiles_read", "in_flight_limit", "peak_in_flight"):
+    print(key + "=" + str(d.get(key)))
+' "$out/stack.json"
+  fi
+  grep -E 'Maximum resident set size|Elapsed \(wall clock\) time' "$out/time-v.txt" 2>/dev/null || true
+}
+
+case "$MODE" in
+  "")
+    build_farm
+    echo "+ $CLI stack $OUT_DIR/frames -o $OUT_DIR/unlimited/out.tif ..."
+    run_stack "$OUT_DIR/unlimited"
+    echo "OK: unlimited run complete"
+    print_summary "$OUT_DIR/unlimited"
+    ;;
+
+  --limit)
+    build_farm
+    echo "+ systemd-run --user --scope -p MemoryMax=$LIMIT -p MemorySwapMax=0" \
+         "-- $REPO/tools/run-acceptance.sh --inside-scope $LIMIT"
+    # --scope, not a service: `man systemd-run` DESCRIPTION -- a transient
+    # scope is executed by systemd-run itself as the parent process and
+    # inherits the caller's execution environment (cwd, env, exit status),
+    # and execution is synchronous. No --quiet: the printed
+    # "Running as unit: run-rNNN.scope" is what makes
+    # `journalctl --user -u run-rNNN.scope` findable afterwards.
+    exec systemd-run --user --scope -p "MemoryMax=$LIMIT" -p MemorySwapMax=0 \
+        -- "$REPO/tools/run-acceptance.sh" --inside-scope "$LIMIT"
+    ;;
+
+  --inside-scope)
+    # Safe to invoke directly; the real caller is the `--limit` branch's
+    # re-exec, which already built $OUT_DIR/limited via build_farm.
+    mkdir -p "$OUT_DIR/limited"
+    cg="/sys/fs/cgroup$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup)"
+    want_bytes="$(limit_to_bytes "$LIMIT")"
+
+    mem_max="$(cat "$cg/memory.max" 2>/dev/null || echo unknown)"
+    mem_swap_max="$(cat "$cg/memory.swap.max" 2>/dev/null || echo unknown)"
+    {
+      echo "memory.max: $mem_max"
+      echo "memory.swap.max: $mem_swap_max"
+      echo "memory.current: $(cat "$cg/memory.current" 2>/dev/null || echo unknown)"
+    } > "$OUT_DIR/limited/cgroup-before.txt"
+
+    # Refuse unless the limit actually took: a silently unenforced MemoryMax
+    # in a transient --user scope is a known failure mode on older systemd
+    # (<https://access.redhat.com/solutions/7099227>, RHEL-8-class). A
+    # ceiling run that "passed" under an unenforced limit is the one
+    # failure mode indistinguishable from success, which is exactly why
+    # this reads the cgroup back rather than trusting systemd-run's exit
+    # status.
+    if [ "$mem_max" != "$want_bytes" ] || [ "$mem_swap_max" != "0" ]; then
+      echo "refuse: cgroup limit was not enforced -- memory.max=$mem_max" \
+           "(wanted $want_bytes), memory.swap.max=$mem_swap_max (wanted 0)" >&2
+      exit 1
+    fi
+    echo "OK: memory.max=$mem_max memory.swap.max=$mem_swap_max, limit confirmed in force"
+
+    echo "+ $CLI stack $OUT_DIR/frames -o $OUT_DIR/limited/out.tif ... (under $LIMIT)"
+    set +e
+    run_stack "$OUT_DIR/limited"
+    status=$?
+    set -e
+
+    # Dump always, pass or fail, while the cgroup still exists -- a --scope
+    # cgroup is destroyed on exit, so this is the only chance to read it.
+    {
+      echo "memory.peak: $(cat "$cg/memory.peak" 2>/dev/null || echo unknown)"
+      echo "memory.swap.peak: $(cat "$cg/memory.swap.peak" 2>/dev/null || echo unknown)"
+      echo "memory.current: $(cat "$cg/memory.current" 2>/dev/null || echo unknown)"
+      echo "memory.zswap.current: $(cat "$cg/memory.zswap.current" 2>/dev/null || echo unknown)"
+      echo "memory.events:"
+      cat "$cg/memory.events" 2>/dev/null || echo unknown
+      echo "memory.stat (anon/file/inactive_file/active_file/slab/sock):"
+      grep -E '^(anon|file|inactive_file|active_file|slab|sock) ' "$cg/memory.stat" 2>/dev/null || echo unknown
+    } > "$OUT_DIR/limited/cgroup-after.txt"
+
+    if [ "$status" -eq 0 ]; then
+      echo "OK: limited run complete, exit $status"
+    else
+      echo "FAILED: limited run exited $status -- see $OUT_DIR/limited/time-v.txt and cgroup-after.txt" >&2
+    fi
+    print_summary "$OUT_DIR/limited"
+    exit "$status"
+    ;;
+esac

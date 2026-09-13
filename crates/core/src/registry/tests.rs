@@ -192,7 +192,18 @@ fn each_family_listing_holds_only_its_own_family() {
     // these returning an empty Vec would leave every other test in this module green.
     let stack_ids: Vec<&str> = stacks.iter().map(|a| a.id()).collect();
     let align_ids: Vec<&str> = aligns.iter().map(|a| a.id()).collect();
-    assert_eq!(stack_ids, vec!["dummy-stack"]);
+    // `laplacian` joins the dummies here: it is the first real algorithm in
+    // the registry, and it is a stack algorithm. `depth-map` and
+    // `weighted-average` are two more stack algorithms, alphabetical
+    // by id like every listing here. `pyramidal-ecc` is the align
+    // listing's first real algorithm, so the align listing has grown too.
+    // The assertion stays exact rather than becoming a `contains` -- its
+    // job is to catch a registration silently disappearing, which a subset
+    // check would not see.
+    assert_eq!(
+        stack_ids,
+        vec!["depth-map", "dummy-stack", "laplacian", "weighted-average"]
+    );
     assert_eq!(align_ids, vec!["dummy-align"]);
 
     assert_eq!(
@@ -217,8 +228,15 @@ fn lists_every_registered_algorithm() {
     let ids: Vec<&str> = listing.iter().map(AlgorithmRef::id).collect();
     assert_eq!(
         ids,
-        vec!["dummy-align", "dummy-stack"],
-        "the listing must contain exactly the two registered dummies, in this order"
+        vec![
+            "depth-map",
+            "dummy-align",
+            "dummy-stack",
+            "laplacian",
+            "weighted-average"
+        ],
+        "the listing must contain exactly the two dummies plus the three registered \
+         real algorithms, in this order"
     );
     for entry in &listing {
         assert!(!entry.display_name().is_empty());

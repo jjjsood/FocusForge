@@ -40,8 +40,12 @@ One block per file:
 path/to/frame.tif
   64x64 3ch 16-bit II compression=1 planar=1 photometric=2
   rows_per_strip=1 strips=64 file_size=25338
+  description: FocusForge fixture mantis-64/00 from 20260829-IMG_9800.tif rect 4064,2700,64,64
   mmap fast path: yes
 ```
+
+The `description:` line is only printed when the file carries an
+`ImageDescription` tag; a file with none keeps its three-line block.
 
 For a directory, a trailing summary follows every file block:
 
@@ -87,6 +91,7 @@ is added, never renamed or removed, in later versions.
       "rows_per_strip": 1,
       "strip_count": 64,
       "file_size": 25338,
+      "description": "FocusForge fixture mantis-64/00 from 20260829-IMG_9800.tif rect 4064,2700,64,64",
       "mmap_fast_path": true,
       "refusal": null,
       "error": null
@@ -124,9 +129,87 @@ parse as a TIFF at all):
 | `rows_per_strip` | the TIFF `RowsPerStrip` tag value |
 | `strip_count` | number of strips implied by height and `rows_per_strip` |
 | `file_size` | on-disk size in bytes |
+| `description` | the TIFF `ImageDescription` tag, `null` when the file has none — a Z-Map carries its frame count here |
 | `mmap_fast_path` | whether the tile reader's fast path applies to this file |
 | `refusal` | `null` when `mmap_fast_path` is `true`, otherwise the reason it is not (compression, tiling, planar layout, bit depth or sample format) |
 | `error` | `null` on a successful parse, otherwise why the file could not be read as a TIFF at all |
+
+## `stack`
+
+```
+focusforge-cli stack [OPTIONS] --output <OUTPUT> <DIR>
+```
+
+Fuses every TIFF frame in `<DIR>` (non-recursive, descending into
+`<DIR>/frames` when that subdirectory exists) into one composite through a
+registered stacking algorithm, and writes it to `--output`. The frames are
+read tile by tile through an out-of-core scheduler bounded by a fixed memory
+budget, so the command never needs to hold a whole stack — or a whole frame
+— in RAM.
+
+Options:
+
+| flag | meaning |
+|---|---|
+| `-o, --output <OUTPUT>` | composite output path (required) |
+| `--algo <ALGO>` | registered stacking algorithm id (required; see `algorithms` below for the list) |
+| `--zmap <ZMAP>` | Z-Map output path; omitted entirely when this flag is absent |
+| `--set <KEY=VALUE>` | set one algorithm parameter, repeatable; a repeated key keeps the last value |
+| `--json` | emit the frozen JSON report instead of human-readable text |
+
+Every algorithm also writes a **Z-Map** when `--zmap` is given: a
+single-channel 16-bit TIFF with one value per output pixel naming the index
+of the source frame that pixel came from.
+
+Refusals happen before the input directory is read where possible: an
+unknown `--algo` id or a `--set` value that fails the algorithm's own
+parameter schema (unknown key, out-of-range value, an enum value that does
+not name a declared variant) is reported and the command exits 1 without
+opening a single frame.
+
+```
+$ focusforge-cli stack fixtures/mantis-64 -o .scratch/out.tif --algo laplacian --zmap .scratch/zmap.tif
+fixtures/mantis-64 (3 frames)
+64x64 3ch
+laplacian - Laplacian Pyramid
+levels = 4 (Auto)
+tile_size=512 levels=4 margin=48 tiles=1 in_flight_limit=32
+wrote: .scratch/out.tif
+wrote: .scratch/zmap.tif
+wall: 0.032s
+```
+
+### `--json`
+
+`--json` emits a report with the input frames, the resolved algorithm and
+its parameters (value and provenance — whether each came from its default,
+an explicit `--set`, or an `auto` hook), the tile geometry the scheduler
+planned, and the paths written. Like `info --json` and `algorithms --json`,
+this is a frozen shape: a field is added, never renamed or removed, in
+later versions.
+
+```json
+{
+  "input": "fixtures/mantis-64",
+  "frame_count": 3,
+  "frames": ["00.tif", "01.tif", "02.tif"],
+  "width": 64,
+  "height": 64,
+  "samples_per_pixel": 3,
+  "algorithm": "laplacian",
+  "display_name": "Laplacian Pyramid",
+  "params": [{ "id": "levels", "value": 4, "provenance": "Auto" }],
+  "tile_size": 512,
+  "levels": 4,
+  "margin": 48,
+  "tiles": 1,
+  "frame_tiles_read": 3,
+  "in_flight_limit": 32,
+  "peak_in_flight": 1,
+  "outputs": [".scratch/out.tif", ".scratch/zmap.tif"],
+  "wall_seconds": 0.030267391
+}
+```
 
 ## `algorithms`
 
@@ -139,12 +222,18 @@ prints that one algorithm's full parameter schema. Every algorithm, stacking
 or alignment, is registered under one shared id space and reachable through
 this one subcommand; there is no separate listing per family.
 
-Whether the listing has anything in it depends on how the binary was built:
-the two algorithms in the source tree today are test doubles compiled in
-only when `focusforge-core`'s `test-algorithms` feature is enabled (as it is
-for `cargo test --workspace`, but not for a plain `cargo build`), so
-`focusforge-cli algorithms` against a release build reports
-`no algorithms registered`.
+Three stacking algorithms are registered in a normal build:
+
+```
+$ focusforge-cli algorithms
+depth-map - Depth Map (stacking)
+laplacian - Laplacian Pyramid (stacking)
+weighted-average - Weighted Average (stacking)
+```
+
+- `laplacian` — Laplacian-pyramid coefficient selection
+- `weighted-average` — per-pixel sharpness-weighted blend
+- `depth-map` — per-pixel selection from a smoothed sharpness surface
 
 `ID` is required for `--set`: `--set` with no `ID` is rejected before
 anything else runs, since there is no schema to validate against.

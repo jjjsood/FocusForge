@@ -17,16 +17,12 @@ pub fn workspace_root() -> PathBuf {
 }
 
 /// `crates/cli/../../fixtures` -- the workspace's committed fixture trees.
-pub fn sibling_data_root() -> Option<PathBuf> {
-    let candidates = [
-        workspace_root().join("..").join("..").join(".."),
-        workspace_root().join("..").join("reference-data"),
-    ];
-    candidates
-        .into_iter()
-        .find(|p| p.join("tools").join("lib").join("rawtiff.py").is_file())
-}
-
+///
+/// `#[allow(dead_code)]`: each integration test file compiles this shared
+/// module into its own binary crate, and not every one of this crate's test
+/// binaries calls this helper (`acceptance.rs` reads `.scratch/` and the
+/// reference stack directly, never a fixture).
+#[allow(dead_code)]
 pub fn fixtures_dir() -> PathBuf {
     workspace_root().join("fixtures")
 }

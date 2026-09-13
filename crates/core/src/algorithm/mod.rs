@@ -17,7 +17,7 @@
 mod error;
 
 pub use crate::params::StackContext;
-use crate::params::{ParamDesc, ParamValues};
+use crate::params::{ParamDesc, ParamValue, ParamValues};
 use crate::tile::{Rect, Tile};
 
 pub use error::AlgorithmError;
@@ -29,10 +29,11 @@ pub use error::AlgorithmError;
 /// usize` -- one index per **pixel**, never per sample. `Tile::samples` is
 /// `width * height * samples_per_pixel` long, but the Z-Map names a source
 /// *frame*, which is a per-pixel fact, not a per-sample one. Fields are
-/// public and there is no validating constructor: the Z-Map as a document
-/// with its own storage and invariants is future work, and a checked
-/// constructor here would need either a fabricated error or a panic for no
-/// caller that exists yet.
+/// public and there is no validating constructor here: the Z-Map as a
+/// document with its own storage and invariants lives in [`crate::zmap`]
+/// (`ZMapInfo`, `crate::zmap::validate_tile`, `crate::zmap::ZMapWriter`) --
+/// a checked constructor on `TileOutput` itself still waits for its first
+/// real caller.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TileOutput {
     pub tile: Tile,
@@ -157,11 +158,54 @@ impl<'a> AlignContext<'a> {
 /// The Z-Map indices `fuse` returns in its [`TileOutput`] are frame indices
 /// into the [`TileCtx`] the call was given, `0..ctx.frame_count()` -- which
 /// is what makes the `u16` meaningful to anything downstream that reads it.
+///
+/// `fuse` receives a fully resolved [`ParamValues`] -- the caller runs
+/// [`crate::params::resolve`] plus [`crate::params::resolved_values`] first --
+/// and a key its own schema declares but the map omits is a named
+/// [`AlgorithmError`], never an index panic.
 pub trait StackAlgorithm: Send + Sync + 'static {
     fn id(&self) -> &str;
     fn display_name(&self) -> &str;
     fn params(&self) -> &[ParamDesc];
     fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError>;
+
+    /// How many pyramid levels the tile scheduler must size its read-rect
+    /// margin for, given this algorithm's fully resolved `cfg`
+    /// (`crate::params::resolve` plus `crate::params::resolved_values`,
+    /// same as `fuse` receives). The CLI asks every algorithm this question
+    /// and feeds the answer straight into
+    /// `crate::tile::TileSchedulerOptions::levels`.
+    ///
+    /// The default reads the well-known key `"levels"` out of `cfg` and
+    /// returns it verbatim, or `0` if `cfg` has no such key. This is exactly
+    /// right for the two cases that matter:
+    ///
+    /// 1. **An algorithm with no pyramid at all** never declares a `"levels"`
+    ///    parameter, so `cfg` (which `crate::params::resolve` fills with
+    ///    exactly one entry per *declared* parameter, nothing else) never
+    ///    carries that key -- the default answers `0`, i.e. no margin, with
+    ///    no work from the algorithm's author. Weighted Average and the
+    ///    Depth Map inherit this without ever thinking about margins.
+    /// 2. **An algorithm that does build a pyramid and spells its depth
+    ///    parameter `"levels"`** (`laplacian` does) gets the right answer
+    ///    from this same default, reading the identical resolved map `fuse`
+    ///    itself reads its own `"levels"` entry from -- the same number from
+    ///    the same place, which is the whole point: `fuse`'s pyramid depth
+    ///    and the scheduler's margin can no longer silently disagree.
+    ///
+    /// An algorithm whose depth parameter is *not* called `"levels"`, or
+    /// whose margin requirement is not a simple pyramid depth, **overrides**
+    /// this method -- a visible, greppable claim about its own margin
+    /// requirement, in its own file, rather than an unnamed convention that
+    /// fails quietly the way the pre-this-decision code did (`laplacian`'s
+    /// pyramid depth and the scheduler's margin were computed from two
+    /// separately supplied numbers that nothing kept in agreement).
+    fn tile_levels(&self, cfg: &ParamValues) -> u32 {
+        cfg.get("levels")
+            .and_then(ParamValue::as_i64)
+            .map(|levels| levels.max(0) as u32)
+            .unwrap_or(0)
+    }
 }
 
 /// An alignment algorithm: solves one frame's geometric transform against
@@ -619,6 +663,23 @@ mod tests {
             }
             other => panic!("expected Tiff, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tile_levels_default_is_zero_when_the_schema_declares_no_levels_key() {
+        // `DummyStack`'s schema is `count-based-threshold` + `mode`, never
+        // `levels`, so the resolved map never carries that key -- the
+        // default answers "no pyramid, no margin".
+        let algo = DummyStack::new();
+        assert_eq!(algo.tile_levels(&ParamValues::new()), 0);
+    }
+
+    #[test]
+    fn tile_levels_default_reads_the_levels_key_when_present() {
+        let algo = DummyStack::new();
+        let mut cfg = ParamValues::new();
+        cfg.insert("levels".to_string(), ParamValue::Int(7));
+        assert_eq!(algo.tile_levels(&cfg), 7);
     }
 
     #[test]
