@@ -85,6 +85,26 @@ FRAME_GLOB="${ACCEPTANCE_FRAME_GLOB:-*IMG_*.tif}"
 EXPECTED_FRAMES="${ACCEPTANCE_EXPECTED_FRAMES:-61}"
 CLI="${ACCEPTANCE_CLI:-target/release/focusforge-cli}"
 
+# --- refuse to measure with a CLI older than the sources -------------------
+# Refuses a release binary older than the sources rather than rebuilding, so
+# a compile never lands in the measured wall clock and stale code is never
+# measured.
+if [ ! -x "$CLI" ]; then
+  echo "refuse: CLI $CLI does not exist or is not executable" >&2
+  echo "hint: cargo build --release --workspace --bin focusforge-cli" >&2
+  exit 1
+fi
+newest_src="$(find crates Cargo.toml Cargo.lock -name target -prune -o \
+  \( -name '*.rs' -o -name '*.wgsl' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
+  -newer "$CLI" -print 2>/dev/null | head -n 1 || true)"
+if [ -n "$newest_src" ]; then
+  echo "refuse: $CLI is older than the workspace sources -- it would measure stale code" >&2
+  echo "        first newer source found: $newest_src" >&2
+  echo "hint: cargo build --release --workspace --bin focusforge-cli" >&2
+  exit 1
+fi
+echo "OK: $CLI is newer than every workspace source"
+
 # --- resolve the source frame directory ------------------------------------
 #
 # frame_paths + uniform_check make stacking the source frame directory
@@ -164,6 +184,14 @@ build_farm() {
 
   if [ "$count" -ne "$EXPECTED_FRAMES" ]; then
     echo "refuse: expected $EXPECTED_FRAMES symlinks in $OUT_DIR/frames, built $count" >&2
+    # A zero count is almost always the glob, not a missing stack: the default
+    # only matches the reference stack's own frame naming, so pointing this
+    # script at any other frame directory needs ACCEPTANCE_FRAME_GLOB set
+    # too. Say so here rather than leaving a correct refusal that reads as a
+    # mystery.
+    if [ "$count" -eq 0 ]; then
+      echo "hint: no file in $STACK matched ACCEPTANCE_FRAME_GLOB='$FRAME_GLOB'" >&2
+    fi
     exit 1
   fi
   if ls "$OUT_DIR/frames" | grep -q Stacked; then
@@ -188,12 +216,35 @@ build_farm() {
 }
 
 # --- the run itself: identical command, different OUT ----------------------
+#
+# `--no-crop`: `stack` applies the auto-crop by default, which would shrink
+# the composite below the full 8192x5464 extent that
+# `crates/cli/tests/acceptance.rs` compares against `Mantis_Stacked.tif`
+# (`tools/tiff-diff.py` refuses any dimension mismatch outright).
+# `--align-algo pyramidal-ecc --lax`: `--lax` is not optional here -- a
+# 61-frame sweep anchored on frame 30 is a longer baseline than the
+# 8-frame fixture on which frame 0 already diverges, and a strict refusal
+# would waste the whole run.
 run_stack() {
   local out="$1"
   /usr/bin/time -v "$CLI" stack "$OUT_DIR/frames" \
       -o "$out/out.tif" --zmap "$out/out-zmap.tif" \
       --algo laplacian --set levels=5 --json \
+      --no-crop --align-algo pyramidal-ecc --lax \
       > "$out/stack.json" 2> "$out/time-v.txt"
+}
+
+# `align`, once per mode, in the unlimited branch only: the `--inside-scope`
+# branch stays a single `run_stack`, whose own in-process alignment is
+# exactly what the memory ceiling is being measured with, and a second
+# standalone align inside the scope would spend minutes measuring nothing
+# new. `--lax` for the same reason `run_stack` above carries it.
+run_align() {
+  local out="$1"
+  local mode="$2"
+  /usr/bin/time -v "$CLI" align "$OUT_DIR/frames" \
+      --algo pyramidal-ecc --set "mode=$mode" --lax --json \
+      > "$out/align-$mode.json" 2> "$out/align-$mode-time-v.txt"
 }
 
 print_summary() {
@@ -210,12 +261,37 @@ for key in ("wall_seconds", "tiles", "frame_tiles_read", "in_flight_limit", "pea
     print(key + "=" + str(d.get(key)))
 ' "$out/stack.json"
   fi
+  for mode in translation rotation-scale; do
+    if [ -f "$out/align-$mode.json" ]; then
+      python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as exc:
+    print("(could not parse " + sys.argv[1] + ": " + str(exc) + ")")
+    sys.exit(0)
+alignments = d.get("alignments", [])
+max_drift = 0.0
+for e in alignments:
+    drift = (e.get("tx", 0.0) ** 2 + e.get("ty", 0.0) ** 2) ** 0.5
+    max_drift = max(max_drift, drift)
+print("align-" + sys.argv[2] + ": frame_count=" + str(d.get("frame_count"))
+      + " failure_count=" + str(d.get("failure_count"))
+      + " max_translation=" + str(round(max_drift, 2)))
+' "$out/align-$mode.json" "$mode"
+    fi
+  done
   grep -E 'Maximum resident set size|Elapsed \(wall clock\) time' "$out/time-v.txt" 2>/dev/null || true
 }
 
 case "$MODE" in
   "")
     build_farm
+    for mode in translation rotation-scale; do
+      echo "+ $CLI align $OUT_DIR/frames --algo pyramidal-ecc --set mode=$mode --lax --json ..."
+      run_align "$OUT_DIR/unlimited" "$mode"
+    done
+    echo "OK: align stage complete (both modes)"
     echo "+ $CLI stack $OUT_DIR/frames -o $OUT_DIR/unlimited/out.tif ..."
     run_stack "$OUT_DIR/unlimited"
     echo "OK: unlimited run complete"

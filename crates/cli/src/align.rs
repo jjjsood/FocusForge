@@ -1,0 +1,437 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! `focusforge-cli align`: computes and reports the per-frame transforms
+//! for a stack -- human text by default, a frozen `--json` document on
+//! request, and an optional per-frame warped-TIFF dump for a visual check
+//! before any fusion runs. A driver, not an implementer: every number here
+//! comes from `focusforge_core::align`.
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Instant;
+
+use focusforge_core::algorithm::{AlignAlgorithm, TileReader};
+use focusforge_core::align::{
+    FailurePolicy, ReferencePolicy, StackAlignment, WarpingReader, align_stack, auto_crop,
+};
+use focusforge_core::io::{TiffSpec, TiffStack, TiffWriter, frame_paths};
+use focusforge_core::params::{self, StackContext};
+use focusforge_core::registry;
+use focusforge_core::tile::Rect;
+use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
+use serde::Serialize;
+
+use crate::set::SetArgs;
+use crate::set::parse_settings;
+use crate::stack::ParamReport;
+
+/// The options `stack` needs to drive its own alignment stage, bundled so
+/// `stack::run` stays under clippy's argument-count lint
+/// (`crate::fuse::FusionGeometry`'s own doc names the same reason).
+pub struct AlignOptions<'a> {
+    pub align: bool,
+    pub crop: bool,
+    pub lax: bool,
+    pub algo: Option<&'a str>,
+    pub set: &'a [(String, String)],
+}
+
+/// Resolves the align algorithm `id` names, or -- when `id` is `None` --
+/// the sole registered alignment algorithm. Reads
+/// `registry::align_algorithms()` rather than naming any id, which is what
+/// keeps `crates/cli/src` free of every algorithm id.
+/// More than one registered algorithm with no id given is refused, loudly,
+/// naming every candidate -- that refusal is the entire argument for this
+/// default over a hardcoded one.
+pub(crate) fn resolve_align_algo(id: Option<&str>) -> Result<&'static dyn AlignAlgorithm, String> {
+    match id {
+        Some(id) => registry::find_align(id).map_err(|e| e.to_string()),
+        None => {
+            let algos = registry::align_algorithms();
+            match algos.as_slice() {
+                [] => Err("no alignment algorithm is registered".to_string()),
+                [only] => Ok(*only),
+                many => Err(format!(
+                    "multiple alignment algorithms are registered; pass an id to choose one: {}",
+                    many.iter().map(|a| a.id()).collect::<Vec<_>>().join(", ")
+                )),
+            }
+        }
+    }
+}
+
+/// The frozen `align --json` document: fields are only ever added, the
+/// same discipline `InfoReport`/`StackReport` follow.
+#[derive(Serialize)]
+pub struct AlignReport {
+    pub input: String,
+    pub frame_count: usize,
+    pub frames: Vec<String>,
+    pub width: u32,
+    pub height: u32,
+    pub samples_per_pixel: u32,
+    pub algorithm: String,
+    pub display_name: String,
+    pub params: Vec<ParamReport>,
+    pub reference: usize,
+    pub reference_policy: ReferencePolicy,
+    /// `"strict"` or `"lax"` -- a plain string, not `FailurePolicy` itself:
+    /// only the seven types the schema needs derive `Serialize`, no more.
+    pub failure_policy: String,
+    pub failure_count: usize,
+    pub alignments: Vec<AlignmentEntry>,
+    pub crop: Option<Rect>,
+    pub warped_dir: Option<String>,
+    pub wall_seconds: f64,
+}
+
+/// One frame's row in [`AlignReport::alignments`]: `#[serde(flatten)]`ed
+/// from [`focusforge_core::align::FrameAlignment`] (`frame`, `transform`,
+/// `status`, `iterations`, `residual`, `fallback`), plus the frame's file
+/// name and the four `similarity_parts` conveniences.
+#[derive(Serialize)]
+pub struct AlignmentEntry {
+    pub name: String,
+    #[serde(flatten)]
+    pub base: focusforge_core::align::FrameAlignment,
+    pub scale: f64,
+    pub rotation_deg: f64,
+    pub tx: f64,
+    pub ty: f64,
+}
+
+pub(crate) fn alignment_entries(
+    alignment: &StackAlignment,
+    frame_names: &[String],
+) -> Vec<AlignmentEntry> {
+    alignment
+        .frames
+        .iter()
+        .map(|f| {
+            let (scale, radians, tx, ty) = f.transform.similarity_parts();
+            AlignmentEntry {
+                name: frame_names[f.frame].clone(),
+                base: *f,
+                scale,
+                rotation_deg: radians.to_degrees(),
+                tx,
+                ty,
+            }
+        })
+        .collect()
+}
+
+/// Runs the subcommand.
+///
+/// `algo_id: None` resolves through [`resolve_align_algo`], never a
+/// hardcoded id. `--lax` selects [`FailurePolicy::IdentityFallback`]; its
+/// absence selects [`FailurePolicy::Strict`], the default.
+#[allow(clippy::too_many_arguments)]
+pub fn run(
+    dir: &Path,
+    algo_id: Option<&str>,
+    json: bool,
+    lax: bool,
+    write_warped: Option<&Path>,
+    set: &SetArgs,
+) -> ExitCode {
+    let start = Instant::now();
+
+    let algo = match resolve_align_algo(algo_id) {
+        Ok(algo) => algo,
+        Err(msg) => return crate::fail(msg),
+    };
+
+    let explicit = match parse_settings(algo.params(), &set.set) {
+        Ok(values) => values,
+        Err(violations) => {
+            return crate::fail(
+                violations
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+    };
+
+    let paths = match frame_paths(dir) {
+        Ok(paths) => paths,
+        Err(err) => return crate::fail(err),
+    };
+    let stack = match TiffStack::open_files(&paths) {
+        Ok(stack) => stack,
+        Err(err) => return crate::fail(err),
+    };
+    let frame_names: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string())
+        })
+        .collect();
+    let header_refs: Vec<(&str, &focusforge_core::io::TiffHeader)> = frame_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), stack.header(i)))
+        .collect();
+    let (uniform, detail) = crate::uniform_check(&header_refs);
+    if !uniform {
+        return crate::fail(detail.unwrap_or_else(|| "non-uniform frame set".to_string()));
+    }
+
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let stack_ctx = StackContext::new(stack.len(), width, height, spp);
+    let resolved = match params::resolve(algo.params(), &explicit, &stack_ctx) {
+        Ok(resolved) => resolved,
+        Err(err) => return crate::fail(err),
+    };
+    let values = params::resolved_values(&resolved);
+
+    let policy = if lax {
+        FailurePolicy::IdentityFallback
+    } else {
+        FailurePolicy::Strict
+    };
+    let alignment = match align_stack(algo, stack_ctx, &stack, &values, policy) {
+        Ok(alignment) => alignment,
+        Err(err) => return crate::fail(err),
+    };
+    let crop = match auto_crop(&alignment, (width, height)) {
+        Ok(crop) => crop,
+        Err(err) => return crate::fail(err),
+    };
+
+    if let Some(write_warped) = write_warped
+        && let Err(msg) = write_warped_frames(
+            write_warped,
+            &stack,
+            &paths,
+            &frame_names,
+            &alignment,
+            width,
+            height,
+            spp,
+        )
+    {
+        return crate::fail(msg);
+    }
+
+    let report = AlignReport {
+        input: dir.display().to_string(),
+        frame_count: stack.len(),
+        frames: frame_names.clone(),
+        width,
+        height,
+        samples_per_pixel: spp,
+        algorithm: algo.id().to_string(),
+        display_name: algo.display_name().to_string(),
+        params: resolved
+            .into_iter()
+            .map(|(id, r)| ParamReport {
+                id,
+                value: r.value,
+                provenance: r.provenance,
+            })
+            .collect(),
+        reference: alignment.reference,
+        reference_policy: alignment.policy,
+        failure_policy: if lax { "lax" } else { "strict" }.to_string(),
+        failure_count: alignment.failure_count(),
+        alignments: alignment_entries(&alignment, &frame_names),
+        crop,
+        warped_dir: write_warped.map(|p| p.display().to_string()),
+        wall_seconds: start.elapsed().as_secs_f64(),
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(err) => return crate::fail(format!("failed to serialize JSON: {err}")),
+        }
+    } else {
+        println!("{}", render(&report));
+    }
+
+    if !lax && alignment.failure_count() > 0 {
+        let names: Vec<String> = alignment
+            .failed()
+            .map(|f| format!("{} ({:?})", frame_names[f.frame], f.status))
+            .collect();
+        return crate::fail(format!(
+            "alignment failed for {} frame(s): {}",
+            names.len(),
+            names.join(", ")
+        ));
+    }
+    if lax && alignment.failure_count() > 0 {
+        eprintln!(
+            "warning: {} frame(s) failed to register and fell back to identity",
+            alignment.failure_count()
+        );
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// Writes one warped TIFF per frame into `dir`, at **source** dimensions,
+/// uncropped -- the crop is reported, not applied, on this path, so the
+/// uncovered rim stays visible for the manual check.
+///
+/// Streams each frame in full-width bands of [`DEFAULT_TILE_SIZE`] rows
+/// through a [`WarpingReader`], the same streaming shape
+/// `PyramidalEcc::build_pyramid` uses -- never a whole-frame buffer.
+#[allow(clippy::too_many_arguments)]
+fn write_warped_frames(
+    dir: &Path,
+    stack: &TiffStack,
+    paths: &[PathBuf],
+    frame_names: &[String],
+    alignment: &StackAlignment,
+    width: u32,
+    height: u32,
+    spp: u32,
+) -> Result<(), String> {
+    match std::fs::metadata(dir) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "--write-warped target {} is not a directory",
+                dir.display()
+            ));
+        }
+        Err(_) => {
+            return Err(format!(
+                "--write-warped target {} does not exist",
+                dir.display()
+            ));
+        }
+    }
+    for name in frame_names {
+        let candidate = dir.join(name);
+        if let Some(collide) = crate::stack::colliding_frame(&candidate, paths, frame_names) {
+            return Err(format!(
+                "--write-warped target {} would overwrite input frame {collide}",
+                dir.display()
+            ));
+        }
+    }
+
+    let transforms: Vec<_> = alignment.frames.iter().map(|f| f.transform).collect();
+    let reader = WarpingReader::new(stack, (width, height), spp, transforms);
+
+    for (i, name) in frame_names.iter().enumerate() {
+        let out_path = dir.join(name);
+        let mut writer = TiffWriter::create(
+            &out_path,
+            TiffSpec {
+                width,
+                height,
+                samples_per_pixel: spp,
+                description: None,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+
+        let mut y = 0u32;
+        while y < height {
+            let band_height = DEFAULT_TILE_SIZE.min(height - y);
+            let rect = Rect {
+                x: 0,
+                y,
+                width,
+                height: band_height,
+            };
+            let mut band = vec![0u16; width as usize * band_height as usize * spp as usize];
+            reader
+                .read_tile_into(i, rect, &mut band)
+                .map_err(|e| e.to_string())?;
+            writer.write_tile(rect, &band).map_err(|e| e.to_string())?;
+            y += band_height;
+        }
+        writer.finish().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn status_text(status: &focusforge_core::algorithm::AlignStatus) -> String {
+    match status {
+        focusforge_core::algorithm::AlignStatus::Converged => "converged".to_string(),
+        focusforge_core::algorithm::AlignStatus::HitCap => "hit-cap".to_string(),
+        focusforge_core::algorithm::AlignStatus::Diverged(reason) => {
+            format!("diverged({reason:?})")
+        }
+        // `AlignStatus` is `#[non_exhaustive]`: a future variant renders as
+        // its own `Debug` text rather than failing to compile here.
+        other => format!("{other:?}"),
+    }
+}
+
+/// Human rendering of one [`AlignReport`]: one row per frame, unit-testable
+/// without capturing stdout. `rho` is labelled in a header line so it is
+/// never mistaken for a pixel distance.
+pub(crate) fn render(report: &AlignReport) -> String {
+    let mut lines = vec![
+        format!("{} ({} frames)", report.input, report.frame_count),
+        format!(
+            "{} - {} (reference={} policy={:?} failure_policy={} failures={})",
+            report.algorithm,
+            report.display_name,
+            report.reference,
+            report.reference_policy,
+            report.failure_policy,
+            report.failure_count,
+        ),
+        "rho = ECC correlation in [-1, 1], not a pixel distance".to_string(),
+    ];
+    for entry in &report.alignments {
+        let mut line = format!(
+            "{:9} tx={:+.2} ty={:+.2} scale={:.6} rot={:+.4}deg  {} iters={} rho={:.4}",
+            entry.name,
+            entry.tx,
+            entry.ty,
+            entry.scale,
+            entry.rotation_deg,
+            status_text(&entry.base.status),
+            entry.base.iterations,
+            entry.base.residual,
+        );
+        if entry.base.frame == report.reference {
+            line.push_str(" (reference)");
+        }
+        if entry.base.fallback {
+            line.push_str(" [fallback]");
+        }
+        lines.push(line);
+    }
+    match report.crop {
+        Some(rect) => lines.push(format!(
+            "auto-crop: {},{} {}x{}",
+            rect.x, rect.y, rect.width, rect.height
+        )),
+        None => lines.push("auto-crop: empty (frame footprints do not intersect)".to_string()),
+    }
+    lines.join("\n")
+}
+
+/// The message an empty crop refuses `stack` with -- unit-tested here
+/// because no fixture produces disjoint footprints
+/// (`crates/core/src/align/crop.rs`'s own `disjoint_footprints_are_empty`
+/// covers the geometry).
+pub(crate) fn empty_crop_refusal() -> String {
+    "auto-crop is empty: the frames' footprints do not intersect; re-run with --no-crop".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_crop_refusal_names_the_flag() {
+        let msg = empty_crop_refusal();
+        assert!(msg.contains("--no-crop"));
+        assert!(msg.contains("empty"));
+    }
+}

@@ -1,0 +1,703 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! `pyramidal-ecc` (the [`AlignAlgorithm`]) and [`align_stack`] (the
+//! whole-stack driver), exercised against `fixtures/mantis-512` and
+//! synthetic in-memory readers. Opened the way `crates/core/tests/
+//! ecc_solver.rs` opens its fixture: `mod common;` plus
+//! `TiffStack::open(common::mantis_512_dir())`, never a relative literal.
+//!
+//! Ground-truth pairs are built the same way `ecc_solver.rs` builds them:
+//! frame 3 (`03.tif`, the sharpest fixture frame) warped by a known
+//! [`Transform`], registered against its own unwarped self -- the only
+//! configuration where the "known" transform is actually known (see that
+//! file's module docs for why).
+
+mod common;
+
+use std::path::PathBuf;
+
+use focusforge_core::algorithm::{
+    AlgorithmError, AlignAlgorithm, AlignContext, AlignStatus, TileReader,
+};
+use focusforge_core::align::warp::warp_from_tile;
+use focusforge_core::align::{FailurePolicy, PyramidalEcc, Transform, align_stack};
+use focusforge_core::io::{TiffError, TiffStack};
+use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
+use focusforge_core::tile::{Rect, Tile};
+
+const FRAME_3: usize = 3;
+
+fn open_fixture() -> TiffStack {
+    TiffStack::open(common::mantis_512_dir()).expect("opening fixtures/mantis-512")
+}
+
+fn full_rect(width: u32, height: u32) -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    }
+}
+
+/// Opens `fixtures/mantis-512` and reads frame 3's full tile.
+fn frame_3_tile() -> (Tile, u32, u32, u32) {
+    let stack = open_fixture();
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(FRAME_3).samples_per_pixel;
+    let rect = full_rect(width, height);
+    let tile = stack
+        .read_tile(FRAME_3, rect)
+        .expect("reading frame 3's tile");
+    (tile, width, height, spp)
+}
+
+/// The region every ground-truth test here solves over -- identical to the
+/// region `crates/core/tests/ecc_solver.rs` measures and to what
+/// `PyramidalEcc::solve_region` itself computes for a 512px level, so these
+/// tests measure against the same rect the driver actually uses.
+fn default_region() -> Rect {
+    Rect {
+        x: 64,
+        y: 64,
+        width: 384,
+        height: 384,
+    }
+}
+
+/// The maximum, over `region`'s four corners, of the Euclidean distance
+/// between where `a` and `b` map that corner -- the same "corner
+/// displacement" measure the solver's own termination criterion uses.
+fn corner_error(a: &Transform, b: &Transform, region: Rect) -> f64 {
+    let corners = [
+        (region.x as f64, region.y as f64),
+        ((region.x + region.width - 1) as f64, region.y as f64),
+        (region.x as f64, (region.y + region.height - 1) as f64),
+        (
+            (region.x + region.width - 1) as f64,
+            (region.y + region.height - 1) as f64,
+        ),
+    ];
+    corners
+        .iter()
+        .map(|&(x, y)| {
+            let (ax, ay) = a.map_point(x, y).expect("ground truth stays in domain");
+            let (bx, by) = b
+                .map_point(x, y)
+                .expect("recovered transform stays in domain");
+            ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt()
+        })
+        .fold(0.0f64, f64::max)
+}
+
+/// A rotation+scale [`Transform`] about `(cx, cy)`.
+fn similarity_about(scale: f64, radians: f64, cx: f64, cy: f64) -> Transform {
+    let to_origin = Transform::translation(-cx, -cy);
+    let rot_scale = Transform::similarity(scale, radians, 0.0, 0.0);
+    let back = Transform::translation(cx, cy);
+    back.compose(&rot_scale).compose(&to_origin)
+}
+
+/// A deterministic xorshift32 PRNG -- never `rand`, mirroring the private
+/// generators already reimplemented per-file in this crate's own tests.
+struct XorShift32(u32);
+
+impl XorShift32 {
+    fn next(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.0 = x;
+        x
+    }
+}
+
+/// A synthetic in-memory [`TileReader`] over an arbitrary number of
+/// same-sized frames, honouring the same exact-length and in-bounds
+/// contracts as [`focusforge_core::io::TiffStack::read_tile_into`] --
+/// mirrors `crates/core/src/algorithm/mod.rs`'s own test-only `VecReader`.
+struct FramesReader {
+    width: u32,
+    height: u32,
+    spp: u32,
+    frames: Vec<Vec<u16>>,
+}
+
+impl TileReader for FramesReader {
+    fn read_tile_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        let Some(src) = self.frames.get(frame) else {
+            return Err(AlgorithmError::FrameOutOfRange {
+                frame,
+                frame_count: self.frames.len(),
+            });
+        };
+        let expected = rect.width as usize * rect.height as usize * self.spp as usize;
+        if out.len() != expected {
+            return Err(AlgorithmError::Tiff(TiffError::BufferSize {
+                expected,
+                got: out.len(),
+            }));
+        }
+        let in_bounds = rect
+            .x
+            .checked_add(rect.width)
+            .is_some_and(|xw| xw <= self.width)
+            && rect
+                .y
+                .checked_add(rect.height)
+                .is_some_and(|yh| yh <= self.height);
+        if !in_bounds {
+            return Err(AlgorithmError::Tiff(TiffError::OutOfBounds {
+                path: PathBuf::from("<memory>"),
+                requested: rect,
+                frame: (self.width, self.height),
+            }));
+        }
+        let stride = self.width as usize * self.spp as usize;
+        let row_len = rect.width as usize * self.spp as usize;
+        let mut off = 0;
+        for r in rect.y..(rect.y + rect.height) {
+            let row_start = r as usize * stride + rect.x as usize * self.spp as usize;
+            out[off..off + row_len].copy_from_slice(&src[row_start..row_start + row_len]);
+            off += row_len;
+        }
+        Ok(())
+    }
+}
+
+/// A reader that must never be asked for a pixel -- proves a rejection
+/// happened before any registration ran.
+struct PanicReader;
+
+impl TileReader for PanicReader {
+    fn read_tile_into(
+        &self,
+        _frame: usize,
+        _rect: Rect,
+        _out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        panic!("no pixel should be read once the schema has rejected the parameters")
+    }
+}
+
+/// A two-frame reader: frame 0 is `reference`, frame 1 is `moving`.
+fn two_frame_reader(
+    width: u32,
+    height: u32,
+    spp: u32,
+    reference: Vec<u16>,
+    moving: Vec<u16>,
+) -> FramesReader {
+    FramesReader {
+        width,
+        height,
+        spp,
+        frames: vec![reference, moving],
+    }
+}
+
+fn cfg_with(mode: &str, pyramid_depth: i64, max_iterations: i64) -> ParamValues {
+    let mut cfg = ParamValues::new();
+    cfg.insert("mode".to_string(), ParamValue::Enum(mode.to_string()));
+    cfg.insert(
+        "max-iterations".to_string(),
+        ParamValue::Int(max_iterations),
+    );
+    cfg.insert("epsilon-px".to_string(), ParamValue::Float(1e-4));
+    cfg.insert("pyramid-depth".to_string(), ParamValue::Int(pyramid_depth));
+    cfg.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("anchor".to_string()),
+    );
+    cfg.insert(
+        "reference-frame".to_string(),
+        ParamValue::Enum("first".to_string()),
+    );
+    cfg
+}
+
+/// Fully resolved defaults for `PyramidalEcc` against `ctx` -- what a real
+/// caller (`align_stack`'s own caller) is expected to hand `align_frame`,
+/// per the same "`fuse` receives a fully resolved `ParamValues`" contract
+/// `StackAlgorithm::fuse` documents.
+fn resolved_defaults(ctx: &StackContext) -> ParamValues {
+    let resolved = params::resolve(PyramidalEcc.params(), &ParamValues::new(), ctx)
+        .expect("defaults resolve cleanly");
+    params::resolved_values(&resolved)
+}
+
+/// Measured 2026-09-13: corner error `2.39e-5` px through the four-level
+/// driven path (`pyramid-depth = 3`), larger than the single-level
+/// `9.24e-7` px measurement on the same data and quantity
+/// (`crates/core/tests/ecc_solver.rs`) because the driven path enters
+/// level 0 already near the optimum and stops further out than a solve
+/// iterated in from identity. Still well inside the pinned `1e-4` px.
+const TRANSLATION_TOLERANCE_PX: f64 = 1e-4;
+
+/// Measured 2026-09-13 the same way,
+/// `recovers_known_rotation_scale_through_the_driver`: corner error
+/// `5.44e-6` px. Pinned at the single-level test's `1e-3` px -- comfortable
+/// headroom over the measured figure.
+const ROTATION_SCALE_TOLERANCE_PX: f64 = 1e-3;
+
+/// Measured 2026-09-13 (`cargo test -p focusforge-core --test align_algorithm
+/// coarse_to_fine_beats_single_level -- --nocapture`), driven path
+/// (`pyramid-depth = 3`, `max-iterations = 100`) recovering an 80px
+/// translation: corner error `6.07e-3` px -- an order of magnitude looser
+/// than [`TRANSLATION_TOLERANCE_PX`], because an 80px displacement is a much
+/// larger normal-equation excursion than the 6.5px pair that tolerance was
+/// measured on. Pinned at ~100x the measured figure.
+const COARSE_TO_FINE_TOLERANCE_PX: f64 = 1.0;
+
+#[test]
+fn recovers_known_translation_through_the_driver() {
+    let (tile, width, height, spp) = frame_3_tile();
+    let rect = full_rect(width, height);
+    let w_true = Transform::translation(6.5, -4.25);
+    let warped = warp_from_tile(&tile, (width, height), rect, &w_true)
+        .expect("translation stays well inside the frame");
+
+    let reader = two_frame_reader(width, height, spp, warped.tile.samples, tile.samples);
+    let stack_ctx = StackContext::new(2, width, height, spp);
+    let ctx = AlignContext::new(stack_ctx, 0, &reader);
+    let cfg = cfg_with("translation", 3, 50);
+
+    let outcome = PyramidalEcc
+        .align_frame(&ctx, 1, &cfg)
+        .expect("valid solver inputs");
+    assert_eq!(
+        outcome.status,
+        AlignStatus::Converged,
+        "outcome: {outcome:?}"
+    );
+    let error = corner_error(&outcome.transform, &w_true, default_region());
+    eprintln!("recovers_known_translation_through_the_driver: corner error = {error} px");
+    assert!(
+        error < TRANSLATION_TOLERANCE_PX,
+        "corner error {error} px exceeds {TRANSLATION_TOLERANCE_PX} px"
+    );
+}
+
+#[test]
+fn recovers_known_rotation_scale_through_the_driver() {
+    let (tile, width, height, spp) = frame_3_tile();
+    let rect = full_rect(width, height);
+    let region = default_region();
+    let (cx, cy) = (
+        (region.x + region.width / 2) as f64,
+        (region.y + region.height / 2) as f64,
+    );
+    let w_true = similarity_about(1.002, 2.0f64.to_radians(), cx, cy);
+    let warped = warp_from_tile(&tile, (width, height), rect, &w_true)
+        .expect("rotation+scale stays well inside the frame");
+
+    let reader = two_frame_reader(width, height, spp, warped.tile.samples, tile.samples);
+    let stack_ctx = StackContext::new(2, width, height, spp);
+    let ctx = AlignContext::new(stack_ctx, 0, &reader);
+    let cfg = cfg_with("rotation-scale", 3, 50);
+
+    let outcome = PyramidalEcc
+        .align_frame(&ctx, 1, &cfg)
+        .expect("valid solver inputs");
+    assert_eq!(
+        outcome.status,
+        AlignStatus::Converged,
+        "outcome: {outcome:?}"
+    );
+    let error = corner_error(&outcome.transform, &w_true, region);
+    eprintln!("recovers_known_rotation_scale_through_the_driver: corner error = {error} px");
+    assert!(
+        error < ROTATION_SCALE_TOLERANCE_PX,
+        "corner error {error} px exceeds {ROTATION_SCALE_TOLERANCE_PX} px"
+    );
+}
+
+#[test]
+fn translation_mode_returns_pure_translation() {
+    let (tile, width, height, spp) = frame_3_tile();
+    let rect = full_rect(width, height);
+    let w_true = Transform::translation(20.0, -15.0);
+    let warped = warp_from_tile(&tile, (width, height), rect, &w_true)
+        .expect("translation stays well inside the frame");
+
+    let reader = two_frame_reader(width, height, spp, warped.tile.samples, tile.samples);
+    let stack_ctx = StackContext::new(2, width, height, spp);
+    let ctx = AlignContext::new(stack_ctx, 0, &reader);
+    let cfg = cfg_with("translation", 3, 50);
+
+    let outcome = PyramidalEcc
+        .align_frame(&ctx, 1, &cfg)
+        .expect("valid solver inputs");
+    let m = outcome.transform.m;
+    assert_eq!(
+        m[0][0], 1.0,
+        "translation mode must never move scale/rotation: {m:?}"
+    );
+    assert_eq!(m[1][1], 1.0, "{m:?}");
+    assert_eq!(m[0][1], 0.0, "{m:?}");
+    assert_eq!(m[1][0], 0.0, "{m:?}");
+    assert_eq!(m[2], [0.0, 0.0, 1.0], "{m:?}");
+}
+
+#[test]
+fn rotation_scale_mode_returns_a_similarity() {
+    let (tile, width, height, spp) = frame_3_tile();
+    let rect = full_rect(width, height);
+    let region = default_region();
+    let (cx, cy) = (
+        (region.x + region.width / 2) as f64,
+        (region.y + region.height / 2) as f64,
+    );
+    let w_true = similarity_about(1.002, 2.0f64.to_radians(), cx, cy);
+    let warped = warp_from_tile(&tile, (width, height), rect, &w_true)
+        .expect("rotation+scale stays well inside the frame");
+
+    let reader = two_frame_reader(width, height, spp, warped.tile.samples, tile.samples);
+    let stack_ctx = StackContext::new(2, width, height, spp);
+    let ctx = AlignContext::new(stack_ctx, 0, &reader);
+    let cfg = cfg_with("rotation-scale", 3, 50);
+
+    let outcome = PyramidalEcc
+        .align_frame(&ctx, 1, &cfg)
+        .expect("valid solver inputs");
+    let m = outcome.transform.m;
+    // 1e-12: the same tolerance `transform.rs`'s own similarity-shape check
+    // uses -- composing several per-level similarity matrices accumulates
+    // float error in the bottom-right entry (measured: `0.9999999999999997`),
+    // so this is a rounding tolerance, not a structural one.
+    assert!((m[2][0] - 0.0).abs() < 1e-12, "{m:?}");
+    assert!((m[2][1] - 0.0).abs() < 1e-12, "{m:?}");
+    assert!((m[2][2] - 1.0).abs() < 1e-12, "{m:?}");
+    assert!((m[0][0] - m[1][1]).abs() < 1e-12, "{m:?}");
+    assert!((m[0][1] + m[1][0]).abs() < 1e-12, "{m:?}");
+}
+
+#[test]
+fn coarse_to_fine_beats_single_level() {
+    let (tile, width, height, spp) = frame_3_tile();
+    let rect = full_rect(width, height);
+    let w_true = Transform::translation(80.0, 0.0);
+    let warped = warp_from_tile(&tile, (width, height), rect, &w_true)
+        .expect("80px translation stays well inside the frame");
+
+    let reader = two_frame_reader(
+        width,
+        height,
+        spp,
+        warped.tile.samples.clone(),
+        tile.samples.clone(),
+    );
+    let stack_ctx = StackContext::new(2, width, height, spp);
+    let ctx = AlignContext::new(stack_ctx, 0, &reader);
+
+    let single_level = PyramidalEcc
+        .align_frame(&ctx, 1, &cfg_with("translation", 0, 50))
+        .expect("valid solver inputs");
+    let single_ok = single_level.status == AlignStatus::Converged
+        && corner_error(&single_level.transform, &w_true, default_region())
+            < TRANSLATION_TOLERANCE_PX;
+    assert!(
+        !single_ok,
+        "a single level (pyramid-depth = 0) must not recover an 80px translation, \
+         which is beyond the measured 60px single-level capture range: {single_level:?}"
+    );
+
+    let driven = PyramidalEcc
+        .align_frame(&ctx, 1, &cfg_with("translation", 3, 100))
+        .expect("valid solver inputs");
+    assert_eq!(driven.status, AlignStatus::Converged, "outcome: {driven:?}");
+    let error = corner_error(&driven.transform, &w_true, default_region());
+    eprintln!("coarse_to_fine_beats_single_level: driven (depth=3) corner error = {error} px");
+    assert!(
+        error < COARSE_TO_FINE_TOLERANCE_PX,
+        "corner error {error} px exceeds {COARSE_TO_FINE_TOLERANCE_PX} px"
+    );
+}
+
+#[test]
+fn reference_frame_is_identity() {
+    let stack = open_fixture();
+    let (width, height) = stack.dimensions();
+    let stack_ctx = StackContext::new(
+        stack.len(),
+        width,
+        height,
+        stack.header(0).samples_per_pixel,
+    );
+    let cfg = resolved_defaults(&stack_ctx);
+
+    let result = align_stack(
+        &PyramidalEcc,
+        stack_ctx,
+        &stack,
+        &cfg,
+        FailurePolicy::Strict,
+    )
+    .expect("real fixture frames register");
+
+    assert_eq!(result.reference, 3, "middle of 8 frames is (8-1)/2 = 3");
+    assert_eq!(result.frames.len(), 8);
+    let reference_frame = &result.frames[3];
+    assert_eq!(reference_frame.transform, Transform::identity());
+    assert_eq!(
+        reference_frame.iterations, 0,
+        "the reference short-circuit reads no pixel"
+    );
+
+    for (i, frame) in result.frames.iter().enumerate() {
+        eprintln!(
+            "reference_frame_is_identity: frame {i} status={:?} iterations={} residual={}",
+            frame.status, frame.iterations, frame.residual
+        );
+        if i == 3 {
+            continue;
+        }
+        if i == 0 {
+            // Measured 2026-09-13, default settings (rotation-scale,
+            // auto pyramid-depth = 3, max-iterations = 50): frame 0
+            // genuinely diverges against the middle-anchor frame 3
+            // (`Diverged(LemmaOneRegion)` on the coarsest level's very
+            // first Newton step), not a solver defect -- consistent with a
+            // measured high-passed NCC of <= 0.07 for frames two or more
+            // steps from the anchor. The solver reports this honestly
+            // (`Diverged`, best-rho transform = identity, since the very first
+            // step failed) rather than fabricating a plausible-looking match.
+            assert!(
+                matches!(frame.status, AlignStatus::Diverged(_)),
+                "frame 0's own divergence must still be reported, not silently \
+                 substituted: {frame:?}"
+            );
+            continue;
+        }
+        assert_ne!(
+            frame.transform,
+            Transform::identity(),
+            "frame {i} must not report identity against a different reference: {frame:?}"
+        );
+    }
+}
+
+#[test]
+fn unregisterable_frame_follows_failure_policy() {
+    let (tile, width, height, spp) = frame_3_tile();
+    let rect = full_rect(width, height);
+
+    let shift = Transform::translation(8.0, 3.0);
+    let warped = warp_from_tile(&tile, (width, height), rect, &shift)
+        .expect("small translation stays well inside the frame");
+
+    let mut rng = XorShift32(0xC0FFEE);
+    let noise: Vec<u16> = (0..tile.samples.len())
+        .map(|_| (rng.next() % 65536) as u16)
+        .collect();
+
+    let stack_ctx = StackContext::new(3, width, height, spp);
+    let mut cfg = resolved_defaults(&stack_ctx);
+    cfg.insert(
+        "reference-frame".to_string(),
+        ParamValue::Enum("first".to_string()),
+    );
+
+    let make_reader = || FramesReader {
+        width,
+        height,
+        spp,
+        frames: vec![
+            tile.samples.clone(),
+            warped.tile.samples.clone(),
+            noise.clone(),
+        ],
+    };
+
+    let strict = align_stack(
+        &PyramidalEcc,
+        stack_ctx,
+        &make_reader(),
+        &cfg,
+        FailurePolicy::Strict,
+    )
+    .expect("the run completes even with a failing frame");
+    assert_eq!(strict.frames.len(), 3, "every frame carries an outcome");
+    assert_eq!(
+        strict.failure_count(),
+        1,
+        "only the noise frame must fail: {:?}",
+        strict.frames
+    );
+    let strict_failed = strict.failed().next().expect("one failure");
+    assert_eq!(strict_failed.frame, 2);
+    assert!(!strict_failed.fallback);
+    // Strict reports whatever the solver's own best-rho transform was --
+    // here that happens to be identity, because the noise pair diverges on
+    // the coarsest level's very first step, before any update is applied.
+    // `fallback == false` is what proves this is the solver's honest
+    // answer and not a substitution.
+    eprintln!(
+        "unregisterable_frame_follows_failure_policy: strict best-rho transform = {:?}",
+        strict_failed.transform
+    );
+
+    let fallback = align_stack(
+        &PyramidalEcc,
+        stack_ctx,
+        &make_reader(),
+        &cfg,
+        FailurePolicy::IdentityFallback,
+    )
+    .expect("the run completes even with a failing frame");
+    assert_eq!(fallback.frames.len(), 3);
+    assert_eq!(fallback.failure_count(), 1);
+    let fallback_failed = fallback.failed().next().expect("one failure");
+    assert_eq!(fallback_failed.frame, 2);
+    assert!(fallback_failed.fallback);
+    assert_eq!(fallback_failed.transform, Transform::identity());
+}
+
+#[test]
+fn anchor_and_chain_policies_both_run() {
+    let stack = open_fixture();
+    let (width, height) = stack.dimensions();
+    let stack_ctx = StackContext::new(
+        stack.len(),
+        width,
+        height,
+        stack.header(0).samples_per_pixel,
+    );
+    let mut cfg = resolved_defaults(&stack_ctx);
+
+    cfg.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("anchor".to_string()),
+    );
+    let anchor = align_stack(
+        &PyramidalEcc,
+        stack_ctx,
+        &stack,
+        &cfg,
+        FailurePolicy::Strict,
+    )
+    .expect("anchor run completes");
+    assert_eq!(anchor.frames.len(), 8);
+
+    cfg.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("chain".to_string()),
+    );
+    let chain = align_stack(
+        &PyramidalEcc,
+        stack_ctx,
+        &stack,
+        &cfg,
+        FailurePolicy::Strict,
+    )
+    .expect("chain run completes");
+    assert_eq!(chain.frames.len(), 8);
+
+    // Measured 2026-09-13 (`-- --nocapture`), not asserted at fixture
+    // scale -- ground truth is weak on this fixture either way.
+    let last = 7;
+    let diff = corner_error(
+        &anchor.frames[last].transform,
+        &chain.frames[last].transform,
+        default_region(),
+    );
+    eprintln!(
+        "anchor_and_chain_policies_both_run: frame {last} anchor-vs-chain corner difference = {diff} px"
+    );
+}
+
+#[test]
+fn outcome_distinguishes_converged_from_capped() {
+    let (tile, width, height, spp) = frame_3_tile();
+    let rect = full_rect(width, height);
+    let w_true = Transform::translation(6.5, -4.25);
+    let warped = warp_from_tile(&tile, (width, height), rect, &w_true)
+        .expect("translation stays well inside the frame");
+
+    let reader = two_frame_reader(
+        width,
+        height,
+        spp,
+        warped.tile.samples.clone(),
+        tile.samples.clone(),
+    );
+    let stack_ctx = StackContext::new(2, width, height, spp);
+    let ctx = AlignContext::new(stack_ctx, 0, &reader);
+
+    let converged = PyramidalEcc
+        .align_frame(&ctx, 1, &cfg_with("translation", 3, 50))
+        .expect("valid solver inputs");
+    assert_eq!(converged.status, AlignStatus::Converged, "{converged:?}");
+
+    let capped = PyramidalEcc
+        .align_frame(&ctx, 1, &cfg_with("translation", 3, 1))
+        .expect("valid solver inputs");
+    assert_ne!(
+        capped.status,
+        AlignStatus::Converged,
+        "one iteration per level must not be enough to converge: {capped:?}"
+    );
+
+    for outcome in [&converged, &capped] {
+        assert!(
+            outcome.residual.is_finite() && (-1.0..=1.0).contains(&outcome.residual),
+            "residual {} is out of [-1, 1]",
+            outcome.residual
+        );
+    }
+    assert_ne!(converged.status, capped.status);
+}
+
+#[test]
+fn rejects_out_of_range_parameters() {
+    let stack_ctx = StackContext::new(2, 512, 512, 3);
+    let reader = PanicReader;
+    let ctx = AlignContext::new(stack_ctx, 0, &reader);
+
+    let mut bad_iterations = cfg_with("translation", 3, 50);
+    bad_iterations.insert("max-iterations".to_string(), ParamValue::Int(0));
+    match PyramidalEcc.align_frame(&ctx, 1, &bad_iterations) {
+        Err(AlgorithmError::Params(_)) => {}
+        other => panic!("expected AlgorithmError::Params for max-iterations=0, got {other:?}"),
+    }
+
+    let mut bad_epsilon = cfg_with("translation", 3, 50);
+    bad_epsilon.insert("epsilon-px".to_string(), ParamValue::Float(-1.0));
+    match PyramidalEcc.align_frame(&ctx, 1, &bad_epsilon) {
+        Err(AlgorithmError::Params(_)) => {}
+        other => panic!("expected AlgorithmError::Params for epsilon-px=-1.0, got {other:?}"),
+    }
+}
+
+#[test]
+fn pyramid_depth_beyond_the_resolution_is_a_named_error() {
+    let (tile, width, height, spp) = frame_3_tile();
+    let reader = two_frame_reader(
+        width,
+        height,
+        spp,
+        tile.samples.clone(),
+        tile.samples.clone(),
+    );
+    let stack_ctx = StackContext::new(2, width, height, spp);
+    let ctx = AlignContext::new(stack_ctx, 0, &reader);
+
+    // max_levels(512, 512) == 7, so 9 is beyond the resolution.
+    let cfg = cfg_with("translation", 9, 50);
+    match PyramidalEcc.align_frame(&ctx, 1, &cfg) {
+        Err(AlgorithmError::Failed { algorithm, detail }) => {
+            assert_eq!(algorithm, "pyramidal-ecc");
+            assert!(
+                detail.contains("exceeds the maximum"),
+                "detail must carry PyramidError::LevelsTooDeep's own message: {detail}"
+            );
+        }
+        other => panic!("expected AlgorithmError::Failed, got {other:?}"),
+    }
+}

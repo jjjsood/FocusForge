@@ -52,7 +52,7 @@ impl AlignAlgorithm for SyntheticAlign {
         _ctx: &crate::algorithm::AlignContext<'_>,
         _frame: usize,
         _cfg: &ParamValues,
-    ) -> Result<crate::align::Transform, crate::algorithm::AlgorithmError> {
+    ) -> Result<crate::algorithm::AlignOutcome, crate::algorithm::AlgorithmError> {
         unreachable!("synthetic algorithm is never run, only indexed")
     }
 }
@@ -204,7 +204,7 @@ fn each_family_listing_holds_only_its_own_family() {
         stack_ids,
         vec!["depth-map", "dummy-stack", "laplacian", "weighted-average"]
     );
-    assert_eq!(align_ids, vec!["dummy-align"]);
+    assert_eq!(align_ids, vec!["dummy-align", "pyramidal-ecc"]);
 
     assert_eq!(
         stacks.len() + aligns.len(),
@@ -233,9 +233,10 @@ fn lists_every_registered_algorithm() {
             "dummy-align",
             "dummy-stack",
             "laplacian",
+            "pyramidal-ecc",
             "weighted-average"
         ],
-        "the listing must contain exactly the two dummies plus the three registered \
+        "the listing must contain exactly the two dummies plus the four registered \
          real algorithms, in this order"
     );
     for entry in &listing {

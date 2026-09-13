@@ -22,6 +22,24 @@ pub struct SetArgs {
     pub set: Vec<(String, String)>,
 }
 
+/// `--align-set key=value`, [`SetArgs`]'s twin for `stack`'s alignment
+/// stage: a second flattened struct, not a shared `--set`, because `mode`
+/// is a parameter id both a stacking algorithm's schema (in test builds)
+/// and an alignment algorithm's can declare, so one shared flag would be
+/// ambiguous about which schema a given `mode=...` pair validates against.
+#[derive(Args, Debug, Default)]
+pub struct AlignSetArgs {
+    /// Set an alignment parameter: `--align-set key=value`, repeatable. A
+    /// repeated key is last-wins. The Rust field is named `align_set`, not
+    /// `set` -- clap derives an argument's internal id from the field name
+    /// by default, and flattening two structs that both name their field
+    /// `set` into the same parent command collides on that id even though
+    /// their `--long` spellings differ (clap 4.6.6 debug assertion:
+    /// "Argument names must be unique").
+    #[arg(long = "align-set", value_name = "KEY=VALUE", value_parser = parse_key_val)]
+    pub align_set: Vec<(String, String)>,
+}
+
 /// Splits `s` at the first `=`, rejecting text with no `=` and rejecting an
 /// empty key. Both rejections are clap's own: returning `Err` from a
 /// `value_parser` makes clap print its own usage error and exit the process

@@ -114,6 +114,8 @@ fn shared_laplacian_run() -> &'static SharedRun {
             "--algo",
             "laplacian",
             "--json",
+            "--no-align",
+            "--no-crop",
         ]);
         assert!(
             result.success,
@@ -147,7 +149,7 @@ fn library_oracle() -> &'static OracleResult {
         let (width, height) = stack.dimensions();
         let spp = stack.header(0).samples_per_pixel;
         let frame_count = stack.len();
-        let stack_ctx = StackContext::new(frame_count, width, height);
+        let stack_ctx = StackContext::new(frame_count, width, height, spp);
 
         let algo = registry::find_stack("laplacian").expect("laplacian must be registered");
         let resolved = params::resolve(algo.params(), &ParamValues::new(), &stack_ctx)
@@ -176,6 +178,8 @@ fn library_oracle() -> &'static OracleResult {
                 height,
                 samples_per_pixel: spp,
                 frame_count: frame_count as u32,
+                crop: None,
+                description: None,
             },
         )
         .expect("consumer must create");
@@ -340,6 +344,8 @@ fn refuses_levels_the_tile_geometry_cannot_plan() {
         "laplacian",
         "--set",
         "levels=7",
+        "--no-align",
+        "--no-crop",
     ]);
     assert!(
         !out.success,
@@ -383,6 +389,8 @@ fn writes_the_zmap_on_request() {
         output.to_str().unwrap(),
         "--algo",
         "dummy-stack",
+        "--no-align",
+        "--no-crop",
     ]);
     assert!(out.success, "stderr: {}", out.stderr);
     let entries: Vec<String> = std::fs::read_dir(&dir)
@@ -448,6 +456,8 @@ fn report_contains_every_field() {
         zmap.to_str().unwrap(),
         "--algo",
         "dummy-stack",
+        "--no-align",
+        "--no-crop",
     ]);
     assert!(out.success, "stderr: {}", out.stderr);
     for needle in [
@@ -513,6 +523,8 @@ fn report_json_has_every_field() {
         "--algo",
         "dummy-stack",
         "--json",
+        "--no-align",
+        "--no-crop",
     ]);
     assert!(out.success, "stderr: {}", out.stderr);
     let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
@@ -561,6 +573,8 @@ fn failed_run_leaves_no_output() {
         bad_zmap.to_str().unwrap(),
         "--algo",
         "dummy-stack",
+        "--no-align",
+        "--no-crop",
     ]);
     assert!(
         !out.success,
@@ -606,6 +620,109 @@ fn refuses_a_non_uniform_frame_set() {
         out.stderr
     );
     assert!(!output.exists());
+}
+
+/// `stack` computes transforms and warps frame tiles through them before
+/// fusing: an aligned run must produce a different composite than the
+/// unaligned one. `--align-algo pyramidal-ecc --lax` is explicit because
+/// this test binary also registers `dummy-align` (`test-algorithms`
+/// feature), so a bare default would hit the "more than one alignment
+/// algorithm" refusal -- `--lax` because frame 0 of this fixture diverges
+/// against the default middle anchor.
+#[test]
+fn stack_aligns_before_fusing() {
+    let dir = tmp_dir("stack_aligns_before_fusing");
+    let unaligned = dir.join("unaligned.tif");
+    let aligned = dir.join("aligned.tif");
+
+    let out_a = run_cli(&[
+        "stack",
+        mantis_512_dir().to_str().unwrap(),
+        "-o",
+        unaligned.to_str().unwrap(),
+        "--algo",
+        "laplacian",
+        "--no-align",
+        "--no-crop",
+    ]);
+    assert!(out_a.success, "stderr: {}", out_a.stderr);
+
+    let out_b = run_cli(&[
+        "stack",
+        mantis_512_dir().to_str().unwrap(),
+        "-o",
+        aligned.to_str().unwrap(),
+        "--algo",
+        "laplacian",
+        "--align-algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--no-crop",
+    ]);
+    assert!(out_b.success, "stderr: {}", out_b.stderr);
+
+    let (unaligned_samples, ..) = read_whole(&unaligned);
+    let (aligned_samples, ..) = read_whole(&aligned);
+    assert_ne!(
+        unaligned_samples, aligned_samples,
+        "an aligned run must differ from the unaligned one"
+    );
+}
+
+/// The auto-crop is applied to `stack`'s output by default: composite and
+/// Z-Map are both declared at the crop rect's dimensions, and the rect
+/// matches what `align --json` reports for the same stack.
+#[test]
+fn stack_output_carries_the_auto_crop() {
+    let dir = tmp_dir("stack_output_carries_the_auto_crop");
+    let output = dir.join("out.tif");
+    let zmap = dir.join("out-zmap.tif");
+    let out = run_cli(&[
+        "stack",
+        mantis_512_dir().to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--zmap",
+        zmap.to_str().unwrap(),
+        "--algo",
+        "laplacian",
+        "--align-algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--json",
+    ]);
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    let crop = report["crop"]
+        .as_object()
+        .expect("crop object present when aligned");
+
+    let (_, cw, ch, _) = read_whole(&output);
+    assert_eq!(cw as u64, crop["width"].as_u64().unwrap());
+    assert_eq!(ch as u64, crop["height"].as_u64().unwrap());
+
+    let (_, zw, zh, _) = read_whole(&zmap);
+    assert_eq!(
+        (zw, zh),
+        (cw, ch),
+        "the Z-Map must be declared at the crop rect's dimensions too"
+    );
+
+    let align_out = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--json",
+    ]);
+    assert!(align_out.success, "stderr: {}", align_out.stderr);
+    let align_report: serde_json::Value =
+        serde_json::from_str(&align_out.stdout).expect("valid JSON");
+    assert_eq!(
+        report["crop"], align_report["crop"],
+        "stack's crop must match align's crop for the same stack"
+    );
 }
 
 #[test]

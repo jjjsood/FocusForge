@@ -14,6 +14,9 @@ retouching the result.
 
 - [`guide/stacking.md`](guide/stacking.md) — running `focusforge-cli stack`,
   choosing an algorithm, and getting the Z-Map
+- [`guide/alignment.md`](guide/alignment.md) — how `focusforge-cli
+  align`/`stack` register frames before fusing, choosing a mode, and
+  checking a result before committing to a full run
 
 ## Reference
 

@@ -6,7 +6,7 @@
 
 use std::sync::LazyLock;
 
-use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext};
+use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus};
 use crate::align::Transform;
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues};
 use crate::registry::AlignRegistration;
@@ -45,15 +45,21 @@ impl AlignAlgorithm for DummyAlign {
         ctx: &AlignContext<'_>,
         frame: usize,
         cfg: &ParamValues,
-    ) -> Result<Transform, AlgorithmError> {
+    ) -> Result<AlignOutcome, AlgorithmError> {
         crate::params::validate(self.params(), cfg)?;
-        if frame == ctx.reference() {
-            Ok(Transform::identity())
+        let transform = if frame == ctx.reference() {
+            Transform::identity()
         } else {
             let mut m = Transform::identity().m;
             m[0][2] = frame as f64 - ctx.reference() as f64;
-            Ok(Transform { m })
-        }
+            Transform { m }
+        };
+        Ok(AlignOutcome {
+            transform,
+            status: AlignStatus::Converged,
+            iterations: 1,
+            residual: 1.0,
+        })
     }
 }
 

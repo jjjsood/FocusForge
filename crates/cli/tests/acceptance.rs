@@ -80,6 +80,13 @@ fn full_stack_similarity_to_mantis_stacked_is_recorded() {
     // A composite identical to the reference (or a mismatched shape) would
     // mean the wrong file was compared -- these are the only things this
     // test asserts. Nothing about the similarity numbers is asserted.
+    //
+    // This is the **`--no-crop`** case: `stack` applies the auto-crop by
+    // default, which would shrink the composite below the full 8192x5464
+    // extent, so `run_align()`'s `run_stack` call passes `--no-crop`
+    // specifically to keep this comparison dimensionally comparable with
+    // `Mantis_Stacked.tif` (a dimension mismatch fails the comparison
+    // outright).
     assert_eq!(
         (cw, ch, cspp, cbits),
         (8192, 5464, 3, 16),
@@ -107,5 +114,122 @@ fn full_stack_similarity_to_mantis_stacked_is_recorded() {
     eprintln!(
         "tile 512 / levels 5: block_mean_ssim={ssim:.4} psnr={psnr_value:.2}dB \
          laplacian_variance={sharpness:.2}"
+    );
+}
+
+/// Reads `align-<mode>.json`, `tools/run-acceptance.sh`'s new `align` stage
+/// artefact for one mode, parsed as a plain `serde_json::Value` -- the
+/// script's own JSON, never re-derived here.
+fn read_align_json(mode: &str) -> Option<serde_json::Value> {
+    let path = common::workspace_root()
+        .join(".scratch/acceptance/unlimited")
+        .join(format!("align-{mode}.json"));
+    if !path.is_file() {
+        eprintln!(
+            "skip: {} not found -- run tools/run-acceptance.sh first",
+            path.display()
+        );
+        return None;
+    }
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} exists but could not be read: {e}", path.display()));
+    Some(
+        serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{} exists but is not valid JSON: {e}", path.display())),
+    )
+}
+
+/// All 61 real frames produce an outcome; the per-frame `status` histogram
+/// and `failure_count` are part of what is recorded -- a sweep this long is
+/// where divergence far from the anchor is expected, not an anomaly. The
+/// alignment itself is done by the script, once, under `--lax`; this test
+/// only parses what it already wrote.
+#[test]
+#[ignore = "reads the 16 GB reference stack"]
+fn aligns_the_reference_stack() {
+    let Some(report) = read_align_json("rotation-scale") else {
+        return;
+    };
+
+    let frame_count = report["frame_count"].as_u64().expect("frame_count");
+    assert_eq!(frame_count, 61, "the full reference stack has 61 frames");
+
+    let alignments = report["alignments"].as_array().expect("alignments array");
+    assert_eq!(alignments.len(), 61);
+
+    let mut histogram: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut max_drift = 0.0f64;
+    let mut sum_drift = 0.0f64;
+    for entry in alignments {
+        let status = entry["status"].as_str().expect("status string").to_string();
+        *histogram.entry(status).or_insert(0) += 1;
+        let (tx, ty) = (
+            entry["tx"].as_f64().expect("tx"),
+            entry["ty"].as_f64().expect("ty"),
+        );
+        let drift = tx.hypot(ty);
+        max_drift = max_drift.max(drift);
+        sum_drift += drift;
+    }
+    let mean_drift = sum_drift / alignments.len() as f64;
+    let failure_count = report["failure_count"].as_u64().expect("failure_count");
+    let wall_seconds = report["wall_seconds"].as_f64().unwrap_or(0.0);
+
+    eprintln!(
+        "aligns_the_reference_stack: frame_count={frame_count} failure_count={failure_count} \
+         max_drift={max_drift:.2}px mean_drift={mean_drift:.2}px wall_seconds={wall_seconds:.1} \
+         status_histogram={histogram:?}"
+    );
+}
+
+/// The two modes disagree on the real stack in the direction focus
+/// breathing predicts: rotation+scale recovers a scale factor away from
+/// 1.0 across the sweep, and leaves a higher ρ (an ECC correlation --
+/// higher is better) than translation-only. Parsed from the two
+/// `align-<mode>.json` artefacts, never aligned in-test, and
+/// assertion-light: finiteness and the 61-frame count are asserted, the
+/// comparison is recorded.
+#[test]
+#[ignore = "reads the 16 GB reference stack"]
+fn the_two_modes_disagree_as_focus_breathing_predicts() {
+    let Some(translation) = read_align_json("translation") else {
+        return;
+    };
+    let Some(rotation_scale) = read_align_json("rotation-scale") else {
+        return;
+    };
+
+    let mean_abs_scale_minus_one = |report: &serde_json::Value| -> f64 {
+        let alignments = report["alignments"].as_array().expect("alignments array");
+        assert_eq!(alignments.len(), 61);
+        let sum: f64 = alignments
+            .iter()
+            .map(|e| (e["scale"].as_f64().expect("scale") - 1.0).abs())
+            .sum();
+        sum / alignments.len() as f64
+    };
+    let mean_rho = |report: &serde_json::Value| -> f64 {
+        let alignments = report["alignments"].as_array().expect("alignments array");
+        let sum: f64 = alignments
+            .iter()
+            .map(|e| e["residual"].as_f64().expect("residual"))
+            .sum();
+        sum / alignments.len() as f64
+    };
+
+    let translation_scale_dev = mean_abs_scale_minus_one(&translation);
+    let rotation_scale_scale_dev = mean_abs_scale_minus_one(&rotation_scale);
+    let translation_rho = mean_rho(&translation);
+    let rotation_scale_rho = mean_rho(&rotation_scale);
+
+    assert!(translation_scale_dev.is_finite());
+    assert!(rotation_scale_scale_dev.is_finite());
+    assert!(translation_rho.is_finite());
+    assert!(rotation_scale_rho.is_finite());
+
+    eprintln!(
+        "the_two_modes_disagree_as_focus_breathing_predicts: \
+         translation mean|scale-1|={translation_scale_dev:.6} mean_rho={translation_rho:.4} -- \
+         rotation-scale mean|scale-1|={rotation_scale_scale_dev:.6} mean_rho={rotation_scale_rho:.4}"
     );
 }

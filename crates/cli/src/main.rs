@@ -15,6 +15,7 @@ use focusforge_core::io::{ByteOrder, TiffError, TiffHeader, frame_paths};
 use serde::Serialize;
 
 mod algorithms;
+mod align;
 mod set;
 mod stack;
 
@@ -76,6 +77,56 @@ enum Command {
         json: bool,
         #[command(flatten)]
         set: set::SetArgs,
+        /// Skip alignment: the tile reader stays the raw stack and the
+        /// output geometry stays full-frame. Defaults to `true`
+        /// (alignment on); `--no-align` is what turns it off (clap
+        /// `ArgAction::SetFalse`, no `default_value` -- clap-rs/clap#4370).
+        #[arg(long = "no-align", action = clap::ArgAction::SetFalse)]
+        align: bool,
+        /// Skip the auto-crop: the output stays at the full frame extent
+        /// even when alignment is on. Defaults to `true` (crop applied);
+        /// `--no-crop` is what turns it off.
+        #[arg(long = "no-crop", action = clap::ArgAction::SetFalse)]
+        crop: bool,
+        /// Soften alignment failures to an identity fallback instead of
+        /// refusing the run. Meaningless with `--no-align`.
+        #[arg(long)]
+        lax: bool,
+        /// Alignment algorithm id. Optional: defaults to the sole
+        /// registered alignment algorithm, refusing (and listing the
+        /// choices) when more than one is registered.
+        #[arg(long = "align-algo")]
+        align_algo: Option<String>,
+        #[command(flatten)]
+        align_set: set::AlignSetArgs,
+    },
+    /// Compute and report the per-frame transforms for a stack: readable
+    /// text by default, a frozen `--json` document on request, and an
+    /// optional per-frame warped-TIFF dump for a visual check.
+    Align {
+        /// Directory of TIFF frames to align (non-recursive, descending
+        /// into `<dir>/frames` when that subdirectory exists).
+        dir: PathBuf,
+        /// Registered alignment algorithm id. Optional: defaults to the
+        /// sole registered alignment algorithm.
+        #[arg(long)]
+        algo: Option<String>,
+        /// Emit the frozen JSON report instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+        /// Soften a failed frame to an identity fallback and exit 0,
+        /// reporting the failure count on stderr, instead of refusing the
+        /// run. Strict (the default) is not a flag -- `--lax` has no
+        /// opposite to be confused with, unlike a `--no-strict` that would
+        /// imply a nonexistent `--strict`.
+        #[arg(long)]
+        lax: bool,
+        /// Write one warped TIFF per frame into this directory, at source
+        /// dimensions, uncropped.
+        #[arg(long = "write-warped", value_name = "DIR")]
+        write_warped: Option<PathBuf>,
+        #[command(flatten)]
+        set: set::SetArgs,
     },
 }
 
@@ -91,7 +142,41 @@ fn main() -> ExitCode {
             zmap,
             json,
             set,
-        } => stack::run(&dir, &output, algo.as_deref(), zmap.as_deref(), json, &set),
+            align,
+            crop,
+            lax,
+            align_algo,
+            align_set,
+        } => stack::run(
+            &dir,
+            &output,
+            algo.as_deref(),
+            zmap.as_deref(),
+            json,
+            &set,
+            &align::AlignOptions {
+                align,
+                crop,
+                lax,
+                algo: align_algo.as_deref(),
+                set: &align_set.align_set,
+            },
+        ),
+        Command::Align {
+            dir,
+            algo,
+            json,
+            lax,
+            write_warped,
+            set,
+        } => align::run(
+            &dir,
+            algo.as_deref(),
+            json,
+            lax,
+            write_warped.as_deref(),
+            &set,
+        ),
     }
 }
 
