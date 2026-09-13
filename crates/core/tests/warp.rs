@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! The tiled warp exercised against `fixtures/mantis-512` and synthetic
-//! `Tile`s. Opened the way `crates/core/tests/pyramid.rs` opens its
-//! fixture: `mod common;` plus `TiffStack::open(common::mantis_512_dir())`,
-//! never a relative literal.
+//! `Tile`s.
 
 mod common;
 
@@ -11,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use focusforge_core::algorithm::{AlgorithmError, TileReader};
 use focusforge_core::align::warp::{warp_from_tile, warp_tile};
-use focusforge_core::align::{AlignError, Transform};
+use focusforge_core::align::{AlignError, Transform, WarpingReader};
 use focusforge_core::io::TiffStack;
 use focusforge_core::tile::{Rect, Tile};
 
@@ -300,6 +298,73 @@ fn tiled_warp_matches_single_piece_warp() {
     assert_eq!(
         tiled_samples, single.tile.samples,
         "samples must be bit-identical, no seams"
+    );
+}
+
+#[test]
+fn warping_reader_identity_matches_a_direct_read() {
+    let stack = open_fixture();
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let frame_count = stack.len();
+
+    // All-identity transforms, one per frame.
+    let transforms = vec![Transform::identity(); frame_count];
+    let reader = WarpingReader::new(&stack, (width, height), spp, transforms);
+
+    // A tile straddling the frame edge, matching this file's own
+    // `edge_flush` convention above.
+    let dst = Rect {
+        x: width - 96,
+        y: height - 96,
+        width: 96,
+        height: 96,
+    };
+    let mut got = vec![0u16; dst.width as usize * dst.height as usize * spp as usize];
+    reader
+        .read_tile_into(0, dst, &mut got)
+        .expect("identity WarpingReader read");
+
+    let direct = stack.read_tile(0, dst).expect("direct read");
+    assert_eq!(
+        got, direct.samples,
+        "an identity WarpingReader must be bit-identical to a direct read"
+    );
+}
+
+#[test]
+fn warping_reader_clamps_at_the_frame_edge() {
+    let stack = open_fixture();
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let frame_count = stack.len();
+
+    // A large translation whose destination rect's footprint reaches past
+    // the frame edge: `source_footprint` clamps rather than refusing, and
+    // the read must succeed with the out-of-source part zero, never
+    // `TiffError::OutOfBounds`.
+    let mut transforms = vec![Transform::identity(); frame_count];
+    transforms[0] = Transform::translation(500.0, 0.0);
+    let reader = WarpingReader::new(&stack, (width, height), spp, transforms);
+
+    let dst = Rect {
+        x: 0,
+        y: 200,
+        width: 64,
+        height: 32,
+    };
+    let mut got = vec![0u16; dst.width as usize * dst.height as usize * spp as usize];
+    reader
+        .read_tile_into(0, dst, &mut got)
+        .expect("a clamped-footprint read must succeed, not error");
+
+    // Some destination pixels map past the right edge (source x = dst.x +
+    // 500 >= width), so their samples are zero -- proving the clamp
+    // happened and no `AlgorithmError::Tiff(TiffError::OutOfBounds)` was
+    // raised for the whole tile.
+    assert!(
+        got.contains(&0),
+        "at least one sample must be the zero fill from the clamped, uncovered region"
     );
 }
 

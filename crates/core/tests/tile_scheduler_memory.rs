@@ -186,6 +186,8 @@ fn peak_live_heap_stays_under_ceiling() {
             height,
             samples_per_pixel: 3,
             frame_count: frame_count as u32,
+            crop: None,
+            description: None,
         },
     )
     .expect("consumer must create");

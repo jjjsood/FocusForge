@@ -25,6 +25,8 @@
 //!    the output hole-free. [`Transform::inverse`] exists for callers that
 //!    need it, never for the hot loop.
 
+use serde::Serialize;
+
 use crate::align::error::AlignError;
 use crate::tile::Rect;
 
@@ -39,7 +41,7 @@ use crate::tile::Rect;
 /// m }` literal directly (`crate::algorithm`, `crate::test_algorithms`); no
 /// invariant can be enforced at construction, so every invariant this module
 /// needs (invertibility, a finite `w`) is checked where it is used instead.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Transform {
     pub m: [[f64; 3]; 3],
 }
@@ -112,6 +114,26 @@ impl Transform {
     /// matrix `m` verbatim, with no restriction on its bottom row.
     pub const fn projective(m: [[f64; 3]; 3]) -> Self {
         Transform { m }
+    }
+
+    /// Decomposes a similarity matrix (as [`Transform::similarity`] and
+    /// [`Transform::translation`] both produce) into `(scale, radians, tx,
+    /// ty)` -- the inverse of [`Transform::similarity`]:
+    /// `scale = hypot(m[0][0], m[1][0])`, `radians = atan2(m[1][0],
+    /// m[0][0])`, `tx = m[0][2]`, `ty = m[1][2]`.
+    ///
+    /// This is a decomposition, not a general affine factorization: it
+    /// reads the exact entries a similarity matrix has and says nothing
+    /// about a matrix with independent shear or non-uniform scale (an
+    /// [`Transform::affine`] or [`Transform::projective`] built by hand).
+    /// It is exact for `EccMode::Translation` and `EccMode::Similarity`
+    /// outputs, both of which produce similarity matrices.
+    pub fn similarity_parts(&self) -> (f64, f64, f64, f64) {
+        let scale = self.m[0][0].hypot(self.m[1][0]);
+        let radians = self.m[1][0].atan2(self.m[0][0]);
+        let tx = self.m[0][2];
+        let ty = self.m[1][2];
+        (scale, radians, tx, ty)
     }
 
     /// Composes `self` with `other` as the matrix product `self · other`:
@@ -382,6 +404,38 @@ mod tests {
 
         let proj = Transform::projective([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]);
         assert_eq!(proj.m, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]);
+    }
+
+    #[test]
+    fn similarity_parts() {
+        for &(scale, radians, tx, ty) in &[
+            (1.0, 0.0, 0.0, 0.0),
+            (1.3, 0.5, 11.0, -4.0),
+            (0.87, -1.1, -3.0, 6.0),
+        ] {
+            let t = Transform::similarity(scale, radians, tx, ty);
+            let (got_scale, got_radians, got_tx, got_ty) = t.similarity_parts();
+            assert!(
+                (got_scale - scale).abs() < 1e-9,
+                "scale: {got_scale} vs {scale}"
+            );
+            assert!(
+                (got_radians - radians).abs() < 1e-9,
+                "radians: {got_radians} vs {radians}"
+            );
+            assert!((got_tx - tx).abs() < 1e-9, "tx: {got_tx} vs {tx}");
+            assert!((got_ty - ty).abs() < 1e-9, "ty: {got_ty} vs {ty}");
+        }
+
+        // A pure translation decomposes to unit scale and zero rotation --
+        // `Transform::translation` is a restriction of the same similarity
+        // family, never a distinct representation.
+        let t = Transform::translation(5.0, -2.0);
+        let (scale, radians, tx, ty) = t.similarity_parts();
+        assert!((scale - 1.0).abs() < 1e-12);
+        assert!(radians.abs() < 1e-12);
+        assert!((tx - 5.0).abs() < 1e-12);
+        assert!((ty - (-2.0)).abs() < 1e-12);
     }
 
     #[test]

@@ -42,17 +42,28 @@ pub struct FusionConsumer {
     values: ParamValues,
     composite: Mutex<Option<TiffWriter<File>>>,
     zmap: Mutex<Option<ZMapWriter<File>>>,
+    /// `None` means both outputs are declared at the full frame extent;
+    /// `Some(rect)` means both are declared at `rect`'s dimensions, and
+    /// every written tile is clipped to `rect` and translated by
+    /// `-(rect.x, rect.y)` before it reaches either writer.
+    crop: Option<Rect>,
 }
 
 /// The frame extent and count [`FusionConsumer::create`] needs to size both
 /// output files -- bundled so `create` stays under clippy's argument-count
 /// lint rather than growing a ninth positional parameter.
-#[derive(Debug, Clone, Copy)]
+///
+/// `crop: None` and `description: None` produce both outputs at the full
+/// frame extent with `TiffWriter`'s own default description. Not `Copy`,
+/// since `description` is an owned `Option<String>`.
+#[derive(Debug, Clone)]
 pub struct FusionGeometry {
     pub width: u32,
     pub height: u32,
     pub samples_per_pixel: u32,
     pub frame_count: u32,
+    pub crop: Option<Rect>,
+    pub description: Option<String>,
 }
 
 impl FusionConsumer {
@@ -75,24 +86,32 @@ impl FusionConsumer {
             height,
             samples_per_pixel,
             frame_count,
+            crop,
+            description,
         } = geometry;
+        let full_frame = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let out_rect = crop.unwrap_or(full_frame);
         let composite = TiffWriter::create(
             composite_path,
             TiffSpec {
-                width,
-                height,
+                width: out_rect.width,
+                height: out_rect.height,
                 samples_per_pixel,
-                description: None,
+                description,
             },
         )?;
         let zmap = match zmap_path {
             Some(zmap_path) => {
-                let zmap_info = ZMapInfo::new(width, height, frame_count).map_err(|source| {
-                    AlgorithmError::Failed {
+                let zmap_info = ZMapInfo::new(out_rect.width, out_rect.height, frame_count)
+                    .map_err(|source| AlgorithmError::Failed {
                         algorithm: algorithm.id().to_string(),
                         detail: source.to_string(),
-                    }
-                })?;
+                    })?;
                 let writer = ZMapWriter::create(zmap_path, zmap_info).map_err(|source| {
                     AlgorithmError::Failed {
                         algorithm: algorithm.id().to_string(),
@@ -108,6 +127,7 @@ impl FusionConsumer {
             values,
             composite: Mutex::new(Some(composite)),
             zmap: Mutex::new(zmap),
+            crop,
         })
     }
 
@@ -148,34 +168,83 @@ fn crop_zmap_into(zmap: &[u16], read_rect: Rect, interior: Rect, out: &mut [u16]
     }
 }
 
+/// The overlap of `a` and `b`, both in absolute frame coordinates. `None`
+/// for an empty (or non-overlapping) intersection.
+fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.width).min(b.x + b.width);
+    let y1 = (a.y + a.height).min(b.y + b.height);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(Rect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    })
+}
+
+/// `rect`, translated by `-(crop.x, crop.y)` when `crop` is `Some` --
+/// absolute frame coordinates in, output-file coordinates out. `rect` must
+/// already lie inside `crop` (guaranteed by [`intersect`] above), so the
+/// subtraction never underflows.
+fn translate_for_crop(rect: Rect, crop: Option<Rect>) -> Rect {
+    match crop {
+        Some(crop) => Rect {
+            x: rect.x - crop.x,
+            y: rect.y - crop.y,
+            width: rect.width,
+            height: rect.height,
+        },
+        None => rect,
+    }
+}
+
 impl TileConsumer for FusionConsumer {
     fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
         let output = self.algorithm.fuse(job.ctx(), &self.values)?;
         let interior = job.interior();
         let spp = output.tile.samples_per_pixel;
 
+        // Clip this job's interior against the crop, in absolute frame
+        // coordinates: a tile wholly outside the crop writes nothing (both
+        // outputs were declared at the crop's dimensions in `create`, so
+        // there is nowhere for it to go), and a tile straddling the crop's
+        // edge writes only its inside part.
+        let target = match self.crop {
+            Some(crop) => match intersect(interior, crop) {
+                Some(clipped) => clipped,
+                None => return Ok(()),
+            },
+            None => interior,
+        };
+
         let mut cropped_composite =
-            vec![0u16; interior.width as usize * interior.height as usize * spp as usize];
+            vec![0u16; target.width as usize * target.height as usize * spp as usize];
         output
             .tile
-            .crop_into(interior, &mut cropped_composite)
+            .crop_into(target, &mut cropped_composite)
             .map_err(|source| AlgorithmError::Failed {
                 algorithm: self.algorithm.id().to_string(),
                 detail: source.to_string(),
             })?;
+
+        let written_rect = translate_for_crop(target, self.crop);
 
         self.composite
             .lock()
             .unwrap()
             .as_mut()
             .expect("composite writer present")
-            .write_tile(interior, &cropped_composite)?;
+            .write_tile(written_rect, &cropped_composite)?;
 
         if let Some(zmap_writer) = self.zmap.lock().unwrap().as_mut() {
-            let mut cropped_zmap = vec![0u16; interior.width as usize * interior.height as usize];
-            crop_zmap_into(&output.zmap, job.read_rect(), interior, &mut cropped_zmap);
+            let mut cropped_zmap = vec![0u16; target.width as usize * target.height as usize];
+            crop_zmap_into(&output.zmap, job.read_rect(), target, &mut cropped_zmap);
             zmap_writer
-                .write_tile(interior, &cropped_zmap)
+                .write_tile(written_rect, &cropped_zmap)
                 .map_err(|source| AlgorithmError::Failed {
                     algorithm: self.algorithm.id().to_string(),
                     detail: source.to_string(),

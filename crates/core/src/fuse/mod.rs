@@ -14,6 +14,7 @@
 
 pub mod consumer;
 pub mod depth_map;
+pub mod description;
 mod error;
 pub mod laplacian;
 pub mod metrics;

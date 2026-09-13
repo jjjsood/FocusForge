@@ -220,7 +220,8 @@ pub trait StackAlgorithm: Send + Sync + 'static {
 /// existing variant names as evidence of the pattern to follow, not as a
 /// defect to fix.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", content = "reason", rename_all = "kebab-case")]
 pub enum AlignStatus {
     /// The solver's step measure fell below its convergence threshold.
     Converged,

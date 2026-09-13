@@ -21,6 +21,7 @@ mod error;
 mod pyramid;
 mod transform;
 pub mod warp;
+mod warp_reader;
 
 pub use crop::{auto_crop, crop_rect};
 pub use driver::{
@@ -31,3 +32,4 @@ pub use ecc_algorithm::PyramidalEcc;
 pub use error::AlignError;
 pub use pyramid::{AlignPyramid, LumaAssembler, max_levels};
 pub use transform::{KERNEL_RADIUS, SourceFootprint, Transform};
+pub use warp_reader::WarpingReader;

@@ -114,6 +114,18 @@
 //!                               0   0    a^2 + b^2     ]
 //! ```
 //!
+//! **`x, y` above are centred on `region`'s own centre, not the image
+//! origin** (`similarity_jacobian_row`): with uncentred coordinates, the
+//! scale and rotation columns' `C = Ḡ^tḠ` diagonal grows as the region's
+//! absolute offset squared while the translation columns stay flat, and
+//! [`solve_linear`]'s relative pivot threshold eventually rejects the
+//! (still perfectly good) translation pivots -- confirmed on the full 16GB
+//! reference stack, where `mode=rotation-scale` diverged as
+//! `singular-hessian` on 60 of 61 frames. Centring the Jacobian means the
+//! recovered `Δp` is an increment about the region's centre, not the image
+//! origin, so `similarity_delta` conjugates it back (`T(c) ∘ ΔW ∘ T(-c)`)
+//! before composing it into `w`.
+//!
 //! ## Sampling and out-of-domain handling
 //!
 //! The solver reuses [`super::warp::catmull_rom_weights`], the crate's one bicubic Catmull-Rom
@@ -194,7 +206,8 @@ pub struct EccParams {
 /// Why a registration failed to converge. A data outcome
 /// ([`EccStatus::Diverged`]), never an [`AlignError`] -- the caller did
 /// nothing wrong.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DivergenceReason {
     /// `C = Ḡ^tḠ`'s pivot test failed in the linear solve -- a flat,
     /// textureless template, most often.
@@ -467,27 +480,106 @@ pub fn solve_level(
             |gx, gy, _x, _y| [f64::from(gx), f64::from(gy)],
             |dp: &[f64; 2]| Transform::translation(dp[0], dp[1]),
         ),
-        EccMode::Similarity => solve_level_generic::<4>(
-            template,
-            region,
-            moving,
-            initial,
-            params,
-            |gx, gy, x, y| {
-                let (tx, ty) = (f64::from(gx), f64::from(gy));
-                [tx * x + ty * y, ty * x - tx * y, tx, ty]
-            },
-            |dp: &[f64; 4]| {
-                Transform::affine(1.0 + dp[0], -dp[1], dp[1], 1.0 + dp[0], dp[2], dp[3])
-            },
-        ),
+        EccMode::Similarity => {
+            // The Jacobian's `x, y` are centred on `region`'s own centre,
+            // not measured from the image origin -- see
+            // `similarity_jacobian_row`'s doc comment for why -- and the
+            // recovered increment is conjugated back to image coordinates
+            // about the same centre in `similarity_delta`. The two must
+            // share exactly this `(cx, cy)`, which is why both closures
+            // below capture it from the same two `let`s rather than each
+            // recomputing it.
+            let cx = region.x as f64 + (region.width as f64 - 1.0) / 2.0;
+            let cy = region.y as f64 + (region.height as f64 - 1.0) / 2.0;
+            solve_level_generic::<4>(
+                template,
+                region,
+                moving,
+                initial,
+                params,
+                move |gx, gy, x, y| similarity_jacobian_row(gx, gy, x, y, cx, cy),
+                move |dp: &[f64; 4]| similarity_delta(dp, cx, cy),
+            )
+        }
     }
 }
 
+/// One (uncentred-argument, internally coordinate-centred) row of the
+/// similarity Jacobian `∂φ/∂p |_identity` from the module docs' "The
+/// similarity Jacobian" section: `[gx*x' + gy*y', gy*x' - gx*y', gx, gy]`,
+/// where `x' = x - cx`, `y' = y - cy` are `(x, y)` measured from the
+/// region's own centre `(cx, cy)`, never from the image origin.
+///
+/// # Why the coordinates must be centred
+///
+/// Columns 0-1 (scale, rotation) scale as `|coord| * gradient`; columns 2-3
+/// (translation) are bare gradient and are scale-invariant. With
+/// uncentred `x, y`, `C = Ḡ^tḠ`'s diagonal for columns 0-1 grows as
+/// `offset^2` while columns 2-3 stay flat, so [`solve_linear`]'s *relative*
+/// pivot threshold (`PIVOT_EPS * max|a|`) rises with the region's absolute
+/// position until the translation pivots fall under it. Measured on an
+/// isolated repro (image content, region size, gradient field and solver
+/// held fixed, only the region's absolute coordinate offset varied):
+///
+/// ```text
+/// offset (0,0)       max|C|=9.4761e8   diag=[9.476e8 9.429e8 2.180e4 2.182e4] solve=Some
+/// offset (256,256)   max|C|=6.6518e9   diag=[6.643e9 6.652e9 2.180e4 2.182e4] solve=Some
+/// offset (3500,2000) max|C|=3.8689e11  diag=[3.848e11 3.869e11 2.180e4 2.182e4] solve=NONE (singular)
+/// ```
+///
+/// This is exactly what `mode=rotation-scale` hit on 60 of 61 frames of the
+/// full stack (region centres thousands of pixels from the origin) and
+/// what no fixture-scale test (region centres a few hundred px from the
+/// origin) ever reaches. Centring `x, y` on the region's own centre removes
+/// the offset from the columns entirely, so conditioning no longer depends
+/// on where in the image the region sits. The existing column mean-centring
+/// elsewhere in this module does **not** fix this: centring a column
+/// removes its *mean*, but `gx*x` still has variance `~= x^2 * var(gx)`,
+/// which keeps growing with the coordinate's absolute magnitude regardless
+/// of the column's own mean.
+///
+/// Once the Jacobian is centred this way, the recovered `Δp` describes an
+/// increment about `(cx, cy)`, not about the image origin, so
+/// [`similarity_delta`] must conjugate it back -- skipping that pairs a
+/// centred Jacobian with an origin-relative increment, a mismatched
+/// parameterization that does **not** report a singularity: it converges
+/// confidently to a wrong transform.
+fn similarity_jacobian_row(gx: f32, gy: f32, x: f64, y: f64, cx: f64, cy: f64) -> [f64; 4] {
+    let (tx, ty) = (f64::from(gx), f64::from(gy));
+    let (xc, yc) = (x - cx, y - cy);
+    [tx * xc + ty * yc, ty * xc - tx * yc, tx, ty]
+}
+
+/// Builds the incremental similarity warp from a solved `Δp`, conjugated
+/// about `(cx, cy)`: `T(c) ∘ ΔW ∘ T(-c)`, i.e. `Transform::translation(cx,
+/// cy).compose(&delta).compose(&Transform::translation(-cx, -cy))`.
+///
+/// `Transform::compose`'s convention is "right operand applied first"
+/// (`crate::align::transform`), so this composition reads, in application
+/// order: shift `(cx, cy)` to the origin, apply the increment `ΔW` (built
+/// exactly as before, `Transform::affine(1+Δp0, -Δp1, Δp1, 1+Δp0, Δp2,
+/// Δp3)`), shift back. Required because [`similarity_jacobian_row`] centres
+/// its `x, y` on `(cx, cy)`: the recovered `Δp` is the increment of a warp
+/// that operates on coordinates already measured from `(cx, cy)`, so
+/// applying it directly to image coordinates (no conjugation) would use the
+/// wrong reference point -- see that function's doc comment for the danger
+/// this creates if it is skipped.
+fn similarity_delta(dp: &[f64; 4], cx: f64, cy: f64) -> Transform {
+    let delta = Transform::affine(1.0 + dp[0], -dp[1], dp[1], 1.0 + dp[0], dp[2], dp[3]);
+    Transform::translation(cx, cy)
+        .compose(&delta)
+        .compose(&Transform::translation(-cx, -cy))
+}
+
 /// The shared solve, generic over the parameterization's degree of freedom
-/// `K`. `jacobian_row(grad_x, grad_y, x, y)` builds one (uncentred) row of
-/// `G`; `build_delta(&Δp)` builds `ΔW` from a solved increment. See the
-/// module docs for every equation used here.
+/// `K`. `jacobian_row(grad_x, grad_y, x, y)` builds one row of `G` (never
+/// *column*-centred here -- that happens below, uniformly for every mode;
+/// a mode whose conditioning needs `x, y` themselves centred, as
+/// [`EccMode::Similarity`] does, does that internally, see
+/// [`similarity_jacobian_row`]); `build_delta(&Δp)` builds `ΔW` from a
+/// solved increment (paired with any such internal centring by conjugating
+/// the result back, see [`similarity_delta`]). See the module docs for
+/// every equation used here.
 #[allow(clippy::too_many_arguments)]
 fn solve_level_generic<const K: usize>(
     template: &Plane,
@@ -1179,6 +1271,113 @@ mod tests {
             Err(AlignError::RegionOutOfBounds { .. }) => {}
             other => panic!("expected RegionOutOfBounds, got {other:?}"),
         }
+    }
+
+    /// The permanent guard for the similarity Jacobian's conditioning
+    /// defect: the same normal-matrix construction [`solve_level_generic`]
+    /// uses, driven directly (no image sampling, no solver loop -- a pure
+    /// linear-algebra check, ~0.04s), at a small region offset and a large
+    /// one.
+    ///
+    /// **Why this exists.** The similarity Jacobian's scale/rotation
+    /// columns (`gx*x + gy*y`, `gy*x - gx*y`) scale as `|coord| *
+    /// gradient`; its translation columns (bare `gx`, `gy`) are
+    /// scale-invariant. With **uncentred** `x, y` (the pre-fix code), `C =
+    /// Ḡ^tḠ`'s diagonal for the first two columns grows as the region's
+    /// absolute offset squared while the last two stay flat at the same
+    /// value regardless of offset. Measured on an isolated repro with real
+    /// image content (this test's synthetic field below reproduces the
+    /// same shape, not the same numbers):
+    ///
+    /// ```text
+    /// offset (256,256)   diag=[6.643e9 6.652e9 2.180e4 2.182e4] solve=Some
+    /// offset (3500,2000) diag=[3.848e11 3.869e11 2.180e4 2.182e4] solve=NONE (singular)
+    /// ```
+    ///
+    /// [`solve_linear`]'s pivot rejection is *relative* to `C`'s largest
+    /// entry, so as the scale/rotation columns grew from `~6.6e9` to
+    /// `~3.9e11` the pivot bar rose right past the translation columns'
+    /// unmoved `~2.18e4`, and the solve that succeeded at the small offset
+    /// failed at the large one -- on the full stack, `mode=rotation-scale`
+    /// hit exactly this on 60 of 61 frames (`singular-hessian`, `mode
+    /// translation` on the same stack: 0 failures).
+    /// [`similarity_jacobian_row`] centres `x, y` on the region's own
+    /// centre before this construction runs, which is what makes both
+    /// offsets below solve identically: this test would have caught the
+    /// defect before any full-stack run ever needed to.
+    #[test]
+    fn similarity_normal_matrix_solves_regardless_of_region_offset() {
+        // A deterministic, non-degenerate synthetic gradient field --
+        // unrelated to any fixture, so this test needs no image data at
+        // all. `region` itself never varies; only `offset_x`/`offset_y`
+        // (added to every sample's coordinate before building the
+        // Jacobian row) does, exactly the one variable the original repro
+        // held everything else fixed against.
+        let region = Rect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 32,
+        };
+        let mut rng = XorShift32(0x5A11_EE5D);
+        let gradients: Vec<(f32, f32)> = (0..region.width * region.height)
+            .map(|_| {
+                let gx = (rng.next() % 2000) as f32 - 1000.0;
+                let gy = (rng.next() % 2000) as f32 - 1000.0;
+                (gx, gy)
+            })
+            .collect();
+
+        // Builds `C = Ḡ^tḠ` exactly the way `solve_level_generic` does
+        // (column-mean-centred `g_rows`, then the outer-product sum), for
+        // a region placed at `(offset_x, offset_y)` in some larger image.
+        let normal_matrix = |offset_x: u32, offset_y: u32| -> [[f64; 4]; 4] {
+            let cx = offset_x as f64 + (region.width as f64 - 1.0) / 2.0;
+            let cy = offset_y as f64 + (region.height as f64 - 1.0) / 2.0;
+            let mut rows: Vec<[f64; 4]> = Vec::with_capacity(gradients.len());
+            for dy in 0..region.height {
+                for dx in 0..region.width {
+                    let (gx, gy) = gradients[(dy * region.width + dx) as usize];
+                    let x = (offset_x + dx) as f64;
+                    let y = (offset_y + dy) as f64;
+                    rows.push(similarity_jacobian_row(gx, gy, x, y, cx, cy));
+                }
+            }
+            let mut col_mean = [0.0f64; 4];
+            for row in &rows {
+                for k in 0..4 {
+                    col_mean[k] += row[k];
+                }
+            }
+            for m in &mut col_mean {
+                *m /= rows.len() as f64;
+            }
+            let mut c = [[0.0f64; 4]; 4];
+            for row in &rows {
+                let centered: [f64; 4] = std::array::from_fn(|k| row[k] - col_mean[k]);
+                for i in 0..4 {
+                    for j in 0..4 {
+                        c[i][j] += centered[i] * centered[j];
+                    }
+                }
+            }
+            c
+        };
+
+        let c_small_offset = normal_matrix(256, 256);
+        let c_large_offset = normal_matrix(3500, 2000);
+
+        assert!(
+            solve_linear(c_small_offset, [0.0f64; 4]).is_some(),
+            "small-offset (256, 256) region: C = {c_small_offset:?}"
+        );
+        assert!(
+            solve_linear(c_large_offset, [0.0f64; 4]).is_some(),
+            "large-offset (3500, 2000) region: C = {c_large_offset:?} -- without centring \
+             the Jacobian's x, y on the region's own centre, this offset is singular \
+             under PIVOT_EPS even though the underlying alignment problem is perfectly \
+             well-posed"
+        );
     }
 
     #[test]

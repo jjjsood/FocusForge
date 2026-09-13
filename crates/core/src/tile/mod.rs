@@ -23,7 +23,7 @@ pub use scheduler::{TileRunReport, TileScheduler, TileSchedulerOptions};
 pub use scratch::ScratchDir;
 
 /// An axis-aligned rectangle in frame pixel coordinates, `u32` throughout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Rect {
     pub x: u32,
     pub y: u32,

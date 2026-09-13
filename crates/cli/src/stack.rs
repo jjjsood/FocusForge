@@ -10,13 +10,21 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
-use focusforge_core::io::{TiffStack, frame_paths};
-use focusforge_core::params::{self, ParamValue, Provenance, StackContext};
+use focusforge_core::algorithm::AlignStatus;
+use focusforge_core::align::{
+    FrameAlignment, ReferencePolicy, StackAlignment, Transform, WarpingReader, align_stack,
+    auto_crop,
+};
+use focusforge_core::fuse::{
+    FusionConsumer, FusionGeometry, description::format_composite_description,
+};
+use focusforge_core::io::{Rect, TiffStack, frame_paths};
+use focusforge_core::params::{self, ParamValue, ParamValues, Provenance, StackContext};
 use focusforge_core::registry;
 use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 use serde::Serialize;
 
+use crate::align::{AlignOptions, AlignmentEntry, resolve_align_algo};
 use crate::set::{SetArgs, parse_settings};
 
 /// The `stack --json` document; fields are only ever added, never removed
@@ -42,6 +50,26 @@ pub struct StackReport {
     /// Final paths only -- never the `.partial` names a run writes to first.
     pub outputs: Vec<String>,
     pub wall_seconds: f64,
+    /// The output extent -- equal to `width`/`height` unless a crop was
+    /// applied; `width`/`height` are the **source** frame extent.
+    pub output_width: u32,
+    pub output_height: u32,
+    pub crop: Option<Rect>,
+    pub description: Option<String>,
+    pub align: Option<StackAlignReport>,
+}
+
+/// `stack --json`'s `align` field: `null` when `--no-align` was given.
+#[derive(Serialize)]
+pub struct StackAlignReport {
+    pub algorithm: String,
+    pub display_name: String,
+    pub params: Vec<ParamReport>,
+    pub reference: usize,
+    pub reference_policy: ReferencePolicy,
+    pub failure_policy: String,
+    pub failure_count: usize,
+    pub alignments: Vec<AlignmentEntry>,
 }
 
 #[derive(Serialize)]
@@ -64,6 +92,7 @@ pub fn run(
     zmap: Option<&Path>,
     json: bool,
     set: &SetArgs,
+    align_opts: &AlignOptions<'_>,
 ) -> ExitCode {
     let start = Instant::now();
 
@@ -175,11 +204,123 @@ pub fn run(
     // trait method.
     let levels = algo.tile_levels(&values);
 
-    // Step 9: build the scheduler. `TileError::NoInterior` fires here, if
+    // Alignment, between the stack algorithm's own parameters and the
+    // scheduler build. Computed *before* any output file exists: a
+    // strict-mode failure refuses here.
+    let alignment_result: Option<(
+        &'static dyn focusforge_core::algorithm::AlignAlgorithm,
+        StackAlignment,
+        ParamValues,
+        Vec<ParamReport>,
+    )> = if align_opts.align {
+        let align_algo = match resolve_align_algo(align_opts.algo) {
+            Ok(a) => a,
+            Err(msg) => return crate::fail(msg),
+        };
+        let align_explicit = match parse_settings(align_algo.params(), align_opts.set) {
+            Ok(v) => v,
+            Err(violations) => {
+                return crate::fail(
+                    violations
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+        };
+        let align_resolved = match params::resolve(align_algo.params(), &align_explicit, &stack_ctx)
+        {
+            Ok(r) => r,
+            Err(err) => return crate::fail(err),
+        };
+        let align_values = params::resolved_values(&align_resolved);
+        let align_params: Vec<ParamReport> = align_resolved
+            .into_iter()
+            .map(|(id, r)| ParamReport {
+                id,
+                value: r.value,
+                provenance: r.provenance,
+            })
+            .collect();
+        let policy = if align_opts.lax {
+            focusforge_core::align::FailurePolicy::IdentityFallback
+        } else {
+            focusforge_core::align::FailurePolicy::Strict
+        };
+        let result = match align_stack(align_algo, stack_ctx, &stack, &align_values, policy) {
+            Ok(r) => r,
+            Err(err) => return crate::fail(err),
+        };
+        if !align_opts.lax && result.failure_count() > 0 {
+            let names: Vec<String> = result
+                .failed()
+                .map(|f| format!("{} ({:?})", frame_names[f.frame], f.status))
+                .collect();
+            return crate::fail(format!(
+                "alignment failed for {} frame(s): {}",
+                names.len(),
+                names.join(", ")
+            ));
+        }
+        Some((align_algo, result, align_values, align_params))
+    } else {
+        None
+    };
+
+    // The alignment used to compute the crop and to drive the tile reader:
+    // the real result when aligned, or an all-identity one otherwise --
+    // `--no-align` with the crop left on still trims the kernel-radius
+    // margin (the two flags are independent), and going through the same
+    // `auto_crop` call in both cases is what guarantees the rect matches
+    // what `align --json` reports for the same stack.
+    let alignment_for_crop: StackAlignment = match &alignment_result {
+        Some((_, result, _, _)) => result.clone(),
+        None => identity_alignment_for_crop(stack.len()),
+    };
+    let crop_rect_value = match auto_crop(&alignment_for_crop, (width, height)) {
+        Ok(c) => c,
+        Err(err) => return crate::fail(err),
+    };
+    if align_opts.crop && crop_rect_value.is_none() {
+        return crate::fail(crate::align::empty_crop_refusal());
+    }
+    let applied_crop = if align_opts.crop {
+        crop_rect_value
+    } else {
+        None
+    };
+
+    let description = alignment_result
+        .as_ref()
+        .map(|(align_algo, result, values, _params)| {
+            let mode = values
+                .get("mode")
+                .and_then(ParamValue::as_enum)
+                .unwrap_or("n/a");
+            format_composite_description(
+                align_algo.id(),
+                result.reference,
+                mode,
+                crop_rect_value.map(|r| (r, align_opts.crop)),
+            )
+        });
+
+    let transforms: Vec<Transform> = alignment_for_crop
+        .frames
+        .iter()
+        .map(|f| f.transform)
+        .collect();
+    let warping_reader = WarpingReader::new(&stack, (width, height), spp, transforms);
+
+    // Builds the scheduler over the warping reader -- bit-identical to
+    // `&stack` when every transform is identity (the decorator's own
+    // short-circuit), which is what keeps `--no-align --no-crop` byte for
+    // byte with the unaligned path. `TileError::NoInterior` fires here, if
     // it fires at all, before any tile is read.
     let mut options = TileSchedulerOptions::new(".scratch");
     options.levels = levels;
-    let scheduler = match TileScheduler::new(&stack, stack_ctx, spp, &options) {
+    let scheduler = match TileScheduler::new(&warping_reader, stack_ctx, spp, &options) {
         Ok(scheduler) => scheduler,
         Err(err) => return crate::fail(err),
     };
@@ -196,6 +337,8 @@ pub fn run(
         height,
         samples_per_pixel: spp,
         frame_count: stack.len() as u32,
+        crop: applied_crop,
+        description: description.clone(),
     };
 
     let consumer = match FusionConsumer::create(
@@ -249,6 +392,23 @@ pub fn run(
         outputs.push(zmap.display().to_string());
     }
 
+    let align_report = alignment_result.map(|(align_algo, result, _values, params)| {
+        let failure_count = result.failure_count();
+        let reference = result.reference;
+        let reference_policy = result.policy;
+        let alignments = crate::align::alignment_entries(&result, &frame_names);
+        StackAlignReport {
+            algorithm: align_algo.id().to_string(),
+            display_name: align_algo.display_name().to_string(),
+            params,
+            reference,
+            reference_policy,
+            failure_policy: if align_opts.lax { "lax" } else { "strict" }.to_string(),
+            failure_count,
+            alignments,
+        }
+    });
+
     let plan = scheduler.plan();
     let report = StackReport {
         input: dir.display().to_string(),
@@ -276,6 +436,11 @@ pub fn run(
         peak_in_flight: run_report.peak_in_flight,
         outputs,
         wall_seconds: start.elapsed().as_secs_f64(),
+        output_width: applied_crop.map(|r| r.width).unwrap_or(width),
+        output_height: applied_crop.map(|r| r.height).unwrap_or(height),
+        crop: applied_crop,
+        description,
+        align: align_report,
     };
 
     if json {
@@ -288,6 +453,28 @@ pub fn run(
     }
 
     ExitCode::SUCCESS
+}
+
+/// An all-identity [`StackAlignment`] over `frame_count` frames: what
+/// `--no-align` feeds to `auto_crop` and the `WarpingReader`, so a crop
+/// still trims the kernel-radius margin even with alignment off, and the
+/// reader stays bit-identical to a direct read either way
+/// (`WarpingReader`'s own identity short-circuit).
+fn identity_alignment_for_crop(frame_count: usize) -> StackAlignment {
+    StackAlignment {
+        reference: 0,
+        policy: ReferencePolicy::Anchor,
+        frames: (0..frame_count)
+            .map(|i| FrameAlignment {
+                frame: i,
+                transform: Transform::identity(),
+                status: AlignStatus::Converged,
+                iterations: 0,
+                residual: 1.0,
+                fallback: false,
+            })
+            .collect(),
+    }
 }
 
 /// `<path>.partial`: appends the suffix to the path's own file name, in the
@@ -338,7 +525,7 @@ fn check_output_parent(output: &Path) -> Result<(), String> {
 /// absolute path equals `candidate`'s, normalized with `std::path::absolute`
 /// (lexical only, so it works on `candidate` even though that file does not
 /// exist yet -- `canonicalize` requires existence and cannot be used here).
-fn colliding_frame(
+pub(crate) fn colliding_frame(
     candidate: &Path,
     frame_paths: &[PathBuf],
     frame_names: &[String],
@@ -416,6 +603,11 @@ mod tests {
             peak_in_flight: 4,
             outputs: vec!["out.tif".to_string(), "out-zmap.tif".to_string()],
             wall_seconds: 1.5,
+            output_width: 512,
+            output_height: 512,
+            crop: None,
+            description: None,
+            align: None,
         }
     }
 

@@ -64,8 +64,11 @@ same report as machine-readable JSON.
 target/release/focusforge-cli stack path/to/frames/ -o out.tif --algo laplacian --zmap zmap.tif
 ```
 
-Fuses every frame into `out.tif` through the `laplacian` algorithm and
-writes the per-pixel source map to `zmap.tif`. See
+Aligns the frames, fuses every one into `out.tif` through the `laplacian`
+algorithm, and writes the per-pixel source map to `zmap.tif`. Alignment and
+the auto-crop that follows it are both on by default (`--no-align` /
+`--no-crop` turn them off); `focusforge-cli align` reports the same
+transforms on their own, before any fusion runs. See
 [`docs/guide/stacking.md`](docs/guide/stacking.md) for the other algorithms
 and their parameters.
 

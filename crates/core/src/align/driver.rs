@@ -53,14 +53,16 @@ use crate::params::{ParamValue, ParamValues, StackContext};
 
 /// Whether every frame registers against one anchor frame, or chains
 /// hop-by-hop through its neighbours toward the reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ReferencePolicy {
     Anchor,
     Chain,
 }
 
 /// Which frame [`align_stack`] treats as the reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ReferenceFrame {
     First,
     Middle,
@@ -76,10 +78,16 @@ pub enum FailurePolicy {
 }
 
 /// One frame's place in a [`StackAlignment`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct FrameAlignment {
     pub frame: usize,
     pub transform: Transform,
+    /// `#[serde(flatten)]`ed: [`AlignStatus`] is itself adjacently tagged
+    /// (`{"status":..,"reason":..}`), and flattening it here is what makes
+    /// `status`/`reason` siblings of `frame`/`transform`/... on this
+    /// struct, rather than a nested `"status": {"status":..}` object one
+    /// level down.
+    #[serde(flatten)]
     pub status: AlignStatus,
     pub iterations: u32,
     pub residual: f64,

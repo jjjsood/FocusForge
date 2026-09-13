@@ -85,6 +85,8 @@ fn run_fusion(
             height,
             samples_per_pixel: spp,
             frame_count: frame_count as u32,
+            crop: None,
+            description: None,
         },
     )
     .expect("consumer must create");

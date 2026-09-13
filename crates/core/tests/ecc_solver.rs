@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! The single-level IC-ECC solver exercised against `fixtures/mantis-512`
-//! and synthetic buffers. Opened the way `crates/core/tests/warp.rs` opens
-//! its fixture: `mod common;` plus `TiffStack::open(common::mantis_512_dir())`,
-//! never a relative literal.
+//! and synthetic buffers.
 //!
 //! Every ground-truth test here warps **one** frame (index 3, `03.tif`, the
 //! sharpest at Laplacian variance 285,247) and registers it against itself
@@ -36,10 +34,7 @@ fn full_rect(width: u32, height: u32) -> Rect {
     }
 }
 
-/// Opens `fixtures/mantis-512` and reads frame 3's full tile -- the setup
-/// every ground-truth test in this file shares (see the module docs: frame 3
-/// is the only frame registered against itself, since it is the only
-/// configuration where the "known" transform is actually known).
+/// Opens `fixtures/mantis-512` and reads frame 3's full tile.
 fn frame_3_tile() -> (Tile, u32, u32) {
     let stack = open_fixture();
     let (width, height) = stack.dimensions();
@@ -105,8 +100,7 @@ fn similarity_about(scale: f64, radians: f64, cx: f64, cy: f64) -> Transform {
 }
 
 /// A deterministic xorshift32 PRNG, seeded with a fixed constant -- never
-/// `rand`, mirroring `crate::fuse::pyramid`'s own test-only generator
-/// (private there, so reimplemented here rather than exposed).
+/// `rand`, reproducible across runs, and local to this test file.
 struct XorShift32(u32);
 
 impl XorShift32 {
@@ -226,6 +220,56 @@ fn recovers_known_rotation_and_scale() {
     assert!(
         error < ROTATION_SCALE_TOLERANCE_PX,
         "corner error {error} px exceeds {ROTATION_SCALE_TOLERANCE_PX} px"
+    );
+}
+
+/// Regression test for the similarity increment's conjugation about the
+/// region centre. Uses a region whose centre sits well away
+/// from `default_region`'s (256, 256) -- (385, 385), the far corner of the
+/// fixture the inset margin still allows -- so that skipping the
+/// conjugation (`similarity_delta` in `crates/core/src/align/ecc.rs`)
+/// would apply the recovered increment about the wrong point and this test
+/// would actually notice: with a region centred at the origin, conjugating
+/// about the centre is a no-op and proves nothing about this step at all.
+#[test]
+fn similarity_conjugates_increment_about_region_centre() {
+    let (tile, width, height) = frame_3_tile();
+    let rect = full_rect(width, height);
+    let moving_plane = luma_plane(&tile, width, height);
+
+    let region = Rect {
+        x: 290,
+        y: 290,
+        width: 190,
+        height: 190,
+    };
+    let (cx, cy) = (
+        (region.x + region.width / 2) as f64,
+        (region.y + region.height / 2) as f64,
+    );
+    let w_true = similarity_about(0.995, (-2.5f64).to_radians(), cx, cy);
+    let warped = warp_from_tile(&tile, (width, height), rect, &w_true)
+        .expect("rotation+scale about a far-from-origin centre stays inside the frame");
+    let template_plane = luma_plane(&warped.tile, width, height);
+
+    let result = solve_level(
+        &template_plane,
+        region,
+        &moving_plane,
+        &Transform::identity(),
+        EccMode::Similarity,
+        &default_params(),
+    )
+    .expect("valid solver inputs");
+
+    assert_eq!(result.status, EccStatus::Converged, "result: {result:?}");
+    let error = corner_error(&result.transform, &w_true, region);
+    eprintln!("similarity_conjugates_increment_about_region_centre: corner error = {error} px");
+    assert!(
+        error < ROTATION_SCALE_TOLERANCE_PX,
+        "corner error {error} px exceeds {ROTATION_SCALE_TOLERANCE_PX} px -- a large error here \
+         (many px, not a small numerical one) means the similarity increment's conjugation \
+         about the region centre is missing or wrong"
     );
 }
 
