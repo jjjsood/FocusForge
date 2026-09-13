@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Fixture-backed driver tests for [`focusforge_core::tile::TileScheduler`]
-//! at tile size 200, `levels = 3` (margin 28, interior 144, 4x4 = 16 tiles
-//! over `fixtures/mantis-512`'s 512x512 extent, last interior 80 px) --
+//! at tile size 200, `levels = 3` (margin 24, interior 152, 4x4 = 16 tiles
+//! over `fixtures/mantis-512`'s 512x512 extent, last interior 56 px) --
 //! below the fixture's own 512 px crop, so seams are exercised.
 //!
 //! Deliberately fuses nothing: every consumer here is trivial (a
@@ -396,10 +396,22 @@ fn schedules_over_the_reference_stack() {
 
     let (width, height) = stack.dimensions();
     let plan = TilePlan::new(width, height, 512, 3).expect("plan must build");
+    // Derived from the plan's own arithmetic, never a pinned literal: the
+    // tile count is a function of the measured overlap margin, which moves
+    // whenever `crate::fuse::pyramid::MEASURED_MARGIN` is re-measured. A
+    // literal here would silently stop describing the plan it checks.
+    let levels = 3u32;
+    let alignment = 1u32 << levels;
+    let margin = focusforge_core::tile::plan::margin_for_levels(levels);
+    let interior = ((512 - 2 * margin) / alignment) * alignment;
+    let expected = (width.div_ceil(interior) * height.div_ceil(interior)) as usize;
     assert_eq!(
         plan.len(),
-        216,
-        "512px tiles at levels=3 must yield 18x12 = 216 tiles"
+        expected,
+        "512px tiles at levels={levels} (margin {margin}, interior {interior}) must yield \
+         {} x {} = {expected} tiles",
+        width.div_ceil(interior),
+        height.div_ceil(interior)
     );
 
     let stack_ctx = StackContext::new(stack.len(), width, height);

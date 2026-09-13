@@ -28,29 +28,36 @@ pub const MAX_LEVELS: u32 = 16;
 /// tile's interior is independent of everything outside its read rect to
 /// within 1 `u16` LSB -- rounded up to a multiple of `2^levels`:
 ///
-/// - `measured` is [`crate::fuse::pyramid::MEASURED_MARGIN`]'s
-///   measurement of exactly the criterion this margin is supposed to
-///   deliver: a worst-case, full-scale difference everywhere outside a
-///   window moves nothing inside that window, inset by the margin, by more
-///   than 1 LSB. The table lives beside the test that measures it
-///   (`fuse::pyramid::tests::stated_margin_matches_the_measurement`) rather
-///   than being duplicated here, so there is exactly one source of truth.
-/// - above the table's range, `analytic = 4 * (2^levels - 1)` -- the reach
-///   of a build-plus-collapse round trip for the 5-tap binomial
-///   kernel, 508 px at `levels = 7`, and **not** the naive
-///   `2^levels`, which is the one-tap-per-level idealization and
-///   understates the true dependency of a multi-tap kernel.
+/// [`crate::fuse::pyramid::MEASURED_MARGIN`] is the measured table, pinned by
+/// `fuse::pyramid::tests::stated_margin_matches_the_measurement`; past its range the margin
+/// falls back to `4 * (2^levels - 1)`, the reach of a build-plus-collapse round trip for a 5-tap
+/// binomial kernel. The measured entry is **not** capped by that analytic reach -- at `levels =
+/// 7` it exceeds it (512 against 508): the analytic figure is the reach in an arbitrarily large
+/// buffer, while the measured one is taken where the tails of two opposite margins overlap.
 ///
-/// `levels` above [`MAX_LEVELS`] is clamped rather than rejected here (a
-/// `const fn` cannot call `Ord::min`); [`TilePlan::new`] is what actually
-/// refuses an over-deep request, with [`TileError::LevelsTooDeep`].
+/// **This is the one place the overlap constant lives.** `levels` above
+/// [`MAX_LEVELS`] is clamped rather than rejected here (a `const fn` cannot
+/// call `Ord::min`, hence the `if` below rather than the trait method);
+/// [`TilePlan::new`] is what actually refuses an over-deep request, with
+/// [`TileError::LevelsTooDeep`].
 pub const fn margin_for_levels(levels: u32) -> u32 {
     let levels = if levels > MAX_LEVELS {
         MAX_LEVELS
     } else {
         levels
     };
-    4 * ((1u32 << levels) - 1)
+    let measured_table = crate::fuse::pyramid::MEASURED_MARGIN;
+    let bound = if (levels as usize) < measured_table.len() {
+        measured_table[levels as usize]
+    } else {
+        // Past the measured range, fall back to the analytic reach.
+        4 * ((1u32 << levels) - 1)
+    };
+    // Round up to the decimation grid. `levels == 0` aligns to 1, i.e. no
+    // change; `bound` is at most `4 * (2^MAX_LEVELS - 1)`, so neither the
+    // addition nor the product can overflow `u32`.
+    let alignment = 1u32 << levels;
+    bound.div_ceil(alignment) * alignment
 }
 
 /// One tile of a [`TilePlan`]: the interior rectangle this tile owns in the
@@ -106,9 +113,53 @@ impl TilePlan {
     ///
     /// Refuses rather than silently adjusting: a zero extent is
     /// `EmptyExtent`, `tile_size == 0` is `TileSizeZero`, `levels >
-    /// MAX_LEVELS` is `LevelsTooDeep`, and a margin that leaves no interior
-    /// (`tile_size <= 2 * margin`) is `NoInterior`, naming the smallest tile
-    /// size that would work (`2 * margin + 1`).
+    /// MAX_LEVELS` is `LevelsTooDeep`, and a tile too small for the margin's
+    /// own validity range is `NoInterior`, naming
+    /// `min_tile_size = max(2 * margin + 2^levels, 4 * margin + 64)` --
+    /// never `2 * margin + 2^levels` alone.
+    /// `crate::fuse::pyramid::MEASURED_MARGIN` is only established in the
+    /// geometry it was measured in, a buffer of `4 * margin + 64` per side;
+    /// a smaller buffer is, by the same measurement's tails-overlap
+    /// argument, the direction that needs *more* margin, not less, so a
+    /// plan may not be smaller than that geometry either. The `4 * margin +
+    /// 64` term only applies where a margin exists: at `levels == 0` there
+    /// is no pyramid and no measurement geometry to respect, so the floor
+    /// is skipped and `min_tile_size` is just `1`.
+    ///
+    /// **This deliberately refuses 512 px at 6 levels, which was accepted
+    /// before this floor existed** -- a narrowing, not a regression, since
+    /// the margin was never established for that geometry
+    /// (`tests::a_512_tile_at_6_levels_is_now_refused`). **The shipped
+    /// default is unaffected**: 512 px at 5 levels needs 448 px
+    /// (`4 * 96 + 64`) and has 512.
+    ///
+    /// # The decimation grid
+    ///
+    /// Every tile's read origin is a multiple of `2^levels`, so all tiles
+    /// decimate in the same dyadic phase. Otherwise adjacent tiles
+    /// decimate on different phases -- a shift-variance seam that does not
+    /// shrink as the margin grows and that no border rule can remove,
+    /// because it is a property of *where* the pyramid samples, not of what
+    /// it does at an edge.
+    ///
+    /// Two roundings together make that true, and both are needed:
+    ///
+    /// - the margin is rounded **up** to a multiple of `2^levels` (in
+    ///   [`margin_for_levels`], so `TileError::NoInterior::margin` and
+    ///   [`TilePlan::margin`] both report the effective overlap), and
+    /// - the interior stride is rounded **down** to a multiple of
+    ///   `2^levels`.
+    ///
+    /// A read origin is then `k * stride - margin`, a difference of two
+    /// multiples of `2^levels`; the first row and column, whose read origin
+    /// clamps to `0`, sit in that same dyadic phase rather than in one of
+    /// their own. `levels == 0` aligns to `1`, i.e. no change. If the un-aligned
+    /// interior is nonzero but rounds down to zero, that is `NoInterior`
+    /// too. This is what makes a tiled-vs-single-tile comparison an
+    /// exact equality rather than a tolerance nobody could otherwise
+    /// derive, and
+    /// `tests::read_origins_land_on_the_decimation_grid` is what holds it
+    /// to that.
     pub fn new(width: u32, height: u32, tile_size: u32, levels: u32) -> Result<Self, TileError> {
         if width == 0 || height == 0 {
             return Err(TileError::EmptyExtent { width, height });
@@ -124,13 +175,48 @@ impl TilePlan {
         }
 
         let margin = margin_for_levels(levels);
-        let interior_size = tile_size.saturating_sub(2 * margin);
+        // The smallest tile that actually plans. `2 * margin + alignment`
+        // alone is not enough: the margin table
+        // (`crate::fuse::pyramid::MEASURED_MARGIN`) is only established in
+        // the geometry it was measured in, a buffer of `4 * margin + 64`
+        // per side (`crate::fuse::pyramid::tests::leak_plane`), and a
+        // smaller buffer is, by the same measurement's tails-overlap
+        // argument, the direction that needs *more* margin, not less. The
+        // `4 * margin + 64` floor only makes sense where a margin exists:
+        // at `levels == 0` there is no pyramid and no measurement geometry
+        // to respect, so it is skipped rather than forcing every 0-level
+        // plan through a 64 px minimum. Both `NoInterior` arms name this
+        // same number, so the advice is never a size that the next guard
+        // refuses in turn.
+        let alignment: u32 = 1u32 << levels;
+        let min_tile_size = if margin == 0 {
+            2 * margin + alignment
+        } else {
+            (2 * margin + alignment).max(4 * margin + 64)
+        };
+        if tile_size < min_tile_size {
+            return Err(TileError::NoInterior {
+                tile_size,
+                margin,
+                levels,
+                min_tile_size,
+            });
+        }
+        let raw_interior = tile_size.saturating_sub(2 * margin);
+        // Round the interior stride down to the pyramid's own decimation
+        // grid -- see this function's rustdoc. Unreachable given the
+        // guard above (`tile_size >= min_tile_size >= 2 * margin +
+        // alignment` forces `raw_interior >= alignment`, and therefore
+        // `interior_size >= alignment > 0`), kept as a named guard rather
+        // than an assertion so a future change to `min_tile_size` cannot
+        // silently reopen a zero-interior plan.
+        let interior_size = (raw_interior / alignment) * alignment;
         if interior_size == 0 {
             return Err(TileError::NoInterior {
                 tile_size,
                 margin,
                 levels,
-                min_tile_size: 2 * margin + 1,
+                min_tile_size,
             });
         }
 
@@ -206,11 +292,37 @@ impl TilePlan {
 mod tests {
     use super::*;
 
+    /// The floor `TilePlan::new` refuses below: the margin table is only
+    /// established in the geometry it was measured in (`4 * margin + 64`
+    /// per side), so a tile smaller than that -- even if `2 * margin +
+    /// 2^levels` alone would leave a nonempty interior -- is refused.
+    /// Recomputed from `margin_for_levels` so a re-measured margin cannot
+    /// silently invalidate a test that pins a literal.
+    fn min_tile_size_for(levels: u32) -> u32 {
+        let margin = margin_for_levels(levels);
+        let alignment = 1u32 << levels;
+        if margin == 0 {
+            alignment
+        } else {
+            (2 * margin + alignment).max(4 * margin + 64)
+        }
+    }
+
+    /// The interior stride `TilePlan::new` derives for a tile size and a
+    /// level count, recomputed from the published margin so that a test
+    /// pins the *arithmetic* rather than a literal that a re-measured
+    /// margin would silently invalidate.
+    fn interior_size_for(tile_size: u32, levels: u32) -> u32 {
+        let alignment = 1u32 << levels;
+        ((tile_size - 2 * margin_for_levels(levels)) / alignment) * alignment
+    }
+
     #[test]
     fn interiors_partition_the_extent() {
         let plan = TilePlan::new(512, 512, 200, 3).unwrap();
-        assert_eq!(plan.margin(), 28);
-        assert_eq!(plan.len(), 16);
+        assert_eq!(plan.margin(), margin_for_levels(3));
+        let interior = interior_size_for(200, 3);
+        assert_eq!(plan.len(), (512u32.div_ceil(interior) as usize).pow(2));
 
         let mut coverage = vec![0u8; 512 * 512];
         for tile in plan.tiles() {
@@ -230,32 +342,70 @@ mod tests {
     #[test]
     fn edge_tiles_are_ragged() {
         let plan = TilePlan::new(512, 512, 200, 3).unwrap();
-        // interior_size = 144; 512 = 144*3 + 80.
+        // Derived, never pinned: the interior stride is the aligned
+        // `200 - 2 * margin_for_levels(3)`, and the frame's last row and
+        // column are whatever is left of 512 after a whole number of those
+        // strides -- ragged, not padded past the frame.
+        let interior = interior_size_for(200, 3);
+        let last_start = (512 / interior) * interior;
+        let ragged = 512 - last_start;
+        assert!(
+            ragged > 0 && ragged < interior,
+            "this fixture must produce a genuinely ragged edge: \
+             interior={interior}, last_start={last_start}, ragged={ragged}"
+        );
         let last_col = plan
             .tiles()
             .iter()
-            .find(|t| t.interior().x == 144 * 3)
+            .find(|t| t.interior().x == last_start)
             .expect("a tile must start the last ragged column");
-        assert_eq!(last_col.interior().width, 80);
+        assert_eq!(last_col.interior().width, ragged);
         let last_row = plan
             .tiles()
             .iter()
-            .find(|t| t.interior().y == 144 * 3)
+            .find(|t| t.interior().y == last_start)
             .expect("a tile must start the last ragged row");
-        assert_eq!(last_row.interior().height, 80);
+        assert_eq!(last_row.interior().height, ragged);
     }
 
     #[test]
     fn overlap_covers_the_measured_margin() {
         // n = 0 (no pyramid) needs no overlap at all: margin_for_levels(0)
         // == 0, correctly below the degenerate 2^0 == 1. For every n >= 1
-        // the analytic margin is at least the superseded 2^n.
+        // the margin is the measured requirement
+        // (`crate::fuse::pyramid::MEASURED_MARGIN`, or the analytic reach
+        // past that table) rounded **up** to the decimation grid, so it
+        // never falls below the measured number, it is itself a multiple of
+        // 2^n, and it exceeds what it rounds by less than one alignment
+        // step. It is deliberately *not* capped at the analytic reach: at
+        // n = 7 the measured requirement is larger, because the analytic
+        // figure describes an arbitrarily large buffer and a tile is not
+        // one.
         assert_eq!(margin_for_levels(0), 0);
         for n in 1..=8u32 {
             let margin = margin_for_levels(n);
-            assert_eq!(margin, 4 * ((1u32 << n) - 1));
+            let alignment = 1u32 << n;
+            let bound = crate::fuse::pyramid::MEASURED_MARGIN
+                .get(n as usize)
+                .copied()
+                .unwrap_or(4 * ((1u32 << n) - 1));
             assert!(
-                margin >= (1u32 << n),
+                margin >= bound,
+                "margin must never fall below the measured requirement: \
+                 n={n}, margin={margin}, bound={bound}"
+            );
+            assert!(
+                margin < bound + alignment,
+                "rounding up to the decimation grid must cost less than one \
+                 alignment step: n={n}, margin={margin}, bound={bound}, alignment={alignment}"
+            );
+            assert_eq!(
+                margin % alignment,
+                0,
+                "the margin must itself be on the decimation grid: n={n}, margin={margin}"
+            );
+            assert!(
+                margin >= alignment,
                 "margin must be at least the superseded 2^N: n={n}, margin={margin}"
             );
         }
@@ -265,15 +415,187 @@ mod tests {
 
     #[test]
     fn no_interior_is_refused_by_name() {
+        // levels = 7's measured margin (512) already exceeds a 512 px
+        // tile on its own (2 * 512 > 512), and the validity-range floor
+        // (`4 * margin + 64` = 2112) is stricter still. This is the whole
+        // point of the test: read the margin through `margin_for_levels`
+        // and the floor through `min_tile_size_for` (neither is a literal
+        // that a re-measurement could silently invalidate) and confirm the
+        // refusal still fires with the smallest workable tile size it
+        // should name.
+        let margin = margin_for_levels(7);
+        let min_tile_size = min_tile_size_for(7);
         let err = TilePlan::new(512, 512, 512, 7).unwrap_err();
         match err {
             TileError::NoInterior {
                 tile_size: 512,
-                margin: 508,
+                margin: m,
                 levels: 7,
-                min_tile_size: 1017,
-            } => {}
-            other => panic!("expected NoInterior naming 512/508/7/1017, got {other:?}"),
+                min_tile_size: mts,
+            } if m == margin && mts == min_tile_size => {}
+            other => {
+                panic!("expected NoInterior naming 512/{margin}/7/{min_tile_size}, got {other:?}")
+            }
+        }
+        // The rendered message is the only thing a user of the 512/7 case
+        // ever sees, so it is pinned here -- derived from the same numbers,
+        // so a re-measured margin moves the text with it.
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "tile_size 512 leaves no interior at margin {margin} for levels=7; \
+                 use tile_size >= {min_tile_size}, or request fewer levels"
+            )
+        );
+    }
+
+    #[test]
+    fn a_512_tile_at_6_levels_is_refused() {
+        // The margin table is established in a buffer of `4 * margin + 64`
+        // per side, which at levels=6 (margin 192) is 832 -- larger than
+        // the 512 px tile `2 * margin + 2^levels` alone would allow (448);
+        // 512 px is refused because it falls inside that gap, not inside
+        // the established geometry.
+        let margin = margin_for_levels(6);
+        let min_tile_size = min_tile_size_for(6);
+        let err = TilePlan::new(512, 512, 512, 6).unwrap_err();
+        match err {
+            TileError::NoInterior {
+                tile_size: 512,
+                margin: m,
+                levels: 6,
+                min_tile_size: mts,
+            } if m == margin && mts == min_tile_size => {}
+            other => {
+                panic!("expected NoInterior naming 512/{margin}/6/{min_tile_size}, got {other:?}")
+            }
+        }
+        assert!(
+            TilePlan::new(512, 512, min_tile_size, 6).is_ok(),
+            "the size the error names must actually plan"
+        );
+        // The rendered message, since it is the only thing a user of the
+        // 512/6 case ever sees.
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "tile_size 512 leaves no interior at margin {margin} for levels=6; \
+                 use tile_size >= {min_tile_size}, or request fewer levels"
+            )
+        );
+    }
+
+    #[test]
+    fn the_size_no_interior_names_actually_plans() {
+        // Five is a default, never a cap, and the only thing
+        // telling a user how to get 7 levels is `NoInterior`'s
+        // `min_tile_size`. So: take that size from the error itself --
+        // never a literal, or the advice and the guard can drift apart --
+        // and plan at exactly it.
+        let err = TilePlan::new(4096, 4096, 512, 7).unwrap_err();
+        let TileError::NoInterior { min_tile_size, .. } = err else {
+            panic!("512 px at levels=7 must be refused with NoInterior, got {err:?}");
+        };
+        let plan = TilePlan::new(4096, 4096, min_tile_size, 7).unwrap_or_else(|e| {
+            panic!("the tile size NoInterior names ({min_tile_size}) must plan, got {e}")
+        });
+        assert_eq!(plan.levels(), 7);
+        assert!(!plan.is_empty());
+        let alignment = 1u32 << 7;
+        for tile in plan.tiles() {
+            assert!(tile.interior().width > 0 && tile.interior().height > 0);
+            assert_eq!(tile.read().x % alignment, 0);
+            assert_eq!(tile.read().y % alignment, 0);
+        }
+    }
+
+    #[test]
+    fn a_tile_between_the_old_and_new_floor_is_refused_by_name() {
+        // `2 * margin + alignment` alone decided whether a tile planned,
+        // and `2 * margin + 1` was the largest size the old logic still
+        // refused (raw margin subtraction survives, but the interior
+        // rounds to zero on the decimation grid). The validity-range floor
+        // (`4 * margin + 64`, applied whenever the margin is nonzero) is
+        // strictly larger at levels=5, so the same size is still refused
+        // today, but for the floor's reason rather than the rounding's:
+        // `min_tile_size_for` shows the floor alone already exceeds
+        // `2 * margin + alignment`, so the alignment-rounds-to-zero guard
+        // in `TilePlan::new` is unreachable once a plan clears the floor --
+        // it stays in the source as a named, cheap defence rather than a
+        // reachable path this test can still isolate.
+        let levels = 5u32;
+        let margin = margin_for_levels(levels);
+        let alignment = 1u32 << levels;
+        let tile_size = 2 * margin + 1;
+        let min_tile_size = min_tile_size_for(levels);
+        assert!(
+            min_tile_size > 2 * margin + alignment,
+            "this fixture assumes the floor is the binding constraint at levels={levels}"
+        );
+        match TilePlan::new(4096, 4096, tile_size, levels) {
+            Err(TileError::NoInterior {
+                tile_size: t,
+                margin: m,
+                levels: l,
+                min_tile_size: mts,
+            }) if t == tile_size && m == margin && l == levels && mts == min_tile_size => {
+                assert!(TilePlan::new(4096, 4096, min_tile_size, levels).is_ok());
+            }
+            other => {
+                panic!(
+                    "expected NoInterior naming {tile_size}/{margin}/{levels}/{min_tile_size}, \
+                     got {other:?}"
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn read_origins_land_on_the_decimation_grid() {
+        // The property holds so that *every* tile's read origin -- the
+        // first one included -- is a multiple of `2^levels`; no two tiles
+        // decimate in different dyadic phases, and a tiled-vs-single-tile
+        // comparison is an equality. Aligning the stride alone is not
+        // enough; the margin subtracted to derive the read origin has to
+        // be on the grid too.
+        for levels in 0..=7u32 {
+            let margin = margin_for_levels(levels);
+            let alignment = if levels == 0 { 1 } else { 1u32 << levels };
+            // Four aligned interiors' worth of tile above the
+            // validity-range floor, and a frame wide enough that several
+            // tiles (plus a ragged edge) exist.
+            let tile_size = min_tile_size_for(levels) + 4 * alignment;
+            let interior = ((tile_size - 2 * margin) / alignment) * alignment;
+            let width = 3 * interior + interior / 2 + 7;
+            let height = 2 * interior + 3;
+            let plan = TilePlan::new(width, height, tile_size, levels)
+                .unwrap_or_else(|e| panic!("plan must build at levels={levels}: {e}"));
+            assert!(
+                plan.len() >= 8,
+                "levels={levels} must produce several tiles, got {}",
+                plan.len()
+            );
+            for tile in plan.tiles() {
+                let r = tile.read();
+                assert_eq!(
+                    r.x % alignment,
+                    0,
+                    "read origin x={} is off the 2^{levels}={alignment} decimation grid \
+                     (tile {}, interior x={})",
+                    r.x,
+                    tile.index(),
+                    tile.interior().x
+                );
+                assert_eq!(
+                    r.y % alignment,
+                    0,
+                    "read origin y={} is off the 2^{levels}={alignment} decimation grid \
+                     (tile {}, interior y={})",
+                    r.y,
+                    tile.index(),
+                    tile.interior().y
+                );
+            }
         }
     }
 

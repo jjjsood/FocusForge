@@ -39,13 +39,13 @@ pub enum TileError {
     /// the smaller term alone is not enough, because `2 * margin + 2^levels`
     /// can be smaller than the `4 * margin + 64` buffer the margin table
     /// was actually measured against, and that direction needs *more*
-    /// margin, not less. The message spells out both ways out, since
-    /// `levels = 7` at the default 512 px tile is the first
-    /// combination a reader hits: use a tile size of at least
-    /// `min_tile_size`, or ask for fewer levels.
+    /// margin, not less. The message spells out both ways out, since a
+    /// 512 px tile at `levels = 7` is the first combination a reader hits:
+    /// use a tile size of at least `min_tile_size`, or ask for fewer
+    /// levels.
     #[error(
-        "tile_size {tile_size} leaves no interior at margin {margin} (levels {levels}); \
-         the smallest tile size that would work is {min_tile_size}"
+        "tile_size {tile_size} leaves no interior at margin {margin} for levels={levels}; \
+         use tile_size >= {min_tile_size}, or request fewer levels"
     )]
     NoInterior {
         tile_size: u32,

@@ -47,10 +47,30 @@ use crate::tile::preprocess::FramePreprocess;
 use crate::tile::scratch::ScratchDir;
 use crate::tile::{Tile, TileError};
 
-/// A neutral default pyramid depth: zero, meaning no overlap and no
-/// pyramid, until a caller states what it actually needs. A caller picks
-/// the level count its algorithm requires.
-pub const DEFAULT_LEVELS: u32 = 0;
+/// The default pyramid depth: **5, a default, never a cap**. `levels` stays
+/// a live parameter -- a caller (`ParamDesc`, or a direct
+/// `TileSchedulerOptions` literal, as every test in this crate already
+/// does) can ask for any depth the geometry allows, up to
+/// [`super::plan::margin_for_levels`]'s measured table and
+/// [`crate::tile::TileError::NoInterior`]'s refusal; nothing here clamps
+/// that request.
+///
+/// Five, not seven, because `crate::fuse::pyramid::MEASURED_MARGIN` --
+/// the *measured*, not analytic, tile-overlap margin -- is
+/// `[0, 4, 12, 24, 48, 96, 192, 512]` for `levels = 0..=7`. At the
+/// [`super::plan::DEFAULT_TILE_SIZE`] of 512 px, and after the interior
+/// stride is rounded down to the decimation grid, that leaves an interior
+/// of 464 px at 3 levels and 320 px at 5 -- **the shipped default is
+/// unaffected by the validity-range floor below**: 512 px at 5 levels
+/// needs 448 px (`4 * 96 + 64`) and has 512.
+///
+/// **6 and 7 levels are both refused outright at 512 px** (`crate::tile::TileError::NoInterior`),
+/// naming 832 px and 2112 px as the smallest tile that plans (`max(2 * margin + 2^levels, 4 *
+/// margin + 64)`): the margin table is only established in a `4 * margin + 64` buffer per side, and
+/// 512 px falls short of it at 6 levels (832 px needed) and at 7 (whose coarsest Gaussian there is
+/// a 4x4 image). 5 levels keeps a healthy majority of the tile as usable interior; raising it costs
+/// width fast.
+pub const DEFAULT_LEVELS: u32 = 5;
 
 /// The default in-flight memory budget: 1 GiB of frame-tile sets, before
 /// per-worker pyramid allocations on top.

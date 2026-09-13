@@ -6,6 +6,7 @@
 
 pub mod algorithm;
 pub mod align;
+pub mod fuse;
 pub mod io;
 pub mod params;
 pub mod registry;
