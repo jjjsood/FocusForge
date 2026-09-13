@@ -9,8 +9,11 @@
 //! single pyramid level. [`crate::align::PyramidalEcc`] drives that solver
 //! coarse-to-fine over a pyramid to register whole frames, and
 //! [`align_stack`] is the free-function driver that runs it across a whole
-//! stack under a reference policy.
+//! stack under a reference policy. `crop` computes the auto-crop rect from
+//! a finished [`StackAlignment`]: pure geometry over the transforms, no
+//! pixel ever read.
 
+mod crop;
 mod driver;
 mod ecc;
 mod ecc_algorithm;
@@ -19,6 +22,7 @@ mod pyramid;
 mod transform;
 pub mod warp;
 
+pub use crop::{auto_crop, crop_rect};
 pub use driver::{
     FailurePolicy, FrameAlignment, ReferenceFrame, ReferencePolicy, StackAlignment, align_stack,
 };

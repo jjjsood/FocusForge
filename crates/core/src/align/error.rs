@@ -81,4 +81,13 @@ pub enum AlignError {
     /// `epsilon_px`, or a `min_valid_fraction` outside `(0.0, 1.0]`.
     #[error("invalid EccParams: {detail}")]
     InvalidParams { detail: String },
+
+    /// The auto-crop footprint mapping was handed a [`super::Transform`]
+    /// whose bottom row is not `[0, 0, w]` -- a genuinely projective matrix,
+    /// which can send a rectangle's corner to infinity and has no bounded
+    /// footprint for the inscribed-rectangle search to run over.
+    #[error(
+        "transform's bottom row {bottom_row:?} is not affine (perspective row must be [0, 0, w])"
+    )]
+    NotAffine { bottom_row: [f64; 3] },
 }
