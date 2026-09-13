@@ -43,9 +43,7 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus};
-use crate::align::error::AlignError;
 use crate::align::{AlignPyramid, EccMode, EccParams, EccStatus, LumaAssembler, Transform};
-use crate::fuse::PyramidError;
 use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
 use crate::registry::AlignRegistration;
 use crate::tile::plan::{DEFAULT_TILE_SIZE, MAX_LEVELS};
@@ -74,14 +72,9 @@ const MAX_REGION_PIXELS: u32 = 1 << 20;
 /// measures noise rather than motion.
 const MIN_COARSEST_EXTENT_PX: u32 = 64;
 
-fn wrap_align_error(source: AlignError) -> AlgorithmError {
-    AlgorithmError::Failed {
-        algorithm: "pyramidal-ecc".to_string(),
-        detail: source.to_string(),
-    }
-}
-
-fn wrap_pyramid_error(source: PyramidError) -> AlgorithmError {
+/// Wraps any of this module's own error sources (align, pyramid) into an
+/// [`AlgorithmError::Failed`] tagged with this algorithm's id.
+fn wrap_error(source: impl std::fmt::Display) -> AlgorithmError {
     AlgorithmError::Failed {
         algorithm: "pyramidal-ecc".to_string(),
         detail: source.to_string(),
@@ -310,12 +303,12 @@ impl PyramidalEcc {
                 samples_per_pixel: spp,
                 samples: band,
             };
-            assembler.push_tile(&tile).map_err(wrap_align_error)?;
+            assembler.push_tile(&tile).map_err(wrap_error)?;
             y += band_height;
         }
 
-        let base = assembler.finish().map_err(wrap_pyramid_error)?;
-        AlignPyramid::from_luma(base, depth).map_err(wrap_pyramid_error)
+        let base = assembler.finish().map_err(wrap_error)?;
+        AlignPyramid::from_luma(base, depth).map_err(wrap_error)
     }
 }
 
@@ -399,7 +392,7 @@ impl AlignAlgorithm for PyramidalEcc {
 
             let result =
                 crate::align::solve_level(level_ref, region, level_frame, &seed, mode, &params)
-                    .map_err(wrap_align_error)?;
+                    .map_err(wrap_error)?;
             total_iterations += result.iterations;
             final_residual = result.correlation;
 
