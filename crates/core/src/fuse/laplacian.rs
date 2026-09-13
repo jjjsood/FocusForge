@@ -167,9 +167,14 @@
 //! than merely lucky: identical frames at the same geometry give an
 //! observed composite difference of exactly 0 (no selection can flip when
 //! every frame ties), isolating the 96..140 px divergence to selection
-//! alone. This is a property of selection algorithms in general, not a
-//! defect specific to this one -- any per-pixel selection algorithm,
-//! including the Depth Map, inherits it unchanged.
+//! alone. This is not a defect specific to this algorithm, but it is
+//! narrower than "any selection algorithm": the band exists because
+//! `collapse`'s 62 px reach stacks on top of the selection cone. An
+//! algorithm that selects per pixel and then **copies source samples**
+//! rather than collapsing a pyramid has a composite fully determined by
+//! its own Z-Map -- `composite[p] == frames[zmap[p]][p]` -- so where that
+//! Z-Map is exact under tiling, so is the composite. The property
+//! travels with `collapse`, not with selection.
 
 use std::sync::{Arc, LazyLock};
 
