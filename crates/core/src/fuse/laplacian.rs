@@ -143,15 +143,9 @@
 //! a *discrete decision flip* -- no margin, at any size short of covering
 //! the full 140 px composite cone, makes the composite tile-invariant.
 //! Raising the margin to 160 px (covering 140, aligned to the `2^5 = 32`
-//! decimation grid) would make both halves exact. Note what that costs
-//! before reaching for it: `min_tile_size` becomes `4 * 160 + 64 = 704`,
-//! so the default 512 px tile would not merely drop to 4 levels, it would
-//! fall below the minimum planning tile entirely. An earlier note filed
-//! this fix as "raise the margin to 128", sized against the undercounted
-//! 125 px band and putting `min_tile_size` at 576; that figure is wrong
-//! and anyone picking this up must re-derive from 140, not 125. Deferred
-//! to a GPU implementation. GPU parity is what would make bit-exact tiling
-//! worth the trade.
+//! decimation grid) would make both halves exact, at a cost: `min_tile_size`
+//! becomes `4 * 160 + 64 = 704`, so the default 512 px tile would fall
+//! below the minimum planning tile entirely.
 //!
 //! | level `k` | cone today, `62 + 2^k` (fixed radius 1) | cone with `W = 8`, `62 + 2^k * r_k` |
 //! |---|---|---|
