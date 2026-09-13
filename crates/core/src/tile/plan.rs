@@ -510,19 +510,17 @@ mod tests {
     }
 
     #[test]
-    fn a_tile_between_the_old_and_new_floor_is_refused_by_name() {
-        // `2 * margin + alignment` alone decided whether a tile planned,
-        // and `2 * margin + 1` was the largest size the old logic still
-        // refused (raw margin subtraction survives, but the interior
-        // rounds to zero on the decimation grid). The validity-range floor
-        // (`4 * margin + 64`, applied whenever the margin is nonzero) is
-        // strictly larger at levels=5, so the same size is still refused
-        // today, but for the floor's reason rather than the rounding's:
-        // `min_tile_size_for` shows the floor alone already exceeds
-        // `2 * margin + alignment`, so the alignment-rounds-to-zero guard
-        // in `TilePlan::new` is unreachable once a plan clears the floor --
-        // it stays in the source as a named, cheap defence rather than a
-        // reachable path this test can still isolate.
+    fn a_tile_the_old_rounding_guard_alone_caught_is_refused_by_name() {
+        // `tile_size = 2 * margin + 1` gives the smallest nonzero raw
+        // interior (`1` px), which rounds down to `0` on the decimation
+        // grid -- the `interior_size == 0` case `TilePlan::new` guards
+        // against.
+
+        // At levels=5 this size is `193`, below the validity-range floor
+        // `4 * margin + 64 = 448`, so `TilePlan::new` refuses it by
+        // `NoInterior` before the alignment-rounds-to-zero guard is
+        // reached; the between-448-and-832 case is
+        // `tests::a_512_tile_at_6_levels_is_refused`.
         let levels = 5u32;
         let margin = margin_for_levels(levels);
         let alignment = 1u32 << levels;
