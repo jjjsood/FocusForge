@@ -17,15 +17,46 @@
 //! ```text
 //! detail_f = build(frame_f.samples, w, h, spp, 1).levels()[0]
 //! score_f  = score_plane(detail_f, radius)          (crate::fuse::laplacian::score_plane)
-//! w_f(p)   = score_f(p) ^ weight-exponent            (f32 powf)
+//! w_f(p)   = score_f(p) ^ weight-exponent            (f64 powf, see below)
 //! out(p)   = sum_f w_f(p) * frame_f(p)  /  sum_f w_f(p)     (den(p) > 0)
 //!          = mean_f frame_f(p)                              (den(p) == 0, see below)
 //! ```
 //!
-//! Both accumulations (the weighted numerator and the plain sample sum kept
-//! for the degenerate case) run in **ascending frame order** in `f32`,
-//! pinned like every other accumulation in this crate: `f32` addition is not
-//! associative. The final `f32` blend is written into a [`Plane`] and
+//! # Precision, and why it is `f64` here
+//!
+//! The score is a windowed sum of Laplacian magnitudes, so on high-contrast
+//! input it reaches the tens of thousands; raised to the declared maximum
+//! `weight-exponent` of 8.0, an `f32` weight overflows to infinity once the
+//! score passes roughly 63,000 (`f32::MAX` is ~3.4e38). Infinity then
+//! reaches the normalisation as `inf / inf`, which is `NaN`, and `NaN`
+//! rounds to 0 -- a silently black pixel at the sharpest place in the
+//! image, exactly where the algorithm should be most confident.
+//!
+//! A twin reproduces this by widening and narrowing in the same two places:
+//!
+//! - **Widen at the weight.** `score` is read as `f64` and `powf` is taken
+//!   in `f64`. Both accumulators -- the weighted numerator and the plain
+//!   sample sum kept for the degenerate case -- and the denominator are
+//!   `f64`, as is the running best used for the tie-break.
+//! - **Narrow once, at the finished ratio.** `num / den` (or the plain mean)
+//!   is cast to `f32` per sample and written into a [`Plane`]. Nothing else
+//!   narrows.
+//!
+//! Both accumulations run in **ascending frame order**, pinned like every
+//! other accumulation in this crate: floating-point addition is not
+//! associative, and the order is part of the specification rather than an
+//! implementation detail.
+//!
+//! ## The optimisation that must not be taken
+//!
+//! The obvious way to keep the weights small is to normalise the scores by
+//! the tile's maximum before exponentiating. **Do not.** It would make every
+//! weight a function of the tile's contents, so a pixel's blend would depend
+//! on which tile it was computed in -- destroying the property this
+//! algorithm has and `laplacian` does not: its composite is bit-identical
+//! between a tiled and an untiled run, asserted with no tolerance in
+//! `tests/fuse_algorithms.rs`. Widening the accumulator is per-pixel and
+//! tile-independent; normalising by a tile statistic is not. The final `f32` blend is written into a [`Plane`] and
 //! converted with [`Plane::to_u16_into`] (`floor(clamp(v, 0, 65535) + 0.5)`)
 //! -- one rounding rule in the project, never an open-coded cast.
 //!
@@ -199,10 +230,10 @@ impl StackAlgorithm for WeightedAverage {
         // frames. Each frame's detail plane and score plane are built,
         // folded into the accumulators and dropped -- peak live memory is
         // independent of `frame_count`.
-        let mut num = vec![0.0f32; pixel_count * spp_usize];
-        let mut sample_sum = vec![0.0f32; pixel_count * spp_usize];
-        let mut den = vec![0.0f32; pixel_count];
-        let mut best = vec![f32::NEG_INFINITY; pixel_count];
+        let mut num = vec![0.0f64; pixel_count * spp_usize];
+        let mut sample_sum = vec![0.0f64; pixel_count * spp_usize];
+        let mut den = vec![0.0f64; pixel_count];
+        let mut best = vec![f64::NEG_INFINITY; pixel_count];
         let mut winner = vec![0u16; pixel_count];
 
         for f in 0..frame_count {
@@ -212,10 +243,10 @@ impl StackAlgorithm for WeightedAverage {
             let scores = score_plane(&detail, radius);
 
             for p in 0..pixel_count {
-                let w = scores[p].powf(weight_exponent);
+                let w = f64::from(scores[p]).powf(f64::from(weight_exponent));
                 let base = p * spp_usize;
                 for c in 0..spp_usize {
-                    let sample = f32::from(tile.samples[base + c]);
+                    let sample = f64::from(tile.samples[base + c]);
                     num[base + c] += w * sample;
                     sample_sum[base + c] += sample;
                 }
@@ -230,13 +261,15 @@ impl StackAlgorithm for WeightedAverage {
             }
         }
 
-        let frame_count_f32 = frame_count as f32;
+        let frame_count_f64 = frame_count as f64;
         let mut blended = vec![0.0f32; pixel_count * spp_usize];
         for p in 0..pixel_count {
             let base = p * spp_usize;
             if den[p] > 0.0 {
                 for c in 0..spp_usize {
-                    blended[base + c] = num[base + c] / den[p];
+                    // The one narrowing: every weight and every sum above is
+                    // `f64`, and only the finished ratio becomes `f32`.
+                    blended[base + c] = (num[base + c] / den[p]) as f32;
                 }
             } else {
                 // Degenerate rule: every frame's weight was exactly zero at
@@ -244,7 +277,7 @@ impl StackAlgorithm for WeightedAverage {
                 // record the Z-Map index as 0 -- never `NO_SOURCE`, never a
                 // division by zero.
                 for c in 0..spp_usize {
-                    blended[base + c] = sample_sum[base + c] / frame_count_f32;
+                    blended[base + c] = (sample_sum[base + c] / frame_count_f64) as f32;
                 }
                 winner[p] = 0;
             }
@@ -452,14 +485,9 @@ mod tests {
 
     #[test]
     fn higher_weight_exponent_shifts_the_blend_toward_the_sharper_frame() {
-        // A modest radius and amplitude, chosen so the windowed score stays
-        // well inside `f32`'s range even after `powf(4.0)` -- a radius of 8
-        // combined with a full 0..65535 checkerboard and an exponent of 8.0
-        // overflows `f32` to infinity (score ~1e6, `1e6^8 ~ 1e48`), which is
-        // a real numerical-range finding about the pinned formula's upper
-        // parameter range, reported separately, not something this test
-        // (about the exponent's *sign* of effect, not its extremes) should
-        // trip over.
+        // A modest radius and amplitude: this test is about the exponent's
+        // *sign* of effect, not its extremes. The extreme is covered by
+        // `the_top_of_the_declared_range_does_not_overflow`.
         let (w, h, spp) = (16u32, 16u32, 1u32);
         let sharp = checkerboard_amplitude(w, h, spp, 10000, 50000);
         let mild = checkerboard_amplitude(w, h, spp, 30000, 35000);
@@ -485,6 +513,48 @@ mod tests {
             dist_high < dist_low,
             "a higher weight-exponent must move the blend strictly closer to the sharper \
              frame at an interior pixel: dist_low={dist_low}, dist_high={dist_high}"
+        );
+    }
+
+    /// The top of the declared parameter range must produce a real pixel,
+    /// not a silently black one.
+    ///
+    /// A radius-8 window over a full 0..65535 checkerboard gives a score
+    /// around 1e6. At `weight-exponent = 8.0` -- the declared maximum --
+    /// `1e6^8` is about `1e48`, which is infinity in `f32` (max ~3.4e38).
+    /// Before the weight was widened to `f64` this produced `inf / inf` in
+    /// the normalisation, i.e. `NaN`, which rounds to 0: a black pixel at
+    /// the sharpest point in the image, with no error raised anywhere.
+    ///
+    /// The declared range is part of the contract, so the whole of it has
+    /// to work. This is the criterion that was missing when the range was
+    /// declared.
+    #[test]
+    fn the_top_of_the_declared_range_does_not_overflow() {
+        let (w, h, spp) = (32u32, 32u32, 1u32);
+        let sharp = checkerboard_amplitude(w, h, spp, 0, 65535);
+        let mild = checkerboard_amplitude(w, h, spp, 30000, 35000);
+        let tiles = vec![tile_of(w, h, spp, sharp.clone()), tile_of(w, h, spp, mild)];
+        let ctx = TileCtx::new(rect(w, h), &tiles);
+
+        let out = WeightedAverage
+            .fuse(&ctx, &cfg(8, 8.0))
+            .expect("the declared maximum exponent must fuse, not fail");
+
+        // Interior pixel, away from the clamp-to-edge border.
+        let p = (16 * w + 16) as usize;
+        let sharp_val = sharp[p];
+        assert_eq!(
+            out.tile.samples[p], sharp_val,
+            "at the declared maximum exponent the sharpest frame should dominate              completely; a 0 here is the old f32 overflow returning as NaN"
+        );
+
+        // And nothing anywhere collapsed to the NaN-rounds-to-zero pixel.
+        let sharp_is_bright = sharp.iter().filter(|&&v| v > 0).count();
+        let out_is_bright = out.tile.samples.iter().filter(|&&v| v > 0).count();
+        assert_eq!(
+            out_is_bright, sharp_is_bright,
+            "every pixel bright in the dominating frame must stay bright in the blend"
         );
     }
 
