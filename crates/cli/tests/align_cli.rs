@@ -317,7 +317,7 @@ fn lax_reports_the_failure_and_exits_zero() {
     assert!(out.success, "stdout: {} stderr: {}", out.stdout, out.stderr);
     assert_eq!(out.code, Some(0));
     assert!(
-        out.stderr.contains('1') || out.stderr.to_lowercase().contains("fail"),
+        out.stderr.contains("frame(s) failed to register"),
         "the failure count must be reported on stderr: {}",
         out.stderr
     );
