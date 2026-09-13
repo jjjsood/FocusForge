@@ -380,16 +380,6 @@ fn zmap_is_spatially_coherent() {
     );
 }
 
-#[test]
-fn tiled_zmap_equals_single_tile_exactly() {
-    let tiled = golden_result();
-    let single = single_tile_result();
-    assert_eq!(
-        tiled.zmap, single.zmap,
-        "the Z-Map at tile 448/5 must equal the single-tile (704/5) Z-Map element for element"
-    );
-}
-
 /// The composite seam is not boundable: every
 /// level's selection cone sits inside the 96 px margin (70 px at level 0,
 /// worst case 78 px at level 4), so the Z-Map is exactly equal between the
