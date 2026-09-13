@@ -394,8 +394,14 @@ mod tests {
             width: 512,
             height: 512,
             samples_per_pixel: 3,
-            algorithm: "laplacian".to_string(),
-            display_name: "Laplacian Pyramid".to_string(),
+            // A fictional id on purpose. This module is `crates/cli/src`,
+            // and the criterion that no algorithm id appears here is
+            // enforced by a literal `git grep` -- a gate with a
+            // documented exception for test data is not a gate. `render`
+            // formats whatever string it is handed, so a real id would
+            // buy the test nothing.
+            algorithm: "example-stack".to_string(),
+            display_name: "Example Stacker".to_string(),
             params: vec![ParamReport {
                 id: "levels".to_string(),
                 value: ParamValue::Int(5),
@@ -421,8 +427,8 @@ mod tests {
             "8 frames",
             "512x512",
             "3ch",
-            "laplacian",
-            "Laplacian Pyramid",
+            "example-stack",
+            "Example Stacker",
             "levels = 5 (Auto)",
             "tile_size=512",
             "levels=5",
