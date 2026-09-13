@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-labelledby="ff-logo-small-inverse-title">
+  <title id="ff-logo-small-inverse-title">FocusForge</title>
+
+  <!-- Inverse cut for dark backgrounds: the dark fill becomes light, the accent is unchanged.
+       Small-size cut, redrawn on a 32 grid: three planes, height 2, gap 2, widths 24 / 16 / 24.
+       Plate edges sit on even coordinates so they stay crisp down to 16 px. -->
+  <g fill="#F2F4F6">
+    <rect x="4" y="18" width="24" height="2"/>
+    <rect x="8" y="22" width="16" height="2"/>
+    <rect x="4" y="26" width="24" height="2"/>
+  </g>
+
+  <!-- Hammer, same 2:5 slope as the master, one module above the face. -->
+  <g fill="#E8763A" transform="rotate(-21.801 13 11.4)">
+    <rect x="10.5" y="7.4" width="5" height="8"/>
+    <rect x="15.5" y="10.4" width="8" height="2"/>
+  </g>
+</svg>

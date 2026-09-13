@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-labelledby="ff-logo-title">
+  <title id="ff-logo-title">FocusForge</title>
+
+  <!-- Anvil: five planes, height 6, gap 6. Widths step by 18: 96 / 78 / 60 / 78 / 96. -->
+  <g fill="#23303B">
+    <rect x="16" y="58"  width="96" height="6"/>
+    <rect x="25" y="70"  width="78" height="6"/>
+    <rect x="34" y="82"  width="60" height="6"/>
+    <rect x="25" y="94"  width="78" height="6"/>
+    <rect x="16" y="106" width="96" height="6"/>
+  </g>
+
+  <!-- Hammer on a 2:5 grid slope, head square to it, one plate gap above the face. -->
+  <g fill="#E8763A" transform="rotate(-21.801 50 35)">
+    <rect x="41" y="20" width="18" height="30"/>
+    <rect x="59" y="32" width="36" height="6"/>
+  </g>
+</svg>
