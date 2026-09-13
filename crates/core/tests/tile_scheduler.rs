@@ -24,10 +24,6 @@ use focusforge_core::tile::{
     NoopPreprocess, TileConsumer, TileError, TileJob, TilePlan, TileScheduler, TileSchedulerOptions,
 };
 
-fn mantis_512_dir() -> PathBuf {
-    common::fixtures_dir().join("mantis-512")
-}
-
 /// A fresh scratch base under this binary's own `CARGO_TARGET_TMPDIR`
 /// subdirectory, named after `label` so parallel tests in this file never
 /// collide.
@@ -97,7 +93,7 @@ impl TileConsumer for PassthroughWriter {
 }
 
 fn run_passthrough(out_path: &Path, options: &TileSchedulerOptions) {
-    let stack = TiffStack::open(mantis_512_dir()).expect("mantis-512 must open");
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let (width, height) = stack.dimensions();
     let stack_ctx = StackContext::new(stack.len(), width, height);
     let scheduler =
@@ -114,7 +110,7 @@ fn passthrough_roundtrip_is_bit_identical() {
     let out_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("passthrough_roundtrip.tif");
     run_passthrough(&out_path, &options("roundtrip", 1 << 30));
 
-    let source = TiffStack::open(mantis_512_dir()).expect("source must reopen");
+    let source = TiffStack::open(common::mantis_512_dir()).expect("source must reopen");
     let (width, height) = source.dimensions();
     let direct = source
         .read_tile(
@@ -149,7 +145,7 @@ fn passthrough_roundtrip_is_bit_identical() {
 
 #[test]
 fn output_is_thread_count_independent() {
-    let stack = TiffStack::open(mantis_512_dir()).expect("mantis-512 must open");
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let bytes_per_tile_set = stack.len() as u64 * 200 * 200 * 3 * 2;
 
     let out_1 = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("thread_count_1.tif");
@@ -197,7 +193,7 @@ impl focusforge_core::tile::FramePreprocess for RecordingPreprocess {
 
 #[test]
 fn preprocess_hook_sees_every_frame_tile() {
-    let stack = TiffStack::open(mantis_512_dir()).expect("mantis-512 must open");
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let (width, height) = stack.dimensions();
     let stack_ctx = StackContext::new(stack.len(), width, height);
     let opts = options("preprocess", 1 << 30);
@@ -280,7 +276,7 @@ impl TileConsumer for ScratchProbe {
 
 #[test]
 fn scratch_is_cleaned_up_on_error() {
-    let stack = TiffStack::open(mantis_512_dir()).expect("mantis-512 must open");
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let (width, height) = stack.dimensions();
     let stack_ctx = StackContext::new(stack.len(), width, height);
 
@@ -345,7 +341,7 @@ impl TileConsumer for FailingOneTile {
 
 #[test]
 fn consumer_error_names_its_tile() {
-    let stack = TiffStack::open(mantis_512_dir()).expect("mantis-512 must open");
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let (width, height) = stack.dimensions();
     let stack_ctx = StackContext::new(stack.len(), width, height);
     let opts = options("failing-tile", 1 << 30);

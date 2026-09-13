@@ -92,10 +92,6 @@ fn peak_since_reset() -> usize {
 /// would.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-fn mantis_512_dir() -> PathBuf {
-    common::fixtures_dir().join("mantis-512")
-}
-
 /// Touches every frame's tile without accumulating anything, so the
 /// measured peak reflects the scheduler's own frame-tile buffers, not this
 /// consumer's.
@@ -114,7 +110,7 @@ impl TileConsumer for NoAllocConsumer {
 fn peak_live_heap_stays_under_ceiling() {
     let _guard = SERIAL.lock().unwrap();
 
-    let stack = TiffStack::open(mantis_512_dir()).expect("mantis-512 must open");
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let (width, height) = stack.dimensions();
     let frame_count = stack.len();
 
@@ -205,7 +201,7 @@ fn in_flight_tiles_respect_the_budget() {
         .map(|n| n.get())
         .unwrap_or(1);
 
-    let stack = TiffStack::open(mantis_512_dir()).expect("mantis-512 must open");
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let (width, height) = stack.dimensions();
     let frame_count = stack.len();
     let bytes_per_tile_set = frame_count as u64 * 128 * 128 * 3 * 2;

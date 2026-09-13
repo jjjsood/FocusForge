@@ -32,3 +32,13 @@ pub fn sibling_data_root() -> Option<PathBuf> {
 pub fn fixtures_dir() -> PathBuf {
     workspace_root().join("fixtures")
 }
+
+/// `fixtures/mantis-512`, shared by every test file driven off that crop.
+///
+/// `#[allow(dead_code)]`: each integration test file compiles this shared
+/// module into its own binary crate, and not every one of this crate's test
+/// binaries calls this helper.
+#[allow(dead_code)]
+pub fn mantis_512_dir() -> PathBuf {
+    fixtures_dir().join("mantis-512")
+}
