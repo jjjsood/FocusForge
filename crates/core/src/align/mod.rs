@@ -27,8 +27,11 @@ pub use crop::{auto_crop, crop_rect};
 pub use driver::{
     FailurePolicy, FrameAlignment, ReferenceFrame, ReferencePolicy, StackAlignment, align_stack,
 };
-pub use ecc::{DivergenceReason, EccMode, EccParams, EccResult, EccStatus, solve_level};
-pub use ecc_algorithm::PyramidalEcc;
+pub use ecc::{
+    DivergenceReason, EccIteration, EccMode, EccParams, EccResult, EccStatus, solve_level,
+    solve_level_traced,
+};
+pub use ecc_algorithm::{EccLevelRecord, PyramidalEcc};
 pub use error::AlignError;
 pub use pyramid::{AlignPyramid, LumaAssembler, max_levels};
 pub use transform::{KERNEL_RADIUS, SourceFootprint, Transform};

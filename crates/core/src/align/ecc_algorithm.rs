@@ -43,7 +43,9 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus};
-use crate::align::{AlignPyramid, EccMode, EccParams, EccStatus, LumaAssembler, Transform};
+use crate::align::{
+    AlignPyramid, EccIteration, EccMode, EccParams, EccResult, EccStatus, LumaAssembler, Transform,
+};
 use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
 use crate::registry::AlignRegistration;
 use crate::tile::plan::{DEFAULT_TILE_SIZE, MAX_LEVELS};
@@ -141,9 +143,20 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "max-iterations".to_string(),
             label: "Max Iterations".to_string(),
-            help: "The per-level iteration cap.".to_string(),
+            help: "The per-level iteration cap. A level that reaches it stops \
+                   short of `epsilon-px` and reports `HitCap`, keeping the best \
+                   transform it found rather than failing. The default was \
+                   measured, not chosen: at a cap of 50, 23 of the 61 reference \
+                   frames stopped short and carried a 0.048-0.521 px truncation \
+                   cost; at 400 all 61 converge, for +31 s on a 182 s alignment \
+                   pass (+17%, or +11.5% of a full stack run). Frames that do \
+                   not need the budget still terminate on `epsilon-px` and pay \
+                   nothing, so the cost falls on exactly the frames that were \
+                   previously truncated. The slowest frame measured used 332 \
+                   iterations, leaving 68 of margin."
+                .to_string(),
             kind: ParamKind::Int { min: 1, max: 1000 },
-            default: ParamValue::Int(50),
+            default: ParamValue::Int(400),
             auto: None,
         },
         ParamDesc {
@@ -310,26 +323,32 @@ impl PyramidalEcc {
         let base = assembler.finish().map_err(wrap_error)?;
         AlignPyramid::from_luma(base, depth).map_err(wrap_error)
     }
-}
 
-impl AlignAlgorithm for PyramidalEcc {
-    fn id(&self) -> &str {
-        "pyramidal-ecc"
-    }
-
-    fn display_name(&self) -> &str {
-        "Pyramidal ECC"
-    }
-
-    fn params(&self) -> &[ParamDesc] {
-        &PARAMS
-    }
-
-    fn align_frame(
+    /// [`AlignAlgorithm::align_frame`], plus one [`EccLevelRecord`] per level
+    /// actually solved. The reference frame short-circuits (see `run`'s own
+    /// early return) and records nothing. Diagnostic surface: additive, and
+    /// never on the path [`AlignAlgorithm::align_frame`] takes.
+    pub fn align_frame_traced(
         &self,
         ctx: &AlignContext<'_>,
         frame: usize,
         cfg: &ParamValues,
+        levels: &mut Vec<EccLevelRecord>,
+    ) -> Result<AlignOutcome, AlgorithmError> {
+        self.run(ctx, frame, cfg, Some(levels))
+    }
+
+    /// The coarse-to-fine loop shared by [`AlignAlgorithm::align_frame`] and
+    /// [`PyramidalEcc::align_frame_traced`]. `levels` is `None` on the
+    /// shipped path, so it allocates nothing and calls [`crate::align::solve_level`];
+    /// `Some` calls [`crate::align::solve_level_traced`] instead and records
+    /// one [`EccLevelRecord`] per level solved.
+    fn run(
+        &self,
+        ctx: &AlignContext<'_>,
+        frame: usize,
+        cfg: &ParamValues,
+        mut levels: Option<&mut Vec<EccLevelRecord>>,
     ) -> Result<AlignOutcome, AlgorithmError> {
         crate::params::validate(self.params(), cfg)?;
 
@@ -390,9 +409,31 @@ impl AlignAlgorithm for PyramidalEcc {
             let level_frame = frame_pyramid.level(k as usize);
             let region = Self::solve_region(level_ref.width(), level_ref.height());
 
-            let result =
-                crate::align::solve_level(level_ref, region, level_frame, &seed, mode, &params)
+            let result = match levels.as_deref_mut() {
+                Some(recs) => {
+                    let mut t = Vec::new();
+                    let r = crate::align::solve_level_traced(
+                        level_ref,
+                        region,
+                        level_frame,
+                        &seed,
+                        mode,
+                        &params,
+                        &mut t,
+                    )
                     .map_err(wrap_error)?;
+                    recs.push(EccLevelRecord {
+                        level: k,
+                        result: r,
+                        trace: t,
+                    });
+                    r
+                }
+                None => {
+                    crate::align::solve_level(level_ref, region, level_frame, &seed, mode, &params)
+                        .map_err(wrap_error)?
+                }
+            };
             total_iterations += result.iterations;
             final_residual = result.correlation;
 
@@ -423,6 +464,41 @@ impl AlignAlgorithm for PyramidalEcc {
             iterations: total_iterations,
             residual: final_residual,
         })
+    }
+}
+
+/// One pyramid level of one [`PyramidalEcc::align_frame_traced`] call.
+#[derive(Debug, Clone)]
+pub struct EccLevelRecord {
+    /// The pyramid level, coarse-to-fine as the loop visits it: `depth` down
+    /// to `0`.
+    pub level: u32,
+    /// That level's own result, in that level's own pixels (never rescaled
+    /// to level 0).
+    pub result: EccResult,
+    pub trace: Vec<EccIteration>,
+}
+
+impl AlignAlgorithm for PyramidalEcc {
+    fn id(&self) -> &str {
+        "pyramidal-ecc"
+    }
+
+    fn display_name(&self) -> &str {
+        "Pyramidal ECC"
+    }
+
+    fn params(&self) -> &[ParamDesc] {
+        &PARAMS
+    }
+
+    fn align_frame(
+        &self,
+        ctx: &AlignContext<'_>,
+        frame: usize,
+        cfg: &ParamValues,
+    ) -> Result<AlignOutcome, AlgorithmError> {
+        self.run(ctx, frame, cfg, None)
     }
 }
 
@@ -462,7 +538,7 @@ mod tests {
         }
 
         let max_iterations = &algo.params()[1];
-        assert_eq!(max_iterations.default, ParamValue::Int(50));
+        assert_eq!(max_iterations.default, ParamValue::Int(400));
         assert_eq!(max_iterations.kind, ParamKind::Int { min: 1, max: 1000 });
 
         let epsilon = &algo.params()[2];
