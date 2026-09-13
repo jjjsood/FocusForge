@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Renders a focus stack whose true Z-Map is known, then scores the fusion against it.
 
-Spike code: throwaway by contract. Nothing in `crates/` may depend on this, and
-the workspace gates do not cover it.
+With `--warp`, it renders a known misregistration instead; that path is used
+by `tools/synth-align.sh` (a workspace gate stage) and
+`crates/cli/tests/synthetic_ground_truth.rs`.
 
 Frame `k` is the source image defocused by `sigma = --sigma-step * |D - k|`, where
 `D` is a continuous synthetic depth map. The true Z-Map is therefore `round(D)`,
@@ -14,11 +15,19 @@ already built:
     python3 spikes/synthetic-ground-truth/synth_stack.py --scene hard
     python3 spikes/synthetic-ground-truth/synth_stack.py --scene easy --sigma-step 1.1
 
+`--warp AMP` (AMP > 0) selects a second, independent instrument instead: it
+renders the same stack with a known, seeded per-frame misregistration,
+verifies the resampler's warp direction with two checks, and (unless
+`--frames-only`) drives `focusforge-cli align --json` twice and writes
+`<out>/measurement.json` -- see `## Ground-truth alignment` below.
+
 Requires numpy and Pillow.
 """
 
 import argparse
+import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -30,7 +39,6 @@ NFRAMES = 8
 SIGMA_QUANT = 0.2  # blur-bank resolution, in sigma
 OUT = ".scratch/spike-synth"
 CLI = "./target/debug/focusforge-cli"
-HARNESS_LIB = "tools/lib"  # from the repository root; override with --harness
 
 ZMAP_UNSET = 0xFFFF  # core::zmap reserves u16::MAX
 
@@ -69,7 +77,11 @@ def blur(img, sigma):
 
 def scene_easy(seed=7):
     """Texture everywhere, including a fine checker: every pixel has something
-    to focus on. Deliberately the scene the algorithm finds easy."""
+    to focus on. Deliberately the scene the algorithm finds easy.
+
+    Never combine with `--warp > 0`: the checkerboard aliases under sub-pixel
+    warp plus defocus, and `run_synthetic_alignment` refuses the combination.
+    """
     rng = np.random.default_rng(seed)
     base = rng.normal(0.0, 1.0, (H, W, SPP))
     img = blur(base, 1.5) * 2.2 + blur(base, 6.0) * 4.0
@@ -379,7 +391,294 @@ def run_scene(name, src, depth, sigma_step, noise_sd, levels_list):
         save_error_map(f"{OUT}/{name}-errmap.png", truth_z, zbest, err)
 
 
+# ---------------------------------------------------------------- ground-truth alignment
+#
+# `--warp AMP` (AMP > 0) renders the same kind of stack, but deliberately
+# misregisters every non-reference frame by a KNOWN similarity transform, so
+# `focusforge-cli align --json`'s recovered transform can be compared against
+# ground truth instead of against a residual.
+
+
+def similarity_matrix(scale, rot_deg, tx, ty, cx, cy):
+    """`translate(tx,ty) @ translate(cx,cy) @ rotscale(scale,rot) @
+    translate(-cx,-cy)` -- reference-to-frame, matching the convention
+    `Transform` pins (integer pixel centres, no half-pixel offset)."""
+    rad = np.deg2rad(rot_deg)
+    c, s = np.cos(rad), np.sin(rad)
+    rotscale = np.array([[scale * c, -scale * s, 0.0], [scale * s, scale * c, 0.0], [0.0, 0.0, 1.0]])
+    to_origin = np.array([[1.0, 0.0, -cx], [0.0, 1.0, -cy], [0.0, 0.0, 1.0]])
+    back = np.array([[1.0, 0.0, cx], [0.0, 1.0, cy], [0.0, 0.0, 1.0]])
+    translate = np.array([[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]])
+    return translate @ back @ rotscale @ to_origin
+
+
+def warp_transforms(amp, seed, reference):
+    """One reference-to-frame matrix per frame. Exact identity at `d == 0`
+    (the reference frame), with NO rng draw consumed for it -- load-bearing
+    for reproducibility, because it keeps every OTHER frame's draw
+    independent of where the reference happens to sit. One rng, frames drawn
+    in ascending `k` order."""
+    rng = np.random.default_rng(seed)
+    cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
+    mats = []
+    for k in range(NFRAMES):
+        d = k - reference
+        if d == 0:
+            mats.append(np.eye(3))
+            continue
+        tx = amp * (1.10 * d + rng.normal(0.0, 0.30))
+        ty = amp * (-0.80 * d + rng.normal(0.0, 0.30))
+        rot = amp * (0.060 * d + rng.normal(0.0, 0.010))  # degrees
+        scale = 1.0 + amp * (0.0012 * d + rng.normal(0.0, 0.0002))
+        mats.append(similarity_matrix(scale, rot, tx, ty, cx, cy))
+    return mats
+
+
+def similarity_parts(m):
+    """The same decomposition as `Transform::similarity_parts()`:
+    `scale = hypot(m00, m10)`, `radians = atan2(m10, m00)`, `tx = m02`,
+    `ty = m12`."""
+    scale = float(np.hypot(m[0][0], m[1][0]))
+    rotation_deg = float(np.degrees(np.arctan2(m[1][0], m[0][0])))
+    tx = float(m[0][2])
+    ty = float(m[1][2])
+    return scale, rotation_deg, tx, ty
+
+
+def _cubic_kernel(x, a=-0.5):
+    """The standard Keys cubic-convolution kernel, `a = -0.5` (Catmull-Rom) --
+    matching the Rust warp kernel. At `x = 1` this is exactly `0`
+    and at `x = 0` exactly `1`, which is what makes the impulse direction
+    check exact arithmetic."""
+    x = np.abs(x)
+    w1 = (a + 2.0) * x**3 - (a + 3.0) * x**2 + 1.0
+    w2 = a * x**3 - 5.0 * a * x**2 + 8.0 * a * x - 4.0 * a
+    return np.where(x <= 1.0, w1, np.where(x < 2.0, w2, 0.0))
+
+
+def _cubic_weights(t):
+    """The four tap weights at offsets `-1, 0, 1, 2` from `floor(s)`, for
+    fractional position `t = s - floor(s)`. At `t = 0` this is exactly
+    `[0, 1, 0, 0]`."""
+    return (_cubic_kernel(t + 1.0), _cubic_kernel(t), _cubic_kernel(1.0 - t), _cubic_kernel(2.0 - t))
+
+
+def resample(img, m):
+    """The independent resampler: destination-driven via the INVERSE,
+    `frame_k[p] = source[M_k^-1 . p]`, so that warping `frame_k` forward by
+    `M_k` the way the Rust crate's own warp path does recovers the source.
+    Integer pixel centres, no half-pixel offset; source coordinates clamped
+    to `[0, W-1] x [0, H-1]` (edge replicate). Written from the crate's
+    transform convention and the standard Catmull-Rom cubic, never ported
+    from the crate's own warp module."""
+    minv = np.linalg.inv(m)
+    h, w = img.shape[0], img.shape[1]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    denom = minv[2, 0] * xx + minv[2, 1] * yy + minv[2, 2]
+    sx = (minv[0, 0] * xx + minv[0, 1] * yy + minv[0, 2]) / denom
+    sy = (minv[1, 0] * xx + minv[1, 1] * yy + minv[1, 2]) / denom
+    sxc = np.clip(sx, 0.0, w - 1.0)
+    syc = np.clip(sy, 0.0, h - 1.0)
+    x0 = np.floor(sxc).astype(np.int64)
+    y0 = np.floor(syc).astype(np.int64)
+    tx = sxc - x0
+    ty = syc - y0
+    wx = _cubic_weights(tx)
+    wy = _cubic_weights(ty)
+    out = np.zeros_like(img, dtype=np.float64)
+    for j, dy in enumerate((-1, 0, 1, 2)):
+        row = np.zeros_like(img, dtype=np.float64)
+        yidx = np.clip(y0 + dy, 0, h - 1)
+        for i, dx in enumerate((-1, 0, 1, 2)):
+            xidx = np.clip(x0 + dx, 0, w - 1)
+            row += wx[i][:, :, None] * img[yidx, xidx, :]
+        out += wy[j][:, :, None] * row
+    return out
+
+
+def direction_check_impulse(verbose=True):
+    """(a) An impulse at `(100, 100)` warped by `translation(+9, +5)` must
+    produce EXACTLY ONE non-zero sample, at exactly `(109, 105)`, carrying
+    the exact input value. Returns `(ok, nonzero_count, (x, y) or None)`."""
+    src = np.zeros((H, W, 1), dtype=np.float64)
+    value = 12345.0
+    src[100, 100, 0] = value
+    m = similarity_matrix(1.0, 0.0, 9.0, 5.0, 0.0, 0.0)
+    out = resample(src, m)
+    nz = np.argwhere(out[:, :, 0] != 0.0)  # (y, x) pairs
+    loc = (int(nz[0][1]), int(nz[0][0])) if len(nz) == 1 else None
+    exact_value = float(out[nz[0][0], nz[0][1], 0]) if len(nz) == 1 else None
+    ok = len(nz) == 1 and loc == (109, 105) and exact_value == value
+    if verbose:
+        print(
+            f"impulse in=(100, 100) translation=(+9, +5) -> "
+            f"nonzero_samples={len(nz)} location={loc} value={exact_value}"
+        )
+        print("OK" if ok else "FAILED: expected exactly one non-zero sample at (109, 105)")
+    return ok, len(nz), loc
+
+
+def run_align(out_dir, algo, mode, lax):
+    cmd = [CLI, "align", out_dir, "--json", "--algo", algo, "--set", f"mode={mode}"]
+    if lax:
+        cmd.append("--lax")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"{' '.join(cmd)} failed (exit {r.returncode}): {r.stderr.strip()[:600]}")
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        sys.exit(f"{' '.join(cmd)} produced invalid JSON: {e}\nstdout[:400]={r.stdout[:400]!r}")
+
+
+def run_synthetic_alignment(args):
+    """The `--warp > 0` path. Composition order is fixed and load-bearing:
+    defocus, then warp, then sensor noise -- `render()` is called with
+    `noise_sd=0.0`, each frame is warped, and the per-frame Gaussian noise is
+    added AFTER the warp, because warping a noise field correlates it and a
+    correlated noise field is easier for ECC than the sensor noise it stands
+    in for."""
+    if args.scene == "easy":
+        sys.exit(
+            "refusing --scene easy with --warp > 0: its 2-pixel checkerboard "
+            "(synth_stack.py's scene_easy, 2-pixel period) aliases under "
+            "sub-pixel warp plus defocus and produces a misleading error "
+            "number -- use --scene hard"
+        )
+
+    out_dir = args.out
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.makedirs(out_dir, exist_ok=True)
+
+    reference = (NFRAMES - 1) // 2  # 3 of 8, matches driver.rs's reference_index(Middle, 8)
+    depth = depth_map()
+    src = SCENES[args.scene]()
+
+    sharp_frames = render(src, depth, args.sigma_step, noise_sd=0.0, seed=args.seed)
+    mats = warp_transforms(args.warp, args.seed, reference)
+    warped = [resample(f.astype(np.float64), m) for f, m in zip(sharp_frames, mats)]
+
+    noise_rng = np.random.default_rng(args.seed ^ 0x5A5A5A5A)
+    final_frames = []
+    for f in warped:
+        noisy = f + (noise_rng.normal(0.0, args.noise, f.shape) if args.noise > 0 else 0.0)
+        final_frames.append(np.clip(np.rint(noisy), 0, 65535).astype(np.uint16))
+
+    for k, fr in enumerate(final_frames):
+        write_rgb(os.path.join(out_dir, "frames", f"{k:02d}.tif"), fr)
+
+    truth = []
+    for k, m in enumerate(mats):
+        scale, rotation_deg, tx, ty = similarity_parts(m)
+        truth.append(
+            {
+                "frame": k,
+                "name": f"{k:02d}.tif",
+                "matrix": m.tolist(),
+                "scale": scale,
+                "rotation_deg": rotation_deg,
+                "tx": tx,
+                "ty": ty,
+            }
+        )
+
+    ok_a, n_a, loc_a = direction_check_impulse(verbose=False)
+    if not ok_a:
+        sys.exit(
+            f"direction check (impulse) FAILED: nonzero_samples={n_a} "
+            f"location={loc_a}, expected exactly 1 at (109, 105)"
+        )
+
+    direction_checks = {
+        "impulse_in": [100, 100],
+        "impulse_translation": [9, 5],
+        "impulse_out": [109, 105],
+        "nonzero_samples": n_a,
+    }
+
+    generator = {
+        "script": "spikes/synthetic-ground-truth/synth_stack.py",
+        "scene": args.scene,
+        "seed": args.seed,
+        "warp_amplitude": args.warp,
+        "sigma_step": args.sigma_step,
+        "noise_sd": args.noise,
+        "width": W,
+        "height": H,
+        "samples_per_pixel": SPP,
+        "frame_count": NFRAMES,
+        "reference": reference,
+        "resampler": "independent numpy Catmull-Rom (a=-0.5), destination-driven via M^-1, edge-replicate clamp",
+        "compose_order": ["defocus", "warp", "sensor-noise"],
+        "cli_algo": args.algo,
+    }
+
+    if args.frames_only:
+        with open(os.path.join(out_dir, "truth.json"), "w") as fh:
+            json.dump(
+                {"generator": generator, "direction_checks": direction_checks, "truth": truth},
+                fh,
+                indent=2,
+                sort_keys=True,
+            )
+        print(f"wrote {out_dir}/frames/ and {out_dir}/truth.json (no CLI invoked)")
+        return
+
+    if not os.path.exists(CLI):
+        sys.exit(f"{CLI} not found -- build the workspace first")
+
+    # Strict for the good run -- a divergence there must fail loudly. Lax for
+    # the broken run -- the break is EXPECTED to strain the solver.
+    rs_report = run_align(out_dir, args.algo, "rotation-scale", lax=False)
+    tr_report = run_align(out_dir, args.algo, "translation", lax=True)
+
+    truth_by_frame = {t["frame"]: t for t in truth}
+    sign_agree = 0
+    qualifying = 0
+    disagreements = []
+    for entry in rs_report["alignments"]:
+        k = entry["frame"]
+        true_tx = truth_by_frame[k]["tx"]
+        if abs(true_tx) >= 0.5:
+            qualifying += 1
+            if (entry["tx"] > 0) == (true_tx > 0):
+                sign_agree += 1
+            else:
+                disagreements.append(k)
+    direction_checks["sign_agreement_frames"] = sign_agree
+
+    if qualifying < 6:
+        sys.exit(
+            f"direction check (b) FAILED: only {qualifying} frames have "
+            f"|true tx| >= 0.5px (need >= 6) -- widen --warp"
+        )
+    if disagreements:
+        sys.exit(
+            f"direction check (b) FAILED: sign(recovered tx) disagreed with "
+            f"sign(true tx) on frames {disagreements} -- the resampler direction "
+            f"is likely inverted"
+        )
+
+    measurement = {
+        "schema": "focusforge synthetic-alignment-truth v1",
+        "generator": generator,
+        "direction_checks": direction_checks,
+        "truth": truth,
+        "runs": {"rotation-scale": rs_report, "translation": tr_report},
+    }
+
+    tmp_path = os.path.join(out_dir, ".tmp")
+    with open(tmp_path, "w") as fh:
+        json.dump(measurement, fh, indent=2, sort_keys=True)
+    os.replace(tmp_path, os.path.join(out_dir, "measurement.json"))
+    print(
+        f"wrote {out_dir}/measurement.json  "
+        f"(direction checks: nonzero_samples={n_a}, sign_agreement={sign_agree}/{qualifying})"
+    )
+
+
 def main():
+    global OUT, rawtiff
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--scene", default="hard", choices=[*SCENES, "all"])
     p.add_argument("--sigma-step", type=float, default=0.45,
@@ -387,15 +686,34 @@ def main():
                         "frames look alike, which is what a real fine-stepped stack does")
     p.add_argument("--noise", type=float, default=250.0, help="per-frame additive noise sd, in 16-bit counts")
     p.add_argument("--levels", default="1,2,3,4,5")
-    p.add_argument("--harness", default=HARNESS_LIB, help="path to this repository's tools/lib, relative to the working directory")
+    p.add_argument("--warp", type=float, default=0.0,
+                   help="misregistration amplitude; > 0 selects the ground-truth "
+                        "alignment run and REPLACES the fusion-scoring run")
+    p.add_argument("--seed", type=int, default=11,
+                   help="seed for the per-frame warp model and the post-warp sensor noise")
+    p.add_argument("--out", default=OUT, help="output directory")
+    p.add_argument("--algo", default="pyramidal-ecc",
+                   help="alignment algorithm id passed to `align --algo` (--warp path only)")
+    p.add_argument("--frames-only", action="store_true",
+                   help="render frames and truth.json only; invoke no CLI (--warp path only)")
+    p.add_argument("--self-check", action="store_true",
+                   help="run the direction verification alone and exit")
     a = p.parse_args()
 
-    sys.path.insert(0, a.harness)
-    global rawtiff
+    if a.self_check:
+        ok, _n, _loc = direction_check_impulse()
+        sys.exit(0 if ok else 1)
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools", "lib"))
     import rawtiff  # noqa: PLC0415  -- needs the path set above
+
+    if a.warp > 0:
+        run_synthetic_alignment(a)
+        return
 
     if not os.path.exists(CLI):
         sys.exit(f"{CLI} not found -- build the workspace first")
+    OUT = a.out
     os.makedirs(OUT, exist_ok=True)
     depth = depth_map()
     for name in SCENES if a.scene == "all" else [a.scene]:

@@ -22,6 +22,11 @@ Every dependency's license is checked against an allowlist in
 `cargo install cargo-deny --locked`). Building the Slint spikes under
 `spikes/` additionally needs `libfontconfig1-dev` (or an equivalent
 pkg-config shim) for Slint's font stack; the main workspace does not need it.
+`tools/check-all.sh`'s "synthetic alignment truth" gate stage needs numpy
+(`python3 -m pip install numpy`): it drives
+`spikes/synthetic-ground-truth/synth_stack.py --warp`, an independent numpy
+oracle for alignment accuracy that is deliberately never ported to Rust (see
+that script's and `tools/synth-align.sh`'s own headers for why).
 
 ## Tests
 
@@ -39,9 +44,10 @@ never hand-edited.
 ## Before you send a change
 
 `tools/check-all.sh` runs every gate (formatting, licenses, fixtures, build,
-clippy, tests, rustdoc, advisories) in one command; `--static` is the fast
-subset a pre-commit hook runs. Read `tools/README.md` for what each script
-does before running cargo commands by hand.
+clippy, tests, rustdoc, advisories, and the synthetic-ground-truth alignment
+check) in one command; `--static` is the fast subset a pre-commit hook runs.
+Read `tools/README.md` for what each script does before running cargo
+commands by hand.
 
 `crates/core` never links a UI crate, and no reader or writer API returns a
 whole frame — the reference stack this project targets does not fit in
