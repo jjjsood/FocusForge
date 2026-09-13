@@ -48,4 +48,37 @@ pub enum AlignError {
         #[source]
         source: AlgorithmError,
     },
+
+    /// A [`super::pyramid::LumaAssembler`] tile push whose rect is not
+    /// fully inside the assembler's declared frame extent. Never clamped:
+    /// the caller's tiling is wrong, not this assembler's problem to paper
+    /// over.
+    #[error("tile {tile:?} is not inside the frame extent {frame:?}")]
+    TileOutsideFrame { tile: Rect, frame: (u32, u32) },
+
+    /// [`super::ecc::solve_level`]'s template and moving planes disagree on
+    /// `samples_per_pixel` -- both must be exactly `1`, a single-channel
+    /// luminance plane. They may still differ in width/height: a coarser
+    /// pyramid level is exactly that.
+    #[error(
+        "template and moving planes must both be single-channel: template spp={template_spp}, moving spp={moving_spp}"
+    )]
+    PlaneMismatch { template_spp: u32, moving_spp: u32 },
+
+    /// [`super::ecc::solve_level`]'s `region` is not fully inside the
+    /// template plane's gradient-valid interior (`1..width-1`,
+    /// `1..height-1`) -- the central-difference gradient has no value on
+    /// the outer ring.
+    #[error("region {region:?} is not inside the template's valid interior {plane:?}")]
+    RegionOutOfBounds { region: Rect, plane: (u32, u32) },
+
+    /// [`super::ecc::solve_level`]'s `region` has zero area.
+    #[error("region {region:?} has zero area")]
+    RegionTooSmall { region: Rect },
+
+    /// [`super::ecc::EccParams`] contains a non-finite or out-of-range
+    /// field: `max_iterations == 0`, a non-positive or non-finite
+    /// `epsilon_px`, or a `min_valid_fraction` outside `(0.0, 1.0]`.
+    #[error("invalid EccParams: {detail}")]
+    InvalidParams { detail: String },
 }

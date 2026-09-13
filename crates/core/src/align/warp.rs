@@ -77,7 +77,10 @@ use crate::tile::{Rect, Tile};
 ///
 /// Written in Horner form; sums to exactly `1.0` for every `t`, and is
 /// exactly `[0.0, 1.0, 0.0, 0.0]` at `t == 0.0`.
-fn catmull_rom_weights(t: f32) -> [f32; 4] {
+///
+/// `pub(crate)`: `crate::align::ecc`'s inner-loop sampler reuses this
+/// kernel, so there is one interpolation kernel in the crate.
+pub(crate) fn catmull_rom_weights(t: f32) -> [f32; 4] {
     [
         t * (t * (-0.5 * t + 1.0) - 0.5),
         t * t * (1.5 * t - 2.5) + 1.0,

@@ -24,5 +24,6 @@ pub mod weighted_average;
 pub use consumer::{FusionConsumer, FusionGeometry};
 pub use error::PyramidError;
 pub use pyramid::{
-    MEASURED_MARGIN, Plane, Pyramid, build, build_from_plane, collapse, collapse_into, max_levels,
+    MEASURED_MARGIN, Plane, Pyramid, build, build_from_plane, collapse, collapse_into,
+    gaussian_levels, max_levels,
 };

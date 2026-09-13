@@ -9,9 +9,13 @@
 //! single pyramid level. Driving `ecc` across a pyramid to register whole
 //! frames is still to come.
 
+mod ecc;
 mod error;
+mod pyramid;
 mod transform;
 pub mod warp;
 
+pub use ecc::{DivergenceReason, EccMode, EccParams, EccResult, EccStatus, solve_level};
 pub use error::AlignError;
+pub use pyramid::{AlignPyramid, LumaAssembler, max_levels};
 pub use transform::{KERNEL_RADIUS, SourceFootprint, Transform};

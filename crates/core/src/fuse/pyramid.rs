@@ -150,7 +150,7 @@
 //! | 3 | 24 | 28 | 160 | 160 |
 //! | 4 | 48 | 60 | 256 | 256 |
 //! | 5 | 96 | 124 | 448 | 448 (the shipped default, 512, clears this) |
-//! | 6 | 192 | 252 | 832 | 832 (512 px is refused here -- a deliberate narrowing, not a regression) |
+//! | 6 | 192 | 252 | 832 | 832 (512 px is refused here) |
 //! | 7 | 512 | 508 | 2112 | 2112 |
 //!
 //! "Smallest tile that plans" is `crate::tile::plan::TilePlan::new`'s
@@ -294,6 +294,69 @@ impl Plane {
     pub fn data_mut(&mut self) -> &mut [f32] {
         &mut self.data
     }
+
+    /// Builds a [`Plane`] directly from `f32` samples, with the identical
+    /// three refusals [`Self::from_u16`] applies, in the identical order:
+    /// [`PyramidError::EmptyExtent`], [`PyramidError::SamplesPerPixelZero`],
+    /// [`PyramidError::BufferSize`]. No conversion, no clamp, no rounding --
+    /// the input already is the storage type. This is the constructor a
+    /// luminance plane needs: the mean of three `u16` samples is not
+    /// integral, so routing it through [`Self::from_u16`] would be a silent
+    /// precision claim.
+    pub fn from_f32(
+        samples: &[f32],
+        width: u32,
+        height: u32,
+        samples_per_pixel: u32,
+    ) -> Result<Self, PyramidError> {
+        if width == 0 || height == 0 {
+            return Err(PyramidError::EmptyExtent { width, height });
+        }
+        if samples_per_pixel == 0 {
+            return Err(PyramidError::SamplesPerPixelZero);
+        }
+        let expected = width as usize * height as usize * samples_per_pixel as usize;
+        if samples.len() != expected {
+            return Err(PyramidError::BufferSize {
+                expected,
+                got: samples.len(),
+            });
+        }
+        Ok(Plane {
+            width,
+            height,
+            samples_per_pixel,
+            data: samples.to_vec(),
+        })
+    }
+}
+
+/// Builds the Gaussian pyramid of `base`: `levels + 1` planes, index `k` is
+/// `G_k` (`k` [`reduce`] passes applied to `base`), index `0` is `base`
+/// itself, unchanged. This is the only `reduce` chain in the crate: a
+/// caller needing the same chain (alignment, for instance) reuses it
+/// rather than writing a second.
+///
+/// `levels > max_levels(base.width(), base.height())` is
+/// [`PyramidError::LevelsTooDeep`], never a silently truncated pyramid.
+pub fn gaussian_levels(base: Plane, levels: u32) -> Result<Vec<Plane>, PyramidError> {
+    let max = max_levels(base.width, base.height);
+    if levels > max {
+        return Err(PyramidError::LevelsTooDeep {
+            requested: levels,
+            max,
+            width: base.width,
+            height: base.height,
+        });
+    }
+
+    let mut gaussians = Vec::with_capacity(levels as usize + 1);
+    gaussians.push(base);
+    for _ in 0..levels {
+        let next = reduce(gaussians.last().expect("gaussians is never empty"));
+        gaussians.push(next);
+    }
+    Ok(gaussians)
 }
 
 /// Filter-and-decimate one row-major `f32` buffer along its horizontal
@@ -504,22 +567,7 @@ impl Pyramid {
 /// `levels > max_levels(base.width(), base.height())` is
 /// [`PyramidError::LevelsTooDeep`], never a silently truncated pyramid.
 pub fn build_from_plane(base: Plane, levels: u32) -> Result<Pyramid, PyramidError> {
-    let max = max_levels(base.width, base.height);
-    if levels > max {
-        return Err(PyramidError::LevelsTooDeep {
-            requested: levels,
-            max,
-            width: base.width,
-            height: base.height,
-        });
-    }
-
-    let mut gaussians = Vec::with_capacity(levels as usize + 1);
-    gaussians.push(base);
-    for _ in 0..levels {
-        let next = reduce(gaussians.last().expect("gaussians is never empty"));
-        gaussians.push(next);
-    }
+    let mut gaussians = gaussian_levels(base, levels)?;
 
     let mut laplacians = Vec::with_capacity(levels as usize);
     for k in 0..levels as usize {
@@ -874,31 +922,14 @@ mod tests {
         leak
     }
 
-    /// Measures the margin **directly against the criterion the published
-    /// constant promises**: two same-size, same-grid buffers that agree
-    /// inside a window differ by at most 1 `u16` LSB everywhere in that
-    /// window once it is inset by the returned margin.
-    ///
-    /// One flatten pass per candidate measures the worst case over *all*
-    /// content, not a sampled probe: for buffers `a` and `b` agreeing
-    /// inside the window, every weight in `flatten` is non-negative, so
-    ///
-    /// ```text
-    /// |flatten(a) - flatten(b)| <= flatten(|a - b|) <= flatten(65535 * outside_window)
-    /// ```
-    ///
-    /// and the right-hand side is one run over a single buffer that is
-    /// `65535` in the band and `0` in the window. The bound is attained (by
-    /// an `a` at full scale in the band against a `b` at zero there), so it
-    /// is the exact adversarial worst case and not a conservative estimate.
-    ///
-    /// Candidates ascend through the multiples of `2^levels` -- the
-    /// published margin has to be on the decimation grid, since that is
-    /// what puts a tile's read origin on it (`tile::plan::margin_for_levels`)
+    /// Measures the margin directly against the criterion this module's
+    /// "Reach and the measured tile-overlap margin" section states, using
+    /// the same adversarial worst-case argument. Candidates ascend through
+    /// multiples of `2^levels` -- the published margin has to be on the
+    /// decimation grid, since that is what puts a tile's read origin on it
     /// -- and the first candidate whose own geometry leaks no more than
-    /// [`MARGIN_THRESHOLD_LSB`] into its window wins. Ascending rather than
-    /// solving is deliberate: each candidate changes the geometry it is
-    /// judged in, so this is a fixed point, not a root.
+    /// [`MARGIN_THRESHOLD_LSB`] into its window wins: a fixed point, not a
+    /// root, since each candidate changes the geometry it is judged in.
     fn measure_margin(levels: u32) -> u32 {
         let alignment = 1u32 << levels;
         let analytic = 4 * ((1u32 << levels) - 1);
@@ -944,8 +975,6 @@ mod tests {
             MEASURED_MARGIN, computed,
             "MEASURED_MARGIN must equal the freshly measured margin at every level"
         );
-        // The n = 7 buffer dominates this
-        // loop.
         let _elapsed = started.elapsed();
     }
 
@@ -1043,11 +1072,8 @@ mod tests {
             // margin, which is why `side` needs room for two margins
             // beyond the asserted core on every side (4 * margin total
             // across each axis). There is **no slack term**: the asserted
-            // inset is exactly `2 * margin`, so this test is what makes
-            // [`MEASURED_MARGIN`] an honest table -- the number it
-            // publishes is the number at which the <= 1 LSB criterion
-            // actually holds, not one that needs a fudge factor added
-            // before it does.
+            // inset is exactly `2 * margin`, the number at which the
+            // <= 1 LSB criterion actually holds.
             let side = (4 * margin + 64).max(4 << n);
             let spp = 3u32;
             let len = side as usize * side as usize * spp as usize;
