@@ -12,13 +12,14 @@ short on purpose rather than incomplete.
 Using FocusForge: shooting a stack, loading it, choosing an algorithm,
 retouching the result.
 
-*No pages yet — there is no stacking, alignment or fusion command to guide a
-reader through.*
+- [`guide/stacking.md`](guide/stacking.md) — running `focusforge-cli stack`,
+  choosing an algorithm, and getting the Z-Map
 
 ## Reference
 
 - [`reference/cli.md`](reference/cli.md) — every `focusforge-cli` subcommand
-  and flag, and the `info --json` and `algorithms --json` schemas
+  and flag, and the `info --json`, `algorithms --json` and `stack --json`
+  schemas
 - [`reference/tiff-fast-path.md`](reference/tiff-fast-path.md) — the TIFF
   layout the reader accepts and the writer emits
 

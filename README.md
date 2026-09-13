@@ -22,6 +22,11 @@ GNU General Public License v3.
 
 ## Features
 
+- Fuses a directory of TIFF frames into one composite (`focusforge-cli
+  stack`), out-of-core so the stack never has to fit in RAM
+- Three stacking algorithms — Laplacian-pyramid coefficient selection,
+  sharpness-weighted blending, and depth-map selection — each producing a
+  Z-Map naming the source frame behind every output pixel
 - Directory-wide stack inspection (`focusforge-cli info`) — dimensions, depth,
   byte order, compression, strip layout and a uniform-layout check across
   every frame, plain text or `--json`
@@ -52,6 +57,17 @@ Prints one block per TIFF in the directory — size, depth, byte order,
 compression, strip layout, whether the mmap fast path applies — followed by a
 frame count, total size and a uniform-layout verdict. Add `--json` for the
 same report as machine-readable JSON.
+
+### Stack a folder
+
+```bash
+target/release/focusforge-cli stack path/to/frames/ -o out.tif --algo laplacian --zmap zmap.tif
+```
+
+Fuses every frame into `out.tif` through the `laplacian` algorithm and
+writes the per-pixel source map to `zmap.tif`. See
+[`docs/guide/stacking.md`](docs/guide/stacking.md) for the other algorithms
+and their parameters.
 
 ## Documentation
 
