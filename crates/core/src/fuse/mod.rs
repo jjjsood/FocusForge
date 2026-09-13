@@ -12,9 +12,13 @@
 //! rounding expression and the measured tile-overlap margin -- written so
 //! a GPU twin can be authored from it alone.
 
+pub mod consumer;
 mod error;
+pub mod laplacian;
+pub mod metrics;
 pub mod pyramid;
 
+pub use consumer::{FusionConsumer, FusionGeometry};
 pub use error::PyramidError;
 pub use pyramid::{
     MEASURED_MARGIN, Plane, Pyramid, build, build_from_plane, collapse, collapse_into, max_levels,

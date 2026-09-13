@@ -24,9 +24,10 @@ pub const MAX_LEVELS: u32 = 16;
 /// The overlap (margin, in pixels, on every side that has a neighbour) a
 /// tiling plan reserves for `levels` pyramid levels.
 ///
-/// Returns the **measured** margin -- the number of pixels at which a
-/// tile's interior is independent of everything outside its read rect to
-/// within 1 `u16` LSB -- rounded up to a multiple of `2^levels`:
+/// Returns the **measured** margin -- the pixel count at which a tile's
+/// interior is independent of everything outside its read rect to within
+/// 1 `u16` LSB -- rounded up to a multiple of `2^levels`, so a tile's read
+/// origin lands on the pyramid's own decimation grid.
 ///
 /// [`crate::fuse::pyramid::MEASURED_MARGIN`] is the measured table, pinned by
 /// `fuse::pyramid::tests::stated_margin_matches_the_measurement`; past its range the margin
@@ -58,6 +59,45 @@ pub const fn margin_for_levels(levels: u32) -> u32 {
     // addition nor the product can overflow `u32`.
     let alignment = 1u32 << levels;
     bound.div_ceil(alignment) * alignment
+}
+
+/// The smallest `tile_size` that plans at `levels` levels --
+/// `max(2 * margin + 2^levels, 4 * margin + 64)`, the same arithmetic
+/// [`TilePlan::new`] enforces, published as one place to read it from. At
+/// `levels == 0` there is no pyramid and no measurement geometry to
+/// respect, so the floor is just `2^0 = 1`.
+pub const fn min_tile_size_for_levels(levels: u32) -> u32 {
+    let margin = margin_for_levels(levels);
+    let alignment = 1u32 << levels;
+    if margin == 0 {
+        2 * margin + alignment
+    } else {
+        let with_alignment = 2 * margin + alignment;
+        let validity_range = 4 * margin + 64;
+        if with_alignment > validity_range {
+            with_alignment
+        } else {
+            validity_range
+        }
+    }
+}
+
+/// The largest level count `n <= MAX_LEVELS` for which
+/// [`min_tile_size_for_levels`]`(n) <= tile_size`, i.e. the deepest pyramid
+/// a tile of this size can plan. A `while` loop rather than
+/// `(0..=MAX_LEVELS).rev().find(...)` because a `const fn` cannot call an
+/// iterator adaptor: `max_levels_for_tile(512) == 5` and
+/// `max_levels_for_tile(832) == 6`.
+pub const fn max_levels_for_tile(tile_size: u32) -> u32 {
+    let mut n = 0u32;
+    let mut best = 0u32;
+    while n <= MAX_LEVELS {
+        if min_tile_size_for_levels(n) <= tile_size {
+            best = n;
+        }
+        n += 1;
+    }
+    best
 }
 
 /// One tile of a [`TilePlan`]: the interior rectangle this tile owns in the
@@ -94,6 +134,39 @@ impl PlannedTile {
     }
 }
 
+/// Partitions one axis of length `extent` into strides of `interior_size`,
+/// returning `(start, size)` pairs that cover `0..extent` with no gap and
+/// no overlap.
+///
+/// A trailing remainder smaller
+/// than `2 * margin` is **absorbed into the previous stride** rather than
+/// becoming a tile of its own. Without this, the default geometry cannot
+/// fuse the reference stack at all -- at `8192x5464`, tile 512, 5 levels
+/// (`interior_size = 320`) the final interior row is `5464 - 17*320 = 24`
+/// px, whose 120 px read rect gives `max_levels(_, 120) = 4 < 5` and
+/// `fuse::build` refuses with `LevelsTooDeep`. Absorbing it instead moves
+/// the last interior's start to `5120` (read origin `5024`, still a
+/// multiple of `2^levels`) and its read rect to `440` px
+/// (`max_levels(_, 440) = 6`). `margin == 0` (no pyramid) never merges,
+/// since `size < 2 * 0` is never true.
+fn axis_partition(extent: u32, interior_size: u32, margin: u32) -> Vec<(u32, u32)> {
+    let mut strides = Vec::new();
+    let mut pos = 0u32;
+    while pos < extent {
+        let size = interior_size.min(extent - pos);
+        strides.push((pos, size));
+        pos += size;
+    }
+    if strides.len() > 1 {
+        let last = strides.len() - 1;
+        if strides[last].1 < 2 * margin {
+            let (_, remainder) = strides.remove(last);
+            strides[last - 1].1 += remainder;
+        }
+    }
+    strides
+}
+
 /// A tiling plan over one frame extent: tile size, pyramid-level overlap,
 /// and the resulting interior/read rectangles, ragged at the right and
 /// bottom edges rather than padded past the frame.
@@ -126,12 +199,12 @@ impl TilePlan {
     /// is no pyramid and no measurement geometry to respect, so the floor
     /// is skipped and `min_tile_size` is just `1`.
     ///
-    /// **This deliberately refuses 512 px at 6 levels, which was accepted
-    /// before this floor existed** -- a narrowing, not a regression, since
-    /// the margin was never established for that geometry
-    /// (`tests::a_512_tile_at_6_levels_is_now_refused`). **The shipped
-    /// default is unaffected**: 512 px at 5 levels needs 448 px
-    /// (`4 * 96 + 64`) and has 512.
+    /// **This refuses 512 px at 6 levels**: the margin table is
+    /// established only up to what `4 * margin + 64` covers, and 512 px
+    /// falls short of it at 6 levels
+    /// (`tests::a_512_tile_at_6_levels_is_refused`). **The shipped default
+    /// is unaffected**: 512 px at 5 levels needs 448 px (`4 * 96 + 64`) and
+    /// has 512.
     ///
     /// # The decimation grid
     ///
@@ -189,11 +262,7 @@ impl TilePlan {
         // same number, so the advice is never a size that the next guard
         // refuses in turn.
         let alignment: u32 = 1u32 << levels;
-        let min_tile_size = if margin == 0 {
-            2 * margin + alignment
-        } else {
-            (2 * margin + alignment).max(4 * margin + 64)
-        };
+        let min_tile_size = min_tile_size_for_levels(levels);
         if tile_size < min_tile_size {
             return Err(TileError::NoInterior {
                 tile_size,
@@ -220,14 +289,13 @@ impl TilePlan {
             });
         }
 
+        let xs = axis_partition(width, interior_size, margin);
+        let ys = axis_partition(height, interior_size, margin);
+
         let mut tiles = Vec::new();
         let mut index = 0usize;
-        let mut y = 0u32;
-        while y < height {
-            let h = interior_size.min(height - y);
-            let mut x = 0u32;
-            while x < width {
-                let w = interior_size.min(width - x);
+        for &(y, h) in &ys {
+            for &(x, w) in &xs {
                 let interior = Rect {
                     x,
                     y,
@@ -250,9 +318,7 @@ impl TilePlan {
                     read,
                 });
                 index += 1;
-                x += w;
             }
-            y += h;
         }
 
         Ok(TilePlan {
@@ -299,13 +365,7 @@ mod tests {
     /// Recomputed from `margin_for_levels` so a re-measured margin cannot
     /// silently invalidate a test that pins a literal.
     fn min_tile_size_for(levels: u32) -> u32 {
-        let margin = margin_for_levels(levels);
-        let alignment = 1u32 << levels;
-        if margin == 0 {
-            alignment
-        } else {
-            (2 * margin + alignment).max(4 * margin + 64)
-        }
+        min_tile_size_for_levels(levels)
     }
 
     /// The interior stride `TilePlan::new` derives for a tile size and a
@@ -565,7 +625,14 @@ mod tests {
             let tile_size = min_tile_size_for(levels) + 4 * alignment;
             let interior = ((tile_size - 2 * margin) / alignment) * alignment;
             let width = 3 * interior + interior / 2 + 7;
-            let height = 2 * interior + 3;
+            // `3 * interior + 3`, not `2 * interior + 3`: the ragged-last-row
+            // absorption can merge a small trailing remainder into the
+            // previous stride, which on
+            // the original `2 * interior + 3` shrunk this axis to as few as
+            // 2 strides at high `levels` -- below the `>= 8` this test needs.
+            // Three full strides plus a small, mergeable remainder keeps at
+            // least 3 strides on this axis (merged or not) at every level.
+            let height = 3 * interior + 3;
             let plan = TilePlan::new(width, height, tile_size, levels)
                 .unwrap_or_else(|e| panic!("plan must build at levels={levels}: {e}"));
             assert!(
@@ -653,6 +720,63 @@ mod tests {
             }) => {}
             other => panic!("expected EmptyExtent, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ragged_last_row_is_absorbed_into_previous_tile() {
+        // The reference stack's own extent, at the shipped default tile
+        // size and level count.
+        // Before the absorption fix, the last interior row was 24 px tall
+        // (5464 - 17*320) and its 120 px read rect gave
+        // `max_levels(_, 120) == 4 < 5`, so `fuse::build` refused with
+        // `LevelsTooDeep` -- unfusable by the default geometry, with no
+        // tile size dodging it (`5464 == 2^3 * 683` has no multiple of 32
+        // as a divisor). This test pins the fix's own verified numbers.
+        let plan = TilePlan::new(8192, 5464, 512, 5)
+            .expect("the reference stack's default geometry must now plan");
+        let last_row = plan
+            .tiles()
+            .iter()
+            .filter(|t| t.interior().x == 0)
+            .max_by_key(|t| t.interior().y)
+            .expect("at least one tile must start the last row");
+        assert_eq!(
+            last_row.interior().y,
+            5120,
+            "the absorbed last interior must start at y=5120"
+        );
+        assert_eq!(
+            last_row.interior().y + last_row.interior().height,
+            5464,
+            "the last interior must still reach the frame's bottom edge"
+        );
+        assert_eq!(
+            last_row.read().y,
+            5024,
+            "the read origin must be 5024 -- still a multiple of 32"
+        );
+        assert_eq!(last_row.read().y % 32, 0);
+        assert_eq!(
+            last_row.read().height,
+            440,
+            "the absorbed row's read rect must be 440 px tall"
+        );
+        assert!(
+            crate::fuse::pyramid::max_levels(last_row.read().width, last_row.read().height) >= 5,
+            "the absorbed geometry must support the shipped default level count"
+        );
+
+        // The x axis divides differently (8192 = 25*320 + 192, and 192 is
+        // not < 2*margin=192) so it is never absorbed -- both behaviours
+        // covered by one plan.
+        let last_col = plan
+            .tiles()
+            .iter()
+            .filter(|t| t.interior().y == 0)
+            .max_by_key(|t| t.interior().x)
+            .expect("at least one tile must start the last column");
+        assert_eq!(last_col.interior().x, 8000);
+        assert_eq!(last_col.interior().width, 192);
     }
 
     #[test]

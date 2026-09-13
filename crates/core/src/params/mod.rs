@@ -425,6 +425,19 @@ pub fn resolve(
     }
 }
 
+/// Bridges [`resolve`]'s output to [`crate::algorithm::StackAlgorithm::fuse`]'s
+/// input: drops provenance, keeping only each parameter's value. `fuse`
+/// takes a fully resolved [`ParamValues`], and this is the one place that
+/// conversion happens, so the CLI, `crate::fuse::consumer::FusionConsumer`
+/// and every test agree on what "resolved" means rather than each
+/// hand-rolling the same map.
+pub fn resolved_values(resolved: &ResolvedParams) -> ParamValues {
+    resolved
+        .iter()
+        .map(|(id, r)| (id.clone(), r.value.clone()))
+        .collect()
+}
+
 /// Normalizes an accepted value to its descriptor's declared kind — the
 /// widening rule made permanent: an `Int` accepted against a `Float`
 /// descriptor becomes a `Float`.
@@ -761,6 +774,23 @@ mod tests {
         let debug_b = format!("{b:?}");
         assert!(debug_a.contains("threshold"));
         assert!(debug_b.contains("threshold"));
+    }
+
+    #[test]
+    fn resolved_values_survives_an_auto_value() {
+        let mut auto_desc = float_desc("threshold", 0.0, 10.0, 2.5);
+        auto_desc.auto = Some(Arc::new(|ctx: &StackContext| {
+            ParamValue::Float(ctx.frame_count as f64)
+        }));
+        let schema = vec![auto_desc, int_desc("radius", 0, 100, 3)];
+        let ctx = StackContext::new(4, 100, 100);
+        let resolved = resolve(&schema, &ParamValues::new(), &ctx).unwrap();
+        assert_eq!(resolved["threshold"].provenance, Provenance::Auto);
+
+        let values = resolved_values(&resolved);
+        assert_eq!(values.get("threshold"), Some(&ParamValue::Float(4.0)));
+        assert_eq!(values.get("radius"), Some(&ParamValue::Int(3)));
+        assert_eq!(values.len(), 2);
     }
 
     #[test]

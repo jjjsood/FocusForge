@@ -26,8 +26,10 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use focusforge_core::algorithm::AlgorithmError;
+use focusforge_core::fuse::FusionConsumer;
 use focusforge_core::io::TiffStack;
-use focusforge_core::params::StackContext;
+use focusforge_core::params::{self, ParamValues, StackContext};
+use focusforge_core::registry;
 use focusforge_core::tile::{
     NoopPreprocess, TileConsumer, TileJob, TileScheduler, TileSchedulerOptions,
 };
@@ -118,7 +120,16 @@ fn peak_live_heap_stays_under_ceiling() {
     // 512 x 512 x 3 samples x 2 B. This is what makes "a load-every-frame
     // implementation fails by construction" a fact rather than a claim.
     let full_load_bytes = frame_count as u64 * width as u64 * height as u64 * 3 * 2;
-    const CEILING: usize = 4 * 1024 * 1024;
+    // Raised from 4 MiB to 5 MiB when this test grew a real allocating
+    // consumer. The ceiling moved because what is being measured grew --
+    // a `FusionConsumer` builds per-worker Laplacian pyramids on top of
+    // the scheduler's frame-tile buffers, where the old `NoAllocConsumer`
+    // added nothing -- NOT because the test was failing and the number
+    // was in the way. The discrimination the test exists for is intact
+    // and asserted just below: 5 MiB is still far under the 12 MiB a
+    // load-every-frame implementation would need, so a full-load
+    // regression still fails this test loudly.
+    const CEILING: usize = 5 * 1024 * 1024;
     assert!(
         (CEILING as u64) < full_load_bytes,
         "ceiling ({CEILING} B) must be below a full load ({full_load_bytes} B) for this \
@@ -130,7 +141,12 @@ fn peak_live_heap_stays_under_ceiling() {
     let options = TileSchedulerOptions {
         tile_size: 128,
         levels: 2,
-        max_bytes_in_flight: 2 * 1024 * 1024,
+        // 3 MiB, not 2: `bytes_per_tile_set` is sized on the padded read
+        // rect (128 + 2 * 12 = 152 px at 2 levels), so one tile set is
+        // ~1.06 MiB and a 2 MiB budget would now floor to a single
+        // in-flight set. Keeping two in flight is the point -- this test
+        // measures peak memory under real concurrency, not in isolation.
+        max_bytes_in_flight: 3 * 1024 * 1024,
         scratch_base,
     };
     let stack_ctx = StackContext::new(frame_count, width, height);
@@ -139,14 +155,46 @@ fn peak_live_heap_stays_under_ceiling() {
     assert_eq!(
         scheduler.in_flight_limit(),
         2,
-        "a 2 MiB budget at this tile size must floor to 2 in-flight tile sets"
+        "a 3 MiB budget at this padded tile size must floor to 2 in-flight tile sets"
     );
+
+    // A real fusion consumer, not the pass-through `NoAllocConsumer`, so
+    // this ceiling measures the algorithm's own per-worker pyramid
+    // allocations (two live pyramids plus one score/winner plane per level)
+    // on top of the scheduler's frame-tile buffers.
+    let algo = registry::find_stack("laplacian").expect("laplacian must be registered");
+    let mut explicit = ParamValues::new();
+    explicit.insert(
+        "levels".to_string(),
+        focusforge_core::params::ParamValue::Int(2),
+    );
+    let resolved =
+        params::resolve(algo.params(), &explicit, &stack_ctx).expect("resolve must succeed");
+    let values = params::resolved_values(&resolved);
+    let composite_path =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_ceiling.tif");
+    let zmap_path =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_ceiling-zmap.tif");
+    let consumer = FusionConsumer::create(
+        algo,
+        values,
+        &composite_path,
+        &zmap_path,
+        focusforge_core::fuse::FusionGeometry {
+            width,
+            height,
+            samples_per_pixel: 3,
+            frame_count: frame_count as u32,
+        },
+    )
+    .expect("consumer must create");
 
     reset_peak();
     let report = scheduler
-        .run(&NoopPreprocess, &NoAllocConsumer)
+        .run(&NoopPreprocess, &consumer)
         .expect("run must succeed");
     let peak = peak_since_reset();
+    consumer.finish().expect("finish must succeed");
 
     assert!(
         peak < CEILING,
@@ -204,7 +252,14 @@ fn in_flight_tiles_respect_the_budget() {
     let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let (width, height) = stack.dimensions();
     let frame_count = stack.len();
-    let bytes_per_tile_set = frame_count as u64 * 128 * 128 * 3 * 2;
+    // The padded read rect, not the 128 px interior: at 2 levels the
+    // measured margin is 12 px, so the scheduler reads and holds
+    // 152x152 tiles and budgets on that. Deriving the budget here from
+    // the interior would ask for a number the scheduler no longer uses,
+    // and every `in_flight_limit` expectation below would be off by the
+    // same 1.41x factor.
+    const PADDED: u64 = 128 + 2 * 12;
+    let bytes_per_tile_set = frame_count as u64 * PADDED * PADDED * 3 * 2;
 
     for &target in &[1usize, 2, 4] {
         if target > available {

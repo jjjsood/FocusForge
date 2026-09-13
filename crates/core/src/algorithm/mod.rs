@@ -158,6 +158,11 @@ impl<'a> AlignContext<'a> {
 /// The Z-Map indices `fuse` returns in its [`TileOutput`] are frame indices
 /// into the [`TileCtx`] the call was given, `0..ctx.frame_count()` -- which
 /// is what makes the `u16` meaningful to anything downstream that reads it.
+///
+/// `fuse` receives a fully resolved [`ParamValues`] -- the caller runs
+/// [`crate::params::resolve`] plus [`crate::params::resolved_values`] first --
+/// and a key its own schema declares but the map omits is a named
+/// [`AlgorithmError`], never an index panic.
 pub trait StackAlgorithm: Send + Sync + 'static {
     fn id(&self) -> &str;
     fn display_name(&self) -> &str;
