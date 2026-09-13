@@ -164,7 +164,7 @@ pub fn run(
     // Step 7: resolve parameters.
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
-    let stack_ctx = StackContext::new(stack.len(), width, height);
+    let stack_ctx = StackContext::new(stack.len(), width, height, spp);
     let resolved = match params::resolve(algo.params(), &explicit, &stack_ctx) {
         Ok(resolved) => resolved,
         Err(err) => return crate::fail(err),

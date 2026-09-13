@@ -6,16 +6,24 @@
 //! query; [`warp`] holds the interpolation kernel and the tiled resampler
 //! built on top of it; `error` holds this module's single error type.
 //! `warp` only ever applies a transform; `ecc` is what solves for one, on a
-//! single pyramid level. Driving `ecc` across a pyramid to register whole
-//! frames is still to come.
+//! single pyramid level. [`crate::align::PyramidalEcc`] drives that solver
+//! coarse-to-fine over a pyramid to register whole frames, and
+//! [`align_stack`] is the free-function driver that runs it across a whole
+//! stack under a reference policy.
 
+mod driver;
 mod ecc;
+mod ecc_algorithm;
 mod error;
 mod pyramid;
 mod transform;
 pub mod warp;
 
+pub use driver::{
+    FailurePolicy, FrameAlignment, ReferenceFrame, ReferencePolicy, StackAlignment, align_stack,
+};
 pub use ecc::{DivergenceReason, EccMode, EccParams, EccResult, EccStatus, solve_level};
+pub use ecc_algorithm::PyramidalEcc;
 pub use error::AlignError;
 pub use pyramid::{AlignPyramid, LumaAssembler, max_levels};
 pub use transform::{KERNEL_RADIUS, SourceFootprint, Transform};

@@ -95,7 +95,7 @@ impl TileConsumer for PassthroughWriter {
 fn run_passthrough(out_path: &Path, options: &TileSchedulerOptions) {
     let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(stack.len(), width, height);
+    let stack_ctx = StackContext::new(stack.len(), width, height, 3);
     let scheduler =
         TileScheduler::new(&stack, stack_ctx, 3, options).expect("scheduler must build");
     let consumer = PassthroughWriter::create(out_path, width, height);
@@ -195,7 +195,7 @@ impl focusforge_core::tile::FramePreprocess for RecordingPreprocess {
 fn preprocess_hook_sees_every_frame_tile() {
     let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(stack.len(), width, height);
+    let stack_ctx = StackContext::new(stack.len(), width, height, 3);
     let opts = options("preprocess", 1 << 30);
     let scheduler = TileScheduler::new(&stack, stack_ctx, 3, &opts).expect("scheduler must build");
     let plan_len = scheduler.plan().len();
@@ -278,7 +278,7 @@ impl TileConsumer for ScratchProbe {
 fn scratch_is_cleaned_up_on_error() {
     let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(stack.len(), width, height);
+    let stack_ctx = StackContext::new(stack.len(), width, height, 3);
 
     // Success path.
     let opts_ok = options("scratch-ok", 1 << 30);
@@ -343,7 +343,7 @@ impl TileConsumer for FailingOneTile {
 fn consumer_error_names_its_tile() {
     let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(stack.len(), width, height);
+    let stack_ctx = StackContext::new(stack.len(), width, height, 3);
     let opts = options("failing-tile", 1 << 30);
     let scheduler = TileScheduler::new(&stack, stack_ctx, 3, &opts).expect("scheduler must build");
 
@@ -414,7 +414,7 @@ fn schedules_over_the_reference_stack() {
         height.div_ceil(interior)
     );
 
-    let stack_ctx = StackContext::new(stack.len(), width, height);
+    let stack_ctx = StackContext::new(stack.len(), width, height, 3);
     let opts = options("reference-stack", 1 << 30);
     let scheduler = TileScheduler::new(&stack, stack_ctx, 3, &opts).expect("scheduler must build");
 

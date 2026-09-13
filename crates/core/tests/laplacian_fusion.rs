@@ -45,7 +45,7 @@ fn run_fusion(
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
     let frame_count = stack.len();
-    let stack_ctx = StackContext::new(frame_count, width, height);
+    let stack_ctx = StackContext::new(frame_count, width, height, spp);
 
     let algo = registry::find_stack("laplacian").expect("laplacian must be registered");
     let mut explicit = ParamValues::new();
@@ -172,7 +172,12 @@ fn algorithm_is_registered_and_lists_its_schema() {
 fn every_parameter_is_declared() {
     let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(stack.len(), width, height);
+    let stack_ctx = StackContext::new(
+        stack.len(),
+        width,
+        height,
+        stack.header(0).samples_per_pixel,
+    );
     let algo = registry::find_stack("laplacian").expect("laplacian must resolve by id");
 
     let resolved = params::resolve(algo.params(), &ParamValues::new(), &stack_ctx)

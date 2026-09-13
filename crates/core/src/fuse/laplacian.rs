@@ -508,13 +508,13 @@ mod tests {
             .clone()
             .expect("levels has an auto hook");
 
-        let ctx_64 = StackContext::new(8, 64, 64);
+        let ctx_64 = StackContext::new(8, 64, 64, 3);
         assert_eq!(hook(&ctx_64), ParamValue::Int(4));
 
-        let ctx_512 = StackContext::new(8, 512, 512);
+        let ctx_512 = StackContext::new(8, 512, 512, 3);
         assert_eq!(hook(&ctx_512), ParamValue::Int(5));
 
-        let ctx_reference = StackContext::new(61, 8192, 5464);
+        let ctx_reference = StackContext::new(61, 8192, 5464, 3);
         assert_eq!(hook(&ctx_reference), ParamValue::Int(5));
     }
 
@@ -527,7 +527,7 @@ mod tests {
             .expect("levels has an auto hook");
 
         for &(frame_count, w, h) in &[(8usize, 64u32, 64u32), (8, 512, 512), (61, 8192, 5464)] {
-            let ctx = StackContext::new(frame_count, w, h);
+            let ctx = StackContext::new(frame_count, w, h, 3);
             let ParamValue::Int(levels) = hook(&ctx) else {
                 panic!("auto must produce an Int")
             };

@@ -147,7 +147,7 @@ fn library_oracle() -> &'static OracleResult {
         let (width, height) = stack.dimensions();
         let spp = stack.header(0).samples_per_pixel;
         let frame_count = stack.len();
-        let stack_ctx = StackContext::new(frame_count, width, height);
+        let stack_ctx = StackContext::new(frame_count, width, height, spp);
 
         let algo = registry::find_stack("laplacian").expect("laplacian must be registered");
         let resolved = params::resolve(algo.params(), &ParamValues::new(), &stack_ctx)

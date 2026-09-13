@@ -47,7 +47,7 @@ fn run_fusion(
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
     let frame_count = stack.len();
-    let stack_ctx = StackContext::new(frame_count, width, height);
+    let stack_ctx = StackContext::new(frame_count, width, height, spp);
 
     let algo =
         registry::find_stack(algo_id).unwrap_or_else(|e| panic!("{algo_id} must resolve: {e}"));
@@ -331,7 +331,12 @@ fn both_algorithms_are_registered() {
 fn every_parameter_is_declared() {
     let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
     let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(stack.len(), width, height);
+    let stack_ctx = StackContext::new(
+        stack.len(),
+        width,
+        height,
+        stack.header(0).samples_per_pixel,
+    );
     let rect = Rect {
         x: 0,
         y: 0,
@@ -376,7 +381,7 @@ fn weighted_average_zmap_follows_its_rule() {
     let (frames, width, height, spp) = all_frames();
     let result = weighted_average_tiled();
 
-    let stack_ctx = StackContext::new(frames.len(), *width, *height);
+    let stack_ctx = StackContext::new(frames.len(), *width, *height, *spp);
     let algo = registry::find_stack("weighted-average").expect("weighted-average must resolve");
     let resolved = params::resolve(algo.params(), &ParamValues::new(), &stack_ctx)
         .expect("resolve must succeed");

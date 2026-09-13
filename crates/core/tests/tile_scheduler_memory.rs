@@ -150,7 +150,7 @@ fn peak_live_heap_stays_under_ceiling() {
         max_bytes_in_flight: 2 * 1024 * 1024,
         scratch_base,
     };
-    let stack_ctx = StackContext::new(frame_count, width, height);
+    let stack_ctx = StackContext::new(frame_count, width, height, 3);
     let scheduler =
         TileScheduler::new(&stack, stack_ctx, 3, &options).expect("scheduler must build");
     assert_eq!(
@@ -276,7 +276,7 @@ fn in_flight_tiles_respect_the_budget() {
             max_bytes_in_flight,
             scratch_base,
         };
-        let stack_ctx = StackContext::new(frame_count, width, height);
+        let stack_ctx = StackContext::new(frame_count, width, height, 3);
         let scheduler =
             TileScheduler::new(&stack, stack_ctx, 3, &options).expect("scheduler must build");
         assert_eq!(scheduler.in_flight_limit(), target);

@@ -1,0 +1,549 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! `pyramidal-ecc`: the [`AlignAlgorithm`] driving [`crate::align::solve_level`]
+//! coarse-to-fine over an [`crate::align::AlignPyramid`] pair, in two modes
+//! -- translation-only and rotation+scale -- selected by the `mode`
+//! parameter.
+//!
+//! # Provenance
+//!
+//! Written from this crate's own patterns (`crate::fuse::depth_map`'s
+//! registered-algorithm shape) and from the mathematics the driver itself
+//! needs (pyramid rescale, region budgeting), never with a third-party
+//! source open as a model.
+//!
+//! # The coarse-to-fine loop
+//!
+//! For pyramid level `k` from `pyramid-depth` down to `0`,
+//! [`crate::align::solve_level`] runs over a `PyramidalEcc::solve_region`-sized
+//! rect, seeded from the previous
+//! (coarser) level's result rescaled by `S = Transform::similarity(2.0,
+//! 0.0, 0.0, 0.0)`: `seed_{k-1} = S.compose(&result_k).compose(&S_inv)`.
+//! `epsilon-px` is passed unscaled at every level -- it is a step measure
+//! in that level's own pixels, so the same threshold means "this level's
+//! own milli-pixel" everywhere, and a finer level always refines what a
+//! coarser one left. A [`crate::align::EccStatus::Diverged`] status at any
+//! level ends the loop there (the seed for finer levels would be
+//! worthless), but the best-ρ transform that level found is still rescaled
+//! all the way to level-0 coordinates, so a caller always gets a level-0
+//! answer.
+//!
+//! # The solve region
+//!
+//! [`crate::align::solve_level`]'s inner loop is bicubic, 16 taps per
+//! sample per iteration -- a full-frame level-0 solve on an 8192x5464
+//! frame is ~716M taps per iteration, which buys nothing a six-parameter
+//! fit needs. `PyramidalEcc::solve_region` instead solves a centred rect covering
+//! [`REGION_FRACTION`] of each axis, shrunk (aspect preserved) to
+//! [`MAX_REGION_PIXELS`] when that rect would exceed it. This is safe for
+//! the 4-DOF mode because rotation and scale get their lever arm from the
+//! *coarse* levels, where the region is most of the (small) level; the
+//! budgeted level-0 pass only refines an estimate already close.
+
+use std::sync::{Arc, LazyLock};
+
+use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus};
+use crate::align::error::AlignError;
+use crate::align::{AlignPyramid, EccMode, EccParams, EccStatus, LumaAssembler, Transform};
+use crate::fuse::PyramidError;
+use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
+use crate::registry::AlignRegistration;
+use crate::tile::plan::{DEFAULT_TILE_SIZE, MAX_LEVELS};
+use crate::tile::{Rect, Tile};
+
+/// Solver-robustness threshold, not a user setting -- the same class as
+/// `crate::align`'s own `PIVOT_EPS` and `CORRELATION_SLACK`. `0.75` is
+/// chosen so an 80px translation on the 512px fixture (which pushes 16 of
+/// the region's 384 columns out of the moving plane's domain, valid
+/// fraction ~= 0.958) stays a partial-overlap solve rather than a
+/// [`crate::align::DivergenceReason::TooFewValidSamples`] refusal.
+const MIN_VALID_FRACTION: f64 = 0.75;
+
+/// The fraction of each level axis [`PyramidalEcc::solve_region`] covers,
+/// before the [`MAX_REGION_PIXELS`] budget shrink.
+const REGION_FRACTION: f64 = 0.75;
+
+/// The sample budget [`PyramidalEcc::solve_region`] never exceeds: at
+/// 8192x5464 this turns a naive 6144x4098 (75%) rect into ~1253x836, a 43x
+/// reduction in per-iteration taps.
+const MAX_REGION_PIXELS: u32 = 1 << 20;
+
+/// The floor on a pyramid level's shorter dimension the `auto`
+/// pyramid-depth closure refuses to go below. Below ~64px the solve region
+/// is a few dozen pixels of a heavily blurred plane, where the solver
+/// measures noise rather than motion.
+const MIN_COARSEST_EXTENT_PX: u32 = 64;
+
+fn wrap_align_error(source: AlignError) -> AlgorithmError {
+    AlgorithmError::Failed {
+        algorithm: "pyramidal-ecc".to_string(),
+        detail: source.to_string(),
+    }
+}
+
+fn wrap_pyramid_error(source: PyramidError) -> AlgorithmError {
+    AlgorithmError::Failed {
+        algorithm: "pyramidal-ecc".to_string(),
+        detail: source.to_string(),
+    }
+}
+
+fn missing_key(key: &str) -> AlgorithmError {
+    AlgorithmError::Failed {
+        algorithm: "pyramidal-ecc".to_string(),
+        detail: format!(
+            "resolved values are missing `{key}`; call crate::params::resolve before align_frame"
+        ),
+    }
+}
+
+/// `min(by_extent, by_floor)`: `by_extent` is [`crate::align::max_levels`]
+/// (the frame-extent cap every pyramid in this crate shares), `by_floor` is
+/// the largest `k` with `ceil(min(w, h) / 2^k) >= MIN_COARSEST_EXTENT_PX`.
+/// Deliberately no tile-geometry term: whole planes are held in RAM, so
+/// this closure is not subject to a per-tile cap.
+/// Measured: `512x512 -> 3`, `8192x5464 -> 6`.
+fn auto_pyramid_depth(ctx: &StackContext) -> ParamValue {
+    let by_extent = crate::align::max_levels(ctx.width, ctx.height);
+    let min_dim = ctx.width.min(ctx.height);
+
+    let mut by_floor = 0u32;
+    while by_floor < MAX_LEVELS {
+        let next = by_floor + 1;
+        let extent_at_next = min_dim.div_ceil(1u32 << next);
+        if extent_at_next < MIN_COARSEST_EXTENT_PX {
+            break;
+        }
+        by_floor = next;
+    }
+
+    ParamValue::Int(by_extent.min(by_floor) as i64)
+}
+
+static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
+    vec![
+        ParamDesc {
+            id: "mode".to_string(),
+            label: "Mode".to_string(),
+            help: "Translation-only (2 DOF) or rotation+scale (4 DOF, for \
+                   focus breathing) -- selects which degrees of freedom the \
+                   solver moves inside the one projective Transform; the \
+                   unmoved degrees of freedom stay at their identity values."
+                .to_string(),
+            kind: ParamKind::Enum {
+                variants: vec![
+                    EnumVariant {
+                        id: "translation".to_string(),
+                        label: "Translation only".to_string(),
+                    },
+                    EnumVariant {
+                        id: "rotation-scale".to_string(),
+                        label: "Rotation + Scale".to_string(),
+                    },
+                ],
+            },
+            default: ParamValue::Enum("rotation-scale".to_string()),
+            auto: None,
+        },
+        ParamDesc {
+            id: "max-iterations".to_string(),
+            label: "Max Iterations".to_string(),
+            help: "The per-level iteration cap.".to_string(),
+            kind: ParamKind::Int { min: 1, max: 1000 },
+            default: ParamValue::Int(50),
+            auto: None,
+        },
+        ParamDesc {
+            id: "epsilon-px".to_string(),
+            label: "Epsilon (px)".to_string(),
+            help: "Maximum corner displacement in level pixels -- the \
+                   per-iteration step measure the solver converges to, not \
+                   a correlation threshold."
+                .to_string(),
+            kind: ParamKind::Float {
+                min: 1e-9,
+                max: 1.0,
+                step: 1e-5,
+                logarithmic: true,
+            },
+            default: ParamValue::Float(1e-4),
+            auto: None,
+        },
+        ParamDesc {
+            id: "pyramid-depth".to_string(),
+            label: "Pyramid Depth".to_string(),
+            help: "How many coarser pyramid levels to register through \
+                   before refining at full resolution. `auto` derives a \
+                   depth from the frame's own resolution, bounded by a \
+                   floor below which a level is too small to solve \
+                   meaningfully."
+                .to_string(),
+            kind: ParamKind::Int {
+                min: 0,
+                max: MAX_LEVELS as i64,
+            },
+            default: ParamValue::Int(4),
+            auto: Some(Arc::new(auto_pyramid_depth)),
+        },
+        ParamDesc {
+            id: "reference-policy".to_string(),
+            label: "Reference Policy".to_string(),
+            help: "Whether every frame registers against one anchor frame, \
+                   or chains hop-by-hop through its neighbours toward the \
+                   reference."
+                .to_string(),
+            kind: ParamKind::Enum {
+                variants: vec![
+                    EnumVariant {
+                        id: "anchor".to_string(),
+                        label: "Anchor".to_string(),
+                    },
+                    EnumVariant {
+                        id: "chain".to_string(),
+                        label: "Chain".to_string(),
+                    },
+                ],
+            },
+            default: ParamValue::Enum("anchor".to_string()),
+            auto: None,
+        },
+        ParamDesc {
+            id: "reference-frame".to_string(),
+            label: "Reference Frame".to_string(),
+            help: "Which frame the stack registers against: the first, the \
+                   middle, or the last."
+                .to_string(),
+            kind: ParamKind::Enum {
+                variants: vec![
+                    EnumVariant {
+                        id: "first".to_string(),
+                        label: "First".to_string(),
+                    },
+                    EnumVariant {
+                        id: "middle".to_string(),
+                        label: "Middle".to_string(),
+                    },
+                    EnumVariant {
+                        id: "last".to_string(),
+                        label: "Last".to_string(),
+                    },
+                ],
+            },
+            default: ParamValue::Enum("middle".to_string()),
+            auto: None,
+        },
+    ]
+});
+
+/// The Pyramidal ECC alignment algorithm. See the module docs for the
+/// coarse-to-fine loop and the solve region.
+pub struct PyramidalEcc;
+
+impl PyramidalEcc {
+    /// The region [`solve_level`](crate::align::solve_level) solves over at
+    /// one `width x height` pyramid level: a centred rect covering
+    /// [`REGION_FRACTION`] of each axis, shrunk (aspect ratio preserved,
+    /// about its own centre) so its pixel count never exceeds
+    /// [`MAX_REGION_PIXELS`]. On a 512px level:
+    /// `Rect { x: 64, y: 64, width: 384, height: 384 }`.
+    fn solve_region(width: u32, height: u32) -> Rect {
+        let raw_w = ((width as f64) * REGION_FRACTION).round().max(1.0) as u32;
+        let raw_h = ((height as f64) * REGION_FRACTION).round().max(1.0) as u32;
+
+        let count = raw_w as u64 * raw_h as u64;
+        let (shrunk_w, shrunk_h) = if count > MAX_REGION_PIXELS as u64 {
+            let factor = (MAX_REGION_PIXELS as f64 / count as f64).sqrt();
+            (
+                ((raw_w as f64 * factor).floor().max(1.0)) as u32,
+                ((raw_h as f64 * factor).floor().max(1.0)) as u32,
+            )
+        } else {
+            (raw_w, raw_h)
+        };
+
+        let shrunk_w = shrunk_w.min(width);
+        let shrunk_h = shrunk_h.min(height);
+
+        let x = ((width - shrunk_w) / 2).max(1);
+        let y = ((height - shrunk_h) / 2).max(1);
+
+        let valid_x_hi = width.saturating_sub(1);
+        let valid_y_hi = height.saturating_sub(1);
+        let w = shrunk_w.min(valid_x_hi.saturating_sub(x));
+        let h = shrunk_h.min(valid_y_hi.saturating_sub(y));
+
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    /// Streams `frame` in from `ctx` in full-width row bands of
+    /// [`DEFAULT_TILE_SIZE`] rows and assembles it into an
+    /// [`AlignPyramid`] of `depth` levels -- never a whole-frame RGB
+    /// buffer.
+    fn build_pyramid(
+        ctx: &AlignContext<'_>,
+        frame: usize,
+        depth: u32,
+    ) -> Result<AlignPyramid, AlgorithmError> {
+        let stack = ctx.stack();
+        let (width, height, spp) = (stack.width, stack.height, stack.samples_per_pixel);
+        let mut assembler = LumaAssembler::new(width, height);
+
+        let mut y = 0u32;
+        while y < height {
+            let band_height = DEFAULT_TILE_SIZE.min(height - y);
+            let rect = Rect {
+                x: 0,
+                y,
+                width,
+                height: band_height,
+            };
+            let needed = width as usize * band_height as usize * spp as usize;
+            let mut band = vec![0u16; needed];
+            ctx.read_tile_into(frame, rect, &mut band)?;
+            let tile = Tile {
+                rect,
+                samples_per_pixel: spp,
+                samples: band,
+            };
+            assembler.push_tile(&tile).map_err(wrap_align_error)?;
+            y += band_height;
+        }
+
+        let base = assembler.finish().map_err(wrap_pyramid_error)?;
+        AlignPyramid::from_luma(base, depth).map_err(wrap_pyramid_error)
+    }
+}
+
+impl AlignAlgorithm for PyramidalEcc {
+    fn id(&self) -> &str {
+        "pyramidal-ecc"
+    }
+
+    fn display_name(&self) -> &str {
+        "Pyramidal ECC"
+    }
+
+    fn params(&self) -> &[ParamDesc] {
+        &PARAMS
+    }
+
+    fn align_frame(
+        &self,
+        ctx: &AlignContext<'_>,
+        frame: usize,
+        cfg: &ParamValues,
+    ) -> Result<AlignOutcome, AlgorithmError> {
+        crate::params::validate(self.params(), cfg)?;
+
+        // The reference frame needs no pixel read at all.
+        if frame == ctx.reference() {
+            return Ok(AlignOutcome {
+                transform: Transform::identity(),
+                status: AlignStatus::Converged,
+                iterations: 0,
+                residual: 1.0,
+            });
+        }
+
+        let mode = match cfg.get("mode").and_then(ParamValue::as_enum) {
+            Some("translation") => EccMode::Translation,
+            Some("rotation-scale") => EccMode::Similarity,
+            Some(other) => {
+                return Err(AlgorithmError::Failed {
+                    algorithm: "pyramidal-ecc".to_string(),
+                    detail: format!("unknown `mode` value `{other}`"),
+                });
+            }
+            None => return Err(missing_key("mode")),
+        };
+        let max_iterations = cfg
+            .get("max-iterations")
+            .and_then(ParamValue::as_i64)
+            .ok_or_else(|| missing_key("max-iterations"))? as u32;
+        let epsilon_px = cfg
+            .get("epsilon-px")
+            .and_then(ParamValue::as_f64)
+            .ok_or_else(|| missing_key("epsilon-px"))?;
+        let depth = cfg
+            .get("pyramid-depth")
+            .and_then(ParamValue::as_i64)
+            .ok_or_else(|| missing_key("pyramid-depth"))? as u32;
+
+        let params = EccParams {
+            max_iterations,
+            epsilon_px,
+            min_valid_fraction: MIN_VALID_FRACTION,
+        };
+
+        let reference_pyramid = Self::build_pyramid(ctx, ctx.reference(), depth)?;
+        let frame_pyramid = Self::build_pyramid(ctx, frame, depth)?;
+
+        let up = Transform::similarity(2.0, 0.0, 0.0, 0.0);
+        let down = Transform::similarity(0.5, 0.0, 0.0, 0.0);
+
+        let mut seed = Transform::identity();
+        let mut total_iterations = 0u32;
+        let mut final_transform = Transform::identity();
+        let mut final_status = AlignStatus::Converged;
+        let mut final_residual = 1.0f64;
+
+        for k in (0..=depth).rev() {
+            let level_ref = reference_pyramid.level(k as usize);
+            let level_frame = frame_pyramid.level(k as usize);
+            let region = Self::solve_region(level_ref.width(), level_ref.height());
+
+            let result =
+                crate::align::solve_level(level_ref, region, level_frame, &seed, mode, &params)
+                    .map_err(wrap_align_error)?;
+            total_iterations += result.iterations;
+            final_residual = result.correlation;
+
+            // Rescale this level's transform all the way to level-0
+            // coordinates -- `k` applications of the same up/down
+            // composition the seed hand-off uses, so a diverging level's
+            // best-ρ transform is a usable level-0 answer too.
+            let mut at_level0 = result.transform;
+            for _ in 0..k {
+                at_level0 = up.compose(&at_level0).compose(&down);
+            }
+            final_transform = at_level0;
+            final_status = result.status.into();
+
+            match result.status {
+                EccStatus::Diverged(_) => break,
+                _ => {
+                    if k > 0 {
+                        seed = up.compose(&result.transform).compose(&down);
+                    }
+                }
+            }
+        }
+
+        Ok(AlignOutcome {
+            transform: final_transform,
+            status: final_status,
+            iterations: total_iterations,
+            residual: final_residual,
+        })
+    }
+}
+
+inventory::submit! { AlignRegistration::new(&PyramidalEcc) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_declares_every_parameter() {
+        let algo = PyramidalEcc;
+        let ids: Vec<&str> = algo.params().iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "mode",
+                "max-iterations",
+                "epsilon-px",
+                "pyramid-depth",
+                "reference-policy",
+                "reference-frame",
+            ],
+            "no seventh parameter -- in particular, no `min-correlation`: \
+             convergence is a step-size measure"
+        );
+
+        let mode = &algo.params()[0];
+        assert_eq!(mode.default, ParamValue::Enum("rotation-scale".to_string()));
+        match &mode.kind {
+            ParamKind::Enum { variants } => {
+                assert_eq!(variants.len(), 2);
+                assert!(variants.iter().any(|v| v.id == "translation"));
+                assert!(variants.iter().any(|v| v.id == "rotation-scale"));
+            }
+            other => panic!("expected Enum, got {other:?}"),
+        }
+
+        let max_iterations = &algo.params()[1];
+        assert_eq!(max_iterations.default, ParamValue::Int(50));
+        assert_eq!(max_iterations.kind, ParamKind::Int { min: 1, max: 1000 });
+
+        let epsilon = &algo.params()[2];
+        assert_eq!(epsilon.default, ParamValue::Float(1e-4));
+        assert_eq!(
+            epsilon.kind,
+            ParamKind::Float {
+                min: 1e-9,
+                max: 1.0,
+                step: 1e-5,
+                logarithmic: true,
+            }
+        );
+
+        let depth = &algo.params()[3];
+        assert_eq!(depth.default, ParamValue::Int(4));
+        assert_eq!(
+            depth.kind,
+            ParamKind::Int {
+                min: 0,
+                max: MAX_LEVELS as i64,
+            }
+        );
+        assert!(
+            depth.auto.is_some(),
+            "pyramid-depth must carry an auto hook"
+        );
+
+        let reference_policy = &algo.params()[4];
+        assert_eq!(
+            reference_policy.default,
+            ParamValue::Enum("anchor".to_string())
+        );
+        let reference_frame = &algo.params()[5];
+        assert_eq!(
+            reference_frame.default,
+            ParamValue::Enum("middle".to_string())
+        );
+    }
+
+    #[test]
+    fn auto_depth_scales_with_resolution() {
+        let ctx_512 = StackContext::new(8, 512, 512, 3);
+        assert_eq!(auto_pyramid_depth(&ctx_512), ParamValue::Int(3));
+
+        let ctx_ref = StackContext::new(61, 8192, 5464, 3);
+        assert_eq!(auto_pyramid_depth(&ctx_ref), ParamValue::Int(6));
+    }
+
+    #[test]
+    fn solve_region_is_the_centred_three_quarters_at_512px() {
+        let region = PyramidalEcc::solve_region(512, 512);
+        assert_eq!(
+            region,
+            Rect {
+                x: 64,
+                y: 64,
+                width: 384,
+                height: 384,
+            }
+        );
+    }
+
+    #[test]
+    fn solve_region_respects_the_sample_budget() {
+        let region = PyramidalEcc::solve_region(8192, 5464);
+        let count = region.width as u64 * region.height as u64;
+        assert!(
+            count <= MAX_REGION_PIXELS as u64,
+            "region {region:?} holds {count} px, over the {MAX_REGION_PIXELS} budget"
+        );
+        // Measured 2026-09-13: shrinking the naive 6144x4098 (75%) rect by
+        // sqrt(2^20 / (6144*4098)) and flooring yields exactly this.
+        assert_eq!(region.width, 1253);
+        assert_eq!(region.height, 836);
+    }
+}

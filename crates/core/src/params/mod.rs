@@ -77,25 +77,31 @@ impl ParamKind {
 /// `#[non_exhaustive]`: extended **in place** as further algorithms need
 /// fields. It must not move, or this module's own tests break.
 ///
-/// The three fields here are exactly what [`crate::io::TiffStack`] already
+/// The fields here are exactly what [`crate::io::TiffStack`] already
 /// exposes: `frame_count` from `TiffStack::len()`, `width`/`height` from
-/// `TiffStack::dimensions()`. `core::params` does not depend on `core::io`;
-/// the caller wires the two together by constructing a `StackContext` from
-/// an open stack.
+/// `TiffStack::dimensions()`, `samples_per_pixel` from
+/// `TiffStack::header(0).samples_per_pixel`. `core::params` does not depend
+/// on `core::io`; the caller wires the two together by constructing a
+/// `StackContext` from an open stack.
+///
+/// `samples_per_pixel` is what lets an [`crate::algorithm::AlignAlgorithm`]
+/// size the exact-length buffer `AlignContext::read_tile_into` demands.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StackContext {
     pub frame_count: usize,
     pub width: u32,
     pub height: u32,
+    pub samples_per_pixel: u32,
 }
 
 impl StackContext {
-    pub fn new(frame_count: usize, width: u32, height: u32) -> Self {
+    pub fn new(frame_count: usize, width: u32, height: u32, samples_per_pixel: u32) -> Self {
         StackContext {
             frame_count,
             width,
             height,
+            samples_per_pixel,
         }
     }
 }
@@ -612,7 +618,7 @@ mod tests {
             int_desc("radius", 0, 100, 3),
         ];
         let values = ParamValues::new();
-        let ctx = StackContext::new(61, 8192, 5464);
+        let ctx = StackContext::new(61, 8192, 5464, 3);
         let resolved = resolve(&schema, &values, &ctx).unwrap();
         assert_eq!(resolved["threshold"].value, ParamValue::Float(2.5));
         assert_eq!(resolved["threshold"].provenance, Provenance::Default);
@@ -627,7 +633,7 @@ mod tests {
             ParamValue::Float(ctx.frame_count as f64)
         }));
         let schema = vec![auto_desc];
-        let ctx = StackContext::new(4, 100, 100);
+        let ctx = StackContext::new(4, 100, 100, 3);
 
         // Nothing explicit: resolves to the auto hook's value.
         let values = ParamValues::new();
@@ -648,7 +654,7 @@ mod tests {
             ParamValue::Float(ctx.frame_count as f64)
         }));
         let schema = vec![auto_desc];
-        let ctx = StackContext::new(4, 100, 100);
+        let ctx = StackContext::new(4, 100, 100, 3);
 
         let mut values = ParamValues::new();
         values.insert("threshold".to_string(), ParamValue::Float(7.0));
@@ -664,7 +670,7 @@ mod tests {
         let mut auto_desc = float_desc("threshold", 0.0, 10.0, 2.5);
         auto_desc.auto = Some(Arc::new(|_ctx: &StackContext| ParamValue::Float(999.0)));
         let schema = vec![auto_desc];
-        let ctx = StackContext::new(4, 100, 100);
+        let ctx = StackContext::new(4, 100, 100, 3);
         let err = resolve(&schema, &ParamValues::new(), &ctx).unwrap_err();
         assert_eq!(err.violations().len(), 1);
         match &err.violations()[0] {
@@ -783,7 +789,7 @@ mod tests {
             ParamValue::Float(ctx.frame_count as f64)
         }));
         let schema = vec![auto_desc, int_desc("radius", 0, 100, 3)];
-        let ctx = StackContext::new(4, 100, 100);
+        let ctx = StackContext::new(4, 100, 100, 3);
         let resolved = resolve(&schema, &ParamValues::new(), &ctx).unwrap();
         assert_eq!(resolved["threshold"].provenance, Provenance::Auto);
 

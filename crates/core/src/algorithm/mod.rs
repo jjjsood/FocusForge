@@ -208,6 +208,52 @@ pub trait StackAlgorithm: Send + Sync + 'static {
     }
 }
 
+/// How one [`AlignAlgorithm::align_frame`] call ended.
+///
+/// `#[non_exhaustive]`: a divergence reason is inherently
+/// algorithm-specific -- `crate::align::DivergenceReason::LemmaOneRegion` is
+/// named after one paper's Lemma 1, and a second aligner will name its own
+/// failure modes after its own mathematics. That accumulation is
+/// deliberate and is exactly what `#[non_exhaustive]` on both this type and
+/// `DivergenceReason` is for; it is not a sign that the vocabulary needs
+/// generalizing away. A reader adding a second aligner should read the
+/// existing variant names as evidence of the pattern to follow, not as a
+/// defect to fix.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignStatus {
+    /// The solver's step measure fell below its convergence threshold.
+    Converged,
+    /// The solver's iteration cap was reached with no convergence.
+    HitCap,
+    /// Registration failed; see [`crate::align::DivergenceReason`].
+    Diverged(crate::align::DivergenceReason),
+}
+
+impl From<crate::align::EccStatus> for AlignStatus {
+    fn from(status: crate::align::EccStatus) -> Self {
+        match status {
+            crate::align::EccStatus::Converged => AlignStatus::Converged,
+            crate::align::EccStatus::HitCap => AlignStatus::HitCap,
+            crate::align::EccStatus::Diverged(reason) => AlignStatus::Diverged(reason),
+        }
+    }
+}
+
+/// The outcome of one [`AlignAlgorithm::align_frame`] call: the recovered
+/// transform plus enough structure to tell a converged frame from a capped
+/// or diverged one without parsing an error string.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlignOutcome {
+    /// Reference-to-frame, the same convention [`crate::align::Transform`]
+    /// pins everywhere else in this crate.
+    pub transform: crate::align::Transform,
+    pub status: AlignStatus,
+    pub iterations: u32,
+    /// An ECC correlation `ρ ∈ [-1, 1]`, never an RMS residual.
+    pub residual: f64,
+}
+
 /// An alignment algorithm: solves one frame's geometric transform against
 /// the stack's reference frame, one call per frame.
 pub trait AlignAlgorithm: Send + Sync + 'static {
@@ -219,7 +265,7 @@ pub trait AlignAlgorithm: Send + Sync + 'static {
         ctx: &AlignContext<'_>,
         frame: usize,
         cfg: &ParamValues,
-    ) -> Result<crate::align::Transform, AlgorithmError>;
+    ) -> Result<AlignOutcome, AlgorithmError>;
 }
 
 impl TileReader for crate::io::TiffStack {
@@ -368,14 +414,20 @@ mod tests {
             ctx: &AlignContext<'_>,
             frame: usize,
             _cfg: &ParamValues,
-        ) -> Result<Transform, AlgorithmError> {
-            if frame == ctx.reference() {
-                Ok(Transform::identity())
+        ) -> Result<AlignOutcome, AlgorithmError> {
+            let transform = if frame == ctx.reference() {
+                Transform::identity()
             } else {
                 let mut m = Transform::identity().m;
                 m[0][2] = frame as f64 - ctx.reference() as f64;
-                Ok(Transform { m })
-            }
+                Transform { m }
+            };
+            Ok(AlignOutcome {
+                transform,
+                status: AlignStatus::Converged,
+                iterations: 1,
+                residual: 1.0,
+            })
         }
     }
 
@@ -401,7 +453,7 @@ mod tests {
             _ctx: &AlignContext<'_>,
             _frame: usize,
             _cfg: &ParamValues,
-        ) -> Result<Transform, AlgorithmError> {
+        ) -> Result<AlignOutcome, AlgorithmError> {
             Err(AlgorithmError::Failed {
                 algorithm: self.id().to_string(),
                 detail: "intentional test failure".to_string(),
@@ -488,16 +540,16 @@ mod tests {
             height: 4,
             spp: 3,
         };
-        let stack_ctx = StackContext::new(3, 4, 4);
+        let stack_ctx = StackContext::new(3, 4, 4, 3);
         let ctx = AlignContext::new(stack_ctx, 1, &reader);
         let algo = DummyAlign;
 
         for frame in 0..stack_ctx.frame_count {
-            let t = algo.align_frame(&ctx, frame, &ParamValues::new()).unwrap();
+            let outcome = algo.align_frame(&ctx, frame, &ParamValues::new()).unwrap();
             if frame == ctx.reference() {
-                assert_eq!(t, Transform::identity());
+                assert_eq!(outcome.transform, Transform::identity());
             } else {
-                assert_ne!(t, Transform::identity());
+                assert_ne!(outcome.transform, Transform::identity());
             }
         }
     }
@@ -630,7 +682,7 @@ mod tests {
             height: 4,
             spp: 3,
         };
-        let stack_ctx = StackContext::new(1, 4, 4);
+        let stack_ctx = StackContext::new(1, 4, 4, 3);
         let ctx = AlignContext::new(stack_ctx, 0, &reader);
 
         let err = FailingAlign
@@ -684,7 +736,7 @@ mod tests {
 
     #[test]
     fn auto_hook_reads_the_stack_context() {
-        let ctx: StackContext = crate::params::StackContext::new(5, 10, 10);
+        let ctx: StackContext = crate::params::StackContext::new(5, 10, 10, 3);
         let algo = DummyStack::new();
         let resolved = crate::params::resolve(algo.params(), &ParamValues::new(), &ctx).unwrap();
         assert_eq!(
@@ -706,7 +758,7 @@ mod tests {
             height: 4,
             spp: 3,
         };
-        let stack_ctx = StackContext::new(1, 4, 4);
+        let stack_ctx = StackContext::new(1, 4, 4, 3);
         let ctx = AlignContext::new(stack_ctx, 0, &reader);
 
         let rect = Rect {

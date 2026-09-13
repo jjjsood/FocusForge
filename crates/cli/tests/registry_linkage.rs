@@ -49,3 +49,21 @@ fn a_downstream_crate_resolves_by_id() {
     let align = registry::find_align("dummy-align").expect("dummy-align resolves by id");
     assert_eq!(align.id(), "dummy-align");
 }
+
+/// `pyramidal-ecc` is a production registration (no `test-algorithms`
+/// feature involved), so this proves the same linker caveat against a real
+/// algorithm, not only the test-only dummies.
+#[test]
+fn pyramidal_ecc_reaches_a_downstream_crate() {
+    let listing = registry::algorithms();
+    let ids: Vec<&str> = listing.iter().map(registry::AlgorithmRef::id).collect();
+    assert!(
+        ids.contains(&"pyramidal-ecc"),
+        "pyramidal-ecc must reach this crate through registry::algorithms(), got {ids:?}"
+    );
+
+    let align = registry::find_align("pyramidal-ecc").expect("pyramidal-ecc resolves by id");
+    assert_eq!(align.id(), "pyramidal-ecc");
+    assert_eq!(align.display_name(), "Pyramidal ECC");
+    assert_eq!(align.params().len(), 6);
+}
