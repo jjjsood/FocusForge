@@ -24,6 +24,9 @@ GNU General Public License v3.
 
 - Fuses a directory of TIFF frames into one composite (`focusforge-cli
   stack`), out-of-core so the stack never has to fit in RAM
+- Aligns handheld or breathing frames before fusing them, recovering shift,
+  rotation and scale drift and cropping the result to the region every frame
+  covers (`focusforge-cli align` reports the same transforms on their own)
 - Three stacking algorithms — Laplacian-pyramid coefficient selection,
   sharpness-weighted blending, and depth-map selection — each producing a
   Z-Map naming the source frame behind every output pixel

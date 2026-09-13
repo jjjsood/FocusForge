@@ -13,6 +13,11 @@ of it when one exists. `--algo` picks the algorithm; see
 [`reference/cli.md`](../reference/cli.md#algorithms) for the full list and
 [`reference/cli.md`](../reference/cli.md#stack) for every flag.
 
+Before fusing, `stack` aligns the frames and crops the output to the region
+every one of them covers — both on by default. See
+[`guide/alignment.md`](alignment.md) for how that stage works and how to
+turn it off.
+
 ## Choosing an algorithm
 
 Three are available:

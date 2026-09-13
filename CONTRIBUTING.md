@@ -29,8 +29,9 @@ pkg-config shim) for Slint's font stack; the main workspace does not need it.
 handling, truncation and out-of-bounds errors), tile reads against both
 byte-order and strip-height variants, the writer's round trip back through
 the reader, the tile scheduler's memory budget, the Z-Map reader and
-writer, each stacking algorithm's fusion output, and the `focusforge-cli
-stack`/`algorithms` commands end to end, plus the fixture manifest.
+writer, each stacking algorithm's fusion output, the pyramidal ECC solver
+and its warp and auto-crop stages, and the `focusforge-cli
+stack`/`align`/`algorithms` commands end to end, plus the fixture manifest.
 Fixtures under `fixtures/mantis-64` and `fixtures/mantis-512` are small
 crops of a 61-frame macro stack, cut and checksummed by harness tooling —
 never hand-edited.
