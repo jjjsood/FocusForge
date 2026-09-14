@@ -253,6 +253,16 @@ impl TileConsumer for FusionConsumer {
 
         Ok(())
     }
+
+    /// Takes both writers out of their mutexes and drops them: called only
+    /// after a genuine error, never on pause or cancel, so no half-covered
+    /// file stays open and a later `finish()` cannot be attempted against
+    /// it. Removing the `.partial` files themselves stays with the caller
+    /// -- a job neither creates nor deletes output files.
+    fn abort(&self) {
+        self.composite.lock().unwrap().take();
+        self.zmap.lock().unwrap().take();
+    }
 }
 
 #[cfg(test)]

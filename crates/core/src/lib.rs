@@ -8,6 +8,7 @@ pub mod algorithm;
 pub mod align;
 pub mod fuse;
 pub mod io;
+pub mod job;
 pub mod params;
 pub mod registry;
 pub mod tile;

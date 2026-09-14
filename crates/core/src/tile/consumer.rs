@@ -60,4 +60,13 @@ impl<'a> TileJob<'a> {
 /// preprocessed.
 pub trait TileConsumer: Send + Sync {
     fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError>;
+
+    /// Called at most once, only when a run ends in a genuine error --
+    /// **never on pause, never on cancel**. `crate::job::Job::run`
+    /// is this hook's only caller. The default is a no-op, which is exactly
+    /// right for a consumer with no resource worth releasing early; a
+    /// consumer that owns an output sink (`crate::fuse::FusionConsumer`)
+    /// overrides it to take that sink out of its mutex and drop it, so a
+    /// later `finish()` cannot be attempted against a half-covered file.
+    fn abort(&self) {}
 }
