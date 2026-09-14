@@ -16,6 +16,8 @@
 use rayon::prelude::*;
 
 use crate::algorithm::{AlgorithmError, TileOutput, TileReader};
+use crate::align::warp::WarpedTile;
+use crate::align::{AlignError, Transform};
 use crate::tile::{Rect, Tile};
 
 /// The adapter facts a [`TileBackend`] implementation was built on: plain
@@ -74,6 +76,32 @@ pub trait TileBackend: Send + Sync {
         samples_per_pixel: u32,
         levels: u32,
     ) -> Result<TileOutput, AlgorithmError>;
+
+    /// Warps destination tile `dst` of `frame_index` (a `frame`-sized frame)
+    /// through `transform`, on the GPU -- the WGSL twin of
+    /// [`crate::align::warp::warp_tile`], reproducing its bicubic
+    /// Catmull-Rom kernel, its out-of-footprint rule and its
+    /// [`AlignError::SourceTileTooSmall`] precheck exactly.
+    ///
+    /// Returns `Result<_, AlignError>`, not `AlgorithmError` like
+    /// Returns `Result<_, AlignError>`, not `AlgorithmError` like
+    /// [`Self::self_check`] and [`Self::fuse_tile`]: what this method
+    /// exists to guarantee is that the GPU path returns the
+    /// *same* `AlignError::SourceTileTooSmall` variant with the same
+    /// payload as the CPU twin, and there is no `From<AlignError> for
+    /// AlgorithmError` (only the other direction,
+    /// `crate::align::AlignError::Read { source: AlgorithmError }`), so a
+    /// widened signature would stringify the variant and defeat that
+    /// guarantee.
+    fn warp_tile(
+        &self,
+        reader: &dyn TileReader,
+        frame_index: usize,
+        frame: (u32, u32),
+        samples_per_pixel: u32,
+        dst: Rect,
+        transform: &Transform,
+    ) -> Result<WarpedTile, AlignError>;
 }
 
 /// The rayon CPU twin of the self-check kernel every [`TileBackend`]
@@ -163,6 +191,25 @@ mod tests {
             let mut cfg = ParamValues::new();
             cfg.insert("levels".to_string(), ParamValue::Int(levels as i64));
             Laplacian.fuse(&ctx, &cfg)
+        }
+
+        fn warp_tile(
+            &self,
+            reader: &dyn TileReader,
+            frame_index: usize,
+            frame: (u32, u32),
+            samples_per_pixel: u32,
+            dst: Rect,
+            transform: &Transform,
+        ) -> Result<WarpedTile, AlignError> {
+            crate::align::warp::warp_tile(
+                reader,
+                frame_index,
+                frame,
+                samples_per_pixel,
+                dst,
+                transform,
+            )
         }
     }
 

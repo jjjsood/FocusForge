@@ -10,6 +10,8 @@
 use std::sync::OnceLock;
 
 use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
+use focusforge_core::align::warp::WarpedTile;
+use focusforge_core::align::{AlignError, Transform};
 use focusforge_core::gpu::{BackendInfo, TileBackend};
 use focusforge_core::tile::{Rect, Tile};
 
@@ -17,6 +19,7 @@ use crate::device::{GpuError, SharedDevice, shared_device};
 use crate::fuse::{self, FusionPipelines};
 use crate::pack::{packed_len, unpack_samples};
 use crate::transfer::{download_buffer, upload_tile};
+use crate::warp::{self, WarpPipelines};
 
 struct Pipeline {
     compute: wgpu::ComputePipeline,
@@ -31,6 +34,7 @@ pub struct GpuBackend {
     device: &'static SharedDevice,
     pipeline: OnceLock<Pipeline>,
     fuse_pipelines: FusionPipelines,
+    warp_pipelines: WarpPipelines,
 }
 
 impl GpuBackend {
@@ -39,6 +43,7 @@ impl GpuBackend {
             device,
             pipeline: OnceLock::new(),
             fuse_pipelines: FusionPipelines::new(),
+            warp_pipelines: WarpPipelines::new(),
         }
     }
 
@@ -219,6 +224,27 @@ impl TileBackend for GpuBackend {
             rect,
             samples_per_pixel,
             levels,
+        )
+    }
+
+    fn warp_tile(
+        &self,
+        reader: &dyn TileReader,
+        frame_index: usize,
+        frame: (u32, u32),
+        samples_per_pixel: u32,
+        dst: Rect,
+        transform: &Transform,
+    ) -> Result<WarpedTile, AlignError> {
+        warp::warp_tile_gpu(
+            self.device,
+            &self.warp_pipelines,
+            reader,
+            frame_index,
+            frame,
+            samples_per_pixel,
+            dst,
+            transform,
         )
     }
 }

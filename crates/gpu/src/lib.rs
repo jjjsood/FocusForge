@@ -14,15 +14,18 @@
 //! **WGSL loading convention.** Every kernel in this crate is an
 //! `include_str!` of a sibling `.wgsl` file passed to
 //! `wgpu::ShaderSource::Wgsl`, never a string literal -- see
-//! \[harness_gain.wgsl\] via \[harness\].
+//! \[harness_gain.wgsl\] via \[harness\], and \[warp_bicubic.wgsl\] via
+//! \[warp\].
 //!
 //! `wgpu` is an optional dependency (`gpu = ["dep:wgpu", "dep:thiserror"]`,
-//! `crates/gpu/Cargo.toml`): [`adapter`] and [`pack`] contain no `wgpu` type
-//! and stay compiled (and tested) with the feature off, which is what keeps
-//! the featureless build free of the `wgpu` compile.
+//! `crates/gpu/Cargo.toml`): [`adapter`], [`pack`] and [`warp_coords`]
+//! contain no `wgpu` type and stay compiled (and tested) with the feature
+//! off, which is what keeps the featureless build free of the `wgpu`
+//! compile.
 
 pub mod adapter;
 pub mod pack;
+pub mod warp_coords;
 
 #[cfg(feature = "gpu")]
 pub mod device;
@@ -33,4 +36,8 @@ pub mod harness;
 #[cfg(feature = "gpu")]
 pub mod limits;
 #[cfg(feature = "gpu")]
+pub(crate) mod pipeline;
+#[cfg(feature = "gpu")]
 pub mod transfer;
+#[cfg(feature = "gpu")]
+pub mod warp;
