@@ -15,7 +15,7 @@
 
 use rayon::prelude::*;
 
-use crate::algorithm::{AlgorithmError, TileReader};
+use crate::algorithm::{AlgorithmError, TileOutput, TileReader};
 use crate::tile::{Rect, Tile};
 
 /// The adapter facts a [`TileBackend`] implementation was built on: plain
@@ -59,6 +59,21 @@ pub trait TileBackend: Send + Sync {
         samples_per_pixel: u32,
         gain: f32,
     ) -> Result<Tile, AlgorithmError>;
+
+    /// Fuses `rect` across `frame_count` frames of `reader` with the
+    /// `laplacian` algorithm's pyramid depth `levels`, on the GPU, returning
+    /// both the composite tile and the Z-Map naming the winning source frame
+    /// per pixel -- `crates/gpu`'s implementation is the WGSL twin of
+    /// [`crate::algorithm::StackAlgorithm::fuse`] as implemented by
+    /// [`crate::fuse::laplacian::Laplacian`].
+    fn fuse_tile(
+        &self,
+        reader: &dyn TileReader,
+        frame_count: usize,
+        rect: Rect,
+        samples_per_pixel: u32,
+        levels: u32,
+    ) -> Result<TileOutput, AlgorithmError>;
 }
 
 /// The rayon CPU twin of the self-check kernel every [`TileBackend`]
@@ -90,6 +105,10 @@ pub fn self_check_cpu(tile: &Tile, gain: f32) -> Tile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::algorithm::StackAlgorithm;
+    use crate::algorithm::TileCtx;
+    use crate::fuse::laplacian::Laplacian;
+    use crate::params::{ParamValue, ParamValues};
 
     struct DummyBackend;
 
@@ -120,6 +139,31 @@ mod tests {
             };
             Ok(self_check_cpu(&tile, gain))
         }
+
+        fn fuse_tile(
+            &self,
+            reader: &dyn TileReader,
+            frame_count: usize,
+            rect: Rect,
+            samples_per_pixel: u32,
+            levels: u32,
+        ) -> Result<TileOutput, AlgorithmError> {
+            let mut tiles = Vec::with_capacity(frame_count);
+            for frame in 0..frame_count {
+                let mut samples =
+                    vec![0u16; (rect.width * rect.height * samples_per_pixel) as usize];
+                reader.read_tile_into(frame, rect, &mut samples)?;
+                tiles.push(Tile {
+                    rect,
+                    samples_per_pixel,
+                    samples,
+                });
+            }
+            let ctx = TileCtx::new(rect, &tiles);
+            let mut cfg = ParamValues::new();
+            cfg.insert("levels".to_string(), ParamValue::Int(levels as i64));
+            Laplacian.fuse(&ctx, &cfg)
+        }
     }
 
     #[test]
@@ -135,6 +179,61 @@ mod tests {
     fn tile_backend_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync + 'static>() {}
         assert_send_sync::<Box<dyn TileBackend>>();
+    }
+
+    /// A test-only, in-memory [`TileReader`] over one flat sample buffer per
+    /// frame -- just enough to drive [`DummyBackend::fuse_tile`] without a
+    /// real fixture.
+    struct FlatReader {
+        frames: Vec<Vec<u16>>,
+    }
+
+    impl TileReader for FlatReader {
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            _rect: Rect,
+            out: &mut [u16],
+        ) -> Result<(), AlgorithmError> {
+            out.copy_from_slice(&self.frames[frame]);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dummy_backend_fuse_tile_runs_laplacian_and_names_a_winner() {
+        let (width, height, spp) = (8u32, 8u32, 3u32);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let flat_a = vec![10_000u16; (width * height * spp) as usize];
+        let mut checker = vec![0u16; (width * height * spp) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let v = if (x + y) % 2 == 0 { 40_000 } else { 20_000 };
+                for c in 0..spp {
+                    checker[((y * width + x) * spp + c) as usize] = v;
+                }
+            }
+        }
+        let reader = FlatReader {
+            frames: vec![flat_a, checker],
+        };
+
+        let backend = DummyBackend;
+        let out = backend
+            .fuse_tile(&reader, 2, rect, spp, 1)
+            .expect("fuse_tile must succeed");
+
+        assert_eq!(out.tile.rect, rect);
+        assert_eq!(out.zmap.len(), (width * height) as usize);
+        assert!(
+            out.zmap.iter().all(|&index| index == 1),
+            "the only frame with detail must win every pixel"
+        );
     }
 
     #[test]

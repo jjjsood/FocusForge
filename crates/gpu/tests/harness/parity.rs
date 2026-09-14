@@ -10,13 +10,13 @@ use focusforge_core::gpu::{TileBackend, self_check_cpu};
 use focusforge_core::io::TiffStack;
 use focusforge_core::tile::{Rect, Tile};
 use focusforge_gpu::adapter::skip_message;
-use focusforge_gpu::harness::harness_backend;
+use focusforge_gpu::harness::gpu_backend;
 
 use crate::common;
 
 #[test]
 fn harness_kernel_matches_cpu_twin() {
-    let backend = match harness_backend() {
+    let backend = match gpu_backend() {
         Ok(backend) => backend,
         Err(err) => {
             println!("{}", skip_message(&err.to_string()));

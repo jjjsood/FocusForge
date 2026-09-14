@@ -27,6 +27,8 @@ pub mod pack;
 #[cfg(feature = "gpu")]
 pub mod device;
 #[cfg(feature = "gpu")]
+pub mod fuse;
+#[cfg(feature = "gpu")]
 pub mod harness;
 #[cfg(feature = "gpu")]
 pub mod limits;

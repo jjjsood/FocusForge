@@ -1,0 +1,231 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! The two-pass windowed score, the per-level selection, and the residual
+//! accumulation -- the GPU twins of `score_plane` and the selection/residual
+//! loop in `Laplacian::fuse`.
+
+use crate::fuse::{FusionPipelines, run_pass, upload_params};
+use crate::transfer::create_storage_buffer;
+
+fn score_params(width: u32, height: u32, spp: u32, radius: u32) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&width.to_le_bytes());
+    bytes[4..8].copy_from_slice(&height.to_le_bytes());
+    bytes[8..12].copy_from_slice(&spp.to_le_bytes());
+    bytes[12..16].copy_from_slice(&radius.to_le_bytes());
+    bytes
+}
+
+/// The two-pass windowed sharpness score of one Laplacian level -- the GPU
+/// twin of `score_plane`. Row pass then column pass, the same pinned order
+/// `score_plane` uses.
+#[allow(clippy::too_many_arguments)]
+pub fn score(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &FusionPipelines,
+    level: &wgpu::Buffer,
+    width: u32,
+    height: u32,
+    spp: u32,
+    radius: u32,
+) -> wgpu::Buffer {
+    let pixel_count = (width as u64) * (height as u64);
+    let row_sums = create_storage_buffer(device, pixel_count * 4, "focusforge-gpu-fuse-score-rows");
+    {
+        let pipeline = pipelines.score_rows(device);
+        let params_buffer = upload_params(device, queue, &score_params(width, height, spp, radius));
+        let entries = [
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: level.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: row_sums.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: params_buffer.as_entire_binding(),
+            },
+        ];
+        run_pass(
+            device,
+            queue,
+            pipeline,
+            &entries,
+            pixel_count as u32,
+            "focusforge-gpu-fuse-score-rows-pass",
+        );
+    }
+
+    let scores = create_storage_buffer(device, pixel_count * 4, "focusforge-gpu-fuse-score-cols");
+    {
+        let pipeline = pipelines.score_cols(device);
+        let params_buffer = upload_params(device, queue, &score_params(width, height, spp, radius));
+        let entries = [
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: row_sums.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: scores.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: params_buffer.as_entire_binding(),
+            },
+        ];
+        run_pass(
+            device,
+            queue,
+            pipeline,
+            &entries,
+            pixel_count as u32,
+            "focusforge-gpu-fuse-score-cols-pass",
+        );
+    }
+
+    scores
+}
+
+fn select_params(width: u32, height: u32, spp: u32, frame: u32) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&width.to_le_bytes());
+    bytes[4..8].copy_from_slice(&height.to_le_bytes());
+    bytes[8..12].copy_from_slice(&spp.to_le_bytes());
+    bytes[12..16].copy_from_slice(&frame.to_le_bytes());
+    bytes
+}
+
+/// One level's selection for one frame: strictly-greater, whole-pixel,
+/// updates `best_level`/`best` in place -- the GPU twin of the CPU
+/// selection loop. `best` is `array<Best>` (`struct Best { score:
+/// f32, winner: u32 }`, 8-byte stride) -- the declared four-storage-buffer
+/// floor, unraised.
+#[allow(clippy::too_many_arguments)]
+pub fn select(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &FusionPipelines,
+    current_level: &wgpu::Buffer,
+    current_score: &wgpu::Buffer,
+    best_level: &wgpu::Buffer,
+    best: &wgpu::Buffer,
+    width: u32,
+    height: u32,
+    spp: u32,
+    frame: u32,
+) {
+    let pipeline = pipelines.select_main(device);
+    let params_buffer = upload_params(device, queue, &select_params(width, height, spp, frame));
+    let entries = [
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: current_level.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: current_score.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: best_level.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 3,
+            resource: best.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 4,
+            resource: params_buffer.as_entire_binding(),
+        },
+    ];
+    run_pass(
+        device,
+        queue,
+        pipeline,
+        &entries,
+        width * height,
+        "focusforge-gpu-fuse-select-pass",
+    );
+}
+
+fn residual_params(len: u32, frame_count: f32) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&len.to_le_bytes());
+    bytes[4..8].copy_from_slice(&frame_count.to_le_bytes());
+    bytes
+}
+
+/// `sum += value`, elementwise -- the GPU twin of the CPU residual sum.
+/// Every frame (including frame 0) runs through this identically; see the
+/// module docs of `crate::fuse` for why that is bit-identical to the CPU
+/// twin's "seed from frame 0, then fold in the rest".
+pub fn accumulate(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &FusionPipelines,
+    sum: &wgpu::Buffer,
+    value: &wgpu::Buffer,
+    len: u32,
+) {
+    let pipeline = pipelines.residual_accumulate(device);
+    let params_buffer = upload_params(device, queue, &residual_params(len, 0.0));
+    let entries = [
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: value.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: sum.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: params_buffer.as_entire_binding(),
+        },
+    ];
+    run_pass(
+        device,
+        queue,
+        pipeline,
+        &entries,
+        len,
+        "focusforge-gpu-fuse-residual-accumulate-pass",
+    );
+}
+
+/// `sum /= frame_count`, elementwise, in place -- the GPU twin of the CPU
+/// residual mean. Binds only `sum` (1) and `params` (2) via
+/// `crate::fuse::shape_d`, whose doc covers why `value` (0) stays unbound.
+pub fn mean(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &FusionPipelines,
+    sum: &wgpu::Buffer,
+    len: u32,
+    frame_count: f32,
+) {
+    let pipeline = pipelines.residual_mean(device);
+    let params_buffer = upload_params(device, queue, &residual_params(len, frame_count));
+    let entries = [
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: sum.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: params_buffer.as_entire_binding(),
+        },
+    ];
+    run_pass(
+        device,
+        queue,
+        pipeline,
+        &entries,
+        len,
+        "focusforge-gpu-fuse-residual-mean-pass",
+    );
+}

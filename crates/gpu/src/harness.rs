@@ -9,11 +9,12 @@
 
 use std::sync::OnceLock;
 
-use focusforge_core::algorithm::{AlgorithmError, TileReader};
+use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
 use focusforge_core::gpu::{BackendInfo, TileBackend};
 use focusforge_core::tile::{Rect, Tile};
 
 use crate::device::{GpuError, SharedDevice, shared_device};
+use crate::fuse::{self, FusionPipelines};
 use crate::pack::{packed_len, unpack_samples};
 use crate::transfer::{download_buffer, upload_tile};
 
@@ -22,19 +23,22 @@ struct Pipeline {
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
-/// [`TileBackend`] implementation for the harness kernel. The compute
-/// pipeline is built once, lazily, on first use; the bind group is rebuilt
-/// per call because each call uploads fresh buffers.
-pub struct HarnessBackend {
+/// [`TileBackend`] for this crate's kernels: `self_check`, `fuse_tile`,
+/// `warp_tile` and `warp_fuse_tile` on one type. Each pipeline is built
+/// lazily on first use; bind groups are rebuilt per call because each call
+/// uploads fresh buffers.
+pub struct GpuBackend {
     device: &'static SharedDevice,
     pipeline: OnceLock<Pipeline>,
+    fuse_pipelines: FusionPipelines,
 }
 
-impl HarnessBackend {
+impl GpuBackend {
     fn new(device: &'static SharedDevice) -> Self {
-        HarnessBackend {
+        GpuBackend {
             device,
             pipeline: OnceLock::new(),
+            fuse_pipelines: FusionPipelines::new(),
         }
     }
 
@@ -107,7 +111,7 @@ impl HarnessBackend {
     }
 }
 
-impl TileBackend for HarnessBackend {
+impl TileBackend for GpuBackend {
     fn info(&self) -> BackendInfo {
         self.device.info().clone()
     }
@@ -198,13 +202,32 @@ impl TileBackend for HarnessBackend {
             samples,
         })
     }
+
+    fn fuse_tile(
+        &self,
+        reader: &dyn TileReader,
+        frame_count: usize,
+        rect: Rect,
+        samples_per_pixel: u32,
+        levels: u32,
+    ) -> Result<TileOutput, AlgorithmError> {
+        fuse::fuse_tile_gpu(
+            self.device,
+            reader,
+            &self.fuse_pipelines,
+            frame_count,
+            rect,
+            samples_per_pixel,
+            levels,
+        )
+    }
 }
 
-static HARNESS: OnceLock<HarnessBackend> = OnceLock::new();
+static GPU_BACKEND: OnceLock<GpuBackend> = OnceLock::new();
 
-/// The process-wide harness backend, built once atop [`shared_device`] --
-/// no test builds its own.
-pub fn harness_backend() -> Result<&'static HarnessBackend, &'static GpuError> {
+/// The process-wide GPU backend, built once atop [`shared_device`] -- no
+/// test builds its own.
+pub fn gpu_backend() -> Result<&'static GpuBackend, &'static GpuError> {
     let device = shared_device()?;
-    Ok(HARNESS.get_or_init(|| HarnessBackend::new(device)))
+    Ok(GPU_BACKEND.get_or_init(|| GpuBackend::new(device)))
 }

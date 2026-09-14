@@ -23,6 +23,20 @@ pub const REQUIRED_FEATURES: wgpu::Features = wgpu::Features::empty();
 /// `max_compute_workgroups_per_dimension = 65,535`). Every headroom above is
 /// at least 8x, so nothing here needs raising; a kernel that needs more
 /// raises a specific limit from this stated baseline.
+///
+/// The fusion kernels are measured against the same baseline, and stay
+/// under it too. The widest kernel, `select` (`crates/gpu/src/fuse/select.wgsl`),
+/// binds 4 storage buffers + 1 uniform (`max_storage_buffers_per_shader_stage
+/// = 4`, exactly at the floor -- the natural 5-buffer selection needed
+/// interleaving `best`'s score and winner into one `array<Best>` to fit).
+/// Its largest `f32`-plane buffer at the golden 448/5 geometry (a
+/// 352x352x3 base plane) is 352*352*3*4 = 1,486,848 bytes, two orders of
+/// magnitude under `max_storage_buffer_binding_size`. Every dispatch still
+/// uses `@workgroup_size(64)`, and the largest single dispatch
+/// (`plane_from_u16`/`plane_to_u16` over that same tile) needs
+/// `ceil(352*352*3/2/64) = 2,893` workgroups, still under
+/// `max_compute_workgroups_per_dimension`, so no limit here needs raising
+/// for them either.
 pub fn required_limits() -> wgpu::Limits {
     wgpu::Limits::downlevel_defaults()
 }
