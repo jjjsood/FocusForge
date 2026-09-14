@@ -66,6 +66,34 @@ pub struct FusionGeometry {
     pub description: Option<String>,
 }
 
+impl FusionGeometry {
+    /// The rect both output files are declared at: the crop when there is
+    /// one, otherwise the whole frame -- the one computation `create`,
+    /// `reopen` and `resume` each need before doing anything else.
+    fn out_rect(&self) -> Rect {
+        self.crop.unwrap_or(Rect {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height,
+        })
+    }
+}
+
+/// Wraps `source` as this `algorithm`'s own [`AlgorithmError::Failed`] --
+/// the one error shape every fallible call in this module converges on,
+/// from `ZMapInfo::new` failing to `TiffWriter::write_tile` refusing a
+/// tile. Takes `algorithm` first (not `self`) so `create`, `reopen` and
+/// `resume` can use it before a `FusionConsumer` exists.
+fn algorithm_error<E: std::fmt::Display>(
+    algorithm: &'static dyn StackAlgorithm,
+) -> impl Fn(E) -> AlgorithmError {
+    move |source| AlgorithmError::Failed {
+        algorithm: algorithm.id().to_string(),
+        detail: source.to_string(),
+    }
+}
+
 impl FusionConsumer {
     /// Creates the composite output file, and the Z-Map output file when
     /// `zmap_path` is `Some`, writing every created file's header now, ready
@@ -81,21 +109,14 @@ impl FusionConsumer {
         zmap_path: Option<&Path>,
         geometry: FusionGeometry,
     ) -> Result<Self, AlgorithmError> {
+        let out_rect = geometry.out_rect();
         let FusionGeometry {
-            width,
-            height,
             samples_per_pixel,
             frame_count,
             crop,
             description,
+            ..
         } = geometry;
-        let full_frame = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
-        let out_rect = crop.unwrap_or(full_frame);
         let composite = TiffWriter::create(
             composite_path,
             TiffSpec {
@@ -108,16 +129,9 @@ impl FusionConsumer {
         let zmap = match zmap_path {
             Some(zmap_path) => {
                 let zmap_info = ZMapInfo::new(out_rect.width, out_rect.height, frame_count)
-                    .map_err(|source| AlgorithmError::Failed {
-                        algorithm: algorithm.id().to_string(),
-                        detail: source.to_string(),
-                    })?;
-                let writer = ZMapWriter::create(zmap_path, zmap_info).map_err(|source| {
-                    AlgorithmError::Failed {
-                        algorithm: algorithm.id().to_string(),
-                        detail: source.to_string(),
-                    }
-                })?;
+                    .map_err(algorithm_error(algorithm))?;
+                let writer =
+                    ZMapWriter::create(zmap_path, zmap_info).map_err(algorithm_error(algorithm))?;
                 Some(writer)
             }
             None => None,
@@ -151,21 +165,14 @@ impl FusionConsumer {
         geometry: FusionGeometry,
         covered: &[Rect],
     ) -> Result<Self, AlgorithmError> {
+        let out_rect = geometry.out_rect();
         let FusionGeometry {
-            width,
-            height,
             samples_per_pixel,
             frame_count,
             crop,
             description,
+            ..
         } = geometry;
-        let full_frame = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
-        let out_rect = crop.unwrap_or(full_frame);
         let mut composite = TiffWriter::reopen(
             composite_path,
             TiffSpec {
@@ -181,16 +188,9 @@ impl FusionConsumer {
         let zmap = match zmap_path {
             Some(zmap_path) => {
                 let zmap_info = ZMapInfo::new(out_rect.width, out_rect.height, frame_count)
-                    .map_err(|source| AlgorithmError::Failed {
-                        algorithm: algorithm.id().to_string(),
-                        detail: source.to_string(),
-                    })?;
-                let mut writer = ZMapWriter::reopen(zmap_path, zmap_info).map_err(|source| {
-                    AlgorithmError::Failed {
-                        algorithm: algorithm.id().to_string(),
-                        detail: source.to_string(),
-                    }
-                })?;
+                    .map_err(algorithm_error(algorithm))?;
+                let mut writer =
+                    ZMapWriter::reopen(zmap_path, zmap_info).map_err(algorithm_error(algorithm))?;
                 for &rect in covered {
                     writer.seed_coverage(rect);
                 }
@@ -232,13 +232,7 @@ impl FusionConsumer {
         geometry: FusionGeometry,
     ) -> Result<(Self, Vec<usize>), AlgorithmError> {
         let crop = geometry.crop;
-        let full_frame = Rect {
-            x: 0,
-            y: 0,
-            width: geometry.width,
-            height: geometry.height,
-        };
-        let out_rect = crop.unwrap_or(full_frame);
+        let out_rect = geometry.out_rect();
         let probe = TiffWriter::reopen(
             composite_path,
             TiffSpec {
@@ -297,10 +291,7 @@ impl FusionConsumer {
             .expect("composite writer present");
         composite.finish()?;
         if let Some(zmap) = self.zmap.lock().unwrap().take() {
-            zmap.finish().map_err(|source| AlgorithmError::Failed {
-                algorithm: self.algorithm.id().to_string(),
-                detail: source.to_string(),
-            })?;
+            zmap.finish().map_err(algorithm_error(self.algorithm))?;
         }
         Ok(())
     }
@@ -398,10 +389,7 @@ impl TileConsumer for FusionConsumer {
         output
             .tile
             .crop_into(target, &mut cropped_composite)
-            .map_err(|source| AlgorithmError::Failed {
-                algorithm: self.algorithm.id().to_string(),
-                detail: source.to_string(),
-            })?;
+            .map_err(algorithm_error(self.algorithm))?;
 
         // The same arithmetic `reopen`'s coverage-seeding uses, via the one
         // shared `written_rect` function -- never a second, independently
@@ -421,10 +409,7 @@ impl TileConsumer for FusionConsumer {
             crop_zmap_into(&output.zmap, job.read_rect(), target, &mut cropped_zmap);
             zmap_writer
                 .write_tile(target_written, &cropped_zmap)
-                .map_err(|source| AlgorithmError::Failed {
-                    algorithm: self.algorithm.id().to_string(),
-                    detail: source.to_string(),
-                })?;
+                .map_err(algorithm_error(self.algorithm))?;
         }
 
         Ok(())

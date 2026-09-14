@@ -129,23 +129,14 @@ pub struct Job<'a> {
 }
 
 impl<'a> Job<'a> {
+    /// A fresh job over the scheduler's whole plan -- exactly
+    /// [`Self::resuming`] with an empty `completed` set, since a fresh job
+    /// is the degenerate case of a resume that has nothing to skip.
     pub fn new(scheduler: &'a TileScheduler<'a>) -> Self {
-        let tiles = scheduler.plan().tiles();
-        let unit_total = tiles.len();
-        let pixel_total: u64 = tiles.iter().map(tile_area).sum();
-
-        let control = JobControl::new();
-        control.set_unit_total(unit_total);
-        control.set_pixel_total(pixel_total);
-
-        Job {
-            scheduler,
-            remaining: tiles.to_vec(),
-            control,
-        }
+        Self::resuming(scheduler, &[])
     }
 
-    /// Builds a job that resumes from a fresh process: same body as
+    /// Builds a job that resumes from a fresh process: same totals as
     /// [`Self::new`], except `remaining` is the plan's tiles filtered by
     /// `!completed.contains(&tile.index())`, and the control is
     /// pre-credited with the completed units and their pixel area (via
