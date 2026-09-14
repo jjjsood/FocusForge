@@ -18,13 +18,11 @@ use focusforge_core::tile::{Rect, Tile};
 use crate::device::{GpuError, SharedDevice, shared_device};
 use crate::fuse::{self, FusionPipelines};
 use crate::pack::{packed_len, unpack_samples};
+use crate::pipeline::{
+    Pipeline, build_pipeline, run_pass, storage_entry, uniform_entry, upload_params,
+};
 use crate::transfer::{download_buffer, upload_tile};
 use crate::warp::{self, WarpPipelines};
-
-struct Pipeline {
-    compute: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-}
 
 /// [`TileBackend`] for this crate's kernels: `self_check`, `fuse_tile`,
 /// `warp_tile` and `warp_fuse_tile` on one type. Each pipeline is built
@@ -49,69 +47,17 @@ impl GpuBackend {
 
     fn pipeline(&self) -> &Pipeline {
         self.pipeline.get_or_init(|| {
-            let device = self.device.device();
-
-            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("focusforge-gpu-harness-gain"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("harness_gain.wgsl").into()),
-            });
-
-            let bind_group_layout =
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("focusforge-gpu-harness-bgl"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("focusforge-gpu-harness-pipeline-layout"),
-                bind_group_layouts: &[Some(&bind_group_layout)],
-                immediate_size: 0,
-            });
-
-            let compute = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("focusforge-gpu-harness-pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-            Pipeline {
-                compute,
-                bind_group_layout,
-            }
+            build_pipeline(
+                self.device.device(),
+                include_str!("harness_gain.wgsl"),
+                "focusforge-gpu-harness-gain",
+                "main",
+                &[
+                    storage_entry(0, true),
+                    storage_entry(1, false),
+                    uniform_entry(2),
+                ],
+            )
         })
     }
 }
@@ -156,47 +102,31 @@ impl TileBackend for GpuBackend {
         params[0..4].copy_from_slice(&word_count.to_le_bytes());
         params[4..8].copy_from_slice(&(sample_count as u32).to_le_bytes());
         params[8..12].copy_from_slice(&gain.to_le_bytes());
-        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("focusforge-gpu-harness-params"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&params_buffer, 0, &params);
+        let params_buffer = upload_params(device, queue, &params);
 
         let pipeline = self.pipeline();
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("focusforge-gpu-harness-bind-group"),
-            layout: &pipeline.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: src_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: dst_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("focusforge-gpu-harness-encoder"),
-        });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("focusforge-gpu-harness-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&pipeline.compute);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(word_count.div_ceil(64), 1, 1);
-        }
-        queue.submit(Some(encoder.finish()));
+        let entries = [
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: src_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: dst_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: params_buffer.as_entire_binding(),
+            },
+        ];
+        run_pass(
+            device,
+            queue,
+            pipeline,
+            &entries,
+            word_count,
+            "focusforge-gpu-harness-pass",
+        );
 
         let bytes = download_buffer(device, queue, &dst_buffer, byte_len);
         let samples = unpack_samples(&bytes, sample_count);

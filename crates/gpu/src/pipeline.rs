@@ -122,7 +122,7 @@ pub(crate) fn upload_params(
     bytes: &[u8],
 ) -> wgpu::Buffer {
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("focusforge-gpu-fuse-params"),
+        label: Some("focusforge-gpu-params"),
         size: bytes.len() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
