@@ -34,6 +34,12 @@ pub enum GpuError {
     /// failed.
     #[error("failed to create wgpu device: {0}")]
     RequestDevice(#[from] wgpu::RequestDeviceError),
+
+    /// A tile's own largest single buffer would exceed a hard device limit
+    /// (`crate::budget::buffer_limit_shortfalls`), refused before dispatch
+    /// rather than surfacing as a wgpu validation panic.
+    #[error("tile needs a buffer this device cannot allocate: {detail}")]
+    TileTooLarge { detail: String },
 }
 
 impl GpuError {
@@ -43,6 +49,25 @@ impl GpuError {
     pub fn limits_short(shortfalls: &[LimitShortfall]) -> Self {
         GpuError::LimitsShort {
             detail: describe_shortfalls(shortfalls),
+        }
+    }
+
+    /// Builds a [`GpuError::TileTooLarge`] naming the shortfall
+    /// (`describe_shortfalls`, so the message names the limit, the
+    /// requested size and the device's own limit -- `shared.limits()` is
+    /// what wgpu actually validates against) plus the adapter's own
+    /// headroom (`adapter_limits`) and the place to raise it
+    /// (`crate::limits::required_limits`), so a refusal never reads as "some
+    /// buffer was too big" with no path forward.
+    pub fn tile_too_large(shortfalls: &[LimitShortfall], adapter_limits: &wgpu::Limits) -> Self {
+        GpuError::TileTooLarge {
+            detail: format!(
+                "{}; the adapter itself allows up to max_storage_buffer_binding_size={} \
+                 max_buffer_size={} -- raise crate::limits::required_limits() to use more",
+                describe_shortfalls(shortfalls),
+                adapter_limits.max_storage_buffer_binding_size,
+                adapter_limits.max_buffer_size,
+            ),
         }
     }
 }
@@ -71,7 +96,6 @@ impl From<AdapterPath<wgpu::Adapter>> for Result<wgpu::Adapter, GpuError> {
 pub struct SharedDevice {
     #[allow(dead_code)]
     instance: Instance,
-    #[allow(dead_code)]
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -92,8 +116,22 @@ impl SharedDevice {
         &self.info
     }
 
+    /// The limits the device was actually created with -- `required_limits()`
+    /// (i.e. `wgpu::Limits::downlevel_defaults()`), never raised here. This
+    /// is what wgpu validates every allocation against, which is why the
+    /// device-budget's pre-dispatch refusal checks this value rather than
+    /// [`Self::adapter_limits`].
     pub fn limits(&self) -> &wgpu::Limits {
         &self.limits
+    }
+
+    /// What the adapter could offer if [`crate::limits::required_limits`]
+    /// were ever raised -- reported as headroom in the device-budget's
+    /// refusal message, never as the threshold itself (that is [`Self::limits`]).
+    /// `wgpu::Limits` by value, the same way `adapter.limits()` is already
+    /// used at [`init`]'s own shortfall check, above.
+    pub fn adapter_limits(&self) -> wgpu::Limits {
+        self.adapter.limits()
     }
 }
 

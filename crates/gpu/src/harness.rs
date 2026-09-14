@@ -15,6 +15,9 @@ use focusforge_core::align::{AlignError, Transform};
 use focusforge_core::gpu::{BackendInfo, TileBackend};
 use focusforge_core::tile::{Rect, Tile};
 
+use crate::budget::{
+    VramBudget, buffer_limit_shortfalls, device_bytes_per_tile, largest_buffer_bytes,
+};
 use crate::device::{GpuError, SharedDevice, shared_device};
 use crate::fuse::{self, FusionPipelines};
 use crate::pack::{packed_len, unpack_samples};
@@ -33,16 +36,43 @@ pub struct GpuBackend {
     pipeline: OnceLock<Pipeline>,
     fuse_pipelines: FusionPipelines,
     warp_pipelines: WarpPipelines,
+    /// The VRAM working-set budget: built eagerly (no `OnceLock`),
+    /// because [`VramBudget::acquire`] needs no geometry at construction --
+    /// each call takes the calling tile's own byte cost. See
+    /// [`Self::with_max_device_bytes`] for the non-singleton constructor a
+    /// test uses to drive a deliberately tiny ceiling.
+    budget: VramBudget,
 }
 
 impl GpuBackend {
     fn new(device: &'static SharedDevice) -> Self {
+        Self::with_budget(device, crate::budget::DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT)
+    }
+
+    fn with_budget(device: &'static SharedDevice, max_device_bytes: u64) -> Self {
         GpuBackend {
             device,
             pipeline: OnceLock::new(),
             fuse_pipelines: FusionPipelines::new(),
             warp_pipelines: WarpPipelines::new(),
+            budget: VramBudget::new(max_device_bytes),
         }
+    }
+
+    /// A second *backend* over the same `&'static SharedDevice` -- never a
+    /// second device -- for a test that needs an explicit budget the
+    /// process-wide [`gpu_backend`] singleton cannot provide. Never probes:
+    /// the budget is reported `Explicit`, exactly like a flag-capped
+    /// `HostBudget` one crate over (`crates/core/src/tile/budget.rs`).
+    pub fn with_max_device_bytes(max_device_bytes: u64) -> Result<GpuBackend, &'static GpuError> {
+        let device = shared_device()?;
+        Ok(GpuBackend::with_budget(device, max_device_bytes))
+    }
+
+    /// The budget wrapping [`Self::warp_fuse_tile`]'s dispatch -- the
+    /// observable a test reads `peak_in_flight()` / `limit_for()` off.
+    pub fn budget(&self) -> &VramBudget {
+        &self.budget
     }
 
     fn pipeline(&self) -> &Pipeline {
@@ -187,6 +217,34 @@ impl TileBackend for GpuBackend {
         samples_per_pixel: u32,
         levels: u32,
     ) -> Result<TileOutput, AlgorithmError> {
+        // Same identity test `stack_tile`'s per-frame check makes, folded
+        // into one flag for the whole tile's byte-cost model (`crate::budget`).
+        let warped = transforms.iter().any(|t| *t != Transform::identity());
+        let bytes = device_bytes_per_tile(
+            transforms.len(),
+            rect.width,
+            rect.height,
+            samples_per_pixel,
+            levels,
+            warped,
+        );
+        let largest = largest_buffer_bytes(rect.width, rect.height, samples_per_pixel, warped);
+
+        // Checked against the *device's* limits -- what wgpu actually
+        // validates an allocation against -- with the adapter's own
+        // headroom named in the refusal message, not used as the threshold.
+        let device_limits = self.device.limits();
+        let shortfalls = buffer_limit_shortfalls(
+            largest,
+            device_limits.max_storage_buffer_binding_size,
+            device_limits.max_buffer_size,
+        );
+        if !shortfalls.is_empty() {
+            let err = GpuError::tile_too_large(&shortfalls, &self.device.adapter_limits());
+            return Err(err.into());
+        }
+
+        let _permit = self.budget.acquire(bytes);
         crate::stack_tile::warp_fuse_tile_gpu(
             self.device,
             &self.warp_pipelines,

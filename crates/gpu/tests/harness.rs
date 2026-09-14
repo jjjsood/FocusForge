@@ -14,6 +14,8 @@
 
 mod common;
 
+#[path = "harness/budget_gpu.rs"]
+mod budget_gpu;
 #[path = "harness/device.rs"]
 mod device;
 #[path = "harness/parity.rs"]

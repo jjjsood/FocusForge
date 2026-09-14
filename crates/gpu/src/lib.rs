@@ -18,12 +18,19 @@
 //! \[warp\].
 //!
 //! `wgpu` is an optional dependency (`gpu = ["dep:wgpu", "dep:thiserror"]`,
-//! `crates/gpu/Cargo.toml`): [`adapter`], [`pack`] and [`warp_coords`]
-//! contain no `wgpu` type and stay compiled (and tested) with the feature
-//! off, which is what keeps the featureless build free of the `wgpu`
-//! compile.
+//! `crates/gpu/Cargo.toml`): [`adapter`], [`pack`], [`warp_coords`] and
+//! [`budget`] contain no `wgpu` type and stay compiled (and tested) with the
+//! feature off, which is what keeps the featureless build free of the `wgpu`
+//! compile. [`limits`] is a mixed module: `LimitShortfall` and
+//! `describe_shortfalls` name no `wgpu` type either and stay unconditional
+//! too, so [`budget`]'s pre-dispatch refusal can reuse them and be
+//! unit-tested in this same default gate; only the three items that do name
+//! `wgpu::Limits` are individually `#[cfg(feature = "gpu")]` inside that
+//! module.
 
 pub mod adapter;
+pub mod budget;
+pub mod limits;
 pub mod pack;
 pub mod warp_coords;
 
@@ -33,8 +40,6 @@ pub mod device;
 pub mod fuse;
 #[cfg(feature = "gpu")]
 pub mod harness;
-#[cfg(feature = "gpu")]
-pub mod limits;
 #[cfg(feature = "gpu")]
 pub(crate) mod pipeline;
 #[cfg(feature = "gpu")]
