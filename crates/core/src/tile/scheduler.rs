@@ -7,6 +7,19 @@
 //! empty) [`FramePreprocess`] hook per frame-tile, and handing the set to a
 //! [`TileConsumer`].
 //!
+//! # A consumer that supplies its own pixels
+//!
+//! A [`TileConsumer`] answering [`TileConsumer::supplies_own_pixels`] `true`
+//! (a GPU-backed consumer, for instance) skips this host read loop entirely -- it pulls
+//! its own, possibly footprint-grown, source rects instead of the
+//! scheduler's own destination read rect. Two consequences follow, both
+//! deliberate rather than papered over: [`TileRunReport::frame_tiles_read`]
+//! is `0` on that path, because the scheduler genuinely read no frame-tile;
+//! and the (currently empty) [`FramePreprocess`] hook is never called for
+//! that tile, since there is no frame-tile to run it over --
+//! [`TileScheduler::run_tiles`] refuses outright (rather than silently
+//! skipping) when a non-noop `FramePreprocess` meets such a consumer.
+//!
 //! # Memory budget
 //!
 //! The rayon pool is sized from `std::thread::available_parallelism()`
@@ -226,6 +239,11 @@ impl<'a> TileScheduler<'a> {
         preprocess: &dyn FramePreprocess,
         consumer: &dyn TileConsumer,
     ) -> Result<TileRunReport, TileError> {
+        let supplies_own_pixels = consumer.supplies_own_pixels();
+        if supplies_own_pixels && !preprocess.is_noop() {
+            return Err(TileError::PixelSupplyingConsumerNeedsNoopPreprocess);
+        }
+
         let scratch = ScratchDir::create_in(&self.scratch_base)?;
         let scratch_path = scratch.path().to_path_buf();
 
@@ -265,6 +283,17 @@ impl<'a> TileScheduler<'a> {
 
                     let outcome = (|| -> Result<(), TileError> {
                         let read_rect = planned.read();
+
+                        if supplies_own_pixels {
+                            let job = TileJob::without_frame_tiles(planned, &scratch_path);
+                            return consumer
+                                .consume(&job)
+                                .map_err(|source| TileError::Consumer {
+                                    rect: planned.interior(),
+                                    source,
+                                });
+                        }
+
                         let len =
                             read_rect.width as usize * read_rect.height as usize * spp as usize;
 

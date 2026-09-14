@@ -131,6 +131,66 @@ impl FusionConsumer {
         })
     }
 
+    /// The write tail: clips `output` against this consumer's crop (if any)
+    /// and writes both the composite and, when one was created, the Z-Map.
+    /// Extracted so a consumer that supplies its own pixels (never calling
+    /// `self.algorithm.fuse` itself) can still reuse this exact tail --
+    /// touches only [`TileJob::interior`]/[`TileJob::read_rect`], never
+    /// [`TileJob::ctx`], which is what makes that reuse possible.
+    pub fn write_output(
+        &self,
+        job: &TileJob<'_>,
+        output: &crate::algorithm::TileOutput,
+    ) -> Result<(), AlgorithmError> {
+        let interior = job.interior();
+        let spp = output.tile.samples_per_pixel;
+
+        // Clip this job's interior against the crop, in absolute frame
+        // coordinates: a tile wholly outside the crop writes nothing (both
+        // outputs were declared at the crop's dimensions in `create`, so
+        // there is nowhere for it to go), and a tile straddling the crop's
+        // edge writes only its inside part.
+        let target = match self.crop {
+            Some(crop) => match intersect(interior, crop) {
+                Some(clipped) => clipped,
+                None => return Ok(()),
+            },
+            None => interior,
+        };
+
+        let mut cropped_composite =
+            vec![0u16; target.width as usize * target.height as usize * spp as usize];
+        output
+            .tile
+            .crop_into(target, &mut cropped_composite)
+            .map_err(|source| AlgorithmError::Failed {
+                algorithm: self.algorithm.id().to_string(),
+                detail: source.to_string(),
+            })?;
+
+        let written_rect = translate_for_crop(target, self.crop);
+
+        self.composite
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("composite writer present")
+            .write_tile(written_rect, &cropped_composite)?;
+
+        if let Some(zmap_writer) = self.zmap.lock().unwrap().as_mut() {
+            let mut cropped_zmap = vec![0u16; target.width as usize * target.height as usize];
+            crop_zmap_into(&output.zmap, job.read_rect(), target, &mut cropped_zmap);
+            zmap_writer
+                .write_tile(written_rect, &cropped_zmap)
+                .map_err(|source| AlgorithmError::Failed {
+                    algorithm: self.algorithm.id().to_string(),
+                    detail: source.to_string(),
+                })?;
+        }
+
+        Ok(())
+    }
+
     /// Finishes the composite writer, and the Z-Map writer when one was
     /// created -- both already refuse an incompletely covered frame.
     pub fn finish(self) -> Result<(), AlgorithmError> {
@@ -205,53 +265,7 @@ fn translate_for_crop(rect: Rect, crop: Option<Rect>) -> Rect {
 impl TileConsumer for FusionConsumer {
     fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
         let output = self.algorithm.fuse(job.ctx(), &self.values)?;
-        let interior = job.interior();
-        let spp = output.tile.samples_per_pixel;
-
-        // Clip this job's interior against the crop, in absolute frame
-        // coordinates: a tile wholly outside the crop writes nothing (both
-        // outputs were declared at the crop's dimensions in `create`, so
-        // there is nowhere for it to go), and a tile straddling the crop's
-        // edge writes only its inside part.
-        let target = match self.crop {
-            Some(crop) => match intersect(interior, crop) {
-                Some(clipped) => clipped,
-                None => return Ok(()),
-            },
-            None => interior,
-        };
-
-        let mut cropped_composite =
-            vec![0u16; target.width as usize * target.height as usize * spp as usize];
-        output
-            .tile
-            .crop_into(target, &mut cropped_composite)
-            .map_err(|source| AlgorithmError::Failed {
-                algorithm: self.algorithm.id().to_string(),
-                detail: source.to_string(),
-            })?;
-
-        let written_rect = translate_for_crop(target, self.crop);
-
-        self.composite
-            .lock()
-            .unwrap()
-            .as_mut()
-            .expect("composite writer present")
-            .write_tile(written_rect, &cropped_composite)?;
-
-        if let Some(zmap_writer) = self.zmap.lock().unwrap().as_mut() {
-            let mut cropped_zmap = vec![0u16; target.width as usize * target.height as usize];
-            crop_zmap_into(&output.zmap, job.read_rect(), target, &mut cropped_zmap);
-            zmap_writer
-                .write_tile(written_rect, &cropped_zmap)
-                .map_err(|source| AlgorithmError::Failed {
-                    algorithm: self.algorithm.id().to_string(),
-                    detail: source.to_string(),
-                })?;
-        }
-
-        Ok(())
+        self.write_output(job, &output)
     }
 }
 

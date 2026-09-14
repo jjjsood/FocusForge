@@ -10,18 +10,19 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use focusforge_core::algorithm::AlignStatus;
+use focusforge_core::algorithm::{AlignStatus, StackAlgorithm};
 use focusforge_core::align::{
     FrameAlignment, ReferencePolicy, StackAlignment, Transform, WarpingReader, align_stack,
     auto_crop,
 };
 use focusforge_core::fuse::{
-    FusionConsumer, FusionGeometry, description::format_composite_description,
+    BackendFusionConsumer, FusionConsumer, FusionGeometry,
+    description::format_composite_description, laplacian::Laplacian,
 };
 use focusforge_core::io::{Rect, TiffStack, frame_paths};
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance, StackContext};
 use focusforge_core::registry;
-use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
+use focusforge_core::tile::{NoopPreprocess, TileConsumer, TileScheduler, TileSchedulerOptions};
 use serde::Serialize;
 
 use crate::align::{AlignOptions, AlignmentEntry, resolve_align_algo};
@@ -57,6 +58,10 @@ pub struct StackReport {
     pub crop: Option<Rect>,
     pub description: Option<String>,
     pub align: Option<StackAlignReport>,
+    /// `"cpu"`, or the selected adapter's [`focusforge_core::gpu::BackendInfo`]
+    /// display -- additive, so which path ran is machine-readable and not
+    /// only a stderr line.
+    pub backend: String,
 }
 
 /// `stack --json`'s `align` field: `null` when `--no-align` was given.
@@ -85,6 +90,7 @@ pub struct ParamReport {
 /// is declared `Option<String>` in `crate::Command::Stack` specifically so
 /// its absence reaches this function as `None` instead of aborting the
 /// process on clap's own usage error (exit 2, no knowledge of the registry).
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     dir: &Path,
     output: &Path,
@@ -93,6 +99,7 @@ pub fn run(
     json: bool,
     set: &SetArgs,
     align_opts: &AlignOptions<'_>,
+    no_gpu: bool,
 ) -> ExitCode {
     let start = Instant::now();
 
@@ -117,6 +124,20 @@ pub fn run(
             Ok(algo) => algo,
             Err(err) => return crate::fail(err),
         },
+    };
+
+    // `Laplacian` (`crates/core/src/gpu.rs`'s own doc comment: "the WGSL
+    // twin of ... `Laplacian::fuse`"). Every other registered algorithm
+    // (`weighted-average`, `depth-map`, and any test-only one) has no GPU
+    // implementation and must stay on the CPU path regardless of whether a
+    // usable adapter exists -- resolving (and reporting) a backend at all is
+    // therefore gated on the selected algorithm's own id, compared against
+    // `Laplacian`'s own `id()` rather than a bare string literal repeated
+    // here.
+    let backend = if algo.id() == Laplacian.id() {
+        crate::resolve_backend(no_gpu)
+    } else {
+        None
     };
 
     // Step 3: parse `--set` against that schema. An unknown key or an
@@ -311,16 +332,25 @@ pub fn run(
         .iter()
         .map(|f| f.transform)
         .collect();
-    let warping_reader = WarpingReader::new(&stack, (width, height), spp, transforms);
+    let warping_reader = WarpingReader::new(&stack, (width, height), spp, transforms.clone());
 
     // Builds the scheduler over the warping reader -- bit-identical to
     // `&stack` when every transform is identity (the decorator's own
     // short-circuit), which is what keeps `--no-align --no-crop` byte for
     // byte with the unaligned path. `TileError::NoInterior` fires here, if
     // it fires at all, before any tile is read.
+    //
+    // With a backend selected, the scheduler is built over `&stack` (the
+    // raw reader) instead: the GPU path pulls its own footprint-grown
+    // source rects through `BackendFusionConsumer` and must not receive
+    // CPU-warped pixels.
     let mut options = TileSchedulerOptions::new(".scratch");
     options.levels = levels;
-    let scheduler = match TileScheduler::new(&warping_reader, stack_ctx, spp, &options) {
+    let reader: &dyn focusforge_core::algorithm::TileReader = match &backend {
+        Some(_) => &stack,
+        None => &warping_reader,
+    };
+    let scheduler = match TileScheduler::new(reader, stack_ctx, spp, &options) {
         Ok(scheduler) => scheduler,
         Err(err) => return crate::fail(err),
     };
@@ -341,21 +371,29 @@ pub fn run(
         description: description.clone(),
     };
 
-    let consumer = match FusionConsumer::create(
+    let sink = match FusionConsumer::create(
         algo,
         values.clone(),
         &composite_partial,
         zmap_partial.as_deref(),
         geometry,
     ) {
-        Ok(consumer) => consumer,
+        Ok(sink) => sink,
         Err(err) => {
             cleanup_partials(&composite_partial, zmap_partial.as_deref());
             return crate::fail(err);
         }
     };
 
-    let run_report = match scheduler.run(&NoopPreprocess, &consumer) {
+    let backend_consumer = backend.map(|b| {
+        BackendFusionConsumer::new(b, &stack, (width, height), transforms, spp, levels, &sink)
+    });
+    let consumer: &dyn TileConsumer = match &backend_consumer {
+        Some(bc) => bc,
+        None => &sink,
+    };
+
+    let run_report = match scheduler.run(&NoopPreprocess, consumer) {
         Ok(report) => report,
         Err(err) => {
             cleanup_partials(&composite_partial, zmap_partial.as_deref());
@@ -363,7 +401,7 @@ pub fn run(
         }
     };
 
-    if let Err(err) = consumer.finish() {
+    if let Err(err) = sink.finish() {
         cleanup_partials(&composite_partial, zmap_partial.as_deref());
         return crate::fail(err);
     }
@@ -441,6 +479,9 @@ pub fn run(
         crop: applied_crop,
         description,
         align: align_report,
+        backend: backend
+            .map(|b| b.info().to_string())
+            .unwrap_or_else(|| "cpu".to_string()),
     };
 
     if json {
@@ -562,6 +603,7 @@ fn render(report: &StackReport) -> String {
         "tile_size={} levels={} margin={} tiles={} in_flight_limit={}",
         report.tile_size, report.levels, report.margin, report.tiles, report.in_flight_limit,
     ));
+    lines.push(format!("backend: {}", report.backend));
     for output in &report.outputs {
         lines.push(format!("wrote: {output}"));
     }
@@ -608,6 +650,7 @@ mod tests {
             crop: None,
             description: None,
             align: None,
+            backend: "cpu".to_string(),
         }
     }
 
@@ -630,6 +673,7 @@ mod tests {
             "wrote: out.tif",
             "wrote: out-zmap.tif",
             "wall: 1.500s",
+            "backend: cpu",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }

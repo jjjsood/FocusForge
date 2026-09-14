@@ -164,6 +164,7 @@ off:
 | `--no-crop` | skip the auto-crop: the output stays at the full frame extent even with alignment on |
 | `--align-algo <ALGO>` | alignment algorithm id; optional, defaults to the sole registered alignment algorithm |
 | `--align-set <KEY=VALUE>` | set one alignment parameter, repeatable; separate from `--set`, which is the stacking algorithm's own |
+| `--no-gpu` | force the CPU path even when a usable GPU adapter is present; only exists when the binary was built with `--features gpu` |
 
 Every algorithm also writes a **Z-Map** when `--zmap` is given: a
 single-channel 16-bit TIFF with one value per output pixel naming the index
@@ -182,17 +183,37 @@ how to soften that. An empty auto-crop (the frames' footprints do not
 intersect) is refused before any output file is created, naming `--no-crop`
 as the way through.
 
+**GPU use is automatic, never an opt-in flag.** Built with `--features
+gpu`, `stack` uses a usable GPU adapter automatically for the `laplacian`
+algorithm — the only one with a GPU implementation; `weighted-average` and
+`depth-map` always run on the CPU. `--no-gpu` forces the CPU path
+regardless of algorithm. A missing or unusable adapter falls back to the
+CPU path on its own, printing why on stderr, never silently and never as a
+hard failure. Either path produces the same result — every GPU kernel is
+proven to match its CPU twin to within 1 LSB at 16-bit — so switching
+backends changes speed, not the output; `stack --json`'s `backend` field
+names which one actually ran.
+
 ```
-$ focusforge-cli stack fixtures/mantis-64 -o .scratch/out.tif --algo laplacian --zmap .scratch/zmap.tif
+$ focusforge-cli stack fixtures/mantis-64 -o .scratch/out.tif --algo laplacian --zmap .scratch/zmap.tif --lax
 fixtures/mantis-64 (3 frames)
 64x64 3ch
 laplacian - Laplacian Pyramid
 levels = 4 (Auto)
 tile_size=512 levels=4 margin=48 tiles=1 in_flight_limit=32
+backend: cpu
 wrote: .scratch/out.tif
 wrote: .scratch/zmap.tif
-wall: 0.032s
+wall: 0.041s
 ```
+
+(`--lax` is needed on this fixture because two of its three frames diverge
+under `pyramidal-ecc` in strict mode; see
+[`guide/alignment.md`](../guide/alignment.md#failure-is-strict-by-default).
+`backend` reads `"cpu"` because this binary was built without `--features
+gpu`; built with it and a usable adapter present, it instead names the
+adapter, for example `NVIDIA GeForce RTX 5070 Ti (backend=Vulkan,
+driver=NVIDIA, driver_info=595.84)`.)
 
 ### `--json`
 
@@ -211,6 +232,8 @@ output extent — equal to `width`/`height` unless a crop was applied),
 otherwise the alignment algorithm's id, display name, parameters,
 reference frame, reference policy, failure policy, failure count and every
 frame's transform, in the same shape `align --json` reports (see below).
+Additive field from the GPU path: `backend` — `"cpu"`, or the selected
+adapter's name and driver info.
 
 ```json
 {
@@ -231,7 +254,8 @@ frame's transform, in the same shape `align --json` reports (see below).
   "in_flight_limit": 32,
   "peak_in_flight": 1,
   "outputs": [".scratch/out.tif", ".scratch/zmap.tif"],
-  "wall_seconds": 0.030267391
+  "wall_seconds": 0.030267391,
+  "backend": "cpu"
 }
 ```
 
@@ -253,6 +277,7 @@ Options:
 | `--json` | emit the frozen JSON report instead of human-readable text |
 | `--write-warped <DIR>` | write one warped TIFF per frame into `<DIR>`, at source dimensions, uncropped |
 | `--set <KEY=VALUE>` | set one algorithm parameter, repeatable; a repeated key keeps the last value |
+| `--no-gpu` | force the CPU path even when a usable GPU adapter is present; only exists when the binary was built with `--features gpu`. Meaningful only together with `--write-warped` — the ECC solver `align` reports on is CPU-only regardless |
 
 A frame whose registration diverges refuses the run, exit 1, naming every
 failed frame — this is the default, and it is not a flag; run

@@ -48,8 +48,8 @@
 //! `crate::fuse::pyramid::MEASURED_MARGIN[levels]` directly: the planner
 //! rounds the raw table up to the `2^levels` decimation grid, and that
 //! rounded value is what the tile geometry actually guarantees. See
-//! `score_radius` (`pub(crate)`, so the Depth Map can derive the same
-//! radii) for the implementation and
+//! `score_radius` (`pub`, so the Depth Map and `crates/gpu`'s WGSL twin
+//! can both derive the same radii) for the implementation and
 //! `tests::selection_reach_fits_the_measured_margin` for the inequality
 //! pinned at every level count `1..=MAX_LEVELS`.
 //!
@@ -238,21 +238,23 @@ fn clamp_edge(v: i64, dim: u32) -> u32 {
 /// before the per-level-count headroom clamp in [`score_radius`] is
 /// applied. See the module docs' "Selection rule" section for the full
 /// `W(N)`/`r_k` derivation.
-pub(crate) const SCORE_RADIUS: u32 = 8;
+pub const SCORE_RADIUS: u32 = 8;
 
 /// The windowed sharpness score's radius at pyramid `level` of a `levels`-
 /// deep pyramid: `W(N) = max(1, min(SCORE_RADIUS, headroom(N)))`,
 /// `headroom(N) = margin_for_levels(N) - 2*(2^N - 1)`, and
 /// `r_k = max(1, W(N) >> k)`. See the module docs' "Selection rule" section
 /// for why the headroom clamp exists and why the right shift is what makes
-/// the rule scale-invariant. `pub(crate)` because the Depth Map reuses
-/// the scoring rule rather than re-deriving it.
+/// the rule scale-invariant. `pub` because the Depth Map reuses the
+/// scoring rule rather than re-deriving it, and `crates/gpu`'s WGSL twin
+/// computes its per-level radius host-side from this same function rather
+/// than re-deriving it in a shader.
 ///
 /// Uses [`margin_for_levels`], **never** `pyramid::MEASURED_MARGIN[levels]`
 /// directly: the planner rounds the raw table up to the `2^levels`
 /// decimation grid, and that rounded value is what the tile geometry
 /// actually guarantees.
-pub(crate) fn score_radius(levels: u32, level: u32) -> u32 {
+pub fn score_radius(levels: u32, level: u32) -> u32 {
     let build_reach = 2 * ((1u32 << levels) - 1);
     let headroom = margin_for_levels(levels).saturating_sub(build_reach);
     let w = SCORE_RADIUS.min(headroom).max(1);
@@ -268,13 +270,11 @@ pub(crate) fn score_radius(levels: u32, level: u32) -> u32 {
 /// 68 adds per pixel (three-channel) rather than the nested form's 867. One
 /// `f32` per pixel, never per sample.
 ///
-/// `pub(crate)`, widened from module-private once it gained a second
-/// caller: `crate::fuse::weighted_average` and `crate::fuse::depth_map`
-/// both call this exact function (at their own radii) rather than
-/// reimplementing a second windowed sum, which is what makes all three
-/// algorithms comparable on the same fixture with the same sharpness
-/// measure.
-pub(crate) fn score_plane(level: &Plane, radius: u32) -> Vec<f32> {
+/// `pub` so [`crate::fuse::weighted_average`] and [`crate::fuse::depth_map`] call this exact
+/// function (at their own radii) instead of reimplementing a second windowed sum -- keeping all
+/// three algorithms comparable on the same fixture and measure -- and so `crates/gpu`'s parity
+/// tests can call the identical CPU twin their WGSL kernel is compared against.
+pub fn score_plane(level: &Plane, radius: u32) -> Vec<f32> {
     let width = level.width();
     let height = level.height();
     let spp = level.samples_per_pixel();

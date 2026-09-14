@@ -12,6 +12,7 @@
 //! rounding expression and the measured tile-overlap margin -- written so
 //! a GPU twin can be authored from it alone.
 
+pub mod backend_consumer;
 pub mod consumer;
 pub mod depth_map;
 pub mod description;
@@ -22,6 +23,7 @@ pub mod pyramid;
 mod sharpness;
 pub mod weighted_average;
 
+pub use backend_consumer::BackendFusionConsumer;
 pub use consumer::{FusionConsumer, FusionGeometry};
 pub use error::PyramidError;
 pub use pyramid::{

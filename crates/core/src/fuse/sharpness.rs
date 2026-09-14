@@ -2,8 +2,9 @@
 
 //! The one thing `weighted_average` and `depth_map` genuinely share: the
 //! level-0 detail plane both take their per-pixel sharpness measure from
-//! (via [`crate::fuse::laplacian::score_plane`], `pub(crate)` for exactly
-//! this reuse), its pinned reach constant, and the inversion of
+//! (via [`crate::fuse::laplacian::score_plane`], `pub` so `crates/gpu`'s
+//! parity tests can call it too), its pinned reach constant, and the
+//! inversion of
 //! [`crate::tile::plan::margin_for_levels`] both algorithms' `tile_levels`
 //! overrides need. Nothing algorithm-specific lives here -- no weight
 //! formula, no tie-break, no degenerate-input rule.
@@ -14,7 +15,7 @@ use crate::tile::plan::{MAX_LEVELS, margin_for_levels};
 
 /// The build-plus-expand reach of a **one**-level pyramid: `2 * (2^1 - 1)`,
 /// the same expression [`crate::fuse::laplacian::score_radius`] evaluates at
-/// `levels = 1`. Both new algorithms build no deeper than one level --
+/// `levels = 1`. Both algorithms build no deeper than one level --
 /// `L_0 = base - expand(reduce(base))` does not depend on how many further
 /// levels a caller would go on to build -- so this is always the detail
 /// plane's own reach, never a function of anything else.
