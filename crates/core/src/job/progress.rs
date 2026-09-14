@@ -25,8 +25,8 @@ pub struct JobProgress {
     /// The sum of every *planned* unit's read-rect area.
     pub pixel_total: u64,
     /// Accumulated wall-clock time actually spent running -- never
-    /// including time spent paused (`JobControl::add_running` is only ever
-    /// called with one segment's own elapsed time).
+    /// including time spent paused (`JobControl::begin_segment`/
+    /// `end_segment` bracket exactly one segment's own elapsed time).
     pub running: Duration,
     pub eta: Option<Duration>,
 }
@@ -38,8 +38,9 @@ pub struct JobProgress {
 /// last interior is 56 px against a 152 px interior; at reference geometry a
 /// 440 px tail against 512). Consumes the *accumulated* running time, never
 /// `Instant::now() - start`, so a caller-side pause does not inflate the
-/// estimate -- it is the caller's job (`JobControl::add_running`) to make
-/// sure `running` only ever grows while a segment is actually executing.
+/// estimate -- it is the caller's job (`JobControl::begin_segment`/
+/// `end_segment`) to make sure `running` only ever grows while a segment is
+/// actually executing.
 ///
 /// `None` while `pixels_done == 0` **or** while `running` is zero -- an
 /// `Option`, never a zero standing in for "unknown". Both guards are needed

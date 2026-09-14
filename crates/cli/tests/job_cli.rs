@@ -128,6 +128,30 @@ fn read_pixels(path: &Path) -> Vec<u8> {
     std::fs::read(path).expect("output file must be readable")
 }
 
+/// `stack <dir> -o <output> --algo laplacian --no-align --no-crop --tile-size
+/// 160 --set levels=3 --max-bytes-in-flight 1` -- the single-worker recipe
+/// this module's own doc comment explains (25 units against
+/// `fixtures/mantis-512`'s 4-tile default plan), assembled once so every
+/// interruptible-run test stops repeating it verbatim.
+fn interruptible_stack_args<'a>(dir: &'a str, output: &'a str) -> Vec<&'a str> {
+    vec![
+        "stack",
+        dir,
+        "-o",
+        output,
+        "--algo",
+        "laplacian",
+        "--no-align",
+        "--no-crop",
+        "--tile-size",
+        "160",
+        "--set",
+        "levels=3",
+        "--max-bytes-in-flight",
+        "1",
+    ]
+}
+
 #[test]
 fn stack_output_is_unchanged_under_the_job_engine() {
     use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
@@ -200,24 +224,10 @@ fn stack_output_is_unchanged_under_the_job_engine() {
 fn progress_line_contains_units_stage_and_eta() {
     let dir = tmp_dir("job_cli_progress_line");
     let output = dir.join("out.tif");
+    let mantis = mantis_512_dir();
     let out = run_cli_in(
         &dir,
-        &[
-            "stack",
-            mantis_512_dir().to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-            "--algo",
-            "laplacian",
-            "--no-align",
-            "--no-crop",
-            "--tile-size",
-            "160",
-            "--set",
-            "levels=3",
-            "--max-bytes-in-flight",
-            "1",
-        ],
+        &interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap()),
     );
     assert!(out.success, "stderr: {}", out.stderr);
     let has_line = out
@@ -255,24 +265,10 @@ fn fuse_counts(stderr: &str) -> Vec<(usize, usize)> {
 fn progress_advances_during_an_uninterrupted_run() {
     let dir = tmp_dir("job_cli_progress_advances");
     let output = dir.join("out.tif");
+    let mantis = mantis_512_dir();
     let out = run_cli_in(
         &dir,
-        &[
-            "stack",
-            mantis_512_dir().to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-            "--algo",
-            "laplacian",
-            "--no-align",
-            "--no-crop",
-            "--tile-size",
-            "160",
-            "--set",
-            "levels=3",
-            "--max-bytes-in-flight",
-            "1",
-        ],
+        &interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap()),
     );
     assert!(out.success, "stderr: {}", out.stderr);
 
@@ -323,24 +319,10 @@ fn progress_to_a_file_has_no_escape_sequences() {
     let dir = tmp_dir("job_cli_progress_no_escapes");
     let output = dir.join("out.tif");
     let start = std::time::Instant::now();
+    let mantis = mantis_512_dir();
     let out = run_cli_in(
         &dir,
-        &[
-            "stack",
-            mantis_512_dir().to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-            "--algo",
-            "laplacian",
-            "--no-align",
-            "--no-crop",
-            "--tile-size",
-            "160",
-            "--set",
-            "levels=3",
-            "--max-bytes-in-flight",
-            "1",
-        ],
+        &interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap()),
     );
     let elapsed = start.elapsed().as_secs_f64();
     assert!(out.success, "stderr: {}", out.stderr);
@@ -398,24 +380,10 @@ mod unix_signals {
     fn sigint_cancels_cleanly() {
         let dir = tmp_dir("job_cli_sigint_cancel");
         let output = dir.join("out.tif");
+        let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &dir,
-            &[
-                "stack",
-                mantis_512_dir().to_str().unwrap(),
-                "-o",
-                output.to_str().unwrap(),
-                "--algo",
-                "laplacian",
-                "--no-align",
-                "--no-crop",
-                "--tile-size",
-                "160",
-                "--set",
-                "levels=3",
-                "--max-bytes-in-flight",
-                "1",
-            ],
+            &interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap()),
         );
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let first = read_line(&mut stderr);
@@ -467,22 +435,7 @@ mod unix_signals {
         let dir = tmp_dir("job_cli_resume_interrupted");
         let output = dir.join("out.tif");
         let mantis_dir = mantis_512_dir();
-        let args = [
-            "stack",
-            mantis_dir.to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-            "--algo",
-            "laplacian",
-            "--no-align",
-            "--no-crop",
-            "--tile-size",
-            "160",
-            "--set",
-            "levels=3",
-            "--max-bytes-in-flight",
-            "1",
-        ];
+        let args = interruptible_stack_args(mantis_dir.to_str().unwrap(), output.to_str().unwrap());
         let mut child = spawn_piped(&dir, &args);
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let _first = read_line(&mut stderr);
@@ -512,24 +465,10 @@ mod unix_signals {
     fn second_sigint_exits_immediately() {
         let dir = tmp_dir("job_cli_second_sigint");
         let output = dir.join("out.tif");
+        let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &dir,
-            &[
-                "stack",
-                mantis_512_dir().to_str().unwrap(),
-                "-o",
-                output.to_str().unwrap(),
-                "--algo",
-                "laplacian",
-                "--no-align",
-                "--no-crop",
-                "--tile-size",
-                "160",
-                "--set",
-                "levels=3",
-                "--max-bytes-in-flight",
-                "1",
-            ],
+            &interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap()),
         );
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let _first = read_line(&mut stderr);
@@ -607,24 +546,10 @@ mod unix_signals {
     fn sigusr1_pauses_the_run_and_a_second_one_resumes_it() {
         let dir = tmp_dir("job_cli_sigusr1_pause");
         let output = dir.join("out.tif");
+        let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &dir,
-            &[
-                "stack",
-                mantis_512_dir().to_str().unwrap(),
-                "-o",
-                output.to_str().unwrap(),
-                "--algo",
-                "laplacian",
-                "--no-align",
-                "--no-crop",
-                "--tile-size",
-                "160",
-                "--set",
-                "levels=3",
-                "--max-bytes-in-flight",
-                "1",
-            ],
+            &interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap()),
         );
         let start = Instant::now();
         let (lines, reader) = read_stamped(child.stderr.take().unwrap(), start);
@@ -722,22 +647,7 @@ mod unix_signals {
         let dir = tmp_dir("job_cli_resume_changed_inputs");
         let stack_dir = copy_fixture_frames(&dir.join("stack"));
         let output = dir.join("out.tif");
-        let args = [
-            "stack",
-            stack_dir.to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-            "--algo",
-            "laplacian",
-            "--no-align",
-            "--no-crop",
-            "--tile-size",
-            "160",
-            "--set",
-            "levels=3",
-            "--max-bytes-in-flight",
-            "1",
-        ];
+        let args = interruptible_stack_args(stack_dir.to_str().unwrap(), output.to_str().unwrap());
         let mut child = spawn_piped(&dir, &args);
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let _first = read_line(&mut stderr);
@@ -862,24 +772,10 @@ mod unix_signals {
         // Cancelled: 130.
         let cancel_dir = tmp_dir("job_cli_exit_cancel");
         let cancel_output = cancel_dir.join("out.tif");
+        let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &cancel_dir,
-            &[
-                "stack",
-                mantis_512_dir().to_str().unwrap(),
-                "-o",
-                cancel_output.to_str().unwrap(),
-                "--algo",
-                "laplacian",
-                "--no-align",
-                "--no-crop",
-                "--tile-size",
-                "160",
-                "--set",
-                "levels=3",
-                "--max-bytes-in-flight",
-                "1",
-            ],
+            &interruptible_stack_args(mantis.to_str().unwrap(), cancel_output.to_str().unwrap()),
         );
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let _first = read_line(&mut stderr);
@@ -1156,26 +1052,11 @@ fn tuning_flags_reach_the_scheduler() {
 
     let tuned_dir = tmp_dir("job_cli_tuning_tuned");
     let tuned_output = tuned_dir.join("out.tif");
-    let tuned_run = run_cli_in(
-        &tuned_dir,
-        &[
-            "stack",
-            mantis_512_dir().to_str().unwrap(),
-            "-o",
-            tuned_output.to_str().unwrap(),
-            "--algo",
-            "laplacian",
-            "--no-align",
-            "--no-crop",
-            "--tile-size",
-            "160",
-            "--set",
-            "levels=3",
-            "--max-bytes-in-flight",
-            "1",
-            "--json",
-        ],
-    );
+    let mantis = mantis_512_dir();
+    let mut tuned_args =
+        interruptible_stack_args(mantis.to_str().unwrap(), tuned_output.to_str().unwrap());
+    tuned_args.push("--json");
+    let tuned_run = run_cli_in(&tuned_dir, &tuned_args);
     assert!(tuned_run.success, "stderr: {}", tuned_run.stderr);
     let tuned_report: serde_json::Value = serde_json::from_str(&tuned_run.stdout).unwrap();
 
