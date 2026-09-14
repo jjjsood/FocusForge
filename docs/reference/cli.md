@@ -195,7 +195,7 @@ backends changes speed, not the output; `stack --json`'s `backend` field
 names which one actually ran.
 
 ```
-$ focusforge-cli stack fixtures/mantis-64 -o .scratch/out.tif --algo laplacian --zmap .scratch/zmap.tif --lax
+$ focusforge-cli stack fixtures/mantis-64 -o .scratch/out.tif --algo laplacian --zmap .scratch/zmap.tif --no-align
 fixtures/mantis-64 (3 frames)
 64x64 3ch
 laplacian - Laplacian Pyramid
@@ -204,16 +204,18 @@ tile_size=512 levels=4 margin=48 tiles=1 in_flight_limit=32
 backend: cpu
 wrote: .scratch/out.tif
 wrote: .scratch/zmap.tif
-wall: 0.041s
+wall: 0.047s
 ```
 
-(`--lax` is needed on this fixture because two of its three frames diverge
-under `pyramidal-ecc` in strict mode; see
-[`guide/alignment.md`](../guide/alignment.md#failure-is-strict-by-default).
-`backend` reads `"cpu"` because this binary was built without `--features
-gpu`; built with it and a usable adapter present, it instead names the
-adapter, for example `NVIDIA GeForce RTX 5070 Ti (backend=Vulkan,
-driver=NVIDIA, driver_info=595.84)`.)
+(`--no-align` keeps this example to the fusion stage the backend field is
+about; `mantis-64`'s own frames diverge under the default `pyramidal-ecc`
+alignment in strict mode, so a real run without either `--no-align` or a
+softened failure policy would refuse instead — see
+[`guide/alignment.md`](../guide/alignment.md#failure-is-strict-by-default) for
+what that policy is and why it defaults to strict. `backend` reads `"cpu"`
+because this binary was built without `--features gpu`; built with it and a
+usable adapter present, it instead names the adapter, for example `NVIDIA
+GeForce RTX 5070 Ti (backend=Vulkan, driver=NVIDIA, driver_info=595.84)`.)
 
 ### `--json`
 
