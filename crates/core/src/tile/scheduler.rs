@@ -408,6 +408,13 @@ impl<'a> TileScheduler<'a> {
                     match outcome {
                         Ok(()) => {
                             completed[planned.index()].store(true, Ordering::SeqCst);
+                            // Per-unit, on the worker that ran it: this is
+                            // what makes a polled `JobProgress` advance
+                            // during the run instead of only when the
+                            // segment ends.
+                            let read_rect = planned.read();
+                            control
+                                .unit_completed(read_rect.width as u64 * read_rect.height as u64);
                             Ok(())
                         }
                         Err(e) => {

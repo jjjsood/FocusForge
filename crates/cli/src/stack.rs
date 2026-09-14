@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use focusforge_core::algorithm::AlignStatus;
@@ -19,13 +20,20 @@ use focusforge_core::fuse::{
     FusionConsumer, FusionGeometry, description::format_composite_description,
 };
 use focusforge_core::io::{Rect, TiffStack, frame_paths};
+use focusforge_core::job::{
+    AlignIdentity, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobOutcome, JobRecord,
+    RecordingConsumer, Resumable, ResumeStore, StackFingerprint,
+};
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance, StackContext};
 use focusforge_core::registry;
 use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 use serde::Serialize;
 
 use crate::align::{AlignOptions, AlignmentEntry, resolve_align_algo};
+use crate::job::{self, JobOptions};
+use crate::progress::{ProgressMode, ProgressRenderer};
 use crate::set::{SetArgs, parse_settings};
+use crate::signals;
 
 /// The `stack --json` document; fields are only ever added, never removed
 /// or renamed.
@@ -85,6 +93,7 @@ pub struct ParamReport {
 /// is declared `Option<String>` in `crate::Command::Stack` specifically so
 /// its absence reaches this function as `None` instead of aborting the
 /// process on clap's own usage error (exit 2, no knowledge of the registry).
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     dir: &Path,
     output: &Path,
@@ -93,8 +102,15 @@ pub fn run(
     json: bool,
     set: &SetArgs,
     align_opts: &AlignOptions<'_>,
+    job_opts: &JobOptions,
+    argv: &[String],
 ) -> ExitCode {
     let start = Instant::now();
+    let mut renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.quiet));
+    let signals = match signals::install(true) {
+        Ok(signals) => signals,
+        Err(msg) => return crate::fail(msg),
+    };
 
     // Step 2: resolve the algorithm first, before anything else -- an
     // unknown or missing id is refused before the input directory (which
@@ -204,15 +220,51 @@ pub fn run(
     // trait method.
     let levels = algo.tile_levels(&values);
 
+    // Header-only stack fingerprint -- cheap, needed both to peek a
+    // resumable ledger below and to build this run's own `JobRecord`.
+    let fingerprint = StackFingerprint {
+        frames: (0..stack.len())
+            .map(|i| FrameFingerprint::from(stack.header(i)))
+            .collect(),
+    };
+
+    // Step 6: scheduler tuning flags, before alignment -- they reach the
+    // scheduler regardless of whether alignment runs at all.
+    let mut options = TileSchedulerOptions::new(".scratch");
+    options.levels = levels;
+    if let Some(tile_size) = job_opts.tile_size {
+        options.tile_size = tile_size;
+    }
+    if let Some(max_bytes_in_flight) = job_opts.max_bytes_in_flight {
+        options.max_bytes_in_flight = max_bytes_in_flight;
+    }
+
     // Alignment, between the stack algorithm's own parameters and the
     // scheduler build. Computed *before* any output file exists: a
     // strict-mode failure refuses here.
-    let alignment_result: Option<(
+    //
+    // `used_peeked_alignment`: when `--resume` finds a matching,
+    // already-recorded alignment under `.scratch/resume/`
+    // (`peek_resumable_crop_and_alignment`), `align_stack` is skipped
+    // entirely -- both its ~240s reference-scale cost and the stage line
+    // below -- and the ledger's own recorded `StackAlignment` is reused
+    // verbatim, so a resumed run's coordinates can never drift from the
+    // tiles the interrupted run already wrote. `crop_rect_value` below is
+    // *always* recomputed via `auto_crop`, peeked or not: it is cheap, pure
+    // geometry over whichever `StackAlignment` is in hand, so it never
+    // needs peeking of its own, and computing it consistently the same way
+    // every time is what keeps a resumed run's composite/Z-Map header
+    // byte-identical to the interrupted run's.
+    let mut align_identity: Option<AlignIdentity> = None;
+    let mut alignment_result: Option<(
         &'static dyn focusforge_core::algorithm::AlignAlgorithm,
         StackAlignment,
         ParamValues,
         Vec<ParamReport>,
-    )> = if align_opts.align {
+    )> = None;
+    let mut used_peeked_alignment = false;
+
+    if align_opts.align {
         let align_algo = match resolve_align_algo(align_opts.algo) {
             Ok(a) => a,
             Err(msg) => return crate::fail(msg),
@@ -243,37 +295,93 @@ pub fn run(
                 provenance: r.provenance,
             })
             .collect();
-        let policy = if align_opts.lax {
-            focusforge_core::align::FailurePolicy::IdentityFallback
+        let identity = AlignIdentity {
+            algorithm: align_algo.id().to_string(),
+            params: align_values.clone(),
+        };
+        align_identity = Some(identity.clone());
+
+        let peeked = if job_opts.resume {
+            peek_resumable_crop_and_alignment(
+                Path::new(".scratch"),
+                &fingerprint,
+                options.tile_size,
+                options.levels,
+                algo.id(),
+                &values,
+                Some(&identity),
+            )
         } else {
-            focusforge_core::align::FailurePolicy::Strict
+            None
         };
-        let result = match align_stack(align_algo, stack_ctx, &stack, &align_values, policy) {
-            Ok(r) => r,
-            Err(err) => return crate::fail(err),
-        };
-        if !align_opts.lax && result.failure_count() > 0 {
-            let names: Vec<String> = result
-                .failed()
-                .map(|f| format!("{} ({:?})", frame_names[f.frame], f.status))
-                .collect();
-            return crate::fail(format!(
-                "alignment failed for {} frame(s): {}",
-                names.len(),
-                names.join(", ")
-            ));
+
+        if let Some(peeked) = peeked.filter(|p| p.alignment.is_some()) {
+            let result = peeked.alignment.expect("filtered to Some above");
+            used_peeked_alignment = true;
+            alignment_result = Some((align_algo, result, align_values, align_params));
+        } else {
+            let policy = if align_opts.lax {
+                focusforge_core::align::FailurePolicy::IdentityFallback
+            } else {
+                focusforge_core::align::FailurePolicy::Strict
+            };
+            // Step 9: `align_stack` has no unit boundary -- a scoped
+            // watcher thread prints the cancellation notice the moment a
+            // SIGINT is observed, so the terminal never looks hung for the
+            // whole alignment's wall time, and once it returns, a still-set
+            // cancel exits 130 before anything is created (below).
+            renderer.stage(&format!("align {} frames (no unit progress)", stack.len()));
+            let done = AtomicBool::new(false);
+            let solved = std::thread::scope(|scope| {
+                let watcher = scope.spawn(|| {
+                    let mut warned = false;
+                    while !done.load(Ordering::SeqCst) {
+                        std::thread::sleep(job::POLL);
+                        if !warned && signals.cancel.load(Ordering::SeqCst) {
+                            eprintln!(
+                                "cancel requested -- alignment has no unit boundary; \
+                                 stopping at the fuse stage (Ctrl-C again to abort now)"
+                            );
+                            warned = true;
+                        }
+                    }
+                });
+                let result = align_stack(align_algo, stack_ctx, &stack, &align_values, policy);
+                done.store(true, Ordering::SeqCst);
+                watcher.join().expect("align watcher thread must not panic");
+                result
+            });
+            if signals.cancel.load(Ordering::SeqCst) {
+                return ExitCode::from(130);
+            }
+            let result = match solved {
+                Ok(r) => r,
+                Err(err) => return crate::fail(err),
+            };
+            if !align_opts.lax && result.failure_count() > 0 {
+                let names: Vec<String> = result
+                    .failed()
+                    .map(|f| format!("{} ({:?})", frame_names[f.frame], f.status))
+                    .collect();
+                return crate::fail(format!(
+                    "alignment failed for {} frame(s): {}",
+                    names.len(),
+                    names.join(", ")
+                ));
+            }
+            alignment_result = Some((align_algo, result, align_values, align_params));
         }
-        Some((align_algo, result, align_values, align_params))
-    } else {
-        None
-    };
+    }
 
     // The alignment used to compute the crop and to drive the tile reader:
     // the real result when aligned, or an all-identity one otherwise --
     // `--no-align` with the crop left on still trims the kernel-radius
     // margin (the two flags are independent), and going through the same
-    // `auto_crop` call in both cases is what guarantees the rect matches
-    // what `align --json` reports for the same stack.
+    // `auto_crop` call in both cases (peeked alignment or not: `auto_crop`
+    // is cheap, pure geometry, never the expensive part) is what guarantees
+    // the rect matches what `align --json` reports for the same stack, and
+    // what a resumed run recomputes identically to the interrupted run it
+    // continues.
     let alignment_for_crop: StackAlignment = match &alignment_result {
         Some((_, result, _, _)) => result.clone(),
         None => identity_alignment_for_crop(stack.len()),
@@ -318,8 +426,6 @@ pub fn run(
     // short-circuit), which is what keeps `--no-align --no-crop` byte for
     // byte with the unaligned path. `TileError::NoInterior` fires here, if
     // it fires at all, before any tile is read.
-    let mut options = TileSchedulerOptions::new(".scratch");
-    options.levels = levels;
     let scheduler = match TileScheduler::new(&warping_reader, stack_ctx, spp, &options) {
         Ok(scheduler) => scheduler,
         Err(err) => return crate::fail(err),
@@ -341,35 +447,201 @@ pub fn run(
         description: description.clone(),
     };
 
-    let consumer = match FusionConsumer::create(
-        algo,
-        values.clone(),
-        &composite_partial,
-        zmap_partial.as_deref(),
-        geometry,
+    // Step 7: the ledger, around the `.partial` discipline above.
+    // `composite_output` is the `.partial` path, never the final name --
+    // `ResumeStore::find` skips a candidate whose `composite_output` no
+    // longer exists, and the final name only appears after a successful
+    // rename.
+    let record = JobRecord {
+        format: JOB_RECORD_FORMAT,
+        fingerprint,
+        width,
+        height,
+        samples_per_pixel: spp,
+        frame_count: stack.len(),
+        tile_size: scheduler.plan().tile_size(),
+        levels: scheduler.plan().levels(),
+        stack_algorithm: algo.id().to_string(),
+        stack_params: values.clone(),
+        align: align_identity,
+        crop: applied_crop,
+        composite_output: composite_partial.clone(),
+        zmap_output: zmap_partial.clone(),
+    };
+    let resume_store = match ResumeStore::open(Path::new(".scratch")) {
+        Ok(store) => store,
+        Err(err) => return crate::fail(err.to_string()),
+    };
+    let ledger = if job_opts.resume {
+        match resume_store.find(&record) {
+            Ok(Resumable::None) => {
+                return crate::fail(
+                    "no resumable state for this stack under .scratch/resume".to_string(),
+                );
+            }
+            Ok(Resumable::Mismatch(mismatch)) => return crate::fail(mismatch.to_string()),
+            Ok(Resumable::Ledger(ledger)) => ledger,
+            Err(err) => return crate::fail(err.to_string()),
+        }
+    } else {
+        // A non-resume run may legally disagree with old state -- a
+        // `Mismatch` here is not an error. Any matching ledger is
+        // discarded first: two cancelled runs over the same stack and
+        // output path would otherwise leave two ledgers, and
+        // `ResumeStore::find`'s pick among them is unspecified order.
+        match resume_store.find(&record) {
+            Ok(Resumable::Ledger(stale)) => {
+                if let Err(err) = stale.discard() {
+                    return crate::fail(err.to_string());
+                }
+            }
+            Ok(_) => {}
+            Err(err) => return crate::fail(err.to_string()),
+        }
+        match resume_store.begin(&record) {
+            Ok(ledger) => ledger,
+            Err(err) => return crate::fail(err.to_string()),
+        }
+    };
+
+    // When no alignment was peeked, `align_stack` runs as usual and
+    // `ledger.record_alignment(&result)` records it at the align/fuse
+    // boundary. By construction, this is the *only* place that boundary can
+    // be: the ledger above is always either fresh (nothing recorded yet) or
+    // came from `find` after this run's own `record` already matched it in
+    // full including `align` identity, and a cancel can only ever happen
+    // once a ledger exists (`Job` -- hence any interruptible state -- is
+    // built after alignment resolves). A peeked alignment
+    // (`used_peeked_alignment`) is already the ledger's own recorded value
+    // and needs no re-recording.
+    if !used_peeked_alignment
+        && let Some((_, result, _, _)) = &alignment_result
+        && let Err(err) = ledger.record_alignment(result)
+    {
+        cleanup_partials(&composite_partial, zmap_partial.as_deref());
+        let _ = ledger.discard();
+        return crate::fail(err.to_string());
+    }
+
+    // The resume composition -- `FusionConsumer::resume` when the ledger
+    // already recorded completed units, `FusionConsumer::create` otherwise;
+    // `Job::resuming`/`Job::new` to match. Both paths wrap the consumer in
+    // `RecordingConsumer` before handing it to `job::drive`.
+    let is_resuming = !ledger.completed().is_empty();
+    let (consumer, surviving): (FusionConsumer, Option<Vec<usize>>) = if is_resuming {
+        match FusionConsumer::resume(
+            scheduler.plan(),
+            ledger.completed(),
+            algo,
+            values.clone(),
+            &composite_partial,
+            zmap_partial.as_deref(),
+            geometry.clone(),
+        ) {
+            Ok((consumer, surviving)) => (consumer, Some(surviving)),
+            Err(err) => {
+                cleanup_partials(&composite_partial, zmap_partial.as_deref());
+                let _ = ledger.discard();
+                return crate::fail(err);
+            }
+        }
+    } else {
+        match FusionConsumer::create(
+            algo,
+            values.clone(),
+            &composite_partial,
+            zmap_partial.as_deref(),
+            geometry,
+        ) {
+            Ok(consumer) => (consumer, None),
+            Err(err) => {
+                cleanup_partials(&composite_partial, zmap_partial.as_deref());
+                let _ = ledger.discard();
+                return crate::fail(err);
+            }
+        }
+    };
+
+    let mut job = match &surviving {
+        Some(surviving) => Job::resuming(&scheduler, surviving),
+        None => Job::new(&scheduler),
+    };
+    let control = job.control();
+    // A fuse-stage entry line, unconditional and immediate (`eta --`, since
+    // no unit has finished yet) -- same reasoning as the align stage line:
+    // it gives a script or a human watching a redirected log a fact the
+    // instant the job starts, and it is what lets a test drive its SIGINT
+    // off "the first line observed" rather than a sleep
+    // (`crates/cli/tests/job_cli.rs`'s own doc comment).
+    renderer.start(&control.progress());
+    let recording = RecordingConsumer {
+        inner: &consumer,
+        ledger: &ledger,
+    };
+    let outcome = match job::drive(
+        &mut job,
+        &control,
+        &NoopPreprocess,
+        &recording,
+        &mut renderer,
+        &signals,
     ) {
-        Ok(consumer) => consumer,
+        Ok(outcome) => outcome,
         Err(err) => {
+            // A genuine error: `Job::run` already called `consumer.abort()`
+            // on this exact path, so `consumer.finish()` must never be
+            // attempted here.
             cleanup_partials(&composite_partial, zmap_partial.as_deref());
+            let _ = ledger.discard();
             return crate::fail(err);
         }
     };
 
-    let run_report = match scheduler.run(&NoopPreprocess, &consumer) {
-        Ok(report) => report,
-        Err(err) => {
-            cleanup_partials(&composite_partial, zmap_partial.as_deref());
-            return crate::fail(err);
-        }
-    };
+    // Step 10: the three outcomes.
+    if outcome == JobOutcome::Cancelled {
+        // On cancel, the `.partial` file
+        // and the ledger deliberately survive -- no `finish()`, no rename,
+        // no `cleanup_partials`. Nothing on stdout: the `--json` report
+        // means a completed run, the same way every existing failure path
+        // prints no JSON.
+        eprintln!(
+            "cancelled -- {} of {} unit(s) done; resume with: {}",
+            control.progress().units_done,
+            control.progress().unit_total,
+            job::resume_recipe(argv)
+        );
+        return ExitCode::from(130);
+    }
+    debug_assert_eq!(
+        outcome,
+        JobOutcome::Completed,
+        "job::drive never returns Paused"
+    );
+
+    let final_progress = control.progress();
+    let in_flight_limit = scheduler.in_flight_limit();
+    let tiles = final_progress.unit_total;
+    // Every tile read reads every frame (`crates/core/src/tile/scheduler.rs`'s
+    // per-tile loop), so this is the exact count, not an approximation.
+    let frame_tiles_read = tiles * stack.len();
+    // `peak_in_flight`: `Job::run` does not expose the per-segment
+    // `TileRunReport` `TileScheduler::run` returns (the job layer discards
+    // it after folding `completed`/`stopped` into `JobOutcome`), so the
+    // true observed peak concurrency is not available through this engine
+    // without a `core` change. `in_flight_limit` is used as the reported
+    // value: an honest upper bound, exact whenever the run never dropped
+    // below the scheduler's configured concurrency.
+    let peak_in_flight = in_flight_limit;
 
     if let Err(err) = consumer.finish() {
         cleanup_partials(&composite_partial, zmap_partial.as_deref());
+        let _ = ledger.discard();
         return crate::fail(err);
     }
 
     if let Err(err) = std::fs::rename(&composite_partial, output) {
         cleanup_partials(&composite_partial, zmap_partial.as_deref());
+        let _ = ledger.discard();
         return crate::fail(format!(
             "renaming {} to {}: {err}",
             composite_partial.display(),
@@ -380,12 +652,17 @@ pub fn run(
         && let Err(err) = std::fs::rename(zmap_partial, zmap)
     {
         let _ = std::fs::remove_file(zmap_partial);
+        let _ = ledger.discard();
         return crate::fail(format!(
             "renaming {} to {}: {err}",
             zmap_partial.display(),
             zmap.display()
         ));
     }
+    if let Err(err) = ledger.discard() {
+        return crate::fail(err.to_string());
+    }
+    renderer.finish("stack complete");
 
     let mut outputs = vec![output.display().to_string()];
     if let Some(zmap) = zmap {
@@ -430,10 +707,10 @@ pub fn run(
         tile_size: plan.tile_size(),
         levels: plan.levels(),
         margin: plan.margin(),
-        tiles: run_report.tiles,
-        frame_tiles_read: run_report.frame_tiles_read,
-        in_flight_limit: run_report.in_flight_limit,
-        peak_in_flight: run_report.peak_in_flight,
+        tiles,
+        frame_tiles_read,
+        in_flight_limit,
+        peak_in_flight,
         outputs,
         wall_seconds: start.elapsed().as_secs_f64(),
         output_width: applied_crop.map(|r| r.width).unwrap_or(width),
@@ -475,6 +752,68 @@ fn identity_alignment_for_crop(frame_count: usize) -> StackAlignment {
             })
             .collect(),
     }
+}
+
+/// A resumable candidate's already-recorded `crop` and (if the ledger had
+/// already reached the fuse stage) `StackAlignment`, read directly off a
+/// matching `.scratch/resume/*/job.json` -- and that same ledger
+/// directory's `alignment.json`, when present -- so a `--resume` run can
+/// build a correct `JobRecord` for the authoritative `ResumeStore::find`
+/// call *without* first running `align_stack` to compute `crop` itself.
+/// Every field compared here (`fingerprint`, `tile_size`, `levels`,
+/// `stack_algorithm`, `stack_params`, `align` identity) is exactly what
+/// `ResumeStore::find` re-verifies afterward -- this function's own mistake
+/// costs only a missed optimization (falling back to running `align_stack`
+/// normally), never a wrong resume: nothing downstream trusts this peek's
+/// verdict on its own.
+fn peek_resumable_crop_and_alignment(
+    scratch_base: &Path,
+    fingerprint: &StackFingerprint,
+    tile_size: u32,
+    levels: u32,
+    stack_algorithm: &str,
+    stack_params: &ParamValues,
+    align_identity: Option<&AlignIdentity>,
+) -> Option<job::PeekedResume> {
+    let entries = std::fs::read_dir(scratch_base.join("resume")).ok()?;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(dir.join("job.json")) else {
+            continue;
+        };
+        let Ok(candidate) = serde_json::from_str::<JobRecord>(&text) else {
+            continue;
+        };
+        if candidate.format != JOB_RECORD_FORMAT {
+            continue;
+        }
+        if !candidate.composite_output.exists() {
+            continue;
+        }
+        if &candidate.fingerprint != fingerprint {
+            continue;
+        }
+        if candidate.tile_size != tile_size || candidate.levels != levels {
+            continue;
+        }
+        if candidate.stack_algorithm != stack_algorithm {
+            continue;
+        }
+        if &candidate.stack_params != stack_params {
+            continue;
+        }
+        if candidate.align.as_ref() != align_identity {
+            continue;
+        }
+        let alignment = std::fs::read_to_string(dir.join("alignment.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok());
+        return Some(job::PeekedResume { alignment });
+    }
+    None
 }
 
 /// `<path>.partial`: appends the suffix to the path's own file name, in the

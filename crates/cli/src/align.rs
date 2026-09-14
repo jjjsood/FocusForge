@@ -21,6 +21,7 @@ use focusforge_core::tile::Rect;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 use serde::Serialize;
 
+use crate::progress::{ProgressMode, ProgressRenderer};
 use crate::set::SetArgs;
 use crate::set::parse_settings;
 use crate::stack::ParamReport;
@@ -126,6 +127,13 @@ pub(crate) fn alignment_entries(
 /// `algo_id: None` resolves through [`resolve_align_algo`], never a
 /// hardcoded id. `--lax` selects [`FailurePolicy::IdentityFallback`]; its
 /// absence selects [`FailurePolicy::Strict`], the default.
+///
+/// `quiet` suppresses the one stage line this subcommand prints.
+/// `align` installs **no** SIGINT handler at all: it has no
+/// fuse-tile units, so a handler here would have nothing to act on and would
+/// only make the process look hung for up to the alignment's own wall time
+/// after a first Ctrl-C. The default disposition (immediate kill) is left
+/// untouched.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     dir: &Path,
@@ -134,8 +142,10 @@ pub fn run(
     lax: bool,
     write_warped: Option<&Path>,
     set: &SetArgs,
+    quiet: bool,
 ) -> ExitCode {
     let start = Instant::now();
+    let mut renderer = ProgressRenderer::new(ProgressMode::choose(quiet));
 
     let algo = match resolve_align_algo(algo_id) {
         Ok(algo) => algo,
@@ -195,6 +205,7 @@ pub fn run(
     } else {
         FailurePolicy::Strict
     };
+    renderer.stage(&format!("align {} frames (no unit progress)", stack.len()));
     let alignment = match align_stack(algo, stack_ctx, &stack, &values, policy) {
         Ok(alignment) => alignment,
         Err(err) => return crate::fail(err),

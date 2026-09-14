@@ -52,6 +52,58 @@ fn run_cli(args: &[&str]) -> CliOutput {
 }
 
 #[test]
+fn align_quiet_prints_no_progress() {
+    let quiet = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--quiet",
+    ]);
+    assert!(quiet.success, "stderr: {}", quiet.stderr);
+    // `--quiet` suppresses the stage line, never the `--lax` failure-count
+    // warning: that is a diagnostic about the result, not progress.
+    assert!(
+        !quiet.stderr.contains("frames (no unit progress)"),
+        "stderr: {}",
+        quiet.stderr
+    );
+
+    let loud = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+    ]);
+    assert!(loud.success, "stderr: {}", loud.stderr);
+    assert!(
+        loud.stderr.contains("frames (no unit progress)"),
+        "stderr: {}",
+        loud.stderr
+    );
+    assert_eq!(quiet.stdout, loud.stdout, "--quiet must not change stdout");
+}
+
+#[test]
+fn align_prints_a_stage_line_on_stderr() {
+    let out = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+    ]);
+    assert!(out.success, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("align 8 frames (no unit progress)"),
+        "stderr: {}",
+        out.stderr
+    );
+}
+
+#[test]
 fn align_reports_one_row_per_frame() {
     let out = run_cli(&[
         "align",

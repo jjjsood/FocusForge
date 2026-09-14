@@ -289,6 +289,79 @@ fn progress_reaches_the_unit_total() {
     );
 }
 
+/// Progress must be **live**, not a per-segment summary: a caller polling
+/// from another thread sees completed units rise during a single
+/// uninterrupted segment, never `0/16` until the end.
+#[test]
+fn progress_advances_while_one_segment_is_still_running() {
+    use std::collections::BTreeSet;
+
+    let stack = open_stack();
+    let opts = options("progress-live", 1);
+    let scheduler = build_scheduler(&stack, &opts);
+    let plan_len = scheduler.plan().len();
+    assert!(plan_len > 4, "this test needs a multi-unit plan");
+
+    let mut job = Job::new(&scheduler);
+    let control = job.control();
+
+    let snapshots = Arc::new(Mutex::new(Vec::new()));
+    let stop_polling = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poller = {
+        let control = Arc::clone(&control);
+        let snapshots = Arc::clone(&snapshots);
+        let stop_polling = Arc::clone(&stop_polling);
+        std::thread::spawn(move || {
+            while !stop_polling.load(Ordering::SeqCst) {
+                snapshots.lock().unwrap().push(control.progress());
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        })
+    };
+
+    let composite_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("progress_advances_while_one_segment_is_still_running.tif");
+    let (width, height) = stack.dimensions();
+    let stack_ctx = StackContext::new(stack.len(), width, height, 3);
+    let consumer = laplacian_consumer(stack_ctx, &composite_path, None);
+
+    let outcome = job
+        .run(&NoopPreprocess, &consumer)
+        .expect("uninterrupted run must succeed");
+    // Stop polling only *after* the single segment has returned, so every
+    // snapshot below was genuinely taken with the run in flight.
+    stop_polling.store(true, Ordering::SeqCst);
+    poller.join().unwrap();
+    assert_eq!(outcome, JobOutcome::Completed);
+    consumer.finish().expect("finish must succeed");
+
+    let history = snapshots.lock().unwrap();
+    let intermediate: Vec<_> = history
+        .iter()
+        .filter(|snap| snap.units_done > 0 && snap.units_done < plan_len)
+        .collect();
+    let distinct: BTreeSet<usize> = intermediate.iter().map(|snap| snap.units_done).collect();
+    assert!(
+        distinct.len() >= 2,
+        "progress must advance per completed unit, not once per segment: saw {distinct:?} \
+         strictly between 0 and {plan_len} across {} snapshots",
+        history.len()
+    );
+    assert!(
+        intermediate
+            .iter()
+            .all(|snap| snap.pixels_done > 0 && snap.eta.is_some()),
+        "every snapshot with a completed unit must carry a completed pixel count and an ETA"
+    );
+    assert!(
+        intermediate
+            .iter()
+            .any(|snap| snap.running > Duration::ZERO && snap.eta > Some(Duration::ZERO)),
+        "the running clock must advance mid-segment too -- otherwise the ETA it feeds is \
+         rendered as `0s` for the whole run"
+    );
+}
+
 #[test]
 fn engine_output_is_byte_identical() {
     let stack = open_stack();

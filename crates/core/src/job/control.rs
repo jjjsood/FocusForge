@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::tile::TileControl;
 
@@ -21,6 +21,12 @@ use super::progress::{JobProgress, eta};
 const RUNNING: u8 = 0;
 const PAUSE_REQUESTED: u8 = 1;
 const CANCEL_REQUESTED: u8 = 2;
+
+/// `segment_start_nanos`' "no segment is executing right now" sentinel. A
+/// real offset from [`JobControl::epoch`] can never reach it (it would take
+/// 584 years), and a sentinel keeps the whole handle lock-free -- see
+/// [`JobControl::progress`].
+const NO_SEGMENT: u64 = u64::MAX;
 
 /// The three states one job's control flag can be in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +56,16 @@ pub struct JobControl {
     pixels_done: AtomicU64,
     pixel_total: AtomicU64,
     stage: AtomicU8,
+    /// Running time of every segment that has already **ended**. The
+    /// currently executing segment's own elapsed time is added on the fly by
+    /// [`Self::progress`], never stored here until [`Self::end_segment`].
     running_nanos: AtomicU64,
+    /// Fixed reference point, so a live segment's elapsed time is expressible
+    /// as two `u64` offsets rather than a lock around an `Instant`.
+    epoch: Instant,
+    /// Offset from [`Self::epoch`] at which the executing segment started, or
+    /// [`NO_SEGMENT`] when none is executing.
+    segment_start_nanos: AtomicU64,
 }
 
 impl JobControl {
@@ -68,6 +83,8 @@ impl JobControl {
             pixel_total: AtomicU64::new(0),
             stage: AtomicU8::new(JobStage::Fuse.to_u8()),
             running_nanos: AtomicU64::new(0),
+            epoch: Instant::now(),
+            segment_start_nanos: AtomicU64::new(NO_SEGMENT),
         })
     }
 
@@ -122,12 +139,18 @@ impl JobControl {
     }
 
     /// A plain snapshot, returned by value -- polled, never pushed.
+    ///
+    /// Every field is **live**: `units_done`/`pixels_done` are credited by
+    /// [`TileControl::unit_completed`] as each unit finishes, and `running`
+    /// adds the executing segment's elapsed time to the accumulated total,
+    /// so a caller polling from another thread watches the counters climb
+    /// during the run rather than seeing them jump at the end of it.
     pub fn progress(&self) -> JobProgress {
         let units_done = self.units_done.load(Ordering::SeqCst);
         let unit_total = self.unit_total.load(Ordering::SeqCst);
         let pixels_done = self.pixels_done.load(Ordering::SeqCst);
         let pixel_total = self.pixel_total.load(Ordering::SeqCst);
-        let running = Duration::from_nanos(self.running_nanos.load(Ordering::SeqCst));
+        let running = self.running_now();
         JobProgress {
             stage: JobStage::from_u8(self.stage.load(Ordering::SeqCst)),
             units_done,
@@ -150,24 +173,63 @@ impl JobControl {
         self.pixel_total.store(total, Ordering::SeqCst);
     }
 
-    /// Adds one segment's completed units and pixels to the running totals.
+    /// Credits units and pixels a segment never ran itself -- the units a
+    /// previous process already completed, seeded once by
+    /// [`super::Job::resuming`]. Units completed by *this* process are
+    /// credited one at a time by [`TileControl::unit_completed`] instead.
     pub(crate) fn add_progress(&self, units: usize, pixels: u64) {
-        self.units_done.fetch_add(units, Ordering::SeqCst);
         self.pixels_done.fetch_add(pixels, Ordering::SeqCst);
+        self.units_done.fetch_add(units, Ordering::SeqCst);
     }
 
-    /// Adds one segment's own elapsed time -- never a pause's wall-clock
-    /// time, since a pause is never inside this duration to begin with (it
-    /// is measured only around the `run_tiles_controlled` call itself).
-    pub(crate) fn add_running(&self, elapsed: Duration) {
+    /// Starts the running clock for one segment. Paired with
+    /// [`Self::end_segment`] by [`super::Job::run`], which is the only
+    /// caller; between the two, [`Self::progress`] reports the accumulated
+    /// running time **plus** this segment's elapsed time so far.
+    pub(crate) fn begin_segment(&self) {
+        self.segment_start_nanos
+            .store(self.epoch.elapsed().as_nanos() as u64, Ordering::SeqCst);
+    }
+
+    /// Folds the executing segment's own elapsed time into the accumulated
+    /// total and stops the clock -- so time spent *paused* between two
+    /// segments is never counted, which is what keeps the ETA honest across
+    /// a pause.
+    pub(crate) fn end_segment(&self) {
+        let start = self.segment_start_nanos.swap(NO_SEGMENT, Ordering::SeqCst);
+        if start == NO_SEGMENT {
+            return;
+        }
+        let now = self.epoch.elapsed().as_nanos() as u64;
         self.running_nanos
-            .fetch_add(elapsed.as_nanos() as u64, Ordering::SeqCst);
+            .fetch_add(now.saturating_sub(start), Ordering::SeqCst);
+    }
+
+    fn running_now(&self) -> Duration {
+        let accumulated = self.running_nanos.load(Ordering::SeqCst);
+        let start = self.segment_start_nanos.load(Ordering::SeqCst);
+        if start == NO_SEGMENT {
+            return Duration::from_nanos(accumulated);
+        }
+        let now = self.epoch.elapsed().as_nanos() as u64;
+        Duration::from_nanos(accumulated.saturating_add(now.saturating_sub(start)))
     }
 }
 
 impl TileControl for JobControl {
     fn should_stop(&self) -> bool {
         self.state() != ControlState::Running
+    }
+
+    /// Credits one finished unit, from the rayon worker that finished it.
+    /// **Pixels first, then units**: a poller that catches the two adds
+    /// mid-flight then sees at worst "pixels counted, unit not yet", never
+    /// the reverse -- so `units_done > 0` always implies `pixels_done > 0`,
+    /// and therefore an `eta` that is `Some` (`super::progress::eta`
+    /// returns `None` only while `pixels_done == 0`).
+    fn unit_completed(&self, pixels: u64) {
+        self.pixels_done.fetch_add(pixels, Ordering::SeqCst);
+        self.units_done.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -267,6 +329,49 @@ mod tests {
         );
         assert_eq!(p2.units_done, 7);
         assert_eq!(p2.pixels_done, 700);
+    }
+
+    #[test]
+    fn unit_completed_credits_one_unit_and_its_pixels_immediately() {
+        let control = JobControl::new();
+        control.set_unit_total(4);
+        control.set_pixel_total(400);
+
+        control.unit_completed(100);
+        let p = control.progress();
+        assert_eq!(p.units_done, 1);
+        assert_eq!(p.pixels_done, 100);
+
+        control.unit_completed(100);
+        assert_eq!(control.progress().units_done, 2);
+    }
+
+    #[test]
+    fn running_grows_inside_an_open_segment_and_freezes_once_it_ends() {
+        let control = JobControl::new();
+        assert_eq!(
+            control.progress().running,
+            Duration::ZERO,
+            "no segment has been opened yet"
+        );
+
+        control.begin_segment();
+        let first = control.progress().running;
+        std::thread::sleep(Duration::from_millis(5));
+        let second = control.progress().running;
+        assert!(
+            second > first,
+            "an open segment's elapsed time must be visible to a poller: {first:?} -> {second:?}"
+        );
+
+        control.end_segment();
+        let frozen = control.progress().running;
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            control.progress().running,
+            frozen,
+            "a closed segment's clock must not keep running -- that is the time spent paused"
+        );
     }
 
     #[test]

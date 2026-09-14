@@ -12,6 +12,26 @@
 /// instead."
 pub trait TileControl: Send + Sync {
     fn should_stop(&self) -> bool;
+
+    /// Called once per unit that **finished successfully**, from the rayon
+    /// worker that ran it, immediately after the same unit is recorded as
+    /// complete. `pixels` is that unit's read-rect area
+    /// (`PlannedTile::read()`'s `width * height`), the quantity
+    /// `crate::job::JobProgress` weights its ETA by.
+    ///
+    /// The default is a no-op, so [`NoControl`] and every test control stay
+    /// one-method implementations. `crate::job::JobControl` overrides it,
+    /// and that override is the *only* reason a polled progress snapshot
+    /// advances while a run is still in flight rather than jumping from
+    /// `0/n` to `n/n` when the segment ends.
+    ///
+    /// Runs on a worker thread and must therefore stay cheap and
+    /// non-blocking -- an atomic add, nothing that could re-enter the
+    /// scheduler. It is never handed caller code: `core` polls, it never
+    /// pushes (`crate::job::JobProgress`' own docs).
+    fn unit_completed(&self, pixels: u64) {
+        let _ = pixels;
+    }
 }
 
 /// The control [`super::scheduler::TileScheduler::run`] and

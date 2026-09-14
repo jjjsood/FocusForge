@@ -16,7 +16,10 @@ use serde::Serialize;
 
 mod algorithms;
 mod align;
+mod job;
+mod progress;
 mod set;
+mod signals;
 mod stack;
 
 /// FocusForge command-line interface.
@@ -99,6 +102,23 @@ enum Command {
         align_algo: Option<String>,
         #[command(flatten)]
         align_set: set::AlignSetArgs,
+        /// Resume a previously cancelled run of this same stack, found by
+        /// stack fingerprint under `.scratch/resume/` -- no argument.
+        /// Refuses at exit 1 when no matching scratch state exists or it
+        /// disagrees with this invocation's inputs.
+        #[arg(long)]
+        resume: bool,
+        /// Print no progress at all.
+        #[arg(long)]
+        quiet: bool,
+        /// Override the scheduler's outer tile size, in pixels. Omit to use
+        /// the scheduler's own default.
+        #[arg(long = "tile-size", value_name = "PX")]
+        tile_size: Option<u32>,
+        /// Override the scheduler's in-flight memory budget, in bytes. Omit
+        /// to use the scheduler's own default.
+        #[arg(long = "max-bytes-in-flight", value_name = "BYTES")]
+        max_bytes_in_flight: Option<usize>,
     },
     /// Compute and report the per-frame transforms for a stack: readable
     /// text by default, a frozen `--json` document on request, and an
@@ -127,6 +147,11 @@ enum Command {
         write_warped: Option<PathBuf>,
         #[command(flatten)]
         set: set::SetArgs,
+        /// Print no progress at all. `align` has no fuse-tile units to
+        /// count: this suppresses only the one stage line `align`
+        /// otherwise prints.
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -147,6 +172,10 @@ fn main() -> ExitCode {
             lax,
             align_algo,
             align_set,
+            resume,
+            quiet,
+            tile_size,
+            max_bytes_in_flight,
         } => stack::run(
             &dir,
             &output,
@@ -161,6 +190,13 @@ fn main() -> ExitCode {
                 algo: align_algo.as_deref(),
                 set: &align_set.align_set,
             },
+            &job::JobOptions {
+                resume,
+                quiet,
+                tile_size,
+                max_bytes_in_flight,
+            },
+            &std::env::args().collect::<Vec<_>>(),
         ),
         Command::Align {
             dir,
@@ -169,6 +205,7 @@ fn main() -> ExitCode {
             lax,
             write_warped,
             set,
+            quiet,
         } => align::run(
             &dir,
             algo.as_deref(),
@@ -176,6 +213,7 @@ fn main() -> ExitCode {
             lax,
             write_warped.as_deref(),
             &set,
+            quiet,
         ),
     }
 }

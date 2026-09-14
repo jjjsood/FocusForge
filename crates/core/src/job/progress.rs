@@ -41,10 +41,15 @@ pub struct JobProgress {
 /// estimate -- it is the caller's job (`JobControl::add_running`) to make
 /// sure `running` only ever grows while a segment is actually executing.
 ///
-/// `None` while `pixels_done == 0` -- an `Option`, never a zero standing in
-/// for "unknown".
+/// `None` while `pixels_done == 0` **or** while `running` is zero -- an
+/// `Option`, never a zero standing in for "unknown". Both guards are needed
+/// and neither implies the other: a resumed run opens with `pixels_done`
+/// already credited for the units a previous process completed
+/// ([`super::Job::resuming`]) and a running clock that has not started, and
+/// extrapolating a rate from zero elapsed time would make the first line of
+/// every resumed run claim the job is about to finish.
 pub fn eta(pixels_done: u64, pixel_total: u64, running: Duration) -> Option<Duration> {
-    if pixels_done == 0 {
+    if pixels_done == 0 || running.is_zero() {
         return None;
     }
     if pixels_done >= pixel_total {
@@ -74,6 +79,17 @@ mod tests {
             eta(2, 10, Duration::from_secs(4)),
             Some(Duration::from_secs(16))
         );
+    }
+
+    #[test]
+    fn eta_is_absent_until_some_running_time_has_been_observed() {
+        // A resumed run starts with `pixels_done` already credited for the
+        // units a previous process finished (`Job::resuming`) but with a
+        // running clock of zero -- no throughput has been observed yet, so
+        // there is nothing to extrapolate from. Returning `Some(ZERO)` here
+        // makes the first line of every resumed run claim the job is about
+        // to finish.
+        assert_eq!(eta(4, 10, Duration::ZERO), None);
     }
 
     #[test]

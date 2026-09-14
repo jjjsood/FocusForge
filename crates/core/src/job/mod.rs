@@ -17,10 +17,14 @@
 //!
 //! [`crate::tile::TileControl`] is consulted as the first statement of every
 //! tile's work, in [`crate::tile::TileScheduler::run_tiles_controlled`],
-//! before the tile counts as in flight. [`JobControl`] is the only
-//! `TileControl` this crate ships outside tests -- pause, resume and cancel
-//! are all expressed as writes to the one atomic flag it wraps, and `should_stop`
-//! is the one place that flag is read back. A second seam (inside
+//! before the tile counts as in flight, and notified again
+//! ([`crate::tile::TileControl::unit_completed`]) the moment that tile has
+//! finished. Control in, progress out, over the one trait object the
+//! scheduler already carries -- which is why [`JobProgress`] advances during
+//! a run rather than in one jump when the segment ends. [`JobControl`] is the
+//! only `TileControl` this crate ships outside tests -- pause, resume and
+//! cancel are all expressed as writes to the one atomic flag it wraps, and
+//! `should_stop` is the one place that flag is read back. A second seam (inside
 //! `TileConsumer::consume`, for a finer-grained pause) is deliberately not
 //! added: everything a consumer does happens inside one `consume` call this
 //! module cannot see into, and nothing on this branch needs finer latency
@@ -62,7 +66,6 @@ pub use record::{AlignIdentity, JOB_RECORD_FORMAT, JobRecord};
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::tile::plan::PlannedTile;
 use crate::tile::{FramePreprocess, TileConsumer, TileError, TileScheduler};
@@ -188,14 +191,20 @@ impl<'a> Job<'a> {
         preprocess: &dyn FramePreprocess,
         consumer: &dyn TileConsumer,
     ) -> Result<JobOutcome, TileError> {
-        let start = Instant::now();
+        // The running clock is bracketed rather than measured afterwards, so
+        // `JobControl::progress` can add this segment's elapsed time to the
+        // accumulated total while the segment is still executing -- an ETA
+        // that only appeared after the run finished would be useless, and a
+        // `running` of zero against a non-zero `pixels_done` renders as
+        // `eta 0s`.
+        self.control.begin_segment();
         let result = self.scheduler.run_tiles_controlled(
             &self.remaining,
             preprocess,
             consumer,
             self.control.as_ref(),
         );
-        self.control.add_running(start.elapsed());
+        self.control.end_segment();
 
         let controlled = match result {
             Ok(controlled) => controlled,
@@ -206,17 +215,14 @@ impl<'a> Job<'a> {
             }
         };
 
+        // No `add_progress` here: every unit this segment ran already
+        // credited itself through `JobControl::unit_completed` the moment it
+        // finished (`crates/core/src/tile/scheduler.rs`'s per-tile
+        // bookkeeping). Counting them a second time here is what made
+        // progress a per-segment summary in the first place.
         let completed_set: HashSet<usize> = controlled.completed.iter().copied().collect();
-        let completed_pixels: u64 = self
-            .remaining
-            .iter()
-            .filter(|tile| completed_set.contains(&tile.index()))
-            .map(tile_area)
-            .sum();
         self.remaining
             .retain(|tile| !completed_set.contains(&tile.index()));
-        self.control
-            .add_progress(controlled.completed.len(), completed_pixels);
 
         if !controlled.stopped {
             return Ok(JobOutcome::Completed);
