@@ -136,6 +136,27 @@ impl Gate {
     fn completed(&self) -> usize {
         self.completed.load(Ordering::SeqCst)
     }
+
+    /// Marks one call as started, then blocks until [`Self::release`] is
+    /// called -- the body [`Gated::consume`] and [`GatedFailure::consume`]
+    /// both need, once to record arrival and once to hold the tile in
+    /// flight until the test is ready to let it finish.
+    fn block(&self) {
+        {
+            let mut started = self.started.lock().unwrap();
+            *started += 1;
+            self.started_cvar.notify_all();
+        }
+        let released = self.released.lock().unwrap();
+        let (_guard, timed_out) = self
+            .released_cvar
+            .wait_timeout_while(released, Duration::from_secs(10), |r| !*r)
+            .unwrap();
+        assert!(
+            !timed_out.timed_out(),
+            "timed out waiting for the gate to open"
+        );
+    }
 }
 
 /// Wraps a real [`TileConsumer`] with a [`Gate`] around each `consume`
@@ -147,23 +168,7 @@ struct Gated<'a> {
 
 impl TileConsumer for Gated<'_> {
     fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
-        {
-            let mut started = self.gate.started.lock().unwrap();
-            *started += 1;
-            self.gate.started_cvar.notify_all();
-        }
-        {
-            let released = self.gate.released.lock().unwrap();
-            let (_guard, timed_out) = self
-                .gate
-                .released_cvar
-                .wait_timeout_while(released, Duration::from_secs(10), |r| !*r)
-                .unwrap();
-            assert!(
-                !timed_out.timed_out(),
-                "timed out waiting for the gate to open"
-            );
-        }
+        self.gate.block();
         let result = self.inner.consume(job);
         if result.is_ok() {
             self.gate.completed.fetch_add(1, Ordering::SeqCst);
@@ -218,23 +223,7 @@ impl TileConsumer for GatedFailure<'_> {
         if job.tile().index() != self.target_index {
             return Ok(());
         }
-        {
-            let mut started = self.gate.started.lock().unwrap();
-            *started += 1;
-            self.gate.started_cvar.notify_all();
-        }
-        {
-            let released = self.gate.released.lock().unwrap();
-            let (_guard, timed_out) = self
-                .gate
-                .released_cvar
-                .wait_timeout_while(released, Duration::from_secs(10), |r| !*r)
-                .unwrap();
-            assert!(
-                !timed_out.timed_out(),
-                "timed out waiting for the gate to open"
-            );
-        }
+        self.gate.block();
         Err(AlgorithmError::Failed {
             algorithm: "gated-failure".to_string(),
             detail: "intentional test failure".to_string(),
