@@ -104,19 +104,30 @@ fn shared_laplacian_run() -> &'static SharedRun {
         let dir = tmp_dir("stack_cli_shared_laplacian");
         let output = dir.join("out.tif");
         let zmap = dir.join("out-zmap.tif");
-        let result = run_cli(&[
-            "stack",
-            mantis_512_dir().to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-            "--zmap",
-            zmap.to_str().unwrap(),
-            "--algo",
-            "laplacian",
-            "--json",
-            "--no-align",
-            "--no-crop",
-        ]);
+        let mut args = vec![
+            "stack".to_string(),
+            mantis_512_dir().to_str().unwrap().to_string(),
+            "-o".to_string(),
+            output.to_str().unwrap().to_string(),
+            "--zmap".to_string(),
+            zmap.to_str().unwrap().to_string(),
+            "--algo".to_string(),
+            "laplacian".to_string(),
+            "--json".to_string(),
+            "--no-align".to_string(),
+            "--no-crop".to_string(),
+        ];
+        // Verifies CLI plumbing reproduces `library_oracle`'s in-process,
+        // CPU-only call exactly, not GPU-vs-CPU numerics (that's the
+        // whole-pipeline `parity_pipeline::*`'s job). Without `--no-gpu`,
+        // `stack --algo laplacian` takes the GPU path on any adapter-equipped
+        // machine, breaking this test's exact-byte equality via the ±1 LSB
+        // GPU/CPU budget; the flag only exists when `gpu` is compiled in.
+        if cfg!(feature = "gpu") {
+            args.push("--no-gpu".to_string());
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = run_cli(&args);
         assert!(
             result.success,
             "shared laplacian run must succeed -- stderr: {}",

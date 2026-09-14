@@ -233,7 +233,7 @@ impl FusionPipelines {
 /// by a device buffer. Not exposed to [`convert`], [`pyramid`] or
 /// [`select`]: those take plain buffers and dimensions so a per-kernel
 /// parity test in a different crate can call them without this type.
-struct GpuPlane {
+pub(crate) struct GpuPlane {
     buffer: wgpu::Buffer,
     width: u32,
     height: u32,
@@ -252,32 +252,61 @@ fn zeroed_f32_buffer(
     buffer
 }
 
+/// Converts an already-resident packed-`u32` buffer (`packed_len(width *
+/// height * spp)` bytes, two `u16` per `u32`, low half first, chunky sample
+/// order -- `crate::pack`, `crate::warp::warp_dispatch`'s own destination
+/// buffer) into a [`GpuPlane`] via [`convert::plane_from_u16`]. This is the
+/// no-repack join the fused pipeline needs at the warp -> fusion boundary:
+/// the warp kernel's destination buffer is byte-for-byte what this function
+/// consumes, so nothing here ever downloads or re-uploads a sample.
+pub(crate) fn plane_from_packed(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &FusionPipelines,
+    packed: &wgpu::Buffer,
+    width: u32,
+    height: u32,
+    spp: u32,
+) -> GpuPlane {
+    let sample_count = width as usize * height as usize * spp as usize;
+    let word_count = (packed_len(sample_count) / 4) as u32;
+    let buffer = convert::plane_from_u16(
+        device,
+        queue,
+        pipelines,
+        packed,
+        word_count,
+        sample_count as u32,
+    );
+    GpuPlane {
+        buffer,
+        width,
+        height,
+        spp,
+    }
+}
+
 /// Uploads `tile`'s samples through the packed-`u32` transport plus
-/// [`convert::plane_from_u16`] -- the only place `u16` samples cross the
-/// bus in this module.
+/// [`plane_from_packed`] -- the only place `u16` samples cross the bus in
+/// this module for a tile that has not already been dispatched on the GPU
+/// (see [`crate::stack_tile::warp_fuse_tile_gpu`] for the identity-transform
+/// case, which reads and uploads exactly this way).
 fn upload_plane(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     pipelines: &FusionPipelines,
     tile: &Tile,
 ) -> GpuPlane {
-    let sample_count = tile.samples.len();
     let packed = upload_tile(device, queue, tile);
-    let word_count = (packed_len(sample_count) / 4) as u32;
-    let buffer = convert::plane_from_u16(
+    plane_from_packed(
         device,
         queue,
         pipelines,
         &packed,
-        word_count,
-        sample_count as u32,
-    );
-    GpuPlane {
-        buffer,
-        width: tile.rect.width,
-        height: tile.rect.height,
-        spp: tile.samples_per_pixel,
-    }
+        tile.rect.width,
+        tile.rect.height,
+        tile.samples_per_pixel,
+    )
 }
 
 /// Builds the Gaussian pyramid `G_0..G_N` of `base` on the GPU -- `levels`
@@ -321,39 +350,37 @@ struct BestLevel {
     height: u32,
 }
 
-/// Fuses `rect` across `frame_count` frames of `reader` at pyramid depth
-/// `levels`, entirely on the GPU, returning the composite tile and the
-/// Z-Map -- the WGSL twin of
-/// `focusforge_core::fuse::laplacian::Laplacian::fuse`. See the module docs
-/// for why frame 0 needs no special case.
-pub fn fuse_tile_gpu(
+/// Fuses `rect` across `frame_count` frames at pyramid depth `levels`,
+/// entirely on the GPU, returning the composite tile and the Z-Map -- the
+/// WGSL twin of `focusforge_core::fuse::laplacian::Laplacian::fuse`. See the
+/// module docs for why frame 0 needs no special case.
+///
+/// `source` supplies frame `i`'s base [`GpuPlane`], already resident on the
+/// GPU -- [`fuse_tile_gpu`] below reads and uploads it directly, while
+/// [`crate::stack_tile::warp_fuse_tile_gpu`] warps it on the GPU and joins
+/// the result at [`plane_from_packed`], with **exactly one readback per
+/// tile** (the two `download_buffer` calls at this function's own tail):
+/// nothing between a warped frame's dispatch and this function's return
+/// touches `download_buffer`, `download_f32` or `map_async`.
+pub(crate) fn fuse_planes_gpu(
     shared: &SharedDevice,
-    reader: &dyn TileReader,
     pipelines: &FusionPipelines,
     frame_count: usize,
     rect: Rect,
     samples_per_pixel: u32,
     levels: u32,
+    source: &mut dyn FnMut(usize) -> Result<GpuPlane, AlgorithmError>,
 ) -> Result<TileOutput, AlgorithmError> {
     let device = shared.device();
     let queue = shared.queue();
-    let (width, height, spp) = (rect.width, rect.height, samples_per_pixel);
-    let pixel_count = (width as usize) * (height as usize);
+    let spp = samples_per_pixel;
 
     let mut best_levels: Vec<Option<BestLevel>> = (0..levels).map(|_| None).collect();
     let mut residual_sum: Option<wgpu::Buffer> = None;
     let mut residual_dims = (0u32, 0u32);
 
     for frame in 0..frame_count {
-        let mut samples = vec![0u16; pixel_count * spp as usize];
-        reader.read_tile_into(frame, rect, &mut samples)?;
-        let tile = Tile {
-            rect,
-            samples_per_pixel: spp,
-            samples,
-        };
-
-        let base = upload_plane(device, queue, pipelines, &tile);
+        let base = source(frame)?;
         let gaussians = gaussian_levels_gpu(device, queue, pipelines, base, levels);
 
         for k in 0..levels as usize {
@@ -533,4 +560,45 @@ pub fn fuse_tile_gpu(
         },
         zmap,
     })
+}
+
+/// Fuses `rect` across `frame_count` frames of `reader` at pyramid depth
+/// `levels`, entirely on the GPU, returning the composite tile and the
+/// Z-Map -- the WGSL twin of
+/// `focusforge_core::fuse::laplacian::Laplacian::fuse`. Reads and uploads
+/// every frame directly; [`crate::stack_tile::warp_fuse_tile_gpu`] is the
+/// warp-then-fuse twin that keeps a warped frame resident instead.
+pub fn fuse_tile_gpu(
+    shared: &SharedDevice,
+    reader: &dyn TileReader,
+    pipelines: &FusionPipelines,
+    frame_count: usize,
+    rect: Rect,
+    samples_per_pixel: u32,
+    levels: u32,
+) -> Result<TileOutput, AlgorithmError> {
+    let device = shared.device();
+    let queue = shared.queue();
+    let pixel_count = rect.width as usize * rect.height as usize;
+
+    let mut source = |frame: usize| -> Result<GpuPlane, AlgorithmError> {
+        let mut samples = vec![0u16; pixel_count * samples_per_pixel as usize];
+        reader.read_tile_into(frame, rect, &mut samples)?;
+        let tile = Tile {
+            rect,
+            samples_per_pixel,
+            samples,
+        };
+        Ok(upload_plane(device, queue, pipelines, &tile))
+    };
+
+    fuse_planes_gpu(
+        shared,
+        pipelines,
+        frame_count,
+        rect,
+        samples_per_pixel,
+        levels,
+        &mut source,
+    )
 }

@@ -13,9 +13,24 @@
 //! construction, including the odd-sample-count tail (`pack.rs`: 5 samples
 //! -> 3 words -> 12 bytes, a multiple of 4, not of 8, and legal).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use focusforge_core::tile::Tile;
 
 use crate::pack::{pack_samples, packed_len};
+
+/// Incremented once per [`download_buffer`] call -- the counter
+/// `warp_to_fusion_never_reads_back` reads through [`readback_count`]
+/// to prove a whole warped tile costs exactly 2 readbacks (composite +
+/// Z-Map), not one per frame.
+static READBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// The number of [`download_buffer`] calls made so far, process-wide. Not
+/// reset between calls: a test that needs a delta reads this before and
+/// after the operation it measures.
+pub fn readback_count() -> u64 {
+    READBACK_COUNT.load(Ordering::SeqCst)
+}
 
 /// Creates a `STORAGE | COPY_DST | COPY_SRC` buffer of exactly `byte_len`
 /// bytes, labelled `label`, with the same usage flags as [`upload_tile`].
@@ -95,6 +110,7 @@ pub fn download_buffer(
     src: &wgpu::Buffer,
     byte_len: u64,
 ) -> Vec<u8> {
+    READBACK_COUNT.fetch_add(1, Ordering::SeqCst);
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("focusforge-gpu-readback-staging"),
         size: byte_len,

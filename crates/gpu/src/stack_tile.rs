@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! The whole-tile pipeline: warp every frame's contribution to `rect` on the
+//! GPU, and fuse the result, keeping every intermediate resident on the
+//! device between the two stages -- its own module, deliberately not
+//! folded into [`crate::pipeline`] (compute-pipeline plumbing) or
+//! [`crate::fuse`] (the fusion kernels alone): this module is the seam
+//! between the warp kernels and the fusion kernels, and naming it after
+//! either alone would be the same naming lie already refused when
+//! `crate::pipeline` was hoisted out of `crate::fuse`.
+//!
+//! **Exactly one readback per tile.** The two `download_buffer` calls
+//! already at the tail of [`crate::fuse::fuse_planes_gpu`] (composite +
+//! Z-Map) are the only reads back to the host anywhere on this path --
+//! nothing between a warped frame's dispatch and the fused result touches
+//! `download_buffer`, `download_f32` or `map_async`.
+
+use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
+use focusforge_core::align::Transform;
+use focusforge_core::tile::{Rect, Tile};
+
+use crate::device::SharedDevice;
+use crate::fuse::{FusionPipelines, GpuPlane, fuse_planes_gpu, plane_from_packed};
+use crate::transfer::upload_tile;
+use crate::warp::{WarpPipelines, warp_tile_dispatch};
+
+/// Drives the whole tile through both stages in one call. Takes no budget:
+/// the caller holds a `VramBudget` permit around it.
+///
+/// `transforms[i]` is frame `i`'s reference-to-frame transform, the same
+/// index-is-frame convention [`focusforge_core::align::WarpingReader`]
+/// already carries. An identity entry is the identical short-circuit "read
+/// `rect` directly" -- no dispatch, just an upload and a
+/// [`plane_from_packed`] join, exactly the same join a warped frame gets.
+#[allow(clippy::too_many_arguments)]
+pub fn warp_fuse_tile_gpu(
+    shared: &SharedDevice,
+    warp_pipelines: &WarpPipelines,
+    fuse_pipelines: &FusionPipelines,
+    reader: &dyn TileReader,
+    frame: (u32, u32),
+    transforms: &[Transform],
+    rect: Rect,
+    samples_per_pixel: u32,
+    levels: u32,
+) -> Result<TileOutput, AlgorithmError> {
+    let device = shared.device();
+    let queue = shared.queue();
+    let frame_count = transforms.len();
+
+    let mut source = |i: usize| -> Result<GpuPlane, AlgorithmError> {
+        let t = &transforms[i];
+        let packed = if *t == Transform::identity() {
+            let mut samples =
+                vec![0u16; rect.width as usize * rect.height as usize * samples_per_pixel as usize];
+            reader.read_tile_into(i, rect, &mut samples)?;
+            let tile = Tile {
+                rect,
+                samples_per_pixel,
+                samples,
+            };
+            upload_tile(device, queue, &tile)
+        } else {
+            let (buffer, _covered) = warp_tile_dispatch(
+                shared,
+                warp_pipelines,
+                reader,
+                i,
+                frame,
+                samples_per_pixel,
+                rect,
+                t,
+            )
+            .map_err(|source| AlgorithmError::Failed {
+                algorithm: "warp".to_string(),
+                detail: source.to_string(),
+            })?;
+            buffer
+        };
+        Ok(plane_from_packed(
+            device,
+            queue,
+            fuse_pipelines,
+            &packed,
+            rect.width,
+            rect.height,
+            samples_per_pixel,
+        ))
+    };
+
+    fuse_planes_gpu(
+        shared,
+        fuse_pipelines,
+        frame_count,
+        rect,
+        samples_per_pixel,
+        levels,
+        &mut source,
+    )
+}

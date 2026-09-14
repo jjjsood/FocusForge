@@ -37,6 +37,38 @@ pub fn skip_message(reason: &str) -> String {
     format!("SKIP: no usable GPU adapter -- {reason}")
 }
 
+/// Which path a `stack`/`align` run takes: the GPU implementation, or the
+/// CPU one. GPU is not opt-in -- a usable adapter is
+/// used automatically, and `--no-gpu` is the only way to force the CPU path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathChoice {
+    Gpu,
+    CpuFallback,
+}
+
+/// Maps a `--no-gpu` flag and a `request_adapter`-shaped result to a path
+/// choice, the adapter (kept on the `Gpu` arm) and one line naming what
+/// happened. `--no-gpu` wins without looking at `result`.
+pub fn choose_path<A: fmt::Display, E: fmt::Display>(
+    forced_cpu: bool,
+    result: Result<A, E>,
+) -> (PathChoice, Result<A, String>, String) {
+    if forced_cpu {
+        let message = "--no-gpu given: forcing the CPU path".to_string();
+        return (PathChoice::CpuFallback, Err(message.clone()), message);
+    }
+    match classify_adapter(result) {
+        AdapterPath::Present(value) => {
+            let message = format!("adapter selected: {value}; using the GPU path");
+            (PathChoice::Gpu, Ok(value), message)
+        }
+        AdapterPath::Absent { reason } => {
+            let message = format!("no usable GPU adapter -- {reason}; continuing on the CPU path");
+            (PathChoice::CpuFallback, Err(reason), message)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +108,48 @@ mod tests {
 
         assert!(message.starts_with("SKIP:"));
         assert!(message.contains("no backend available"));
+    }
+
+    #[test]
+    fn choose_path_on_a_synthetic_err_names_the_reason_and_the_cpu_fallback() {
+        let result: Result<u32, FakeError> = Err(FakeError("no backend available"));
+
+        let (path, value, message) = choose_path(false, result);
+
+        assert_eq!(path, PathChoice::CpuFallback);
+        assert_eq!(value, Err("no backend available".to_string()));
+        assert!(
+            message.contains("no backend available"),
+            "message must name what was missing: {message}"
+        );
+        assert!(
+            message.to_lowercase().contains("cpu"),
+            "message must name the CPU fallback: {message}"
+        );
+    }
+
+    #[test]
+    fn choose_path_on_a_synthetic_ok_names_the_adapter_and_takes_the_gpu_path() {
+        let result: Result<u32, FakeError> = Ok(42);
+
+        let (path, value, message) = choose_path(false, result);
+
+        assert_eq!(path, PathChoice::Gpu);
+        assert_eq!(value, Ok(42));
+        assert!(
+            message.contains("42"),
+            "message must name the adapter: {message}"
+        );
+    }
+
+    #[test]
+    fn choose_path_with_forced_cpu_ignores_a_present_adapter() {
+        let result: Result<u32, FakeError> = Ok(42);
+
+        let (path, value, message) = choose_path(true, result);
+
+        assert_eq!(path, PathChoice::CpuFallback);
+        assert!(value.is_err());
+        assert!(message.contains("--no-gpu"));
     }
 }

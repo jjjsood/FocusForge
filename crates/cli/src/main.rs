@@ -16,8 +16,27 @@ use serde::Serialize;
 
 mod algorithms;
 mod align;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod set;
 mod stack;
+
+/// Resolves whether this run takes the GPU path or the CPU one:
+/// `#[cfg(feature = "gpu")]` delegates to [`gpu::resolve_backend`]; with the
+/// feature off, always `None` -- `stack`/`align` behave exactly as phases 3
+/// and 4 left them, with no GPU probing at all. A crate-root `fn`, not
+/// `pub(crate)`: `stack` and `align` are descendant modules of this one, so
+/// a private item here is already visible to them (the same visibility
+/// `crate::fail` already relies on).
+#[cfg(feature = "gpu")]
+fn resolve_backend(no_gpu: bool) -> Option<&'static dyn focusforge_core::gpu::TileBackend> {
+    gpu::resolve_backend(no_gpu)
+}
+
+#[cfg(not(feature = "gpu"))]
+fn resolve_backend(_no_gpu: bool) -> Option<&'static dyn focusforge_core::gpu::TileBackend> {
+    None
+}
 
 /// FocusForge command-line interface.
 #[derive(Parser)]
@@ -99,6 +118,15 @@ enum Command {
         align_algo: Option<String>,
         #[command(flatten)]
         align_set: set::AlignSetArgs,
+        /// Force the CPU path even when a usable GPU adapter is available.
+        /// Only present when the `gpu` feature is compiled in -- with it
+        /// off, this flag does not exist at all, not even as a no-op.
+        /// Defaults to `true` (the GPU path is used automatically);
+        /// `--no-gpu` is what turns it off (clap `ArgAction::SetFalse`, no
+        /// `default_value` -- clap-rs/clap#4370).
+        #[cfg(feature = "gpu")]
+        #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
+        gpu: bool,
     },
     /// Compute and report the per-frame transforms for a stack: readable
     /// text by default, a frozen `--json` document on request, and an
@@ -127,6 +155,13 @@ enum Command {
         write_warped: Option<PathBuf>,
         #[command(flatten)]
         set: set::SetArgs,
+        /// Force the CPU path even when a usable GPU adapter is available.
+        /// Only present when the `gpu` feature is compiled in. Meaningful
+        /// only with `--write-warped`: plain `align` has nothing on the
+        /// GPU-shaped path (its ECC solver is CPU-only).
+        #[cfg(feature = "gpu")]
+        #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
+        gpu: bool,
     },
 }
 
@@ -147,21 +182,30 @@ fn main() -> ExitCode {
             lax,
             align_algo,
             align_set,
-        } => stack::run(
-            &dir,
-            &output,
-            algo.as_deref(),
-            zmap.as_deref(),
-            json,
-            &set,
-            &align::AlignOptions {
-                align,
-                crop,
-                lax,
-                algo: align_algo.as_deref(),
-                set: &align_set.align_set,
-            },
-        ),
+            #[cfg(feature = "gpu")]
+            gpu,
+        } => {
+            #[cfg(feature = "gpu")]
+            let no_gpu = !gpu;
+            #[cfg(not(feature = "gpu"))]
+            let no_gpu = false;
+            stack::run(
+                &dir,
+                &output,
+                algo.as_deref(),
+                zmap.as_deref(),
+                json,
+                &set,
+                &align::AlignOptions {
+                    align,
+                    crop,
+                    lax,
+                    algo: align_algo.as_deref(),
+                    set: &align_set.align_set,
+                },
+                no_gpu,
+            )
+        }
         Command::Align {
             dir,
             algo,
@@ -169,14 +213,23 @@ fn main() -> ExitCode {
             lax,
             write_warped,
             set,
-        } => align::run(
-            &dir,
-            algo.as_deref(),
-            json,
-            lax,
-            write_warped.as_deref(),
-            &set,
-        ),
+            #[cfg(feature = "gpu")]
+            gpu,
+        } => {
+            #[cfg(feature = "gpu")]
+            let no_gpu = !gpu;
+            #[cfg(not(feature = "gpu"))]
+            let no_gpu = false;
+            align::run(
+                &dir,
+                algo.as_deref(),
+                json,
+                lax,
+                write_warped.as_deref(),
+                &set,
+                no_gpu,
+            )
+        }
     }
 }
 

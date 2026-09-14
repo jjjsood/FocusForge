@@ -7,7 +7,8 @@
 //! `device::adapter_selection_is_reported`,
 //! `transfer::tile_roundtrip_is_bit_identical`,
 //! `parity::harness_kernel_matches_cpu_twin`, `parity_fusion::*`,
-//! `parity_warp::*` -- only resolve as module paths inside one binary.
+//! `parity_warp::*`, `parity_pipeline::*` -- only resolve as module paths
+//! inside one binary.
 
 #![cfg(feature = "gpu")]
 
@@ -19,6 +20,8 @@ mod device;
 mod parity;
 #[path = "harness/parity_fusion.rs"]
 mod parity_fusion;
+#[path = "harness/parity_pipeline.rs"]
+mod parity_pipeline;
 #[path = "harness/parity_warp.rs"]
 mod parity_warp;
 #[path = "harness/transfer.rs"]

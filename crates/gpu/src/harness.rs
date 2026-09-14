@@ -177,6 +177,37 @@ impl TileBackend for GpuBackend {
             transform,
         )
     }
+
+    fn warp_fuse_tile(
+        &self,
+        reader: &dyn TileReader,
+        frame: (u32, u32),
+        transforms: &[Transform],
+        rect: Rect,
+        samples_per_pixel: u32,
+        levels: u32,
+    ) -> Result<TileOutput, AlgorithmError> {
+        crate::stack_tile::warp_fuse_tile_gpu(
+            self.device,
+            &self.warp_pipelines,
+            &self.fuse_pipelines,
+            reader,
+            frame,
+            transforms,
+            rect,
+            samples_per_pixel,
+            levels,
+        )
+    }
+}
+
+impl std::fmt::Display for GpuBackend {
+    /// Delegates to [`GpuBackend::info`]'s own `Display` -- what lets
+    /// `crate::adapter::choose_path`'s `A: fmt::Display` bound name the real
+    /// adapter on the GPU arm, in `crates/cli/src/gpu.rs`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.info())
+    }
 }
 
 static GPU_BACKEND: OnceLock<GpuBackend> = OnceLock::new();

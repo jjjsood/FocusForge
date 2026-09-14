@@ -38,6 +38,8 @@ pub mod limits;
 #[cfg(feature = "gpu")]
 pub(crate) mod pipeline;
 #[cfg(feature = "gpu")]
+pub mod stack_tile;
+#[cfg(feature = "gpu")]
 pub mod transfer;
 #[cfg(feature = "gpu")]
 pub mod warp;

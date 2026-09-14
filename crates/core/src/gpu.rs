@@ -102,6 +102,33 @@ pub trait TileBackend: Send + Sync {
         dst: Rect,
         transform: &Transform,
     ) -> Result<WarpedTile, AlignError>;
+
+    /// Drives the whole tile through both stages in one call: warps every
+    /// frame's contribution to `rect` (an identity entry in `transforms` is
+    /// the identical short-circuit `WarpingReader` uses -- "read `rect`
+    /// directly", never a dispatch) and fuses the result with the
+    /// `laplacian` algorithm's pyramid depth `levels`, keeping every
+    /// intermediate resident on the GPU implementation's own device.
+    /// `transforms[i]` is frame `i`'s reference-to-frame transform, the same
+    /// index-is-frame convention [`crate::align::WarpingReader`]
+    /// already carries -- `transforms.len()` is the frame count, so there is
+    /// no separate `frame_count` argument.
+    ///
+    /// Returns `AlgorithmError`, not `AlignError` like [`Self::warp_tile`]:
+    /// this value crosses into [`crate::tile::TileConsumer::consume`], which
+    /// is `AlgorithmError`-typed, and a warp failure wraps as
+    /// `AlgorithmError::Failed { algorithm: "warp", detail }` exactly the way
+    /// [`crate::align::WarpingReader`] already wraps it -- so
+    /// the two paths' error text is identical.
+    fn warp_fuse_tile(
+        &self,
+        reader: &dyn TileReader,
+        frame: (u32, u32),
+        transforms: &[Transform],
+        rect: Rect,
+        samples_per_pixel: u32,
+        levels: u32,
+    ) -> Result<TileOutput, AlgorithmError>;
 }
 
 /// The rayon CPU twin of the self-check kernel every [`TileBackend`]
@@ -210,6 +237,42 @@ mod tests {
                 dst,
                 transform,
             )
+        }
+
+        fn warp_fuse_tile(
+            &self,
+            reader: &dyn TileReader,
+            frame: (u32, u32),
+            transforms: &[Transform],
+            rect: Rect,
+            samples_per_pixel: u32,
+            levels: u32,
+        ) -> Result<TileOutput, AlgorithmError> {
+            let mut tiles = Vec::with_capacity(transforms.len());
+            for (i, t) in transforms.iter().enumerate() {
+                let tile = if *t == Transform::identity() {
+                    let mut samples =
+                        vec![0u16; (rect.width * rect.height * samples_per_pixel) as usize];
+                    reader.read_tile_into(i, rect, &mut samples)?;
+                    Tile {
+                        rect,
+                        samples_per_pixel,
+                        samples,
+                    }
+                } else {
+                    crate::align::warp::warp_tile(reader, i, frame, samples_per_pixel, rect, t)
+                        .map_err(|source| AlgorithmError::Failed {
+                            algorithm: "warp".to_string(),
+                            detail: source.to_string(),
+                        })?
+                        .tile
+                };
+                tiles.push(tile);
+            }
+            let ctx = TileCtx::new(rect, &tiles);
+            let mut cfg = ParamValues::new();
+            cfg.insert("levels".to_string(), ParamValue::Int(levels as i64));
+            Laplacian.fuse(&ctx, &cfg)
         }
     }
 

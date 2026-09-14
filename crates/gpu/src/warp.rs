@@ -22,6 +22,14 @@ use crate::pipeline::{
 use crate::transfer::{create_storage_buffer, download_buffer, upload_tile};
 use crate::warp_coords::{coords_bytes, map_coords};
 
+/// A packed-`u32` buffer of `byte_len` bytes, explicitly written to zero.
+fn zeroed_packed_buffer(device: &wgpu::Device, queue: &wgpu::Queue, byte_len: u64) -> wgpu::Buffer {
+    let buffer = create_storage_buffer(device, byte_len, "focusforge-gpu-warp-dst-zeroed");
+    let bytes = vec![0u8; byte_len as usize];
+    queue.write_buffer(&buffer, 0, &bytes);
+    buffer
+}
+
 /// The bicubic warp kernel's one pipeline, built through
 /// [`crate::pipeline::build_pipeline`] on first use -- the same
 /// `OnceLock<Pipeline>` shape `crate::harness::GpuBackend`'s own `pipeline`
@@ -88,6 +96,38 @@ pub fn warp_from_tile_gpu(
     dst: Rect,
     t: &Transform,
 ) -> Result<WarpedTile, AlignError> {
+    let sample_count = dst.width as usize * dst.height as usize * src.samples_per_pixel as usize;
+    let (dst_buffer, covered) = warp_dispatch(shared, pipelines, src, frame, dst, t)?;
+
+    let device = shared.device();
+    let queue = shared.queue();
+    let word_count = (packed_len(sample_count) / 4) as u32;
+    let bytes = download_buffer(device, queue, &dst_buffer, u64::from(word_count) * 4);
+    let samples = unpack_samples(&bytes, sample_count);
+
+    Ok(WarpedTile {
+        tile: Tile {
+            rect: dst,
+            samples_per_pixel: src.samples_per_pixel,
+            samples,
+        },
+        covered,
+    })
+}
+
+/// The dispatch half of [`warp_from_tile_gpu`], split off so the fused
+/// pipeline can keep the destination buffer resident on the GPU across the
+/// warp -> fusion boundary instead of reading it back here. Returns the
+/// packed-`u32` destination buffer **unread** plus the host's own coverage
+/// choice (never re-derived from a GPU readback).
+pub(crate) fn warp_dispatch(
+    shared: &SharedDevice,
+    pipelines: &WarpPipelines,
+    src: &Tile,
+    frame: (u32, u32),
+    dst: Rect,
+    t: &Transform,
+) -> Result<(wgpu::Buffer, Vec<bool>), AlignError> {
     let mapped = map_coords(src.rect, frame, dst, t)?;
 
     let device = shared.device();
@@ -139,17 +179,7 @@ pub fn warp_from_tile_gpu(
         "focusforge-gpu-warp-pass",
     );
 
-    let bytes = download_buffer(device, queue, &dst_buffer, u64::from(word_count) * 4);
-    let samples = unpack_samples(&bytes, sample_count);
-
-    Ok(WarpedTile {
-        tile: Tile {
-            rect: dst,
-            samples_per_pixel: spp,
-            samples,
-        },
-        covered: mapped.covered,
-    })
+    Ok((dst_buffer, mapped.covered))
 }
 
 /// Warps destination tile `dst` of `frame_index` (a `frame`-sized frame)
@@ -169,17 +199,58 @@ pub fn warp_tile_gpu(
     dst: Rect,
     t: &Transform,
 ) -> Result<WarpedTile, AlignError> {
+    let sample_count = dst.width as usize * dst.height as usize * samples_per_pixel as usize;
+    let (dst_buffer, covered) = warp_tile_dispatch(
+        shared,
+        pipelines,
+        reader,
+        frame_index,
+        frame,
+        samples_per_pixel,
+        dst,
+        t,
+    )?;
+
+    let device = shared.device();
+    let queue = shared.queue();
+    let word_count = (packed_len(sample_count) / 4) as u32;
+    let bytes = download_buffer(device, queue, &dst_buffer, u64::from(word_count) * 4);
+    let samples = unpack_samples(&bytes, sample_count);
+
+    Ok(WarpedTile {
+        tile: Tile {
+            rect: dst,
+            samples_per_pixel,
+            samples,
+        },
+        covered,
+    })
+}
+
+/// The dispatch half of [`warp_tile_gpu`], split off for the same reason as
+/// [`warp_dispatch`]. On [`SourceFootprint::Outside`], returns a
+/// [`zeroed_packed_buffer`] and `covered: vec![false; ..]`, with no read and
+/// no dispatch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn warp_tile_dispatch(
+    shared: &SharedDevice,
+    pipelines: &WarpPipelines,
+    reader: &dyn TileReader,
+    frame_index: usize,
+    frame: (u32, u32),
+    samples_per_pixel: u32,
+    dst: Rect,
+    t: &Transform,
+) -> Result<(wgpu::Buffer, Vec<bool>), AlignError> {
     match t.source_footprint(dst, frame)? {
         SourceFootprint::Outside => {
             let pixel_count = dst.width as usize * dst.height as usize;
-            Ok(WarpedTile {
-                tile: Tile {
-                    rect: dst,
-                    samples_per_pixel,
-                    samples: vec![0u16; pixel_count * samples_per_pixel as usize],
-                },
-                covered: vec![false; pixel_count],
-            })
+            let sample_count = pixel_count * samples_per_pixel as usize;
+            let word_count = (packed_len(sample_count) / 4) as u64;
+            let device = shared.device();
+            let queue = shared.queue();
+            let buffer = zeroed_packed_buffer(device, queue, word_count * 4);
+            Ok((buffer, vec![false; pixel_count]))
         }
         SourceFootprint::Covers { read, .. } => {
             let mut buf =
@@ -196,7 +267,7 @@ pub fn warp_tile_gpu(
                 samples_per_pixel,
                 samples: buf,
             };
-            warp_from_tile_gpu(shared, pipelines, &src, frame, dst, t)
+            warp_dispatch(shared, pipelines, &src, frame, dst, t)
         }
     }
 }
