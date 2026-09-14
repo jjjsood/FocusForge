@@ -39,6 +39,23 @@ impl ZMapWriter<File> {
         )?;
         Ok(ZMapWriter { inner, info })
     }
+
+    /// Reopens `path` -- delegates to [`TiffWriter::reopen`], re-deriving
+    /// the expected `ImageDescription` through
+    /// [`format_description`]`(info.frame_count())` so the description
+    /// check inside `reopen` is the exact same one [`Self::create`] wrote.
+    pub fn reopen(path: &Path, info: ZMapInfo) -> Result<Self, ZMapError> {
+        let inner = TiffWriter::reopen(
+            path,
+            TiffSpec {
+                width: info.width(),
+                height: info.height(),
+                samples_per_pixel: 1,
+                description: Some(format_description(info.frame_count())),
+            },
+        )?;
+        Ok(ZMapWriter { inner, info })
+    }
 }
 
 impl<W: Write + Seek> ZMapWriter<W> {
@@ -50,6 +67,12 @@ impl<W: Write + Seek> ZMapWriter<W> {
         validate_tile(indices, self.info.frame_count())?;
         self.inner.write_tile(rect, indices)?;
         Ok(())
+    }
+
+    /// Delegates to [`TiffWriter::seed_coverage`] -- marks `rect`'s rows as
+    /// already covered on a reopened writer, without writing any bytes.
+    pub(crate) fn seed_coverage(&mut self, rect: Rect) {
+        self.inner.seed_coverage(rect);
     }
 
     /// Delegates to [`TiffWriter::finish`], which already refuses a

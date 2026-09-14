@@ -49,10 +49,16 @@
 //! ever runs caller code on a rayon worker thread.
 
 pub mod control;
+pub mod fingerprint;
+pub mod ledger;
 pub mod progress;
+pub mod record;
 
 pub use control::{ControlState, JobControl};
+pub use fingerprint::{FingerprintMismatch, FrameCount, FrameFingerprint, StackFingerprint};
+pub use ledger::{Ledger, RecordingConsumer, Resumable, ResumeError, ResumeStore};
 pub use progress::JobProgress;
+pub use record::{AlignIdentity, JOB_RECORD_FORMAT, JobRecord};
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -135,6 +141,43 @@ impl<'a> Job<'a> {
         Job {
             scheduler,
             remaining: tiles.to_vec(),
+            control,
+        }
+    }
+
+    /// Builds a job that resumes from a fresh process: same body as
+    /// [`Self::new`], except `remaining` is the plan's tiles filtered by
+    /// `!completed.contains(&tile.index())`, and the control is
+    /// pre-credited with the completed units and their pixel area (via
+    /// `JobControl::add_progress`) so `unit_total` still reads the whole
+    /// plan and `units_done`/`eta` are honest across a restart rather than
+    /// restarting at zero. `completed` is turned into a `HashSet` once, not
+    /// an `O(n^2)` scan per tile.
+    pub fn resuming(scheduler: &'a TileScheduler<'a>, completed: &[usize]) -> Self {
+        let tiles = scheduler.plan().tiles();
+        let unit_total = tiles.len();
+        let pixel_total: u64 = tiles.iter().map(tile_area).sum();
+
+        let control = JobControl::new();
+        control.set_unit_total(unit_total);
+        control.set_pixel_total(pixel_total);
+
+        let completed_set: HashSet<usize> = completed.iter().copied().collect();
+        let remaining: Vec<PlannedTile> = tiles
+            .iter()
+            .filter(|tile| !completed_set.contains(&tile.index()))
+            .copied()
+            .collect();
+        let completed_pixels: u64 = tiles
+            .iter()
+            .filter(|tile| completed_set.contains(&tile.index()))
+            .map(tile_area)
+            .sum();
+        control.add_progress(completed_set.len(), completed_pixels);
+
+        Job {
+            scheduler,
+            remaining,
             control,
         }
     }

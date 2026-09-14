@@ -53,7 +53,7 @@ use crate::params::{ParamValue, ParamValues, StackContext};
 
 /// Whether every frame registers against one anchor frame, or chains
 /// hop-by-hop through its neighbours toward the reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReferencePolicy {
     Anchor,
@@ -78,7 +78,7 @@ pub enum FailurePolicy {
 }
 
 /// One frame's place in a [`StackAlignment`].
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FrameAlignment {
     pub frame: usize,
     pub transform: Transform,
@@ -98,7 +98,12 @@ pub struct FrameAlignment {
 
 /// The result of one [`align_stack`] run: every frame's outcome, plus which
 /// frame was the reference and under which policy.
-#[derive(Debug, Clone)]
+///
+/// Serializable so a resumed run can reuse a recorded alignment instead of
+/// calling [`align_stack`] again. `PartialEq` is additive, for the
+/// round-trip test comparing a deserialized value against the one that
+/// produced it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StackAlignment {
     pub reference: usize,
     pub policy: ReferencePolicy,

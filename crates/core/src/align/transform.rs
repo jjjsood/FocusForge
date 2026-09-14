@@ -25,7 +25,7 @@
 //!    the output hole-free. [`Transform::inverse`] exists for callers that
 //!    need it, never for the hot loop.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::align::error::AlignError;
 use crate::tile::Rect;
@@ -41,7 +41,7 @@ use crate::tile::Rect;
 /// m }` literal directly (`crate::algorithm`, `crate::test_algorithms`); no
 /// invariant can be enforced at construction, so every invariant this module
 /// needs (invertibility, a finite `w`) is checked where it is used instead.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Transform {
     pub m: [[f64; 3]; 3],
 }

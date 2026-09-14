@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use crate::algorithm::{AlgorithmError, StackAlgorithm};
 use crate::io::{TiffSpec, TiffWriter};
 use crate::params::ParamValues;
-use crate::tile::{Rect, TileConsumer, TileJob};
+use crate::tile::{Rect, TileConsumer, TileJob, TilePlan};
 use crate::zmap::{ZMapInfo, ZMapWriter};
 
 /// Drives one [`StackAlgorithm`] over every tile a scheduler hands it, and
@@ -131,6 +131,161 @@ impl FusionConsumer {
         })
     }
 
+    /// Reopens both output files a previous, interrupted [`Self::create`]
+    /// run already wrote to -- never truncates, mirrors `create` in every
+    /// argument except the trailing `covered` rects, which reseed both
+    /// writers' in-memory coverage trackers so a later `finish()` accepts
+    /// the file once the remaining tiles are written.
+    ///
+    /// `covered` must be exactly the **output-file-coordinate** rects
+    /// `written_rect` produced for every unit a resume is keeping as
+    /// already complete -- the same rects [`Self::consume`] itself writes
+    /// at, via that one shared function, so a resumed run cannot end up
+    /// with a stripe of zeros at a crop edge that a fresh run would not
+    /// have had.
+    pub fn reopen(
+        algorithm: &'static dyn StackAlgorithm,
+        values: ParamValues,
+        composite_path: &Path,
+        zmap_path: Option<&Path>,
+        geometry: FusionGeometry,
+        covered: &[Rect],
+    ) -> Result<Self, AlgorithmError> {
+        let FusionGeometry {
+            width,
+            height,
+            samples_per_pixel,
+            frame_count,
+            crop,
+            description,
+        } = geometry;
+        let full_frame = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let out_rect = crop.unwrap_or(full_frame);
+        let mut composite = TiffWriter::reopen(
+            composite_path,
+            TiffSpec {
+                width: out_rect.width,
+                height: out_rect.height,
+                samples_per_pixel,
+                description,
+            },
+        )?;
+        for &rect in covered {
+            composite.seed_coverage(rect);
+        }
+        let zmap = match zmap_path {
+            Some(zmap_path) => {
+                let zmap_info = ZMapInfo::new(out_rect.width, out_rect.height, frame_count)
+                    .map_err(|source| AlgorithmError::Failed {
+                        algorithm: algorithm.id().to_string(),
+                        detail: source.to_string(),
+                    })?;
+                let mut writer = ZMapWriter::reopen(zmap_path, zmap_info).map_err(|source| {
+                    AlgorithmError::Failed {
+                        algorithm: algorithm.id().to_string(),
+                        detail: source.to_string(),
+                    }
+                })?;
+                for &rect in covered {
+                    writer.seed_coverage(rect);
+                }
+                Some(writer)
+            }
+            None => None,
+        };
+        Ok(FusionConsumer {
+            algorithm,
+            values,
+            composite: Mutex::new(Some(composite)),
+            zmap: Mutex::new(zmap),
+            crop,
+        })
+    }
+
+    /// The resume composition: reopens both output files, filtering
+    /// `completed` (a ledger's recorded-complete unit indices) through the
+    /// composite file's own length -- a recorded unit whose rows the file
+    /// cannot hold is dropped back into the set that must be recomputed,
+    /// never trusted as done (`crate::io::TiffWriter::holds_rows`;
+    /// `crates/core/src/job/ledger.rs`'s own module docs, "The ordering
+    /// rule"). `TiffWriter::holds_rows` and `seed_coverage` are
+    /// `pub(crate)`, so this composition -- the only place both a resume's
+    /// length check and its coverage reseed happen together -- has to live
+    /// inside this crate; this method is the public surface a resume drives
+    /// instead.
+    ///
+    /// Returns the built consumer plus the unit indices that genuinely
+    /// survived the check -- the set [`crate::job::Job::resuming`] must be
+    /// built from, never `completed` itself.
+    pub fn resume(
+        plan: &TilePlan,
+        completed: &[usize],
+        algorithm: &'static dyn StackAlgorithm,
+        values: ParamValues,
+        composite_path: &Path,
+        zmap_path: Option<&Path>,
+        geometry: FusionGeometry,
+    ) -> Result<(Self, Vec<usize>), AlgorithmError> {
+        let crop = geometry.crop;
+        let full_frame = Rect {
+            x: 0,
+            y: 0,
+            width: geometry.width,
+            height: geometry.height,
+        };
+        let out_rect = crop.unwrap_or(full_frame);
+        let probe = TiffWriter::reopen(
+            composite_path,
+            TiffSpec {
+                width: out_rect.width,
+                height: out_rect.height,
+                samples_per_pixel: geometry.samples_per_pixel,
+                description: geometry.description.clone(),
+            },
+        )?;
+
+        let mut surviving_indices = Vec::new();
+        let mut surviving_rects = Vec::new();
+        for &index in completed {
+            let Some(tile) = plan.tiles().get(index) else {
+                // An index outside this plan's geometry -- never trusted.
+                // `ResumeStore::find` already refuses a changed tile
+                // geometry before a caller ever reaches this method; this
+                // is a defensive backstop, not a path a correct caller hits.
+                continue;
+            };
+            match written_rect(tile.interior(), crop) {
+                Some(rect) => {
+                    if probe.holds_rows(rect) {
+                        surviving_indices.push(index);
+                        surviving_rects.push(rect);
+                    }
+                }
+                None => {
+                    // The tile wrote nothing at all (wholly outside the
+                    // crop): trivially complete, nothing to seed.
+                    surviving_indices.push(index);
+                }
+            }
+        }
+        drop(probe);
+
+        let consumer = Self::reopen(
+            algorithm,
+            values,
+            composite_path,
+            zmap_path,
+            geometry,
+            &surviving_rects,
+        )?;
+        Ok((consumer, surviving_indices))
+    }
+
     /// Finishes the composite writer, and the Z-Map writer when one was
     /// created -- both already refuse an incompletely covered frame.
     pub fn finish(self) -> Result<(), AlgorithmError> {
@@ -202,6 +357,23 @@ fn translate_for_crop(rect: Rect, crop: Option<Rect>) -> Rect {
     }
 }
 
+/// The rectangle one tile's `interior` is actually written at in the output
+/// files, given an optional crop -- `intersect(interior, crop)` then
+/// [`translate_for_crop`], factored out of [`FusionConsumer::consume`] so a
+/// resume's [`FusionConsumer::reopen`] seeds coverage with **exactly** the
+/// same arithmetic `consume` used to write it in the first place. Two
+/// copies of this arithmetic is how a resumed run ends up with a
+/// one-tile-wide stripe of zeros at a crop edge. `None` when `interior`
+/// lies wholly outside `crop` -- that tile wrote nothing, so there is
+/// nothing to seed.
+pub(crate) fn written_rect(interior: Rect, crop: Option<Rect>) -> Option<Rect> {
+    let target = match crop {
+        Some(crop) => intersect(interior, crop)?,
+        None => interior,
+    };
+    Some(translate_for_crop(target, crop))
+}
+
 impl TileConsumer for FusionConsumer {
     fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
         let output = self.algorithm.fuse(job.ctx(), &self.values)?;
@@ -231,20 +403,24 @@ impl TileConsumer for FusionConsumer {
                 detail: source.to_string(),
             })?;
 
-        let written_rect = translate_for_crop(target, self.crop);
+        // The same arithmetic `reopen`'s coverage-seeding uses, via the one
+        // shared `written_rect` function -- never a second, independently
+        // written `translate_for_crop` call here.
+        let target_written = written_rect(interior, self.crop)
+            .expect("interior already clipped to the crop above, target is non-empty");
 
         self.composite
             .lock()
             .unwrap()
             .as_mut()
             .expect("composite writer present")
-            .write_tile(written_rect, &cropped_composite)?;
+            .write_tile(target_written, &cropped_composite)?;
 
         if let Some(zmap_writer) = self.zmap.lock().unwrap().as_mut() {
             let mut cropped_zmap = vec![0u16; target.width as usize * target.height as usize];
             crop_zmap_into(&output.zmap, job.read_rect(), target, &mut cropped_zmap);
             zmap_writer
-                .write_tile(written_rect, &cropped_zmap)
+                .write_tile(target_written, &cropped_zmap)
                 .map_err(|source| AlgorithmError::Failed {
                     algorithm: self.algorithm.id().to_string(),
                     detail: source.to_string(),
@@ -294,5 +470,60 @@ mod tests {
         // row 0: idx (3*6+3)=21, 22 -> [21, 22]
         // row 1: idx (4*6+3)=27, 28 -> [27, 28]
         assert_eq!(out, vec![21, 22, 27, 28]);
+    }
+
+    #[test]
+    fn written_rect_matches_intersect_then_translate_with_no_crop() {
+        let interior = Rect {
+            x: 10,
+            y: 20,
+            width: 5,
+            height: 6,
+        };
+        assert_eq!(written_rect(interior, None), Some(interior));
+    }
+
+    #[test]
+    fn written_rect_clips_and_translates_against_a_crop() {
+        let interior = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let crop = Rect {
+            x: 5,
+            y: 5,
+            width: 10,
+            height: 10,
+        };
+        // Overlap in absolute coordinates is [5,10) -- a 5x5 rect --
+        // translated by -(5,5) to output-file coordinates.
+        assert_eq!(
+            written_rect(interior, Some(crop)),
+            Some(Rect {
+                x: 0,
+                y: 0,
+                width: 5,
+                height: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn written_rect_is_none_when_wholly_outside_the_crop() {
+        let interior = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let crop = Rect {
+            x: 100,
+            y: 100,
+            width: 10,
+            height: 10,
+        };
+        assert_eq!(written_rect(interior, Some(crop)), None);
     }
 }

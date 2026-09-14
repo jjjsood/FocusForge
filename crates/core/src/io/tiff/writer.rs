@@ -10,12 +10,12 @@
 //! [`finish`](TiffWriter::finish) refuses a frame that is not fully covered
 //! rather than silently accepting a hole or a double write.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::super::error::TiffError;
-use super::header::TAG_STRIP_OFFSETS;
+use super::header::{ByteOrder, TAG_STRIP_OFFSETS, TiffHeader};
 use crate::tile::Rect;
 
 const TAG_IMAGE_WIDTH: u16 = 256;
@@ -66,6 +66,162 @@ impl TiffWriter<File> {
         writer.path = path.to_path_buf();
         Ok(writer)
     }
+
+    /// Reopens `path` -- an existing file this writer (or an interrupted
+    /// prior run of it) already created via [`Self::create`] -- for further
+    /// [`write_tile`](TiffWriter::write_tile) calls, refusing anything that
+    /// is not the exact layout `create` would itself have produced.
+    ///
+    /// **Never truncates**: `OpenOptions::read(true).write(true)`, not
+    /// `File::create` (`create` would truncate the file this reopen must
+    /// extend).
+    /// Coverage starts empty, exactly like a freshly created writer -- a
+    /// caller reseeds it with `seed_coverage` for whatever rows the
+    /// file already durably holds (checked with `holds_rows`) before
+    /// writing anything further, so `finish()` accepts a resumed file only
+    /// once seeded coverage plus newly written rows again cover every row.
+    pub fn reopen(path: &Path, spec: TiffSpec) -> Result<Self, TiffError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|source| TiffError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let header = TiffHeader::parse(path, &file)?;
+        let (pixel_start, row_bytes) = validate_reopen(path, &header, &spec)?;
+
+        Ok(TiffWriter {
+            sink: file,
+            path: path.to_path_buf(),
+            width: header.width,
+            height: header.height,
+            samples_per_pixel: header.samples_per_pixel,
+            pixel_start,
+            row_bytes,
+            coverage: vec![Vec::new(); header.height as usize],
+            row_buf: Vec::new(),
+        })
+    }
+
+    /// Whether the file on disk currently holds every byte
+    /// [`write_tile`](TiffWriter::write_tile) would have written for
+    /// `rect`. The tested answer to "a ledger entry whose intermediate is
+    /// missing or short" (`crates/core/src/job/ledger.rs`'s own module
+    /// docs, "The ordering rule"): a recorded-complete unit whose interior
+    /// this returns `false` for must be dropped back into the recomputed
+    /// set, never trusted as done. A missing file is the degenerate case,
+    /// handled one layer up (`crate::job::ResumeStore::find` skips a
+    /// candidate whose `composite_output` does not exist at all).
+    ///
+    /// **Checked against `rect`'s own last written byte, not the row's full
+    /// width.** `write_tile` seeks to, and writes, exactly `rect.width *
+    /// samples_per_pixel * 2` bytes per row -- never the whole frame row --
+    /// so a rect that does not reach the frame's right edge (any tile but
+    /// the last column, in the common multi-column tile plan this crate
+    /// ships) never extends the file out to a full `row_bytes` stride on
+    /// its own. Gating on `pixel_start + (rect.y + rect.height) * row_bytes`
+    /// alone would therefore misreport nearly every non-last-column tile as
+    /// "not held" even when its own bytes are entirely present and durable
+    /// -- the resume would recompute units it never needed to. Within one
+    /// `write_tile` call rows are written in order `0..height` on a single
+    /// thread, so the **last** row's write is the last byte this rect's own
+    /// call could have produced; checking the file reaches that exact
+    /// offset is both necessary and sufficient for "this rect's own write
+    /// completed", with no assumption about any other tile's rect.
+    pub(crate) fn holds_rows(&self, rect: Rect) -> bool {
+        let file_len = self.sink.metadata().map(|m| m.len()).unwrap_or(0);
+        let last_row = self.pixel_start + (rect.y + rect.height - 1) as u64 * self.row_bytes;
+        let last_row_end =
+            last_row + (rect.x + rect.width) as u64 * self.samples_per_pixel as u64 * 2;
+        file_len >= last_row_end
+    }
+}
+
+/// `"FocusForge <CARGO_PKG_VERSION>"` -- the default `ImageDescription`
+/// every writer falls back to when [`TiffSpec::description`] is `None`, in
+/// one place so [`TiffWriter::new`] and [`validate_reopen`] can never drift
+/// apart on the formula.
+fn default_description() -> String {
+    format!("FocusForge {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// `spec`'s effective `ImageDescription`, applying the same default
+/// [`TiffWriter::new`] does.
+fn spec_description(spec: &TiffSpec) -> String {
+    spec.description.clone().unwrap_or_else(default_description)
+}
+
+/// Shared by [`TiffWriter::<File>::reopen`]: validates `spec` against an
+/// already-parsed header, refusing anything that is not the file `create`
+/// would itself have produced -- byte order, compression, `RowsPerStrip`,
+/// dimensions, description, and an arithmetic strip-offset table
+/// (`pixel_start + s * row_bytes`, taken from `strip_offsets[0]` and
+/// `header.row_bytes()` rather than recomputed, so a layout the parse
+/// accepted is the layout the writer uses). Returns `(pixel_start,
+/// row_bytes)` for the caller to build a [`TiffWriter`] from. Factored out
+/// as a free function (not tied to `W`) so a unit test can drive it over a
+/// header parsed from a `Cursor<Vec<u8>>`, with no real file.
+fn validate_reopen(
+    path: &Path,
+    header: &TiffHeader,
+    spec: &TiffSpec,
+) -> Result<(u64, u64), TiffError> {
+    macro_rules! check {
+        ($field:literal, $expected:expr, $found:expr) => {
+            if $expected != $found {
+                return Err(TiffError::ReopenMismatch {
+                    path: path.to_path_buf(),
+                    field: $field,
+                    expected: format!("{:?}", $expected),
+                    found: format!("{:?}", $found),
+                });
+            }
+        };
+    }
+
+    check!("byte_order", ByteOrder::Little, header.byte_order);
+    check!("compression", 1u16, header.compression);
+    check!("rows_per_strip", 1u32, header.rows_per_strip);
+    check!("width", spec.width, header.width);
+    check!("height", spec.height, header.height);
+    check!(
+        "samples_per_pixel",
+        spec.samples_per_pixel,
+        header.samples_per_pixel
+    );
+
+    let expected_description = spec_description(spec);
+    check!(
+        "image_description",
+        Some(expected_description.clone()),
+        header.image_description.clone()
+    );
+
+    let row_bytes = header.row_bytes();
+    let pixel_start = *header
+        .strip_offsets
+        .first()
+        .ok_or_else(|| TiffError::ReopenMismatch {
+            path: path.to_path_buf(),
+            field: "strip_offsets",
+            expected: "at least one strip".to_string(),
+            found: "none".to_string(),
+        })?;
+    for (s, &offset) in header.strip_offsets.iter().enumerate() {
+        let expected_offset = pixel_start + s as u64 * row_bytes;
+        if offset != expected_offset {
+            return Err(TiffError::ReopenMismatch {
+                path: path.to_path_buf(),
+                field: "strip_offsets",
+                expected: expected_offset.to_string(),
+                found: offset.to_string(),
+            });
+        }
+    }
+
+    Ok((pixel_start, row_bytes))
 }
 
 impl<W: Write + Seek> TiffWriter<W> {
@@ -83,8 +239,7 @@ impl<W: Write + Seek> TiffWriter<W> {
         } = spec;
         let path = PathBuf::new();
 
-        let description =
-            description.unwrap_or_else(|| format!("FocusForge {}", env!("CARGO_PKG_VERSION")));
+        let description = description.unwrap_or_else(default_description);
         let mut description_bytes = description.into_bytes();
         description_bytes.push(0);
 
@@ -257,6 +412,24 @@ impl<W: Write + Seek> TiffWriter<W> {
             );
         }
         Ok(())
+    }
+
+    /// Marks `rect`'s rows as already covered, without writing any bytes --
+    /// what a [`TiffWriter::<File>::reopen`]ed writer's coverage tracker is
+    /// reseeded with, for whatever rows [`TiffWriter::<File>::holds_rows`]
+    /// confirms the file already durably holds, before `finish()` can accept
+    /// a resumed file. `pub(crate)`, never `pub`: a public "mark this
+    /// covered" would be a way to make `finish()` accept a file with a hole
+    /// in it.
+    pub(crate) fn seed_coverage(&mut self, rect: Rect) {
+        for r in 0..rect.height {
+            let row = rect.y + r;
+            insert_interval(
+                &mut self.coverage[row as usize],
+                rect.x,
+                rect.x + rect.width,
+            );
+        }
     }
 
     /// `Ok(())` only when every row's merged coverage is exactly
@@ -530,5 +703,190 @@ mod tests {
             actual, expected,
             "bytes at each row's computed offset must equal what write_tile wrote"
         );
+    }
+
+    // --- reopen ------------------------------------------------------------
+
+    /// The `validate_reopen` logic exercised over a `Cursor<Vec<u8>>`'s
+    /// parsed header -- no real file, so the mismatch checks are pinned
+    /// without filesystem I/O.
+    #[test]
+    fn validate_reopen_accepts_the_header_it_would_itself_produce() {
+        let writer = TiffWriter::new(Cursor::new(Vec::new()), spec(4, 4, 1)).unwrap();
+        let header = parse_cursor(&writer.sink);
+        let (pixel_start, row_bytes) =
+            validate_reopen(Path::new("test.tif"), &header, &spec(4, 4, 1)).unwrap();
+        assert_eq!(pixel_start, writer.pixel_start);
+        assert_eq!(row_bytes, writer.row_bytes);
+    }
+
+    #[test]
+    fn validate_reopen_refuses_a_mismatched_width() {
+        let writer = TiffWriter::new(Cursor::new(Vec::new()), spec(4, 4, 1)).unwrap();
+        let header = parse_cursor(&writer.sink);
+        match validate_reopen(Path::new("test.tif"), &header, &spec(8, 4, 1)) {
+            Err(TiffError::ReopenMismatch { field: "width", .. }) => {}
+            other => panic!("expected ReopenMismatch on width, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_reopen_refuses_a_mismatched_description() {
+        let writer = TiffWriter::new(Cursor::new(Vec::new()), spec(4, 4, 1)).unwrap();
+        let header = parse_cursor(&writer.sink);
+        let mut mismatched = spec(4, 4, 1);
+        mismatched.description = Some("something else".to_string());
+        match validate_reopen(Path::new("test.tif"), &header, &mismatched) {
+            Err(TiffError::ReopenMismatch {
+                field: "image_description",
+                ..
+            }) => {}
+            other => panic!("expected ReopenMismatch on image_description, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_reopen_refuses_a_mismatched_rows_per_strip() {
+        // A header whose RowsPerStrip is not 1 (e.g. a real stack frame's
+        // multi-row strips) must never be accepted for reopen -- this
+        // writer's whole layout assumes one strip per row.
+        let mut header = parse_cursor(
+            &TiffWriter::new(Cursor::new(Vec::new()), spec(4, 4, 1))
+                .unwrap()
+                .sink,
+        );
+        header.rows_per_strip = 2;
+        match validate_reopen(Path::new("test.tif"), &header, &spec(4, 4, 1)) {
+            Err(TiffError::ReopenMismatch {
+                field: "rows_per_strip",
+                ..
+            }) => {}
+            other => panic!("expected ReopenMismatch on rows_per_strip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reopen_accepts_the_file_it_wrote_and_seeded_coverage_plus_new_rows_finish() {
+        let dir =
+            std::env::temp_dir().join(format!("ff-tiff-writer-reopen-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("reopen.tif");
+        let _ = std::fs::remove_file(&path);
+
+        // First "segment": write rows 0..2 of a 4x4 frame, then simulate a
+        // crash by dropping the writer without calling `finish()`.
+        {
+            let mut writer = TiffWriter::create(&path, spec(4, 4, 1)).unwrap();
+            for y in 0..2u32 {
+                writer
+                    .write_tile(
+                        Rect {
+                            x: 0,
+                            y,
+                            width: 4,
+                            height: 1,
+                        },
+                        &[9u16; 4],
+                    )
+                    .unwrap();
+            }
+            // Dropped here, unfinished -- the coverage tracker (in-memory)
+            // is lost, but the bytes already reached the OS.
+        }
+
+        // Reopen: coverage starts empty again, so it must be reseeded for
+        // the rows already on disk before `finish()` can succeed.
+        let mut reopened = TiffWriter::<File>::reopen(&path, spec(4, 4, 1)).unwrap();
+        assert!(reopened.holds_rows(Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 2,
+        }));
+        assert!(!reopened.holds_rows(Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        }));
+        reopened.seed_coverage(Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 2,
+        });
+        for y in 2..4u32 {
+            reopened
+                .write_tile(
+                    Rect {
+                        x: 0,
+                        y,
+                        width: 4,
+                        height: 1,
+                    },
+                    &[9u16; 4],
+                )
+                .unwrap();
+        }
+        reopened
+            .finish()
+            .expect("seeded plus newly written rows must cover the whole frame");
+
+        let bytes = std::fs::read(&path).unwrap();
+        // Every pixel byte must equal 9 (as u16 LE) -- the header is proven
+        // unchanged by `header_parse_reads_kilobytes_not_the_file` and the
+        // other layout tests above; this test only needs the pixel bytes.
+        let header = TiffHeader::open(&path).unwrap();
+        let pixel_start = header.strip_offsets[0] as usize;
+        for i in 0..16usize {
+            let off = pixel_start + i * 2;
+            let value = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+            assert_eq!(value, 9, "pixel {i} must be 9");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_refuses_a_file_that_never_finished_with_wrong_dimensions() {
+        let dir = std::env::temp_dir().join(format!(
+            "ff-tiff-writer-reopen-mismatch-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("mismatch.tif");
+        let _ = std::fs::remove_file(&path);
+        TiffWriter::create(&path, spec(4, 4, 1)).unwrap();
+
+        match TiffWriter::<File>::reopen(&path, spec(8, 8, 1)) {
+            Err(TiffError::ReopenMismatch { field: "width", .. }) => {}
+            Ok(_) => panic!("expected ReopenMismatch on width, got Ok"),
+            Err(other) => panic!("expected ReopenMismatch on width, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finish_refuses_an_incomplete_frame_stays_green_after_reopen_additions() {
+        // Regression pin: `reopen`/`seed_coverage`/`holds_rows` are
+        // additive and must not change `finish`'s existing refusal.
+        let mut writer = TiffWriter::new(Cursor::new(Vec::new()), spec(4, 4, 1)).unwrap();
+        for y in 0..3u32 {
+            writer
+                .write_tile(
+                    Rect {
+                        x: 0,
+                        y,
+                        width: 4,
+                        height: 1,
+                    },
+                    &[1u16; 4],
+                )
+                .unwrap();
+        }
+        match writer.finish() {
+            Err(TiffError::IncompleteFrame { row, .. }) => assert_eq!(row, 3),
+            other => panic!("expected IncompleteFrame naming row 3, got {other:?}"),
+        }
     }
 }
