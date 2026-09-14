@@ -1,0 +1,210 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! A per-sample gain and clamp kernel, deliberately arithmetically obvious
+//! so a wrong kernel is never confused with a wrong buffer layout.
+//!
+//! Every kernel in this crate is loaded from a sibling `.wgsl` file via
+//! `include_str!`, never a Rust string literal --
+//! [`harness_gain.wgsl`](../src/harness_gain.wgsl) is the example.
+
+use std::sync::OnceLock;
+
+use focusforge_core::algorithm::{AlgorithmError, TileReader};
+use focusforge_core::gpu::{BackendInfo, TileBackend};
+use focusforge_core::tile::{Rect, Tile};
+
+use crate::device::{GpuError, SharedDevice, shared_device};
+use crate::pack::{packed_len, unpack_samples};
+use crate::transfer::{download_buffer, upload_tile};
+
+struct Pipeline {
+    compute: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+/// [`TileBackend`] implementation for the harness kernel. The compute
+/// pipeline is built once, lazily, on first use; the bind group is rebuilt
+/// per call because each call uploads fresh buffers.
+pub struct HarnessBackend {
+    device: &'static SharedDevice,
+    pipeline: OnceLock<Pipeline>,
+}
+
+impl HarnessBackend {
+    fn new(device: &'static SharedDevice) -> Self {
+        HarnessBackend {
+            device,
+            pipeline: OnceLock::new(),
+        }
+    }
+
+    fn pipeline(&self) -> &Pipeline {
+        self.pipeline.get_or_init(|| {
+            let device = self.device.device();
+
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("focusforge-gpu-harness-gain"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("harness_gain.wgsl").into()),
+            });
+
+            let bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("focusforge-gpu-harness-bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("focusforge-gpu-harness-pipeline-layout"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            });
+
+            let compute = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("focusforge-gpu-harness-pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+            Pipeline {
+                compute,
+                bind_group_layout,
+            }
+        })
+    }
+}
+
+impl TileBackend for HarnessBackend {
+    fn info(&self) -> BackendInfo {
+        self.device.info().clone()
+    }
+
+    fn self_check(
+        &self,
+        reader: &dyn TileReader,
+        frame: usize,
+        rect: Rect,
+        samples_per_pixel: u32,
+        gain: f32,
+    ) -> Result<Tile, AlgorithmError> {
+        let sample_count = (rect.width * rect.height * samples_per_pixel) as usize;
+        let mut samples = vec![0u16; sample_count];
+        reader.read_tile_into(frame, rect, &mut samples)?;
+        let tile = Tile {
+            rect,
+            samples_per_pixel,
+            samples,
+        };
+
+        let device = self.device.device();
+        let queue = self.device.queue();
+
+        let word_count = (packed_len(sample_count) / 4) as u32;
+        let byte_len = u64::from(word_count) * 4;
+
+        let src_buffer = upload_tile(device, queue, &tile);
+        let dst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("focusforge-gpu-harness-dst"),
+            size: byte_len,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let mut params = [0u8; 16];
+        params[0..4].copy_from_slice(&word_count.to_le_bytes());
+        params[4..8].copy_from_slice(&(sample_count as u32).to_le_bytes());
+        params[8..12].copy_from_slice(&gain.to_le_bytes());
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("focusforge-gpu-harness-params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&params_buffer, 0, &params);
+
+        let pipeline = self.pipeline();
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("focusforge-gpu-harness-bind-group"),
+            layout: &pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: src_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dst_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("focusforge-gpu-harness-encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("focusforge-gpu-harness-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline.compute);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(word_count.div_ceil(64), 1, 1);
+        }
+        queue.submit(Some(encoder.finish()));
+
+        let bytes = download_buffer(device, queue, &dst_buffer, byte_len);
+        let samples = unpack_samples(&bytes, sample_count);
+
+        Ok(Tile {
+            rect,
+            samples_per_pixel,
+            samples,
+        })
+    }
+}
+
+static HARNESS: OnceLock<HarnessBackend> = OnceLock::new();
+
+/// The process-wide harness backend, built once atop [`shared_device`] --
+/// no test builds its own.
+pub fn harness_backend() -> Result<&'static HarnessBackend, &'static GpuError> {
+    let device = shared_device()?;
+    Ok(HARNESS.get_or_init(|| HarnessBackend::new(device)))
+}

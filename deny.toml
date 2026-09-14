@@ -31,3 +31,14 @@ allow = [
     "ISC",        # libloading (wgpu-hal tree)
     "CC0-1.0",    # hexf-parse (naga, via wgpu)
 ]
+
+# The wgpu major is pinned to 29 by Slint's `unstable-wgpu-29`
+# (crates/gpu/src/lib.rs). A blanket `[bans] multiple-versions = "deny"` is
+# deliberately not used: Cargo.lock already carries unrelated duplicate
+# versions of foldhash, hashbrown, jni-sys and syn, and a blanket policy
+# would demand a growing skip list maintained for that churn -- exactly
+# where a real wgpu duplication would eventually be silenced. This targeted
+# form fails the gate by name on a second wgpu major, with no collateral.
+[[bans.deny]]
+name = "wgpu"
+deny-multiple-versions = true
