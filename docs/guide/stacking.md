@@ -47,6 +47,20 @@ per pixel, which source frame contributed:
 focusforge-cli stack path/to/frames/ -o out.tif --algo depth-map --zmap zmap.tif
 ```
 
+## Using the GPU
+
+Build with `--features gpu` (`cargo build --release --features gpu`) to
+enable a GPU-accelerated fusion path for the `laplacian` algorithm —
+`weighted-average` and `depth-map` always run on the CPU. When that feature
+is compiled in and a usable adapter is present, `stack` uses it
+automatically; there is no opt-in flag. `--no-gpu` forces the CPU path
+regardless. A missing or unusable adapter falls back to the CPU path on its
+own, printing why on stderr, never silently and never as a hard failure.
+Every GPU kernel produces the same result as its CPU counterpart, to within
+1 LSB at 16-bit, so switching backends changes speed, not the output — see
+`--json`'s `backend` field in
+[`reference/cli.md`](../reference/cli.md#stack) to confirm which one ran.
+
 ## Reading the result
 
 ```bash
