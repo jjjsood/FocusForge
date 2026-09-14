@@ -116,11 +116,15 @@ impl SharedDevice {
         &self.info
     }
 
-    /// The limits the device was actually created with -- `required_limits()`
-    /// (i.e. `wgpu::Limits::downlevel_defaults()`), never raised here. This
-    /// is what wgpu validates every allocation against, which is why the
-    /// device-budget's pre-dispatch refusal checks this value rather than
-    /// [`Self::adapter_limits`].
+    /// The limits the device was actually created with --
+    /// `crate::limits::device_limits(&adapter.limits())`, **not** the
+    /// unraised `required_limits()` floor: this device is also handed to
+    /// Slint's swapchain, so its `max_texture_dimension_{1d,2d,3d}` are
+    /// widened to the adapter's own resolution while every compute limit
+    /// and both buffer limits stay exactly at `required_limits()`'s stated
+    /// floor. This is what wgpu validates every allocation against, which
+    /// is why the device-budget's pre-dispatch refusal checks this value
+    /// rather than [`Self::adapter_limits`].
     pub fn limits(&self) -> &wgpu::Limits {
         &self.limits
     }
@@ -129,7 +133,7 @@ impl SharedDevice {
     /// were ever raised -- reported as headroom in the device-budget's
     /// refusal message, never as the threshold itself (that is [`Self::limits`]).
     /// `wgpu::Limits` by value, the same way `adapter.limits()` is already
-    /// used at [`init`]'s own shortfall check, above.
+    /// used at `init`'s own shortfall check, above.
     pub fn adapter_limits(&self) -> wgpu::Limits {
         self.adapter.limits()
     }

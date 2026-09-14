@@ -289,11 +289,6 @@ impl VramBudget {
         }
     }
 
-    /// The ceiling this budget was constructed with.
-    pub fn max_device_bytes(&self) -> u64 {
-        self.max_device_bytes
-    }
-
     /// The in-flight limit for a tile costing `bytes_per_tile` device
     /// bytes -- the live path [`Self::acquire`] itself calls, not a
     /// test-only helper.
