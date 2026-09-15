@@ -5,9 +5,9 @@
 ```
 crates/core/   TIFF I/O, tiles, stacking algorithms and the Z-Map
 crates/gpu/    the shared wgpu device, WGSL fusion/warp kernels and the
-               tile-scheduler pipeline that runs them, behind the `gpu` feature.
-               A stated 1 GiB VRAM working-set budget bounds how many tiles
-               that pipeline keeps in flight on the device at once, mirroring
+               tile-scheduler pipeline that runs them, behind the `gpu`
+               feature (on by default). An allocate-and-back-off probe at
+               startup discovers the device's usable VRAM budget, mirroring
                `crates/core`'s own host-memory budget one crate over
 crates/cli/    focusforge-cli, the headless interface
 crates/gui/    the planned Slint application; no code yet
@@ -20,12 +20,13 @@ fixtures/      small checked-in TIFF crops used by the test suite
 Rust, edition 2024, toolchain pinned to `1.95.0` (`rust-toolchain.toml`).
 `focusforge-core` depends on `memmap2`, `thiserror`, `inventory` (algorithm
 registration), `rayon` and `serde`; `focusforge-gpu` declares
-`wgpu = "29.0.4"`, gated behind its own `gpu` Cargo feature (off by
-default, so `cargo build --workspace` alone never needs a GPU or a
-Vulkan/Metal/DX12-capable driver); `focusforge-cli` adds `clap`, `serde`
-and `serde_json`, and forwards the same `gpu` feature to enable `--no-gpu`
-and the automatic GPU path on `stack`/`align`. Every dependency's license
-is checked against an allowlist in
+`wgpu = "29.0.4"`, gated behind its own `gpu` Cargo feature, on by default on
+both `focusforge-gpu` and `focusforge-cli` (`--no-default-features` excludes
+it, so `cargo build --workspace --no-default-features` is the invocation
+that never needs a GPU or a Vulkan/Metal/DX12-capable driver); `focusforge-cli`
+adds `clap`, `serde` and `serde_json`, and forwards the same `gpu` feature to
+enable `--no-gpu` and the automatic GPU path on `stack`/`align`. Every
+dependency's license is checked against an allowlist in
 `deny.toml` with `cargo deny check licenses` (install with
 `cargo install cargo-deny --locked`). Building the Slint spikes under
 `spikes/` additionally needs `libfontconfig1-dev` (or an equivalent
