@@ -30,6 +30,7 @@ use focusforge_core::params::{self, ParamValue, ParamValues, Provenance, StackCo
 use focusforge_core::project::{self, Metrics, PROJECT_EXTENSION};
 use focusforge_core::registry;
 use focusforge_core::tile::{NoopPreprocess, TileConsumer, TileScheduler, TileSchedulerOptions};
+use focusforge_core::timing::{Stage, StageTimer};
 use serde::Serialize;
 
 use crate::align::{AlignOptions, AlignmentEntry, resolve_align_algo};
@@ -79,6 +80,23 @@ pub struct StackReport {
     /// `false` for a computed one, a `--resume` ledger-peeked one, or a
     /// `--no-align` run. Additive field.
     pub align_cached: bool,
+    /// Wall-clock stage breakdown -- `setup`/`align`/`fuse`/`finalize` as
+    /// seconds, `warp_write` always `null` (`stack` never enters it). Every
+    /// figure is wall clock, never CPU time; the four non-null stages sum
+    /// exactly to `wall_seconds`, because the spans are contiguous and
+    /// disjoint by construction -- see
+    /// [`focusforge_core::timing::StageTimings`]'s own rustdoc for the full
+    /// contract, including what a parallel stage's number means.
+    pub stages: focusforge_core::timing::StageTimings,
+    /// How this run's `align` stage was satisfied: `"computed"` (a real
+    /// `align_stack` solve), `"cached"` (the stage cache),
+    /// `"resumed"` (a `--resume` ledger peek), or `"skipped"`
+    /// (`--no-align`, so `stages.align` is `null`). `align_cached` alone
+    /// cannot tell a resumed run from a genuinely fast alignment -- both
+    /// spend a few milliseconds inside the stage and neither is a compute
+    /// -- so this field, not that one, is what a later run compares before
+    /// reading a stage number as a real cost. Additive field.
+    pub align_source: String,
 }
 
 /// `stack --json`'s `align` field: `null` when `--no-align` was given.
@@ -726,6 +744,9 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     let dir: &Path = dir;
 
     let start = Instant::now();
+    // `cancelled` already use for `wall_seconds`, so a completed run's
+    // stage breakdown and its own `wall_seconds` share one clock exactly.
+    let mut timer = StageTimer::from_start(start);
     let mut renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.quiet));
     let status = StatusSink::new(preset_opts.status, identity, "stack");
     status.set_algorithm(algo.id());
@@ -841,6 +862,12 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // `true` only when the alignment came from the stage cache --
     // never for a computed one, a ledger-peeked one, or a `--no-align` run.
     let mut align_cached = false;
+    // `align_cached` alone cannot tell a `--resume` reuse from a genuinely
+    // fast compute (both are `false`), so this field names all four ways
+    // the align stage can be satisfied. Overwritten below the moment any
+    // non-`--no-align` path is taken; stays `"skipped"` only when
+    // `align_prepared` is `None`.
+    let mut align_source = "skipped".to_string();
 
     // Step 8.5a: *resolving* the alignment algorithm and its parameters is
     // pure -- registry lookup, `--align-set`/`[align]` validation, `auto`
@@ -972,6 +999,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         return GroupResult::DryRun(Box::new(plan));
     }
 
+    timer.mark(Stage::Setup);
     if let Some((align_algo, _, align_values, align_params)) = align_prepared {
         // Step 5: resolved once, fed both to the identity below and to
         // `align_stack` (never re-derived in the miss arm).
@@ -1004,6 +1032,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         if let Some(peeked) = peeked.filter(|p| p.alignment.is_some()) {
             let result = peeked.alignment.expect("filtered to Some above");
             used_peeked_alignment = true;
+            align_source = "resumed".to_string();
             alignment_result = Some((align_algo, result, align_values, align_params));
         } else {
             // Step 6: the stage cache lookup. Consulted only when the
@@ -1020,6 +1049,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
 
             if let Some(result) = cache_hit {
                 align_cached = true;
+                align_source = "cached".to_string();
                 renderer.stage(&format!(
                     "align {} frames (reused from the stage cache)",
                     stack.len()
@@ -1083,9 +1113,14 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 {
                     eprintln!("warning: {err}");
                 }
+                align_source = "computed".to_string();
                 alignment_result = Some((align_algo, result, align_values, align_params));
             }
         }
+        // Marked only inside this arm: `--no-align` never enters this
+        // `if let` at all, so the stage stays `None` -- "not entered"
+        // rather than a near-zero measured span.
+        timer.mark(Stage::Align);
     }
 
     // The alignment used to compute the crop and to drive the tile reader:
@@ -1405,6 +1440,11 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         );
         return cancelled(&status, start);
     }
+    // Marked only past the cancel return above: a cancelled run's timer is
+    // dropped with `GroupResult::Cancelled`, never turned into
+    // `StageTimings`; folding `prepare` into `fuse` means this one mark
+    // also closes the scheduler build/staging/ledger-open span above.
+    timer.mark(Stage::Fuse);
     debug_assert_eq!(
         outcome,
         JobOutcome::Completed,
@@ -1504,6 +1544,10 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         }
     });
 
+    timer.mark(Stage::Finalize);
+    let wall_seconds = timer.total_seconds();
+    let stages = timer.finish();
+
     let plan = scheduler.plan();
     let report = StackReport {
         input: dir.display().to_string(),
@@ -1530,7 +1574,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         in_flight_limit,
         peak_in_flight,
         outputs,
-        wall_seconds: start.elapsed().as_secs_f64(),
+        wall_seconds,
         output_width: applied_crop.map(|r| r.width).unwrap_or(width),
         output_height: applied_crop.map(|r| r.height).unwrap_or(height),
         crop: applied_crop,
@@ -1538,6 +1582,8 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         align: align_report,
         backend: backend_id,
         align_cached,
+        stages,
+        align_source,
     };
 
     GroupResult::Completed(Box::new(report))
@@ -1788,7 +1834,27 @@ fn render(report: &StackReport) -> String {
         lines.push(format!("wrote: {output}"));
     }
     lines.push(format!("wall: {:.3}s", report.wall_seconds));
+    lines.push(format!(
+        "stages: {} {} {} {}",
+        stage_fact("setup", report.stages.setup),
+        stage_fact("align", report.stages.align),
+        stage_fact("fuse", report.stages.fuse),
+        stage_fact("finalize", report.stages.finalize),
+    ));
     lines.join("\n")
+}
+
+/// One `stages:` fact -- `"{name}={value:.3}s"` for a stage that was
+/// entered, `"{name}=not-entered"` for one that was not. Never
+/// `"{name}=0.000s"` for a never-entered stage: that would read as work
+/// that happened instantly rather than work that never ran. Shared by
+/// [`render`] (`stack --json`'s human twin) and
+/// [`crate::align::render`] (`align --json`'s).
+pub(crate) fn stage_fact(name: &str, value: Option<f64>) -> String {
+    match value {
+        Some(seconds) => format!("{name}={seconds:.3}s"),
+        None => format!("{name}=not-entered"),
+    }
 }
 
 /// One resolved parameter, in the line shape [`render`] uses --
@@ -1881,6 +1947,14 @@ mod tests {
             align: None,
             backend: "cpu".to_string(),
             align_cached: false,
+            stages: focusforge_core::timing::StageTimings {
+                setup: Some(0.012),
+                align: Some(1.2),
+                fuse: Some(0.25),
+                warp_write: None,
+                finalize: Some(0.038),
+            },
+            align_source: "computed".to_string(),
         }
     }
 
@@ -1903,9 +1977,29 @@ mod tests {
             "wrote: mantis-512.ffproj",
             "wall: 1.500s",
             "backend: cpu",
+            "stages:",
+            "setup=0.012s",
+            "align=1.200s",
+            "fuse=0.250s",
+            "finalize=0.038s",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
+    }
+
+    #[test]
+    fn a_stage_never_entered_renders_as_not_entered_never_as_zero() {
+        let mut sample = sample_report();
+        sample.stages.align = None;
+        let text = render(&sample);
+        assert!(
+            text.contains("align=not-entered"),
+            "missing align=not-entered in: {text}"
+        );
+        assert!(
+            !text.contains("align=0.000s"),
+            "a never-entered stage must never render as 0.000s: {text}"
+        );
     }
 
     #[test]

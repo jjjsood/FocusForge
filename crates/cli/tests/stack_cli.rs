@@ -540,6 +540,7 @@ fn report_contains_every_field() {
         "in_flight_limit=",
         "wrote:",
         "wall:",
+        "stages:",
     ] {
         assert!(
             out.stdout.contains(needle),
@@ -610,6 +611,7 @@ fn report_json_has_every_field() {
         "peak_in_flight",
         "outputs",
         "wall_seconds",
+        "stages",
     ] {
         assert!(report.get(key).is_some(), "missing key {key:?} in {report}");
     }
@@ -620,6 +622,176 @@ fn report_json_has_every_field() {
             assert!(p.get(key).is_some(), "missing key {key:?} in param {p}");
         }
     }
+}
+
+/// Every entered stage reports a number, `warp_write` is `null`
+/// (`stack` never enters it), and the human-text report carries the same
+/// breakdown on a `stages:` line. `dummy-align` converges immediately
+/// (`crates/cli/tests/cache_cli.rs`'s own doc comment), so this pays
+/// nothing for a real ECC solve.
+#[test]
+fn stage_timings_are_reported_for_every_entered_stage() {
+    let dir = tmp_dir("stage_timings_every_entered_stage");
+    let output = dir.join("mantis-512.ffproj");
+    let out = run_cli(&[
+        "stack",
+        mantis_512_dir().to_str().unwrap(),
+        "-o",
+        output.parent().unwrap().to_str().unwrap(),
+        "--algo",
+        "dummy-stack",
+        "--align-algo",
+        "dummy-align",
+        "--no-crop",
+        "--no-cache",
+        "--json",
+    ]);
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    let stages = &report["stages"];
+    for key in ["setup", "align", "fuse", "finalize"] {
+        assert!(
+            stages[key].is_number(),
+            "stages.{key} must be a number for an entered stage: {report}"
+        );
+    }
+    assert_eq!(
+        stages["warp_write"],
+        serde_json::Value::Null,
+        "stack never enters warp_write: {report}"
+    );
+    assert_eq!(
+        report["align_source"], "computed",
+        "a fresh alignment must report align_source=\"computed\": {report}"
+    );
+
+    let human = run_cli(&[
+        "stack",
+        mantis_512_dir().to_str().unwrap(),
+        "-o",
+        tmp_dir("stage_timings_every_entered_stage_human")
+            .to_str()
+            .unwrap(),
+        "--algo",
+        "dummy-stack",
+        "--align-algo",
+        "dummy-align",
+        "--no-crop",
+        "--no-cache",
+    ]);
+    assert!(human.success, "stderr: {}", human.stderr);
+    assert!(
+        human.stdout.contains("stages:"),
+        "human report must carry a stages: line: {}",
+        human.stdout
+    );
+    assert!(
+        human.stdout.contains("finalize="),
+        "human report must name each entered stage: {}",
+        human.stdout
+    );
+}
+
+/// The accounting identity: the non-null stages sum to `wall_seconds`
+/// exactly (up to `f64` addition rounding), because the spans are
+/// contiguous, disjoint, and share the run's own clock.
+#[test]
+fn stage_timings_account_for_the_wall_clock() {
+    let dir = tmp_dir("stage_timings_account_for_wall_clock");
+    let output = dir.join("mantis-512.ffproj");
+    let out = run_cli(&[
+        "stack",
+        mantis_512_dir().to_str().unwrap(),
+        "-o",
+        output.parent().unwrap().to_str().unwrap(),
+        "--algo",
+        "dummy-stack",
+        "--align-algo",
+        "dummy-align",
+        "--no-crop",
+        "--json",
+    ]);
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    let stages = &report["stages"];
+    let sum: f64 = ["setup", "align", "fuse", "finalize", "warp_write"]
+        .iter()
+        .filter_map(|key| stages[key].as_f64())
+        .sum();
+    let wall = report["wall_seconds"].as_f64().expect("wall_seconds");
+    assert!(
+        (sum - wall).abs() <= 1e-6,
+        "stage sum {sum} must equal wall_seconds {wall}: {report}"
+    );
+}
+
+/// `--no-align` never enters the align stage at all: `null`, not `0.0`, and
+/// `align_source` names the skip.
+#[test]
+fn stage_timings_mark_a_skipped_align_as_not_entered() {
+    let dir = tmp_dir("stage_timings_skipped_align");
+    let output = dir.join("mantis-512.ffproj");
+    let out = run_cli(&[
+        "stack",
+        mantis_512_dir().to_str().unwrap(),
+        "-o",
+        output.parent().unwrap().to_str().unwrap(),
+        "--algo",
+        "dummy-stack",
+        "--no-align",
+        "--no-crop",
+        "--json",
+    ]);
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    assert_eq!(
+        report["stages"]["align"],
+        serde_json::Value::Null,
+        "no unit of alignment work ran: {report}"
+    );
+    assert_eq!(
+        report["align_source"], "skipped",
+        "must name the skip rather than leave the null unexplained: {report}"
+    );
+}
+
+/// The instrumentation does not perturb the output: two runs of the same
+/// fixture and parameters produce byte-identical composites.
+#[test]
+fn stage_timings_do_not_change_the_output() {
+    let dir = tmp_dir("stage_timings_do_not_change_the_output");
+    let out_a = dir.join("a");
+    let out_b = dir.join("b");
+    for out in [&out_a, &out_b] {
+        std::fs::create_dir_all(out).unwrap();
+    }
+    let args = |out: &Path| {
+        vec![
+            "stack".to_string(),
+            mantis_512_dir().to_str().unwrap().to_string(),
+            "-o".to_string(),
+            out.to_str().unwrap().to_string(),
+            "--algo".to_string(),
+            "dummy-stack".to_string(),
+            "--no-align".to_string(),
+            "--no-crop".to_string(),
+            "--json".to_string(),
+        ]
+    };
+    let a_args = args(&out_a);
+    let b_args = args(&out_b);
+    let a = run_cli(&a_args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(a.success, "stderr: {}", a.stderr);
+    let b = run_cli(&b_args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(b.success, "stderr: {}", b.stderr);
+
+    let (a_composite, _) = export_both(&out_a.join("mantis-512.ffproj"));
+    let (b_composite, _) = export_both(&out_b.join("mantis-512.ffproj"));
+    assert_eq!(
+        std::fs::read(&a_composite).unwrap(),
+        std::fs::read(&b_composite).unwrap(),
+        "stage timing must not perturb the composite the run writes"
+    );
 }
 
 /// A **failed seal** leaves neither a project at the named path nor a

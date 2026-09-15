@@ -83,7 +83,20 @@ fn align_quiet_prints_no_progress() {
         "stderr: {}",
         loud.stderr
     );
-    assert_eq!(quiet.stdout, loud.stdout, "--quiet must not change stdout");
+    // `--quiet` must not change stdout, other than the trailing `stages:`
+    // line: it carries real per-run wall-clock figures, so two separately
+    // timed runs of the same alignment never render it identically even
+    // though every other line is deterministic.
+    fn strip_stages(s: &str) -> Vec<&str> {
+        s.lines()
+            .filter(|line| !line.starts_with("stages:"))
+            .collect()
+    }
+    assert_eq!(
+        strip_stages(&quiet.stdout),
+        strip_stages(&loud.stdout),
+        "--quiet must not change stdout (aside from the timing-dependent stages: line)"
+    );
 }
 
 #[test]
@@ -176,6 +189,8 @@ fn align_json_schema_is_stable() {
         "crop",
         "warped_dir",
         "wall_seconds",
+        "stages",
+        "align_source",
     ] {
         assert!(report.get(key).is_some(), "missing key {key:?} in {report}");
     }
@@ -308,6 +323,77 @@ fn align_write_warped_writes_one_tiff_per_frame() {
             "warped frames are written at source dimensions, uncropped"
         );
     }
+}
+
+/// `align` never fuses: `fuse` is always `null`, and every run computes
+/// (`align` has no `--resume`, no stage cache and no `--no-align`), so
+/// `align_source` is always `"computed"`.
+#[test]
+fn stage_timings_report_fuse_as_not_entered() {
+    let out = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--json",
+    ]);
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    assert_eq!(
+        report["stages"]["fuse"],
+        serde_json::Value::Null,
+        "align never fuses: {report}"
+    );
+    for key in ["setup", "align", "finalize"] {
+        assert!(
+            report["stages"][key].is_number(),
+            "stages.{key} must be a number for an entered stage: {report}"
+        );
+    }
+    assert_eq!(
+        report["align_source"], "computed",
+        "align always computes: {report}"
+    );
+}
+
+/// `warp_write` reports `null` when `--write-warped` was not given -- "not
+/// requested" must never read as "instant" -- and a number when it was.
+#[test]
+fn stage_timings_report_warp_write_only_under_the_flag() {
+    let without = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--json",
+    ]);
+    assert!(without.success, "stderr: {}", without.stderr);
+    let without_report: serde_json::Value = serde_json::from_str(&without.stdout).unwrap();
+    assert_eq!(
+        without_report["stages"]["warp_write"],
+        serde_json::Value::Null,
+        "no --write-warped, no mark: {without_report}"
+    );
+
+    let dir = tmp_dir("stage_timings_report_warp_write_only_under_the_flag");
+    let with = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--write-warped",
+        dir.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(with.success, "stderr: {}", with.stderr);
+    let with_report: serde_json::Value = serde_json::from_str(&with.stdout).unwrap();
+    assert!(
+        with_report["stages"]["warp_write"].is_number(),
+        "--write-warped must produce a warp_write number: {with_report}"
+    );
 }
 
 /// Strict is the default: a frame that fails to register exits 1 and names

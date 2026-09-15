@@ -237,6 +237,20 @@ frame's transform, in the same shape `align --json` reports (see below).
 Additive field from the GPU path: `backend` — `"cpu"`, or the selected
 adapter's name and driver info.
 
+Additive field `stages`: a per-stage wall-clock breakdown of `wall_seconds`
+— `setup`, `align`, `fuse` and `finalize`, each seconds as a float or `null`
+when that stage was never entered (`--no-align` leaves `align` null;
+`warp_write` is always `null` here, `stack` has no such stage). The four
+non-null numbers sum to `wall_seconds` exactly: the spans are contiguous and
+disjoint, produced by one monotonic timer. `fuse` is the wall clock of a
+parallel fan-out (the tile scheduler's own rayon pool), not CPU time — read
+it beside `in_flight_limit`/`peak_in_flight`, not as a claim about how much
+work happened. Additive field `align_source`: how the `align` stage's number
+was produced — `"computed"` (a real solve), `"cached"` (a stage-cache hit),
+`"resumed"` (a `--resume` ledger peek) or `"skipped"` (`--no-align`) — because
+a cache hit or a resume enters the stage and reports a small real number that
+is not "alignment took 10ms".
+
 ```json
 {
   "input": "fixtures/mantis-64",
@@ -257,7 +271,9 @@ adapter's name and driver info.
   "peak_in_flight": 1,
   "outputs": [".scratch/out.tif", ".scratch/zmap.tif"],
   "wall_seconds": 0.030267391,
-  "backend": "cpu"
+  "backend": "cpu",
+  "stages": { "setup": 0.001, "align": 0.012, "fuse": 0.016, "warp_write": null, "finalize": 0.001 },
+  "align_source": "computed"
 }
 ```
 
@@ -308,7 +324,19 @@ footprints share no common region.
 ### `--json`
 
 Frozen, additive-only, the same discipline as every other `--json` shape in
-this reference:
+this reference.
+
+Additive field `stages`: the same per-stage wall-clock breakdown `stack
+--json` carries, but with `align`'s own stage set — `setup`, `align`,
+`warp_write` and `finalize`, each seconds or `null` when never entered.
+`fuse` is always `null` here (`align` never fuses). `warp_write` is `null`
+unless `--write-warped` was given — a run without the flag never enters
+that stage, which is not the same as it taking zero time. The non-null
+stages sum to `wall_seconds` exactly, the same contiguous-and-disjoint
+contract `stack --json` documents. Additive field `align_source`: always
+`"computed"` for `align` (no `--resume`, no stage cache, no `--no-align`
+here), carried so a consumer reading both reports' `align` stage does not
+need to know which command produced it.
 
 ```json
 {
@@ -343,7 +371,9 @@ this reference:
   ],
   "crop": { "x": 31, "y": 40, "width": 422, "height": 424 },
   "warped_dir": null,
-  "wall_seconds": 8.497
+  "wall_seconds": 8.497,
+  "stages": { "setup": 0.021, "align": 8.401, "fuse": null, "warp_write": null, "finalize": 0.075 },
+  "align_source": "computed"
 }
 ```
 

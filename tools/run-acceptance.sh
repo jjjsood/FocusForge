@@ -5,6 +5,10 @@
 #                                                 ceiling with swap disabled
 #        tools/run-acceptance.sh --inside-scope 8G -- internal re-entry only,
 #                                                 never invoked by hand
+#        tools/run-acceptance.sh --algo depth-map -- either mode above, but
+#                                                 stacking with --algo depth-map
+#   --algo ID  stacking algorithm (default laplacian); --set levels=5 only
+#              accompanies laplacian
 #
 # The acceptance run: the whole 61-frame, 16 GB reference stack through the
 # real CLI, end to end, at full size. This is not a gate and never runs in
@@ -75,22 +79,37 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
-MODE="${1:-}"
-LIMIT="${2:-}"
+MODE=""
+LIMIT=""
+ALGO="laplacian"
 
-case "$MODE" in
-  "") ;;
-  --limit|--inside-scope)
-    if [ -z "$LIMIT" ]; then
-      echo "usage: tools/run-acceptance.sh [--limit SIZE]" >&2
-      exit 2
-    fi
-    ;;
-  *)
-    echo "usage: tools/run-acceptance.sh [--limit SIZE]" >&2
-    exit 2
-    ;;
-esac
+usage() {
+  echo "usage: tools/run-acceptance.sh [--limit SIZE|--inside-scope SIZE] [--algo ID]" >&2
+  exit 2
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --limit|--inside-scope)
+      if [ -n "$MODE" ] || [ -z "${2:-}" ]; then
+        usage
+      fi
+      MODE="$1"
+      LIMIT="$2"
+      shift 2
+      ;;
+    --algo)
+      if [ -z "${2:-}" ]; then
+        usage
+      fi
+      ALGO="$2"
+      shift 2
+      ;;
+    *)
+      usage
+      ;;
+  esac
+done
 
 echo "== tools/run-acceptance.sh ($([ -n "$MODE" ] && echo "${MODE} ${LIMIT}" || echo "unlimited")) =="
 echo "This run reads the reference stack in full, takes minutes, and writes"
@@ -295,9 +314,14 @@ run_stack() {
   if [ "$ALIGN" != "1" ]; then
     align_flags=(--no-align)
   fi
+  # levels is a laplacian-only parameter; depth-map refuses it.
+  local algo_settings=()
+  if [ "$ALGO" = "laplacian" ]; then
+    algo_settings=(--set levels=5)
+  fi
   /usr/bin/time -v "$CLI" stack "$OUT_DIR/frames" \
       -o "$out" \
-      --algo laplacian --set levels=5 --json \
+      --algo "$ALGO" "${algo_settings[@]}" --json \
       --no-crop "${align_flags[@]}" \
       > "$out/stack.json" 2> "$out/time-v.txt"
 
@@ -340,6 +364,9 @@ except Exception as exc:
     sys.exit(0)
 for key in ("wall_seconds", "tiles", "frame_tiles_read", "in_flight_limit", "peak_in_flight"):
     print(key + "=" + str(d.get(key)))
+stages = d.get("stages", {})
+for key in ("setup", "align", "fuse", "finalize"):
+    print("stages." + key + "=" + str(stages.get(key)))
 ' "$out/stack.json"
   fi
   for mode in translation rotation-scale; do
@@ -394,7 +421,7 @@ case "$MODE" in
     # "Running as unit: run-rNNN.scope" is what makes
     # `journalctl --user -u run-rNNN.scope` findable afterwards.
     exec systemd-run --user --scope -p "MemoryMax=$LIMIT" -p MemorySwapMax=0 \
-        -- "$REPO/tools/run-acceptance.sh" --inside-scope "$LIMIT"
+        -- "$REPO/tools/run-acceptance.sh" --inside-scope "$LIMIT" --algo "$ALGO"
     ;;
 
   --inside-scope)

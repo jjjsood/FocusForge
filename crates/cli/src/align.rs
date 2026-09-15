@@ -21,6 +21,7 @@ use focusforge_core::params::{self, StackContext};
 use focusforge_core::registry;
 use focusforge_core::tile::Rect;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
+use focusforge_core::timing::{Stage, StageTimer};
 use serde::Serialize;
 
 use crate::preset::{self, PresetOptions};
@@ -88,6 +89,17 @@ pub struct AlignReport {
     pub crop: Option<Rect>,
     pub warped_dir: Option<String>,
     pub wall_seconds: f64,
+    /// Wall-clock stage breakdown -- `setup`/`align`/`finalize` as seconds,
+    /// `warp_write` a number only when `--write-warped` ran, `fuse`
+    /// always `null` (`align` never fuses). Every figure is wall clock,
+    /// never CPU time; the non-null stages sum exactly to `wall_seconds` --
+    /// see [`focusforge_core::timing::StageTimings`]'s own rustdoc for the
+    /// full contract. Fields are only ever added.
+    pub stages: focusforge_core::timing::StageTimings,
+    /// Always `"computed"`: `align` has no `--resume`, no stage cache and
+    /// no `--no-align`. Present so `align --json` and `stack --json` report
+    /// their `align` stage the same way.
+    pub align_source: String,
 }
 
 /// One frame's row in [`AlignReport::alignments`]: `#[serde(flatten)]`ed
@@ -151,6 +163,8 @@ pub fn run(
     no_gpu: bool,
 ) -> ExitCode {
     let start = Instant::now();
+    // One monotonic timer shares `start` with `wall_seconds` below.
+    let mut timer = StageTimer::from_start(start);
     let mut renderer = ProgressRenderer::new(ProgressMode::choose(quiet));
     let sink = StatusSink::new(preset_opts.status, dir.display().to_string(), "align");
 
@@ -241,6 +255,7 @@ pub fn run(
     } else {
         FailurePolicy::Strict
     };
+    timer.mark(Stage::Setup);
     renderer.stage(&format!("align {} frames (no unit progress)", stack.len()));
     let alignment = match align_stack(algo, stack_ctx, &stack, &values, policy) {
         Ok(alignment) => alignment,
@@ -250,6 +265,7 @@ pub fn run(
         Ok(crop) => crop,
         Err(err) => return sink.fail(err),
     };
+    timer.mark(Stage::Align);
 
     if let Some(write_warped) = write_warped {
         // Resolved only here, not for a plain `align` run: plain `align` has
@@ -270,7 +286,15 @@ pub fn run(
         ) {
             return sink.fail(msg);
         }
+        // Marked only inside this arm: no `--write-warped`, no mark, so the
+        // field stays `null` -- "not requested" is never confused with
+        // "instant".
+        timer.mark(Stage::WarpWrite);
     }
+
+    timer.mark(Stage::Finalize);
+    let wall_seconds = timer.total_seconds();
+    let stages = timer.finish();
 
     let report = AlignReport {
         input: dir.display().to_string(),
@@ -296,7 +320,11 @@ pub fn run(
         alignments: alignment_entries(&alignment, &frame_names),
         crop,
         warped_dir: write_warped.map(|p| p.display().to_string()),
-        wall_seconds: start.elapsed().as_secs_f64(),
+        wall_seconds,
+        stages,
+        // `align` has no `--resume`, no stage cache and no `--no-align`:
+        // every run reaches this line by computing.
+        align_source: "computed".to_string(),
     };
 
     if json {
@@ -538,6 +566,17 @@ pub(crate) fn render(report: &AlignReport) -> String {
         )),
         None => lines.push("auto-crop: empty (frame footprints do not intersect)".to_string()),
     }
+    // `align --json` prints no whole-run wall figure today (unlike
+    // `stack`'s `wall:` line), so this line carries the total as a trailing
+    // `(wall …)` rather than adding a second, redundant top-level line.
+    lines.push(format!(
+        "stages: {} {} {} {} (wall {:.3}s)",
+        crate::stack::stage_fact("setup", report.stages.setup),
+        crate::stack::stage_fact("align", report.stages.align),
+        crate::stack::stage_fact("warp_write", report.stages.warp_write),
+        crate::stack::stage_fact("finalize", report.stages.finalize),
+        report.wall_seconds,
+    ));
     lines.join("\n")
 }
 

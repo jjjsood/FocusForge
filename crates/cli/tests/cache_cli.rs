@@ -323,6 +323,71 @@ fn fusion_parameter_change_reuses_alignment() {
     );
 }
 
+/// A stage-cache hit still *enters* the align stage (a fingerprint lookup
+/// and a JSON decode of the cached transforms), so it must still report a
+/// number there -- never `null`, which would read as "alignment was
+/// skipped" rather than "alignment was reused". `align_source` is what
+/// tells the two apart from a genuine (slow) compute.
+#[test]
+fn stage_timings_survive_a_cache_hit() {
+    let cwd = tmp_dir("cache_cli_stage_timings_survive_hit");
+    let input = mantis_512_dir();
+    let out_a = cwd.join("out_a");
+    let out_b = cwd.join("out_b");
+    for dir in [&out_a, &out_b] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+
+    let a = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            input.to_str().unwrap(),
+            "-o",
+            out_a.to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--align-algo",
+            "dummy-align",
+            "--set",
+            "levels=3",
+            "--json",
+        ],
+    );
+    assert!(a.success, "stderr: {}", a.stderr);
+
+    let b = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            input.to_str().unwrap(),
+            "-o",
+            out_b.to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--align-algo",
+            "dummy-align",
+            "--set",
+            "levels=5",
+            "--json",
+        ],
+    );
+    assert!(b.success, "stderr: {}", b.stderr);
+    let b_report: serde_json::Value = serde_json::from_str(&b.stdout).expect("--json");
+    assert_eq!(
+        b_report["align_cached"], true,
+        "this run must be the cache hit: {b_report}"
+    );
+    assert!(
+        b_report["stages"]["align"].is_number(),
+        "a cache hit still enters the align stage, and must report a number, not null: {b_report}"
+    );
+    assert_eq!(
+        b_report["align_source"], "cached",
+        "align_source is what explains the small number: {b_report}"
+    );
+}
+
 /// `--no-cache` recomputes even when a valid entry exists, and leaves no
 /// entry behind.
 #[test]

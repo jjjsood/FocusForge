@@ -14,6 +14,7 @@ pub mod params;
 pub mod project;
 pub mod registry;
 pub mod tile;
+pub mod timing;
 pub mod zmap;
 
 #[cfg(feature = "test-algorithms")]
