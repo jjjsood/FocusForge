@@ -40,7 +40,24 @@
 #                              the whole run before the release-CLI check
 #   ACCEPTANCE_FRAME_GLOB     glob for source frames within it (default:
 #                              *IMG_*.tif)
-#   ACCEPTANCE_EXPECTED_FRAMES expected farm size (default: 61)
+#   ACCEPTANCE_EXPECTED_FRAMES expected *source* frame count found in
+#                              ACCEPTANCE_STACK_DIR after the Stacked
+#                              exclusion (default: 61) -- a guard against a
+#                              glob mismatch, independent of how many farm
+#                              entries are actually built (see
+#                              ACCEPTANCE_TARGET_FRAMES below).
+#   ACCEPTANCE_TARGET_FRAMES  how many farm entries build_farm() actually
+#                              builds (default: ACCEPTANCE_EXPECTED_FRAMES,
+#                              one symlink per source); a larger value
+#                              repeats sources, `r<replica>-`-prefixed to
+#                              match replay order.
+#   ACCEPTANCE_ALIGN          `1` (default): `run_stack` aligns in-process
+#                              with `--align-algo pyramidal-ecc --lax`, and
+#                              the unlimited branch also runs two standalone
+#                              `align` legs. `0`: `run_stack` uses
+#                              `--no-align` instead and the standalone
+#                              `align` legs are skipped entirely -- measures
+#                              the scheduler, not alignment.
 #   ACCEPTANCE_OUT_DIR        base output directory (default:
 #                              .scratch/acceptance)
 #   ACCEPTANCE_CLI            CLI binary to run (default:
@@ -83,6 +100,8 @@ echo
 OUT_DIR="${ACCEPTANCE_OUT_DIR:-.scratch/acceptance}"
 FRAME_GLOB="${ACCEPTANCE_FRAME_GLOB:-*IMG_*.tif}"
 EXPECTED_FRAMES="${ACCEPTANCE_EXPECTED_FRAMES:-61}"
+TARGET_FRAMES="${ACCEPTANCE_TARGET_FRAMES:-$EXPECTED_FRAMES}"
+ALIGN="${ACCEPTANCE_ALIGN:-1}"
 CLI="${ACCEPTANCE_CLI:-target/release/focusforge-cli}"
 
 # --- refuse to measure with a CLI older than the sources -------------------
@@ -138,6 +157,15 @@ else
   STACK="$HARNESS/Stack"
 fi
 
+# The same convention `frame_paths` already
+# applies: a `frames/` subdirectory, when present, is where the
+# actual frame files live -- committed fixture trees (`fixtures/mantis-512`)
+# are laid out this way; the real reference stack directory is not, so this
+# is a no-op there.
+if [ -d "${STACK}/frames" ]; then
+  STACK="${STACK}/frames"
+fi
+
 if [ ! -x "$CLI" ]; then
   echo "refuse: $CLI is not built -- run: cargo build --release -p focusforge-cli" >&2
   exit 1
@@ -171,27 +199,58 @@ build_farm() {
   local candidates=( "$STACK"/$FRAME_GLOB )
   shopt -u nullglob
 
-  local count=0
+  # The *source* list first, independent of how many farm entries are
+  # actually built below -- a glob mismatch must refuse here, before any
+  # replay repeat count is applied.
+  local sources=()
   local f name
   for f in "${candidates[@]}"; do
     name="$(basename "$f")"
     case "$name" in
       *Stacked*) continue ;;
     esac
-    ln -s "$f" "$OUT_DIR/frames/$name"
-    count=$((count + 1))
+    sources+=("$f")
   done
+  local source_count=${#sources[@]}
 
-  if [ "$count" -ne "$EXPECTED_FRAMES" ]; then
-    echo "refuse: expected $EXPECTED_FRAMES symlinks in $OUT_DIR/frames, built $count" >&2
+  if [ "$source_count" -ne "$EXPECTED_FRAMES" ]; then
+    echo "refuse: expected $EXPECTED_FRAMES source frames matching" \
+         "ACCEPTANCE_FRAME_GLOB in $STACK, found $source_count" >&2
     # A zero count is almost always the glob, not a missing stack: the default
     # only matches the reference stack's own frame naming, so pointing this
     # script at any other frame directory needs ACCEPTANCE_FRAME_GLOB set
     # too. Say so here rather than leaving a correct refusal that reads as a
     # mystery.
-    if [ "$count" -eq 0 ]; then
+    if [ "$source_count" -eq 0 ]; then
       echo "hint: no file in $STACK matched ACCEPTANCE_FRAME_GLOB='$FRAME_GLOB'" >&2
     fi
+    exit 1
+  fi
+
+  local count=0
+  if [ "$TARGET_FRAMES" -eq "$source_count" ]; then
+    # One symlink per source, under its own name.
+    for f in "${sources[@]}"; do
+      name="$(basename "$f")"
+      ln -s "$f" "$OUT_DIR/frames/$name"
+      count=$((count + 1))
+    done
+  else
+    # Replay farm: sources repeated, `r<replica>-` prefix keeps name order
+    # equal to replay order.
+    local i idx replica linkname
+    for ((i = 0; i < TARGET_FRAMES; i++)); do
+      idx=$((i % source_count))
+      replica=$((i / source_count))
+      name="$(basename "${sources[$idx]}")"
+      linkname="$(printf 'r%03d-%s' "$replica" "$name")"
+      ln -s "${sources[$idx]}" "$OUT_DIR/frames/$linkname"
+      count=$((count + 1))
+    done
+  fi
+
+  if [ "$count" -ne "$TARGET_FRAMES" ]; then
+    echo "refuse: expected $TARGET_FRAMES symlinks in $OUT_DIR/frames, built $count" >&2
     exit 1
   fi
   if ls "$OUT_DIR/frames" | grep -q Stacked; then
@@ -201,15 +260,15 @@ build_farm() {
   echo "OK: built $count-entry frame farm at $OUT_DIR/frames"
 
   "$CLI" info --json "$OUT_DIR/frames" > "$OUT_DIR/info.json"
-  if ! grep -q "\"frame_count\": $EXPECTED_FRAMES" "$OUT_DIR/info.json"; then
-    echo "refuse: $OUT_DIR/info.json does not report frame_count $EXPECTED_FRAMES" >&2
+  if ! grep -q "\"frame_count\": $TARGET_FRAMES" "$OUT_DIR/info.json"; then
+    echo "refuse: $OUT_DIR/info.json does not report frame_count $TARGET_FRAMES" >&2
     exit 1
   fi
   if ! grep -q '"uniform_layout": true' "$OUT_DIR/info.json"; then
     echo "refuse: $OUT_DIR/info.json does not report uniform_layout true" >&2
     exit 1
   fi
-  echo "OK: $OUT_DIR/info.json reports frame_count $EXPECTED_FRAMES, uniform_layout true"
+  echo "OK: $OUT_DIR/info.json reports frame_count $TARGET_FRAMES, uniform_layout true"
 
   # A missing output parent is refused before any long work starts.
   mkdir -p "$OUT_DIR/unlimited" "$OUT_DIR/limited"
@@ -225,12 +284,21 @@ build_farm() {
 # 61-frame sweep anchored on frame 30 is a longer baseline than the
 # 8-frame fixture on which frame 0 already diverges, and a strict refusal
 # would waste the whole run.
+#
+# `ACCEPTANCE_ALIGN=0` swaps `--align-algo pyramidal-ecc --lax` for
+# `--no-align` -- these runs measure the scheduler, not alignment, and
+# solving a real ECC alignment at 300/600 frames would spend hours on a
+# stage that is not being measured here.
 run_stack() {
   local out="$1"
+  local align_flags=(--align-algo pyramidal-ecc --lax)
+  if [ "$ALIGN" != "1" ]; then
+    align_flags=(--no-align)
+  fi
   /usr/bin/time -v "$CLI" stack "$OUT_DIR/frames" \
       -o "$out/out.tif" --zmap "$out/out-zmap.tif" \
       --algo laplacian --set levels=5 --json \
-      --no-crop --align-algo pyramidal-ecc --lax \
+      --no-crop "${align_flags[@]}" \
       > "$out/stack.json" 2> "$out/time-v.txt"
 }
 
@@ -287,11 +355,15 @@ print("align-" + sys.argv[2] + ": frame_count=" + str(d.get("frame_count"))
 case "$MODE" in
   "")
     build_farm
-    for mode in translation rotation-scale; do
-      echo "+ $CLI align $OUT_DIR/frames --algo pyramidal-ecc --set mode=$mode --lax --json ..."
-      run_align "$OUT_DIR/unlimited" "$mode"
-    done
-    echo "OK: align stage complete (both modes)"
+    if [ "$ALIGN" = "1" ]; then
+      for mode in translation rotation-scale; do
+        echo "+ $CLI align $OUT_DIR/frames --algo pyramidal-ecc --set mode=$mode --lax --json ..."
+        run_align "$OUT_DIR/unlimited" "$mode"
+      done
+      echo "OK: align stage complete (both modes)"
+    else
+      echo "SKIP: align stage (ACCEPTANCE_ALIGN=0)"
+    fi
     echo "+ $CLI stack $OUT_DIR/frames -o $OUT_DIR/unlimited/out.tif ..."
     run_stack "$OUT_DIR/unlimited"
     echo "OK: unlimited run complete"
