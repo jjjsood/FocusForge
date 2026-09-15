@@ -16,6 +16,7 @@ use serde::Serialize;
 
 mod algorithms;
 mod align;
+mod cache;
 mod export;
 #[cfg(feature = "gpu")]
 mod gpu;
@@ -182,6 +183,12 @@ enum Command {
         #[cfg(feature = "gpu")]
         #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
         gpu: bool,
+        /// Skip the stage cache: recompute the alignment even when a valid
+        /// entry exists, and leave no entry behind. Defaults to `true` (the
+        /// cache is used); `--no-cache` is what turns it off (clap
+        /// `ArgAction::SetFalse`, no `default_value` -- clap-rs/clap#4370).
+        #[arg(long = "no-cache", action = clap::ArgAction::SetFalse)]
+        cache: bool,
     },
     /// Turn a project into an image file: the composite with `-o`, the
     /// Z-Map with `--zmap`, either or both in one invocation. At least one
@@ -267,6 +274,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Manage the stage cache under `.scratch/stage-cache/`.
+    Cache {
+        #[command(subcommand)]
+        action: cache::CacheAction,
+    },
 }
 
 fn main() -> ExitCode {
@@ -297,6 +309,7 @@ fn main() -> ExitCode {
             dry_run,
             #[cfg(feature = "gpu")]
             gpu,
+            cache,
         } => {
             #[cfg(feature = "gpu")]
             let no_gpu = !gpu;
@@ -321,6 +334,7 @@ fn main() -> ExitCode {
                     quiet,
                     tile_size,
                     max_bytes_in_flight,
+                    cache,
                 },
                 &preset::PresetOptions {
                     preset: preset.as_deref(),
@@ -375,6 +389,7 @@ fn main() -> ExitCode {
             )
         }
         Command::Review { dir, json } => review::run(&dir, json),
+        Command::Cache { action } => cache::run(action),
     }
 }
 

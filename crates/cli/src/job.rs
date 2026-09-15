@@ -33,6 +33,11 @@ pub struct JobOptions {
     pub quiet: bool,
     pub tile_size: Option<u32>,
     pub max_bytes_in_flight: Option<usize>,
+    /// `true` unless `--no-cache` was given. Disables **both** the stage
+    /// cache read and the write -- a user reaching for `--no-cache`
+    /// suspects the cache, so leaving a fresh entry behind would be a
+    /// surprise.
+    pub cache: bool,
 }
 
 /// A resumable candidate's already-recorded alignment, peeked off

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::align::FailurePolicy;
 use crate::job::fingerprint::StackFingerprint;
 use crate::params::ParamValues;
 use crate::tile::Rect;
@@ -20,7 +21,15 @@ use crate::tile::Rect;
 /// The current on-disk record format. Bump this, never the field shapes
 /// below, when the record's meaning changes in a way an older reader must
 /// not interpret optimistically.
-pub const JOB_RECORD_FORMAT: u32 = 1;
+///
+/// `1 -> 2`: [`AlignIdentity`] gained `failure_policy`. A `job.json` written
+/// before this build carries no failure policy, and defaulting it to
+/// [`FailurePolicy::Strict`] would let a strict resume adopt a lax run's
+/// tiles -- exactly the bug this bump fixes. An unrecognised format is
+/// already "no resumable state, start over"
+/// (`super::ledger::ResumeStore::find`), so the bump is safe by
+/// construction.
+pub const JOB_RECORD_FORMAT: u32 = 2;
 
 /// Everything a resume must agree with before it is allowed to continue: the
 /// stack's identity, the geometry that gives a `PlannedTile::index()` its
@@ -61,11 +70,25 @@ pub struct JobRecord {
 /// resume can tell "the same alignment was requested" from "a different
 /// aligner or a different parameter now governs this stack" without
 /// re-running `align_stack`.
+///
+/// This is also the align stage cache key's algorithm half:
+/// **`AlignAlgorithm::params()` plus exactly one named driver policy, and
+/// nothing else** -- `failure_policy`, named in [`DRIVER_POLICY_FIELDS`]. A
+/// field added here without a matching addition to `DRIVER_POLICY_FIELDS`
+/// widens the cache key silently; `crates/core/tests/stage_cache.rs`'s
+/// `the_align_key_is_params_plus_exactly_one_driver_policy` is the test that
+/// catches it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlignIdentity {
     pub algorithm: String,
     pub params: ParamValues,
+    pub failure_policy: FailurePolicy,
 }
+
+/// The field names on [`AlignIdentity`] that are **not** one of
+/// `AlignAlgorithm::params()`'s declared parameters -- the named exception
+/// the stage cache key's completeness test checks against.
+pub const DRIVER_POLICY_FIELDS: &[&str] = &["failure_policy"];
 
 #[cfg(test)]
 mod tests {

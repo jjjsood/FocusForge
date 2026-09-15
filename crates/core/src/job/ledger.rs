@@ -51,11 +51,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::algorithm::AlgorithmError;
-use crate::align::StackAlignment;
+use crate::align::{ReferencePolicy, StackAlignment};
 use crate::tile::{TileConsumer, TileJob};
 
 use super::fingerprint::{FingerprintMismatch, FrameCount};
 use super::record::JobRecord;
+use super::stage_cache::CachedFrameAlignment;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -158,21 +159,9 @@ impl Ledger {
         &self.dir
     }
 
-    /// # The ordering rule
-    ///
-    /// Called with `&self` because [`RecordingConsumer`] calls it from
-    /// rayon worker threads. **Must be called only after the unit's own
-    /// rows have already been handed to
-    /// [`crate::io::TiffWriter::write_tile`]** -- see this module's own
-    /// docs, "The ordering rule". Appends one newline-terminated JSON line,
-    /// `{"unit":<index>}\n`, through a `Mutex<File>` -- the mutex, not
-    /// `O_APPEND`, is what makes concurrent appends non-interleaving
-    /// (POSIX guarantees an atomic *offset update* for `O_APPEND`, not an
-    /// atomic multi-byte write). No `sync_data`, no `flush` -- durability
-    /// against a process crash comes from both writes already being in the
-    /// page cache in program order; durability against a power cut is
-    /// `TiffWriter::holds_rows`'s job on the way back in, not
-    /// this call's.
+    /// Call only after the unit's own rows have already reached
+    /// [`crate::io::TiffWriter::write_tile`] -- see the module docs' "The
+    /// ordering rule" for why.
     pub fn record_unit(&self, index: usize) -> Result<(), ResumeError> {
         let mut line = serde_json::to_string(&UnitRecord { unit: index }).map_err(|source| {
             ResumeError::Json {
@@ -190,15 +179,23 @@ impl Ledger {
     }
 
     /// Writes `alignment.json` atomically, once, at the align/fuse
-    /// boundary, through bit-exact `f64::to_bits()` encoding rather than
-    /// plain JSON floats: without it,
-    /// `serde_json`'s float formatter is not guaranteed to round-trip a
-    /// 17-significant-digit `f64` to the same bits
-    /// (<https://github.com/serde-rs/json/issues/707>), so a resumed run's
-    /// transforms could in principle drift by 1 ULP from the interrupted
-    /// run's.
+    /// boundary, through a bit-exact `f64::to_bits()` encoding rather than
+    /// plain JSON floats: without it, `serde_json`'s float formatter is not
+    /// guaranteed to round-trip a 17-significant-digit `f64` to the same
+    /// bits (<https://github.com/serde-rs/json/issues/707>), so a resumed
+    /// run's transforms could in principle drift by 1 ULP from the
+    /// interrupted run's.
     pub fn record_alignment(&self, alignment: &StackAlignment) -> Result<(), ResumeError> {
-        write_atomic(&self.dir.join("alignment.json"), alignment)
+        let encoded = LedgerAlignment {
+            reference: alignment.reference,
+            policy: alignment.policy,
+            frames: alignment
+                .frames
+                .iter()
+                .map(CachedFrameAlignment::from)
+                .collect(),
+        };
+        write_atomic(&self.dir.join("alignment.json"), &encoded)
     }
 
     /// The recorded [`StackAlignment`], if this ledger's run had already
@@ -270,10 +267,29 @@ fn read_completed_units(path: &Path) -> Result<Vec<usize>, ResumeError> {
     Ok(completed)
 }
 
+/// `alignment.json`'s on-disk shape: `StackAlignment` with every `f64`
+/// carried as its `f64::to_bits()` `u64`, exactly the encoding the stage
+/// cache uses for the same reason -- `CachedFrameAlignment` is the one
+/// shared encoder, reused rather than copied.
+#[derive(Debug, Serialize, Deserialize)]
+struct LedgerAlignment {
+    reference: usize,
+    policy: ReferencePolicy,
+    frames: Vec<CachedFrameAlignment>,
+}
+
 /// Reads `alignment.json` back, if present. Absence is `Ok(None)`, never an
 /// error -- a ledger whose run had not yet reached the fuse stage has no
 /// recorded alignment at all.
-fn read_alignment(path: &Path) -> Result<Option<StackAlignment>, ResumeError> {
+///
+/// `pub`: also the decoder `crates/cli/src/stack.rs`'s
+/// `peek_resumable_crop_and_alignment` uses to peek a not-yet-`begin`'d
+/// ledger's `alignment.json` -- the one place outside this module that
+/// reads the file, and it must decode the same
+/// `LedgerAlignment`/[`CachedFrameAlignment`] bit-exact shape this
+/// function does rather than parsing `StackAlignment` straight off the
+/// wire, which does not match the on-disk field names.
+pub fn read_alignment(path: &Path) -> Result<Option<StackAlignment>, ResumeError> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -284,12 +300,20 @@ fn read_alignment(path: &Path) -> Result<Option<StackAlignment>, ResumeError> {
             });
         }
     };
-    let alignment: StackAlignment =
+    let encoded: LedgerAlignment =
         serde_json::from_str(&text).map_err(|source| ResumeError::Json {
             path: path.to_path_buf(),
             source,
         })?;
-    Ok(Some(alignment))
+    Ok(Some(StackAlignment {
+        reference: encoded.reference,
+        policy: encoded.policy,
+        frames: encoded
+            .frames
+            .into_iter()
+            .map(CachedFrameAlignment::into_frame_alignment)
+            .collect(),
+    }))
 }
 
 /// Writes `value` as JSON to `path` atomically: a temp file in the same
@@ -299,7 +323,10 @@ fn read_alignment(path: &Path) -> Result<Option<StackAlignment>, ResumeError> {
 /// whole of this module's crash-safety budget: write-once files are made
 /// durable before they are visible; the append-only log relies on ordering
 /// plus [`crate::io::TiffWriter::holds_rows`] instead.
-fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), ResumeError> {
+///
+/// `pub(super)`: shared with [`super::stage_cache`], the stage cache
+/// module, rather than copied there.
+pub(super) fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), ResumeError> {
     let json = serde_json::to_vec(value).map_err(|source| ResumeError::Json {
         path: path.to_path_buf(),
         source,
@@ -516,10 +543,9 @@ impl ResumeStore {
 }
 
 /// Decorates a real [`TileConsumer`], recording each unit's completion into
-/// a [`Ledger`] **after** the inner consumer's write has already returned --
-/// see this module's own docs, "The ordering rule". Same shape as
-/// `crates/core/tests/job_engine.rs`'s `Gated`/`AbortRecorder` decorators,
-/// so the scheduler is untouched.
+/// a [`Ledger`] only after the inner consumer's write has already returned,
+/// which is what keeps every ledger entry in the ordering `record_unit`
+/// requires.
 pub struct RecordingConsumer<'a> {
     pub inner: &'a dyn TileConsumer,
     pub ledger: &'a Ledger,
@@ -558,7 +584,7 @@ mod tests {
     fn sample_record(scratch: &Path, output_name: &str) -> JobRecord {
         let output = scratch.join(output_name);
         // The output file must exist for `find` to consider a ledger
-        // resumable at all (step 6's stale-ledger guard).
+        // resumable at all (the stale-ledger guard).
         fs::write(&output, b"x").unwrap();
         JobRecord {
             format: super::super::record::JOB_RECORD_FORMAT,

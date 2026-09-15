@@ -23,7 +23,8 @@ use focusforge_core::fuse::{
 use focusforge_core::io::{Group, Proposal, Rect, TiffSpec, TiffStack, propose};
 use focusforge_core::job::{
     AlignIdentity, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobOutcome, JobRecord,
-    RecordingConsumer, Resumable, ResumeStore, StackFingerprint,
+    RecordingConsumer, Resumable, ResumeStore, StackFingerprint, StageCache, StageKey,
+    read_alignment,
 };
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance, StackContext};
 use focusforge_core::project::{self, Metrics, PROJECT_EXTENSION};
@@ -74,6 +75,10 @@ pub struct StackReport {
     /// display -- additive, so which path ran is machine-readable and not
     /// only a stderr line.
     pub backend: String,
+    /// `true` only when the alignment came out of the stage cache;
+    /// `false` for a computed one, a `--resume` ledger-peeked one, or a
+    /// `--no-align` run. Additive field.
+    pub align_cached: bool,
 }
 
 /// `stack --json`'s `align` field: `null` when `--no-align` was given.
@@ -294,6 +299,46 @@ pub fn run(
         return refuse(msg);
     }
 
+    // Step 9: `--only` subset selection. Identities are computed against
+    // the **full** proposal, before any filtering -- a subset selection
+    // must never change what a group is called, or a re-run could not be
+    // matched back to the original record.
+    let identities: Vec<String> = proposal
+        .groups
+        .iter()
+        .map(|g| group_identity(multi, dir, g))
+        .collect();
+    let selected: Vec<bool> = if group_args.only.is_empty() {
+        vec![true; proposal.groups.len()]
+    } else {
+        for requested in &group_args.only {
+            let matches = proposal
+                .groups
+                .iter()
+                .enumerate()
+                .any(|(i, g)| &identities[i] == requested || &g.name == requested);
+            if !matches {
+                return refuse(only_no_match_refusal(requested, &proposal, &identities));
+            }
+        }
+        proposal
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                group_args
+                    .only
+                    .iter()
+                    .any(|only| &identities[i] == only || &g.name == only)
+            })
+            .collect()
+    };
+    for (i, sel) in selected.iter().enumerate() {
+        if !sel {
+            eprintln!("skipped (not named by --only): {}", identities[i]);
+        }
+    }
+
     let setup = RunSetup {
         algo,
         backend,
@@ -311,17 +356,12 @@ pub fn run(
     let mut manifest = Vec::new();
     let mut failed = false;
     let mut cancelled = false;
-    for group in &proposal.groups {
+    for (i, group) in proposal.groups.iter().enumerate() {
+        if !selected[i] {
+            continue;
+        }
         let group_output = project_path(output, group);
-        // A single-group run keeps today's identity -- the input directory
-        // as the user wrote it -- byte for byte; only a genuinely grouped
-        // run keys its records by group name, which is what gives
-        // "one record per stack" more than one member.
-        let identity = if multi {
-            group.name.clone()
-        } else {
-            dir.display().to_string()
-        };
+        let identity = identities[i].clone();
         let result = run_group(&setup, group, &group_output, identity.clone());
         manifest.push(manifest_entry(group, identity, &result));
         match &result {
@@ -336,6 +376,11 @@ pub fn run(
         }
     }
 
+    // A `--only` subset re-run merges into whatever manifest already sits
+    // at this run's path rather than overwriting it: without this,
+    // `review` (which prefers a manifest over a directory glob whenever one
+    // exists) would silently shrink to just the re-run subset after every
+    // partial re-run, defeating the triage this supports.
     if let Err(msg) = write_manifest(output, dir, manifest) {
         eprintln!("warning: {msg}");
     }
@@ -460,6 +505,39 @@ fn check_project_collisions(output: Option<&Path>, proposal: &Proposal) -> Resul
     Ok(())
 }
 
+/// One group's identity: the input directory as the user wrote it for a
+/// single-group run, the group's name otherwise. `--only` and the run loop
+/// both use it.
+fn group_identity(multi: bool, dir: &Path, group: &Group) -> String {
+    if multi {
+        group.name.clone()
+    } else {
+        dir.display().to_string()
+    }
+}
+
+/// The refusal when a `--only` value matches no proposed group: names every
+/// group's identity (and its plain name, where the two differ), before any
+/// frame is opened.
+fn only_no_match_refusal(requested: &str, proposal: &Proposal, identities: &[String]) -> String {
+    let known: Vec<String> = proposal
+        .groups
+        .iter()
+        .zip(identities)
+        .map(|(g, identity)| {
+            if &g.name == identity {
+                identity.clone()
+            } else {
+                format!("{identity} (name: {})", g.name)
+            }
+        })
+        .collect();
+    format!(
+        "--only {requested:?} matches no proposed group; known identities: {}",
+        known.join(", ")
+    )
+}
+
 fn manifest_entry(group: &Group, identity: String, result: &GroupResult) -> groups::ManifestEntry {
     let (outcome, outputs, wall_seconds, error) = match result {
         GroupResult::Completed(report) => (
@@ -497,15 +575,49 @@ fn write_manifest(
     root: &Path,
     entries: Vec<groups::ManifestEntry>,
 ) -> Result<(), String> {
+    let path = manifest_path(out_dir, root);
+    let root_str = root.display().to_string();
+    let merged = merge_manifest_entries(&path, &root_str, entries);
     let manifest = groups::RunManifest {
         format: groups::MANIFEST_FORMAT,
-        root: root.display().to_string(),
-        groups: entries,
+        root: root_str,
+        groups: merged,
     };
-    let path = manifest_path(out_dir, root);
     let text = serde_json::to_string_pretty(&manifest)
         .map_err(|err| format!("{}: serializing the manifest: {err}", path.display()))?;
     std::fs::write(&path, text).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+/// Merges freshly-(re-)run `entries` into whatever manifest already sits at
+/// `path`: an existing entry whose identity matches one just (re-)run is
+/// replaced, every other existing entry survives untouched, and a manifest
+/// whose `root` disagrees with this run's is treated as absent -- a fresh
+/// write. A full run (no `--only`) attempts every proposed group, so this
+/// degenerates to a full overwrite in that case; a `--only` subset re-run is
+/// where the merge is load-bearing.
+fn merge_manifest_entries(
+    path: &Path,
+    root: &str,
+    entries: Vec<groups::ManifestEntry>,
+) -> Vec<groups::ManifestEntry> {
+    let existing = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<groups::RunManifest>(&text).ok())
+        .filter(|m| m.format == groups::MANIFEST_FORMAT && m.root == root);
+
+    let Some(existing) = existing else {
+        return entries;
+    };
+
+    let fresh_identities: std::collections::HashSet<&str> =
+        entries.iter().map(|e| e.identity()).collect();
+    let mut merged: Vec<groups::ManifestEntry> = existing
+        .groups
+        .into_iter()
+        .filter(|e| !fresh_identities.contains(e.identity()))
+        .collect();
+    merged.extend(entries);
+    merged
 }
 
 /// Where [`write_manifest`] puts its document. Split out so the naming rule
@@ -678,11 +790,17 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     let levels = algo.tile_levels(&values);
 
     // Header-only stack fingerprint -- cheap, needed both to peek a
-    // resumable ledger below and to build this run's own `JobRecord`.
+    // resumable ledger below and to build this run's own `JobRecord`, and
+    // as the stage cache key: one fingerprint, one definition, two
+    // consumers.
     let fingerprint = StackFingerprint {
         frames: (0..stack.len())
             .map(|i| FrameFingerprint::from(stack.header(i)))
             .collect(),
+    };
+    let stage_cache = match StageCache::open(Path::new(".scratch")) {
+        Ok(cache) => cache,
+        Err(err) => return failed(&status, start, err.to_string()),
     };
 
     // Step 6: scheduler tuning flags, before alignment -- they reach the
@@ -720,6 +838,9 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         Vec<ParamReport>,
     )> = None;
     let mut used_peeked_alignment = false;
+    // `true` only when the alignment came from the stage cache --
+    // never for a computed one, a ledger-peeked one, or a `--no-align` run.
+    let mut align_cached = false;
 
     // Step 8.5a: *resolving* the alignment algorithm and its parameters is
     // pure -- registry lookup, `--align-set`/`[align]` validation, `auto`
@@ -852,9 +973,17 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     }
 
     if let Some((align_algo, _, align_values, align_params)) = align_prepared {
+        // Step 5: resolved once, fed both to the identity below and to
+        // `align_stack` (never re-derived in the miss arm).
+        let policy = if align_opts.lax {
+            focusforge_core::align::FailurePolicy::IdentityFallback
+        } else {
+            focusforge_core::align::FailurePolicy::Strict
+        };
         let identity = AlignIdentity {
             algorithm: align_algo.id().to_string(),
             params: align_values.clone(),
+            failure_policy: policy,
         };
         align_identity = Some(identity.clone());
 
@@ -877,60 +1006,85 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             used_peeked_alignment = true;
             alignment_result = Some((align_algo, result, align_values, align_params));
         } else {
-            let policy = if align_opts.lax {
-                focusforge_core::align::FailurePolicy::IdentityFallback
+            // Step 6: the stage cache lookup. Consulted only when the
+            // ledger peek above returned nothing (`--resume` with no
+            // matching ledger, or no `--resume` at all) -- ordering is
+            // fixed: a peeked alignment is the value the already-written
+            // tiles were produced against and always wins.
+            let stage_key = StageKey::align(&fingerprint, &identity);
+            let cache_hit = if job_opts.cache {
+                stage_cache.get_alignment(&stage_key)
             } else {
-                focusforge_core::align::FailurePolicy::Strict
+                None
             };
-            // Step 9: `align_stack` has no unit boundary -- a scoped
-            // watcher thread prints the cancellation notice the moment a
-            // SIGINT is observed, so the terminal never looks hung for the
-            // whole alignment's wall time, and once it returns, a still-set
-            // cancel exits 130 before anything is created (below).
-            renderer.stage(&format!("align {} frames (no unit progress)", stack.len()));
-            let done = AtomicBool::new(false);
-            let solved = std::thread::scope(|scope| {
-                let watcher = scope.spawn(|| {
-                    let mut warned = false;
-                    while !done.load(Ordering::SeqCst) {
-                        std::thread::sleep(job::POLL);
-                        if !warned && signals.cancel.load(Ordering::SeqCst) {
-                            eprintln!(
-                                "cancel requested -- alignment has no unit boundary; \
-                                 stopping at the fuse stage (Ctrl-C again to abort now)"
-                            );
-                            warned = true;
+
+            if let Some(result) = cache_hit {
+                align_cached = true;
+                renderer.stage(&format!(
+                    "align {} frames (reused from the stage cache)",
+                    stack.len()
+                ));
+                alignment_result = Some((align_algo, result, align_values, align_params));
+            } else {
+                // Step 9 (unnumbered in the align stage): `align_stack` has
+                // no unit boundary -- a scoped watcher thread prints the
+                // cancellation notice the moment a SIGINT is observed, so
+                // the terminal never looks hung for the whole alignment's
+                // wall time, and once it returns, a still-set cancel exits
+                // 130 before anything is created (below).
+                renderer.stage(&format!("align {} frames (no unit progress)", stack.len()));
+                let done = AtomicBool::new(false);
+                let solved = std::thread::scope(|scope| {
+                    let watcher = scope.spawn(|| {
+                        let mut warned = false;
+                        while !done.load(Ordering::SeqCst) {
+                            std::thread::sleep(job::POLL);
+                            if !warned && signals.cancel.load(Ordering::SeqCst) {
+                                eprintln!(
+                                    "cancel requested -- alignment has no unit boundary; \
+                                     stopping at the fuse stage (Ctrl-C again to abort now)"
+                                );
+                                warned = true;
+                            }
                         }
-                    }
+                    });
+                    let result = align_stack(align_algo, stack_ctx, &stack, &align_values, policy);
+                    done.store(true, Ordering::SeqCst);
+                    watcher.join().expect("align watcher thread must not panic");
+                    result
                 });
-                let result = align_stack(align_algo, stack_ctx, &stack, &align_values, policy);
-                done.store(true, Ordering::SeqCst);
-                watcher.join().expect("align watcher thread must not panic");
-                result
-            });
-            if signals.cancel.load(Ordering::SeqCst) {
-                return cancelled(&status, start);
+                if signals.cancel.load(Ordering::SeqCst) {
+                    return cancelled(&status, start);
+                }
+                let result = match solved {
+                    Ok(r) => r,
+                    Err(err) => return failed(&status, start, err),
+                };
+                if !align_opts.lax && result.failure_count() > 0 {
+                    let names: Vec<String> = result
+                        .failed()
+                        .map(|f| format!("{} ({:?})", frame_names[f.frame], f.status))
+                        .collect();
+                    return failed(
+                        &status,
+                        start,
+                        format!(
+                            "alignment failed for {} frame(s): {}",
+                            names.len(),
+                            names.join(", ")
+                        ),
+                    );
+                }
+                // A run about to refuse (above) caches nothing. A `put`
+                // failure warns on stderr and does not fail the run -- the
+                // posture `write_manifest`'s own caller already takes.
+                if job_opts.cache
+                    && let Err(err) = stage_cache.put_alignment(&stage_key, &paths, &result)
+                {
+                    eprintln!("warning: {err}");
+                }
+                alignment_result = Some((align_algo, result, align_values, align_params));
             }
-            let result = match solved {
-                Ok(r) => r,
-                Err(err) => return failed(&status, start, err),
-            };
-            if !align_opts.lax && result.failure_count() > 0 {
-                let names: Vec<String> = result
-                    .failed()
-                    .map(|f| format!("{} ({:?})", frame_names[f.frame], f.status))
-                    .collect();
-                return failed(
-                    &status,
-                    start,
-                    format!(
-                        "alignment failed for {} frame(s): {}",
-                        names.len(),
-                        names.join(", ")
-                    ),
-                );
-            }
-            alignment_result = Some((align_algo, result, align_values, align_params));
         }
     }
 
@@ -1383,6 +1537,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         description,
         align: align_report,
         backend: backend_id,
+        align_cached,
     };
 
     GroupResult::Completed(Box::new(report))
@@ -1539,9 +1694,11 @@ fn peek_resumable_crop_and_alignment(
         if candidate.align.as_ref() != align_identity {
             continue;
         }
-        let alignment = std::fs::read_to_string(dir.join("alignment.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok());
+        // `read_alignment` decodes the same bit-exact `transform_bits` shape
+        // `alignment.json` is actually written in; any read failure
+        // (absent, unparsable) is treated as "no recorded alignment yet"
+        // here, same as everywhere else in this function.
+        let alignment = read_alignment(&dir.join("alignment.json")).ok().flatten();
         return Some(job::PeekedResume { alignment });
     }
     None
@@ -1723,6 +1880,7 @@ mod tests {
             description: None,
             align: None,
             backend: "cpu".to_string(),
+            align_cached: false,
         }
     }
 
@@ -1790,5 +1948,107 @@ mod tests {
 
         let not_found = colliding_frame(Path::new("dir/out.tif"), &frame_paths, &frame_names);
         assert_eq!(not_found, None);
+    }
+
+    fn sample_group(name: &str, dir: &str) -> Group {
+        Group {
+            name: name.to_string(),
+            dir: PathBuf::from(dir),
+            frames: vec![PathBuf::from(dir).join("00.tif")],
+            signal: focusforge_core::io::GroupSignal::Directory,
+            first_time: None,
+            last_time: None,
+        }
+    }
+
+    #[test]
+    fn group_identity_is_the_input_dir_for_a_single_group_run_and_the_name_for_a_multi_one() {
+        let group = sample_group("IMG_01-02", "card-dump");
+        assert_eq!(
+            group_identity(false, Path::new("card-dump"), &group),
+            "card-dump"
+        );
+        assert_eq!(
+            group_identity(true, Path::new("card-dump"), &group),
+            "IMG_01-02"
+        );
+    }
+
+    #[test]
+    fn only_no_match_refusal_lists_every_known_identity() {
+        let a = sample_group("a", "dir");
+        let b = sample_group("b", "dir");
+        let proposal = Proposal {
+            root: PathBuf::from("dir"),
+            groups: vec![a, b],
+            gap: std::time::Duration::from_secs(60),
+            time_signal_available: false,
+        };
+        let identities = vec!["a".to_string(), "b".to_string()];
+        let message = only_no_match_refusal("c", &proposal, &identities);
+        assert!(message.contains("--only \"c\""), "{message}");
+        assert!(message.contains('a'), "{message}");
+        assert!(message.contains('b'), "{message}");
+    }
+
+    fn sample_manifest_entry(name: &str, output: &str) -> groups::ManifestEntry {
+        groups::ManifestEntry {
+            name: name.to_string(),
+            identity: name.to_string(),
+            frame_count: 1,
+            outcome: "completed".to_string(),
+            outputs: vec![output.to_string()],
+            wall_seconds: 1.0,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn merge_manifest_entries_keeps_unrelated_entries_and_replaces_matching_ones() {
+        let dir = std::env::temp_dir().join(format!("ff-stack-merge-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("manifest.json");
+        let existing = groups::RunManifest {
+            format: groups::MANIFEST_FORMAT,
+            root: "root".to_string(),
+            groups: vec![
+                sample_manifest_entry("a", "a.ffproj"),
+                sample_manifest_entry("b", "b.ffproj"),
+            ],
+        };
+        std::fs::write(&path, serde_json::to_string(&existing).unwrap()).unwrap();
+
+        let fresh = vec![sample_manifest_entry("a", "a2.ffproj")];
+        let merged = merge_manifest_entries(&path, "root", fresh);
+        assert_eq!(merged.len(), 2);
+        let a = merged.iter().find(|e| e.identity() == "a").unwrap();
+        assert_eq!(a.outputs, vec!["a2.ffproj".to_string()]);
+        let b = merged.iter().find(|e| e.identity() == "b").unwrap();
+        assert_eq!(b.outputs, vec!["b.ffproj".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_manifest_entries_treats_a_mismatched_root_as_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "ff-stack-merge-mismatch-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("manifest.json");
+        let existing = groups::RunManifest {
+            format: groups::MANIFEST_FORMAT,
+            root: "other-root".to_string(),
+            groups: vec![sample_manifest_entry("a", "a.ffproj")],
+        };
+        std::fs::write(&path, serde_json::to_string(&existing).unwrap()).unwrap();
+
+        let fresh = vec![sample_manifest_entry("b", "b.ffproj")];
+        let merged = merge_manifest_entries(&path, "root", fresh);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].identity(), "b");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

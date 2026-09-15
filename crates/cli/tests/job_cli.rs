@@ -1221,11 +1221,54 @@ mod unix_signals {
             .expect("align.alignments must be an array");
         assert_eq!(resumed_alignments.len(), recorded_frames.len());
         for (resumed_entry, recorded_frame) in resumed_alignments.iter().zip(recorded_frames) {
-            assert_eq!(
-                resumed_entry["transform"], recorded_frame["transform"],
-                "a resumed run must reuse the ledger's exact recorded transform, \
-                 never a freshly re-solved one"
-            );
+            // `alignment.json` stores `transform_bits` (`f64::to_bits()`), so
+            // the recorded side decodes exactly; `--json`'s `transform` goes
+            // through a `serde_json` float round trip that may lose a bit
+            // (<https://github.com/serde-rs/json/issues/707>). Hence 2 ULPs:
+            // slack for that formatting noise, far too tight for a re-solved
+            // alignment, which differs in far more than the last 1-2 bits.
+            let recorded_bits: Vec<Vec<u64>> = recorded_frame["transform_bits"]
+                .as_array()
+                .expect("alignment.json's frame must carry transform_bits")
+                .iter()
+                .map(|row| {
+                    row.as_array()
+                        .expect("transform_bits row must be an array")
+                        .iter()
+                        .map(|v| v.as_u64().expect("transform_bits entry must be a u64"))
+                        .collect()
+                })
+                .collect();
+            let resumed_values: Vec<Vec<f64>> = resumed_entry["transform"]["m"]
+                .as_array()
+                .expect("--json's transform.m must be an array")
+                .iter()
+                .map(|row| {
+                    row.as_array()
+                        .expect("transform.m row must be an array")
+                        .iter()
+                        .map(|v| v.as_f64().expect("transform.m entry must be a float"))
+                        .collect()
+                })
+                .collect();
+            for (resumed_row, recorded_row) in resumed_values.iter().zip(&recorded_bits) {
+                for (resumed_value, recorded_bits) in resumed_row.iter().zip(recorded_row) {
+                    let recorded_value = f64::from_bits(*recorded_bits);
+                    // A handful of ULPs of slack for the documented
+                    // formatter noise above -- computed as a value
+                    // difference rather than a raw bit-pattern subtraction
+                    // so a negative entry's sign bit does not throw off the
+                    // distance.
+                    let tolerance = 8.0 * f64::EPSILON * recorded_value.abs().max(1.0);
+                    let diff = (resumed_value - recorded_value).abs();
+                    assert!(
+                        diff <= tolerance,
+                        "a resumed run must reuse the ledger's exact recorded transform, \
+                         never a freshly re-solved one: resumed {resumed_value:?} vs \
+                         recorded {recorded_value:?} (diff {diff:e}, tolerance {tolerance:e})"
+                    );
+                }
+            }
         }
     }
 }

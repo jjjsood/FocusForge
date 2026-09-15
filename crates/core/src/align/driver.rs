@@ -71,7 +71,11 @@ pub enum ReferenceFrame {
 
 /// What [`align_stack`] does with a frame whose outcome is
 /// [`AlignStatus::Diverged`]. See the module docs' "Failure policy".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialized as `"strict"` / `"identity-fallback"`; part of the
+/// alignment cache key [`crate::job::record::AlignIdentity`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum FailurePolicy {
     Strict,
     IdentityFallback,

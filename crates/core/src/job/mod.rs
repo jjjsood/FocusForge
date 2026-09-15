@@ -57,12 +57,17 @@ pub mod fingerprint;
 pub mod ledger;
 pub mod progress;
 pub mod record;
+pub mod stage_cache;
 
 pub use control::{ControlState, JobControl};
 pub use fingerprint::{FingerprintMismatch, FrameCount, FrameFingerprint, StackFingerprint};
-pub use ledger::{Ledger, RecordingConsumer, Resumable, ResumeError, ResumeStore};
+pub use ledger::{Ledger, RecordingConsumer, Resumable, ResumeError, ResumeStore, read_alignment};
 pub use progress::JobProgress;
-pub use record::{AlignIdentity, JOB_RECORD_FORMAT, JobRecord};
+pub use record::{AlignIdentity, DRIVER_POLICY_FIELDS, JOB_RECORD_FORMAT, JobRecord};
+pub use stage_cache::{
+    CachedAlignment, CachedStage, FrameKey, STAGE_CACHE_FORMAT, StageCache, StageCacheError,
+    StageKey,
+};
 
 use std::collections::HashSet;
 use std::sync::Arc;

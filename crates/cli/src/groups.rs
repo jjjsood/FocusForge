@@ -52,9 +52,11 @@ pub const GROUPS_FILE_FORMAT: u32 = 1;
 /// The run-level manifest's schema version.
 pub const MANIFEST_FORMAT: u32 = 1;
 
-/// The two grouping flags, flattened into `stack` -- the shape
+/// The three grouping/subset flags, flattened into `stack` -- the shape
 /// [`crate::set::SetArgs`] established, where the type is the reusable
-/// thing rather than a position on the command line.
+/// thing rather than a position on the command line. All three decide what
+/// a run is pointed at: `--groups`/`--write-groups` decide what a stack
+/// *is*, `--only` decides which of the proposed stacks actually run.
 #[derive(Args, Debug, Default)]
 pub struct GroupArgs {
     /// Group the frames as this TOML file says instead of proposing a
@@ -68,6 +70,15 @@ pub struct GroupArgs {
     /// back with `--groups` to override the proposal.
     #[arg(long = "write-groups", value_name = "PATH")]
     pub write_groups: Option<PathBuf>,
+    /// Run only the named result(s), repeatable: matches a group's identity
+    /// (what `review --json`'s `identity` field prints, and what this run's
+    /// own `--status` stream uses) or its plain name. Every unselected
+    /// group is skipped -- named on stderr, not re-run -- and its project
+    /// on disk is left untouched. Combine with `--set`/`--align-set` to
+    /// cheaply re-run a subset after changing a fusion or alignment
+    /// parameter.
+    #[arg(long, value_name = "ID")]
+    pub only: Vec<String>,
 }
 
 /// One grouping file.

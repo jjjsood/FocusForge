@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The header-only stack fingerprint a resume compares against
-//! is **cheap, two-tier**. This
-//! is the *scratch/resume* fingerprint -- a plain comparison of the
-//! [`crate::io::TiffHeader`] fields [`TiffStack::header`](crate::io::TiffStack::header)
-//! already parsed for free, no hash crate, no pixel read. It is
-//! deliberately a *different* value from [`crate::project`]'s manifest
-//! fingerprint, which is a real content hash (blake3) over every source
-//! file -- see this module's own `tests::not_convertible_to_a_content_hash`
-//! and [`crate::project::stack_fingerprint`]. Neither substitutes for the
-//! other: this one exists to find a resumable ledger in milliseconds, that
-//! one to say years later exactly which bytes a project was computed from.
+//! The header-only stack fingerprint a resume compares against: a plain
+//! comparison of the [`crate::io::TiffHeader`] fields already parsed for
+//! free -- no hash crate, no pixel read. Deliberately different from
+//! [`crate::project`]'s manifest fingerprint, a blake3 hash over every
+//! source file: this one finds a resumable ledger in milliseconds, that
+//! one says exactly which bytes a project was computed from.
 
 use std::path::PathBuf;
 
@@ -253,13 +248,11 @@ mod tests {
     /// This fingerprint is not, and is not convertible to, the project
     /// manifest's content hash.
     ///
-    /// The guard used to be "this crate has no hashing dependency at all",
-    /// which stopped being the right one the moment `crate::project` added
-    /// blake3 for the manifest's own fingerprint -- a value that is
-    /// deliberately *different* from this one. The claim worth guarding was
-    /// never about the crate: it is that **this module** reaches for no
-    /// hash, so a `FrameFingerprint` has nothing to convert into and cannot
-    /// quietly drift into a content hash.
+    /// The claim worth guarding is not about the crate as a whole (which
+    /// does use blake3, for the manifest's own fingerprint): it is that
+    /// **this module** reaches for no hash, so a `FrameFingerprint` has
+    /// nothing to convert into and cannot quietly drift into a content
+    /// hash.
     #[test]
     fn not_convertible_to_a_content_hash() {
         // The needles are assembled rather than written out, so this
