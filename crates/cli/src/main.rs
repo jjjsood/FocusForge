@@ -30,13 +30,25 @@ mod stack;
 /// a private item here is already visible to them (the same visibility
 /// `crate::fail` already relies on).
 #[cfg(feature = "gpu")]
-fn resolve_backend(no_gpu: bool) -> Option<&'static dyn focusforge_core::gpu::TileBackend> {
-    gpu::resolve_backend(no_gpu)
+fn resolve_backend(
+    no_gpu: bool,
+    max_vram: Option<u64>,
+) -> (
+    Option<&'static dyn focusforge_core::gpu::TileBackend>,
+    Option<stack::DeviceBudgetReport>,
+) {
+    gpu::resolve_backend(no_gpu, max_vram)
 }
 
 #[cfg(not(feature = "gpu"))]
-fn resolve_backend(_no_gpu: bool) -> Option<&'static dyn focusforge_core::gpu::TileBackend> {
-    None
+fn resolve_backend(
+    _no_gpu: bool,
+    _max_vram: Option<u64>,
+) -> (
+    Option<&'static dyn focusforge_core::gpu::TileBackend>,
+    Option<stack::DeviceBudgetReport>,
+) {
+    (None, None)
 }
 
 /// FocusForge command-line interface.
@@ -130,6 +142,18 @@ enum Command {
             value_parser = crate::bytes::parse_byte_size
         )]
         max_host_memory: Option<u64>,
+        /// A **ceiling only** on the adaptive device (VRAM) budget: it can
+        /// lower the budget the startup probe settled on, and can never
+        /// raise it. Omit it entirely to get the probed value. Accepts the
+        /// same suffixed sizes as `--max-host-memory`. Only present when the
+        /// `gpu` feature is compiled in.
+        #[cfg(feature = "gpu")]
+        #[arg(
+            long = "max-vram",
+            value_name = "SIZE",
+            value_parser = crate::bytes::parse_byte_size
+        )]
+        max_vram: Option<u64>,
         /// Force the CPU path even when a usable GPU adapter is available.
         /// Only present when the `gpu` feature is compiled in -- with it
         /// off, this flag does not exist at all, not even as a no-op.
@@ -196,12 +220,16 @@ fn main() -> ExitCode {
             align_set,
             max_host_memory,
             #[cfg(feature = "gpu")]
+            max_vram,
+            #[cfg(feature = "gpu")]
             gpu,
         } => {
             #[cfg(feature = "gpu")]
             let no_gpu = !gpu;
             #[cfg(not(feature = "gpu"))]
             let no_gpu = false;
+            #[cfg(not(feature = "gpu"))]
+            let max_vram: Option<u64> = None;
             stack::run(
                 &dir,
                 &output,
@@ -218,6 +246,7 @@ fn main() -> ExitCode {
                 },
                 no_gpu,
                 max_host_memory,
+                max_vram,
             )
         }
         Command::Align {

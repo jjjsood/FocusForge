@@ -102,7 +102,7 @@ pub fn warp_from_tile_gpu(
     let device = shared.device();
     let queue = shared.queue();
     let word_count = (packed_len(sample_count) / 4) as u32;
-    let bytes = download_buffer(device, queue, &dst_buffer, u64::from(word_count) * 4);
+    let bytes = download_buffer(device, queue, &dst_buffer, u64::from(word_count) * 4)?;
     let samples = unpack_samples(&bytes, sample_count);
 
     Ok(WarpedTile {
@@ -214,7 +214,7 @@ pub fn warp_tile_gpu(
     let device = shared.device();
     let queue = shared.queue();
     let word_count = (packed_len(sample_count) / 4) as u32;
-    let bytes = download_buffer(device, queue, &dst_buffer, u64::from(word_count) * 4);
+    let bytes = download_buffer(device, queue, &dst_buffer, u64::from(word_count) * 4)?;
     let samples = unpack_samples(&bytes, sample_count);
 
     Ok(WarpedTile {

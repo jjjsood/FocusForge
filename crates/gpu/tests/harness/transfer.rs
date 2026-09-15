@@ -66,7 +66,7 @@ fn assert_roundtrip(
 
     let buffer = upload_tile(device, queue, &tile);
     let byte_len = packed_len(tile.samples.len()) as u64;
-    let bytes = download_buffer(device, queue, &buffer, byte_len);
+    let bytes = download_buffer(device, queue, &buffer, byte_len).expect("download_buffer");
     let round_tripped = unpack_samples(&bytes, tile.samples.len());
 
     assert_eq!(

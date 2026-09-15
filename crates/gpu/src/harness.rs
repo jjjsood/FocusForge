@@ -16,15 +16,17 @@ use focusforge_core::gpu::{BackendInfo, TileBackend};
 use focusforge_core::tile::{Rect, Tile};
 
 use crate::budget::{
-    VramBudget, buffer_limit_shortfalls, device_bytes_per_tile, largest_buffer_bytes,
+    DeviceBudget, ProbeOutcome, VramBudget, buffer_limit_shortfalls, device_bytes_per_tile,
+    largest_buffer_bytes, probe_budget,
 };
-use crate::device::{GpuError, SharedDevice, shared_device};
+use crate::device::{GpuError, SharedDevice, block_on, shared_device};
 use crate::fuse::{self, FusionPipelines};
 use crate::pack::{packed_len, unpack_samples};
 use crate::pipeline::{
     Pipeline, build_pipeline, run_pass, storage_entry, uniform_entry, upload_params,
 };
 use crate::transfer::{download_buffer, upload_tile};
+use crate::vram::WgpuAllocProbe;
 use crate::warp::{self, WarpPipelines};
 
 /// [`TileBackend`] for this crate's kernels: `self_check`, `fuse_tile`,
@@ -42,37 +44,73 @@ pub struct GpuBackend {
     /// [`Self::with_max_device_bytes`] for the non-singleton constructor a
     /// test uses to drive a deliberately tiny ceiling.
     budget: VramBudget,
+    /// The settled budget and its provenance, reported through
+    /// [`Self::device_budget`] -- `crates/cli` turns this into
+    /// `StackReport`'s additive `max_device_bytes_in_flight` /
+    /// `device_budget_provenance` fields.
+    device_budget: DeviceBudget,
 }
 
 impl GpuBackend {
-    fn new(device: &'static SharedDevice) -> Self {
-        Self::with_budget(device, crate::budget::DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT)
-    }
-
-    fn with_budget(device: &'static SharedDevice, max_device_bytes: u64) -> Self {
+    fn with_budget(device: &'static SharedDevice, device_budget: DeviceBudget) -> Self {
         GpuBackend {
             device,
             pipeline: OnceLock::new(),
             fuse_pipelines: FusionPipelines::new(),
             warp_pipelines: WarpPipelines::new(),
-            budget: VramBudget::new(max_device_bytes),
+            budget: VramBudget::new(device_budget.bytes()),
+            device_budget,
         }
     }
 
+    /// Probes the device for a working budget
+    /// ([`probe_budget`] over a real [`WgpuAllocProbe`]), applies `ceiling`
+    /// (never raising, only ever lowering -- [`DeviceBudget::capped_to`]),
+    /// and builds the backend. `Err(GpuError::VramExhausted)` when the probe
+    /// refused all the way down to `crate::budget::PROBE_MIN_DEVICE_BYTES`:
+    /// the device cannot serve even the smallest budget -- only this
+    /// startup case falls back to the CPU path; a mid-run exhaustion after
+    /// this probe already succeeded does not).
+    fn probed(device: &'static SharedDevice, ceiling: Option<u64>) -> Result<GpuBackend, GpuError> {
+        let probe = WgpuAllocProbe::new(device.device());
+        let device_budget = match probe_budget(&probe) {
+            ProbeOutcome::Settled { bytes, .. } => DeviceBudget::probed(bytes),
+            ProbeOutcome::Exhausted { floor, detail } => {
+                return Err(GpuError::VramExhausted {
+                    floor_bytes: floor,
+                    detail,
+                });
+            }
+        };
+        Ok(GpuBackend::with_budget(
+            device,
+            device_budget.capped_to(ceiling),
+        ))
+    }
+
     /// A second *backend* over the same `&'static SharedDevice` -- never a
-    /// second device -- for a test that needs an explicit budget the
-    /// process-wide [`gpu_backend`] singleton cannot provide. Never probes:
-    /// the budget is reported `Explicit`, exactly like a flag-capped
-    /// `HostBudget` one crate over (`crates/core/src/tile/budget.rs`).
+    /// second device -- for a test that needs an
+    /// explicit budget the process-wide [`gpu_backend`] singleton cannot
+    /// provide. Never probes: the budget is reported `Explicit`, exactly
+    /// like a flag-capped `HostBudget` one crate over.
     pub fn with_max_device_bytes(max_device_bytes: u64) -> Result<GpuBackend, &'static GpuError> {
         let device = shared_device()?;
-        Ok(GpuBackend::with_budget(device, max_device_bytes))
+        Ok(GpuBackend::with_budget(
+            device,
+            DeviceBudget::explicit(max_device_bytes),
+        ))
     }
 
     /// The budget wrapping [`Self::warp_fuse_tile`]'s dispatch -- the
     /// observable a test reads `peak_in_flight()` / `limit_for()` off.
     pub fn budget(&self) -> &VramBudget {
         &self.budget
+    }
+
+    /// The settled device-byte budget and where it came from -- `"cpu"`-path
+    /// runs never call this; `crates/cli/src/gpu.rs` is the one caller.
+    pub fn device_budget(&self) -> DeviceBudget {
+        self.device_budget
     }
 
     fn pipeline(&self) -> &Pipeline {
@@ -158,7 +196,7 @@ impl TileBackend for GpuBackend {
             "focusforge-gpu-harness-pass",
         );
 
-        let bytes = download_buffer(device, queue, &dst_buffer, byte_len);
+        let bytes = download_buffer(device, queue, &dst_buffer, byte_len)?;
         let samples = unpack_samples(&bytes, sample_count);
 
         Ok(Tile {
@@ -245,7 +283,14 @@ impl TileBackend for GpuBackend {
         }
 
         let _permit = self.budget.acquire(bytes);
-        crate::stack_tile::warp_fuse_tile_gpu(
+
+        // Both scopes are pushed and popped on this one rayon worker: wgpu
+        // routes an error to the innermost matching scope of the *raising*
+        // thread. One pair per tile, never per pyramid level -- a validation
+        // error names its kernel from the dispatch label instead.
+        let device = self.device.device();
+        let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let result = crate::stack_tile::warp_fuse_tile_gpu(
             self.device,
             &self.warp_pipelines,
             &self.fuse_pipelines,
@@ -255,7 +300,22 @@ impl TileBackend for GpuBackend {
             rect,
             samples_per_pixel,
             levels,
-        )
+        );
+        let oom = block_on(scope.pop());
+        match oom {
+            // `result`'s `Ok` value is discarded here even if the dispatch
+            // otherwise "succeeded": after an OOM, `create_buffer` has
+            // handed back error buffers whose later use raises *validation*
+            // errors, which route to a different filter and would
+            // otherwise let a run "succeed" on poisoned buffers.
+            // Mid-run exhaustion is a run failure naming the flag to lower,
+            // never a fallback.
+            Some(err) => Err(GpuError::DeviceOutOfMemory {
+                detail: err.to_string(),
+            }
+            .into()),
+            None => result,
+        }
     }
 }
 
@@ -268,11 +328,29 @@ impl std::fmt::Display for GpuBackend {
     }
 }
 
-static GPU_BACKEND: OnceLock<GpuBackend> = OnceLock::new();
+/// `OnceLock<Result<..>>`, not `OnceLock<GpuBackend>`: probing can itself
+/// fail (`GpuError::VramExhausted`), and this is the same
+/// initialiser-returns-its-error-instead-of-unwinding pattern
+/// `device::SHARED` already uses, for the same reason -- no lock poisons,
+/// every later caller observes the same stored `Err`.
+static GPU_BACKEND: OnceLock<Result<GpuBackend, GpuError>> = OnceLock::new();
 
-/// The process-wide GPU backend, built once atop [`shared_device`] -- no
-/// test builds its own.
-pub fn gpu_backend() -> Result<&'static GpuBackend, &'static GpuError> {
+/// The process-wide GPU backend, probed once atop [`shared_device`] and
+/// capped to `max_vram` -- no test builds its own. **The first caller wins
+/// on the ceiling**: the probe and the cap both happen inside the
+/// [`OnceLock`]'s initializer, so a second call with a different `max_vram`
+/// reuses the first call's already-settled result rather than re-probing.
+/// `crates/cli` calls this exactly once per process, so this is never
+/// actually observed there.
+pub fn gpu_backend_capped(max_vram: Option<u64>) -> Result<&'static GpuBackend, &'static GpuError> {
     let device = shared_device()?;
-    Ok(GPU_BACKEND.get_or_init(|| GpuBackend::new(device)))
+    GPU_BACKEND
+        .get_or_init(|| GpuBackend::probed(device, max_vram))
+        .as_ref()
+}
+
+/// [`gpu_backend_capped`] with no ceiling -- every existing caller that has
+/// no `--max-vram` value to apply.
+pub fn gpu_backend() -> Result<&'static GpuBackend, &'static GpuError> {
+    gpu_backend_capped(None)
 }

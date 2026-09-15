@@ -70,6 +70,20 @@ pub struct StackReport {
     /// display -- additive, so which path ran is machine-readable and not
     /// only a stderr line.
     pub backend: String,
+    /// The device in-flight-byte budget actually in force for this run's
+    /// GPU path -- `null` on the CPU path.
+    pub max_device_bytes_in_flight: Option<u64>,
+    /// Where that budget came from: `Host` (the startup probe settled),
+    /// `HostFallback` (no probe ran, the stated default was used), or
+    /// `Explicit` (`--max-vram` lowered it) -- `null` on the CPU path.
+    pub device_budget_provenance: Option<Provenance>,
+}
+
+/// The settled device (VRAM) budget and its provenance. Lives in the CLI
+/// because `core` has no concept of VRAM.
+pub struct DeviceBudgetReport {
+    pub max_device_bytes: u64,
+    pub provenance: Provenance,
 }
 
 /// `stack --json`'s `align` field: `null` when `--no-align` was given.
@@ -109,6 +123,7 @@ pub fn run(
     align_opts: &AlignOptions<'_>,
     no_gpu: bool,
     max_host_memory: Option<u64>,
+    max_vram: Option<u64>,
 ) -> ExitCode {
     let start = Instant::now();
 
@@ -143,10 +158,10 @@ pub fn run(
     // therefore gated on the selected algorithm's own id, compared against
     // `Laplacian`'s own `id()` rather than a bare string literal repeated
     // here.
-    let backend = if algo.id() == Laplacian.id() {
-        crate::resolve_backend(no_gpu)
+    let (backend, device_budget_report) = if algo.id() == Laplacian.id() {
+        crate::resolve_backend(no_gpu, max_vram)
     } else {
-        None
+        (None, None)
     };
 
     // Step 3: parse `--set` against that schema. An unknown key or an
@@ -495,6 +510,8 @@ pub fn run(
         backend: backend
             .map(|b| b.info().to_string())
             .unwrap_or_else(|| "cpu".to_string()),
+        max_device_bytes_in_flight: device_budget_report.as_ref().map(|r| r.max_device_bytes),
+        device_budget_provenance: device_budget_report.as_ref().map(|r| r.provenance),
     };
 
     if json {
@@ -621,6 +638,14 @@ fn render(report: &StackReport) -> String {
         report.max_bytes_in_flight, report.budget_provenance, report.backed_off,
     ));
     lines.push(format!("backend: {}", report.backend));
+    if let (Some(max_device_bytes_in_flight), Some(device_budget_provenance)) = (
+        report.max_device_bytes_in_flight,
+        report.device_budget_provenance,
+    ) {
+        lines.push(format!(
+            "max_device_bytes_in_flight={max_device_bytes_in_flight} device_budget={device_budget_provenance:?}"
+        ));
+    }
     for output in &report.outputs {
         lines.push(format!("wrote: {output}"));
     }
@@ -671,6 +696,8 @@ mod tests {
             description: None,
             align: None,
             backend: "cpu".to_string(),
+            max_device_bytes_in_flight: None,
+            device_budget_provenance: None,
         }
     }
 

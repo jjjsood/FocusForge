@@ -165,6 +165,7 @@ off:
 | `--align-algo <ALGO>` | alignment algorithm id; optional, defaults to the sole registered alignment algorithm |
 | `--align-set <KEY=VALUE>` | set one alignment parameter, repeatable; separate from `--set`, which is the stacking algorithm's own |
 | `--max-host-memory <SIZE>` | a **ceiling only** on the adaptive host-memory budget: it can lower the budget the host-derived estimate resolved to, never raise it. Omit it entirely to get the machine's own concurrency. Accepts suffixed sizes: `B`; `KiB`/`MiB`/`GiB`/`TiB` (1024-based); `KB`/`MB`/`GB`/`TB` (1000-based); no suffix means bytes (e.g. `8GiB`, `512MiB`, `4096`) |
+| `--max-vram <SIZE>` | a **ceiling only** on the adaptive device (VRAM) budget: it can lower the budget the startup probe settled on, never raise it. Omit it entirely to get the probed value. Same accepted sizes as `--max-host-memory`; only exists when the binary was built with `--features gpu` |
 | `--no-gpu` | force the CPU path even when a usable GPU adapter is present; only exists when the binary was built with `--features gpu` |
 
 Every algorithm also writes a **Z-Map** when `--zmap` is given: a
@@ -248,6 +249,13 @@ used instead; `"Explicit"` — `--max-host-memory` lowered the budget), and
 `backed_off` (whether the runtime back-off shrunk the in-flight limit during
 this run because of observed memory pressure).
 
+Additive fields from the device (VRAM) budget, GPU path only:
+`max_device_bytes_in_flight` (the in-flight device-byte budget actually in
+force) and `device_budget_provenance` (`"Host"` — a startup probe settled on
+this value; `"HostFallback"` — no probe ran and the stated default was used
+instead; `"Explicit"` — `--max-vram` lowered it). Both are `null` on the CPU
+path.
+
 ```json
 {
   "input": "fixtures/mantis-64",
@@ -271,7 +279,9 @@ this run because of observed memory pressure).
   "backed_off": false,
   "outputs": [".scratch/out.tif", ".scratch/zmap.tif"],
   "wall_seconds": 0.030267391,
-  "backend": "cpu"
+  "backend": "cpu",
+  "max_device_bytes_in_flight": null,
+  "device_budget_provenance": null
 }
 ```
 

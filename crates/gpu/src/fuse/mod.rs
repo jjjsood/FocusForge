@@ -535,12 +535,12 @@ pub(crate) fn fuse_planes_gpu(
         word_count,
         sample_count as u32,
     );
-    let packed_bytes = download_buffer(device, queue, &packed_out, (word_count as u64) * 4);
+    let packed_bytes = download_buffer(device, queue, &packed_out, (word_count as u64) * 4)?;
     let samples = unpack_samples(&packed_bytes, sample_count);
 
     let (winner_best, ww, wh) = winner_buffer.expect("levels >= 1 guarantees a level-0 winner");
     let winner_count = ww as usize * wh as usize;
-    let raw = download_buffer(device, queue, &winner_best, (winner_count * 8) as u64);
+    let raw = download_buffer(device, queue, &winner_best, (winner_count * 8) as u64)?;
     let mut zmap = vec![0u16; winner_count];
     for (i, chunk) in raw.chunks_exact(8).enumerate() {
         let winner = u32::from_le_bytes(chunk[4..8].try_into().expect("4 bytes"));

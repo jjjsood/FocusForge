@@ -7,11 +7,6 @@
 //! own allocator report is recorded next to `device_bytes_per_tile`'s
 //! prediction, once, as a diagnostic rather than a bound
 //! (`allocator_report_matches_the_prediction`).
-//!
-//! Carries its own collecting [`TileConsumer`] rather than reaching into
-//! `crate::parity_pipeline`'s private helpers or `BackendFusionConsumer`
-//! (`crates/core/src/fuse/backend_consumer.rs`, which writes a TIFF sink
-//! this test has no use for).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -134,16 +129,45 @@ fn tiny_budget_serializes_tiles_and_keeps_the_result() {
     let tiny_backend = GpuBackend::with_max_device_bytes(1).expect("tiny gpu backend");
     let tiny_result = run_plan(&tiny_backend, "tiny");
 
-    // The fixture-scale byte cost pinned in `crates/gpu/src/budget.rs`'s own
-    // default-gate unit test -- any positive value collapses to the same
-    // limit against a 1-byte ceiling, so this ties the assertion to the
-    // real per-tile geometry rather than an arbitrary number.
+    // The fixture-scale per-tile byte cost (8 frames, 512x512x3, warped).
     let bytes = device_bytes_per_tile(8, 512, 512, 3, LEVELS, true);
     assert_eq!(tiny_backend.budget().peak_in_flight(), 1);
     assert_eq!(tiny_backend.budget().limit_for(bytes), 1);
     assert_eq!(
         default_result, tiny_result,
         "a tiny device budget must not change a single tile's composite samples or Z-Map"
+    );
+}
+
+/// The real [`focusforge_gpu::vram::WgpuAllocProbe`], through the process
+/// singleton (`gpu_backend`): the settled budget is positive and its
+/// provenance is `Host` (a probe settled) or `HostFallback`, never
+/// `Explicit`, since no `--max-vram` ceiling applies here.
+#[test]
+fn wgpu_alloc_probe_settles_and_reports_provenance() {
+    if focusforge_gpu::device::shared_device_or_skip().is_none() {
+        return;
+    }
+    let backend = gpu_backend().expect("gpu backend");
+    let device_budget = backend.device_budget();
+    println!(
+        "wgpu_alloc_probe_settles_and_reports_provenance: bytes={} provenance={:?}",
+        device_budget.bytes(),
+        device_budget.provenance()
+    );
+    assert!(
+        device_budget.bytes() > 0,
+        "a settled device budget must be a positive byte count"
+    );
+    assert!(
+        matches!(
+            device_budget.provenance(),
+            focusforge_core::params::Provenance::Host
+                | focusforge_core::params::Provenance::HostFallback
+        ),
+        "the singleton backend (no --max-vram applied) must report Host or HostFallback \
+         provenance, got {:?}",
+        device_budget.provenance()
     );
 }
 
@@ -211,8 +235,8 @@ fn allocator_report_matches_the_prediction() {
         _ => {
             println!(
                 "allocator report unavailable: Device::generate_allocator_report() returned \
-                 None on this backend (skip reason: the portability path, not the Vulkan path \
-                 this machine is expected to take)"
+                 None on this backend (skip reason: the adapter uses the portability path, \
+                 not native Vulkan)"
             );
         }
     }
