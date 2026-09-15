@@ -10,10 +10,10 @@
 //! `crates/gpu/tests/harness.rs`'s one-binary-one-device convention.
 //!
 //! Each test here loads the GPU (through the spawned process) and is meant
-//! to be run deliberately, once, alongside the other
-//! `--features gpu` runs -- never inside a red-green loop.
+//! to be run deliberately, alongside the other `--features gpu-tests`
+//! runs, not as part of a routine `cargo test` invocation.
 
-#![cfg(feature = "gpu")]
+#![cfg(feature = "gpu-tests")]
 
 mod common;
 
@@ -367,5 +367,106 @@ fn no_gpu_flag_forces_cpu_even_with_adapter() {
         !result.stderr.to_lowercase().contains("adapter selected"),
         "a forced CPU run must never report an adapter as selected: {}",
         result.stderr
+    );
+}
+
+/// `--max-vram` is a ceiling only: a value below the probed budget lowers it
+/// and reports `Explicit`; a value above it changes nothing, including its
+/// provenance. `stack --json` reports both `max_device_bytes_in_flight` and
+/// `device_budget_provenance` on the GPU path, and `null` for both on the
+/// CPU path.
+#[test]
+fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
+    let dir = tmp_dir("cli_gpu_max_vram");
+
+    let base_args = |output: &Path, extra: &[&str]| -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "stack".to_string(),
+            mantis_512_dir().to_str().unwrap().to_string(),
+            "-o".to_string(),
+            output.to_str().unwrap().to_string(),
+            "--algo".to_string(),
+            "laplacian".to_string(),
+            "--align-algo".to_string(),
+            "pyramidal-ecc".to_string(),
+            "--lax".to_string(),
+            "--json".to_string(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args
+    };
+    let run_args = |args: &[String]| -> CliOutput {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        run(&refs)
+    };
+
+    let probed_out = dir.join("probed.tif");
+    let probed = run_args(&base_args(&probed_out, &[]));
+    assert!(probed.success, "stderr: {}", probed.stderr);
+    let probed_report: serde_json::Value =
+        serde_json::from_str(&probed.stdout).expect("--json must parse");
+    if probed_report["backend"] == "cpu" {
+        println!("SKIP: no usable adapter on this machine, cannot exercise --max-vram");
+        return;
+    }
+    let probed_bytes = probed_report["max_device_bytes_in_flight"]
+        .as_u64()
+        .expect("GPU path must report a non-null max_device_bytes_in_flight");
+    assert_ne!(
+        probed_report["device_budget_provenance"],
+        serde_json::Value::Null,
+        "GPU path must report a non-null device_budget_provenance: {probed_report}"
+    );
+
+    // A ceiling well below the probed value lowers it and reports Explicit.
+    let ceiling: u64 = 256 << 20; // 256MiB -- the probe's own floor.
+    assert!(
+        ceiling < probed_bytes,
+        "fixture assumption: probed budget ({probed_bytes}) must exceed the 256MiB ceiling used below"
+    );
+    let low_out = dir.join("low.tif");
+    let low = run_args(&base_args(&low_out, &["--max-vram", "256MiB"]));
+    assert!(low.success, "stderr: {}", low.stderr);
+    let low_report: serde_json::Value =
+        serde_json::from_str(&low.stdout).expect("--json must parse");
+    assert_eq!(
+        low_report["max_device_bytes_in_flight"], ceiling,
+        "report: {low_report}"
+    );
+    assert_eq!(
+        low_report["device_budget_provenance"], "Explicit",
+        "report: {low_report}"
+    );
+
+    // A ceiling above the probed value changes nothing, provenance included.
+    let high_out = dir.join("high.tif");
+    let high = run_args(&base_args(&high_out, &["--max-vram", "64GiB"]));
+    assert!(high.success, "stderr: {}", high.stderr);
+    let high_report: serde_json::Value =
+        serde_json::from_str(&high.stdout).expect("--json must parse");
+    assert_eq!(
+        high_report["max_device_bytes_in_flight"], probed_report["max_device_bytes_in_flight"],
+        "a ceiling above the probed value must not change it: {high_report}"
+    );
+    assert_eq!(
+        high_report["device_budget_provenance"], probed_report["device_budget_provenance"],
+        "a ceiling above the probed value must not change its provenance: {high_report}"
+    );
+
+    // CPU path: both fields null.
+    let cpu_out = dir.join("cpu.tif");
+    let cpu = run_args(&base_args(&cpu_out, &["--no-gpu"]));
+    assert!(cpu.success, "stderr: {}", cpu.stderr);
+    let cpu_report: serde_json::Value =
+        serde_json::from_str(&cpu.stdout).expect("--json must parse");
+    assert_eq!(
+        cpu_report["max_device_bytes_in_flight"],
+        serde_json::Value::Null,
+        "report: {cpu_report}"
+    );
+    assert_eq!(
+        cpu_report["device_budget_provenance"],
+        serde_json::Value::Null,
+        "report: {cpu_report}"
     );
 }

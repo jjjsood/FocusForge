@@ -8,9 +8,11 @@
 //! `transfer::tile_roundtrip_is_bit_identical`,
 //! `parity::harness_kernel_matches_cpu_twin`, `parity_fusion::*`,
 //! `parity_warp::*`, `parity_pipeline::*` -- only resolve as module paths
-//! inside one binary.
+//! inside one binary. Gated behind `gpu-tests` (not the default `gpu`) so
+//! a plain `cargo test` never brings up a device: run deliberately with
+//! `cargo test --features gpu-tests -- --test-threads=1`.
 
-#![cfg(feature = "gpu")]
+#![cfg(feature = "gpu-tests")]
 
 mod common;
 

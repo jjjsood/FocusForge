@@ -1,19 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! The whole-tile pipeline: warp every frame's contribution to `rect` on the
-//! GPU, and fuse the result, keeping every intermediate resident on the
-//! device between the two stages -- its own module, deliberately not
-//! folded into [`crate::pipeline`] (compute-pipeline plumbing) or
-//! [`crate::fuse`] (the fusion kernels alone): this module is the seam
-//! between the warp kernels and the fusion kernels, and naming it after
-//! either alone would be the same naming lie already refused when
-//! `crate::pipeline` was hoisted out of `crate::fuse`.
-//!
-//! **Exactly one readback per tile.** The two `download_buffer` calls
-//! already at the tail of [`crate::fuse::fuse_planes_gpu`] (composite +
-//! Z-Map) are the only reads back to the host anywhere on this path --
-//! nothing between a warped frame's dispatch and the fused result touches
-//! `download_buffer`, `download_f32` or `map_async`.
+//! GPU and fuse the result, with every intermediate kept on the device.
+//! No per-frame readback: the two `download_buffer` calls at the tail of
+//! `crate::fuse::fuse_planes_gpu` (composite, Z-Map) are the only reads
+//! back to the host on this path.
 
 use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
 use focusforge_core::align::Transform;
@@ -31,7 +22,7 @@ use crate::warp::{WarpPipelines, warp_tile_dispatch};
 /// index-is-frame convention [`focusforge_core::align::WarpingReader`]
 /// already carries. An identity entry is the identical short-circuit "read
 /// `rect` directly" -- no dispatch, just an upload and a
-/// [`plane_from_packed`] join, exactly the same join a warped frame gets.
+/// `plane_from_packed` join, exactly the same join a warped frame gets.
 #[allow(clippy::too_many_arguments)]
 pub fn warp_fuse_tile_gpu(
     shared: &SharedDevice,

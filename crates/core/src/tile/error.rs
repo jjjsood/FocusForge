@@ -109,4 +109,23 @@ pub enum TileError {
          never run for them"
     )]
     PixelSupplyingConsumerNeedsNoopPreprocess,
+
+    /// A host-derived, uncapped memory budget (`HostBudget::refuses_below_
+    /// one_tile_set`) is smaller than one tile set -- refused by name rather
+    /// than silently floored or deadlocked. An
+    /// explicitly supplied budget or a `--max-host-memory` ceiling still
+    /// floors at 1 and runs -- this variant is host-derived-only. The
+    /// message deliberately does not name `--max-host-memory`, which only
+    /// lowers the budget and can never fix this.
+    #[error(
+        "the host-derived memory budget of {budget_bytes} B is smaller than one tile set \
+         ({bytes_per_tile_set} B for {frame_count} frames at tile_size {tile_size}); free \
+         memory on this machine, stack fewer frames, or use a smaller tile_size"
+    )]
+    HostMemoryTooSmall {
+        budget_bytes: u64,
+        bytes_per_tile_set: u64,
+        frame_count: usize,
+        tile_size: u32,
+    },
 }

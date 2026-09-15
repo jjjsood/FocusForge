@@ -47,4 +47,6 @@ pub mod stack_tile;
 #[cfg(feature = "gpu")]
 pub mod transfer;
 #[cfg(feature = "gpu")]
+pub mod vram;
+#[cfg(feature = "gpu")]
 pub mod warp;

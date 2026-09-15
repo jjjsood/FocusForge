@@ -20,6 +20,10 @@
 #      the assertion; memory.peak, memory.swap.peak and the anon/file split
 #      are recorded, never thresholded.
 #
+# `run_stack` passes `--no-gpu`: `gpu` is a default feature, and without it
+# this run would measure the GPU path's VRAM probe instead of the CPU tile
+# scheduler's host-memory behaviour it exists to measure.
+#
 # Uses the release binary: the dev profile is far too slow at this scale.
 #
 # Why not `ulimit -v` for the memory ceiling: `crates/core/src/io/tiff/stack.rs`
@@ -237,7 +241,7 @@ run_stack() {
     /usr/bin/time -v "$CLI" stack "$OUT_DIR/frames" \
       -o "$out/out.tif" --zmap "$out/out-zmap.tif" \
       --algo laplacian --set levels=5 --json \
-      --no-crop --align-algo pyramidal-ecc --lax \
+      --no-crop --align-algo pyramidal-ecc --lax --no-gpu \
       > "$out/stack.json" 2> "$out/time-v.txt"
 }
 

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! The upload/readback half of the packed-`u32` storage-buffer path
-//! (`pack.rs` is the arithmetic half). Feature-gated: this is the only file
-//! in the crate that turns packed bytes into a `wgpu::Buffer` and back.
+//! (`pack.rs` is the arithmetic half).
 //!
 //! **Alignment.** `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT` (256 bytes) governs
 //! buffer<->texture copies only; it does not apply here. `map_async` /
@@ -17,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use focusforge_core::tile::Tile;
 
+use crate::device::GpuError;
 use crate::pack::{pack_samples, packed_len};
 
 /// Incremented once per [`download_buffer`] call -- the counter
@@ -69,10 +69,10 @@ pub fn download_f32(
     queue: &wgpu::Queue,
     src: &wgpu::Buffer,
     len: usize,
-) -> Vec<f32> {
+) -> Result<Vec<f32>, GpuError> {
     let byte_len = (len * 4) as u64;
-    let bytes = download_buffer(device, queue, src, byte_len);
-    bytes
+    let bytes = download_buffer(device, queue, src, byte_len)?;
+    Ok(bytes
         .chunks_exact(4)
         .map(|word| {
             f32::from_le_bytes(
@@ -80,7 +80,7 @@ pub fn download_f32(
                     .expect("chunks_exact(4) always yields 4 bytes"),
             )
         })
-        .collect()
+        .collect())
 }
 
 /// Uploads `tile`'s packed samples into a new `STORAGE | COPY_DST | COPY_SRC`
@@ -103,13 +103,15 @@ pub fn upload_tile(device: &wgpu::Device, queue: &wgpu::Queue, tile: &Tile) -> w
 }
 
 /// Copies `byte_len` bytes of `src` back to the host through a
-/// `COPY_DST | MAP_READ` staging buffer.
+/// `COPY_DST | MAP_READ` staging buffer. `Err(GpuError::Readback)` if
+/// `device.poll` fails, the `map_async` callback never fires, or the
+/// mapping it delivers is an error.
 pub fn download_buffer(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     src: &wgpu::Buffer,
     byte_len: u64,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, GpuError> {
     READBACK_COUNT.fetch_add(1, Ordering::SeqCst);
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("focusforge-gpu-readback-staging"),
@@ -131,12 +133,18 @@ pub fn download_buffer(
     });
     device
         .poll(wgpu::PollType::wait_indefinitely())
-        .expect("device.poll failed while waiting for readback map");
+        .map_err(|err| GpuError::Readback {
+            detail: format!("device.poll failed while waiting for readback map: {err}"),
+        })?;
     rx.recv()
-        .expect("map_async callback never fired")
-        .expect("failed to map readback staging buffer");
+        .map_err(|_| GpuError::Readback {
+            detail: "map_async callback never fired".to_string(),
+        })?
+        .map_err(|err| GpuError::Readback {
+            detail: format!("failed to map readback staging buffer: {err}"),
+        })?;
 
     let data = slice.get_mapped_range().to_vec();
     staging.unmap();
-    data
+    Ok(data)
 }

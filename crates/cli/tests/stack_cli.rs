@@ -171,12 +171,10 @@ fn library_oracle() -> &'static OracleResult {
         let dir = tmp_dir("stack_cli_oracle");
         let composite_path = dir.join("oracle.tif");
         let zmap_path = dir.join("oracle-zmap.tif");
-        let options = TileSchedulerOptions {
-            tile_size: 512,
-            levels,
-            max_bytes_in_flight: 1 << 30,
-            scratch_base: tmp_path("stack_cli_oracle_scratch"),
-        };
+        let mut options =
+            TileSchedulerOptions::explicit_budget(tmp_path("stack_cli_oracle_scratch"), 1 << 30);
+        options.tile_size = 512;
+        options.levels = levels;
         let scheduler =
             TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
         let consumer = FusionConsumer::create(
@@ -321,6 +319,7 @@ fn out_of_range_parameter_is_rejected() {
         "laplacian",
         "--set",
         "levels=999",
+        "--no-gpu",
     ]);
     assert!(
         !out.success,
@@ -357,6 +356,7 @@ fn refuses_levels_the_tile_geometry_cannot_plan() {
         "levels=7",
         "--no-align",
         "--no-crop",
+        "--no-gpu",
     ]);
     assert!(
         !out.success,
@@ -483,6 +483,9 @@ fn report_contains_every_field() {
         "margin=",
         "tiles=",
         "in_flight_limit=",
+        "max_bytes_in_flight=",
+        "budget=",
+        "backed_off=",
         "wrote:",
         "wall:",
     ] {
@@ -556,6 +559,9 @@ fn report_json_has_every_field() {
         "frame_tiles_read",
         "in_flight_limit",
         "peak_in_flight",
+        "max_bytes_in_flight",
+        "budget_provenance",
+        "backed_off",
         "outputs",
         "wall_seconds",
     ] {
@@ -568,6 +574,91 @@ fn report_json_has_every_field() {
             assert!(p.get(key).is_some(), "missing key {key:?} in param {p}");
         }
     }
+}
+
+#[test]
+fn max_host_memory_lowers_never_raises_and_does_not_move_pixels() {
+    let dir = tmp_dir("max_host_memory_ceiling");
+    let baseline_out = dir.join("baseline.tif");
+    let capped_out = dir.join("capped.tif");
+    let uncapped_out = dir.join("uncapped.tif");
+
+    let common_args = |output: &Path| {
+        vec![
+            "stack".to_string(),
+            mantis_512_dir().to_str().unwrap().to_string(),
+            "-o".to_string(),
+            output.to_str().unwrap().to_string(),
+            "--algo".to_string(),
+            "dummy-stack".to_string(),
+            "--json".to_string(),
+            "--no-align".to_string(),
+            "--no-crop".to_string(),
+        ]
+    };
+
+    let baseline_args = common_args(&baseline_out);
+    let baseline_args: Vec<&str> = baseline_args.iter().map(String::as_str).collect();
+    let baseline = run_cli(&baseline_args);
+    assert!(baseline.success, "stderr: {}", baseline.stderr);
+
+    let mut capped_args = common_args(&capped_out);
+    capped_args.push("--max-host-memory".to_string());
+    capped_args.push("4MiB".to_string());
+    let capped_args: Vec<&str> = capped_args.iter().map(String::as_str).collect();
+    let capped = run_cli(&capped_args);
+    assert!(capped.success, "stderr: {}", capped.stderr);
+    let capped_report: serde_json::Value =
+        serde_json::from_str(&capped.stdout).expect("--json must parse");
+    assert_eq!(capped_report["max_bytes_in_flight"], 4_194_304);
+    assert_eq!(capped_report["budget_provenance"], "Explicit");
+
+    let mut uncapped_args = common_args(&uncapped_out);
+    uncapped_args.push("--max-host-memory".to_string());
+    uncapped_args.push("1TiB".to_string());
+    let uncapped_args: Vec<&str> = uncapped_args.iter().map(String::as_str).collect();
+    let uncapped = run_cli(&uncapped_args);
+    assert!(uncapped.success, "stderr: {}", uncapped.stderr);
+    let uncapped_report: serde_json::Value =
+        serde_json::from_str(&uncapped.stdout).expect("--json must parse");
+    // Not a byte-for-byte comparison against a separate unflagged run's own
+    // reported number: each `stack` invocation is a separate process reading
+    // live host memory through its
+    // own fresh `OnceLock` (`crate::host::snapshot`), and this whole test
+    // suite runs with other memory-heavy `stack_cli` tests concurrently
+    // (cargo's own default), so "available" genuinely moves by hundreds of
+    // MB between two process launches a few seconds apart -- comparing
+    // `max_bytes_in_flight` across two separate invocations was observed
+    // flaky. What actually proves "a ceiling above the adaptive result
+    // changes nothing" without depending on two processes agreeing on a
+    // live-probed number: this run's own provenance did not fall to
+    // `Explicit` (which is what `HostBudget::capped_to` reports only when
+    // the ceiling actually bit), and its own budget is nowhere near the 1
+    // TiB ceiling -- no real host has that much RAM, so a value that close
+    // would itself mean the ceiling degenerated the budget.
+    assert_ne!(
+        uncapped_report["budget_provenance"], "Explicit",
+        "a ceiling above the adaptive result must not turn the budget explicit"
+    );
+    let uncapped_bytes_in_flight = uncapped_report["max_bytes_in_flight"]
+        .as_u64()
+        .expect("max_bytes_in_flight must be a number");
+    assert!(
+        uncapped_bytes_in_flight < (1u64 << 40),
+        "a 1TiB ceiling must not itself become the reported budget: {uncapped_bytes_in_flight}"
+    );
+
+    let baseline_bytes = std::fs::read(&baseline_out).expect("baseline output must exist");
+    let capped_bytes = std::fs::read(&capped_out).expect("capped output must exist");
+    let uncapped_bytes = std::fs::read(&uncapped_out).expect("uncapped output must exist");
+    assert_eq!(
+        baseline_bytes, capped_bytes,
+        "lowering the budget must not move a single pixel"
+    );
+    assert_eq!(
+        baseline_bytes, uncapped_bytes,
+        "a ceiling above the adaptive result must not move a single pixel"
+    );
 }
 
 #[test]

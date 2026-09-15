@@ -51,9 +51,9 @@ cargo build --release
 ```
 
 Produces `target/release/focusforge-cli`, the only binary in the workspace
-right now. Add `--features gpu` to also compile the GPU-accelerated fusion
-path; without it, `stack` always runs on the CPU and `--no-gpu` does not
-exist as a flag.
+right now, with the GPU-accelerated fusion path compiled in by default. Pass
+`--no-default-features` to exclude it; without it, `stack` always runs on the
+CPU and `--no-gpu` does not exist as a flag.
 
 ### Inspect a stack
 

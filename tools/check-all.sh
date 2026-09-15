@@ -14,47 +14,12 @@
 #                0 prints none).
 #   --log-dir D  write logs to D instead of .logs/gate/run-<stamp>/.
 #
-# Output contract: stdout stays SMALL and BOUNDED -- two lines per gate plus
-# the tail of whatever failed -- so that a script or a terminal pane reading
-# this through a fixed character budget always sees the summary instead of
-# losing it to a passing suite's chatter. Nothing is discarded, only
-# relocated: every gate's complete stdout+stderr lands in its own file under
-# the run's log directory, whose path the summary prints. Do not "helpfully"
-# restore streaming as the default.
-#
-# The mechanism lives in tools/lib/run-logged.sh; this script only maps its
-# flags onto it and keeps its own log root, so that a gate run someone is
-# still reading is not evicted by an unrelated tool's logs.
-#
-# Two tracks. `fixture e2e` runs the built CLI over the checked-in fixtures and
-# nothing else depends on its result, so it is started in the background and
-# joined at the end while the shorter gates run beside it. Note what it is and
-# is not: it invokes the ALREADY-BUILT binary under target/debug/. That is the
-# reason it can run concurrently at all -- cargo takes an exclusive lock on
-# target/, so a second cargo command in the background would simply block on
-# the first and buy nothing. A background gate here must stay a non-cargo
-# command, and it must be started after `build`, which is what produces the
-# binary it runs.
-#
-# Every cargo command and the fixture-e2e binary run below goes through
-# tools/with-lock.sh build -- cargo's own target/ lock only serializes cargo
-# against cargo, not cargo against a DIFFERENT checkout reading the
-# same shared target/debug/<bin> while this one relinks it. See
-# tools/lib/lock.sh. This does cost this script some of the intra-session
-# overlap the comment above describes (fixture-e2e now queues behind clippy
-# instead of running beside it) -- accepted, because the lock is only useful
-# if it is not gamed back open the moment it is inconvenient.
-#
-# `clippy` is not in --static even though it never mutates the source: it
-# compiles the whole workspace. The static set has to stay fast enough that
-# nobody is tempted to skip the pre-commit hook, which means no gate in it may
-# need target/ or a dependency graph. rustfmt reads files, check-licenses
-# reads Cargo.lock, check-fixtures reads hashes -- clippy would be the one
-# that costs minutes.
-#
-# Never set RUSTFLAGS here. A gate that compiles with different flags than a
-# developer's own `cargo build` gets its own copy of target/ and rebuilds the
-# world on every switch between the two.
+# Output contract: gate output goes to per-gate logs; stdout stays two
+# lines per gate. `fixture e2e` runs the built binary in the background,
+# cargo-free, after `build`. `build (no default features)` runs first so
+# `build`'s GPU-enabled binary is written last, the one later stages use.
+# Cargo and direct binary runs go through tools/with-lock.sh build; clippy
+# stays out of --static because it compiles; RUSTFLAGS is never set here.
 #
 # Exit code: 0 all gates passed, 1 at least one failed.
 set -uo pipefail  # deliberately not -e: every gate runs, then the summary
@@ -112,8 +77,16 @@ run_gate "fixture manifest" tools/check-fixtures.sh
 run_gate "fixture manifest selftest" tools/check-fixtures-selftest.sh
 
 if [ "$STATIC_ONLY" -eq 0 ]; then
-  # Must come first: it produces the binary the background stage runs, and it
-  # holds the target/ lock the cargo gates below queue on anyway.
+  # Build-only: proves the no-GPU path still compiles, test targets included.
+  # Must run BEFORE `build` -- see the two-track header comment above for why
+  # the order is load-bearing.
+  run_gate "build (no default features)" \
+                             tools/with-lock.sh build -- \
+                             cargo build --workspace --all-targets --no-default-features
+
+  # Must come first among the GPU-enabled stages: it produces the binary the
+  # background stage runs, and it holds the target/ lock the cargo gates below
+  # queue on anyway.
   run_gate "build"          tools/with-lock.sh build -- cargo build --workspace --all-targets
 
   # The long background stage, started now and joined at the end. Not a

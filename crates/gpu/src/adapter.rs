@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The `Result<Adapter, RequestAdapterError> -> path` mapping, deliberately
-//! `wgpu`-free so it stays testable in the default, GPU-free gate even
-//! though `wgpu` is an optional dependency of this crate
-//! (`crates/gpu/Cargo.toml`). Only [`std::fmt::Display`] is ever used on the
-//! error, which is what keeps this module free of any `wgpu` type; `mod
-//! device` instantiates [`classify_adapter`] at `A = wgpu::Adapter`,
-//! `E = wgpu::RequestAdapterError` once the `gpu` feature is on.
+//! Maps a `request_adapter` result to a path choice. Generic over the
+//! adapter and error types (only `Display` is read), so it compiles and is
+//! tested without the `gpu` feature.
 
 use std::fmt;
 
@@ -63,7 +59,10 @@ pub fn choose_path<A: fmt::Display, E: fmt::Display>(
             (PathChoice::Gpu, Ok(value), message)
         }
         AdapterPath::Absent { reason } => {
-            let message = format!("no usable GPU adapter -- {reason}; continuing on the CPU path");
+            // Reason-led, because `GpuError::VramExhausted` (an adapter that
+            // cannot serve the minimum budget) lands here too. The message
+            // always contains the reason and "CPU path".
+            let message = format!("{reason}; continuing on the CPU path");
             (PathChoice::CpuFallback, Err(reason), message)
         }
     }
@@ -139,6 +138,28 @@ mod tests {
         assert!(
             message.contains("42"),
             "message must name the adapter: {message}"
+        );
+    }
+
+    /// `GpuError::VramExhausted`'s message as a `FakeError`: the VRAM-floor
+    /// refusal falls back to the CPU like a missing adapter.
+    #[test]
+    fn choose_path_on_a_vram_exhausted_shaped_err_falls_back_to_cpu_naming_the_reason() {
+        let result: Result<u32, FakeError> = Err(FakeError(
+            "device cannot serve even the minimum VRAM budget of 268435456 bytes: refused",
+        ));
+
+        let (path, value, message) = choose_path(false, result);
+
+        assert_eq!(path, PathChoice::CpuFallback);
+        assert!(value.is_err());
+        assert!(
+            message.contains("minimum VRAM budget"),
+            "message must name the reason: {message}"
+        );
+        assert!(
+            message.to_lowercase().contains("cpu path"),
+            "message must name the CPU fallback: {message}"
         );
     }
 
