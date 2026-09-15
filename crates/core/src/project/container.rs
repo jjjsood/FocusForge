@@ -26,8 +26,10 @@ use zip::write::{SimpleFileOptions, ZipWriter};
 use super::error::ProjectError;
 
 /// `<path>.partial`: the suffix appended to the file name, in `path`'s own
-/// directory.
-pub(crate) fn partial_path(path: &Path) -> PathBuf {
+/// directory. Shared with `crates/cli`, whose `export` writes the same
+/// `.partial`-then-rename discipline for the image files it produces from a
+/// project.
+pub fn partial_path(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
         .map(|n| n.to_os_string())

@@ -64,7 +64,7 @@ use std::path::{Path, PathBuf};
 
 pub use blob::{Plane, StagedBlob, hash_file, short_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, Op, Point};
-pub use container::ProjectWriter;
+pub use container::{ProjectWriter, partial_path};
 pub use error::ProjectError;
 pub use manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,

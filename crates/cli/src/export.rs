@@ -19,12 +19,12 @@
 //!   the image. `core` returns them as data; printing them is this
 //!   module's.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use focusforge_core::io::{TiffSpec, TiffWriter};
-use focusforge_core::project::{Plane, PlaneRef, Project, ProjectError};
+use focusforge_core::project::{Plane, PlaneRef, Project, ProjectError, partial_path};
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use serde::Serialize;
 
@@ -128,19 +128,6 @@ pub fn run(
         println!("{}", render(&report));
     }
     ExitCode::SUCCESS
-}
-
-/// `<path>.partial`, in `path`'s own directory, so the rename is
-/// same-filesystem -- the discipline `stack` established and the reason a
-/// hash mismatch discovered at the *end* of a blob still leaves nothing at
-/// the named path.
-fn partial_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    name.push(".partial");
-    path.with_file_name(name)
 }
 
 fn write_composite(project: &mut Project, plane: &PlaneRef, path: &Path) -> Result<(), String> {
@@ -300,13 +287,5 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
-    }
-
-    #[test]
-    fn partial_path_appends_the_suffix_to_the_file_name() {
-        assert_eq!(
-            partial_path(Path::new("/tmp/out.tif")),
-            Path::new("/tmp/out.tif.partial")
-        );
     }
 }
