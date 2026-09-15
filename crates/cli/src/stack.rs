@@ -20,7 +20,7 @@ use focusforge_core::fuse::{
     BackendFusionConsumer, FusionConsumer, FusionGeometry,
     description::format_composite_description, laplacian::Laplacian,
 };
-use focusforge_core::io::{Rect, TiffStack, frame_paths};
+use focusforge_core::io::{Group, Proposal, Rect, TiffStack, propose};
 use focusforge_core::job::{
     AlignIdentity, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobOutcome, JobRecord,
     RecordingConsumer, Resumable, ResumeStore, StackFingerprint,
@@ -31,6 +31,7 @@ use focusforge_core::tile::{NoopPreprocess, TileConsumer, TileScheduler, TileSch
 use serde::Serialize;
 
 use crate::align::{AlignOptions, AlignmentEntry, resolve_align_algo};
+use crate::groups::{self, GroupArgs};
 use crate::job::{self, JobOptions};
 use crate::preset::{self, PresetOptions};
 use crate::progress::{ProgressMode, ProgressRenderer};
@@ -158,15 +159,25 @@ pub fn run(
     align_opts: &AlignOptions<'_>,
     job_opts: &JobOptions,
     preset_opts: &PresetOptions<'_>,
+    group_args: &GroupArgs,
     argv: &[String],
     no_gpu: bool,
 ) -> ExitCode {
-    let start = Instant::now();
-    let mut renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.quiet));
-    let status = StatusSink::new(preset_opts.status, dir.display().to_string(), "stack");
+    // Every refusal in this outer driver is group-independent, so it fires
+    // exactly once, before the first group runs, and writes exactly one
+    // status record -- a `StatusSink` built for that one refusal, which its
+    // own `Drop` assertion is then satisfied by.
+    let refuse = |message: String| -> ExitCode {
+        StatusSink::new(preset_opts.status, dir.display().to_string(), "stack").fail(message)
+    };
+
+    // `signals::install` registers its SIGINT/SIGUSR1 handlers **per call**
+    // and its two-stage Ctrl-C mechanism depends on that registration
+    // order, so it is installed once here and passed down: a per-group call
+    // would stack N handler pairs and break the second-Ctrl-C kill.
     let signals = match signals::install(true) {
         Ok(signals) => signals,
-        Err(msg) => return status.fail(msg),
+        Err(msg) => return refuse(msg),
     };
 
     // Step 1a: the preset, ahead of everything else -- a malformed file is
@@ -174,10 +185,10 @@ pub fn run(
     // falls back to.
     let file = match preset::load(preset_opts.preset) {
         Ok(preset) => preset,
-        Err(msg) => return status.fail(msg),
+        Err(msg) => return refuse(msg),
     };
     if preset_opts.dry_run && job_opts.resume {
-        return status.fail("--dry-run and --resume are incompatible: a dry run writes nothing, so there is nothing to resume into");
+        return refuse("--dry-run and --resume are incompatible: a dry run writes nothing, so there is nothing to resume into".to_string());
     }
 
     // Step 2: resolve the algorithm first, before anything else -- an
@@ -193,17 +204,16 @@ pub fn run(
                 .iter()
                 .map(|a| a.id())
                 .collect();
-            return status.fail(format!(
+            return refuse(format!(
                 "--algo is required (or an `algo` key in the preset); known algorithms: {}",
                 ids.join(", ")
             ));
         }
         Some(id) => match registry::find_stack(id) {
             Ok(algo) => algo,
-            Err(err) => return status.fail(err),
+            Err(err) => return refuse(err.to_string()),
         },
     };
-    status.set_algorithm(algo.id());
 
     // `Laplacian` (`crates/core/src/gpu.rs`'s own doc comment: "the WGSL
     // twin of ... `Laplacian::fuse`"). Every other registered algorithm
@@ -228,7 +238,7 @@ pub fn run(
     {
         Ok(values) => values,
         Err(violations) => {
-            return status.fail(
+            return refuse(
                 violations
                     .iter()
                     .map(ToString::to_string)
@@ -247,17 +257,371 @@ pub fn run(
     // `FusionConsumer::create`'s own failure, so the `.partial` cleanup is
     // exercised by a real failure rather than a second copy of this check.
     if let Err(msg) = check_output_parent(output) {
-        return status.fail(msg);
+        return refuse(msg);
     }
 
-    // Step 5: frame discovery and the strict uniformity guard.
-    let paths = match frame_paths(dir) {
-        Ok(paths) => paths,
-        Err(err) => return status.fail(err),
+    // Step 3b: the grouping, before any work starts. `propose` reads
+    // directory entries and header tags only -- no tile, no pixel -- and
+    // `--groups` replaces its verdict wholesale.
+    let walked = match propose(dir) {
+        Ok(proposal) => proposal,
+        Err(err) => return refuse(err.to_string()),
     };
+    let proposal = match group_args.groups.as_deref() {
+        None => walked,
+        Some(path) => match groups::load(path, dir, &walked) {
+            Ok(proposal) => proposal,
+            Err(msg) => return refuse(msg),
+        },
+    };
+
+    // Printed **even under `--quiet`**: `--quiet` governs progress, not
+    // decisions, and no flag suppresses the proposal. Hence a direct
+    // `eprintln!` rather than `ProgressRenderer`,
+    // whose `Quiet` mode is a no-op by construction.
+    eprintln!(
+        "{}",
+        groups::render_proposal(&proposal, group_args.groups.as_deref())
+    );
+    if let Some(path) = group_args.write_groups.as_deref()
+        && let Err(msg) = groups::write(&proposal, path)
+    {
+        return refuse(msg);
+    }
+
+    let multi = proposal.groups.len() > 1;
+    if multi && let Err(msg) = check_multi_group_output(output, zmap, &proposal) {
+        return refuse(msg);
+    }
+
+    let setup = RunSetup {
+        algo,
+        backend,
+        explicit,
+        file,
+        align_opts,
+        job_opts,
+        preset_opts,
+        argv,
+        signals: &signals,
+        input: dir,
+    };
+
+    let mut results: Vec<GroupResult> = Vec::new();
+    let mut manifest = Vec::new();
+    let mut failed = false;
+    let mut cancelled = false;
+    for group in &proposal.groups {
+        let (group_output, group_zmap) = if multi {
+            (group_output_path(output, group), None)
+        } else {
+            (output.to_path_buf(), zmap)
+        };
+        // A single-group run keeps today's identity -- the input directory
+        // as the user wrote it -- byte for byte; only a genuinely grouped
+        // run keys its records by group name, which is what gives
+        // "one record per stack" more than one member.
+        let identity = if multi {
+            group.name.clone()
+        } else {
+            dir.display().to_string()
+        };
+        let result = run_group(&setup, group, &group_output, group_zmap, identity);
+        manifest.push(manifest_entry(group, &result));
+        match &result {
+            GroupResult::Failed { .. } => failed = true,
+            // A SIGINT stops the whole run, not one group.
+            GroupResult::Cancelled { .. } => cancelled = true,
+            _ => {}
+        }
+        results.push(result);
+        if cancelled {
+            break;
+        }
+    }
+
+    if multi && let Err(msg) = write_manifest(output, dir, manifest) {
+        eprintln!("warning: {msg}");
+    }
+
+    report_results(&results, json);
+
+    if cancelled {
+        return ExitCode::from(130);
+    }
+    if failed {
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// Everything one group's run needs that cannot differ between groups:
+/// resolved once by [`run`], borrowed by every [`run_group`] call.
+struct RunSetup<'a> {
+    algo: &'static dyn StackAlgorithm,
+    backend: Option<&'static dyn focusforge_core::gpu::TileBackend>,
+    explicit: ParamValues,
+    file: preset::Preset,
+    align_opts: &'a AlignOptions<'a>,
+    job_opts: &'a JobOptions,
+    preset_opts: &'a PresetOptions<'a>,
+    argv: &'a [String],
+    signals: &'a signals::Signals,
+    /// The directory the run was pointed at, as the user wrote it: what
+    /// `StackReport::input` reports, for every group.
+    input: &'a Path,
+}
+
+/// What one group's run ended as. The outer driver owns every print of a
+/// document, so a single-group run emits exactly today's `StackReport` and
+/// a multi-group run emits one wrapping document instead of N concatenated
+/// ones.
+enum GroupResult {
+    Completed(Box<StackReport>),
+    DryRun(Box<DryRunPlan>),
+    /// Already reported on stderr and recorded by the group's own status
+    /// sink; carried so the manifest has an outcome to list.
+    Failed {
+        error: String,
+        wall_seconds: f64,
+    },
+    Cancelled {
+        wall_seconds: f64,
+    },
+}
+
+/// Records the refusal on this group's status sink, prints it exactly as
+/// [`crate::fail`] does, and hands the outer driver an outcome to list.
+fn failed(status: &StatusSink, start: Instant, message: impl std::fmt::Display) -> GroupResult {
+    let message = message.to_string();
+    let _ = status.fail(message.clone());
+    GroupResult::Failed {
+        error: message,
+        wall_seconds: start.elapsed().as_secs_f64(),
+    }
+}
+
+fn cancelled(status: &StatusSink, start: Instant) -> GroupResult {
+    status.cancelled();
+    GroupResult::Cancelled {
+        wall_seconds: start.elapsed().as_secs_f64(),
+    }
+}
+
+/// One group's output path inside the `-o` directory of a multi-group run:
+/// the group's own name, which the naming rule already made unique across
+/// the proposal.
+fn group_output_path(out_dir: &Path, group: &Group) -> PathBuf {
+    out_dir.join(format!("{}.tif", group.name))
+}
+
+/// 2026-09-15)`): more than one group means `-o` must name an **existing
+/// directory**, and `--zmap` -- one path for N Z-Maps -- is refused loudly
+/// rather than silently dropped. Both refusals name the groups, so the user
+/// sees what forced the change.
+fn check_multi_group_output(
+    output: &Path,
+    zmap: Option<&Path>,
+    proposal: &Proposal,
+) -> Result<(), String> {
+    let named: Vec<&str> = proposal.groups.iter().map(|g| g.name.as_str()).collect();
+    if !output.is_dir() {
+        return Err(format!(
+            "{} groups were proposed ({}), so -o must name an existing directory to write one \
+             composite per group into -- {} is not one. Point -o at a directory, or use \
+             --groups to say which frames form the single stack you meant.",
+            named.len(),
+            named.join(", "),
+            output.display()
+        ));
+    }
+    if let Some(zmap) = zmap {
+        return Err(format!(
+            "--zmap {} names one file, but {} groups were proposed ({}) -- one path cannot hold \
+             {} Z-Maps. Run one group at a time with --groups, or drop --zmap.",
+            zmap.display(),
+            named.len(),
+            named.join(", "),
+            named.len()
+        ));
+    }
+    // The naming rule makes this unreachable; it is asserted rather than
+    // trusted, because a collision would silently overwrite one group's
+    // composite with another's.
+    let mut paths: Vec<PathBuf> = proposal
+        .groups
+        .iter()
+        .map(|g| group_output_path(output, g))
+        .collect();
+    paths.sort();
+    let unique = {
+        let mut copy = paths.clone();
+        copy.dedup();
+        copy.len()
+    };
+    if unique != paths.len() {
+        return Err(format!(
+            "two groups resolve to the same output path under {} -- refusing rather than \
+             overwriting one group's composite with another's",
+            output.display()
+        ));
+    }
+    Ok(())
+}
+
+fn manifest_entry(group: &Group, result: &GroupResult) -> groups::ManifestEntry {
+    let (outcome, outputs, wall_seconds, error) = match result {
+        GroupResult::Completed(report) => (
+            "completed",
+            report.outputs.clone(),
+            report.wall_seconds,
+            None,
+        ),
+        GroupResult::DryRun(plan) => ("dry-run", plan.would_write.clone(), 0.0, None),
+        GroupResult::Failed {
+            error,
+            wall_seconds,
+        } => ("failed", Vec::new(), *wall_seconds, Some(error.clone())),
+        GroupResult::Cancelled { wall_seconds } => ("cancelled", Vec::new(), *wall_seconds, None),
+    };
+    groups::ManifestEntry {
+        name: group.name.clone(),
+        frame_count: group.frames.len(),
+        outcome: outcome.to_string(),
+        outputs,
+        wall_seconds,
+        error,
+    }
+}
+
+/// The run-level manifest, into the `-o` directory of a multi-group run.
+/// A write failure warns rather than failing the run, for the reason
+/// `StatusSink::emit` gives: an artifact that could not be written must not
+/// turn completed stacks into failed ones.
+fn write_manifest(
+    out_dir: &Path,
+    root: &Path,
+    entries: Vec<groups::ManifestEntry>,
+) -> Result<(), String> {
+    let manifest = groups::RunManifest {
+        format: groups::MANIFEST_FORMAT,
+        root: root.display().to_string(),
+        groups: entries,
+    };
+    let path = out_dir.join("manifest.json");
+    let text = serde_json::to_string_pretty(&manifest)
+        .map_err(|err| format!("{}: serializing the manifest: {err}", path.display()))?;
+    std::fs::write(&path, text).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+/// Prints whatever the run produced: for **one** group exactly today's
+/// document, for many a single wrapping one. `stack --json`'s standing
+/// contract is that *a* document on stdout means a completed run, so N
+/// concatenated documents is not an option, and hollowing out the frozen
+/// `StackReport` is not either (`DryRunPlan` is the precedent).
+fn report_results(results: &[GroupResult], json: bool) {
+    if results.len() == 1 {
+        match &results[0] {
+            GroupResult::Completed(report) => print_document(report.as_ref(), json, render),
+            GroupResult::DryRun(plan) => print_document(plan.as_ref(), json, render_plan),
+            GroupResult::Failed { .. } | GroupResult::Cancelled { .. } => {}
+        }
+        return;
+    }
+    if json {
+        let documents: Vec<serde_json::Value> = results
+            .iter()
+            .filter_map(|result| match result {
+                GroupResult::Completed(report) => serde_json::to_value(report.as_ref()).ok(),
+                GroupResult::DryRun(plan) => serde_json::to_value(plan.as_ref()).ok(),
+                _ => None,
+            })
+            .collect();
+        let wrapped = serde_json::json!({ "format": 1, "groups": documents });
+        match serde_json::to_string_pretty(&wrapped) {
+            Ok(text) => println!("{text}"),
+            Err(err) => eprintln!("error: failed to serialize JSON: {err}"),
+        }
+        return;
+    }
+    let mut first = true;
+    for result in results {
+        let text = match result {
+            GroupResult::Completed(report) => render(report),
+            GroupResult::DryRun(plan) => render_plan(plan),
+            _ => continue,
+        };
+        if !first {
+            println!();
+        }
+        first = false;
+        println!("{text}");
+    }
+}
+
+fn print_document<T: Serialize>(value: &T, json: bool, human: fn(&T) -> String) {
+    if json {
+        match serde_json::to_string_pretty(value) {
+            Ok(text) => println!("{text}"),
+            Err(err) => eprintln!("error: failed to serialize JSON: {err}"),
+        }
+    } else {
+        println!("{}", human(value));
+    }
+}
+
+/// One group's stack, from the checks before the run to the composite. The
+/// frames arrive as a slice instead of being enumerated here.
+///
+/// Everything downstream already took a path slice
+/// (`TiffStack::open_files`), so a one-group proposal hands this function
+/// precisely `frame_paths(dir)`'s own vector, in its own order, which is
+/// what makes the single-stack equivalence true by construction rather than
+/// by a special case.
+///
+/// The per-group state lives here on purpose: one `StatusSink` (whose `Drop`
+/// assertion is per instance, so one record per group), one
+/// `ProgressRenderer`, and one `Instant` -- so `wall_seconds` stays per
+/// stack rather than per run.
+fn run_group(
+    setup: &RunSetup<'_>,
+    group: &Group,
+    output: &Path,
+    zmap: Option<&Path>,
+    identity: String,
+) -> GroupResult {
+    let RunSetup {
+        algo,
+        backend,
+        explicit,
+        file,
+        align_opts,
+        job_opts,
+        preset_opts,
+        argv,
+        signals,
+        input: dir,
+    } = setup;
+    let (algo, backend, explicit, file) = (*algo, *backend, explicit.clone(), file);
+    let (align_opts, job_opts, preset_opts, argv, signals) =
+        (*align_opts, *job_opts, *preset_opts, *argv, *signals);
+    let dir: &Path = dir;
+
+    let start = Instant::now();
+    let mut renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.quiet));
+    let status = StatusSink::new(preset_opts.status, identity, "stack");
+    status.set_algorithm(algo.id());
+
+    // Step 4 (`--output`'s parent) is the outer driver's now: it is
+    // group-independent, and it must fire before the input directory is
+    // read at all, which grouping does.
+    //
+    // Step 5: this group's frames, already enumerated by the proposal, and
+    // the strict uniformity guard.
+    let paths = group.frames.clone();
     let stack = match TiffStack::open_files(&paths) {
         Ok(stack) => stack,
-        Err(err) => return status.fail(err),
+        Err(err) => return failed(&status, start, err),
     };
     let frame_names: Vec<String> = paths
         .iter()
@@ -274,23 +638,35 @@ pub fn run(
         .collect();
     let (uniform, detail) = crate::uniform_check(&header_refs);
     if !uniform {
-        return status.fail(detail.unwrap_or_else(|| "non-uniform frame set".to_string()));
+        return failed(
+            &status,
+            start,
+            detail.unwrap_or_else(|| "non-uniform frame set".to_string()),
+        );
     }
 
     // Step 6: refuse an output that is also an input frame.
     if let Some(name) = colliding_frame(output, &paths, &frame_names) {
-        return status.fail(format!(
-            "output path {} is also an input frame ({name})",
-            output.display()
-        ));
+        return failed(
+            &status,
+            start,
+            format!(
+                "output path {} is also an input frame ({name})",
+                output.display()
+            ),
+        );
     }
     if let Some(zmap) = zmap
         && let Some(name) = colliding_frame(zmap, &paths, &frame_names)
     {
-        return status.fail(format!(
-            "--zmap path {} is also an input frame ({name})",
-            zmap.display()
-        ));
+        return failed(
+            &status,
+            start,
+            format!(
+                "--zmap path {} is also an input frame ({name})",
+                zmap.display()
+            ),
+        );
     }
 
     // Step 7: resolve parameters.
@@ -299,7 +675,7 @@ pub fn run(
     let stack_ctx = StackContext::new(stack.len(), width, height, spp);
     let resolved = match params::resolve(algo.params(), &explicit, &stack_ctx) {
         Ok(resolved) => resolved,
-        Err(err) => return status.fail(err),
+        Err(err) => return failed(&status, start, err),
     };
     let values = params::resolved_values(&resolved);
 
@@ -359,14 +735,16 @@ pub fn run(
     let align_prepared = if align_opts.align {
         let align_algo = match resolve_align_algo(align_opts.algo.or(file.align_algo.as_deref())) {
             Ok(a) => a,
-            Err(msg) => return status.fail(msg),
+            Err(msg) => return failed(&status, start, msg),
         };
         let align_explicit = match parse_settings(align_algo.params(), align_opts.set)
             .and_then(|cli| merge_preset(align_algo.params(), &file.align, cli))
         {
             Ok(v) => v,
             Err(violations) => {
-                return status.fail(
+                return failed(
+                    &status,
+                    start,
                     violations
                         .iter()
                         .map(ToString::to_string)
@@ -378,7 +756,7 @@ pub fn run(
         let align_resolved = match params::resolve(align_algo.params(), &align_explicit, &stack_ctx)
         {
             Ok(r) => r,
-            Err(err) => return status.fail(err),
+            Err(err) => return failed(&status, start, err),
         };
         let align_values = params::resolved_values(&align_resolved);
         let align_params: Vec<ParamReport> = align_resolved
@@ -411,7 +789,7 @@ pub fn run(
                 .unwrap_or_default(),
         };
         if let Err(msg) = preset::write(&written, path) {
-            return status.fail(msg);
+            return failed(&status, start, msg);
         }
     }
 
@@ -424,7 +802,7 @@ pub fn run(
     if preset_opts.dry_run {
         let scheduler = match TileScheduler::new(&stack, stack_ctx, spp, &options) {
             Ok(scheduler) => scheduler,
-            Err(err) => return status.fail(err),
+            Err(err) => return failed(&status, start, err),
         };
         let geometry = scheduler.plan();
         let mut would_write = vec![output.display().to_string()];
@@ -478,15 +856,7 @@ pub fn run(
             ],
         };
         status.dry_run(&plan.would_write);
-        if json {
-            match serde_json::to_string_pretty(&plan) {
-                Ok(text) => println!("{text}"),
-                Err(err) => return status.fail(format!("failed to serialize JSON: {err}")),
-            }
-        } else {
-            println!("{}", render_plan(&plan));
-        }
-        return ExitCode::SUCCESS;
+        return GroupResult::DryRun(Box::new(plan));
     }
 
     if let Some((align_algo, _, align_values, align_params)) = align_prepared {
@@ -547,23 +917,26 @@ pub fn run(
                 result
             });
             if signals.cancel.load(Ordering::SeqCst) {
-                status.cancelled();
-                return ExitCode::from(130);
+                return cancelled(&status, start);
             }
             let result = match solved {
                 Ok(r) => r,
-                Err(err) => return status.fail(err),
+                Err(err) => return failed(&status, start, err),
             };
             if !align_opts.lax && result.failure_count() > 0 {
                 let names: Vec<String> = result
                     .failed()
                     .map(|f| format!("{} ({:?})", frame_names[f.frame], f.status))
                     .collect();
-                return status.fail(format!(
-                    "alignment failed for {} frame(s): {}",
-                    names.len(),
-                    names.join(", ")
-                ));
+                return failed(
+                    &status,
+                    start,
+                    format!(
+                        "alignment failed for {} frame(s): {}",
+                        names.len(),
+                        names.join(", ")
+                    ),
+                );
             }
             alignment_result = Some((align_algo, result, align_values, align_params));
         }
@@ -584,10 +957,10 @@ pub fn run(
     };
     let crop_rect_value = match auto_crop(&alignment_for_crop, (width, height)) {
         Ok(c) => c,
-        Err(err) => return status.fail(err),
+        Err(err) => return failed(&status, start, err),
     };
     if align_opts.crop && crop_rect_value.is_none() {
-        return status.fail(crate::align::empty_crop_refusal());
+        return failed(&status, start, crate::align::empty_crop_refusal());
     }
     let applied_crop = if align_opts.crop {
         crop_rect_value
@@ -637,7 +1010,7 @@ pub fn run(
     };
     let scheduler = match TileScheduler::new(reader, stack_ctx, spp, &options) {
         Ok(scheduler) => scheduler,
-        Err(err) => return status.fail(err),
+        Err(err) => return failed(&status, start, err),
     };
 
     // Step 10: `.partial` discipline -- create both writers on partial
@@ -687,17 +1060,22 @@ pub fn run(
     };
     let resume_store = match ResumeStore::open(Path::new(".scratch")) {
         Ok(store) => store,
-        Err(err) => return status.fail(err.to_string()),
+        Err(err) => return failed(&status, start, err.to_string()),
     };
     let ledger = if job_opts.resume {
         match resume_store.find(&record) {
             Ok(Resumable::None) => {
-                return status
-                    .fail("no resumable state for this stack under .scratch/resume".to_string());
+                return failed(
+                    &status,
+                    start,
+                    "no resumable state for this stack under .scratch/resume",
+                );
             }
-            Ok(Resumable::Mismatch(mismatch)) => return status.fail(mismatch.to_string()),
+            Ok(Resumable::Mismatch(mismatch)) => {
+                return failed(&status, start, mismatch.to_string());
+            }
             Ok(Resumable::Ledger(ledger)) => ledger,
-            Err(err) => return status.fail(err.to_string()),
+            Err(err) => return failed(&status, start, err.to_string()),
         }
     } else {
         // A non-resume run may legally disagree with old state -- a
@@ -708,15 +1086,15 @@ pub fn run(
         match resume_store.find(&record) {
             Ok(Resumable::Ledger(stale)) => {
                 if let Err(err) = stale.discard() {
-                    return status.fail(err.to_string());
+                    return failed(&status, start, err.to_string());
                 }
             }
             Ok(_) => {}
-            Err(err) => return status.fail(err.to_string()),
+            Err(err) => return failed(&status, start, err.to_string()),
         }
         match resume_store.begin(&record) {
             Ok(ledger) => ledger,
-            Err(err) => return status.fail(err.to_string()),
+            Err(err) => return failed(&status, start, err.to_string()),
         }
     };
 
@@ -736,7 +1114,7 @@ pub fn run(
     {
         cleanup_partials(&composite_partial, zmap_partial.as_deref());
         let _ = ledger.discard();
-        return status.fail(err.to_string());
+        return failed(&status, start, err.to_string());
     }
 
     // The resume composition -- `FusionConsumer::resume` when the ledger
@@ -758,7 +1136,7 @@ pub fn run(
             Err(err) => {
                 cleanup_partials(&composite_partial, zmap_partial.as_deref());
                 let _ = ledger.discard();
-                return status.fail(err);
+                return failed(&status, start, err);
             }
         }
     } else {
@@ -773,7 +1151,7 @@ pub fn run(
             Err(err) => {
                 cleanup_partials(&composite_partial, zmap_partial.as_deref());
                 let _ = ledger.discard();
-                return status.fail(err);
+                return failed(&status, start, err);
             }
         }
     };
@@ -814,7 +1192,7 @@ pub fn run(
         &NoopPreprocess,
         &recording,
         &mut renderer,
-        &signals,
+        signals,
     ) {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -823,7 +1201,7 @@ pub fn run(
             // attempted here.
             cleanup_partials(&composite_partial, zmap_partial.as_deref());
             let _ = ledger.discard();
-            return status.fail(err);
+            return failed(&status, start, err);
         }
     };
 
@@ -840,8 +1218,7 @@ pub fn run(
             control.progress().unit_total,
             job::resume_recipe(argv)
         );
-        status.cancelled();
-        return ExitCode::from(130);
+        return cancelled(&status, start);
     }
     debug_assert_eq!(
         outcome,
@@ -875,31 +1252,39 @@ pub fn run(
     if let Err(err) = sink.finish() {
         cleanup_partials(&composite_partial, zmap_partial.as_deref());
         let _ = ledger.discard();
-        return status.fail(err);
+        return failed(&status, start, err);
     }
 
     if let Err(err) = std::fs::rename(&composite_partial, output) {
         cleanup_partials(&composite_partial, zmap_partial.as_deref());
         let _ = ledger.discard();
-        return status.fail(format!(
-            "renaming {} to {}: {err}",
-            composite_partial.display(),
-            output.display()
-        ));
+        return failed(
+            &status,
+            start,
+            format!(
+                "renaming {} to {}: {err}",
+                composite_partial.display(),
+                output.display()
+            ),
+        );
     }
     if let (Some(zmap_partial), Some(zmap)) = (&zmap_partial, zmap)
         && let Err(err) = std::fs::rename(zmap_partial, zmap)
     {
         let _ = std::fs::remove_file(zmap_partial);
         let _ = ledger.discard();
-        return status.fail(format!(
-            "renaming {} to {}: {err}",
-            zmap_partial.display(),
-            zmap.display()
-        ));
+        return failed(
+            &status,
+            start,
+            format!(
+                "renaming {} to {}: {err}",
+                zmap_partial.display(),
+                zmap.display()
+            ),
+        );
     }
     if let Err(err) = ledger.discard() {
-        return status.fail(err.to_string());
+        return failed(&status, start, err.to_string());
     }
     renderer.finish("stack complete");
 
@@ -961,16 +1346,7 @@ pub fn run(
         backend: backend_id,
     };
 
-    if json {
-        match serde_json::to_string_pretty(&report) {
-            Ok(text) => println!("{text}"),
-            Err(err) => return status.fail(format!("failed to serialize JSON: {err}")),
-        }
-    } else {
-        println!("{}", render(&report));
-    }
-
-    ExitCode::SUCCESS
+    GroupResult::Completed(Box::new(report))
 }
 
 /// An all-identity [`StackAlignment`] over `frame_count` frames: what

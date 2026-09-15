@@ -311,6 +311,7 @@ dependencies = [
 name = "focusforge-core"
 version = "0.1.0"
 dependencies = [
+ "focusforge-core",
  "inventory",
  "memmap2",
  "rayon",

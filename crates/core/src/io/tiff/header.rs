@@ -33,6 +33,12 @@ const TAG_STRIP_BYTE_COUNTS: u16 = 279;
 const TAG_PLANAR_CONFIG: u16 = 284;
 const TAG_TILE_WIDTH: u16 = 322;
 const TAG_SAMPLE_FORMAT: u16 = 339;
+/// EXIF sub-IFD pointer: a `LONG` offset to a second IFD.
+const TAG_EXIF_IFD: u16 = 34665;
+/// EXIF `DateTimeOriginal` -- **capture** time, the tag grouping reads.
+/// Never `DateTime` (306), which on the reference data is darktable's
+/// *export* time, thirteen days after the shot.
+const TAG_DATE_TIME_ORIGINAL: u16 = 36867;
 
 /// TIFF field type -> byte size of one value.
 fn field_type_size(field_type: u16) -> Option<u32> {
@@ -89,6 +95,58 @@ impl ByteOrder {
         }
         Some(out)
     }
+}
+
+/// One IFD entry, unresolved: its value is either the four inline payload
+/// bytes or an offset to them.
+struct RawEntry {
+    tag: u16,
+    field_type: u16,
+    count: u32,
+    payload: [u8; 4],
+}
+
+/// Read the entry table of the IFD at `offset`. Extracted so the EXIF
+/// sub-IFD behind tag 34665 is read by exactly the same code as IFD0 --
+/// a second, hand-rolled walk for the fallback is how the two drift apart.
+fn read_ifd<S: ByteSource>(
+    source: &S,
+    byte_order: ByteOrder,
+    offset: u64,
+    path: &Path,
+) -> Result<Vec<RawEntry>, TiffError> {
+    let count_bytes = source
+        .read_at(offset, 2)
+        .map_err(|_| TiffError::TruncatedIfd {
+            path: path.to_path_buf(),
+            entries: 0,
+        })?;
+    let n_entries = byte_order.u16_at(&count_bytes).unwrap_or(0);
+
+    let ifd_bytes = source
+        .read_at(offset + 2, 12 * usize::from(n_entries))
+        .map_err(|_| TiffError::TruncatedIfd {
+            path: path.to_path_buf(),
+            entries: n_entries,
+        })?;
+
+    let mut entries: Vec<RawEntry> = Vec::with_capacity(usize::from(n_entries));
+    for i in 0..usize::from(n_entries) {
+        let base = i * 12;
+        let chunk = &ifd_bytes[base..base + 12];
+        let tag = byte_order.u16_at(&chunk[0..2]).unwrap_or(0);
+        let field_type = byte_order.u16_at(&chunk[2..4]).unwrap_or(0);
+        let count = byte_order.u32_at(&chunk[4..8]).unwrap_or(0);
+        let mut payload = [0u8; 4];
+        payload.copy_from_slice(&chunk[8..12]);
+        entries.push(RawEntry {
+            tag,
+            field_type,
+            count,
+            payload,
+        });
+    }
+    Ok(entries)
 }
 
 /// A byte-addressable source a header can be parsed out of, without caring
@@ -156,6 +214,14 @@ pub struct TiffHeader {
     pub rows_per_strip: u32,
     pub sample_format: Box<[u16]>,
     pub image_description: Option<String>,
+    /// EXIF `DateTimeOriginal` (36867), verbatim ASCII, from IFD0 or --
+    /// when IFD0 lacks it -- the EXIF sub-IFD behind tag 34665. `None` when
+    /// absent or unreadable, including when the sub-IFD pointer is junk: a
+    /// frame that is otherwise a perfectly good stack member must not
+    /// become unreadable because its EXIF pointer is garbage.
+    ///
+    /// Never `DateTime` (306). See `TAG_DATE_TIME_ORIGINAL`.
+    pub date_time_original: Option<String>,
     pub file_size: u64,
     pub strip_offsets: Vec<u64>,
     pub strip_byte_counts: Vec<u64>,
@@ -244,44 +310,7 @@ impl TiffHeader {
             });
         }
 
-        let count_bytes = source
-            .read_at(ifd_offset, 2)
-            .map_err(|_| TiffError::TruncatedIfd {
-                path: path.to_path_buf(),
-                entries: 0,
-            })?;
-        let n_entries = byte_order.u16_at(&count_bytes).unwrap_or(0);
-
-        let ifd_bytes = source
-            .read_at(ifd_offset + 2, 12 * usize::from(n_entries))
-            .map_err(|_| TiffError::TruncatedIfd {
-                path: path.to_path_buf(),
-                entries: n_entries,
-            })?;
-
-        struct RawEntry {
-            tag: u16,
-            field_type: u16,
-            count: u32,
-            payload: [u8; 4],
-        }
-
-        let mut entries: Vec<RawEntry> = Vec::with_capacity(usize::from(n_entries));
-        for i in 0..usize::from(n_entries) {
-            let base = i * 12;
-            let chunk = &ifd_bytes[base..base + 12];
-            let tag = byte_order.u16_at(&chunk[0..2]).unwrap_or(0);
-            let field_type = byte_order.u16_at(&chunk[2..4]).unwrap_or(0);
-            let count = byte_order.u32_at(&chunk[4..8]).unwrap_or(0);
-            let mut payload = [0u8; 4];
-            payload.copy_from_slice(&chunk[8..12]);
-            entries.push(RawEntry {
-                tag,
-                field_type,
-                count,
-                payload,
-            });
-        }
+        let entries = read_ifd(source, byte_order, ifd_offset, path)?;
 
         // Resolve one entry's raw bytes: inline when total size <= 4 bytes,
         // otherwise seek to its offset.
@@ -377,6 +406,33 @@ impl TiffHeader {
             }
         };
 
+        // Capture time: IFD0 first -- where all 61 reference frames carry it
+        // -- then the EXIF sub-IFD behind 34665, for exporters that do not
+        // duplicate it up. Every failure below yields `None`, never `Err`:
+        // a junk sub-IFD pointer must not make an otherwise good stack
+        // member unreadable.
+        let read_ascii = |entry: &RawEntry| -> Option<String> {
+            let bytes = resolve_bytes(entry).ok()?;
+            let text = bytes.split(|&b| b == 0).next().unwrap_or(&[]);
+            Some(String::from_utf8_lossy(text).into_owned())
+        };
+        let date_time_original = match find(TAG_DATE_TIME_ORIGINAL) {
+            Some(entry) => read_ascii(entry),
+            None => find(TAG_EXIF_IFD)
+                .and_then(|entry| {
+                    byte_order
+                        .ints_at(entry.field_type, entry.count, &entry.payload)
+                        .and_then(|v| v.first().copied())
+                })
+                .and_then(|exif_offset| read_ifd(source, byte_order, exif_offset, path).ok())
+                .and_then(|exif_entries| {
+                    exif_entries
+                        .iter()
+                        .find(|e| e.tag == TAG_DATE_TIME_ORIGINAL)
+                        .and_then(&read_ascii)
+                }),
+        };
+
         // TIFF's default RowsPerStrip is 2**32-1 ("one strip holds the whole
         // image"); clamp so `row / rows_per_strip` stays meaningful.
         let mut rows_per_strip = scalar(TAG_ROWS_PER_STRIP)?.unwrap_or(u64::from(height)) as u32;
@@ -386,7 +442,7 @@ impl TiffHeader {
 
         // Refusal priority: tiled first (the strip tables may not apply at
         // all to a tiled file), then compression, planar layout, bit depth,
-        // sample format. At most one refusal is carried.
+        // sample format. At most one refusal is carried, ever.
         let refusal = if tiled {
             Some(Refusal::Tiled)
         } else if compression != 1 {
@@ -431,6 +487,7 @@ impl TiffHeader {
             rows_per_strip,
             sample_format: sample_format.into_boxed_slice(),
             image_description,
+            date_time_original,
             file_size,
             strip_offsets,
             strip_byte_counts,
@@ -534,7 +591,7 @@ mod tests {
 
     /// A structurally valid 4x4 RGB 16-bit header, one strip, `order`
     /// endianness. `BitsPerSample` is 3xSHORT (6 bytes), so it is never
-    /// inline -- the trap Strategy step 4 calls out.
+    /// inline: 6 bytes exceeds the 4-byte inline limit.
     fn valid_entries(order: ByteOrder) -> Vec<TestEntry> {
         vec![
             entry_long(TAG_IMAGE_WIDTH, order, &[4]),

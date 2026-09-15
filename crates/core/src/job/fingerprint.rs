@@ -229,6 +229,11 @@ mod tests {
             rows_per_strip: 1,
             sample_format: Box::new([1, 1, 1]),
             image_description: Some("hello".to_string()),
+            // Read by grouping, deliberately **not** by the
+            // fingerprint: adding it to `FrameFingerprint` would invalidate
+            // every resume ledger already on disk for no benefit. The
+            // assertions below are what pin that field set.
+            date_time_original: Some("2026:08:29 18:42:41".to_string()),
             file_size: 12345,
             strip_offsets: vec![10, 20, 30, 40],
             strip_byte_counts: vec![1, 2, 3, 4],

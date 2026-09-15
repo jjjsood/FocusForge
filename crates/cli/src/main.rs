@@ -18,6 +18,7 @@ mod algorithms;
 mod align;
 #[cfg(feature = "gpu")]
 mod gpu;
+mod groups;
 mod job;
 mod preset;
 mod progress;
@@ -101,6 +102,8 @@ enum Command {
         json: bool,
         #[command(flatten)]
         set: set::SetArgs,
+        #[command(flatten)]
+        group_args: groups::GroupArgs,
         /// Skip alignment: the tile reader stays the raw stack and the
         /// output geometry stays full-frame. Defaults to `true`
         /// (alignment on); `--no-align` is what turns it off (clap
@@ -240,6 +243,7 @@ fn main() -> ExitCode {
             zmap,
             json,
             set,
+            group_args,
             align,
             crop,
             lax,
@@ -286,6 +290,7 @@ fn main() -> ExitCode {
                     status: status.as_deref(),
                     dry_run,
                 },
+                &group_args,
                 &std::env::args().collect::<Vec<_>>(),
                 no_gpu,
             )

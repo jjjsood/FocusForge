@@ -109,6 +109,34 @@ fn read_line(reader: &mut impl BufRead) -> String {
     line
 }
 
+/// The first stderr line of actual **work** -- a `fuse ` progress line or
+/// an `align ` stage line.
+///
+/// `stack` prints its grouping proposal before anything runs, and no flag
+/// suppresses it (it is output, not progress), so a test that gates a signal on
+/// "the job has started" skips that block instead of reading exactly one line.
+/// Returns the empty string at EOF, so a process that died never hangs this
+/// loop.
+fn read_work_line(reader: &mut impl BufRead, prefix: &str) -> String {
+    loop {
+        let line = read_line(reader);
+        if line.is_empty() || line.starts_with(prefix) {
+            return line;
+        }
+    }
+}
+
+/// Every line of the printed grouping proposal for a one-group run: the
+/// `grouping ...` header plus its indented group lines. What a whole-stderr
+/// assertion has to allow for now.
+fn strip_grouping(stderr: &str) -> String {
+    stderr
+        .lines()
+        .filter(|l| !l.starts_with("grouping ") && !l.starts_with("  "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Copies `fixtures/mantis-512/frames/*.tif` into `<dest>/frames/`, so a
 /// test that mutates a frame's bytes (`resume_with_changed_inputs_fails`)
 /// never touches the committed fixture.
@@ -329,7 +357,10 @@ fn progress_to_a_file_has_no_escape_sequences() {
     assert!(!out.stderr.contains('\r'), "stderr: {}", out.stderr);
     assert!(!out.stderr.contains('\x1b'), "stderr: {}", out.stderr);
     let bound = 2 + (elapsed / 2.0).ceil() as usize;
-    let line_count = out.stderr.lines().count();
+    // The bound is `ProgressRenderer`'s own line-count promise, so the
+    // grouping proposal -- printed once, before any progress -- is
+    // subtracted rather than folded into it.
+    let line_count = strip_grouping(&out.stderr).lines().count();
     assert!(
         line_count <= bound,
         "line_count={line_count} bound={bound} elapsed={elapsed} stderr: {}",
@@ -356,7 +387,13 @@ fn quiet_prints_no_progress() {
         ],
     );
     assert!(out.success, "stderr: {}", out.stderr);
-    assert!(out.stderr.is_empty(), "stderr: {}", out.stderr);
+    // `--quiet` removes progress, not decisions: the grouping proposal prints
+    // regardless, so what must be empty is everything else.
+    assert!(
+        strip_grouping(&out.stderr).trim().is_empty(),
+        "stderr: {}",
+        out.stderr
+    );
     assert!(output.exists());
 }
 
@@ -386,7 +423,7 @@ mod unix_signals {
             &interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap()),
         );
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
-        let first = read_line(&mut stderr);
+        let first = read_work_line(&mut stderr, "fuse ");
         assert!(first.starts_with("fuse "), "first line: {first}");
 
         send(child.id(), "-INT");
@@ -421,7 +458,7 @@ mod unix_signals {
         args.push(status.to_str().unwrap());
         let mut child = spawn_piped(&dir, &args);
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
-        let first = read_line(&mut stderr);
+        let first = read_work_line(&mut stderr, "fuse ");
         assert!(first.starts_with("fuse "), "first line: {first}");
 
         send(child.id(), "-INT");
@@ -468,7 +505,7 @@ mod unix_signals {
         let args = interruptible_stack_args(mantis_dir.to_str().unwrap(), output.to_str().unwrap());
         let mut child = spawn_piped(&dir, &args);
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
-        let _first = read_line(&mut stderr);
+        let _first = read_work_line(&mut stderr, "fuse ");
         send(child.id(), "-INT");
         let status = child.wait().unwrap();
         assert_eq!(status.code(), Some(130));
@@ -501,7 +538,7 @@ mod unix_signals {
             &interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap()),
         );
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
-        let _first = read_line(&mut stderr);
+        let _first = read_work_line(&mut stderr, "fuse ");
 
         send(child.id(), "-INT");
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -680,7 +717,7 @@ mod unix_signals {
         let args = interruptible_stack_args(stack_dir.to_str().unwrap(), output.to_str().unwrap());
         let mut child = spawn_piped(&dir, &args);
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
-        let _first = read_line(&mut stderr);
+        let _first = read_work_line(&mut stderr, "fuse ");
         send(child.id(), "-INT");
         let status = child.wait().unwrap();
         assert_eq!(status.code(), Some(130));
@@ -736,7 +773,7 @@ mod unix_signals {
         let args = interruptible_stack_args(mantis_dir.to_str().unwrap(), output.to_str().unwrap());
         let mut child = spawn_piped(&dir, &args);
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
-        let _first = read_line(&mut stderr);
+        let _first = read_work_line(&mut stderr, "fuse ");
         send(child.id(), "-INT");
         let status = child.wait().unwrap();
         assert_eq!(status.code(), Some(130));
@@ -791,7 +828,7 @@ mod unix_signals {
         first_args.push("160");
         let mut child = spawn_piped(&dir, &first_args);
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
-        let _first = read_line(&mut stderr);
+        let _first = read_work_line(&mut stderr, "fuse ");
         send(child.id(), "-INT");
         let status = child.wait().unwrap();
         assert_eq!(status.code(), Some(130));
@@ -855,7 +892,7 @@ mod unix_signals {
             &interruptible_stack_args(mantis.to_str().unwrap(), cancel_output.to_str().unwrap()),
         );
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
-        let _first = read_line(&mut stderr);
+        let _first = read_work_line(&mut stderr, "fuse ");
         send(child.id(), "-INT");
         let status = child.wait().unwrap();
         assert_eq!(status.code(), Some(130));
@@ -1057,7 +1094,7 @@ mod unix_signals {
         ];
         let mut child = spawn_piped(&dir, &args);
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
-        let align_line = read_line(&mut stderr);
+        let align_line = read_work_line(&mut stderr, "align ");
         assert!(align_line.starts_with("align "), "{align_line}");
         let fuse_line = read_line(&mut stderr);
         assert!(fuse_line.starts_with("fuse "), "{fuse_line}");

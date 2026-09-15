@@ -472,3 +472,74 @@ fn reads_the_reference_stack() {
         start.elapsed()
     );
 }
+
+// --- capture time -----------------------------------------------------------
+//
+// `DateTimeOriginal` (36867) is what grouping reads. No committed fixture
+// frame carries it and `TiffWriter` cannot write one, so these three cases
+// build their own frames through `io::test_frames` (behind the
+// `test-algorithms` feature, enabled for this crate's tests by its own
+// dev-dependency on itself).
+
+fn capture_time_dir(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir must be creatable");
+    dir
+}
+
+#[test]
+fn date_time_original_is_read_from_ifd0() {
+    let dir = capture_time_dir("date_time_original_ifd0");
+    let path = dir.join("frame.tif");
+    focusforge_core::io::test_frames::write_frame_with_capture_time(
+        &path,
+        8,
+        4,
+        Some("2026:08:29 18:42:41"),
+    )
+    .expect("test frame must write");
+
+    let header = TiffHeader::open(&path).expect("test frame must parse");
+    assert_eq!(
+        header.date_time_original.as_deref(),
+        Some("2026:08:29 18:42:41")
+    );
+    // Still a genuinely valid frame, not just a parseable header.
+    let stack = TiffStack::open_files(&[path]).expect("test frame must open as a stack");
+    assert_eq!(stack.dimensions(), (8, 4));
+}
+
+#[test]
+fn date_time_original_falls_back_to_the_exif_sub_ifd() {
+    let dir = capture_time_dir("date_time_original_sub_ifd");
+    let path = dir.join("frame.tif");
+    focusforge_core::io::test_frames::write_frame_with_exif_capture_time(
+        &path,
+        8,
+        4,
+        "2026:08:29 18:42:43",
+    )
+    .expect("test frame must write");
+
+    let header = TiffHeader::open(&path).expect("test frame must parse");
+    assert_eq!(
+        header.date_time_original.as_deref(),
+        Some("2026:08:29 18:42:43"),
+        "36867 behind the 34665 pointer must be found when IFD0 has none"
+    );
+}
+
+#[test]
+fn date_time_original_survives_a_junk_exif_pointer() {
+    let dir = capture_time_dir("date_time_original_junk_pointer");
+    let path = dir.join("frame.tif");
+    focusforge_core::io::test_frames::write_frame_with_junk_exif_pointer(&path, 8, 4)
+        .expect("test frame must write");
+
+    let header = TiffHeader::open(&path)
+        .expect("a junk EXIF pointer must not make an otherwise good frame unreadable");
+    assert_eq!(header.date_time_original, None);
+    let stack = TiffStack::open_files(&[path]).expect("the frame must still open as a stack");
+    assert_eq!(stack.dimensions(), (8, 4));
+}
