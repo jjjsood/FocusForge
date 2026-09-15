@@ -32,9 +32,11 @@ use serde::Serialize;
 
 use crate::align::{AlignOptions, AlignmentEntry, resolve_align_algo};
 use crate::job::{self, JobOptions};
+use crate::preset::{self, PresetOptions};
 use crate::progress::{ProgressMode, ProgressRenderer};
-use crate::set::{SetArgs, parse_settings};
+use crate::set::{SetArgs, merge_preset, parse_settings};
 use crate::signals;
+use crate::status::StatusSink;
 
 /// The `stack --json` document; fields are only ever added, never removed
 /// or renamed.
@@ -92,6 +94,53 @@ pub struct ParamReport {
     pub provenance: Provenance,
 }
 
+/// `stack --dry-run --json`'s document: **not** a [`StackReport`].
+///
+/// `stack --json`'s standing contract is that a document on stdout means a
+/// completed run, so a plan gets its own shape rather than a report with
+/// hollow fields: `dry_run: true` leads, `would_write` replaces `outputs`,
+/// and `crop`/`output_width`/`output_height`/`wall_seconds` are absent
+/// entirely -- an existing consumer of `stack --json` therefore cannot
+/// mistake a plan for a run, and a new one cannot read a crop that was never
+/// computed.
+#[derive(Serialize)]
+pub struct DryRunPlan {
+    /// Always `true`. A constant field, because the marker is what a
+    /// consumer branches on.
+    pub dry_run: bool,
+    pub input: String,
+    pub frame_count: usize,
+    pub width: u32,
+    pub height: u32,
+    pub samples_per_pixel: u32,
+    pub algorithm: String,
+    pub display_name: String,
+    pub params: Vec<ParamReport>,
+    /// `null` with `--no-align`; otherwise the alignment algorithm and its
+    /// resolved parameters -- resolved, never run.
+    pub align: Option<DryRunAlignPlan>,
+    pub tile_size: u32,
+    pub levels: u32,
+    pub margin: u32,
+    pub tiles: usize,
+    pub in_flight_limit: usize,
+    pub backend: String,
+    /// The paths this invocation *would* write. None of them exists.
+    pub would_write: Vec<String>,
+    /// What this plan deliberately does not promise, named rather than
+    /// omitted: a plan that silently left `crop` out would read as "no
+    /// crop".
+    pub not_computed: Vec<String>,
+}
+
+/// [`DryRunPlan`]'s `align` field: the alignment half resolved, not run.
+#[derive(Serialize)]
+pub struct DryRunAlignPlan {
+    pub algorithm: String,
+    pub display_name: String,
+    pub params: Vec<ParamReport>,
+}
+
 /// Runs the subcommand.
 ///
 /// `algo_id: None` is refused here, by name, rather than by clap: `--algo`
@@ -108,20 +157,34 @@ pub fn run(
     set: &SetArgs,
     align_opts: &AlignOptions<'_>,
     job_opts: &JobOptions,
+    preset_opts: &PresetOptions<'_>,
     argv: &[String],
     no_gpu: bool,
 ) -> ExitCode {
     let start = Instant::now();
     let mut renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.quiet));
+    let status = StatusSink::new(preset_opts.status, dir.display().to_string(), "stack");
     let signals = match signals::install(true) {
         Ok(signals) => signals,
-        Err(msg) => return crate::fail(msg),
+        Err(msg) => return status.fail(msg),
     };
+
+    // Step 1a: the preset, ahead of everything else -- a malformed file is
+    // refused before a frame is opened, and its `algo` key is what step 2
+    // falls back to.
+    let file = match preset::load(preset_opts.preset) {
+        Ok(preset) => preset,
+        Err(msg) => return status.fail(msg),
+    };
+    if preset_opts.dry_run && job_opts.resume {
+        return status.fail("--dry-run and --resume are incompatible: a dry run writes nothing, so there is nothing to resume into");
+    }
 
     // Step 2: resolve the algorithm first, before anything else -- an
     // unknown or missing id is refused before the input directory (which
-    // may not even exist) is ever touched.
-    let algo = match algo_id {
+    // may not even exist) is ever touched. `--algo` beats the preset's own
+    // `algo` key: one rule, flag beats file.
+    let algo = match algo_id.or(file.algo.as_deref()) {
         None => {
             // Stacking algorithms only: this flag cannot accept an
             // alignment id, so offering one as a candidate would send the
@@ -130,16 +193,17 @@ pub fn run(
                 .iter()
                 .map(|a| a.id())
                 .collect();
-            return crate::fail(format!(
-                "--algo is required; known algorithms: {}",
+            return status.fail(format!(
+                "--algo is required (or an `algo` key in the preset); known algorithms: {}",
                 ids.join(", ")
             ));
         }
         Some(id) => match registry::find_stack(id) {
             Ok(algo) => algo,
-            Err(err) => return crate::fail(err),
+            Err(err) => return status.fail(err),
         },
     };
+    status.set_algorithm(algo.id());
 
     // `Laplacian` (`crates/core/src/gpu.rs`'s own doc comment: "the WGSL
     // twin of ... `Laplacian::fuse`"). Every other registered algorithm
@@ -155,13 +219,16 @@ pub fn run(
         None
     };
 
-    // Step 3: parse `--set` against that schema. An unknown key or an
-    // out-of-range value is refused here, range-checked already by
-    // `ParamValue::parse`, with the input directory still unread.
-    let explicit = match parse_settings(algo.params(), &set.set) {
+    // Step 3: parse `--set` against that schema and overlay it on the
+    // preset's `[stack]` table. An unknown key or an out-of-range value is
+    // refused here -- from either source, with the same `ParamViolation`
+    // rendering -- with the input directory still unread.
+    let explicit = match parse_settings(algo.params(), &set.set)
+        .and_then(|cli| merge_preset(algo.params(), &file.stack, cli))
+    {
         Ok(values) => values,
         Err(violations) => {
-            return crate::fail(
+            return status.fail(
                 violations
                     .iter()
                     .map(ToString::to_string)
@@ -180,17 +247,17 @@ pub fn run(
     // `FusionConsumer::create`'s own failure, so the `.partial` cleanup is
     // exercised by a real failure rather than a second copy of this check.
     if let Err(msg) = check_output_parent(output) {
-        return crate::fail(msg);
+        return status.fail(msg);
     }
 
     // Step 5: frame discovery and the strict uniformity guard.
     let paths = match frame_paths(dir) {
         Ok(paths) => paths,
-        Err(err) => return crate::fail(err),
+        Err(err) => return status.fail(err),
     };
     let stack = match TiffStack::open_files(&paths) {
         Ok(stack) => stack,
-        Err(err) => return crate::fail(err),
+        Err(err) => return status.fail(err),
     };
     let frame_names: Vec<String> = paths
         .iter()
@@ -207,12 +274,12 @@ pub fn run(
         .collect();
     let (uniform, detail) = crate::uniform_check(&header_refs);
     if !uniform {
-        return crate::fail(detail.unwrap_or_else(|| "non-uniform frame set".to_string()));
+        return status.fail(detail.unwrap_or_else(|| "non-uniform frame set".to_string()));
     }
 
     // Step 6: refuse an output that is also an input frame.
     if let Some(name) = colliding_frame(output, &paths, &frame_names) {
-        return crate::fail(format!(
+        return status.fail(format!(
             "output path {} is also an input frame ({name})",
             output.display()
         ));
@@ -220,7 +287,7 @@ pub fn run(
     if let Some(zmap) = zmap
         && let Some(name) = colliding_frame(zmap, &paths, &frame_names)
     {
-        return crate::fail(format!(
+        return status.fail(format!(
             "--zmap path {} is also an input frame ({name})",
             zmap.display()
         ));
@@ -232,7 +299,7 @@ pub fn run(
     let stack_ctx = StackContext::new(stack.len(), width, height, spp);
     let resolved = match params::resolve(algo.params(), &explicit, &stack_ctx) {
         Ok(resolved) => resolved,
-        Err(err) => return crate::fail(err),
+        Err(err) => return status.fail(err),
     };
     let values = params::resolved_values(&resolved);
 
@@ -284,15 +351,22 @@ pub fn run(
     )> = None;
     let mut used_peeked_alignment = false;
 
-    if align_opts.align {
-        let align_algo = match resolve_align_algo(align_opts.algo) {
+    // Step 8.5a: *resolving* the alignment algorithm and its parameters is
+    // pure -- registry lookup, `--align-set`/`[align]` validation, `auto`
+    // evaluation -- and is split out from *running* `align_stack` below so
+    // `--write-preset` and `--dry-run` can report the alignment half without
+    // paying for the ECC solve (~240 s on the reference stack).
+    let align_prepared = if align_opts.align {
+        let align_algo = match resolve_align_algo(align_opts.algo.or(file.align_algo.as_deref())) {
             Ok(a) => a,
-            Err(msg) => return crate::fail(msg),
+            Err(msg) => return status.fail(msg),
         };
-        let align_explicit = match parse_settings(align_algo.params(), align_opts.set) {
+        let align_explicit = match parse_settings(align_algo.params(), align_opts.set)
+            .and_then(|cli| merge_preset(align_algo.params(), &file.align, cli))
+        {
             Ok(v) => v,
             Err(violations) => {
-                return crate::fail(
+                return status.fail(
                     violations
                         .iter()
                         .map(ToString::to_string)
@@ -304,7 +378,7 @@ pub fn run(
         let align_resolved = match params::resolve(align_algo.params(), &align_explicit, &stack_ctx)
         {
             Ok(r) => r,
-            Err(err) => return crate::fail(err),
+            Err(err) => return status.fail(err),
         };
         let align_values = params::resolved_values(&align_resolved);
         let align_params: Vec<ParamReport> = align_resolved
@@ -315,6 +389,107 @@ pub fn run(
                 provenance: r.provenance,
             })
             .collect();
+        Some((align_algo, align_explicit, align_values, align_params))
+    } else {
+        None
+    };
+
+    // `--write-preset`, after resolution and independent of whether the run
+    // proceeds -- it is meaningful under `--dry-run`, the "same as last
+    // time, new folders" path. **Explicit values only**:
+    // `explicit` and `align_explicit` are exactly the keys that resolve as
+    // `Provenance::Explicit`, so a value left to an `auto` closure stays
+    // live and is recomputed fresh on the next, differently-sized stack.
+    if let Some(path) = preset_opts.write_preset {
+        let written = preset::Preset {
+            algo: Some(algo.id().to_string()),
+            align_algo: align_prepared.as_ref().map(|(a, ..)| a.id().to_string()),
+            stack: explicit.clone(),
+            align: align_prepared
+                .as_ref()
+                .map(|(_, e, ..)| e.clone())
+                .unwrap_or_default(),
+        };
+        if let Err(msg) = preset::write(&written, path) {
+            return status.fail(msg);
+        }
+    }
+
+    // `--dry-run`: resolve, report, exit 0 -- inserted **before** the
+    // alignment arm below, so `align_stack` (~240 s on the reference stack)
+    // never runs, and before the `.partial` files, the `ResumeStore` and the
+    // ledger further down, so nothing is created anywhere.
+    // `TileScheduler::new` is pure: it builds a `TilePlan` and divides the
+    // byte budget, touching no file (`crates/core/src/tile/scheduler.rs`).
+    if preset_opts.dry_run {
+        let scheduler = match TileScheduler::new(&stack, stack_ctx, spp, &options) {
+            Ok(scheduler) => scheduler,
+            Err(err) => return status.fail(err),
+        };
+        let geometry = scheduler.plan();
+        let mut would_write = vec![output.display().to_string()];
+        if let Some(zmap) = zmap {
+            would_write.push(zmap.display().to_string());
+        }
+        let plan = DryRunPlan {
+            dry_run: true,
+            input: dir.display().to_string(),
+            frame_count: stack.len(),
+            width,
+            height,
+            samples_per_pixel: spp,
+            algorithm: algo.id().to_string(),
+            display_name: algo.display_name().to_string(),
+            params: resolved
+                .into_iter()
+                .map(|(id, r)| ParamReport {
+                    id,
+                    value: r.value,
+                    provenance: r.provenance,
+                })
+                .collect(),
+            align: align_prepared
+                .as_ref()
+                .map(|(align_algo, _, _, params)| DryRunAlignPlan {
+                    algorithm: align_algo.id().to_string(),
+                    display_name: align_algo.display_name().to_string(),
+                    params: params
+                        .iter()
+                        .map(|p| ParamReport {
+                            id: p.id.clone(),
+                            value: p.value.clone(),
+                            provenance: p.provenance,
+                        })
+                        .collect(),
+                }),
+            tile_size: geometry.tile_size(),
+            levels: geometry.levels(),
+            margin: geometry.margin(),
+            tiles: geometry.tiles().len(),
+            in_flight_limit: scheduler.in_flight_limit(),
+            backend: backend
+                .map(|b| b.info().to_string())
+                .unwrap_or_else(|| "cpu".to_string()),
+            would_write,
+            not_computed: vec![
+                "crop".to_string(),
+                "output_width".to_string(),
+                "output_height".to_string(),
+            ],
+        };
+        status.dry_run(&plan.would_write);
+        if json {
+            match serde_json::to_string_pretty(&plan) {
+                Ok(text) => println!("{text}"),
+                Err(err) => return status.fail(format!("failed to serialize JSON: {err}")),
+            }
+        } else {
+            println!("{}", render_plan(&plan));
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some((align_algo, _, align_values, align_params)) = align_prepared {
         let identity = AlignIdentity {
             algorithm: align_algo.id().to_string(),
             params: align_values.clone(),
@@ -372,18 +547,19 @@ pub fn run(
                 result
             });
             if signals.cancel.load(Ordering::SeqCst) {
+                status.cancelled();
                 return ExitCode::from(130);
             }
             let result = match solved {
                 Ok(r) => r,
-                Err(err) => return crate::fail(err),
+                Err(err) => return status.fail(err),
             };
             if !align_opts.lax && result.failure_count() > 0 {
                 let names: Vec<String> = result
                     .failed()
                     .map(|f| format!("{} ({:?})", frame_names[f.frame], f.status))
                     .collect();
-                return crate::fail(format!(
+                return status.fail(format!(
                     "alignment failed for {} frame(s): {}",
                     names.len(),
                     names.join(", ")
@@ -408,10 +584,10 @@ pub fn run(
     };
     let crop_rect_value = match auto_crop(&alignment_for_crop, (width, height)) {
         Ok(c) => c,
-        Err(err) => return crate::fail(err),
+        Err(err) => return status.fail(err),
     };
     if align_opts.crop && crop_rect_value.is_none() {
-        return crate::fail(crate::align::empty_crop_refusal());
+        return status.fail(crate::align::empty_crop_refusal());
     }
     let applied_crop = if align_opts.crop {
         crop_rect_value
@@ -461,7 +637,7 @@ pub fn run(
     };
     let scheduler = match TileScheduler::new(reader, stack_ctx, spp, &options) {
         Ok(scheduler) => scheduler,
-        Err(err) => return crate::fail(err),
+        Err(err) => return status.fail(err),
     };
 
     // Step 10: `.partial` discipline -- create both writers on partial
@@ -511,18 +687,17 @@ pub fn run(
     };
     let resume_store = match ResumeStore::open(Path::new(".scratch")) {
         Ok(store) => store,
-        Err(err) => return crate::fail(err.to_string()),
+        Err(err) => return status.fail(err.to_string()),
     };
     let ledger = if job_opts.resume {
         match resume_store.find(&record) {
             Ok(Resumable::None) => {
-                return crate::fail(
-                    "no resumable state for this stack under .scratch/resume".to_string(),
-                );
+                return status
+                    .fail("no resumable state for this stack under .scratch/resume".to_string());
             }
-            Ok(Resumable::Mismatch(mismatch)) => return crate::fail(mismatch.to_string()),
+            Ok(Resumable::Mismatch(mismatch)) => return status.fail(mismatch.to_string()),
             Ok(Resumable::Ledger(ledger)) => ledger,
-            Err(err) => return crate::fail(err.to_string()),
+            Err(err) => return status.fail(err.to_string()),
         }
     } else {
         // A non-resume run may legally disagree with old state -- a
@@ -533,15 +708,15 @@ pub fn run(
         match resume_store.find(&record) {
             Ok(Resumable::Ledger(stale)) => {
                 if let Err(err) = stale.discard() {
-                    return crate::fail(err.to_string());
+                    return status.fail(err.to_string());
                 }
             }
             Ok(_) => {}
-            Err(err) => return crate::fail(err.to_string()),
+            Err(err) => return status.fail(err.to_string()),
         }
         match resume_store.begin(&record) {
             Ok(ledger) => ledger,
-            Err(err) => return crate::fail(err.to_string()),
+            Err(err) => return status.fail(err.to_string()),
         }
     };
 
@@ -561,7 +736,7 @@ pub fn run(
     {
         cleanup_partials(&composite_partial, zmap_partial.as_deref());
         let _ = ledger.discard();
-        return crate::fail(err.to_string());
+        return status.fail(err.to_string());
     }
 
     // The resume composition -- `FusionConsumer::resume` when the ledger
@@ -583,7 +758,7 @@ pub fn run(
             Err(err) => {
                 cleanup_partials(&composite_partial, zmap_partial.as_deref());
                 let _ = ledger.discard();
-                return crate::fail(err);
+                return status.fail(err);
             }
         }
     } else {
@@ -598,7 +773,7 @@ pub fn run(
             Err(err) => {
                 cleanup_partials(&composite_partial, zmap_partial.as_deref());
                 let _ = ledger.discard();
-                return crate::fail(err);
+                return status.fail(err);
             }
         }
     };
@@ -648,7 +823,7 @@ pub fn run(
             // attempted here.
             cleanup_partials(&composite_partial, zmap_partial.as_deref());
             let _ = ledger.discard();
-            return crate::fail(err);
+            return status.fail(err);
         }
     };
 
@@ -665,6 +840,7 @@ pub fn run(
             control.progress().unit_total,
             job::resume_recipe(argv)
         );
+        status.cancelled();
         return ExitCode::from(130);
     }
     debug_assert_eq!(
@@ -699,13 +875,13 @@ pub fn run(
     if let Err(err) = sink.finish() {
         cleanup_partials(&composite_partial, zmap_partial.as_deref());
         let _ = ledger.discard();
-        return crate::fail(err);
+        return status.fail(err);
     }
 
     if let Err(err) = std::fs::rename(&composite_partial, output) {
         cleanup_partials(&composite_partial, zmap_partial.as_deref());
         let _ = ledger.discard();
-        return crate::fail(format!(
+        return status.fail(format!(
             "renaming {} to {}: {err}",
             composite_partial.display(),
             output.display()
@@ -716,14 +892,14 @@ pub fn run(
     {
         let _ = std::fs::remove_file(zmap_partial);
         let _ = ledger.discard();
-        return crate::fail(format!(
+        return status.fail(format!(
             "renaming {} to {}: {err}",
             zmap_partial.display(),
             zmap.display()
         ));
     }
     if let Err(err) = ledger.discard() {
-        return crate::fail(err.to_string());
+        return status.fail(err.to_string());
     }
     renderer.finish("stack complete");
 
@@ -731,6 +907,7 @@ pub fn run(
     if let Some(zmap) = zmap {
         outputs.push(zmap.display().to_string());
     }
+    status.completed(&outputs);
 
     let align_report = alignment_result.map(|(align_algo, result, _values, params)| {
         let failure_count = result.failure_count();
@@ -787,7 +964,7 @@ pub fn run(
     if json {
         match serde_json::to_string_pretty(&report) {
             Ok(text) => println!("{text}"),
-            Err(err) => return crate::fail(format!("failed to serialize JSON: {err}")),
+            Err(err) => return status.fail(format!("failed to serialize JSON: {err}")),
         }
     } else {
         println!("{}", render(&report));
@@ -953,14 +1130,7 @@ fn render(report: &StackReport) -> String {
         ),
         format!("{} - {}", report.algorithm, report.display_name),
     ];
-    for p in &report.params {
-        lines.push(format!(
-            "{} = {} ({:?})",
-            p.id,
-            serde_json::to_string(&p.value).unwrap_or_else(|_| "?".to_string()),
-            p.provenance,
-        ));
-    }
+    lines.extend(report.params.iter().map(param_line));
     lines.push(format!(
         "tile_size={} levels={} margin={} tiles={} in_flight_limit={}",
         report.tile_size, report.levels, report.margin, report.tiles, report.in_flight_limit,
@@ -970,6 +1140,55 @@ fn render(report: &StackReport) -> String {
         lines.push(format!("wrote: {output}"));
     }
     lines.push(format!("wall: {:.3}s", report.wall_seconds));
+    lines.join("\n")
+}
+
+/// One resolved parameter, in the line shape [`render`] uses --
+/// `"{id} = {value} ({Provenance:?})"`, so a dry run and a real run print
+/// the same sentence for the same fact.
+fn param_line(p: &ParamReport) -> String {
+    format!(
+        "{} = {} ({:?})",
+        p.id,
+        serde_json::to_string(&p.value).unwrap_or_else(|_| "?".to_string()),
+        p.provenance,
+    )
+}
+
+/// Human rendering of one [`DryRunPlan`], the same one-fact-per-line shape
+/// [`render`] uses. The last two lines state what a dry run refuses to
+/// promise, rather than leaving it out.
+fn render_plan(plan: &DryRunPlan) -> String {
+    let mut lines = vec![
+        "dry run -- resolved only, nothing computed and nothing written".to_string(),
+        format!("{} ({} frames)", plan.input, plan.frame_count),
+        format!(
+            "{}x{} {}ch",
+            plan.width, plan.height, plan.samples_per_pixel
+        ),
+        format!("{} - {}", plan.algorithm, plan.display_name),
+    ];
+    lines.extend(plan.params.iter().map(param_line));
+    match &plan.align {
+        Some(align) => {
+            lines.push(format!(
+                "align: {} - {}",
+                align.algorithm, align.display_name
+            ));
+            lines.extend(align.params.iter().map(param_line));
+        }
+        None => lines.push("align: skipped (--no-align)".to_string()),
+    }
+    lines.push(format!(
+        "tile_size={} levels={} margin={} tiles={} in_flight_limit={}",
+        plan.tile_size, plan.levels, plan.margin, plan.tiles, plan.in_flight_limit,
+    ));
+    lines.push(format!("backend: {}", plan.backend));
+    for output in &plan.would_write {
+        lines.push(format!("would write: {output}"));
+    }
+    lines.push("crop: not computed -- --dry-run stops before alignment".to_string());
+    lines.push("output size: not computed -- it follows from the crop".to_string());
     lines.join("\n")
 }
 

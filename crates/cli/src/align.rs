@@ -23,10 +23,12 @@ use focusforge_core::tile::Rect;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 use serde::Serialize;
 
+use crate::preset::{self, PresetOptions};
 use crate::progress::{ProgressMode, ProgressRenderer};
 use crate::set::SetArgs;
-use crate::set::parse_settings;
+use crate::set::{merge_preset, parse_settings};
 use crate::stack::ParamReport;
+use crate::status::StatusSink;
 
 /// The options `stack` needs to drive its own alignment stage, bundled so
 /// `stack::run` stays under clippy's argument-count lint
@@ -145,20 +147,39 @@ pub fn run(
     write_warped: Option<&Path>,
     set: &SetArgs,
     quiet: bool,
+    preset_opts: &PresetOptions<'_>,
     no_gpu: bool,
 ) -> ExitCode {
     let start = Instant::now();
     let mut renderer = ProgressRenderer::new(ProgressMode::choose(quiet));
+    let sink = StatusSink::new(preset_opts.status, dir.display().to_string(), "align");
 
-    let algo = match resolve_align_algo(algo_id) {
-        Ok(algo) => algo,
-        Err(msg) => return crate::fail(msg),
+    // One preset file serves both subcommands: `align` reads `align-algo`
+    // and `[align]` only. The unused half is not silently dropped -- a
+    // `[stack]`/`[align]` typo would otherwise be a quiet no-op.
+    let file = match preset::load(preset_opts.preset) {
+        Ok(file) => file,
+        Err(msg) => return sink.fail(msg),
     };
+    if !file.stack.is_empty() {
+        eprintln!("preset: [stack] table not used by align");
+    }
+    if file.algo.is_some() {
+        eprintln!("preset: algo key not used by align (align reads align-algo)");
+    }
 
-    let explicit = match parse_settings(algo.params(), &set.set) {
+    let algo = match resolve_align_algo(algo_id.or(file.align_algo.as_deref())) {
+        Ok(algo) => algo,
+        Err(msg) => return sink.fail(msg),
+    };
+    sink.set_algorithm(algo.id());
+
+    let explicit = match parse_settings(algo.params(), &set.set)
+        .and_then(|cli| merge_preset(algo.params(), &file.align, cli))
+    {
         Ok(values) => values,
         Err(violations) => {
-            return crate::fail(
+            return sink.fail(
                 violations
                     .iter()
                     .map(ToString::to_string)
@@ -168,13 +189,25 @@ pub fn run(
         }
     };
 
+    if let Some(path) = preset_opts.write_preset {
+        let written = preset::Preset {
+            algo: None,
+            align_algo: Some(algo.id().to_string()),
+            stack: Default::default(),
+            align: explicit.clone(),
+        };
+        if let Err(msg) = preset::write(&written, path) {
+            return sink.fail(msg);
+        }
+    }
+
     let paths = match frame_paths(dir) {
         Ok(paths) => paths,
-        Err(err) => return crate::fail(err),
+        Err(err) => return sink.fail(err),
     };
     let stack = match TiffStack::open_files(&paths) {
         Ok(stack) => stack,
-        Err(err) => return crate::fail(err),
+        Err(err) => return sink.fail(err),
     };
     let frame_names: Vec<String> = paths
         .iter()
@@ -191,7 +224,7 @@ pub fn run(
         .collect();
     let (uniform, detail) = crate::uniform_check(&header_refs);
     if !uniform {
-        return crate::fail(detail.unwrap_or_else(|| "non-uniform frame set".to_string()));
+        return sink.fail(detail.unwrap_or_else(|| "non-uniform frame set".to_string()));
     }
 
     let (width, height) = stack.dimensions();
@@ -199,7 +232,7 @@ pub fn run(
     let stack_ctx = StackContext::new(stack.len(), width, height, spp);
     let resolved = match params::resolve(algo.params(), &explicit, &stack_ctx) {
         Ok(resolved) => resolved,
-        Err(err) => return crate::fail(err),
+        Err(err) => return sink.fail(err),
     };
     let values = params::resolved_values(&resolved);
 
@@ -211,11 +244,11 @@ pub fn run(
     renderer.stage(&format!("align {} frames (no unit progress)", stack.len()));
     let alignment = match align_stack(algo, stack_ctx, &stack, &values, policy) {
         Ok(alignment) => alignment,
-        Err(err) => return crate::fail(err),
+        Err(err) => return sink.fail(err),
     };
     let crop = match auto_crop(&alignment, (width, height)) {
         Ok(crop) => crop,
-        Err(err) => return crate::fail(err),
+        Err(err) => return sink.fail(err),
     };
 
     if let Some(write_warped) = write_warped {
@@ -235,7 +268,7 @@ pub fn run(
             spp,
             backend,
         ) {
-            return crate::fail(msg);
+            return sink.fail(msg);
         }
     }
 
@@ -269,7 +302,7 @@ pub fn run(
     if json {
         match serde_json::to_string_pretty(&report) {
             Ok(text) => println!("{text}"),
-            Err(err) => return crate::fail(format!("failed to serialize JSON: {err}")),
+            Err(err) => return sink.fail(format!("failed to serialize JSON: {err}")),
         }
     } else {
         println!("{}", render(&report));
@@ -280,7 +313,7 @@ pub fn run(
             .failed()
             .map(|f| format!("{} ({:?})", frame_names[f.frame], f.status))
             .collect();
-        return crate::fail(format!(
+        return sink.fail(format!(
             "alignment failed for {} frame(s): {}",
             names.len(),
             names.join(", ")
@@ -293,6 +326,13 @@ pub fn run(
         );
     }
 
+    // `outputs` carries the `--write-warped` directory when one was given,
+    // and is empty otherwise: a plain `align` computes numbers, not files.
+    sink.completed(
+        &write_warped
+            .map(|p| vec![p.display().to_string()])
+            .unwrap_or_default(),
+    );
     ExitCode::SUCCESS
 }
 

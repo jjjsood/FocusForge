@@ -19,10 +19,12 @@ mod align;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod job;
+mod preset;
 mod progress;
 mod set;
 mod signals;
 mod stack;
+mod status;
 
 /// Resolves whether this run takes the GPU path or the CPU one:
 /// `#[cfg(feature = "gpu")]` delegates to [`gpu::resolve_backend`]; with the
@@ -138,6 +140,29 @@ enum Command {
         /// to use the scheduler's own default.
         #[arg(long = "max-bytes-in-flight", value_name = "BYTES")]
         max_bytes_in_flight: Option<usize>,
+        /// Read parameter values from a TOML preset: the `algo` and
+        /// `align-algo` keys plus the `[stack]` and `[align]` value
+        /// tables. A flag always beats the file -- `--set`/`--align-set`
+        /// override the tables, `--algo`/`--align-algo` override the keys.
+        #[arg(long, value_name = "PATH")]
+        preset: Option<PathBuf>,
+        /// Write the preset that reproduces this run to this path: the
+        /// algorithm ids plus the values you actually chose. Values left
+        /// to an `auto` closure stay live and are never frozen into the
+        /// file.
+        #[arg(long = "write-preset", value_name = "PATH")]
+        write_preset: Option<PathBuf>,
+        /// Append one NDJSON status record for this stack to this path:
+        /// identity, outcome, outputs and the error, if any. Every
+        /// terminal path writes exactly one record.
+        #[arg(long, value_name = "PATH")]
+        status: Option<PathBuf>,
+        /// Resolve everything, print what would happen -- parameters with
+        /// their provenance, tile geometry, output paths -- and exit 0
+        /// without computing or writing anything. Stops *before*
+        /// alignment, so it reports no crop rect and no output extent.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
         /// Force the CPU path even when a usable GPU adapter is available.
         /// Only present when the `gpu` feature is compiled in -- with it
         /// off, this flag does not exist at all, not even as a no-op.
@@ -180,6 +205,19 @@ enum Command {
         /// otherwise prints.
         #[arg(long)]
         quiet: bool,
+        /// Read parameter values from a TOML preset. `align` uses only
+        /// `align-algo` and the `[align]` table; a non-empty `[stack]`
+        /// table or `algo` key is unused here and says so on stderr, so
+        /// one preset file serves both subcommands.
+        #[arg(long, value_name = "PATH")]
+        preset: Option<PathBuf>,
+        /// Write the preset that reproduces this run to this path:
+        /// `align-algo` plus the `[align]` values you actually chose.
+        #[arg(long = "write-preset", value_name = "PATH")]
+        write_preset: Option<PathBuf>,
+        /// Append one NDJSON status record for this run to this path.
+        #[arg(long, value_name = "PATH")]
+        status: Option<PathBuf>,
         /// Force the CPU path even when a usable GPU adapter is available.
         /// Only present when the `gpu` feature is compiled in. Meaningful
         /// only with `--write-warped`: plain `align` has nothing on the
@@ -211,6 +249,10 @@ fn main() -> ExitCode {
             quiet,
             tile_size,
             max_bytes_in_flight,
+            preset,
+            write_preset,
+            status,
+            dry_run,
             #[cfg(feature = "gpu")]
             gpu,
         } => {
@@ -238,6 +280,12 @@ fn main() -> ExitCode {
                     tile_size,
                     max_bytes_in_flight,
                 },
+                &preset::PresetOptions {
+                    preset: preset.as_deref(),
+                    write_preset: write_preset.as_deref(),
+                    status: status.as_deref(),
+                    dry_run,
+                },
                 &std::env::args().collect::<Vec<_>>(),
                 no_gpu,
             )
@@ -250,6 +298,9 @@ fn main() -> ExitCode {
             write_warped,
             set,
             quiet,
+            preset,
+            write_preset,
+            status,
             #[cfg(feature = "gpu")]
             gpu,
         } => {
@@ -265,6 +316,12 @@ fn main() -> ExitCode {
                 write_warped.as_deref(),
                 &set,
                 quiet,
+                &preset::PresetOptions {
+                    preset: preset.as_deref(),
+                    write_preset: write_preset.as_deref(),
+                    status: status.as_deref(),
+                    dry_run: false,
+                },
                 no_gpu,
             )
         }

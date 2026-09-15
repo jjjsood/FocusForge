@@ -8,7 +8,7 @@
 //! `align`.
 
 use clap::Args;
-use focusforge_core::params::{ParamDesc, ParamValue, ParamValues, ParamViolation};
+use focusforge_core::params::{self, ParamDesc, ParamValue, ParamValues, ParamViolation};
 
 /// A repeatable `--set key=value` argument.
 ///
@@ -95,6 +95,36 @@ pub fn parse_settings(
     }
 }
 
+/// Validates a preset file's `[stack]` or `[align]` table against `schema`
+/// and overlays `cli` -- the values [`parse_settings`] already produced from
+/// inline `--set` flags -- on top of it, key by key, so **a flag beats the
+/// file** for the same key.
+///
+/// Preset values arrive already typed from the `toml` parser, never as
+/// `key=value` text, so they go through [`params::validate`] rather than
+/// [`parse_settings`]: one pass reporting every offender, with the same
+/// [`ParamViolation`] variants an equivalent `--set` produces
+/// (`UnknownKey`, `TypeMismatch`, `OutOfRange`, `UnknownVariant`,
+/// `NotFinite`) minus [`ParamViolation::Unparsable`], which cannot fire
+/// where nothing was parsed from text.
+///
+/// A preset-supplied key resolves with
+/// [`focusforge_core::params::Provenance::Explicit`], exactly as the same
+/// value written on the command line would: a preset is the user setting the
+/// value, in a file.
+pub fn merge_preset(
+    schema: &[ParamDesc],
+    preset: &ParamValues,
+    cli: ParamValues,
+) -> Result<ParamValues, Vec<ParamViolation>> {
+    if let Err(err) = params::validate(schema, preset) {
+        return Err(err.into_violations());
+    }
+    let mut values = preset.clone();
+    values.extend(cli);
+    Ok(values)
+}
+
 #[cfg(test)]
 mod tests {
     use focusforge_core::params::{EnumVariant, ParamKind};
@@ -170,5 +200,82 @@ mod tests {
     #[test]
     fn parse_key_val_rejects_empty_key() {
         assert!(parse_key_val("=value").is_err());
+    }
+
+    #[test]
+    fn merge_preset_keeps_a_preset_only_key() {
+        let schema = four_kind_schema();
+        let mut preset = ParamValues::new();
+        preset.insert("i".to_string(), ParamValue::Int(3));
+        let merged =
+            merge_preset(&schema, &preset, ParamValues::new()).expect("a valid preset must merge");
+        assert_eq!(merged["i"], ParamValue::Int(3));
+    }
+
+    #[test]
+    fn merge_preset_lets_an_inline_set_win() {
+        let schema = four_kind_schema();
+        let mut preset = ParamValues::new();
+        preset.insert("i".to_string(), ParamValue::Int(3));
+        preset.insert("f".to_string(), ParamValue::Float(0.25));
+        let cli = parse_settings(&schema, &[("i".to_string(), "7".to_string())])
+            .expect("the inline value must parse");
+        let merged = merge_preset(&schema, &preset, cli).expect("a valid preset must merge");
+        assert_eq!(
+            merged["i"],
+            ParamValue::Int(7),
+            "the flag must beat the file"
+        );
+        assert_eq!(
+            merged["f"],
+            ParamValue::Float(0.25),
+            "an untouched preset key must survive"
+        );
+    }
+
+    #[test]
+    fn merge_preset_reports_the_same_violation_an_equivalent_set_would() {
+        let schema = four_kind_schema();
+
+        let mut out_of_range = ParamValues::new();
+        out_of_range.insert("i".to_string(), ParamValue::Int(99));
+        let violations = merge_preset(&schema, &out_of_range, ParamValues::new())
+            .expect_err("an out-of-range preset value must be refused");
+        assert!(
+            matches!(violations.as_slice(), [ParamViolation::OutOfRange { id, .. }] if id == "i"),
+            "{violations:?}"
+        );
+        assert_eq!(
+            violations,
+            parse_settings(&schema, &[("i".to_string(), "99".to_string())])
+                .expect_err("the equivalent --set must be refused too"),
+        );
+
+        let mut unknown = ParamValues::new();
+        unknown.insert("nope".to_string(), ParamValue::Int(1));
+        let violations = merge_preset(&schema, &unknown, ParamValues::new())
+            .expect_err("an unknown preset key must be refused");
+        assert!(
+            matches!(violations.as_slice(), [ParamViolation::UnknownKey { key, .. }] if key == "nope"),
+            "{violations:?}"
+        );
+
+        let mut mistyped = ParamValues::new();
+        mistyped.insert("i".to_string(), ParamValue::Bool(true));
+        let violations = merge_preset(&schema, &mistyped, ParamValues::new())
+            .expect_err("a mistyped preset value must be refused");
+        assert!(
+            matches!(violations.as_slice(), [ParamViolation::TypeMismatch { id, .. }] if id == "i"),
+            "{violations:?}"
+        );
+
+        let mut bad_variant = ParamValues::new();
+        bad_variant.insert("e".to_string(), ParamValue::Enum("zzz".to_string()));
+        let violations = merge_preset(&schema, &bad_variant, ParamValues::new())
+            .expect_err("an unknown variant must be refused");
+        assert!(
+            matches!(violations.as_slice(), [ParamViolation::UnknownVariant { id, .. }] if id == "e"),
+            "{violations:?}"
+        );
     }
 }

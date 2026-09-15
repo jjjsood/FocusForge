@@ -407,6 +407,36 @@ mod unix_signals {
         assert!(rest.contains("--resume"), "stderr: {first}{rest}");
     }
 
+    /// The status stream on the cancel path: exit 130 *and* one
+    /// `outcome: "cancelled"` record. A script consuming the stream must
+    /// never be left waiting for a verdict a cancelled stack never sends.
+    #[test]
+    fn status_record_written_on_cancel() {
+        let dir = tmp_dir("job_cli_status_cancel");
+        let output = dir.join("out.tif");
+        let status = dir.join("status.ndjson");
+        let mantis = mantis_512_dir();
+        let mut args = interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap());
+        args.push("--status");
+        args.push(status.to_str().unwrap());
+        let mut child = spawn_piped(&dir, &args);
+        let mut stderr = BufReader::new(child.stderr.take().unwrap());
+        let first = read_line(&mut stderr);
+        assert!(first.starts_with("fuse "), "first line: {first}");
+
+        send(child.id(), "-INT");
+        let exit = child.wait().expect("child must exit");
+        assert_eq!(exit.code(), Some(130), "status: {exit:?}");
+
+        let text = std::fs::read_to_string(&status).expect("the status file must exist");
+        assert_eq!(text.lines().count(), 1, "status file: {text}");
+        let record: serde_json::Value =
+            serde_json::from_str(text.trim_end()).expect("the record must parse");
+        assert_eq!(record["outcome"], "cancelled");
+        assert_eq!(record["command"], "stack");
+        assert_eq!(record["identity"], mantis.to_str().unwrap());
+    }
+
     #[test]
     fn sigint_then_resume_finishes_the_job() {
         let ref_dir = tmp_dir("job_cli_resume_reference");
