@@ -4,16 +4,15 @@
 //!
 //! No committed fixture frame has one (`fixtures/mantis-512/frames/00.tif`
 //! carries twelve tags, none of them 306 or 36867) and [`TiffWriter`]
-//! deliberately cannot write one -- its IFD is a fixed twelve-entry set
-//! (`crates/core/src/io/tiff/writer.rs`). Without this module every
-//! capture-time test would assert against data it has no way to construct,
-//! so grouping's whole time signal would be untested.
+//! deliberately cannot write one -- its IFD is a fixed twelve-entry set.
+//! Without this module every capture-time test would assert against data
+//! it has no way to construct, so grouping's whole time signal would be
+//! untested.
 //!
-//! Behind the `test-algorithms` feature rather than `#[cfg(test)]` for the
-//! reason [`crate::test_algorithms`] states at length: `#[cfg(test)]` code
-//! never reaches the rlib, so `crates/cli`'s own tests -- which drive the
-//! built binary over a directory tree they must first *build* -- could not
-//! reach it.
+//! Behind the `test-algorithms` feature rather than `#[cfg(test)]`, per
+//! [`crate::test_algorithms`]: `#[cfg(test)]` code never reaches the rlib,
+//! so `crates/cli`'s own tests -- which drive the built binary over a
+//! directory tree they must first *build* -- could not reach it.
 //!
 //! The frames are small but genuinely valid: uncompressed 16-bit RGB, one
 //! strip, `II`, a real pixel payload, so [`TiffStack::open_files`] opens
@@ -54,8 +53,7 @@ enum ExifPlan<'a> {
 
 /// Write a valid 16-bit RGB frame at `path`, carrying `DateTimeOriginal`
 /// (36867) in **IFD0** when `when` is `Some` -- the placement the reference
-/// data actually uses: verified on 2026-09-15, all 61 reference frames
-/// carry it in IFD0.
+/// data actually uses: all 61 reference-stack frames carry it in IFD0.
 ///
 /// `when` is written verbatim, so a test can pass a malformed string
 /// (`"not-a-date"`) and exercise the unparseable path.
@@ -209,13 +207,12 @@ fn serialize(
 
     // Patch StripOffsets and, when present, the 34665 pointer -- both are
     // single LONGs, so the patch cannot move anything.
-    for (i, (tag, _, data)) in entries.iter_mut().enumerate() {
+    for (tag, _, data) in entries.iter_mut() {
         match *tag {
             TAG_STRIP_OFFSETS => *data = longs(&[pixel_start as u32]),
             TAG_EXIF_IFD if exif_value.is_some() => *data = longs(&[exif_ifd_offset as u32]),
             _ => {}
         }
-        let _ = i;
     }
 
     let mut buf = vec![0u8; (pixel_start + pixel_bytes) as usize];
