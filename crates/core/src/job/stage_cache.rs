@@ -96,14 +96,16 @@ pub enum StageCacheError {
 }
 
 impl From<ResumeError> for StageCacheError {
+    /// `write_atomic` only ever constructs `ResumeError::Io` or
+    /// `ResumeError::Json`; `Mismatch` and `UnknownFormat` are
+    /// `ResumeStore::find` outcomes this conversion never sees.
     fn from(err: ResumeError) -> Self {
         match err {
             ResumeError::Io { path, source } => StageCacheError::Io { path, source },
             ResumeError::Json { path, source } => StageCacheError::Json { path, source },
-            other => StageCacheError::Io {
-                path: PathBuf::new(),
-                source: std::io::Error::other(other.to_string()),
-            },
+            ResumeError::Mismatch(_) | ResumeError::UnknownFormat { .. } => {
+                unreachable!("write_atomic never returns Mismatch or UnknownFormat")
+            }
         }
     }
 }
@@ -173,7 +175,7 @@ struct KeyMirror<'a> {
 
 /// A stage's cache key: the path-free projection of a [`StackFingerprint`]
 /// plus that stage's own declared identity. Built by [`StageKey::align`] for
-/// the align stage -- the only cacheable stage today.
+/// the align stage -- the only cacheable stage.
 ///
 /// **In the key:** every [`FrameFingerprint`] field except `path` (via
 /// [`FrameKey`]), [`AlignIdentity::algorithm`], `AlignIdentity::params`
