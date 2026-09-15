@@ -75,6 +75,24 @@ pub fn install(app: &AppWindow) -> Arc<Mutex<AppController>> {
         let controller = controller.clone();
         move || controller.lock().unwrap().checkpoint_export_requested()
     });
+    app.on_composite_undock_requested({
+        let controller = controller.clone();
+        move || {
+            controller
+                .lock()
+                .unwrap()
+                .undock_requested(crate::canvas::PaneSource::Composite)
+        }
+    });
+    app.on_zmap_undock_requested({
+        let controller = controller.clone();
+        move || {
+            controller
+                .lock()
+                .unwrap()
+                .undock_requested(crate::canvas::PaneSource::ZMap)
+        }
+    });
 
     controller
 }
@@ -126,5 +144,8 @@ fn perform(app: &AppWindow, event: ShellEvent) {
         // Never reachable while `export_enabled()` is always `false` --
         // but the window has nothing to do with it either way.
         ShellEvent::CheckpointExportRequested => {}
+        // Never reachable while `undock_enabled()` is always `true` with
+        // both panes docked.
+        ShellEvent::PaneUndockRequested(_) => {}
     }
 }

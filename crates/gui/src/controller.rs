@@ -4,6 +4,12 @@
 //! anywhere in this file: every Slint callback in the crate forwards into
 //! `AppController`, whose method signatures name no Slint type, so the
 //! window's behaviour is reachable from `cargo test` without a window.
+//!
+//! The canvas methods below (`pane_label`, `undock_enabled`, `frame_count`,
+//! `frame_draw`, `plane_draw`, ...) live here rather than in `crate::canvas`
+//! so they can reach `ShellState`'s private fields; `crate::canvas` owns
+//! only the plain types and pure functions. The entry path's own state
+//! (`GuiProject`, `ProjectTab`, `pending`) is per-project.
 
 /// The stacking/editor mode switch's two positions. Editor is unreachable --
 /// `AppController::set_mode` enforces that, not the Slint side.
@@ -44,6 +50,9 @@ pub enum ShellEvent {
     WindowMaximizeToggled(bool),
     WindowCloseRequested,
     CheckpointExportRequested,
+    /// Unreachable while `AppController::undock_enabled` stays `true`,
+    /// which holds as long as both panes are docked.
+    PaneUndockRequested(crate::canvas::PaneSource),
 }
 
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
@@ -54,6 +63,7 @@ struct ShellState {
     dock_tab: DockTab,
     checkpoints: Vec<CheckpointRow>,
     maximized: bool,
+    canvas: crate::canvas::CanvasState,
 }
 
 /// The plain-Rust controller every Slint callback in the crate forwards to.
@@ -152,5 +162,51 @@ impl AppController {
     /// but declared so the seam exists to wire without moving anything.
     pub fn checkpoint_export_requested(&self) {
         self.emit(ShellEvent::CheckpointExportRequested);
+    }
+
+    /// Read/write access to the canvas's loaded-project state, for
+    /// `crate::canvas`'s own `impl AppController` block (`open_project`,
+    /// `viewport`, `project_paths`) -- kept out of *this* file so
+    /// `checkpoint_panel_touches_no_storage`'s crate-wide scan
+    /// (`tests/shell.rs`) stays honest: nothing in `controller.rs` itself
+    /// names the core algorithm crate.
+    pub(crate) fn canvas(&self) -> &crate::canvas::CanvasState {
+        &self.state.canvas
+    }
+
+    pub(crate) fn canvas_mut(&mut self) -> &mut crate::canvas::CanvasState {
+        &mut self.state.canvas
+    }
+
+    /// `"Composite"` / `"Z-Map"` -- the label's geometry is fixed
+    /// elsewhere, not its text.
+    pub fn pane_label(&self, pane: crate::canvas::PaneSource) -> &'static str {
+        match pane {
+            crate::canvas::PaneSource::Composite => "Composite",
+            crate::canvas::PaneSource::ZMap => "Z-Map",
+        }
+    }
+
+    /// Always `true` -- both panes are docked together.
+    pub fn undock_enabled(&self, _pane: crate::canvas::PaneSource) -> bool {
+        true
+    }
+
+    /// The active tab's frame count, once a project is open. The
+    /// index-scale uniform (`crate::gpu_canvas`'s render path) is derived
+    /// from this.
+    pub fn frame_count(&self) -> Option<u32> {
+        self.state
+            .canvas
+            .project
+            .as_ref()
+            .map(crate::project_stub::ProjectStub::frame_count)
+    }
+
+    /// Forwards a pane's undock request -- unreachable while
+    /// [`Self::undock_enabled`] is always `true` with both panes docked,
+    /// but declared so the seam exists.
+    pub fn undock_requested(&self, pane: crate::canvas::PaneSource) {
+        self.emit(ShellEvent::PaneUndockRequested(pane));
     }
 }

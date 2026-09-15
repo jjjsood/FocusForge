@@ -70,12 +70,27 @@ export component AppWindow inherits Window {
         height: ShellGeometry.toolbar-height;
     }
 
+    // Both images are `in` properties set from Rust
+    // (`crates/gui/src/gpu_canvas.rs`) once a project is loaded -- the wgpu
+    // texture is never computed here.
+    in property <image> composite-source;
+    in property <image> zmap-source;
+    in property <bool> canvas-undock-enabled: true;
+    callback composite-undock-requested();
+    callback zmap-undock-requested();
+
     canvas-ground := FFCanvas {
         x: 0px;
         y: ShellGeometry.strip-height + ShellGeometry.toolbar-height;
         width: root.width - ShellGeometry.dock-width;
         height: root.height - ShellGeometry.strip-height - ShellGeometry.toolbar-height
             - ShellGeometry.bottom-bar-height;
+        composite-source: root.composite-source;
+        zmap-source: root.zmap-source;
+        undock-enabled: root.canvas-undock-enabled;
+
+        composite-undock-requested => { root.composite-undock-requested(); }
+        zmap-undock-requested => { root.zmap-undock-requested(); }
     }
 
     dock := FFDock {

@@ -7,8 +7,20 @@
 //! `device::adapter_selection_is_reported`,
 //! `transfer::tile_roundtrip_is_bit_identical`,
 //! `parity::harness_kernel_matches_cpu_twin`, `parity_fusion::*`,
-//! `parity_warp::*`, `parity_pipeline::*` -- only resolve as module paths
-//! inside one binary.
+//! `parity_warp::*`, `parity_pipeline::*`, `parity_tonemap::*` -- only
+//! resolve as module paths inside one binary.
+//!
+//! **Runtime skip guard, `FF_GPU_PARITY`:**
+//! `crates/gui` depends on `focusforge-gpu` with the `gpu` feature, which
+//! unifies that feature on for plain `cargo test --workspace` and would
+//! otherwise pull this whole binary into the default gate. Every test here
+//! routes through `focusforge_gpu::device::shared_device_or_skip()`, which
+//! prints a skip and returns `None` unless `FF_GPU_PARITY=1` is set --
+//! enables rather than requires, the inverse polarity of
+//! `FF_REQUIRE_SYNTH_ALIGN` (`crates/cli/tests/synthetic_ground_truth.rs`),
+//! because a GPU being present is not itself a reason to spend minutes of
+//! the default gate on parity. Run explicitly:
+//! `FF_GPU_PARITY=1 cargo test -p focusforge-gpu --features gpu --test harness`.
 
 #![cfg(feature = "gpu")]
 
@@ -24,6 +36,8 @@ mod parity;
 mod parity_fusion;
 #[path = "harness/parity_pipeline.rs"]
 mod parity_pipeline;
+#[path = "harness/parity_tonemap.rs"]
+mod parity_tonemap;
 #[path = "harness/parity_warp.rs"]
 mod parity_warp;
 #[path = "harness/transfer.rs"]

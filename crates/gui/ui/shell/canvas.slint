@@ -1,20 +1,90 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The canvas region: two panes with a 16 px gutter and a 2 px divider
-// centred inside the middle gutter -- the divider is not added on top of
-// the gutter. Each pane carries the wgpu-written image, a 120 x 22 label at
-// +10/+10 from the top-left, and a 26 x 22 undock control at +10/+10 from
-// the top-right.
+// The canvas region: two panes, a divider between them, each pane carrying
+// the wgpu-written image, a label and an undock control.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
 
+component FFPaneLabel inherits Rectangle {
+    in property <string> label: "";
+
+    width: 120px;
+    height: 22px;
+    background: Theme.surface-overlay;
+    border-radius: Theme.radius-sm;
+
+    Text {
+        text: root.label;
+        color: Theme.text-primary;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component FFUndockControl inherits Rectangle {
+    // Disabled on the last (single) pane.
+    in property <bool> enabled: true;
+    callback undock-requested();
+
+    width: 26px;
+    height: 22px;
+    background: area.has-hover && root.enabled ? Theme.surface-hover : Theme.surface-overlay;
+    border-radius: Theme.radius-sm;
+    opacity: root.enabled ? 1.0 : 0.5;
+
+    area := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.undock-requested(); }
+    }
+    Image {
+        source: @image-url("../../../../assets/icons/maximize.svg");
+        colorize: Theme.text-secondary;
+        width: Theme.icon-sm;
+        height: Theme.icon-sm;
+    }
+}
+
 export component FFPane inherits Rectangle {
+    in property <image> source;
+    in property <string> label: "";
+    in property <bool> undock-enabled: true;
+    callback undock-requested();
+
     background: Theme.surface-canvas;
     border-radius: Theme.radius-md;
+    clip: true;
+
+    Image {
+        source: root.source;
+        image-fit: contain;
+        width: parent.width;
+        height: parent.height;
+    }
+
+    pane-label := FFPaneLabel {
+        x: 10px;
+        y: 10px;
+        label: root.label;
+    }
+
+    pane-undock := FFUndockControl {
+        x: parent.width - 10px - self.width;
+        y: 10px;
+        enabled: root.undock-enabled;
+        undock-requested => { root.undock-requested(); }
+    }
 }
 
 export component FFCanvas inherits Rectangle {
+    in property <image> composite-source;
+    in property <image> zmap-source;
+    in property <bool> undock-enabled: true;
+    callback composite-undock-requested();
+    callback zmap-undock-requested();
+
     background: Theme.surface-base;
 
     pane-left := FFPane {
@@ -22,6 +92,10 @@ export component FFCanvas inherits Rectangle {
         y: ShellGeometry.pane-gutter;
         width: (parent.width - 3 * ShellGeometry.pane-gutter) / 2;
         height: parent.height - 2 * ShellGeometry.pane-gutter;
+        source: root.composite-source;
+        label: "Composite";
+        undock-enabled: root.undock-enabled;
+        undock-requested => { root.composite-undock-requested(); }
     }
 
     pane-divider := Rectangle {
@@ -38,5 +112,9 @@ export component FFCanvas inherits Rectangle {
         y: ShellGeometry.pane-gutter;
         width: pane-left.width;
         height: pane-left.height;
+        source: root.zmap-source;
+        label: "Z-Map";
+        undock-enabled: root.undock-enabled;
+        undock-requested => { root.zmap-undock-requested(); }
     }
 }

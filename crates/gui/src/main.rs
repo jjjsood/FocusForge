@@ -30,6 +30,11 @@ struct Args {
     /// Renders the design-token specimen sheet instead of the shell.
     #[arg(long)]
     theme_sheet: bool,
+    /// Open a project directory: resolves `<dir>/golden/laplacian.tif` +
+    /// `<dir>/golden/laplacian-zmap.tif` (`focusforge_gui::project_stub`,
+    /// a stub project format).
+    #[arg(long)]
+    open: Option<PathBuf>,
 }
 
 /// Parses `"WxH"`; `None` on anything else, including a missing or
@@ -46,10 +51,23 @@ fn parse_size(spec: &str) -> Option<(u32, u32)> {
 /// print the named `GpuError` plus the still-working CLI path and exit:
 /// no CPU-tone-mapped fallback, no `Automatic` fallback.
 fn select_backend() {
-    let mut settings = slint::wgpu_29::WGPUSettings::default();
-    settings.device_required_limits = slint::wgpu_29::wgpu::Limits::default();
+    let shared = match focusforge_gpu::device::shared_device() {
+        Ok(shared) => shared,
+        Err(err) => {
+            eprintln!("{err}");
+            eprintln!("focusforge-cli still works without a GPU adapter");
+            std::process::exit(1);
+        }
+    };
+
+    let config = slint::wgpu_29::WGPUConfiguration::Manual {
+        instance: shared.instance().clone(),
+        adapter: shared.adapter().clone(),
+        device: shared.device().clone(),
+        queue: shared.queue().clone(),
+    };
     if let Err(e) = slint::BackendSelector::new()
-        .require_wgpu_29(slint::wgpu_29::WGPUConfiguration::Automatic(settings))
+        .require_wgpu_29(config)
         .select()
     {
         eprintln!("{e}");
@@ -58,6 +76,7 @@ fn select_backend() {
     // The crate's feature set pins exactly one backend/renderer
     // combination, so "resolved" is what was compiled in.
     println!("resolved backend: winit, renderer: renderer-femtovg-wgpu (wgpu 29.0.4)");
+    println!("{}", focusforge_gpu::device::adapter_report(shared.info()));
 }
 
 /// Installs the exit-after and resize timers, then runs the event loop.
@@ -130,7 +149,34 @@ fn main() {
         run_window(sheet, &args)
     } else {
         let app = AppWindow::new().expect("failed to instantiate AppWindow");
-        let _controller = bridge::install(&app);
+        let controller = bridge::install(&app);
+
+        if let Some(path) = &args.open {
+            if let Err(e) = controller.lock().unwrap().open_project(path) {
+                eprintln!("--open failed: {e}");
+                std::process::exit(1);
+            }
+            let shared = focusforge_gpu::device::shared_device()
+                .expect("select_backend already selected one");
+            let (composite_path, zmap_path) = controller
+                .lock()
+                .unwrap()
+                .project_paths()
+                .expect("open_project just succeeded");
+
+            let mut composite_pane = focusforge_gui::gpu_canvas::PaneTexture::default();
+            focusforge_gui::gpu_canvas::render_composite(
+                shared,
+                &mut composite_pane,
+                &composite_path,
+            );
+            app.set_composite_source(composite_pane.image());
+
+            let mut zmap_pane = focusforge_gui::gpu_canvas::PaneTexture::default();
+            focusforge_gui::gpu_canvas::render_zmap(shared, &mut zmap_pane, &zmap_path);
+            app.set_zmap_source(zmap_pane.image());
+        }
+
         run_window(app, &args)
     };
 

@@ -22,6 +22,22 @@ pub use generated::*;
 mod controller;
 pub use controller::*;
 
+/// Canvas state as plain Rust -- no `use slint::` and no `use wgpu::`
+/// anywhere in it. `pub` so `tests/canvas.rs` reaches
+/// its pure types and functions directly, the same way `tests/shell.rs`
+/// reaches `AppController` above.
+pub mod canvas;
+
+/// A stub project format: `--open <dir>`
+/// resolves `<dir>/golden/laplacian.tif` + `<dir>/golden/laplacian-zmap.tif`.
+mod project_stub;
+
+/// The wgpu half of the canvas: texture creation and
+/// `slint::Image::try_from`, the only module in the crate naming `wgpu` or
+/// `slint::wgpu_29`. `pub` so `src/main.rs` can drive it
+/// after `bridge::install`.
+pub mod gpu_canvas;
+
 /// The Slint side of the seam, and the only module in the crate that names
 /// `winit`. `pub` so `src/main.rs` -- a separate crate target that consumes
 /// this library like any other caller -- can install it on an `AppWindow`.

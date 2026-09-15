@@ -36,6 +36,24 @@ pub(crate) fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+/// A write-only `Rgba8Unorm` storage-texture binding -- the display kernel's
+/// `dst` (`crate::display`), the only kernel in this crate that writes a
+/// texture rather than a buffer. `downlevel_defaults()` allows 4 storage
+/// textures per stage (inherited from `defaults()`), so the device limits
+/// carry this unchanged.
+pub(crate) fn storage_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        },
+        count: None,
+    }
+}
+
 /// Builds one [`Pipeline`]: shader module, bind group layout, pipeline
 /// layout, compute pipeline. `wgsl_src` is always an `include_str!` at the
 /// call site, never a string literal. Every pipeline in this crate --
