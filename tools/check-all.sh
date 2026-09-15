@@ -36,6 +36,15 @@
 # command, and it must be started after `build`, which is what produces the
 # binary it runs.
 #
+# Every cargo command and the fixture-e2e binary run below goes through
+# tools/with-lock.sh build -- cargo's own target/ lock only serializes cargo
+# against cargo, not cargo against a DIFFERENT checkout reading the
+# same shared target/debug/<bin> while this one relinks it. See
+# tools/lib/lock.sh. This does cost this script some of the intra-session
+# overlap the comment above describes (fixture-e2e now queues behind clippy
+# instead of running beside it) -- accepted, because the lock is only useful
+# if it is not gamed back open the moment it is inconvenient.
+#
 # `clippy` is not in --static even though it never mutates the source: it
 # compiles the whole workspace. The static set has to stay fast enough that
 # nobody is tempted to skip the pre-commit hook, which means no gate in it may
@@ -105,11 +114,11 @@ run_gate "fixture manifest selftest" tools/check-fixtures-selftest.sh
 if [ "$STATIC_ONLY" -eq 0 ]; then
   # Must come first: it produces the binary the background stage runs, and it
   # holds the target/ lock the cargo gates below queue on anyway.
-  run_gate "build"          cargo build --workspace --all-targets
+  run_gate "build"          tools/with-lock.sh build -- cargo build --workspace --all-targets
 
   # The long background stage, started now and joined at the end. Not a
   # cargo command -- see the header.
-  run_logged_bg "fixture e2e" tools/fixture-e2e.sh
+  run_logged_bg "fixture e2e" tools/with-lock.sh build -- tools/fixture-e2e.sh
 
   # Foreground and BEFORE `cargo test`, never a background stage: `cargo
   # test` reads what this writes (.scratch/synth-align/measurement.json), so
@@ -117,14 +126,16 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   run_gate "synthetic alignment truth" tools/synth-align.sh
 
   # --- remaining gates --------------------------------------------------
-  run_gate "clippy"         cargo clippy --workspace --all-targets --all-features -- -D warnings
+  run_gate "clippy"         tools/with-lock.sh build -- cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   # FF_REQUIRE_SYNTH_ALIGN=1 turns the test's skip into a failure when the
   # artefact exists: a skip inside the gate must read as a bug, not a pass.
   REQUIRE_SYNTH=0
   [ -f .scratch/synth-align/measurement.json ] && REQUIRE_SYNTH=1
-  run_gate "cargo test"     env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" cargo test --workspace
-  run_gate "rustdoc"        env RUSTDOCFLAGS="-D warnings" \
+  run_gate "cargo test"     tools/with-lock.sh build -- \
+                              env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" cargo test --workspace
+  run_gate "rustdoc"        tools/with-lock.sh build -- \
+                              env RUSTDOCFLAGS="-D warnings" \
                               cargo doc --workspace --no-deps --document-private-items
   # Separate from `licenses` on purpose: an advisory is a fact about the world
   # that can turn red without this repository changing, so it must not be able
