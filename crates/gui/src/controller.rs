@@ -20,6 +20,7 @@ use crate::input_config::Provenance;
 use crate::input_map::{
     Action, ActionEvent, Button, InputRowView, InputTable, Modifiers, PointerKind, Trigger,
 };
+use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
 
 /// The stacking/editor mode switch's two positions. Editor is unreachable --
 /// `AppController::set_mode` enforces that, not the Slint side.
@@ -80,12 +81,11 @@ struct DragState {
 }
 
 /// The one dispatch point's own state: the active table, where it came
-/// from, the controller-tracked `space` pseudo-modifier, any live drag, and
-/// every action fired so far that has no implementation, and the two pieces
-/// of state zoom/pan needs:
-/// the last known cursor position (`wheel` and `pointer` both record it, so
-/// a drag and a wheel share one notion of where the cursor is) and the
-/// wheel's own sub-detent accumulator.
+/// from, the controller-tracked `space` pseudo-modifier, any live drag,
+/// every action fired so far with no implementation, and the two pieces of
+/// state zoom/pan needs: the last known cursor position (`wheel` and
+/// `pointer` both record it, so a drag and a wheel share one notion of
+/// where the cursor is) and the wheel's own sub-detent accumulator.
 #[derive(Debug, Clone, Default)]
 struct InputState {
     table: InputTable,
@@ -93,6 +93,11 @@ struct InputState {
     space_held: bool,
     drag: Option<DragState>,
     unimplemented: Vec<Action>,
+    last_pointer: (f32, f32),
+    /// Accumulated wheel delta not yet spent into a ladder step -- one stop
+    /// per accumulated 60 px. Reset on a sign change so reversing direction
+    /// never burns a leftover.
+    wheel_accum: f32,
 }
 
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
@@ -105,11 +110,29 @@ struct ShellState {
     maximized: bool,
     canvas: crate::canvas::CanvasState,
     input: InputState,
+    /// The loaded project's composite/Z-Map size, set once by
+    /// `AppController::set_project_image` (`crate::canvas::open_project`).
+    /// `None` until a project is open.
+    image: Option<ImageSize>,
+    /// Both panes' current geometry, pushed by `set_pane_geometry`
+    /// (`ui/shell/canvas.slint`'s five `out` properties, read once by
+    /// `src/main.rs` at startup and again on every `canvas-resized`).
+    panes: Option<(PaneRect, PaneRect)>,
+    /// `None` until the first `set_pane_geometry` call after a project
+    /// opens fits it -- `open_project` cannot fit immediately, since it is
+    /// never handed a pane rect.
+    viewport: Option<Viewport>,
     /// The settings modal's visibility -- the only consumer of
     /// `--settings-section`. No `ShellEvent` variant needed:
     /// nothing else in the crate observes it, so `bridge.rs` reads the
     /// return value back directly rather than round-tripping the sink.
     settings_open: bool,
+}
+
+/// Whether `(x, y)` falls within `pane`'s rect -- [`AppController::anchor`]'s
+/// only helper.
+fn pane_contains(pane: PaneRect, x: f32, y: f32) -> bool {
+    x >= pane.x && x <= pane.x + pane.width && y >= pane.y && y <= pane.y + pane.height
 }
 
 /// The plain-Rust controller every Slint callback in the crate forwards to.
@@ -276,23 +299,231 @@ impl AppController {
     }
 
     /// Records `event`'s action as unimplemented (by name, never silently)
-    /// when there is no implementation for it; an implemented one
-    /// is applied instead ([`Self::apply_action`]). Either
-    /// way [`ShellEvent::Input`] is raised -- nothing is both dropped and
+    /// when there is no implementation for it; an implemented one is
+    /// applied instead ([`Self::apply_action`]). Either way
+    /// [`ShellEvent::Input`] is raised -- nothing is both dropped and
     /// unrecorded, and nothing stops being emitted.
     fn emit_action(&mut self, event: ActionEvent) {
         let action = event.action();
-        if !action.implemented() && !self.state.input.unimplemented.contains(&action) {
+        if action.implemented() {
+            self.apply_action(&event);
+        } else if !self.state.input.unimplemented.contains(&action) {
             self.state.input.unimplemented.push(action);
         }
         self.emit(ShellEvent::Input(event));
     }
 
+    /// The viewport half of dispatch: `ZoomAtCursor`
+    /// spends the wheel's accumulated delta into ladder steps about the
+    /// cursor; `PanHorizontal` and the drag-driven `Pan` both read straight
+    /// into [`crate::viewport::Viewport::pan_by`].
+    fn apply_action(&mut self, event: &ActionEvent) {
+        match *event {
+            ActionEvent::Fired {
+                action: Action::ZoomAtCursor,
+                steps,
+            } => self.zoom_wheel(steps),
+            ActionEvent::Fired {
+                action: Action::PanHorizontal,
+                steps,
+            } => self.pan_viewport(steps, 0.0),
+            ActionEvent::Update {
+                action: Action::Pan,
+                dx,
+                dy,
+            } => self.pan_viewport(dx, dy),
+            _ => {}
+        }
+    }
+
+    /// Spends `steps` into whole 60 px ladder units, anchored at the last
+    /// known cursor position -- one stop per accumulated 60 px. The
+    /// accumulator resets on a sign change, so reversing direction never
+    /// burns a leftover.
+    fn zoom_wheel(&mut self, steps: f32) {
+        const DETENT: f32 = 60.0;
+        let Some(image) = self.state.image else {
+            return;
+        };
+        let Some((left, _)) = self.state.panes else {
+            return;
+        };
+        let anchor = self.anchor();
+
+        let accum = &mut self.state.input.wheel_accum;
+        if *accum != 0.0 && accum.signum() != steps.signum() {
+            *accum = 0.0;
+        }
+        *accum += steps;
+
+        while self.state.input.wheel_accum.abs() >= DETENT {
+            let dir = if self.state.input.wheel_accum > 0.0 {
+                1
+            } else {
+                -1
+            };
+            self.state.input.wheel_accum -= DETENT * dir as f32;
+            if let Some(viewport) = self.state.viewport.as_mut() {
+                viewport.zoom_steps(dir, anchor, image, left);
+            }
+        }
+    }
+
+    /// A screen-pixel pan on whichever pane the cursor is over -- both
+    /// panes share the one viewport, so only the size (identical for both)
+    /// matters here.
+    fn pan_viewport(&mut self, dx: f32, dy: f32) {
+        let Some(image) = self.state.image else {
+            return;
+        };
+        let Some((left, _)) = self.state.panes else {
+            return;
+        };
+        let Some(viewport) = self.state.viewport.as_mut() else {
+            return;
+        };
+        viewport.pan_by(dx, dy, image, left);
+    }
+
+    /// The last known cursor position, mapped into pane-local coordinates:
+    /// subtract the rect of whichever pane contains it, and when it is over
+    /// the gutter, the divider or outside both, clamp it into the nearer
+    /// pane's rect. Both panes carry the same viewport, so which pane the
+    /// cursor is in does not change the result, only where inside it.
+    fn anchor(&self) -> (f32, f32) {
+        let (x, y) = self.state.input.last_pointer;
+        let Some((left, right)) = self.state.panes else {
+            return (x, y);
+        };
+        let pane = if pane_contains(left, x, y) {
+            left
+        } else if pane_contains(right, x, y) {
+            right
+        } else {
+            let mid = (left.x + left.width + right.x) / 2.0;
+            if x < mid { left } else { right }
+        };
+        (
+            x.clamp(pane.x, pane.x + pane.width) - pane.x,
+            y.clamp(pane.y, pane.y + pane.height) - pane.y,
+        )
+    }
+
+    /// Installs both panes' current geometry, pushed by `ui/shell/canvas.slint`'s
+    /// five `out` properties (`src/bridge.rs`'s `canvas-resized` handler and
+    /// `src/main.rs`'s startup push). Fits the viewport on the first call
+    /// after a project opens (`open_project` cannot, having no pane rect of
+    /// its own); every later call re-`resize`s it, so fit stays sticky.
+    pub fn set_pane_geometry(&mut self, left: PaneRect, right: PaneRect) {
+        self.state.panes = Some((left, right));
+        let Some(image) = self.state.image else {
+            return;
+        };
+        match self.state.viewport.as_mut() {
+            Some(viewport) => viewport.resize(image, left),
+            None => self.state.viewport = Some(crate::viewport::fit(image, left)),
+        }
+    }
+
+    /// One ladder step in, about the pane's centre -- a button has no
+    /// cursor.
+    pub fn zoom_in(&mut self) {
+        self.zoom_button(1);
+    }
+
+    /// One ladder step out, about the pane's centre.
+    pub fn zoom_out(&mut self) {
+        self.zoom_button(-1);
+    }
+
+    fn zoom_button(&mut self, dir: i32) {
+        let Some(image) = self.state.image else {
+            return;
+        };
+        let Some((left, _)) = self.state.panes else {
+            return;
+        };
+        let Some(viewport) = self.state.viewport.as_mut() else {
+            return;
+        };
+        let centre = (left.width / 2.0, left.height / 2.0);
+        viewport.zoom_steps(dir, centre, image, left);
+    }
+
+    /// `Fit`: shows the whole image, centred, in whichever pane geometry is
+    /// current.
+    pub fn fit(&mut self) {
+        let Some(image) = self.state.image else {
+            return;
+        };
+        let Some((left, _)) = self.state.panes else {
+            return;
+        };
+        self.state.viewport = Some(crate::viewport::fit(image, left));
+    }
+
+    /// The zoom cluster's readout string -- empty before a project is open.
+    pub fn zoom_readout(&self) -> String {
+        self.state
+            .viewport
+            .as_ref()
+            .map(Viewport::readout)
+            .unwrap_or_default()
+    }
+
+    /// Whether the viewport is at the ladder's minimum -- fit-to-window with
+    /// one step below it.
+    pub fn at_min_zoom(&self) -> bool {
+        let (Some(image), Some((left, _)), Some(viewport)) = (
+            self.state.image,
+            self.state.panes,
+            self.state.viewport.as_ref(),
+        ) else {
+            return false;
+        };
+        viewport.at_min(image, left)
+    }
+
+    /// Whether the viewport is at the ladder's maximum -- 500 %, when fit
+    /// does not already exceed it.
+    pub fn at_max_zoom(&self) -> bool {
+        let (Some(image), Some((left, _)), Some(viewport)) = (
+            self.state.image,
+            self.state.panes,
+            self.state.viewport.as_ref(),
+        ) else {
+            return false;
+        };
+        viewport.at_max(image, left)
+    }
+
+    /// The current viewport's visible source rect and its pane-local
+    /// projection, for `crate::gpu_canvas::CanvasRenderer::redraw` and
+    /// `ui/shell/canvas.slint`'s `FFPane` placement properties. `None`
+    /// before a project is open or before the first pane geometry arrives.
+    pub fn pane_draw(&self) -> Option<PaneDraw> {
+        let image = self.state.image?;
+        let (left, _) = self.state.panes?;
+        self.state.viewport.as_ref()?.draw(image, left)
+    }
+
+    /// Sets the loaded project's image size and clears any prior viewport --
+    /// `crate::canvas::open_project`'s own seam into `ShellState`, kept here
+    /// so it can reach the private field. The next `set_pane_geometry` call
+    /// fits a fresh viewport for the new image.
+    pub(crate) fn set_project_image(&mut self, image: ImageSize) {
+        self.state.image = Some(image);
+        self.state.viewport = None;
+    }
+
     /// The one wheel entry point. Axis normalisation first: an unmodified
-    /// `delta_x`-dominant event resolves to the same
-    /// row as `shift + delta_y`, because platforms commonly deliver a
-    /// shifted wheel as a horizontal delta with the modifier consumed.
-    pub fn wheel(&mut self, delta_x: f32, delta_y: f32, mods: Modifiers) {
+    /// `delta_x`-dominant event resolves to the same row as
+    /// `shift + delta_y`, because platforms commonly deliver a shifted
+    /// wheel as a horizontal delta with the modifier consumed.
+    /// `x`/`y` are the wheel's own cursor position -- `TouchArea` writes
+    /// `mouse-x`/`mouse-y` before `scroll-event` is invoked.
+    pub fn wheel(&mut self, delta_x: f32, delta_y: f32, x: f32, y: f32, mods: Modifiers) {
+        self.state.input.last_pointer = (x, y);
         let (trigger, steps) = if delta_x.abs() > delta_y.abs() && !mods.shift {
             (Trigger::Wheel(mods.with_shift()), delta_x)
         } else {
@@ -309,6 +540,7 @@ impl AppController {
     /// `Trigger::Drag` hit or fires once on a `Trigger::Click` hit; `Up`
     /// ends any live drag.
     pub fn pointer(&mut self, kind: PointerKind, button: Button, x: f32, y: f32, mods: Modifiers) {
+        self.state.input.last_pointer = (x, y);
         match kind {
             PointerKind::Down => {
                 let drag_trigger = Trigger::Drag { button, mods };

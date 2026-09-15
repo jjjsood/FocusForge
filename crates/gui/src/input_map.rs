@@ -206,12 +206,15 @@ impl Action {
         Action::PickSourceUnderPointer,
     ];
 
-    /// `true` for `ZoomAtCursor`, `Pan` and `PanHorizontal`;
-    /// `false` for the other seven: `StepSourceFrame`,
-    /// `OverlayOpacity`, `BrushSize`, `BrushSoftness`, `Undo`, `Redo`,
+    /// `true` for `ZoomAtCursor`, `Pan` and `PanHorizontal`; `false` for
+    /// the remaining seven: `StepSourceFrame`, `OverlayOpacity`,
+    /// `BrushSize`, `BrushSoftness`, `Undo`, `Redo`,
     /// `PickSourceUnderPointer`.
     pub fn implemented(&self) -> bool {
-        false
+        matches!(
+            self,
+            Action::ZoomAtCursor | Action::Pan | Action::PanHorizontal
+        )
     }
 }
 

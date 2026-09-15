@@ -60,6 +60,14 @@ pub enum CanvasError {
     UnsupportedDisplayFormat { got: String },
     #[error(transparent)]
     Project(#[from] ProjectStubError),
+    /// One viewport over two panes, enforced rather than assumed: a
+    /// composite and a Z-Map of different
+    /// sizes have no one rect a shared viewport could mean.
+    #[error("composite is {composite:?}, Z-Map is {zmap:?} -- both panes must share one geometry")]
+    PaneDimensionsDiffer {
+        composite: (u32, u32),
+        zmap: (u32, u32),
+    },
 }
 
 /// Refuses any format name other than [`DISPLAY_FORMAT`], by name, rather
@@ -87,16 +95,40 @@ impl AppController {
     /// Opens `path` as a project directory (`crate::project_stub::ProjectStub`
     /// -- a stub project format), naming a
     /// missing composite or Z-Map file by name rather than a generic I/O
-    /// error.
+    /// error, and refusing a composite/Z-Map size mismatch by name too
+    /// ("one viewport over two panes" is enforced, not
+    /// assumed). Sets the controller's image size and clears any prior
+    /// viewport; the next `set_pane_geometry` call fits it (`open_project`
+    /// is never handed a pane rect of its own).
     pub fn open_project(&mut self, path: &Path) -> Result<(), CanvasError> {
         let project = ProjectStub::open(path)?;
+        let composite = project.dimensions(PaneSource::Composite);
+        let zmap = project.dimensions(PaneSource::ZMap);
+        if composite != zmap {
+            return Err(CanvasError::PaneDimensionsDiffer { composite, zmap });
+        }
         self.canvas_mut().project = Some(project);
+        self.set_project_image(crate::viewport::ImageSize {
+            width: composite.0,
+            height: composite.1,
+        });
         Ok(())
     }
 
     /// The clamped visible rect the current viewport is showing for `pane`
     pub fn viewport(&self, pane: PaneSource) -> Option<Viewport> {
         let project = self.canvas().project.as_ref()?;
+        if let Some(draw) = self.pane_draw() {
+            let (x, y, width, height) = draw.src;
+            return Some(Viewport {
+                rect: Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+            });
+        }
         let (width, height) = project.dimensions(pane);
         Some(Viewport {
             rect: Rect {

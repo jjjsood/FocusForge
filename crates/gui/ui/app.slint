@@ -91,7 +91,7 @@ export component AppWindow inherits Window {
     callback zmap-undock-requested();
     // Forwarded from `FFCanvas`'s own callbacks of the same shape -- the
     // matching one-line-forward style as the two above.
-    callback canvas-scrolled(length, length, bool, bool, bool);
+    callback canvas-scrolled(length, length, length, length, bool, bool, bool);
     // `int`: `event.kind` folded to 0 = Down, 1 = Up or Cancel, 2 = Move --
     // see `ui/shell/canvas.slint`'s `canvas-pointer` declaration.
     callback canvas-pointer(PointerEventButton, int, length, length, bool, bool, bool);
@@ -101,6 +101,24 @@ export component AppWindow inherits Window {
     callback canvas-key-pressed(string, bool, bool, bool);
     callback canvas-key-released(string, bool, bool, bool);
     callback canvas-focus-changed();
+    // The one shared viewport's placement: `in`
+    // properties set from Rust on every gesture repaint, bound to **both**
+    // `FFPane`s below -- "one viewport over two panes" is structural, not a
+    // synchronisation. `canvas-resized` forwards `FFCanvas`'s own callback
+    // of the same shape; the five `out` properties mirror its geometry so
+    // `src/bridge.rs` can read them (`app.get_canvas_pane_left_x()` and
+    // friends).
+    in property <length> image-x;
+    in property <length> image-y;
+    in property <length> image-w;
+    in property <length> image-h;
+    in property <bool> pixelated;
+    callback canvas-resized();
+    out property <length> canvas-pane-left-x: canvas.pane-left-x;
+    out property <length> canvas-pane-right-x: canvas.pane-right-x;
+    out property <length> canvas-pane-left-y: canvas.pane-left-y;
+    out property <length> canvas-pane-left-width: canvas.pane-left-width;
+    out property <length> canvas-pane-left-height: canvas.pane-left-height;
 
     canvas-ground := FocusScope {
         x: 0px;
@@ -124,22 +142,28 @@ export component AppWindow inherits Window {
         }
         focus-changed-event(reason) => { root.canvas-focus-changed(); }
 
-        FFCanvas {
+        canvas := FFCanvas {
             width: 100%;
             height: 100%;
             composite-source: root.composite-source;
             zmap-source: root.zmap-source;
             undock-enabled: root.canvas-undock-enabled;
+            image-x: root.image-x;
+            image-y: root.image-y;
+            image-w: root.image-w;
+            image-h: root.image-h;
+            pixelated: root.pixelated;
 
             composite-undock-requested => { root.composite-undock-requested(); }
             zmap-undock-requested => { root.zmap-undock-requested(); }
-            canvas-scrolled(dx, dy, ctrl, shift, alt) => {
-                root.canvas-scrolled(dx, dy, ctrl, shift, alt);
+            canvas-scrolled(dx, dy, x, y, ctrl, shift, alt) => {
+                root.canvas-scrolled(dx, dy, x, y, ctrl, shift, alt);
             }
             canvas-pointer(button, kind, x, y, ctrl, shift, alt) => {
                 root.canvas-pointer(button, kind, x, y, ctrl, shift, alt);
             }
             canvas-dragged(x, y) => { root.canvas-dragged(x, y); }
+            canvas-resized => { root.canvas-resized(); }
         }
     }
 
@@ -165,14 +189,24 @@ export component AppWindow inherits Window {
     in property <string> input-provenance: "";
     callback settings-open-requested();
     callback settings-close-requested();
+    // The bottom bar's zoom cluster -- governs both panes, which is why it
+    // lives at the root rather than inside `FFPane`.
+    in property <string> zoom-readout: "";
+    callback zoom-in-requested();
+    callback zoom-out-requested();
+    callback zoom-fit-requested();
 
     bottom-bar := FFBottomBar {
         x: 0px;
         y: root.height - ShellGeometry.bottom-bar-height;
         width: root.width;
         height: ShellGeometry.bottom-bar-height;
+        zoom-readout: root.zoom-readout;
 
         settings-requested => { root.settings-open-requested(); }
+        zoom-in-requested => { root.zoom-in-requested(); }
+        zoom-out-requested => { root.zoom-out-requested(); }
+        zoom-fit-requested => { root.zoom-fit-requested(); }
     }
 
     settings-modal := FFSettingsModal {

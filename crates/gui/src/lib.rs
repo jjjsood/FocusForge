@@ -41,6 +41,11 @@ pub mod input_map;
 /// directly.
 pub mod input_config;
 
+/// The viewport as pure arithmetic: no `use slint::`, no `use wgpu::`, and no
+/// dependency on the core algorithm crate. `pub` so `tests/viewport.rs` and
+/// `src/bridge.rs`/`src/main.rs` reach its types directly.
+pub mod viewport;
+
 /// The wgpu half of the canvas: texture creation and
 /// `slint::Image::try_from`, the only module in the crate naming `wgpu` or
 /// `slint::wgpu_29`. `pub` so `src/main.rs` can drive it

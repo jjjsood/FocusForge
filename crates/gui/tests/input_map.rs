@@ -659,7 +659,7 @@ fn horizontal_wheel_resolves_as_shift_wheel() {
     let (events, cb) = sink();
     controller.set_sink(cb);
 
-    controller.wheel(12.0, 3.0, NONE); // delta_x dominant, unmodified
+    controller.wheel(12.0, 3.0, 0.0, 0.0, NONE); // delta_x dominant, unmodified
     {
         let got = events.lock().unwrap();
         assert_eq!(got.len(), 1);
@@ -674,6 +674,8 @@ fn horizontal_wheel_resolves_as_shift_wheel() {
     controller.wheel(
         0.0,
         12.0,
+        0.0,
+        0.0,
         Modifiers {
             shift: true,
             ..NONE
@@ -691,7 +693,7 @@ fn horizontal_wheel_resolves_as_shift_wheel() {
     events.lock().unwrap().clear();
 
     // delta_y-dominant is unaffected.
-    controller.wheel(1.0, 10.0, NONE);
+    controller.wheel(1.0, 10.0, 0.0, 0.0, NONE);
     let got = events.lock().unwrap();
     assert!(matches!(
         &got[0],
@@ -765,20 +767,27 @@ fn key_rows_resolve_with_their_modifiers() {
 
 #[test]
 fn unimplemented_actions_are_named_not_silent() {
+    // `ZoomAtCursor`, `Pan` and `PanHorizontal` are `implemented() == true`;
+    // every trigger below is still driven, but the
+    // assertions at the bottom now split: the three implemented actions
+    // must no longer be recorded, the remaining seven still must be, by
+    // name.
     let mut stacking = AppController::new();
     stacking.set_sink(Box::new(|_| {}));
-    stacking.wheel(0.0, 5.0, NONE); // ZoomAtCursor
-    stacking.wheel(0.0, 5.0, Modifiers { ctrl: true, ..NONE }); // StepSourceFrame
+    stacking.wheel(0.0, 5.0, 0.0, 0.0, NONE); // ZoomAtCursor -- implemented
+    stacking.wheel(0.0, 5.0, 0.0, 0.0, Modifiers { ctrl: true, ..NONE }); // StepSourceFrame
     stacking.wheel(
         0.0,
         5.0,
+        0.0,
+        0.0,
         Modifiers {
             shift: true,
             ..NONE
         },
-    ); // PanHorizontal
-    stacking.wheel(0.0, 5.0, Modifiers { alt: true, ..NONE }); // OverlayOpacity
-    stacking.pointer(PointerKind::Down, Button::Middle, 0.0, 0.0, NONE); // Pan
+    ); // PanHorizontal -- implemented
+    stacking.wheel(0.0, 5.0, 0.0, 0.0, Modifiers { alt: true, ..NONE }); // OverlayOpacity
+    stacking.pointer(PointerKind::Down, Button::Middle, 0.0, 0.0, NONE); // Pan -- implemented
     stacking.pointer(PointerKind::Up, Button::Middle, 0.0, 0.0, NONE);
     stacking.pointer(
         PointerKind::Down,
@@ -793,12 +802,14 @@ fn unimplemented_actions_are_named_not_silent() {
     editor.wheel(
         0.0,
         5.0,
+        0.0,
+        0.0,
         Modifiers {
             shift: true,
             ..NONE
         },
     ); // BrushSize
-    editor.wheel(0.0, 5.0, Modifiers { alt: true, ..NONE }); // BrushSoftness
+    editor.wheel(0.0, 5.0, 0.0, 0.0, Modifiers { alt: true, ..NONE }); // BrushSoftness
     editor.key(true, "z", Modifiers { ctrl: true, ..NONE }); // Undo
     editor.key(
         true,
@@ -813,17 +824,25 @@ fn unimplemented_actions_are_named_not_silent() {
     let mut got: Vec<Action> = stacking.unimplemented_actions().to_vec();
     got.extend_from_slice(editor.unimplemented_actions());
 
+    let implemented = [Action::ZoomAtCursor, Action::Pan, Action::PanHorizontal];
     for action in Action::ALL {
-        assert!(
-            got.contains(&action),
-            "{action} was never recorded as unimplemented"
-        );
+        if implemented.contains(&action) {
+            assert!(
+                !got.contains(&action),
+                "{action} is implemented and must not be recorded as unimplemented"
+            );
+        } else {
+            assert!(
+                got.contains(&action),
+                "{action} was never recorded as unimplemented"
+            );
+        }
     }
     got.sort_by_key(Action::to_string);
     got.dedup();
     assert_eq!(
         got.len(),
-        Action::ALL.len(),
+        Action::ALL.len() - implemented.len(),
         "no duplicates expected: {got:?}"
     );
 }

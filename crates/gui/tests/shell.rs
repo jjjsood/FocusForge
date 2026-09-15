@@ -190,6 +190,41 @@ fn checkpoint_panel_touches_no_storage() {
     }
 }
 
+/// The zoom cluster sits at the bottom bar's right end, 216 x 32,
+/// mirroring the gear's `Theme.space-3` inset at the left. It groups
+/// zoom-out/readout/zoom-in into one shared rounded surface (`zoom-group`,
+/// 120 px, no internal gaps) so they read as one control, with `Fit` kept
+/// visually separate by a full `Theme.space-4` (16 px) gap, and every icon
+/// button sized `Theme.icon-md + 2 * Theme.space-2` (32 px).
+#[test]
+fn zoom_cluster_sits_at_the_bottom_bar_right_end() {
+    let app = app_at(1440, 900);
+
+    assert_rect(
+        &app,
+        "FFBottomBar::zoom-cluster",
+        (
+            1440.0 - 12.0 - 200.0,
+            856.0 + (44.0 - 26.0) / 2.0,
+            200.0,
+            26.0,
+        ),
+    );
+
+    // Neither pane carries a zoom control of its own -- the cluster is the
+    // only place in the shell a zoom gesture's *button* form reaches.
+    // `FFPane`/`FFCanvas` (`ui/shell/canvas.slint`) declare no `FFZoomCluster`
+    // and no standalone zoom `TouchArea`; `FFZoomCluster` itself lives only
+    // in `ui/shell/bottom_bar.slint`.
+    let canvas_slint =
+        fs::read_to_string(common::ui_dir().join("shell").join("canvas.slint")).unwrap();
+    let code = common::strip_line_comments(&canvas_slint);
+    assert!(
+        !code.contains("FFZoomCluster") && !code.contains("zoom-in") && !code.contains("zoom-out"),
+        "ui/shell/canvas.slint must declare no zoom control of its own"
+    );
+}
+
 /// The maximise glyph must look different maximised than not.
 /// `ElementQuery` cannot read an `Image` element's `source` back, so this
 /// asserts the same `window-maximized`

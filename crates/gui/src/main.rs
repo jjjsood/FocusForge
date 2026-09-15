@@ -226,7 +226,7 @@ fn main() {
         run_window(sheet, &args)
     } else {
         let app = AppWindow::new().expect("failed to instantiate AppWindow");
-        let controller = bridge::install(&app);
+        let focusforge_gui::bridge::Installed { controller, canvas } = bridge::install(&app);
 
         install_input_table(&controller, &app, &args);
 
@@ -243,17 +243,31 @@ fn main() {
                 .project_paths()
                 .expect("open_project just succeeded");
 
-            let mut composite_pane = focusforge_gui::gpu_canvas::PaneTexture::default();
-            focusforge_gui::gpu_canvas::render_composite(
+            let renderer = focusforge_gui::gpu_canvas::CanvasRenderer::open(
                 shared,
-                &mut composite_pane,
                 &composite_path,
-            );
-            app.set_composite_source(composite_pane.image());
+                &zmap_path,
+            )
+            .expect("open canvas renderer");
+            *canvas.borrow_mut() = Some(renderer);
 
-            let mut zmap_pane = focusforge_gui::gpu_canvas::PaneTexture::default();
-            focusforge_gui::gpu_canvas::render_zmap(shared, &mut zmap_pane, &zmap_path);
-            app.set_zmap_source(zmap_pane.image());
+            // Push the initial pane geometry by the same read
+            // `canvas-resized` uses, so the first
+            // frame does not depend on a `changed` callback having fired,
+            // then repaint once to show it -- the `--size` timer's own
+            // resize is what proves `canvas-resized` handles the rest.
+            let left = focusforge_gui::viewport::PaneRect {
+                x: app.get_canvas_pane_left_x(),
+                y: app.get_canvas_pane_left_y(),
+                width: app.get_canvas_pane_left_width(),
+                height: app.get_canvas_pane_left_height(),
+            };
+            let right = focusforge_gui::viewport::PaneRect {
+                x: app.get_canvas_pane_right_x(),
+                ..left
+            };
+            controller.lock().unwrap().set_pane_geometry(left, right);
+            focusforge_gui::bridge::repaint(&app, &controller, &canvas);
         }
 
         run_window(app, &args)

@@ -5,6 +5,8 @@
 //! every `AppWindow` callback as a one-line forward, and performs each
 //! `ShellEvent` against the window.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use slint::ComponentHandle;
@@ -12,7 +14,9 @@ use slint::winit_030::WinitWindowAccessor;
 
 use crate::controller::{AppController, DockTab, ShellEvent, ShellMode};
 use crate::generated::AppWindow;
+use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
+use crate::viewport::PaneRect;
 
 /// `slint::platform::PointerEventButton` -> `input_map::Button` -- the only
 /// place in the crate that names the Slint type.
@@ -34,12 +38,80 @@ fn modifiers(controller: &AppController, ctrl: bool, shift: bool, alt: bool) -> 
     }
 }
 
+/// `install`'s return: the controller handle so `src/main.rs` can read the
+/// same state the window shows, and the GPU-owned renderer cell -- an
+/// `Rc<RefCell<..>>`, not held by the `Send + Sync` sink,
+/// because it holds an `Rc` and the GPU state `perform` (the sink's own
+/// path) cannot touch.
+pub struct Installed {
+    pub controller: Arc<Mutex<AppController>>,
+    pub canvas: Rc<RefCell<Option<CanvasRenderer>>>,
+}
+
+/// Reads `controller.pane_draw()`, asks `canvas` for the two re-rendered
+/// images, and sets `composite-source`/`zmap-source`, the five placement
+/// properties and `zoom-readout`. The one place a gesture becomes a
+/// repaint -- every gesture callback below ends in a call to this. A no-op
+/// while `canvas` is `None` (no project open yet).
+pub fn repaint(
+    app: &AppWindow,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Option<CanvasRenderer>>>,
+) {
+    let (draw, readout) = {
+        let controller = controller.lock().unwrap();
+        (controller.pane_draw(), controller.zoom_readout())
+    };
+    app.set_zoom_readout(readout.into());
+
+    let Some(draw) = draw else {
+        return;
+    };
+    let mut canvas = canvas.borrow_mut();
+    let Some(renderer) = canvas.as_mut() else {
+        return;
+    };
+    let (composite_image, zmap_image) = renderer.redraw(&draw);
+    app.set_composite_source(composite_image);
+    app.set_zmap_source(zmap_image);
+    app.set_image_x(draw.dst.0);
+    app.set_image_y(draw.dst.1);
+    app.set_image_w(draw.dst.2);
+    app.set_image_h(draw.dst.3);
+    app.set_pixelated(draw.pixelated);
+}
+
+/// Reads `FFCanvas`'s five geometry `out` properties (mirrored at the root)
+/// and pushes them into the controller as the two panes' current rects.
+fn read_pane_geometry(app: &AppWindow) -> (PaneRect, PaneRect) {
+    let y = app.get_canvas_pane_left_y();
+    let width = app.get_canvas_pane_left_width();
+    let height = app.get_canvas_pane_left_height();
+    (
+        PaneRect {
+            x: app.get_canvas_pane_left_x(),
+            y,
+            width,
+            height,
+        },
+        PaneRect {
+            x: app.get_canvas_pane_right_x(),
+            y,
+            width,
+            height,
+        },
+    )
+}
+
 /// Wires every callback in `app` to a fresh [`AppController`], and returns
-/// the controller handle so `main.rs` can read the same state the window
-/// shows. The sink wraps `slint::invoke_from_event_loop` so a worker
-/// thread's push and a callback's own event take the same path.
-pub fn install(app: &AppWindow) -> Arc<Mutex<AppController>> {
+/// [`Installed`] so `main.rs` can read the same state the window shows and
+/// drive the same GPU renderer cell. The sink wraps
+/// `slint::invoke_from_event_loop` so a background thread's push (a
+/// finished diagnostics write) and a callback's own event take the same
+/// path.
+pub fn install(app: &AppWindow) -> Installed {
     let controller = Arc::new(Mutex::new(AppController::new()));
+    let canvas: Rc<RefCell<Option<CanvasRenderer>>> = Rc::new(RefCell::new(None));
 
     {
         let app_weak = app.as_weak();
@@ -116,33 +188,100 @@ pub fn install(app: &AppWindow) -> Arc<Mutex<AppController>> {
     });
     app.on_canvas_scrolled({
         let controller = controller.clone();
-        move |delta_x, delta_y, ctrl, shift, alt| {
-            let mut controller = controller.lock().unwrap();
-            let mods = modifiers(&controller, ctrl, shift, alt);
-            controller.wheel(delta_x, delta_y, mods);
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |delta_x, delta_y, x, y, ctrl, shift, alt| {
+            {
+                let mut controller = controller.lock().unwrap();
+                let mods = modifiers(&controller, ctrl, shift, alt);
+                controller.wheel(delta_x, delta_y, x, y, mods);
+            }
+            if let Some(app) = app_weak.upgrade() {
+                repaint(&app, &controller, &canvas);
+            }
         }
     });
     app.on_canvas_pointer({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move |btn, kind, x, y, ctrl, shift, alt| {
-            let mut controller = controller.lock().unwrap();
-            let mods = modifiers(&controller, ctrl, shift, alt);
-            // `kind` is `ui/shell/canvas.slint`'s fold of `PointerEventKind`:
-            // 0 = Down, 1 = Up or Cancel, 2 = Move. `Move` fires on every
-            // mouse movement over the area, before `moved` -- forwarded as
-            // `PointerKind::Move` rather than folded into `Up`, which would
-            // end a live drag after zero `ActionUpdate`s.
-            let kind = match kind {
-                0 => PointerKind::Down,
-                2 => PointerKind::Move,
-                _ => PointerKind::Up,
-            };
-            controller.pointer(kind, button(btn), x, y, mods);
+            {
+                let mut controller = controller.lock().unwrap();
+                let mods = modifiers(&controller, ctrl, shift, alt);
+                // `kind` is `ui/shell/canvas.slint`'s fold of `PointerEventKind`:
+                // 0 = Down, 1 = Up or Cancel, 2 = Move. `Move` fires on every
+                // mouse movement over the area, before `moved`, and carries no
+                // motion of its own -- forwarded as `PointerKind::Move` rather
+                // than folded into `Up`, which would end a live drag on the
+                // first movement.
+                let kind = match kind {
+                    0 => PointerKind::Down,
+                    2 => PointerKind::Move,
+                    _ => PointerKind::Up,
+                };
+                controller.pointer(kind, button(btn), x, y, mods);
+            }
+            if let Some(app) = app_weak.upgrade() {
+                repaint(&app, &controller, &canvas);
+            }
         }
     });
     app.on_canvas_dragged({
         let controller = controller.clone();
-        move |x, y| controller.lock().unwrap().pointer_moved(x, y)
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |x, y| {
+            controller.lock().unwrap().pointer_moved(x, y);
+            if let Some(app) = app_weak.upgrade() {
+                repaint(&app, &controller, &canvas);
+            }
+        }
+    });
+    app.on_canvas_resized({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            if let Some(app) = app_weak.upgrade() {
+                let (left, right) = read_pane_geometry(&app);
+                controller.lock().unwrap().set_pane_geometry(left, right);
+                repaint(&app, &controller, &canvas);
+            }
+        }
+    });
+    app.on_zoom_in_requested({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().zoom_in();
+            if let Some(app) = app_weak.upgrade() {
+                repaint(&app, &controller, &canvas);
+            }
+        }
+    });
+    app.on_zoom_out_requested({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().zoom_out();
+            if let Some(app) = app_weak.upgrade() {
+                repaint(&app, &controller, &canvas);
+            }
+        }
+    });
+    app.on_zoom_fit_requested({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().fit();
+            if let Some(app) = app_weak.upgrade() {
+                repaint(&app, &controller, &canvas);
+            }
+        }
     });
     app.on_canvas_key_pressed({
         let controller = controller.clone();
@@ -185,7 +324,7 @@ pub fn install(app: &AppWindow) -> Arc<Mutex<AppController>> {
         }
     });
 
-    controller
+    Installed { controller, canvas }
 }
 
 /// Performs one [`ShellEvent`] against the window. The only function in the
