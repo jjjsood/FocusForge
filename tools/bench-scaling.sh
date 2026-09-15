@@ -37,10 +37,10 @@
 # needs (wall_seconds, max_bytes_in_flight, budget_provenance,
 # max_device_bytes_in_flight, device_budget_provenance, peak_in_flight) --
 # no new instrumentation, no cargo bench target, no new dependency. Total
-# wall-clock is minutes, not seconds, once real alignment is in the loop and
-# the frame-count axis's 32-frame points are in it too.
+# wall-clock is tens of minutes, not seconds, once real alignment and the
+# 3x frame-count grid are both in the loop.
 #
-# Exit: 0 on success (prints two curve tables), 1 if the CLI binary is
+# Exit: 0 on success (prints three curve tables), 1 if the CLI binary is
 # missing or any run fails.
 
 set -euo pipefail
@@ -66,6 +66,15 @@ run() {
     -o "$OUT/$name.tif" "$@" >"$OUT/$name.json"
 }
 
+# Same as run(), but against an explicit source directory instead of $FIXTURE
+# -- used for the frame-count axis's synthetic 16/32-frame directories.
+run_dir() {
+  local name="$1" dir="$2"
+  shift 2
+  "$CLI" stack "$dir" --algo laplacian --align-algo pyramidal-ecc --lax --json \
+    -o "$OUT/$name.tif" "$@" >"$OUT/$name.json"
+}
+
 echo "Running CPU budget sweep (6 points) against $FIXTURE ..." >&2
 run cpu-1 --no-gpu --max-host-memory 12MiB
 run cpu-2 --no-gpu --max-host-memory 24MiB
@@ -81,6 +90,28 @@ run gpu-4 --max-vram 1018646528
 run gpu-8 --max-vram 2037293056
 run gpu-16 --max-vram 4074586112
 run gpu-32 --max-vram 8149172224
+
+echo "Building synthetic 16/32-frame directories (fixtures/mantis-512's 8 real frames, duplicated) ..." >&2
+FRAMES_SRC="$FIXTURE/frames"
+for n in 16 32; do
+  dest="$OUT/frames-$n/frames"
+  mkdir -p "$dest"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    src_name=$(printf '%02d.tif' $((i % 8)))
+    dst_name=$(printf '%02d.tif' "$i")
+    cp "$FRAMES_SRC/$src_name" "$dest/$dst_name"
+    i=$((i + 1))
+  done
+done
+
+echo "Running frame-count sweep (8/16/32 frames, default adaptive budgets, CPU+GPU) ..." >&2
+run       frames-8-cpu  --no-gpu
+run       frames-8-gpu
+run_dir   frames-16-cpu "$OUT/frames-16" --no-gpu
+run_dir   frames-16-gpu "$OUT/frames-16"
+run_dir   frames-32-cpu "$OUT/frames-32" --no-gpu
+run_dir   frames-32-gpu "$OUT/frames-32"
 
 python3 - "$OUT" <<'PY'
 import json
@@ -129,7 +160,42 @@ gpu_total = print_curve(
     gpu_names, gpu_targets, "max_device_bytes_in_flight", "device_budget_provenance",
 )
 
-print(f"\ntotal wall-clock (both curves): {cpu_total + gpu_total:.2f}s")
+def print_frame_curve():
+    print("\nFrame-count curve (8/16/32 frames, default adaptive budgets)")
+    print(
+        f"{'frames':>8} {'path':>4} {'wall_seconds':>12} "
+        f"{'peak_in_flight':>14} {'budget_bytes':>14} {'backed_off':>10}"
+    )
+    total = 0.0
+    rows = []
+    for n in (8, 16, 32):
+        for path, field, prov_field in (
+            ("cpu", "max_bytes_in_flight", "budget_provenance"),
+            ("gpu", "max_device_bytes_in_flight", "device_budget_provenance"),
+        ):
+            r = load(f"frames-{n}-{path}")
+            total += r["wall_seconds"]
+            rows.append((n, path, r))
+            print(
+                f"{n:>8} {path:>4} {r['wall_seconds']:>12.3f} "
+                f"{r['peak_in_flight']:>14} {r[field]:>14} "
+                f"{str(r['backed_off']):>10}"
+            )
+    print(f"subtotal: {total:.2f}s")
+    for path in ("cpu", "gpu"):
+        first = next(r for n, p, r in rows if p == path and n == 8)
+        last = next(r for n, p, r in rows if p == path and n == 32)
+        print(
+            f"{path} peak_in_flight, 8 frames vs 32 frames: "
+            f"{first['peak_in_flight']} -> {last['peak_in_flight']} "
+            "(same fixed budget, more bytes per tile-set as frame_count grows "
+            "-- concurrency should shrink gracefully here, not collapse)"
+        )
+    return total
+
+frame_total = print_frame_curve()
+
+print(f"\ntotal wall-clock (all three curves): {cpu_total + gpu_total + frame_total:.2f}s")
 print(
     "\nSingle run each, one machine, smallest fixture in the repo -- a "
     "sanity check that the scaling is real and in the right direction, "
