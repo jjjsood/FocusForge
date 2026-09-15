@@ -56,6 +56,7 @@ pub mod checkpoint;
 pub mod container;
 pub mod error;
 pub mod manifest;
+pub mod review;
 pub mod seal;
 
 use std::fs::File;
@@ -70,6 +71,7 @@ pub use manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
     SourceResolution,
 };
+pub use review::ReviewMetrics;
 pub use seal::{SealRequest, SealedProject, seal, seal_at};
 
 use crate::tile::Rect;

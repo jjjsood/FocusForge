@@ -322,8 +322,8 @@ pub fn run(
         } else {
             dir.display().to_string()
         };
-        let result = run_group(&setup, group, &group_output, identity);
-        manifest.push(manifest_entry(group, &result));
+        let result = run_group(&setup, group, &group_output, identity.clone());
+        manifest.push(manifest_entry(group, identity, &result));
         match &result {
             GroupResult::Failed { .. } => failed = true,
             // A SIGINT stops the whole run, not one group.
@@ -336,7 +336,7 @@ pub fn run(
         }
     }
 
-    if multi && let Err(msg) = write_manifest(output, dir, manifest) {
+    if let Err(msg) = write_manifest(output, dir, manifest) {
         eprintln!("warning: {msg}");
     }
 
@@ -460,7 +460,7 @@ fn check_project_collisions(output: Option<&Path>, proposal: &Proposal) -> Resul
     Ok(())
 }
 
-fn manifest_entry(group: &Group, result: &GroupResult) -> groups::ManifestEntry {
+fn manifest_entry(group: &Group, identity: String, result: &GroupResult) -> groups::ManifestEntry {
     let (outcome, outputs, wall_seconds, error) = match result {
         GroupResult::Completed(report) => (
             "completed",
@@ -477,6 +477,7 @@ fn manifest_entry(group: &Group, result: &GroupResult) -> groups::ManifestEntry 
     };
     groups::ManifestEntry {
         name: group.name.clone(),
+        identity,
         frame_count: group.frames.len(),
         outcome: outcome.to_string(),
         outputs,
@@ -508,8 +509,10 @@ fn write_manifest(
 }
 
 /// Where [`write_manifest`] puts its document. Split out so the naming rule
-/// is unit-testable without a filesystem.
-fn manifest_path(out_dir: Option<&Path>, root: &Path) -> PathBuf {
+/// is unit-testable without a filesystem, and `pub(crate)` so
+/// `crate::review`'s beside-the-frames scan mirrors this exact rule instead
+/// of re-deriving it by hand.
+pub(crate) fn manifest_path(out_dir: Option<&Path>, root: &Path) -> PathBuf {
     match out_dir {
         Some(dir) => dir.join("manifest.json"),
         None => {

@@ -23,6 +23,7 @@ mod groups;
 mod job;
 mod preset;
 mod progress;
+mod review;
 mod set;
 mod signals;
 mod stack;
@@ -252,6 +253,20 @@ enum Command {
         #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
         gpu: bool,
     },
+    /// Report one record per result found under a directory of projects, or
+    /// a batch run's output directory: identity, outcome, sharpness ratio
+    /// and Z-Map spread, with a failed stack a visible record rather than a
+    /// missing file. Reads a run manifest when one is present, otherwise a
+    /// non-recursive listing of `*.ffproj` files; never groups frames
+    /// itself and writes nothing.
+    Review {
+        /// Directory to review: a run's `-o` output, or a plain directory of
+        /// `*.ffproj` projects.
+        dir: PathBuf,
+        /// Emit one wrapped JSON document instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -359,6 +374,7 @@ fn main() -> ExitCode {
                 no_gpu,
             )
         }
+        Command::Review { dir, json } => review::run(&dir, json),
     }
 }
 

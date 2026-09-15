@@ -454,14 +454,15 @@ fn every_run_carries_a_zmap_and_writes_no_image() {
         "--no-crop",
     ]);
     assert!(out.success, "stderr: {}", out.stderr);
-    let entries: Vec<String> = std::fs::read_dir(&dir)
+    let mut entries: Vec<String> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
+    entries.sort();
     assert_eq!(
         entries,
-        vec!["mantis-512.ffproj".to_string()],
-        "one project and nothing else -- no image, no partial: {entries:?}"
+        vec!["manifest.json".to_string(), "mantis-512.ffproj".to_string()],
+        "one project and its run manifest, nothing else -- no image, no partial: {entries:?}"
     );
     let (_, zmap) = export_both(&output);
     let (_, zw, zh, zspp) = read_whole(&zmap);

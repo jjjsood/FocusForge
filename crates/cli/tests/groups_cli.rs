@@ -745,9 +745,10 @@ fn an_output_file_and_a_zmap_are_refused_by_name() {
 }
 
 /// The committed fixture tree: one group, on the directory signal alone (no
-/// fixture frame carries a date tag), collected into `-o` as one project.
+/// fixture frame carries a date tag), collected into `-o` as one project --
+/// and a manifest too, single-group included.
 #[test]
-fn the_fixture_tree_is_one_group_and_writes_one_project() {
+fn a_one_group_run_writes_a_manifest_too() {
     let out_dir = tmp_dir("groups_cli_fixture_single");
     let result = run_cli(&[
         "stack",
@@ -776,8 +777,13 @@ fn the_fixture_tree_is_one_group_and_writes_one_project() {
             .all(|e| e.path().extension().is_none_or(|x| x != "tif")),
         "a run writes no image at all"
     );
-    assert!(
-        !out_dir.join("manifest.json").exists(),
-        "a one-group run writes no manifest"
-    );
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.join("manifest.json"))
+            .expect("a one-group run writes a manifest too"),
+    )
+    .expect("the manifest must parse");
+    assert_eq!(manifest["format"], 1);
+    let groups = manifest["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "exactly one entry for the one group");
+    assert_eq!(groups[0]["outcome"], "completed");
 }

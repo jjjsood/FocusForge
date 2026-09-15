@@ -10,6 +10,7 @@
 
 mod common;
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -24,6 +25,7 @@ use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::registry;
 use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 use focusforge_core::zmap::NO_SOURCE;
+use focusforge_core::zmap::metrics::all_eight_identical_fraction;
 
 /// One fusion run's outputs, read back from disk into plain sample
 /// buffers, plus the geometry needed to interpret them. `width`/`height`
@@ -728,7 +730,12 @@ fn spatial_coherence_fraction(zmap: &[u16], width: u32, height: u32) -> f64 {
                     *counts.entry(zmap[idx as usize]).or_insert(0) += 1;
                 }
             }
-            if let Some((&majority, _)) = counts.iter().max_by_key(|&(_, &c)| c) {
+            // Keyed by `(count, Reverse(index))` so ties resolve to the lowest index
+            // deterministically -- `HashMap` iteration order is not reproducible.
+            if let Some((&majority, _)) = counts
+                .iter()
+                .max_by_key(|&(&index, &c)| (c, Reverse(index)))
+            {
                 let idx = (y as u32 * width + x as u32) as usize;
                 if zmap[idx] == majority {
                     agree += 1;
@@ -739,52 +746,16 @@ fn spatial_coherence_fraction(zmap: &[u16], width: u32, height: u32) -> f64 {
     agree as f64 / total as f64
 }
 
-/// The fraction of pixels whose **entire** (present) 8-neighbourhood shares
-/// the pixel's own winner -- the discriminating coherence measure: a random
-/// 8-way map scores ~12.5% here, while [`spatial_coherence_fraction`]'s
-/// majority vote still passes a map that is, by this measure, noise (a
-/// prior check found 60.8% majority agreement alongside 12.6%
-/// all-8-identical). Uses the same border convention that helper already
-/// uses: an out-of-range neighbour is skipped, not counted as a mismatch,
-/// so an edge or corner pixel needs only its *present* neighbours to agree,
-/// never all 8 -- a different border rule shifts this fraction by ~0.1
-/// points, so the convention is pinned here.
-fn all_eight_neighbours_identical_fraction(zmap: &[u16], width: u32, height: u32) -> f64 {
-    let mut identical = 0usize;
-    let total = (width * height) as usize;
-    for y in 0..height as i64 {
-        for x in 0..width as i64 {
-            let center = zmap[(y as u32 * width + x as u32) as usize];
-            let mut all_match = true;
-            'neighbours: for dy in -1i64..=1 {
-                for dx in -1i64..=1 {
-                    if dx == 0 && dy == 0 {
-                        continue;
-                    }
-                    let (nx, ny) = (x + dx, y + dy);
-                    if nx < 0 || ny < 0 || nx >= width as i64 || ny >= height as i64 {
-                        continue;
-                    }
-                    let idx = ny as u32 * width + nx as u32;
-                    if zmap[idx as usize] != center {
-                        all_match = false;
-                        break 'neighbours;
-                    }
-                }
-            }
-            if all_match {
-                identical += 1;
-            }
-        }
-    }
-    identical as f64 / total as f64
-}
+/// The all-8-neighbours-identical fraction is
+/// `focusforge_core::zmap::metrics::all_eight_identical_fraction` -- this is
+/// a call site, not a second definition, and the measured number must not
+/// move.
 
 #[test]
 fn zmap_is_spatially_coherent() {
     let result = golden_result();
     let fraction = spatial_coherence_fraction(&result.zmap, result.width, result.height);
-    let all8 = all_eight_neighbours_identical_fraction(&result.zmap, result.width, result.height);
+    let all8 = all_eight_identical_fraction(&result.zmap, result.width, result.height);
     println!(
         "zmap_is_spatially_coherent: majority-agreement={fraction:.4} all-8-identical={all8:.4}"
     );
@@ -803,8 +774,7 @@ fn zmap_is_spatially_coherent() {
 #[test]
 fn zmap_neighbourhood_is_uniform_well_above_the_random_baseline() {
     let result = golden_result();
-    let fraction =
-        all_eight_neighbours_identical_fraction(&result.zmap, result.width, result.height);
+    let fraction = all_eight_identical_fraction(&result.zmap, result.width, result.height);
     println!(
         "zmap_neighbourhood_is_uniform_well_above_the_random_baseline: all-8-identical={:.4} \
          (old golden 0.1273, random baseline 0.125, target >= 0.55)",

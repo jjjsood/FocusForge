@@ -110,6 +110,12 @@ pub struct RunManifest {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ManifestEntry {
     pub name: String,
+    /// The identity the run's `--status` stream used for this group --
+    /// the group name for a multi-group run, the input directory as the
+    /// user wrote it for a single-group one. Absent reads as empty;
+    /// [`Self::identity`] then falls back to `name`.
+    #[serde(default)]
+    pub identity: String,
     pub frame_count: usize,
     /// `completed`, `failed`, `cancelled` or `dry-run` -- the same
     /// vocabulary [`crate::status::StatusRecord::outcome`] uses.
@@ -117,6 +123,18 @@ pub struct ManifestEntry {
     pub outputs: Vec<String>,
     pub wall_seconds: f64,
     pub error: Option<String>,
+}
+
+impl ManifestEntry {
+    /// The identity to report: the stored field, or [`Self::name`] when it
+    /// is empty -- a manifest written before `identity` existed.
+    pub fn identity(&self) -> &str {
+        if self.identity.is_empty() {
+            &self.name
+        } else {
+            &self.identity
+        }
+    }
 }
 
 /// The proposal as a grouping file: frames relative to `proposal.root`
