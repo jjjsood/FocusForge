@@ -40,6 +40,7 @@ struct ParamReport<'a> {
     #[serde(flatten)]
     desc: &'a ParamDesc,
     has_auto: bool,
+    has_host_default: bool,
     value: ParamValue,
     provenance: Provenance,
 }
@@ -48,11 +49,8 @@ struct ParamReport<'a> {
 /// registered algorithm and makes `--set` meaningless, which is why a
 /// non-empty `set` with no `id` is rejected before anything else runs.
 ///
-/// This is the explicit runtime check the decision allows over a clap
-/// `requires = "id"` rule: clap does not support `#[arg(...)]` attributes on
-/// a `#[command(flatten)]` field (clap-rs/clap#3269), and a `requires` rule
-/// written *inside* `SetArgs` would make a future `stack` subcommand —
-/// which has no `id` argument — abort at startup on clap's own assertion.
+/// Checked at runtime because clap cannot attach `requires = "id"` to a
+/// `#[command(flatten)]` field (clap-rs/clap#3269).
 pub fn run(id: Option<&str>, json: bool, set: &SetArgs) -> ExitCode {
     if id.is_none() && !set.set.is_empty() {
         return crate::fail("--set requires an algorithm id");
@@ -82,7 +80,10 @@ pub fn run(id: Option<&str>, json: bool, set: &SetArgs) -> ExitCode {
         None => Default::default(),
     };
 
-    let report = build_report(&entries, &explicit);
+    let report = match build_report(&entries, &explicit) {
+        Ok(report) => report,
+        Err(err) => return crate::fail(err),
+    };
 
     if json {
         match serde_json::to_string_pretty(&report) {
@@ -98,48 +99,50 @@ pub fn run(id: Option<&str>, json: bool, set: &SetArgs) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Builds the report for `entries`, resolving each parameter explicit →
-/// default only: a value present in `explicit` (keyed by parameter id) wins
-/// with [`Provenance::Explicit`], otherwise the descriptor's own default
-/// with [`Provenance::Default`]. `explicit` only ever carries settings for
-/// a single selected algorithm (`run` rejects `--set` without an id), so it
-/// cannot cross-apply to a different algorithm's parameter of the same id.
-fn build_report(entries: &[AlgorithmRef], explicit: &ParamValues) -> AlgorithmsReport<'static> {
+/// Builds the report for `entries`, resolving each parameter through
+/// [`focusforge_core::params::resolve_in`] with no `StackContext`: explicit
+/// wins, a stack `auto` hook is skipped, a host-derived default is
+/// evaluated, otherwise the descriptor's default applies. `explicit` only
+/// ever holds settings for the one selected algorithm (`run` rejects `--set`
+/// without an id).
+fn build_report(
+    entries: &[AlgorithmRef],
+    explicit: &ParamValues,
+) -> Result<AlgorithmsReport<'static>, focusforge_core::params::ParamError> {
+    let facts = focusforge_core::host::snapshot();
     let algorithms = entries
         .iter()
-        .map(|entry| AlgorithmReport {
-            id: entry.id().to_string(),
-            display_name: entry.display_name().to_string(),
-            family: entry.family().to_string(),
-            params: entry
-                .params()
-                .iter()
-                .map(|desc| {
-                    let (value, provenance) = match explicit.get(&desc.id) {
-                        Some(v) => (v.clone(), Provenance::Explicit),
-                        None => (desc.default.clone(), Provenance::Default),
-                    };
-                    ParamReport {
-                        desc,
-                        has_auto: desc.auto.is_some(),
-                        value,
-                        provenance,
-                    }
-                })
-                .collect(),
+        .map(|entry| {
+            let resolved =
+                focusforge_core::params::resolve_in(entry.params(), explicit, None, &facts)?;
+            Ok(AlgorithmReport {
+                id: entry.id().to_string(),
+                display_name: entry.display_name().to_string(),
+                family: entry.family().to_string(),
+                params: entry
+                    .params()
+                    .iter()
+                    .map(|desc| {
+                        let r = &resolved[&desc.id];
+                        ParamReport {
+                            desc,
+                            has_auto: desc.auto.is_some(),
+                            has_host_default: desc.host_default.is_some(),
+                            value: r.value.clone(),
+                            provenance: r.provenance,
+                        }
+                    })
+                    .collect(),
+            })
         })
-        .collect();
-    AlgorithmsReport { algorithms }
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AlgorithmsReport { algorithms })
 }
 
 /// One line per registered algorithm (id, display name, family), or the
 /// literal line `no algorithms registered` when nothing is registered.
-/// Takes `&[AlgorithmReport]` rather than printing directly so the empty
-/// case is unit-testable without capturing stdout. Which of the two a given
-/// process actually shows depends on whether `target/debug/focusforge-cli`
-/// was last built by `cargo build --workspace --all-targets` (pulls in
-/// `focusforge-core/test-algorithms`) or a plain `cargo build` — not on
-/// this function, which is correct either way.
+/// Returns a `String` so the empty case is unit-testable without capturing
+/// stdout.
 fn render_listing(algorithms: &[AlgorithmReport<'_>]) -> String {
     if algorithms.is_empty() {
         return "no algorithms registered".to_string();
@@ -177,6 +180,9 @@ fn render_schema(algo: &AlgorithmReport<'_>) -> String {
                 "none"
             }
         ));
+        if p.has_host_default {
+            lines.push("    host default: present, evaluated".to_string());
+        }
     }
     lines.join("\n")
 }

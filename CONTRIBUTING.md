@@ -17,7 +17,7 @@ fixtures/      small checked-in TIFF crops used by the test suite
 
 ## Tech stack
 
-Rust, edition 2024, toolchain pinned to `1.94.1` (`rust-toolchain.toml`).
+Rust, edition 2024, toolchain pinned to `1.95.0` (`rust-toolchain.toml`).
 `focusforge-core` depends on `memmap2`, `thiserror`, `inventory` (algorithm
 registration), `rayon` and `serde`; `focusforge-gpu` declares
 `wgpu = "29.0.4"`, gated behind its own `gpu` Cargo feature (off by

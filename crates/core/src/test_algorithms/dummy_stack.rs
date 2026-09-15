@@ -27,6 +27,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             auto: Some(std::sync::Arc::new(|ctx: &crate::params::StackContext| {
                 ParamValue::Float(1.0 / ctx.frame_count.max(1) as f64)
             })),
+            host_default: None,
         },
         ParamDesc {
             id: "mode".to_string(),
@@ -46,6 +47,22 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             },
             default: ParamValue::Enum("fast".to_string()),
             auto: None,
+            host_default: None,
+        },
+        ParamDesc {
+            id: "workers".to_string(),
+            label: "Workers".to_string(),
+            help: "dummy worker-count parameter, exercising a host-derived \
+                   default resolved from the host's own facts through a dedicated \
+                   seam when nothing else sets it; \
+                   no shipped algorithm declares one."
+                .to_string(),
+            kind: ParamKind::Int { min: 1, max: 1024 },
+            default: ParamValue::Int(1),
+            auto: None,
+            host_default: Some(std::sync::Arc::new(|facts: &crate::host::HostFacts| {
+                ParamValue::Int(facts.logical_cores() as i64)
+            })),
         },
     ]
 });

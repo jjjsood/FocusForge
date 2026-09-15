@@ -79,6 +79,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             kind: ParamKind::Int { min: 0, max: 16 },
             default: ParamValue::Int(SCORE_RADIUS_DEFAULT),
             auto: None,
+            host_default: None,
         },
         ParamDesc {
             id: "smoothing-radius".to_string(),
@@ -92,6 +93,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             kind: ParamKind::Int { min: 0, max: 16 },
             default: ParamValue::Int(SMOOTHING_RADIUS_DEFAULT),
             auto: None,
+            host_default: None,
         },
     ]
 });

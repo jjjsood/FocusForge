@@ -140,6 +140,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             kind: ParamKind::Int { min: 0, max: 16 },
             default: ParamValue::Int(RADIUS_DEFAULT),
             auto: None,
+            host_default: None,
         },
         ParamDesc {
             id: "weight-exponent".to_string(),
@@ -158,6 +159,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             },
             default: ParamValue::Float(WEIGHT_EXPONENT_DEFAULT),
             auto: None,
+            host_default: None,
         },
     ]
 });
@@ -521,14 +523,9 @@ mod tests {
     ///
     /// A radius-8 window over a full 0..65535 checkerboard gives a score
     /// around 1e6. At `weight-exponent = 8.0` -- the declared maximum --
-    /// `1e6^8` is about `1e48`, which is infinity in `f32` (max ~3.4e38).
-    /// Before the weight was widened to `f64` this produced `inf / inf` in
-    /// the normalisation, i.e. `NaN`, which rounds to 0: a black pixel at
-    /// the sharpest point in the image, with no error raised anywhere.
-    ///
-    /// The declared range is part of the contract, so the whole of it has
-    /// to work. This is the criterion that was missing when the range was
-    /// declared.
+    /// `1e6^8` is about `1e48`, which is infinity in `f32` (max ~3.4e38);
+    /// at that weight the declared range must not overflow to a black
+    /// pixel.
     #[test]
     fn the_top_of_the_declared_range_does_not_overflow() {
         let (w, h, spp) = (32u32, 32u32, 1u32);

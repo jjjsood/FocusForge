@@ -221,10 +221,11 @@ GeForce RTX 5070 Ti (backend=Vulkan, driver=NVIDIA, driver_info=595.84)`.)
 
 `--json` emits a report with the input frames, the resolved algorithm and
 its parameters (value and provenance — whether each came from its default,
-an explicit `--set`, or an `auto` hook), the tile geometry the scheduler
-planned, and the paths written. Like `info --json` and `algorithms --json`,
-this is a frozen shape: a field is added, never renamed or removed, in
-later versions.
+an explicit `--set`, an `auto` hook, or a host-derived default, with
+`HostFallback` when host facts were unavailable and the descriptor's own
+default was used instead), the tile geometry the scheduler planned, and the
+paths written. Like `info --json` and `algorithms --json`, this is a frozen
+shape: a field is added, never renamed or removed, in later versions.
 
 Additive fields from alignment: `output_width`/`output_height` (the actual
 output extent — equal to `width`/`height` unless a crop was applied),
@@ -405,10 +406,13 @@ Prints `<ID>`'s id, display name and family, then one block per declared
 parameter: its kind (a float or int range and step, a bool, or an enum's
 variant ids and labels), its default, the value that resolved for this
 invocation, where that value came from, and whether the parameter has an
-`auto` hook. Resolution here is explicit-over-default only — an `auto` hook
-needs a loaded stack to run against, and this subcommand loads no image, so
-a parameter with no `--set` reports its plain default and a hook is shown as
-present but not evaluated, never run.
+`auto` hook. Resolution here is explicit → `auto` (stack) → host-derived
+default → plain default — but an `auto` hook needs a loaded stack to run
+against, and this subcommand loads no image, so a *stack* `auto` hook is
+always shown as present but not evaluated, never run. A parameter with a
+host-derived default (`host_default`) is different: it needs no loaded
+image, so it *is* evaluated here, reporting `Host` — or `HostFallback` with
+the descriptor's own plain default, when host facts are unavailable.
 
 `--set key=value` sets one parameter, and is repeatable; a key set more than
 once keeps the last value. Every `--set` pair is validated against `<ID>`'s

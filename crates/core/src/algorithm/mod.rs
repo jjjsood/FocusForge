@@ -331,6 +331,7 @@ mod tests {
                 auto: Some(Arc::new(|ctx: &StackContext| {
                     ParamValue::Float(ctx.frame_count as f64)
                 })),
+                host_default: None,
             },
             ParamDesc {
                 id: "mode".to_string(),
@@ -350,6 +351,7 @@ mod tests {
                 },
                 default: ParamValue::Enum("fast".to_string()),
                 auto: None,
+                host_default: None,
             },
         ]
     });

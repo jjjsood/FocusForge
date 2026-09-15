@@ -118,6 +118,7 @@ mod tests {
                 },
                 default: ParamValue::Float(0.5),
                 auto: None,
+                host_default: None,
             },
             ParamDesc {
                 id: "i".to_string(),
@@ -126,6 +127,7 @@ mod tests {
                 kind: ParamKind::Int { min: 0, max: 10 },
                 default: ParamValue::Int(1),
                 auto: None,
+                host_default: None,
             },
             ParamDesc {
                 id: "b".to_string(),
@@ -134,6 +136,7 @@ mod tests {
                 kind: ParamKind::Bool,
                 default: ParamValue::Bool(false),
                 auto: None,
+                host_default: None,
             },
             ParamDesc {
                 id: "e".to_string(),
@@ -147,6 +150,7 @@ mod tests {
                 },
                 default: ParamValue::Enum("x".to_string()),
                 auto: None,
+                host_default: None,
             },
         ]
     }
