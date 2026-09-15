@@ -20,12 +20,13 @@ use focusforge_core::fuse::{
     BackendFusionConsumer, FusionConsumer, FusionGeometry,
     description::format_composite_description, laplacian::Laplacian,
 };
-use focusforge_core::io::{Group, Proposal, Rect, TiffStack, propose};
+use focusforge_core::io::{Group, Proposal, Rect, TiffSpec, TiffStack, propose};
 use focusforge_core::job::{
     AlignIdentity, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobOutcome, JobRecord,
     RecordingConsumer, Resumable, ResumeStore, StackFingerprint,
 };
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance, StackContext};
+use focusforge_core::project::{self, Metrics, PROJECT_EXTENSION};
 use focusforge_core::registry;
 use focusforge_core::tile::{NoopPreprocess, TileConsumer, TileScheduler, TileSchedulerOptions};
 use serde::Serialize;
@@ -151,7 +152,7 @@ pub struct DryRunAlignPlan {
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     dir: &Path,
-    output: &Path,
+    output: Option<&Path>,
     algo_id: Option<&str>,
     zmap: Option<&Path>,
     json: bool,
@@ -248,15 +249,14 @@ pub fn run(
         }
     };
 
-    // Check `--output`'s parent directory, still **before**
-    // the input directory is read at all -- a run naming both a missing
-    // input and a missing output parent must name the output parent, which
-    // `refuses_empty_dir_and_unwritable_output` pins. Group-independent:
-    // in a multi-group run `-o` is the directory every group writes into.
-    // Never `--zmap`'s parent: that path is deliberately left to
-    // `FusionConsumer::create`'s own failure, so the `.partial` cleanup is
-    // exercised by a real failure rather than a second copy of this check.
-    if let Err(msg) = check_output_parent(output) {
+    // The zmap-flag and `-o` refusals fire **before** the input directory is
+    // read at all -- a run naming both a missing input and a bad `-o` must name
+    // the `-o`, which `refuses_empty_dir_and_unwritable_output` pins. Both are
+    // group-independent, so they fire exactly once, before the first group.
+    if let Some(zmap) = zmap {
+        return refuse(zmap_flag_refusal(zmap));
+    }
+    if let Err(msg) = check_output_dir(output) {
         return refuse(msg);
     }
 
@@ -290,7 +290,7 @@ pub fn run(
     }
 
     let multi = proposal.groups.len() > 1;
-    if multi && let Err(msg) = check_multi_group_output(output, zmap, &proposal) {
+    if let Err(msg) = check_project_collisions(output, &proposal) {
         return refuse(msg);
     }
 
@@ -312,11 +312,7 @@ pub fn run(
     let mut failed = false;
     let mut cancelled = false;
     for group in &proposal.groups {
-        let (group_output, group_zmap) = if multi {
-            (group_output_path(output, group), None)
-        } else {
-            (output.to_path_buf(), zmap)
-        };
+        let group_output = project_path(output, group);
         // A single-group run keeps today's identity -- the input directory
         // as the user wrote it -- byte for byte; only a genuinely grouped
         // run keys its records by group name, which is what gives
@@ -326,7 +322,7 @@ pub fn run(
         } else {
             dir.display().to_string()
         };
-        let result = run_group(&setup, group, &group_output, group_zmap, identity);
+        let result = run_group(&setup, group, &group_output, identity);
         manifest.push(manifest_entry(group, &result));
         match &result {
             GroupResult::Failed { .. } => failed = true,
@@ -408,50 +404,43 @@ fn cancelled(status: &StatusSink, start: Instant) -> GroupResult {
     }
 }
 
-/// One group's output path inside the `-o` directory of a multi-group run:
-/// the group's own name, which the naming rule already made unique across
-/// the proposal.
-fn group_output_path(out_dir: &Path, group: &Group) -> PathBuf {
-    out_dir.join(format!("{}.tif", group.name))
+/// Where one group's project lands: inside the `-o` directory when one was
+/// given, otherwise **beside the frames** -- the directory the group's
+/// frames were enumerated from (`Group::dir`, the directory holding
+/// `frames/`, never inside it).
+///
+/// The stem is the **group name**, already unique across the proposal,
+/// already prints in the proposal and already writes into a `--groups`
+/// file. The directory basename would collide for two time-split groups in
+/// one directory, which is a normal case rather than an error.
+fn project_path(out_dir: Option<&Path>, group: &Group) -> PathBuf {
+    out_dir
+        .unwrap_or(group.dir.as_path())
+        .join(format!("{}.{}", group.name, PROJECT_EXTENSION))
 }
 
-/// 2026-09-15)`): more than one group means `-o` must name an **existing
-/// directory**, and `--zmap` -- one path for N Z-Maps -- is refused loudly
-/// rather than silently dropped. Both refusals name the groups, so the user
-/// sees what forced the change.
-fn check_multi_group_output(
-    output: &Path,
-    zmap: Option<&Path>,
-    proposal: &Proposal,
-) -> Result<(), String> {
-    let named: Vec<&str> = proposal.groups.iter().map(|g| g.name.as_str()).collect();
-    if !output.is_dir() {
-        return Err(format!(
-            "{} groups were proposed ({}), so -o must name an existing directory to write one \
-             composite per group into -- {} is not one. Point -o at a directory, or use \
-             --groups to say which frames form the single stack you meant.",
-            named.len(),
-            named.join(", "),
-            output.display()
-        ));
-    }
-    if let Some(zmap) = zmap {
-        return Err(format!(
-            "--zmap {} names one file, but {} groups were proposed ({}) -- one path cannot hold \
-             {} Z-Maps. Run one group at a time with --groups, or drop --zmap.",
-            zmap.display(),
-            named.len(),
-            named.join(", "),
-            named.len()
-        ));
-    }
-    // The naming rule makes this unreachable; it is asserted rather than
-    // trusted, because a collision would silently overwrite one group's
-    // composite with another's.
+/// The `--zmap` refusal. Loud means the message names the replacement: a
+/// removed flag is refused *quietly and unhelpfully*, by clap, as
+/// "unexpected argument '--zmap'".
+fn zmap_flag_refusal(zmap: &Path) -> String {
+    format!(
+        "a project carries its own Z-Map, so `--zmap {}` is gone from `stack`. \
+         Run `focusforge-cli export <project> --zmap {}` after the run.",
+        zmap.display(),
+        zmap.display()
+    )
+}
+
+/// Two groups must never resolve to one project path. The naming rule
+/// makes this unreachable inside a single directory; it becomes reachable
+/// the moment `-o` collapses several directories onto one, so it is
+/// asserted rather than trusted -- a collision would silently overwrite one
+/// group's project with another's.
+fn check_project_collisions(output: Option<&Path>, proposal: &Proposal) -> Result<(), String> {
     let mut paths: Vec<PathBuf> = proposal
         .groups
         .iter()
-        .map(|g| group_output_path(output, g))
+        .map(|g| project_path(output, g))
         .collect();
     paths.sort();
     let unique = {
@@ -460,10 +449,12 @@ fn check_multi_group_output(
         copy.len()
     };
     if unique != paths.len() {
+        let named: Vec<&str> = proposal.groups.iter().map(|g| g.name.as_str()).collect();
         return Err(format!(
-            "two groups resolve to the same output path under {} -- refusing rather than \
-             overwriting one group's composite with another's",
-            output.display()
+            "two of the {} proposed groups ({}) resolve to the same project path -- refusing \
+             rather than overwriting one group's project with another's",
+            named.len(),
+            named.join(", ")
         ));
     }
     Ok(())
@@ -494,12 +485,14 @@ fn manifest_entry(group: &Group, result: &GroupResult) -> groups::ManifestEntry 
     }
 }
 
-/// The run-level manifest, into the `-o` directory of a multi-group run.
-/// A write failure warns rather than failing the run, for the reason
-/// `StatusSink::emit` gives: an artifact that could not be written must not
-/// turn completed stacks into failed ones.
+/// The run-level manifest, written for every run, single-group included.
+/// With `-o <dir>` it goes to `<dir>/manifest.json`; without `-o`, projects
+/// may land in several directories, so it goes to the input root as
+/// `<root-basename>-run.json` (a name that cannot collide with a project).
+/// A write failure warns rather than failing the run: a missing manifest
+/// must never read as a missing failure.
 fn write_manifest(
-    out_dir: &Path,
+    out_dir: Option<&Path>,
     root: &Path,
     entries: Vec<groups::ManifestEntry>,
 ) -> Result<(), String> {
@@ -508,10 +501,26 @@ fn write_manifest(
         root: root.display().to_string(),
         groups: entries,
     };
-    let path = out_dir.join("manifest.json");
+    let path = manifest_path(out_dir, root);
     let text = serde_json::to_string_pretty(&manifest)
         .map_err(|err| format!("{}: serializing the manifest: {err}", path.display()))?;
     std::fs::write(&path, text).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+/// Where [`write_manifest`] puts its document. Split out so the naming rule
+/// is unit-testable without a filesystem.
+fn manifest_path(out_dir: Option<&Path>, root: &Path) -> PathBuf {
+    match out_dir {
+        Some(dir) => dir.join("manifest.json"),
+        None => {
+            let base = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "run".to_string());
+            root.join(format!("{base}-run.json"))
+        }
+    }
 }
 
 /// Prints whatever the run produced: for **one** group exactly today's
@@ -583,13 +592,7 @@ fn print_document<T: Serialize>(value: &T, json: bool, human: fn(&T) -> String) 
 /// assertion is per instance, so one record per group), one
 /// `ProgressRenderer`, and one `Instant` -- so `wall_seconds` stays per
 /// stack rather than per run.
-fn run_group(
-    setup: &RunSetup<'_>,
-    group: &Group,
-    output: &Path,
-    zmap: Option<&Path>,
-    identity: String,
-) -> GroupResult {
+fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: String) -> GroupResult {
     let RunSetup {
         algo,
         backend,
@@ -653,18 +656,6 @@ fn run_group(
             format!(
                 "output path {} is also an input frame ({name})",
                 output.display()
-            ),
-        );
-    }
-    if let Some(zmap) = zmap
-        && let Some(name) = colliding_frame(zmap, &paths, &frame_names)
-    {
-        return failed(
-            &status,
-            start,
-            format!(
-                "--zmap path {} is also an input frame ({name})",
-                zmap.display()
             ),
         );
     }
@@ -805,10 +796,8 @@ fn run_group(
             Err(err) => return failed(&status, start, err),
         };
         let geometry = scheduler.plan();
-        let mut would_write = vec![output.display().to_string()];
-        if let Some(zmap) = zmap {
-            would_write.push(zmap.display().to_string());
-        }
+        // One project, and nothing else: a run writes no image at all.
+        let would_write = vec![output.display().to_string()];
         let plan = DryRunPlan {
             dry_run: true,
             input: dir.display().to_string(),
@@ -1013,12 +1002,42 @@ fn run_group(
         Err(err) => return failed(&status, start, err),
     };
 
-    // Step 10: `.partial` discipline -- create both writers on partial
-    // paths, run, finish, then rename onto the names the user gave. Any
-    // failure from here on removes both partials (best effort) and leaves
-    // nothing at either named path.
-    let composite_partial = partial_path(output);
-    let zmap_partial = zmap.map(partial_path);
+    // Step 10: the staging area. Fusion still writes two TIFFs -- a project
+    // cannot be written tile by tile, because a blob's entry name *is* the
+    // content hash of the finished plane and zstd has no seekable format --
+    // and the project is sealed from them once the job completes.
+    //
+    // They live under `.scratch/`, never beside the target: `propose`'s walk
+    // descends into every subdirectory, so a staging *directory* left beside
+    // the frames by an interrupted run would be proposed as an extra group
+    // on the next run. Only the sealed container's `.partial` file sits
+    // beside the target, and a `.partial` file is invisible to that walk
+    // (`frame_paths` filters `*.tif`/`*.tiff`).
+    //
+    // The key is the group name plus a short digest of the project path it
+    // will seal into. It must be stable across runs or `--resume` cannot
+    // find its ledger (`ResumeStore::find` skips a candidate whose
+    // `composite_output` no longer exists) -- the same invocation always
+    // produces the same key. The digest is what keeps two *different* runs
+    // that happen to propose the same group name apart: with the name
+    // alone, two runs collecting into two different `-o` directories would
+    // fight over one staging directory, which is not a collision the user
+    // asked for. With it, two runs collide exactly when they already share
+    // an output path.
+    let staging = Path::new(".scratch/projects").join(format!(
+        "{}-{}",
+        group.name,
+        project::short_hash(&output.display().to_string())
+    ));
+    if let Err(err) = std::fs::create_dir_all(&staging) {
+        return failed(
+            &status,
+            start,
+            format!("creating {}: {err}", staging.display()),
+        );
+    }
+    let staged_composite = staging.join("composite.tif");
+    let staged_zmap = staging.join("zmap.tif");
 
     let geometry = FusionGeometry {
         width,
@@ -1028,6 +1047,15 @@ fn run_group(
         crop: applied_crop,
         description: description.clone(),
     };
+
+    // Resolved **here**, in one place: the exact `ImageDescription` the
+    // staged composite carries, so the manifest records it and `export`
+    // re-emits a byte-identical file. `None` is `TiffWriter`'s own default,
+    // and guessing at that string rather than asking for it is how the two
+    // drift apart.
+    let composite_description = description
+        .clone()
+        .unwrap_or_else(TiffSpec::default_description);
 
     // Resolved once: the ledger's identity and the report's `backend` field
     // are the same fact, and a resume that compared a differently-spelled
@@ -1055,8 +1083,8 @@ fn run_group(
         backend: backend_id.clone(),
         align: align_identity,
         crop: applied_crop,
-        composite_output: composite_partial.clone(),
-        zmap_output: zmap_partial.clone(),
+        composite_output: staged_composite.clone(),
+        zmap_output: Some(staged_zmap.clone()),
     };
     let resume_store = match ResumeStore::open(Path::new(".scratch")) {
         Ok(store) => store,
@@ -1112,7 +1140,7 @@ fn run_group(
         && let Some((_, result, _, _)) = &alignment_result
         && let Err(err) = ledger.record_alignment(result)
     {
-        cleanup_partials(&composite_partial, zmap_partial.as_deref());
+        cleanup_staging(&staging);
         let _ = ledger.discard();
         return failed(&status, start, err.to_string());
     }
@@ -1128,13 +1156,13 @@ fn run_group(
             ledger.completed(),
             algo,
             values.clone(),
-            &composite_partial,
-            zmap_partial.as_deref(),
+            &staged_composite,
+            Some(&staged_zmap),
             geometry.clone(),
         ) {
             Ok((sink, surviving)) => (sink, Some(surviving)),
             Err(err) => {
-                cleanup_partials(&composite_partial, zmap_partial.as_deref());
+                cleanup_staging(&staging);
                 let _ = ledger.discard();
                 return failed(&status, start, err);
             }
@@ -1143,13 +1171,13 @@ fn run_group(
         match FusionConsumer::create(
             algo,
             values.clone(),
-            &composite_partial,
-            zmap_partial.as_deref(),
+            &staged_composite,
+            Some(&staged_zmap),
             geometry,
         ) {
             Ok(sink) => (sink, None),
             Err(err) => {
-                cleanup_partials(&composite_partial, zmap_partial.as_deref());
+                cleanup_staging(&staging);
                 let _ = ledger.discard();
                 return failed(&status, start, err);
             }
@@ -1199,7 +1227,7 @@ fn run_group(
             // A genuine error: `Job::run` already called `consumer.abort()`
             // on this exact path, so `consumer.finish()` must never be
             // attempted here.
-            cleanup_partials(&composite_partial, zmap_partial.as_deref());
+            cleanup_staging(&staging);
             let _ = ledger.discard();
             return failed(&status, start, err);
         }
@@ -1250,48 +1278,56 @@ fn run_group(
     let peak_in_flight = in_flight_limit;
 
     if let Err(err) = sink.finish() {
-        cleanup_partials(&composite_partial, zmap_partial.as_deref());
+        cleanup_staging(&staging);
         let _ = ledger.discard();
         return failed(&status, start, err);
     }
 
-    if let Err(err) = std::fs::rename(&composite_partial, output) {
-        cleanup_partials(&composite_partial, zmap_partial.as_deref());
-        let _ = ledger.discard();
-        return failed(
-            &status,
-            start,
-            format!(
-                "renaming {} to {}: {err}",
-                composite_partial.display(),
-                output.display()
+    // Step 11: seal the two staged planes into one project. This is where
+    // the two renames used to be: same seam, same failure posture -- any
+    // error cleans the staging directory, discards the ledger and fails the
+    // group, leaving neither a project at the named path nor a `.partial`
+    // beside it.
+    renderer.stage("seal project");
+    let metrics = measure_metrics(&staged_composite, &paths);
+    let sealed = project::seal(project::SealRequest {
+        project_path: output,
+        staged_composite: &staged_composite,
+        staged_zmap: &staged_zmap,
+        sources: &paths,
+        algorithm: algo.id(),
+        params: &values,
+        align: alignment_result
+            .as_ref()
+            .map(
+                |(align_algo, result, align_values, _)| project::AlignRecord {
+                    algorithm: align_algo.id().to_string(),
+                    params: align_values.clone(),
+                    reference: result.reference,
+                },
             ),
-        );
-    }
-    if let (Some(zmap_partial), Some(zmap)) = (&zmap_partial, zmap)
-        && let Err(err) = std::fs::rename(zmap_partial, zmap)
-    {
-        let _ = std::fs::remove_file(zmap_partial);
-        let _ = ledger.discard();
-        return failed(
-            &status,
-            start,
-            format!(
-                "renaming {} to {}: {err}",
-                zmap_partial.display(),
-                zmap.display()
-            ),
-        );
-    }
+        composite_description,
+        label: None,
+        metrics,
+    });
+    let sealed = match sealed {
+        Ok(sealed) => sealed,
+        Err(err) => {
+            cleanup_staging(&staging);
+            let _ = ledger.discard();
+            return failed(&status, start, err);
+        }
+    };
+    cleanup_staging(&staging);
     if let Err(err) = ledger.discard() {
         return failed(&status, start, err.to_string());
     }
+    // The completion line stays a fixed sentence: it is
+    // what `job_cli.rs` watches for, and a measured number belongs in the
+    // report and the manifest rather than in a line a test matches on.
     renderer.finish("stack complete");
 
-    let mut outputs = vec![output.display().to_string()];
-    if let Some(zmap) = zmap {
-        outputs.push(zmap.display().to_string());
-    }
+    let outputs = vec![sealed.path.display().to_string()];
     status.completed(&outputs);
 
     let align_report = alignment_result.map(|(align_algo, result, _values, params)| {
@@ -1347,6 +1383,81 @@ fn run_group(
     };
 
     GroupResult::Completed(Box::new(report))
+}
+
+/// The sharpness window's maximum side. A whole-plane Laplacian variance is
+/// not computable here: `laplacian_variance` is whole-buffer and
+/// `crates/core/src/io` forbids assembling a whole frame from tiles, and
+/// "max over every source frame" at whole-frame size would mean a second
+/// full stack read per run. A named central window is what the manifest
+/// records instead, honestly, beside the numbers.
+const LAPVAR_WINDOW: u32 = 2048;
+
+/// The composite's and the sharpest source frame's Laplacian variance over
+/// one **central window**, measured identically on both so the ratio
+/// `review` divides stays meaningful.
+///
+/// Bounded memory (~100 MB at 2048x2048x3) and exactly one tile read per
+/// source frame. Every failure is silence rather than a refusal: a metric
+/// that could not be measured must not turn a completed stack into a
+/// failed one, and `Option` is what says so in the manifest.
+fn measure_metrics(composite: &Path, sources: &[PathBuf]) -> Metrics {
+    let Ok(stack) = TiffStack::open_files(std::slice::from_ref(&composite.to_path_buf())) else {
+        return Metrics::default();
+    };
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let side_w = LAPVAR_WINDOW.min(width);
+    let side_h = LAPVAR_WINDOW.min(height);
+    let window = centered(width, height, side_w, side_h);
+    let composite_lapvar = lapvar(&stack, window, spp);
+
+    // Sequentially, one frame at a time: each open maps that frame, and 61
+    // concurrent mappings would exceed an 8 GB ceiling.
+    let mut max_input_lapvar: Option<f64> = None;
+    for path in sources {
+        let Ok(frame) = TiffStack::open_files(std::slice::from_ref(path)) else {
+            continue;
+        };
+        let (fw, fh) = frame.dimensions();
+        if fw < side_w || fh < side_h {
+            continue;
+        }
+        let fspp = frame.header(0).samples_per_pixel;
+        let rect = centered(fw, fh, side_w, side_h);
+        if let Some(value) = lapvar(&frame, rect, fspp) {
+            max_input_lapvar = Some(max_input_lapvar.map_or(value, |m: f64| m.max(value)));
+        }
+    }
+
+    Metrics {
+        composite_lapvar,
+        max_input_lapvar,
+        lapvar_window: composite_lapvar.map(|_| window),
+    }
+}
+
+/// The `side_w` x `side_h` rect centred in a `width` x `height` plane.
+fn centered(width: u32, height: u32, side_w: u32, side_h: u32) -> Rect {
+    Rect {
+        x: (width - side_w) / 2,
+        y: (height - side_h) / 2,
+        width: side_w,
+        height: side_h,
+    }
+}
+
+/// `laplacian_variance` over one window of frame 0 of `stack`, or `None`
+/// when that window cannot be read.
+fn lapvar(stack: &TiffStack, rect: Rect, spp: u32) -> Option<f64> {
+    let mut samples = vec![0u16; rect.width as usize * rect.height as usize * spp as usize];
+    stack.read_tile_into(0, rect, &mut samples).ok()?;
+    Some(focusforge_core::fuse::metrics::laplacian_variance(
+        &samples,
+        rect.width,
+        rect.height,
+        spp,
+    ))
 }
 
 /// An all-identity [`StackAlignment`] over `frame_count` frames: what
@@ -1433,48 +1544,49 @@ fn peek_resumable_crop_and_alignment(
     None
 }
 
-/// `<path>.partial`: appends the suffix to the path's own file name, in the
-/// same directory as `path`, so the eventual rename is same-filesystem and
-/// atomic by construction.
-fn partial_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    name.push(".partial");
-    path.with_file_name(name)
+/// Best-effort removal of one group's staging directory and both staged
+/// planes. Never fails the caller: a missing directory (the common case,
+/// when nothing was created yet) is not itself an error.
+///
+/// Called on **failure** and on success, never on cancel: a cancelled run
+/// deliberately keeps its staged planes *and* its ledger so `--resume` can
+/// continue.
+fn cleanup_staging(staging: &Path) {
+    let _ = std::fs::remove_dir_all(staging);
 }
 
-/// Best-effort cleanup of both partial files. Never fails the caller: a
-/// missing partial (the common case, when nothing was created yet) is not
-/// itself an error.
-fn cleanup_partials(composite_partial: &Path, zmap_partial: Option<&Path>) {
-    let _ = std::fs::remove_file(composite_partial);
-    if let Some(zmap_partial) = zmap_partial {
-        let _ = std::fs::remove_file(zmap_partial);
-    }
-}
-
-/// Refuses when `output`'s parent does not exist or is not a directory.
-/// Never creates it. Without this check, `TiffWriter::create` surfaces a
-/// bare `ENOENT` from inside the run, after tiles have been read.
-fn check_output_parent(output: &Path) -> Result<(), String> {
-    let parent = output.parent().filter(|p| !p.as_os_str().is_empty());
-    let parent = match parent {
-        Some(parent) => parent,
-        None => return Ok(()),
+/// Refuses an `-o` that is not an existing directory.
+///
+/// `-o` names the directory a run's projects are **collected into**, not a
+/// file path. A path that looks like an image gets an export hint pointing
+/// at `focusforge-cli export`; every non-directory path is refused loudly,
+/// by name -- never by letting `TiffWriter::create` surface a bare `ENOENT`
+/// from inside the run after tiles have been read. Never creates the
+/// directory.
+fn check_output_dir(output: Option<&Path>) -> Result<(), String> {
+    let Some(output) = output else {
+        return Ok(());
     };
-    match std::fs::metadata(parent) {
-        Ok(meta) if meta.is_dir() => Ok(()),
-        Ok(_) => Err(format!(
-            "output directory {} is not a directory",
-            parent.display()
-        )),
-        Err(_) => Err(format!(
-            "output directory {} does not exist",
-            parent.display()
-        )),
+    if output.is_dir() {
+        return Ok(());
     }
+    let looks_like_an_image = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"));
+    let mut message = format!(
+        "-o names the directory this run's projects are collected into -- {} is not an \
+         existing directory. Point -o at a directory, or omit it to write each project beside \
+         its own frames.",
+        output.display()
+    );
+    if looks_like_an_image {
+        message.push_str(
+            " A stacking run no longer writes an image: run \
+             `focusforge-cli export <project> -o <file>` afterwards.",
+        );
+    }
+    Err(message)
 }
 
 /// The file name of the first entry of `frame_paths`/`frame_names` whose
@@ -1600,7 +1712,7 @@ mod tests {
             frame_tiles_read: 32,
             in_flight_limit: 5,
             peak_in_flight: 4,
-            outputs: vec!["out.tif".to_string(), "out-zmap.tif".to_string()],
+            outputs: vec!["mantis-512.ffproj".to_string()],
             wall_seconds: 1.5,
             output_width: 512,
             output_height: 512,
@@ -1627,8 +1739,7 @@ mod tests {
             "margin=96",
             "tiles=4",
             "in_flight_limit=5",
-            "wrote: out.tif",
-            "wrote: out-zmap.tif",
+            "wrote: mantis-512.ffproj",
             "wall: 1.500s",
             "backend: cpu",
         ] {
@@ -1637,11 +1748,34 @@ mod tests {
     }
 
     #[test]
-    fn partial_path_appends_the_suffix_to_the_file_name() {
+    fn the_run_manifest_goes_beside_the_frames_without_o() {
         assert_eq!(
-            partial_path(Path::new("/tmp/out.tif")),
-            Path::new("/tmp/out.tif.partial")
+            manifest_path(None, Path::new("/shoot/mantis")),
+            Path::new("/shoot/mantis/mantis-run.json")
         );
+        assert_eq!(
+            manifest_path(Some(Path::new("/out")), Path::new("/shoot/mantis")),
+            Path::new("/out/manifest.json")
+        );
+    }
+
+    #[test]
+    fn an_output_file_path_is_refused_by_name() {
+        let message = check_output_dir(Some(Path::new("out.tif"))).unwrap_err();
+        assert!(message.contains("export"), "{message}");
+        assert!(message.contains("out.tif"), "{message}");
+        // A non-image path that is not a directory is still refused, just
+        // without the migration sentence.
+        let plain = check_output_dir(Some(Path::new("/definitely/not/here"))).unwrap_err();
+        assert!(!plain.contains("export"), "{plain}");
+        assert!(check_output_dir(None).is_ok(), "omitting -o is legal");
+    }
+
+    #[test]
+    fn the_zmap_refusal_names_the_replacement() {
+        let message = zmap_flag_refusal(Path::new("map.tif"));
+        assert!(message.contains("focusforge-cli export"), "{message}");
+        assert!(message.contains("--zmap map.tif"), "{message}");
     }
 
     #[test]

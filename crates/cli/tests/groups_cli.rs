@@ -173,12 +173,15 @@ fn single_stack_directory_matches_the_plain_invocation() {
     ] {
         frame(&dir, file, Some(when));
     }
-    let grouped = dir.join("grouped.tif");
+    // The project is named after the **group**, and this directory's frames
+    // share no basename range, so the naming rule falls back to the
+    // directory's own basename.
+    let grouped = dir.join("groups_cli_single_stack.ffproj");
     let result = run_cli(&[
         "stack",
         dir.to_str().unwrap(),
         "-o",
-        grouped.to_str().unwrap(),
+        dir.to_str().unwrap(),
         "--algo",
         "dummy-stack",
         "--json",
@@ -194,7 +197,7 @@ fn single_stack_directory_matches_the_plain_invocation() {
     assert_eq!(
         report["outputs"][0],
         grouped.to_str().unwrap(),
-        "a one-group run writes to -o exactly as before"
+        "a one-group run writes its project into -o exactly as a many-group run does"
     );
     assert!(
         report.get("groups").is_none(),
@@ -242,10 +245,25 @@ fn single_stack_directory_matches_the_plain_invocation() {
     consumer.finish().expect("finish must succeed");
 
     assert_eq!(
-        read_whole(&grouped),
+        read_whole(&export_composite(&grouped)),
         read_whole(&plain),
         "a grouped one-stack run must produce the same composite, byte for byte"
     );
+}
+
+/// The composite of `project`, exported beside it -- the comparison a
+/// container makes necessary: what must be preserved is the payload, never
+/// the envelope.
+fn export_composite(project: &Path) -> PathBuf {
+    let exported = project.with_extension("exported.tif");
+    let out = run_cli(&[
+        "export",
+        project.to_str().unwrap(),
+        "-o",
+        exported.to_str().unwrap(),
+    ]);
+    assert!(out.success, "export stderr: {}", out.stderr);
+    exported
 }
 
 // --- the grouping file -----------------------------------------------------
@@ -333,12 +351,12 @@ fn groups_file_overrides_the_proposal() {
     )
     .unwrap();
 
-    let output = out_dir.join("out.tif");
+    let output = out_dir.join("everything.ffproj");
     let result = run_cli(&[
         "stack",
         dump.to_str().unwrap(),
         "-o",
-        output.to_str().unwrap(),
+        out_dir.to_str().unwrap(),
         "--algo",
         "dummy-stack",
         "--no-align",
@@ -374,7 +392,7 @@ fn groups_file_with_a_missing_frame_is_refused() {
         "stack",
         dump.to_str().unwrap(),
         "-o",
-        out_dir.join("out.tif").to_str().unwrap(),
+        out_dir.to_str().unwrap(),
         "--algo",
         "dummy-stack",
         "--no-align",
@@ -407,7 +425,7 @@ fn groups_file_duplicate_or_orphan_frame_is_refused() {
         "stack",
         dump.to_str().unwrap(),
         "-o",
-        out_dir.join("out.tif").to_str().unwrap(),
+        out_dir.to_str().unwrap(),
         "--algo",
         "dummy-stack",
         "--no-align",
@@ -432,7 +450,7 @@ fn groups_file_duplicate_or_orphan_frame_is_refused() {
         "stack",
         dump.to_str().unwrap(),
         "-o",
-        out_dir.join("out.tif").to_str().unwrap(),
+        out_dir.to_str().unwrap(),
         "--algo",
         "dummy-stack",
         "--no-align",
@@ -455,7 +473,7 @@ fn empty_directory_fails_clearly() {
         "stack",
         dir.to_str().unwrap(),
         "-o",
-        dir.join("out.tif").to_str().unwrap(),
+        dir.to_str().unwrap(),
         "--algo",
         "dummy-stack",
         "--no-align",
@@ -515,8 +533,9 @@ fn status_and_manifest_have_one_entry_per_group() {
     assert_eq!(manifest["groups"][0]["frame_count"], 2);
     assert_eq!(manifest["groups"][0]["outcome"], "completed");
     assert!(
-        out_dir.join("IMG_9801-9802.tif").is_file() && out_dir.join("IMG_9910-9911.tif").is_file(),
-        "each group's composite is named after the group"
+        out_dir.join("IMG_9801-9802.ffproj").is_file()
+            && out_dir.join("IMG_9910-9911.ffproj").is_file(),
+        "each group's project is named after the group"
     );
 }
 
@@ -551,7 +570,7 @@ fn a_failing_group_does_not_abort_the_run() {
     assert!(!result.success, "one group failed, so the run exits 1");
     assert_eq!(result.code, Some(1));
     assert!(
-        out_dir.join("IMG_9801-9802.tif").is_file(),
+        out_dir.join("IMG_9801-9802.ffproj").is_file(),
         "the healthy group must still have been written"
     );
 
@@ -647,7 +666,7 @@ fn json_shape_is_unchanged_for_one_group_and_wrapped_for_many() {
         "stack",
         single.to_str().unwrap(),
         "-o",
-        single.join("out.tif").to_str().unwrap(),
+        single.to_str().unwrap(),
         "--algo",
         "dummy-stack",
         "--no-align",
@@ -663,14 +682,13 @@ fn json_shape_is_unchanged_for_one_group_and_wrapped_for_many() {
     );
 }
 
-/// `-o` is a
-/// project-writing **directory** for every proposal size, and the two old
+/// `-o` is a project-writing **directory** for every proposal size, and the two
 /// spellings -- `-o <file>` and `--zmap <file>` -- are refused **by name**,
 /// with the migration sentence, rather than by clap's generic
 /// "unexpected argument". Both refusals are group-independent, so they fire
 /// before the grouping is even computed.
 #[test]
-fn multi_group_refuses_a_file_output_and_a_zmap() {
+fn an_output_file_and_a_zmap_are_refused_by_name() {
     let dump = card_dump("groups_cli_output_placement");
     let out_dir = tmp_dir("groups_cli_output_placement_out");
 
@@ -684,15 +702,20 @@ fn multi_group_refuses_a_file_output_and_a_zmap() {
         "--no-align",
     ]);
     assert!(!as_file.success);
-    assert_eq!(as_file.code, Some(1));
-    assert!(
-        as_file.stderr.contains("IMG_9801-9802") && as_file.stderr.contains("IMG_9910-9911"),
-        "the refusal must name both groups: {}",
-        as_file.stderr
-    );
+    assert_eq!(as_file.code, Some(1), "never clap's exit 2");
     assert!(
         as_file.stderr.contains("existing directory"),
         "the refusal must say what -o has to be: {}",
+        as_file.stderr
+    );
+    assert!(
+        as_file.stderr.contains("focusforge-cli export"),
+        "an -o <file> refusal must name the replacement: {}",
+        as_file.stderr
+    );
+    assert!(
+        !as_file.stderr.contains("grouping "),
+        "the refusal fires before the grouping is computed: {}",
         as_file.stderr
     );
 
@@ -708,26 +731,29 @@ fn multi_group_refuses_a_file_output_and_a_zmap() {
         "--no-align",
     ]);
     assert!(!with_zmap.success);
+    assert_eq!(with_zmap.code, Some(1));
     assert!(
-        with_zmap.stderr.contains("--zmap") && with_zmap.stderr.contains("2 groups"),
-        "--zmap must be refused loudly, not silently dropped: {}",
+        with_zmap.stderr.contains("focusforge-cli export") && with_zmap.stderr.contains("--zmap"),
+        "--zmap must be refused loudly, naming its replacement: {}",
+        with_zmap.stderr
+    );
+    assert!(
+        !with_zmap.stderr.contains("unexpected argument"),
+        "clap's generic refusal tells a user nothing: {}",
         with_zmap.stderr
     );
 }
 
 /// The committed fixture tree: one group, on the directory signal alone (no
-/// fixture frame carries a date tag), `-o <file>` and `--zmap <file>` both
-/// still working exactly as before.
+/// fixture frame carries a date tag), collected into `-o` as one project.
 #[test]
-fn the_fixture_tree_is_one_group_and_keeps_its_file_outputs() {
+fn the_fixture_tree_is_one_group_and_writes_one_project() {
     let out_dir = tmp_dir("groups_cli_fixture_single");
     let result = run_cli(&[
         "stack",
         common::fixtures_dir().join("mantis-512").to_str().unwrap(),
         "-o",
-        out_dir.join("out.tif").to_str().unwrap(),
-        "--zmap",
-        out_dir.join("zmap.tif").to_str().unwrap(),
+        out_dir.to_str().unwrap(),
         "--algo",
         "dummy-stack",
         "--no-align",
@@ -739,7 +765,17 @@ fn the_fixture_tree_is_one_group_and_keeps_its_file_outputs() {
         "a `frames/` layout is one stack, `golden/` beside it is not a second: {}",
         result.stderr
     );
-    assert!(out_dir.join("out.tif").is_file() && out_dir.join("zmap.tif").is_file());
+    assert!(
+        out_dir.join("mantis-512.ffproj").is_file(),
+        "the project is named after the group, which falls back to the directory basename"
+    );
+    assert!(
+        std::fs::read_dir(&out_dir)
+            .unwrap()
+            .flatten()
+            .all(|e| e.path().extension().is_none_or(|x| x != "tif")),
+        "a run writes no image at all"
+    );
     assert!(
         !out_dir.join("manifest.json").exists(),
         "a one-group run writes no manifest"

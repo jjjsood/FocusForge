@@ -16,6 +16,7 @@ use serde::Serialize;
 
 mod algorithms;
 mod align;
+mod export;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod groups;
@@ -87,15 +88,20 @@ enum Command {
         /// Directory of TIFF frames to fuse (non-recursive, descending into
         /// `<dir>/frames` when that subdirectory exists).
         dir: PathBuf,
-        /// Composite output path.
-        #[arg(short = 'o', long = "output")]
-        output: PathBuf,
+        /// Directory to collect this run's projects into. Omit to write
+        /// each project beside its own frames.
+        #[arg(short = 'o', long = "output", value_name = "DIR")]
+        output: Option<PathBuf>,
         /// Registered stacking algorithm id. Required, but never a clap
         /// `required` field.
         #[arg(long)]
         algo: Option<String>,
-        /// Z-Map output path. Omit to write no Z-Map file for this run.
-        #[arg(long)]
+        /// Gone: a project carries its own Z-Map. Still **declared**, and
+        /// hidden, purely so `stack::run` can refuse it by name and point
+        /// at `focusforge-cli export` -- removing it outright would leave
+        /// clap printing "unexpected argument '--zmap'", which tells a user
+        /// nothing about where their Z-Map went.
+        #[arg(long, hide = true)]
         zmap: Option<PathBuf>,
         /// Emit the frozen JSON report instead of human-readable text.
         #[arg(long)]
@@ -175,6 +181,23 @@ enum Command {
         #[cfg(feature = "gpu")]
         #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
         gpu: bool,
+    },
+    /// Turn a project into an image file: the composite with `-o`, the
+    /// Z-Map with `--zmap`, either or both in one invocation. At least one
+    /// of the two is required. This is the only thing in the workspace that
+    /// writes a TIFF from a stack result.
+    Export {
+        /// The `.ffproj` project to read.
+        project: PathBuf,
+        /// Write the composite to this path.
+        #[arg(short = 'o', long = "output", value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Write the Z-Map to this path.
+        #[arg(long, value_name = "FILE")]
+        zmap: Option<PathBuf>,
+        /// Emit the frozen JSON report instead of human-readable text.
+        #[arg(long)]
+        json: bool,
     },
     /// Compute and report the per-frame transforms for a stack: readable
     /// text by default, a frozen `--json` document on request, and an
@@ -266,7 +289,7 @@ fn main() -> ExitCode {
             let no_gpu = false;
             stack::run(
                 &dir,
-                &output,
+                output.as_deref(),
                 algo.as_deref(),
                 zmap.as_deref(),
                 json,
@@ -295,6 +318,12 @@ fn main() -> ExitCode {
                 no_gpu,
             )
         }
+        Command::Export {
+            project,
+            output,
+            zmap,
+            json,
+        } => export::run(&project, output.as_deref(), zmap.as_deref(), json),
         Command::Align {
             dir,
             algo,

@@ -40,6 +40,19 @@ pub struct TiffSpec {
     pub description: Option<String>,
 }
 
+impl TiffSpec {
+    /// The `ImageDescription` a writer falls back to when
+    /// [`TiffSpec::description`] is `None`.
+    ///
+    /// Public because a caller that must *reproduce* a written file byte for
+    /// byte has to know the string rather than guess it: `crates/cli`'s
+    /// `stack` resolves the description once, before fusion, and records it
+    /// in the project manifest so `export` re-emits the identical tag.
+    pub fn default_description() -> String {
+        default_description()
+    }
+}
+
 /// Random-access 16-bit TIFF writer. Never holds a whole frame in memory.
 pub struct TiffWriter<W: Write + Seek> {
     sink: W,
@@ -106,30 +119,11 @@ impl TiffWriter<File> {
     }
 
     /// Whether the file on disk currently holds every byte
-    /// [`write_tile`](TiffWriter::write_tile) would have written for
-    /// `rect`. The tested answer to "a ledger entry whose intermediate is
-    /// missing or short" (`crates/core/src/job/ledger.rs`'s own module
-    /// docs, "The ordering rule"): a recorded-complete unit whose interior
-    /// this returns `false` for must be dropped back into the recomputed
-    /// set, never trusted as done. A missing file is the degenerate case,
-    /// handled one layer up (`crate::job::ResumeStore::find` skips a
-    /// candidate whose `composite_output` does not exist at all).
-    ///
-    /// **Checked against `rect`'s own last written byte, not the row's full
-    /// width.** `write_tile` seeks to, and writes, exactly `rect.width *
-    /// samples_per_pixel * 2` bytes per row -- never the whole frame row --
-    /// so a rect that does not reach the frame's right edge (any tile but
-    /// the last column, in the common multi-column tile plan this crate
-    /// ships) never extends the file out to a full `row_bytes` stride on
-    /// its own. Gating on `pixel_start + (rect.y + rect.height) * row_bytes`
-    /// alone would therefore misreport nearly every non-last-column tile as
-    /// "not held" even when its own bytes are entirely present and durable
-    /// -- the resume would recompute units it never needed to. Within one
-    /// `write_tile` call rows are written in order `0..height` on a single
-    /// thread, so the **last** row's write is the last byte this rect's own
-    /// call could have produced; checking the file reaches that exact
-    /// offset is both necessary and sufficient for "this rect's own write
-    /// completed", with no assumption about any other tile's rect.
+    /// [`write_tile`](TiffWriter::write_tile) would have written for `rect`,
+    /// checked against `rect`'s own last written byte -- `write_tile`
+    /// writes its rows in order on one thread, so reaching that offset is
+    /// necessary and sufficient. A recorded-complete unit this returns
+    /// `false` for is dropped back into the recomputed set.
     pub(crate) fn holds_rows(&self, rect: Rect) -> bool {
         let file_len = self.sink.metadata().map(|m| m.len()).unwrap_or(0);
         let last_row = self.pixel_start + (rect.y + rect.height - 1) as u64 * self.row_bytes;
@@ -434,9 +428,9 @@ impl<W: Write + Seek> TiffWriter<W> {
 
     /// `Ok(())` only when every row's merged coverage is exactly
     /// `[(0, width)]`; otherwise `IncompleteFrame` naming the first row that
-    /// is short -- a per-row covered-sample *counter* was rejected (Strategy
-    /// step 5) because it is green for a double-written region that
-    /// compensates a gap elsewhere. Ends with `flush()`; a `File` sink is
+    /// is short. A per-row covered-sample *counter* would not work: it
+    /// reads green for a double-written region that compensates a gap
+    /// elsewhere. Ends with `flush()`; a `File` sink is
     /// `sync_all()`ed first so a caller that immediately reopens the file
     /// through `TiffStack` sees all of it.
     pub fn finish(mut self) -> Result<(), TiffError>
@@ -868,8 +862,8 @@ mod tests {
 
     #[test]
     fn finish_refuses_an_incomplete_frame_stays_green_after_reopen_additions() {
-        // Regression pin: `reopen`/`seed_coverage`/`holds_rows` are
-        // additive and must not change `finish`'s existing refusal.
+        // `reopen`, `seed_coverage` and `holds_rows` are additive and do
+        // not change `finish`'s existing refusal.
         let mut writer = TiffWriter::new(Cursor::new(Vec::new()), spec(4, 4, 1)).unwrap();
         for y in 0..3u32 {
             writer

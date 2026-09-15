@@ -27,12 +27,12 @@ use crate::zmap::{ZMapInfo, ZMapWriter};
 /// [`Self::create`] is given `None`.
 ///
 /// **Every real run now passes `Some`**, because a stacking run writes a
-/// project and a project carries its own Z-Map: the map is the document
-/// itself, so a run that produced no map would produce nothing
-/// worth keeping.
-/// wants the composite alone can still ask for -- the library oracle in
-/// `crates/cli/tests/stack_cli.rs` is one -- and it costs one 89.6 MB plane
-/// per reference-scale run against a 268 MB composite when it is not used.
+/// project and a project carries its own Z-Map: the map is the document, so
+/// a run that produced no map would produce nothing worth keeping. `None`
+/// survives as the shape a caller that genuinely wants the composite alone
+/// can still ask for -- the library oracle in `crates/cli/tests/stack_cli.rs`
+/// is one -- and it costs one 89.6 MB plane per reference-scale run against
+/// a 268 MB composite when it is not used.
 ///
 /// The Z-Map's path is explicit and never inside a frames directory
 /// (`crate::zmap`'s own module docs): this type takes two separate paths,
@@ -410,11 +410,9 @@ fn translate_for_crop(rect: Rect, crop: Option<Rect>) -> Rect {
 /// files, given an optional crop -- `intersect(interior, crop)` then
 /// [`translate_for_crop`], factored out of [`FusionConsumer::consume`] so a
 /// resume's [`FusionConsumer::reopen`] seeds coverage with **exactly** the
-/// same arithmetic `consume` used to write it in the first place. Two
-/// copies of this arithmetic is how a resumed run ends up with a
-/// one-tile-wide stripe of zeros at a crop edge. `None` when `interior`
-/// lies wholly outside `crop` -- that tile wrote nothing, so there is
-/// nothing to seed.
+/// same arithmetic `consume` used to write it in the first place. `None`
+/// when `interior` lies wholly outside `crop` -- that tile wrote nothing,
+/// so there is nothing to seed.
 pub(crate) fn written_rect(interior: Rect, crop: Option<Rect>) -> Option<Rect> {
     let target = match crop {
         Some(crop) => intersect(interior, crop)?,

@@ -46,6 +46,27 @@ fn tmp_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// Both payloads of `project`, exported beside it as `<stem>-composite.tif`
+/// and `<stem>-zmap.tif`.
+///
+/// `stack` writes a project, so every test that needs the *files* asks
+/// `export` for them. One invocation emits both, so the container is opened
+/// once.
+fn export_both(project: &Path) -> (PathBuf, PathBuf) {
+    let composite = project.with_extension("composite.tif");
+    let zmap = project.with_extension("zmap.tif");
+    let out = run_cli(&[
+        "export",
+        project.to_str().unwrap(),
+        "-o",
+        composite.to_str().unwrap(),
+        "--zmap",
+        zmap.to_str().unwrap(),
+    ]);
+    assert!(out.success, "export stderr: {}", out.stderr);
+    (composite, zmap)
+}
+
 fn partial_of(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap().to_os_string();
     name.push(".partial");
@@ -92,7 +113,15 @@ fn run_cli(args: &[&str]) -> CliOutput {
 /// The one `laplacian` run driven through the built binary: `-o`, `--zmap`
 /// and no `--set`, so `levels` resolves through its `auto` hook. Shared by
 /// every test that needs its output, its Z-Map or its report.
+///
+/// The run itself writes a **project**; `output` and `zmap` are what one
+/// `export` call then brings back out as files, so every downstream
+/// assertion below is unchanged by the move to a container and the ~50 s
+/// fusion is still paid exactly once.
 struct SharedRun {
+    /// The `.ffproj` the run wrote -- the thing `stack` now produces.
+    #[allow(dead_code)]
+    project: PathBuf,
     output: PathBuf,
     zmap: PathBuf,
     report: serde_json::Value,
@@ -102,15 +131,14 @@ fn shared_laplacian_run() -> &'static SharedRun {
     static ONCE: OnceLock<SharedRun> = OnceLock::new();
     ONCE.get_or_init(|| {
         let dir = tmp_dir("stack_cli_shared_laplacian");
+        let project = dir.join("mantis-512.ffproj");
         let output = dir.join("out.tif");
         let zmap = dir.join("out-zmap.tif");
         let mut args = vec![
             "stack".to_string(),
             mantis_512_dir().to_str().unwrap().to_string(),
             "-o".to_string(),
-            output.to_str().unwrap().to_string(),
-            "--zmap".to_string(),
-            zmap.to_str().unwrap().to_string(),
+            dir.to_str().unwrap().to_string(),
             "--algo".to_string(),
             "laplacian".to_string(),
             "--json".to_string(),
@@ -135,7 +163,25 @@ fn shared_laplacian_run() -> &'static SharedRun {
         );
         let report: serde_json::Value =
             serde_json::from_str(&result.stdout).expect("--json must parse");
+
+        // One `export`, emitting both payloads from the one container the
+        // run wrote. That is the whole migration: the bytes are the same,
+        // they just come out one command later.
+        let exported = run_cli(&[
+            "export",
+            project.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--zmap",
+            zmap.to_str().unwrap(),
+        ]);
+        assert!(
+            exported.success,
+            "export must succeed -- stderr: {}",
+            exported.stderr
+        );
         SharedRun {
+            project,
             output,
             zmap,
             report,
@@ -253,7 +299,7 @@ fn unknown_algorithm_is_rejected_early() {
         "stack",
         missing_dir,
         "-o",
-        output.to_str().unwrap(),
+        output.parent().unwrap().to_str().unwrap(),
         "--algo",
         "no-such-algorithm",
     ]);
@@ -288,7 +334,7 @@ fn unknown_parameter_key_is_rejected() {
         "stack",
         missing_dir,
         "-o",
-        output.to_str().unwrap(),
+        output.parent().unwrap().to_str().unwrap(),
         "--algo",
         "dummy-stack",
         "--set",
@@ -316,7 +362,7 @@ fn out_of_range_parameter_is_rejected() {
         "stack",
         missing_dir,
         "-o",
-        output.to_str().unwrap(),
+        output.parent().unwrap().to_str().unwrap(),
         "--algo",
         "laplacian",
         "--set",
@@ -348,9 +394,7 @@ fn refuses_levels_the_tile_geometry_cannot_plan() {
         "stack",
         mantis_512_dir().to_str().unwrap(),
         "-o",
-        output.to_str().unwrap(),
-        "--zmap",
-        zmap.to_str().unwrap(),
+        output.parent().unwrap().to_str().unwrap(),
         "--algo",
         "laplacian",
         "--set",
@@ -386,18 +430,24 @@ fn reports_resolved_parameter_values() {
     assert_eq!(levels["provenance"], "Auto", "report: {}", run.report);
 }
 
+/// Every run writes a Z-Map, because a project carries its own: the map
+/// is the document, so a run that produced none would produce nothing
+/// worth keeping. Asserts that a run writes **no image at all**.
 #[test]
-fn writes_the_zmap_on_request() {
+fn every_run_carries_a_zmap_and_writes_no_image() {
     let run = shared_laplacian_run();
-    assert!(run.zmap.exists(), "--zmap was given, the file must exist");
+    assert!(
+        run.zmap.exists(),
+        "a project carries its own Z-Map, and `export --zmap` must produce it"
+    );
 
     let dir = tmp_dir("writes_the_zmap_on_request_off");
-    let output = dir.join("out.tif");
+    let output = dir.join("mantis-512.ffproj");
     let out = run_cli(&[
         "stack",
         mantis_512_dir().to_str().unwrap(),
         "-o",
-        output.to_str().unwrap(),
+        output.parent().unwrap().to_str().unwrap(),
         "--algo",
         "dummy-stack",
         "--no-align",
@@ -410,8 +460,15 @@ fn writes_the_zmap_on_request() {
         .collect();
     assert_eq!(
         entries,
-        vec!["out.tif".to_string()],
-        "no Z-Map or partial file may exist anywhere under the output directory: {entries:?}"
+        vec!["mantis-512.ffproj".to_string()],
+        "one project and nothing else -- no image, no partial: {entries:?}"
+    );
+    let (_, zmap) = export_both(&output);
+    let (_, zw, zh, zspp) = read_whole(&zmap);
+    assert_eq!(
+        (zw, zh, zspp),
+        (512, 512, 1),
+        "the map is one index per pixel"
     );
 }
 
@@ -424,7 +481,7 @@ fn refuses_empty_dir_and_unwritable_output() {
         "stack",
         empty_dir.to_str().unwrap(),
         "-o",
-        output_a.to_str().unwrap(),
+        output_a.parent().unwrap().to_str().unwrap(),
         "--algo",
         "dummy-stack",
     ]);
@@ -437,7 +494,7 @@ fn refuses_empty_dir_and_unwritable_output() {
         "stack",
         missing_dir,
         "-o",
-        bad_output.to_str().unwrap(),
+        bad_output.parent().unwrap().to_str().unwrap(),
         "--algo",
         "dummy-stack",
     ]);
@@ -456,15 +513,12 @@ fn refuses_empty_dir_and_unwritable_output() {
 #[test]
 fn report_contains_every_field() {
     let dir = tmp_dir("report_contains_every_field");
-    let output = dir.join("out.tif");
-    let zmap = dir.join("out-zmap.tif");
+    let output = dir.join("mantis-512.ffproj");
     let out = run_cli(&[
         "stack",
         mantis_512_dir().to_str().unwrap(),
         "-o",
-        output.to_str().unwrap(),
-        "--zmap",
-        zmap.to_str().unwrap(),
+        output.parent().unwrap().to_str().unwrap(),
         "--algo",
         "dummy-stack",
         "--no-align",
@@ -522,15 +576,12 @@ fn algo_is_required() {
 #[test]
 fn report_json_has_every_field() {
     let dir = tmp_dir("report_json_has_every_field");
-    let output = dir.join("out.tif");
-    let zmap = dir.join("out-zmap.tif");
+    let output = dir.join("mantis-512.ffproj");
     let out = run_cli(&[
         "stack",
         mantis_512_dir().to_str().unwrap(),
         "-o",
-        output.to_str().unwrap(),
-        "--zmap",
-        zmap.to_str().unwrap(),
+        output.parent().unwrap().to_str().unwrap(),
         "--algo",
         "dummy-stack",
         "--json",
@@ -570,34 +621,50 @@ fn report_json_has_every_field() {
     }
 }
 
+/// A **failed seal** leaves neither a project at the named path nor a
+/// `.partial` beside it, and removes its staging directory.
+///
+/// A read-only `-o` directory passes the checks before the run (it *is*
+/// a directory), lets fusion finish, and only fails when sealing tries
+/// to create the container's `.partial`.
 #[test]
-fn failed_run_leaves_no_output() {
-    let dir = tmp_dir("failed_run_leaves_no_output");
-    let output = dir.join("out.tif");
-    let bad_zmap = PathBuf::from("/definitely/does/not/exist/xyz-zmap-dir/zmap.tif");
+fn failed_seal_leaves_no_output() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tmp_dir("failed_seal_leaves_no_output");
+    let out_dir = dir.join("readonly");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let output = out_dir.join("mantis-512.ffproj");
+    std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
     let out = run_cli(&[
         "stack",
         mantis_512_dir().to_str().unwrap(),
         "-o",
-        output.to_str().unwrap(),
-        "--zmap",
-        bad_zmap.to_str().unwrap(),
+        out_dir.to_str().unwrap(),
         "--algo",
         "dummy-stack",
         "--no-align",
         "--no-crop",
     ]);
+    // Restore before asserting, so a failed assertion still leaves a
+    // removable directory behind.
+    std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
     assert!(
         !out.success,
         "stdout: {} stderr: {}",
         out.stdout, out.stderr
     );
+    assert!(!output.exists(), "no project may survive a failed seal");
     assert!(
-        !output.exists(),
-        "the composite must not survive a later failure"
+        !partial_of(&output).exists(),
+        "no .partial may survive a failed seal"
     );
-    assert!(!partial_of(&output).exists());
-    assert!(!bad_zmap.exists());
+    assert!(
+        std::fs::read_dir(&out_dir).unwrap().next().is_none(),
+        "the failed seal left something behind in the output directory"
+    );
 }
 
 #[test]
@@ -611,12 +678,12 @@ fn refuses_a_non_uniform_frame_set() {
     )
     .unwrap();
 
-    let output = dir.join("out.tif");
+    let output = dir.join("mantis-512.ffproj");
     let out = run_cli(&[
         "stack",
         dir.to_str().unwrap(),
         "-o",
-        output.to_str().unwrap(),
+        output.parent().unwrap().to_str().unwrap(),
         "--algo",
         "dummy-stack",
     ]);
@@ -643,14 +710,18 @@ fn refuses_a_non_uniform_frame_set() {
 #[test]
 fn stack_aligns_before_fusing() {
     let dir = tmp_dir("stack_aligns_before_fusing");
-    let unaligned = dir.join("unaligned.tif");
-    let aligned = dir.join("aligned.tif");
+    let unaligned_dir = dir.join("unaligned");
+    let aligned_dir = dir.join("aligned");
+    std::fs::create_dir_all(&unaligned_dir).unwrap();
+    std::fs::create_dir_all(&aligned_dir).unwrap();
+    let unaligned = unaligned_dir.join("mantis-512.ffproj");
+    let aligned = aligned_dir.join("mantis-512.ffproj");
 
     let out_a = run_cli(&[
         "stack",
         mantis_512_dir().to_str().unwrap(),
         "-o",
-        unaligned.to_str().unwrap(),
+        unaligned.parent().unwrap().to_str().unwrap(),
         "--algo",
         "laplacian",
         "--no-align",
@@ -662,7 +733,7 @@ fn stack_aligns_before_fusing() {
         "stack",
         mantis_512_dir().to_str().unwrap(),
         "-o",
-        aligned.to_str().unwrap(),
+        aligned.parent().unwrap().to_str().unwrap(),
         "--algo",
         "laplacian",
         "--align-algo",
@@ -672,8 +743,10 @@ fn stack_aligns_before_fusing() {
     ]);
     assert!(out_b.success, "stderr: {}", out_b.stderr);
 
-    let (unaligned_samples, ..) = read_whole(&unaligned);
-    let (aligned_samples, ..) = read_whole(&aligned);
+    let (unaligned_composite, _) = export_both(&unaligned);
+    let (aligned_composite, _) = export_both(&aligned);
+    let (unaligned_samples, ..) = read_whole(&unaligned_composite);
+    let (aligned_samples, ..) = read_whole(&aligned_composite);
     assert_ne!(
         unaligned_samples, aligned_samples,
         "an aligned run must differ from the unaligned one"
@@ -686,15 +759,12 @@ fn stack_aligns_before_fusing() {
 #[test]
 fn stack_output_carries_the_auto_crop() {
     let dir = tmp_dir("stack_output_carries_the_auto_crop");
-    let output = dir.join("out.tif");
-    let zmap = dir.join("out-zmap.tif");
+    let project = dir.join("mantis-512.ffproj");
     let out = run_cli(&[
         "stack",
         mantis_512_dir().to_str().unwrap(),
         "-o",
-        output.to_str().unwrap(),
-        "--zmap",
-        zmap.to_str().unwrap(),
+        dir.to_str().unwrap(),
         "--algo",
         "laplacian",
         "--align-algo",
@@ -708,6 +778,7 @@ fn stack_output_carries_the_auto_crop() {
         .as_object()
         .expect("crop object present when aligned");
 
+    let (output, zmap) = export_both(&project);
     let (_, cw, ch, _) = read_whole(&output);
     assert_eq!(cw as u64, crop["width"].as_u64().unwrap());
     assert_eq!(ch as u64, crop["height"].as_u64().unwrap());
@@ -736,8 +807,15 @@ fn stack_output_carries_the_auto_crop() {
     );
 }
 
+/// `-o` naming an existing **file** -- an input frame being the sharpest
+/// case -- is refused by name, with the migration sentence, before the
+/// input directory is read.
+///
+/// The old shape of this test pointed `--zmap` at an input frame; with the
+/// flag gone the reachable case is `-o`, and the composite-collides-with-an-
+/// input check stays in `run_group` as the defensive backstop it now is.
 #[test]
-fn refuses_output_that_is_an_input() {
+fn refuses_an_output_path_that_is_an_existing_file() {
     let frame = mantis_512_dir().join("frames").join("00.tif");
 
     let out = run_cli(&[
@@ -753,25 +831,19 @@ fn refuses_output_that_is_an_input() {
         "stdout: {} stderr: {}",
         out.stdout, out.stderr
     );
-    assert!(out.stderr.contains("00.tif"), "stderr: {}", out.stderr);
-
-    let output = tmp_path("refuses_output_that_is_an_input.tif");
-    let _ = std::fs::remove_file(&output);
-    let out = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        output.to_str().unwrap(),
-        "--zmap",
-        frame.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-    ]);
+    assert_eq!(out.code, Some(1), "never clap's exit 2");
     assert!(
-        !out.success,
-        "stdout: {} stderr: {}",
-        out.stdout, out.stderr
+        out.stderr.contains("existing directory"),
+        "stderr: {}",
+        out.stderr
     );
-    assert!(out.stderr.contains("00.tif"), "stderr: {}", out.stderr);
-    assert!(!output.exists());
+    assert!(
+        out.stderr.contains("focusforge-cli export"),
+        "a `.tif` -o path must name the replacement: {}",
+        out.stderr
+    );
+    assert!(
+        frame.metadata().unwrap().len() > 0,
+        "the refusal must not have touched the frame"
+    );
 }

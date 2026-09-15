@@ -89,20 +89,43 @@ fn read_bytes(path: &Path) -> Vec<u8> {
     std::fs::read(path).expect("output file must be readable")
 }
 
+/// The composite of `project`, exported beside it.
+///
+/// Two containers of the same stack are not byte-identical -- they carry
+/// different `created_at` stamps -- so every byte-level comparison here goes
+/// through `export`, which is the claim worth keeping anyway: the container
+/// changed where the payload lives, not what it is.
+fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
+    let exported = project.with_extension("exported.tif");
+    let out = run_cli_in(
+        cwd,
+        &[
+            "export",
+            project.to_str().unwrap(),
+            "-o",
+            exported.to_str().unwrap(),
+        ],
+    );
+    assert!(out.success, "export stderr: {}", out.stderr);
+    exported
+}
+
 #[test]
 fn preset_file_matches_equivalent_set_flags() {
     let dir = tmp_dir("preset_cli_matches_set");
     let mantis = mantis_512_dir();
     let preset = write_preset(&dir, "p.toml", "[stack]\nlevels = 3\n");
 
-    let from_preset = dir.join("preset.tif");
+    let preset_dir = dir.join("preset-out");
+    std::fs::create_dir_all(&preset_dir).unwrap();
+    let from_preset = preset_dir.join("mantis-512.ffproj");
     let out = run_cli_in(
         &dir,
         &[
             "stack",
             mantis.to_str().unwrap(),
             "-o",
-            from_preset.to_str().unwrap(),
+            from_preset.parent().unwrap().to_str().unwrap(),
             "--algo",
             "laplacian",
             "--preset",
@@ -113,14 +136,16 @@ fn preset_file_matches_equivalent_set_flags() {
     );
     assert!(out.success, "stderr: {}", out.stderr);
 
-    let from_flags = dir.join("flags.tif");
+    let flags_dir = dir.join("flags-out");
+    std::fs::create_dir_all(&flags_dir).unwrap();
+    let from_flags = flags_dir.join("mantis-512.ffproj");
     let out = run_cli_in(
         &dir,
         &[
             "stack",
             mantis.to_str().unwrap(),
             "-o",
-            from_flags.to_str().unwrap(),
+            from_flags.parent().unwrap().to_str().unwrap(),
             "--algo",
             "laplacian",
             "--set",
@@ -132,8 +157,8 @@ fn preset_file_matches_equivalent_set_flags() {
     assert!(out.success, "stderr: {}", out.stderr);
 
     assert_eq!(
-        read_bytes(&from_preset),
-        read_bytes(&from_flags),
+        read_bytes(&export_composite(&dir, &from_preset)),
+        read_bytes(&export_composite(&dir, &from_flags)),
         "a preset value must produce the same composite as the equivalent --set"
     );
 }
@@ -148,7 +173,7 @@ fn set_flag_overrides_preset_file() {
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            dir.join("out.tif").to_str().unwrap(),
+            dir.to_str().unwrap(),
             "--algo",
             "dummy-stack",
             "--preset",
@@ -197,7 +222,7 @@ fn invalid_preset_value_is_refused() {
                 "stack",
                 mantis.to_str().unwrap(),
                 "-o",
-                dir.join("out.tif").to_str().unwrap(),
+                dir.to_str().unwrap(),
                 "--algo",
                 "dummy-stack",
                 "--preset",
@@ -212,7 +237,7 @@ fn invalid_preset_value_is_refused() {
                 "stack",
                 mantis.to_str().unwrap(),
                 "-o",
-                dir.join("out.tif").to_str().unwrap(),
+                dir.to_str().unwrap(),
                 "--algo",
                 "dummy-stack",
                 "--set",
@@ -236,7 +261,7 @@ fn invalid_preset_value_is_refused() {
             "stack",
             mantis.to_str().unwrap(),
             "-o",
-            dir.join("out.tif").to_str().unwrap(),
+            dir.to_str().unwrap(),
             "--algo",
             "dummy-stack",
             "--preset",
@@ -276,7 +301,7 @@ fn preset_type_error_is_refused_by_the_parser() {
             "stack",
             mantis.to_str().unwrap(),
             "-o",
-            dir.join("out.tif").to_str().unwrap(),
+            dir.to_str().unwrap(),
             "--algo",
             "dummy-stack",
             "--preset",
@@ -297,7 +322,7 @@ fn preset_type_error_is_refused_by_the_parser() {
             "stack",
             mantis.to_str().unwrap(),
             "-o",
-            dir.join("out.tif").to_str().unwrap(),
+            dir.to_str().unwrap(),
             "--algo",
             "dummy-stack",
             "--preset",
@@ -331,7 +356,7 @@ fn preset_supplies_the_algorithm_id() {
             "stack",
             mantis.to_str().unwrap(),
             "-o",
-            dir.join("out.tif").to_str().unwrap(),
+            dir.to_str().unwrap(),
             "--preset",
             preset.to_str().unwrap(),
             "--json",
@@ -350,7 +375,7 @@ fn preset_supplies_the_algorithm_id() {
             "stack",
             mantis.to_str().unwrap(),
             "-o",
-            dir.join("out2.tif").to_str().unwrap(),
+            dir.to_str().unwrap(),
             "--preset",
             preset.to_str().unwrap(),
             "--algo",
@@ -372,7 +397,7 @@ fn preset_supplies_the_algorithm_id() {
             "stack",
             mantis.to_str().unwrap(),
             "-o",
-            dir.join("out3.tif").to_str().unwrap(),
+            dir.to_str().unwrap(),
             "--preset",
             empty.to_str().unwrap(),
         ],
@@ -395,14 +420,16 @@ fn written_preset_round_trips() {
     let dir = tmp_dir("preset_cli_write_round_trip");
     let mantis = mantis_512_dir();
     let written = dir.join("written.toml");
-    let first = dir.join("first.tif");
+    let first_dir = dir.join("first-out");
+    std::fs::create_dir_all(&first_dir).unwrap();
+    let first = first_dir.join("mantis-512.ffproj");
     let out = run_cli_in(
         &dir,
         &[
             "stack",
             mantis.to_str().unwrap(),
             "-o",
-            first.to_str().unwrap(),
+            first.parent().unwrap().to_str().unwrap(),
             "--algo",
             "laplacian",
             "--set",
@@ -424,14 +451,16 @@ fn written_preset_round_trips() {
     );
     assert!(text.contains("levels = 3"), "written preset:\n{text}");
 
-    let second = dir.join("second.tif");
+    let second_dir = dir.join("second-out");
+    std::fs::create_dir_all(&second_dir).unwrap();
+    let second = second_dir.join("mantis-512.ffproj");
     let out = run_cli_in(
         &dir,
         &[
             "stack",
             mantis.to_str().unwrap(),
             "-o",
-            second.to_str().unwrap(),
+            second.parent().unwrap().to_str().unwrap(),
             "--preset",
             written.to_str().unwrap(),
             "--no-align",
@@ -440,8 +469,8 @@ fn written_preset_round_trips() {
     );
     assert!(out.success, "stderr: {}", out.stderr);
     assert_eq!(
-        read_bytes(&first),
-        read_bytes(&second),
+        read_bytes(&export_composite(&dir, &first)),
+        read_bytes(&export_composite(&dir, &second)),
         "a written preset must reproduce the composite it came from"
     );
 }
@@ -449,8 +478,7 @@ fn written_preset_round_trips() {
 #[test]
 fn dry_run_writes_nothing_and_succeeds() {
     let dir = tmp_dir("preset_cli_dry_run_writes_nothing");
-    let output = dir.join("dry.tif");
-    let zmap = dir.join("dry-zmap.tif");
+    let output = dir.join("mantis-512.ffproj");
     let status = dir.join("status.ndjson");
     let out = run_cli_in(
         &dir,
@@ -458,9 +486,7 @@ fn dry_run_writes_nothing_and_succeeds() {
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            output.to_str().unwrap(),
-            "--zmap",
-            zmap.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
             "--algo",
             "laplacian",
             // Two alignment algorithms are registered in this test binary
@@ -498,11 +524,14 @@ fn dry_run_writes_nothing_and_succeeds() {
         out.stdout
     );
 
-    assert!(!output.exists(), "a dry run writes no output");
-    assert!(!zmap.exists(), "a dry run writes no Z-Map");
+    assert!(!output.exists(), "a dry run writes no project");
     assert!(
-        !dir.join("dry.tif.partial").exists(),
+        !dir.join("mantis-512.ffproj.partial").exists(),
         "a dry run creates no .partial"
+    );
+    assert!(
+        !dir.join(".scratch").join("projects").exists(),
+        "a dry run stages no planes"
     );
     assert!(
         !dir.join(".scratch").join("resume").exists(),
@@ -523,7 +552,7 @@ fn dry_run_stops_before_alignment() {
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            dir.join("dry.tif").to_str().unwrap(),
+            dir.to_str().unwrap(),
             "--algo",
             "laplacian",
             // Two alignment algorithms are registered in this test binary
@@ -558,14 +587,14 @@ fn dry_run_stops_before_alignment() {
 #[test]
 fn dry_run_json_is_not_a_stack_report() {
     let dir = tmp_dir("preset_cli_dry_run_json");
-    let output = dir.join("dry.tif");
+    let output = dir.join("mantis-512.ffproj");
     let out = run_cli_in(
         &dir,
         &[
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            output.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
             "--algo",
             "laplacian",
             // Two alignment algorithms are registered in this test binary
@@ -609,7 +638,7 @@ fn dry_run_refuses_to_resume() {
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            dir.join("dry.tif").to_str().unwrap(),
+            dir.to_str().unwrap(),
             "--algo",
             "laplacian",
             "--dry-run",
@@ -686,14 +715,14 @@ fn status_record_names_identity_outcome_and_path() {
     let dir = tmp_dir("preset_cli_status_completed");
     let mantis = mantis_512_dir();
     let status = dir.join("status.ndjson");
-    let output = dir.join("out.tif");
+    let output = dir.join("mantis-512.ffproj");
     let out = run_cli_in(
         &dir,
         &[
             "stack",
             mantis.to_str().unwrap(),
             "-o",
-            output.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
             "--algo",
             "dummy-stack",
             "--status",
@@ -734,7 +763,7 @@ fn status_record_written_on_refusal() {
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            dir.join("out.tif").to_str().unwrap(),
+            dir.to_str().unwrap(),
             "--algo",
             "dummy-stack",
             "--set",
@@ -773,7 +802,7 @@ fn status_stream_is_separate_from_progress_and_stdout() {
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            dir.join("out.tif").to_str().unwrap(),
+            dir.to_str().unwrap(),
             "--algo",
             "dummy-stack",
             "--status",
@@ -822,7 +851,7 @@ fn written_preset_holds_explicit_values_only() {
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            dir.join("out.tif").to_str().unwrap(),
+            dir.to_str().unwrap(),
             "--algo",
             "laplacian",
             "--write-preset",

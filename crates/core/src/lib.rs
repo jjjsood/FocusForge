@@ -11,6 +11,7 @@ pub mod gpu;
 pub mod io;
 pub mod job;
 pub mod params;
+pub mod project;
 pub mod registry;
 pub mod tile;
 pub mod zmap;

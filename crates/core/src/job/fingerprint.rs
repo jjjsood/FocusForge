@@ -262,10 +262,17 @@ mod tests {
     /// quietly drift into a content hash.
     #[test]
     fn not_convertible_to_a_content_hash() {
-        let manifest = include_str!("../../Cargo.toml");
+        // The needles are assembled rather than written out, so this
+        // check does not match its own source line.
+        let needles = [concat!("bla", "ke3"), concat!("Has", "her")];
+        let module = include_str!("fingerprint.rs");
+        let uses_a_hash = module
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .any(|line| needles.iter().any(|needle| line.contains(needle)));
         assert!(
-            !manifest.contains("blake3"),
-            "focusforge-core must gain no hashing dependency for this fingerprint"
+            !uses_a_hash,
+            "the resume fingerprint must stay a plain header comparison -- no hash crate"
         );
         // A header-only fingerprint carries no pixel bytes at all -- proven
         // structurally: every field on `FrameFingerprint` comes from

@@ -296,10 +296,23 @@ run_stack() {
     align_flags=(--no-align)
   fi
   /usr/bin/time -v "$CLI" stack "$OUT_DIR/frames" \
-      -o "$out/out.tif" --zmap "$out/out-zmap.tif" \
+      -o "$out" \
       --algo laplacian --set levels=5 --json \
       --no-crop "${align_flags[@]}" \
       > "$out/stack.json" 2> "$out/time-v.txt"
+
+  # A stacking run writes a project, not an image. The two TIFFs
+  # `crates/cli/tests/acceptance.rs` looks for by name come out of that
+  # project through `export`, which is a seconds-long read of two blobs
+  # rather than a second fusion.
+  local project
+  project=$(find "$out" -maxdepth 1 -name '*.ffproj' -print -quit)
+  if [ -z "$project" ]; then
+    echo "refuse: the run wrote no project under $out" >&2
+    return 1
+  fi
+  "$CLI" export "$project" -o "$out/out.tif" --zmap "$out/out-zmap.tif" \
+      > "$out/export.txt" 2>&1
 }
 
 # `align`, once per mode, in the unlimited branch only: the `--inside-scope`
@@ -364,7 +377,7 @@ case "$MODE" in
     else
       echo "SKIP: align stage (ACCEPTANCE_ALIGN=0)"
     fi
-    echo "+ $CLI stack $OUT_DIR/frames -o $OUT_DIR/unlimited/out.tif ..."
+    echo "+ $CLI stack $OUT_DIR/frames -o $OUT_DIR/unlimited ... then $CLI export ..."
     run_stack "$OUT_DIR/unlimited"
     echo "OK: unlimited run complete"
     print_summary "$OUT_DIR/unlimited"
@@ -413,7 +426,7 @@ case "$MODE" in
     fi
     echo "OK: memory.max=$mem_max memory.swap.max=$mem_swap_max, limit confirmed in force"
 
-    echo "+ $CLI stack $OUT_DIR/frames -o $OUT_DIR/limited/out.tif ... (under $LIMIT)"
+    echo "+ $CLI stack $OUT_DIR/frames -o $OUT_DIR/limited ... then $CLI export ... (under $LIMIT)"
     set +e
     run_stack "$OUT_DIR/limited"
     status=$?

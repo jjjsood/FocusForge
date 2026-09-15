@@ -126,7 +126,7 @@ fn stack_gpu_matches_stack_no_gpu() {
         "stack",
         mantis_512_dir().to_str().unwrap(),
         "-o",
-        gpu_out.to_str().unwrap(),
+        gpu_out.parent().unwrap().to_str().unwrap(),
         "--algo",
         "laplacian",
         // Disambiguates the alignment algorithm: this test binary's
@@ -155,7 +155,7 @@ fn stack_gpu_matches_stack_no_gpu() {
         "stack",
         mantis_512_dir().to_str().unwrap(),
         "-o",
-        cpu_out.to_str().unwrap(),
+        cpu_out.parent().unwrap().to_str().unwrap(),
         "--algo",
         "laplacian",
         "--align-algo",
@@ -272,12 +272,12 @@ fn align_write_warped_gpu_matches_no_gpu() {
 #[test]
 fn auto_falls_back_without_adapter() {
     let dir = tmp_dir("cli_gpu_auto_falls_back");
-    let output = dir.join("out.tif");
+    let output = dir.join("mantis-512.ffproj");
     let Some(result) = run_with_no_adapter(&[
         "stack",
         mantis_512_dir().to_str().unwrap(),
         "-o",
-        output.to_str().unwrap(),
+        output.parent().unwrap().to_str().unwrap(),
         "--algo",
         "laplacian",
         "--align-algo",
@@ -313,12 +313,12 @@ fn auto_falls_back_without_adapter() {
 #[test]
 fn fallback_emits_a_message() {
     let dir = tmp_dir("cli_gpu_fallback_emits_a_message");
-    let output = dir.join("out.tif");
+    let output = dir.join("mantis-512.ffproj");
     let Some(result) = run_with_no_adapter(&[
         "stack",
         mantis_512_dir().to_str().unwrap(),
         "-o",
-        output.to_str().unwrap(),
+        output.parent().unwrap().to_str().unwrap(),
         "--algo",
         "laplacian",
         "--align-algo",
@@ -340,12 +340,12 @@ fn fallback_emits_a_message() {
 #[test]
 fn no_gpu_flag_forces_cpu_even_with_adapter() {
     let dir = tmp_dir("cli_gpu_no_gpu_forces_cpu");
-    let output = dir.join("out.tif");
+    let output = dir.join("mantis-512.ffproj");
     let result = run(&[
         "stack",
         mantis_512_dir().to_str().unwrap(),
         "-o",
-        output.to_str().unwrap(),
+        output.parent().unwrap().to_str().unwrap(),
         "--algo",
         "laplacian",
         "--align-algo",

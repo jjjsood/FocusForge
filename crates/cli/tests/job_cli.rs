@@ -152,15 +152,57 @@ fn copy_fixture_frames(dest: &Path) -> PathBuf {
     dest.to_path_buf()
 }
 
+/// Every staged composite under `<cwd>/.scratch/projects/`.
+///
+/// The staging key is the group name **plus a digest of the project path**,
+/// so two runs that propose the same group name into different output
+/// directories do not fight over one directory. A test therefore looks for
+/// the planes rather than spelling the key.
+fn staged_composites(cwd: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(cwd.join(".scratch").join("projects"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path().join("composite.tif"))
+        .filter(|p| p.is_file())
+        .collect();
+    found.sort();
+    found
+}
+
 fn read_pixels(path: &Path) -> Vec<u8> {
     std::fs::read(path).expect("output file must be readable")
 }
 
-/// `stack <dir> -o <output> --algo laplacian --no-align --no-crop --tile-size
-/// 160 --set levels=3 --max-bytes-in-flight 1` -- the single-worker recipe
-/// this module's own doc comment explains (25 units against
-/// `fixtures/mantis-512`'s 4-tile default plan), assembled once so every
-/// interruptible-run test stops repeating it verbatim.
+/// The composite of `project`, exported to `<project>.exported.tif`.
+///
+/// Two containers of the same stack are **not** byte-identical -- they carry
+/// different `created_at` stamps -- so every byte-level comparison in this
+/// file goes through `export`, which is the honest one anyway: what the
+/// container must preserve is the payload, not its own envelope.
+fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
+    let exported = project.with_extension("exported.tif");
+    let out = run_cli_in(
+        cwd,
+        &[
+            "export",
+            project.to_str().unwrap(),
+            "-o",
+            exported.to_str().unwrap(),
+        ],
+    );
+    assert!(out.success, "export stderr: {}", out.stderr);
+    exported
+}
+
+/// `stack <dir> -o <out_dir> --algo laplacian --no-align --no-crop
+/// --tile-size 160 --set levels=3 --max-bytes-in-flight 1` -- the
+/// single-worker recipe this module's own doc comment explains (25 units
+/// against `fixtures/mantis-512`'s 4-tile default plan), assembled once so
+/// every interruptible-run test stops repeating it verbatim.
+///
+/// `out_dir` is the **directory** the run collects its project into: a
+/// stacking run writes a project, not an image, so `-o` names a directory.
 fn interruptible_stack_args<'a>(dir: &'a str, output: &'a str) -> Vec<&'a str> {
     vec![
         "stack",
@@ -189,14 +231,14 @@ fn stack_output_is_unchanged_under_the_job_engine() {
     use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 
     let dir = tmp_dir("job_cli_output_unchanged");
-    let output = dir.join("out.tif");
+    let output = dir.join("mantis-512.ffproj");
     let out = run_cli_in(
         &dir,
         &[
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            output.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
             "--algo",
             "laplacian",
             "--no-align",
@@ -241,8 +283,11 @@ fn stack_output_is_unchanged_under_the_job_engine() {
     scheduler.run(&NoopPreprocess, &consumer).unwrap();
     consumer.finish().unwrap();
 
+    // The composite now lives inside the project, so the comparison goes
+    // through `export` -- which is exactly the claim worth keeping: the
+    // container changed where the bytes live, not what they are.
     assert_eq!(
-        read_pixels(&output),
+        read_pixels(&export_composite(&dir, &output)),
         read_pixels(&oracle_path),
         "stack must produce the same bytes through the job engine as the library oracle"
     );
@@ -251,11 +296,14 @@ fn stack_output_is_unchanged_under_the_job_engine() {
 #[test]
 fn progress_line_contains_units_stage_and_eta() {
     let dir = tmp_dir("job_cli_progress_line");
-    let output = dir.join("out.tif");
+    let output = dir.join("mantis-512.ffproj");
     let mantis = mantis_512_dir();
     let out = run_cli_in(
         &dir,
-        &interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap()),
+        &interruptible_stack_args(
+            mantis.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
+        ),
     );
     assert!(out.success, "stderr: {}", out.stderr);
     let has_line = out
@@ -292,11 +340,14 @@ fn fuse_counts(stderr: &str) -> Vec<(usize, usize)> {
 #[test]
 fn progress_advances_during_an_uninterrupted_run() {
     let dir = tmp_dir("job_cli_progress_advances");
-    let output = dir.join("out.tif");
+    let output = dir.join("mantis-512.ffproj");
     let mantis = mantis_512_dir();
     let out = run_cli_in(
         &dir,
-        &interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap()),
+        &interruptible_stack_args(
+            mantis.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
+        ),
     );
     assert!(out.success, "stderr: {}", out.stderr);
 
@@ -345,12 +396,15 @@ fn progress_advances_during_an_uninterrupted_run() {
 #[test]
 fn progress_to_a_file_has_no_escape_sequences() {
     let dir = tmp_dir("job_cli_progress_no_escapes");
-    let output = dir.join("out.tif");
+    let output = dir.join("mantis-512.ffproj");
     let start = std::time::Instant::now();
     let mantis = mantis_512_dir();
     let out = run_cli_in(
         &dir,
-        &interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap()),
+        &interruptible_stack_args(
+            mantis.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
+        ),
     );
     let elapsed = start.elapsed().as_secs_f64();
     assert!(out.success, "stderr: {}", out.stderr);
@@ -371,14 +425,14 @@ fn progress_to_a_file_has_no_escape_sequences() {
 #[test]
 fn quiet_prints_no_progress() {
     let dir = tmp_dir("job_cli_quiet");
-    let output = dir.join("out.tif");
+    let output = dir.join("mantis-512.ffproj");
     let out = run_cli_in(
         &dir,
         &[
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            output.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
             "--algo",
             "laplacian",
             "--no-align",
@@ -416,11 +470,14 @@ mod unix_signals {
     #[test]
     fn sigint_cancels_cleanly() {
         let dir = tmp_dir("job_cli_sigint_cancel");
-        let output = dir.join("out.tif");
+        let output = dir.join("mantis-512.ffproj");
         let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &dir,
-            &interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap()),
+            &interruptible_stack_args(
+                mantis.to_str().unwrap(),
+                output.parent().unwrap().to_str().unwrap(),
+            ),
         );
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let first = read_work_line(&mut stderr, "fuse ");
@@ -431,8 +488,16 @@ mod unix_signals {
 
         assert_eq!(status.code(), Some(130), "status: {status:?}");
         assert!(!output.exists(), "named output must not exist");
-        let partial = dir.join("out.tif.partial");
-        assert!(partial.exists(), "partial output must survive a cancel");
+        // The resumable state is no longer a `.partial` beside the output:
+        // fusion stages its two planes under `.scratch/projects/<group>/`
+        // and the project is sealed from them only once the job completes,
+        // so a cancel leaves the staged planes and the ledger, and nothing
+        // at all beside the named path.
+        assert_eq!(
+            staged_composites(&dir).len(),
+            1,
+            "the staged composite must survive a cancel"
+        );
         let resume_dir = dir.join(".scratch").join("resume");
         let entries: Vec<_> = std::fs::read_dir(&resume_dir)
             .expect("resume dir must exist")
@@ -450,10 +515,13 @@ mod unix_signals {
     #[test]
     fn status_record_written_on_cancel() {
         let dir = tmp_dir("job_cli_status_cancel");
-        let output = dir.join("out.tif");
+        let output = dir.join("mantis-512.ffproj");
         let status = dir.join("status.ndjson");
         let mantis = mantis_512_dir();
-        let mut args = interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap());
+        let mut args = interruptible_stack_args(
+            mantis.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
+        );
         args.push("--status");
         args.push(status.to_str().unwrap());
         let mut child = spawn_piped(&dir, &args);
@@ -477,14 +545,14 @@ mod unix_signals {
     #[test]
     fn sigint_then_resume_finishes_the_job() {
         let ref_dir = tmp_dir("job_cli_resume_reference");
-        let ref_output = ref_dir.join("out.tif");
+        let ref_output = ref_dir.join("mantis-512.ffproj");
         let ref_run = run_cli_in(
             &ref_dir,
             &[
                 "stack",
                 mantis_512_dir().to_str().unwrap(),
                 "-o",
-                ref_output.to_str().unwrap(),
+                ref_output.parent().unwrap().to_str().unwrap(),
                 "--algo",
                 "laplacian",
                 "--no-align",
@@ -500,9 +568,12 @@ mod unix_signals {
         assert!(ref_run.success, "stderr: {}", ref_run.stderr);
 
         let dir = tmp_dir("job_cli_resume_interrupted");
-        let output = dir.join("out.tif");
+        let output = dir.join("mantis-512.ffproj");
         let mantis_dir = mantis_512_dir();
-        let args = interruptible_stack_args(mantis_dir.to_str().unwrap(), output.to_str().unwrap());
+        let args = interruptible_stack_args(
+            mantis_dir.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
+        );
         let mut child = spawn_piped(&dir, &args);
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let _first = read_work_line(&mut stderr, "fuse ");
@@ -517,8 +588,8 @@ mod unix_signals {
         assert!(output.exists());
 
         assert_eq!(
-            read_pixels(&output),
-            read_pixels(&ref_output),
+            read_pixels(&export_composite(&dir, &output)),
+            read_pixels(&export_composite(&ref_dir, &ref_output)),
             "a killed-then-resumed run must match an uninterrupted one byte for byte"
         );
         let resume_dir = dir.join(".scratch").join("resume");
@@ -531,11 +602,14 @@ mod unix_signals {
     #[test]
     fn second_sigint_exits_immediately() {
         let dir = tmp_dir("job_cli_second_sigint");
-        let output = dir.join("out.tif");
+        let output = dir.join("mantis-512.ffproj");
         let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &dir,
-            &interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap()),
+            &interruptible_stack_args(
+                mantis.to_str().unwrap(),
+                output.parent().unwrap().to_str().unwrap(),
+            ),
         );
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let _first = read_work_line(&mut stderr, "fuse ");
@@ -612,11 +686,14 @@ mod unix_signals {
     #[test]
     fn sigusr1_pauses_the_run_and_a_second_one_resumes_it() {
         let dir = tmp_dir("job_cli_sigusr1_pause");
-        let output = dir.join("out.tif");
+        let output = dir.join("mantis-512.ffproj");
         let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &dir,
-            &interruptible_stack_args(mantis.to_str().unwrap(), output.to_str().unwrap()),
+            &interruptible_stack_args(
+                mantis.to_str().unwrap(),
+                output.parent().unwrap().to_str().unwrap(),
+            ),
         );
         let start = Instant::now();
         let (lines, reader) = read_stamped(child.stderr.take().unwrap(), start);
@@ -689,14 +766,14 @@ mod unix_signals {
     #[test]
     fn resume_without_state_fails_clearly() {
         let dir = tmp_dir("job_cli_resume_without_state");
-        let output = dir.join("out.tif");
+        let output = dir.join("mantis-512.ffproj");
         let out = run_cli_in(
             &dir,
             &[
                 "stack",
                 mantis_512_dir().to_str().unwrap(),
                 "-o",
-                output.to_str().unwrap(),
+                output.parent().unwrap().to_str().unwrap(),
                 "--algo",
                 "laplacian",
                 "--no-align",
@@ -713,8 +790,11 @@ mod unix_signals {
     fn resume_with_changed_inputs_fails() {
         let dir = tmp_dir("job_cli_resume_changed_inputs");
         let stack_dir = copy_fixture_frames(&dir.join("stack"));
-        let output = dir.join("out.tif");
-        let args = interruptible_stack_args(stack_dir.to_str().unwrap(), output.to_str().unwrap());
+        let output = dir.join("mantis-512.ffproj");
+        let args = interruptible_stack_args(
+            stack_dir.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
+        );
         let mut child = spawn_piped(&dir, &args);
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let _first = read_work_line(&mut stderr, "fuse ");
@@ -768,9 +848,12 @@ mod unix_signals {
     #[test]
     fn resume_with_a_changed_backend_fails() {
         let dir = tmp_dir("job_cli_resume_changed_backend");
-        let output = dir.join("out.tif");
+        let output = dir.join("mantis-512.ffproj");
         let mantis_dir = mantis_512_dir();
-        let args = interruptible_stack_args(mantis_dir.to_str().unwrap(), output.to_str().unwrap());
+        let args = interruptible_stack_args(
+            mantis_dir.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
+        );
         let mut child = spawn_piped(&dir, &args);
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let _first = read_work_line(&mut stderr, "fuse ");
@@ -807,13 +890,13 @@ mod unix_signals {
     #[test]
     fn resume_with_changed_tile_size_fails() {
         let dir = tmp_dir("job_cli_resume_changed_tile_size");
-        let output = dir.join("out.tif");
+        let output = dir.join("mantis-512.ffproj");
         let mantis_dir = mantis_512_dir();
         let base_args = [
             "stack",
             mantis_dir.to_str().unwrap(),
             "-o",
-            output.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
             "--algo",
             "laplacian",
             "--no-align",
@@ -851,14 +934,14 @@ mod unix_signals {
     fn exit_codes_distinguish_the_three_outcomes() {
         // Completed: 0.
         let ok_dir = tmp_dir("job_cli_exit_ok");
-        let ok_output = ok_dir.join("out.tif");
+        let ok_output = ok_dir.join("mantis-512.ffproj");
         let ok = run_cli_in(
             &ok_dir,
             &[
                 "stack",
                 mantis_512_dir().to_str().unwrap(),
                 "-o",
-                ok_output.to_str().unwrap(),
+                ok_output.parent().unwrap().to_str().unwrap(),
                 "--algo",
                 "laplacian",
                 "--no-align",
@@ -869,14 +952,14 @@ mod unix_signals {
 
         // Failed: 1.
         let fail_dir = tmp_dir("job_cli_exit_fail");
-        let fail_output = fail_dir.join("out.tif");
+        let fail_output = fail_dir.join("mantis-512.ffproj");
         let failed = run_cli_in(
             &fail_dir,
             &[
                 "stack",
                 mantis_512_dir().to_str().unwrap(),
                 "-o",
-                fail_output.to_str().unwrap(),
+                fail_output.parent().unwrap().to_str().unwrap(),
                 "--algo",
                 "does-not-exist",
             ],
@@ -885,11 +968,14 @@ mod unix_signals {
 
         // Cancelled: 130.
         let cancel_dir = tmp_dir("job_cli_exit_cancel");
-        let cancel_output = cancel_dir.join("out.tif");
+        let cancel_output = cancel_dir.join("mantis-512.ffproj");
         let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &cancel_dir,
-            &interruptible_stack_args(mantis.to_str().unwrap(), cancel_output.to_str().unwrap()),
+            &interruptible_stack_args(
+                mantis.to_str().unwrap(),
+                cancel_output.parent().unwrap().to_str().unwrap(),
+            ),
         );
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let _first = read_work_line(&mut stderr, "fuse ");
@@ -978,7 +1064,7 @@ mod unix_signals {
                 "stack",
                 &frames_arg,
                 "-o",
-                reference_output.to_str().unwrap(),
+                reference_output.parent().unwrap().to_str().unwrap(),
                 "--algo",
                 "laplacian",
                 "--no-align",
@@ -990,12 +1076,12 @@ mod unix_signals {
 
         // The interrupted run: SIGINT once a progress line shows the fuse
         // stage genuinely under way -- never a sleep.
-        let output = dir.join("out.tif");
+        let output = dir.join("mantis-512.ffproj");
         let args = [
             "stack",
             &frames_arg,
             "-o",
-            output.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
             "--algo",
             "laplacian",
             "--no-align",
@@ -1017,9 +1103,10 @@ mod unix_signals {
 
         assert_eq!(status.code(), Some(130), "status: {status:?}");
         assert!(!output.exists(), "the named output must not exist");
-        assert!(
-            dir.join("out.tif.partial").exists(),
-            "the partial output is the resumable state and must survive"
+        assert_eq!(
+            staged_composites(&dir).len(),
+            1,
+            "the staged composite is the resumable state and must survive"
         );
         let ledgers = std::fs::read_dir(dir.join(".scratch").join("resume"))
             .expect("resume dir must exist")
@@ -1072,13 +1159,13 @@ mod unix_signals {
         // is compared against the resumed run's `--json` report -- both drawn
         // from the same recorded `StackAlignment`, never two ECC solves.
         let dir = tmp_dir("job_cli_align_resume");
-        let output = dir.join("out.tif");
+        let output = dir.join("mantis-512.ffproj");
         let mantis_dir = mantis_512_dir();
         let args = [
             "stack",
             mantis_dir.to_str().unwrap(),
             "-o",
-            output.to_str().unwrap(),
+            output.parent().unwrap().to_str().unwrap(),
             "--algo",
             "laplacian",
             "--no-crop",
@@ -1146,14 +1233,14 @@ mod unix_signals {
 #[test]
 fn tuning_flags_reach_the_scheduler() {
     let default_dir = tmp_dir("job_cli_tuning_default");
-    let default_output = default_dir.join("out.tif");
+    let default_output = default_dir.join("mantis-512.ffproj");
     let default_run = run_cli_in(
         &default_dir,
         &[
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            default_output.to_str().unwrap(),
+            default_output.parent().unwrap().to_str().unwrap(),
             "--algo",
             "laplacian",
             "--no-align",
@@ -1165,10 +1252,12 @@ fn tuning_flags_reach_the_scheduler() {
     let default_report: serde_json::Value = serde_json::from_str(&default_run.stdout).unwrap();
 
     let tuned_dir = tmp_dir("job_cli_tuning_tuned");
-    let tuned_output = tuned_dir.join("out.tif");
+    let tuned_output = tuned_dir.join("mantis-512.ffproj");
     let mantis = mantis_512_dir();
-    let mut tuned_args =
-        interruptible_stack_args(mantis.to_str().unwrap(), tuned_output.to_str().unwrap());
+    let mut tuned_args = interruptible_stack_args(
+        mantis.to_str().unwrap(),
+        tuned_output.parent().unwrap().to_str().unwrap(),
+    );
     tuned_args.push("--json");
     let tuned_run = run_cli_in(&tuned_dir, &tuned_args);
     assert!(tuned_run.success, "stderr: {}", tuned_run.stderr);

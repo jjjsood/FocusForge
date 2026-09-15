@@ -474,13 +474,13 @@ fn stack_defaults_to_cpu() {
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("stack_defaults_to_cpu");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
-    let output = tmp.join("out.tif");
+    let output = tmp.join("mantis-512.ffproj");
 
     let out = bin()
         .arg("stack")
         .arg(mantis_512_dir())
         .arg("-o")
-        .arg(&output)
+        .arg(output.parent().unwrap())
         .arg("--algo")
         .arg("dummy-stack")
         .arg("--no-align")
