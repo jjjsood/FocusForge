@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The bottom bar: the only band that spans the dock, because zoom, Fit and
+// the ETA belong to the whole window. Otherwise an empty container except
+// for the gear control at the left end, which reaches the `Input map`
+// settings section.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFBottomBar inherits Rectangle {
+    height: ShellGeometry.bottom-bar-height;
+    background: Theme.surface-raised;
+}

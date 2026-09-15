@@ -315,9 +315,11 @@ fn no_colour_literal_outside_the_theme() {
 
 #[test]
 fn the_colour_scanner_catches_a_literal() {
-    // Without this test, `no_colour_literal_outside_the_theme` is green for
-    // the wrong reason: today `theme.slint` is the only `.slint` file in
-    // the crate, so the walk above finds nothing to scan at all.
+    // `no_colour_literal_outside_the_theme` passing proves nothing on its
+    // own: a walk that silently finds zero violations looks identical
+    // whether the scanner works or is vacuously never matching anything.
+    // This test proves the scanner itself catches a real literal, so the
+    // other test's green means "scanned and clean", not "scanned nothing".
     let sample = "component Foo inherits Rectangle {\n    background: #ff0000;\n}\n";
     assert_eq!(
         color_literal_lines(sample),

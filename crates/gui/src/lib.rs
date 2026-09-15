@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Generated Rust bindings for `ui/theme.slint`, re-exported so integration
-//! tests under `crates/gui/tests/` can reach the `Theme` global and the
-//! `ThemeProbe` component. `build.rs` compiles `ui/theme.slint` as the
-//! **main** file, so only what it exports is visible here -- see
-//! `ui/theme.slint`'s own header comment.
+//! Generated Rust bindings for `ui/app.slint`, the crate's real entry
+//! point. `build.rs` compiles `ui/app.slint` as the **main** file, so only
+//! what it exports is visible here: `AppWindow` itself, plus `Theme`,
+//! `TypeRole` and `ThemeProbe`, which `ui/app.slint` re-exports from
+//! `ui/theme.slint` so the crate's Slint integration tests keep compiling --
+//! see `ui/app.slint`'s own header comment.
 
 // Machine-generated code only; the workspace's `unsafe_code = "deny"` lint
 // stays in force for everything hand-written in this crate.
@@ -13,3 +14,19 @@ mod generated {
     slint::include_modules!();
 }
 pub use generated::*;
+
+/// Plain-Rust shell state and the callback-forwarding seam -- no
+/// `use slint::` anywhere in it. Reachable from `cargo test` without a
+/// window, the same way
+/// `tests/theme.rs` reaches `Theme` and `ThemeProbe` above.
+mod controller;
+pub use controller::*;
+
+/// The Slint side of the seam, and the only module in the crate that names
+/// `winit`. `pub` so `src/main.rs` -- a separate crate target that consumes
+/// this library like any other caller -- can install it on an `AppWindow`.
+pub mod bridge;
+
+/// Writes a `Window::take_snapshot()` buffer to a PNG file, for
+/// `--screenshot`.
+pub mod screenshot;

@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The stacking-mode toolbar: the run's transport at the left, two dim,
+// inert labels at the right end.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFToolbar inherits Rectangle {
+    height: ShellGeometry.toolbar-height;
+    background: Theme.surface-raised;
+}

@@ -11,7 +11,10 @@ workspace = true
 [dependencies]
 slint = { version = "~1.17", default-features = false, features = [
     "std", "compat-1-2", "backend-winit", "renderer-femtovg-wgpu", "unstable-wgpu-29",
+    "unstable-winit-030",
 ] }
+clap = { version = "4", features = ["derive"] }
+png = "0.18"
 
 [build-dependencies]
 slint-build = "~1.17"

@@ -1,0 +1,201 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The token sheet `--theme-sheet` renders one row per named token group
+// (colour, type, spacing, radius, icon size). Kept out of `theme.slint`
+// itself: `crates/gui/tests/theme.rs`'s `no_type_role_fixes_a_width` forbids
+// the substring `width` anywhere in that file, and a swatch needs one.
+
+import { Theme, TypeRole } from "theme.slint";
+
+component ColourSwatch inherits Rectangle {
+    in property <color> swatch;
+    in property <string> label;
+    width: 210px;
+    height: 32px;
+
+    HorizontalLayout {
+        spacing: Theme.space-2;
+        Rectangle {
+            width: 24px;
+            height: 24px;
+            background: root.swatch;
+            border-radius: Theme.radius-sm;
+            border-width: 1px;
+            border-color: Theme.border-default;
+        }
+        Text {
+            text: root.label;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component GroupHeading inherits Text {
+    color: Theme.text-secondary;
+    font-weight: 600;
+}
+
+component TypeSample inherits Rectangle {
+    in property <TypeRole> role;
+    in property <string> label;
+    height: 24px;
+
+    Text {
+        text: root.label;
+        color: Theme.text-primary;
+        font-size: root.role.size;
+        font-weight: root.role.weight;
+        letter-spacing: root.role.letter-spacing;
+    }
+}
+
+component SpacingSample inherits Rectangle {
+    in property <length> step;
+    in property <string> label;
+    height: 24px;
+
+    HorizontalLayout {
+        spacing: Theme.space-2;
+        Rectangle {
+            width: root.step;
+            height: 16px;
+            background: Theme.accent-default;
+        }
+        Text { text: root.label; color: Theme.text-primary; vertical-alignment: center; }
+    }
+}
+
+component RadiusSample inherits Rectangle {
+    in property <length> corner;
+    in property <string> label;
+    height: 24px;
+
+    HorizontalLayout {
+        spacing: Theme.space-2;
+        Rectangle {
+            width: 32px;
+            height: 24px;
+            background: Theme.surface-overlay;
+            border-radius: root.corner;
+        }
+        Text { text: root.label; color: Theme.text-primary; vertical-alignment: center; }
+    }
+}
+
+component IconSizeSample inherits Rectangle {
+    in property <length> icon-size;
+    in property <string> label;
+    height: 24px;
+
+    HorizontalLayout {
+        spacing: Theme.space-2;
+        Rectangle {
+            width: root.icon-size;
+            height: root.icon-size;
+            background: Theme.text-primary;
+        }
+        Text { text: root.label; color: Theme.text-primary; vertical-alignment: center; }
+    }
+}
+
+export component ThemeSheet inherits Window {
+    title: "FocusForge -- token sheet";
+    preferred-width: 940px;
+    preferred-height: 1000px;
+    background: Theme.surface-base;
+    default-font-family: Theme.font-family;
+
+    VerticalLayout {
+        padding: Theme.space-4;
+        spacing: Theme.space-3;
+        alignment: start;
+
+        GroupHeading { text: "Surfaces / Borders"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            ColourSwatch { swatch: Theme.surface-canvas; label: "surface.canvas"; }
+            ColourSwatch { swatch: Theme.surface-base; label: "surface.base"; }
+            ColourSwatch { swatch: Theme.surface-raised; label: "surface.raised"; }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            ColourSwatch { swatch: Theme.surface-overlay; label: "surface.overlay"; }
+            ColourSwatch { swatch: Theme.surface-hover; label: "surface.hover"; }
+            ColourSwatch { swatch: Theme.surface-disabled; label: "surface.disabled"; }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            ColourSwatch { swatch: Theme.border-default; label: "border.default"; }
+            ColourSwatch { swatch: Theme.border-strong; label: "border.strong"; }
+        }
+
+        GroupHeading { text: "Text"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            ColourSwatch { swatch: Theme.text-primary; label: "text.primary"; }
+            ColourSwatch { swatch: Theme.text-secondary; label: "text.secondary"; }
+            ColourSwatch { swatch: Theme.text-muted; label: "text.muted"; }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            ColourSwatch { swatch: Theme.text-disabled; label: "text.disabled"; }
+            ColourSwatch { swatch: Theme.text-on-accent; label: "text.onAccent"; }
+        }
+
+        GroupHeading { text: "Accent / Status"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            ColourSwatch { swatch: Theme.accent-default; label: "accent.default"; }
+            ColourSwatch { swatch: Theme.accent-hover; label: "accent.hover"; }
+            ColourSwatch { swatch: Theme.accent-pressed; label: "accent.pressed"; }
+            ColourSwatch { swatch: Theme.accent-subtle; label: "accent.subtle"; }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            ColourSwatch { swatch: Theme.status-failure; label: "status.failure"; }
+            ColourSwatch { swatch: Theme.status-warning; label: "status.warning"; }
+            ColourSwatch { swatch: Theme.status-success; label: "status.success"; }
+        }
+
+        GroupHeading { text: "Type"; }
+        TypeSample { role: Theme.text-section; label: "text.section"; }
+        TypeSample { role: Theme.text-body; label: "text.body"; }
+        TypeSample { role: Theme.text-value; label: "text.value"; }
+        TypeSample { role: Theme.text-emphasis; label: "text.emphasis"; }
+        TypeSample { role: Theme.text-title; label: "text.title"; }
+        TypeSample { role: Theme.text-display; label: "text.display"; }
+
+        GroupHeading { text: "Spacing"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            SpacingSample { step: Theme.space-1; label: "space-1"; }
+            SpacingSample { step: Theme.space-2; label: "space-2"; }
+            SpacingSample { step: Theme.space-3; label: "space-3"; }
+            SpacingSample { step: Theme.space-4; label: "space-4"; }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            SpacingSample { step: Theme.space-6; label: "space-6"; }
+            SpacingSample { step: Theme.space-8; label: "space-8"; }
+            SpacingSample { step: Theme.space-12; label: "space-12"; }
+        }
+
+        GroupHeading { text: "Radius"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            RadiusSample { corner: Theme.radius-sm; label: "radius-sm"; }
+            RadiusSample { corner: Theme.radius-md; label: "radius-md"; }
+            RadiusSample { corner: Theme.radius-lg; label: "radius-lg"; }
+            RadiusSample { corner: Theme.radius-full; label: "radius-full"; }
+        }
+
+        GroupHeading { text: "Icon sizes"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            IconSizeSample { icon-size: Theme.icon-lg; label: "icon-lg"; }
+            IconSizeSample { icon-size: Theme.icon-md; label: "icon-md"; }
+            IconSizeSample { icon-size: Theme.icon-sm; label: "icon-sm"; }
+        }
+    }
+}

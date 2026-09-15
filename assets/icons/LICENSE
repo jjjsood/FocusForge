@@ -2,7 +2,7 @@ Lucide icons, vendored by name, upstream bytes unmodified.
 
 Source: https://lucide.dev / https://github.com/lucide-icons/lucide
 Version vendored: 1.46.0 (upstream git tag `1.46.0`)
-Glyph count shipped: 34 -- one file per glyph, assets/icons/<lucide-name>.svg
+Glyph count shipped: 35 -- one file per glyph, assets/icons/<lucide-name>.svg
 
 The text below is upstream's own LICENSE file at that tag, reproduced verbatim
 (ISC, GPLv3-compatible and already allowed at deny.toml:21; the crate-level

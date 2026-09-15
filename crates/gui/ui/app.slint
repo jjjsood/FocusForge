@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The entry point compiled by `build.rs`. Slint exposes to Rust only what
+// this file exports.
+
+import { Theme, TypeRole, ThemeProbe } from "theme.slint";
+export { Theme, TypeRole, ThemeProbe }
+
+import { ThemeSheet } from "theme_sheet.slint";
+export { ThemeSheet }
+
+import { ShellGeometry } from "geometry.slint";
+import { FFTabStrip } from "shell/tab_strip.slint";
+import { FFToolbar } from "shell/toolbar.slint";
+import { FFCanvas } from "shell/canvas.slint";
+import { FFDock } from "shell/dock.slint";
+import { FFBottomBar } from "shell/bottom_bar.slint";
+
+export component AppWindow inherits Window {
+    // Every callback forwards one-for-one into `AppController` via
+    // `src/bridge.rs`.
+    callback window-drag-requested();
+    callback window-minimize-requested();
+    callback window-maximize-toggled();
+    callback window-close-requested();
+    callback mode-selected(string);
+    callback dock-tab-selected(string);
+    callback checkpoint-export-requested();
+
+    // Every piece of state the shell shows is an `in` property set from
+    // Rust, never computed here.
+    in property <bool> editor-enabled: false;
+    in property <string> mode: "stacking";
+    in property <string> dock-tab: "images";
+    // Named `window-maximized`, not `maximized`: `Window` already declares
+    // an in-out `maximized` (`i-slint-compiler` 1.17.1's `Window` builtin,
+    // `//-shadowable`), which is native window state reached only through
+    // the runtime `Window` API (`src/bridge.rs`), never as a generated root
+    // accessor. This property is the separate, plain chrome state the tab
+    // strip's maximize glyph draws from.
+    in property <bool> window-maximized: false;
+
+    no-frame: true;
+    resize-border-width: 8px;
+    min-width: ShellGeometry.min-width;
+    min-height: ShellGeometry.min-height;
+    preferred-width: ShellGeometry.base-width;
+    preferred-height: ShellGeometry.base-height;
+    background: Theme.surface-base;
+    default-font-family: Theme.font-family;
+    title: "FocusForge";
+
+    tab-strip := FFTabStrip {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: ShellGeometry.strip-height;
+        maximized: root.window-maximized;
+
+        window-drag-requested => { root.window-drag-requested(); }
+        window-minimize-requested => { root.window-minimize-requested(); }
+        window-maximize-toggled => { root.window-maximize-toggled(); }
+        window-close-requested => { root.window-close-requested(); }
+    }
+
+    toolbar := FFToolbar {
+        x: 0px;
+        y: ShellGeometry.strip-height;
+        width: root.width - ShellGeometry.dock-width;
+        height: ShellGeometry.toolbar-height;
+    }
+
+    canvas-ground := FFCanvas {
+        x: 0px;
+        y: ShellGeometry.strip-height + ShellGeometry.toolbar-height;
+        width: root.width - ShellGeometry.dock-width;
+        height: root.height - ShellGeometry.strip-height - ShellGeometry.toolbar-height
+            - ShellGeometry.bottom-bar-height;
+    }
+
+    dock := FFDock {
+        x: root.width - ShellGeometry.dock-width;
+        y: ShellGeometry.strip-height;
+        width: ShellGeometry.dock-width;
+        height: root.height - ShellGeometry.strip-height - ShellGeometry.bottom-bar-height;
+        editor-enabled: root.editor-enabled;
+        mode: root.mode;
+        dock-tab: root.dock-tab;
+
+        mode-selected(m) => { root.mode-selected(m); }
+        dock-tab-selected(t) => { root.dock-tab-selected(t); }
+        checkpoint-export-requested => { root.checkpoint-export-requested(); }
+    }
+
+    bottom-bar := FFBottomBar {
+        x: 0px;
+        y: root.height - ShellGeometry.bottom-bar-height;
+        width: root.width;
+        height: ShellGeometry.bottom-bar-height;
+    }
+}

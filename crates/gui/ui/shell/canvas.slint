@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The canvas region: two panes with a 16 px gutter and a 2 px divider
+// centred inside the middle gutter -- the divider is not added on top of
+// the gutter. Each pane carries the wgpu-written image, a 120 x 22 label at
+// +10/+10 from the top-left, and a 26 x 22 undock control at +10/+10 from
+// the top-right.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFPane inherits Rectangle {
+    background: Theme.surface-canvas;
+    border-radius: Theme.radius-md;
+}
+
+export component FFCanvas inherits Rectangle {
+    background: Theme.surface-base;
+
+    pane-left := FFPane {
+        x: ShellGeometry.pane-gutter;
+        y: ShellGeometry.pane-gutter;
+        width: (parent.width - 3 * ShellGeometry.pane-gutter) / 2;
+        height: parent.height - 2 * ShellGeometry.pane-gutter;
+    }
+
+    pane-divider := Rectangle {
+        x: pane-left.x + pane-left.width
+            + (ShellGeometry.pane-gutter - ShellGeometry.pane-divider) / 2;
+        y: ShellGeometry.pane-gutter;
+        width: ShellGeometry.pane-divider;
+        height: parent.height - 2 * ShellGeometry.pane-gutter;
+        background: Theme.border-default;
+    }
+
+    pane-right := FFPane {
+        x: parent.width - ShellGeometry.pane-gutter - pane-left.width;
+        y: ShellGeometry.pane-gutter;
+        width: pane-left.width;
+        height: pane-left.height;
+    }
+}

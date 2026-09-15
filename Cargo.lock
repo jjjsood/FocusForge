@@ -1391,7 +1391,9 @@ dependencies = [
 name = "focusforge-gui"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "i-slint-backend-testing",
+ "png",
  "slint",
  "slint-build",
 ]
@@ -4515,6 +4517,7 @@ dependencies = [
  "const-field-offset",
  "i-slint-backend-android-activity",
  "i-slint-backend-selector",
+ "i-slint-backend-winit",
  "i-slint-common",
  "i-slint-core",
  "i-slint-core-macros",

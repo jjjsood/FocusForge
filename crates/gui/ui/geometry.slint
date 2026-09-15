@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The shell's geometry, as a single exported global: every number here is
+// transcribed once, so the `.slint` shell files and the geometry tests read one source.
+
+export global ShellGeometry {
+    // The window itself.
+    out property <length> base-width: 1440px;
+    out property <length> base-height: 900px;
+    out property <length> min-width: 1200px;
+    out property <length> min-height: 760px;
+
+    // The three horizontal bands.
+    out property <length> strip-height: 36px;
+    out property <length> toolbar-height: 40px;
+    out property <length> bottom-bar-height: 44px;
+    out property <length> dock-width: 260px;
+
+    // The canvas region's two panes. The divider sits
+    // centred *inside* the gutter, never added on top of it:
+    // 1180 - 3*16 = 1132, /2 = 566 (base); 940 - 3*16 = 892, /2 = 446 (min).
+    out property <length> pane-gutter: 16px;
+    out property <length> pane-divider: 2px;
+
+    // The dock's three insets, drawn separately, not collapsed to one.
+    out property <length> dock-band-inset: 6px;
+    out property <length> dock-content-inset: 8px;
+    out property <length> dock-scrollbar-inset: 4px;
+
+    // The tab strip's window glyphs.
+    out property <length> glyph-pitch: 36px;
+    out property <length> glyph-first-x: 1335px; // 1342 - 7
+
+    // Dock rows.
+    out property <length> checkpoint-row-height: 40px;
+    out property <length> tab-width: 224px;
+    out property <length> tab-pitch: 228px;
+}
