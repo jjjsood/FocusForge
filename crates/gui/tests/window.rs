@@ -43,10 +43,24 @@ fn screenshot_is_not_uniform() {
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let mut reader = decoder.read_info().unwrap();
     let info = reader.info();
-    assert_eq!(
-        (info.width, info.height),
-        (1440, 900),
-        "unexpected PNG dimensions"
+    // Physical pixels, not logical: the host's own DPI/scale factor (unset by
+    // this test, so whatever winit reports for the display it runs on)
+    // multiplies the 1440x900 base the window opens at. Assert the invariant
+    // that survives across hosts -- both dimensions scaled by the same
+    // factor, and that factor plausible -- rather than a fixed pixel count.
+    let scale_x = f64::from(info.width) / 1440.0;
+    let scale_y = f64::from(info.height) / 900.0;
+    assert!(
+        (scale_x - scale_y).abs() < 0.01,
+        "screenshot scale factor differs between width and height: {scale_x} vs {scale_y} ({}x{})",
+        info.width,
+        info.height
+    );
+    assert!(
+        (0.5..=4.0).contains(&scale_x),
+        "implausible screenshot scale factor {scale_x} ({}x{})",
+        info.width,
+        info.height
     );
 
     let mut buf = vec![0u8; reader.output_buffer_size().expect("PNG has no frames")];
