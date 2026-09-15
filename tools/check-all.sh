@@ -36,6 +36,17 @@
 # command, and it must be started after `build`, which is what produces the
 # binary it runs.
 #
+# `build (no default features)` runs BEFORE `build`, not after, and that order
+# is load-bearing, not cosmetic. Both stages write the same
+# target/debug/focusforge-cli, keyed by cargo's feature-set fingerprint so both
+# variants coexist in the shared target/. Two later stages execute whichever
+# binary was written last: the background `fixture e2e` track above and
+# `cargo test --workspace` (through CARGO_BIN_EXE_focusforge-cli). If the
+# no-default build ran last, those stages would silently exercise a GPU-less
+# binary. Running it first means `build` always writes the GPU-enabled binary
+# last, which is the one every later stage is meant to exercise, since `gpu`
+# is a default feature.
+#
 # `clippy` is not in --static even though it never mutates the source: it
 # compiles the whole workspace. The static set has to stay fast enough that
 # nobody is tempted to skip the pre-commit hook, which means no gate in it may
@@ -103,8 +114,15 @@ run_gate "fixture manifest" tools/check-fixtures.sh
 run_gate "fixture manifest selftest" tools/check-fixtures-selftest.sh
 
 if [ "$STATIC_ONLY" -eq 0 ]; then
-  # Must come first: it produces the binary the background stage runs, and it
-  # holds the target/ lock the cargo gates below queue on anyway.
+  # Build-only: proves the no-GPU path still compiles, test targets included.
+  # Must run BEFORE `build` -- see the two-track header comment above for why
+  # the order is load-bearing.
+  run_gate "build (no default features)" \
+                             cargo build --workspace --all-targets --no-default-features
+
+  # Must come first among the GPU-enabled stages: it produces the binary the
+  # background stage runs, and it holds the target/ lock the cargo gates below
+  # queue on anyway.
   run_gate "build"          cargo build --workspace --all-targets
 
   # The long background stage, started now and joined at the end. Not a

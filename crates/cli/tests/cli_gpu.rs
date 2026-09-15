@@ -10,10 +10,10 @@
 //! `crates/gpu/tests/harness.rs`'s one-binary-one-device convention.
 //!
 //! Each test here loads the GPU (through the spawned process) and is meant
-//! to be run deliberately, once, alongside the other
-//! `--features gpu` runs -- never inside a red-green loop.
+//! to be run deliberately, alongside the other `--features gpu-tests`
+//! runs, not as part of a routine `cargo test` invocation.
 
-#![cfg(feature = "gpu")]
+#![cfg(feature = "gpu-tests")]
 
 mod common;
 

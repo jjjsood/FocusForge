@@ -51,15 +51,23 @@ never hand-edited.
 
 `crates/gpu`'s WGSL fusion and warp kernels, and the pipeline in
 `focusforge-cli` that dispatches them, sit behind the `gpu` Cargo feature —
-off by default, so a plain `cargo build --workspace` or `cargo test
---workspace` never touches them. `cargo clippy --workspace --all-targets
---all-features` compiles (never runs) that code on every gate pass, so a
-break there is still caught without a GPU present. Their own tests need a
-real GPU device and stay behind `cargo test --workspace --features gpu` —
+on by default, so a plain `cargo build --workspace` or `cargo test
+--workspace` compiles and, where a test drives the `laplacian` algorithm or
+`align --write-warped`, runs them. `--no-default-features` excludes the GPU
+path entirely and still compiles, test targets included; that build's one
+behavioural check
+(`cargo test -p focusforge-cli --no-default-features --test cli
+no_gpu_flag_absent_without_the_feature`) is run by hand, not in the standing
+gate. `cargo clippy --workspace --all-targets --all-features` compiles that
+code on every gate pass regardless of the default. The device tests that need
+a real GPU adapter sit behind a separate, non-default `gpu-tests` feature and
+run as `cargo test --workspace --features gpu-tests -- --test-threads=1` —
 run by hand, deliberately, once per change to that code, never inside the
-default gate. Those tests assert each kernel matches its CPU twin to within
-1 LSB at 16-bit, and that a whole GPU `stack` run matches the equivalent CPU
-run on `fixtures/mantis-512`.
+default gate. `--test-threads=1` is required: `parity_pipeline`'s
+`warp_to_fusion_never_reads_back` asserts on a process-global readback
+counter that only holds under serial execution. Those tests assert each
+kernel matches its CPU twin to within 1 LSB at 16-bit, and that a whole GPU
+`stack` run matches the equivalent CPU run on `fixtures/mantis-512`.
 
 ## Before you send a change
 

@@ -138,21 +138,8 @@ fn peak_live_heap_stays_under_ceiling() {
     // 512 x 512 x 3 samples x 2 B. This is what makes "a load-every-frame
     // implementation fails by construction" a fact rather than a claim.
     let full_load_bytes = frame_count as u64 * width as u64 * height as u64 * 3 * 2;
-    // Raised from 4 MiB to 5 MiB when this test grew a real allocating
-    // consumer. The ceiling moved because what is being measured grew --
-    // a `FusionConsumer` builds per-worker Laplacian pyramids on top of
-    // the scheduler's frame-tile buffers, where the old `NoAllocConsumer`
-    // added nothing -- NOT because the test was failing and the number
-    // was in the way. That is the whole of it: a first diagnosis blamed
-    // the budget formula instead and was wrong, because `tile_size` is
-    // already the outer size. The consumer's pyramids are the real
-    // reason, and they are why this ceiling stays raised while the
-    // formula went back.
-    //
-    // The discrimination the test exists for is intact and asserted just
-    // below: 5 MiB is still far under the 12 MiB a load-every-frame
-    // implementation would need, so a full-load regression still fails
-    // this test loudly.
+    // 5 MiB: scheduler buffers plus per-worker pyramids; still far under
+    // the 12 MiB a load-every-frame implementation needs.
     const CEILING: usize = 5 * 1024 * 1024;
     assert!(
         (CEILING as u64) < full_load_bytes,

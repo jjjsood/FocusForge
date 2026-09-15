@@ -7,26 +7,11 @@
 //! sibling `.wgsl` file; [`convert`], [`pyramid`] and [`select`] wrap them
 //! with plain `&wgpu::Buffer` + dimension arguments so parity tests call them.
 //!
-//! **Frame 0 is not special-cased.** The CPU twin seeds its running best
-//! directly from frame 0's own pyramid and its residual sum from frame 0's
-//! own residual. Here, `best`'s score is initialised to `f32::NEG_INFINITY`
-//! and the residual sum to `0.0`, and *every* frame from `0` runs through
-//! the identical select/accumulate dispatches: frame 0's real score is
-//! always finite (a sum of `abs()` values) and therefore always greater
-//! than `-infinity`, so the select kernel unconditionally installs it --
-//! bit-identical to a direct seed, since no arithmetic touches the winning
-//! path (a copy and two stores). `0.0 + x == x` exactly in `f32` for every
-//! finite `x`, so the zero-seeded residual sum is bit-identical to seeding
-//! from frame 0 directly. This is what lets one loop over `0..frame_count`
-//! replace the CPU twin's "seed from frame 0, then fold in the rest".
-//!
-//! Buffers are allocated and dropped per dispatch: keeping pyramid levels
-//! resident on the GPU between stages is out of scope for this module.
-//!
-//! The pipeline-building plumbing (`Pipeline`, `storage_entry`,
-//! `uniform_entry`, `build_pipeline`, `run_pass`, `upload_params`) lives in
-//! `crate::pipeline`, not here: the warp kernel needs the identical six
-//! helpers, and this module only ever imports them.
+//! **Frame 0 is not special-cased.** `best`'s score starts at
+//! `f32::NEG_INFINITY` and the residual sum at `0.0`, and every frame runs
+//! the same select/accumulate dispatches. Frame 0's score is finite, so
+//! select installs it by copy, and `0.0 + x == x` in `f32`: both are
+//! bit-identical to the CPU twin's "seed from frame 0, then fold in the rest".
 
 pub mod convert;
 pub mod pyramid;
@@ -85,17 +70,10 @@ fn shape_c() -> Vec<wgpu::BindGroupLayoutEntry> {
 }
 
 /// Shape D: one storage buffer read/write, one uniform -- `residual::mean`
-/// alone. `residual.wgsl` declares `mean`'s two module-level globals at
-/// binding 1 (`sum`) and binding 2 (`params`); its `value` (binding 0) is
-/// declared for `accumulate`'s use and is not reachable from `mean`'s own
-/// body, so `mean`'s pipeline layout omits binding 0 entirely rather than
-/// reusing `shape_a` and pointing its binding-0 entry at the same buffer as
-/// binding 1. Fix for a real wgpu validation failure measured on the RTX
-/// 5070 Ti (Vulkan, driver 595.84): binding the same physical buffer at a
-/// `read`-only slot and a `read_write` slot in one dispatch is rejected as
-/// "conflicting usages" regardless of whether the shader body actually
-/// dereferences the unused slot -- aliasing is invalid by binding, not by
-/// reachability.
+/// alone, bindings 1 (`sum`) and 2 (`params`). Binding 0 is omitted, not
+/// aliased to `sum`: wgpu rejects one buffer bound both `read` and
+/// `read_write` in a dispatch ("conflicting usages"), even when the shader
+/// never touches the unused slot (Vulkan, RTX 5070 Ti, driver 595.84).
 fn shape_d() -> Vec<wgpu::BindGroupLayoutEntry> {
     vec![storage_entry(1, false), uniform_entry(2)]
 }
@@ -351,17 +329,10 @@ struct BestLevel {
 }
 
 /// Fuses `rect` across `frame_count` frames at pyramid depth `levels`,
-/// entirely on the GPU, returning the composite tile and the Z-Map -- the
-/// WGSL twin of `focusforge_core::fuse::laplacian::Laplacian::fuse`. See the
-/// module docs for why frame 0 needs no special case.
-///
-/// `source` supplies frame `i`'s base [`GpuPlane`], already resident on the
-/// GPU -- [`fuse_tile_gpu`] below reads and uploads it directly, while
-/// [`crate::stack_tile::warp_fuse_tile_gpu`] warps it on the GPU and joins
-/// the result at [`plane_from_packed`], with **exactly one readback per
-/// tile** (the two `download_buffer` calls at this function's own tail):
-/// nothing between a warped frame's dispatch and this function's return
-/// touches `download_buffer`, `download_f32` or `map_async`.
+/// entirely on the GPU -- the WGSL twin of `Laplacian::fuse`. `source`
+/// supplies frame `i`'s base [`GpuPlane`], already resident. The two
+/// `download_buffer` calls at the tail (composite, Z-Map) are the only
+/// readbacks; the module docs cover why frame 0 needs no special case.
 pub(crate) fn fuse_planes_gpu(
     shared: &SharedDevice,
     pipelines: &FusionPipelines,

@@ -165,8 +165,8 @@ off:
 | `--align-algo <ALGO>` | alignment algorithm id; optional, defaults to the sole registered alignment algorithm |
 | `--align-set <KEY=VALUE>` | set one alignment parameter, repeatable; separate from `--set`, which is the stacking algorithm's own |
 | `--max-host-memory <SIZE>` | a **ceiling only** on the adaptive host-memory budget: it can lower the budget the host-derived estimate resolved to, never raise it. Omit it entirely to get the machine's own concurrency. Accepts suffixed sizes: `B`; `KiB`/`MiB`/`GiB`/`TiB` (1024-based); `KB`/`MB`/`GB`/`TB` (1000-based); no suffix means bytes (e.g. `8GiB`, `512MiB`, `4096`) |
-| `--max-vram <SIZE>` | a **ceiling only** on the adaptive device (VRAM) budget: it can lower the budget the startup probe settled on, never raise it. Omit it entirely to get the probed value. Same accepted sizes as `--max-host-memory`; only exists when the binary was built with `--features gpu` |
-| `--no-gpu` | force the CPU path even when a usable GPU adapter is present; only exists when the binary was built with `--features gpu` |
+| `--max-vram <SIZE>` | a **ceiling only** on the adaptive device (VRAM) budget: it can lower the budget the startup probe settled on, never raise it. Omit it entirely to get the probed value. Same accepted sizes as `--max-host-memory`; absent when the binary was built `--no-default-features` |
+| `--no-gpu` | force the CPU path even when a usable GPU adapter is present; absent when the binary was built `--no-default-features` |
 
 Every algorithm also writes a **Z-Map** when `--zmap` is given: a
 single-channel 16-bit TIFF with one value per output pixel naming the index
@@ -185,9 +185,9 @@ how to soften that. An empty auto-crop (the frames' footprints do not
 intersect) is refused before any output file is created, naming `--no-crop`
 as the way through.
 
-**GPU use is automatic, never an opt-in flag.** Built with `--features
-gpu`, `stack` uses a usable GPU adapter automatically for the `laplacian`
-algorithm — the only one with a GPU implementation; `weighted-average` and
+**GPU use is automatic, never an opt-in flag.** The GPU path is compiled in
+by default, and `stack` uses a usable GPU adapter automatically for the
+`laplacian` algorithm — the only one with a GPU implementation; `weighted-average` and
 `depth-map` always run on the CPU. `--no-gpu` forces the CPU path
 regardless of algorithm. A missing or unusable adapter falls back to the
 CPU path on its own, printing why on stderr, never silently and never as a
@@ -197,7 +197,7 @@ backends changes speed, not the output; `stack --json`'s `backend` field
 names which one actually ran.
 
 ```
-$ focusforge-cli stack fixtures/mantis-64 -o .scratch/out.tif --algo laplacian --zmap .scratch/zmap.tif --no-align
+$ focusforge-cli stack fixtures/mantis-64 -o .scratch/out.tif --algo laplacian --zmap .scratch/zmap.tif --no-align --no-gpu
 fixtures/mantis-64 (3 frames)
 64x64 3ch
 laplacian - Laplacian Pyramid
@@ -216,8 +216,8 @@ alignment in strict mode, so a real run without either `--no-align` or a
 softened failure policy would refuse instead — see
 [`guide/alignment.md`](../guide/alignment.md#failure-is-strict-by-default) for
 what that policy is and why it defaults to strict. `backend` reads `"cpu"`
-because this binary was built without `--features gpu`; built with it and a
-usable adapter present, it instead names the adapter, for example `NVIDIA
+because this example passes `--no-gpu`; omit it on a default build with a
+usable adapter present and it instead names the adapter, for example `NVIDIA
 GeForce RTX 5070 Ti (backend=Vulkan, driver=NVIDIA, driver_info=595.84)`.)
 
 ### `--json`
@@ -303,7 +303,7 @@ Options:
 | `--json` | emit the frozen JSON report instead of human-readable text |
 | `--write-warped <DIR>` | write one warped TIFF per frame into `<DIR>`, at source dimensions, uncropped |
 | `--set <KEY=VALUE>` | set one algorithm parameter, repeatable; a repeated key keeps the last value |
-| `--no-gpu` | force the CPU path even when a usable GPU adapter is present; only exists when the binary was built with `--features gpu`. Meaningful only together with `--write-warped` — the ECC solver `align` reports on is CPU-only regardless |
+| `--no-gpu` | force the CPU path even when a usable GPU adapter is present; absent when the binary was built `--no-default-features`. Meaningful only together with `--write-warped` — the ECC solver `align` reports on is CPU-only regardless |
 
 A frame whose registration diverges refuses the run, exit 1, naming every
 failed frame — this is the default, and it is not a flag; run

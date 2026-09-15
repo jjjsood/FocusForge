@@ -319,6 +319,7 @@ fn out_of_range_parameter_is_rejected() {
         "laplacian",
         "--set",
         "levels=999",
+        "--no-gpu",
     ]);
     assert!(
         !out.success,
@@ -355,6 +356,7 @@ fn refuses_levels_the_tile_geometry_cannot_plan() {
         "levels=7",
         "--no-align",
         "--no-crop",
+        "--no-gpu",
     ]);
     assert!(
         !out.success,
