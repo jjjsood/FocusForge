@@ -48,6 +48,14 @@ pub struct StackReport {
     pub frame_tiles_read: usize,
     pub in_flight_limit: usize,
     pub peak_in_flight: usize,
+    /// The host in-flight-byte budget actually in force for this run.
+    pub max_bytes_in_flight: u64,
+    /// Where that budget came from: `Host` (adaptive), `HostFallback` (the
+    /// probe degraded), or `Explicit` (`--max-host-memory` lowered it).
+    pub budget_provenance: Provenance,
+    /// Whether the runtime back-off shrunk the in-flight limit during this
+    /// run.
+    pub backed_off: bool,
     /// Final paths only -- never the `.partial` names a run writes to first.
     pub outputs: Vec<String>,
     pub wall_seconds: f64,
@@ -100,6 +108,7 @@ pub fn run(
     set: &SetArgs,
     align_opts: &AlignOptions<'_>,
     no_gpu: bool,
+    max_host_memory: Option<u64>,
 ) -> ExitCode {
     let start = Instant::now();
 
@@ -346,6 +355,7 @@ pub fn run(
     // CPU-warped pixels.
     let mut options = TileSchedulerOptions::new(".scratch");
     options.levels = levels;
+    options.budget = options.budget.capped_to(max_host_memory);
     let reader: &dyn focusforge_core::algorithm::TileReader = match &backend {
         Some(_) => &stack,
         None => &warping_reader,
@@ -472,6 +482,9 @@ pub fn run(
         frame_tiles_read: run_report.frame_tiles_read,
         in_flight_limit: run_report.in_flight_limit,
         peak_in_flight: run_report.peak_in_flight,
+        max_bytes_in_flight: run_report.max_bytes_in_flight,
+        budget_provenance: run_report.budget_provenance,
+        backed_off: run_report.final_in_flight_limit < run_report.in_flight_limit,
         outputs,
         wall_seconds: start.elapsed().as_secs_f64(),
         output_width: applied_crop.map(|r| r.width).unwrap_or(width),
@@ -603,6 +616,10 @@ fn render(report: &StackReport) -> String {
         "tile_size={} levels={} margin={} tiles={} in_flight_limit={}",
         report.tile_size, report.levels, report.margin, report.tiles, report.in_flight_limit,
     ));
+    lines.push(format!(
+        "max_bytes_in_flight={} budget={:?} backed_off={}",
+        report.max_bytes_in_flight, report.budget_provenance, report.backed_off,
+    ));
     lines.push(format!("backend: {}", report.backend));
     for output in &report.outputs {
         lines.push(format!("wrote: {output}"));
@@ -643,6 +660,9 @@ mod tests {
             frame_tiles_read: 32,
             in_flight_limit: 5,
             peak_in_flight: 4,
+            max_bytes_in_flight: 1 << 30,
+            budget_provenance: Provenance::Host,
+            backed_off: false,
             outputs: vec!["out.tif".to_string(), "out-zmap.tif".to_string()],
             wall_seconds: 1.5,
             output_width: 512,
@@ -670,6 +690,9 @@ mod tests {
             "margin=96",
             "tiles=4",
             "in_flight_limit=5",
+            "max_bytes_in_flight=1073741824",
+            "budget=Host",
+            "backed_off=false",
             "wrote: out.tif",
             "wrote: out-zmap.tif",
             "wall: 1.500s",

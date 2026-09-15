@@ -164,6 +164,7 @@ off:
 | `--no-crop` | skip the auto-crop: the output stays at the full frame extent even with alignment on |
 | `--align-algo <ALGO>` | alignment algorithm id; optional, defaults to the sole registered alignment algorithm |
 | `--align-set <KEY=VALUE>` | set one alignment parameter, repeatable; separate from `--set`, which is the stacking algorithm's own |
+| `--max-host-memory <SIZE>` | a **ceiling only** on the adaptive host-memory budget: it can lower the budget the host-derived estimate resolved to, never raise it. Omit it entirely to get the machine's own concurrency. Accepts suffixed sizes: `B`; `KiB`/`MiB`/`GiB`/`TiB` (1024-based); `KB`/`MB`/`GB`/`TB` (1000-based); no suffix means bytes (e.g. `8GiB`, `512MiB`, `4096`) |
 | `--no-gpu` | force the CPU path even when a usable GPU adapter is present; only exists when the binary was built with `--features gpu` |
 
 Every algorithm also writes a **Z-Map** when `--zmap` is given: a
@@ -201,6 +202,7 @@ fixtures/mantis-64 (3 frames)
 laplacian - Laplacian Pyramid
 levels = 4 (Auto)
 tile_size=512 levels=4 margin=48 tiles=1 in_flight_limit=32
+max_bytes_in_flight=1073741824 budget=Host backed_off=false
 backend: cpu
 wrote: .scratch/out.tif
 wrote: .scratch/zmap.tif
@@ -238,6 +240,14 @@ frame's transform, in the same shape `align --json` reports (see below).
 Additive field from the GPU path: `backend` — `"cpu"`, or the selected
 adapter's name and driver info.
 
+Additive fields from the host-memory budget: `max_bytes_in_flight` (the
+in-flight byte budget actually in force), `budget_provenance` (`"Host"` —
+derived from the host's currently reported available memory;
+`"HostFallback"` — the host probe was unavailable and the stated default was
+used instead; `"Explicit"` — `--max-host-memory` lowered the budget), and
+`backed_off` (whether the runtime back-off shrunk the in-flight limit during
+this run because of observed memory pressure).
+
 ```json
 {
   "input": "fixtures/mantis-64",
@@ -256,6 +266,9 @@ adapter's name and driver info.
   "frame_tiles_read": 3,
   "in_flight_limit": 32,
   "peak_in_flight": 1,
+  "max_bytes_in_flight": 1073741824,
+  "budget_provenance": "Host",
+  "backed_off": false,
   "outputs": [".scratch/out.tif", ".scratch/zmap.tif"],
   "wall_seconds": 0.030267391,
   "backend": "cpu"

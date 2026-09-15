@@ -67,12 +67,9 @@ fn run_fusion(
 
     let scheduler_scratch =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("fuse_algorithms_{label}"));
-    let options = TileSchedulerOptions {
-        tile_size,
-        levels,
-        max_bytes_in_flight: 1 << 30,
-        scratch_base: scheduler_scratch,
-    };
+    let mut options = TileSchedulerOptions::explicit_budget(scheduler_scratch, 1 << 30);
+    options.tile_size = tile_size;
+    options.levels = levels;
     let scheduler =
         TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
     let consumer = FusionConsumer::create(

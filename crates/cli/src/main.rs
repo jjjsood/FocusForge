@@ -16,6 +16,7 @@ use serde::Serialize;
 
 mod algorithms;
 mod align;
+mod bytes;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod set;
@@ -118,6 +119,17 @@ enum Command {
         align_algo: Option<String>,
         #[command(flatten)]
         align_set: set::AlignSetArgs,
+        /// A **ceiling only** on the adaptive host-memory budget: it can
+        /// lower the budget the host-derived estimate resolved to, and can
+        /// never raise it. Nobody has to pass this to get the machine's own
+        /// concurrency -- omit it entirely and the budget is derived from
+        /// the host. Accepts suffixed sizes (`8GiB`, `512MiB`, `4096`).
+        #[arg(
+            long = "max-host-memory",
+            value_name = "SIZE",
+            value_parser = crate::bytes::parse_byte_size
+        )]
+        max_host_memory: Option<u64>,
         /// Force the CPU path even when a usable GPU adapter is available.
         /// Only present when the `gpu` feature is compiled in -- with it
         /// off, this flag does not exist at all, not even as a no-op.
@@ -182,6 +194,7 @@ fn main() -> ExitCode {
             lax,
             align_algo,
             align_set,
+            max_host_memory,
             #[cfg(feature = "gpu")]
             gpu,
         } => {
@@ -204,6 +217,7 @@ fn main() -> ExitCode {
                     set: &align_set.align_set,
                 },
                 no_gpu,
+                max_host_memory,
             )
         }
         Command::Align {
