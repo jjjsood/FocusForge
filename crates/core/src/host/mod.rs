@@ -258,25 +258,25 @@ impl HostProbe for SysinfoProbe {
 /// (GuillaumeGomez/sysinfo#1723, open), which yields the *host* total
 /// instead of the container's -- an over-estimate, never an under-estimate.
 fn read_process_facts(sys: &mut System) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let mut rss = None;
+    let mut process_cgroup_limits = None;
     if let Ok(pid) = sysinfo::get_current_pid() {
         sys.refresh_processes_specifics(
             ProcessesToUpdate::Some(std::slice::from_ref(&pid)),
             false,
             ProcessRefreshKind::nothing().with_memory(),
         );
-        let process = sys.process(pid);
-        let rss = process.map(|p| p.memory());
-        if let Some(limits) = process.and_then(|p| p.cgroup_limits()) {
-            return (Some(limits.total_memory), Some(limits.free_memory), rss);
+        if let Some(process) = sys.process(pid) {
+            rss = Some(process.memory());
+            process_cgroup_limits = process.cgroup_limits();
         }
-        if let Some(limits) = sys.cgroup_limits() {
-            return (Some(limits.total_memory), Some(limits.free_memory), rss);
-        }
-        return (None, None, rss);
     }
-    match sys.cgroup_limits() {
-        Some(limits) => (Some(limits.total_memory), Some(limits.free_memory), None),
-        None => (None, None, None),
+    // The process's own cgroup scope wins when it has one; the root scope
+    // (`System::cgroup_limits`) is the fallback used both when the process
+    // form returned `None` and when the pid lookup itself failed.
+    match process_cgroup_limits.or_else(|| sys.cgroup_limits()) {
+        Some(limits) => (Some(limits.total_memory), Some(limits.free_memory), rss),
+        None => (None, None, rss),
     }
 }
 
