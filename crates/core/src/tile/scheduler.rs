@@ -7,6 +7,19 @@
 //! empty) [`FramePreprocess`] hook per frame-tile, and handing the set to a
 //! [`TileConsumer`].
 //!
+//! # A consumer that supplies its own pixels
+//!
+//! A [`TileConsumer`] answering [`TileConsumer::supplies_own_pixels`] `true`
+//! (a GPU-backed consumer, for instance) skips this host read loop entirely -- it pulls
+//! its own, possibly footprint-grown, source rects instead of the
+//! scheduler's own destination read rect. Two consequences follow, both
+//! deliberate rather than papered over: [`TileRunReport::frame_tiles_read`]
+//! is `0` on that path, because the scheduler genuinely read no frame-tile;
+//! and the (currently empty) [`FramePreprocess`] hook is never called for
+//! that tile, since there is no frame-tile to run it over --
+//! [`TileScheduler::run_tiles`] refuses outright (rather than silently
+//! skipping) when a non-noop `FramePreprocess` meets such a consumer.
+//!
 //! # Memory budget
 //!
 //! The rayon pool is sized from `std::thread::available_parallelism()`
@@ -274,15 +287,22 @@ impl<'a> TileScheduler<'a> {
 
     /// The controlled entry point [`run`](Self::run) and
     /// [`run_tiles`](Self::run_tiles) delegate to with [`NoControl`], and
-    /// `core::job::Job::run` drives directly. It makes exactly two
-    /// additions: a control check as
-    /// the very first statement of the per-tile closure (before
-    /// `live.fetch_add`, so a skipped unit never counts as in flight and
-    /// never perturbs `peak_in_flight`), and per-index completion
-    /// bookkeeping so a caller can resume from exactly the tiles this call
-    /// did not finish. This is what makes "byte-identical with and without
-    /// the engine" fall out of the shape rather than needing a second code
-    /// path.
+    /// `core::job::Job::run` drives directly. The body that used to be
+    /// `run_tiles`, plus a control check as the very first statement of the
+    /// per-tile closure (before `live.fetch_add`, so a skipped unit never
+    /// counts as in flight and never perturbs `peak_in_flight`), and
+    /// per-index completion bookkeeping so a caller can resume from exactly
+    /// the tiles this call did not finish. This is what makes
+    /// "byte-identical with and without the engine" fall out of the shape
+    /// rather than needing a second code path.
+    ///
+    /// A consumer answering [`TileConsumer::supplies_own_pixels`] `true`
+    /// short-circuits the host read loop: it is handed a
+    /// [`TileJob::without_frame_tiles`] and the run's `frame_tiles_read`
+    /// stays at 0. Completion bookkeeping is unaffected -- such a tile is
+    /// marked complete and reported through [`TileControl::unit_completed`]
+    /// exactly like a normally-read one, so pause/resume behaves the same on
+    /// either path.
     ///
     /// # The pause bound
     ///
@@ -304,6 +324,16 @@ impl<'a> TileScheduler<'a> {
         consumer: &dyn TileConsumer,
         control: &dyn TileControl,
     ) -> Result<ControlledRun, TileError> {
+        // Deliberately here, not in the `run_tiles` wrapper above:
+        // `crate::job::Job::run` drives this method directly and never goes
+        // through `run_tiles`, so a guard living in the wrapper would leave
+        // the job-engine path silently accepting the combination this
+        // refuses.
+        let supplies_own_pixels = consumer.supplies_own_pixels();
+        if supplies_own_pixels && !preprocess.is_noop() {
+            return Err(TileError::PixelSupplyingConsumerNeedsNoopPreprocess);
+        }
+
         let scratch = ScratchDir::create_in(&self.scratch_base)?;
         let scratch_path = scratch.path().to_path_buf();
 
@@ -362,6 +392,17 @@ impl<'a> TileScheduler<'a> {
 
                     let outcome = (|| -> Result<(), TileError> {
                         let read_rect = planned.read();
+
+                        if supplies_own_pixels {
+                            let job = TileJob::without_frame_tiles(planned, &scratch_path);
+                            return consumer
+                                .consume(&job)
+                                .map_err(|source| TileError::Consumer {
+                                    rect: planned.interior(),
+                                    source,
+                                });
+                        }
+
                         let len =
                             read_rect.width as usize * read_rect.height as usize * spp as usize;
 

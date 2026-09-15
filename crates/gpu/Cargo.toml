@@ -9,7 +9,9 @@ publish = false
 workspace = true
 
 [features]
-gpu = []
+gpu = ["dep:wgpu", "dep:thiserror"]
 
 [dependencies]
-wgpu = "29.0.4"
+focusforge-core = { path = "../core" }
+wgpu = { version = "29.0.4", optional = true }
+thiserror = { version = "2.0.20", optional = true }

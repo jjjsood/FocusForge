@@ -490,6 +490,12 @@ impl ResumeStore {
             );
             check_identity!(
                 candidate.composite_output,
+                "backend",
+                candidate.backend,
+                record.backend
+            );
+            check_identity!(
+                candidate.composite_output,
                 "crop",
                 candidate.crop,
                 record.crop
@@ -533,6 +539,14 @@ impl TileConsumer for RecordingConsumer<'_> {
     fn abort(&self) {
         self.inner.abort();
     }
+
+    /// Forwarded, never left at the trait's `false` default: this decorator
+    /// is transparent, and a GPU consumer wrapped in it would otherwise make
+    /// the scheduler read every frame-tile on the host for a consumer that
+    /// does not use them.
+    fn supplies_own_pixels(&self) -> bool {
+        self.inner.supplies_own_pixels()
+    }
 }
 
 #[cfg(test)]
@@ -557,6 +571,7 @@ mod tests {
             levels: 3,
             stack_algorithm: "laplacian".to_string(),
             stack_params: crate::params::ParamValues::new(),
+            backend: "cpu".to_string(),
             align: None,
             crop: None,
             composite_output: output,
@@ -572,6 +587,66 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// A consumer that supplies its own pixels and records nothing else --
+    /// stands in for `crate::fuse::BackendFusionConsumer`, which lives above
+    /// this module and needs a GPU backend to build.
+    struct PixelSupplier;
+
+    impl TileConsumer for PixelSupplier {
+        fn consume(&self, _job: &TileJob<'_>) -> Result<(), AlgorithmError> {
+            Ok(())
+        }
+
+        fn supplies_own_pixels(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn recording_consumer_forwards_supplies_own_pixels() {
+        let scratch = tmp_dir("supplies-own-pixels");
+        let store = ResumeStore::open(&scratch).unwrap();
+        let record = sample_record(&scratch, "out.tif");
+        let ledger = store.begin(&record).unwrap();
+
+        let inner = PixelSupplier;
+        let recording = RecordingConsumer {
+            inner: &inner,
+            ledger: &ledger,
+        };
+        assert!(
+            recording.supplies_own_pixels(),
+            "wrapping a pixel-supplying consumer in the ledger decorator must not \
+             put the scheduler's host read loop back"
+        );
+
+        drop(ledger);
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn a_changed_backend_is_refused() {
+        let scratch = tmp_dir("changed-backend");
+        let store = ResumeStore::open(&scratch).unwrap();
+        let record = sample_record(&scratch, "out.tif");
+        let ledger = store.begin(&record).unwrap();
+        ledger.record_unit(0).unwrap();
+        drop(ledger);
+
+        let mut moved = record.clone();
+        moved.backend = "gpu:some-adapter".to_string();
+        match store.find(&moved).unwrap() {
+            Resumable::Mismatch(mismatch) => {
+                let text = mismatch.to_string();
+                assert!(text.contains("backend changed"), "{text}");
+                assert!(text.contains("gpu:some-adapter"), "{text}");
+                assert!(text.contains("cpu"), "{text}");
+            }
+            other => panic!("expected a backend mismatch, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&scratch);
     }
 
     #[test]

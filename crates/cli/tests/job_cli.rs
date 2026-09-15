@@ -690,6 +690,53 @@ mod unix_signals {
         );
     }
 
+    /// Which compute backend produced the already-written tiles is part of
+    /// a ledger's identity: a run cancelled on the GPU path and resumed on
+    /// the CPU one (or the reverse) would silently finish one file out of
+    /// two different implementations. The default gate compiles no `gpu`
+    /// feature, so both runs here genuinely resolve `"cpu"` -- the recorded
+    /// value is edited between them, which is the only way to reach the
+    /// refusal without a GPU-feature build, and is exactly what a resume on
+    /// a differently-built binary would look like on disk.
+    #[test]
+    fn resume_with_a_changed_backend_fails() {
+        let dir = tmp_dir("job_cli_resume_changed_backend");
+        let output = dir.join("out.tif");
+        let mantis_dir = mantis_512_dir();
+        let args = interruptible_stack_args(mantis_dir.to_str().unwrap(), output.to_str().unwrap());
+        let mut child = spawn_piped(&dir, &args);
+        let mut stderr = BufReader::new(child.stderr.take().unwrap());
+        let _first = read_line(&mut stderr);
+        send(child.id(), "-INT");
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(130));
+
+        let resume_root = dir.join(".scratch").join("resume");
+        let job_json = std::fs::read_dir(&resume_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("job.json"))
+            .find(|path| path.exists())
+            .expect("the cancelled run must have left a job.json");
+        let recorded = std::fs::read_to_string(&job_json).unwrap();
+        let tampered = recorded.replace("\"backend\":\"cpu\"", "\"backend\":\"gpu:fake\"");
+        assert_ne!(
+            tampered, recorded,
+            "job.json must record the backend that produced its tiles"
+        );
+        std::fs::write(&job_json, tampered).unwrap();
+
+        let mut resumed_args: Vec<&str> = args.to_vec();
+        resumed_args.push("--resume");
+        let resumed = run_cli_in(&dir, &resumed_args);
+        assert!(!resumed.success);
+        assert_eq!(resumed.code, Some(1));
+        assert!(
+            resumed.stderr.contains("backend changed"),
+            "{}",
+            resumed.stderr
+        );
+    }
+
     #[test]
     fn resume_with_changed_tile_size_fails() {
         let dir = tmp_dir("job_cli_resume_changed_tile_size");

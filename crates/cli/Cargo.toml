@@ -12,9 +12,13 @@ workspace = true
 name = "focusforge-cli"
 path = "src/main.rs"
 
+[features]
+gpu = ["dep:focusforge-gpu", "focusforge-gpu/gpu"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 focusforge-core = { path = "../core" }
+focusforge-gpu = { path = "../gpu", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 signal-hook = { version = "0.4.4", default-features = false }

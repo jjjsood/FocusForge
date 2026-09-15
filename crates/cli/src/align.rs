@@ -12,8 +12,10 @@ use std::time::Instant;
 
 use focusforge_core::algorithm::{AlignAlgorithm, TileReader};
 use focusforge_core::align::{
-    FailurePolicy, ReferencePolicy, StackAlignment, WarpingReader, align_stack, auto_crop,
+    FailurePolicy, ReferencePolicy, StackAlignment, Transform, WarpingReader, align_stack,
+    auto_crop,
 };
+use focusforge_core::gpu::TileBackend;
 use focusforge_core::io::{TiffSpec, TiffStack, TiffWriter, frame_paths};
 use focusforge_core::params::{self, StackContext};
 use focusforge_core::registry;
@@ -143,6 +145,7 @@ pub fn run(
     write_warped: Option<&Path>,
     set: &SetArgs,
     quiet: bool,
+    no_gpu: bool,
 ) -> ExitCode {
     let start = Instant::now();
     let mut renderer = ProgressRenderer::new(ProgressMode::choose(quiet));
@@ -215,8 +218,13 @@ pub fn run(
         Err(err) => return crate::fail(err),
     };
 
-    if let Some(write_warped) = write_warped
-        && let Err(msg) = write_warped_frames(
+    if let Some(write_warped) = write_warped {
+        // Resolved only here, not for a plain `align` run: plain `align` has
+        // nothing on the GPU-shaped path (its ECC solver is CPU-only), so
+        // probing for an adapter on every run would be noise with nothing
+        // to show for it.
+        let backend = crate::resolve_backend(no_gpu);
+        if let Err(msg) = write_warped_frames(
             write_warped,
             &stack,
             &paths,
@@ -225,9 +233,10 @@ pub fn run(
             width,
             height,
             spp,
-        )
-    {
-        return crate::fail(msg);
+            backend,
+        ) {
+            return crate::fail(msg);
+        }
     }
 
     let report = AlignReport {
@@ -291,9 +300,15 @@ pub fn run(
 /// uncropped -- the crop is reported, not applied, on this path, so the
 /// uncovered rim stays visible for the manual check.
 ///
-/// Streams each frame in full-width bands of [`DEFAULT_TILE_SIZE`] rows
-/// through a [`WarpingReader`], the same streaming shape
-/// `PyramidalEcc::build_pyramid` uses -- never a whole-frame buffer.
+/// With no backend, streams each frame in full-width bands of
+/// [`DEFAULT_TILE_SIZE`] rows through a [`WarpingReader`], the same
+/// streaming shape `PyramidalEcc::build_pyramid` uses -- never a whole-frame
+/// buffer. With a backend, cuts each band into [`DEFAULT_TILE_SIZE`]-wide
+/// chunks too: a full-width band at the reference stack's 8192 px needs a
+/// coordinate buffer of `8192 * 512 * 24 = 100.7 MB`
+/// (`crates/gpu/src/warp_coords.rs`), inside but uncomfortably near the
+/// `max_storage_buffer_binding_size = 128 MiB` floor this crate deliberately
+/// still runs at; [`DEFAULT_TILE_SIZE`]-wide chunks keep it at 6.3 MB.
 #[allow(clippy::too_many_arguments)]
 fn write_warped_frames(
     dir: &Path,
@@ -304,6 +319,7 @@ fn write_warped_frames(
     width: u32,
     height: u32,
     spp: u32,
+    backend: Option<&dyn TileBackend>,
 ) -> Result<(), String> {
     match std::fs::metadata(dir) {
         Ok(m) if m.is_dir() => {}
@@ -331,38 +347,96 @@ fn write_warped_frames(
     }
 
     let transforms: Vec<_> = alignment.frames.iter().map(|f| f.transform).collect();
-    let reader = WarpingReader::new(stack, (width, height), spp, transforms);
 
-    for (i, name) in frame_names.iter().enumerate() {
-        let out_path = dir.join(name);
-        let mut writer = TiffWriter::create(
-            &out_path,
-            TiffSpec {
-                width,
-                height,
-                samples_per_pixel: spp,
-                description: None,
-            },
-        )
-        .map_err(|e| e.to_string())?;
-
-        let mut y = 0u32;
-        while y < height {
-            let band_height = DEFAULT_TILE_SIZE.min(height - y);
-            let rect = Rect {
-                x: 0,
-                y,
-                width,
-                height: band_height,
-            };
-            let mut band = vec![0u16; width as usize * band_height as usize * spp as usize];
-            reader
-                .read_tile_into(i, rect, &mut band)
+    match backend {
+        None => {
+            let reader = WarpingReader::new(stack, (width, height), spp, transforms);
+            for (i, name) in frame_names.iter().enumerate() {
+                let out_path = dir.join(name);
+                let mut writer = TiffWriter::create(
+                    &out_path,
+                    TiffSpec {
+                        width,
+                        height,
+                        samples_per_pixel: spp,
+                        description: None,
+                    },
+                )
                 .map_err(|e| e.to_string())?;
-            writer.write_tile(rect, &band).map_err(|e| e.to_string())?;
-            y += band_height;
+
+                let mut y = 0u32;
+                while y < height {
+                    let band_height = DEFAULT_TILE_SIZE.min(height - y);
+                    let rect = Rect {
+                        x: 0,
+                        y,
+                        width,
+                        height: band_height,
+                    };
+                    let mut band = vec![0u16; width as usize * band_height as usize * spp as usize];
+                    reader
+                        .read_tile_into(i, rect, &mut band)
+                        .map_err(|e| e.to_string())?;
+                    writer.write_tile(rect, &band).map_err(|e| e.to_string())?;
+                    y += band_height;
+                }
+                writer.finish().map_err(|e| e.to_string())?;
+            }
         }
-        writer.finish().map_err(|e| e.to_string())?;
+        Some(backend) => {
+            for (i, name) in frame_names.iter().enumerate() {
+                let out_path = dir.join(name);
+                let mut writer = TiffWriter::create(
+                    &out_path,
+                    TiffSpec {
+                        width,
+                        height,
+                        samples_per_pixel: spp,
+                        description: None,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+
+                let t = &transforms[i];
+                let mut y = 0u32;
+                while y < height {
+                    let band_height = DEFAULT_TILE_SIZE.min(height - y);
+                    let mut x = 0u32;
+                    while x < width {
+                        let chunk_width = DEFAULT_TILE_SIZE.min(width - x);
+                        let rect = Rect {
+                            x,
+                            y,
+                            width: chunk_width,
+                            height: band_height,
+                        };
+                        let samples = if *t == Transform::identity() {
+                            let mut buf =
+                                vec![
+                                    0u16;
+                                    chunk_width as usize * band_height as usize * spp as usize
+                                ];
+                            stack
+                                .read_tile_into(i, rect, &mut buf)
+                                .map_err(|e| e.to_string())?;
+                            buf
+                        } else {
+                            backend
+                                .warp_tile(stack, i, (width, height), spp, rect, t)
+                                .map_err(|e| e.to_string())?
+                                .tile
+                                .samples
+                        };
+                        writer
+                            .write_tile(rect, &samples)
+                            .map_err(|e| e.to_string())?;
+                        x += chunk_width;
+                    }
+                    y += band_height;
+                }
+                writer.finish().map_err(|e| e.to_string())?;
+            }
+        }
     }
     Ok(())
 }

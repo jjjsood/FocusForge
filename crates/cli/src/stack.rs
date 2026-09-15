@@ -11,13 +11,14 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use focusforge_core::algorithm::AlignStatus;
+use focusforge_core::algorithm::{AlignStatus, StackAlgorithm};
 use focusforge_core::align::{
     FrameAlignment, ReferencePolicy, StackAlignment, Transform, WarpingReader, align_stack,
     auto_crop,
 };
 use focusforge_core::fuse::{
-    FusionConsumer, FusionGeometry, description::format_composite_description,
+    BackendFusionConsumer, FusionConsumer, FusionGeometry,
+    description::format_composite_description, laplacian::Laplacian,
 };
 use focusforge_core::io::{Rect, TiffStack, frame_paths};
 use focusforge_core::job::{
@@ -26,7 +27,7 @@ use focusforge_core::job::{
 };
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance, StackContext};
 use focusforge_core::registry;
-use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
+use focusforge_core::tile::{NoopPreprocess, TileConsumer, TileScheduler, TileSchedulerOptions};
 use serde::Serialize;
 
 use crate::align::{AlignOptions, AlignmentEntry, resolve_align_algo};
@@ -65,6 +66,10 @@ pub struct StackReport {
     pub crop: Option<Rect>,
     pub description: Option<String>,
     pub align: Option<StackAlignReport>,
+    /// `"cpu"`, or the selected adapter's [`focusforge_core::gpu::BackendInfo`]
+    /// display -- additive, so which path ran is machine-readable and not
+    /// only a stderr line.
+    pub backend: String,
 }
 
 /// `stack --json`'s `align` field: `null` when `--no-align` was given.
@@ -104,6 +109,7 @@ pub fn run(
     align_opts: &AlignOptions<'_>,
     job_opts: &JobOptions,
     argv: &[String],
+    no_gpu: bool,
 ) -> ExitCode {
     let start = Instant::now();
     let mut renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.quiet));
@@ -133,6 +139,20 @@ pub fn run(
             Ok(algo) => algo,
             Err(err) => return crate::fail(err),
         },
+    };
+
+    // `Laplacian` (`crates/core/src/gpu.rs`'s own doc comment: "the WGSL
+    // twin of ... `Laplacian::fuse`"). Every other registered algorithm
+    // (`weighted-average`, `depth-map`, and any test-only one) has no GPU
+    // implementation and must stay on the CPU path regardless of whether a
+    // usable adapter exists -- resolving (and reporting) a backend at all is
+    // therefore gated on the selected algorithm's own id, compared against
+    // `Laplacian`'s own `id()` rather than a bare string literal repeated
+    // here.
+    let backend = if algo.id() == Laplacian.id() {
+        crate::resolve_backend(no_gpu)
+    } else {
+        None
     };
 
     // Step 3: parse `--set` against that schema. An unknown key or an
@@ -419,14 +439,27 @@ pub fn run(
         .iter()
         .map(|f| f.transform)
         .collect();
-    let warping_reader = WarpingReader::new(&stack, (width, height), spp, transforms);
+    let warping_reader = WarpingReader::new(&stack, (width, height), spp, transforms.clone());
 
     // Builds the scheduler over the warping reader -- bit-identical to
     // `&stack` when every transform is identity (the decorator's own
     // short-circuit), which is what keeps `--no-align --no-crop` byte for
     // byte with the unaligned path. `TileError::NoInterior` fires here, if
     // it fires at all, before any tile is read.
-    let scheduler = match TileScheduler::new(&warping_reader, stack_ctx, spp, &options) {
+    //
+    // With a backend selected, the scheduler is built over `&stack` (the
+    // raw reader) instead: the GPU path pulls its own footprint-grown
+    // source rects through `BackendFusionConsumer` and must not receive
+    // CPU-warped pixels.
+    //
+    // `options` is built far above, before alignment, so `--tile-size` and
+    // `--max-bytes-in-flight` are already in effect for the resume peek --
+    // never rebuilt here.
+    let reader: &dyn focusforge_core::algorithm::TileReader = match &backend {
+        Some(_) => &stack,
+        None => &warping_reader,
+    };
+    let scheduler = match TileScheduler::new(reader, stack_ctx, spp, &options) {
         Ok(scheduler) => scheduler,
         Err(err) => return crate::fail(err),
     };
@@ -447,6 +480,13 @@ pub fn run(
         description: description.clone(),
     };
 
+    // Resolved once: the ledger's identity and the report's `backend` field
+    // are the same fact, and a resume that compared a differently-spelled
+    // copy of it would refuse (or accept) for the wrong reason.
+    let backend_id = backend
+        .map(|b| b.info().to_string())
+        .unwrap_or_else(|| "cpu".to_string());
+
     // Step 7: the ledger, around the `.partial` discipline above.
     // `composite_output` is the `.partial` path, never the final name --
     // `ResumeStore::find` skips a candidate whose `composite_output` no
@@ -463,6 +503,7 @@ pub fn run(
         levels: scheduler.plan().levels(),
         stack_algorithm: algo.id().to_string(),
         stack_params: values.clone(),
+        backend: backend_id.clone(),
         align: align_identity,
         crop: applied_crop,
         composite_output: composite_partial.clone(),
@@ -528,7 +569,7 @@ pub fn run(
     // `Job::resuming`/`Job::new` to match. Both paths wrap the consumer in
     // `RecordingConsumer` before handing it to `job::drive`.
     let is_resuming = !ledger.completed().is_empty();
-    let (consumer, surviving): (FusionConsumer, Option<Vec<usize>>) = if is_resuming {
+    let (sink, surviving): (FusionConsumer, Option<Vec<usize>>) = if is_resuming {
         match FusionConsumer::resume(
             scheduler.plan(),
             ledger.completed(),
@@ -538,7 +579,7 @@ pub fn run(
             zmap_partial.as_deref(),
             geometry.clone(),
         ) {
-            Ok((consumer, surviving)) => (consumer, Some(surviving)),
+            Ok((sink, surviving)) => (sink, Some(surviving)),
             Err(err) => {
                 cleanup_partials(&composite_partial, zmap_partial.as_deref());
                 let _ = ledger.discard();
@@ -553,7 +594,7 @@ pub fn run(
             zmap_partial.as_deref(),
             geometry,
         ) {
-            Ok(consumer) => (consumer, None),
+            Ok(sink) => (sink, None),
             Err(err) => {
                 cleanup_partials(&composite_partial, zmap_partial.as_deref());
                 let _ = ledger.discard();
@@ -574,8 +615,22 @@ pub fn run(
     // off "the first line observed" rather than a sleep
     // (`crates/cli/tests/job_cli.rs`'s own doc comment).
     renderer.start(&control.progress());
+    // The GPU consumer, when one was resolved, sits *between* the ledger and
+    // the `FusionConsumer`: `BackendFusionConsumer` supplies its own pixels
+    // and writes through `sink`'s `write_output`, while `RecordingConsumer`
+    // stays the outermost wrapper so every unit the engine completes is
+    // recorded on either path. `RecordingConsumer` forwards
+    // `supplies_own_pixels`, so wrapping it does not put the scheduler's
+    // host read loop back.
+    let backend_consumer = backend.map(|b| {
+        BackendFusionConsumer::new(b, &stack, (width, height), transforms, spp, levels, &sink)
+    });
+    let consumer: &dyn TileConsumer = match &backend_consumer {
+        Some(bc) => bc,
+        None => &sink,
+    };
     let recording = RecordingConsumer {
-        inner: &consumer,
+        inner: consumer,
         ledger: &ledger,
     };
     let outcome = match job::drive(
@@ -621,9 +676,17 @@ pub fn run(
     let final_progress = control.progress();
     let in_flight_limit = scheduler.in_flight_limit();
     let tiles = final_progress.unit_total;
-    // Every tile read reads every frame (`crates/core/src/tile/scheduler.rs`'s
-    // per-tile loop), so this is the exact count, not an approximation.
-    let frame_tiles_read = tiles * stack.len();
+    // On the CPU path every tile read reads every frame
+    // (`crates/core/src/tile/scheduler.rs`'s per-tile loop), so this is the
+    // exact count, not an approximation. On the GPU path it is exactly 0:
+    // `BackendFusionConsumer` supplies its own pixels, so the scheduler
+    // short-circuits its host read loop and never reads a frame-tile through
+    // it at all (the same 0 `TileRunReport::frame_tiles_read` reports there).
+    let frame_tiles_read = if backend.is_some() {
+        0
+    } else {
+        tiles * stack.len()
+    };
     // `peak_in_flight`: `Job::run` does not expose the per-segment
     // `TileRunReport` `TileScheduler::run` returns (the job layer discards
     // it after folding `completed`/`stopped` into `JobOutcome`), so the
@@ -633,7 +696,7 @@ pub fn run(
     // below the scheduler's configured concurrency.
     let peak_in_flight = in_flight_limit;
 
-    if let Err(err) = consumer.finish() {
+    if let Err(err) = sink.finish() {
         cleanup_partials(&composite_partial, zmap_partial.as_deref());
         let _ = ledger.discard();
         return crate::fail(err);
@@ -718,6 +781,7 @@ pub fn run(
         crop: applied_crop,
         description,
         align: align_report,
+        backend: backend_id,
     };
 
     if json {
@@ -901,6 +965,7 @@ fn render(report: &StackReport) -> String {
         "tile_size={} levels={} margin={} tiles={} in_flight_limit={}",
         report.tile_size, report.levels, report.margin, report.tiles, report.in_flight_limit,
     ));
+    lines.push(format!("backend: {}", report.backend));
     for output in &report.outputs {
         lines.push(format!("wrote: {output}"));
     }
@@ -947,6 +1012,7 @@ mod tests {
             crop: None,
             description: None,
             align: None,
+            backend: "cpu".to_string(),
         }
     }
 
@@ -969,6 +1035,7 @@ mod tests {
             "wrote: out.tif",
             "wrote: out-zmap.tif",
             "wall: 1.500s",
+            "backend: cpu",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }

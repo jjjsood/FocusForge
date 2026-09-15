@@ -35,6 +35,9 @@ GNU General Public License v3.
   every frame, plain text or `--json`
 - Flags an unsupported frame by name (compression, tiling, planar layout, a
   bit depth other than 16) instead of silently misreading it
+- Fuses the `laplacian` algorithm on a GPU automatically when one is
+  available, falling back to the CPU cleanly when it isn't; either path
+  produces the same result, proven to match within 1 LSB at 16-bit
 - A single parameter schema drives every algorithm's settings; `focusforge-cli
   algorithms` lists what's registered, prints a schema, and validates
   `--set key=value` overrides against it
@@ -48,7 +51,9 @@ cargo build --release
 ```
 
 Produces `target/release/focusforge-cli`, the only binary in the workspace
-right now.
+right now. Add `--features gpu` to also compile the GPU-accelerated fusion
+path; without it, `stack` always runs on the CPU and `--no-gpu` does not
+exist as a flag.
 
 ### Inspect a stack
 

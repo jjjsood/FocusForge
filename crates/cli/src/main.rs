@@ -16,11 +16,30 @@ use serde::Serialize;
 
 mod algorithms;
 mod align;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod job;
 mod progress;
 mod set;
 mod signals;
 mod stack;
+
+/// Resolves whether this run takes the GPU path or the CPU one:
+/// `#[cfg(feature = "gpu")]` delegates to [`gpu::resolve_backend`]; with the
+/// feature off, always `None` -- `stack`/`align` behave exactly as phases 3
+/// and 4 left them, with no GPU probing at all. A crate-root `fn`, not
+/// `pub(crate)`: `stack` and `align` are descendant modules of this one, so
+/// a private item here is already visible to them (the same visibility
+/// `crate::fail` already relies on).
+#[cfg(feature = "gpu")]
+fn resolve_backend(no_gpu: bool) -> Option<&'static dyn focusforge_core::gpu::TileBackend> {
+    gpu::resolve_backend(no_gpu)
+}
+
+#[cfg(not(feature = "gpu"))]
+fn resolve_backend(_no_gpu: bool) -> Option<&'static dyn focusforge_core::gpu::TileBackend> {
+    None
+}
 
 /// FocusForge command-line interface.
 #[derive(Parser)]
@@ -119,6 +138,15 @@ enum Command {
         /// to use the scheduler's own default.
         #[arg(long = "max-bytes-in-flight", value_name = "BYTES")]
         max_bytes_in_flight: Option<usize>,
+        /// Force the CPU path even when a usable GPU adapter is available.
+        /// Only present when the `gpu` feature is compiled in -- with it
+        /// off, this flag does not exist at all, not even as a no-op.
+        /// Defaults to `true` (the GPU path is used automatically);
+        /// `--no-gpu` is what turns it off (clap `ArgAction::SetFalse`, no
+        /// `default_value` -- clap-rs/clap#4370).
+        #[cfg(feature = "gpu")]
+        #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
+        gpu: bool,
     },
     /// Compute and report the per-frame transforms for a stack: readable
     /// text by default, a frozen `--json` document on request, and an
@@ -152,6 +180,13 @@ enum Command {
         /// otherwise prints.
         #[arg(long)]
         quiet: bool,
+        /// Force the CPU path even when a usable GPU adapter is available.
+        /// Only present when the `gpu` feature is compiled in. Meaningful
+        /// only with `--write-warped`: plain `align` has nothing on the
+        /// GPU-shaped path (its ECC solver is CPU-only).
+        #[cfg(feature = "gpu")]
+        #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
+        gpu: bool,
     },
 }
 
@@ -176,28 +211,37 @@ fn main() -> ExitCode {
             quiet,
             tile_size,
             max_bytes_in_flight,
-        } => stack::run(
-            &dir,
-            &output,
-            algo.as_deref(),
-            zmap.as_deref(),
-            json,
-            &set,
-            &align::AlignOptions {
-                align,
-                crop,
-                lax,
-                algo: align_algo.as_deref(),
-                set: &align_set.align_set,
-            },
-            &job::JobOptions {
-                resume,
-                quiet,
-                tile_size,
-                max_bytes_in_flight,
-            },
-            &std::env::args().collect::<Vec<_>>(),
-        ),
+            #[cfg(feature = "gpu")]
+            gpu,
+        } => {
+            #[cfg(feature = "gpu")]
+            let no_gpu = !gpu;
+            #[cfg(not(feature = "gpu"))]
+            let no_gpu = false;
+            stack::run(
+                &dir,
+                &output,
+                algo.as_deref(),
+                zmap.as_deref(),
+                json,
+                &set,
+                &align::AlignOptions {
+                    align,
+                    crop,
+                    lax,
+                    algo: align_algo.as_deref(),
+                    set: &align_set.align_set,
+                },
+                &job::JobOptions {
+                    resume,
+                    quiet,
+                    tile_size,
+                    max_bytes_in_flight,
+                },
+                &std::env::args().collect::<Vec<_>>(),
+                no_gpu,
+            )
+        }
         Command::Align {
             dir,
             algo,
@@ -206,15 +250,24 @@ fn main() -> ExitCode {
             write_warped,
             set,
             quiet,
-        } => align::run(
-            &dir,
-            algo.as_deref(),
-            json,
-            lax,
-            write_warped.as_deref(),
-            &set,
-            quiet,
-        ),
+            #[cfg(feature = "gpu")]
+            gpu,
+        } => {
+            #[cfg(feature = "gpu")]
+            let no_gpu = !gpu;
+            #[cfg(not(feature = "gpu"))]
+            let no_gpu = false;
+            align::run(
+                &dir,
+                algo.as_deref(),
+                json,
+                lax,
+                write_warped.as_deref(),
+                &set,
+                quiet,
+                no_gpu,
+            )
+        }
     }
 }
 

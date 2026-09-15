@@ -300,6 +300,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "focusforge-core",
+ "focusforge-gpu",
  "serde",
  "serde_json",
  "signal-hook",
@@ -321,6 +322,8 @@ dependencies = [
 name = "focusforge-gpu"
 version = "0.1.0"
 dependencies = [
+ "focusforge-core",
+ "thiserror",
  "wgpu",
 ]
 

@@ -43,6 +43,14 @@ pub struct JobRecord {
     pub levels: u32,
     pub stack_algorithm: String,
     pub stack_params: ParamValues,
+    /// Which compute path produced the already-written tiles: `"cpu"`, or
+    /// the selected adapter's `crate::gpu::BackendInfo` display -- the same
+    /// string `stack --json` reports as `backend`. Part of the identity, not
+    /// merely informational: a run cancelled on the GPU path and resumed on
+    /// the CPU one would finish one output file out of two different
+    /// implementations of the same algorithm, which is precisely what the
+    /// `<= 1 LSB` parity budget permits and a single file must not contain.
+    pub backend: String,
     pub align: Option<AlignIdentity>,
     pub crop: Option<Rect>,
     pub composite_output: PathBuf,
@@ -75,6 +83,7 @@ mod tests {
             levels: 3,
             stack_algorithm: "laplacian".to_string(),
             stack_params: ParamValues::new(),
+            backend: "cpu".to_string(),
             align: None,
             crop: None,
             composite_output: PathBuf::from("out.tif"),

@@ -464,6 +464,63 @@ fn info_exits_1_for_empty_directory() {
     assert!(stderr.contains("error:"), "stderr: {stderr}");
 }
 
+/// With the `gpu` feature off, `stack` runs CPU-only:
+/// no GPU probing, no `--no-gpu` flag, and the additive `backend` field is
+/// always `"cpu"` -- run against `dummy-stack` (cheap: no pyramid, no
+/// alignment, no crop), the same pattern `crates/cli/tests/stack_cli.rs`
+/// already uses for its own inexpensive runs.
+#[test]
+fn stack_defaults_to_cpu() {
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("stack_defaults_to_cpu");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let output = tmp.join("out.tif");
+
+    let out = bin()
+        .arg("stack")
+        .arg(mantis_512_dir())
+        .arg("-o")
+        .arg(&output)
+        .arg("--algo")
+        .arg("dummy-stack")
+        .arg("--no-align")
+        .arg("--no-crop")
+        .arg("--json")
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(report["backend"], "cpu", "report: {report}");
+}
+
+/// With the `gpu` feature off, `--no-gpu` does not exist at all -- not a
+/// silently-accepted no-op -- on either `stack` or `align`. Only meaningful
+/// without the feature: with it on, `--no-gpu` legitimately exists and this
+/// assertion would fail, not because of a bug but because the premise no
+/// longer holds -- `cli_gpu.rs` covers the feature-on behaviour instead.
+#[test]
+#[cfg(not(feature = "gpu"))]
+fn no_gpu_flag_absent_without_the_feature() {
+    for sub in ["stack", "align"] {
+        let output = bin()
+            .arg(sub)
+            .arg("--help")
+            .output()
+            .expect("failed to run binary");
+        assert!(output.status.success(), "exit status: {:?}", output.status);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("--no-gpu"),
+            "{sub} --help must not mention --no-gpu without the gpu feature: {stdout}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "reads the 16 GB reference stack"]
 fn info_reads_the_reference_stack() {
