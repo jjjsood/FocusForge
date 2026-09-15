@@ -69,11 +69,7 @@ fn app_slint_does_not_reexport_primitives() {
     let contents = fs::read_to_string(&path).unwrap();
     // Code only -- the header comment is free to name `Primitives` while
     // explaining why the code below never does.
-    let code: String = contents
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let code = common::strip_line_comments(&contents);
 
     assert!(
         !code.contains("Primitives"),

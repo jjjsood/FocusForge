@@ -53,6 +53,18 @@ pub fn find_rust_files(dir: &Path) -> Vec<PathBuf> {
     find_files_with_extension(dir, "rs")
 }
 
+/// `contents` with every line whose trimmed start is `//` dropped -- code
+/// only, so a source-scanning test does not trip on what a comment merely
+/// talks about.
+#[allow(dead_code)]
+pub fn strip_line_comments(contents: &str) -> String {
+    contents
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn find_files_with_extension(dir: &Path, ext: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {

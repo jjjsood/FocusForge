@@ -13,7 +13,6 @@
 mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
 
 use focusforge_gui::{Theme, ThemeProbe};
 use slint::{Color, Global};
@@ -275,26 +274,9 @@ fn color_literal_lines(contents: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Every `.slint` file under `dir`, recursively -- no external crate, this
-/// crate's own `.slint` tree is small.
-fn find_slint_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            find_slint_files(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("slint") {
-            out.push(path);
-        }
-    }
-}
-
 #[test]
 fn no_colour_literal_outside_the_theme() {
-    let mut files = Vec::new();
-    find_slint_files(&common::ui_dir(), &mut files);
+    let files = common::find_slint_files(&common::ui_dir());
 
     let mut violations = Vec::new();
     for path in files {

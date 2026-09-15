@@ -79,11 +79,7 @@ fn controller_api_is_slint_free() {
     let contents = fs::read_to_string(&path).unwrap();
     // Code only -- doc comments are free to *talk about* the rule (as this
     // file's own header does) without tripping the scan that enforces it.
-    let code: String = contents
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let code = common::strip_line_comments(&contents);
 
     assert!(
         !code.contains("use slint"),
