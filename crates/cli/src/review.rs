@@ -209,6 +209,22 @@ fn base_record(
     }
 }
 
+/// A record whose metrics could not be produced -- every non-`Some(metrics)`
+/// outcome shares this shape, so the reason is the only thing each call site
+/// has to state.
+fn no_metrics_record(
+    base: StatusRecord,
+    reason: impl Into<String>,
+    unresolved_sources: Vec<String>,
+) -> ReviewRecord {
+    ReviewRecord {
+        base,
+        metrics: None,
+        metrics_reason: Some(reason.into()),
+        unresolved_sources,
+    }
+}
+
 /// One manifest entry's record. `outcome`, `error` and `wall_seconds` come
 /// from the manifest entry itself -- a `failed` group is a record because
 /// the manifest lists it, which is the whole mechanism behind §10's
@@ -216,8 +232,8 @@ fn base_record(
 fn record_from_manifest_entry(reviewed_dir: &Path, entry: &groups::ManifestEntry) -> ReviewRecord {
     let identity = entry.identity().to_string();
     if entry.outcome != "completed" {
-        return ReviewRecord {
-            base: base_record(
+        return no_metrics_record(
+            base_record(
                 identity,
                 &entry.outcome,
                 None,
@@ -225,15 +241,14 @@ fn record_from_manifest_entry(reviewed_dir: &Path, entry: &groups::ManifestEntry
                 entry.wall_seconds,
                 entry.error.clone(),
             ),
-            metrics: None,
-            metrics_reason: Some(outcome_reason(&entry.outcome)),
-            unresolved_sources: Vec::new(),
-        };
+            outcome_reason(&entry.outcome),
+            Vec::new(),
+        );
     }
 
     let Some(first_output) = entry.outputs.first() else {
-        return ReviewRecord {
-            base: base_record(
+        return no_metrics_record(
+            base_record(
                 identity,
                 "failed",
                 None,
@@ -241,10 +256,9 @@ fn record_from_manifest_entry(reviewed_dir: &Path, entry: &groups::ManifestEntry
                 entry.wall_seconds,
                 Some("completed in the manifest but lists no output".to_string()),
             ),
-            metrics: None,
-            metrics_reason: Some("no project path recorded for this result".to_string()),
-            unresolved_sources: Vec::new(),
-        };
+            "no project path recorded for this result",
+            Vec::new(),
+        );
     };
     let project_path = resolve_output(reviewed_dir, first_output);
     open_and_measure(identity, entry.wall_seconds, project_path)
@@ -273,8 +287,8 @@ fn open_and_measure(identity: String, wall_seconds: f64, project_path: PathBuf) 
     let mut project = match Project::open(&project_path) {
         Ok(project) => project,
         Err(err) => {
-            return ReviewRecord {
-                base: base_record(
+            return no_metrics_record(
+                base_record(
                     identity,
                     "failed",
                     None,
@@ -282,10 +296,9 @@ fn open_and_measure(identity: String, wall_seconds: f64, project_path: PathBuf) 
                     wall_seconds,
                     Some(err.to_string()),
                 ),
-                metrics: None,
-                metrics_reason: Some("the project could not be opened".to_string()),
-                unresolved_sources: Vec::new(),
-            };
+                "the project could not be opened",
+                Vec::new(),
+            );
         }
     };
 
@@ -314,8 +327,8 @@ fn open_and_measure(identity: String, wall_seconds: f64, project_path: PathBuf) 
         // A `completed` result whose run stored no sharpness numbers reports
         // the same way a failure's absent metrics do -- never recomputed
         // from the composite blob.
-        Ok(_) => ReviewRecord {
-            base: base_record(
+        Ok(_) => no_metrics_record(
+            base_record(
                 identity,
                 "completed",
                 algorithm,
@@ -323,14 +336,13 @@ fn open_and_measure(identity: String, wall_seconds: f64, project_path: PathBuf) 
                 wall_seconds,
                 None,
             ),
-            metrics: None,
-            metrics_reason: Some("the run recorded no sharpness numbers".to_string()),
-            unresolved_sources: unresolved,
-        },
+            "the run recorded no sharpness numbers",
+            unresolved,
+        ),
         // A corrupt Z-Map blob is a `ProjectError` from `read_plane_into`'s own
         // blake3 check, never a silently wrong number.
-        Err(err) => ReviewRecord {
-            base: base_record(
+        Err(err) => no_metrics_record(
+            base_record(
                 identity,
                 "failed",
                 algorithm,
@@ -338,10 +350,9 @@ fn open_and_measure(identity: String, wall_seconds: f64, project_path: PathBuf) 
                 wall_seconds,
                 Some(err.to_string()),
             ),
-            metrics: None,
-            metrics_reason: Some("the project's Z-Map could not be measured".to_string()),
-            unresolved_sources: unresolved,
-        },
+            "the project's Z-Map could not be measured",
+            unresolved,
+        ),
     }
 }
 
