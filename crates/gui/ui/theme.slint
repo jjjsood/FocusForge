@@ -1,17 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The design language as code. Naming rule: a token name's
-// dots become dashes and any internal camelCase becomes kebab-case, so
-// `text.onAccent` -> `text-on-accent`, which Slint's codegen turns into
-// `get_text_on_accent()` on the Rust side.
-//
-// Two globals, deliberately asymmetric in visibility:
-//   - `Primitives` is NOT exported: the raw ramp is specimen-board use only
-//     and must be unreachable from any other .slint file or from Rust.
-//     Slint exposes to Rust and to other .slint files only what the main
-//     file exports (slint 1.17.1 docs, Global trait).
-//   - `Theme` IS exported: every semantic colour it carries is initialised
-//     from a `Primitives` member, never from a hex literal directly.
+// The design language as code.
 
 import "../../../assets/fonts/Inter-Regular.ttf";
 import "../../../assets/fonts/Inter-Medium.ttf";
