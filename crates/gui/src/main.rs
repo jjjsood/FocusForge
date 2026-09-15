@@ -251,21 +251,12 @@ fn main() {
             .expect("open canvas renderer");
             *canvas.borrow_mut() = Some(renderer);
 
-            // Push the initial pane geometry by the same read
+            // Push the initial pane geometry through the same read
             // `canvas-resized` uses, so the first
             // frame does not depend on a `changed` callback having fired,
             // then repaint once to show it -- the `--size` timer's own
             // resize is what proves `canvas-resized` handles the rest.
-            let left = focusforge_gui::viewport::PaneRect {
-                x: app.get_canvas_pane_left_x(),
-                y: app.get_canvas_pane_left_y(),
-                width: app.get_canvas_pane_left_width(),
-                height: app.get_canvas_pane_left_height(),
-            };
-            let right = focusforge_gui::viewport::PaneRect {
-                x: app.get_canvas_pane_right_x(),
-                ..left
-            };
+            let (left, right) = focusforge_gui::bridge::read_pane_geometry(&app);
             controller.lock().unwrap().set_pane_geometry(left, right);
             focusforge_gui::bridge::repaint(&app, &controller, &canvas);
         }

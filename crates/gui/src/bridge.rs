@@ -81,9 +81,29 @@ pub fn repaint(
     app.set_pixelated(draw.pixelated);
 }
 
+/// Locks `controller`, runs `mutate` against it, then repaints if the
+/// window is still alive -- the "gesture becomes a redraw" tail shared by
+/// every viewport callback below (`on_canvas_scrolled`, `on_canvas_pointer`,
+/// `on_canvas_dragged`, `on_zoom_in_requested`, `on_zoom_out_requested`,
+/// `on_zoom_fit_requested`).
+fn dispatch(
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Option<CanvasRenderer>>>,
+    app_weak: &slint::Weak<AppWindow>,
+    mutate: impl FnOnce(&mut AppController),
+) {
+    mutate(&mut controller.lock().unwrap());
+    if let Some(app) = app_weak.upgrade() {
+        repaint(&app, controller, canvas);
+    }
+}
+
 /// Reads `FFCanvas`'s five geometry `out` properties (mirrored at the root)
 /// and pushes them into the controller as the two panes' current rects.
-fn read_pane_geometry(app: &AppWindow) -> (PaneRect, PaneRect) {
+/// `pub` (the `main.rs` binary is a separate crate from this lib target) so
+/// `src/main.rs`'s startup push reads the same properties through the same
+/// function rather than re-listing them.
+pub fn read_pane_geometry(app: &AppWindow) -> (PaneRect, PaneRect) {
     let y = app.get_canvas_pane_left_y();
     let width = app.get_canvas_pane_left_width();
     let height = app.get_canvas_pane_left_height();
@@ -191,14 +211,10 @@ pub fn install(app: &AppWindow) -> Installed {
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move |delta_x, delta_y, x, y, ctrl, shift, alt| {
-            {
-                let mut controller = controller.lock().unwrap();
-                let mods = modifiers(&controller, ctrl, shift, alt);
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                let mods = modifiers(controller, ctrl, shift, alt);
                 controller.wheel(delta_x, delta_y, x, y, mods);
-            }
-            if let Some(app) = app_weak.upgrade() {
-                repaint(&app, &controller, &canvas);
-            }
+            });
         }
     });
     app.on_canvas_pointer({
@@ -206,9 +222,8 @@ pub fn install(app: &AppWindow) -> Installed {
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move |btn, kind, x, y, ctrl, shift, alt| {
-            {
-                let mut controller = controller.lock().unwrap();
-                let mods = modifiers(&controller, ctrl, shift, alt);
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                let mods = modifiers(controller, ctrl, shift, alt);
                 // `kind` is `ui/shell/canvas.slint`'s fold of `PointerEventKind`:
                 // 0 = Down, 1 = Up or Cancel, 2 = Move. `Move` fires on every
                 // mouse movement over the area, before `moved`, and carries no
@@ -221,10 +236,7 @@ pub fn install(app: &AppWindow) -> Installed {
                     _ => PointerKind::Up,
                 };
                 controller.pointer(kind, button(btn), x, y, mods);
-            }
-            if let Some(app) = app_weak.upgrade() {
-                repaint(&app, &controller, &canvas);
-            }
+            });
         }
     });
     app.on_canvas_dragged({
@@ -232,10 +244,9 @@ pub fn install(app: &AppWindow) -> Installed {
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move |x, y| {
-            controller.lock().unwrap().pointer_moved(x, y);
-            if let Some(app) = app_weak.upgrade() {
-                repaint(&app, &controller, &canvas);
-            }
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.pointer_moved(x, y);
+            });
         }
     });
     app.on_canvas_resized({
@@ -254,34 +265,19 @@ pub fn install(app: &AppWindow) -> Installed {
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
-        move || {
-            controller.lock().unwrap().zoom_in();
-            if let Some(app) = app_weak.upgrade() {
-                repaint(&app, &controller, &canvas);
-            }
-        }
+        move || dispatch(&controller, &canvas, &app_weak, AppController::zoom_in)
     });
     app.on_zoom_out_requested({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
-        move || {
-            controller.lock().unwrap().zoom_out();
-            if let Some(app) = app_weak.upgrade() {
-                repaint(&app, &controller, &canvas);
-            }
-        }
+        move || dispatch(&controller, &canvas, &app_weak, AppController::zoom_out)
     });
     app.on_zoom_fit_requested({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
-        move || {
-            controller.lock().unwrap().fit();
-            if let Some(app) = app_weak.upgrade() {
-                repaint(&app, &controller, &canvas);
-            }
-        }
+        move || dispatch(&controller, &canvas, &app_weak, AppController::fit)
     });
     app.on_canvas_key_pressed({
         let controller = controller.clone();
