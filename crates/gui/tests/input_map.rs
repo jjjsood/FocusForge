@@ -9,6 +9,7 @@
 mod common;
 
 use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use focusforge_gui::input_map::InputTable;
@@ -405,45 +406,51 @@ fn unwritable_config_dir_is_not_fatal() {
     assert_eq!(loaded.table, InputTable::default());
 }
 
+/// Writes `toml` to a fresh `input.toml`, loads it, and asserts the load
+/// fell back to the defaults with exactly one problem -- the common shape
+/// every case below shares. Returns that problem alongside the path it was
+/// written to, so a caller can still check a path- or spelling-specific
+/// field.
+fn expect_one_problem(toml: &str) -> (PathBuf, input_config::ConfigError) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.toml");
+    fs::write(&path, toml).unwrap();
+    let loaded = input_config::load(dir.path());
+    assert_eq!(loaded.table, InputTable::default());
+    assert_eq!(
+        loaded.problems.len(),
+        1,
+        "expected exactly one problem: {:?}",
+        loaded
+            .problems
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+    let mut problems = loaded.problems;
+    (path, problems.remove(0))
+}
+
 #[test]
 fn bad_config_is_refused_by_name() {
     // Malformed TOML syntax.
     {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("input.toml");
-        fs::write(&path, "version = 1\n[[bindings]\n").unwrap();
-        let loaded = input_config::load(dir.path());
-        assert_eq!(loaded.table, InputTable::default());
-        assert_eq!(loaded.problems.len(), 1);
-        assert!(matches!(
-            loaded.problems[0],
-            input_config::ConfigError::Parse { .. }
-        ));
-        assert!(
-            loaded.problems[0]
-                .to_string()
-                .contains(&path.display().to_string())
-        );
+        let (path, problem) = expect_one_problem("version = 1\n[[bindings]\n");
+        assert!(matches!(problem, input_config::ConfigError::Parse { .. }));
+        assert!(problem.to_string().contains(&path.display().to_string()));
     }
 
     // Unknown action name.
     {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("input.toml");
-        fs::write(
-            &path,
+        let (path, problem) = expect_one_problem(
             "version = 1\n\n[[bindings]]\ntrigger = \"wheel\"\nstacking = \"levitate\"\n",
-        )
-        .unwrap();
-        let loaded = input_config::load(dir.path());
-        assert_eq!(loaded.table, InputTable::default());
-        assert_eq!(loaded.problems.len(), 1);
-        match &loaded.problems[0] {
+        );
+        match problem {
             input_config::ConfigError::UnknownAction {
                 spelling, path: p, ..
             } => {
                 assert_eq!(spelling, "levitate");
-                assert_eq!(p, &path);
+                assert_eq!(p, path);
             }
             other => panic!("expected UnknownAction, got {other}"),
         }
@@ -451,17 +458,10 @@ fn bad_config_is_refused_by_name() {
 
     // Unknown trigger spelling.
     {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("input.toml");
-        fs::write(
-            &path,
+        let (_, problem) = expect_one_problem(
             "version = 1\n\n[[bindings]]\ntrigger = \"banana-drag\"\nstacking = \"pan\"\n",
-        )
-        .unwrap();
-        let loaded = input_config::load(dir.path());
-        assert_eq!(loaded.table, InputTable::default());
-        assert_eq!(loaded.problems.len(), 1);
-        match &loaded.problems[0] {
+        );
+        match problem {
             input_config::ConfigError::UnknownTrigger { spelling, .. } => {
                 assert_eq!(spelling, "banana-drag");
             }
@@ -473,17 +473,10 @@ fn bad_config_is_refused_by_name() {
     // triggers -- the table's rows are display-indexed, so a trigger it has
     // no row for cannot be shown.
     {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("input.toml");
-        fs::write(
-            &path,
+        let (_, problem) = expect_one_problem(
             "version = 1\n\n[[bindings]]\ntrigger = \"right-click\"\nstacking = \"pan\"\n",
-        )
-        .unwrap();
-        let loaded = input_config::load(dir.path());
-        assert_eq!(loaded.table, InputTable::default());
-        assert_eq!(loaded.problems.len(), 1);
-        match &loaded.problems[0] {
+        );
+        match problem {
             input_config::ConfigError::UnknownTrigger { spelling, .. } => {
                 assert_eq!(spelling, "right-click");
             }
@@ -493,19 +486,12 @@ fn bad_config_is_refused_by_name() {
 
     // Duplicate trigger within one mode.
     {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("input.toml");
-        fs::write(
-            &path,
+        let (_, problem) = expect_one_problem(
             "version = 1\n\n[[bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\n\n\
              [[bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n",
-        )
-        .unwrap();
-        let loaded = input_config::load(dir.path());
-        assert_eq!(loaded.table, InputTable::default());
-        assert_eq!(loaded.problems.len(), 1);
+        );
         assert!(matches!(
-            loaded.problems[0],
+            problem,
             input_config::ConfigError::DuplicateTrigger { .. }
         ));
     }
