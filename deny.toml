@@ -1,20 +1,9 @@
 # GPLv3-compatible license allowlist, current SPDX spelling.
 #
-# crates/gui now depends on slint. Its own license expression --
-# `GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR
-# LicenseRef-Slint-Software-3.0` (same for every `i-slint-*` crate) -- is
-# satisfied by the `GPL-3.0-only` arm alone, already allowed below, so no
-# clarify entry was needed for Slint itself. What `tools/check-licenses.sh`
-# actually failed on were three crates two levels further down Slint's tree,
-# each an `[[licenses.exceptions]]` below rather than a global `allow`
-# addition, because the license is right for that one crate's provenance and
-# not a blanket policy: `clipboard-win` and `error-code` (BSL-1.0, via
-# `copypasta` <- `i-slint-backend-winit`'s clipboard support) and
-# `libfuzzer-sys` (MIT/Apache-2.0/NCSA, via `rav1e` <- `ravif` <- `image` <-
-# `i-slint-compiler`/`i-slint-core`; a fuzzing-only dependency of an AV1
-# encoder Slint's image loader pulls in, never linked into this workspace's
-# own code). Boost Software License 1.0 and the NCSA license are both on the
-# FSF's GPL-compatible free-license list.
+# Slint's own license expression -- `GPL-3.0-only OR
+# LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0` (same
+# for every `i-slint-*` crate) -- is satisfied by the `GPL-3.0-only` arm
+# alone, already allowed below.
 [licenses]
 allow = [
     "GPL-3.0-or-later",
@@ -30,6 +19,36 @@ allow = [
     "Zlib",       # foldhash, slotmap (wgpu-hal tree)
     "ISC",        # libloading (wgpu-hal tree)
     "CC0-1.0",    # hexf-parse (naga, via wgpu)
+]
+
+[[licenses.exceptions]]
+name = "clipboard-win"
+allow = ["BSL-1.0"]
+
+[[licenses.exceptions]]
+name = "error-code"
+allow = ["BSL-1.0"]
+
+[[licenses.exceptions]]
+name = "libfuzzer-sys"
+allow = ["MIT", "Apache-2.0", "NCSA"]
+
+# Three RUSTSEC advisories are reached only through Slint's own transitive
+# dependency tree; each advisory itself states "no safe upgrade available", so
+# there is nothing to fix from this side. Ignored here rather than silently
+# failing the gate on a morning when nothing in this workspace changed;
+# revisit on any Slint version bump.
+[advisories]
+ignore = [
+    # paste v1.0.15, via paste -> pulp -> exr -> image ->
+    # (i-slint-compiler, i-slint-core, slint) -> focusforge-gui
+    { id = "RUSTSEC-2024-0436", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint version bump" },
+    # rustybuzz v0.20.1, via rustybuzz -> usvg -> resvg ->
+    # (i-slint-common, i-slint-compiler, i-slint-core) -> focusforge-gui
+    { id = "RUSTSEC-2026-0206", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint version bump" },
+    # ttf-parser v0.25.1, via ttf-parser -> fontdb -> usvg -> resvg ->
+    # (i-slint-common, i-slint-compiler, i-slint-core) -> focusforge-gui
+    { id = "RUSTSEC-2026-0192", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint version bump" },
 ]
 
 # The wgpu major is pinned to 29 by Slint's `unstable-wgpu-29`

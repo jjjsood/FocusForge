@@ -10,7 +10,8 @@ crates/gpu/    the shared wgpu device, WGSL fusion/warp kernels and the
                that pipeline keeps in flight on the device at once, mirroring
                `crates/core`'s own host-memory budget one crate over
 crates/cli/    focusforge-cli, the headless interface
-crates/gui/    the planned Slint application; no code yet
+crates/gui/    the Slint application: the design tokens and vendored icons
+               land first, the shell surfaces follow
 spikes/        standalone, workspace-excluded feasibility spikes
 fixtures/      small checked-in TIFF crops used by the test suite
 ```
@@ -24,12 +25,21 @@ registration), `rayon` and `serde`; `focusforge-gpu` declares
 default, so `cargo build --workspace` alone never needs a GPU or a
 Vulkan/Metal/DX12-capable driver); `focusforge-cli` adds `clap`, `serde`
 and `serde_json`, and forwards the same `gpu` feature to enable `--no-gpu`
-and the automatic GPU path on `stack`/`align`. Every dependency's license
+and the automatic GPU path on `stack`/`align`. `focusforge-gui` depends on
+`slint = "~1.17"` (`default-features = false`, features `std`,
+`compat-1-2`, `backend-winit`, `renderer-femtovg-wgpu`, `unstable-wgpu-29`
+-- the last one pinned to the same wgpu major `focusforge-gpu` declares),
+plus `slint-build` as a build dependency and `i-slint-backend-testing` as a
+dev dependency; Inter ships bundled under `assets/fonts/` and the icon set
+is vendored from Lucide under `assets/icons/`. Every dependency's license
 is checked against an allowlist in
 `deny.toml` with `cargo deny check licenses` (install with
-`cargo install cargo-deny --locked`). Building the Slint spikes under
-`spikes/` additionally needs `libfontconfig1-dev` (or an equivalent
-pkg-config shim) for Slint's font stack; the main workspace does not need it.
+`cargo install cargo-deny --locked`). **`libfontconfig1-dev` (Debian/Ubuntu
+naming) is a main-workspace build prerequisite**: `crates/gui`
+links Slint with `renderer-femtovg-wgpu`, which has a hard, code-side-unfixable
+dependency on fontconfig (slint-ui/slint discussion #12357), so a from-clean
+`cargo build --workspace` -- and therefore `tools/check-all.sh` -- needs it.
+There is no pkg-config-shim alternative; install the real package.
 `tools/check-all.sh`'s "synthetic alignment truth" gate stage needs numpy
 (`python3 -m pip install numpy`): it drives
 `spikes/synthetic-ground-truth/synth_stack.py --warp`, an independent numpy
