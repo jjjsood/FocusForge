@@ -32,6 +32,15 @@ pub mod canvas;
 /// resolves `<dir>/golden/laplacian.tif` + `<dir>/golden/laplacian-zmap.tif`.
 mod project_stub;
 
+/// The input table as data -- no `use slint::`, no `use wgpu::`. `pub` so
+/// `tests/input_map.rs` reaches its types directly.
+pub mod input_map;
+
+/// The input table's file format: load/write `input.toml`, no
+/// `use slint::`. `pub` so `src/main.rs` and `tests/input_map.rs` reach it
+/// directly.
+pub mod input_config;
+
 /// The wgpu half of the canvas: texture creation and
 /// `slint::Image::try_from`, the only module in the crate naming `wgpu` or
 /// `slint::wgpu_29`. `pub` so `src/main.rs` can drive it

@@ -15,6 +15,8 @@ import { FFToolbar } from "shell/toolbar.slint";
 import { FFCanvas } from "shell/canvas.slint";
 import { FFDock } from "shell/dock.slint";
 import { FFBottomBar } from "shell/bottom_bar.slint";
+import { FFSettingsModal, InputRow } from "shell/settings_modal.slint";
+export { InputRow }
 
 export component AppWindow inherits Window {
     // Every callback forwards one-for-one into `AppController` via
@@ -49,6 +51,15 @@ export component AppWindow inherits Window {
     background: Theme.surface-base;
     default-font-family: Theme.font-family;
     title: "FocusForge";
+    // Gives `canvas-ground` (the input dispatch point's `FocusScope`,
+    // declared below) keyboard focus on window activation -- without this,
+    // nothing in the shell ever takes focus, so `key-pressed`/`key-released`
+    // never fire and every key-chord row (`ctrl+z`, `ctrl+shift+z`,
+    // `space+left-drag`) is dead code in the real window. `forward-focus` is
+    // the compiler-recognised `Window` property for exactly this
+    // (`i-slint-compiler` 1.17.1's `forward-focus` builtin), not a second
+    // handler.
+    forward-focus: canvas-ground;
 
     tab-strip := FFTabStrip {
         x: 0px;
@@ -78,19 +89,58 @@ export component AppWindow inherits Window {
     in property <bool> canvas-undock-enabled: true;
     callback composite-undock-requested();
     callback zmap-undock-requested();
+    // Forwarded from `FFCanvas`'s own callbacks of the same shape -- the
+    // matching one-line-forward style as the two above.
+    callback canvas-scrolled(length, length, bool, bool, bool);
+    // `int`: `event.kind` folded to 0 = Down, 1 = Up or Cancel, 2 = Move --
+    // see `ui/shell/canvas.slint`'s `canvas-pointer` declaration.
+    callback canvas-pointer(PointerEventButton, int, length, length, bool, bool, bool);
+    callback canvas-dragged(length, length);
+    // The `FocusScope`'s own callbacks -- `text` carries the
+    // pressed/released key's unicode, the three bools its modifiers.
+    callback canvas-key-pressed(string, bool, bool, bool);
+    callback canvas-key-released(string, bool, bool, bool);
+    callback canvas-focus-changed();
 
-    canvas-ground := FFCanvas {
+    canvas-ground := FocusScope {
         x: 0px;
         y: ShellGeometry.strip-height + ShellGeometry.toolbar-height;
         width: root.width - ShellGeometry.dock-width;
         height: root.height - ShellGeometry.strip-height - ShellGeometry.toolbar-height
             - ShellGeometry.bottom-bar-height;
-        composite-source: root.composite-source;
-        zmap-source: root.zmap-source;
-        undock-enabled: root.canvas-undock-enabled;
 
-        composite-undock-requested => { root.composite-undock-requested(); }
-        zmap-undock-requested => { root.zmap-undock-requested(); }
+        // `reject` so the chrome accelerators still reach the parent;
+        // `key-pressed` auto-repeats while a key is held, which
+        // `AppController::set_space_held`'s idempotence absorbs.
+        key-pressed(event) => {
+            root.canvas-key-pressed(event.text, event.modifiers.control, event.modifiers.shift,
+                event.modifiers.alt);
+            reject
+        }
+        key-released(event) => {
+            root.canvas-key-released(event.text, event.modifiers.control, event.modifiers.shift,
+                event.modifiers.alt);
+            reject
+        }
+        focus-changed-event(reason) => { root.canvas-focus-changed(); }
+
+        FFCanvas {
+            width: 100%;
+            height: 100%;
+            composite-source: root.composite-source;
+            zmap-source: root.zmap-source;
+            undock-enabled: root.canvas-undock-enabled;
+
+            composite-undock-requested => { root.composite-undock-requested(); }
+            zmap-undock-requested => { root.zmap-undock-requested(); }
+            canvas-scrolled(dx, dy, ctrl, shift, alt) => {
+                root.canvas-scrolled(dx, dy, ctrl, shift, alt);
+            }
+            canvas-pointer(button, kind, x, y, ctrl, shift, alt) => {
+                root.canvas-pointer(button, kind, x, y, ctrl, shift, alt);
+            }
+            canvas-dragged(x, y) => { root.canvas-dragged(x, y); }
+        }
     }
 
     dock := FFDock {
@@ -107,10 +157,33 @@ export component AppWindow inherits Window {
         checkpoint-export-requested => { root.checkpoint-export-requested(); }
     }
 
+    // Settings modal state -- pushed from Rust once at startup
+    // (`src/main.rs`, `--settings-section`) and toggled through
+    // `AppController::open_settings`/`close_settings`.
+    in property <bool> settings-open: false;
+    in property <[InputRow]> input-rows: [];
+    in property <string> input-provenance: "";
+    callback settings-open-requested();
+    callback settings-close-requested();
+
     bottom-bar := FFBottomBar {
         x: 0px;
         y: root.height - ShellGeometry.bottom-bar-height;
         width: root.width;
         height: ShellGeometry.bottom-bar-height;
+
+        settings-requested => { root.settings-open-requested(); }
+    }
+
+    settings-modal := FFSettingsModal {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        settings-open: root.settings-open;
+        input-rows: root.input-rows;
+        input-provenance: root.input-provenance;
+
+        settings-close-requested => { root.settings-close-requested(); }
     }
 }

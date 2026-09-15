@@ -12,6 +12,27 @@ use slint::winit_030::WinitWindowAccessor;
 
 use crate::controller::{AppController, DockTab, ShellEvent, ShellMode};
 use crate::generated::AppWindow;
+use crate::input_map::{Button, Modifiers, PointerKind};
+
+/// `slint::platform::PointerEventButton` -> `input_map::Button` -- the only
+/// place in the crate that names the Slint type.
+fn button(b: slint::platform::PointerEventButton) -> Button {
+    match b {
+        slint::platform::PointerEventButton::Left => Button::Left,
+        slint::platform::PointerEventButton::Middle => Button::Middle,
+        slint::platform::PointerEventButton::Right => Button::Right,
+        _ => Button::Other,
+    }
+}
+
+fn modifiers(controller: &AppController, ctrl: bool, shift: bool, alt: bool) -> Modifiers {
+    Modifiers {
+        ctrl,
+        shift,
+        alt,
+        space: controller.space_held(),
+    }
+}
 
 /// Wires every callback in `app` to a fresh [`AppController`], and returns
 /// the controller handle so `main.rs` can read the same state the window
@@ -93,6 +114,76 @@ pub fn install(app: &AppWindow) -> Arc<Mutex<AppController>> {
                 .undock_requested(crate::canvas::PaneSource::ZMap)
         }
     });
+    app.on_canvas_scrolled({
+        let controller = controller.clone();
+        move |delta_x, delta_y, ctrl, shift, alt| {
+            let mut controller = controller.lock().unwrap();
+            let mods = modifiers(&controller, ctrl, shift, alt);
+            controller.wheel(delta_x, delta_y, mods);
+        }
+    });
+    app.on_canvas_pointer({
+        let controller = controller.clone();
+        move |btn, kind, x, y, ctrl, shift, alt| {
+            let mut controller = controller.lock().unwrap();
+            let mods = modifiers(&controller, ctrl, shift, alt);
+            // `kind` is `ui/shell/canvas.slint`'s fold of `PointerEventKind`:
+            // 0 = Down, 1 = Up or Cancel, 2 = Move. `Move` fires on every
+            // mouse movement over the area, before `moved` -- forwarded as
+            // `PointerKind::Move` rather than folded into `Up`, which would
+            // end a live drag after zero `ActionUpdate`s.
+            let kind = match kind {
+                0 => PointerKind::Down,
+                2 => PointerKind::Move,
+                _ => PointerKind::Up,
+            };
+            controller.pointer(kind, button(btn), x, y, mods);
+        }
+    });
+    app.on_canvas_dragged({
+        let controller = controller.clone();
+        move |x, y| controller.lock().unwrap().pointer_moved(x, y)
+    });
+    app.on_canvas_key_pressed({
+        let controller = controller.clone();
+        move |text, ctrl, shift, alt| {
+            let mut controller = controller.lock().unwrap();
+            let mods = modifiers(&controller, ctrl, shift, alt);
+            controller.key(true, text.as_str(), mods);
+        }
+    });
+    app.on_canvas_key_released({
+        let controller = controller.clone();
+        move |text, ctrl, shift, alt| {
+            let mut controller = controller.lock().unwrap();
+            let mods = modifiers(&controller, ctrl, shift, alt);
+            controller.key(false, text.as_str(), mods);
+        }
+    });
+    app.on_canvas_focus_changed({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().clear_input_modifiers()
+    });
+    app.on_settings_open_requested({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            let open = controller.lock().unwrap().open_settings();
+            if let Some(app) = app_weak.upgrade() {
+                app.set_settings_open(open);
+            }
+        }
+    });
+    app.on_settings_close_requested({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            let open = controller.lock().unwrap().close_settings();
+            if let Some(app) = app_weak.upgrade() {
+                app.set_settings_open(open);
+            }
+        }
+    });
 
     controller
 }
@@ -147,5 +238,13 @@ fn perform(app: &AppWindow, event: ShellEvent) {
         // Never reachable while `undock_enabled()` is always `true` with
         // both panes docked.
         ShellEvent::PaneUndockRequested(_) => {}
+        // A no-op here regardless of `Action::implemented()`: the viewport
+        // mutation itself already happened synchronously inside
+        // `AppController::emit_action` before this event was even raised,
+        // and the repaint it needs runs on the
+        // *callback* path (`repaint`, above), not through the sink --
+        // `perform` runs off a `Send + Sync` closure that can hold neither
+        // an `Rc` nor the GPU state `CanvasRenderer` needs.
+        ShellEvent::Input(_) => {}
     }
 }

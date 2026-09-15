@@ -35,6 +35,17 @@ struct Args {
     /// a stub project format).
     #[arg(long)]
     open: Option<PathBuf>,
+    /// Overrides where the input map is read from/written to --
+    /// `<DIR>/focusforge/input.toml`, mirroring what
+    /// `input_config::default_config_dir()` itself resolves to. Exists so a
+    /// test run never writes into the tester's own
+    /// `~/.config/focusforge/`.
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    /// Opens the settings modal on the named section at startup:
+    /// `input-map` or `diagnostics`.
+    #[arg(long)]
+    settings_section: Option<String>,
 }
 
 /// Parses `"WxH"`; `None` on anything else, including a missing or
@@ -139,8 +150,74 @@ fn run_window<T: ComponentHandle + 'static>(app: T, args: &Args) -> i32 {
     exit_code.get()
 }
 
+/// `<DIR>/focusforge` when `--config-dir` was given (mirroring what
+/// `directories::ProjectDirs` itself would resolve for the application),
+/// else `input_config::default_config_dir()`.
+fn resolve_config_dir(args: &Args) -> Option<PathBuf> {
+    args.config_dir
+        .clone()
+        .map(|dir| dir.join("focusforge"))
+        .or_else(focusforge_gui::input_config::default_config_dir)
+}
+
+/// Loads the input table, prints every refusal once on stderr, writes the
+/// defaults on first run, and installs it on `controller` and `app`.
+/// A refused or unwritable config file is never a reason the window
+/// fails to open.
+fn install_input_table(
+    controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
+    app: &AppWindow,
+    args: &Args,
+) {
+    use focusforge_gui::input_config;
+
+    let Some(config_dir) = resolve_config_dir(args) else {
+        eprintln!("could not resolve a config directory -- starting on the input map defaults");
+        return;
+    };
+
+    let mut loaded = input_config::load(&config_dir);
+    for problem in &loaded.problems {
+        eprintln!("{problem}");
+    }
+    if matches!(loaded.provenance, input_config::Provenance::Defaults)
+        && loaded.problems.is_empty()
+        && let Err(e) = input_config::write_defaults(&config_dir)
+    {
+        eprintln!("{e}");
+        loaded.problems.push(e);
+    }
+
+    let mut controller = controller.lock().unwrap();
+    controller.install_input_table(loaded.table, loaded.provenance);
+
+    let rows: Vec<focusforge_gui::InputRow> = controller
+        .input_rows()
+        .into_iter()
+        .map(|r| focusforge_gui::InputRow {
+            input: r.input.into(),
+            stacking: r.stacking.into(),
+            editor: r.editor.into(),
+        })
+        .collect();
+    app.set_input_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    app.set_input_provenance(controller.input_provenance_line().into());
+
+    if args.settings_section.is_some() {
+        controller.open_settings();
+        app.set_settings_open(true);
+    }
+}
+
 fn main() {
     let args = Args::parse();
+
+    if let Some(section) = &args.settings_section
+        && section != "input-map"
+    {
+        eprintln!("--settings-section accepts only \"input-map\", got {section:?}");
+        std::process::exit(2);
+    }
 
     select_backend();
 
@@ -150,6 +227,8 @@ fn main() {
     } else {
         let app = AppWindow::new().expect("failed to instantiate AppWindow");
         let controller = bridge::install(&app);
+
+        install_input_table(&controller, &app, &args);
 
         if let Some(path) = &args.open {
             if let Err(e) = controller.lock().unwrap().open_project(path) {

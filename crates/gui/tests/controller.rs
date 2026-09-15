@@ -12,10 +12,34 @@ use std::sync::{Arc, Mutex};
 use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode};
 
 /// True when `body` (already trimmed) is exactly one statement of the form
-/// `root.<ident>(...)`, per step 6's rule.
+/// `root.<ident>(...)`, with an optional trailing `accept`/`reject` token,
+/// since `scroll-event` and `key-pressed`/`key-released` must return an
+/// `EventResult` and their handler bodies therefore end in a bare `accept`
+/// or `reject` after the forwarding call. Nothing else widens: a handler
+/// body with two statements before that trailing token must still fail.
 fn is_single_root_call(body: &str) -> bool {
     let body = body.trim();
+    let body = body
+        .strip_suffix("accept")
+        .or_else(|| body.strip_suffix("reject"))
+        .map(str::trim_end)
+        .unwrap_or(body);
     body.starts_with("root.") && body.ends_with(");") && body.matches(';').count() == 1
+}
+
+#[test]
+fn is_single_root_call_allows_one_trailing_accept_or_reject() {
+    assert!(is_single_root_call("root.canvas_scrolled(a, b); accept"));
+    assert!(is_single_root_call("root.canvas_key_pressed(a); reject"));
+    assert!(is_single_root_call("root.foo();"));
+    assert!(
+        !is_single_root_call("root.foo(); root.bar(); accept"),
+        "two statements before the trailing token must still fail"
+    );
+    assert!(
+        !is_single_root_call("let x = 1; root.foo(); accept"),
+        "a non-forward statement before the trailing token must still fail"
+    );
 }
 
 /// Every `... => { ... }` handler body in `contents`, as

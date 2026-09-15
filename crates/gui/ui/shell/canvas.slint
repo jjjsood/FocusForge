@@ -84,8 +84,41 @@ export component FFCanvas inherits Rectangle {
     in property <bool> undock-enabled: true;
     callback composite-undock-requested();
     callback zmap-undock-requested();
+    // The one input dispatch point's gesture forwards. No other `.slint`
+    // file in the crate declares `scroll-event`, `pointer-event` or
+    // `moved`.
+    callback canvas-scrolled(length, length, bool, bool, bool);
+    // The `int` is `event.kind` folded to 0 = Down, 1 = Up or Cancel,
+    // 2 = Move -- `PointerEventKind` itself is not publicly nameable from
+    // `src/bridge.rs` (unlike `PointerEventButton`), so the fold happens
+    // here rather than forwarding an unnameable type. `Move` fires on every
+    // mouse movement over the area, before `moved`; the dispatch point
+    // (`AppController::pointer`, `PointerKind::Move`) is what ignores it.
+    callback canvas-pointer(PointerEventButton, int, length, length, bool, bool, bool);
+    callback canvas-dragged(length, length);
 
     background: Theme.surface-base;
+
+    // First child so it spans the whole canvas region while the
+    // later-declared panes and their `FFUndockControl` `TouchArea`s keep
+    // z-order above it.
+    hit-area := TouchArea {
+        width: 100%;
+        height: 100%;
+
+        scroll-event(event) => {
+            root.canvas-scrolled(event.delta-x, event.delta-y, event.modifiers.control,
+                event.modifiers.shift, event.modifiers.alt);
+            accept
+        }
+        pointer-event(event) => {
+            root.canvas-pointer(event.button,
+                event.kind == PointerEventKind.down ? 0 : (event.kind == PointerEventKind.move ? 2 : 1),
+                self.mouse-x, self.mouse-y, event.modifiers.control, event.modifiers.shift,
+                event.modifiers.alt);
+        }
+        moved => { root.canvas-dragged(self.mouse-x, self.mouse-y); }
+    }
 
     pane-left := FFPane {
         x: ShellGeometry.pane-gutter;

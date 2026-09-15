@@ -3,12 +3,32 @@
 // The bottom bar: the only band that spans the dock, because zoom, Fit and
 // the ETA belong to the whole window. Otherwise an empty container except
 // for the gear control at the left end, which reaches the `Input map`
-// settings section.
+// settings section, and the zoom cluster at the right end: the control, the
+// readout and `Fit`, governing both panes, placed here rather than in a
+// pane so it stays visible regardless of which pane has focus.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
 
 export component FFBottomBar inherits Rectangle {
+    callback settings-requested();
+
     height: ShellGeometry.bottom-bar-height;
     background: Theme.surface-raised;
+
+    gear := TouchArea {
+        x: Theme.space-3;
+        y: (parent.height - self.height) / 2;
+        width: Theme.icon-lg;
+        height: Theme.icon-lg;
+
+        clicked => { root.settings-requested(); }
+
+        Image {
+            source: @image-url("../../../../assets/icons/settings.svg");
+            colorize: gear.has-hover ? Theme.text-primary : Theme.text-secondary;
+            width: Theme.icon-md;
+            height: Theme.icon-md;
+        }
+    }
 }
