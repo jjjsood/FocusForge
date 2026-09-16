@@ -5,7 +5,7 @@
 //! A project is a zip holding exactly three kinds of entry:
 //!
 //! ```text
-//! $ unzip -l mantis-512.ffp        # a real run over fixtures/mantis-512
+//! $ unzip -l mantis-512.ffp   # a real run over fixtures/mantis-512
 //!   Length      Date    Time    Name
 //! ---------  ---------- -----   ----
 //!      3804  1980-01-01 00:00   manifest.json
