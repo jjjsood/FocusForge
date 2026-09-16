@@ -3,15 +3,24 @@
 ## Repository layout
 
 ```
-crates/core/   TIFF I/O, tiles, stacking algorithms and the Z-Map
+crates/core/   TIFF I/O, tiles, stacking and alignment algorithms, the
+               Z-Map, the job engine (pause/resume/cancel over tile-sized
+               work units), the stage cache, grouping proposals and the
+               `.ffproj` project container
 crates/gpu/    the shared wgpu device, WGSL fusion/warp kernels and the
                tile-scheduler pipeline that runs them, behind the `gpu`
                feature (on by default). An allocate-and-back-off probe at
                startup discovers the device's usable VRAM budget, mirroring
                `crates/core`'s own host-memory budget one crate over
-crates/cli/    focusforge-cli, the headless interface
-crates/gui/    the Slint application: the design tokens and vendored icons
-               land first, the shell surfaces follow
+crates/cli/    focusforge-cli, the headless interface: every algorithm and
+               every batch-run control (grouping, presets, resume, review,
+               the stage cache) is reachable here
+crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
+               strip, settings modal), a wgpu-backed canvas that renders a
+               composite/Z-Map pair, and remappable keyboard/mouse
+               bindings. `--open <dir>` resolves the fixed development pair
+               `<dir>/golden/laplacian.tif` + `<dir>/golden/laplacian-zmap.tif`,
+               separate from the `.ffproj` container `stack` writes
 spikes/        standalone, workspace-excluded feasibility spikes
 fixtures/      small checked-in TIFF crops used by the test suite
 ```
@@ -20,24 +29,29 @@ fixtures/      small checked-in TIFF crops used by the test suite
 
 Rust, edition 2024, toolchain pinned to `1.95.0` (`rust-toolchain.toml`).
 `focusforge-core` depends on `memmap2`, `thiserror`, `inventory` (algorithm
-registration), `rayon` and `serde`; `focusforge-gpu` declares
+registration), `rayon`, `serde` and `serde_json`; `blake3` hashes project
+blobs, `zip`/`zstd` (compression backends off, `zip`'s clock feature off too,
+so two seals of the same inputs produce identical container bytes) read and
+write the `.ffproj` container, and `sysinfo` reads host memory for the
+adaptive tile-scheduler budget; `focusforge-gpu` declares
 `wgpu = "29.0.4"`, gated behind its own `gpu` Cargo feature, on by default on
 both `focusforge-gpu` and `focusforge-cli` (`--no-default-features` excludes
 it, so `cargo build --workspace --no-default-features` is the invocation
 that never needs a GPU or a Vulkan/Metal/DX12-capable driver); `focusforge-cli`
-adds `clap`, `serde` and `serde_json`, and forwards the same `gpu` feature to
-enable `--no-gpu` and the automatic GPU path on `stack`/`align`. `focusforge-gui` depends on
-`slint = "~1.17"` (`default-features = false`, features `std`,
-`compat-1-2`, `backend-winit`, `renderer-femtovg-wgpu`, `unstable-wgpu-29`
--- the last one pinned to the same wgpu major `focusforge-gpu` declares),
-plus `slint-build` as a build dependency and `i-slint-backend-testing` as a
-dev dependency; Inter ships bundled under `assets/fonts/` and the icon set
-is vendored from Lucide under `assets/icons/`. Every dependency's license
-is checked against an allowlist in
-`deny.toml` with `cargo deny check licenses` (install with
+adds `clap`, `serde`, `serde_json`, `toml` and `signal-hook` (SIGINT/SIGUSR1
+handling for `stack`'s pause/resume/cancel controls), and forwards the same
+`gpu` feature to enable `--no-gpu` and the automatic GPU path on
+`stack`/`align`. `focusforge-gui` depends on `slint = "~1.17"`
+(`default-features = false`, features `std`, `compat-1-2`, `backend-winit`,
+`renderer-femtovg-wgpu`, `unstable-wgpu-29` -- pinned to the same wgpu major
+`focusforge-gpu` declares -- and `unstable-winit-030`), plus `slint-build` as
+a build dependency and `i-slint-backend-testing` as a dev dependency; Inter
+ships bundled under `assets/fonts/` and the icon set is vendored from Lucide
+under `assets/icons/`. Every dependency's license is checked against an
+allowlist in `deny.toml` with `cargo deny check licenses` (install with
 `cargo install cargo-deny --locked`). **`libfontconfig1-dev` (Debian/Ubuntu
-naming) is a main-workspace build prerequisite**: `crates/gui`
-links Slint with `renderer-femtovg-wgpu`, which has a hard, code-side-unfixable
+naming) is a main-workspace build prerequisite**: `crates/gui` links Slint
+with `renderer-femtovg-wgpu`, which has a hard, code-side-unfixable
 dependency on fontconfig (slint-ui/slint discussion #12357), so a from-clean
 `cargo build --workspace` -- and therefore `tools/check-all.sh` -- needs it.
 There is no pkg-config-shim alternative; install the real package.
@@ -54,11 +68,18 @@ handling, truncation and out-of-bounds errors), tile reads against both
 byte-order and strip-height variants, the writer's round trip back through
 the reader, the tile scheduler's memory budget, the Z-Map reader and
 writer, each stacking algorithm's fusion output, the pyramidal ECC solver
-and its warp and auto-crop stages, and the `focusforge-cli
-stack`/`align`/`algorithms` commands end to end, plus the fixture manifest.
-Fixtures under `fixtures/mantis-64` and `fixtures/mantis-512` are small
-crops of a 61-frame macro stack, cut and checksummed by harness tooling —
-never hand-edited.
+and its warp and auto-crop stages, the job engine's pause/resume/cancel
+control loop, the stage cache, grouping proposals and the `.ffproj` project
+container's read/write round trip, and the `focusforge-cli
+stack`/`align`/`algorithms`/`export`/`review`/`cache` commands end to end,
+plus the fixture manifest. `crates/gui` has its own suite — the theme
+tokens, the plain-Rust shell and canvas state, the viewport arithmetic, and
+the input-remapping table and its `input.toml` file format run headlessly
+through `i-slint-backend-testing`, with no real window; a separate windowed
+suite launches the real binary and needs a compositor and a GPU adapter,
+skipping itself with a printed line on a host with neither. Fixtures under
+`fixtures/mantis-64` and `fixtures/mantis-512` are small crops of a 61-frame
+macro stack, cut and checksummed by harness tooling — never hand-edited.
 
 `crates/gpu`'s WGSL fusion and warp kernels, and the pipeline in
 `focusforge-cli` that dispatches them, sit behind the `gpu` Cargo feature —

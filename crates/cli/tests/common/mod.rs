@@ -26,3 +26,22 @@ pub fn workspace_root() -> PathBuf {
 pub fn fixtures_dir() -> PathBuf {
     workspace_root().join("fixtures")
 }
+
+/// Appends `--no-gpu` to `args` when this crate's own `gpu` feature is
+/// compiled in -- a no-op build has no such flag at all, not even as a
+/// no-op (`crates/cli/src/main.rs`'s own `#[cfg(feature = "gpu")]` on the
+/// arg). `gpu` became a default build feature, so any test that names a
+/// real algorithm (`laplacian`, `depth-map`) and depends on running the CPU
+/// tile scheduler -- exact-byte equality against a CPU oracle, deterministic
+/// single-worker pause/resume timing -- must call this or silently start
+/// exercising the GPU path's ±1 LSB budget instead.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+pub fn push_no_gpu(mut args: Vec<&str>) -> Vec<&str> {
+    if cfg!(feature = "gpu") {
+        args.push("--no-gpu");
+    }
+    args
+}

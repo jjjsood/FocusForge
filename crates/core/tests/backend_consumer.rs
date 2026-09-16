@@ -20,7 +20,7 @@ use focusforge_core::io::TiffStack;
 use focusforge_core::params::{ParamValue, ParamValues, StackContext};
 use focusforge_core::tile::preprocess::FramePreprocess;
 use focusforge_core::tile::{
-    Rect, Tile, TileConsumer, TileError, TileJob, TileScheduler, TileSchedulerOptions,
+    NoControl, Rect, Tile, TileConsumer, TileError, TileJob, TileScheduler, TileSchedulerOptions,
 };
 
 fn scratch_base(label: &str) -> PathBuf {
@@ -275,6 +275,62 @@ fn backend_fusion_consumer_matches_fusion_consumer_byte_for_byte() {
     );
 }
 
+/// `TileConsumer::abort` must leave no half-covered output file open: both
+/// writers are taken out of their mutexes and dropped. The trait default is a
+/// no-op, so a wrapper that does not override `abort` loses that guarantee.
+/// Observed through `FusionConsumer::finish`'s
+/// `expect("composite writer present")`: after `abort` there is no writer.
+#[test]
+fn abort_drops_the_sinks_writers_through_the_backend_consumer() {
+    let stack = open_stack();
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let frame_count = stack.len();
+    let composite_path =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("backend_consumer_abort_composite.partial");
+
+    let mut values = ParamValues::new();
+    values.insert("levels".to_string(), ParamValue::Int(5));
+    let sink = FusionConsumer::create(
+        &Laplacian,
+        values,
+        &composite_path,
+        None,
+        FusionGeometry {
+            width,
+            height,
+            samples_per_pixel: spp,
+            frame_count: frame_count as u32,
+            crop: None,
+            description: None,
+        },
+    )
+    .expect("create must succeed");
+
+    let backend = DummyBackend;
+    let consumer = BackendFusionConsumer::new(
+        &backend,
+        &stack,
+        (width, height),
+        vec![Transform::identity(); frame_count],
+        spp,
+        5,
+        &sink,
+    );
+    consumer.abort();
+
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.finish()));
+    std::panic::set_hook(previous_hook);
+    assert!(
+        finished.is_err(),
+        "abort must have dropped the composite writer, leaving finish nothing to close"
+    );
+
+    let _ = std::fs::remove_file(&composite_path);
+}
+
 #[test]
 fn a_non_noop_preprocess_is_refused_by_name_for_a_pixel_supplying_consumer() {
     let stack = open_stack();
@@ -288,6 +344,36 @@ fn a_non_noop_preprocess_is_refused_by_name_for_a_pixel_supplying_consumer() {
     let err = scheduler
         .run(&NotNoopPreprocess, &OwnPixelsProbe)
         .expect_err("a non-noop preprocess must be refused for a pixel-supplying consumer");
+    assert!(
+        matches!(err, TileError::PixelSupplyingConsumerNeedsNoopPreprocess),
+        "expected PixelSupplyingConsumerNeedsNoopPreprocess, got {err:?}"
+    );
+}
+
+/// The same refusal, reached through `run_tiles_controlled` rather than
+/// `run`. `crate::job::Job::run` drives that method directly and never goes
+/// through `run_tiles`, so a guard living in the `run_tiles` wrapper would
+/// leave the job-engine path silently accepting the combination this
+/// refuses. Latent today -- `NoopPreprocess` is the only implementation in
+/// the tree -- which is exactly why it needs a test rather than a comment.
+#[test]
+fn the_non_noop_refusal_also_fires_on_the_controlled_entry_point() {
+    let stack = open_stack();
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let stack_ctx = StackContext::new(stack.len(), width, height, spp);
+    let options = TileSchedulerOptions::new(scratch_base("refuse_non_noop_controlled"));
+    let scheduler =
+        TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
+
+    let err = scheduler
+        .run_tiles_controlled(
+            scheduler.plan().tiles(),
+            &NotNoopPreprocess,
+            &OwnPixelsProbe,
+            &NoControl,
+        )
+        .expect_err("a non-noop preprocess must be refused on the controlled path too");
     assert!(
         matches!(err, TileError::PixelSupplyingConsumerNeedsNoopPreprocess),
         "expected PixelSupplyingConsumerNeedsNoopPreprocess, got {err:?}"

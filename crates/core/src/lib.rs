@@ -13,9 +13,12 @@ pub mod fuse;
 pub mod gpu;
 pub mod host;
 pub mod io;
+pub mod job;
 pub mod params;
+pub mod project;
 pub mod registry;
 pub mod tile;
+pub mod timing;
 pub mod zmap;
 
 #[cfg(feature = "test-algorithms")]

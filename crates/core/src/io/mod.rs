@@ -16,10 +16,14 @@
 //! A crate-level grep for whole-frame reads enforces the rule above.
 
 mod error;
+mod grouping;
+#[cfg(feature = "test-algorithms")]
+pub mod test_frames;
 pub(crate) mod tiff;
 
 pub use crate::tile::{Rect, Tile};
 pub use error::{Refusal, TiffError};
+pub use grouping::{CaptureTime, GROUP_GAP, Group, GroupSignal, Proposal, propose};
 pub use tiff::header::{ByteOrder, TiffHeader};
 pub use tiff::stack::{TiffStack, frame_paths};
 pub use tiff::writer::{TiffSpec, TiffWriter};

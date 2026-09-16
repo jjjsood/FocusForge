@@ -5,25 +5,6 @@
 //! moving [`Plane`], for a translation-only and a rotation+scale
 //! (similarity) parameterization.
 //!
-//! # Provenance
-//!
-//! This module is written from the mathematics below, never with a
-//! reference implementation open as a model -- this crate's own,
-//! from-scratch pyramidal ECC. The peer-reviewed source -- Evangelidis & Psarakis, TPAMI
-//! 30(10):1858-1865, 2008 -- contains **no inverse-compositional
-//! equations**: its own §3.3 delegates the whole derivation to "Table 1
-//! appropriately modified", with no IC table, no IC equation and no
-//! composition rule. Every concrete IC equation transcribed here therefore
-//! rests on the paper's forward-additive equations (4), (5), (10), (11) and
-//! (19), re-derived for the inverse-compositional case, corroborated as a
-//! *fact* (never copied as *code*) against the algorithm's own author's
-//! published toolbox -- itself unlicensed for copying purposes, so nothing
-//! from it is transliterated here, only facts about its behaviour are
-//! cited. OpenCV's `findTransformECC` is Apache-2.0 and implements the
-//! **forward-additive** variant only; it is not a like-for-like oracle for
-//! this solver's update path (it may sanity-check the objective, ρ, never
-//! the update), and nothing from its source enters this file.
-//!
 //! ## The objective
 //!
 //! `I_r` is the template (reference), `I_w` the moving image. `y = φ(x; p)`
@@ -40,60 +21,37 @@
 //!
 //! ## The inverse-compositional update
 //!
-//! With `Ḡ` the **column**-zero-mean design matrix (row `n` is
+//! With `Ḡ` the **column**-zero-mean design matrix (row `n` is
 //! `∇T(x_n)^t · J(x_n)`, `J` the warp Jacobian at the identity warp) and
-//! `C = Ḡ^tḠ`:
+//! `C = Ḡ^tḠ`:
 //!
 //! ```text
-//! Gt  = Ḡ^t ī_r,           Gw = Ḡ^t ī_w
+//! Gt  = Ḡ^t ī_r,           Gw = Ḡ^t ī_w
 //! v   = C^-1 Gt
 //! num = ‖ī_r‖^2 - Gt^t v,  den = ī_r^t ī_w - Gw^t v
 //! λ   = num / den
 //! Δp  = C^-1 (λ · Gw - Gt)
 //! ```
 //!
-//! `den <= 0` is the paper's Lemma 1 region (eq. (19) would *decrease* the
-//! correlation); this solver reports it as
-//! [`DivergenceReason::LemmaOneRegion`] rather than switching to eqs.
-//! (20)/(21), which neither reference implementation the sourcing pass
-//! found implements either.
-//!
-//! **`Ḡ` is column-centred**, the paper's eqs. (10)-(11), not the author's
-//! own toolbox's raw `G`: with `ī_r`/`ī_w` zero-mean, the centred projector
-//! annihilates the constant vector and so acts on the space the data
-//! vectors actually live in. Only `C` differs between the two choices
-//! (`Ḡ^t v = G^t v` for any zero-mean `v`); the general case was not
-//! established, this is a recorded choice.
-//!
-//! **Zero-meaning is over the current overlap only**: both `ī_r` and `ī_w`
-//! are computed from the samples the moving-plane sampler could actually
-//! reach *this iteration*, never over the whole region regardless of
-//! validity. This is load-bearing, not an optimization.
+//! `den <= 0` reports [`DivergenceReason::LemmaOneRegion`]. `Ḡ` is
+//! column-centred, not the raw design matrix: with `ī_r`/`ī_w` zero-mean,
+//! the centred projector annihilates the constant vector and so acts on
+//! the space the data vectors actually live in. Zero-meaning is over the
+//! current overlap only, recomputed whenever validity changes -- this is
+//! load-bearing, not an optimization.
 //!
 //! ## Composition -- `W ← W · ΔW^-1`
 //!
-//! The increment is inverted and composed on the **right**
-//! (`Transform::compose`'s "right operand applied first" order), Baker &
-//! Matthews' *Lucas-Kanade 20 Years On* eq. (34). This is **not** the
-//! author's own toolbox's `ΔW^-1 · W`: under the template-to-moving-image
-//! convention the two orders are not equivalent, because the increment gets
-//! conjugated by the current warp. Measured during the sourcing pass
-//! (template = an image warped by 20° about its centre plus a translation,
-//! 3-DOF Euclidean IC, RMS residual per iteration): the toolbox order
-//! converges **linearly** (`6.851 → 2.314 → 0.875 → 0.323 → 0.123 → 0.045 →
-//! 0.017 → 0.006`, ratio ≈ 0.37 every step) while this order converges
-//! **quadratically** (`6.851 → 0.747 → 0.056 → 0.004 → 0.0003 → 0.0000`).
-//! For a **pure translation** the two orders are identical, because
-//! translations commute -- which is why the toolbox has never been bitten by
-//! this, and why a later reader must not "fix" this file back to match it.
+//! The increment is inverted and composed on the **right** (`Transform::compose`'s "right operand
+//! applied first" order): under the template-to-moving-image convention the increment gets
+//! conjugated by the current warp, so the opposite order is not equivalent. Measured (template
+//! warped by 20° about its centre plus a translation, 3-DOF Euclidean IC): the opposite order
+//! converges **linearly** (ratio ≈ 0.37 every step) while this order converges **quadratically**; a
+//! pure translation makes the two orders identical, since translations commute.
 //!
-//! ## The similarity Jacobian -- derived here
+//! ## The similarity Jacobian
 //!
-//! No ECC source supplies a similarity (uniform-scale rotation) Jacobian:
-//! the author's own toolbox refuses `similarity` and silently substitutes
-//! affine, and OpenCV's `findTransformECC` has no scaled-Euclidean mode at
-//! all -- exactly the degree of freedom focus breathing exists to measure.
-//! Derived here, with `p = [c, s, tx, ty]` and
+//! With `p = [c, s, tx, ty]` and
 //! `ΔW = [[1+Δp0, -Δp1, Δp2], [Δp1, 1+Δp0, Δp3], [0, 0, 1]]`:
 //!
 //! ```text
@@ -101,12 +59,7 @@
 //!                      y   x  0  1 ]
 //! ```
 //!
-//! corroborated (not derived from) the author's own toolbox's
-//! `iat_get_similarity.m`, whose design-matrix rows for a *feature-based*
-//! least-squares estimator -- not part of ECC at all -- happen to be
-//! `[x -y 1 0; y x 0 1]`; that corroborates the parameterization, not the
-//! ECC derivation. `ΔW^-1` has the closed form (`ΔW = [[a, -b, tx], [b, a,
-//! ty], [0, 0, 1]]`):
+//! `ΔW^-1` has the closed form (`ΔW = [[a, -b, tx], [b, a, ty], [0, 0, 1]]`):
 //!
 //! ```text
 //! ΔW^-1 = (1 / (a^2 + b^2)) * [ a   b  -(a*tx + b*ty) ;
@@ -126,7 +79,7 @@
 //! origin, so `similarity_delta` conjugates it back (`T(c) ∘ ΔW ∘ T(-c)`)
 //! before composing it into `w`.
 //!
-//! ## Sampling and out-of-domain handling
+//! ## Sampling and validity
 //!
 //! The solver reuses [`super::warp::catmull_rom_weights`], the crate's one bicubic Catmull-Rom
 //! kernel, with its pinned horizontal-then-vertical accumulation order. **Validity is stricter than
@@ -137,14 +90,11 @@
 //! Out-of-domain samples are excluded from every accumulation and counted; a `valid_fraction` below
 //! [`EccParams::min_valid_fraction`] ends the run as [`DivergenceReason::TooFewValidSamples`].
 //!
-//! ## The full-overlap precondition
-//!
-//! `∇T`, the warp Jacobian, `Ḡ` and `C` are computed once, outside the
-//! loop, and never revisited. `ī_r`, `Gt` and `v = C^-1 Gt` are
-//! loop-invariant **only when every sample in `region` is valid on every
-//! iteration** -- checked at runtime every iteration, never assumed; when
-//! the check fails they are recomputed for that iteration rather than
-//! reusing a stale, quietly wrong template mean.
+//! `∇T`, the warp Jacobian, `Ḡ` and `C` are computed once, outside the
+//! loop. `ī_r`, `Gt` and `v = C^-1 Gt` are loop-invariant **only when
+//! every sample in `region` is valid on every iteration** -- checked at
+//! runtime every iteration; when the check fails they are recomputed
+//! rather than reusing a stale template mean.
 //!
 //! ## Termination
 //!
@@ -153,20 +103,15 @@
 //! falls below [`EccParams::epsilon_px`]; **hit the cap** at
 //! [`EccParams::max_iterations`] with no convergence; **diverged**, for a
 //! singular Hessian, the Lemma 1 region, a non-invertible increment, too
-//! few valid samples, a non-finite update, or a correlation that falls more
-//! than a documented slack below the best ρ seen so far
-//! ([`DivergenceReason::CorrelationDecreased`] -- **ours, not sourced**: the
-//! paper's own stopping rule, Table 1 step S4, is a step-norm test with no
-//! divergence signal at all). The step measure is a deliberate deviation
-//! from step S4's raw `‖Δp‖`: in similarity mode that norm mixes
+//! few valid samples, a non-finite update, or a correlation that falls
+//! more than a documented slack below the best ρ seen so far
+//! ([`DivergenceReason::CorrelationDecreased`]). The step measure is used
+//! rather than the raw `‖Δp‖`: in similarity mode that norm mixes
 //! dimensionless `c`, `s` against pixel-valued `tx`, `ty`, so one epsilon
-//! would mean two different things per mode, and the per-level number could
-//! not be scaled between pyramid levels the way a pixel corner displacement
-//! can. On divergence, the returned transform is the **best-ρ transform
-//! seen**, never the last one tried, so a caller that ignores `status`
-//! still gets the least-wrong answer.
-//!
-//! ### What hitting the cap costs (measured, not assumed)
+//! would mean two different things per mode, and could not be scaled
+//! between pyramid levels the way a pixel corner displacement can. On
+//! divergence, the returned transform is the **best-ρ transform seen**,
+//! never the last one tried.
 //!
 //! The shipped default, `max-iterations = 400`, converges all 61
 //! reference frames -- none hits the cap, the slowest needing 332
@@ -211,7 +156,7 @@ pub struct EccParams {
 /// Why a registration failed to converge. A data outcome
 /// ([`EccStatus::Diverged`]), never an [`AlignError`] -- the caller did
 /// nothing wrong.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DivergenceReason {
     /// `C = Ḡ^tḠ`'s pivot test failed in the linear solve -- a flat,
@@ -574,13 +519,11 @@ fn solve_level_dispatch(
 /// # Why the coordinates must be centred
 ///
 /// Columns 0-1 (scale, rotation) scale as `|coord| * gradient`; columns 2-3
-/// (translation) are bare gradient and are scale-invariant. With
-/// uncentred `x, y`, `C = Ḡ^tḠ`'s diagonal for columns 0-1 grows as
-/// `offset^2` while columns 2-3 stay flat, so [`solve_linear`]'s *relative*
-/// pivot threshold (`PIVOT_EPS * max|a|`) rises with the region's absolute
-/// position until the translation pivots fall under it. Measured on an
-/// isolated repro (image content, region size, gradient field and solver
-/// held fixed, only the region's absolute coordinate offset varied):
+/// (translation) are bare gradient and scale-invariant. With uncentred
+/// `x, y`, `C = Ḡ^tḠ`'s diagonal for columns 0-1 grows as `offset^2` while
+/// columns 2-3 stay flat, so [`solve_linear`]'s *relative* pivot threshold
+/// (`PIVOT_EPS * max|a|`) rises with the region's absolute position until
+/// the translation pivots fall under it:
 ///
 /// ```text
 /// offset (0,0)       max|C|=9.4761e8   diag=[9.476e8 9.429e8 2.180e4 2.182e4] solve=Some
@@ -588,23 +531,15 @@ fn solve_level_dispatch(
 /// offset (3500,2000) max|C|=3.8689e11  diag=[3.848e11 3.869e11 2.180e4 2.182e4] solve=NONE (singular)
 /// ```
 ///
-/// This is exactly what `mode=rotation-scale` hit on 60 of 61 frames of the
-/// full stack (region centres thousands of pixels from the origin) and
-/// what no fixture-scale test (region centres a few hundred px from the
-/// origin) ever reaches. Centring `x, y` on the region's own centre removes
-/// the offset from the columns entirely, so conditioning no longer depends
-/// on where in the image the region sits. The existing column mean-centring
-/// elsewhere in this module does **not** fix this: centring a column
-/// removes its *mean*, but `gx*x` still has variance `~= x^2 * var(gx)`,
-/// which keeps growing with the coordinate's absolute magnitude regardless
-/// of the column's own mean.
+/// Confirmed on the full 16GB reference stack, where `mode=rotation-scale`
+/// diverged as `singular-hessian` on 60 of 61 frames. Centring `x, y` on
+/// the region's own centre removes the offset from the columns entirely.
 ///
 /// Once the Jacobian is centred this way, the recovered `Δp` describes an
 /// increment about `(cx, cy)`, not about the image origin, so
 /// [`similarity_delta`] must conjugate it back -- skipping that pairs a
-/// centred Jacobian with an origin-relative increment, a mismatched
-/// parameterization that does **not** report a singularity: it converges
-/// confidently to a wrong transform.
+/// centred Jacobian with an origin-relative increment, converging
+/// confidently to a wrong transform without reporting a singularity.
 fn similarity_jacobian_row(gx: f32, gy: f32, x: f64, y: f64, cx: f64, cy: f64) -> [f64; 4] {
     let (tx, ty) = (f64::from(gx), f64::from(gy));
     let (xc, yc) = (x - cx, y - cy);
@@ -613,18 +548,11 @@ fn similarity_jacobian_row(gx: f32, gy: f32, x: f64, y: f64, cx: f64, cy: f64) -
 
 /// Builds the incremental similarity warp from a solved `Δp`, conjugated
 /// about `(cx, cy)`: `T(c) ∘ ΔW ∘ T(-c)`, i.e. `Transform::translation(cx,
-/// cy).compose(&delta).compose(&Transform::translation(-cx, -cy))`.
-///
-/// `Transform::compose`'s convention is "right operand applied first"
-/// (`crate::align::transform`), so this composition reads, in application
-/// order: shift `(cx, cy)` to the origin, apply the increment `ΔW` (built
-/// exactly as before, `Transform::affine(1+Δp0, -Δp1, Δp1, 1+Δp0, Δp2,
-/// Δp3)`), shift back. Required because [`similarity_jacobian_row`] centres
-/// its `x, y` on `(cx, cy)`: the recovered `Δp` is the increment of a warp
-/// that operates on coordinates already measured from `(cx, cy)`, so
-/// applying it directly to image coordinates (no conjugation) would use the
-/// wrong reference point -- see that function's doc comment for the danger
-/// this creates if it is skipped.
+/// cy).compose(&delta).compose(&Transform::translation(-cx, -cy))`, where
+/// `delta = Transform::affine(1+Δp0, -Δp1, Δp1, 1+Δp0, Δp2, Δp3)`.
+/// Required because [`similarity_jacobian_row`] centres its `x, y` on
+/// `(cx, cy)`, so the recovered `Δp` must be conjugated back before
+/// applying it to image coordinates.
 fn similarity_delta(dp: &[f64; 4], cx: f64, cy: f64) -> Transform {
     let delta = Transform::affine(1.0 + dp[0], -dp[1], dp[1], 1.0 + dp[0], dp[2], dp[3]);
     Transform::translation(cx, cy)
@@ -1240,14 +1168,11 @@ mod tests {
              valid_fraction = {}",
             result.valid_fraction
         );
-        // Measured 2026-09-13 (`cargo test -p focusforge-core --lib \
-        // align::ecc::tests::partial_overlap_recomputes_and_still_recovers \
-        // -- --nocapture`): corner error `5.79e-4` px, `valid_fraction` at
+        // Measured: corner error `5.79e-4` px, `valid_fraction` at
         // convergence `0.98333...` (118/120 columns valid, exactly the
         // predicted two-column loss). Tolerance set at roughly 100x that
         // measured figure -- headroom for platform-to-platform `f64`/`f32`
-        // accumulation differences, the same convention `tests/ecc_solver.rs`
-        // uses for its own `TRANSLATION_TOLERANCE_PX`.
+        // accumulation differences.
         assert!(
             error < 5e-2,
             "corner error {error} px exceeds tolerance -- the partial-overlap \
@@ -1599,32 +1524,18 @@ mod tests {
     /// linear-algebra check, ~0.04s), at a small region offset and a large
     /// one.
     ///
-    /// **Why this exists.** The similarity Jacobian's scale/rotation
-    /// columns (`gx*x + gy*y`, `gy*x - gx*y`) scale as `|coord| *
-    /// gradient`; its translation columns (bare `gx`, `gy`) are
-    /// scale-invariant. With **uncentred** `x, y` (the pre-fix code), `C =
-    /// Ḡ^tḠ`'s diagonal for the first two columns grows as the region's
-    /// absolute offset squared while the last two stay flat at the same
-    /// value regardless of offset. Measured on an isolated repro with real
-    /// image content (this test's synthetic field below reproduces the
-    /// same shape, not the same numbers):
+    /// With **uncentred** `x, y`, `C = Ḡ^tḠ`'s diagonal for the
+    /// scale/rotation columns grows as the region's absolute offset
+    /// squared while the translation columns stay flat:
     ///
     /// ```text
     /// offset (256,256)   diag=[6.643e9 6.652e9 2.180e4 2.182e4] solve=Some
     /// offset (3500,2000) diag=[3.848e11 3.869e11 2.180e4 2.182e4] solve=NONE (singular)
     /// ```
     ///
-    /// [`solve_linear`]'s pivot rejection is *relative* to `C`'s largest
-    /// entry, so as the scale/rotation columns grew from `~6.6e9` to
-    /// `~3.9e11` the pivot bar rose right past the translation columns'
-    /// unmoved `~2.18e4`, and the solve that succeeded at the small offset
-    /// failed at the large one -- on the full stack, `mode=rotation-scale`
-    /// hit exactly this on 60 of 61 frames (`singular-hessian`, `mode
-    /// translation` on the same stack: 0 failures).
     /// [`similarity_jacobian_row`] centres `x, y` on the region's own
     /// centre before this construction runs, which is what makes both
-    /// offsets below solve identically: this test would have caught the
-    /// defect before any full-stack run ever needed to.
+    /// offsets below solve identically.
     #[test]
     fn similarity_normal_matrix_solves_regardless_of_region_offset() {
         // A deterministic, non-degenerate synthetic gradient field --

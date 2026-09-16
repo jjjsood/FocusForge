@@ -17,10 +17,19 @@ use serde::Serialize;
 mod algorithms;
 mod align;
 mod bytes;
+mod cache;
+mod export;
 #[cfg(feature = "gpu")]
 mod gpu;
+mod groups;
+mod job;
+mod preset;
+mod progress;
+mod review;
 mod set;
+mod signals;
 mod stack;
+mod status;
 
 /// Resolves whether this run takes the GPU path or the CPU one:
 /// `#[cfg(feature = "gpu")]` delegates to [`gpu::resolve_backend`]; with the
@@ -82,21 +91,28 @@ enum Command {
         /// Directory of TIFF frames to fuse (non-recursive, descending into
         /// `<dir>/frames` when that subdirectory exists).
         dir: PathBuf,
-        /// Composite output path.
-        #[arg(short = 'o', long = "output")]
-        output: PathBuf,
+        /// Directory to collect this run's projects into. Omit to write
+        /// each project beside its own frames.
+        #[arg(short = 'o', long = "output", value_name = "DIR")]
+        output: Option<PathBuf>,
         /// Registered stacking algorithm id. Required, but never a clap
         /// `required` field.
         #[arg(long)]
         algo: Option<String>,
-        /// Z-Map output path. Omit to write no Z-Map file for this run.
-        #[arg(long)]
+        /// Gone: a project carries its own Z-Map. Still **declared**, and
+        /// hidden, purely so `stack::run` can refuse it by name and point
+        /// at `focusforge-cli export` -- removing it outright would leave
+        /// clap printing "unexpected argument '--zmap'", which tells a user
+        /// nothing about where their Z-Map went.
+        #[arg(long, hide = true)]
         zmap: Option<PathBuf>,
         /// Emit the frozen JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
         #[command(flatten)]
         set: set::SetArgs,
+        #[command(flatten)]
+        group_args: groups::GroupArgs,
         /// Skip alignment: the tile reader stays the raw stack and the
         /// output geometry stays full-frame. Defaults to `true`
         /// (alignment on); `--no-align` is what turns it off (clap
@@ -119,6 +135,19 @@ enum Command {
         align_algo: Option<String>,
         #[command(flatten)]
         align_set: set::AlignSetArgs,
+        /// Resume a previously cancelled run of this same stack, found by
+        /// stack fingerprint under `.scratch/resume/` -- no argument.
+        /// Refuses at exit 1 when no matching scratch state exists or it
+        /// disagrees with this invocation's inputs.
+        #[arg(long)]
+        resume: bool,
+        /// Print no progress at all.
+        #[arg(long)]
+        quiet: bool,
+        /// Override the scheduler's outer tile size, in pixels. Omit to use
+        /// the scheduler's own default.
+        #[arg(long = "tile-size", value_name = "PX")]
+        tile_size: Option<u32>,
         /// A **ceiling only** on the adaptive host-memory budget: it can
         /// lower the budget the host-derived estimate resolved to, and can
         /// never raise it. Nobody has to pass this to get the machine's own
@@ -142,6 +171,29 @@ enum Command {
             value_parser = crate::bytes::parse_byte_size
         )]
         max_vram: Option<u64>,
+        /// Read parameter values from a TOML preset: the `algo` and
+        /// `align-algo` keys plus the `[stack]` and `[align]` value
+        /// tables. A flag always beats the file -- `--set`/`--align-set`
+        /// override the tables, `--algo`/`--align-algo` override the keys.
+        #[arg(long, value_name = "PATH")]
+        preset: Option<PathBuf>,
+        /// Write the preset that reproduces this run to this path: the
+        /// algorithm ids plus the values you actually chose. Values left
+        /// to an `auto` closure stay live and are never frozen into the
+        /// file.
+        #[arg(long = "write-preset", value_name = "PATH")]
+        write_preset: Option<PathBuf>,
+        /// Append one NDJSON status record for this stack to this path:
+        /// identity, outcome, outputs and the error, if any. Every
+        /// terminal path writes exactly one record.
+        #[arg(long, value_name = "PATH")]
+        status: Option<PathBuf>,
+        /// Resolve everything, print what would happen -- parameters with
+        /// their provenance, tile geometry, output paths -- and exit 0
+        /// without computing or writing anything. Stops *before*
+        /// alignment, so it reports no crop rect and no output extent.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
         /// Force the CPU path even when a usable GPU adapter is available.
         /// Only present when the `gpu` feature is compiled in -- with it
         /// off, this flag does not exist at all, not even as a no-op.
@@ -151,6 +203,29 @@ enum Command {
         #[cfg(feature = "gpu")]
         #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
         gpu: bool,
+        /// Skip the stage cache: recompute the alignment even when a valid
+        /// entry exists, and leave no entry behind. Defaults to `true` (the
+        /// cache is used); `--no-cache` is what turns it off (clap
+        /// `ArgAction::SetFalse`, no `default_value` -- clap-rs/clap#4370).
+        #[arg(long = "no-cache", action = clap::ArgAction::SetFalse)]
+        cache: bool,
+    },
+    /// Turn a project into an image file: the composite with `-o`, the
+    /// Z-Map with `--zmap`, either or both in one invocation. At least one
+    /// of the two is required. This is the only thing in the workspace that
+    /// writes a TIFF from a stack result.
+    Export {
+        /// The `.ffproj` project to read.
+        project: PathBuf,
+        /// Write the composite to this path.
+        #[arg(short = 'o', long = "output", value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Write the Z-Map to this path.
+        #[arg(long, value_name = "FILE")]
+        zmap: Option<PathBuf>,
+        /// Emit the frozen JSON report instead of human-readable text.
+        #[arg(long)]
+        json: bool,
     },
     /// Compute and report the per-frame transforms for a stack: readable
     /// text by default, a frozen `--json` document on request, and an
@@ -179,6 +254,24 @@ enum Command {
         write_warped: Option<PathBuf>,
         #[command(flatten)]
         set: set::SetArgs,
+        /// Print no progress at all. `align` has no fuse-tile units to
+        /// count: this suppresses only the one stage line `align`
+        /// otherwise prints.
+        #[arg(long)]
+        quiet: bool,
+        /// Read parameter values from a TOML preset. `align` uses only
+        /// `align-algo` and the `[align]` table; a non-empty `[stack]`
+        /// table or `algo` key is unused here and says so on stderr, so
+        /// one preset file serves both subcommands.
+        #[arg(long, value_name = "PATH")]
+        preset: Option<PathBuf>,
+        /// Write the preset that reproduces this run to this path:
+        /// `align-algo` plus the `[align]` values you actually chose.
+        #[arg(long = "write-preset", value_name = "PATH")]
+        write_preset: Option<PathBuf>,
+        /// Append one NDJSON status record for this run to this path.
+        #[arg(long, value_name = "PATH")]
+        status: Option<PathBuf>,
         /// Force the CPU path even when a usable GPU adapter is available.
         /// Only present when the `gpu` feature is compiled in. Meaningful
         /// only with `--write-warped`: plain `align` has nothing on the
@@ -186,6 +279,25 @@ enum Command {
         #[cfg(feature = "gpu")]
         #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
         gpu: bool,
+    },
+    /// Report one record per result found under a directory of projects, or
+    /// a batch run's output directory: identity, outcome, sharpness ratio
+    /// and Z-Map spread, with a failed stack a visible record rather than a
+    /// missing file. Reads a run manifest when one is present, otherwise a
+    /// non-recursive listing of `*.ffproj` files; never groups frames
+    /// itself and writes nothing.
+    Review {
+        /// Directory to review: a run's `-o` output, or a plain directory of
+        /// `*.ffproj` projects.
+        dir: PathBuf,
+        /// Emit one wrapped JSON document instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage the stage cache under `.scratch/stage-cache/`.
+    Cache {
+        #[command(subcommand)]
+        action: cache::CacheAction,
     },
 }
 
@@ -201,16 +313,25 @@ fn main() -> ExitCode {
             zmap,
             json,
             set,
+            group_args,
             align,
             crop,
             lax,
             align_algo,
             align_set,
+            resume,
+            quiet,
+            tile_size,
             max_host_memory,
             #[cfg(feature = "gpu")]
             max_vram,
+            preset,
+            write_preset,
+            status,
+            dry_run,
             #[cfg(feature = "gpu")]
             gpu,
+            cache,
         } => {
             #[cfg(feature = "gpu")]
             let no_gpu = !gpu;
@@ -220,7 +341,7 @@ fn main() -> ExitCode {
             let max_vram: Option<u64> = None;
             stack::run(
                 &dir,
-                &output,
+                output.as_deref(),
                 algo.as_deref(),
                 zmap.as_deref(),
                 json,
@@ -232,11 +353,31 @@ fn main() -> ExitCode {
                     algo: align_algo.as_deref(),
                     set: &align_set.align_set,
                 },
+                &job::JobOptions {
+                    resume,
+                    quiet,
+                    tile_size,
+                    cache,
+                },
+                &preset::PresetOptions {
+                    preset: preset.as_deref(),
+                    write_preset: write_preset.as_deref(),
+                    status: status.as_deref(),
+                    dry_run,
+                },
+                &group_args,
+                &std::env::args().collect::<Vec<_>>(),
                 no_gpu,
                 max_host_memory,
                 max_vram,
             )
         }
+        Command::Export {
+            project,
+            output,
+            zmap,
+            json,
+        } => export::run(&project, output.as_deref(), zmap.as_deref(), json),
         Command::Align {
             dir,
             algo,
@@ -244,6 +385,10 @@ fn main() -> ExitCode {
             lax,
             write_warped,
             set,
+            quiet,
+            preset,
+            write_preset,
+            status,
             #[cfg(feature = "gpu")]
             gpu,
         } => {
@@ -258,9 +403,18 @@ fn main() -> ExitCode {
                 lax,
                 write_warped.as_deref(),
                 &set,
+                quiet,
+                &preset::PresetOptions {
+                    preset: preset.as_deref(),
+                    write_preset: write_preset.as_deref(),
+                    status: status.as_deref(),
+                    dry_run: false,
+                },
                 no_gpu,
             )
         }
+        Command::Review { dir, json } => review::run(&dir, json),
+        Command::Cache { action } => cache::run(action),
     }
 }
 

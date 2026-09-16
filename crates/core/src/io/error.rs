@@ -160,4 +160,17 @@ pub enum TiffError {
         covered: Vec<(u32, u32)>,
         width: u32,
     },
+
+    /// `TiffWriter::reopen` refuses a file that is not the exact layout this
+    /// writer would itself have produced -- byte order, compression,
+    /// `RowsPerStrip`, dimensions, description, or an arithmetic strip-offset
+    /// table. In the style of [`Self::StripTableMismatch`]: named field,
+    /// both values.
+    #[error("{}: reopen refused, {field} disagrees: expected {expected}, found {found}", path.display())]
+    ReopenMismatch {
+        path: PathBuf,
+        field: &'static str,
+        expected: String,
+        found: String,
+    },
 }

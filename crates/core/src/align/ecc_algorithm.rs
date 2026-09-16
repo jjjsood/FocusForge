@@ -5,13 +5,6 @@
 //! -- translation-only and rotation+scale -- selected by the `mode`
 //! parameter.
 //!
-//! # Provenance
-//!
-//! Written from this crate's own patterns (`crate::fuse::depth_map`'s
-//! registered-algorithm shape) and from the mathematics the driver itself
-//! needs (pyramid rescale, region budgeting), never with a third-party
-//! source open as a model.
-//!
 //! # The coarse-to-fine loop
 //!
 //! For pyramid level `k` from `pyramid-depth` down to `0`,
@@ -52,10 +45,9 @@ use crate::tile::plan::{DEFAULT_TILE_SIZE, MAX_LEVELS};
 use crate::tile::{Rect, Tile};
 
 /// Solver-robustness threshold, not a user setting -- the same class as
-/// `crate::align`'s own `PIVOT_EPS` and `CORRELATION_SLACK`. `0.75` is
-/// chosen so an 80px translation on the 512px fixture (which pushes 16 of
-/// the region's 384 columns out of the moving plane's domain, valid
-/// fraction ~= 0.958) stays a partial-overlap solve rather than a
+/// `crate::align`'s own `PIVOT_EPS` and `CORRELATION_SLACK`. `0.75` keeps
+/// an 80px translation on the 512px fixture (valid fraction ~= 0.958) a
+/// partial-overlap solve rather than a
 /// [`crate::align::DivergenceReason::TooFewValidSamples`] refusal.
 const MIN_VALID_FRACTION: f64 = 0.75;
 
@@ -146,15 +138,11 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             label: "Max Iterations".to_string(),
             help: "The per-level iteration cap. A level that reaches it stops \
                    short of `epsilon-px` and reports `HitCap`, keeping the best \
-                   transform it found rather than failing. The default was \
-                   measured, not chosen: at a cap of 50, 23 of the 61 reference \
-                   frames stopped short and carried a 0.048-0.521 px truncation \
-                   cost; at 400 all 61 converge, for +31 s on a 182 s alignment \
-                   pass (+17%, or +11.5% of a full stack run). Frames that do \
-                   not need the budget still terminate on `epsilon-px` and pay \
-                   nothing, so the cost falls on exactly the frames that were \
-                   previously truncated. The slowest frame measured used 332 \
-                   iterations, leaving 68 of margin."
+                   transform it found rather than failing. Frames that converge \
+                   earlier stop on `epsilon-px` and pay nothing. On a 61-frame \
+                   44.8 MP stack a cap of 50 left 23 frames short (0.048-0.521 \
+                   px residual); 400 converges all 61, the slowest at 332 \
+                   iterations, for +31 s on a 182 s alignment pass."
                 .to_string(),
             kind: ParamKind::Int { min: 1, max: 1000 },
             default: ParamValue::Int(400),
@@ -398,7 +386,27 @@ impl PyramidalEcc {
             min_valid_fraction: MIN_VALID_FRACTION,
         };
 
-        let reference_pyramid = Self::build_pyramid(ctx, ctx.reference(), depth)?;
+        let stack = ctx.stack();
+        // Accept a driver-prepared reference pyramid only when it is the
+        // right thing: the right concrete type, built at the same
+        // `pyramid-depth`, at this stack's own dimensions. Any miss falls
+        // back to a rebuild, so a mismatch costs speed and never
+        // correctness -- see the module docs on `AlignContext::prepared`.
+        let prepared = ctx
+            .prepared()
+            .and_then(|p| p.downcast_ref::<AlignPyramid>())
+            .filter(|p| {
+                p.level_count() == depth as usize + 1
+                    && p.dimensions() == (stack.width, stack.height)
+            });
+        let built;
+        let reference_pyramid: &AlignPyramid = match prepared {
+            Some(shared) => shared,
+            None => {
+                built = Self::build_pyramid(ctx, ctx.reference(), depth)?;
+                &built
+            }
+        };
         let frame_pyramid = Self::build_pyramid(ctx, frame, depth)?;
 
         let up = Transform::similarity(2.0, 0.0, 0.0, 0.0);
@@ -505,6 +513,28 @@ impl AlignAlgorithm for PyramidalEcc {
         cfg: &ParamValues,
     ) -> Result<AlignOutcome, AlgorithmError> {
         self.run(ctx, frame, cfg, None)
+    }
+
+    /// Builds the reference frame's pyramid once, for the driver to hand
+    /// back to every [`AlignAlgorithm::align_frame`] call of this run
+    /// through [`AlignContext::prepared`]. Uses `build_pyramid`
+    /// unchanged -- the same call `run` itself falls back to when the
+    /// prepared value is missing or does not match.
+    fn prepare_run(
+        &self,
+        ctx: &AlignContext<'_>,
+        cfg: &ParamValues,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, AlgorithmError> {
+        crate::params::validate(self.params(), cfg)?;
+        let depth = cfg
+            .get("pyramid-depth")
+            .and_then(ParamValue::as_i64)
+            .ok_or_else(|| missing_key("pyramid-depth"))? as u32;
+        Ok(Some(Arc::new(Self::build_pyramid(
+            ctx,
+            ctx.reference(),
+            depth,
+        )?)))
     }
 }
 
@@ -616,7 +646,7 @@ mod tests {
             count <= MAX_REGION_PIXELS as u64,
             "region {region:?} holds {count} px, over the {MAX_REGION_PIXELS} budget"
         );
-        // Measured 2026-09-13: shrinking the naive 6144x4098 (75%) rect by
+        // Shrinking the naive 6144x4098 (75%) rect by
         // sqrt(2^20 / (6144*4098)) and flooring yields exactly this.
         assert_eq!(region.width, 1253);
         assert_eq!(region.height, 836);

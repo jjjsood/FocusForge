@@ -10,6 +10,7 @@
 
 pub mod budget;
 pub mod consumer;
+pub mod control;
 mod error;
 pub mod plan;
 pub mod preprocess;
@@ -22,14 +23,15 @@ pub use budget::{
     PRESSURE_SHARE_PERCENT,
 };
 pub use consumer::{TileConsumer, TileJob};
+pub use control::{NoControl, TileControl};
 pub use error::TileError;
 pub use plan::{PlannedTile, TilePlan};
 pub use preprocess::{FramePreprocess, NoopPreprocess};
-pub use scheduler::{TileRunReport, TileScheduler, TileSchedulerOptions};
+pub use scheduler::{ControlledRun, TileRunReport, TileScheduler, TileSchedulerOptions};
 pub use scratch::ScratchDir;
 
 /// An axis-aligned rectangle in frame pixel coordinates, `u32` throughout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Rect {
     pub x: u32,
     pub y: u32,

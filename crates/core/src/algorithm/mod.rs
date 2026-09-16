@@ -31,9 +31,7 @@ pub use error::AlgorithmError;
 /// *frame*, which is a per-pixel fact, not a per-sample one. Fields are
 /// public and there is no validating constructor here: the Z-Map as a
 /// document with its own storage and invariants lives in [`crate::zmap`]
-/// (`ZMapInfo`, `crate::zmap::validate_tile`, `crate::zmap::ZMapWriter`) --
-/// a checked constructor on `TileOutput` itself still waits for its first
-/// real caller.
+/// (`ZMapInfo`, `crate::zmap::validate_tile`, `crate::zmap::ZMapWriter`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TileOutput {
     pub tile: Tile,
@@ -43,13 +41,11 @@ pub struct TileOutput {
 /// The per-tile view across every frame of a stack that
 /// [`StackAlgorithm::fuse`] reads from.
 ///
-/// Opaque on purpose: today's backing is a materialized slice of
-/// already-read [`Tile`]s, and a future scheduler may swap it for memmap'd
-/// scratch or a streaming source without touching a single algorithm body,
-/// because every call site below is identical either way. The field is
-/// named `tiles`, not `frames` -- these are frame-*tiles*, and [`Tile`]
-/// itself carries no frame index, so this context is what supplies one by
-/// position.
+/// Opaque on purpose: the backing is a materialized slice of already-read
+/// [`Tile`]s, reached only through this type's own methods, never the field
+/// directly. The field is named `tiles`, not `frames` -- these are
+/// frame-*tiles*, and [`Tile`] itself carries no frame index, so this
+/// context is what supplies one by position.
 pub struct TileCtx<'a> {
     rect: Rect,
     tiles: &'a [Tile],
@@ -107,17 +103,22 @@ pub trait TileReader: Send + Sync {
 }
 
 /// What an [`AlignAlgorithm::align_frame`] call sees: the facts about the
-/// stack, which frame is the alignment reference, and a handle onto real
-/// pixels through a [`TileReader`].
+/// stack, which frame is the alignment reference, a handle onto real pixels
+/// through a [`TileReader`], and (in the anchor arm only) a driver-prepared
+/// value from [`AlignAlgorithm::prepare_run`].
 ///
 /// `Send + Sync` on [`TileReader`] is what keeps `AlignContext<'_>` `Sync`,
-/// which is what lets `align_frame` run across frames under rayon.
-/// The reader field stays private -- no accessor -- so exposing one later is
-/// an additive change rather than a removal.
+/// which is what lets `align_frame` run across frames under rayon. `Send +
+/// Sync` on the erased `prepared` value gives it the same guarantee: a `dyn
+/// Any + Send + Sync` behind a shared `&'a` reference is safe to read from
+/// multiple rayon workers at once, and neither type offers any way to
+/// mutate through a shared reference, so nothing here needs a lock. The
+/// reader field stays private -- no accessor.
 pub struct AlignContext<'a> {
     stack: StackContext,
     reference: usize,
     reader: &'a dyn TileReader,
+    prepared: Option<&'a (dyn std::any::Any + Send + Sync)>,
 }
 
 impl<'a> AlignContext<'a> {
@@ -126,7 +127,28 @@ impl<'a> AlignContext<'a> {
             stack,
             reference,
             reader,
+            prepared: None,
         }
+    }
+
+    /// Attaches the driver's [`AlignAlgorithm::prepare_run`] output, if any.
+    /// Takes the `Option` rather than a bare reference so a driver can
+    /// thread `prepare_run`'s own return value straight through with no
+    /// branch of its own.
+    pub fn with_prepared(
+        mut self,
+        prepared: Option<&'a (dyn std::any::Any + Send + Sync)>,
+    ) -> Self {
+        self.prepared = prepared;
+        self
+    }
+
+    /// The driver-prepared value for this run, if `prepare_run` returned
+    /// one. An algorithm that `downcast_ref`s this to a type it does not
+    /// recognise -- someone else's prepared state, or none at all -- gets
+    /// `None` and **rebuilds**; that is the normal case, never an error.
+    pub fn prepared(&self) -> Option<&'a (dyn std::any::Any + Send + Sync)> {
+        self.prepared
     }
 
     pub fn stack(&self) -> &StackContext {
@@ -191,7 +213,7 @@ pub trait StackAlgorithm: Send + Sync + 'static {
     ///    from this same default, reading the identical resolved map `fuse`
     ///    itself reads its own `"levels"` entry from -- the same number from
     ///    the same place, which is the whole point: `fuse`'s pyramid depth
-    ///    and the scheduler's margin can no longer silently disagree.
+    ///    and the scheduler's margin cannot silently disagree.
     ///
     /// An algorithm whose depth parameter is *not* called `"levels"`, or
     /// whose margin requirement is not a simple pyramid depth, **overrides**
@@ -212,15 +234,11 @@ pub trait StackAlgorithm: Send + Sync + 'static {
 ///
 /// `#[non_exhaustive]`: a divergence reason is inherently
 /// algorithm-specific -- `crate::align::DivergenceReason::LemmaOneRegion` is
-/// named after one paper's Lemma 1, and a second aligner will name its own
-/// failure modes after its own mathematics. That accumulation is
-/// deliberate and is exactly what `#[non_exhaustive]` on both this type and
-/// `DivergenceReason` is for; it is not a sign that the vocabulary needs
-/// generalizing away. A reader adding a second aligner should read the
-/// existing variant names as evidence of the pattern to follow, not as a
-/// defect to fix.
+/// named after one paper's Lemma 1. `#[non_exhaustive]` on both this type
+/// and `DivergenceReason` is what lets each aligner name its own failure
+/// modes after its own mathematics.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status", content = "reason", rename_all = "kebab-case")]
 pub enum AlignStatus {
     /// The solver's step measure fell below its convergence threshold.
@@ -267,6 +285,24 @@ pub trait AlignAlgorithm: Send + Sync + 'static {
         frame: usize,
         cfg: &ParamValues,
     ) -> Result<AlignOutcome, AlgorithmError>;
+
+    /// Called **at most once per run**, by the driver, **only in the anchor
+    /// arm**, before any [`align_frame`](Self::align_frame) call of that
+    /// run -- with the same fully resolved `cfg` every `align_frame` call of
+    /// that run will receive. The returned value is opaque to the driver,
+    /// which only owns it and hands it back to every `align_frame` call
+    /// through [`AlignContext::prepared`]; nothing here interprets it.
+    ///
+    /// `Ok(None)` is always a correct implementation -- it costs only the
+    /// rebuild it declines to avoid -- which is why every implementor except
+    /// [`crate::align::PyramidalEcc`] inherits this default unchanged.
+    fn prepare_run(
+        &self,
+        _ctx: &AlignContext<'_>,
+        _cfg: &ParamValues,
+    ) -> Result<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>, AlgorithmError> {
+        Ok(None)
+    }
 }
 
 impl TileReader for crate::io::TiffStack {
@@ -356,10 +392,8 @@ mod tests {
         ]
     });
 
-    /// A test-only fusion algorithm. `id` and `display_name` are owned
-    /// `String` fields, not literals, so the trait's accessors genuinely
-    /// borrow from `&self` rather than returning `&'static str` in
-    /// disguise.
+    /// A test-only fusion algorithm; `id`/`display_name` are owned `String`s
+    /// so the accessors borrow from `&self`.
     struct DummyStack {
         id: String,
         display_name: String,

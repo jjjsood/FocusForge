@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use focusforge_core::algorithm::{AlignAlgorithm, TileReader};
 use focusforge_core::align::{
-    FailurePolicy, ReferencePolicy, StackAlignment, Transform, WarpingReader, align_stack,
-    auto_crop,
+    AlignDriverOptions, FailurePolicy, ReferencePolicy, StackAlignment, Transform, WarpingReader,
+    align_stack_with, auto_crop,
 };
 use focusforge_core::gpu::TileBackend;
 use focusforge_core::io::{TiffSpec, TiffStack, TiffWriter, frame_paths};
@@ -21,11 +21,15 @@ use focusforge_core::params::{self, StackContext};
 use focusforge_core::registry;
 use focusforge_core::tile::Rect;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
+use focusforge_core::timing::{Stage, StageTimer};
 use serde::Serialize;
 
+use crate::preset::{self, PresetOptions};
+use crate::progress::{ProgressMode, ProgressRenderer};
 use crate::set::SetArgs;
-use crate::set::parse_settings;
+use crate::set::{merge_preset, parse_settings};
 use crate::stack::ParamReport;
+use crate::status::StatusSink;
 
 /// The options `stack` needs to drive its own alignment stage, bundled so
 /// `stack::run` stays under clippy's argument-count lint
@@ -85,6 +89,26 @@ pub struct AlignReport {
     pub crop: Option<Rect>,
     pub warped_dir: Option<String>,
     pub wall_seconds: f64,
+    /// Wall-clock stage breakdown -- `setup`/`align`/`finalize` as seconds,
+    /// `warp_write` a number only when `--write-warped` ran, `fuse`
+    /// always `null` (`align` never fuses). Every figure is wall clock,
+    /// never CPU time; the non-null stages sum exactly to `wall_seconds` --
+    /// see [`focusforge_core::timing::StageTimings`]'s own rustdoc for the
+    /// full contract. Fields are only ever added.
+    pub stages: focusforge_core::timing::StageTimings,
+    /// Always `"computed"`: `align` has no `--resume`, no stage cache and
+    /// no `--no-align`. Present so `align --json` and `stack --json` report
+    /// their `align` stage the same way.
+    pub align_source: String,
+    /// The anchor arm's worker bound and the peak it actually reached --
+    /// always `Some` here, since every `align` run computes (the same
+    /// reasoning `align_source`'s own doc gives for why it is always
+    /// `"computed"` on this command). `Option`, not a plain `usize`, so one
+    /// key name carries one type across both `align --json` and
+    /// `stack --json` (`AlignReport::align_source`'s own rustdoc makes the
+    /// same argument).
+    pub align_workers: Option<usize>,
+    pub peak_align_workers: Option<usize>,
 }
 
 /// One frame's row in [`AlignReport::alignments`]: `#[serde(flatten)]`ed
@@ -128,6 +152,13 @@ pub(crate) fn alignment_entries(
 /// `algo_id: None` resolves through [`resolve_align_algo`], never a
 /// hardcoded id. `--lax` selects [`FailurePolicy::IdentityFallback`]; its
 /// absence selects [`FailurePolicy::Strict`], the default.
+///
+/// `quiet` suppresses the one stage line this subcommand prints.
+/// `align` installs **no** SIGINT handler at all: it has no
+/// fuse-tile units, so a handler here would have nothing to act on and would
+/// only make the process look hung for up to the alignment's own wall time
+/// after a first Ctrl-C. The default disposition (immediate kill) is left
+/// untouched.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     dir: &Path,
@@ -136,19 +167,42 @@ pub fn run(
     lax: bool,
     write_warped: Option<&Path>,
     set: &SetArgs,
+    quiet: bool,
+    preset_opts: &PresetOptions<'_>,
     no_gpu: bool,
 ) -> ExitCode {
     let start = Instant::now();
+    // One monotonic timer shares `start` with `wall_seconds` below.
+    let mut timer = StageTimer::from_start(start);
+    let mut renderer = ProgressRenderer::new(ProgressMode::choose(quiet));
+    let sink = StatusSink::new(preset_opts.status, dir.display().to_string(), "align");
 
-    let algo = match resolve_align_algo(algo_id) {
-        Ok(algo) => algo,
-        Err(msg) => return crate::fail(msg),
+    // One preset file serves both subcommands: `align` reads `align-algo`
+    // and `[align]` only. The unused half is not silently dropped -- a
+    // `[stack]`/`[align]` typo would otherwise be a quiet no-op.
+    let file = match preset::load(preset_opts.preset) {
+        Ok(file) => file,
+        Err(msg) => return sink.fail(msg),
     };
+    if !file.stack.is_empty() {
+        eprintln!("preset: [stack] table not used by align");
+    }
+    if file.algo.is_some() {
+        eprintln!("preset: algo key not used by align (align reads align-algo)");
+    }
 
-    let explicit = match parse_settings(algo.params(), &set.set) {
+    let algo = match resolve_align_algo(algo_id.or(file.align_algo.as_deref())) {
+        Ok(algo) => algo,
+        Err(msg) => return sink.fail(msg),
+    };
+    sink.set_algorithm(algo.id());
+
+    let explicit = match parse_settings(algo.params(), &set.set)
+        .and_then(|cli| merge_preset(algo.params(), &file.align, cli))
+    {
         Ok(values) => values,
         Err(violations) => {
-            return crate::fail(
+            return sink.fail(
                 violations
                     .iter()
                     .map(ToString::to_string)
@@ -158,13 +212,25 @@ pub fn run(
         }
     };
 
+    if let Some(path) = preset_opts.write_preset {
+        let written = preset::Preset {
+            algo: None,
+            align_algo: Some(algo.id().to_string()),
+            stack: Default::default(),
+            align: explicit.clone(),
+        };
+        if let Err(msg) = preset::write(&written, path) {
+            return sink.fail(msg);
+        }
+    }
+
     let paths = match frame_paths(dir) {
         Ok(paths) => paths,
-        Err(err) => return crate::fail(err),
+        Err(err) => return sink.fail(err),
     };
     let stack = match TiffStack::open_files(&paths) {
         Ok(stack) => stack,
-        Err(err) => return crate::fail(err),
+        Err(err) => return sink.fail(err),
     };
     let frame_names: Vec<String> = paths
         .iter()
@@ -181,7 +247,7 @@ pub fn run(
         .collect();
     let (uniform, detail) = crate::uniform_check(&header_refs);
     if !uniform {
-        return crate::fail(detail.unwrap_or_else(|| "non-uniform frame set".to_string()));
+        return sink.fail(detail.unwrap_or_else(|| "non-uniform frame set".to_string()));
     }
 
     let (width, height) = stack.dimensions();
@@ -189,7 +255,7 @@ pub fn run(
     let stack_ctx = StackContext::new(stack.len(), width, height, spp);
     let resolved = match params::resolve(algo.params(), &explicit, &stack_ctx) {
         Ok(resolved) => resolved,
-        Err(err) => return crate::fail(err),
+        Err(err) => return sink.fail(err),
     };
     let values = params::resolved_values(&resolved);
 
@@ -198,14 +264,25 @@ pub fn run(
     } else {
         FailurePolicy::Strict
     };
-    let alignment = match align_stack(algo, stack_ctx, &stack, &values, policy) {
-        Ok(alignment) => alignment,
-        Err(err) => return crate::fail(err),
+    timer.mark(Stage::Setup);
+    renderer.stage(&format!("align {} frames (no unit progress)", stack.len()));
+    let run = match align_stack_with(
+        algo,
+        stack_ctx,
+        &stack,
+        &values,
+        policy,
+        &AlignDriverOptions::default(),
+    ) {
+        Ok(run) => run,
+        Err(err) => return sink.fail(err),
     };
+    let alignment = run.alignment;
     let crop = match auto_crop(&alignment, (width, height)) {
         Ok(crop) => crop,
-        Err(err) => return crate::fail(err),
+        Err(err) => return sink.fail(err),
     };
+    timer.mark(Stage::Align);
 
     if let Some(write_warped) = write_warped {
         // Resolved only here, not for a plain `align` run: plain `align` has
@@ -225,9 +302,17 @@ pub fn run(
             spp,
             backend,
         ) {
-            return crate::fail(msg);
+            return sink.fail(msg);
         }
+        // Marked only inside this arm: no `--write-warped`, no mark, so the
+        // field stays `null` -- "not requested" is never confused with
+        // "instant".
+        timer.mark(Stage::WarpWrite);
     }
+
+    timer.mark(Stage::Finalize);
+    let wall_seconds = timer.total_seconds();
+    let stages = timer.finish();
 
     let report = AlignReport {
         input: dir.display().to_string(),
@@ -253,13 +338,19 @@ pub fn run(
         alignments: alignment_entries(&alignment, &frame_names),
         crop,
         warped_dir: write_warped.map(|p| p.display().to_string()),
-        wall_seconds: start.elapsed().as_secs_f64(),
+        wall_seconds,
+        stages,
+        // `align` has no `--resume`, no stage cache and no `--no-align`:
+        // every run reaches this line by computing.
+        align_source: "computed".to_string(),
+        align_workers: Some(run.worker_limit),
+        peak_align_workers: Some(run.peak_workers),
     };
 
     if json {
         match serde_json::to_string_pretty(&report) {
             Ok(text) => println!("{text}"),
-            Err(err) => return crate::fail(format!("failed to serialize JSON: {err}")),
+            Err(err) => return sink.fail(format!("failed to serialize JSON: {err}")),
         }
     } else {
         println!("{}", render(&report));
@@ -270,7 +361,7 @@ pub fn run(
             .failed()
             .map(|f| format!("{} ({:?})", frame_names[f.frame], f.status))
             .collect();
-        return crate::fail(format!(
+        return sink.fail(format!(
             "alignment failed for {} frame(s): {}",
             names.len(),
             names.join(", ")
@@ -283,6 +374,13 @@ pub fn run(
         );
     }
 
+    // `outputs` carries the `--write-warped` directory when one was given,
+    // and is empty otherwise: a plain `align` computes numbers, not files.
+    sink.completed(
+        &write_warped
+            .map(|p| vec![p.display().to_string()])
+            .unwrap_or_default(),
+    );
     ExitCode::SUCCESS
 }
 
@@ -488,6 +586,19 @@ pub(crate) fn render(report: &AlignReport) -> String {
         )),
         None => lines.push("auto-crop: empty (frame footprints do not intersect)".to_string()),
     }
+    // The total rides the `stages:` line as `(wall …)`, and `workers=`/`peak=`
+    // ride it too: that line already varies run to run, so every other stdout
+    // line stays deterministic.
+    lines.push(format!(
+        "stages: {} {} {} {} workers={} peak={} (wall {:.3}s)",
+        crate::stack::stage_fact("setup", report.stages.setup),
+        crate::stack::stage_fact("align", report.stages.align),
+        crate::stack::stage_fact("warp_write", report.stages.warp_write),
+        crate::stack::stage_fact("finalize", report.stages.finalize),
+        crate::stack::worker_fact(report.align_workers),
+        crate::stack::worker_fact(report.peak_align_workers),
+        report.wall_seconds,
+    ));
     lines.join("\n")
 }
 

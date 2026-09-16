@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Fixture-backed driver tests for `weighted-average` and `depth-map` over
-//! `fixtures/mantis-512`, modelled on `crates/core/tests/laplacian_fusion.rs`
-//! but local rather than lifted into `tests/common/mod.rs`, so that settled
-//! file is not touched. Two differences from its model, both load-bearing:
-//! the scheduler's `levels` comes from `algo.tile_levels(&values)`, exactly
-//! as `crates/cli/src/stack.rs` does, so this test exercises the same
-//! bridge the CLI uses; and `levels_override` exists solely for the seam
-//! demonstration (`the_trait_default_would_have_seamed`).
+//! `fixtures/mantis-512`. The scheduler's `levels` comes from
+//! `algo.tile_levels(&values)`, the same bridge the CLI uses; and
+//! `levels_override` exists solely for the seam demonstration
+//! (`the_trait_default_would_have_seamed`).
 
 mod common;
 
@@ -21,6 +18,7 @@ use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::registry;
 use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 use focusforge_core::zmap::NO_SOURCE;
+use focusforge_core::zmap::metrics::all_eight_identical_fraction;
 
 /// One fusion run's outputs, read back from disk into plain sample buffers.
 struct FusionResult {
@@ -278,41 +276,6 @@ fn reference_score_plane(level: &Plane, radius: u32) -> Vec<f32> {
     scores
 }
 
-/// The fraction of pixels whose **entire** (present) 8-neighbourhood shares
-/// the pixel's own winner. Copied from `laplacian_fusion.rs`, keeping its
-/// border convention (an out-of-range neighbour is skipped, never counted
-/// as a mismatch).
-fn all_eight_neighbours_identical_fraction(zmap: &[u16], width: u32, height: u32) -> f64 {
-    let mut identical = 0usize;
-    let total = (width * height) as usize;
-    for y in 0..height as i64 {
-        for x in 0..width as i64 {
-            let center = zmap[(y as u32 * width + x as u32) as usize];
-            let mut all_match = true;
-            'neighbours: for dy in -1i64..=1 {
-                for dx in -1i64..=1 {
-                    if dx == 0 && dy == 0 {
-                        continue;
-                    }
-                    let (nx, ny) = (x + dx, y + dy);
-                    if nx < 0 || ny < 0 || nx >= width as i64 || ny >= height as i64 {
-                        continue;
-                    }
-                    let idx = ny as u32 * width + nx as u32;
-                    if zmap[idx as usize] != center {
-                        all_match = false;
-                        break 'neighbours;
-                    }
-                }
-            }
-            if all_match {
-                identical += 1;
-            }
-        }
-    }
-    identical as f64 / total as f64
-}
-
 #[test]
 fn both_algorithms_are_registered() {
     for id in ["weighted-average", "depth-map"] {
@@ -488,12 +451,9 @@ fn depth_map_zmap_is_coherent() {
     let default_run = depth_map_single_tile();
     let zero_radius_run = depth_map_zero_radius();
 
-    let default_fraction = all_eight_neighbours_identical_fraction(
-        &default_run.zmap,
-        default_run.width,
-        default_run.height,
-    );
-    let zero_fraction = all_eight_neighbours_identical_fraction(
+    let default_fraction =
+        all_eight_identical_fraction(&default_run.zmap, default_run.width, default_run.height);
+    let zero_fraction = all_eight_identical_fraction(
         &zero_radius_run.zmap,
         zero_radius_run.width,
         zero_radius_run.height,

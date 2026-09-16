@@ -233,3 +233,102 @@ fn the_two_modes_disagree_as_focus_breathing_predicts() {
          rotation-scale mean|scale-1|={rotation_scale_scale_dev:.6} mean_rho={rotation_scale_rho:.4}"
     );
 }
+
+/// The full-scale measurement of whether re-running a subset is cheap by
+/// construction, not merely true on a fixture. A first `stack` run over the
+/// real 61-frame reference stack computes and caches the alignment
+/// (`--align-algo pyramidal-ecc --lax`); a second run, differing only in a
+/// fusion parameter (`--set levels=`), must reuse it (`align_cached: true`)
+/// and finish in a fraction of the first run's wall clock -- alignment
+/// dominates a real run (~240 s for a bare `align` against 253.97 s for a
+/// whole `stack --algo depth-map`), so a cache hit that skips it entirely
+/// is the measurement that says the triage loop actually pays off at
+/// scale.
+#[test]
+#[ignore = "reads the 16 GB reference stack"]
+fn fusion_change_reuses_reference_alignment() {
+    let Some(stack_dir) = common::reference_stack_dir() else {
+        eprintln!("skip: reference stack not found");
+        return;
+    };
+
+    // Repo-relative: `.scratch/` is created cwd-relative by every scratch
+    // consumer this run touches, so `run_dir` doubles as that cwd.
+    let run_dir = common::workspace_root().join(".scratch/alignment-reuse/reference-run");
+    let _ = std::fs::remove_dir_all(&run_dir);
+    let frames = run_dir.join("frames");
+    std::fs::create_dir_all(&frames).expect("frames dir must be creatable");
+    let mut count = 0;
+    for entry in std::fs::read_dir(&stack_dir).expect("the reference stack must be readable") {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.contains("IMG_") || !name.ends_with(".tif") {
+            continue;
+        }
+        std::os::unix::fs::symlink(&path, frames.join(&name)).unwrap();
+        count += 1;
+    }
+    assert_eq!(count, 61, "IMG_-filtered list must be the 61 source frames");
+
+    let run = |out_dir: &Path, levels: &str| -> (bool, std::time::Duration, serde_json::Value) {
+        std::fs::create_dir_all(out_dir).unwrap();
+        let start = std::time::Instant::now();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+            .current_dir(&run_dir)
+            .args([
+                "stack",
+                frames.to_str().unwrap(),
+                "-o",
+                out_dir.to_str().unwrap(),
+                "--algo",
+                "laplacian",
+                "--set",
+                &format!("levels={levels}"),
+                "--align-algo",
+                "pyramidal-ecc",
+                "--lax",
+                "--no-crop",
+                "--json",
+            ])
+            .output()
+            .expect("failed to run focusforge-cli");
+        let elapsed = start.elapsed();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let report: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|err| {
+            panic!("--json must parse: {err}\nstdout: {stdout}\nstderr: {stderr}")
+        });
+        (output.status.success(), elapsed, report)
+    };
+
+    let out_a = run_dir.join("out_a");
+    let (ok_a, elapsed_a, report_a) = run(&out_a, "5");
+    assert!(ok_a, "the first run (a cold compute) must succeed");
+    assert_eq!(
+        report_a["align_cached"], false,
+        "the first run must compute the alignment, not reuse it: {report_a}"
+    );
+
+    let out_b = run_dir.join("out_b");
+    let (ok_b, elapsed_b, report_b) = run(&out_b, "3");
+    assert!(ok_b, "the second run (a cache hit) must succeed");
+    assert_eq!(
+        report_b["align_cached"], true,
+        "changing only a fusion parameter must reuse the cached alignment at full scale: \
+         {report_b}"
+    );
+
+    let entry_dir = run_dir.join(".scratch").join("stage-cache").join("align");
+    let entry_size: u64 = std::fs::read_dir(&entry_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+        .sum();
+
+    eprintln!(
+        "fusion_change_reuses_reference_alignment: first run (cold, computes alignment) \
+         {elapsed_a:.2?}; second run (cache hit, fusion-only change) {elapsed_b:.2?}; stage \
+         cache alignment entry size for 61 frames: {entry_size} bytes"
+    );
+}

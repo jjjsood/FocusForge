@@ -5,6 +5,10 @@
 #                                                 ceiling with swap disabled
 #        tools/run-acceptance.sh --inside-scope 8G -- internal re-entry only,
 #                                                 never invoked by hand
+#        tools/run-acceptance.sh --algo depth-map -- either mode above, but
+#                                                 stacking with --algo depth-map
+#   --algo ID  stacking algorithm (default laplacian); --set levels=5 only
+#              accompanies laplacian
 #
 # The acceptance run: the whole 61-frame, 16 GB reference stack through the
 # real CLI, end to end, at full size. This is not a gate and never runs in
@@ -44,7 +48,24 @@
 #                              the whole run before the release-CLI check
 #   ACCEPTANCE_FRAME_GLOB     glob for source frames within it (default:
 #                              *IMG_*.tif)
-#   ACCEPTANCE_EXPECTED_FRAMES expected farm size (default: 61)
+#   ACCEPTANCE_EXPECTED_FRAMES expected *source* frame count found in
+#                              ACCEPTANCE_STACK_DIR after the Stacked
+#                              exclusion (default: 61) -- a guard against a
+#                              glob mismatch, independent of how many farm
+#                              entries are actually built (see
+#                              ACCEPTANCE_TARGET_FRAMES below).
+#   ACCEPTANCE_TARGET_FRAMES  how many farm entries build_farm() actually
+#                              builds (default: ACCEPTANCE_EXPECTED_FRAMES,
+#                              one symlink per source); a larger value
+#                              repeats sources, `r<replica>-`-prefixed to
+#                              match replay order.
+#   ACCEPTANCE_ALIGN          `1` (default): `run_stack` aligns in-process
+#                              with `--align-algo pyramidal-ecc --lax`, and
+#                              the unlimited branch also runs two standalone
+#                              `align` legs. `0`: `run_stack` uses
+#                              `--no-align` instead and the standalone
+#                              `align` legs are skipped entirely -- measures
+#                              the scheduler, not alignment.
 #   ACCEPTANCE_OUT_DIR        base output directory (default:
 #                              .scratch/acceptance)
 #   ACCEPTANCE_CLI            CLI binary to run (default:
@@ -62,22 +83,37 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
-MODE="${1:-}"
-LIMIT="${2:-}"
+MODE=""
+LIMIT=""
+ALGO="laplacian"
 
-case "$MODE" in
-  "") ;;
-  --limit|--inside-scope)
-    if [ -z "$LIMIT" ]; then
-      echo "usage: tools/run-acceptance.sh [--limit SIZE]" >&2
-      exit 2
-    fi
-    ;;
-  *)
-    echo "usage: tools/run-acceptance.sh [--limit SIZE]" >&2
-    exit 2
-    ;;
-esac
+usage() {
+  echo "usage: tools/run-acceptance.sh [--limit SIZE|--inside-scope SIZE] [--algo ID]" >&2
+  exit 2
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --limit|--inside-scope)
+      if [ -n "$MODE" ] || [ -z "${2:-}" ]; then
+        usage
+      fi
+      MODE="$1"
+      LIMIT="$2"
+      shift 2
+      ;;
+    --algo)
+      if [ -z "${2:-}" ]; then
+        usage
+      fi
+      ALGO="$2"
+      shift 2
+      ;;
+    *)
+      usage
+      ;;
+  esac
+done
 
 echo "== tools/run-acceptance.sh ($([ -n "$MODE" ] && echo "${MODE} ${LIMIT}" || echo "unlimited")) =="
 echo "This run reads the reference stack in full, takes minutes, and writes"
@@ -87,6 +123,8 @@ echo
 OUT_DIR="${ACCEPTANCE_OUT_DIR:-.scratch/acceptance}"
 FRAME_GLOB="${ACCEPTANCE_FRAME_GLOB:-*IMG_*.tif}"
 EXPECTED_FRAMES="${ACCEPTANCE_EXPECTED_FRAMES:-61}"
+TARGET_FRAMES="${ACCEPTANCE_TARGET_FRAMES:-$EXPECTED_FRAMES}"
+ALIGN="${ACCEPTANCE_ALIGN:-1}"
 CLI="${ACCEPTANCE_CLI:-target/release/focusforge-cli}"
 
 # --- refuse to measure with a CLI older than the sources -------------------
@@ -142,6 +180,15 @@ else
   STACK="$HARNESS/Stack"
 fi
 
+# The same convention `frame_paths` already
+# applies: a `frames/` subdirectory, when present, is where the
+# actual frame files live -- committed fixture trees (`fixtures/mantis-512`)
+# are laid out this way; the real reference stack directory is not, so this
+# is a no-op there.
+if [ -d "${STACK}/frames" ]; then
+  STACK="${STACK}/frames"
+fi
+
 if [ ! -x "$CLI" ]; then
   echo "refuse: $CLI is not built -- run: cargo build --release -p focusforge-cli" >&2
   exit 1
@@ -175,27 +222,58 @@ build_farm() {
   local candidates=( "$STACK"/$FRAME_GLOB )
   shopt -u nullglob
 
-  local count=0
+  # The *source* list first, independent of how many farm entries are
+  # actually built below -- a glob mismatch must refuse here, before any
+  # replay repeat count is applied.
+  local sources=()
   local f name
   for f in "${candidates[@]}"; do
     name="$(basename "$f")"
     case "$name" in
       *Stacked*) continue ;;
     esac
-    ln -s "$f" "$OUT_DIR/frames/$name"
-    count=$((count + 1))
+    sources+=("$f")
   done
+  local source_count=${#sources[@]}
 
-  if [ "$count" -ne "$EXPECTED_FRAMES" ]; then
-    echo "refuse: expected $EXPECTED_FRAMES symlinks in $OUT_DIR/frames, built $count" >&2
+  if [ "$source_count" -ne "$EXPECTED_FRAMES" ]; then
+    echo "refuse: expected $EXPECTED_FRAMES source frames matching" \
+         "ACCEPTANCE_FRAME_GLOB in $STACK, found $source_count" >&2
     # A zero count is almost always the glob, not a missing stack: the default
     # only matches the reference stack's own frame naming, so pointing this
     # script at any other frame directory needs ACCEPTANCE_FRAME_GLOB set
     # too. Say so here rather than leaving a correct refusal that reads as a
     # mystery.
-    if [ "$count" -eq 0 ]; then
+    if [ "$source_count" -eq 0 ]; then
       echo "hint: no file in $STACK matched ACCEPTANCE_FRAME_GLOB='$FRAME_GLOB'" >&2
     fi
+    exit 1
+  fi
+
+  local count=0
+  if [ "$TARGET_FRAMES" -eq "$source_count" ]; then
+    # One symlink per source, under its own name.
+    for f in "${sources[@]}"; do
+      name="$(basename "$f")"
+      ln -s "$f" "$OUT_DIR/frames/$name"
+      count=$((count + 1))
+    done
+  else
+    # Replay farm: sources repeated, `r<replica>-` prefix keeps name order
+    # equal to replay order.
+    local i idx replica linkname
+    for ((i = 0; i < TARGET_FRAMES; i++)); do
+      idx=$((i % source_count))
+      replica=$((i / source_count))
+      name="$(basename "${sources[$idx]}")"
+      linkname="$(printf 'r%03d-%s' "$replica" "$name")"
+      ln -s "${sources[$idx]}" "$OUT_DIR/frames/$linkname"
+      count=$((count + 1))
+    done
+  fi
+
+  if [ "$count" -ne "$TARGET_FRAMES" ]; then
+    echo "refuse: expected $TARGET_FRAMES symlinks in $OUT_DIR/frames, built $count" >&2
     exit 1
   fi
   if ls "$OUT_DIR/frames" | grep -q Stacked; then
@@ -205,15 +283,15 @@ build_farm() {
   echo "OK: built $count-entry frame farm at $OUT_DIR/frames"
 
   "$CLI" info --json "$OUT_DIR/frames" > "$OUT_DIR/info.json"
-  if ! grep -q "\"frame_count\": $EXPECTED_FRAMES" "$OUT_DIR/info.json"; then
-    echo "refuse: $OUT_DIR/info.json does not report frame_count $EXPECTED_FRAMES" >&2
+  if ! grep -q "\"frame_count\": $TARGET_FRAMES" "$OUT_DIR/info.json"; then
+    echo "refuse: $OUT_DIR/info.json does not report frame_count $TARGET_FRAMES" >&2
     exit 1
   fi
   if ! grep -q '"uniform_layout": true' "$OUT_DIR/info.json"; then
     echo "refuse: $OUT_DIR/info.json does not report uniform_layout true" >&2
     exit 1
   fi
-  echo "OK: $OUT_DIR/info.json reports frame_count $EXPECTED_FRAMES, uniform_layout true"
+  echo "OK: $OUT_DIR/info.json reports frame_count $TARGET_FRAMES, uniform_layout true"
 
   # A missing output parent is refused before any long work starts.
   mkdir -p "$OUT_DIR/unlimited" "$OUT_DIR/limited"
@@ -221,28 +299,40 @@ build_farm() {
 
 # --- the run itself: identical command, different OUT ----------------------
 #
-# `--no-crop`: `stack` applies the auto-crop by default, which would shrink
-# the composite below the full 8192x5464 extent that
-# `crates/cli/tests/acceptance.rs` compares against `Mantis_Stacked.tif`
-# (`tools/tiff-diff.py` refuses any dimension mismatch outright).
-# `--align-algo pyramidal-ecc --lax`: `--lax` is not optional here -- a
-# 61-frame sweep anchored on frame 30 is a longer baseline than the
-# 8-frame fixture on which frame 0 already diverges, and a strict refusal
-# would waste the whole run.
-# Wrapped in both locks (tools/lib/lock.sh): `build`, because this reads
-# target/release/$CLI directly and a concurrent `cargo build` running at
-# the same time would relink it mid-read; `gpu`, because `stack` drives
-# real wgpu compute on the one physical GPU this machine has, and a second
-# concurrent GPU-touching run at the same time is exactly what OOM-killed a
-# run before.
+# Both locks: this reads target/release directly and drives the GPU.
 run_stack() {
   local out="$1"
+  local align_flags=(--align-algo pyramidal-ecc --lax)
+  if [ "$ALIGN" != "1" ]; then
+    align_flags=(--no-align)
+  fi
+  # levels is a laplacian-only parameter; depth-map refuses it.
+  local algo_settings=()
+  if [ "$ALGO" = "laplacian" ]; then
+    algo_settings=(--set levels=5)
+  fi
+  # `--no-cache`: a stage-cache hit would report a cached alignment instead
+  # of a measurement.
   tools/with-lock.sh build -- tools/with-lock.sh gpu -- \
     /usr/bin/time -v "$CLI" stack "$OUT_DIR/frames" \
-      -o "$out/out.tif" --zmap "$out/out-zmap.tif" \
-      --algo laplacian --set levels=5 --json \
-      --no-crop --align-algo pyramidal-ecc --lax --no-gpu \
+      -o "$out" \
+      --algo "$ALGO" "${algo_settings[@]}" --json \
+      --no-crop "${align_flags[@]}" --no-gpu --no-cache \
       > "$out/stack.json" 2> "$out/time-v.txt"
+
+  # A stacking run writes a project, not an image. The two TIFFs
+  # `crates/cli/tests/acceptance.rs` looks for by name come out of that
+  # project through `export`, which is a seconds-long read of two blobs
+  # rather than a second fusion.
+  local project
+  project=$(find "$out" -maxdepth 1 -name '*.ffproj' -print -quit)
+  if [ -z "$project" ]; then
+    echo "refuse: the run wrote no project under $out" >&2
+    return 1
+  fi
+  tools/with-lock.sh build -- \
+    "$CLI" export "$project" -o "$out/out.tif" --zmap "$out/out-zmap.tif" \
+      > "$out/export.txt" 2>&1
 }
 
 # `align`, once per mode, in the unlimited branch only: the `--inside-scope`
@@ -269,8 +359,11 @@ try:
 except Exception as exc:
     print("(could not parse " + sys.argv[1] + ": " + str(exc) + ")")
     sys.exit(0)
-for key in ("wall_seconds", "tiles", "frame_tiles_read", "in_flight_limit", "peak_in_flight"):
+for key in ("wall_seconds", "tiles", "frame_tiles_read", "in_flight_limit", "peak_in_flight", "align_workers", "peak_align_workers"):
     print(key + "=" + str(d.get(key)))
+stages = d.get("stages", {})
+for key in ("setup", "align", "fuse", "finalize"):
+    print("stages." + key + "=" + str(stages.get(key)))
 ' "$out/stack.json"
   fi
   for mode in translation rotation-scale; do
@@ -289,8 +382,11 @@ for e in alignments:
     max_drift = max(max_drift, drift)
 print("align-" + sys.argv[2] + ": frame_count=" + str(d.get("frame_count"))
       + " failure_count=" + str(d.get("failure_count"))
-      + " max_translation=" + str(round(max_drift, 2)))
+      + " max_translation=" + str(round(max_drift, 2))
+      + " align_workers=" + str(d.get("align_workers"))
+      + " peak_align_workers=" + str(d.get("peak_align_workers")))
 ' "$out/align-$mode.json" "$mode"
+      grep -E 'Maximum resident set size' "$out/align-$mode-time-v.txt" 2>/dev/null || true
     fi
   done
   grep -E 'Maximum resident set size|Elapsed \(wall clock\) time' "$out/time-v.txt" 2>/dev/null || true
@@ -299,12 +395,16 @@ print("align-" + sys.argv[2] + ": frame_count=" + str(d.get("frame_count"))
 case "$MODE" in
   "")
     build_farm
-    for mode in translation rotation-scale; do
-      echo "+ $CLI align $OUT_DIR/frames --algo pyramidal-ecc --set mode=$mode --lax --json ..."
-      run_align "$OUT_DIR/unlimited" "$mode"
-    done
-    echo "OK: align stage complete (both modes)"
-    echo "+ $CLI stack $OUT_DIR/frames -o $OUT_DIR/unlimited/out.tif ..."
+    if [ "$ALIGN" = "1" ]; then
+      for mode in translation rotation-scale; do
+        echo "+ $CLI align $OUT_DIR/frames --algo pyramidal-ecc --set mode=$mode --lax --json ..."
+        run_align "$OUT_DIR/unlimited" "$mode"
+      done
+      echo "OK: align stage complete (both modes)"
+    else
+      echo "SKIP: align stage (ACCEPTANCE_ALIGN=0)"
+    fi
+    echo "+ $CLI stack $OUT_DIR/frames -o $OUT_DIR/unlimited ... then $CLI export ..."
     run_stack "$OUT_DIR/unlimited"
     echo "OK: unlimited run complete"
     print_summary "$OUT_DIR/unlimited"
@@ -321,7 +421,7 @@ case "$MODE" in
     # "Running as unit: run-rNNN.scope" is what makes
     # `journalctl --user -u run-rNNN.scope` findable afterwards.
     exec systemd-run --user --scope -p "MemoryMax=$LIMIT" -p MemorySwapMax=0 \
-        -- "$REPO/tools/run-acceptance.sh" --inside-scope "$LIMIT"
+        -- "$REPO/tools/run-acceptance.sh" --inside-scope "$LIMIT" --algo "$ALGO"
     ;;
 
   --inside-scope)
@@ -353,7 +453,7 @@ case "$MODE" in
     fi
     echo "OK: memory.max=$mem_max memory.swap.max=$mem_swap_max, limit confirmed in force"
 
-    echo "+ $CLI stack $OUT_DIR/frames -o $OUT_DIR/limited/out.tif ... (under $LIMIT)"
+    echo "+ $CLI stack $OUT_DIR/frames -o $OUT_DIR/limited ... then $CLI export ... (under $LIMIT)"
     set +e
     run_stack "$OUT_DIR/limited"
     status=$?

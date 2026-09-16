@@ -68,7 +68,8 @@
 //! its cadence.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
@@ -77,6 +78,7 @@ use crate::host::HostFacts;
 use crate::params::{Provenance, StackContext};
 use crate::tile::budget::{HostBudget, HostBudgetGate, HostSources};
 use crate::tile::consumer::{TileConsumer, TileJob};
+use crate::tile::control::{NoControl, TileControl};
 use crate::tile::plan::{DEFAULT_TILE_SIZE, PlannedTile, TilePlan};
 use crate::tile::preprocess::FramePreprocess;
 use crate::tile::scratch::ScratchDir;
@@ -200,6 +202,46 @@ pub struct TileRunReport {
     /// The admission limit in force at the end of the run -- equal to
     /// `in_flight_limit` unless the runtime back-off shrunk it.
     pub final_in_flight_limit: usize,
+}
+
+/// What one [`TileScheduler::run_tiles_controlled`] call measured, produced,
+/// and -- unlike [`TileRunReport`] alone -- whether it stopped before every
+/// submitted tile ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlledRun {
+    /// `report.tiles` is the count of tiles *submitted* to this call, not
+    /// necessarily the count that ran: on a stopped run (see `stopped`) it
+    /// is no longer that number.
+    pub report: TileRunReport,
+    /// `true` if [`TileControl::should_stop`] ended this call before every
+    /// submitted tile ran.
+    pub stopped: bool,
+    /// The sorted [`PlannedTile::index`] values that finished in this call.
+    pub completed: Vec<usize>,
+}
+
+/// Internal short-circuit sentinel for
+/// [`TileScheduler::run_tiles_controlled`]'s `try_for_each_init`. Never a
+/// [`TileError`] variant -- `TileError` is `#[non_exhaustive]` and every one
+/// of its variants already means failure; a `Cancelled` variant there
+/// would make every existing `match` on `TileError` read a user's pause as a
+/// broken run.
+///
+/// `Failed` carries no payload: `TileError` is not `Clone` (it wraps
+/// `std::io::Error` and `rayon::ThreadPoolBuildError`, neither of which is),
+/// so the first genuine error this run observes is recorded once in a
+/// side-channel `Mutex<Option<TileError>>` instead and consulted
+/// unconditionally after the loop -- a duplicate `TileError` payload here
+/// would be redundant even if carrying one were possible. rayon 1.12.0 does
+/// not specify which of several parallel errors `try_for_each_init` returns,
+/// so that side channel, not this enum's payload, is what makes "a stop
+/// never masks a real error" true.
+enum RunStop {
+    /// [`TileControl::should_stop`] returned `true`.
+    Requested,
+    /// A tile's own work failed; the real [`TileError`] lives in the run's
+    /// `first_error` mutex.
+    Failed,
 }
 
 /// `bytes_per_tile_set` for `frame_count` frames of `tile_size x tile_size`
@@ -328,6 +370,13 @@ impl<'a> TileScheduler<'a> {
         self.budget
     }
 
+    /// The admission gate's current permit ceiling. Starts equal to
+    /// [`Self::in_flight_limit`]; a caller that never runs anything through
+    /// this scheduler's own runtime back-off will always see the two equal.
+    pub fn final_in_flight_limit(&self) -> usize {
+        self.gate.limit()
+    }
+
     /// Run every tile of this scheduler's plan.
     pub fn run(
         &self,
@@ -348,6 +397,55 @@ impl<'a> TileScheduler<'a> {
         preprocess: &dyn FramePreprocess,
         consumer: &dyn TileConsumer,
     ) -> Result<TileRunReport, TileError> {
+        self.run_tiles_controlled(tiles, preprocess, consumer, &NoControl)
+            .map(|controlled| controlled.report)
+    }
+
+    /// The controlled entry point [`run`](Self::run) and
+    /// [`run_tiles`](Self::run_tiles) delegate to with [`NoControl`], and
+    /// `core::job::Job::run` drives directly. The body that used to be
+    /// `run_tiles`, plus a control check as the very first statement of the
+    /// per-tile closure (before `live.fetch_add`, so a skipped unit never
+    /// counts as in flight and never perturbs `peak_in_flight`), and
+    /// per-index completion bookkeeping so a caller can resume from exactly
+    /// the tiles this call did not finish. This is what makes
+    /// "byte-identical with and without the engine" fall out of the shape
+    /// rather than needing a second code path.
+    ///
+    /// A consumer answering [`TileConsumer::supplies_own_pixels`] `true`
+    /// short-circuits the host read loop: it is handed a
+    /// [`TileJob::without_frame_tiles`] and the run's `frame_tiles_read`
+    /// stays at 0. Completion bookkeeping is unaffected -- such a tile is
+    /// marked complete and reported through [`TileControl::unit_completed`]
+    /// exactly like a normally-read one, so pause/resume behaves the same on
+    /// either path.
+    ///
+    /// # The pause bound
+    ///
+    /// Once a [`TileControl::should_stop`] implementation starts returning
+    /// `true`, every worker checks it immediately after acquiring its
+    /// admission permit and before starting work, so at most
+    /// `self.in_flight_limit()` permits already held when the request is
+    /// observed can each finish the one unit admitted under it. **At most
+    /// `in_flight_limit` further units complete** after
+    /// a stop is requested -- exactly at most 1 when `max_bytes_in_flight =
+    /// 1` pins the admission gate to a single permit via the floor in
+    /// `in_flight_for_budget`. This bound rests on our own check, not on
+    /// rayon's short-circuit, which is documented as best-effort rather
+    /// than a guaranteed immediate stop (rayon 1.12.0 --
+    /// <https://docs.rs/rayon/1.12.0/rayon/iter/trait.ParallelIterator.html#method.try_for_each_init>).
+    pub fn run_tiles_controlled(
+        &self,
+        tiles: &[PlannedTile],
+        preprocess: &dyn FramePreprocess,
+        consumer: &dyn TileConsumer,
+        control: &dyn TileControl,
+    ) -> Result<ControlledRun, TileError> {
+        // Deliberately here, not in the `run_tiles` wrapper above:
+        // `crate::job::Job::run` drives this method directly and never goes
+        // through `run_tiles`, so a guard living in the wrapper would leave
+        // the job-engine path silently accepting the combination this
+        // refuses.
         let supplies_own_pixels = consumer.supplies_own_pixels();
         if supplies_own_pixels && !preprocess.is_noop() {
             return Err(TileError::PixelSupplyingConsumerNeedsNoopPreprocess);
@@ -365,13 +463,25 @@ impl<'a> TileScheduler<'a> {
         let live = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
         let frame_tiles_read = AtomicUsize::new(0);
+        // Completed units are recorded by index, not merely counted: rayon
+        // finishes tiles out of order, so "the first N" is never the set
+        // that actually ran. Sized to the
+        // *whole plan*, not just this call's `tiles`, so a resume's index
+        // set stays meaningful against `self.plan()`.
+        let completed: Vec<AtomicBool> = (0..self.plan.len())
+            .map(|_| AtomicBool::new(false))
+            .collect();
+        // A stop must never mask a real error: the first genuine failure this run observes, independent of
+        // whichever closure's return value `try_for_each_init` itself ends
+        // up propagating.
+        let first_error: Mutex<Option<TileError>> = Mutex::new(None);
 
         let frame_count = self.frame_count;
         let spp = self.samples_per_pixel;
         let reader = self.reader;
         let gate = &self.gate;
 
-        let result: Result<(), TileError> = pool.install(|| {
+        let install_result: Result<(), RunStop> = pool.install(|| {
             tiles.par_iter().try_for_each_init(
                 || {
                     (0..frame_count)
@@ -387,8 +497,26 @@ impl<'a> TileScheduler<'a> {
                         })
                         .collect::<Vec<_>>()
                 },
-                |buf: &mut Vec<Tile>, planned: &PlannedTile| -> Result<(), TileError> {
+                |buf: &mut Vec<Tile>, planned: &PlannedTile| -> Result<(), RunStop> {
+                    // The budget admission permit is acquired first, above
+                    // the control check below: the rayon pool's own thread
+                    // count no longer tracks the budget (`pool_threads` is
+                    // `available_parallelism()` unconditionally), so a stop
+                    // check that ran *before* admission would let every pool
+                    // thread past it before any of them blocks on the gate --
+                    // silently widening the pause bound documented on
+                    // `run_tiles_controlled` from `in_flight_limit` to
+                    // `pool_threads`. Acquiring first keeps admission itself
+                    // the bound: at most one further unit per outstanding
+                    // permit completes after a stop is requested.
                     let _permit = gate.acquire();
+
+                    // The control check is the first statement after
+                    // admission, above `live.fetch_add` below, so a skipped
+                    // unit never counts as in flight.
+                    if control.should_stop() {
+                        return Err(RunStop::Requested);
+                    }
 
                     let cur = live.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(cur, Ordering::SeqCst);
@@ -462,21 +590,64 @@ impl<'a> TileScheduler<'a> {
                         tile.samples = Vec::new();
                     }
 
-                    outcome
+                    match outcome {
+                        Ok(()) => {
+                            completed[planned.index()].store(true, Ordering::SeqCst);
+                            // Per-unit, on the worker that ran it: this is
+                            // what makes a polled `JobProgress` advance
+                            // during the run instead of only when the
+                            // segment ends.
+                            let read_rect = planned.read();
+                            control
+                                .unit_completed(read_rect.width as u64 * read_rect.height as u64);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            let mut guard = first_error.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(e);
+                            }
+                            Err(RunStop::Failed)
+                        }
+                    }
                 },
             )
         });
 
-        result?;
+        // A recorded genuine error always wins over a mere stop request.
+        if let Some(err) = first_error.into_inner().unwrap() {
+            return Err(err);
+        }
 
-        Ok(TileRunReport {
-            tiles: tiles.len(),
-            frame_tiles_read: frame_tiles_read.load(Ordering::Relaxed),
-            in_flight_limit: self.in_flight,
-            peak_in_flight: peak.load(Ordering::SeqCst),
-            max_bytes_in_flight: self.budget.bytes(),
-            budget_provenance: self.budget.provenance(),
-            final_in_flight_limit: self.gate.limit(),
+        let stopped = match install_result {
+            Ok(()) => false,
+            Err(RunStop::Requested) => true,
+            Err(RunStop::Failed) => {
+                unreachable!(
+                    "RunStop::Failed is only ever returned after recording the real error, \
+                     and that recorded error already returned above"
+                )
+            }
+        };
+
+        let completed_indices: Vec<usize> = completed
+            .iter()
+            .enumerate()
+            .filter_map(|(index, done)| done.load(Ordering::SeqCst).then_some(index))
+            .collect();
+
+        Ok(ControlledRun {
+            report: TileRunReport {
+                tiles: tiles.len(),
+                frame_tiles_read: frame_tiles_read.load(Ordering::Relaxed),
+                in_flight_limit: self.in_flight,
+                peak_in_flight: peak.load(Ordering::SeqCst),
+                max_bytes_in_flight: self.budget.bytes(),
+                budget_provenance: self.budget.provenance(),
+                final_in_flight_limit: self.gate.limit(),
+            },
+            stopped,
+            completed: completed_indices,
         })
     }
 }

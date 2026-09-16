@@ -11,17 +11,16 @@
 #   Budget axis: --max-host-memory (CPU) / --max-vram (GPU) swept to 6
 #              points that are exact multiples of bytes_per_tile_set /
 #              device_bytes_per_tile AS MEASURED AT 8 FRAMES
-#              (crates/core/src/tile/scheduler.rs: 8 * 512 * 512 * 3 * 2 =
-#              12,582,912 B; crates/gpu/src/budget.rs, measured
-#              254,661,632 B). The byte VALUES stay fixed across the frame
-#              axis on purpose -- that is what makes the frame axis show
-#              anything: the same fixed ceiling, applied to a tile-set that
-#              gets bigger as frame_count grows, must fit fewer tiles.
+#              (8 * 512 * 512 * 3 * 2 = 12,582,912 B; the GPU figure,
+#              measured, is 254,661,632 B). The byte VALUES stay fixed
+#              across the frame axis on purpose -- that is what makes the
+#              frame axis show anything: the same fixed ceiling, applied to
+#              a tile-set that gets bigger as frame_count grows, must fit
+#              fewer tiles.
 #   Frame axis: 8 (the real fixture), 16, 32 frames -- 16/32 built by
 #              duplicating the 8 real fixtures/mantis-512 frames cyclically
 #              into $OUT/frames-{16,32}/frames/ (bytewise-sorted names,
-#              zero-padded -- see crates/core/src/io/tiff/stack.rs's
-#              frame_paths; no content/hash uniqueness check, so reused
+#              zero-padded; no content/hash uniqueness check, so reused
 #              frames are accepted).
 #
 # Both flags are ceiling-only: a value at or above the host/device's own
@@ -60,8 +59,9 @@ mkdir -p "$OUT"
 run() {
   local name="$1" dir="$2"
   shift 2
+  mkdir -p "$OUT/$name"
   "$CLI" stack "$dir" --algo laplacian --align-algo pyramidal-ecc --lax --json \
-    -o "$OUT/$name.tif" "$@" >"$OUT/$name.json"
+    -o "$OUT/$name" "$@" >"$OUT/$name.json"
 }
 
 echo "Building synthetic 16/32-frame directories (fixtures/mantis-512's 8 real frames, duplicated) ..." >&2
@@ -161,12 +161,9 @@ def print_gpu_grid():
     # one: StackReport.peak_in_flight is ALWAYS the host scheduler's own
     # counter (same field, same source, as the CPU grid above), because the
     # JSON report has no field for the GPU device's own realized in-flight
-    # tile count -- crates/gpu/src/budget.rs has a DeviceBudget::peak_in_flight
-    # (:500), but crates/cli/src/stack.rs never reads it into StackReport.
-    # So --max-vram's effect is only observable here via the budget BYTES
-    # themselves (max_device_bytes_in_flight) and their provenance, not via
-    # any concurrency count. This is a real observability gap, not a
-    # property of the adaptive budget itself.
+    # tile count. So --max-vram's effect is only observable here via the
+    # budget BYTES themselves (max_device_bytes_in_flight) and their
+    # provenance, not via any concurrency count.
     title = "GPU grid (--max-vram x frame count, default GPU path)"
     print(f"\n{title}")
     header = f"{'target':>8}"

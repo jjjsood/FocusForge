@@ -1,0 +1,281 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! The header-only stack fingerprint a resume compares against: a plain
+//! comparison of the [`crate::io::TiffHeader`] fields already parsed for
+//! free -- no hash crate, no pixel read. Deliberately different from
+//! [`crate::project`]'s manifest fingerprint, a blake3 hash over every
+//! source file: this one finds a resumable ledger in milliseconds, that
+//! one says exactly which bytes a project was computed from.
+
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::io::TiffHeader;
+
+/// One frame's identity, read straight off its already-parsed
+/// [`TiffHeader`] -- every named field, none of them requiring a pixel to
+/// be read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrameFingerprint {
+    pub path: PathBuf,
+    pub file_size: u64,
+    pub image_description: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub samples_per_pixel: u32,
+    pub strip_offsets: Vec<u64>,
+    pub strip_byte_counts: Vec<u64>,
+}
+
+impl From<&TiffHeader> for FrameFingerprint {
+    fn from(header: &TiffHeader) -> Self {
+        FrameFingerprint {
+            path: header.path.clone(),
+            file_size: header.file_size,
+            image_description: header.image_description.clone(),
+            width: header.width,
+            height: header.height,
+            samples_per_pixel: header.samples_per_pixel,
+            strip_offsets: header.strip_offsets.clone(),
+            strip_byte_counts: header.strip_byte_counts.clone(),
+        }
+    }
+}
+
+/// A stack fingerprint gained or lost frames between the run that recorded
+/// it and the one comparing against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameCount {
+    pub expected: usize,
+    pub found: usize,
+}
+
+impl std::fmt::Display for FrameCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "frame count changed: expected {}, found {}",
+            self.expected, self.found
+        )
+    }
+}
+
+/// The first disagreement [`StackFingerprint::compare`] found, as data: the
+/// frame, the field, and both values -- never a bare bool, so a refusal can
+/// name what changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FingerprintMismatch {
+    pub frame: usize,
+    pub path: PathBuf,
+    pub field: &'static str,
+    pub expected: String,
+    pub found: String,
+}
+
+impl std::fmt::Display for FingerprintMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "frame {} ({}): {} changed: expected {}, found {}",
+            self.frame,
+            self.path.display(),
+            self.field,
+            self.expected,
+            self.found
+        )
+    }
+}
+
+/// A whole stack's identity: one [`FrameFingerprint`] per frame, in frame
+/// order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StackFingerprint {
+    pub frames: Vec<FrameFingerprint>,
+}
+
+macro_rules! check_field {
+    ($frame:expr, $path:expr, $field:literal, $expected:expr, $found:expr) => {
+        if $expected != $found {
+            return Err(FingerprintMismatch {
+                frame: $frame,
+                path: $path.clone(),
+                field: $field,
+                expected: format!("{:?}", $expected),
+                found: format!("{:?}", $found),
+            });
+        }
+    };
+}
+
+impl StackFingerprint {
+    /// The **first** disagreement between `self` (the fingerprint a resume
+    /// was recorded against) and `other` (the fingerprint freshly computed
+    /// for the stack being resumed), field by field, frame by frame in
+    /// order. A frame-count change is reported through the caller
+    /// (`Resumable`/`ResumeStore::find`), not through this method's `Err`,
+    /// since [`FrameCount`] is not a per-frame [`FingerprintMismatch`].
+    pub fn compare(&self, other: &Self) -> Result<(), FingerprintMismatch> {
+        for (i, (a, b)) in self.frames.iter().zip(other.frames.iter()).enumerate() {
+            check_field!(i, b.path, "path", a.path, b.path);
+            check_field!(i, b.path, "file_size", a.file_size, b.file_size);
+            check_field!(
+                i,
+                b.path,
+                "image_description",
+                a.image_description,
+                b.image_description
+            );
+            check_field!(i, b.path, "width", a.width, b.width);
+            check_field!(i, b.path, "height", a.height, b.height);
+            check_field!(
+                i,
+                b.path,
+                "samples_per_pixel",
+                a.samples_per_pixel,
+                b.samples_per_pixel
+            );
+            check_field!(i, b.path, "strip_offsets", a.strip_offsets, b.strip_offsets);
+            check_field!(
+                i,
+                b.path,
+                "strip_byte_counts",
+                a.strip_byte_counts,
+                b.strip_byte_counts
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(path: &str, width: u32) -> FrameFingerprint {
+        FrameFingerprint {
+            path: PathBuf::from(path),
+            file_size: 100,
+            image_description: None,
+            width,
+            height: 10,
+            samples_per_pixel: 3,
+            strip_offsets: vec![1, 2, 3],
+            strip_byte_counts: vec![4, 5, 6],
+        }
+    }
+
+    #[test]
+    fn identical_fingerprints_compare_equal() {
+        let a = StackFingerprint {
+            frames: vec![frame("a.tif", 10), frame("b.tif", 10)],
+        };
+        let b = a.clone();
+        assert_eq!(a.compare(&b), Ok(()));
+    }
+
+    #[test]
+    fn compare_names_the_first_disagreeing_field() {
+        let a = StackFingerprint {
+            frames: vec![frame("a.tif", 10)],
+        };
+        let mut changed = frame("a.tif", 10);
+        changed.width = 20;
+        let b = StackFingerprint {
+            frames: vec![changed],
+        };
+
+        let err = a.compare(&b).unwrap_err();
+        assert_eq!(err.frame, 0);
+        assert_eq!(err.field, "width");
+        assert_eq!(err.expected, "10");
+        assert_eq!(err.found, "20");
+        assert!(err.to_string().contains("a.tif"));
+        assert!(err.to_string().contains("width"));
+    }
+
+    #[test]
+    fn compare_reports_the_first_field_in_declaration_order_not_the_last() {
+        // A frame that disagrees on both `path` and `width` must report
+        // `path` first -- proves `compare` short-circuits per frame rather
+        // than collecting every disagreement.
+        let a = StackFingerprint {
+            frames: vec![frame("a.tif", 10)],
+        };
+        let b = StackFingerprint {
+            frames: vec![frame("renamed.tif", 20)],
+        };
+        let err = a.compare(&b).unwrap_err();
+        assert_eq!(err.field, "path");
+    }
+
+    #[test]
+    fn from_tiff_header_reads_exactly_the_named_fields() {
+        let header = TiffHeader {
+            path: PathBuf::from("frame.tif"),
+            width: 4,
+            height: 4,
+            byte_order: crate::io::ByteOrder::Little,
+            bits_per_sample: Box::new([16, 16, 16]),
+            samples_per_pixel: 3,
+            compression: 1,
+            photometric: 2,
+            planar_config: 1,
+            rows_per_strip: 1,
+            sample_format: Box::new([1, 1, 1]),
+            image_description: Some("hello".to_string()),
+            // Read by grouping, deliberately **not** by the
+            // fingerprint: adding it to `FrameFingerprint` would invalidate
+            // every resume ledger already on disk for no benefit. The
+            // assertions below are what pin that field set.
+            date_time_original: Some("2026:08:29 18:42:41".to_string()),
+            file_size: 12345,
+            strip_offsets: vec![10, 20, 30, 40],
+            strip_byte_counts: vec![1, 2, 3, 4],
+            refusal: None,
+        };
+        let fp = FrameFingerprint::from(&header);
+        assert_eq!(fp.path, PathBuf::from("frame.tif"));
+        assert_eq!(fp.file_size, 12345);
+        assert_eq!(fp.image_description, Some("hello".to_string()));
+        assert_eq!(fp.width, 4);
+        assert_eq!(fp.height, 4);
+        assert_eq!(fp.samples_per_pixel, 3);
+        assert_eq!(fp.strip_offsets, vec![10, 20, 30, 40]);
+        assert_eq!(fp.strip_byte_counts, vec![1, 2, 3, 4]);
+    }
+
+    /// This fingerprint is not, and is not convertible to, the project
+    /// manifest's content hash.
+    ///
+    /// The claim worth guarding is not about the crate as a whole (which
+    /// does use blake3, for the manifest's own fingerprint): it is that
+    /// **this module** reaches for no hash, so a `FrameFingerprint` has
+    /// nothing to convert into and cannot quietly drift into a content
+    /// hash.
+    #[test]
+    fn not_convertible_to_a_content_hash() {
+        // The needles are assembled rather than written out, so this
+        // check does not match its own source line.
+        let needles = [concat!("bla", "ke3"), concat!("Has", "her")];
+        let module = include_str!("fingerprint.rs");
+        let uses_a_hash = module
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .any(|line| needles.iter().any(|needle| line.contains(needle)));
+        assert!(
+            !uses_a_hash,
+            "the resume fingerprint must stay a plain header comparison -- no hash crate"
+        );
+        // A header-only fingerprint carries no pixel bytes at all -- proven
+        // structurally: every field on `FrameFingerprint` comes from
+        // `TiffHeader`, and `TiffHeader` itself never reads pixel data
+        // (`crates/core/src/io/tiff/header.rs`'s own module docs).
+        let fp = frame("a.tif", 10);
+        assert_eq!(
+            fp.strip_offsets.len(),
+            3,
+            "no pixel bytes, only the strip table"
+        );
+    }
+}

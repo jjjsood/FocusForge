@@ -68,4 +68,13 @@ impl TileConsumer for BackendFusionConsumer<'_> {
     fn supplies_own_pixels(&self) -> bool {
         true
     }
+
+    /// Forwarded to the sink, which owns both writers: this consumer holds
+    /// no output file of its own, so the whole of the cleanup after a
+    /// genuine error is [`FusionConsumer`]'s own `abort`. Without this
+    /// override the trait's no-op default would apply and a half-covered
+    /// file would stay open on the backend path.
+    fn abort(&self) {
+        self.sink.abort();
+    }
 }

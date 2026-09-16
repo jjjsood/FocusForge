@@ -1,17 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! The Z-Map: one `u16` per pixel naming the source frame that contributed
-//! the detail there. **The Z-Map is the document**: fusion emits the
-//! composite image *and* this map, retouching paints source indices into
-//! it rather than pixels, and no edit path ever writes a pixel directly.
-//! Retouching reads it as a palette lookup for the rainbow source overlay
-//! and as the target of retouch painting. [`crate::project`] already
-//! snapshots it into a
-//! project's single checkpoint -- one content-addressed blob per map, named
-//! by [`crate::project::Checkpoint::zmap_blob`] -- without the append-only
-//! op log or its replay. The shape is settled here, once, rather than
-//! emerging from fusion's internals, because the overlay, retouching and
-//! checkpoints all depend on it.
+//! the detail there. **The Z-Map is the document**: fusion emits the composite image *and* this
+//! map, retouching paints indices, not pixels, and no edit path writes one directly.
+//! [`crate::project`] already snapshots it into a checkpoint -- one content-addressed blob, named
+//! by [`crate::project::Checkpoint::zmap_blob`].
 //!
 //! [`NO_SOURCE`] is legal everywhere and every consumer must *handle* it --
 //! forgetting it is a silent wrong-pixel bug, not a compile error: the
@@ -37,6 +30,7 @@
 
 mod description;
 mod error;
+pub mod metrics;
 mod reader;
 mod writer;
 
@@ -44,6 +38,7 @@ use crate::tile::Rect;
 
 pub use description::{format_description, parse_description};
 pub use error::ZMapError;
+pub use metrics::{SpreadScan, ZMapSpread, all_eight_identical_fraction};
 pub use reader::ZMapReader;
 pub use writer::ZMapWriter;
 

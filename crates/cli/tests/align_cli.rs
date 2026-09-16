@@ -52,6 +52,71 @@ fn run_cli(args: &[&str]) -> CliOutput {
 }
 
 #[test]
+fn align_quiet_prints_no_progress() {
+    let quiet = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--quiet",
+    ]);
+    assert!(quiet.success, "stderr: {}", quiet.stderr);
+    // `--quiet` suppresses the stage line, never the `--lax` failure-count
+    // warning: that is a diagnostic about the result, not progress.
+    assert!(
+        !quiet.stderr.contains("frames (no unit progress)"),
+        "stderr: {}",
+        quiet.stderr
+    );
+
+    let loud = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+    ]);
+    assert!(loud.success, "stderr: {}", loud.stderr);
+    assert!(
+        loud.stderr.contains("frames (no unit progress)"),
+        "stderr: {}",
+        loud.stderr
+    );
+    // `--quiet` must not change stdout, other than the trailing `stages:`
+    // line: it carries real per-run wall-clock figures, so two separately
+    // timed runs of the same alignment never render it identically even
+    // though every other line is deterministic.
+    fn strip_stages(s: &str) -> Vec<&str> {
+        s.lines()
+            .filter(|line| !line.starts_with("stages:"))
+            .collect()
+    }
+    assert_eq!(
+        strip_stages(&quiet.stdout),
+        strip_stages(&loud.stdout),
+        "--quiet must not change stdout (aside from the timing-dependent stages: line)"
+    );
+}
+
+#[test]
+fn align_prints_a_stage_line_on_stderr() {
+    let out = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+    ]);
+    assert!(out.success, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("align 8 frames (no unit progress)"),
+        "stderr: {}",
+        out.stderr
+    );
+}
+
+#[test]
 fn align_reports_one_row_per_frame() {
     let out = run_cli(&[
         "align",
@@ -124,6 +189,10 @@ fn align_json_schema_is_stable() {
         "crop",
         "warped_dir",
         "wall_seconds",
+        "stages",
+        "align_source",
+        "align_workers",
+        "peak_align_workers",
     ] {
         assert!(report.get(key).is_some(), "missing key {key:?} in {report}");
     }
@@ -175,6 +244,40 @@ fn align_json_schema_is_stable() {
         report["crop"].is_object(),
         "crop must be a non-null object for this fixture"
     );
+}
+
+/// The anchor arm's worker bound and the peak it actually reached land on
+/// the frozen `align --json` report, additively, alongside every key
+/// `align_json_schema_is_stable` already pins.
+#[test]
+fn worker_limit_in_report() {
+    let out = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--json",
+    ]);
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    // 8-frame fixture: 7 registrations, so the bound is capped there on any
+    // host with >= 7 cores.
+    let ceiling = available.min(7) as u64;
+
+    for key in ["align_workers", "peak_align_workers"] {
+        let value = report[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{key} must be a number: {report}"));
+        assert!(
+            (1..=ceiling).contains(&value),
+            "{key}={value} must be in 1..={ceiling}: {report}"
+        );
+    }
 }
 
 /// Structural, not magnitude-based: `mode=translation` moves only 2 degrees
@@ -256,6 +359,77 @@ fn align_write_warped_writes_one_tiff_per_frame() {
             "warped frames are written at source dimensions, uncropped"
         );
     }
+}
+
+/// `align` never fuses: `fuse` is always `null`, and every run computes
+/// (`align` has no `--resume`, no stage cache and no `--no-align`), so
+/// `align_source` is always `"computed"`.
+#[test]
+fn stage_timings_report_fuse_as_not_entered() {
+    let out = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--json",
+    ]);
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    assert_eq!(
+        report["stages"]["fuse"],
+        serde_json::Value::Null,
+        "align never fuses: {report}"
+    );
+    for key in ["setup", "align", "finalize"] {
+        assert!(
+            report["stages"][key].is_number(),
+            "stages.{key} must be a number for an entered stage: {report}"
+        );
+    }
+    assert_eq!(
+        report["align_source"], "computed",
+        "align always computes: {report}"
+    );
+}
+
+/// `warp_write` reports `null` when `--write-warped` was not given -- "not
+/// requested" must never read as "instant" -- and a number when it was.
+#[test]
+fn stage_timings_report_warp_write_only_under_the_flag() {
+    let without = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--json",
+    ]);
+    assert!(without.success, "stderr: {}", without.stderr);
+    let without_report: serde_json::Value = serde_json::from_str(&without.stdout).unwrap();
+    assert_eq!(
+        without_report["stages"]["warp_write"],
+        serde_json::Value::Null,
+        "no --write-warped, no mark: {without_report}"
+    );
+
+    let dir = tmp_dir("stage_timings_report_warp_write_only_under_the_flag");
+    let with = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--write-warped",
+        dir.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(with.success, "stderr: {}", with.stderr);
+    let with_report: serde_json::Value = serde_json::from_str(&with.stdout).unwrap();
+    assert!(
+        with_report["stages"]["warp_write"].is_number(),
+        "--write-warped must produce a warp_write number: {with_report}"
+    );
 }
 
 /// Strict is the default: a frame that fails to register exits 1 and names
