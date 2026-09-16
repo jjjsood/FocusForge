@@ -7,6 +7,13 @@
 //! a `OnceLock` -- the same discipline `stack_cli.rs` uses -- and the
 //! library oracle beside it is the independent writer the exported composite
 //! is compared against, whole file for whole file.
+//!
+//! Every spawn isolates `.scratch/` with its own per-process temp directory
+//! and `.current_dir(dir)`: `stack`'s scratch tree is cwd-relative, so
+//! concurrent test runs sharing one `target/` -- or two tests in the same
+//! run under cargo's default parallel execution -- must never share a
+//! working directory either. `export` writes no scratch state, so its spawns
+//! run in the shared `stack` run's cwd.
 
 mod common;
 
@@ -24,21 +31,18 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
 }
 
-fn tmp_dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 struct CliOutput {
     success: bool,
     stdout: String,
     stderr: String,
 }
 
-fn run_cli(args: &[&str]) -> CliOutput {
-    let output = bin().args(args).output().expect("failed to run binary");
+fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
+    let output = bin()
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run binary");
     CliOutput {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -59,10 +63,23 @@ fn only_project(dir: &Path) -> PathBuf {
 
 /// One `stack` run over `fixtures/mantis-512`, collected into a `-o`
 /// directory. ~50 s, paid once for this whole binary.
-fn shared_project() -> &'static PathBuf {
-    static ONCE: OnceLock<PathBuf> = OnceLock::new();
+struct SharedProject {
+    /// The run's own working directory, held alive for the process's
+    /// lifetime: every test that reads [`SharedProject::project`] does so
+    /// long after this struct's builder closure returns, so the directory
+    /// must outlive the `OnceLock` cell, not just that closure. The
+    /// `OnceLock` static is never dropped, so `common::TmpDir::drop`'s
+    /// `remove_dir_all` never runs for this one.
+    cwd: common::TmpDir,
+    project: PathBuf,
+}
+
+fn shared_project() -> &'static SharedProject {
+    static ONCE: OnceLock<SharedProject> = OnceLock::new();
     ONCE.get_or_init(|| {
-        let out = tmp_dir("export_cli_shared_stack");
+        let cwd = common::tmp_dir("export_cli_shared_stack");
+        let out = cwd.join("out");
+        std::fs::create_dir_all(&out).unwrap();
         let input = common::fixtures_dir().join("mantis-512");
         let mut args = vec![
             "stack".to_string(),
@@ -81,13 +98,14 @@ fn shared_project() -> &'static PathBuf {
             args.push("--no-gpu".to_string());
         }
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result = run_cli(&args);
+        let result = run_cli_in(&cwd, &args);
         assert!(
             result.success,
             "stack must succeed -- stderr: {}",
             result.stderr
         );
-        only_project(&out)
+        let project = only_project(&out);
+        SharedProject { cwd, project }
     })
 }
 
@@ -95,8 +113,16 @@ fn shared_project() -> &'static PathBuf {
 /// geometry, writing its composite with `TiffWriter`'s own default
 /// description -- exactly what the CLI resolves when a `--no-align` run
 /// carries no alignment description of its own. The whole-file oracle.
-fn library_composite() -> &'static PathBuf {
-    static ONCE: OnceLock<PathBuf> = OnceLock::new();
+struct LibraryComposite {
+    /// Holds the temp directory `composite` lives in alive, since a later
+    /// test reads the path long after this struct's builder returns.
+    #[allow(dead_code)]
+    _dir: common::TmpDir,
+    composite: PathBuf,
+}
+
+fn library_composite() -> &'static LibraryComposite {
+    static ONCE: OnceLock<LibraryComposite> = OnceLock::new();
     ONCE.get_or_init(|| {
         let input = common::fixtures_dir().join("mantis-512");
         let stack = TiffStack::open(&input).expect("mantis-512 must open");
@@ -111,7 +137,7 @@ fn library_composite() -> &'static PathBuf {
         let values = params::resolved_values(&resolved);
         let levels = algo.tile_levels(&values);
 
-        let dir = tmp_dir("export_cli_oracle");
+        let dir = common::tmp_dir("export_cli_oracle");
         let composite_path = dir.join("oracle.tif");
         let zmap_path = dir.join("oracle-zmap.tif");
         let options = {
@@ -141,25 +167,31 @@ fn library_composite() -> &'static PathBuf {
             .run(&NoopPreprocess, &consumer)
             .expect("run must succeed");
         consumer.finish().expect("finish must succeed");
-        composite_path
+        LibraryComposite {
+            _dir: dir,
+            composite: composite_path,
+        }
     })
 }
 
 #[test]
 fn exported_composite_is_byte_identical_to_the_staged_plane() {
-    let project = shared_project();
-    let dir = tmp_dir("export_cli_composite");
+    let shared = shared_project();
+    let dir = common::tmp_dir("export_cli_composite");
     let out = dir.join("out.tif");
-    let result = run_cli(&[
-        "export",
-        project.to_str().unwrap(),
-        "-o",
-        out.to_str().unwrap(),
-    ]);
+    let result = run_cli_in(
+        &shared.cwd,
+        &[
+            "export",
+            shared.project.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ],
+    );
     assert!(result.success, "stderr: {}", result.stderr);
 
     let exported = std::fs::read(&out).expect("export must have written the file");
-    let oracle = std::fs::read(library_composite()).expect("oracle composite");
+    let oracle = std::fs::read(&library_composite().composite).expect("oracle composite");
     assert_eq!(
         exported.len(),
         oracle.len(),
@@ -178,15 +210,18 @@ fn exported_composite_is_byte_identical_to_the_staged_plane() {
 
 #[test]
 fn exported_zmap_matches_the_golden_map() {
-    let project = shared_project();
-    let dir = tmp_dir("export_cli_zmap");
+    let shared = shared_project();
+    let dir = common::tmp_dir("export_cli_zmap");
     let out = dir.join("out-zmap.tif");
-    let result = run_cli(&[
-        "export",
-        project.to_str().unwrap(),
-        "--zmap",
-        out.to_str().unwrap(),
-    ]);
+    let result = run_cli_in(
+        &shared.cwd,
+        &[
+            "export",
+            shared.project.to_str().unwrap(),
+            "--zmap",
+            out.to_str().unwrap(),
+        ],
+    );
     assert!(result.success, "stderr: {}", result.stderr);
 
     let golden = common::fixtures_dir()
@@ -203,8 +238,8 @@ fn exported_zmap_matches_the_golden_map() {
 
 #[test]
 fn export_needs_at_least_one_output_flag() {
-    let project = shared_project();
-    let result = run_cli(&["export", project.to_str().unwrap()]);
+    let shared = shared_project();
+    let result = run_cli_in(&shared.cwd, &["export", shared.project.to_str().unwrap()]);
     assert!(!result.success);
     assert!(
         result.stderr.contains("-o") && result.stderr.contains("--zmap"),
@@ -218,15 +253,18 @@ fn export_warns_about_unresolved_sources_and_still_writes() {
     // A project written with `-o <dir>` records absolute, `as-given`
     // sources by construction: "relative" means descendant of the
     // project's own directory.
-    let project = shared_project();
-    let dir = tmp_dir("export_cli_unresolved");
+    let shared = shared_project();
+    let dir = common::tmp_dir("export_cli_unresolved");
     let out = dir.join("moved.tif");
-    let result = run_cli(&[
-        "export",
-        project.to_str().unwrap(),
-        "-o",
-        out.to_str().unwrap(),
-    ]);
+    let result = run_cli_in(
+        &shared.cwd,
+        &[
+            "export",
+            shared.project.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ],
+    );
     assert!(
         result.success,
         "an unresolved source is a warning, not a refusal"
@@ -246,19 +284,22 @@ fn export_warns_about_unresolved_sources_and_still_writes() {
 
 #[test]
 fn export_json_reports_what_it_wrote() {
-    let project = shared_project();
-    let dir = tmp_dir("export_cli_json");
+    let shared = shared_project();
+    let dir = common::tmp_dir("export_cli_json");
     let composite = dir.join("out.tif");
     let zmap = dir.join("out-zmap.tif");
-    let result = run_cli(&[
-        "export",
-        project.to_str().unwrap(),
-        "-o",
-        composite.to_str().unwrap(),
-        "--zmap",
-        zmap.to_str().unwrap(),
-        "--json",
-    ]);
+    let result = run_cli_in(
+        &shared.cwd,
+        &[
+            "export",
+            shared.project.to_str().unwrap(),
+            "-o",
+            composite.to_str().unwrap(),
+            "--zmap",
+            zmap.to_str().unwrap(),
+            "--json",
+        ],
+    );
     assert!(result.success, "stderr: {}", result.stderr);
     let report: serde_json::Value = serde_json::from_str(&result.stdout).expect("--json parses");
     let wrote: Vec<String> = report["wrote"]

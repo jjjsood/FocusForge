@@ -15,6 +15,18 @@
 //! `dummy-stack` everywhere a composite is actually produced: this file is
 //! about the grouping seam, not about fusion numerics, and `laplacian` on a
 //! real fixture costs ~25 s per run.
+//!
+//! Every test isolates `.scratch/` with its own per-process temp directory
+//! and `.current_dir(cwd)`: `stack`'s scratch tree is cwd-relative, so
+//! concurrent test runs sharing one `target/` -- or two tests in the same
+//! run under cargo's default parallel execution -- must never share a
+//! working directory either. The working directory a spawned process runs
+//! in is never a directory a test also feeds in as input, names as `-o`, or
+//! enumerates; it holds only the test's own named children and `.scratch/`.
+//! `single_stack_directory_matches_the_plain_invocation`, whose whole point
+//! is one directory serving as both input and `-o`, keeps that directory as
+//! a fixed-name child of its cwd rather than the cwd itself, so its
+//! basename -- and every assertion derived from it -- is unchanged.
 
 mod common;
 
@@ -28,13 +40,6 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
 }
 
-fn tmp_dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 struct CliOutput {
     success: bool,
     code: Option<i32>,
@@ -42,8 +47,12 @@ struct CliOutput {
     stderr: String,
 }
 
-fn run_cli(args: &[&str]) -> CliOutput {
-    let output = bin().args(args).output().expect("failed to run binary");
+fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
+    let output = bin()
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run binary");
     CliOutput {
         success: output.status.success(),
         code: output.status.code(),
@@ -58,8 +67,8 @@ fn frame(dir: &Path, name: &str, when: Option<&str>) {
 }
 
 /// A flat card dump holding two subjects twenty minutes apart.
-fn card_dump(name: &str) -> PathBuf {
-    let dir = tmp_dir(name);
+fn card_dump(name: &str) -> common::TmpDir {
+    let dir = common::tmp_dir(name);
     for (file, when) in [
         ("IMG_9801.tif", "2026:08:29 18:42:41"),
         ("IMG_9802.tif", "2026:08:29 18:42:42"),
@@ -93,17 +102,21 @@ fn read_whole(path: &Path) -> Vec<u16> {
 #[test]
 fn grouping_is_printed_before_work_starts() {
     let dump = card_dump("groups_cli_printed_first");
-    let out_dir = tmp_dir("groups_cli_printed_first_out");
-    let result = run_cli(&[
-        "stack",
-        dump.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-    ]);
+    let out_dir = common::tmp_dir("groups_cli_printed_first_out");
+    let cwd = common::tmp_dir("groups_cli_printed_first_cwd");
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+        ],
+    );
     assert!(result.success, "stderr: {}", result.stderr);
 
     let grouping_at = result
@@ -133,18 +146,22 @@ fn grouping_is_printed_before_work_starts() {
 #[test]
 fn grouping_is_printed_under_quiet() {
     let dump = card_dump("groups_cli_quiet");
-    let out_dir = tmp_dir("groups_cli_quiet_out");
-    let result = run_cli(&[
-        "stack",
-        dump.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-        "--quiet",
-    ]);
+    let out_dir = common::tmp_dir("groups_cli_quiet_out");
+    let cwd = common::tmp_dir("groups_cli_quiet_cwd");
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--quiet",
+        ],
+    );
     assert!(result.success, "stderr: {}", result.stderr);
     assert!(
         result.stderr.contains("grouping ") && result.stderr.contains("2 groups"),
@@ -165,7 +182,12 @@ fn grouping_is_printed_under_quiet() {
 /// the path that never went through grouping at all.
 #[test]
 fn single_stack_directory_matches_the_plain_invocation() {
-    let dir = tmp_dir("groups_cli_single_stack");
+    let cwd = common::tmp_dir("groups_cli_single_stack");
+    // Input and `-o` are deliberately the same directory here -- the whole
+    // property under test -- so it is a fixed-name child of the cwd, never
+    // the cwd itself.
+    let dir = cwd.join("groups_cli_single_stack");
+    std::fs::create_dir_all(&dir).unwrap();
     for (file, when) in [
         ("00.tif", "2026:08:29 18:42:41"),
         ("01.tif", "2026:08:29 18:42:42"),
@@ -177,17 +199,20 @@ fn single_stack_directory_matches_the_plain_invocation() {
     // share no basename range, so the naming rule falls back to the
     // directory's own basename.
     let grouped = dir.join("groups_cli_single_stack.ffp");
-    let result = run_cli(&[
-        "stack",
-        dir.to_str().unwrap(),
-        "-o",
-        dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--json",
-        "--no-align",
-        "--no-crop",
-    ]);
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dir.to_str().unwrap(),
+            "-o",
+            dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--json",
+            "--no-align",
+            "--no-crop",
+        ],
+    );
     assert!(result.success, "stderr: {}", result.stderr);
 
     let report: serde_json::Value =
@@ -219,9 +244,10 @@ fn single_stack_directory_matches_the_plain_invocation() {
     )
     .expect("resolve");
     let values = focusforge_core::params::resolved_values(&resolved);
-    let options = focusforge_core::tile::TileSchedulerOptions::new(
-        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("groups_cli_single_stack_scratch"),
-    );
+    // The scheduler's own in-process scratch, distinct from `.scratch/` the
+    // spawned CLI process writes -- a child of this test's cwd, not the
+    // shared `target/` it used to live directly under.
+    let options = focusforge_core::tile::TileSchedulerOptions::new(cwd.join("scratch"));
     let scheduler = focusforge_core::tile::TileScheduler::new(&stack, ctx, spp, &options)
         .expect("scheduler must build");
     let consumer = focusforge_core::fuse::FusionConsumer::create(
@@ -245,7 +271,7 @@ fn single_stack_directory_matches_the_plain_invocation() {
     consumer.finish().expect("finish must succeed");
 
     assert_eq!(
-        read_whole(&export_composite(&grouped)),
+        read_whole(&export_composite(&cwd, &grouped)),
         read_whole(&plain),
         "a grouped one-stack run must produce the same composite, byte for byte"
     );
@@ -254,14 +280,17 @@ fn single_stack_directory_matches_the_plain_invocation() {
 /// The composite of `project`, exported beside it -- the comparison a
 /// container makes necessary: what must be preserved is the payload, never
 /// the envelope.
-fn export_composite(project: &Path) -> PathBuf {
+fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
     let exported = project.with_extension("exported.tif");
-    let out = run_cli(&[
-        "export",
-        project.to_str().unwrap(),
-        "-o",
-        exported.to_str().unwrap(),
-    ]);
+    let out = run_cli_in(
+        cwd,
+        &[
+            "export",
+            project.to_str().unwrap(),
+            "-o",
+            exported.to_str().unwrap(),
+        ],
+    );
     assert!(out.success, "export stderr: {}", out.stderr);
     exported
 }
@@ -271,21 +300,25 @@ fn export_composite(project: &Path) -> PathBuf {
 #[test]
 fn write_groups_then_groups_round_trips() {
     let dump = card_dump("groups_cli_round_trip");
-    let out_dir = tmp_dir("groups_cli_round_trip_out");
+    let out_dir = common::tmp_dir("groups_cli_round_trip_out");
+    let cwd = common::tmp_dir("groups_cli_round_trip_cwd");
     let file = out_dir.join("groups.toml");
-    let first = run_cli(&[
-        "stack",
-        dump.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-        "--write-groups",
-        file.to_str().unwrap(),
-        "--dry-run",
-    ]);
+    let first = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--write-groups",
+            file.to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
     assert!(first.success, "stderr: {}", first.stderr);
 
     let text = std::fs::read_to_string(&file).expect("--write-groups must write the file");
@@ -297,19 +330,22 @@ fn write_groups_then_groups_round_trips() {
         "`format` must sit outside every [[group]] block:\n{text}"
     );
 
-    let second = run_cli(&[
-        "stack",
-        dump.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-        "--groups",
-        file.to_str().unwrap(),
-        "--dry-run",
-    ]);
+    let second = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--groups",
+            file.to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
     assert!(second.success, "stderr: {}", second.stderr);
 
     let proposed = grouping_lines(&first.stderr);
@@ -340,7 +376,8 @@ fn grouping_lines(stderr: &str) -> Vec<String> {
 #[test]
 fn groups_file_overrides_the_proposal() {
     let dump = card_dump("groups_cli_override");
-    let out_dir = tmp_dir("groups_cli_override_out");
+    let out_dir = common::tmp_dir("groups_cli_override_out");
+    let cwd = common::tmp_dir("groups_cli_override_cwd");
     let file = out_dir.join("groups.toml");
     // One group holding all four frames -- the opposite of what the
     // heuristic proposes for this tree.
@@ -352,19 +389,22 @@ fn groups_file_overrides_the_proposal() {
     .unwrap();
 
     let output = out_dir.join("everything.ffp");
-    let result = run_cli(&[
-        "stack",
-        dump.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-        "--groups",
-        file.to_str().unwrap(),
-        "--json",
-    ]);
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--groups",
+            file.to_str().unwrap(),
+            "--json",
+        ],
+    );
     assert!(result.success, "stderr: {}", result.stderr);
     assert!(
         result.stderr.contains("everything") && result.stderr.contains("1 group ("),
@@ -379,7 +419,8 @@ fn groups_file_overrides_the_proposal() {
 #[test]
 fn groups_file_with_a_missing_frame_is_refused() {
     let dump = card_dump("groups_cli_missing_frame");
-    let out_dir = tmp_dir("groups_cli_missing_frame_out");
+    let out_dir = common::tmp_dir("groups_cli_missing_frame_out");
+    let cwd = common::tmp_dir("groups_cli_missing_frame_cwd");
     let file = out_dir.join("groups.toml");
     std::fs::write(
         &file,
@@ -388,17 +429,20 @@ fn groups_file_with_a_missing_frame_is_refused() {
     )
     .unwrap();
 
-    let result = run_cli(&[
-        "stack",
-        dump.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--groups",
-        file.to_str().unwrap(),
-    ]);
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--groups",
+            file.to_str().unwrap(),
+        ],
+    );
     assert!(!result.success);
     assert_eq!(result.code, Some(1));
     assert!(
@@ -411,7 +455,8 @@ fn groups_file_with_a_missing_frame_is_refused() {
 #[test]
 fn groups_file_duplicate_or_orphan_frame_is_refused() {
     let dump = card_dump("groups_cli_duplicate_frame");
-    let out_dir = tmp_dir("groups_cli_duplicate_frame_out");
+    let out_dir = common::tmp_dir("groups_cli_duplicate_frame_out");
+    let cwd = common::tmp_dir("groups_cli_duplicate_frame_cwd");
 
     let duplicate = out_dir.join("duplicate.toml");
     std::fs::write(
@@ -421,17 +466,20 @@ fn groups_file_duplicate_or_orphan_frame_is_refused() {
          [\"IMG_9801.tif\"]\n",
     )
     .unwrap();
-    let result = run_cli(&[
-        "stack",
-        dump.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--groups",
-        duplicate.to_str().unwrap(),
-    ]);
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--groups",
+            duplicate.to_str().unwrap(),
+        ],
+    );
     assert!(!result.success);
     assert!(
         result.stderr.contains("IMG_9801.tif") && result.stderr.contains("twice"),
@@ -446,17 +494,20 @@ fn groups_file_duplicate_or_orphan_frame_is_refused() {
          \"IMG_9910.tif\"]\n",
     )
     .unwrap();
-    let result = run_cli(&[
-        "stack",
-        dump.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--groups",
-        orphan.to_str().unwrap(),
-    ]);
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--groups",
+            orphan.to_str().unwrap(),
+        ],
+    );
     assert!(!result.success);
     assert!(
         result.stderr.contains("IMG_9911.tif") && result.stderr.contains("in no group"),
@@ -467,17 +518,23 @@ fn groups_file_duplicate_or_orphan_frame_is_refused() {
 
 #[test]
 fn empty_directory_fails_clearly() {
-    let dir = tmp_dir("groups_cli_empty");
+    let cwd = common::tmp_dir("groups_cli_empty");
+    // Input and `-o` are deliberately the same directory here, so it is a
+    // fixed-name child of the cwd, never the cwd itself.
+    let dir = cwd.join("groups_cli_empty");
     std::fs::create_dir_all(dir.join("nothing-here")).unwrap();
-    let result = run_cli(&[
-        "stack",
-        dir.to_str().unwrap(),
-        "-o",
-        dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-    ]);
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dir.to_str().unwrap(),
+            "-o",
+            dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+        ],
+    );
     assert!(!result.success, "stdout: {}", result.stdout);
     assert_eq!(result.code, Some(1));
     assert!(
@@ -493,20 +550,24 @@ fn empty_directory_fails_clearly() {
 #[test]
 fn status_and_manifest_have_one_entry_per_group() {
     let dump = card_dump("groups_cli_status_manifest");
-    let out_dir = tmp_dir("groups_cli_status_manifest_out");
+    let out_dir = common::tmp_dir("groups_cli_status_manifest_out");
+    let cwd = common::tmp_dir("groups_cli_status_manifest_cwd");
     let status = out_dir.join("status.ndjson");
-    let result = run_cli(&[
-        "stack",
-        dump.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-        "--status",
-        status.to_str().unwrap(),
-    ]);
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--status",
+            status.to_str().unwrap(),
+        ],
+    );
     assert!(result.success, "stderr: {}", result.stderr);
 
     let records: Vec<serde_json::Value> = std::fs::read_to_string(&status)
@@ -552,20 +613,24 @@ fn a_failing_group_does_not_abort_the_run() {
         Some("2026:08:29 19:02:57"),
     )
     .unwrap();
-    let out_dir = tmp_dir("groups_cli_failing_group_out");
+    let out_dir = common::tmp_dir("groups_cli_failing_group_out");
+    let cwd = common::tmp_dir("groups_cli_failing_group_cwd");
     let status = out_dir.join("status.ndjson");
-    let result = run_cli(&[
-        "stack",
-        dump.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-        "--status",
-        status.to_str().unwrap(),
-    ]);
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--status",
+            status.to_str().unwrap(),
+        ],
+    );
     assert!(!result.success, "one group failed, so the run exits 1");
     assert_eq!(result.code, Some(1));
     assert!(
@@ -596,21 +661,25 @@ fn a_failing_group_does_not_abort_the_run() {
 #[test]
 fn a_bad_set_refuses_before_any_group_runs() {
     let dump = card_dump("groups_cli_bad_set");
-    let out_dir = tmp_dir("groups_cli_bad_set_out");
+    let out_dir = common::tmp_dir("groups_cli_bad_set_out");
+    let cwd = common::tmp_dir("groups_cli_bad_set_cwd");
     let status = out_dir.join("status.ndjson");
-    let result = run_cli(&[
-        "stack",
-        dump.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--set",
-        "no-such-parameter=1",
-        "--no-align",
-        "--status",
-        status.to_str().unwrap(),
-    ]);
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--set",
+            "no-such-parameter=1",
+            "--no-align",
+            "--status",
+            status.to_str().unwrap(),
+        ],
+    );
     assert!(!result.success);
     assert_eq!(result.code, Some(1));
     assert!(
@@ -634,18 +703,22 @@ fn a_bad_set_refuses_before_any_group_runs() {
 #[test]
 fn json_shape_is_unchanged_for_one_group_and_wrapped_for_many() {
     let dump = card_dump("groups_cli_json_shape");
-    let out_dir = tmp_dir("groups_cli_json_shape_out");
-    let many = run_cli(&[
-        "stack",
-        dump.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-        "--json",
-    ]);
+    let out_dir = common::tmp_dir("groups_cli_json_shape_out");
+    let cwd = common::tmp_dir("groups_cli_json_shape_cwd");
+    let many = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--json",
+        ],
+    );
     assert!(many.success, "stderr: {}", many.stderr);
     let wrapped: serde_json::Value =
         serde_json::from_str(&many.stdout).expect("one document, never N concatenated");
@@ -658,20 +731,25 @@ fn json_shape_is_unchanged_for_one_group_and_wrapped_for_many() {
         "the wrapper is not itself a StackReport: {wrapped}"
     );
 
-    let single = tmp_dir("groups_cli_json_shape_single");
+    // Input and `-o` are deliberately the same directory here too, so it is
+    // a fixed-name child of the shared cwd, never the cwd itself.
+    let single = cwd.join("groups_cli_json_shape_single");
     frame(&single, "00.tif", Some("2026:08:29 18:42:41"));
     frame(&single, "01.tif", Some("2026:08:29 18:42:42"));
-    let one = run_cli(&[
-        "stack",
-        single.to_str().unwrap(),
-        "-o",
-        single.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-        "--json",
-    ]);
+    let one = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            single.to_str().unwrap(),
+            "-o",
+            single.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--json",
+        ],
+    );
     assert!(one.success, "stderr: {}", one.stderr);
     let report: serde_json::Value = serde_json::from_str(&one.stdout).unwrap();
     assert_eq!(report["frame_count"], 2);
@@ -689,17 +767,21 @@ fn json_shape_is_unchanged_for_one_group_and_wrapped_for_many() {
 #[test]
 fn an_output_file_and_a_zmap_are_refused_by_name() {
     let dump = card_dump("groups_cli_output_placement");
-    let out_dir = tmp_dir("groups_cli_output_placement_out");
+    let out_dir = common::tmp_dir("groups_cli_output_placement_out");
+    let cwd = common::tmp_dir("groups_cli_output_placement_cwd");
 
-    let as_file = run_cli(&[
-        "stack",
-        dump.to_str().unwrap(),
-        "-o",
-        out_dir.join("out.tif").to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-    ]);
+    let as_file = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.join("out.tif").to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+        ],
+    );
     assert!(!as_file.success);
     assert_eq!(as_file.code, Some(1), "never clap's exit 2");
     assert!(
@@ -718,17 +800,20 @@ fn an_output_file_and_a_zmap_are_refused_by_name() {
         as_file.stderr
     );
 
-    let with_zmap = run_cli(&[
-        "stack",
-        dump.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--zmap",
-        out_dir.join("zmap.tif").to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-    ]);
+    let with_zmap = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--zmap",
+            out_dir.join("zmap.tif").to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+        ],
+    );
     assert!(!with_zmap.success);
     assert_eq!(with_zmap.code, Some(1));
     assert!(
@@ -748,17 +833,21 @@ fn an_output_file_and_a_zmap_are_refused_by_name() {
 /// and a manifest too, single-group included.
 #[test]
 fn a_one_group_run_writes_a_manifest_too() {
-    let out_dir = tmp_dir("groups_cli_fixture_single");
-    let result = run_cli(&[
-        "stack",
-        common::fixtures_dir().join("mantis-512").to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-    ]);
+    let out_dir = common::tmp_dir("groups_cli_fixture_single");
+    let cwd = common::tmp_dir("groups_cli_fixture_single_cwd");
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            common::fixtures_dir().join("mantis-512").to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+        ],
+    );
     assert!(result.success, "stderr: {}", result.stderr);
     assert!(
         result.stderr.contains("1 group ("),
@@ -770,7 +859,7 @@ fn a_one_group_run_writes_a_manifest_too() {
         "the project is named after the group, which falls back to the directory basename"
     );
     assert!(
-        std::fs::read_dir(&out_dir)
+        std::fs::read_dir(&*out_dir)
             .unwrap()
             .flatten()
             .all(|e| e.path().extension().is_none_or(|x| x != "tif")),

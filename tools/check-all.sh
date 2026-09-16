@@ -111,8 +111,20 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   # artefact exists: a skip inside the gate must read as a bug, not a pass.
   REQUIRE_SYNTH=0
   [ -f .scratch/synth-align/measurement.json ] && REQUIRE_SYNTH=1
-  run_gate "cargo test"     tools/with-lock.sh build -- \
-                              env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" cargo test --workspace
+  # nextest, not `cargo test`: it runs the workspace's ~40 test binaries in
+  # parallel processes instead of serially, cutting this stage from the sum
+  # of every binary's time down to roughly the slowest one. It cannot run
+  # doctests (a known nextest limitation, not a bug here), so those are a
+  # second, separate cargo test invocation right after. `gpu` is a default
+  # feature and the gpu crate's own suite already runs inside this stage
+  # today at ~0.02s for 36 tests -- cheap enough that nextest's added
+  # cross-binary parallelism is not a GPU contention risk the way an actual
+  # `--features gpu-tests` run is (that one stays outside this gate, single-
+  # threaded).
+  run_gate "cargo nextest"  tools/with-lock.sh build -- \
+                              env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" cargo nextest run --workspace
+  run_gate "cargo test --doc" tools/with-lock.sh build -- \
+                              env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" cargo test --doc --workspace
   run_gate "rustdoc"        tools/with-lock.sh build -- \
                               env RUSTDOCFLAGS="-D warnings" \
                               cargo doc --workspace --no-deps --document-private-items

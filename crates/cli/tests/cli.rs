@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Every spawn isolates `.scratch/` with its own per-process temp directory
+//! and `.current_dir(dir)`, since parallel tests must never share a working
+//! directory. Only [`stack_defaults_to_cpu`]'s subcommand writes
+//! cwd-relative state, but every spawn routes through [`spawn_in`] anyway.
+
 mod common;
 
 use std::path::{Path, PathBuf};
@@ -9,6 +14,21 @@ use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+}
+
+/// Spawns the built CLI with `args`, in `dir` as its working directory.
+///
+/// Returns the raw `std::process::Output` rather than a project-specific
+/// wrapper: every test in this file reads `output.status` (including its
+/// `Debug` rendering) and both byte streams directly, so a thinner spawn
+/// helper is the smaller diff than reshaping every call site around a
+/// `CliOutput` struct's field names.
+fn spawn_in(dir: &Path, args: &[&str]) -> std::process::Output {
+    bin()
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run binary")
 }
 
 fn mantis_512_dir() -> PathBuf {
@@ -48,10 +68,8 @@ fn write_compressed_copy(source: &Path, dest: &Path) {
 
 #[test]
 fn version_flag_prints_package_version() {
-    let output = bin()
-        .arg("--version")
-        .output()
-        .expect("failed to run binary");
+    let cwd = common::tmp_dir("version_flag_prints_package_version");
+    let output = spawn_in(&cwd, &["--version"]);
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -62,11 +80,8 @@ fn version_flag_prints_package_version() {
 
 #[test]
 fn info_reports_fixture_directory() {
-    let output = bin()
-        .arg("info")
-        .arg(mantis_512_dir())
-        .output()
-        .expect("failed to run binary");
+    let cwd = common::tmp_dir("info_reports_fixture_directory");
+    let output = spawn_in(&cwd, &["info", mantis_512_dir().to_str().unwrap()]);
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -92,11 +107,9 @@ fn info_reports_fixture_directory() {
 
 #[test]
 fn info_reports_single_file_fields() {
-    let output = bin()
-        .arg("info")
-        .arg(mantis_512_dir().join("frames").join("00.tif"))
-        .output()
-        .expect("failed to run binary");
+    let cwd = common::tmp_dir("info_reports_single_file_fields");
+    let path = mantis_512_dir().join("frames").join("00.tif");
+    let output = spawn_in(&cwd, &["info", path.to_str().unwrap()]);
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -114,24 +127,16 @@ fn info_reports_single_file_fields() {
 
 #[test]
 fn info_reports_the_description() {
+    let cwd = common::tmp_dir("info_reports_the_description");
     let path = mantis_64_dir().join("frames").join("00.tif");
     let expected = "description: FocusForge fixture mantis-64/00 from 20260829-IMG_9800.tif rect 4064,2700,64,64";
 
-    let output = bin()
-        .arg("info")
-        .arg(&path)
-        .output()
-        .expect("failed to run binary");
+    let output = spawn_in(&cwd, &["info", path.to_str().unwrap()]);
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains(expected), "stdout: {stdout}");
 
-    let json_output = bin()
-        .arg("info")
-        .arg("--json")
-        .arg(&path)
-        .output()
-        .expect("failed to run binary");
+    let json_output = spawn_in(&cwd, &["info", "--json", path.to_str().unwrap()]);
     assert!(
         json_output.status.success(),
         "exit status: {:?}",
@@ -147,12 +152,11 @@ fn info_reports_the_description() {
 
 #[test]
 fn info_json() {
-    let output = bin()
-        .arg("info")
-        .arg("--json")
-        .arg(mantis_512_dir())
-        .output()
-        .expect("failed to run binary");
+    let cwd = common::tmp_dir("info_json");
+    let output = spawn_in(
+        &cwd,
+        &["info", "--json", mantis_512_dir().to_str().unwrap()],
+    );
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     for needle in [
@@ -178,10 +182,8 @@ fn info_json() {
 /// `name`, `path` and `error`.
 #[test]
 fn info_json_nulls_every_metadata_field_on_a_broken_member() {
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("info_json_nulls_every_metadata_field_on_a_broken_member");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let cwd = common::tmp_dir("info_json_nulls_every_metadata_field_on_a_broken_member_cwd");
+    let tmp = common::tmp_dir("info_json_nulls_every_metadata_field_on_a_broken_member");
     std::fs::copy(
         mantis_64_dir().join("frames").join("00.tif"),
         tmp.join("00.tif"),
@@ -189,12 +191,7 @@ fn info_json_nulls_every_metadata_field_on_a_broken_member() {
     .unwrap();
     std::fs::write(tmp.join("broken.tif"), b"junkbyte").unwrap();
 
-    let output = bin()
-        .arg("info")
-        .arg("--json")
-        .arg(&tmp)
-        .output()
-        .expect("failed to run binary");
+    let output = spawn_in(&cwd, &["info", "--json", tmp.to_str().unwrap()]);
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let report: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
@@ -235,9 +232,8 @@ fn info_json_nulls_every_metadata_field_on_a_broken_member() {
 
 #[test]
 fn info_reports_non_uniform_directory() {
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("info_reports_non_uniform_directory");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let cwd = common::tmp_dir("info_reports_non_uniform_directory_cwd");
+    let tmp = common::tmp_dir("info_reports_non_uniform_directory");
     std::fs::copy(
         mantis_64_dir().join("reference.tif"),
         tmp.join("reference.tif"),
@@ -249,11 +245,7 @@ fn info_reports_non_uniform_directory() {
     )
     .unwrap();
 
-    let output = bin()
-        .arg("info")
-        .arg(&tmp)
-        .output()
-        .expect("failed to run binary");
+    let output = spawn_in(&cwd, &["info", tmp.to_str().unwrap()]);
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -268,10 +260,8 @@ fn info_reports_non_uniform_directory() {
 /// an identical-looking `II/rps=1` on both sides.
 #[test]
 fn info_reports_non_uniform_directory_names_compression() {
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("info_reports_non_uniform_directory_names_compression");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let cwd = common::tmp_dir("info_reports_non_uniform_directory_names_compression_cwd");
+    let tmp = common::tmp_dir("info_reports_non_uniform_directory_names_compression");
     std::fs::copy(
         mantis_64_dir().join("frames").join("00.tif"),
         tmp.join("00.tif"),
@@ -287,11 +277,7 @@ fn info_reports_non_uniform_directory_names_compression() {
         &tmp.join("02-compressed.tif"),
     );
 
-    let output = bin()
-        .arg("info")
-        .arg(&tmp)
-        .output()
-        .expect("failed to run binary");
+    let output = spawn_in(&cwd, &["info", tmp.to_str().unwrap()]);
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -304,10 +290,8 @@ fn info_reports_non_uniform_directory_names_compression() {
 
 #[test]
 fn info_skips_non_tiff_and_names_a_broken_tiff() {
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("info_skips_non_tiff_and_names_a_broken_tiff");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let cwd = common::tmp_dir("info_skips_non_tiff_and_names_a_broken_tiff_cwd");
+    let tmp = common::tmp_dir("info_skips_non_tiff_and_names_a_broken_tiff");
     std::fs::copy(
         mantis_64_dir().join("frames").join("00.tif"),
         tmp.join("00.tif"),
@@ -316,11 +300,7 @@ fn info_skips_non_tiff_and_names_a_broken_tiff() {
     std::fs::write(tmp.join("README.md"), b"not a frame").unwrap();
     std::fs::write(tmp.join("broken.tif"), b"junkbyte").unwrap();
 
-    let output = bin()
-        .arg("info")
-        .arg(&tmp)
-        .output()
-        .expect("failed to run binary");
+    let output = spawn_in(&cwd, &["info", tmp.to_str().unwrap()]);
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("README.md"), "stdout: {stdout}");
@@ -331,20 +311,18 @@ fn info_skips_non_tiff_and_names_a_broken_tiff() {
 
 #[test]
 fn info_reads_headers_only() {
+    let cwd = common::tmp_dir("info_reads_headers_only_cwd");
     // Truncate a copy of mantis-64/frames/00.tif to its 762-byte header:
     // header, IFD and both strip tables complete, zero pixel bytes.
     let source = mantis_64_dir().join("frames").join("00.tif");
     let bytes = std::fs::read(&source).expect("read fixture frame");
     let truncated = &bytes[..762];
 
-    let file_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("info_reads_headers_only.tif");
+    let holder = common::tmp_dir("info_reads_headers_only");
+    let file_path = holder.join("info_reads_headers_only.tif");
     std::fs::write(&file_path, truncated).unwrap();
 
-    let output = bin()
-        .arg("info")
-        .arg(&file_path)
-        .output()
-        .expect("failed to run binary");
+    let output = spawn_in(&cwd, &["info", file_path.to_str().unwrap()]);
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -354,15 +332,9 @@ fn info_reads_headers_only() {
     assert!(stdout.contains("mmap fast path: yes"), "stdout: {stdout}");
 
     // Same proof for a directory containing the truncated file.
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("info_reads_headers_only_dir");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = common::tmp_dir("info_reads_headers_only_dir");
     std::fs::write(tmp.join("truncated.tif"), truncated).unwrap();
-    let output = bin()
-        .arg("info")
-        .arg(&tmp)
-        .output()
-        .expect("failed to run binary");
+    let output = spawn_in(&cwd, &["info", tmp.to_str().unwrap()]);
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("64x64 3ch 16-bit II"), "stdout: {stdout}");
@@ -370,8 +342,9 @@ fn info_reads_headers_only() {
 
 #[test]
 fn info_reports_written_file_as_fast_path() {
-    let out_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("info_reports_written_file_as_fast_path.tif");
+    let cwd = common::tmp_dir("info_reports_written_file_as_fast_path_cwd");
+    let holder = common::tmp_dir("info_reports_written_file_as_fast_path");
+    let out_path = holder.join("info_reports_written_file_as_fast_path.tif");
     let mut writer = TiffWriter::create(
         &out_path,
         TiffSpec {
@@ -395,11 +368,7 @@ fn info_reports_written_file_as_fast_path() {
         .expect("write_tile must succeed");
     writer.finish().expect("finish must succeed");
 
-    let output = bin()
-        .arg("info")
-        .arg(&out_path)
-        .output()
-        .expect("failed to run binary");
+    let output = spawn_in(&cwd, &["info", out_path.to_str().unwrap()]);
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("mmap fast path: yes"), "stdout: {stdout}");
@@ -407,15 +376,12 @@ fn info_reports_written_file_as_fast_path() {
 
 #[test]
 fn info_reports_compressed_file_as_refused() {
-    let dest = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("info_reports_compressed_file_as_refused.tif");
+    let cwd = common::tmp_dir("info_reports_compressed_file_as_refused_cwd");
+    let holder = common::tmp_dir("info_reports_compressed_file_as_refused");
+    let dest = holder.join("info_reports_compressed_file_as_refused.tif");
     write_compressed_copy(&mantis_64_dir().join("frames").join("00.tif"), &dest);
 
-    let output = bin()
-        .arg("info")
-        .arg(&dest)
-        .output()
-        .expect("failed to run binary");
+    let output = spawn_in(&cwd, &["info", dest.to_str().unwrap()]);
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -426,15 +392,12 @@ fn info_reports_compressed_file_as_refused() {
 
 #[test]
 fn info_exits_1_for_unparseable_single_file() {
-    let dest =
-        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("info_exits_1_for_unparseable_single_file");
+    let cwd = common::tmp_dir("info_exits_1_for_unparseable_single_file_cwd");
+    let holder = common::tmp_dir("info_exits_1_for_unparseable_single_file");
+    let dest = holder.join("info_exits_1_for_unparseable_single_file");
     std::fs::write(&dest, b"not a tiff at all").unwrap();
 
-    let output = bin()
-        .arg("info")
-        .arg(&dest)
-        .output()
-        .expect("failed to run binary");
+    let output = spawn_in(&cwd, &["info", dest.to_str().unwrap()]);
     assert!(
         !output.status.success(),
         "expected exit 1, got {:?}",
@@ -446,15 +409,10 @@ fn info_exits_1_for_unparseable_single_file() {
 
 #[test]
 fn info_exits_1_for_empty_directory() {
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("info_exits_1_for_empty_directory");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let cwd = common::tmp_dir("info_exits_1_for_empty_directory_cwd");
+    let tmp = common::tmp_dir("info_exits_1_for_empty_directory");
 
-    let output = bin()
-        .arg("info")
-        .arg(&tmp)
-        .output()
-        .expect("failed to run binary");
+    let output = spawn_in(&cwd, &["info", tmp.to_str().unwrap()]);
     assert!(
         !output.status.success(),
         "expected exit 1, got {:?}",
@@ -471,29 +429,30 @@ fn info_exits_1_for_empty_directory() {
 /// already uses for its own inexpensive runs.
 #[test]
 fn stack_defaults_to_cpu() {
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("stack_defaults_to_cpu");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
-    let output = tmp.join("mantis-512.ffp");
+    let cwd = common::tmp_dir("stack_defaults_to_cpu");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
 
-    let out = bin()
-        .arg("stack")
-        .arg(mantis_512_dir())
-        .arg("-o")
-        .arg(output.parent().unwrap())
-        .arg("--algo")
-        .arg("dummy-stack")
-        .arg("--no-align")
-        .arg("--no-crop")
-        .arg("--json")
-        .output()
-        .expect("failed to run binary");
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+    let output = spawn_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--json",
+        ],
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let report: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(report["backend"], "cpu", "report: {report}");
 }
@@ -506,12 +465,9 @@ fn stack_defaults_to_cpu() {
 #[test]
 #[cfg(not(feature = "gpu"))]
 fn no_gpu_flag_absent_without_the_feature() {
+    let cwd = common::tmp_dir("no_gpu_flag_absent_without_the_feature");
     for sub in ["stack", "align"] {
-        let output = bin()
-            .arg(sub)
-            .arg("--help")
-            .output()
-            .expect("failed to run binary");
+        let output = spawn_in(&cwd, &[sub, "--help"]);
         assert!(output.status.success(), "exit status: {:?}", output.status);
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
@@ -529,12 +485,8 @@ fn info_reads_the_reference_stack() {
         return;
     };
 
-    let output = bin()
-        .arg("info")
-        .arg("--json")
-        .arg(&stack_dir)
-        .output()
-        .expect("failed to run binary");
+    let cwd = common::tmp_dir("info_reads_the_reference_stack");
+    let output = spawn_in(&cwd, &["info", "--json", stack_dir.to_str().unwrap()]);
     assert!(output.status.success(), "exit status: {:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
