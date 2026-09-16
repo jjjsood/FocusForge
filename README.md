@@ -97,11 +97,11 @@ same report as machine-readable JSON.
 
 ```bash
 target/release/focusforge-cli stack path/to/frames/ --algo laplacian
-target/release/focusforge-cli export path/to/frames/frames.ffproj -o out.tif --zmap zmap.tif
+target/release/focusforge-cli export path/to/frames/frames.ffp -o out.tif --zmap zmap.tif
 ```
 
 `stack` aligns the frames and fuses them into a project beside the frames
-(one `.ffproj` file per detected stack); `export` then turns that project
+(one `.ffp` file per detected stack); `export` then turns that project
 into `out.tif` and its per-pixel source map `zmap.tif`. Alignment and the
 auto-crop that precedes fusion are both on by default (`--no-align` /
 `--no-crop` turn them off); `focusforge-cli align` reports the same

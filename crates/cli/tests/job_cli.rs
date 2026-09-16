@@ -251,7 +251,7 @@ fn stack_output_is_unchanged_under_the_job_engine() {
     use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 
     let dir = tmp_dir("job_cli_output_unchanged");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let source = mantis_512_dir();
     let mut args = vec![
         "stack",
@@ -322,7 +322,7 @@ fn stack_output_is_unchanged_under_the_job_engine() {
 #[test]
 fn progress_line_contains_units_stage_and_eta() {
     let dir = tmp_dir("job_cli_progress_line");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let mantis = mantis_512_dir();
     let out = run_cli_in(
         &dir,
@@ -366,7 +366,7 @@ fn fuse_counts(stderr: &str) -> Vec<(usize, usize)> {
 #[test]
 fn progress_advances_during_an_uninterrupted_run() {
     let dir = tmp_dir("job_cli_progress_advances");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let mantis = mantis_512_dir();
     let out = run_cli_in(
         &dir,
@@ -422,7 +422,7 @@ fn progress_advances_during_an_uninterrupted_run() {
 #[test]
 fn progress_to_a_file_has_no_escape_sequences() {
     let dir = tmp_dir("job_cli_progress_no_escapes");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let start = std::time::Instant::now();
     let mantis = mantis_512_dir();
     let out = run_cli_in(
@@ -451,7 +451,7 @@ fn progress_to_a_file_has_no_escape_sequences() {
 #[test]
 fn quiet_prints_no_progress() {
     let dir = tmp_dir("job_cli_quiet");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let source = mantis_512_dir();
     let mut args = vec![
         "stack",
@@ -502,7 +502,7 @@ mod unix_signals {
     #[test]
     fn sigint_cancels_cleanly() {
         let dir = tmp_dir("job_cli_sigint_cancel");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &dir,
@@ -547,7 +547,7 @@ mod unix_signals {
     #[test]
     fn status_record_written_on_cancel() {
         let dir = tmp_dir("job_cli_status_cancel");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let status = dir.join("status.ndjson");
         let mantis = mantis_512_dir();
         let mut args = interruptible_stack_args(
@@ -577,7 +577,7 @@ mod unix_signals {
     #[test]
     fn sigint_then_resume_finishes_the_job() {
         let ref_dir = tmp_dir("job_cli_resume_reference");
-        let ref_output = ref_dir.join("mantis-512.ffproj");
+        let ref_output = ref_dir.join("mantis-512.ffp");
         let mantis_dir_ref = mantis_512_dir();
         let mut ref_args = vec![
             "stack",
@@ -602,7 +602,7 @@ mod unix_signals {
         assert!(ref_run.success, "stderr: {}", ref_run.stderr);
 
         let dir = tmp_dir("job_cli_resume_interrupted");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let mantis_dir = mantis_512_dir();
         let args = interruptible_stack_args(
             mantis_dir.to_str().unwrap(),
@@ -636,7 +636,7 @@ mod unix_signals {
     #[test]
     fn second_sigint_exits_immediately() {
         let dir = tmp_dir("job_cli_second_sigint");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &dir,
@@ -720,7 +720,7 @@ mod unix_signals {
     #[test]
     fn sigusr1_pauses_the_run_and_a_second_one_resumes_it() {
         let dir = tmp_dir("job_cli_sigusr1_pause");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &dir,
@@ -800,7 +800,7 @@ mod unix_signals {
     #[test]
     fn resume_without_state_fails_clearly() {
         let dir = tmp_dir("job_cli_resume_without_state");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let out = run_cli_in(
             &dir,
             &[
@@ -824,7 +824,7 @@ mod unix_signals {
     fn resume_with_changed_inputs_fails() {
         let dir = tmp_dir("job_cli_resume_changed_inputs");
         let stack_dir = copy_fixture_frames(&dir.join("stack"));
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let args = interruptible_stack_args(
             stack_dir.to_str().unwrap(),
             output.parent().unwrap().to_str().unwrap(),
@@ -882,7 +882,7 @@ mod unix_signals {
     #[test]
     fn resume_with_a_changed_backend_fails() {
         let dir = tmp_dir("job_cli_resume_changed_backend");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let mantis_dir = mantis_512_dir();
         let args = interruptible_stack_args(
             mantis_dir.to_str().unwrap(),
@@ -924,7 +924,7 @@ mod unix_signals {
     #[test]
     fn resume_with_changed_tile_size_fails() {
         let dir = tmp_dir("job_cli_resume_changed_tile_size");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let mantis_dir = mantis_512_dir();
         let mut base_args = vec![
             "stack",
@@ -971,7 +971,7 @@ mod unix_signals {
     fn exit_codes_distinguish_the_three_outcomes() {
         // Completed: 0.
         let ok_dir = tmp_dir("job_cli_exit_ok");
-        let ok_output = ok_dir.join("mantis-512.ffproj");
+        let ok_output = ok_dir.join("mantis-512.ffp");
         let ok = run_cli_in(
             &ok_dir,
             &[
@@ -989,7 +989,7 @@ mod unix_signals {
 
         // Failed: 1.
         let fail_dir = tmp_dir("job_cli_exit_fail");
-        let fail_output = fail_dir.join("mantis-512.ffproj");
+        let fail_output = fail_dir.join("mantis-512.ffp");
         let failed = run_cli_in(
             &fail_dir,
             &[
@@ -1005,7 +1005,7 @@ mod unix_signals {
 
         // Cancelled: 130.
         let cancel_dir = tmp_dir("job_cli_exit_cancel");
-        let cancel_output = cancel_dir.join("mantis-512.ffproj");
+        let cancel_output = cancel_dir.join("mantis-512.ffp");
         let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &cancel_dir,
@@ -1113,7 +1113,7 @@ mod unix_signals {
 
         // The interrupted run: SIGINT once a progress line shows the fuse
         // stage genuinely under way -- never a sleep.
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let args = [
             "stack",
             &frames_arg,
@@ -1196,7 +1196,7 @@ mod unix_signals {
         // is compared against the resumed run's `--json` report -- both drawn
         // from the same recorded `StackAlignment`, never two ECC solves.
         let dir = tmp_dir("job_cli_align_resume");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let mantis_dir = mantis_512_dir();
         let mut args = vec![
             "stack",
@@ -1316,7 +1316,7 @@ mod unix_signals {
 #[test]
 fn tuning_flags_reach_the_scheduler() {
     let default_dir = tmp_dir("job_cli_tuning_default");
-    let default_output = default_dir.join("mantis-512.ffproj");
+    let default_output = default_dir.join("mantis-512.ffp");
     let default_run = run_cli_in(
         &default_dir,
         &[
@@ -1335,7 +1335,7 @@ fn tuning_flags_reach_the_scheduler() {
     let default_report: serde_json::Value = serde_json::from_str(&default_run.stdout).unwrap();
 
     let tuned_dir = tmp_dir("job_cli_tuning_tuned");
-    let tuned_output = tuned_dir.join("mantis-512.ffproj");
+    let tuned_output = tuned_dir.join("mantis-512.ffp");
     let mantis = mantis_512_dir();
     let mut tuned_args = interruptible_stack_args(
         mantis.to_str().unwrap(),

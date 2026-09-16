@@ -215,7 +215,7 @@ enum Command {
     /// of the two is required. This is the only thing in the workspace that
     /// writes a TIFF from a stack result.
     Export {
-        /// The `.ffproj` project to read.
+        /// The `.ffp` project to read.
         project: PathBuf,
         /// Write the composite to this path.
         #[arg(short = 'o', long = "output", value_name = "FILE")]
@@ -284,11 +284,11 @@ enum Command {
     /// a batch run's output directory: identity, outcome, sharpness ratio
     /// and Z-Map spread, with a failed stack a visible record rather than a
     /// missing file. Reads a run manifest when one is present, otherwise a
-    /// non-recursive listing of `*.ffproj` files; never groups frames
+    /// non-recursive listing of `*.ffp` files; never groups frames
     /// itself and writes nothing.
     Review {
         /// Directory to review: a run's `-o` output, or a plain directory of
-        /// `*.ffproj` projects.
+        /// `*.ffp` projects.
         dir: PathBuf,
         /// Emit one wrapped JSON document instead of a human-readable table.
         #[arg(long)]

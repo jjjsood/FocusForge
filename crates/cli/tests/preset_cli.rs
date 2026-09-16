@@ -118,7 +118,7 @@ fn preset_file_matches_equivalent_set_flags() {
 
     let preset_dir = dir.join("preset-out");
     std::fs::create_dir_all(&preset_dir).unwrap();
-    let from_preset = preset_dir.join("mantis-512.ffproj");
+    let from_preset = preset_dir.join("mantis-512.ffp");
     let out = run_cli_in(
         &dir,
         &common::push_no_gpu(vec![
@@ -138,7 +138,7 @@ fn preset_file_matches_equivalent_set_flags() {
 
     let flags_dir = dir.join("flags-out");
     std::fs::create_dir_all(&flags_dir).unwrap();
-    let from_flags = flags_dir.join("mantis-512.ffproj");
+    let from_flags = flags_dir.join("mantis-512.ffp");
     let out = run_cli_in(
         &dir,
         &common::push_no_gpu(vec![
@@ -422,7 +422,7 @@ fn written_preset_round_trips() {
     let written = dir.join("written.toml");
     let first_dir = dir.join("first-out");
     std::fs::create_dir_all(&first_dir).unwrap();
-    let first = first_dir.join("mantis-512.ffproj");
+    let first = first_dir.join("mantis-512.ffp");
     let out = run_cli_in(
         &dir,
         &common::push_no_gpu(vec![
@@ -453,7 +453,7 @@ fn written_preset_round_trips() {
 
     let second_dir = dir.join("second-out");
     std::fs::create_dir_all(&second_dir).unwrap();
-    let second = second_dir.join("mantis-512.ffproj");
+    let second = second_dir.join("mantis-512.ffp");
     let out = run_cli_in(
         &dir,
         &common::push_no_gpu(vec![
@@ -478,7 +478,7 @@ fn written_preset_round_trips() {
 #[test]
 fn dry_run_writes_nothing_and_succeeds() {
     let dir = tmp_dir("preset_cli_dry_run_writes_nothing");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let status = dir.join("status.ndjson");
     let out = run_cli_in(
         &dir,
@@ -526,7 +526,7 @@ fn dry_run_writes_nothing_and_succeeds() {
 
     assert!(!output.exists(), "a dry run writes no project");
     assert!(
-        !dir.join("mantis-512.ffproj.partial").exists(),
+        !dir.join("mantis-512.ffp.partial").exists(),
         "a dry run creates no .partial"
     );
     assert!(
@@ -587,7 +587,7 @@ fn dry_run_stops_before_alignment() {
 #[test]
 fn dry_run_json_is_not_a_stack_report() {
     let dir = tmp_dir("preset_cli_dry_run_json");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let out = run_cli_in(
         &dir,
         &common::push_no_gpu(vec![
@@ -715,7 +715,7 @@ fn status_record_names_identity_outcome_and_path() {
     let dir = tmp_dir("preset_cli_status_completed");
     let mantis = mantis_512_dir();
     let status = dir.join("status.ndjson");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let out = run_cli_in(
         &dir,
         &[

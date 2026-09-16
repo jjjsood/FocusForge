@@ -298,7 +298,7 @@ fn align_write_warped_gpu_matches_no_gpu() {
 #[test]
 fn auto_falls_back_without_adapter() {
     let dir = tmp_dir("cli_gpu_auto_falls_back");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let Some(result) = run_with_no_adapter(&[
         "stack",
         mantis_512_dir().to_str().unwrap(),
@@ -339,7 +339,7 @@ fn auto_falls_back_without_adapter() {
 #[test]
 fn fallback_emits_a_message() {
     let dir = tmp_dir("cli_gpu_fallback_emits_a_message");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let Some(result) = run_with_no_adapter(&[
         "stack",
         mantis_512_dir().to_str().unwrap(),
@@ -366,7 +366,7 @@ fn fallback_emits_a_message() {
 #[test]
 fn no_gpu_flag_forces_cpu_even_with_adapter() {
     let dir = tmp_dir("cli_gpu_no_gpu_forces_cpu");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let result = run(&[
         "stack",
         mantis_512_dir().to_str().unwrap(),

@@ -198,7 +198,7 @@ fn leave_a_cancelled_run_ledger(cwd: &Path) -> PathBuf {
         backend: "cpu".to_string(),
         align: None,
         crop: None,
-        composite_output: PathBuf::from("leftover.ffproj"),
+        composite_output: PathBuf::from("leftover.ffp"),
         zmap_output: None,
     };
     let store =
@@ -313,8 +313,8 @@ fn fusion_parameter_change_reuses_alignment() {
     let c_report: serde_json::Value = serde_json::from_str(&c.stdout).expect("--json");
     assert_eq!(c_report["align_cached"], false);
 
-    let b_composite = export_composite(&cwd, &out_b.join("mantis-512.ffproj"));
-    let c_composite = export_composite(&cwd, &out_c.join("mantis-512.ffproj"));
+    let b_composite = export_composite(&cwd, &out_b.join("mantis-512.ffp"));
+    let c_composite = export_composite(&cwd, &out_c.join("mantis-512.ffp"));
     assert_eq!(
         read_pixels(&b_composite),
         read_pixels(&c_composite),
@@ -449,8 +449,8 @@ fn no_cache_flag_forces_a_recompute() {
         "--no-cache must leave no entry behind"
     );
 
-    let a_composite = export_composite(&cwd, &out_a.join("mantis-512.ffproj"));
-    let b_composite = export_composite(&cwd, &out_b.join("mantis-512.ffproj"));
+    let a_composite = export_composite(&cwd, &out_a.join("mantis-512.ffp"));
+    let b_composite = export_composite(&cwd, &out_b.join("mantis-512.ffp"));
     assert_eq!(
         read_pixels(&a_composite),
         read_pixels(&b_composite),
@@ -495,7 +495,7 @@ fn cache_clear_removes_entries_and_nothing_else() {
     let ledger_dir = leave_a_cancelled_run_ledger(&cwd);
     let ledger_job_before = std::fs::read(ledger_dir.join("job.json")).unwrap();
 
-    let project_before = std::fs::read(out.join("mantis-512.ffproj")).unwrap();
+    let project_before = std::fs::read(out.join("mantis-512.ffp")).unwrap();
     let manifest_before = std::fs::read(out.join("manifest.json")).unwrap();
 
     // A completed run removes its staging directory, so build the one an
@@ -529,7 +529,7 @@ fn cache_clear_removes_entries_and_nothing_else() {
         "a cancelled run's resume ledger must survive a cache clear byte for byte"
     );
     assert_eq!(
-        std::fs::read(out.join("mantis-512.ffproj")).unwrap(),
+        std::fs::read(out.join("mantis-512.ffp")).unwrap(),
         project_before,
         "the sealed project must survive a cache clear byte for byte"
     );
@@ -576,7 +576,7 @@ fn only_runs_the_named_results() {
         .unwrap()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "ffproj"))
+        .filter(|p| p.extension().is_some_and(|e| e == "ffp"))
         .collect();
     assert_eq!(projects.len(), 3, "one project per proposed group");
     let mtimes_before: Vec<(PathBuf, std::time::SystemTime)> = projects
@@ -751,7 +751,7 @@ fn unknown_only_value_fails_clearly() {
 
 /// Cache state never enters the project format or a user-visible output
 /// directory: no file under `-o` names the cache, and no byte sequence
-/// naming the cache appears inside the sealed `*.ffproj`. The store sits at
+/// naming the cache appears inside the sealed `*.ffp`. The store sits at
 /// `.scratch/stage-cache/`.
 #[test]
 fn the_cache_stays_in_the_scratch_directory() {
@@ -790,7 +790,7 @@ fn the_cache_stays_in_the_scratch_directory() {
         );
     }
 
-    let project_bytes = std::fs::read(out.join("mantis-512.ffproj")).unwrap();
+    let project_bytes = std::fs::read(out.join("mantis-512.ffp")).unwrap();
     let needle = b"stage-cache";
     assert!(
         !project_bytes

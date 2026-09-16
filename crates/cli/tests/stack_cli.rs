@@ -164,7 +164,7 @@ fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
 /// assertion below is unchanged by the move to a container and the ~50 s
 /// fusion is still paid exactly once.
 struct SharedRun {
-    /// The `.ffproj` the run wrote -- the thing `stack` now produces.
+    /// The `.ffp` the run wrote -- the thing `stack` now produces.
     #[allow(dead_code)]
     project: PathBuf,
     output: PathBuf,
@@ -188,7 +188,7 @@ fn shared_laplacian_run() -> &'static SharedRun {
         let cwd = tmp_dir("stack_cli_shared_laplacian");
         let out_dir = cwd.join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
-        let project = out_dir.join("mantis-512.ffproj");
+        let project = out_dir.join("mantis-512.ffp");
         let output = out_dir.join("out.tif");
         let zmap = out_dir.join("out-zmap.tif");
         let mut args = vec![
@@ -527,7 +527,7 @@ fn every_run_carries_a_zmap_and_writes_no_image() {
     let cwd = tmp_dir("writes_the_zmap_on_request_off");
     let out_dir = cwd.join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
-    let output = out_dir.join("mantis-512.ffproj");
+    let output = out_dir.join("mantis-512.ffp");
     let out = run_cli_in(
         &cwd,
         &[
@@ -549,7 +549,7 @@ fn every_run_carries_a_zmap_and_writes_no_image() {
     entries.sort();
     assert_eq!(
         entries,
-        vec!["manifest.json".to_string(), "mantis-512.ffproj".to_string()],
+        vec!["manifest.json".to_string(), "mantis-512.ffp".to_string()],
         "one project and its run manifest, nothing else -- no image, no partial: {entries:?}"
     );
     let (_, zmap) = export_both(&cwd, &output);
@@ -903,9 +903,9 @@ fn max_host_memory_lowers_never_raises_and_does_not_move_pixels() {
         "a 1TiB ceiling must not itself become the reported budget: {uncapped_bytes_in_flight}"
     );
 
-    let (baseline_composite, _) = export_both(&cwd, &baseline_dir.join("mantis-512.ffproj"));
-    let (capped_composite, _) = export_both(&cwd, &capped_dir.join("mantis-512.ffproj"));
-    let (uncapped_composite, _) = export_both(&cwd, &uncapped_dir.join("mantis-512.ffproj"));
+    let (baseline_composite, _) = export_both(&cwd, &baseline_dir.join("mantis-512.ffp"));
+    let (capped_composite, _) = export_both(&cwd, &capped_dir.join("mantis-512.ffp"));
+    let (uncapped_composite, _) = export_both(&cwd, &uncapped_dir.join("mantis-512.ffp"));
     let baseline_bytes = std::fs::read(&baseline_composite).expect("baseline output must exist");
     let capped_bytes = std::fs::read(&capped_composite).expect("capped output must exist");
     let uncapped_bytes = std::fs::read(&uncapped_composite).expect("uncapped output must exist");
@@ -1082,8 +1082,8 @@ fn stage_timings_do_not_change_the_output() {
     let b = run_cli_in(&cwd, &b_args.iter().map(String::as_str).collect::<Vec<_>>());
     assert!(b.success, "stderr: {}", b.stderr);
 
-    let (a_composite, _) = export_both(&cwd, &out_a.join("mantis-512.ffproj"));
-    let (b_composite, _) = export_both(&cwd, &out_b.join("mantis-512.ffproj"));
+    let (a_composite, _) = export_both(&cwd, &out_a.join("mantis-512.ffp"));
+    let (b_composite, _) = export_both(&cwd, &out_b.join("mantis-512.ffp"));
     assert_eq!(
         std::fs::read(&a_composite).unwrap(),
         std::fs::read(&b_composite).unwrap(),
@@ -1104,7 +1104,7 @@ fn failed_seal_leaves_no_output() {
     let cwd = tmp_dir("failed_seal_leaves_no_output");
     let out_dir = cwd.join("readonly");
     std::fs::create_dir_all(&out_dir).unwrap();
-    let output = out_dir.join("mantis-512.ffproj");
+    let output = out_dir.join("mantis-512.ffp");
     std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
     let out = run_cli_in(
@@ -1157,7 +1157,7 @@ fn refuses_a_non_uniform_frame_set() {
     )
     .unwrap();
 
-    let output = frames.join("mantis-512.ffproj");
+    let output = frames.join("mantis-512.ffp");
     let out = run_cli_in(
         &cwd,
         &[
@@ -1196,8 +1196,8 @@ fn stack_aligns_before_fusing() {
     let aligned_dir = cwd.join("aligned");
     std::fs::create_dir_all(&unaligned_dir).unwrap();
     std::fs::create_dir_all(&aligned_dir).unwrap();
-    let unaligned = unaligned_dir.join("mantis-512.ffproj");
-    let aligned = aligned_dir.join("mantis-512.ffproj");
+    let unaligned = unaligned_dir.join("mantis-512.ffp");
+    let aligned = aligned_dir.join("mantis-512.ffp");
 
     let out_a = run_cli_in(
         &cwd,
@@ -1249,7 +1249,7 @@ fn stack_output_carries_the_auto_crop() {
     let cwd = tmp_dir("stack_output_carries_the_auto_crop");
     let out_dir = cwd.join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
-    let project = out_dir.join("mantis-512.ffproj");
+    let project = out_dir.join("mantis-512.ffp");
     let out = run_cli_in(
         &cwd,
         &[

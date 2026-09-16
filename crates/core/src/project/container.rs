@@ -130,8 +130,8 @@ mod tests {
     #[test]
     fn partial_path_appends_the_suffix_to_the_file_name() {
         assert_eq!(
-            partial_path(Path::new("/tmp/demo.ffproj")),
-            Path::new("/tmp/demo.ffproj.partial")
+            partial_path(Path::new("/tmp/demo.ffp")),
+            Path::new("/tmp/demo.ffp.partial")
         );
     }
 }

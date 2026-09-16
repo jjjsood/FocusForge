@@ -7,7 +7,7 @@
 //! `laplacian` fusion in milliseconds) or over a **copy** of it in
 //! `CARGO_TARGET_TMPDIR`. Never the committed fixture tree as an output
 //! directory: `tools/check-fixtures.sh` diffs the present file list against
-//! `MANIFEST.sha256`, so one stray `.ffproj` under `fixtures/` fails the
+//! `MANIFEST.sha256`, so one stray `.ffp` under `fixtures/` fails the
 //! gate.
 
 mod common;
@@ -136,7 +136,7 @@ fn stack_writes_a_project_and_no_image() {
     assert!(result.success, "stderr: {}", result.stderr);
 
     let files = walk(&out);
-    let projects = extensions(&files, "ffproj");
+    let projects = extensions(&files, "ffp");
     assert_eq!(projects.len(), 1, "exactly one project expected: {files:?}");
     assert!(
         extensions(&files, "tif").is_empty() && extensions(&files, "tiff").is_empty(),
@@ -170,7 +170,7 @@ fn project_lands_beside_the_frames() {
     assert!(result.success, "stderr: {}", result.stderr);
 
     let after = walk(&target);
-    let projects = extensions(&after, "ffproj");
+    let projects = extensions(&after, "ffp");
     assert_eq!(
         projects.len(),
         1,
@@ -191,7 +191,7 @@ fn project_lands_beside_the_frames() {
         "a run wrote an image beside the frames: {after:?}"
     );
     assert!(
-        result.stdout.contains(".ffproj") || result.stderr.contains(".ffproj"),
+        result.stdout.contains(".ffp") || result.stderr.contains(".ffp"),
         "the report must name the project it wrote -- stdout: {}",
         result.stdout
     );
@@ -208,7 +208,7 @@ fn output_dir_collects_the_project() {
         &stack_args(target.to_str().unwrap(), &["-o", out.to_str().unwrap()]),
     );
     assert!(result.success, "stderr: {}", result.stderr);
-    assert_eq!(extensions(&walk(&out), "ffproj").len(), 1);
+    assert_eq!(extensions(&walk(&out), "ffp").len(), 1);
     assert_eq!(
         walk(&target),
         before,
@@ -312,7 +312,7 @@ fn one_project_per_group_and_a_failure_spares_the_others() {
         &stack_args(root.to_str().unwrap(), &["-o", out.to_str().unwrap()]),
     );
     assert!(!result.success, "one group failed, so the run failed");
-    let projects = extensions(&walk(&out), "ffproj").len();
+    let projects = extensions(&walk(&out), "ffp").len();
     assert_eq!(
         projects, 1,
         "the healthy group's project must survive its neighbour's failure"
@@ -340,14 +340,14 @@ fn report_names_the_project_and_no_image() {
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
     assert_eq!(outputs.len(), 1, "one project, no image: {outputs:?}");
-    assert!(outputs[0].ends_with(".ffproj"), "{outputs:?}");
+    assert!(outputs[0].ends_with(".ffp"), "{outputs:?}");
 
     // The human rendering says the same thing.
     let human = run_cli_in(
         &cwd,
         &stack_args(input.to_str().unwrap(), &["-o", out.to_str().unwrap()]),
     );
-    assert!(human.stdout.contains(".ffproj"), "{}", human.stdout);
+    assert!(human.stdout.contains(".ffp"), "{}", human.stdout);
     assert!(
         !human.stdout.contains("wrote: ") || !human.stdout.contains(".tif\n"),
         "the report names no image path: {}",
@@ -371,7 +371,7 @@ fn report_names_the_project_and_no_image() {
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
     assert_eq!(would.len(), 1, "{would:?}");
-    assert!(would[0].ends_with(".ffproj"), "{would:?}");
+    assert!(would[0].ends_with(".ffp"), "{would:?}");
     assert_eq!(would[0], outputs[0]);
 }
 
@@ -431,7 +431,7 @@ fn cancel_keeps_the_staged_planes_for_resume() {
         "a cancel must say how to resume: {text}"
     );
     assert!(
-        extensions(&walk(&out), "ffproj").is_empty(),
+        extensions(&walk(&out), "ffp").is_empty(),
         "a cancelled run writes no project"
     );
     let staged = staged_composites(&cwd);

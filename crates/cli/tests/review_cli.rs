@@ -674,7 +674,7 @@ fn an_unopenable_project_is_a_failed_record() {
         2,
         None,
     );
-    let truncated = dir.join("truncated.ffproj");
+    let truncated = dir.join("truncated.ffp");
     let bytes = std::fs::read(&good_project).unwrap();
     std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
 

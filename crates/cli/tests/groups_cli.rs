@@ -176,7 +176,7 @@ fn single_stack_directory_matches_the_plain_invocation() {
     // The project is named after the **group**, and this directory's frames
     // share no basename range, so the naming rule falls back to the
     // directory's own basename.
-    let grouped = dir.join("groups_cli_single_stack.ffproj");
+    let grouped = dir.join("groups_cli_single_stack.ffp");
     let result = run_cli(&[
         "stack",
         dir.to_str().unwrap(),
@@ -351,7 +351,7 @@ fn groups_file_overrides_the_proposal() {
     )
     .unwrap();
 
-    let output = out_dir.join("everything.ffproj");
+    let output = out_dir.join("everything.ffp");
     let result = run_cli(&[
         "stack",
         dump.to_str().unwrap(),
@@ -533,8 +533,7 @@ fn status_and_manifest_have_one_entry_per_group() {
     assert_eq!(manifest["groups"][0]["frame_count"], 2);
     assert_eq!(manifest["groups"][0]["outcome"], "completed");
     assert!(
-        out_dir.join("IMG_9801-9802.ffproj").is_file()
-            && out_dir.join("IMG_9910-9911.ffproj").is_file(),
+        out_dir.join("IMG_9801-9802.ffp").is_file() && out_dir.join("IMG_9910-9911.ffp").is_file(),
         "each group's project is named after the group"
     );
 }
@@ -570,7 +569,7 @@ fn a_failing_group_does_not_abort_the_run() {
     assert!(!result.success, "one group failed, so the run exits 1");
     assert_eq!(result.code, Some(1));
     assert!(
-        out_dir.join("IMG_9801-9802.ffproj").is_file(),
+        out_dir.join("IMG_9801-9802.ffp").is_file(),
         "the healthy group must still have been written"
     );
 
@@ -767,7 +766,7 @@ fn a_one_group_run_writes_a_manifest_too() {
         result.stderr
     );
     assert!(
-        out_dir.join("mantis-512.ffproj").is_file(),
+        out_dir.join("mantis-512.ffp").is_file(),
         "the project is named after the group, which falls back to the directory basename"
     );
     assert!(

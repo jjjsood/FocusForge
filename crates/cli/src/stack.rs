@@ -2105,7 +2105,7 @@ mod tests {
             max_bytes_in_flight: 1 << 30,
             budget_provenance: Provenance::Host,
             backed_off: false,
-            outputs: vec!["mantis-512.ffproj".to_string()],
+            outputs: vec!["mantis-512.ffp".to_string()],
             wall_seconds: 1.5,
             output_width: 512,
             output_height: 512,
@@ -2149,7 +2149,7 @@ mod tests {
             "max_bytes_in_flight=1073741824",
             "budget=Host",
             "backed_off=false",
-            "wrote: mantis-512.ffproj",
+            "wrote: mantis-512.ffp",
             "wall: 1.500s",
             "backend: cpu",
             "stages:",
@@ -2306,19 +2306,19 @@ mod tests {
             format: groups::MANIFEST_FORMAT,
             root: "root".to_string(),
             groups: vec![
-                sample_manifest_entry("a", "a.ffproj"),
-                sample_manifest_entry("b", "b.ffproj"),
+                sample_manifest_entry("a", "a.ffp"),
+                sample_manifest_entry("b", "b.ffp"),
             ],
         };
         std::fs::write(&path, serde_json::to_string(&existing).unwrap()).unwrap();
 
-        let fresh = vec![sample_manifest_entry("a", "a2.ffproj")];
+        let fresh = vec![sample_manifest_entry("a", "a2.ffp")];
         let merged = merge_manifest_entries(&path, "root", fresh);
         assert_eq!(merged.len(), 2);
         let a = merged.iter().find(|e| e.identity() == "a").unwrap();
-        assert_eq!(a.outputs, vec!["a2.ffproj".to_string()]);
+        assert_eq!(a.outputs, vec!["a2.ffp".to_string()]);
         let b = merged.iter().find(|e| e.identity() == "b").unwrap();
-        assert_eq!(b.outputs, vec!["b.ffproj".to_string()]);
+        assert_eq!(b.outputs, vec!["b.ffp".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2334,11 +2334,11 @@ mod tests {
         let existing = groups::RunManifest {
             format: groups::MANIFEST_FORMAT,
             root: "other-root".to_string(),
-            groups: vec![sample_manifest_entry("a", "a.ffproj")],
+            groups: vec![sample_manifest_entry("a", "a.ffp")],
         };
         std::fs::write(&path, serde_json::to_string(&existing).unwrap()).unwrap();
 
-        let fresh = vec![sample_manifest_entry("b", "b.ffproj")];
+        let fresh = vec![sample_manifest_entry("b", "b.ffp")];
         let merged = merge_manifest_entries(&path, "root", fresh);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].identity(), "b");

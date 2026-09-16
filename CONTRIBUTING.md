@@ -6,7 +6,7 @@
 crates/core/   TIFF I/O, tiles, stacking and alignment algorithms, the
                Z-Map, the job engine (pause/resume/cancel over tile-sized
                work units), the stage cache, grouping proposals and the
-               `.ffproj` project container
+               `.ffp` project container
 crates/gpu/    the shared wgpu device, WGSL fusion/warp kernels and the
                tile-scheduler pipeline that runs them, behind the `gpu`
                feature (on by default). An allocate-and-back-off probe at
@@ -20,7 +20,7 @@ crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
                composite/Z-Map pair, and remappable keyboard/mouse
                bindings. `--open <dir>` resolves the fixed development pair
                `<dir>/golden/laplacian.tif` + `<dir>/golden/laplacian-zmap.tif`,
-               separate from the `.ffproj` container `stack` writes
+               separate from the `.ffp` container `stack` writes
 spikes/        standalone, workspace-excluded feasibility spikes
 fixtures/      small checked-in TIFF crops used by the test suite
 ```
@@ -32,7 +32,7 @@ Rust, edition 2024, toolchain pinned to `1.95.0` (`rust-toolchain.toml`).
 registration), `rayon`, `serde` and `serde_json`; `blake3` hashes project
 blobs, `zip`/`zstd` (compression backends off, `zip`'s clock feature off too,
 so two seals of the same inputs produce identical container bytes) read and
-write the `.ffproj` container, and `sysinfo` reads host memory for the
+write the `.ffp` container, and `sysinfo` reads host memory for the
 adaptive tile-scheduler budget; `focusforge-gpu` declares
 `wgpu = "29.0.4"`, gated behind its own `gpu` Cargo feature, on by default on
 both `focusforge-gpu` and `focusforge-cli` (`--no-default-features` excludes
@@ -69,7 +69,7 @@ byte-order and strip-height variants, the writer's round trip back through
 the reader, the tile scheduler's memory budget, the Z-Map reader and
 writer, each stacking algorithm's fusion output, the pyramidal ECC solver
 and its warp and auto-crop stages, the job engine's pause/resume/cancel
-control loop, the stage cache, grouping proposals and the `.ffproj` project
+control loop, the stage cache, grouping proposals and the `.ffp` project
 container's read/write round trip, and the `focusforge-cli
 stack`/`align`/`algorithms`/`export`/`review`/`cache` commands end to end,
 plus the fixture manifest. `crates/gui` has its own suite — the theme

@@ -31,7 +31,7 @@ retouching the result.
 - [`reference/tiff-fast-path.md`](reference/tiff-fast-path.md) — the TIFF
   layout the reader accepts and the writer emits
 - [`reference/project-format.md`](reference/project-format.md) — the
-  `.ffproj` project container `stack` writes and `export`/`review` read
+  `.ffp` project container `stack` writes and `export`/`review` read
 
 Building from source, the repository layout and the test suite are in
 [`../CONTRIBUTING.md`](../CONTRIBUTING.md), not here — this tree is for using

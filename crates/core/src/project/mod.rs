@@ -5,7 +5,7 @@
 //! A project is a zip holding exactly three kinds of entry:
 //!
 //! ```text
-//! $ unzip -l mantis-512.ffproj        # a real run over fixtures/mantis-512
+//! $ unzip -l mantis-512.ffp        # a real run over fixtures/mantis-512
 //!   Length      Date    Time    Name
 //! ---------  ---------- -----   ----
 //!      3804  1980-01-01 00:00   manifest.json
@@ -82,7 +82,7 @@ use crate::tile::Rect;
 pub const FORMAT_VERSION: u32 = 1;
 
 /// The project file's extension.
-pub const PROJECT_EXTENSION: &str = "ffproj";
+pub const PROJECT_EXTENSION: &str = "ffp";
 
 /// The content-hash algorithm, named in every manifest rather than implied.
 pub const HASH_ALGORITHM: &str = "blake3";

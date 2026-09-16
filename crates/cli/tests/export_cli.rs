@@ -51,7 +51,7 @@ fn only_project(dir: &Path) -> PathBuf {
         .unwrap()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "ffproj"))
+        .filter(|p| p.extension().is_some_and(|e| e == "ffp"))
         .collect();
     assert_eq!(found.len(), 1, "exactly one project expected in {dir:?}");
     found.pop().unwrap()

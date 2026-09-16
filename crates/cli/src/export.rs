@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn render_names_every_fact_one_per_line() {
         let text = render(&ExportReport {
-            project: "demo.ffproj".to_string(),
+            project: "demo.ffp".to_string(),
             wrote: vec!["out.tif".to_string(), "out-zmap.tif".to_string()],
             unresolved_sources: vec!["/elsewhere/00.tif".to_string()],
             width: 512,
@@ -275,7 +275,7 @@ mod tests {
             wall_seconds: 0.25,
         });
         for needle in [
-            "demo.ffproj",
+            "demo.ffp",
             "512x512",
             "3ch",
             "8 frames",
