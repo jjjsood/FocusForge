@@ -466,8 +466,8 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
     let cwd = common::tmp_dir("cli_gpu_max_vram_cwd");
     let dir = common::tmp_dir("cli_gpu_max_vram");
 
-    let probed_out = out_dir(&dir, "probed");
-    let probed = run_owned(&cwd, &max_vram_stack_args(&probed_out, &[]));
+    let probed_dir = out_dir(&dir, "probed");
+    let probed = run_owned(&cwd, &max_vram_stack_args(&probed_dir, &[]));
     assert!(probed.success, "stderr: {}", probed.stderr);
     let probed_report: serde_json::Value =
         serde_json::from_str(&probed.stdout).expect("--json must parse");
@@ -490,10 +490,10 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
         ceiling < probed_bytes,
         "fixture assumption: probed budget ({probed_bytes}) must exceed the 256MiB ceiling used below"
     );
-    let low_out = out_dir(&dir, "low");
+    let low_dir = out_dir(&dir, "low");
     let low = run_owned(
         &cwd,
-        &max_vram_stack_args(&low_out, &["--max-vram", "256MiB"]),
+        &max_vram_stack_args(&low_dir, &["--max-vram", "256MiB"]),
     );
     assert!(low.success, "stderr: {}", low.stderr);
     let low_report: serde_json::Value =
@@ -508,10 +508,10 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
     );
 
     // A ceiling above the probed value changes nothing, provenance included.
-    let high_out = out_dir(&dir, "high");
+    let high_dir = out_dir(&dir, "high");
     let high = run_owned(
         &cwd,
-        &max_vram_stack_args(&high_out, &["--max-vram", "64GiB"]),
+        &max_vram_stack_args(&high_dir, &["--max-vram", "64GiB"]),
     );
     assert!(high.success, "stderr: {}", high.stderr);
     let high_report: serde_json::Value =
@@ -526,8 +526,8 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
     );
 
     // CPU path: both fields null.
-    let cpu_out = out_dir(&dir, "cpu");
-    let cpu = run_owned(&cwd, &max_vram_stack_args(&cpu_out, &["--no-gpu"]));
+    let cpu_dir = out_dir(&dir, "cpu");
+    let cpu = run_owned(&cwd, &max_vram_stack_args(&cpu_dir, &["--no-gpu"]));
     assert!(cpu.success, "stderr: {}", cpu.stderr);
     let cpu_report: serde_json::Value =
         serde_json::from_str(&cpu.stdout).expect("--json must parse");
@@ -552,8 +552,8 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
     let dir = common::tmp_dir("cli_gpu_device_peak_in_flight");
 
     // Uncapped GPU run.
-    let uncapped_out = out_dir(&dir, "uncapped");
-    let uncapped = run_owned(&cwd, &max_vram_stack_args(&uncapped_out, &[]));
+    let uncapped_dir = out_dir(&dir, "uncapped");
+    let uncapped = run_owned(&cwd, &max_vram_stack_args(&uncapped_dir, &[]));
     assert!(uncapped.success, "stderr: {}", uncapped.stderr);
     let uncapped_report: serde_json::Value =
         serde_json::from_str(&uncapped.stdout).expect("--json must parse");
@@ -576,10 +576,10 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
     // `--max-vram 1MiB` floors the device gate at exactly one tile, on any
     // machine, without touching the host-side `in_flight_limit` (one
     // tile's device footprint on this fixture is 254 661 632 bytes).
-    let capped_out = out_dir(&dir, "capped");
+    let capped_dir = out_dir(&dir, "capped");
     let capped = run_owned(
         &cwd,
-        &max_vram_stack_args(&capped_out, &["--max-vram", "1MiB"]),
+        &max_vram_stack_args(&capped_dir, &["--max-vram", "1MiB"]),
     );
     assert!(capped.success, "stderr: {}", capped.stderr);
     let capped_report: serde_json::Value =
@@ -594,8 +594,8 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
     );
 
     // `--no-gpu`: the field is null.
-    let cpu_out = out_dir(&dir, "cpu");
-    let cpu = run_owned(&cwd, &max_vram_stack_args(&cpu_out, &["--no-gpu"]));
+    let cpu_dir = out_dir(&dir, "cpu");
+    let cpu = run_owned(&cwd, &max_vram_stack_args(&cpu_dir, &["--no-gpu"]));
     assert!(cpu.success, "stderr: {}", cpu.stderr);
     let cpu_report: serde_json::Value =
         serde_json::from_str(&cpu.stdout).expect("--json must parse");
