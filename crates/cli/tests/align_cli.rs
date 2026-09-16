@@ -191,6 +191,8 @@ fn align_json_schema_is_stable() {
         "wall_seconds",
         "stages",
         "align_source",
+        "align_workers",
+        "peak_align_workers",
     ] {
         assert!(report.get(key).is_some(), "missing key {key:?} in {report}");
     }
@@ -242,6 +244,40 @@ fn align_json_schema_is_stable() {
         report["crop"].is_object(),
         "crop must be a non-null object for this fixture"
     );
+}
+
+/// The anchor arm's worker bound and the peak it actually reached land on
+/// the frozen `align --json` report, additively, alongside every key
+/// `align_json_schema_is_stable` already pins.
+#[test]
+fn worker_limit_in_report() {
+    let out = run_cli(&[
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--json",
+    ]);
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    // 8-frame fixture: 7 registrations, so the bound is capped there on any
+    // host with >= 7 cores.
+    let ceiling = available.min(7) as u64;
+
+    for key in ["align_workers", "peak_align_workers"] {
+        let value = report[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{key} must be a number: {report}"));
+        assert!(
+            (1..=ceiling).contains(&value),
+            "{key}={value} must be in 1..={ceiling}: {report}"
+        );
+    }
 }
 
 /// Structural, not magnitude-based: `mode=translation` moves only 2 degrees

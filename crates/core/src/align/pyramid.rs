@@ -12,13 +12,10 @@
 //!
 //! # Residency
 //!
-//! A pairwise
-//! registration holds exactly two frames' pyramids live, level 0 included --
-//! 179 MB per frame at level 0 (8192 x 5464 `f32`) plus 59.7 MB for levels
-//! 1..N, **477 MB steady-state for the pair** (corrected: an earlier figure
-//! of 358 MB for the pair contradicted its own components, 179 +
-//! 59.7 per frame is 238.7, and the pair is 477.4). The **transient** peak is
-//! higher still, ~622 MB, with the assembler's own buffer and
+//! A pairwise registration holds exactly two frames' pyramids live, level 0
+//! included -- 179 MB per frame at level 0 (8192 x 5464 `f32`) plus 59.7 MB
+//! for levels 1..N, **477 MB steady-state for the pair**. The **transient**
+//! peak is higher still, ~622 MB, with the assembler's own buffer and
 //! [`Plane::from_f32`]'s copy of it also live for one frame at a time --
 //! [`crate::align::driver::bytes_per_registration`] is the one place that
 //! full figure is computed, term by term. Levels are streamed in from tiles

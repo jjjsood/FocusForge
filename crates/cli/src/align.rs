@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use focusforge_core::algorithm::{AlignAlgorithm, TileReader};
 use focusforge_core::align::{
-    FailurePolicy, ReferencePolicy, StackAlignment, Transform, WarpingReader, align_stack,
-    auto_crop,
+    AlignDriverOptions, FailurePolicy, ReferencePolicy, StackAlignment, Transform, WarpingReader,
+    align_stack_with, auto_crop,
 };
 use focusforge_core::gpu::TileBackend;
 use focusforge_core::io::{TiffSpec, TiffStack, TiffWriter, frame_paths};
@@ -100,6 +100,11 @@ pub struct AlignReport {
     /// no `--no-align`. Present so `align --json` and `stack --json` report
     /// their `align` stage the same way.
     pub align_source: String,
+    /// The anchor arm's worker bound and the peak it reached: always `Some`
+    /// here. `Option` so the key has one type in `align --json` and
+    /// `stack --json`.
+    pub align_workers: Option<usize>,
+    pub peak_align_workers: Option<usize>,
 }
 
 /// One frame's row in [`AlignReport::alignments`]: `#[serde(flatten)]`ed
@@ -257,10 +262,18 @@ pub fn run(
     };
     timer.mark(Stage::Setup);
     renderer.stage(&format!("align {} frames (no unit progress)", stack.len()));
-    let alignment = match align_stack(algo, stack_ctx, &stack, &values, policy) {
-        Ok(alignment) => alignment,
+    let run = match align_stack_with(
+        algo,
+        stack_ctx,
+        &stack,
+        &values,
+        policy,
+        &AlignDriverOptions::default(),
+    ) {
+        Ok(run) => run,
         Err(err) => return sink.fail(err),
     };
+    let alignment = run.alignment;
     let crop = match auto_crop(&alignment, (width, height)) {
         Ok(crop) => crop,
         Err(err) => return sink.fail(err),
@@ -325,6 +338,8 @@ pub fn run(
         // `align` has no `--resume`, no stage cache and no `--no-align`:
         // every run reaches this line by computing.
         align_source: "computed".to_string(),
+        align_workers: Some(run.worker_limit),
+        peak_align_workers: Some(run.peak_workers),
     };
 
     if json {
@@ -566,15 +581,23 @@ pub(crate) fn render(report: &AlignReport) -> String {
         )),
         None => lines.push("auto-crop: empty (frame footprints do not intersect)".to_string()),
     }
-    // `align --json` prints no whole-run wall figure today (unlike
-    // `stack`'s `wall:` line), so this line carries the total as a trailing
-    // `(wall …)` rather than adding a second, redundant top-level line.
+    // The total rides the `stages:` line as `(wall …)`, and `workers=`/`peak=`
+    // ride it too: that line already varies run to run, so every other stdout
+    // line stays deterministic.
     lines.push(format!(
-        "stages: {} {} {} {} (wall {:.3}s)",
+        "stages: {} {} {} {} workers={} peak={} (wall {:.3}s)",
         crate::stack::stage_fact("setup", report.stages.setup),
         crate::stack::stage_fact("align", report.stages.align),
         crate::stack::stage_fact("warp_write", report.stages.warp_write),
         crate::stack::stage_fact("finalize", report.stages.finalize),
+        report
+            .align_workers
+            .map(|w| w.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        report
+            .peak_align_workers
+            .map(|w| w.to_string())
+            .unwrap_or_else(|| "?".to_string()),
         report.wall_seconds,
     ));
     lines.join("\n")

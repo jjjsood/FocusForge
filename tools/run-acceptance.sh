@@ -362,7 +362,7 @@ try:
 except Exception as exc:
     print("(could not parse " + sys.argv[1] + ": " + str(exc) + ")")
     sys.exit(0)
-for key in ("wall_seconds", "tiles", "frame_tiles_read", "in_flight_limit", "peak_in_flight"):
+for key in ("wall_seconds", "tiles", "frame_tiles_read", "in_flight_limit", "peak_in_flight", "align_workers", "peak_align_workers"):
     print(key + "=" + str(d.get(key)))
 stages = d.get("stages", {})
 for key in ("setup", "align", "fuse", "finalize"):
@@ -385,8 +385,11 @@ for e in alignments:
     max_drift = max(max_drift, drift)
 print("align-" + sys.argv[2] + ": frame_count=" + str(d.get("frame_count"))
       + " failure_count=" + str(d.get("failure_count"))
-      + " max_translation=" + str(round(max_drift, 2)))
+      + " max_translation=" + str(round(max_drift, 2))
+      + " align_workers=" + str(d.get("align_workers"))
+      + " peak_align_workers=" + str(d.get("peak_align_workers")))
 ' "$out/align-$mode.json" "$mode"
+      grep -E 'Maximum resident set size' "$out/align-$mode-time-v.txt" 2>/dev/null || true
     fi
   done
   grep -E 'Maximum resident set size|Elapsed \(wall clock\) time' "$out/time-v.txt" 2>/dev/null || true

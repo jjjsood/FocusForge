@@ -249,7 +249,13 @@ work happened. Additive field `align_source`: how the `align` stage's number
 was produced — `"computed"` (a real solve), `"cached"` (a stage-cache hit),
 `"resumed"` (a `--resume` ledger peek) or `"skipped"` (`--no-align`) — because
 a cache hit or a resume enters the stage and reports a small real number that
-is not "alignment took 10ms".
+is not "alignment took 10ms". Additive fields `align_workers`/`peak_align_workers`:
+the anchor arm's worker bound and the peak it actually reached -- numbers only
+when `align_source == "computed"`, `null` otherwise. A `"cached"`, `"resumed"`
+or `"skipped"` run never runs the alignment driver itself, so it has no
+worker count of its own; reporting one from a previous run's cache entry
+would be a fabricated number, exactly the confusion `align_source` exists to
+prevent.
 
 ```json
 {
@@ -273,7 +279,9 @@ is not "alignment took 10ms".
   "wall_seconds": 0.030267391,
   "backend": "cpu",
   "stages": { "setup": 0.001, "align": 0.012, "fuse": 0.016, "warp_write": null, "finalize": 0.001 },
-  "align_source": "computed"
+  "align_source": "computed",
+  "align_workers": 2,
+  "peak_align_workers": 2
 }
 ```
 
@@ -336,7 +344,10 @@ stages sum to `wall_seconds` exactly, the same contiguous-and-disjoint
 contract `stack --json` documents. Additive field `align_source`: always
 `"computed"` for `align` (no `--resume`, no stage cache, no `--no-align`
 here), carried so a consumer reading both reports' `align` stage does not
-need to know which command produced it.
+need to know which command produced it. Additive fields
+`align_workers`/`peak_align_workers`: the anchor arm's worker bound and the
+peak it actually reached (chain mode always reports `1`/`1` -- it is serial
+by construction) -- always numbers here, since every `align` run computes.
 
 ```json
 {
@@ -373,7 +384,9 @@ need to know which command produced it.
   "warped_dir": null,
   "wall_seconds": 8.497,
   "stages": { "setup": 0.021, "align": 8.401, "fuse": null, "warp_write": null, "finalize": 0.075 },
-  "align_source": "computed"
+  "align_source": "computed",
+  "align_workers": 2,
+  "peak_align_workers": 2
 }
 ```
 

@@ -25,7 +25,9 @@ mod warp_reader;
 
 pub use crop::{auto_crop, crop_rect};
 pub use driver::{
-    FailurePolicy, FrameAlignment, ReferenceFrame, ReferencePolicy, StackAlignment, align_stack,
+    AlignDriverOptions, AlignRun, DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT, FailurePolicy, FrameAlignment,
+    ReferenceFrame, ReferencePolicy, StackAlignment, align_stack, align_stack_with,
+    bytes_per_registration,
 };
 pub use ecc::{
     DivergenceReason, EccIteration, EccMode, EccParams, EccResult, EccStatus, solve_level,

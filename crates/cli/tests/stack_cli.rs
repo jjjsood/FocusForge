@@ -612,6 +612,8 @@ fn report_json_has_every_field() {
         "outputs",
         "wall_seconds",
         "stages",
+        "align_workers",
+        "peak_align_workers",
     ] {
         assert!(report.get(key).is_some(), "missing key {key:?} in {report}");
     }
@@ -753,6 +755,61 @@ fn stage_timings_mark_a_skipped_align_as_not_entered() {
         report["align_source"], "skipped",
         "must name the skip rather than leave the null unexplained: {report}"
     );
+}
+
+/// `align_workers`/`peak_align_workers` are numbers only when
+/// `align_source == "computed"` -- a cached, resumed or `--no-align` run
+/// never earns a worker count it did not spend.
+#[test]
+fn align_worker_fields_follow_align_source() {
+    let dir = tmp_dir("align_worker_fields_follow_align_source");
+    let output = dir.join("mantis-512.ffproj");
+    let computed = run_cli(&[
+        "stack",
+        mantis_512_dir().to_str().unwrap(),
+        "-o",
+        output.parent().unwrap().to_str().unwrap(),
+        "--algo",
+        "dummy-stack",
+        "--align-algo",
+        "dummy-align",
+        "--no-crop",
+        "--no-cache",
+        "--json",
+    ]);
+    assert!(computed.success, "stderr: {}", computed.stderr);
+    let report: serde_json::Value = serde_json::from_str(&computed.stdout).expect("valid JSON");
+    assert_eq!(report["align_source"], "computed");
+    for key in ["align_workers", "peak_align_workers"] {
+        assert!(
+            report[key].is_number(),
+            "{key} must be a number when align_source == \"computed\": {report}"
+        );
+    }
+
+    let skipped = run_cli(&[
+        "stack",
+        mantis_512_dir().to_str().unwrap(),
+        "-o",
+        tmp_dir("align_worker_fields_follow_align_source_skipped")
+            .to_str()
+            .unwrap(),
+        "--algo",
+        "dummy-stack",
+        "--no-align",
+        "--no-crop",
+        "--json",
+    ]);
+    assert!(skipped.success, "stderr: {}", skipped.stderr);
+    let report: serde_json::Value = serde_json::from_str(&skipped.stdout).expect("valid JSON");
+    assert_eq!(report["align_source"], "skipped");
+    for key in ["align_workers", "peak_align_workers"] {
+        assert_eq!(
+            report[key],
+            serde_json::Value::Null,
+            "{key} must be null under --no-align: {report}"
+        );
+    }
 }
 
 /// The instrumentation does not perturb the output: two runs of the same

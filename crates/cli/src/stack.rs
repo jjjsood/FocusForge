@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use focusforge_core::algorithm::{AlignStatus, StackAlgorithm};
 use focusforge_core::align::{
-    FrameAlignment, ReferencePolicy, StackAlignment, Transform, WarpingReader, align_stack,
-    auto_crop,
+    AlignDriverOptions, FrameAlignment, ReferencePolicy, StackAlignment, Transform, WarpingReader,
+    align_stack_with, auto_crop,
 };
 use focusforge_core::fuse::{
     BackendFusionConsumer, FusionConsumer, FusionGeometry,
@@ -97,6 +97,14 @@ pub struct StackReport {
     /// -- so this field, not that one, is what a later run compares before
     /// reading a stage number as a real cost. Additive field.
     pub align_source: String,
+    /// The anchor arm's worker bound and the peak it actually reached --
+    /// `None` unless `align_source == "computed"`. A `"cached"`, `"resumed"`
+    /// or `"skipped"` run never calls `align_stack_with`, so it has no
+    /// worker count of its own; reporting one from a previous run's cache
+    /// entry would be a fabricated number, exactly the confusion
+    /// `align_source` exists to prevent. Additive fields.
+    pub align_workers: Option<usize>,
+    pub peak_align_workers: Option<usize>,
 }
 
 /// `stack --json`'s `align` field: `null` when `--no-align` was given.
@@ -868,6 +876,10 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // non-`--no-align` path is taken; stays `"skipped"` only when
     // `align_prepared` is `None`.
     let mut align_source = "skipped".to_string();
+    // `Some` only in the "computed" arm below -- a cached, resumed or
+    // skipped alignment never earns a worker count.
+    let mut align_workers: Option<usize> = None;
+    let mut peak_align_workers: Option<usize> = None;
 
     // Step 8.5a: *resolving* the alignment algorithm and its parameters is
     // pure -- registry lookup, `--align-set`/`[align]` validation, `auto`
@@ -1078,7 +1090,14 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                             }
                         }
                     });
-                    let result = align_stack(align_algo, stack_ctx, &stack, &align_values, policy);
+                    let result = align_stack_with(
+                        align_algo,
+                        stack_ctx,
+                        &stack,
+                        &align_values,
+                        policy,
+                        &AlignDriverOptions::default(),
+                    );
                     done.store(true, Ordering::SeqCst);
                     watcher.join().expect("align watcher thread must not panic");
                     result
@@ -1086,10 +1105,13 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 if signals.cancel.load(Ordering::SeqCst) {
                     return cancelled(&status, start);
                 }
-                let result = match solved {
+                let run = match solved {
                     Ok(r) => r,
                     Err(err) => return failed(&status, start, err),
                 };
+                align_workers = Some(run.worker_limit);
+                peak_align_workers = Some(run.peak_workers);
+                let result = run.alignment;
                 if !align_opts.lax && result.failure_count() > 0 {
                     let names: Vec<String> = result
                         .failed()
@@ -1584,6 +1606,8 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         align_cached,
         stages,
         align_source,
+        align_workers,
+        peak_align_workers,
     };
 
     GroupResult::Completed(Box::new(report))
@@ -1834,12 +1858,23 @@ fn render(report: &StackReport) -> String {
         lines.push(format!("wrote: {output}"));
     }
     lines.push(format!("wall: {:.3}s", report.wall_seconds));
+    // `workers=<limit> peak=<peak>` rides the existing `stages:` line, for
+    // symmetry with `crate::align::render` -- both `?` unless the align
+    // stage was actually computed.
     lines.push(format!(
-        "stages: {} {} {} {}",
+        "stages: {} {} {} {} workers={} peak={}",
         stage_fact("setup", report.stages.setup),
         stage_fact("align", report.stages.align),
         stage_fact("fuse", report.stages.fuse),
         stage_fact("finalize", report.stages.finalize),
+        report
+            .align_workers
+            .map(|w| w.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        report
+            .peak_align_workers
+            .map(|w| w.to_string())
+            .unwrap_or_else(|| "?".to_string()),
     ));
     lines.join("\n")
 }
@@ -1955,6 +1990,8 @@ mod tests {
                 finalize: Some(0.038),
             },
             align_source: "computed".to_string(),
+            align_workers: Some(3),
+            peak_align_workers: Some(3),
         }
     }
 
