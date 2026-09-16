@@ -63,6 +63,11 @@ pub fn repaint(
         (controller.pane_draw(), controller.zoom_readout())
     };
     app.set_zoom_readout(readout.into());
+    // `pane_draw()` is `Some` only once a project's image and pane geometry
+    // are both known -- exactly "is there anything to show chrome for":
+    // without this flag the pane labels/undock controls and the zoom
+    // cluster render as if live with nothing loaded.
+    app.set_project_loaded(draw.is_some());
 
     let Some(draw) = draw else {
         return;

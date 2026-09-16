@@ -179,6 +179,9 @@ fn pane_chrome_geometry() {
     });
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    // The label and undock control are hidden until a project is open --
+    // see `pane_chrome_hidden_without_a_project` for the default (`false`) case.
+    app.set_project_loaded(true);
 
     for pane in ["pane-left", "pane-right"] {
         let pane_handle = ElementQuery::from_root(&app)
@@ -221,6 +224,36 @@ fn pane_chrome_geometry() {
             (undock_size.width - 26.0).abs() < GEOMETRY_EPS
                 && (undock_size.height - 22.0).abs() < GEOMETRY_EPS,
             "{pane}: undock size {undock_size:?}, expected 26x22"
+        );
+    }
+}
+
+/// Before a project is open there is nothing for a pane label to name or
+/// for an undock control to undock, so both are hidden rather than drawn
+/// over an empty pane.
+/// `project-loaded` defaults to `false`, matching every window that has not
+/// yet run `bridge::repaint` -- see `src/bridge.rs::repaint`.
+#[test]
+fn pane_chrome_hidden_without_a_project() {
+    thread_local! {
+        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    INIT.with(|done| {
+        if !done.get() {
+            i_slint_backend_testing::init_no_event_loop();
+            done.set(true);
+        }
+    });
+    let app = AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+
+    for id in ["FFPane::pane-label", "FFPane::pane-undock"] {
+        assert!(
+            ElementQuery::from_root(&app)
+                .match_id(id)
+                .find_all()
+                .is_empty(),
+            "{id}: must be hidden while no project is open"
         );
     }
 }

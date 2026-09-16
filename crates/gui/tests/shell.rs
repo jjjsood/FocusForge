@@ -191,11 +191,10 @@ fn checkpoint_panel_touches_no_storage() {
 }
 
 /// The zoom cluster sits at the bottom bar's right end, 216 x 32,
-/// mirroring the gear's `Theme.space-3` inset at the left. It groups
-/// zoom-out/readout/zoom-in into one shared rounded surface (`zoom-group`,
-/// 120 px, no internal gaps) so they read as one control, with `Fit` kept
-/// visually separate by a full `Theme.space-4` (16 px) gap, and every icon
-/// button sized `Theme.icon-md + 2 * Theme.space-2` (32 px).
+/// mirroring the gear's `Theme.space-3` inset at the left. Zoom-out,
+/// readout and zoom-in share one rounded surface (`zoom-group`, 120 px, no
+/// internal gaps), with `Fit` kept visually separate by a full
+/// `Theme.space-4` (16 px) gap.
 #[test]
 fn zoom_cluster_sits_at_the_bottom_bar_right_end() {
     let app = app_at(1440, 900);
@@ -204,10 +203,10 @@ fn zoom_cluster_sits_at_the_bottom_bar_right_end() {
         &app,
         "FFBottomBar::zoom-cluster",
         (
-            1440.0 - 12.0 - 200.0,
-            856.0 + (44.0 - 26.0) / 2.0,
-            200.0,
-            26.0,
+            1440.0 - 12.0 - 216.0,
+            856.0 + (44.0 - 32.0) / 2.0,
+            216.0,
+            32.0,
         ),
     );
 
@@ -223,6 +222,45 @@ fn zoom_cluster_sits_at_the_bottom_bar_right_end() {
         !code.contains("FFZoomCluster") && !code.contains("zoom-in") && !code.contains("zoom-out"),
         "ui/shell/canvas.slint must declare no zoom control of its own"
     );
+}
+
+/// Before a project is open there is no viewport to zoom or fit, so the
+/// whole cluster -- not just the readout text -- is greyed and inert:
+/// greying the readout alone would leave the buttons looking live.
+#[test]
+fn zoom_cluster_is_disabled_without_a_project() {
+    let app = app_at(1440, 900);
+
+    for id in [
+        "FFZoomCluster::zoom-out",
+        "FFZoomCluster::zoom-in",
+        "FFZoomCluster::zoom-fit",
+    ] {
+        let handle = ElementQuery::from_root(&app)
+            .match_id(id)
+            .find_first()
+            .unwrap_or_else(|| panic!("no element matched id {id:?}"));
+        assert_eq!(
+            handle.accessible_enabled(),
+            Some(false),
+            "{id}: must be disabled while no project is open"
+        );
+    }
+}
+
+/// With no project open `zoom-readout` is bound from an empty Rust string
+/// (`AppController::zoom_readout`); the cluster shows an em dash rather
+/// than a blank gap so the readout still reads as a real, if inert, part
+/// of the control.
+#[test]
+fn zoom_readout_shows_a_dash_without_a_project() {
+    let app = app_at(1440, 900);
+
+    let readout = ElementQuery::from_root(&app)
+        .match_id("FFZoomCluster::zoom-readout")
+        .find_first()
+        .expect("no element matched id \"FFZoomCluster::zoom-readout\"");
+    assert_eq!(readout.accessible_label().as_deref(), Some("—"));
 }
 
 /// The maximise glyph must look different maximised than not.
