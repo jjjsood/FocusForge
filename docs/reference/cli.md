@@ -181,7 +181,6 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | `--only <ID>` | run only the named result(s), repeatable; every unselected group is skipped, its project left untouched |
 | `--no-align` | skip alignment: frame tiles are fused unwarped and the output stays full-frame |
 | `--no-crop` | skip the auto-crop: the output stays at the full frame extent even with alignment on |
-| `--lax` | soften alignment failures to an identity fallback instead of refusing the run |
 | `--align-algo <ALGO>` | alignment algorithm id; optional, defaults to the sole registered alignment algorithm |
 | `--align-set <KEY=VALUE>` | set one alignment parameter, repeatable; separate from `--set`, which is the stacking algorithm's own |
 | `--resume` | resume a previously cancelled run of this same stack, found by fingerprint under `.scratch/resume/` |
@@ -210,10 +209,9 @@ unknown `--algo` id or a `--set` value that fails the algorithm's own
 parameter schema (unknown key, out-of-range value, an enum value that does
 not name a declared variant) is reported and the command exits 1 without
 opening a single frame. A frame that fails to register is a refusal too,
-naming every failed frame, exit 1 — `--lax` softens that to an identity
-fallback. An empty auto-crop (the frames' footprints do not intersect) is
-refused before any output file is created, naming `--no-crop` as the way
-through.
+naming every failed frame, exit 1. An empty auto-crop (the frames' footprints
+do not intersect) is refused before any output file is created, naming
+`--no-crop` as the way through.
 
 **GPU use is automatic, never an opt-in flag.** The GPU path is compiled in
 by default, and `stack` uses a usable GPU adapter automatically for the
@@ -384,8 +382,9 @@ prevent.
 }
 ```
 
-This run used `--lax`, which is why `align.failure_count` is nonzero and
-one alignment's `status` is `"diverged"` yet the run still completed — see
+This run softened alignment failures to an identity fallback, which is why
+`align.failure_count` is nonzero and one alignment's `status` is
+`"diverged"` yet the run still completed — see
 [`guide/alignment.md`](../guide/alignment.md#failure-is-strict-by-default).
 
 ## `align`
@@ -404,7 +403,6 @@ Options:
 |---|---|
 | `--algo <ALGO>` | registered alignment algorithm id; optional, defaults to the sole registered one |
 | `--json` | emit the frozen JSON report instead of human-readable text |
-| `--lax` | soften a failed frame to an identity fallback and exit 0, reporting the failure count on stderr, instead of refusing the run |
 | `--write-warped <DIR>` | write one warped TIFF per frame into `<DIR>`, at source dimensions, uncropped |
 | `--set <KEY=VALUE>` | set one algorithm parameter, repeatable; a repeated key keeps the last value |
 | `--quiet` | print no progress at all (`align` has one stage line to suppress; it has no per-tile units to count) |
