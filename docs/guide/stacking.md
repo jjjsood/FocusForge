@@ -1,22 +1,38 @@
 # Stacking a folder of frames
 
 `focusforge-cli stack` fuses a directory of TIFF frames — the same shape
-`focusforge-cli info` inspects — into one composite through a chosen
-algorithm.
+`focusforge-cli info` inspects — into a **project**, through a chosen
+algorithm. A run prepares a project for review; it does not write an image
+file. `focusforge-cli export` does that, as a separate step.
 
 ```bash
-focusforge-cli stack path/to/frames/ -o out.tif --algo laplacian
+focusforge-cli stack path/to/frames/ --algo laplacian
 ```
 
 `path/to/frames/` is read non-recursively, or from a `frames/` subdirectory
 of it when one exists. `--algo` picks the algorithm; see
 [`reference/cli.md`](../reference/cli.md#algorithms) for the full list and
-[`reference/cli.md`](../reference/cli.md#stack) for every flag.
+[`reference/cli.md`](../reference/cli.md#stack) for every flag. The project
+is written beside the frames as `<dir>/<dir-name>.ffproj`, or collected into
+a directory named with `-o`/`--output` — see
+[`guide/batch-runs.md`](batch-runs.md) for a folder holding more than one
+stack.
 
 Before fusing, `stack` aligns the frames and crops the output to the region
 every one of them covers — both on by default. See
 [`guide/alignment.md`](alignment.md) for how that stage works and how to
 turn it off.
+
+## Getting an image back
+
+```bash
+focusforge-cli export path/to/frames/frames.ffproj -o out.tif --zmap zmap.tif
+```
+
+`export` reads a project and writes the composite (`-o`), the Z-Map
+(`--zmap`), or both in one invocation — at least one of the two is required.
+The composite it writes is byte-identical to the plane the `stack` run
+produced.
 
 ## Choosing an algorithm
 
@@ -40,11 +56,13 @@ range, and its default.
 
 ## Getting the Z-Map
 
-Pass `--zmap` to also write a Z-Map — a single-channel 16-bit TIFF naming,
-per pixel, which source frame contributed:
+Every project already carries its Z-Map — a single-channel 16-bit TIFF
+naming, per pixel, which source frame contributed. Pass `--zmap` to `export`
+to write it out:
 
 ```bash
-focusforge-cli stack path/to/frames/ -o out.tif --algo depth-map --zmap zmap.tif
+focusforge-cli stack path/to/frames/ --algo depth-map
+focusforge-cli export path/to/frames/frames.ffproj --zmap zmap.tif
 ```
 
 ## Using the GPU
@@ -65,10 +83,10 @@ Every GPU kernel produces the same result as its CPU counterpart, to within
 ## Reading the result
 
 ```bash
-focusforge-cli stack path/to/frames/ -o out.tif --algo laplacian --json
+focusforge-cli stack path/to/frames/ --algo laplacian --json
 ```
 
 `--json` reports the frames that were read, the resolved algorithm and
 parameters (with where each value came from), the tile geometry the run
-planned, and the paths written — see
+planned, and the project path written — see
 [`reference/cli.md`](../reference/cli.md#--json-1) for the full schema.

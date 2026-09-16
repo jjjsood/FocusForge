@@ -29,9 +29,9 @@ optimized, in `[-1, 1]`, not a pixel distance. The last line is the
 auto-crop rectangle `stack` would apply: the largest axis-aligned rectangle
 that every warped frame actually covers.
 
-On the 61-frame reference macro stack this project is developed against,
-alignment recovers up to 159 px of drift in translation-only mode, and up to
-199 px when frames also breathe in scale and rotation.
+On a 61-frame macro stack, alignment recovers up to 159 px of drift in
+translation-only mode, and up to 199 px when frames also breathe in scale
+and rotation.
 
 ## Choosing a mode
 
@@ -72,7 +72,7 @@ would cut is still visible for inspection.
 ## Skipping it
 
 ```bash
-focusforge-cli stack path/to/frames/ -o out.tif --algo laplacian --no-align
+focusforge-cli stack path/to/frames/ --algo laplacian --no-align
 ```
 
 `--no-align` fuses the raw frames unwarped; `--no-crop` keeps alignment on

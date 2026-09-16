@@ -1,11 +1,22 @@
 # CLI reference
 
-`focusforge-cli` is the headless interface to FocusForge. Every algorithm is
-reachable here before any GUI control exists.
+`focusforge-cli` is the headless interface to FocusForge. Every algorithm,
+and every batch-run control (grouping, presets, resume, review, the stage
+cache), is reachable here.
 
 ```
 focusforge-cli <COMMAND>
 ```
+
+| command | does |
+|---|---|
+| [`info`](#info) | prints TIFF metadata for a file or a directory of frames |
+| [`algorithms`](#algorithms) | lists registered algorithms, or prints one's full parameter schema |
+| [`stack`](#stack) | fuses a directory's frames into one project per detected stack |
+| [`export`](#export) | turns a project into a composite and/or Z-Map TIFF |
+| [`align`](#align) | computes and reports each frame's transform, without fusing |
+| [`review`](#review) | reports one record per project found under a directory or a run's output |
+| [`cache`](#cache) | manages the stage cache under `.scratch/stage-cache/` |
 
 ## `info`
 
@@ -137,53 +148,72 @@ parse as a TIFF at all):
 ## `stack`
 
 ```
-focusforge-cli stack [OPTIONS] --output <OUTPUT> <DIR>
+focusforge-cli stack [OPTIONS] <DIR>
 ```
 
 Fuses every TIFF frame in `<DIR>` (non-recursive, descending into
-`<DIR>/frames` when that subdirectory exists) into one composite through a
-registered stacking algorithm, and writes it to `--output`. The frames are
-read tile by tile through an out-of-core scheduler bounded by a fixed memory
-budget, so the command never needs to hold a whole stack — or a whole frame
-— in RAM.
+`<DIR>/frames` when that subdirectory exists) into one **project** per
+detected stack, through a registered stacking algorithm. A run prepares
+projects for review; it does not write an image file — run
+[`export`](#export) for that. The frames are read tile by tile through an
+out-of-core scheduler bounded by a fixed memory budget, so the command never
+needs to hold a whole stack — or a whole frame — in RAM.
 
 **Alignment runs first, by default.** Before fusion, `stack` computes each
 frame's transform against a reference frame (the same solver `align` drives
 directly — see below), warps every frame tile through it, and crops the
 output to the region every frame actually covers. Both are on unless turned
-off:
+off.
+
+**Grouping runs before that.** `<DIR>` may hold more than one stack; `stack`
+proposes a split by capture time or directory structure and prints it before
+doing anything else — see [`guide/batch-runs.md`](../guide/batch-runs.md)
+for the full workflow (`--groups`, `--write-groups`, `--only`).
 
 | flag | meaning |
 |---|---|
-| `-o, --output <OUTPUT>` | composite output path (required) |
+| `-o, --output <DIR>` | directory to collect this run's projects into; omit to write each project beside its own frames |
 | `--algo <ALGO>` | registered stacking algorithm id (required; see `algorithms` below for the list) |
-| `--zmap <ZMAP>` | Z-Map output path; omitted entirely when this flag is absent |
 | `--set <KEY=VALUE>` | set one algorithm parameter, repeatable; a repeated key keeps the last value |
 | `--json` | emit the frozen JSON report instead of human-readable text |
+| `--groups <PATH>` | group the frames as this TOML file says instead of proposing a grouping |
+| `--write-groups <PATH>` | write the proposed grouping to this path in the format `--groups` reads, then carry on with the run |
+| `--only <ID>` | run only the named result(s), repeatable; every unselected group is skipped, its project left untouched |
 | `--no-align` | skip alignment: frame tiles are fused unwarped and the output stays full-frame |
 | `--no-crop` | skip the auto-crop: the output stays at the full frame extent even with alignment on |
+| `--lax` | soften alignment failures to an identity fallback instead of refusing the run |
 | `--align-algo <ALGO>` | alignment algorithm id; optional, defaults to the sole registered alignment algorithm |
 | `--align-set <KEY=VALUE>` | set one alignment parameter, repeatable; separate from `--set`, which is the stacking algorithm's own |
+| `--resume` | resume a previously cancelled run of this same stack, found by fingerprint under `.scratch/resume/` |
+| `--quiet` | print no progress at all |
+| `--tile-size <PX>` | override the scheduler's outer tile size, in pixels |
 | `--max-host-memory <SIZE>` | a **ceiling only** on the adaptive host-memory budget: it can lower the budget the host-derived estimate resolved to, never raise it. Omit it entirely to get the machine's own concurrency. Accepts suffixed sizes: `B`; `KiB`/`MiB`/`GiB`/`TiB` (1024-based); `KB`/`MB`/`GB`/`TB` (1000-based); no suffix means bytes (e.g. `8GiB`, `512MiB`, `4096`) |
 | `--max-vram <SIZE>` | a **ceiling only** on the adaptive device (VRAM) budget: it can lower the budget the startup probe settled on, never raise it. Omit it entirely to get the probed value. Same accepted sizes as `--max-host-memory`; absent when the binary was built `--no-default-features` |
+| `--preset <PATH>` | read parameter values from a TOML preset — see [`guide/batch-runs.md`](../guide/batch-runs.md#presets) |
+| `--write-preset <PATH>` | write the preset that reproduces this run |
+| `--status <PATH>` | append one NDJSON status record for this stack to this path |
+| `--dry-run` | resolve everything and print what would happen, without computing or writing anything |
 | `--no-gpu` | force the CPU path even when a usable GPU adapter is present; absent when the binary was built `--no-default-features` |
+| `--no-cache` | skip the stage cache: recompute alignment even when a valid entry exists, and leave no entry behind |
 
-Every algorithm also writes a **Z-Map** when `--zmap` is given: a
-single-channel 16-bit TIFF with one value per output pixel naming the index
-of the source frame that pixel came from. With alignment and the crop both
-on (the default), the composite and the Z-Map are declared at the crop
-rect's dimensions, not the source frame's; `--no-crop` keeps them at the
-full frame.
+Every project carries a **Z-Map**: a single-channel 16-bit TIFF, stored
+inside the project alongside the composite, with one value per output pixel
+naming the index of the source frame that pixel came from. With alignment
+and the crop both on (the default), the composite and the Z-Map are declared
+at the crop rect's dimensions, not the source frame's; `--no-crop` keeps
+them at the full frame. Run [`export`](#export) to write either one out as a
+TIFF file. See [`reference/project-format.md`](project-format.md) for the
+container itself.
 
 Refusals happen before the input directory is read where possible: an
 unknown `--algo` id or a `--set` value that fails the algorithm's own
 parameter schema (unknown key, out-of-range value, an enum value that does
 not name a declared variant) is reported and the command exits 1 without
 opening a single frame. A frame that fails to register is a refusal too,
-naming every failed frame, exit 1 — see `focusforge-cli align --help` for
-how to soften that. An empty auto-crop (the frames' footprints do not
-intersect) is refused before any output file is created, naming `--no-crop`
-as the way through.
+naming every failed frame, exit 1 — `--lax` softens that to an identity
+fallback. An empty auto-crop (the frames' footprints do not intersect) is
+refused before any output file is created, naming `--no-crop` as the way
+through.
 
 **GPU use is automatic, never an opt-in flag.** The GPU path is compiled in
 by default, and `stack` uses a usable GPU adapter automatically for the
@@ -197,28 +227,37 @@ backends changes speed, not the output; `stack --json`'s `backend` field
 names which one actually ran.
 
 ```
-$ focusforge-cli stack fixtures/mantis-64 -o .scratch/out.tif --algo laplacian --zmap .scratch/zmap.tif --no-align --no-gpu
+$ focusforge-cli stack fixtures/mantis-64 -o .scratch/out/ --algo laplacian --no-align --no-gpu --quiet
+--no-gpu given: forcing the CPU path
+grouping fixtures/mantis-64: 1 group (directory structure (no frame carries a readable capture time))
+  mantis-64  3 frames  00.tif .. 02.tif  [directory]
 fixtures/mantis-64 (3 frames)
 64x64 3ch
 laplacian - Laplacian Pyramid
 levels = 4 (Auto)
 tile_size=512 levels=4 margin=48 tiles=1 in_flight_limit=32
-max_bytes_in_flight=1073741824 budget=Host backed_off=false
+max_bytes_in_flight=20095898419 budget=Host backed_off=false
 backend: cpu
-wrote: .scratch/out.tif
-wrote: .scratch/zmap.tif
-wall: 0.047s
+wrote: .scratch/out/mantis-64.ffproj
+wall: 0.125s
+stages: setup=0.001s align=not-entered fuse=0.109s finalize=0.015s workers=? peak=?
 ```
 
-(`--no-align` keeps this example to the fusion stage the backend field is
-about; `mantis-64`'s own frames diverge under the default `pyramidal-ecc`
-alignment in strict mode, so a real run without either `--no-align` or a
-softened failure policy would refuse instead — see
+`.scratch/out/` must already exist — `-o` names an existing directory to
+collect projects into, it never creates one. (`--no-align` keeps this
+example to the fusion stage the `backend` field is about; `mantis-64`'s own
+frames diverge under the default `pyramidal-ecc` alignment in strict mode,
+so a real run without either `--no-align` or a softened failure policy
+would refuse instead — see
 [`guide/alignment.md`](../guide/alignment.md#failure-is-strict-by-default) for
 what that policy is and why it defaults to strict. `backend` reads `"cpu"`
 because this example passes `--no-gpu`; omit it on a default build with a
 usable adapter present and it instead names the adapter, for example `NVIDIA
 GeForce RTX 5070 Ti (backend=Vulkan, driver=NVIDIA, driver_info=595.84)`.)
+`--quiet` suppresses only the per-tile progress line; the run summary above
+still prints. `stages`' `workers=?`/`peak=?` here mean `--no-align` never
+entered the alignment stage at all — a real run reports numbers instead
+(see below).
 
 ### `--json`
 
@@ -283,38 +322,71 @@ prevent.
 
 ```json
 {
-  "input": "fixtures/mantis-64",
-  "frame_count": 3,
-  "frames": ["00.tif", "01.tif", "02.tif"],
-  "width": 64,
-  "height": 64,
+  "input": "fixtures/mantis-512",
+  "frame_count": 8,
+  "frames": ["00.tif", "01.tif", "..."],
+  "width": 512,
+  "height": 512,
   "samples_per_pixel": 3,
   "algorithm": "laplacian",
   "display_name": "Laplacian Pyramid",
-  "params": [{ "id": "levels", "value": 4, "provenance": "Auto" }],
+  "params": [{ "id": "levels", "value": 5, "provenance": "Auto" }],
   "tile_size": 512,
-  "levels": 4,
-  "margin": 48,
-  "tiles": 1,
-  "frame_tiles_read": 3,
+  "levels": 5,
+  "margin": 96,
+  "tiles": 4,
+  "frame_tiles_read": 32,
   "in_flight_limit": 32,
-  "peak_in_flight": 1,
-  "max_bytes_in_flight": 1073741824,
+  "peak_in_flight": 32,
+  "max_bytes_in_flight": 20381420748,
   "budget_provenance": "Host",
   "backed_off": false,
-  "outputs": [".scratch/mantis-64.ffproj"],
-  "wall_seconds": 0.030267391,
+  "outputs": [".scratch/out/mantis-512.ffproj"],
+  "wall_seconds": 13.010864322,
+  "output_width": 422,
+  "output_height": 424,
+  "crop": { "x": 31, "y": 40, "width": 422, "height": 424 },
+  "description": "FocusForge 0.1.0 align=pyramidal-ecc anchor=3 mode=rotation-scale crop=31,40,422,424 cropped=true",
+  "align": {
+    "algorithm": "pyramidal-ecc",
+    "display_name": "Pyramidal ECC",
+    "params": [{ "id": "mode", "value": "rotation-scale", "provenance": "Default" }],
+    "reference": 3,
+    "reference_policy": "anchor",
+    "failure_policy": "lax",
+    "failure_count": 3,
+    "alignments": [
+      {
+        "frame": 2,
+        "name": "02.tif",
+        "transform": { "m": [[1.0239, 0.0021, 45.03], [-0.0021, 1.0239, -37.77], [0.0, 0.0, 1.0]] },
+        "status": "converged",
+        "iterations": 81,
+        "residual": 0.9690,
+        "fallback": false,
+        "scale": 1.0239,
+        "rotation_deg": -0.119,
+        "tx": 45.03,
+        "ty": -37.77
+      },
+      "..."
+    ]
+  },
   "backend": "cpu",
   "max_device_bytes_in_flight": null,
   "device_budget_provenance": null,
   "device_peak_in_flight": null,
   "align_cached": false,
-  "stages": { "setup": 0.001, "align": 0.012, "fuse": 0.016, "warp_write": null, "finalize": 0.001 },
+  "stages": { "setup": 0.001, "align": 9.918, "fuse": 2.712, "warp_write": null, "finalize": 0.379 },
   "align_source": "computed",
-  "align_workers": 2,
-  "peak_align_workers": 2
+  "align_workers": 7,
+  "peak_align_workers": 7
 }
 ```
+
+This run used `--lax`, which is why `align.failure_count` is nonzero and
+one alignment's `status` is `"diverged"` yet the run still completed — see
+[`guide/alignment.md`](../guide/alignment.md#failure-is-strict-by-default).
 
 ## `align`
 
@@ -332,8 +404,13 @@ Options:
 |---|---|
 | `--algo <ALGO>` | registered alignment algorithm id; optional, defaults to the sole registered one |
 | `--json` | emit the frozen JSON report instead of human-readable text |
+| `--lax` | soften a failed frame to an identity fallback and exit 0, reporting the failure count on stderr, instead of refusing the run |
 | `--write-warped <DIR>` | write one warped TIFF per frame into `<DIR>`, at source dimensions, uncropped |
 | `--set <KEY=VALUE>` | set one algorithm parameter, repeatable; a repeated key keeps the last value |
+| `--quiet` | print no progress at all (`align` has one stage line to suppress; it has no per-tile units to count) |
+| `--preset <PATH>` | read `align-algo` and the `[align]` table from a TOML preset — see [`guide/batch-runs.md`](../guide/batch-runs.md#presets). A non-empty `[stack]` table or `algo` key in the same file is unused here and says so on stderr |
+| `--write-preset <PATH>` | write the preset that reproduces this run: `align-algo` plus the `[align]` values chosen |
+| `--status <PATH>` | append one NDJSON status record for this run to this path |
 | `--no-gpu` | force the CPU path even when a usable GPU adapter is present; absent when the binary was built `--no-default-features`. Meaningful only together with `--write-warped` — the ECC solver `align` reports on is CPU-only regardless |
 
 A frame whose registration diverges refuses the run, exit 1, naming every
@@ -445,18 +522,22 @@ prints that one algorithm's full parameter schema. Every algorithm, stacking
 or alignment, is registered under one shared id space and reachable through
 this one subcommand; there is no separate listing per family.
 
-Three stacking algorithms are registered in a normal build:
+Three stacking algorithms and one alignment algorithm are registered in a
+normal build:
 
 ```
 $ focusforge-cli algorithms
 depth-map - Depth Map (stacking)
 laplacian - Laplacian Pyramid (stacking)
+pyramidal-ecc - Pyramidal ECC (alignment)
 weighted-average - Weighted Average (stacking)
 ```
 
 - `laplacian` — Laplacian-pyramid coefficient selection
 - `weighted-average` — per-pixel sharpness-weighted blend
 - `depth-map` — per-pixel selection from a smoothed sharpness surface
+- `pyramidal-ecc` — the alignment solver `align` and `stack` both drive; see
+  [`guide/alignment.md`](../guide/alignment.md)
 
 `ID` is required for `--set`: `--set` with no `ID` is rejected before
 anything else runs, since there is no schema to validate against.
@@ -499,3 +580,114 @@ and the command exits without printing a schema.
 above, one element in `{"algorithms": [...]}`. This is the frozen
 `algorithms --json` schema: a field is added, never renamed or removed, in
 later versions, matching `info --json`'s own compatibility promise.
+
+## `export`
+
+```
+focusforge-cli export [OPTIONS] <PROJECT>
+```
+
+Turns a project a `stack` run wrote into an image file: the composite with
+`-o`, the Z-Map with `--zmap`, either or both in one invocation — at least
+one is required. This is the only thing in the workspace that writes a TIFF
+from a stack result; the composite it writes is byte-identical to the plane
+the run staged. See [`reference/project-format.md`](project-format.md) for
+what `<PROJECT>` (a `.ffproj` file) holds.
+
+| flag | meaning |
+|---|---|
+| `-o, --output <FILE>` | write the composite to this path |
+| `--zmap <FILE>` | write the Z-Map to this path |
+| `--json` | emit the frozen JSON report instead of human-readable text |
+
+```
+$ focusforge-cli export .scratch/out/mantis-64.ffproj -o .scratch/out.tif --zmap .scratch/zmap.tif
+warning: 3 source frame(s) unresolved -- not reachable from this project, either because the path was recorded as given or because it is no longer there. The export below is unaffected; re-fusing or retouching would not be:
+  .../fixtures/mantis-64/frames/00.tif
+  .../fixtures/mantis-64/frames/01.tif
+  .../fixtures/mantis-64/frames/02.tif
+.scratch/out/mantis-64.ffproj
+60x60 3ch, 3 frames
+algorithm: laplacian
+unresolved sources: 3
+wrote: .scratch/out.tif
+wrote: .scratch/zmap.tif
+wall: 0.010s
+```
+
+A source frame path the project cannot resolve is not a hard error: a
+warning naming every unresolved source prints before the write, and the
+export still happens — it reads the plane data stored inside the project,
+not the original frames.
+
+### `--json`
+
+Frozen, additive-only, the same discipline as every other `--json` shape in
+this reference: `project`, `wrote` (final paths only), `unresolved_sources`
+(present and empty when every source resolved, not an omission), `width`,
+`height`, `samples_per_pixel`, `frame_count`, `algorithm` and
+`wall_seconds`.
+
+## `review`
+
+```
+focusforge-cli review [--json] <DIR>
+```
+
+Reports one record per stack found under `<DIR>` — a `stack` run's `-o`
+output directory, or a plain directory of `.ffproj` files — without
+re-fusing, re-grouping or writing anything. When `<DIR>` holds a run
+manifest (`manifest.json`, written by every `stack` run), `review` reads it
+and lists every group the run attempted, a failed one included; otherwise it
+lists the `.ffproj` files it finds directly, non-recursively.
+
+```
+$ focusforge-cli review .scratch/out
+review .scratch/out/manifest.json: 1 result
+  fixtures/mantis-64       completed sharpness=0.9823   sources=3   coherence=0.7464   wall=0.120s
+```
+
+`sharpness` is the ratio of two numbers the run already recorded in the
+project's manifest; `coherence` is computed by streaming the project's
+Z-Map. Both are `--` when a project has no recorded metrics — a failed
+stack, for instance — and a note (the metrics reason, or the run's error)
+prints after the fields instead. See
+[`guide/batch-runs.md`](../guide/batch-runs.md#reviewing-the-results) for a
+walkthrough.
+
+### `--json`
+
+Emits `{"format": 1, "results": [...]}`. Each result carries the same
+identity/outcome/error fields the `--status` NDJSON stream uses, plus
+`metrics` (`{"sharpness_ratio": ..., "distinct_sources": ..., "coherence":
+...}` or `null`), `metrics_reason` (why `metrics` is `null`, or `null`
+itself), and `unresolved_sources` (present and empty when every source
+resolved).
+
+## `cache`
+
+```
+focusforge-cli cache <COMMAND>
+```
+
+Manages the stage cache under `.scratch/stage-cache/`, the store `stack`
+reads and writes to skip a repeated alignment solve — see
+[`guide/batch-runs.md`](../guide/batch-runs.md#the-stage-cache). One
+subcommand today:
+
+### `cache clear`
+
+```
+focusforge-cli cache clear [--json]
+```
+
+Removes every entry from the stage cache. Never touches `.scratch/resume/`
+or any project — a clear must never be able to destroy a cancelled run's
+recoverable work.
+
+```
+$ focusforge-cli cache clear
+removed 1 stage cache entry
+```
+
+`--json` emits `{"format": 1, "removed": <count>}`.

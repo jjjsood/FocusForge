@@ -15,22 +15,35 @@ GNU General Public License v3.
 </p>
 
 <!--
-  Hero screenshot goes here once the GUI ships a window worth showing
-  (crates/gui has design tokens and vendored icons,
-  but no surface yet). Suggested: assets/screenshots/editor.png, ~1200px
-  wide, PNG, with a <sub> caption underneath.
+  Hero screenshot goes here once the GUI has a window worth showing.
+  Suggested: assets/screenshots/editor.png, ~1200px wide, PNG, with a
+  <sub> caption underneath.
 -->
 
 ## Features
 
-- Fuses a directory of TIFF frames into one composite (`focusforge-cli
-  stack`), out-of-core so the stack never has to fit in RAM
+- Fuses a directory of TIFF frames into a focus-stacked project
+  (`focusforge-cli stack`), out-of-core so the stack never has to fit in RAM
+- Detects and proposes how a mixed folder of frames splits into separate
+  stacks by capture time and directory structure, printed before the run and
+  overridable or saved to a file for editing and reuse
 - Aligns handheld or breathing frames before fusing them, recovering shift,
   rotation and scale drift and cropping the result to the region every frame
   covers (`focusforge-cli align` reports the same transforms on their own)
 - Three stacking algorithms — Laplacian-pyramid coefficient selection,
   sharpness-weighted blending, and depth-map selection — each producing a
   Z-Map naming the source frame behind every output pixel
+- Turns a stacked project into an image file on request (`focusforge-cli
+  export`), separately from the run that produced it, so exporting is never
+  bundled into a batch you didn't ask to also render
+- Reports outcome, sharpness and Z-Map coverage per stack after a run
+  (`focusforge-cli review`), so a failed stack in a batch is a visible record
+  rather than a missing file
+- Reusable parameter bundles (presets) and a re-run flag that fuses only the
+  stacks you name, so tuning one stack after a batch run costs one re-run,
+  not the whole folder again
+- Cancellable and resumable runs — Ctrl-C stops a run cleanly and `--resume`
+  picks the same stack back up without redoing finished work
 - Directory-wide stack inspection (`focusforge-cli info`) — dimensions, depth,
   byte order, compression, strip layout and a uniform-layout check across
   every frame, plain text or `--json`
@@ -47,7 +60,7 @@ GNU General Public License v3.
 
 ### Prerequisites
 
-Rust, toolchain pinned to `1.94.1` (`rust-toolchain.toml`, picked up
+Rust, toolchain pinned to `1.95.0` (`rust-toolchain.toml`, picked up
 automatically by `rustup`). `crates/gui` links Slint with
 `renderer-femtovg-wgpu`, which has a hard dependency on fontconfig; on
 Debian/Ubuntu-family hosts install the dev package before building:
@@ -64,8 +77,8 @@ There is no code-side workaround for a missing fontconfig on this renderer.
 cargo build --release
 ```
 
-Produces `target/release/focusforge-cli`, the only binary in the workspace
-right now, with the GPU-accelerated fusion path compiled in by default. Pass
+Produces `target/release/focusforge-cli` and `target/release/focusforge-gui`,
+with the GPU-accelerated fusion path compiled in by default. Pass
 `--no-default-features` to exclude it; without it, `stack` always runs on the
 CPU and `--no-gpu` does not exist as a flag.
 
@@ -83,16 +96,19 @@ same report as machine-readable JSON.
 ### Stack a folder
 
 ```bash
-target/release/focusforge-cli stack path/to/frames/ -o out.tif --algo laplacian --zmap zmap.tif
+target/release/focusforge-cli stack path/to/frames/ --algo laplacian
+target/release/focusforge-cli export path/to/frames/frames.ffproj -o out.tif --zmap zmap.tif
 ```
 
-Aligns the frames, fuses every one into `out.tif` through the `laplacian`
-algorithm, and writes the per-pixel source map to `zmap.tif`. Alignment and
-the auto-crop that follows it are both on by default (`--no-align` /
+`stack` aligns the frames and fuses them into a project beside the frames
+(one `.ffproj` file per detected stack); `export` then turns that project
+into `out.tif` and its per-pixel source map `zmap.tif`. Alignment and the
+auto-crop that precedes fusion are both on by default (`--no-align` /
 `--no-crop` turn them off); `focusforge-cli align` reports the same
 transforms on their own, before any fusion runs. See
 [`docs/guide/stacking.md`](docs/guide/stacking.md) for the other algorithms
-and their parameters.
+and their parameters, and [`docs/guide/batch-runs.md`](docs/guide/batch-runs.md)
+for stacking a folder that holds more than one stack.
 
 ## Documentation
 
