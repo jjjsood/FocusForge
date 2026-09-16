@@ -470,3 +470,83 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
         "report: {cpu_report}"
     );
 }
+
+/// `device_peak_in_flight` is the device budget's own high-water tile count
+/// for this run -- distinct from `peak_in_flight`, the host scheduler's own
+/// count, which `--max-vram` cannot move. `null` on the CPU path.
+#[test]
+fn device_peak_in_flight_is_the_device_gates_own_high_water() {
+    let dir = tmp_dir("cli_gpu_device_peak_in_flight");
+
+    let base_args = |output: &Path, extra: &[&str]| -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "stack".to_string(),
+            mantis_512_dir().to_str().unwrap().to_string(),
+            "-o".to_string(),
+            output.to_str().unwrap().to_string(),
+            "--algo".to_string(),
+            "laplacian".to_string(),
+            "--align-algo".to_string(),
+            "pyramidal-ecc".to_string(),
+            "--lax".to_string(),
+            "--json".to_string(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args
+    };
+    let run_args = |args: &[String]| -> CliOutput {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        run(&refs)
+    };
+
+    // Uncapped GPU run.
+    let uncapped_out = dir.join("uncapped.tif");
+    let uncapped = run_args(&base_args(&uncapped_out, &[]));
+    assert!(uncapped.success, "stderr: {}", uncapped.stderr);
+    let uncapped_report: serde_json::Value =
+        serde_json::from_str(&uncapped.stdout).expect("--json must parse");
+    if uncapped_report["backend"] == "cpu" {
+        println!("SKIP: no usable adapter on this machine, cannot exercise device_peak_in_flight");
+        return;
+    }
+    let uncapped_peak = uncapped_report["device_peak_in_flight"]
+        .as_u64()
+        .expect("GPU path must report a non-null device_peak_in_flight");
+    assert!(uncapped_peak >= 1, "report: {uncapped_report}");
+    let host_peak = uncapped_report["peak_in_flight"]
+        .as_u64()
+        .expect("report must carry peak_in_flight");
+    assert!(
+        uncapped_peak <= host_peak,
+        "device concurrency must never exceed host concurrency: {uncapped_report}"
+    );
+
+    // `--max-vram 1MiB` floors the device gate at exactly one tile, on any
+    // machine, without touching the host-side `in_flight_limit` (one
+    // tile's device footprint on this fixture is 254 661 632 bytes).
+    let capped_out = dir.join("capped.tif");
+    let capped = run_args(&base_args(&capped_out, &["--max-vram", "1MiB"]));
+    assert!(capped.success, "stderr: {}", capped.stderr);
+    let capped_report: serde_json::Value =
+        serde_json::from_str(&capped.stdout).expect("--json must parse");
+    assert_eq!(
+        capped_report["device_peak_in_flight"], 1,
+        "report: {capped_report}"
+    );
+    assert_eq!(
+        capped_report["in_flight_limit"], uncapped_report["in_flight_limit"],
+        "--max-vram must not move the host scheduler's own limit: {capped_report}"
+    );
+
+    // `--no-gpu`: the field is null.
+    let cpu_out = dir.join("cpu.tif");
+    let cpu = run_args(&base_args(&cpu_out, &["--no-gpu"]));
+    assert!(cpu.success, "stderr: {}", cpu.stderr);
+    let cpu_report: serde_json::Value =
+        serde_json::from_str(&cpu.stdout).expect("--json must parse");
+    assert_eq!(
+        cpu_report["device_peak_in_flight"],
+        serde_json::Value::Null,
+        "report: {cpu_report}"
+    );
+}

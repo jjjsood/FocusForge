@@ -30,25 +30,13 @@ mod stack;
 /// a private item here is already visible to them (the same visibility
 /// `crate::fail` already relies on).
 #[cfg(feature = "gpu")]
-fn resolve_backend(
-    no_gpu: bool,
-    max_vram: Option<u64>,
-) -> (
-    Option<&'static dyn focusforge_core::gpu::TileBackend>,
-    Option<stack::DeviceBudgetReport>,
-) {
+fn resolve_backend(no_gpu: bool, max_vram: Option<u64>) -> stack::BackendChoice {
     gpu::resolve_backend(no_gpu, max_vram)
 }
 
 #[cfg(not(feature = "gpu"))]
-fn resolve_backend(
-    _no_gpu: bool,
-    _max_vram: Option<u64>,
-) -> (
-    Option<&'static dyn focusforge_core::gpu::TileBackend>,
-    Option<stack::DeviceBudgetReport>,
-) {
-    (None, None)
+fn resolve_backend(_no_gpu: bool, _max_vram: Option<u64>) -> stack::BackendChoice {
+    stack::BackendChoice::cpu()
 }
 
 /// FocusForge command-line interface.
