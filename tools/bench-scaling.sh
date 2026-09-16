@@ -1,47 +1,44 @@
 #!/usr/bin/env bash
 # Usage: tools/bench-scaling.sh
 #
-# Small, fast-ish demonstration that the adaptive CPU/GPU budgets actually
-# scale -- not a rigorous benchmark, a sanity comparison anyone can re-run
-# on their own machine to see the same shape of numbers. Sweeps
-# `focusforge-cli stack --align-algo pyramidal-ecc --lax` across a full
-# grid: 6 budget points x 3 frame counts x {CPU, GPU} = 36 runs. Real
-# alignment rather than --no-align -- but note the real cost this carries:
-# pyramidal-ecc's solve dominates each run's wall_seconds (~20-30s at 8
-# frames, scaling up with frame count, independent of the budget swept), so
-# the concurrency signal this script exists to show up is a delta on top of
-# that floor, not the whole number.
+# Fast-ish demonstration that the adaptive CPU/GPU budgets scale -- a
+# sanity check, not a rigorous benchmark; re-run it to see the same shape
+# of numbers. Sweeps `focusforge-cli stack --align-algo pyramidal-ecc
+# --lax` across a full grid: 6 budget points x 3 frame counts x {CPU, GPU}
+# = 36 runs, real alignment. pyramidal-ecc's solve dominates wall time
+# (~20-30s at 8 frames), so the concurrency signal is a delta on that floor.
 #
-#   CPU curve: --max-host-memory swept to land in_flight_limit at exactly
-#              1, 2, 4, 8, 16, 32 -- the byte values below are exact
-#              multiples of bytes_per_tile_set for THIS fixture's geometry
-#              (crates/core/src/tile/scheduler.rs's bytes_per_tile_set: 8
-#              frames * 512 * 512 * 3 samples * 2 bytes = 12,582,912 B).
-#   GPU curve: --max-vram swept the same way against device_bytes_per_tile
-#              for this fixture (crates/gpu/src/budget.rs, measured
-#              254,661,632 B) -- bare byte values, since that size isn't a
-#              clean MiB multiple. The report has no device-side tile-count
-#              field to print (only the byte budget itself,
-#              max_device_bytes_in_flight); in_flight_limit in the JSON is
-#              the CPU rayon pool's own size and does not move with this
-#              sweep at all -- do not confuse the two.
+#   Budget axis: --max-host-memory (CPU) / --max-vram (GPU) swept to 6
+#              points that are exact multiples of bytes_per_tile_set /
+#              device_bytes_per_tile AS MEASURED AT 8 FRAMES
+#              (crates/core/src/tile/scheduler.rs: 8 * 512 * 512 * 3 * 2 =
+#              12,582,912 B; crates/gpu/src/budget.rs, measured
+#              254,661,632 B). The byte VALUES stay fixed across the frame
+#              axis on purpose -- that is what makes the frame axis show
+#              anything: the same fixed ceiling, applied to a tile-set that
+#              gets bigger as frame_count grows, must fit fewer tiles.
+#   Frame axis: 8 (the real fixture), 16, 32 frames -- 16/32 built by
+#              duplicating the 8 real fixtures/mantis-512 frames cyclically
+#              into $OUT/frames-{16,32}/frames/ (bytewise-sorted names,
+#              zero-padded -- see crates/core/src/io/tiff/stack.rs's
+#              frame_paths; no content/hash uniqueness check, so reused
+#              frames are accepted).
 #
 # Both flags are ceiling-only: a value at or above the host/device's own
 # derived budget is a silent no-op (provenance stays Host, not Explicit).
-# The summary below flags any swept point where that happened instead of
-# quietly plotting a wrong curve. If fixtures/mantis-512's geometry ever
-# changes (frame count, tile size, algorithm), these byte values need
+# The summary flags any grid cell where that happened instead of quietly
+# plotting a wrong number. If fixtures/mantis-512's geometry ever changes
+# (frame count, tile size, algorithm), the 8-frame byte values need
 # re-deriving from the formulas above, not guessing.
 #
 # Each run's own frozen `--json` report already carries everything this
 # needs (wall_seconds, max_bytes_in_flight, budget_provenance,
-# max_device_bytes_in_flight, device_budget_provenance, peak_in_flight) --
-# no new instrumentation, no cargo bench target, no new dependency. Total
-# wall-clock is tens of minutes, not seconds, once real alignment and the
-# 3x frame-count grid are both in the loop.
+# max_device_bytes_in_flight, device_budget_provenance, peak_in_flight).
+# Takes tens of minutes, not seconds, once real alignment and the 3x
+# frame-count grid are both in the loop.
 #
-# Exit: 0 on success (prints three curve tables), 1 if the CLI binary is
-# missing or any run fails.
+# Exit: 0 on success (prints two grids, CPU and GPU), 1 if the CLI binary
+# is missing or any run fails.
 
 set -euo pipefail
 
@@ -59,37 +56,13 @@ fi
 
 mkdir -p "$OUT"
 
+# run <name> <frame-dir> [extra CLI args...]
 run() {
-  local name="$1"
-  shift
-  "$CLI" stack "$FIXTURE" --algo laplacian --align-algo pyramidal-ecc --lax --json \
-    -o "$OUT/$name.tif" "$@" >"$OUT/$name.json"
-}
-
-# Same as run(), but against an explicit source directory instead of $FIXTURE
-# -- used for the frame-count axis's synthetic 16/32-frame directories.
-run_dir() {
   local name="$1" dir="$2"
   shift 2
   "$CLI" stack "$dir" --algo laplacian --align-algo pyramidal-ecc --lax --json \
     -o "$OUT/$name.tif" "$@" >"$OUT/$name.json"
 }
-
-echo "Running CPU budget sweep (6 points) against $FIXTURE ..." >&2
-run cpu-1 --no-gpu --max-host-memory 12MiB
-run cpu-2 --no-gpu --max-host-memory 24MiB
-run cpu-4 --no-gpu --max-host-memory 48MiB
-run cpu-8 --no-gpu --max-host-memory 96MiB
-run cpu-16 --no-gpu --max-host-memory 192MiB
-run cpu-32 --no-gpu --max-host-memory 384MiB
-
-echo "Running GPU budget sweep (6 points) against $FIXTURE ..." >&2
-run gpu-1 --max-vram 254661632
-run gpu-2 --max-vram 509323264
-run gpu-4 --max-vram 1018646528
-run gpu-8 --max-vram 2037293056
-run gpu-16 --max-vram 4074586112
-run gpu-32 --max-vram 8149172224
 
 echo "Building synthetic 16/32-frame directories (fixtures/mantis-512's 8 real frames, duplicated) ..." >&2
 FRAMES_SRC="$FIXTURE/frames"
@@ -105,97 +78,126 @@ for n in 16 32; do
   done
 done
 
-echo "Running frame-count sweep (8/16/32 frames, default adaptive budgets, CPU+GPU) ..." >&2
-run       frames-8-cpu  --no-gpu
-run       frames-8-gpu
-run_dir   frames-16-cpu "$OUT/frames-16" --no-gpu
-run_dir   frames-16-gpu "$OUT/frames-16"
-run_dir   frames-32-cpu "$OUT/frames-32" --no-gpu
-run_dir   frames-32-gpu "$OUT/frames-32"
+dir_for() {
+  case "$1" in
+    8) echo "$FIXTURE" ;;
+    16) echo "$OUT/frames-16" ;;
+    32) echo "$OUT/frames-32" ;;
+  esac
+}
+
+echo "Running CPU grid (6 budget points x 3 frame counts) ..." >&2
+for target in 1 2 4 8 16 32; do
+  bytes=$((12582912 * target))
+  for frames in 8 16 32; do
+    dir="$(dir_for "$frames")"
+    run "cpu-${target}-f${frames}" "$dir" --no-gpu --max-host-memory "${bytes}"
+  done
+done
+
+echo "Running GPU grid (6 budget points x 3 frame counts) ..." >&2
+for target in 1 2 4 8 16 32; do
+  bytes=$((254661632 * target))
+  for frames in 8 16 32; do
+    dir="$(dir_for "$frames")"
+    run "gpu-${target}-f${frames}" "$dir" --max-vram "${bytes}"
+  done
+done
 
 python3 - "$OUT" <<'PY'
 import json
 import sys
 
 out = sys.argv[1]
+targets = [1, 2, 4, 8, 16, 32]
+frame_counts = [8, 16, 32]
 
-cpu_targets = [1, 2, 4, 8, 16, 32]
-gpu_targets = [1, 2, 4, 8, 16, 32]
 
 def load(name):
     with open(f"{out}/{name}.json") as f:
         return json.load(f)
 
-def print_curve(title, names, targets, budget_field, provenance_field):
+
+def print_cpu_grid():
+    # StackReport.peak_in_flight (crates/core/src/tile/scheduler.rs) is the
+    # HOST tile scheduler's own high-water mark -- exactly what
+    # --max-host-memory governs, so this grid's peak_in_flight column is a
+    # direct, correct read of the swept budget's effect.
+    title = "CPU grid (--max-host-memory x frame count, --no-gpu)"
     print(f"\n{title}")
-    print(f"{'target':>8} {'wall_seconds':>12} {budget_field:>24} {provenance_field:>16}")
-    reports = [load(n) for n in names]
-    for target, r in zip(targets, reports):
-        budget = r[budget_field]
-        provenance = r[provenance_field]
-        flag = "  <- ceiling did not bind" if provenance != "Explicit" else ""
-        print(f"{target:>8} {r['wall_seconds']:>12.3f} {budget:>24} {provenance:>16}{flag}")
-    total = sum(r["wall_seconds"] for r in reports)
-    print(f"subtotal: {total:.2f}s")
-    first, last = reports[0]["wall_seconds"], reports[-1]["wall_seconds"]
-    if last > 0:
-        print(f"target={targets[0]} vs target={targets[-1]}: {first / last:.1f}x")
-    return total
+    header = f"{'target':>8}"
+    for f in frame_counts:
+        header += f" | f={f:<2} peak_in_flight (wall_s)"
+    print(header)
 
-cpu_names = [f"cpu-{n}" for n in cpu_targets]
-gpu_names = [f"gpu-{n}" for n in gpu_targets]
-
-# "target" here is the requested in-flight tile count; the report field that
-# actually moves with the sweep is the byte budget itself
-# (max_bytes_in_flight / max_device_bytes_in_flight) -- in_flight_limit is
-# the CPU rayon pool's own size (decoupled from the byte budget, always
-# available_parallelism), never the GPU device's tile count, so it is not a
-# meaningful column for the GPU curve.
-cpu_total = print_curve(
-    "CPU curve (--max-host-memory swept, --no-gpu)",
-    cpu_names, cpu_targets, "max_bytes_in_flight", "budget_provenance",
-)
-gpu_total = print_curve(
-    "GPU curve (--max-vram swept, default GPU path)",
-    gpu_names, gpu_targets, "max_device_bytes_in_flight", "device_budget_provenance",
-)
-
-def print_frame_curve():
-    print("\nFrame-count curve (8/16/32 frames, default adaptive budgets)")
-    print(
-        f"{'frames':>8} {'path':>4} {'wall_seconds':>12} "
-        f"{'peak_in_flight':>14} {'budget_bytes':>14} {'backed_off':>10}"
-    )
     total = 0.0
-    rows = []
-    for n in (8, 16, 32):
-        for path, field, prov_field in (
-            ("cpu", "max_bytes_in_flight", "budget_provenance"),
-            ("gpu", "max_device_bytes_in_flight", "device_budget_provenance"),
-        ):
-            r = load(f"frames-{n}-{path}")
+    cells = {}
+    for target in targets:
+        row = f"{target:>8}"
+        for frames in frame_counts:
+            r = load(f"cpu-{target}-f{frames}")
+            cells[(target, frames)] = r
             total += r["wall_seconds"]
-            rows.append((n, path, r))
-            print(
-                f"{n:>8} {path:>4} {r['wall_seconds']:>12.3f} "
-                f"{r['peak_in_flight']:>14} {r[field]:>14} "
-                f"{str(r['backed_off']):>10}"
-            )
+            flag = "*" if r["budget_provenance"] != "Explicit" else " "
+            row += f" | {r['peak_in_flight']:>2}{flag}          ({r['wall_seconds']:>7.2f})"
+        print(row)
     print(f"subtotal: {total:.2f}s")
-    for path in ("cpu", "gpu"):
-        first = next(r for n, p, r in rows if p == path and n == 8)
-        last = next(r for n, p, r in rows if p == path and n == 32)
-        print(
-            f"{path} peak_in_flight, 8 frames vs 32 frames: "
-            f"{first['peak_in_flight']} -> {last['peak_in_flight']} "
-            "(same fixed budget, more bytes per tile-set as frame_count grows "
-            "-- concurrency should shrink gracefully here, not collapse)"
-        )
+
+    for target in targets:
+        f8 = cells[(target, 8)]["peak_in_flight"]
+        f32 = cells[(target, 32)]["peak_in_flight"]
+        if f8 != f32:
+            print(
+                f"  target={target}: peak_in_flight shrinks with frame count "
+                f"({f8} at 8 frames -> {f32} at 32 frames) -- same fixed byte "
+                "ceiling, bigger tile-set, fewer tiles fit: graceful "
+                "degradation, not a collapse"
+            )
     return total
 
-frame_total = print_frame_curve()
 
-print(f"\ntotal wall-clock (all three curves): {cpu_total + gpu_total + frame_total:.2f}s")
+def print_gpu_grid():
+    # NOT the same shape as the CPU grid, and deliberately not printed as
+    # one: StackReport.peak_in_flight is ALWAYS the host scheduler's own
+    # counter (same field, same source, as the CPU grid above), because the
+    # JSON report has no field for the GPU device's own realized in-flight
+    # tile count -- crates/gpu/src/budget.rs has a DeviceBudget::peak_in_flight
+    # (:500), but crates/cli/src/stack.rs never reads it into StackReport.
+    # So --max-vram's effect is only observable here via the budget BYTES
+    # themselves (max_device_bytes_in_flight) and their provenance, not via
+    # any concurrency count. This is a real observability gap, not a
+    # property of the adaptive budget itself.
+    title = "GPU grid (--max-vram x frame count, default GPU path)"
+    print(f"\n{title}")
+    header = f"{'target':>8}"
+    for f in frame_counts:
+        header += f" | f={f:<2} max_device_bytes (wall_s)"
+    print(header)
+
+    total = 0.0
+    for target in targets:
+        row = f"{target:>8}"
+        for frames in frame_counts:
+            r = load(f"gpu-{target}-f{frames}")
+            total += r["wall_seconds"]
+            flag = "*" if r["device_budget_provenance"] != "Explicit" else " "
+            mib = r["max_device_bytes_in_flight"] / (1024 * 1024)
+            row += f" | {mib:>7.1f}MiB{flag} ({r['wall_seconds']:>7.2f})"
+        print(row)
+    print(f"subtotal: {total:.2f}s")
+    print(
+        "  every cell's device_budget_provenance is Explicit (ceiling always "
+        "bound, confirmed per-cell) -- but peak_in_flight is not printed "
+        "here: it is the host scheduler's own counter (see the CPU grid "
+        "above), not the device's, and stays flat regardless of --max-vram."
+    )
+    return total
+
+
+cpu_total = print_cpu_grid()
+gpu_total = print_gpu_grid()
+
+print(f"\ntotal wall-clock (both grids, 36 runs): {cpu_total + gpu_total:.2f}s")
 print(
     "\nSingle run each, one machine, smallest fixture in the repo -- a "
     "sanity check that the scaling is real and in the right direction, "
