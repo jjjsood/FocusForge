@@ -9,9 +9,18 @@
 
 use focusforge_core::gpu::TileBackend;
 use focusforge_gpu::adapter::{PathChoice, choose_path};
-use focusforge_gpu::harness::gpu_backend_capped;
+use focusforge_gpu::harness::{GpuBackend, gpu_backend_capped};
 
-use crate::stack::DeviceBudgetReport;
+use crate::stack::{BackendChoice, DeviceBudgetReport, DevicePeak};
+
+/// The device budget's own realized high-water tile count for this
+/// `GpuBackend`: read fresh on every call, never cached, since it is only
+/// meaningful after `scheduler.run` has returned.
+impl DevicePeak for GpuBackend {
+    fn peak_in_flight(&self) -> usize {
+        self.budget().peak_in_flight()
+    }
+}
 
 /// `no_gpu` is `--no-gpu`'s value: `true` forces the CPU path
 /// unconditionally, without even attempting -- let alone reporting a
@@ -19,27 +28,28 @@ use crate::stack::DeviceBudgetReport;
 /// cap on the probed device budget (`gpu_backend_capped`). Prints the
 /// decision to **stderr** (the stream `crate::fail` and `align`'s own lax
 /// warning already use), and returns the backend plus its settled budget
-/// report on the GPU path, `(None, None)` on the CPU path.
-pub fn resolve_backend(
-    no_gpu: bool,
-    max_vram: Option<u64>,
-) -> (Option<&'static dyn TileBackend>, Option<DeviceBudgetReport>) {
+/// report and device-peak handle on the GPU path, `BackendChoice::cpu()` on
+/// the CPU path. `backend` and `device_peak` coerce from the same
+/// `&'static GpuBackend` binding, so nothing re-enters the `GPU_BACKEND`
+/// `OnceLock` and no second probe or ceiling is observed.
+pub fn resolve_backend(no_gpu: bool, max_vram: Option<u64>) -> BackendChoice {
     let (path, result, message) = choose_path(no_gpu, gpu_backend_capped(max_vram));
     eprintln!("{message}");
     match path {
         PathChoice::Gpu => match result.ok() {
             Some(backend) => {
                 let device_budget = backend.device_budget();
-                (
-                    Some(backend as &dyn TileBackend),
-                    Some(DeviceBudgetReport {
+                BackendChoice {
+                    backend: Some(backend as &dyn TileBackend),
+                    device_budget: Some(DeviceBudgetReport {
                         max_device_bytes: device_budget.bytes(),
                         provenance: device_budget.provenance(),
                     }),
-                )
+                    device_peak: Some(backend as &dyn DevicePeak),
+                }
             }
-            None => (None, None),
+            None => BackendChoice::cpu(),
         },
-        PathChoice::CpuFallback => (None, None),
+        PathChoice::CpuFallback => BackendChoice::cpu(),
     }
 }

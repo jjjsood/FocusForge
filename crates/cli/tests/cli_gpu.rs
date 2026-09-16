@@ -83,6 +83,32 @@ fn run(args: &[&str]) -> CliOutput {
     }
 }
 
+/// Shared `stack` invocation for the `--max-vram` tests below: laplacian +
+/// pyramidal-ecc, `--lax --json`, against the standard fixture -- `extra`
+/// appends whatever each test varies (`--max-vram`, `--no-gpu`, ...).
+fn max_vram_stack_args(output: &Path, extra: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "stack".to_string(),
+        mantis_512_dir().to_str().unwrap().to_string(),
+        "-o".to_string(),
+        output.to_str().unwrap().to_string(),
+        "--algo".to_string(),
+        "laplacian".to_string(),
+        "--align-algo".to_string(),
+        "pyramidal-ecc".to_string(),
+        "--lax".to_string(),
+        "--json".to_string(),
+    ];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    args
+}
+
+/// `run`, taking the owned `Vec<String>` `max_vram_stack_args` builds.
+fn run_owned(args: &[String]) -> CliOutput {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(&refs)
+}
+
 /// A `stack` run against an absent WGPU backend (`dx12` does not exist on
 /// Linux -- `Backends::from_env()`, `crates/gpu/src/device.rs`), so the
 /// process-level fallback path is exercised without needing a machine that
@@ -379,29 +405,8 @@ fn no_gpu_flag_forces_cpu_even_with_adapter() {
 fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
     let dir = tmp_dir("cli_gpu_max_vram");
 
-    let base_args = |output: &Path, extra: &[&str]| -> Vec<String> {
-        let mut args: Vec<String> = vec![
-            "stack".to_string(),
-            mantis_512_dir().to_str().unwrap().to_string(),
-            "-o".to_string(),
-            output.to_str().unwrap().to_string(),
-            "--algo".to_string(),
-            "laplacian".to_string(),
-            "--align-algo".to_string(),
-            "pyramidal-ecc".to_string(),
-            "--lax".to_string(),
-            "--json".to_string(),
-        ];
-        args.extend(extra.iter().map(|s| s.to_string()));
-        args
-    };
-    let run_args = |args: &[String]| -> CliOutput {
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        run(&refs)
-    };
-
     let probed_out = dir.join("probed.tif");
-    let probed = run_args(&base_args(&probed_out, &[]));
+    let probed = run_owned(&max_vram_stack_args(&probed_out, &[]));
     assert!(probed.success, "stderr: {}", probed.stderr);
     let probed_report: serde_json::Value =
         serde_json::from_str(&probed.stdout).expect("--json must parse");
@@ -425,7 +430,7 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
         "fixture assumption: probed budget ({probed_bytes}) must exceed the 256MiB ceiling used below"
     );
     let low_out = dir.join("low.tif");
-    let low = run_args(&base_args(&low_out, &["--max-vram", "256MiB"]));
+    let low = run_owned(&max_vram_stack_args(&low_out, &["--max-vram", "256MiB"]));
     assert!(low.success, "stderr: {}", low.stderr);
     let low_report: serde_json::Value =
         serde_json::from_str(&low.stdout).expect("--json must parse");
@@ -440,7 +445,7 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
 
     // A ceiling above the probed value changes nothing, provenance included.
     let high_out = dir.join("high.tif");
-    let high = run_args(&base_args(&high_out, &["--max-vram", "64GiB"]));
+    let high = run_owned(&max_vram_stack_args(&high_out, &["--max-vram", "64GiB"]));
     assert!(high.success, "stderr: {}", high.stderr);
     let high_report: serde_json::Value =
         serde_json::from_str(&high.stdout).expect("--json must parse");
@@ -455,7 +460,7 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
 
     // CPU path: both fields null.
     let cpu_out = dir.join("cpu.tif");
-    let cpu = run_args(&base_args(&cpu_out, &["--no-gpu"]));
+    let cpu = run_owned(&max_vram_stack_args(&cpu_out, &["--no-gpu"]));
     assert!(cpu.success, "stderr: {}", cpu.stderr);
     let cpu_report: serde_json::Value =
         serde_json::from_str(&cpu.stdout).expect("--json must parse");
@@ -466,6 +471,65 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
     );
     assert_eq!(
         cpu_report["device_budget_provenance"],
+        serde_json::Value::Null,
+        "report: {cpu_report}"
+    );
+}
+
+/// `device_peak_in_flight` is the device budget's own high-water tile count
+/// for this run -- distinct from `peak_in_flight`, the host scheduler's own
+/// count, which `--max-vram` cannot move. `null` on the CPU path.
+#[test]
+fn device_peak_in_flight_is_the_device_gates_own_high_water() {
+    let dir = tmp_dir("cli_gpu_device_peak_in_flight");
+
+    // Uncapped GPU run.
+    let uncapped_out = dir.join("uncapped.tif");
+    let uncapped = run_owned(&max_vram_stack_args(&uncapped_out, &[]));
+    assert!(uncapped.success, "stderr: {}", uncapped.stderr);
+    let uncapped_report: serde_json::Value =
+        serde_json::from_str(&uncapped.stdout).expect("--json must parse");
+    if uncapped_report["backend"] == "cpu" {
+        println!("SKIP: no usable adapter on this machine, cannot exercise device_peak_in_flight");
+        return;
+    }
+    let uncapped_peak = uncapped_report["device_peak_in_flight"]
+        .as_u64()
+        .expect("GPU path must report a non-null device_peak_in_flight");
+    assert!(uncapped_peak >= 1, "report: {uncapped_report}");
+    let host_peak = uncapped_report["peak_in_flight"]
+        .as_u64()
+        .expect("report must carry peak_in_flight");
+    assert!(
+        uncapped_peak <= host_peak,
+        "device concurrency must never exceed host concurrency: {uncapped_report}"
+    );
+
+    // `--max-vram 1MiB` floors the device gate at exactly one tile, on any
+    // machine, without touching the host-side `in_flight_limit` (one
+    // tile's device footprint on this fixture is 254 661 632 bytes).
+    let capped_out = dir.join("capped.tif");
+    let capped = run_owned(&max_vram_stack_args(&capped_out, &["--max-vram", "1MiB"]));
+    assert!(capped.success, "stderr: {}", capped.stderr);
+    let capped_report: serde_json::Value =
+        serde_json::from_str(&capped.stdout).expect("--json must parse");
+    assert_eq!(
+        capped_report["device_peak_in_flight"], 1,
+        "report: {capped_report}"
+    );
+    assert_eq!(
+        capped_report["in_flight_limit"], uncapped_report["in_flight_limit"],
+        "--max-vram must not move the host scheduler's own limit: {capped_report}"
+    );
+
+    // `--no-gpu`: the field is null.
+    let cpu_out = dir.join("cpu.tif");
+    let cpu = run_owned(&max_vram_stack_args(&cpu_out, &["--no-gpu"]));
+    assert!(cpu.success, "stderr: {}", cpu.stderr);
+    let cpu_report: serde_json::Value =
+        serde_json::from_str(&cpu.stdout).expect("--json must parse");
+    assert_eq!(
+        cpu_report["device_peak_in_flight"],
         serde_json::Value::Null,
         "report: {cpu_report}"
     );
