@@ -95,7 +95,7 @@ fn plane_conversion_matches_cpu() {
         word_count,
         sample_count as u32,
     );
-    let gpu_f32 = download_f32(device, queue, &f32_buffer, sample_count);
+    let gpu_f32 = download_f32(device, queue, &f32_buffer, sample_count).expect("download_f32");
 
     let cpu_plane =
         Plane::from_u16(&tile.samples, rect.width, rect.height, spp).expect("cpu from_u16");
@@ -113,7 +113,8 @@ fn plane_conversion_matches_cpu() {
         word_count,
         sample_count as u32,
     );
-    let out_bytes = download_buffer(device, queue, &packed_out, (word_count as u64) * 4);
+    let out_bytes = download_buffer(device, queue, &packed_out, (word_count as u64) * 4)
+        .expect("download_buffer");
     let gpu_u16 = unpack_samples(&out_bytes, sample_count);
     assert_eq!(
         gpu_u16,
@@ -152,7 +153,8 @@ fn gaussian_reduce_matches_cpu() {
             gpu_pyramid::reduce(device, queue, &pipelines, &src_buffer, width, height, spp);
         assert_eq!(out_width, cpu_reduced.width());
         assert_eq!(out_height, cpu_reduced.height());
-        let gpu_data = download_f32(device, queue, &gpu_buffer, cpu_reduced.data().len());
+        let gpu_data = download_f32(device, queue, &gpu_buffer, cpu_reduced.data().len())
+            .expect("download_f32");
 
         assert_eq!(
             gpu_data,
@@ -200,7 +202,8 @@ fn laplacian_expand_matches_cpu() {
         out_width,
         out_height,
     );
-    let gpu_data = download_f32(device, queue, &gpu_buffer, cpu_expanded.data().len());
+    let gpu_data =
+        download_f32(device, queue, &gpu_buffer, cpu_expanded.data().len()).expect("download_f32");
 
     assert_eq!(
         gpu_data,
@@ -246,7 +249,8 @@ fn score_plane_matches_cpu() {
         level0.samples_per_pixel(),
         radius,
     );
-    let gpu_scores = download_f32(device, queue, &gpu_scores_buffer, cpu_scores.len());
+    let gpu_scores =
+        download_f32(device, queue, &gpu_scores_buffer, cpu_scores.len()).expect("download_f32");
 
     assert_eq!(
         gpu_scores, cpu_scores,

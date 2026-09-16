@@ -19,7 +19,7 @@ use focusforge_core::io::TiffStack;
 use focusforge_core::params::{ParamValue, ParamValues, StackContext};
 use focusforge_core::tile::{NoopPreprocess, Rect, Tile, TileScheduler, TileSchedulerOptions};
 use focusforge_core::zmap::ZMapReader;
-use focusforge_gpu::harness::gpu_backend;
+use focusforge_gpu::harness::{GpuBackend, gpu_backend};
 use focusforge_gpu::transfer::readback_count;
 
 use crate::common;
@@ -30,13 +30,7 @@ const NEAR_TIE_REL: f32 = 128.0 * f32::EPSILON;
 
 const LEVELS: u32 = 5;
 
-/// `(width, height, spp)` grouped into one `Copy` value -- purely so
-/// [`near_tie_status`], [`reachable_near_tie`] and [`minimal_symmetric_taps`]
-/// stay under clippy's `too_many_arguments` lint once the full-window
-/// fallback added a `disputed_winner`/extra base-plane parameter on top of
-/// the three canvas dimensions every function in this file already threads
-/// separately; every field is the same real canvas geometry, never a new
-/// concept.
+/// Canvas `(width, height, spp)` as one `Copy` value.
 #[derive(Clone, Copy)]
 struct CanvasGeom {
     width: u32,
@@ -44,16 +38,10 @@ struct CanvasGeom {
     spp: u32,
 }
 
-/// A destination pixel's identity at one pyramid level: `level` itself,
-/// `raw_pixel` (the level-0 destination index every caller starts from --
-/// also the raw-sample tap [`perturbed_frame_score_at`] perturbs, since the
-/// ±1 LSB warp tolerance this module measures is a property of the raw
-/// warped sample, not of any one pyramid level) and `mapped_pixel`
-/// (`raw_pixel`'s own index inside level `level`'s smaller `score_plane`,
-/// `x0 >> level` / `y0 >> level` against that level's own `width >> level`).
-/// Grouped into one `Copy` value for the same too_many_arguments reason as
-/// [`CanvasGeom`]: every level-aware reachability helper below takes one of
-/// these instead of a bare `usize` pixel index.
+/// A destination pixel at one pyramid level: `raw_pixel` is the level-0
+/// index (and the raw sample a probe perturbs, since the ±1 LSB warp
+/// tolerance is a raw-sample property); `mapped_pixel` is its index in level
+/// `level`'s `score_plane` (`x0 >> level`, `y0 >> level`, row `width >> level`).
 #[derive(Clone, Copy)]
 struct LevelPixel {
     level: u32,
@@ -175,9 +163,16 @@ fn run_cpu(label: &str, transforms: Vec<Transform>) -> RunOutputs {
 
 /// `None` when there is no usable adapter -- callers `return` early on
 /// `None`, printing the skip reason themselves via [`focusforge_gpu::device::shared_device_or_skip`].
-fn run_gpu(label: &str, transforms: Vec<Transform>) -> Option<RunOutputs> {
+/// `backend` is a parameter, not always [`gpu_backend`]'s singleton, so the
+/// same plan can run a second time against
+/// `GpuBackend::with_max_device_bytes(1)`: a CPU-twin parity check at two
+/// different device budgets.
+fn run_gpu(
+    label: &str,
+    transforms: Vec<Transform>,
+    backend: &dyn TileBackend,
+) -> Option<RunOutputs> {
     focusforge_gpu::device::shared_device_or_skip()?;
-    let backend = gpu_backend().expect("gpu backend");
 
     let stack = open_stack();
     let (width, height) = stack.dimensions();
@@ -252,16 +247,10 @@ fn read_zmap(path: &Path) -> Vec<u16> {
     out
 }
 
-/// Every frame's level-`level` windowed score over the **whole** canvas
-/// (never tiled: `fixtures/mantis-512` is 512x512x3x8 frames, small enough
-/// to hold in memory for this verification-only recomputation), through the
-/// same CPU `WarpingReader` the CPU run itself used -- the near-tie margin
-/// at any differing pixel is then a lookup, not a re-tiled re-fusion. Always
-/// builds the full `LEVELS`-deep pyramid regardless of which single `level`
-/// is read back: this runs once per level actually probed (via
-/// [`level_scores_cached`]), never once per pixel, so there is no
-/// repeated-build cost worth trimming here the way [`score_with_deltas`]
-/// trims its own per-probe pyramid depth.
+/// Every frame's level-`level` windowed score over the whole canvas (the
+/// 512x512x3x8 fixture fits in memory), through the same `WarpingReader` the
+/// CPU run used, so a pixel's near-tie margin is a lookup. Builds the full
+/// `LEVELS`-deep pyramid; runs once per level via [`level_scores_cached`].
 fn whole_canvas_level_scores(
     stack: &TiffStack,
     transforms: &[Transform],
@@ -306,20 +295,10 @@ fn level_scores_cached<'a>(
         .as_slice()
 }
 
-/// Recomputes contributing frame `frame`'s level-`lp.level` windowed score
-/// at `lp.mapped_pixel` after applying every `(tap, delta)` pair in
-/// `deltas` (raw, level-0 sample indices -- see [`LevelPixel`]'s own doc for
-/// why the perturbed tap and the read-back pixel live in different
-/// coordinate spaces once `lp.level > 0`) to that frame's own warped plane
-/// simultaneously (every channel, clamped `0..=65535`) and rebuilding the
-/// pyramid **once** -- the exact CPU score function (`score_plane`/
-/// `score_radius`), never a shortcut local recompute, so the window's real
-/// (clamp-to-edge, separable two-pass) accumulation is respected exactly as
-/// the CPU pipeline itself computed it. Only `lp.level + 1` pyramid levels
-/// are built: level `lp.level`'s own Laplacian depends only on
-/// `G_{lp.level}`/`G_{lp.level+1}`, never on any deeper level -- building
-/// past `lp.level + 1` here would be real, provably wasted work on every one
-/// of the many calls this and [`ranked_tap_deltas`] make.
+/// Frame `frame`'s level-`lp.level` score at `lp.mapped_pixel` after applying
+/// every raw `(tap, delta)` in `deltas` (every channel, clamped `0..=65535`),
+/// via the real `score_plane`/`score_radius`. Builds only `lp.level + 1`
+/// pyramid levels: level `k`'s Laplacian needs only `G_k` and `G_{k+1}`.
 fn score_with_deltas(
     reader: &WarpingReader,
     width: u32,
@@ -347,14 +326,9 @@ fn score_with_deltas(
     score_plane(&pyr.levels()[lp.level as usize], radius)[lp.mapped_pixel]
 }
 
-/// [`score_with_deltas`] at a single raw sample (`lp.raw_pixel`) -- the
-/// single-/double-frame reachability check's own probe, kept as a thin
-/// wrapper so that check's call sites don't change. The perturbed tap is
-/// always `lp.raw_pixel` (level 0's own destination pixel) regardless of
-/// `lp.level`: the ±1 LSB tolerance this whole module measures is a
-/// property of the raw warped sample, and `lp.raw_pixel` is the raw pixel
-/// that most directly feeds level `lp.level`'s own mapped pixel through the
-/// reduce chain.
+/// [`score_with_deltas`] at the single raw sample `lp.raw_pixel`, whatever
+/// `lp.level`: the ±1 LSB tolerance is a raw-sample property, and
+/// `lp.raw_pixel` feeds level `lp.level`'s mapped pixel most directly.
 fn perturbed_frame_score_at(
     reader: &WarpingReader,
     width: u32,
@@ -415,14 +389,9 @@ fn score_at_pixel_fast(level: &pyramid::Plane, radius: u32, pixel: usize) -> f32
     acc
 }
 
-/// Reads frame `frame`'s whole warped plane once -- the full-window search
-/// below probes hundreds of perturbations per frame, and every one of them
-/// starts from the same unperturbed warp; re-invoking `WarpingReader` (a
-/// full-canvas bicubic resample) once per probe, as the single-/double-
-/// frame check above does for its own much smaller 16-probe budget, would
-/// make the window search's probe count (hundreds, not 16) pay for a full
-/// resample every time for no reason -- the resample never changes, only a
-/// handful of raw samples get perturbed on top of it.
+/// Reads frame `frame`'s whole warped plane once; the full-window search
+/// perturbs copies of it ([`samples_with_deltas`]) instead of re-running the
+/// bicubic resample for each of its hundreds of probes.
 fn read_frame_samples(
     reader: &WarpingReader,
     width: u32,
@@ -736,16 +705,10 @@ fn argmax_with_override(
     best_frame
 }
 
-/// The frame indices of the highest and second-highest score at
-/// `mapped_pixel` across `scores` -- `(winner, runner_up)`, first-frame-wins
-/// on an exact tie exactly like [`argmax_with_override`]. Used to derive a
-/// `(recorded_winner, disputed_winner)` pair for pyramid levels above 0,
-/// where -- unlike level 0's real Z-Map -- no separate GPU-observed winner
-/// exists to compare against: `crates/gpu/src/fuse/mod.rs` only ever reads
-/// back level 0's winner buffer (`fuse_planes_gpu`'s tail), so a tight CPU
-/// margin between these two frames is the only observable signal that a
-/// level's own selection is unstable enough to plausibly explain a
-/// composite delta.
+/// `(winner, runner_up)` by score at `mapped_pixel`, first frame winning an
+/// exact tie like [`argmax_with_override`]. Stands in for the recorded
+/// winner at levels above 0, where the GPU reads back no winner buffer, so
+/// a tight CPU margin is the only signal of an unstable selection.
 fn top_two_frames(scores: &[Vec<f32>], mapped_pixel: usize) -> (usize, usize) {
     let mut frames: Vec<usize> = (0..scores.len()).collect();
     frames.sort_by(|&a, &b| {
@@ -765,14 +728,9 @@ fn top_two_frames(scores: &[Vec<f32>], mapped_pixel: usize) -> (usize, usize) {
 /// away from `recorded_winner` -- this level's own actual winner selection,
 /// never a value this function invents.
 ///
-/// This single-/double-frame check under-explores its own premise: it only
-/// ever perturbs one frame's *destination* pixel at a time, never the rest
-/// of the up-to-17x17 window `score_plane` actually sums over, and never
-/// both the current winner and the disputed frame simultaneously. When it
-/// finds nothing, the full-window fallback
-/// ([`full_window_reachable_near_tie`]) pushes `recorded_winner` to its
-/// worst reachable score and `disputed_winner` to its best, both over the
-/// full score window, before giving up.
+/// If no single-frame, destination-pixel probe flips the argmax,
+/// [`full_window_reachable_near_tie`] pushes `recorded_winner` to its worst
+/// and `disputed_winner` to its best over the whole 17x17 score window.
 fn reachable_near_tie(
     reader: &WarpingReader,
     scores: &[Vec<f32>],
@@ -802,17 +760,11 @@ fn reachable_near_tie(
     )
 }
 
-/// Whether pixel `lp` is a proven near-tie -- by ±1 LSB perturbation
-/// reachability (`reachable_near_tie`), not the static `NEAR_TIE_REL`
-/// bound -- plus the `(best, runner_up)` scores for the diagnostic print.
-/// Shared by the level-0 Z-Map index check and the composite value check
-/// at every pyramid level: the warp stage's own legitimate ± 1 LSB
-/// pixel-value difference can flip a near-tied Laplacian-selection winner
-/// to a different, equally-correct source frame at *any* level, and
-/// because the two frames are different photographs, the runner-up's
-/// pixel value can differ from the winner's by hundreds of LSBs -- so a
-/// pixel proven reachable at any level is exempted at the composite level
-/// too, never only at the level-0 Z-Map index.
+/// Whether `lp` is a proven near-tie (±1 LSB reachability via
+/// [`reachable_near_tie`], not `NEAR_TIE_REL`), plus `(best, runner_up)` for
+/// the diagnostic. Used by the level-0 Z-Map check and by the composite
+/// check at every level: a flipped near-tie picks a different, equally valid
+/// frame whose value can differ by hundreds of LSBs.
 fn near_tie_status(
     reader: &WarpingReader,
     scores: &[Vec<f32>],
@@ -872,9 +824,7 @@ fn rebuild_composite_pixel_with_perturbations(
     output.tile.samples[start..start + spp as usize].to_vec()
 }
 
-/// [`rebuild_composite_pixel_with_perturbations`] for the single-source case
-/// -- kept as a thin wrapper so [`warp_noise_propagation_reachable`]'s own
-/// call sites and its self-check test don't change.
+/// [`rebuild_composite_pixel_with_perturbations`] for a single source.
 fn rebuild_composite_pixel_with_perturbation(
     reader: &WarpingReader,
     frame_count: usize,
@@ -892,22 +842,12 @@ fn rebuild_composite_pixel_with_perturbation(
     )
 }
 
-/// The bounded composite-reachability fallback for a disputed composite
-/// pixel [`near_tie_status`] could not explain at any pyramid level:
-/// whether a lone ±1 LSB perturbation of the recorded winner's own raw
-/// warped sample at `pixel`, propagated through the real CPU
-/// `Laplacian::fuse` reconstruction ([`rebuild_composite_pixel_with_perturbation`],
-/// never a shortcut recompute), moves the composite at `pixel` by at least
-/// `observed_delta` -- the actual GPU-vs-CPU delta this pixel showed. A
-/// mechanism genuinely distinct from [`reachable_near_tie`]: it never
-/// touches selection (the caller only reaches this after the Z-Map winner
-/// is already known to agree at every level), and it is not a search over
-/// the score window -- it is the warp kernel's own already-verified
-/// per-sample tolerance, amplified by `collapse`'s own clamp-to-edge tap
-/// repetition at a canvas boundary, read back through the one function
-/// that actually turns a fused Laplacian pyramid into 16-bit samples.
-/// Returns `(exempted, best_reachable_delta)` for the caller's own
-/// diagnostic print.
+/// Whether a lone ±1 LSB perturbation of the recorded winner's raw sample
+/// at `pixel`, rebuilt through the real `Laplacian::fuse`
+/// ([`rebuild_composite_pixel_with_perturbation`]), moves the composite by
+/// at least `observed_delta`. Selection never changes: this is the warp
+/// tolerance amplified by `collapse`'s clamp-to-edge taps at a boundary.
+/// Returns `(exempted, best_reachable_delta)`.
 fn warp_noise_propagation_reachable(
     reader: &WarpingReader,
     frame_count: usize,
@@ -1101,16 +1041,18 @@ fn assert_zmap_exact_or_near_tie(
 /// (`fuse_planes_gpu`'s tail only reads back level 0). The pixel is
 /// exempted from the tight assertion the moment any level explains it; the
 /// explaining level is counted and logged, never silently dropped.
-#[test]
-fn gpu_stack_matches_cpu_stack() {
+/// `backend` is a parameter so the same comparison runs at two device
+/// budgets ([`gpu_stack_matches_cpu_stack_at_probed_budget`],
+/// [`gpu_stack_matches_cpu_stack_at_a_forced_one_tile_budget`]).
+fn assert_gpu_matches_cpu_stack(label: &str, backend: &dyn TileBackend) {
     let stack = open_stack();
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
     let frame_count = stack.len();
     let transforms = non_identity_transforms(frame_count);
 
-    let cpu = run_cpu("composite", transforms.clone());
-    let Some(gpu) = run_gpu("composite", transforms.clone()) else {
+    let cpu = run_cpu(&format!("{label}_composite"), transforms.clone());
+    let Some(gpu) = run_gpu(&format!("{label}_composite"), transforms.clone(), backend) else {
         return;
     };
 
@@ -1153,9 +1095,8 @@ fn gpu_stack_matches_cpu_stack() {
 
         let mut explaining_level: Option<u32> = None;
         if pixel_worst_delta > 1 {
-            // Level 0 first: the only level with an actual observed GPU
-            // Z-Map value to compare against, and the cheapest (already
-            // built for the Z-Map test).
+            // Level 0 first: the only level with an observed GPU Z-Map value
+            // to compare against.
             if cpu_zmap[pixel] != gpu_zmap[pixel] {
                 let lp = level_pixel(pixel, width, 0);
                 let scores = level_scores_cached(
@@ -1351,15 +1292,38 @@ fn gpu_stack_matches_cpu_stack() {
 }
 
 #[test]
-fn gpu_zmap_matches_cpu_zmap_exactly() {
+fn gpu_stack_matches_cpu_stack_at_probed_budget() {
+    if focusforge_gpu::device::shared_device_or_skip().is_none() {
+        return;
+    }
+    let backend = gpu_backend().expect("gpu backend");
+    assert_gpu_matches_cpu_stack("probed_budget", backend);
+}
+
+/// The same comparison, forced onto a one-tile-in-flight `GpuBackend`
+/// (`GpuBackend::with_max_device_bytes(1)`) -- proves the composite and
+/// Z-Map do not move when the number of tiles in flight changes: the
+/// budget trades speed, never correctness.
+#[test]
+fn gpu_stack_matches_cpu_stack_at_a_forced_one_tile_budget() {
+    if focusforge_gpu::device::shared_device_or_skip().is_none() {
+        return;
+    }
+    let backend = GpuBackend::with_max_device_bytes(1).expect("tiny gpu backend");
+    assert_gpu_matches_cpu_stack("tiny_budget", &backend);
+}
+
+/// See [`assert_gpu_matches_cpu_stack`]'s own doc comment: `backend` is a
+/// parameter for the identical reason.
+fn assert_gpu_matches_cpu_zmap(label: &str, backend: &dyn TileBackend) {
     let stack = open_stack();
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
     let frame_count = stack.len();
     let transforms = non_identity_transforms(frame_count);
 
-    let cpu = run_cpu("zmap", transforms.clone());
-    let Some(gpu) = run_gpu("zmap", transforms.clone()) else {
+    let cpu = run_cpu(&format!("{label}_zmap"), transforms.clone());
+    let Some(gpu) = run_gpu(&format!("{label}_zmap"), transforms.clone(), backend) else {
         return;
     };
 
@@ -1370,6 +1334,25 @@ fn gpu_zmap_matches_cpu_zmap_exactly() {
     let scores = whole_canvas_level_scores(&stack, &transforms, width, height, spp, 0);
     let reader = WarpingReader::new(&stack, (width, height), spp, transforms.clone());
     assert_zmap_exact_or_near_tie(&gpu_zmap, &cpu_zmap, &scores, &reader, width, height, spp);
+}
+
+#[test]
+fn gpu_zmap_matches_cpu_zmap_exactly() {
+    if focusforge_gpu::device::shared_device_or_skip().is_none() {
+        return;
+    }
+    let backend = gpu_backend().expect("gpu backend");
+    assert_gpu_matches_cpu_zmap("probed_budget", backend);
+}
+
+/// The Z-Map twin of [`gpu_stack_matches_cpu_stack_at_a_forced_one_tile_budget`].
+#[test]
+fn gpu_zmap_matches_cpu_zmap_exactly_at_a_forced_one_tile_budget() {
+    if focusforge_gpu::device::shared_device_or_skip().is_none() {
+        return;
+    }
+    let backend = GpuBackend::with_max_device_bytes(1).expect("tiny gpu backend");
+    assert_gpu_matches_cpu_zmap("tiny_budget", &backend);
 }
 
 #[test]
@@ -1408,14 +1391,10 @@ fn warp_to_fusion_never_reads_back() {
     );
 }
 
-/// CPU-only (never opens a GPU device -- [`run_cpu`] is the tile scheduler
-/// over [`FusionConsumer`]/[`WarpingReader`], both pure CPU code): a
-/// self-check on [`warp_noise_propagation_reachable`] itself, ahead of
-/// [`gpu_stack_matches_cpu_stack`] ever calling it against a real GPU
-/// delta. Pixel 68615 (x=7, y=134, `fixtures/mantis-512`'s left canvas
-/// edge) is the residual pixel the fact-finding round (2026-09-14) found:
-/// its CPU Z-Map winner is deterministic, so the pixel and its winning
-/// frame are reproducible with no GPU involved.
+/// CPU-only self-check of [`warp_noise_propagation_reachable`] (no GPU
+/// device). Pixel 68615 (x=7, y=134, the fixture's left edge) is a known
+/// boundary residual; its CPU Z-Map winner is deterministic, so the pixel
+/// and its winning frame reproduce without a GPU.
 #[test]
 fn warp_noise_propagation_reachable_bounds_a_boundary_pixel() {
     let stack = open_stack();

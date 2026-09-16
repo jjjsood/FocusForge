@@ -139,6 +139,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             },
             default: ParamValue::Enum("rotation-scale".to_string()),
             auto: None,
+            host_default: None,
         },
         ParamDesc {
             id: "max-iterations".to_string(),
@@ -158,6 +159,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             kind: ParamKind::Int { min: 1, max: 1000 },
             default: ParamValue::Int(400),
             auto: None,
+            host_default: None,
         },
         ParamDesc {
             id: "epsilon-px".to_string(),
@@ -174,6 +176,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             },
             default: ParamValue::Float(1e-4),
             auto: None,
+            host_default: None,
         },
         ParamDesc {
             id: "pyramid-depth".to_string(),
@@ -190,6 +193,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             },
             default: ParamValue::Int(4),
             auto: Some(Arc::new(auto_pyramid_depth)),
+            host_default: None,
         },
         ParamDesc {
             id: "reference-policy".to_string(),
@@ -212,6 +216,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             },
             default: ParamValue::Enum("anchor".to_string()),
             auto: None,
+            host_default: None,
         },
         ParamDesc {
             id: "reference-frame".to_string(),
@@ -237,6 +242,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             },
             default: ParamValue::Enum("middle".to_string()),
             auto: None,
+            host_default: None,
         },
     ]
 });

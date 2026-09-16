@@ -17,6 +17,12 @@ use wgpu::{
 use crate::adapter::{AdapterPath, classify_adapter, skip_message};
 use crate::limits::{LimitShortfall, describe_shortfalls, device_limits, required_limits};
 
+/// The `for_resource_creation` threshold, as a percent of a heap's own
+/// budget: the value gfx-rs/wgpu#7460 itself proposes. Only D3D12 and
+/// (optionally, when `VK_EXT_memory_budget` is enabled) Vulkan honour this
+/// at all in wgpu 29.0.4.
+const MEMORY_BUDGET_THRESHOLD_PERCENT: u8 = 90;
+
 /// Everything that can go wrong bringing up the shared device, named rather
 /// than left as an adapter-creation panic.
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +46,29 @@ pub enum GpuError {
     /// rather than surfacing as a wgpu validation panic.
     #[error("tile needs a buffer this device cannot allocate: {detail}")]
     TileTooLarge { detail: String },
+
+    /// A readback (`crate::transfer::download_buffer`/`download_f32`)
+    /// failed: `device.poll` itself failed, the `map_async` callback never
+    /// fired, or the mapping it delivered was an error -- three panics
+    /// turned into one named, recoverable value.
+    #[error("readback failed: {detail}")]
+    Readback { detail: String },
+
+    /// An in-run allocation refusal caught by a `push_error_scope` /
+    /// `pop_error_scope(OutOfMemory)` pair around a tile's dispatch. Its
+    /// message names `--max-vram` as the flag to lower -- mid-run
+    /// exhaustion after a successful startup probe is a run failure, never
+    /// a fallback.
+    #[error("GPU ran out of device memory mid-run: {detail}; lower --max-vram to reduce demand")]
+    DeviceOutOfMemory { detail: String },
+
+    /// [`crate::budget::probe_budget`] backed all the way down to
+    /// [`crate::budget::PROBE_MIN_DEVICE_BYTES`] without a single accepted
+    /// reservation: the device cannot serve even the smallest budget. Maps
+    /// to [`crate::adapter::PathChoice::CpuFallback`] via `choose_path`,
+    /// exactly like [`GpuError::NoAdapter`].
+    #[error("device cannot serve even the minimum VRAM budget of {floor_bytes} bytes: {detail}")]
+    VramExhausted { floor_bytes: u64, detail: String },
 }
 
 impl GpuError {
@@ -76,6 +105,15 @@ impl From<GpuError> for focusforge_core::algorithm::AlgorithmError {
     fn from(err: GpuError) -> Self {
         focusforge_core::algorithm::AlgorithmError::Failed {
             algorithm: "gpu".to_string(),
+            detail: err.to_string(),
+        }
+    }
+}
+
+/// For `crate::warp`'s readback call sites, which return `AlignError`.
+impl From<GpuError> for focusforge_core::align::AlignError {
+    fn from(err: GpuError) -> Self {
+        focusforge_core::align::AlignError::Backend {
             detail: err.to_string(),
         }
     }
@@ -150,10 +188,10 @@ impl SharedDevice {
     }
 }
 
-/// Same trick `i-slint-core`'s wgpu_29 backend uses: wgpu's adapter/device
-/// request futures are ready on first poll on every native platform, so no
-/// async executor dependency is needed here.
-fn block_on<F: Future>(future: F) -> F::Output {
+/// wgpu's adapter/device request and error-scope futures are ready on first
+/// poll on every native platform (the same approach `i-slint-core`'s wgpu_29
+/// backend takes), so no async executor is needed.
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     let mut future = std::pin::pin!(future);
@@ -170,7 +208,13 @@ fn init() -> Result<SharedDevice, GpuError> {
         backends: Backends::from_env().unwrap_or_default(),
         flags: InstanceFlags::from_build_config().with_env(),
         backend_options: wgpu::BackendOptions::from_env_or_default(),
-        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        // `for_device_loss` stays `None` on purpose: arming it risks
+        // `download_buffer`'s poll path hitting a device-loss panic instead
+        // of the recoverable `OutOfMemory` error scope this crate builds.
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds {
+            for_resource_creation: Some(MEMORY_BUDGET_THRESHOLD_PERCENT),
+            for_device_loss: None,
+        },
         display: None,
     });
 
@@ -235,29 +279,7 @@ pub fn shared_device() -> Result<&'static SharedDevice, &'static GpuError> {
 /// `None` instead of propagating the error -- the one place a test learns
 /// there is no GPU. Tests call this and `return` early so a skip prints a
 /// reason instead of failing or silently passing.
-///
-/// **Also the `FF_GPU_PARITY` runtime skip guard:**
-/// `crates/gui` depending on `focusforge-gpu`'s `gpu` feature
-/// unifies that feature on for plain `cargo test --workspace`, which would
-/// otherwise pull `crates/gpu/tests/harness.rs`'s ~2,500-line parity suite
-/// into the default gate. Every test in that binary already routes through
-/// this function, so it is the one place to gate at: unless the environment
-/// variable `FF_GPU_PARITY` is exactly `"1"`, this prints a skip and returns
-/// `None` regardless of whether a usable adapter exists -- enables rather
-/// than requires, the inverse polarity of `FF_REQUIRE_SYNTH_ALIGN`
-/// (`crates/cli/tests/synthetic_ground_truth.rs`), because a GPU being
-/// present is not itself a reason to spend minutes of the default gate on
-/// parity. This function has **zero** production callers --
-/// `crates/cli/src/gpu.rs` goes through `gpu_backend()`, not this -- so the
-/// guard cannot reach a user-facing path.
 pub fn shared_device_or_skip() -> Option<&'static SharedDevice> {
-    if std::env::var("FF_GPU_PARITY").as_deref() != Ok("1") {
-        println!(
-            "{}",
-            skip_message("FF_GPU_PARITY is not set to \"1\" -- set it to run the GPU parity suite")
-        );
-        return None;
-    }
     match shared_device() {
         Ok(device) => Some(device),
         Err(err) => {

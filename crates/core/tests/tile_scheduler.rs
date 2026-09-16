@@ -31,13 +31,12 @@ fn scratch_base(label: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("tile_scheduler_scratch_{label}"))
 }
 
-fn options(label: &str, max_bytes_in_flight: usize) -> TileSchedulerOptions {
-    TileSchedulerOptions {
-        tile_size: 200,
-        levels: 3,
-        max_bytes_in_flight,
-        scratch_base: scratch_base(label),
-    }
+fn options(label: &str, max_bytes_in_flight: u64) -> TileSchedulerOptions {
+    let mut options =
+        TileSchedulerOptions::explicit_budget(scratch_base(label), max_bytes_in_flight);
+    options.tile_size = 200;
+    options.levels = 3;
+    options
 }
 
 /// A consumer that crops frame 0's read tile down to the tile's interior
@@ -152,10 +151,7 @@ fn output_is_thread_count_independent() {
     run_passthrough(&out_1, &options("thread1", 1));
 
     let out_8 = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("thread_count_8.tif");
-    run_passthrough(
-        &out_8,
-        &options("thread8", (bytes_per_tile_set * 8) as usize),
-    );
+    run_passthrough(&out_8, &options("thread8", bytes_per_tile_set * 8));
 
     let bytes_1 = std::fs::read(&out_1).unwrap();
     let bytes_8 = std::fs::read(&out_8).unwrap();
@@ -367,13 +363,12 @@ fn consumer_error_names_its_tile() {
     );
 }
 
-/// `#[ignore]`d: reads the 16 GB reference stack. Runs once, at the end,
-/// with `--nocapture` to see the recorded wall clock and `VmHWM`.
+/// `#[ignore]`d: reads the 16 GB reference stack. Run with `--nocapture` to
+/// see the wall clock and `VmHWM`.
 #[test]
 #[ignore = "reads the 16 GB reference stack"]
 fn schedules_over_the_reference_stack() {
     let Some(stack_dir) = common::reference_stack_dir() else {
-        eprintln!("reference stack not found; skipping");
         return;
     };
 

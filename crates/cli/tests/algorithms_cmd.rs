@@ -95,9 +95,16 @@ fn reports_an_auto_hook_as_unevaluated() {
         stdout.contains("threshold: ") && stdout.contains("(Default)"),
         "threshold's provenance with no --set must be Default, not Auto: {stdout}"
     );
+    // A *stack* `auto` hook is still never evaluated here (no `(Auto)` ever
+    // appears), but a host-derived default *is* evaluated -- `(Host)` is
+    // expected to appear on `dummy-stack`'s `workers` parameter.
     assert!(
         !stdout.contains("(Auto)"),
-        "no reported provenance may be Auto -- the auto hook is never evaluated here: {stdout}"
+        "no reported provenance may be Auto -- a stack auto hook is never evaluated here: {stdout}"
+    );
+    assert!(
+        stdout.contains("workers: ") && stdout.contains("(Host)"),
+        "dummy-stack's host-derived `workers` parameter must report (Host): {stdout}"
     );
 }
 

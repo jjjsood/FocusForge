@@ -119,9 +119,9 @@
 //!   **70 px at every level except level 4, where it is 78 px** -- `r_k`
 //!   halves as `2^k` doubles, so each level spends the same 8 px of
 //!   headroom, except level 4 where `r_4 = 1` (the `max(1, ...)` clamp
-//!   binds) while `2^4 = 16` still multiplies it. **78 px is exactly
-//!   today's (pre-this-item) worst case, so `MEASURED_MARGIN` does not
-//!   move.** Every one of these cones sits inside the 96 px margin
+//!   binds) while `2^4 = 16` still multiplies it. **78 px is the worst
+//!   case, so `MEASURED_MARGIN` does not need to move.** Every one of
+//!   these cones sits inside the 96 px margin
 //!   `MEASURED_MARGIN[5]` (rounded by [`crate::tile::plan::margin_for_levels`])
 //!   publishes, so every interior pixel's *selection* reads bit-identical
 //!   samples in the tiled and untiled runs, combined in the same order on
@@ -147,7 +147,7 @@
 //! becomes `4 * 160 + 64 = 704`, so the default 512 px tile would fall
 //! below the minimum planning tile entirely.
 //!
-//! | level `k` | cone today, `62 + 2^k` (fixed radius 1) | cone with `W = 8`, `62 + 2^k * r_k` |
+//! | level `k` | cone at fixed radius 1, `62 + 2^k` | cone with `W = 8`, `62 + 2^k * r_k` |
 //! |---|---|---|
 //! | 0 | 63 | 70 |
 //! | 1 | 64 | 70 |
@@ -213,6 +213,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         },
         default: ParamValue::Int(DEFAULT_LEVELS as i64),
         auto: Some(Arc::new(auto_levels)),
+        host_default: None,
     }]
 });
 
@@ -540,9 +541,9 @@ mod tests {
     #[test]
     fn every_parameter_the_implementation_reads_is_declared() {
         // `fuse` reads exactly one key, "levels" -- omitting it from an
-        // otherwise-valid `cfg` must be the named error of step 5.1, never
-        // a panic, which is what proves the implementation never reaches
-        // past its own declared schema.
+        // otherwise-valid `cfg` must be a named error, never a panic, which
+        // is what proves the implementation never reaches past its own
+        // declared schema.
         let algo = Laplacian;
         let (rect_, tiles) = {
             let (w, h, spp) = (8u32, 8u32, 3u32);

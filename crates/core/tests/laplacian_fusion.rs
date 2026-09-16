@@ -51,7 +51,7 @@ fn run_fusion(
     label: &str,
     tile_size: u32,
     levels: u32,
-    max_bytes_in_flight: usize,
+    max_bytes_in_flight: u64,
     reader: &dyn TileReader,
     stack_ctx: StackContext,
     crop: Option<Rect>,
@@ -79,12 +79,9 @@ fn run_fusion(
 
     let scheduler_scratch =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("laplacian_fusion_{label}"));
-    let options = TileSchedulerOptions {
-        tile_size,
-        levels,
-        max_bytes_in_flight,
-        scratch_base: scheduler_scratch,
-    };
+    let mut options = TileSchedulerOptions::explicit_budget(scheduler_scratch, max_bytes_in_flight);
+    options.tile_size = tile_size;
+    options.levels = levels;
     let scheduler =
         TileScheduler::new(reader, stack_ctx, spp, &options).expect("scheduler must build");
     let consumer = FusionConsumer::create(

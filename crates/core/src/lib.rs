@@ -11,6 +11,7 @@ pub mod align;
 pub mod display;
 pub mod fuse;
 pub mod gpu;
+pub mod host;
 pub mod io;
 pub mod params;
 pub mod registry;

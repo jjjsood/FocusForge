@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 
 pub use error::{ParamError, ParamViolation};
 
+use crate::host::HostFacts;
+
 /// One value an [`ParamKind::Enum`] descriptor can take: `id` is the
 /// `--set mode=<id>` token and the key a schema instance compares against,
 /// `label` is what a GUI combo box shows. Decoupled from day one so a label
@@ -112,6 +114,16 @@ impl StackContext {
 /// declaration.
 pub type AutoFn = Arc<dyn Fn(&StackContext) -> ParamValue + Send + Sync>;
 
+/// A closure deriving a value for one parameter from host resource facts
+/// instead of the stack being processed. A sibling to [`AutoFn`], not a
+/// widened version of it: `algorithms --json` evaluates a host-derived
+/// default with no `StackContext` at all (no image is loaded there), and
+/// one closure type taking both a `&StackContext` and a `&HostFacts` would
+/// give that caller no way to tell which hooks need the stack it does not
+/// have. A descriptor may declare both `auto` and `host_default`;
+/// [`resolve_in`] lets `auto` win.
+pub type HostFn = Arc<dyn Fn(&HostFacts) -> ParamValue + Send + Sync>;
+
 /// One algorithm setting, described as data rather than as a struct field:
 /// its identity, its allowed shape, its default, and an optional hook that
 /// derives a value from the stack instead of the plain default.
@@ -129,6 +141,11 @@ pub struct ParamDesc {
     /// Not data, so never serialized: dropped to `None` on deserialize.
     #[serde(skip)]
     pub auto: Option<AutoFn>,
+    /// Not data, so never serialized: dropped to `None` on deserialize.
+    /// Host facts stay outside `ParamDesc`'s own schema data for the same
+    /// reason `auto` does -- see [`HostFn`].
+    #[serde(skip)]
+    pub host_default: Option<HostFn>,
 }
 
 impl fmt::Debug for ParamDesc {
@@ -140,6 +157,7 @@ impl fmt::Debug for ParamDesc {
             .field("kind", &self.kind)
             .field("default", &self.default)
             .field("auto", &self.auto.as_ref().map(|_| "..."))
+            .field("host_default", &self.host_default.as_ref().map(|_| "..."))
             .finish()
     }
 }
@@ -274,6 +292,13 @@ pub type ParamValues = BTreeMap<String, ParamValue>;
 pub enum Provenance {
     Explicit,
     Auto,
+    /// Derived from host resource facts (`desc.host_default`) while those
+    /// facts were actually probed (`FactsOrigin::Probed`).
+    Host,
+    /// `desc.host_default` exists, but host facts were unavailable -- the
+    /// hook was not called, and the descriptor's own stated `default` was
+    /// used instead.
+    HostFallback,
     Default,
 }
 
@@ -385,24 +410,68 @@ pub fn validate(schema: &[ParamDesc], values: &ParamValues) -> Result<(), ParamE
 /// and every resolved value is normalized to the descriptor's declared
 /// kind — an `Int` accepted against a `Float` descriptor is stored as
 /// `Float`, so no consumer has to know the widening rule existed.
+///
+/// A thin wrapper over [`resolve_in`] with a [`StackContext`] always
+/// supplied: `resolve_in(schema, values, Some(ctx),
+/// &crate::host::snapshot())`.
 pub fn resolve(
     schema: &[ParamDesc],
     values: &ParamValues,
     ctx: &StackContext,
+) -> Result<ResolvedParams, ParamError> {
+    resolve_in(schema, values, Some(ctx), &crate::host::snapshot())
+}
+
+/// Resolves a schema plus a partial set of explicit values, an optional
+/// [`StackContext`] and [`HostFacts`] into a complete set in which every
+/// entry knows where it came from. The one resolution body both `resolve`
+/// (always has a stack) and `focusforge-cli algorithms` (never has one, but
+/// always has host facts) go through.
+///
+/// Resolution order:
+/// 1. an explicit value wins, reported [`Provenance::Explicit`];
+/// 2. `desc.auto`, but only when `ctx.is_some()` -- with no stack loaded
+///    the hook is skipped, not run, which is what keeps a stack `auto`
+///    hook unevaluated by `algorithms`;
+/// 3. `desc.host_default`, when `host.origin()` is `Probed`, reported
+///    [`Provenance::Host`];
+/// 4. `desc.host_default`, when `host.origin()` is `Fallback` -- the hook
+///    is *not* called at all, and the descriptor's own stated `default` is
+///    used instead, reported [`Provenance::HostFallback`];
+/// 5. otherwise the descriptor's own stated `default`, reported
+///    [`Provenance::Default`].
+///
+/// A descriptor declaring both `auto` and `host_default` is legal; `auto`
+/// wins when a `ctx` is available (branch 2 is checked first). Every
+/// resolved value is normalized to the descriptor's declared kind. An
+/// out-of-range value computed by `auto` or `host_default` is wrapped in
+/// [`ParamViolation::Auto`], naming the hook rather than just the range.
+pub fn resolve_in(
+    schema: &[ParamDesc],
+    values: &ParamValues,
+    ctx: Option<&StackContext>,
+    host: &HostFacts,
 ) -> Result<ResolvedParams, ParamError> {
     let mut violations = Vec::new();
     let mut resolved = BTreeMap::new();
     for desc in schema {
         let (value, provenance) = if let Some(v) = values.get(&desc.id) {
             (v.clone(), Provenance::Explicit)
-        } else if let Some(auto) = &desc.auto {
+        } else if let (Some(auto), Some(ctx)) = (&desc.auto, ctx) {
             (auto(ctx), Provenance::Auto)
+        } else if let Some(host_default) = &desc.host_default {
+            match host.origin() {
+                crate::host::FactsOrigin::Probed => (host_default(host), Provenance::Host),
+                crate::host::FactsOrigin::Fallback => {
+                    (desc.default.clone(), Provenance::HostFallback)
+                }
+            }
         } else {
             (desc.default.clone(), Provenance::Default)
         };
-        // Checked exactly once per parameter: an `Auto` value's own violation
-        // is wrapped so a computed-out-of-range value names the hook, not
-        // just the range.
+        // Checked exactly once per parameter: a computed value's own
+        // violation is wrapped so an out-of-range `Auto`/`Host` value names
+        // the hook, not just the range.
         match check(desc, &value) {
             Ok(()) => {
                 let normalized = normalize(desc, value);
@@ -414,14 +483,16 @@ pub fn resolve(
                     },
                 );
             }
-            Err(violation) => violations.push(if provenance == Provenance::Auto {
-                ParamViolation::Auto {
-                    id: desc.id.clone(),
-                    source: Box::new(violation),
-                }
-            } else {
-                violation
-            }),
+            Err(violation) => violations.push(
+                if matches!(provenance, Provenance::Auto | Provenance::Host) {
+                    ParamViolation::Auto {
+                        id: desc.id.clone(),
+                        source: Box::new(violation),
+                    }
+                } else {
+                    violation
+                },
+            ),
         }
     }
     if violations.is_empty() {
@@ -471,6 +542,7 @@ mod tests {
             },
             default: ParamValue::Float(default),
             auto: None,
+            host_default: None,
         }
     }
 
@@ -482,6 +554,7 @@ mod tests {
             kind: ParamKind::Int { min, max },
             default: ParamValue::Int(default),
             auto: None,
+            host_default: None,
         }
     }
 
@@ -493,6 +566,7 @@ mod tests {
             kind: ParamKind::Bool,
             default: ParamValue::Bool(default),
             auto: None,
+            host_default: None,
         }
     }
 
@@ -512,6 +586,7 @@ mod tests {
             },
             default: ParamValue::Enum(default.to_string()),
             auto: None,
+            host_default: None,
         }
     }
 
@@ -683,6 +758,121 @@ mod tests {
             }
             other => panic!("expected Auto, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_in_host_default_branch_when_probed() {
+        let mut desc = int_desc("workers", 1, 64, 1);
+        desc.host_default = Some(Arc::new(|f: &crate::host::HostFacts| {
+            ParamValue::Int(f.logical_cores() as i64)
+        }));
+        let schema = vec![desc];
+        let host = crate::host::HostFacts::new(16_000_000_000, 8_000_000_000, None, None, 7);
+
+        let resolved = resolve_in(&schema, &ParamValues::new(), None, &host).unwrap();
+        assert_eq!(resolved["workers"].value, ParamValue::Int(7));
+        assert_eq!(resolved["workers"].provenance, Provenance::Host);
+    }
+
+    #[test]
+    fn resolve_in_host_fallback_reports_stated_default_and_never_calls_the_hook() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_in_hook = Arc::clone(&called);
+        let mut desc = int_desc("workers", 1, 64, 3);
+        desc.host_default = Some(Arc::new(move |_f: &crate::host::HostFacts| {
+            called_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+            ParamValue::Int(999)
+        }));
+        let schema = vec![desc];
+        let host = crate::host::HostFacts::fallback();
+
+        let resolved = resolve_in(&schema, &ParamValues::new(), None, &host).unwrap();
+        assert_eq!(resolved["workers"].value, ParamValue::Int(3));
+        assert_eq!(resolved["workers"].provenance, Provenance::HostFallback);
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "the host_default hook must not be called when facts are a fallback"
+        );
+    }
+
+    #[test]
+    fn resolve_in_auto_wins_over_host_default_when_a_ctx_is_available() {
+        let mut desc = float_desc("threshold", 0.0, 10.0, 2.5);
+        desc.auto = Some(Arc::new(|ctx: &StackContext| {
+            ParamValue::Float(ctx.frame_count as f64)
+        }));
+        desc.host_default = Some(Arc::new(|_f: &crate::host::HostFacts| {
+            ParamValue::Float(9.0)
+        }));
+        let schema = vec![desc];
+        let ctx = StackContext::new(4, 100, 100, 3);
+        let host = crate::host::HostFacts::new(1, 1, None, None, 1);
+
+        let resolved = resolve_in(&schema, &ParamValues::new(), Some(&ctx), &host).unwrap();
+        assert_eq!(resolved["threshold"].value, ParamValue::Float(4.0));
+        assert_eq!(resolved["threshold"].provenance, Provenance::Auto);
+    }
+
+    #[test]
+    fn resolve_in_ctx_none_leaves_a_stack_auto_hook_unevaluated() {
+        let mut desc = float_desc("threshold", 0.0, 10.0, 2.5);
+        desc.auto = Some(Arc::new(|_ctx: &StackContext| {
+            panic!("a stack auto hook must not be called when ctx is None")
+        }));
+        let schema = vec![desc];
+        let host = crate::host::HostFacts::fallback();
+
+        let resolved = resolve_in(&schema, &ParamValues::new(), None, &host).unwrap();
+        assert_eq!(resolved["threshold"].value, ParamValue::Float(2.5));
+        assert_eq!(resolved["threshold"].provenance, Provenance::Default);
+    }
+
+    #[test]
+    fn resolve_in_explicit_still_wins_over_host_default() {
+        let mut desc = int_desc("workers", 1, 64, 1);
+        desc.host_default = Some(Arc::new(|f: &crate::host::HostFacts| {
+            ParamValue::Int(f.logical_cores() as i64)
+        }));
+        let schema = vec![desc];
+        let host = crate::host::HostFacts::new(1, 1, None, None, 7);
+        let mut values = ParamValues::new();
+        values.insert("workers".to_string(), ParamValue::Int(2));
+
+        let resolved = resolve_in(&schema, &values, None, &host).unwrap();
+        assert_eq!(resolved["workers"].value, ParamValue::Int(2));
+        assert_eq!(resolved["workers"].provenance, Provenance::Explicit);
+    }
+
+    #[test]
+    fn resolve_in_out_of_range_host_value_is_wrapped_naming_the_parameter() {
+        let mut desc = int_desc("workers", 1, 64, 1);
+        desc.host_default = Some(Arc::new(|_f: &crate::host::HostFacts| ParamValue::Int(999)));
+        let schema = vec![desc];
+        let host = crate::host::HostFacts::new(1, 1, None, None, 1);
+
+        let err = resolve_in(&schema, &ParamValues::new(), None, &host).unwrap_err();
+        assert_eq!(err.violations().len(), 1);
+        match &err.violations()[0] {
+            ParamViolation::Auto { id, source } => {
+                assert_eq!(id, "workers");
+                match source.as_ref() {
+                    ParamViolation::OutOfRange { value, .. } => assert_eq!(*value, 999.0),
+                    other => panic!("expected OutOfRange, got {other:?}"),
+                }
+            }
+            other => panic!("expected Auto (wrapping a Host value), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_in_plain_default_when_neither_auto_nor_host_default_declared() {
+        let desc = float_desc("threshold", 0.0, 10.0, 2.5);
+        let schema = vec![desc];
+        let host = crate::host::HostFacts::fallback();
+
+        let resolved = resolve_in(&schema, &ParamValues::new(), None, &host).unwrap();
+        assert_eq!(resolved["threshold"].value, ParamValue::Float(2.5));
+        assert_eq!(resolved["threshold"].provenance, Provenance::Default);
     }
 
     #[test]

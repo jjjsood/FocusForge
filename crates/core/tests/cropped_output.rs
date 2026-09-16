@@ -48,12 +48,9 @@ fn cropped_run_declares_both_outputs_at_the_crop() {
 
     let scheduler_scratch =
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cropped_output_scheduler");
-    let options = TileSchedulerOptions {
-        tile_size: 448,
-        levels: 5,
-        max_bytes_in_flight: 1 << 30,
-        scratch_base: scheduler_scratch,
-    };
+    let mut options = TileSchedulerOptions::explicit_budget(scheduler_scratch, 1 << 30);
+    options.tile_size = 448;
+    options.levels = 5;
     let scheduler =
         TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
 

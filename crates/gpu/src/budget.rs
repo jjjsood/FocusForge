@@ -5,17 +5,26 @@
 //! scheduler's host-memory budget. Names no `wgpu` type, so it is not
 //! feature-gated.
 //!
-//! **Why a stated constant, not a measured VRAM size.** wgpu 29.0.4 exposes
-//! no adapter memory-size query at all (`Adapter` docs:
+//! **Why a probe, and why the constant survives as the degraded answer.**
+//! wgpu 29.0.4 exposes no adapter memory-size query at all (`Adapter` docs:
 //! <https://docs.rs/wgpu/29.0.4/wgpu/struct.Adapter.html> -- `limits`,
 //! `get_info`, `features`, `get_downlevel_capabilities`,
 //! `get_texture_format_features`, `get_presentation_timestamp`, nothing
-//! memory-sized; gfx-rs/wgpu#2447 is open). [`DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`]
-//! is therefore a stated 1 GiB ceiling, identical reasoning to
-//! `crate::tile::scheduler::DEFAULT_MAX_BYTES_IN_FLIGHT`. The adapter's
-//! reported limits are used for what they *can* answer: refusing, before
-//! dispatch, a single allocation that would exceed a hard device limit
-//! (`buffer_limit_shortfalls`, below).
+//! memory-sized; gfx-rs/wgpu#2447 is open). There is therefore no device
+//! total to read, so the budget this crate actually uses is discovered by
+//! [`probe_budget`]: an optimistic-but-bounded starting request
+//! ([`PROBE_START_MULTIPLE`] times [`DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`]),
+//! halved on each refusal down to a stated floor
+//! ([`PROBE_MIN_DEVICE_BYTES`]), within a bounded number of attempts
+//! ([`PROBE_MAX_ATTEMPTS`]) -- allocate-and-back-off, not a design
+//! preference but the only path available.
+//! [`DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`] is not deleted: it survives as
+//! [`DeviceBudget::fallback`], the degraded answer used when no probe ran at
+//! all, identical reasoning to `crate::tile::scheduler::DEFAULT_MAX_BYTES_IN_FLIGHT`.
+//! The adapter's reported limits are used for what they *can* answer:
+//! refusing, before dispatch, a single allocation that would exceed a hard
+//! device limit (`buffer_limit_shortfalls`, below) -- a separate, smaller
+//! concern than the working-set budget this module discovers.
 //!
 //! **Why every byte allocated during a tile, not a live high-water mark.**
 //! `wgpu::Buffer`'s drop does not promise immediate reclamation, and this
@@ -30,6 +39,8 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
+
+use focusforge_core::params::Provenance;
 
 use crate::limits::LimitShortfall;
 use crate::pack::packed_len;
@@ -237,6 +248,150 @@ pub fn buffer_limit_shortfalls(
     out
 }
 
+/// The device-side VRAM working-set budget: a byte count, where it came
+/// from, and whether a live probe set it. Mirrors `HostBudget`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceBudget {
+    bytes: u64,
+    provenance: Provenance,
+    probed: bool,
+}
+
+impl DeviceBudget {
+    /// A budget [`probe_budget`] actually settled on.
+    pub fn probed(bytes: u64) -> Self {
+        DeviceBudget {
+            bytes,
+            provenance: Provenance::Host,
+            probed: true,
+        }
+    }
+
+    /// The degraded answer: [`DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`], used
+    /// when no probe ran at all.
+    pub fn fallback() -> Self {
+        DeviceBudget {
+            bytes: DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT,
+            provenance: Provenance::HostFallback,
+            probed: false,
+        }
+    }
+
+    /// A caller-supplied budget: never probes -- the constructor
+    /// `GpuBackend::with_max_device_bytes` uses for a test that needs an
+    /// explicit ceiling without touching the real device, mirroring
+    /// `HostBudget::explicit`.
+    pub fn explicit(bytes: u64) -> Self {
+        DeviceBudget {
+            bytes,
+            provenance: Provenance::Explicit,
+            probed: false,
+        }
+    }
+
+    /// Applies a ceiling: lowers to `ceiling` (reported `Explicit`) only when
+    /// it is below the current value; otherwise changes nothing, provenance
+    /// included. Same rule as `HostBudget::capped_to`.
+    pub fn capped_to(self, ceiling: Option<u64>) -> Self {
+        match ceiling {
+            Some(ceiling) if ceiling < self.bytes => DeviceBudget {
+                bytes: ceiling,
+                provenance: Provenance::Explicit,
+                probed: self.probed,
+            },
+            _ => self,
+        }
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub fn provenance(&self) -> Provenance {
+        self.provenance
+    }
+
+    /// Whether this budget was actually set by a live probe.
+    pub fn was_probed(&self) -> bool {
+        self.probed
+    }
+}
+
+/// The wgpu-free seam a real allocation attempt is made through -- the same
+/// "stay testable in the default, GPU-free gate" trick `crate::adapter`'s
+/// generic `classify_adapter` already uses. `WgpuAllocProbe` (in the `vram` module)
+/// is the real, `gpu`-feature-gated implementor; the tests in this module
+/// drive a fake.
+pub trait DeviceAllocProbe {
+    /// Attempts to reserve `bytes` on the device, returning `Err` naming why
+    /// on refusal.
+    fn try_reserve(&self, bytes: u64) -> Result<(), String>;
+}
+
+/// The optimistic starting multiple of [`DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`]
+/// [`probe_budget`] first asks for -- bounded, not unbounded, because a
+/// Vulkan adapter without `VK_EXT_memory_budget` never refuses at all, so an
+/// unbounded start would settle at "as much as
+/// possible" instead of a stated ceiling. The in-flight *tile* count stays
+/// capped independently by `VramBudget`'s `cap` field.
+pub const PROBE_START_MULTIPLE: u64 = 8;
+
+/// The floor the probe backs off to and stops: one `max_buffer_size` chunk
+/// at `downlevel_defaults()` (`crate::limits::required_limits`,
+/// `wgpu::Limits::downlevel_defaults().max_buffer_size == 256 MiB`).
+pub const PROBE_MIN_DEVICE_BYTES: u64 = 256 << 20;
+
+/// The number of attempts [`probe_budget`] makes before giving up -- exactly
+/// the number of halvings from `PROBE_START_MULTIPLE *
+/// DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT` (8 GiB) down to
+/// [`PROBE_MIN_DEVICE_BYTES`] (256 MiB), inclusive of the first,
+/// unhalved attempt: `8 GiB / 256 MiB == 32 == 2^5`, five halvings plus the
+/// initial request is six attempts. Derived from the other two constants
+/// rather than picked independently.
+pub const PROBE_MAX_ATTEMPTS: u32 = 6;
+
+/// What [`probe_budget`] settled on: a byte count and how many attempts it
+/// took, or -- refused all the way down to [`PROBE_MIN_DEVICE_BYTES`] -- the
+/// floor and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Settled { bytes: u64, attempts: u32 },
+    Exhausted { floor: u64, detail: String },
+}
+
+/// Allocate-and-back-off: starts at `PROBE_START_MULTIPLE *
+/// DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`, halving on each refusal, down to
+/// `PROBE_MIN_DEVICE_BYTES`, for at most `PROBE_MAX_ATTEMPTS` attempts. Never
+/// raises the request after a refusal -- monotonically non-increasing across
+/// attempts by construction, which is the no-oscillation property,
+/// asserted directly by this module's own tests rather than merely argued
+/// in prose.
+pub fn probe_budget(probe: &dyn DeviceAllocProbe) -> ProbeOutcome {
+    let mut request = PROBE_START_MULTIPLE * DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT;
+    let mut last_detail = String::new();
+    for attempt in 1..=PROBE_MAX_ATTEMPTS {
+        match probe.try_reserve(request) {
+            Ok(()) => {
+                return ProbeOutcome::Settled {
+                    bytes: request,
+                    attempts: attempt,
+                };
+            }
+            Err(detail) => {
+                last_detail = detail;
+                if request <= PROBE_MIN_DEVICE_BYTES {
+                    break;
+                }
+                request = (request / 2).max(PROBE_MIN_DEVICE_BYTES);
+            }
+        }
+    }
+    ProbeOutcome::Exhausted {
+        floor: PROBE_MIN_DEVICE_BYTES,
+        detail: last_detail,
+    }
+}
+
 /// An RAII permit from [`VramBudget::acquire`]: dropping it always
 /// decrements the in-flight count and wakes every waiter, so an early `?`
 /// return from inside the wrapped call releases the permit exactly as
@@ -323,6 +478,154 @@ impl VramBudget {
 mod tests {
     use super::*;
     use crate::limits::describe_shortfalls;
+    use focusforge_core::params::Provenance;
+
+    // --- DeviceBudget ---
+
+    #[test]
+    fn probed_reports_host_provenance() {
+        let budget = DeviceBudget::probed(12_345);
+        assert_eq!(budget.bytes(), 12_345);
+        assert_eq!(budget.provenance(), Provenance::Host);
+    }
+
+    #[test]
+    fn fallback_reports_the_stated_constant_and_host_fallback_provenance() {
+        let budget = DeviceBudget::fallback();
+        assert_eq!(budget.bytes(), DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT);
+        assert_eq!(budget.provenance(), Provenance::HostFallback);
+    }
+
+    #[test]
+    fn capped_to_lowers_when_the_ceiling_is_smaller() {
+        let budget = DeviceBudget::probed(1_000).capped_to(Some(100));
+        assert_eq!(budget.bytes(), 100);
+        assert_eq!(budget.provenance(), Provenance::Explicit);
+    }
+
+    #[test]
+    fn capped_to_leaves_a_higher_ceiling_unchanged() {
+        let original = DeviceBudget::probed(1_000);
+        let capped = original.capped_to(Some(u64::MAX));
+        assert_eq!(capped, original);
+        assert_eq!(capped.provenance(), Provenance::Host);
+    }
+
+    #[test]
+    fn capped_to_none_leaves_the_budget_unchanged() {
+        let original = DeviceBudget::probed(1_000);
+        assert_eq!(original.capped_to(None), original);
+    }
+
+    // --- probe_budget ---
+
+    /// A scripted [`DeviceAllocProbe`]: refuses any request strictly above
+    /// `accepts_up_to`, recording every requested byte count it was asked
+    /// to try.
+    struct FakeProbe {
+        accepts_up_to: u64,
+        requests: Mutex<Vec<u64>>,
+    }
+
+    impl FakeProbe {
+        fn new(accepts_up_to: u64) -> Self {
+            FakeProbe {
+                accepts_up_to,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DeviceAllocProbe for FakeProbe {
+        fn try_reserve(&self, bytes: u64) -> Result<(), String> {
+            self.requests.lock().unwrap().push(bytes);
+            if bytes <= self.accepts_up_to {
+                Ok(())
+            } else {
+                Err(format!("refused {bytes} bytes"))
+            }
+        }
+    }
+
+    #[test]
+    fn probe_settles_immediately_when_the_optimistic_start_is_accepted() {
+        let probe = FakeProbe::new(u64::MAX);
+        let outcome = probe_budget(&probe);
+        match outcome {
+            ProbeOutcome::Settled { bytes, attempts } => {
+                assert_eq!(
+                    bytes,
+                    PROBE_START_MULTIPLE * DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT
+                );
+                assert_eq!(attempts, 1);
+            }
+            ProbeOutcome::Exhausted { .. } => panic!("expected Settled, got Exhausted"),
+        }
+        assert_eq!(probe.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_injected_refusal_shrinks_and_settles_at_the_largest_accepted_value() {
+        // Refuses the optimistic start (8 GiB) but accepts everything at or
+        // below one halving down (4 GiB): the loop must shrink exactly once
+        // and settle there.
+        let ceiling = PROBE_START_MULTIPLE * DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT / 2;
+        let probe = FakeProbe::new(ceiling);
+        let outcome = probe_budget(&probe);
+        match outcome {
+            ProbeOutcome::Settled { bytes, attempts } => {
+                assert_eq!(bytes, ceiling);
+                assert_eq!(attempts, 2);
+            }
+            ProbeOutcome::Exhausted { .. } => panic!("expected Settled, got Exhausted"),
+        }
+    }
+
+    #[test]
+    fn probe_converges_within_the_attempt_bound_and_never_raises_the_request() {
+        // Never accepts anything -- the worst case for both the attempt
+        // bound and monotonicity.
+        let probe = FakeProbe::new(0);
+        let outcome = probe_budget(&probe);
+        let requests = probe.requests.lock().unwrap().clone();
+        assert!(
+            requests.len() as u32 <= PROBE_MAX_ATTEMPTS,
+            "probe made {} attempts, bound is {PROBE_MAX_ATTEMPTS}",
+            requests.len()
+        );
+        for pair in requests.windows(2) {
+            assert!(
+                pair[1] <= pair[0],
+                "request size must never grow: {:?}",
+                requests
+            );
+        }
+        match outcome {
+            ProbeOutcome::Exhausted { floor, .. } => {
+                assert_eq!(floor, PROBE_MIN_DEVICE_BYTES);
+            }
+            ProbeOutcome::Settled { .. } => panic!("expected Exhausted, got Settled"),
+        }
+    }
+
+    #[test]
+    fn refused_all_the_way_down_yields_exhausted_naming_the_floor() {
+        let probe = FakeProbe::new(0);
+        let outcome = probe_budget(&probe);
+        match outcome {
+            ProbeOutcome::Exhausted { floor, detail } => {
+                assert_eq!(floor, PROBE_MIN_DEVICE_BYTES);
+                assert!(!detail.is_empty());
+            }
+            ProbeOutcome::Settled { .. } => panic!("expected Exhausted, got Settled"),
+        }
+        // Exactly `PROBE_MAX_ATTEMPTS` halvings from the optimistic start
+        // down to the floor -- the bound is derived, not picked
+        // independently.
+        let requests = probe.requests.lock().unwrap();
+        assert_eq!(requests.len() as u32, PROBE_MAX_ATTEMPTS);
+        assert_eq!(*requests.last().unwrap(), PROBE_MIN_DEVICE_BYTES);
+    }
 
     // Mirrors `crates/core/src/tile/scheduler.rs`'s three budget cases,
     // plus the zero short-circuit `scheduler.rs` covers inline rather than

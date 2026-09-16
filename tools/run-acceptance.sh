@@ -20,6 +20,10 @@
 #      the assertion; memory.peak, memory.swap.peak and the anon/file split
 #      are recorded, never thresholded.
 #
+# `run_stack` passes `--no-gpu`: `gpu` is a default feature, and without it
+# this run would measure the GPU path's VRAM probe instead of the CPU tile
+# scheduler's host-memory behaviour it exists to measure.
+#
 # Uses the release binary: the dev profile is far too slow at this scale.
 #
 # Why not `ulimit -v` for the memory ceiling: `crates/core/src/io/tiff/stack.rs`
@@ -225,12 +229,19 @@ build_farm() {
 # 61-frame sweep anchored on frame 30 is a longer baseline than the
 # 8-frame fixture on which frame 0 already diverges, and a strict refusal
 # would waste the whole run.
+# Wrapped in both locks (tools/lib/lock.sh): `build`, because this reads
+# target/release/$CLI directly and a concurrent `cargo build` running at
+# the same time would relink it mid-read; `gpu`, because `stack` drives
+# real wgpu compute on the one physical GPU this machine has, and a second
+# concurrent GPU-touching run at the same time is exactly what OOM-killed a
+# run before.
 run_stack() {
   local out="$1"
-  /usr/bin/time -v "$CLI" stack "$OUT_DIR/frames" \
+  tools/with-lock.sh build -- tools/with-lock.sh gpu -- \
+    /usr/bin/time -v "$CLI" stack "$OUT_DIR/frames" \
       -o "$out/out.tif" --zmap "$out/out-zmap.tif" \
       --algo laplacian --set levels=5 --json \
-      --no-crop --align-algo pyramidal-ecc --lax \
+      --no-crop --align-algo pyramidal-ecc --lax --no-gpu \
       > "$out/stack.json" 2> "$out/time-v.txt"
 }
 
@@ -242,7 +253,8 @@ run_stack() {
 run_align() {
   local out="$1"
   local mode="$2"
-  /usr/bin/time -v "$CLI" align "$OUT_DIR/frames" \
+  tools/with-lock.sh build -- tools/with-lock.sh gpu -- \
+    /usr/bin/time -v "$CLI" align "$OUT_DIR/frames" \
       --algo pyramidal-ecc --set "mode=$mode" --lax --json \
       > "$out/align-$mode.json" 2> "$out/align-$mode-time-v.txt"
 }

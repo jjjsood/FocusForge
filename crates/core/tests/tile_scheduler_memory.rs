@@ -25,13 +25,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
-use focusforge_core::algorithm::AlgorithmError;
+use focusforge_core::algorithm::{AlgorithmError, TileReader};
 use focusforge_core::fuse::FusionConsumer;
+use focusforge_core::host::HostFacts;
 use focusforge_core::io::TiffStack;
 use focusforge_core::params::{self, ParamValues, StackContext};
 use focusforge_core::registry;
 use focusforge_core::tile::{
-    NoopPreprocess, TileConsumer, TileJob, TileScheduler, TileSchedulerOptions,
+    NoopPreprocess, Rect, TileConsumer, TileError, TileJob, TileScheduler, TileSchedulerOptions,
 };
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -94,6 +95,23 @@ fn peak_since_reset() -> usize {
 /// would.
 static SERIAL: Mutex<()> = Mutex::new(());
 
+/// A [`TileReader`] that fills every read with zeros without touching disk
+/// or allocating per-frame state of its own -- cheap enough to drive a
+/// fabricated 600-frame stack that never existed as real files.
+struct ZeroReader;
+
+impl TileReader for ZeroReader {
+    fn read_tile_into(
+        &self,
+        _frame: usize,
+        _rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        out.fill(0);
+        Ok(())
+    }
+}
+
 /// Touches every frame's tile without accumulating anything, so the
 /// measured peak reflects the scheduler's own frame-tile buffers, not this
 /// consumer's.
@@ -120,21 +138,8 @@ fn peak_live_heap_stays_under_ceiling() {
     // 512 x 512 x 3 samples x 2 B. This is what makes "a load-every-frame
     // implementation fails by construction" a fact rather than a claim.
     let full_load_bytes = frame_count as u64 * width as u64 * height as u64 * 3 * 2;
-    // Raised from 4 MiB to 5 MiB when this test grew a real allocating
-    // consumer. The ceiling moved because what is being measured grew --
-    // a `FusionConsumer` builds per-worker Laplacian pyramids on top of
-    // the scheduler's frame-tile buffers, where the old `NoAllocConsumer`
-    // added nothing -- NOT because the test was failing and the number
-    // was in the way. That is the whole of it: a first diagnosis blamed
-    // the budget formula instead and was wrong, because `tile_size` is
-    // already the outer size. The consumer's pyramids are the real
-    // reason, and they are why this ceiling stays raised while the
-    // formula went back.
-    //
-    // The discrimination the test exists for is intact and asserted just
-    // below: 5 MiB is still far under the 12 MiB a load-every-frame
-    // implementation would need, so a full-load regression still fails
-    // this test loudly.
+    // 5 MiB: scheduler buffers plus per-worker pyramids; still far under
+    // the 12 MiB a load-every-frame implementation needs.
     const CEILING: usize = 5 * 1024 * 1024;
     assert!(
         (CEILING as u64) < full_load_bytes,
@@ -144,12 +149,9 @@ fn peak_live_heap_stays_under_ceiling() {
 
     let scratch_base =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_ceiling");
-    let options = TileSchedulerOptions {
-        tile_size: 128,
-        levels: 2,
-        max_bytes_in_flight: 2 * 1024 * 1024,
-        scratch_base,
-    };
+    let mut options = TileSchedulerOptions::explicit_budget(scratch_base, 2 * 1024 * 1024);
+    options.tile_size = 128;
+    options.levels = 2;
     let stack_ctx = StackContext::new(frame_count, width, height, 3);
     let scheduler =
         TileScheduler::new(&stack, stack_ctx, 3, &options).expect("scheduler must build");
@@ -270,14 +272,11 @@ fn in_flight_tiles_respect_the_budget() {
         let max_bytes_in_flight = if target == 1 {
             1
         } else {
-            (bytes_per_tile_set * target as u64) as usize
+            bytes_per_tile_set * target as u64
         };
-        let options = TileSchedulerOptions {
-            tile_size: 128,
-            levels: 2,
-            max_bytes_in_flight,
-            scratch_base,
-        };
+        let mut options = TileSchedulerOptions::explicit_budget(scratch_base, max_bytes_in_flight);
+        options.tile_size = 128;
+        options.levels = 2;
         let stack_ctx = StackContext::new(frame_count, width, height, 3);
         let scheduler =
             TileScheduler::new(&stack, stack_ctx, 3, &options).expect("scheduler must build");
@@ -307,4 +306,99 @@ fn in_flight_tiles_respect_the_budget() {
             );
         }
     }
+}
+
+/// A 600-frame stack over a host with room for it keeps `pool_threads()`
+/// above one even though the byte budget floors `in_flight_limit()` to one:
+/// pool size and in-flight limit are decoupled.
+#[test]
+fn pool_decouples_from_the_in_flight_limit_at_scale() {
+    let available_parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if available_parallelism <= 1 {
+        eprintln!("host reports only one logical core; skipping the decoupling case");
+        return;
+    }
+
+    let frame_count = 600usize;
+    // usable_available = 150_000_000 B; budget = 40% = 60_000_000 B.
+    // bytes_per_tile_set(600, 128, 3) = 58_982_400 B, so the budget covers
+    // exactly one tile set and floors `in_flight_limit()` to 1, while
+    // `pool_threads()` stays decoupled from it.
+    let facts = HostFacts::new(300_000_000, 150_000_000, None, None, available_parallelism);
+    let scratch_base =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_decouple");
+    let mut options = TileSchedulerOptions::with_host_facts(scratch_base, &facts);
+    options.tile_size = 128;
+    options.levels = 0;
+
+    let reader = ZeroReader;
+    let stack_ctx = StackContext::new(frame_count, 128, 128, 3);
+    let scheduler =
+        TileScheduler::new(&reader, stack_ctx, 3, &options).expect("scheduler must build");
+    assert_eq!(
+        scheduler.in_flight_limit(),
+        1,
+        "the byte budget must floor to exactly one tile set at this scale"
+    );
+    assert!(
+        scheduler.pool_threads() > 1,
+        "the pool must not collapse with the budget: pool_threads={}",
+        scheduler.pool_threads()
+    );
+
+    let report = scheduler
+        .run(&NoopPreprocess, &NoAllocConsumer)
+        .expect("run must succeed");
+    assert!(
+        report.peak_in_flight <= scheduler.in_flight_limit(),
+        "the admission gate must still cap live tile sets at the limit: peak={}",
+        report.peak_in_flight
+    );
+}
+
+/// A host-derived, uncapped budget below one tile set is refused by name --
+/// never floored, never a hang.
+#[test]
+fn too_small_host_budget_is_refused_by_name() {
+    // usable_available = 100 B; budget = 40% = 40 B, far under one tile set.
+    let facts = HostFacts::new(1_000, 100, None, None, 4);
+    let scratch_base =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_too_small");
+    let mut options = TileSchedulerOptions::with_host_facts(scratch_base, &facts);
+    options.tile_size = 128;
+    options.levels = 0;
+
+    let reader = ZeroReader;
+    let frame_count = 8usize;
+    let stack_ctx = StackContext::new(frame_count, 128, 128, 3);
+    let err = match TileScheduler::new(&reader, stack_ctx, 3, &options) {
+        Err(err) => err,
+        Ok(_) => panic!("a too-small host-derived budget must be refused"),
+    };
+
+    let expected_bytes_per_tile_set = frame_count as u64 * 128 * 128 * 3 * 2;
+    match &err {
+        TileError::HostMemoryTooSmall {
+            budget_bytes,
+            bytes_per_tile_set,
+            frame_count: reported_frame_count,
+            tile_size,
+        } => {
+            assert_eq!(*budget_bytes, 40);
+            assert_eq!(*bytes_per_tile_set, expected_bytes_per_tile_set);
+            assert_eq!(*reported_frame_count, frame_count);
+            assert_eq!(*tile_size, 128);
+        }
+        other => panic!("expected HostMemoryTooSmall, got {other:?}"),
+    }
+
+    let rendered = err.to_string();
+    assert!(rendered.contains(&40.to_string()), "{rendered}");
+    assert!(
+        rendered.contains(&expected_bytes_per_tile_set.to_string()),
+        "{rendered}"
+    );
+    assert!(rendered.contains("stack fewer frames"), "{rendered}");
 }

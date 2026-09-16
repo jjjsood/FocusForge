@@ -5,9 +5,9 @@
 ```
 crates/core/   TIFF I/O, tiles, stacking algorithms and the Z-Map
 crates/gpu/    the shared wgpu device, WGSL fusion/warp kernels and the
-               tile-scheduler pipeline that runs them, behind the `gpu` feature.
-               A stated 1 GiB VRAM working-set budget bounds how many tiles
-               that pipeline keeps in flight on the device at once, mirroring
+               tile-scheduler pipeline that runs them, behind the `gpu`
+               feature (on by default). An allocate-and-back-off probe at
+               startup discovers the device's usable VRAM budget, mirroring
                `crates/core`'s own host-memory budget one crate over
 crates/cli/    focusforge-cli, the headless interface
 crates/gui/    the Slint application: the design tokens and vendored icons
@@ -18,14 +18,15 @@ fixtures/      small checked-in TIFF crops used by the test suite
 
 ## Tech stack
 
-Rust, edition 2024, toolchain pinned to `1.94.1` (`rust-toolchain.toml`).
+Rust, edition 2024, toolchain pinned to `1.95.0` (`rust-toolchain.toml`).
 `focusforge-core` depends on `memmap2`, `thiserror`, `inventory` (algorithm
 registration), `rayon` and `serde`; `focusforge-gpu` declares
-`wgpu = "29.0.4"`, gated behind its own `gpu` Cargo feature (off by
-default, so `cargo build --workspace` alone never needs a GPU or a
-Vulkan/Metal/DX12-capable driver); `focusforge-cli` adds `clap`, `serde`
-and `serde_json`, and forwards the same `gpu` feature to enable `--no-gpu`
-and the automatic GPU path on `stack`/`align`. `focusforge-gui` depends on
+`wgpu = "29.0.4"`, gated behind its own `gpu` Cargo feature, on by default on
+both `focusforge-gpu` and `focusforge-cli` (`--no-default-features` excludes
+it, so `cargo build --workspace --no-default-features` is the invocation
+that never needs a GPU or a Vulkan/Metal/DX12-capable driver); `focusforge-cli`
+adds `clap`, `serde` and `serde_json`, and forwards the same `gpu` feature to
+enable `--no-gpu` and the automatic GPU path on `stack`/`align`. `focusforge-gui` depends on
 `slint = "~1.17"` (`default-features = false`, features `std`,
 `compat-1-2`, `backend-winit`, `renderer-femtovg-wgpu`, `unstable-wgpu-29`
 -- the last one pinned to the same wgpu major `focusforge-gpu` declares),
@@ -61,15 +62,23 @@ never hand-edited.
 
 `crates/gpu`'s WGSL fusion and warp kernels, and the pipeline in
 `focusforge-cli` that dispatches them, sit behind the `gpu` Cargo feature —
-off by default, so a plain `cargo build --workspace` or `cargo test
---workspace` never touches them. `cargo clippy --workspace --all-targets
---all-features` compiles (never runs) that code on every gate pass, so a
-break there is still caught without a GPU present. Their own tests need a
-real GPU device and stay behind `cargo test --workspace --features gpu` —
+on by default, so a plain `cargo build --workspace` or `cargo test
+--workspace` compiles and, where a test drives the `laplacian` algorithm or
+`align --write-warped`, runs them. `--no-default-features` excludes the GPU
+path entirely and still compiles, test targets included; that build's one
+behavioural check
+(`cargo test -p focusforge-cli --no-default-features --test cli
+no_gpu_flag_absent_without_the_feature`) is run by hand, not in the standing
+gate. `cargo clippy --workspace --all-targets --all-features` compiles that
+code on every gate pass regardless of the default. The device tests that need
+a real GPU adapter sit behind a separate, non-default `gpu-tests` feature and
+run as `cargo test --workspace --features gpu-tests -- --test-threads=1` —
 run by hand, deliberately, once per change to that code, never inside the
-default gate. Those tests assert each kernel matches its CPU twin to within
-1 LSB at 16-bit, and that a whole GPU `stack` run matches the equivalent CPU
-run on `fixtures/mantis-512`.
+default gate. `--test-threads=1` is required: `parity_pipeline`'s
+`warp_to_fusion_never_reads_back` asserts on a process-global readback
+counter that only holds under serial execution. Those tests assert each
+kernel matches its CPU twin to within 1 LSB at 16-bit, and that a whole GPU
+`stack` run matches the equivalent CPU run on `fixtures/mantis-512`.
 
 ## Before you send a change
 
