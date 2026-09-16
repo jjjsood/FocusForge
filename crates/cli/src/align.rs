@@ -100,9 +100,13 @@ pub struct AlignReport {
     /// no `--no-align`. Present so `align --json` and `stack --json` report
     /// their `align` stage the same way.
     pub align_source: String,
-    /// The anchor arm's worker bound and the peak it reached: always `Some`
-    /// here. `Option` so the key has one type in `align --json` and
-    /// `stack --json`.
+    /// The anchor arm's worker bound and the peak it actually reached --
+    /// always `Some` here, since every `align` run computes (the same
+    /// reasoning `align_source`'s own doc gives for why it is always
+    /// `"computed"` on this command). `Option`, not a plain `usize`, so one
+    /// key name carries one type across both `align --json` and
+    /// `stack --json` (`AlignReport::align_source`'s own rustdoc makes the
+    /// same argument).
     pub align_workers: Option<usize>,
     pub peak_align_workers: Option<usize>,
 }
@@ -590,14 +594,8 @@ pub(crate) fn render(report: &AlignReport) -> String {
         crate::stack::stage_fact("align", report.stages.align),
         crate::stack::stage_fact("warp_write", report.stages.warp_write),
         crate::stack::stage_fact("finalize", report.stages.finalize),
-        report
-            .align_workers
-            .map(|w| w.to_string())
-            .unwrap_or_else(|| "?".to_string()),
-        report
-            .peak_align_workers
-            .map(|w| w.to_string())
-            .unwrap_or_else(|| "?".to_string()),
+        crate::stack::worker_fact(report.align_workers),
+        crate::stack::worker_fact(report.peak_align_workers),
         report.wall_seconds,
     ));
     lines.join("\n")

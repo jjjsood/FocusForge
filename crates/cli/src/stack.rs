@@ -1867,14 +1867,8 @@ fn render(report: &StackReport) -> String {
         stage_fact("align", report.stages.align),
         stage_fact("fuse", report.stages.fuse),
         stage_fact("finalize", report.stages.finalize),
-        report
-            .align_workers
-            .map(|w| w.to_string())
-            .unwrap_or_else(|| "?".to_string()),
-        report
-            .peak_align_workers
-            .map(|w| w.to_string())
-            .unwrap_or_else(|| "?".to_string()),
+        worker_fact(report.align_workers),
+        worker_fact(report.peak_align_workers),
     ));
     lines.join("\n")
 }
@@ -1889,6 +1883,17 @@ pub(crate) fn stage_fact(name: &str, value: Option<f64>) -> String {
     match value {
         Some(seconds) => format!("{name}={seconds:.3}s"),
         None => format!("{name}=not-entered"),
+    }
+}
+
+/// One `workers=`/`peak=` value on the `stages:` line -- the worker count
+/// when the align stage actually ran, `"?"` when it did not (a cached,
+/// resumed or skipped alignment reports no worker count of its own). Shared
+/// by [`render`] and [`crate::align::render`].
+pub(crate) fn worker_fact(value: Option<usize>) -> String {
+    match value {
+        Some(workers) => workers.to_string(),
+        None => "?".to_string(),
     }
 }
 
