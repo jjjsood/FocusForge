@@ -62,6 +62,14 @@ pub struct StackReport {
     pub frame_tiles_read: usize,
     pub in_flight_limit: usize,
     pub peak_in_flight: usize,
+    /// The host in-flight-byte budget actually in force for this run.
+    pub max_bytes_in_flight: u64,
+    /// Where that budget came from: `Host` (adaptive), `HostFallback` (the
+    /// probe degraded), or `Explicit` (`--max-host-memory` lowered it).
+    pub budget_provenance: Provenance,
+    /// Whether the runtime back-off shrunk the in-flight limit during this
+    /// run.
+    pub backed_off: bool,
     /// Final paths only -- never the `.partial` names a run writes to first.
     pub outputs: Vec<String>,
     pub wall_seconds: f64,
@@ -76,6 +84,13 @@ pub struct StackReport {
     /// display -- additive, so which path ran is machine-readable and not
     /// only a stderr line.
     pub backend: String,
+    /// The device in-flight-byte budget actually in force for this run's
+    /// GPU path -- `null` on the CPU path.
+    pub max_device_bytes_in_flight: Option<u64>,
+    /// Where that budget came from: `Host` (the startup probe settled),
+    /// `HostFallback` (no probe ran, the stated default was used), or
+    /// `Explicit` (`--max-vram` lowered it) -- `null` on the CPU path.
+    pub device_budget_provenance: Option<Provenance>,
     /// `true` only when the alignment came out of the stage cache;
     /// `false` for a computed one, a `--resume` ledger-peeked one, or a
     /// `--no-align` run. Additive field.
@@ -105,6 +120,14 @@ pub struct StackReport {
     /// `align_source` exists to prevent. Additive fields.
     pub align_workers: Option<usize>,
     pub peak_align_workers: Option<usize>,
+}
+
+/// The settled device (VRAM) budget and its provenance. Lives in the CLI
+/// because `core` has no concept of VRAM.
+#[derive(Clone, Copy)]
+pub struct DeviceBudgetReport {
+    pub max_device_bytes: u64,
+    pub provenance: Provenance,
 }
 
 /// `stack --json`'s `align` field: `null` when `--no-align` was given.
@@ -194,6 +217,8 @@ pub fn run(
     group_args: &GroupArgs,
     argv: &[String],
     no_gpu: bool,
+    max_host_memory: Option<u64>,
+    max_vram: Option<u64>,
 ) -> ExitCode {
     // Every refusal in this outer driver is group-independent, so it fires
     // exactly once, before the first group runs, and writes exactly one
@@ -255,10 +280,10 @@ pub fn run(
     // therefore gated on the selected algorithm's own id, compared against
     // `Laplacian`'s own `id()` rather than a bare string literal repeated
     // here.
-    let backend = if algo.id() == Laplacian.id() {
-        crate::resolve_backend(no_gpu)
+    let (backend, device_budget_report) = if algo.id() == Laplacian.id() {
+        crate::resolve_backend(no_gpu, max_vram)
     } else {
-        None
+        (None, None)
     };
 
     // Step 3: parse `--set` against that schema and overlay it on the
@@ -368,11 +393,13 @@ pub fn run(
     let setup = RunSetup {
         algo,
         backend,
+        device_budget_report,
         explicit,
         file,
         align_opts,
         job_opts,
         preset_opts,
+        max_host_memory,
         argv,
         signals: &signals,
         input: dir,
@@ -427,11 +454,18 @@ pub fn run(
 struct RunSetup<'a> {
     algo: &'static dyn StackAlgorithm,
     backend: Option<&'static dyn focusforge_core::gpu::TileBackend>,
+    /// The device (VRAM) budget settled on when `backend` was resolved --
+    /// `None` on the CPU path, or when the GPU probe itself never ran.
+    device_budget_report: Option<DeviceBudgetReport>,
     explicit: ParamValues,
     file: preset::Preset,
     align_opts: &'a AlignOptions<'a>,
     job_opts: &'a JobOptions,
     preset_opts: &'a PresetOptions<'a>,
+    /// A **ceiling only** on the adaptive host-memory budget
+    /// (`--max-host-memory`) -- applied to every group's own
+    /// `TileSchedulerOptions`.
+    max_host_memory: Option<u64>,
     argv: &'a [String],
     signals: &'a signals::Signals,
     /// The directory the run was pointed at, as the user wrote it: what
@@ -737,18 +771,32 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     let RunSetup {
         algo,
         backend,
+        device_budget_report,
         explicit,
         file,
         align_opts,
         job_opts,
         preset_opts,
+        max_host_memory,
         argv,
         signals,
         input: dir,
     } = setup;
-    let (algo, backend, explicit, file) = (*algo, *backend, explicit.clone(), file);
-    let (align_opts, job_opts, preset_opts, argv, signals) =
-        (*align_opts, *job_opts, *preset_opts, *argv, *signals);
+    let (algo, backend, device_budget_report, explicit, file) = (
+        *algo,
+        *backend,
+        *device_budget_report,
+        explicit.clone(),
+        file,
+    );
+    let (align_opts, job_opts, preset_opts, max_host_memory, argv, signals) = (
+        *align_opts,
+        *job_opts,
+        *preset_opts,
+        *max_host_memory,
+        *argv,
+        *signals,
+    );
     let dir: &Path = dir;
 
     let start = Instant::now();
@@ -839,9 +887,10 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     if let Some(tile_size) = job_opts.tile_size {
         options.tile_size = tile_size;
     }
-    if let Some(max_bytes_in_flight) = job_opts.max_bytes_in_flight {
-        options.max_bytes_in_flight = max_bytes_in_flight;
-    }
+    // `--max-host-memory` is a ceiling only: it can lower the host-derived
+    // budget, never raise it (`capped_to`). Applied here, before alignment,
+    // so it is already in effect for the `--resume` peek below.
+    options.budget = options.budget.capped_to(max_host_memory);
 
     // Alignment, between the stack algorithm's own parameters and the
     // scheduler build. Computed *before* any output file exists: a
@@ -1205,7 +1254,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // CPU-warped pixels.
     //
     // `options` is built far above, before alignment, so `--tile-size` and
-    // `--max-bytes-in-flight` are already in effect for the resume peek --
+    // `--max-host-memory` are already in effect for the resume peek --
     // never rebuilt here.
     let reader: &dyn focusforge_core::algorithm::TileReader = match &backend {
         Some(_) => &stack,
@@ -1595,6 +1644,9 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         frame_tiles_read,
         in_flight_limit,
         peak_in_flight,
+        max_bytes_in_flight: scheduler.budget().bytes(),
+        budget_provenance: scheduler.budget().provenance(),
+        backed_off: scheduler.final_in_flight_limit() < in_flight_limit,
         outputs,
         wall_seconds,
         output_width: applied_crop.map(|r| r.width).unwrap_or(width),
@@ -1603,6 +1655,8 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         description,
         align: align_report,
         backend: backend_id,
+        max_device_bytes_in_flight: device_budget_report.as_ref().map(|r| r.max_device_bytes),
+        device_budget_provenance: device_budget_report.as_ref().map(|r| r.provenance),
         align_cached,
         stages,
         align_source,
@@ -1853,7 +1907,19 @@ fn render(report: &StackReport) -> String {
         "tile_size={} levels={} margin={} tiles={} in_flight_limit={}",
         report.tile_size, report.levels, report.margin, report.tiles, report.in_flight_limit,
     ));
+    lines.push(format!(
+        "max_bytes_in_flight={} budget={:?} backed_off={}",
+        report.max_bytes_in_flight, report.budget_provenance, report.backed_off,
+    ));
     lines.push(format!("backend: {}", report.backend));
+    if let (Some(max_device_bytes_in_flight), Some(device_budget_provenance)) = (
+        report.max_device_bytes_in_flight,
+        report.device_budget_provenance,
+    ) {
+        lines.push(format!(
+            "max_device_bytes_in_flight={max_device_bytes_in_flight} device_budget={device_budget_provenance:?}"
+        ));
+    }
     for output in &report.outputs {
         lines.push(format!("wrote: {output}"));
     }
@@ -1978,6 +2044,9 @@ mod tests {
             frame_tiles_read: 32,
             in_flight_limit: 5,
             peak_in_flight: 4,
+            max_bytes_in_flight: 1 << 30,
+            budget_provenance: Provenance::Host,
+            backed_off: false,
             outputs: vec!["mantis-512.ffproj".to_string()],
             wall_seconds: 1.5,
             output_width: 512,
@@ -1986,6 +2055,8 @@ mod tests {
             description: None,
             align: None,
             backend: "cpu".to_string(),
+            max_device_bytes_in_flight: None,
+            device_budget_provenance: None,
             align_cached: false,
             stages: focusforge_core::timing::StageTimings {
                 setup: Some(0.012),
@@ -2016,6 +2087,9 @@ mod tests {
             "margin=96",
             "tiles=4",
             "in_flight_limit=5",
+            "max_bytes_in_flight=1073741824",
+            "budget=Host",
+            "backed_off=false",
             "wrote: mantis-512.ffproj",
             "wall: 1.500s",
             "backend: cpu",

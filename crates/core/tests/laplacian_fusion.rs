@@ -4,9 +4,8 @@
 //! run at tile 448 / levels 5 (the golden geometry), plus the seam
 //! comparisons at 704/5 (single-tile reference) and 480/5 (ragged variant).
 //!
-//! `metrics_reproduce_the_measured_baselines` is the calibration gate:
-//! every floor below is meaningless unless it passes, so it is written and
-//! run first.
+//! `metrics_reproduce_the_measured_baselines` is the calibration check:
+//! every floor below is meaningless unless it passes.
 
 mod common;
 
@@ -53,7 +52,7 @@ fn run_fusion(
     label: &str,
     tile_size: u32,
     levels: u32,
-    max_bytes_in_flight: usize,
+    max_bytes_in_flight: u64,
     reader: &dyn TileReader,
     stack_ctx: StackContext,
     crop: Option<Rect>,
@@ -81,12 +80,9 @@ fn run_fusion(
 
     let scheduler_scratch =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("laplacian_fusion_{label}"));
-    let options = TileSchedulerOptions {
-        tile_size,
-        levels,
-        max_bytes_in_flight,
-        scratch_base: scheduler_scratch,
-    };
+    let mut options = TileSchedulerOptions::explicit_budget(scheduler_scratch, max_bytes_in_flight);
+    options.tile_size = tile_size;
+    options.levels = levels;
     let scheduler =
         TileScheduler::new(reader, stack_ctx, spp, &options).expect("scheduler must build");
     let consumer = FusionConsumer::create(
@@ -745,11 +741,6 @@ fn spatial_coherence_fraction(zmap: &[u16], width: u32, height: u32) -> f64 {
     }
     agree as f64 / total as f64
 }
-
-/// The all-8-neighbours-identical fraction is
-/// `focusforge_core::zmap::metrics::all_eight_identical_fraction` -- this is
-/// a call site, not a second definition, and the measured number must not
-/// move.
 
 #[test]
 fn zmap_is_spatially_coherent() {

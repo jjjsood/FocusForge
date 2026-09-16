@@ -31,9 +31,7 @@ pub use error::AlgorithmError;
 /// *frame*, which is a per-pixel fact, not a per-sample one. Fields are
 /// public and there is no validating constructor here: the Z-Map as a
 /// document with its own storage and invariants lives in [`crate::zmap`]
-/// (`ZMapInfo`, `crate::zmap::validate_tile`, `crate::zmap::ZMapWriter`) --
-/// a checked constructor on `TileOutput` itself still waits for its first
-/// real caller.
+/// (`ZMapInfo`, `crate::zmap::validate_tile`, `crate::zmap::ZMapWriter`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TileOutput {
     pub tile: Tile,
@@ -43,13 +41,11 @@ pub struct TileOutput {
 /// The per-tile view across every frame of a stack that
 /// [`StackAlgorithm::fuse`] reads from.
 ///
-/// Opaque on purpose: today's backing is a materialized slice of
-/// already-read [`Tile`]s, and a future scheduler may swap it for memmap'd
-/// scratch or a streaming source without touching a single algorithm body,
-/// because every call site below is identical either way. The field is
-/// named `tiles`, not `frames` -- these are frame-*tiles*, and [`Tile`]
-/// itself carries no frame index, so this context is what supplies one by
-/// position.
+/// Opaque on purpose: the backing is a materialized slice of already-read
+/// [`Tile`]s, reached only through this type's own methods, never the field
+/// directly. The field is named `tiles`, not `frames` -- these are
+/// frame-*tiles*, and [`Tile`] itself carries no frame index, so this
+/// context is what supplies one by position.
 pub struct TileCtx<'a> {
     rect: Rect,
     tiles: &'a [Tile],
@@ -113,13 +109,11 @@ pub trait TileReader: Send + Sync {
 ///
 /// `Send + Sync` on [`TileReader`] is what keeps `AlignContext<'_>` `Sync`,
 /// which is what lets `align_frame` run across frames under rayon. `Send +
-/// Sync` on the erased `prepared` value is the same argument applied a
-/// second time: a `dyn Any + Send + Sync` behind a shared `&'a` reference is
-/// exactly as safe to read from multiple rayon workers at once as the
-/// reader already is, and neither type offers any way to mutate through a
-/// shared reference, so there is nothing here that would need a lock.
-/// The reader field stays private -- no accessor -- so exposing one later is
-/// an additive change rather than a removal.
+/// Sync` on the erased `prepared` value gives it the same guarantee: a `dyn
+/// Any + Send + Sync` behind a shared `&'a` reference is safe to read from
+/// multiple rayon workers at once, and neither type offers any way to
+/// mutate through a shared reference, so nothing here needs a lock. The
+/// reader field stays private -- no accessor.
 pub struct AlignContext<'a> {
     stack: StackContext,
     reference: usize,
@@ -219,7 +213,7 @@ pub trait StackAlgorithm: Send + Sync + 'static {
     ///    from this same default, reading the identical resolved map `fuse`
     ///    itself reads its own `"levels"` entry from -- the same number from
     ///    the same place, which is the whole point: `fuse`'s pyramid depth
-    ///    and the scheduler's margin can no longer silently disagree.
+    ///    and the scheduler's margin cannot silently disagree.
     ///
     /// An algorithm whose depth parameter is *not* called `"levels"`, or
     /// whose margin requirement is not a simple pyramid depth, **overrides**
@@ -240,13 +234,9 @@ pub trait StackAlgorithm: Send + Sync + 'static {
 ///
 /// `#[non_exhaustive]`: a divergence reason is inherently
 /// algorithm-specific -- `crate::align::DivergenceReason::LemmaOneRegion` is
-/// named after one paper's Lemma 1, and a second aligner will name its own
-/// failure modes after its own mathematics. That accumulation is
-/// deliberate and is exactly what `#[non_exhaustive]` on both this type and
-/// `DivergenceReason` is for; it is not a sign that the vocabulary needs
-/// generalizing away. A reader adding a second aligner should read the
-/// existing variant names as evidence of the pattern to follow, not as a
-/// defect to fix.
+/// named after one paper's Lemma 1. `#[non_exhaustive]` on both this type
+/// and `DivergenceReason` is what lets each aligner name its own failure
+/// modes after its own mathematics.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status", content = "reason", rename_all = "kebab-case")]
@@ -377,6 +367,7 @@ mod tests {
                 auto: Some(Arc::new(|ctx: &StackContext| {
                     ParamValue::Float(ctx.frame_count as f64)
                 })),
+                host_default: None,
             },
             ParamDesc {
                 id: "mode".to_string(),
@@ -396,14 +387,13 @@ mod tests {
                 },
                 default: ParamValue::Enum("fast".to_string()),
                 auto: None,
+                host_default: None,
             },
         ]
     });
 
-    /// A test-only fusion algorithm. `id` and `display_name` are owned
-    /// `String` fields, not literals, so the trait's accessors genuinely
-    /// borrow from `&self` rather than returning `&'static str` in
-    /// disguise.
+    /// A test-only fusion algorithm; `id`/`display_name` are owned `String`s
+    /// so the accessors borrow from `&self`.
     struct DummyStack {
         id: String,
         display_name: String,

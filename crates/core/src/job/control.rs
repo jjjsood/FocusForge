@@ -100,18 +100,12 @@ impl JobControl {
     ///
     /// Every worker tests [`Self::state`] (through
     /// [`crate::tile::TileControl::should_stop`]) at the top of every unit,
-    /// before that unit counts as in flight
-    /// (`crate::tile::TileScheduler::run_tiles_controlled`). So once this
-    /// call's store has returned, each worker already holding a unit can
-    /// still finish the one it holds, but no worker can pick up another --
-    /// **at most `TileScheduler::in_flight_limit()` further units
-    /// complete**, and exactly at most 1 when a scheduler is budgeted down
-    /// to a single worker (`max_bytes_in_flight = 1` pins the pool to one
-    /// worker via the floor in `in_flight_for_budget`). This bound rests on
-    /// the scheduler's own check, not on rayon's short-circuit, which
-    /// promises only to try to stop remaining work "as soon as possible"
-    /// (rayon 1.12.0 --
-    /// <https://docs.rs/rayon/1.12.0/rayon/iter/trait.ParallelIterator.html#method.try_for_each_init>).
+    /// before that unit counts as in flight. So once this call's store has
+    /// returned, each worker already holding a unit can still finish the
+    /// one it holds, but no worker can pick up another -- at most
+    /// `TileScheduler::in_flight_limit()` further units complete, and
+    /// exactly at most 1 when a scheduler is budgeted down to a single
+    /// permit.
     pub fn pause(&self) {
         let _ = self.state.compare_exchange(
             RUNNING,

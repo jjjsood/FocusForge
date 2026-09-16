@@ -35,12 +35,11 @@ fn scratch_base(label: &str) -> PathBuf {
 }
 
 fn options(label: &str, max_bytes_in_flight: usize) -> TileSchedulerOptions {
-    TileSchedulerOptions {
-        tile_size: 200,
-        levels: 3,
-        max_bytes_in_flight,
-        scratch_base: scratch_base(label),
-    }
+    let mut options =
+        TileSchedulerOptions::explicit_budget(scratch_base(label), max_bytes_in_flight as u64);
+    options.tile_size = 200;
+    options.levels = 3;
+    options
 }
 
 fn open_stack() -> TiffStack {
@@ -108,9 +107,7 @@ fn job_record(
 }
 
 /// Blocks each `consume` call until [`Gate::release`] is called, and
-/// records when a call has begun -- same rendezvous shape as
-/// `crates/core/tests/job_engine.rs`'s `Gate`, duplicated here since
-/// integration test binaries share no code except `common`.
+/// records when a call has begun.
 struct Gate {
     started: Mutex<usize>,
     started_cvar: Condvar,
@@ -247,11 +244,11 @@ fn kill_and_resume_matches_uninterrupted_output() {
     let scratch = scratch_base("kill-resume-job");
     let composite_path = scratch.join("out.tif");
     std::fs::create_dir_all(&scratch).unwrap();
-    let job_opts = TileSchedulerOptions {
-        tile_size: 200,
-        levels: 3,
-        max_bytes_in_flight: 1,
-        scratch_base: scratch.clone(),
+    let job_opts = {
+        let mut o = TileSchedulerOptions::explicit_budget(scratch.clone(), 1_u64);
+        o.tile_size = 200;
+        o.levels = 3;
+        o
     };
     {
         let scheduler = build_scheduler(&stack, &job_opts);
@@ -346,11 +343,11 @@ fn resume_skips_completed_units() {
     let scratch = scratch_base("skip-completed");
     let composite_path = scratch.join("out.tif");
     std::fs::create_dir_all(&scratch).unwrap();
-    let job_opts = TileSchedulerOptions {
-        tile_size: 200,
-        levels: 3,
-        max_bytes_in_flight: 1,
-        scratch_base: scratch.clone(),
+    let job_opts = {
+        let mut o = TileSchedulerOptions::explicit_budget(scratch.clone(), 1_u64);
+        o.tile_size = 200;
+        o.levels = 3;
+        o
     };
     let plan_len;
     {
@@ -540,11 +537,11 @@ fn crash_between_tile_write_and_ledger_recomputes_one_unit() {
     let scratch = scratch_base("crash-window");
     let composite_path = scratch.join("out.tif");
     std::fs::create_dir_all(&scratch).unwrap();
-    let job_opts = TileSchedulerOptions {
-        tile_size: 200,
-        levels: 3,
-        max_bytes_in_flight: 1 << 30,
-        scratch_base: scratch.clone(),
+    let job_opts = {
+        let mut o = TileSchedulerOptions::explicit_budget(scratch.clone(), 1_u64 << 30);
+        o.tile_size = 200;
+        o.levels = 3;
+        o
     };
     let target_index;
     {
@@ -629,11 +626,11 @@ fn truncated_output_is_not_complete() {
     let scratch = scratch_base("truncated");
     let composite_path = scratch.join("out.tif");
     std::fs::create_dir_all(&scratch).unwrap();
-    let job_opts = TileSchedulerOptions {
-        tile_size: 200,
-        levels: 3,
-        max_bytes_in_flight: 1,
-        scratch_base: scratch.clone(),
+    let job_opts = {
+        let mut o = TileSchedulerOptions::explicit_budget(scratch.clone(), 1_u64);
+        o.tile_size = 200;
+        o.levels = 3;
+        o
     };
     {
         let scheduler = build_scheduler(&stack, &job_opts);
@@ -748,11 +745,11 @@ fn ledger_stays_under_the_scratch_base() {
     std::fs::create_dir_all(&output_dir).unwrap();
     let composite_path = output_dir.join("out.tif.partial");
 
-    let job_opts = TileSchedulerOptions {
-        tile_size: 200,
-        levels: 3,
-        max_bytes_in_flight: 1,
-        scratch_base: scratch.clone(),
+    let job_opts = {
+        let mut o = TileSchedulerOptions::explicit_budget(scratch.clone(), 1_u64);
+        o.tile_size = 200;
+        o.levels = 3;
+        o
     };
     let scheduler = build_scheduler(&stack, &job_opts);
     let record = job_record(&stack, &values, &composite_path, None);
@@ -940,11 +937,11 @@ fn resume_after_a_clean_cancel_continues() {
     let scratch = scratch_base("after-cancel");
     let composite_path = scratch.join("out.tif");
     std::fs::create_dir_all(&scratch).unwrap();
-    let job_opts = TileSchedulerOptions {
-        tile_size: 200,
-        levels: 3,
-        max_bytes_in_flight: 1,
-        scratch_base: scratch.clone(),
+    let job_opts = {
+        let mut o = TileSchedulerOptions::explicit_budget(scratch.clone(), 1_u64);
+        o.tile_size = 200;
+        o.levels = 3;
+        o
     };
     {
         let scheduler = build_scheduler(&stack, &job_opts);
@@ -1026,7 +1023,6 @@ fn resume_after_a_clean_cancel_continues() {
 #[ignore = "reads the 16 GB reference stack"]
 fn resume_on_the_reference_stack() {
     let Some(stack_dir) = common::reference_stack_dir() else {
-        eprintln!("reference stack not found; skipping");
         return;
     };
 
@@ -1059,11 +1055,14 @@ fn resume_on_the_reference_stack() {
 
     // Reference: an uninterrupted run, full parallelism, its own scratch
     // base (a per-call `ScratchDir`, not the resume store).
-    let ref_opts = TileSchedulerOptions {
-        tile_size,
-        levels,
-        max_bytes_in_flight: 1 << 30,
-        scratch_base: scratch_base("reference-stack-reference"),
+    let ref_opts = {
+        let mut o = TileSchedulerOptions::explicit_budget(
+            scratch_base("reference-stack-reference"),
+            1 << 30,
+        );
+        o.tile_size = tile_size;
+        o.levels = levels;
+        o
     };
     let ref_scheduler = TileScheduler::new(&stack, stack_ctx, 3, &ref_opts)
         .expect("reference scheduler must build");
@@ -1081,11 +1080,11 @@ fn resume_on_the_reference_stack() {
     // (`max_bytes_in_flight: 1` is what makes that deterministic, same as
     // every other kill point in this file).
     let composite_path = scratch.join("out.tif");
-    let job_opts_kill = TileSchedulerOptions {
-        tile_size,
-        levels,
-        max_bytes_in_flight: 1,
-        scratch_base: scratch.clone(),
+    let job_opts_kill = {
+        let mut o = TileSchedulerOptions::explicit_budget(scratch.clone(), 1);
+        o.tile_size = tile_size;
+        o.levels = levels;
+        o
     };
     let kill_start = std::time::Instant::now();
     {
@@ -1142,11 +1141,11 @@ fn resume_on_the_reference_stack() {
     let kill_elapsed = kill_start.elapsed();
 
     // Second "process": resume, full parallelism for the recomputed units.
-    let job_opts_resume = TileSchedulerOptions {
-        tile_size,
-        levels,
-        max_bytes_in_flight: 1 << 30,
-        scratch_base: scratch.clone(),
+    let job_opts_resume = {
+        let mut o = TileSchedulerOptions::explicit_budget(scratch.clone(), 1 << 30);
+        o.tile_size = tile_size;
+        o.levels = levels;
+        o
     };
     let stack2 = TiffStack::open_files(&paths).expect("reference stack must reopen");
     let scheduler2 = TileScheduler::new(&stack2, stack_ctx, 3, &job_opts_resume)

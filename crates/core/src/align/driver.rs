@@ -239,11 +239,10 @@ fn workers_for_budget(
     let available_parallelism = available_parallelism.max(1);
     let registrations = registrations.max(1);
     let remaining = (max_bytes_in_flight as u64).saturating_sub(shared_bytes);
-    let raw = if bytes_per_registration == 0 {
-        available_parallelism as u64
-    } else {
-        (remaining / bytes_per_registration).max(1)
-    };
+    let raw = remaining
+        .checked_div(bytes_per_registration)
+        .map(|quotient| quotient.max(1))
+        .unwrap_or(available_parallelism as u64);
     raw.min(available_parallelism as u64)
         .min(registrations as u64) as usize
 }

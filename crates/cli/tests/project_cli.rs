@@ -121,7 +121,7 @@ fn stack_args<'a>(dir: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
         "--no-crop",
     ];
     args.extend_from_slice(extra);
-    args
+    common::push_no_gpu(args)
 }
 
 #[test]
@@ -391,7 +391,7 @@ fn cancel_keeps_the_staged_planes_for_resume() {
     let input = common::fixtures_dir().join("mantis-512");
     let mut child = bin()
         .current_dir(&cwd)
-        .args([
+        .args(common::push_no_gpu(vec![
             "stack",
             input.to_str().unwrap(),
             "-o",
@@ -400,7 +400,7 @@ fn cancel_keeps_the_staged_planes_for_resume() {
             "laplacian",
             "--no-align",
             "--no-crop",
-        ])
+        ]))
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

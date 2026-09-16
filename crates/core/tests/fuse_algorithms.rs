@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Fixture-backed driver tests for `weighted-average` and `depth-map` over
-//! `fixtures/mantis-512`, modelled on `crates/core/tests/laplacian_fusion.rs`
-//! but local rather than lifted into `tests/common/mod.rs`, so that settled
-//! file is not touched. Two differences from its model, both load-bearing:
-//! the scheduler's `levels` comes from `algo.tile_levels(&values)`, exactly
-//! as `crates/cli/src/stack.rs` does, so this test exercises the same
-//! bridge the CLI uses; and `levels_override` exists solely for the seam
-//! demonstration (`the_trait_default_would_have_seamed`).
+//! `fixtures/mantis-512`. The scheduler's `levels` comes from
+//! `algo.tile_levels(&values)`, the same bridge the CLI uses; and
+//! `levels_override` exists solely for the seam demonstration
+//! (`the_trait_default_would_have_seamed`).
 
 mod common;
 
@@ -68,12 +65,9 @@ fn run_fusion(
 
     let scheduler_scratch =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("fuse_algorithms_{label}"));
-    let options = TileSchedulerOptions {
-        tile_size,
-        levels,
-        max_bytes_in_flight: 1 << 30,
-        scratch_base: scheduler_scratch,
-    };
+    let mut options = TileSchedulerOptions::explicit_budget(scheduler_scratch, 1 << 30);
+    options.tile_size = tile_size;
+    options.levels = levels;
     let scheduler =
         TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
     let consumer = FusionConsumer::create(

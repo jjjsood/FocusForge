@@ -30,12 +30,11 @@ fn scratch_base(label: &str) -> PathBuf {
 }
 
 fn options(label: &str, max_bytes_in_flight: usize) -> TileSchedulerOptions {
-    TileSchedulerOptions {
-        tile_size: 200,
-        levels: 3,
-        max_bytes_in_flight,
-        scratch_base: scratch_base(label),
-    }
+    let mut options =
+        TileSchedulerOptions::explicit_budget(scratch_base(label), max_bytes_in_flight as u64);
+    options.tile_size = 200;
+    options.levels = 3;
+    options
 }
 
 fn open_stack() -> TiffStack {

@@ -9,18 +9,35 @@
 
 use focusforge_core::gpu::TileBackend;
 use focusforge_gpu::adapter::{PathChoice, choose_path};
-use focusforge_gpu::harness::gpu_backend;
+use focusforge_gpu::harness::gpu_backend_capped;
 
-/// `no_gpu` is `--no-gpu`'s value: `true` forces the CPU path
-/// unconditionally, without even attempting -- let alone reporting a
-/// missing -- adapter. Prints the decision to **stderr** (the stream
-/// `crate::fail` and `align`'s own lax warning already use), and returns
-/// the backend on the GPU path, `None` on the CPU path.
-pub fn resolve_backend(no_gpu: bool) -> Option<&'static dyn TileBackend> {
-    let (path, result, message) = choose_path(no_gpu, gpu_backend());
+use crate::stack::DeviceBudgetReport;
+
+/// `no_gpu` (`--no-gpu`'s value) forces the CPU path unconditionally;
+/// `max_vram` (`--max-vram`'s value) caps the probed device budget. Prints
+/// the chosen path to stderr unconditionally, including under `--quiet`.
+/// Returns the backend plus its settled budget report on the GPU path,
+/// `(None, None)` on the CPU path.
+pub fn resolve_backend(
+    no_gpu: bool,
+    max_vram: Option<u64>,
+) -> (Option<&'static dyn TileBackend>, Option<DeviceBudgetReport>) {
+    let (path, result, message) = choose_path(no_gpu, gpu_backend_capped(max_vram));
     eprintln!("{message}");
     match path {
-        PathChoice::Gpu => result.ok().map(|backend| backend as &dyn TileBackend),
-        PathChoice::CpuFallback => None,
+        PathChoice::Gpu => match result.ok() {
+            Some(backend) => {
+                let device_budget = backend.device_budget();
+                (
+                    Some(backend as &dyn TileBackend),
+                    Some(DeviceBudgetReport {
+                        max_device_bytes: device_budget.bytes(),
+                        provenance: device_budget.provenance(),
+                    }),
+                )
+            }
+            None => (None, None),
+        },
+        PathChoice::CpuFallback => (None, None),
     }
 }

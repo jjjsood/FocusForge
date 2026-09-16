@@ -3,9 +3,9 @@
 //! The tile warp in WGSL: the GPU twin of
 //! `focusforge_core::align::warp::{warp_from_tile, warp_tile}`. The host
 //! (`crate::warp_coords::map_coords`) decides coverage and the mapped source
-//! coordinate in `f64`, exactly as `crates/core` does today, and refuses a
-//! too-small source tile before anything here is encoded; this module only
-//! uploads, dispatches the bicubic kernel and reads the result back.
+//! coordinate in `f64`, as `crates/core` does, and refuses a too-small
+//! source tile before anything here is encoded; this module only uploads,
+//! dispatches the bicubic kernel and reads the result back.
 
 use std::sync::OnceLock;
 
@@ -30,10 +30,11 @@ fn zeroed_packed_buffer(device: &wgpu::Device, queue: &wgpu::Queue, byte_len: u6
     buffer
 }
 
-/// The bicubic warp kernel's one pipeline, built through
-/// [`crate::pipeline::build_pipeline`] on first use -- the same
-/// `OnceLock<Pipeline>` shape `crate::harness::GpuBackend`'s own `pipeline`
-/// field uses.
+/// The bicubic warp kernel's pipeline, built on first use: 3 storage + 1
+/// uniform binding. At a 512x512x3 destination the coord buffer is
+/// 6,291,456 bytes (24-byte `Coord` per pixel), the packed destination
+/// 1,572,864 bytes, and the dispatch 6,144 workgroups, all within
+/// `crate::limits::required_limits`.
 #[derive(Default)]
 pub struct WarpPipelines {
     bicubic: OnceLock<Pipeline>,
@@ -102,7 +103,7 @@ pub fn warp_from_tile_gpu(
     let device = shared.device();
     let queue = shared.queue();
     let word_count = (packed_len(sample_count) / 4) as u32;
-    let bytes = download_buffer(device, queue, &dst_buffer, u64::from(word_count) * 4);
+    let bytes = download_buffer(device, queue, &dst_buffer, u64::from(word_count) * 4)?;
     let samples = unpack_samples(&bytes, sample_count);
 
     Ok(WarpedTile {
@@ -214,7 +215,7 @@ pub fn warp_tile_gpu(
     let device = shared.device();
     let queue = shared.queue();
     let word_count = (packed_len(sample_count) / 4) as u32;
-    let bytes = download_buffer(device, queue, &dst_buffer, u64::from(word_count) * 4);
+    let bytes = download_buffer(device, queue, &dst_buffer, u64::from(word_count) * 4)?;
     let samples = unpack_samples(&bytes, sample_count);
 
     Ok(WarpedTile {

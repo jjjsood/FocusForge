@@ -8,6 +8,7 @@
 //!
 //! No API here takes or returns a whole frame.
 
+pub mod budget;
 pub mod consumer;
 pub mod control;
 mod error;
@@ -16,6 +17,11 @@ pub mod preprocess;
 pub mod scheduler;
 pub mod scratch;
 
+pub use budget::{
+    Clock, HOST_BUDGET_SHARE_PERCENT, HostBudget, HostBudgetGate, HostPermit, HostSources,
+    ManualClock, MonotonicClock, PRESSURE_CONFIRMATIONS, PRESSURE_POLL_INTERVAL_MS,
+    PRESSURE_SHARE_PERCENT,
+};
 pub use consumer::{TileConsumer, TileJob};
 pub use control::{NoControl, TileControl};
 pub use error::TileError;

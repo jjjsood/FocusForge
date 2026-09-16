@@ -6,8 +6,12 @@
 
 pub mod algorithm;
 pub mod align;
+/// The 16-to-8-bit display reduction (no tone curve, ordered dither) and its
+/// shared constants -- `crates/gpu`'s WGSL kernel is this module's twin.
+pub mod display;
 pub mod fuse;
 pub mod gpu;
+pub mod host;
 pub mod io;
 pub mod job;
 pub mod params;

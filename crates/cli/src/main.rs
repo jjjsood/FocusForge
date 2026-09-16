@@ -16,6 +16,7 @@ use serde::Serialize;
 
 mod algorithms;
 mod align;
+mod bytes;
 mod cache;
 mod export;
 #[cfg(feature = "gpu")]
@@ -38,13 +39,25 @@ mod status;
 /// a private item here is already visible to them (the same visibility
 /// `crate::fail` already relies on).
 #[cfg(feature = "gpu")]
-fn resolve_backend(no_gpu: bool) -> Option<&'static dyn focusforge_core::gpu::TileBackend> {
-    gpu::resolve_backend(no_gpu)
+fn resolve_backend(
+    no_gpu: bool,
+    max_vram: Option<u64>,
+) -> (
+    Option<&'static dyn focusforge_core::gpu::TileBackend>,
+    Option<stack::DeviceBudgetReport>,
+) {
+    gpu::resolve_backend(no_gpu, max_vram)
 }
 
 #[cfg(not(feature = "gpu"))]
-fn resolve_backend(_no_gpu: bool) -> Option<&'static dyn focusforge_core::gpu::TileBackend> {
-    None
+fn resolve_backend(
+    _no_gpu: bool,
+    _max_vram: Option<u64>,
+) -> (
+    Option<&'static dyn focusforge_core::gpu::TileBackend>,
+    Option<stack::DeviceBudgetReport>,
+) {
+    (None, None)
 }
 
 /// FocusForge command-line interface.
@@ -147,10 +160,29 @@ enum Command {
         /// the scheduler's own default.
         #[arg(long = "tile-size", value_name = "PX")]
         tile_size: Option<u32>,
-        /// Override the scheduler's in-flight memory budget, in bytes. Omit
-        /// to use the scheduler's own default.
-        #[arg(long = "max-bytes-in-flight", value_name = "BYTES")]
-        max_bytes_in_flight: Option<usize>,
+        /// A **ceiling only** on the adaptive host-memory budget: it can
+        /// lower the budget the host-derived estimate resolved to, and can
+        /// never raise it. Nobody has to pass this to get the machine's own
+        /// concurrency -- omit it entirely and the budget is derived from
+        /// the host. Accepts suffixed sizes (`8GiB`, `512MiB`, `4096`).
+        #[arg(
+            long = "max-host-memory",
+            value_name = "SIZE",
+            value_parser = crate::bytes::parse_byte_size
+        )]
+        max_host_memory: Option<u64>,
+        /// A **ceiling only** on the adaptive device (VRAM) budget: it can
+        /// lower the budget the startup probe settled on, and can never
+        /// raise it. Omit it entirely to get the probed value. Accepts the
+        /// same suffixed sizes as `--max-host-memory`. Only present when the
+        /// `gpu` feature is compiled in.
+        #[cfg(feature = "gpu")]
+        #[arg(
+            long = "max-vram",
+            value_name = "SIZE",
+            value_parser = crate::bytes::parse_byte_size
+        )]
+        max_vram: Option<u64>,
         /// Read parameter values from a TOML preset: the `algo` and
         /// `align-algo` keys plus the `[stack]` and `[align]` value
         /// tables. A flag always beats the file -- `--set`/`--align-set`
@@ -302,7 +334,9 @@ fn main() -> ExitCode {
             resume,
             quiet,
             tile_size,
-            max_bytes_in_flight,
+            max_host_memory,
+            #[cfg(feature = "gpu")]
+            max_vram,
             preset,
             write_preset,
             status,
@@ -315,6 +349,8 @@ fn main() -> ExitCode {
             let no_gpu = !gpu;
             #[cfg(not(feature = "gpu"))]
             let no_gpu = false;
+            #[cfg(not(feature = "gpu"))]
+            let max_vram: Option<u64> = None;
             stack::run(
                 &dir,
                 output.as_deref(),
@@ -333,7 +369,6 @@ fn main() -> ExitCode {
                     resume,
                     quiet,
                     tile_size,
-                    max_bytes_in_flight,
                     cache,
                 },
                 &preset::PresetOptions {
@@ -345,6 +380,8 @@ fn main() -> ExitCode {
                 &group_args,
                 &std::env::args().collect::<Vec<_>>(),
                 no_gpu,
+                max_host_memory,
+                max_vram,
             )
         }
         Command::Export {

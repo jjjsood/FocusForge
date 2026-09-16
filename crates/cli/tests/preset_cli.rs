@@ -121,7 +121,7 @@ fn preset_file_matches_equivalent_set_flags() {
     let from_preset = preset_dir.join("mantis-512.ffproj");
     let out = run_cli_in(
         &dir,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             mantis.to_str().unwrap(),
             "-o",
@@ -132,7 +132,7 @@ fn preset_file_matches_equivalent_set_flags() {
             preset.to_str().unwrap(),
             "--no-align",
             "--no-crop",
-        ],
+        ]),
     );
     assert!(out.success, "stderr: {}", out.stderr);
 
@@ -141,7 +141,7 @@ fn preset_file_matches_equivalent_set_flags() {
     let from_flags = flags_dir.join("mantis-512.ffproj");
     let out = run_cli_in(
         &dir,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             mantis.to_str().unwrap(),
             "-o",
@@ -152,7 +152,7 @@ fn preset_file_matches_equivalent_set_flags() {
             "levels=3",
             "--no-align",
             "--no-crop",
-        ],
+        ]),
     );
     assert!(out.success, "stderr: {}", out.stderr);
 
@@ -371,7 +371,7 @@ fn preset_supplies_the_algorithm_id() {
     // An explicit `--algo` still wins over the file.
     let out = run_cli_in(
         &dir,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             mantis.to_str().unwrap(),
             "-o",
@@ -383,7 +383,7 @@ fn preset_supplies_the_algorithm_id() {
             "--json",
             "--no-align",
             "--no-crop",
-        ],
+        ]),
     );
     assert!(out.success, "stderr: {}", out.stderr);
     let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("--json must parse");
@@ -425,7 +425,7 @@ fn written_preset_round_trips() {
     let first = first_dir.join("mantis-512.ffproj");
     let out = run_cli_in(
         &dir,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             mantis.to_str().unwrap(),
             "-o",
@@ -438,7 +438,7 @@ fn written_preset_round_trips() {
             written.to_str().unwrap(),
             "--no-align",
             "--no-crop",
-        ],
+        ]),
     );
     assert!(out.success, "stderr: {}", out.stderr);
 
@@ -456,7 +456,7 @@ fn written_preset_round_trips() {
     let second = second_dir.join("mantis-512.ffproj");
     let out = run_cli_in(
         &dir,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             mantis.to_str().unwrap(),
             "-o",
@@ -465,7 +465,7 @@ fn written_preset_round_trips() {
             written.to_str().unwrap(),
             "--no-align",
             "--no-crop",
-        ],
+        ]),
     );
     assert!(out.success, "stderr: {}", out.stderr);
     assert_eq!(
@@ -482,7 +482,7 @@ fn dry_run_writes_nothing_and_succeeds() {
     let status = dir.join("status.ndjson");
     let out = run_cli_in(
         &dir,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
@@ -497,7 +497,7 @@ fn dry_run_writes_nothing_and_succeeds() {
             "--dry-run",
             "--status",
             status.to_str().unwrap(),
-        ],
+        ]),
     );
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 
@@ -548,7 +548,7 @@ fn dry_run_stops_before_alignment() {
     let dir = tmp_dir("preset_cli_dry_run_no_alignment");
     let out = run_cli_in(
         &dir,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
@@ -561,7 +561,7 @@ fn dry_run_stops_before_alignment() {
             "--align-algo",
             "pyramidal-ecc",
             "--dry-run",
-        ],
+        ]),
     );
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 
@@ -590,7 +590,7 @@ fn dry_run_json_is_not_a_stack_report() {
     let output = dir.join("mantis-512.ffproj");
     let out = run_cli_in(
         &dir,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
@@ -604,7 +604,7 @@ fn dry_run_json_is_not_a_stack_report() {
             "pyramidal-ecc",
             "--dry-run",
             "--json",
-        ],
+        ]),
     );
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 
@@ -634,7 +634,7 @@ fn dry_run_refuses_to_resume() {
     let dir = tmp_dir("preset_cli_dry_run_resume");
     let out = run_cli_in(
         &dir,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
@@ -643,7 +643,7 @@ fn dry_run_refuses_to_resume() {
             "laplacian",
             "--dry-run",
             "--resume",
-        ],
+        ]),
     );
     assert_eq!(out.code, Some(1), "stdout: {}", out.stdout);
     assert!(
@@ -847,7 +847,7 @@ fn written_preset_holds_explicit_values_only() {
     let written = dir.join("written.toml");
     let out = run_cli_in(
         &dir,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
@@ -858,7 +858,7 @@ fn written_preset_holds_explicit_values_only() {
             written.to_str().unwrap(),
             "--no-align",
             "--no-crop",
-        ],
+        ]),
     );
     assert!(out.success, "stderr: {}", out.stderr);
 

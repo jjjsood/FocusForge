@@ -30,12 +30,10 @@ pub struct SetArgs {
 #[derive(Args, Debug, Default)]
 pub struct AlignSetArgs {
     /// Set an alignment parameter: `--align-set key=value`, repeatable. A
-    /// repeated key is last-wins. The Rust field is named `align_set`, not
-    /// `set` -- clap derives an argument's internal id from the field name
-    /// by default, and flattening two structs that both name their field
-    /// `set` into the same parent command collides on that id even though
-    /// their `--long` spellings differ (clap 4.6.6 debug assertion:
-    /// "Argument names must be unique").
+    /// repeated key is last-wins.
+    // clap derives an argument's internal id from the field name; naming
+    // this field `set` would collide with `SetArgs::set`'s id once both
+    // structs are flattened into the same command.
     #[arg(long = "align-set", value_name = "KEY=VALUE", value_parser = parse_key_val)]
     pub align_set: Vec<(String, String)>,
 }
@@ -54,20 +52,10 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
     Ok((key.to_string(), value.to_string()))
 }
 
-/// Parses and validates `pairs` against `schema`, returning a complete set
-/// of settings or every violation found — every pair is visited before
-/// returning, which is what makes several bad settings one report.
-///
-/// [`ParamViolation::UnknownKey`] is the one violation this function
-/// constructs directly: [`ParamValue::parse`] takes a descriptor, and an
-/// unknown key has none. Every other rejection is
-/// [`ParamValue::parse`]'s own, folded in via
-/// [`focusforge_core::params::ParamError::into_violations`].
-///
-/// A repeated key is last-wins: `pairs` is folded into a [`ParamValues`] (a
-/// `BTreeMap`), so a later pair overwrites an earlier one for the same key —
-/// deliberate, and matching clap's own convention for a repeated
-/// single-value option.
+/// Parses and validates `pairs` against `schema`, returning every setting or
+/// every violation (all pairs are visited, so several bad settings make one
+/// report). A repeated key is last-wins. [`ParamViolation::UnknownKey`] is
+/// built here; every other rejection is [`ParamValue::parse`]'s own.
 pub fn parse_settings(
     schema: &[ParamDesc],
     pairs: &[(String, String)],
@@ -95,23 +83,9 @@ pub fn parse_settings(
     }
 }
 
-/// Validates a preset file's `[stack]` or `[align]` table against `schema`
-/// and overlays `cli` -- the values [`parse_settings`] already produced from
-/// inline `--set` flags -- on top of it, key by key, so **a flag beats the
-/// file** for the same key.
-///
-/// Preset values arrive already typed from the `toml` parser, never as
-/// `key=value` text, so they go through [`params::validate`] rather than
-/// [`parse_settings`]: one pass reporting every offender, with the same
-/// [`ParamViolation`] variants an equivalent `--set` produces
-/// (`UnknownKey`, `TypeMismatch`, `OutOfRange`, `UnknownVariant`,
-/// `NotFinite`) minus [`ParamViolation::Unparsable`], which cannot fire
-/// where nothing was parsed from text.
-///
-/// A preset-supplied key resolves with
-/// [`focusforge_core::params::Provenance::Explicit`], exactly as the same
-/// value written on the command line would: a preset is the user setting the
-/// value, in a file.
+/// Validates a preset's `[stack]` or `[align]` table against `schema` with
+/// [`params::validate`] (values arrive typed, never as text) and overlays
+/// `cli` on top, key by key: a flag beats the file.
 pub fn merge_preset(
     schema: &[ParamDesc],
     preset: &ParamValues,
@@ -148,6 +122,7 @@ mod tests {
                 },
                 default: ParamValue::Float(0.5),
                 auto: None,
+                host_default: None,
             },
             ParamDesc {
                 id: "i".to_string(),
@@ -156,6 +131,7 @@ mod tests {
                 kind: ParamKind::Int { min: 0, max: 10 },
                 default: ParamValue::Int(1),
                 auto: None,
+                host_default: None,
             },
             ParamDesc {
                 id: "b".to_string(),
@@ -164,6 +140,7 @@ mod tests {
                 kind: ParamKind::Bool,
                 default: ParamValue::Bool(false),
                 auto: None,
+                host_default: None,
             },
             ParamDesc {
                 id: "e".to_string(),
@@ -177,6 +154,7 @@ mod tests {
                 },
                 default: ParamValue::Enum("x".to_string()),
                 auto: None,
+                host_default: None,
             },
         ]
     }

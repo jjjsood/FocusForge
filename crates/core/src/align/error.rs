@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! One module-owned error for `crate::align`.
+//! Error type for `crate::align`.
 //!
 //! Modelled on `crate::tile::error` and `crate::fuse::error`: every variant
 //! names its offending value. `#[non_exhaustive]` so new variants can be
@@ -90,4 +90,12 @@ pub enum AlignError {
         "transform's bottom row {bottom_row:?} is not affine (perspective row must be [0, 0, w])"
     )]
     NotAffine { bottom_row: [f64; 3] },
+
+    /// `crates/gpu`'s device backend failed underneath a warp call --
+    /// `impl From<focusforge_gpu::device::GpuError> for AlignError`
+    /// (`crates/gpu/src/device.rs`) is the only place this variant is
+    /// built, mirroring `AlgorithmError::Failed { algorithm: "gpu", .. }`
+    /// one crate over.
+    #[error("gpu backend: {detail}")]
+    Backend { detail: String },
 }

@@ -19,6 +19,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         kind: ParamKind::Int { min: 0, max: 256 },
         default: ParamValue::Int(16),
         auto: None,
+        host_default: None,
     }]
 });
 

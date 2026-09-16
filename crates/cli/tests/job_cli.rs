@@ -5,7 +5,7 @@
 //! tuning flags and the three exit codes.
 //!
 //! Every interruptible run passes `--no-align --no-crop --set levels=3
-//! --tile-size 160 --max-bytes-in-flight 1`, turning `fixtures/mantis-512`'s
+//! --tile-size 160 --max-host-memory 1`, turning `fixtures/mantis-512`'s
 //! 4-tile default plan into 25 single-worker units. Not `--tile-size 64`,
 //! which this tree refuses outright: "tile_size 64 leaves no interior at
 //! margin 24 for levels=3; use tile_size >= 160".
@@ -132,7 +132,18 @@ fn read_work_line(reader: &mut impl BufRead, prefix: &str) -> String {
 fn strip_grouping(stderr: &str) -> String {
     stderr
         .lines()
-        .filter(|l| !l.starts_with("grouping ") && !l.starts_with("  "))
+        .filter(|l| {
+            !l.starts_with("grouping ")
+                && !l.starts_with("  ")
+                // The GPU/CPU path choice (`crates/cli/src/gpu.rs`'s
+                // `resolve_backend`) prints once regardless of `--quiet`,
+                // exactly like the grouping proposal above -- not a
+                // progress tick, so it is excluded from both the
+                // quiet-is-empty check and the progress line-count budget
+                // the same way.
+                && !l.ends_with("the GPU path")
+                && !l.ends_with("the CPU path")
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -196,7 +207,7 @@ fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
 }
 
 /// `stack <dir> -o <out_dir> --algo laplacian --no-align --no-crop
-/// --tile-size 160 --set levels=3 --max-bytes-in-flight 1` -- the
+/// --tile-size 160 --set levels=3 --max-host-memory 1` -- the
 /// single-worker recipe this module's own doc comment explains (25 units
 /// against `fixtures/mantis-512`'s 4-tile default plan), assembled once so
 /// every interruptible-run test stops repeating it verbatim.
@@ -204,7 +215,7 @@ fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
 /// `out_dir` is the **directory** the run collects its project into: a
 /// stacking run writes a project, not an image, so `-o` names a directory.
 fn interruptible_stack_args<'a>(dir: &'a str, output: &'a str) -> Vec<&'a str> {
-    vec![
+    let mut args = vec![
         "stack",
         dir,
         "-o",
@@ -217,9 +228,18 @@ fn interruptible_stack_args<'a>(dir: &'a str, output: &'a str) -> Vec<&'a str> {
         "160",
         "--set",
         "levels=3",
-        "--max-bytes-in-flight",
+        "--max-host-memory",
         "1",
-    ]
+    ];
+    // Without `--no-gpu`, `--algo laplacian` takes the GPU path automatically
+    // now that `gpu` is a default build feature, and every SIGINT/pause test
+    // in this file depends on the CPU tile scheduler's own admission gate
+    // and worker count -- a GPU run bypasses both. `--no-gpu` only exists
+    // when this crate's own `gpu` feature is compiled in.
+    if cfg!(feature = "gpu") {
+        args.push("--no-gpu");
+    }
+    args
 }
 
 #[test]
@@ -232,19 +252,25 @@ fn stack_output_is_unchanged_under_the_job_engine() {
 
     let dir = tmp_dir("job_cli_output_unchanged");
     let output = dir.join("mantis-512.ffproj");
-    let out = run_cli_in(
-        &dir,
-        &[
-            "stack",
-            mantis_512_dir().to_str().unwrap(),
-            "-o",
-            output.parent().unwrap().to_str().unwrap(),
-            "--algo",
-            "laplacian",
-            "--no-align",
-            "--no-crop",
-        ],
-    );
+    let source = mantis_512_dir();
+    let mut args = vec![
+        "stack",
+        source.to_str().unwrap(),
+        "-o",
+        output.parent().unwrap().to_str().unwrap(),
+        "--algo",
+        "laplacian",
+        "--no-align",
+        "--no-crop",
+    ];
+    // Without `--no-gpu`, `--algo laplacian` takes the GPU path automatically
+    // now that `gpu` is a default build feature, and the in-process oracle
+    // below is CPU-only -- GPU/CPU parity is <=1 LSB by contract, not
+    // byte-identical, so this comparison needs both sides on the CPU path.
+    if cfg!(feature = "gpu") {
+        args.push("--no-gpu");
+    }
+    let out = run_cli_in(&dir, &args);
     assert!(out.success, "stderr: {}", out.stderr);
 
     // The in-process library oracle: the same `FusionConsumer` +
@@ -258,11 +284,11 @@ fn stack_output_is_unchanged_under_the_job_engine() {
     let values = params::resolved_values(&resolved);
     let levels = algo.tile_levels(&values);
     let oracle_path = dir.join("oracle.tif");
-    let options = TileSchedulerOptions {
-        tile_size: 512,
-        levels,
-        max_bytes_in_flight: 1 << 30,
-        scratch_base: dir.join("oracle-scratch"),
+    let options = {
+        let mut o = TileSchedulerOptions::explicit_budget(dir.join("oracle-scratch"), 1 << 30);
+        o.tile_size = 512;
+        o.levels = levels;
+        o
     };
     let scheduler = TileScheduler::new(&stack, stack_ctx, spp, &options).unwrap();
     let consumer = FusionConsumer::create(
@@ -335,7 +361,7 @@ fn fuse_counts(stderr: &str) -> Vec<(usize, usize)> {
 /// reports completed units mid-run, never `0/25` until the end.
 ///
 /// Needs a run longer than one `PLAIN_INTERVAL` (2 s) for a mid-run line to
-/// exist at all, which is what the `--tile-size 160 --max-bytes-in-flight 1`
+/// exist at all, which is what the `--tile-size 160 --max-host-memory 1`
 /// single-worker recipe guarantees against this fixture.
 #[test]
 fn progress_advances_during_an_uninterrupted_run() {
@@ -426,20 +452,26 @@ fn progress_to_a_file_has_no_escape_sequences() {
 fn quiet_prints_no_progress() {
     let dir = tmp_dir("job_cli_quiet");
     let output = dir.join("mantis-512.ffproj");
-    let out = run_cli_in(
-        &dir,
-        &[
-            "stack",
-            mantis_512_dir().to_str().unwrap(),
-            "-o",
-            output.parent().unwrap().to_str().unwrap(),
-            "--algo",
-            "laplacian",
-            "--no-align",
-            "--no-crop",
-            "--quiet",
-        ],
-    );
+    let source = mantis_512_dir();
+    let mut args = vec![
+        "stack",
+        source.to_str().unwrap(),
+        "-o",
+        output.parent().unwrap().to_str().unwrap(),
+        "--algo",
+        "laplacian",
+        "--no-align",
+        "--no-crop",
+        "--quiet",
+    ];
+    // Without `--no-gpu`, `--algo laplacian` takes the GPU path automatically
+    // now that `gpu` is a default build feature, and a GPU-unavailable
+    // fallback prints a warning to stderr regardless of `--quiet`, which this
+    // test asserts is otherwise empty.
+    if cfg!(feature = "gpu") {
+        args.push("--no-gpu");
+    }
+    let out = run_cli_in(&dir, &args);
     assert!(out.success, "stderr: {}", out.stderr);
     // `--quiet` removes progress, not decisions: the grouping proposal prints
     // regardless, so what must be empty is everything else.
@@ -546,25 +578,27 @@ mod unix_signals {
     fn sigint_then_resume_finishes_the_job() {
         let ref_dir = tmp_dir("job_cli_resume_reference");
         let ref_output = ref_dir.join("mantis-512.ffproj");
-        let ref_run = run_cli_in(
-            &ref_dir,
-            &[
-                "stack",
-                mantis_512_dir().to_str().unwrap(),
-                "-o",
-                ref_output.parent().unwrap().to_str().unwrap(),
-                "--algo",
-                "laplacian",
-                "--no-align",
-                "--no-crop",
-                "--tile-size",
-                "160",
-                "--set",
-                "levels=3",
-                "--max-bytes-in-flight",
-                "1",
-            ],
-        );
+        let mantis_dir_ref = mantis_512_dir();
+        let mut ref_args = vec![
+            "stack",
+            mantis_dir_ref.to_str().unwrap(),
+            "-o",
+            ref_output.parent().unwrap().to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--no-align",
+            "--no-crop",
+            "--tile-size",
+            "160",
+            "--set",
+            "levels=3",
+            "--max-host-memory",
+            "1",
+        ];
+        if cfg!(feature = "gpu") {
+            ref_args.push("--no-gpu");
+        }
+        let ref_run = run_cli_in(&ref_dir, &ref_args);
         assert!(ref_run.success, "stderr: {}", ref_run.stderr);
 
         let dir = tmp_dir("job_cli_resume_interrupted");
@@ -892,7 +926,7 @@ mod unix_signals {
         let dir = tmp_dir("job_cli_resume_changed_tile_size");
         let output = dir.join("mantis-512.ffproj");
         let mantis_dir = mantis_512_dir();
-        let base_args = [
+        let mut base_args = vec![
             "stack",
             mantis_dir.to_str().unwrap(),
             "-o",
@@ -903,9 +937,12 @@ mod unix_signals {
             "--no-crop",
             "--set",
             "levels=3",
-            "--max-bytes-in-flight",
+            "--max-host-memory",
             "1",
         ];
+        if cfg!(feature = "gpu") {
+            base_args.push("--no-gpu");
+        }
         let mut first_args = base_args.to_vec();
         first_args.push("--tile-size");
         first_args.push("160");
@@ -1161,7 +1198,7 @@ mod unix_signals {
         let dir = tmp_dir("job_cli_align_resume");
         let output = dir.join("mantis-512.ffproj");
         let mantis_dir = mantis_512_dir();
-        let args = [
+        let mut args = vec![
             "stack",
             mantis_dir.to_str().unwrap(),
             "-o",
@@ -1176,9 +1213,12 @@ mod unix_signals {
             "160",
             "--set",
             "levels=3",
-            "--max-bytes-in-flight",
+            "--max-host-memory",
             "1",
         ];
+        if cfg!(feature = "gpu") {
+            args.push("--no-gpu");
+        }
         let mut child = spawn_piped(&dir, &args);
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let align_line = read_work_line(&mut stderr, "align ");

@@ -287,9 +287,10 @@ pub fn run(
     if let Some(write_warped) = write_warped {
         // Resolved only here, not for a plain `align` run: plain `align` has
         // nothing on the GPU-shaped path (its ECC solver is CPU-only), so
-        // probing for an adapter on every run would be noise with nothing
-        // to show for it.
-        let backend = crate::resolve_backend(no_gpu);
+        // probing for an adapter on every run would be noise with nothing to
+        // show for it. `align` also has no `--max-vram` flag of its own, so
+        // there is no ceiling to thread through.
+        let (backend, _device_budget_report) = crate::resolve_backend(no_gpu, None);
         if let Err(msg) = write_warped_frames(
             write_warped,
             &stack,

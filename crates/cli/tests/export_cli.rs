@@ -114,11 +114,11 @@ fn library_composite() -> &'static PathBuf {
         let dir = tmp_dir("export_cli_oracle");
         let composite_path = dir.join("oracle.tif");
         let zmap_path = dir.join("oracle-zmap.tif");
-        let options = TileSchedulerOptions {
-            tile_size: 512,
-            levels,
-            max_bytes_in_flight: 1 << 30,
-            scratch_base: dir.join("scratch"),
+        let options = {
+            let mut o = TileSchedulerOptions::explicit_budget(dir.join("scratch"), 1 << 30);
+            o.tile_size = 512;
+            o.levels = levels;
+            o
         };
         let scheduler =
             TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");

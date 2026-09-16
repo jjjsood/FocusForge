@@ -20,19 +20,16 @@ use crate::signals::Signals;
 /// How often the pipeline's poll thread ticks progress and this crate's
 /// signal flags. Cancel latency is therefore `POLL` plus at most
 /// `TileScheduler::in_flight_limit()` further units; with
-/// `--max-bytes-in-flight 1` that is one tile, which is what makes the
+/// `--max-host-memory 1` that is one tile, which is what makes the
 /// SIGINT tests deterministic.
 pub const POLL: Duration = Duration::from_millis(100);
 
-/// `--resume`, `--quiet`, `--tile-size`, `--max-bytes-in-flight` and
-/// `--no-cache`, bundled so `stack::run` stays under clippy's
-/// argument-count lint -- the same dodge `AlignOptions` and
-/// `FusionGeometry` already use.
+/// `--resume`, `--quiet`, `--tile-size` and `--no-cache`, bundled to keep
+/// `stack::run`'s argument count down.
 pub struct JobOptions {
     pub resume: bool,
     pub quiet: bool,
     pub tile_size: Option<u32>,
-    pub max_bytes_in_flight: Option<usize>,
     /// `true` unless `--no-cache` was given. Disables **both** the stage
     /// cache read and the write -- a user reaching for `--no-cache`
     /// suspects the cache, so leaving a fresh entry behind would be a

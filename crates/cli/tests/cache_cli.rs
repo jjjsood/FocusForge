@@ -231,7 +231,7 @@ fn fusion_parameter_change_reuses_alignment() {
 
     let a = run_cli_in(
         &cwd,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             input.to_str().unwrap(),
             "-o",
@@ -243,7 +243,7 @@ fn fusion_parameter_change_reuses_alignment() {
             "--set",
             "levels=3",
             "--json",
-        ],
+        ]),
     );
     assert!(a.success, "stderr: {}", a.stderr);
     let a_report: serde_json::Value = serde_json::from_str(&a.stdout).expect("--json");
@@ -259,7 +259,7 @@ fn fusion_parameter_change_reuses_alignment() {
 
     let b = run_cli_in(
         &cwd,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             input.to_str().unwrap(),
             "-o",
@@ -271,7 +271,7 @@ fn fusion_parameter_change_reuses_alignment() {
             "--set",
             "levels=5",
             "--json",
-        ],
+        ]),
     );
     assert!(b.success, "stderr: {}", b.stderr);
     let b_report: serde_json::Value = serde_json::from_str(&b.stdout).expect("--json");
@@ -294,7 +294,7 @@ fn fusion_parameter_change_reuses_alignment() {
     // Control: the same parameters as `b`, forced to a cold recompute.
     let c = run_cli_in(
         &cwd,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             input.to_str().unwrap(),
             "-o",
@@ -307,7 +307,7 @@ fn fusion_parameter_change_reuses_alignment() {
             "levels=5",
             "--no-cache",
             "--json",
-        ],
+        ]),
     );
     assert!(c.success, "stderr: {}", c.stderr);
     let c_report: serde_json::Value = serde_json::from_str(&c.stdout).expect("--json");
@@ -340,7 +340,7 @@ fn stage_timings_survive_a_cache_hit() {
 
     let a = run_cli_in(
         &cwd,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             input.to_str().unwrap(),
             "-o",
@@ -352,13 +352,13 @@ fn stage_timings_survive_a_cache_hit() {
             "--set",
             "levels=3",
             "--json",
-        ],
+        ]),
     );
     assert!(a.success, "stderr: {}", a.stderr);
 
     let b = run_cli_in(
         &cwd,
-        &[
+        &common::push_no_gpu(vec![
             "stack",
             input.to_str().unwrap(),
             "-o",
@@ -370,7 +370,7 @@ fn stage_timings_survive_a_cache_hit() {
             "--set",
             "levels=5",
             "--json",
-        ],
+        ]),
     );
     assert!(b.success, "stderr: {}", b.stderr);
     let b_report: serde_json::Value = serde_json::from_str(&b.stdout).expect("--json");

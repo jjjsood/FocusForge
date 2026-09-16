@@ -9,7 +9,9 @@ publish = false
 workspace = true
 
 [features]
+default = ["gpu"]
 gpu = ["dep:wgpu", "dep:thiserror"]
+gpu-tests = ["gpu"]
 
 [dependencies]
 focusforge-core = { path = "../core" }

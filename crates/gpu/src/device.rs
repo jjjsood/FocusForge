@@ -15,7 +15,13 @@ use wgpu::{
 };
 
 use crate::adapter::{AdapterPath, classify_adapter, skip_message};
-use crate::limits::{LimitShortfall, describe_shortfalls, required_limits};
+use crate::limits::{LimitShortfall, describe_shortfalls, device_limits, required_limits};
+
+/// The `for_resource_creation` threshold, as a percent of a heap's own
+/// budget: the value gfx-rs/wgpu#7460 itself proposes. Only D3D12 and
+/// (optionally, when `VK_EXT_memory_budget` is enabled) Vulkan honour this
+/// at all in wgpu 29.0.4.
+const MEMORY_BUDGET_THRESHOLD_PERCENT: u8 = 90;
 
 /// Everything that can go wrong bringing up the shared device, named rather
 /// than left as an adapter-creation panic.
@@ -40,6 +46,29 @@ pub enum GpuError {
     /// rather than surfacing as a wgpu validation panic.
     #[error("tile needs a buffer this device cannot allocate: {detail}")]
     TileTooLarge { detail: String },
+
+    /// A readback (`crate::transfer::download_buffer`/`download_f32`)
+    /// failed: `device.poll` itself failed, the `map_async` callback never
+    /// fired, or the mapping it delivered was an error -- three panics
+    /// turned into one named, recoverable value.
+    #[error("readback failed: {detail}")]
+    Readback { detail: String },
+
+    /// An in-run allocation refusal caught by a `push_error_scope` /
+    /// `pop_error_scope(OutOfMemory)` pair around a tile's dispatch. Its
+    /// message names `--max-vram` as the flag to lower -- mid-run
+    /// exhaustion after a successful startup probe is a run failure, never
+    /// a fallback.
+    #[error("GPU ran out of device memory mid-run: {detail}; lower --max-vram to reduce demand")]
+    DeviceOutOfMemory { detail: String },
+
+    /// [`crate::budget::probe_budget`] backed all the way down to
+    /// [`crate::budget::PROBE_MIN_DEVICE_BYTES`] without a single accepted
+    /// reservation: the device cannot serve even the smallest budget. Maps
+    /// to [`crate::adapter::PathChoice::CpuFallback`] via `choose_path`,
+    /// exactly like [`GpuError::NoAdapter`].
+    #[error("device cannot serve even the minimum VRAM budget of {floor_bytes} bytes: {detail}")]
+    VramExhausted { floor_bytes: u64, detail: String },
 }
 
 impl GpuError {
@@ -81,6 +110,15 @@ impl From<GpuError> for focusforge_core::algorithm::AlgorithmError {
     }
 }
 
+/// For `crate::warp`'s readback call sites, which return `AlignError`.
+impl From<GpuError> for focusforge_core::align::AlignError {
+    fn from(err: GpuError) -> Self {
+        focusforge_core::align::AlignError::Backend {
+            detail: err.to_string(),
+        }
+    }
+}
+
 impl From<AdapterPath<wgpu::Adapter>> for Result<wgpu::Adapter, GpuError> {
     fn from(path: AdapterPath<wgpu::Adapter>) -> Self {
         match path {
@@ -92,9 +130,11 @@ impl From<AdapterPath<wgpu::Adapter>> for Result<wgpu::Adapter, GpuError> {
 
 /// The device/queue the crate shares, plus the adapter facts a caller needs
 /// to report or reason about (`info`, `limits`). Holds `instance` and
-/// `adapter` too so neither is dropped out from under the device.
+/// `adapter` too so neither is dropped out from under the device, and so
+/// the `Manual` device-ownership path
+/// (`slint::wgpu_29::WGPUConfiguration::Manual`) can clone all four handles
+/// back out (`Self::instance`, `Self::adapter`).
 pub struct SharedDevice {
-    #[allow(dead_code)]
     instance: Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -104,6 +144,20 @@ pub struct SharedDevice {
 }
 
 impl SharedDevice {
+    /// The `wgpu::Instance` the device was created from. `wgpu::Instance` is
+    /// `Clone` in the pinned wgpu 29.0.4, so a caller taking
+    /// the `Manual` device-ownership path clones out rather than moving this
+    /// crate's own copy.
+    pub fn instance(&self) -> &wgpu::Instance {
+        &self.instance
+    }
+
+    /// The `wgpu::Adapter` the device was requested from. `wgpu::Adapter` is
+    /// `Clone` in the pinned wgpu 29.0.4, for the same reason.
+    pub fn adapter(&self) -> &wgpu::Adapter {
+        &self.adapter
+    }
+
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }
@@ -116,15 +170,10 @@ impl SharedDevice {
         &self.info
     }
 
-    /// The limits the device was actually created with --
-    /// `crate::limits::device_limits(&adapter.limits())`, **not** the
-    /// unraised `required_limits()` floor: this device is also handed to
-    /// Slint's swapchain, so its `max_texture_dimension_{1d,2d,3d}` are
-    /// widened to the adapter's own resolution while every compute limit
-    /// and both buffer limits stay exactly at `required_limits()`'s stated
-    /// floor. This is what wgpu validates every allocation against, which
-    /// is why the device-budget's pre-dispatch refusal checks this value
-    /// rather than [`Self::adapter_limits`].
+    /// The limits the device was created with (`crate::limits::device_limits`):
+    /// `required_limits()` with only the texture dimensions widened for
+    /// Slint's swapchain. wgpu validates allocations against these, so the
+    /// pre-dispatch refusal does too, not [`Self::adapter_limits`].
     pub fn limits(&self) -> &wgpu::Limits {
         &self.limits
     }
@@ -139,10 +188,10 @@ impl SharedDevice {
     }
 }
 
-/// Same trick `i-slint-core`'s wgpu_29 backend uses: wgpu's adapter/device
-/// request futures are ready on first poll on every native platform, so no
-/// async executor dependency is needed here.
-fn block_on<F: Future>(future: F) -> F::Output {
+/// wgpu's adapter/device request and error-scope futures are ready on first
+/// poll on every native platform (the same approach `i-slint-core`'s wgpu_29
+/// backend takes), so no async executor is needed.
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     let mut future = std::pin::pin!(future);
@@ -159,7 +208,13 @@ fn init() -> Result<SharedDevice, GpuError> {
         backends: Backends::from_env().unwrap_or_default(),
         flags: InstanceFlags::from_build_config().with_env(),
         backend_options: wgpu::BackendOptions::from_env_or_default(),
-        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        // `for_device_loss` stays `None` on purpose: arming it risks
+        // `download_buffer`'s poll path hitting a device-loss panic instead
+        // of the recoverable `OutOfMemory` error scope this crate builds.
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds {
+            for_resource_creation: Some(MEMORY_BUDGET_THRESHOLD_PERCENT),
+            for_device_loss: None,
+        },
         display: None,
     });
 
@@ -189,16 +244,17 @@ fn init() -> Result<SharedDevice, GpuError> {
         driver_info: adapter_info.driver_info.clone(),
     };
 
+    let limits = device_limits(&adapter.limits());
+
     let (device, queue) = block_on(adapter.request_device(&DeviceDescriptor {
         label: Some("focusforge-gpu-shared-device"),
         required_features: crate::limits::REQUIRED_FEATURES,
-        required_limits: required_limits(),
+        required_limits: limits.clone(),
         experimental_features: ExperimentalFeatures::disabled(),
         memory_hints: MemoryHints::default(),
         trace: Trace::default(),
     }))?;
 
-    let limits = required_limits();
     Ok(SharedDevice {
         instance,
         adapter,

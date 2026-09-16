@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// Doc links to `pub(crate)` items resolve: this crate's docs are always
+// built with `--document-private-items`.
+#![allow(rustdoc::private_intra_doc_links)]
+
 //! The GPU path: the same kernels `crates/core` runs on the CPU, in WGSL,
 //! reached from `crates/core` through
 //! [`focusforge_core::gpu::TileBackend`], never the other way around
@@ -36,6 +40,11 @@ pub mod warp_coords;
 
 #[cfg(feature = "gpu")]
 pub mod device;
+/// The display kernel: a 16-to-8-bit reduction with ordered dither and no
+/// tone curve, the display texture Slint imports, and the one readback
+/// path that exists only for the parity test.
+#[cfg(feature = "gpu")]
+pub mod display;
 #[cfg(feature = "gpu")]
 pub mod fuse;
 #[cfg(feature = "gpu")]
@@ -46,5 +55,7 @@ pub(crate) mod pipeline;
 pub mod stack_tile;
 #[cfg(feature = "gpu")]
 pub mod transfer;
+#[cfg(feature = "gpu")]
+pub mod vram;
 #[cfg(feature = "gpu")]
 pub mod warp;

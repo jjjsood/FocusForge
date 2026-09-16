@@ -24,6 +24,10 @@
 #      the assertion; memory.peak, memory.swap.peak and the anon/file split
 #      are recorded, never thresholded.
 #
+# `run_stack` passes `--no-gpu`: `gpu` is a default feature, and without it
+# this run would measure the GPU path's VRAM probe instead of the CPU tile
+# scheduler's host-memory behaviour it exists to measure.
+#
 # Uses the release binary: the dev profile is far too slow at this scale.
 #
 # Why not `ulimit -v` for the memory ceiling: `crates/core/src/io/tiff/stack.rs`
@@ -295,19 +299,7 @@ build_farm() {
 
 # --- the run itself: identical command, different OUT ----------------------
 #
-# `--no-crop`: `stack` applies the auto-crop by default, which would shrink
-# the composite below the full 8192x5464 extent that
-# `crates/cli/tests/acceptance.rs` compares against `Mantis_Stacked.tif`
-# (`tools/tiff-diff.py` refuses any dimension mismatch outright).
-# `--align-algo pyramidal-ecc --lax`: `--lax` is not optional here -- a
-# 61-frame sweep anchored on frame 30 is a longer baseline than the
-# 8-frame fixture on which frame 0 already diverges, and a strict refusal
-# would waste the whole run.
-#
-# `ACCEPTANCE_ALIGN=0` swaps `--align-algo pyramidal-ecc --lax` for
-# `--no-align` -- these runs measure the scheduler, not alignment, and
-# solving a real ECC alignment at 300/600 frames would spend hours on a
-# stage that is not being measured here.
+# Both locks: this reads target/release directly and drives the GPU.
 run_stack() {
   local out="$1"
   local align_flags=(--align-algo pyramidal-ecc --lax)
@@ -319,10 +311,11 @@ run_stack() {
   if [ "$ALGO" = "laplacian" ]; then
     algo_settings=(--set levels=5)
   fi
-  /usr/bin/time -v "$CLI" stack "$OUT_DIR/frames" \
+  tools/with-lock.sh build -- tools/with-lock.sh gpu -- \
+    /usr/bin/time -v "$CLI" stack "$OUT_DIR/frames" \
       -o "$out" \
       --algo "$ALGO" "${algo_settings[@]}" --json \
-      --no-crop "${align_flags[@]}" \
+      --no-crop "${align_flags[@]}" --no-gpu \
       > "$out/stack.json" 2> "$out/time-v.txt"
 
   # A stacking run writes a project, not an image. The two TIFFs
@@ -335,7 +328,8 @@ run_stack() {
     echo "refuse: the run wrote no project under $out" >&2
     return 1
   fi
-  "$CLI" export "$project" -o "$out/out.tif" --zmap "$out/out-zmap.tif" \
+  tools/with-lock.sh build -- \
+    "$CLI" export "$project" -o "$out/out.tif" --zmap "$out/out-zmap.tif" \
       > "$out/export.txt" 2>&1
 }
 
@@ -347,7 +341,8 @@ run_stack() {
 run_align() {
   local out="$1"
   local mode="$2"
-  /usr/bin/time -v "$CLI" align "$OUT_DIR/frames" \
+  tools/with-lock.sh build -- tools/with-lock.sh gpu -- \
+    /usr/bin/time -v "$CLI" align "$OUT_DIR/frames" \
       --algo pyramidal-ecc --set "mode=$mode" --lax --json \
       > "$out/align-$mode.json" 2> "$out/align-$mode-time-v.txt"
 }
