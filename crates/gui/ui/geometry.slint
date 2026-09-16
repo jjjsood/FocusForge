@@ -3,6 +3,8 @@
 // The shell's geometry, as a single exported global: every number here is
 // transcribed once, so the `.slint` shell files and the geometry tests read one source.
 
+import { Theme } from "theme.slint";
+
 export global ShellGeometry {
     // The window itself.
     out property <length> base-width: 1440px;
@@ -30,6 +32,29 @@ export global ShellGeometry {
     // The tab strip's window glyphs.
     out property <length> glyph-pitch: 36px;
     out property <length> glyph-first-x: 1335px; // 1342 - 7
+
+    // Every box on the tab strip -- the projects button, the scroll arrows,
+    // each tab and "+" -- shares one top edge and one height: boxes span
+    // strip y 6..36, so they sit flush on the strip's bottom edge and
+    // connect into the toolbar.
+    out property <length> strip-box-height: 30px;
+    out property <length> strip-box-top: 6px;
+    // The square boxes (projects button, scroll arrows, "+") -- 30 wide.
+    out property <length> strip-box-width: 30px;
+
+    // The four-square Projects-overlay button at the tab strip's far left:
+    // 8 px inset, the 30 px box, 8 px to the first tab (board: button x
+    // 8..38, first tab x 46). The slot is everything left of the tabs.
+    out property <length> projects-button-inset: 8px;
+    out property <length> projects-button-slot: 46px;
+
+    // The gap between neighbouring strip boxes: a tab and the next, a scroll
+    // arrow and the tabs viewport, the right arrow and the pinned "+".
+    out property <length> strip-box-gap: Theme.space-1;
+    // The clear gap between the strip's right-hand group (the last tab and
+    // "+", or the right arrow and the pinned "+" on overflow) and the window
+    // glyphs -- roughly one "+" width.
+    out property <length> strip-cluster-gap: Theme.space-8;
 
     // Dock rows.
     out property <length> checkpoint-row-height: 40px;

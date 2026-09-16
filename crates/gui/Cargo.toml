@@ -21,6 +21,12 @@ focusforge-gpu = { path = "../gpu", features = ["gpu"] }
 toml = "1"
 serde = { version = "1", features = ["derive"] }
 directories = "6"
+# The native folder/file picker. Default features,
+# blocking `pick_folder`/`pick_file` only -- never `AsyncFileDialog`.
+# On Linux this pulls `ashpd` +
+# `pollster` (sync, no async runtime) via the `xdg-portal` default feature,
+# not GTK3.
+rfd = "0.17.2"
 
 [build-dependencies]
 slint-build = "~1.17"

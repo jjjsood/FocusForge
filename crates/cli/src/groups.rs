@@ -46,17 +46,16 @@ use clap::Args;
 use focusforge_core::io::{Group, GroupSignal, Proposal};
 use serde::{Deserialize, Serialize};
 
-/// The grouping file's schema version, additive-only from here forward.
+/// The grouping file's schema version. Changes are additive only: a later
+/// field must not break a consumer written against an earlier one.
 pub const GROUPS_FILE_FORMAT: u32 = 1;
 
 /// The run-level manifest's schema version.
 pub const MANIFEST_FORMAT: u32 = 1;
 
-/// The three grouping/subset flags, flattened into `stack` -- the shape
-/// [`crate::set::SetArgs`] established, where the type is the reusable
-/// thing rather than a position on the command line. All three decide what
-/// a run is pointed at: `--groups`/`--write-groups` decide what a stack
-/// *is*, `--only` decides which of the proposed stacks actually run.
+/// The three grouping/subset flags, flattened into `stack`:
+/// `--groups`/`--write-groups` decide what a stack *is*, `--only` decides
+/// which of the proposed stacks run.
 #[derive(Args, Debug, Default)]
 pub struct GroupArgs {
     /// Group the frames as this TOML file says instead of proposing a
@@ -138,7 +137,7 @@ pub struct ManifestEntry {
 
 impl ManifestEntry {
     /// The identity to report: the stored field, or [`Self::name`] when it
-    /// is empty -- a manifest written before `identity` existed.
+    /// is empty.
     pub fn identity(&self) -> &str {
         if self.identity.is_empty() {
             &self.name
@@ -181,8 +180,7 @@ pub fn write(proposal: &Proposal, path: &Path) -> Result<(), String> {
 /// each naming the offending frame: a listed frame that the walk did not
 /// find, a frame listed in two groups, and a frame the walk found that no
 /// group lists. Comparison is by `std::path::absolute` of `root.join(entry)`
-/// -- lexical normalization, the idiom `crate::stack::colliding_frame`
-/// already uses, which needs no file to exist.
+/// -- lexical normalization, which needs no file to exist.
 pub fn load(path: &Path, root: &Path, walked: &Proposal) -> Result<Proposal, String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let file: GroupsFile =
@@ -289,6 +287,7 @@ pub fn load(path: &Path, root: &Path, walked: &Proposal) -> Result<Proposal, Str
         groups,
         gap: walked.gap,
         time_signal_available: walked.time_signal_available,
+        skipped: walked.skipped.clone(),
     })
 }
 
@@ -357,6 +356,13 @@ pub fn render_proposal(proposal: &Proposal, from: Option<&Path>) -> String {
             }
         }
     }
+
+    // Reported, never swallowed: a subdirectory the walk gave up on is the
+    // same fact whether the CLI or the GUI's entry path is what walked it.
+    for path in &proposal.skipped {
+        lines.push(format!("skipped {}: no readable frames", path.display()));
+    }
+
     lines.join("\n")
 }
 
@@ -445,7 +451,19 @@ mod tests {
             ],
             gap: Duration::from_secs(60),
             time_signal_available: true,
+            skipped: Vec::new(),
         }
+    }
+
+    #[test]
+    fn render_proposal_prints_a_skipped_line_per_skipped_directory() {
+        let mut proposal = sample_proposal();
+        proposal.skipped = vec![PathBuf::from("card-dump/thumbnails")];
+        let text = render_proposal(&proposal, None);
+        assert!(
+            text.contains("skipped card-dump/thumbnails: no readable frames"),
+            "{text}"
+        );
     }
 
     #[test]

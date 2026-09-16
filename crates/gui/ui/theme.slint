@@ -113,6 +113,10 @@ export global Theme {
     out property <length> icon-lg: 20px;
     out property <length> icon-md: 16px;
     out property <length> icon-sm: 14px;
+
+    // Motion animates the tab strip's scroll. An easing cannot be a
+    // property, so every `animate` using motion-fast pairs it with ease-out.
+    out property <duration> motion-fast: 150ms;
 }
 
 // Empty on purpose: a handle so a test can reach a global. No UI surface

@@ -132,6 +132,9 @@ fn window_minimum_size_is_enforced() {
 #[test]
 fn checkpoint_panel_shows_its_empty_state() {
     let app = app_at(1440, 900);
+    // The dock tab row exists only while a project is loaded
+    // (`dock_without_a_project_says_so`).
+    app.set_project_loaded(true);
 
     let panel = ElementQuery::from_root(&app)
         .match_id("FFDock::checkpoint-panel")
@@ -165,12 +168,7 @@ fn checkpoint_panel_touches_no_storage() {
     // `input_config.rs` is a config file, not the checkpoint panel reaching
     // for storage. Excluded by name: this test's own subject is the
     // checkpoint panel, not the whole crate.
-    let canvas_files = [
-        "canvas.rs",
-        "gpu_canvas.rs",
-        "project_stub.rs",
-        "input_config.rs",
-    ];
+    let canvas_files = ["canvas.rs", "gpu_canvas.rs", "entry.rs", "input_config.rs"];
     for path in common::find_rust_files(&common::src_dir()) {
         if path
             .file_name()
@@ -204,10 +202,10 @@ fn zoom_cluster_sits_at_the_bottom_bar_right_end() {
         &app,
         "FFBottomBar::zoom-cluster",
         (
-            1440.0 - 12.0 - 200.0,
-            856.0 + (44.0 - 26.0) / 2.0,
-            200.0,
-            26.0,
+            1440.0 - 12.0 - 216.0,
+            856.0 + (44.0 - 32.0) / 2.0,
+            216.0,
+            32.0,
         ),
     );
 
@@ -262,5 +260,347 @@ fn maximize_glyph_reflects_the_maximized_state() {
         label().as_deref(),
         Some("Maximize"),
         "un-maximizing again must flip the label back"
+    );
+}
+
+/// The gear carries its own persistently-boxed background -- the "icon
+/// button" catalogue entry's default state already carries a visible box --
+/// rather than a bare `TouchArea`. It does **not** share the zoom
+/// cluster's own `FFZoomIconButton`, whose grouped, hover-only convention
+/// is a different at-rest state. The gear is a single standalone control,
+/// so it keeps its own individual box, sized to the same 32 x 32 baseline
+/// the zoom buttons use for one shared bar-wide rhythm.
+#[test]
+fn gear_has_its_own_persistent_box() {
+    let app = app_at(1440, 900);
+
+    let (_, _, w, h) = rect(&app, "FFBottomBar::gear");
+    assert_eq!(
+        (w, h),
+        (32.0, 32.0),
+        "the gear's hit box must match the zoom cluster's own 32 x 32 baseline \
+         (Theme.icon-md + 2 * Theme.space-2), not the bare 20 px TouchArea it used to be"
+    );
+
+    let bottom_bar_slint =
+        fs::read_to_string(common::ui_dir().join("shell").join("bottom_bar.slint")).unwrap();
+    let code = common::strip_line_comments(&bottom_bar_slint);
+    assert!(
+        code.contains("gear := FFGearButton"),
+        "bottom_bar.slint: the gear must use its own FFGearButton component, not the zoom \
+         cluster's FFZoomIconButton -- the two must not share chrome"
+    );
+    assert!(
+        !code.contains("gear := FFZoomIconButton"),
+        "bottom_bar.slint: the gear must not reuse the zoom cluster's own icon-button component"
+    );
+
+    // `FFGearButton`'s default (non-hover) background must not be
+    // `transparent` -- that is the exact defect this pass fixed: a button
+    // with chrome only on hover reads as no button at all until the mouse
+    // finds it.
+    let default_background = code
+        .split("background: area.has-hover ? Theme.surface-hover : ")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .expect("FFGearButton must bind its background to a hover/default pair");
+    assert_ne!(
+        default_background.trim(),
+        "transparent",
+        "FFGearButton's default state must carry a visible background"
+    );
+}
+
+/// The four-square Projects-overlay button sits at the strip's far left and
+/// the tabs start after it -- `ShellGeometry.projects-button-slot` wired to
+/// `tabs-region`'s `x`, not merely declared and left unused: button x
+/// 8..38, first tab x 46.
+#[test]
+fn tab_strip_reserves_the_projects_button_slot() {
+    let app = app_at(1440, 900);
+
+    let (x, _, _, _) = rect(&app, "FFTabStrip::tabs-region");
+    assert_eq!(
+        x, 46.0,
+        "tabs-region must start at ShellGeometry.projects-button-slot (46px), not flush at x=0"
+    );
+    // The projects button is a 30x30 strip box at x 8, on the tabs' top edge.
+    assert_rect(&app, "FFTabStrip::projects-button", (8.0, 6.0, 30.0, 30.0));
+}
+
+/// The tab strip's scroll arrows must actually be wired to the
+/// controller's flags, not merely lit over a strip with no overflow. Both
+/// arrows show exactly while the strip overflows, and each greys out
+/// (disabled) at its end of the list.
+#[test]
+fn scroll_arrows_are_bound_to_the_overflow_flags() {
+    let tab_strip_slint =
+        fs::read_to_string(common::ui_dir().join("shell").join("tab_strip.slint")).unwrap();
+    let code = common::strip_line_comments(&tab_strip_slint);
+
+    for (arrow, flag) in [
+        ("left-arrow", "can-scroll-left"),
+        ("right-arrow", "can-scroll-right"),
+    ] {
+        let start = code
+            .find(&format!("{arrow} := FFTabStripIconButton {{"))
+            .unwrap_or_else(|| panic!("tab_strip.slint must declare {arrow}"));
+        let body = &code[start..start + 400.min(code.len() - start)];
+        assert!(
+            body.contains("visible: root.tabs-overflow;")
+                && body.contains(&format!("enabled: root.{flag};")),
+            "{arrow} must bind visible to root.tabs-overflow and enabled to root.{flag}: {body}"
+        );
+    }
+}
+
+/// Every box on the tab strip -- each tab, the projects button, the scroll
+/// arrows and "+" -- is one `FFStripBox`, which draws the 1px
+/// `Theme.border-default` frame on its left, right and top edges. Sharing
+/// the component is what keeps their top edge, height and frame from
+/// drifting apart (the "+" once sat 3px lower than the tabs).
+#[test]
+fn every_strip_box_shares_one_framed_component() {
+    let tab_strip_slint =
+        fs::read_to_string(common::ui_dir().join("shell").join("tab_strip.slint")).unwrap();
+    let code = common::strip_line_comments(&tab_strip_slint);
+
+    let start = code
+        .find("component FFStripBox inherits Rectangle {")
+        .expect("tab_strip.slint must declare FFStripBox");
+    let end = start
+        + code[start..]
+            .find("component FFTab inherits FFStripBox {")
+            .expect("FFStripBox must be followed by FFTab inheriting it");
+    let body = &code[start..end];
+
+    for needle in [
+        "y: ShellGeometry.strip-box-top;",
+        "height: ShellGeometry.strip-box-height;",
+        "x: parent.width - 1px;",
+        "background: Theme.border-default;",
+    ] {
+        assert!(
+            body.contains(needle),
+            "FFStripBox must carry {needle}: {body}"
+        );
+    }
+    assert!(
+        code.contains("component FFTabStripIconButton inherits FFStripBox {"),
+        "the icon boxes must share FFStripBox with the tabs"
+    );
+}
+
+/// `FFTab`'s title/unsaved/close row must be anchored to the tab's full
+/// bounds -- as a child of a plain `Rectangle` rather than a layout-managed
+/// parent, an un-anchored `HorizontalLayout` sizes to its own content's
+/// natural height, which is why its `vertical-alignment: center` texts
+/// would otherwise read top-aligned instead of centered in the tab's
+/// full 30px height.
+#[test]
+fn tab_content_row_fills_the_tabs_full_bounds() {
+    let tab_strip_slint =
+        fs::read_to_string(common::ui_dir().join("shell").join("tab_strip.slint")).unwrap();
+    let code = common::strip_line_comments(&tab_strip_slint);
+
+    let layout_start = code
+        .find("HorizontalLayout {")
+        .expect("FFTab must declare its content HorizontalLayout");
+    let body = &code[layout_start..layout_start + 300.min(code.len() - layout_start)];
+
+    for needle in ["x: 0px;", "y: 0px;", "width: 100%;", "height: 100%;"] {
+        assert!(
+            body.contains(needle),
+            "FFTab's content HorizontalLayout must anchor to the tab's full bounds \
+             ({needle} missing): {body}"
+        );
+    }
+}
+
+/// The tabs, "+" and the visible scroll arrows share one top edge and one
+/// height -- measured on the live element tree, not on source text.
+#[test]
+fn strip_boxes_share_top_edge_and_height() {
+    let app = app_at(1440, 900);
+
+    let (_, plus_y, plus_w, plus_h) = rect(&app, "FFTabStrip::plus-button");
+    let (_, button_y, _, button_h) = rect(&app, "FFTabStrip::projects-button");
+    assert_eq!((plus_y, plus_h), (button_y, button_h));
+    assert_eq!((plus_y, plus_w, plus_h), (6.0, 30.0, 30.0));
+}
+
+/// The window glyphs share the strip boxes' vertical band, so their glyphs
+/// centre on the tab titles' and "+"'s line, and sit at x
+/// 1342 / 1378 / 1414 (16 px glyph, 7 px box margin, 36 px pitch) --
+/// right-anchored, so the inset survives a resize.
+#[test]
+fn window_glyphs_share_the_strip_box_band() {
+    for (width, height) in [(1440, 900), (1200, 760)] {
+        let app = app_at(width, height);
+        let (_, plus_y, _, plus_h) = rect(&app, "FFTabStrip::plus-button");
+        let right = width as f32;
+        for (i, id) in [
+            "FFTabStrip::window-minimize",
+            "FFTabStrip::window-maximize",
+            "FFTabStrip::window-close",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (x, y, w, h) = rect(&app, id);
+            assert_eq!(
+                (y, h),
+                (plus_y, plus_h),
+                "{id} must share the strip boxes' band"
+            );
+            assert_eq!(w, 30.0, "{id}");
+            assert_eq!(
+                x,
+                right - 105.0 + i as f32 * 36.0,
+                "{id} at window width {width}"
+            );
+        }
+    }
+}
+
+/// The accessible label of the first element matching `id` -- a `Text`'s is
+/// its `text`.
+fn label(app: &AppWindow, id: &str) -> String {
+    ElementQuery::from_root(app)
+        .match_id(id)
+        .find_first()
+        .unwrap_or_else(|| panic!("no element matched id {id:?}"))
+        .accessible_label()
+        .unwrap_or_else(|| panic!("{id}: no accessible label"))
+        .to_string()
+}
+
+/// The empty state: the wordmark above one raised 520-wide card, centred
+/// on the canvas column, holding the title, the copy,
+/// the single `Open folder…` button (168 x 34) and the drop caption, in that
+/// order and all inside the card's 32 px inset.
+#[test]
+fn empty_state_is_a_card_under_the_wordmark() {
+    let app = app_at(1440, 900);
+
+    let card = rect(&app, "FFEmptyState::empty-card");
+    assert_eq!((card.0, card.2), (330.0, 520.0), "card x/width: {card:?}");
+    let wordmark = rect(&app, "FFEmptyState::wordmark");
+    assert_eq!(
+        (wordmark.0, wordmark.2),
+        (446.0, 288.0),
+        "wordmark: {wordmark:?}"
+    );
+    assert!(
+        wordmark.1 + wordmark.3 < card.1,
+        "the wordmark sits above the card"
+    );
+
+    assert_eq!(label(&app, "FFEmptyState::empty-title"), "No project open");
+    assert_eq!(
+        label(&app, "FFEmptyState::empty-body"),
+        "Open a folder of frames. Each detected stack becomes its own project, in its own tab."
+    );
+    assert_eq!(label(&app, "FFEmptyState::open-folder"), "Open folder…");
+    assert_eq!(
+        label(&app, "FFEmptyState::drop-caption"),
+        "Dropping a folder works on X11, macOS and Windows — not on native Wayland. \
+         Open folder… works everywhere."
+    );
+
+    let button = rect(&app, "FFEmptyState::open-folder");
+    assert_eq!(
+        (button.2, button.3),
+        (168.0, 34.0),
+        "button size: {button:?}"
+    );
+
+    let mut previous_bottom = card.1;
+    for id in [
+        "FFEmptyState::empty-title",
+        "FFEmptyState::empty-body",
+        "FFEmptyState::open-folder",
+        "FFEmptyState::drop-caption",
+    ] {
+        let (x, y, w, h) = rect(&app, id);
+        assert_eq!(x, card.0 + 32.0, "{id}: 32 px left inset");
+        assert!(
+            x + w <= card.0 + card.2 - 32.0 + EPS,
+            "{id}: inside the right inset"
+        );
+        assert!(y >= previous_bottom, "{id}: below its predecessor");
+        previous_bottom = y + h;
+    }
+    assert!(
+        previous_bottom <= card.1 + card.3 - 32.0 + EPS,
+        "the caption ends inside the card's bottom inset"
+    );
+}
+
+/// The dock without a project: the checkpoint panel's empty line, a
+/// disabled `Export image`, and `No project open.` in
+/// place of the dock tab row, which only a loaded project shows.
+#[test]
+fn dock_without_a_project_says_so() {
+    let app = app_at(1440, 900);
+
+    assert_eq!(
+        label(&app, "FFCheckpointPanel::checkpoint-empty-note"),
+        "None yet — fuse a stack"
+    );
+    assert_eq!(
+        label(&app, "FFCheckpointPanel::checkpoint-export"),
+        "Export image"
+    );
+    assert_rect(
+        &app,
+        "FFCheckpointPanel::checkpoint-export",
+        (1306.0, 94.0, 122.0, 24.0),
+    );
+    assert_eq!(label(&app, "FFDock::no-project-note"), "No project open.");
+    let rule = rect(&app, "FFDock::checkpoint-rule");
+    let note = rect(&app, "FFDock::no-project-note");
+    assert!(note.1 > rule.1, "the note sits under the checkpoint rule");
+
+    let found = |id: &str| {
+        ElementQuery::from_root(&app)
+            .match_id(id)
+            .find_first()
+            .is_some()
+    };
+    assert!(
+        !found("FFDock::dock-tabs"),
+        "no dock tab row without a project"
+    );
+
+    app.set_project_loaded(true);
+    assert!(
+        found("FFDock::dock-tabs"),
+        "a loaded project shows the dock tab row"
+    );
+    assert!(
+        !found("FFDock::no-project-note"),
+        "a loaded project hides the note"
+    );
+}
+
+/// The bottom bar's status line without a project: a rule one grid step
+/// right of the gear, then `No project open` (rule x 52, text x 68).
+#[test]
+fn bottom_bar_status_reads_no_project_open() {
+    let app = app_at(1440, 900);
+
+    assert_eq!(label(&app, "FFBottomBar::status-text"), "No project open");
+    assert_rect(&app, "FFBottomBar::status-rule", (52.0, 868.0, 1.0, 20.0));
+    let (x, _, _, _) = rect(&app, "FFBottomBar::status-text");
+    assert_eq!(x, 68.0);
+
+    app.set_project_loaded(true);
+    assert!(
+        ElementQuery::from_root(&app)
+            .match_id("FFBottomBar::status-text")
+            .find_first()
+            .is_none(),
+        "a loaded project does not read \"No project open\""
     );
 }

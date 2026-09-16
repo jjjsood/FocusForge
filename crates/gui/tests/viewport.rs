@@ -45,12 +45,13 @@ fn mantis_512_dir() -> PathBuf {
 }
 
 /// A controller with a fixture project loaded and a base-window pane
-/// geometry pushed, as `src/main.rs` does after `--open`.
+/// geometry pushed, as `src/main.rs` does after `--open` -- rebuilt on
+/// `open_paths`: the fixture's own `frames/` layout (`frame_paths`'
+/// redirect) makes it one `Unsaved` group, 512 x 512 image size, read from
+/// the frame headers.
 fn opened_controller() -> AppController {
     let mut controller = AppController::new();
-    controller
-        .open_project(&mantis_512_dir())
-        .expect("open fixture project");
+    controller.open_paths(&[mantis_512_dir()]);
     controller.set_pane_geometry(
         PaneRect {
             x: 16.0,

@@ -6,14 +6,17 @@
 //! `ShellEvent` against the window.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use slint::ComponentHandle;
-use slint::winit_030::WinitWindowAccessor;
+use slint::winit_030::{CustomApplicationHandler, EventResult, WinitWindowAccessor, winit};
+use winit::event_loop::ActiveEventLoop;
+use winit::window::WindowId;
 
-use crate::controller::{AppController, DockTab, ShellEvent, ShellMode};
-use crate::generated::AppWindow;
+use crate::controller::{AppController, DockTab, GroupingQuestion, OpenAs, ShellEvent, ShellMode};
+use crate::generated::{AppWindow, ProjectTabView};
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
 use crate::viewport::PaneRect;
@@ -50,19 +53,24 @@ pub struct Installed {
 
 /// Reads `controller.pane_draw()`, asks `canvas` for the two re-rendered
 /// images, and sets `composite-source`/`zmap-source`, the five placement
-/// properties and `zoom-readout`. The one place a gesture becomes a
-/// repaint -- every gesture callback below ends in a call to this. A no-op
-/// while `canvas` is `None` (no project open yet).
+/// properties, `zoom-readout` and `project-loaded`. The one place a gesture
+/// becomes a repaint -- every gesture callback below ends in a call to
+/// this. A no-op while `canvas` is `None` (no project open yet).
 pub fn repaint(
     app: &AppWindow,
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Option<CanvasRenderer>>>,
 ) {
-    let (draw, readout) = {
+    let (draw, readout, project_loaded) = {
         let controller = controller.lock().unwrap();
-        (controller.pane_draw(), controller.zoom_readout())
+        (
+            controller.pane_draw(),
+            controller.zoom_readout(),
+            controller.active_project().is_some(),
+        )
     };
     app.set_zoom_readout(readout.into());
+    app.set_project_loaded(project_loaded);
 
     let Some(draw) = draw else {
         return;
@@ -123,25 +131,120 @@ pub fn read_pane_geometry(app: &AppWindow) -> (PaneRect, PaneRect) {
     )
 }
 
-/// Wires every callback in `app` to a fresh [`AppController`], and returns
-/// [`Installed`] so `main.rs` can read the same state the window shows and
-/// drive the same GPU renderer cell. The sink wraps
+/// Pushes the controller's project-tab state (`project_tabs`,
+/// `tab_scroll_x`, the two scroll-enabled flags, `show_empty_state`,
+/// `plus_selected`) into
+/// `app` -- the one place `ShellEvent::ProjectsChanged` is performed.
+fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
+    let controller = controller.lock().unwrap();
+    let tabs: Vec<ProjectTabView> = controller
+        .project_tabs()
+        .into_iter()
+        .map(|t| ProjectTabView {
+            title: t.title.into(),
+            unsaved: t.unsaved,
+            selected: t.selected,
+        })
+        .collect();
+    app.set_project_tabs(std::rc::Rc::new(slint::VecModel::from(tabs)).into());
+    push_tab_scroll(app, &controller);
+    app.set_show_empty_state(controller.active_project().is_none());
+    app.set_plus_selected(controller.plus_selected());
+    app.set_skipped_notice(controller.notice().unwrap_or_default().into());
+}
+
+/// Pushes the tab strip's scroll offset, overflow layout and two arrow
+/// flags -- the one place `ShellEvent::TabScrollChanged` is performed.
+fn push_tab_scroll(app: &AppWindow, controller: &AppController) {
+    app.set_tab_scroll_x(controller.tab_scroll_x());
+    app.set_tabs_overflow(controller.tabs_overflow());
+    app.set_can_scroll_left(controller.can_scroll_left());
+    app.set_can_scroll_right(controller.can_scroll_right());
+}
+
+/// Pushes a raised [`GroupingQuestion`] into `app`'s dialog properties.
+fn push_question(app: &AppWindow, question: &GroupingQuestion) {
+    app.set_question_open(true);
+    app.set_question_frame_count(question.frame_count as i32);
+    app.set_question_project_count(question.project_count as i32);
+}
+
+/// Winit-level drop observer, installed via
+/// `BackendSelector::with_winit_custom_application_handler` -- the only
+/// route to a file-manager drop. Buffers every `WindowEvent::DroppedFile`
+/// and flushes the buffer into one
+/// `open_paths` call in `about_to_wait`: one gesture is one open, whether it
+/// delivered one folder path or three file paths.
+pub struct DropHandler {
+    controller: Arc<Mutex<AppController>>,
+    pending: Vec<PathBuf>,
+}
+
+impl DropHandler {
+    /// `controller` is cloned into this handler before any window exists
+    /// (`src/main.rs`): the handler needs no `AppWindow` of its own --
+    /// `AppController::open_paths`'s own sink is what pushes the resulting
+    /// window properties, through `slint::invoke_from_event_loop`, exactly
+    /// as a picker callback's own `open_paths` call does.
+    pub fn new(controller: Arc<Mutex<AppController>>) -> Self {
+        DropHandler {
+            controller,
+            pending: Vec::new(),
+        }
+    }
+}
+
+impl CustomApplicationHandler for DropHandler {
+    fn window_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        _winit_window: Option<&winit::window::Window>,
+        _slint_window: Option<&slint::Window>,
+        event: &winit::event::WindowEvent,
+    ) -> EventResult {
+        if let winit::event::WindowEvent::DroppedFile(path) = event {
+            self.pending.push(path.clone());
+        }
+        EventResult::Propagate
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) -> EventResult {
+        if !self.pending.is_empty() {
+            let paths = std::mem::take(&mut self.pending);
+            // The controller's own sink pushes every resulting window
+            // property (`ShellEvent::ProjectsChanged`/`QuestionRaised`/
+            // `EntryRefused`) through `slint::invoke_from_event_loop` --
+            // this call needs no repaint of its own.
+            let _ = self.controller.lock().unwrap().open_paths(&paths);
+        }
+        EventResult::Propagate
+    }
+}
+
+/// Wires every callback in `app` to `controller`, and returns [`Installed`]
+/// so `main.rs` can read the same state the window shows and drive the same
+/// GPU renderer cell. `controller` is a parameter, not created here:
+/// `main.rs` builds it first and clones it into the
+/// winit-level [`DropHandler`], which must be installed on the
+/// `BackendSelector` chain before any window exists. The sink wraps
 /// `slint::invoke_from_event_loop` so a background thread's push (a
 /// finished diagnostics write) and a callback's own event take the same
 /// path.
-pub fn install(app: &AppWindow) -> Installed {
-    let controller = Arc::new(Mutex::new(AppController::new()));
+pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Installed {
     let canvas: Rc<RefCell<Option<CanvasRenderer>>> = Rc::new(RefCell::new(None));
 
     {
         let app_weak = app.as_weak();
+        let controller_for_sink = controller.clone();
         controller.lock().unwrap().set_sink(Box::new(move |event| {
             let app_weak = app_weak.clone();
+            let controller = controller_for_sink.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(app) = app_weak.upgrade() else {
                     return;
                 };
-                perform(&app, event);
+                perform(&app, &controller, event);
             });
         }));
     }
@@ -320,12 +423,103 @@ pub fn install(app: &AppWindow) -> Installed {
         }
     });
 
+    // The entry path: the picker is a one-line forward, and `open_paths`'s
+    // own sink pushes every property this raises (`ShellEvent::ProjectsChanged`/
+    // `QuestionRaised`/`EntryRefused`), so this callback body needs no
+    // return-value handling of its own.
+    app.on_open_folder_requested({
+        let controller = controller.clone();
+        move || {
+            if let Some(path) = crate::picker::pick_entry() {
+                let _ = controller.lock().unwrap().open_paths(&[path]);
+            }
+        }
+    });
+    app.on_plus_clicked({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().select_plus()
+    });
+    app.on_tab_selected({
+        let controller = controller.clone();
+        move |i| controller.lock().unwrap().select_project(i as usize)
+    });
+    app.on_tab_closed({
+        let controller = controller.clone();
+        move |i| controller.lock().unwrap().close_project(i as usize)
+    });
+    app.on_tab_scroll_left({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().scroll_tabs(-1)
+    });
+    app.on_tab_scroll_right({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().scroll_tabs(1)
+    });
+    app.on_tab_region_width_changed({
+        let controller = controller.clone();
+        move |width| controller.lock().unwrap().set_tab_region_width(width)
+    });
+    // A `changed` handler never fires for the initial value, so the
+    // viewport's first measurement is read here once.
+    controller
+        .lock()
+        .unwrap()
+        .set_tab_region_width(app.get_tab_region_width());
+    app.on_question_open_as_one({
+        let controller = controller.clone();
+        move || {
+            let _ = controller
+                .lock()
+                .unwrap()
+                .answer_question(OpenAs::OneProject);
+        }
+    });
+    app.on_question_open_as_many({
+        let controller = controller.clone();
+        move || {
+            let _ = controller
+                .lock()
+                .unwrap()
+                .answer_question(OpenAs::NProjects);
+        }
+    });
+    app.on_question_cancelled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().cancel_question();
+            if let Some(app) = app_weak.upgrade() {
+                app.set_question_open(false);
+            }
+        }
+    });
+    app.on_refusal_pick_another_folder({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_refusal_open(false);
+            }
+            if let Some(path) = crate::picker::pick_entry() {
+                let _ = controller.lock().unwrap().open_paths(&[path]);
+            }
+        }
+    });
+    app.on_skipped_notice_dismissed({
+        let app_weak = app.as_weak();
+        move || {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_skipped_notice("".into());
+            }
+        }
+    });
+
     Installed { controller, canvas }
 }
 
 /// Performs one [`ShellEvent`] against the window. The only function in the
 /// crate that names `winit`.
-fn perform(app: &AppWindow, event: ShellEvent) {
+fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: ShellEvent) {
     match event {
         ShellEvent::WindowDragRequested => {
             // Both results discarded deliberately: `with_winit_window`
@@ -381,5 +575,12 @@ fn perform(app: &AppWindow, event: ShellEvent) {
         // `perform` runs off a `Send + Sync` closure that can hold neither
         // an `Rc` nor the GPU state `CanvasRenderer` needs.
         ShellEvent::Input(_) => {}
+        // The three entry-path events. `EntryRefused`'s
+        // message is already rendered by `AppController::refuse`, never
+        // formatted here.
+        ShellEvent::ProjectsChanged => push_projects(app, controller),
+        ShellEvent::TabScrollChanged => push_tab_scroll(app, &controller.lock().unwrap()),
+        ShellEvent::QuestionRaised(question) => push_question(app, &question),
+        ShellEvent::EntryRefused(_) => app.set_refusal_open(true),
     }
 }

@@ -28,9 +28,17 @@ pub use controller::*;
 /// reaches `AppController` above.
 pub mod canvas;
 
-/// A stub project format: `--open <dir>`
-/// resolves `<dir>/golden/laplacian.tif` + `<dir>/golden/laplacian-zmap.tif`.
-mod project_stub;
+/// The entry path: classifying a picker result, a drop, or `--open`'s path
+/// into a folder, a set of dropped frames, or a saved project, and turning
+/// that into per-tab project state. No `use slint::`
+/// anywhere in it -- the one module in the crate naming the core algorithm
+/// crate's grouping and project modules. `pub` so `tests/entry.rs` and
+/// `src/main.rs`/`src/picker.rs`/`src/bridge.rs` reach its types directly.
+pub mod entry;
+
+/// The native folder/file picker -- blocking, never `AsyncFileDialog`.
+/// `pub` so `src/bridge.rs` can call it.
+pub mod picker;
 
 /// The input table as data -- no `use slint::`, no `use wgpu::`. `pub` so
 /// `tests/input_map.rs` reaches its types directly.

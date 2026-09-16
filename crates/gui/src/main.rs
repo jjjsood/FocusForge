@@ -4,10 +4,11 @@
 //! can be observed without a person in front of it (steps 9-13).
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
-use focusforge_gui::{AppWindow, ThemeSheet, bridge, screenshot};
+use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, screenshot};
 use slint::ComponentHandle;
 
 #[derive(Parser)]
@@ -30,11 +31,12 @@ struct Args {
     /// Renders the design-token specimen sheet instead of the shell.
     #[arg(long)]
     theme_sheet: bool,
-    /// Open a project directory: resolves `<dir>/golden/laplacian.tif` +
-    /// `<dir>/golden/laplacian-zmap.tif` (`focusforge_gui::project_stub`,
-    /// a stub project format).
-    #[arg(long)]
-    open: Option<PathBuf>,
+    /// Opens a path the same way the picker or a drop would: a folder
+    /// proposes a grouping, a `*.ffp` reopens a saved project
+    /// (`AppController::open_paths`). Repeatable; each
+    /// path is opened in order, one `open_paths` call per path.
+    #[arg(long, action = clap::ArgAction::Append)]
+    open: Vec<PathBuf>,
     /// Overrides where the input map is read from/written to --
     /// `<DIR>/focusforge/input.toml`, mirroring what
     /// `input_config::default_config_dir()` itself resolves to. Exists so a
@@ -61,7 +63,7 @@ fn parse_size(spec: &str) -> Option<(u32, u32)> {
 /// composite/Z-Map texture off the CPU round-trip. No usable adapter ->
 /// print the named `GpuError` plus the still-working CLI path and exit:
 /// no CPU-tone-mapped fallback, no `Automatic` fallback.
-fn select_backend() {
+fn select_backend(controller: Arc<Mutex<AppController>>) {
     let shared = match focusforge_gpu::device::shared_device() {
         Ok(shared) => shared,
         Err(err) => {
@@ -77,8 +79,12 @@ fn select_backend() {
         device: shared.device().clone(),
         queue: shared.queue().clone(),
     };
+    // `BackendSelector` chain, before any window exists, which is why
+    // `controller` is built before `select_backend` runs rather than
+    // inside `bridge::install`.
     if let Err(e) = slint::BackendSelector::new()
         .require_wgpu_29(config)
+        .with_winit_custom_application_handler(bridge::DropHandler::new(controller))
         .select()
     {
         eprintln!("{e}");
@@ -219,46 +225,36 @@ fn main() {
         std::process::exit(2);
     }
 
-    select_backend();
+    // Built before `select_backend`: the drop route
+    // (`bridge::DropHandler`) installs on the `BackendSelector` chain
+    // before any window exists.
+    let controller = Arc::new(Mutex::new(AppController::new()));
+    select_backend(controller.clone());
 
     let code = if args.theme_sheet {
         let sheet = ThemeSheet::new().expect("failed to instantiate ThemeSheet");
         run_window(sheet, &args)
     } else {
         let app = AppWindow::new().expect("failed to instantiate AppWindow");
-        let focusforge_gui::bridge::Installed { controller, canvas } = bridge::install(&app);
+        let focusforge_gui::bridge::Installed { controller, canvas } =
+            bridge::install(&app, controller);
+        let _ = &canvas;
 
         install_input_table(&controller, &app, &args);
 
-        if let Some(path) = &args.open {
-            if let Err(e) = controller.lock().unwrap().open_project(path) {
-                eprintln!("--open failed: {e}");
-                std::process::exit(1);
-            }
-            let shared = focusforge_gpu::device::shared_device()
-                .expect("select_backend already selected one");
-            let (composite_path, zmap_path) = controller
+        for path in &args.open {
+            // The same `open_paths` the picker and the drop route call: a
+            // folder proposes a grouping, a `*.ffp` reopens a saved project.
+            // A reopened project feeds the canvas straight from its own
+            // sealed planes; an unsaved group waits for `Fuse stack`.
+            let outcome = controller
                 .lock()
                 .unwrap()
-                .project_paths()
-                .expect("open_project just succeeded");
-
-            let renderer = focusforge_gui::gpu_canvas::CanvasRenderer::open(
-                shared,
-                &composite_path,
-                &zmap_path,
-            )
-            .expect("open canvas renderer");
-            *canvas.borrow_mut() = Some(renderer);
-
-            // Push the initial pane geometry through the same read
-            // `canvas-resized` uses, so the first
-            // frame does not depend on a `changed` callback having fired,
-            // then repaint once to show it -- the `--size` timer's own
-            // resize is what proves `canvas-resized` handles the rest.
-            let (left, right) = focusforge_gui::bridge::read_pane_geometry(&app);
-            controller.lock().unwrap().set_pane_geometry(left, right);
-            focusforge_gui::bridge::repaint(&app, &controller, &canvas);
+                .open_paths(std::slice::from_ref(path));
+            if let focusforge_gui::OpenOutcome::Refused(err) = outcome {
+                eprintln!("--open failed: {err}");
+                std::process::exit(1);
+            }
         }
 
         run_window(app, &args)

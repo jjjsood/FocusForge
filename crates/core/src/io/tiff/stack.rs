@@ -261,14 +261,7 @@ pub fn frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
             source,
         })?;
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let is_tiff = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"));
-        if !is_tiff {
+        if !path.is_file() || !is_frame_path(&path) {
             continue;
         }
         paths.push(path);
@@ -279,6 +272,16 @@ pub fn frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
         return Err(TiffError::NoFrames { path: scan_dir });
     }
     Ok(paths)
+}
+
+/// Whether `path` is a TIFF frame by extension: `.tif`/`.tiff`,
+/// case-insensitively. The one place that filter is spelled -- [`frame_paths`]
+/// calls it, and the GUI's classification of a multi-file drop calls it too,
+/// rather than keeping a second copy of the same check in `crates/gui`.
+pub fn is_frame_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
 }
 
 /// Lenient uniformity: dimensions, bits per sample, samples per pixel,
@@ -357,4 +360,19 @@ fn map_file(path: &Path) -> Result<Mmap, TiffError> {
         source,
     })?;
     Ok(mmap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_frame_path_accepts_tif_and_tiff_case_insensitively() {
+        assert!(is_frame_path(Path::new("a.tif")));
+        assert!(is_frame_path(Path::new("a.TIF")));
+        assert!(is_frame_path(Path::new("a.tiff")));
+        assert!(is_frame_path(Path::new("a.TIFF")));
+        assert!(!is_frame_path(Path::new("a.png")));
+        assert!(!is_frame_path(Path::new("a")));
+    }
 }

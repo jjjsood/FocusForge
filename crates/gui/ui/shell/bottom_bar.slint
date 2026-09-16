@@ -10,14 +10,24 @@
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
 
-component FFZoomIconButton inherits Rectangle {
+// The gear's own persistently-boxed button -- the "icon button" catalogue
+// entry, whose default state already carries a visible background. Not
+// shared with the zoom cluster's own buttons: the gear is a single
+// standalone control, not a segment of a grouped surface, so it keeps its
+// own box at rest rather than the zoom buttons' hover-only convention
+// below.
+component FFGearButton inherits Rectangle {
     in property <image> icon;
     callback pressed();
 
-    width: 26px;
-    height: 26px;
+    // Matches the zoom cluster's own icon buttons for one shared baseline
+    // across the bar (`Theme.icon-md + 2 * Theme.space-2` = 32px), even
+    // though the gear does not share their component.
+    width: Theme.icon-md + 2 * Theme.space-2;
+    height: self.width;
     background: area.has-hover ? Theme.surface-hover : Theme.surface-overlay;
     border-radius: Theme.radius-sm;
+    accessible-role: button;
 
     area := TouchArea {
         clicked => { root.pressed(); }
@@ -30,63 +40,130 @@ component FFZoomIconButton inherits Rectangle {
     }
 }
 
+component FFZoomIconButton inherits Rectangle {
+    in property <image> icon;
+    // Greyed and inert while no project is open -- there is no viewport to
+    // zoom, so a live-looking button next to a blank readout is misleading.
+    in property <bool> enabled: true;
+    callback pressed();
+
+    // Token-derived, not a bare literal: the icon plus a full `space-2` step
+    // of padding on every side. The previous 26px -- a 5px pad that matched
+    // no token -- read as too tight a frame around the glyph.
+    width: Theme.icon-md + 2 * Theme.space-2;
+    height: self.width;
+    // Transparent at rest -- the shared `zoom-group` background (below) is
+    // what reads as one element; only the hover highlight belongs to the
+    // button itself. Separate boxed buttons either side of a floating
+    // readout did not read as one control.
+    background: area.has-hover && root.enabled ? Theme.surface-hover : transparent;
+    border-radius: Theme.radius-sm;
+    opacity: root.enabled ? 1.0 : 0.5;
+    accessible-role: button;
+    accessible-enabled: root.enabled;
+
+    area := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.pressed(); }
+    }
+    Image {
+        source: root.icon;
+        colorize: area.has-hover && root.enabled ? Theme.text-primary : Theme.text-secondary;
+        width: Theme.icon-md;
+        height: Theme.icon-md;
+    }
+}
+
 // The zoom button box is `Theme.icon-md + 2 * Theme.space-2` = 32px square
 // (see `FFZoomIconButton`), so the cluster's own height follows it rather
 // than a pinned 26px, and everything else in the cluster matches that
 // height for one shared baseline. At the bar's right end, mirroring the
 // gear's `Theme.space-3` inset at the left: `zoom-group 120 (32+56+32, one
-// shared surface) | 16 | Fit 80` -- 120+16+80 = 216. The previous layout
-// pinned 200 x 26 (a flat 4 px between every element, each control its own
-// box); this instead groups zoom-out/readout/zoom-in into one shared
-// rounded surface -- the same track-plus-segments idiom `FFModeSwitch` uses
-// (`shell/dock.slint`) -- so they read as one control rather than three
-// floating pieces, and keeps `Fit` visually separate with a full
+// shared surface) | 16 | Fit 80` -- 120+16+80 = 216. Zoom-out, the readout
+// and zoom-in share one rounded surface -- the same track-plus-segments
+// idiom `FFModeSwitch` uses -- so they read as one control rather than
+// three floating pieces, with `Fit` kept visually separate by a full
 // `Theme.space-4` gap as its own action.
 export component FFZoomCluster inherits Rectangle {
     in property <string> readout: "";
+    // Whether a project is open, so the readout, the zoom buttons and `Fit`
+    // grey out together instead of only the readout going blank -- there is
+    // nothing to zoom or fit before a project is loaded.
+    in property <bool> project-loaded: false;
     callback zoom-in-requested();
     callback zoom-out-requested();
     callback zoom-fit-requested();
 
-    width: 200px;
-    height: 26px;
+    width: 216px;
+    height: zoom-group.height;
 
-    zoom-out := FFZoomIconButton {
+    // The shared "track": one rounded surface behind zoom-out, the readout
+    // and zoom-in, with no gap between them -- this is what makes the three
+    // read as one element. Anonymous (not its own `component`), so
+    // `zoom-out`/`zoom-in` keep the qualified ids `FFZoomCluster::zoom-out`
+    // / `zoom-in` scoped tests already rely on. Its height follows the icon
+    // buttons' own token-derived height, never a repeated literal.
+    zoom-group := Rectangle {
         x: 0px;
         y: 0px;
-        icon: @image-url("../../../../assets/icons/zoom-out.svg");
-        pressed => { root.zoom-out-requested(); }
-    }
+        width: 120px;
+        height: zoom-out.height;
+        background: Theme.surface-overlay;
+        border-radius: Theme.radius-sm;
 
-    zoom-readout := Text {
-        x: zoom-out.x + zoom-out.width + 4px;
-        y: 0px;
-        width: 56px;
-        height: 26px;
-        text: root.readout;
-        color: Theme.text-secondary;
-        font-size: Theme.text-value.size;
-        font-weight: Theme.text-value.weight;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
+        zoom-out := FFZoomIconButton {
+            x: 0px;
+            y: 0px;
+            enabled: root.project-loaded;
+            icon: @image-url("../../../../assets/icons/zoom-out.svg");
+            pressed => { root.zoom-out-requested(); }
+        }
 
-    zoom-in := FFZoomIconButton {
-        x: zoom-readout.x + zoom-readout.width + 4px;
-        y: 0px;
-        icon: @image-url("../../../../assets/icons/zoom-in.svg");
-        pressed => { root.zoom-in-requested(); }
+        zoom-readout := Text {
+            x: zoom-out.x + zoom-out.width;
+            y: 0px;
+            width: 56px;
+            height: zoom-group.height;
+            // Dimmed the same way the zoom buttons are: the dash had no
+            // opacity of its own, so it would otherwise sit full-strength
+            // while its two neighbours were greyed.
+            opacity: root.project-loaded ? 1.0 : 0.5;
+            // A project-less window has nothing to report a percentage
+            // for -- an em dash rather than a blank space, matching the
+            // app's own "no binding here" convention
+            // (`crate::input_map::Binding`'s `None` column).
+            text: root.readout == "" ? "—" : root.readout;
+            color: Theme.text-secondary;
+            font-size: Theme.text-value.size;
+            font-weight: Theme.text-value.weight;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        zoom-in := FFZoomIconButton {
+            x: zoom-readout.x + zoom-readout.width;
+            y: 0px;
+            enabled: root.project-loaded;
+            icon: @image-url("../../../../assets/icons/zoom-in.svg");
+            pressed => { root.zoom-in-requested(); }
+        }
     }
 
     zoom-fit := Rectangle {
-        x: zoom-in.x + zoom-in.width + 4px;
+        // A full step of breathing room ahead of `Fit` (`Theme.space-4`),
+        // separating it from the zoom group above.
+        x: zoom-group.x + zoom-group.width + Theme.space-4;
         y: 0px;
         width: 80px;
-        height: 26px;
-        background: fit-area.has-hover ? Theme.surface-hover : Theme.surface-overlay;
+        height: zoom-group.height;
+        background: fit-area.has-hover && root.project-loaded ? Theme.surface-hover : Theme.surface-overlay;
         border-radius: Theme.radius-sm;
+        opacity: root.project-loaded ? 1.0 : 0.5;
+        accessible-role: button;
+        accessible-enabled: root.project-loaded;
 
         fit-area := TouchArea {
+            enabled: root.project-loaded;
             clicked => { root.zoom-fit-requested(); }
         }
         Text {
@@ -103,6 +180,7 @@ export component FFZoomCluster inherits Rectangle {
 export component FFBottomBar inherits Rectangle {
     callback settings-requested();
     in property <string> zoom-readout: "";
+    in property <bool> project-loaded: false;
     callback zoom-in-requested();
     callback zoom-out-requested();
     callback zoom-fit-requested();
@@ -110,26 +188,53 @@ export component FFBottomBar inherits Rectangle {
     height: ShellGeometry.bottom-bar-height;
     background: Theme.surface-raised;
 
-    gear := TouchArea {
+    gear := FFGearButton {
         x: Theme.space-3;
         y: (parent.height - self.height) / 2;
-        width: Theme.icon-lg;
-        height: Theme.icon-lg;
+        icon: @image-url("../../../../assets/icons/settings.svg");
+        pressed => { root.settings-requested(); }
+    }
 
-        clicked => { root.settings-requested(); }
+    // The status line: a 1 x 20 rule one grid step right of the gear, then
+    // the text a further 16 px on, both centred on the bar. Without a
+    // project it reads `No project open` in `text.disabled`; with one open
+    // and nothing to report it reads `No job running`; otherwise it is the
+    // run's own stage word, bold, in the failure colour once the run has
+    // failed.
+    status-rule := Rectangle {
+        x: gear.x + gear.width + Theme.space-2;
+        y: (parent.height - self.height) / 2;
+        width: 1px;
+        height: 20px;
+        background: Theme.border-default;
+    }
 
-        Image {
-            source: @image-url("../../../../assets/icons/settings.svg");
-            colorize: gear.has-hover ? Theme.text-primary : Theme.text-secondary;
-            width: Theme.icon-md;
-            height: Theme.icon-md;
-        }
+    status-text := Text {
+        x: status-rule.x + Theme.space-4;
+        y: 0px;
+        height: parent.height;
+        visible: !root.project-loaded;
+        text: "No project open";
+        color: Theme.text-disabled;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        vertical-alignment: center;
+    }
+
+    // The 1 px rule along the bar's top edge, full window width.
+    top-rule := Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: 1px;
+        background: Theme.border-default;
     }
 
     zoom-cluster := FFZoomCluster {
-        x: parent.width - Theme.space-3 - 200px;
+        x: parent.width - Theme.space-3 - 216px;
         y: (parent.height - self.height) / 2;
         readout: root.zoom-readout;
+        project-loaded: root.project-loaded;
 
         zoom-in-requested => { root.zoom-in-requested(); }
         zoom-out-requested => { root.zoom-out-requested(); }

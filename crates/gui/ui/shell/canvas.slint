@@ -5,6 +5,7 @@
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
+import { FFEmptyState } from "empty_state.slint";
 
 component FFPaneLabel inherits Rectangle {
     in property <string> label: "";
@@ -127,6 +128,13 @@ export component FFCanvas inherits Rectangle {
     // `changed` handler never fires for (`src/main.rs`'s own startup read).
     callback canvas-resized();
 
+    // The empty state: `true` while no tab is open.
+    // Placed last (below) so it covers the canvas region without moving
+    // either pane -- `tests/shell.rs`'s pane-geometry tests keep finding
+    // `pane-left`/`pane-right` at their spec rects regardless.
+    in property <bool> show-empty-state: true;
+    callback open-folder-requested();
+
     // The pane geometry `AppController::set_pane_geometry` needs, read back
     // as plain property reads -- no arithmetic, `pane-gutter`/`pane-divider`
     // stay derived once, here. `pane-left`/`pane-right` share one `y`,
@@ -203,5 +211,14 @@ export component FFCanvas inherits Rectangle {
         image-h: root.image-h;
         pixelated: root.pixelated;
         undock-requested => { root.zmap-undock-requested(); }
+    }
+
+    empty-state := FFEmptyState {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        visible: root.show-empty-state;
+        open-folder-requested => { root.open-folder-requested(); }
     }
 }

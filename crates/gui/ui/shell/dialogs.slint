@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The one grouping question and the two refusals the entry path can
+// produce. Modelled on `ui/shell/settings_modal.slint`.
+// No string in this file, or anywhere else under `ui/`, contains `group` --
+// "stacks" and "projects" carry the same meaning without inventing
+// vocabulary the CLI has no counterpart for.
+
+import { Theme } from "../theme.slint";
+
+export component FFGroupingQuestion inherits Rectangle {
+    in property <bool> question-open: false;
+    in property <int> frame-count: 0;
+    in property <int> project-count: 0;
+    callback open-as-one();
+    callback open-as-many();
+    callback cancelled();
+
+    visible: root.question-open;
+
+    scrim := Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Theme.surface-canvas.with-alpha(0.6);
+    }
+
+    panel := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 480px;
+        height: 200px;
+        background: Theme.surface-raised;
+        border-radius: Theme.radius-lg;
+
+        VerticalLayout {
+            padding: Theme.space-4;
+            spacing: Theme.space-3;
+
+            body := Text {
+                text: "This folder reads as " + root.project-count + " stacks of "
+                    + root.frame-count + " frames.";
+                color: Theme.text-primary;
+                font-size: Theme.text-body.size;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                spacing: Theme.space-2;
+
+                one-button := Rectangle {
+                    height: 36px;
+                    background: Theme.accent-default;
+                    border-radius: Theme.radius-sm;
+                    TouchArea { clicked => { root.open-as-one(); } }
+                    Text {
+                        text: "Open as one project";
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+                }
+                many-button := Rectangle {
+                    height: 36px;
+                    background: Theme.surface-hover;
+                    border-radius: Theme.radius-sm;
+                    TouchArea { clicked => { root.open-as-many(); } }
+                    Text {
+                        text: "Open as " + root.project-count + " projects";
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+                }
+            }
+
+            cancel-area := TouchArea {
+                height: 24px;
+                clicked => { root.cancelled(); }
+                Text {
+                    text: "Cancel";
+                    color: Theme.text-muted;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+export component FFRefusalDialog inherits Rectangle {
+    in property <bool> refusal-open: false;
+    callback pick-another-folder();
+
+    visible: root.refusal-open;
+
+    scrim := Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Theme.surface-canvas.with-alpha(0.6);
+    }
+
+    panel := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 420px;
+        height: 180px;
+        background: Theme.surface-raised;
+        border-radius: Theme.radius-lg;
+
+        VerticalLayout {
+            padding: Theme.space-4;
+            spacing: Theme.space-3;
+
+            Text {
+                text: "No frames here";
+                color: Theme.text-primary;
+                font-size: Theme.text-title.size;
+                font-weight: Theme.text-title.weight;
+            }
+            Text {
+                text: "FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.";
+                color: Theme.text-secondary;
+                font-size: Theme.text-body.size;
+                wrap: word-wrap;
+            }
+            pick-area := Rectangle {
+                height: 36px;
+                background: Theme.accent-default;
+                border-radius: Theme.radius-sm;
+                TouchArea { clicked => { root.pick-another-folder(); } }
+                Text {
+                    text: "Pick another folder…";
+                    color: Theme.text-primary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+            }
+        }
+    }
+}
+
+export component FFSkippedNotice inherits Rectangle {
+    in property <string> notice-text: "";
+    callback dismissed();
+
+    visible: root.notice-text != "";
+    height: 32px;
+    background: Theme.surface-raised;
+
+    HorizontalLayout {
+        padding-left: Theme.space-3;
+        padding-right: Theme.space-3;
+        spacing: Theme.space-2;
+
+        Text {
+            text: root.notice-text;
+            color: Theme.text-secondary;
+            font-size: Theme.text-body.size;
+            overflow: elide;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        dismiss-area := TouchArea {
+            width: 16px;
+            clicked => { root.dismissed(); }
+            Image {
+                source: @image-url("../../../../assets/icons/x.svg");
+                colorize: Theme.text-secondary;
+                width: 12px;
+                height: 12px;
+            }
+        }
+    }
+}

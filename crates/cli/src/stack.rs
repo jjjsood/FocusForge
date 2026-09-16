@@ -2277,6 +2277,7 @@ mod tests {
             groups: vec![a, b],
             gap: std::time::Duration::from_secs(60),
             time_signal_available: false,
+            skipped: Vec::new(),
         };
         let identities = vec!["a".to_string(), "b".to_string()];
         let message = only_no_match_refusal("c", &proposal, &identities);

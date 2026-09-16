@@ -55,65 +55,17 @@ fn no_cpu_tonemap_in_the_gui_crate() {
 /// The "one viewport over two panes" invariant, enforced by name in
 /// `canvas::check_pane_dimensions`, a pure function.
 #[test]
-fn open_project_refuses_a_composite_zmap_dimension_mismatch_by_name() {
-    use focusforge_core::io::{TiffSpec, TiffWriter};
-    use focusforge_core::tile::Rect;
-    use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
-    use focusforge_gui::AppController;
-    use focusforge_gui::canvas::CanvasError;
+fn check_pane_dimensions_refuses_a_composite_zmap_mismatch_by_name() {
+    use focusforge_gui::canvas::{CanvasError, check_pane_dimensions};
 
-    let dir = tempfile::tempdir().unwrap();
-    let golden = dir.path().join("golden");
-    fs::create_dir_all(&golden).unwrap();
-
-    let mut composite = TiffWriter::create(
-        &golden.join("laplacian.tif"),
-        TiffSpec {
-            width: 8,
-            height: 8,
-            samples_per_pixel: 3,
-            description: None,
-        },
-    )
-    .unwrap();
-    composite
-        .write_tile(
-            Rect {
-                x: 0,
-                y: 0,
-                width: 8,
-                height: 8,
-            },
-            &vec![0u16; 8 * 8 * 3],
-        )
-        .unwrap();
-    composite.finish().unwrap();
-
-    let mut zmap = ZMapWriter::create(
-        &golden.join("laplacian-zmap.tif"),
-        ZMapInfo::new(4, 4, 1).unwrap(),
-    )
-    .unwrap();
-    zmap.write_tile(
-        Rect {
-            x: 0,
-            y: 0,
-            width: 4,
-            height: 4,
-        },
-        &[0u16; 4 * 4],
-    )
-    .unwrap();
-    zmap.finish().unwrap();
-
-    let mut controller = AppController::new();
-    match controller.open_project(dir.path()) {
+    match check_pane_dimensions((8, 8), (4, 4)) {
         Err(CanvasError::PaneDimensionsDiffer { composite, zmap }) => {
             assert_eq!(composite, (8, 8));
             assert_eq!(zmap, (4, 4));
         }
         other => panic!("expected PaneDimensionsDiffer, got {other:?}"),
     }
+    assert!(check_pane_dimensions((8, 8), (8, 8)).is_ok());
 }
 
 #[test]

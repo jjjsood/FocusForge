@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! The native folder/file picker: blocking, never `AsyncFileDialog`, which
+//! sidesteps slint-ui/slint#12437 (an open, macOS-only bug from an async
+//! dialog left open during a drag) by construction. Freezing the shell's
+//! own repaints while the dialog is up is correct: the portal dialog is a
+//! separate process with its own window.
+//!
+//! rfd 0.17.2's own risk
+//! (<https://github.com/PolyMeilex/rfd/issues/320>): a cancelled dialog and
+//! "no dialog backend available" both return `None` here. Either way
+//! nothing opens and the empty state stays on screen.
+
+use std::path::PathBuf;
+
+/// Opens the OS folder picker. `None` on cancel (or a missing dialog
+/// backend, rfd#320).
+pub fn pick_entry() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Open folder or project")
+        .pick_folder()
+}
+
+/// Opens the OS file picker filtered to `.ffp` -- reopening a saved
+/// project.
+pub fn pick_project() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Open a FocusForge project")
+        .add_filter("FocusForge project", &["ffp"])
+        .pick_file()
+}

@@ -9,4 +9,14 @@ import { ShellGeometry } from "../geometry.slint";
 export component FFToolbar inherits Rectangle {
     height: ShellGeometry.toolbar-height;
     background: Theme.surface-raised;
+
+    // The 1 px rule along the toolbar's bottom edge, over the canvas width
+    // only.
+    bottom-rule := Rectangle {
+        x: 0px;
+        y: parent.height - self.height;
+        width: parent.width;
+        height: 1px;
+        background: Theme.border-default;
+    }
 }

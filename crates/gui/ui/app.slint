@@ -10,13 +10,15 @@ import { ThemeSheet } from "theme_sheet.slint";
 export { ThemeSheet }
 
 import { ShellGeometry } from "geometry.slint";
-import { FFTabStrip } from "shell/tab_strip.slint";
+import { FFTabStrip, ProjectTabView } from "shell/tab_strip.slint";
+export { ProjectTabView }
 import { FFToolbar } from "shell/toolbar.slint";
 import { FFCanvas } from "shell/canvas.slint";
 import { FFDock } from "shell/dock.slint";
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFSettingsModal, InputRow } from "shell/settings_modal.slint";
 export { InputRow }
+import { FFGroupingQuestion, FFRefusalDialog, FFSkippedNotice } from "shell/dialogs.slint";
 
 export component AppWindow inherits Window {
     // Every callback forwards one-for-one into `AppController` via
@@ -61,17 +63,49 @@ export component AppWindow inherits Window {
     // handler.
     forward-focus: canvas-ground;
 
+    // The entry path: the tab strip's own project list, scroll state, and
+    // the "+" forward. `open-folder-requested` is the empty state's button
+    // (the picker); the strip's "+" raises `plus-clicked`, which selects
+    // "+" itself.
+    in property <[ProjectTabView]> project-tabs: [];
+    in property <length> tab-scroll-x: 0px;
+    in property <bool> tabs-overflow: false;
+    in property <bool> can-scroll-left: false;
+    in property <bool> can-scroll-right: false;
+    in property <bool> show-empty-state: true;
+    in property <bool> plus-selected: true;
+    callback open-folder-requested();
+    callback plus-clicked();
+    callback tab-selected(int);
+    callback tab-closed(int);
+    callback tab-scroll-left();
+    callback tab-scroll-right();
+    callback tab-region-width-changed(length);
+    out property <length> tab-region-width: tab-strip.tabs-region-width;
+
     tab-strip := FFTabStrip {
         x: 0px;
         y: 0px;
         width: root.width;
         height: ShellGeometry.strip-height;
         maximized: root.window-maximized;
+        tabs: root.project-tabs;
+        plus-selected: root.plus-selected;
+        tab-scroll-x: root.tab-scroll-x;
+        tabs-overflow: root.tabs-overflow;
+        can-scroll-left: root.can-scroll-left;
+        can-scroll-right: root.can-scroll-right;
 
         window-drag-requested => { root.window-drag-requested(); }
         window-minimize-requested => { root.window-minimize-requested(); }
         window-maximize-toggled => { root.window-maximize-toggled(); }
         window-close-requested => { root.window-close-requested(); }
+        plus-clicked => { root.plus-clicked(); }
+        tab-selected(i) => { root.tab-selected(i); }
+        tab-closed(i) => { root.tab-closed(i); }
+        scroll-left => { root.tab-scroll-left(); }
+        scroll-right => { root.tab-scroll-right(); }
+        tabs-region-width-changed(w) => { root.tab-region-width-changed(w); }
     }
 
     toolbar := FFToolbar {
@@ -153,9 +187,11 @@ export component AppWindow inherits Window {
             image-w: root.image-w;
             image-h: root.image-h;
             pixelated: root.pixelated;
+            show-empty-state: root.show-empty-state;
 
             composite-undock-requested => { root.composite-undock-requested(); }
             zmap-undock-requested => { root.zmap-undock-requested(); }
+            open-folder-requested => { root.open-folder-requested(); }
             canvas-scrolled(dx, dy, x, y, ctrl, shift, alt) => {
                 root.canvas-scrolled(dx, dy, x, y, ctrl, shift, alt);
             }
@@ -175,6 +211,7 @@ export component AppWindow inherits Window {
         editor-enabled: root.editor-enabled;
         mode: root.mode;
         dock-tab: root.dock-tab;
+        project-loaded: root.project-loaded;
 
         mode-selected(m) => { root.mode-selected(m); }
         dock-tab-selected(t) => { root.dock-tab-selected(t); }
@@ -192,6 +229,9 @@ export component AppWindow inherits Window {
     // The bottom bar's zoom cluster -- governs both panes, which is why it
     // lives at the root rather than inside `FFPane`.
     in property <string> zoom-readout: "";
+    // Whether a project is open, so the whole zoom cluster greys out
+    // together rather than only its readout going blank.
+    in property <bool> project-loaded: false;
     callback zoom-in-requested();
     callback zoom-out-requested();
     callback zoom-fit-requested();
@@ -202,6 +242,7 @@ export component AppWindow inherits Window {
         width: root.width;
         height: ShellGeometry.bottom-bar-height;
         zoom-readout: root.zoom-readout;
+        project-loaded: root.project-loaded;
 
         settings-requested => { root.settings-open-requested(); }
         zoom-in-requested => { root.zoom-in-requested(); }
@@ -219,5 +260,63 @@ export component AppWindow inherits Window {
         input-provenance: root.input-provenance;
 
         settings-close-requested => { root.settings-close-requested(); }
+    }
+
+    // The one grouping question and the two refusals the entry path can
+    // produce.
+    in property <bool> question-open: false;
+    in property <int> question-frame-count: 0;
+    in property <int> question-project-count: 0;
+    callback question-open-as-one();
+    callback question-open-as-many();
+    callback question-cancelled();
+    in property <bool> refusal-open: false;
+    callback refusal-pick-another-folder();
+    in property <string> skipped-notice: "";
+    callback skipped-notice-dismissed();
+
+    grouping-question := FFGroupingQuestion {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        question-open: root.question-open;
+        frame-count: root.question-frame-count;
+        project-count: root.question-project-count;
+        open-as-one => { root.question-open-as-one(); }
+        open-as-many => { root.question-open-as-many(); }
+        cancelled => { root.question-cancelled(); }
+    }
+
+    refusal-dialog := FFRefusalDialog {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        refusal-open: root.refusal-open;
+        pick-another-folder => { root.refusal-pick-another-folder(); }
+    }
+
+    skipped-notice-banner := FFSkippedNotice {
+        x: 0px;
+        y: root.height - ShellGeometry.bottom-bar-height - self.height;
+        width: root.width;
+        notice-text: root.skipped-notice;
+        dismissed => { root.skipped-notice-dismissed(); }
+    }
+
+    // `no-frame: true` above means the compositor draws no OS chrome, so
+    // without this the window has no visible boundary against a dark
+    // desktop. Painted last (last child = topmost), non-interactive (no
+    // `TouchArea`) so it never steals a click meant for the chrome beneath
+    // it.
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: transparent;
+        border-width: 1px;
+        border-color: Theme.border-default;
     }
 }

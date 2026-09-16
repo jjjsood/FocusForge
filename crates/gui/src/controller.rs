@@ -16,11 +16,24 @@
 //! `Action`. They read `crate::input_map`'s types only -- no `use slint::`
 //! here either.
 
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use crate::entry;
 use crate::input_config::Provenance;
 use crate::input_map::{
     Action, ActionEvent, Button, InputRowView, InputTable, Modifiers, PointerKind, Trigger,
 };
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
+
+// Re-exported so `tests/entry.rs` and `crate::bridge` reach these through
+// `focusforge_gui::{..}` the same way they reach `AppController` -- the
+// entry path's own types are declared in `crate::entry` (the one module
+// naming the core algorithm crate's grouping and project modules), never
+// here.
+pub use crate::entry::{
+    EntryError, GroupingQuestion, GuiProject, OpenAs, OpenOutcome, Opened, Proposal,
+};
 
 /// The stacking/editor mode switch's two positions. Editor is unreachable --
 /// `AppController::set_mode` enforces that, not the Slint side.
@@ -69,6 +82,17 @@ pub enum ShellEvent {
     /// `pointer_moved`, `key`) every time a trigger resolves to an
     /// `Action`.
     Input(ActionEvent),
+    /// The open project set changed: a tab opened, closed or was selected.
+    ProjectsChanged,
+    /// Only the tab strip's scroll state moved -- its offset, overflow
+    /// layout or arrow flags: an arrow click or a tabs-region resize.
+    TabScrollChanged,
+    /// A folder read as more than one stack -- the one grouping question,
+    /// asked once.
+    QuestionRaised(GroupingQuestion),
+    /// An open attempt was refused. Carries its already-rendered message:
+    /// `perform` (`crate::bridge`) must not format user-facing text.
+    EntryRefused(String),
 }
 
 /// One live drag: which action it started and the last position seen, so
@@ -100,6 +124,40 @@ struct InputState {
     wheel_accum: f32,
 }
 
+/// One tab: its project state, its title, and the per-tab image
+/// size/viewport -- each tab carries its own zoom. `image` is set once when
+/// the tab is created and never changes; `viewport` starts `None` and is
+/// fitted by the first `set_pane_geometry` call after the tab becomes
+/// active.
+struct ProjectTab {
+    project: GuiProject,
+    title: String,
+    image: Option<ImageSize>,
+    viewport: Option<Viewport>,
+}
+
+impl ProjectTab {
+    fn new(project: GuiProject) -> Self {
+        let title = entry::tab_title(&project);
+        let image = entry::tab_image_size(&project);
+        ProjectTab {
+            project,
+            title,
+            image,
+            viewport: None,
+        }
+    }
+}
+
+/// The tab strip's plain-Rust view of one tab -- the generated
+/// `ProjectTabView` Slint struct's twin with no Slint type in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectTabRow {
+    pub title: String,
+    pub unsaved: bool,
+    pub selected: bool,
+}
+
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
 /// seam rather than re-cutting it.
 #[derive(Default)]
@@ -108,25 +166,51 @@ struct ShellState {
     dock_tab: DockTab,
     checkpoints: Vec<CheckpointRow>,
     maximized: bool,
-    canvas: crate::canvas::CanvasState,
     input: InputState,
-    /// The loaded project's composite/Z-Map size, set once by
-    /// `AppController::set_project_image` (`crate::canvas::open_project`).
-    /// `None` until a project is open.
-    image: Option<ImageSize>,
+    /// Every open project tab. Each tab owns its own image and viewport, so
+    /// switching tabs keeps each tab's own zoom.
+    projects: Vec<ProjectTab>,
+    /// The selected tab; `None` means "+" is selected -- no project active,
+    /// the empty state shown. Always `None` while `projects` is empty.
+    active: Option<usize>,
     /// Both panes' current geometry, pushed by `set_pane_geometry`
     /// (`ui/shell/canvas.slint`'s five `out` properties, read once by
     /// `src/main.rs` at startup and again on every `canvas-resized`).
     panes: Option<(PaneRect, PaneRect)>,
-    /// `None` until the first `set_pane_geometry` call after a project
-    /// opens fits it -- `open_project` cannot fit immediately, since it is
-    /// never handed a pane rect.
-    viewport: Option<Viewport>,
+    /// A grouping question raised by [`AppController::open_paths`], and the
+    /// [`Proposal`] behind it -- both cleared by
+    /// [`AppController::answer_question`] or
+    /// [`AppController::cancel_question`], which is what makes "asked once"
+    /// a property of the state machine rather than of the dialog.
+    pending: Option<(GroupingQuestion, Proposal)>,
+    /// The skipped-subfolder notice from the most recent open, if any.
+    notice: Option<String>,
+    /// The most recent refusal's already-rendered message, if any.
+    last_refusal: Option<String>,
+    /// The tab strip's scroll offset in pixels, always within
+    /// [`clamp_tab_scroll`]'s range for the current tabs and viewport.
+    tab_scroll_x: f32,
+    /// The tabs-region's width --
+    /// [`AppController::set_tab_region_width`].
+    tab_region_width: f32,
     /// The settings modal's visibility -- the only consumer of
     /// `--settings-section`. No `ShellEvent` variant needed:
     /// nothing else in the crate observes it, so `bridge.rs` reads the
     /// return value back directly rather than round-tripping the sink.
     settings_open: bool,
+    /// When the most recent close request was acted on --
+    /// [`AppController::close_project_at`]'s debounce.
+    last_close: Option<Instant>,
+}
+
+impl ShellState {
+    fn active(&self) -> Option<&ProjectTab> {
+        self.active.and_then(|i| self.projects.get(i))
+    }
+
+    fn active_mut(&mut self) -> Option<&mut ProjectTab> {
+        self.active.and_then(move |i| self.projects.get_mut(i))
+    }
 }
 
 /// Whether `(x, y)` falls within `pane`'s rect -- [`AppController::anchor`]'s
@@ -144,8 +228,16 @@ pub struct AppController {
 }
 
 impl AppController {
+    /// `tab_region_width` starts at its `ShellGeometry.base-width` value,
+    /// not zero: a `changed` handler fires only for a *later* change, never
+    /// for the width's initial value, so a zero default read a freshly
+    /// opened project's tab row as overflowing a strip nobody had measured
+    /// yet, lighting both scroll arrows over a single tab. The real width
+    /// still overwrites this the moment the window is ever resized.
     pub fn new() -> Self {
-        Self::default()
+        let mut controller = Self::default();
+        controller.state.tab_region_width = Self::BASE_TAB_REGION_WIDTH;
+        controller
     }
 
     /// Test-only: a controller already in `mode`, bypassing
@@ -245,20 +337,6 @@ impl AppController {
         self.emit(ShellEvent::CheckpointExportRequested);
     }
 
-    /// Read/write access to the canvas's loaded-project state, for
-    /// `crate::canvas`'s own `impl AppController` block (`open_project`,
-    /// `viewport`, `project_paths`) -- kept out of *this* file so
-    /// `checkpoint_panel_touches_no_storage`'s crate-wide scan
-    /// (`tests/shell.rs`) stays honest: nothing in `controller.rs` itself
-    /// names the core algorithm crate.
-    pub(crate) fn canvas(&self) -> &crate::canvas::CanvasState {
-        &self.state.canvas
-    }
-
-    pub(crate) fn canvas_mut(&mut self) -> &mut crate::canvas::CanvasState {
-        &mut self.state.canvas
-    }
-
     /// `"Composite"` / `"Z-Map"` -- the label's geometry is fixed
     /// elsewhere, not its text.
     pub fn pane_label(&self, pane: crate::canvas::PaneSource) -> &'static str {
@@ -273,15 +351,13 @@ impl AppController {
         true
     }
 
-    /// The active tab's frame count, once a project is open. The
+    /// The active tab's frame count, once a project is open -- the
     /// index-scale uniform (`crate::gpu_canvas`'s render path) is derived
-    /// from this.
+    /// from this. `None` while "+" is selected.
     pub fn frame_count(&self) -> Option<u32> {
         self.state
-            .canvas
-            .project
-            .as_ref()
-            .map(crate::project_stub::ProjectStub::frame_count)
+            .active()
+            .map(|tab| entry::tab_frame_count(&tab.project))
     }
 
     /// Forwards a pane's undock request -- unreachable while
@@ -342,9 +418,6 @@ impl AppController {
     /// burns a leftover.
     fn zoom_wheel(&mut self, steps: f32) {
         const DETENT: f32 = 60.0;
-        let Some(image) = self.state.image else {
-            return;
-        };
         let Some((left, _)) = self.state.panes else {
             return;
         };
@@ -363,7 +436,11 @@ impl AppController {
                 -1
             };
             self.state.input.wheel_accum -= DETENT * dir as f32;
-            if let Some(viewport) = self.state.viewport.as_mut() {
+            let Some(tab) = self.state.active_mut() else {
+                return;
+            };
+            let Some(image) = tab.image else { return };
+            if let Some(viewport) = tab.viewport.as_mut() {
                 viewport.zoom_steps(dir, anchor, image, left);
             }
         }
@@ -373,13 +450,14 @@ impl AppController {
     /// panes share the one viewport, so only the size (identical for both)
     /// matters here.
     fn pan_viewport(&mut self, dx: f32, dy: f32) {
-        let Some(image) = self.state.image else {
-            return;
-        };
         let Some((left, _)) = self.state.panes else {
             return;
         };
-        let Some(viewport) = self.state.viewport.as_mut() else {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(image) = tab.image else { return };
+        let Some(viewport) = tab.viewport.as_mut() else {
             return;
         };
         viewport.pan_by(dx, dy, image, left);
@@ -416,12 +494,15 @@ impl AppController {
     /// its own); every later call re-`resize`s it, so fit stays sticky.
     pub fn set_pane_geometry(&mut self, left: PaneRect, right: PaneRect) {
         self.state.panes = Some((left, right));
-        let Some(image) = self.state.image else {
+        let Some(tab) = self.state.active_mut() else {
             return;
         };
-        match self.state.viewport.as_mut() {
+        let Some(image) = tab.image else {
+            return;
+        };
+        match tab.viewport.as_mut() {
             Some(viewport) => viewport.resize(image, left),
-            None => self.state.viewport = Some(crate::viewport::fit(image, left)),
+            None => tab.viewport = Some(crate::viewport::fit(image, left)),
         }
     }
 
@@ -437,13 +518,14 @@ impl AppController {
     }
 
     fn zoom_button(&mut self, dir: i32) {
-        let Some(image) = self.state.image else {
-            return;
-        };
         let Some((left, _)) = self.state.panes else {
             return;
         };
-        let Some(viewport) = self.state.viewport.as_mut() else {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(image) = tab.image else { return };
+        let Some(viewport) = tab.viewport.as_mut() else {
             return;
         };
         let centre = (left.width / 2.0, left.height / 2.0);
@@ -453,67 +535,64 @@ impl AppController {
     /// `Fit`: shows the whole image, centred, in whichever pane geometry is
     /// current.
     pub fn fit(&mut self) {
-        let Some(image) = self.state.image else {
-            return;
-        };
         let Some((left, _)) = self.state.panes else {
             return;
         };
-        self.state.viewport = Some(crate::viewport::fit(image, left));
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(image) = tab.image else { return };
+        tab.viewport = Some(crate::viewport::fit(image, left));
     }
 
-    /// The zoom cluster's readout string -- empty before a project is open.
+    /// The zoom cluster's readout string -- empty while no tab is active or
+    /// no viewport has fitted yet.
     pub fn zoom_readout(&self) -> String {
         self.state
-            .viewport
-            .as_ref()
+            .active()
+            .and_then(|tab| tab.viewport.as_ref())
             .map(Viewport::readout)
             .unwrap_or_default()
     }
 
-    /// Whether the viewport is at the ladder's minimum -- fit-to-window with
-    /// one step below it.
+    /// Whether the active tab's viewport is at the ladder's minimum --
+    /// fit-to-window with one step below it.
     pub fn at_min_zoom(&self) -> bool {
-        let (Some(image), Some((left, _)), Some(viewport)) = (
-            self.state.image,
-            self.state.panes,
-            self.state.viewport.as_ref(),
-        ) else {
+        let Some(tab) = self.state.active() else {
+            return false;
+        };
+        let (Some(image), Some((left, _)), Some(viewport)) =
+            (tab.image, self.state.panes, tab.viewport.as_ref())
+        else {
             return false;
         };
         viewport.at_min(image, left)
     }
 
-    /// Whether the viewport is at the ladder's maximum -- 500 %, when fit
-    /// does not already exceed it.
+    /// Whether the active tab's viewport is at the ladder's maximum --
+    /// 500 %, when fit does not already exceed it.
     pub fn at_max_zoom(&self) -> bool {
-        let (Some(image), Some((left, _)), Some(viewport)) = (
-            self.state.image,
-            self.state.panes,
-            self.state.viewport.as_ref(),
-        ) else {
+        let Some(tab) = self.state.active() else {
+            return false;
+        };
+        let (Some(image), Some((left, _)), Some(viewport)) =
+            (tab.image, self.state.panes, tab.viewport.as_ref())
+        else {
             return false;
         };
         viewport.at_max(image, left)
     }
 
-    /// The current viewport's visible source rect and its pane-local
+    /// The active tab's viewport's visible source rect and its pane-local
     /// projection, for `crate::gpu_canvas::CanvasRenderer::redraw` and
-    /// `ui/shell/canvas.slint`'s `FFPane` placement properties. `None`
-    /// before a project is open or before the first pane geometry arrives.
+    /// `ui/shell/canvas.slint`'s `FFPane` placement properties. `None` while
+    /// no tab is active, no image size is known, or before the first pane
+    /// geometry arrives.
     pub fn pane_draw(&self) -> Option<PaneDraw> {
-        let image = self.state.image?;
+        let tab = self.state.active()?;
+        let image = tab.image?;
         let (left, _) = self.state.panes?;
-        self.state.viewport.as_ref()?.draw(image, left)
-    }
-
-    /// Sets the loaded project's image size and clears any prior viewport --
-    /// `crate::canvas::open_project`'s own seam into `ShellState`, kept here
-    /// so it can reach the private field. The next `set_pane_geometry` call
-    /// fits a fresh viewport for the new image.
-    pub(crate) fn set_project_image(&mut self, image: ImageSize) {
-        self.state.image = Some(image);
-        self.state.viewport = None;
+        tab.viewport.as_ref()?.draw(image, left)
     }
 
     /// The one wheel entry point. Axis normalisation first: an unmodified
@@ -672,4 +751,350 @@ impl AppController {
         self.state.settings_open = false;
         false
     }
+
+    // -- The entry path: the picker, the drop route and `--open` all call
+    // `open_paths`, so the two entrances and the flag cannot diverge. --
+
+    /// The one entry point for the picker (`src/picker.rs`), the drop
+    /// handler (`src/bridge.rs`) and `--open` (`src/main.rs`).
+    ///
+    /// The returned [`OpenOutcome::Opened`] always carries an empty
+    /// `projects` -- ownership of the opened [`GuiProject`]s moves onto this
+    /// controller's own tabs, which [`Self::project_tabs`],
+    /// [`Self::active_project`] and [`Self::frame_count`] read back; the
+    /// return value is a signal that the call resolved, not a second copy of
+    /// state the caller must track itself.
+    pub fn open_paths(&mut self, paths: &[PathBuf]) -> OpenOutcome {
+        match entry::classify(paths) {
+            Ok(target) => self.resolve_open(entry::open(target)),
+            Err(err) => self.refuse(err),
+        }
+    }
+
+    /// Answers the one pending grouping question. A no-op signalled as a
+    /// refusal when nothing is pending -- the UI only ever calls this while
+    /// [`Self::pending_question`] is `Some`.
+    pub fn answer_question(&mut self, answer: OpenAs) -> OpenOutcome {
+        let Some((_, proposal)) = self.state.pending.take() else {
+            return OpenOutcome::Refused(EntryError::Unreadable {
+                path: PathBuf::new(),
+            });
+        };
+        self.resolve_open(OpenOutcome::Opened(entry::answer_question(
+            &proposal, answer,
+        )))
+    }
+
+    /// Withdraws the pending question with no project opened. Clears
+    /// `pending`, which is what makes "asked once" a property of the state
+    /// machine rather than of the dialog.
+    pub fn cancel_question(&mut self) {
+        self.state.pending = None;
+    }
+
+    /// The pending grouping question, if one is raised.
+    pub fn pending_question(&self) -> Option<&GroupingQuestion> {
+        self.state.pending.as_ref().map(|(question, _)| question)
+    }
+
+    /// The skipped-subfolder notice from the most recent open, if any.
+    pub fn notice(&self) -> Option<&str> {
+        self.state.notice.as_deref()
+    }
+
+    /// The most recent refusal's already-rendered message, if any.
+    pub fn last_refusal(&self) -> Option<&str> {
+        self.state.last_refusal.as_deref()
+    }
+
+    fn resolve_open(&mut self, outcome: OpenOutcome) -> OpenOutcome {
+        match outcome {
+            OpenOutcome::Opened(opened) => {
+                let skipped = opened.skipped.clone();
+                self.accept(opened);
+                OpenOutcome::Opened(Opened {
+                    projects: Vec::new(),
+                    skipped,
+                })
+            }
+            OpenOutcome::Question(question, proposal) => {
+                self.state.pending = Some((question.clone(), proposal.clone()));
+                self.emit(ShellEvent::QuestionRaised(question.clone()));
+                OpenOutcome::Question(question, proposal)
+            }
+            OpenOutcome::Refused(err) => self.refuse(err),
+        }
+    }
+
+    /// Places every opened project in a tab, selects the first of them, and
+    /// records the skipped-subfolder notice. New tabs always go at the end,
+    /// whether "+" or a project tab was selected.
+    fn accept(&mut self, opened: Opened) {
+        self.state.notice = notice_line(&opened.skipped);
+        self.state.last_refusal = None;
+        if !opened.projects.is_empty() {
+            self.state.active = Some(self.state.projects.len());
+            self.state
+                .projects
+                .extend(opened.projects.into_iter().map(ProjectTab::new));
+        }
+        self.settle_tab_scroll();
+        self.emit(ShellEvent::ProjectsChanged);
+    }
+
+    fn refuse(&mut self, err: EntryError) -> OpenOutcome {
+        let message = err.to_string();
+        self.state.last_refusal = Some(message.clone());
+        self.emit(ShellEvent::EntryRefused(message));
+        OpenOutcome::Refused(err)
+    }
+
+    // -- Tabs as controller state. --
+
+    /// Every open tab, in order -- the plain twin of
+    /// `ui/shell/tab_strip.slint`'s `ProjectTabView`.
+    pub fn project_tabs(&self) -> Vec<ProjectTabRow> {
+        self.state
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| ProjectTabRow {
+                title: tab.title.clone(),
+                unsaved: matches!(tab.project, GuiProject::Unsaved(_)),
+                selected: self.state.active == Some(i),
+            })
+            .collect()
+    }
+
+    /// The selected tab's index, `None` while "+" is selected.
+    pub fn active_project(&self) -> Option<usize> {
+        self.state.active
+    }
+
+    /// Whether "+" is the selected strip element -- no project active, the
+    /// empty state shown. True with zero tabs.
+    pub fn plus_selected(&self) -> bool {
+        self.state.active.is_none()
+    }
+
+    /// "+": selects the pseudo-tab, leaving every project tab open and the
+    /// strip's scroll where it is. Also closes the projects overlay, the
+    /// same as a gallery card click.
+    pub fn select_plus(&mut self) {
+        if self.state.active.take().is_some() {
+            self.emit(ShellEvent::ProjectsChanged);
+        }
+    }
+
+    pub fn select_project(&mut self, index: usize) {
+        if index < self.state.projects.len() {
+            self.state.active = Some(index);
+            self.settle_tab_scroll();
+            self.emit(ShellEvent::ProjectsChanged);
+        }
+    }
+
+    /// Closes tab `index`, re-selecting its neighbour -- "+" when the last
+    /// tab closes, and "+" stays selected if it already was.
+    /// How long after a close further close requests are ignored: 300 ms.
+    /// A double-click on a tab's close glyph
+    /// otherwise closes two tabs -- the first click closes one, the next tab
+    /// slides under the pointer and the second click closes that one too.
+    pub const CLOSE_DEBOUNCE: Duration = Duration::from_millis(300);
+
+    /// [`Self::close_project_at`] at the current time -- what the tab
+    /// strip's close glyph calls (`src/bridge.rs`).
+    pub fn close_project(&mut self, index: usize) {
+        self.close_project_at(index, Instant::now());
+    }
+
+    /// Closes tab `index` as of `now`, unless a close was acted on less than
+    /// [`Self::CLOSE_DEBOUNCE`] before. `now` is a parameter so tests step
+    /// the clock without sleeping.
+    pub fn close_project_at(&mut self, index: usize, now: Instant) {
+        if index >= self.state.projects.len() {
+            return;
+        }
+        if self
+            .state
+            .last_close
+            .is_some_and(|last| now.saturating_duration_since(last) < Self::CLOSE_DEBOUNCE)
+        {
+            return;
+        }
+        self.state.last_close = Some(now);
+        self.state.projects.remove(index);
+        // Closing another tab never moves the selection: only the indices
+        // after the removed one shift down by one.
+        self.state.active = match self.state.active {
+            Some(active) if active == index && !self.state.projects.is_empty() => {
+                Some(index.min(self.state.projects.len() - 1))
+            }
+            Some(active) if active > index => Some(active - 1),
+            Some(active) if active < index => Some(active),
+            _ => None,
+        };
+        self.settle_tab_scroll();
+        self.emit(ShellEvent::ProjectsChanged);
+    }
+
+    // -- The scrolling tab strip. The arithmetic is the free functions
+    // below `impl AppController` ([`tabs_overflow`],
+    // [`tab_viewport_width`], [`clamp_tab_scroll`],
+    // [`tab_scroll_into_view`]); `.slint` only reads the results. --
+
+    /// `tabs-region`'s width at `ShellGeometry.base-width`: 1440 minus the
+    /// 46 px projects slot, the 105 px window-glyph cluster (`base-width -
+    /// glyph-first-x`) and the 32 px
+    /// `strip-cluster-gap` -- see [`AppController::new`] for why the region
+    /// starts here rather than at zero.
+    const BASE_TAB_REGION_WIDTH: f32 = 1257.0;
+
+    /// The tabs-region's measured width, pushed from `FFTabStrip`'s
+    /// `tabs-region-width` (at install, and on every change). Re-clamps the
+    /// offset, so a wider window never leaves an empty gap at the right, and
+    /// always pushes on a real change: a narrower strip can leave the offset
+    /// where it was yet light the right arrow or switch to the overflow layout.
+    pub fn set_tab_region_width(&mut self, width: f32) {
+        let width = width.max(0.0);
+        if width == self.state.tab_region_width {
+            return;
+        }
+        self.state.tab_region_width = width;
+        self.state.tab_scroll_x = self.clamped_tab_scroll(self.state.tab_scroll_x);
+        self.emit(ShellEvent::TabScrollChanged);
+    }
+
+    fn clamped_tab_scroll(&self, offset: f32) -> f32 {
+        let count = self.state.projects.len();
+        let viewport = tab_viewport_width(count, self.state.tab_region_width);
+        clamp_tab_scroll(offset, tab_content_width(count), viewport)
+    }
+
+    /// Re-clamps after the tab set changed, then brings the active tab into
+    /// view. Emits nothing: every caller emits `ProjectsChanged`, which
+    /// pushes the scroll state too.
+    fn settle_tab_scroll(&mut self) {
+        let count = self.state.projects.len();
+        let clamped = self.clamped_tab_scroll(self.state.tab_scroll_x);
+        self.state.tab_scroll_x = match self.state.active {
+            Some(index) => tab_scroll_into_view(
+                clamped,
+                index,
+                count,
+                tab_viewport_width(count, self.state.tab_region_width),
+            ),
+            None => clamped,
+        };
+    }
+
+    /// Scrolls by `steps` whole tab-pitches -- negative is left, positive is
+    /// right -- clamped by [`clamp_tab_scroll`]. Pushes only when it moved.
+    pub fn scroll_tabs(&mut self, steps: i32) {
+        let offset = self.clamped_tab_scroll(self.state.tab_scroll_x + steps as f32 * TAB_PITCH);
+        if offset != self.state.tab_scroll_x {
+            self.state.tab_scroll_x = offset;
+            self.emit(ShellEvent::TabScrollChanged);
+        }
+    }
+
+    pub fn tab_scroll_x(&self) -> f32 {
+        self.state.tab_scroll_x
+    }
+
+    /// Whether the strip is in its overflow layout: arrows shown, "+" pinned.
+    pub fn tabs_overflow(&self) -> bool {
+        tabs_overflow(self.state.projects.len(), self.state.tab_region_width)
+    }
+
+    pub fn can_scroll_left(&self) -> bool {
+        self.state.tab_scroll_x > 0.0
+    }
+
+    pub fn can_scroll_right(&self) -> bool {
+        self.state.tab_scroll_x < self.clamped_tab_scroll(f32::MAX)
+    }
+}
+
+/// `ShellGeometry.tab-pitch` (`ui/geometry.slint`): one tab plus its gap.
+pub const TAB_PITCH: f32 = 228.0;
+/// `ShellGeometry.tab-width` (`ui/geometry.slint`).
+pub const TAB_WIDTH: f32 = 224.0;
+/// `ShellGeometry.strip-box-width` (`ui/geometry.slint`): each scroll arrow
+/// and "+".
+pub const STRIP_BOX_WIDTH: f32 = 30.0;
+/// `ShellGeometry.strip-box-gap` (`ui/geometry.slint`, `Theme.space-1`).
+pub const STRIP_BOX_GAP: f32 = 4.0;
+
+/// Whether `tab_count` tabs plus the trailing "+" outrun a tabs-region
+/// `region_width` wide. The overflow layout reserves more room than this
+/// (arrows beside the viewport), so the decision is taken against the
+/// no-arrow layout alone and cannot flicker at the threshold.
+pub fn tabs_overflow(tab_count: usize, region_width: f32) -> bool {
+    tab_count as f32 * TAB_PITCH + STRIP_BOX_WIDTH > region_width
+}
+
+/// The scrolling viewport's width inside a tabs-region `region_width` wide:
+/// the whole region without overflow; on overflow, the region less the left
+/// arrow, the right arrow and the pinned "+", each with its box gap
+/// (`ui/shell/tab_strip.slint`'s `tabs-viewport`).
+pub fn tab_viewport_width(tab_count: usize, region_width: f32) -> f32 {
+    if tabs_overflow(tab_count, region_width) {
+        (region_width - 3.0 * (STRIP_BOX_WIDTH + STRIP_BOX_GAP)).max(0.0)
+    } else {
+        region_width
+    }
+}
+
+/// The scrolling content's width: the tabs alone, first tab's left edge to
+/// last tab's right edge -- "+" is pinned outside the viewport on overflow.
+pub fn tab_content_width(tab_count: usize) -> f32 {
+    (tab_count as f32 * TAB_PITCH - STRIP_BOX_GAP).max(0.0)
+}
+
+/// The largest offset that still fills the viewport: `content - viewport`,
+/// or 0 when the content fits.
+pub fn max_tab_scroll(content_width: f32, viewport_width: f32) -> f32 {
+    (content_width - viewport_width).max(0.0)
+}
+
+/// `offset` clamped to `0 ..= max_tab_scroll(content, viewport)`.
+pub fn clamp_tab_scroll(offset: f32, content_width: f32, viewport_width: f32) -> f32 {
+    offset.clamp(0.0, max_tab_scroll(content_width, viewport_width))
+}
+
+/// The smallest change to `offset` that shows tab `index` whole in a
+/// viewport `viewport_width` wide. Returns a clamped offset.
+pub fn tab_scroll_into_view(
+    offset: f32,
+    index: usize,
+    tab_count: usize,
+    viewport_width: f32,
+) -> f32 {
+    let max = max_tab_scroll(tab_content_width(tab_count), viewport_width);
+    let left = index as f32 * TAB_PITCH;
+    let right = left + TAB_WIDTH;
+    let mut s = offset.clamp(0.0, max);
+    if right > s + viewport_width {
+        s = right - viewport_width;
+    }
+    if left < s {
+        s = left;
+    }
+    s.clamp(0.0, max)
+}
+
+/// The skipped-subfolder notice's text, `None` when nothing was skipped --
+/// not an error, `FFSkippedNotice`'s own copy (`ui/shell/dialogs.slint`).
+fn notice_line(skipped: &[PathBuf]) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = skipped.iter().map(|p| p.display().to_string()).collect();
+    Some(format!(
+        "{} subfolder{} held no readable frames and were skipped: {}",
+        skipped.len(),
+        if skipped.len() == 1 { "" } else { "s" },
+        names.join(", ")
+    ))
 }
