@@ -14,13 +14,9 @@
 //! runs, not as part of a routine `cargo test` invocation.
 //!
 //! Every spawn isolates `.scratch/` with its own per-process temp directory
-//! and `.current_dir(cwd)`, exactly `crates/cli/tests/job_cli.rs`'s idiom,
-//! and each test's cwd is separate from the directory it points
-//! `-o`/`--write-warped` at and from any directory it enumerates.
-//! Every `stack` run in this file points `-o` at its own freshly created
-//! directory (`out_dir`), never one shared with another run in the same
-//! test, and a test that needs pixel bytes asks `export` for them
-//! (`export_composite`) rather than reading a file `stack` no longer writes.
+//! and `.current_dir(cwd)`, separate from any `-o` directory it points at.
+//! Each `stack` run gets its own fresh `out_dir`; a test needing pixel
+//! bytes asks `export` for them, since `stack` writes no composite file.
 
 #![cfg(feature = "gpu-tests")]
 
@@ -97,12 +93,14 @@ fn run(dir: &Path, args: &[&str]) -> CliOutput {
 /// Shared `stack` invocation for the `--max-vram` tests below: laplacian +
 /// pyramidal-ecc, `--lax --json`, against the standard fixture -- `extra`
 /// appends whatever each test varies (`--max-vram`, `--no-gpu`, ...).
-fn max_vram_stack_args(output: &Path, extra: &[&str]) -> Vec<String> {
+/// `output_dir` is the directory `-o` collects this run's project into, not
+/// a file path -- `stack`'s own contract.
+fn max_vram_stack_args(output_dir: &Path, extra: &[&str]) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "stack".to_string(),
         mantis_512_dir().to_str().unwrap().to_string(),
         "-o".to_string(),
-        output.to_str().unwrap().to_string(),
+        output_dir.to_str().unwrap().to_string(),
         "--algo".to_string(),
         "laplacian".to_string(),
         "--align-algo".to_string(),
@@ -118,6 +116,32 @@ fn max_vram_stack_args(output: &Path, extra: &[&str]) -> Vec<String> {
 fn run_owned(dir: &Path, args: &[String]) -> CliOutput {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     run(dir, &refs)
+}
+
+/// A fresh subdirectory of `parent`, created for one `stack` run's own `-o`
+/// -- `check_output_dir` refuses any `-o` that is not an already-existing
+/// directory and never creates one itself.
+fn out_dir(parent: &Path, name: &str) -> PathBuf {
+    let dir = parent.join(name);
+    std::fs::create_dir_all(&dir).expect("test output directory must be creatable");
+    dir
+}
+
+/// The composite of `project`, exported beside it as
+/// `<project-file-name>.composite.tif` for byte comparison.
+fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
+    let composite = project.with_extension("composite.tif");
+    let out = run(
+        cwd,
+        &[
+            "export",
+            project.to_str().unwrap(),
+            "-o",
+            composite.to_str().unwrap(),
+        ],
+    );
+    assert!(out.success, "export stderr: {}", out.stderr);
+    composite
 }
 
 /// A `stack` run against an absent WGPU backend (`dx12` does not exist on
@@ -154,8 +178,8 @@ fn stack_gpu_matches_stack_no_gpu() {
     const STACK_TOLERANCE: i32 = 512;
     let cwd = common::tmp_dir("cli_gpu_stack_matches_cwd");
     let dir = common::tmp_dir("cli_gpu_stack_matches");
-    let gpu_out = dir.join("gpu.tif");
-    let cpu_out = dir.join("cpu.tif");
+    let gpu_dir = out_dir(&dir, "gpu");
+    let cpu_dir = out_dir(&dir, "cpu");
 
     let gpu = run(
         &cwd,
@@ -163,7 +187,7 @@ fn stack_gpu_matches_stack_no_gpu() {
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            gpu_out.parent().unwrap().to_str().unwrap(),
+            gpu_dir.to_str().unwrap(),
             "--algo",
             "laplacian",
             // Disambiguates the alignment algorithm: this test binary's
@@ -195,7 +219,7 @@ fn stack_gpu_matches_stack_no_gpu() {
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            cpu_out.parent().unwrap().to_str().unwrap(),
+            cpu_dir.to_str().unwrap(),
             "--algo",
             "laplacian",
             "--align-algo",
@@ -214,8 +238,10 @@ fn stack_gpu_matches_stack_no_gpu() {
         serde_json::from_str(&cpu.stdout).expect("cpu run --json must parse");
     assert_eq!(cpu_report["backend"], "cpu", "report: {cpu_report}");
 
-    let (gpu_samples, gw, gh, gspp) = read_whole(&gpu_out);
-    let (cpu_samples, cw, ch, cspp) = read_whole(&cpu_out);
+    let gpu_composite = export_composite(&cwd, &gpu_dir.join("mantis-512.ffproj"));
+    let cpu_composite = export_composite(&cwd, &cpu_dir.join("mantis-512.ffproj"));
+    let (gpu_samples, gw, gh, gspp) = read_whole(&gpu_composite);
+    let (cpu_samples, cw, ch, cspp) = read_whole(&cpu_composite);
     assert_eq!(
         (gw, gh, gspp),
         (cw, ch, cspp),
@@ -440,7 +466,7 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
     let cwd = common::tmp_dir("cli_gpu_max_vram_cwd");
     let dir = common::tmp_dir("cli_gpu_max_vram");
 
-    let probed_out = dir.join("probed.tif");
+    let probed_out = out_dir(&dir, "probed");
     let probed = run_owned(&cwd, &max_vram_stack_args(&probed_out, &[]));
     assert!(probed.success, "stderr: {}", probed.stderr);
     let probed_report: serde_json::Value =
@@ -464,7 +490,7 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
         ceiling < probed_bytes,
         "fixture assumption: probed budget ({probed_bytes}) must exceed the 256MiB ceiling used below"
     );
-    let low_out = dir.join("low.tif");
+    let low_out = out_dir(&dir, "low");
     let low = run_owned(
         &cwd,
         &max_vram_stack_args(&low_out, &["--max-vram", "256MiB"]),
@@ -482,7 +508,7 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
     );
 
     // A ceiling above the probed value changes nothing, provenance included.
-    let high_out = dir.join("high.tif");
+    let high_out = out_dir(&dir, "high");
     let high = run_owned(
         &cwd,
         &max_vram_stack_args(&high_out, &["--max-vram", "64GiB"]),
@@ -500,7 +526,7 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
     );
 
     // CPU path: both fields null.
-    let cpu_out = dir.join("cpu.tif");
+    let cpu_out = out_dir(&dir, "cpu");
     let cpu = run_owned(&cwd, &max_vram_stack_args(&cpu_out, &["--no-gpu"]));
     assert!(cpu.success, "stderr: {}", cpu.stderr);
     let cpu_report: serde_json::Value =
@@ -526,7 +552,7 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
     let dir = common::tmp_dir("cli_gpu_device_peak_in_flight");
 
     // Uncapped GPU run.
-    let uncapped_out = dir.join("uncapped.tif");
+    let uncapped_out = out_dir(&dir, "uncapped");
     let uncapped = run_owned(&cwd, &max_vram_stack_args(&uncapped_out, &[]));
     assert!(uncapped.success, "stderr: {}", uncapped.stderr);
     let uncapped_report: serde_json::Value =
@@ -550,7 +576,7 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
     // `--max-vram 1MiB` floors the device gate at exactly one tile, on any
     // machine, without touching the host-side `in_flight_limit` (one
     // tile's device footprint on this fixture is 254 661 632 bytes).
-    let capped_out = dir.join("capped.tif");
+    let capped_out = out_dir(&dir, "capped");
     let capped = run_owned(
         &cwd,
         &max_vram_stack_args(&capped_out, &["--max-vram", "1MiB"]),
@@ -568,7 +594,7 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
     );
 
     // `--no-gpu`: the field is null.
-    let cpu_out = dir.join("cpu.tif");
+    let cpu_out = out_dir(&dir, "cpu");
     let cpu = run_owned(&cwd, &max_vram_stack_args(&cpu_out, &["--no-gpu"]));
     assert!(cpu.success, "stderr: {}", cpu.stderr);
     let cpu_report: serde_json::Value =
