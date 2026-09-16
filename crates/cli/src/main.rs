@@ -24,11 +24,11 @@ mod stack;
 
 /// Resolves whether this run takes the GPU path or the CPU one:
 /// `#[cfg(feature = "gpu")]` delegates to [`gpu::resolve_backend`]; with the
-/// feature off, always `None` -- `stack`/`align` behave exactly as phases 3
-/// and 4 left them, with no GPU probing at all. A crate-root `fn`, not
-/// `pub(crate)`: `stack` and `align` are descendant modules of this one, so
-/// a private item here is already visible to them (the same visibility
-/// `crate::fail` already relies on).
+/// feature off, always [`stack::BackendChoice::cpu()`] -- `stack`/`align`
+/// probe for nothing and stay on the CPU path unconditionally. A crate-root
+/// `fn`, not `pub(crate)`: `stack` and `align` are descendant modules of
+/// this one, so a private item here is already visible to them (the same
+/// visibility `crate::fail` already relies on).
 #[cfg(feature = "gpu")]
 fn resolve_backend(no_gpu: bool, max_vram: Option<u64>) -> stack::BackendChoice {
     gpu::resolve_backend(no_gpu, max_vram)
