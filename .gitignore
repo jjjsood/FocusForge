@@ -4,3 +4,4 @@
 /spikes/*/target
 /spikes/*/__pycache__
 *.code-workspace
+/.locks/

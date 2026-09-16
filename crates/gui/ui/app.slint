@@ -121,6 +121,11 @@ export component AppWindow inherits Window {
     in property <image> composite-source;
     in property <image> zmap-source;
     in property <bool> canvas-undock-enabled: true;
+    // Whether a project is open -- governs the pane chrome (label, undock)
+    // and the bottom bar's zoom cluster together, so nothing offers an
+    // action there is nothing yet to act on. Set from Rust alongside
+    // `zoom-readout` in `src/bridge.rs::repaint`, `false` until then.
+    in property <bool> project-loaded: false;
     callback composite-undock-requested();
     callback zmap-undock-requested();
     // Forwarded from `FFCanvas`'s own callbacks of the same shape -- the
@@ -182,6 +187,7 @@ export component AppWindow inherits Window {
             composite-source: root.composite-source;
             zmap-source: root.zmap-source;
             undock-enabled: root.canvas-undock-enabled;
+            project-loaded: root.project-loaded;
             image-x: root.image-x;
             image-y: root.image-y;
             image-w: root.image-w;
@@ -228,10 +234,9 @@ export component AppWindow inherits Window {
     callback settings-close-requested();
     // The bottom bar's zoom cluster -- governs both panes, which is why it
     // lives at the root rather than inside `FFPane`.
+    // Greys out together with the rest of the chrome via the single
+    // `project-loaded` property declared above.
     in property <string> zoom-readout: "";
-    // Whether a project is open, so the whole zoom cluster greys out
-    // together rather than only its readout going blank.
-    in property <bool> project-loaded: false;
     callback zoom-in-requested();
     callback zoom-out-requested();
     callback zoom-fit-requested();
