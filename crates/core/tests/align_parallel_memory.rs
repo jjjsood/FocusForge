@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use focusforge_core::algorithm::AlignAlgorithm;
 use focusforge_core::align::{
     AlignDriverOptions, FailurePolicy, PyramidalEcc, align_stack_with, bytes_per_registration,
+    bytes_shared_reference,
 };
 use focusforge_core::io::TiffStack;
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
@@ -115,16 +116,19 @@ fn peak_live_heap_tracks_the_worker_budget() {
     // The shipped 400 costs seconds this memory-shape property does not need.
     cfg.insert("max-iterations".to_string(), ParamValue::Int(40));
 
+    let shared_reference = bytes_shared_reference(stack_ctx);
     let per_registration = bytes_per_registration(stack_ctx, DEFAULT_TILE_SIZE);
     // 7 registrations on this fixture (8 frames): a 1x budget must floor to
     // exactly one worker, and a 3x budget must clear that floor without
     // running into the `registrations` cap the fixture's small frame count
-    // could otherwise trip.
+    // could otherwise trip. The budget's shared reference
+    // term is a per-run constant, not a per-worker one -- both budgets add
+    // it in once, then n worker-shares of the frame-side figure.
     let one_x = AlignDriverOptions {
-        max_bytes_in_flight: per_registration as usize,
+        max_bytes_in_flight: (shared_reference + per_registration) as usize,
     };
     let three_x = AlignDriverOptions {
-        max_bytes_in_flight: (per_registration * 3) as usize,
+        max_bytes_in_flight: (shared_reference + per_registration * 3) as usize,
     };
 
     reset_peak();
@@ -160,13 +164,13 @@ fn peak_live_heap_tracks_the_worker_budget() {
         parallel.worker_limit
     );
 
-    // Slack: the fixture's own per-registration figure is derived at
-    // 512x512 (~5 MB), and the serial arm still allocates its own read
-    // buffers, pyramids and driver bookkeeping around that one live
-    // registration -- 4x is generous headroom over the arithmetic figure
-    // while still discriminating a budget that is actually enforced from
-    // one that is merely divided on paper.
-    let ceiling = per_registration.saturating_mul(4);
+    // Slack: the fixture's own shared-reference-plus-one-registration figure
+    // is derived at 512x512 (~5 MB total), and the serial arm still
+    // allocates its own read buffers, pyramids and driver bookkeeping around
+    // that one live registration -- 4x is generous headroom over the
+    // arithmetic figure while still discriminating a budget that is
+    // actually enforced from one that is merely divided on paper.
+    let ceiling = (shared_reference + per_registration).saturating_mul(4);
     assert!(
         (serial_peak as u64) < ceiling,
         "1x-budget peak {serial_peak} B exceeded {ceiling} B (4x one registration's {per_registration} B)"

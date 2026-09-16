@@ -107,17 +107,24 @@ pub trait TileReader: Send + Sync {
 }
 
 /// What an [`AlignAlgorithm::align_frame`] call sees: the facts about the
-/// stack, which frame is the alignment reference, and a handle onto real
-/// pixels through a [`TileReader`].
+/// stack, which frame is the alignment reference, a handle onto real pixels
+/// through a [`TileReader`], and (in the anchor arm only) a driver-prepared
+/// value from [`AlignAlgorithm::prepare_run`].
 ///
 /// `Send + Sync` on [`TileReader`] is what keeps `AlignContext<'_>` `Sync`,
-/// which is what lets `align_frame` run across frames under rayon.
+/// which is what lets `align_frame` run across frames under rayon. `Send +
+/// Sync` on the erased `prepared` value is the same argument applied a
+/// second time: a `dyn Any + Send + Sync` behind a shared `&'a` reference is
+/// exactly as safe to read from multiple rayon workers at once as the
+/// reader already is, and neither type offers any way to mutate through a
+/// shared reference, so there is nothing here that would need a lock.
 /// The reader field stays private -- no accessor -- so exposing one later is
 /// an additive change rather than a removal.
 pub struct AlignContext<'a> {
     stack: StackContext,
     reference: usize,
     reader: &'a dyn TileReader,
+    prepared: Option<&'a (dyn std::any::Any + Send + Sync)>,
 }
 
 impl<'a> AlignContext<'a> {
@@ -126,7 +133,28 @@ impl<'a> AlignContext<'a> {
             stack,
             reference,
             reader,
+            prepared: None,
         }
+    }
+
+    /// Attaches the driver's [`AlignAlgorithm::prepare_run`] output, if any.
+    /// Takes the `Option` rather than a bare reference so a driver can
+    /// thread `prepare_run`'s own return value straight through with no
+    /// branch of its own.
+    pub fn with_prepared(
+        mut self,
+        prepared: Option<&'a (dyn std::any::Any + Send + Sync)>,
+    ) -> Self {
+        self.prepared = prepared;
+        self
+    }
+
+    /// The driver-prepared value for this run, if `prepare_run` returned
+    /// one. An algorithm that `downcast_ref`s this to a type it does not
+    /// recognise -- someone else's prepared state, or none at all -- gets
+    /// `None` and **rebuilds**; that is the normal case, never an error.
+    pub fn prepared(&self) -> Option<&'a (dyn std::any::Any + Send + Sync)> {
+        self.prepared
     }
 
     pub fn stack(&self) -> &StackContext {
@@ -267,6 +295,24 @@ pub trait AlignAlgorithm: Send + Sync + 'static {
         frame: usize,
         cfg: &ParamValues,
     ) -> Result<AlignOutcome, AlgorithmError>;
+
+    /// Called **at most once per run**, by the driver, **only in the anchor
+    /// arm**, before any [`align_frame`](Self::align_frame) call of that
+    /// run -- with the same fully resolved `cfg` every `align_frame` call of
+    /// that run will receive. The returned value is opaque to the driver,
+    /// which only owns it and hands it back to every `align_frame` call
+    /// through [`AlignContext::prepared`]; nothing here interprets it.
+    ///
+    /// `Ok(None)` is always a correct implementation -- it costs only the
+    /// rebuild it declines to avoid -- which is why every implementor except
+    /// [`crate::align::PyramidalEcc`] inherits this default unchanged.
+    fn prepare_run(
+        &self,
+        _ctx: &AlignContext<'_>,
+        _cfg: &ParamValues,
+    ) -> Result<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>, AlgorithmError> {
+        Ok(None)
+    }
 }
 
 impl TileReader for crate::io::TiffStack {

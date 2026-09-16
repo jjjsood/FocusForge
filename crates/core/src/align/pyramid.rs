@@ -23,6 +23,15 @@
 //! the *reader*) and then held in RAM as whole [`Plane`]s for the pairwise
 //! solve. `level(0)` is retained -- the level-0-omitted variant is not
 //! built.
+//!
+//! An anchored run holds the reference frame's pyramid only **once**, for
+//! the whole run, not once per registration: a registration holds one
+//! *shared* reference pyramid
+//! ([`crate::align::driver::bytes_shared_reference`], a per-run constant)
+//! plus its own frame-side transient
+//! ([`crate::align::driver::bytes_per_registration`], per worker). Their sum
+//! is still the ~622 MB figure above -- the split changes who pays for the
+//! reference pyramid's residency, not the total.
 
 use crate::align::error::AlignError;
 use crate::fuse::PyramidError;
@@ -139,15 +148,7 @@ mod tests {
     #[test]
     fn level_dimensions_and_odd_sizes() {
         // `dim_k = ceil(dim / 2^k)`, the rule `crate::fuse::pyramid`
-        // already states, not a second one: 13 -> 7 -> 4 -> 2. A base of
-        // 13x13 only supports one legal reduce
-        // (`crate::fuse::pyramid::max_levels(13, 13) == 1`, the same "do
-        // not shrink below ~4px" floor `fuse::pyramid::tests::
-        // level_count_limit_is_enforced` pins), so the odd-size step this
-        // module can build (13 -> 7) is checked against a real
-        // `AlignPyramid`, and the formula's next two steps (7 -> 4 -> 2,
-        // below any pyramid's legal floor) are checked directly against
-        // the same `div_ceil` rule.
+        // already states: 13 -> 7 -> 4 -> 2.
         let base = Plane::from_f32(&vec![5.0f32; 169], 13, 13, 1).unwrap();
         assert_eq!(max_levels(13, 13), 1);
         let pyramid = AlignPyramid::from_luma(base, 1).unwrap();

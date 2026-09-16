@@ -21,6 +21,15 @@
 //! -- hop **after** prefix, since [`Transform::compose`] applies its right operand first -- serial
 //! by construction, each hop needing the previous hop's result.
 //!
+//! ## The reference pyramid is cached once per run
+//!
+//! `align_stack_with` calls [`AlignAlgorithm::prepare_run`] once, before either sub-arm; the result
+//! lives in **this function's own stack frame** as an `Arc`, never as state on the `&'static`
+//! algorithm, so overlapping runs hold separate `Arc`s. It reaches every `align_frame` call through
+//! [`AlignContext::prepared`], by `&`, safe under this module's rayon fan-out because every worker
+//! holds the same shared, already-finished, never-mutated reference. Chain mode never calls
+//! `prepare_run`: its reference changes every hop, so nothing stays stable to cache.
+//!
 //! # Failure policy
 //!
 //! A frame whose outcome is [`AlignStatus::Diverged`] is a failure. **Both**
@@ -150,7 +159,31 @@ impl Default for AlignDriverOptions {
     }
 }
 
-/// The transient peak bytes one anchor-mode registration holds live -- the
+/// The bytes the anchor arm's **shared** reference pyramid holds live, once
+/// per run rather than once per worker -- a per-run constant instead of a
+/// term inside every registration's own figure. The sibling of
+/// [`bytes_per_registration`], which is what remains per worker once this
+/// term is pulled out.
+///
+/// ```text
+/// plane                  = width * height * 4    // f32 luma
+/// bytes_shared_reference  = plane * 4 / 3         // level 0 + sum of levels 1..N, ratio 1/4 each
+/// ```
+///
+/// The `4/3` is the infinite geometric sum `1 + 1/4 + 1/16 + ...`, so the
+/// figure is an upper bound independent of `pyramid-depth`. At 8192x5464x3
+/// this evaluates to ~238.7 MB; at the 512x512x3 fixture, ~1.4 MB.
+/// `bytes_shared_reference(stack) + bytes_per_registration(stack,
+/// DEFAULT_TILE_SIZE)` equals the 622 MB figure
+/// `the_split_sums_to_622_mb_at_the_reference_scale` checks, so the two
+/// functions can never silently drift into describing different physics.
+pub fn bytes_shared_reference(stack: StackContext) -> u64 {
+    let plane = stack.width as u64 * stack.height as u64 * 4;
+    plane * 4 / 3
+}
+
+/// The transient peak bytes one anchor-mode registration holds live **on top
+/// of** the one shared reference pyramid ([`bytes_shared_reference`]) -- the
 /// sibling of `crate::tile::scheduler::bytes_per_tile_set`, `pub` because two
 /// callers outside this module need it: the memory test
 /// (`crates/core/tests/align_parallel_memory.rs`) sizes its budgets from it,
@@ -158,31 +191,29 @@ impl Default for AlignDriverOptions {
 /// deliberately is choosing a multiple of it.
 ///
 /// ```text
-/// plane      = width * height * 4                      // f32 luma, from align/pyramid
-/// pyramid   <= plane * 4 / 3                            // level 0 + sum of levels 1..N, ratio 1/4 each
-/// assembler  = plane                                    // LumaAssembler::data, from align/pyramid
-/// copy       = plane                                    // Plane::from_f32 copies, from align/pyramid
-/// band       = width * band_rows * spp * 2              // from ecc_algorithm's band sizing
-/// bytes_per_registration = pyramid + assembler + copy + band
+/// plane      = width * height * 4                      // f32 luma
+/// assembler  = plane                                    // LumaAssembler::data
+/// copy       = plane                                    // Plane::from_f32 copies
+/// band       = width * band_rows * spp * 2
+/// bytes_per_registration = assembler + copy + band
 /// ```
 ///
 /// `band_rows` is `DEFAULT_TILE_SIZE`, the band height
 /// `PyramidalEcc::build_pyramid` streams with. The peak is **transient, not
-/// steady-state**: it is the instant inside the *second* `build_pyramid`
-/// call when the first frame's finished pyramid, the assembler's `Vec<f32>`,
+/// steady-state**: it is the instant inside the frame-side `build_pyramid`
+/// call when the shared reference pyramid, the assembler's `Vec<f32>`,
 /// `Plane::from_f32`'s copy of it and one band buffer are all live at once.
-/// Exactly one reference pyramid exists per run, not one per
-/// concurrent registration -- that is why its term left this function and
-/// moved into [`bytes_shared_reference`], a per-**run** constant rather than
-/// a per-**worker** cost. At 8192x5464x3 this evaluates to ~383.3 MB (179.0
+/// Exactly one reference pyramid exists per run, not one per concurrent
+/// registration -- its term lives in [`bytes_shared_reference`], a
+/// per-**run** constant, not here. At 8192x5464x3 this evaluates to
+/// ~383.3 MB (179.0 + 179.0 + 25.2); at the 512x512x3 fixture, ~3.67 MB.
 /// + 179.0 + 25.2); at the 512x512x3 fixture, ~3.67 MB.
 pub fn bytes_per_registration(stack: StackContext, band_rows: u32) -> u64 {
     let plane = stack.width as u64 * stack.height as u64 * 4;
-    let pyramid = plane * 4 / 3;
     let assembler = plane;
     let copy = plane;
     let band = stack.width as u64 * band_rows as u64 * stack.samples_per_pixel as u64 * 2;
-    pyramid + assembler + copy + band
+    assembler + copy + band
 }
 
 /// The pure arithmetic behind the anchor arm's worker count: mirrors
@@ -190,11 +221,16 @@ pub fn bytes_per_registration(stack: StackContext, band_rows: u32) -> u64 {
 /// at 1 (never 0, so a budget smaller than one registration still makes
 /// progress), capped at `available_parallelism` -- plus one clamp the
 /// scheduler has no equivalent for: capped at `registrations`, the number of
-/// non-reference frames there are to register. A tile plan always has more
-/// tiles than workers; an 8-frame fixture on a 32-core host does not, and a
-/// pool of 32 threads for 7 registrations would report a limit no run could
-/// ever reach.
+/// non-reference frames there are to register.
+///
+/// `shared_bytes` (the run's one shared reference pyramid,
+/// [`bytes_shared_reference`]) is subtracted from `max_bytes_in_flight`
+/// **once**, before dividing by the per-worker `bytes_per_registration` --
+/// `saturating_sub`, so a budget smaller than the shared pyramid floors to
+/// one worker instead of underflowing.
+/// additive.
 fn workers_for_budget(
+    shared_bytes: u64,
     bytes_per_registration: u64,
     max_bytes_in_flight: usize,
     available_parallelism: usize,
@@ -202,10 +238,11 @@ fn workers_for_budget(
 ) -> usize {
     let available_parallelism = available_parallelism.max(1);
     let registrations = registrations.max(1);
+    let remaining = (max_bytes_in_flight as u64).saturating_sub(shared_bytes);
     let raw = if bytes_per_registration == 0 {
         available_parallelism as u64
     } else {
-        (max_bytes_in_flight as u64 / bytes_per_registration).max(1)
+        (remaining / bytes_per_registration).max(1)
     };
     raw.min(available_parallelism as u64)
         .min(registrations as u64) as usize
@@ -381,21 +418,33 @@ pub fn align_stack_with(
     let (worker_limit, peak_workers) = match policy {
         ReferencePolicy::Anchor => {
             let registrations = stack.frame_count.saturating_sub(1);
+            let shared_bytes = bytes_shared_reference(stack);
             let bytes = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
             let available_parallelism = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1);
             let workers = workers_for_budget(
+                shared_bytes,
                 bytes,
                 options.max_bytes_in_flight,
                 available_parallelism,
                 registrations,
             );
 
+            // One `AlignContext` per run, built once before the branch --
+            // `prepare_run` is called exactly here, at most once per run,
+            // only in the anchor arm, so both sub-arms below share the same
+            // prepared reference pyramid from this single line. The `Arc`
+            // binding lives in this stack frame and is dropped when this
+            // function returns: that is the whole lifetime story for "the
+            // cache is scoped to one run", see the module docs.
+            let ctx = AlignContext::new(stack, reference, reader);
+            let prepared = algorithm.prepare_run(&ctx, cfg)?;
+            let ctx = ctx.with_prepared(prepared.as_deref());
+
             if workers <= 1 {
                 // Today's loop, verbatim: no pool is built at all, and this
                 // is the byte-identity tests' reference side.
-                let ctx = AlignContext::new(stack, reference, reader);
                 for (i, slot) in frames.iter_mut().enumerate() {
                     if i == reference {
                         continue;
@@ -414,7 +463,6 @@ pub fn align_stack_with(
                         detail: format!("alignment thread pool: {source}"),
                     })?;
 
-                let ctx = AlignContext::new(stack, reference, reader);
                 let live = AtomicUsize::new(0);
                 let peak = AtomicUsize::new(0);
 
@@ -675,19 +723,21 @@ mod tests {
     fn worker_budget_arithmetic() {
         // The scheduler's own `budget_arithmetic_at_the_reference_scale`
         // shape: a plain division that floors, not yet clamped by anything.
-        let workers = workers_for_budget(100, 250, 32, 60);
+        // `shared_bytes = 0` is what proves the new parameter additive: the
+        // expected value is unchanged.
+        let workers = workers_for_budget(0, 100, 250, 32, 60);
         assert_eq!(workers, 2);
     }
 
     #[test]
     fn worker_budget_floors_at_one_never_zero() {
-        let workers = workers_for_budget(1_000_000, 1, 32, 60);
+        let workers = workers_for_budget(0, 1_000_000, 1, 32, 60);
         assert_eq!(workers, 1);
     }
 
     #[test]
     fn worker_budget_caps_at_available_parallelism() {
-        let workers = workers_for_budget(1, usize::MAX, 4, 60);
+        let workers = workers_for_budget(0, 1, usize::MAX, 4, 60);
         assert_eq!(workers, 4);
     }
 
@@ -696,13 +746,13 @@ mod tests {
         // The scheduler has no equivalent of this clamp: a tile plan always
         // outnumbers its workers, an 8-frame fixture on a 32-core host does
         // not.
-        let workers = workers_for_budget(1, usize::MAX, 32, 7);
+        let workers = workers_for_budget(0, 1, usize::MAX, 32, 7);
         assert_eq!(workers, 7);
     }
 
     #[test]
     fn worker_budget_zero_divisor_does_not_panic() {
-        let workers = workers_for_budget(0, 100, 8, 60);
+        let workers = workers_for_budget(0, 0, 100, 8, 60);
         assert_eq!(workers, 8);
     }
 
@@ -712,24 +762,44 @@ mod tests {
         // when neither clamp binds.
         let bytes = 1_000u64;
         let budget = 250_000usize;
-        let workers = workers_for_budget(bytes, budget, 1_000, 1_000);
+        let workers = workers_for_budget(0, bytes, budget, 1_000, 1_000);
         assert!(workers as u64 <= budget as u64 / bytes);
     }
 
     #[test]
-    fn worker_budget_at_the_reference_scale() {
-        // 2026-09-15)`: ~622 MB per registration, a 2 GiB shipped default,
-        // ~3 workers -- pinned with an explicit `available_parallelism` so
-        // this assertion never depends on the host.
+    fn worker_budget_accounts_for_the_shared_reference() {
+        // `workers_for_budget` subtracts `shared_bytes` once, up front, then
+        // divides the remainder by the per-worker figure -- never the other
+        // way around, and never per-worker.
+        let workers = workers_for_budget(100, 100, 300, 32, 60);
+        // remaining = 300 - 100 = 200; 200 / 100 = 2.
+        assert_eq!(workers, 2);
+    }
+
+    #[test]
+    fn the_split_sums_to_622_mb_at_the_reference_scale() {
+        // `bytes_shared_reference(stack) + bytes_per_registration(stack,
+        // DEFAULT_TILE_SIZE)` must equal the 622 MB total
+        // `crate::align::pyramid`'s module docs quote.
         let stack = StackContext::new(61, 8192, 5464, 3);
-        let bytes = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
-        let ratio = bytes as f64 / 622_000_000f64;
+        let sum = bytes_shared_reference(stack) + bytes_per_registration(stack, DEFAULT_TILE_SIZE);
+        let ratio = sum as f64 / 622_000_000f64;
         assert!(
             (ratio - 1.0).abs() < 0.01,
-            "bytes_per_registration {bytes} is not within 1% of 622 MB"
+            "bytes_shared_reference + bytes_per_registration = {sum} is not within 1% of 622 MB"
         );
-        let workers = workers_for_budget(bytes, DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT, 32, 60);
-        assert_eq!(workers, 3, "the decision's own ~3 workers figure");
+    }
+
+    #[test]
+    fn worker_budget_at_the_reference_scale() {
+        // Pinned with an explicit `available_parallelism` and registration
+        // count, so this assertion never depends on the host: the default
+        // budget yields 4 workers at the reference scale.
+        let stack = StackContext::new(61, 8192, 5464, 3);
+        let shared = bytes_shared_reference(stack);
+        let bytes = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
+        let workers = workers_for_budget(shared, bytes, DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT, 32, 60);
+        assert_eq!(workers, 4, "the decision's own 4-workers figure");
     }
 
     #[test]
@@ -750,22 +820,37 @@ mod tests {
             .map(|k| pyramid.level(k).data().len() as u64 * 4)
             .sum();
         let plane = width as u64 * height as u64 * 4;
-        // The assembler's own buffer plus `Plane::from_f32`'s copy of it.
+        // The assembler's own buffer plus `Plane::from_f32`'s copy of it --
+        // the frame-side figure `bytes_per_registration` owns.
         let assembler_and_copy = plane * 2;
         let band = width as u64 * DEFAULT_TILE_SIZE as u64 * spp as u64 * 2;
-        let floor = pyramid_bytes + assembler_and_copy + band;
+        let floor = assembler_and_copy + band;
 
         let stack = StackContext::new(8, width, height, spp);
         let bpr = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
 
         assert!(
             bpr >= floor,
-            "budget {bpr} must be >= the real pyramid+assembler+band figure {floor}"
+            "budget {bpr} must be >= the real assembler+copy+band figure {floor}"
         );
         let ratio = bpr as f64 / floor as f64;
         assert!(
             ratio <= 1.05,
             "budget {bpr} must be within 5% of the real figure {floor} (ratio {ratio})"
+        );
+
+        // `bytes_shared_reference` is the term that left: it must still be
+        // an upper bound on the real, once-per-run pyramid's own size.
+        let shared = bytes_shared_reference(stack);
+        assert!(
+            shared >= pyramid_bytes,
+            "bytes_shared_reference {shared} must be >= the real pyramid figure {pyramid_bytes}"
+        );
+        let shared_ratio = shared as f64 / pyramid_bytes as f64;
+        assert!(
+            shared_ratio <= 1.05,
+            "bytes_shared_reference {shared} must be within 5% of the real pyramid figure \
+             {pyramid_bytes} (ratio {shared_ratio})"
         );
     }
 }

@@ -392,7 +392,27 @@ impl PyramidalEcc {
             min_valid_fraction: MIN_VALID_FRACTION,
         };
 
-        let reference_pyramid = Self::build_pyramid(ctx, ctx.reference(), depth)?;
+        let stack = ctx.stack();
+        // Accept a driver-prepared reference pyramid only when it is the
+        // right thing: the right concrete type, built at the same
+        // `pyramid-depth`, at this stack's own dimensions. Any miss falls
+        // back to a rebuild, so a mismatch costs speed and never
+        // correctness -- see the module docs on `AlignContext::prepared`.
+        let prepared = ctx
+            .prepared()
+            .and_then(|p| p.downcast_ref::<AlignPyramid>())
+            .filter(|p| {
+                p.level_count() == depth as usize + 1
+                    && p.dimensions() == (stack.width, stack.height)
+            });
+        let built;
+        let reference_pyramid: &AlignPyramid = match prepared {
+            Some(shared) => shared,
+            None => {
+                built = Self::build_pyramid(ctx, ctx.reference(), depth)?;
+                &built
+            }
+        };
         let frame_pyramid = Self::build_pyramid(ctx, frame, depth)?;
 
         let up = Transform::similarity(2.0, 0.0, 0.0, 0.0);
@@ -499,6 +519,28 @@ impl AlignAlgorithm for PyramidalEcc {
         cfg: &ParamValues,
     ) -> Result<AlignOutcome, AlgorithmError> {
         self.run(ctx, frame, cfg, None)
+    }
+
+    /// Builds the reference frame's pyramid once, for the driver to hand
+    /// back to every [`AlignAlgorithm::align_frame`] call of this run
+    /// through [`AlignContext::prepared`]. Uses `build_pyramid`
+    /// unchanged -- the same call `run` itself falls back to when the
+    /// prepared value is missing or does not match.
+    fn prepare_run(
+        &self,
+        ctx: &AlignContext<'_>,
+        cfg: &ParamValues,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, AlgorithmError> {
+        crate::params::validate(self.params(), cfg)?;
+        let depth = cfg
+            .get("pyramid-depth")
+            .and_then(ParamValue::as_i64)
+            .ok_or_else(|| missing_key("pyramid-depth"))? as u32;
+        Ok(Some(Arc::new(Self::build_pyramid(
+            ctx,
+            ctx.reference(),
+            depth,
+        )?)))
     }
 }
 
