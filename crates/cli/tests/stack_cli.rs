@@ -4,6 +4,14 @@
 //! rejection path, the Z-Map switch, the report's fields and the
 //! library-versus-CLI agreement.
 //!
+//! Every test isolates `.scratch/` with its own per-process temp directory
+//! and `.current_dir(dir)`: `stack`'s scratch tree is cwd-relative, so
+//! concurrent test runs sharing one `target/` -- or two tests in the same
+//! run under cargo's default parallel execution -- must never share a
+//! working directory either. The working directory a spawned process runs
+//! in is never a directory a test also feeds in as input, names as `-o`, or
+//! enumerates; it holds only the test's own named children and `.scratch/`.
+//!
 //! Every rejection path below runs against `dummy-stack` (registered in this
 //! crate's test binary through `crates/cli/Cargo.toml`'s `[dev-dependencies]`
 //! feature, as `crates/cli/tests/algorithms_cmd.rs` documents) and costs
@@ -35,15 +43,45 @@ fn mantis_512_dir() -> PathBuf {
     common::fixtures_dir().join("mantis-512")
 }
 
-fn tmp_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
+/// A fresh, empty directory, removed again when the test that made it ends
+/// -- used as the spawned process's own working directory, so `.scratch/`
+/// lands here and never collides with another test's.
+///
+/// Derefs to `Path`, so `&dir` and `dir.join(..)` read exactly as they did
+/// when this was a bare `PathBuf`.
+struct TmpDir {
+    path: PathBuf,
 }
 
-fn tmp_dir(name: &str) -> PathBuf {
-    let dir = tmp_path(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+impl std::ops::Deref for TmpDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        // A failed test keeps its evidence -- the partials, the ledger and
+        // the outputs are exactly what a failure needs to be diagnosed.
+        if std::thread::panicking() {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// **Named per process, not just per test.** `CARGO_TARGET_TMPDIR` gives two
+/// concurrent `cargo test` runs the *same* path for the same test name, so
+/// `remove_dir_all` below could delete a concurrent run's live
+/// `.scratch/resume/` ledger -- reproduced 3 rounds out of 3 without the pid.
+fn tmp_dir(name: &str) -> TmpDir {
+    let path =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    TmpDir { path }
 }
 
 /// Both payloads of `project`, exported beside it as `<stem>-composite.tif`
@@ -52,17 +90,20 @@ fn tmp_dir(name: &str) -> PathBuf {
 /// `stack` writes a project, so every test that needs the *files* asks
 /// `export` for them. One invocation emits both, so the container is opened
 /// once.
-fn export_both(project: &Path) -> (PathBuf, PathBuf) {
+fn export_both(cwd: &Path, project: &Path) -> (PathBuf, PathBuf) {
     let composite = project.with_extension("composite.tif");
     let zmap = project.with_extension("zmap.tif");
-    let out = run_cli(&[
-        "export",
-        project.to_str().unwrap(),
-        "-o",
-        composite.to_str().unwrap(),
-        "--zmap",
-        zmap.to_str().unwrap(),
-    ]);
+    let out = run_cli_in(
+        cwd,
+        &[
+            "export",
+            project.to_str().unwrap(),
+            "-o",
+            composite.to_str().unwrap(),
+            "--zmap",
+            zmap.to_str().unwrap(),
+        ],
+    );
     assert!(out.success, "export stderr: {}", out.stderr);
     (composite, zmap)
 }
@@ -100,8 +141,12 @@ struct CliOutput {
     stderr: String,
 }
 
-fn run_cli(args: &[&str]) -> CliOutput {
-    let output = bin().args(args).output().expect("failed to run binary");
+fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
+    let output = bin()
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run binary");
     CliOutput {
         success: output.status.success(),
         code: output.status.code(),
@@ -125,20 +170,32 @@ struct SharedRun {
     output: PathBuf,
     zmap: PathBuf,
     report: serde_json::Value,
+    /// The run's own working directory, held alive for the process's
+    /// lifetime: `stacks_the_fixture_set` and
+    /// `cli_output_matches_the_library_result` read `output`/`zmap` long
+    /// after this function returns, so the directory must outlive the
+    /// `OnceLock` cell, not just the closure that fills it. The `OnceLock`
+    /// static is never dropped, so `TmpDir::drop`'s `remove_dir_all` never
+    /// runs for this one -- the same lifetime the un-isolated shared
+    /// directory already had.
+    #[allow(dead_code)]
+    _cwd: TmpDir,
 }
 
 fn shared_laplacian_run() -> &'static SharedRun {
     static ONCE: OnceLock<SharedRun> = OnceLock::new();
     ONCE.get_or_init(|| {
-        let dir = tmp_dir("stack_cli_shared_laplacian");
-        let project = dir.join("mantis-512.ffproj");
-        let output = dir.join("out.tif");
-        let zmap = dir.join("out-zmap.tif");
+        let cwd = tmp_dir("stack_cli_shared_laplacian");
+        let out_dir = cwd.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let project = out_dir.join("mantis-512.ffproj");
+        let output = out_dir.join("out.tif");
+        let zmap = out_dir.join("out-zmap.tif");
         let mut args = vec![
             "stack".to_string(),
             mantis_512_dir().to_str().unwrap().to_string(),
             "-o".to_string(),
-            dir.to_str().unwrap().to_string(),
+            out_dir.to_str().unwrap().to_string(),
             "--algo".to_string(),
             "laplacian".to_string(),
             "--json".to_string(),
@@ -155,7 +212,7 @@ fn shared_laplacian_run() -> &'static SharedRun {
             args.push("--no-gpu".to_string());
         }
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result = run_cli(&args);
+        let result = run_cli_in(&cwd, &args);
         assert!(
             result.success,
             "shared laplacian run must succeed -- stderr: {}",
@@ -167,14 +224,17 @@ fn shared_laplacian_run() -> &'static SharedRun {
         // One `export`, emitting both payloads from the one container the
         // run wrote. That is the whole migration: the bytes are the same,
         // they just come out one command later.
-        let exported = run_cli(&[
-            "export",
-            project.to_str().unwrap(),
-            "-o",
-            output.to_str().unwrap(),
-            "--zmap",
-            zmap.to_str().unwrap(),
-        ]);
+        let exported = run_cli_in(
+            &cwd,
+            &[
+                "export",
+                project.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--zmap",
+                zmap.to_str().unwrap(),
+            ],
+        );
         assert!(
             exported.success,
             "export must succeed -- stderr: {}",
@@ -185,6 +245,7 @@ fn shared_laplacian_run() -> &'static SharedRun {
             output,
             zmap,
             report,
+            _cwd: cwd,
         }
     })
 }
@@ -214,11 +275,14 @@ fn library_oracle() -> &'static OracleResult {
         let values = params::resolved_values(&resolved);
         let levels = algo.tile_levels(&values);
 
+        // This function spawns nothing, so `dir` need not outlive the
+        // closure: both TIFFs below are read into `Vec<u16>` before it
+        // returns, and `dir`'s own `Drop` then cleans up -- cleanup this
+        // scratch directory did not have before.
         let dir = tmp_dir("stack_cli_oracle");
         let composite_path = dir.join("oracle.tif");
         let zmap_path = dir.join("oracle-zmap.tif");
-        let mut options =
-            TileSchedulerOptions::explicit_budget(tmp_path("stack_cli_oracle_scratch"), 1 << 30);
+        let mut options = TileSchedulerOptions::explicit_budget(dir.join("scratch"), 1 << 30);
         options.tile_size = 512;
         options.levels = levels;
         let scheduler =
@@ -292,15 +356,20 @@ fn cli_output_matches_the_library_result() {
 #[test]
 fn unknown_algorithm_is_rejected_early() {
     let missing_dir = "/definitely/does/not/exist/xyz-stack-cli-unknown-algo";
-    let output = tmp_path("unknown_algorithm_is_rejected_early.tif");
-    let out = run_cli(&[
-        "stack",
-        missing_dir,
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "no-such-algorithm",
-    ]);
+    let cwd = tmp_dir("unknown_algorithm_is_rejected_early");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            missing_dir,
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "no-such-algorithm",
+        ],
+    );
     assert!(
         !out.success,
         "stdout: {} stderr: {}",
@@ -327,17 +396,22 @@ fn unknown_algorithm_is_rejected_early() {
 #[test]
 fn unknown_parameter_key_is_rejected() {
     let missing_dir = "/definitely/does/not/exist/xyz-stack-cli-unknown-key";
-    let output = tmp_path("unknown_parameter_key_is_rejected.tif");
-    let out = run_cli(&[
-        "stack",
-        missing_dir,
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--set",
-        "bogus=1",
-    ]);
+    let cwd = tmp_dir("unknown_parameter_key_is_rejected");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            missing_dir,
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--set",
+            "bogus=1",
+        ],
+    );
     assert!(
         !out.success,
         "stdout: {} stderr: {}",
@@ -355,18 +429,23 @@ fn unknown_parameter_key_is_rejected() {
 #[test]
 fn out_of_range_parameter_is_rejected() {
     let missing_dir = "/definitely/does/not/exist/xyz-stack-cli-out-of-range";
-    let output = tmp_path("out_of_range_parameter_is_rejected.tif");
-    let out = run_cli(&[
-        "stack",
-        missing_dir,
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "laplacian",
-        "--set",
-        "levels=999",
-        "--no-gpu",
-    ]);
+    let cwd = tmp_dir("out_of_range_parameter_is_rejected");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            missing_dir,
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--set",
+            "levels=999",
+            "--no-gpu",
+        ],
+    );
     assert!(
         !out.success,
         "stdout: {} stderr: {}",
@@ -385,23 +464,27 @@ fn out_of_range_parameter_is_rejected() {
 /// any tile is read.
 #[test]
 fn refuses_levels_the_tile_geometry_cannot_plan() {
-    let output = tmp_path("refuses_levels_the_tile_geometry_cannot_plan.tif");
-    let zmap = tmp_path("refuses_levels_the_tile_geometry_cannot_plan-zmap.tif");
-    let _ = std::fs::remove_file(&output);
-    let _ = std::fs::remove_file(&zmap);
-    let out = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "laplacian",
-        "--set",
-        "levels=7",
-        "--no-align",
-        "--no-crop",
-        "--no-gpu",
-    ]);
+    let cwd = tmp_dir("refuses_levels_the_tile_geometry_cannot_plan");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let output = out_dir.join("refuses_levels_the_tile_geometry_cannot_plan.tif");
+    let zmap = out_dir.join("refuses_levels_the_tile_geometry_cannot_plan-zmap.tif");
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--set",
+            "levels=7",
+            "--no-align",
+            "--no-crop",
+            "--no-gpu",
+        ],
+    );
     assert!(
         !out.success,
         "stdout: {} stderr: {}",
@@ -441,20 +524,25 @@ fn every_run_carries_a_zmap_and_writes_no_image() {
         "a project carries its own Z-Map, and `export --zmap` must produce it"
     );
 
-    let dir = tmp_dir("writes_the_zmap_on_request_off");
-    let output = dir.join("mantis-512.ffproj");
-    let out = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-    ]);
+    let cwd = tmp_dir("writes_the_zmap_on_request_off");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let output = out_dir.join("mantis-512.ffproj");
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+        ],
+    );
     assert!(out.success, "stderr: {}", out.stderr);
-    let mut entries: Vec<String> = std::fs::read_dir(&dir)
+    let mut entries: Vec<String> = std::fs::read_dir(&out_dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
@@ -464,7 +552,7 @@ fn every_run_carries_a_zmap_and_writes_no_image() {
         vec!["manifest.json".to_string(), "mantis-512.ffproj".to_string()],
         "one project and its run manifest, nothing else -- no image, no partial: {entries:?}"
     );
-    let (_, zmap) = export_both(&output);
+    let (_, zmap) = export_both(&cwd, &output);
     let (_, zw, zh, zspp) = read_whole(&zmap);
     assert_eq!(
         (zw, zh, zspp),
@@ -475,30 +563,39 @@ fn every_run_carries_a_zmap_and_writes_no_image() {
 
 #[test]
 fn refuses_empty_dir_and_unwritable_output() {
-    let empty_dir = tmp_dir("refuses_empty_dir_and_unwritable_output_empty");
-    let output_a = tmp_path("refuses_empty_dir_and_unwritable_output_a.tif");
-    let _ = std::fs::remove_file(&output_a);
-    let out = run_cli(&[
-        "stack",
-        empty_dir.to_str().unwrap(),
-        "-o",
-        output_a.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-    ]);
+    let cwd = tmp_dir("refuses_empty_dir_and_unwritable_output");
+    let empty_dir = cwd.join("empty");
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let output_a = out_dir.join("refuses_empty_dir_and_unwritable_output_a.tif");
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            empty_dir.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+        ],
+    );
     assert!(!out.success, "an empty directory must be refused");
     assert!(!output_a.exists());
 
     let missing_dir = "/definitely/does/not/exist/xyz-stack-cli-unwritable-output";
     let bad_output = PathBuf::from("/definitely/does/not/exist/xyz-output-parent/out.tif");
-    let out = run_cli(&[
-        "stack",
-        missing_dir,
-        "-o",
-        bad_output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-    ]);
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            missing_dir,
+            "-o",
+            bad_output.parent().unwrap().to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+        ],
+    );
     assert!(
         !out.success,
         "stdout: {} stderr: {}",
@@ -513,18 +610,22 @@ fn refuses_empty_dir_and_unwritable_output() {
 
 #[test]
 fn report_contains_every_field() {
-    let dir = tmp_dir("report_contains_every_field");
-    let output = dir.join("mantis-512.ffproj");
-    let out = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-    ]);
+    let cwd = tmp_dir("report_contains_every_field");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+        ],
+    );
     assert!(out.success, "stderr: {}", out.stderr);
     for needle in [
         "8 frames",
@@ -556,8 +657,12 @@ fn report_contains_every_field() {
 #[test]
 fn algo_is_required() {
     let missing_dir = "/definitely/does/not/exist/xyz-stack-cli-algo-required";
-    let output = tmp_path("algo_is_required.tif");
-    let out = run_cli(&["stack", missing_dir, "-o", output.to_str().unwrap()]);
+    let cwd = tmp_dir("algo_is_required");
+    let output = cwd.join("algo_is_required.tif");
+    let out = run_cli_in(
+        &cwd,
+        &["stack", missing_dir, "-o", output.to_str().unwrap()],
+    );
     assert!(
         !out.success,
         "stdout: {} stderr: {}",
@@ -580,19 +685,23 @@ fn algo_is_required() {
 
 #[test]
 fn report_json_has_every_field() {
-    let dir = tmp_dir("report_json_has_every_field");
-    let output = dir.join("mantis-512.ffproj");
-    let out = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--json",
-        "--no-align",
-        "--no-crop",
-    ]);
+    let cwd = tmp_dir("report_json_has_every_field");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--json",
+            "--no-align",
+            "--no-crop",
+        ],
+    );
     assert!(out.success, "stderr: {}", out.stderr);
     let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
     for key in [
@@ -639,21 +748,25 @@ fn report_json_has_every_field() {
 /// nothing for a real ECC solve.
 #[test]
 fn stage_timings_are_reported_for_every_entered_stage() {
-    let dir = tmp_dir("stage_timings_every_entered_stage");
-    let output = dir.join("mantis-512.ffproj");
-    let out = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--align-algo",
-        "dummy-align",
-        "--no-crop",
-        "--no-cache",
-        "--json",
-    ]);
+    let cwd = tmp_dir("stage_timings_every_entered_stage");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--align-algo",
+            "dummy-align",
+            "--no-crop",
+            "--no-cache",
+            "--json",
+        ],
+    );
     assert!(out.success, "stderr: {}", out.stderr);
     let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
     let stages = &report["stages"];
@@ -673,20 +786,23 @@ fn stage_timings_are_reported_for_every_entered_stage() {
         "a fresh alignment must report align_source=\"computed\": {report}"
     );
 
-    let human = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        tmp_dir("stage_timings_every_entered_stage_human")
-            .to_str()
-            .unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--align-algo",
-        "dummy-align",
-        "--no-crop",
-        "--no-cache",
-    ]);
+    let human_out_dir = cwd.join("out_human");
+    std::fs::create_dir_all(&human_out_dir).unwrap();
+    let human = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            human_out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--align-algo",
+            "dummy-align",
+            "--no-crop",
+            "--no-cache",
+        ],
+    );
     assert!(human.success, "stderr: {}", human.stderr);
     assert!(
         human.stdout.contains("stages:"),
@@ -702,10 +818,10 @@ fn stage_timings_are_reported_for_every_entered_stage() {
 
 #[test]
 fn max_host_memory_lowers_never_raises_and_does_not_move_pixels() {
-    let dir = tmp_dir("max_host_memory_ceiling");
-    let baseline_dir = dir.join("baseline");
-    let capped_dir = dir.join("capped");
-    let uncapped_dir = dir.join("uncapped");
+    let cwd = tmp_dir("max_host_memory_ceiling");
+    let baseline_dir = cwd.join("baseline");
+    let capped_dir = cwd.join("capped");
+    let uncapped_dir = cwd.join("uncapped");
     std::fs::create_dir_all(&baseline_dir).unwrap();
     std::fs::create_dir_all(&capped_dir).unwrap();
     std::fs::create_dir_all(&uncapped_dir).unwrap();
@@ -729,14 +845,14 @@ fn max_host_memory_lowers_never_raises_and_does_not_move_pixels() {
 
     let baseline_args = common_args(&baseline_dir);
     let baseline_args: Vec<&str> = baseline_args.iter().map(String::as_str).collect();
-    let baseline = run_cli(&baseline_args);
+    let baseline = run_cli_in(&cwd, &baseline_args);
     assert!(baseline.success, "stderr: {}", baseline.stderr);
 
     let mut capped_args = common_args(&capped_dir);
     capped_args.push("--max-host-memory".to_string());
     capped_args.push("4MiB".to_string());
     let capped_args: Vec<&str> = capped_args.iter().map(String::as_str).collect();
-    let capped = run_cli(&capped_args);
+    let capped = run_cli_in(&cwd, &capped_args);
     assert!(capped.success, "stderr: {}", capped.stderr);
     let capped_report: serde_json::Value =
         serde_json::from_str(&capped.stdout).expect("--json must parse");
@@ -747,7 +863,7 @@ fn max_host_memory_lowers_never_raises_and_does_not_move_pixels() {
     uncapped_args.push("--max-host-memory".to_string());
     uncapped_args.push("1TiB".to_string());
     let uncapped_args: Vec<&str> = uncapped_args.iter().map(String::as_str).collect();
-    let uncapped = run_cli(&uncapped_args);
+    let uncapped = run_cli_in(&cwd, &uncapped_args);
     assert!(uncapped.success, "stderr: {}", uncapped.stderr);
     let uncapped_report: serde_json::Value =
         serde_json::from_str(&uncapped.stdout).expect("--json must parse");
@@ -778,9 +894,9 @@ fn max_host_memory_lowers_never_raises_and_does_not_move_pixels() {
         "a 1TiB ceiling must not itself become the reported budget: {uncapped_bytes_in_flight}"
     );
 
-    let (baseline_composite, _) = export_both(&baseline_dir.join("mantis-512.ffproj"));
-    let (capped_composite, _) = export_both(&capped_dir.join("mantis-512.ffproj"));
-    let (uncapped_composite, _) = export_both(&uncapped_dir.join("mantis-512.ffproj"));
+    let (baseline_composite, _) = export_both(&cwd, &baseline_dir.join("mantis-512.ffproj"));
+    let (capped_composite, _) = export_both(&cwd, &capped_dir.join("mantis-512.ffproj"));
+    let (uncapped_composite, _) = export_both(&cwd, &uncapped_dir.join("mantis-512.ffproj"));
     let baseline_bytes = std::fs::read(&baseline_composite).expect("baseline output must exist");
     let capped_bytes = std::fs::read(&capped_composite).expect("capped output must exist");
     let uncapped_bytes = std::fs::read(&uncapped_composite).expect("uncapped output must exist");
@@ -799,20 +915,24 @@ fn max_host_memory_lowers_never_raises_and_does_not_move_pixels() {
 /// contiguous, disjoint, and share the run's own clock.
 #[test]
 fn stage_timings_account_for_the_wall_clock() {
-    let dir = tmp_dir("stage_timings_account_for_wall_clock");
-    let output = dir.join("mantis-512.ffproj");
-    let out = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--align-algo",
-        "dummy-align",
-        "--no-crop",
-        "--json",
-    ]);
+    let cwd = tmp_dir("stage_timings_account_for_wall_clock");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--align-algo",
+            "dummy-align",
+            "--no-crop",
+            "--json",
+        ],
+    );
     assert!(out.success, "stderr: {}", out.stderr);
     let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
     let stages = &report["stages"];
@@ -831,19 +951,23 @@ fn stage_timings_account_for_the_wall_clock() {
 /// `align_source` names the skip.
 #[test]
 fn stage_timings_mark_a_skipped_align_as_not_entered() {
-    let dir = tmp_dir("stage_timings_skipped_align");
-    let output = dir.join("mantis-512.ffproj");
-    let out = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-        "--json",
-    ]);
+    let cwd = tmp_dir("stage_timings_skipped_align");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--json",
+        ],
+    );
     assert!(out.success, "stderr: {}", out.stderr);
     let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
     assert_eq!(
@@ -862,21 +986,25 @@ fn stage_timings_mark_a_skipped_align_as_not_entered() {
 /// never earns a worker count it did not spend.
 #[test]
 fn align_worker_fields_follow_align_source() {
-    let dir = tmp_dir("align_worker_fields_follow_align_source");
-    let output = dir.join("mantis-512.ffproj");
-    let computed = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--align-algo",
-        "dummy-align",
-        "--no-crop",
-        "--no-cache",
-        "--json",
-    ]);
+    let cwd = tmp_dir("align_worker_fields_follow_align_source");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let computed = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--align-algo",
+            "dummy-align",
+            "--no-crop",
+            "--no-cache",
+            "--json",
+        ],
+    );
     assert!(computed.success, "stderr: {}", computed.stderr);
     let report: serde_json::Value = serde_json::from_str(&computed.stdout).expect("valid JSON");
     assert_eq!(report["align_source"], "computed");
@@ -887,19 +1015,22 @@ fn align_worker_fields_follow_align_source() {
         );
     }
 
-    let skipped = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        tmp_dir("align_worker_fields_follow_align_source_skipped")
-            .to_str()
-            .unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-        "--json",
-    ]);
+    let skipped_out_dir = cwd.join("out_skipped");
+    std::fs::create_dir_all(&skipped_out_dir).unwrap();
+    let skipped = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            skipped_out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--json",
+        ],
+    );
     assert!(skipped.success, "stderr: {}", skipped.stderr);
     let report: serde_json::Value = serde_json::from_str(&skipped.stdout).expect("valid JSON");
     assert_eq!(report["align_source"], "skipped");
@@ -916,9 +1047,9 @@ fn align_worker_fields_follow_align_source() {
 /// fixture and parameters produce byte-identical composites.
 #[test]
 fn stage_timings_do_not_change_the_output() {
-    let dir = tmp_dir("stage_timings_do_not_change_the_output");
-    let out_a = dir.join("a");
-    let out_b = dir.join("b");
+    let cwd = tmp_dir("stage_timings_do_not_change_the_output");
+    let out_a = cwd.join("a");
+    let out_b = cwd.join("b");
     for out in [&out_a, &out_b] {
         std::fs::create_dir_all(out).unwrap();
     }
@@ -937,13 +1068,13 @@ fn stage_timings_do_not_change_the_output() {
     };
     let a_args = args(&out_a);
     let b_args = args(&out_b);
-    let a = run_cli(&a_args.iter().map(String::as_str).collect::<Vec<_>>());
+    let a = run_cli_in(&cwd, &a_args.iter().map(String::as_str).collect::<Vec<_>>());
     assert!(a.success, "stderr: {}", a.stderr);
-    let b = run_cli(&b_args.iter().map(String::as_str).collect::<Vec<_>>());
+    let b = run_cli_in(&cwd, &b_args.iter().map(String::as_str).collect::<Vec<_>>());
     assert!(b.success, "stderr: {}", b.stderr);
 
-    let (a_composite, _) = export_both(&out_a.join("mantis-512.ffproj"));
-    let (b_composite, _) = export_both(&out_b.join("mantis-512.ffproj"));
+    let (a_composite, _) = export_both(&cwd, &out_a.join("mantis-512.ffproj"));
+    let (b_composite, _) = export_both(&cwd, &out_b.join("mantis-512.ffproj"));
     assert_eq!(
         std::fs::read(&a_composite).unwrap(),
         std::fs::read(&b_composite).unwrap(),
@@ -961,22 +1092,25 @@ fn stage_timings_do_not_change_the_output() {
 fn failed_seal_leaves_no_output() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tmp_dir("failed_seal_leaves_no_output");
-    let out_dir = dir.join("readonly");
+    let cwd = tmp_dir("failed_seal_leaves_no_output");
+    let out_dir = cwd.join("readonly");
     std::fs::create_dir_all(&out_dir).unwrap();
     let output = out_dir.join("mantis-512.ffproj");
     std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    let out = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-        "--no-align",
-        "--no-crop",
-    ]);
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+        ],
+    );
     // Restore before asserting, so a failed assertion still leaves a
     // removable directory behind.
     std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1000,23 +1134,32 @@ fn failed_seal_leaves_no_output() {
 #[test]
 fn refuses_a_non_uniform_frame_set() {
     let mantis_64 = common::fixtures_dir().join("mantis-64");
-    let dir = tmp_dir("refuses_a_non_uniform_frame_set");
-    std::fs::copy(mantis_64.join("reference.tif"), dir.join("reference.tif")).unwrap();
+    let cwd = tmp_dir("refuses_a_non_uniform_frame_set");
+    let frames = cwd.join("frames");
+    std::fs::create_dir_all(&frames).unwrap();
+    std::fs::copy(
+        mantis_64.join("reference.tif"),
+        frames.join("reference.tif"),
+    )
+    .unwrap();
     std::fs::copy(
         mantis_64.join("reference-MM-rps8.tif"),
-        dir.join("reference-MM-rps8.tif"),
+        frames.join("reference-MM-rps8.tif"),
     )
     .unwrap();
 
-    let output = dir.join("mantis-512.ffproj");
-    let out = run_cli(&[
-        "stack",
-        dir.to_str().unwrap(),
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-    ]);
+    let output = frames.join("mantis-512.ffproj");
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            frames.to_str().unwrap(),
+            "-o",
+            frames.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+        ],
+    );
     assert!(
         !out.success,
         "stdout: {} stderr: {}",
@@ -1039,42 +1182,48 @@ fn refuses_a_non_uniform_frame_set() {
 /// against the default middle anchor.
 #[test]
 fn stack_aligns_before_fusing() {
-    let dir = tmp_dir("stack_aligns_before_fusing");
-    let unaligned_dir = dir.join("unaligned");
-    let aligned_dir = dir.join("aligned");
+    let cwd = tmp_dir("stack_aligns_before_fusing");
+    let unaligned_dir = cwd.join("unaligned");
+    let aligned_dir = cwd.join("aligned");
     std::fs::create_dir_all(&unaligned_dir).unwrap();
     std::fs::create_dir_all(&aligned_dir).unwrap();
     let unaligned = unaligned_dir.join("mantis-512.ffproj");
     let aligned = aligned_dir.join("mantis-512.ffproj");
 
-    let out_a = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        unaligned.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "laplacian",
-        "--no-align",
-        "--no-crop",
-    ]);
+    let out_a = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            unaligned_dir.to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--no-align",
+            "--no-crop",
+        ],
+    );
     assert!(out_a.success, "stderr: {}", out_a.stderr);
 
-    let out_b = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        aligned.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "laplacian",
-        "--align-algo",
-        "pyramidal-ecc",
-        "--lax",
-        "--no-crop",
-    ]);
+    let out_b = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            aligned_dir.to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--align-algo",
+            "pyramidal-ecc",
+            "--lax",
+            "--no-crop",
+        ],
+    );
     assert!(out_b.success, "stderr: {}", out_b.stderr);
 
-    let (unaligned_composite, _) = export_both(&unaligned);
-    let (aligned_composite, _) = export_both(&aligned);
+    let (unaligned_composite, _) = export_both(&cwd, &unaligned);
+    let (aligned_composite, _) = export_both(&cwd, &aligned);
     let (unaligned_samples, ..) = read_whole(&unaligned_composite);
     let (aligned_samples, ..) = read_whole(&aligned_composite);
     assert_ne!(
@@ -1088,27 +1237,32 @@ fn stack_aligns_before_fusing() {
 /// matches what `align --json` reports for the same stack.
 #[test]
 fn stack_output_carries_the_auto_crop() {
-    let dir = tmp_dir("stack_output_carries_the_auto_crop");
-    let project = dir.join("mantis-512.ffproj");
-    let out = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        dir.to_str().unwrap(),
-        "--algo",
-        "laplacian",
-        "--align-algo",
-        "pyramidal-ecc",
-        "--lax",
-        "--json",
-    ]);
+    let cwd = tmp_dir("stack_output_carries_the_auto_crop");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let project = out_dir.join("mantis-512.ffproj");
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--align-algo",
+            "pyramidal-ecc",
+            "--lax",
+            "--json",
+        ],
+    );
     assert!(out.success, "stderr: {}", out.stderr);
     let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
     let crop = report["crop"]
         .as_object()
         .expect("crop object present when aligned");
 
-    let (output, zmap) = export_both(&project);
+    let (output, zmap) = export_both(&cwd, &project);
     let (_, cw, ch, _) = read_whole(&output);
     assert_eq!(cw as u64, crop["width"].as_u64().unwrap());
     assert_eq!(ch as u64, crop["height"].as_u64().unwrap());
@@ -1120,14 +1274,17 @@ fn stack_output_carries_the_auto_crop() {
         "the Z-Map must be declared at the crop rect's dimensions too"
     );
 
-    let align_out = run_cli(&[
-        "align",
-        mantis_512_dir().to_str().unwrap(),
-        "--algo",
-        "pyramidal-ecc",
-        "--lax",
-        "--json",
-    ]);
+    let align_out = run_cli_in(
+        &cwd,
+        &[
+            "align",
+            mantis_512_dir().to_str().unwrap(),
+            "--algo",
+            "pyramidal-ecc",
+            "--lax",
+            "--json",
+        ],
+    );
     assert!(align_out.success, "stderr: {}", align_out.stderr);
     let align_report: serde_json::Value =
         serde_json::from_str(&align_out.stdout).expect("valid JSON");
@@ -1146,16 +1303,20 @@ fn stack_output_carries_the_auto_crop() {
 /// input check stays in `run_group` as the defensive backstop it now is.
 #[test]
 fn refuses_an_output_path_that_is_an_existing_file() {
+    let cwd = tmp_dir("refuses_an_output_path_that_is_an_existing_file");
     let frame = mantis_512_dir().join("frames").join("00.tif");
 
-    let out = run_cli(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        frame.to_str().unwrap(),
-        "--algo",
-        "dummy-stack",
-    ]);
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            frame.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+        ],
+    );
     assert!(
         !out.success,
         "stdout: {} stderr: {}",
