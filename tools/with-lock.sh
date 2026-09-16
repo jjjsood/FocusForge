@@ -7,7 +7,13 @@
 # command you are about to type by hand, so it serializes against other
 # builds and GPU runs on this machine.
 #
-# Exit code: the wrapped command's own, or 2 on a usage error.
+# Never wrap a script that already takes this lock itself (check-all.sh does,
+# per gate) -- the outer call would hold the lock for the whole run while the
+# inner one waits on it forever. `with_lock` refuses that shape immediately;
+# FF_LOCK_TIMEOUT (default 1800s) bounds every other wait.
+#
+# Exit code: the wrapped command's own, or 2 on a usage error, 3 refusing a
+# self-deadlock, 4 on a timed-out wait for the lock.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
