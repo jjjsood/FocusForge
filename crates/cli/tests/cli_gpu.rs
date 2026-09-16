@@ -12,6 +12,15 @@
 //! Each test here loads the GPU (through the spawned process) and is meant
 //! to be run deliberately, alongside the other `--features gpu-tests`
 //! runs, not as part of a routine `cargo test` invocation.
+//!
+//! Every spawn isolates `.scratch/` with its own per-process temp directory
+//! and `.current_dir(cwd)`, exactly `crates/cli/tests/job_cli.rs`'s idiom,
+//! and each test's cwd is separate from the directory it points
+//! `-o`/`--write-warped` at and from any directory it enumerates.
+//! Every `stack` run in this file points `-o` at its own freshly created
+//! directory (`out_dir`), never one shared with another run in the same
+//! test, and a test that needs pixel bytes asks `export` for them
+//! (`export_composite`) rather than reading a file `stack` no longer writes.
 
 #![cfg(feature = "gpu-tests")]
 
@@ -61,21 +70,18 @@ fn max_abs_diff(a: &[u16], b: &[u16]) -> i32 {
         .unwrap_or(0)
 }
 
-fn tmp_dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 struct CliOutput {
     success: bool,
     stdout: String,
     stderr: String,
 }
 
-fn run(args: &[&str]) -> CliOutput {
-    let output = bin().args(args).output().expect("failed to run binary");
+fn run(dir: &Path, args: &[&str]) -> CliOutput {
+    let output = bin()
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run binary");
     CliOutput {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -104,9 +110,9 @@ fn max_vram_stack_args(output: &Path, extra: &[&str]) -> Vec<String> {
 }
 
 /// `run`, taking the owned `Vec<String>` `max_vram_stack_args` builds.
-fn run_owned(args: &[String]) -> CliOutput {
+fn run_owned(dir: &Path, args: &[String]) -> CliOutput {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run(&refs)
+    run(dir, &refs)
 }
 
 /// A `stack` run against an absent WGPU backend (`dx12` does not exist on
@@ -115,13 +121,14 @@ fn run_owned(args: &[String]) -> CliOutput {
 /// genuinely lacks a GPU. Only meaningful on Linux: a non-Linux host prints
 /// a skip instead of asserting a different platform's `WGPU_BACKEND`
 /// vocabulary.
-fn run_with_no_adapter(args: &[&str]) -> Option<CliOutput> {
+fn run_with_no_adapter(dir: &Path, args: &[&str]) -> Option<CliOutput> {
     if !cfg!(target_os = "linux") {
         println!("SKIP: WGPU_BACKEND=dx12 only names an absent backend on Linux");
         return None;
     }
     let output = bin()
         .args(args)
+        .current_dir(dir)
         .env("WGPU_BACKEND", "dx12")
         .output()
         .expect("failed to run binary");
@@ -144,27 +151,31 @@ fn stack_gpu_matches_stack_no_gpu() {
     /// alignment can flip a near-tied Laplacian-selection winner between GPU
     /// and CPU, and the runner-up can differ by hundreds of LSB.
     const STACK_TOLERANCE: i32 = 512;
-    let dir = tmp_dir("cli_gpu_stack_matches");
+    let cwd = common::tmp_dir("cli_gpu_stack_matches_cwd");
+    let dir = common::tmp_dir("cli_gpu_stack_matches");
     let gpu_out = dir.join("gpu.tif");
     let cpu_out = dir.join("cpu.tif");
 
-    let gpu = run(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        gpu_out.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "laplacian",
-        // Disambiguates the alignment algorithm: this test binary's
-        // dev-dependency enables `focusforge-core`'s `test-algorithms`
-        // feature, which registers `dummy-align` alongside the real
-        // `pyramidal-ecc` -- the same reason `stack_cli.rs`/`align_cli.rs`
-        // always pass one of `--align-algo`/`--no-align` explicitly.
-        "--align-algo",
-        "pyramidal-ecc",
-        "--lax",
-        "--json",
-    ]);
+    let gpu = run(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            gpu_out.parent().unwrap().to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            // Disambiguates the alignment algorithm: this test binary's
+            // dev-dependency enables `focusforge-core`'s `test-algorithms`
+            // feature, which registers `dummy-align` alongside the real
+            // `pyramidal-ecc` -- the same reason `stack_cli.rs`/`align_cli.rs`
+            // always pass one of `--align-algo`/`--no-align` explicitly.
+            "--align-algo",
+            "pyramidal-ecc",
+            "--lax",
+            "--json",
+        ],
+    );
     assert!(
         gpu.success,
         "gpu run must succeed -- stderr: {}",
@@ -177,19 +188,22 @@ fn stack_gpu_matches_stack_no_gpu() {
         "a usable adapter must select the GPU path with no flag: {gpu_report}"
     );
 
-    let cpu = run(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        cpu_out.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "laplacian",
-        "--align-algo",
-        "pyramidal-ecc",
-        "--lax",
-        "--json",
-        "--no-gpu",
-    ]);
+    let cpu = run(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            cpu_out.parent().unwrap().to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--align-algo",
+            "pyramidal-ecc",
+            "--lax",
+            "--json",
+            "--no-gpu",
+        ],
+    );
     assert!(
         cpu.success,
         "cpu run must succeed -- stderr: {}",
@@ -224,47 +238,54 @@ fn stack_gpu_matches_stack_no_gpu() {
 #[test]
 fn align_write_warped_gpu_matches_no_gpu() {
     const WARP_TOLERANCE: i32 = 1;
-    let gpu_dir = tmp_dir("cli_gpu_align_warped_gpu");
-    let cpu_dir = tmp_dir("cli_gpu_align_warped_cpu");
+    let cwd = common::tmp_dir("cli_gpu_align_warped_cwd");
+    let gpu_dir = common::tmp_dir("cli_gpu_align_warped_gpu");
+    let cpu_dir = common::tmp_dir("cli_gpu_align_warped_cpu");
 
-    let gpu = run(&[
-        "align",
-        mantis_512_dir().to_str().unwrap(),
-        // Disambiguates the alignment algorithm -- see the comment on
-        // `stack_gpu_matches_stack_no_gpu`'s own `--align-algo`.
-        "--algo",
-        "pyramidal-ecc",
-        "--lax",
-        "--write-warped",
-        gpu_dir.to_str().unwrap(),
-    ]);
+    let gpu = run(
+        &cwd,
+        &[
+            "align",
+            mantis_512_dir().to_str().unwrap(),
+            // Disambiguates the alignment algorithm -- see the comment on
+            // `stack_gpu_matches_stack_no_gpu`'s own `--align-algo`.
+            "--algo",
+            "pyramidal-ecc",
+            "--lax",
+            "--write-warped",
+            gpu_dir.to_str().unwrap(),
+        ],
+    );
     assert!(
         gpu.success,
         "gpu align must succeed -- stderr: {}",
         gpu.stderr
     );
 
-    let cpu = run(&[
-        "align",
-        mantis_512_dir().to_str().unwrap(),
-        "--algo",
-        "pyramidal-ecc",
-        "--lax",
-        "--write-warped",
-        cpu_dir.to_str().unwrap(),
-        "--no-gpu",
-    ]);
+    let cpu = run(
+        &cwd,
+        &[
+            "align",
+            mantis_512_dir().to_str().unwrap(),
+            "--algo",
+            "pyramidal-ecc",
+            "--lax",
+            "--write-warped",
+            cpu_dir.to_str().unwrap(),
+            "--no-gpu",
+        ],
+    );
     assert!(
         cpu.success,
         "cpu align must succeed -- stderr: {}",
         cpu.stderr
     );
 
-    let mut gpu_entries: Vec<_> = std::fs::read_dir(&gpu_dir)
+    let mut gpu_entries: Vec<_> = std::fs::read_dir(&*gpu_dir)
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    let mut cpu_entries: Vec<_> = std::fs::read_dir(&cpu_dir)
+    let mut cpu_entries: Vec<_> = std::fs::read_dir(&*cpu_dir)
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
@@ -297,20 +318,24 @@ fn align_write_warped_gpu_matches_no_gpu() {
 /// still exits 0 with a correct result.
 #[test]
 fn auto_falls_back_without_adapter() {
-    let dir = tmp_dir("cli_gpu_auto_falls_back");
+    let cwd = common::tmp_dir("cli_gpu_auto_falls_back_cwd");
+    let dir = common::tmp_dir("cli_gpu_auto_falls_back");
     let output = dir.join("mantis-512.ffproj");
-    let Some(result) = run_with_no_adapter(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "laplacian",
-        "--align-algo",
-        "pyramidal-ecc",
-        "--lax",
-        "--json",
-    ]) else {
+    let Some(result) = run_with_no_adapter(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            output.parent().unwrap().to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--align-algo",
+            "pyramidal-ecc",
+            "--lax",
+            "--json",
+        ],
+    ) else {
         return;
     };
     assert!(
@@ -338,20 +363,24 @@ fn auto_falls_back_without_adapter() {
 /// usable adapter must have printed a message about it.
 #[test]
 fn fallback_emits_a_message() {
-    let dir = tmp_dir("cli_gpu_fallback_emits_a_message");
+    let cwd = common::tmp_dir("cli_gpu_fallback_emits_a_message_cwd");
+    let dir = common::tmp_dir("cli_gpu_fallback_emits_a_message");
     let output = dir.join("mantis-512.ffproj");
-    let Some(result) = run_with_no_adapter(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "laplacian",
-        "--align-algo",
-        "pyramidal-ecc",
-        "--lax",
-        "--json",
-    ]) else {
+    let Some(result) = run_with_no_adapter(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            output.parent().unwrap().to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--align-algo",
+            "pyramidal-ecc",
+            "--lax",
+            "--json",
+        ],
+    ) else {
         return;
     };
     assert!(result.success, "stderr: {}", result.stderr);
@@ -365,21 +394,25 @@ fn fallback_emits_a_message() {
 /// never even attempts (let alone reports) adapter selection.
 #[test]
 fn no_gpu_flag_forces_cpu_even_with_adapter() {
-    let dir = tmp_dir("cli_gpu_no_gpu_forces_cpu");
+    let cwd = common::tmp_dir("cli_gpu_no_gpu_forces_cpu_cwd");
+    let dir = common::tmp_dir("cli_gpu_no_gpu_forces_cpu");
     let output = dir.join("mantis-512.ffproj");
-    let result = run(&[
-        "stack",
-        mantis_512_dir().to_str().unwrap(),
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algo",
-        "laplacian",
-        "--align-algo",
-        "pyramidal-ecc",
-        "--lax",
-        "--json",
-        "--no-gpu",
-    ]);
+    let result = run(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            output.parent().unwrap().to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--align-algo",
+            "pyramidal-ecc",
+            "--lax",
+            "--json",
+            "--no-gpu",
+        ],
+    );
     assert!(result.success, "stderr: {}", result.stderr);
     let report: serde_json::Value =
         serde_json::from_str(&result.stdout).expect("--json must parse");
@@ -403,10 +436,11 @@ fn no_gpu_flag_forces_cpu_even_with_adapter() {
 /// CPU path.
 #[test]
 fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
-    let dir = tmp_dir("cli_gpu_max_vram");
+    let cwd = common::tmp_dir("cli_gpu_max_vram_cwd");
+    let dir = common::tmp_dir("cli_gpu_max_vram");
 
     let probed_out = dir.join("probed.tif");
-    let probed = run_owned(&max_vram_stack_args(&probed_out, &[]));
+    let probed = run_owned(&cwd, &max_vram_stack_args(&probed_out, &[]));
     assert!(probed.success, "stderr: {}", probed.stderr);
     let probed_report: serde_json::Value =
         serde_json::from_str(&probed.stdout).expect("--json must parse");
@@ -430,7 +464,10 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
         "fixture assumption: probed budget ({probed_bytes}) must exceed the 256MiB ceiling used below"
     );
     let low_out = dir.join("low.tif");
-    let low = run_owned(&max_vram_stack_args(&low_out, &["--max-vram", "256MiB"]));
+    let low = run_owned(
+        &cwd,
+        &max_vram_stack_args(&low_out, &["--max-vram", "256MiB"]),
+    );
     assert!(low.success, "stderr: {}", low.stderr);
     let low_report: serde_json::Value =
         serde_json::from_str(&low.stdout).expect("--json must parse");
@@ -445,7 +482,10 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
 
     // A ceiling above the probed value changes nothing, provenance included.
     let high_out = dir.join("high.tif");
-    let high = run_owned(&max_vram_stack_args(&high_out, &["--max-vram", "64GiB"]));
+    let high = run_owned(
+        &cwd,
+        &max_vram_stack_args(&high_out, &["--max-vram", "64GiB"]),
+    );
     assert!(high.success, "stderr: {}", high.stderr);
     let high_report: serde_json::Value =
         serde_json::from_str(&high.stdout).expect("--json must parse");
@@ -460,7 +500,7 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
 
     // CPU path: both fields null.
     let cpu_out = dir.join("cpu.tif");
-    let cpu = run_owned(&max_vram_stack_args(&cpu_out, &["--no-gpu"]));
+    let cpu = run_owned(&cwd, &max_vram_stack_args(&cpu_out, &["--no-gpu"]));
     assert!(cpu.success, "stderr: {}", cpu.stderr);
     let cpu_report: serde_json::Value =
         serde_json::from_str(&cpu.stdout).expect("--json must parse");
@@ -481,11 +521,12 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
 /// count, which `--max-vram` cannot move. `null` on the CPU path.
 #[test]
 fn device_peak_in_flight_is_the_device_gates_own_high_water() {
-    let dir = tmp_dir("cli_gpu_device_peak_in_flight");
+    let cwd = common::tmp_dir("cli_gpu_device_peak_in_flight_cwd");
+    let dir = common::tmp_dir("cli_gpu_device_peak_in_flight");
 
     // Uncapped GPU run.
     let uncapped_out = dir.join("uncapped.tif");
-    let uncapped = run_owned(&max_vram_stack_args(&uncapped_out, &[]));
+    let uncapped = run_owned(&cwd, &max_vram_stack_args(&uncapped_out, &[]));
     assert!(uncapped.success, "stderr: {}", uncapped.stderr);
     let uncapped_report: serde_json::Value =
         serde_json::from_str(&uncapped.stdout).expect("--json must parse");
@@ -509,7 +550,10 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
     // machine, without touching the host-side `in_flight_limit` (one
     // tile's device footprint on this fixture is 254 661 632 bytes).
     let capped_out = dir.join("capped.tif");
-    let capped = run_owned(&max_vram_stack_args(&capped_out, &["--max-vram", "1MiB"]));
+    let capped = run_owned(
+        &cwd,
+        &max_vram_stack_args(&capped_out, &["--max-vram", "1MiB"]),
+    );
     assert!(capped.success, "stderr: {}", capped.stderr);
     let capped_report: serde_json::Value =
         serde_json::from_str(&capped.stdout).expect("--json must parse");
@@ -524,7 +568,7 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
 
     // `--no-gpu`: the field is null.
     let cpu_out = dir.join("cpu.tif");
-    let cpu = run_owned(&max_vram_stack_args(&cpu_out, &["--no-gpu"]));
+    let cpu = run_owned(&cwd, &max_vram_stack_args(&cpu_out, &["--no-gpu"]));
     assert!(cpu.success, "stderr: {}", cpu.stderr);
     let cpu_report: serde_json::Value =
         serde_json::from_str(&cpu.stdout).expect("--json must parse");

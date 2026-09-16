@@ -14,6 +14,11 @@
 //! project directly through `focusforge_core::project::seal` with
 //! hand-picked `Metrics`, which is cheaper still and gives exact control
 //! over the numbers a test needs to assert on.
+//!
+//! Every test isolates `.scratch/` with its own per-process temp directory
+//! and `.current_dir(dir)`, since parallel tests must never share a
+//! directory. `review` writes no scratch state, so most tests share the
+//! project `seal_project` built; only `review_writes_nothing` needs its own.
 
 mod common;
 
@@ -44,9 +49,10 @@ fn snapshot_bin(dir: &Path) -> PathBuf {
     dst
 }
 
-fn run_bin(path: &Path, args: &[&str]) -> CliOutput {
+fn run_bin(dir: &Path, path: &Path, args: &[&str]) -> CliOutput {
     let output = Command::new(path)
         .args(args)
+        .current_dir(dir)
         .output()
         .expect("failed to run binary");
     CliOutput {
@@ -57,13 +63,6 @@ fn run_bin(path: &Path, args: &[&str]) -> CliOutput {
     }
 }
 
-fn tmp_dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 struct CliOutput {
     success: bool,
     code: Option<i32>,
@@ -71,8 +70,12 @@ struct CliOutput {
     stderr: String,
 }
 
-fn run_cli(args: &[&str]) -> CliOutput {
-    let output = bin().args(args).output().expect("failed to run binary");
+fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
+    let output = bin()
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run binary");
     CliOutput {
         success: output.status.success(),
         code: output.status.code(),
@@ -90,6 +93,13 @@ fn mantis_512_dir() -> PathBuf {
 /// every test that needs a genuinely measured sharpness ratio and Z-Map
 /// spread.
 struct SharedRun {
+    /// The run's own working directory, held alive for the process's
+    /// lifetime: every test that reads [`SharedRun::out`] does so long after
+    /// this struct's builder closure returns, so the directory must outlive
+    /// the `OnceLock` cell, not just that closure. The `OnceLock` static is
+    /// never dropped, so `common::TmpDir::drop`'s `remove_dir_all` never
+    /// runs for this one.
+    cwd: common::TmpDir,
     /// The `-o` directory, also `review`'s target.
     out: PathBuf,
 }
@@ -97,7 +107,9 @@ struct SharedRun {
 fn shared_laplacian_run() -> &'static SharedRun {
     static ONCE: OnceLock<SharedRun> = OnceLock::new();
     ONCE.get_or_init(|| {
-        let out = tmp_dir("review_cli_shared_laplacian");
+        let cwd = common::tmp_dir("review_cli_shared_laplacian");
+        let out = cwd.join("out");
+        std::fs::create_dir_all(&out).unwrap();
         let mut args = vec![
             "stack".to_string(),
             mantis_512_dir().to_str().unwrap().to_string(),
@@ -112,13 +124,13 @@ fn shared_laplacian_run() -> &'static SharedRun {
             args.push("--no-gpu".to_string());
         }
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result = run_cli(&args);
+        let result = run_cli_in(&cwd, &args);
         assert!(
             result.success,
             "shared laplacian run must succeed -- stderr: {}",
             result.stderr
         );
-        SharedRun { out }
+        SharedRun { cwd, out }
     })
 }
 
@@ -129,7 +141,7 @@ fn shared_review_document() -> &'static serde_json::Value {
     static ONCE: OnceLock<serde_json::Value> = OnceLock::new();
     ONCE.get_or_init(|| {
         let run = shared_laplacian_run();
-        let result = run_cli(&["review", run.out.to_str().unwrap(), "--json"]);
+        let result = run_cli_in(&run.cwd, &["review", run.out.to_str().unwrap(), "--json"]);
         assert!(result.success, "stderr: {}", result.stderr);
         serde_json::from_str(&result.stdout).expect("review --json must parse")
     })
@@ -144,8 +156,8 @@ fn frame(dir: &Path, name: &str, when: Option<&str>) {
 
 /// Three subjects, twenty minutes apart -- three groups on the capture-time
 /// signal alone.
-fn three_group_dump(name: &str) -> PathBuf {
-    let dir = tmp_dir(name);
+fn three_group_dump(name: &str) -> common::TmpDir {
+    let dir = common::tmp_dir(name);
     for (file, when) in [
         ("IMG_9801.tif", "2026:08:29 18:42:41"),
         ("IMG_9802.tif", "2026:08:29 18:42:42"),
@@ -254,8 +266,8 @@ fn seal_project(
     metrics: Metrics,
     frame_count: u32,
     single_source: Option<u16>,
-) -> (PathBuf, PathBuf) {
-    let dir = tmp_dir(dir_name);
+) -> (common::TmpDir, PathBuf) {
+    let dir = common::tmp_dir(dir_name);
     let staging = dir.join("staging");
     let (composite, zmap) = stage_planes(&staging, frame_count, single_source);
     let sources = write_sources(&dir, frame_count.max(1) as usize);
@@ -341,10 +353,10 @@ fn snapshot(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
 
 #[test]
 fn review_of_a_frame_directory_refuses_and_names_stack() {
-    let dir = tmp_dir("review_cli_frame_dir");
+    let dir = common::tmp_dir("review_cli_frame_dir");
     frame(&dir, "IMG_0001.tif", None);
     frame(&dir, "IMG_0002.tif", None);
-    let result = run_cli(&["review", dir.to_str().unwrap()]);
+    let result = run_cli_in(&dir, &["review", dir.to_str().unwrap()]);
     assert!(!result.success, "a bare frame directory must be refused");
     assert_eq!(result.code, Some(1));
     assert!(
@@ -362,14 +374,15 @@ fn review_of_a_frame_directory_refuses_and_names_stack() {
 #[test]
 fn review_emits_one_record_per_manifest_entry() {
     let dump = three_group_dump("review_cli_three_groups");
-    let out = tmp_dir("review_cli_three_groups_out");
-    let result = run_cli(&dummy_stack_args(
-        dump.to_str().unwrap(),
-        out.to_str().unwrap(),
-    ));
+    let out = common::tmp_dir("review_cli_three_groups_out");
+    let cwd = common::tmp_dir("review_cli_three_groups_cwd");
+    let result = run_cli_in(
+        &cwd,
+        &dummy_stack_args(dump.to_str().unwrap(), out.to_str().unwrap()),
+    );
     assert!(result.success, "stderr: {}", result.stderr);
 
-    let review = run_cli(&["review", out.to_str().unwrap(), "--json"]);
+    let review = run_cli_in(&cwd, &["review", out.to_str().unwrap(), "--json"]);
     assert!(review.success, "stderr: {}", review.stderr);
     let doc: serde_json::Value = serde_json::from_str(&review.stdout).unwrap();
     let results = doc["results"].as_array().unwrap();
@@ -381,7 +394,7 @@ fn review_emits_one_record_per_manifest_entry() {
 
 #[test]
 fn review_reports_a_failed_group_as_a_failed_record() {
-    let dump = tmp_dir("review_cli_failing_group");
+    let dump = common::tmp_dir("review_cli_failing_group");
     for (file, when) in [
         ("IMG_9801.tif", "2026:08:29 18:42:41"),
         ("IMG_9802.tif", "2026:08:29 18:42:42"),
@@ -405,14 +418,15 @@ fn review_reports_a_failed_group_as_a_failed_record() {
     )
     .unwrap();
 
-    let out = tmp_dir("review_cli_failing_group_out");
-    let result = run_cli(&dummy_stack_args(
-        dump.to_str().unwrap(),
-        out.to_str().unwrap(),
-    ));
+    let out = common::tmp_dir("review_cli_failing_group_out");
+    let cwd = common::tmp_dir("review_cli_failing_group_cwd");
+    let result = run_cli_in(
+        &cwd,
+        &dummy_stack_args(dump.to_str().unwrap(), out.to_str().unwrap()),
+    );
     assert!(!result.success, "one group failed, so the run exits 1");
 
-    let review = run_cli(&["review", out.to_str().unwrap(), "--json"]);
+    let review = run_cli_in(&cwd, &["review", out.to_str().unwrap(), "--json"]);
     assert!(
         review.success,
         "review itself must exit 0 even when a reviewed run failed: {}",
@@ -438,7 +452,7 @@ fn review_reports_a_failed_group_as_a_failed_record() {
             .as_str()
             .is_some_and(|r| !r.is_empty())
     );
-    let text = run_cli(&["review", out.to_str().unwrap()]).stdout;
+    let text = run_cli_in(&cwd, &["review", out.to_str().unwrap()]).stdout;
     assert!(
         !text.contains("sharpness=0 ") && !text.contains("coherence=0.0000"),
         "the table must never render an absent metric as a zero: {text}"
@@ -460,7 +474,7 @@ fn a_completed_but_unmeasured_result_reports_a_metrics_reason() {
         )],
     );
 
-    let review = run_cli(&["review", dir.to_str().unwrap(), "--json"]);
+    let review = run_cli_in(&dir, &["review", dir.to_str().unwrap(), "--json"]);
     assert!(review.success, "stderr: {}", review.stderr);
     let doc: serde_json::Value = serde_json::from_str(&review.stdout).unwrap();
     let results = doc["results"].as_array().unwrap();
@@ -525,8 +539,8 @@ fn review_values_do_not_depend_on_the_directory_name() {
         )],
     );
 
-    let review_a = run_cli(&["review", dir_a.to_str().unwrap(), "--json"]);
-    let review_b = run_cli(&["review", dir_b.to_str().unwrap(), "--json"]);
+    let review_a = run_cli_in(&dir_a, &["review", dir_a.to_str().unwrap(), "--json"]);
+    let review_b = run_cli_in(&dir_b, &["review", dir_b.to_str().unwrap(), "--json"]);
     assert!(review_a.success && review_b.success);
     let doc_a: serde_json::Value = serde_json::from_str(&review_a.stdout).unwrap();
     let doc_b: serde_json::Value = serde_json::from_str(&review_b.stdout).unwrap();
@@ -565,7 +579,7 @@ fn a_degenerate_stack_scores_lower_on_sharpness_and_narrower_on_spread() {
             None,
         )],
     );
-    let review = run_cli(&["review", dir.to_str().unwrap(), "--json"]);
+    let review = run_cli_in(&dir, &["review", dir.to_str().unwrap(), "--json"]);
     assert!(review.success, "stderr: {}", review.stderr);
     let doc: serde_json::Value = serde_json::from_str(&review.stdout).unwrap();
     let metrics = &doc["results"][0]["metrics"];
@@ -607,7 +621,7 @@ fn json_is_one_wrapped_document() {
             None,
         )],
     );
-    let review = run_cli(&["review", dir.to_str().unwrap(), "--json"]);
+    let review = run_cli_in(&dir, &["review", dir.to_str().unwrap(), "--json"]);
     assert!(review.success, "stderr: {}", review.stderr);
 
     let mut de =
@@ -641,8 +655,8 @@ fn table_and_json_carry_the_same_values() {
             None,
         )],
     );
-    let json = run_cli(&["review", dir.to_str().unwrap(), "--json"]);
-    let table = run_cli(&["review", dir.to_str().unwrap()]);
+    let json = run_cli_in(&dir, &["review", dir.to_str().unwrap(), "--json"]);
+    let table = run_cli_in(&dir, &["review", dir.to_str().unwrap()]);
     assert!(json.success && table.success);
     let doc: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
     let metrics = &doc["results"][0]["metrics"];
@@ -699,7 +713,7 @@ fn an_unopenable_project_is_a_failed_record() {
         ],
     );
 
-    let review = run_cli(&["review", dir.to_str().unwrap(), "--json"]);
+    let review = run_cli_in(&dir, &["review", dir.to_str().unwrap(), "--json"]);
     assert!(
         review.success,
         "an unopenable project must not crash review: {}",
@@ -749,7 +763,7 @@ fn unresolved_sources_are_listed_not_fatal() {
             None,
         )],
     );
-    let review = run_cli(&["review", dir.to_str().unwrap(), "--json"]);
+    let review = run_cli_in(&dir, &["review", dir.to_str().unwrap(), "--json"]);
     assert!(review.success, "stderr: {}", review.stderr);
     let doc: serde_json::Value = serde_json::from_str(&review.stdout).unwrap();
     let record = &doc["results"][0];
@@ -792,9 +806,13 @@ fn review_writes_nothing() {
         )],
     );
 
+    // The snapshotted directory must never double as the cwd `review` runs
+    // in, so a stray write into cwd would be caught by the comparison below
+    // rather than silently landing inside the very tree being compared.
+    let cwd = common::tmp_dir("review_cli_writes_nothing_cwd");
     let before = snapshot(&dir);
-    let json = run_cli(&["review", dir.to_str().unwrap(), "--json"]);
-    let table = run_cli(&["review", dir.to_str().unwrap()]);
+    let json = run_cli_in(&cwd, &["review", dir.to_str().unwrap(), "--json"]);
+    let table = run_cli_in(&cwd, &["review", dir.to_str().unwrap()]);
     assert!(json.success && table.success);
     let after = snapshot(&dir);
     assert_eq!(
@@ -850,13 +868,14 @@ fn review_of_a_reference_run() {
         return;
     };
 
-    let dir = tmp_dir("review_cli_reference_run");
+    let dir = common::tmp_dir("review_cli_reference_run");
     let cli = snapshot_bin(&dir);
     let frames = link_reference_frames(&dir, &stack_dir);
     let out = dir.join("out");
     std::fs::create_dir_all(&out).unwrap();
 
     let stack_result = run_bin(
+        &dir,
         &cli,
         &[
             "stack",
@@ -876,7 +895,7 @@ fn review_of_a_reference_run() {
     );
 
     let review_start = Instant::now();
-    let review = run_bin(&cli, &["review", out.to_str().unwrap(), "--json"]);
+    let review = run_bin(&dir, &cli, &["review", out.to_str().unwrap(), "--json"]);
     let review_elapsed = review_start.elapsed();
     assert!(review.success, "stderr: {}", review.stderr);
 
