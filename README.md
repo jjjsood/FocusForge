@@ -42,8 +42,9 @@ GNU General Public License v3.
 - Reusable parameter bundles (presets) and a re-run flag that fuses only the
   stacks you name, so tuning one stack after a batch run costs one re-run,
   not the whole folder again
-- Cancellable and resumable runs — Ctrl-C stops a run cleanly and `--resume`
-  picks the same stack back up without redoing finished work
+- Cancellable, pausable and resumable runs — Ctrl-C stops a run cleanly,
+  SIGUSR1 pauses one in place on Unix, and `--resume` picks a cancelled stack
+  back up without redoing finished work
 - Directory-wide stack inspection (`focusforge-cli info`) — dimensions, depth,
   byte order, compression, strip layout and a uniform-layout check across
   every frame, plain text or `--json`

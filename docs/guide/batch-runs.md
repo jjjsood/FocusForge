@@ -91,7 +91,7 @@ an `auto` closure. A flag on the command line always beats the file:
 override its keys. `focusforge-cli align` reads the same file, using only
 its `align-algo` key and `[align]` table.
 
-## Cancelling and resuming
+## Pausing, cancelling and resuming
 
 Ctrl-C during a run stops it cleanly: work already committed to a project
 stays, and the run exits 130. Passing `--resume` on a later invocation of
@@ -105,6 +105,12 @@ focusforge-cli stack path/to/frames/ --algo laplacian --resume
 `--resume` matches the earlier run by a fingerprint over the stack's inputs;
 it refuses, rather than guessing, when no matching cancelled state exists or
 it disagrees with this invocation.
+
+On Unix, sending `SIGUSR1` to a running `stack` process pauses it in place —
+no `--resume` needed, since the process itself is still alive: `kill -USR1
+<pid>` toggles the pause, and the run's own progress output names the way
+back (`paused -- send SIGUSR1 to resume (Ctrl-C to cancel)`). SIGUSR1 has no
+Windows equivalent, so pausing is Unix-only there.
 
 ## The stage cache
 

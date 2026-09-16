@@ -213,6 +213,16 @@ naming every failed frame, exit 1. An empty auto-crop (the frames' footprints
 do not intersect) is refused before any output file is created, naming
 `--no-crop` as the way through.
 
+**Ctrl-C cancels, SIGUSR1 pauses.** A first SIGINT stops the run cleanly at
+the next segment boundary, prints the exact `--resume` recipe, and exits
+130; work already committed to a project stays on disk. A second SIGINT
+kills the process immediately. On Unix, SIGUSR1 toggles a pause in place —
+the run prints `paused -- send SIGUSR1 to resume (Ctrl-C to cancel)` and
+blocks until a second SIGUSR1 (resume) or a SIGINT (cancel); no `--resume`
+flag is needed to come back from a pause, since the process itself is still
+running. SIGUSR1 does not exist as a signal on Windows, so pausing is
+Unix-only there.
+
 **GPU use is automatic, never an opt-in flag.** The GPU path is compiled in
 by default, and `stack` uses a usable GPU adapter automatically for the
 `laplacian` algorithm — the only one with a GPU implementation; `weighted-average` and
