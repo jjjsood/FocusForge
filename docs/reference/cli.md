@@ -287,7 +287,10 @@ used instead; `"Explicit"` — `--max-host-memory` lowered the budget), and
 in-flight limit during this run because of observed *host memory* pressure —
 reported on both paths, since the host scheduler runs on the GPU path too;
 never about VRAM, since the device budget has no runtime back-off of its
-own).
+own). `peak_in_flight` (next to `in_flight_limit`, both above) is this
+group's *configured* host in-flight-tile limit, not a measured high-water
+mark — the engine this command drives does not expose the real observed
+concurrency, so the configured bound is reported instead.
 
 Additive fields from the device (VRAM) budget, GPU path only:
 `max_device_bytes_in_flight` (the in-flight device-byte budget actually in
@@ -295,8 +298,13 @@ force), `device_budget_provenance` (`"Host"` — a startup probe settled on
 this value; `"HostFallback"` — no probe ran and the stated default was used
 instead; `"Explicit"` — `--max-vram` lowered it), and `device_peak_in_flight`
 (the device budget's own high-water count of tiles admitted at once during
-this run — distinct from `peak_in_flight`, which is the host scheduler's
-count and is reported on both paths). All three are `null` on the CPU path.
+**this group** — unlike `peak_in_flight`, this one is a real measurement, not
+a configured limit). `device_peak_in_flight` is scoped per group: in a
+multi-group run, each group in the wrapped `groups` document reports its own
+measurement, never a running maximum over the groups that preceded it in the
+same process. It is `0` for a group that admitted no tile through the device
+gate (fully served from the stage cache, say), and `null` only when there was
+no GPU backend at all. All three fields are `null` on the CPU path.
 
 Additive field `stages`: a per-stage wall-clock breakdown of `wall_seconds`
 — `setup`, `align`, `fuse` and `finalize`, each seconds as a float or `null`

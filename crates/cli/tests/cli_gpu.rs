@@ -605,3 +605,112 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
         "report: {cpu_report}"
     );
 }
+
+/// Builds a two-group `stack` root: `a-two/` (2 frames, cheap per-tile
+/// device footprint) and `b-sixteen/` (16 frames across two copied name
+/// sets, expensive per-tile device footprint), both copied from
+/// `fixtures/mantis-512/frames`. No frame carries a capture time, so
+/// `propose` groups by directory, and its depth-first bytewise walk yields
+/// exactly these two groups, `a-two` first (`"a-two" < "b-sixteen"` bytewise).
+fn build_two_group_root(parent: &Path) -> PathBuf {
+    let root = parent.join("in");
+    std::fs::create_dir_all(&root).expect("root must be creatable");
+
+    let frames_dir = mantis_512_dir().join("frames");
+    let mut frame_files: Vec<PathBuf> = std::fs::read_dir(&frames_dir)
+        .expect("fixture frames dir must exist")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("tif"))
+        .collect();
+    frame_files.sort();
+
+    let a_two = root.join("a-two");
+    std::fs::create_dir_all(&a_two).expect("a-two must be creatable");
+    for src in frame_files.iter().take(2) {
+        let name = src.file_name().expect("fixture frame must have a name");
+        std::fs::copy(src, a_two.join(name)).expect("copy into a-two must succeed");
+    }
+
+    let b_sixteen = root.join("b-sixteen");
+    std::fs::create_dir_all(&b_sixteen).expect("b-sixteen must be creatable");
+    for prefix in ["s0-", "s1-"] {
+        for src in &frame_files {
+            let name = format!(
+                "{prefix}{}",
+                src.file_name()
+                    .expect("fixture frame must have a name")
+                    .to_string_lossy()
+            );
+            std::fs::copy(src, b_sixteen.join(name)).expect("copy into b-sixteen must succeed");
+        }
+    }
+
+    root
+}
+
+/// Two groups in one `stack` invocation report independent device peaks,
+/// not a running maximum. A shared `64MiB` `--max-vram` floors `b-sixteen`
+/// at one device tile while `a-two` (which runs first) admits two or more,
+/// which a prefix maximum could not produce.
+#[test]
+fn device_peak_in_flight_is_scoped_to_its_own_group() {
+    let cwd = common::tmp_dir("cli_gpu_device_peak_two_group_cwd");
+    let in_holder = common::tmp_dir("cli_gpu_device_peak_two_group_in");
+    let out_holder = common::tmp_dir("cli_gpu_device_peak_two_group_out");
+    let root = build_two_group_root(&in_holder);
+    let out = out_dir(&out_holder, "out");
+
+    let output = run(
+        &cwd,
+        &[
+            "stack",
+            root.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--no-align",
+            "--no-crop",
+            "--tile-size",
+            "256",
+            "--set",
+            "levels=4",
+            "--max-vram",
+            "64MiB",
+            "--json",
+        ],
+    );
+    assert!(output.success, "stderr: {}", output.stderr);
+    let doc: serde_json::Value = serde_json::from_str(&output.stdout).expect("--json must parse");
+    assert_eq!(doc["format"], 1, "doc: {doc}");
+    let groups = doc["groups"].as_array().expect("groups must be an array");
+
+    if groups[0]["backend"] == "cpu" {
+        println!("SKIP: no usable adapter on this machine, cannot exercise device_peak_in_flight");
+        return;
+    }
+    if groups[0]["in_flight_limit"].as_u64().unwrap_or(0) < 2 {
+        println!(
+            "SKIP: host scheduler caps this machine at one in-flight tile, no per-group difference is observable"
+        );
+        return;
+    }
+
+    assert_eq!(groups.len(), 2, "doc: {doc}");
+    let light_peak = groups[0]["device_peak_in_flight"]
+        .as_u64()
+        .expect("the 2-frame group must report a non-null device_peak_in_flight");
+    let heavy_peak = groups[1]["device_peak_in_flight"]
+        .as_u64()
+        .expect("the 16-frame group must report a non-null device_peak_in_flight");
+    assert_eq!(
+        heavy_peak, 1,
+        "the 16-frame group's own peak, not a running maximum: {doc}"
+    );
+    assert!(
+        light_peak > heavy_peak,
+        "the second group's own peak must be strictly less, which a prefix \
+         maximum over both groups cannot produce: {doc}"
+    );
+}

@@ -62,6 +62,10 @@ pub struct StackReport {
     pub tiles: usize,
     pub frame_tiles_read: usize,
     pub in_flight_limit: usize,
+    /// This group's *configured* host in-flight-tile limit (`in_flight_limit`,
+    /// above), not a measured peak: `Job::run` does not expose the
+    /// scheduler's per-segment `TileRunReport`. `device_peak_in_flight` is
+    /// the measured device-side figure.
     pub peak_in_flight: usize,
     /// The host in-flight-byte budget actually in force for this run.
     pub max_bytes_in_flight: u64,
@@ -96,9 +100,14 @@ pub struct StackReport {
     /// `Explicit` (`--max-vram` lowered it) -- `null` on the CPU path.
     pub device_budget_provenance: Option<Provenance>,
     /// The device budget's own high-water count of tiles admitted at once
-    /// during this run -- `null` on the CPU path. Distinct from
-    /// `peak_in_flight`, which is the *host* scheduler's count and is
-    /// reported on both paths.
+    /// during **this group** -- scoped per group, the same footing as every
+    /// other field on this struct: group 2 of a multi-group run reports its
+    /// own peak, never a running maximum over the groups that preceded it in
+    /// the same process. `0` for a group that admitted no tile through the
+    /// device gate (fully served from the stage cache, say); `null` only on
+    /// the CPU path, never for "zero device work this group". Distinct from
+    /// `peak_in_flight`, which is the *host* scheduler's configured limit,
+    /// not a measurement, and is reported on both paths.
     pub device_peak_in_flight: Option<usize>,
     /// `true` only when the alignment came out of the stage cache;
     /// `false` for a computed one, a `--resume` ledger-peeked one, or a
@@ -138,6 +147,10 @@ pub struct StackReport {
 /// not a field on `DeviceBudgetReport`, because that number does not exist
 /// until the scheduler has run.
 pub trait DevicePeak {
+    /// Restarts the high-water interval [`Self::peak_in_flight`] reads back
+    /// -- see `run_group`'s single call site for why it sits immediately
+    /// before `job::drive` rather than at the top of the function.
+    fn reset_peak(&self);
     fn peak_in_flight(&self) -> usize;
 }
 
@@ -1529,6 +1542,14 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         inner: consumer,
         ledger: &ledger,
     };
+    // Reset here, not earlier: the only `VramBudget::acquire` call site in
+    // the tree is inside `GpuBackend::warp_fuse_tile`, reached only through
+    // the driver's own `BackendFusionConsumer` below -- so this is the last
+    // point before any permit for this group can be taken, making the read
+    // at the end of the group a genuine per-group high-water mark.
+    if let Some(peak) = device_peak {
+        peak.reset_peak();
+    }
     let outcome = match job::drive(
         &mut job,
         &control,

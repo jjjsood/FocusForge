@@ -5,37 +5,18 @@
 //! scheduler's host-memory budget. Names no `wgpu` type, so it is not
 //! feature-gated.
 //!
-//! **Why a probe, and why the constant survives as the degraded answer.**
-//! wgpu 29.0.4 exposes no adapter memory-size query at all (`Adapter` docs:
-//! <https://docs.rs/wgpu/29.0.4/wgpu/struct.Adapter.html> -- `limits`,
-//! `get_info`, `features`, `get_downlevel_capabilities`,
-//! `get_texture_format_features`, `get_presentation_timestamp`, nothing
-//! memory-sized; gfx-rs/wgpu#2447 is open). There is therefore no device
-//! total to read, so the budget this crate actually uses is discovered by
-//! [`probe_budget`]: an optimistic-but-bounded starting request
-//! ([`PROBE_START_MULTIPLE`] times [`DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`]),
-//! halved on each refusal down to a stated floor
-//! ([`PROBE_MIN_DEVICE_BYTES`]), within a bounded number of attempts
-//! ([`PROBE_MAX_ATTEMPTS`]) -- allocate-and-back-off, not a design
-//! preference but the only path available.
-//! [`DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`] is not deleted: it survives as
-//! [`DeviceBudget::fallback`], the degraded answer used when no probe ran at
-//! all, identical reasoning to `crate::tile::scheduler::DEFAULT_MAX_BYTES_IN_FLIGHT`.
-//! The adapter's reported limits are used for what they *can* answer:
-//! refusing, before dispatch, a single allocation that would exceed a hard
-//! device limit (`buffer_limit_shortfalls`, below) -- a separate, smaller
-//! concern than the working-set budget this module discovers.
+//! **Probe, with a constant fallback.** wgpu 29.0.4 exposes no adapter
+//! memory size (gfx-rs/wgpu#2447), so [`probe_budget`] allocates and backs
+//! off: [`PROBE_START_MULTIPLE`] x [`DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`],
+//! halved per refusal down to [`PROBE_MIN_DEVICE_BYTES`], at most
+//! [`PROBE_MAX_ATTEMPTS`] tries. [`DeviceBudget::fallback`] is the constant
+//! when no probe ran; [`buffer_limit_shortfalls`] checks single buffers.
 //!
-//! **Why every byte allocated during a tile, not a live high-water mark.**
-//! `wgpu::Buffer`'s drop does not promise immediate reclamation, and this
-//! pipeline polls the device only at its two per-tile readbacks
-//! (`crate::transfer::download_buffer`, called at
-//! `crate::fuse::fuse_planes_gpu`'s own tail for the composite and the
-//! Z-Map). [`device_bytes_per_tile`] therefore counts every intermediate a
-//! tile allocates as if it stayed live for the whole tile, even the ones
-//! dropped mid-tile -- deliberately conservative, proven or disproven by
-//! `crates/gpu/tests/harness/budget_gpu.rs`'s allocator-report test rather
-//! than assumed.
+//! **Every byte a tile allocates counts, not a live high-water mark.**
+//! Dropping a `wgpu::Buffer` does not promise immediate reclamation, and the
+//! pipeline polls only at its two per-tile readbacks (composite, Z-Map), so
+//! [`device_bytes_per_tile`] treats every intermediate as live for the
+//! whole tile. Conservative; the allocator-report test prints the measurement.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -317,11 +298,9 @@ impl DeviceBudget {
     }
 }
 
-/// The wgpu-free seam a real allocation attempt is made through -- the same
-/// "stay testable in the default, GPU-free gate" trick `crate::adapter`'s
-/// generic `classify_adapter` already uses. `WgpuAllocProbe` (in the `vram` module)
-/// is the real, `gpu`-feature-gated implementor; the tests in this module
-/// drive a fake.
+/// The seam a real allocation attempt goes through, so the probe logic is
+/// testable without a GPU. `WgpuAllocProbe` (the `vram` module) is the real
+/// implementor; this module's tests drive a fake.
 pub trait DeviceAllocProbe {
     /// Attempts to reserve `bytes` on the device, returning `Err` naming why
     /// on refusal.
@@ -360,12 +339,9 @@ pub enum ProbeOutcome {
 }
 
 /// Allocate-and-back-off: starts at `PROBE_START_MULTIPLE *
-/// DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`, halving on each refusal, down to
-/// `PROBE_MIN_DEVICE_BYTES`, for at most `PROBE_MAX_ATTEMPTS` attempts. Never
-/// raises the request after a refusal -- monotonically non-increasing across
-/// attempts by construction, which is the no-oscillation property,
-/// asserted directly by this module's own tests rather than merely argued
-/// in prose.
+/// DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`, halving on each refusal down to
+/// `PROBE_MIN_DEVICE_BYTES`, for at most `PROBE_MAX_ATTEMPTS` attempts. The
+/// request never grows after a refusal, so it cannot oscillate.
 pub fn probe_budget(probe: &dyn DeviceAllocProbe) -> ProbeOutcome {
     let mut request = PROBE_START_MULTIPLE * DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT;
     let mut last_detail = String::new();
@@ -444,9 +420,8 @@ impl VramBudget {
         }
     }
 
-    /// The in-flight limit for a tile costing `bytes_per_tile` device
-    /// bytes -- the live path [`Self::acquire`] itself calls, not a
-    /// test-only helper.
+    /// The in-flight limit for a tile costing `bytes_per_tile` device bytes,
+    /// as [`Self::acquire`] computes it.
     pub fn limit_for(&self, bytes_per_tile: u64) -> usize {
         tiles_in_flight_for_budget(bytes_per_tile, self.max_device_bytes, self.cap)
     }
@@ -466,11 +441,17 @@ impl VramBudget {
         Permit { budget: self }
     }
 
-    /// The high-water mark of tiles admitted at once since construction --
-    /// the observable the GPU-gated serialization test asserts on, the same
-    /// high-water shape `TileRunReport::peak_in_flight` already has.
+    /// The most tiles admitted at once since construction or the last
+    /// [`Self::reset_peak`].
     pub fn peak_in_flight(&self) -> usize {
         self.peak.load(Ordering::SeqCst)
+    }
+
+    /// Restarts the high-water interval [`Self::peak_in_flight`] reads.
+    /// Call only while no permit is live: a reset racing a concurrent
+    /// `acquire`'s `fetch_max` would lose a real admission.
+    pub fn reset_peak(&self) {
+        self.peak.store(0, Ordering::SeqCst);
     }
 }
 
@@ -627,10 +608,6 @@ mod tests {
         assert_eq!(*requests.last().unwrap(), PROBE_MIN_DEVICE_BYTES);
     }
 
-    // Mirrors `crates/core/src/tile/scheduler.rs`'s three budget cases,
-    // plus the zero short-circuit `scheduler.rs` covers inline rather than
-    // as its own named test.
-
     #[test]
     fn device_bytes_per_tile_at_fixture_scale() {
         // 8 frames, 512x512, 3 spp, 5 levels, warped -- the geometry
@@ -740,5 +717,72 @@ mod tests {
         assert_eq!(observed_concurrent.load(Ordering::SeqCst), 1);
         assert_eq!(budget.peak_in_flight(), 1);
         assert_eq!(budget.limit_for(1), 1);
+    }
+
+    #[test]
+    fn reset_peak_restarts_the_high_water_interval() {
+        // One permit at a time on one thread: `cap` comes from
+        // `available_parallelism`, so a nested `acquire` on a single-core
+        // host would block forever.
+        let budget = VramBudget::new(1);
+
+        let permit = budget.acquire(1);
+        drop(permit);
+        assert_eq!(budget.peak_in_flight(), 1);
+
+        budget.reset_peak();
+        assert_eq!(budget.peak_in_flight(), 0);
+
+        let permit = budget.acquire(1);
+        drop(permit);
+        // The second interval is measured on its own, not as the max over
+        // both.
+        assert_eq!(budget.peak_in_flight(), 1);
+    }
+
+    /// Pins the `--max-vram` ceiling `crates/cli/tests/cli_gpu.rs`'s
+    /// `device_peak_in_flight_is_scoped_to_its_own_group` uses (`64MiB`),
+    /// against the *ragged* read rects a 512x512 frame plans into at
+    /// `--tile-size 256 --set levels=4` (208/256/240 px per axis via
+    /// `axis_partition`, `margin_for_levels(4) == 48`): every combination of
+    /// those three sizes on each axis is one tile's read rect in that plan's
+    /// 3x3 grid. `spp = 3`, `levels = 4`, `warped = false` (the CLI test runs
+    /// `--no-align`, so the warp flag is false).
+    #[test]
+    fn max_vram_ceiling_floors_the_heavy_group_at_one_tile_for_every_ragged_rect() {
+        const CEILING: u64 = 64 << 20; // the literal `--max-vram` value the CLI test passes
+        const RECT_SIZES: [u32; 3] = [208, 256, 240];
+        const SPP: u32 = 3;
+        const LEVELS: u32 = 4;
+        const CAP: usize = 32;
+
+        // The 2-frame group's most expensive rect still admits at least two
+        // tiles at once -- not a running max, an actual concurrency.
+        let mut max_bytes_2 = 0u64;
+        let mut min_bytes_16 = u64::MAX;
+        for &w in &RECT_SIZES {
+            for &h in &RECT_SIZES {
+                let bytes_2 = device_bytes_per_tile(2, w, h, SPP, LEVELS, false);
+                let bytes_16 = device_bytes_per_tile(16, w, h, SPP, LEVELS, false);
+                max_bytes_2 = max_bytes_2.max(bytes_2);
+                min_bytes_16 = min_bytes_16.min(bytes_16);
+                // Every ragged rect floors the 16-frame group at exactly one
+                // tile -- including its cheapest rect, the tightest case.
+                assert_eq!(
+                    tiles_in_flight_for_budget(bytes_16, CEILING, CAP),
+                    1,
+                    "w={w} h={h} bytes_16={bytes_16} must floor at one tile"
+                );
+            }
+        }
+        assert!(
+            tiles_in_flight_for_budget(max_bytes_2, CEILING, CAP) >= 2,
+            "the 2-frame group's heaviest rect ({max_bytes_2} bytes) must still admit \
+             two or more tiles under a {CEILING}-byte ceiling"
+        );
+        // Both bounds hold with margin, not by a hair: sanity-check the
+        // window this literal ceiling sits inside.
+        assert!(2 * max_bytes_2 <= CEILING);
+        assert!(CEILING < 2 * min_bytes_16);
     }
 }

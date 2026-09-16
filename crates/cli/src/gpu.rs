@@ -14,9 +14,14 @@ use focusforge_gpu::harness::{GpuBackend, gpu_backend_capped};
 use crate::stack::{BackendChoice, DeviceBudgetReport, DevicePeak};
 
 /// The device budget's own realized high-water tile count for this
-/// `GpuBackend`: read fresh on every call, never cached, since it is only
-/// meaningful after `scheduler.run` has returned.
+/// `GpuBackend`, scoped to one group: `reset_peak` restarts the interval,
+/// and `peak_in_flight` is read fresh on every call, never cached, since it
+/// is only meaningful after `scheduler.run` has returned.
 impl DevicePeak for GpuBackend {
+    fn reset_peak(&self) {
+        self.budget().reset_peak();
+    }
+
     fn peak_in_flight(&self) -> usize {
         self.budget().peak_in_flight()
     }
