@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The dock: 260 px wide, from the tab strip to the bottom bar. Composes the
+// mode switch, the checkpoint panel and the dock tab row (each its own file
+// under `dock/`, per the shell-region split) with the dock's own chrome --
+// the edge rule, the checkpoint rule and the no-project note. The dock
+// tabs' own content (images list, settings panel) ships separately; this
+// file ships the row, not what is behind it.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFModeSwitch inherits Rectangle {
+    callback mode-selected(string);
+    in property <bool> editor-enabled: false;
+    in property <string> mode: "stacking";
+
+    height: 28px;
+    background: Theme.surface-overlay;
+    border-radius: Theme.radius-md;
+
+    HorizontalLayout {
+        stacking-half := Rectangle {
+            background: root.mode == "stacking" ? Theme.accent-default : transparent;
+            border-radius: Theme.radius-md;
+            Text {
+                text: "Stacking";
+                horizontal-alignment: center;
+                color: root.mode == "stacking" ? Theme.text-on-accent : Theme.text-primary;
+            }
+            TouchArea {
+                clicked => { root.mode-selected("stacking"); }
+            }
+        }
+        editor-half := Rectangle {
+            opacity: root.editor-enabled ? 1.0 : 0.5;
+            background: root.mode == "editor" ? Theme.accent-default : transparent;
+            border-radius: Theme.radius-md;
+            Text {
+                text: "Editor";
+                horizontal-alignment: center;
+                color: Theme.text-disabled;
+            }
+            TouchArea {
+                enabled: root.editor-enabled;
+                clicked => { root.mode-selected("editor"); }
+            }
+        }
+    }
+}
+
+export component FFCheckpointPanel inherits Rectangle {
+    callback checkpoint-export-requested();
+
+    height: 72px;
+
+    VerticalLayout {
+        spacing: Theme.space-2;
+
+        heading-row := HorizontalLayout {
+            height: 20px;
+            alignment: space-between;
+
+            Text {
+                text: "Checkpoints";
+                color: Theme.text-secondary;
+                font-size: Theme.text-section.size;
+                font-weight: Theme.text-section.weight;
+            }
+
+            checkpoint-export := Rectangle {
+                width: 60px;
+                height: 20px;
+                accessible-role: button;
+                accessible-enabled: false;
+                background: Theme.surface-disabled;
+                border-radius: Theme.radius-sm;
+
+                Text {
+                    text: "Export";
+                    horizontal-alignment: center;
+                    color: Theme.text-disabled;
+                    font-size: Theme.text-body.size;
+                }
+
+                TouchArea {
+                    enabled: false;
+                    clicked => { root.checkpoint-export-requested(); }
+                }
+            }
+        }
+
+        Text {
+            text: "None yet — the first fuse writes one";
+            color: Theme.text-muted;
+            font-size: Theme.text-body.size;
+            wrap: word-wrap;
+        }
+    }
+}
+
+export component FFDockTabs inherits Rectangle {
+    callback tab-selected(string);
+    in property <string> active: "images";
+
+    height: 28px;
+
+    HorizontalLayout {
+        images-tab := Rectangle {
+            background: root.active == "images" ? Theme.surface-hover : transparent;
+            border-radius: Theme.radius-sm;
+            Text {
+                text: "Images";
+                horizontal-alignment: center;
+                color: Theme.text-primary;
+            }
+            TouchArea {
+                clicked => { root.tab-selected("images"); }
+            }
+        }
+        settings-tab := Rectangle {
+            background: root.active == "settings" ? Theme.surface-hover : transparent;
+            border-radius: Theme.radius-sm;
+            Text {
+                text: "Settings";
+                horizontal-alignment: center;
+                color: Theme.text-primary;
+            }
+            TouchArea {
+                clicked => { root.tab-selected("settings"); }
+            }
+        }
+    }
+}
+
+export component FFDock inherits Rectangle {
+    callback mode-selected(string);
+    callback dock-tab-selected(string);
+    callback checkpoint-export-requested();
+    in property <bool> editor-enabled: false;
+    in property <string> mode: "stacking";
+    in property <string> dock-tab: "images";
+
+    background: Theme.surface-raised;
+
+    VerticalLayout {
+        padding-left: ShellGeometry.dock-content-inset;
+        padding-right: ShellGeometry.dock-content-inset;
+        padding-top: Theme.space-2;
+        spacing: Theme.space-2;
+        alignment: start;
+
+        mode-switch := FFModeSwitch {
+            editor-enabled: root.editor-enabled;
+            mode: root.mode;
+            mode-selected(m) => { root.mode-selected(m); }
+        }
+
+        checkpoint-panel := FFCheckpointPanel {
+            checkpoint-export-requested => { root.checkpoint-export-requested(); }
+        }
+
+        dock-tabs := FFDockTabs {
+            active: root.dock-tab;
+            tab-selected(t) => { root.dock-tab-selected(t); }
+        }
+    }
+}

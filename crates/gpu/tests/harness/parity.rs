@@ -9,20 +9,18 @@ use focusforge_core::algorithm::TileReader;
 use focusforge_core::gpu::{TileBackend, self_check_cpu};
 use focusforge_core::io::TiffStack;
 use focusforge_core::tile::{Rect, Tile};
-use focusforge_gpu::adapter::skip_message;
+use focusforge_gpu::device::shared_device_or_skip;
 use focusforge_gpu::harness::gpu_backend;
 
 use crate::common;
 
 #[test]
 fn harness_kernel_matches_cpu_twin() {
-    let backend = match gpu_backend() {
-        Ok(backend) => backend,
-        Err(err) => {
-            println!("{}", skip_message(&err.to_string()));
-            return;
-        }
+    let Some(_shared) = shared_device_or_skip() else {
+        return;
     };
+    let backend =
+        gpu_backend().expect("gpu backend must be available once shared_device_or_skip found one");
 
     let stack = TiffStack::open(common::mantis_512_dir()).expect("open mantis-512 fixture");
     let frame = 3;

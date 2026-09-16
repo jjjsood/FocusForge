@@ -55,3 +55,31 @@ fn missing_limit_is_named() {
         "failure text must name the limit that was short, got: {message}"
     );
 }
+
+#[test]
+fn device_limits_raise_only_resolution() {
+    // Pure: a synthetic "adapter-like" limits value, no adapter touched.
+    let adapter_like = wgpu::Limits {
+        max_texture_dimension_1d: 16_384,
+        max_texture_dimension_2d: 16_384,
+        max_texture_dimension_3d: 4_096,
+        ..wgpu::Limits::default()
+    };
+
+    let got = limits::device_limits(&adapter_like);
+
+    let mut expected = limits::required_limits();
+    expected.max_texture_dimension_1d = adapter_like.max_texture_dimension_1d;
+    expected.max_texture_dimension_2d = adapter_like.max_texture_dimension_2d;
+    expected.max_texture_dimension_3d = adapter_like.max_texture_dimension_3d;
+
+    assert_eq!(
+        got, expected,
+        "device_limits must raise exactly the three texture-dimension fields"
+    );
+    assert_ne!(
+        got.max_texture_dimension_2d,
+        limits::required_limits().max_texture_dimension_2d,
+        "the adapter's resolution must actually have been applied"
+    );
+}

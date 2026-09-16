@@ -1,0 +1,207 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The canvas region: two panes, a divider between them, each pane carrying
+// the wgpu-written image, a label and an undock control.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+component FFPaneLabel inherits Rectangle {
+    in property <string> label: "";
+
+    width: 120px;
+    height: 22px;
+    background: Theme.surface-overlay;
+    border-radius: Theme.radius-sm;
+
+    Text {
+        text: root.label;
+        color: Theme.text-primary;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component FFUndockControl inherits Rectangle {
+    // Disabled on the last (single) pane.
+    in property <bool> enabled: true;
+    callback undock-requested();
+
+    width: 26px;
+    height: 22px;
+    background: area.has-hover && root.enabled ? Theme.surface-hover : Theme.surface-overlay;
+    border-radius: Theme.radius-sm;
+    opacity: root.enabled ? 1.0 : 0.5;
+
+    area := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.undock-requested(); }
+    }
+    Image {
+        source: @image-url("../../../../assets/icons/maximize.svg");
+        colorize: Theme.text-secondary;
+        width: Theme.icon-sm;
+        height: Theme.icon-sm;
+    }
+}
+
+export component FFPane inherits Rectangle {
+    in property <image> source;
+    in property <string> label: "";
+    in property <bool> undock-enabled: true;
+    // The one shared viewport's placement, forwarded identically to both
+    // panes from `FFCanvas`: `image-fit: fill` plus an explicit rect is
+    // what lets a zoom/pan draw a *sub*-rect of the source, which
+    // `image-fit: contain` (whole-image-only) and `source-clip-*` (which
+    // needs the whole composite resident as one texture) both cannot.
+    in property <length> image-x;
+    in property <length> image-y;
+    in property <length> image-w;
+    in property <length> image-h;
+    in property <bool> pixelated;
+    callback undock-requested();
+
+    background: Theme.surface-canvas;
+    border-radius: Theme.radius-md;
+    clip: true;
+
+    Image {
+        source: root.source;
+        x: root.image-x;
+        y: root.image-y;
+        width: root.image-w;
+        height: root.image-h;
+        image-fit: fill;
+        image-rendering: root.pixelated ? ImageRendering.pixelated : ImageRendering.smooth;
+    }
+
+    pane-label := FFPaneLabel {
+        x: 10px;
+        y: 10px;
+        label: root.label;
+    }
+
+    pane-undock := FFUndockControl {
+        x: parent.width - 10px - self.width;
+        y: 10px;
+        enabled: root.undock-enabled;
+        undock-requested => { root.undock-requested(); }
+    }
+}
+
+export component FFCanvas inherits Rectangle {
+    in property <image> composite-source;
+    in property <image> zmap-source;
+    in property <bool> undock-enabled: true;
+    // The one shared viewport's placement -- forwarded identically to
+    // both panes below, which is what makes "one viewport
+    // over two panes" structural rather than a synchronisation.
+    in property <length> image-x;
+    in property <length> image-y;
+    in property <length> image-w;
+    in property <length> image-h;
+    in property <bool> pixelated;
+    callback composite-undock-requested();
+    callback zmap-undock-requested();
+    // The one input dispatch point's gesture forwards. No other `.slint`
+    // file in the crate declares `scroll-event`, `pointer-event` or
+    // `moved`. The two extra `length`s carry the wheel's own cursor
+    // position (`self.mouse-x`/`mouse-y` are written before `scroll-event`
+    // is invoked), since `moved` only fires while the pointer is pressed
+    // and cannot track a hovering cursor.
+    callback canvas-scrolled(length, length, length, length, bool, bool, bool);
+    // The `int` is `event.kind` folded to 0 = Down, 1 = Up or Cancel,
+    // 2 = Move -- `PointerEventKind` itself is not publicly nameable from
+    // `src/bridge.rs` (unlike `PointerEventButton`), so the fold happens
+    // here rather than forwarding an unnameable type. `Move` fires on every
+    // mouse movement over the area, before `moved`; the dispatch point
+    // (`AppController::pointer`, `PointerKind::Move`) is what ignores it.
+    callback canvas-pointer(PointerEventButton, int, length, length, bool, bool, bool);
+    callback canvas-dragged(length, length);
+    // Fires whenever this component's own size changes, so `src/bridge.rs`
+    // can re-read the five geometry properties below and re-fit/re-clamp
+    // the viewport. Nothing is passed: the bridge reads
+    // the `out` properties itself, which also covers the initial value a
+    // `changed` handler never fires for (`src/main.rs`'s own startup read).
+    callback canvas-resized();
+
+    // The pane geometry `AppController::set_pane_geometry` needs, read back
+    // as plain property reads -- no arithmetic, `pane-gutter`/`pane-divider`
+    // stay derived once, here. `pane-left`/`pane-right` share one `y`,
+    // `width` and `height` by construction (below), so only `pane-left`'s
+    // are exposed for those three.
+    out property <length> pane-left-x: pane-left.x;
+    out property <length> pane-right-x: pane-right.x;
+    out property <length> pane-left-y: pane-left.y;
+    out property <length> pane-left-width: pane-left.width;
+    out property <length> pane-left-height: pane-left.height;
+
+    changed width => { root.canvas-resized(); }
+    changed height => { root.canvas-resized(); }
+
+    background: Theme.surface-base;
+
+    // First child so it spans the whole canvas region while the
+    // later-declared panes and their `FFUndockControl` `TouchArea`s keep
+    // z-order above it.
+    hit-area := TouchArea {
+        width: 100%;
+        height: 100%;
+
+        scroll-event(event) => {
+            root.canvas-scrolled(event.delta-x, event.delta-y, self.mouse-x, self.mouse-y,
+                event.modifiers.control, event.modifiers.shift, event.modifiers.alt);
+            accept
+        }
+        pointer-event(event) => {
+            root.canvas-pointer(event.button,
+                event.kind == PointerEventKind.down ? 0 : (event.kind == PointerEventKind.move ? 2 : 1),
+                self.mouse-x, self.mouse-y, event.modifiers.control, event.modifiers.shift,
+                event.modifiers.alt);
+        }
+        moved => { root.canvas-dragged(self.mouse-x, self.mouse-y); }
+    }
+
+    pane-left := FFPane {
+        x: ShellGeometry.pane-gutter;
+        y: ShellGeometry.pane-gutter;
+        width: (parent.width - 3 * ShellGeometry.pane-gutter) / 2;
+        height: parent.height - 2 * ShellGeometry.pane-gutter;
+        source: root.composite-source;
+        label: "Composite";
+        undock-enabled: root.undock-enabled;
+        image-x: root.image-x;
+        image-y: root.image-y;
+        image-w: root.image-w;
+        image-h: root.image-h;
+        pixelated: root.pixelated;
+        undock-requested => { root.composite-undock-requested(); }
+    }
+
+    pane-divider := Rectangle {
+        x: pane-left.x + pane-left.width
+            + (ShellGeometry.pane-gutter - ShellGeometry.pane-divider) / 2;
+        y: ShellGeometry.pane-gutter;
+        width: ShellGeometry.pane-divider;
+        height: parent.height - 2 * ShellGeometry.pane-gutter;
+        background: Theme.border-default;
+    }
+
+    pane-right := FFPane {
+        x: parent.width - ShellGeometry.pane-gutter - pane-left.width;
+        y: ShellGeometry.pane-gutter;
+        width: pane-left.width;
+        height: pane-left.height;
+        source: root.zmap-source;
+        label: "Z-Map";
+        undock-enabled: root.undock-enabled;
+        image-x: root.image-x;
+        image-y: root.image-y;
+        image-w: root.image-w;
+        image-h: root.image-h;
+        pixelated: root.pixelated;
+        undock-requested => { root.zmap-undock-requested(); }
+    }
+}

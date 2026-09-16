@@ -16,8 +16,9 @@ GNU General Public License v3.
 
 <!--
   Hero screenshot goes here once the GUI ships a window worth showing
-  (crates/gui has no code yet). Suggested: assets/screenshots/editor.png,
-  ~1200px wide, PNG, with a <sub> caption underneath.
+  (crates/gui has design tokens and vendored icons,
+  but no surface yet). Suggested: assets/screenshots/editor.png, ~1200px
+  wide, PNG, with a <sub> caption underneath.
 -->
 
 ## Features
@@ -43,6 +44,19 @@ GNU General Public License v3.
   `--set key=value` overrides against it
 
 ## Quick start
+
+### Prerequisites
+
+Rust, toolchain pinned to `1.94.1` (`rust-toolchain.toml`, picked up
+automatically by `rustup`). `crates/gui` links Slint with
+`renderer-femtovg-wgpu`, which has a hard dependency on fontconfig; on
+Debian/Ubuntu-family hosts install the dev package before building:
+
+```bash
+sudo apt install libfontconfig1-dev
+```
+
+There is no code-side workaround for a missing fontconfig on this renderer.
 
 ### Build
 

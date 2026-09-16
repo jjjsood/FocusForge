@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The tab strip doubles as the title bar. Holds project tabs, the drag
+// region, and the three window-control glyphs.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+component WindowGlyphButton inherits Rectangle {
+    in property <image> glyph;
+    callback triggered();
+
+    width: 30px;
+    height: 30px;
+    border-radius: Theme.radius-sm;
+    background: area.has-hover ? Theme.surface-hover : transparent;
+
+    area := TouchArea {
+        clicked => { root.triggered(); }
+    }
+    Image {
+        source: root.glyph;
+        colorize: Theme.text-secondary;
+        width: Theme.icon-md;
+        height: Theme.icon-md;
+    }
+}
+
+export component FFTabStrip inherits Rectangle {
+    // Forwarded straight to the AppController via AppWindow.
+    callback window-drag-requested();
+    callback window-minimize-requested();
+    callback window-maximize-toggled();
+    callback window-close-requested();
+
+    // Set from `AppWindow::window-maximized`, itself set from
+    // `AppController::maximized()` via the bridge. Drives the maximize
+    // glyph below -- maximised must look different from not-maximised.
+    in property <bool> maximized: false;
+
+    height: ShellGeometry.strip-height;
+    background: Theme.surface-raised;
+
+    // The drag region: the whole strip behind the window-control cluster.
+    // `changed pressed` is a single-statement handler; it fires on both
+    // press and release, and a refused or redundant compositor move is a
+    // documented no-op.
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+        changed pressed => { root.window-drag-requested(); }
+    }
+
+    HorizontalLayout {
+        alignment: end;
+        padding-right: 6px;
+        spacing: 6px;
+
+        WindowGlyphButton {
+            glyph: @image-url("../../../../assets/icons/minus.svg");
+            triggered => { root.window-minimize-requested(); }
+        }
+        window-maximize := WindowGlyphButton {
+            // Maximised looks different from not-maximised: the plain
+            // square swaps for the two-overlapping-squares restore glyph,
+            // same convention every other window on the desktop uses.
+            glyph: root.maximized
+                ? @image-url("../../../../assets/icons/copy.svg")
+                : @image-url("../../../../assets/icons/square.svg");
+            accessible-role: button;
+            accessible-label: root.maximized ? "Restore" : "Maximize";
+            triggered => { root.window-maximize-toggled(); }
+        }
+        WindowGlyphButton {
+            glyph: @image-url("../../../../assets/icons/x.svg");
+            triggered => { root.window-close-requested(); }
+        }
+    }
+}

@@ -15,7 +15,7 @@ use wgpu::{
 };
 
 use crate::adapter::{AdapterPath, classify_adapter, skip_message};
-use crate::limits::{LimitShortfall, describe_shortfalls, required_limits};
+use crate::limits::{LimitShortfall, describe_shortfalls, device_limits, required_limits};
 
 /// The `for_resource_creation` threshold, as a percent of a heap's own
 /// budget: the value gfx-rs/wgpu#7460 itself proposes. Only D3D12 and
@@ -130,9 +130,11 @@ impl From<AdapterPath<wgpu::Adapter>> for Result<wgpu::Adapter, GpuError> {
 
 /// The device/queue the crate shares, plus the adapter facts a caller needs
 /// to report or reason about (`info`, `limits`). Holds `instance` and
-/// `adapter` too so neither is dropped out from under the device.
+/// `adapter` too so neither is dropped out from under the device, and so
+/// the `Manual` device-ownership path
+/// (`slint::wgpu_29::WGPUConfiguration::Manual`) can clone all four handles
+/// back out (`Self::instance`, `Self::adapter`).
 pub struct SharedDevice {
-    #[allow(dead_code)]
     instance: Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -142,6 +144,20 @@ pub struct SharedDevice {
 }
 
 impl SharedDevice {
+    /// The `wgpu::Instance` the device was created from. `wgpu::Instance` is
+    /// `Clone` in the pinned wgpu 29.0.4, so a caller taking
+    /// the `Manual` device-ownership path clones out rather than moving this
+    /// crate's own copy.
+    pub fn instance(&self) -> &wgpu::Instance {
+        &self.instance
+    }
+
+    /// The `wgpu::Adapter` the device was requested from. `wgpu::Adapter` is
+    /// `Clone` in the pinned wgpu 29.0.4, for the same reason.
+    pub fn adapter(&self) -> &wgpu::Adapter {
+        &self.adapter
+    }
+
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }
@@ -154,15 +170,10 @@ impl SharedDevice {
         &self.info
     }
 
-    /// The limits the device was actually created with --
-    /// `crate::limits::device_limits(&adapter.limits())`, **not** the
-    /// unraised `required_limits()` floor: this device is also handed to
-    /// Slint's swapchain, so its `max_texture_dimension_{1d,2d,3d}` are
-    /// widened to the adapter's own resolution while every compute limit
-    /// and both buffer limits stay exactly at `required_limits()`'s stated
-    /// floor. This is what wgpu validates every allocation against, which
-    /// is why the device-budget's pre-dispatch refusal checks this value
-    /// rather than [`Self::adapter_limits`].
+    /// The limits the device was created with (`crate::limits::device_limits`):
+    /// `required_limits()` with only the texture dimensions widened for
+    /// Slint's swapchain. wgpu validates allocations against these, so the
+    /// pre-dispatch refusal does too, not [`Self::adapter_limits`].
     pub fn limits(&self) -> &wgpu::Limits {
         &self.limits
     }
@@ -233,16 +244,17 @@ fn init() -> Result<SharedDevice, GpuError> {
         driver_info: adapter_info.driver_info.clone(),
     };
 
+    let limits = device_limits(&adapter.limits());
+
     let (device, queue) = block_on(adapter.request_device(&DeviceDescriptor {
         label: Some("focusforge-gpu-shared-device"),
         required_features: crate::limits::REQUIRED_FEATURES,
-        required_limits: required_limits(),
+        required_limits: limits.clone(),
         experimental_features: ExperimentalFeatures::disabled(),
         memory_hints: MemoryHints::default(),
         trace: Trace::default(),
     }))?;
 
-    let limits = required_limits();
     Ok(SharedDevice {
         instance,
         adapter,
