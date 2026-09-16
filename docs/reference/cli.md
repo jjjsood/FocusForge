@@ -213,6 +213,16 @@ naming every failed frame, exit 1. An empty auto-crop (the frames' footprints
 do not intersect) is refused before any output file is created, naming
 `--no-crop` as the way through.
 
+**Ctrl-C cancels, SIGUSR1 pauses.** A first SIGINT stops the run cleanly at
+the next segment boundary, prints the exact `--resume` recipe, and exits
+130; work already committed to a project stays on disk. A second SIGINT
+kills the process immediately. On Unix, SIGUSR1 toggles a pause in place —
+the run prints `paused -- send SIGUSR1 to resume (Ctrl-C to cancel)` and
+blocks until a second SIGUSR1 (resume) or a SIGINT (cancel); no `--resume`
+flag is needed to come back from a pause, since the process itself is still
+running. SIGUSR1 does not exist as a signal on Windows, so pausing is
+Unix-only there.
+
 **GPU use is automatic, never an opt-in flag.** The GPU path is compiled in
 by default, and `stack` uses a usable GPU adapter automatically for the
 `laplacian` algorithm — the only one with a GPU implementation; `weighted-average` and
@@ -287,7 +297,10 @@ used instead; `"Explicit"` — `--max-host-memory` lowered the budget), and
 in-flight limit during this run because of observed *host memory* pressure —
 reported on both paths, since the host scheduler runs on the GPU path too;
 never about VRAM, since the device budget has no runtime back-off of its
-own).
+own). `peak_in_flight` (next to `in_flight_limit`, both above) is this
+group's *configured* host in-flight-tile limit, not a measured high-water
+mark — the engine this command drives does not expose the real observed
+concurrency, so the configured bound is reported instead.
 
 Additive fields from the device (VRAM) budget, GPU path only:
 `max_device_bytes_in_flight` (the in-flight device-byte budget actually in
@@ -295,8 +308,13 @@ force), `device_budget_provenance` (`"Host"` — a startup probe settled on
 this value; `"HostFallback"` — no probe ran and the stated default was used
 instead; `"Explicit"` — `--max-vram` lowered it), and `device_peak_in_flight`
 (the device budget's own high-water count of tiles admitted at once during
-this run — distinct from `peak_in_flight`, which is the host scheduler's
-count and is reported on both paths). All three are `null` on the CPU path.
+**this group** — unlike `peak_in_flight`, this one is a real measurement, not
+a configured limit). `device_peak_in_flight` is scoped per group: in a
+multi-group run, each group in the wrapped `groups` document reports its own
+measurement, never a running maximum over the groups that preceded it in the
+same process. It is `0` for a group that admitted no tile through the device
+gate (fully served from the stage cache, say), and `null` only when there was
+no GPU backend at all. All three fields are `null` on the CPU path.
 
 Additive field `stages`: a per-stage wall-clock breakdown of `wall_seconds`
 — `setup`, `align`, `fuse` and `finalize`, each seconds as a float or `null`

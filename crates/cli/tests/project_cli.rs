@@ -9,6 +9,13 @@
 //! directory: `tools/check-fixtures.sh` diffs the present file list against
 //! `MANIFEST.sha256`, so one stray `.ffproj` under `fixtures/` fails the
 //! gate.
+//!
+//! Every test isolates `.scratch/` with its own per-process temp directory and
+//! `.current_dir(cwd)` through [`run_cli_in`]: `.scratch/resume` and
+//! `.scratch/projects` are resolved relative to the process's cwd, so tests
+//! sharing one cwd share one ledger store and race each other's cleanup -- and
+//! concurrent test runs sharing one `target/` must never share a working
+//! directory either.
 
 mod common;
 
@@ -19,22 +26,11 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
 }
 
-fn tmp_dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 struct CliOutput {
     success: bool,
     code: Option<i32>,
     stdout: String,
     stderr: String,
-}
-
-fn run_cli(args: &[&str]) -> CliOutput {
-    run_cli_in(Path::new("."), args)
 }
 
 /// Runs the binary with `cwd` as its working directory.
@@ -99,8 +95,13 @@ fn extensions<'a>(files: &'a [PathBuf], ext: &str) -> Vec<&'a PathBuf> {
 
 /// A writable copy of `fixtures/mantis-64`, so a beside-the-frames run has
 /// somewhere legal to land.
-fn fixture_copy(name: &str) -> PathBuf {
-    let dir = tmp_dir(name);
+///
+/// Returns the guard alongside the target path: `common::tmp_dir` returns a
+/// directory that deletes itself on drop, so a caller that only kept the
+/// `PathBuf` this used to return would have the tree removed before the CLI
+/// ever saw it.
+fn fixture_copy(name: &str) -> (common::TmpDir, PathBuf) {
+    let dir = common::tmp_dir(name);
     let target = dir.join("mantis-64");
     let frames = target.join("frames");
     std::fs::create_dir_all(&frames).unwrap();
@@ -108,7 +109,7 @@ fn fixture_copy(name: &str) -> PathBuf {
     for entry in std::fs::read_dir(&source).unwrap().flatten() {
         std::fs::copy(entry.path(), frames.join(entry.file_name())).unwrap();
     }
-    target
+    (dir, target)
 }
 
 fn stack_args<'a>(dir: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
@@ -126,8 +127,8 @@ fn stack_args<'a>(dir: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
 
 #[test]
 fn stack_writes_a_project_and_no_image() {
-    let cwd = tmp_dir("project_cli_no_image_cwd");
-    let out = tmp_dir("project_cli_no_image");
+    let cwd = common::tmp_dir("project_cli_no_image_cwd");
+    let out = common::tmp_dir("project_cli_no_image");
     let input = common::fixtures_dir().join("mantis-64");
     let result = run_cli_in(
         &cwd,
@@ -163,8 +164,8 @@ fn stack_writes_a_project_and_no_image() {
 
 #[test]
 fn project_lands_beside_the_frames() {
-    let cwd = tmp_dir("project_cli_beside_cwd");
-    let target = fixture_copy("project_cli_beside");
+    let cwd = common::tmp_dir("project_cli_beside_cwd");
+    let (_dir, target) = fixture_copy("project_cli_beside");
     let before = walk(&target);
     let result = run_cli_in(&cwd, &stack_args(target.to_str().unwrap(), &[]));
     assert!(result.success, "stderr: {}", result.stderr);
@@ -199,9 +200,9 @@ fn project_lands_beside_the_frames() {
 
 #[test]
 fn output_dir_collects_the_project() {
-    let cwd = tmp_dir("project_cli_collect_cwd");
-    let target = fixture_copy("project_cli_collect");
-    let out = tmp_dir("project_cli_collect_out");
+    let cwd = common::tmp_dir("project_cli_collect_cwd");
+    let (_dir, target) = fixture_copy("project_cli_collect");
+    let out = common::tmp_dir("project_cli_collect_out");
     let before = walk(&target);
     let result = run_cli_in(
         &cwd,
@@ -218,12 +219,17 @@ fn output_dir_collects_the_project() {
 
 #[test]
 fn refuses_a_missing_output_directory() {
-    let missing = tmp_dir("project_cli_missing_out").join("nope");
+    let cwd = common::tmp_dir("project_cli_missing_out_cwd");
+    // Bound, not a temporary: `common::tmp_dir` returns a guard that deletes
+    // its directory on drop, so `.join(..)` on an unbound temporary would
+    // have the tree gone before the CLI ever saw it.
+    let base = common::tmp_dir("project_cli_missing_out");
+    let missing = base.join("nope");
     let input = common::fixtures_dir().join("mantis-64");
-    let result = run_cli(&stack_args(
-        input.to_str().unwrap(),
-        &["-o", missing.to_str().unwrap()],
-    ));
+    let result = run_cli_in(
+        &cwd,
+        &stack_args(input.to_str().unwrap(), &["-o", missing.to_str().unwrap()]),
+    );
     assert!(!result.success);
     assert_eq!(result.code, Some(1));
     assert!(
@@ -236,12 +242,15 @@ fn refuses_a_missing_output_directory() {
 
 #[test]
 fn refuses_an_output_file_path_by_name() {
-    let out = tmp_dir("project_cli_output_file").join("out.tif");
+    let cwd = common::tmp_dir("project_cli_output_file_cwd");
+    // Bound, not a temporary -- see `refuses_a_missing_output_directory`.
+    let base = common::tmp_dir("project_cli_output_file");
+    let out = base.join("out.tif");
     let input = common::fixtures_dir().join("mantis-64");
-    let result = run_cli(&stack_args(
-        input.to_str().unwrap(),
-        &["-o", out.to_str().unwrap()],
-    ));
+    let result = run_cli_in(
+        &cwd,
+        &stack_args(input.to_str().unwrap(), &["-o", out.to_str().unwrap()]),
+    );
     assert!(!result.success);
     assert!(
         result.stderr.contains("export"),
@@ -253,18 +262,22 @@ fn refuses_an_output_file_path_by_name() {
 
 #[test]
 fn zmap_flag_is_refused_with_a_migration_message() {
-    let out = tmp_dir("project_cli_zmap_flag");
+    let cwd = common::tmp_dir("project_cli_zmap_flag_cwd");
+    let out = common::tmp_dir("project_cli_zmap_flag");
     let input = common::fixtures_dir().join("mantis-64");
     let zmap = out.join("map.tif");
-    let result = run_cli(&stack_args(
-        input.to_str().unwrap(),
-        &[
-            "-o",
-            out.to_str().unwrap(),
-            "--zmap",
-            zmap.to_str().unwrap(),
-        ],
-    ));
+    let result = run_cli_in(
+        &cwd,
+        &stack_args(
+            input.to_str().unwrap(),
+            &[
+                "-o",
+                out.to_str().unwrap(),
+                "--zmap",
+                zmap.to_str().unwrap(),
+            ],
+        ),
+    );
     assert!(!result.success);
     assert_eq!(result.code, Some(1), "never clap's exit 2");
     assert!(
@@ -281,7 +294,7 @@ fn zmap_flag_is_refused_with_a_migration_message() {
 
 #[test]
 fn one_project_per_group_and_a_failure_spares_the_others() {
-    let root = tmp_dir("project_cli_multi_group");
+    let root = common::tmp_dir("project_cli_multi_group");
     let good = root.join("good");
     let bad = root.join("bad");
     std::fs::create_dir_all(good.join("frames")).unwrap();
@@ -305,8 +318,8 @@ fn one_project_per_group_and_a_failure_spares_the_others() {
     let bytes = std::fs::read(&victim).unwrap();
     std::fs::write(&victim, &bytes[..bytes.len() / 2]).unwrap();
 
-    let cwd = tmp_dir("project_cli_multi_group_cwd");
-    let out = tmp_dir("project_cli_multi_group_out");
+    let cwd = common::tmp_dir("project_cli_multi_group_cwd");
+    let out = common::tmp_dir("project_cli_multi_group_out");
     let result = run_cli_in(
         &cwd,
         &stack_args(root.to_str().unwrap(), &["-o", out.to_str().unwrap()]),
@@ -321,8 +334,8 @@ fn one_project_per_group_and_a_failure_spares_the_others() {
 
 #[test]
 fn report_names_the_project_and_no_image() {
-    let cwd = tmp_dir("project_cli_report_cwd");
-    let out = tmp_dir("project_cli_report");
+    let cwd = common::tmp_dir("project_cli_report_cwd");
+    let out = common::tmp_dir("project_cli_report");
     let input = common::fixtures_dir().join("mantis-64");
     let result = run_cli_in(
         &cwd,
@@ -386,11 +399,11 @@ fn cancel_keeps_the_staged_planes_for_resume() {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
 
-    let cwd = tmp_dir("project_cli_cancel_cwd");
-    let out = tmp_dir("project_cli_cancel");
+    let cwd = common::tmp_dir("project_cli_cancel_cwd");
+    let out = common::tmp_dir("project_cli_cancel");
     let input = common::fixtures_dir().join("mantis-512");
     let mut child = bin()
-        .current_dir(&cwd)
+        .current_dir(&*cwd)
         .args(common::push_no_gpu(vec![
             "stack",
             input.to_str().unwrap(),

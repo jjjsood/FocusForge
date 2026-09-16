@@ -27,6 +27,56 @@ pub fn fixtures_dir() -> PathBuf {
     workspace_root().join("fixtures")
 }
 
+/// A fresh, empty directory, removed again when the test that made it ends
+/// -- used as a spawned process's own working directory, so `.scratch/`
+/// lands here and never collides with another test's.
+///
+/// Derefs to `Path`, so `&dir` and `dir.join(..)` read exactly as they did
+/// when a test file's own copy of this type was a bare `PathBuf`.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls
+/// [`tmp_dir`].
+#[allow(dead_code)]
+pub struct TmpDir {
+    path: PathBuf,
+}
+
+impl std::ops::Deref for TmpDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        // A failed test keeps its evidence -- the partials, the ledger and
+        // the outputs are exactly what a failure needs to be diagnosed.
+        if std::thread::panicking() {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// **Named per process, not just per test.** `CARGO_TARGET_TMPDIR` can be
+/// shared by concurrent `cargo test` runs, so without the pid two runs of
+/// the same test name raced on the same `.scratch/resume/` ledger: `error:
+/// .scratch/resume…: No such file or directory` and a `stack` run exiting 1
+/// where it should exit 0, reproduced 3 rounds out of 3.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+pub fn tmp_dir(name: &str) -> TmpDir {
+    let path =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    TmpDir { path }
+}
+
 /// Appends `--no-gpu` to `args` when this crate's own `gpu` feature is
 /// compiled in -- a no-op build has no such flag at all, not even as a
 /// no-op (`crates/cli/src/main.rs`'s own `#[cfg(feature = "gpu")]` on the
