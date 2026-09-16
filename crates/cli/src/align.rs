@@ -290,7 +290,7 @@ pub fn run(
         // probing for an adapter on every run would be noise with nothing to
         // show for it. `align` also has no `--max-vram` flag of its own, so
         // there is no ceiling to thread through.
-        let (backend, _device_budget_report) = crate::resolve_backend(no_gpu, None);
+        let backend = crate::resolve_backend(no_gpu, None).backend;
         if let Err(msg) = write_warped_frames(
             write_warped,
             &stack,

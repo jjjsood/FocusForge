@@ -246,15 +246,20 @@ in-flight byte budget actually in force), `budget_provenance` (`"Host"` —
 derived from the host's currently reported available memory;
 `"HostFallback"` — the host probe was unavailable and the stated default was
 used instead; `"Explicit"` — `--max-host-memory` lowered the budget), and
-`backed_off` (whether the runtime back-off shrunk the in-flight limit during
-this run because of observed memory pressure).
+`backed_off` (whether the **host** scheduler's runtime back-off shrunk the
+in-flight limit during this run because of observed *host memory* pressure —
+reported on both paths, since the host scheduler runs on the GPU path too;
+never about VRAM, since the device budget has no runtime back-off of its
+own).
 
 Additive fields from the device (VRAM) budget, GPU path only:
 `max_device_bytes_in_flight` (the in-flight device-byte budget actually in
-force) and `device_budget_provenance` (`"Host"` — a startup probe settled on
+force), `device_budget_provenance` (`"Host"` — a startup probe settled on
 this value; `"HostFallback"` — no probe ran and the stated default was used
-instead; `"Explicit"` — `--max-vram` lowered it). Both are `null` on the CPU
-path.
+instead; `"Explicit"` — `--max-vram` lowered it), and `device_peak_in_flight`
+(the device budget's own high-water count of tiles admitted at once during
+this run — distinct from `peak_in_flight`, which is the host scheduler's
+count and is reported on both paths). All three are `null` on the CPU path.
 
 Additive field `stages`: a per-stage wall-clock breakdown of `wall_seconds`
 — `setup`, `align`, `fuse` and `finalize`, each seconds as a float or `null`
@@ -275,21 +280,6 @@ or `"skipped"` run never runs the alignment driver itself, so it has no
 worker count of its own; reporting one from a previous run's cache entry
 would be a fabricated number, exactly the confusion `align_source` exists to
 prevent.
-
-Additive fields from the host-memory budget: `max_bytes_in_flight` (the
-in-flight byte budget actually in force), `budget_provenance` (`"Host"` —
-derived from the host's currently reported available memory;
-`"HostFallback"` — the host probe was unavailable and the stated default was
-used instead; `"Explicit"` — `--max-host-memory` lowered the budget), and
-`backed_off` (whether the runtime back-off shrunk the in-flight limit during
-this run because of observed memory pressure).
-
-Additive fields from the device (VRAM) budget, GPU path only:
-`max_device_bytes_in_flight` (the in-flight device-byte budget actually in
-force) and `device_budget_provenance` (`"Host"` — a startup probe settled on
-this value; `"HostFallback"` — no probe ran and the stated default was used
-instead; `"Explicit"` — `--max-vram` lowered it). Both are `null` on the CPU
-path.
 
 ```json
 {
@@ -317,6 +307,8 @@ path.
   "backend": "cpu",
   "max_device_bytes_in_flight": null,
   "device_budget_provenance": null,
+  "device_peak_in_flight": null,
+  "align_cached": false,
   "stages": { "setup": 0.001, "align": 0.012, "fuse": 0.016, "warp_write": null, "finalize": 0.001 },
   "align_source": "computed",
   "align_workers": 2,

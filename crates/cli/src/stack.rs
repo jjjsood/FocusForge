@@ -20,6 +20,7 @@ use focusforge_core::fuse::{
     BackendFusionConsumer, FusionConsumer, FusionGeometry,
     description::format_composite_description, laplacian::Laplacian,
 };
+use focusforge_core::gpu::TileBackend;
 use focusforge_core::io::{Group, Proposal, Rect, TiffSpec, TiffStack, propose};
 use focusforge_core::job::{
     AlignIdentity, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobOutcome, JobRecord,
@@ -67,8 +68,11 @@ pub struct StackReport {
     /// Where that budget came from: `Host` (adaptive), `HostFallback` (the
     /// probe degraded), or `Explicit` (`--max-host-memory` lowered it).
     pub budget_provenance: Provenance,
-    /// Whether the runtime back-off shrunk the in-flight limit during this
-    /// run.
+    /// Whether the **host** scheduler's runtime back-off (the process-RSS
+    /// pressure rule) shrunk the in-flight limit during this run -- reported
+    /// on both paths, since the host scheduler runs on the GPU path too.
+    /// Never about VRAM: the device budget has no runtime back-off of its
+    /// own to report.
     pub backed_off: bool,
     /// Final paths only -- never the `.partial` names a run writes to first.
     pub outputs: Vec<String>,
@@ -91,6 +95,11 @@ pub struct StackReport {
     /// `HostFallback` (no probe ran, the stated default was used), or
     /// `Explicit` (`--max-vram` lowered it) -- `null` on the CPU path.
     pub device_budget_provenance: Option<Provenance>,
+    /// The device budget's own high-water count of tiles admitted at once
+    /// during this run -- `null` on the CPU path. Distinct from
+    /// `peak_in_flight`, which is the *host* scheduler's count and is
+    /// reported on both paths.
+    pub device_peak_in_flight: Option<usize>,
     /// `true` only when the alignment came out of the stage cache;
     /// `false` for a computed one, a `--resume` ledger-peeked one, or a
     /// `--no-align` run. Additive field.
@@ -122,12 +131,45 @@ pub struct StackReport {
     pub peak_align_workers: Option<usize>,
 }
 
+/// A narrow, `crates/gpu`-free handle on a `GpuBackend`'s realized tile
+/// concurrency, scoped to exactly one group: [`Self::reset_peak`] before the
+/// group's drive, [`Self::peak_in_flight`] read only after it returns. Not a
+/// `TileBackend` method, because `crates/core` never learns what VRAM is;
+/// not a field on `DeviceBudgetReport`, because that number does not exist
+/// until the scheduler has run.
+pub trait DevicePeak {
+    fn peak_in_flight(&self) -> usize;
+}
+
 /// The settled device (VRAM) budget and its provenance. Lives in the CLI
 /// because `core` has no concept of VRAM.
 #[derive(Clone, Copy)]
 pub struct DeviceBudgetReport {
     pub max_device_bytes: u64,
     pub provenance: Provenance,
+}
+
+/// `resolve_backend`'s return value: a named struct rather than a growing
+/// tuple, since a third `Option<&'static dyn ...>` element would be a
+/// plausible `clippy::type_complexity` trip (warn-by-default, and the gate
+/// runs `clippy … -D warnings`). `backend` and `device_peak` coerce from the
+/// *same* `&'static GpuBackend` binding on the GPU path, so nothing re-enters
+/// the `GPU_BACKEND` `OnceLock` and no second probe or ceiling is observed.
+pub struct BackendChoice {
+    pub backend: Option<&'static dyn TileBackend>,
+    pub device_budget: Option<DeviceBudgetReport>,
+    pub device_peak: Option<&'static dyn DevicePeak>,
+}
+
+impl BackendChoice {
+    /// The CPU path: no backend, no device budget, no device peak.
+    pub fn cpu() -> Self {
+        BackendChoice {
+            backend: None,
+            device_budget: None,
+            device_peak: None,
+        }
+    }
 }
 
 /// `stack --json`'s `align` field: `null` when `--no-align` was given.
@@ -280,11 +322,14 @@ pub fn run(
     // therefore gated on the selected algorithm's own id, compared against
     // `Laplacian`'s own `id()` rather than a bare string literal repeated
     // here.
-    let (backend, device_budget_report) = if algo.id() == Laplacian.id() {
+    let choice = if algo.id() == Laplacian.id() {
         crate::resolve_backend(no_gpu, max_vram)
     } else {
-        (None, None)
+        BackendChoice::cpu()
     };
+    let backend = choice.backend;
+    let device_budget_report = choice.device_budget;
+    let device_peak = choice.device_peak;
 
     // Step 3: parse `--set` against that schema and overlay it on the
     // preset's `[stack]` table. An unknown key or an out-of-range value is
@@ -394,6 +439,7 @@ pub fn run(
         algo,
         backend,
         device_budget_report,
+        device_peak,
         explicit,
         file,
         align_opts,
@@ -457,6 +503,10 @@ struct RunSetup<'a> {
     /// The device (VRAM) budget settled on when `backend` was resolved --
     /// `None` on the CPU path, or when the GPU probe itself never ran.
     device_budget_report: Option<DeviceBudgetReport>,
+    /// The same `&'static GpuBackend` as `backend`, coerced to its narrow
+    /// `DevicePeak` handle -- `None` on the CPU path, mirroring
+    /// `device_budget_report`.
+    device_peak: Option<&'static dyn DevicePeak>,
     explicit: ParamValues,
     file: preset::Preset,
     align_opts: &'a AlignOptions<'a>,
@@ -772,6 +822,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         algo,
         backend,
         device_budget_report,
+        device_peak,
         explicit,
         file,
         align_opts,
@@ -782,10 +833,11 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         signals,
         input: dir,
     } = setup;
-    let (algo, backend, device_budget_report, explicit, file) = (
+    let (algo, backend, device_budget_report, device_peak, explicit, file) = (
         *algo,
         *backend,
         *device_budget_report,
+        *device_peak,
         explicit.clone(),
         file,
     );
@@ -1657,6 +1709,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         backend: backend_id,
         max_device_bytes_in_flight: device_budget_report.as_ref().map(|r| r.max_device_bytes),
         device_budget_provenance: device_budget_report.as_ref().map(|r| r.provenance),
+        device_peak_in_flight: device_peak.map(|p| p.peak_in_flight()),
         align_cached,
         stages,
         align_source,
@@ -1912,12 +1965,17 @@ fn render(report: &StackReport) -> String {
         report.max_bytes_in_flight, report.budget_provenance, report.backed_off,
     ));
     lines.push(format!("backend: {}", report.backend));
-    if let (Some(max_device_bytes_in_flight), Some(device_budget_provenance)) = (
+    if let (
+        Some(max_device_bytes_in_flight),
+        Some(device_budget_provenance),
+        Some(device_peak_in_flight),
+    ) = (
         report.max_device_bytes_in_flight,
         report.device_budget_provenance,
+        report.device_peak_in_flight,
     ) {
         lines.push(format!(
-            "max_device_bytes_in_flight={max_device_bytes_in_flight} device_budget={device_budget_provenance:?}"
+            "max_device_bytes_in_flight={max_device_bytes_in_flight} device_budget={device_budget_provenance:?} device_peak_in_flight={device_peak_in_flight}"
         ));
     }
     for output in &report.outputs {
@@ -2057,6 +2115,7 @@ mod tests {
             backend: "cpu".to_string(),
             max_device_bytes_in_flight: None,
             device_budget_provenance: None,
+            device_peak_in_flight: None,
             align_cached: false,
             stages: focusforge_core::timing::StageTimings {
                 setup: Some(0.012),
@@ -2115,6 +2174,31 @@ mod tests {
         assert!(
             !text.contains("align=0.000s"),
             "a never-entered stage must never render as 0.000s: {text}"
+        );
+    }
+
+    #[test]
+    fn render_names_the_device_line_on_the_gpu_path() {
+        let mut gpu_report = sample_report();
+        gpu_report.backend = "NVIDIA GeForce RTX 5070 Ti".to_string();
+        gpu_report.max_device_bytes_in_flight = Some(1 << 28);
+        gpu_report.device_budget_provenance = Some(Provenance::Host);
+        gpu_report.device_peak_in_flight = Some(2);
+        let text = render(&gpu_report);
+        for needle in [
+            "max_device_bytes_in_flight=268435456",
+            "device_budget=Host",
+            "device_peak_in_flight=2",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
+
+        // The negative half: the unmodified CPU `sample_report()` renders no
+        // device line at all.
+        let cpu_text = render(&sample_report());
+        assert!(
+            !cpu_text.contains("device_peak_in_flight"),
+            "CPU report must render no device_peak_in_flight substring: {cpu_text}"
         );
     }
 

@@ -729,9 +729,18 @@ fn report_json_has_every_field() {
         "stages",
         "align_workers",
         "peak_align_workers",
+        "device_peak_in_flight",
     ] {
         assert!(report.get(key).is_some(), "missing key {key:?} in {report}");
     }
+    // `--algo dummy-stack` never resolves a backend at all (`crates/cli/src/stack.rs`'s
+    // `run`), so this run is the CPU half of the presence/absence check even on a
+    // default `gpu` build: the new field must be exactly `null`.
+    assert_eq!(
+        report["device_peak_in_flight"],
+        serde_json::Value::Null,
+        "report: {report}"
+    );
     let params = report["params"].as_array().expect("params array");
     assert!(!params.is_empty());
     for p in params {
