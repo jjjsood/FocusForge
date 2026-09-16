@@ -311,11 +311,13 @@ run_stack() {
   if [ "$ALGO" = "laplacian" ]; then
     algo_settings=(--set levels=5)
   fi
+  # `--no-cache`: a stage-cache hit would report a cached alignment instead
+  # of a measurement.
   tools/with-lock.sh build -- tools/with-lock.sh gpu -- \
     /usr/bin/time -v "$CLI" stack "$OUT_DIR/frames" \
       -o "$out" \
       --algo "$ALGO" "${algo_settings[@]}" --json \
-      --no-crop "${align_flags[@]}" --no-gpu \
+      --no-crop "${align_flags[@]}" --no-gpu --no-cache \
       > "$out/stack.json" 2> "$out/time-v.txt"
 
   # A stacking run writes a project, not an image. The two TIFFs
