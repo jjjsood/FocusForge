@@ -32,10 +32,6 @@ use focusforge_core::params::ParamValues;
 use focusforge_core::project::{self, Metrics, PROJECT_EXTENSION, SealRequest};
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
-fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
-}
-
 /// A private copy of the built CLI binary, frozen at the moment it is taken.
 ///
 /// `CARGO_BIN_EXE_focusforge-cli` resolves to one fixed path in the shared
@@ -49,18 +45,23 @@ fn snapshot_bin(dir: &Path) -> PathBuf {
     dst
 }
 
-fn run_bin(dir: &Path, path: &Path, args: &[&str]) -> CliOutput {
-    let output = Command::new(path)
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("failed to run binary");
+fn cli_output(output: std::process::Output) -> CliOutput {
     CliOutput {
         success: output.status.success(),
         code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
+}
+
+fn run_bin(dir: &Path, path: &Path, args: &[&str]) -> CliOutput {
+    cli_output(
+        Command::new(path)
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to run binary"),
+    )
 }
 
 struct CliOutput {
@@ -71,17 +72,7 @@ struct CliOutput {
 }
 
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
-    let output = bin()
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("failed to run binary");
-    CliOutput {
-        success: output.status.success(),
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    run_bin(dir, Path::new(env!("CARGO_BIN_EXE_focusforge-cli")), args)
 }
 
 fn mantis_512_dir() -> PathBuf {

@@ -76,17 +76,22 @@ struct CliOutput {
     stderr: String,
 }
 
-fn run(dir: &Path, args: &[&str]) -> CliOutput {
-    let output = bin()
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("failed to run binary");
+fn cli_output(output: std::process::Output) -> CliOutput {
     CliOutput {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
+}
+
+fn run(dir: &Path, args: &[&str]) -> CliOutput {
+    cli_output(
+        bin()
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to run binary"),
+    )
 }
 
 /// Shared `stack` invocation for the `--max-vram` tests below: laplacian +
@@ -132,11 +137,7 @@ fn run_with_no_adapter(dir: &Path, args: &[&str]) -> Option<CliOutput> {
         .env("WGPU_BACKEND", "dx12")
         .output()
         .expect("failed to run binary");
-    Some(CliOutput {
-        success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
+    Some(cli_output(output))
 }
 
 /// A `stack` run with a usable adapter (no flag, the GPU path) must produce
