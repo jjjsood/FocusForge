@@ -54,6 +54,12 @@ pub mod input_config;
 /// `src/bridge.rs`/`src/main.rs` reach its types directly.
 pub mod viewport;
 
+/// The `Settings` dock panel model, generated from `ParamDesc` alone -- no
+/// `use slint::` anywhere in it. `pub` so `tests/settings_panel.rs` reaches
+/// its types directly, the same way `tests/tab_scroll.rs` reaches
+/// `crate::controller`'s mirrored geometry.
+pub mod settings_panel;
+
 /// The wgpu half of the canvas: texture creation and
 /// `slint::Image::try_from`, the only module in the crate naming `wgpu` or
 /// `slint::wgpu_29`. `pub` so `src/main.rs` can drive it

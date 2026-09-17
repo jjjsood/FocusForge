@@ -1,0 +1,1036 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! The `Settings` dock panel, generated from `ParamDesc` alone. Plain Rust,
+//! no `use slint::` anywhere in this file -- `build_rows` turns a
+//! resolved schema into the flat [`SettingsRow`] list
+//! `ui/shell/dock/settings_panel.slint`'s `for` loop renders, and every
+//! `focusforge_core` reference the panel needs lives here, so
+//! `crate::controller` never names that crate directly. [`crate::settings_panel::control_kind`] is
+//! the crate's only `match` on `ParamKind`.
+
+use std::collections::BTreeMap;
+
+// Re-exported (`pub(crate)`) so `crate::controller` can name the types it
+// stores on a project tab and passes to a mutator -- `ParamDesc`'s own
+// fields and `resolve_in`/`registry`/`Family` stay private to this module,
+// the only place that resolves a schema.
+use focusforge_core::params::{ParamDesc, ParamKind, ResolvedParams, resolve_in};
+pub(crate) use focusforge_core::params::{ParamValue, ParamValues, ParamViolation, StackContext};
+use focusforge_core::registry;
+
+use crate::entry::GuiProject;
+
+/// The active tab's own state [`build_rows`] needs -- a plain view over
+/// `crate::controller::ProjectTab`'s fields, so this module never has to
+/// name that type.
+pub(crate) struct ActiveTabParams<'a> {
+    pub ctx: Option<&'a StackContext>,
+    pub errors: &'a BTreeMap<String, ParamViolation>,
+    pub menu_open: Option<&'a str>,
+    pub fuse_id: &'a str,
+    pub fuse_values: &'a ParamValues,
+    pub align_id: &'a str,
+    pub align_values: &'a ParamValues,
+    pub project_values: &'a ParamValues,
+}
+
+/// The Fuse/Align algorithm ids and explicit values a newly created tab
+/// starts with: the first id-sorted registry entry of each family with no
+/// explicit values for an unsaved project, or the sealed manifest's own
+/// algorithm/params for a reopened one -- every key on a reopened project
+/// therefore resolves `Explicit`, never `Default`. A manifest recorded with no
+/// `align` (a `--no-align` run) falls back to the same registry seeding an
+/// unsaved tab gets.
+pub(crate) fn seed_algorithm_state(
+    project: &GuiProject,
+) -> (String, ParamValues, String, ParamValues) {
+    match project {
+        GuiProject::Unsaved(_) => (
+            default_fuse_id(),
+            ParamValues::new(),
+            default_align_id(),
+            ParamValues::new(),
+        ),
+        GuiProject::Opened(opened) => {
+            let manifest = opened.manifest();
+            let (align_id, align_values) = match &manifest.align {
+                Some(record) => (record.algorithm.clone(), record.params.clone()),
+                None => (default_align_id(), ParamValues::new()),
+            };
+            (
+                manifest.algorithm.clone(),
+                manifest.params.clone(),
+                align_id,
+                align_values,
+            )
+        }
+    }
+}
+
+/// The lowest id in the stack-algorithm registry -- already id-sorted, since
+/// [`registry::stack_algorithms`] iterates a `BTreeMap` keyed by id -- empty
+/// only if no stacking algorithm is registered at all, which the shipped
+/// registry never produces.
+fn default_fuse_id() -> String {
+    registry::stack_algorithms()
+        .first()
+        .map(|a| a.id().to_string())
+        .unwrap_or_default()
+}
+
+/// [`default_fuse_id`]'s twin for the alignment family.
+fn default_align_id() -> String {
+    registry::align_algorithms()
+        .first()
+        .map(|a| a.id().to_string())
+        .unwrap_or_default()
+}
+
+/// One row's visual control. `Float { logarithmic: true }` and `Float {
+/// logarithmic: false }` are deliberately two different arms -- the
+/// `logarithmic` flag changes the control, not a caption on it. `Int`
+/// shares [`row_height`]'s linear-slider metric with `LinearFloat` (both
+/// render through `FFSlider { scale: "linear" }`) but stays its own arm,
+/// since [`control_kind`]'s match has one arm per `ParamKind` shape and a
+/// shared render is not a shared kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    /// A section's own heading row: `FUSE` / `ALIGN` / `CROP`, carrying
+    /// [`HeadingState`] and the `DEFAULT` badge.
+    SectionHeading,
+    /// The Fuse/Align algorithm picker -- not a `ParamKind`, a pseudo-row
+    /// ahead of the schema's own params.
+    Picker,
+    LinearFloat,
+    LogFloat,
+    Int,
+    Bool,
+    Enum,
+    /// One field's violation message, dropped in beside it.
+    Error,
+    /// The panel's own last row: resets every section at once, enabled only
+    /// once `build_rows` has produced at least one [`HeadingState::Explicit`]
+    /// heading. `SettingsRow::selected` carries `"true"`/`"false"` for its
+    /// enabled state, the same convention [`RowKind::Bool`] uses for its own
+    /// value.
+    ResetAll,
+}
+
+/// A section heading's provenance axis. `Default` carries the `DEFAULT`
+/// badge; `Explicit` is what makes the panel's own reset-all row enabled;
+/// `Pending` carries neither, since no value has been derived yet. `Host`
+/// and `HostFallback` fold into `Default` here -- both mean the app derived
+/// the value, not the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadingState {
+    Default,
+    Explicit,
+    Pending,
+}
+
+/// One row of the panel's flat list -- the plain twin of
+/// `ui/shell/dock/settings_panel.slint`'s generated `SettingsRow` struct.
+/// Every kind uses a different subset of these fields; unused fields carry
+/// their type's default.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsRow {
+    pub kind: RowKind,
+    /// Which of the three `ParamValues` maps a mutation on this row targets
+    /// -- `"fuse"`, `"align"` or `"crop"`. Param ids are unique only
+    /// *within* one algorithm's own schema, never across the whole panel,
+    /// so a callback needs this alongside `id` to know which map to write.
+    pub section: String,
+    /// The parameter id (`"algorithm"` for a [`RowKind::Picker`] row, the
+    /// section name for a [`RowKind::SectionHeading`] row).
+    pub id: String,
+    pub label: String,
+    /// The control's rendered value: a slider's readout, a field's text.
+    pub value_text: String,
+    /// A slider's thumb position, `0.0..=1.0`. Meaningless off
+    /// `LinearFloat`/`LogFloat`/`Int`.
+    pub fraction: f32,
+    /// An enum/picker menu's option labels, in order.
+    pub choices: Vec<String>,
+    /// The same menu's option ids, index-paired with `choices`.
+    pub choice_ids: Vec<String>,
+    /// The currently selected id (`Enum`/`Picker`) or `"true"`/`"false"`
+    /// (`Bool`).
+    pub selected: String,
+    pub menu_open: bool,
+    pub heading_state: HeadingState,
+    /// This row's cumulative top offset in the content column, set by
+    /// [`assign_tops`] after every row is built -- the `.slint` side reads
+    /// it directly rather than accumulating row heights itself, the same
+    /// non-uniform-pitch shape the tab strip's fixed `tab-pitch` does not
+    /// need.
+    pub top: f32,
+}
+
+impl SettingsRow {
+    pub(crate) fn heading(section: &str, label: &str, state: HeadingState) -> Self {
+        SettingsRow {
+            kind: RowKind::SectionHeading,
+            section: section.to_string(),
+            id: section.to_string(),
+            label: label.to_string(),
+            value_text: String::new(),
+            fraction: 0.0,
+            choices: Vec::new(),
+            choice_ids: Vec::new(),
+            selected: String::new(),
+            menu_open: false,
+            heading_state: state,
+            top: 0.0,
+        }
+    }
+}
+
+/// The whole panel, as `AppController::settings_panel` builds it every time
+/// the active tab or its values change -- never diffed, always rebuilt: the
+/// schema is small (at most a few dozen rows) and rebuilding is what keeps
+/// "one section per family, one field per `ParamDesc`" true by construction
+/// rather than by an incremental patch that could drift from it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PanelModel {
+    pub rows: Vec<SettingsRow>,
+    /// The index into `rows` of the heading currently stuck to the
+    /// viewport's top, if any.
+    pub sticky: Option<usize>,
+    /// How far `sticky` has already been pushed off the viewport's own top
+    /// edge by the next heading arriving from below -- see
+    /// [`sticky_push`].
+    pub sticky_push: f32,
+    pub content_height: f32,
+    pub scroll_y: f32,
+    pub viewport_height: f32,
+}
+
+// -- Geometry, mirroring `ShellGeometry`'s panel metrics (`ui/geometry.slint`)
+// exactly as `crate::controller::TAB_PITCH` mirrors `ShellGeometry.tab-pitch`.
+// No inter-row gap constant: the gap before the next row's label is part of
+// a row's own height, so `content_height` (a plain sum) is exactly what
+// `ui/shell/dock/settings_panel.slint` lays out -- the same discipline the
+// tab strip's fixed pitch already uses. --
+
+/// `ShellGeometry.param-label-height`: a slider/field/menu row's own label
+/// line, above its control. A toggle row's label sits beside the control
+/// instead, so [`row_height`] does not add this for [`RowKind::Bool`].
+pub const PARAM_LABEL_HEIGHT: f32 = 17.0;
+/// `ShellGeometry.param-row-linear`: `FFSlider { scale: "linear" }`'s own
+/// visual height plus the gap to the next row, shared by
+/// [`RowKind::LinearFloat`] and [`RowKind::Int`].
+pub const PARAM_ROW_LINEAR: f32 = 43.0;
+/// `ShellGeometry.param-row-log`: `FFSlider { scale: "logarithmic" }`'s own
+/// visual height plus its trailing gap -- 17 px more than the linear scale,
+/// for the decade-tick line.
+pub const PARAM_ROW_LOG: f32 = 60.0;
+/// `ShellGeometry.param-row-field`: the algorithm picker's closed row plus
+/// its trailing gap.
+pub const PARAM_ROW_FIELD: f32 = 45.0;
+/// `ShellGeometry.param-row-bool`: `FFToggle`'s own row, label and control
+/// on one line. Always the last row of a section, so it carries no trailing
+/// gap of its own.
+pub const PARAM_ROW_BOOL: f32 = 20.0;
+/// `ShellGeometry.param-row-enum`: `FFMenu`'s closed row plus its trailing
+/// gap.
+pub const PARAM_ROW_ENUM: f32 = 43.0;
+/// `ShellGeometry.param-error-height`.
+pub const PARAM_ERROR_HEIGHT: f32 = 16.0;
+/// `ShellGeometry.section-heading-height`: the label/badge band itself, one
+/// fixed height for every [`HeadingState`] -- only the badge's own
+/// visibility varies, never this row's size.
+pub const SECTION_HEADING_HEIGHT: f32 = 41.0;
+/// `ShellGeometry.section-heading-bottom-gap`: trailing space after the
+/// band above, before the section's first field.
+pub const SECTION_HEADING_BOTTOM_GAP: f32 = 8.0;
+/// `ShellGeometry.panel-content-width`. Every row is this wide, whatever an
+/// `EnumVariant.label` measures -- no control's geometry is derived from a
+/// label's width.
+pub const PANEL_CONTENT_WIDTH: f32 = 228.0;
+/// A slider row's readout field, flush right, plus the gap that separates
+/// it from the track (`ui/components/ff_slider.slint`'s `70px`).
+pub const SLIDER_READOUT_RESERVE: f32 = 70.0;
+/// A slider's own draggable track width: the row's full width minus its
+/// readout field.
+pub const SLIDER_TRACK_WIDTH: f32 = PANEL_CONTENT_WIDTH - SLIDER_READOUT_RESERVE;
+/// Read room past the last row's own bottom edge (`Theme.space-4`):
+/// without it, scrolling to the end leaves the last row's text flush
+/// against the viewport's own bottom edge.
+pub const PANEL_BOTTOM_BUFFER: f32 = 16.0;
+/// `ShellGeometry.reset-all-top-gap`: two grid steps above the panel's own
+/// bottom-of-list reset control, separating it clearly from the last
+/// section -- more than [`SECTION_HEADING_BOTTOM_GAP`], since this is a
+/// break between the fields and a standalone action, not a heading and its
+/// own section.
+pub const RESET_ALL_TOP_GAP: f32 = 32.0;
+/// `ShellGeometry.reset-all-height`: the reset-all control's own height.
+pub const RESET_ALL_HEIGHT: f32 = 32.0;
+
+/// The one match on [`ParamKind`] in the crate. `Float { logarithmic: true
+/// }` and `Float { logarithmic: false }` are separate arms -- the flag
+/// changes the control, not a caption on it -- and there is no `_` arm: a
+/// fifth `ParamKind` shape is a compile error here, never a silent
+/// mis-render.
+pub fn control_kind(kind: &ParamKind) -> RowKind {
+    match kind {
+        ParamKind::Float {
+            logarithmic: true, ..
+        } => RowKind::LogFloat,
+        ParamKind::Float {
+            logarithmic: false, ..
+        } => RowKind::LinearFloat,
+        ParamKind::Int { .. } => RowKind::Int,
+        ParamKind::Bool => RowKind::Bool,
+        ParamKind::Enum { .. } => RowKind::Enum,
+    }
+}
+
+/// A slider's thumb position for `value` against `kind`'s declared bounds,
+/// `0.0..=1.0`. The logarithmic reading is `(ln v - ln min) / (ln max - ln
+/// min)`, falling back to the linear reading when `min <= 0` -- a
+/// synthetic `min: 0.0` descriptor cannot take a logarithm of zero.
+/// Deliberately an `if let` chain, not a `match`, so [`control_kind`] stays
+/// the crate's only `match` on `ParamKind`.
+pub fn slider_fraction(value: f64, kind: &ParamKind) -> f32 {
+    if let &ParamKind::Float {
+        min,
+        max,
+        logarithmic,
+        ..
+    } = kind
+    {
+        if logarithmic && min > 0.0 {
+            let fraction = (value.max(min).ln() - min.ln()) / (max.ln() - min.ln());
+            return fraction.clamp(0.0, 1.0) as f32;
+        }
+        return linear_fraction(value, min, max);
+    }
+    if let &ParamKind::Int { min, max } = kind {
+        return linear_fraction(value, min as f64, max as f64);
+    }
+    0.0
+}
+
+fn linear_fraction(value: f64, min: f64, max: f64) -> f32 {
+    if max <= min {
+        return 0.0;
+    }
+    (((value - min) / (max - min)).clamp(0.0, 1.0)) as f32
+}
+
+/// [`slider_fraction`]'s inverse: a thumb position back into a [`ParamValue`]
+/// of `kind`'s own declared shape. `Int` rounds to the nearest whole value.
+pub fn slider_value(fraction: f32, kind: &ParamKind) -> ParamValue {
+    let fraction = fraction.clamp(0.0, 1.0) as f64;
+    if let &ParamKind::Float {
+        min,
+        max,
+        logarithmic,
+        ..
+    } = kind
+    {
+        if logarithmic && min > 0.0 {
+            return ParamValue::Float((min.ln() + fraction * (max.ln() - min.ln())).exp());
+        }
+        return ParamValue::Float(min + fraction * (max - min));
+    }
+    if let &ParamKind::Int { min, max } = kind {
+        let v = min as f64 + fraction * (max as f64 - min as f64);
+        return ParamValue::Int(v.round() as i64);
+    }
+    ParamValue::Float(fraction)
+}
+
+/// A [`ParamViolation`]'s message with its leading `<id>: ` dropped, so a
+/// message rendered beside a field that already carries its own label does
+/// not repeat the id. [`ParamViolation::UnknownKey`] carries no such prefix
+/// at all and is returned verbatim; [`ParamViolation::Auto`] carries two
+/// (its own, and its boxed `source`'s), so this recurses rather than
+/// splitting once. [`ParamViolation::Unparsable`] is replaced outright: the
+/// core's own message quotes the rejected text and names the target kind for
+/// a CLI reader, but a field beside its own (still visible) value only needs
+/// to say it was not one.
+pub fn violation_text(violation: &ParamViolation) -> String {
+    match violation {
+        ParamViolation::UnknownKey { .. } => violation.to_string(),
+        ParamViolation::Auto { source, .. } => {
+            format!("auto value rejected: {}", violation_text(source))
+        }
+        // The core message quotes the unparsable text and names the target
+        // kind for a CLI reader; a field beside its own value needs neither.
+        ParamViolation::Unparsable { kind, .. } if *kind == "bool" => "Not true or false".into(),
+        ParamViolation::Unparsable { .. } => "Not a number".into(),
+        other => {
+            let rendered = other.to_string();
+            match rendered.split_once(": ") {
+                Some((_, rest)) => rest.to_string(),
+                None => rendered,
+            }
+        }
+    }
+}
+
+/// `"<section>:<id>"` -- the one key format the picker's own pseudo-field
+/// (`id == "algorithm"`), an enum's open menu and a field's stored error all
+/// share, so `AppController` never formats it more than once.
+pub fn menu_key(section: &str, id: &str) -> String {
+    format!("{section}:{id}")
+}
+
+/// The `&'static ParamDesc` `section`'s current algorithm (or, for `"crop"`,
+/// the project schema) declares for `id` -- `None` when the section is
+/// unknown or the algorithm behind `fuse_id`/`align_id` carries no such
+/// parameter, which a mid-drag algorithm switch can produce.
+pub fn find_desc(
+    section: &str,
+    fuse_id: &str,
+    align_id: &str,
+    id: &str,
+) -> Option<&'static ParamDesc> {
+    let schema: &'static [ParamDesc] = match section {
+        "fuse" => registry::find_stack(fuse_id).ok()?.params(),
+        "align" => registry::find_align(align_id).ok()?.params(),
+        "crop" => &focusforge_core::project::PROJECT_PARAMS,
+        _ => return None,
+    };
+    schema.iter().find(|desc| desc.id == id)
+}
+
+/// What every section shares while [`section_rows`] resolves its own rows --
+/// bundled so the function takes one context argument rather than four.
+#[derive(Clone, Copy)]
+struct SectionContext<'a> {
+    ctx: Option<&'a StackContext>,
+    host: &'a focusforge_core::host::HostFacts,
+    errors: &'a BTreeMap<String, ParamViolation>,
+    menu_open: Option<&'a str>,
+}
+
+/// Builds the whole panel's flat row list, Fuse then Align then Crop: each
+/// section's heading, its algorithm picker (Fuse/Align only), then one row
+/// per [`ParamDesc`] in declaration order with an [`RowKind::Error`] row
+/// trailing any field in violation. With no tab active the panel still
+/// renders, seeded like a fresh unsaved tab but with no [`StackContext`].
+pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow> {
+    let empty_values = ParamValues::new();
+    let empty_errors = BTreeMap::new();
+    let default_fuse_id = default_fuse_id();
+    let default_align_id = default_align_id();
+
+    let (ctx, errors, menu_open, fuse_id, fuse_values, align_id, align_values, project_values) =
+        match &active {
+            Some(a) => (
+                a.ctx,
+                a.errors,
+                a.menu_open,
+                a.fuse_id,
+                a.fuse_values,
+                a.align_id,
+                a.align_values,
+                a.project_values,
+            ),
+            None => (
+                None,
+                &empty_errors,
+                None,
+                default_fuse_id.as_str(),
+                &empty_values,
+                default_align_id.as_str(),
+                &empty_values,
+                &empty_values,
+            ),
+        };
+
+    let host = focusforge_core::host::snapshot();
+    let section_ctx = SectionContext {
+        ctx,
+        host: &host,
+        errors,
+        menu_open,
+    };
+    let mut rows = Vec::new();
+
+    if let Ok(fuse) = registry::find_stack(fuse_id) {
+        let picker: Vec<(String, String)> = registry::stack_algorithms()
+            .iter()
+            .map(|a| (a.id().to_string(), a.display_name().to_string()))
+            .collect();
+        rows.extend(section_rows(
+            "fuse",
+            "FUSE",
+            fuse.params(),
+            fuse_values,
+            &section_ctx,
+            Some((fuse_id, picker)),
+        ));
+    }
+    if let Ok(align) = registry::find_align(align_id) {
+        let picker: Vec<(String, String)> = registry::align_algorithms()
+            .iter()
+            .map(|a| (a.id().to_string(), a.display_name().to_string()))
+            .collect();
+        rows.extend(section_rows(
+            "align",
+            "ALIGN",
+            align.params(),
+            align_values,
+            &section_ctx,
+            Some((align_id, picker)),
+        ));
+    }
+    rows.extend(section_rows(
+        "crop",
+        "CROP",
+        &focusforge_core::project::PROJECT_PARAMS,
+        project_values,
+        &section_ctx,
+        None,
+    ));
+
+    let any_explicit = rows
+        .iter()
+        .any(|r| r.kind == RowKind::SectionHeading && r.heading_state == HeadingState::Explicit);
+    rows.push(SettingsRow {
+        kind: RowKind::ResetAll,
+        section: String::new(),
+        id: String::new(),
+        label: String::new(),
+        value_text: String::new(),
+        fraction: 0.0,
+        choices: Vec::new(),
+        choice_ids: Vec::new(),
+        selected: any_explicit.to_string(),
+        menu_open: false,
+        heading_state: HeadingState::Pending,
+        top: 0.0,
+    });
+
+    rows
+}
+
+/// One section's own rows: its heading, its algorithm picker when `picker`
+/// is `Some`, and one row (plus a trailing [`RowKind::Error`] row on a
+/// violation) per entry of `schema`, in declaration order.
+fn section_rows(
+    section: &str,
+    heading_label: &str,
+    schema: &[ParamDesc],
+    values: &ParamValues,
+    section_ctx: &SectionContext<'_>,
+    picker: Option<(&str, Vec<(String, String)>)>,
+) -> Vec<SettingsRow> {
+    let SectionContext {
+        ctx,
+        host,
+        errors,
+        menu_open,
+    } = *section_ctx;
+
+    let heading_state = if !values.is_empty() {
+        HeadingState::Explicit
+    } else if ctx.is_some() {
+        HeadingState::Default
+    } else {
+        HeadingState::Pending
+    };
+
+    let mut rows = vec![SettingsRow::heading(section, heading_label, heading_state)];
+
+    if let Some((selected_id, options)) = picker {
+        let key = menu_key(section, "algorithm");
+        let value_text = options
+            .iter()
+            .find(|(id, _)| id == selected_id)
+            .map(|(_, label)| label.clone())
+            .unwrap_or_default();
+        let (choice_ids, choices): (Vec<String>, Vec<String>) = options.into_iter().unzip();
+        rows.push(SettingsRow {
+            kind: RowKind::Picker,
+            section: section.to_string(),
+            id: "algorithm".to_string(),
+            label: "Algorithm".to_string(),
+            value_text,
+            fraction: 0.0,
+            choices,
+            choice_ids,
+            selected: selected_id.to_string(),
+            menu_open: menu_open == Some(key.as_str()),
+            heading_state: HeadingState::Default,
+            top: 0.0,
+        });
+    }
+
+    // Resolved once per section against the whole schema: cheap (at most a
+    // few dozen parameters) and it keeps every field's value in the one call
+    // `resolve_in` documents as authoritative. A resolution failure (an
+    // out-of-range `auto`/`host_default` value, never produced by a shipped
+    // schema) falls back to each descriptor's own stated default rather than
+    // losing every other field in the section.
+    let resolved: ResolvedParams = resolve_in(schema, values, ctx, host).unwrap_or_default();
+
+    for desc in schema {
+        let key = menu_key(section, &desc.id);
+        let value = resolved
+            .get(&desc.id)
+            .map(|r| r.value.clone())
+            .unwrap_or_else(|| desc.default.clone());
+        rows.push(field_row(
+            section,
+            desc,
+            &value,
+            menu_open == Some(key.as_str()),
+        ));
+        if let Some(violation) = errors.get(&key) {
+            rows.push(SettingsRow {
+                kind: RowKind::Error,
+                section: section.to_string(),
+                id: desc.id.clone(),
+                label: String::new(),
+                value_text: violation_text(violation),
+                fraction: 0.0,
+                choices: Vec::new(),
+                choice_ids: Vec::new(),
+                selected: String::new(),
+                menu_open: false,
+                heading_state: HeadingState::Default,
+                top: 0.0,
+            });
+        }
+    }
+
+    rows
+}
+
+/// One parameter's own row, its shape ([`control_kind`]) driving which of
+/// `value_text`/`fraction`/`choices`/`selected` carries the value.
+fn field_row(section: &str, desc: &ParamDesc, value: &ParamValue, menu_open: bool) -> SettingsRow {
+    let kind = control_kind(&desc.kind);
+    let mut row = SettingsRow {
+        kind,
+        section: section.to_string(),
+        id: desc.id.clone(),
+        label: desc.label.clone(),
+        value_text: String::new(),
+        fraction: 0.0,
+        choices: Vec::new(),
+        choice_ids: Vec::new(),
+        selected: String::new(),
+        menu_open: false,
+        heading_state: HeadingState::Default,
+        top: 0.0,
+    };
+    match kind {
+        RowKind::LinearFloat | RowKind::LogFloat => {
+            let v = value.as_f64().unwrap_or_default();
+            row.value_text = format!("{v}");
+            row.fraction = slider_fraction(v, &desc.kind);
+        }
+        RowKind::Int => {
+            let v = value.as_i64().unwrap_or_default();
+            row.value_text = v.to_string();
+            row.fraction = slider_fraction(v as f64, &desc.kind);
+        }
+        RowKind::Bool => {
+            let v = value.as_bool().unwrap_or_default();
+            row.selected = v.to_string();
+            row.value_text = row.selected.clone();
+        }
+        RowKind::Enum => {
+            let selected = value.as_enum().unwrap_or_default().to_string();
+            if let ParamKind::Enum { variants } = &desc.kind {
+                row.value_text = variants
+                    .iter()
+                    .find(|v| v.id == selected)
+                    .map(|v| v.label.clone())
+                    .unwrap_or_default();
+                row.choice_ids = variants.iter().map(|v| v.id.clone()).collect();
+                row.choices = variants.iter().map(|v| v.label.clone()).collect();
+            }
+            row.selected = selected;
+            row.menu_open = menu_open;
+        }
+        RowKind::SectionHeading | RowKind::Picker | RowKind::Error | RowKind::ResetAll => {
+            unreachable!("control_kind never returns a pseudo-row kind")
+        }
+    }
+    row
+}
+
+/// One `RowKind`'s own height -- `PARAM_LABEL_HEIGHT` plus the control's
+/// height for every label-above-control row, the control's own height alone
+/// for [`RowKind::Bool`] (label beside the toggle) and [`RowKind::Error`]
+/// (no label). [`RowKind::SectionHeading`] is never queried here: only
+/// [`content_height`] reads its dedicated [`SECTION_HEADING_HEIGHT`].
+pub fn row_height(kind: RowKind) -> f32 {
+    match kind {
+        RowKind::SectionHeading => {
+            unreachable!("a heading's height is content_height's own constant, not this table")
+        }
+        RowKind::Picker => PARAM_LABEL_HEIGHT + PARAM_ROW_FIELD,
+        RowKind::LinearFloat | RowKind::Int => PARAM_LABEL_HEIGHT + PARAM_ROW_LINEAR,
+        RowKind::LogFloat => PARAM_LABEL_HEIGHT + PARAM_ROW_LOG,
+        RowKind::Enum => PARAM_LABEL_HEIGHT + PARAM_ROW_ENUM,
+        RowKind::Bool => PARAM_ROW_BOOL,
+        RowKind::Error => PARAM_ERROR_HEIGHT,
+        RowKind::ResetAll => RESET_ALL_TOP_GAP + RESET_ALL_HEIGHT,
+    }
+}
+
+/// The whole content column's height: every row's own height, a
+/// [`RowKind::SectionHeading`] reading [`SECTION_HEADING_HEIGHT`] rather
+/// than from [`row_height`].
+pub fn content_height(rows: &[SettingsRow]) -> f32 {
+    rows.iter().map(row_total_height).sum::<f32>() + PANEL_BOTTOM_BUFFER
+}
+
+/// Sets every row's [`SettingsRow::top`] to its cumulative offset in the
+/// content column -- called once after the row list is built, before the
+/// model is handed to `.slint`.
+pub fn assign_tops(rows: &mut [SettingsRow]) {
+    let mut y = 0.0;
+    for row in rows.iter_mut() {
+        row.top = y;
+        y += row_total_height(row);
+    }
+}
+
+fn row_total_height(row: &SettingsRow) -> f32 {
+    if row.kind == RowKind::SectionHeading {
+        SECTION_HEADING_HEIGHT + SECTION_HEADING_BOTTOM_GAP
+    } else {
+        row_height(row.kind)
+    }
+}
+
+/// `offset` clamped to `0 ..= max(content - viewport, 0)` -- the panel's own
+/// twin of `crate::controller::clamp_tab_scroll`.
+pub fn clamp_panel_scroll(offset: f32, content_height: f32, viewport_height: f32) -> f32 {
+    offset.clamp(0.0, (content_height - viewport_height).max(0.0))
+}
+
+/// The index into `rows` whose own `[top, top + height)` band contains
+/// `y`, a content-column offset -- `None` above the first row or at or past
+/// the last row's bottom edge.
+pub fn row_at(rows: &[SettingsRow], y: f32) -> Option<usize> {
+    if y < 0.0 {
+        return None;
+    }
+    rows.iter()
+        .position(|row| y < row.top + row_total_height(row))
+}
+
+/// The index into `rows` of the last [`RowKind::SectionHeading`] whose top
+/// edge has scrolled past the viewport's own top -- `None` before the first
+/// heading has done so. Section headings stick while the panel scrolls
+/// because the heading is the only place the panel shows where a value came
+/// from.
+pub fn sticky_heading(rows: &[SettingsRow], offset: f32) -> Option<usize> {
+    let mut y = 0.0;
+    let mut sticky = None;
+    for (i, row) in rows.iter().enumerate() {
+        if row.kind == RowKind::SectionHeading {
+            if y <= offset {
+                sticky = Some(i);
+            } else {
+                break;
+            }
+        }
+        y += row_total_height(row);
+    }
+    sticky
+}
+
+/// How far the sticky heading `sticky_heading` returned has already been
+/// pushed up and off the viewport's own top edge by the next heading
+/// arriving from below -- `0` until that heading is closer than one whole
+/// heading row ([`SECTION_HEADING_HEIGHT`] plus its own trailing gap, the
+/// same total the heading component actually draws) away, then growing to
+/// that same total at the exact offset the two swap: the outgoing
+/// heading's own bottom edge lines up exactly with the incoming one's top
+/// edge throughout.
+pub fn sticky_push(rows: &[SettingsRow], sticky: Option<usize>, offset: f32) -> f32 {
+    let Some(i) = sticky else {
+        return 0.0;
+    };
+    let Some(next) = rows[i + 1..]
+        .iter()
+        .find(|row| row.kind == RowKind::SectionHeading)
+    else {
+        return 0.0;
+    };
+    let row_height = SECTION_HEADING_HEIGHT + SECTION_HEADING_BOTTOM_GAP;
+    let gap = next.top - offset;
+    (row_height - gap).clamp(0.0, row_height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn float_desc(min: f64, max: f64, logarithmic: bool) -> ParamKind {
+        ParamKind::Float {
+            min,
+            max,
+            step: 0.1,
+            logarithmic,
+        }
+    }
+
+    #[test]
+    fn every_param_kind_has_one_control() {
+        assert_eq!(
+            control_kind(&float_desc(0.0, 10.0, false)),
+            RowKind::LinearFloat
+        );
+        assert_eq!(
+            control_kind(&float_desc(1e-9, 1.0, true)),
+            RowKind::LogFloat
+        );
+        assert_eq!(
+            control_kind(&ParamKind::Int { min: 0, max: 10 }),
+            RowKind::Int
+        );
+        assert_eq!(control_kind(&ParamKind::Bool), RowKind::Bool);
+        assert_eq!(
+            control_kind(&ParamKind::Enum { variants: vec![] }),
+            RowKind::Enum
+        );
+        // The logarithmic flag changes the control, not a caption on it.
+        assert_ne!(
+            control_kind(&float_desc(0.0, 10.0, false)),
+            control_kind(&float_desc(0.0, 10.0, true))
+        );
+    }
+
+    #[test]
+    fn logarithmic_float_positions_by_decade() {
+        // epsilon-px: min 1e-9, max 1.0, default 1e-4.
+        let kind = float_desc(1e-9, 1.0, true);
+        let fraction = slider_fraction(1e-4, &kind);
+        assert!(
+            (fraction - 0.5556).abs() < 0.001,
+            "expected ~0.5556, got {fraction}"
+        );
+        // The linear reading of the same value is near zero.
+        let linear = linear_fraction(1e-4, 1e-9, 1.0);
+        assert!(linear < 0.001);
+
+        // A synthetic descriptor with min <= 0 must fall back to linear
+        // rather than dividing by an infinite log.
+        let non_positive_min = float_desc(0.0, 10.0, true);
+        assert_eq!(slider_fraction(5.0, &non_positive_min), 0.5);
+    }
+
+    #[test]
+    fn slider_value_round_trips_slider_fraction() {
+        let kind = float_desc(1e-9, 1.0, true);
+        let fraction = slider_fraction(1e-4, &kind);
+        let value = slider_value(fraction, &kind);
+        match value {
+            ParamValue::Float(v) => assert!((v - 1e-4).abs() / 1e-4 < 0.01),
+            other => panic!("expected Float, got {other:?}"),
+        }
+
+        let int_kind = ParamKind::Int { min: 0, max: 6 };
+        assert_eq!(slider_value(1.0, &int_kind), ParamValue::Int(6));
+        assert_eq!(slider_value(0.0, &int_kind), ParamValue::Int(0));
+    }
+
+    #[test]
+    fn violation_text_drops_the_id_prefix() {
+        let out_of_range = ParamViolation::OutOfRange {
+            id: "levels".to_string(),
+            value: 20.0,
+            min: 0.0,
+            max: 10.0,
+        };
+        assert_eq!(
+            violation_text(&out_of_range),
+            "value 20 is outside the allowed range [0, 10]"
+        );
+
+        let unparsable = ParamViolation::Unparsable {
+            id: "max-iterations".to_string(),
+            kind: "int",
+            text: "abc".to_string(),
+        };
+        assert_eq!(
+            violation_text(&unparsable),
+            "Not a number",
+            "a field's own error stays plain, not the core's quoted parse message"
+        );
+
+        let unparsable_bool = ParamViolation::Unparsable {
+            id: "auto-crop".to_string(),
+            kind: "bool",
+            text: "maybe".to_string(),
+        };
+        assert_eq!(violation_text(&unparsable_bool), "Not true or false");
+
+        let unknown_key = ParamViolation::UnknownKey {
+            key: "bogus".to_string(),
+            declared: vec!["levels".to_string()],
+        };
+        assert_eq!(
+            violation_text(&unknown_key),
+            unknown_key.to_string(),
+            "UnknownKey carries no id prefix to drop"
+        );
+
+        let auto = ParamViolation::Auto {
+            id: "pyramid-depth".to_string(),
+            source: Box::new(ParamViolation::OutOfRange {
+                id: "pyramid-depth".to_string(),
+                value: 99.0,
+                min: 0.0,
+                max: 6.0,
+            }),
+        };
+        let text = violation_text(&auto);
+        assert!(!text.contains("pyramid-depth"), "got: {text}");
+        assert!(text.contains("auto value rejected"));
+        assert!(text.contains("value 99 is outside"));
+    }
+
+    fn linear_row(id: &str) -> SettingsRow {
+        SettingsRow {
+            kind: RowKind::LinearFloat,
+            section: "fuse".to_string(),
+            id: id.to_string(),
+            label: id.to_string(),
+            value_text: String::new(),
+            fraction: 0.0,
+            choices: Vec::new(),
+            choice_ids: Vec::new(),
+            selected: String::new(),
+            menu_open: false,
+            heading_state: HeadingState::Default,
+            top: 0.0,
+        }
+    }
+
+    #[test]
+    fn assign_tops_is_the_cumulative_sum_content_height_agrees_with() {
+        let mut rows = vec![
+            SettingsRow::heading("fuse", "FUSE", HeadingState::Default),
+            linear_row("levels"),
+            linear_row("radius"),
+        ];
+        assign_tops(&mut rows);
+        assert_eq!(rows[0].top, 0.0);
+        assert_eq!(
+            rows[1].top,
+            SECTION_HEADING_HEIGHT + SECTION_HEADING_BOTTOM_GAP
+        );
+        assert_eq!(
+            rows[2].top,
+            SECTION_HEADING_HEIGHT + SECTION_HEADING_BOTTOM_GAP + row_height(RowKind::LinearFloat)
+        );
+        assert_eq!(
+            rows[2].top + row_height(RowKind::LinearFloat) + PANEL_BOTTOM_BUFFER,
+            content_height(&rows)
+        );
+    }
+
+    #[test]
+    fn content_height_reads_a_heading_row_without_row_height() {
+        // `row_height` panics on `RowKind::SectionHeading` -- this must go
+        // through the dedicated formula instead, for every `HeadingState`.
+        let rows = vec![
+            SettingsRow::heading("fuse", "FUSE", HeadingState::Explicit),
+            linear_row("levels"),
+        ];
+        let expected = SECTION_HEADING_HEIGHT
+            + SECTION_HEADING_BOTTOM_GAP
+            + row_height(RowKind::LinearFloat)
+            + PANEL_BOTTOM_BUFFER;
+        assert_eq!(content_height(&rows), expected);
+    }
+
+    #[test]
+    fn clamp_panel_scroll_matches_tab_scroll_shape() {
+        assert_eq!(clamp_panel_scroll(-10.0, 762.0, 602.0), 0.0);
+        assert_eq!(clamp_panel_scroll(1000.0, 762.0, 602.0), 160.0);
+        assert_eq!(clamp_panel_scroll(50.0, 400.0, 602.0), 0.0);
+    }
+
+    #[test]
+    fn sticky_heading_is_the_last_one_scrolled_past() {
+        let rows = vec![
+            SettingsRow::heading("fuse", "FUSE", HeadingState::Default),
+            linear_row("levels"),
+            SettingsRow::heading("align", "ALIGN", HeadingState::Default),
+            linear_row("epsilon-px"),
+        ];
+        assert_eq!(sticky_heading(&rows, 0.0), Some(0));
+        let fuse_heading_height = SECTION_HEADING_HEIGHT + SECTION_HEADING_BOTTOM_GAP;
+        let first_row_height = row_height(RowKind::LinearFloat);
+        let past_fuse_row = fuse_heading_height + first_row_height + 1.0;
+        assert_eq!(sticky_heading(&rows, past_fuse_row), Some(2));
+    }
+
+    #[test]
+    fn sticky_push_grows_as_the_next_heading_arrives_then_resets_on_swap() {
+        let mut rows = vec![
+            SettingsRow::heading("fuse", "FUSE", HeadingState::Default),
+            linear_row("levels"),
+            SettingsRow::heading("align", "ALIGN", HeadingState::Default),
+            linear_row("epsilon-px"),
+        ];
+        assign_tops(&mut rows);
+        let align_top = rows[2].top;
+        let heading_row = SECTION_HEADING_HEIGHT + SECTION_HEADING_BOTTOM_GAP;
+
+        // Far from the swap: no push yet.
+        assert_eq!(sticky_push(&rows, Some(0), 0.0), 0.0);
+        assert_eq!(
+            sticky_push(&rows, Some(0), align_top - heading_row - 1.0),
+            0.0
+        );
+
+        // Inside one heading row of the swap: pushed by exactly the
+        // remaining distance, so the outgoing heading's own bottom edge
+        // always lines up with the incoming heading's own top edge.
+        assert_eq!(
+            sticky_push(&rows, Some(0), align_top - heading_row + 10.0),
+            10.0
+        );
+
+        // Exactly at the swap: fully pushed off, one heading row's worth.
+        assert_eq!(sticky_push(&rows, Some(0), align_top), heading_row);
+
+        // Past the swap, `sticky_heading` itself has already moved to
+        // ALIGN, and with no third heading behind it there is nothing left
+        // to push it.
+        assert_eq!(sticky_heading(&rows, align_top), Some(2));
+        assert_eq!(sticky_push(&rows, Some(2), align_top), 0.0);
+    }
+
+    #[test]
+    fn row_at_finds_the_row_a_content_offset_falls_in() {
+        let mut rows = vec![
+            SettingsRow::heading("fuse", "FUSE", HeadingState::Default),
+            linear_row("levels"),
+            linear_row("radius"),
+        ];
+        assign_tops(&mut rows);
+
+        assert_eq!(row_at(&rows, 0.0), Some(0), "the heading's own top edge");
+        assert_eq!(
+            row_at(&rows, rows[1].top),
+            Some(1),
+            "a row's own top edge belongs to that row"
+        );
+        assert_eq!(
+            row_at(&rows, rows[2].top + row_height(RowKind::LinearFloat) - 1.0),
+            Some(2),
+            "just before the last row's bottom edge"
+        );
+        assert_eq!(
+            row_at(&rows, content_height(&rows)),
+            None,
+            "past every row's bottom edge"
+        );
+        assert_eq!(row_at(&rows, -1.0), None, "above the content column");
+    }
+}

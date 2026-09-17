@@ -8,6 +8,8 @@ import { ShellGeometry } from "../geometry.slint";
 import { FFModeSwitch } from "dock/mode_switch.slint";
 import { FFCheckpointPanel } from "dock/checkpoint_panel.slint";
 import { FFDockTabs } from "dock/dock_tabs.slint";
+import { FFSettingsPanel, SettingsRow, SectionHeadView } from "dock/settings_panel.slint";
+export { SettingsRow, SectionHeadView }
 
 export component FFDock inherits Rectangle {
     callback mode-selected(string);
@@ -20,6 +22,23 @@ export component FFDock inherits Rectangle {
     // has nothing to show, and draws the line `No project open.` in its
     // place instead.
     in property <bool> project-loaded: false;
+
+    // The settings panel: generated entirely from the row list Rust hands
+    // it, forwarded one line into `FFSettingsPanel`.
+    in property <[SettingsRow]> settings-rows: [];
+    in property <SectionHeadView> settings-sticky: { visible: false, section: "", label: "", provenance: "default", push: 0px };
+    in property <length> settings-scroll-y: 0px;
+    in property <length> settings-content-height: 0px;
+    in property <bool> settings-enabled: true;
+    callback settings-param-changed(string, string, float);
+    callback settings-param-text-edited(string, string, string);
+    callback settings-algorithm-selected(string, string);
+    callback settings-reset-all();
+    callback settings-menu-toggled(string, string);
+    callback settings-scrolled(length);
+    callback settings-scrollbar-pointer(int, length);
+    callback settings-scrollbar-dragged(length);
+    callback settings-viewport-height-changed(length);
 
     background: Theme.surface-raised;
 
@@ -45,6 +64,33 @@ export component FFDock inherits Rectangle {
             active: root.dock-tab;
             tab-selected(t) => { root.dock-tab-selected(t); }
         }
+    }
+
+    settings-panel := FFSettingsPanel {
+        x: ShellGeometry.dock-content-inset;
+        y: dock-tabs.y + dock-tabs.height + Theme.space-2;
+        // The scrollbar sits flush on this panel's own right edge (see
+        // `ff_scrollbar.slint`'s `x: parent.width - self.width`), so this
+        // width is what puts that edge `dock-scrollbar-inset` from the
+        // dock's own right edge: the panel starts `dock-content-inset` in,
+        // and ends `dock-scrollbar-inset` short of the dock's far side.
+        width: ShellGeometry.dock-width - ShellGeometry.dock-content-inset - ShellGeometry.dock-scrollbar-inset;
+        height: parent.height - self.y - ShellGeometry.dock-content-inset;
+        visible: root.project-loaded && root.dock-tab == "settings";
+        rows: root.settings-rows;
+        sticky: root.settings-sticky;
+        scroll-y: root.settings-scroll-y;
+        content-height: root.settings-content-height;
+        enabled: root.settings-enabled;
+        param-changed(section, id, f) => { root.settings-param-changed(section, id, f); }
+        param-text-edited(section, id, text) => { root.settings-param-text-edited(section, id, text); }
+        algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
+        reset-all => { root.settings-reset-all(); }
+        menu-toggled(section, id) => { root.settings-menu-toggled(section, id); }
+        scrolled(delta) => { root.settings-scrolled(delta); }
+        scrollbar-pointer(kind, y) => { root.settings-scrollbar-pointer(kind, y); }
+        scrollbar-dragged(y) => { root.settings-scrollbar-dragged(y); }
+        viewport-height-changed(h) => { root.settings-viewport-height-changed(h); }
     }
 
     no-project-note := Text {

@@ -16,6 +16,7 @@
 //! `Action`. They read `crate::input_map`'s types only -- no `use slint::`
 //! here either.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,9 @@ use crate::entry;
 use crate::input_config::Provenance;
 use crate::input_map::{
     Action, ActionEvent, Button, InputRowView, InputTable, Modifiers, PointerKind, Trigger,
+};
+use crate::settings_panel::{
+    self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext,
 };
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
 
@@ -90,6 +94,10 @@ pub enum ShellEvent {
     /// A folder read as more than one stack -- the one grouping question,
     /// asked once.
     QuestionRaised(GroupingQuestion),
+    /// The settings panel's own state moved: a value, an algorithm choice,
+    /// a reset, an open menu or the scroll offset -- never a tab switch,
+    /// which `ProjectsChanged` already rebuilds the panel for.
+    SettingsChanged,
     /// An open attempt was refused. Carries its already-rendered message:
     /// `perform` (`crate::bridge`) must not format user-facing text.
     EntryRefused(String),
@@ -134,17 +142,52 @@ struct ProjectTab {
     title: String,
     image: Option<ImageSize>,
     viewport: Option<Viewport>,
+    /// This tab's [`StackContext`], read once here -- the settings panel
+    /// resolves `auto` against it on every render rather than re-opening a
+    /// header. `None` only for an unreadable or frame-less group, which the
+    /// entry path never actually produces.
+    ctx: Option<StackContext>,
+    /// The active Fuse/Align algorithm id, seeded from the first id-sorted
+    /// registry entry of each family for an unsaved tab, or from the sealed
+    /// manifest for a reopened one.
+    fuse_id: String,
+    align_id: String,
+    /// Only the explicitly-set keys of each section -- `resolve_in` derives
+    /// everything else. A reopened project's manifest values land here as
+    /// explicit.
+    fuse_values: ParamValues,
+    align_values: ParamValues,
+    project_values: ParamValues,
+    /// One violation per offending `"<section>:<id>"` key -- what lets two
+    /// fields carry a message at the same time.
+    errors: BTreeMap<String, ParamViolation>,
+    /// The one open picker/enum menu's `"<section>:<id>"` key, if any.
+    menu_open: Option<String>,
 }
 
 impl ProjectTab {
     fn new(project: GuiProject) -> Self {
         let title = entry::tab_title(&project);
-        let image = entry::tab_image_size(&project);
+        let ctx = entry::tab_stack_context(&project);
+        let image = ctx.map(|c| ImageSize {
+            width: c.width,
+            height: c.height,
+        });
+        let (fuse_id, fuse_values, align_id, align_values) =
+            settings_panel::seed_algorithm_state(&project);
         ProjectTab {
             project,
             title,
             image,
             viewport: None,
+            ctx,
+            fuse_id,
+            align_id,
+            fuse_values,
+            align_values,
+            project_values: ParamValues::new(),
+            errors: BTreeMap::new(),
+            menu_open: None,
         }
     }
 }
@@ -201,6 +244,19 @@ struct ShellState {
     /// When the most recent close request was acted on --
     /// [`AppController::close_project_at`]'s debounce.
     last_close: Option<Instant>,
+    /// The settings panel's scroll offset in pixels, always within
+    /// [`settings_panel::clamp_panel_scroll`]'s range for the panel's
+    /// current content and viewport.
+    settings_scroll_y: f32,
+    /// The settings panel's viewport height -- `FFSettingsPanel`'s own
+    /// measured height, pushed on install and on every resize.
+    settings_viewport_height: f32,
+    /// Where a live scrollbar-thumb drag grabbed it, as an offset from the
+    /// thumb's own top edge -- `None` when the pointer is up, or when it
+    /// went down on the bare track (a jump, not a drag). Kept separate
+    /// from `input_map`'s own `DragState`: this drag has no bindable
+    /// action, no modifiers and no canvas gesture to route through.
+    scrollbar_drag: Option<f32>,
 }
 
 impl ShellState {
@@ -839,6 +895,13 @@ impl AppController {
                 .extend(opened.projects.into_iter().map(ProjectTab::new));
         }
         self.settle_tab_scroll();
+        self.state.settings_scroll_y = 0.0;
+        self.settle_settings_scroll();
+        // `ProjectsChanged` alone: its own push already rebuilds the panel
+        // for the newly active tab (`push_projects`, `src/bridge.rs`) --
+        // a second `SettingsChanged` here would schedule a second, redundant
+        // rebuild one event-loop turn later, splitting one tab switch into
+        // two visible updates.
         self.emit(ShellEvent::ProjectsChanged);
     }
 
@@ -882,6 +945,7 @@ impl AppController {
     /// same as a gallery card click.
     pub fn select_plus(&mut self) {
         if self.state.active.take().is_some() {
+            self.settle_settings_scroll();
             self.emit(ShellEvent::ProjectsChanged);
         }
     }
@@ -890,6 +954,7 @@ impl AppController {
         if index < self.state.projects.len() {
             self.state.active = Some(index);
             self.settle_tab_scroll();
+            self.settle_settings_scroll();
             self.emit(ShellEvent::ProjectsChanged);
         }
     }
@@ -935,7 +1000,286 @@ impl AppController {
             _ => None,
         };
         self.settle_tab_scroll();
+        self.settle_settings_scroll();
         self.emit(ShellEvent::ProjectsChanged);
+    }
+
+    // -- The settings panel. The model is rebuilt from scratch on every
+    // call -- the schema is small, and rebuilding is what keeps "one
+    // section per family, one field per `ParamDesc`" true by construction
+    // rather than by an incremental patch that could drift from it. --
+
+    /// Builds the whole panel: Fuse, Align, Crop, in that order, each
+    /// section's rows flattened from `AlgorithmRef::params()`'s own
+    /// declaration order. With no tab active ("+" selected) the panel still
+    /// renders -- the default algorithm of each family, with no explicit
+    /// values and no `StackContext`, so an `auto` parameter reads as
+    /// `pending` rather than as a user's choice.
+    pub fn settings_panel(&self) -> PanelModel {
+        let viewport_height = self.state.settings_viewport_height;
+        let active = self
+            .state
+            .active()
+            .map(|tab| settings_panel::ActiveTabParams {
+                ctx: tab.ctx.as_ref(),
+                errors: &tab.errors,
+                menu_open: tab.menu_open.as_deref(),
+                fuse_id: &tab.fuse_id,
+                fuse_values: &tab.fuse_values,
+                align_id: &tab.align_id,
+                align_values: &tab.align_values,
+                project_values: &tab.project_values,
+            });
+        let mut rows = settings_panel::build_rows(active);
+        settings_panel::assign_tops(&mut rows);
+
+        let content_height = settings_panel::content_height(&rows);
+        let scroll_y = settings_panel::clamp_panel_scroll(
+            self.state.settings_scroll_y,
+            content_height,
+            viewport_height,
+        );
+        let sticky = settings_panel::sticky_heading(&rows, scroll_y);
+        let sticky_push = settings_panel::sticky_push(&rows, sticky, scroll_y);
+        PanelModel {
+            rows,
+            sticky,
+            sticky_push,
+            content_height,
+            scroll_y,
+            viewport_height,
+        }
+    }
+
+    /// Sets one parameter's value directly -- a slider or a toggle, whose
+    /// control already guarantees a value inside the schema's own bounds.
+    /// One `ShellEvent::SettingsChanged` per call.
+    pub fn set_param_value(&mut self, section: &str, id: &str, value: ParamValue) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        tab_values_mut(tab, section).insert(id.to_string(), value);
+        tab.errors.remove(&settings_panel::menu_key(section, id));
+        self.emit(ShellEvent::SettingsChanged);
+    }
+
+    /// Parses typed text against the field's own descriptor
+    /// (`ParamValue::parse`): on `Ok` inserts the value and clears that
+    /// field's error; on `Err` stores its one violation under this field's
+    /// key, leaving any other field's own error untouched -- what lets two
+    /// fields carry a message at the same time.
+    pub fn set_param_text(&mut self, section: &str, id: &str, text: &str) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(desc) = settings_panel::find_desc(section, &tab.fuse_id, &tab.align_id, id) else {
+            return;
+        };
+        let key = settings_panel::menu_key(section, id);
+        match ParamValue::parse(desc, text) {
+            Ok(value) => {
+                tab_values_mut(tab, section).insert(id.to_string(), value);
+                tab.errors.remove(&key);
+            }
+            Err(err) => {
+                let violation = err
+                    .into_violations()
+                    .into_iter()
+                    .next()
+                    .expect("ParamValue::parse returns exactly one violation");
+                tab.errors.insert(key, violation);
+            }
+        }
+        self.emit(ShellEvent::SettingsChanged);
+    }
+
+    /// Selects a Fuse or Align algorithm, clearing that section's values
+    /// and errors -- a fresh algorithm resolves its own schema from
+    /// scratch, never carrying over a stray value the previous one
+    /// happened to share an id with.
+    pub fn set_fuse_algorithm(&mut self, id: &str) {
+        self.set_algorithm("fuse", id);
+    }
+
+    pub fn set_align_algorithm(&mut self, id: &str) {
+        self.set_algorithm("align", id);
+    }
+
+    fn set_algorithm(&mut self, section: &str, id: &str) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        match section {
+            "fuse" => tab.fuse_id = id.to_string(),
+            "align" => tab.align_id = id.to_string(),
+            _ => return,
+        }
+        tab_values_mut(tab, section).clear();
+        let prefix = format!("{section}:");
+        tab.errors.retain(|k, _| !k.starts_with(&prefix));
+        self.emit(ShellEvent::SettingsChanged);
+    }
+
+    /// Removes every explicit key of every section's `ParamValues` and
+    /// drops every error at once -- the mechanically exact "back to
+    /// default": no stored `Provenance`, no schema change, just re-resolving
+    /// with nothing explicit any more. The panel's own bottom-of-list
+    /// control, one emit for all three sections.
+    pub fn reset_all_sections(&mut self) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        tab.fuse_values.clear();
+        tab.align_values.clear();
+        tab.project_values.clear();
+        tab.errors.clear();
+        self.emit(ShellEvent::SettingsChanged);
+    }
+
+    /// Opens or closes one picker/enum menu, `key` being the row's own
+    /// `"<section>:<id>"` -- only one menu is ever open at a time.
+    pub fn toggle_param_menu(&mut self, key: &str) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        tab.menu_open = if tab.menu_open.as_deref() == Some(key) {
+            None
+        } else {
+            Some(key.to_string())
+        };
+        self.emit(ShellEvent::SettingsChanged);
+    }
+
+    /// [`Self::toggle_param_menu`], composing the row key from its own
+    /// section and id -- what a picker/enum row's own callback reaches
+    /// through, so the `"<section>:<id>"` format stays this module's alone.
+    pub fn toggle_param_menu_for(&mut self, section: &str, id: &str) {
+        self.toggle_param_menu(&settings_panel::menu_key(section, id));
+    }
+
+    /// Converts a slider's thumb position back into this field's own value
+    /// ([`settings_panel::slider_value`]) against its declared bounds, then
+    /// stores it -- the one entry point a drag gesture reaches through.
+    /// A no-op when no tab is active or the field's descriptor cannot be
+    /// found (an algorithm switch mid-drag).
+    pub fn set_param_fraction(&mut self, section: &str, id: &str, fraction: f32) {
+        let Some(tab) = self.state.active() else {
+            return;
+        };
+        let Some(desc) = settings_panel::find_desc(section, &tab.fuse_id, &tab.align_id, id) else {
+            return;
+        };
+        let value = settings_panel::slider_value(fraction, &desc.kind);
+        self.set_param_value(section, id, value);
+    }
+
+    /// Scrolls the settings panel by `delta_px`, clamped to its current
+    /// content/viewport. Pushes only when it moved.
+    pub fn scroll_settings_panel(&mut self, delta_px: f32) {
+        self.set_settings_scroll(self.state.settings_scroll_y + delta_px);
+    }
+
+    /// Sets the settings panel's scroll offset to an absolute pixel
+    /// position, clamped to its current content/viewport. Pushes only
+    /// when it moved.
+    fn set_settings_scroll(&mut self, offset_px: f32) {
+        let content_height = self.settings_panel().content_height;
+        let viewport_height = self.state.settings_viewport_height;
+        let offset = settings_panel::clamp_panel_scroll(offset_px, content_height, viewport_height);
+        if offset != self.state.settings_scroll_y {
+            self.state.settings_scroll_y = offset;
+            self.emit(ShellEvent::SettingsChanged);
+        }
+    }
+
+    /// The settings scrollbar thumb's current `(top, height)` in
+    /// track-pixel space -- the same two formulas `ff_scrollbar.slint`
+    /// draws it with, so a press can tell the thumb from the bare track.
+    fn settings_scrollbar_thumb(&self) -> (f32, f32) {
+        let content_height = self.settings_panel().content_height;
+        let viewport_height = self.state.settings_viewport_height;
+        if content_height <= 0.0 {
+            return (0.0, viewport_height);
+        }
+        let height = (viewport_height * viewport_height / content_height).max(16.0);
+        let top = self.state.settings_scroll_y * viewport_height / content_height;
+        (top, height)
+    }
+
+    /// A press on the settings scrollbar: on the thumb itself, grabs it
+    /// at that point so `scrollbar_dragged` below can track the pointer
+    /// with no jump; on the bare track, jumps there, centring the thumb
+    /// on the press and grabbing its centre for the drag that follows.
+    /// `PointerKind::Move` is ignored, the same reason as
+    /// [`AppController::pointer`]'s own -- it carries no motion, and
+    /// ending the drag here would end it on its own first movement.
+    pub fn scrollbar_pointer(&mut self, kind: PointerKind, mouse_y: f32) {
+        match kind {
+            PointerKind::Down => {
+                let (thumb_top, thumb_height) = self.settings_scrollbar_thumb();
+                if mouse_y >= thumb_top && mouse_y < thumb_top + thumb_height {
+                    self.state.scrollbar_drag = Some(mouse_y - thumb_top);
+                } else {
+                    let viewport_height = self.state.settings_viewport_height.max(1.0);
+                    let content_height = self.settings_panel().content_height;
+                    let target_top = mouse_y - thumb_height / 2.0;
+                    self.set_settings_scroll(target_top * content_height / viewport_height);
+                    self.state.scrollbar_drag = Some(thumb_height / 2.0);
+                }
+            }
+            PointerKind::Up => self.state.scrollbar_drag = None,
+            PointerKind::Move => {}
+        }
+    }
+
+    /// The live settings-scrollbar drag, if any: `mouse_y` minus the grab
+    /// offset is the thumb's new top edge, converted back to a
+    /// content-space offset the same way `settings_scrollbar_thumb`
+    /// converts the other way.
+    pub fn scrollbar_dragged(&mut self, mouse_y: f32) {
+        let Some(grab_offset) = self.state.scrollbar_drag else {
+            return;
+        };
+        let viewport_height = self.state.settings_viewport_height.max(1.0);
+        let content_height = self.settings_panel().content_height;
+        let target_top = mouse_y - grab_offset;
+        self.set_settings_scroll(target_top * content_height / viewport_height);
+    }
+
+    /// The settings panel viewport's measured height -- pushed on install
+    /// and on every resize; re-clamps the scroll offset.
+    pub fn set_settings_viewport_height(&mut self, height: f32) {
+        self.state.settings_viewport_height = height.max(0.0);
+        let content_height = self.settings_panel().content_height;
+        self.state.settings_scroll_y = settings_panel::clamp_panel_scroll(
+            self.state.settings_scroll_y,
+            content_height,
+            self.state.settings_viewport_height,
+        );
+        self.emit(ShellEvent::SettingsChanged);
+    }
+
+    pub fn settings_scroll_y(&self) -> f32 {
+        self.state.settings_scroll_y
+    }
+
+    /// Whether a background job is running -- the deferred-capability
+    /// pattern `editor_enabled`/`export_enabled` already use. The panel
+    /// reads this as a whole-panel disable.
+    pub fn job_running(&self) -> bool {
+        false
+    }
+
+    /// Re-clamps the settings scroll offset against the now-active tab's
+    /// own panel content, and pushes it -- called by every place the active
+    /// tab changes.
+    fn settle_settings_scroll(&mut self) {
+        let content_height = self.settings_panel().content_height;
+        self.state.settings_scroll_y = settings_panel::clamp_panel_scroll(
+            self.state.settings_scroll_y,
+            content_height,
+            self.state.settings_viewport_height,
+        );
     }
 
     // -- The scrolling tab strip. The arithmetic is the free functions
@@ -1082,6 +1426,15 @@ pub fn tab_scroll_into_view(
         s = left;
     }
     s.clamp(0.0, max)
+}
+
+/// The `ParamValues` map `section` mutates on this tab.
+fn tab_values_mut<'a>(tab: &'a mut ProjectTab, section: &str) -> &'a mut ParamValues {
+    match section {
+        "align" => &mut tab.align_values,
+        "crop" => &mut tab.project_values,
+        _ => &mut tab.fuse_values,
+    }
 }
 
 /// The skipped-subfolder notice's text, `None` when nothing was skipped --

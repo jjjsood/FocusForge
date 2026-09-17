@@ -904,6 +904,39 @@ fn plus_shows_the_selected_marker_only_when_selected() {
     assert!(empty.size().width > 0.0);
 }
 
+/// `project-loaded` (the dock's own gate for the tab row, the settings panel
+/// and the "No project open." note) must flip the moment "+" or a project
+/// tab is selected, with no canvas gesture in between. Exercises the real
+/// `push_projects`, not a hand-rolled copy of what it should do.
+#[test]
+fn selecting_plus_and_back_flips_project_loaded_without_a_canvas_gesture() {
+    use std::sync::{Arc, Mutex};
+
+    init_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+
+    let controller = Arc::new(Mutex::new(with_one_project(
+        "entry_project_loaded_no_gesture",
+    )));
+    focusforge_gui::bridge::push_projects(&app, &controller);
+    assert!(app.get_project_loaded(), "a project is active");
+
+    controller.lock().unwrap().select_plus();
+    focusforge_gui::bridge::push_projects(&app, &controller);
+    assert!(
+        !app.get_project_loaded(),
+        "\"+\" holds no project, with no gesture in between"
+    );
+
+    controller.lock().unwrap().select_project(0);
+    focusforge_gui::bridge::push_projects(&app, &controller);
+    assert!(
+        app.get_project_loaded(),
+        "back on the tab, again with no gesture in between"
+    );
+}
+
 /// A drop while a loaded tab is active leaves it untouched and appends the
 /// dropped stack(s), the first one active and
 /// scrolled into view. The drop route is `open_paths` (`bridge::DropHandler`).

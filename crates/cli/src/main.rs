@@ -752,3 +752,28 @@ fn fail(message: impl std::fmt::Display) -> ExitCode {
     eprintln!("error: {message}");
     ExitCode::FAILURE
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--no-crop`'s clap default and `PROJECT_PARAMS`'s `auto-crop`
+    /// descriptor default are one source of truth. This test fails the
+    /// moment either one moves without the other.
+    #[test]
+    fn no_crop_flag_reads_the_project_schema() {
+        let cli = Cli::try_parse_from(["focusforge-cli", "stack", "dir", "--algo", "x"])
+            .expect("a minimal `stack` invocation must parse");
+        let Command::Stack { crop, .. } = cli.command else {
+            panic!("expected a Command::Stack");
+        };
+        let expected = focusforge_core::project::PROJECT_PARAMS
+            .iter()
+            .find(|d| d.id == "auto-crop")
+            .expect("PROJECT_PARAMS must declare an auto-crop descriptor")
+            .default
+            .as_bool()
+            .expect("auto-crop's default must be a bool");
+        assert_eq!(crop, expected);
+    }
+}

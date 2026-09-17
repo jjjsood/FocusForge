@@ -11,14 +11,18 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use slint::ComponentHandle;
+use slint::Model as _;
 use slint::winit_030::{CustomApplicationHandler, EventResult, WinitWindowAccessor, winit};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
 use crate::controller::{AppController, DockTab, GroupingQuestion, OpenAs, ShellEvent, ShellMode};
-use crate::generated::{AppWindow, ProjectTabView};
+use crate::generated::{
+    AppWindow, ProjectTabView, SectionHeadView, SettingsRow as GeneratedSettingsRow,
+};
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
+use crate::settings_panel::{HeadingState, RowKind};
 use crate::viewport::PaneRect;
 
 /// `slint::platform::PointerEventButton` -> `input_map::Button` -- the only
@@ -133,9 +137,11 @@ pub fn read_pane_geometry(app: &AppWindow) -> (PaneRect, PaneRect) {
 
 /// Pushes the controller's project-tab state (`project_tabs`,
 /// `tab_scroll_x`, the two scroll-enabled flags, `show_empty_state`,
-/// `plus_selected`) into
-/// `app` -- the one place `ShellEvent::ProjectsChanged` is performed.
-fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
+/// `project_loaded`, `plus_selected`) into
+/// `app` -- the one place `ShellEvent::ProjectsChanged` is performed. `pub`
+/// so a test can call it directly without a real event loop (`install`'s
+/// sink needs one; this function does not).
+pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     let controller = controller.lock().unwrap();
     let tabs: Vec<ProjectTabView> = controller
         .project_tabs()
@@ -149,8 +155,14 @@ fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     app.set_project_tabs(std::rc::Rc::new(slint::VecModel::from(tabs)).into());
     push_tab_scroll(app, &controller);
     app.set_show_empty_state(controller.active_project().is_none());
+    // The dock's own gate for the tab row, the settings panel and the
+    // "No project open." note (`ui/shell/dock.slint`) -- otherwise stuck at
+    // whatever a canvas gesture (`repaint`, above) last set it to, since a
+    // tab switch or close never fires one of its own.
+    app.set_project_loaded(controller.active_project().is_some());
     app.set_plus_selected(controller.plus_selected());
     app.set_skipped_notice(controller.notice().unwrap_or_default().into());
+    push_settings_panel(app, &controller);
 }
 
 /// Pushes the tab strip's scroll offset, overflow layout and two arrow
@@ -160,6 +172,103 @@ fn push_tab_scroll(app: &AppWindow, controller: &AppController) {
     app.set_tabs_overflow(controller.tabs_overflow());
     app.set_can_scroll_left(controller.can_scroll_left());
     app.set_can_scroll_right(controller.can_scroll_right());
+}
+
+/// `RowKind`'s own string reading -- the settings panel's `.slint` side
+/// branches on this, never on a `ParamKind` or an algorithm id.
+fn row_kind_str(kind: RowKind) -> &'static str {
+    match kind {
+        RowKind::SectionHeading => "heading",
+        RowKind::Picker => "picker",
+        RowKind::LinearFloat => "linear-float",
+        RowKind::LogFloat => "log-float",
+        RowKind::Int => "int",
+        RowKind::Bool => "bool",
+        RowKind::Enum => "enum",
+        RowKind::Error => "error",
+        RowKind::ResetAll => "reset-all",
+    }
+}
+
+/// `HeadingState`'s own string reading, matching `FFSectionHeading`'s
+/// `provenance` property.
+fn heading_state_str(state: HeadingState) -> &'static str {
+    match state {
+        HeadingState::Default => "default",
+        HeadingState::Explicit => "explicit",
+        HeadingState::Pending => "pending",
+    }
+}
+
+/// Updates the settings panel's row model with `set_row_data` when the row
+/// count did not change, instead of handing `app` a freshly built
+/// `VecModel` every time: a fresh model resets the `for` loop's whole
+/// element tree, which drops a `TouchArea` mid-gesture and kills a slider
+/// drag after its first tick, where `set_row_data` keeps every element's
+/// identity. A row count change (a tab switch, an algorithm pick) still
+/// needs the fresh model, since the tree itself must grow or shrink. The
+/// one place `ShellEvent::SettingsChanged` is performed; also called from
+/// `push_projects` so a tab switch or close rebuilds the panel for the
+/// newly active tab. `pub` so a test can push a real, unmodified row set
+/// and then edit one row's own text without going through a live event.
+pub fn push_settings_panel(app: &AppWindow, controller: &AppController) {
+    let panel = controller.settings_panel();
+    let rows: Vec<GeneratedSettingsRow> = panel
+        .rows
+        .iter()
+        .map(|row| GeneratedSettingsRow {
+            kind: row_kind_str(row.kind).into(),
+            section: row.section.clone().into(),
+            id: row.id.clone().into(),
+            label: row.label.clone().into(),
+            value_text: row.value_text.clone().into(),
+            fraction: row.fraction,
+            choices: std::rc::Rc::new(slint::VecModel::from(
+                row.choices
+                    .iter()
+                    .map(|s| s.clone().into())
+                    .collect::<Vec<slint::SharedString>>(),
+            ))
+            .into(),
+            choice_ids: std::rc::Rc::new(slint::VecModel::from(
+                row.choice_ids
+                    .iter()
+                    .map(|s| s.clone().into())
+                    .collect::<Vec<slint::SharedString>>(),
+            ))
+            .into(),
+            selected: row.selected.clone().into(),
+            menu_open: row.menu_open,
+            heading_state: heading_state_str(row.heading_state).into(),
+            top: row.top,
+        })
+        .collect();
+    let existing = app.get_settings_rows();
+    if existing.row_count() == rows.len() {
+        for (i, row) in rows.into_iter().enumerate() {
+            existing.set_row_data(i, row);
+        }
+    } else {
+        app.set_settings_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    }
+    app.set_settings_content_height(panel.content_height);
+    app.set_settings_scroll_y(panel.scroll_y);
+
+    let sticky = panel.sticky.map(|i| &panel.rows[i]);
+    app.set_settings_sticky(SectionHeadView {
+        visible: sticky.is_some(),
+        section: sticky
+            .map(|r| r.section.as_str())
+            .unwrap_or_default()
+            .into(),
+        label: sticky.map(|r| r.label.as_str()).unwrap_or_default().into(),
+        provenance: sticky
+            .map(|r| heading_state_str(r.heading_state))
+            .unwrap_or("default")
+            .into(),
+        push: panel.sticky_push,
+    });
+    app.set_settings_enabled(!controller.job_running());
 }
 
 /// Pushes a raised [`GroupingQuestion`] into `app`'s dialog properties.
@@ -514,6 +623,83 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
         }
     });
 
+    // The settings panel: every callback is a one-line forward,
+    // `AppController` alone decides what a row's own kind, section and id
+    // mean.
+    app.on_settings_param_changed({
+        let controller = controller.clone();
+        move |section, id, fraction| {
+            controller
+                .lock()
+                .unwrap()
+                .set_param_fraction(section.as_str(), id.as_str(), fraction);
+        }
+    });
+    app.on_settings_param_text_edited({
+        let controller = controller.clone();
+        move |section, id, text| {
+            controller
+                .lock()
+                .unwrap()
+                .set_param_text(section.as_str(), id.as_str(), text.as_str());
+        }
+    });
+    app.on_settings_algorithm_selected({
+        let controller = controller.clone();
+        move |section, id| {
+            let mut controller = controller.lock().unwrap();
+            if section.as_str() == "align" {
+                controller.set_align_algorithm(id.as_str());
+            } else {
+                controller.set_fuse_algorithm(id.as_str());
+            }
+        }
+    });
+    app.on_settings_reset_all({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().reset_all_sections()
+    });
+    app.on_settings_menu_toggled({
+        let controller = controller.clone();
+        move |section, id| {
+            controller
+                .lock()
+                .unwrap()
+                .toggle_param_menu_for(section.as_str(), id.as_str());
+        }
+    });
+    app.on_settings_scrolled({
+        let controller = controller.clone();
+        move |delta| controller.lock().unwrap().scroll_settings_panel(delta)
+    });
+    app.on_settings_scrollbar_pointer({
+        let controller = controller.clone();
+        move |kind, y| {
+            // `ui/components/ff_scrollbar.slint`'s own fold of
+            // `PointerEventKind`, the same convention as `canvas.slint`'s:
+            // 0 = Down, 1 = Up or Cancel, 2 = Move.
+            let kind = match kind {
+                0 => PointerKind::Down,
+                2 => PointerKind::Move,
+                _ => PointerKind::Up,
+            };
+            controller.lock().unwrap().scrollbar_pointer(kind, y);
+        }
+    });
+    app.on_settings_scrollbar_dragged({
+        let controller = controller.clone();
+        move |y| controller.lock().unwrap().scrollbar_dragged(y)
+    });
+    app.on_settings_viewport_height_changed({
+        let controller = controller.clone();
+        move |height| {
+            controller
+                .lock()
+                .unwrap()
+                .set_settings_viewport_height(height);
+        }
+    });
+
     Installed { controller, canvas }
 }
 
@@ -582,5 +768,6 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::TabScrollChanged => push_tab_scroll(app, &controller.lock().unwrap()),
         ShellEvent::QuestionRaised(question) => push_question(app, &question),
         ShellEvent::EntryRefused(_) => app.set_refusal_open(true),
+        ShellEvent::SettingsChanged => push_settings_panel(app, &controller.lock().unwrap()),
     }
 }

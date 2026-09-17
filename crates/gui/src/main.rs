@@ -48,6 +48,9 @@ struct Args {
     /// `input-map` or `diagnostics`.
     #[arg(long)]
     settings_section: Option<String>,
+    /// Selects the dock's tab row at startup: `images` or `settings`.
+    #[arg(long)]
+    dock_tab: Option<String>,
 }
 
 /// Parses `"WxH"`; `None` on anything else, including a missing or
@@ -224,6 +227,13 @@ fn main() {
         eprintln!("--settings-section accepts only \"input-map\", got {section:?}");
         std::process::exit(2);
     }
+    if let Some(tab) = &args.dock_tab
+        && tab != "images"
+        && tab != "settings"
+    {
+        eprintln!("--dock-tab accepts only \"images\" or \"settings\", got {tab:?}");
+        std::process::exit(2);
+    }
 
     // Built before `select_backend`: the drop route
     // (`bridge::DropHandler`) installs on the `BackendSelector` chain
@@ -255,6 +265,15 @@ fn main() {
                 eprintln!("--open failed: {err}");
                 std::process::exit(1);
             }
+        }
+
+        if let Some(tab) = &args.dock_tab {
+            let tab = if tab == "settings" {
+                focusforge_gui::DockTab::Settings
+            } else {
+                focusforge_gui::DockTab::Images
+            };
+            controller.lock().unwrap().select_dock_tab(tab);
         }
 
         run_window(app, &args)

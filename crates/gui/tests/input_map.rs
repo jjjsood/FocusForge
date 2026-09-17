@@ -851,12 +851,27 @@ fn unimplemented_actions_are_named_not_silent() {
 // One table, one dispatch point.
 // ---------------------------------------------------------------------
 
+/// Files whose own widget owns a raw gesture callback rather than routing
+/// through the canvas's rebindable zoom/pan/drag gesture table: the canvas
+/// itself, plus every scrollable panel and drag-based control (the slider
+/// and the scrollbar), each forwarding its callback body in one line to
+/// `AppController` and interpreting nothing in `.slint`.
+const RAW_GESTURE_CALLBACK_EXCEPTIONS: &[&str] = &[
+    "canvas.slint",
+    "ff_slider.slint",
+    "ff_scrollbar.slint",
+    "settings_panel.slint",
+];
+
 #[test]
 fn no_handler_outside_the_dispatch_point() {
     let mut violations = Vec::new();
     for path in common::find_slint_files(&common::ui_dir()) {
-        let is_canvas = path.file_name().and_then(|n| n.to_str()) == Some("canvas.slint");
-        if is_canvas {
+        let is_exempt = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| RAW_GESTURE_CALLBACK_EXCEPTIONS.contains(&name));
+        if is_exempt {
             continue;
         }
         let contents = fs::read_to_string(&path).unwrap();

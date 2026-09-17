@@ -14,7 +14,8 @@ import { FFTabStrip, ProjectTabView } from "shell/tab_strip.slint";
 export { ProjectTabView }
 import { FFToolbar } from "shell/toolbar.slint";
 import { FFCanvas } from "shell/canvas.slint";
-import { FFDock } from "shell/dock.slint";
+import { FFDock, SettingsRow, SectionHeadView } from "shell/dock.slint";
+export { SettingsRow, SectionHeadView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFSettingsModal, InputRow } from "shell/settings_modal.slint";
 export { InputRow }
@@ -209,6 +210,24 @@ export component AppWindow inherits Window {
         }
     }
 
+    // The settings panel: pushed from `AppController::settings_panel`
+    // (`src/bridge.rs`) on every `ShellEvent::SettingsChanged`, forwarded
+    // one line into `FFDock`.
+    in property <[SettingsRow]> settings-rows: [];
+    in property <SectionHeadView> settings-sticky: { visible: false, section: "", label: "", provenance: "default", push: 0px };
+    in property <length> settings-scroll-y: 0px;
+    in property <length> settings-content-height: 0px;
+    in property <bool> settings-enabled: true;
+    callback settings-param-changed(string, string, float);
+    callback settings-param-text-edited(string, string, string);
+    callback settings-algorithm-selected(string, string);
+    callback settings-reset-all();
+    callback settings-menu-toggled(string, string);
+    callback settings-scrolled(length);
+    callback settings-scrollbar-pointer(int, length);
+    callback settings-scrollbar-dragged(length);
+    callback settings-viewport-height-changed(length);
+
     dock := FFDock {
         x: root.width - ShellGeometry.dock-width;
         y: ShellGeometry.strip-height;
@@ -218,10 +237,24 @@ export component AppWindow inherits Window {
         mode: root.mode;
         dock-tab: root.dock-tab;
         project-loaded: root.project-loaded;
+        settings-rows: root.settings-rows;
+        settings-sticky: root.settings-sticky;
+        settings-scroll-y: root.settings-scroll-y;
+        settings-content-height: root.settings-content-height;
+        settings-enabled: root.settings-enabled;
 
         mode-selected(m) => { root.mode-selected(m); }
         dock-tab-selected(t) => { root.dock-tab-selected(t); }
         checkpoint-export-requested => { root.checkpoint-export-requested(); }
+        settings-param-changed(section, id, f) => { root.settings-param-changed(section, id, f); }
+        settings-param-text-edited(section, id, text) => { root.settings-param-text-edited(section, id, text); }
+        settings-algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
+        settings-reset-all => { root.settings-reset-all(); }
+        settings-menu-toggled(section, id) => { root.settings-menu-toggled(section, id); }
+        settings-scrolled(delta) => { root.settings-scrolled(delta); }
+        settings-scrollbar-pointer(kind, y) => { root.settings-scrollbar-pointer(kind, y); }
+        settings-scrollbar-dragged(y) => { root.settings-scrollbar-dragged(y); }
+        settings-viewport-height-changed(h) => { root.settings-viewport-height-changed(h); }
     }
 
     // Settings modal state -- pushed from Rust once at startup

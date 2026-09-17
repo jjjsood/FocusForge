@@ -13,13 +13,12 @@
 use std::path::{Path, PathBuf};
 
 use focusforge_core::io::{Group, TiffError, TiffHeader, is_frame_path, one_group, propose};
+use focusforge_core::params::StackContext;
 use focusforge_core::project::{PROJECT_EXTENSION, Project, ProjectError};
 // Named here, and re-exported, so `controller.rs` can carry a `Proposal` in
 // its own pending-question state without naming `focusforge_core` itself
 // (`tests/shell.rs`'s crate-wide scan).
 pub use focusforge_core::io::Proposal;
-
-use crate::viewport::ImageSize;
 
 /// What a set of paths (a picker result, a drop gesture, `--open`'s single
 /// argument) resolves to, before any grouping question is asked.
@@ -229,28 +228,33 @@ pub fn answer_question(proposal: &Proposal, answer: OpenAs) -> Opened {
     }
 }
 
-/// A tab's image size, without a composite: an [`GuiProject::Unsaved`] tab
-/// reads its first frame's header only ([`TiffHeader::open`], the same
-/// header-only read `grouping::read_capture_time` already does), so a
-/// pre-fuse tab carries a real size and zoom/pan work on it
-/// unchanged. `None` for an unreadable or frame-less group, which
-/// `propose`/`one_group` never actually produce but a future caller must
-/// not panic on.
-pub fn tab_image_size(project: &GuiProject) -> Option<ImageSize> {
+/// A tab's [`StackContext`], without a composite: an [`GuiProject::Unsaved`]
+/// tab reads its first frame's header only ([`TiffHeader::open`], the same
+/// read `grouping::read_capture_time` already does) plus the group's own
+/// frame count; a reopened [`GuiProject::Opened`] reads the sealed
+/// manifest's composite plane instead. Cached once by `ProjectTab::new`,
+/// never re-read on every settings-panel resolve. `None` for an unreadable
+/// or frame-less group, which `propose`/`one_group` never actually produce
+/// but a future caller must not panic on.
+pub fn tab_stack_context(project: &GuiProject) -> Option<StackContext> {
     match project {
         GuiProject::Unsaved(group) => {
             let header = TiffHeader::open(group.frames.first()?).ok()?;
-            Some(ImageSize {
-                width: header.width,
-                height: header.height,
-            })
+            Some(StackContext::new(
+                group.frames.len(),
+                header.width,
+                header.height,
+                header.samples_per_pixel,
+            ))
         }
         GuiProject::Opened(project) => {
             let composite = &project.manifest().composite;
-            Some(ImageSize {
-                width: composite.width,
-                height: composite.height,
-            })
+            Some(StackContext::new(
+                composite.frame_count as usize,
+                composite.width,
+                composite.height,
+                composite.samples_per_pixel,
+            ))
         }
     }
 }

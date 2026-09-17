@@ -62,6 +62,7 @@ pub mod seal;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 pub use blob::{Plane, StagedBlob, hash_file, short_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, Op, Point};
@@ -74,7 +75,28 @@ pub use manifest::{
 pub use review::ReviewMetrics;
 pub use seal::{SealRequest, SealedProject, seal, seal_at};
 
+use crate::params::{ParamDesc, ParamKind, ParamValue};
 use crate::tile::Rect;
+
+/// The project-level parameter schema: values that describe how a project
+/// was prepared rather than any one algorithm's own settings. One
+/// descriptor today, `auto-crop`, a project value rather than an algorithm
+/// parameter -- rendered by the GUI's settings panel through the same
+/// generator every algorithm's schema goes through, and read by
+/// `focusforge-cli stack`'s `--no-crop` flag so the two never drift.
+pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
+    vec![ParamDesc {
+        id: "auto-crop".to_string(),
+        label: "Auto-crop".to_string(),
+        help: "Trims the composite and Z-Map to the region every aligned \
+               frame actually covers. Off keeps the full frame extent."
+            .to_string(),
+        kind: ParamKind::Bool,
+        default: ParamValue::Bool(true),
+        auto: None,
+        host_default: None,
+    }]
+});
 
 /// The on-disk format version this build writes and reads. A project
 /// declaring a **higher** one is refused by name rather than
@@ -290,4 +312,21 @@ fn read_json<T: serde::de::DeserializeOwned>(
         .map_err(|source| ProjectError::io(path, source))?;
     serde_json::from_str(&text)
         .map_err(|err| ProjectError::container(path, format!("{entry}: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_params_holds_exactly_one_auto_crop_bool_descriptor() {
+        assert_eq!(PROJECT_PARAMS.len(), 1);
+        let desc = &PROJECT_PARAMS[0];
+        assert_eq!(desc.id, "auto-crop");
+        assert_eq!(desc.label, "Auto-crop");
+        assert_eq!(desc.kind, ParamKind::Bool);
+        assert_eq!(desc.default, ParamValue::Bool(true));
+        assert!(desc.auto.is_none());
+        assert!(desc.host_default.is_none());
+    }
 }

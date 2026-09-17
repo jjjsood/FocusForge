@@ -163,12 +163,17 @@ fn checkpoint_panel_touches_no_storage() {
     // The crate legitimately has storage-touching code
     // for the canvas -- reading a loaded project's composite/Z-Map TIFFs is
 
-    // The canvas legitimately touches storage: reading a loaded project's
-    // composite/Z-Map TIFFs is exactly what the canvas is for, and
-    // `input_config.rs` is a config file, not the checkpoint panel reaching
-    // for storage. Excluded by name: this test's own subject is the
-    // checkpoint panel, not the whole crate.
-    let canvas_files = ["canvas.rs", "gpu_canvas.rs", "entry.rs", "input_config.rs"];
+    // The canvas legitimately touches storage (a project's TIFFs),
+    // `input_config.rs` is a config file, and `settings_panel.rs` is the one
+    // module allowed to name the schema/registry crate. Excluded by name:
+    // this test's own subject is the checkpoint panel, not the whole crate.
+    let canvas_files = [
+        "canvas.rs",
+        "gpu_canvas.rs",
+        "entry.rs",
+        "input_config.rs",
+        "settings_panel.rs",
+    ];
     for path in common::find_rust_files(&common::src_dir()) {
         if path
             .file_name()

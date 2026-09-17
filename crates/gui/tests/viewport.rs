@@ -332,8 +332,23 @@ fn gestures_come_from_the_input_map() {
     assert_eq!(canvas_slint.matches("pointer-event(").count(), 1);
     assert_eq!(canvas_slint.matches("moved =>").count(), 1);
 
+    // `ff_slider.slint`'s drag, `ff_scrollbar.slint`'s drag and
+    // `settings_panel.slint`'s scroll are each a one-line forward to
+    // `AppController`, the same as the canvas's own gesture table -- this
+    // single-dispatch-point rule governs the canvas's rebindable zoom/pan/
+    // drag gestures specifically, not every interactive widget in the crate.
+    let raw_gesture_callback_exceptions = [
+        "canvas.slint",
+        "ff_slider.slint",
+        "ff_scrollbar.slint",
+        "settings_panel.slint",
+    ];
     for path in common::find_slint_files(&common::ui_dir()) {
-        if path.file_name().and_then(|n| n.to_str()) == Some("canvas.slint") {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| raw_gesture_callback_exceptions.contains(&name))
+        {
             continue;
         }
         let contents = fs::read_to_string(&path).unwrap();
