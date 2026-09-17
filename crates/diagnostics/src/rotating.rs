@@ -2,11 +2,10 @@
 
 //! A size-rotating append-only writer for the JSON Lines log file.
 //!
-//! Rotation happens after a write pushes the file past `max_bytes`, never
-//! mid-write, so a rotated file never ends inside a JSON object. Locking
-//! recovers from a poisoned mutex instead of panicking, because a panic
-//! hook may still need to append its own record after another writer
-//! panicked mid-write.
+//! Rotation happens only between writes, so a rotated file never ends
+//! mid-object. Locking recovers from a poisoned mutex instead of panicking,
+//! because a panic hook may still need to append its own record after
+//! another writer panicked mid-write.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};

@@ -79,12 +79,7 @@ fn verbosity_v_adds_info_and_q_leaves_only_error() {
 fn json_lines_every_line_parses_as_an_object_with_the_required_keys() {
     let mut cmd = common::cli_bin("diagnostics_cli_json_lines");
     cmd.args(["-v", "info", fixture().to_str().unwrap()]);
-    let data_dir = cmd
-        .get_envs()
-        .find(|(k, _)| *k == "FOCUSFORGE_DATA_DIR")
-        .and_then(|(_, v)| v)
-        .map(PathBuf::from)
-        .expect("cli_bin always sets FOCUSFORGE_DATA_DIR");
+    let data_dir = common::data_dir_of(&cmd);
 
     let output = cmd.output().expect("failed to run binary");
     assert!(output.status.success());
@@ -109,12 +104,7 @@ fn json_lines_every_line_parses_as_an_object_with_the_required_keys() {
 #[test]
 fn unwritable_data_directory_falls_back_to_stderr_alone() {
     let mut cmd = common::cli_bin("diagnostics_cli_unwritable");
-    let data_dir = cmd
-        .get_envs()
-        .find(|(k, _)| *k == "FOCUSFORGE_DATA_DIR")
-        .and_then(|(_, v)| v)
-        .map(PathBuf::from)
-        .expect("cli_bin always sets FOCUSFORGE_DATA_DIR");
+    let data_dir = common::data_dir_of(&cmd);
     std::fs::create_dir_all(&data_dir).unwrap();
     let mut perms = std::fs::metadata(&data_dir).unwrap().permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
@@ -125,8 +115,7 @@ fn unwritable_data_directory_falls_back_to_stderr_alone() {
         .output()
         .expect("failed to run binary");
 
-    let restore = std::fs::metadata(&data_dir).unwrap().permissions();
-    let mut restore = restore;
+    let mut restore = std::fs::metadata(&data_dir).unwrap().permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut restore, 0o755);
     std::fs::set_permissions(&data_dir, restore).unwrap();
 
