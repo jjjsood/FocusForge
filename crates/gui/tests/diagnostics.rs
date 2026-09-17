@@ -37,3 +37,42 @@ fn startup_line_reaches_the_log_file_before_the_settings_section_exit() {
         "expected a startup line from the diagnostics target, got: {contents}"
     );
 }
+
+#[test]
+fn the_settings_section_refusal_reaches_the_log_and_prints_once() {
+    let mut cmd = common::gui_bin("diagnostics_refusal");
+    let data_dir = cmd
+        .get_envs()
+        .find(|(k, _)| *k == "FOCUSFORGE_DATA_DIR")
+        .and_then(|(_, v)| v)
+        .map(std::path::PathBuf::from)
+        .expect("gui_bin always sets FOCUSFORGE_DATA_DIR");
+
+    let output = cmd
+        .args(["--settings-section", "nope"])
+        .output()
+        .expect("failed to run focusforge-gui");
+
+    let refusal = "--settings-section accepts only \"input-map\", got \"nope\"";
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches(refusal).count(),
+        1,
+        "the refusal must print exactly once, got: {stderr}"
+    );
+
+    let log_path = data_dir
+        .join("focusforge")
+        .join("logs")
+        .join("focusforge.jsonl");
+    let contents = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("log file must exist at {}: {e}", log_path.display()));
+    assert!(
+        contents.lines().any(|line| {
+            let record: serde_json::Value =
+                serde_json::from_str(line).expect("every log line is JSON");
+            record["level"] == "ERROR" && record["message"].as_str().is_some_and(|m| m == refusal)
+        }),
+        "no ERROR record carries the refusal: {contents}"
+    );
+}

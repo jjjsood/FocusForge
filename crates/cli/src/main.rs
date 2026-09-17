@@ -12,6 +12,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use focusforge_core::io::{ByteOrder, TiffError, TiffHeader, frame_paths};
+use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
 mod algorithms;
@@ -317,12 +318,28 @@ enum Command {
     },
 }
 
+/// The subcommand's own name, as the job span carries it in the log.
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Info { .. } => "info",
+        Command::Algorithms { .. } => "algorithms",
+        Command::Stack { .. } => "stack",
+        Command::Export { .. } => "export",
+        Command::Align { .. } => "align",
+        Command::Review { .. } => "review",
+        Command::Cache { .. } => "cache",
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let _diagnostics = focusforge_diagnostics::init(&focusforge_diagnostics::Options {
         data_dir: focusforge_diagnostics::data_dir_from_env(),
         verbosity: verbosity(&cli),
     });
+    // Entered for the whole invocation, so every event a run raises names
+    // the command it came from.
+    let _job = tracing::debug_span!("job", command = command_name(&cli.command)).entered();
     match cli.command {
         Command::Info { path, json } => info(&path, json),
         Command::Algorithms { id, json, set } => algorithms::run(id.as_deref(), json, &set),
@@ -770,5 +787,6 @@ fn print_human(report: &InfoReport) {
 
 fn fail(message: impl std::fmt::Display) -> ExitCode {
     eprintln!("error: {message}");
+    tracing::error!(target: MIRRORED_OUTPUT_TARGET, "error: {message}");
     ExitCode::FAILURE
 }

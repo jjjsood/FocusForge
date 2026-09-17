@@ -1418,6 +1418,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -1433,6 +1434,8 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "thiserror 2.0.20",
+ "tracing",
+ "tracing-subscriber",
  "zip",
  "zstd",
 ]
@@ -1471,11 +1474,13 @@ dependencies = [
  "i-slint-backend-testing",
  "png",
  "serde",
+ "serde_json",
  "slint",
  "slint-build",
  "tempfile",
  "thiserror 2.0.20",
  "toml",
+ "tracing",
 ]
 
 [[package]]

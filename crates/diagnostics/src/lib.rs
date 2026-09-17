@@ -25,6 +25,11 @@ const WORKSPACE_TARGETS: [&str; 5] = [
     "focusforge_diagnostics",
 ];
 
+/// The target for an event that repeats, for the log file alone, a line the
+/// program has already printed on stderr itself. Excluded from the stderr
+/// sink at every verbosity, so such a line is never printed twice.
+pub const MIRRORED_OUTPUT_TARGET: &str = "focusforge::mirrored_output";
+
 /// The live log file's rotation threshold and retention count: an ~48 MiB
 /// ceiling (one 8 MiB live file plus five rotated ones).
 const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
@@ -137,11 +142,13 @@ fn bridge_cap(verbosity: i8) -> log::LevelFilter {
 }
 
 /// The stderr layer's per-target filter: [`WORKSPACE_TARGETS`] follow the
-/// `-v`/`-q` verbosity, every other target follows the default level.
+/// `-v`/`-q` verbosity, [`MIRRORED_OUTPUT_TARGET`] is off whatever the
+/// verbosity, every other target follows the default level.
 fn stderr_targets(verbosity: i8) -> Targets {
     Targets::new()
         .with_default(stderr_default_level(verbosity))
         .with_targets(WORKSPACE_TARGETS.map(|t| (t, stderr_level(verbosity))))
+        .with_target(MIRRORED_OUTPUT_TARGET, LevelFilter::OFF)
 }
 
 /// The file layer's per-target filter: fixed regardless of `-v`/`-q`, so a
@@ -150,6 +157,7 @@ fn file_targets() -> Targets {
     Targets::new()
         .with_default(LevelFilter::WARN)
         .with_targets(WORKSPACE_TARGETS.map(|t| (t, LevelFilter::DEBUG)))
+        .with_target(MIRRORED_OUTPUT_TARGET, LevelFilter::DEBUG)
 }
 
 /// Installs the process-wide subscriber and the `tracing-log` bridge, and
@@ -229,6 +237,27 @@ mod tests {
     fn stderr_filter_lifts_third_party_default_from_verbosity_two() {
         assert!(!stderr_targets(1).would_enable("some_third_party_crate", &Level::DEBUG));
         assert!(stderr_targets(2).would_enable("some_third_party_crate", &Level::DEBUG));
+    }
+
+    #[test]
+    fn stderr_filter_never_accepts_the_mirrored_output_target() {
+        for verbosity in [-1, 0, 1, 2, 3] {
+            let filter = stderr_targets(verbosity);
+            for level in [Level::ERROR, Level::WARN, Level::INFO, Level::DEBUG] {
+                assert!(
+                    !filter.would_enable(MIRRORED_OUTPUT_TARGET, &level),
+                    "{level} on the mirrored-output target reached stderr at verbosity {verbosity}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_filter_accepts_the_mirrored_output_target_down_to_debug() {
+        let filter = file_targets();
+        assert!(filter.would_enable(MIRRORED_OUTPUT_TARGET, &Level::ERROR));
+        assert!(filter.would_enable(MIRRORED_OUTPUT_TARGET, &Level::WARN));
+        assert!(filter.would_enable(MIRRORED_OUTPUT_TARGET, &Level::DEBUG));
     }
 
     #[test]

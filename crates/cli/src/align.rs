@@ -22,6 +22,7 @@ use focusforge_core::registry;
 use focusforge_core::tile::Rect;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 use focusforge_core::timing::{Stage, StageTimer};
+use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
 use crate::preset::{self, PresetOptions};
@@ -174,6 +175,7 @@ pub fn run(
     let start = Instant::now();
     // One monotonic timer shares `start` with `wall_seconds` below.
     let mut timer = StageTimer::from_start(start);
+    timer.enter(Stage::Setup);
     let mut renderer = ProgressRenderer::new(ProgressMode::choose(quiet));
     let sink = StatusSink::new(preset_opts.status, dir.display().to_string(), "align");
 
@@ -265,6 +267,7 @@ pub fn run(
         FailurePolicy::Strict
     };
     timer.mark(Stage::Setup);
+    timer.enter(Stage::Align);
     renderer.stage(&format!("align {} frames (no unit progress)", stack.len()));
     let run = match align_stack_with(
         algo,
@@ -285,6 +288,7 @@ pub fn run(
     timer.mark(Stage::Align);
 
     if let Some(write_warped) = write_warped {
+        timer.enter(Stage::WarpWrite);
         // Resolved only here, not for a plain `align` run: plain `align` has
         // nothing on the GPU-shaped path (its ECC solver is CPU-only), so
         // probing for an adapter on every run would be noise with nothing to
@@ -368,10 +372,12 @@ pub fn run(
         ));
     }
     if lax && alignment.failure_count() > 0 {
-        eprintln!(
+        let warning = format!(
             "warning: {} frame(s) failed to register and fell back to identity",
             alignment.failure_count()
         );
+        eprintln!("{warning}");
+        tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "{warning}");
     }
 
     // `outputs` carries the `--write-warped` directory when one was given,

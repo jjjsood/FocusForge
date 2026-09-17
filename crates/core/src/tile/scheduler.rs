@@ -481,6 +481,12 @@ impl<'a> TileScheduler<'a> {
         let reader = self.reader;
         let gate = &self.gate;
 
+        // Span context does not cross onto a pool thread by itself: the
+        // caller's span is captured here and each tile span is parented to
+        // it explicitly, so an event raised inside a tile's closure still
+        // names the run it belongs to.
+        let parent = tracing::Span::current();
+
         let install_result: Result<(), RunStop> = pool.install(|| {
             tiles.par_iter().try_for_each_init(
                 || {
@@ -517,6 +523,16 @@ impl<'a> TileScheduler<'a> {
                     if control.should_stop() {
                         return Err(RunStop::Requested);
                     }
+
+                    // One span per tile, never per pixel: the finest
+                    // granularity anything in this loop may cost.
+                    let tile_span = tracing::debug_span!(
+                        parent: &parent,
+                        "tile",
+                        index = planned.index(),
+                        rect = ?planned.interior()
+                    );
+                    let _tile = tile_span.enter();
 
                     let cur = live.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(cur, Ordering::SeqCst);
@@ -600,6 +616,7 @@ impl<'a> TileScheduler<'a> {
                             let read_rect = planned.read();
                             control
                                 .unit_completed(read_rect.width as u64 * read_rect.height as u64);
+                            tracing::debug!("tile complete");
                             Ok(())
                         }
                         Err(e) => {

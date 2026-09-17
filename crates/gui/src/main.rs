@@ -65,8 +65,7 @@ fn select_backend() {
     let shared = match focusforge_gpu::device::shared_device() {
         Ok(shared) => shared,
         Err(err) => {
-            eprintln!("{err}");
-            eprintln!("focusforge-cli still works without a GPU adapter");
+            tracing::error!("{err}\nfocusforge-cli still works without a GPU adapter");
             std::process::exit(1);
         }
     };
@@ -81,7 +80,7 @@ fn select_backend() {
         .require_wgpu_29(config)
         .select()
     {
-        eprintln!("{e}");
+        tracing::error!("{e}");
         std::process::exit(1);
     }
     // The crate's feature set pins exactly one backend/renderer
@@ -112,7 +111,7 @@ fn run_window<T: ComponentHandle + 'static>(app: T, args: &Args) -> i32 {
             if let Some((w, h)) = parse_size(&spec) {
                 app.window().set_size(slint::PhysicalSize::new(w, h));
             } else {
-                eprintln!("--size expects WxH, got {spec:?}");
+                tracing::warn!("--size expects WxH, got {spec:?}");
             }
         });
     }
@@ -128,12 +127,12 @@ fn run_window<T: ComponentHandle + 'static>(app: T, args: &Args) -> i32 {
                 match app.window().take_snapshot() {
                     Ok(buffer) => {
                         if let Err(e) = screenshot::write_png(&buffer, path) {
-                            eprintln!("--screenshot failed: {e}");
+                            tracing::error!("--screenshot failed: {e}");
                             exit_code.set(1);
                         }
                     }
                     Err(e) => {
-                        eprintln!("take_snapshot failed: {e}");
+                        tracing::error!("take_snapshot failed: {e}");
                         exit_code.set(1);
                     }
                 }
@@ -144,7 +143,7 @@ fn run_window<T: ComponentHandle + 'static>(app: T, args: &Args) -> i32 {
     }
 
     if let Err(e) = app.run() {
-        eprintln!("event loop exited with an error: {e}");
+        tracing::error!("event loop exited with an error: {e}");
         exit_code.set(1);
     }
     exit_code.get()
@@ -172,19 +171,21 @@ fn install_input_table(
     use focusforge_gui::input_config;
 
     let Some(config_dir) = resolve_config_dir(args) else {
-        eprintln!("could not resolve a config directory -- starting on the input map defaults");
+        tracing::warn!(
+            "could not resolve a config directory -- starting on the input map defaults"
+        );
         return;
     };
 
     let mut loaded = input_config::load(&config_dir);
     for problem in &loaded.problems {
-        eprintln!("{problem}");
+        tracing::warn!("{problem}");
     }
     if matches!(loaded.provenance, input_config::Provenance::Defaults)
         && loaded.problems.is_empty()
         && let Err(e) = input_config::write_defaults(&config_dir)
     {
-        eprintln!("{e}");
+        tracing::warn!("{e}");
         loaded.problems.push(e);
     }
 
@@ -220,7 +221,7 @@ fn main() {
     if let Some(section) = &args.settings_section
         && section != "input-map"
     {
-        eprintln!("--settings-section accepts only \"input-map\", got {section:?}");
+        tracing::error!("--settings-section accepts only \"input-map\", got {section:?}");
         std::process::exit(2);
     }
 
@@ -237,7 +238,7 @@ fn main() {
 
         if let Some(path) = &args.open {
             if let Err(e) = controller.lock().unwrap().open_project(path) {
-                eprintln!("--open failed: {e}");
+                tracing::error!("--open failed: {e}");
                 std::process::exit(1);
             }
             let shared = focusforge_gpu::device::shared_device()

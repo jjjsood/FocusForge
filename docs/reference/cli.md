@@ -35,6 +35,12 @@ Every run also writes a JSON Lines log (one JSON object per line) to a log
 file in the platform's per-user data directory, independently of `-v`/`-q`.
 The file rotates once it reaches 8 MiB, keeping up to 5 rotated files.
 
+The log records every warning and refusal a run prints on stderr, whatever
+`-v`/`-q` say, and never repeats a line stderr already carried. Each entry
+also names the context it belongs to: the command, the stack, the stage
+(`setup`, `align`, `fuse`, `warp_write`, `finalize`) and, for work that runs
+per tile, the tile.
+
 ## `info`
 
 ```
