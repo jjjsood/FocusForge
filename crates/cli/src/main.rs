@@ -337,6 +337,9 @@ fn main() -> ExitCode {
         data_dir: focusforge_diagnostics::data_dir_from_env(),
         verbosity: verbosity(&cli),
     });
+    // The earliest point a forced crash is observable: `init` is what
+    // installs the hook that reports it.
+    focusforge_diagnostics::force_crash("startup");
     // Entered for the whole invocation, so every event a run raises names
     // the command it came from.
     let _job = tracing::debug_span!("job", command = command_name(&cli.command)).entered();

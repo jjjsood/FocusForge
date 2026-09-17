@@ -456,6 +456,7 @@ pub fn align_stack_with(
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(workers)
                     .thread_name(|i| format!("focusforge-align-{i}"))
+                    .panic_handler(crate::pool::log_worker_panic)
                     .build()
                     .map_err(|source| AlgorithmError::Failed {
                         algorithm: "align_stack".to_string(),

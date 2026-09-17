@@ -15,6 +15,7 @@ pub mod host;
 pub mod io;
 pub mod job;
 pub mod params;
+mod pool;
 pub mod project;
 pub mod registry;
 pub mod tile;

@@ -5,14 +5,18 @@
 //! sink, both fed by `tracing` events and, through the `tracing-log`
 //! bridge, by `log`-crate records (`wgpu`, `naga`).
 
+mod crash;
+mod ring;
 mod rotating;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::prelude::*;
 
+use ring::Ring;
 use rotating::RotatingFile;
 
 /// This workspace's own `tracing` targets, filtered independently of every
@@ -160,12 +164,65 @@ fn file_targets() -> Targets {
         .with_target(MIRRORED_OUTPUT_TARGET, LevelFilter::DEBUG)
 }
 
-/// Installs the process-wide subscriber and the `tracing-log` bridge, and
-/// emits the run's first event. Call once, as the first statement of
-/// `main`; a second call panics on the already-installed subscriber. The
-/// file sink is opened at `<data dir>/logs/focusforge.jsonl`; when it
-/// cannot open, the stderr sink runs alone, [`Diagnostics::log_path`] stays
-/// `None` and one note naming the directory goes to stderr.
+/// The flight recorder's per-target filter: DEBUG for every target, so an
+/// event a third-party crate raises below the file layer's default still
+/// reaches a crash report.
+fn ring_targets() -> Targets {
+    Targets::new().with_default(LevelFilter::DEBUG)
+}
+
+/// This process's own executable name, as both the startup event and a
+/// crash report's file name carry it.
+fn binary_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "focusforge".to_string())
+}
+
+/// A panic payload as text: the `&str` and `String` forms a `panic!` can
+/// produce, and a fixed stand-in for anything else.
+pub fn panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+/// The path of the most recent crash report this process wrote, or `None`
+/// when no panic has been reported.
+pub fn last_crash_report() -> Option<PathBuf> {
+    crash::last_report()
+}
+
+/// Configures rayon's global pool: named workers, so a crash report names
+/// which pool a panic came from, and a handler for the panics rayon cannot
+/// propagate back to a caller (`spawn` and friends), which would otherwise
+/// abort the process. A pool another caller already built keeps its own
+/// configuration.
+fn configure_global_pool() {
+    let _ = rayon::ThreadPoolBuilder::new()
+        .thread_name(|i| format!("focusforge-worker-{i}"))
+        .panic_handler(|payload| {
+            tracing::error!(
+                target: "focusforge_diagnostics",
+                payload = %panic_payload(&*payload),
+                "a worker thread panicked"
+            );
+        })
+        .build_global();
+}
+
+/// Installs the process-wide subscriber, the `tracing-log` bridge, the
+/// panic hook and the global pool's configuration, and emits the run's
+/// first event. Call once, as the first statement of `main`; a second call
+/// panics on the already-installed subscriber. The file sink is opened at
+/// `<data dir>/logs/focusforge.jsonl` and crash reports go to
+/// `<data dir>/crashes/`; when the file cannot open, the stderr sink runs
+/// alone and one note naming the directory goes there.
 pub fn init(options: &Options) -> Diagnostics {
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
@@ -188,19 +245,28 @@ pub fn init(options: &Options) -> Diagnostics {
         }
     };
 
+    let ring = Ring::new();
+    let ring_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(ring.clone())
+        .with_filter(ring_targets());
+
     tracing_subscriber::registry()
         .with(stderr_layer)
         .with(file_layer)
+        .with(ring_layer)
         .init();
 
     let _ = tracing_log::LogTracer::builder()
         .with_max_level(bridge_cap(options.verbosity))
         .init();
 
-    let binary = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "focusforge".to_string());
+    let binary = binary_name();
+    if let Some(data_dir) = options.data_dir.as_deref() {
+        crash::install_hook(data_dir.join("crashes"), ring, binary.clone());
+    }
+    configure_global_pool();
+
     tracing::info!(
         target: "focusforge_diagnostics",
         binary = %binary,
@@ -209,6 +275,38 @@ pub fn init(options: &Options) -> Diagnostics {
     );
 
     Diagnostics { log_path }
+}
+
+/// Panics when the `FF_FORCE_CRASH` environment variable names `site`, so
+/// the crash path can be exercised on a real binary: `panic` and `pool` at
+/// `"startup"` -- on the calling thread and on a worker of the global pool
+/// respectively -- and `stack` at `"stack"`, which fires for the first
+/// stack of a run only, leaving the rest to run. Any other value does
+/// nothing, as does an unset variable.
+pub fn force_crash(site: &str) {
+    let Some(kind) = std::env::var_os("FF_FORCE_CRASH") else {
+        return;
+    };
+    match (site, kind.to_string_lossy().as_ref()) {
+        ("startup", "panic") => panic!("forced panic: FF_FORCE_CRASH=panic"),
+        ("startup", "pool") => {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            rayon::spawn(move || {
+                // Dropped as the panic below unwinds, which is what wakes
+                // the receiver without a sleep.
+                let _tx = tx;
+                panic!("forced panic: FF_FORCE_CRASH=pool");
+            });
+            let _ = rx.recv();
+        }
+        ("stack", "stack") => {
+            static FIRED: AtomicBool = AtomicBool::new(false);
+            if !FIRED.swap(true, Ordering::SeqCst) {
+                panic!("forced panic: FF_FORCE_CRASH=stack");
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +356,15 @@ mod tests {
         assert!(filter.would_enable(MIRRORED_OUTPUT_TARGET, &Level::ERROR));
         assert!(filter.would_enable(MIRRORED_OUTPUT_TARGET, &Level::WARN));
         assert!(filter.would_enable(MIRRORED_OUTPUT_TARGET, &Level::DEBUG));
+    }
+
+    #[test]
+    fn ring_filter_accepts_a_debug_event_the_file_filter_rejects() {
+        let ring = ring_targets();
+        let file = file_targets();
+        assert!(ring.would_enable("some_third_party_crate", &Level::DEBUG));
+        assert!(!file.would_enable("some_third_party_crate", &Level::DEBUG));
+        assert!(ring.would_enable("focusforge_core", &Level::DEBUG));
     }
 
     #[test]

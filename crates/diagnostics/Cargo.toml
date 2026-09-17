@@ -11,10 +11,11 @@ workspace = true
 [dependencies]
 directories = "6"
 log = "0.4.34"
+rayon = "1.12"
+serde_json = "1"
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
 tracing-log = "0.2.0"
 tracing-subscriber = { version = "0.3.23", features = ["json"] }
 
 [dev-dependencies]
-serde_json = "1"
 tempfile = "3"

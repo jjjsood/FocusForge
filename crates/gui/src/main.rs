@@ -215,6 +215,9 @@ fn main() {
         data_dir: focusforge_diagnostics::data_dir_from_env(),
         verbosity: 0,
     });
+    // The earliest point a forced crash is observable: `init` is what
+    // installs the hook that reports it.
+    focusforge_diagnostics::force_crash("startup");
 
     let args = Args::parse();
 

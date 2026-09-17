@@ -457,6 +457,7 @@ impl<'a> TileScheduler<'a> {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.pool_threads)
             .thread_name(|i| format!("focusforge-tile-{i}"))
+            .panic_handler(crate::pool::log_worker_panic)
             .build()
             .map_err(|source| TileError::ThreadPool { source })?;
 

@@ -475,7 +475,33 @@ pub fn run(
         }
         let group_output = project_path(output, group);
         let identity = identities[i].clone();
-        let result = run_group(&setup, group, &group_output, identity.clone());
+        let group_start = Instant::now();
+        // A panic ends this group alone: the rest of the batch still runs,
+        // and the group is recorded exactly as any other refusal is. The
+        // unwinding run's own status sink never emitted, so the verdict
+        // needs a fresh one.
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_group(&setup, group, &group_output, identity.clone())
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                let status = StatusSink::new(preset_opts.status, identity.clone(), "stack");
+                let result = self::failed(
+                    &status,
+                    group_start,
+                    focusforge_diagnostics::panic_payload(&*payload),
+                );
+                if let Some(report) = focusforge_diagnostics::last_crash_report() {
+                    eprintln!("crash report: {}", report.display());
+                    tracing::error!(
+                        target: MIRRORED_OUTPUT_TARGET,
+                        "crash report: {}",
+                        report.display()
+                    );
+                }
+                result
+            }
+        };
         manifest.push(manifest_entry(group, identity, &result));
         match &result {
             GroupResult::Failed { .. } => failed = true,
@@ -882,6 +908,8 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // Entered for this group alone, so an event raised anywhere below names
     // the stack it belongs to.
     let _stack = tracing::debug_span!("stack", identity = %identity).entered();
+    // Inside the span, so a forced crash carries this run's own context.
+    focusforge_diagnostics::force_crash("stack");
     // One monotonic timer built from the same `Instant` `failed`/
     // `cancelled` already use for `wall_seconds`, so a completed run's
     // stage breakdown and its own `wall_seconds` share one clock exactly.
