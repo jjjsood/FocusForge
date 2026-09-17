@@ -28,7 +28,7 @@ use std::process::Command;
 use focusforge_core::io::{Rect, TiffStack};
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+    common::cli_bin("cli_gpu")
 }
 
 fn mantis_512_dir() -> PathBuf {

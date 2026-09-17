@@ -20,6 +20,7 @@ gpu-tests = ["gpu"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 focusforge-core = { path = "../core" }
+focusforge-diagnostics = { path = "../diagnostics" }
 focusforge-gpu = { path = "../gpu", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -54,11 +54,15 @@ fn cli_output(output: std::process::Output) -> CliOutput {
     }
 }
 
+/// `dir` is already a fresh, per-test working directory (see the module
+/// doc comment), so its own `ff-data` subdirectory is a fresh data
+/// directory too -- never the tester's real one.
 fn run_bin(dir: &Path, path: &Path, args: &[&str]) -> CliOutput {
     cli_output(
         Command::new(path)
             .args(args)
             .current_dir(dir)
+            .env("FOCUSFORGE_DATA_DIR", dir.join("ff-data"))
             .output()
             .expect("failed to run binary"),
     )

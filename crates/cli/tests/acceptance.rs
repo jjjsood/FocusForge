@@ -275,6 +275,7 @@ fn fusion_change_reuses_reference_alignment() {
         let start = std::time::Instant::now();
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
             .current_dir(&run_dir)
+            .env("FOCUSFORGE_DATA_DIR", run_dir.join("ff-data"))
             .args([
                 "stack",
                 frames.to_str().unwrap(),

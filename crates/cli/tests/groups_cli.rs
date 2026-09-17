@@ -37,7 +37,7 @@ use focusforge_core::io::TiffStack;
 use focusforge_core::io::test_frames::write_frame_with_capture_time;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+    common::cli_bin("groups_cli")
 }
 
 struct CliOutput {

@@ -210,6 +210,11 @@ fn install_input_table(
 }
 
 fn main() {
+    let _diagnostics = focusforge_diagnostics::init(&focusforge_diagnostics::Options {
+        data_dir: focusforge_diagnostics::data_dir_from_env(),
+        verbosity: 0,
+    });
+
     let args = Args::parse();
 
     if let Some(section) = &args.settings_section

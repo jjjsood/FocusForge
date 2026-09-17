@@ -18,6 +18,23 @@ focusforge-cli <COMMAND>
 | [`review`](#review) | reports one record per project found under a directory or a run's output |
 | [`cache`](#cache) | manages the stage cache under `.scratch/stage-cache/` |
 
+## Global options
+
+`-v` and `-q` apply to every command and control how much a run says on
+stderr:
+
+```
+focusforge-cli [-v]... [-q] <COMMAND>
+```
+
+- Repeat `-v` for more detail: once for informational messages, twice for
+  debug detail. Omit it for warnings and errors only.
+- `-q` restricts stderr to errors only. `-q` wins when both are given.
+
+Every run also writes a JSON Lines log (one JSON object per line) to a log
+file in the platform's per-user data directory, independently of `-v`/`-q`.
+The file rotates once it reaches 8 MiB, keeping up to 5 rotated files.
+
 ## `info`
 
 ```

@@ -58,6 +58,22 @@ fn resolve_backend(_no_gpu: bool, _max_vram: Option<u64>) -> stack::BackendChoic
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Increase log detail (repeatable).
+    #[arg(short = 'v', action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+    /// Log errors only.
+    #[arg(short = 'q', global = true)]
+    quiet: bool,
+}
+
+/// The `-v`/`-q` count as [`focusforge_diagnostics::Options::verbosity`]:
+/// `-1` when `-q` is set (which wins over any `-v`), else the `-v` count.
+fn verbosity(cli: &Cli) -> i8 {
+    if cli.quiet {
+        -1
+    } else {
+        i8::try_from(cli.verbose).unwrap_or(i8::MAX)
+    }
 }
 
 #[derive(Subcommand)]
@@ -303,6 +319,10 @@ enum Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let _diagnostics = focusforge_diagnostics::init(&focusforge_diagnostics::Options {
+        data_dir: focusforge_diagnostics::data_dir_from_env(),
+        verbosity: verbosity(&cli),
+    });
     match cli.command {
         Command::Info { path, json } => info(&path, json),
         Command::Algorithms { id, json, set } => algorithms::run(id.as_deref(), json, &set),
