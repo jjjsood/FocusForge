@@ -115,9 +115,15 @@ pub(crate) fn create_new_numbered(
 /// `:` is what makes the name legal on every target filesystem. Full
 /// RFC 3339 precision lives in the report body instead.
 pub(crate) fn report_stem(unix_seconds: i64, binary: &str, pid: u32) -> String {
+    format!("{}-{binary}-{pid}", utc_stamp(unix_seconds))
+}
+
+/// `<YYYYMMDD>T<HHMMSS>Z`: the timestamp half of [`report_stem`], and the
+/// one colon-free spelling of an instant this crate puts into a file name.
+pub(crate) fn utc_stamp(unix_seconds: i64) -> String {
     let (year, month, day) = civil_from_unix(unix_seconds);
     let (hour, minute, second) = time_of_day(unix_seconds);
-    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z-{binary}-{pid}")
+    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
 }
 
 /// Now, as whole seconds since the Unix epoch.
@@ -177,6 +183,14 @@ mod tests {
             "20240229T120000Z-focusforge-gui-7"
         );
         assert!(!report_stem(0, "focusforge-cli", 1).contains(':'));
+    }
+
+    #[test]
+    fn the_timestamp_half_of_a_stem_is_the_stem_without_its_binary_and_pid() {
+        assert_eq!(utc_stamp(1789482330), "20260915T142530Z");
+        assert!(
+            report_stem(1789482330, "focusforge-cli", 4242).starts_with(&utc_stamp(1789482330))
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! sink, both fed by `tracing` events and, through the `tracing-log`
 //! bridge, by `log`-crate records (`wgpu`, `naga`).
 
+pub mod bundle;
 mod crash;
 mod native;
 mod ring;
@@ -42,13 +43,22 @@ const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 const KEEP_ROTATED: u32 = 5;
 
 /// `<FOCUSFORGE_DATA_DIR>/focusforge` when that variable is set, else the
-/// platform's own per-user data directory for `focusforge`. The only
-/// function in this crate that reads the environment.
+/// platform's own per-user data directory for `focusforge`.
 pub fn data_dir_from_env() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("FOCUSFORGE_DATA_DIR") {
         return Some(PathBuf::from(dir).join("focusforge"));
     }
     directories::ProjectDirs::from("", "", "focusforge").map(|d| d.data_dir().to_path_buf())
+}
+
+/// `<FOCUSFORGE_CONFIG_DIR>/focusforge` when that variable is set, else the
+/// platform's own per-user configuration directory for `focusforge` -- the
+/// directory the graphical shell keeps its input map in.
+pub fn config_dir_from_env() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("FOCUSFORGE_CONFIG_DIR") {
+        return Some(PathBuf::from(dir).join("focusforge"));
+    }
+    directories::ProjectDirs::from("", "", "focusforge").map(|d| d.config_dir().to_path_buf())
 }
 
 /// Configuration for [`init`].

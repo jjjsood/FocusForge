@@ -1473,6 +1473,7 @@ dependencies = [
  "signal-hook",
  "toml",
  "tracing",
+ "zip",
 ]
 
 [[package]]
@@ -1500,6 +1501,7 @@ version = "0.1.0"
 dependencies = [
  "crash-handler",
  "directories",
+ "focusforge-core",
  "log",
  "minidumper",
  "rayon",
@@ -1509,6 +1511,7 @@ dependencies = [
  "tracing",
  "tracing-log",
  "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]

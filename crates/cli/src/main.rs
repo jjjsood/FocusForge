@@ -19,6 +19,7 @@ mod algorithms;
 mod align;
 mod bytes;
 mod cache;
+mod diagnostics;
 mod export;
 #[cfg(feature = "gpu")]
 mod gpu;
@@ -316,6 +317,23 @@ enum Command {
         #[command(subcommand)]
         action: cache::CacheAction,
     },
+    /// Package this installation's logs, crash reports, system summary,
+    /// graphics adapter record, effective configuration and version into
+    /// one ZIP, listing every file before writing it. The home directory
+    /// and the user name are redacted out of every text entry, image data
+    /// is never included, and nothing is sent anywhere.
+    Diagnostics {
+        /// Where to write the ZIP. Omit for a dated name in the current
+        /// directory.
+        #[arg(short = 'o', long = "output", value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Include the minidump binaries. They cannot be redacted.
+        #[arg(long = "include-minidumps")]
+        include_minidumps: bool,
+        /// Overwrite the output path when it already exists.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// The subcommand's own name, as the job span carries it in the log.
@@ -328,6 +346,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Align { .. } => "align",
         Command::Review { .. } => "review",
         Command::Cache { .. } => "cache",
+        Command::Diagnostics { .. } => "diagnostics",
     }
 }
 
@@ -460,6 +479,11 @@ fn main() -> ExitCode {
         }
         Command::Review { dir, json } => review::run(&dir, json),
         Command::Cache { action } => cache::run(action),
+        Command::Diagnostics {
+            output,
+            include_minidumps,
+            force,
+        } => diagnostics::run(output.as_deref(), include_minidumps, force),
     }
 }
 
