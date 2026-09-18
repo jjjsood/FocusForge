@@ -40,11 +40,7 @@ impl Checkpoint {
     /// the same instant name the same checkpoint file, and no `uuid`
     /// dependency is needed to get a collision-free name.
     pub fn derive_id(stack_fingerprint: &str, zmap_blob: &str, created_at: i64) -> String {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(stack_fingerprint.as_bytes());
-        hasher.update(zmap_blob.as_bytes());
-        hasher.update(&created_at.to_le_bytes());
-        hasher.finalize().to_hex()[..32].to_string()
+        Self::derive(None, stack_fingerprint, zmap_blob, created_at)
     }
 
     /// `blake3(parent ‖ stack_fingerprint ‖ zmap_blob ‖ created_at)`,
@@ -57,8 +53,19 @@ impl Checkpoint {
         zmap_blob: &str,
         created_at: i64,
     ) -> String {
+        Self::derive(Some(parent), stack_fingerprint, zmap_blob, created_at)
+    }
+
+    fn derive(
+        parent: Option<&str>,
+        stack_fingerprint: &str,
+        zmap_blob: &str,
+        created_at: i64,
+    ) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(parent.as_bytes());
+        if let Some(parent) = parent {
+            hasher.update(parent.as_bytes());
+        }
         hasher.update(stack_fingerprint.as_bytes());
         hasher.update(zmap_blob.as_bytes());
         hasher.update(&created_at.to_le_bytes());
@@ -108,8 +115,7 @@ pub enum Op {
     ResetRegion {
         /// `crate::tile::Rect` deliberately derives no `Default` (an empty
         /// rect is not a meaningful geometry anywhere else in the
-        /// workspace), so the op-field default is spelled here rather than
-        /// bought by widening a type five modules away.
+        /// workspace), so the op-field default is spelled here instead.
         #[serde(default = "empty_rect")]
         rect: Rect,
     },
