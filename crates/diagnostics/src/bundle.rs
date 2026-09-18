@@ -2,14 +2,10 @@
 
 //! The diagnostics bundle: one ZIP holding the rotated logs, the crash
 //! evidence, a system summary, the graphics adapter record, the effective
-//! configuration and the build's own version.
+//! configuration and version -- nothing in it is sent anywhere.
 //!
-//! Two steps, so what a caller shows is exactly what is written:
-//! [`manifest`] resolves every entry and touches no output path,
-//! [`write()`] stores those entries and nothing else. Home directory and
-//! user name are redacted out of every text entry, image data cannot enter
-//! -- only allowlisted names under `logs/` and `crashes/` are collected --
-//! and nothing is sent anywhere.
+//! [`manifest`] resolves every entry without touching an output path;
+//! [`write()`] stores exactly those entries, redacting text as it goes.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};

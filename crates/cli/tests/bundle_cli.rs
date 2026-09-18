@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `focusforge-cli diagnostics`, seen from outside the process: what the
-//! bundle holds, that the printed list is the archive's own entry list,
-//! the minidump opt-in, redaction, the allowlist, the effective
-//! configuration, the version entry and the boundary cases.
+//! `focusforge-cli diagnostics`, seen from outside the process: bundle
+//! contents match the printed list, the minidump opt-in, redaction, the
+//! allowlist, effective configuration, the version entry and boundary cases.
 //!
 //! Every case seeds a temporary data directory through `common::cli_bin`,
-//! whose `FOCUSFORGE_DATA_DIR` override keeps the run away from the
-//! tester's own data directory.
+//! whose `FOCUSFORGE_DATA_DIR` override keeps the run off the tester's own.
 
 mod common;
 
@@ -400,7 +398,7 @@ fn system_and_adapter_entries() {
     assert!(adapter["selected"].is_null(), "{adapter}");
     assert!(adapter["note"].is_string(), "{adapter}");
 
-    // The same logs, now holding the record a graphics run writes.
+    // The same logs, holding the record a graphics run writes.
     let mut with_record = common::cli_bin("bundle_cli_system_adapter");
     let dir = data_dir(&with_record);
     std::fs::write(
