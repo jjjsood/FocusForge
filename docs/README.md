@@ -25,6 +25,8 @@ retouching the result.
 - [`guide/diagnostics.md`](guide/diagnostics.md) — the log every run keeps,
   what a crash leaves behind, the notice on the next start, and packaging a
   diagnostics bundle
+- [`guide/gui-mcp.md`](guide/gui-mcp.md) — run Slint's local development MCP
+  endpoint for GUI inspection and interaction
 
 ## Reference
 
