@@ -15,6 +15,11 @@ crates/gpu/    the shared wgpu device, WGSL fusion/warp kernels and the
 crates/cli/    focusforge-cli, the headless interface: every algorithm and
                every batch-run control (grouping, presets, resume, review,
                the stage cache) is reachable here
+crates/diagnostics/ the shared `tracing` subscriber (stderr sink, rotating
+               JSON Lines file), the panic hook and its in-memory flight
+               recorder, the native-crash monitor process and the
+               diagnostics bundle writer -- linked only by `crates/cli` and
+               `crates/gui`, never by `crates/core` or `crates/gpu`
 crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
                strip, settings modal), a wgpu-backed canvas that renders a
                composite/Z-Map pair, and remappable keyboard/mouse
@@ -47,7 +52,15 @@ handling for `stack`'s pause/resume/cancel controls), and forwards the same
 `focusforge-gpu` declares -- and `unstable-winit-030`), plus `slint-build` as
 a build dependency and `i-slint-backend-testing` as a dev dependency; Inter
 ships bundled under `assets/fonts/` and the icon set is vendored from Lucide
-under `assets/icons/`. Every dependency's license is checked against an
+under `assets/icons/`. `focusforge-diagnostics` declares `tracing` and
+`tracing-subscriber` (with the `tracing-log` bridge, so `log`-crate records
+from `wgpu`/`naga` land in the same sinks) for the shared subscriber,
+`directories` for the platform data/config paths, `crash-handler` and
+`minidumper` for the native-crash sidecar, and `zip` (the same
+`default-features = false` build the `.ffproj` container uses) for the
+diagnostics bundle; `tracing-tracy` and `tracing-chrome` are pulled in only
+behind its own `trace` Cargo feature, which `focusforge-cli` and
+`focusforge-gui` forward. Every dependency's license is checked against an
 allowlist in `deny.toml` with `cargo deny check licenses` (install with
 `cargo install cargo-deny --locked`). **`libfontconfig1-dev` (Debian/Ubuntu
 naming) is a main-workspace build prerequisite**: `crates/gui` links Slint
@@ -71,15 +84,24 @@ writer, each stacking algorithm's fusion output, the pyramidal ECC solver
 and its warp and auto-crop stages, the job engine's pause/resume/cancel
 control loop, the stage cache, grouping proposals and the `.ffproj` project
 container's read/write round trip, and the `focusforge-cli
-stack`/`align`/`algorithms`/`export`/`review`/`cache` commands end to end,
+stack`/`align`/`algorithms`/`export`/`review`/`cache`/`diagnostics` commands
+end to end -- including a forced panic, a forced native crash and the
+crash notice on the next start, each driven by spawning the built binary as
+a child process so a deliberate crash never takes down the test runner --
 plus the fixture manifest. `crates/gui` has its own suite — the theme
 tokens, the plain-Rust shell and canvas state, the viewport arithmetic, and
 the input-remapping table and its `input.toml` file format run headlessly
 through `i-slint-backend-testing`, with no real window; a separate windowed
 suite launches the real binary and needs a compositor and a GPU adapter,
 skipping itself with a printed line on a host with neither. Fixtures under
-`fixtures/mantis-64` and `fixtures/mantis-512` are small crops of a 61-frame
-macro stack, cut and checksummed by harness tooling — never hand-edited.
+`fixtures/mantis-64` and `fixtures/mantis-512` are small, checksummed crops
+of a 61-frame macro stack, generated rather than hand-edited; regenerating
+them needs the full reference stack, which is not part of this repository.
+`crates/diagnostics` has its own suite covering the subscriber's per-target
+filters, the rotating log file, the `log`-crate bridge, the panic hook's
+report and flight recording, and the crash-notice bookkeeping and
+diagnostics bundle's redaction and manifest, each writing into its own
+temporary directory rather than a shared one.
 
 `crates/gpu`'s WGSL fusion and warp kernels, and the pipeline in
 `focusforge-cli` that dispatches them, sit behind the `gpu` Cargo feature —
