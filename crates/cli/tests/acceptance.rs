@@ -55,7 +55,6 @@ fn read_whole(path: &Path) -> (Vec<u16>, u32, u32, u32, u16) {
 #[ignore = "reads the 16 GB reference stack"]
 fn full_stack_similarity_to_mantis_stacked_is_recorded() {
     let Some(stack_dir) = common::reference_stack_dir() else {
-        eprintln!("skip: reference stack not found");
         return;
     };
 
@@ -117,9 +116,8 @@ fn full_stack_similarity_to_mantis_stacked_is_recorded() {
     );
 }
 
-/// Reads `align-<mode>.json`, `tools/run-acceptance.sh`'s new `align` stage
-/// artefact for one mode, parsed as a plain `serde_json::Value` -- the
-/// script's own JSON, never re-derived here.
+/// Reads `align-<mode>.json`, `tools/run-acceptance.sh`'s `align` stage
+/// artefact for one mode, as a plain `serde_json::Value`.
 fn read_align_json(mode: &str) -> Option<serde_json::Value> {
     let path = common::workspace_root()
         .join(".scratch/acceptance/unlimited")
@@ -248,7 +246,6 @@ fn the_two_modes_disagree_as_focus_breathing_predicts() {
 #[ignore = "reads the 16 GB reference stack"]
 fn fusion_change_reuses_reference_alignment() {
     let Some(stack_dir) = common::reference_stack_dir() else {
-        eprintln!("skip: reference stack not found");
         return;
     };
 
