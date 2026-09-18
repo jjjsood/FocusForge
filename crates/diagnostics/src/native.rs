@@ -112,18 +112,18 @@ fn socket_name(value: &str) -> SocketName<'_> {
 /// The number identifying the crash: the signal on Unix, the structured
 /// exception code on Windows.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn crash_signal(context: &CrashContext) -> u32 {
-    context.siginfo.ssi_signo
+fn crash_signal(cc: &CrashContext) -> u32 {
+    cc.siginfo.ssi_signo
 }
 
 #[cfg(target_os = "macos")]
-fn crash_signal(context: &CrashContext) -> u32 {
-    context.exception.as_ref().map_or(0, |e| e.kind)
+fn crash_signal(cc: &CrashContext) -> u32 {
+    cc.exception.as_ref().map_or(0, |e| e.kind)
 }
 
 #[cfg(target_os = "windows")]
-fn crash_signal(context: &CrashContext) -> u32 {
-    context.exception_code as u32
+fn crash_signal(cc: &CrashContext) -> u32 {
+    cc.exception_code as u32
 }
 
 /// The name of the signal the crash handler caught, as the metadata's
@@ -284,10 +284,10 @@ fn crash_event(client: Client) -> Box<dyn crash_handler::CrashEvent> {
     // that was already open when the handler was attached, and blocks until
     // the monitor has written the dump.
     unsafe {
-        crash_handler::make_crash_event(move |context: &CrashContext| {
-            let _ = client.send_message(MESSAGE_SIGNAL, crash_signal(context).to_le_bytes());
+        crash_handler::make_crash_event(move |cc: &CrashContext| {
+            let _ = client.send_message(MESSAGE_SIGNAL, crash_signal(cc).to_le_bytes());
             let _ = client.ping();
-            CrashEventResult::Handled(client.request_dump(context).is_ok())
+            CrashEventResult::Handled(client.request_dump(cc).is_ok())
         })
     }
 }
