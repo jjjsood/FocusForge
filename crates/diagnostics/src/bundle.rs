@@ -6,7 +6,7 @@
 //!
 //! Two steps, so what a caller shows is exactly what is written:
 //! [`manifest`] resolves every entry and touches no output path,
-//! [`write`] stores those entries and nothing else. Home directory and
+//! [`write()`] stores those entries and nothing else. Home directory and
 //! user name are redacted out of every text entry, image data cannot enter
 //! -- only allowlisted names under `logs/` and `crashes/` are collected --
 //! and nothing is sent anywhere.
