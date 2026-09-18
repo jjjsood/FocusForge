@@ -9,25 +9,34 @@
 //! this hook be exercised end to end with a stub backend in the default,
 //! GPU-free gate.
 
-use crate::algorithm::{AlgorithmError, TileReader};
-use crate::align::Transform;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::algorithm::{AlgorithmError, TileCtx, TileReader};
+use crate::align::{Transform, WarpingReader};
 use crate::fuse::FusionConsumer;
 use crate::gpu::TileBackend;
-use crate::tile::{TileConsumer, TileJob};
+use crate::tile::{Tile, TileConsumer, TileJob};
 
 /// Joins a [`TileBackend`] to a [`FusionConsumer`] sink: `consume` calls
 /// [`TileBackend::warp_fuse_tile`] over the **raw** `reader` (never a
-/// [`crate::align::WarpingReader`] -- the backend pulls its own
-/// footprint-grown source rects) and hands the result to
-/// [`FusionConsumer::write_output`].
+/// [`WarpingReader`] -- the backend pulls its own footprint-grown source
+/// rects) and hands the result to [`FusionConsumer::write_output`].
+///
+/// A tile whose backend reports its device lost is finished on the host
+/// instead, through [`WarpingReader`] and the sink's own
+/// [`TileConsumer::consume`].
 pub struct BackendFusionConsumer<'a> {
     backend: &'a dyn TileBackend,
     reader: &'a dyn TileReader,
+    /// The host path's pixel source, over the same frames and transforms
+    /// the backend warps itself.
+    warping: WarpingReader<'a>,
     frame: (u32, u32),
     transforms: Vec<Transform>,
     samples_per_pixel: u32,
     levels: u32,
     sink: &'a FusionConsumer,
+    fallback_tiles: AtomicUsize,
 }
 
 impl<'a> BackendFusionConsumer<'a> {
@@ -40,28 +49,80 @@ impl<'a> BackendFusionConsumer<'a> {
         levels: u32,
         sink: &'a FusionConsumer,
     ) -> Self {
+        let warping = WarpingReader::new(reader, frame, samples_per_pixel, transforms.clone());
         BackendFusionConsumer {
             backend,
             reader,
+            warping,
             frame,
             transforms,
             samples_per_pixel,
             levels,
             sink,
+            fallback_tiles: AtomicUsize::new(0),
         }
+    }
+
+    /// How many tiles this consumer finished on the host after the device
+    /// was lost. `0` for a run whose device stayed healthy -- which is also
+    /// how many frame tiles the run read through this consumer, times the
+    /// frame count.
+    pub fn fallback_tiles(&self) -> usize {
+        self.fallback_tiles.load(Ordering::Relaxed)
+    }
+
+    /// Reads this tile's frame tiles through the warping reader and lets the
+    /// sink fuse and write them. [`TileConsumer::consume`], not
+    /// [`FusionConsumer::write_output`]: the sink owns the algorithm and the
+    /// resolved parameter values, and reaching them through `consume` is
+    /// what makes a tile finished here equal to the same tile on a run that
+    /// never had a backend at all.
+    fn consume_on_host(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
+        let rect = job.read_rect();
+        let len = rect.width as usize * rect.height as usize * self.samples_per_pixel as usize;
+        let mut tiles = Vec::with_capacity(self.transforms.len());
+        for frame in 0..self.transforms.len() {
+            let mut samples = vec![0u16; len];
+            self.warping.read_tile_into(frame, rect, &mut samples)?;
+            tiles.push(Tile {
+                rect,
+                samples_per_pixel: self.samples_per_pixel,
+                samples,
+            });
+        }
+        self.fallback_tiles.fetch_add(1, Ordering::Relaxed);
+        let ctx = TileCtx::new(rect, &tiles);
+        self.sink
+            .consume(&TileJob::new(job.tile(), ctx, job.scratch()))
     }
 }
 
 impl TileConsumer for BackendFusionConsumer<'_> {
     fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
-        let output = self.backend.warp_fuse_tile(
+        if self.backend.device_lost() {
+            return self.consume_on_host(job);
+        }
+        let output = match self.backend.warp_fuse_tile(
             self.reader,
             self.frame,
             &self.transforms,
             job.read_rect(),
             self.samples_per_pixel,
             self.levels,
-        )?;
+        ) {
+            Ok(output) => output,
+            // The device is re-checked on every error, whatever its shape:
+            // the first call after a loss can fail anywhere between
+            // allocating a buffer and reading the result back. An error
+            // raised while the device is still healthy is a genuine failure
+            // and propagates.
+            Err(err) => {
+                if self.backend.device_lost() {
+                    return self.consume_on_host(job);
+                }
+                return Err(err);
+            }
+        };
         self.sink.write_output(job, &output)
     }
 

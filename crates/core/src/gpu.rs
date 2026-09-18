@@ -7,7 +7,7 @@
 //! feature.
 //!
 //! Every [`TileBackend`] method takes `&dyn TileReader` plus a rect the
-//! *caller* names, never a pre-read [`Tile`] or a `TileCtx`: a later
+//! *caller* names, never a pre-read [`Tile`] or a `TileCtx`: a
 //! `TileConsumer` can hand a backend a
 //! [`crate::align::Transform::source_footprint`]-shaped rect instead of the
 //! scheduler's destination read rect, and pull its own pixels. `crates/gpu`
@@ -49,6 +49,14 @@ pub trait TileBackend: Send + Sync {
     /// The adapter this backend runs on, for logging and diagnosability.
     fn info(&self) -> BackendInfo;
 
+    /// `true` once this backend's device has been lost. Every later call on
+    /// the backend then fails, so a caller that observes `true` must finish
+    /// the work on a path of its own instead of retrying. Defaults to
+    /// `false`, for a backend with no notion of device loss.
+    fn device_lost(&self) -> bool {
+        false
+    }
+
     /// Read `rect` of `frame` through `reader`, apply a trivial per-sample
     /// gain on the GPU, and return the result. Exists only to exercise the
     /// upload/dispatch/readback path -- this trait's other methods,
@@ -83,16 +91,12 @@ pub trait TileBackend: Send + Sync {
     /// Catmull-Rom kernel, its out-of-footprint rule and its
     /// [`AlignError::SourceTileTooSmall`] precheck exactly.
     ///
-    /// Returns `Result<_, AlignError>`, not `AlgorithmError` like
-    /// Returns `Result<_, AlignError>`, not `AlgorithmError` like
-    /// [`Self::self_check`] and [`Self::fuse_tile`]: what this method
-    /// exists to guarantee is that the GPU path returns the
-    /// *same* `AlignError::SourceTileTooSmall` variant with the same
-    /// payload as the CPU twin, and there is no `From<AlignError> for
-    /// AlgorithmError` (only the other direction,
-    /// `crate::align::AlignError::Read { source: AlgorithmError }`), so a
-    /// widened signature would stringify the variant and defeat that
-    /// guarantee.
+    /// The GPU path must return the same `AlignError::SourceTileTooSmall`
+    /// variant and payload as the CPU twin, so this returns
+    /// `Result<_, AlignError>`, not `AlgorithmError` like
+    /// [`Self::self_check`] and [`Self::fuse_tile`]. There is no
+    /// `From<AlignError> for AlgorithmError` (only the reverse), so a
+    /// widened signature would stringify the variant and lose that guarantee.
     fn warp_tile(
         &self,
         reader: &dyn TileReader,

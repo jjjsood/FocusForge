@@ -231,7 +231,8 @@ fn init() -> Result<SharedDevice, GpuError> {
     let adapter: Result<wgpu::Adapter, GpuError> = classify_adapter(adapter_result).into();
     let adapter = adapter?;
 
-    let shortfalls = crate::limits::shortfalls(&required_limits(), &adapter.limits());
+    let adapter_limits = adapter.limits();
+    let shortfalls = crate::limits::shortfalls(&required_limits(), &adapter_limits);
     if !shortfalls.is_empty() {
         return Err(GpuError::limits_short(&shortfalls));
     }
@@ -244,7 +245,7 @@ fn init() -> Result<SharedDevice, GpuError> {
         driver_info: adapter_info.driver_info.clone(),
     };
 
-    let limits = device_limits(&adapter.limits());
+    let limits = device_limits(&adapter_limits);
 
     let (device, queue) = block_on(adapter.request_device(&DeviceDescriptor {
         label: Some("focusforge-gpu-shared-device"),
@@ -254,6 +255,26 @@ fn init() -> Result<SharedDevice, GpuError> {
         memory_hints: MemoryHints::default(),
         trace: Trace::default(),
     }))?;
+
+    crate::errors::install_handlers(&device);
+
+    // Two records, not one: the adapter's identity is what a report is read
+    // against, the limits are what a refused allocation is read against, and
+    // a limits set is long. Both are raised inside the process-wide device's
+    // initialiser, so a batch of any number of stacks logs each exactly once.
+    tracing::debug!(
+        adapter = %adapter_info.name,
+        backend = %info.backend,
+        driver = %adapter_info.driver,
+        driver_info = %adapter_info.driver_info,
+        device_type = ?adapter_info.device_type,
+        "graphics adapter selected"
+    );
+    tracing::debug!(
+        adapter_limits = ?adapter_limits,
+        device_limits = ?limits,
+        "graphics adapter and device limits"
+    );
 
     Ok(SharedDevice {
         instance,

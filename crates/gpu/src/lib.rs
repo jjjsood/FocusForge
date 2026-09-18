@@ -21,16 +21,9 @@
 //! \[harness_gain.wgsl\] via \[harness\], and \[warp_bicubic.wgsl\] via
 //! \[warp\].
 //!
-//! `wgpu` is an optional dependency (`gpu = ["dep:wgpu", "dep:thiserror"]`,
-//! `crates/gpu/Cargo.toml`): [`adapter`], [`pack`], [`warp_coords`] and
-//! [`budget`] contain no `wgpu` type and stay compiled (and tested) with the
-//! feature off, which is what keeps the featureless build free of the `wgpu`
-//! compile. [`limits`] is a mixed module: `LimitShortfall` and
-//! `describe_shortfalls` name no `wgpu` type either and stay unconditional
-//! too, so [`budget`]'s pre-dispatch refusal can reuse them and be
-//! unit-tested in this same default gate; only the three items that do name
-//! `wgpu::Limits` are individually `#[cfg(feature = "gpu")]` inside that
-//! module.
+//! `wgpu` is optional (`gpu = ["dep:wgpu", "dep:thiserror"]`): [`adapter`],
+//! [`pack`], [`warp_coords`], [`budget`] and [`limits`] compile without it;
+//! inside [`limits`], only what names a `wgpu` type is gated.
 
 pub mod adapter;
 pub mod budget;
@@ -45,6 +38,8 @@ pub mod device;
 /// path that exists only for the parity test.
 #[cfg(feature = "gpu")]
 pub mod display;
+#[cfg(feature = "gpu")]
+pub mod errors;
 #[cfg(feature = "gpu")]
 pub mod fuse;
 #[cfg(feature = "gpu")]

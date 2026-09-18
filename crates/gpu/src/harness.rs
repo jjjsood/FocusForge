@@ -20,6 +20,7 @@ use crate::budget::{
     largest_buffer_bytes, probe_budget,
 };
 use crate::device::{GpuError, SharedDevice, block_on, shared_device};
+use crate::errors;
 use crate::fuse::{self, FusionPipelines};
 use crate::pack::{packed_len, unpack_samples};
 use crate::pipeline::{
@@ -289,33 +290,69 @@ impl TileBackend for GpuBackend {
         // thread. One pair per tile, never per pyramid level -- a validation
         // error names its kernel from the dispatch label instead.
         let device = self.device.device();
-        let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        let result = crate::stack_tile::warp_fuse_tile_gpu(
-            self.device,
-            &self.warp_pipelines,
-            &self.fuse_pipelines,
-            reader,
-            frame,
-            transforms,
-            rect,
-            samples_per_pixel,
-            levels,
-        );
-        let oom = block_on(scope.pop());
-        match oom {
-            // `result`'s `Ok` value is discarded here even if the dispatch
-            // otherwise "succeeded": after an OOM, `create_buffer` has
-            // handed back error buffers whose later use raises *validation*
-            // errors, which route to a different filter and would
-            // otherwise let a run "succeed" on poisoned buffers.
-            // Mid-run exhaustion is a run failure naming the flag to lower,
-            // never a fallback.
-            Some(err) => Err(GpuError::DeviceOutOfMemory {
-                detail: err.to_string(),
+        let result = errors::with_validation_scope(device, || {
+            let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let result = crate::stack_tile::warp_fuse_tile_gpu(
+                self.device,
+                &self.warp_pipelines,
+                &self.fuse_pipelines,
+                reader,
+                frame,
+                transforms,
+                rect,
+                samples_per_pixel,
+                levels,
+            );
+            let oom = block_on(scope.pop());
+            match oom {
+                // `result`'s `Ok` value is discarded even if the dispatch
+                // otherwise "succeeded": after an OOM, `create_buffer` has
+                // handed back error buffers whose use raises *validation*
+                // errors, which route to a different filter. A mid-run
+                // exhaustion fails the run; it never falls back to the host.
+                Some(err) => Err(GpuError::DeviceOutOfMemory {
+                    detail: err.to_string(),
+                }
+                .into()),
+                None => result,
             }
-            .into()),
-            None => result,
-        }
+        });
+
+        #[cfg(feature = "gpu-tests")]
+        forced_device_loss(device);
+
+        result
+    }
+
+    fn device_lost(&self) -> bool {
+        // wgpu queues the device-lost callback and runs it from a poll, so
+        // without this non-blocking maintain a loss would only become
+        // visible at the next tile's own blocking readback -- one tile too
+        // late to keep off the device.
+        let _ = self.device.device().poll(wgpu::PollType::Poll);
+        errors::device_lost()
+    }
+}
+
+/// Destroys the shared device once `FF_FORCE_DEVICE_LOST` tiles have been
+/// fused; an absent or unparsable value does nothing. The poll is what makes
+/// the loss observable: wgpu runs the device-lost callback from a poll, not
+/// from `destroy`.
+#[cfg(feature = "gpu-tests")]
+fn forced_device_loss(device: &wgpu::Device) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static FUSED_TILES: AtomicUsize = AtomicUsize::new(0);
+
+    let Some(after) = std::env::var("FF_FORCE_DEVICE_LOST")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return;
+    };
+    if FUSED_TILES.fetch_add(1, Ordering::SeqCst) + 1 == after {
+        device.destroy();
+        let _ = device.poll(wgpu::PollType::Poll);
     }
 }
 

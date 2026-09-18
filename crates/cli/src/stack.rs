@@ -1654,14 +1654,15 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     let tiles = final_progress.unit_total;
     // On the CPU path every tile read reads every frame
     // (`crates/core/src/tile/scheduler.rs`'s per-tile loop), so this is the
-    // exact count, not an approximation. On the GPU path it is exactly 0:
-    // `BackendFusionConsumer` supplies its own pixels, so the scheduler
-    // short-circuits its host read loop and never reads a frame-tile through
-    // it at all (the same 0 `TileRunReport::frame_tiles_read` reports there).
-    let frame_tiles_read = if backend.is_some() {
-        0
-    } else {
-        tiles * stack.len()
+    // exact count, not an approximation. On the GPU path the scheduler
+    // short-circuits its host read loop entirely and reads no frame-tile
+    // through it, so the only frame tiles a GPU run reads are the ones
+    // `BackendFusionConsumer` read itself after a device loss -- every frame
+    // of every tile it finished on the host, and `0` for a run whose device
+    // stayed healthy.
+    let frame_tiles_read = match &backend_consumer {
+        Some(consumer) => consumer.fallback_tiles() * stack.len(),
+        None => tiles * stack.len(),
     };
     // `peak_in_flight`: `Job::run` does not expose the per-segment
     // `TileRunReport` `TileScheduler::run` returns (the job layer discards
