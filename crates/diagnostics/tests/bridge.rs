@@ -22,7 +22,16 @@ fn read_lines(path: &std::path::Path) -> Vec<Value> {
 }
 
 #[test]
+#[allow(unsafe_code)]
 fn tracing_events_and_log_records_both_reach_the_file_sink() {
+    // SAFETY: this file's own doc comment guarantees `init` runs at most
+    // once per process, so no other thread reads or writes the environment
+    // while this runs. `current_exe()` here is this test binary itself,
+    // which has no `main` checking this marker, so leaving native-crash
+    // capture on would make `init` re-spawn -- and re-run -- this test.
+    unsafe {
+        std::env::set_var("FF_CRASH_MONITOR", "off");
+    }
     let dir = tempfile::tempdir().unwrap();
     let diagnostics = focusforge_diagnostics::init(&focusforge_diagnostics::Options {
         data_dir: Some(dir.path().to_path_buf()),
