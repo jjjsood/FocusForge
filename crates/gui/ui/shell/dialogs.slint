@@ -144,6 +144,62 @@ export component FFRefusalDialog inherits Rectangle {
     }
 }
 
+// A non-modal notice over the canvas: no scrim, self-timing (auto-dismisses
+// after six seconds) and also dismissed early by its own `x`. Either way,
+// dismissal carries no side effect beyond closing the notice -- there is
+// nothing here to mark reported.
+export component FFToast inherits Rectangle {
+    in property <bool> toast-open: false;
+    in property <string> message: "";
+    callback dismissed();
+
+    width: 300px;
+    height: 84px;
+    background: Theme.surface-raised;
+    border-width: 1px;
+    border-color: Theme.border-default;
+    border-radius: Theme.radius-lg;
+    opacity: root.toast-open ? 1.0 : 0.0;
+    animate opacity { duration: Theme.motion-slow; easing: ease-out; }
+
+    icon := Image {
+        x: Theme.space-4;
+        y: Theme.space-4;
+        source: @image-url("../../../../assets/icons/triangle-alert.svg");
+        colorize: Theme.status-failure;
+        width: 18px;
+        height: 18px;
+    }
+
+    title := Text {
+        x: icon.x + icon.width + Theme.space-2;
+        y: icon.y;
+        width: parent.width - self.x - Theme.space-3;
+        height: 32px;
+        text: root.message;
+        color: Theme.text-primary;
+        font-size: Theme.text-title.size;
+        font-weight: Theme.text-title.weight;
+        wrap: word-wrap;
+        overflow: clip;
+    }
+
+    dismiss-area := TouchArea {
+        x: parent.width - Theme.space-3 - 12px;
+        y: Theme.space-3;
+        width: 12px;
+        height: 12px;
+        enabled: root.toast-open;
+        clicked => { root.dismissed(); }
+        Image {
+            source: @image-url("../../../../assets/icons/x.svg");
+            colorize: Theme.text-secondary;
+            width: 12px;
+            height: 12px;
+        }
+    }
+}
+
 export component FFSkippedNotice inherits Rectangle {
     in property <string> notice-text: "";
     callback dismissed();

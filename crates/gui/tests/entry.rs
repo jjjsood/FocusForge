@@ -463,7 +463,7 @@ fn tab_scroll_changes_reach_the_sink_and_opening_scrolls_into_view() {
     assert!(!controller.can_scroll_left() && controller.can_scroll_right());
 
     let events = Arc::new(Mutex::new(Vec::new()));
-    controller.set_sink(Box::new({
+    controller.set_sink(Arc::new({
         let events = events.clone();
         move |e| events.lock().unwrap().push(e)
     }));
@@ -770,7 +770,7 @@ fn closing_the_last_tab_selects_plus() {
 
     let mut controller = with_one_project("entry_close_last");
     let events = Arc::new(Mutex::new(Vec::new()));
-    controller.set_sink(Box::new({
+    controller.set_sink(Arc::new({
         let events = events.clone();
         move |e| events.lock().unwrap().push(e)
     }));
@@ -1025,7 +1025,7 @@ fn a_double_click_on_a_close_glyph_closes_one_tab() {
         let controller = Arc::new(Mutex::new(four));
         focusforge_gui::bridge::install(&app, controller.clone());
         let queued = Arc::new(Mutex::new(Vec::new()));
-        controller.lock().unwrap().set_sink(Box::new({
+        controller.lock().unwrap().set_sink(Arc::new({
             let queued = queued.clone();
             move |e| queued.lock().unwrap().push(e)
         }));

@@ -16,6 +16,7 @@
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
+import { FFButton } from "../components/ff_button.slint";
 
 export component FFEmptyState inherits Rectangle {
     callback open-folder-requested();
@@ -79,27 +80,11 @@ export component FFEmptyState inherits Rectangle {
                         HorizontalLayout {
                             alignment: start;
 
-                            open-folder := Rectangle {
+                            open-folder := FFButton {
                                 width: 168px;
-                                height: 34px;
-                                border-radius: Theme.radius-sm;
-                                background: Theme.accent-default;
-                                accessible-role: button;
-                                accessible-label: "Open folder…";
-
-                                open-area := TouchArea {
-                                    clicked => { root.open-folder-requested(); }
-                                }
-                                Text {
-                                    text: "Open folder…";
-                                    color: Theme.text-on-accent;
-                                    font-size: Theme.text-body.size;
-                                    font-weight: Theme.text-body.weight;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                    width: 100%;
-                                    height: 100%;
-                                }
+                                kind: "primary";
+                                text: "Open folder…";
+                                clicked => { root.open-folder-requested(); }
                             }
                         }
 

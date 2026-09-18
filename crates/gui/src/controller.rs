@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::entry;
@@ -25,6 +26,7 @@ use crate::input_config::Provenance;
 use crate::input_map::{
     Action, ActionEvent, Button, InputRowView, InputTable, Modifiers, PointerKind, Trigger,
 };
+use crate::job;
 use crate::settings_panel::{
     self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext,
 };
@@ -101,6 +103,9 @@ pub enum ShellEvent {
     /// An open attempt was refused. Carries its already-rendered message:
     /// `perform` (`crate::bridge`) must not format user-facing text.
     EntryRefused(String),
+    /// A fuse run's state or progress moved -- started, paused, resumed,
+    /// cancelled, failed or completed.
+    JobChanged,
 }
 
 /// One live drag: which action it started and the last position seen, so
@@ -271,6 +276,17 @@ impl ShellState {
 
 /// Whether `(x, y)` falls within `pane`'s rect -- [`AppController::anchor`]'s
 /// only helper.
+/// A short, stable digest of a path -- what keeps two different tabs that
+/// happen to propose the same group name from fighting over one staging
+/// directory. Not cryptographic: only uniqueness across concurrent runs on
+/// this machine matters here.
+pub(crate) fn path_digest(path: &std::path::Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn pane_contains(pane: PaneRect, x: f32, y: f32) -> bool {
     x >= pane.x && x <= pane.x + pane.width && y >= pane.y && y <= pane.y + pane.height
 }
@@ -280,7 +296,43 @@ fn pane_contains(pane: PaneRect, x: f32, y: f32) -> bool {
 #[derive(Default)]
 pub struct AppController {
     state: ShellState,
-    sink: Option<Box<dyn Fn(ShellEvent) + Send + Sync>>,
+    sink: Option<Arc<dyn Fn(ShellEvent) + Send + Sync>>,
+    job: JobSlot,
+    /// Test-only override for `start_fuse`'s scratch root: unset, a run's
+    /// ledger and staging live under this crate's own `.scratch/`, exactly
+    /// where a real window's resumable state belongs; set, they live under
+    /// whatever directory the test handed in, so a test run never depends on
+    /// -- or collides with -- a shared directory.
+    scratch_root_for_test: Option<PathBuf>,
+}
+
+/// The active fuse run, if any: the control and observer a worker thread
+/// (`crate::job::spawn`) was handed, the shell's own view of its state, the
+/// request that started it -- kept for `retry_fuse` -- the tab it is
+/// running against (a tab switch mid-run must not let `settle_job` promote
+/// whichever tab happens to be active once the worker finishes), and the
+/// join handle [`AppController::settle_job`] polls.
+#[derive(Default)]
+struct JobSlot {
+    state: job::RunState,
+    control: Option<Arc<job::JobControl>>,
+    observer: Option<Arc<job::GuiObserver>>,
+    request: Option<job::JobRequest>,
+    tab_index: Option<usize>,
+    handle: Option<std::thread::JoinHandle<Result<job::FuseOutcome, job::PipelineError>>>,
+}
+
+/// The toolbar/bottom-bar surfaces' plain-Rust view of the active run --
+/// [`AppController::job_view`]'s return value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobView {
+    pub state: job::RunState,
+    pub toolbar_run_state: String,
+    pub stage_word: String,
+    pub step_text: String,
+    pub eta_text: String,
+    pub bar_tone: String,
+    pub fraction: f32,
 }
 
 impl AppController {
@@ -308,12 +360,19 @@ impl AppController {
         controller
     }
 
+    /// Test-only: redirects `start_fuse`'s scratch root away from this
+    /// crate's own `.scratch/`, so a test's ledger and staging never depend
+    /// on a directory other tests -- or a live window -- also write to.
+    pub fn set_scratch_root_for_test(&mut self, root: PathBuf) {
+        self.scratch_root_for_test = Some(root);
+    }
+
     /// Installs the observer sink. `src/bridge.rs` is the only caller
     /// outside tests; the controller tests install their own sink directly,
     /// since `i_slint_backend_testing::init_no_event_loop()` disables
     /// `slint::invoke_from_event_loop` and the bridge is never exercised by
     /// them.
-    pub fn set_sink(&mut self, sink: Box<dyn Fn(ShellEvent) + Send + Sync>) {
+    pub fn set_sink(&mut self, sink: Arc<dyn Fn(ShellEvent) + Send + Sync>) {
         self.sink = Some(sink);
     }
 
@@ -988,7 +1047,10 @@ impl AppController {
             return;
         }
         self.state.last_close = Some(now);
-        self.state.projects.remove(index);
+        let closed = self.state.projects.remove(index);
+        if let GuiProject::Opened(project) = &closed.project {
+            let _ = std::fs::remove_dir_all(job::plane_cache_dir(project.path()));
+        }
         // Closing another tab never moves the selection: only the indices
         // after the removed one shift down by one.
         self.state.active = match self.state.active {
@@ -1267,7 +1329,177 @@ impl AppController {
     /// pattern `editor_enabled`/`export_enabled` already use. The panel
     /// reads this as a whole-panel disable.
     pub fn job_running(&self) -> bool {
-        false
+        job::is_live(&self.job.state)
+    }
+
+    /// Starts a fuse run on the active tab's own frames and explicit
+    /// settings, off the UI thread -- refuses while the tab carries a
+    /// settings violation, a run is already live, or the tab has no frame
+    /// list of its own (already fused; re-fusing an already-sealed project
+    /// is not supported). Returns whether a run was started.
+    pub fn start_fuse(&mut self) -> bool {
+        if self.job_running() {
+            return false;
+        }
+        let Some(tab) = self.state.active() else {
+            return false;
+        };
+        if !tab.errors.is_empty() {
+            return false;
+        }
+        let GuiProject::Unsaved(group) = &tab.project else {
+            return false;
+        };
+        let project_path = group.dir.join(format!("{}.ffp", group.name));
+        let staging_key = format!("{}-{:x}", group.name, path_digest(&project_path));
+        let request = job::JobRequest {
+            frames: group.frames.clone(),
+            project_path,
+            scratch_root: self
+                .scratch_root_for_test
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(".scratch")),
+            staging_key,
+            fuse_id: tab.fuse_id.clone(),
+            fuse_values: tab.fuse_values.clone(),
+            align_id: Some(tab.align_id.clone()),
+            align_values: tab.align_values.clone(),
+            align_lax: false,
+            crop: true,
+            backend: None,
+        };
+        self.run_request(request);
+        true
+    }
+
+    /// Pauses a running job, or resumes a paused one -- a no-op while
+    /// cancelling, failed, idle or fused.
+    pub fn pause_or_resume(&mut self) {
+        let Some(control) = self.job.control.clone() else {
+            return;
+        };
+        match self.job.state {
+            job::RunState::Running => {
+                control.pause();
+                self.job.state = job::RunState::Paused;
+            }
+            job::RunState::Paused => {
+                control.clear();
+                if let Some(observer) = &self.job.observer {
+                    observer.resume();
+                }
+                self.job.state = job::RunState::Running;
+            }
+            _ => return,
+        }
+        self.emit(ShellEvent::JobChanged);
+    }
+
+    /// Requests a cancel. During alignment this lands only once alignment
+    /// returns (the engine's own "reported, never controlled" contract);
+    /// the shell shows `Cancelling` for that interval.
+    pub fn cancel_fuse(&mut self) {
+        let Some(control) = self.job.control.clone() else {
+            return;
+        };
+        control.cancel();
+        if let Some(observer) = &self.job.observer {
+            observer.resume();
+        }
+        self.job.state = job::RunState::Cancelling;
+        self.emit(ShellEvent::JobChanged);
+    }
+
+    /// Starts the same work again, from the request a failed run stored --
+    /// controller-level only: the engine itself carries no notion of retry.
+    pub fn retry_fuse(&mut self) -> bool {
+        let Some(request) = self.job.request.clone() else {
+            return false;
+        };
+        self.run_request(request);
+        true
+    }
+
+    fn run_request(&mut self, request: job::JobRequest) {
+        let control = job::JobControl::new();
+        let observer = Arc::new(job::GuiObserver::new());
+        self.job.control = Some(Arc::clone(&control));
+        self.job.observer = Some(Arc::clone(&observer));
+        self.job.request = Some(request.clone());
+        self.job.tab_index = self.state.active;
+        self.job.state = job::RunState::Running;
+        self.job.handle = Some(job::spawn(request, control, observer));
+        self.emit(ShellEvent::JobChanged);
+    }
+
+    /// The failed run's own message, `None` outside [`job::RunState::Failed`]
+    /// -- what the failure toast names.
+    pub fn job_failure_message(&self) -> Option<&str> {
+        match &self.job.state {
+            job::RunState::Failed(message) => Some(message.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The toolbar/bottom-bar surfaces' current view of the active run.
+    pub fn job_view(&self) -> JobView {
+        let progress = self.job.observer.as_ref().and_then(|o| o.last_progress());
+        JobView {
+            state: self.job.state.clone(),
+            toolbar_run_state: job::toolbar_run_state(&self.job.state).to_string(),
+            stage_word: job::stage_word(&self.job.state, progress.as_ref()),
+            step_text: job::current_step(&self.job.state, progress.as_ref())
+                .map(|s| s.text())
+                .unwrap_or_default(),
+            eta_text: job::eta_text(&self.job.state, progress.as_ref()),
+            bar_tone: job::bar_tone(&self.job.state).to_string(),
+            fraction: job::bar_fraction(progress.as_ref()),
+        }
+    }
+
+    /// Joins the worker thread if it has finished, moving the shell out of
+    /// `Running`/`Cancelling` and, on completion, promoting the tab from
+    /// `Unsaved` to `Opened` with its stack context re-read from the sealed
+    /// composite. Returns the two materialized plane paths for the bridge to
+    /// feed the canvas; `None` while still running or on any other outcome.
+    /// Never blocks.
+    pub fn settle_job(&mut self) -> Option<(PathBuf, PathBuf)> {
+        let handle = self.job.handle.take()?;
+        if !handle.is_finished() {
+            self.job.handle = Some(handle);
+            return None;
+        }
+        let settled = job::settle(handle.join());
+        self.job.state = settled.state;
+        self.job.control = None;
+        self.job.observer = None;
+        let tab_index = self.job.tab_index.take();
+        let planes = settled.opened.and_then(|(project, composite, zmap)| {
+            let tab = tab_index.and_then(|i| self.state.projects.get_mut(i))?;
+            tab.project = GuiProject::Opened(Box::new(project));
+            tab.title = entry::tab_title(&tab.project);
+            tab.ctx = entry::tab_stack_context(&tab.project);
+            tab.image = tab.ctx.map(|c| ImageSize {
+                width: c.width,
+                height: c.height,
+            });
+            Some((composite, zmap))
+        });
+        self.emit(ShellEvent::JobChanged);
+        planes
+    }
+
+    /// Materializes the active tab's own planes into its cache directory and
+    /// returns the two paths -- a no-op returning `None` for an
+    /// [`GuiProject::Unsaved`] tab, which has no sealed project to read yet.
+    /// What `--open <saved>.ffp` uses to feed the canvas with no run
+    /// involved.
+    pub fn materialize_active_tab_planes(&mut self) -> Option<(PathBuf, PathBuf)> {
+        let tab = self.state.active_mut()?;
+        let GuiProject::Opened(project) = &mut tab.project else {
+            return None;
+        };
+        job::materialize_planes(project).ok()
     }
 
     /// Re-clamps the settings scroll offset against the now-active tab's

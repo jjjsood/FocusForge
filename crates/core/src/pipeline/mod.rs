@@ -1,0 +1,990 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! The align -> fuse -> seal spine: opens a stack, resolves its two
+//! algorithm schemas, aligns it, tiles and fuses it under
+//! [`Job`](crate::job::Job), and seals the result into a project.
+//! `focusforge-cli` and the GUI are its only two callers, so a stack run
+//! means exactly one thing regardless of which front end started it.
+//!
+//! Presentation reaches this module only as a
+//! [`StageObserver`](crate::pipeline::StageObserver) trait object: this
+//! module never prints, never depends on a terminal or a window, and the
+//! poll thread it owns calls the observer, never a `println!`.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use crate::algorithm::{AlgorithmError, AlignAlgorithm, StackAlgorithm, TileReader};
+use crate::align::{
+    AlignDriverOptions, FailurePolicy, FrameAlignment, ReferencePolicy, StackAlignment, Transform,
+    WarpingReader, align_stack_with, auto_crop,
+};
+use crate::fuse::description::format_composite_description;
+use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
+use crate::gpu::TileBackend;
+use crate::io::{ByteOrder, Rect, TiffHeader, TiffStack};
+use crate::job::{
+    AlignIdentity, ControlState, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobControl, JobOutcome,
+    JobProgress, JobRecord, JobStage, RecordingConsumer, Resumable, ResumeStore, StackFingerprint,
+    StageCache, StageKey, read_alignment,
+};
+use crate::params::{self, ParamValue, ParamValues, Provenance, ResolvedParams, StackContext};
+use crate::project::{self, AlignRecord, Metrics, SealRequest, SealedProject};
+use crate::tile::{NoopPreprocess, TileConsumer, TileError, TileScheduler, TileSchedulerOptions};
+use crate::timing::{Stage, StageTimer, StageTimings};
+
+/// An alignment request: which algorithm, its explicit parameters, and
+/// whether a frame that fails to converge is refused (`Strict`) or falls
+/// back to the identity transform (`IdentityFallback`).
+pub struct AlignRequest {
+    pub algorithm: &'static dyn AlignAlgorithm,
+    pub explicit: ParamValues,
+    pub lax: bool,
+}
+
+/// Everything one align-fuse-seal run needs, owned so it can cross a thread
+/// boundary. `frames` is the source list in frame order; `explicit` carries
+/// only the caller's own overrides, resolved once inside [`run`] against the
+/// [`StackContext`] built from `frames` itself -- never against a context
+/// the caller computed earlier, which could have drifted from what actually
+/// gets opened.
+pub struct FuseRequest {
+    pub frames: Vec<PathBuf>,
+    pub project_path: PathBuf,
+    pub scratch_root: PathBuf,
+    /// Names this run's staging directory
+    /// (`<scratch_root>/projects/<staging_key>`); the caller picks a key
+    /// stable across a resume of the same run and unique across concurrent
+    /// ones.
+    pub staging_key: String,
+    pub algorithm: &'static dyn StackAlgorithm,
+    pub explicit: ParamValues,
+    pub align: Option<AlignRequest>,
+    pub crop: bool,
+    pub tile_size: Option<u32>,
+    pub max_host_memory: Option<u64>,
+    pub backend: Option<&'static dyn TileBackend>,
+    pub resume: bool,
+    pub cache: bool,
+    /// How often the poll thread this module owns calls
+    /// [`StageObserver::tick`].
+    pub poll: Duration,
+}
+
+/// How [`run`] ended: either the whole job completed and sealed, or a
+/// cancel landed -- always at a fuse-unit boundary, never mid-tile.
+pub enum FuseOutcome {
+    Completed(Box<FuseReport>),
+    Cancelled {
+        units_done: usize,
+        unit_total: usize,
+    },
+}
+
+/// The alignment half of [`FuseReport`], present only when the request
+/// carried an [`AlignRequest`].
+pub struct FuseAlignReport {
+    pub algorithm_id: String,
+    pub display_name: String,
+    pub params: ResolvedParams,
+    pub failure_policy: FailurePolicy,
+    pub alignment: StackAlignment,
+}
+
+/// Everything a completed run produced, returned as data so every front end
+/// builds its own report from one source.
+pub struct FuseReport {
+    pub sealed: SealedProject,
+    pub frame_count: usize,
+    pub frames: Vec<String>,
+    pub width: u32,
+    pub height: u32,
+    pub samples_per_pixel: u32,
+    pub stack_params: ResolvedParams,
+    pub tile_size: u32,
+    pub levels: u32,
+    pub margin: u32,
+    pub tiles: usize,
+    pub frame_tiles_read: usize,
+    pub in_flight_limit: usize,
+    pub max_bytes_in_flight: u64,
+    pub budget_provenance: Provenance,
+    pub backed_off: bool,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub crop: Option<Rect>,
+    pub description: Option<String>,
+    pub align: Option<FuseAlignReport>,
+    pub align_cached: bool,
+    pub align_source: String,
+    pub align_workers: Option<usize>,
+    pub peak_align_workers: Option<usize>,
+    pub stages: StageTimings,
+    pub wall_seconds: f64,
+    pub metrics: Metrics,
+}
+
+/// What one run's align stage carries the moment it starts, reported once
+/// through [`StageObserver::stage`] -- before any frame is registered, since
+/// alignment reports no unit progress of its own.
+pub enum RunStage {
+    Align { frames: usize, source: AlignSource },
+    Fuse,
+    Seal,
+    Finished,
+}
+
+/// How the align stage is about to be satisfied -- named so a front end can
+/// render "reused from the stage cache" without inspecting a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignSource {
+    Computed,
+    Cached,
+    Resumed,
+}
+
+/// A front end's presentational hooks into [`run`]. Every method has a
+/// no-op default, which is what a headless caller (a test, or the GUI's own
+/// `--test job` path) runs on. `Sync`: the poll thread this module owns
+/// calls these methods from a thread other than the caller's.
+pub trait StageObserver: Sync {
+    fn stage(&self, _stage: RunStage) {}
+    fn tick(&self, _progress: &JobProgress) {}
+    /// Called once a fuse segment reports [`JobOutcome::Paused`]; blocks
+    /// until the front end resumes (`control.clear()`) or cancels
+    /// (`control.cancel()`) -- `focusforge-cli`'s own signal wait and the
+    /// GUI's condvar park are both implementations of this one method.
+    fn paused(&self, _control: &JobControl) {}
+}
+
+/// A [`StageObserver`] that does nothing -- what a caller with no
+/// presentation layer of its own (a test) passes.
+pub struct NoopObserver;
+
+impl StageObserver for NoopObserver {}
+
+/// Every early exit from the spine, typed by the stage that raised it.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PipelineError {
+    #[error("{0}")]
+    Input(String),
+    #[error("{0}")]
+    Params(String),
+    #[error(transparent)]
+    Algorithm(#[from] AlgorithmError),
+    #[error("{0}")]
+    Align(String),
+    #[error(transparent)]
+    Tile(#[from] TileError),
+    #[error(transparent)]
+    StageCache(#[from] crate::job::StageCacheError),
+    #[error(transparent)]
+    Resume(#[from] crate::job::ResumeError),
+    #[error("{0}")]
+    ResumeMismatch(String),
+    #[error(transparent)]
+    Project(#[from] project::ProjectError),
+    #[error("{0}")]
+    Io(String),
+}
+
+/// Runs one stack from `request.frames` to a sealed project at
+/// `request.project_path`: opens the stack and checks uniformity, resolves
+/// both schemas, aligns (ledger peek, then `stage_cache`, then a genuine
+/// solve), crops, builds the reader and the tile scheduler, stages under
+/// `<scratch_root>/projects/<staging_key>`, opens the resume ledger, runs
+/// [`Job`] to completion over `control` and seals. `control` is built by
+/// the caller **before** this call, so [`JobControl::set_stage`] covers both
+/// the align and the fuse stage with one object.
+pub fn run(
+    request: &FuseRequest,
+    observer: &dyn StageObserver,
+    control: Arc<JobControl>,
+    stage_cache: Option<&StageCache>,
+) -> Result<FuseOutcome, PipelineError> {
+    let start = Instant::now();
+    let mut timer = StageTimer::from_start(start);
+
+    let stack = TiffStack::open_files(&request.frames)
+        .map_err(|err| PipelineError::Input(err.to_string()))?;
+    let frame_names: Vec<String> = request
+        .frames
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string())
+        })
+        .collect();
+    let header_refs: Vec<(&str, &TiffHeader)> = frame_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), stack.header(i)))
+        .collect();
+    let (uniform, detail) = uniform_check(&header_refs);
+    if !uniform {
+        return Err(PipelineError::Input(
+            detail.unwrap_or_else(|| "non-uniform frame set".to_string()),
+        ));
+    }
+
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let stack_ctx = StackContext::new(stack.len(), width, height, spp);
+    let resolved = params::resolve(request.algorithm.params(), &request.explicit, &stack_ctx)
+        .map_err(|err| PipelineError::Params(err.to_string()))?;
+    let values = params::resolved_values(&resolved);
+    let levels = request.algorithm.tile_levels(&values);
+
+    let fingerprint = StackFingerprint {
+        frames: (0..stack.len())
+            .map(|i| FrameFingerprint::from(stack.header(i)))
+            .collect(),
+    };
+
+    let mut options = TileSchedulerOptions::new(&request.scratch_root);
+    options.levels = levels;
+    if let Some(tile_size) = request.tile_size {
+        options.tile_size = tile_size;
+    }
+    options.budget = options.budget.capped_to(request.max_host_memory);
+
+    timer.mark(Stage::Setup);
+
+    let mut alignment_result: Option<(
+        &'static dyn AlignAlgorithm,
+        ResolvedParams,
+        FailurePolicy,
+        StackAlignment,
+    )> = None;
+    let mut used_peeked_alignment = false;
+    let mut align_cached = false;
+    let mut align_source = "skipped".to_string();
+    let mut align_workers: Option<usize> = None;
+    let mut peak_align_workers: Option<usize> = None;
+
+    if let Some(align_req) = &request.align {
+        // The control exists before this stage starts (`Job::with_control`'s
+        // whole point), so a poller reading `control.progress()` right now
+        // sees `stage == Align`.
+        control.set_stage(JobStage::Align);
+
+        let align_resolved = params::resolve(
+            align_req.algorithm.params(),
+            &align_req.explicit,
+            &stack_ctx,
+        )
+        .map_err(|err| PipelineError::Params(err.to_string()))?;
+        let align_values = params::resolved_values(&align_resolved);
+        let policy = if align_req.lax {
+            FailurePolicy::IdentityFallback
+        } else {
+            FailurePolicy::Strict
+        };
+        let identity = AlignIdentity {
+            algorithm: align_req.algorithm.id().to_string(),
+            params: align_values.clone(),
+            failure_policy: policy,
+        };
+
+        let peeked = if request.resume {
+            peek_resumable_alignment(
+                &request.scratch_root,
+                &fingerprint,
+                options.tile_size,
+                options.levels,
+                request.algorithm.id(),
+                &values,
+                Some(&identity),
+            )
+        } else {
+            None
+        };
+
+        if let Some(alignment) = peeked.flatten() {
+            used_peeked_alignment = true;
+            align_source = "resumed".to_string();
+            alignment_result = Some((align_req.algorithm, align_resolved, policy, alignment));
+        } else {
+            let stage_key = StageKey::align(&fingerprint, &identity);
+            let cache_hit = if request.cache {
+                stage_cache.and_then(|cache| cache.get_alignment(&stage_key))
+            } else {
+                None
+            };
+
+            if let Some(alignment) = cache_hit {
+                align_cached = true;
+                align_source = "cached".to_string();
+                observer.stage(RunStage::Align {
+                    frames: stack.len(),
+                    source: AlignSource::Cached,
+                });
+                alignment_result = Some((align_req.algorithm, align_resolved, policy, alignment));
+            } else {
+                observer.stage(RunStage::Align {
+                    frames: stack.len(),
+                    source: AlignSource::Computed,
+                });
+                let done = AtomicBool::new(false);
+                let poll = request.poll;
+                let solved = std::thread::scope(|scope| {
+                    let watcher = scope.spawn(|| {
+                        while !done.load(Ordering::SeqCst) {
+                            std::thread::sleep(poll);
+                            observer.tick(&control.progress());
+                        }
+                    });
+                    let result = align_stack_with(
+                        align_req.algorithm,
+                        stack_ctx,
+                        &stack,
+                        &align_values,
+                        policy,
+                        &AlignDriverOptions::default(),
+                    );
+                    done.store(true, Ordering::SeqCst);
+                    watcher.join().expect("align watcher thread must not panic");
+                    result
+                });
+                // Alignment has no unit boundary, so a cancel requested
+                // while it ran only ever lands once it returns -- the
+                // `Cancelling` interval the surface must show.
+                if control.state() == ControlState::CancelRequested {
+                    return Ok(FuseOutcome::Cancelled {
+                        units_done: 0,
+                        unit_total: 0,
+                    });
+                }
+                let solved = solved?;
+                align_workers = Some(solved.worker_limit);
+                peak_align_workers = Some(solved.peak_workers);
+                let alignment = solved.alignment;
+                if !align_req.lax && alignment.failure_count() > 0 {
+                    return Err(PipelineError::Align(format!(
+                        "alignment failed for {} frame(s)",
+                        alignment.failure_count()
+                    )));
+                }
+                // A cache write failure costs a missed optimisation next
+                // run, never this one -- it must not turn a completed
+                // alignment into a failed run.
+                if request.cache
+                    && let Some(cache) = stage_cache
+                {
+                    let _ = cache.put_alignment(&stage_key, &request.frames, &alignment);
+                }
+                align_source = "computed".to_string();
+                alignment_result = Some((align_req.algorithm, align_resolved, policy, alignment));
+            }
+        }
+        timer.mark(Stage::Align);
+    }
+
+    let alignment_for_crop: StackAlignment = match &alignment_result {
+        Some((_, _, _, alignment)) => alignment.clone(),
+        None => identity_alignment_for_crop(stack.len()),
+    };
+    let crop_rect_value = auto_crop(&alignment_for_crop, (width, height))
+        .map_err(|err| PipelineError::Align(err.to_string()))?;
+    if request.crop && crop_rect_value.is_none() {
+        return Err(PipelineError::Align(
+            "the aligned frames' overlap leaves no interior once the kernel margin is trimmed"
+                .to_string(),
+        ));
+    }
+    let applied_crop = if request.crop { crop_rect_value } else { None };
+
+    let description =
+        alignment_result
+            .as_ref()
+            .map(|(align_algo, align_resolved, _, alignment)| {
+                let align_values = params::resolved_values(align_resolved);
+                let mode = align_values
+                    .get("mode")
+                    .and_then(ParamValue::as_enum)
+                    .unwrap_or("n/a");
+                format_composite_description(
+                    align_algo.id(),
+                    alignment.reference,
+                    mode,
+                    crop_rect_value.map(|r| (r, request.crop)),
+                )
+            });
+
+    let transforms: Vec<Transform> = alignment_for_crop
+        .frames
+        .iter()
+        .map(|f| f.transform)
+        .collect();
+    let warping_reader = WarpingReader::new(&stack, (width, height), spp, transforms.clone());
+
+    let reader: &dyn TileReader = match &request.backend {
+        Some(_) => &stack,
+        None => &warping_reader,
+    };
+    let scheduler = TileScheduler::new(reader, stack_ctx, spp, &options)?;
+
+    let staging = request
+        .scratch_root
+        .join("projects")
+        .join(&request.staging_key);
+    std::fs::create_dir_all(&staging)
+        .map_err(|err| PipelineError::Io(format!("creating {}: {err}", staging.display())))?;
+    let staged_composite = staging.join("composite.tif");
+    let staged_zmap = staging.join("zmap.tif");
+
+    let geometry = FusionGeometry {
+        width,
+        height,
+        samples_per_pixel: spp,
+        frame_count: stack.len() as u32,
+        crop: applied_crop,
+        description: description.clone(),
+    };
+    let composite_description = description
+        .clone()
+        .unwrap_or_else(crate::io::TiffSpec::default_description);
+    let backend_id = request
+        .backend
+        .map(|b| b.info().to_string())
+        .unwrap_or_else(|| "cpu".to_string());
+
+    let record = JobRecord {
+        format: JOB_RECORD_FORMAT,
+        fingerprint,
+        width,
+        height,
+        samples_per_pixel: spp,
+        frame_count: stack.len(),
+        tile_size: scheduler.plan().tile_size(),
+        levels: scheduler.plan().levels(),
+        stack_algorithm: request.algorithm.id().to_string(),
+        stack_params: values.clone(),
+        backend: backend_id.clone(),
+        align: alignment_result
+            .as_ref()
+            .map(|(align_algo, align_resolved, policy, _)| AlignIdentity {
+                algorithm: align_algo.id().to_string(),
+                params: params::resolved_values(align_resolved),
+                failure_policy: *policy,
+            }),
+        crop: applied_crop,
+        composite_output: staged_composite.clone(),
+        zmap_output: Some(staged_zmap.clone()),
+    };
+    let resume_store = ResumeStore::open(&request.scratch_root)?;
+    let ledger = if request.resume {
+        match resume_store.find(&record)? {
+            Resumable::None => {
+                return Err(PipelineError::ResumeMismatch(format!(
+                    "no resumable state for this stack under {}",
+                    request.scratch_root.join("resume").display()
+                )));
+            }
+            Resumable::Mismatch(mismatch) => {
+                return Err(PipelineError::ResumeMismatch(mismatch.to_string()));
+            }
+            Resumable::Ledger(ledger) => ledger,
+        }
+    } else {
+        if let Resumable::Ledger(stale) = resume_store.find(&record)? {
+            stale
+                .discard()
+                .map_err(|err| PipelineError::Io(err.to_string()))?;
+        }
+        resume_store.begin(&record)?
+    };
+
+    if !used_peeked_alignment
+        && let Some((_, _, _, alignment)) = &alignment_result
+        && let Err(err) = ledger.record_alignment(alignment)
+    {
+        cleanup_staging(&staging);
+        let _ = ledger.discard();
+        return Err(PipelineError::Io(err.to_string()));
+    }
+
+    let is_resuming = !ledger.completed().is_empty();
+    let (sink, surviving): (FusionConsumer, Option<Vec<usize>>) = if is_resuming {
+        match FusionConsumer::resume(
+            scheduler.plan(),
+            ledger.completed(),
+            request.algorithm,
+            values.clone(),
+            &staged_composite,
+            Some(&staged_zmap),
+            geometry.clone(),
+        ) {
+            Ok((sink, surviving)) => (sink, Some(surviving)),
+            Err(err) => {
+                cleanup_staging(&staging);
+                let _ = ledger.discard();
+                return Err(err.into());
+            }
+        }
+    } else {
+        match FusionConsumer::create(
+            request.algorithm,
+            values.clone(),
+            &staged_composite,
+            Some(&staged_zmap),
+            geometry,
+        ) {
+            Ok(sink) => (sink, None),
+            Err(err) => {
+                cleanup_staging(&staging);
+                let _ = ledger.discard();
+                return Err(err.into());
+            }
+        }
+    };
+
+    control.set_stage(JobStage::Fuse);
+    // `Job::with_control` is what credits `control` with the plan's real
+    // unit/pixel totals (and any already-completed units on a resume);
+    // constructing it before `observer.stage` fires means the very first
+    // progress snapshot a front end reads already carries the true total,
+    // never a transient `0/0`.
+    let mut job = Job::with_control(
+        &scheduler,
+        surviving.as_deref().unwrap_or(&[]),
+        Arc::clone(&control),
+    );
+    observer.stage(RunStage::Fuse);
+
+    let backend_consumer = request.backend.map(|b| {
+        BackendFusionConsumer::new(b, &stack, (width, height), transforms, spp, levels, &sink)
+    });
+    let consumer: &dyn TileConsumer = match &backend_consumer {
+        Some(bc) => bc,
+        None => &sink,
+    };
+    let recording = RecordingConsumer {
+        inner: consumer,
+        ledger: &ledger,
+    };
+
+    let outcome = match drive_job(&mut job, &control, &recording, observer, request.poll) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            cleanup_staging(&staging);
+            let _ = ledger.discard();
+            return Err(err.into());
+        }
+    };
+
+    if outcome == JobOutcome::Cancelled {
+        let progress = control.progress();
+        return Ok(FuseOutcome::Cancelled {
+            units_done: progress.units_done,
+            unit_total: progress.unit_total,
+        });
+    }
+    timer.mark(Stage::Fuse);
+    debug_assert_eq!(
+        outcome,
+        JobOutcome::Completed,
+        "drive_job never returns Paused"
+    );
+
+    let final_progress = control.progress();
+    let in_flight_limit = scheduler.in_flight_limit();
+    let tiles = final_progress.unit_total;
+    let frame_tiles_read = if request.backend.is_some() {
+        0
+    } else {
+        tiles * stack.len()
+    };
+
+    if let Err(err) = sink.finish() {
+        cleanup_staging(&staging);
+        let _ = ledger.discard();
+        return Err(err.into());
+    }
+
+    observer.stage(RunStage::Seal);
+    let metrics = measure_metrics(&staged_composite, &request.frames);
+    let sealed = project::seal(SealRequest {
+        project_path: &request.project_path,
+        staged_composite: &staged_composite,
+        staged_zmap: &staged_zmap,
+        sources: &request.frames,
+        algorithm: request.algorithm.id(),
+        params: &values,
+        align: alignment_result
+            .as_ref()
+            .map(|(align_algo, align_resolved, _, alignment)| AlignRecord {
+                algorithm: align_algo.id().to_string(),
+                params: params::resolved_values(align_resolved),
+                reference: alignment.reference,
+            }),
+        composite_description,
+        label: None,
+        metrics,
+    });
+    let sealed = match sealed {
+        Ok(sealed) => sealed,
+        Err(err) => {
+            cleanup_staging(&staging);
+            let _ = ledger.discard();
+            return Err(err.into());
+        }
+    };
+    cleanup_staging(&staging);
+    ledger
+        .discard()
+        .map_err(|err| PipelineError::Io(err.to_string()))?;
+    observer.stage(RunStage::Finished);
+
+    timer.mark(Stage::Finalize);
+    let wall_seconds = timer.total_seconds();
+    let stages = timer.finish();
+    let plan = scheduler.plan();
+
+    let align_report =
+        alignment_result.map(
+            |(align_algo, align_resolved, policy, alignment)| FuseAlignReport {
+                algorithm_id: align_algo.id().to_string(),
+                display_name: align_algo.display_name().to_string(),
+                params: align_resolved,
+                failure_policy: policy,
+                alignment,
+            },
+        );
+
+    Ok(FuseOutcome::Completed(Box::new(FuseReport {
+        sealed,
+        frame_count: stack.len(),
+        frames: frame_names,
+        width,
+        height,
+        samples_per_pixel: spp,
+        stack_params: resolved,
+        tile_size: plan.tile_size(),
+        levels: plan.levels(),
+        margin: plan.margin(),
+        tiles,
+        frame_tiles_read,
+        in_flight_limit,
+        max_bytes_in_flight: scheduler.budget().bytes(),
+        budget_provenance: scheduler.budget().provenance(),
+        backed_off: scheduler.final_in_flight_limit() < in_flight_limit,
+        output_width: applied_crop.map(|r| r.width).unwrap_or(width),
+        output_height: applied_crop.map(|r| r.height).unwrap_or(height),
+        crop: applied_crop,
+        description,
+        align: align_report,
+        align_cached,
+        align_source,
+        align_workers,
+        peak_align_workers,
+        stages,
+        wall_seconds,
+        metrics,
+    })))
+}
+
+/// Runs `job` to completion, one segment at a time: [`StageObserver::tick`]
+/// every [`FuseRequest::poll`] while a segment executes, and
+/// [`StageObserver::paused`] (blocking until it returns) whenever a segment
+/// reports [`JobOutcome::Paused`] -- the one segment/resume contract every
+/// caller drives against, whatever wakes it.
+fn drive_job(
+    job: &mut Job<'_>,
+    control: &Arc<JobControl>,
+    consumer: &dyn TileConsumer,
+    observer: &dyn StageObserver,
+    poll: Duration,
+) -> Result<JobOutcome, TileError> {
+    loop {
+        let outcome = run_segment(job, control, consumer, poll, observer)?;
+        match outcome {
+            JobOutcome::Completed | JobOutcome::Cancelled => return Ok(outcome),
+            JobOutcome::Paused => {
+                if control.state() == ControlState::CancelRequested {
+                    // A cancel raced the pause within the same segment.
+                    continue;
+                }
+                observer.paused(control);
+            }
+        }
+    }
+}
+
+/// Runs exactly one [`Job::run`] segment on a scoped thread, polling
+/// `control.progress()` onto `observer.tick` from this thread every `poll`.
+fn run_segment(
+    job: &mut Job<'_>,
+    control: &Arc<JobControl>,
+    consumer: &dyn TileConsumer,
+    poll: Duration,
+    observer: &dyn StageObserver,
+) -> Result<JobOutcome, TileError> {
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(|| job.run(&NoopPreprocess, consumer));
+        loop {
+            if handle.is_finished() {
+                break;
+            }
+            std::thread::sleep(poll);
+            observer.tick(&control.progress());
+        }
+        handle.join().expect("job segment thread must not panic")
+    })
+}
+
+/// An all-identity [`StackAlignment`] over `frame_count` frames -- what a
+/// request with no [`AlignRequest`] feeds to [`auto_crop`] and the
+/// [`WarpingReader`], so a crop still trims the kernel-radius margin with
+/// alignment off, and the reader stays bit-identical to a direct read
+/// either way (`WarpingReader`'s own identity short-circuit).
+fn identity_alignment_for_crop(frame_count: usize) -> StackAlignment {
+    use crate::algorithm::AlignStatus;
+    StackAlignment {
+        reference: 0,
+        policy: ReferencePolicy::Anchor,
+        frames: (0..frame_count)
+            .map(|i| FrameAlignment {
+                frame: i,
+                transform: Transform::identity(),
+                status: AlignStatus::Converged,
+                iterations: 0,
+                residual: 1.0,
+                fallback: false,
+            })
+            .collect(),
+    }
+}
+
+/// A resumable candidate's already-recorded [`StackAlignment`], read
+/// directly off a matching `<scratch_base>/resume/*/job.json` (and that
+/// same directory's `alignment.json`, when present) so a resumed run can
+/// build a correct [`JobRecord`] without first running [`align_stack_with`].
+/// A `None` return costs only a missed optimisation -- the caller falls
+/// back to computing alignment normally -- never a wrong resume, since
+/// nothing downstream trusts this peek's verdict on its own.
+fn peek_resumable_alignment(
+    scratch_base: &Path,
+    fingerprint: &StackFingerprint,
+    tile_size: u32,
+    levels: u32,
+    stack_algorithm: &str,
+    stack_params: &ParamValues,
+    align_identity: Option<&AlignIdentity>,
+) -> Option<Option<StackAlignment>> {
+    let entries = std::fs::read_dir(scratch_base.join("resume")).ok()?;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(dir.join("job.json")) else {
+            continue;
+        };
+        let Ok(candidate) = serde_json::from_str::<JobRecord>(&text) else {
+            continue;
+        };
+        if candidate.format != JOB_RECORD_FORMAT {
+            continue;
+        }
+        if !candidate.composite_output.exists() {
+            continue;
+        }
+        if &candidate.fingerprint != fingerprint {
+            continue;
+        }
+        if candidate.tile_size != tile_size || candidate.levels != levels {
+            continue;
+        }
+        if candidate.stack_algorithm != stack_algorithm {
+            continue;
+        }
+        if &candidate.stack_params != stack_params {
+            continue;
+        }
+        if candidate.align.as_ref() != align_identity {
+            continue;
+        }
+        let alignment = read_alignment(&dir.join("alignment.json")).ok().flatten();
+        return Some(alignment);
+    }
+    None
+}
+
+/// Best-effort removal of one run's staging directory and both staged
+/// planes. Never fails the caller: a missing directory (the common case) is
+/// not itself an error. Called on failure and on success, never on cancel --
+/// a cancelled run keeps its staged planes and its ledger so a resume can
+/// continue.
+fn cleanup_staging(staging: &Path) {
+    let _ = std::fs::remove_dir_all(staging);
+}
+
+/// The maximum side of the sharpness window [`measure_metrics`] reads --
+/// bounded memory, one tile read per source frame.
+const LAPVAR_WINDOW: u32 = 2048;
+
+/// The composite's and the sharpest source frame's Laplacian variance over
+/// one central window, measured identically on both. Every failure is
+/// silence rather than a refusal: a metric that could not be measured must
+/// not turn a completed run into a failed one.
+fn measure_metrics(composite: &Path, sources: &[PathBuf]) -> Metrics {
+    let Ok(stack) = TiffStack::open_files(std::slice::from_ref(&composite.to_path_buf())) else {
+        return Metrics::default();
+    };
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let side_w = LAPVAR_WINDOW.min(width);
+    let side_h = LAPVAR_WINDOW.min(height);
+    let window = centered(width, height, side_w, side_h);
+    let composite_lapvar = lapvar(&stack, window, spp);
+
+    let mut max_input_lapvar: Option<f64> = None;
+    for path in sources {
+        let Ok(frame) = TiffStack::open_files(std::slice::from_ref(path)) else {
+            continue;
+        };
+        let (fw, fh) = frame.dimensions();
+        if fw < side_w || fh < side_h {
+            continue;
+        }
+        let fspp = frame.header(0).samples_per_pixel;
+        let rect = centered(fw, fh, side_w, side_h);
+        if let Some(value) = lapvar(&frame, rect, fspp) {
+            max_input_lapvar = Some(max_input_lapvar.map_or(value, |m: f64| m.max(value)));
+        }
+    }
+
+    Metrics {
+        composite_lapvar,
+        max_input_lapvar,
+        lapvar_window: composite_lapvar.map(|_| window),
+    }
+}
+
+fn centered(width: u32, height: u32, side_w: u32, side_h: u32) -> Rect {
+    Rect {
+        x: (width - side_w) / 2,
+        y: (height - side_h) / 2,
+        width: side_w,
+        height: side_h,
+    }
+}
+
+fn lapvar(stack: &TiffStack, rect: Rect, spp: u32) -> Option<f64> {
+    let mut samples = vec![0u16; rect.width as usize * rect.height as usize * spp as usize];
+    stack.read_tile_into(0, rect, &mut samples).ok()?;
+    Some(crate::fuse::metrics::laplacian_variance(
+        &samples,
+        rect.width,
+        rect.height,
+        spp,
+    ))
+}
+
+fn pipeline_byte_order_str(order: ByteOrder) -> &'static str {
+    match order {
+        ByteOrder::Little => "II",
+        ByteOrder::Big => "MM",
+    }
+}
+
+fn pipeline_describe_layout(h: &TiffHeader) -> String {
+    format!(
+        "{}/rps={}",
+        pipeline_byte_order_str(h.byte_order),
+        h.rows_per_strip
+    )
+}
+
+fn pipeline_describe_layout_diff(h: &TiffHeader, other: &TiffHeader) -> String {
+    let mut s = pipeline_describe_layout(h);
+    if h.compression != other.compression {
+        s.push_str(&format!("/compression={}", h.compression));
+    }
+    if h.width != other.width || h.height != other.height {
+        s.push_str(&format!("/{}x{}", h.width, h.height));
+    }
+    if h.bits_per_sample != other.bits_per_sample {
+        s.push_str(&format!("/bits={:?}", h.bits_per_sample));
+    }
+    if h.samples_per_pixel != other.samples_per_pixel {
+        s.push_str(&format!("/samples={}", h.samples_per_pixel));
+    }
+    if h.photometric != other.photometric {
+        s.push_str(&format!("/photometric={}", h.photometric));
+    }
+    if h.planar_config != other.planar_config {
+        s.push_str(&format!("/planar={}", h.planar_config));
+    }
+    s
+}
+
+/// Whether every header shares one layout (width, height, bit depth,
+/// samples per pixel, byte order, `RowsPerStrip`, compression, planar
+/// config, photometric interpretation), and if not, which file is the
+/// outlier against the majority layout. Ties among equally common layouts
+/// favor the most-recently-seen group.
+pub fn uniform_check(headers: &[(&str, &TiffHeader)]) -> (bool, Option<String>) {
+    type Signature = (u32, u32, Vec<u16>, u32, ByteOrder, u32, u16, u16, u16);
+    fn signature(h: &TiffHeader) -> Signature {
+        (
+            h.width,
+            h.height,
+            h.bits_per_sample.to_vec(),
+            h.samples_per_pixel,
+            h.byte_order,
+            h.rows_per_strip,
+            h.compression,
+            h.planar_config,
+            h.photometric,
+        )
+    }
+
+    if headers.len() < 2 {
+        return (true, None);
+    }
+
+    let mut groups: Vec<(Signature, usize)> = Vec::new();
+    for (_, h) in headers {
+        let sig = signature(h);
+        if let Some(group) = groups.iter_mut().find(|(gs, _)| *gs == sig) {
+            group.1 += 1;
+        } else {
+            groups.push((sig, 1));
+        }
+    }
+
+    if groups.len() == 1 {
+        return (true, None);
+    }
+
+    let mut majority = groups[0].clone();
+    for group in groups.iter().skip(1) {
+        if group.1 >= majority.1 {
+            majority = group.clone();
+        }
+    }
+    let majority_sig = majority.0;
+
+    let outlier = headers
+        .iter()
+        .find(|(_, h)| signature(h) != majority_sig)
+        .expect("groups.len() > 1 implies at least one non-majority header");
+    let majority_header = headers
+        .iter()
+        .find(|(_, h)| signature(h) == majority_sig)
+        .expect("majority signature came from one of these headers");
+
+    let detail = format!(
+        "{} is {}, others {}",
+        outlier.0,
+        pipeline_describe_layout_diff(outlier.1, majority_header.1),
+        pipeline_describe_layout(majority_header.1)
+    );
+    (false, Some(detail))
+}

@@ -354,3 +354,28 @@ pub fn gpu_backend_capped(max_vram: Option<u64>) -> Result<&'static GpuBackend, 
 pub fn gpu_backend() -> Result<&'static GpuBackend, &'static GpuError> {
     gpu_backend_capped(None)
 }
+
+/// Resolves whether a stack run over `algorithm_id` takes the GPU path, and
+/// a one-line, human-readable account of the choice either way. This crate
+/// ships a WGSL port of exactly one stacking algorithm, so every other id
+/// stays on the CPU path without attempting an adapter probe. `no_gpu`
+/// forces the CPU path regardless of `algorithm_id`; `max_vram` is a
+/// ceiling-only cap on the probed device budget.
+pub fn backend_for(
+    algorithm_id: &str,
+    no_gpu: bool,
+    max_vram: Option<u64>,
+) -> (Option<&'static GpuBackend>, String) {
+    use focusforge_core::algorithm::StackAlgorithm;
+    if algorithm_id != focusforge_core::fuse::laplacian::Laplacian.id() {
+        // No adapter attempted, and nothing to report: an algorithm with no
+        // GPU kernel stays on the CPU path silently, exactly as if this
+        // function had never been called.
+        return (None, String::new());
+    }
+    let (path, result, message) = crate::adapter::choose_path(no_gpu, gpu_backend_capped(max_vram));
+    match path {
+        crate::adapter::PathChoice::Gpu => (result.ok(), message),
+        crate::adapter::PathChoice::CpuFallback => (None, message),
+    }
+}

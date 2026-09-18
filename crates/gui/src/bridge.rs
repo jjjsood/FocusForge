@@ -6,9 +6,10 @@
 //! `ShellEvent` against the window.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use slint::ComponentHandle;
 use slint::Model as _;
@@ -16,12 +17,15 @@ use slint::winit_030::{CustomApplicationHandler, EventResult, WinitWindowAccesso
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
-use crate::controller::{AppController, DockTab, GroupingQuestion, OpenAs, ShellEvent, ShellMode};
+use crate::controller::{
+    AppController, DockTab, GroupingQuestion, JobView, OpenAs, ShellEvent, ShellMode,
+};
 use crate::generated::{
     AppWindow, ProjectTabView, SectionHeadView, SettingsRow as GeneratedSettingsRow,
 };
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
+use crate::job;
 use crate::settings_panel::{HeadingState, RowKind};
 use crate::viewport::PaneRect;
 
@@ -53,6 +57,14 @@ fn modifiers(controller: &AppController, ctrl: bool, shift: bool, alt: bool) -> 
 pub struct Installed {
     pub controller: Arc<Mutex<AppController>>,
     pub canvas: Rc<RefCell<Option<CanvasRenderer>>>,
+    /// The live run's own poll timer, recreated by every `Fuse stack`/`Retry`
+    /// press (`start_job_timer`) and dropped -- which deactivates it --
+    /// the moment a new one replaces it.
+    pub job_timer: Rc<RefCell<Option<slint::Timer>>>,
+    /// The failure toast's auto-dismiss timer, recreated every time the
+    /// toast opens and dropped -- deactivating it -- the moment a new
+    /// failure replaces it.
+    pub toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 }
 
 /// Reads `controller.pane_draw()`, asks `canvas` for the two re-rendered
@@ -172,6 +184,117 @@ fn push_tab_scroll(app: &AppWindow, controller: &AppController) {
     app.set_tabs_overflow(controller.tabs_overflow());
     app.set_can_scroll_left(controller.can_scroll_left());
     app.set_can_scroll_right(controller.can_scroll_right());
+}
+
+/// How long the failure toast stays up before closing itself.
+const TOAST_AUTO_DISMISS: Duration = Duration::from_secs(6);
+
+/// Opens the failure toast with `message` and arms its auto-dismiss timer,
+/// replacing any timer already running -- dropping the old one deactivates
+/// it, so a second failure while the first toast is still up restarts the
+/// count rather than closing early.
+fn open_job_toast(
+    app: &AppWindow,
+    message: String,
+    toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
+) {
+    app.set_job_toast_message(message.into());
+    app.set_job_toast_open(true);
+    let timer = slint::Timer::default();
+    let app_weak = app.as_weak();
+    timer.start(
+        slint::TimerMode::SingleShot,
+        TOAST_AUTO_DISMISS,
+        move || {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_job_toast_open(false);
+            }
+        },
+    );
+    *toast_timer.borrow_mut() = Some(timer);
+}
+
+/// Pushes the run's current view onto the toolbar/bottom-bar properties --
+/// the one place `ShellEvent::JobChanged` and the poll timer both write.
+fn push_job(app: &AppWindow, view: &JobView) {
+    app.set_toolbar_run_state(view.toolbar_run_state.as_str().into());
+    app.set_stage_word(view.stage_word.as_str().into());
+    app.set_step_text(view.step_text.as_str().into());
+    app.set_bar_fraction(view.fraction);
+    app.set_bar_tone(view.bar_tone.as_str().into());
+    app.set_eta_text(view.eta_text.as_str().into());
+}
+
+/// Opens `CanvasRenderer` on a project's two materialized planes, naming the
+/// failure on stderr rather than panicking: a plane the pipeline itself just
+/// wrote failing to reopen is an environment problem (a full disk, a
+/// permissions change), not a bug worth crashing the window over.
+fn open_canvas(canvas: &Rc<RefCell<Option<CanvasRenderer>>>, composite: &Path, zmap: &Path) {
+    let Ok(shared) = focusforge_gpu::device::shared_device() else {
+        return;
+    };
+    match CanvasRenderer::open(shared, composite, zmap) {
+        Ok(renderer) => *canvas.borrow_mut() = Some(renderer),
+        Err(err) => eprintln!("failed to open the project's planes: {err}"),
+    }
+}
+
+/// Materializes the active tab's own planes (the `--open <saved>.ffp` path,
+/// with no run involved) and feeds the canvas -- a no-op for an `Unsaved`
+/// tab, which [`AppController::materialize_active_tab_planes`] already
+/// refuses.
+pub fn feed_canvas(
+    app: &AppWindow,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Option<CanvasRenderer>>>,
+) {
+    let planes = controller.lock().unwrap().materialize_active_tab_planes();
+    if let Some((composite, zmap)) = planes {
+        open_canvas(canvas, &composite, &zmap);
+        repaint(app, controller, canvas);
+    }
+}
+
+/// Installs a repeating timer, on the window's own clock ([`job::POLL`]),
+/// that polls the live run's progress onto the toolbar/bottom-bar
+/// properties, feeds the canvas once a run completes, opens the failure
+/// toast the moment a run fails, and stops itself once the run settles --
+/// what `Fuse stack`/`Retry` starts, and the only place
+/// [`AppController::settle_job`] is called from.
+fn start_job_timer(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Option<CanvasRenderer>>>,
+    job_timer: Rc<RefCell<Option<slint::Timer>>>,
+    toast_timer: Rc<RefCell<Option<slint::Timer>>>,
+) {
+    let timer = slint::Timer::default();
+    let timer_slot = job_timer.clone();
+    timer.start(slint::TimerMode::Repeated, job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let planes = controller.lock().unwrap().settle_job();
+        if let Some((composite, zmap)) = planes {
+            open_canvas(&canvas, &composite, &zmap);
+            push_projects(&app, &controller);
+            repaint(&app, &controller, &canvas);
+        } else if let Some(message) = controller
+            .lock()
+            .unwrap()
+            .job_failure_message()
+            .map(str::to_string)
+        {
+            open_job_toast(&app, message, &toast_timer);
+        }
+        let view = controller.lock().unwrap().job_view();
+        let live = job::is_live(&view.state);
+        push_job(&app, &view);
+        if !live && let Some(t) = timer_slot.borrow().as_ref() {
+            t.stop();
+        }
+    });
+    *job_timer.borrow_mut() = Some(timer);
 }
 
 /// `RowKind`'s own string reading -- the settings panel's `.slint` side
@@ -342,11 +465,13 @@ impl CustomApplicationHandler for DropHandler {
 /// path.
 pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Installed {
     let canvas: Rc<RefCell<Option<CanvasRenderer>>> = Rc::new(RefCell::new(None));
+    let job_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+    let toast_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
 
     {
         let app_weak = app.as_weak();
         let controller_for_sink = controller.clone();
-        controller.lock().unwrap().set_sink(Box::new(move |event| {
+        controller.lock().unwrap().set_sink(Arc::new(move |event| {
             let app_weak = app_weak.clone();
             let controller = controller_for_sink.clone();
             let _ = slint::invoke_from_event_loop(move || {
@@ -399,6 +524,56 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
     app.on_checkpoint_export_requested({
         let controller = controller.clone();
         move || controller.lock().unwrap().checkpoint_export_requested()
+    });
+    // The run's own transport. `fuse-requested`/`retry-requested` start the
+    // poll timer that feeds the rest; `pause-or-resume-requested` and
+    // `cancel-requested` need nothing extra -- the timer already running for
+    // a live job keeps polling through a pause or a cancel.
+    app.on_fuse_requested({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let job_timer = job_timer.clone();
+        let toast_timer = toast_timer.clone();
+        let app_weak = app.as_weak();
+        move || {
+            let started = controller.lock().unwrap().start_fuse();
+            if started {
+                start_job_timer(
+                    app_weak.clone(),
+                    controller.clone(),
+                    canvas.clone(),
+                    job_timer.clone(),
+                    toast_timer.clone(),
+                );
+            }
+        }
+    });
+    app.on_pause_or_resume_requested({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().pause_or_resume()
+    });
+    app.on_cancel_requested({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().cancel_fuse()
+    });
+    app.on_retry_requested({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let job_timer = job_timer.clone();
+        let toast_timer = toast_timer.clone();
+        let app_weak = app.as_weak();
+        move || {
+            let started = controller.lock().unwrap().retry_fuse();
+            if started {
+                start_job_timer(
+                    app_weak.clone(),
+                    controller.clone(),
+                    canvas.clone(),
+                    job_timer.clone(),
+                    toast_timer.clone(),
+                );
+            }
+        }
     });
     app.on_composite_undock_requested({
         let controller = controller.clone();
@@ -622,6 +797,14 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
             }
         }
     });
+    app.on_job_toast_dismissed({
+        let app_weak = app.as_weak();
+        move || {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_job_toast_open(false);
+            }
+        }
+    });
 
     // The settings panel: every callback is a one-line forward,
     // `AppController` alone decides what a row's own kind, section and id
@@ -700,7 +883,12 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
         }
     });
 
-    Installed { controller, canvas }
+    Installed {
+        controller,
+        canvas,
+        job_timer,
+        toast_timer,
+    }
 }
 
 /// Performs one [`ShellEvent`] against the window. The only function in the
@@ -769,5 +957,6 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::QuestionRaised(question) => push_question(app, &question),
         ShellEvent::EntryRefused(_) => app.set_refusal_open(true),
         ShellEvent::SettingsChanged => push_settings_panel(app, &controller.lock().unwrap()),
+        ShellEvent::JobChanged => push_job(app, &controller.lock().unwrap().job_view()),
     }
 }

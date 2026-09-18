@@ -15,6 +15,10 @@ pub mod host;
 pub mod io;
 pub mod job;
 pub mod params;
+/// The align -> fuse -> seal spine both front ends drive
+/// (`crates/cli`, `crates/gui`) -- one function so a stack run means the
+/// same thing regardless of which one started it.
+pub mod pipeline;
 pub mod project;
 pub mod registry;
 pub mod tile;

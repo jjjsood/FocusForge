@@ -245,7 +245,7 @@ fn editor_mode_is_unreachable_in_this_phase() {
 
     let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_events = events.clone();
-    controller.set_sink(Box::new(move |event| {
+    controller.set_sink(Arc::new(move |event| {
         sink_events.lock().unwrap().push(event)
     }));
 
@@ -269,7 +269,7 @@ fn controller_events_reach_an_installed_sink() {
     let mut controller = AppController::new();
     let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_events = events.clone();
-    controller.set_sink(Box::new(move |event| {
+    controller.set_sink(Arc::new(move |event| {
         sink_events.lock().unwrap().push(event)
     }));
 
@@ -300,7 +300,7 @@ fn maximize_toggle_flips_controller_state_and_carries_it_on_the_event() {
     let mut controller = AppController::new();
     let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_events = events.clone();
-    controller.set_sink(Box::new(move |event| {
+    controller.set_sink(Arc::new(move |event| {
         sink_events.lock().unwrap().push(event)
     }));
 

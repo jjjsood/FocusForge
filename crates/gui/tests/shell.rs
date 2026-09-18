@@ -61,6 +61,9 @@ fn assert_rect(app: &AppWindow, id: &str, expected: (f32, f32, f32, f32)) {
 #[test]
 fn shell_bands_match_the_spec() {
     let app = app_at(1440, 900);
+    // The toolbar row only renders with a project open; these bands assume
+    // one is.
+    app.set_show_empty_state(false);
 
     assert_rect(&app, "AppWindow::tab-strip", (0.0, 0.0, 1440.0, 36.0));
     assert_rect(&app, "AppWindow::toolbar", (0.0, 36.0, 1180.0, 40.0));
@@ -82,6 +85,7 @@ fn shell_bands_match_the_spec() {
 #[test]
 fn shell_bands_hold_at_the_minimum() {
     let app = app_at(1200, 760);
+    app.set_show_empty_state(false);
 
     let dock = rect(&app, "AppWindow::dock");
     assert!(
@@ -173,6 +177,7 @@ fn checkpoint_panel_touches_no_storage() {
         "entry.rs",
         "input_config.rs",
         "settings_panel.rs",
+        "job.rs",
     ];
     for path in common::find_rust_files(&common::src_dir()) {
         if path
@@ -639,11 +644,62 @@ fn bottom_bar_status_reads_no_project_open() {
     assert_eq!(x, 68.0);
 
     app.set_project_loaded(true);
-    assert!(
-        ElementQuery::from_root(&app)
-            .match_id("FFBottomBar::status-text")
-            .find_first()
-            .is_none(),
+    assert_ne!(
+        label(&app, "FFBottomBar::status-text"),
+        "No project open",
         "a loaded project does not read \"No project open\""
     );
+}
+
+/// The toolbar's transport buttons: 116 x 26, 10 px apart, the first at
+/// `Theme.space-3` (12px) and the second at 138px -- the running state's
+/// `Pause`/`Cancel` pair.
+#[test]
+fn transport() {
+    let app = app_at(1440, 900);
+    app.set_show_empty_state(false);
+    app.set_toolbar_run_state("running".into());
+
+    assert_rect(&app, "FFToolbar::pause-button", (12.0, 43.0, 116.0, 26.0));
+    assert_rect(&app, "FFToolbar::cancel-button", (138.0, 43.0, 116.0, 26.0));
+}
+
+/// The bottom bar's progress track, in reading order (stage -> step -> bar
+/// -> ETA), at the base width and at the 1200px minimum: the bar's width is
+/// dynamic, always ending `Theme.space-4` before the ETA.
+#[test]
+fn bottom_bar_progress() {
+    let app = app_at(1440, 900);
+    app.set_project_loaded(true);
+    app.set_stage_word("Fusing".into());
+    app.set_step_text("step 2 of 3".into());
+    app.set_bar_fraction(0.5);
+    app.set_eta_text("ETA 1:12".into());
+
+    let (step_x, step_y, _, _) = rect(&app, "FFBottomBar::step-text");
+    assert_eq!((step_x, step_y), (166.0, 856.0));
+    assert_rect(
+        &app,
+        "FFBottomBar::progress-bar",
+        (250.0, 876.0, 798.0, 4.0),
+    );
+    let (eta_x, eta_y, _, _) = rect(&app, "FFBottomBar::eta-text");
+    assert_eq!((eta_x, eta_y), (1064.0, 856.0));
+
+    let app_min = app_at(1200, 760);
+    app_min.set_project_loaded(true);
+    app_min.set_stage_word("Fusing".into());
+    app_min.set_step_text("step 2 of 3".into());
+    app_min.set_bar_fraction(0.5);
+    app_min.set_eta_text("ETA 1:12".into());
+
+    let (step_x, step_y, _, _) = rect(&app_min, "FFBottomBar::step-text");
+    assert_eq!((step_x, step_y), (166.0, 716.0));
+    assert_rect(
+        &app_min,
+        "FFBottomBar::progress-bar",
+        (250.0, 736.0, 558.0, 4.0),
+    );
+    let (eta_x, eta_y, _, _) = rect(&app_min, "FFBottomBar::eta-text");
+    assert_eq!((eta_x, eta_y), (824.0, 716.0));
 }

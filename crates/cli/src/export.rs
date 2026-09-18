@@ -23,9 +23,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use focusforge_core::io::{TiffSpec, TiffWriter};
-use focusforge_core::project::{Plane, PlaneRef, Project, ProjectError, partial_path};
-use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+use focusforge_core::project::{self, Plane, Project};
 use serde::Serialize;
 
 /// The frozen `export --json` schema, additive-only -- the same contract
@@ -96,14 +94,14 @@ pub fn run(
 
     let mut wrote = Vec::new();
     if let Some(path) = output {
-        if let Err(msg) = write_composite(&mut project, &composite_ref, path) {
-            return fail(msg);
+        if let Err(err) = project::materialize_plane(&mut project, Plane::Composite, path) {
+            return fail(err);
         }
         wrote.push(path.display().to_string());
     }
     if let Some(path) = zmap {
-        if let Err(msg) = write_zmap(&mut project, &zmap_ref, path) {
-            return fail(msg);
+        if let Err(err) = project::materialize_plane(&mut project, Plane::ZMap, path) {
+            return fail(err);
         }
         wrote.push(path.display().to_string());
     }
@@ -128,104 +126,6 @@ pub fn run(
         println!("{}", render(&report));
     }
     ExitCode::SUCCESS
-}
-
-fn write_composite(project: &mut Project, plane: &PlaneRef, path: &Path) -> Result<(), String> {
-    let partial = partial_path(path);
-    let writer = TiffWriter::create(
-        &partial,
-        TiffSpec {
-            width: plane.width,
-            height: plane.height,
-            samples_per_pixel: plane.samples_per_pixel,
-            description: Some(plane.description.clone()),
-        },
-    )
-    .map_err(|err| err.to_string())?;
-    stream(
-        project,
-        Plane::Composite,
-        &partial,
-        path,
-        writer,
-        |w, rect, band| w.write_tile(rect, band).map_err(|err| err.to_string()),
-    )
-}
-
-fn write_zmap(project: &mut Project, plane: &PlaneRef, path: &Path) -> Result<(), String> {
-    let partial = partial_path(path);
-    let info = ZMapInfo::new(plane.width, plane.height, plane.frame_count)
-        .map_err(|err| err.to_string())?;
-    let writer = ZMapWriter::create(&partial, info).map_err(|err| err.to_string())?;
-    stream(
-        project,
-        Plane::ZMap,
-        &partial,
-        path,
-        writer,
-        |w, rect, band| w.write_tile(rect, band).map_err(|err| err.to_string()),
-    )
-}
-
-/// The one band loop both payloads share: stream the blob into `writer`,
-/// finish it, and rename the partial onto the named path -- **only** once
-/// [`Project::read_plane_into`] has verified the blob's hash, which it does
-/// at the end of the stream. A tampered blob therefore leaves nothing
-/// behind rather than a corrupt image.
-fn stream<W: Finishable>(
-    project: &mut Project,
-    which: Plane,
-    partial: &Path,
-    final_path: &Path,
-    mut writer: W,
-    mut write: impl FnMut(&mut W, focusforge_core::io::Rect, &[u16]) -> Result<(), String>,
-) -> Result<(), String> {
-    let mut failure: Option<String> = None;
-    let read = project.read_plane_into(which, &mut |band, rect| {
-        if failure.is_some() {
-            return;
-        }
-        if let Err(err) = write(&mut writer, rect, band) {
-            failure = Some(err);
-        }
-    });
-    let outcome = read
-        .map_err(|err: ProjectError| err.to_string())
-        .and_then(|()| match failure {
-            Some(err) => Err(err),
-            None => writer.finish(),
-        })
-        .and_then(|()| {
-            std::fs::rename(partial, final_path).map_err(|err| {
-                format!(
-                    "renaming {} to {}: {err}",
-                    partial.display(),
-                    final_path.display()
-                )
-            })
-        });
-    if outcome.is_err() {
-        let _ = std::fs::remove_file(partial);
-    }
-    outcome
-}
-
-/// The `finish()` half of the two writers, so [`stream`] has one shape
-/// rather than two near-copies.
-trait Finishable: Sized {
-    fn finish(self) -> Result<(), String>;
-}
-
-impl Finishable for TiffWriter<std::fs::File> {
-    fn finish(self) -> Result<(), String> {
-        TiffWriter::finish(self).map_err(|err| err.to_string())
-    }
-}
-
-impl Finishable for ZMapWriter<std::fs::File> {
-    fn finish(self) -> Result<(), String> {
-        ZMapWriter::finish(self).map_err(|err| err.to_string())
-    }
 }
 
 /// Human rendering: one fact per line, unit-testable without capturing

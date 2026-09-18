@@ -74,3 +74,8 @@ pub mod bridge;
 /// Writes a `Window::take_snapshot()` buffer to a PNG file, for
 /// `--screenshot`.
 pub mod screenshot;
+
+/// The window's own fuse worker, running a stack on a background thread
+/// through the same driver `focusforge-cli` uses. `pub` so `tests/job.rs`
+/// reaches its types directly.
+pub mod job;

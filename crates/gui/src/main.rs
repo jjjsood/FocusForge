@@ -51,6 +51,32 @@ struct Args {
     /// Selects the dock's tab row at startup: `images` or `settings`.
     #[arg(long)]
     dock_tab: Option<String>,
+    /// Sets the toolbar's transport to a named run state at startup, for
+    /// inspecting a state no click sequence currently reaches: `idle`,
+    /// `running`, `paused`, `cancelling` or `failed`.
+    #[arg(long)]
+    toolbar_state: Option<String>,
+}
+
+const TOOLBAR_STATES: [&str; 5] = ["idle", "running", "paused", "cancelling", "failed"];
+
+/// Sets the toolbar's and the bottom bar's transport preview together, from
+/// literal values with no controller or job behind them -- for inspecting a
+/// state no click sequence currently reaches.
+fn apply_toolbar_state_preview(app: &AppWindow, state: &str) {
+    app.set_toolbar_run_state(state.into());
+    let (stage_word, step_text, fraction, tone, eta) = match state {
+        "running" => ("Fusing", "step 2 of 3", 0.62, "running", "ETA 1:12"),
+        "paused" => ("Paused", "step 2 of 3", 0.62, "held", "ETA —"),
+        "cancelling" => ("Cancelling", "step 1 of 3", 0.0, "held", "ETA —"),
+        "failed" => ("Failed", "step 1 of 3", 0.28, "failed", "ETA —"),
+        _ => ("", "", 0.0, "held", ""),
+    };
+    app.set_stage_word(stage_word.into());
+    app.set_step_text(step_text.into());
+    app.set_bar_fraction(fraction);
+    app.set_bar_tone(tone.into());
+    app.set_eta_text(eta.into());
 }
 
 /// Parses `"WxH"`; `None` on anything else, including a missing or
@@ -234,6 +260,12 @@ fn main() {
         eprintln!("--dock-tab accepts only \"images\" or \"settings\", got {tab:?}");
         std::process::exit(2);
     }
+    if let Some(state) = &args.toolbar_state
+        && !TOOLBAR_STATES.contains(&state.as_str())
+    {
+        eprintln!("--toolbar-state accepts one of {TOOLBAR_STATES:?}, got {state:?}");
+        std::process::exit(2);
+    }
 
     // Built before `select_backend`: the drop route
     // (`bridge::DropHandler`) installs on the `BackendSelector` chain
@@ -246,11 +278,20 @@ fn main() {
         run_window(sheet, &args)
     } else {
         let app = AppWindow::new().expect("failed to instantiate AppWindow");
-        let focusforge_gui::bridge::Installed { controller, canvas } =
-            bridge::install(&app, controller);
-        let _ = &canvas;
+        let focusforge_gui::bridge::Installed {
+            controller,
+            canvas,
+            job_timer,
+            toast_timer,
+        } = bridge::install(&app, controller);
+        let _ = &job_timer;
+        let _ = &toast_timer;
 
         install_input_table(&controller, &app, &args);
+
+        if let Some(state) = &args.toolbar_state {
+            apply_toolbar_state_preview(&app, state.as_str());
+        }
 
         for path in &args.open {
             // The same `open_paths` the picker and the drop route call: a
@@ -265,6 +306,7 @@ fn main() {
                 eprintln!("--open failed: {err}");
                 std::process::exit(1);
             }
+            bridge::feed_canvas(&app, &controller, &canvas);
         }
 
         if let Some(tab) = &args.dock_tab {

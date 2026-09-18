@@ -6,6 +6,7 @@
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
 import { FFZoomCluster } from "bottom_bar/zoom_cluster.slint";
+import { FFProgressBar } from "../components/ff_progress_bar.slint";
 
 // The gear's own persistently-boxed button -- the "icon button" catalogue
 // entry, whose default state already carries a visible background. Not
@@ -45,6 +46,17 @@ export component FFBottomBar inherits Rectangle {
     callback zoom-out-requested();
     callback zoom-fit-requested();
 
+    // The run's own words, empty when there is none to report -- an empty
+    // `stage-word` falls back to "No job running" below rather than a blank
+    // slot, so an open project with nothing running still reads as such.
+    in property <string> stage-word: "";
+    in property <string> step-text: "";
+    // 0.0..1.0 of the whole job -- passed straight to `FFProgressBar`.
+    in property <float> bar-fraction: 0.0;
+    // "running" | "held" | "failed" -- `FFProgressBar`'s own tone vocabulary.
+    in property <string> bar-tone: "running";
+    in property <string> eta-text: "";
+
     height: ShellGeometry.bottom-bar-height;
     background: Theme.surface-raised;
 
@@ -73,11 +85,49 @@ export component FFBottomBar inherits Rectangle {
         x: status-rule.x + Theme.space-4;
         y: 0px;
         height: parent.height;
-        visible: !root.project-loaded;
-        text: "No project open";
-        color: Theme.text-disabled;
+        text: !root.project-loaded ? "No project open"
+            : root.stage-word == "" ? "No job running" : root.stage-word;
+        color: !root.project-loaded ? Theme.text-disabled
+            : root.bar-tone == "failed" ? Theme.status-failure : Theme.text-primary;
         font-size: Theme.text-body.size;
-        font-weight: Theme.text-body.weight;
+        font-weight: root.project-loaded ? Theme.text-title.weight : Theme.text-body.weight;
+        vertical-alignment: center;
+    }
+
+    step-text := Text {
+        x: ShellGeometry.progress-step-x;
+        y: 0px;
+        height: parent.height;
+        visible: root.project-loaded && root.step-text != "";
+        text: root.step-text;
+        color: Theme.text-secondary;
+        font-size: Theme.text-value.size;
+        font-weight: Theme.text-value.weight;
+        vertical-alignment: center;
+    }
+
+    // Stretches with the window so its right edge stays `Theme.space-4`
+    // before the ETA at every width -- 798px at the 1440px base width,
+    // never a fixed literal.
+    progress-bar := FFProgressBar {
+        x: ShellGeometry.progress-bar-x;
+        y: (parent.height - self.height) / 2;
+        width: parent.width - ShellGeometry.progress-eta-inset - Theme.space-4
+            - ShellGeometry.progress-bar-x;
+        visible: root.project-loaded;
+        fraction: root.bar-fraction;
+        tone: root.bar-tone;
+    }
+
+    eta-text := Text {
+        x: parent.width - ShellGeometry.progress-eta-inset;
+        y: 0px;
+        height: parent.height;
+        visible: root.project-loaded && root.eta-text != "";
+        text: root.eta-text;
+        color: Theme.text-secondary;
+        font-size: Theme.text-value.size;
+        font-weight: Theme.text-value.weight;
         vertical-alignment: center;
     }
 

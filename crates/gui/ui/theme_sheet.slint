@@ -17,6 +17,8 @@ import { FFScrollbar } from "components/ff_scrollbar.slint";
 import { FFResetAll } from "components/ff_reset_all.slint";
 import { FFRowLabel } from "components/ff_row_label.slint";
 import { FFRowText } from "components/ff_row_text.slint";
+import { FFButton } from "components/ff_button.slint";
+import { FFProgressBar } from "components/ff_progress_bar.slint";
 
 component ColourSwatch inherits Rectangle {
     in property <color> swatch;
@@ -113,7 +115,7 @@ component IconSizeSample inherits Rectangle {
 export component ThemeSheet inherits Window {
     title: "FocusForge -- token sheet";
     preferred-width: 940px;
-    preferred-height: 1900px;
+    preferred-height: 2050px;
     background: Theme.surface-base;
     default-font-family: Theme.font-family;
 
@@ -290,6 +292,27 @@ export component ThemeSheet inherits Window {
             FFScrollbar { height: 80px; content-height: 400px; viewport-height: 80px; offset: 40px; }
             FFResetAll { width: 220px; enabled: true; }
             FFResetAll { width: 220px; enabled: false; }
+        }
+
+        GroupHeading { text: "Toolbar: transport button"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            FFButton { width: 116px; compact: true; kind: "primary"; glyph: "▶"; text: "Fuse stack"; }
+            FFButton { width: 116px; compact: true; kind: "default"; glyph: "⏸"; text: "Pause"; }
+            FFButton { width: 116px; compact: true; kind: "default"; glyph: "▶"; text: "Resume"; }
+            FFButton { width: 116px; compact: true; kind: "default"; glyph: "☐"; text: "Cancel"; }
+            FFButton { width: 116px; compact: true; kind: "quiet"; glyph: "☐"; text: "Cancelling…"; enabled: false; }
+            FFButton { width: 116px; compact: true; kind: "primary"; glyph: "↻"; text: "Retry"; }
+            FFButton { width: 116px; compact: true; kind: "default"; text: "Fuse stack"; enabled: false; }
+        }
+
+        GroupHeading { text: "Bottom bar: progress track"; }
+        VerticalLayout {
+            spacing: Theme.space-2;
+            FFProgressBar { width: 400px; tone: "running"; fraction: 0.62; }
+            FFProgressBar { width: 400px; tone: "held"; fraction: 0.62; }
+            FFProgressBar { width: 400px; tone: "failed"; fraction: 0.24; }
+            FFProgressBar { width: 400px; tone: "running"; fraction: 0.0; }
         }
     }
 }

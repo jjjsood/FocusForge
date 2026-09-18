@@ -75,6 +75,103 @@ pub use manifest::{
 pub use review::ReviewMetrics;
 pub use seal::{SealRequest, SealedProject, seal, seal_at};
 
+/// Decompresses `which` into an uncompressed TIFF (the composite) or Z-Map
+/// file at `path`: writes a `.partial` sibling first and renames it onto
+/// `path` only once [`Project::read_plane_into`] has verified the blob's
+/// hash, so a tampered blob leaves nothing behind rather than a corrupt
+/// image.
+pub fn materialize_plane(
+    project: &mut Project,
+    which: Plane,
+    path: &Path,
+) -> Result<(), ProjectError> {
+    let plane_ref = project.plane(which).clone();
+    let partial = partial_path(path);
+    match which {
+        Plane::Composite => {
+            let writer = crate::io::TiffWriter::create(
+                &partial,
+                crate::io::TiffSpec {
+                    width: plane_ref.width,
+                    height: plane_ref.height,
+                    samples_per_pixel: plane_ref.samples_per_pixel,
+                    description: Some(plane_ref.description.clone()),
+                },
+            )
+            .map_err(|err| ProjectError::container(&partial, err))?;
+            stream_plane(project, which, &partial, path, writer)
+        }
+        Plane::ZMap => {
+            let info = crate::zmap::ZMapInfo::new(
+                plane_ref.width,
+                plane_ref.height,
+                plane_ref.frame_count,
+            )
+            .map_err(|err| ProjectError::container(&partial, err))?;
+            let writer = crate::zmap::ZMapWriter::create(&partial, info)
+                .map_err(|err| ProjectError::container(&partial, err))?;
+            stream_plane(project, which, &partial, path, writer)
+        }
+    }
+}
+
+/// The `finish()`/`write_tile()` half of both writers [`materialize_plane`]
+/// drives, so the streaming loop below has one shape rather than two
+/// near-copies.
+trait PlaneWriter {
+    fn write_tile(&mut self, rect: crate::io::Rect, samples: &[u16]) -> Result<(), String>;
+    fn finish(self) -> Result<(), String>;
+}
+
+impl PlaneWriter for crate::io::TiffWriter<std::fs::File> {
+    fn write_tile(&mut self, rect: crate::io::Rect, samples: &[u16]) -> Result<(), String> {
+        crate::io::TiffWriter::write_tile(self, rect, samples).map_err(|err| err.to_string())
+    }
+    fn finish(self) -> Result<(), String> {
+        crate::io::TiffWriter::finish(self).map_err(|err| err.to_string())
+    }
+}
+
+impl PlaneWriter for crate::zmap::ZMapWriter<std::fs::File> {
+    fn write_tile(&mut self, rect: crate::io::Rect, samples: &[u16]) -> Result<(), String> {
+        crate::zmap::ZMapWriter::write_tile(self, rect, samples).map_err(|err| err.to_string())
+    }
+    fn finish(self) -> Result<(), String> {
+        crate::zmap::ZMapWriter::finish(self).map_err(|err| err.to_string())
+    }
+}
+
+fn stream_plane<W: PlaneWriter>(
+    project: &mut Project,
+    which: Plane,
+    partial: &Path,
+    final_path: &Path,
+    mut writer: W,
+) -> Result<(), ProjectError> {
+    let mut failure: Option<String> = None;
+    let read = project.read_plane_into(which, &mut |band, rect| {
+        if failure.is_some() {
+            return;
+        }
+        if let Err(err) = writer.write_tile(rect, band) {
+            failure = Some(err);
+        }
+    });
+    let outcome = read.and_then(|()| match failure {
+        Some(err) => Err(ProjectError::container(final_path, err)),
+        None => writer
+            .finish()
+            .map_err(|err| ProjectError::container(final_path, err)),
+    });
+    let outcome = outcome.and_then(|()| {
+        std::fs::rename(partial, final_path).map_err(|err| ProjectError::io(final_path, err))
+    });
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(partial);
+    }
+    outcome
+}
+
 use crate::params::{ParamDesc, ParamKind, ParamValue};
 use crate::tile::Rect;
 

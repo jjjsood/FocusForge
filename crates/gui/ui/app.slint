@@ -19,7 +19,7 @@ export { SettingsRow, SectionHeadView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFSettingsModal, InputRow } from "shell/settings_modal.slint";
 export { InputRow }
-import { FFGroupingQuestion, FFRefusalDialog, FFSkippedNotice } from "shell/dialogs.slint";
+import { FFGroupingQuestion, FFRefusalDialog, FFSkippedNotice, FFToast } from "shell/dialogs.slint";
 
 export component AppWindow inherits Window {
     // Every callback forwards one-for-one into `AppController` via
@@ -31,6 +31,11 @@ export component AppWindow inherits Window {
     callback mode-selected(string);
     callback dock-tab-selected(string);
     callback checkpoint-export-requested();
+    // The run's own transport, forwarded one-for-one from `FFToolbar` below.
+    callback fuse-requested();
+    callback pause-or-resume-requested();
+    callback cancel-requested();
+    callback retry-requested();
 
     // Every piece of state the shell shows is an `in` property set from
     // Rust, never computed here.
@@ -109,12 +114,28 @@ export component AppWindow inherits Window {
         tabs-region-width-changed(w) => { root.tab-region-width-changed(w); }
     }
 
+    // The transport's current run state: "idle" | "running" | "paused" |
+    // "cancelling" | "failed".
+    in property <string> toolbar-run-state: "idle";
+
+    // Hidden with no project open (or "+" selected over background tabs) --
+    // there is no run to transport. `canvas-ground` below grows into its row.
     toolbar := FFToolbar {
         x: 0px;
         y: ShellGeometry.strip-height;
         width: root.width - ShellGeometry.dock-width;
-        height: ShellGeometry.toolbar-height;
+        height: root.show-empty-state ? 0px : ShellGeometry.toolbar-height;
+        visible: !root.show-empty-state;
+        run-state: root.toolbar-run-state;
+
+        fuse-requested => { root.fuse-requested(); }
+        pause-or-resume-requested => { root.pause-or-resume-requested(); }
+        cancel-requested => { root.cancel-requested(); }
+        retry-requested => { root.retry-requested(); }
     }
+
+    property <length> toolbar-visible-height: root.show-empty-state
+        ? 0px : ShellGeometry.toolbar-height;
 
     // Both images are `in` properties set from Rust
     // (`crates/gui/src/gpu_canvas.rs`) once a project is loaded -- the wgpu
@@ -162,9 +183,9 @@ export component AppWindow inherits Window {
 
     canvas-ground := FocusScope {
         x: 0px;
-        y: ShellGeometry.strip-height + ShellGeometry.toolbar-height;
+        y: ShellGeometry.strip-height + root.toolbar-visible-height;
         width: root.width - ShellGeometry.dock-width;
-        height: root.height - ShellGeometry.strip-height - ShellGeometry.toolbar-height
+        height: root.height - ShellGeometry.strip-height - root.toolbar-visible-height
             - ShellGeometry.bottom-bar-height;
 
         // `reject` so the chrome accelerators still reach the parent;
@@ -274,6 +295,14 @@ export component AppWindow inherits Window {
     callback zoom-out-requested();
     callback zoom-fit-requested();
 
+    // The run's own words for the bottom bar's progress track -- pushed from
+    // Rust alongside the toolbar's `toolbar-run-state`, never computed here.
+    in property <string> stage-word: "";
+    in property <string> step-text: "";
+    in property <float> bar-fraction: 0.0;
+    in property <string> bar-tone: "running";
+    in property <string> eta-text: "";
+
     bottom-bar := FFBottomBar {
         x: 0px;
         y: root.height - ShellGeometry.bottom-bar-height;
@@ -281,6 +310,11 @@ export component AppWindow inherits Window {
         height: ShellGeometry.bottom-bar-height;
         zoom-readout: root.zoom-readout;
         project-loaded: root.project-loaded;
+        stage-word: root.stage-word;
+        step-text: root.step-text;
+        bar-fraction: root.bar-fraction;
+        bar-tone: root.bar-tone;
+        eta-text: root.eta-text;
 
         settings-requested => { root.settings-open-requested(); }
         zoom-in-requested => { root.zoom-in-requested(); }
@@ -313,6 +347,14 @@ export component AppWindow inherits Window {
     in property <string> skipped-notice: "";
     callback skipped-notice-dismissed();
 
+    // The failed run's own notice, over the canvas rather than in the
+    // bottom bar -- a job failure and a "some subfolders were skipped"
+    // notice are different messages and never share a slot. Opens on its
+    // own the moment a run fails; there is no button that reveals it.
+    in property <bool> job-toast-open: false;
+    in property <string> job-toast-message: "";
+    callback job-toast-dismissed();
+
     grouping-question := FFGroupingQuestion {
         x: 0px;
         y: 0px;
@@ -341,6 +383,14 @@ export component AppWindow inherits Window {
         width: root.width;
         notice-text: root.skipped-notice;
         dismissed => { root.skipped-notice-dismissed(); }
+    }
+
+    job-toast := FFToast {
+        x: canvas-ground.x + Theme.space-3;
+        y: canvas-ground.y + Theme.space-3;
+        toast-open: root.job-toast-open;
+        message: root.job-toast-message;
+        dismissed => { root.job-toast-dismissed(); }
     }
 
     // `no-frame: true` above means the compositor draws no OS chrome, so

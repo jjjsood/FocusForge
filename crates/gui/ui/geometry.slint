@@ -89,4 +89,15 @@ export global ShellGeometry {
     // against them, rather than assuming the primitive's own literal.
     out property <length> scrollbar-width: 6px; // `FFScrollbar`'s own width.
     out property <length> field-height: 28px; // `FFField`'s own height.
+
+    // The toolbar's transport buttons and the bottom bar's progress track,
+    // measured at 1440px width.
+    out property <length> toolbar-button-height: 26px;
+    out property <length> toolbar-button-width: 116px;
+    out property <length> toolbar-button-gap: 10px;
+    out property <length> progress-step-x: 166px;
+    out property <length> progress-bar-x: 250px;
+    out property <length> progress-bar-height: 4px;
+    // The ETA's left edge, measured from the bottom bar's own right edge.
+    out property <length> progress-eta-inset: 376px;
 }
