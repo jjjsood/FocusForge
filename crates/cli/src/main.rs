@@ -357,10 +357,13 @@ fn main() -> ExitCode {
         return ExitCode::from(code as u8);
     }
     let cli = Cli::parse();
+    let data_dir = focusforge_diagnostics::data_dir_from_env();
     let _diagnostics = focusforge_diagnostics::init(&focusforge_diagnostics::Options {
-        data_dir: focusforge_diagnostics::data_dir_from_env(),
+        data_dir: data_dir.clone(),
         verbosity: verbosity(&cli),
     });
+    // Ahead of the job span, so the notice carries no subcommand of its own.
+    diagnostics::announce_crashes(data_dir.as_deref());
     // The earliest point a forced crash is observable: `init` is what
     // installs the hook that reports it.
     focusforge_diagnostics::force_crash("startup");

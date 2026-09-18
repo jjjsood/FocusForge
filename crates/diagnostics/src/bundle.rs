@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
-use crate::crash::{now_seconds, rfc3339};
+use crate::crash::{crash_dir, now_seconds, read_dir_sorted, rfc3339};
 
 /// What the home directory and the user name are replaced with.
 const HOME_PLACEHOLDER: &str = "[home]";
@@ -294,7 +294,7 @@ fn collect(options: &Options) -> (Vec<Entry>, Vec<String>) {
         }
     }
 
-    for (path, name) in read_dir_sorted(&data_dir.join("crashes")) {
+    for (path, name) in read_dir_sorted(&crash_dir(data_dir)) {
         let entry_name = format!("crashes/{name}");
         if name.ends_with(".json") {
             entries.push(Entry {
@@ -348,24 +348,6 @@ fn crash_kind(path: &Path) -> EntryKind {
     } else {
         EntryKind::PanicReport
     }
-}
-
-/// Every readable file in `dir` as a (path, file name) pair, by name. A
-/// directory that cannot be read yields nothing.
-fn read_dir_sorted(dir: &Path) -> Vec<(PathBuf, String)> {
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<(PathBuf, String)> = read
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .filter_map(|entry| {
-            let name = entry.file_name().to_str()?.to_string();
-            Some((entry.path(), name))
-        })
-        .collect();
-    files.sort_by(|a, b| a.1.cmp(&b.1));
-    files
 }
 
 /// The host's memory figures, core count and operating system. The host

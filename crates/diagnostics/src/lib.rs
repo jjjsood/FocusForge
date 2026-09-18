@@ -7,6 +7,7 @@
 
 pub mod bundle;
 mod crash;
+pub mod crash_notice;
 mod native;
 mod ring;
 mod rotating;
@@ -280,7 +281,7 @@ pub fn init(options: &Options) -> Diagnostics {
     let version = env!("CARGO_PKG_VERSION");
     let mut guard = None;
     if let Some(data_dir) = options.data_dir.as_deref() {
-        let crash_dir = data_dir.join("crashes");
+        let crash_dir = crash::crash_dir(data_dir);
         crash::install_hook(crash_dir.clone(), ring, binary.clone());
         guard = match native::attach(&crash_dir, &binary, version) {
             Ok(guard) => guard,

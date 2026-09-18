@@ -29,6 +29,29 @@ pub fn last_report() -> Option<PathBuf> {
         .clone()
 }
 
+/// Where a data directory keeps its crash evidence.
+pub(crate) fn crash_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("crashes")
+}
+
+/// Every readable file in `dir` as a (path, file name) pair, by name. A
+/// directory that cannot be read yields nothing.
+pub(crate) fn read_dir_sorted(dir: &Path) -> Vec<(PathBuf, String)> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(PathBuf, String)> = read
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            Some((entry.path(), name))
+        })
+        .collect();
+    files.sort_by(|a, b| a.1.cmp(&b.1));
+    files
+}
+
 /// Installs a panic hook that writes a crash report into `crash_dir` and
 /// then runs whatever hook was installed before, so the default panic text
 /// still reaches stderr and a test harness keeps its own behaviour.
