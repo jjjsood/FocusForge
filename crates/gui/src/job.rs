@@ -207,12 +207,22 @@ impl Step {
     }
 }
 
+/// Which [`Step`] `progress` is on: `Align` while the engine reports that
+/// stage, `Write` once every unit of the fuse stage is done (the seal, which
+/// the engine reports as no stage of its own -- `JobStage` has only
+/// `Align`/`Fuse`), `Fuse` otherwise -- including no progress at all yet.
+fn progress_step(progress: Option<&JobProgress>) -> Step {
+    match progress {
+        Some(p) if p.stage == JobStage::Align => Step::Align,
+        Some(p) if p.unit_total > 0 && p.units_done >= p.unit_total => Step::Write,
+        _ => Step::Fuse,
+    }
+}
+
 /// The stage word the bar shows for `state`/`progress` -- `Aligning`,
 /// `Fusing`, `Writing`, `Paused`, `Cancelling`, `Failed` or a completed run's
 /// own `fused HH:MM`. `progress` picks between `Aligning`/`Fusing`/`Writing`
-/// while running: `Writing` covers the seal, which the engine reports as no
-/// stage of its own (`JobStage` has only `Align`/`Fuse`) -- a completed fuse
-/// (`units_done == unit_total`, non-zero) reads as the write/seal step.
+/// while running, via [`progress_step`].
 pub fn stage_word(state: &RunState, progress: Option<&JobProgress>) -> String {
     match state {
         RunState::Paused => "Paused".to_string(),
@@ -220,10 +230,10 @@ pub fn stage_word(state: &RunState, progress: Option<&JobProgress>) -> String {
         RunState::Failed(_) => "Failed".to_string(),
         RunState::Idle => String::new(),
         RunState::Fused { at } => format!("fused {at}"),
-        RunState::Running => match progress {
-            Some(p) if p.stage == JobStage::Align => "Aligning".to_string(),
-            Some(p) if p.unit_total > 0 && p.units_done >= p.unit_total => "Writing".to_string(),
-            _ => "Fusing".to_string(),
+        RunState::Running => match progress_step(progress) {
+            Step::Align => "Aligning".to_string(),
+            Step::Fuse => "Fusing".to_string(),
+            Step::Write => "Writing".to_string(),
         },
     }
 }
@@ -260,19 +270,16 @@ pub fn is_live(state: &RunState) -> bool {
     )
 }
 
-/// The step this run is on, derived the same way [`stage_word`] is -- never
-/// fabricated from a state the engine did not report.
+/// The step this run is on, derived through the same [`progress_step`]
+/// classification [`stage_word`] uses -- never fabricated from a state the
+/// engine did not report.
 pub fn current_step(state: &RunState, progress: Option<&JobProgress>) -> Option<Step> {
     match state {
         RunState::Idle => None,
         RunState::Paused | RunState::Cancelling | RunState::Failed(_) | RunState::Fused { .. } => {
             None
         }
-        RunState::Running => match progress {
-            Some(p) if p.stage == JobStage::Align => Some(Step::Align),
-            Some(p) if p.unit_total > 0 && p.units_done >= p.unit_total => Some(Step::Write),
-            _ => Some(Step::Fuse),
-        },
+        RunState::Running => Some(progress_step(progress)),
     }
 }
 
