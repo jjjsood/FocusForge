@@ -17,6 +17,35 @@ focusforge-cli <COMMAND>
 | [`align`](#align) | computes and reports each frame's transform, without fusing |
 | [`review`](#review) | reports one record per project found under a directory or a run's output |
 | [`cache`](#cache) | manages the stage cache under `.scratch/stage-cache/` |
+| [`diagnostics`](#diagnostics) | packages logs and crash evidence into one redacted ZIP |
+
+## Global options
+
+`-v` and `-q` apply to every command and control how much a run says on
+stderr:
+
+```
+focusforge-cli [-v]... [-q] <COMMAND>
+```
+
+- Repeat `-v` for more detail: once for informational messages, twice for
+  debug detail. Omit it for warnings and errors only.
+- `-q` restricts stderr to errors only. `-q` wins when both are given.
+
+Every run also writes a JSON Lines log (one JSON object per line) to a log
+file in the platform's per-user data directory, independently of `-v`/`-q`.
+The file rotates once it reaches 8 MiB, keeping up to 5 rotated files.
+
+The log records every warning and refusal a run prints on stderr, whatever
+`-v`/`-q` say, and never repeats a line stderr already carried. Each entry
+also names the context it belongs to: the command, the stack, the stage
+(`setup`, `align`, `fuse`, `warp_write`, `finalize`) and, for work that runs
+per tile, the tile.
+
+If an earlier run left crash evidence that hasn't been packaged yet, the
+next run prints a one-line notice before doing anything else — see
+[`diagnostics`](#diagnostics) and
+[`guide/diagnostics.md`](../guide/diagnostics.md).
 
 ## `info`
 
@@ -707,3 +736,28 @@ removed 1 stage cache entry
 ```
 
 `--json` emits `{"format": 1, "removed": <count>}`.
+
+## `diagnostics`
+
+```
+focusforge-cli diagnostics [-o FILE] [--include-minidumps] [--force]
+```
+
+Packages this installation's log files, any crash reports, a system
+summary, the graphics adapter record, the configuration a new run would
+resolve (with `Provenance` for each value), and the version and commit into
+one ZIP, printing the file list before writing it. Every text entry has the
+home directory and the user name redacted out; no image data is ever
+included, and nothing is sent anywhere. See
+[`guide/diagnostics.md`](../guide/diagnostics.md) for the log format, what a
+crash leaves behind, and the notice printed on the next start after one.
+
+- `-o FILE` — where to write the ZIP. Omit for a dated name in the current
+  directory.
+- `--include-minidumps` — include the minidump binaries alongside their
+  JSON metadata. They cannot be redacted, and each one is marked so in the
+  printed file list.
+- `--force` — overwrite `FILE` if it already exists.
+
+Exits non-zero if the output path exists without `--force`, or if the
+bundle could not be written.

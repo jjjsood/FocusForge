@@ -5,8 +5,6 @@
 //! explicit skip line and passing rather than reddening
 //! `cargo test --workspace` on a headless gate host.
 
-use std::process::Command;
-
 mod common;
 
 /// `true` when this host can plausibly open a window.
@@ -29,8 +27,7 @@ fn screenshot_is_not_uniform() {
         std::fs::create_dir_all(parent).unwrap();
     }
 
-    let bin = env!("CARGO_BIN_EXE_focusforge-gui");
-    let status = Command::new(bin)
+    let status = common::gui_bin("window")
         .arg("--exit-after")
         .arg("3000")
         .arg("--screenshot")

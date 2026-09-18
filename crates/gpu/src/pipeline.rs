@@ -111,6 +111,7 @@ pub(crate) fn run_pass(
     if invocation_count == 0 {
         return;
     }
+    crate::errors::record_dispatch(label);
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(label),
         layout: &pipeline.bind_group_layout,

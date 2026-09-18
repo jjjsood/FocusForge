@@ -456,6 +456,7 @@ pub fn align_stack_with(
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(workers)
                     .thread_name(|i| format!("focusforge-align-{i}"))
+                    .panic_handler(crate::pool::log_worker_panic)
                     .build()
                     .map_err(|source| AlgorithmError::Failed {
                         algorithm: "align_stack".to_string(),
@@ -479,6 +480,12 @@ pub fn align_stack_with(
                 // malformed-params (refused before this loop) and I/O
                 // failures, not the common case; divergence is an `Ok`
                 // outcome, never an `Err`.
+                // Span context does not cross onto a pool thread by itself:
+                // the caller's span is captured here and each frame span is
+                // parented to it explicitly, so an event raised while one
+                // frame registers still names the run it belongs to.
+                let parent = tracing::Span::current();
+
                 let outcomes: Vec<Option<Result<FrameAlignment, AlgorithmError>>> =
                     pool.install(|| {
                         (0..stack.frame_count)
@@ -487,6 +494,9 @@ pub fn align_stack_with(
                                 if i == reference {
                                     return None;
                                 }
+                                let frame_span =
+                                    tracing::debug_span!(parent: &parent, "frame", index = i);
+                                let _frame = frame_span.enter();
                                 let cur = live.fetch_add(1, Ordering::SeqCst) + 1;
                                 peak.fetch_max(cur, Ordering::SeqCst);
                                 let result = algorithm

@@ -129,16 +129,16 @@ mod tests {
 
     #[test]
     fn refuses_a_missing_composite_by_name() {
-        let dir = std::env::temp_dir().join("focusforge-project-stub-test-missing-composite");
+        let guard = tempfile::TempDir::with_prefix("focusforge-project-stub-").unwrap();
+        let dir = guard.path();
         std::fs::create_dir_all(dir.join("golden")).unwrap();
         std::fs::write(dir.join("golden").join("laplacian-zmap.tif"), b"").unwrap();
 
-        match ProjectStub::open(&dir) {
+        match ProjectStub::open(dir) {
             Err(ProjectStubError::MissingComposite { path }) => {
                 assert!(path.ends_with("golden/laplacian.tif"));
             }
             other => panic!("expected MissingComposite, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

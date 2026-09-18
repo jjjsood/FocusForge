@@ -8,9 +8,10 @@
 mod common;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use focusforge_core::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput, TileReader};
+use focusforge_core::align::WarpingReader;
 use focusforge_core::align::warp::WarpedTile;
 use focusforge_core::align::{AlignError, Transform};
 use focusforge_core::fuse::laplacian::Laplacian;
@@ -377,5 +378,214 @@ fn the_non_noop_refusal_also_fires_on_the_controlled_entry_point() {
     assert!(
         matches!(err, TileError::PixelSupplyingConsumerNeedsNoopPreprocess),
         "expected PixelSupplyingConsumerNeedsNoopPreprocess, got {err:?}"
+    );
+}
+
+/// A backend that serves exactly two tiles and then reports its device
+/// lost: the third `warp_fuse_tile` call, and every one after it, sets the
+/// lost flag and fails. Its own arithmetic is the host's -- a warp through
+/// [`WarpingReader`] then [`Laplacian::fuse`] -- so a composite mixing
+/// backend tiles with fallback tiles equals a pure host run byte for byte.
+struct LosingBackend {
+    dispatches: AtomicUsize,
+    lost: AtomicBool,
+}
+
+const HEALTHY_TILES: usize = 2;
+
+impl TileBackend for LosingBackend {
+    fn info(&self) -> BackendInfo {
+        BackendInfo {
+            name: "test-losing".into(),
+            backend: "test-losing".into(),
+            driver: "test-losing".into(),
+            driver_info: "test-losing".into(),
+        }
+    }
+
+    fn self_check(
+        &self,
+        _reader: &dyn TileReader,
+        _frame: usize,
+        _rect: Rect,
+        _samples_per_pixel: u32,
+        _gain: f32,
+    ) -> Result<Tile, AlgorithmError> {
+        unimplemented!("not exercised by this file's tests")
+    }
+
+    fn fuse_tile(
+        &self,
+        _reader: &dyn TileReader,
+        _frame_count: usize,
+        _rect: Rect,
+        _samples_per_pixel: u32,
+        _levels: u32,
+    ) -> Result<TileOutput, AlgorithmError> {
+        unimplemented!("not exercised by this file's tests")
+    }
+
+    fn warp_tile(
+        &self,
+        _reader: &dyn TileReader,
+        _frame_index: usize,
+        _frame: (u32, u32),
+        _samples_per_pixel: u32,
+        _dst: Rect,
+        _transform: &Transform,
+    ) -> Result<WarpedTile, AlignError> {
+        unimplemented!("not exercised by this file's tests")
+    }
+
+    fn device_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+
+    fn warp_fuse_tile(
+        &self,
+        reader: &dyn TileReader,
+        frame: (u32, u32),
+        transforms: &[Transform],
+        rect: Rect,
+        samples_per_pixel: u32,
+        levels: u32,
+    ) -> Result<TileOutput, AlgorithmError> {
+        if self.dispatches.fetch_add(1, Ordering::SeqCst) >= HEALTHY_TILES {
+            self.lost.store(true, Ordering::SeqCst);
+            return Err(AlgorithmError::Failed {
+                algorithm: "laplacian".to_string(),
+                detail: "device lost".to_string(),
+            });
+        }
+        let warping = WarpingReader::new(reader, frame, samples_per_pixel, transforms.to_vec());
+        let mut tiles = Vec::with_capacity(transforms.len());
+        for i in 0..transforms.len() {
+            let mut samples =
+                vec![0u16; rect.width as usize * rect.height as usize * samples_per_pixel as usize];
+            warping.read_tile_into(i, rect, &mut samples)?;
+            tiles.push(Tile {
+                rect,
+                samples_per_pixel,
+                samples,
+            });
+        }
+        let ctx = TileCtx::new(rect, &tiles);
+        let mut cfg = ParamValues::new();
+        cfg.insert("levels".to_string(), ParamValue::Int(levels as i64));
+        Laplacian.fuse(&ctx, &cfg)
+    }
+}
+
+/// A mild rotation-plus-scale for every frame but the reference, so the
+/// fallback goes through the warp path rather than `WarpingReader`'s
+/// identity short-circuit.
+fn non_identity_transforms(frame_count: usize) -> Vec<Transform> {
+    let t = Transform::similarity(1.005, 0.0075, 0.4, -0.25);
+    (0..frame_count)
+        .map(|i| if i == 0 { Transform::identity() } else { t })
+        .collect()
+}
+
+/// A device lost part-way through a run finishes that run on the host, with
+/// a composite equal byte for byte to one produced entirely on the host,
+/// and reports how many tiles it read frames for.
+#[test]
+fn device_loss_finishes_the_run_on_the_host() {
+    let stack = open_stack();
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let frame_count = stack.len();
+    let stack_ctx = StackContext::new(frame_count, width, height, spp);
+    let transforms = non_identity_transforms(frame_count);
+
+    // Three pyramid levels, not the five the tests above use: five would
+    // need a tile larger than the fixture is wide, and a tile size small
+    // enough to plan several tiles over a 512 px fixture is what puts both
+    // the backend path and the host path in one run.
+    const LEVELS: u32 = 3;
+    let mut values = ParamValues::new();
+    values.insert("levels".to_string(), ParamValue::Int(LEVELS as i64));
+
+    let mut options = TileSchedulerOptions::new(scratch_base("device_loss"));
+    options.tile_size = 200;
+    options.levels = LEVELS;
+
+    let geometry = FusionGeometry {
+        width,
+        height,
+        samples_per_pixel: spp,
+        frame_count: frame_count as u32,
+        crop: None,
+        description: None,
+    };
+
+    let host_path =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("backend_consumer_device_loss_host.tif");
+    let fallback_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("backend_consumer_device_loss_fallback.tif");
+
+    // The whole run on the host, through a warping reader carrying the same
+    // transforms -- the oracle.
+    let planned = {
+        let warping = WarpingReader::new(&stack, (width, height), spp, transforms.clone());
+        let scheduler =
+            TileScheduler::new(&warping, stack_ctx, spp, &options).expect("scheduler must build");
+        let planned = scheduler.plan().len();
+        let consumer = FusionConsumer::create(
+            &Laplacian,
+            values.clone(),
+            &host_path,
+            None,
+            geometry.clone(),
+        )
+        .expect("create must succeed");
+        scheduler
+            .run(&focusforge_core::tile::NoopPreprocess, &consumer)
+            .expect("run must succeed");
+        consumer.finish().expect("finish must succeed");
+        planned
+    };
+    assert!(
+        planned > HEALTHY_TILES,
+        "the plan must hold more tiles than the backend serves, got {planned}"
+    );
+
+    let fallback_tiles = {
+        let scheduler =
+            TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
+        let sink =
+            FusionConsumer::create(&Laplacian, values.clone(), &fallback_path, None, geometry)
+                .expect("create must succeed");
+        let backend = LosingBackend {
+            dispatches: AtomicUsize::new(0),
+            lost: AtomicBool::new(false),
+        };
+        let consumer = BackendFusionConsumer::new(
+            &backend,
+            &stack,
+            (width, height),
+            transforms.clone(),
+            spp,
+            LEVELS,
+            &sink,
+        );
+        scheduler
+            .run(&focusforge_core::tile::NoopPreprocess, &consumer)
+            .expect("a lost device must not fail the run");
+        let fallback_tiles = consumer.fallback_tiles();
+        drop(consumer);
+        sink.finish().expect("finish must succeed");
+        fallback_tiles
+    };
+
+    assert_eq!(
+        fallback_tiles,
+        planned - HEALTHY_TILES,
+        "every tile past the two the backend served must have been read on the host"
+    );
+    assert_eq!(
+        std::fs::read(&host_path).expect("read host composite"),
+        std::fs::read(&fallback_path).expect("read fallback composite"),
+        "a run finished on the host after a device loss must equal a pure host run"
     );
 }

@@ -12,12 +12,14 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use focusforge_core::io::{ByteOrder, TiffError, TiffHeader, frame_paths};
+use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
 mod algorithms;
 mod align;
 mod bytes;
 mod cache;
+mod diagnostics;
 mod export;
 #[cfg(feature = "gpu")]
 mod gpu;
@@ -58,6 +60,22 @@ fn resolve_backend(_no_gpu: bool, _max_vram: Option<u64>) -> stack::BackendChoic
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Increase log detail (repeatable).
+    #[arg(short = 'v', action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+    /// Log errors only.
+    #[arg(short = 'q', global = true)]
+    quiet: bool,
+}
+
+/// The `-v`/`-q` count as [`focusforge_diagnostics::Options::verbosity`]:
+/// `-1` when `-q` is set (which wins over any `-v`), else the `-v` count.
+fn verbosity(cli: &Cli) -> i8 {
+    if cli.quiet {
+        -1
+    } else {
+        i8::try_from(cli.verbose).unwrap_or(i8::MAX)
+    }
 }
 
 #[derive(Subcommand)]
@@ -299,10 +317,59 @@ enum Command {
         #[command(subcommand)]
         action: cache::CacheAction,
     },
+    /// Package this installation's logs, crash reports, system summary,
+    /// graphics adapter record, effective configuration and version into
+    /// one ZIP, listing every file before writing it. The home directory
+    /// and the user name are redacted out of every text entry, image data
+    /// is never included, and nothing is sent anywhere.
+    Diagnostics {
+        /// Where to write the ZIP. Omit for a dated name in the current
+        /// directory.
+        #[arg(short = 'o', long = "output", value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Include the minidump binaries. They cannot be redacted.
+        #[arg(long = "include-minidumps")]
+        include_minidumps: bool,
+        /// Overwrite the output path when it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+/// The subcommand's own name, as the job span carries it in the log.
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Info { .. } => "info",
+        Command::Algorithms { .. } => "algorithms",
+        Command::Stack { .. } => "stack",
+        Command::Export { .. } => "export",
+        Command::Align { .. } => "align",
+        Command::Review { .. } => "review",
+        Command::Cache { .. } => "cache",
+        Command::Diagnostics { .. } => "diagnostics",
+    }
 }
 
 fn main() -> ExitCode {
+    // Ahead of every parser: a re-spawned monitor process carries no
+    // arguments of its own and never reaches the application's own work.
+    if let Some(code) = focusforge_diagnostics::run_monitor() {
+        return ExitCode::from(code as u8);
+    }
     let cli = Cli::parse();
+    let data_dir = focusforge_diagnostics::data_dir_from_env();
+    let _diagnostics = focusforge_diagnostics::init(&focusforge_diagnostics::Options {
+        data_dir: data_dir.clone(),
+        verbosity: verbosity(&cli),
+    });
+    // Ahead of the job span, so the notice carries no subcommand of its own.
+    diagnostics::announce_crashes(data_dir.as_deref());
+    // The earliest point a forced crash is observable: `init` is what
+    // installs the hook that reports it.
+    focusforge_diagnostics::force_crash("startup");
+    // Entered for the whole invocation, so every event a run raises names
+    // the command it came from.
+    let _job = tracing::debug_span!("job", command = command_name(&cli.command)).entered();
     match cli.command {
         Command::Info { path, json } => info(&path, json),
         Command::Algorithms { id, json, set } => algorithms::run(id.as_deref(), json, &set),
@@ -415,6 +482,11 @@ fn main() -> ExitCode {
         }
         Command::Review { dir, json } => review::run(&dir, json),
         Command::Cache { action } => cache::run(action),
+        Command::Diagnostics {
+            output,
+            include_minidumps,
+            force,
+        } => diagnostics::run(output.as_deref(), include_minidumps, force),
     }
 }
 
@@ -750,5 +822,6 @@ fn print_human(report: &InfoReport) {
 
 fn fail(message: impl std::fmt::Display) -> ExitCode {
     eprintln!("error: {message}");
+    tracing::error!(target: MIRRORED_OUTPUT_TARGET, "error: {message}");
     ExitCode::FAILURE
 }

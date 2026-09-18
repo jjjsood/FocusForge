@@ -32,6 +32,7 @@ use focusforge_core::project::{self, Metrics, PROJECT_EXTENSION};
 use focusforge_core::registry;
 use focusforge_core::tile::{NoopPreprocess, TileConsumer, TileScheduler, TileSchedulerOptions};
 use focusforge_core::timing::{Stage, StageTimer};
+use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
 use crate::align::{AlignOptions, AlignmentEntry, resolve_align_algo};
@@ -474,7 +475,33 @@ pub fn run(
         }
         let group_output = project_path(output, group);
         let identity = identities[i].clone();
-        let result = run_group(&setup, group, &group_output, identity.clone());
+        let group_start = Instant::now();
+        // A panic ends this group alone: the rest of the batch still runs,
+        // and the group is recorded exactly as any other refusal is. The
+        // unwinding run's own status sink never emitted, so the verdict
+        // needs a fresh one.
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_group(&setup, group, &group_output, identity.clone())
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                let status = StatusSink::new(preset_opts.status, identity.clone(), "stack");
+                let result = self::failed(
+                    &status,
+                    group_start,
+                    focusforge_diagnostics::panic_payload(&*payload),
+                );
+                if let Some(report) = focusforge_diagnostics::last_crash_report() {
+                    eprintln!("crash report: {}", report.display());
+                    tracing::error!(
+                        target: MIRRORED_OUTPUT_TARGET,
+                        "crash report: {}",
+                        report.display()
+                    );
+                }
+                result
+            }
+        };
         manifest.push(manifest_entry(group, identity, &result));
         match &result {
             GroupResult::Failed { .. } => failed = true,
@@ -495,6 +522,7 @@ pub fn run(
     // partial re-run, defeating the triage this supports.
     if let Err(msg) = write_manifest(output, dir, manifest) {
         eprintln!("warning: {msg}");
+        tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "warning: {msg}");
     }
 
     report_results(&results, json);
@@ -787,7 +815,13 @@ fn report_results(results: &[GroupResult], json: bool) {
         let wrapped = serde_json::json!({ "format": 1, "groups": documents });
         match serde_json::to_string_pretty(&wrapped) {
             Ok(text) => println!("{text}"),
-            Err(err) => eprintln!("error: failed to serialize JSON: {err}"),
+            Err(err) => {
+                eprintln!("error: failed to serialize JSON: {err}");
+                tracing::error!(
+                    target: MIRRORED_OUTPUT_TARGET,
+                    "error: failed to serialize JSON: {err}"
+                );
+            }
         }
         return;
     }
@@ -810,7 +844,13 @@ fn print_document<T: Serialize>(value: &T, json: bool, human: fn(&T) -> String) 
     if json {
         match serde_json::to_string_pretty(value) {
             Ok(text) => println!("{text}"),
-            Err(err) => eprintln!("error: failed to serialize JSON: {err}"),
+            Err(err) => {
+                eprintln!("error: failed to serialize JSON: {err}");
+                tracing::error!(
+                    target: MIRRORED_OUTPUT_TARGET,
+                    "error: failed to serialize JSON: {err}"
+                );
+            }
         }
     } else {
         println!("{}", human(value));
@@ -865,9 +905,16 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     let dir: &Path = dir;
 
     let start = Instant::now();
+    // Entered for this group alone, so an event raised anywhere below names
+    // the stack it belongs to.
+    let _stack = tracing::debug_span!("stack", identity = %identity).entered();
+    // Inside the span, so a forced crash carries this run's own context.
+    focusforge_diagnostics::force_crash("stack");
+    // One monotonic timer built from the same `Instant` `failed`/
     // `cancelled` already use for `wall_seconds`, so a completed run's
     // stage breakdown and its own `wall_seconds` share one clock exactly.
     let mut timer = StageTimer::from_start(start);
+    timer.enter(Stage::Setup);
     let mut renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.quiet));
     let status = StatusSink::new(preset_opts.status, identity, "stack");
     status.set_algorithm(algo.id());
@@ -1127,6 +1174,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
 
     timer.mark(Stage::Setup);
     if let Some((align_algo, _, align_values, align_params)) = align_prepared {
+        timer.enter(Stage::Align);
         // Step 5: resolved once, fed both to the identity below and to
         // `align_stack` (never re-derived in the miss arm).
         let policy = if align_opts.lax {
@@ -1196,10 +1244,11 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                         while !done.load(Ordering::SeqCst) {
                             std::thread::sleep(job::POLL);
                             if !warned && signals.cancel.load(Ordering::SeqCst) {
-                                eprintln!(
-                                    "cancel requested -- alignment has no unit boundary; \
-                                     stopping at the fuse stage (Ctrl-C again to abort now)"
-                                );
+                                let notice = "cancel requested -- alignment has no unit \
+                                     boundary; stopping at the fuse stage (Ctrl-C again to \
+                                     abort now)";
+                                eprintln!("{notice}");
+                                tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "{notice}");
                                 warned = true;
                             }
                         }
@@ -1248,6 +1297,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                     && let Err(err) = stage_cache.put_alignment(&stage_key, &paths, &result)
                 {
                     eprintln!("warning: {err}");
+                    tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "warning: {err}");
                 }
                 align_source = "computed".to_string();
                 alignment_result = Some((align_algo, result, align_values, align_params));
@@ -1258,6 +1308,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         // rather than a near-zero measured span.
         timer.mark(Stage::Align);
     }
+    timer.enter(Stage::Fuse);
 
     // The alignment used to compute the crop and to drive the tile reader:
     // the real result when aligned, or an all-identity one otherwise --
@@ -1576,12 +1627,14 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         // no `cleanup_partials`. Nothing on stdout: the `--json` report
         // means a completed run, the same way every existing failure path
         // prints no JSON.
-        eprintln!(
+        let notice = format!(
             "cancelled -- {} of {} unit(s) done; resume with: {}",
             control.progress().units_done,
             control.progress().unit_total,
             job::resume_recipe(argv)
         );
+        eprintln!("{notice}");
+        tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "{notice}");
         return cancelled(&status, start);
     }
     // Marked only past the cancel return above: a cancelled run's timer is
@@ -1589,6 +1642,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // `StageTimings`; folding `prepare` into `fuse` means this one mark
     // also closes the scheduler build/staging/ledger-open span above.
     timer.mark(Stage::Fuse);
+    timer.enter(Stage::Finalize);
     debug_assert_eq!(
         outcome,
         JobOutcome::Completed,
@@ -1600,14 +1654,15 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     let tiles = final_progress.unit_total;
     // On the CPU path every tile read reads every frame
     // (`crates/core/src/tile/scheduler.rs`'s per-tile loop), so this is the
-    // exact count, not an approximation. On the GPU path it is exactly 0:
-    // `BackendFusionConsumer` supplies its own pixels, so the scheduler
-    // short-circuits its host read loop and never reads a frame-tile through
-    // it at all (the same 0 `TileRunReport::frame_tiles_read` reports there).
-    let frame_tiles_read = if backend.is_some() {
-        0
-    } else {
-        tiles * stack.len()
+    // exact count, not an approximation. On the GPU path the scheduler
+    // short-circuits its host read loop entirely and reads no frame-tile
+    // through it, so the only frame tiles a GPU run reads are the ones
+    // `BackendFusionConsumer` read itself after a device loss -- every frame
+    // of every tile it finished on the host, and `0` for a run whose device
+    // stayed healthy.
+    let frame_tiles_read = match &backend_consumer {
+        Some(consumer) => consumer.fallback_tiles() * stack.len(),
+        None => tiles * stack.len(),
     };
     // `peak_in_flight`: `Job::run` does not expose the per-segment
     // `TileRunReport` `TileScheduler::run` returns (the job layer discards

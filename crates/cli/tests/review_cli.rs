@@ -54,11 +54,15 @@ fn cli_output(output: std::process::Output) -> CliOutput {
     }
 }
 
+/// `dir` is already a fresh, per-test working directory (see the module
+/// doc comment), so its own `ff-data` subdirectory is a fresh data
+/// directory too -- never the tester's real one.
 fn run_bin(dir: &Path, path: &Path, args: &[&str]) -> CliOutput {
     cli_output(
         Command::new(path)
             .args(args)
             .current_dir(dir)
+            .env("FOCUSFORGE_DATA_DIR", dir.join("ff-data"))
             .output()
             .expect("failed to run binary"),
     )
@@ -357,7 +361,7 @@ fn review_of_a_frame_directory_refuses_and_names_stack() {
     );
     assert!(
         result.stderr.contains("--groups") || result.stderr.contains("--write-groups"),
-        "the refusal must name the grouping flags: {}",
+        "the refusal must name `--groups` / `--write-groups`: {}",
         result.stderr
     );
 }
@@ -855,7 +859,7 @@ fn link_reference_frames(dir: &Path, stack_dir: &Path) -> PathBuf {
 #[ignore = "reads the 16 GB reference stack"]
 fn review_of_a_reference_run() {
     let Some(stack_dir) = common::reference_stack_dir() else {
-        eprintln!("skip: reference stack not found");
+        eprintln!("skip: the reference stack is not available");
         return;
     };
 

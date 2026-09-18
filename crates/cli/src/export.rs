@@ -26,6 +26,7 @@ use std::time::Instant;
 use focusforge_core::io::{TiffSpec, TiffWriter};
 use focusforge_core::project::{Plane, PlaneRef, Project, ProjectError, partial_path};
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
 /// The frozen `export --json` schema, additive-only -- the same contract
@@ -79,15 +80,17 @@ pub fn run(
         .map(|s| s.path.clone())
         .collect();
     if !unresolved.is_empty() {
-        eprintln!(
+        let warning = format!(
             "warning: {} source frame(s) unresolved -- not reachable from this project, either \
              because the path was recorded as given or because it is no longer there. The \
              export below is unaffected; re-fusing or retouching would not be:",
             unresolved.len()
         );
+        eprintln!("{warning}");
         for path in &unresolved {
             eprintln!("  {path}");
         }
+        tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "{warning}");
     }
 
     let composite_ref = project.plane(Plane::Composite).clone();
@@ -254,6 +257,7 @@ fn render(report: &ExportReport) -> String {
 
 fn fail(message: impl std::fmt::Display) -> ExitCode {
     eprintln!("error: {message}");
+    tracing::error!(target: MIRRORED_OUTPUT_TARGET, "error: {message}");
     ExitCode::FAILURE
 }
 

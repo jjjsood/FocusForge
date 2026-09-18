@@ -4,6 +4,12 @@
 # LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0` (same
 # for every `i-slint-*` crate) -- is satisfied by the `GPL-3.0-only` arm
 # alone, already allowed below.
+
+# Optional dependencies are resolved too, so a crate that only an
+# off-by-default feature pulls in still has to pass the licence check.
+[graph]
+all-features = true
+
 [licenses]
 allow = [
     "GPL-3.0-or-later",
@@ -21,23 +27,25 @@ allow = [
     "CC0-1.0",    # hexf-parse (naga, via wgpu)
 ]
 
+# BSL-1.0, via `copypasta` <- `i-slint-backend-winit`'s clipboard support;
+# Boost Software License 1.0 is on the FSF's GPL-compatible free-license list.
 [[licenses.exceptions]]
 name = "clipboard-win"
 allow = ["BSL-1.0"]
 
+# BSL-1.0, via the same clipboard-win path.
 [[licenses.exceptions]]
 name = "error-code"
 allow = ["BSL-1.0"]
 
+# MIT/Apache-2.0/NCSA, via `rav1e` <- `ravif` <- `image` <-
+# `i-slint-compiler`/`i-slint-core`, a fuzzing-only dependency never linked
+# into this workspace's own code; NCSA is on the FSF's GPL-compatible list.
 [[licenses.exceptions]]
 name = "libfuzzer-sys"
 allow = ["MIT", "Apache-2.0", "NCSA"]
 
-# Three RUSTSEC advisories are reached only through Slint's own transitive
-# dependency tree; each advisory itself states "no safe upgrade available", so
-# there is nothing to fix from this side. Ignored here rather than silently
-# failing the gate on a morning when nothing in this workspace changed;
-# revisit on any Slint version bump.
+# Reached only through Slint; no fixed version exists. Revisit on a Slint bump.
 [advisories]
 ignore = [
     # paste v1.0.15, via paste -> pulp -> exr -> image ->
@@ -51,13 +59,8 @@ ignore = [
     { id = "RUSTSEC-2026-0192", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint version bump" },
 ]
 
-# The wgpu major is pinned to 29 by Slint's `unstable-wgpu-29`
-# (crates/gpu/src/lib.rs). A blanket `[bans] multiple-versions = "deny"` is
-# deliberately not used: Cargo.lock already carries unrelated duplicate
-# versions of foldhash, hashbrown, jni-sys and syn, and a blanket policy
-# would demand a growing skip list maintained for that churn -- exactly
-# where a real wgpu duplication would eventually be silenced. This targeted
-# form fails the gate by name on a second wgpu major, with no collateral.
+# wgpu is pinned to one major version by Slint's `unstable-wgpu-29` feature
+# (crates/gpu/src/lib.rs); this bans a second wgpu major by name.
 [[bans.deny]]
 name = "wgpu"
 deny-multiple-versions = true

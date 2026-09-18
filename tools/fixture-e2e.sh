@@ -22,6 +22,9 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
+# Keeps this gate's own runs out of the developer's real log file.
+export FOCUSFORGE_DATA_DIR="$REPO/.scratch/fixture-e2e-data"
+
 CLI=target/debug/focusforge-cli
 
 if [ ! -x "$CLI" ]; then
@@ -78,11 +81,7 @@ printf '%s' "$ALIGN_OUT" | grep -q '"reference": 3' \
   || { echo "FAIL: fixture e2e -- align missing fact: reference 3" >&2; exit 1; }
 echo "OK: fact present -- align reference: 3"
 
-# Measured 2026-09-13 against this fixture's default settings
-# (mode=rotation-scale, reference-policy=anchor, reference-frame=middle):
-# frames 0, 1 and 7 diverge against the middle anchor, not only frame 0 --
-# per-frame divergence counts are recorded output, per containment 3 of the
-# same Decision.
+# Frames 0, 1 and 7 diverge against the middle anchor.
 printf '%s' "$ALIGN_OUT" | grep -q '"failure_count": 3' \
   || { echo "FAIL: fixture e2e -- align missing fact: failure_count 3" >&2; exit 1; }
 echo "OK: fact present -- align failure_count: 3 (per-frame divergence, recorded)"

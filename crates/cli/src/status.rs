@@ -8,38 +8,31 @@
 //! records. A script driving many invocations branches on these records
 //! instead of parsing progress text.
 //!
-//! **Every terminal path writes exactly one record.** That is the whole
-//! point of the stream: a script that waits for a verdict which never comes
-//! hangs, which is precisely the failure mode the prior tool's batch API
-//! documents. [`StatusSink::fail`] is a drop-in for [`crate::fail`] that
-//! records first, so each refusal site is a one-function rename rather than
-//! a checklist, and [`StatusSink`]'s [`Drop`] `debug_assert!`s that a record
-//! was produced -- an early return added later without one fails a debug
-//! test rather than producing a stream nobody can finish reading.
+//! Every terminal path writes exactly one record: [`StatusSink::fail`]
+//! records, then refuses like [`crate::fail`], and [`StatusSink`]'s [`Drop`]
+//! `debug_assert!`s that a record was produced.
 
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::{Deserialize, Serialize};
 
-/// The status record's schema version. Additive-only from this release
-/// forward: a later field (a group name, say) must not break a consumer
-/// written against this one.
+/// The status record's schema version. Changes are additive only: a later
+/// field must not break a consumer written against an earlier one.
 pub const STATUS_RECORD_FORMAT: u32 = 1;
 
-/// One stack's verdict.
-///
-/// `outcome` uses the vocabulary of the exit-code table already fixed in
-/// `crates/cli/src/job.rs`: 0 -> `completed`, 130 -> `cancelled`,
-/// 1 -> `failed`, plus `dry-run` for a run that deliberately computed
-/// nothing.
+/// One stack's verdict. `outcome` follows the exit codes: 0 -> `completed`,
+/// 130 -> `cancelled`, 1 -> `failed`, plus `dry-run` for a run that
+/// computed nothing.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct StatusRecord {
     pub format: u32,
-    /// The input directory **as the user wrote it**, matching
-    /// `StackReport::input`. One invocation is one stack for now.
+    /// The identity of the one stack this record describes -- the input
+    /// directory as the user wrote it for a single-group run, matching
+    /// `StackReport::input`, or the group name for a multi-group one.
     pub identity: String,
     pub command: String,
     pub outcome: String,
@@ -109,6 +102,11 @@ impl<'a> StatusSink<'a> {
         };
         if let Err(err) = append(path, &record) {
             eprintln!("warning: --status {}: {err}", path.display());
+            tracing::warn!(
+                target: MIRRORED_OUTPUT_TARGET,
+                "warning: --status {}: {err}",
+                path.display()
+            );
         }
     }
 
@@ -137,9 +135,8 @@ impl<'a> StatusSink<'a> {
     }
 }
 
-/// Appends one record as a single line. Opened per record rather than held
-/// open: this is at most a handful of writes per process, and a file reopened
-/// in append mode is what lets a script rotate or truncate the stream between
+/// Appends one record as a single line, opened per record: a file reopened
+/// in append mode lets a script rotate or truncate the stream between
 /// invocations without the next run writing into a stale offset.
 fn append(path: &Path, record: &StatusRecord) -> Result<(), String> {
     use std::io::Write;

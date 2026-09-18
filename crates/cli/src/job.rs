@@ -94,8 +94,15 @@ fn run_segment(
     signals: &Signals,
 ) -> Result<JobOutcome, TileError> {
     let mut desired_pause = false;
+    // Span context does not cross onto the segment thread by itself: the
+    // stage span current here is captured and re-entered there, so every
+    // event the scheduler raises names the stage that drives it.
+    let parent = tracing::Span::current();
     std::thread::scope(|scope| {
-        let handle = scope.spawn(|| job.run(preprocess, consumer));
+        let handle = scope.spawn(|| {
+            let _parent = parent.enter();
+            job.run(preprocess, consumer)
+        });
         loop {
             if handle.is_finished() {
                 break;
