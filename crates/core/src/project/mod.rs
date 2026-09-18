@@ -51,6 +51,7 @@
 //! Nothing here prints. Unresolved sources come back as **data**
 //! ([`Project::unresolved_sources`]) and reporting them is the CLI's.
 
+pub mod append;
 pub mod blob;
 pub mod checkpoint;
 pub mod container;
@@ -64,6 +65,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+pub use append::{AppendRequest, append, append_at};
 pub use blob::{Plane, StagedBlob, hash_file, short_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, Op, Point};
 pub use container::{ProjectWriter, partial_path};
@@ -262,6 +264,12 @@ impl Project {
         &self.checkpoint
     }
 
+    /// The whole checkpoint chain, head first, walking [`Checkpoint::parent`]
+    /// down to the original parentless one.
+    pub fn checkpoint_chain(&mut self) -> Result<Vec<Checkpoint>, ProjectError> {
+        checkpoint_chain_from(&mut self.archive, &self.path, &self.checkpoint.id)
+    }
+
     /// Where one recorded source is looked for: relative to the project's
     /// own directory when it was recorded as a descendant, otherwise the
     /// absolute path exactly as it was given.
@@ -396,7 +404,7 @@ impl Project {
     }
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(
+pub(super) fn read_json<T: serde::de::DeserializeOwned>(
     archive: &mut zip::ZipArchive<File>,
     path: &Path,
     entry: &str,
@@ -409,6 +417,36 @@ fn read_json<T: serde::de::DeserializeOwned>(
         .map_err(|source| ProjectError::io(path, source))?;
     serde_json::from_str(&text)
         .map_err(|err| ProjectError::container(path, format!("{entry}: {err}")))
+}
+
+/// The checkpoint chain reachable from `head_id`, head first: walks
+/// [`Checkpoint::parent`] down to the original parentless checkpoint. A
+/// repeated id names itself in a [`ProjectError::Container`] rather than
+/// looping forever.
+fn checkpoint_chain_from(
+    archive: &mut zip::ZipArchive<File>,
+    path: &Path,
+    head_id: &str,
+) -> Result<Vec<Checkpoint>, ProjectError> {
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut current_id = head_id.to_string();
+    loop {
+        if !seen.insert(current_id.clone()) {
+            return Err(ProjectError::container(
+                path,
+                format!("checkpoint chain names {current_id} more than once"),
+            ));
+        }
+        let checkpoint: Checkpoint =
+            read_json(archive, path, &format!("checkpoints/{current_id}.json"))?;
+        let parent = checkpoint.parent.clone();
+        chain.push(checkpoint);
+        match parent {
+            Some(next) => current_id = next,
+            None => return Ok(chain),
+        }
+    }
 }
 
 #[cfg(test)]

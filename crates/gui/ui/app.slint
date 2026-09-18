@@ -117,6 +117,7 @@ export component AppWindow inherits Window {
     // The transport's current run state: "idle" | "running" | "paused" |
     // "cancelling" | "failed".
     in property <string> toolbar-run-state: "idle";
+    in property <bool> fuse-enabled: true;
 
     // Hidden with no project open (or "+" selected over background tabs) --
     // there is no run to transport. `canvas-ground` below grows into its row.
@@ -127,6 +128,7 @@ export component AppWindow inherits Window {
         height: root.show-empty-state ? 0px : ShellGeometry.toolbar-height;
         visible: !root.show-empty-state;
         run-state: root.toolbar-run-state;
+        fuse-enabled: root.fuse-enabled;
 
         fuse-requested => { root.fuse-requested(); }
         pause-or-resume-requested => { root.pause-or-resume-requested(); }

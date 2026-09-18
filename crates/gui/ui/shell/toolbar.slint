@@ -11,6 +11,9 @@ export component FFToolbar inherits Rectangle {
     // "idle" | "running" | "paused" | "cancelling" | "failed". Any other
     // value renders as "idle".
     in property <string> run-state: "idle";
+    // Enabled at two or more frames; disabled below that on an unfused and
+    // a fused tab alike.
+    in property <bool> fuse-enabled: true;
     callback fuse-requested();
     callback pause-or-resume-requested();
     callback cancel-requested();
@@ -80,6 +83,7 @@ export component FFToolbar inherits Rectangle {
         kind: "primary";
         glyph: "▶";
         text: "Fuse stack";
+        enabled: root.fuse-enabled;
         clicked => { root.fuse-requested(); }
     }
 

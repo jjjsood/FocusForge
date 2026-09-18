@@ -17,7 +17,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use zip::CompressionMethod;
@@ -93,6 +93,22 @@ impl ProjectWriter {
         let mut source = File::open(compressed).map_err(|err| ProjectError::io(compressed, err))?;
         std::io::copy(&mut source, zip).map_err(|err| ProjectError::io(compressed, err))?;
         self.written.insert(name);
+        Ok(())
+    }
+
+    /// Copies an entry from `source` byte for byte, under `name` -- what
+    /// carries an existing archive entry (a blob, a checkpoint) from one
+    /// container into another without decoding it. Skipped, like
+    /// [`Self::add_blob`], when `name` was already written.
+    pub fn add_stream(&mut self, name: &str, source: &mut impl Read) -> Result<(), ProjectError> {
+        if self.written.contains(name) {
+            return Ok(());
+        }
+        let zip = self.zip.as_mut().expect("writer is live until finish");
+        zip.start_file(name, Self::options())
+            .map_err(|err| ProjectError::container(&self.partial, err))?;
+        std::io::copy(source, zip).map_err(|err| ProjectError::io(&self.partial, err))?;
+        self.written.insert(name.to_string());
         Ok(())
     }
 

@@ -1062,6 +1062,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         backend,
         resume: job_opts.resume,
         cache: job_opts.cache,
+        append: false,
         poll: job::POLL,
     };
 

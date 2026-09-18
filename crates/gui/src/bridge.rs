@@ -174,6 +174,7 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     app.set_project_loaded(controller.active_project().is_some());
     app.set_plus_selected(controller.plus_selected());
     app.set_skipped_notice(controller.notice().unwrap_or_default().into());
+    app.set_fuse_enabled(controller.fuse_enabled());
     push_settings_panel(app, &controller);
 }
 
@@ -223,6 +224,7 @@ fn push_job(app: &AppWindow, view: &JobView) {
     app.set_bar_fraction(view.fraction);
     app.set_bar_tone(view.bar_tone.as_str().into());
     app.set_eta_text(view.eta_text.as_str().into());
+    app.set_fuse_enabled(view.fuse_enabled);
 }
 
 /// Opens `CanvasRenderer` on a project's two materialized planes, naming the

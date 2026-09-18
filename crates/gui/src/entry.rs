@@ -259,6 +259,35 @@ pub fn tab_stack_context(project: &GuiProject) -> Option<StackContext> {
     }
 }
 
+/// A tab's own frame list, in frame order: the group's own `frames` for an
+/// [`GuiProject::Unsaved`] tab; for a reopened [`GuiProject::Opened`] one,
+/// its manifest's recorded sources mapped through [`Project::source_path`].
+/// What a re-fuse assembles its request from.
+pub fn project_frames(project: &GuiProject) -> Vec<PathBuf> {
+    match project {
+        GuiProject::Unsaved(group) => group.frames.clone(),
+        GuiProject::Opened(project) => project
+            .manifest()
+            .sources
+            .iter()
+            .map(|source| project.source_path(source))
+            .collect(),
+    }
+}
+
+/// The first of an opened project's recorded sources whose resolved path is
+/// not a file, if any -- what a re-fuse refuses on, deliberately narrower
+/// than [`Project::unresolved_sources`], which also reports every source
+/// recorded `AsGiven` even when it is perfectly present on disk.
+pub fn missing_source(project: &Project) -> Option<PathBuf> {
+    project
+        .manifest()
+        .sources
+        .iter()
+        .map(|source| project.source_path(source))
+        .find(|path| !path.is_file())
+}
+
 /// A tab's frame count: the group's own frame count pre-fuse, the sealed
 /// composite's recorded one once opened.
 pub fn tab_frame_count(project: &GuiProject) -> u32 {

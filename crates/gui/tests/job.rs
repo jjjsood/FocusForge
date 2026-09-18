@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::pipeline::{self, FuseOutcome, FuseRequest, StageObserver};
+use focusforge_core::project::{self, Project};
 use focusforge_core::registry;
+use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::job;
 use focusforge_gui::{AppController, OpenOutcome};
 
@@ -173,6 +175,7 @@ fn gui_run_matches_the_cli_run() {
         backend: None,
         resume: false,
         cache: true,
+        append: false,
         poll: Duration::from_millis(5),
     };
     struct Noop;
@@ -302,6 +305,7 @@ fn no_align_request(label: &str, frame_count: usize) -> FuseRequest {
         backend: None,
         resume: false,
         cache: true,
+        append: false,
         poll: Duration::from_millis(5),
     }
 }
@@ -627,4 +631,251 @@ fn fuse_stack_is_refused_while_a_field_is_in_violation() {
         "a field in violation must refuse the run"
     );
     assert!(!controller.job_running());
+}
+
+// ---------------------------------------------------------------------
+// Re-fusing an already-opened tab runs the pipeline again and appends a
+// checkpoint, instead of the press doing nothing.
+// ---------------------------------------------------------------------
+
+fn opened_project_path(root_name: &str, controller: &AppController) -> PathBuf {
+    let title = controller.project_tabs()[0].title.clone();
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(root_name)
+        .join(format!("{title}.ffp"))
+}
+
+#[test]
+fn re_fusing_an_opened_tab_appends_a_checkpoint() {
+    let mut controller = controller_with_frames("reopen_appends", 2);
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert!(
+        !controller.project_tabs()[0].unsaved,
+        "the first run promotes Unsaved to Opened"
+    );
+
+    assert!(
+        controller.start_fuse(),
+        "pressing Fuse stack on an Opened tab must run the pipeline again"
+    );
+    assert!(controller.job_running());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert!(!controller.job_running());
+    match controller.job_view().state {
+        job::RunState::Fused { .. } => {}
+        other => panic!("expected a completed re-fuse, got {other:?}"),
+    }
+    assert_eq!(controller.checkpoint_count(), Some(2));
+}
+
+// ---------------------------------------------------------------------
+// The checkpoint count is real: zero before the first run, incrementing
+// per successful run, and read back from the container on reopen.
+// ---------------------------------------------------------------------
+
+#[test]
+fn checkpoint_count_increments_per_run() {
+    let mut controller = controller_with_frames("count_increments", 2);
+    assert_eq!(controller.checkpoint_count(), Some(0));
+
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert_eq!(controller.checkpoint_count(), Some(1));
+
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert_eq!(controller.checkpoint_count(), Some(2));
+}
+
+#[test]
+fn a_reopened_project_reports_the_count_on_disk() {
+    let mut controller = controller_with_frames("reopen_count", 2);
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert_eq!(controller.checkpoint_count(), Some(2));
+
+    let project_path = opened_project_path("reopen_count_frames", &controller);
+    let mut reopened = AppController::new();
+    assert!(matches!(
+        reopened.open_paths(&[project_path]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(
+        reopened.checkpoint_count(),
+        Some(2),
+        "the count must come from the container, not the session that wrote it"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The fuse control is enabled at two or more frames, on an unfused and a
+// fused tab alike, and disabled below that; unreachable with "+" selected
+// or no tab.
+// ---------------------------------------------------------------------
+
+#[test]
+fn fuse_is_enabled_from_two_frames_and_disabled_below() {
+    let one = controller_with_frames("enabled_one", 1);
+    assert!(!one.fuse_enabled(), "one frame is not a stack");
+
+    let mut two = controller_with_frames("enabled_two", 2);
+    assert!(two.fuse_enabled());
+
+    assert!(two.start_fuse());
+    wait_for_settle(&mut two, Duration::from_secs(120));
+    assert!(
+        two.fuse_enabled(),
+        "a fused tab with its original frame count stays enabled"
+    );
+}
+
+#[test]
+fn the_plus_tab_offers_no_fuse_control() {
+    let controller = AppController::new();
+    assert!(controller.plus_selected());
+    assert!(!controller.fuse_enabled(), "no tab means nothing to fuse");
+
+    let mut with_frames = controller_with_frames("plus_tab", 2);
+    assert!(with_frames.fuse_enabled());
+    with_frames.select_plus();
+    assert!(with_frames.plus_selected());
+    assert!(
+        !with_frames.fuse_enabled(),
+        "the \"+\" tab offers no fuse control even with a project open in the background"
+    );
+}
+
+// ---------------------------------------------------------------------
+// A re-fuse refuses before a run starts when a recorded frame is no
+// longer a file, naming it; an absolute but present source still re-fuses.
+// ---------------------------------------------------------------------
+
+#[test]
+fn re_fuse_is_refused_when_a_frame_is_missing() {
+    let mut controller = controller_with_frames("missing_frame", 2);
+    assert!(controller.start_fuse());
+    let planes = wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert!(planes.is_some());
+    assert!(!controller.project_tabs()[0].unsaved);
+
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("missing_frame_frames");
+    std::fs::remove_file(root.join("00.tif")).unwrap();
+
+    assert!(
+        !controller.start_fuse(),
+        "a re-fuse with a missing frame must be refused before a run starts"
+    );
+    assert!(!controller.job_running());
+    let message = controller
+        .last_refusal()
+        .expect("a refusal message must be recorded");
+    assert!(
+        message.contains("00.tif"),
+        "the refusal must name the missing frame: {message}"
+    );
+}
+
+/// A sealed project whose sources are recorded outside its own directory --
+/// `AsGiven`, present on disk -- built directly through `project::seal`
+/// rather than through a run: only an externally-produced project (a
+/// `-o <dir>` CLI run) ever holds one, since the GUI's own runs always seal
+/// beside the frames they fuse.
+fn sealed_project_with_as_given_sources(name: &str) -> PathBuf {
+    let project_dir = tree(&format!("{name}_project"));
+    let frames_dir = tree(&format!("{name}_frames"));
+    for i in 0..2 {
+        copy_frame(&frames_dir, &format!("{i:02}.tif"), i);
+    }
+    let sources: Vec<PathBuf> = (0..2)
+        .map(|i| frames_dir.join(format!("{i:02}.tif")))
+        .collect();
+
+    let staging = tree(&format!("{name}_staging"));
+    let composite = staging.join("composite.tif");
+    std::fs::copy(mantis_frame(0), &composite).unwrap();
+    let zmap = staging.join("zmap.tif");
+    let mut writer = ZMapWriter::create(&zmap, ZMapInfo::new(4, 4, 2).unwrap()).unwrap();
+    writer
+        .write_tile(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            &[0u16; 16],
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let project_path = project_dir.join("demo.ffp");
+    project::seal(project::SealRequest {
+        project_path: &project_path,
+        staged_composite: &composite,
+        staged_zmap: &zmap,
+        sources: &sources,
+        algorithm: "laplacian",
+        params: &ParamValues::new(),
+        align: None,
+        composite_description: "staged composite".to_string(),
+        label: None,
+        metrics: project::Metrics::default(),
+    })
+    .expect("seal must succeed");
+    project_path
+}
+
+#[test]
+fn an_absolute_but_present_source_still_re_fuses() {
+    let project_path = sealed_project_with_as_given_sources("as_given");
+    for source in &Project::open(&project_path).unwrap().manifest().sources {
+        assert_eq!(source.resolution, project::SourceResolution::AsGiven);
+    }
+
+    let mut controller = AppController::new();
+    assert!(matches!(
+        controller.open_paths(&[project_path]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.set_scratch_root_for_test(tree("as_given_scratch"));
+
+    assert!(
+        controller.start_fuse(),
+        "a recorded absolute source that is present must not refuse the re-fuse"
+    );
+    assert!(controller.last_refusal().is_none());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    match controller.job_view().state {
+        job::RunState::Fused { .. } => {}
+        other => panic!("expected a completed re-fuse, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// A re-fuse reports as a run in its own right: the idle line afterwards
+// reflects the head checkpoint's own time, not a rendered clock reading.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_second_run_reports_its_own_completion_time() {
+    let mut controller = controller_with_frames("second_run_time", 2);
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+
+    let job::RunState::Fused { at } = controller.job_view().state else {
+        panic!("expected a completed fuse");
+    };
+
+    let project_path = opened_project_path("second_run_time_frames", &controller);
+    let project = Project::open(&project_path).unwrap();
+    let expected = job::format_utc_hhmm(project.checkpoint().created_at);
+    assert_eq!(
+        at, expected,
+        "the idle line must reflect the head checkpoint's own time"
+    );
 }

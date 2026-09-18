@@ -31,7 +31,7 @@ use crate::job::{
     StageCache, StageKey, read_alignment,
 };
 use crate::params::{self, ParamValue, ParamValues, Provenance, ResolvedParams, StackContext};
-use crate::project::{self, AlignRecord, Metrics, SealRequest, SealedProject};
+use crate::project::{self, AlignRecord, AppendRequest, Metrics, SealRequest, SealedProject};
 use crate::tile::{NoopPreprocess, TileConsumer, TileError, TileScheduler, TileSchedulerOptions};
 use crate::timing::{Stage, StageTimer, StageTimings};
 
@@ -68,6 +68,12 @@ pub struct FuseRequest {
     pub backend: Option<&'static dyn TileBackend>,
     pub resume: bool,
     pub cache: bool,
+    /// Write onto the existing project as a new checkpoint instead of
+    /// sealing a fresh container. Existence at `project_path` is
+    /// deliberately not the trigger: `focusforge-cli stack` over a folder
+    /// that already holds a project keeps overwriting it rather than
+    /// silently growing a chain.
+    pub append: bool,
     /// How often the poll thread this module owns calls
     /// [`StageObserver::tick`].
     pub poll: Duration,
@@ -608,24 +614,41 @@ pub fn run(
 
     observer.stage(RunStage::Seal);
     let metrics = measure_metrics(&staged_composite, &request.frames);
-    let sealed = project::seal(SealRequest {
-        project_path: &request.project_path,
-        staged_composite: &staged_composite,
-        staged_zmap: &staged_zmap,
-        sources: &request.frames,
-        algorithm: request.algorithm.id(),
-        params: &values,
-        align: alignment_result
+    let align_record =
+        alignment_result
             .as_ref()
             .map(|(align_algo, align_resolved, _, alignment)| AlignRecord {
                 algorithm: align_algo.id().to_string(),
                 params: params::resolved_values(align_resolved),
                 reference: alignment.reference,
-            }),
-        composite_description,
-        label: None,
-        metrics,
-    });
+            });
+    let sealed = if request.append {
+        project::append(AppendRequest {
+            project_path: &request.project_path,
+            staged_composite: &staged_composite,
+            staged_zmap: &staged_zmap,
+            sources: &request.frames,
+            algorithm: request.algorithm.id(),
+            params: &values,
+            align: align_record,
+            composite_description,
+            label: None,
+            metrics,
+        })
+    } else {
+        project::seal(SealRequest {
+            project_path: &request.project_path,
+            staged_composite: &staged_composite,
+            staged_zmap: &staged_zmap,
+            sources: &request.frames,
+            algorithm: request.algorithm.id(),
+            params: &values,
+            align: align_record,
+            composite_description,
+            label: None,
+            metrics,
+        })
+    };
     let sealed = match sealed {
         Ok(sealed) => sealed,
         Err(err) => {

@@ -54,6 +54,10 @@ pub struct JobRequest {
     pub align_lax: bool,
     pub crop: bool,
     pub backend: Option<&'static dyn TileBackend>,
+    /// Write onto the tab's already-sealed project as a new checkpoint
+    /// instead of sealing a fresh container -- set for a re-fuse of an
+    /// already-opened tab, clear for a first fuse.
+    pub append: bool,
 }
 
 /// How often the pipeline's poll thread ticks progress -- the window's own
@@ -95,6 +99,7 @@ pub fn spawn(
             backend: request.backend,
             resume: false,
             cache: true,
+            append: request.append,
             poll: POLL,
         };
         pipeline::run(&fuse_request, observer.as_ref(), control, None)
@@ -222,7 +227,7 @@ fn progress_step(progress: Option<&JobProgress>) -> Step {
 /// The stage word the bar shows for `state`/`progress` -- `Aligning`,
 /// `Fusing`, `Writing`, `Paused`, `Cancelling`, `Failed` or a completed run's
 /// own `fused HH:MM`. `progress` picks between `Aligning`/`Fusing`/`Writing`
-/// while running, via [`progress_step`].
+/// while running, via `progress_step`.
 pub fn stage_word(state: &RunState, progress: Option<&JobProgress>) -> String {
     match state {
         RunState::Paused => "Paused".to_string(),
@@ -270,7 +275,7 @@ pub fn is_live(state: &RunState) -> bool {
     )
 }
 
-/// The step this run is on, derived through the same [`progress_step`]
+/// The step this run is on, derived through the same `progress_step`
 /// classification [`stage_word`] uses -- never fabricated from a state the
 /// engine did not report.
 pub fn current_step(state: &RunState, progress: Option<&JobProgress>) -> Option<Step> {

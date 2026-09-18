@@ -168,10 +168,16 @@ struct ProjectTab {
     errors: BTreeMap<String, ParamViolation>,
     /// The one open picker/enum menu's `"<section>:<id>"` key, if any.
     menu_open: Option<String>,
+    /// The project's real checkpoint count -- `0` for an `Unsaved` tab, the
+    /// reopened project's own on-disk chain length for an `Opened` one,
+    /// incremented on every successful run ([`AppController::settle_job`])
+    /// rather than inferred from which [`GuiProject`] variant the tab
+    /// happens to be in.
+    checkpoints: usize,
 }
 
 impl ProjectTab {
-    fn new(project: GuiProject) -> Self {
+    fn new(mut project: GuiProject) -> Self {
         let title = entry::tab_title(&project);
         let ctx = entry::tab_stack_context(&project);
         let image = ctx.map(|c| ImageSize {
@@ -180,6 +186,10 @@ impl ProjectTab {
         });
         let (fuse_id, fuse_values, align_id, align_values) =
             settings_panel::seed_algorithm_state(&project);
+        let checkpoints = match &mut project {
+            GuiProject::Unsaved(_) => 0,
+            GuiProject::Opened(p) => p.checkpoint_chain().map(|chain| chain.len()).unwrap_or(1),
+        };
         ProjectTab {
             project,
             title,
@@ -193,6 +203,7 @@ impl ProjectTab {
             project_values: ParamValues::new(),
             errors: BTreeMap::new(),
             menu_open: None,
+            checkpoints,
         }
     }
 }
@@ -333,6 +344,7 @@ pub struct JobView {
     pub eta_text: String,
     pub bar_tone: String,
     pub fraction: f32,
+    pub fuse_enabled: bool,
 }
 
 impl AppController {
@@ -966,9 +978,16 @@ impl AppController {
 
     fn refuse(&mut self, err: EntryError) -> OpenOutcome {
         let message = err.to_string();
+        self.refuse_message(message);
+        OpenOutcome::Refused(err)
+    }
+
+    /// Refuses with an already-rendered message and no [`EntryError`] behind
+    /// it -- what a re-fuse's own frame-reachability check uses, since
+    /// nothing there is an entry-path failure.
+    pub fn refuse_message(&mut self, message: String) {
         self.state.last_refusal = Some(message.clone());
         self.emit(ShellEvent::EntryRefused(message));
-        OpenOutcome::Refused(err)
     }
 
     // -- Tabs as controller state. --
@@ -1334,9 +1353,11 @@ impl AppController {
 
     /// Starts a fuse run on the active tab's own frames and explicit
     /// settings, off the UI thread -- refuses while the tab carries a
-    /// settings violation, a run is already live, or the tab has no frame
-    /// list of its own (already fused; re-fusing an already-sealed project
-    /// is not supported). Returns whether a run was started.
+    /// settings violation, a run is already live, or (an `Opened` tab only)
+    /// one of its recorded frames is no longer a file. A press on an
+    /// `Unsaved` tab seals a first checkpoint; a press on an already-`Opened`
+    /// one appends a new one onto the same project. Returns whether a run
+    /// was started.
     pub fn start_fuse(&mut self) -> bool {
         if self.job_running() {
             return false;
@@ -1347,13 +1368,29 @@ impl AppController {
         if !tab.errors.is_empty() {
             return false;
         }
-        let GuiProject::Unsaved(group) = &tab.project else {
+        if let GuiProject::Opened(project) = &tab.project
+            && let Some(missing) = entry::missing_source(project)
+        {
+            let message = format!(
+                "{} is no longer on disk. This project cannot be fused again until it is back.",
+                missing.display()
+            );
+            self.refuse_message(message);
             return false;
+        }
+        let tab = self
+            .state
+            .active()
+            .expect("an active tab was checked above");
+        let append = matches!(tab.project, GuiProject::Opened(_));
+        let project_path = match &tab.project {
+            GuiProject::Unsaved(group) => group.dir.join(format!("{}.ffp", group.name)),
+            GuiProject::Opened(project) => project.path().to_path_buf(),
         };
-        let project_path = group.dir.join(format!("{}.ffp", group.name));
-        let staging_key = format!("{}-{:x}", group.name, path_digest(&project_path));
+        let frames = entry::project_frames(&tab.project);
+        let staging_key = format!("{}-{:x}", tab.title, path_digest(&project_path));
         let request = job::JobRequest {
-            frames: group.frames.clone(),
+            frames,
             project_path,
             scratch_root: self
                 .scratch_root_for_test
@@ -1367,6 +1404,7 @@ impl AppController {
             align_lax: false,
             crop: true,
             backend: None,
+            append,
         };
         self.run_request(request);
         true
@@ -1454,7 +1492,23 @@ impl AppController {
             eta_text: job::eta_text(&self.job.state, progress.as_ref()),
             bar_tone: job::bar_tone(&self.job.state).to_string(),
             fraction: job::bar_fraction(progress.as_ref()),
+            fuse_enabled: self.fuse_enabled(),
         }
+    }
+
+    /// Whether the active tab's fuse control is enabled: a real project tab
+    /// holding two or more frames -- `false` with `"+"` selected, with no
+    /// tab, or below two frames, `Unsaved` or `Opened` alike.
+    pub fn fuse_enabled(&self) -> bool {
+        self.state
+            .active()
+            .is_some_and(|tab| entry::tab_frame_count(&tab.project) >= 2)
+    }
+
+    /// The active tab's checkpoint count -- real, incrementing on every
+    /// successful run, `None` while no tab is active.
+    pub fn checkpoint_count(&self) -> Option<usize> {
+        self.state.active().map(|tab| tab.checkpoints)
     }
 
     /// Joins the worker thread if it has finished, moving the shell out of
@@ -1483,6 +1537,7 @@ impl AppController {
                 width: c.width,
                 height: c.height,
             });
+            tab.checkpoints += 1;
             Some((composite, zmap))
         });
         self.emit(ShellEvent::JobChanged);

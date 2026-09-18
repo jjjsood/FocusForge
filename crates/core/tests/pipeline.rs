@@ -55,6 +55,7 @@ fn base_request(label: &str, frames: Vec<PathBuf>, explicit: ParamValues) -> Fus
         backend: None,
         resume: false,
         cache: true,
+        append: false,
         poll: Duration::from_millis(5),
     }
 }

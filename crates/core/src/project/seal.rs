@@ -213,7 +213,7 @@ fn blob_records(composite: &BlobRecord, zmap: &BlobRecord) -> Vec<BlobRecord> {
     }
 }
 
-fn record(blob: &StagedBlob) -> BlobRecord {
+pub(super) fn record(blob: &StagedBlob) -> BlobRecord {
     BlobRecord {
         hash: blob.hash.clone(),
         kind: BlobKind::Full,
@@ -230,7 +230,7 @@ fn record(blob: &StagedBlob) -> BlobRecord {
 /// absolute path with `AsGiven`, and reported on open. An `-o <dir>` run
 /// therefore routinely produces `AsGiven` projects -- that is the intended
 /// behaviour, not a defect.
-fn source_ref(path: &Path, project_dir: &Path) -> Result<SourceRef, ProjectError> {
+pub(super) fn source_ref(path: &Path, project_dir: &Path) -> Result<SourceRef, ProjectError> {
     let hash = blob::hash_file(path)?;
     let bytes = std::fs::metadata(path)
         .map_err(|source| ProjectError::io(path, source))?
@@ -258,7 +258,7 @@ fn source_ref(path: &Path, project_dir: &Path) -> Result<SourceRef, ProjectError
 
 /// Unix seconds, UTC. `0` if the clock is before the epoch, which is not a
 /// state worth failing a finished stack over.
-fn now_unix() -> i64 {
+pub(super) fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
