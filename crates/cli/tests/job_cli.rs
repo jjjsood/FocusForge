@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+    common::cli_bin("job_cli")
 }
 
 fn mantis_512_dir() -> PathBuf {

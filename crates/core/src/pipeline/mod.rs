@@ -163,6 +163,11 @@ pub trait StageObserver: Sync {
     /// (`control.cancel()`) -- `focusforge-cli`'s own signal wait and the
     /// GUI's condvar park are both implementations of this one method.
     fn paused(&self, _control: &JobControl) {}
+    /// A human-readable warning raised mid-run that a front end may surface
+    /// however it sees fit -- `focusforge-cli`'s own implementation mirrors
+    /// it into the diagnostics log; `core` itself never depends on that
+    /// crate and never decides how (or whether) a message is displayed.
+    fn notice(&self, _message: &str) {}
 }
 
 /// A [`StageObserver`] that does nothing -- what a caller with no
@@ -213,6 +218,7 @@ pub fn run(
 ) -> Result<FuseOutcome, PipelineError> {
     let start = Instant::now();
     let mut timer = StageTimer::from_start(start);
+    timer.enter(Stage::Setup);
 
     let stack = TiffStack::open_files(&request.frames)
         .map_err(|err| PipelineError::Input(err.to_string()))?;
@@ -273,6 +279,7 @@ pub fn run(
     let mut peak_align_workers: Option<usize> = None;
 
     if let Some(align_req) = &request.align {
+        timer.enter(Stage::Align);
         // The control exists before this stage starts (`Job::with_control`'s
         // whole point), so a poller reading `control.progress()` right now
         // sees `stage == Align`.
@@ -337,11 +344,30 @@ pub fn run(
                 });
                 let done = AtomicBool::new(false);
                 let poll = request.poll;
+                // Span context does not cross onto the watcher thread by
+                // itself: the stage span current here is captured and
+                // re-entered there, so every event it raises names the
+                // stage that drives it.
+                let parent = tracing::Span::current();
                 let solved = std::thread::scope(|scope| {
                     let watcher = scope.spawn(|| {
+                        let _parent = parent.enter();
+                        // `align_stack_with` has no unit boundary of its
+                        // own, so a cancel requested while it runs is
+                        // otherwise invisible until it returns -- this is
+                        // the one place that can say so while it is still
+                        // running.
+                        let mut warned = false;
                         while !done.load(Ordering::SeqCst) {
                             std::thread::sleep(poll);
                             observer.tick(&control.progress());
+                            if !warned && control.state() == ControlState::CancelRequested {
+                                observer.notice(
+                                    "cancel requested -- alignment has no unit boundary; \
+                                     stopping at the fuse stage (Ctrl-C again to abort now)",
+                                );
+                                warned = true;
+                            }
                         }
                     });
                     let result = align_stack_with(
@@ -380,8 +406,9 @@ pub fn run(
                 // alignment into a failed run.
                 if request.cache
                     && let Some(cache) = stage_cache
+                    && let Err(err) = cache.put_alignment(&stage_key, &request.frames, &alignment)
                 {
-                    let _ = cache.put_alignment(&stage_key, &request.frames, &alignment);
+                    observer.notice(&format!("warning: {err}"));
                 }
                 align_source = "computed".to_string();
                 alignment_result = Some((align_req.algorithm, align_resolved, policy, alignment));
@@ -389,6 +416,7 @@ pub fn run(
         }
         timer.mark(Stage::Align);
     }
+    timer.enter(Stage::Fuse);
 
     let alignment_for_crop: StackAlignment = match &alignment_result {
         Some((_, _, _, alignment)) => alignment.clone(),
@@ -591,6 +619,7 @@ pub fn run(
         });
     }
     timer.mark(Stage::Fuse);
+    timer.enter(Stage::Finalize);
     debug_assert_eq!(
         outcome,
         JobOutcome::Completed,
@@ -600,10 +629,9 @@ pub fn run(
     let final_progress = control.progress();
     let in_flight_limit = scheduler.in_flight_limit();
     let tiles = final_progress.unit_total;
-    let frame_tiles_read = if request.backend.is_some() {
-        0
-    } else {
-        tiles * stack.len()
+    let frame_tiles_read = match &backend_consumer {
+        Some(consumer) => consumer.fallback_tiles() * stack.len(),
+        None => tiles * stack.len(),
     };
 
     if let Err(err) = sink.finish() {
@@ -747,8 +775,15 @@ fn run_segment(
     poll: Duration,
     observer: &dyn StageObserver,
 ) -> Result<JobOutcome, TileError> {
+    // Span context does not cross onto the segment thread by itself: the
+    // stage span current here is captured and re-entered there, so every
+    // event the scheduler raises names the stage that drives it.
+    let parent = tracing::Span::current();
     std::thread::scope(|scope| {
-        let handle = scope.spawn(|| job.run(&NoopPreprocess, consumer));
+        let handle = scope.spawn(|| {
+            let _parent = parent.enter();
+            job.run(&NoopPreprocess, consumer)
+        });
         loop {
             if handle.is_finished() {
                 break;

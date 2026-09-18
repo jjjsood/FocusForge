@@ -70,6 +70,20 @@ runlog_init run
 # A failing gate must not stop the run: every gate reports, then the summary.
 run_gate() { run_logged "$@" || true; }
 
+# What the workspace test run left in the temporary directory it was given.
+# Anything at all is a failure: every test owns its directory through a guard
+# that removes it. The entries are listed, not counted, because cargo and
+# rustc write here too when a stage of this script compiles anything.
+test_tmp_residue() {
+  local dir="$1"
+  local left
+  left="$(ls -A "$dir" 2>/dev/null)"
+  [ -z "$left" ] && return 0
+  echo "the workspace test run left these behind in ${dir#"$REPO"/}:"
+  ls -lA "$dir"
+  return 1
+}
+
 # --- static checks: seconds each, no side effects ---------------------------
 run_gate "rustfmt"          cargo fmt --all --check
 run_gate "licenses"         tools/check-licenses.sh
@@ -119,12 +133,27 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   # feature and the gpu crate's own suite already runs inside this stage
   # today at ~0.02s for 36 tests -- cheap enough that nextest's added
   # cross-binary parallelism is not a GPU contention risk the way an actual
-  # `--features gpu-tests` run is (that one stays outside this gate, single-
-  # threaded).
+  # `--features gpu-tests` run is (that one stays outside this gate, and runs
+  # single-threaded).
+  #
+  # A private TMPDIR, emptied first, so the stage after can see what the run
+  # abandoned. /tmp is a bounded tmpfs on a current Linux desktop, which a
+  # leaking test fills within a few runs.
+  TEST_TMP="$REPO/.scratch/test-tmp"
+  rm -rf "$TEST_TMP"
+  mkdir -p "$TEST_TMP"
   run_gate "cargo nextest"  tools/with-lock.sh build -- \
-                              env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" cargo nextest run --workspace
+                              env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" TMPDIR="$TEST_TMP" \
+                              cargo nextest run --workspace
+  run_gate "test tmp residue" test_tmp_residue "$TEST_TMP"
   run_gate "cargo test --doc" tools/with-lock.sh build -- \
                               env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" cargo test --doc --workspace
+  # The off-by-default `trace` feature's own suite: the stage above resolves
+  # no profiling crate at all, and the clippy stage compiles the feature
+  # without running anything. ~13.5s on an already-compiled tree, most of it
+  # one real stack run over fixtures/mantis-512.
+  run_gate "trace feature"  tools/with-lock.sh build -- \
+                              cargo test -p focusforge-cli --features trace --test trace_cli
   run_gate "rustdoc"        tools/with-lock.sh build -- \
                               env RUSTDOCFLAGS="-D warnings" \
                               cargo doc --workspace --no-deps --document-private-items

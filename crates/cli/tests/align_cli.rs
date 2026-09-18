@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+    common::cli_bin("align_cli")
 }
 
 fn mantis_512_dir() -> PathBuf {

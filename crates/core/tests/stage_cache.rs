@@ -10,8 +10,6 @@ mod common;
 
 use std::fs;
 use std::path::PathBuf;
-use std::process;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use focusforge_core::algorithm::AlignStatus;
@@ -25,17 +23,10 @@ use focusforge_core::job::{
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::registry;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "ff-stage-cache-test-{}-{label}-{}",
-        process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+/// A directory of its own for one test, removed when the returned guard
+/// drops -- including while a panic unwinds out of the test.
+fn tmp_dir(label: &str) -> tempfile::TempDir {
+    tempfile::TempDir::with_prefix(format!("ff-stage-cache-{label}-")).unwrap()
 }
 
 fn sample_frame(idx: usize) -> FrameFingerprint {
@@ -97,7 +88,7 @@ fn alignment_parameter_change_is_a_miss() {
     assert_ne!(key_a.digest(), key_b.digest());
 
     let scratch = tmp_dir("param-change");
-    let cache = StageCache::open(&scratch).unwrap();
+    let cache = StageCache::open(scratch.path()).unwrap();
     cache
         .put_alignment(&key_a, &[], &sample_alignment(2))
         .unwrap();
@@ -110,7 +101,7 @@ fn a_strict_run_does_not_reuse_a_lax_alignment() {
     let lax = sample_identity("ecc", FailurePolicy::IdentityFallback);
     let strict = sample_identity("ecc", FailurePolicy::Strict);
     let scratch = tmp_dir("lax-vs-strict");
-    let cache = StageCache::open(&scratch).unwrap();
+    let cache = StageCache::open(scratch.path()).unwrap();
     let key_lax = StageKey::align(&fingerprint, &lax);
     cache
         .put_alignment(&key_lax, &[], &sample_alignment(2))
@@ -123,7 +114,7 @@ fn a_strict_run_does_not_reuse_a_lax_alignment() {
 #[test]
 fn changed_frame_is_a_miss() {
     let scratch = tmp_dir("changed-frame");
-    let cache = StageCache::open(&scratch).unwrap();
+    let cache = StageCache::open(scratch.path()).unwrap();
     let fingerprint = sample_fingerprint(2);
     let identity = sample_identity("ecc", FailurePolicy::Strict);
     let key = StageKey::align(&fingerprint, &identity);
@@ -224,7 +215,7 @@ fn a_renamed_input_directory_still_hits() {
     assert_eq!(key_a.digest(), key_b.digest());
 
     let scratch = tmp_dir("renamed");
-    let cache = StageCache::open(&scratch).unwrap();
+    let cache = StageCache::open(scratch.path()).unwrap();
     cache
         .put_alignment(&key_a, &[], &sample_alignment(3))
         .unwrap();
@@ -273,7 +264,7 @@ fn a_round_trip_preserves_every_bit() {
         ],
     };
     let scratch = tmp_dir("round-trip");
-    let cache = StageCache::open(&scratch).unwrap();
+    let cache = StageCache::open(scratch.path()).unwrap();
     cache.put_alignment(&key, &[], &alignment).unwrap();
     let back = cache.get_alignment(&key).expect("must hit");
 
@@ -292,7 +283,7 @@ fn a_round_trip_preserves_every_bit() {
 #[test]
 fn mtime_is_not_in_the_key() {
     let scratch = tmp_dir("mtime");
-    let frames_dir = scratch.join("frames");
+    let frames_dir = scratch.path().join("frames");
     fs::create_dir_all(&frames_dir).unwrap();
     let source = common::fixtures_dir().join("mantis-64").join("frames");
     let mut paths = Vec::new();
@@ -320,7 +311,7 @@ fn mtime_is_not_in_the_key() {
     let identity = sample_identity("ecc", FailurePolicy::Strict);
     let key_before = StageKey::align(&fingerprint_before, &identity);
 
-    let cache = StageCache::open(&scratch).unwrap();
+    let cache = StageCache::open(scratch.path()).unwrap();
     cache
         .put_alignment(&key_before, &paths, &sample_alignment(paths.len()))
         .unwrap();
@@ -347,7 +338,7 @@ fn mtime_is_not_in_the_key() {
 #[test]
 fn truncated_entry_is_a_miss() {
     let scratch = tmp_dir("truncated");
-    let cache = StageCache::open(&scratch).unwrap();
+    let cache = StageCache::open(scratch.path()).unwrap();
     let fingerprint = sample_fingerprint(2);
     let identity = sample_identity("ecc", FailurePolicy::Strict);
     let key = StageKey::align(&fingerprint, &identity);
@@ -366,7 +357,7 @@ fn truncated_entry_is_a_miss() {
 #[test]
 fn unrecognised_entry_format_is_a_miss() {
     let scratch = tmp_dir("unrecognised-format");
-    let cache = StageCache::open(&scratch).unwrap();
+    let cache = StageCache::open(scratch.path()).unwrap();
     let fingerprint = sample_fingerprint(2);
     let identity = sample_identity("ecc", FailurePolicy::Strict);
     let key = StageKey::align(&fingerprint, &identity);
@@ -386,7 +377,7 @@ fn unrecognised_entry_format_is_a_miss() {
 #[test]
 fn a_digest_collision_is_a_miss() {
     let scratch = tmp_dir("digest-collision");
-    let cache = StageCache::open(&scratch).unwrap();
+    let cache = StageCache::open(scratch.path()).unwrap();
     let fingerprint_a = sample_fingerprint(2);
     let mut fingerprint_b = fingerprint_a.clone();
     fingerprint_b.frames[0].file_size += 1;
@@ -412,7 +403,7 @@ fn a_digest_collision_is_a_miss() {
 #[test]
 fn alignment_entry_size_is_bounded() {
     let scratch = tmp_dir("entry-size");
-    let cache = StageCache::open(&scratch).unwrap();
+    let cache = StageCache::open(scratch.path()).unwrap();
     let fingerprint = sample_fingerprint(61);
     let identity = sample_identity("ecc", FailurePolicy::Strict);
     let key = StageKey::align(&fingerprint, &identity);

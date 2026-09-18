@@ -2,11 +2,9 @@
 
 //! `focusforge-cli export`: a project in, an image out.
 //!
-//! These are what prove the container changed the *destination* and not the
-//! *data*. One `laplacian` run over `fixtures/mantis-512` is shared through
-//! a `OnceLock` -- the same discipline `stack_cli.rs` uses -- and the
-//! library oracle beside it is the independent writer the exported composite
-//! is compared against, whole file for whole file.
+//! One `laplacian` run over `fixtures/mantis-512` is shared through a
+//! `OnceLock`; the library oracle beside it is the independent writer the
+//! exported composite is compared against, whole file for whole file.
 //!
 //! Every spawn isolates `.scratch/` with its own per-process temp directory
 //! and `.current_dir(dir)`: `stack`'s scratch tree is cwd-relative, so
@@ -28,7 +26,7 @@ use focusforge_core::registry;
 use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+    common::cli_bin("export_cli")
 }
 
 struct CliOutput {

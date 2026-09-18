@@ -11,9 +11,7 @@
 //! - **Byte-identical.** The composite is re-emitted from manifest data --
 //!   the exact `ImageDescription` the run recorded, the same twelve-tag IFD
 //!   `TiffWriter` always writes -- so an exported file equals the plane
-//!   fusion staged, byte for byte. That is what makes "the change in where
-//!   they live costs nothing in what they are" a checkable claim rather
-//!   than a hope.
+//!   fusion staged, byte for byte.
 //! - **A warning, never a silence.** A project whose sources cannot be
 //!   resolved relatively names every one of them on stderr and still writes
 //!   the image. `core` returns them as data; printing them is this
@@ -24,6 +22,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use focusforge_core::project::{self, Plane, Project};
+use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
 /// The frozen `export --json` schema, additive-only -- the same contract
@@ -47,9 +46,8 @@ pub struct ExportReport {
 
 /// Runs the subcommand.
 ///
-/// At least one of `-o`/`--zmap` is required **by name**, here rather than
-/// by clap -- the same posture `--algo` uses on `stack`: a usage error from
-/// clap exits 2 knowing nothing about what the command is for.
+/// At least one of `-o`/`--zmap` is required **by name**, checked here so
+/// the error names the missing flag instead of clap's generic exit 2.
 pub fn run(
     project_path: &Path,
     output: Option<&Path>,
@@ -77,15 +75,17 @@ pub fn run(
         .map(|s| s.path.clone())
         .collect();
     if !unresolved.is_empty() {
-        eprintln!(
+        let warning = format!(
             "warning: {} source frame(s) unresolved -- not reachable from this project, either \
              because the path was recorded as given or because it is no longer there. The \
              export below is unaffected; re-fusing or retouching would not be:",
             unresolved.len()
         );
+        eprintln!("{warning}");
         for path in &unresolved {
             eprintln!("  {path}");
         }
+        tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "{warning}");
     }
 
     let composite_ref = project.plane(Plane::Composite).clone();
@@ -154,6 +154,7 @@ fn render(report: &ExportReport) -> String {
 
 fn fail(message: impl std::fmt::Display) -> ExitCode {
     eprintln!("error: {message}");
+    tracing::error!(target: MIRRORED_OUTPUT_TARGET, "error: {message}");
     ExitCode::FAILURE
 }
 

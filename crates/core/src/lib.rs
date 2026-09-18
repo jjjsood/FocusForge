@@ -19,6 +19,7 @@ pub mod params;
 /// (`crates/cli`, `crates/gui`) -- one function so a stack run means the
 /// same thing regardless of which one started it.
 pub mod pipeline;
+mod pool;
 pub mod project;
 pub mod registry;
 pub mod tile;

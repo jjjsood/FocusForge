@@ -2,8 +2,8 @@
 
 //! Process-level coverage of `stack`'s grouping: the printed proposal, the
 //! grouping file and its three rejection modes, the multi-group run's four
-//! observable contracts, and the superset property -- one stack in, exactly
-//! today's run out.
+//! observable contracts, and the superset property -- a lone-group proposal
+//! runs identically to an ungrouped run.
 //!
 //! Every tree here is **built by the test**: no committed fixture frame
 //! carries a capture-time tag, so a tree copied from `fixtures/` would prove
@@ -23,10 +23,8 @@
 //! working directory either. The working directory a spawned process runs
 //! in is never a directory a test also feeds in as input, names as `-o`, or
 //! enumerates; it holds only the test's own named children and `.scratch/`.
-//! `single_stack_directory_matches_the_plain_invocation`, whose whole point
-//! is one directory serving as both input and `-o`, keeps that directory as
-//! a fixed-name child of its cwd rather than the cwd itself, so its
-//! basename -- and every assertion derived from it -- is unchanged.
+//! A test that uses one directory as both input and `-o` keeps it as a
+//! fixed-name child of its cwd, so its basename is stable.
 
 mod common;
 
@@ -37,7 +35,7 @@ use focusforge_core::io::TiffStack;
 use focusforge_core::io::test_frames::write_frame_with_capture_time;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+    common::cli_bin("groups_cli")
 }
 
 struct CliOutput {
@@ -177,9 +175,9 @@ fn grouping_is_printed_under_quiet() {
 
 // --- the superset property -------------------------------------------------
 
-/// One stack in, exactly today's run out -- compared byte for byte against
-/// a composite produced from the same frames named individually, which is
-/// the path that never went through grouping at all.
+/// A single stack runs identically to ungrouped frames -- compared byte for
+/// byte against a composite produced from the same frames named
+/// individually, the path that never went through grouping at all.
 #[test]
 fn single_stack_directory_matches_the_plain_invocation() {
     let cwd = common::tmp_dir("groups_cli_single_stack");
@@ -246,7 +244,7 @@ fn single_stack_directory_matches_the_plain_invocation() {
     let values = focusforge_core::params::resolved_values(&resolved);
     // The scheduler's own in-process scratch, distinct from `.scratch/` the
     // spawned CLI process writes -- a child of this test's cwd, not the
-    // shared `target/` it used to live directly under.
+    // shared `target/`.
     let options = focusforge_core::tile::TileSchedulerOptions::new(cwd.join("scratch"));
     let scheduler = focusforge_core::tile::TileScheduler::new(&stack, ctx, spp, &options)
         .expect("scheduler must build");
@@ -761,9 +759,8 @@ fn json_shape_is_unchanged_for_one_group_and_wrapped_for_many() {
 
 /// `-o` is a project-writing **directory** for every proposal size, and the two
 /// spellings -- `-o <file>` and `--zmap <file>` -- are refused **by name**,
-/// with the migration sentence, rather than by clap's generic
-/// "unexpected argument". Both refusals are group-independent, so they fire
-/// before the grouping is even computed.
+/// rather than by clap's generic "unexpected argument". Both refusals are
+/// group-independent, so they fire before the grouping is even computed.
 #[test]
 fn an_output_file_and_a_zmap_are_refused_by_name() {
     let dump = card_dump("groups_cli_output_placement");

@@ -15,5 +15,12 @@ gpu-tests = ["gpu"]
 
 [dependencies]
 focusforge-core = { path = "../core" }
+tracing = "0.1.44"
 wgpu = { version = "29.0.4", optional = true }
 thiserror = { version = "2.0.20", optional = true }
+
+# `tests/harness/errors.rs` installs a capturing layer of its own. Product
+# code in this crate raises events through the facade and never installs a
+# subscriber.
+[dev-dependencies]
+tracing-subscriber = "0.3.23"

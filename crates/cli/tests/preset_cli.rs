@@ -3,14 +3,12 @@
 //! Process-level coverage of `--preset`, `--write-preset`, `--status` and
 //! `--dry-run` on `focusforge-cli stack`.
 //!
-//! A new binary rather than more of `stack_cli.rs`, matching this crate's
-//! per-subject test layout. Every refusal path runs against `dummy-stack`
-//! (registered in this crate's test binary through `crates/cli/Cargo.toml`'s
-//! `[dev-dependencies]` feature, as `crates/cli/tests/algorithms_cmd.rs`
-//! documents) and never opens a tile. The byte-for-byte tests pay for a real
-//! `laplacian` fusion over `fixtures/mantis-512` with `--no-align --no-crop`,
-//! which is the cheapest invocation whose pixels actually depend on a
-//! parameter.
+//! Every refusal path runs against `dummy-stack` (registered in this crate's
+//! test binary through `crates/cli/Cargo.toml`'s `[dev-dependencies]`
+//! feature, as `crates/cli/tests/algorithms_cmd.rs` documents) and never
+//! opens a tile. The byte-for-byte tests pay for a real `laplacian` fusion
+//! over `fixtures/mantis-512` with `--no-align --no-crop`, which is the
+//! cheapest invocation whose pixels actually depend on a parameter.
 
 mod common;
 
@@ -18,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+    common::cli_bin("preset_cli")
 }
 
 fn mantis_512_dir() -> PathBuf {
@@ -89,12 +87,8 @@ fn read_bytes(path: &Path) -> Vec<u8> {
     std::fs::read(path).expect("output file must be readable")
 }
 
-/// The composite of `project`, exported beside it.
-///
-/// Two containers of the same stack are not byte-identical -- they carry
-/// different `created_at` stamps -- so every byte-level comparison here goes
-/// through `export`, which is the claim worth keeping anyway: the container
-/// changed where the payload lives, not what it is.
+/// The composite of `project`, exported beside it. Two containers of the
+/// same stack differ in `created_at`, so byte comparisons go through `export`.
 fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
     let exported = project.with_extension("exported.tif");
     let out = run_cli_in(
@@ -389,7 +383,7 @@ fn preset_supplies_the_algorithm_id() {
     let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("--json must parse");
     assert_eq!(report["algorithm"], "laplacian");
 
-    // Neither flag nor file: the existing refusal, now naming the preset key.
+    // Neither flag nor file: the refusal names the preset key.
     let empty = write_preset(&dir, "empty.toml", "[stack]\n");
     let out = run_cli_in(
         &dir,
@@ -555,9 +549,6 @@ fn dry_run_stops_before_alignment() {
             dir.to_str().unwrap(),
             "--algo",
             "laplacian",
-            // Two alignment algorithms are registered in this test binary
-            // (`dummy-align` and the real one), so the id is explicit here
-            // -- a dry run resolves the alignment half without running it.
             "--align-algo",
             "pyramidal-ecc",
             "--dry-run",
@@ -597,9 +588,6 @@ fn dry_run_json_is_not_a_stack_report() {
             output.parent().unwrap().to_str().unwrap(),
             "--algo",
             "laplacian",
-            // Two alignment algorithms are registered in this test binary
-            // (`dummy-align` and the real one), so the id is explicit here
-            // -- a dry run resolves the alignment half without running it.
             "--align-algo",
             "pyramidal-ecc",
             "--dry-run",

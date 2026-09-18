@@ -21,6 +21,7 @@ use focusforge_core::params::{self, ParamValue, ParamValues, Provenance, StackCo
 use focusforge_core::project::{self, PROJECT_EXTENSION};
 use focusforge_core::registry;
 use focusforge_core::tile::{TileScheduler, TileSchedulerOptions};
+use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
 use crate::align::{AlignOptions, AlignmentEntry, resolve_align_algo};
@@ -454,7 +455,33 @@ pub fn run(
         }
         let group_output = project_path(output, group);
         let identity = identities[i].clone();
-        let result = run_group(&setup, group, &group_output, identity.clone());
+        let group_start = Instant::now();
+        // A panic ends this group alone: the rest of the batch still runs,
+        // and the group is recorded exactly as any other refusal is. The
+        // unwinding run's own status sink never emitted, so the verdict
+        // needs a fresh one.
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_group(&setup, group, &group_output, identity.clone())
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                let status = StatusSink::new(preset_opts.status, identity.clone(), "stack");
+                let result = self::failed(
+                    &status,
+                    group_start,
+                    focusforge_diagnostics::panic_payload(&*payload),
+                );
+                if let Some(report) = focusforge_diagnostics::last_crash_report() {
+                    eprintln!("crash report: {}", report.display());
+                    tracing::error!(
+                        target: MIRRORED_OUTPUT_TARGET,
+                        "crash report: {}",
+                        report.display()
+                    );
+                }
+                result
+            }
+        };
         manifest.push(manifest_entry(group, identity, &result));
         match &result {
             GroupResult::Failed { .. } => failed = true,
@@ -475,6 +502,7 @@ pub fn run(
     // partial re-run, defeating the triage this supports.
     if let Err(msg) = write_manifest(output, dir, manifest) {
         eprintln!("warning: {msg}");
+        tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "warning: {msg}");
     }
 
     report_results(&results, json);
@@ -767,7 +795,13 @@ fn report_results(results: &[GroupResult], json: bool) {
         let wrapped = serde_json::json!({ "format": 1, "groups": documents });
         match serde_json::to_string_pretty(&wrapped) {
             Ok(text) => println!("{text}"),
-            Err(err) => eprintln!("error: failed to serialize JSON: {err}"),
+            Err(err) => {
+                eprintln!("error: failed to serialize JSON: {err}");
+                tracing::error!(
+                    target: MIRRORED_OUTPUT_TARGET,
+                    "error: failed to serialize JSON: {err}"
+                );
+            }
         }
         return;
     }
@@ -790,7 +824,13 @@ fn print_document<T: Serialize>(value: &T, json: bool, human: fn(&T) -> String) 
     if json {
         match serde_json::to_string_pretty(value) {
             Ok(text) => println!("{text}"),
-            Err(err) => eprintln!("error: failed to serialize JSON: {err}"),
+            Err(err) => {
+                eprintln!("error: failed to serialize JSON: {err}");
+                tracing::error!(
+                    target: MIRRORED_OUTPUT_TARGET,
+                    "error: failed to serialize JSON: {err}"
+                );
+            }
         }
     } else {
         println!("{}", human(value));
@@ -845,6 +885,11 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     let dir: &Path = dir;
 
     let start = Instant::now();
+    // Entered for this group alone, so an event raised anywhere below names
+    // the stack it belongs to.
+    let _stack = tracing::debug_span!("stack", identity = %identity).entered();
+    // Inside the span, so a forced crash carries this run's own context.
+    focusforge_diagnostics::force_crash("stack");
     let renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.quiet));
     let status = StatusSink::new(preset_opts.status, identity, "stack");
     status.set_algorithm(algo.id());
@@ -1043,6 +1088,16 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             lax: align_opts.lax,
         }
     });
+    // The key is the group name plus a short digest of the project path it
+    // will seal into. It must be stable across runs or `--resume` cannot
+    // find its ledger (`ResumeStore::find` skips a candidate whose
+    // `composite_output` no longer exists) -- the same invocation always
+    // produces the same key. The digest is what keeps two *different* runs
+    // that happen to propose the same group name apart: with the name
+    // alone, two runs collecting into two different `-o` directories would
+    // fight over one staging directory, which is not a collision the user
+    // asked for. With it, two runs collide exactly when they already share
+    // an output path.
     let staging_key = format!(
         "{}-{}",
         group.name,
@@ -1107,10 +1162,12 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             // The `.partial` file and the ledger deliberately survive a
             // clean cancel. Nothing on stdout: the `--json` report means a
             // completed run, the same way every failure path prints none.
-            eprintln!(
+            let notice = format!(
                 "cancelled -- {units_done} of {unit_total} unit(s) done; resume with: {}",
                 job::resume_recipe(argv)
             );
+            eprintln!("{notice}");
+            tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "{notice}");
             cancelled(&status, start)
         }
         Ok(focusforge_core::pipeline::FuseOutcome::Completed(report)) => {
@@ -1219,6 +1276,11 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
                 return;
             }
         }
+    }
+
+    fn notice(&self, message: &str) {
+        eprintln!("{message}");
+        tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "{message}");
     }
 }
 
@@ -1720,8 +1782,8 @@ mod tests {
 
     #[test]
     fn merge_manifest_entries_keeps_unrelated_entries_and_replaces_matching_ones() {
-        let dir = std::env::temp_dir().join(format!("ff-stack-merge-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let guard = tempfile::TempDir::with_prefix("ff-stack-merge-test-").unwrap();
+        let dir = guard.path();
         let path = dir.join("manifest.json");
         let existing = groups::RunManifest {
             format: groups::MANIFEST_FORMAT,
@@ -1740,17 +1802,12 @@ mod tests {
         assert_eq!(a.outputs, vec!["a2.ffp".to_string()]);
         let b = merged.iter().find(|e| e.identity() == "b").unwrap();
         assert_eq!(b.outputs, vec!["b.ffp".to_string()]);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn merge_manifest_entries_treats_a_mismatched_root_as_absent() {
-        let dir = std::env::temp_dir().join(format!(
-            "ff-stack-merge-mismatch-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
+        let guard = tempfile::TempDir::with_prefix("ff-stack-merge-mismatch-test-").unwrap();
+        let dir = guard.path();
         let path = dir.join("manifest.json");
         let existing = groups::RunManifest {
             format: groups::MANIFEST_FORMAT,
@@ -1763,7 +1820,5 @@ mod tests {
         let merged = merge_manifest_entries(&path, "root", fresh);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].identity(), "b");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

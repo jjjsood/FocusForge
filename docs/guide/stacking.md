@@ -74,7 +74,11 @@ present, `stack` uses it automatically; there is no opt-in flag. `--no-gpu`
 forces the CPU path regardless, and `cargo build --release
 --no-default-features` excludes the GPU path from the binary entirely. A
 missing or unusable adapter falls back to the CPU path on its own, printing
-why on stderr, never silently and never as a hard failure.
+why on stderr, never silently and never as a hard failure. If the graphics
+device is lost partway through a run, the tiles still to do run on the host
+instead, rather than failing the run; see
+[`guide/diagnostics.md`](diagnostics.md) for where that and other GPU errors
+are logged.
 Every GPU kernel produces the same result as its CPU counterpart, to within
 1 LSB at 16-bit, so switching backends changes speed, not the output — see
 `--json`'s `backend` field in

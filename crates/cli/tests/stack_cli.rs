@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Process-level coverage of `focusforge-cli stack`: a successful run, every
-//! rejection path, the Z-Map switch, the report's fields and the
-//! library-versus-CLI agreement.
+//! rejection path, the Z-Map every project carries, the report's fields and
+//! the library-versus-CLI agreement.
 //!
 //! Every test isolates `.scratch/` with its own per-process temp directory
 //! and `.current_dir(dir)`: `stack`'s scratch tree is cwd-relative, so
@@ -36,7 +36,7 @@ use focusforge_core::registry;
 use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+    common::cli_bin("stack_cli")
 }
 
 fn mantis_512_dir() -> PathBuf {
@@ -47,8 +47,7 @@ fn mantis_512_dir() -> PathBuf {
 /// -- used as the spawned process's own working directory, so `.scratch/`
 /// lands here and never collides with another test's.
 ///
-/// Derefs to `Path`, so `&dir` and `dir.join(..)` read exactly as they did
-/// when this was a bare `PathBuf`.
+/// Derefs to `Path`, so `&dir` and `dir.join(..)` work directly.
 struct TmpDir {
     path: PathBuf,
 }
@@ -155,16 +154,15 @@ fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
     }
 }
 
-/// The one `laplacian` run driven through the built binary: `-o`, `--zmap`
-/// and no `--set`, so `levels` resolves through its `auto` hook. Shared by
-/// every test that needs its output, its Z-Map or its report.
+/// The one `laplacian` run driven through the built binary: `-o` and no
+/// `--set`, so `levels` resolves through its `auto` hook. Shared by every
+/// test that needs its output, its Z-Map or its report.
 ///
 /// The run itself writes a **project**; `output` and `zmap` are what one
-/// `export` call then brings back out as files, so every downstream
-/// assertion below is unchanged by the move to a container and the ~50 s
-/// fusion is still paid exactly once.
+/// `export` call then brings back out as files, and the ~50 s fusion is
+/// paid exactly once.
 struct SharedRun {
-    /// The `.ffp` the run wrote -- the thing `stack` now produces.
+    /// The `.ffp` the run wrote.
     #[allow(dead_code)]
     project: PathBuf,
     output: PathBuf,
@@ -176,8 +174,7 @@ struct SharedRun {
     /// after this function returns, so the directory must outlive the
     /// `OnceLock` cell, not just the closure that fills it. The `OnceLock`
     /// static is never dropped, so `TmpDir::drop`'s `remove_dir_all` never
-    /// runs for this one -- the same lifetime the un-isolated shared
-    /// directory already had.
+    /// runs for this one.
     #[allow(dead_code)]
     _cwd: TmpDir,
 }
@@ -221,9 +218,7 @@ fn shared_laplacian_run() -> &'static SharedRun {
         let report: serde_json::Value =
             serde_json::from_str(&result.stdout).expect("--json must parse");
 
-        // One `export`, emitting both payloads from the one container the
-        // run wrote. That is the whole migration: the bytes are the same,
-        // they just come out one command later.
+        // One `export` emits both payloads from the container the run wrote.
         let exported = run_cli_in(
             &cwd,
             &[
@@ -277,8 +272,8 @@ fn library_oracle() -> &'static OracleResult {
 
         // This function spawns nothing, so `dir` need not outlive the
         // closure: both TIFFs below are read into `Vec<u16>` before it
-        // returns, and `dir`'s own `Drop` then cleans up -- cleanup this
-        // scratch directory did not have before.
+        // returns, and `dir`'s own `Drop` then cleans up the scratch
+        // directory.
         let dir = tmp_dir("stack_cli_oracle");
         let composite_path = dir.join("oracle.tif");
         let zmap_path = dir.join("oracle-zmap.tif");
@@ -733,9 +728,8 @@ fn report_json_has_every_field() {
     ] {
         assert!(report.get(key).is_some(), "missing key {key:?} in {report}");
     }
-    // `--algo dummy-stack` never resolves a backend at all (`crates/cli/src/stack.rs`'s
-    // `run`), so this run is the CPU half of the presence/absence check even on a
-    // default `gpu` build: the new field must be exactly `null`.
+    // `dummy-stack` never resolves a backend, so this is the CPU half of the
+    // check even on a `gpu` build: the field must be exactly `null`.
     assert_eq!(
         report["device_peak_in_flight"],
         serde_json::Value::Null,
@@ -752,9 +746,9 @@ fn report_json_has_every_field() {
 
 /// Every entered stage reports a number, `warp_write` is `null`
 /// (`stack` never enters it), and the human-text report carries the same
-/// breakdown on a `stages:` line. `dummy-align` converges immediately
-/// (`crates/cli/tests/cache_cli.rs`'s own doc comment), so this pays
-/// nothing for a real ECC solve.
+/// breakdown on a `stages:` line. `dummy-align` is a trivial fixed-point
+/// algorithm that converges immediately, so this pays nothing for a real
+/// ECC solve.
 #[test]
 fn stage_timings_are_reported_for_every_entered_stage() {
     let cwd = tmp_dir("stage_timings_every_entered_stage");
@@ -835,8 +829,8 @@ fn max_host_memory_lowers_never_raises_and_does_not_move_pixels() {
     std::fs::create_dir_all(&capped_dir).unwrap();
     std::fs::create_dir_all(&uncapped_dir).unwrap();
 
-    // `stack` writes a project into the directory `-o` names (it no longer
-    // writes a bare image), so each run gets its own output directory and
+    // `stack` writes a project into the directory `-o` names, not a bare
+    // image, so each run gets its own output directory and
     // the pixels are compared through `export_both` below.
     let common_args = |output_dir: &Path| {
         vec![
@@ -876,21 +870,9 @@ fn max_host_memory_lowers_never_raises_and_does_not_move_pixels() {
     assert!(uncapped.success, "stderr: {}", uncapped.stderr);
     let uncapped_report: serde_json::Value =
         serde_json::from_str(&uncapped.stdout).expect("--json must parse");
-    // Not a byte-for-byte comparison against a separate unflagged run's own
-    // reported number: each `stack` invocation is a separate process reading
-    // live host memory through its
-    // own fresh `OnceLock` (`crate::host::snapshot`), and this whole test
-    // suite runs with other memory-heavy `stack_cli` tests concurrently
-    // (cargo's own default), so "available" genuinely moves by hundreds of
-    // MB between two process launches a few seconds apart -- comparing
-    // `max_bytes_in_flight` across two separate invocations was observed
-    // flaky. What actually proves "a ceiling above the adaptive result
-    // changes nothing" without depending on two processes agreeing on a
-    // live-probed number: this run's own provenance did not fall to
-    // `Explicit` (which is what `HostBudget::capped_to` reports only when
-    // the ceiling actually bit), and its own budget is nowhere near the 1
-    // TiB ceiling -- no real host has that much RAM, so a value that close
-    // would itself mean the ceiling degenerated the budget.
+    // Budgets are not compared across processes: live host memory moves by
+    // hundreds of MB between launches. A ceiling that did not bite leaves the
+    // provenance non-`Explicit` and the budget far below the 1 TiB ceiling.
     assert_ne!(
         uncapped_report["budget_provenance"], "Explicit",
         "a ceiling above the adaptive result must not turn the budget explicit"
@@ -1304,12 +1286,7 @@ fn stack_output_carries_the_auto_crop() {
 }
 
 /// `-o` naming an existing **file** -- an input frame being the sharpest
-/// case -- is refused by name, with the migration sentence, before the
-/// input directory is read.
-///
-/// The old shape of this test pointed `--zmap` at an input frame; with the
-/// flag gone the reachable case is `-o`, and the composite-collides-with-an-
-/// input check stays in `run_group` as the defensive backstop it now is.
+/// case -- is refused by name, before the input directory is read.
 #[test]
 fn refuses_an_output_path_that_is_an_existing_file() {
     let cwd = tmp_dir("refuses_an_output_path_that_is_an_existing_file");

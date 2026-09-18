@@ -28,7 +28,7 @@ use std::process::Command;
 use focusforge_core::io::{Rect, TiffStack};
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+    common::cli_bin("cli_gpu")
 }
 
 fn mantis_512_dir() -> PathBuf {
@@ -712,5 +712,184 @@ fn device_peak_in_flight_is_scoped_to_its_own_group() {
         light_peak > heavy_peak,
         "the second group's own peak must be strictly less, which a prefix \
          maximum over both groups cannot produce: {doc}"
+    );
+}
+
+/// The JSON Lines log a spawned run writes under its own data directory.
+fn log_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("focusforge")
+        .join("logs")
+        .join("focusforge.jsonl")
+}
+
+/// Both payloads of `project`, exported beside it in one invocation.
+fn export_both(cwd: &Path, project: &Path) -> (PathBuf, PathBuf) {
+    let composite = project.with_extension("composite.tif");
+    let zmap = project.with_extension("zmap.tif");
+    let out = run(
+        cwd,
+        &[
+            "export",
+            project.to_str().unwrap(),
+            "-o",
+            composite.to_str().unwrap(),
+            "--zmap",
+            zmap.to_str().unwrap(),
+        ],
+    );
+    assert!(out.success, "export stderr: {}", out.stderr);
+    (composite, zmap)
+}
+
+/// `stack` over the standard fixture with alignment off and a tile size
+/// small enough to plan several tiles -- the shape both sides of the
+/// device-loss comparison run with. Alignment off means identity transforms
+/// on both sides, so the per-kernel one-LSB claim and the exact-Z-Map claim
+/// apply directly instead of through real alignment's near-tie
+/// disagreements.
+fn device_loss_stack_args(output_dir: &Path, extra: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "stack".to_string(),
+        mantis_512_dir().to_str().unwrap().to_string(),
+        "-o".to_string(),
+        output_dir.to_str().unwrap().to_string(),
+        "--algo".to_string(),
+        "laplacian".to_string(),
+        "--no-align".to_string(),
+        // 512 px of fixture at a 448 px tile plans four tiles, so destroying
+        // the device after the first leaves work for the host.
+        "--tile-size".to_string(),
+        "448".to_string(),
+        "--json".to_string(),
+    ];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    args
+}
+
+/// A device destroyed after the first fused tile finishes the run on the
+/// host: exit 0, the loss and its reason in the log, the frame tiles the
+/// host path actually read reported, and both planes equal to a host-only
+/// run's.
+#[test]
+fn device_lost_falls_back() {
+    let cwd = common::tmp_dir("cli_gpu_device_lost_cwd");
+    let dir = common::tmp_dir("cli_gpu_device_lost");
+    let gpu_dir = out_dir(&dir, "gpu");
+    let cpu_dir = out_dir(&dir, "cpu");
+
+    let mut cmd = common::cli_bin("cli_gpu_device_lost");
+    let data_dir = common::data_dir_of(&cmd);
+    // A device budget below one tile's own footprint floors the run at one
+    // tile in flight, so the first tile is genuinely finished -- and the
+    // device genuinely destroyed -- before the second is dispatched. Without
+    // it all four tiles are in flight at once and the destroy lands after
+    // the last of them has already been fused.
+    let gpu_args = device_loss_stack_args(&gpu_dir, &["--max-vram", "1MiB"]);
+    let gpu = cli_output(
+        cmd.args(gpu_args.iter().map(String::as_str))
+            .current_dir(&*cwd)
+            .env("FF_FORCE_DEVICE_LOST", "1")
+            .output()
+            .expect("failed to run binary"),
+    );
+    assert!(
+        gpu.success,
+        "a lost device must still finish the run -- stderr: {}",
+        gpu.stderr
+    );
+    let gpu_report: serde_json::Value =
+        serde_json::from_str(&gpu.stdout).expect("gpu run --json must parse");
+    assert_ne!(
+        gpu_report["backend"], "cpu",
+        "the run must have started on the GPU path: {gpu_report}"
+    );
+    assert!(
+        gpu_report["frame_tiles_read"]
+            .as_u64()
+            .is_some_and(|read| read > 0),
+        "the tiles finished on the host must be counted: {gpu_report}"
+    );
+
+    let log = std::fs::read_to_string(log_path(&data_dir)).expect("the run must write a log");
+    assert!(
+        log.contains("graphics device lost"),
+        "the log must name the device loss: {log}"
+    );
+    assert!(
+        log.contains("Destroyed"),
+        "the log must carry the loss's reason: {log}"
+    );
+
+    let cpu = run_owned(&cwd, &device_loss_stack_args(&cpu_dir, &["--no-gpu"]));
+    assert!(cpu.success, "cpu run stderr: {}", cpu.stderr);
+
+    let (gpu_composite, gpu_zmap) = export_both(&cwd, &gpu_dir.join("mantis-512.ffp"));
+    let (cpu_composite, cpu_zmap) = export_both(&cwd, &cpu_dir.join("mantis-512.ffp"));
+
+    let (gpu_samples, gpu_w, gpu_h, gpu_spp) = read_whole(&gpu_composite);
+    let (cpu_samples, cpu_w, cpu_h, cpu_spp) = read_whole(&cpu_composite);
+    assert_eq!((gpu_w, gpu_h, gpu_spp), (cpu_w, cpu_h, cpu_spp));
+    let diff = max_abs_diff(&gpu_samples, &cpu_samples);
+    assert!(
+        diff <= 1,
+        "a run finished on the host must stay within 1 LSB of a host-only run, got {diff}"
+    );
+
+    assert_eq!(
+        std::fs::read(&gpu_zmap).expect("read gpu zmap"),
+        std::fs::read(&cpu_zmap).expect("read cpu zmap"),
+        "the Z-Map must be identical on both sides"
+    );
+}
+
+/// The adapter and its limits are recorded once per process, whatever the
+/// number of stacks, and neither record reaches stderr -- the one
+/// `adapter selected: ` line stays the whole of a run's adapter output
+/// there.
+#[test]
+fn adapter_logged_once() {
+    let cwd = common::tmp_dir("cli_gpu_adapter_logged_cwd");
+    let in_holder = common::tmp_dir("cli_gpu_adapter_logged_in");
+    let out_holder = common::tmp_dir("cli_gpu_adapter_logged_out");
+    let root = build_two_group_root(&in_holder);
+    let out = out_dir(&out_holder, "out");
+
+    let mut cmd = common::cli_bin("cli_gpu_adapter_logged");
+    let data_dir = common::data_dir_of(&cmd);
+    let output = cli_output(
+        cmd.args([
+            "stack",
+            root.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--no-align",
+            "--lax",
+            "--json",
+        ])
+        .current_dir(&*cwd)
+        .output()
+        .expect("failed to run binary"),
+    );
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let log = std::fs::read_to_string(log_path(&data_dir)).expect("the run must write a log");
+    assert_eq!(
+        log.matches("graphics adapter selected").count(),
+        1,
+        "a two-group batch must record the adapter exactly once: {log}"
+    );
+    assert_eq!(
+        log.matches("graphics adapter and device limits").count(),
+        1,
+        "a two-group batch must record the limits exactly once: {log}"
+    );
+    assert_eq!(
+        output.stderr.matches("adapter selected: ").count(),
+        1,
+        "stderr must still carry exactly one adapter line: {}",
+        output.stderr
     );
 }

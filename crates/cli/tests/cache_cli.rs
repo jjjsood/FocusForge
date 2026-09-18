@@ -27,7 +27,7 @@ use focusforge_core::job::{JOB_RECORD_FORMAT, JobRecord, ResumeStore, StackFinge
 use focusforge_core::params::ParamValues;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+    common::cli_bin("cache_cli")
 }
 
 fn mantis_512_dir() -> PathBuf {

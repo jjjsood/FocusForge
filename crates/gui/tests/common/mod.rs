@@ -5,6 +5,7 @@
 //! already established -- never a literal `../..` string.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// `crates/gui/../..` -- the workspace root.
 pub fn workspace_root() -> PathBuf {
@@ -79,4 +80,18 @@ fn find_files_with_extension(dir: &Path, ext: &str) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// The built GUI, with `FOCUSFORGE_DATA_DIR` pointed at a fresh directory
+/// under `CARGO_TARGET_TMPDIR`, named for `test_name` and this process --
+/// mirrors `crates/cli/tests/common/mod.rs::cli_bin`, so a windowed test run
+/// never touches the developer's own data directory.
+#[allow(dead_code)]
+pub fn gui_bin(test_name: &str) -> Command {
+    let data_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("{test_name}-data-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_focusforge-gui"));
+    cmd.env("FOCUSFORGE_DATA_DIR", &data_dir);
+    cmd
 }

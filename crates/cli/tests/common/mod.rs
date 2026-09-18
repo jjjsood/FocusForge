@@ -5,6 +5,7 @@
 //! binary's own cwd is not the workspace root.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[path = "../../../core/tests/common/reference_stack.rs"]
 mod reference_stack;
@@ -31,8 +32,8 @@ pub fn fixtures_dir() -> PathBuf {
 /// -- used as a spawned process's own working directory, so `.scratch/`
 /// lands here and never collides with another test's.
 ///
-/// Derefs to `Path`, so `&dir` and `dir.join(..)` read exactly as they did
-/// when a test file's own copy of this type was a bare `PathBuf`.
+/// Derefs to `Path`, so `&dir` and `dir.join(..)` read exactly as a bare
+/// `PathBuf` would.
 ///
 /// `#[allow(dead_code)]`: not every test binary in this crate calls
 /// [`tmp_dir`].
@@ -80,7 +81,7 @@ pub fn tmp_dir(name: &str) -> TmpDir {
 /// Appends `--no-gpu` to `args` when this crate's own `gpu` feature is
 /// compiled in -- a no-op build has no such flag at all, not even as a
 /// no-op (`crates/cli/src/main.rs`'s own `#[cfg(feature = "gpu")]` on the
-/// arg). `gpu` became a default build feature, so any test that names a
+/// arg). `gpu` is a default build feature, so any test that names a
 /// real algorithm (`laplacian`, `depth-map`) and depends on running the CPU
 /// tile scheduler -- exact-byte equality against a CPU oracle, deterministic
 /// single-worker pause/resume timing -- must call this or silently start
@@ -94,4 +95,31 @@ pub fn push_no_gpu(mut args: Vec<&str>) -> Vec<&str> {
         args.push("--no-gpu");
     }
     args
+}
+
+/// The built CLI, with `FOCUSFORGE_DATA_DIR` pointed at a fresh directory
+/// per `test_name` and process, so a spawned run never touches the
+/// developer's own data directory and two parallel test binaries never
+/// share one.
+#[allow(dead_code)]
+pub fn cli_bin(test_name: &str) -> Command {
+    let data_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("{test_name}-data-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_focusforge-cli"));
+    cmd.env("FOCUSFORGE_DATA_DIR", &data_dir);
+    cmd
+}
+
+/// The `FOCUSFORGE_DATA_DIR` [`cli_bin`] set on `cmd`.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+pub fn data_dir_of(cmd: &Command) -> PathBuf {
+    cmd.get_envs()
+        .find(|(k, _)| *k == "FOCUSFORGE_DATA_DIR")
+        .and_then(|(_, v)| v)
+        .map(PathBuf::from)
+        .expect("cli_bin always sets FOCUSFORGE_DATA_DIR")
 }

@@ -68,6 +68,20 @@ pub enum Stage {
     Finalize,
 }
 
+impl Stage {
+    /// This stage's lower-case name, the spelling its key carries in
+    /// [`StageTimings`] and its span carries in the log.
+    fn name(self) -> &'static str {
+        match self {
+            Stage::Setup => "setup",
+            Stage::Align => "align",
+            Stage::Fuse => "fuse",
+            Stage::WarpWrite => "warp_write",
+            Stage::Finalize => "finalize",
+        }
+    }
+}
+
 /// Accumulates wall-clock seconds per [`Stage`] from one monotonic clock,
 /// the same `Instant`-epoch shape [`crate::job::control::JobControl`]
 /// already uses.
@@ -93,6 +107,7 @@ pub struct StageTimer {
     fuse_entered: bool,
     warp_write_entered: bool,
     finalize_entered: bool,
+    stage_span: Option<tracing::span::EnteredSpan>,
 }
 
 impl StageTimer {
@@ -122,7 +137,21 @@ impl StageTimer {
             fuse_entered: false,
             warp_write_entered: false,
             finalize_entered: false,
+            stage_span: None,
         }
+    }
+
+    /// Closes whatever stage span is open and enters one for the stage
+    /// about to run, so every event raised until the next [`Self::enter`]
+    /// or [`Self::mark`] names the stage it happened in. A timer that holds
+    /// an entered span is not `Send`: it stays on the thread that built it,
+    /// and an early return closes the span by dropping the timer.
+    pub fn enter(&mut self, stage: Stage) {
+        // Taken before the new span is created: a span created while the
+        // previous one is still entered would become its child rather than
+        // its sibling.
+        self.stage_span = None;
+        self.stage_span = Some(tracing::debug_span!("stage", stage = stage.name()).entered());
     }
 
     /// Closes the span since the last mark (or since [`Self::new`]) and
@@ -154,6 +183,7 @@ impl StageTimer {
                 self.finalize_entered = true;
             }
         }
+        self.stage_span = None;
     }
 
     /// How many times this timer has read the clock: one at [`Self::new`]

@@ -13,6 +13,8 @@ mod common;
 mod budget_gpu;
 #[path = "harness/device.rs"]
 mod device;
+#[path = "harness/errors.rs"]
+mod errors;
 #[path = "harness/parity.rs"]
 mod parity;
 #[path = "harness/parity_fusion.rs"]

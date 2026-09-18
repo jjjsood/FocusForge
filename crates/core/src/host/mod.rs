@@ -226,10 +226,8 @@ impl HostProbe for SysinfoProbe {
         let (cgroup_limit, cgroup_available, process_rss) = read_process_facts(&mut sys);
 
         // Not sysinfo's CPU list: `available_parallelism` already honours a
-        // cgroup CPU quota, and this codebase already reads it this way
-        // (`crates/core/src/tile/scheduler.rs`, `crates/gpu/src/budget.rs`),
-        // so a second source for the same number is exactly the duplication
-        // this module exists to avoid.
+        // cgroup CPU quota, so re-deriving the same number from sysinfo
+        // would be pure duplication.
         let logical_cores = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
@@ -289,6 +287,31 @@ pub fn snapshot() -> HostFacts {
     *SNAPSHOT.get_or_init(|| SysinfoProbe::new().facts())
 }
 
+/// What operating system this is, as far as the platform will say. Each
+/// field is `None` when the platform does not answer.
+///
+/// The host name is deliberately absent: it routinely carries the user's
+/// own name, and nothing here may leak it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OsDescription {
+    /// The distribution or operating system name, e.g. `Ubuntu`.
+    pub name: Option<String>,
+    /// The operating system version, e.g. `24.04`.
+    pub os_version: Option<String>,
+    /// The kernel version, e.g. `6.8.0-45-generic`.
+    pub kernel_version: Option<String>,
+}
+
+/// Reads this host's [`OsDescription`]. No `System` instance is built: all
+/// three are associated functions.
+pub fn os_description() -> OsDescription {
+    OsDescription {
+        name: System::name(),
+        os_version: System::os_version(),
+        kernel_version: System::kernel_version(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +322,15 @@ mod tests {
         assert_eq!(facts.origin(), FactsOrigin::Probed);
         assert!(facts.total_memory() > 0, "facts: {facts:?}");
         assert!(facts.logical_cores() >= 1);
+    }
+
+    #[test]
+    fn the_os_description_carries_at_least_a_name_or_a_kernel_version() {
+        let os = os_description();
+        assert!(os.name.is_some() || os.kernel_version.is_some(), "{os:?}");
+        for field in [&os.name, &os.os_version, &os.kernel_version] {
+            assert!(field.as_deref() != Some(""), "{os:?}");
+        }
     }
 
     #[test]

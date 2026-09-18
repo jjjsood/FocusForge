@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Process-level coverage of what a `stack` run now writes: **a project, not
+//! Process-level coverage of what a `stack` run writes: **a project, not
 //! an image**.
 //!
 //! Every run here is over `fixtures/mantis-64` (8 frames at 64x64, a real
@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+    common::cli_bin("project_cli")
 }
 
 struct CliOutput {
@@ -34,11 +34,6 @@ struct CliOutput {
 }
 
 /// Runs the binary with `cwd` as its working directory.
-///
-/// Every test that actually completes a run uses its **own** directory, the
-/// discipline `job_cli.rs` already follows: `.scratch/resume` and
-/// `.scratch/projects` are resolved relative to the process's cwd, so tests
-/// sharing one cwd share one ledger store and race each other's cleanup.
 fn run_cli_in(cwd: &Path, args: &[&str]) -> CliOutput {
     let output = bin()
         .current_dir(cwd)
@@ -96,10 +91,8 @@ fn extensions<'a>(files: &'a [PathBuf], ext: &str) -> Vec<&'a PathBuf> {
 /// A writable copy of `fixtures/mantis-64`, so a beside-the-frames run has
 /// somewhere legal to land.
 ///
-/// Returns the guard alongside the target path: `common::tmp_dir` returns a
-/// directory that deletes itself on drop, so a caller that only kept the
-/// `PathBuf` this used to return would have the tree removed before the CLI
-/// ever saw it.
+/// Returns the guard alongside the target path: dropping the guard deletes
+/// the tree, so the caller must hold it for as long as the path is in use.
 fn fixture_copy(name: &str) -> (common::TmpDir, PathBuf) {
     let dir = common::tmp_dir(name);
     let target = dir.join("mantis-64");
@@ -392,8 +385,8 @@ fn report_names_the_project_and_no_image() {
 /// cancelled run deliberately keeps its staged planes and its ledger so
 /// `--resume` can continue, where a failed one removes both.
 ///
-/// Driven the way `job_cli.rs` drives its own cancel tests -- a SIGINT once
-/// the fuse stage has actually started -- rather than by a sleep.
+/// Sends a SIGINT once the fuse stage has actually started, rather than
+/// sleeping for a fixed duration.
 #[test]
 fn cancel_keeps_the_staged_planes_for_resume() {
     use std::io::{BufRead, BufReader};

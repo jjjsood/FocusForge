@@ -12,12 +12,8 @@ workspace = true
 gpu = []
 test-algorithms = []
 
-# A dev-dependency on this very crate, the documented way to switch a
-# feature on for a package's own test targets: `crates/core/tests/grouping.rs`
-# builds its capture-time trees with `io::test_frames`, which lives behind
-# `test-algorithms` (see that module for why it cannot be `#[cfg(test)]`).
-# Without this line every `cargo test -p focusforge-core --test grouping`
-# would have to carry `--features test-algorithms` by hand.
+# A dev-dependency on this very crate, the documented way to switch on the
+# `test-algorithms` feature for a package's own test targets.
 [dev-dependencies]
 focusforge-core = { path = ".", features = ["test-algorithms"] }
 # `project_format.rs` reads a sealed container with an **independent**
@@ -26,6 +22,11 @@ focusforge-core = { path = ".", features = ["test-algorithms"] }
 blake3 = { version = "1.8.7", features = ["mmap", "rayon"] }
 zip = { version = "8.6.0", default-features = false }
 zstd = "0.14"
+# `tracing_spans.rs` installs a capturing layer of its own. Product code in
+# this crate raises events through the facade and never installs a
+# subscriber.
+tracing-subscriber = "0.3.23"
+tempfile = "3"
 
 [dependencies]
 blake3 = { version = "1.8.7", features = ["mmap", "rayon"] }
@@ -33,6 +34,7 @@ inventory = "0.3.24"
 memmap2 = "0.9.11"
 rayon = "1.12"
 thiserror = "2.0.20"
+tracing = "0.1.44"
 serde = { version = "1", features = ["derive"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 serde_json = "1"

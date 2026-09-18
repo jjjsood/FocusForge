@@ -56,6 +56,10 @@ GNU General Public License v3.
 - A single parameter schema drives every algorithm's settings; `focusforge-cli
   algorithms` lists what's registered, prints a schema, and validates
   `--set key=value` overrides against it
+- Keeps a structured log of every run and, on a crash, a report of what led
+  to it, all local to your own machine; `focusforge-cli diagnostics`
+  packages the evidence into one redacted ZIP, and the next start after a
+  crash tells you it's there
 
 ## Quick start
 

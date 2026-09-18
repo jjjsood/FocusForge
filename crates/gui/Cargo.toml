@@ -8,6 +8,9 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+trace = ["focusforge-diagnostics/trace"]
+
 [dependencies]
 slint = { version = "~1.17", default-features = false, features = [
     "std", "compat-1-2", "backend-winit", "renderer-femtovg-wgpu", "unstable-wgpu-29",
@@ -17,20 +20,18 @@ clap = { version = "4", features = ["derive"] }
 png = "0.18"
 thiserror = "2.0.20"
 focusforge-core = { path = "../core" }
+focusforge-diagnostics = { path = "../diagnostics" }
 focusforge-gpu = { path = "../gpu", features = ["gpu"] }
 toml = "1"
 serde = { version = "1", features = ["derive"] }
 directories = "6"
-# The native folder/file picker. Default features,
-# blocking `pick_folder`/`pick_file` only -- never `AsyncFileDialog`.
-# On Linux this pulls `ashpd` +
-# `pollster` (sync, no async runtime) via the `xdg-portal` default feature,
-# not GTK3.
 rfd = "0.17.2"
+tracing = "0.1.44"
 
 [build-dependencies]
 slint-build = "~1.17"
 
 [dev-dependencies]
 i-slint-backend-testing = "~1.17"
+serde_json = "1"
 tempfile = "3"

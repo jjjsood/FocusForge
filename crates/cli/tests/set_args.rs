@@ -6,10 +6,12 @@
 //! `crates/cli/Cargo.toml`'s `[dev-dependencies]` enables
 //! `focusforge-core/test-algorithms` for `CARGO_BIN_EXE_focusforge-cli`.
 
+mod common;
+
 use std::process::Command;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+    common::cli_bin("set_args")
 }
 
 #[test]

@@ -13,16 +13,14 @@ use std::process::Command;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+    common::cli_bin("cli")
 }
 
 /// Spawns the built CLI with `args`, in `dir` as its working directory.
 ///
 /// Returns the raw `std::process::Output` rather than a project-specific
 /// wrapper: every test in this file reads `output.status` (including its
-/// `Debug` rendering) and both byte streams directly, so a thinner spawn
-/// helper is the smaller diff than reshaping every call site around a
-/// `CliOutput` struct's field names.
+/// `Debug` rendering) and both byte streams directly.
 fn spawn_in(dir: &Path, args: &[&str]) -> std::process::Output {
     bin()
         .args(args)
@@ -425,8 +423,7 @@ fn info_exits_1_for_empty_directory() {
 /// With the `gpu` feature off, `stack` runs CPU-only:
 /// no GPU probing, no `--no-gpu` flag, and the additive `backend` field is
 /// always `"cpu"` -- run against `dummy-stack` (cheap: no pyramid, no
-/// alignment, no crop), the same pattern `crates/cli/tests/stack_cli.rs`
-/// already uses for its own inexpensive runs.
+/// alignment, no crop) to keep the run inexpensive.
 #[test]
 fn stack_defaults_to_cpu() {
     let cwd = common::tmp_dir("stack_defaults_to_cpu");
@@ -457,11 +454,8 @@ fn stack_defaults_to_cpu() {
     assert_eq!(report["backend"], "cpu", "report: {report}");
 }
 
-/// With the `gpu` feature off, `--no-gpu` does not exist at all -- not a
-/// silently-accepted no-op -- on either `stack` or `align`. Only meaningful
-/// without the feature: with it on, `--no-gpu` legitimately exists and this
-/// assertion would fail, not because of a bug but because the premise no
-/// longer holds -- `cli_gpu.rs` covers the feature-on behaviour instead.
+/// With the `gpu` feature off, `--no-gpu` does not exist on `stack` or
+/// `align` -- it is refused, not silently accepted.
 #[test]
 #[cfg(not(feature = "gpu"))]
 fn no_gpu_flag_absent_without_the_feature() {
@@ -481,7 +475,6 @@ fn no_gpu_flag_absent_without_the_feature() {
 #[ignore = "reads the 16 GB reference stack"]
 fn info_reads_the_reference_stack() {
     let Some(stack_dir) = common::reference_stack_dir() else {
-        eprintln!("skip: reference stack not found");
         return;
     };
 
