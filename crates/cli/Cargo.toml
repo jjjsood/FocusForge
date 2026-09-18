@@ -31,6 +31,7 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 focusforge-core = { path = "../core", features = ["test-algorithms"] }
+tempfile = "3"
 # Reading a written bundle back, with the same pinned feature set the
 # writer uses.
 zip = { version = "8.6.0", default-features = false }

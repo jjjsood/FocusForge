@@ -30,6 +30,14 @@ const SOCKET_ENV: &str = "FF_CRASH_SOCKET";
 /// The [`MONITOR_ENV`] value that switches native-crash capture off.
 const CAPTURE_OFF: &str = "off";
 
+/// The one argument a re-spawned monitor carries. Nothing reads it: both
+/// entry points decide from [`MONITOR_ENV`] before any argument parser
+/// runs, so the monitor never sees it. It is there for an executable that
+/// is not one of them -- a libtest binary, whose argument parser rejects
+/// the unknown option and exits instead of running its whole test list
+/// again in every generation of a re-spawn chain.
+const MONITOR_ARG: &str = "--focusforge-crash-monitor";
+
 /// The monitor ends its loop when no application has connected within this
 /// period, so a monitor whose parent died before connecting cannot linger.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -143,8 +151,8 @@ fn signal_name(signal: u32) -> String {
 /// Runs this process as its parent's crash monitor when `FF_CRASH_MONITOR`
 /// marks it as one, returning the exit code to leave with; `None` means
 /// this process is an ordinary application run. Call as the first statement
-/// of `main`, before any argument parser sees the empty argument list a
-/// re-spawned monitor carries.
+/// of `main`, before any argument parser sees the argument a re-spawned
+/// monitor carries.
 pub fn run_monitor() -> Option<i32> {
     let socket = std::env::var_os(MONITOR_ENV)?
         .to_string_lossy()
@@ -328,6 +336,7 @@ pub(crate) fn attach(
     let socket = socket_string();
     let executable = std::env::current_exe().map_err(Error::Spawn)?;
     let mut monitor = Command::new(executable)
+        .arg(MONITOR_ARG)
         .env(MONITOR_ENV, &socket)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

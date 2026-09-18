@@ -443,6 +443,47 @@ fn monitor_exits_with_app() {
 }
 
 #[test]
+fn monitor_runs_with_the_argument_it_is_spawned_with() {
+    #[cfg(not(target_os = "linux"))]
+    println!("skipped: a bound socket is read from /proc/net/unix");
+
+    #[cfg(target_os = "linux")]
+    {
+        let socket = format!("focusforge-crash-cli-{}", std::process::id());
+        let mut monitor = Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+            .arg("--focusforge-crash-monitor")
+            .env("FF_CRASH_MONITOR", &socket)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to run the binary");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let bound = loop {
+            let sockets = std::fs::read_to_string("/proc/net/unix").unwrap_or_default();
+            if sockets.contains(&format!("@{socket}")) {
+                break true;
+            }
+            if monitor.try_wait().is_ok_and(|exited| exited.is_some()) || Instant::now() >= deadline
+            {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let _ = monitor.kill();
+        let output = monitor
+            .wait_with_output()
+            .expect("failed to reap the monitor");
+        assert!(
+            bound,
+            "a monitor spawned with that argument must bind its socket, not parse it: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn monitor_unavailable() {
     let unbindable = common::tmp_dir("crash_cli_monitor_unavailable")
         .join("absent")

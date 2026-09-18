@@ -69,9 +69,8 @@ pub struct Preset {
     pub align: ParamValues,
 }
 
-/// The four preset/status/dry-run flags, bundled so `stack::run` and
-/// `align::run` stay under clippy's argument-count lint -- the dodge
-/// [`crate::align::AlignOptions`] and [`crate::job::JobOptions`] already use.
+/// The four preset/status/dry-run flags, bundled to keep `stack::run` and
+/// `align::run`'s argument count down.
 pub struct PresetOptions<'a> {
     pub preset: Option<&'a Path>,
     pub write_preset: Option<&'a Path>,
@@ -101,22 +100,21 @@ pub fn write(preset: &Preset, path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use focusforge_core::params::ParamValue;
 
-    /// `std::env::temp_dir()`, not `CARGO_TARGET_TMPDIR`: the latter is set
-    /// only when cargo builds an integration test or a benchmark, never for
-    /// a unit test compiled into the binary itself.
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("focusforge-preset-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A directory of its own for one test, removed when the returned guard
+    /// drops. A guard from `tempfile`, not `CARGO_TARGET_TMPDIR`: the latter
+    /// is set only when cargo builds an integration test or a benchmark,
+    /// never for a unit test compiled into the binary itself.
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::TempDir::with_prefix("focusforge-preset-").unwrap()
     }
 
-    fn write_temp(name: &str, text: &str) -> PathBuf {
-        let path = temp_dir().join(name);
+    fn write_temp(dir: &Path, name: &str, text: &str) -> PathBuf {
+        let path = dir.join(name);
         std::fs::write(&path, text).unwrap();
         path
     }
@@ -128,7 +126,9 @@ mod tests {
 
     #[test]
     fn load_reads_both_tables_and_both_scalars() {
+        let dir = temp_dir();
         let path = write_temp(
+            dir.path(),
             "preset_load_reads_both_tables.toml",
             "algo = \"a\"\nalign-algo = \"b\"\n\n[stack]\nlevels = 5\n\n[align]\nrho = 0.25\n",
         );
@@ -141,7 +141,12 @@ mod tests {
 
     #[test]
     fn load_names_the_path_and_the_detail_on_a_parse_error() {
-        let path = write_temp("preset_load_parse_error.toml", "[stack\nlevels = 5\n");
+        let dir = temp_dir();
+        let path = write_temp(
+            dir.path(),
+            "preset_load_parse_error.toml",
+            "[stack\nlevels = 5\n",
+        );
         let err = load(Some(&path)).expect_err("a malformed preset must refuse");
         assert!(
             err.contains("preset_load_parse_error.toml"),
@@ -151,15 +156,20 @@ mod tests {
 
     #[test]
     fn load_refuses_an_unknown_table() {
-        let path = write_temp("preset_load_unknown_table.toml", "[stacking]\nlevels = 5\n");
+        let dir = temp_dir();
+        let path = write_temp(
+            dir.path(),
+            "preset_load_unknown_table.toml",
+            "[stacking]\nlevels = 5\n",
+        );
         let err = load(Some(&path)).expect_err("an unknown table must refuse");
         assert!(err.contains("stacking"), "refusal must name the key: {err}");
     }
 
     #[test]
     fn load_refuses_a_missing_file() {
-        let path = temp_dir().join("preset_absent.toml");
-        let _ = std::fs::remove_file(&path);
+        let dir = temp_dir();
+        let path = dir.path().join("preset_absent.toml");
         let err = load(Some(&path)).expect_err("a missing preset must refuse");
         assert!(err.contains("preset_absent.toml"), "{err}");
     }
