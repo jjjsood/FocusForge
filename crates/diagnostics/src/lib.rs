@@ -6,6 +6,7 @@
 //! bridge, by `log`-crate records (`wgpu`, `naga`).
 
 mod crash;
+mod native;
 mod ring;
 mod rotating;
 
@@ -16,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::prelude::*;
 
+pub use native::run_monitor;
 use ring::Ring;
 use rotating::RotatingFile;
 
@@ -62,6 +64,9 @@ pub struct Options {
 /// The subscriber's resolved state, returned by [`init`].
 pub struct Diagnostics {
     log_path: Option<PathBuf>,
+    /// Kept for the run's whole length: dropping it detaches the crash
+    /// handler and lets the monitor process exit.
+    _native: Option<native::Guard>,
 }
 
 impl Diagnostics {
@@ -262,27 +267,44 @@ pub fn init(options: &Options) -> Diagnostics {
         .init();
 
     let binary = binary_name();
+    let version = env!("CARGO_PKG_VERSION");
+    let mut guard = None;
     if let Some(data_dir) = options.data_dir.as_deref() {
-        crash::install_hook(data_dir.join("crashes"), ring, binary.clone());
+        let crash_dir = data_dir.join("crashes");
+        crash::install_hook(crash_dir.clone(), ring, binary.clone());
+        guard = match native::attach(&crash_dir, &binary, version) {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::warn!(
+                    target: "focusforge_diagnostics",
+                    error = %e,
+                    "native crashes will not be captured"
+                );
+                None
+            }
+        };
     }
     configure_global_pool();
 
     tracing::info!(
         target: "focusforge_diagnostics",
         binary = %binary,
-        version = env!("CARGO_PKG_VERSION"),
+        version,
         "starting"
     );
 
-    Diagnostics { log_path }
+    Diagnostics {
+        log_path,
+        _native: guard,
+    }
 }
 
-/// Panics when the `FF_FORCE_CRASH` environment variable names `site`, so
-/// the crash path can be exercised on a real binary: `panic` and `pool` at
-/// `"startup"` -- on the calling thread and on a worker of the global pool
-/// respectively -- and `stack` at `"stack"`, which fires for the first
-/// stack of a run only, leaving the rest to run. Any other value does
-/// nothing, as does an unset variable.
+/// Crashes when the `FF_FORCE_CRASH` environment variable names `site`, so
+/// the crash path can be exercised on a real binary. At `"startup"`:
+/// `panic` and `pool` panic on the calling thread and on a pool worker,
+/// `segv`, `stack-overflow` and `abort` raise the native crash they name.
+/// At `"stack"`, `stack` panics for a run's first stack alone. Any other
+/// value does nothing, as does an unset variable.
 pub fn force_crash(site: &str) {
     let Some(kind) = std::env::var_os("FF_FORCE_CRASH") else {
         return;
@@ -299,6 +321,7 @@ pub fn force_crash(site: &str) {
             });
             let _ = rx.recv();
         }
+        ("startup", kind @ ("segv" | "stack-overflow" | "abort")) => native::raise(kind),
         ("stack", "stack") => {
             static FIRED: AtomicBool = AtomicBool::new(false);
             if !FIRED.swap(true, Ordering::SeqCst) {

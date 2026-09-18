@@ -211,6 +211,11 @@ fn install_input_table(
 }
 
 fn main() {
+    // Ahead of every parser: a re-spawned monitor process carries no
+    // arguments of its own and never opens a window.
+    if let Some(code) = focusforge_diagnostics::run_monitor() {
+        std::process::exit(code);
+    }
     let _diagnostics = focusforge_diagnostics::init(&focusforge_diagnostics::Options {
         data_dir: focusforge_diagnostics::data_dir_from_env(),
         verbosity: 0,

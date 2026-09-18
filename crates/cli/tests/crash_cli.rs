@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! What a panic leaves behind, seen from outside the process: the crash
+//! What a crash leaves behind, seen from outside the process: the panic
 //! report, the default panic text the previously installed hook still
-//! prints, the exit code, and a batch run whose first stack panics while
-//! the rest run.
+//! prints, the exit code, a batch run whose first stack panics while the
+//! rest run, and -- for a native crash no panic hook can see -- the
+//! minidump and metadata pair the monitor process writes.
 //!
 //! Every case spawns a child through `common::cli_bin`, whose
 //! `FOCUSFORGE_DATA_DIR` override keeps reports out of the tester's own
-//! data directory, and forces the panic with `FF_FORCE_CRASH`.
+//! data directory, and forces the crash with `FF_FORCE_CRASH`.
 
 mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use focusforge_core::io::test_frames::write_frame_with_capture_time;
 
@@ -240,5 +242,250 @@ fn panicking_stack_fails_alone() {
         stderr.contains(&path.display().to_string()),
         "stderr names the crash report {}, got: {stderr}",
         path.display()
+    );
+}
+
+/// The minidump and its metadata, polled for up to five seconds: the
+/// monitor writes them after the application process is already dead, and
+/// the metadata is written last, so its presence marks the pair complete.
+#[cfg(unix)]
+fn native_crash_files(dir: &Path) -> (PathBuf, serde_json::Value) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map(|entries| entries.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        let of_extension = |ext: &str| -> Vec<PathBuf> {
+            paths
+                .iter()
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(ext))
+                .cloned()
+                .collect()
+        };
+        let dumps = of_extension("dmp");
+        let metadata = of_extension("json");
+        if dumps.len() == 1
+            && metadata.len() == 1
+            && let Ok(body) = std::fs::read_to_string(&metadata[0])
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body)
+        {
+            assert_eq!(
+                dumps[0].file_stem(),
+                metadata[0].file_stem(),
+                "the dump and its metadata share one stem"
+            );
+            let bytes = std::fs::read(&dumps[0]).expect("the minidump must be readable");
+            assert!(
+                bytes.starts_with(b"MDMP"),
+                "{} must begin with the minidump magic, got {:?}",
+                dumps[0].display(),
+                &bytes[..bytes.len().min(4)]
+            );
+            return (dumps[0].clone(), parsed);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no minidump and metadata pair under {} within five seconds, got {paths:?}",
+            dir.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Runs the CLI with `FF_FORCE_CRASH` set to `kind`, returning the child's
+/// pid and the signal it died from.
+#[cfg(unix)]
+fn crash_child(cmd: &mut Command, kind: &str) -> (u32, i32) {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut child = cmd
+        .env("FF_FORCE_CRASH", kind)
+        .arg("algorithms")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to run the binary");
+    let pid = child.id();
+    let status = child.wait().expect("failed to wait for the binary");
+    let signal = status
+        .signal()
+        .unwrap_or_else(|| panic!("the child must die from a signal, got {status:?}"));
+    (pid, signal)
+}
+
+/// The metadata's own account of the crash, checked against the child that
+/// produced it.
+#[cfg(unix)]
+fn assert_metadata(metadata: &serde_json::Value, pid: u32, reason: &str, dump: &Path) {
+    assert_eq!(metadata["binary"], "focusforge-cli");
+    assert_eq!(metadata["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(metadata["pid"], pid);
+    assert_eq!(metadata["reason"], reason);
+    assert_eq!(
+        metadata["minidump"],
+        dump.file_name().unwrap().to_string_lossy().as_ref()
+    );
+    assert!(
+        metadata["timestamp"]
+            .as_str()
+            .is_some_and(|t| t.contains(':') && t.ends_with('Z')),
+        "the metadata keeps full RFC 3339 precision: {}",
+        metadata["timestamp"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_segfault() {
+    let mut cmd = common::cli_bin("crash_cli_native_segfault");
+    let (pid, signal) = crash_child(&mut cmd, "segv");
+    assert_eq!(signal, 11, "a forced segfault dies from SIGSEGV");
+
+    let (dump, metadata) = native_crash_files(&crashes_dir(&cmd));
+    assert_metadata(&metadata, pid, "SIGSEGV", &dump);
+    assert!(
+        dump.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("focusforge-cli"),
+        "the dump names the binary: {}",
+        dump.display()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_stack_overflow() {
+    let mut cmd = common::cli_bin("crash_cli_native_stack_overflow");
+    let (pid, signal) = crash_child(&mut cmd, "stack-overflow");
+    assert_eq!(signal, 11, "an overflowed stack dies from SIGSEGV");
+
+    let (dump, metadata) = native_crash_files(&crashes_dir(&cmd));
+    assert_metadata(&metadata, pid, "SIGSEGV", &dump);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_abort() {
+    let mut cmd = common::cli_bin("crash_cli_native_abort");
+    let (pid, signal) = crash_child(&mut cmd, "abort");
+    assert_eq!(signal, 6, "a forced abort dies from SIGABRT");
+
+    let (dump, metadata) = native_crash_files(&crashes_dir(&cmd));
+    assert_metadata(&metadata, pid, "SIGABRT", &dump);
+}
+
+/// Every live process whose environment carries both `data_dir` and the
+/// monitor marker -- the monitor spawned for a run under that directory,
+/// and nothing else on the machine.
+#[cfg(target_os = "linux")]
+fn monitors_under(data_dir: &Path) -> Vec<u32> {
+    let expected = format!("FOCUSFORGE_DATA_DIR={}", data_dir.display());
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(environ) = std::fs::read(entry.path().join("environ")) else {
+            continue;
+        };
+        let vars: Vec<&[u8]> = environ.split(|b| *b == 0).collect();
+        if vars.contains(&expected.as_bytes())
+            && vars.iter().any(|v| v.starts_with(b"FF_CRASH_MONITOR="))
+        {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+#[test]
+fn monitor_exits_with_app() {
+    #[cfg(not(target_os = "linux"))]
+    println!("skipped: the monitor's lifetime is read from /proc");
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut monitored = common::cli_bin("crash_cli_monitor_exits_monitored");
+        let with_monitor = monitored
+            .arg("algorithms")
+            .output()
+            .expect("failed to run the binary");
+
+        let mut plain = common::cli_bin("crash_cli_monitor_exits_plain");
+        let without_monitor = plain
+            .env("FF_CRASH_MONITOR", "off")
+            .arg("algorithms")
+            .output()
+            .expect("failed to run the binary");
+
+        assert_eq!(with_monitor.status.code(), without_monitor.status.code());
+        assert_eq!(with_monitor.stdout, without_monitor.stdout);
+        assert_eq!(
+            String::from_utf8_lossy(&with_monitor.stderr),
+            String::from_utf8_lossy(&without_monitor.stderr)
+        );
+
+        let data_dir = common::data_dir_of(&monitored);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = monitors_under(&data_dir);
+            if left.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the monitor outlived the run it belongs to: {left:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[test]
+fn monitor_unavailable() {
+    let unbindable = common::tmp_dir("crash_cli_monitor_unavailable")
+        .join("absent")
+        .join("crash.sock");
+
+    let mut cmd = common::cli_bin("crash_cli_monitor_unavailable_run");
+    let output = cmd
+        .env("FF_CRASH_SOCKET", &unbindable)
+        .arg("algorithms")
+        .output()
+        .expect("failed to run the binary");
+
+    assert!(
+        output.status.success(),
+        "a monitor that cannot start must not fail the run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("laplacian"),
+        "the command still prints its usual output: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let log = common::data_dir_of(&cmd)
+        .join("focusforge")
+        .join("logs")
+        .join("focusforge.jsonl");
+    let contents = std::fs::read_to_string(&log)
+        .unwrap_or_else(|e| panic!("log file must exist at {}: {e}", log.display()));
+    let warnings: Vec<&str> = contents
+        .lines()
+        .filter(|line| {
+            let record: serde_json::Value =
+                serde_json::from_str(line).expect("every log line is JSON");
+            record["level"] == "WARN"
+                && record["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("native crashes"))
+        })
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "exactly one WARN record names the missing native-crash capture, got {warnings:?}"
     );
 }

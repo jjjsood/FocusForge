@@ -4,7 +4,8 @@
 //! panic, holding the panic's own facts and the flight recorder's dump.
 
 use std::backtrace::Backtrace;
-use std::io::Write;
+use std::fs::File;
+use std::io::{self, Write};
 use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -14,7 +15,7 @@ use crate::ring::Ring;
 
 /// The crash report's schema version. Additive-only: a later field must not
 /// break a reader written against this one.
-const CRASH_REPORT_FORMAT: u32 = 1;
+pub(crate) const CRASH_REPORT_FORMAT: u32 = 1;
 
 /// The path of the last report this process wrote, so a caught panic can
 /// point at it.
@@ -55,10 +56,7 @@ fn write_report(
     backtrace: &str,
     ring: Vec<String>,
 ) -> Option<PathBuf> {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let seconds = now_seconds();
     let location = info.location();
     let report = serde_json::json!({
         "format": CRASH_REPORT_FORMAT,
@@ -73,28 +71,65 @@ fn write_report(
     });
     let body = serde_json::to_vec_pretty(&report).ok()?;
 
-    std::fs::create_dir_all(crash_dir).ok()?;
-    let path = crash_dir.join(format!(
-        "{}.json",
-        report_stem(seconds, binary, std::process::id())
-    ));
-    let mut file = std::fs::File::create_new(&path).ok()?;
+    let stem = report_stem(seconds, binary, std::process::id());
+    let (mut file, path) = create_new_numbered(crash_dir, &stem, "json").ok()?;
     file.write_all(&body).ok()?;
     file.flush().ok()?;
     Some(path)
 }
 
+/// The number of stems tried before giving up, which bounds the work done
+/// inside a panic hook.
+const MAX_STEM_ATTEMPTS: u32 = 64;
+
+/// Creates `<dir>/<stem>.<extension>`, or the first free
+/// `<stem>-2.<extension>`, `<stem>-3.<extension>`, ... when that name is
+/// taken. Two crash events in the same second of the same process share a
+/// stem, and neither may overwrite the other.
+pub(crate) fn create_new_numbered(
+    dir: &Path,
+    stem: &str,
+    extension: &str,
+) -> io::Result<(File, PathBuf)> {
+    std::fs::create_dir_all(dir)?;
+    for attempt in 1..=MAX_STEM_ATTEMPTS {
+        let name = if attempt == 1 {
+            format!("{stem}.{extension}")
+        } else {
+            format!("{stem}-{attempt}.{extension}")
+        };
+        let path = dir.join(name);
+        match File::create_new(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("{MAX_STEM_ATTEMPTS} crash files already carry the stem {stem}"),
+    ))
+}
+
 /// `<YYYYMMDD>T<HHMMSS>Z-<binary>-<pid>`: basic ISO 8601, whose lack of a
 /// `:` is what makes the name legal on every target filesystem. Full
 /// RFC 3339 precision lives in the report body instead.
-fn report_stem(unix_seconds: i64, binary: &str, pid: u32) -> String {
+pub(crate) fn report_stem(unix_seconds: i64, binary: &str, pid: u32) -> String {
     let (year, month, day) = civil_from_unix(unix_seconds);
     let (hour, minute, second) = time_of_day(unix_seconds);
     format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z-{binary}-{pid}")
 }
 
+/// Now, as whole seconds since the Unix epoch.
+pub(crate) fn now_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// The same instant as an RFC 3339 UTC timestamp.
-fn rfc3339(unix_seconds: i64) -> String {
+pub(crate) fn rfc3339(unix_seconds: i64) -> String {
     let (year, month, day) = civil_from_unix(unix_seconds);
     let (hour, minute, second) = time_of_day(unix_seconds);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
@@ -142,6 +177,70 @@ mod tests {
             "20240229T120000Z-focusforge-gui-7"
         );
         assert!(!report_stem(0, "focusforge-cli", 1).contains(':'));
+    }
+
+    #[test]
+    fn a_second_file_under_one_stem_is_numbered_rather_than_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = "20260917T142530Z-focusforge-cli-7";
+
+        let (mut first, first_path) = create_new_numbered(dir.path(), stem, "json").unwrap();
+        first.write_all(b"first").unwrap();
+        let (mut second, second_path) = create_new_numbered(dir.path(), stem, "json").unwrap();
+        second.write_all(b"second").unwrap();
+        let (_, third_path) = create_new_numbered(dir.path(), stem, "json").unwrap();
+
+        assert_eq!(
+            first_path.file_name().unwrap(),
+            "20260917T142530Z-focusforge-cli-7.json"
+        );
+        assert_eq!(
+            second_path.file_name().unwrap(),
+            "20260917T142530Z-focusforge-cli-7-2.json"
+        );
+        assert_eq!(
+            third_path.file_name().unwrap(),
+            "20260917T142530Z-focusforge-cli-7-3.json"
+        );
+        assert_eq!(std::fs::read_to_string(&first_path).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&second_path).unwrap(), "second");
+    }
+
+    #[test]
+    fn a_stem_differing_only_in_pid_stays_unsuffixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, first) = create_new_numbered(
+            dir.path(),
+            &report_stem(1789482330, "focusforge-cli", 7),
+            "json",
+        )
+        .unwrap();
+        let (_, second) = create_new_numbered(
+            dir.path(),
+            &report_stem(1789482330, "focusforge-cli", 8),
+            "json",
+        )
+        .unwrap();
+
+        assert_eq!(
+            first.file_name().unwrap(),
+            "20260915T142530Z-focusforge-cli-7.json"
+        );
+        assert_eq!(
+            second.file_name().unwrap(),
+            "20260915T142530Z-focusforge-cli-8.json"
+        );
+    }
+
+    #[test]
+    fn the_minidump_and_its_metadata_share_one_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, dump) =
+            create_new_numbered(dir.path(), "20260917T142530Z-focusforge-cli-7", "dmp").unwrap();
+        let metadata = dump.with_extension("json");
+
+        assert_eq!(dump.file_stem(), metadata.file_stem());
+        assert_eq!(dump.extension().unwrap(), "dmp");
     }
 
     #[test]

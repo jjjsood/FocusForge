@@ -332,6 +332,11 @@ fn command_name(command: &Command) -> &'static str {
 }
 
 fn main() -> ExitCode {
+    // Ahead of every parser: a re-spawned monitor process carries no
+    // arguments of its own and never reaches the application's own work.
+    if let Some(code) = focusforge_diagnostics::run_monitor() {
+        return ExitCode::from(code as u8);
+    }
     let cli = Cli::parse();
     let _diagnostics = focusforge_diagnostics::init(&focusforge_diagnostics::Options {
         data_dir: focusforge_diagnostics::data_dir_from_env(),
