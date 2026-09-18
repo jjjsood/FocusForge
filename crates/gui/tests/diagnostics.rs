@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! `focusforge-gui` installs the same subscriber and panic hook as the CLI
-//! before its window opens. `--settings-section nope` exits through
-//! `std::process::exit` and `FF_FORCE_CRASH=panic` panics, both before any
-//! window is created (`crates/gui/src/main.rs`), so this runs on a headless
-//! host, unlike `window.rs`.
+//! before its window opens. `--settings-section nope` ends with exit code 2
+//! and `FF_FORCE_CRASH=panic` panics, both before any window is created
+//! (`crates/gui/src/main.rs`), so this runs on a headless host, unlike
+//! `window.rs`.
 
 mod common;
 
@@ -122,6 +122,35 @@ fn the_settings_section_refusal_reaches_the_log_and_prints_once() {
         }),
         "no ERROR record carries the refusal: {contents}"
     );
+}
+
+/// The trace's closing bracket is written from the flush guard's
+/// destructor, so a run that ends before any window exists still has to
+/// unwind out of `main` for the file to be readable.
+#[cfg(feature = "trace")]
+#[test]
+fn trace_file_parses_after_early_exit() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("diagnostics_trace-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("failed to create the trace directory");
+    let trace_path = dir.join("trace.json");
+
+    let output = common::gui_bin("diagnostics_trace")
+        .args(["--settings-section", "nope"])
+        .env("FOCUSFORGE_TRACE_FILE", &trace_path)
+        .output()
+        .expect("failed to run focusforge-gui");
+
+    assert_eq!(output.status.code(), Some(2));
+    let body = std::fs::read_to_string(&trace_path)
+        .unwrap_or_else(|e| panic!("no trace at {}: {e}", trace_path.display()));
+    let events: Vec<serde_json::Value> =
+        serde_json::from_str(&body).expect("the trace is one closed JSON array");
+    assert!(
+        !events.is_empty(),
+        "the run's own records must be in the trace, got: {body}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A native crash fires no panic hook: the monitor process the GUI spawns

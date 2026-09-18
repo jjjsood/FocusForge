@@ -4,6 +4,7 @@
 //! can be observed without a person in front of it (steps 9-13).
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
@@ -58,15 +59,16 @@ fn parse_size(spec: &str) -> Option<(u32, u32)> {
 /// Selects the pinned wgpu 29 backend before any window is created, on the
 /// `Manual` device-ownership path: `focusforge_gpu::device::shared_device()`
 /// is created first, then handed to Slint by value, which is what keeps the
-/// composite/Z-Map texture off the CPU round-trip. No usable adapter ->
-/// print the named `GpuError` plus the still-working CLI path and exit:
-/// no CPU-tone-mapped fallback, no `Automatic` fallback.
-fn select_backend() {
+/// composite/Z-Map texture off the CPU round-trip. There is no
+/// CPU-tone-mapped and no `Automatic` fallback, so no usable adapter is the
+/// run's end: the named `GpuError` and the still-working command-line path
+/// are printed and `Err` carries the code the process ends with.
+fn select_backend() -> Result<(), ExitCode> {
     let shared = match focusforge_gpu::device::shared_device() {
         Ok(shared) => shared,
         Err(err) => {
             tracing::error!("{err}\nfocusforge-cli still works without a GPU adapter");
-            std::process::exit(1);
+            return Err(ExitCode::from(1));
         }
     };
 
@@ -81,12 +83,13 @@ fn select_backend() {
         .select()
     {
         tracing::error!("{e}");
-        std::process::exit(1);
+        return Err(ExitCode::from(1));
     }
     // The crate's feature set pins exactly one backend/renderer
     // combination, so "resolved" is what was compiled in.
     println!("resolved backend: winit, renderer: renderer-femtovg-wgpu (wgpu 29.0.4)");
     println!("{}", focusforge_gpu::device::adapter_report(shared.info()));
+    Ok(())
 }
 
 /// Installs the exit-after and resize timers, then runs the event loop.
@@ -210,12 +213,13 @@ fn install_input_table(
     }
 }
 
-fn main() {
+fn main() -> ExitCode {
     // Ahead of every parser: a re-spawned monitor process carries no
     // arguments of its own and never opens a window.
     if let Some(code) = focusforge_diagnostics::run_monitor() {
-        std::process::exit(code);
+        return ExitCode::from(code as u8);
     }
+    // Held across `run`, so what it buffers is flushed as it drops here.
     let _diagnostics = focusforge_diagnostics::init(&focusforge_diagnostics::Options {
         data_dir: focusforge_diagnostics::data_dir_from_env(),
         verbosity: 0,
@@ -224,30 +228,39 @@ fn main() {
     // installs the hook that reports it.
     focusforge_diagnostics::force_crash("startup");
 
-    let args = Args::parse();
+    run(&Args::parse())
+}
 
+/// Everything the arguments ask for, from the first refusal through the
+/// event loop. Every ending is a returned code rather than a process exit,
+/// which runs no destructor: the diagnostics value `main` holds has to drop
+/// for what it buffers to reach disk. Exit codes: 0 for a window closed
+/// normally, 1 for a failure while opening one, 2 for a refused argument.
+fn run(args: &Args) -> ExitCode {
     if let Some(section) = &args.settings_section
         && section != "input-map"
     {
         tracing::error!("--settings-section accepts only \"input-map\", got {section:?}");
-        std::process::exit(2);
+        return ExitCode::from(2);
     }
 
-    select_backend();
+    if let Err(code) = select_backend() {
+        return code;
+    }
 
     let code = if args.theme_sheet {
         let sheet = ThemeSheet::new().expect("failed to instantiate ThemeSheet");
-        run_window(sheet, &args)
+        run_window(sheet, args)
     } else {
         let app = AppWindow::new().expect("failed to instantiate AppWindow");
         let focusforge_gui::bridge::Installed { controller, canvas } = bridge::install(&app);
 
-        install_input_table(&controller, &app, &args);
+        install_input_table(&controller, &app, args);
 
         if let Some(path) = &args.open {
             if let Err(e) = controller.lock().unwrap().open_project(path) {
                 tracing::error!("--open failed: {e}");
-                std::process::exit(1);
+                return ExitCode::from(1);
             }
             let shared = focusforge_gpu::device::shared_device()
                 .expect("select_backend already selected one");
@@ -275,8 +288,8 @@ fn main() {
             focusforge_gui::bridge::repaint(&app, &controller, &canvas);
         }
 
-        run_window(app, &args)
+        run_window(app, args)
     };
 
-    std::process::exit(code);
+    ExitCode::from(code as u8)
 }

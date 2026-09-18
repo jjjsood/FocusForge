@@ -11,6 +11,8 @@ pub mod crash_notice;
 mod native;
 mod ring;
 mod rotating;
+#[cfg(feature = "trace")]
+mod trace;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -78,6 +80,11 @@ pub struct Diagnostics {
     /// Kept for the run's whole length: dropping it detaches the crash
     /// handler and lets the monitor process exit.
     _native: Option<native::Guard>,
+    /// Kept until the process returns from `main`: dropping it flushes the
+    /// Chrome trace and closes its JSON array. A process that exits without
+    /// running this destructor leaves an unterminated file.
+    #[cfg(feature = "trace")]
+    _chrome: Option<tracing_chrome::FlushGuard>,
 }
 
 impl Diagnostics {
@@ -267,11 +274,29 @@ pub fn init(options: &Options) -> Diagnostics {
         .with_writer(ring.clone())
         .with_filter(ring_targets());
 
-    tracing_subscriber::registry()
+    let subscriber = tracing_subscriber::registry()
         .with(stderr_layer)
         .with(file_layer)
-        .with(ring_layer)
-        .init();
+        .with(ring_layer);
+
+    #[cfg(feature = "trace")]
+    let chrome = trace::chrome();
+    #[cfg(feature = "trace")]
+    let subscriber = subscriber.with(chrome.layer).with(trace::tracy());
+
+    subscriber.init();
+
+    // After `.init()`: a warning raised before the subscriber is installed
+    // reaches no sink at all.
+    #[cfg(feature = "trace")]
+    if let Some((path, error)) = &chrome.refused {
+        tracing::warn!(
+            target: "focusforge_diagnostics",
+            path = %path.display(),
+            error = %error,
+            "writing no trace file"
+        );
+    }
 
     let _ = tracing_log::LogTracer::builder()
         .with_max_level(bridge_cap(options.verbosity))
@@ -307,6 +332,8 @@ pub fn init(options: &Options) -> Diagnostics {
     Diagnostics {
         log_path,
         _native: guard,
+        #[cfg(feature = "trace")]
+        _chrome: chrome.guard,
     }
 }
 

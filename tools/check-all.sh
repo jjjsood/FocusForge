@@ -125,6 +125,12 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
                               env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" cargo nextest run --workspace
   run_gate "cargo test --doc" tools/with-lock.sh build -- \
                               env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" cargo test --doc --workspace
+  # The off-by-default `trace` feature's own suite: the stage above resolves
+  # no profiling crate at all, and the clippy stage compiles the feature
+  # without running anything. ~13.5s on an already-compiled tree, most of it
+  # one real stack run over fixtures/mantis-512.
+  run_gate "trace feature"  tools/with-lock.sh build -- \
+                              cargo test -p focusforge-cli --features trace --test trace_cli
   run_gate "rustdoc"        tools/with-lock.sh build -- \
                               env RUSTDOCFLAGS="-D warnings" \
                               cargo doc --workspace --no-deps --document-private-items

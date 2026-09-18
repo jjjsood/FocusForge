@@ -16,6 +16,7 @@ path = "src/main.rs"
 default = ["gpu"]
 gpu = ["dep:focusforge-gpu", "focusforge-gpu/gpu"]
 gpu-tests = ["gpu", "focusforge-gpu/gpu-tests"]
+trace = ["focusforge-diagnostics/trace"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

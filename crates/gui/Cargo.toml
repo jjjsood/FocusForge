@@ -8,6 +8,9 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+trace = ["focusforge-diagnostics/trace"]
+
 [dependencies]
 slint = { version = "~1.17", default-features = false, features = [
     "std", "compat-1-2", "backend-winit", "renderer-femtovg-wgpu", "unstable-wgpu-29",

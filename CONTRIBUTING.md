@@ -101,6 +101,31 @@ counter that only holds under serial execution. Those tests assert each
 kernel matches its CPU twin to within 1 LSB at 16-bit, and that a whole GPU
 `stack` run matches the equivalent CPU run on `fixtures/mantis-512`.
 
+## Profiling
+
+`--features trace` hangs two profiling layers on the spans the log file
+already carries — no new instrumentation, and nothing of either profiler is
+compiled or even resolved without the feature.
+
+```
+cargo build -p focusforge-cli --features trace
+FOCUSFORGE_TRACE_FILE=trace.json target/debug/focusforge-cli stack fixtures/mantis-512 --lax
+```
+
+`FOCUSFORGE_TRACE_FILE` names the Chrome-trace file the run writes; unset,
+no file is opened and the layer costs nothing. Load the result in a trace
+viewer (`ui.perfetto.dev`, or Chrome's own `chrome://tracing`): the stage
+spans nest inside the stack span, and each tile span sits on the pool
+thread that ran it. A path that cannot be opened is one warning on stderr,
+not a failed run.
+
+The same build serves the Tracy profiler, which collects nothing until one
+attaches: start the binary, then connect Tracy from the same machine — the
+client listens on localhost and announces itself nowhere. Stage and tile
+zones appear live, named by their fields.
+
+`focusforge-gui` takes the same feature and reads the same variable.
+
 ## Before you send a change
 
 `tools/check-all.sh` runs every gate (formatting, licenses, fixtures, build,
