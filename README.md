@@ -119,6 +119,8 @@ for stacking a folder that holds more than one stack.
 
 See [`docs/`](docs/README.md) for the full guide and reference, including
 every `focusforge-cli` subcommand and the TIFF layouts it reads and writes.
+For development-time GUI inspection and interaction through Slint's local MCP
+endpoint, see [`docs/guide/gui-mcp.md`](docs/guide/gui-mcp.md).
 
 ## Contributing
 
