@@ -12,8 +12,16 @@ workspace = true
 gpu = []
 test-algorithms = []
 
-# A dev-dependency on this very crate, the documented way to switch on the
-# `test-algorithms` feature for a package's own test targets.
+[[test]]
+name = "zmap_ground_truth"
+path = "tests/zmap_ground_truth.rs"
+
+# A dev-dependency on this very crate, the documented way to switch a
+# feature on for a package's own test targets: `crates/core/tests/grouping.rs`
+# builds its capture-time trees with `io::test_frames`, which lives behind
+# `test-algorithms` (see that module for why it cannot be `#[cfg(test)]`).
+# Without this line every `cargo test -p focusforge-core --test grouping`
+# would have to carry `--features test-algorithms` by hand.
 [dev-dependencies]
 focusforge-core = { path = ".", features = ["test-algorithms"] }
 # `project_format.rs` reads a sealed container with an **independent**
