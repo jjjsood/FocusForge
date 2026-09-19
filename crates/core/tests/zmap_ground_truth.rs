@@ -3,8 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use focusforge_core::fuse::laplacian::score_plane;
 use focusforge_core::fuse::metrics::{laplacian_variance, psnr};
-use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
+use focusforge_core::fuse::{FusionConsumer, FusionGeometry, Plane, build};
 use focusforge_core::io::{Rect, TiffStack};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::registry;
@@ -13,6 +14,7 @@ use focusforge_core::zmap::NO_SOURCE;
 use serde::Deserialize;
 
 const INPUT_DIR_ENV: &str = "FOCUSFORGE_ZMAP_GROUND_TRUTH_DIR";
+const RADIUS_CORPUS_DIR_ENV: &str = "FOCUSFORGE_RADIUS_CORPUS_DIR";
 const RANDOM_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 const RANDOM_EXACT_TOLERANCE: f64 = 0.01;
 const INITIAL_EXACT_COUNT: usize = 211_229;
@@ -115,6 +117,38 @@ fn load_selected_scene() -> Result<Scene, String> {
         )
     })?;
     let dir = PathBuf::from(dir);
+    load_scene(&dir, true)
+}
+
+fn load_training_scene(corpus: &Path, name: &str) -> Result<Scene, String> {
+    let scene = load_scene(&corpus.join(name), false)?;
+    let (expected_scene, expected_sigma_step) = match name {
+        "train-centre" => ("hard", 0.45),
+        "train-sigma-070" => ("hard", 0.70),
+        "train-scene-easy" => ("easy", 0.45),
+        _ => {
+            return Err(format!(
+                "training scene {name} is not selected for the radius ladder"
+            ));
+        }
+    };
+    let identity = &scene.identity;
+    if identity.scene != expected_scene
+        || identity.sigma_step != expected_sigma_step
+        || identity.noise != 0.0
+        || identity.frames != 8
+        || identity.noise_seed != 11
+        || identity.texture_seed != 7
+        || identity.relief != "standard"
+    {
+        return Err(format!(
+            "training scene {name}: metadata does not match the selected input: {identity}"
+        ));
+    }
+    Ok(scene)
+}
+
+fn load_scene(dir: &Path, require_pinned_identity: bool) -> Result<Scene, String> {
     let metadata_path = dir.join("truth.json");
     let metadata_text = std::fs::read_to_string(&metadata_path).map_err(|error| {
         format!(
@@ -128,7 +162,11 @@ fn load_selected_scene() -> Result<Scene, String> {
             metadata_path.display()
         )
     })?;
-    let identity = pinned_identity(&metadata)?;
+    let identity = if require_pinned_identity {
+        pinned_identity(&metadata)?
+    } else {
+        scene_identity(&metadata)?
+    };
     let stack = TiffStack::open(dir.join("frames"))
         .map_err(|error| format!("{identity}: frames are unavailable: {error}"))?;
     let (width, height) = stack.dimensions();
@@ -176,7 +214,7 @@ fn load_selected_scene() -> Result<Scene, String> {
         },
     )?;
     Ok(Scene {
-        source_dir: dir,
+        source_dir: dir.to_path_buf(),
         identity,
         width,
         height,
@@ -187,8 +225,20 @@ fn load_selected_scene() -> Result<Scene, String> {
     })
 }
 
-fn pinned_identity(metadata: &SceneMetadata) -> Result<SceneIdentity, String> {
-    let identity = SceneIdentity {
+fn scene_identity(metadata: &SceneMetadata) -> Result<SceneIdentity, String> {
+    if metadata.width == 0 || metadata.height == 0 {
+        return Err(format!(
+            "scene={}: truth.json geometry is empty (width={}, height={})",
+            metadata.scene, metadata.width, metadata.height
+        ));
+    }
+    if metadata.frames == 0 {
+        return Err(format!(
+            "scene={}: truth.json records zero frames",
+            metadata.scene
+        ));
+    }
+    Ok(SceneIdentity {
         scene: metadata.scene.clone(),
         frames: metadata.frames,
         sigma_step: metadata.sigma_step,
@@ -196,7 +246,11 @@ fn pinned_identity(metadata: &SceneMetadata) -> Result<SceneIdentity, String> {
         noise_seed: metadata.noise_seed,
         texture_seed: metadata.texture_seed,
         relief: metadata.relief.clone(),
-    };
+    })
+}
+
+fn pinned_identity(metadata: &SceneMetadata) -> Result<SceneIdentity, String> {
+    let identity = scene_identity(metadata)?;
     let stale = identity.scene != "mantis"
         || identity.frames != 8
         || identity.sigma_step != 0.45
@@ -207,12 +261,6 @@ fn pinned_identity(metadata: &SceneMetadata) -> Result<SceneIdentity, String> {
     if stale {
         return Err(format!(
             "selected scene {identity}: truth.json does not match the pinned mantis generation parameters"
-        ));
-    }
-    if metadata.width == 0 || metadata.height == 0 {
-        return Err(format!(
-            "selected scene {identity}: truth.json geometry is empty (width={}, height={})",
-            metadata.width, metadata.height
         ));
     }
     Ok(identity)
@@ -431,7 +479,7 @@ fn fusion_output_dir(scene_dir: &Path) -> PathBuf {
     scene_dir.join("fusion-output")
 }
 
-fn run_fusion(scene: &Scene) -> FusionResult {
+fn run_fusion(scene: &Scene, algorithm_id: &str, explicit: &ParamValues) -> FusionResult {
     let stack = TiffStack::open(scene.source_dir.join("frames"))
         .expect("a validated selected scene's frames reopen");
     let context = StackContext::new(
@@ -440,17 +488,15 @@ fn run_fusion(scene: &Scene) -> FusionResult {
         scene.height,
         scene.samples_per_pixel,
     );
-    let algorithm = registry::find_stack("depth-map").expect("depth-map is registered");
-    let mut explicit = ParamValues::new();
-    explicit.insert("score-radius".to_string(), ParamValue::Int(4));
-    explicit.insert("smoothing-radius".to_string(), ParamValue::Int(8));
-    let resolved = params::resolve(algorithm.params(), &explicit, &context)
-        .expect("depth-map defaults resolve for the selected scene");
+    let algorithm = registry::find_stack(algorithm_id)
+        .unwrap_or_else(|error| panic!("{algorithm_id} is registered: {error}"));
+    let resolved = params::resolve(algorithm.params(), explicit, &context)
+        .unwrap_or_else(|error| panic!("{algorithm_id} parameters resolve: {error}"));
     let values = params::resolved_values(&resolved);
     let scratch = fusion_output_dir(&scene.source_dir);
     std::fs::create_dir_all(&scratch).expect("fusion output directory is creatable");
-    let composite_path = scratch.join("depth-map.tif");
-    let zmap_path = scratch.join("depth-map-zmap.tif");
+    let composite_path = scratch.join(format!("{algorithm_id}.tif"));
+    let zmap_path = scratch.join(format!("{algorithm_id}-zmap.tif"));
     let mut options = TileSchedulerOptions::explicit_budget(scratch.join("scheduler"), 1 << 30);
     options.tile_size = 256;
     options.levels = algorithm.tile_levels(&values);
@@ -496,7 +542,241 @@ fn run_fusion(scene: &Scene) -> FusionResult {
 
 fn fusion_result() -> &'static FusionResult {
     static RESULT: OnceLock<FusionResult> = OnceLock::new();
-    RESULT.get_or_init(|| run_fusion(selected_scene()))
+    RESULT.get_or_init(|| {
+        let mut explicit = ParamValues::new();
+        explicit.insert("score-radius".to_string(), ParamValue::Int(4));
+        explicit.insert("smoothing-radius".to_string(), ParamValue::Int(8));
+        run_fusion(selected_scene(), "depth-map", &explicit)
+    })
+}
+
+fn weighted_average_indices(scene: &Scene, radius: u32) -> Vec<u16> {
+    let pixel_count = scene.width as usize * scene.height as usize;
+    let mut best = vec![f32::NEG_INFINITY; pixel_count];
+    let mut winner = vec![0u16; pixel_count];
+    for (frame, samples) in scene.frames.iter().enumerate() {
+        let detail = build(
+            samples,
+            scene.width,
+            scene.height,
+            scene.samples_per_pixel,
+            1,
+        )
+        .expect("validated scene builds a detail pyramid");
+        let scores = score_plane(&detail.levels()[0], radius);
+        for pixel in 0..pixel_count {
+            if scores[pixel] > best[pixel] {
+                best[pixel] = scores[pixel];
+                winner[pixel] = frame as u16;
+            }
+        }
+    }
+    winner
+}
+
+fn depth_map_indices(scene: &Scene, score_radius: u32, smoothing_radius: u32) -> Vec<u16> {
+    let pixel_count = scene.width as usize * scene.height as usize;
+    let mut best = vec![f32::NEG_INFINITY; pixel_count];
+    let mut winner = vec![0u16; pixel_count];
+    for (frame, samples) in scene.frames.iter().enumerate() {
+        let detail = build(
+            samples,
+            scene.width,
+            scene.height,
+            scene.samples_per_pixel,
+            1,
+        )
+        .expect("validated scene builds a detail pyramid");
+        let raw = score_plane(&detail.levels()[0], score_radius);
+        let mut plane = Plane::from_u16(&vec![0; pixel_count], scene.width, scene.height, 1)
+            .expect("one score per pixel creates a plane");
+        plane.data_mut().copy_from_slice(&raw);
+        let scores = score_plane(&plane, smoothing_radius);
+        for pixel in 0..pixel_count {
+            if scores[pixel] > best[pixel] {
+                best[pixel] = scores[pixel];
+                winner[pixel] = frame as u16;
+            }
+        }
+    }
+    winner
+}
+
+fn print_radius_measurement(
+    scene: &Scene,
+    parameter: &str,
+    radius: u32,
+    selected: &[u16],
+) -> (f64, f64, usize) {
+    let (exact_fraction, mean_absolute_error, exact_count) =
+        index_metrics(&scene.identity, selected, &scene.truth, scene.frames.len())
+            .expect("experimental selection has valid indices");
+    eprintln!(
+        "{identity}; parameter={parameter}; radius={radius}; exact={exact_count}/{samples} ({exact_fraction:.6}); mean_absolute_index_error={mean_absolute_error:.6}",
+        identity = scene.identity,
+        samples = scene.truth.len(),
+    );
+    (exact_fraction, mean_absolute_error, exact_count)
+}
+
+fn weighted_average_values(radius: i64) -> ParamValues {
+    let mut values = ParamValues::new();
+    values.insert("radius".to_string(), ParamValue::Int(radius));
+    values.insert("weight-exponent".to_string(), ParamValue::Float(2.0));
+    values
+}
+
+fn depth_map_values(score_radius: i64, smoothing_radius: i64) -> ParamValues {
+    let mut values = ParamValues::new();
+    values.insert("score-radius".to_string(), ParamValue::Int(score_radius));
+    values.insert(
+        "smoothing-radius".to_string(),
+        ParamValue::Int(smoothing_radius),
+    );
+    values
+}
+
+fn assert_production_parity(
+    scene: &Scene,
+    algorithm: &str,
+    values: &ParamValues,
+    expected: Vec<u16>,
+) {
+    let actual = run_fusion(scene, algorithm, values);
+    assert_eq!(
+        actual.zmap, expected,
+        "{}: {algorithm} experimental selection must equal scheduler fusion",
+        scene.identity
+    );
+}
+
+#[test]
+#[ignore = "requires an explicitly generated training corpus"]
+fn radius_ceiling() {
+    let corpus = std::env::var_os(RADIUS_CORPUS_DIR_ENV).unwrap_or_else(|| {
+        panic!(
+            "{RADIUS_CORPUS_DIR_ENV} is required; generate the training corpus and pass its directory explicitly"
+        )
+    });
+    let candidates = [0u32, 4, 8, 16, 24, 32, 48, 64];
+    let scene_names = ["train-centre", "train-sigma-070", "train-scene-easy"];
+
+    for name in scene_names {
+        let scene = load_training_scene(Path::new(&corpus), name)
+            .unwrap_or_else(|error| panic!("training scene {name} must validate: {error}"));
+
+        for (radius, values) in &[
+            (0i64, weighted_average_values(0)),
+            (8, weighted_average_values(8)),
+            (16, weighted_average_values(16)),
+        ] {
+            assert_production_parity(
+                &scene,
+                "weighted-average",
+                values,
+                weighted_average_indices(&scene, *radius as u32),
+            );
+        }
+        for &(score_radius, smoothing_radius) in &[(0i64, 8i64), (4, 8), (16, 8), (4, 0), (4, 16)] {
+            assert_production_parity(
+                &scene,
+                "depth-map",
+                &depth_map_values(score_radius, smoothing_radius),
+                depth_map_indices(&scene, score_radius as u32, smoothing_radius as u32),
+            );
+        }
+
+        let (truth_exact, truth_error, _) = index_metrics(
+            &scene.identity,
+            &scene.truth,
+            &scene.truth,
+            scene.frames.len(),
+        )
+        .expect("truth indices validate");
+        let random = seeded_random_indices(scene.truth.len(), scene.frames.len());
+        let (random_exact, random_error, _) =
+            index_metrics(&scene.identity, &random, &scene.truth, scene.frames.len())
+                .expect("random indices validate");
+        let (best_frame, best_psnr) = best_single_frame(&scene);
+        let best_single = vec![best_frame as u16; scene.truth.len()];
+        let (single_exact, single_error, _) = index_metrics(
+            &scene.identity,
+            &best_single,
+            &scene.truth,
+            scene.frames.len(),
+        )
+        .expect("best-frame indices validate");
+        eprintln!(
+            "{}: controls truth_exact={truth_exact:.6} truth_error={truth_error:.6}; random seed {RANDOM_SEED:#x} exact={random_exact:.6} error={random_error:.6}; best_single frame={best_frame} exact={single_exact:.6} error={single_error:.6} psnr={best_psnr:.6}",
+            scene.identity
+        );
+        assert_eq!((truth_exact, truth_error), (1.0, 0.0));
+        assert!(random_exact < single_exact && single_exact < truth_exact);
+
+        let mut weighted_counts = Vec::new();
+        let mut score_counts = Vec::new();
+        let mut smoothing_counts = Vec::new();
+
+        for radius in candidates {
+            let weighted = weighted_average_indices(&scene, radius);
+            let weighted_repeat = weighted_average_indices(&scene, radius);
+            assert_eq!(
+                weighted, weighted_repeat,
+                "{}: weighted-average radius={radius} must be deterministic",
+                scene.identity
+            );
+            weighted_counts.push((
+                radius,
+                print_radius_measurement(&scene, "weighted-average.radius", radius, &weighted).2,
+            ));
+
+            let score = depth_map_indices(&scene, radius, 8);
+            let score_repeat = depth_map_indices(&scene, radius, 8);
+            assert_eq!(
+                score, score_repeat,
+                "{}: depth-map score-radius={radius} must be deterministic",
+                scene.identity
+            );
+            score_counts.push((
+                radius,
+                print_radius_measurement(&scene, "depth-map.score-radius", radius, &score).2,
+            ));
+
+            let smoothing = depth_map_indices(&scene, 4, radius);
+            let smoothing_repeat = depth_map_indices(&scene, 4, radius);
+            assert_eq!(
+                smoothing, smoothing_repeat,
+                "{}: depth-map smoothing-radius={radius} must be deterministic",
+                scene.identity
+            );
+            smoothing_counts.push((
+                radius,
+                print_radius_measurement(&scene, "depth-map.smoothing-radius", radius, &smoothing)
+                    .2,
+            ));
+        }
+        for (parameter, counts) in [
+            ("weighted-average.radius", weighted_counts),
+            ("depth-map.score-radius", score_counts),
+            ("depth-map.smoothing-radius", smoothing_counts),
+        ] {
+            let at_16 = counts
+                .iter()
+                .find(|(radius, _)| *radius == 16)
+                .expect("the ladder contains radius 16")
+                .1;
+            let at_24 = counts
+                .iter()
+                .find(|(radius, _)| *radius == 24)
+                .expect("the ladder contains radius 24")
+                .1;
+            assert!(
+                at_24 < at_16,
+                "{}: {parameter} exact count must decline above 16: r16={at_16}, r24={at_24}",
+                scene.identity
+            );
+        }
+    }
 }
 
 #[test]
