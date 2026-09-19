@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 use focusforge_core::algorithm::{AlgorithmError, StackAlgorithm};
 use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
-use focusforge_core::io::TiffStack;
+use focusforge_core::io::{FrameReader, TiffStack};
 use focusforge_core::job::fingerprint::{FrameFingerprint, StackFingerprint};
 use focusforge_core::job::record::{JOB_RECORD_FORMAT, JobRecord};
 use focusforge_core::job::{Job, JobOutcome, RecordingConsumer, Resumable, ResumeStore};
@@ -225,7 +225,7 @@ fn geometry_of(width: u32, height: u32, frame_count: usize) -> FusionGeometry {
 fn stack_fingerprint(stack: &TiffStack) -> StackFingerprint {
     StackFingerprint {
         frames: (0..stack.len())
-            .map(|i| FrameFingerprint::from(stack.header(i)))
+            .map(|i| FrameFingerprint::from(FrameReader::frame(stack, i)))
             .collect(),
     }
 }
@@ -260,7 +260,9 @@ fn job_record(
 }
 
 /// Blocks each `consume` call until [`Gate::release`] is called, and
-/// records when a call has begun.
+/// records when a call has begun -- same rendezvous shape as
+/// `crates/core/tests/job_resume.rs`'s `Gate`, duplicated here since
+/// integration test binaries share no code except `common`.
 struct Gate {
     started: Mutex<usize>,
     started_cvar: Condvar,
@@ -331,7 +333,8 @@ impl TileConsumer for Gated<'_> {
     }
 }
 
-/// Counts every `consume` call it forwards.
+/// Counts every `consume` call it forwards -- same shape as
+/// `crates/core/tests/job_resume.rs`'s `CountingWrap`.
 struct CountingWrap<'a> {
     inner: &'a dyn TileConsumer,
     calls: AtomicUsize,
@@ -359,8 +362,9 @@ fn read_vmhwm() -> String {
 }
 
 // ---------------------------------------------------------------------
-// Fast tests: fixture-scale, no reference stack. They catch a builder bug
-// before the expensive runs below would hit it hours in.
+// Fast tests: fixture-scale, no reference stack. These run inside
+// `cargo test --workspace` and are what keep the expensive runs below from
+// failing on a builder bug hours into an approved run.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -382,7 +386,7 @@ fn replay_builder_produces_exactly_the_requested_count_in_repeat_order() {
     assert_eq!(forty_five[40], sources[0]);
     assert_eq!(forty_five[44], sources[4]);
 
-    // 300-from-61 and 600-from-61 themselves, at the real source count.
+    // 300-from-61 and 600-from-61 themselves, at the real source count of 61.
     let sixty_one: Vec<PathBuf> = (0..61)
         .map(|i| PathBuf::from(format!("ref-{i}.tif")))
         .collect();
@@ -451,7 +455,8 @@ fn in_flight_limit_matches_the_budget_prediction_at_300_and_600_frames() {
 
 // ---------------------------------------------------------------------
 // Ignored: reads the 16 GB reference stack, runs for minutes, `--release`
-// only; run with `--nocapture` to see the measurements.
+// only. Run once, at the end, with `--nocapture`, only after the runs have
+// been approved -- never inside a red-green loop.
 // ---------------------------------------------------------------------
 
 /// Runs `SCALE_TILES` tiles of the real engine, unchanged, over a
@@ -522,7 +527,7 @@ fn run_scale_leg(
     drop(consumer);
     let _ = std::fs::remove_file(&composite_path);
 
-    Some((scheduler.in_flight_limit(), peak, elapsed, vmhwm))
+    (scheduler.in_flight_limit(), peak, elapsed, vmhwm)
 }
 
 #[test]
@@ -540,9 +545,7 @@ fn scale_300_frames() {
          cannot discriminate a tiled implementation from a full-load one"
     );
 
-    let Some((in_flight, peak, elapsed, vmhwm)) = run_scale_leg(300, 2) else {
-        return;
-    };
+    let (in_flight, peak, elapsed, vmhwm) = run_scale_leg(300, 2);
     let extrapolated = elapsed.as_secs_f64() * 442.0 / SCALE_TILES as f64;
     println!(
         "scale_300_frames: in_flight_limit={in_flight} peak_live_heap={peak} B (ceiling \
@@ -567,9 +570,7 @@ fn scale_600_frames() {
          cannot discriminate a tiled implementation from a full-load one"
     );
 
-    let Some((in_flight, peak, elapsed, vmhwm)) = run_scale_leg(600, 1) else {
-        return;
-    };
+    let (in_flight, peak, elapsed, vmhwm) = run_scale_leg(600, 1);
     let extrapolated = elapsed.as_secs_f64() * 442.0 / SCALE_TILES as f64;
     println!(
         "scale_600_frames: in_flight_limit={in_flight} peak_live_heap={peak} B (ceiling \
@@ -737,7 +738,9 @@ fn scale_600_resume_continues() {
         // scheduler's own `in_flight_limit` can never be reached, since the
         // one worker blocks *inside* `Gated::consume` and cannot pick up a
         // second tile until this segment's `gate.release()` lets it finish
-        // the first.
+        // the first (same reasoning as `crates/core/tests/job_resume.rs`'s
+        // own `resume_on_the_reference_stack`, `gate.wait_for_started(1)` at
+        // its own `max_bytes_in_flight: 1`).
         assert_eq!(scheduler.in_flight_limit(), 1);
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| job.run(&NoopPreprocess, &gated));

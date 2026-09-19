@@ -16,7 +16,7 @@ use focusforge_core::algorithm::AlignStatus;
 use focusforge_core::align::{
     FailurePolicy, FrameAlignment, ReferencePolicy, StackAlignment, Transform,
 };
-use focusforge_core::io::TiffHeader;
+use focusforge_core::io::{FrameDesc, TiffHeader};
 use focusforge_core::job::{
     AlignIdentity, DRIVER_POLICY_FIELDS, FrameFingerprint, StackFingerprint, StageCache, StageKey,
 };
@@ -305,7 +305,7 @@ fn mtime_is_not_in_the_key() {
     let fingerprint_before = StackFingerprint {
         frames: paths
             .iter()
-            .map(|p| FrameFingerprint::from(&TiffHeader::open(p).unwrap()))
+            .map(|p| FrameFingerprint::from(&FrameDesc::from(&TiffHeader::open(p).unwrap())))
             .collect(),
     };
     let identity = sample_identity("ecc", FailurePolicy::Strict);
@@ -324,7 +324,7 @@ fn mtime_is_not_in_the_key() {
     let fingerprint_after = StackFingerprint {
         frames: paths
             .iter()
-            .map(|p| FrameFingerprint::from(&TiffHeader::open(p).unwrap()))
+            .map(|p| FrameFingerprint::from(&FrameDesc::from(&TiffHeader::open(p).unwrap())))
             .collect(),
     };
     let key_after = StageKey::align(&fingerprint_after, &identity);

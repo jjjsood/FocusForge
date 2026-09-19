@@ -16,8 +16,8 @@ use focusforge_core::align::{
     align_stack_with, auto_crop,
 };
 use focusforge_core::gpu::TileBackend;
-use focusforge_core::io::{TiffSpec, TiffStack, TiffWriter, frame_paths};
-use focusforge_core::params::{self, StackContext};
+use focusforge_core::io::{FrameReader, TiffSpec, TiffStack, TiffWriter, frame_paths};
+use focusforge_core::params;
 use focusforge_core::registry;
 use focusforge_core::tile::Rect;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
@@ -234,6 +234,7 @@ pub fn run(
         Ok(stack) => stack,
         Err(err) => return sink.fail(err),
     };
+    let frame_reader: &dyn FrameReader = &stack;
     let frame_names: Vec<String> = paths
         .iter()
         .map(|p| {
@@ -242,19 +243,19 @@ pub fn run(
                 .unwrap_or_else(|| p.display().to_string())
         })
         .collect();
-    let header_refs: Vec<(&str, &focusforge_core::io::TiffHeader)> = frame_names
+    let frame_descs: Vec<(&str, &focusforge_core::io::FrameDesc)> = frame_names
         .iter()
         .enumerate()
-        .map(|(i, name)| (name.as_str(), stack.header(i)))
+        .map(|(i, name)| (name.as_str(), frame_reader.frame(i)))
         .collect();
-    let (uniform, detail) = crate::uniform_check(&header_refs);
+    let (uniform, detail) = crate::uniform_check(&frame_descs);
     if !uniform {
         return sink.fail(detail.unwrap_or_else(|| "non-uniform frame set".to_string()));
     }
 
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
-    let stack_ctx = StackContext::new(stack.len(), width, height, spp);
+    let stack_ctx = frame_reader.stack_context();
+    let (width, height) = (stack_ctx.width, stack_ctx.height);
+    let spp = stack_ctx.samples_per_pixel;
     let resolved = match params::resolve(algo.params(), &explicit, &stack_ctx) {
         Ok(resolved) => resolved,
         Err(err) => return sink.fail(err),
@@ -272,7 +273,7 @@ pub fn run(
     let run = match align_stack_with(
         algo,
         stack_ctx,
-        &stack,
+        frame_reader,
         &values,
         policy,
         &AlignDriverOptions::default(),
@@ -297,7 +298,7 @@ pub fn run(
         let backend = crate::resolve_backend(no_gpu, None).backend;
         if let Err(msg) = write_warped_frames(
             write_warped,
-            &stack,
+            frame_reader,
             &paths,
             &frame_names,
             &alignment,
@@ -406,7 +407,7 @@ pub fn run(
 #[allow(clippy::too_many_arguments)]
 fn write_warped_frames(
     dir: &Path,
-    stack: &TiffStack,
+    stack: &dyn TileReader,
     paths: &[PathBuf],
     frame_names: &[String],
     alignment: &StackAlignment,

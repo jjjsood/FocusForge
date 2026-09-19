@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 use memmap2::Mmap;
 
 use super::super::error::TiffError;
+use super::super::frame::{FrameDesc, FrameReader};
 use super::header::{ByteOrder, TAG_STRIP_OFFSETS, TiffHeader};
 use crate::tile::{Rect, Tile};
 
@@ -25,6 +26,7 @@ use crate::tile::{Rect, Tile};
 #[derive(Debug)]
 pub struct TiffStack {
     headers: Vec<TiffHeader>,
+    descs: Vec<FrameDesc>,
     maps: Vec<OnceLock<Mmap>>,
 }
 
@@ -68,8 +70,13 @@ impl TiffStack {
             }
             headers.push(header);
         }
+        let descs = headers.iter().map(FrameDesc::from).collect();
         let maps = headers.iter().map(|_| OnceLock::new()).collect();
-        Ok(TiffStack { headers, maps })
+        Ok(TiffStack {
+            headers,
+            descs,
+            maps,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -225,6 +232,20 @@ impl TiffStack {
         }
 
         Ok(())
+    }
+}
+
+impl FrameReader for TiffStack {
+    fn len(&self) -> usize {
+        TiffStack::len(self)
+    }
+
+    fn dimensions(&self) -> (u32, u32) {
+        TiffStack::dimensions(self)
+    }
+
+    fn frame(&self, index: usize) -> &FrameDesc {
+        &self.descs[index]
     }
 }
 

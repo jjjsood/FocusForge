@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use focusforge_core::io::{ByteOrder, TiffError, TiffHeader, frame_paths};
+use focusforge_core::io::{ByteOrder, FrameDesc, TiffError, TiffHeader, frame_paths};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
@@ -604,7 +604,16 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
         .iter()
         .filter_map(|p| p.header.as_ref().ok().map(|h| (p.name.as_str(), h)))
         .collect();
-    let (uniform_layout, uniform_detail) = uniform_check(&ok_headers);
+    let descs: Vec<FrameDesc> = ok_headers
+        .iter()
+        .map(|(_, header)| FrameDesc::from(*header))
+        .collect();
+    let named_descs: Vec<(&str, &FrameDesc)> = ok_headers
+        .iter()
+        .zip(descs.iter())
+        .map(|((name, _), desc)| (*name, desc))
+        .collect();
+    let (uniform_layout, uniform_detail) = uniform_check(&named_descs);
 
     let files = parsed
         .iter()
@@ -662,76 +671,26 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
     }
 }
 
-/// Base description: byte order and `RowsPerStrip`, the two fields the
-/// frozen sentence always names.
-pub(crate) fn describe_layout(h: &TiffHeader) -> String {
-    format!("{}/rps={}", byte_order_str(h.byte_order), h.rows_per_strip)
-}
-
-/// `describe_layout(h)` plus a suffix for every field that differs from
-/// `other` and is not already covered by the base string (byte order and
-/// `RowsPerStrip` are; the rest of `uniform_check`'s nine-field signature is
-/// not). Without this, two members that disagree only on, say,
-/// `Compression` render an identical-looking base string on both sides of
-/// "is X, others X".
-pub(crate) fn describe_layout_diff(h: &TiffHeader, other: &TiffHeader) -> String {
-    let mut s = describe_layout(h);
-    if h.compression != other.compression {
-        s.push_str(&format!("/compression={}", h.compression));
-    }
-    if h.width != other.width || h.height != other.height {
-        s.push_str(&format!("/{}x{}", h.width, h.height));
-    }
-    if h.bits_per_sample != other.bits_per_sample {
-        s.push_str(&format!("/bits={:?}", h.bits_per_sample));
-    }
-    if h.samples_per_pixel != other.samples_per_pixel {
-        s.push_str(&format!("/samples={}", h.samples_per_pixel));
-    }
-    if h.photometric != other.photometric {
-        s.push_str(&format!("/photometric={}", h.photometric));
-    }
-    if h.planar_config != other.planar_config {
-        s.push_str(&format!("/planar={}", h.planar_config));
-    }
-    s
-}
-
-/// Stricter than the reader's `check_uniform`: compares byte order and
-/// `RowsPerStrip` too, because this verdict is a pre-check for stacking,
-/// not the reader's admission test. Only headers that parsed are compared;
-/// a file that failed to parse is counted in `unreadable_count` instead.
-/// Ties among equally common layouts favor the most-recently-seen group,
-/// which is what makes the two required fixture cases (one outlier among a
-/// majority, either direction) name the same outlier a human would point
-/// at.
-pub(crate) fn uniform_check(headers: &[(&str, &TiffHeader)]) -> (bool, Option<String>) {
-    type Signature = (u32, u32, Vec<u16>, u32, ByteOrder, u32, u16, u16, u16);
-    fn signature(h: &TiffHeader) -> Signature {
-        (
-            h.width,
-            h.height,
-            h.bits_per_sample.to_vec(),
-            h.samples_per_pixel,
-            h.byte_order,
-            h.rows_per_strip,
-            h.compression,
-            h.planar_config,
-            h.photometric,
-        )
-    }
-
-    if headers.len() < 2 {
+/// Compares every reader-provided layout fragment. Only descriptions from
+/// parsed headers are compared; a file that failed to parse is counted in
+/// `unreadable_count` instead. Ties among equally common layouts favor the
+/// most-recently-seen group, which is what makes the two required fixture
+/// cases (one outlier among a majority, either direction) name the same
+/// outlier a human would point at.
+pub(crate) fn uniform_check(frames: &[(&str, &FrameDesc)]) -> (bool, Option<String>) {
+    if frames.len() < 2 {
         return (true, None);
     }
 
-    let mut groups: Vec<(Signature, usize)> = Vec::new();
-    for (_, h) in headers {
-        let sig = signature(h);
-        if let Some(group) = groups.iter_mut().find(|(gs, _)| *gs == sig) {
+    let mut groups: Vec<(&Vec<String>, usize)> = Vec::new();
+    for (_, desc) in frames {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|(signature, _)| **signature == desc.layout_signature)
+        {
             group.1 += 1;
         } else {
-            groups.push((sig, 1));
+            groups.push((&desc.layout_signature, 1));
         }
     }
 
@@ -739,28 +698,34 @@ pub(crate) fn uniform_check(headers: &[(&str, &TiffHeader)]) -> (bool, Option<St
         return (true, None);
     }
 
-    let mut majority = groups[0].clone();
+    let mut majority = groups[0];
     for group in groups.iter().skip(1) {
         if group.1 >= majority.1 {
-            majority = group.clone();
+            majority = *group;
         }
     }
     let majority_sig = majority.0;
 
-    let outlier = headers
+    let outlier = frames
         .iter()
-        .find(|(_, h)| signature(h) != majority_sig)
-        .expect("groups.len() > 1 implies at least one non-majority header");
-    let majority_header = headers
+        .find(|(_, desc)| &desc.layout_signature != majority_sig)
+        .expect("groups.len() > 1 implies at least one non-majority frame");
+    let majority_desc = frames
         .iter()
-        .find(|(_, h)| signature(h) == majority_sig)
-        .expect("majority signature came from one of these headers");
+        .find(|(_, desc)| &desc.layout_signature == majority_sig)
+        .expect("majority signature came from one of these frames");
+
+    let mut outlier_detail = outlier.1.layout_label.clone();
+    for i in 2..outlier.1.layout_signature.len() {
+        if outlier.1.layout_signature[i] != majority_desc.1.layout_signature[i] {
+            outlier_detail.push('/');
+            outlier_detail.push_str(&outlier.1.layout_signature[i]);
+        }
+    }
 
     let detail = format!(
         "{} is {}, others {}",
-        outlier.0,
-        describe_layout_diff(outlier.1, majority_header.1),
-        describe_layout(majority_header.1)
+        outlier.0, outlier_detail, majority_desc.1.layout_label
     );
     (false, Some(detail))
 }
@@ -824,4 +789,35 @@ fn fail(message: impl std::fmt::Display) -> ExitCode {
     eprintln!("error: {message}");
     tracing::error!(target: MIRRORED_OUTPUT_TARGET, "error: {message}");
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn desc(label: &str, signature: &[&str]) -> FrameDesc {
+        FrameDesc {
+            path: PathBuf::from(label),
+            file_size: 0,
+            image_description: None,
+            width: 1,
+            height: 1,
+            samples_per_pixel: 1,
+            strip_offsets: Vec::new(),
+            strip_byte_counts: Vec::new(),
+            layout_label: signature[0..2].join("/"),
+            layout_signature: signature.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn neutral_layout_tie_uses_the_last_group_and_lists_suffixes() {
+        let a = desc("a", &["II", "rps=1", "compression=1", "4x4"]);
+        let b = desc("b", &["MM", "rps=8", "compression=5", "8x4"]);
+        let (_, detail) = uniform_check(&[("a", &a), ("b", &b)]);
+        assert_eq!(
+            detail.as_deref(),
+            Some("a is II/rps=1/compression=1/4x4, others MM/rps=8")
+        );
+    }
 }

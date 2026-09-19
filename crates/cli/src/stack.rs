@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use focusforge_core::algorithm::{AlignStatus, StackAlgorithm};
+use focusforge_core::algorithm::{AlignStatus, StackAlgorithm, TileReader};
 use focusforge_core::align::{
     AlignDriverOptions, FrameAlignment, ReferencePolicy, StackAlignment, Transform, WarpingReader,
     align_stack_with, auto_crop,
@@ -21,13 +21,13 @@ use focusforge_core::fuse::{
     description::format_composite_description, laplacian::Laplacian,
 };
 use focusforge_core::gpu::TileBackend;
-use focusforge_core::io::{Group, Proposal, Rect, TiffSpec, TiffStack, propose};
+use focusforge_core::io::{FrameReader, Group, Proposal, Rect, TiffSpec, TiffStack, propose};
 use focusforge_core::job::{
     AlignIdentity, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobOutcome, JobRecord,
     RecordingConsumer, Resumable, ResumeStore, StackFingerprint, StageCache, StageKey,
     read_alignment,
 };
-use focusforge_core::params::{self, ParamValue, ParamValues, Provenance, StackContext};
+use focusforge_core::params::{self, ParamValue, ParamValues, Provenance};
 use focusforge_core::project::{self, Metrics, PROJECT_EXTENSION};
 use focusforge_core::registry;
 use focusforge_core::tile::{NoopPreprocess, TileConsumer, TileScheduler, TileSchedulerOptions};
@@ -930,6 +930,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         Ok(stack) => stack,
         Err(err) => return failed(&status, start, err),
     };
+    let frame_reader: &dyn FrameReader = &stack;
     let frame_names: Vec<String> = paths
         .iter()
         .map(|p| {
@@ -938,12 +939,12 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 .unwrap_or_else(|| p.display().to_string())
         })
         .collect();
-    let header_refs: Vec<(&str, &focusforge_core::io::TiffHeader)> = frame_names
+    let frame_descs: Vec<(&str, &focusforge_core::io::FrameDesc)> = frame_names
         .iter()
         .enumerate()
-        .map(|(i, name)| (name.as_str(), stack.header(i)))
+        .map(|(i, name)| (name.as_str(), frame_reader.frame(i)))
         .collect();
-    let (uniform, detail) = crate::uniform_check(&header_refs);
+    let (uniform, detail) = crate::uniform_check(&frame_descs);
     if !uniform {
         return failed(
             &status,
@@ -965,9 +966,9 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     }
 
     // Step 7: resolve parameters.
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
-    let stack_ctx = StackContext::new(stack.len(), width, height, spp);
+    let stack_ctx = frame_reader.stack_context();
+    let (width, height) = (stack_ctx.width, stack_ctx.height);
+    let spp = stack_ctx.samples_per_pixel;
     let resolved = match params::resolve(algo.params(), &explicit, &stack_ctx) {
         Ok(resolved) => resolved,
         Err(err) => return failed(&status, start, err),
@@ -983,8 +984,8 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // as the stage cache key: one fingerprint, one definition, two
     // consumers.
     let fingerprint = StackFingerprint {
-        frames: (0..stack.len())
-            .map(|i| FrameFingerprint::from(stack.header(i)))
+        frames: (0..frame_reader.len())
+            .map(|i| FrameFingerprint::from(frame_reader.frame(i)))
             .collect(),
     };
     let stage_cache = match StageCache::open(Path::new(".scratch")) {
@@ -1256,7 +1257,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                     let result = align_stack_with(
                         align_algo,
                         stack_ctx,
-                        &stack,
+                        frame_reader,
                         &align_values,
                         policy,
                         &AlignDriverOptions::default(),
@@ -1356,7 +1357,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         .iter()
         .map(|f| f.transform)
         .collect();
-    let warping_reader = WarpingReader::new(&stack, (width, height), spp, transforms.clone());
+    let warping_reader = WarpingReader::new(frame_reader, (width, height), spp, transforms.clone());
 
     // Builds the scheduler over the warping reader -- bit-identical to
     // `&stack` when every transform is identity (the decorator's own
@@ -1373,7 +1374,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // `--max-host-memory` are already in effect for the resume peek --
     // never rebuilt here.
     let reader: &dyn focusforge_core::algorithm::TileReader = match &backend {
-        Some(_) => &stack,
+        Some(_) => frame_reader,
         None => &warping_reader,
     };
     let scheduler = match TileScheduler::new(reader, stack_ctx, spp, &options) {
@@ -1583,7 +1584,15 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // `supplies_own_pixels`, so wrapping it does not put the scheduler's
     // host read loop back.
     let backend_consumer = backend.map(|b| {
-        BackendFusionConsumer::new(b, &stack, (width, height), transforms, spp, levels, &sink)
+        BackendFusionConsumer::new(
+            b,
+            frame_reader,
+            (width, height),
+            transforms,
+            spp,
+            levels,
+            &sink,
+        )
     });
     let consumer: &dyn TileConsumer = match &backend_consumer {
         Some(bc) => bc,
@@ -1816,8 +1825,8 @@ fn measure_metrics(composite: &Path, sources: &[PathBuf]) -> Metrics {
     let Ok(stack) = TiffStack::open_files(std::slice::from_ref(&composite.to_path_buf())) else {
         return Metrics::default();
     };
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
+    let (width, height) = FrameReader::dimensions(&stack);
+    let spp = stack.frame(0).samples_per_pixel;
     let side_w = LAPVAR_WINDOW.min(width);
     let side_h = LAPVAR_WINDOW.min(height);
     let window = centered(width, height, side_w, side_h);
@@ -1830,11 +1839,11 @@ fn measure_metrics(composite: &Path, sources: &[PathBuf]) -> Metrics {
         let Ok(frame) = TiffStack::open_files(std::slice::from_ref(path)) else {
             continue;
         };
-        let (fw, fh) = frame.dimensions();
+        let (fw, fh) = FrameReader::dimensions(&frame);
         if fw < side_w || fh < side_h {
             continue;
         }
-        let fspp = frame.header(0).samples_per_pixel;
+        let fspp = frame.frame(0).samples_per_pixel;
         let rect = centered(fw, fh, side_w, side_h);
         if let Some(value) = lapvar(&frame, rect, fspp) {
             max_input_lapvar = Some(max_input_lapvar.map_or(value, |m: f64| m.max(value)));
@@ -1858,11 +1867,11 @@ fn centered(width: u32, height: u32, side_w: u32, side_h: u32) -> Rect {
     }
 }
 
-/// `laplacian_variance` over one window of frame 0 of `stack`, or `None`
+/// `laplacian_variance` over one window of frame 0 through `reader`, or `None`
 /// when that window cannot be read.
-fn lapvar(stack: &TiffStack, rect: Rect, spp: u32) -> Option<f64> {
+fn lapvar(reader: &dyn TileReader, rect: Rect, spp: u32) -> Option<f64> {
     let mut samples = vec![0u16; rect.width as usize * rect.height as usize * spp as usize];
-    stack.read_tile_into(0, rect, &mut samples).ok()?;
+    reader.read_tile_into(0, rect, &mut samples).ok()?;
     Some(focusforge_core::fuse::metrics::laplacian_variance(
         &samples,
         rect.width,

@@ -17,6 +17,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use super::super::error::{Refusal, TiffError};
+use crate::io::FrameDesc;
 
 // --- tags ---------------------------------------------------------------
 
@@ -59,6 +60,14 @@ pub enum ByteOrder {
 }
 
 impl ByteOrder {
+    /// The two-letter TIFF tag for this byte order.
+    pub fn tag(self) -> &'static str {
+        match self {
+            ByteOrder::Little => "II",
+            ByteOrder::Big => "MM",
+        }
+    }
+
     fn u16_at(self, bytes: &[u8]) -> Option<u16> {
         let arr: [u8; 2] = bytes.get(0..2)?.try_into().ok()?;
         Some(match self {
@@ -94,6 +103,34 @@ impl ByteOrder {
             out.push(value);
         }
         Some(out)
+    }
+}
+
+impl From<&TiffHeader> for FrameDesc {
+    fn from(header: &TiffHeader) -> Self {
+        let layout_signature = vec![
+            header.byte_order.tag().to_string(),
+            format!("rps={}", header.rows_per_strip),
+            format!("compression={}", header.compression),
+            format!("{}x{}", header.width, header.height),
+            format!("bits={:?}", header.bits_per_sample),
+            format!("samples={}", header.samples_per_pixel),
+            format!("photometric={}", header.photometric),
+            format!("planar={}", header.planar_config),
+        ];
+        let layout_label = format!("{}/{}", layout_signature[0], layout_signature[1]);
+        FrameDesc {
+            path: header.path.clone(),
+            file_size: header.file_size,
+            image_description: header.image_description.clone(),
+            width: header.width,
+            height: header.height,
+            samples_per_pixel: header.samples_per_pixel,
+            strip_offsets: header.strip_offsets.clone(),
+            strip_byte_counts: header.strip_byte_counts.clone(),
+            layout_label,
+            layout_signature,
+        }
     }
 }
 
@@ -442,7 +479,7 @@ impl TiffHeader {
 
         // Refusal priority: tiled first (the strip tables may not apply at
         // all to a tiled file), then compression, planar layout, bit depth,
-        // sample format. At most one refusal is carried, ever.
+        // sample format. At most one refusal is carried.
         let refusal = if tiled {
             Some(Refusal::Tiled)
         } else if compression != 1 {
@@ -591,7 +628,7 @@ mod tests {
 
     /// A structurally valid 4x4 RGB 16-bit header, one strip, `order`
     /// endianness. `BitsPerSample` is 3xSHORT (6 bytes), so it is never
-    /// inline: 6 bytes exceeds the 4-byte inline limit.
+    /// inline -- the trap Strategy step 4 calls out.
     fn valid_entries(order: ByteOrder) -> Vec<TestEntry> {
         vec![
             entry_long(TAG_IMAGE_WIDTH, order, &[4]),
