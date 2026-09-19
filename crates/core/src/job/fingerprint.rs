@@ -230,7 +230,10 @@ mod tests {
             compression: 1,
             photometric: 2,
             planar_config: 1,
+            predictor: 1,
             rows_per_strip: 1,
+            tile_width: None,
+            tile_length: None,
             sample_format: Box::new([1, 1, 1]),
             image_description: Some("hello".to_string()),
             // Read by grouping, deliberately **not** by the
@@ -241,6 +244,8 @@ mod tests {
             file_size: 12345,
             strip_offsets: vec![10, 20, 30, 40],
             strip_byte_counts: vec![1, 2, 3, 4],
+            tile_offsets: vec![],
+            tile_byte_counts: vec![],
             refusal: None,
         };
         let desc = FrameDesc::from(&header);

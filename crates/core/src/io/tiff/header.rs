@@ -32,7 +32,11 @@ const TAG_SAMPLES_PER_PIXEL: u16 = 277;
 const TAG_ROWS_PER_STRIP: u16 = 278;
 const TAG_STRIP_BYTE_COUNTS: u16 = 279;
 const TAG_PLANAR_CONFIG: u16 = 284;
+const TAG_PREDICTOR: u16 = 317;
 const TAG_TILE_WIDTH: u16 = 322;
+const TAG_TILE_LENGTH: u16 = 323;
+const TAG_TILE_OFFSETS: u16 = 324;
+const TAG_TILE_BYTE_COUNTS: u16 = 325;
 const TAG_SAMPLE_FORMAT: u16 = 339;
 /// EXIF sub-IFD pointer: a `LONG` offset to a second IFD.
 const TAG_EXIF_IFD: u16 = 34665;
@@ -248,7 +252,10 @@ pub struct TiffHeader {
     pub compression: u16,
     pub photometric: u16,
     pub planar_config: u16,
+    pub predictor: u16,
     pub rows_per_strip: u32,
+    pub tile_width: Option<u32>,
+    pub tile_length: Option<u32>,
     pub sample_format: Box<[u16]>,
     pub image_description: Option<String>,
     /// EXIF `DateTimeOriginal` (36867), verbatim ASCII, from IFD0 or --
@@ -262,6 +269,8 @@ pub struct TiffHeader {
     pub file_size: u64,
     pub strip_offsets: Vec<u64>,
     pub strip_byte_counts: Vec<u64>,
+    pub tile_offsets: Vec<u64>,
+    pub tile_byte_counts: Vec<u64>,
     pub refusal: Option<Refusal>,
 }
 
@@ -416,6 +425,7 @@ impl TiffHeader {
 
         let compression = scalar(TAG_COMPRESSION)?.unwrap_or(1) as u16;
         let planar_config = scalar(TAG_PLANAR_CONFIG)?.unwrap_or(1) as u16;
+        let predictor = scalar(TAG_PREDICTOR)?.unwrap_or(1) as u16;
         let photometric = scalar(TAG_PHOTOMETRIC)?.unwrap_or(1) as u16;
 
         let sample_format: Vec<u16> = match read_ints(TAG_SAMPLE_FORMAT)? {
@@ -423,7 +433,9 @@ impl TiffHeader {
             None => vec![1; samples_per_pixel as usize],
         };
 
-        let tiled = find(TAG_TILE_WIDTH).is_some();
+        let tile_width = scalar(TAG_TILE_WIDTH)?.map(|value| value as u32);
+        let tile_length = scalar(TAG_TILE_LENGTH)?.map(|value| value as u32);
+        let tiled = tile_width.is_some();
 
         let strip_offsets = read_ints(TAG_STRIP_OFFSETS)?.unwrap_or_default();
         if strip_offsets.is_empty() && !tiled {
@@ -433,6 +445,8 @@ impl TiffHeader {
             });
         }
         let strip_byte_counts = read_ints(TAG_STRIP_BYTE_COUNTS)?.unwrap_or_default();
+        let tile_offsets = read_ints(TAG_TILE_OFFSETS)?.unwrap_or_default();
+        let tile_byte_counts = read_ints(TAG_TILE_BYTE_COUNTS)?.unwrap_or_default();
 
         let image_description = match find(TAG_IMAGE_DESCRIPTION) {
             None => None,
@@ -521,13 +535,18 @@ impl TiffHeader {
             compression,
             photometric,
             planar_config,
+            predictor,
             rows_per_strip,
+            tile_width,
+            tile_length,
             sample_format: sample_format.into_boxed_slice(),
             image_description,
             date_time_original,
             file_size,
             strip_offsets,
             strip_byte_counts,
+            tile_offsets,
+            tile_byte_counts,
             refusal,
         })
     }
@@ -660,6 +679,9 @@ mod tests {
         assert_eq!(header.samples_per_pixel, 3);
         assert_eq!(header.rows_per_strip, 4);
         assert_eq!(header.strip_offsets, vec![0]);
+        assert_eq!(header.predictor, 1);
+        assert_eq!(header.tile_width, None);
+        assert_eq!(header.tile_length, None);
         assert!(header.refusal.is_none());
     }
 
@@ -670,6 +692,28 @@ mod tests {
         assert_eq!(header.byte_order, ByteOrder::Big);
         assert_eq!(&*header.bits_per_sample, &[16, 16, 16]);
         assert!(header.refusal.is_none());
+    }
+
+    #[test]
+    fn parses_tile_and_predictor_metadata_without_changing_fast_path_refusal() {
+        let mut entries = valid_entries(ByteOrder::Little);
+        entries
+            .retain(|entry| entry.tag != TAG_STRIP_OFFSETS && entry.tag != TAG_STRIP_BYTE_COUNTS);
+        entries.extend([
+            entry_short(TAG_PREDICTOR, ByteOrder::Little, &[2]),
+            entry_long(TAG_TILE_WIDTH, ByteOrder::Little, &[2]),
+            entry_long(TAG_TILE_LENGTH, ByteOrder::Little, &[2]),
+            entry_long(TAG_TILE_OFFSETS, ByteOrder::Little, &[0, 24, 48, 72]),
+            entry_long(TAG_TILE_BYTE_COUNTS, ByteOrder::Little, &[24, 24, 24, 24]),
+        ]);
+        let bytes = build(ByteOrder::Little, 42, &entries);
+        let header = parse(&bytes).expect("tiled header must still probe");
+        assert_eq!(header.predictor, 2);
+        assert_eq!(header.tile_width, Some(2));
+        assert_eq!(header.tile_length, Some(2));
+        assert_eq!(header.tile_offsets, vec![0, 24, 48, 72]);
+        assert_eq!(header.tile_byte_counts, vec![24, 24, 24, 24]);
+        assert_eq!(header.refusal, Some(Refusal::Tiled));
     }
 
     #[test]

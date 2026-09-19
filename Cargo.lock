@@ -1505,6 +1505,7 @@ name = "focusforge-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "flate2",
  "focusforge-core",
  "inventory",
  "memmap2",
@@ -1516,6 +1517,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
+ "weezl",
  "zip",
  "zstd",
 ]
