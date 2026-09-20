@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A thin progress bar: `progress` (0.0-1.0) fills it left to right;
+// `indeterminate` instead sweeps a fixed-width segment back and forth, for
+// work whose length is unknown ahead of time.
+
+import { Theme } from "../theme.slint";
+
+export component FFProgressBar inherits Rectangle {
+    in property <bool> indeterminate: false;
+    in property <float> progress: 0.0;
+
+    width: 260px;
+    height: 4px;
+    // A radius this far past half the bar's own thickness renders as a
+    // lens rather than a rounded end on some backends; half the thickness
+    // is already a full pill.
+    border-radius: self.height / 2;
+    background: Theme.border-default;
+    clip: true;
+
+    // Reads `animation-tick()` only while indeterminate, so a static bar
+    // never schedules a per-frame redraw for a sweep it isn't showing.
+    property <bool> sweep-right: root.indeterminate
+        ? mod(animation-tick() / 1ms, 1800.0) >= 900.0
+        : true;
+
+    fill := Rectangle {
+        height: 100%;
+        border-radius: parent.border-radius;
+        background: Theme.accent-default;
+        width: root.indeterminate
+            ? parent.width * 0.35
+            : parent.width * max(0.0, min(1.0, root.progress));
+        x: root.indeterminate ? (root.sweep-right ? parent.width - self.width : 0px) : 0px;
+
+        animate x { duration: 900ms; easing: ease-in-out; }
+        animate width { duration: 150ms; }
+    }
+}

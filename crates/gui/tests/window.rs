@@ -16,10 +16,7 @@ use std::process::Stdio;
 #[cfg(feature = "mcp")]
 use std::time::{Duration, Instant};
 
-/// `true` when this host can plausibly open a window.
-fn has_display() -> bool {
-    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
-}
+use common::has_display;
 
 #[test]
 fn screenshot_is_not_uniform() {

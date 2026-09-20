@@ -302,3 +302,80 @@ fn maximize_glyph_reflects_the_maximized_state() {
         "un-maximizing again must flip the label back"
     );
 }
+
+/// `FFManifestList`'s own rect, found by type since the panel gives its one
+/// instance no local id.
+fn manifest_list_rect(app: &AppWindow) -> (f32, f32, f32, f32) {
+    let handle = ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFManifestList")
+        .find_first()
+        .expect("no FFManifestList element found");
+    let pos = handle.absolute_position();
+    let size = handle.size();
+    (pos.x, pos.y, size.width, size.height)
+}
+
+fn manifest_row(name: &str) -> focusforge_gui::FFManifestRow {
+    focusforge_gui::FFManifestRow {
+        name: name.into(),
+        value: "1 KB".into(),
+        not_redacted: false,
+    }
+}
+
+/// The footer sits at one position throughout every state the diagnostics
+/// panel can show, and the manifest list's own size never grows with its
+/// row count -- both load-bearing for the boards' "every row present in
+/// every state" layout.
+#[test]
+fn diagnostics_panel_footer_and_list_are_stable_across_states() {
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    app.set_settings_section("diagnostics".into());
+
+    let one_row = std::rc::Rc::new(slint::VecModel::from(vec![manifest_row("adapter.json")]));
+    app.set_diagnostics_rows(one_row.into());
+
+    let footer_id = "FFDiagnosticsPanel::footer";
+    let idle = rect(&app, footer_id);
+    let (_, _, idle_width, idle_height) = manifest_list_rect(&app);
+
+    app.set_diagnostics_include_minidumps(true);
+    assert_rect(&app, footer_id, idle);
+
+    app.set_diagnostics_status("existing-file".into());
+    app.set_diagnostics_message(
+        "This file already exists. Creating the bundle will overwrite it.".into(),
+    );
+    app.set_diagnostics_primary_label("Overwrite and create".into());
+    assert_rect(&app, footer_id, idle);
+
+    app.set_diagnostics_status("writing".into());
+    app.set_diagnostics_busy(true);
+    app.set_diagnostics_primary_label("Writing…".into());
+    assert_rect(&app, footer_id, idle);
+
+    app.set_diagnostics_status("written".into());
+    app.set_diagnostics_busy(false);
+    app.set_diagnostics_message("Bundle created successfully.".into());
+    app.set_diagnostics_primary_label("Create bundle".into());
+    assert_rect(&app, footer_id, idle);
+
+    app.set_diagnostics_status("failed".into());
+    app.set_diagnostics_message("Could not write the bundle. Nothing was written.".into());
+    app.set_diagnostics_primary_label("Create bundle".into());
+    assert_rect(&app, footer_id, idle);
+
+    let many_rows = std::rc::Rc::new(slint::VecModel::from(
+        (0..12)
+            .map(|i| manifest_row(&format!("entry-{i}.json")))
+            .collect::<Vec<_>>(),
+    ));
+    app.set_diagnostics_rows(many_rows.into());
+    let (_, _, width, height) = manifest_list_rect(&app);
+    assert!(
+        (width - idle_width).abs() < EPS && (height - idle_height).abs() < EPS,
+        "the manifest list's own size must not grow with the row count: got {width}x{height}, expected {idle_width}x{idle_height}"
+    );
+}

@@ -95,3 +95,11 @@ pub fn gui_bin(test_name: &str) -> Command {
     cmd.env("FOCUSFORGE_DATA_DIR", &data_dir);
     cmd
 }
+
+/// `true` when this host can plausibly open a window -- a test that opens
+/// the real binary's window skips with an explicit line rather than
+/// reddening `cargo test --workspace` on a headless gate host.
+#[allow(dead_code)]
+pub fn has_display() -> bool {
+    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}

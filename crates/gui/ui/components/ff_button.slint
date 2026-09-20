@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A button: `kind` selects its fill -- `primary` the accent colour,
+// `default` a filled neutral box, `quiet` text only -- with an optional
+// leading icon. Width follows the label; only height is fixed.
+
+import { Theme } from "../theme.slint";
+
+export component FFButton inherits Rectangle {
+    in property <string> kind: "default"; // "default" | "primary" | "quiet"
+    in property <string> label: "";
+    in property <image> icon-source;
+    in property <bool> enabled: true;
+    in property <bool> compact: false;
+    callback clicked();
+
+    height: root.compact ? 26px : 32px;
+    border-radius: Theme.radius-sm;
+    background: root.kind == "primary"
+        ? (root.enabled ? (area.has-hover ? Theme.accent-hover : Theme.accent-default) : Theme.surface-disabled)
+        : root.kind == "default"
+            ? (root.enabled ? Theme.surface-overlay : Theme.surface-disabled)
+            : (root.enabled && area.has-hover ? Theme.surface-hover : transparent);
+    accessible-role: button;
+    accessible-enabled: root.enabled;
+
+    property <color> content-color: !root.enabled
+        ? Theme.text-disabled
+        : root.kind == "primary" ? Theme.text-on-accent
+        : root.kind == "quiet" ? Theme.text-secondary
+        : Theme.text-primary;
+
+    HorizontalLayout {
+        padding-left: Theme.space-4;
+        padding-right: Theme.space-4;
+        spacing: Theme.space-2;
+        alignment: center;
+
+        if root.icon-source.width > 0: Image {
+            source: root.icon-source;
+            colorize: root.content-color;
+            width: Theme.icon-md;
+            height: Theme.icon-md;
+            // A fixed height opts this child out of the layout's own
+            // vertical stretch, so it needs its own centering.
+            y: (parent.height - self.height) / 2;
+        }
+        Text {
+            text: root.label;
+            color: root.content-color;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            vertical-alignment: center;
+        }
+    }
+
+    area := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}

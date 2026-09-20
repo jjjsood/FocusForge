@@ -100,7 +100,7 @@ fn the_settings_section_refusal_reaches_the_log_and_prints_once() {
         .output()
         .expect("failed to run focusforge-gui");
 
-    let refusal = "--settings-section accepts only \"input-map\", got \"nope\"";
+    let refusal = "--settings-section accepts \"input-map\" or \"diagnostics\", got \"nope\"";
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         stderr.matches(refusal).count(),
@@ -122,6 +122,28 @@ fn the_settings_section_refusal_reaches_the_log_and_prints_once() {
         }),
         "no ERROR record carries the refusal: {contents}"
     );
+}
+
+/// Windowed: `--settings-section` values that are not refused go on to open
+/// a real window, unlike `nope` above, so this needs a compositor
+/// (`common::has_display`) -- everything else in this file exits before a
+/// window is created.
+#[test]
+fn the_settings_section_accepts_input_map_and_diagnostics() {
+    for section in ["input-map", "diagnostics"] {
+        if !common::has_display() {
+            println!("SKIP: window tests need DISPLAY or WAYLAND_DISPLAY");
+            return;
+        }
+        let status = common::gui_bin("diagnostics_section_accept")
+            .args(["--settings-section", section, "--exit-after", "500"])
+            .status()
+            .expect("failed to run focusforge-gui");
+        assert!(
+            status.success(),
+            "--settings-section {section} must be accepted, got {status:?}"
+        );
+    }
 }
 
 /// The trace's closing bracket is written from the flush guard's

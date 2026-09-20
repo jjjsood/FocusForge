@@ -46,6 +46,11 @@ pub mod input_config;
 /// `src/bridge.rs`/`src/main.rs` reach its types directly.
 pub mod viewport;
 
+/// The diagnostics panel's view types, no `use slint::` anywhere in it.
+/// `pub` so `tests/controller.rs` and `src/bridge.rs` reach its types
+/// directly, the same way `input_map` and `viewport` do above.
+pub mod diagnostics;
+
 /// The wgpu half of the canvas: texture creation and
 /// `slint::Image::try_from`, the only module in the crate naming `wgpu` or
 /// `slint::wgpu_29`. `pub` so `src/main.rs` can drive it

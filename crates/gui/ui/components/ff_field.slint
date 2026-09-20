@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A text field: `tone` colours the outline for the two states a caller
+// reports over it (warning, failure); the ordinary outline is the neutral
+// border. Focus grows the control by 2 px on every edge, the same outset
+// every focusable control shares. Width is the caller's; only height
+// follows state.
+
+import { Theme } from "../theme.slint";
+
+export component FFField inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> enabled: true;
+    in property <string> tone: "neutral"; // "neutral" | "warning" | "failure"
+    in property <length> field-width: 110px;
+    callback edited(string);
+
+    property <bool> emphasised: input.has-focus || root.tone != "neutral";
+    property <color> outline: root.tone == "warning"
+        ? Theme.status-warning
+        : root.tone == "failure"
+            ? Theme.status-failure
+            : Theme.border-strong;
+
+    width: root.field-width + (root.emphasised ? 4px : 0px);
+    height: root.emphasised ? 32px : 28px;
+    forward-focus: input;
+    background: Theme.surface-raised;
+    border-radius: Theme.radius-sm;
+    border-width: root.emphasised ? 2px : 1px;
+    border-color: root.outline;
+    opacity: root.enabled ? 1.0 : 0.5;
+
+    input := TextInput {
+        x: Theme.space-2;
+        width: parent.width - 2 * Theme.space-2;
+        height: parent.height;
+        text: root.text;
+        enabled: root.enabled;
+        color: Theme.text-primary;
+        font-size: Theme.text-body.size;
+        vertical-alignment: center;
+        single-line: true;
+
+        edited => { root.edited(self.text); }
+    }
+}

@@ -16,6 +16,14 @@
 //! `Action`. They read `crate::input_map`'s types only -- no `use slint::`
 //! here either.
 
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::diagnostics::{
+    DiagnosticsEntryView, DiagnosticsStatus, DiagnosticsView, clamp_manifest_scroll,
+    manifest_content_height, size_text,
+};
 use crate::input_config::Provenance;
 use crate::input_map::{
     Action, ActionEvent, Button, InputRowView, InputTable, Modifiers, PointerKind, Trigger,
@@ -37,6 +45,19 @@ pub enum DockTab {
     #[default]
     Images,
     Settings,
+}
+
+/// The settings modal's nav-rail sections, in board order. Four of the six
+/// are disabled and cannot be selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsSection {
+    General,
+    Performance,
+    Storage,
+    #[default]
+    InputMap,
+    Diagnostics,
+    About,
 }
 
 /// The two fields a checkpoint row shows: the fusion algorithm used and when
@@ -69,6 +90,9 @@ pub enum ShellEvent {
     /// `pointer_moved`, `key`) every time a trigger resolves to an
     /// `Action`.
     Input(ActionEvent),
+    /// Raised by [`AppController::start_bundle_write`]'s background thread
+    /// once the write attempt has settled, carrying its outcome.
+    DiagnosticsWriteFinished(DiagnosticsStatus),
 }
 
 /// One live drag: which action it started and the last position seen, so
@@ -100,6 +124,29 @@ struct InputState {
     wheel_accum: f32,
 }
 
+/// The diagnostics panel's own state: the two directories a bundle is
+/// built from, the include-minidumps choice, the write destination and
+/// where a write attempt stands. The message shown for each status is
+/// fixed wording, not stored state -- `diagnostics_view()` derives it.
+#[derive(Debug, Clone, Default)]
+struct DiagnosticsState {
+    data_dir: Option<PathBuf>,
+    config_dir: Option<PathBuf>,
+    include_minidumps: bool,
+    destination: PathBuf,
+    status: DiagnosticsStatus,
+    /// The manifest list's scroll offset and the two measurements needed to
+    /// clamp and draw it: its content height (cached from the last
+    /// [`AppController::diagnostics_view`] build) and its viewport height
+    /// (pushed by the list's own `viewport-height-changed`).
+    manifest_scroll_y: f32,
+    manifest_content_height: f32,
+    manifest_viewport_height: f32,
+    /// The grabbed point's offset from the thumb's top edge while a
+    /// scrollbar drag is live, `None` otherwise.
+    manifest_scrollbar_drag: Option<f32>,
+}
+
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
 /// seam rather than re-cutting it.
 #[derive(Default)]
@@ -127,6 +174,10 @@ struct ShellState {
     /// nothing else in the crate observes it, so `bridge.rs` reads the
     /// return value back directly rather than round-tripping the sink.
     settings_open: bool,
+    /// The nav-rail section the modal shows, defaulting to the only one
+    /// with content.
+    settings_section: SettingsSection,
+    diagnostics: DiagnosticsState,
 }
 
 /// Whether `(x, y)` falls within `pane`'s rect -- [`AppController::anchor`]'s
@@ -140,7 +191,9 @@ fn pane_contains(pane: PaneRect, x: f32, y: f32) -> bool {
 #[derive(Default)]
 pub struct AppController {
     state: ShellState,
-    sink: Option<Box<dyn Fn(ShellEvent) + Send + Sync>>,
+    /// An `Arc`, not a `Box`, so [`Self::start_bundle_write`]'s thread can
+    /// hold its own clone and call it once the write is done.
+    sink: Option<Arc<dyn Fn(ShellEvent) + Send + Sync>>,
 }
 
 impl AppController {
@@ -166,7 +219,7 @@ impl AppController {
     /// `slint::invoke_from_event_loop` and the bridge is never exercised by
     /// them.
     pub fn set_sink(&mut self, sink: Box<dyn Fn(ShellEvent) + Send + Sync>) {
-        self.sink = Some(sink);
+        self.sink = Some(Arc::from(sink));
     }
 
     fn emit(&self, event: ShellEvent) {
@@ -671,5 +724,290 @@ impl AppController {
     pub fn close_settings(&mut self) -> bool {
         self.state.settings_open = false;
         false
+    }
+
+    pub fn settings_section(&self) -> SettingsSection {
+        self.state.settings_section
+    }
+
+    pub fn select_settings_section(&mut self, section: SettingsSection) {
+        self.state.settings_section = section;
+    }
+
+    /// Feeds the diagnostics panel its data and configuration directories
+    /// and derives the default destination from the data directory:
+    /// `<data_dir>/diagnostics/<default file name>`, or the file name alone
+    /// when no data directory resolves.
+    pub fn set_diagnostics_dirs(&mut self, data_dir: Option<PathBuf>, config_dir: Option<PathBuf>) {
+        self.state.diagnostics.data_dir = data_dir;
+        self.state.diagnostics.config_dir = config_dir;
+        let destination = self.default_destination();
+        self.set_diagnostics_destination(destination);
+    }
+
+    /// `<data_dir>/diagnostics/<a freshly timestamped file name>`, or the
+    /// file name alone when no data directory resolves -- never the same
+    /// path twice in the same second, so a destination this builds is never
+    /// found existing by the write that follows it.
+    fn default_destination(&self) -> PathBuf {
+        let file_name = focusforge_diagnostics::bundle::default_file_name();
+        match &self.state.diagnostics.data_dir {
+            Some(dir) => dir.join("diagnostics").join(file_name),
+            None => PathBuf::from(file_name),
+        }
+    }
+
+    /// `bundle::write` refuses an existing path unless forced, so every
+    /// destination change re-derives whether that is the state to show.
+    fn set_diagnostics_destination(&mut self, path: PathBuf) {
+        self.state.diagnostics.status = if path.exists() {
+            DiagnosticsStatus::ExistingFile
+        } else {
+            DiagnosticsStatus::Idle
+        };
+        self.state.diagnostics.destination = path;
+    }
+
+    pub fn set_destination(&mut self, text: &str) {
+        self.set_diagnostics_destination(PathBuf::from(text));
+    }
+
+    pub fn set_include_minidumps(&mut self, include: bool) {
+        self.state.diagnostics.include_minidumps = include;
+    }
+
+    /// Where a write attempt currently stands -- what the footer's one
+    /// button does on a click depends on it (`bridge.rs`'s
+    /// `on_diagnostics_primary_clicked`).
+    pub fn diagnostics_status(&self) -> DiagnosticsStatus {
+        self.state.diagnostics.status
+    }
+
+    /// Starts a bundle write in the background: marks the view `Writing`
+    /// synchronously, then writes on a thread that creates the
+    /// destination's parent directory, forces an overwrite exactly when the
+    /// destination already existed, and reports its outcome through the
+    /// cloned sink.
+    pub fn start_bundle_write(&mut self) -> std::thread::JoinHandle<()> {
+        let force = self.state.diagnostics.status == DiagnosticsStatus::ExistingFile;
+        self.state.diagnostics.status = DiagnosticsStatus::Writing;
+        let sink = self.sink.clone();
+        let options = focusforge_diagnostics::bundle::Options {
+            data_dir: self.state.diagnostics.data_dir.clone(),
+            config_dir: self.state.diagnostics.config_dir.clone(),
+            include_minidumps: self.state.diagnostics.include_minidumps,
+        };
+        let destination = self.state.diagnostics.destination.clone();
+
+        std::thread::spawn(move || {
+            let manifest = focusforge_diagnostics::bundle::manifest(&options);
+            if let Some(parent) = destination.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let redaction = focusforge_diagnostics::bundle::Redaction::from_env();
+            let status = match focusforge_diagnostics::bundle::write(
+                &manifest,
+                &destination,
+                force,
+                &redaction,
+            ) {
+                Ok(written) => {
+                    if let Some(data_dir) = options.data_dir.as_deref() {
+                        let bundled = focusforge_diagnostics::crash_notice::crash_ids(
+                            data_dir,
+                            &written.sources,
+                        );
+                        // Best effort: the bundle is written either way.
+                        if let Err(e) =
+                            focusforge_diagnostics::crash_notice::mark_reported(data_dir, &bundled)
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                "the packaged crashes could not be marked as reported"
+                            );
+                        }
+                    }
+                    DiagnosticsStatus::Written
+                }
+                Err(_) => DiagnosticsStatus::Failed,
+            };
+            if let Some(sink) = sink {
+                sink(ShellEvent::DiagnosticsWriteFinished(status));
+            }
+        })
+    }
+
+    /// Stores a background write's outcome -- called once
+    /// [`ShellEvent::DiagnosticsWriteFinished`] reaches the event loop,
+    /// since the thread that produced it holds no lock on `self`.
+    pub fn finish_bundle_write(&mut self, status: DiagnosticsStatus) {
+        self.state.diagnostics.status = status;
+        if status != DiagnosticsStatus::Written {
+            return;
+        }
+        // A fresh destination for the next export, so a second click needs
+        // no extra step. `default_file_name` is timestamped to the second,
+        // so two writes started within the same second can still collide --
+        // rare enough that landing on the ordinary existing-file state
+        // (rather than keeping `Written`) is the whole answer.
+        let fresh = self.default_destination();
+        if fresh.exists() {
+            self.state.diagnostics.status = DiagnosticsStatus::ExistingFile;
+        }
+        self.state.diagnostics.destination = fresh;
+    }
+
+    /// A press on the manifest scrollbar: on the thumb itself, grabs it at
+    /// that point so a following drag tracks the pointer with no jump; on
+    /// the bare track, jumps there, centring the thumb on the press and
+    /// grabbing its centre for the drag that follows. `PointerKind::Move`
+    /// is ignored -- it carries no motion, and ending the drag here would
+    /// end it on its own first movement.
+    pub fn manifest_scrollbar_pointer(&mut self, kind: PointerKind, mouse_y: f32) {
+        match kind {
+            PointerKind::Down => {
+                let (thumb_top, thumb_height) = self.manifest_scrollbar_thumb();
+                if mouse_y >= thumb_top && mouse_y < thumb_top + thumb_height {
+                    self.state.diagnostics.manifest_scrollbar_drag = Some(mouse_y - thumb_top);
+                } else {
+                    let viewport_height = self.state.diagnostics.manifest_viewport_height.max(1.0);
+                    let content_height = self.state.diagnostics.manifest_content_height;
+                    let target_top = mouse_y - thumb_height / 2.0;
+                    self.set_manifest_scroll(target_top * content_height / viewport_height);
+                    self.state.diagnostics.manifest_scrollbar_drag = Some(thumb_height / 2.0);
+                }
+            }
+            PointerKind::Up => self.state.diagnostics.manifest_scrollbar_drag = None,
+            PointerKind::Move => {}
+        }
+    }
+
+    /// The live manifest-scrollbar drag, if any: `mouse_y` minus the grab
+    /// offset is the thumb's new top edge, converted back to a
+    /// content-space offset the same way `manifest_scrollbar_thumb`
+    /// converts the other way.
+    pub fn manifest_scrollbar_dragged(&mut self, mouse_y: f32) {
+        let Some(grab_offset) = self.state.diagnostics.manifest_scrollbar_drag else {
+            return;
+        };
+        let viewport_height = self.state.diagnostics.manifest_viewport_height.max(1.0);
+        let content_height = self.state.diagnostics.manifest_content_height;
+        let target_top = mouse_y - grab_offset;
+        self.set_manifest_scroll(target_top * content_height / viewport_height);
+    }
+
+    fn set_manifest_scroll(&mut self, offset_px: f32) {
+        let content_height = self.state.diagnostics.manifest_content_height;
+        let viewport_height = self.state.diagnostics.manifest_viewport_height;
+        self.state.diagnostics.manifest_scroll_y =
+            clamp_manifest_scroll(offset_px, content_height, viewport_height);
+    }
+
+    /// The manifest scrollbar thumb's current `(top, height)` in
+    /// track-pixel space -- the same two formulas the scrollbar itself
+    /// draws it with, so a press can tell the thumb from the bare track.
+    fn manifest_scrollbar_thumb(&self) -> (f32, f32) {
+        let content_height = self.state.diagnostics.manifest_content_height;
+        let viewport_height = self.state.diagnostics.manifest_viewport_height;
+        if content_height <= 0.0 {
+            return (0.0, viewport_height);
+        }
+        let height = (viewport_height * viewport_height / content_height).max(16.0);
+        let top = self.state.diagnostics.manifest_scroll_y * viewport_height / content_height;
+        (top, height)
+    }
+
+    /// The manifest list's measured viewport height -- pushed once, when
+    /// the panel is first constructed; re-clamps the scroll offset.
+    pub fn set_manifest_viewport_height(&mut self, height: f32) {
+        self.state.diagnostics.manifest_viewport_height = height.max(0.0);
+        self.set_manifest_scroll(self.state.diagnostics.manifest_scroll_y);
+    }
+
+    /// Scrolls the manifest list by `delta_px`, clamped to its current
+    /// content/viewport -- the wheel's own path, alongside the scrollbar's.
+    pub fn manifest_scrolled(&mut self, delta_px: f32) {
+        self.set_manifest_scroll(self.state.diagnostics.manifest_scroll_y + delta_px);
+    }
+
+    /// The manifest list's current scroll offset -- cheap to read after any
+    /// of the methods above, since none of them touch the manifest itself
+    /// (unlike [`Self::diagnostics_view`], which re-reads it from disk).
+    pub fn manifest_scroll_offset(&self) -> f32 {
+        self.state.diagnostics.manifest_scroll_y
+    }
+
+    /// Builds the diagnostics panel's whole view fresh from
+    /// [`focusforge_diagnostics::bundle::manifest`] and the destination
+    /// state above -- the panel carries no state of its own. Also refreshes
+    /// the cached manifest content height the scrollbar methods above read,
+    /// re-clamping the scroll offset against it.
+    pub fn diagnostics_view(&mut self) -> DiagnosticsView {
+        let options = focusforge_diagnostics::bundle::Options {
+            data_dir: self.state.diagnostics.data_dir.clone(),
+            config_dir: self.state.diagnostics.config_dir.clone(),
+            include_minidumps: self.state.diagnostics.include_minidumps,
+        };
+        let manifest = focusforge_diagnostics::bundle::manifest(&options);
+        let note = (!manifest.has_logs() && !manifest.has_crash_evidence())
+            .then(|| "No logs or crash evidence were found.".to_string());
+        let entries: Vec<DiagnosticsEntryView> = manifest
+            .entries
+            .iter()
+            .map(|entry| {
+                let bytes = match &entry.source {
+                    focusforge_diagnostics::bundle::EntrySource::Generated(text) => {
+                        text.len() as u64
+                    }
+                    focusforge_diagnostics::bundle::EntrySource::File(path) => {
+                        fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+                    }
+                };
+                let not_redacted = !entry.redacted;
+                let value = if not_redacted {
+                    format!("{} · not redacted", size_text(bytes))
+                } else {
+                    size_text(bytes)
+                };
+                DiagnosticsEntryView {
+                    name: entry.name.clone(),
+                    value,
+                    not_redacted,
+                }
+            })
+            .collect();
+
+        let (primary_label, message) = match self.state.diagnostics.status {
+            DiagnosticsStatus::Idle => ("Create bundle", String::new()),
+            DiagnosticsStatus::ExistingFile => (
+                "Overwrite and create",
+                "This file already exists. Creating the bundle will overwrite it.".to_string(),
+            ),
+            DiagnosticsStatus::Writing => ("Writing…", String::new()),
+            DiagnosticsStatus::Written => {
+                ("Create bundle", "Bundle created successfully.".to_string())
+            }
+            DiagnosticsStatus::Failed => (
+                "Create bundle",
+                "Could not write the bundle. Nothing was written.".to_string(),
+            ),
+        };
+
+        let content_height = manifest_content_height(entries.len(), note.is_some());
+        self.state.diagnostics.manifest_content_height = content_height;
+        self.set_manifest_scroll(self.state.diagnostics.manifest_scroll_y);
+
+        DiagnosticsView {
+            entries,
+            note,
+            include_minidumps: self.state.diagnostics.include_minidumps,
+            destination: self.state.diagnostics.destination.display().to_string(),
+            status: self.state.diagnostics.status,
+            message,
+            primary_label: primary_label.to_string(),
+            busy: self.state.diagnostics.status == DiagnosticsStatus::Writing,
+            manifest_scroll_offset: self.state.diagnostics.manifest_scroll_y,
+            manifest_content_height: content_height,
+        }
     }
 }

@@ -854,9 +854,17 @@ fn unimplemented_actions_are_named_not_silent() {
 #[test]
 fn no_handler_outside_the_dispatch_point() {
     let mut violations = Vec::new();
+    // The canvas and the diagnostics manifest list each forward their own
+    // scroll/pointer/drag gestures straight to the controller through
+    // dedicated methods, not through the `Action` table -- neither is
+    // steerable input a rebind config could touch.
+    let exempt = ["canvas.slint", "ff_manifest_list.slint"];
     for path in common::find_slint_files(&common::ui_dir()) {
-        let is_canvas = path.file_name().and_then(|n| n.to_str()) == Some("canvas.slint");
-        if is_canvas {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| exempt.contains(&n))
+        {
             continue;
         }
         let contents = fs::read_to_string(&path).unwrap();
@@ -883,19 +891,25 @@ fn no_handler_outside_the_dispatch_point() {
 }
 
 #[test]
-fn nav_rail_has_one_entry_this_phase() {
+fn nav_rail_has_six_entries_four_disabled() {
     let path = common::ui_dir().join("shell").join("settings_modal.slint");
     let contents = fs::read_to_string(&path).unwrap();
     let code = common::strip_line_comments(&contents);
     assert_eq!(
         code.matches("FFNavRailEntry {").count(),
-        1,
-        "exactly one nav-rail entry"
+        6,
+        "the nav rail must carry all six sections"
     );
-    for disabled in ["Performance", "Storage", "General", "About"] {
+    for label in ["General", "Performance", "Storage", "About"] {
         assert!(
-            !code.contains(disabled),
-            "{disabled} must not appear yet"
+            code.contains(&format!("label: \"{label}\";")),
+            "{label} must be present"
+        );
+    }
+    for label in ["Input map", "Diagnostics"] {
+        assert!(
+            code.contains(&format!("label: \"{label}\";")),
+            "{label} must be present"
         );
     }
 }

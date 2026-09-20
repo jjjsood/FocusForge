@@ -12,8 +12,9 @@ use std::sync::{Arc, Mutex};
 use slint::ComponentHandle;
 use slint::winit_030::WinitWindowAccessor;
 
-use crate::controller::{AppController, DockTab, ShellEvent, ShellMode};
-use crate::generated::AppWindow;
+use crate::controller::{AppController, DockTab, SettingsSection, ShellEvent, ShellMode};
+use crate::diagnostics::DiagnosticsStatus;
+use crate::generated::{AppWindow, FFManifestRow};
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
 use crate::viewport::PaneRect;
@@ -128,6 +129,40 @@ pub fn read_pane_geometry(app: &AppWindow) -> (PaneRect, PaneRect) {
     )
 }
 
+/// Rebuilds the diagnostics panel's whole view from the controller and
+/// pushes it into the window -- the panel carries no state of its own, so
+/// every change that could affect it re-runs this rather than patching one
+/// property.
+pub fn push_diagnostics_view(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
+    let view = controller.lock().unwrap().diagnostics_view();
+    let rows: Vec<FFManifestRow> = view
+        .entries
+        .iter()
+        .map(|entry| FFManifestRow {
+            name: entry.name.clone().into(),
+            value: entry.value.clone().into(),
+            not_redacted: entry.not_redacted,
+        })
+        .collect();
+    app.set_diagnostics_rows(Rc::new(slint::VecModel::from(rows)).into());
+    app.set_diagnostics_note(view.note.unwrap_or_default().into());
+    app.set_diagnostics_include_minidumps(view.include_minidumps);
+    app.set_diagnostics_destination(view.destination.into());
+    let status = match view.status {
+        DiagnosticsStatus::Idle => "idle",
+        DiagnosticsStatus::ExistingFile => "existing-file",
+        DiagnosticsStatus::Writing => "writing",
+        DiagnosticsStatus::Written => "written",
+        DiagnosticsStatus::Failed => "failed",
+    };
+    app.set_diagnostics_status(status.into());
+    app.set_diagnostics_message(view.message.into());
+    app.set_diagnostics_primary_label(view.primary_label.into());
+    app.set_diagnostics_busy(view.busy);
+    app.set_diagnostics_manifest_scroll_offset(view.manifest_scroll_offset);
+    app.set_diagnostics_manifest_content_height(view.manifest_content_height);
+}
+
 /// Wires every callback in `app` to a fresh [`AppController`], and returns
 /// [`Installed`] so `main.rs` can read the same state the window shows and
 /// drive the same GPU renderer cell. The sink wraps
@@ -140,12 +175,23 @@ pub fn install(app: &AppWindow) -> Installed {
 
     {
         let app_weak = app.as_weak();
+        let sink_controller = controller.clone();
         controller.lock().unwrap().set_sink(Box::new(move |event| {
             let app_weak = app_weak.clone();
+            let controller = sink_controller.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(app) = app_weak.upgrade() else {
                     return;
                 };
+                // A write's outcome updates the controller's own state
+                // first -- the thread that produced it holds no lock on
+                // `self` -- then rebuilds the view the same way every other
+                // diagnostics mutation does.
+                if let ShellEvent::DiagnosticsWriteFinished(status) = event {
+                    controller.lock().unwrap().finish_bundle_write(status);
+                    push_diagnostics_view(&app, &controller);
+                    return;
+                }
                 perform(&app, event);
             });
         }));
@@ -324,6 +370,118 @@ pub fn install(app: &AppWindow) -> Installed {
             }
         }
     });
+    app.on_settings_section_selected({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |section| {
+            let parsed = match section.as_str() {
+                "general" => SettingsSection::General,
+                "performance" => SettingsSection::Performance,
+                "storage" => SettingsSection::Storage,
+                "diagnostics" => SettingsSection::Diagnostics,
+                "about" => SettingsSection::About,
+                _ => SettingsSection::InputMap,
+            };
+            controller.lock().unwrap().select_settings_section(parsed);
+            if let Some(app) = app_weak.upgrade() {
+                app.set_settings_section(section);
+            }
+        }
+    });
+    app.on_diagnostics_minidumps_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |include| {
+            controller.lock().unwrap().set_include_minidumps(include);
+            if let Some(app) = app_weak.upgrade() {
+                push_diagnostics_view(&app, &controller);
+            }
+        }
+    });
+    app.on_diagnostics_destination_edited({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |text| {
+            controller.lock().unwrap().set_destination(text.as_str());
+            if let Some(app) = app_weak.upgrade() {
+                push_diagnostics_view(&app, &controller);
+            }
+        }
+    });
+    app.on_diagnostics_manifest_scrollbar_pointer({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |kind, y| {
+            // `kind` is `ff_manifest_list.slint`'s fold of `PointerEventKind`,
+            // the same convention `canvas-pointer` uses: 0 = Down, 1 = Up or
+            // Cancel, 2 = Move.
+            let kind = match kind {
+                0 => PointerKind::Down,
+                2 => PointerKind::Move,
+                _ => PointerKind::Up,
+            };
+            let mut controller = controller.lock().unwrap();
+            controller.manifest_scrollbar_pointer(kind, y);
+            let offset = controller.manifest_scroll_offset();
+            drop(controller);
+            if let Some(app) = app_weak.upgrade() {
+                app.set_diagnostics_manifest_scroll_offset(offset);
+            }
+        }
+    });
+    app.on_diagnostics_manifest_scrollbar_dragged({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |y| {
+            let mut controller = controller.lock().unwrap();
+            controller.manifest_scrollbar_dragged(y);
+            let offset = controller.manifest_scroll_offset();
+            drop(controller);
+            if let Some(app) = app_weak.upgrade() {
+                app.set_diagnostics_manifest_scroll_offset(offset);
+            }
+        }
+    });
+    app.on_diagnostics_manifest_viewport_height_changed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |height| {
+            let mut controller = controller.lock().unwrap();
+            controller.set_manifest_viewport_height(height);
+            let offset = controller.manifest_scroll_offset();
+            drop(controller);
+            if let Some(app) = app_weak.upgrade() {
+                app.set_diagnostics_manifest_scroll_offset(offset);
+            }
+        }
+    });
+    app.on_diagnostics_manifest_scrolled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |delta| {
+            let mut controller = controller.lock().unwrap();
+            controller.manifest_scrolled(delta);
+            let offset = controller.manifest_scroll_offset();
+            drop(controller);
+            if let Some(app) = app_weak.upgrade() {
+                app.set_diagnostics_manifest_scroll_offset(offset);
+            }
+        }
+    });
+    app.on_diagnostics_primary_clicked({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            // Detached: the write's own outcome reaches the window through
+            // the sink, not through this handle. Every click starts a write
+            // -- a finished bundle re-derives a fresh timestamped
+            // destination first, so exporting again needs no extra click.
+            let _ = controller.lock().unwrap().start_bundle_write();
+            if let Some(app) = app_weak.upgrade() {
+                push_diagnostics_view(&app, &controller);
+            }
+        }
+    });
 
     Installed { controller, canvas }
 }
@@ -386,5 +544,9 @@ fn perform(app: &AppWindow, event: ShellEvent) {
         // `perform` runs off a `Send + Sync` closure that can hold neither
         // an `Rc` nor the GPU state `CanvasRenderer` needs.
         ShellEvent::Input(_) => {}
+        // Intercepted before `perform` is ever called -- the sink installed
+        // in `install` handles this variant itself, since it needs the
+        // controller lock this function does not carry.
+        ShellEvent::DiagnosticsWriteFinished(_) => {}
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! `focusforge-gui`'s entry point. Every flag below exists so the window
-//! can be observed without a person in front of it (steps 9-13).
+//! can be observed without a person in front of it.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -207,10 +207,30 @@ fn install_input_table(
     app.set_input_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
     app.set_input_provenance(controller.input_provenance_line().into());
 
-    if args.settings_section.is_some() {
+    if let Some(section) = &args.settings_section {
         controller.open_settings();
         app.set_settings_open(true);
+        let parsed = if section == "diagnostics" {
+            focusforge_gui::SettingsSection::Diagnostics
+        } else {
+            focusforge_gui::SettingsSection::InputMap
+        };
+        controller.select_settings_section(parsed);
+        app.set_settings_section(section.clone().into());
     }
+}
+
+/// Feeds the diagnostics panel its directories and pushes its first view
+/// into the window.
+fn install_diagnostics(
+    controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
+    app: &AppWindow,
+) {
+    controller.lock().unwrap().set_diagnostics_dirs(
+        focusforge_diagnostics::data_dir_from_env(),
+        focusforge_diagnostics::config_dir_from_env(),
+    );
+    focusforge_gui::bridge::push_diagnostics_view(app, controller);
 }
 
 fn main() -> ExitCode {
@@ -239,8 +259,11 @@ fn main() -> ExitCode {
 fn run(args: &Args) -> ExitCode {
     if let Some(section) = &args.settings_section
         && section != "input-map"
+        && section != "diagnostics"
     {
-        tracing::error!("--settings-section accepts only \"input-map\", got {section:?}");
+        tracing::error!(
+            "--settings-section accepts \"input-map\" or \"diagnostics\", got {section:?}"
+        );
         return ExitCode::from(2);
     }
 
@@ -256,6 +279,7 @@ fn run(args: &Args) -> ExitCode {
         let focusforge_gui::bridge::Installed { controller, canvas } = bridge::install(&app);
 
         install_input_table(&controller, &app, args);
+        install_diagnostics(&controller, &app);
 
         if let Some(path) = &args.open {
             if let Err(e) = controller.lock().unwrap().open_project(path) {

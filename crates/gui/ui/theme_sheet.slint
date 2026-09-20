@@ -6,6 +6,11 @@
 // the substring `width` anywhere in that file, and a swatch needs one.
 
 import { Theme, TypeRole } from "theme.slint";
+import { FFButton } from "components/ff_button.slint";
+import { FFToggle } from "components/ff_toggle.slint";
+import { FFField } from "components/ff_field.slint";
+import { FFProgressBar } from "components/ff_progress_bar.slint";
+import { FFManifestList } from "components/ff_manifest_list.slint";
 
 component ColourSwatch inherits Rectangle {
     in property <color> swatch;
@@ -105,6 +110,11 @@ export component ThemeSheet inherits Window {
     preferred-height: 1000px;
     background: Theme.surface-base;
     default-font-family: Theme.font-family;
+    // Gives the field's focused-state sample real keyboard focus on show,
+    // the same `forward-focus` mechanism `ui/app.slint` uses for the
+    // canvas -- a window can forward focus to only one element, so this is
+    // also why the toggle's own focused sample never shows its ring here.
+    forward-focus: field-focus-demo;
 
     VerticalLayout {
         padding: Theme.space-4;
@@ -196,6 +206,91 @@ export component ThemeSheet inherits Window {
             IconSizeSample { icon-size: Theme.icon-lg; label: "icon-lg"; }
             IconSizeSample { icon-size: Theme.icon-md; label: "icon-md"; }
             IconSizeSample { icon-size: Theme.icon-sm; label: "icon-sm"; }
+        }
+
+        GroupHeading { text: "FFButton"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            FFButton {
+                kind: "primary";
+                label: "Create bundle";
+                icon-source: @image-url("../../../assets/icons/download.svg");
+            }
+            FFButton {
+                kind: "default";
+                label: "Writing…";
+                icon-source: @image-url("../../../assets/icons/download.svg");
+                enabled: false;
+            }
+            FFButton { kind: "default"; label: "Done"; }
+            FFButton { kind: "quiet"; label: "Cancel"; }
+            FFButton {
+                kind: "primary";
+                label: "Disabled";
+                icon-source: @image-url("../../../assets/icons/download.svg");
+                enabled: false;
+            }
+            FFButton { kind: "default"; label: "Compact"; compact: true; }
+        }
+
+        GroupHeading { text: "FFToggle"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFToggle { checked: false; }
+            FFToggle { checked: true; }
+            FFToggle { checked: false; enabled: false; }
+            FFToggle { checked: true; enabled: false; }
+        }
+
+        GroupHeading { text: "FFField"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFField { text: "...diagnostics/2026-09-17-1400.zip"; field-width: 220px; }
+            FFField {
+                text: "...diagnostics/2026-09-17-1400.zip";
+                field-width: 220px;
+                tone: "warning";
+            }
+            FFField {
+                text: "...diagnostics/2026-09-17-1400.zip";
+                field-width: 220px;
+                tone: "failure";
+            }
+            FFField { text: "Read only"; field-width: 120px; enabled: false; }
+            field-focus-demo := FFField {
+                text: "Focused";
+                field-width: 120px;
+            }
+        }
+
+        GroupHeading { text: "FFProgressBar"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFProgressBar { progress: 0.0; }
+            FFProgressBar { progress: 0.55; }
+            FFProgressBar { progress: 1.0; }
+            FFProgressBar { indeterminate: true; }
+        }
+
+        GroupHeading { text: "FFManifestList"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFManifestList {
+                rows: [
+                    { name: "diagnostics.log", value: "412 KB", not-redacted: false },
+                    { name: "diagnostics.log.1", value: "1.0 MB", not-redacted: false },
+                    { name: "panic-2026-09-15T10-22-01.json", value: "8 KB", not-redacted: false },
+                    { name: "system-summary.txt", value: "2 KB", not-redacted: false },
+                    {
+                        name: "crash-2026-09-18T09-03-12.dmp",
+                        value: "8.2 MB · not redacted",
+                        not-redacted: true,
+                    },
+                ];
+            }
+            FFManifestList {
+                note: "No logs or crash evidence were found.";
+            }
         }
     }
 }

@@ -331,8 +331,17 @@ fn gestures_come_from_the_input_map() {
     assert_eq!(canvas_slint.matches("pointer-event(").count(), 1);
     assert_eq!(canvas_slint.matches("moved =>").count(), 1);
 
+    // The diagnostics manifest list forwards its own scroll/pointer/drag
+    // gestures straight to the controller through dedicated methods, not
+    // through the `Action` table -- not steerable input a rebind config
+    // could touch, the same exemption `canvas.slint` already has.
+    let exempt = ["canvas.slint", "ff_manifest_list.slint"];
     for path in common::find_slint_files(&common::ui_dir()) {
-        if path.file_name().and_then(|n| n.to_str()) == Some("canvas.slint") {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| exempt.contains(&n))
+        {
             continue;
         }
         let contents = fs::read_to_string(&path).unwrap();
