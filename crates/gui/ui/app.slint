@@ -208,8 +208,10 @@ export component AppWindow inherits Window {
     in property <bool> diagnostics-busy: false;
     in property <length> diagnostics-manifest-scroll-offset: 0px;
     in property <length> diagnostics-manifest-content-height: 0px;
+    in property <length> diagnostics-destination-scroll-offset: 0px;
     callback diagnostics-minidumps-toggled(bool);
     callback diagnostics-destination-edited(string);
+    callback diagnostics-destination-cursor-moved(length, length);
     callback diagnostics-primary-clicked();
     callback diagnostics-manifest-scrollbar-pointer(int, length);
     callback diagnostics-manifest-scrollbar-dragged(length);
@@ -255,11 +257,13 @@ export component AppWindow inherits Window {
         diagnostics-busy: root.diagnostics-busy;
         diagnostics-manifest-scroll-offset: root.diagnostics-manifest-scroll-offset;
         diagnostics-manifest-content-height: root.diagnostics-manifest-content-height;
+        diagnostics-destination-scroll-offset: root.diagnostics-destination-scroll-offset;
 
         settings-close-requested => { root.settings-close-requested(); }
         settings-section-selected(s) => { root.settings-section-selected(s); }
         diagnostics-minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
         diagnostics-destination-edited(t) => { root.diagnostics-destination-edited(t); }
+        diagnostics-destination-cursor-moved(x, w) => { root.diagnostics-destination-cursor-moved(x, w); }
         diagnostics-primary-clicked => { root.diagnostics-primary-clicked(); }
         diagnostics-manifest-scrollbar-pointer(kind, y) => { root.diagnostics-manifest-scrollbar-pointer(kind, y); }
         diagnostics-manifest-scrollbar-dragged(y) => { root.diagnostics-manifest-scrollbar-dragged(y); }

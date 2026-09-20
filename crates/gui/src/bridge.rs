@@ -179,6 +179,7 @@ pub fn push_diagnostics_view(app: &AppWindow, controller: &Arc<Mutex<AppControll
     app.set_diagnostics_busy(view.busy);
     app.set_diagnostics_manifest_scroll_offset(view.manifest_scroll_offset);
     app.set_diagnostics_manifest_content_height(view.manifest_content_height);
+    app.set_diagnostics_destination_scroll_offset(view.destination_scroll_offset);
 }
 
 /// Wires every callback in `app` to a fresh [`AppController`], and returns
@@ -421,6 +422,19 @@ pub fn install(app: &AppWindow) -> Installed {
         let app_weak = app.as_weak();
         move |text| {
             controller.lock().unwrap().set_destination(text.as_str());
+            if let Some(app) = app_weak.upgrade() {
+                push_diagnostics_view(&app, &controller);
+            }
+        }
+    });
+    app.on_diagnostics_destination_cursor_moved({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |cursor_x, viewport_width| {
+            controller
+                .lock()
+                .unwrap()
+                .diagnostics_destination_cursor_moved(cursor_x, viewport_width);
             if let Some(app) = app_weak.upgrade() {
                 push_diagnostics_view(&app, &controller);
             }

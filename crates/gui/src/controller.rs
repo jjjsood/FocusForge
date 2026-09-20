@@ -145,6 +145,10 @@ struct DiagnosticsState {
     /// The grabbed point's offset from the thumb's top edge while a
     /// scrollbar drag is live, `None` otherwise.
     manifest_scrollbar_drag: Option<f32>,
+    /// The destination field's horizontal scroll offset, pushed by
+    /// [`AppController::diagnostics_destination_cursor_moved`] whenever the
+    /// cursor would otherwise land outside the field's visible width.
+    destination_scroll_x: f32,
 }
 
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
@@ -184,6 +188,28 @@ struct ShellState {
 /// only helper.
 fn pane_contains(pane: PaneRect, x: f32, y: f32) -> bool {
     x >= pane.x && x <= pane.x + pane.width && y >= pane.y && y <= pane.y + pane.height
+}
+
+/// A one-sided margin so a scrolled cursor never sits flush against the
+/// field's own edge, capped at half the visible width for a very narrow
+/// field.
+fn field_scroll_margin(viewport_width: f32) -> f32 {
+    4.0_f32.min(viewport_width / 2.0).max(0.0)
+}
+
+/// The horizontal scroll offset that keeps a cursor at `cursor_x` (measured
+/// from the field's unscrolled left edge) inside `[0, viewport_width]`,
+/// shifting `current_offset` by the least amount needed --
+/// [`AppController::diagnostics_destination_cursor_moved`]'s only helper.
+fn clamp_field_scroll(cursor_x: f32, current_offset: f32, viewport_width: f32) -> f32 {
+    let margin = field_scroll_margin(viewport_width);
+    if cursor_x + current_offset < margin {
+        margin - cursor_x
+    } else if cursor_x + current_offset > viewport_width - margin {
+        viewport_width - margin - cursor_x
+    } else {
+        current_offset
+    }
 }
 
 /// The plain-Rust controller every Slint callback in the crate forwards to.
@@ -940,6 +966,25 @@ impl AppController {
         self.state.diagnostics.manifest_scroll_y
     }
 
+    /// The destination field's cursor moved to `cursor_x`, measured from
+    /// the field's own unscrolled left edge; `viewport_width` is the
+    /// field's currently visible width. Scrolls the field by the least
+    /// amount needed to keep the cursor inside that width, the way a
+    /// native single-line text input does.
+    pub fn diagnostics_destination_cursor_moved(&mut self, cursor_x: f32, viewport_width: f32) {
+        self.state.diagnostics.destination_scroll_x = clamp_field_scroll(
+            cursor_x,
+            self.state.diagnostics.destination_scroll_x,
+            viewport_width,
+        );
+    }
+
+    /// The destination field's current horizontal scroll offset -- cheap to
+    /// read after [`Self::diagnostics_destination_cursor_moved`].
+    pub fn diagnostics_destination_scroll_offset(&self) -> f32 {
+        self.state.diagnostics.destination_scroll_x
+    }
+
     /// Builds the diagnostics panel's whole view fresh from
     /// [`focusforge_diagnostics::bundle::manifest`] and the destination
     /// state above -- the panel carries no state of its own. Also refreshes
@@ -1011,6 +1056,7 @@ impl AppController {
             busy: self.state.diagnostics.status == DiagnosticsStatus::Writing,
             manifest_scroll_offset: self.state.diagnostics.manifest_scroll_y,
             manifest_content_height: content_height,
+            destination_scroll_offset: self.state.diagnostics.destination_scroll_x,
         }
     }
 }

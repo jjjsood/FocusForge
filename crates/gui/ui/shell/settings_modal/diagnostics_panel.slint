@@ -26,9 +26,11 @@ export component FFDiagnosticsPanel inherits Rectangle {
     in property <bool> busy: false;
     in property <length> manifest-scroll-offset: 0px;
     in property <length> manifest-content-height: 0px;
+    in property <length> destination-scroll-offset: 0px;
 
     callback minidumps-toggled(bool);
     callback destination-edited(string);
+    callback destination-cursor-moved(length, length);
     callback primary-clicked();
     callback manifest-scrollbar-pointer(int, length);
     callback manifest-scrollbar-dragged(length);
@@ -109,7 +111,9 @@ export component FFDiagnosticsPanel inherits Rectangle {
             enabled: !root.busy;
             tone: root.field-tone;
             field-width: parent.width - Theme.space-4 - Theme.space-1 - Theme.space-6;
+            scroll-offset: root.destination-scroll-offset;
             edited(text) => { root.destination-edited(text); }
+            cursor-moved(x, w) => { root.destination-cursor-moved(x, w); }
         }
 
         status-slot := Rectangle {

@@ -47,6 +47,8 @@ pub struct DiagnosticsView {
     pub manifest_scroll_offset: f32,
     /// The manifest list's total content height for its current row count.
     pub manifest_content_height: f32,
+    /// The destination field's current horizontal scroll offset.
+    pub destination_scroll_offset: f32,
 }
 
 /// One manifest row's fixed height and the gap between rows, in the units

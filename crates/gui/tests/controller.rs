@@ -545,3 +545,48 @@ fn diagnostics_bundle_marks_reported() {
         "an unwritable crash directory must not turn the write into a failure"
     );
 }
+
+#[test]
+fn diagnostics_destination_field_scrolls_to_keep_cursor_visible() {
+    let mut controller = AppController::new();
+    assert_eq!(
+        controller.diagnostics_destination_scroll_offset(),
+        0.0,
+        "a fresh controller must start unscrolled"
+    );
+
+    // The cursor sits past the visible width -- the field must scroll left
+    // (a negative offset) just enough to bring it back inside.
+    controller.diagnostics_destination_cursor_moved(140.0, 100.0);
+    let offset = controller.diagnostics_destination_scroll_offset();
+    assert!(
+        offset < 0.0,
+        "a cursor past the visible width must scroll the field, got {offset}"
+    );
+    assert!(
+        (0.0..=100.0).contains(&(140.0 + offset)),
+        "the cursor must land back inside the visible width: cursor 140 + offset {offset}"
+    );
+
+    // The cursor moves back near the field's start (Home, or backspacing to
+    // a short prefix) -- the field must scroll back to show it rather than
+    // leaving it hidden behind the still-scrolled offset.
+    controller.diagnostics_destination_cursor_moved(2.0, 100.0);
+    let offset = controller.diagnostics_destination_scroll_offset();
+    assert!(
+        (0.0..=100.0).contains(&(2.0 + offset)),
+        "the cursor must land back inside the visible width after scrolling left: cursor 2 + offset {offset}"
+    );
+
+    // A cursor that is already inside the visible width leaves the offset
+    // untouched.
+    let mut steady = AppController::new();
+    steady.diagnostics_destination_cursor_moved(50.0, 100.0);
+    let before = steady.diagnostics_destination_scroll_offset();
+    steady.diagnostics_destination_cursor_moved(55.0, 100.0);
+    assert_eq!(
+        steady.diagnostics_destination_scroll_offset(),
+        before,
+        "a cursor still inside the visible width must not move the offset"
+    );
+}

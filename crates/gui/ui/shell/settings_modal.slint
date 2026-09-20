@@ -136,8 +136,10 @@ export component FFSettingsModal inherits Rectangle {
     in property <bool> diagnostics-busy: false;
     in property <length> diagnostics-manifest-scroll-offset: 0px;
     in property <length> diagnostics-manifest-content-height: 0px;
+    in property <length> diagnostics-destination-scroll-offset: 0px;
     callback diagnostics-minidumps-toggled(bool);
     callback diagnostics-destination-edited(string);
+    callback diagnostics-destination-cursor-moved(length, length);
     callback diagnostics-primary-clicked();
     callback diagnostics-manifest-scrollbar-pointer(int, length);
     callback diagnostics-manifest-scrollbar-dragged(length);
@@ -277,9 +279,11 @@ export component FFSettingsModal inherits Rectangle {
                 busy: root.diagnostics-busy;
                 manifest-scroll-offset: root.diagnostics-manifest-scroll-offset;
                 manifest-content-height: root.diagnostics-manifest-content-height;
+                destination-scroll-offset: root.diagnostics-destination-scroll-offset;
 
                 minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
                 destination-edited(t) => { root.diagnostics-destination-edited(t); }
+                destination-cursor-moved(x, w) => { root.diagnostics-destination-cursor-moved(x, w); }
                 primary-clicked => { root.diagnostics-primary-clicked(); }
                 manifest-scrollbar-pointer(kind, y) => { root.diagnostics-manifest-scrollbar-pointer(kind, y); }
                 manifest-scrollbar-dragged(y) => { root.diagnostics-manifest-scrollbar-dragged(y); }
