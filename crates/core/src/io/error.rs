@@ -103,6 +103,18 @@ pub enum TiffError {
         expected: usize,
     },
 
+    /// The decoded-segment cache cannot retain even one segment.
+    #[error("{}: decoded cache bound {bound} bytes is below required segment size {required} bytes", path.display())]
+    DecodedCacheTooSmall {
+        path: PathBuf,
+        bound: u64,
+        required: u64,
+    },
+
+    /// The requested frame does not exist in this opened set.
+    #[error("frame {index} is outside the opened frame set ({count} frames)")]
+    FrameIndex { index: usize, count: usize },
+
     /// Magic 43: BigTIFF, which this reader never supports.
     #[error("{}: BigTIFF (magic 43) is not supported, only classic TIFF (magic 42)", path.display())]
     BigTiff { path: PathBuf },

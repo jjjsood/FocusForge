@@ -39,12 +39,12 @@ pub struct DecodedSegment {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SegmentInfo {
-    origin: SegmentOrigin,
-    stored_width: u32,
-    stored_height: u32,
-    valid_width: u32,
-    valid_height: u32,
+pub(crate) struct SegmentInfo {
+    pub(crate) origin: SegmentOrigin,
+    pub(crate) stored_width: u32,
+    pub(crate) stored_height: u32,
+    pub(crate) valid_width: u32,
+    pub(crate) valid_height: u32,
     offset: u64,
     byte_count: u64,
 }
@@ -60,7 +60,7 @@ pub struct TiffSegmentDecoder<'a> {
 impl<'a> TiffSegmentDecoder<'a> {
     /// Validate a parsed TIFF header and its complete file bytes.
     pub fn new(header: &'a TiffHeader, bytes: &'a [u8]) -> Result<Self, TiffError> {
-        let segments = layout(header)?;
+        let segments = segment_layout(header)?;
         Ok(Self {
             header,
             bytes,
@@ -83,38 +83,7 @@ impl<'a> TiffSegmentDecoder<'a> {
                 index,
                 count: self.segments.len(),
             })?;
-        let start = usize::try_from(info.offset).map_err(|_| TiffError::SegmentPastEof {
-            path: self.header.path.clone(),
-            index,
-        })?;
-        let count = usize::try_from(info.byte_count).map_err(|_| TiffError::SegmentPastEof {
-            path: self.header.path.clone(),
-            index,
-        })?;
-        let end = start
-            .checked_add(count)
-            .ok_or_else(|| TiffError::SegmentPastEof {
-                path: self.header.path.clone(),
-                index,
-            })?;
-        let stored = self
-            .bytes
-            .get(start..end)
-            .ok_or_else(|| TiffError::SegmentPastEof {
-                path: self.header.path.clone(),
-                index,
-            })?;
-        let expected = sample_bytes(self.header, info.stored_width, info.stored_height)?;
-        let raw = decode_bytes(self.header, stored, expected, index)?;
-        let samples = samples_and_crop(self.header, &raw, info)?;
-        Ok(DecodedSegment {
-            origin: info.origin,
-            stored_width: info.stored_width,
-            stored_height: info.stored_height,
-            valid_width: info.valid_width,
-            valid_height: info.valid_height,
-            samples,
-        })
+        decode_segment(self.header, self.bytes, info, index)
     }
 }
 
@@ -134,7 +103,7 @@ impl TiffSegmentReader {
             path: path.as_ref().to_path_buf(),
             source,
         })?;
-        let segments = layout(&header)?;
+        let segments = segment_layout(&header)?;
         Ok(Self {
             header,
             bytes: bytes.into_boxed_slice(),
@@ -158,7 +127,7 @@ impl TiffSegmentReader {
     }
 }
 
-fn layout(header: &TiffHeader) -> Result<Vec<SegmentInfo>, TiffError> {
+pub(crate) fn segment_layout(header: &TiffHeader) -> Result<Vec<SegmentInfo>, TiffError> {
     validate_class(header)?;
     let tiled = header.tile_width.is_some();
     let (offsets, counts, geometry) = if let Some(width) = header.tile_width {
@@ -170,8 +139,12 @@ fn layout(header: &TiffHeader) -> Result<Vec<SegmentInfo>, TiffError> {
         }
         let columns = header.width.div_ceil(width);
         let rows = header.height.div_ceil(height);
-        let expected = usize::try_from(u64::from(columns) * u64::from(rows))
-            .map_err(|_| layout_error(header, "tile count overflows usize"))?;
+        let expected = usize::try_from(
+            u64::from(columns)
+                .checked_mul(u64::from(rows))
+                .ok_or_else(|| layout_error(header, "tile count overflows"))?,
+        )
+        .map_err(|_| layout_error(header, "tile count overflows usize"))?;
         (
             &header.tile_offsets,
             &header.tile_byte_counts,
@@ -198,13 +171,25 @@ fn layout(header: &TiffHeader) -> Result<Vec<SegmentInfo>, TiffError> {
     }
 
     let mut segments = Vec::with_capacity(geometry.3);
-    for index in 0..geometry.3 {
+    for segment_index in 0..geometry.3 {
+        let index = u32::try_from(segment_index)
+            .map_err(|_| layout_error(header, "segment index overflows u32"))?;
         let (x, y) = if tiled {
-            let col = (index as u32) % geometry.2;
-            let row = (index as u32) / geometry.2;
-            (col * geometry.0, row * geometry.1)
+            let col = index % geometry.2;
+            let row = index / geometry.2;
+            (
+                col.checked_mul(geometry.0)
+                    .ok_or_else(|| layout_error(header, "tile x coordinate overflows"))?,
+                row.checked_mul(geometry.1)
+                    .ok_or_else(|| layout_error(header, "tile y coordinate overflows"))?,
+            )
         } else {
-            (0, index as u32 * geometry.1)
+            (
+                0,
+                index
+                    .checked_mul(geometry.1)
+                    .ok_or_else(|| layout_error(header, "strip y coordinate overflows"))?,
+            )
         };
         let valid_width = header.width.saturating_sub(x).min(geometry.0);
         let valid_height = header.height.saturating_sub(y).min(geometry.1);
@@ -225,11 +210,51 @@ fn layout(header: &TiffHeader) -> Result<Vec<SegmentInfo>, TiffError> {
             },
             valid_width,
             valid_height,
-            offset: offsets[index],
-            byte_count: counts[index],
+            offset: offsets[segment_index],
+            byte_count: counts[segment_index],
         });
     }
     Ok(segments)
+}
+
+/// Decode one pre-validated segment from borrowed file bytes.
+pub(crate) fn decode_segment(
+    header: &TiffHeader,
+    bytes: &[u8],
+    info: SegmentInfo,
+    index: usize,
+) -> Result<DecodedSegment, TiffError> {
+    let start = usize::try_from(info.offset).map_err(|_| TiffError::SegmentPastEof {
+        path: header.path.clone(),
+        index,
+    })?;
+    let count = usize::try_from(info.byte_count).map_err(|_| TiffError::SegmentPastEof {
+        path: header.path.clone(),
+        index,
+    })?;
+    let end = start
+        .checked_add(count)
+        .ok_or_else(|| TiffError::SegmentPastEof {
+            path: header.path.clone(),
+            index,
+        })?;
+    let stored = bytes
+        .get(start..end)
+        .ok_or_else(|| TiffError::SegmentPastEof {
+            path: header.path.clone(),
+            index,
+        })?;
+    let expected = sample_bytes(header, info.stored_width, info.stored_height)?;
+    let raw = decode_bytes(header, stored, expected, index)?;
+    let samples = samples_and_crop(header, &raw, info)?;
+    Ok(DecodedSegment {
+        origin: info.origin,
+        stored_width: info.stored_width,
+        stored_height: info.stored_height,
+        valid_width: info.valid_width,
+        valid_height: info.valid_height,
+        samples,
+    })
 }
 
 fn validate_class(header: &TiffHeader) -> Result<(), TiffError> {

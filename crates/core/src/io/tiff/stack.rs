@@ -305,7 +305,7 @@ pub fn frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
 /// Lenient uniformity: dimensions, bits per sample, samples per pixel,
 /// photometric and planar configuration must agree with `first`. Byte order
 /// and `RowsPerStrip` are deliberately not compared.
-fn check_uniform(first: &TiffHeader, other: &TiffHeader) -> Result<(), TiffError> {
+pub(crate) fn check_uniform(first: &TiffHeader, other: &TiffHeader) -> Result<(), TiffError> {
     let mut detail = Vec::new();
     if first.width != other.width || first.height != other.height {
         detail.push(format!(
@@ -365,7 +365,7 @@ fn check_uniform(first: &TiffHeader, other: &TiffHeader) -> Result<(), TiffError
 /// the mapping keeps the underlying pages alive on its own.
 // SAFETY: contract above; the only `unsafe` call this crate makes.
 #[allow(unsafe_code)]
-fn map_file(path: &Path) -> Result<Mmap, TiffError> {
+pub(crate) fn map_file(path: &Path) -> Result<Mmap, TiffError> {
     let file = File::open(path).map_err(|source| TiffError::Io {
         path: path.to_path_buf(),
         source,

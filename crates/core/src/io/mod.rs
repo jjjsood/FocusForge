@@ -26,6 +26,7 @@ pub use crate::tile::{Rect, Tile};
 pub use error::{Refusal, TiffError};
 pub use frame::{FrameDesc, FrameError, FrameReader};
 pub use grouping::{CaptureTime, GROUP_GAP, Group, GroupSignal, Proposal, propose};
+pub use tiff::decoded::{CacheStats, DecodedTiffStack};
 pub use tiff::header::{ByteOrder, TiffHeader};
 pub use tiff::segment::{DecodedSegment, SegmentOrigin, TiffSegmentDecoder, TiffSegmentReader};
 pub use tiff::stack::{TiffStack, frame_paths};
