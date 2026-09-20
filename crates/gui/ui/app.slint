@@ -17,6 +17,7 @@ import { FFDock } from "shell/dock.slint";
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFSettingsModal, InputRow, FFManifestRow } from "shell/settings_modal.slint";
 export { InputRow, FFManifestRow }
+import { FFToast } from "components/ff_toast.slint";
 
 export component AppWindow inherits Window {
     // Every callback forwards one-for-one into `AppController` via
@@ -187,6 +188,16 @@ export component AppWindow inherits Window {
         checkpoint-export-requested => { root.checkpoint-export-requested(); }
     }
 
+    if root.crash-notice-visible : crash-notice := FFToast {
+        x: ShellGeometry.pane-gutter;
+        y: ShellGeometry.strip-height + ShellGeometry.toolbar-height + ShellGeometry.pane-gutter;
+        title: root.crash-notice-title;
+        icon-source: @image-url("../../../assets/icons/triangle-alert.svg");
+
+        dismissed => { root.crash-notice-dismissed(); }
+        link-activated => { root.crash-notice-review-requested(); }
+    }
+
     // Settings modal state -- pushed from Rust once at startup
     // (`src/main.rs`, `--settings-section`) and toggled through
     // `AppController::open_settings`/`close_settings`.
@@ -217,6 +228,12 @@ export component AppWindow inherits Window {
     callback diagnostics-manifest-scrollbar-dragged(length);
     callback diagnostics-manifest-viewport-height-changed(length);
     callback diagnostics-manifest-scrolled(length);
+
+    in property <bool> crash-notice-visible: false;
+    in property <string> crash-notice-title: "";
+    callback crash-notice-dismissed();
+    callback crash-notice-review-requested();
+
     // The bottom bar's zoom cluster -- governs both panes, which is why it
     // lives at the root rather than inside `FFPane`.
     in property <string> zoom-readout: "";

@@ -42,6 +42,11 @@ $ focusforge-cli info some/folder
 The hint clears itself once you run `focusforge-cli diagnostics` — see
 below — which marks every crash it packages as reported.
 
+The GUI shows the same thing as a dismissible notice the next time you start
+it, naming how many crashes it found. Dismissing the notice or following it
+into Settings → Diagnostics and creating a bundle both mark that evidence
+reported, so it does not come back.
+
 ## Packaging a diagnostics bundle
 
 ```

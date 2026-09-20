@@ -280,6 +280,7 @@ fn run(args: &Args) -> ExitCode {
 
         install_input_table(&controller, &app, args);
         install_diagnostics(&controller, &app);
+        bridge::install_crash_notice(&controller, &app);
 
         if let Some(path) = &args.open {
             if let Err(e) = controller.lock().unwrap().open_project(path) {

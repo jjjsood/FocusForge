@@ -379,3 +379,32 @@ fn diagnostics_panel_footer_and_list_are_stable_across_states() {
         "the manifest list's own size must not grow with the row count: got {width}x{height}, expected {idle_width}x{idle_height}"
     );
 }
+
+/// The toast paints at the pane gutter under the tab strip and toolbar, at
+/// its fixed size, regardless of window width; with no notice pending, no
+/// element matches its id at all -- the conditional `if` never instantiates
+/// it, rather than leaving it merely invisible.
+#[test]
+fn crash_notice_placement_and_absence() {
+    let app = app_at(1440, 900);
+    assert!(
+        ElementQuery::from_root(&app)
+            .match_id("AppWindow::crash-notice")
+            .find_first()
+            .is_none(),
+        "no element must match the toast's id while no notice is pending"
+    );
+
+    app.set_crash_notice_visible(true);
+    app.set_crash_notice_title("1 crash found".into());
+    assert_rect(&app, "AppWindow::crash-notice", (16.0, 92.0, 300.0, 84.0));
+
+    let narrow = app_at(1200, 760);
+    narrow.set_crash_notice_visible(true);
+    narrow.set_crash_notice_title("1 crash found".into());
+    let (x, y, _, _) = rect(&narrow, "AppWindow::crash-notice");
+    assert!(
+        (x - 16.0).abs() < EPS && (y - 92.0).abs() < EPS,
+        "the toast's top-left must stay at the pane gutter regardless of window width: got ({x}, {y})"
+    );
+}

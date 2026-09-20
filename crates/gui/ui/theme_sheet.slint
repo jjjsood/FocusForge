@@ -11,6 +11,7 @@ import { FFToggle } from "components/ff_toggle.slint";
 import { FFField } from "components/ff_field.slint";
 import { FFProgressBar } from "components/ff_progress_bar.slint";
 import { FFManifestList } from "components/ff_manifest_list.slint";
+import { FFToast } from "components/ff_toast.slint";
 
 component ColourSwatch inherits Rectangle {
     in property <color> swatch;
@@ -290,6 +291,23 @@ export component ThemeSheet inherits Window {
             }
             FFManifestList {
                 note: "No logs or crash evidence were found.";
+            }
+        }
+
+        GroupHeading { text: "FFToast"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFToast {
+                title: "1 crash found";
+                icon-source: @image-url("../../../assets/icons/triangle-alert.svg");
+            }
+            FFToast {
+                title: "3 crashes found";
+                icon-source: @image-url("../../../assets/icons/triangle-alert.svg");
+            }
+            FFToast {
+                title: "128 crashes found";
+                icon-source: @image-url("../../../assets/icons/triangle-alert.svg");
             }
         }
     }

@@ -590,3 +590,217 @@ fn diagnostics_destination_field_scrolls_to_keep_cursor_visible() {
         "a cursor still inside the visible width must not move the offset"
     );
 }
+
+// --- Crash notice: pending count, dismiss, review, timeout, bundle write --
+
+use focusforge_gui::SettingsSection;
+
+/// A panic report, a minidump with its metadata (one crash, not two), and a
+/// third crash that already carries its reported marker -- two unreported
+/// crashes.
+fn seed_notice_crashes(root: &Path) -> std::path::PathBuf {
+    let data = root.join("focusforge");
+    let crashes = data.join("crashes");
+    fs::create_dir_all(&crashes).unwrap();
+    fs::write(
+        crashes.join("20260918T010203Z-focusforge-gui-panic.json"),
+        "{\"format\":1,\"payload\":\"boom\"}",
+    )
+    .unwrap();
+    fs::write(
+        crashes.join("20260918T010204Z-focusforge-gui-native.json"),
+        "{\"format\":1,\"minidump\":\"20260918T010204Z-focusforge-gui-native.dmp\"}",
+    )
+    .unwrap();
+    fs::write(
+        crashes.join("20260918T010204Z-focusforge-gui-native.dmp"),
+        b"MDMP",
+    )
+    .unwrap();
+    fs::write(
+        crashes.join("20260918T010205Z-focusforge-gui-old.json"),
+        "{\"format\":1,\"payload\":\"already seen\"}",
+    )
+    .unwrap();
+    fs::write(
+        crashes.join("20260918T010205Z-focusforge-gui-old.reported"),
+        "2026-09-18T01:02:06Z",
+    )
+    .unwrap();
+    data
+}
+
+#[test]
+fn crash_notice_counts_and_dismisses() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = seed_notice_crashes(root.path());
+
+    let mut controller = AppController::new();
+    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.scan_crash_notice();
+    assert!(controller.crash_notice_visible());
+    assert_eq!(controller.crash_notice_count(), 2);
+    assert_eq!(controller.crash_notice_text(), "2 crashes found");
+
+    controller.dismiss_crash_notice();
+    assert!(!controller.crash_notice_visible());
+    assert_eq!(controller.crash_notice_count(), 0);
+
+    let mut after = AppController::new();
+    after.set_diagnostics_dirs(Some(data_dir), None);
+    after.scan_crash_notice();
+    assert!(
+        !after.crash_notice_visible(),
+        "a fresh controller over the same directory must see nothing pending"
+    );
+    assert_eq!(after.crash_notice_count(), 0);
+
+    // A second data directory with an empty crash directory counts 0 from
+    // the start.
+    let empty_root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(empty_root.path().join("focusforge/crashes")).unwrap();
+    let mut empty = AppController::new();
+    empty.set_diagnostics_dirs(Some(empty_root.path().join("focusforge")), None);
+    empty.scan_crash_notice();
+    assert!(!empty.crash_notice_visible());
+    assert_eq!(empty.crash_notice_count(), 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn crash_notice_unreadable_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = seed_notice_crashes(root.path());
+    let crashes = data_dir.join("crashes");
+    let writable = fs::metadata(&crashes).unwrap().permissions();
+    fs::set_permissions(&crashes, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut controller = AppController::new();
+    controller.set_diagnostics_dirs(Some(data_dir), None);
+    controller.scan_crash_notice();
+
+    fs::set_permissions(&crashes, writable).unwrap();
+
+    assert!(
+        !controller.crash_notice_visible(),
+        "an unreadable crash directory must show no notice"
+    );
+    assert_eq!(controller.crash_notice_count(), 0);
+}
+
+#[test]
+fn crash_notice_timeout_reports_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = seed_notice_crashes(root.path());
+
+    let mut controller = AppController::new();
+    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.scan_crash_notice();
+    assert!(controller.crash_notice_visible());
+    let count_before = controller.crash_notice_count();
+
+    controller.crash_notice_timed_out();
+    assert!(!controller.crash_notice_visible());
+    assert!(
+        !data_dir
+            .join("crashes/20260918T010203Z-focusforge-gui-panic.reported")
+            .exists(),
+        "a timeout must write no reported marker"
+    );
+    assert!(
+        !data_dir
+            .join("crashes/20260918T010204Z-focusforge-gui-native.reported")
+            .exists(),
+        "a timeout must write no reported marker"
+    );
+
+    let mut after = AppController::new();
+    after.set_diagnostics_dirs(Some(data_dir), None);
+    after.scan_crash_notice();
+    assert!(
+        after.crash_notice_visible(),
+        "the evidence must still be pending after a timeout"
+    );
+    assert_eq!(after.crash_notice_count(), count_before);
+}
+
+#[test]
+fn crash_notice_review_opens_diagnostics() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = seed_notice_crashes(root.path());
+
+    let mut controller = AppController::new();
+    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.scan_crash_notice();
+    assert!(controller.crash_notice_visible());
+
+    let open = controller.review_crashes();
+    assert!(open, "review must leave the settings modal open");
+    assert_eq!(controller.settings_section(), SettingsSection::Diagnostics);
+    assert!(!controller.crash_notice_visible());
+    assert!(
+        data_dir
+            .join("crashes/20260918T010203Z-focusforge-gui-panic.reported")
+            .exists(),
+        "review must mark the pending evidence reported, same as dismiss"
+    );
+    assert!(
+        data_dir
+            .join("crashes/20260918T010204Z-focusforge-gui-native.reported")
+            .exists()
+    );
+
+    let marker = data_dir.join("crashes/20260918T010203Z-focusforge-gui-panic.reported");
+    let marked_at = fs::read_to_string(&marker).unwrap();
+    let open_again = controller.review_crashes();
+    assert!(open_again);
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        marked_at,
+        "a second call must mark nothing further"
+    );
+}
+
+#[test]
+fn crash_notice_cleared_by_a_bundle_write() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = seed_two_crashes(root.path());
+
+    let mut controller = AppController::new();
+    let events = install_recording_sink(&mut controller);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.scan_crash_notice();
+    assert!(controller.crash_notice_visible());
+    assert_eq!(controller.crash_notice_count(), 2);
+
+    controller.set_destination(root.path().join("bundle.zip").to_str().unwrap());
+    let status = run_write(&mut controller, &events);
+    assert_eq!(status, DiagnosticsStatus::Written);
+    assert!(
+        !controller.crash_notice_visible(),
+        "a bundle written from the window must hide the notice"
+    );
+    assert_eq!(controller.crash_notice_count(), 0);
+
+    // A failed write leaves it showing.
+    let root2 = tempfile::tempdir().unwrap();
+    let data_dir2 = seed_two_crashes(root2.path());
+    let mut controller2 = AppController::new();
+    let events2 = install_recording_sink(&mut controller2);
+    controller2.set_diagnostics_dirs(Some(data_dir2.clone()), None);
+    controller2.scan_crash_notice();
+    assert!(controller2.crash_notice_visible());
+
+    let blocked_parent = data_dir2.parent().unwrap().join("blocked");
+    fs::write(&blocked_parent, b"not a directory").unwrap();
+    controller2.set_destination(blocked_parent.join("bundle.zip").to_str().unwrap());
+    let status2 = run_write(&mut controller2, &events2);
+    assert_eq!(status2, DiagnosticsStatus::Failed);
+    assert!(
+        controller2.crash_notice_visible(),
+        "a failed write must leave the notice showing"
+    );
+    assert_eq!(controller2.crash_notice_count(), 2);
+}

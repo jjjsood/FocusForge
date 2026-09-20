@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use slint::ComponentHandle;
 use slint::winit_030::WinitWindowAccessor;
@@ -180,6 +181,34 @@ pub fn push_diagnostics_view(app: &AppWindow, controller: &Arc<Mutex<AppControll
     app.set_diagnostics_manifest_scroll_offset(view.manifest_scroll_offset);
     app.set_diagnostics_manifest_content_height(view.manifest_content_height);
     app.set_diagnostics_destination_scroll_offset(view.destination_scroll_offset);
+}
+
+/// Pushes the crash notice's own two properties into the window -- mirrors
+/// [`push_diagnostics_view`] for the toast.
+pub fn push_crash_notice(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
+    let controller = controller.lock().unwrap();
+    app.set_crash_notice_visible(controller.crash_notice_visible());
+    app.set_crash_notice_title(controller.crash_notice_text().into());
+}
+
+/// Scans for unreported crash evidence and pushes the notice, then --
+/// only when it is showing -- arms its auto-dismiss timeout. The timer is
+/// armed before `run()`, the same precedent `src/main.rs`'s own
+/// `--exit-after` timer sets.
+pub fn install_crash_notice(controller: &Arc<Mutex<AppController>>, app: &AppWindow) {
+    controller.lock().unwrap().scan_crash_notice();
+    push_crash_notice(app, controller);
+    if !controller.lock().unwrap().crash_notice_visible() {
+        return;
+    }
+    let timer_controller = controller.clone();
+    let app_weak = app.as_weak();
+    slint::Timer::single_shot(Duration::from_secs(10), move || {
+        timer_controller.lock().unwrap().crash_notice_timed_out();
+        if let Some(app) = app_weak.upgrade() {
+            push_crash_notice(&app, &timer_controller);
+        }
+    });
 }
 
 /// Wires every callback in `app` to a fresh [`AppController`], and returns
@@ -490,6 +519,30 @@ pub fn install(app: &AppWindow) -> Installed {
             // destination first, so exporting again needs no extra click.
             let _ = controller.lock().unwrap().start_bundle_write();
             if let Some(app) = app_weak.upgrade() {
+                push_diagnostics_view(&app, &controller);
+            }
+        }
+    });
+
+    app.on_crash_notice_dismissed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().dismiss_crash_notice();
+            if let Some(app) = app_weak.upgrade() {
+                push_crash_notice(&app, &controller);
+            }
+        }
+    });
+    app.on_crash_notice_review_requested({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            let open = controller.lock().unwrap().review_crashes();
+            if let Some(app) = app_weak.upgrade() {
+                app.set_settings_open(open);
+                app.set_settings_section("diagnostics".into());
+                push_crash_notice(&app, &controller);
                 push_diagnostics_view(&app, &controller);
             }
         }

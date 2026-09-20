@@ -149,6 +149,11 @@ struct DiagnosticsState {
     /// [`AppController::diagnostics_destination_cursor_moved`] whenever the
     /// cursor would otherwise land outside the field's visible width.
     destination_scroll_x: f32,
+    /// The crash notice's own snapshot: the unreported crash ids found at
+    /// start and whether the notice is currently shown for them. Taken once
+    /// by [`AppController::scan_crash_notice`]; nothing re-scans mid-session.
+    crash_notice_ids: Vec<String>,
+    crash_notice_visible: bool,
 }
 
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
@@ -884,6 +889,80 @@ impl AppController {
             self.state.diagnostics.status = DiagnosticsStatus::ExistingFile;
         }
         self.state.diagnostics.destination = fresh;
+        // A bundle written from the window already marks the crashes it
+        // packaged; dropping the notice's own snapshot means a user who
+        // only ever bundles never sees it return for that evidence.
+        self.state.diagnostics.crash_notice_ids.clear();
+        self.state.diagnostics.crash_notice_visible = false;
+    }
+
+    /// Snapshots `data_dir`'s unreported crash evidence and shows the notice
+    /// exactly when that snapshot is non-empty. No data directory and an
+    /// unreadable crash directory both yield an empty snapshot and a hidden
+    /// notice -- neither ever fails the window's start-up. Called once at
+    /// start; nothing re-scans mid-session.
+    pub fn scan_crash_notice(&mut self) {
+        let ids = match &self.state.diagnostics.data_dir {
+            Some(dir) => focusforge_diagnostics::crash_notice::unreported(dir),
+            None => Vec::new(),
+        };
+        self.state.diagnostics.crash_notice_visible = !ids.is_empty();
+        self.state.diagnostics.crash_notice_ids = ids;
+    }
+
+    pub fn crash_notice_visible(&self) -> bool {
+        self.state.diagnostics.crash_notice_visible
+    }
+
+    pub fn crash_notice_count(&self) -> usize {
+        self.state.diagnostics.crash_notice_ids.len()
+    }
+
+    /// "1 crash found" / "N crashes found", worded for the toast's title.
+    pub fn crash_notice_text(&self) -> String {
+        match self.crash_notice_count() {
+            1 => "1 crash found".to_string(),
+            n => format!("{n} crashes found"),
+        }
+    }
+
+    /// Marks the snapshot's crash ids reported, best-effort: a write
+    /// failure is logged and never surfaced, mirroring the CLI's own
+    /// precedent. Takes the snapshot, so a second call marks nothing.
+    fn mark_crash_notice_reported(&mut self) {
+        self.state.diagnostics.crash_notice_visible = false;
+        let ids = std::mem::take(&mut self.state.diagnostics.crash_notice_ids);
+        if ids.is_empty() {
+            return;
+        }
+        let Some(data_dir) = self.state.diagnostics.data_dir.clone() else {
+            return;
+        };
+        if let Err(e) = focusforge_diagnostics::crash_notice::mark_reported(&data_dir, &ids) {
+            tracing::warn!(error = %e, "the crash notice's evidence could not be marked as reported");
+        }
+    }
+
+    /// Hides the notice without writing anything: the evidence stays
+    /// unreported, so it returns on the next start.
+    pub fn crash_notice_timed_out(&mut self) {
+        self.state.diagnostics.crash_notice_visible = false;
+    }
+
+    /// Hides the notice and marks its evidence reported.
+    pub fn dismiss_crash_notice(&mut self) {
+        self.mark_crash_notice_reported();
+    }
+
+    /// Marks the notice's evidence reported the same way [`Self::dismiss_crash_notice`]
+    /// does, then opens the settings modal on the diagnostics section.
+    /// Returns the settings-open state the way [`Self::open_settings`] does,
+    /// so a caller pushes it without a second lock.
+    pub fn review_crashes(&mut self) -> bool {
+        self.mark_crash_notice_reported();
+        let open = self.open_settings();
+        self.select_settings_section(SettingsSection::Diagnostics);
+        open
     }
 
     /// A press on the manifest scrollbar: on the thumb itself, grabs it at

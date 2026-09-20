@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A non-modal, dismissible notice: an alert glyph and a title on one row, a
+// secondary link below it, and a close control at the top-right corner. No
+// scrim -- a caller stacks it directly over other content.
+
+import { Theme } from "../theme.slint";
+
+export component FFToast inherits Rectangle {
+    in property <string> title: "";
+    in property <string> link-label: "Review";
+    in property <image> icon-source;
+    callback dismissed();
+    callback link-activated();
+
+    width: 300px;
+    height: 84px;
+    background: Theme.surface-overlay;
+    border-width: 1px;
+    border-color: Theme.border-default;
+    border-radius: Theme.radius-sm;
+
+    icon := Image {
+        x: 16px;
+        y: 14px;
+        width: Theme.icon-md;
+        height: Theme.icon-md;
+        source: root.icon-source;
+        colorize: Theme.status-failure;
+    }
+
+    Text {
+        x: 44px;
+        y: icon.y + (icon.height - self.height) / 2;
+        text: root.title;
+        color: Theme.text-primary;
+        font-size: Theme.text-value.size;
+        font-weight: Theme.text-value.weight;
+    }
+
+    close-area := TouchArea {
+        x: root.width - 14px - Theme.icon-sm;
+        y: 14px;
+        width: Theme.icon-sm;
+        height: Theme.icon-sm;
+        accessible-role: button;
+        clicked => { root.dismissed(); }
+
+        Image {
+            width: Theme.icon-sm;
+            height: Theme.icon-sm;
+            source: @image-url("../../../../assets/icons/x.svg");
+            colorize: Theme.text-muted;
+        }
+    }
+
+    link-area := TouchArea {
+        x: 44px;
+        y: 48px;
+        accessible-role: button;
+        clicked => { root.link-activated(); }
+
+        HorizontalLayout {
+            Text {
+                text: root.link-label;
+                color: Theme.accent-default;
+                font-size: Theme.text-body.size;
+            }
+        }
+    }
+}
