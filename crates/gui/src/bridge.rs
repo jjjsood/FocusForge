@@ -21,7 +21,8 @@ use crate::controller::{
     AppController, DockTab, GroupingQuestion, JobView, OpenAs, ShellEvent, ShellMode,
 };
 use crate::generated::{
-    AppWindow, ProjectTabView, SectionHeadView, SettingsRow as GeneratedSettingsRow,
+    AppWindow, ImageRowView as GeneratedImageRow, ProjectTabView, SectionHeadView,
+    SettingsRow as GeneratedSettingsRow,
 };
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
@@ -167,6 +168,11 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     app.set_project_tabs(std::rc::Rc::new(slint::VecModel::from(tabs)).into());
     push_tab_scroll(app, &controller);
     app.set_show_empty_state(controller.active_project().is_none());
+    // The grouping question closes itself here rather than in its own
+    // answer handler -- answering opens a project, which raises this same
+    // `ProjectsChanged` push, so the dialog only needs to track whether a
+    // question is still pending.
+    app.set_question_open(controller.pending_question().is_some());
     // The dock's own gate for the tab row, the settings panel and the
     // "No project open." note (`ui/shell/dock.slint`) -- otherwise stuck at
     // whatever a canvas gesture (`repaint`, above) last set it to, since a
@@ -176,6 +182,7 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     app.set_skipped_notice(controller.notice().unwrap_or_default().into());
     app.set_fuse_enabled(controller.fuse_enabled());
     push_settings_panel(app, &controller);
+    push_images_panel(app, &controller);
 }
 
 /// Pushes the tab strip's scroll offset, overflow layout and two arrow
@@ -292,6 +299,13 @@ fn start_job_timer(
         let view = controller.lock().unwrap().job_view();
         let live = job::is_live(&view.state);
         push_job(&app, &view);
+        if !live {
+            // The run just settled -- the moment the images/settings panels'
+            // own whole-panel disable must lift again.
+            let controller = controller.lock().unwrap();
+            push_settings_panel(&app, &controller);
+            push_images_panel(&app, &controller);
+        }
         if !live && let Some(t) = timer_slot.borrow().as_ref() {
             t.stop();
         }
@@ -394,6 +408,59 @@ pub fn push_settings_panel(app: &AppWindow, controller: &AppController) {
         push: panel.sticky_push,
     });
     app.set_settings_enabled(!controller.job_running());
+}
+
+/// Pushes the `Images` panel's whole state -- [`push_settings_panel`]'s
+/// twin.
+pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
+    let panel = controller.images_panel();
+    let rows: Vec<GeneratedImageRow> = panel
+        .rows
+        .iter()
+        .map(|row| GeneratedImageRow {
+            chip: slint::Color::from_rgb_u8(row.chip[0], row.chip[1], row.chip[2]),
+            name: row.name.clone().into(),
+            time_text: row.time_text.clone().into(),
+            excluded: row.excluded,
+            unresolved: row.unresolved,
+            top: row.top,
+        })
+        .collect();
+    let existing = app.get_images_rows();
+    if existing.row_count() == rows.len() {
+        for (i, row) in rows.into_iter().enumerate() {
+            existing.set_row_data(i, row);
+        }
+    } else {
+        app.set_images_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    }
+    app.set_images_header_text(panel.header_text.into());
+    app.set_images_content_height(panel.content_height);
+    app.set_images_scroll_y(panel.scroll_y);
+    let sort = match controller.frame_sort() {
+        Some(crate::images::FrameSort::Name) => "name",
+        Some(crate::images::FrameSort::CaptureTime) => "capture-time",
+        None => "",
+    };
+    app.set_images_sort(sort.into());
+    app.set_images_sort_menu_open(controller.images_sort_menu_open());
+    app.set_images_dragging_row(controller.dragging_row().map_or(-1, |i| i as i32));
+    app.set_images_drag_offset(controller.drag_offset());
+    app.set_images_drag_target_row(controller.drag_target_row().map_or(-1, |i| i as i32));
+    app.set_images_enabled(!controller.job_running());
+
+    match controller.pending_frame_change() {
+        Some(copy) => {
+            let secondary = copy.secondary_label();
+            app.set_frame_warning_open(true);
+            app.set_frame_warning_title(copy.title.into());
+            app.set_frame_warning_body(copy.body.into());
+            app.set_frame_warning_info(copy.info.into());
+            app.set_frame_warning_confirm_label(copy.confirm_label.into());
+            app.set_frame_warning_secondary_label(secondary.into());
+        }
+        None => app.set_frame_warning_open(false),
+    }
 }
 
 /// Pushes a raised [`GroupingQuestion`] into `app`'s dialog properties.
@@ -885,6 +952,104 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
         }
     });
 
+    // The `Images` panel's own scroll -- `FFScrollbar`'s twin wiring above.
+    app.on_images_scrolled({
+        let controller = controller.clone();
+        move |delta| controller.lock().unwrap().scroll_images_panel(delta)
+    });
+    app.on_images_scrollbar_pointer({
+        let controller = controller.clone();
+        move |kind, y| {
+            let kind = match kind {
+                0 => PointerKind::Down,
+                2 => PointerKind::Move,
+                _ => PointerKind::Up,
+            };
+            controller.lock().unwrap().images_scrollbar_pointer(kind, y);
+        }
+    });
+    app.on_images_scrollbar_dragged({
+        let controller = controller.clone();
+        move |y| controller.lock().unwrap().images_scrollbar_dragged(y)
+    });
+    app.on_images_viewport_height_changed({
+        let controller = controller.clone();
+        move |height| {
+            controller
+                .lock()
+                .unwrap()
+                .set_images_viewport_height(height)
+        }
+    });
+    app.on_images_add_frames_requested({
+        let controller = controller.clone();
+        move || {
+            if let Some(paths) = crate::picker::pick_frames() {
+                controller.lock().unwrap().add_frames(&paths);
+            }
+        }
+    });
+    app.on_images_sort_menu_toggled({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().toggle_images_sort_menu()
+    });
+    app.on_images_sort_selected({
+        let controller = controller.clone();
+        move |id| {
+            let sort = match id.as_str() {
+                "capture-time" => crate::images::FrameSort::CaptureTime,
+                _ => crate::images::FrameSort::Name,
+            };
+            controller.lock().unwrap().set_frame_sort(sort);
+        }
+    });
+    app.on_images_frame_excluded_toggled({
+        let controller = controller.clone();
+        move |i| controller.lock().unwrap().toggle_frame_excluded(i as usize)
+    });
+    app.on_images_frame_remove_requested({
+        let controller = controller.clone();
+        move |i| controller.lock().unwrap().remove_frame(i as usize)
+    });
+    app.on_frame_warning_cancelled({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().cancel_frame_change()
+    });
+    app.on_frame_warning_confirmed({
+        let controller = controller.clone();
+        move || {
+            controller.lock().unwrap().confirm_frame_change();
+        }
+    });
+    app.on_frame_warning_secondary_pressed({
+        let controller = controller.clone();
+        move || {
+            let mut controller = controller.lock().unwrap();
+            let exclude = controller
+                .pending_frame_change()
+                .is_some_and(|copy| copy.exclude_instead_button);
+            if exclude {
+                controller.exclude_instead();
+            } else {
+                controller.new_project_instead();
+            }
+        }
+    });
+    app.on_images_frame_grip_pointer({
+        let controller = controller.clone();
+        move |i, kind, y| {
+            let kind = match kind {
+                0 => PointerKind::Down,
+                2 => PointerKind::Move,
+                _ => PointerKind::Up,
+            };
+            controller
+                .lock()
+                .unwrap()
+                .frame_drag_pointer(i as usize, kind, y);
+        }
+    });
+
     Installed {
         controller,
         canvas,
@@ -959,6 +1124,15 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::QuestionRaised(question) => push_question(app, &question),
         ShellEvent::EntryRefused(_) => app.set_refusal_open(true),
         ShellEvent::SettingsChanged => push_settings_panel(app, &controller.lock().unwrap()),
-        ShellEvent::JobChanged => push_job(app, &controller.lock().unwrap().job_view()),
+        ShellEvent::JobChanged => {
+            let controller = controller.lock().unwrap();
+            push_job(app, &controller.job_view());
+            // A run starting or ending is also the moment the images/settings
+            // panels' own whole-panel disable must flip -- neither panel
+            // otherwise re-reads `job_running()` on its own.
+            push_settings_panel(app, &controller);
+            push_images_panel(app, &controller);
+        }
+        ShellEvent::ImagesChanged => push_images_panel(app, &controller.lock().unwrap()),
     }
 }

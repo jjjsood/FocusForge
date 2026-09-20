@@ -13,6 +13,10 @@ export component FFMenuList inherits Rectangle {
     in property <[string]> choices: [];
     in property <[string]> choice-ids: [];
     in property <string> selected: "";
+    // A caller whose ids carry no meaning of their own (a sort menu, whose
+    // entries are just "Name"/"Capture time") hides the grey id column
+    // rather than showing it as a second, meaningless label.
+    in property <bool> show-choice-ids: true;
     callback option-selected(string);
 
     height: root.choices.length * 24px;
@@ -38,7 +42,7 @@ export component FFMenuList inherits Rectangle {
                     vertical-alignment: center;
                     overflow: elide;
                 }
-                Text {
+                if root.show-choice-ids: Text {
                     text: root.choice-ids[i];
                     color: Theme.text-disabled;
                     font-size: Theme.text-section.size;

@@ -61,6 +61,15 @@ export global ShellGeometry {
     out property <length> tab-width: 224px;
     out property <length> tab-pitch: 228px;
 
+    // The `Images` list: 200 x 26 content in a 248 x 26 band, a 14 x 14
+    // colour chip at +24.
+    out property <length> image-row-height: 26px;
+    out property <length> image-row-band-width: 248px;
+    out property <length> image-row-content-width: 200px;
+    out property <length> image-row-content-inset: 24px;
+    out property <length> image-chip-size: 14px;
+    out property <length> image-header-height: 24px;
+
     // The settings panel. Mirrored one-for-one as `pub const`s in
     // `crates/gui/src/settings_panel.rs`, exactly as `tab-pitch` above is
     // mirrored on the Rust side. There is no separate inter-row gap

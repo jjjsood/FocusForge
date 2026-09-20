@@ -19,6 +19,9 @@ import { FFRowLabel } from "components/ff_row_label.slint";
 import { FFRowText } from "components/ff_row_text.slint";
 import { FFButton } from "components/ff_button.slint";
 import { FFProgressBar } from "components/ff_progress_bar.slint";
+import { FFImageRow } from "components/ff_image_row.slint";
+import { FFDialog } from "components/ff_dialog.slint";
+import { FFDialogFooter } from "components/ff_dialog_footer.slint";
 
 component ColourSwatch inherits Rectangle {
     in property <color> swatch;
@@ -313,6 +316,100 @@ export component ThemeSheet inherits Window {
             FFProgressBar { width: 400px; tone: "held"; fraction: 0.62; }
             FFProgressBar { width: 400px; tone: "failed"; fraction: 0.24; }
             FFProgressBar { width: 400px; tone: "running"; fraction: 0.0; }
+        }
+
+        GroupHeading { text: "Images list: row"; }
+        VerticalLayout {
+            spacing: 0px;
+            FFImageRow {
+                width: 248px;
+                chip: Theme.status-failure;
+                name: "00.tif";
+                time-text: "14:12:00";
+            }
+            FFImageRow {
+                width: 248px;
+                chip: Theme.status-warning;
+                name: "01.tif";
+                time-text: "14:13:01";
+                hovered: true;
+            }
+            FFImageRow {
+                width: 248px;
+                chip: Theme.status-success;
+                name: "02.tif";
+                time-text: "14:14:02";
+                excluded: true;
+                hovered: true;
+            }
+            FFImageRow {
+                width: 248px;
+                chip: Theme.accent-default;
+                name: "03.tif";
+                time-text: "";
+                unresolved: true;
+            }
+            FFImageRow {
+                width: 248px;
+                chip: Theme.accent-hover;
+                name: "04.tif";
+                time-text: "14:16:04";
+                dragging: true;
+            }
+        }
+
+        GroupHeading { text: "Dialog footer"; }
+        FFDialogFooter {
+            width: 480px;
+            secondary-label: "New project instead";
+            confirm-label: "Add and re-fuse";
+        }
+
+        GroupHeading { text: "Dialog: warning, with a secondary button"; }
+        Rectangle {
+            width: 500px;
+            height: 320px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "warning";
+                title: "Add 3 frames and fuse again?";
+                body: "This project already holds 2 checkpoints, and confirming keeps every one of them.";
+                info: "Or start a new project with the same settings instead.";
+                secondary-label: "New project instead";
+                confirm-label: "Add and re-fuse";
+            }
+        }
+
+        GroupHeading { text: "Dialog: warning, Remove's own footer"; }
+        Rectangle {
+            width: 500px;
+            height: 320px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "warning";
+                title: "Remove and fuse again?";
+                body: "This project already holds 2 checkpoints, and confirming keeps every one of them.";
+                info: "You can also start a new project with the same settings instead.";
+                secondary-label: "Exclude instead";
+                confirm-label: "Remove and re-fuse";
+            }
+        }
+        Rectangle {
+            width: 200px;
+            height: 48px;
+            FFMenuList {
+                width: 200px;
+                choices: ["Name", "Capture time"];
+                choice-ids: ["name", "capture-time"];
+                show-choice-ids: false;
+                selected: "name";
+            }
         }
     }
 }

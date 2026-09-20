@@ -57,6 +57,15 @@ struct Args {
     /// `running`, `paused`, `cancelling` or `failed`.
     #[arg(long)]
     toolbar_state: Option<String>,
+    /// Opens the `Images` panel's sort menu at startup, for inspecting it
+    /// with no click sequence.
+    #[arg(long)]
+    images_sort_menu_open: bool,
+    /// Requests removing the frame at this index right after `--open`, for
+    /// inspecting the frame-set warning it raises on a checkpointed project
+    /// with no click sequence.
+    #[arg(long)]
+    frame_remove_warning: Option<usize>,
 }
 
 const TOOLBAR_STATES: [&str; 5] = ["idle", "running", "paused", "cancelling", "failed"];
@@ -343,6 +352,14 @@ fn run(args: &Args) -> ExitCode {
                 focusforge_gui::DockTab::Images
             };
             controller.lock().unwrap().select_dock_tab(tab);
+        }
+
+        if args.images_sort_menu_open {
+            controller.lock().unwrap().toggle_images_sort_menu();
+        }
+
+        if let Some(index) = args.frame_remove_warning {
+            controller.lock().unwrap().remove_frame(index);
         }
 
         run_window(app, args)

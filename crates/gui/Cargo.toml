@@ -32,6 +32,7 @@ tracing = "0.1.44"
 slint-build = "~1.17"
 
 [dev-dependencies]
+focusforge-core = { path = "../core", features = ["test-algorithms"] }
 i-slint-backend-testing = "~1.17"
 serde_json = "1"
 tempfile = "3"

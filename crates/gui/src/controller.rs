@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::entry;
+use crate::images;
 use crate::input_config::Provenance;
 use crate::input_map::{
     Action, ActionEvent, Button, InputRowView, InputTable, Modifiers, PointerKind, Trigger,
@@ -106,6 +107,11 @@ pub enum ShellEvent {
     /// A fuse run's state or progress moved -- started, paused, resumed,
     /// cancelled, failed or completed.
     JobChanged,
+    /// The `Images` panel's own state moved: a row's exclusion, the frame
+    /// order, the sort selection, the scroll offset, or a frame-set-change
+    /// warning opened or closed -- never a tab switch, which
+    /// `ProjectsChanged` already rebuilds the panel for.
+    ImagesChanged,
 }
 
 /// One live drag: which action it started and the last position seen, so
@@ -174,6 +180,17 @@ struct ProjectTab {
     /// rather than inferred from which [`GuiProject`] variant the tab
     /// happens to be in.
     checkpoints: usize,
+    /// The ordered frame set a fuse actually consumes -- session-only, seeded
+    /// from [`entry::project_frames`] and re-seeded from it on every
+    /// successful run, so a fused tab's list always matches what it just
+    /// fused. `excluded` is the same length, `true` at every position whose
+    /// frame is left out of the next fuse without moving any other position.
+    frames: Vec<PathBuf>,
+    excluded: Vec<bool>,
+    /// The sort menu's own selection -- `None` is the dragged state, where
+    /// neither `Name` nor `Capture time` is checked. Cleared by a manual
+    /// drag.
+    frame_sort: Option<images::FrameSort>,
 }
 
 impl ProjectTab {
@@ -190,6 +207,8 @@ impl ProjectTab {
             GuiProject::Unsaved(_) => 0,
             GuiProject::Opened(p) => p.checkpoint_chain().map(|chain| chain.len()).unwrap_or(1),
         };
+        let frames = entry::project_frames(&project);
+        let excluded = vec![false; frames.len()];
         ProjectTab {
             project,
             title,
@@ -204,7 +223,35 @@ impl ProjectTab {
             errors: BTreeMap::new(),
             menu_open: None,
             checkpoints,
+            frames,
+            excluded,
+            frame_sort: None,
         }
+    }
+
+    /// The frames a fuse of this tab would actually use -- `frames` with
+    /// every excluded position left out, order otherwise unchanged.
+    fn included_frames(&self) -> Vec<PathBuf> {
+        self.frames
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.excluded.get(*i).copied().unwrap_or(false))
+            .map(|(_, path)| path.clone())
+            .collect()
+    }
+
+    /// Permutes `frames` and `excluded` together by `order` (each entry the
+    /// original index now at that position) -- what a manual drag and a sort
+    /// both apply, so an exclusion stays attached to the frame it was set on
+    /// rather than to a position.
+    fn reorder(&mut self, order: &[usize]) {
+        let old_frames = std::mem::take(&mut self.frames);
+        let old_excluded = std::mem::take(&mut self.excluded);
+        self.frames = order.iter().map(|&i| old_frames[i].clone()).collect();
+        self.excluded = order
+            .iter()
+            .map(|&i| old_excluded.get(i).copied().unwrap_or(false))
+            .collect();
     }
 }
 
@@ -273,6 +320,56 @@ struct ShellState {
     /// from `input_map`'s own `DragState`: this drag has no bindable
     /// action, no modifiers and no canvas gesture to route through.
     scrollbar_drag: Option<f32>,
+    /// The `Images` panel's own scroll offset and viewport height --
+    /// [`AppController::settings_scrollbar_thumb`]'s twin, kept separate
+    /// since the two panels are never both the visible dock tab at once but
+    /// each remembers its own scroll position across a tab switch.
+    images_scroll_y: f32,
+    images_viewport_height: f32,
+    images_scrollbar_drag: Option<f32>,
+    /// A frame-set-changing action waiting on its warning's `Cancel`/confirm
+    /// -- raised only once the active tab already carries a checkpoint,
+    /// cleared by [`AppController::confirm_frame_change`] or
+    /// [`AppController::cancel_frame_change`].
+    pending_frame_change: Option<PendingFrameChange>,
+    /// Whether the `Images` panel's sort menu is open -- the same
+    /// externally-driven convention `tab.menu_open` uses for a settings row.
+    images_sort_menu_open: bool,
+    /// A live grip drag, if any: which row it started on and the raw
+    /// row-local `y` the grip reported at press time -- later `y` values
+    /// minus this one, in whole [`images::ROW_HEIGHT`] steps, is how far
+    /// the row has moved.
+    drag_row: Option<DragRow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DragRow {
+    from: usize,
+    press_y: f32,
+    /// The grip's own `mouse_y` as of the most recent `Move` -- `press_y`
+    /// until the first one arrives.
+    current_y: f32,
+}
+
+/// [`ShellState::pending_frame_change`]'s payload: which action is waiting,
+/// and what it still needs applied once confirmed.
+#[derive(Debug, Clone, PartialEq)]
+enum PendingFrameChange {
+    Add(Vec<PathBuf>),
+    Move { from: usize, to: usize },
+    Sort(crate::images::FrameSort),
+    Remove(usize),
+}
+
+impl PendingFrameChange {
+    fn kind(&self) -> crate::images::FrameSetChangeKind {
+        match self {
+            PendingFrameChange::Add(_) => crate::images::FrameSetChangeKind::Add,
+            PendingFrameChange::Move { .. } => crate::images::FrameSetChangeKind::Move,
+            PendingFrameChange::Sort(_) => crate::images::FrameSetChangeKind::Sort,
+            PendingFrameChange::Remove(_) => crate::images::FrameSetChangeKind::Remove,
+        }
+    }
 }
 
 impl ShellState {
@@ -960,7 +1057,7 @@ impl AppController {
         self.state.notice = notice_line(&opened.skipped);
         self.state.last_refusal = None;
         if !opened.projects.is_empty() {
-            self.state.active = Some(self.state.projects.len());
+            self.set_active_tab(Some(self.state.projects.len()));
             self.state
                 .projects
                 .extend(opened.projects.into_iter().map(ProjectTab::new));
@@ -1018,11 +1115,23 @@ impl AppController {
         self.state.active.is_none()
     }
 
+    /// Sets which tab is active, if any -- clearing a frame-set-change
+    /// warning still queued for whichever tab was active before, on an
+    /// actual switch. The pending edit belongs to that tab's own frame
+    /// list, not to whatever becomes active next.
+    fn set_active_tab(&mut self, active: Option<usize>) {
+        if self.state.active != active {
+            self.state.pending_frame_change = None;
+        }
+        self.state.active = active;
+    }
+
     /// "+": selects the pseudo-tab, leaving every project tab open and the
     /// strip's scroll where it is. Also closes the projects overlay, the
     /// same as a gallery card click.
     pub fn select_plus(&mut self) {
-        if self.state.active.take().is_some() {
+        if self.state.active.is_some() {
+            self.set_active_tab(None);
             self.settle_settings_scroll();
             self.emit(ShellEvent::ProjectsChanged);
         }
@@ -1030,7 +1139,7 @@ impl AppController {
 
     pub fn select_project(&mut self, index: usize) {
         if index < self.state.projects.len() {
-            self.state.active = Some(index);
+            self.set_active_tab(Some(index));
             self.settle_tab_scroll();
             self.settle_settings_scroll();
             self.emit(ShellEvent::ProjectsChanged);
@@ -1071,7 +1180,10 @@ impl AppController {
             let _ = std::fs::remove_dir_all(job::plane_cache_dir(project.path()));
         }
         // Closing another tab never moves the selection: only the indices
-        // after the removed one shift down by one.
+        // after the removed one shift down by one -- not the tab switch
+        // `set_active_tab` guards against, so a still-active tab's own
+        // pending warning survives the renumbering.
+        let closed_was_active = self.state.active == Some(index);
         self.state.active = match self.state.active {
             Some(active) if active == index && !self.state.projects.is_empty() => {
                 Some(index.min(self.state.projects.len() - 1))
@@ -1080,6 +1192,9 @@ impl AppController {
             Some(active) if active < index => Some(active),
             _ => None,
         };
+        if closed_was_active {
+            self.state.pending_frame_change = None;
+        }
         self.settle_tab_scroll();
         self.settle_settings_scroll();
         self.emit(ShellEvent::ProjectsChanged);
@@ -1344,6 +1459,444 @@ impl AppController {
         self.state.settings_scroll_y
     }
 
+    // -- The `Images` panel. `frames`/`excluded` live on the active
+    // `ProjectTab`; every mutation below is a no-op outside stacking mode,
+    // and every frame-set-changing one -- everything but the reversible
+    // exclude -- is gated behind the active tab's own checkpoint count. --
+
+    /// Builds the whole `Images` panel for the active tab -- empty with no
+    /// tab active ("+" selected).
+    pub fn images_panel(&self) -> images::ImagesModel {
+        let viewport_height = self.state.images_viewport_height;
+        let Some(tab) = self.state.active() else {
+            return images::build_model(&[], &[], 0.0);
+        };
+        let content_height = tab.frames.len() as f32 * images::ROW_HEIGHT;
+        let scroll_y = settings_panel::clamp_panel_scroll(
+            self.state.images_scroll_y,
+            content_height,
+            viewport_height,
+        );
+        images::build_model(&tab.frames, &tab.excluded, scroll_y)
+    }
+
+    /// The active tab's checkpoint count, `0` with none active -- what every
+    /// frame-set-change gate below reads.
+    fn frame_change_checkpoints(&self) -> usize {
+        self.checkpoint_count().unwrap_or(0)
+    }
+
+    /// Toggles one frame's exclusion -- reversible, changes no other frame's
+    /// position, never gated behind a checkpoint (the reversible default).
+    /// A no-op outside stacking mode, past the frame list's end, or while
+    /// this tab's own job is running.
+    pub fn toggle_frame_excluded(&mut self, index: usize) {
+        if self.mode() != ShellMode::Stacking || self.job_running() {
+            return;
+        }
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(excluded) = tab.excluded.get_mut(index) else {
+            return;
+        };
+        *excluded = !*excluded;
+        self.emit(ShellEvent::ImagesChanged);
+    }
+
+    /// Adds `paths` to the active tab's frame list, appended in the order
+    /// given -- immediately, before the first checkpoint; behind the counted
+    /// warning once one exists. A no-op outside stacking mode or while this
+    /// tab's own job is running.
+    pub fn add_frames(&mut self, paths: &[PathBuf]) {
+        if self.mode() != ShellMode::Stacking
+            || paths.is_empty()
+            || self.state.active().is_none()
+            || self.job_running()
+        {
+            return;
+        }
+        if self.frame_change_checkpoints() > 0 {
+            self.state.pending_frame_change = Some(PendingFrameChange::Add(paths.to_vec()));
+        } else {
+            self.apply_add_frames(paths);
+        }
+        self.emit(ShellEvent::ImagesChanged);
+    }
+
+    fn apply_add_frames(&mut self, paths: &[PathBuf]) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        tab.frames.extend_from_slice(paths);
+        tab.excluded.extend(std::iter::repeat_n(false, paths.len()));
+        tab.frame_sort = None;
+    }
+
+    /// Removes the frame at `index` -- immediately, before the first
+    /// checkpoint; behind the counted warning once one exists. A no-op
+    /// outside stacking mode, past the frame list's end, or while this
+    /// tab's own job is running.
+    pub fn remove_frame(&mut self, index: usize) {
+        if self.mode() != ShellMode::Stacking || self.job_running() {
+            return;
+        }
+        let Some(tab) = self.state.active() else {
+            return;
+        };
+        if index >= tab.frames.len() {
+            return;
+        }
+        if self.frame_change_checkpoints() > 0 {
+            self.state.pending_frame_change = Some(PendingFrameChange::Remove(index));
+        } else {
+            self.apply_remove_frame(index);
+        }
+        self.emit(ShellEvent::ImagesChanged);
+    }
+
+    fn apply_remove_frame(&mut self, index: usize) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        if index >= tab.frames.len() {
+            return;
+        }
+        tab.frames.remove(index);
+        if index < tab.excluded.len() {
+            tab.excluded.remove(index);
+        }
+    }
+
+    /// Drags the frame at `from` to `to` -- the manual order, which clears
+    /// the sort menu's own selection. Immediate before the first checkpoint,
+    /// behind the counted warning once one exists. A no-op outside stacking
+    /// mode or while this tab's own job is running.
+    pub fn move_frame(&mut self, from: usize, to: usize) {
+        if self.mode() != ShellMode::Stacking || self.job_running() {
+            return;
+        }
+        let Some(tab) = self.state.active() else {
+            return;
+        };
+        if from >= tab.frames.len() || to >= tab.frames.len() {
+            return;
+        }
+        if self.frame_change_checkpoints() > 0 {
+            self.state.pending_frame_change = Some(PendingFrameChange::Move { from, to });
+        } else {
+            self.apply_move_frame(from, to);
+        }
+        self.emit(ShellEvent::ImagesChanged);
+    }
+
+    fn apply_move_frame(&mut self, from: usize, to: usize) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let order = images::move_order(tab.frames.len(), from, to);
+        tab.reorder(&order);
+        tab.frame_sort = None;
+    }
+
+    /// Sorts the active tab's frame list by `sort` -- one code path for "the
+    /// order changed": the same gating and application [`Self::move_frame`]
+    /// uses for a manual drag. A no-op while this tab's own job is running.
+    pub fn set_frame_sort(&mut self, sort: images::FrameSort) {
+        if self.mode() != ShellMode::Stacking || self.state.active().is_none() || self.job_running()
+        {
+            return;
+        }
+        self.state.images_sort_menu_open = false;
+        if self.frame_change_checkpoints() > 0 {
+            self.state.pending_frame_change = Some(PendingFrameChange::Sort(sort));
+        } else {
+            self.apply_sort(sort);
+        }
+        self.emit(ShellEvent::ImagesChanged);
+    }
+
+    /// Opens or closes the sort menu -- the same externally-driven
+    /// convention [`Self::toggle_param_menu`] uses for a settings row. A
+    /// no-op outside stacking mode.
+    pub fn toggle_images_sort_menu(&mut self) {
+        if self.mode() != ShellMode::Stacking {
+            return;
+        }
+        self.state.images_sort_menu_open = !self.state.images_sort_menu_open;
+        self.emit(ShellEvent::ImagesChanged);
+    }
+
+    pub fn images_sort_menu_open(&self) -> bool {
+        self.state.images_sort_menu_open
+    }
+
+    /// The row currently being dragged, if any -- the origin slot's own
+    /// placeholder styling and the floating copy [`Self::drag_offset`]
+    /// positions both render against it.
+    pub fn dragging_row(&self) -> Option<usize> {
+        self.state.drag_row.map(|drag| drag.from)
+    }
+
+    /// The live pixel offset a drag has moved by since the press, clamped so
+    /// the dragged row's floating copy never leaves the list's own content
+    /// band. `0.0` with no drag in progress.
+    pub fn drag_offset(&self) -> f32 {
+        let Some(drag) = self.state.drag_row else {
+            return 0.0;
+        };
+        let Some(tab) = self.state.active() else {
+            return 0.0;
+        };
+        let top = drag.from as f32 * images::ROW_HEIGHT;
+        let content_height = tab.frames.len() as f32 * images::ROW_HEIGHT;
+        let max = (content_height - images::ROW_HEIGHT - top).max(0.0);
+        (drag.current_y - drag.press_y).clamp(-top, max)
+    }
+
+    /// The row index a drag would land at if released right now -- the same
+    /// rounding [`Self::frame_drag_pointer`]'s own release arm applies,
+    /// read live off the drag's current position rather than a fresh
+    /// pointer sample. `None` with no drag in progress.
+    pub fn drag_target_row(&self) -> Option<usize> {
+        let drag = self.state.drag_row?;
+        Some(self.drag_target(&drag, drag.current_y))
+    }
+
+    /// The grip's raw pointer stream for the row at `index`: `Down` starts a
+    /// drag there; `Up` commits it, moving the row by however many whole
+    /// [`images::ROW_HEIGHT`] steps `mouse_y` has travelled from the press;
+    /// `Move` updates [`Self::drag_offset`], the floating copy's live
+    /// position. A no-op outside stacking mode or while this tab's own job
+    /// is running.
+    pub fn frame_drag_pointer(&mut self, index: usize, kind: PointerKind, mouse_y: f32) {
+        if self.mode() != ShellMode::Stacking || self.job_running() {
+            return;
+        }
+        match kind {
+            PointerKind::Down => {
+                self.state.drag_row = Some(DragRow {
+                    from: index,
+                    press_y: mouse_y,
+                    current_y: mouse_y,
+                });
+                self.emit(ShellEvent::ImagesChanged);
+            }
+            PointerKind::Move => {
+                let Some(drag) = self.state.drag_row.as_mut() else {
+                    return;
+                };
+                if drag.from != index {
+                    return;
+                }
+                drag.current_y = mouse_y;
+                self.emit(ShellEvent::ImagesChanged);
+            }
+            PointerKind::Up => {
+                let Some(drag) = self.state.drag_row.take() else {
+                    return;
+                };
+                let target = self.drag_target(&drag, mouse_y);
+                if target != drag.from {
+                    self.move_frame(drag.from, target);
+                } else {
+                    self.emit(ShellEvent::ImagesChanged);
+                }
+            }
+        }
+    }
+
+    fn drag_target(&self, drag: &DragRow, mouse_y: f32) -> usize {
+        let Some(tab) = self.state.active() else {
+            return drag.from;
+        };
+        let last = tab.frames.len().saturating_sub(1);
+        let steps = ((mouse_y - drag.press_y) / images::ROW_HEIGHT).round() as isize;
+        (drag.from as isize + steps).clamp(0, last as isize) as usize
+    }
+
+    fn apply_sort(&mut self, sort: images::FrameSort) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let order = images::sort_order(&tab.frames, sort);
+        tab.reorder(&order);
+        tab.frame_sort = Some(sort);
+    }
+
+    /// The sort menu's own selection -- `None` while the order came from a
+    /// manual drag, or no tab is active.
+    pub fn frame_sort(&self) -> Option<images::FrameSort> {
+        self.state.active().and_then(|tab| tab.frame_sort)
+    }
+
+    /// The frame-set-change warning still open, if any -- `None` whenever
+    /// the active tab carries no checkpoint of its own to invalidate, since
+    /// there is nothing for a frame-set edit to disagree with.
+    pub fn pending_frame_change(&self) -> Option<images::FrameSetWarningCopy> {
+        let pending = self.state.pending_frame_change.as_ref()?;
+        if self.frame_change_checkpoints() == 0 {
+            return None;
+        }
+        Some(images::frame_set_warning_copy(
+            pending.kind(),
+            self.frame_change_checkpoints(),
+        ))
+    }
+
+    /// Applies the pending frame-set change and re-fuses -- the ordinary
+    /// [`Self::start_fuse`], which appends a checkpoint onto an
+    /// already-`Opened` tab rather than discarding any. A no-op, returning
+    /// `false`, with nothing pending.
+    pub fn confirm_frame_change(&mut self) -> bool {
+        let Some(pending) = self.state.pending_frame_change.take() else {
+            return false;
+        };
+        match pending {
+            PendingFrameChange::Add(paths) => self.apply_add_frames(&paths),
+            PendingFrameChange::Move { from, to } => self.apply_move_frame(from, to),
+            PendingFrameChange::Sort(sort) => self.apply_sort(sort),
+            PendingFrameChange::Remove(index) => self.apply_remove_frame(index),
+        }
+        self.emit(ShellEvent::ImagesChanged);
+        self.start_fuse()
+    }
+
+    /// Withdraws the pending frame-set change with nothing applied -- the
+    /// project stays exactly as it was.
+    pub fn cancel_frame_change(&mut self) {
+        self.state.pending_frame_change = None;
+        self.emit(ShellEvent::ImagesChanged);
+    }
+
+    /// `Remove`'s own non-destructive footer button: withdraws the pending
+    /// removal and excludes that frame instead -- the reversible default,
+    /// immediate, no re-fuse. `false` when nothing pending is a removal.
+    pub fn exclude_instead(&mut self) -> bool {
+        match self.state.pending_frame_change.take() {
+            Some(PendingFrameChange::Remove(index)) => {
+                self.toggle_frame_excluded(index);
+                true
+            }
+            other => {
+                self.state.pending_frame_change = other;
+                false
+            }
+        }
+    }
+
+    /// Every frame-set warning's own non-destructive alternative: opens a
+    /// new, checkpoint-free tab over the active tab's current frame set and
+    /// explicit Fuse/Align settings, withdraws the pending change, and
+    /// leaves the active tab exactly as it was. `false` with nothing
+    /// pending or no active tab.
+    pub fn new_project_instead(&mut self) -> bool {
+        if self.state.pending_frame_change.take().is_none() {
+            return false;
+        }
+        let Some(tab) = self.state.active() else {
+            return false;
+        };
+        let GuiProject::Opened(project) = &tab.project else {
+            return false;
+        };
+        let dir = project
+            .path()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        let name = format!("{} copy", tab.title);
+        let mut new_tab =
+            ProjectTab::new(entry::duplicate_as_unsaved(dir, name, tab.frames.clone()));
+        new_tab.fuse_id = tab.fuse_id.clone();
+        new_tab.align_id = tab.align_id.clone();
+        new_tab.fuse_values = tab.fuse_values.clone();
+        new_tab.align_values = tab.align_values.clone();
+        self.state.projects.push(new_tab);
+        self.set_active_tab(Some(self.state.projects.len() - 1));
+        self.emit(ShellEvent::ProjectsChanged);
+        true
+    }
+
+    /// Scrolls the `Images` panel by `delta_px`, clamped to its current
+    /// content/viewport.
+    pub fn scroll_images_panel(&mut self, delta_px: f32) {
+        self.set_images_scroll(self.state.images_scroll_y + delta_px);
+    }
+
+    fn set_images_scroll(&mut self, offset_px: f32) {
+        let content_height = self.images_panel().content_height;
+        let viewport_height = self.state.images_viewport_height;
+        let offset = settings_panel::clamp_panel_scroll(offset_px, content_height, viewport_height);
+        if offset != self.state.images_scroll_y {
+            self.state.images_scroll_y = offset;
+            self.emit(ShellEvent::ImagesChanged);
+        }
+    }
+
+    /// The `Images` panel scrollbar thumb's current `(top, height)` in
+    /// track-pixel space -- [`Self::settings_scrollbar_thumb`]'s twin.
+    fn images_scrollbar_thumb(&self) -> (f32, f32) {
+        let content_height = self.images_panel().content_height;
+        let viewport_height = self.state.images_viewport_height;
+        if content_height <= 0.0 {
+            return (0.0, viewport_height);
+        }
+        let height = (viewport_height * viewport_height / content_height).max(16.0);
+        let top = self.state.images_scroll_y * viewport_height / content_height;
+        (top, height)
+    }
+
+    /// A press on the `Images` scrollbar -- [`Self::scrollbar_pointer`]'s
+    /// twin.
+    pub fn images_scrollbar_pointer(&mut self, kind: PointerKind, mouse_y: f32) {
+        match kind {
+            PointerKind::Down => {
+                let (thumb_top, thumb_height) = self.images_scrollbar_thumb();
+                if mouse_y >= thumb_top && mouse_y < thumb_top + thumb_height {
+                    self.state.images_scrollbar_drag = Some(mouse_y - thumb_top);
+                } else {
+                    let viewport_height = self.state.images_viewport_height.max(1.0);
+                    let content_height = self.images_panel().content_height;
+                    let target_top = mouse_y - thumb_height / 2.0;
+                    self.set_images_scroll(target_top * content_height / viewport_height);
+                    self.state.images_scrollbar_drag = Some(thumb_height / 2.0);
+                }
+            }
+            PointerKind::Up => self.state.images_scrollbar_drag = None,
+            PointerKind::Move => {}
+        }
+    }
+
+    /// The live `Images` scrollbar drag, if any -- [`Self::scrollbar_dragged`]'s
+    /// twin.
+    pub fn images_scrollbar_dragged(&mut self, mouse_y: f32) {
+        let Some(grab_offset) = self.state.images_scrollbar_drag else {
+            return;
+        };
+        let viewport_height = self.state.images_viewport_height.max(1.0);
+        let content_height = self.images_panel().content_height;
+        let target_top = mouse_y - grab_offset;
+        self.set_images_scroll(target_top * content_height / viewport_height);
+    }
+
+    /// The `Images` panel viewport's measured height -- pushed on install
+    /// and on every resize; re-clamps the scroll offset.
+    pub fn set_images_viewport_height(&mut self, height: f32) {
+        self.state.images_viewport_height = height.max(0.0);
+        let content_height = self.images_panel().content_height;
+        self.state.images_scroll_y = settings_panel::clamp_panel_scroll(
+            self.state.images_scroll_y,
+            content_height,
+            self.state.images_viewport_height,
+        );
+        self.emit(ShellEvent::ImagesChanged);
+    }
+
+    pub fn images_scroll_y(&self) -> f32 {
+        self.state.images_scroll_y
+    }
+
     /// Whether a background job is running -- the deferred-capability
     /// pattern `editor_enabled`/`export_enabled` already use. The panel
     /// reads this as a whole-panel disable.
@@ -1368,9 +1921,8 @@ impl AppController {
         if !tab.errors.is_empty() {
             return false;
         }
-        if let GuiProject::Opened(project) = &tab.project
-            && let Some(missing) = entry::missing_source(project)
-        {
+        let frames = tab.included_frames();
+        if let Some(missing) = frames.iter().find(|path| !path.is_file()) {
             let message = format!(
                 "{} is no longer on disk. This project cannot be fused again until it is back.",
                 missing.display()
@@ -1387,7 +1939,6 @@ impl AppController {
             GuiProject::Unsaved(group) => group.dir.join(format!("{}.ffp", group.name)),
             GuiProject::Opened(project) => project.path().to_path_buf(),
         };
-        let frames = entry::project_frames(&tab.project);
         let staging_key = format!("{}-{:x}", tab.title, path_digest(&project_path));
         let request = job::JobRequest {
             frames,
@@ -1538,6 +2089,9 @@ impl AppController {
                 height: c.height,
             });
             tab.checkpoints += 1;
+            tab.frames = entry::project_frames(&tab.project);
+            tab.excluded = vec![false; tab.frames.len()];
+            tab.frame_sort = None;
             Some((composite, zmap))
         });
         self.emit(ShellEvent::JobChanged);

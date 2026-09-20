@@ -342,6 +342,8 @@ fn gestures_come_from_the_input_map() {
         "ff_slider.slint",
         "ff_scrollbar.slint",
         "settings_panel.slint",
+        "images_panel.slint",
+        "ff_image_row.slint",
     ];
     for path in common::find_slint_files(&common::ui_dir()) {
         if path

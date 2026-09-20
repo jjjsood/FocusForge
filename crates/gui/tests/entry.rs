@@ -937,6 +937,43 @@ fn selecting_plus_and_back_flips_project_loaded_without_a_canvas_gesture() {
     );
 }
 
+/// Answering the grouping question must close its dialog: `push_projects`
+/// propagates the controller's cleared `pending_question` to Slint's
+/// `question_open` -- exercises the real `bridge::push_projects`, not the
+/// controller alone.
+#[test]
+fn answering_the_question_closes_its_dialog() {
+    use std::sync::{Arc, Mutex};
+
+    init_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+
+    let root = tree("entry_question_dialog_closes");
+    copy_frame(&root.join("subject-a"), "00.tif", 0);
+    copy_frame(&root.join("subject-b"), "00.tif", 1);
+
+    let controller = Arc::new(Mutex::new(AppController::new()));
+    let outcome = controller.lock().unwrap().open_paths(&[root]);
+    assert!(matches!(outcome, OpenOutcome::Question(..)));
+    app.set_question_open(true);
+    focusforge_gui::bridge::push_projects(&app, &controller);
+    assert!(
+        app.get_question_open(),
+        "still pending -- push_projects must not close a real question"
+    );
+
+    controller
+        .lock()
+        .unwrap()
+        .answer_question(OpenAs::OneProject);
+    focusforge_gui::bridge::push_projects(&app, &controller);
+    assert!(
+        !app.get_question_open(),
+        "answered -- the dialog must close on the very next push_projects"
+    );
+}
+
 /// A drop while a loaded tab is active leaves it untouched and appends the
 /// dropped stack(s), the first one active and
 /// scrolled into view. The drop route is `open_paths` (`bridge::DropHandler`).

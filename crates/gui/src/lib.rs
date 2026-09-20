@@ -79,3 +79,8 @@ pub mod screenshot;
 /// through the same driver `focusforge-cli` uses. `pub` so `tests/job.rs`
 /// reaches its types directly.
 pub mod job;
+
+/// The `Images` dock panel model, and the frame-set-change warnings' copy --
+/// no `use slint::` anywhere in it. `pub` so `tests/images.rs` reaches its
+/// types directly.
+pub mod images;

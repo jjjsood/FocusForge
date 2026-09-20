@@ -14,12 +14,12 @@ import { FFTabStrip, ProjectTabView } from "shell/tab_strip.slint";
 export { ProjectTabView }
 import { FFToolbar } from "shell/toolbar.slint";
 import { FFCanvas } from "shell/canvas.slint";
-import { FFDock, SettingsRow, SectionHeadView } from "shell/dock.slint";
-export { SettingsRow, SectionHeadView }
+import { FFDock, SettingsRow, SectionHeadView, ImageRowView } from "shell/dock.slint";
+export { SettingsRow, SectionHeadView, ImageRowView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFSettingsModal, InputRow } from "shell/settings_modal.slint";
 export { InputRow }
-import { FFGroupingQuestion, FFRefusalDialog, FFSkippedNotice, FFToast } from "shell/dialogs.slint";
+import { FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSkippedNotice, FFToast } from "shell/dialogs.slint";
 
 export component AppWindow inherits Window {
     // Every callback forwards one-for-one into `AppController` via
@@ -251,6 +251,32 @@ export component AppWindow inherits Window {
     callback settings-scrollbar-dragged(length);
     callback settings-viewport-height-changed(length);
 
+    // The `Images` panel: pushed from `AppController::images_panel`
+    // (`src/bridge.rs`) on every `ShellEvent::ImagesChanged`, forwarded
+    // one line into `FFDock`.
+    in property <[ImageRowView]> images-rows: [];
+    in property <string> images-header-text: "";
+    in property <length> images-scroll-y: 0px;
+    in property <length> images-content-height: 0px;
+    in property <string> images-sort: "";
+    in property <bool> images-sort-menu-open: false;
+    in property <int> images-dragging-row: -1;
+    in property <length> images-drag-offset: 0px;
+    in property <int> images-drag-target-row: -1;
+    // Whether the mutating controls (row grip/eye/bin, add, sort, drag) are
+    // reachable at all -- `false` while this tab's own job is running.
+    in property <bool> images-enabled: true;
+    callback images-add-frames-requested();
+    callback images-sort-menu-toggled();
+    callback images-sort-selected(string);
+    callback images-frame-excluded-toggled(int);
+    callback images-frame-remove-requested(int);
+    callback images-frame-grip-pointer(int, int, length);
+    callback images-scrolled(length);
+    callback images-scrollbar-pointer(int, length);
+    callback images-scrollbar-dragged(length);
+    callback images-viewport-height-changed(length);
+
     dock := FFDock {
         x: root.width - ShellGeometry.dock-width;
         y: ShellGeometry.strip-height;
@@ -265,6 +291,16 @@ export component AppWindow inherits Window {
         settings-scroll-y: root.settings-scroll-y;
         settings-content-height: root.settings-content-height;
         settings-enabled: root.settings-enabled;
+        images-rows: root.images-rows;
+        images-header-text: root.images-header-text;
+        images-scroll-y: root.images-scroll-y;
+        images-content-height: root.images-content-height;
+        images-sort: root.images-sort;
+        images-sort-menu-open: root.images-sort-menu-open;
+        images-dragging-row: root.images-dragging-row;
+        images-drag-offset: root.images-drag-offset;
+        images-drag-target-row: root.images-drag-target-row;
+        images-enabled: root.images-enabled;
 
         mode-selected(m) => { root.mode-selected(m); }
         dock-tab-selected(t) => { root.dock-tab-selected(t); }
@@ -278,6 +314,16 @@ export component AppWindow inherits Window {
         settings-scrollbar-pointer(kind, y) => { root.settings-scrollbar-pointer(kind, y); }
         settings-scrollbar-dragged(y) => { root.settings-scrollbar-dragged(y); }
         settings-viewport-height-changed(h) => { root.settings-viewport-height-changed(h); }
+        images-add-frames-requested => { root.images-add-frames-requested(); }
+        images-sort-menu-toggled => { root.images-sort-menu-toggled(); }
+        images-sort-selected(picked) => { root.images-sort-selected(picked); }
+        images-frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
+        images-frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
+        images-frame-grip-pointer(i, kind, y) => { root.images-frame-grip-pointer(i, kind, y); }
+        images-scrolled(delta) => { root.images-scrolled(delta); }
+        images-scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
+        images-scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
+        images-viewport-height-changed(h) => { root.images-viewport-height-changed(h); }
     }
 
     // Settings modal state -- pushed from Rust once at startup
@@ -357,6 +403,18 @@ export component AppWindow inherits Window {
     in property <string> job-toast-message: "";
     callback job-toast-dismissed();
 
+    // The one warning a frame-set change (add/reorder/remove) raises once
+    // its project already carries a checkpoint.
+    in property <bool> frame-warning-open: false;
+    in property <string> frame-warning-title: "";
+    in property <string> frame-warning-body: "";
+    in property <string> frame-warning-info: "";
+    in property <string> frame-warning-confirm-label: "Confirm";
+    in property <string> frame-warning-secondary-label: "";
+    callback frame-warning-cancelled();
+    callback frame-warning-secondary-pressed();
+    callback frame-warning-confirmed();
+
     grouping-question := FFGroupingQuestion {
         x: 0px;
         y: 0px;
@@ -393,6 +451,22 @@ export component AppWindow inherits Window {
         toast-open: root.job-toast-open;
         message: root.job-toast-message;
         dismissed => { root.job-toast-dismissed(); }
+    }
+
+    frame-warning := FFFrameSetWarning {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.frame-warning-open;
+        title: root.frame-warning-title;
+        body: root.frame-warning-body;
+        info: root.frame-warning-info;
+        confirm-label: root.frame-warning-confirm-label;
+        secondary-label: root.frame-warning-secondary-label;
+        cancelled => { root.frame-warning-cancelled(); }
+        secondary-pressed => { root.frame-warning-secondary-pressed(); }
+        confirmed => { root.frame-warning-confirmed(); }
     }
 
     // `no-frame: true` above means the compositor draws no OS chrome, so

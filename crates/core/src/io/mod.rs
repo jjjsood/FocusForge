@@ -23,7 +23,9 @@ pub(crate) mod tiff;
 
 pub use crate::tile::{Rect, Tile};
 pub use error::{Refusal, TiffError};
-pub use grouping::{CaptureTime, GROUP_GAP, Group, GroupSignal, Proposal, one_group, propose};
+pub use grouping::{
+    CaptureTime, GROUP_GAP, Group, GroupSignal, Proposal, capture_time, one_group, propose,
+};
 pub use tiff::header::{ByteOrder, TiffHeader};
-pub use tiff::stack::{TiffStack, frame_paths, is_frame_path};
+pub use tiff::stack::{COMPOSITE_FILENAME, TiffStack, ZMAP_FILENAME, frame_paths, is_frame_path};
 pub use tiff::writer::{TiffSpec, TiffWriter};

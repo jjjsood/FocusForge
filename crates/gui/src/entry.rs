@@ -12,7 +12,9 @@
 
 use std::path::{Path, PathBuf};
 
-use focusforge_core::io::{Group, TiffError, TiffHeader, is_frame_path, one_group, propose};
+use focusforge_core::io::{
+    Group, GroupSignal, TiffError, TiffHeader, is_frame_path, one_group, propose,
+};
 use focusforge_core::params::StackContext;
 use focusforge_core::project::{PROJECT_EXTENSION, Project, ProjectError};
 // Named here, and re-exported, so `controller.rs` can carry a `Proposal` in
@@ -275,19 +277,6 @@ pub fn project_frames(project: &GuiProject) -> Vec<PathBuf> {
     }
 }
 
-/// The first of an opened project's recorded sources whose resolved path is
-/// not a file, if any -- what a re-fuse refuses on, deliberately narrower
-/// than [`Project::unresolved_sources`], which also reports every source
-/// recorded `AsGiven` even when it is perfectly present on disk.
-pub fn missing_source(project: &Project) -> Option<PathBuf> {
-    project
-        .manifest()
-        .sources
-        .iter()
-        .map(|source| project.source_path(source))
-        .find(|path| !path.is_file())
-}
-
 /// A tab's frame count: the group's own frame count pre-fuse, the sealed
 /// composite's recorded one once opened.
 pub fn tab_frame_count(project: &GuiProject) -> u32 {
@@ -309,4 +298,19 @@ pub fn tab_title(project: &GuiProject) -> String {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| project.path().display().to_string()),
     }
+}
+
+/// A fresh `Unsaved` project over `frames`, named `name` inside `dir` and
+/// carrying no capture-time signal of its own -- what "New project
+/// instead" opens: the same frames a frame-set-change warning was about to
+/// touch, with no checkpoint of their own.
+pub fn duplicate_as_unsaved(dir: PathBuf, name: String, frames: Vec<PathBuf>) -> GuiProject {
+    GuiProject::Unsaved(Group {
+        name,
+        dir,
+        frames,
+        signal: GroupSignal::Directory,
+        first_time: None,
+        last_time: None,
+    })
 }

@@ -7,6 +7,7 @@
 // vocabulary the CLI has no counterpart for.
 
 import { Theme } from "../theme.slint";
+import { FFDialog } from "../components/ff_dialog.slint";
 
 export component FFGroupingQuestion inherits Rectangle {
     in property <bool> question-open: false;
@@ -198,6 +199,14 @@ export component FFToast inherits Rectangle {
             height: 12px;
         }
     }
+}
+
+// The one warning a frame-set change (add/reorder/remove) shows once its
+// project already carries a checkpoint -- `AppController::pending_frame_change`
+// supplies every string and flag below, already rendered.
+export component FFFrameSetWarning inherits FFDialog {
+    tone: "warning";
+    confirm-kind: "primary";
 }
 
 export component FFSkippedNotice inherits Rectangle {

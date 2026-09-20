@@ -156,7 +156,7 @@ pub fn propose(root: &Path) -> Result<Proposal, TiffError> {
     let mut groups = Vec::new();
     let mut time_signal_available = false;
     for (dir, frames) in dirs {
-        let timed: Vec<Option<CaptureTime>> = frames.iter().map(|p| read_capture_time(p)).collect();
+        let timed: Vec<Option<CaptureTime>> = frames.iter().map(|p| capture_time(p)).collect();
         if timed.iter().any(Option::is_some) {
             time_signal_available = true;
         }
@@ -271,7 +271,7 @@ fn collect_frame_dirs(
 /// not parse at all is untimed rather than fatal: grouping is not the
 /// validator, and the run over that group reports the real error when it
 /// opens the stack.
-fn read_capture_time(path: &Path) -> Option<CaptureTime> {
+pub fn capture_time(path: &Path) -> Option<CaptureTime> {
     let header = TiffHeader::open(path).ok()?;
     parse_exif_datetime(header.date_time_original.as_deref()?)
 }

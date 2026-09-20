@@ -10,6 +10,8 @@ import { FFCheckpointPanel } from "dock/checkpoint_panel.slint";
 import { FFDockTabs } from "dock/dock_tabs.slint";
 import { FFSettingsPanel, SettingsRow, SectionHeadView } from "dock/settings_panel.slint";
 export { SettingsRow, SectionHeadView }
+import { FFImagesPanel, ImageRowView } from "dock/images_panel.slint";
+export { ImageRowView }
 
 export component FFDock inherits Rectangle {
     callback mode-selected(string);
@@ -39,6 +41,29 @@ export component FFDock inherits Rectangle {
     callback settings-scrollbar-pointer(int, length);
     callback settings-scrollbar-dragged(length);
     callback settings-viewport-height-changed(length);
+
+    // The `Images` panel: forwarded the same way, one line into
+    // `FFImagesPanel`.
+    in property <[ImageRowView]> images-rows: [];
+    in property <string> images-header-text: "";
+    in property <length> images-scroll-y: 0px;
+    in property <length> images-content-height: 0px;
+    in property <string> images-sort: "";
+    in property <bool> images-sort-menu-open: false;
+    in property <int> images-dragging-row: -1;
+    in property <length> images-drag-offset: 0px;
+    in property <int> images-drag-target-row: -1;
+    in property <bool> images-enabled: true;
+    callback images-add-frames-requested();
+    callback images-sort-menu-toggled();
+    callback images-sort-selected(string);
+    callback images-frame-excluded-toggled(int);
+    callback images-frame-remove-requested(int);
+    callback images-frame-grip-pointer(int, int, length);
+    callback images-scrolled(length);
+    callback images-scrollbar-pointer(int, length);
+    callback images-scrollbar-dragged(length);
+    callback images-viewport-height-changed(length);
 
     background: Theme.surface-raised;
 
@@ -91,6 +116,34 @@ export component FFDock inherits Rectangle {
         scrollbar-pointer(kind, y) => { root.settings-scrollbar-pointer(kind, y); }
         scrollbar-dragged(y) => { root.settings-scrollbar-dragged(y); }
         viewport-height-changed(h) => { root.settings-viewport-height-changed(h); }
+    }
+
+    images-panel := FFImagesPanel {
+        x: ShellGeometry.dock-content-inset;
+        y: dock-tabs.y + dock-tabs.height + Theme.space-2;
+        width: ShellGeometry.dock-width - ShellGeometry.dock-content-inset - ShellGeometry.dock-scrollbar-inset;
+        height: parent.height - self.y - ShellGeometry.dock-content-inset;
+        visible: root.project-loaded && root.dock-tab == "images";
+        rows: root.images-rows;
+        header-text: root.images-header-text;
+        scroll-y: root.images-scroll-y;
+        content-height: root.images-content-height;
+        mutable: root.mode == "stacking" && root.images-enabled;
+        sort: root.images-sort;
+        sort-menu-open: root.images-sort-menu-open;
+        dragging-row: root.images-dragging-row;
+        drag-offset: root.images-drag-offset;
+        drag-target-row: root.images-drag-target-row;
+        add-frames-requested => { root.images-add-frames-requested(); }
+        sort-menu-toggled => { root.images-sort-menu-toggled(); }
+        sort-selected(picked) => { root.images-sort-selected(picked); }
+        frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
+        frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
+        frame-grip-pointer(i, kind, y) => { root.images-frame-grip-pointer(i, kind, y); }
+        scrolled(delta) => { root.images-scrolled(delta); }
+        scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
+        scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
+        viewport-height-changed(h) => { root.images-viewport-height-changed(h); }
     }
 
     no-project-note := Text {

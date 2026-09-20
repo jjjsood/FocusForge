@@ -29,3 +29,13 @@ pub fn pick_project() -> Option<PathBuf> {
         .add_filter("FocusForge project", &["ffp"])
         .pick_file()
 }
+
+/// Opens the OS file picker, multi-select, filtered to TIFF frames -- the
+/// `Images` panel's Add path. `None` on cancel (or a missing dialog backend,
+/// rfd#320), the same as its two siblings.
+pub fn pick_frames() -> Option<Vec<PathBuf>> {
+    rfd::FileDialog::new()
+        .set_title("Add frames")
+        .add_filter("TIFF frames", &["tif", "tiff"])
+        .pick_files()
+}

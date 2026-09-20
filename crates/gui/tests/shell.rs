@@ -178,6 +178,7 @@ fn checkpoint_panel_touches_no_storage() {
         "input_config.rs",
         "settings_panel.rs",
         "job.rs",
+        "images.rs",
     ];
     for path in common::find_rust_files(&common::src_dir()) {
         if path

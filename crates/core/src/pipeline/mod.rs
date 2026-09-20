@@ -24,7 +24,7 @@ use crate::align::{
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use crate::gpu::TileBackend;
-use crate::io::{ByteOrder, Rect, TiffHeader, TiffStack};
+use crate::io::{ByteOrder, COMPOSITE_FILENAME, Rect, TiffHeader, TiffStack, ZMAP_FILENAME};
 use crate::job::{
     AlignIdentity, ControlState, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobControl, JobOutcome,
     JobProgress, JobRecord, JobStage, RecordingConsumer, Resumable, ResumeStore, StackFingerprint,
@@ -468,8 +468,8 @@ pub fn run(
         .join(&request.staging_key);
     std::fs::create_dir_all(&staging)
         .map_err(|err| PipelineError::Io(format!("creating {}: {err}", staging.display())))?;
-    let staged_composite = staging.join("composite.tif");
-    let staged_zmap = staging.join("zmap.tif");
+    let staged_composite = staging.join(COMPOSITE_FILENAME);
+    let staged_zmap = staging.join(ZMAP_FILENAME);
 
     let geometry = FusionGeometry {
         width,

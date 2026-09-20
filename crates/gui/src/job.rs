@@ -13,6 +13,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
 use focusforge_core::gpu::TileBackend;
+use focusforge_core::io::{COMPOSITE_FILENAME, ZMAP_FILENAME};
 use focusforge_core::params::ParamValues;
 use focusforge_core::pipeline::{self, AlignRequest, FuseRequest, RunStage, StageObserver};
 use focusforge_core::project::{self, Plane, Project, ProjectError};
@@ -358,8 +359,8 @@ fn is_fresh(path: &Path, ffp_modified: SystemTime) -> bool {
 pub fn materialize_planes(project: &mut Project) -> Result<(PathBuf, PathBuf), PlaneCacheError> {
     let dir = plane_cache_dir(project.path());
     std::fs::create_dir_all(&dir)?;
-    let composite = dir.join("composite.tif");
-    let zmap = dir.join("zmap.tif");
+    let composite = dir.join(COMPOSITE_FILENAME);
+    let zmap = dir.join(ZMAP_FILENAME);
     let ffp_modified = std::fs::metadata(project.path())?.modified()?;
     if !is_fresh(&composite, ffp_modified) {
         project::materialize_plane(project, Plane::Composite, &composite)?;

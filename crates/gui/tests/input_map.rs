@@ -861,6 +861,8 @@ const RAW_GESTURE_CALLBACK_EXCEPTIONS: &[&str] = &[
     "ff_slider.slint",
     "ff_scrollbar.slint",
     "settings_panel.slint",
+    "images_panel.slint",
+    "ff_image_row.slint",
 ];
 
 #[test]

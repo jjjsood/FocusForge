@@ -274,14 +274,29 @@ pub fn frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
     Ok(paths)
 }
 
-/// Whether `path` is a TIFF frame by extension: `.tif`/`.tiff`,
-/// case-insensitively. The one place that filter is spelled -- [`frame_paths`]
-/// calls it, and the GUI's classification of a multi-file drop calls it too,
-/// rather than keeping a second copy of the same check in `crates/gui`.
+/// The composite plane every fuse writes beside its source frames.
+pub const COMPOSITE_FILENAME: &str = "composite.tif";
+/// The Z-Map plane every fuse writes beside its source frames.
+pub const ZMAP_FILENAME: &str = "zmap.tif";
+
+/// Whether `path` is a TIFF frame: `.tif`/`.tiff` by extension,
+/// case-insensitively, and not one of a project's own output files sitting
+/// beside its sources from an earlier fuse. The one place that filter is
+/// spelled -- [`frame_paths`] calls it, and so does the GUI's classification
+/// of a multi-file drop, rather than a second copy of the same check in
+/// `crates/gui`.
 pub fn is_frame_path(path: &Path) -> bool {
-    path.extension()
+    let is_tiff = path
+        .extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
+        .is_some_and(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"));
+    if !is_tiff {
+        return false;
+    }
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) => name != COMPOSITE_FILENAME && name != ZMAP_FILENAME,
+        None => true,
+    }
 }
 
 /// Lenient uniformity: dimensions, bits per sample, samples per pixel,
@@ -374,5 +389,43 @@ mod tests {
         assert!(is_frame_path(Path::new("a.TIFF")));
         assert!(!is_frame_path(Path::new("a.png")));
         assert!(!is_frame_path(Path::new("a")));
+    }
+
+    #[test]
+    fn is_frame_path_excludes_a_projects_own_output_files() {
+        assert!(!is_frame_path(Path::new(COMPOSITE_FILENAME)));
+        assert!(!is_frame_path(Path::new(ZMAP_FILENAME)));
+        assert!(!is_frame_path(Path::new("some/dir/composite.tif")));
+        assert!(!is_frame_path(Path::new("some/dir/zmap.tif")));
+    }
+
+    #[test]
+    fn frame_paths_excludes_a_prior_fuses_own_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["00.tif", "01.tif", "02.tif"] {
+            std::fs::write(
+                dir.path().join(name),
+                b"not a real tiff, frame_paths never reads it",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.path().join(COMPOSITE_FILENAME),
+            b"a prior fuse's own composite",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(ZMAP_FILENAME), b"a prior fuse's own zmap").unwrap();
+
+        let found = frame_paths(dir.path()).unwrap();
+        assert_eq!(
+            found.len(),
+            3,
+            "the project's own prior outputs must not count as source frames"
+        );
+        for path in &found {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert_ne!(name, COMPOSITE_FILENAME);
+            assert_ne!(name, ZMAP_FILENAME);
+        }
     }
 }
