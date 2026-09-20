@@ -54,14 +54,11 @@ export component FFImageRow inherits Rectangle {
 
     background: root.dragging || (root.interactive && area.has-hover) ? Theme.surface-hover : transparent;
 
-    // The grip and the eye/bin nest inside this TouchArea rather than
-    // sitting beside it: a sibling TouchArea occludes `area`'s own hover
-    // the instant the pointer sits over it (Slint delivers a move to
-    // exactly one item at a point), which would drop `area.has-hover` --
-    // and with it every control depending on it -- the moment the pointer
-    // reaches the control it is about to press. Nested, `area`'s own
-    // `input_event_filter_before_children` still runs on the way down to
-    // whichever child ends up handling the event, so its hover survives.
+    // Nested rather than a sibling: Slint delivers a pointer move to exactly
+    // one item, so a sibling TouchArea would occlude `area.has-hover` (and
+    // every control depending on it) once the pointer reaches it. Nesting
+    // keeps `area`'s `input_event_filter_before_children` running on the
+    // way down, so its hover survives.
     area := TouchArea {
         enabled: root.interactive;
         width: 100%;

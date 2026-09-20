@@ -795,13 +795,10 @@ fn dragging_a_row_by_its_grip_reorders_it_through_the_real_window() {
     app.set_project_loaded(true);
     focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
 
-    // A live window re-renders after every dispatched event; this headless
-    // backend does neither on its own -- `mock_elapsed_time` is what
-    // instantiates a conditional element the event just made true
-    // (`i-slint-backend-testing-1.17.1/testing_backend.rs`'s own doc:
-    // "instantiating pending repeaters and conditionals"), and the state
-    // push is done by hand in place of the sink's `invoke_from_event_loop`,
-    // which this backend never pumps.
+    // The headless backend neither re-renders nor pumps the event loop on
+    // its own: `mock_elapsed_time` instantiates any conditional element the
+    // event just made true, and the state push below stands in for the
+    // `invoke_from_event_loop` callback this backend never runs.
     let dispatch = |event: WindowEvent| {
         app.window().dispatch_event(event);
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
@@ -1284,12 +1281,9 @@ fn write_the_61_frame_manual_evidence_tree() {
         sources.push(path);
     }
     // A directory mixing timed and untimed frames always proposes more than
-    // one group (`focusforge_core::io::grouping::group_one_directory`
-    // appends the untimed frames as their own group), so opening this
-    // directory raises the one grouping question rather than settling
-    // straight into a single project. Sealing directly, in a sibling
-    // directory so its own composite/Z-Map never sit beside the source
-    // frames, is this generator's own stand-in for a manual "open as one
-    // project" answer.
+    // one group, since `group_one_directory` appends the untimed frames as
+    // their own group. Sealing directly into a sibling directory answers
+    // that grouping question as "open as one project" would, without the
+    // composite/Z-Map ever sitting beside the source frames.
     seal_project_with_sources(&dir.join("sealed"), &sources);
 }
