@@ -595,28 +595,11 @@ fn diagnostics_destination_field_scrolls_to_keep_cursor_visible() {
 
 use focusforge_gui::SettingsSection;
 
-/// A panic report, a minidump with its metadata (one crash, not two), and a
-/// third crash that already carries its reported marker -- two unreported
-/// crashes.
+/// [`seed_two_crashes`] plus a third crash that already carries its
+/// reported marker -- still two unreported crashes.
 fn seed_notice_crashes(root: &Path) -> std::path::PathBuf {
-    let data = root.join("focusforge");
+    let data = seed_two_crashes(root);
     let crashes = data.join("crashes");
-    fs::create_dir_all(&crashes).unwrap();
-    fs::write(
-        crashes.join("20260918T010203Z-focusforge-gui-panic.json"),
-        "{\"format\":1,\"payload\":\"boom\"}",
-    )
-    .unwrap();
-    fs::write(
-        crashes.join("20260918T010204Z-focusforge-gui-native.json"),
-        "{\"format\":1,\"minidump\":\"20260918T010204Z-focusforge-gui-native.dmp\"}",
-    )
-    .unwrap();
-    fs::write(
-        crashes.join("20260918T010204Z-focusforge-gui-native.dmp"),
-        b"MDMP",
-    )
-    .unwrap();
     fs::write(
         crashes.join("20260918T010205Z-focusforge-gui-old.json"),
         "{\"format\":1,\"payload\":\"already seen\"}",
