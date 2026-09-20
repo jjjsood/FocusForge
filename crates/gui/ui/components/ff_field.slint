@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // A text field: `tone` colours the outline for the two states a caller
-// reports over it (warning, failure); the ordinary outline is the neutral
-// border. Focus grows the control by 2 px on every edge, the same outset
-// every focusable control shares. Width is the caller's; only height
-// follows state.
+// reports (warning, failure); otherwise it is the neutral border. Focus
+// grows the control by 2 px on every edge, like every focusable control.
+// Only height follows state; width is the caller's.
 
 import { Theme } from "../theme.slint";
 

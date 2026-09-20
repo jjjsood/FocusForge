@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // A bordered, fixed-size list of name/value rows that scrolls internally
-// rather than growing with the row count, plus one optional muted note row
-// shown in place of the list when there is nothing to list. The scrollbar
-// and the wheel both forward raw input and the list reports its own
-// viewport height; the caller owns the scroll offset and content height,
-// and decides thumb-drag from track-jump.
+// rather than growing with the row count, with an optional muted note row
+// when empty. Scrollbar and wheel forward raw input; the caller owns
+// scroll offset, content height, and telling a thumb-drag from a track-jump.
 
 import { Theme } from "../theme.slint";
 

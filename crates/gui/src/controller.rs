@@ -829,7 +829,10 @@ impl AppController {
                     }
                     DiagnosticsStatus::Written
                 }
-                Err(_) => DiagnosticsStatus::Failed,
+                Err(e) => {
+                    tracing::warn!(error = %e, "diagnostics bundle write failed");
+                    DiagnosticsStatus::Failed
+                }
             };
             if let Some(sink) = sink {
                 sink(ShellEvent::DiagnosticsWriteFinished(status));

@@ -129,6 +129,24 @@ pub fn read_pane_geometry(app: &AppWindow) -> (PaneRect, PaneRect) {
     )
 }
 
+/// Locks `controller`, runs `mutate` against it, then pushes the resulting
+/// manifest scroll offset into the window if it's still alive -- the tail
+/// shared by every manifest-scrollbar callback below.
+fn dispatch_manifest_scroll(
+    controller: &Arc<Mutex<AppController>>,
+    app_weak: &slint::Weak<AppWindow>,
+    mutate: impl FnOnce(&mut AppController),
+) {
+    let offset = {
+        let mut controller = controller.lock().unwrap();
+        mutate(&mut controller);
+        controller.manifest_scroll_offset()
+    };
+    if let Some(app) = app_weak.upgrade() {
+        app.set_diagnostics_manifest_scroll_offset(offset);
+    }
+}
+
 /// Rebuilds the diagnostics panel's whole view from the controller and
 /// pushes it into the window -- the panel carries no state of its own, so
 /// every change that could affect it re-runs this rather than patching one
@@ -420,52 +438,32 @@ pub fn install(app: &AppWindow) -> Installed {
                 2 => PointerKind::Move,
                 _ => PointerKind::Up,
             };
-            let mut controller = controller.lock().unwrap();
-            controller.manifest_scrollbar_pointer(kind, y);
-            let offset = controller.manifest_scroll_offset();
-            drop(controller);
-            if let Some(app) = app_weak.upgrade() {
-                app.set_diagnostics_manifest_scroll_offset(offset);
-            }
+            dispatch_manifest_scroll(&controller, &app_weak, |c| {
+                c.manifest_scrollbar_pointer(kind, y)
+            });
         }
     });
     app.on_diagnostics_manifest_scrollbar_dragged({
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move |y| {
-            let mut controller = controller.lock().unwrap();
-            controller.manifest_scrollbar_dragged(y);
-            let offset = controller.manifest_scroll_offset();
-            drop(controller);
-            if let Some(app) = app_weak.upgrade() {
-                app.set_diagnostics_manifest_scroll_offset(offset);
-            }
+            dispatch_manifest_scroll(&controller, &app_weak, |c| c.manifest_scrollbar_dragged(y));
         }
     });
     app.on_diagnostics_manifest_viewport_height_changed({
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move |height| {
-            let mut controller = controller.lock().unwrap();
-            controller.set_manifest_viewport_height(height);
-            let offset = controller.manifest_scroll_offset();
-            drop(controller);
-            if let Some(app) = app_weak.upgrade() {
-                app.set_diagnostics_manifest_scroll_offset(offset);
-            }
+            dispatch_manifest_scroll(&controller, &app_weak, |c| {
+                c.set_manifest_viewport_height(height)
+            });
         }
     });
     app.on_diagnostics_manifest_scrolled({
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move |delta| {
-            let mut controller = controller.lock().unwrap();
-            controller.manifest_scrolled(delta);
-            let offset = controller.manifest_scroll_offset();
-            drop(controller);
-            if let Some(app) = app_weak.upgrade() {
-                app.set_diagnostics_manifest_scroll_offset(offset);
-            }
+            dispatch_manifest_scroll(&controller, &app_weak, |c| c.manifest_scrolled(delta));
         }
     });
     app.on_diagnostics_primary_clicked({
