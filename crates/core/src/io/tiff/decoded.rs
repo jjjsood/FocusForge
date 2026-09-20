@@ -52,7 +52,6 @@ struct Key {
 struct Entry {
     bytes: u64,
     used_at: u64,
-    loading: bool,
     segment: Option<Arc<DecodedSegment>>,
 }
 
@@ -84,11 +83,10 @@ impl SegmentCache {
             .entries
             .iter()
             .filter(|(_, entry)| {
-                !entry.loading
-                    && entry
-                        .segment
-                        .as_ref()
-                        .is_some_and(|segment| Arc::strong_count(segment) == 1)
+                entry
+                    .segment
+                    .as_ref()
+                    .is_some_and(|segment| Arc::strong_count(segment) == 1)
             })
             .min_by_key(|(_, entry)| entry.used_at)
             .map(|(key, _)| *key);
@@ -185,7 +183,6 @@ impl SegmentCache {
                 Entry {
                     bytes,
                     used_at: tick,
-                    loading: true,
                     segment: None,
                 },
             );
@@ -198,7 +195,6 @@ impl SegmentCache {
                     let segment = Arc::new(decoded);
                     let tick = Self::next_tick(&mut state);
                     let entry = state.entries.get_mut(&key).expect("loading entry exists");
-                    entry.loading = false;
                     entry.used_at = tick;
                     entry.segment = Some(Arc::clone(&segment));
                     self.changed.notify_all();
