@@ -22,6 +22,8 @@ import { FFProgressBar } from "components/ff_progress_bar.slint";
 import { FFImageRow } from "components/ff_image_row.slint";
 import { FFDialog } from "components/ff_dialog.slint";
 import { FFDialogFooter } from "components/ff_dialog_footer.slint";
+import { FFChip } from "components/ff_chip.slint";
+import { FFProjectCard } from "components/ff_project_card.slint";
 
 component ColourSwatch inherits Rectangle {
     in property <color> swatch;
@@ -117,8 +119,8 @@ component IconSizeSample inherits Rectangle {
 
 export component ThemeSheet inherits Window {
     title: "FocusForge -- token sheet";
-    preferred-width: 940px;
-    preferred-height: 2050px;
+    preferred-width: 1100px;
+    preferred-height: 2760px;
     background: Theme.surface-base;
     default-font-family: Theme.font-family;
 
@@ -409,6 +411,83 @@ export component ThemeSheet inherits Window {
                 choice-ids: ["name", "capture-time"];
                 show-choice-ids: false;
                 selected: "name";
+            }
+        }
+
+        GroupHeading { text: "Projects overlay: chip"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFChip { text: "UNSAVED"; tone: "accent"; }
+            FFChip { text: "CURRENT"; tone: "accent"; }
+            FFChip { text: "MUTED"; tone: "muted"; }
+        }
+
+        GroupHeading { text: "Projects overlay: outlined button"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFButton { width: 130px; height: 30px; kind: "outlined"; text: "Run again"; }
+            FFButton { width: 130px; height: 30px; kind: "outlined"; text: "Locate frames…"; }
+        }
+
+        GroupHeading { text: "Projects overlay: card, every kind"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            FFProjectCard {
+                kind: "open";
+                current: true;
+                unsaved: true;
+                project-name: "IMG_9801-9861";
+                meta-text: "61 frames · 4 checkpoints";
+            }
+            FFProjectCard {
+                kind: "open";
+                fusing: true;
+                fusing-fraction: 0.42;
+                project-name: "IMG_9941-9977";
+                meta-text: "37 frames · fusing, step 2 of 3";
+            }
+            FFProjectCard {
+                kind: "failed";
+                glyph: @image-url("../../../assets/icons/triangle-alert.svg");
+                headline: "Did not stack";
+                stage: "FAILED WHILE ALIGNING";
+                reason: "Frames 12 and 13 share no overlap. Alignment stopped there.";
+                action-label: "Run again";
+                project-name: "IMG_9862-9903";
+                meta-text: "42 frames · no project written";
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            FFProjectCard {
+                kind: "sources-missing";
+                glyph: @image-url("../../../assets/icons/circle-alert.svg");
+                headline: "Sources missing";
+                stage: "NOTHING TO SHOW";
+                reason: "The project points at frames that are not where it left them.";
+                action-label: "Locate frames…";
+                project-name: "IMG_9978-9994";
+                meta-text: "17 frames · project found, sources not";
+            }
+            FFProjectCard {
+                kind: "cancelled";
+                glyph: @image-url("../../../assets/icons/x.svg");
+                headline: "Cancelled";
+                stage: "STOPPED WHILE FUSING";
+                reason: "You stopped this one. Nothing was written.";
+                action-label: "Run again";
+                project-name: "IMG_10062-10090";
+                meta-text: "29 frames · stopped before writing";
+            }
+            FFProjectCard {
+                kind: "not-a-project";
+                glyph: @image-url("../../../assets/icons/folder.svg");
+                headline: "Not a project";
+                stage: "LEFT ALONE";
+                reason: "This folder holds something else. Nothing was read and nothing was changed.";
+                action-label: "";
+                project-name: "contact-sheets";
+                meta-text: "not read · not changed";
             }
         }
     }

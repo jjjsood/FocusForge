@@ -5,6 +5,7 @@
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
+import { FFChip } from "../components/ff_chip.slint";
 
 // One open project's tab -- the plain twin of `crate::controller::ProjectTabView`.
 export struct ProjectTabView {
@@ -109,14 +110,8 @@ component FFTab inherits FFStripBox {
             horizontal-stretch: 1;
         }
 
-        // "chip / unsaved" specimen.
-        if root.view.unsaved: Text {
+        if root.view.unsaved: FFChip {
             text: "UNSAVED";
-            color: Theme.accent-default;
-            font-size: Theme.text-section.size;
-            font-weight: Theme.text-section.weight;
-            letter-spacing: Theme.text-section.letter-spacing;
-            vertical-alignment: center;
         }
 
         // The touch area takes the layout's full height; the glyph is
@@ -244,13 +239,18 @@ export component FFTabStrip inherits Rectangle {
         changed pressed => { root.window-drag-requested(); }
     }
 
-    // The four-square Projects-overlay button. The box is drawn but
-    // triggers nothing.
+    // The four-square Projects-overlay button: lit while the overlay is
+    // open, the same 2 px top-edge marker every active strip box carries.
+    in property <bool> projects-overlay-open: false;
+    callback projects-toggled();
+
     projects-button := FFTabStripIconButton {
         x: ShellGeometry.projects-button-inset;
         glyph: @image-url("../../../../assets/icons/layout-grid.svg");
+        active: root.projects-overlay-open;
         accessible-role: button;
         accessible-label: "Projects";
+        triggered => { root.projects-toggled(); }
     }
 
     // Everything between the projects slot and the window glyphs, less the

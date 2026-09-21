@@ -217,7 +217,7 @@ impl Step {
 /// stage, `Write` once every unit of the fuse stage is done (the seal, which
 /// the engine reports as no stage of its own -- `JobStage` has only
 /// `Align`/`Fuse`), `Fuse` otherwise -- including no progress at all yet.
-fn progress_step(progress: Option<&JobProgress>) -> Step {
+pub fn progress_step(progress: Option<&JobProgress>) -> Step {
     match progress {
         Some(p) if p.stage == JobStage::Align => Step::Align,
         Some(p) if p.unit_total > 0 && p.units_done >= p.unit_total => Step::Write,

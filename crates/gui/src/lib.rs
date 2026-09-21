@@ -84,3 +84,14 @@ pub mod job;
 /// no `use slint::` anywhere in it. `pub` so `tests/images.rs` reaches its
 /// types directly.
 pub mod images;
+
+/// The projects overlay's own vocabulary -- a failure card's fixed copy per
+/// kind and the gallery's grid arithmetic. No `use slint::` anywhere in it.
+/// `pub` so `tests/projects_overlay.rs` and `src/bridge.rs` reach its types
+/// directly.
+pub mod overlay;
+
+/// The `Recent` list's own file format, mirroring `crate::input_config`. No
+/// `use slint::` anywhere in it. `pub` so `src/main.rs` and
+/// `tests/projects_overlay.rs` reach it directly.
+pub mod recent;

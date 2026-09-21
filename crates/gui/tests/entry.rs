@@ -221,7 +221,8 @@ fn skipped_subfolders_are_reported_not_failed() {
     let notice = controller
         .notice()
         .expect("the skipped subfolder must be reported");
-    assert!(notice.contains("thumbs"));
+    assert!(notice.contains("1 subfolder"));
+    assert!(notice.contains("skipped"));
     assert!(
         controller.last_refusal().is_none(),
         "a skipped subfolder is not a failure"

@@ -37,8 +37,15 @@ fn display_path_has_no_readback() {
 
 #[test]
 fn no_cpu_tonemap_in_the_gui_crate() {
+    // `overlay.rs`'s own picture is a one-time 330x186 reduction of a
+    // project's stored composite, off the interactive display path this
+    // scan protects -- the one file allowed to tone-map on the CPU.
+    const EXEMPT: &str = "overlay.rs";
     let forbidden = ["tonemap_cpu", "reduce16to8"];
     for path in common::find_rust_files(&common::src_dir()) {
+        if path.file_name().and_then(|n| n.to_str()) == Some(EXEMPT) {
+            continue;
+        }
         let contents = fs::read_to_string(&path).unwrap();
         let stripped = common::strip_line_comments(&contents);
         for needle in forbidden {

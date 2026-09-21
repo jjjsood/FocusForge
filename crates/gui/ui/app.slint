@@ -19,7 +19,9 @@ export { SettingsRow, SectionHeadView, ImageRowView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFSettingsModal, InputRow } from "shell/settings_modal.slint";
 export { InputRow }
-import { FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSkippedNotice, FFToast } from "shell/dialogs.slint";
+import { FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFToast } from "shell/dialogs.slint";
+import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
+export { ProjectCardView, RecentRowView }
 
 export component AppWindow inherits Window {
     // Every callback forwards one-for-one into `AppController` via
@@ -89,6 +91,11 @@ export component AppWindow inherits Window {
     callback tab-region-width-changed(length);
     out property <length> tab-region-width: tab-strip.tabs-region-width;
 
+    // The projects overlay's own toggle: the tab strip's four-square button
+    // lights while it is open, and the same press or `Esc` closes it.
+    in property <bool> projects-overlay-open: false;
+    callback projects-overlay-toggled();
+
     tab-strip := FFTabStrip {
         x: 0px;
         y: 0px;
@@ -101,6 +108,7 @@ export component AppWindow inherits Window {
         tabs-overflow: root.tabs-overflow;
         can-scroll-left: root.can-scroll-left;
         can-scroll-right: root.can-scroll-right;
+        projects-overlay-open: root.projects-overlay-open;
 
         window-drag-requested => { root.window-drag-requested(); }
         window-minimize-requested => { root.window-minimize-requested(); }
@@ -112,6 +120,7 @@ export component AppWindow inherits Window {
         scroll-left => { root.tab-scroll-left(); }
         scroll-right => { root.tab-scroll-right(); }
         tabs-region-width-changed(w) => { root.tab-region-width-changed(w); }
+        projects-toggled => { root.projects-overlay-toggled(); }
     }
 
     // The transport's current run state: "idle" | "running" | "paused" |
@@ -370,6 +379,53 @@ export component AppWindow inherits Window {
         zoom-fit-requested => { root.zoom-fit-requested(); }
     }
 
+    // The projects overlay's gallery: pushed from `AppController::project_cards`
+    // on every `ShellEvent::OverlayChanged`.
+    in property <string> gallery-heading: "Open projects";
+    in property <string> gallery-count-text: "";
+    in property <[ProjectCardView]> project-cards: [];
+    in property <length> gallery-content-height: 0px;
+    in property <length> gallery-scroll-y: 0px;
+    callback projects-card-clicked(int);
+    callback projects-card-action-clicked(int);
+    callback projects-card-close-clicked(int);
+    callback gallery-scrolled(length);
+    callback gallery-scrollbar-pointer(int, length);
+    callback gallery-scrollbar-dragged(length);
+    callback gallery-viewport-height-changed(length);
+    callback gallery-width-changed(length);
+    in property <[RecentRowView]> recent-rows: [];
+    callback projects-new-project-requested();
+    callback projects-open-project-requested();
+    callback projects-close-project-requested();
+    out property <length> gallery-width: projects-overlay.gallery-width;
+
+    projects-overlay := FFProjectsOverlay {
+        x: 0px;
+        y: ShellGeometry.strip-height;
+        width: root.width;
+        height: root.height - ShellGeometry.strip-height;
+        overlay-open: root.projects-overlay-open;
+        gallery-heading: root.gallery-heading;
+        gallery-count-text: root.gallery-count-text;
+        cards: root.project-cards;
+        gallery-content-height: root.gallery-content-height;
+        gallery-scroll-y: root.gallery-scroll-y;
+        recent-rows: root.recent-rows;
+
+        card-clicked(i) => { root.projects-card-clicked(i); }
+        card-action-clicked(i) => { root.projects-card-action-clicked(i); }
+        card-close-clicked(i) => { root.projects-card-close-clicked(i); }
+        gallery-scrolled(delta) => { root.gallery-scrolled(delta); }
+        gallery-scrollbar-pointer(kind, y) => { root.gallery-scrollbar-pointer(kind, y); }
+        gallery-scrollbar-dragged(y) => { root.gallery-scrollbar-dragged(y); }
+        gallery-viewport-height-changed(h) => { root.gallery-viewport-height-changed(h); }
+        gallery-width-changed(w) => { root.gallery-width-changed(w); }
+        new-project-requested => { root.projects-new-project-requested(); }
+        open-project-requested => { root.projects-open-project-requested(); }
+        close-project-requested => { root.projects-close-project-requested(); }
+    }
+
     settings-modal := FFSettingsModal {
         x: 0px;
         y: 0px;
@@ -437,18 +493,22 @@ export component AppWindow inherits Window {
         pick-another-folder => { root.refusal-pick-another-folder(); }
     }
 
-    skipped-notice-banner := FFSkippedNotice {
-        x: 0px;
-        y: root.height - ShellGeometry.bottom-bar-height - self.height;
-        width: root.width;
-        notice-text: root.skipped-notice;
+    // Both toasts sit over the canvas, never the projects overlay: a toast
+    // open when the overlay opens waits, still armed, and reappears the
+    // moment the overlay closes -- neither flag its own toast clears.
+    skipped-toast := FFToast {
+        x: canvas-ground.x + Theme.space-3;
+        y: canvas-ground.y + Theme.space-3;
+        tone: "info";
+        toast-open: root.skipped-notice != "" && !root.projects-overlay-open;
+        message: root.skipped-notice;
         dismissed => { root.skipped-notice-dismissed(); }
     }
 
     job-toast := FFToast {
         x: canvas-ground.x + Theme.space-3;
         y: canvas-ground.y + Theme.space-3;
-        toast-open: root.job-toast-open;
+        toast-open: root.job-toast-open && !root.projects-overlay-open;
         message: root.job-toast-message;
         dismissed => { root.job-toast-dismissed(); }
     }

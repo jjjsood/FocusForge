@@ -152,6 +152,9 @@ export component FFRefusalDialog inherits Rectangle {
 export component FFToast inherits Rectangle {
     in property <bool> toast-open: false;
     in property <string> message: "";
+    // "failure" (default): a run's own toast. "info": a plain notice, such
+    // as a folder open that skipped some of what it found.
+    in property <string> tone: "failure";
     callback dismissed();
 
     width: 300px;
@@ -166,8 +169,9 @@ export component FFToast inherits Rectangle {
     icon := Image {
         x: Theme.space-4;
         y: Theme.space-4;
-        source: @image-url("../../../../assets/icons/triangle-alert.svg");
-        colorize: Theme.status-failure;
+        source: root.tone == "failure" ? @image-url("../../../../assets/icons/triangle-alert.svg")
+            : @image-url("../../../../assets/icons/info.svg");
+        colorize: root.tone == "failure" ? Theme.status-failure : Theme.text-secondary;
         width: 18px;
         height: 18px;
     }
@@ -209,36 +213,3 @@ export component FFFrameSetWarning inherits FFDialog {
     confirm-kind: "primary";
 }
 
-export component FFSkippedNotice inherits Rectangle {
-    in property <string> notice-text: "";
-    callback dismissed();
-
-    visible: root.notice-text != "";
-    height: 32px;
-    background: Theme.surface-raised;
-
-    HorizontalLayout {
-        padding-left: Theme.space-3;
-        padding-right: Theme.space-3;
-        spacing: Theme.space-2;
-
-        Text {
-            text: root.notice-text;
-            color: Theme.text-secondary;
-            font-size: Theme.text-body.size;
-            overflow: elide;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-        }
-        dismiss-area := TouchArea {
-            width: 16px;
-            clicked => { root.dismissed(); }
-            Image {
-                source: @image-url("../../../../assets/icons/x.svg");
-                colorize: Theme.text-secondary;
-                width: 12px;
-                height: 12px;
-            }
-        }
-    }
-}

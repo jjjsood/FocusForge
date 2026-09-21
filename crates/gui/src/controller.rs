@@ -17,7 +17,7 @@
 //! here either.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,8 @@ use crate::input_map::{
     Action, ActionEvent, Button, InputRowView, InputTable, Modifiers, PointerKind, Trigger,
 };
 use crate::job;
+use crate::overlay::{self, CardView, FailureCard, FailureKind};
+use crate::recent;
 use crate::settings_panel::{
     self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext,
 };
@@ -112,6 +114,9 @@ pub enum ShellEvent {
     /// warning opened or closed -- never a tab switch, which
     /// `ProjectsChanged` already rebuilds the panel for.
     ImagesChanged,
+    /// The projects overlay's own state moved: opened, closed, its gallery
+    /// scrolled, or its failure cards changed.
+    OverlayChanged,
 }
 
 /// One live drag: which action it started and the last position seen, so
@@ -191,6 +196,12 @@ struct ProjectTab {
     /// neither `Name` nor `Capture time` is checked. Cleared by a manual
     /// drag.
     frame_sort: Option<images::FrameSort>,
+    /// This tab's own card picture -- primed once, right here for a fresh
+    /// tab and again in [`AppController::settle_job`] once a fuse seals it,
+    /// and never recomputed after that. `Arc`-shared rather than cloned per
+    /// push, since [`AppController::project_cards`] rebuilds far more often
+    /// than a picture actually changes.
+    thumbnail: Option<Arc<overlay::Thumbnail>>,
 }
 
 impl ProjectTab {
@@ -209,6 +220,7 @@ impl ProjectTab {
         };
         let frames = entry::project_frames(&project);
         let excluded = vec![false; frames.len()];
+        let thumbnail = overlay::render_thumbnail(&mut project, &frames).map(Arc::new);
         ProjectTab {
             project,
             title,
@@ -226,6 +238,7 @@ impl ProjectTab {
             frames,
             excluded,
             frame_sort: None,
+            thumbnail,
         }
     }
 
@@ -262,6 +275,28 @@ pub struct ProjectTabRow {
     pub title: String,
     pub unsaved: bool,
     pub selected: bool,
+}
+
+/// The rail's plain-Rust view of one `Recent` row -- [`AppController::recent_rows`]'s
+/// return type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentRow {
+    pub name: String,
+    pub folder: String,
+    pub date_text: String,
+}
+
+/// What a chrome key press means -- [`AppController::chrome_key`]'s return
+/// type. The two picker variants need `crate::bridge`'s event-loop thread,
+/// since the picker itself cannot run inside the controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromeKey {
+    /// Not a chrome key press -- falls through to [`AppController::key`].
+    None,
+    /// Already performed; nothing left for the bridge to do.
+    Consumed,
+    NewProject,
+    OpenProject,
 }
 
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
@@ -340,6 +375,25 @@ struct ShellState {
     /// minus this one, in whole [`images::ROW_HEIGHT`] steps, is how far
     /// the row has moved.
     drag_row: Option<DragRow>,
+    /// Whether the projects overlay is open.
+    overlay_open: bool,
+    /// Every card standing for a stack that did not become an open project
+    /// this session -- cleared the moment its own path opens successfully.
+    failures: Vec<FailureCard>,
+    /// The gallery's own scroll offset and viewport height --
+    /// [`ShellState::images_scroll_y`]'s twin.
+    gallery_scroll_y: f32,
+    gallery_viewport_height: f32,
+    /// The gallery's measured content width -- what [`overlay::columns`]
+    /// lays the grid out against.
+    gallery_width: f32,
+    gallery_scrollbar_drag: Option<f32>,
+    /// The `Recent` list, most recent first -- loaded once at startup
+    /// ([`AppController::install_recent`]) and appended to by every
+    /// successful open. `None` config dir (its own resolution failed) means
+    /// entries are tracked in memory for the session but never persisted.
+    recent: Vec<recent::RecentEntry>,
+    recent_config_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1026,6 +1080,17 @@ impl AppController {
         self.state.notice.as_deref()
     }
 
+    /// Clears the skipped-subfolder notice. Manual dismiss only -- unlike
+    /// the run-failure toast, this one names something already finished,
+    /// not a live status to time out on its own, so it waits for its own
+    /// `x`. Clearing `self.state.notice` here, not only the Slint-side
+    /// property, is what stops a later, unrelated push from resurrecting
+    /// the old text.
+    pub fn dismiss_notice(&mut self) {
+        self.state.notice = None;
+        self.emit(ShellEvent::ProjectsChanged);
+    }
+
     /// The most recent refusal's already-rendered message, if any.
     pub fn last_refusal(&self) -> Option<&str> {
         self.state.last_refusal.as_deref()
@@ -1053,11 +1118,51 @@ impl AppController {
     /// Places every opened project in a tab, selects the first of them, and
     /// records the skipped-subfolder notice. New tabs always go at the end,
     /// whether "+" or a project tab was selected.
+    /// Every skipped subfolder becomes a `Not a project` card; an opened
+    /// project whose sources do not all resolve becomes a `Sources missing`
+    /// one alongside its tab; a path that opens successfully clears any card
+    /// already held for it.
     fn accept(&mut self, opened: Opened) {
         self.state.notice = notice_line(&opened.skipped);
         self.state.last_refusal = None;
+        for skipped in &opened.skipped {
+            self.record_failure(not_a_project_card(skipped.clone()));
+        }
         if !opened.projects.is_empty() {
             self.set_active_tab(Some(self.state.projects.len()));
+            let opened_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            for project in &opened.projects {
+                self.clear_failure(&project_identity_path(project));
+                self.record_recent(entry::tab_title(project), recent_folder(project), opened_at);
+                if let GuiProject::Opened(p) = project
+                    && p.unresolved_sources().next().is_some()
+                {
+                    let path = p.path().to_path_buf();
+                    let title = p
+                        .path()
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.path().display().to_string());
+                    let frame_count = p.manifest().composite.frame_count as usize;
+                    self.record_failure(FailureCard {
+                        kind: FailureKind::SourcesMissing,
+                        path,
+                        title,
+                        stage: "NOTHING TO SHOW".to_string(),
+                        reason: "The project points at frames that are not where it left them."
+                            .to_string(),
+                        meta: format!(
+                            "{frame_count} {} · project found, sources not",
+                            frame_word(frame_count)
+                        ),
+                        frames: frame_count,
+                        request: None,
+                    });
+                }
+            }
             self.state
                 .projects
                 .extend(opened.projects.into_iter().map(ProjectTab::new));
@@ -1075,6 +1180,12 @@ impl AppController {
 
     fn refuse(&mut self, err: EntryError) -> OpenOutcome {
         let message = err.to_string();
+        match &err {
+            EntryError::Unreadable { path } | EntryError::NoReadableFrames { path } => {
+                self.record_failure(not_a_project_card(path.clone()));
+            }
+            _ => {}
+        }
         self.refuse_message(message);
         OpenOutcome::Refused(err)
     }
@@ -1135,8 +1246,12 @@ impl AppController {
             self.settle_settings_scroll();
             self.emit(ShellEvent::ProjectsChanged);
         }
+        self.close_projects_overlay();
     }
 
+    /// Also closes the projects overlay, the same as a gallery card click:
+    /// the tab strip and the gallery both switch to the same project one
+    /// way or another.
     pub fn select_project(&mut self, index: usize) {
         if index < self.state.projects.len() {
             self.set_active_tab(Some(index));
@@ -1144,6 +1259,7 @@ impl AppController {
             self.settle_settings_scroll();
             self.emit(ShellEvent::ProjectsChanged);
         }
+        self.close_projects_overlay();
     }
 
     /// Closes tab `index`, re-selecting its neighbour -- "+" when the last
@@ -1198,6 +1314,423 @@ impl AppController {
         self.settle_tab_scroll();
         self.settle_settings_scroll();
         self.emit(ShellEvent::ProjectsChanged);
+    }
+
+    // -- The projects overlay: its toggle, its gallery and the rail's
+    // actions the overlay itself does not draw. --
+
+    /// Installs the `Recent` list loaded at startup and the directory it
+    /// persists to -- `main.rs`'s own read, mirroring
+    /// `install_input_table`; this crate's one exception to "no fs touch in
+    /// `controller.rs`" is [`recent::save`]/[`recent::load`] themselves,
+    /// which live in `crate::recent`, not here.
+    pub fn install_recent(&mut self, entries: Vec<recent::RecentEntry>, config_dir: PathBuf) {
+        self.state.recent = entries;
+        self.state.recent_config_dir = Some(config_dir);
+    }
+
+    /// The rail's own `Recent` rows, dates rendered against `now_unix` --
+    /// a parameter rather than a live clock read, so a test controls it.
+    pub fn recent_rows(&self, now_unix: i64) -> Vec<RecentRow> {
+        self.state
+            .recent
+            .iter()
+            .map(|e| RecentRow {
+                name: e.name.clone(),
+                folder: e.folder.display().to_string(),
+                date_text: recent::format_date(e.opened_at, now_unix),
+            })
+            .collect()
+    }
+
+    /// Records `name`/`folder` at the front of the `Recent` list and
+    /// persists it, if a config directory resolved at startup. A write
+    /// failure is silent: the `Recent` list is a convenience, never a
+    /// reason to interrupt an open.
+    fn record_recent(&mut self, name: String, folder: PathBuf, opened_at: i64) {
+        recent::record(&mut self.state.recent, name, folder, opened_at);
+        if let Some(dir) = &self.state.recent_config_dir {
+            let _ = recent::save(dir, &self.state.recent);
+        }
+    }
+
+    /// Whether the projects overlay is open.
+    pub fn projects_overlay_open(&self) -> bool {
+        self.state.overlay_open
+    }
+
+    /// Opens the overlay, or closes it if it is already open -- the
+    /// four-square button's own toggle, and `Esc`'s. Opening also primes any
+    /// tab whose picture never got a chance to (a fresh tab and a fuse
+    /// settling already prime their own), the exception rather than the
+    /// rule.
+    pub fn toggle_projects_overlay(&mut self) {
+        self.state.overlay_open = !self.state.overlay_open;
+        if self.state.overlay_open {
+            for tab in &mut self.state.projects {
+                if tab.thumbnail.is_none() {
+                    tab.thumbnail =
+                        overlay::render_thumbnail(&mut tab.project, &tab.frames).map(Arc::new);
+                }
+            }
+        }
+        self.set_gallery_scroll(self.state.gallery_scroll_y);
+        self.emit(ShellEvent::OverlayChanged);
+    }
+
+    /// Closes the overlay if it is open; a no-op otherwise.
+    pub fn close_projects_overlay(&mut self) {
+        if self.state.overlay_open {
+            self.state.overlay_open = false;
+            self.emit(ShellEvent::OverlayChanged);
+        }
+    }
+
+    /// A key press against the rail's own five shortcuts -- `Esc` and
+    /// `Ctrl+N/O/S/W` -- checked before [`Self::key`]'s rebindable table, so
+    /// none of the five can be shadowed by a user's rebind. Meaningful only
+    /// while the overlay is open, since that is the one surface these five
+    /// belong to; every other key press reads [`ChromeKey::None`] and falls
+    /// through unchanged.
+    pub fn chrome_key(&mut self, text: &str, mods: Modifiers) -> ChromeKey {
+        let Some(key) = text.chars().next() else {
+            return ChromeKey::None;
+        };
+        if key == '\u{1b}' {
+            if self.state.overlay_open {
+                self.close_projects_overlay();
+                return ChromeKey::Consumed;
+            }
+            return ChromeKey::None;
+        }
+        if !self.state.overlay_open || !mods.ctrl {
+            return ChromeKey::None;
+        }
+        match key.to_ascii_lowercase() {
+            'n' => ChromeKey::NewProject,
+            'o' => ChromeKey::OpenProject,
+            // `Save project` is visibly disabled until a tab has something
+            // sealable -- `Ctrl+S` is consumed and does nothing.
+            's' => ChromeKey::Consumed,
+            'w' => {
+                if let Some(i) = self.active_project() {
+                    self.close_project(i);
+                }
+                ChromeKey::Consumed
+            }
+            _ => ChromeKey::None,
+        }
+    }
+
+    /// The gallery's own heading: `"Open projects"` while every attempt this
+    /// session opened, `"Projects"` the moment any did not.
+    pub fn gallery_heading(&self) -> &'static str {
+        if self.state.failures.is_empty() {
+            "Open projects"
+        } else {
+            "Projects"
+        }
+    }
+
+    /// The gallery's own count line, beside its heading: `"N open"`, or
+    /// `"N · M did not open"` once a failure card exists.
+    pub fn gallery_count_text(&self) -> String {
+        if self.state.failures.is_empty() {
+            format!("{} open", self.state.projects.len())
+        } else {
+            format!(
+                "{} · {} did not open",
+                self.state.projects.len() + self.state.failures.len(),
+                self.state.failures.len()
+            )
+        }
+    }
+
+    /// Every card the gallery shows, positioned on the grid: one per open
+    /// project, then one per stack that did not become one this session.
+    /// `crate::bridge` is the one place this crosses into Slint.
+    pub fn project_cards(&self) -> Vec<CardView> {
+        let columns = overlay::columns(self.state.gallery_width);
+        let progress = self.job.observer.as_ref().and_then(|o| o.last_progress());
+        let running_step = job::current_step(&self.job.state, progress.as_ref());
+        let mut cards = Vec::with_capacity(self.state.projects.len() + self.state.failures.len());
+        for (i, tab) in self.state.projects.iter().enumerate() {
+            let fusing = self.job.tab_index == Some(i) && job::is_live(&self.job.state);
+            let frame_count = entry::tab_frame_count(&tab.project);
+            let fusing_step = if fusing { running_step } else { None }.map(|step| {
+                format!(
+                    "{}, {}",
+                    job::stage_word(&self.job.state, progress.as_ref()).to_lowercase(),
+                    step.text()
+                )
+            });
+            let (x, y) = overlay::card_origin(cards.len(), columns);
+            cards.push(CardView {
+                kind: "open".to_string(),
+                current: self.state.active == Some(i),
+                unsaved: matches!(tab.project, GuiProject::Unsaved(_)),
+                fusing,
+                fusing_fraction: if fusing {
+                    job::bar_fraction(progress.as_ref())
+                } else {
+                    0.0
+                },
+                project_name: tab.title.clone(),
+                meta_text: open_card_meta(frame_count, tab.checkpoints, fusing_step.as_deref()),
+                headline: String::new(),
+                stage: String::new(),
+                reason: String::new(),
+                action_label: String::new(),
+                picture: tab.thumbnail.clone(),
+                x,
+                y,
+            });
+        }
+        for failure in &self.state.failures {
+            let (x, y) = overlay::card_origin(cards.len(), columns);
+            cards.push(CardView {
+                kind: failure.kind.card_kind().to_string(),
+                current: false,
+                unsaved: false,
+                fusing: false,
+                fusing_fraction: 0.0,
+                project_name: failure.title.clone(),
+                meta_text: failure.meta.clone(),
+                headline: failure.kind.headline().to_string(),
+                stage: failure.stage.clone(),
+                reason: failure.reason.clone(),
+                action_label: failure.kind.action_label().to_string(),
+                picture: None,
+                x,
+                y,
+            });
+        }
+        cards
+    }
+
+    /// Records `card`, replacing any card already held for the same path.
+    fn record_failure(&mut self, card: FailureCard) {
+        self.state.failures.retain(|c| c.path != card.path);
+        self.state.failures.push(card);
+        self.emit(ShellEvent::OverlayChanged);
+    }
+
+    /// Clears any card held for `path` -- what a path opening successfully
+    /// does to whichever card, if any, stood for its last attempt.
+    fn clear_failure(&mut self, path: &Path) {
+        let before = self.state.failures.len();
+        self.state.failures.retain(|c| c.path != path);
+        if self.state.failures.len() != before {
+            self.emit(ShellEvent::OverlayChanged);
+        }
+    }
+
+    /// A gallery card's own click, by its position in [`Self::project_cards`]:
+    /// switches to that project and closes the overlay for an open card, a
+    /// no-op for a not-opened one -- there is nothing to switch to.
+    pub fn select_gallery_card(&mut self, index: usize) {
+        if index >= self.state.projects.len() {
+            return;
+        }
+        // Closes the overlay too -- `select_project`'s own job now.
+        self.select_project(index);
+    }
+
+    /// The failure card at gallery index `index`'s own kind string, if any --
+    /// what `crate::bridge` reads before deciding whether its action needs
+    /// the folder picker.
+    pub fn gallery_failure_kind(&self, index: usize) -> Option<&'static str> {
+        let failure_index = index.checked_sub(self.state.projects.len())?;
+        self.state
+            .failures
+            .get(failure_index)
+            .map(|f| f.kind.card_kind())
+    }
+
+    /// `Run again` on a `Did not stack`/`Cancelled` card: re-runs that
+    /// card's own kept request, on its own tab if one is still open (so the
+    /// outcome lands back on the right card rather than whichever tab
+    /// happened to be active). Never more than one card's worth of work: a
+    /// no-op while a run is already live. Returns whether a run started.
+    pub fn run_gallery_action(&mut self, index: usize) -> bool {
+        if self.job_running() {
+            return false;
+        }
+        let Some(failure_index) = index.checked_sub(self.state.projects.len()) else {
+            return false;
+        };
+        let Some(failure) = self.state.failures.get(failure_index) else {
+            return false;
+        };
+        let Some(request) = failure.request.clone() else {
+            return false;
+        };
+        let path = failure.path.clone();
+        if let Some(tab_index) = self
+            .state
+            .projects
+            .iter()
+            .position(|t| project_identity_path(&t.project) == path)
+        {
+            self.state.active = Some(tab_index);
+        }
+        self.run_request(request);
+        true
+    }
+
+    /// `Locate frames…` on a `Sources missing` card: re-resolves that
+    /// project's own tab against `folder` in memory only -- no write, and no
+    /// touch of the sealed `.ffp`'s own fingerprint. Clears the card only
+    /// once every source resolves; a folder missing some of them changes
+    /// nothing, silently.
+    pub fn locate_missing_sources(&mut self, index: usize, folder: PathBuf) {
+        let Some(failure_index) = index.checked_sub(self.state.projects.len()) else {
+            return;
+        };
+        let Some(failure) = self.state.failures.get(failure_index) else {
+            return;
+        };
+        if failure.kind != FailureKind::SourcesMissing {
+            return;
+        }
+        let path = failure.path.clone();
+        let Some(tab) = self
+            .state
+            .projects
+            .iter_mut()
+            .find(|t| project_identity_path(&t.project) == path)
+        else {
+            return;
+        };
+        let GuiProject::Opened(project) = &tab.project else {
+            return;
+        };
+        let candidates: Vec<PathBuf> = project
+            .manifest()
+            .sources
+            .iter()
+            .map(|source| {
+                let name = Path::new(&source.path)
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(&source.path));
+                folder.join(name)
+            })
+            .collect();
+        if candidates.iter().all(|p| p.is_file()) {
+            tab.excluded = vec![false; candidates.len()];
+            tab.frames = candidates;
+            self.clear_failure(&path);
+        }
+    }
+
+    pub fn scroll_gallery(&mut self, delta_px: f32) {
+        self.set_gallery_scroll(self.state.gallery_scroll_y + delta_px);
+    }
+
+    fn gallery_content_height(&self) -> f32 {
+        let columns = overlay::columns(self.state.gallery_width);
+        overlay::content_height(
+            self.state.projects.len() + self.state.failures.len(),
+            columns,
+        )
+    }
+
+    fn set_gallery_scroll(&mut self, offset_px: f32) {
+        let content_height = self.gallery_content_height();
+        let viewport_height = self.state.gallery_viewport_height;
+        let offset = settings_panel::clamp_panel_scroll(offset_px, content_height, viewport_height);
+        if offset != self.state.gallery_scroll_y {
+            self.state.gallery_scroll_y = offset;
+            self.emit(ShellEvent::OverlayChanged);
+        }
+    }
+
+    /// The gallery scrollbar thumb's current `(top, height)` in
+    /// track-pixel space -- [`Self::images_scrollbar_thumb`]'s twin.
+    fn gallery_scrollbar_thumb(&self) -> (f32, f32) {
+        let content_height = self.gallery_content_height();
+        let viewport_height = self.state.gallery_viewport_height;
+        if content_height <= 0.0 {
+            return (0.0, viewport_height);
+        }
+        let height = (viewport_height * viewport_height / content_height).max(16.0);
+        let top = self.state.gallery_scroll_y * viewport_height / content_height;
+        (top, height)
+    }
+
+    /// A press on the gallery scrollbar -- [`Self::images_scrollbar_pointer`]'s
+    /// twin.
+    pub fn gallery_scrollbar_pointer(&mut self, kind: PointerKind, mouse_y: f32) {
+        match kind {
+            PointerKind::Down => {
+                let (thumb_top, thumb_height) = self.gallery_scrollbar_thumb();
+                if mouse_y >= thumb_top && mouse_y < thumb_top + thumb_height {
+                    self.state.gallery_scrollbar_drag = Some(mouse_y - thumb_top);
+                } else {
+                    let viewport_height = self.state.gallery_viewport_height.max(1.0);
+                    let content_height = self.gallery_content_height();
+                    let target_top = mouse_y - thumb_height / 2.0;
+                    self.set_gallery_scroll(target_top * content_height / viewport_height);
+                    self.state.gallery_scrollbar_drag = Some(thumb_height / 2.0);
+                }
+            }
+            PointerKind::Up => self.state.gallery_scrollbar_drag = None,
+            PointerKind::Move => {}
+        }
+    }
+
+    /// The live gallery scrollbar drag, if any -- [`Self::images_scrollbar_dragged`]'s
+    /// twin.
+    pub fn gallery_scrollbar_dragged(&mut self, mouse_y: f32) {
+        let Some(grab_offset) = self.state.gallery_scrollbar_drag else {
+            return;
+        };
+        let viewport_height = self.state.gallery_viewport_height.max(1.0);
+        let content_height = self.gallery_content_height();
+        let target_top = mouse_y - grab_offset;
+        self.set_gallery_scroll(target_top * content_height / viewport_height);
+    }
+
+    /// The gallery viewport's measured height -- pushed on install and on
+    /// every resize; re-clamps the scroll offset.
+    pub fn set_gallery_viewport_height(&mut self, height: f32) {
+        self.state.gallery_viewport_height = height.max(0.0);
+        let content_height = self.gallery_content_height();
+        self.state.gallery_scroll_y = settings_panel::clamp_panel_scroll(
+            self.state.gallery_scroll_y,
+            content_height,
+            self.state.gallery_viewport_height,
+        );
+        self.emit(ShellEvent::OverlayChanged);
+    }
+
+    pub fn gallery_scroll_y(&self) -> f32 {
+        self.state.gallery_scroll_y
+    }
+
+    /// The gallery's own scrollable content height, in pixels -- what
+    /// `FFScrollbar`'s `content-height` is pushed from.
+    pub fn gallery_content_height_px(&self) -> f32 {
+        self.gallery_content_height()
+    }
+
+    /// The gallery's measured content width -- pushed on install and on
+    /// every resize; re-clamps the scroll offset since a width change moves
+    /// the column count.
+    pub fn set_gallery_width(&mut self, width: f32) {
+        let width = width.max(0.0);
+        if width == self.state.gallery_width {
+            return;
+        }
+        self.state.gallery_width = width;
+        let content_height = self.gallery_content_height();
+        self.state.gallery_scroll_y = settings_panel::clamp_panel_scroll(
+            self.state.gallery_scroll_y,
+            content_height,
+            self.state.gallery_viewport_height,
+        );
+        self.emit(ShellEvent::OverlayChanged);
     }
 
     // -- The settings panel. The model is rebuilt from scratch on every
@@ -2074,13 +2607,64 @@ impl AppController {
             self.job.handle = Some(handle);
             return None;
         }
+        // Read before `settle_job` clears the observer below: the step this
+        // run was on when it stopped is what a failure or cancellation
+        // card's own stage line names.
+        let progress = self.job.observer.as_ref().and_then(|o| o.last_progress());
+        let step = job::progress_step(progress.as_ref());
+        let request = self.job.request.clone();
+        let was_cancelling = self.job.state == job::RunState::Cancelling;
         let settled = job::settle(handle.join());
         self.job.state = settled.state;
         self.job.control = None;
         self.job.observer = None;
         let tab_index = self.job.tab_index.take();
+        let tab_info = tab_index
+            .and_then(|i| self.state.projects.get(i))
+            .map(|tab| (project_identity_path(&tab.project), tab.title.clone()));
+        let frame_count = request.as_ref().map_or(0, |r| r.frames.len());
+
+        match &self.job.state {
+            job::RunState::Failed(message) => {
+                if let Some((path, title)) = tab_info.clone() {
+                    self.record_failure(FailureCard {
+                        kind: FailureKind::Failed,
+                        path,
+                        title,
+                        stage: format!("FAILED WHILE {}", step_verb(step)),
+                        reason: message.clone(),
+                        meta: format!(
+                            "{frame_count} {} · no project written",
+                            frame_word(frame_count)
+                        ),
+                        frames: frame_count,
+                        request: request.clone(),
+                    });
+                }
+            }
+            job::RunState::Idle if was_cancelling => {
+                if let Some((path, title)) = tab_info {
+                    self.record_failure(FailureCard {
+                        kind: FailureKind::Cancelled,
+                        path,
+                        title,
+                        stage: format!("STOPPED WHILE {}", step_verb(step)),
+                        reason: "You stopped this one. Nothing was written.".to_string(),
+                        meta: format!(
+                            "{frame_count} {} · stopped before writing",
+                            frame_word(frame_count)
+                        ),
+                        frames: frame_count,
+                        request,
+                    });
+                }
+            }
+            _ => {}
+        }
+
         let planes = settled.opened.and_then(|(project, composite, zmap)| {
             let tab = tab_index.and_then(|i| self.state.projects.get_mut(i))?;
+            let path = project_identity_path(&tab.project);
             tab.project = GuiProject::Opened(Box::new(project));
             tab.title = entry::tab_title(&tab.project);
             tab.ctx = entry::tab_stack_context(&tab.project);
@@ -2092,7 +2676,12 @@ impl AppController {
             tab.frames = entry::project_frames(&tab.project);
             tab.excluded = vec![false; tab.frames.len()];
             tab.frame_sort = None;
-            Some((composite, zmap))
+            tab.thumbnail = overlay::render_thumbnail(&mut tab.project, &tab.frames).map(Arc::new);
+            Some((path, composite, zmap))
+        });
+        let planes = planes.map(|(path, composite, zmap)| {
+            self.clear_failure(&path);
+            (composite, zmap)
         });
         self.emit(ShellEvent::JobChanged);
         planes
@@ -2278,17 +2867,96 @@ fn tab_values_mut<'a>(tab: &'a mut ProjectTab, section: &str) -> &'a mut ParamVa
     }
 }
 
+/// `"frame"` for exactly one, `"frames"` otherwise -- every card meta line's
+/// own pluralization.
+fn frame_word(count: usize) -> &'static str {
+    if count == 1 { "frame" } else { "frames" }
+}
+
+/// A path's own identity for a project or a card: an `Unsaved` tab's own
+/// source folder, a sealed one's `.ffp` file -- what a later successful open
+/// of the same path clears a failure card by.
+fn project_identity_path(project: &GuiProject) -> PathBuf {
+    match project {
+        GuiProject::Unsaved(group) => group.dir.clone(),
+        GuiProject::Opened(project) => project.path().to_path_buf(),
+    }
+}
+
+/// The folder a `Recent` entry names for `project`: the source folder for
+/// an `Unsaved` group, the sealed `.ffp`'s own parent directory once opened
+/// -- a folder either way, never a file path.
+fn recent_folder(project: &GuiProject) -> PathBuf {
+    match project {
+        GuiProject::Unsaved(group) => group.dir.clone(),
+        GuiProject::Opened(project) => project
+            .path()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| project.path().to_path_buf()),
+    }
+}
+
+/// The `Not a project` card for `path`: a skipped subfolder, or an
+/// `Unreadable`/`NoReadableFrames` refusal.
+fn not_a_project_card(path: PathBuf) -> FailureCard {
+    let title = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    FailureCard {
+        kind: FailureKind::NotAProject,
+        path,
+        title,
+        stage: "LEFT ALONE".to_string(),
+        reason: "This folder holds something else. Nothing was read and nothing was changed."
+            .to_string(),
+        meta: "not read · not changed".to_string(),
+        frames: 0,
+        request: None,
+    }
+}
+
+/// `job::Step`'s own uppercase present-participle, for a failure or
+/// cancellation card's stage line (`"FAILED WHILE ALIGNING"`).
+fn step_verb(step: job::Step) -> &'static str {
+    match step {
+        job::Step::Align => "ALIGNING",
+        job::Step::Fuse => "FUSING",
+        job::Step::Write => "WRITING",
+    }
+}
+
+/// An open card's second meta line: `fusing_step` (already rendered, e.g.
+/// `"fusing, step 2 of 3"`) while a run is live against this tab, otherwise
+/// the checkpoint count -- `"no checkpoint yet"` at zero.
+fn open_card_meta(frame_count: u32, checkpoints: usize, fusing_step: Option<&str>) -> String {
+    let frames = frame_word(frame_count as usize);
+    if let Some(step) = fusing_step {
+        return format!("{frame_count} {frames} · {step}");
+    }
+    if checkpoints == 0 {
+        return format!("{frame_count} {frames} · no checkpoint yet");
+    }
+    let checkpoint_word = if checkpoints == 1 {
+        "checkpoint"
+    } else {
+        "checkpoints"
+    };
+    format!("{frame_count} {frames} · {checkpoints} {checkpoint_word}")
+}
+
 /// The skipped-subfolder notice's text, `None` when nothing was skipped --
-/// not an error, `FFSkippedNotice`'s own copy (`ui/shell/dialogs.slint`).
+/// not an error, its toast's own copy (`ui/shell/dialogs.slint`'s
+/// `FFToast`, `tone: "info"`). Short enough to stay on the toast's one
+/// line regardless of how many subfolders it names.
 fn notice_line(skipped: &[PathBuf]) -> Option<String> {
     if skipped.is_empty() {
         return None;
     }
-    let names: Vec<String> = skipped.iter().map(|p| p.display().to_string()).collect();
     Some(format!(
-        "{} subfolder{} held no readable frames and were skipped: {}",
+        "{} subfolder{} skipped",
         skipped.len(),
-        if skipped.len() == 1 { "" } else { "s" },
-        names.join(", ")
+        if skipped.len() == 1 { "" } else { "s" }
     ))
 }

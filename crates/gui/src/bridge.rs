@@ -18,10 +18,11 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
 use crate::controller::{
-    AppController, DockTab, GroupingQuestion, JobView, OpenAs, ShellEvent, ShellMode,
+    AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, ShellEvent, ShellMode,
 };
 use crate::generated::{
-    AppWindow, ImageRowView as GeneratedImageRow, ProjectTabView, SectionHeadView,
+    AppWindow, ImageRowView as GeneratedImageRow, ProjectCardView as GeneratedProjectCard,
+    ProjectTabView, RecentRowView as GeneratedRecentRow, SectionHeadView,
     SettingsRow as GeneratedSettingsRow,
 };
 use crate::gpu_canvas::CanvasRenderer;
@@ -183,6 +184,7 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     app.set_fuse_enabled(controller.fuse_enabled());
     push_settings_panel(app, &controller);
     push_images_panel(app, &controller);
+    push_projects_overlay(app, &controller);
 }
 
 /// Pushes the tab strip's scroll offset, overflow layout and two arrow
@@ -299,6 +301,7 @@ fn start_job_timer(
         let view = controller.lock().unwrap().job_view();
         let live = job::is_live(&view.state);
         push_job(&app, &view);
+        push_projects_overlay(&app, &controller.lock().unwrap());
         if !live {
             // The run just settled -- the moment the images/settings panels'
             // own whole-panel disable must lift again.
@@ -463,6 +466,67 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     }
 }
 
+/// A card picture, converted into an actual Slint image -- the one place
+/// `crate::overlay::Thumbnail` crosses into `slint::Image`. A blank 1x1
+/// image with no picture yet -- `FFProjectCard` only draws it when
+/// `has-picture` is set, so its content never shows.
+fn thumbnail_image(thumbnail: Option<&crate::overlay::Thumbnail>) -> slint::Image {
+    let Some(thumbnail) = thumbnail else {
+        return slint::Image::default();
+    };
+    let mut buffer =
+        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(thumbnail.width, thumbnail.height);
+    buffer.make_mut_bytes().copy_from_slice(&thumbnail.rgba);
+    slint::Image::from_rgba8(buffer)
+}
+
+/// Pushes the projects overlay's whole state -- the one place
+/// `ShellEvent::OverlayChanged` is performed.
+pub fn push_projects_overlay(app: &AppWindow, controller: &AppController) {
+    app.set_projects_overlay_open(controller.projects_overlay_open());
+    app.set_gallery_heading(controller.gallery_heading().into());
+    app.set_gallery_count_text(controller.gallery_count_text().into());
+    let cards: Vec<GeneratedProjectCard> = controller
+        .project_cards()
+        .into_iter()
+        .map(|c| GeneratedProjectCard {
+            kind: c.kind.into(),
+            current: c.current,
+            unsaved: c.unsaved,
+            fusing: c.fusing,
+            fusing_fraction: c.fusing_fraction,
+            project_name: c.project_name.into(),
+            meta_text: c.meta_text.into(),
+            headline: c.headline.into(),
+            stage: c.stage.into(),
+            reason: c.reason.into(),
+            action_label: c.action_label.into(),
+            has_picture: c.picture.is_some(),
+            picture: thumbnail_image(c.picture.as_deref()),
+            x: c.x,
+            y: c.y,
+        })
+        .collect();
+    app.set_project_cards(std::rc::Rc::new(slint::VecModel::from(cards)).into());
+    app.set_gallery_content_height(controller.gallery_content_height_px());
+    app.set_gallery_scroll_y(controller.gallery_scroll_y());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let recent: Vec<GeneratedRecentRow> = controller
+        .recent_rows(now)
+        .into_iter()
+        .map(|r| GeneratedRecentRow {
+            name: r.name.into(),
+            folder: r.folder.into(),
+            date_text: r.date_text.into(),
+        })
+        .collect();
+    app.set_recent_rows(std::rc::Rc::new(slint::VecModel::from(recent)).into());
+}
+
 /// Pushes a raised [`GroupingQuestion`] into `app`'s dialog properties.
 fn push_question(app: &AppWindow, question: &GroupingQuestion) {
     app.set_question_open(true);
@@ -520,6 +584,21 @@ impl CustomApplicationHandler for DropHandler {
             let _ = self.controller.lock().unwrap().open_paths(&paths);
         }
         EventResult::Propagate
+    }
+}
+
+/// Opens `path`, if the picker returned one, and closes the projects
+/// overlay on a successful open -- the rail's `New project`/`Open
+/// project…` actions and their `Ctrl+N`/`Ctrl+O` chrome-key twins share this
+/// one path.
+fn open_from_picker(controller: &Arc<Mutex<AppController>>, path: Option<PathBuf>) {
+    let Some(path) = path else { return };
+    let mut controller = controller.lock().unwrap();
+    if matches!(
+        controller.open_paths(&[path]),
+        crate::OpenOutcome::Opened(_)
+    ) {
+        controller.close_projects_overlay();
     }
 }
 
@@ -735,12 +814,25 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
         let app_weak = app.as_weak();
         move || dispatch(&controller, &canvas, &app_weak, AppController::fit)
     });
+    // The five chrome keys are consulted before the rebindable table, so
+    // none of them can be shadowed by a user's `input.toml`
+    // (`AppController::chrome_key`).
     app.on_canvas_key_pressed({
         let controller = controller.clone();
         move |text, ctrl, shift, alt| {
-            let mut controller = controller.lock().unwrap();
-            let mods = modifiers(&controller, ctrl, shift, alt);
-            controller.key(true, text.as_str(), mods);
+            let mods = {
+                let controller = controller.lock().unwrap();
+                modifiers(&controller, ctrl, shift, alt)
+            };
+            let chrome = controller.lock().unwrap().chrome_key(text.as_str(), mods);
+            match chrome {
+                ChromeKey::None => controller.lock().unwrap().key(true, text.as_str(), mods),
+                ChromeKey::Consumed => {}
+                ChromeKey::NewProject => open_from_picker(&controller, crate::picker::pick_entry()),
+                ChromeKey::OpenProject => {
+                    open_from_picker(&controller, crate::picker::pick_project())
+                }
+            }
         }
     });
     app.on_canvas_key_released({
@@ -859,8 +951,10 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
         }
     });
     app.on_skipped_notice_dismissed({
+        let controller = controller.clone();
         let app_weak = app.as_weak();
         move || {
+            controller.lock().unwrap().dismiss_notice();
             if let Some(app) = app_weak.upgrade() {
                 app.set_skipped_notice("".into());
             }
@@ -1035,6 +1129,124 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
             }
         }
     });
+    // The projects overlay: the tab strip's own toggle, the gallery's
+    // scroll -- `FFScrollbar`'s twin wiring above -- and its cards' own
+    // click-through.
+    app.on_projects_overlay_toggled({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().toggle_projects_overlay()
+    });
+    // The rail's own actions: New/Open reuse the picker any other open path
+    // uses; Close closes whichever tab is active, the same as `Ctrl+W` would.
+    app.on_projects_new_project_requested({
+        let controller = controller.clone();
+        move || open_from_picker(&controller, crate::picker::pick_entry())
+    });
+    app.on_projects_open_project_requested({
+        let controller = controller.clone();
+        move || open_from_picker(&controller, crate::picker::pick_project())
+    });
+    app.on_projects_close_project_requested({
+        let controller = controller.clone();
+        move || {
+            let mut controller = controller.lock().unwrap();
+            if let Some(i) = controller.active_project() {
+                controller.close_project(i);
+            }
+        }
+    });
+    app.on_projects_card_clicked({
+        let controller = controller.clone();
+        move |i| controller.lock().unwrap().select_gallery_card(i as usize)
+    });
+    app.on_projects_card_close_clicked({
+        let controller = controller.clone();
+        move |i| controller.lock().unwrap().close_project(i as usize)
+    });
+    // `Run again` re-runs that one card's own kept request off the worker
+    // thread the same way `fuse-requested`/`retry-requested` do; `Locate
+    // frames…` needs the folder picker, which only this event-loop-thread
+    // callback can call.
+    app.on_projects_card_action_clicked({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let job_timer = job_timer.clone();
+        let toast_timer = toast_timer.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            let i = i as usize;
+            let kind = controller.lock().unwrap().gallery_failure_kind(i);
+            match kind {
+                Some("sources-missing") => {
+                    if let Some(folder) = crate::picker::pick_entry() {
+                        controller.lock().unwrap().locate_missing_sources(i, folder);
+                    }
+                }
+                Some("failed") | Some("cancelled") => {
+                    let started = controller.lock().unwrap().run_gallery_action(i);
+                    if started {
+                        start_job_timer(
+                            app_weak.clone(),
+                            controller.clone(),
+                            canvas.clone(),
+                            job_timer.clone(),
+                            toast_timer.clone(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    app.on_gallery_scrolled({
+        let controller = controller.clone();
+        move |delta| controller.lock().unwrap().scroll_gallery(delta)
+    });
+    app.on_gallery_scrollbar_pointer({
+        let controller = controller.clone();
+        move |kind, y| {
+            let kind = match kind {
+                0 => PointerKind::Down,
+                2 => PointerKind::Move,
+                _ => PointerKind::Up,
+            };
+            controller
+                .lock()
+                .unwrap()
+                .gallery_scrollbar_pointer(kind, y);
+        }
+    });
+    app.on_gallery_scrollbar_dragged({
+        let controller = controller.clone();
+        move |y| controller.lock().unwrap().gallery_scrollbar_dragged(y)
+    });
+    app.on_gallery_viewport_height_changed({
+        let controller = controller.clone();
+        move |height| {
+            controller
+                .lock()
+                .unwrap()
+                .set_gallery_viewport_height(height)
+        }
+    });
+    app.on_gallery_width_changed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |width| {
+            controller.lock().unwrap().set_gallery_width(width);
+            if let Some(app) = app_weak.upgrade() {
+                push_projects_overlay(&app, &controller.lock().unwrap());
+            }
+        }
+    });
+    // A `changed` handler never fires for the initial value -- the
+    // gallery's first measurement is read here once, the same reason
+    // `tab_region_width` is (above).
+    controller
+        .lock()
+        .unwrap()
+        .set_gallery_width(app.get_gallery_width());
+
     app.on_images_frame_grip_pointer({
         let controller = controller.clone();
         move |i, kind, y| {
@@ -1132,7 +1344,9 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             // otherwise re-reads `job_running()` on its own.
             push_settings_panel(app, &controller);
             push_images_panel(app, &controller);
+            push_projects_overlay(app, &controller);
         }
         ShellEvent::ImagesChanged => push_images_panel(app, &controller.lock().unwrap()),
+        ShellEvent::OverlayChanged => push_projects_overlay(app, &controller.lock().unwrap()),
     }
 }

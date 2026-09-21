@@ -61,6 +61,10 @@ struct Args {
     /// with no click sequence.
     #[arg(long)]
     images_sort_menu_open: bool,
+    /// Opens the projects overlay at startup, for inspecting every state of
+    /// this surface with no click sequence.
+    #[arg(long)]
+    projects_overlay: bool,
     /// Requests removing the frame at this index right after `--open`, for
     /// inspecting the frame-set warning it raises on a checkpointed project
     /// with no click sequence.
@@ -257,6 +261,24 @@ fn install_input_table(
     }
 }
 
+/// Loads the `Recent` list from the same config directory `install_input_table`
+/// resolves and installs it on `controller`. A directory that fails to
+/// resolve leaves the list empty for the session, never a reason the window
+/// fails to open.
+fn install_recent(
+    controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
+    args: &Args,
+) {
+    let Some(config_dir) = resolve_config_dir(args) else {
+        return;
+    };
+    let entries = focusforge_gui::recent::load(&config_dir);
+    controller
+        .lock()
+        .unwrap()
+        .install_recent(entries, config_dir);
+}
+
 fn main() -> ExitCode {
     // Ahead of every parser: a re-spawned monitor process carries no
     // arguments of its own and never opens a window.
@@ -324,6 +346,7 @@ fn run(args: &Args) -> ExitCode {
         let _ = &toast_timer;
 
         install_input_table(&controller, &app, args);
+        install_recent(&controller, args);
 
         if let Some(state) = &args.toolbar_state {
             apply_toolbar_state_preview(&app, state.as_str());
@@ -356,6 +379,10 @@ fn run(args: &Args) -> ExitCode {
 
         if args.images_sort_menu_open {
             controller.lock().unwrap().toggle_images_sort_menu();
+        }
+
+        if args.projects_overlay {
+            controller.lock().unwrap().toggle_projects_overlay();
         }
 
         if let Some(index) = args.frame_remove_warning {
