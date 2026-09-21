@@ -325,12 +325,7 @@ impl TileBackend for GpuBackend {
     }
 
     fn device_lost(&self) -> bool {
-        // wgpu queues the device-lost callback and runs it from a poll, so
-        // without this non-blocking maintain a loss would only become
-        // visible at the next tile's own blocking readback -- one tile too
-        // late to keep off the device.
-        let _ = self.device.device().poll(wgpu::PollType::Poll);
-        errors::device_lost()
+        self.device.lost()
     }
 }
 

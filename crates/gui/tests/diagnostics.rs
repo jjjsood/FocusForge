@@ -175,6 +175,98 @@ fn trace_file_parses_after_early_exit() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Runs `focusforge-gui` with a device destroyed part-way through the
+/// session (`FF_FORCE_DEVICE_LOST_MS`) and a watchdog well past it
+/// (`--exit-after`), so an exit code of 0 would mean the response never
+/// fired. Asserts the whole response as one shape: the documented exit
+/// code, exactly one record of the loss itself and exactly one of the
+/// session ending because of it, and no panic.
+#[cfg(feature = "gpu-tests")]
+fn assert_device_loss_response(extra_args: &[std::ffi::OsString]) {
+    if !common::has_display() {
+        println!("SKIP: window tests need DISPLAY or WAYLAND_DISPLAY");
+        return;
+    }
+    let mut cmd = common::gui_bin("diagnostics_device_loss");
+    let data_dir = cmd
+        .get_envs()
+        .find(|(k, _)| *k == "FOCUSFORGE_DATA_DIR")
+        .and_then(|(_, v)| v)
+        .map(std::path::PathBuf::from)
+        .expect("gui_bin always sets FOCUSFORGE_DATA_DIR");
+
+    let output = cmd
+        .env("FF_FORCE_DEVICE_LOST_MS", "1500")
+        .args(extra_args)
+        .args(["--exit-after", "15000"])
+        .output()
+        .expect("failed to run focusforge-gui");
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a run whose device is lost must end on exit code 3, not the watchdog's own 0 -- stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log_path = data_dir
+        .join("focusforge")
+        .join("logs")
+        .join("focusforge.jsonl");
+    let contents = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("log file must exist at {}: {e}", log_path.display()));
+    let records: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("every log line is JSON"))
+        .collect();
+
+    let loss_records = records
+        .iter()
+        .filter(|r| {
+            r["level"] == "ERROR"
+                && r["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("graphics device lost"))
+        })
+        .count();
+    assert_eq!(
+        loss_records, 1,
+        "exactly one record of the loss itself, got {contents}"
+    );
+
+    let response_records = records
+        .iter()
+        .filter(|r| {
+            r["level"] == "ERROR"
+                && r["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("the graphics device is gone"))
+        })
+        .count();
+    assert_eq!(
+        response_records, 1,
+        "exactly one record of the response, however many poll ticks passed, got {contents}"
+    );
+
+    assert!(
+        !contents.contains("panicked at"),
+        "the loss path must never panic, got: {contents}"
+    );
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn device_loss_ends_the_session_with_a_project_open() {
+    let project = common::workspace_root().join("fixtures").join("mantis-512");
+    assert_device_loss_response(&["--open".into(), project.into_os_string()]);
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn device_loss_ends_the_session_with_no_project_open() {
+    assert_device_loss_response(&[]);
+}
+
 /// A native crash fires no panic hook: the monitor process the GUI spawns
 /// is what leaves the minidump and its metadata behind.
 #[cfg(unix)]
