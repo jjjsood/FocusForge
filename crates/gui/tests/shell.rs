@@ -380,6 +380,35 @@ fn diagnostics_panel_footer_and_list_are_stable_across_states() {
     );
 }
 
+/// While no scan has completed, the footer stays at its idle position and
+/// only the primary action disables -- the toggle and destination field are
+/// bound on `busy` alone and stay live throughout.
+#[test]
+fn diagnostics_panel_loading() {
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    app.set_settings_section("diagnostics".into());
+
+    let footer_id = "FFDiagnosticsPanel::footer";
+    let idle = rect(&app, footer_id);
+
+    let primary_id = "FFDiagnosticsPanel::bundle-primary";
+    let primary = || {
+        ElementQuery::from_root(&app)
+            .match_id(primary_id)
+            .find_first()
+            .unwrap_or_else(|| panic!("no element matched id {primary_id:?}"))
+    };
+    assert_eq!(primary().accessible_enabled(), Some(true));
+
+    app.set_diagnostics_loading(true);
+    assert_rect(&app, footer_id, idle);
+    assert_eq!(primary().accessible_enabled(), Some(false));
+
+    app.set_diagnostics_loading(false);
+    assert_eq!(primary().accessible_enabled(), Some(true));
+}
+
 /// The toast paints at the pane gutter under the tab strip and toolbar, at
 /// its fixed size, regardless of window width; with no notice pending, no
 /// element matches its id at all -- the conditional `if` never instantiates

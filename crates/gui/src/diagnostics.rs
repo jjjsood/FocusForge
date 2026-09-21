@@ -16,6 +16,28 @@ pub struct DiagnosticsEntryView {
     pub not_redacted: bool,
 }
 
+/// One entry of a completed manifest scan, before it is formatted for
+/// display: the value column's byte count and redacted mark are rendered
+/// from this by [`crate::controller::AppController::diagnostics_view`], not
+/// computed again on the scan thread.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DiagnosticsScanEntry {
+    pub name: String,
+    pub bytes: u64,
+    pub redacted: bool,
+}
+
+/// A background manifest scan's result: which entries the bundle would
+/// hold and whether it found any log or crash evidence at all, independent
+/// of `bundle::Manifest` so the scan thread never hands `fs::Metadata` or a
+/// formatted string back to the controller.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DiagnosticsScan {
+    pub entries: Vec<DiagnosticsScanEntry>,
+    pub has_logs: bool,
+    pub has_crash_evidence: bool,
+}
+
 /// Where a write attempt stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DiagnosticsStatus {
@@ -42,6 +64,9 @@ pub struct DiagnosticsView {
     pub primary_label: String,
     /// Set while a write is in flight, disabling every control.
     pub busy: bool,
+    /// Set while no scan has completed yet, or a rescan is in flight,
+    /// disabling only the footer's primary action.
+    pub loading: bool,
     /// The manifest list's current scroll offset, in its own track-pixel
     /// space.
     pub manifest_scroll_offset: f32,

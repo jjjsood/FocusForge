@@ -217,6 +217,7 @@ export component AppWindow inherits Window {
     in property <string> diagnostics-message: "";
     in property <string> diagnostics-primary-label: "Create bundle";
     in property <bool> diagnostics-busy: false;
+    in property <bool> diagnostics-loading: false;
     in property <length> diagnostics-manifest-scroll-offset: 0px;
     in property <length> diagnostics-manifest-content-height: 0px;
     in property <length> diagnostics-destination-scroll-offset: 0px;
@@ -272,6 +273,7 @@ export component AppWindow inherits Window {
         diagnostics-message: root.diagnostics-message;
         diagnostics-primary-label: root.diagnostics-primary-label;
         diagnostics-busy: root.diagnostics-busy;
+        diagnostics-loading: root.diagnostics-loading;
         diagnostics-manifest-scroll-offset: root.diagnostics-manifest-scroll-offset;
         diagnostics-manifest-content-height: root.diagnostics-manifest-content-height;
         diagnostics-destination-scroll-offset: root.diagnostics-destination-scroll-offset;

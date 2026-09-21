@@ -24,6 +24,7 @@ export component FFDiagnosticsPanel inherits Rectangle {
     in property <string> message: "";
     in property <string> primary-label: "Create bundle";
     in property <bool> busy: false;
+    in property <bool> loading: false;
     in property <length> manifest-scroll-offset: 0px;
     in property <length> manifest-content-height: 0px;
     in property <length> destination-scroll-offset: 0px;
@@ -138,11 +139,11 @@ export component FFDiagnosticsPanel inherits Rectangle {
             height: 32px;
             alignment: end;
 
-            FFButton {
+            bundle-primary := FFButton {
                 kind: "primary";
                 label: root.primary-label;
                 icon-source: root.download-icon;
-                enabled: !root.busy;
+                enabled: !root.busy && !root.loading;
                 clicked => { root.primary-clicked(); }
             }
         }

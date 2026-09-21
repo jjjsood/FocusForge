@@ -178,6 +178,7 @@ pub fn push_diagnostics_view(app: &AppWindow, controller: &Arc<Mutex<AppControll
     app.set_diagnostics_message(view.message.into());
     app.set_diagnostics_primary_label(view.primary_label.into());
     app.set_diagnostics_busy(view.busy);
+    app.set_diagnostics_loading(view.loading);
     app.set_diagnostics_manifest_scroll_offset(view.manifest_scroll_offset);
     app.set_diagnostics_manifest_content_height(view.manifest_content_height);
     app.set_diagnostics_destination_scroll_offset(view.destination_scroll_offset);
@@ -237,6 +238,18 @@ pub fn install(app: &AppWindow) -> Installed {
                 // diagnostics mutation does.
                 if let ShellEvent::DiagnosticsWriteFinished(status) = event {
                     controller.lock().unwrap().finish_bundle_write(status);
+                    push_diagnostics_view(&app, &controller);
+                    return;
+                }
+                // A scan's outcome updates the controller's stored manifest
+                // first, the same way a write's outcome does above, then
+                // rebuilds the view -- the one place `diagnostics_view`
+                // stops reporting `loading`.
+                if let ShellEvent::DiagnosticsScanFinished { generation, scan } = event {
+                    controller
+                        .lock()
+                        .unwrap()
+                        .finish_manifest_scan(generation, scan);
                     push_diagnostics_view(&app, &controller);
                     return;
                 }
@@ -440,7 +453,10 @@ pub fn install(app: &AppWindow) -> Installed {
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move |include| {
-            controller.lock().unwrap().set_include_minidumps(include);
+            // Detached: the rescan's own outcome reaches the window through
+            // the sink, the same way `on_diagnostics_primary_clicked`'s
+            // write does below.
+            let _ = controller.lock().unwrap().set_include_minidumps(include);
             if let Some(app) = app_weak.upgrade() {
                 push_diagnostics_view(&app, &controller);
             }
@@ -613,5 +629,7 @@ fn perform(app: &AppWindow, event: ShellEvent) {
         // in `install` handles this variant itself, since it needs the
         // controller lock this function does not carry.
         ShellEvent::DiagnosticsWriteFinished(_) => {}
+        // Intercepted the same way, for the same reason.
+        ShellEvent::DiagnosticsScanFinished { .. } => {}
     }
 }

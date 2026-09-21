@@ -301,6 +301,32 @@ fn install_recording_sink(controller: &mut AppController) -> Arc<Mutex<Vec<Shell
     events
 }
 
+/// Runs `controller.start_manifest_scan()`, joins it, and applies every
+/// `DiagnosticsScanFinished` event the sink recorded since the call started
+/// -- there may be more than one when a scan started elsewhere (e.g. by
+/// `set_include_minidumps`) is still in flight, but `finish_manifest_scan`'s
+/// own generation guard means only the one this call started ever lands in
+/// the controller's stored state. Asserts that one was applied.
+fn run_scan(controller: &mut AppController, events: &Arc<Mutex<Vec<ShellEvent>>>) {
+    let before = events.lock().unwrap().len();
+    controller.start_manifest_scan().join().unwrap();
+    let got = events.lock().unwrap()[before..].to_vec();
+    assert!(
+        got.iter()
+            .any(|e| matches!(e, ShellEvent::DiagnosticsScanFinished { .. })),
+        "expected at least one DiagnosticsScanFinished event, got {got:?}"
+    );
+    for event in got {
+        if let ShellEvent::DiagnosticsScanFinished { generation, scan } = event {
+            controller.finish_manifest_scan(generation, scan);
+        }
+    }
+    assert!(
+        !controller.diagnostics_view().loading,
+        "the scan this call started must match the controller's current generation"
+    );
+}
+
 #[test]
 fn diagnostics_bundle_manifest() {
     let seeded_root = tempfile::tempdir().unwrap();
@@ -312,8 +338,16 @@ fn diagnostics_bundle_manifest() {
     for (data_dir, expect_note) in [(&seeded, false), (&empty, true)] {
         for include_minidumps in [false, true] {
             let mut controller = AppController::new();
+            let events = install_recording_sink(&mut controller);
             controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
-            controller.set_include_minidumps(include_minidumps);
+            // Joined so its own scan report has already landed before
+            // `run_scan` takes its "since here" snapshot below -- otherwise
+            // a straggling report can land in an unrelated later window.
+            controller
+                .set_include_minidumps(include_minidumps)
+                .join()
+                .unwrap();
+            run_scan(&mut controller, &events);
             let view = controller.diagnostics_view();
 
             let reference = focusforge_diagnostics::bundle::manifest(
@@ -369,7 +403,14 @@ fn diagnostics_bundle_write() {
         let mut controller = AppController::new();
         let events = install_recording_sink(&mut controller);
         controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
-        controller.set_include_minidumps(include_minidumps);
+        // Joined for the same reason as `diagnostics_bundle_manifest`: its
+        // own scan must land before `run_scan`'s window, or `run_write`'s
+        // later one can catch the straggler instead.
+        controller
+            .set_include_minidumps(include_minidumps)
+            .join()
+            .unwrap();
+        run_scan(&mut controller, &events);
         let view = controller.diagnostics_view();
         let out = root.path().join(format!("bundle-{include_minidumps}.zip"));
         controller.set_destination(out.to_str().unwrap());
@@ -411,6 +452,7 @@ fn diagnostics_bundle_write_repeats_without_an_extra_click() {
 
     let status = run_write(&mut controller, &events);
     assert_eq!(status, DiagnosticsStatus::Written);
+    run_scan(&mut controller, &events);
     let view = controller.diagnostics_view();
     assert_eq!(
         view.primary_label, "Create bundle",
@@ -544,6 +586,218 @@ fn diagnostics_bundle_marks_reported() {
         DiagnosticsStatus::Written,
         "an unwritable crash directory must not turn the write into a failure"
     );
+}
+
+// --- Diagnostics: the background scan --------------------------------
+
+/// Names of `bundle::manifest`'s entries for `data_dir`, sorted the way the
+/// manifest itself already sorts the generated four and the collected rest.
+fn reference_entry_names(data_dir: &Path, include_minidumps: bool) -> Vec<String> {
+    focusforge_diagnostics::bundle::manifest(&focusforge_diagnostics::bundle::Options {
+        data_dir: Some(data_dir.to_path_buf()),
+        config_dir: None,
+        include_minidumps,
+    })
+    .entries
+    .iter()
+    .map(|e| e.name.clone())
+    .collect()
+}
+
+#[test]
+fn diagnostics_scan_off_the_main_thread() {
+    let seeded_root = tempfile::tempdir().unwrap();
+    let seeded = common::seed_large_diagnostics_dir(seeded_root.path(), 20 * 1024 * 1024);
+    let empty_root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(empty_root.path().join("focusforge")).unwrap();
+    let empty = empty_root.path().join("focusforge");
+
+    for data_dir in [&seeded, &empty] {
+        let mut controller = AppController::new();
+        let start = std::time::Instant::now();
+        controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+        let view = controller.diagnostics_view();
+        let elapsed = start.elapsed();
+        assert!(
+            view.entries.is_empty(),
+            "the first view must carry no rows before any scan has completed, got {:?}",
+            view.entries
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "set_diagnostics_dirs plus diagnostics_view took {elapsed:?} over {}",
+            data_dir.display()
+        );
+    }
+
+    let reference = reference_entry_names(&seeded, false);
+    assert!(
+        !reference.is_empty(),
+        "bundle::manifest itself must yield entries for the seeded directory"
+    );
+}
+
+#[test]
+fn diagnostics_scan_reports_through_the_sink() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = seed_diagnostics_dir(root.path());
+
+    for include_minidumps in [false, true] {
+        let mut controller = AppController::new();
+        controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+        // Sets the choice and lets its own scan finish unobserved, so the
+        // sink installed below records only the scan this test starts.
+        controller
+            .set_include_minidumps(include_minidumps)
+            .join()
+            .unwrap();
+
+        let events = install_recording_sink(&mut controller);
+        controller.start_manifest_scan().join().unwrap();
+        let got = events.lock().unwrap().clone();
+        let [ShellEvent::DiagnosticsScanFinished { generation, scan }] = got.as_slice() else {
+            panic!("expected exactly one DiagnosticsScanFinished event, got {got:?}");
+        };
+        controller.finish_manifest_scan(*generation, scan.clone());
+        let view = controller.diagnostics_view();
+
+        let reference =
+            focusforge_diagnostics::bundle::manifest(&focusforge_diagnostics::bundle::Options {
+                data_dir: Some(data_dir.clone()),
+                config_dir: None,
+                include_minidumps,
+            });
+        assert_eq!(
+            view.entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>(),
+            reference
+                .entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>(),
+            "row order/names must equal bundle::manifest's, include_minidumps={include_minidumps}"
+        );
+        for (row, entry) in view.entries.iter().zip(reference.entries.iter()) {
+            assert_eq!(
+                row.not_redacted, !entry.redacted,
+                "{}: not-redacted mark must match the manifest entry",
+                row.name
+            );
+        }
+    }
+}
+
+#[test]
+fn diagnostics_rescan_on_minidump_choice() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = seed_diagnostics_dir(root.path());
+
+    let mut controller = AppController::new();
+    let events = install_recording_sink(&mut controller);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    run_scan(&mut controller, &events);
+    assert!(
+        !controller.diagnostics_view().entries.is_empty(),
+        "the seeded directory must show rows once the initial scan lands"
+    );
+
+    for include_minidumps in [true, false] {
+        let before = events.lock().unwrap().len();
+        let handle = controller.set_include_minidumps(include_minidumps);
+
+        let mid_view = controller.diagnostics_view();
+        assert!(
+            mid_view.loading,
+            "the view between the toggle and its report must be loading"
+        );
+        assert!(
+            mid_view.entries.is_empty(),
+            "the view between the toggle and its report must carry no rows, not the previous list"
+        );
+
+        handle.join().unwrap();
+        let got = events.lock().unwrap()[before..].to_vec();
+        let [ShellEvent::DiagnosticsScanFinished { generation, scan }] = got.as_slice() else {
+            panic!("expected exactly one DiagnosticsScanFinished event, got {got:?}");
+        };
+        controller.finish_manifest_scan(*generation, scan.clone());
+
+        let view = controller.diagnostics_view();
+        let reference = reference_entry_names(&data_dir, include_minidumps);
+        assert_eq!(
+            view.entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>(),
+            reference,
+            "the rescanned rows must equal bundle::manifest for include_minidumps={include_minidumps}"
+        );
+    }
+}
+
+#[test]
+fn diagnostics_scan_unreadable_dir() {
+    let root = tempfile::tempdir().unwrap();
+    let blocked_parent = root.path().join("blocked");
+    fs::write(&blocked_parent, b"not a directory").unwrap();
+    let unreadable = blocked_parent.join("focusforge");
+
+    let mut controller = AppController::new();
+    let events = install_recording_sink(&mut controller);
+    controller.set_diagnostics_dirs(Some(unreadable), None);
+    run_scan(&mut controller, &events);
+    let view = controller.diagnostics_view();
+
+    assert!(
+        !view.loading,
+        "an unreadable data directory must still report a completed scan"
+    );
+    assert_eq!(
+        view.entries
+            .iter()
+            .map(|e| e.name.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            "adapter.json",
+            "configuration.json",
+            "system.json",
+            "version.json"
+        ],
+        "an unreadable data directory must still surface the generated entries"
+    );
+    assert_eq!(
+        view.note.as_deref(),
+        Some("No logs or crash evidence were found.")
+    );
+}
+
+#[test]
+fn diagnostics_scan_outlives_its_controller() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = seed_diagnostics_dir(root.path());
+
+    let mut controller = AppController::new();
+    let events = install_recording_sink(&mut controller);
+    controller.set_diagnostics_dirs(Some(data_dir), None);
+    let handle = controller.start_manifest_scan();
+    drop(controller);
+
+    handle
+        .join()
+        .expect("the scan thread must not panic once its controller is gone");
+    let got = events.lock().unwrap().clone();
+    assert!(
+        got.len() <= 1,
+        "the sink must hold at most the one scan event, never a second, got {got:?}"
+    );
+    if let [event] = got.as_slice() {
+        assert!(
+            matches!(event, ShellEvent::DiagnosticsScanFinished { .. }),
+            "the one recorded event must be the scan's own, got {event:?}"
+        );
+    }
 }
 
 #[test]

@@ -21,8 +21,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::diagnostics::{
-    DiagnosticsEntryView, DiagnosticsStatus, DiagnosticsView, clamp_manifest_scroll,
-    manifest_content_height, size_text,
+    DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
+    DiagnosticsView, clamp_manifest_scroll, manifest_content_height, size_text,
 };
 use crate::input_config::Provenance;
 use crate::input_map::{
@@ -93,6 +93,13 @@ pub enum ShellEvent {
     /// Raised by [`AppController::start_bundle_write`]'s background thread
     /// once the write attempt has settled, carrying its outcome.
     DiagnosticsWriteFinished(DiagnosticsStatus),
+    /// Raised by [`AppController::start_manifest_scan`]'s background thread
+    /// once a scan has settled, carrying the generation it started from and
+    /// the scan itself.
+    DiagnosticsScanFinished {
+        generation: u64,
+        scan: DiagnosticsScan,
+    },
 }
 
 /// One live drag: which action it started and the last position seen, so
@@ -154,6 +161,13 @@ struct DiagnosticsState {
     /// by [`AppController::scan_crash_notice`]; nothing re-scans mid-session.
     crash_notice_ids: Vec<String>,
     crash_notice_visible: bool,
+    /// Bumped by every [`AppController::start_manifest_scan`] call, so a
+    /// report from a superseded scan can be told apart from the current one.
+    scan_generation: u64,
+    /// The last manifest scan to report, tagged with the generation it came
+    /// from. `None` until the first scan completes; a stored generation
+    /// behind [`Self::scan_generation`] means a rescan is in flight.
+    scan: Option<(u64, DiagnosticsScan)>,
 }
 
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
@@ -803,8 +817,11 @@ impl AppController {
         self.set_diagnostics_destination(PathBuf::from(text));
     }
 
-    pub fn set_include_minidumps(&mut self, include: bool) {
+    /// Sets the choice and starts the rescan its new value needs, so no
+    /// caller can change it without one.
+    pub fn set_include_minidumps(&mut self, include: bool) -> std::thread::JoinHandle<()> {
         self.state.diagnostics.include_minidumps = include;
+        self.start_manifest_scan()
     }
 
     /// Where a write attempt currently stands -- what the footer's one
@@ -871,6 +888,53 @@ impl AppController {
         })
     }
 
+    /// Starts a manifest scan in the background: bumps the generation so a
+    /// superseded report is discarded, then on a spawned thread builds the
+    /// manifest and resolves every entry's byte size (`text.len()` /
+    /// `fs::metadata`) into a [`DiagnosticsScan`] snapshot. Reports through
+    /// the cloned sink; no directory I/O happens on the main thread.
+    pub fn start_manifest_scan(&mut self) -> std::thread::JoinHandle<()> {
+        self.state.diagnostics.scan_generation += 1;
+        let generation = self.state.diagnostics.scan_generation;
+        let sink = self.sink.clone();
+        let options = focusforge_diagnostics::bundle::Options {
+            data_dir: self.state.diagnostics.data_dir.clone(),
+            config_dir: self.state.diagnostics.config_dir.clone(),
+            include_minidumps: self.state.diagnostics.include_minidumps,
+        };
+
+        std::thread::spawn(move || {
+            let manifest = focusforge_diagnostics::bundle::manifest(&options);
+            let entries: Vec<DiagnosticsScanEntry> = manifest
+                .entries
+                .iter()
+                .map(|entry| {
+                    let bytes = match &entry.source {
+                        focusforge_diagnostics::bundle::EntrySource::Generated(text) => {
+                            text.len() as u64
+                        }
+                        focusforge_diagnostics::bundle::EntrySource::File(path) => {
+                            fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+                        }
+                    };
+                    DiagnosticsScanEntry {
+                        name: entry.name.clone(),
+                        bytes,
+                        redacted: entry.redacted,
+                    }
+                })
+                .collect();
+            let scan = DiagnosticsScan {
+                entries,
+                has_logs: manifest.has_logs(),
+                has_crash_evidence: manifest.has_crash_evidence(),
+            };
+            if let Some(sink) = sink {
+                sink(ShellEvent::DiagnosticsScanFinished { generation, scan });
+            }
+        })
+    }
+
     /// Stores a background write's outcome -- called once
     /// [`ShellEvent::DiagnosticsWriteFinished`] reaches the event loop,
     /// since the thread that produced it holds no lock on `self`.
@@ -894,6 +958,18 @@ impl AppController {
         // only ever bundles never sees it return for that evidence.
         self.state.diagnostics.crash_notice_ids.clear();
         self.state.diagnostics.crash_notice_visible = false;
+    }
+
+    /// Stores a background scan's outcome, called once
+    /// [`ShellEvent::DiagnosticsScanFinished`] arrives. Drops a report whose
+    /// generation a later rescan has already superseded; otherwise refreshes
+    /// the cached content height and scroll clamp via [`Self::diagnostics_view`].
+    pub fn finish_manifest_scan(&mut self, generation: u64, scan: DiagnosticsScan) {
+        if generation != self.state.diagnostics.scan_generation {
+            return;
+        }
+        self.state.diagnostics.scan = Some((generation, scan));
+        self.diagnostics_view();
     }
 
     /// Snapshots `data_dir`'s unreported crash evidence and shows the notice
@@ -1039,8 +1115,8 @@ impl AppController {
     }
 
     /// The manifest list's current scroll offset -- cheap to read after any
-    /// of the methods above, since none of them touch the manifest itself
-    /// (unlike [`Self::diagnostics_view`], which re-reads it from disk).
+    /// of the methods above, since none of them touch the stored scan
+    /// (unlike [`Self::diagnostics_view`], which re-clamps against it).
     pub fn manifest_scroll_offset(&self) -> f32 {
         self.state.diagnostics.manifest_scroll_y
     }
@@ -1064,45 +1140,50 @@ impl AppController {
         self.state.diagnostics.destination_scroll_x
     }
 
-    /// Builds the diagnostics panel's whole view fresh from
-    /// [`focusforge_diagnostics::bundle::manifest`] and the destination
-    /// state above -- the panel carries no state of its own. Also refreshes
-    /// the cached manifest content height the scrollbar methods above read,
-    /// re-clamping the scroll offset against it.
+    /// Builds the diagnostics panel's whole view from the last completed
+    /// scan and the destination state above -- a pure read that touches no
+    /// directory, so it costs nothing on the main thread. Yields no rows and
+    /// the loading note while no scan has reported for the current
+    /// generation. Also refreshes the cached content height the scrollbar
+    /// methods read, re-clamping the scroll offset against it.
     pub fn diagnostics_view(&mut self) -> DiagnosticsView {
-        let options = focusforge_diagnostics::bundle::Options {
-            data_dir: self.state.diagnostics.data_dir.clone(),
-            config_dir: self.state.diagnostics.config_dir.clone(),
-            include_minidumps: self.state.diagnostics.include_minidumps,
+        let current_generation = self.state.diagnostics.scan_generation;
+        let loading = !matches!(
+            &self.state.diagnostics.scan,
+            Some((generation, _)) if *generation == current_generation
+        );
+
+        let (entries, note): (Vec<DiagnosticsEntryView>, Option<String>) = if loading {
+            (Vec::new(), Some("Collecting…".to_string()))
+        } else {
+            let scan = &self
+                .state
+                .diagnostics
+                .scan
+                .as_ref()
+                .expect("loading is false only when a scan is stored")
+                .1;
+            let note = (!scan.has_logs && !scan.has_crash_evidence)
+                .then(|| "No logs or crash evidence were found.".to_string());
+            let entries = scan
+                .entries
+                .iter()
+                .map(|entry| {
+                    let not_redacted = !entry.redacted;
+                    let value = if not_redacted {
+                        format!("{} · not redacted", size_text(entry.bytes))
+                    } else {
+                        size_text(entry.bytes)
+                    };
+                    DiagnosticsEntryView {
+                        name: entry.name.clone(),
+                        value,
+                        not_redacted,
+                    }
+                })
+                .collect();
+            (entries, note)
         };
-        let manifest = focusforge_diagnostics::bundle::manifest(&options);
-        let note = (!manifest.has_logs() && !manifest.has_crash_evidence())
-            .then(|| "No logs or crash evidence were found.".to_string());
-        let entries: Vec<DiagnosticsEntryView> = manifest
-            .entries
-            .iter()
-            .map(|entry| {
-                let bytes = match &entry.source {
-                    focusforge_diagnostics::bundle::EntrySource::Generated(text) => {
-                        text.len() as u64
-                    }
-                    focusforge_diagnostics::bundle::EntrySource::File(path) => {
-                        fs::metadata(path).map(|m| m.len()).unwrap_or(0)
-                    }
-                };
-                let not_redacted = !entry.redacted;
-                let value = if not_redacted {
-                    format!("{} · not redacted", size_text(bytes))
-                } else {
-                    size_text(bytes)
-                };
-                DiagnosticsEntryView {
-                    name: entry.name.clone(),
-                    value,
-                    not_redacted,
-                }
-            })
-            .collect();
 
         let (primary_label, message) = match self.state.diagnostics.status {
             DiagnosticsStatus::Idle => ("Create bundle", String::new()),
@@ -1133,6 +1214,7 @@ impl AppController {
             message,
             primary_label: primary_label.to_string(),
             busy: self.state.diagnostics.status == DiagnosticsStatus::Writing,
+            loading,
             manifest_scroll_offset: self.state.diagnostics.manifest_scroll_y,
             manifest_content_height: content_height,
             destination_scroll_offset: self.state.diagnostics.destination_scroll_x,

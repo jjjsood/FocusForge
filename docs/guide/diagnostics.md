@@ -81,9 +81,13 @@ current directory), and `--force` overwrites a path that already exists.
 
 Settings → Diagnostics shows the same file list `focusforge-cli diagnostics`
 prints for your data directory, each row's size in kilobytes below a
-megabyte and one decimal above. "Include minidumps" is off by default; switch
-it on to add them to the bundle, and every minidump row is marked not
-redacted in the list, with a warning line explaining why.
+megabyte and one decimal above. The list gathers that in the background, so
+it opens showing "Collecting…" rather than blocking the window, and the
+export button stays unavailable until it finishes; the minidump toggle and
+destination field stay editable throughout. "Include minidumps" is off by
+default; switch it on to add them to the bundle -- doing so re-gathers the
+list, since which files it would collect just changed -- and every minidump
+row is marked not redacted in the list, with a warning line explaining why.
 
 The destination field defaults to a dated ZIP beside your logs, and is
 editable. Creating the bundle checks the path first: a destination that

@@ -264,8 +264,9 @@ fn install_input_table(
     }
 }
 
-/// Feeds the diagnostics panel its directories and pushes its first view
-/// into the window.
+/// Sets the diagnostics directories, starts a scan for them on a background
+/// thread, and pushes the panel's first view -- which carries no rows yet,
+/// since nothing on this path reads either directory itself.
 fn install_diagnostics(
     controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
     app: &AppWindow,
@@ -274,6 +275,7 @@ fn install_diagnostics(
         focusforge_diagnostics::data_dir_from_env(),
         focusforge_diagnostics::config_dir_from_env(),
     );
+    let _ = controller.lock().unwrap().start_manifest_scan();
     focusforge_gui::bridge::push_diagnostics_view(app, controller);
 }
 
