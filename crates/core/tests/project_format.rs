@@ -464,8 +464,8 @@ fn sources_are_referenced_not_embedded() {
         "container ({container_len} bytes) is not smaller than one frame ({frame_len} bytes)"
     );
 
-    // The fingerprint is a real content hash over the frame list, not a
-    // cheap header-only one.
+    // The fingerprint is a real content hash over the frame list, not the
+    // resume ledger's cheap header-only one.
     assert_eq!(project.manifest().stack_fingerprint.len(), 64);
     assert_eq!(
         project.manifest().stack_fingerprint,
@@ -556,7 +556,7 @@ fn a_moved_project_reports_its_relative_sources_as_unresolved() {
 #[test]
 fn a_tampered_blob_is_refused_on_read() {
     let (_dir, project_path) = sealed("project_format_tampered");
-    let tampered = project_path.with_extension("tampered.ffproj");
+    let tampered = project_path.with_extension("tampered.ffp");
     let composite_blob = Project::open(&project_path)
         .unwrap()
         .plane(Plane::Composite)
@@ -634,8 +634,8 @@ fn the_container_is_reproducible() {
         project::seal(request(&path, &composite, &zmap, &sources, &values)).unwrap();
         std::fs::read(&path).unwrap()
     };
-    let a = seal_one("a.ffproj");
-    let b = seal_one("b.ffproj");
+    let a = seal_one("a.ffp");
+    let b = seal_one("b.ffp");
     assert_eq!(
         a.len(),
         b.len(),
@@ -645,8 +645,8 @@ fn the_container_is_reproducible() {
     // `created_at` is the one field that legitimately differs, and both
     // copies of it are the only bytes allowed to. Re-sealing with a pinned
     // clock is what makes the comparison exact.
-    let c = dir.join("c.ffproj");
-    let d = dir.join("d.ffproj");
+    let c = dir.join("c.ffp");
+    let d = dir.join("d.ffp");
     project::seal_at(
         request(&c, &composite, &zmap, &sources, &values),
         1_700_000_000,
@@ -667,7 +667,7 @@ fn the_container_is_reproducible() {
 #[test]
 fn a_future_format_version_is_refused_by_name() {
     let (_dir, project_path) = sealed("project_format_future_version");
-    let future = project_path.with_extension("future.ffproj");
+    let future = project_path.with_extension("future.ffp");
     rewrite_entry(&project_path, &future, "manifest.json", |bytes| {
         let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
         value["format_version"] = serde_json::json!(FORMAT_VERSION + 1);
@@ -690,10 +690,6 @@ fn a_future_format_version_is_refused_by_name() {
 #[test]
 #[ignore = "builds an 89.6 MB Z-Map; minutes, not seconds"]
 fn zmap_blob_compression_over_the_reference_scale() {
-    let Some(_dir) = common::sibling_data_root() else {
-        eprintln!("skipping: harness not reachable from this checkout");
-        return;
-    };
     let dir = tmp_dir("project_format_reference_zmap");
     let (width, height, frames) = (8192u32, 5464u32, 61u32);
     let path = dir.join("zmap.tif");

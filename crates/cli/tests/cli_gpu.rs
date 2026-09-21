@@ -238,8 +238,8 @@ fn stack_gpu_matches_stack_no_gpu() {
         serde_json::from_str(&cpu.stdout).expect("cpu run --json must parse");
     assert_eq!(cpu_report["backend"], "cpu", "report: {cpu_report}");
 
-    let gpu_composite = export_composite(&cwd, &gpu_dir.join("mantis-512.ffproj"));
-    let cpu_composite = export_composite(&cwd, &cpu_dir.join("mantis-512.ffproj"));
+    let gpu_composite = export_composite(&cwd, &gpu_dir.join("mantis-512.ffp"));
+    let cpu_composite = export_composite(&cwd, &cpu_dir.join("mantis-512.ffp"));
     let (gpu_samples, gw, gh, gspp) = read_whole(&gpu_composite);
     let (cpu_samples, cw, ch, cspp) = read_whole(&cpu_composite);
     assert_eq!(
@@ -347,7 +347,7 @@ fn align_write_warped_gpu_matches_no_gpu() {
 fn auto_falls_back_without_adapter() {
     let cwd = common::tmp_dir("cli_gpu_auto_falls_back_cwd");
     let dir = common::tmp_dir("cli_gpu_auto_falls_back");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let Some(result) = run_with_no_adapter(
         &cwd,
         &[
@@ -392,7 +392,7 @@ fn auto_falls_back_without_adapter() {
 fn fallback_emits_a_message() {
     let cwd = common::tmp_dir("cli_gpu_fallback_emits_a_message_cwd");
     let dir = common::tmp_dir("cli_gpu_fallback_emits_a_message");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let Some(result) = run_with_no_adapter(
         &cwd,
         &[
@@ -423,7 +423,7 @@ fn fallback_emits_a_message() {
 fn no_gpu_flag_forces_cpu_even_with_adapter() {
     let cwd = common::tmp_dir("cli_gpu_no_gpu_forces_cpu_cwd");
     let dir = common::tmp_dir("cli_gpu_no_gpu_forces_cpu");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let result = run(
         &cwd,
         &[
@@ -824,8 +824,8 @@ fn device_lost_falls_back() {
     let cpu = run_owned(&cwd, &device_loss_stack_args(&cpu_dir, &["--no-gpu"]));
     assert!(cpu.success, "cpu run stderr: {}", cpu.stderr);
 
-    let (gpu_composite, gpu_zmap) = export_both(&cwd, &gpu_dir.join("mantis-512.ffproj"));
-    let (cpu_composite, cpu_zmap) = export_both(&cwd, &cpu_dir.join("mantis-512.ffproj"));
+    let (gpu_composite, gpu_zmap) = export_both(&cwd, &gpu_dir.join("mantis-512.ffp"));
+    let (cpu_composite, cpu_zmap) = export_both(&cwd, &cpu_dir.join("mantis-512.ffp"));
 
     let (gpu_samples, gpu_w, gpu_h, gpu_spp) = read_whole(&gpu_composite);
     let (cpu_samples, cpu_w, cpu_h, cpu_spp) = read_whole(&cpu_composite);

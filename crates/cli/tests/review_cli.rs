@@ -683,7 +683,7 @@ fn an_unopenable_project_is_a_failed_record() {
         2,
         None,
     );
-    let truncated = dir.join("truncated.ffproj");
+    let truncated = dir.join("truncated.ffp");
     let bytes = std::fs::read(&good_project).unwrap();
     std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
 
@@ -859,7 +859,6 @@ fn link_reference_frames(dir: &Path, stack_dir: &Path) -> PathBuf {
 #[ignore = "reads the 16 GB reference stack"]
 fn review_of_a_reference_run() {
     let Some(stack_dir) = common::reference_stack_dir() else {
-        eprintln!("skip: the reference stack is not available");
         return;
     };
 

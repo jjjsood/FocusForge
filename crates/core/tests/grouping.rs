@@ -193,6 +193,13 @@ fn no_frames_in_a_subdirectory_is_a_negative_not_an_error() {
     let proposal = propose(&root).expect("a frameless subdirectory must not abort the walk");
     assert_eq!(proposal.groups.len(), 1);
     assert_eq!(proposal.groups[0].dir, root.join("subject"));
+    let mut skipped = proposal.skipped.clone();
+    skipped.sort();
+    assert_eq!(
+        skipped,
+        vec![root.join("export"), root.join("thumbnails")],
+        "both frameless subdirectories must be reported, not swallowed"
+    );
 }
 
 #[test]

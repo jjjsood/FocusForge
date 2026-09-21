@@ -20,14 +20,14 @@ use focusforge_gui::{AppController, ShellEvent, ShellMode, input_config};
 
 const NONE: Modifiers = Modifiers::NONE;
 
-type EventSink = Box<dyn Fn(ShellEvent) + Send + Sync>;
+type EventSink = Arc<dyn Fn(ShellEvent) + Send + Sync>;
 
 fn sink() -> (Arc<Mutex<Vec<ShellEvent>>>, EventSink) {
     let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_events = events.clone();
     (
         events,
-        Box::new(move |event| sink_events.lock().unwrap().push(event)),
+        Arc::new(move |event| sink_events.lock().unwrap().push(event)),
     )
 }
 
@@ -773,7 +773,7 @@ fn unimplemented_actions_are_named_not_silent() {
     // must no longer be recorded, the remaining seven still must be, by
     // name.
     let mut stacking = AppController::new();
-    stacking.set_sink(Box::new(|_| {}));
+    stacking.set_sink(Arc::new(|_| {}));
     stacking.wheel(0.0, 5.0, 0.0, 0.0, NONE); // ZoomAtCursor -- implemented
     stacking.wheel(0.0, 5.0, 0.0, 0.0, Modifiers { ctrl: true, ..NONE }); // StepSourceFrame
     stacking.wheel(
@@ -798,7 +798,7 @@ fn unimplemented_actions_are_named_not_silent() {
     ); // PickSourceUnderPointer
 
     let mut editor = AppController::new_with_mode_for_test(ShellMode::Editor);
-    editor.set_sink(Box::new(|_| {}));
+    editor.set_sink(Arc::new(|_| {}));
     editor.wheel(
         0.0,
         5.0,
@@ -851,12 +851,30 @@ fn unimplemented_actions_are_named_not_silent() {
 // One table, one dispatch point.
 // ---------------------------------------------------------------------
 
+/// Files whose own widget owns a raw gesture callback rather than routing
+/// through the canvas's rebindable zoom/pan/drag gesture table: the canvas
+/// itself, plus every scrollable panel and drag-based control (the slider
+/// and the scrollbar), each forwarding its callback body in one line to
+/// `AppController` and interpreting nothing in `.slint`.
+const RAW_GESTURE_CALLBACK_EXCEPTIONS: &[&str] = &[
+    "canvas.slint",
+    "ff_slider.slint",
+    "ff_scrollbar.slint",
+    "settings_panel.slint",
+    "images_panel.slint",
+    "ff_image_row.slint",
+    "gallery.slint",
+];
+
 #[test]
 fn no_handler_outside_the_dispatch_point() {
     let mut violations = Vec::new();
     for path in common::find_slint_files(&common::ui_dir()) {
-        let is_canvas = path.file_name().and_then(|n| n.to_str()) == Some("canvas.slint");
-        if is_canvas {
+        let is_exempt = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| RAW_GESTURE_CALLBACK_EXCEPTIONS.contains(&name));
+        if is_exempt {
             continue;
         }
         let contents = fs::read_to_string(&path).unwrap();

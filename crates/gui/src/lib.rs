@@ -28,9 +28,17 @@ pub use controller::*;
 /// reaches `AppController` above.
 pub mod canvas;
 
-/// A stub project format: `--open <dir>`
-/// resolves `<dir>/golden/laplacian.tif` + `<dir>/golden/laplacian-zmap.tif`.
-mod project_stub;
+/// The entry path: classifying a picker result, a drop, or `--open`'s path
+/// into a folder, a set of dropped frames, or a saved project, and turning
+/// that into per-tab project state. No `use slint::`
+/// anywhere in it -- the one module in the crate naming the core algorithm
+/// crate's grouping and project modules. `pub` so `tests/entry.rs` and
+/// `src/main.rs`/`src/picker.rs`/`src/bridge.rs` reach its types directly.
+pub mod entry;
+
+/// The native folder/file picker -- blocking, never `AsyncFileDialog`.
+/// `pub` so `src/bridge.rs` can call it.
+pub mod picker;
 
 /// The input table as data -- no `use slint::`, no `use wgpu::`. `pub` so
 /// `tests/input_map.rs` reaches its types directly.
@@ -46,6 +54,12 @@ pub mod input_config;
 /// `src/bridge.rs`/`src/main.rs` reach its types directly.
 pub mod viewport;
 
+/// The `Settings` dock panel model, generated from `ParamDesc` alone -- no
+/// `use slint::` anywhere in it. `pub` so `tests/settings_panel.rs` reaches
+/// its types directly, the same way `tests/tab_scroll.rs` reaches
+/// `crate::controller`'s mirrored geometry.
+pub mod settings_panel;
+
 /// The wgpu half of the canvas: texture creation and
 /// `slint::Image::try_from`, the only module in the crate naming `wgpu` or
 /// `slint::wgpu_29`. `pub` so `src/main.rs` can drive it
@@ -60,3 +74,24 @@ pub mod bridge;
 /// Writes a `Window::take_snapshot()` buffer to a PNG file, for
 /// `--screenshot`.
 pub mod screenshot;
+
+/// The window's own fuse worker, running a stack on a background thread
+/// through the same driver `focusforge-cli` uses. `pub` so `tests/job.rs`
+/// reaches its types directly.
+pub mod job;
+
+/// The `Images` dock panel model, and the frame-set-change warnings' copy --
+/// no `use slint::` anywhere in it. `pub` so `tests/images.rs` reaches its
+/// types directly.
+pub mod images;
+
+/// The projects overlay's own vocabulary -- a failure card's fixed copy per
+/// kind and the gallery's grid arithmetic. No `use slint::` anywhere in it.
+/// `pub` so `tests/projects_overlay.rs` and `src/bridge.rs` reach its types
+/// directly.
+pub mod overlay;
+
+/// The `Recent` list's own file format, mirroring `crate::input_config`. No
+/// `use slint::` anywhere in it. `pub` so `src/main.rs` and
+/// `tests/projects_overlay.rs` reach it directly.
+pub mod recent;

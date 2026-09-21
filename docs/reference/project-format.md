@@ -1,10 +1,10 @@
-# The project container (`.ffproj`)
+# The project container (`.ffp`)
 
-`focusforge-cli stack` writes one `.ffproj` file per detected stack instead
+`focusforge-cli stack` writes one `.ffp` file per detected stack instead
 of an image. It is a zip archive holding exactly three kinds of entry:
 
 ```
-$ unzip -l mantis-512.ffproj
+$ unzip -l mantis-512.ffp
   Length      Date    Time    Name
 ---------  ---------- -----   ----
      3804  1980-01-01 00:00   manifest.json

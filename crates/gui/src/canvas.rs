@@ -9,26 +9,11 @@
 //! `crates/gui/src/gpu_canvas.rs`, the only module in the crate naming
 //! `wgpu` or `slint::wgpu_29`.
 
-use std::path::{Path, PathBuf};
-
-use focusforge_core::tile::Rect;
-
-use crate::controller::AppController;
-use crate::project_stub::{ProjectStub, ProjectStubError};
-
 /// Which pane a piece of canvas state belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneSource {
     Composite,
     ZMap,
-}
-
-/// The visible region a pane uploads to the GPU: the fixture currently used
-/// fits entirely in view, so `rect` is the full extent; a viewport that
-/// scrolls past the fixture moves it and pays a re-upload per step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Viewport {
-    pub rect: Rect,
 }
 
 /// The display texture's size, the whole "allocated once, re-allocated only
@@ -52,14 +37,12 @@ pub fn needs_realloc(current: Option<TextureSpec>, wanted: TextureSpec) -> bool 
 /// as `TextureImportError::InvalidFormat` at `try_from`).
 pub const DISPLAY_FORMAT: &str = "Rgba8Unorm";
 
-/// What can go wrong opening a project or validating the display format,
-/// named rather than left as a panic or a stringly-typed error.
+/// What can go wrong validating the display format, or finding a loaded
+/// project's two panes at different sizes.
 #[derive(Debug, thiserror::Error)]
 pub enum CanvasError {
     #[error("unsupported display format {got:?}, only \"Rgba8Unorm\" is supported")]
     UnsupportedDisplayFormat { got: String },
-    #[error(transparent)]
-    Project(#[from] ProjectStubError),
     /// One viewport over two panes, enforced rather than assumed: a
     /// composite and a Z-Map of different
     /// sizes have no one rect a shared viewport could mean.
@@ -83,71 +66,12 @@ pub fn validate_display_format(name: &str) -> Result<(), CanvasError> {
     }
 }
 
-/// What `AppController` knows about the loaded project's canvas, once
-/// `AppController::open_project` has succeeded. `Default` so `ShellState`
-/// (`controller.rs`) can keep deriving it.
-#[derive(Debug, Clone, Default)]
-pub struct CanvasState {
-    pub(crate) project: Option<ProjectStub>,
-}
-
-impl AppController {
-    /// Opens `path` as a project directory (`crate::project_stub::ProjectStub`
-    /// -- a stub project format), naming a
-    /// missing composite or Z-Map file by name rather than a generic I/O
-    /// error, and refusing a composite/Z-Map size mismatch by name too
-    /// ("one viewport over two panes" is enforced, not
-    /// assumed). Sets the controller's image size and clears any prior
-    /// viewport; the next `set_pane_geometry` call fits it (`open_project`
-    /// is never handed a pane rect of its own).
-    pub fn open_project(&mut self, path: &Path) -> Result<(), CanvasError> {
-        let project = ProjectStub::open(path)?;
-        let composite = project.dimensions(PaneSource::Composite);
-        let zmap = project.dimensions(PaneSource::ZMap);
-        if composite != zmap {
-            return Err(CanvasError::PaneDimensionsDiffer { composite, zmap });
-        }
-        self.canvas_mut().project = Some(project);
-        self.set_project_image(crate::viewport::ImageSize {
-            width: composite.0,
-            height: composite.1,
-        });
+/// Refuses a composite/Z-Map size mismatch by name -- one viewport over
+/// two panes is enforced, not assumed.
+pub fn check_pane_dimensions(composite: (u32, u32), zmap: (u32, u32)) -> Result<(), CanvasError> {
+    if composite == zmap {
         Ok(())
-    }
-
-    /// The clamped visible rect the current viewport is showing for `pane`
-    pub fn viewport(&self, pane: PaneSource) -> Option<Viewport> {
-        let project = self.canvas().project.as_ref()?;
-        if let Some(draw) = self.pane_draw() {
-            let (x, y, width, height) = draw.src;
-            return Some(Viewport {
-                rect: Rect {
-                    x,
-                    y,
-                    width,
-                    height,
-                },
-            });
-        }
-        let (width, height) = project.dimensions(pane);
-        Some(Viewport {
-            rect: Rect {
-                x: 0,
-                y: 0,
-                width,
-                height,
-            },
-        })
-    }
-
-    /// The composite/Z-Map file paths a loaded project resolved, for
-    /// `crate::gpu_canvas` to read tiles from.
-    pub fn project_paths(&self) -> Option<(PathBuf, PathBuf)> {
-        self.canvas().project.as_ref().map(|p| {
-            (
-                p.composite_path().to_path_buf(),
-                p.zmap_path().to_path_buf(),
-            )
-        })
+    } else {
+        Err(CanvasError::PaneDimensionsDiffer { composite, zmap })
     }
 }

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Process-level coverage of what a `stack` run now writes: **a project, not
+//! Process-level coverage of what a `stack` run writes: **a project, not
 //! an image**.
 //!
 //! Every run here is over `fixtures/mantis-64` (8 frames at 64x64, a real
 //! `laplacian` fusion in milliseconds) or over a **copy** of it in
 //! `CARGO_TARGET_TMPDIR`. Never the committed fixture tree as an output
 //! directory: `tools/check-fixtures.sh` diffs the present file list against
-//! `MANIFEST.sha256`, so one stray `.ffproj` under `fixtures/` fails the
+//! `MANIFEST.sha256`, so one stray `.ffp` under `fixtures/` fails the
 //! gate.
 //!
 //! Every test isolates `.scratch/` with its own per-process temp directory and
@@ -34,11 +34,6 @@ struct CliOutput {
 }
 
 /// Runs the binary with `cwd` as its working directory.
-///
-/// Every test that actually completes a run uses its **own** directory, the
-/// discipline `job_cli.rs` already follows: `.scratch/resume` and
-/// `.scratch/projects` are resolved relative to the process's cwd, so tests
-/// sharing one cwd share one ledger store and race each other's cleanup.
 fn run_cli_in(cwd: &Path, args: &[&str]) -> CliOutput {
     let output = bin()
         .current_dir(cwd)
@@ -96,10 +91,8 @@ fn extensions<'a>(files: &'a [PathBuf], ext: &str) -> Vec<&'a PathBuf> {
 /// A writable copy of `fixtures/mantis-64`, so a beside-the-frames run has
 /// somewhere legal to land.
 ///
-/// Returns the guard alongside the target path: `common::tmp_dir` returns a
-/// directory that deletes itself on drop, so a caller that only kept the
-/// `PathBuf` this used to return would have the tree removed before the CLI
-/// ever saw it.
+/// Returns the guard alongside the target path: dropping the guard deletes
+/// the tree, so the caller must hold it for as long as the path is in use.
 fn fixture_copy(name: &str) -> (common::TmpDir, PathBuf) {
     let dir = common::tmp_dir(name);
     let target = dir.join("mantis-64");
@@ -137,7 +130,7 @@ fn stack_writes_a_project_and_no_image() {
     assert!(result.success, "stderr: {}", result.stderr);
 
     let files = walk(&out);
-    let projects = extensions(&files, "ffproj");
+    let projects = extensions(&files, "ffp");
     assert_eq!(projects.len(), 1, "exactly one project expected: {files:?}");
     assert!(
         extensions(&files, "tif").is_empty() && extensions(&files, "tiff").is_empty(),
@@ -171,7 +164,7 @@ fn project_lands_beside_the_frames() {
     assert!(result.success, "stderr: {}", result.stderr);
 
     let after = walk(&target);
-    let projects = extensions(&after, "ffproj");
+    let projects = extensions(&after, "ffp");
     assert_eq!(
         projects.len(),
         1,
@@ -192,7 +185,7 @@ fn project_lands_beside_the_frames() {
         "a run wrote an image beside the frames: {after:?}"
     );
     assert!(
-        result.stdout.contains(".ffproj") || result.stderr.contains(".ffproj"),
+        result.stdout.contains(".ffp") || result.stderr.contains(".ffp"),
         "the report must name the project it wrote -- stdout: {}",
         result.stdout
     );
@@ -209,7 +202,7 @@ fn output_dir_collects_the_project() {
         &stack_args(target.to_str().unwrap(), &["-o", out.to_str().unwrap()]),
     );
     assert!(result.success, "stderr: {}", result.stderr);
-    assert_eq!(extensions(&walk(&out), "ffproj").len(), 1);
+    assert_eq!(extensions(&walk(&out), "ffp").len(), 1);
     assert_eq!(
         walk(&target),
         before,
@@ -325,7 +318,7 @@ fn one_project_per_group_and_a_failure_spares_the_others() {
         &stack_args(root.to_str().unwrap(), &["-o", out.to_str().unwrap()]),
     );
     assert!(!result.success, "one group failed, so the run failed");
-    let projects = extensions(&walk(&out), "ffproj").len();
+    let projects = extensions(&walk(&out), "ffp").len();
     assert_eq!(
         projects, 1,
         "the healthy group's project must survive its neighbour's failure"
@@ -353,14 +346,14 @@ fn report_names_the_project_and_no_image() {
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
     assert_eq!(outputs.len(), 1, "one project, no image: {outputs:?}");
-    assert!(outputs[0].ends_with(".ffproj"), "{outputs:?}");
+    assert!(outputs[0].ends_with(".ffp"), "{outputs:?}");
 
     // The human rendering says the same thing.
     let human = run_cli_in(
         &cwd,
         &stack_args(input.to_str().unwrap(), &["-o", out.to_str().unwrap()]),
     );
-    assert!(human.stdout.contains(".ffproj"), "{}", human.stdout);
+    assert!(human.stdout.contains(".ffp"), "{}", human.stdout);
     assert!(
         !human.stdout.contains("wrote: ") || !human.stdout.contains(".tif\n"),
         "the report names no image path: {}",
@@ -384,7 +377,7 @@ fn report_names_the_project_and_no_image() {
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
     assert_eq!(would.len(), 1, "{would:?}");
-    assert!(would[0].ends_with(".ffproj"), "{would:?}");
+    assert!(would[0].ends_with(".ffp"), "{would:?}");
     assert_eq!(would[0], outputs[0]);
 }
 
@@ -392,8 +385,8 @@ fn report_names_the_project_and_no_image() {
 /// cancelled run deliberately keeps its staged planes and its ledger so
 /// `--resume` can continue, where a failed one removes both.
 ///
-/// Driven the way `job_cli.rs` drives its own cancel tests -- a SIGINT once
-/// the fuse stage has actually started -- rather than by a sleep.
+/// Sends a SIGINT once the fuse stage has actually started, rather than
+/// sleeping for a fixed duration.
 #[test]
 fn cancel_keeps_the_staged_planes_for_resume() {
     use std::io::{BufRead, BufReader};
@@ -444,7 +437,7 @@ fn cancel_keeps_the_staged_planes_for_resume() {
         "a cancel must say how to resume: {text}"
     );
     assert!(
-        extensions(&walk(&out), "ffproj").is_empty(),
+        extensions(&walk(&out), "ffp").is_empty(),
         "a cancelled run writes no project"
     );
     let staged = staged_composites(&cwd);

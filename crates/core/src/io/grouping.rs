@@ -117,6 +117,12 @@ pub struct Proposal {
     /// the printed proposal says so rather than leaving the reader to infer
     /// it from the absence of times.
     pub time_signal_available: bool,
+    /// Every subdirectory the walk descended into but read no frames from --
+    /// a thumbnails or export subdirectory, or one past the walk's own depth
+    /// limit.
+    /// Reported rather than swallowed, so the CLI and a GUI entry path never
+    /// disagree about the same run.
+    pub skipped: Vec<PathBuf>,
 }
 
 /// Propose a grouping of every frame under `root`.
@@ -144,12 +150,13 @@ pub struct Proposal {
 /// single-stack run over an empty directory already produces.
 pub fn propose(root: &Path) -> Result<Proposal, TiffError> {
     let mut dirs = Vec::new();
-    collect_frame_dirs(root, 0, &mut dirs)?;
+    let mut skipped = Vec::new();
+    collect_frame_dirs(root, 0, &mut dirs, &mut skipped)?;
 
     let mut groups = Vec::new();
     let mut time_signal_available = false;
     for (dir, frames) in dirs {
-        let timed: Vec<Option<CaptureTime>> = frames.iter().map(|p| read_capture_time(p)).collect();
+        let timed: Vec<Option<CaptureTime>> = frames.iter().map(|p| capture_time(p)).collect();
         if timed.iter().any(Option::is_some) {
             time_signal_available = true;
         }
@@ -169,19 +176,43 @@ pub fn propose(root: &Path) -> Result<Proposal, TiffError> {
         groups,
         gap: GROUP_GAP,
         time_signal_available,
+        skipped,
     })
+}
+
+/// One named group over exactly the frames given -- no directory scan, no
+/// capture-time signal, `signal: GroupSignal::Directory` and no times
+/// either way. The GUI's "Open as one" answer and a multi-file drop both
+/// build a group this way rather than assembling one by hand: a `Group`
+/// built outside `core` would be grouping vocabulary the CLI has no
+/// counterpart for.
+pub fn one_group(dir: &Path, frames: Vec<PathBuf>) -> Group {
+    let mut group = Group {
+        name: String::new(),
+        dir: dir.to_path_buf(),
+        frames,
+        signal: GroupSignal::Directory,
+        first_time: None,
+        last_time: None,
+    };
+    assign_names(std::slice::from_mut(&mut group));
+    group
 }
 
 /// Depth-first, bytewise by directory name, so a proposal is deterministic.
 /// A directory that `frame_paths` resolved through its own `frames/`
 /// subdirectory does not also get that subdirectory walked -- otherwise the
-/// fixture layout would propose the same frames twice.
+/// fixture layout would propose the same frames twice. `skipped` collects
+/// every directory the walk gave up on silently: a `NoFrames` directory, or
+/// one past [`MAX_DEPTH`].
 fn collect_frame_dirs(
     dir: &Path,
     depth: usize,
     out: &mut Vec<(PathBuf, Vec<PathBuf>)>,
+    skipped: &mut Vec<PathBuf>,
 ) -> Result<(), TiffError> {
     if depth > MAX_DEPTH {
+        skipped.push(dir.to_path_buf());
         return Ok(());
     }
 
@@ -199,8 +230,17 @@ fn collect_frame_dirs(
                 return Ok(());
             }
         }
-        // "Not a stack here", not a failure: the walk continues.
-        Err(TiffError::NoFrames { .. }) => {}
+        // "Not a stack here", not a failure: the walk continues. Reported
+        // only past the root (`depth > 0`) -- the root itself is routinely
+        // a pure container of frame-bearing subdirectories (the very shape
+        // the ambiguous-folder question exists for), and flagging *it* as
+        // "skipped" on every such folder would make the notice fire on the
+        // ordinary case rather than the exceptional one.
+        Err(TiffError::NoFrames { .. }) => {
+            if depth > 0 {
+                skipped.push(dir.to_path_buf());
+            }
+        }
         Err(err) => return Err(err),
     }
 
@@ -222,7 +262,7 @@ fn collect_frame_dirs(
         .collect();
     subdirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
     for subdir in subdirs {
-        collect_frame_dirs(&subdir, depth + 1, out)?;
+        collect_frame_dirs(&subdir, depth + 1, out, skipped)?;
     }
     Ok(())
 }
@@ -231,7 +271,7 @@ fn collect_frame_dirs(
 /// not parse at all is untimed rather than fatal: grouping is not the
 /// validator, and the run over that group reports the real error when it
 /// opens the stack.
-fn read_capture_time(path: &Path) -> Option<CaptureTime> {
+pub fn capture_time(path: &Path) -> Option<CaptureTime> {
     let header = TiffHeader::open(path).ok()?;
     parse_exif_datetime(header.date_time_original.as_deref()?)
 }
@@ -563,5 +603,19 @@ mod tests {
             .map(|n| dir.join(n))
             .collect();
         assert_eq!(basename_range(&frames, dir), "subject-a");
+    }
+
+    #[test]
+    fn one_group_names_and_stamps_the_given_frames_as_a_directory_signal_group() {
+        let dir = Path::new("/card");
+        let frames: Vec<PathBuf> = ["20260829-IMG_9800.tif", "20260829-IMG_9860.tif"]
+            .iter()
+            .map(|n| dir.join(n))
+            .collect();
+        let group = one_group(dir, frames.clone());
+        assert_eq!(group.frames, frames);
+        assert_eq!(group.name, "20260829-IMG_9800-9860");
+        assert_eq!(group.signal, GroupSignal::Directory);
+        assert!(group.first_time.is_none() && group.last_time.is_none());
     }
 }

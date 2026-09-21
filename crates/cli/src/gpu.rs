@@ -8,8 +8,7 @@
 //! module, and none of it is compiled.
 
 use focusforge_core::gpu::TileBackend;
-use focusforge_gpu::adapter::{PathChoice, choose_path};
-use focusforge_gpu::harness::{GpuBackend, gpu_backend_capped};
+use focusforge_gpu::harness::{GpuBackend, backend_for};
 
 use crate::stack::{BackendChoice, DeviceBudgetReport, DevicePeak};
 
@@ -32,24 +31,23 @@ impl DevicePeak for GpuBackend {
 /// the chosen path to stderr unconditionally, including under `--quiet`.
 /// Returns the backend plus its settled budget report and device-peak
 /// handle on the GPU path, `BackendChoice::cpu()` on the CPU path.
-pub fn resolve_backend(no_gpu: bool, max_vram: Option<u64>) -> BackendChoice {
-    let (path, result, message) = choose_path(no_gpu, gpu_backend_capped(max_vram));
-    eprintln!("{message}");
-    match path {
-        PathChoice::Gpu => match result.ok() {
-            Some(backend) => {
-                let device_budget = backend.device_budget();
-                BackendChoice {
-                    backend: Some(backend as &dyn TileBackend),
-                    device_budget: Some(DeviceBudgetReport {
-                        max_device_bytes: device_budget.bytes(),
-                        provenance: device_budget.provenance(),
-                    }),
-                    device_peak: Some(backend as &dyn DevicePeak),
-                }
+pub fn resolve_backend(algorithm_id: &str, no_gpu: bool, max_vram: Option<u64>) -> BackendChoice {
+    let (backend, message) = backend_for(algorithm_id, no_gpu, max_vram);
+    if !message.is_empty() {
+        eprintln!("{message}");
+    }
+    match backend {
+        Some(backend) => {
+            let device_budget = backend.device_budget();
+            BackendChoice {
+                backend: Some(backend as &dyn TileBackend),
+                device_budget: Some(DeviceBudgetReport {
+                    max_device_bytes: device_budget.bytes(),
+                    provenance: device_budget.provenance(),
+                }),
+                device_peak: Some(backend as &dyn DevicePeak),
             }
-            None => BackendChoice::cpu(),
-        },
-        PathChoice::CpuFallback => BackendChoice::cpu(),
+        }
+        None => BackendChoice::cpu(),
     }
 }

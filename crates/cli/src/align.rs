@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use focusforge_core::algorithm::{AlignAlgorithm, TileReader};
+use focusforge_core::algorithm::{AlignAlgorithm, StackAlgorithm, TileReader};
 use focusforge_core::align::{
     AlignDriverOptions, FailurePolicy, ReferencePolicy, StackAlignment, Transform, WarpingReader,
     align_stack_with, auto_crop,
@@ -247,7 +247,7 @@ pub fn run(
         .enumerate()
         .map(|(i, name)| (name.as_str(), stack.header(i)))
         .collect();
-    let (uniform, detail) = crate::uniform_check(&header_refs);
+    let (uniform, detail) = focusforge_core::pipeline::uniform_check(&header_refs);
     if !uniform {
         return sink.fail(detail.unwrap_or_else(|| "non-uniform frame set".to_string()));
     }
@@ -294,7 +294,12 @@ pub fn run(
         // probing for an adapter on every run would be noise with nothing to
         // show for it. `align` also has no `--max-vram` flag of its own, so
         // there is no ceiling to thread through.
-        let backend = crate::resolve_backend(no_gpu, None).backend;
+        let backend = crate::resolve_backend(
+            focusforge_core::fuse::laplacian::Laplacian.id(),
+            no_gpu,
+            None,
+        )
+        .backend;
         if let Err(msg) = write_warped_frames(
             write_warped,
             &stack,
@@ -606,24 +611,4 @@ pub(crate) fn render(report: &AlignReport) -> String {
         report.wall_seconds,
     ));
     lines.join("\n")
-}
-
-/// The message an empty crop refuses `stack` with -- unit-tested here
-/// because no fixture produces disjoint footprints
-/// (`crates/core/src/align/crop.rs`'s own `disjoint_footprints_are_empty`
-/// covers the geometry).
-pub(crate) fn empty_crop_refusal() -> String {
-    "auto-crop is empty: the frames' footprints do not intersect; re-run with --no-crop".to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_crop_refusal_names_the_flag() {
-        let msg = empty_crop_refusal();
-        assert!(msg.contains("--no-crop"));
-        assert!(msg.contains("empty"));
-    }
 }

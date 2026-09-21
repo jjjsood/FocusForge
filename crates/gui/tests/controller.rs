@@ -12,11 +12,12 @@ use std::sync::{Arc, Mutex};
 use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode};
 
 /// True when `body` (already trimmed) is exactly one statement of the form
-/// `root.<ident>(...)`, with an optional trailing `accept`/`reject` token,
-/// since `scroll-event` and `key-pressed`/`key-released` must return an
-/// `EventResult` and their handler bodies therefore end in a bare `accept`
-/// or `reject` after the forwarding call. Nothing else widens: a handler
-/// body with two statements before that trailing token must still fail.
+/// `root.<ident>(...)`, an optional trailing `accept`/`reject` (`scroll-event`
+/// and the key handlers return an `EventResult`), a bare literal assignment
+/// (`self.<ident> = <literal>;` or `<child-id>.<ident> = <literal>;`), or one
+/// `if <property-path> { <literal-assignment> }` with no `else` -- a small
+/// Slint-side gate resetting itself. Nothing else widens: two statements, a
+/// computed or forwarded right-hand side, or an `else` branch all still fail.
 fn is_single_root_call(body: &str) -> bool {
     let body = body.trim();
     let body = body
@@ -24,7 +25,56 @@ fn is_single_root_call(body: &str) -> bool {
         .or_else(|| body.strip_suffix("reject"))
         .map(str::trim_end)
         .unwrap_or(body);
-    body.starts_with("root.") && body.ends_with(");") && body.matches(';').count() == 1
+    if body.starts_with("root.") && body.ends_with(");") && body.matches(';').count() == 1 {
+        return true;
+    }
+    is_self_literal_assignment(body)
+}
+
+/// `self.<ident> = <literal>;` where `<ident>` is a single plain identifier
+/// (no `.`, no operator) and `<literal>` is `true`, `false`, a quoted string,
+/// or a number with an optional unit suffix (`1`, `0.5`, `1px`) -- never a
+/// bare identifier (which would be another property, e.g. `self.x = y;`) or
+/// anything with a call or an operator in it. See [`is_single_root_call`].
+fn is_self_literal_assignment(body: &str) -> bool {
+    let Some(rest) = body.strip_prefix("self.") else {
+        return false;
+    };
+    let Some((lhs, rhs_with_semi)) = rest.split_once('=') else {
+        return false;
+    };
+    let lhs = lhs.trim();
+    if lhs.is_empty()
+        || !lhs
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return false;
+    }
+    let Some(rhs) = rhs_with_semi.trim().strip_suffix(';') else {
+        return false;
+    };
+    body.matches(';').count() == 1 && is_literal_token(rhs.trim())
+}
+
+/// `true`, `false`, a `"..."` string, or a number (`1`, `0.5`, `-3`) with an
+/// optional trailing unit made only of ASCII letters or `%` (`1px`, `50%`).
+fn is_literal_token(token: &str) -> bool {
+    if token == "true" || token == "false" {
+        return true;
+    }
+    if let Some(inner) = token.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+        return !inner.contains('"');
+    }
+    let token = token.strip_prefix('-').unwrap_or(token);
+    let digits_end = token
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(token.len());
+    let (number, unit) = token.split_at(digits_end);
+    !number.is_empty()
+        && number.chars().filter(|&c| c == '.').count() <= 1
+        && number.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && (unit.is_empty() || unit.chars().all(|c| c.is_ascii_alphabetic() || c == '%'))
 }
 
 #[test]
@@ -40,6 +90,65 @@ fn is_single_root_call_allows_one_trailing_accept_or_reject() {
         !is_single_root_call("let x = 1; root.foo(); accept"),
         "a non-forward statement before the trailing token must still fail"
     );
+}
+
+#[test]
+fn is_single_root_call_allows_a_bare_self_literal_assignment() {
+    assert!(is_single_root_call("self.opacity = 1;"));
+    assert!(is_single_root_call("self.on = true;"));
+    assert!(is_single_root_call(r#"self.text = "x";"#));
+    assert!(is_single_root_call("self.height = 1px;"));
+    assert!(is_single_root_call("self.opacity = 0.5;"));
+    assert!(
+        !is_single_root_call("self.opacity = root.opacity;"),
+        "the right side must be a literal, not another property"
+    );
+    assert!(
+        !is_single_root_call("self.opacity = enabled;"),
+        "the right side must be a literal, not a bare unqualified property either"
+    );
+    assert!(
+        !is_single_root_call("self.opacity = self.compute();"),
+        "the right side must not be a call"
+    );
+    assert!(
+        !is_single_root_call("self.x.y = 1;"),
+        "the left side must be exactly one property, not a nested path"
+    );
+    assert!(
+        !is_single_root_call("self.count += 1;"),
+        "the left side must be a plain identifier, not a compound assignment"
+    );
+    assert!(
+        !is_single_root_call("self.opacity = 1; self.height = 1;"),
+        "two statements must still fail"
+    );
+}
+
+#[test]
+fn is_literal_token_accepts_only_true_false_strings_and_numbers() {
+    assert!(is_literal_token("true"));
+    assert!(is_literal_token("false"));
+    assert!(is_literal_token("1"));
+    assert!(is_literal_token("-3"));
+    assert!(is_literal_token("0.5"));
+    assert!(is_literal_token("1px"));
+    assert!(is_literal_token("50%"));
+    assert!(is_literal_token(r#""text""#));
+    assert!(
+        !is_literal_token("enabled"),
+        "a bare identifier is not a literal"
+    );
+    assert!(
+        !is_literal_token("root"),
+        "a bare identifier is not a literal"
+    );
+    assert!(!is_literal_token("1 + 1"), "an expression is not a literal");
+    assert!(
+        !is_literal_token("px1"),
+        "a unit must trail a number, not lead it"
+    );
+    assert!(!is_literal_token(""), "empty is not a literal");
 }
 
 /// Every `... => { ... }` handler body in `contents`, as
@@ -136,7 +245,7 @@ fn editor_mode_is_unreachable_in_this_phase() {
 
     let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_events = events.clone();
-    controller.set_sink(Box::new(move |event| {
+    controller.set_sink(Arc::new(move |event| {
         sink_events.lock().unwrap().push(event)
     }));
 
@@ -160,7 +269,7 @@ fn controller_events_reach_an_installed_sink() {
     let mut controller = AppController::new();
     let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_events = events.clone();
-    controller.set_sink(Box::new(move |event| {
+    controller.set_sink(Arc::new(move |event| {
         sink_events.lock().unwrap().push(event)
     }));
 
@@ -191,7 +300,7 @@ fn maximize_toggle_flips_controller_state_and_carries_it_on_the_event() {
     let mut controller = AppController::new();
     let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_events = events.clone();
-    controller.set_sink(Box::new(move |event| {
+    controller.set_sink(Arc::new(move |event| {
         sink_events.lock().unwrap().push(event)
     }));
 
