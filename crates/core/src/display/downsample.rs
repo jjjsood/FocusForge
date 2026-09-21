@@ -42,14 +42,11 @@ pub fn center_crop(
 }
 
 /// Accumulates a source image into a fixed `target_width x target_height`
-/// reduction, one band at a time: [`Self::add_band`] folds each band's
-/// samples that fall inside the centre crop into the target cells they
-/// average into, and [`Self::finish`] divides every cell by how many source
-/// samples landed in it. A box filter, not a weighted one: a target cell's
-/// value is the plain mean of every source sample mapped onto it, so a
-/// non-integer source/target ratio still produces a value everywhere (no
-/// target cell can end up with zero samples, since every source row and
-/// column inside the crop maps onto exactly one target row and column).
+/// box-filter reduction, one band at a time: [`Self::add_band`] folds each
+/// band's in-crop samples into their target cells, and [`Self::finish`]
+/// takes the plain mean of each cell. Every source row and column inside the
+/// crop maps onto exactly one target row and column, so no cell is ever
+/// left empty regardless of the source/target ratio.
 pub struct Downsampler {
     crop: Rect,
     target_width: u32,
