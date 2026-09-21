@@ -8,7 +8,7 @@
 import { Theme } from "../../theme.slint";
 import { FFManifestList, FFManifestRow } from "../../components/ff_manifest_list.slint";
 import { FFToggle } from "../../components/ff_toggle.slint";
-import { FFField } from "../../components/ff_field.slint";
+import { FFTextField } from "../../components/ff_text_field.slint";
 import { FFProgressBar } from "../../components/ff_progress_bar.slint";
 import { FFButton } from "../../components/ff_button.slint";
 
@@ -45,7 +45,6 @@ export component FFDiagnosticsPanel inherits Rectangle {
     property <string> field-tone: (root.status == "existing-file" || root.status == "failed")
         ? "warning"
         : "neutral";
-    property <image> download-icon: @image-url("../../../../../assets/icons/download.svg");
 
     VerticalLayout {
         padding-left: Theme.space-4 + Theme.space-1;
@@ -82,9 +81,9 @@ export component FFDiagnosticsPanel inherits Rectangle {
                 horizontal-stretch: 1;
             }
             FFToggle {
-                checked: root.include-minidumps;
-                enabled: !root.busy;
-                toggled(checked) => { root.minidumps-toggled(checked); }
+                on: root.include-minidumps;
+                disabled: root.busy;
+                toggled => { root.minidumps-toggled(!root.include-minidumps); }
             }
         }
 
@@ -107,7 +106,7 @@ export component FFDiagnosticsPanel inherits Rectangle {
             font-size: Theme.text-body.size;
         }
 
-        dest-field := FFField {
+        dest-field := FFTextField {
             text: root.destination;
             enabled: !root.busy;
             tone: root.field-tone;
@@ -141,8 +140,7 @@ export component FFDiagnosticsPanel inherits Rectangle {
 
             bundle-primary := FFButton {
                 kind: "primary";
-                label: root.primary-label;
-                icon-source: root.download-icon;
+                text: root.primary-label;
                 enabled: !root.busy && !root.loading;
                 clicked => { root.primary-clicked(); }
             }

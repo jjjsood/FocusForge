@@ -144,20 +144,29 @@ impl<'a> Job<'a> {
         Self::resuming(scheduler, &[])
     }
 
-    /// Builds a job that resumes from a fresh process: same totals as
-    /// [`Self::new`], except `remaining` is the plan's tiles filtered by
-    /// `!completed.contains(&tile.index())`, and the control is
-    /// pre-credited with the completed units and their pixel area (via
-    /// `JobControl::add_progress`) so `unit_total` still reads the whole
-    /// plan and `units_done`/`eta` are honest across a restart rather than
-    /// restarting at zero. `completed` is turned into a `HashSet` once, not
-    /// an `O(n^2)` scan per tile.
+    /// Builds a job that resumes from a fresh process, over a control this
+    /// call creates -- exactly [`Self::with_control`] with a fresh
+    /// [`JobControl`], since most callers have no reason to hold a control
+    /// before the job it belongs to exists.
     pub fn resuming(scheduler: &'a TileScheduler<'a>, completed: &[usize]) -> Self {
+        Self::with_control(scheduler, completed, JobControl::new())
+    }
+
+    /// Builds a job over a `control` the caller already holds, so a caller
+    /// driving an alignment stage can call [`JobControl::set_stage`] on it
+    /// before this job exists. Same totals as [`Self::new`] with an empty
+    /// `completed` set, except `remaining` excludes the completed tiles and
+    /// `control` is pre-credited with their units and pixels, so
+    /// `units_done`/`eta` stay honest across a restart.
+    pub fn with_control(
+        scheduler: &'a TileScheduler<'a>,
+        completed: &[usize],
+        control: Arc<JobControl>,
+    ) -> Self {
         let tiles = scheduler.plan().tiles();
         let unit_total = tiles.len();
         let pixel_total: u64 = tiles.iter().map(tile_area).sum();
 
-        let control = JobControl::new();
         control.set_unit_total(unit_total);
         control.set_pixel_total(pixel_total);
 
@@ -221,10 +230,9 @@ impl<'a> Job<'a> {
         };
 
         // No `add_progress` here: every unit this segment ran already
-        // credited itself through `JobControl::unit_completed` the moment it
-        // finished (`crates/core/src/tile/scheduler.rs`'s per-tile
-        // bookkeeping). Counting them a second time here is what made
-        // progress a per-segment summary in the first place.
+        // credited itself through `JobControl::unit_completed` via the
+        // scheduler's own per-tile bookkeeping, so counting them again here
+        // would double them.
         let completed_set: HashSet<usize> = controlled.completed.iter().copied().collect();
         self.remaining
             .retain(|tile| !completed_set.contains(&tile.index()));

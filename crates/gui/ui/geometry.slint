@@ -3,6 +3,8 @@
 // The shell's geometry, as a single exported global: every number here is
 // transcribed once, so the `.slint` shell files and the geometry tests read one source.
 
+import { Theme } from "theme.slint";
+
 export global ShellGeometry {
     // The window itself.
     out property <length> base-width: 1440px;
@@ -31,8 +33,80 @@ export global ShellGeometry {
     out property <length> glyph-pitch: 36px;
     out property <length> glyph-first-x: 1335px; // 1342 - 7
 
+    // Every box on the tab strip -- the projects button, the scroll arrows,
+    // each tab and "+" -- shares one top edge and one height: boxes span
+    // strip y 6..36, so they sit flush on the strip's bottom edge and
+    // connect into the toolbar.
+    out property <length> strip-box-height: 30px;
+    out property <length> strip-box-top: 6px;
+    // The square boxes (projects button, scroll arrows, "+") -- 30 wide.
+    out property <length> strip-box-width: 30px;
+
+    // The four-square Projects-overlay button at the tab strip's far left:
+    // 8 px inset, the 30 px box, 8 px to the first tab (board: button x
+    // 8..38, first tab x 46). The slot is everything left of the tabs.
+    out property <length> projects-button-inset: 8px;
+    out property <length> projects-button-slot: 46px;
+
+    // The gap between neighbouring strip boxes: a tab and the next, a scroll
+    // arrow and the tabs viewport, the right arrow and the pinned "+".
+    out property <length> strip-box-gap: Theme.space-1;
+    // The clear gap between the strip's right-hand group (the last tab and
+    // "+", or the right arrow and the pinned "+" on overflow) and the window
+    // glyphs -- roughly one "+" width.
+    out property <length> strip-cluster-gap: Theme.space-8;
+
     // Dock rows.
     out property <length> checkpoint-row-height: 40px;
     out property <length> tab-width: 224px;
     out property <length> tab-pitch: 228px;
+
+    // The `Images` list: 200 x 26 content in a 248 x 26 band, a 14 x 14
+    // colour chip at +24.
+    out property <length> image-row-height: 26px;
+    out property <length> image-row-band-width: 248px;
+    out property <length> image-row-content-width: 200px;
+    out property <length> image-row-content-inset: 24px;
+    out property <length> image-chip-size: 14px;
+    out property <length> image-header-height: 24px;
+
+    // The settings panel. Mirrored one-for-one as `pub const`s in
+    // `crates/gui/src/settings_panel.rs`, exactly as `tab-pitch` above is
+    // mirrored on the Rust side. There is no separate inter-row gap
+    // property: the breathing room a row needs before the next row's label
+    // is part of the row's own height, so a control this short does not
+    // draw as tall as its slot -- the rest of the slot is the gap.
+    out property <length> param-label-height: 17px;
+    out property <length> param-row-linear: 43px;
+    out property <length> param-row-log: 60px;
+    out property <length> param-row-field: 45px;
+    out property <length> param-row-bool: 20px;
+    out property <length> param-row-enum: 43px;
+    out property <length> param-error-height: 16px;
+    out property <length> section-heading-height: 41px;
+    // Trailing empty space after a heading's own text/badge, before its
+    // section's first field -- one grid step: without it the sticky
+    // overlay's own rule sits flush against whatever comes next.
+    out property <length> section-heading-bottom-gap: 8px;
+    out property <length> panel-content-width: 228px;
+    // The panel's own bottom-of-list reset control -- two grid steps above
+    // it, clear of CROP's own last field, its own height below.
+    out property <length> reset-all-top-gap: 32px;
+    out property <length> reset-all-height: 32px;
+
+    // Two primitive sizes shared wherever something else needs to lay out
+    // against them, rather than assuming the primitive's own literal.
+    out property <length> scrollbar-width: 6px; // `FFScrollbar`'s own width.
+    out property <length> field-height: 28px; // `FFField`'s own height.
+
+    // The toolbar's transport buttons and the bottom bar's progress track,
+    // measured at 1440px width.
+    out property <length> toolbar-button-height: 26px;
+    out property <length> toolbar-button-width: 116px;
+    out property <length> toolbar-button-gap: 10px;
+    out property <length> progress-step-x: 166px;
+    out property <length> progress-bar-x: 250px;
+    out property <length> progress-bar-height: 4px;
+    // The ETA's left edge, measured from the bottom bar's own right edge.
+    out property <length> progress-eta-inset: 376px;
 }

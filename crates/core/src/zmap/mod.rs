@@ -31,6 +31,7 @@
 mod description;
 mod error;
 pub mod metrics;
+mod palette;
 mod reader;
 mod writer;
 
@@ -39,6 +40,7 @@ use crate::tile::Rect;
 pub use description::{format_description, parse_description};
 pub use error::ZMapError;
 pub use metrics::{SpreadScan, ZMapSpread, all_eight_identical_fraction};
+pub use palette::source_color;
 pub use reader::ZMapReader;
 pub use writer::ZMapWriter;
 

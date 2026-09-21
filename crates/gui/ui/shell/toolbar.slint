@@ -5,8 +5,109 @@
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
+import { FFButton } from "../components/ff_button.slint";
 
 export component FFToolbar inherits Rectangle {
+    // "idle" | "running" | "paused" | "cancelling" | "failed". Any other
+    // value renders as "idle".
+    in property <string> run-state: "idle";
+    // Enabled at two or more frames; disabled below that on an unfused and
+    // a fused tab alike.
+    in property <bool> fuse-enabled: true;
+    callback fuse-requested();
+    callback pause-or-resume-requested();
+    callback cancel-requested();
+    callback retry-requested();
+
     height: ShellGeometry.toolbar-height;
     background: Theme.surface-raised;
+
+    property <length> button-y: (root.height - ShellGeometry.toolbar-button-height) / 2;
+    property <length> second-button-x: Theme.space-3 + ShellGeometry.toolbar-button-width
+        + ShellGeometry.toolbar-button-gap;
+    property <bool> is-idle: root.run-state != "running" && root.run-state != "paused"
+        && root.run-state != "cancelling" && root.run-state != "failed";
+
+    if root.run-state == "running": pause-button := FFButton {
+        x: Theme.space-3;
+        y: root.button-y;
+        width: ShellGeometry.toolbar-button-width;
+        compact: true;
+        glyph: "⏸";
+        text: "Pause";
+        clicked => { root.pause-or-resume-requested(); }
+    }
+    if root.run-state == "paused": resume-button := FFButton {
+        x: Theme.space-3;
+        y: root.button-y;
+        width: ShellGeometry.toolbar-button-width;
+        compact: true;
+        glyph: "▶";
+        text: "Resume";
+        clicked => { root.pause-or-resume-requested(); }
+    }
+    if root.run-state == "running" || root.run-state == "paused": cancel-button := FFButton {
+        x: root.second-button-x;
+        y: root.button-y;
+        width: ShellGeometry.toolbar-button-width;
+        compact: true;
+        glyph: "☐";
+        text: "Cancel";
+        clicked => { root.cancel-requested(); }
+    }
+    if root.run-state == "cancelling": cancelling-button := FFButton {
+        x: Theme.space-3;
+        y: root.button-y;
+        width: ShellGeometry.toolbar-button-width;
+        compact: true;
+        kind: "quiet";
+        glyph: "☐";
+        text: "Cancelling…";
+        enabled: false;
+    }
+    if root.run-state == "failed": retry-button := FFButton {
+        x: Theme.space-3;
+        y: root.button-y;
+        width: ShellGeometry.toolbar-button-width;
+        compact: true;
+        kind: "primary";
+        glyph: "↻";
+        text: "Retry";
+        clicked => { root.retry-requested(); }
+    }
+    if root.is-idle: fuse-button := FFButton {
+        x: Theme.space-3;
+        y: root.button-y;
+        width: ShellGeometry.toolbar-button-width;
+        compact: true;
+        kind: "primary";
+        glyph: "▶";
+        text: "Fuse stack";
+        enabled: root.fuse-enabled;
+        clicked => { root.fuse-requested(); }
+    }
+
+    // Right-aligned, muted, and reached by no `TouchArea` -- neither label
+    // does anything yet.
+    right-end := Text {
+        x: parent.width - Theme.space-3 - self.width;
+        y: 0px;
+        height: parent.height;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        text: root.is-idle ? "Save checkpoint" : "Fuse stack · Save checkpoint";
+        color: Theme.text-disabled;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+    }
+
+    // The 1 px rule along the toolbar's bottom edge, over the canvas width
+    // only.
+    bottom-rule := Rectangle {
+        x: 0px;
+        y: parent.height - self.height;
+        width: parent.width;
+        height: 1px;
+        background: Theme.border-default;
+    }
 }

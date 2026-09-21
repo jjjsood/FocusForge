@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A dialog's own button row: `Cancel` at the left, an optional secondary
+// button and the confirm button grouped at the right.
+
+import { Theme } from "../theme.slint";
+import { FFButton } from "ff_button.slint";
+
+export component FFDialogFooter inherits Rectangle {
+    in property <string> secondary-label: "";
+    in property <string> confirm-label: "Confirm";
+    // "primary" | "danger" -- the confirm button's own tone.
+    in property <string> confirm-kind: "primary";
+    callback cancelled();
+    callback secondary-pressed();
+    callback confirmed();
+
+    height: 34px;
+
+    HorizontalLayout {
+        alignment: space-between;
+
+        FFButton {
+            width: 70px;
+            kind: "quiet";
+            text: "Cancel";
+            clicked => { root.cancelled(); }
+        }
+
+        HorizontalLayout {
+            spacing: Theme.space-2;
+
+            if root.secondary-label != "": FFButton {
+                width: 160px;
+                kind: "default";
+                text: root.secondary-label;
+                clicked => { root.secondary-pressed(); }
+            }
+            FFButton {
+                width: 160px;
+                kind: root.confirm-kind;
+                text: root.confirm-label;
+                clicked => { root.confirmed(); }
+            }
+        }
+    }
+}

@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A bare uppercase status word -- no box, no fill.
+
+import { Theme } from "../theme.slint";
+
+export component FFChip inherits Text {
+    // "accent" | "muted".
+    in property <string> tone: "accent";
+
+    color: root.tone == "muted" ? Theme.text-muted : Theme.accent-default;
+    font-size: Theme.text-section.size;
+    font-weight: Theme.text-section.weight;
+    letter-spacing: Theme.text-section.letter-spacing;
+    vertical-alignment: center;
+}

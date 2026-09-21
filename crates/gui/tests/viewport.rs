@@ -45,12 +45,13 @@ fn mantis_512_dir() -> PathBuf {
 }
 
 /// A controller with a fixture project loaded and a base-window pane
-/// geometry pushed, as `src/main.rs` does after `--open`.
+/// geometry pushed, as `src/main.rs` does after `--open` -- rebuilt on
+/// `open_paths`: the fixture's own `frames/` layout (`frame_paths`'
+/// redirect) makes it one `Unsaved` group, 512 x 512 image size, read from
+/// the frame headers.
 fn opened_controller() -> AppController {
     let mut controller = AppController::new();
-    controller
-        .open_project(&mantis_512_dir())
-        .expect("open fixture project");
+    controller.open_paths(&[mantis_512_dir()]);
     controller.set_pane_geometry(
         PaneRect {
             x: 16.0,
@@ -331,16 +332,26 @@ fn gestures_come_from_the_input_map() {
     assert_eq!(canvas_slint.matches("pointer-event(").count(), 1);
     assert_eq!(canvas_slint.matches("moved =>").count(), 1);
 
-    // The diagnostics manifest list forwards its own scroll/pointer/drag
-    // gestures straight to the controller through dedicated methods, not
-    // through the `Action` table -- not steerable input a rebind config
-    // could touch, the same exemption `canvas.slint` already has.
-    let exempt = ["canvas.slint", "ff_manifest_list.slint"];
+    // `ff_slider.slint`'s drag, `ff_scrollbar.slint`'s drag and
+    // `settings_panel.slint`'s scroll are each a one-line forward to
+    // `AppController`, the same as the canvas's own gesture table -- this
+    // single-dispatch-point rule governs the canvas's rebindable zoom/pan/
+    // drag gestures specifically, not every interactive widget in the crate.
+    let raw_gesture_callback_exceptions = [
+        "canvas.slint",
+        "ff_slider.slint",
+        "ff_scrollbar.slint",
+        "settings_panel.slint",
+        "images_panel.slint",
+        "ff_image_row.slint",
+        "gallery.slint",
+        "ff_manifest_list.slint",
+    ];
     for path in common::find_slint_files(&common::ui_dir()) {
         if path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| exempt.contains(&n))
+            .is_some_and(|name| raw_gesture_callback_exceptions.contains(&name))
         {
             continue;
         }

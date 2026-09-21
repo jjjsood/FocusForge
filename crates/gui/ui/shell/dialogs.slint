@@ -1,0 +1,231 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The one grouping question and the two refusals the entry path can
+// produce. Modelled on `ui/shell/settings_modal.slint`.
+// No string in this file, or anywhere else under `ui/`, contains `group` --
+// "stacks" and "projects" carry the same meaning without inventing
+// vocabulary the CLI has no counterpart for.
+
+import { Theme } from "../theme.slint";
+import { FFDialog } from "../components/ff_dialog.slint";
+
+export component FFGroupingQuestion inherits Rectangle {
+    in property <bool> question-open: false;
+    in property <int> frame-count: 0;
+    in property <int> project-count: 0;
+    callback open-as-one();
+    callback open-as-many();
+    callback cancelled();
+
+    visible: root.question-open;
+
+    scrim := Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Theme.surface-canvas.with-alpha(0.6);
+    }
+
+    panel := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 480px;
+        height: 200px;
+        background: Theme.surface-raised;
+        border-radius: Theme.radius-lg;
+
+        VerticalLayout {
+            padding: Theme.space-4;
+            spacing: Theme.space-3;
+
+            body := Text {
+                text: "This folder reads as " + root.project-count + " stacks of "
+                    + root.frame-count + " frames.";
+                color: Theme.text-primary;
+                font-size: Theme.text-body.size;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                spacing: Theme.space-2;
+
+                one-button := Rectangle {
+                    height: 36px;
+                    background: Theme.accent-default;
+                    border-radius: Theme.radius-sm;
+                    TouchArea { clicked => { root.open-as-one(); } }
+                    Text {
+                        text: "Open as one project";
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+                }
+                many-button := Rectangle {
+                    height: 36px;
+                    background: Theme.surface-hover;
+                    border-radius: Theme.radius-sm;
+                    TouchArea { clicked => { root.open-as-many(); } }
+                    Text {
+                        text: "Open as " + root.project-count + " projects";
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+                }
+            }
+
+            cancel-area := TouchArea {
+                height: 24px;
+                clicked => { root.cancelled(); }
+                Text {
+                    text: "Cancel";
+                    color: Theme.text-muted;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+export component FFRefusalDialog inherits Rectangle {
+    in property <bool> refusal-open: false;
+    callback pick-another-folder();
+
+    visible: root.refusal-open;
+
+    scrim := Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Theme.surface-canvas.with-alpha(0.6);
+    }
+
+    panel := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 420px;
+        height: 180px;
+        background: Theme.surface-raised;
+        border-radius: Theme.radius-lg;
+
+        VerticalLayout {
+            padding: Theme.space-4;
+            spacing: Theme.space-3;
+
+            Text {
+                text: "No frames here";
+                color: Theme.text-primary;
+                font-size: Theme.text-title.size;
+                font-weight: Theme.text-title.weight;
+            }
+            Text {
+                text: "FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.";
+                color: Theme.text-secondary;
+                font-size: Theme.text-body.size;
+                wrap: word-wrap;
+            }
+            pick-area := Rectangle {
+                height: 36px;
+                background: Theme.accent-default;
+                border-radius: Theme.radius-sm;
+                TouchArea { clicked => { root.pick-another-folder(); } }
+                Text {
+                    text: "Pick another folder…";
+                    color: Theme.text-primary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+            }
+        }
+    }
+}
+
+// A non-modal notice over the canvas: no scrim, self-timing (auto-dismisses
+// after six seconds) and also dismissed early by its own `x`. Either way,
+// dismissal carries no side effect beyond closing the notice -- there is
+// nothing here to mark reported.
+export component FFToast inherits Rectangle {
+    in property <bool> toast-open: false;
+    in property <string> message: "";
+    // "failure" (default): a run's own toast. "info": a plain notice, such
+    // as a folder open that skipped some of what it found.
+    in property <string> tone: "failure";
+    // A second, optional line below the message; hidden when empty.
+    in property <string> link-label: "";
+    callback dismissed();
+    callback link-activated();
+
+    width: 300px;
+    height: 84px;
+    background: Theme.surface-raised;
+    border-width: 1px;
+    border-color: Theme.border-default;
+    border-radius: Theme.radius-lg;
+    opacity: root.toast-open ? 1.0 : 0.0;
+    animate opacity { duration: Theme.motion-slow; easing: ease-out; }
+
+    icon := Image {
+        x: Theme.space-4;
+        y: Theme.space-4;
+        source: root.tone == "failure" ? @image-url("../../../../assets/icons/triangle-alert.svg")
+            : @image-url("../../../../assets/icons/info.svg");
+        colorize: root.tone == "failure" ? Theme.status-failure : Theme.text-secondary;
+        width: 18px;
+        height: 18px;
+    }
+
+    title := Text {
+        x: icon.x + icon.width + Theme.space-2;
+        y: icon.y;
+        width: parent.width - self.x - Theme.space-3;
+        height: 32px;
+        text: root.message;
+        color: Theme.text-primary;
+        font-size: Theme.text-title.size;
+        font-weight: Theme.text-title.weight;
+        wrap: word-wrap;
+        overflow: clip;
+    }
+
+    if root.link-label != "": link-area := TouchArea {
+        x: title.x;
+        y: title.y + title.height;
+        accessible-role: button;
+        clicked => { root.link-activated(); }
+
+        Text {
+            text: root.link-label;
+            color: Theme.accent-default;
+            font-size: Theme.text-body.size;
+        }
+    }
+
+    dismiss-area := TouchArea {
+        x: parent.width - Theme.space-3 - 12px;
+        y: Theme.space-3;
+        width: 12px;
+        height: 12px;
+        enabled: root.toast-open;
+        clicked => { root.dismissed(); }
+        Image {
+            source: @image-url("../../../../assets/icons/x.svg");
+            colorize: Theme.text-secondary;
+            width: 12px;
+            height: 12px;
+        }
+    }
+}
+
+// The one warning a frame-set change (add/reorder/remove) shows once its
+// project already carries a checkpoint -- `AppController::pending_frame_change`
+// supplies every string and flag below, already rendered.
+export component FFFrameSetWarning inherits FFDialog {
+    tone: "warning";
+    confirm-kind: "primary";
+}
+

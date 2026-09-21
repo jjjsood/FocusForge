@@ -14,12 +14,6 @@ for the interface and wgpu for compute and canvas. Free software under the
 GNU General Public License v3.
 </p>
 
-<!--
-  Hero screenshot goes here once the GUI has a window worth showing.
-  Suggested: assets/screenshots/editor.png, ~1200px wide, PNG, with a
-  <sub> caption underneath.
--->
-
 ## Features
 
 - Fuses a directory of TIFF frames into a focus-stacked project
@@ -60,6 +54,11 @@ GNU General Public License v3.
   to it, all local to your own machine; `focusforge-cli diagnostics`
   packages the evidence into one redacted ZIP, and the next start after a
   crash tells you it's there
+- A window (`focusforge-gui`) alongside the CLI: open a folder or a saved
+  project into a tab, watch the composite and its Z-Map side by side,
+  choose an algorithm and edit its parameters from the same schema
+  `focusforge-cli algorithms` prints, and run, pause, cancel or retry a
+  fuse without leaving it
 
 ## Quick start
 
@@ -102,11 +101,11 @@ same report as machine-readable JSON.
 
 ```bash
 target/release/focusforge-cli stack path/to/frames/ --algo laplacian
-target/release/focusforge-cli export path/to/frames/frames.ffproj -o out.tif --zmap zmap.tif
+target/release/focusforge-cli export path/to/frames/frames.ffp -o out.tif --zmap zmap.tif
 ```
 
 `stack` aligns the frames and fuses them into a project beside the frames
-(one `.ffproj` file per detected stack); `export` then turns that project
+(one `.ffp` file per detected stack); `export` then turns that project
 into `out.tif` and its per-pixel source map `zmap.tif`. Alignment and the
 auto-crop that precedes fusion are both on by default (`--no-align` /
 `--no-crop` turn them off); `focusforge-cli align` reports the same
@@ -115,12 +114,19 @@ transforms on their own, before any fusion runs. See
 and their parameters, and [`docs/guide/batch-runs.md`](docs/guide/batch-runs.md)
 for stacking a folder that holds more than one stack.
 
+### Open it in the window
+
+```bash
+target/release/focusforge-gui --open path/to/frames/
+```
+
+Opens the same folder into a window instead of the command line, one tab
+per detected stack. See [`docs/guide/gui.md`](docs/guide/gui.md).
+
 ## Documentation
 
 See [`docs/`](docs/README.md) for the full guide and reference, including
 every `focusforge-cli` subcommand and the TIFF layouts it reads and writes.
-For development-time GUI inspection and interaction through Slint's local MCP
-endpoint, see [`docs/guide/gui-mcp.md`](docs/guide/gui-mcp.md).
 
 ## Contributing
 

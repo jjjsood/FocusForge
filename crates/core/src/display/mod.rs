@@ -16,6 +16,9 @@ use rayon::prelude::*;
 
 use crate::zmap::NO_SOURCE;
 
+pub mod downsample;
+pub use downsample::{Downsampler, center_crop};
+
 /// The 4x4 ordered (Bayer) dither matrix, values `0..=15`. Ordered, not
 /// random, so a still image dithers the same way on every frame and does
 /// not shimmer.

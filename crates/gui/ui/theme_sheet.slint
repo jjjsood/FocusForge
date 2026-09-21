@@ -6,12 +6,26 @@
 // the substring `width` anywhere in that file, and a swatch needs one.
 
 import { Theme, TypeRole } from "theme.slint";
-import { FFButton } from "components/ff_button.slint";
-import { FFToggle } from "components/ff_toggle.slint";
+import { FFSlider } from "components/ff_slider.slint";
 import { FFField } from "components/ff_field.slint";
+import { FFToggle } from "components/ff_toggle.slint";
+import { FFMenu } from "components/ff_menu.slint";
+import { FFMenuList } from "components/ff_menu_list.slint";
+import { FFSectionHeading } from "components/ff_section_heading.slint";
+import { FFErrorRow } from "components/ff_error_row.slint";
+import { FFScrollbar } from "components/ff_scrollbar.slint";
+import { FFResetAll } from "components/ff_reset_all.slint";
+import { FFRowLabel } from "components/ff_row_label.slint";
+import { FFRowText } from "components/ff_row_text.slint";
+import { FFButton } from "components/ff_button.slint";
 import { FFProgressBar } from "components/ff_progress_bar.slint";
+import { FFImageRow } from "components/ff_image_row.slint";
+import { FFDialog } from "components/ff_dialog.slint";
+import { FFDialogFooter } from "components/ff_dialog_footer.slint";
+import { FFChip } from "components/ff_chip.slint";
+import { FFProjectCard } from "components/ff_project_card.slint";
 import { FFManifestList } from "components/ff_manifest_list.slint";
-import { FFToast } from "components/ff_toast.slint";
+import { FFToast } from "shell/dialogs.slint";
 
 component ColourSwatch inherits Rectangle {
     in property <color> swatch;
@@ -107,15 +121,10 @@ component IconSizeSample inherits Rectangle {
 
 export component ThemeSheet inherits Window {
     title: "FocusForge -- token sheet";
-    preferred-width: 940px;
-    preferred-height: 1000px;
+    preferred-width: 1100px;
+    preferred-height: 2760px;
     background: Theme.surface-base;
     default-font-family: Theme.font-family;
-    // Gives the field's focused-state sample real keyboard focus on show,
-    // the same `forward-focus` mechanism `ui/app.slint` uses for the
-    // canvas -- a window can forward focus to only one element, so this is
-    // also why the toggle's own focused sample never shows its ring here.
-    forward-focus: field-focus-demo;
 
     VerticalLayout {
         padding: Theme.space-4;
@@ -209,70 +218,6 @@ export component ThemeSheet inherits Window {
             IconSizeSample { icon-size: Theme.icon-sm; label: "icon-sm"; }
         }
 
-        GroupHeading { text: "FFButton"; }
-        HorizontalLayout {
-            spacing: Theme.space-3;
-            FFButton {
-                kind: "primary";
-                label: "Create bundle";
-                icon-source: @image-url("../../../assets/icons/download.svg");
-            }
-            FFButton {
-                kind: "default";
-                label: "Writing…";
-                icon-source: @image-url("../../../assets/icons/download.svg");
-                enabled: false;
-            }
-            FFButton { kind: "default"; label: "Done"; }
-            FFButton { kind: "quiet"; label: "Cancel"; }
-            FFButton {
-                kind: "primary";
-                label: "Disabled";
-                icon-source: @image-url("../../../assets/icons/download.svg");
-                enabled: false;
-            }
-            FFButton { kind: "default"; label: "Compact"; compact: true; }
-        }
-
-        GroupHeading { text: "FFToggle"; }
-        HorizontalLayout {
-            spacing: Theme.space-4;
-            FFToggle { checked: false; }
-            FFToggle { checked: true; }
-            FFToggle { checked: false; enabled: false; }
-            FFToggle { checked: true; enabled: false; }
-        }
-
-        GroupHeading { text: "FFField"; }
-        HorizontalLayout {
-            spacing: Theme.space-4;
-            FFField { text: "...diagnostics/2026-09-17-1400.zip"; field-width: 220px; }
-            FFField {
-                text: "...diagnostics/2026-09-17-1400.zip";
-                field-width: 220px;
-                tone: "warning";
-            }
-            FFField {
-                text: "...diagnostics/2026-09-17-1400.zip";
-                field-width: 220px;
-                tone: "failure";
-            }
-            FFField { text: "Read only"; field-width: 120px; enabled: false; }
-            field-focus-demo := FFField {
-                text: "Focused";
-                field-width: 120px;
-            }
-        }
-
-        GroupHeading { text: "FFProgressBar"; }
-        HorizontalLayout {
-            spacing: Theme.space-4;
-            FFProgressBar { progress: 0.0; }
-            FFProgressBar { progress: 0.55; }
-            FFProgressBar { progress: 1.0; }
-            FFProgressBar { indeterminate: true; }
-        }
-
         GroupHeading { text: "FFManifestList"; }
         HorizontalLayout {
             spacing: Theme.space-4;
@@ -297,17 +242,288 @@ export component ThemeSheet inherits Window {
         GroupHeading { text: "FFToast"; }
         HorizontalLayout {
             spacing: Theme.space-4;
+            FFToast { toast-open: true; message: "1 crash found"; }
+            FFToast { toast-open: true; message: "3 crashes found"; tone: "info"; }
             FFToast {
-                title: "1 crash found";
-                icon-source: @image-url("../../../assets/icons/triangle-alert.svg");
+                toast-open: true;
+                message: "128 crashes found";
+                link-label: "Review";
             }
-            FFToast {
-                title: "3 crashes found";
-                icon-source: @image-url("../../../assets/icons/triangle-alert.svg");
+        }
+
+        GroupHeading { text: "Settings panel: section heading"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            FFSectionHeading { width: 220px; label: "FUSE"; provenance: "default"; }
+            FFSectionHeading { width: 220px; label: "ALIGN"; provenance: "explicit"; }
+            FFSectionHeading { width: 220px; label: "CROP"; provenance: "pending"; }
+        }
+
+        GroupHeading { text: "Settings panel: slider"; }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Score Radius";
+            FFSlider { scale: "linear"; fraction: 0.4; value-text: "4"; }
+        }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Score Radius (disabled)";
+            FFSlider { scale: "linear"; fraction: 0.4; value-text: "4"; disabled: true; }
+        }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Epsilon (px)";
+            FFSlider { scale: "logarithmic"; fraction: 0.5556; value-text: "0.0001"; }
+        }
+
+        GroupHeading { text: "Settings panel: field states"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            FFField { width: 90px; text: "4"; }
+            FFField { width: 90px; text: "4"; hovered: true; }
+            FFField { width: 90px; text: "4"; focused: true; }
+            FFField { width: 90px; text: "4"; disabled: true; }
+            FFField { width: 90px; text: "4"; invalid: true; }
+        }
+
+        GroupHeading { text: "Settings panel: toggle"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFToggle { on: true; }
+            FFToggle { on: false; }
+            FFToggle { on: true; disabled: true; }
+        }
+
+        GroupHeading { text: "Settings panel: picker (closed)"; }
+        FFMenu {
+            width: 220px;
+            label: "Option A";
+            choices: ["Option A", "Option B"];
+            choice-ids: ["option-a", "option-b"];
+            selected: "option-a";
+        }
+
+        GroupHeading { text: "Settings panel: picker (open)"; }
+        Rectangle {
+            width: 220px;
+            height: 120px;
+            FFMenu {
+                width: 220px;
+                label: "Option A";
+                choices: ["Option A", "Option B"];
+                choice-ids: ["option-a", "option-b"];
+                selected: "option-a";
+                open: true;
             }
-            FFToast {
-                title: "128 crashes found";
-                icon-source: @image-url("../../../assets/icons/triangle-alert.svg");
+        }
+
+        GroupHeading { text: "Settings panel: bool row + error row"; }
+        HorizontalLayout {
+            width: 320px;
+            alignment: space-between;
+            FFRowText { text: "Auto-crop"; }
+            FFToggle { on: true; }
+        }
+        FFErrorRow { width: 320px; message: "epsilon-px: out of range"; }
+
+        GroupHeading { text: "Settings panel: scrollbar + reset-all"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            FFScrollbar { height: 80px; content-height: 400px; viewport-height: 80px; offset: 40px; }
+            FFResetAll { width: 220px; enabled: true; }
+            FFResetAll { width: 220px; enabled: false; }
+        }
+
+        GroupHeading { text: "Toolbar: transport button"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            FFButton { width: 116px; compact: true; kind: "primary"; glyph: "▶"; text: "Fuse stack"; }
+            FFButton { width: 116px; compact: true; kind: "default"; glyph: "⏸"; text: "Pause"; }
+            FFButton { width: 116px; compact: true; kind: "default"; glyph: "▶"; text: "Resume"; }
+            FFButton { width: 116px; compact: true; kind: "default"; glyph: "☐"; text: "Cancel"; }
+            FFButton { width: 116px; compact: true; kind: "quiet"; glyph: "☐"; text: "Cancelling…"; enabled: false; }
+            FFButton { width: 116px; compact: true; kind: "primary"; glyph: "↻"; text: "Retry"; }
+            FFButton { width: 116px; compact: true; kind: "default"; text: "Fuse stack"; enabled: false; }
+        }
+
+        GroupHeading { text: "Bottom bar: progress track"; }
+        VerticalLayout {
+            spacing: Theme.space-2;
+            FFProgressBar { width: 400px; tone: "running"; fraction: 0.62; }
+            FFProgressBar { width: 400px; tone: "held"; fraction: 0.62; }
+            FFProgressBar { width: 400px; tone: "failed"; fraction: 0.24; }
+            FFProgressBar { width: 400px; tone: "running"; fraction: 0.0; }
+            FFProgressBar { width: 400px; tone: "running"; indeterminate: true; }
+        }
+
+        GroupHeading { text: "Images list: row"; }
+        VerticalLayout {
+            spacing: 0px;
+            FFImageRow {
+                width: 248px;
+                chip: Theme.status-failure;
+                name: "00.tif";
+                time-text: "14:12:00";
+            }
+            FFImageRow {
+                width: 248px;
+                chip: Theme.status-warning;
+                name: "01.tif";
+                time-text: "14:13:01";
+                hovered: true;
+            }
+            FFImageRow {
+                width: 248px;
+                chip: Theme.status-success;
+                name: "02.tif";
+                time-text: "14:14:02";
+                excluded: true;
+                hovered: true;
+            }
+            FFImageRow {
+                width: 248px;
+                chip: Theme.accent-default;
+                name: "03.tif";
+                time-text: "";
+                unresolved: true;
+            }
+            FFImageRow {
+                width: 248px;
+                chip: Theme.accent-hover;
+                name: "04.tif";
+                time-text: "14:16:04";
+                dragging: true;
+            }
+        }
+
+        GroupHeading { text: "Dialog footer"; }
+        FFDialogFooter {
+            width: 480px;
+            secondary-label: "New project instead";
+            confirm-label: "Add and re-fuse";
+        }
+
+        GroupHeading { text: "Dialog: warning, with a secondary button"; }
+        Rectangle {
+            width: 500px;
+            height: 320px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "warning";
+                title: "Add 3 frames and fuse again?";
+                body: "This project already holds 2 checkpoints, and confirming keeps every one of them.";
+                info: "Or start a new project with the same settings instead.";
+                secondary-label: "New project instead";
+                confirm-label: "Add and re-fuse";
+            }
+        }
+
+        GroupHeading { text: "Dialog: warning, Remove's own footer"; }
+        Rectangle {
+            width: 500px;
+            height: 320px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "warning";
+                title: "Remove and fuse again?";
+                body: "This project already holds 2 checkpoints, and confirming keeps every one of them.";
+                info: "You can also start a new project with the same settings instead.";
+                secondary-label: "Exclude instead";
+                confirm-label: "Remove and re-fuse";
+            }
+        }
+        Rectangle {
+            width: 200px;
+            height: 48px;
+            FFMenuList {
+                width: 200px;
+                choices: ["Name", "Capture time"];
+                choice-ids: ["name", "capture-time"];
+                show-choice-ids: false;
+                selected: "name";
+            }
+        }
+
+        GroupHeading { text: "Projects overlay: chip"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFChip { text: "UNSAVED"; tone: "accent"; }
+            FFChip { text: "CURRENT"; tone: "accent"; }
+            FFChip { text: "MUTED"; tone: "muted"; }
+        }
+
+        GroupHeading { text: "Projects overlay: outlined button"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFButton { width: 130px; height: 30px; kind: "outlined"; text: "Run again"; }
+            FFButton { width: 130px; height: 30px; kind: "outlined"; text: "Locate frames…"; }
+        }
+
+        GroupHeading { text: "Projects overlay: card, every kind"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            FFProjectCard {
+                kind: "open";
+                current: true;
+                unsaved: true;
+                project-name: "IMG_9801-9861";
+                meta-text: "61 frames · 4 checkpoints";
+            }
+            FFProjectCard {
+                kind: "open";
+                fusing: true;
+                fusing-fraction: 0.42;
+                project-name: "IMG_9941-9977";
+                meta-text: "37 frames · fusing, step 2 of 3";
+            }
+            FFProjectCard {
+                kind: "failed";
+                glyph: @image-url("../../../assets/icons/triangle-alert.svg");
+                headline: "Did not stack";
+                stage: "FAILED WHILE ALIGNING";
+                reason: "Frames 12 and 13 share no overlap. Alignment stopped there.";
+                action-label: "Run again";
+                project-name: "IMG_9862-9903";
+                meta-text: "42 frames · no project written";
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            FFProjectCard {
+                kind: "sources-missing";
+                glyph: @image-url("../../../assets/icons/circle-alert.svg");
+                headline: "Sources missing";
+                stage: "NOTHING TO SHOW";
+                reason: "The project points at frames that are not where it left them.";
+                action-label: "Locate frames…";
+                project-name: "IMG_9978-9994";
+                meta-text: "17 frames · project found, sources not";
+            }
+            FFProjectCard {
+                kind: "cancelled";
+                glyph: @image-url("../../../assets/icons/x.svg");
+                headline: "Cancelled";
+                stage: "STOPPED WHILE FUSING";
+                reason: "You stopped this one. Nothing was written.";
+                action-label: "Run again";
+                project-name: "IMG_10062-10090";
+                meta-text: "29 frames · stopped before writing";
+            }
+            FFProjectCard {
+                kind: "not-a-project";
+                glyph: @image-url("../../../assets/icons/folder.svg");
+                headline: "Not a project";
+                stage: "LEFT ALONE";
+                reason: "This folder holds something else. Nothing was read and nothing was changed.";
+                action-label: "";
+                project-name: "contact-sheets";
+                meta-text: "not read · not changed";
             }
         }
     }

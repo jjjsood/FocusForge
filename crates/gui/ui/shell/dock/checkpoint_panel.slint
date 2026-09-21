@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The checkpoint panel with no checkpoint yet: a 28 px heading row --
+// `CHECKPOINTS` left, an `Export image` button right, both at a 12 px inset
+// from the dock edges -- and the one muted line under it. The panel ends
+// 32 px below that line, where `FFDock` draws its rule.
+
+import { Theme } from "../../theme.slint";
+
+export component FFCheckpointPanel inherits Rectangle {
+    callback checkpoint-export-requested();
+
+    VerticalLayout {
+        padding-left: Theme.space-1;
+        padding-right: Theme.space-1;
+        padding-top: Theme.space-3;
+        padding-bottom: Theme.space-8;
+
+        heading-row := HorizontalLayout {
+            height: 28px;
+            alignment: space-between;
+
+            Text {
+                text: "CHECKPOINTS";
+                color: Theme.text-secondary;
+                font-size: Theme.text-section.size;
+                font-weight: Theme.text-section.weight;
+                letter-spacing: Theme.text-section.letter-spacing;
+                vertical-alignment: center;
+            }
+
+            VerticalLayout {
+                alignment: center;
+
+                checkpoint-export := Rectangle {
+                    width: 122px;
+                    height: 24px;
+                    accessible-role: button;
+                    accessible-label: "Export image";
+                    accessible-enabled: false;
+                    background: Theme.surface-overlay;
+                    border-radius: Theme.radius-sm;
+
+                    HorizontalLayout {
+                        padding-left: Theme.space-2;
+                        spacing: Theme.space-1;
+                        alignment: start;
+
+                        VerticalLayout {
+                            alignment: center;
+                            Image {
+                                source: @image-url("../../../../../assets/icons/download.svg");
+                                colorize: Theme.text-disabled;
+                                width: Theme.icon-md;
+                                height: Theme.icon-md;
+                            }
+                        }
+                        Text {
+                            text: "Export image";
+                            color: Theme.text-disabled;
+                            font-size: Theme.text-body.size;
+                            font-weight: Theme.text-body.weight;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    TouchArea {
+                        enabled: false;
+                        clicked => { root.checkpoint-export-requested(); }
+                    }
+                }
+            }
+        }
+
+        checkpoint-empty-note := Text {
+            text: "None yet — fuse a stack";
+            min-height: Theme.text-body.size * Theme.text-body.line-height;
+            vertical-alignment: center;
+            color: Theme.text-disabled;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            wrap: word-wrap;
+        }
+    }
+}

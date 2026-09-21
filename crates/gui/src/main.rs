@@ -5,10 +5,11 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
-use focusforge_gui::{AppWindow, ThemeSheet, bridge, screenshot};
+use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, screenshot};
 use slint::ComponentHandle;
 
 #[derive(Parser)]
@@ -31,11 +32,12 @@ struct Args {
     /// Renders the design-token specimen sheet instead of the shell.
     #[arg(long)]
     theme_sheet: bool,
-    /// Open a project directory: resolves `<dir>/golden/laplacian.tif` +
-    /// `<dir>/golden/laplacian-zmap.tif` (`focusforge_gui::project_stub`,
-    /// a stub project format).
-    #[arg(long)]
-    open: Option<PathBuf>,
+    /// Opens a path the same way the picker or a drop would: a folder
+    /// proposes a grouping, a `*.ffp` reopens a saved project
+    /// (`AppController::open_paths`). Repeatable; each path is opened in
+    /// order, one `open_paths` call per path.
+    #[arg(long, action = clap::ArgAction::Append)]
+    open: Vec<PathBuf>,
     /// Overrides where the input map is read from/written to --
     /// `<DIR>/focusforge/input.toml`, mirroring what
     /// `input_config::default_config_dir()` itself resolves to. Exists so a
@@ -47,6 +49,48 @@ struct Args {
     /// `input-map` or `diagnostics`.
     #[arg(long)]
     settings_section: Option<String>,
+    /// Selects the dock's tab row at startup: `images` or `settings`.
+    #[arg(long)]
+    dock_tab: Option<String>,
+    /// Sets the toolbar's transport to a named run state at startup, for
+    /// inspecting a state no click sequence currently reaches: `idle`,
+    /// `running`, `paused`, `cancelling` or `failed`.
+    #[arg(long)]
+    toolbar_state: Option<String>,
+    /// Opens the `Images` panel's sort menu at startup, for inspecting it
+    /// with no click sequence.
+    #[arg(long)]
+    images_sort_menu_open: bool,
+    /// Opens the projects overlay at startup, for inspecting every state of
+    /// this surface with no click sequence.
+    #[arg(long)]
+    projects_overlay: bool,
+    /// Requests removing the frame at this index right after `--open`, for
+    /// inspecting the frame-set warning it raises on a checkpointed project
+    /// with no click sequence.
+    #[arg(long)]
+    frame_remove_warning: Option<usize>,
+}
+
+const TOOLBAR_STATES: [&str; 5] = ["idle", "running", "paused", "cancelling", "failed"];
+
+/// Sets the toolbar's and the bottom bar's transport preview together, from
+/// literal values with no controller or job behind them -- for inspecting a
+/// state no click sequence currently reaches.
+fn apply_toolbar_state_preview(app: &AppWindow, state: &str) {
+    app.set_toolbar_run_state(state.into());
+    let (stage_word, step_text, fraction, tone, eta) = match state {
+        "running" => ("Fusing", "step 2 of 3", 0.62, "running", "ETA 1:12"),
+        "paused" => ("Paused", "step 2 of 3", 0.62, "held", "ETA —"),
+        "cancelling" => ("Cancelling", "step 1 of 3", 0.0, "held", "ETA —"),
+        "failed" => ("Failed", "step 1 of 3", 0.28, "failed", "ETA —"),
+        _ => ("", "", 0.0, "held", ""),
+    };
+    app.set_stage_word(stage_word.into());
+    app.set_step_text(step_text.into());
+    app.set_bar_fraction(fraction);
+    app.set_bar_tone(tone.into());
+    app.set_eta_text(eta.into());
 }
 
 /// Parses `"WxH"`; `None` on anything else, including a missing or
@@ -63,7 +107,7 @@ fn parse_size(spec: &str) -> Option<(u32, u32)> {
 /// CPU-tone-mapped and no `Automatic` fallback, so no usable adapter is the
 /// run's end: the named `GpuError` and the still-working command-line path
 /// are printed and `Err` carries the code the process ends with.
-fn select_backend() -> Result<(), ExitCode> {
+fn select_backend(controller: Arc<Mutex<AppController>>) -> Result<(), ExitCode> {
     let shared = match focusforge_gpu::device::shared_device() {
         Ok(shared) => shared,
         Err(err) => {
@@ -78,8 +122,12 @@ fn select_backend() -> Result<(), ExitCode> {
         device: shared.device().clone(),
         queue: shared.queue().clone(),
     };
+    // The drop route is installed on this *existing* `BackendSelector`
+    // chain, before any window exists, which is why `controller` is built
+    // before `select_backend` runs rather than inside `bridge::install`.
     if let Err(e) = slint::BackendSelector::new()
         .require_wgpu_29(config)
+        .with_winit_custom_application_handler(bridge::DropHandler::new(controller))
         .select()
     {
         tracing::error!("{e}");
@@ -279,6 +327,24 @@ fn install_diagnostics(
     focusforge_gui::bridge::push_diagnostics_view(app, controller);
 }
 
+/// Loads the `Recent` list from the same config directory `install_input_table`
+/// resolves and installs it on `controller`. A directory that fails to
+/// resolve leaves the list empty for the session, never a reason the window
+/// fails to open.
+fn install_recent(
+    controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
+    args: &Args,
+) {
+    let Some(config_dir) = resolve_config_dir(args) else {
+        return;
+    };
+    let entries = focusforge_gui::recent::load(&config_dir);
+    controller
+        .lock()
+        .unwrap()
+        .install_recent(entries, config_dir);
+}
+
 fn main() -> ExitCode {
     // Ahead of every parser: a re-spawned monitor process carries no
     // arguments of its own and never opens a window.
@@ -313,8 +379,25 @@ fn run(args: &Args) -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    if let Some(tab) = &args.dock_tab
+        && tab != "images"
+        && tab != "settings"
+    {
+        tracing::error!("--dock-tab accepts only \"images\" or \"settings\", got {tab:?}");
+        return ExitCode::from(2);
+    }
+    if let Some(state) = &args.toolbar_state
+        && !TOOLBAR_STATES.contains(&state.as_str())
+    {
+        tracing::error!("--toolbar-state accepts one of {TOOLBAR_STATES:?}, got {state:?}");
+        return ExitCode::from(2);
+    }
 
-    if let Err(code) = select_backend() {
+    // Built before `select_backend`: the drop route
+    // (`bridge::DropHandler`) installs on the `BackendSelector` chain
+    // before any window exists.
+    let controller = Arc::new(Mutex::new(AppController::new()));
+    if let Err(code) = select_backend(controller.clone()) {
         return code;
     }
 
@@ -323,41 +406,59 @@ fn run(args: &Args) -> ExitCode {
         run_window(sheet, args)
     } else {
         let app = AppWindow::new().expect("failed to instantiate AppWindow");
-        let focusforge_gui::bridge::Installed { controller, canvas } = bridge::install(&app);
+        let focusforge_gui::bridge::Installed {
+            controller,
+            canvas,
+            job_timer,
+            toast_timer,
+        } = bridge::install(&app, controller);
+        let _ = &job_timer;
+        let _ = &toast_timer;
 
         install_input_table(&controller, &app, args);
         install_diagnostics(&controller, &app);
         bridge::install_crash_notice(&controller, &app);
+        install_recent(&controller, args);
 
-        if let Some(path) = &args.open {
-            if let Err(e) = controller.lock().unwrap().open_project(path) {
-                tracing::error!("--open failed: {e}");
-                return ExitCode::from(1);
-            }
-            let shared = focusforge_gpu::device::shared_device()
-                .expect("select_backend already selected one");
-            let (composite_path, zmap_path) = controller
+        if let Some(state) = &args.toolbar_state {
+            apply_toolbar_state_preview(&app, state.as_str());
+        }
+
+        for path in &args.open {
+            // The same `open_paths` the picker and the drop route call: a
+            // folder proposes a grouping, a `*.ffp` reopens a saved project.
+            // A reopened project feeds the canvas straight from its own
+            // sealed planes; an unsaved group waits for `Fuse stack`.
+            let outcome = controller
                 .lock()
                 .unwrap()
-                .project_paths()
-                .expect("open_project just succeeded");
+                .open_paths(std::slice::from_ref(path));
+            if let focusforge_gui::OpenOutcome::Refused(err) = outcome {
+                tracing::error!("--open failed: {err}");
+                return ExitCode::from(1);
+            }
+            bridge::feed_canvas(&app, &controller, &canvas);
+        }
 
-            let renderer = focusforge_gui::gpu_canvas::CanvasRenderer::open(
-                shared,
-                &composite_path,
-                &zmap_path,
-            )
-            .expect("open canvas renderer");
-            *canvas.borrow_mut() = Some(renderer);
+        if let Some(tab) = &args.dock_tab {
+            let tab = if tab == "settings" {
+                focusforge_gui::DockTab::Settings
+            } else {
+                focusforge_gui::DockTab::Images
+            };
+            controller.lock().unwrap().select_dock_tab(tab);
+        }
 
-            // Push the initial pane geometry through the same read
-            // `canvas-resized` uses, so the first
-            // frame does not depend on a `changed` callback having fired,
-            // then repaint once to show it -- the `--size` timer's own
-            // resize is what proves `canvas-resized` handles the rest.
-            let (left, right) = focusforge_gui::bridge::read_pane_geometry(&app);
-            controller.lock().unwrap().set_pane_geometry(left, right);
-            focusforge_gui::bridge::repaint(&app, &controller, &canvas);
+        if args.images_sort_menu_open {
+            controller.lock().unwrap().toggle_images_sort_menu();
+        }
+
+        if args.projects_overlay {
+            controller.lock().unwrap().toggle_projects_overlay();
+        }
+
+        if let Some(index) = args.frame_remove_warning {
+            controller.lock().unwrap().remove_frame(index);
         }
 
         run_window(app, args)
