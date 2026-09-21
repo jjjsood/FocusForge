@@ -21,11 +21,11 @@ crates/diagnostics/ the shared `tracing` subscriber (stderr sink, rotating
                diagnostics bundle writer -- linked only by `crates/cli` and
                `crates/gui`, never by `crates/core` or `crates/gpu`
 crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
-               strip, settings modal), a wgpu-backed canvas that renders a
-               composite/Z-Map pair, and remappable keyboard/mouse
-               bindings. `--open <dir>` resolves the fixed development pair
-               `<dir>/golden/laplacian.tif` + `<dir>/golden/laplacian-zmap.tif`,
-               separate from the `.ffp` container `stack` writes
+               strip, projects overlay, settings modal), a wgpu-backed
+               canvas that renders a composite/Z-Map pair, a fuse worker
+               that drives `crates/core`'s own job engine on a background
+               thread, and a keyboard/mouse binding table read from
+               `input.toml`
 spikes/        standalone, workspace-excluded feasibility spikes
 fixtures/      small checked-in TIFF crops used by the test suite
 ```
@@ -50,7 +50,12 @@ handling for `stack`'s pause/resume/cancel controls), and forwards the same
 (`default-features = false`, features `std`, `compat-1-2`, `backend-winit`,
 `renderer-femtovg-wgpu`, `unstable-wgpu-29` -- pinned to the same wgpu major
 `focusforge-gpu` declares -- and `unstable-winit-030`), plus `slint-build` as
-a build dependency and `i-slint-backend-testing` as a dev dependency; Inter
+a build dependency and `i-slint-backend-testing` as a dev dependency; `clap`
+parses its own command-line flags, `rfd` opens the native folder/file
+picker, `toml` and `serde` read and write `input.toml` and the `Recent`
+project list, `directories` resolves where those live per platform, `png`
+writes the `--screenshot` file, and `tracing` reaches the same subscriber
+`focusforge-diagnostics` installs. Inter
 ships bundled under `assets/fonts/` and the icon set is vendored from Lucide
 under `assets/icons/`. `focusforge-diagnostics` declares `tracing` and
 `tracing-subscriber` (with the `tracing-log` bridge, so `log`-crate records
@@ -89,8 +94,11 @@ end to end -- including a forced panic, a forced native crash and the
 crash notice on the next start, each driven by spawning the built binary as
 a child process so a deliberate crash never takes down the test runner --
 plus the fixture manifest. `crates/gui` has its own suite — the theme
-tokens, the plain-Rust shell and canvas state, the viewport arithmetic, and
-the input-remapping table and its `input.toml` file format run headlessly
+tokens, the plain-Rust shell and canvas state, the viewport arithmetic, the
+input-binding table and its `input.toml` file format, classifying a folder,
+a dropped set of frames or a saved project into tabs, the `Images` and
+`Settings` dock panels, the projects overlay's gallery and failure cards,
+and the fuse worker's pause/resume/cancel/retry states all run headlessly
 through `i-slint-backend-testing`, with no real window; a separate windowed
 suite launches the real binary and needs a compositor and a GPU adapter,
 skipping itself with a printed line on a host with neither. Fixtures under

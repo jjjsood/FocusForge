@@ -12,6 +12,9 @@ short on purpose rather than incomplete.
 Using FocusForge: shooting a stack, loading it, choosing an algorithm,
 retouching the result.
 
+- [`guide/gui.md`](guide/gui.md) — opening a folder or a project in the
+  window, the dock's `Images` and `Settings` panels, running and controlling
+  a fuse, and switching between open projects
 - [`guide/stacking.md`](guide/stacking.md) — running `focusforge-cli stack`,
   choosing an algorithm, getting an image back with `export`, and getting the
   Z-Map
@@ -25,8 +28,6 @@ retouching the result.
 - [`guide/diagnostics.md`](guide/diagnostics.md) — the log every run keeps,
   what a crash leaves behind, the notice on the next start, and packaging a
   diagnostics bundle
-- [`guide/gui-mcp.md`](guide/gui-mcp.md) — run Slint's local development MCP
-  endpoint for GUI inspection and interaction
 
 ## Reference
 
