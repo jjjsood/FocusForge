@@ -442,6 +442,77 @@ fn every_strip_box_shares_one_framed_component() {
     );
 }
 
+/// The images panel header, the zoom cluster and the tab strip's window
+/// controls all draw their glyph buttons from one shared primitive, at the
+/// size and padding each call site sets -- not a copy declared locally.
+#[test]
+fn icon_button_is_a_shared_primitive() {
+    let primitive = fs::read_to_string(
+        common::ui_dir()
+            .join("components")
+            .join("ff_icon_button.slint"),
+    )
+    .unwrap();
+    let primitive_code = common::strip_line_comments(&primitive);
+    assert_eq!(
+        primitive_code.matches("export component").count(),
+        1,
+        "ff_icon_button.slint must export exactly one component"
+    );
+    assert!(primitive_code.contains("export component FFIconButton"));
+    for shell_import in ["shell/", "\"../shell"] {
+        assert!(
+            !primitive_code.contains(shell_import),
+            "a primitive must import no shell file"
+        );
+    }
+
+    for (region_path, needle) in [
+        (
+            common::ui_dir()
+                .join("shell")
+                .join("dock")
+                .join("images_panel.slint"),
+            "component FFImagesHeaderButton",
+        ),
+        (
+            common::ui_dir()
+                .join("shell")
+                .join("bottom_bar")
+                .join("zoom_cluster.slint"),
+            "component FFZoomIconButton",
+        ),
+        (
+            common::ui_dir().join("shell").join("tab_strip.slint"),
+            "component WindowGlyphButton",
+        ),
+    ] {
+        let region_code = common::strip_line_comments(&fs::read_to_string(&region_path).unwrap());
+        assert!(
+            !region_code.contains(needle),
+            "{}: must declare no glyph-button component of its own",
+            region_path.display()
+        );
+    }
+
+    for (width, height) in [(1440, 900), (1200, 760)] {
+        let app = app_at(width, height);
+        app.set_project_loaded(true);
+        for (id, side) in [
+            ("FFZoomCluster::zoom-out", 32.0),
+            ("FFImagesPanel::add-button", 22.0),
+            ("FFTabStrip::window-close", 30.0),
+        ] {
+            let (_, _, w, h) = rect(&app, id);
+            assert_eq!(
+                (w, h),
+                (side, side),
+                "{id}: must render {side}x{side} at window width {width}"
+            );
+        }
+    }
+}
+
 /// `FFTab`'s title/unsaved/close row must be anchored to the tab's full
 /// bounds -- as a child of a plain `Rectangle` rather than a layout-managed
 /// parent, an un-anchored `HorizontalLayout` sizes to its own content's

@@ -6,6 +6,8 @@
 // the substring `width` anywhere in that file, and a swatch needs one.
 
 import { Theme, TypeRole } from "theme.slint";
+import { ShellGeometry } from "geometry.slint";
+import { FFIconButton } from "components/ff_icon_button.slint";
 import { FFSlider } from "components/ff_slider.slint";
 import { FFField } from "components/ff_field.slint";
 import { FFToggle } from "components/ff_toggle.slint";
@@ -120,7 +122,7 @@ component IconSizeSample inherits Rectangle {
 export component ThemeSheet inherits Window {
     title: "FocusForge -- token sheet";
     preferred-width: 1100px;
-    preferred-height: 2760px;
+    preferred-height: 2830px;
     background: Theme.surface-base;
     default-font-family: Theme.font-family;
 
@@ -214,6 +216,27 @@ export component ThemeSheet inherits Window {
             IconSizeSample { icon-size: Theme.icon-lg; label: "icon-lg"; }
             IconSizeSample { icon-size: Theme.icon-md; label: "icon-md"; }
             IconSizeSample { icon-size: Theme.icon-sm; label: "icon-sm"; }
+        }
+
+        GroupHeading { text: "Icon button"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            FFIconButton { icon: @image-url("../../../assets/icons/zoom-out.svg"); }
+            FFIconButton {
+                icon: @image-url("../../../assets/icons/arrow-up-down.svg");
+                glyph-size: Theme.icon-sm;
+                pad: Theme.space-1;
+            }
+            FFIconButton {
+                icon: @image-url("../../../assets/icons/x.svg");
+                width: ShellGeometry.strip-box-width;
+                height: ShellGeometry.strip-box-height;
+                recolor-on-hover: false;
+            }
+            FFIconButton {
+                icon: @image-url("../../../assets/icons/zoom-out.svg");
+                enabled: false;
+            }
         }
 
         GroupHeading { text: "Settings panel: section heading"; }

@@ -8,6 +8,7 @@ import { ShellGeometry } from "../../geometry.slint";
 import { FFImageRow } from "../../components/ff_image_row.slint";
 import { FFScrollbar } from "../../components/ff_scrollbar.slint";
 import { FFMenuList } from "../../components/ff_menu_list.slint";
+import { FFIconButton } from "../../components/ff_icon_button.slint";
 
 /// One row of the panel's flat list -- the `.slint` twin of
 /// `crate::images::ImageRow`.
@@ -18,32 +19,6 @@ export struct ImageRowView {
     excluded: bool,
     unresolved: bool,
     top: length,
-}
-
-// A header icon button: transparent at rest, a hover highlight only --
-// `bottom_bar/zoom_cluster.slint`'s `FFZoomIconButton` at a smaller size,
-// used only in this file's own header row.
-component FFImagesHeaderButton inherits Rectangle {
-    in property <image> icon;
-    callback pressed();
-
-    width: Theme.icon-sm + 2 * Theme.space-1;
-    height: self.width;
-    background: area.has-hover ? Theme.surface-hover : transparent;
-    border-radius: Theme.radius-sm;
-    accessible-role: button;
-
-    area := TouchArea {
-        clicked => { root.pressed(); }
-    }
-    Image {
-        source: root.icon;
-        colorize: area.has-hover ? Theme.text-primary : Theme.text-secondary;
-        width: Theme.icon-sm;
-        height: Theme.icon-sm;
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-    }
 }
 
 export component FFImagesPanel inherits Rectangle {
@@ -97,13 +72,17 @@ export component FFImagesPanel inherits Rectangle {
 
             if root.mutable: HorizontalLayout {
                 spacing: Theme.space-1;
-                add-button := FFImagesHeaderButton {
+                add-button := FFIconButton {
                     icon: @image-url("../../../../../assets/icons/folder-plus.svg");
-                    pressed => { root.add-frames-requested(); }
+                    glyph-size: Theme.icon-sm;
+                    pad: Theme.space-1;
+                    triggered => { root.add-frames-requested(); }
                 }
-                sort-button := FFImagesHeaderButton {
+                sort-button := FFIconButton {
                     icon: @image-url("../../../../../assets/icons/arrow-up-down.svg");
-                    pressed => { root.sort-menu-toggled(); }
+                    glyph-size: Theme.icon-sm;
+                    pad: Theme.space-1;
+                    triggered => { root.sort-menu-toggled(); }
                 }
             }
         }
