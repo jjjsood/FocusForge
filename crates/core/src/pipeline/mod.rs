@@ -396,9 +396,9 @@ pub fn run(
                 peak_align_workers = Some(solved.peak_workers);
                 let alignment = solved.alignment;
                 if !align_req.lax && alignment.failure_count() > 0 {
-                    return Err(PipelineError::Align(format!(
-                        "alignment failed for {} frame(s)",
-                        alignment.failure_count()
+                    return Err(PipelineError::Align(describe_align_failure(
+                        &alignment,
+                        &frame_names,
                     )));
                 }
                 // A cache write failure costs a missed optimisation next
@@ -793,6 +793,47 @@ fn run_segment(
         }
         handle.join().expect("job segment thread must not panic")
     })
+}
+
+/// Names the lowest-indexed diverged frame and its divergence reason in
+/// plain words. States the total number of diverged frames only when more
+/// than one diverged.
+fn describe_align_failure(alignment: &StackAlignment, frame_names: &[String]) -> String {
+    use crate::algorithm::AlignStatus;
+
+    let mut failed = alignment.failed();
+    let first = failed
+        .next()
+        .expect("caller checks failure_count() > 0 before building this message");
+    let AlignStatus::Diverged(reason) = first.status else {
+        unreachable!("StackAlignment::failed only yields Diverged entries")
+    };
+    let name = frame_names
+        .get(first.frame)
+        .map(String::as_str)
+        .unwrap_or("<unnamed frame>");
+    let phrase = divergence_phrase(reason);
+    match failed.count() {
+        0 => format!("{name} failed to align: {phrase}"),
+        more => format!(
+            "{name} failed to align: {phrase} ({} frames total)",
+            more + 1
+        ),
+    }
+}
+
+/// Short, user-facing wording for each way a registration can diverge.
+fn divergence_phrase(reason: crate::align::DivergenceReason) -> &'static str {
+    use crate::align::DivergenceReason;
+
+    match reason {
+        DivergenceReason::SingularHessian => "the frame has too little texture to register",
+        DivergenceReason::LemmaOneRegion => "no further step would improve the match",
+        DivergenceReason::NonInvertibleIncrement => "the computed correction could not be inverted",
+        DivergenceReason::CorrelationDecreased => "the match grew worse instead of better",
+        DivergenceReason::TooFewValidSamples => "too few pixels overlapped to measure a match",
+        DivergenceReason::NonFiniteUpdate => "the computation produced an invalid result",
+    }
 }
 
 /// An all-identity [`StackAlignment`] over `frame_count` frames -- what a

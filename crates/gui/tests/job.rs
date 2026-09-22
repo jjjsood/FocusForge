@@ -532,6 +532,35 @@ fn failure_is_reported_and_retryable() {
     }
 }
 
+#[test]
+fn the_failure_message_names_the_frame_and_the_reason() {
+    let mut controller = controller_with_unalignable_frames("message");
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(60));
+    assert!(!controller.job_running());
+    let message = controller
+        .job_failure_message()
+        .expect("a failed run must carry its own message")
+        .to_string();
+
+    assert!(
+        message.contains("01.tif"),
+        "message must name the diverged frame's file name, got: {message}"
+    );
+    assert!(
+        !message.contains("SingularHessian"),
+        "message must spell the reason in words, not the status identifier, got: {message}"
+    );
+    assert!(
+        message.split_whitespace().count() > 2,
+        "message must carry a reason in words, not just a frame name: {message}"
+    );
+    assert!(
+        !message.contains("total"),
+        "only one frame diverges here, so the message must not state a frame count: {message}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // The step vocabulary is derivable from what the engine reports.
 // ---------------------------------------------------------------------
