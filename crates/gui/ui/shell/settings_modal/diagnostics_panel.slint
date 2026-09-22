@@ -6,6 +6,7 @@
 // the footer sits at one position throughout.
 
 import { Theme } from "../../theme.slint";
+import { ShellGeometry } from "../../geometry.slint";
 import { FFManifestList, FFManifestRow } from "../../components/ff_manifest_list.slint";
 import { FFToggle } from "../../components/ff_toggle.slint";
 import { FFTextField } from "../../components/ff_text_field.slint";
@@ -135,11 +136,14 @@ export component FFDiagnosticsPanel inherits Rectangle {
         }
 
         footer := HorizontalLayout {
-            height: 32px;
+            height: ShellGeometry.toolbar-button-height;
             alignment: end;
 
             bundle-primary := FFButton {
                 kind: "primary";
+                compact: true;
+                has-icon: true;
+                icon-source: @image-url("../../../../../assets/icons/download.svg");
                 text: root.primary-label;
                 enabled: !root.busy && !root.loading;
                 clicked => { root.primary-clicked(); }

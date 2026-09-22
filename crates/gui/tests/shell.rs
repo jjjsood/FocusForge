@@ -741,7 +741,7 @@ fn dock_without_a_project_says_so() {
     assert_rect(
         &app,
         "FFCheckpointPanel::checkpoint-export",
-        (1306.0, 94.0, 122.0, 24.0),
+        (1309.0, 93.0, 119.0, 26.0),
     );
     assert_eq!(label(&app, "FFDock::no-project-note"), "No project open.");
     let rule = rect(&app, "FFDock::checkpoint-rule");

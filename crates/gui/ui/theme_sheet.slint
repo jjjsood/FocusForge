@@ -344,6 +344,13 @@ export component ThemeSheet inherits Window {
             FFButton { width: 116px; compact: true; kind: "quiet"; glyph: "☐"; text: "Cancelling…"; enabled: false; }
             FFButton { width: 116px; compact: true; kind: "primary"; glyph: "↻"; text: "Retry"; }
             FFButton { width: 116px; compact: true; kind: "default"; text: "Fuse stack"; enabled: false; }
+            FFButton {
+                width: 140px;
+                kind: "primary";
+                has-icon: true;
+                icon-source: @image-url("../../../assets/icons/download.svg");
+                text: "Create bundle";
+            }
         }
 
         GroupHeading { text: "Bottom bar: progress track"; }
