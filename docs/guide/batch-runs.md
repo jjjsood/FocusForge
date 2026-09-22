@@ -119,7 +119,7 @@ A run's alignment result is kept in a stage cache under
 produced it, so a re-run that changes only a fusion parameter (`--only`
 plus `--set`) skips a costly re-solve. `--no-cache` skips the cache
 entirely for one run, reading nothing from it and leaving nothing behind;
-`focusforge-cli cache clear` empties it without touching any project or a
+`focusforge-cli cache` empties it without touching any project or a
 `--resume` run's own recoverable state.
 
 ## Reviewing the results

@@ -712,26 +712,17 @@ resolved).
 ## `cache`
 
 ```
-focusforge-cli cache <COMMAND>
+focusforge-cli cache [--json]
 ```
 
-Manages the stage cache under `.scratch/stage-cache/`, the store `stack`
-reads and writes to skip a repeated alignment solve — see
-[`guide/batch-runs.md`](../guide/batch-runs.md#the-stage-cache). One
-subcommand today:
-
-### `cache clear`
-
-```
-focusforge-cli cache clear [--json]
-```
-
-Removes every entry from the stage cache. Never touches `.scratch/resume/`
-or any project — a clear must never be able to destroy a cancelled run's
-recoverable work.
+Removes every entry from the stage cache under `.scratch/stage-cache/`, the
+store `stack` reads and writes to skip a repeated alignment solve — see
+[`guide/batch-runs.md`](../guide/batch-runs.md#the-stage-cache). Never touches
+`.scratch/resume/` or any project — a clear must never be able to destroy a
+cancelled run's recoverable work.
 
 ```
-$ focusforge-cli cache clear
+$ focusforge-cli cache
 removed 1 stage cache entry
 ```
 
