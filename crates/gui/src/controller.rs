@@ -269,6 +269,13 @@ struct ProjectTab {
     /// push, since [`AppController::project_cards`] rebuilds far more often
     /// than a picture actually changes.
     thumbnail: Option<Arc<overlay::Thumbnail>>,
+    /// This tab's own run: `Idle` until a fuse starts on it, and whatever it
+    /// last settled to afterward -- read by every bottom-bar and card
+    /// surface for the tab that owns it, regardless of which tab is active.
+    run: job::RunState,
+    /// The request behind this tab's own last run, kept for `Retry` --
+    /// `None` until a run is started on this tab.
+    request: Option<job::JobRequest>,
 }
 
 impl ProjectTab {
@@ -306,6 +313,8 @@ impl ProjectTab {
             excluded,
             frame_sort: None,
             thumbnail,
+            run: job::RunState::Idle,
+            request: None,
         }
     }
 
@@ -566,20 +575,21 @@ pub struct AppController {
     /// whatever directory the test handed in, so a test run never depends on
     /// -- or collides with -- a shared directory.
     scratch_root_for_test: Option<PathBuf>,
+    /// The most recent run's own failure message, taken exactly once by
+    /// [`Self::take_settled_failure`] -- what lets the failure toast
+    /// announce the run that actually failed without reopening itself on
+    /// every later poll.
+    settled_failure: Option<String>,
 }
 
-/// The active fuse run, if any: the control and observer a worker thread
-/// (`crate::job::spawn`) was handed, the shell's own view of its state, the
-/// request that started it -- kept for `retry_fuse` -- the tab it is
-/// running against (a tab switch mid-run must not let `settle_job` promote
-/// whichever tab happens to be active once the worker finishes), and the
-/// join handle [`AppController::settle_job`] polls.
+/// The single live worker, if any: the control/observer pair a background
+/// thread was handed, the tab it runs against, and the join handle
+/// [`AppController::settle_job`] polls. A project's own run state and
+/// request live on its [`ProjectTab`] instead.
 #[derive(Default)]
 struct JobSlot {
-    state: job::RunState,
     control: Option<Arc<job::JobControl>>,
     observer: Option<Arc<job::GuiObserver>>,
-    request: Option<job::JobRequest>,
     tab_index: Option<usize>,
     handle: Option<std::thread::JoinHandle<Result<job::FuseOutcome, job::PipelineError>>>,
 }
@@ -1408,6 +1418,15 @@ impl AppController {
             Some(active) if active < index => Some(active),
             _ => None,
         };
+        // The live worker's own owner marker renumbers the same way: `None`
+        // once the tab that owned it is gone, so `settle_job` writes its
+        // outcome nowhere rather than promoting whatever tab is active once
+        // it finishes.
+        self.job.tab_index = match self.job.tab_index {
+            Some(owner) if owner == index => None,
+            Some(owner) if owner > index => Some(owner - 1),
+            other => other,
+        };
         if closed_was_active {
             self.state.pending_frame_change = None;
         }
@@ -1555,16 +1574,25 @@ impl AppController {
     /// `crate::bridge` is the one place this crosses into Slint.
     pub fn project_cards(&self) -> Vec<CardView> {
         let columns = overlay::columns(self.state.gallery_width);
-        let progress = self.job.observer.as_ref().and_then(|o| o.last_progress());
-        let running_step = job::current_step(&self.job.state, progress.as_ref());
+        let running = self.running_tab();
+        let progress = if running.is_some() {
+            self.job.observer.as_ref().and_then(|o| o.last_progress())
+        } else {
+            None
+        };
         let mut cards = Vec::with_capacity(self.state.projects.len() + self.state.failures.len());
         for (i, tab) in self.state.projects.iter().enumerate() {
-            let fusing = self.job.tab_index == Some(i) && job::is_live(&self.job.state);
+            let fusing = running == Some(i);
             let frame_count = entry::tab_frame_count(&tab.project);
-            let fusing_step = if fusing { running_step } else { None }.map(|step| {
+            let fusing_step = if fusing {
+                job::current_step(&tab.run, progress.as_ref())
+            } else {
+                None
+            }
+            .map(|step| {
                 format!(
                     "{}, {}",
-                    job::stage_word(&self.job.state, progress.as_ref()).to_lowercase(),
+                    job::stage_word(&tab.run, progress.as_ref()).to_lowercase(),
                     step.text()
                 )
             });
@@ -1652,12 +1680,13 @@ impl AppController {
     }
 
     /// `Run again` on a `Did not stack`/`Cancelled` card: re-runs that
-    /// card's own kept request, on its own tab if one is still open (so the
-    /// outcome lands back on the right card rather than whichever tab
-    /// happened to be active). Never more than one card's worth of work: a
-    /// no-op while a run is already live. Returns whether a run started.
+    /// card's own kept request, on its own tab. Refuses rather than
+    /// attributing the run to whatever tab happens to be active when that
+    /// project's tab is no longer open, and never more than one card's worth
+    /// of work: a no-op while any run is already live. Returns whether a run
+    /// started.
     pub fn run_gallery_action(&mut self, index: usize) -> bool {
-        if self.job_running() {
+        if self.any_job_running() {
             return false;
         }
         let Some(failure_index) = index.checked_sub(self.state.projects.len()) else {
@@ -1670,15 +1699,16 @@ impl AppController {
             return false;
         };
         let path = failure.path.clone();
-        if let Some(tab_index) = self
+        let Some(tab_index) = self
             .state
             .projects
             .iter()
             .position(|t| project_identity_path(&t.project) == path)
-        {
-            self.state.active = Some(tab_index);
-        }
-        self.run_request(request);
+        else {
+            return false;
+        };
+        self.state.active = Some(tab_index);
+        self.run_request(tab_index, request);
         true
     }
 
@@ -2534,11 +2564,33 @@ impl AppController {
         self.state.images_scroll_y
     }
 
-    /// Whether a background job is running -- the deferred-capability
+    /// The tab a worker thread is actually running against, if any --
+    /// `None` the instant the worker has finished and its outcome not yet
+    /// read, even though `job.tab_index` still names the tab.
+    fn running_tab(&self) -> Option<usize> {
+        if self.job.control.is_some() {
+            self.job.tab_index
+        } else {
+            None
+        }
+    }
+
+    /// Whether the *active* tab's own run is live -- the deferred-capability
     /// pattern `editor_enabled`/`export_enabled` already use. The panel
-    /// reads this as a whole-panel disable.
+    /// reads this as a whole-panel disable, scoped to whichever tab is in
+    /// front.
     pub fn job_running(&self) -> bool {
-        job::is_live(&self.job.state)
+        self.state
+            .active()
+            .is_some_and(|tab| job::is_live(&tab.run))
+    }
+
+    /// Whether a worker thread is live at all, regardless of which tab it
+    /// belongs to -- what refuses a second concurrent start. Stays `true`
+    /// across the gap between a worker finishing and [`Self::settle_job`]
+    /// reading its outcome.
+    pub fn any_job_running(&self) -> bool {
+        self.job.control.is_some()
     }
 
     /// Starts a fuse run on the active tab's own frames and explicit
@@ -2549,9 +2601,12 @@ impl AppController {
     /// one appends a new one onto the same project. Returns whether a run
     /// was started.
     pub fn start_fuse(&mut self) -> bool {
-        if self.job_running() {
+        if self.any_job_running() {
             return false;
         }
+        let Some(active) = self.state.active else {
+            return false;
+        };
         let Some(tab) = self.state.active() else {
             return false;
         };
@@ -2594,27 +2649,35 @@ impl AppController {
             backend: None,
             append,
         };
-        self.run_request(request);
+        self.run_request(active, request);
         true
     }
 
-    /// Pauses a running job, or resumes a paused one -- a no-op while
+    /// Pauses a running job, or resumes a paused one -- a no-op while the
+    /// active tab is not the one actually running, or that run is
     /// cancelling, failed, idle or fused.
     pub fn pause_or_resume(&mut self) {
         let Some(control) = self.job.control.clone() else {
             return;
         };
-        match self.job.state {
+        let running = self.running_tab();
+        if running.is_none() || running != self.state.active {
+            return;
+        }
+        let Some(tab) = running.and_then(|i| self.state.projects.get_mut(i)) else {
+            return;
+        };
+        match tab.run {
             job::RunState::Running => {
                 control.pause();
-                self.job.state = job::RunState::Paused;
+                tab.run = job::RunState::Paused;
             }
             job::RunState::Paused => {
                 control.clear();
                 if let Some(observer) = &self.job.observer {
                     observer.resume();
                 }
-                self.job.state = job::RunState::Running;
+                tab.run = job::RunState::Running;
             }
             _ => return,
         }
@@ -2623,64 +2686,107 @@ impl AppController {
 
     /// Requests a cancel. During alignment this lands only once alignment
     /// returns (the engine's own "reported, never controlled" contract);
-    /// the shell shows `Cancelling` for that interval.
+    /// the shell shows `Cancelling` for that interval. A no-op unless the
+    /// active tab is the one actually running.
     pub fn cancel_fuse(&mut self) {
         let Some(control) = self.job.control.clone() else {
+            return;
+        };
+        let running = self.running_tab();
+        if running.is_none() || running != self.state.active {
+            return;
+        }
+        let Some(tab) = running.and_then(|i| self.state.projects.get_mut(i)) else {
             return;
         };
         control.cancel();
         if let Some(observer) = &self.job.observer {
             observer.resume();
         }
-        self.job.state = job::RunState::Cancelling;
+        tab.run = job::RunState::Cancelling;
         self.emit(ShellEvent::JobChanged);
     }
 
-    /// Starts the same work again, from the request a failed run stored --
-    /// controller-level only: the engine itself carries no notion of retry.
+    /// Starts the same work again, from the request the active tab's own
+    /// failed run stored -- controller-level only: the engine itself carries
+    /// no notion of retry. Refuses while any run is live, including one on
+    /// another tab.
     pub fn retry_fuse(&mut self) -> bool {
-        let Some(request) = self.job.request.clone() else {
+        if self.any_job_running() {
+            return false;
+        }
+        let Some(active) = self.state.active else {
             return false;
         };
-        self.run_request(request);
+        let Some(request) = self
+            .state
+            .projects
+            .get(active)
+            .and_then(|tab| tab.request.clone())
+        else {
+            return false;
+        };
+        self.run_request(active, request);
         true
     }
 
-    fn run_request(&mut self, request: job::JobRequest) {
+    /// Starts `request` on tab `tab_index`, off the UI thread.
+    fn run_request(&mut self, tab_index: usize, request: job::JobRequest) {
         let control = job::JobControl::new();
         let observer = Arc::new(job::GuiObserver::new());
         self.job.control = Some(Arc::clone(&control));
         self.job.observer = Some(Arc::clone(&observer));
-        self.job.request = Some(request.clone());
-        self.job.tab_index = self.state.active;
-        self.job.state = job::RunState::Running;
-        self.job.handle = Some(job::spawn(request, control, observer));
+        self.job.tab_index = Some(tab_index);
+        self.job.handle = Some(job::spawn(request.clone(), control, observer));
+        if let Some(tab) = self.state.projects.get_mut(tab_index) {
+            tab.run = job::RunState::Running;
+            tab.request = Some(request);
+        }
         self.emit(ShellEvent::JobChanged);
     }
 
-    /// The failed run's own message, `None` outside [`job::RunState::Failed`]
-    /// -- what the failure toast names.
+    /// The active tab's own failed run message, `None` outside
+    /// [`job::RunState::Failed`].
     pub fn job_failure_message(&self) -> Option<&str> {
-        match &self.job.state {
-            job::RunState::Failed(message) => Some(message.as_str()),
+        match self.state.active().map(|tab| &tab.run) {
+            Some(job::RunState::Failed(message)) => Some(message.as_str()),
             _ => None,
         }
     }
 
-    /// The toolbar/bottom-bar surfaces' current view of the active run.
+    /// The most recent run's own failure message, taken exactly once --
+    /// `None` once already read, or with no failure to announce. What the
+    /// failure toast names, so it fires only for the run that actually
+    /// failed and never re-opens on a later poll.
+    pub fn take_settled_failure(&mut self) -> Option<String> {
+        self.settled_failure.take()
+    }
+
+    /// The toolbar/bottom-bar surfaces' current view of the active tab's
+    /// run, empty rather than another tab's numbers with no active tab or
+    /// with the active tab not the one actually running.
     pub fn job_view(&self) -> JobView {
-        let progress = self.job.observer.as_ref().and_then(|o| o.last_progress());
+        let run = self
+            .state
+            .active()
+            .map(|tab| tab.run.clone())
+            .unwrap_or_default();
+        let progress = if self.state.active == self.running_tab() {
+            self.job.observer.as_ref().and_then(|o| o.last_progress())
+        } else {
+            None
+        };
         JobView {
-            state: self.job.state.clone(),
-            toolbar_run_state: job::toolbar_run_state(&self.job.state).to_string(),
-            stage_word: job::stage_word(&self.job.state, progress.as_ref()),
-            step_text: job::current_step(&self.job.state, progress.as_ref())
+            toolbar_run_state: job::toolbar_run_state(&run).to_string(),
+            stage_word: job::stage_word(&run, progress.as_ref()),
+            step_text: job::current_step(&run, progress.as_ref())
                 .map(|s| s.text())
                 .unwrap_or_default(),
-            eta_text: job::eta_text(&self.job.state, progress.as_ref()),
-            bar_tone: job::bar_tone(&self.job.state).to_string(),
+            eta_text: job::eta_text(&run, progress.as_ref()),
+            bar_tone: job::bar_tone(&run).to_string(),
             fraction: job::bar_fraction(progress.as_ref()),
             fuse_enabled: self.fuse_enabled(),
+            state: run,
         }
     }
 
@@ -2711,18 +2817,24 @@ impl AppController {
             self.job.handle = Some(handle);
             return None;
         }
-        // Read before `settle_job` clears the observer below: the step this
-        // run was on when it stopped is what a failure or cancellation
-        // card's own stage line names.
+        // Read before the observer is cleared below: the step this run was
+        // on when it stopped is what a failure or cancellation card's own
+        // stage line names.
         let progress = self.job.observer.as_ref().and_then(|o| o.last_progress());
         let step = job::progress_step(progress.as_ref());
-        let request = self.job.request.clone();
-        let was_cancelling = self.job.state == job::RunState::Cancelling;
+        let tab_index = self.job.tab_index.take();
+        let owner = tab_index.and_then(|i| self.state.projects.get(i));
+        let request = owner.and_then(|tab| tab.request.clone());
+        let was_cancelling = owner.is_some_and(|tab| tab.run == job::RunState::Cancelling);
         let settled = job::settle(handle.join());
-        self.job.state = settled.state;
         self.job.control = None;
         self.job.observer = None;
-        let tab_index = self.job.tab_index.take();
+        // With the owning tab gone (closed mid-run), this writes nothing --
+        // no tab is promoted, and no outcome lands on whichever tab happens
+        // to be active now.
+        if let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) {
+            tab.run = settled.state.clone();
+        }
         if tab_index == self.state.active {
             // The run's own tab is the active one -- the canvas must reload
             // even though the owner already matches, since the planes on
@@ -2734,8 +2846,9 @@ impl AppController {
             .map(|tab| (project_identity_path(&tab.project), tab.title.clone()));
         let frame_count = request.as_ref().map_or(0, |r| r.frames.len());
 
-        match &self.job.state {
+        match &settled.state {
             job::RunState::Failed(message) => {
+                self.settled_failure = Some(message.clone());
                 if let Some((path, title)) = tab_info.clone() {
                     self.record_failure(FailureCard {
                         kind: FailureKind::Failed,

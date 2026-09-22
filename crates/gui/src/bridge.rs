@@ -330,7 +330,10 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     app.set_project_loaded(controller.active_project().is_some());
     app.set_plus_selected(controller.plus_selected());
     app.set_skipped_notice(controller.notice().unwrap_or_default().into());
-    app.set_fuse_enabled(controller.fuse_enabled());
+    // The active tab may have changed with no `JobChanged`/poll event of its
+    // own in between -- push its own run onto the bar right here rather than
+    // leaving the words the previously active tab last wrote.
+    push_job(app, &controller.job_view());
     push_settings_panel(app, &controller);
     push_images_panel(app, &controller);
     push_projects_overlay(app, &controller);
@@ -409,16 +412,11 @@ fn start_job_timer(
         if settled.is_some() {
             push_projects(&app, &controller);
             repaint(&app, &controller, &canvas);
-        } else if let Some(message) = controller
-            .lock()
-            .unwrap()
-            .job_failure_message()
-            .map(str::to_string)
-        {
+        } else if let Some(message) = controller.lock().unwrap().take_settled_failure() {
             open_job_toast(&app, message, &toast_timer);
         }
         let view = controller.lock().unwrap().job_view();
-        let live = job::is_live(&view.state);
+        let live = controller.lock().unwrap().any_job_running();
         push_job(&app, &view);
         push_projects_overlay(&app, &controller.lock().unwrap());
         if !live {

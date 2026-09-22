@@ -105,10 +105,12 @@ pub fn tree(name: &str) -> PathBuf {
     dir
 }
 
-/// Polls `settle_job`/`job_view` until the run is no longer live, returning
-/// the materialized plane paths from the call that actually settled it (if
-/// any). The window's own timer does exactly this poll, just on a Slint
-/// `Timer` instead of a plain loop.
+/// Polls `settle_job` until no worker is live any more, returning the
+/// materialized plane paths from the call that actually settled it (if
+/// any). Tracks the worker itself, not the active tab's own view of it, so
+/// this still waits out a run on a tab other than the one selected. The
+/// window's own timer does exactly this poll, just on a Slint `Timer`
+/// instead of a plain loop.
 #[allow(dead_code)]
 pub fn wait_for_settle(
     controller: &mut focusforge_gui::AppController,
@@ -119,7 +121,7 @@ pub fn wait_for_settle(
         if let Some(planes) = controller.settle_job() {
             return Some(planes);
         }
-        if !focusforge_gui::job::is_live(&controller.job_view().state) {
+        if !controller.any_job_running() {
             return None;
         }
         assert!(

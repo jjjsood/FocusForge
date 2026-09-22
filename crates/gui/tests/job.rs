@@ -10,7 +10,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::ParamValues;
@@ -50,6 +50,41 @@ fn controller_with_frames(name: &str, count: usize) -> AppController {
     ));
     controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
     controller
+}
+
+/// A controller with two unsaved tabs, each over its own copied fixture
+/// frames -- three for tab 0, two for tab 1, so a per-tab assertion cannot
+/// pass on a shared frame count. Tab 0 is selected on return.
+fn controller_with_two_tabs(name: &str) -> AppController {
+    let mut controller = controller_with_frames(&format!("{name}_a"), 3);
+    let root_b = common::tree(&format!("{name}_b_frames"));
+    for i in 0..2 {
+        copy_frame(&root_b, &format!("{i:02}.tif"), i);
+    }
+    assert!(matches!(
+        controller.open_paths(&[root_b]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.select_project(0);
+    controller
+}
+
+/// Starts a fuse on the active tab and holds it at a pause once the
+/// observer has ticked at least one unit of progress -- pausing before any
+/// tick would let a later assertion read a held run at `0.0` for reasons
+/// this helper does not intend to prove.
+fn start_and_hold_at_pause(controller: &mut AppController, timeout: Duration) {
+    assert!(controller.start_fuse());
+    let start = Instant::now();
+    while controller.job_view().fraction <= 0.0 {
+        assert!(
+            start.elapsed() < timeout,
+            "the run never ticked progress within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    controller.pause_or_resume();
+    assert_eq!(controller.job_view().state, job::RunState::Paused);
 }
 
 // ---------------------------------------------------------------------
@@ -842,4 +877,278 @@ fn a_second_run_reports_its_own_completion_time() {
         at, expected,
         "the idle line must reflect the head checkpoint's own time"
     );
+}
+
+// ---------------------------------------------------------------------
+// Every project carries its own run: the bottom bar, the transport, the
+// whole-panel disable and the overlay's cards all read the tab that owns
+// them, never the last run's.
+// ---------------------------------------------------------------------
+
+#[test]
+fn switching_to_an_idle_tab_clears_the_running_tabs_words() {
+    let mut controller = controller_with_two_tabs("idle_clears");
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+    assert!(controller.job_view().fraction > 0.0);
+
+    controller.select_project(1);
+    let view = controller.job_view();
+    assert_eq!(view.stage_word, "");
+    assert_eq!(view.step_text, "");
+    assert_eq!(view.eta_text, "");
+    assert_eq!(view.fraction, 0.0);
+
+    controller.select_project(0);
+    controller.cancel_fuse();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+}
+
+#[test]
+fn returning_to_the_running_tab_restores_its_live_progress() {
+    let mut controller = controller_with_two_tabs("returns_restores");
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+    let held_fraction = controller.job_view().fraction;
+    assert!(held_fraction > 0.0);
+
+    controller.select_project(1);
+    assert_eq!(controller.job_view().fraction, 0.0);
+
+    controller.select_project(0);
+    let view = controller.job_view();
+    assert_eq!(view.stage_word, "Paused");
+    assert_eq!(
+        view.fraction, held_fraction,
+        "the same non-zero fraction the bar read before the switch"
+    );
+    assert_eq!(view.eta_text, "ETA —");
+
+    controller.cancel_fuse();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+}
+
+#[test]
+fn a_fused_tab_keeps_its_own_completion_after_a_later_run() {
+    let mut controller = controller_with_two_tabs("fused_keeps");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    let job::RunState::Fused { at } = controller.job_view().state else {
+        panic!("expected tab 0 to complete");
+    };
+
+    controller.select_project(1);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    match controller.job_view().state {
+        job::RunState::Fused { .. } => {}
+        other => panic!("expected tab 1 to complete too, got {other:?}"),
+    }
+
+    controller.select_project(0);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Fused { at },
+        "tab 0's own completion must survive tab 1's later run"
+    );
+}
+
+/// A controller tab that cannot align: a textured reference frame and
+/// `frame_count - 1` perfectly flat ones, whose zero gradient drives
+/// `pyramidal-ecc`'s solver singular. Opens as a new tab, which becomes
+/// active.
+fn add_unalignable_tab(controller: &mut AppController, name: &str, frame_count: usize) {
+    let root = common::tree(&format!("{name}_frames"));
+    write_synthetic_frame(&root.join("00.tif"), 64, false);
+    for i in 1..frame_count {
+        write_synthetic_frame(&root.join(format!("{i:02}.tif")), 64, true);
+    }
+    assert!(matches!(
+        controller.open_paths(&[root]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.set_align_algorithm("pyramidal-ecc");
+}
+
+#[test]
+fn two_failures_keep_their_own_messages_and_requests() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree("two_failures_scratch"));
+
+    add_unalignable_tab(&mut controller, "two_failures_a", 2);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    let message_a = controller
+        .job_failure_message()
+        .expect("tab A must carry its own failure message")
+        .to_string();
+
+    add_unalignable_tab(&mut controller, "two_failures_b", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    let message_b = controller
+        .job_failure_message()
+        .expect("tab B must carry its own failure message")
+        .to_string();
+
+    controller.select_project(0);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Failed(message_a.clone())
+    );
+    controller.select_project(1);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Failed(message_b)
+    );
+
+    assert!(
+        controller.retry_fuse(),
+        "retry on the active tab must start a run"
+    );
+    assert!(
+        controller.job_running(),
+        "the retried tab must read its own run as live"
+    );
+    assert!(
+        !controller.project_cards()[0].fusing,
+        "the other tab's card must stay idle while this one retries"
+    );
+
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    assert!(!controller.job_running());
+
+    controller.select_project(0);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Failed(message_a),
+        "tab A's own failure must survive tab B's retry"
+    );
+}
+
+#[test]
+fn a_tab_switch_updates_the_bar_without_a_job_event() {
+    use slint::ComponentHandle;
+
+    i_slint_backend_testing::init_no_event_loop();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+
+    let mut controller = controller_with_two_tabs("bar_without_event");
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+    let controller = std::sync::Arc::new(std::sync::Mutex::new(controller));
+
+    focusforge_gui::bridge::push_projects(&app, &controller);
+    assert_eq!(app.get_stage_word(), "Paused");
+
+    // Only the tab switch, no `JobChanged`/poll event of its own.
+    controller.lock().unwrap().select_project(1);
+    focusforge_gui::bridge::push_projects(&app, &controller);
+
+    assert_eq!(app.get_stage_word(), "");
+    assert_eq!(app.get_step_text(), "");
+    assert_eq!(app.get_eta_text(), "");
+
+    let mut guard = controller.lock().unwrap();
+    guard.select_project(0);
+    guard.cancel_fuse();
+    common::wait_for_settle(&mut guard, Duration::from_secs(120));
+}
+
+#[test]
+fn an_idle_tab_stays_editable_while_another_tab_fuses() {
+    let mut controller = controller_with_two_tabs("idle_editable");
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(1);
+    assert!(
+        !controller.job_running(),
+        "the idle tab must not read another tab's run as its own"
+    );
+    controller.toggle_frame_excluded(0);
+    assert!(
+        controller.images_panel().rows[0].excluded,
+        "the idle tab's own images panel must stay editable while another tab fuses"
+    );
+
+    controller.select_project(0);
+    controller.cancel_fuse();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+}
+
+#[test]
+fn a_second_start_is_refused_while_any_run_is_live() {
+    let mut controller = controller_with_two_tabs("second_start_refused");
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(1);
+    assert!(
+        !controller.start_fuse(),
+        "starting a second fuse while one is live must be refused"
+    );
+
+    controller.select_project(0);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Paused,
+        "the first run must be unaffected by the refused second start"
+    );
+
+    controller.cancel_fuse();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+}
+
+#[test]
+fn closing_the_owning_tab_mid_run_promotes_nothing() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree("closing_mid_run_scratch"));
+    add_unalignable_tab(&mut controller, "closing_mid_run_a", 2);
+    // The survivor: a different frame count than tab A's, so a leaked value
+    // could not pass by coincidence.
+    let survivor_root = common::tree("closing_mid_run_b_frames");
+    for i in 0..3 {
+        copy_frame(&survivor_root, &format!("{i:02}.tif"), i);
+    }
+    assert!(matches!(
+        controller.open_paths(&[survivor_root]),
+        OpenOutcome::Opened(_)
+    ));
+
+    controller.select_project(0);
+    assert!(controller.start_fuse());
+    assert!(controller.any_job_running());
+
+    controller.close_project(0);
+    assert_eq!(controller.project_tabs().len(), 1);
+    assert!(
+        controller.any_job_running(),
+        "the orphaned run keeps refusing a second start until it settles"
+    );
+    assert!(
+        !controller.start_fuse(),
+        "a fresh start is refused while the orphaned run is still live"
+    );
+
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    assert!(!controller.any_job_running());
+
+    assert_eq!(
+        controller.checkpoint_count(),
+        Some(0),
+        "the orphaned run's outcome must not write onto the surviving tab"
+    );
+    assert_eq!(
+        controller.project_cards().len(),
+        1,
+        "the orphaned run's failure card must not land on the survivor"
+    );
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Idle,
+        "the bar reports the now-active, surviving tab"
+    );
+
+    assert!(
+        controller.start_fuse(),
+        "a fresh start is accepted again once the orphaned run has settled"
+    );
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
 }
