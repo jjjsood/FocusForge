@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! `focusforge-gui`'s entry point. Every flag below exists so the window
-//! can be observed without a person in front of it (steps 9-13).
+//! can be observed without a person in front of it.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -177,6 +177,18 @@ fn run_window<T: ComponentHandle + 'static>(app: T, args: &Args) -> i32 {
         });
     }
 
+    #[cfg(feature = "gpu-tests")]
+    if let Some(ms) = std::env::var("FF_FORCE_DEVICE_LOST_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        slint::Timer::single_shot(Duration::from_millis(ms), || {
+            if let Ok(shared) = focusforge_gpu::device::shared_device() {
+                shared.force_loss();
+            }
+        });
+    }
+
     if let Some(ms) = args.exit_after {
         let app_weak = app.as_weak();
         let screenshot_path = args.screenshot.clone();
@@ -185,22 +197,54 @@ fn run_window<T: ComponentHandle + 'static>(app: T, args: &Args) -> i32 {
             if let Some(app) = app_weak.upgrade()
                 && let Some(path) = &screenshot_path
             {
-                match app.window().take_snapshot() {
-                    Ok(buffer) => {
-                        if let Err(e) = screenshot::write_png(&buffer, path) {
-                            tracing::error!("--screenshot failed: {e}");
+                if focusforge_gpu::errors::device_lost() {
+                    tracing::error!("--screenshot skipped: the graphics device is already lost");
+                } else {
+                    match app.window().take_snapshot() {
+                        Ok(buffer) => {
+                            if let Err(e) = screenshot::write_png(&buffer, path) {
+                                tracing::error!("--screenshot failed: {e}");
+                                exit_code.set(1);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("take_snapshot failed: {e}");
                             exit_code.set(1);
                         }
-                    }
-                    Err(e) => {
-                        tracing::error!("take_snapshot failed: {e}");
-                        exit_code.set(1);
                     }
                 }
             }
 
             let _ = slint::quit_event_loop();
         });
+    }
+
+    // Polls for a lost device every 250 ms, off the render path entirely --
+    // the flag other code reads is only ever this fresh. Bound to a local so
+    // dropping it at function exit stops it. Latched: the loss flag is never
+    // cleared, so a second tick before the loop unwinds must not repeat it.
+    let loss_timer = slint::Timer::default();
+    {
+        let exit_code = exit_code.clone();
+        let latched = std::cell::Cell::new(false);
+        loss_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(250),
+            move || {
+                if latched.get() {
+                    return;
+                }
+                let Ok(shared) = focusforge_gpu::device::shared_device() else {
+                    return;
+                };
+                if shared.lost() {
+                    latched.set(true);
+                    tracing::error!("ending the session: the graphics device is gone");
+                    exit_code.set(3);
+                    let _ = slint::quit_event_loop();
+                }
+            },
+        );
     }
 
     if let Err(e) = app.run() {
@@ -265,10 +309,32 @@ fn install_input_table(
     app.set_input_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
     app.set_input_provenance(controller.input_provenance_line().into());
 
-    if args.settings_section.is_some() {
+    if let Some(section) = &args.settings_section {
         controller.open_settings();
         app.set_settings_open(true);
+        let parsed = if section == "diagnostics" {
+            focusforge_gui::SettingsSection::Diagnostics
+        } else {
+            focusforge_gui::SettingsSection::InputMap
+        };
+        controller.select_settings_section(parsed);
+        app.set_settings_section(section.clone().into());
     }
+}
+
+/// Sets the diagnostics directories, starts a scan for them on a background
+/// thread, and pushes the panel's first view -- which carries no rows yet,
+/// since nothing on this path reads either directory itself.
+fn install_diagnostics(
+    controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
+    app: &AppWindow,
+) {
+    controller.lock().unwrap().set_diagnostics_dirs(
+        focusforge_diagnostics::data_dir_from_env(),
+        focusforge_diagnostics::config_dir_from_env(),
+    );
+    let _ = controller.lock().unwrap().start_manifest_scan();
+    focusforge_gui::bridge::push_diagnostics_view(app, controller);
 }
 
 /// Loads the `Recent` list from the same config directory `install_input_table`
@@ -311,12 +377,16 @@ fn main() -> ExitCode {
 /// event loop. Every ending is a returned code rather than a process exit,
 /// which runs no destructor: the diagnostics value `main` holds has to drop
 /// for what it buffers to reach disk. Exit codes: 0 for a window closed
-/// normally, 1 for a failure while opening one, 2 for a refused argument.
+/// normally, 1 for a failure while opening one, 2 for a refused argument, 3
+/// for a session ended because the graphics device was lost.
 fn run(args: &Args) -> ExitCode {
     if let Some(section) = &args.settings_section
         && section != "input-map"
+        && section != "diagnostics"
     {
-        tracing::error!("--settings-section accepts only \"input-map\", got {section:?}");
+        tracing::error!(
+            "--settings-section accepts \"input-map\" or \"diagnostics\", got {section:?}"
+        );
         return ExitCode::from(2);
     }
     if let Some(tab) = &args.dock_tab
@@ -358,6 +428,8 @@ fn run(args: &Args) -> ExitCode {
         let _ = &toast_timer;
 
         install_input_table(&controller, &app, args);
+        install_diagnostics(&controller, &app);
+        bridge::install_crash_notice(&controller, &app);
         install_recent(&controller, args);
 
         if let Some(state) = &args.toolbar_state {

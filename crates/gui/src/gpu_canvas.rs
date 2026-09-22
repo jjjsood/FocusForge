@@ -40,6 +40,9 @@ impl PaneTexture {
         self.image.clone().unwrap_or_default()
     }
 
+    /// The single point where both a (re)allocation and a render happen, so
+    /// one early return covers both halves of a lost device: no new
+    /// `DisplayTexture` and no `render` call once the device is known gone.
     fn ensure_and_render(
         &mut self,
         shared: &SharedDevice,
@@ -49,21 +52,86 @@ impl PaneTexture {
         samples_per_pixel: u32,
         index_scale: u32,
     ) {
+        if focusforge_gpu::errors::device_lost() {
+            return;
+        }
         let wanted = TextureSpec { width, height };
         if crate::canvas::needs_realloc(self.spec, wanted) {
             let texture = DisplayTexture::new(shared.device(), width, height);
-            self.image = Some(
-                slint::Image::try_from(texture.texture().clone())
-                    .expect("display texture must satisfy slint's import contract"),
-            );
-            self.display_texture = Some(texture);
-            self.spec = Some(wanted);
+            let imported = slint::Image::try_from(texture.texture().clone());
+            self.apply_import(imported, texture, wanted);
         }
-        let texture = self
-            .display_texture
-            .as_ref()
-            .expect("ensure_and_render always allocates before this point");
+        let Some(texture) = self.display_texture.as_ref() else {
+            // The only newly (re)allocated texture failed import: nothing to
+            // render into this frame, and the previous image is kept as-is.
+            return;
+        };
         render(shared, texture, src, samples_per_pixel, index_scale);
+    }
+
+    /// Applies the outcome of importing a newly (re)allocated texture. On
+    /// success the pane's texture, image and spec all advance together; on
+    /// failure the previous image is kept and only `wanted` is recorded, so
+    /// the same failing size is not retried on the next redraw.
+    fn apply_import(
+        &mut self,
+        imported: Result<slint::Image, slint::wgpu_29::TextureImportError>,
+        texture: DisplayTexture,
+        wanted: TextureSpec,
+    ) {
+        match imported {
+            Ok(image) => {
+                self.image = Some(image);
+                self.display_texture = Some(texture);
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    width = wanted.width,
+                    height = wanted.height,
+                    "display texture import failed; keeping the previous frame"
+                );
+            }
+        }
+        self.spec = Some(wanted);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_failure_keeps_the_previous_image_and_records_the_spec() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let mut pane = PaneTexture::default();
+        let texture = DisplayTexture::new(shared.device(), 4, 4);
+        let wanted = crate::canvas::TextureSpec {
+            width: 4,
+            height: 4,
+        };
+
+        pane.apply_import(
+            Err(slint::wgpu_29::TextureImportError::InvalidFormat),
+            texture,
+            wanted,
+        );
+
+        assert!(
+            pane.display_texture.is_none(),
+            "a failed import must not store the texture it was given"
+        );
+        assert_eq!(
+            pane.spec,
+            Some(wanted),
+            "the failing size must still be recorded"
+        );
+        assert!(
+            !crate::canvas::needs_realloc(pane.spec, wanted),
+            "the same failing size must not be retried on the next redraw"
+        );
     }
 }
 

@@ -143,3 +143,35 @@ pub fn gui_bin(test_name: &str) -> Command {
     cmd.env("FOCUSFORGE_DATA_DIR", &data_dir);
     cmd
 }
+
+/// `true` when this host can plausibly open a window -- a test that opens
+/// the real binary's window skips with an explicit line rather than
+/// reddening `cargo test --workspace` on a headless gate host.
+#[allow(dead_code)]
+pub fn has_display() -> bool {
+    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+/// A `<root>/focusforge` data directory holding roughly `total_log_bytes`
+/// across a live log and three rotated siblings, one JSON Lines record per
+/// line, plus one crash report -- large enough that a synchronous manifest
+/// scan over it costs measurable time.
+#[allow(dead_code)]
+pub fn seed_large_diagnostics_dir(root: &Path, total_log_bytes: usize) -> PathBuf {
+    let data = root.join("focusforge");
+    std::fs::create_dir_all(data.join("logs")).unwrap();
+    std::fs::create_dir_all(data.join("crashes")).unwrap();
+    let line = "{\"level\":\"INFO\",\"target\":\"focusforge_gui\",\"message\":\"tick\"}\n";
+    let lines_per_file = (total_log_bytes / 4) / line.len();
+    let content = line.repeat(lines_per_file);
+    std::fs::write(data.join("logs/focusforge.jsonl"), &content).unwrap();
+    for n in 1..=3 {
+        std::fs::write(data.join(format!("logs/focusforge.{n}.jsonl")), &content).unwrap();
+    }
+    std::fs::write(
+        data.join("crashes/20260918T010203Z-focusforge-gui-1.dmp"),
+        b"MDMP",
+    )
+    .unwrap();
+    data
+}

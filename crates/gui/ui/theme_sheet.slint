@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The token sheet `--theme-sheet` renders one row per named token group
-// (colour, type, spacing, radius, icon size). Kept out of `theme.slint`
-// itself: `crates/gui/tests/theme.rs`'s `no_type_role_fixes_a_width` forbids
-// the substring `width` anywhere in that file, and a swatch needs one.
+// Visual reference sheet for every design token and shared component,
+// rendered via `--theme-sheet`. Kept separate from `theme.slint`: a test
+// there forbids the substring `width` anywhere in that file, and a swatch
+// needs one.
 
 import { Theme, TypeRole } from "theme.slint";
 import { ShellGeometry } from "geometry.slint";
@@ -26,6 +26,8 @@ import { FFDialog } from "components/ff_dialog.slint";
 import { FFDialogFooter } from "components/ff_dialog_footer.slint";
 import { FFChip } from "components/ff_chip.slint";
 import { FFProjectCard } from "components/ff_project_card.slint";
+import { FFManifestList } from "components/ff_manifest_list.slint";
+import { FFToast } from "shell/dialogs.slint";
 
 component ColourSwatch inherits Rectangle {
     in property <color> swatch;
@@ -122,7 +124,7 @@ component IconSizeSample inherits Rectangle {
 export component ThemeSheet inherits Window {
     title: "FocusForge -- token sheet";
     preferred-width: 1100px;
-    preferred-height: 2830px;
+    preferred-height: 2960px;
     background: Theme.surface-base;
     default-font-family: Theme.font-family;
 
@@ -239,6 +241,39 @@ export component ThemeSheet inherits Window {
             }
         }
 
+        GroupHeading { text: "FFManifestList"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFManifestList {
+                rows: [
+                    { name: "diagnostics.log", value: "412 KB", not-redacted: false },
+                    { name: "diagnostics.log.1", value: "1.0 MB", not-redacted: false },
+                    { name: "panic-2026-09-15T10-22-01.json", value: "8 KB", not-redacted: false },
+                    { name: "system-summary.txt", value: "2 KB", not-redacted: false },
+                    {
+                        name: "crash-2026-09-18T09-03-12.dmp",
+                        value: "8.2 MB · not redacted",
+                        not-redacted: true,
+                    },
+                ];
+            }
+            FFManifestList {
+                note: "No logs or crash evidence were found.";
+            }
+        }
+
+        GroupHeading { text: "FFToast"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFToast { toast-open: true; message: "1 crash found"; }
+            FFToast { toast-open: true; message: "3 crashes found"; tone: "info"; }
+            FFToast {
+                toast-open: true;
+                message: "128 crashes found";
+                link-label: "Review";
+            }
+        }
+
         GroupHeading { text: "Settings panel: section heading"; }
         HorizontalLayout {
             spacing: Theme.space-6;
@@ -332,6 +367,13 @@ export component ThemeSheet inherits Window {
             FFButton { width: 116px; compact: true; kind: "quiet"; glyph: "☐"; text: "Cancelling…"; enabled: false; }
             FFButton { width: 116px; compact: true; kind: "primary"; glyph: "↻"; text: "Retry"; }
             FFButton { width: 116px; compact: true; kind: "default"; text: "Fuse stack"; enabled: false; }
+            FFButton {
+                width: 140px;
+                kind: "primary";
+                has-icon: true;
+                icon-source: @image-url("../../../assets/icons/download.svg");
+                text: "Create bundle";
+            }
         }
 
         GroupHeading { text: "Bottom bar: progress track"; }
@@ -341,6 +383,7 @@ export component ThemeSheet inherits Window {
             FFProgressBar { width: 400px; tone: "held"; fraction: 0.62; }
             FFProgressBar { width: 400px; tone: "failed"; fraction: 0.24; }
             FFProgressBar { width: 400px; tone: "running"; fraction: 0.0; }
+            FFProgressBar { width: 400px; tone: "running"; indeterminate: true; }
         }
 
         GroupHeading { text: "Images list: row"; }

@@ -40,6 +40,11 @@ show along the bottom of the window while a run is live. Fusing a tab that
 was already opened from a project appends the new result rather than
 replacing it.
 
+If the graphics device the window is using disappears (a driver reset, a
+GPU unplugged), the canvas stops updating and the window closes itself a
+moment later rather than hanging; see
+[`guide/diagnostics.md`](diagnostics.md) for where that is logged.
+
 ## Switching between projects
 
 The projects overlay lists every open project as a card, plus a card for any

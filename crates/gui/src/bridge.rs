@@ -19,12 +19,14 @@ use winit::window::WindowId;
 
 use crate::canvas::CanvasFeed;
 use crate::controller::{
-    AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, ShellEvent, ShellMode,
+    AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, SettingsSection,
+    ShellEvent, ShellMode,
 };
+use crate::diagnostics::DiagnosticsStatus;
 use crate::generated::{
-    AppWindow, ImageRowView as GeneratedImageRow, ProjectCardView as GeneratedProjectCard,
-    ProjectTabView, RecentRowView as GeneratedRecentRow, SectionHeadView,
-    SettingsRow as GeneratedSettingsRow,
+    AppWindow, FFManifestRow, ImageRowView as GeneratedImageRow,
+    ProjectCardView as GeneratedProjectCard, ProjectTabView, RecentRowView as GeneratedRecentRow,
+    SectionHeadView, SettingsRow as GeneratedSettingsRow,
 };
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
@@ -212,6 +214,88 @@ pub fn read_pane_geometry(app: &AppWindow) -> (PaneRect, PaneRect) {
             height,
         },
     )
+}
+
+/// Locks `controller`, runs `mutate` against it, then pushes the resulting
+/// manifest scroll offset into the window if it's still alive -- the tail
+/// shared by every manifest-scrollbar callback below.
+fn dispatch_manifest_scroll(
+    controller: &Arc<Mutex<AppController>>,
+    app_weak: &slint::Weak<AppWindow>,
+    mutate: impl FnOnce(&mut AppController),
+) {
+    let offset = {
+        let mut controller = controller.lock().unwrap();
+        mutate(&mut controller);
+        controller.manifest_scroll_offset()
+    };
+    if let Some(app) = app_weak.upgrade() {
+        app.set_diagnostics_manifest_scroll_offset(offset);
+    }
+}
+
+/// Rebuilds the diagnostics panel's whole view from the controller and
+/// pushes it into the window -- the panel carries no state of its own, so
+/// every change that could affect it re-runs this rather than patching one
+/// property.
+pub fn push_diagnostics_view(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
+    let view = controller.lock().unwrap().diagnostics_view();
+    let rows: Vec<FFManifestRow> = view
+        .entries
+        .iter()
+        .map(|entry| FFManifestRow {
+            name: entry.name.clone().into(),
+            value: entry.value.clone().into(),
+            not_redacted: entry.not_redacted,
+        })
+        .collect();
+    app.set_diagnostics_rows(Rc::new(slint::VecModel::from(rows)).into());
+    app.set_diagnostics_note(view.note.unwrap_or_default().into());
+    app.set_diagnostics_include_minidumps(view.include_minidumps);
+    app.set_diagnostics_destination(view.destination.into());
+    let status = match view.status {
+        DiagnosticsStatus::Idle => "idle",
+        DiagnosticsStatus::ExistingFile => "existing-file",
+        DiagnosticsStatus::Writing => "writing",
+        DiagnosticsStatus::Written => "written",
+        DiagnosticsStatus::Failed => "failed",
+    };
+    app.set_diagnostics_status(status.into());
+    app.set_diagnostics_message(view.message.into());
+    app.set_diagnostics_primary_label(view.primary_label.into());
+    app.set_diagnostics_busy(view.busy);
+    app.set_diagnostics_loading(view.loading);
+    app.set_diagnostics_manifest_scroll_offset(view.manifest_scroll_offset);
+    app.set_diagnostics_manifest_content_height(view.manifest_content_height);
+    app.set_diagnostics_destination_scroll_offset(view.destination_scroll_offset);
+}
+
+/// Pushes the crash notice's own two properties into the window -- mirrors
+/// [`push_diagnostics_view`] for the toast.
+pub fn push_crash_notice(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
+    let controller = controller.lock().unwrap();
+    app.set_crash_notice_visible(controller.crash_notice_visible());
+    app.set_crash_notice_title(controller.crash_notice_text().into());
+}
+
+/// Scans for unreported crash evidence and pushes the notice, then --
+/// only when it is showing -- arms its auto-dismiss timeout. The timer is
+/// armed before `run()`, the same precedent `src/main.rs`'s own
+/// `--exit-after` timer sets.
+pub fn install_crash_notice(controller: &Arc<Mutex<AppController>>, app: &AppWindow) {
+    controller.lock().unwrap().scan_crash_notice();
+    push_crash_notice(app, controller);
+    if !controller.lock().unwrap().crash_notice_visible() {
+        return;
+    }
+    let timer_controller = controller.clone();
+    let app_weak = app.as_weak();
+    slint::Timer::single_shot(Duration::from_secs(10), move || {
+        timer_controller.lock().unwrap().crash_notice_timed_out();
+        if let Some(app) = app_weak.upgrade() {
+            push_crash_notice(&app, &timer_controller);
+        }
+    });
 }
 
 /// Pushes the controller's project-tab state (`project_tabs`,
@@ -932,6 +1016,138 @@ pub fn install(
             }
         }
     });
+    app.on_settings_section_selected({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |section| {
+            let parsed = match section.as_str() {
+                "general" => SettingsSection::General,
+                "performance" => SettingsSection::Performance,
+                "storage" => SettingsSection::Storage,
+                "diagnostics" => SettingsSection::Diagnostics,
+                "about" => SettingsSection::About,
+                _ => SettingsSection::InputMap,
+            };
+            controller.lock().unwrap().select_settings_section(parsed);
+            if let Some(app) = app_weak.upgrade() {
+                app.set_settings_section(section);
+            }
+        }
+    });
+    app.on_diagnostics_minidumps_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |include| {
+            // Detached: the rescan's own outcome reaches the window through
+            // the sink, the same way `on_diagnostics_primary_clicked`'s
+            // write does below.
+            let _ = controller.lock().unwrap().set_include_minidumps(include);
+            if let Some(app) = app_weak.upgrade() {
+                push_diagnostics_view(&app, &controller);
+            }
+        }
+    });
+    app.on_diagnostics_destination_edited({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |text| {
+            controller.lock().unwrap().set_destination(text.as_str());
+            if let Some(app) = app_weak.upgrade() {
+                push_diagnostics_view(&app, &controller);
+            }
+        }
+    });
+    app.on_diagnostics_destination_cursor_moved({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |cursor_x, viewport_width| {
+            controller
+                .lock()
+                .unwrap()
+                .diagnostics_destination_cursor_moved(cursor_x, viewport_width);
+            if let Some(app) = app_weak.upgrade() {
+                push_diagnostics_view(&app, &controller);
+            }
+        }
+    });
+    app.on_diagnostics_manifest_scrollbar_pointer({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |kind, y| {
+            // `kind` is `ff_manifest_list.slint`'s fold of `PointerEventKind`,
+            // the same convention `canvas-pointer` uses: 0 = Down, 1 = Up or
+            // Cancel, 2 = Move.
+            let kind = match kind {
+                0 => PointerKind::Down,
+                2 => PointerKind::Move,
+                _ => PointerKind::Up,
+            };
+            dispatch_manifest_scroll(&controller, &app_weak, |c| {
+                c.manifest_scrollbar_pointer(kind, y)
+            });
+        }
+    });
+    app.on_diagnostics_manifest_scrollbar_dragged({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |y| {
+            dispatch_manifest_scroll(&controller, &app_weak, |c| c.manifest_scrollbar_dragged(y));
+        }
+    });
+    app.on_diagnostics_manifest_viewport_height_changed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |height| {
+            dispatch_manifest_scroll(&controller, &app_weak, |c| {
+                c.set_manifest_viewport_height(height)
+            });
+        }
+    });
+    app.on_diagnostics_manifest_scrolled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |delta| {
+            dispatch_manifest_scroll(&controller, &app_weak, |c| c.manifest_scrolled(delta));
+        }
+    });
+    app.on_diagnostics_primary_clicked({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            // Detached: the write's own outcome reaches the window through
+            // the sink, not through this handle. Every click starts a write
+            // -- a finished bundle re-derives a fresh timestamped
+            // destination first, so exporting again needs no extra click.
+            let _ = controller.lock().unwrap().start_bundle_write();
+            if let Some(app) = app_weak.upgrade() {
+                push_diagnostics_view(&app, &controller);
+            }
+        }
+    });
+
+    app.on_crash_notice_dismissed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().dismiss_crash_notice();
+            if let Some(app) = app_weak.upgrade() {
+                push_crash_notice(&app, &controller);
+            }
+        }
+    });
+    app.on_crash_notice_review_requested({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            let open = controller.lock().unwrap().review_crashes();
+            if let Some(app) = app_weak.upgrade() {
+                app.set_settings_open(open);
+                app.set_settings_section("diagnostics".into());
+                push_crash_notice(&app, &controller);
+                push_diagnostics_view(&app, &controller);
+            }
+        }
+    });
 
     // The entry path: the picker is a one-line forward, and `open_paths`'s
     // own sink pushes every property this raises (`ShellEvent::ProjectsChanged`/
@@ -1441,6 +1657,23 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         // `perform` runs off a `Send + Sync` closure that can hold neither
         // an `Rc` nor the GPU state `CanvasRenderer` needs.
         ShellEvent::Input(_) => {}
+        // A write's outcome updates the controller's own state first -- the
+        // thread that produced it holds no lock on `self` -- then rebuilds
+        // the view the same way every other diagnostics mutation does.
+        ShellEvent::DiagnosticsWriteFinished(status) => {
+            controller.lock().unwrap().finish_bundle_write(status);
+            push_diagnostics_view(app, controller);
+        }
+        // A scan's outcome updates the controller's stored manifest first,
+        // the same way a write's outcome does above, then rebuilds the view
+        // -- the one place `diagnostics_view` stops reporting `loading`.
+        ShellEvent::DiagnosticsScanFinished { generation, scan } => {
+            controller
+                .lock()
+                .unwrap()
+                .finish_manifest_scan(generation, scan);
+            push_diagnostics_view(app, controller);
+        }
         // The three entry-path events. `EntryRefused`'s
         // message is already rendered by `AppController::refuse`, never
         // formatted here.
