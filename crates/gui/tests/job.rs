@@ -57,7 +57,7 @@ fn controller_with_frames(name: &str, count: usize) -> AppController {
     }
     let mut controller = AppController::new();
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
     controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
@@ -490,7 +490,7 @@ fn controller_with_unalignable_frames(name: &str) -> AppController {
     write_synthetic_frame(&root.join("01.tif"), 64, true);
     let mut controller = AppController::new();
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
     // Pinned rather than left at the tab's default seed: the flat frame's
@@ -700,7 +700,7 @@ fn a_reopened_project_reports_the_count_on_disk() {
     let project_path = opened_project_path("reopen_count_frames", &controller);
     let mut reopened = AppController::new();
     assert!(matches!(
-        reopened.open_paths(&[project_path]),
+        common::open_and_settle(&mut reopened, &[project_path]),
         OpenOutcome::Opened(_)
     ));
     assert_eq!(
@@ -837,7 +837,7 @@ fn an_absolute_but_present_source_still_re_fuses() {
 
     let mut controller = AppController::new();
     assert!(matches!(
-        controller.open_paths(&[project_path]),
+        common::open_and_settle(&mut controller, &[project_path]),
         OpenOutcome::Opened(_)
     ));
     controller.set_scratch_root_for_test(tree("as_given_scratch"));

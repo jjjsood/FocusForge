@@ -424,21 +424,27 @@ fn run(args: &Args) -> ExitCode {
             apply_toolbar_state_preview(&app, state.as_str());
         }
 
-        for path in &args.open {
-            // The same `open_paths` the picker and the drop route call: a
-            // folder proposes a grouping, a `*.ffp` reopens a saved project.
-            // A reopened project feeds the canvas straight from its own
-            // sealed planes; an unsaved group waits for `Fuse stack`.
-            let outcome = controller
+        // Each load runs on its own worker thread; a refusal reaches the
+        // window's own refusal dialog. Only the first `--open` path starts
+        // here -- the wait timer starts each of the rest in turn once the
+        // one before it settles, and feeds the canvas once the last one
+        // has.
+        let mut open_paths = args.open.clone().into_iter();
+        if let Some(first) = open_paths.next() {
+            controller
                 .lock()
                 .unwrap()
-                .open_paths(std::slice::from_ref(path));
-            if let focusforge_gui::OpenOutcome::Refused(err) = outcome {
-                tracing::error!("--open failed: {err}");
-                return ExitCode::from(1);
-            }
-            bridge::feed_canvas(&app, &controller, &canvas);
+                .open_paths(std::slice::from_ref(&first));
         }
+        let open_wait_timer = (!args.open.is_empty()).then(|| {
+            bridge::start_open_wait_timer(
+                app.as_weak(),
+                controller.clone(),
+                canvas.clone(),
+                open_paths,
+            )
+        });
+        let _ = &open_wait_timer;
 
         if let Some(tab) = &args.dock_tab {
             let tab = if tab == "settings" {

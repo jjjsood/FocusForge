@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A small ring that spins continuously -- no fractional or determinate
+// mode, only motion.
+
+import { Theme } from "../theme.slint";
+
+export component FFSpinner inherits Rectangle {
+    width: Theme.icon-lg;
+    height: Theme.icon-lg;
+    background: transparent;
+
+    // A rotation binding on a component's own root element is not applied
+    // (Slint), so the ring is a plain child of this wrapper instead.
+    ring := Image {
+        width: 100%;
+        height: 100%;
+        source: @image-url("../../../../assets/icons/loader-circle.svg");
+        colorize: Theme.accent-default;
+
+        // Reads `animation-tick()` on every repaint -- the same driver
+        // `FFProgressBar`'s own sweep uses -- so the ring keeps turning for
+        // as long as it is on screen, one full turn per second.
+        transform-rotation: mod(animation-tick() / 1ms, 1000.0) / 1000.0 * 360deg;
+    }
+}

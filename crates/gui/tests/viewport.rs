@@ -51,7 +51,7 @@ fn mantis_512_dir() -> PathBuf {
 /// the frame headers.
 fn opened_controller() -> AppController {
     let mut controller = AppController::new();
-    controller.open_paths(&[mantis_512_dir()]);
+    common::open_and_settle(&mut controller, &[mantis_512_dir()]);
     controller.set_pane_geometry(
         PaneRect {
             x: 16.0,

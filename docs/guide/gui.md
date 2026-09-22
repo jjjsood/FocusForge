@@ -11,7 +11,8 @@ A folder argument proposes a grouping the same way `focusforge-cli stack`
 would and opens each proposed stack as its own tab; a `*.ffp` path reopens a
 project that was already stacked. Leaving `--open` off starts with no
 project open — use **Open project…** (below) or drop a folder or a set of
-frames onto the window.
+frames onto the window. A path that fails to open shows the same refusal
+dialog a failed drop or picker choice would, rather than closing the window.
 
 ## The window
 
