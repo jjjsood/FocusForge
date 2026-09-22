@@ -57,8 +57,8 @@ export component FFButton inherits Rectangle {
         if root.has-icon: Image {
             source: root.icon-source;
             colorize: root.label-color;
-            width: 16px;
-            height: 16px;
+            width: Theme.icon-md;
+            height: Theme.icon-md;
             y: (parent.height - self.height) / 2;
         }
         if !root.has-icon && root.glyph != "": Text {
