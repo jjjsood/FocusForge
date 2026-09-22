@@ -568,8 +568,9 @@ fn the_failure_message_names_the_frame_and_the_reason() {
         "message must spell the reason in words, not the status identifier, got: {message}"
     );
     assert!(
-        message.split_whitespace().count() > 2,
-        "message must carry a reason in words, not just a frame name: {message}"
+        message.contains("too little texture to register"),
+        "the flat second frame's zero gradient drives a singular Hessian, so the message \
+         must carry that reason in words, got: {message}"
     );
     assert!(
         !message.contains("total"),
