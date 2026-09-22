@@ -678,11 +678,10 @@ fn rejects_out_of_range_parameters() {
     }
 }
 
-/// Every non-reference fixture frame, traced level by level at fully
-/// resolved defaults. Prints one row per [`EccLevelRecord`], plus a diverged
-/// level's last few [`EccIteration`] rows.
-#[test]
-fn each_divergence_reports_its_pyramid_level() {
+/// Opens `fixtures/mantis-512` with its `StackContext` and fully resolved
+/// [`PyramidalEcc`] defaults -- the setup both whole-fixture tests below
+/// share.
+fn fixture_with_defaults() -> (TiffStack, StackContext, ParamValues) {
     let stack = open_fixture();
     let (width, height) = stack.dimensions();
     let stack_ctx = StackContext::new(
@@ -692,6 +691,15 @@ fn each_divergence_reports_its_pyramid_level() {
         stack.header(0).samples_per_pixel,
     );
     let cfg = resolved_defaults(&stack_ctx);
+    (stack, stack_ctx, cfg)
+}
+
+/// Every non-reference fixture frame, traced level by level at fully
+/// resolved defaults. Prints one row per [`EccLevelRecord`], plus a diverged
+/// level's last few [`EccIteration`] rows.
+#[test]
+fn each_divergence_reports_its_pyramid_level() {
+    let (stack, stack_ctx, cfg) = fixture_with_defaults();
     let reference = 3usize;
     assert_eq!(reference, (stack.len() - 1) / 2, "middle of 8 frames is 3");
 
@@ -756,15 +764,7 @@ fn each_divergence_reports_its_pyramid_level() {
 /// every other frame converges.
 #[test]
 fn the_whole_checked_in_stack_aligns() {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(
-        stack.len(),
-        width,
-        height,
-        stack.header(0).samples_per_pixel,
-    );
-    let cfg = resolved_defaults(&stack_ctx);
+    let (stack, stack_ctx, cfg) = fixture_with_defaults();
 
     let result = align_stack(
         &PyramidalEcc,
