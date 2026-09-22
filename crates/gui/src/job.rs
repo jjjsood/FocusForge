@@ -24,7 +24,7 @@ use focusforge_core::registry;
 pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 
-/// The shell's own view of a fuse run -- the surface's five reachable
+/// The shell's own view of a fuse run -- the surface's six reachable
 /// states.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RunState {
@@ -36,6 +36,11 @@ pub enum RunState {
     Failed(String),
     Fused {
         at: String,
+    },
+    /// Waiting for the live run to settle -- `position` counts the live run
+    /// as 1, so the first waiting tab is `2`.
+    Queued {
+        position: usize,
     },
 }
 
@@ -236,6 +241,7 @@ pub fn stage_word(state: &RunState, progress: Option<&JobProgress>) -> String {
         RunState::Failed(_) => "Failed".to_string(),
         RunState::Idle => String::new(),
         RunState::Fused { at } => format!("fused {at}"),
+        RunState::Queued { position } => format!("Queued ({position})"),
         RunState::Running => match progress_step(progress) {
             Step::Align => "Aligning".to_string(),
             Step::Fuse => "Fusing".to_string(),
@@ -253,6 +259,7 @@ pub fn toolbar_run_state(state: &RunState) -> &'static str {
         RunState::Paused => "paused",
         RunState::Cancelling => "cancelling",
         RunState::Failed(_) => "failed",
+        RunState::Queued { .. } => "queued",
     }
 }
 
@@ -282,9 +289,11 @@ pub fn is_live(state: &RunState) -> bool {
 pub fn current_step(state: &RunState, progress: Option<&JobProgress>) -> Option<Step> {
     match state {
         RunState::Idle => None,
-        RunState::Paused | RunState::Cancelling | RunState::Failed(_) | RunState::Fused { .. } => {
-            None
-        }
+        RunState::Paused
+        | RunState::Cancelling
+        | RunState::Failed(_)
+        | RunState::Fused { .. }
+        | RunState::Queued { .. } => None,
         RunState::Running => Some(progress_step(progress)),
     }
 }
@@ -295,7 +304,7 @@ pub fn current_step(state: &RunState, progress: Option<&JobProgress>) -> Option<
 pub fn eta_text(state: &RunState, progress: Option<&JobProgress>) -> String {
     match state {
         RunState::Paused | RunState::Cancelling | RunState::Failed(_) => "ETA —".to_string(),
-        RunState::Idle | RunState::Fused { .. } => String::new(),
+        RunState::Idle | RunState::Fused { .. } | RunState::Queued { .. } => String::new(),
         RunState::Running => match progress.and_then(|p| p.eta) {
             Some(eta) => {
                 let secs = eta.as_secs();

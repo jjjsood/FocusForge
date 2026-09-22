@@ -16,7 +16,7 @@
 //! `Action`. They read `crate::input_map`'s types only -- no `use slint::`
 //! here either.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -221,6 +221,11 @@ struct DiagnosticsState {
 /// fitted by the first `set_pane_geometry` call after the tab becomes
 /// active.
 struct ProjectTab {
+    /// Assigned once by a monotonic counter on [`AppController`] and never
+    /// reused -- what the live-run slot and the queue identify a tab by, so
+    /// a run stays attached to its own tab across a close that shifts every
+    /// later index down.
+    id: u64,
     project: GuiProject,
     title: String,
     image: Option<ImageSize>,
@@ -279,7 +284,7 @@ struct ProjectTab {
 }
 
 impl ProjectTab {
-    fn new(mut project: GuiProject) -> Self {
+    fn new(mut project: GuiProject, id: u64) -> Self {
         let title = entry::tab_title(&project);
         let ctx = entry::tab_stack_context(&project);
         let image = ctx.map(|c| ImageSize {
@@ -296,6 +301,7 @@ impl ProjectTab {
         let excluded = vec![false; frames.len()];
         let thumbnail = overlay::render_thumbnail(&mut project, &frames).map(Arc::new);
         ProjectTab {
+            id,
             project,
             title,
             image,
@@ -351,6 +357,12 @@ pub struct ProjectTabRow {
     pub title: String,
     pub unsaved: bool,
     pub selected: bool,
+    /// `""` idle, `"play"` running/paused/cancelling, `"ellipsis"` waiting
+    /// -- which strip icon, if any, draws over this tab's own row.
+    pub run_mark_icon: String,
+    /// Whether pressing `Fuse stack` on this tab right now would enqueue it
+    /// rather than start it.
+    pub would_queue: bool,
 }
 
 /// The rail's plain-Rust view of one `Recent` row -- [`AppController::recent_rows`]'s
@@ -580,18 +592,24 @@ pub struct AppController {
     /// announce the run that actually failed without reopening itself on
     /// every later poll.
     settled_failure: Option<String>,
+    /// The last id handed to a [`ProjectTab`] -- incremented before each
+    /// use, so ids start at 1 and no two tabs ever share one.
+    next_tab_id: u64,
 }
 
 /// The single live worker, if any: the control/observer pair a background
 /// thread was handed, the tab it runs against, and the join handle
-/// [`AppController::settle_job`] polls. A project's own run state and
-/// request live on its [`ProjectTab`] instead.
+/// [`AppController::settle_job`] polls, plus the tabs waiting their turn. A
+/// project's own run state and request live on its [`ProjectTab`] instead.
 #[derive(Default)]
 struct JobSlot {
     control: Option<Arc<job::JobControl>>,
     observer: Option<Arc<job::GuiObserver>>,
-    tab_index: Option<usize>,
+    tab_id: Option<u64>,
     handle: Option<std::thread::JoinHandle<Result<job::FuseOutcome, job::PipelineError>>>,
+    /// Tab ids waiting for the live run to settle, in press order. The live
+    /// run itself is position 1; the head of this queue is position 2.
+    queue: VecDeque<u64>,
 }
 
 /// The toolbar/bottom-bar surfaces' plain-Rust view of the active run --
@@ -1273,9 +1291,11 @@ impl AppController {
                     });
                 }
             }
-            self.state
-                .projects
-                .extend(opened.projects.into_iter().map(ProjectTab::new));
+            for project in opened.projects {
+                self.next_tab_id += 1;
+                let id = self.next_tab_id;
+                self.state.projects.push(ProjectTab::new(project, id));
+            }
         }
         self.settle_tab_scroll();
         self.state.settings_scroll_y = 0.0;
@@ -1321,6 +1341,12 @@ impl AppController {
                 title: tab.title.clone(),
                 unsaved: matches!(tab.project, GuiProject::Unsaved(_)),
                 selected: self.state.active == Some(i),
+                run_mark_icon: match &tab.run {
+                    job::RunState::Queued { .. } => "ellipsis".to_string(),
+                    state if job::is_live(state) => "play".to_string(),
+                    _ => String::new(),
+                },
+                would_queue: self.would_queue(i),
             })
             .collect()
     }
@@ -1405,6 +1431,10 @@ impl AppController {
         if let GuiProject::Opened(project) = &closed.project {
             let _ = std::fs::remove_dir_all(job::plane_cache_dir(project.path()));
         }
+        // A closed tab leaves the queue by its own id -- no renumbering by
+        // index is needed for the tabs behind it.
+        self.job.queue.retain(|&id| id != closed.id);
+        self.renumber_queue();
         // Closing another tab never moves the selection: only the indices
         // after the removed one shift down by one -- not the tab switch
         // `set_active_tab` guards against, so a still-active tab's own
@@ -1417,15 +1447,6 @@ impl AppController {
             Some(active) if active > index => Some(active - 1),
             Some(active) if active < index => Some(active),
             _ => None,
-        };
-        // The live worker's own owner marker renumbers the same way: `None`
-        // once the tab that owned it is gone, so `settle_job` writes its
-        // outcome nowhere rather than promoting whatever tab is active once
-        // it finishes.
-        self.job.tab_index = match self.job.tab_index {
-            Some(owner) if owner == index => None,
-            Some(owner) if owner > index => Some(owner - 1),
-            other => other,
         };
         if closed_was_active {
             self.state.pending_frame_change = None;
@@ -2473,8 +2494,12 @@ impl AppController {
             .map(|p| p.to_path_buf())
             .unwrap_or_default();
         let name = format!("{} copy", tab.title);
-        let mut new_tab =
-            ProjectTab::new(entry::duplicate_as_unsaved(dir, name, tab.frames.clone()));
+        self.next_tab_id += 1;
+        let id = self.next_tab_id;
+        let mut new_tab = ProjectTab::new(
+            entry::duplicate_as_unsaved(dir, name, tab.frames.clone()),
+            id,
+        );
         new_tab.fuse_id = tab.fuse_id.clone();
         new_tab.align_id = tab.align_id.clone();
         new_tab.fuse_values = tab.fuse_values.clone();
@@ -2564,12 +2589,19 @@ impl AppController {
         self.state.images_scroll_y
     }
 
+    /// The current index of the tab carrying id `id`, if it is still open --
+    /// what lets the live-run slot and the queue outlive a close that shifts
+    /// every later index down.
+    fn tab_index(&self, id: u64) -> Option<usize> {
+        self.state.projects.iter().position(|tab| tab.id == id)
+    }
+
     /// The tab a worker thread is actually running against, if any --
     /// `None` the instant the worker has finished and its outcome not yet
-    /// read, even though `job.tab_index` still names the tab.
+    /// read, and `None` once its own tab has closed.
     fn running_tab(&self) -> Option<usize> {
         if self.job.control.is_some() {
-            self.job.tab_index
+            self.job.tab_id.and_then(|id| self.tab_index(id))
         } else {
             None
         }
@@ -2593,17 +2625,81 @@ impl AppController {
         self.job.control.is_some()
     }
 
-    /// Starts a fuse run on the active tab's own frames and explicit
-    /// settings, off the UI thread -- refuses while the tab carries a
-    /// settings violation, a run is already live, or (an `Opened` tab only)
-    /// one of its recorded frames is no longer a file. A press on an
-    /// `Unsaved` tab seals a first checkpoint; a press on an already-`Opened`
-    /// one appends a new one onto the same project. Returns whether a run
-    /// was started.
-    pub fn start_fuse(&mut self) -> bool {
-        if self.any_job_running() {
-            return false;
+    /// Whether tab `index` would join the queue if its primary button
+    /// (`Fuse stack` or, on a failed tab, `Retry`) were pressed right now:
+    /// another run is live and this tab holds none of it -- neither the
+    /// live run, a place in the queue, nor a pause.
+    pub fn would_queue(&self, index: usize) -> bool {
+        self.any_job_running()
+            && self.state.projects.get(index).is_some_and(|tab| {
+                !matches!(tab.run, job::RunState::Running | job::RunState::Paused)
+            })
+    }
+
+    /// Whether there is work the shell still owes an answer to -- a live
+    /// worker or a non-empty queue. Broader than [`Self::any_job_running`]:
+    /// a queued tab has no worker of its own, but the poll timer still has
+    /// to keep running for it.
+    pub fn work_pending(&self) -> bool {
+        self.any_job_running() || !self.job.queue.is_empty()
+    }
+
+    /// Rewrites every queued tab's [`job::RunState::Queued`] position from
+    /// [`JobSlot::queue`]'s current order -- the live run holds position 1,
+    /// so the queue's head reads `2`. Called at the end of every push,
+    /// removal or pop so [`job::stage_word`] stays a pure function of the
+    /// state it is handed.
+    fn renumber_queue(&mut self) {
+        let ids: Vec<u64> = self.job.queue.iter().copied().collect();
+        for (i, id) in ids.into_iter().enumerate() {
+            if let Some(index) = self.tab_index(id)
+                && let Some(tab) = self.state.projects.get_mut(index)
+            {
+                tab.run = job::RunState::Queued { position: i + 2 };
+            }
         }
+    }
+
+    /// Assembles the [`job::JobRequest`] tab `index` would run right now,
+    /// from its current frames and explicit settings -- what a direct start
+    /// and a promotion out of the queue both call, so a queued tab's request
+    /// is built at the moment it starts rather than at the moment it was
+    /// queued. `None` only if `index` no longer names an open tab.
+    fn fuse_request_for(&self, index: usize) -> Option<job::JobRequest> {
+        let tab = self.state.projects.get(index)?;
+        let frames = tab.included_frames();
+        let append = matches!(tab.project, GuiProject::Opened(_));
+        let project_path = match &tab.project {
+            GuiProject::Unsaved(group) => group.dir.join(format!("{}.ffp", group.name)),
+            GuiProject::Opened(project) => project.path().to_path_buf(),
+        };
+        let staging_key = format!("{}-{:x}", tab.title, path_digest(&project_path));
+        Some(job::JobRequest {
+            frames,
+            project_path,
+            scratch_root: self
+                .scratch_root_for_test
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(".scratch")),
+            staging_key,
+            fuse_id: tab.fuse_id.clone(),
+            fuse_values: tab.fuse_values.clone(),
+            align_id: Some(tab.align_id.clone()),
+            align_values: tab.align_values.clone(),
+            align_lax: false,
+            crop: true,
+            backend: None,
+            append,
+        })
+    }
+
+    /// Starts a fuse run on the active tab, off the UI thread -- refuses
+    /// while the tab carries a settings violation or a recorded frame is
+    /// missing, checked before anything else so an invalid tab is never
+    /// queued. An `Unsaved` tab seals its first checkpoint; an `Opened` tab
+    /// appends a new one. While another run is live, a valid press enqueues
+    /// the tab instead. Returns whether a run started or was enqueued.
+    pub fn start_fuse(&mut self) -> bool {
         let Some(active) = self.state.active else {
             return false;
         };
@@ -2622,32 +2718,18 @@ impl AppController {
             self.refuse_message(message);
             return false;
         }
-        let tab = self
-            .state
-            .active()
-            .expect("an active tab was checked above");
-        let append = matches!(tab.project, GuiProject::Opened(_));
-        let project_path = match &tab.project {
-            GuiProject::Unsaved(group) => group.dir.join(format!("{}.ffp", group.name)),
-            GuiProject::Opened(project) => project.path().to_path_buf(),
-        };
-        let staging_key = format!("{}-{:x}", tab.title, path_digest(&project_path));
-        let request = job::JobRequest {
-            frames,
-            project_path,
-            scratch_root: self
-                .scratch_root_for_test
-                .clone()
-                .unwrap_or_else(|| PathBuf::from(".scratch")),
-            staging_key,
-            fuse_id: tab.fuse_id.clone(),
-            fuse_values: tab.fuse_values.clone(),
-            align_id: Some(tab.align_id.clone()),
-            align_values: tab.align_values.clone(),
-            align_lax: false,
-            crop: true,
-            backend: None,
-            append,
+        if self.any_job_running() {
+            let id = tab.id;
+            if self.job.tab_id == Some(id) || self.job.queue.contains(&id) {
+                return false;
+            }
+            self.job.queue.push_back(id);
+            self.renumber_queue();
+            self.emit(ShellEvent::JobChanged);
+            return true;
+        }
+        let Some(request) = self.fuse_request_for(active) else {
+            return false;
         };
         self.run_request(active, request);
         true
@@ -2684,11 +2766,23 @@ impl AppController {
         self.emit(ShellEvent::JobChanged);
     }
 
-    /// Requests a cancel. During alignment this lands only once alignment
-    /// returns (the engine's own "reported, never controlled" contract);
-    /// the shell shows `Cancelling` for that interval. A no-op unless the
-    /// active tab is the one actually running.
+    /// Requests a cancel, or leaves the queue. A queued active tab is
+    /// removed from the queue and returned to `Idle`, never touching the
+    /// live run's control. Otherwise the cancel lands only once alignment
+    /// returns, showing `Cancelling` for that interval. A no-op unless the
+    /// active tab is queued or is the one actually running.
     pub fn cancel_fuse(&mut self) {
+        if let Some(id) = self.state.active().map(|tab| tab.id)
+            && let Some(pos) = self.job.queue.iter().position(|&queued| queued == id)
+        {
+            self.job.queue.remove(pos);
+            if let Some(tab) = self.state.active_mut() {
+                tab.run = job::RunState::Idle;
+            }
+            self.renumber_queue();
+            self.emit(ShellEvent::JobChanged);
+            return;
+        }
         let Some(control) = self.job.control.clone() else {
             return;
         };
@@ -2709,23 +2803,30 @@ impl AppController {
 
     /// Starts the same work again, from the request the active tab's own
     /// failed run stored -- controller-level only: the engine itself carries
-    /// no notion of retry. Refuses while any run is live, including one on
-    /// another tab.
+    /// no notion of retry. Enqueues behind another live run rather than
+    /// refusing, same as [`Self::start_fuse`]; the stored request is reused
+    /// unchanged, since a failed run's own request was valid enough to have
+    /// started once.
     pub fn retry_fuse(&mut self) -> bool {
-        if self.any_job_running() {
-            return false;
-        }
         let Some(active) = self.state.active else {
             return false;
         };
-        let Some(request) = self
-            .state
-            .projects
-            .get(active)
-            .and_then(|tab| tab.request.clone())
-        else {
+        let Some(tab) = self.state.projects.get(active) else {
             return false;
         };
+        let Some(request) = tab.request.clone() else {
+            return false;
+        };
+        if self.any_job_running() {
+            let id = tab.id;
+            if self.job.tab_id == Some(id) || self.job.queue.contains(&id) {
+                return false;
+            }
+            self.job.queue.push_back(id);
+            self.renumber_queue();
+            self.emit(ShellEvent::JobChanged);
+            return true;
+        }
         self.run_request(active, request);
         true
     }
@@ -2736,7 +2837,7 @@ impl AppController {
         let observer = Arc::new(job::GuiObserver::new());
         self.job.control = Some(Arc::clone(&control));
         self.job.observer = Some(Arc::clone(&observer));
-        self.job.tab_index = Some(tab_index);
+        self.job.tab_id = self.state.projects.get(tab_index).map(|tab| tab.id);
         self.job.handle = Some(job::spawn(request.clone(), control, observer));
         if let Some(tab) = self.state.projects.get_mut(tab_index) {
             tab.run = job::RunState::Running;
@@ -2822,7 +2923,7 @@ impl AppController {
         // stage line names.
         let progress = self.job.observer.as_ref().and_then(|o| o.last_progress());
         let step = job::progress_step(progress.as_ref());
-        let tab_index = self.job.tab_index.take();
+        let tab_index = self.job.tab_id.take().and_then(|id| self.tab_index(id));
         let owner = tab_index.and_then(|i| self.state.projects.get(i));
         let request = owner.and_then(|tab| tab.request.clone());
         let was_cancelling = owner.is_some_and(|tab| tab.run == job::RunState::Cancelling);
@@ -2906,6 +3007,38 @@ impl AppController {
             self.clear_failure(&path);
             (composite, zmap)
         });
+        // Promotes the queue head: an id that no longer resolves (its tab
+        // closed) or whose recorded frames are no longer all on disk is
+        // dropped and refused, and the next id in line is tried. A popped
+        // tab is out of the queue either way, so its run leaves `Queued`
+        // here and a promotion overwrites it with `Running` below.
+        while let Some(id) = self.job.queue.pop_front() {
+            let Some(index) = self.tab_index(id) else {
+                continue;
+            };
+            if let Some(tab) = self.state.projects.get_mut(index) {
+                tab.run = job::RunState::Idle;
+            }
+            let missing = self
+                .state
+                .projects
+                .get(index)
+                .and_then(|tab| tab.included_frames().into_iter().find(|p| !p.is_file()));
+            if let Some(missing) = missing {
+                let message = format!(
+                    "{} is no longer on disk. This project cannot be fused again until it is back.",
+                    missing.display()
+                );
+                self.refuse_message(message);
+                continue;
+            }
+            let Some(request) = self.fuse_request_for(index) else {
+                continue;
+            };
+            self.run_request(index, request);
+            break;
+        }
+        self.renumber_queue();
         self.emit(ShellEvent::JobChanged);
         planes
     }

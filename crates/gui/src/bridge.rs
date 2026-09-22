@@ -306,16 +306,7 @@ pub fn install_crash_notice(controller: &Arc<Mutex<AppController>>, app: &AppWin
 /// sink needs one; this function does not).
 pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     let controller = controller.lock().unwrap();
-    let tabs: Vec<ProjectTabView> = controller
-        .project_tabs()
-        .into_iter()
-        .map(|t| ProjectTabView {
-            title: t.title.into(),
-            unsaved: t.unsaved,
-            selected: t.selected,
-        })
-        .collect();
-    app.set_project_tabs(std::rc::Rc::new(slint::VecModel::from(tabs)).into());
+    push_tab_rows(app, &controller);
     push_tab_scroll(app, &controller);
     app.set_show_empty_state(controller.active_project().is_none());
     // The grouping question closes itself here rather than in its own
@@ -337,6 +328,30 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     push_settings_panel(app, &controller);
     push_images_panel(app, &controller);
     push_projects_overlay(app, &controller);
+}
+
+/// Pushes the tab strip's own rows -- title, unsaved marker, selection and
+/// each tab's own run mark -- so a mark appears or clears the moment that
+/// tab's run state changes, not only when the project list itself does.
+/// Also pushes the toolbar's own preview of what a `Fuse stack` press on the
+/// active tab would do right now, read off that tab's own row.
+fn push_tab_rows(app: &AppWindow, controller: &AppController) {
+    let rows = controller.project_tabs();
+    let active = controller.active_project();
+    let would_queue = active
+        .and_then(|i| rows.get(i))
+        .is_some_and(|row| row.would_queue);
+    app.set_toolbar_would_queue(would_queue);
+    let tabs: Vec<ProjectTabView> = rows
+        .into_iter()
+        .map(|t| ProjectTabView {
+            title: t.title.into(),
+            unsaved: t.unsaved,
+            selected: t.selected,
+            run_mark_icon: t.run_mark_icon.into(),
+        })
+        .collect();
+    app.set_project_tabs(std::rc::Rc::new(slint::VecModel::from(tabs)).into());
 }
 
 /// Pushes the tab strip's scroll offset, overflow layout and two arrow
@@ -416,7 +431,7 @@ fn start_job_timer(
             open_job_toast(&app, message, &toast_timer);
         }
         let view = controller.lock().unwrap().job_view();
-        let live = controller.lock().unwrap().any_job_running();
+        let live = controller.lock().unwrap().work_pending();
         push_job(&app, &view);
         push_projects_overlay(&app, &controller.lock().unwrap());
         if !live {
@@ -1683,6 +1698,9 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::JobChanged => {
             let controller = controller.lock().unwrap();
             push_job(app, &controller.job_view());
+            // A tab's own run mark changes at the same moments: it starts,
+            // queues, is promoted, or settles.
+            push_tab_rows(app, &controller);
             // A run starting or ending is also the moment the images/settings
             // panels' own whole-panel disable must flip -- neither panel
             // otherwise re-reads `job_running()` on its own.

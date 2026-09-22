@@ -266,6 +266,7 @@ fn overflow_layout_matches_the_arithmetic_and_arrows_click() {
             title: format!("tab {i}").into(),
             unsaved: false,
             selected: false,
+            run_mark_icon: "".into(),
         })
         .collect();
     app.set_project_tabs(Rc::new(slint::VecModel::from(tabs)).into());

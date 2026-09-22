@@ -324,6 +324,7 @@ fn push_tabs(app: &focusforge_gui::AppWindow, controller: &AppController) {
             title: t.title.into(),
             unsaved: t.unsaved,
             selected: t.selected,
+            run_mark_icon: t.run_mark_icon.into(),
         })
         .collect();
     app.set_project_tabs(std::rc::Rc::new(slint::VecModel::from(tabs)).into());
@@ -1082,6 +1083,7 @@ fn a_double_click_on_a_close_glyph_closes_one_tab() {
                         title: t.title.into(),
                         unsaved: t.unsaved,
                         selected: t.selected,
+                        run_mark_icon: t.run_mark_icon.into(),
                     })
                     .collect();
                 let flags = (c.tab_scroll_x(), c.tabs_overflow());

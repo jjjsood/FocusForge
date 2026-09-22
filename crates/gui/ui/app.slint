@@ -127,6 +127,9 @@ export component AppWindow inherits Window {
     // "cancelling" | "failed".
     in property <string> toolbar-run-state: "idle";
     in property <bool> fuse-enabled: true;
+    // Another tab's run is live and this one holds no place in it -- the
+    // next `Fuse stack` press here would enqueue rather than start.
+    in property <bool> toolbar-would-queue: false;
 
     // Hidden with no project open (or "+" selected over background tabs) --
     // there is no run to transport. `canvas-ground` below grows into its row.
@@ -138,6 +141,7 @@ export component AppWindow inherits Window {
         visible: !root.show-empty-state;
         run-state: root.toolbar-run-state;
         fuse-enabled: root.fuse-enabled;
+        would-queue: root.toolbar-would-queue;
 
         fuse-requested => { root.fuse-requested(); }
         pause-or-resume-requested => { root.pause-or-resume-requested(); }

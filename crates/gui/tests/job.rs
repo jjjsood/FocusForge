@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
-use focusforge_core::params::ParamValues;
+use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::pipeline::{self, FuseOutcome, FuseRequest, StageObserver};
 use focusforge_core::project::{self, Project};
 use focusforge_core::registry;
@@ -63,6 +63,23 @@ fn controller_with_two_tabs(name: &str) -> AppController {
     }
     assert!(matches!(
         controller.open_paths(&[root_b]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.select_project(0);
+    controller
+}
+
+/// A controller with three unsaved tabs, each over its own copied fixture
+/// frames -- three, two and four frames, so a per-tab assertion cannot pass
+/// on a shared frame count. Tab 0 is selected on return.
+fn controller_with_three_tabs(name: &str) -> AppController {
+    let mut controller = controller_with_two_tabs(name);
+    let root_c = common::tree(&format!("{name}_c_frames"));
+    for i in 0..4 {
+        copy_frame(&root_c, &format!("{i:02}.tif"), i);
+    }
+    assert!(matches!(
+        controller.open_paths(&[root_c]),
         OpenOutcome::Opened(_)
     ));
     controller.select_project(0);
@@ -1074,22 +1091,627 @@ fn an_idle_tab_stays_editable_while_another_tab_fuses() {
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
 }
 
+// ---------------------------------------------------------------------
+// A second `Fuse stack` press while a run is live queues the tab instead
+// of refusing the press, the queue runs in press order, a queued tab's
+// position renumbers when the queue changes, and a queued tab holds no
+// worker of its own.
+// ---------------------------------------------------------------------
+
 #[test]
-fn a_second_start_is_refused_while_any_run_is_live() {
-    let mut controller = controller_with_two_tabs("second_start_refused");
+fn a_second_fuse_queues_and_then_runs() {
+    let mut controller = controller_with_two_tabs("second_fuse_queues");
     start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
 
     controller.select_project(1);
     assert!(
-        !controller.start_fuse(),
-        "starting a second fuse while one is live must be refused"
+        controller.start_fuse(),
+        "a press on the second tab while the first runs must enqueue it"
+    );
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Queued { position: 2 },
+        "the queued tab reads its own position"
+    );
+
+    controller.select_project(0);
+    controller.pause_or_resume();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert!(
+        !controller.project_tabs()[0].unsaved,
+        "the first tab seals a checkpoint"
+    );
+
+    // The queue promotes the second tab once the first settles.
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    controller.select_project(1);
+    match controller.job_view().state {
+        job::RunState::Fused { .. } => {}
+        other => panic!("expected the queued tab to complete, got {other:?}"),
+    }
+    assert!(!controller.project_tabs()[1].unsaved);
+}
+
+#[test]
+fn the_queue_runs_in_press_order() {
+    let mut controller = controller_with_three_tabs("queue_runs_in_press_order");
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    // Press on tab 2 before tab 1 -- the strip's own order is 0, 1, 2, so
+    // the queue must run 2 before 1 to prove it is press order, not tab
+    // order.
+    controller.select_project(2);
+    assert!(controller.start_fuse());
+    controller.select_project(1);
+    assert!(controller.start_fuse());
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Queued { position: 3 },
+        "the later press sits behind the earlier one"
+    );
+
+    controller.select_project(0);
+    controller.pause_or_resume();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+
+    // The queue's head (tab 2, pressed first) runs next.
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    controller.select_project(2);
+    match controller.job_view().state {
+        job::RunState::Fused { .. } => {}
+        other => panic!("expected the first-pressed tab to run next, got {other:?}"),
+    }
+
+    // Tab 1 (pressed second) runs last.
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    controller.select_project(1);
+    match controller.job_view().state {
+        job::RunState::Fused { .. } => {}
+        other => panic!("expected the second-pressed tab to run last, got {other:?}"),
+    }
+}
+
+#[test]
+fn cancelling_a_queued_tab_spares_the_running_one_and_renumbers() {
+    let mut controller = controller_with_three_tabs("cancel_queued_spares_and_renumbers");
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(1);
+    assert!(controller.start_fuse());
+    controller.select_project(2);
+    assert!(controller.start_fuse());
+
+    controller.select_project(1);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Queued { position: 2 }
+    );
+    controller.cancel_fuse();
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Idle,
+        "cancelling a queued tab returns it to Idle"
     );
 
     controller.select_project(0);
     assert_eq!(
         controller.job_view().state,
         job::RunState::Paused,
-        "the first run must be unaffected by the refused second start"
+        "the running tab is untouched by a queued cancel"
+    );
+
+    controller.select_project(2);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Queued { position: 2 },
+        "the tab behind the cancelled one renumbers into its place"
+    );
+
+    controller.select_project(0);
+    controller.pause_or_resume();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(1);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Idle,
+        "the cancelled tab never ran"
+    );
+    assert!(
+        controller.project_tabs()[1].unsaved,
+        "the cancelled tab never sealed a checkpoint"
+    );
+    controller.select_project(2);
+    match controller.job_view().state {
+        job::RunState::Fused { .. } => {}
+        other => panic!("expected the promoted tab to complete, got {other:?}"),
+    }
+}
+
+#[test]
+fn cancelling_the_running_tab_promotes_the_queue() {
+    let mut controller = controller_with_two_tabs("cancel_running_promotes_the_queue");
+    assert!(controller.start_fuse());
+
+    controller.select_project(1);
+    assert!(controller.start_fuse());
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Queued { position: 2 }
+    );
+
+    controller.select_project(0);
+    // Cancelled essentially the instant the worker starts -- real alignment
+    // takes measurably longer than this call, so the cancel reliably lands
+    // before the tiny fixture could complete on its own.
+    controller.cancel_fuse();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Idle,
+        "the cancelled tab is not re-queued"
+    );
+
+    controller.select_project(1);
+    match controller.job_view().state {
+        job::RunState::Fused { .. } => {}
+        other => panic!("expected the promoted tab to complete after the cancel, got {other:?}"),
+    }
+}
+
+#[test]
+fn closing_a_queued_tab_leaves_the_queue_and_the_rest_still_run() {
+    let mut controller = controller_with_three_tabs("closing_queued_leaves_the_rest");
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(1);
+    assert!(controller.start_fuse());
+    controller.select_project(2);
+    assert!(controller.start_fuse());
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Queued { position: 3 }
+    );
+
+    // Tab 1 is next in line; closing it must not disturb the running tab
+    // or the tab still behind it.
+    controller.close_project(1);
+    assert_eq!(controller.project_tabs().len(), 2);
+
+    controller.select_project(0);
+    assert_eq!(controller.job_view().state, job::RunState::Paused);
+
+    controller.select_project(1);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Queued { position: 2 },
+        "the tab behind the closed one renumbers into its place"
+    );
+
+    controller.select_project(0);
+    controller.pause_or_resume();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(1);
+    match controller.job_view().state {
+        job::RunState::Fused { .. } => {}
+        other => panic!("expected the remaining queued tab to complete, got {other:?}"),
+    }
+}
+
+#[test]
+fn closing_a_tab_before_the_running_one_does_not_misidentify_the_run() {
+    let mut controller = controller_with_three_tabs("close_before_running");
+    controller.select_project(1);
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(2);
+    assert!(controller.start_fuse());
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Queued { position: 2 }
+    );
+
+    // Closing an earlier tab shifts every later index down by one -- the
+    // running tab was index 1, the queued tab index 2.
+    controller.close_project(0);
+    assert_eq!(controller.project_tabs().len(), 2);
+
+    controller.select_project(0);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Paused,
+        "the run must still be attached to its own tab after an earlier tab closes"
+    );
+    assert!(controller.any_job_running());
+
+    controller.select_project(1);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Queued { position: 2 },
+        "the queued tab must still resolve after an earlier tab closes"
+    );
+
+    controller.select_project(0);
+    controller.pause_or_resume();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(1);
+    match controller.job_view().state {
+        job::RunState::Fused { .. } => {}
+        other => panic!("expected the promoted tab to complete, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_run_keeps_its_tab_when_an_earlier_tab_closes() {
+    let mut controller = controller_with_two_tabs("run_keeps_its_tab");
+    let root_c = common::tree("run_keeps_its_tab_c_frames");
+    for i in 0..4 {
+        copy_frame(&root_c, &format!("{i:02}.tif"), i);
+    }
+    assert!(matches!(
+        controller.open_paths(&[root_c]),
+        OpenOutcome::Opened(_)
+    ));
+
+    // Tab 2 (four frames) runs; tabs 0 and 1 stay idle.
+    controller.select_project(2);
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    // Closing an earlier tab shifts every later index down by one -- the
+    // running tab was index 2, becomes index 1.
+    controller.close_project(0);
+    assert_eq!(controller.project_tabs().len(), 2);
+
+    controller.select_project(1);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Paused,
+        "the run must still be attached to its own tab after an earlier tab closes"
+    );
+
+    controller.pause_or_resume();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+
+    assert_eq!(
+        controller.checkpoint_count(),
+        Some(1),
+        "the completed run's checkpoint lands on its own tab"
+    );
+    controller.select_project(0);
+    assert_eq!(
+        controller.checkpoint_count(),
+        Some(0),
+        "the run's outcome must not land on the surviving idle tab"
+    );
+}
+
+#[test]
+fn a_queued_run_reads_the_settings_current_when_it_starts() {
+    let mut controller = controller_with_two_tabs("queued_reads_current_settings");
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(1);
+    assert!(controller.start_fuse());
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Queued { position: 2 }
+    );
+
+    // A queued tab stays editable -- this value differs from the panel's
+    // own default, so a request built at enqueue time would fail the
+    // assertion below.
+    controller.set_param_value("fuse", "score-radius", ParamValue::Int(7));
+
+    controller.select_project(0);
+    controller.pause_or_resume();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+
+    let title = controller.project_tabs()[1].title.clone();
+    let project_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("queued_reads_current_settings_b_frames")
+        .join(format!("{title}.ffp"));
+    let manifest = Project::open(&project_path).unwrap().manifest().clone();
+    assert_eq!(
+        manifest.params.get("score-radius"),
+        Some(&ParamValue::Int(7)),
+        "the queued run must use the settings current when it started, not when it was queued"
+    );
+}
+
+#[test]
+fn an_invalid_tab_is_refused_rather_than_queued() {
+    // Case 1: a field in violation.
+    let mut controller = controller_with_two_tabs("invalid_field_not_queued");
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(1);
+    controller.set_align_algorithm("pyramidal-ecc");
+    let ecc = registry::find_align("pyramidal-ecc").unwrap();
+    let max_iterations_id = ecc
+        .params()
+        .iter()
+        .find(|d| d.id == "max-iterations")
+        .expect("max-iterations must exist on pyramidal-ecc")
+        .id
+        .clone();
+    controller.set_param_text("align", &max_iterations_id, "not-a-number");
+
+    assert!(
+        !controller.start_fuse(),
+        "a field in violation must be refused, not queued, even while another run is live"
+    );
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Idle,
+        "the invalid tab does not enter the queue"
+    );
+
+    controller.select_project(0);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Paused,
+        "the running tab is untouched by a refused enqueue"
+    );
+    controller.cancel_fuse();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+
+    // Case 2: a recorded frame no longer on disk.
+    let mut controller = controller_with_frames("invalid_frame_not_queued", 2);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert!(!controller.project_tabs()[0].unsaved);
+
+    let root_b = common::tree("invalid_frame_not_queued_b_frames");
+    for i in 0..2 {
+        copy_frame(&root_b, &format!("{i:02}.tif"), i);
+    }
+    assert!(matches!(
+        controller.open_paths(&[root_b]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.select_project(1);
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(0);
+    let frames_root =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("invalid_frame_not_queued_frames");
+    std::fs::remove_file(frames_root.join("00.tif")).unwrap();
+
+    let before = controller.job_view().state;
+    assert!(
+        !controller.start_fuse(),
+        "a re-fuse with a missing frame must be refused before it can be queued"
+    );
+    let message = controller
+        .last_refusal()
+        .expect("a refusal message must be recorded")
+        .to_string();
+    assert!(message.contains("00.tif"));
+    assert_eq!(
+        controller.job_view().state,
+        before,
+        "the invalid tab's run state is untouched by a refused enqueue -- not Queued, not reset"
+    );
+
+    controller.select_project(1);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Paused,
+        "the running tab is untouched by a refused enqueue"
+    );
+    controller.cancel_fuse();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+}
+
+#[test]
+fn a_queued_tab_that_can_no_longer_run_is_refused_and_the_next_one_starts() {
+    let mut controller = controller_with_three_tabs("queued_tab_dropped_at_promotion");
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(1);
+    assert!(controller.start_fuse());
+    controller.select_project(2);
+    assert!(controller.start_fuse());
+
+    // Tab 1's frames go away while it waits, so the promotion that reaches
+    // it cannot build a run for it.
+    let frames_b =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("queued_tab_dropped_at_promotion_b_frames");
+    std::fs::remove_file(frames_b.join("00.tif")).unwrap();
+
+    controller.select_project(0);
+    controller.pause_or_resume();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(1);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Idle,
+        "a queued tab dropped at promotion returns to Idle rather than waiting forever"
+    );
+    let message = controller
+        .last_refusal()
+        .expect("the dropped tab must say why it left the queue")
+        .to_string();
+    assert!(message.contains("00.tif"), "got {message}");
+
+    controller.select_project(2);
+    assert!(
+        matches!(
+            controller.job_view().state,
+            job::RunState::Running | job::RunState::Fused { .. }
+        ),
+        "the tab behind the dropped one is promoted in its place"
+    );
+    assert!(
+        controller.work_pending(),
+        "the promoted tab still owes the clock a poll"
+    );
+
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert!(
+        !controller.work_pending(),
+        "the clock stops once the queue has drained"
+    );
+    controller.select_project(1);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Idle,
+        "the dropped tab is still idle after the queue drains, so it can be fused again"
+    );
+}
+
+#[test]
+fn the_clock_keeps_running_while_work_is_pending() {
+    let mut controller = controller_with_two_tabs("clock_keeps_running");
+    assert!(!controller.work_pending());
+
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+    assert!(controller.work_pending());
+
+    controller.select_project(1);
+    assert!(controller.start_fuse());
+    assert!(
+        controller.work_pending(),
+        "a queued tab has no worker but still owes the clock a poll"
+    );
+
+    controller.select_project(0);
+    controller.pause_or_resume();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert!(
+        controller.work_pending(),
+        "the promoted tab is now the live worker"
+    );
+
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert!(
+        !controller.work_pending(),
+        "the clock may stop once the queue is empty and no run is live"
+    );
+}
+
+#[test]
+fn the_strip_marks_the_fusing_tab_and_the_queued_ones() {
+    let mut controller = controller_with_three_tabs("strip_marks_fusing_and_queued");
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(1);
+    assert!(controller.start_fuse());
+
+    // The third tab is selected but takes no part in the run -- its mark
+    // must stay clear, and the marks on the other two must be readable
+    // without switching to them.
+    controller.select_project(2);
+
+    let tabs = controller.project_tabs();
+    assert_eq!(
+        tabs[0].run_mark_icon, "play",
+        "the running tab reads its own mark from the strip alone"
+    );
+    assert_eq!(
+        tabs[1].run_mark_icon, "ellipsis",
+        "the queued tab reads its own mark from the strip alone"
+    );
+    assert_eq!(
+        tabs[2].run_mark_icon, "",
+        "the selected but idle tab carries no run mark"
+    );
+    assert_eq!(
+        controller.job_view().toolbar_run_state,
+        "idle",
+        "the bottom bar reports only the active tab, not the run happening elsewhere"
+    );
+
+    controller.select_project(0);
+    controller.pause_or_resume();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+
+    let tabs = controller.project_tabs();
+    assert_eq!(tabs[0].run_mark_icon, "", "the completed tab's mark clears");
+    assert_eq!(
+        tabs[1].run_mark_icon, "",
+        "the completed, promoted tab's mark clears once it settles"
+    );
+}
+
+#[test]
+fn retry_queues_while_another_run_is_live() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree("retry_queues_scratch"));
+    add_unalignable_tab(&mut controller, "retry_queues_a", 2);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    match controller.job_view().state {
+        job::RunState::Failed(_) => {}
+        other => panic!("expected the first tab to fail, got {other:?}"),
+    }
+
+    let survivor_root = common::tree("retry_queues_b_frames");
+    for i in 0..3 {
+        copy_frame(&survivor_root, &format!("{i:02}.tif"), i);
+    }
+    assert!(matches!(
+        controller.open_paths(&[survivor_root]),
+        OpenOutcome::Opened(_)
+    ));
+
+    controller.select_project(1);
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(0);
+    assert!(
+        controller.retry_fuse(),
+        "retry on a failed tab while another run is live must enqueue rather than refuse"
+    );
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Queued { position: 2 }
+    );
+
+    controller.select_project(1);
+    controller.pause_or_resume();
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+
+    controller.select_project(0);
+    match controller.job_view().state {
+        job::RunState::Failed(_) => {}
+        other => {
+            panic!("expected the retried tab to fail the same way once promoted, got {other:?}")
+        }
+    }
+}
+
+#[test]
+fn a_second_start_queues_while_a_run_is_live() {
+    let mut controller = controller_with_two_tabs("second_start_queues");
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(1);
+    assert!(
+        controller.start_fuse(),
+        "starting a second fuse while one is live must enqueue it, not refuse it"
+    );
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Queued { position: 2 },
+        "the second tab reads its own queued position"
+    );
+
+    controller.select_project(0);
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Paused,
+        "the first run must be unaffected by the enqueued second start"
     );
 
     controller.cancel_fuse();
@@ -1120,35 +1742,30 @@ fn closing_the_owning_tab_mid_run_promotes_nothing() {
     assert_eq!(controller.project_tabs().len(), 1);
     assert!(
         controller.any_job_running(),
-        "the orphaned run keeps refusing a second start until it settles"
-    );
-    assert!(
-        !controller.start_fuse(),
-        "a fresh start is refused while the orphaned run is still live"
+        "the orphaned run keeps running until it settles"
     );
 
-    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    assert!(
+        controller.start_fuse(),
+        "a press on the survivor while the orphaned run is still live enqueues it, rather than refusing"
+    );
+    assert_eq!(
+        controller.job_view().state,
+        job::RunState::Queued { position: 2 },
+        "the survivor waits behind the orphaned run rather than starting immediately"
+    );
+
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
     assert!(!controller.any_job_running());
 
-    assert_eq!(
-        controller.checkpoint_count(),
-        Some(0),
-        "the orphaned run's outcome must not write onto the surviving tab"
-    );
     assert_eq!(
         controller.project_cards().len(),
         1,
         "the orphaned run's failure card must not land on the survivor"
     );
-    assert_eq!(
-        controller.job_view().state,
-        job::RunState::Idle,
-        "the bar reports the now-active, surviving tab"
-    );
-
-    assert!(
-        controller.start_fuse(),
-        "a fresh start is accepted again once the orphaned run has settled"
-    );
-    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    match controller.job_view().state {
+        job::RunState::Fused { .. } => {}
+        other => panic!("expected the promoted queued run to complete, got {other:?}"),
+    }
+    assert_eq!(controller.checkpoint_count(), Some(1));
 }

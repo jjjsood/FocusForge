@@ -13,6 +13,8 @@ export struct ProjectTabView {
     title: string,
     unsaved: bool,
     selected: bool,
+    // "" idle, "play" running/paused/cancelling, "ellipsis" waiting.
+    run-mark-icon: string,
 }
 
 // The one box every element of the tab strip is drawn in -- projects
@@ -111,7 +113,22 @@ component FFTab inherits FFStripBox {
             horizontal-stretch: 1;
         }
 
-        if root.view.unsaved: FFChip {
+        // The run mark takes the unsaved chip's own slot while a tab is
+        // fusing or queued; `UNSAVED` returns once the run settles.
+        if root.view.run-mark-icon != "": Rectangle {
+            width: Theme.icon-md;
+            Image {
+                source: root.view.run-mark-icon == "play"
+                    ? @image-url("../../../../assets/icons/play.svg")
+                    : @image-url("../../../../assets/icons/ellipsis.svg");
+                colorize: Theme.text-secondary;
+                x: 0px;
+                y: (parent.height - self.height) / 2;
+                width: Theme.icon-md;
+                height: Theme.icon-md;
+            }
+        }
+        if root.view.run-mark-icon == "" && root.view.unsaved: FFChip {
             text: "UNSAVED";
         }
 

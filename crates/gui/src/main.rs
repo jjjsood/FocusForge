@@ -73,6 +73,12 @@ struct Args {
     /// with no click sequence.
     #[arg(long)]
     frame_remove_warning: Option<usize>,
+    /// Selects these tab indices in turn and presses `Fuse stack` on each,
+    /// right after `--open`, leaving the last one selected -- for
+    /// inspecting a live run and the tabs queued behind it with no click
+    /// sequence. Comma-separated.
+    #[arg(long, value_delimiter = ',')]
+    fuse_tabs: Vec<usize>,
 }
 
 const TOOLBAR_STATES: [&str; 5] = ["idle", "running", "paused", "cancelling", "failed"];
@@ -471,6 +477,13 @@ fn run(args: &Args) -> ExitCode {
 
         if let Some(index) = args.frame_remove_warning {
             controller.lock().unwrap().remove_frame(index);
+        }
+
+        for index in &args.fuse_tabs {
+            // The window's own callbacks, so a press here arms the poll
+            // timer exactly as a click on the button does.
+            app.invoke_tab_selected(*index as i32);
+            app.invoke_fuse_requested();
         }
 
         run_window(app, args)
