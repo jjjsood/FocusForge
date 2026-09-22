@@ -519,6 +519,18 @@ struct LoadResult {
     thumbnails: Vec<Option<Arc<overlay::Thumbnail>>>,
 }
 
+/// Decodes one thumbnail per project, in order -- what [`AppController::open_paths`]
+/// and [`AppController::answer_question`] both run on their own worker thread.
+fn decode_thumbnails(projects: &mut [GuiProject]) -> Vec<Option<Arc<overlay::Thumbnail>>> {
+    projects
+        .iter_mut()
+        .map(|project| {
+            let frames = entry::project_frames(project);
+            overlay::render_thumbnail(project, &frames).map(Arc::new)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct DragRow {
     from: usize,
@@ -1225,14 +1237,7 @@ impl AppController {
             // opening the reference stack's 44.8 MP first frame measured
             // ~5s synchronously.
             let thumbnails = match &mut outcome {
-                OpenOutcome::Opened(opened) => opened
-                    .projects
-                    .iter_mut()
-                    .map(|project| {
-                        let frames = entry::project_frames(project);
-                        overlay::render_thumbnail(project, &frames).map(Arc::new)
-                    })
-                    .collect(),
+                OpenOutcome::Opened(opened) => decode_thumbnails(&mut opened.projects),
                 OpenOutcome::Question(..) | OpenOutcome::Refused(_) => Vec::new(),
             };
             *outcome_slot
@@ -1294,14 +1299,7 @@ impl AppController {
         let outcome_slot = Arc::clone(&self.state.load.outcome);
         Some(std::thread::spawn(move || {
             let mut opened = entry::answer_question(&proposal, answer);
-            let thumbnails = opened
-                .projects
-                .iter_mut()
-                .map(|project| {
-                    let frames = entry::project_frames(project);
-                    overlay::render_thumbnail(project, &frames).map(Arc::new)
-                })
-                .collect();
+            let thumbnails = decode_thumbnails(&mut opened.projects);
             *outcome_slot
                 .lock()
                 .expect("no thread panicked while holding the load outcome") = Some(LoadResult {
