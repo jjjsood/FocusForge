@@ -161,6 +161,16 @@ component FFTabStripIconButton inherits FFStripBox {
     }
 }
 
+// A window-control glyph button: fixed to the strip box band, no
+// hover-recolour -- the three window buttons share this box, only their
+// `x`, `icon` and `accessible-label` differ.
+component WindowIconButton inherits FFIconButton {
+    y: ShellGeometry.strip-box-top;
+    width: ShellGeometry.strip-box-width;
+    height: ShellGeometry.strip-box-height;
+    recolor-on-hover: false;
+}
+
 export component FFTabStrip inherits Rectangle {
     // Forwarded straight to the AppController via AppWindow.
     callback window-drag-requested();
@@ -301,22 +311,14 @@ export component FFTabStrip inherits Rectangle {
         width: ShellGeometry.base-width - ShellGeometry.glyph-first-x;
         height: parent.height;
 
-        window-minimize := FFIconButton {
+        window-minimize := WindowIconButton {
             x: 0px;
-            y: ShellGeometry.strip-box-top;
-            width: ShellGeometry.strip-box-width;
-            height: ShellGeometry.strip-box-height;
-            recolor-on-hover: false;
             icon: @image-url("../../../../assets/icons/minus.svg");
             accessible-label: "Minimize";
             triggered => { root.window-minimize-requested(); }
         }
-        window-maximize := FFIconButton {
+        window-maximize := WindowIconButton {
             x: ShellGeometry.glyph-pitch;
-            y: ShellGeometry.strip-box-top;
-            width: ShellGeometry.strip-box-width;
-            height: ShellGeometry.strip-box-height;
-            recolor-on-hover: false;
             // Maximised looks different from not-maximised: the plain
             // square swaps for the two-overlapping-squares restore glyph,
             // same convention every other window on the desktop uses.
@@ -326,12 +328,8 @@ export component FFTabStrip inherits Rectangle {
             accessible-label: root.maximized ? "Restore" : "Maximize";
             triggered => { root.window-maximize-toggled(); }
         }
-        window-close := FFIconButton {
+        window-close := WindowIconButton {
             x: 2 * ShellGeometry.glyph-pitch;
-            y: ShellGeometry.strip-box-top;
-            width: ShellGeometry.strip-box-width;
-            height: ShellGeometry.strip-box-height;
-            recolor-on-hover: false;
             icon: @image-url("../../../../assets/icons/x.svg");
             accessible-label: "Close";
             triggered => { root.window-close-requested(); }
