@@ -9,7 +9,11 @@
 //! `crates/gui/src/gpu_canvas.rs`, the only module in the crate naming
 //! `wgpu` or `slint::wgpu_29`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use focusforge_core::TiffError;
+use focusforge_core::io::TiffStack;
+use focusforge_core::tile::Rect;
 
 /// What the open renderer cell should do for the frame about to draw --
 /// [`crate::controller::AppController::canvas_feed`]'s answer, decided with
@@ -92,6 +96,58 @@ pub fn check_pane_dimensions(composite: (u32, u32), zmap: (u32, u32)) -> Result<
         Ok(())
     } else {
         Err(CanvasError::PaneDimensionsDiffer { composite, zmap })
+    }
+}
+
+/// The one open source-frame handle the left canvas pane draws from -- never
+/// more than one [`TiffStack`] mapped at once. Sixty-one frames held open at
+/// the same time would map the whole reference stack, which is why
+/// [`Self::set`] drops whatever was open before mapping the next.
+#[derive(Default)]
+pub struct FrameSource {
+    open: Option<(PathBuf, TiffStack)>,
+}
+
+impl FrameSource {
+    /// Opens `path`, dropping whatever was open first. Nothing is left open
+    /// on failure.
+    pub fn set(&mut self, path: &Path) -> Result<(), TiffError> {
+        self.open = None;
+        let stack = TiffStack::open_files(std::slice::from_ref(&path.to_path_buf()))?;
+        self.open = Some((path.to_path_buf(), stack));
+        Ok(())
+    }
+
+    /// Drops the open handle, if any.
+    pub fn clear(&mut self) {
+        self.open = None;
+    }
+
+    /// The currently open frame's own path, if any.
+    pub fn path(&self) -> Option<&Path> {
+        self.open.as_ref().map(|(path, _)| path.as_path())
+    }
+
+    /// The open frame's `(width, height)`, if any.
+    pub fn dimensions(&self) -> Option<(u32, u32)> {
+        self.open.as_ref().map(|(_, stack)| stack.dimensions())
+    }
+
+    /// The open frame's samples per pixel, if any.
+    pub fn samples_per_pixel(&self) -> Option<u32> {
+        self.open
+            .as_ref()
+            .map(|(_, stack)| stack.header(0).samples_per_pixel)
+    }
+
+    /// Reads `rect`'s pixels into `out`. Callers check [`Self::dimensions`]
+    /// first, so a frame is always open by the time this runs.
+    pub fn read_into(&self, rect: Rect, out: &mut [u16]) -> Result<(), TiffError> {
+        let (_, stack) = self
+            .open
+            .as_ref()
+            .expect("read_into is only called once a frame is confirmed open");
+        stack.read_tile_into(0, rect, out)
     }
 }
 

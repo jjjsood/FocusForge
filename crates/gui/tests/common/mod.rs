@@ -95,6 +95,15 @@ pub fn fixture_frame(set: &str, index: usize) -> PathBuf {
         .join(format!("{index:02}.tif"))
 }
 
+/// The 61-frame reference stack's own directory, from `FOCUSFORGE_REFERENCE_STACK`
+/// when that variable is set and names a real directory. `None` otherwise --
+/// never a panic -- keeps the default test suite off the 16 GB tree.
+#[allow(dead_code)]
+pub fn reference_stack_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("FOCUSFORGE_REFERENCE_STACK")?);
+    dir.is_dir().then_some(dir)
+}
+
 /// A fresh, empty directory under `CARGO_TARGET_TMPDIR`, named `name` --
 /// removed first if an earlier run left one behind.
 #[allow(dead_code)]

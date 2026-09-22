@@ -6,6 +6,7 @@
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
 import { FFEmptyState } from "empty_state.slint";
+import { FFErrorRow } from "../components/ff_error_row.slint";
 
 component FFPaneLabel inherits Rectangle {
     in property <string> label: "";
@@ -51,6 +52,9 @@ component FFUndockControl inherits Rectangle {
 export component FFPane inherits Rectangle {
     in property <image> source;
     in property <string> label: "";
+    // The reader's own refusal text for `source`, if it could not be drawn
+    // -- shown centred in place of the image while non-empty.
+    in property <string> message: "";
     in property <bool> undock-enabled: true;
     // Whether a project is open -- the label and the undock control have
     // nothing to name or to undock before one is, so they are hidden rather
@@ -82,6 +86,14 @@ export component FFPane inherits Rectangle {
         image-rendering: root.pixelated ? ImageRendering.pixelated : ImageRendering.smooth;
     }
 
+    if root.message != "" : pane-message := FFErrorRow {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: parent.width - 2 * Theme.space-6;
+        message: root.message;
+        horizontal-alignment: center;
+    }
+
     pane-label := FFPaneLabel {
         x: 10px;
         y: 10px;
@@ -101,16 +113,27 @@ export component FFPane inherits Rectangle {
 export component FFCanvas inherits Rectangle {
     in property <image> composite-source;
     in property <image> zmap-source;
+    // The left pane's own source, label and refusal text -- see
+    // `FFPane::message`.
+    in property <image> frame-source;
+    in property <string> frame-label: "";
+    in property <string> frame-message: "";
     in property <bool> undock-enabled: true;
     // Forwarded to both panes' chrome -- see `FFPane::project-loaded`.
     in property <bool> project-loaded: false;
     // The one shared viewport's placement -- forwarded identically to
     // both panes below, which is what makes "one viewport
-    // over two panes" structural rather than a synchronisation.
+    // over two panes" structural rather than a synchronisation. The right
+    // pane draws the sealed composite/Z-Map at this extent.
     in property <length> image-x;
     in property <length> image-y;
     in property <length> image-w;
     in property <length> image-h;
+    // The left pane's own placement, over the selected frame's extent.
+    in property <length> frame-image-x;
+    in property <length> frame-image-y;
+    in property <length> frame-image-w;
+    in property <length> frame-image-h;
     in property <bool> pixelated;
     callback composite-undock-requested();
     callback zmap-undock-requested();
@@ -185,14 +208,15 @@ export component FFCanvas inherits Rectangle {
         y: ShellGeometry.pane-gutter;
         width: (parent.width - 3 * ShellGeometry.pane-gutter) / 2;
         height: parent.height - 2 * ShellGeometry.pane-gutter;
-        source: root.composite-source;
-        label: "Composite";
+        source: root.frame-source;
+        label: root.frame-label;
+        message: root.frame-message;
         undock-enabled: root.undock-enabled;
         project-loaded: root.project-loaded;
-        image-x: root.image-x;
-        image-y: root.image-y;
-        image-w: root.image-w;
-        image-h: root.image-h;
+        image-x: root.frame-image-x;
+        image-y: root.frame-image-y;
+        image-w: root.frame-image-w;
+        image-h: root.frame-image-h;
         pixelated: root.pixelated;
         undock-requested => { root.composite-undock-requested(); }
     }

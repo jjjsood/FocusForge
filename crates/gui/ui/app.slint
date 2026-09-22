@@ -157,6 +157,12 @@ export component AppWindow inherits Window {
     // texture is never computed here.
     in property <image> composite-source;
     in property <image> zmap-source;
+    // The selected source frame (`src/gpu_canvas.rs::redraw_frame`) -- the
+    // left pane's own image, label and refusal text, independent of the
+    // composite/Z-Map pair above.
+    in property <image> frame-source;
+    in property <string> frame-label: "";
+    in property <string> frame-message: "";
     in property <bool> canvas-undock-enabled: true;
     // Whether a project is open -- governs the pane chrome (label, undock)
     // and the bottom bar's zoom cluster together, so nothing offers an
@@ -188,6 +194,13 @@ export component AppWindow inherits Window {
     in property <length> image-y;
     in property <length> image-w;
     in property <length> image-h;
+    // The left pane's own placement, drawn against the selected frame's
+    // extent rather than the composite/Z-Map's -- the two panes share one
+    // viewport's scale but not one image size.
+    in property <length> frame-image-x;
+    in property <length> frame-image-y;
+    in property <length> frame-image-w;
+    in property <length> frame-image-h;
     in property <bool> pixelated;
     callback canvas-resized();
     out property <length> canvas-pane-left-x: canvas.pane-left-x;
@@ -223,12 +236,19 @@ export component AppWindow inherits Window {
             height: 100%;
             composite-source: root.composite-source;
             zmap-source: root.zmap-source;
+            frame-source: root.frame-source;
+            frame-label: root.frame-label;
+            frame-message: root.frame-message;
             undock-enabled: root.canvas-undock-enabled;
             project-loaded: root.project-loaded;
             image-x: root.image-x;
             image-y: root.image-y;
             image-w: root.image-w;
             image-h: root.image-h;
+            frame-image-x: root.frame-image-x;
+            frame-image-y: root.frame-image-y;
+            frame-image-w: root.frame-image-w;
+            frame-image-h: root.frame-image-h;
             pixelated: root.pixelated;
             show-empty-state: root.show-empty-state;
 
@@ -282,6 +302,7 @@ export component AppWindow inherits Window {
     callback images-add-frames-requested();
     callback images-sort-menu-toggled();
     callback images-sort-selected(string);
+    callback images-frame-selected(int);
     callback images-frame-excluded-toggled(int);
     callback images-frame-remove-requested(int);
     callback images-frame-grip-pointer(int, int, length);
@@ -330,6 +351,7 @@ export component AppWindow inherits Window {
         images-add-frames-requested => { root.images-add-frames-requested(); }
         images-sort-menu-toggled => { root.images-sort-menu-toggled(); }
         images-sort-selected(picked) => { root.images-sort-selected(picked); }
+        images-frame-selected(i) => { root.images-frame-selected(i); }
         images-frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
         images-frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
         images-frame-grip-pointer(i, kind, y) => { root.images-frame-grip-pointer(i, kind, y); }

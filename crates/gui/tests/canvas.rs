@@ -7,13 +7,16 @@
 mod common;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use focusforge_core::io::TiffHeader;
 use focusforge_gui::AppWindow;
 use focusforge_gui::canvas::{
-    CanvasFeed, DISPLAY_FORMAT, TextureSpec, draw_rect_fits, needs_realloc, validate_display_format,
+    CanvasFeed, DISPLAY_FORMAT, FrameSource, TextureSpec, draw_rect_fits, needs_realloc,
+    validate_display_format,
 };
+use focusforge_gui::viewport::PaneRect;
 use focusforge_gui::{AppController, OpenOutcome};
 use i_slint_backend_testing::ElementQuery;
 use slint::ComponentHandle;
@@ -448,6 +451,242 @@ fn opening_a_saved_project_feeds_its_own_planes() {
         other => {
             panic!("opening a saved project mid-session must load its own planes, got {other:?}")
         }
+    }
+}
+
+/// The right pane draws at the sealed composite's own extent, not the
+/// source frames': fuses a `mantis-512` tab (512x512 frames), whose
+/// alignment crop makes the composite smaller, and asserts `plane_draw`'s
+/// source rect stays bounded by the composite's own dimensions.
+#[test]
+fn right_pane_uses_composite_extent() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree("right_pane_extent_scratch"));
+    open_fixture_tab(&mut controller, "right_pane_extent", "mantis-512", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120))
+        .expect("the fuse must complete");
+
+    let composite_path = load_path(&mut controller, None);
+    let composite_header =
+        TiffHeader::open(&composite_path).expect("the sealed composite must have a real header");
+    assert!(
+        composite_header.width < 512 || composite_header.height < 512,
+        "the alignment crop must make the composite smaller than the 512x512 frames, got {}x{}",
+        composite_header.width,
+        composite_header.height
+    );
+
+    controller.set_pane_geometry(
+        PaneRect {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 600.0,
+        },
+        PaneRect {
+            x: 600.0,
+            y: 0.0,
+            width: 600.0,
+            height: 600.0,
+        },
+    );
+    controller.fit();
+
+    let frame = controller
+        .frame_draw()
+        .expect("a fused tab still has a frame pane to draw");
+    let plane = controller
+        .plane_draw()
+        .expect("a fused tab has a sealed plane to draw");
+
+    assert!(
+        plane.src.2 <= composite_header.width && plane.src.3 <= composite_header.height,
+        "the right pane's source rect {:?} must stay within the sealed composite's own extent \
+         {}x{}",
+        plane.src,
+        composite_header.width,
+        composite_header.height
+    );
+    assert_ne!(
+        plane.src, frame.src,
+        "the right pane must no longer be stretched across the source frames' extent"
+    );
+}
+
+/// A frame the mmap reader refuses (a compressed TIFF) shows the reader's
+/// own refusal text, and dropping into it still drops whatever was open
+/// before -- the drop-before-open rule holds even on a failed open.
+#[test]
+fn compressed_frame_shows_reader_refusal() {
+    let dir = common::tree("compressed_frame_refusal");
+    let good = common::fixture_frame("mantis-64", 0);
+    let compressed = dir.join("compressed.tif");
+    write_compressed_copy(&good, &compressed);
+
+    let mut frame = FrameSource::default();
+    frame
+        .set(&good)
+        .expect("the uncompressed fixture frame must open");
+    assert!(frame.path().is_some());
+
+    let err = frame
+        .set(&compressed)
+        .expect_err("a compressed frame must be refused");
+    assert!(
+        err.to_string()
+            .contains("Compression=5, only uncompressed (1) is supported"),
+        "the reader's own refusal text must reach the surface, got: {err}"
+    );
+    assert!(
+        frame.path().is_none(),
+        "a failed open must still drop whatever was open before it"
+    );
+}
+
+/// Copies `source` (a little-endian, classic-TIFF fixture frame) to `dest`,
+/// patching its `Compression` tag (259) from 1 to 5 in place.
+fn write_compressed_copy(source: &Path, dest: &Path) {
+    let mut bytes = fs::read(source).expect("read fixture frame");
+    assert_eq!(
+        &bytes[0..2],
+        b"II",
+        "fixture frame must be little-endian for this byte-level patch"
+    );
+    let ifd_offset = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let n_entries =
+        u16::from_le_bytes(bytes[ifd_offset..ifd_offset + 2].try_into().unwrap()) as usize;
+    let mut patched = false;
+    for i in 0..n_entries {
+        let entry_off = ifd_offset + 2 + i * 12;
+        let tag = u16::from_le_bytes(bytes[entry_off..entry_off + 2].try_into().unwrap());
+        if tag == 259 {
+            bytes[entry_off + 8..entry_off + 10].copy_from_slice(&5u16.to_le_bytes());
+            patched = true;
+            break;
+        }
+    }
+    assert!(
+        patched,
+        "Compression tag (259) not found in {}",
+        source.display()
+    );
+    fs::write(dest, bytes).expect("write compressed copy");
+}
+
+/// The drop-before-open rule with no GPU and no window: stepping over every
+/// frame of a fixture set leaves exactly one handle open (the last one), and
+/// a failed `set` leaves none open at all.
+#[test]
+fn frame_source_holds_one_frame() {
+    let mut frame = FrameSource::default();
+    for i in 0..3 {
+        frame
+            .set(&common::fixture_frame("mantis-64", i))
+            .expect("a fixture frame must open");
+    }
+    assert_eq!(
+        frame.path().unwrap().file_name().unwrap().to_str().unwrap(),
+        "02.tif",
+        "only the last-opened frame's handle must remain"
+    );
+    assert!(frame.dimensions().is_some());
+
+    let missing = PathBuf::from("/does/not/exist.tif");
+    assert!(frame.set(&missing).is_err());
+    assert!(
+        frame.path().is_none(),
+        "a failed set must leave no handle open at all"
+    );
+    assert!(frame.dimensions().is_none());
+}
+
+/// Reads the resident set size (bytes) from `/proc/self/statm`'s second
+/// field (pages), Linux-only -- this is the reference-stack step-through's
+/// own bound, exercised nowhere else.
+#[cfg(target_os = "linux")]
+fn resident_bytes() -> usize {
+    let statm = fs::read_to_string("/proc/self/statm").expect("/proc/self/statm must read");
+    let pages: usize = statm
+        .split_whitespace()
+        .nth(1)
+        .expect("statm must have a resident field")
+        .parse()
+        .expect("resident field must be a number");
+    pages * 4096
+}
+
+/// Steps `FrameSource` over all 61 frames of the reference stack, reading
+/// one bounded rect from each into a reused buffer, asserting resident
+/// memory stays flat rather than growing with the frame count -- the
+/// evidence that exactly one mmap is ever open at a time.
+#[test]
+#[ignore = "reads the reference stack, minutes"]
+fn frame_steps_keep_one_handle() {
+    #[cfg(not(target_os = "linux"))]
+    {
+        eprintln!("resident-memory measurement needs /proc/self/statm; skipping");
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(stack_dir) = common::reference_stack_dir() else {
+            eprintln!("FOCUSFORGE_REFERENCE_STACK not set to a real directory; skipping");
+            return;
+        };
+        let paths: Vec<PathBuf> = focusforge_core::io::frame_paths(&stack_dir)
+            .expect("frame_paths must enumerate the directory")
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("IMG_"))
+            })
+            .collect();
+        assert_eq!(
+            paths.len(),
+            61,
+            "IMG_-filtered list must exclude Mantis_Stacked.tif"
+        );
+
+        let mut frame = FrameSource::default();
+        let rect = focusforge_core::tile::Rect {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        };
+        let mut buf = vec![0u16; 512 * 512 * 3];
+
+        let mut baseline = 0usize;
+        let mut peak = 0usize;
+        for (i, path) in paths.iter().enumerate() {
+            frame.set(path).expect("a reference-stack frame must open");
+            frame
+                .read_into(rect, &mut buf)
+                .expect("the visible rect must read");
+            let rss = resident_bytes();
+            peak = peak.max(rss);
+            if i == 0 {
+                baseline = rss;
+            }
+        }
+        let growth = peak.saturating_sub(baseline);
+        eprintln!(
+            "resident after frame 0: {baseline} bytes, peak across 61 frames: {peak} bytes, \
+             growth {growth} bytes"
+        );
+        assert!(
+            growth < 300 * 1024 * 1024,
+            "resident memory must stay flat while stepping through every frame: grew \
+             {growth} bytes ({} MB)",
+            growth / (1024 * 1024)
+        );
+        assert_eq!(
+            frame.path(),
+            Some(paths.last().unwrap().as_path()),
+            "only the last frame's handle must remain open"
+        );
     }
 }
 

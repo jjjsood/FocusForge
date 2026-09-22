@@ -72,14 +72,19 @@ pub struct Installed {
 }
 
 /// The single open renderer, and which tab's planes it holds -- `None`
-/// before anything has loaded, and again after clearing it. Built once
-/// in `src/main.rs`, before any window exists, and shared with the drop
-/// route as well as `install`'s own callbacks, so every path that can load
-/// a project shares the one cell.
+/// before anything has loaded. Built once in `src/main.rs`, before any
+/// window exists, and shared with the drop route as well as `install`'s own
+/// callbacks, so every path that can load a project shares the one cell.
+/// The renderer outlives a plane clear: an unfused tab still has one, for
+/// its selected frame alone.
 #[derive(Default)]
 pub struct Canvas {
     renderer: Option<CanvasRenderer>,
     tab: Option<usize>,
+    /// The frame reader's own refusal, kept until a different frame opens
+    /// or the same one succeeds -- the left `FFPane`'s message line reads
+    /// this.
+    frame_error: Option<String>,
 }
 
 impl Canvas {
@@ -88,9 +93,18 @@ impl Canvas {
         self.tab
     }
 
-    /// Drops the renderer and forgets its owner.
+    /// The open frame reader's own refusal text, if the last [`Self::set_frame`]
+    /// failed.
+    pub fn frame_error(&self) -> Option<&str> {
+        self.frame_error.as_deref()
+    }
+
+    /// Drops the planes and forgets the owning tab; the frame half is left
+    /// alone.
     fn clear(&mut self) {
-        self.renderer = None;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.clear_planes();
+        }
         self.tab = None;
     }
 
@@ -99,25 +113,62 @@ impl Canvas {
     /// failing to reopen is an environment problem (a full disk, a
     /// permissions change), not a bug worth crashing the window over. `tab`
     /// is recorded even when the open fails, so an unreadable plane file is
-    /// not retried on every gesture.
+    /// not retried on every gesture. Reuses the renderer's own frame half
+    /// rather than replacing it, since it may already hold the tab's
+    /// selected frame.
     fn load(&mut self, tab: usize, composite: &Path, zmap: &Path) {
         self.tab = Some(tab);
-        let Ok(shared) = focusforge_gpu::device::shared_device() else {
+        if self.renderer.is_none() {
+            let Ok(shared) = focusforge_gpu::device::shared_device() else {
+                return;
+            };
+            self.renderer = Some(CanvasRenderer::new(shared));
+        }
+        let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        match CanvasRenderer::open(shared, composite, zmap) {
-            Ok(renderer) => self.renderer = Some(renderer),
-            Err(err) => eprintln!("failed to open the project's planes: {err}"),
+        if let Err(err) = renderer.set_planes(composite, zmap) {
+            eprintln!("failed to open the project's planes: {err}");
+        }
+    }
+
+    /// Opens `path` as the left pane's source, creating the renderer first
+    /// when this tab has never had planes to draw. A no-op when `path` is
+    /// already open; `None` drops whatever frame was open. Keeps the
+    /// reader's own refusal text on failure rather than a generic message.
+    pub fn set_frame(&mut self, path: Option<&Path>) {
+        if self.renderer.is_none() {
+            let Ok(shared) = focusforge_gpu::device::shared_device() else {
+                return;
+            };
+            self.renderer = Some(CanvasRenderer::new(shared));
+        }
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let Some(path) = path else {
+            renderer.clear_frame();
+            self.frame_error = None;
+            return;
+        };
+        if renderer.frame_path() == Some(path) {
+            return;
+        }
+        match renderer.set_frame(path) {
+            Ok(()) => self.frame_error = None,
+            Err(err) => self.frame_error = Some(err.to_string()),
         }
     }
 }
 
 /// Reconciles the open renderer cell with the active tab
-/// ([`AppController::canvas_feed`]), then draws it: the two re-rendered
-/// images, the five placement properties, `zoom-readout` and
-/// `project-loaded`. The one place a gesture, an active-tab change or a
-/// completed run becomes a repaint. With nothing to draw, both sources and
-/// the placement are cleared rather than left showing the previous tab.
+/// ([`AppController::canvas_feed`]) and the selected frame, then draws both
+/// panes: the left pane's re-rendered frame with its own label and refusal
+/// text, the right pane's re-rendered composite/Z-Map pair, each with its
+/// own placement, plus `zoom-readout` and `project-loaded`. The one place a
+/// gesture, an active-tab change or a completed run becomes a repaint. With
+/// nothing to draw, a pane's source and placement are cleared rather than
+/// left showing the previous tab.
 pub fn repaint(
     app: &AppWindow,
     controller: &Arc<Mutex<AppController>>,
@@ -137,21 +188,51 @@ pub fn repaint(
         } => canvas.borrow_mut().load(tab, &composite, &zmap),
     }
 
-    let (draw, readout, project_loaded) = {
+    let (frame_path, frame_label, frame_draw, plane_draw, readout, project_loaded) = {
         let controller = controller.lock().unwrap();
         (
-            controller.pane_draw(),
+            controller.selected_frame_path(),
+            controller.frame_pane_label(),
+            controller.frame_draw(),
+            controller.plane_draw(),
             controller.zoom_readout(),
             controller.active_project().is_some(),
         )
     };
+    canvas.borrow_mut().set_frame(frame_path.as_deref());
+
     app.set_zoom_readout(readout.into());
     app.set_project_loaded(project_loaded);
+    app.set_frame_label(frame_label.into());
+    app.set_frame_message(canvas.borrow().frame_error().unwrap_or("").into());
 
-    let redrawn = draw.and_then(|draw| {
+    let frame_redrawn = frame_draw.and_then(|draw| {
         let mut canvas = canvas.borrow_mut();
         let renderer = canvas.renderer.as_mut()?;
-        Some((draw, renderer.redraw(&draw)?))
+        Some((draw, renderer.redraw_frame(&draw)?))
+    });
+    match frame_redrawn {
+        Some((draw, frame_image)) => {
+            app.set_frame_source(frame_image);
+            app.set_frame_image_x(draw.dst.0);
+            app.set_frame_image_y(draw.dst.1);
+            app.set_frame_image_w(draw.dst.2);
+            app.set_frame_image_h(draw.dst.3);
+            app.set_pixelated(draw.pixelated);
+        }
+        None => {
+            app.set_frame_source(slint::Image::default());
+            app.set_frame_image_x(0.0);
+            app.set_frame_image_y(0.0);
+            app.set_frame_image_w(0.0);
+            app.set_frame_image_h(0.0);
+        }
+    }
+
+    let redrawn = plane_draw.and_then(|draw| {
+        let mut canvas = canvas.borrow_mut();
+        let renderer = canvas.renderer.as_mut()?;
+        Some((draw, renderer.redraw_planes(&draw)?))
     });
     match redrawn {
         Some((draw, (composite_image, zmap_image))) => {
@@ -559,6 +640,7 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
             excluded: row.excluded,
             unresolved: row.unresolved,
             top: row.top,
+            selected: row.selected,
         })
         .collect();
     let existing = app.get_images_rows();
@@ -1418,9 +1500,25 @@ pub fn install(
         let controller = controller.clone();
         move |i| controller.lock().unwrap().toggle_frame_excluded(i as usize)
     });
+    app.on_images_frame_selected({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.select_frame(i as usize);
+            });
+        }
+    });
     app.on_images_frame_remove_requested({
         let controller = controller.clone();
-        move |i| controller.lock().unwrap().remove_frame(i as usize)
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.remove_frame(i as usize);
+            });
+        }
     });
     app.on_frame_warning_cancelled({
         let controller = controller.clone();
@@ -1428,8 +1526,12 @@ pub fn install(
     });
     app.on_frame_warning_confirmed({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
-            controller.lock().unwrap().confirm_frame_change();
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.confirm_frame_change();
+            });
         }
     });
     app.on_frame_warning_secondary_pressed({

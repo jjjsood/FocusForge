@@ -122,9 +122,11 @@ pub struct PaneDraw {
     /// hands the composite/Z-Map tile readers' own `read_tile_into`.
     pub src: (u32, u32, u32, u32),
     /// `(x, y, width, height)` in pane-local logical px -- `FFPane::image-x/
-    /// image-y/image-w/image-h`. Identical for both panes: they share one
-    /// viewport and one size, so only their own `x`/`y` (applied by Slint's
-    /// own layout, not here) differs.
+    /// image-y/image-w/image-h`. The two panes share one viewport, not one
+    /// image extent: each is this same viewport's `scale`/`origin` drawn
+    /// against that pane's own [`ImageSize`], so their own `x`/`y` (applied
+    /// by Slint's own layout, not here) and their own `width`/`height` can
+    /// both differ.
     pub dst: (f32, f32, f32, f32),
     /// `pixelated` at or above 100 %, `smooth` below it.
     pub pixelated: bool,

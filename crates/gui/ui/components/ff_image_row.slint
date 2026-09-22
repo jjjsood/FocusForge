@@ -16,6 +16,10 @@ export component FFImageRow inherits Rectangle {
     in property <bool> unresolved: false;
     // This row is the one being dragged to a new position.
     in property <bool> dragging: false;
+    // This row is the frame the left canvas pane draws. Drawn as a 30% wash
+    // in the row's own chip colour plus a 4 px bar at the left edge;
+    // `dragging`'s bar wins while a drag is in flight.
+    in property <bool> selected: false;
     // Forces the hover visual for the component sheet; a live row also
     // shows it under the pointer.
     in property <bool> hovered: false;
@@ -29,6 +33,7 @@ export component FFImageRow inherits Rectangle {
 
     callback exclude-toggled();
     callback remove-requested();
+    callback clicked();
     // The grip's own raw pointer stream (0 = down, 1 = up, 2 = move; the
     // same fold `ff_scrollbar.slint`'s `pointer` uses), `y` relative to this
     // row's own top edge -- the panel/controller decide what a drag means.
@@ -52,7 +57,9 @@ export component FFImageRow inherits Rectangle {
         : Theme.text-primary;
     property <color> time-color: root.unresolved ? Theme.text-disabled : Theme.text-muted;
 
-    background: root.dragging || (root.interactive && area.has-hover) ? Theme.surface-hover : transparent;
+    background: root.dragging || (root.interactive && area.has-hover) ? Theme.surface-hover
+        : root.selected ? root.chip.with-alpha(0.3)
+        : transparent;
 
     // Nested rather than a sibling: Slint delivers a pointer move to exactly
     // one item, so a sibling TouchArea would occlude `area.has-hover` (and
@@ -63,6 +70,7 @@ export component FFImageRow inherits Rectangle {
         enabled: root.interactive;
         width: 100%;
         height: 100%;
+        clicked => { root.clicked(); }
 
         // The grip -- the row's own drag handle, in the gutter before the
         // chip.
@@ -128,6 +136,12 @@ export component FFImageRow inherits Rectangle {
         width: 4px;
         height: 100%;
         background: Theme.accent-default;
+    }
+    if !root.dragging && root.selected: Rectangle {
+        x: 0;
+        width: 4px;
+        height: 100%;
+        background: root.chip;
     }
 
     content := HorizontalLayout {

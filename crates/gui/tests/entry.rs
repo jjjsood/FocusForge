@@ -681,7 +681,7 @@ fn plus_selects_the_new_project_placeholder() {
     let (left, right) = base_pane();
     controller.set_pane_geometry(left, right);
     assert_eq!(controller.zoom_readout(), "");
-    assert!(controller.pane_draw().is_none());
+    assert!(controller.frame_draw().is_none());
 }
 
 #[test]

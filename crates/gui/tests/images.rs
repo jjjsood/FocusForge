@@ -262,8 +262,148 @@ fn rows_carry_no_index() {
             excluded: _,
             unresolved: _,
             top: _,
+            selected: _,
         } = row;
     }
+}
+
+// ---------------------------------------------------------------------
+// Selection: exactly one frame selected, a position rather than an
+// identity, driving the left canvas pane.
+// ---------------------------------------------------------------------
+
+fn mantis64_frame(index: usize) -> PathBuf {
+    common::fixture_frame("mantis-64", index)
+}
+
+fn controller_with_mantis64_frames(name: &str) -> AppController {
+    let root = tree(&format!("{name}_frames"));
+    for i in 0..3 {
+        std::fs::copy(mantis64_frame(i), root.join(format!("{i:02}.tif")))
+            .expect("fixture frame must copy");
+    }
+    let mut controller = AppController::new();
+    assert!(matches!(
+        controller.open_paths(&[root]),
+        OpenOutcome::Opened(_)
+    ));
+    controller
+}
+
+/// The selected position, the path the canvas is fed and the panel's own
+/// `selected` flags are one value -- never index 0, the last row instead.
+#[test]
+fn frame_selection_drives_left_pane() {
+    let mut controller = controller_with_mantis64_frames("frame_selection_drives_left_pane");
+    let last = 2;
+    controller.select_frame(last);
+
+    let path = controller
+        .selected_frame_path()
+        .expect("a tab is open with frames to select");
+    assert_eq!(path.file_name().unwrap().to_str().unwrap(), "02.tif");
+    assert_eq!(controller.frame_pane_label(), "02.tif");
+
+    let panel = controller.images_panel();
+    for (i, row) in panel.rows.iter().enumerate() {
+        assert_eq!(
+            row.selected,
+            i == last,
+            "row {i}'s selected flag must match the position picked, not index 0"
+        );
+    }
+}
+
+/// One row carries `selected` after open, after removing the selected row,
+/// after removing down to the list's last remaining row, and after the
+/// post-run re-seed -- never zero, never two. Seeding a first-excluded set
+/// skips the excluded position, checked directly against the seed function
+/// tab creation and the post-run re-seed both call.
+#[test]
+fn selection_is_always_exactly_one() {
+    assert_eq!(
+        focusforge_gui::images::first_included(&[true, false, false]),
+        1,
+        "seeding must skip an excluded first frame"
+    );
+
+    fn selected_count(controller: &AppController) -> usize {
+        controller
+            .images_panel()
+            .rows
+            .iter()
+            .filter(|r| r.selected)
+            .count()
+    }
+
+    let mut controller = controller_with_timed_frames("selection_always_one", 3);
+    assert_eq!(selected_count(&controller), 1, "after open");
+
+    controller.select_frame(1);
+    controller.remove_frame(1);
+    assert_eq!(
+        selected_count(&controller),
+        1,
+        "after removing the selected row"
+    );
+
+    // Down to the last remaining row: select it, then remove it.
+    let last = controller.images_panel().rows.len() - 1;
+    controller.select_frame(last);
+    controller.remove_frame(last);
+    assert_eq!(
+        selected_count(&controller),
+        1,
+        "after removing the selected row when it was the list's last row"
+    );
+
+    // The post-run re-seed: a second fuse must land exactly one selected
+    // row again, regardless of what was selected before it started.
+    let mut controller = controller_with_frames("selection_always_one_run", 3);
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    controller.select_frame(2);
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert_eq!(selected_count(&controller), 1, "after the post-run re-seed");
+    assert!(
+        controller.images_panel().rows[0].selected,
+        "the re-seed lands on the first included frame"
+    );
+}
+
+/// Selection is a position, not an identity: the same frame stays selected
+/// across a manual reorder that moves it, and across removing a frame that
+/// now sits above it.
+#[test]
+fn selection_survives_reorder_and_remove() {
+    let mut controller = controller_with_timed_frames("selection_survives", 4);
+    controller.select_frame(2);
+    let selected_name = controller.frame_pane_label();
+    assert_eq!(selected_name, "02.tif");
+
+    // A manual drag from below the selection to above it.
+    controller.move_frame(3, 0);
+    assert_eq!(
+        controller.frame_pane_label(),
+        selected_name,
+        "the same frame stays selected across a reorder"
+    );
+
+    let panel = controller.images_panel();
+    let selected_pos = panel.rows.iter().position(|r| r.selected).unwrap();
+    assert!(
+        selected_pos > 0,
+        "the reorder must have left at least one row above the selection"
+    );
+
+    // Removing a frame above the (moved) selection.
+    controller.remove_frame(0);
+    assert_eq!(
+        controller.frame_pane_label(),
+        selected_name,
+        "the same frame stays selected across removing a frame above it"
+    );
 }
 
 // ---------------------------------------------------------------------

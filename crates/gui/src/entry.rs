@@ -277,6 +277,15 @@ pub fn project_frames(project: &GuiProject) -> Vec<PathBuf> {
     }
 }
 
+/// A tab's own source-frame size, read from an actual frame's header --
+/// always the frames' own extent, never the sealed composite's (possibly
+/// cropped) one, for a fresh group and for a reopened project alike.
+pub fn tab_image_size(project: &GuiProject) -> Option<(u32, u32)> {
+    let frames = project_frames(project);
+    let header = TiffHeader::open(frames.first()?).ok()?;
+    Some((header.width, header.height))
+}
+
 /// A tab's frame count: the group's own frame count pre-fuse, the sealed
 /// composite's recorded one once opened.
 pub fn tab_frame_count(project: &GuiProject) -> u32 {

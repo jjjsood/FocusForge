@@ -264,6 +264,11 @@ struct ProjectTab {
     /// frame is left out of the next fuse without moving any other position.
     frames: Vec<PathBuf>,
     excluded: Vec<bool>,
+    /// The frame the left canvas pane draws -- a position into `frames`,
+    /// never an identity. Seeded to the first not-excluded position when the
+    /// tab is created, and kept in step by every edit that moves or shortens
+    /// `frames`.
+    selected: usize,
     /// The sort menu's own selection -- `None` is the dragged state, where
     /// neither `Name` nor `Capture time` is checked. Cleared by a manual
     /// drag.
@@ -287,10 +292,8 @@ impl ProjectTab {
     fn new(mut project: GuiProject, id: u64) -> Self {
         let title = entry::tab_title(&project);
         let ctx = entry::tab_stack_context(&project);
-        let image = ctx.map(|c| ImageSize {
-            width: c.width,
-            height: c.height,
-        });
+        let image =
+            entry::tab_image_size(&project).map(|(width, height)| ImageSize { width, height });
         let (fuse_id, fuse_values, align_id, align_values) =
             settings_panel::seed_algorithm_state(&project);
         let checkpoints = match &mut project {
@@ -299,6 +302,7 @@ impl ProjectTab {
         };
         let frames = entry::project_frames(&project);
         let excluded = vec![false; frames.len()];
+        let selected = images::first_included(&excluded);
         let thumbnail = overlay::render_thumbnail(&mut project, &frames).map(Arc::new);
         ProjectTab {
             id,
@@ -317,6 +321,7 @@ impl ProjectTab {
             checkpoints,
             frames,
             excluded,
+            selected,
             frame_sort: None,
             thumbnail,
             run: job::RunState::Idle,
@@ -338,7 +343,8 @@ impl ProjectTab {
     /// Permutes `frames` and `excluded` together by `order` (each entry the
     /// original index now at that position) -- what a manual drag and a sort
     /// both apply, so an exclusion stays attached to the frame it was set on
-    /// rather than to a position.
+    /// rather than to a position. `selected` follows the same frame to its
+    /// new position.
     fn reorder(&mut self, order: &[usize]) {
         let old_frames = std::mem::take(&mut self.frames);
         let old_excluded = std::mem::take(&mut self.excluded);
@@ -347,6 +353,15 @@ impl ProjectTab {
             .iter()
             .map(|&i| old_excluded.get(i).copied().unwrap_or(false))
             .collect();
+        self.selected = order
+            .iter()
+            .position(|&i| i == self.selected)
+            .unwrap_or(self.selected);
+    }
+
+    /// The selected frame's path -- `None` only for an empty frame list.
+    fn selected_frame(&self) -> Option<&PathBuf> {
+        self.frames.get(self.selected)
     }
 }
 
@@ -990,15 +1005,35 @@ impl AppController {
     }
 
     /// The active tab's viewport's visible source rect and its pane-local
-    /// projection, for `crate::gpu_canvas::CanvasRenderer::redraw` and
-    /// `ui/shell/canvas.slint`'s `FFPane` placement properties. `None` while
-    /// no tab is active, no image size is known, or before the first pane
-    /// geometry arrives.
-    pub fn pane_draw(&self) -> Option<PaneDraw> {
+    /// projection over the selected frame, for
+    /// `crate::gpu_canvas::CanvasRenderer::redraw_frame` and the left
+    /// `FFPane`'s placement properties. `None` while no tab is active, no
+    /// frame size is known, or before the first pane geometry arrives.
+    pub fn frame_draw(&self) -> Option<PaneDraw> {
         let tab = self.state.active()?;
         let image = tab.image?;
         let (left, _) = self.state.panes?;
         tab.viewport.as_ref()?.draw(image, left)
+    }
+
+    /// The active tab's viewport's visible source rect and its pane-local
+    /// projection over the sealed composite/Z-Map's own extent, for
+    /// `crate::gpu_canvas::CanvasRenderer::redraw_planes` and the right
+    /// `FFPane`'s placement properties. `None` while no tab is active, the
+    /// tab has nothing sealed yet, or before the first pane geometry
+    /// arrives.
+    pub fn plane_draw(&self) -> Option<PaneDraw> {
+        let tab = self.state.active()?;
+        let GuiProject::Opened(project) = &tab.project else {
+            return None;
+        };
+        let plane = &project.manifest().composite;
+        let image = ImageSize {
+            width: plane.width,
+            height: plane.height,
+        };
+        let (_, right) = self.state.panes?;
+        tab.viewport.as_ref()?.draw(image, right)
     }
 
     /// The one wheel entry point. Axis normalisation first: an unmodified
@@ -1775,6 +1810,7 @@ impl AppController {
         if candidates.iter().all(|p| p.is_file()) {
             tab.excluded = vec![false; candidates.len()];
             tab.frames = candidates;
+            tab.selected = images::first_included(&tab.excluded);
             self.clear_failure(&path);
         }
     }
@@ -2157,7 +2193,7 @@ impl AppController {
     pub fn images_panel(&self) -> images::ImagesModel {
         let viewport_height = self.state.images_viewport_height;
         let Some(tab) = self.state.active() else {
-            return images::build_model(&[], &[], 0.0);
+            return images::build_model(&[], &[], None, 0.0);
         };
         let content_height = tab.frames.len() as f32 * images::ROW_HEIGHT;
         let scroll_y = settings_panel::clamp_panel_scroll(
@@ -2165,7 +2201,7 @@ impl AppController {
             content_height,
             viewport_height,
         );
-        images::build_model(&tab.frames, &tab.excluded, scroll_y)
+        images::build_model(&tab.frames, &tab.excluded, Some(tab.selected), scroll_y)
     }
 
     /// The active tab's checkpoint count, `0` with none active -- what every
@@ -2190,6 +2226,35 @@ impl AppController {
         };
         *excluded = !*excluded;
         self.emit(ShellEvent::ImagesChanged);
+    }
+
+    /// Selects the frame at `index` for the left pane. No gate: which frame
+    /// is on the canvas changes no frame set, so this works even mid-run or
+    /// past the checkpoint count that gates a set-changing edit. A no-op
+    /// past the frame list's end or with no tab active.
+    pub fn select_frame(&mut self, index: usize) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        if index >= tab.frames.len() {
+            return;
+        }
+        tab.selected = index;
+        self.emit(ShellEvent::ImagesChanged);
+    }
+
+    /// The selected frame's path -- `None` with no tab active or an empty
+    /// frame list.
+    pub fn selected_frame_path(&self) -> Option<PathBuf> {
+        self.state.active()?.selected_frame().cloned()
+    }
+
+    /// The left pane's label: the selected frame's file name, or empty with
+    /// no tab active or nothing selected.
+    pub fn frame_pane_label(&self) -> String {
+        self.selected_frame_path()
+            .map(|path| images::file_name(&path))
+            .unwrap_or_default()
     }
 
     /// Adds `paths` to the active tab's frame list, appended in the order
@@ -2254,6 +2319,11 @@ impl AppController {
         if index < tab.excluded.len() {
             tab.excluded.remove(index);
         }
+        tab.selected = if tab.selected > index {
+            tab.selected - 1
+        } else {
+            tab.selected.min(tab.frames.len().saturating_sub(1))
+        };
     }
 
     /// Drags the frame at `from` to `to` -- the manual order, which clears
@@ -2992,13 +3062,13 @@ impl AppController {
             tab.project = GuiProject::Opened(Box::new(project));
             tab.title = entry::tab_title(&tab.project);
             tab.ctx = entry::tab_stack_context(&tab.project);
-            tab.image = tab.ctx.map(|c| ImageSize {
-                width: c.width,
-                height: c.height,
-            });
+            // `tab.image` is the source frames' own extent, set once at tab
+            // creation -- a fuse changes the sealed composite's size, never
+            // the frames', so it is not re-derived here.
             tab.checkpoints += 1;
             tab.frames = entry::project_frames(&tab.project);
             tab.excluded = vec![false; tab.frames.len()];
+            tab.selected = images::first_included(&tab.excluded);
             tab.frame_sort = None;
             tab.thumbnail = overlay::render_thumbnail(&mut tab.project, &tab.frames).map(Arc::new);
             Some((path, composite, zmap))

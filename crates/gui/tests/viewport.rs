@@ -295,7 +295,7 @@ fn panes_share_one_viewport() {
 
     // Cursor over the left pane (x in [16, 582]).
     controller.wheel(0.0, 60.0, 100.0, 100.0, NONE);
-    let draw_left = controller.pane_draw().expect("a project is open");
+    let draw_left = controller.frame_draw().expect("a project is open");
 
     controller.fit();
 
@@ -303,25 +303,82 @@ fn panes_share_one_viewport() {
     // offset as the left-pane cursor above (both panes are the same size,
     // offset only by `x`) -- must resolve through the same one viewport.
     controller.wheel(0.0, 60.0, 682.0, 100.0, NONE);
-    let draw_right = controller.pane_draw().expect("a project is open");
+    let draw_right = controller.frame_draw().expect("a project is open");
 
     assert_eq!(
         draw_left, draw_right,
         "one viewport must respond identically regardless of which pane the cursor is over"
     );
 
-    // Structural: both `FFPane`s in `ui/shell/canvas.slint` read one set of
-    // placement properties (`root.image-*`/`root.pixelated`), not two.
+    // Structural: `pixelated` is one shared property read by both `FFPane`s
+    // in `ui/shell/canvas.slint`; `image-*` is the right pane's own
+    // (composite/Z-Map) extent and `frame-image-*` the left pane's own,
+    // each driven by that one viewport but naming its own pane's `ImageSize`.
     let canvas_slint =
         fs::read_to_string(common::ui_dir().join("shell").join("canvas.slint")).unwrap();
-    for prop in ["image-x", "image-y", "image-w", "image-h", "pixelated"] {
-        let needle = format!("{prop}: root.{prop}");
-        let count = canvas_slint.matches(needle.as_str()).count();
+    let needle = "pixelated: root.pixelated";
+    let count = canvas_slint.matches(needle).count();
+    assert_eq!(
+        count, 2,
+        "pixelated must be forwarded identically to both panes, found {count} occurrence(s)"
+    );
+    for prop in ["image-x", "image-y", "image-w", "image-h"] {
+        let right_needle = format!("{prop}: root.{prop}");
+        let left_needle = format!("{prop}: root.frame-{prop}");
         assert_eq!(
-            count, 2,
-            "{prop} must be forwarded identically to both panes, found {count} occurrence(s)"
+            canvas_slint.matches(right_needle.as_str()).count(),
+            1,
+            "the right pane must bind its own {prop} exactly once"
+        );
+        assert_eq!(
+            canvas_slint.matches(left_needle.as_str()).count(),
+            1,
+            "the left pane must bind its own frame-{prop} exactly once"
         );
     }
+}
+
+/// One viewport drives two extents at once: the frame pane's own size and a
+/// composite cropped smaller on both axes, by an odd number of pixels each.
+/// A zoom taken over the frame pane keeps that source point registered
+/// under the cursor there, and both panes' draws report the same scale.
+#[test]
+fn two_pane_sizes_share_one_viewport() {
+    let frame_size = image(1024, 1024);
+    let plane_size = image(1024 - 7, 1024 - 5);
+    let p = pane(512.0, 512.0);
+    let anchor = (233.0, 177.0);
+
+    let mut vp = fit(frame_size, p);
+    let src_before = source_point(&vp, anchor);
+    vp.zoom_steps(2, anchor, frame_size, p);
+    let src_after = source_point(&vp, anchor);
+    let drift_x = ((src_after.0 - src_before.0) * vp.scale()).abs();
+    let drift_y = ((src_after.1 - src_before.1) * vp.scale()).abs();
+    assert!(
+        drift_x < 1.0 && drift_y < 1.0,
+        "the anchor point must stay under the cursor in the pane it was taken in: \
+         drift {drift_x}, {drift_y} screen px"
+    );
+
+    let frame_draw = vp
+        .draw(frame_size, p)
+        .expect("the frame pane must have something to draw");
+    let plane_draw = vp
+        .draw(plane_size, p)
+        .expect("the plane pane must have something to draw");
+
+    let scale_of = |d: &focusforge_gui::viewport::PaneDraw| d.dst.2 as f64 / d.src.2 as f64;
+    assert!(
+        (scale_of(&frame_draw) - scale_of(&plane_draw)).abs() < 1e-6,
+        "both panes must draw at the same one scale: {} vs {}",
+        scale_of(&frame_draw),
+        scale_of(&plane_draw)
+    );
+    assert_eq!(
+        frame_draw.pixelated, plane_draw.pixelated,
+        "both panes must cross the pixelated threshold together"
+    );
 }
 
 #[test]

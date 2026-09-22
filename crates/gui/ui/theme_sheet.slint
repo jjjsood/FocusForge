@@ -124,9 +124,13 @@ component IconSizeSample inherits Rectangle {
 export component ThemeSheet inherits Window {
     title: "FocusForge -- token sheet";
     preferred-width: 1100px;
-    preferred-height: 2960px;
+    preferred-height: 1000px;
     background: Theme.surface-base;
     default-font-family: Theme.font-family;
+
+    Flickable {
+        width: root.width;
+        height: root.height;
 
     VerticalLayout {
         padding: Theme.space-4;
@@ -424,6 +428,13 @@ export component ThemeSheet inherits Window {
                 time-text: "14:16:04";
                 dragging: true;
             }
+            FFImageRow {
+                width: 248px;
+                chip: Theme.status-success;
+                name: "05.tif";
+                time-text: "14:17:05";
+                selected: true;
+            }
         }
 
         GroupHeading { text: "Dialog footer"; }
@@ -556,5 +567,6 @@ export component ThemeSheet inherits Window {
                 meta-text: "not read · not changed";
             }
         }
+    }
     }
 }
