@@ -9,6 +9,25 @@
 //! `crates/gui/src/gpu_canvas.rs`, the only module in the crate naming
 //! `wgpu` or `slint::wgpu_29`.
 
+use std::path::PathBuf;
+
+/// What the open renderer cell should do for the frame about to draw --
+/// [`crate::controller::AppController::canvas_feed`]'s answer, decided with
+/// no GPU and no window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanvasFeed {
+    /// The renderer already holds the active tab's planes; draw as is.
+    Keep,
+    /// No tab is active, or the active tab has nothing sealed to show yet.
+    Clear,
+    /// Open `composite`/`zmap` as `tab`'s own planes.
+    Load {
+        tab: usize,
+        composite: PathBuf,
+        zmap: PathBuf,
+    },
+}
+
 /// Which pane a piece of canvas state belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneSource {
@@ -74,4 +93,16 @@ pub fn check_pane_dimensions(composite: (u32, u32), zmap: (u32, u32)) -> Result<
     } else {
         Err(CanvasError::PaneDimensionsDiffer { composite, zmap })
     }
+}
+
+/// Whether `src`'s rect lies fully inside a `frame`-sized image -- the same
+/// bound `TiffStack::read_tile_into` enforces, decided before any read
+/// happens so an out-of-range viewport rect never reaches the mmap.
+pub fn draw_rect_fits(frame: (u32, u32), src: (u32, u32, u32, u32)) -> bool {
+    let (frame_width, frame_height) = frame;
+    let (x, y, width, height) = src;
+    width > 0
+        && height > 0
+        && x.checked_add(width).is_some_and(|xw| xw <= frame_width)
+        && y.checked_add(height).is_some_and(|yh| yh <= frame_height)
 }

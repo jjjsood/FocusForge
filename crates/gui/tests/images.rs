@@ -791,7 +791,13 @@ fn dragging_a_row_by_its_grip_reorders_it_through_the_real_window() {
         "images_grip_drag_wire",
         5,
     )));
-    let _installed = focusforge_gui::bridge::install(&app, controller.clone());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        std::rc::Rc::new(std::cell::RefCell::new(
+            focusforge_gui::bridge::Canvas::default(),
+        )),
+    );
     app.set_project_loaded(true);
     focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
 
@@ -884,7 +890,13 @@ fn dragging_a_row_by_its_grip_floats_a_copy_that_follows_the_cursor() {
         "images_grip_drag_ghost",
         5,
     )));
-    let _installed = focusforge_gui::bridge::install(&app, controller.clone());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        std::rc::Rc::new(std::cell::RefCell::new(
+            focusforge_gui::bridge::Canvas::default(),
+        )),
+    );
     app.set_project_loaded(true);
     focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
 
@@ -1006,7 +1018,13 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
         "job_disables_images_and_settings",
         3,
     )));
-    let _installed = focusforge_gui::bridge::install(&app, controller.clone());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        std::rc::Rc::new(std::cell::RefCell::new(
+            focusforge_gui::bridge::Canvas::default(),
+        )),
+    );
     app.set_project_loaded(true);
     app.set_dock_tab("images".into());
     let push = |c: &AppController| {
@@ -1226,7 +1244,13 @@ fn the_frame_set_warnings_footer_sits_at_the_panels_bottom_edge() {
     assert!(controller.pending_frame_change().is_some());
 
     let controller = Arc::new(Mutex::new(controller));
-    let _installed = focusforge_gui::bridge::install(&app, controller.clone());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        std::rc::Rc::new(std::cell::RefCell::new(
+            focusforge_gui::bridge::Canvas::default(),
+        )),
+    );
     app.set_project_loaded(true);
     focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
 

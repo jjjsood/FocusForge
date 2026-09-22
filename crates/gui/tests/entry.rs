@@ -1061,7 +1061,10 @@ fn a_double_click_on_a_close_glyph_closes_one_tab() {
         let mut four = with_four_projects(&format!("entry_double_click_close_{case}"));
         four.select_project(active);
         let controller = Arc::new(Mutex::new(four));
-        focusforge_gui::bridge::install(&app, controller.clone());
+        let canvas = std::rc::Rc::new(std::cell::RefCell::new(
+            focusforge_gui::bridge::Canvas::default(),
+        ));
+        focusforge_gui::bridge::install(&app, controller.clone(), canvas);
         let queued = Arc::new(Mutex::new(Vec::new()));
         controller.lock().unwrap().set_sink(Arc::new({
             let queued = queued.clone();

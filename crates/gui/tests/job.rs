@@ -10,7 +10,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::ParamValues;
@@ -26,32 +26,20 @@ use focusforge_gui::{AppController, OpenOutcome};
 // itself, since `start_fuse` seals a `.ffp` beside the frames it fuses.
 // ---------------------------------------------------------------------
 
-fn mantis_frame(index: usize) -> PathBuf {
-    common::workspace_root()
-        .join("fixtures")
-        .join("mantis-512")
-        .join("frames")
-        .join(format!("{index:02}.tif"))
-}
-
-fn tree(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp tree must be creatable");
-    dir
-}
-
 fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
     std::fs::create_dir_all(dest_dir).unwrap();
-    std::fs::copy(mantis_frame(source_index), dest_dir.join(name))
-        .expect("fixture frame must copy");
+    std::fs::copy(
+        common::fixture_frame("mantis-512", source_index),
+        dest_dir.join(name),
+    )
+    .expect("fixture frame must copy");
 }
 
 /// A controller with one unsaved project open over `count` copied fixture
 /// frames (named `00.tif`, `01.tif`, ... in fixture order), its own scratch
 /// root under `CARGO_TARGET_TMPDIR`.
 fn controller_with_frames(name: &str, count: usize) -> AppController {
-    let root = tree(&format!("{name}_frames"));
+    let root = common::tree(&format!("{name}_frames"));
     for i in 0..count {
         copy_frame(&root, &format!("{i:02}.tif"), i);
     }
@@ -60,32 +48,8 @@ fn controller_with_frames(name: &str, count: usize) -> AppController {
         controller.open_paths(&[root]),
         OpenOutcome::Opened(_)
     ));
-    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
+    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
     controller
-}
-
-/// Polls `settle_job`/`job_view` until the run is no longer live, returning
-/// the materialized plane paths from the call that actually settled it (if
-/// any). The window's own timer does exactly this poll, just on a Slint
-/// `Timer` instead of a plain loop.
-fn wait_for_settle(
-    controller: &mut AppController,
-    timeout: Duration,
-) -> Option<(PathBuf, PathBuf)> {
-    let start = Instant::now();
-    loop {
-        if let Some(planes) = controller.settle_job() {
-            return Some(planes);
-        }
-        if !job::is_live(&controller.job_view().state) {
-            return None;
-        }
-        assert!(
-            start.elapsed() < timeout,
-            "job did not settle within {timeout:?}"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -104,7 +68,7 @@ fn fuse_runs_to_completion_off_the_ui_thread() {
         "start_fuse must return before the run finishes"
     );
 
-    let planes = wait_for_settle(&mut controller, Duration::from_secs(120))
+    let planes = common::wait_for_settle(&mut controller, Duration::from_secs(120))
         .expect("a completed run must hand back its two materialized planes");
     assert!(planes.0.is_file() && planes.1.is_file());
     assert!(!controller.job_running());
@@ -149,13 +113,13 @@ fn gui_run_matches_the_cli_run() {
     // pinned to the golden's own geometry (448/5, unaligned) -- neither the
     // panel's defaults nor the CLI's own default tile size, so this is a
     // genuine comparison rather than a re-assertion of a default.
-    let root = tree("cli_match_frames");
+    let root = common::tree("cli_match_frames");
     for i in 0..8 {
         copy_frame(&root, &format!("{i:02}.tif"), i);
     }
     let frames: Vec<PathBuf> = (0..8).map(|i| root.join(format!("{i:02}.tif"))).collect();
 
-    let scratch = tree("cli_match_scratch");
+    let scratch = common::tree("cli_match_scratch");
     let mut explicit = ParamValues::new();
     explicit.insert(
         "levels".to_string(),
@@ -284,7 +248,7 @@ impl StageObserver for ResumeOnPause {
 }
 
 fn no_align_request(label: &str, frame_count: usize) -> FuseRequest {
-    let root = tree(label);
+    let root = common::tree(label);
     for i in 0..frame_count {
         copy_frame(&root, &format!("{i:02}.tif"), i);
     }
@@ -294,7 +258,7 @@ fn no_align_request(label: &str, frame_count: usize) -> FuseRequest {
     FuseRequest {
         frames,
         project_path: root.join("project.ffp"),
-        scratch_root: tree(&format!("{label}_scratch")),
+        scratch_root: common::tree(&format!("{label}_scratch")),
         staging_key: label.to_string(),
         algorithm: registry::find_stack("laplacian").expect("laplacian must be registered"),
         explicit: ParamValues::new(),
@@ -372,7 +336,7 @@ fn cancel_during_align_shows_the_interval() {
     controller.cancel_fuse();
     assert_eq!(controller.job_view().toolbar_run_state, "cancelling");
 
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
     assert!(!controller.job_running());
     assert_eq!(controller.job_view().state, job::RunState::Idle);
 }
@@ -485,7 +449,7 @@ fn write_synthetic_frame(path: &Path, size: u32, flat: bool) {
 /// (`focusforge_core::align::ecc`'s own divergence tests use the same
 /// construction).
 fn controller_with_unalignable_frames(name: &str) -> AppController {
-    let root = tree(&format!("{name}_frames"));
+    let root = common::tree(&format!("{name}_frames"));
     write_synthetic_frame(&root.join("00.tif"), 64, false);
     write_synthetic_frame(&root.join("01.tif"), 64, true);
     let mut controller = AppController::new();
@@ -497,7 +461,7 @@ fn controller_with_unalignable_frames(name: &str) -> AppController {
     // zero gradient is what drives `pyramidal-ecc`'s solver singular, and
     // that failure mode is specific to this algorithm's own math.
     controller.set_align_algorithm("pyramidal-ecc");
-    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
+    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
     controller
 }
 
@@ -505,7 +469,7 @@ fn controller_with_unalignable_frames(name: &str) -> AppController {
 fn failure_is_reported_and_retryable() {
     let mut controller = controller_with_unalignable_frames("failure");
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
     assert!(!controller.job_running());
     let message = controller
         .job_failure_message()
@@ -522,7 +486,7 @@ fn failure_is_reported_and_retryable() {
 
     assert!(controller.retry_fuse(), "a failed run must be retryable");
     assert!(controller.job_running());
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
     assert!(!controller.job_running());
     match controller.job_view().state {
         job::RunState::Failed(_) => {}
@@ -608,7 +572,7 @@ fn running_disables_the_panel_and_arms_only_the_transport() {
         "the panel's own whole-panel disable reads this flag"
     );
     assert_eq!(controller.job_view().toolbar_run_state, "running");
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
     assert!(!controller.job_running());
 }
 
@@ -649,7 +613,7 @@ fn opened_project_path(root_name: &str, controller: &AppController) -> PathBuf {
 fn re_fusing_an_opened_tab_appends_a_checkpoint() {
     let mut controller = controller_with_frames("reopen_appends", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
     assert!(
         !controller.project_tabs()[0].unsaved,
         "the first run promotes Unsaved to Opened"
@@ -660,7 +624,7 @@ fn re_fusing_an_opened_tab_appends_a_checkpoint() {
         "pressing Fuse stack on an Opened tab must run the pipeline again"
     );
     assert!(controller.job_running());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
     assert!(!controller.job_running());
     match controller.job_view().state {
         job::RunState::Fused { .. } => {}
@@ -680,11 +644,11 @@ fn checkpoint_count_increments_per_run() {
     assert_eq!(controller.checkpoint_count(), Some(0));
 
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(2));
 }
 
@@ -692,9 +656,9 @@ fn checkpoint_count_increments_per_run() {
 fn a_reopened_project_reports_the_count_on_disk() {
     let mut controller = controller_with_frames("reopen_count", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(2));
 
     let project_path = opened_project_path("reopen_count_frames", &controller);
@@ -725,7 +689,7 @@ fn fuse_is_enabled_from_two_frames_and_disabled_below() {
     assert!(two.fuse_enabled());
 
     assert!(two.start_fuse());
-    wait_for_settle(&mut two, Duration::from_secs(120));
+    common::wait_for_settle(&mut two, Duration::from_secs(120));
     assert!(
         two.fuse_enabled(),
         "a fused tab with its original frame count stays enabled"
@@ -757,7 +721,7 @@ fn the_plus_tab_offers_no_fuse_control() {
 fn re_fuse_is_refused_when_a_frame_is_missing() {
     let mut controller = controller_with_frames("missing_frame", 2);
     assert!(controller.start_fuse());
-    let planes = wait_for_settle(&mut controller, Duration::from_secs(120));
+    let planes = common::wait_for_settle(&mut controller, Duration::from_secs(120));
     assert!(planes.is_some());
     assert!(!controller.project_tabs()[0].unsaved);
 
@@ -784,8 +748,8 @@ fn re_fuse_is_refused_when_a_frame_is_missing() {
 /// `-o <dir>` CLI run) ever holds one, since the GUI's own runs always seal
 /// beside the frames they fuse.
 fn sealed_project_with_as_given_sources(name: &str) -> PathBuf {
-    let project_dir = tree(&format!("{name}_project"));
-    let frames_dir = tree(&format!("{name}_frames"));
+    let project_dir = common::tree(&format!("{name}_project"));
+    let frames_dir = common::tree(&format!("{name}_frames"));
     for i in 0..2 {
         copy_frame(&frames_dir, &format!("{i:02}.tif"), i);
     }
@@ -793,9 +757,9 @@ fn sealed_project_with_as_given_sources(name: &str) -> PathBuf {
         .map(|i| frames_dir.join(format!("{i:02}.tif")))
         .collect();
 
-    let staging = tree(&format!("{name}_staging"));
+    let staging = common::tree(&format!("{name}_staging"));
     let composite = staging.join("composite.tif");
-    std::fs::copy(mantis_frame(0), &composite).unwrap();
+    std::fs::copy(common::fixture_frame("mantis-512", 0), &composite).unwrap();
     let zmap = staging.join("zmap.tif");
     let mut writer = ZMapWriter::create(&zmap, ZMapInfo::new(4, 4, 2).unwrap()).unwrap();
     writer
@@ -840,14 +804,14 @@ fn an_absolute_but_present_source_still_re_fuses() {
         controller.open_paths(&[project_path]),
         OpenOutcome::Opened(_)
     ));
-    controller.set_scratch_root_for_test(tree("as_given_scratch"));
+    controller.set_scratch_root_for_test(common::tree("as_given_scratch"));
 
     assert!(
         controller.start_fuse(),
         "a recorded absolute source that is present must not refuse the re-fuse"
     );
     assert!(controller.last_refusal().is_none());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
     match controller.job_view().state {
         job::RunState::Fused { .. } => {}
         other => panic!("expected a completed re-fuse, got {other:?}"),
@@ -863,9 +827,9 @@ fn an_absolute_but_present_source_still_re_fuses() {
 fn a_second_run_reports_its_own_completion_time() {
     let mut controller = controller_with_frames("second_run_time", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
 
     let job::RunState::Fused { at } = controller.job_view().state else {
         panic!("expected a completed fuse");

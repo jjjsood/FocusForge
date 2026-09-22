@@ -135,12 +135,22 @@ impl CanvasRenderer {
     /// `slint::Image`s to bind to `FFPane::source`. A no-op (besides
     /// re-cloning the two already-current images) when `draw` is exactly
     /// what was last drawn -- a gesture that changes nothing costs nothing.
-    pub fn redraw(&mut self, draw: &PaneDraw) -> (slint::Image, slint::Image) {
+    /// `None` when `draw.src` falls outside the open composite, or either
+    /// read fails; `self.last` stays untouched on that path so a later,
+    /// valid rect still renders.
+    pub fn redraw(&mut self, draw: &PaneDraw) -> Option<(slint::Image, slint::Image)> {
         if self.last.as_ref() == Some(draw) {
-            return (self.composite_pane.image(), self.zmap_pane.image());
+            return Some((self.composite_pane.image(), self.zmap_pane.image()));
         }
 
         let (x, y, width, height) = draw.src;
+        let (frame_size, samples_per_pixel) = {
+            let header = self.composite.header(0);
+            ((header.width, header.height), header.samples_per_pixel)
+        };
+        if !crate::canvas::draw_rect_fits(frame_size, draw.src) {
+            return None;
+        }
         let rect = Rect {
             x,
             y,
@@ -148,11 +158,8 @@ impl CanvasRenderer {
             height,
         };
 
-        let samples_per_pixel = self.composite.header(0).samples_per_pixel;
         let mut samples = vec![0u16; (width * height * samples_per_pixel) as usize];
-        self.composite
-            .read_tile_into(0, rect, &mut samples)
-            .expect("read composite tile for display");
+        self.composite.read_tile_into(0, rect, &mut samples).ok()?;
         self.composite_pane.ensure_and_render(
             self.shared,
             width,
@@ -163,13 +170,11 @@ impl CanvasRenderer {
         );
 
         let mut indices = vec![0u16; (width * height) as usize];
-        self.zmap
-            .read_tile_into(rect, &mut indices)
-            .expect("read zmap tile for display");
+        self.zmap.read_tile_into(rect, &mut indices).ok()?;
         self.zmap_pane
             .ensure_and_render(self.shared, width, height, &indices, 1, self.index_scale);
 
         self.last = Some(*draw);
-        (self.composite_pane.image(), self.zmap_pane.image())
+        Some((self.composite_pane.image(), self.zmap_pane.image()))
     }
 }

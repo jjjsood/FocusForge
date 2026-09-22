@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// `crates/gui/../..` -- the workspace root.
 pub fn workspace_root() -> PathBuf {
@@ -80,6 +81,53 @@ fn find_files_with_extension(dir: &Path, ext: &str) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// `fixtures/<set>/frames/<index>.tif` -- `set` names a fixture directory
+/// under `fixtures/` (`"mantis-64"`, `"mantis-512"`), `index` the frame's own
+/// two-digit position in it.
+#[allow(dead_code)]
+pub fn fixture_frame(set: &str, index: usize) -> PathBuf {
+    workspace_root()
+        .join("fixtures")
+        .join(set)
+        .join("frames")
+        .join(format!("{index:02}.tif"))
+}
+
+/// A fresh, empty directory under `CARGO_TARGET_TMPDIR`, named `name` --
+/// removed first if an earlier run left one behind.
+#[allow(dead_code)]
+pub fn tree(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp tree must be creatable");
+    dir
+}
+
+/// Polls `settle_job`/`job_view` until the run is no longer live, returning
+/// the materialized plane paths from the call that actually settled it (if
+/// any). The window's own timer does exactly this poll, just on a Slint
+/// `Timer` instead of a plain loop.
+#[allow(dead_code)]
+pub fn wait_for_settle(
+    controller: &mut focusforge_gui::AppController,
+    timeout: Duration,
+) -> Option<(PathBuf, PathBuf)> {
+    let start = Instant::now();
+    loop {
+        if let Some(planes) = controller.settle_job() {
+            return Some(planes);
+        }
+        if !focusforge_gui::job::is_live(&controller.job_view().state) {
+            return None;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "job did not settle within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// The built GUI, with `FOCUSFORGE_DATA_DIR` pointed at a fresh directory

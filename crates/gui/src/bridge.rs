@@ -17,6 +17,7 @@ use slint::winit_030::{CustomApplicationHandler, EventResult, WinitWindowAccesso
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
+use crate::canvas::CanvasFeed;
 use crate::controller::{
     AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, ShellEvent, ShellMode,
 };
@@ -58,7 +59,6 @@ fn modifiers(controller: &AppController, ctrl: bool, shift: bool, alt: bool) -> 
 /// path) cannot touch.
 pub struct Installed {
     pub controller: Arc<Mutex<AppController>>,
-    pub canvas: Rc<RefCell<Option<CanvasRenderer>>>,
     /// The live run's own poll timer, recreated by every `Fuse stack`/`Retry`
     /// press (`start_job_timer`) and dropped -- which deactivates it --
     /// the moment a new one replaces it.
@@ -69,16 +69,72 @@ pub struct Installed {
     pub toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 }
 
-/// Reads `controller.pane_draw()`, asks `canvas` for the two re-rendered
-/// images, and sets `composite-source`/`zmap-source`, the five placement
-/// properties, `zoom-readout` and `project-loaded`. The one place a gesture
-/// becomes a repaint -- every gesture callback below ends in a call to
-/// this. A no-op while `canvas` is `None` (no project open yet).
+/// The single open renderer, and which tab's planes it holds -- `None`
+/// before anything has loaded, and again after clearing it. Built once
+/// in `src/main.rs`, before any window exists, and shared with the drop
+/// route as well as `install`'s own callbacks, so every path that can load
+/// a project shares the one cell.
+#[derive(Default)]
+pub struct Canvas {
+    renderer: Option<CanvasRenderer>,
+    tab: Option<usize>,
+}
+
+impl Canvas {
+    /// Which tab's planes the renderer currently holds.
+    pub fn tab(&self) -> Option<usize> {
+        self.tab
+    }
+
+    /// Drops the renderer and forgets its owner.
+    fn clear(&mut self) {
+        self.renderer = None;
+        self.tab = None;
+    }
+
+    /// Opens `composite`/`zmap` as `tab`'s own planes, naming the failure on
+    /// stderr rather than panicking: a plane the pipeline itself just wrote
+    /// failing to reopen is an environment problem (a full disk, a
+    /// permissions change), not a bug worth crashing the window over. `tab`
+    /// is recorded even when the open fails, so an unreadable plane file is
+    /// not retried on every gesture.
+    fn load(&mut self, tab: usize, composite: &Path, zmap: &Path) {
+        self.tab = Some(tab);
+        let Ok(shared) = focusforge_gpu::device::shared_device() else {
+            return;
+        };
+        match CanvasRenderer::open(shared, composite, zmap) {
+            Ok(renderer) => self.renderer = Some(renderer),
+            Err(err) => eprintln!("failed to open the project's planes: {err}"),
+        }
+    }
+}
+
+/// Reconciles the open renderer cell with the active tab
+/// ([`AppController::canvas_feed`]), then draws it: the two re-rendered
+/// images, the five placement properties, `zoom-readout` and
+/// `project-loaded`. The one place a gesture, an active-tab change or a
+/// completed run becomes a repaint. With nothing to draw, both sources and
+/// the placement are cleared rather than left showing the previous tab.
 pub fn repaint(
     app: &AppWindow,
     controller: &Arc<Mutex<AppController>>,
-    canvas: &Rc<RefCell<Option<CanvasRenderer>>>,
+    canvas: &Rc<RefCell<Canvas>>,
 ) {
+    let feed = {
+        let loaded = canvas.borrow().tab();
+        controller.lock().unwrap().canvas_feed(loaded)
+    };
+    match feed {
+        CanvasFeed::Keep => {}
+        CanvasFeed::Clear => canvas.borrow_mut().clear(),
+        CanvasFeed::Load {
+            tab,
+            composite,
+            zmap,
+        } => canvas.borrow_mut().load(tab, &composite, &zmap),
+    }
+
     let (draw, readout, project_loaded) = {
         let controller = controller.lock().unwrap();
         (
@@ -90,21 +146,30 @@ pub fn repaint(
     app.set_zoom_readout(readout.into());
     app.set_project_loaded(project_loaded);
 
-    let Some(draw) = draw else {
-        return;
-    };
-    let mut canvas = canvas.borrow_mut();
-    let Some(renderer) = canvas.as_mut() else {
-        return;
-    };
-    let (composite_image, zmap_image) = renderer.redraw(&draw);
-    app.set_composite_source(composite_image);
-    app.set_zmap_source(zmap_image);
-    app.set_image_x(draw.dst.0);
-    app.set_image_y(draw.dst.1);
-    app.set_image_w(draw.dst.2);
-    app.set_image_h(draw.dst.3);
-    app.set_pixelated(draw.pixelated);
+    let redrawn = draw.and_then(|draw| {
+        let mut canvas = canvas.borrow_mut();
+        let renderer = canvas.renderer.as_mut()?;
+        Some((draw, renderer.redraw(&draw)?))
+    });
+    match redrawn {
+        Some((draw, (composite_image, zmap_image))) => {
+            app.set_composite_source(composite_image);
+            app.set_zmap_source(zmap_image);
+            app.set_image_x(draw.dst.0);
+            app.set_image_y(draw.dst.1);
+            app.set_image_w(draw.dst.2);
+            app.set_image_h(draw.dst.3);
+            app.set_pixelated(draw.pixelated);
+        }
+        None => {
+            app.set_composite_source(slint::Image::default());
+            app.set_zmap_source(slint::Image::default());
+            app.set_image_x(0.0);
+            app.set_image_y(0.0);
+            app.set_image_w(0.0);
+            app.set_image_h(0.0);
+        }
+    }
 }
 
 /// Locks `controller`, runs `mutate` against it, then repaints if the
@@ -114,7 +179,7 @@ pub fn repaint(
 /// `on_zoom_fit_requested`).
 fn dispatch(
     controller: &Arc<Mutex<AppController>>,
-    canvas: &Rc<RefCell<Option<CanvasRenderer>>>,
+    canvas: &Rc<RefCell<Canvas>>,
     app_weak: &slint::Weak<AppWindow>,
     mutate: impl FnOnce(&mut AppController),
 ) {
@@ -236,46 +301,17 @@ fn push_job(app: &AppWindow, view: &JobView) {
     app.set_fuse_enabled(view.fuse_enabled);
 }
 
-/// Opens `CanvasRenderer` on a project's two materialized planes, naming the
-/// failure on stderr rather than panicking: a plane the pipeline itself just
-/// wrote failing to reopen is an environment problem (a full disk, a
-/// permissions change), not a bug worth crashing the window over.
-fn open_canvas(canvas: &Rc<RefCell<Option<CanvasRenderer>>>, composite: &Path, zmap: &Path) {
-    let Ok(shared) = focusforge_gpu::device::shared_device() else {
-        return;
-    };
-    match CanvasRenderer::open(shared, composite, zmap) {
-        Ok(renderer) => *canvas.borrow_mut() = Some(renderer),
-        Err(err) => eprintln!("failed to open the project's planes: {err}"),
-    }
-}
-
-/// Materializes the active tab's own planes (the `--open <saved>.ffp` path,
-/// with no run involved) and feeds the canvas -- a no-op for an `Unsaved`
-/// tab, which [`AppController::materialize_active_tab_planes`] already
-/// refuses.
-pub fn feed_canvas(
-    app: &AppWindow,
-    controller: &Arc<Mutex<AppController>>,
-    canvas: &Rc<RefCell<Option<CanvasRenderer>>>,
-) {
-    let planes = controller.lock().unwrap().materialize_active_tab_planes();
-    if let Some((composite, zmap)) = planes {
-        open_canvas(canvas, &composite, &zmap);
-        repaint(app, controller, canvas);
-    }
-}
-
 /// Installs a repeating timer, on the window's own clock ([`job::POLL`]),
 /// that polls the live run's progress onto the toolbar/bottom-bar
-/// properties, feeds the canvas once a run completes, opens the failure
-/// toast the moment a run fails, and stops itself once the run settles --
-/// what `Fuse stack`/`Retry` starts, and the only place
-/// [`AppController::settle_job`] is called from.
+/// properties, opens the failure toast the moment a run fails, and stops
+/// itself once the run settles -- what `Fuse stack`/`Retry` starts, and the
+/// only place [`AppController::settle_job`] is called from. A completed run
+/// pushes the projects and repaints regardless of which tab it ran against;
+/// `repaint`'s own reconcile decides whether its planes belong on screen.
 fn start_job_timer(
     app_weak: slint::Weak<AppWindow>,
     controller: Arc<Mutex<AppController>>,
-    canvas: Rc<RefCell<Option<CanvasRenderer>>>,
+    canvas: Rc<RefCell<Canvas>>,
     job_timer: Rc<RefCell<Option<slint::Timer>>>,
     toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 ) {
@@ -285,9 +321,8 @@ fn start_job_timer(
         let Some(app) = app_weak.upgrade() else {
             return;
         };
-        let planes = controller.lock().unwrap().settle_job();
-        if let Some((composite, zmap)) = planes {
-            open_canvas(&canvas, &composite, &zmap);
+        let settled = controller.lock().unwrap().settle_job();
+        if settled.is_some() {
             push_projects(&app, &controller);
             repaint(&app, &controller, &canvas);
         } else if let Some(message) = controller
@@ -542,18 +577,26 @@ fn push_question(app: &AppWindow, question: &GroupingQuestion) {
 /// delivered one folder path or three file paths.
 pub struct DropHandler {
     controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+    app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>>,
     pending: Vec<PathBuf>,
 }
 
 impl DropHandler {
-    /// `controller` is cloned into this handler before any window exists
-    /// (`src/main.rs`): the handler needs no `AppWindow` of its own --
-    /// `AppController::open_paths`'s own sink is what pushes the resulting
-    /// window properties, through `slint::invoke_from_event_loop`, exactly
-    /// as a picker callback's own `open_paths` call does.
-    pub fn new(controller: Arc<Mutex<AppController>>) -> Self {
+    /// `controller` and `canvas` are cloned into this handler before any
+    /// window exists (`src/main.rs`), and `app_handle` is filled in once
+    /// `AppWindow::new` runs -- the handler is installed on the
+    /// `BackendSelector` chain before that, so it cannot hold an
+    /// `AppWindow` of its own at construction time.
+    pub fn new(
+        controller: Arc<Mutex<AppController>>,
+        canvas: Rc<RefCell<Canvas>>,
+        app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>>,
+    ) -> Self {
         DropHandler {
             controller,
+            canvas,
+            app_handle,
             pending: Vec::new(),
         }
     }
@@ -577,42 +620,57 @@ impl CustomApplicationHandler for DropHandler {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) -> EventResult {
         if !self.pending.is_empty() {
             let paths = std::mem::take(&mut self.pending);
-            // The controller's own sink pushes every resulting window
-            // property (`ShellEvent::ProjectsChanged`/`QuestionRaised`/
-            // `EntryRefused`) through `slint::invoke_from_event_loop` --
-            // this call needs no repaint of its own.
             let _ = self.controller.lock().unwrap().open_paths(&paths);
+            // `repaint` reconciles the canvas with whatever became active --
+            // the same tail every other open path ends in, so a dropped
+            // project's own planes replace whatever the canvas held before,
+            // with no further gesture needed.
+            if let Some(app) = self
+                .app_handle
+                .borrow()
+                .as_ref()
+                .and_then(slint::Weak::upgrade)
+            {
+                repaint(&app, &self.controller, &self.canvas);
+            }
         }
         EventResult::Propagate
     }
 }
 
-/// Opens `path`, if the picker returned one, and closes the projects
-/// overlay on a successful open -- the rail's `New project`/`Open
+/// Opens `path`, if the picker returned one, closes the projects overlay on
+/// a successful open, and repaints -- the rail's `New project`/`Open
 /// project…` actions and their `Ctrl+N`/`Ctrl+O` chrome-key twins share this
 /// one path.
-fn open_from_picker(controller: &Arc<Mutex<AppController>>, path: Option<PathBuf>) {
+fn open_from_picker(
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+    app_weak: &slint::Weak<AppWindow>,
+    path: Option<PathBuf>,
+) {
     let Some(path) = path else { return };
-    let mut controller = controller.lock().unwrap();
-    if matches!(
-        controller.open_paths(&[path]),
-        crate::OpenOutcome::Opened(_)
-    ) {
-        controller.close_projects_overlay();
-    }
+    dispatch(controller, canvas, app_weak, |controller| {
+        if matches!(
+            controller.open_paths(&[path]),
+            crate::OpenOutcome::Opened(_)
+        ) {
+            controller.close_projects_overlay();
+        }
+    });
 }
 
 /// Wires every callback in `app` to `controller`, and returns [`Installed`]
-/// so `main.rs` can read the same state the window shows and drive the same
-/// GPU renderer cell. `controller` is a parameter, not created here:
-/// `main.rs` builds it first and clones it into the
-/// winit-level [`DropHandler`], which must be installed on the
-/// `BackendSelector` chain before any window exists. The sink wraps
-/// `slint::invoke_from_event_loop` so a background thread's push (a
-/// finished diagnostics write) and a callback's own event take the same
-/// path.
-pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Installed {
-    let canvas: Rc<RefCell<Option<CanvasRenderer>>> = Rc::new(RefCell::new(None));
+/// so `main.rs` can read the same state the window shows. `controller` and
+/// `canvas` are both parameters, not created here: `main.rs` builds both
+/// first and clones them into the winit-level [`DropHandler`], which must
+/// be installed on the `BackendSelector` chain before any window exists.
+/// The sink wraps `slint::invoke_from_event_loop` so a worker thread's own
+/// push and a callback's own event take the same path.
+pub fn install(
+    app: &AppWindow,
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+) -> Installed {
     let job_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     let toast_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
 
@@ -819,6 +877,8 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
     // (`AppController::chrome_key`).
     app.on_canvas_key_pressed({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move |text, ctrl, shift, alt| {
             let mods = {
                 let controller = controller.lock().unwrap();
@@ -828,10 +888,15 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
             match chrome {
                 ChromeKey::None => controller.lock().unwrap().key(true, text.as_str(), mods),
                 ChromeKey::Consumed => {}
-                ChromeKey::NewProject => open_from_picker(&controller, crate::picker::pick_entry()),
-                ChromeKey::OpenProject => {
-                    open_from_picker(&controller, crate::picker::pick_project())
+                ChromeKey::NewProject => {
+                    open_from_picker(&controller, &canvas, &app_weak, crate::picker::pick_entry())
                 }
+                ChromeKey::OpenProject => open_from_picker(
+                    &controller,
+                    &canvas,
+                    &app_weak,
+                    crate::picker::pick_project(),
+                ),
             }
         }
     });
@@ -870,27 +935,45 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
 
     // The entry path: the picker is a one-line forward, and `open_paths`'s
     // own sink pushes every property this raises (`ShellEvent::ProjectsChanged`/
-    // `QuestionRaised`/`EntryRefused`), so this callback body needs no
-    // return-value handling of its own.
+    // `QuestionRaised`/`EntryRefused`); `dispatch`'s own repaint is what feeds
+    // the canvas for whichever tab the open landed on.
     app.on_open_folder_requested({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
             if let Some(path) = crate::picker::pick_entry() {
-                let _ = controller.lock().unwrap().open_paths(&[path]);
+                dispatch(&controller, &canvas, &app_weak, |controller| {
+                    let _ = controller.open_paths(&[path]);
+                });
             }
         }
     });
     app.on_plus_clicked({
         let controller = controller.clone();
-        move || controller.lock().unwrap().select_plus()
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || dispatch(&controller, &canvas, &app_weak, AppController::select_plus)
     });
     app.on_tab_selected({
         let controller = controller.clone();
-        move |i| controller.lock().unwrap().select_project(i as usize)
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.select_project(i as usize);
+            })
+        }
     });
     app.on_tab_closed({
         let controller = controller.clone();
-        move |i| controller.lock().unwrap().close_project(i as usize)
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.close_project(i as usize);
+            })
+        }
     });
     app.on_tab_scroll_left({
         let controller = controller.clone();
@@ -912,20 +995,22 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
         .set_tab_region_width(app.get_tab_region_width());
     app.on_question_open_as_one({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
-            let _ = controller
-                .lock()
-                .unwrap()
-                .answer_question(OpenAs::OneProject);
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                let _ = controller.answer_question(OpenAs::OneProject);
+            });
         }
     });
     app.on_question_open_as_many({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
-            let _ = controller
-                .lock()
-                .unwrap()
-                .answer_question(OpenAs::NProjects);
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                let _ = controller.answer_question(OpenAs::NProjects);
+            });
         }
     });
     app.on_question_cancelled({
@@ -940,13 +1025,16 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
     });
     app.on_refusal_pick_another_folder({
         let controller = controller.clone();
+        let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
             if let Some(app) = app_weak.upgrade() {
                 app.set_refusal_open(false);
             }
             if let Some(path) = crate::picker::pick_entry() {
-                let _ = controller.lock().unwrap().open_paths(&[path]);
+                dispatch(&controller, &canvas, &app_weak, |controller| {
+                    let _ = controller.open_paths(&[path]);
+                });
             }
         }
     });
@@ -1140,28 +1228,54 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
     // uses; Close closes whichever tab is active, the same as `Ctrl+W` would.
     app.on_projects_new_project_requested({
         let controller = controller.clone();
-        move || open_from_picker(&controller, crate::picker::pick_entry())
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || open_from_picker(&controller, &canvas, &app_weak, crate::picker::pick_entry())
     });
     app.on_projects_open_project_requested({
         let controller = controller.clone();
-        move || open_from_picker(&controller, crate::picker::pick_project())
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            open_from_picker(
+                &controller,
+                &canvas,
+                &app_weak,
+                crate::picker::pick_project(),
+            )
+        }
     });
     app.on_projects_close_project_requested({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
-            let mut controller = controller.lock().unwrap();
-            if let Some(i) = controller.active_project() {
-                controller.close_project(i);
-            }
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                if let Some(i) = controller.active_project() {
+                    controller.close_project(i);
+                }
+            });
         }
     });
     app.on_projects_card_clicked({
         let controller = controller.clone();
-        move |i| controller.lock().unwrap().select_gallery_card(i as usize)
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.select_gallery_card(i as usize);
+            })
+        }
     });
     app.on_projects_card_close_clicked({
         let controller = controller.clone();
-        move |i| controller.lock().unwrap().close_project(i as usize)
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.close_project(i as usize);
+            })
+        }
     });
     // `Run again` re-runs that one card's own kept request off the worker
     // thread the same way `fuse-requested`/`retry-requested` do; `Locate
@@ -1264,7 +1378,6 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
 
     Installed {
         controller,
-        canvas,
         job_timer,
         toast_timer,
     }

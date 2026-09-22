@@ -394,6 +394,11 @@ struct ShellState {
     /// entries are tracked in memory for the session but never persisted.
     recent: Vec<recent::RecentEntry>,
     recent_config_dir: Option<PathBuf>,
+    /// The active tab's planes changed underneath the open renderer cell --
+    /// a background run settling on it or a close renumbering the tabs --
+    /// so the next [`AppController::canvas_feed`] reloads even though the
+    /// owner index still compares equal.
+    canvas_dirty: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1311,6 +1316,10 @@ impl AppController {
         if closed_was_active {
             self.state.pending_frame_change = None;
         }
+        // A close renumbers every later tab down by one, so an index-shaped
+        // owner marker can end up comparing equal to a *different* tab --
+        // force a reload rather than trust the comparison.
+        self.state.canvas_dirty = true;
         self.settle_tab_scroll();
         self.settle_settings_scroll();
         self.emit(ShellEvent::ProjectsChanged);
@@ -2619,6 +2628,12 @@ impl AppController {
         self.job.control = None;
         self.job.observer = None;
         let tab_index = self.job.tab_index.take();
+        if tab_index == self.state.active {
+            // The run's own tab is the active one -- the canvas must reload
+            // even though the owner already matches, since the planes on
+            // disk just changed underneath it.
+            self.state.canvas_dirty = true;
+        }
         let tab_info = tab_index
             .and_then(|i| self.state.projects.get(i))
             .map(|tab| (project_identity_path(&tab.project), tab.title.clone()));
@@ -2698,6 +2713,30 @@ impl AppController {
             return None;
         };
         job::materialize_planes(project).ok()
+    }
+
+    /// What the open renderer cell should do for the frame about to draw,
+    /// given which tab it currently holds (`None` before anything has
+    /// loaded). `Keep` when the owner already matches the active tab and
+    /// nothing changed underneath it since; otherwise materializes the
+    /// active tab's own planes and answers `Load`, or `Clear` when it has
+    /// none (no tab active, `+` selected, or nothing sealed yet).
+    pub fn canvas_feed(&mut self, loaded: Option<usize>) -> crate::canvas::CanvasFeed {
+        if loaded == self.state.active && !self.state.canvas_dirty {
+            return crate::canvas::CanvasFeed::Keep;
+        }
+        self.state.canvas_dirty = false;
+        let Some(tab) = self.state.active else {
+            return crate::canvas::CanvasFeed::Clear;
+        };
+        match self.materialize_active_tab_planes() {
+            Some((composite, zmap)) => crate::canvas::CanvasFeed::Load {
+                tab,
+                composite,
+                zmap,
+            },
+            None => crate::canvas::CanvasFeed::Clear,
+        }
     }
 
     /// Re-clamps the settings scroll offset against the now-active tab's
