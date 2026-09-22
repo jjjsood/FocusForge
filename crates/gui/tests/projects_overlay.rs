@@ -569,7 +569,9 @@ fn no_control_acts_on_several_cards() {
         .unwrap_or(after.len());
     let section = common::strip_line_comments(&after[..end]);
 
-    let forbidden = ["Vec<usize>", "[usize]", "indices", "selected", "multi"];
+    // "selected" is deliberately not in this list: a single tab's own
+    // one-frame `selected` field is a scalar, not a batch of cards.
+    let forbidden = ["Vec<usize>", "[usize]", "indices", "multi"];
     let mut found = Vec::new();
     for needle in forbidden {
         if section.contains(needle) {

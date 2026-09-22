@@ -17,6 +17,7 @@ use slint::winit_030::{CustomApplicationHandler, EventResult, WinitWindowAccesso
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
+use crate::canvas::CanvasFeed;
 use crate::controller::{
     AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, SettingsSection,
     ShellEvent, ShellMode,
@@ -60,7 +61,6 @@ fn modifiers(controller: &AppController, ctrl: bool, shift: bool, alt: bool) -> 
 /// path) cannot touch.
 pub struct Installed {
     pub controller: Arc<Mutex<AppController>>,
-    pub canvas: Rc<RefCell<Option<CanvasRenderer>>>,
     /// The live run's own poll timer, recreated by every `Fuse stack`/`Retry`
     /// press (`start_job_timer`) and dropped -- which deactivates it --
     /// the moment a new one replaces it.
@@ -71,42 +71,188 @@ pub struct Installed {
     pub toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 }
 
-/// Reads `controller.pane_draw()`, asks `canvas` for the two re-rendered
-/// images, and sets `composite-source`/`zmap-source`, the five placement
-/// properties, `zoom-readout` and `project-loaded`. The one place a gesture
-/// becomes a repaint -- every gesture callback below ends in a call to
-/// this. A no-op while `canvas` is `None` (no project open yet).
+/// The single open renderer, and which tab's planes it holds -- `None`
+/// before anything has loaded. Built once in `src/main.rs`, before any
+/// window exists, and shared with the drop route as well as `install`'s own
+/// callbacks, so every path that can load a project shares the one cell.
+/// The renderer outlives a plane clear: an unfused tab still has one, for
+/// its selected frame alone.
+#[derive(Default)]
+pub struct Canvas {
+    renderer: Option<CanvasRenderer>,
+    tab: Option<usize>,
+    /// The frame reader's own refusal, kept until a different frame opens
+    /// or the same one succeeds -- the left `FFPane`'s message line reads
+    /// this.
+    frame_error: Option<String>,
+}
+
+impl Canvas {
+    /// Which tab's planes the renderer currently holds.
+    pub fn tab(&self) -> Option<usize> {
+        self.tab
+    }
+
+    /// The open frame reader's own refusal text, if the last [`Self::set_frame`]
+    /// failed.
+    pub fn frame_error(&self) -> Option<&str> {
+        self.frame_error.as_deref()
+    }
+
+    /// Drops the planes and forgets the owning tab; the frame half is left
+    /// alone.
+    fn clear(&mut self) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.clear_planes();
+        }
+        self.tab = None;
+    }
+
+    /// Opens `composite`/`zmap` as `tab`'s own planes, naming the failure on
+    /// stderr rather than panicking: a plane the pipeline itself just wrote
+    /// failing to reopen is an environment problem (a full disk, a
+    /// permissions change), not a bug worth crashing the window over. `tab`
+    /// is recorded even when the open fails, so an unreadable plane file is
+    /// not retried on every gesture. Reuses the renderer's own frame half
+    /// rather than replacing it, since it may already hold the tab's
+    /// selected frame.
+    fn load(&mut self, tab: usize, composite: &Path, zmap: &Path) {
+        self.tab = Some(tab);
+        if self.renderer.is_none() {
+            let Ok(shared) = focusforge_gpu::device::shared_device() else {
+                return;
+            };
+            self.renderer = Some(CanvasRenderer::new(shared));
+        }
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        if let Err(err) = renderer.set_planes(composite, zmap) {
+            eprintln!("failed to open the project's planes: {err}");
+        }
+    }
+
+    /// Opens `path` as the left pane's source, creating the renderer first
+    /// when this tab has never had planes to draw. A no-op when `path` is
+    /// already open; `None` drops whatever frame was open. Keeps the
+    /// reader's own refusal text on failure rather than a generic message.
+    pub fn set_frame(&mut self, path: Option<&Path>) {
+        if self.renderer.is_none() {
+            let Ok(shared) = focusforge_gpu::device::shared_device() else {
+                return;
+            };
+            self.renderer = Some(CanvasRenderer::new(shared));
+        }
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let Some(path) = path else {
+            renderer.clear_frame();
+            self.frame_error = None;
+            return;
+        };
+        if renderer.frame_path() == Some(path) {
+            return;
+        }
+        match renderer.set_frame(path) {
+            Ok(()) => self.frame_error = None,
+            Err(err) => self.frame_error = Some(err.to_string()),
+        }
+    }
+}
+
+/// Reconciles the open renderer cell with the active tab
+/// ([`AppController::canvas_feed`]) and the selected frame, then draws both
+/// panes: the left pane's re-rendered frame with its own label and refusal
+/// text, the right pane's re-rendered composite/Z-Map pair, each with its
+/// own placement, plus `zoom-readout` and `project-loaded`. The one place a
+/// gesture, an active-tab change or a completed run becomes a repaint. With
+/// nothing to draw, a pane's source and placement are cleared rather than
+/// left showing the previous tab.
 pub fn repaint(
     app: &AppWindow,
     controller: &Arc<Mutex<AppController>>,
-    canvas: &Rc<RefCell<Option<CanvasRenderer>>>,
+    canvas: &Rc<RefCell<Canvas>>,
 ) {
-    let (draw, readout, project_loaded) = {
+    let feed = {
+        let loaded = canvas.borrow().tab();
+        controller.lock().unwrap().canvas_feed(loaded)
+    };
+    match feed {
+        CanvasFeed::Keep => {}
+        CanvasFeed::Clear => canvas.borrow_mut().clear(),
+        CanvasFeed::Load {
+            tab,
+            composite,
+            zmap,
+        } => canvas.borrow_mut().load(tab, &composite, &zmap),
+    }
+
+    let (frame_path, frame_label, frame_draw, plane_draw, readout, project_loaded) = {
         let controller = controller.lock().unwrap();
         (
-            controller.pane_draw(),
+            controller.selected_frame_path(),
+            controller.frame_pane_label(),
+            controller.frame_draw(),
+            controller.plane_draw(),
             controller.zoom_readout(),
             controller.active_project().is_some(),
         )
     };
+    canvas.borrow_mut().set_frame(frame_path.as_deref());
+
     app.set_zoom_readout(readout.into());
     app.set_project_loaded(project_loaded);
+    app.set_frame_label(frame_label.into());
+    app.set_frame_message(canvas.borrow().frame_error().unwrap_or("").into());
 
-    let Some(draw) = draw else {
-        return;
-    };
-    let mut canvas = canvas.borrow_mut();
-    let Some(renderer) = canvas.as_mut() else {
-        return;
-    };
-    let (composite_image, zmap_image) = renderer.redraw(&draw);
-    app.set_composite_source(composite_image);
-    app.set_zmap_source(zmap_image);
-    app.set_image_x(draw.dst.0);
-    app.set_image_y(draw.dst.1);
-    app.set_image_w(draw.dst.2);
-    app.set_image_h(draw.dst.3);
-    app.set_pixelated(draw.pixelated);
+    let frame_redrawn = frame_draw.and_then(|draw| {
+        let mut canvas = canvas.borrow_mut();
+        let renderer = canvas.renderer.as_mut()?;
+        Some((draw, renderer.redraw_frame(&draw)?))
+    });
+    match frame_redrawn {
+        Some((draw, frame_image)) => {
+            app.set_frame_source(frame_image);
+            app.set_frame_image_x(draw.dst.0);
+            app.set_frame_image_y(draw.dst.1);
+            app.set_frame_image_w(draw.dst.2);
+            app.set_frame_image_h(draw.dst.3);
+            app.set_pixelated(draw.pixelated);
+        }
+        None => {
+            app.set_frame_source(slint::Image::default());
+            app.set_frame_image_x(0.0);
+            app.set_frame_image_y(0.0);
+            app.set_frame_image_w(0.0);
+            app.set_frame_image_h(0.0);
+        }
+    }
+
+    let redrawn = plane_draw.and_then(|draw| {
+        let mut canvas = canvas.borrow_mut();
+        let renderer = canvas.renderer.as_mut()?;
+        Some((draw, renderer.redraw_planes(&draw)?))
+    });
+    match redrawn {
+        Some((draw, (composite_image, zmap_image))) => {
+            app.set_composite_source(composite_image);
+            app.set_zmap_source(zmap_image);
+            app.set_image_x(draw.dst.0);
+            app.set_image_y(draw.dst.1);
+            app.set_image_w(draw.dst.2);
+            app.set_image_h(draw.dst.3);
+            app.set_pixelated(draw.pixelated);
+        }
+        None => {
+            app.set_composite_source(slint::Image::default());
+            app.set_zmap_source(slint::Image::default());
+            app.set_image_x(0.0);
+            app.set_image_y(0.0);
+            app.set_image_w(0.0);
+            app.set_image_h(0.0);
+        }
+    }
 }
 
 /// Locks `controller`, runs `mutate` against it, then repaints if the
@@ -116,7 +262,7 @@ pub fn repaint(
 /// `on_zoom_fit_requested`).
 fn dispatch(
     controller: &Arc<Mutex<AppController>>,
-    canvas: &Rc<RefCell<Option<CanvasRenderer>>>,
+    canvas: &Rc<RefCell<Canvas>>,
     app_weak: &slint::Weak<AppWindow>,
     mutate: impl FnOnce(&mut AppController),
 ) {
@@ -241,16 +387,7 @@ pub fn install_crash_notice(controller: &Arc<Mutex<AppController>>, app: &AppWin
 /// sink needs one; this function does not).
 pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     let controller = controller.lock().unwrap();
-    let tabs: Vec<ProjectTabView> = controller
-        .project_tabs()
-        .into_iter()
-        .map(|t| ProjectTabView {
-            title: t.title.into(),
-            unsaved: t.unsaved,
-            selected: t.selected,
-        })
-        .collect();
-    app.set_project_tabs(std::rc::Rc::new(slint::VecModel::from(tabs)).into());
+    push_tab_rows(app, &controller);
     push_tab_scroll(app, &controller);
     app.set_show_empty_state(controller.active_project().is_none());
     // The grouping question closes itself here rather than in its own
@@ -265,10 +402,37 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     app.set_project_loaded(controller.active_project().is_some());
     app.set_plus_selected(controller.plus_selected());
     app.set_skipped_notice(controller.notice().unwrap_or_default().into());
-    app.set_fuse_enabled(controller.fuse_enabled());
+    // The active tab may have changed with no `JobChanged`/poll event of its
+    // own in between -- push its own run onto the bar right here rather than
+    // leaving the words the previously active tab last wrote.
+    push_job(app, &controller.job_view());
     push_settings_panel(app, &controller);
     push_images_panel(app, &controller);
     push_projects_overlay(app, &controller);
+}
+
+/// Pushes the tab strip's own rows -- title, unsaved marker, selection and
+/// each tab's own run mark -- so a mark appears or clears the moment that
+/// tab's run state changes, not only when the project list itself does.
+/// Also pushes the toolbar's own preview of what a `Fuse stack` press on the
+/// active tab would do right now, read off that tab's own row.
+fn push_tab_rows(app: &AppWindow, controller: &AppController) {
+    let rows = controller.project_tabs();
+    let active = controller.active_project();
+    let would_queue = active
+        .and_then(|i| rows.get(i))
+        .is_some_and(|row| row.would_queue);
+    app.set_toolbar_would_queue(would_queue);
+    let tabs: Vec<ProjectTabView> = rows
+        .into_iter()
+        .map(|t| ProjectTabView {
+            title: t.title.into(),
+            unsaved: t.unsaved,
+            selected: t.selected,
+            run_mark_icon: t.run_mark_icon.into(),
+        })
+        .collect();
+    app.set_project_tabs(std::rc::Rc::new(slint::VecModel::from(tabs)).into());
 }
 
 /// Pushes the tab strip's scroll offset, overflow layout and two arrow
@@ -320,46 +484,17 @@ fn push_job(app: &AppWindow, view: &JobView) {
     app.set_fuse_enabled(view.fuse_enabled);
 }
 
-/// Opens `CanvasRenderer` on a project's two materialized planes, naming the
-/// failure on stderr rather than panicking: a plane the pipeline itself just
-/// wrote failing to reopen is an environment problem (a full disk, a
-/// permissions change), not a bug worth crashing the window over.
-fn open_canvas(canvas: &Rc<RefCell<Option<CanvasRenderer>>>, composite: &Path, zmap: &Path) {
-    let Ok(shared) = focusforge_gpu::device::shared_device() else {
-        return;
-    };
-    match CanvasRenderer::open(shared, composite, zmap) {
-        Ok(renderer) => *canvas.borrow_mut() = Some(renderer),
-        Err(err) => eprintln!("failed to open the project's planes: {err}"),
-    }
-}
-
-/// Materializes the active tab's own planes (the `--open <saved>.ffp` path,
-/// with no run involved) and feeds the canvas -- a no-op for an `Unsaved`
-/// tab, which [`AppController::materialize_active_tab_planes`] already
-/// refuses.
-pub fn feed_canvas(
-    app: &AppWindow,
-    controller: &Arc<Mutex<AppController>>,
-    canvas: &Rc<RefCell<Option<CanvasRenderer>>>,
-) {
-    let planes = controller.lock().unwrap().materialize_active_tab_planes();
-    if let Some((composite, zmap)) = planes {
-        open_canvas(canvas, &composite, &zmap);
-        repaint(app, controller, canvas);
-    }
-}
-
 /// Installs a repeating timer, on the window's own clock ([`job::POLL`]),
 /// that polls the live run's progress onto the toolbar/bottom-bar
-/// properties, feeds the canvas once a run completes, opens the failure
-/// toast the moment a run fails, and stops itself once the run settles --
-/// what `Fuse stack`/`Retry` starts, and the only place
-/// [`AppController::settle_job`] is called from.
+/// properties, opens the failure toast the moment a run fails, and stops
+/// itself once the run settles -- what `Fuse stack`/`Retry` starts, and the
+/// only place [`AppController::settle_job`] is called from. A completed run
+/// pushes the projects and repaints regardless of which tab it ran against;
+/// `repaint`'s own reconcile decides whether its planes belong on screen.
 fn start_job_timer(
     app_weak: slint::Weak<AppWindow>,
     controller: Arc<Mutex<AppController>>,
-    canvas: Rc<RefCell<Option<CanvasRenderer>>>,
+    canvas: Rc<RefCell<Canvas>>,
     job_timer: Rc<RefCell<Option<slint::Timer>>>,
     toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 ) {
@@ -369,21 +504,15 @@ fn start_job_timer(
         let Some(app) = app_weak.upgrade() else {
             return;
         };
-        let planes = controller.lock().unwrap().settle_job();
-        if let Some((composite, zmap)) = planes {
-            open_canvas(&canvas, &composite, &zmap);
+        let settled = controller.lock().unwrap().settle_job();
+        if settled.is_some() {
             push_projects(&app, &controller);
             repaint(&app, &controller, &canvas);
-        } else if let Some(message) = controller
-            .lock()
-            .unwrap()
-            .job_failure_message()
-            .map(str::to_string)
-        {
+        } else if let Some(message) = controller.lock().unwrap().take_settled_failure() {
             open_job_toast(&app, message, &toast_timer);
         }
         let view = controller.lock().unwrap().job_view();
-        let live = job::is_live(&view.state);
+        let live = controller.lock().unwrap().work_pending();
         push_job(&app, &view);
         push_projects_overlay(&app, &controller.lock().unwrap());
         if !live {
@@ -511,6 +640,7 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
             excluded: row.excluded,
             unresolved: row.unresolved,
             top: row.top,
+            selected: row.selected,
         })
         .collect();
     let existing = app.get_images_rows();
@@ -626,18 +756,26 @@ fn push_question(app: &AppWindow, question: &GroupingQuestion) {
 /// delivered one folder path or three file paths.
 pub struct DropHandler {
     controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+    app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>>,
     pending: Vec<PathBuf>,
 }
 
 impl DropHandler {
-    /// `controller` is cloned into this handler before any window exists
-    /// (`src/main.rs`): the handler needs no `AppWindow` of its own --
-    /// `AppController::open_paths`'s own sink is what pushes the resulting
-    /// window properties, through `slint::invoke_from_event_loop`, exactly
-    /// as a picker callback's own `open_paths` call does.
-    pub fn new(controller: Arc<Mutex<AppController>>) -> Self {
+    /// `controller` and `canvas` are cloned into this handler before any
+    /// window exists (`src/main.rs`), and `app_handle` is filled in once
+    /// `AppWindow::new` runs -- the handler is installed on the
+    /// `BackendSelector` chain before that, so it cannot hold an
+    /// `AppWindow` of its own at construction time.
+    pub fn new(
+        controller: Arc<Mutex<AppController>>,
+        canvas: Rc<RefCell<Canvas>>,
+        app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>>,
+    ) -> Self {
         DropHandler {
             controller,
+            canvas,
+            app_handle,
             pending: Vec::new(),
         }
     }
@@ -661,42 +799,57 @@ impl CustomApplicationHandler for DropHandler {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) -> EventResult {
         if !self.pending.is_empty() {
             let paths = std::mem::take(&mut self.pending);
-            // The controller's own sink pushes every resulting window
-            // property (`ShellEvent::ProjectsChanged`/`QuestionRaised`/
-            // `EntryRefused`) through `slint::invoke_from_event_loop` --
-            // this call needs no repaint of its own.
             let _ = self.controller.lock().unwrap().open_paths(&paths);
+            // `repaint` reconciles the canvas with whatever became active --
+            // the same tail every other open path ends in, so a dropped
+            // project's own planes replace whatever the canvas held before,
+            // with no further gesture needed.
+            if let Some(app) = self
+                .app_handle
+                .borrow()
+                .as_ref()
+                .and_then(slint::Weak::upgrade)
+            {
+                repaint(&app, &self.controller, &self.canvas);
+            }
         }
         EventResult::Propagate
     }
 }
 
-/// Opens `path`, if the picker returned one, and closes the projects
-/// overlay on a successful open -- the rail's `New project`/`Open
+/// Opens `path`, if the picker returned one, closes the projects overlay on
+/// a successful open, and repaints -- the rail's `New project`/`Open
 /// project…` actions and their `Ctrl+N`/`Ctrl+O` chrome-key twins share this
 /// one path.
-fn open_from_picker(controller: &Arc<Mutex<AppController>>, path: Option<PathBuf>) {
+fn open_from_picker(
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+    app_weak: &slint::Weak<AppWindow>,
+    path: Option<PathBuf>,
+) {
     let Some(path) = path else { return };
-    let mut controller = controller.lock().unwrap();
-    if matches!(
-        controller.open_paths(&[path]),
-        crate::OpenOutcome::Opened(_)
-    ) {
-        controller.close_projects_overlay();
-    }
+    dispatch(controller, canvas, app_weak, |controller| {
+        if matches!(
+            controller.open_paths(&[path]),
+            crate::OpenOutcome::Opened(_)
+        ) {
+            controller.close_projects_overlay();
+        }
+    });
 }
 
 /// Wires every callback in `app` to `controller`, and returns [`Installed`]
-/// so `main.rs` can read the same state the window shows and drive the same
-/// GPU renderer cell. `controller` is a parameter, not created here:
-/// `main.rs` builds it first and clones it into the
-/// winit-level [`DropHandler`], which must be installed on the
-/// `BackendSelector` chain before any window exists. The sink wraps
-/// `slint::invoke_from_event_loop` so a background thread's push (a
-/// finished diagnostics write) and a callback's own event take the same
-/// path.
-pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Installed {
-    let canvas: Rc<RefCell<Option<CanvasRenderer>>> = Rc::new(RefCell::new(None));
+/// so `main.rs` can read the same state the window shows. `controller` and
+/// `canvas` are both parameters, not created here: `main.rs` builds both
+/// first and clones them into the winit-level [`DropHandler`], which must
+/// be installed on the `BackendSelector` chain before any window exists.
+/// The sink wraps `slint::invoke_from_event_loop` so a worker thread's own
+/// push and a callback's own event take the same path.
+pub fn install(
+    app: &AppWindow,
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+) -> Installed {
     let job_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     let toast_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
 
@@ -903,6 +1056,8 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
     // (`AppController::chrome_key`).
     app.on_canvas_key_pressed({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move |text, ctrl, shift, alt| {
             let mods = {
                 let controller = controller.lock().unwrap();
@@ -912,10 +1067,15 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
             match chrome {
                 ChromeKey::None => controller.lock().unwrap().key(true, text.as_str(), mods),
                 ChromeKey::Consumed => {}
-                ChromeKey::NewProject => open_from_picker(&controller, crate::picker::pick_entry()),
-                ChromeKey::OpenProject => {
-                    open_from_picker(&controller, crate::picker::pick_project())
+                ChromeKey::NewProject => {
+                    open_from_picker(&controller, &canvas, &app_weak, crate::picker::pick_entry())
                 }
+                ChromeKey::OpenProject => open_from_picker(
+                    &controller,
+                    &canvas,
+                    &app_weak,
+                    crate::picker::pick_project(),
+                ),
             }
         }
     });
@@ -1086,27 +1246,45 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
 
     // The entry path: the picker is a one-line forward, and `open_paths`'s
     // own sink pushes every property this raises (`ShellEvent::ProjectsChanged`/
-    // `QuestionRaised`/`EntryRefused`), so this callback body needs no
-    // return-value handling of its own.
+    // `QuestionRaised`/`EntryRefused`); `dispatch`'s own repaint is what feeds
+    // the canvas for whichever tab the open landed on.
     app.on_open_folder_requested({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
             if let Some(path) = crate::picker::pick_entry() {
-                let _ = controller.lock().unwrap().open_paths(&[path]);
+                dispatch(&controller, &canvas, &app_weak, |controller| {
+                    let _ = controller.open_paths(&[path]);
+                });
             }
         }
     });
     app.on_plus_clicked({
         let controller = controller.clone();
-        move || controller.lock().unwrap().select_plus()
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || dispatch(&controller, &canvas, &app_weak, AppController::select_plus)
     });
     app.on_tab_selected({
         let controller = controller.clone();
-        move |i| controller.lock().unwrap().select_project(i as usize)
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.select_project(i as usize);
+            })
+        }
     });
     app.on_tab_closed({
         let controller = controller.clone();
-        move |i| controller.lock().unwrap().close_project(i as usize)
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.close_project(i as usize);
+            })
+        }
     });
     app.on_tab_scroll_left({
         let controller = controller.clone();
@@ -1128,20 +1306,22 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
         .set_tab_region_width(app.get_tab_region_width());
     app.on_question_open_as_one({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
-            let _ = controller
-                .lock()
-                .unwrap()
-                .answer_question(OpenAs::OneProject);
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                let _ = controller.answer_question(OpenAs::OneProject);
+            });
         }
     });
     app.on_question_open_as_many({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
-            let _ = controller
-                .lock()
-                .unwrap()
-                .answer_question(OpenAs::NProjects);
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                let _ = controller.answer_question(OpenAs::NProjects);
+            });
         }
     });
     app.on_question_cancelled({
@@ -1156,13 +1336,16 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
     });
     app.on_refusal_pick_another_folder({
         let controller = controller.clone();
+        let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
             if let Some(app) = app_weak.upgrade() {
                 app.set_refusal_open(false);
             }
             if let Some(path) = crate::picker::pick_entry() {
-                let _ = controller.lock().unwrap().open_paths(&[path]);
+                dispatch(&controller, &canvas, &app_weak, |controller| {
+                    let _ = controller.open_paths(&[path]);
+                });
             }
         }
     });
@@ -1317,9 +1500,25 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
         let controller = controller.clone();
         move |i| controller.lock().unwrap().toggle_frame_excluded(i as usize)
     });
+    app.on_images_frame_selected({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.select_frame(i as usize);
+            });
+        }
+    });
     app.on_images_frame_remove_requested({
         let controller = controller.clone();
-        move |i| controller.lock().unwrap().remove_frame(i as usize)
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.remove_frame(i as usize);
+            });
+        }
     });
     app.on_frame_warning_cancelled({
         let controller = controller.clone();
@@ -1327,8 +1526,12 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
     });
     app.on_frame_warning_confirmed({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
-            controller.lock().unwrap().confirm_frame_change();
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.confirm_frame_change();
+            });
         }
     });
     app.on_frame_warning_secondary_pressed({
@@ -1356,28 +1559,54 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
     // uses; Close closes whichever tab is active, the same as `Ctrl+W` would.
     app.on_projects_new_project_requested({
         let controller = controller.clone();
-        move || open_from_picker(&controller, crate::picker::pick_entry())
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || open_from_picker(&controller, &canvas, &app_weak, crate::picker::pick_entry())
     });
     app.on_projects_open_project_requested({
         let controller = controller.clone();
-        move || open_from_picker(&controller, crate::picker::pick_project())
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            open_from_picker(
+                &controller,
+                &canvas,
+                &app_weak,
+                crate::picker::pick_project(),
+            )
+        }
     });
     app.on_projects_close_project_requested({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
-            let mut controller = controller.lock().unwrap();
-            if let Some(i) = controller.active_project() {
-                controller.close_project(i);
-            }
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                if let Some(i) = controller.active_project() {
+                    controller.close_project(i);
+                }
+            });
         }
     });
     app.on_projects_card_clicked({
         let controller = controller.clone();
-        move |i| controller.lock().unwrap().select_gallery_card(i as usize)
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.select_gallery_card(i as usize);
+            })
+        }
     });
     app.on_projects_card_close_clicked({
         let controller = controller.clone();
-        move |i| controller.lock().unwrap().close_project(i as usize)
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.close_project(i as usize);
+            })
+        }
     });
     // `Run again` re-runs that one card's own kept request off the worker
     // thread the same way `fuse-requested`/`retry-requested` do; `Locate
@@ -1480,7 +1709,6 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
 
     Installed {
         controller,
-        canvas,
         job_timer,
         toast_timer,
     }
@@ -1572,6 +1800,9 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::JobChanged => {
             let controller = controller.lock().unwrap();
             push_job(app, &controller.job_view());
+            // A tab's own run mark changes at the same moments: it starts,
+            // queues, is promoted, or settles.
+            push_tab_rows(app, &controller);
             // A run starting or ending is also the moment the images/settings
             // panels' own whole-panel disable must flip -- neither panel
             // otherwise re-reads `job_running()` on its own.

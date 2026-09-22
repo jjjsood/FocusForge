@@ -8,12 +8,16 @@ import { ShellGeometry } from "../geometry.slint";
 import { FFButton } from "../components/ff_button.slint";
 
 export component FFToolbar inherits Rectangle {
-    // "idle" | "running" | "paused" | "cancelling" | "failed". Any other
-    // value renders as "idle".
+    // "idle" | "running" | "paused" | "cancelling" | "failed" | "queued".
+    // Any other value renders as "idle".
     in property <string> run-state: "idle";
     // Enabled at two or more frames; disabled below that on an unfused and
     // a fused tab alike.
     in property <bool> fuse-enabled: true;
+    // Another tab is running and this one holds no place in it -- the next
+    // `Fuse stack` press would enqueue rather than start. Relabels the same
+    // button; the press still enqueues once made.
+    in property <bool> would-queue: false;
     callback fuse-requested();
     callback pause-or-resume-requested();
     callback cancel-requested();
@@ -26,7 +30,8 @@ export component FFToolbar inherits Rectangle {
     property <length> second-button-x: Theme.space-3 + ShellGeometry.toolbar-button-width
         + ShellGeometry.toolbar-button-gap;
     property <bool> is-idle: root.run-state != "running" && root.run-state != "paused"
-        && root.run-state != "cancelling" && root.run-state != "failed";
+        && root.run-state != "cancelling" && root.run-state != "failed"
+        && root.run-state != "queued";
 
     if root.run-state == "running": pause-button := FFButton {
         x: Theme.space-3;
@@ -46,8 +51,11 @@ export component FFToolbar inherits Rectangle {
         text: "Resume";
         clicked => { root.pause-or-resume-requested(); }
     }
-    if root.run-state == "running" || root.run-state == "paused": cancel-button := FFButton {
-        x: root.second-button-x;
+    // A queued tab has no pause/resume button, so `Cancel` takes the first
+    // slot -- the one button a queued row needs, in the place `Fuse stack`
+    // would otherwise sit.
+    if root.run-state == "running" || root.run-state == "paused" || root.run-state == "queued": cancel-button := FFButton {
+        x: root.run-state == "queued" ? Theme.space-3 : root.second-button-x;
         y: root.button-y;
         width: ShellGeometry.toolbar-button-width;
         compact: true;
@@ -72,7 +80,7 @@ export component FFToolbar inherits Rectangle {
         compact: true;
         kind: "primary";
         glyph: "↻";
-        text: "Retry";
+        text: root.would-queue ? "Queued" : "Retry";
         clicked => { root.retry-requested(); }
     }
     if root.is-idle: fuse-button := FFButton {
@@ -82,7 +90,7 @@ export component FFToolbar inherits Rectangle {
         compact: true;
         kind: "primary";
         glyph: "▶";
-        text: "Fuse stack";
+        text: root.would-queue ? "Queued" : "Fuse stack";
         enabled: root.fuse-enabled;
         clicked => { root.fuse-requested(); }
     }

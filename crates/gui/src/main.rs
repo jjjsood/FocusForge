@@ -3,12 +3,15 @@
 //! `focusforge-gui`'s entry point. Every flag below exists so the window
 //! can be observed without a person in front of it.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
+use focusforge_gui::bridge::Canvas;
 use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, screenshot};
 use slint::ComponentHandle;
 
@@ -70,6 +73,12 @@ struct Args {
     /// with no click sequence.
     #[arg(long)]
     frame_remove_warning: Option<usize>,
+    /// Selects these tab indices in turn and presses `Fuse stack` on each,
+    /// right after `--open`, leaving the last one selected -- for
+    /// inspecting a live run and the tabs queued behind it with no click
+    /// sequence. Comma-separated.
+    #[arg(long, value_delimiter = ',')]
+    fuse_tabs: Vec<usize>,
 }
 
 const TOOLBAR_STATES: [&str; 5] = ["idle", "running", "paused", "cancelling", "failed"];
@@ -107,7 +116,11 @@ fn parse_size(spec: &str) -> Option<(u32, u32)> {
 /// CPU-tone-mapped and no `Automatic` fallback, so no usable adapter is the
 /// run's end: the named `GpuError` and the still-working command-line path
 /// are printed and `Err` carries the code the process ends with.
-fn select_backend(controller: Arc<Mutex<AppController>>) -> Result<(), ExitCode> {
+fn select_backend(
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+    app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>>,
+) -> Result<(), ExitCode> {
     let shared = match focusforge_gpu::device::shared_device() {
         Ok(shared) => shared,
         Err(err) => {
@@ -123,11 +136,14 @@ fn select_backend(controller: Arc<Mutex<AppController>>) -> Result<(), ExitCode>
         queue: shared.queue().clone(),
     };
     // The drop route is installed on this *existing* `BackendSelector`
-    // chain, before any window exists, which is why `controller` is built
-    // before `select_backend` runs rather than inside `bridge::install`.
+    // chain, before any window exists, which is why `controller` and
+    // `canvas` are both built before `select_backend` runs rather than
+    // inside `bridge::install`.
     if let Err(e) = slint::BackendSelector::new()
         .require_wgpu_29(config)
-        .with_winit_custom_application_handler(bridge::DropHandler::new(controller))
+        .with_winit_custom_application_handler(bridge::DropHandler::new(
+            controller, canvas, app_handle,
+        ))
         .select()
     {
         tracing::error!("{e}");
@@ -393,11 +409,13 @@ fn run(args: &Args) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // Built before `select_backend`: the drop route
-    // (`bridge::DropHandler`) installs on the `BackendSelector` chain
-    // before any window exists.
+    // Built before `select_backend`: the drop route (`bridge::DropHandler`)
+    // installs on the `BackendSelector` chain before any window exists, and
+    // needs the same renderer cell every other open path feeds.
     let controller = Arc::new(Mutex::new(AppController::new()));
-    if let Err(code) = select_backend(controller.clone()) {
+    let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
+    let app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>> = Rc::new(RefCell::new(None));
+    if let Err(code) = select_backend(controller.clone(), canvas.clone(), app_handle.clone()) {
         return code;
     }
 
@@ -406,12 +424,12 @@ fn run(args: &Args) -> ExitCode {
         run_window(sheet, args)
     } else {
         let app = AppWindow::new().expect("failed to instantiate AppWindow");
+        *app_handle.borrow_mut() = Some(app.as_weak());
         let focusforge_gui::bridge::Installed {
             controller,
-            canvas,
             job_timer,
             toast_timer,
-        } = bridge::install(&app, controller);
+        } = bridge::install(&app, controller, canvas.clone());
         let _ = &job_timer;
         let _ = &toast_timer;
 
@@ -437,7 +455,7 @@ fn run(args: &Args) -> ExitCode {
                 tracing::error!("--open failed: {err}");
                 return ExitCode::from(1);
             }
-            bridge::feed_canvas(&app, &controller, &canvas);
+            bridge::repaint(&app, &controller, &canvas);
         }
 
         if let Some(tab) = &args.dock_tab {
@@ -459,6 +477,13 @@ fn run(args: &Args) -> ExitCode {
 
         if let Some(index) = args.frame_remove_warning {
             controller.lock().unwrap().remove_frame(index);
+        }
+
+        for index in &args.fuse_tabs {
+            // The window's own callbacks, so a press here arms the poll
+            // timer exactly as a click on the button does.
+            app.invoke_tab_selected(*index as i32);
+            app.invoke_fuse_requested();
         }
 
         run_window(app, args)

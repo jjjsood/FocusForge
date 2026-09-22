@@ -162,22 +162,43 @@ pub enum CanvasRendererError {
 /// renderer, for its frame pane alone.
 pub struct CanvasRenderer {
     shared: &'static SharedDevice,
-    composite: TiffStack,
-    zmap: ZMapReader,
+    composite: Option<TiffStack>,
+    zmap: Option<ZMapReader>,
     composite_pane: PaneTexture,
     zmap_pane: PaneTexture,
-    index_scale: u32,
-    last: Option<PaneDraw>,
+    index_scale: Option<u32>,
+    last_planes: Option<PaneDraw>,
+    frame: crate::canvas::FrameSource,
+    frame_pane: PaneTexture,
+    last_frame: Option<PaneDraw>,
 }
 
 impl CanvasRenderer {
-    /// Opens the composite and the Z-Map once, naming whichever fails by
-    /// name rather than a generic I/O error.
-    pub fn open(
-        shared: &'static SharedDevice,
+    /// A renderer with nothing open yet.
+    pub fn new(shared: &'static SharedDevice) -> Self {
+        Self {
+            shared,
+            composite: None,
+            zmap: None,
+            composite_pane: PaneTexture::default(),
+            zmap_pane: PaneTexture::default(),
+            index_scale: None,
+            last_planes: None,
+            frame: crate::canvas::FrameSource::default(),
+            frame_pane: PaneTexture::default(),
+            last_frame: None,
+        }
+    }
+
+    /// Opens `composite`/`zmap` as this renderer's planes, replacing
+    /// whichever pair was open before, naming whichever file fails by name
+    /// rather than a generic I/O error. Atomic: a failed open leaves the
+    /// previous pair, if any, untouched.
+    pub fn set_planes(
+        &mut self,
         composite_path: &Path,
         zmap_path: &Path,
-    ) -> Result<Self, CanvasRendererError> {
+    ) -> Result<(), CanvasRendererError> {
         let composite = TiffStack::open_files(std::slice::from_ref(&composite_path.to_path_buf()))
             .map_err(|source| CanvasRendererError::Composite {
                 path: composite_path.to_path_buf(),
@@ -187,28 +208,72 @@ impl CanvasRenderer {
             path: zmap_path.to_path_buf(),
             source,
         })?;
-        let index_scale = zmap_index_scale(zmap.frame_count());
-        Ok(Self {
-            shared,
-            composite,
-            zmap,
-            composite_pane: PaneTexture::default(),
-            zmap_pane: PaneTexture::default(),
-            index_scale,
-            last: None,
-        })
+        self.index_scale = Some(zmap_index_scale(zmap.frame_count()));
+        self.composite = Some(composite);
+        self.zmap = Some(zmap);
+        self.composite_pane = PaneTexture::default();
+        self.zmap_pane = PaneTexture::default();
+        self.last_planes = None;
+        Ok(())
     }
 
-    /// Re-reads and re-uploads `draw.src` for both panes, returning the two
+    /// Drops the open planes, leaving the frame half untouched.
+    pub fn clear_planes(&mut self) {
+        self.composite = None;
+        self.zmap = None;
+        self.index_scale = None;
+        self.composite_pane = PaneTexture::default();
+        self.zmap_pane = PaneTexture::default();
+        self.last_planes = None;
+    }
+
+    /// The frame pane's currently open path, if any.
+    pub fn frame_path(&self) -> Option<&Path> {
+        self.frame.path()
+    }
+
+    /// Opens `path` as the frame pane's source, dropping whatever was open
+    /// first. `Err` leaves nothing open.
+    pub fn set_frame(&mut self, path: &Path) -> Result<(), TiffError> {
+        let result = self.frame.set(path);
+        self.frame_pane = PaneTexture::default();
+        self.last_frame = None;
+        result
+    }
+
+    /// Drops the open frame, if any.
+    pub fn clear_frame(&mut self) {
+        self.frame.clear();
+        self.frame_pane = PaneTexture::default();
+        self.last_frame = None;
+    }
+
+    /// Re-reads and re-uploads `draw.src` for both planes, returning the two
     /// `slint::Image`s to bind to `FFPane::source`. A no-op (besides
     /// re-cloning the two already-current images) when `draw` is exactly
     /// what was last drawn -- a gesture that changes nothing costs nothing.
-    pub fn redraw(&mut self, draw: &PaneDraw) -> (slint::Image, slint::Image) {
-        if self.last.as_ref() == Some(draw) {
-            return (self.composite_pane.image(), self.zmap_pane.image());
+    /// `None` with no planes open, when `draw.src` falls outside the open
+    /// composite, or either read fails; `self.last_planes` stays untouched
+    /// on that path so a later, valid rect still renders.
+    pub fn redraw_planes(&mut self, draw: &PaneDraw) -> Option<(slint::Image, slint::Image)> {
+        if self.composite.is_none() || self.zmap.is_none() {
+            return None;
         }
+        if self.last_planes.as_ref() == Some(draw) {
+            return Some((self.composite_pane.image(), self.zmap_pane.image()));
+        }
+        let composite = self.composite.as_ref()?;
+        let zmap = self.zmap.as_ref()?;
+        let index_scale = self.index_scale?;
 
         let (x, y, width, height) = draw.src;
+        let (frame_size, samples_per_pixel) = {
+            let header = composite.header(0);
+            ((header.width, header.height), header.samples_per_pixel)
+        };
+        if !crate::canvas::draw_rect_fits(frame_size, draw.src) {
+            return None;
+        }
         let rect = Rect {
             x,
             y,
@@ -216,11 +281,8 @@ impl CanvasRenderer {
             height,
         };
 
-        let samples_per_pixel = self.composite.header(0).samples_per_pixel;
         let mut samples = vec![0u16; (width * height * samples_per_pixel) as usize];
-        self.composite
-            .read_tile_into(0, rect, &mut samples)
-            .expect("read composite tile for display");
+        composite.read_tile_into(0, rect, &mut samples).ok()?;
         self.composite_pane.ensure_and_render(
             self.shared,
             width,
@@ -231,13 +293,50 @@ impl CanvasRenderer {
         );
 
         let mut indices = vec![0u16; (width * height) as usize];
-        self.zmap
-            .read_tile_into(rect, &mut indices)
-            .expect("read zmap tile for display");
+        zmap.read_tile_into(rect, &mut indices).ok()?;
         self.zmap_pane
-            .ensure_and_render(self.shared, width, height, &indices, 1, self.index_scale);
+            .ensure_and_render(self.shared, width, height, &indices, 1, index_scale);
 
-        self.last = Some(*draw);
-        (self.composite_pane.image(), self.zmap_pane.image())
+        self.last_planes = Some(*draw);
+        Some((self.composite_pane.image(), self.zmap_pane.image()))
+    }
+
+    /// Re-reads and re-uploads `draw.src` for the frame pane, returning the
+    /// `slint::Image` to bind to `FFPane::source`. `None` with no frame
+    /// open, when `draw.src` falls outside it, or the read fails;
+    /// `self.last_frame` stays untouched on that path so a later, valid
+    /// rect still renders. The same display path [`Self::redraw_planes`]
+    /// uses, at an index scale of 0 -- a source frame carries no Z-Map
+    /// indices.
+    pub fn redraw_frame(&mut self, draw: &PaneDraw) -> Option<slint::Image> {
+        let frame_size = self.frame.dimensions()?;
+        let samples_per_pixel = self.frame.samples_per_pixel()?;
+        if self.last_frame.as_ref() == Some(draw) {
+            return Some(self.frame_pane.image());
+        }
+        if !crate::canvas::draw_rect_fits(frame_size, draw.src) {
+            return None;
+        }
+        let (x, y, width, height) = draw.src;
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+
+        let mut samples = vec![0u16; (width * height * samples_per_pixel) as usize];
+        self.frame.read_into(rect, &mut samples).ok()?;
+        self.frame_pane.ensure_and_render(
+            self.shared,
+            width,
+            height,
+            &samples,
+            samples_per_pixel,
+            0,
+        );
+
+        self.last_frame = Some(*draw);
+        Some(self.frame_pane.image())
     }
 }

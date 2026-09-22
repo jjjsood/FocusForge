@@ -29,6 +29,8 @@ pub struct ImageRow {
     /// The recorded source is no longer a file on disk.
     pub unresolved: bool,
     pub top: f32,
+    /// Whether this is the frame the left canvas pane draws.
+    pub selected: bool,
 }
 
 /// The `Images` panel's whole state -- header, rows and the scroll offset
@@ -45,7 +47,7 @@ pub struct ImagesModel {
 /// Builds one row per frame, in order. `excluded` shorter than `frames` is
 /// read as "not excluded" for the missing tail -- a tab always keeps the two
 /// in lockstep, but a row builder should not panic on an untrusted slice.
-fn build_rows(frames: &[PathBuf], excluded: &[bool]) -> Vec<ImageRow> {
+fn build_rows(frames: &[PathBuf], excluded: &[bool], selected: Option<usize>) -> Vec<ImageRow> {
     let total = frames.len().max(1) as u32;
     frames
         .iter()
@@ -66,9 +68,17 @@ fn build_rows(frames: &[PathBuf], excluded: &[bool]) -> Vec<ImageRow> {
                 excluded: excluded.get(i).copied().unwrap_or(false),
                 unresolved,
                 top: i as f32 * ROW_HEIGHT,
+                selected: selected == Some(i),
             }
         })
         .collect()
+}
+
+/// The position seeding lands on: the first not-excluded index, or `0` when
+/// every frame is excluded -- a tab holding at least one frame always names
+/// exactly one selected position, even a fully excluded one.
+pub fn first_included(excluded: &[bool]) -> usize {
+    excluded.iter().position(|&x| !x).unwrap_or(0)
 }
 
 /// The `HH:MM:SS` tail of a `"YYYY:MM:DD HH:MM:SS"` capture time -- the row
@@ -82,7 +92,7 @@ fn time_of_day(text: &str) -> String {
     }
 }
 
-fn file_name(path: &Path) -> String {
+pub(crate) fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
@@ -90,8 +100,13 @@ fn file_name(path: &Path) -> String {
 
 /// Builds the whole panel model: the header count and the rows, at a given
 /// scroll offset already clamped by the caller.
-pub fn build_model(frames: &[PathBuf], excluded: &[bool], scroll_y: f32) -> ImagesModel {
-    let rows = build_rows(frames, excluded);
+pub fn build_model(
+    frames: &[PathBuf],
+    excluded: &[bool],
+    selected: Option<usize>,
+    scroll_y: f32,
+) -> ImagesModel {
+    let rows = build_rows(frames, excluded, selected);
     let excluded_count = rows.iter().filter(|r| r.excluded).count();
     let header_text = format!(
         "{} frame{} \u{b7} {} excluded",
@@ -279,7 +294,7 @@ mod tests {
                 )
             })
             .collect();
-        let model = build_model(&frames, &[false, false, false], 0.0);
+        let model = build_model(&frames, &[false, false, false], None, 0.0);
         assert_eq!(model.rows.len(), 3);
         assert_eq!(model.header_text, "3 frames \u{b7} 0 excluded");
         // ImageRow's own fields are exhaustively named here -- there is no
@@ -295,14 +310,14 @@ mod tests {
             write_timed(dir.path(), "00.tif", Some("2026:08:29 10:00:00")),
             write_timed(dir.path(), "01.tif", None),
         ];
-        let model = build_model(&frames, &[false, false], 0.0);
+        let model = build_model(&frames, &[false, false], None, 0.0);
         assert_eq!(model.rows[1].time_text, "");
         assert!(!model.rows[1].unresolved);
     }
 
     #[test]
     fn an_unresolved_source_carries_no_fabricated_time() {
-        let model = build_model(&[PathBuf::from("/does/not/exist.tif")], &[false], 0.0);
+        let model = build_model(&[PathBuf::from("/does/not/exist.tif")], &[false], None, 0.0);
         assert!(model.rows[0].unresolved);
         assert_eq!(model.rows[0].time_text, "");
     }
@@ -319,7 +334,7 @@ mod tests {
                 )
             })
             .collect();
-        let model = build_model(&frames, &[true, false], 0.0);
+        let model = build_model(&frames, &[true, false], None, 0.0);
         assert_eq!(model.header_text, "2 frames \u{b7} 1 excluded");
     }
 
