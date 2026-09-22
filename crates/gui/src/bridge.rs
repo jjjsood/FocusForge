@@ -18,8 +18,8 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
 use crate::controller::{
-    AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, SettingsSection,
-    ShellEvent, ShellMode,
+    AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, OpenOutcome,
+    SettingsSection, ShellEvent, ShellMode,
 };
 use crate::diagnostics::DiagnosticsStatus;
 use crate::generated::{
@@ -400,6 +400,44 @@ fn start_job_timer(
     *job_timer.borrow_mut() = Some(timer);
 }
 
+/// Waits for a load started before the event loop ran (`--open`) to settle,
+/// starting the next `queued` path in turn each time the previous one does,
+/// then feeds the canvas once the last one has settled -- the same shape as
+/// `start_job_timer`, polling [`AppController::load_in_flight`] instead of
+/// a job's own handle. Returns the timer's own retaining cell; the caller
+/// keeps it alive for as long as the window runs.
+pub fn start_open_wait_timer(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Option<CanvasRenderer>>>,
+    mut queued: std::vec::IntoIter<PathBuf>,
+) -> Rc<RefCell<Option<slint::Timer>>> {
+    let slot: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+    let timer_slot = slot.clone();
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().load_in_flight() {
+            return;
+        }
+        if let Some(next) = queued.next() {
+            controller
+                .lock()
+                .unwrap()
+                .open_paths(std::slice::from_ref(&next));
+            return;
+        }
+        feed_canvas(&app, &controller, &canvas);
+        if let Some(t) = timer_slot.borrow().as_ref() {
+            t.stop();
+        }
+    });
+    *slot.borrow_mut() = Some(timer);
+    slot
+}
+
 /// `RowKind`'s own string reading -- the settings panel's `.slint` side
 /// branches on this, never on a `ParamKind` or an algorithm id.
 fn row_kind_str(kind: RowKind) -> &'static str {
@@ -671,19 +709,13 @@ impl CustomApplicationHandler for DropHandler {
     }
 }
 
-/// Opens `path`, if the picker returned one, and closes the projects
-/// overlay on a successful open -- the rail's `New project`/`Open
+/// Opens `path`, if the picker returned one -- the rail's `New project`/`Open
 /// project…` actions and their `Ctrl+N`/`Ctrl+O` chrome-key twins share this
-/// one path.
+/// one path. The projects overlay closes itself once the load settles onto
+/// a real tab (`AppController::accept`), the same as a successful open.
 fn open_from_picker(controller: &Arc<Mutex<AppController>>, path: Option<PathBuf>) {
     let Some(path) = path else { return };
-    let mut controller = controller.lock().unwrap();
-    if matches!(
-        controller.open_paths(&[path]),
-        crate::OpenOutcome::Opened(_)
-    ) {
-        controller.close_projects_overlay();
-    }
+    controller.lock().unwrap().open_paths(&[path]);
 }
 
 /// Wires every callback in `app` to `controller`, and returns [`Installed`]
@@ -1128,20 +1160,32 @@ pub fn install(app: &AppWindow, controller: Arc<Mutex<AppController>>) -> Instal
         .set_tab_region_width(app.get_tab_region_width());
     app.on_question_open_as_one({
         let controller = controller.clone();
+        let app_weak = app.as_weak();
         move || {
             let _ = controller
                 .lock()
                 .unwrap()
                 .answer_question(OpenAs::OneProject);
+            // The answer's decode runs on a worker, so nothing else pushes
+            // `question_open` before it settles -- closed here instead.
+            // When a load is already in flight, the question stays pending
+            // and the next `push_projects` reopens the dialog.
+            if let Some(app) = app_weak.upgrade() {
+                app.set_question_open(false);
+            }
         }
     });
     app.on_question_open_as_many({
         let controller = controller.clone();
+        let app_weak = app.as_weak();
         move || {
             let _ = controller
                 .lock()
                 .unwrap()
                 .answer_question(OpenAs::NProjects);
+            if let Some(app) = app_weak.upgrade() {
+                app.set_question_open(false);
+            }
         }
     });
     app.on_question_cancelled({
@@ -1581,5 +1625,25 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         }
         ShellEvent::ImagesChanged => push_images_panel(app, &controller.lock().unwrap()),
         ShellEvent::OverlayChanged => push_projects_overlay(app, &controller.lock().unwrap()),
+        // A background load's own three events (`AppController::open_paths`).
+        // The indicator's threshold and fade are the Slint region's own
+        // state, driven by `load-active` alone -- it shows no other part of
+        // a load's progress, so a tick has nothing to push.
+        ShellEvent::LoadStarted => app.set_load_active(true),
+        ShellEvent::LoadProgress { .. } => {}
+        ShellEvent::LoadReady => {
+            let outcome = controller.lock().unwrap().settle_open();
+            // Pushed synchronously, in the same step `load-active` clears --
+            // `settle_open`'s own sink push (`ProjectsChanged` and friends)
+            // only lands a turn later, which would render an empty-state
+            // frame in between.
+            match outcome {
+                Some(OpenOutcome::Opened(_)) => push_projects(app, controller),
+                Some(OpenOutcome::Question(question, _)) => push_question(app, &question),
+                Some(OpenOutcome::Refused(_)) => app.set_refusal_open(true),
+                None => {}
+            }
+            app.set_load_active(false);
+        }
     }
 }

@@ -841,3 +841,47 @@ fn bottom_bar_progress() {
     let (eta_x, eta_y, _, _) = rect(&app_min, "FFBottomBar::eta-text");
     assert_eq!((eta_x, eta_y), (824.0, 716.0));
 }
+
+/// The loading indicator's show threshold: still hidden 100ms short of the
+/// 500ms it needs, visible once past it.
+#[test]
+fn loading_indicator_appears_only_past_its_threshold() {
+    let app = app_at(1440, 900);
+    app.set_load_active(true);
+    // Registers the freshly-`running` threshold timer against the current
+    // mocked tick -- without this zero-length call, the later jump below
+    // would start the timer's own countdown from whatever tick it first
+    // gets instantiated at instead of from here.
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(400));
+    assert!(
+        !app.get_load_indicator_visible(),
+        "must stay hidden 100ms short of the 500ms threshold"
+    );
+
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(150));
+    assert!(
+        app.get_load_indicator_visible(),
+        "must be visible once the threshold has passed"
+    );
+}
+
+/// A load that ends before the threshold never shows the indicator at all --
+/// clearing `load-active` before the gate opens must not open it later.
+#[test]
+fn loading_indicator_never_shows_for_a_load_that_ends_before_the_threshold() {
+    let app = app_at(1440, 900);
+    app.set_load_active(true);
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(400));
+    assert!(!app.get_load_indicator_visible());
+
+    app.set_load_active(false);
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(150));
+    assert!(
+        !app.get_load_indicator_visible(),
+        "a load that finished before the threshold must never flash the indicator"
+    );
+}

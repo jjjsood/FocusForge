@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A rounded surface panel holding a spinner and a caption, cast with a drop
+// shadow so it reads as floating above whatever sits behind it.
+
+import { Theme } from "../theme.slint";
+import { FFSpinner } from "ff_spinner.slint";
+
+export component FFLoadingPanel inherits Rectangle {
+    in property <string> caption: "";
+
+    // Sized from its own padded content, so it self-sizes correctly
+    // whether its parent is a layout or not.
+    width: content.preferred-width;
+    height: content.preferred-height;
+    background: Theme.surface-raised;
+    border-radius: Theme.radius-lg;
+    // Lifts the panel off whatever is behind it -- the same recipe
+    // `FFImageRow`'s own floating state uses.
+    drop-shadow-color: Theme.surface-canvas.with-alpha(0.5);
+    drop-shadow-offset-y: Theme.space-1;
+    drop-shadow-blur: Theme.space-2;
+
+    content := VerticalLayout {
+        padding: Theme.space-4;
+        spacing: Theme.space-2;
+        alignment: center;
+        // The spinner has a fixed width, so it does not stretch to the
+        // layout's own width the way the caption does -- centred
+        // explicitly, or it sits at the layout's left edge instead.
+        cross-axis-alignment: center;
+
+        FFSpinner {}
+
+        Text {
+            text: root.caption;
+            color: Theme.text-secondary;
+            font-size: Theme.text-body.size;
+            horizontal-alignment: center;
+        }
+    }
+}

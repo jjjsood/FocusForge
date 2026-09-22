@@ -19,6 +19,8 @@ import { FFRowLabel } from "components/ff_row_label.slint";
 import { FFRowText } from "components/ff_row_text.slint";
 import { FFButton } from "components/ff_button.slint";
 import { FFProgressBar } from "components/ff_progress_bar.slint";
+import { FFSpinner } from "components/ff_spinner.slint";
+import { FFLoadingPanel } from "components/ff_loading_panel.slint";
 import { FFImageRow } from "components/ff_image_row.slint";
 import { FFDialog } from "components/ff_dialog.slint";
 import { FFDialogFooter } from "components/ff_dialog_footer.slint";
@@ -361,6 +363,13 @@ export component ThemeSheet inherits Window {
             FFProgressBar { width: 400px; tone: "failed"; fraction: 0.24; }
             FFProgressBar { width: 400px; tone: "running"; fraction: 0.0; }
             FFProgressBar { width: 400px; tone: "running"; indeterminate: true; }
+        }
+
+        GroupHeading { text: "Loading indicator"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFSpinner {}
+            FFLoadingPanel { caption: "Loading…"; }
         }
 
         GroupHeading { text: "Images list: row"; }

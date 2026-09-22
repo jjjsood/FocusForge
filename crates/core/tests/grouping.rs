@@ -202,6 +202,80 @@ fn no_frames_in_a_subdirectory_is_a_negative_not_an_error() {
     );
 }
 
+/// The progress-observing walk reports the same [`focusforge_core::io::Proposal`]
+/// `propose` does and counts every frame exactly once, on a tree with two
+/// frame-bearing subfolders and a skipped one.
+#[test]
+fn progress_observing_walk_matches_propose_and_counts_every_frame_once() {
+    use focusforge_core::io::propose_with_progress;
+
+    let root = tree("grouping_progress");
+    frame(
+        &root.join("subject-a"),
+        "00.tif",
+        Some("2026:08:29 18:42:41"),
+    );
+    frame(
+        &root.join("subject-a"),
+        "01.tif",
+        Some("2026:08:29 18:42:42"),
+    );
+    frame(
+        &root.join("subject-b"),
+        "00.tif",
+        Some("2026:08:29 18:42:43"),
+    );
+    std::fs::create_dir_all(root.join("thumbnails")).unwrap();
+    std::fs::write(root.join("thumbnails").join("readme.txt"), b"not a frame").unwrap();
+
+    let reference = propose(&root).expect("the tree must propose");
+
+    let mut ticks: Vec<(usize, usize)> = Vec::new();
+    let observed = propose_with_progress(&root, |frames_read, frame_total| {
+        ticks.push((frames_read, frame_total));
+    })
+    .expect("the observed walk must propose the same tree");
+
+    assert_eq!(observed.root, reference.root);
+    assert_eq!(observed.gap, reference.gap);
+    assert_eq!(
+        observed.time_signal_available,
+        reference.time_signal_available
+    );
+    let mut observed_skipped = observed.skipped.clone();
+    observed_skipped.sort();
+    let mut reference_skipped = reference.skipped.clone();
+    reference_skipped.sort();
+    assert_eq!(observed_skipped, reference_skipped);
+    assert_eq!(observed.groups.len(), reference.groups.len());
+    for (o, r) in observed.groups.iter().zip(reference.groups.iter()) {
+        assert_eq!(o.name, r.name);
+        assert_eq!(o.dir, r.dir);
+        assert_eq!(o.frames, r.frames);
+        assert_eq!(o.signal, r.signal);
+    }
+
+    // Three real frames across the tree -- the skipped `thumbnails`
+    // subdirectory holds none, so it contributes no report.
+    assert_eq!(
+        ticks.len(),
+        3,
+        "one report per frame read, not per group or per directory: {ticks:?}"
+    );
+    let frame_total = 3;
+    for (i, &(frames_read, total)) in ticks.iter().enumerate() {
+        assert_eq!(
+            total, frame_total,
+            "frame_total must stay fixed across every report"
+        );
+        assert_eq!(
+            frames_read,
+            i + 1,
+            "frames_read must count up by exactly one per report, never skip or repeat"
+        );
+    }
+}
+
 #[test]
 fn an_empty_tree_is_no_frames() {
     let root = tree("grouping_empty_tree");
@@ -298,7 +372,6 @@ fn proposing_reads_no_pixels() {
 #[ignore = "reads the 16 GB reference stack"]
 fn proposal_over_the_reference_stack() {
     let Some(dir) = common::reference_stack_dir() else {
-        eprintln!("skip: no reachable reference stack");
         return;
     };
     let self_contained = dir.join("frames").is_dir();

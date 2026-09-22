@@ -9,9 +9,17 @@ target/release/focusforge-gui --open path/to/frames/
 
 A folder argument proposes a grouping the same way `focusforge-cli stack`
 would and opens each proposed stack as its own tab; a `*.ffp` path reopens a
-project that was already stacked. Leaving `--open` off starts with no
-project open — use **Open project…** (below) or drop a folder or a set of
-frames onto the window.
+project that was already stacked. `--open` is repeatable — each path is
+opened in turn, the next one waiting for the one before it to finish rather
+than racing it. Leaving `--open` off starts with no project open — use
+**Open project…** (below) or drop a folder or a set of frames onto the
+window. A path that fails to open shows the same refusal dialog a failed
+drop or picker choice would, rather than closing the window.
+
+Opening a folder, a project or a picker/drop result reads its frame headers
+and decodes a thumbnail off the window's own thread, so the window keeps
+responding while a large folder is scanned; a loading indicator appears over
+the canvas once a load has been running for half a second.
 
 ## The window
 
