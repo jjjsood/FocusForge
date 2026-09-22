@@ -4,8 +4,10 @@
 //! from `CARGO_MANIFEST_DIR`, the idiom `crates/core/tests/common/mod.rs`
 //! already established -- never a literal `../..` string.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// `crates/gui/../..` -- the workspace root.
@@ -102,6 +104,13 @@ pub fn fixture_frame(set: &str, index: usize) -> PathBuf {
 pub fn reference_stack_dir() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("FOCUSFORGE_REFERENCE_STACK")?);
     dir.is_dir().then_some(dir)
+}
+
+/// A fresh, empty renderer cell for `bridge::install`, with no project's
+/// planes loaded yet.
+#[allow(dead_code)]
+pub fn empty_canvas() -> Rc<RefCell<focusforge_gui::bridge::Canvas>> {
+    Rc::new(RefCell::new(focusforge_gui::bridge::Canvas::default()))
 }
 
 /// A fresh, empty directory under `CARGO_TARGET_TMPDIR`, named `name` --
