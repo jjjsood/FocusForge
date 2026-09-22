@@ -552,7 +552,7 @@ fn failure_is_reported_and_retryable() {
 fn the_failure_message_names_the_frame_and_the_reason() {
     let mut controller = controller_with_unalignable_frames("message");
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
     assert!(!controller.job_running());
     let message = controller
         .job_failure_message()
