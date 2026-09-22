@@ -2,15 +2,11 @@
 
 //! `pyramidal-ecc` (the [`AlignAlgorithm`]) and [`align_stack`] (the
 //! whole-stack driver), exercised against `fixtures/mantis-512` and
-//! synthetic in-memory readers. Opened the way `crates/core/tests/
-//! ecc_solver.rs` opens its fixture: `mod common;` plus
-//! `TiffStack::open(common::mantis_512_dir())`, never a relative literal.
+//! synthetic in-memory readers.
 //!
-//! Ground-truth pairs are built the same way `ecc_solver.rs` builds them:
-//! frame 3 (`03.tif`, the sharpest fixture frame) warped by a known
-//! [`Transform`], registered against its own unwarped self -- the only
-//! configuration where the "known" transform is actually known (see that
-//! file's module docs for why).
+//! Ground-truth pairs warp frame 3 (`03.tif`, the sharpest fixture frame) by
+//! a known [`Transform`] and register it against its own unwarped self --
+//! the only configuration where the "known" transform is actually known.
 
 mod common;
 
@@ -101,8 +97,7 @@ fn similarity_about(scale: f64, radians: f64, cx: f64, cy: f64) -> Transform {
     back.compose(&rot_scale).compose(&to_origin)
 }
 
-/// A deterministic xorshift32 PRNG -- never `rand`, mirroring the private
-/// generators already reimplemented per-file in this crate's own tests.
+/// Deterministic xorshift32 PRNG.
 struct XorShift32(u32);
 
 impl XorShift32 {
@@ -118,8 +113,7 @@ impl XorShift32 {
 
 /// A synthetic in-memory [`TileReader`] over an arbitrary number of
 /// same-sized frames, honouring the same exact-length and in-bounds
-/// contracts as [`focusforge_core::io::TiffStack::read_tile_into`] --
-/// mirrors `crates/core/src/algorithm/mod.rs`'s own test-only `VecReader`.
+/// contracts as [`focusforge_core::io::TiffStack::read_tile_into`].
 struct FramesReader {
     width: u32,
     height: u32,
@@ -702,12 +696,12 @@ fn each_divergence_reports_its_pyramid_level() {
     let (stack, stack_ctx, cfg) = fixture_with_defaults();
     let reference = 3usize;
     assert_eq!(reference, (stack.len() - 1) / 2, "middle of 8 frames is 3");
+    let ctx = AlignContext::new(stack_ctx, reference, &stack);
 
     for frame in 0..stack.len() {
         if frame == reference {
             continue;
         }
-        let ctx = AlignContext::new(stack_ctx, reference, &stack);
         let mut levels: Vec<EccLevelRecord> = Vec::new();
         let outcome = PyramidalEcc
             .align_frame_traced(&ctx, frame, &cfg, &mut levels)
