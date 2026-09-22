@@ -108,6 +108,17 @@ impl Canvas {
         self.tab = None;
     }
 
+    /// The open renderer, creating one first when this tab has never had
+    /// anything to draw. `None` only when the shared GPU device failed to
+    /// open.
+    fn renderer_mut(&mut self) -> Option<&mut CanvasRenderer> {
+        if self.renderer.is_none() {
+            let shared = focusforge_gpu::device::shared_device().ok()?;
+            self.renderer = Some(CanvasRenderer::new(shared));
+        }
+        self.renderer.as_mut()
+    }
+
     /// Opens `composite`/`zmap` as `tab`'s own planes, naming the failure on
     /// stderr rather than panicking: a plane the pipeline itself just wrote
     /// failing to reopen is an environment problem (a full disk, a
@@ -118,13 +129,7 @@ impl Canvas {
     /// selected frame.
     fn load(&mut self, tab: usize, composite: &Path, zmap: &Path) {
         self.tab = Some(tab);
-        if self.renderer.is_none() {
-            let Ok(shared) = focusforge_gpu::device::shared_device() else {
-                return;
-            };
-            self.renderer = Some(CanvasRenderer::new(shared));
-        }
-        let Some(renderer) = self.renderer.as_mut() else {
+        let Some(renderer) = self.renderer_mut() else {
             return;
         };
         if let Err(err) = renderer.set_planes(composite, zmap) {
@@ -137,13 +142,7 @@ impl Canvas {
     /// already open; `None` drops whatever frame was open. Keeps the
     /// reader's own refusal text on failure rather than a generic message.
     pub fn set_frame(&mut self, path: Option<&Path>) {
-        if self.renderer.is_none() {
-            let Ok(shared) = focusforge_gpu::device::shared_device() else {
-                return;
-            };
-            self.renderer = Some(CanvasRenderer::new(shared));
-        }
-        let Some(renderer) = self.renderer.as_mut() else {
+        let Some(renderer) = self.renderer_mut() else {
             return;
         };
         let Some(path) = path else {
