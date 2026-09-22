@@ -21,6 +21,7 @@ import { FFRowLabel } from "components/ff_row_label.slint";
 import { FFRowText } from "components/ff_row_text.slint";
 import { FFButton } from "components/ff_button.slint";
 import { FFProgressBar } from "components/ff_progress_bar.slint";
+import { FFPanePlaceholder } from "components/ff_pane_placeholder.slint";
 import { FFImageRow } from "components/ff_image_row.slint";
 import { FFDialog } from "components/ff_dialog.slint";
 import { FFDialogFooter } from "components/ff_dialog_footer.slint";
@@ -389,6 +390,9 @@ export component ThemeSheet inherits Window {
             FFProgressBar { width: 400px; tone: "running"; fraction: 0.0; }
             FFProgressBar { width: 400px; tone: "running"; indeterminate: true; }
         }
+
+        GroupHeading { text: "Canvas: pane placeholder"; }
+        FFPanePlaceholder { }
 
         GroupHeading { text: "Images list: row"; }
         VerticalLayout {

@@ -169,6 +169,10 @@ export component AppWindow inherits Window {
     // action there is nothing yet to act on. Set from Rust alongside
     // `zoom-readout` in `src/bridge.rs::repaint`, `false` until then.
     in property <bool> project-loaded: false;
+    // Whether the active tab has a composite to show -- governs the right
+    // pane's not-yet-fused placeholder. Set from Rust alongside
+    // `project-loaded` in `src/bridge.rs::push_projects`.
+    in property <bool> composite-ready: false;
     callback composite-undock-requested();
     callback zmap-undock-requested();
     // Forwarded from `FFCanvas`'s own callbacks of the same shape -- the
@@ -241,6 +245,7 @@ export component AppWindow inherits Window {
             frame-message: root.frame-message;
             undock-enabled: root.canvas-undock-enabled;
             project-loaded: root.project-loaded;
+            composite-ready: root.composite-ready;
             image-x: root.image-x;
             image-y: root.image-y;
             image-w: root.image-w;

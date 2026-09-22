@@ -415,6 +415,63 @@ fn closing_the_active_tab_feeds_the_neighbour() {
     }
 }
 
+/// `composite_ready` follows the *active* tab's own checkpoint count: false
+/// with no tab active, false right after opening (no run yet), true once
+/// that tab's own fuse settles, false while a second, never-fused tab is
+/// active even though the first tab is fused, true again on returning to
+/// the fused tab.
+#[test]
+fn composite_ready_follows_the_active_tabs_own_fuse() {
+    let mut controller = AppController::new();
+    assert!(
+        !controller.composite_ready(),
+        "no active tab has no composite to show"
+    );
+
+    controller.set_scratch_root_for_test(common::tree("composite_ready_scratch"));
+    open_fixture_tab(&mut controller, "composite_ready", "mantis-64", 2);
+    assert!(
+        !controller.composite_ready(),
+        "a freshly opened tab has no composite until its first fuse"
+    );
+
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60))
+        .expect("the first fuse must complete");
+    assert!(
+        controller.composite_ready(),
+        "the active tab's own settled fuse must flip it true"
+    );
+    assert!(matches!(
+        controller.canvas_feed(None),
+        CanvasFeed::Load { tab: 0, .. }
+    ));
+
+    open_fixture_tab(&mut controller, "composite_ready", "mantis-512", 3);
+    assert!(
+        !controller.composite_ready(),
+        "a second, never-fused tab being active must read false, even though tab 0 is fused"
+    );
+
+    controller.select_project(0);
+    assert!(
+        controller.composite_ready(),
+        "returning to the fused tab must read true again"
+    );
+
+    controller.select_plus();
+    assert!(
+        !controller.composite_ready(),
+        "\"+\" selected must read false, even though tab 0 is fused"
+    );
+
+    controller.select_project(0);
+    assert!(
+        controller.composite_ready(),
+        "leaving \"+\" for the fused tab must read true again"
+    );
+}
+
 #[test]
 fn opening_a_saved_project_feeds_its_own_planes() {
     let mut controller = AppController::new();
@@ -780,6 +837,128 @@ fn pane_chrome_hidden_without_a_project() {
                 .find_all()
                 .is_empty(),
             "{id}: must be hidden while no project is open"
+        );
+    }
+}
+
+/// The not-yet-fused placeholder is on screen exactly while a project is
+/// loaded and the active tab has no composite yet, 220 px wide and centred
+/// on `pane-right`'s own rect without covering its label, at both the base
+/// and the minimum window size -- and a mid-run set of bottom-bar
+/// properties changes neither its visibility nor its rect, since it reads
+/// no run state at all.
+#[test]
+fn pane_placeholder_shows_only_until_the_first_fuse() {
+    thread_local! {
+        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    INIT.with(|done| {
+        if !done.get() {
+            i_slint_backend_testing::init_no_event_loop();
+            done.set(true);
+        }
+    });
+    let app = AppWindow::new().unwrap();
+
+    for (label, width, height) in [("base", 1440, 900), ("minimum", 1200, 760)] {
+        app.window()
+            .set_size(slint::PhysicalSize::new(width, height));
+        app.set_project_loaded(true);
+        app.set_composite_ready(false);
+
+        let pane = ElementQuery::from_root(&app)
+            .match_id("FFCanvas::pane-right")
+            .find_first()
+            .unwrap_or_else(|| panic!("{label}: no element matched id \"FFCanvas::pane-right\""));
+        let pane_pos = pane.absolute_position();
+        let pane_size = pane.size();
+
+        let placeholder = ElementQuery::from_root(&app)
+            .match_id("FFCanvas::pane-placeholder")
+            .find_first()
+            .unwrap_or_else(|| {
+                panic!("{label}: placeholder must show while the active tab has no composite")
+            });
+        let p_pos = placeholder.absolute_position();
+        let p_size = placeholder.size();
+        assert!(
+            (p_size.width - 220.0).abs() < GEOMETRY_EPS,
+            "{label}: placeholder width {}, expected 220",
+            p_size.width
+        );
+        assert!(
+            (p_pos.x - (pane_pos.x + (pane_size.width - p_size.width) / 2.0)).abs() < GEOMETRY_EPS
+                && (p_pos.y - (pane_pos.y + (pane_size.height - p_size.height) / 2.0)).abs()
+                    < GEOMETRY_EPS,
+            "{label}: placeholder must be centred on pane-right's rect, got {p_pos:?} over pane \
+             {pane_pos:?} {pane_size:?}"
+        );
+
+        // The 120x22 label at pane-right's own +10/+10 must still be found,
+        // and the placeholder must not overlap it.
+        let label_el = ElementQuery::from_root(&app)
+            .match_id("FFPane::pane-label")
+            .find_all()
+            .into_iter()
+            .find(|el| {
+                let p = el.absolute_position();
+                (p.x - (pane_pos.x + 10.0)).abs() < GEOMETRY_EPS
+                    && (p.y - (pane_pos.y + 10.0)).abs() < GEOMETRY_EPS
+            })
+            .unwrap_or_else(|| panic!("{label}: no pane-label found at pane-right's +10/+10"));
+        let l_pos = label_el.absolute_position();
+        let l_size = label_el.size();
+        let disjoint = p_pos.x >= l_pos.x + l_size.width
+            || l_pos.x >= p_pos.x + p_size.width
+            || p_pos.y >= l_pos.y + l_size.height
+            || l_pos.y >= p_pos.y + p_size.height;
+        assert!(
+            disjoint,
+            "{label}: placeholder {p_pos:?} {p_size:?} must not overlap the pane label \
+             {l_pos:?} {l_size:?}"
+        );
+
+        // A mid-run bottom-bar state must not move or hide the placeholder
+        // -- it reads no run property.
+        app.set_stage_word("Fusing".into());
+        app.set_step_text("step 2 of 3".into());
+        app.set_bar_fraction(0.62);
+        app.set_bar_tone("running".into());
+        let placeholder_after = ElementQuery::from_root(&app)
+            .match_id("FFCanvas::pane-placeholder")
+            .find_first()
+            .unwrap_or_else(|| panic!("{label}: placeholder must still show mid-run"));
+        assert_eq!(
+            placeholder_after.absolute_position(),
+            p_pos,
+            "{label}: a mid-run bottom-bar state must not move the placeholder"
+        );
+        assert_eq!(
+            placeholder_after.size(),
+            p_size,
+            "{label}: a mid-run bottom-bar state must not resize the placeholder"
+        );
+        app.set_stage_word("".into());
+        app.set_step_text("".into());
+        app.set_bar_fraction(0.0);
+        app.set_bar_tone("".into());
+
+        app.set_composite_ready(true);
+        assert!(
+            ElementQuery::from_root(&app)
+                .match_id("FFCanvas::pane-placeholder")
+                .find_all()
+                .is_empty(),
+            "{label}: placeholder must be gone once the active tab has a composite"
+        );
+
+        app.set_project_loaded(false);
+        assert!(
+            ElementQuery::from_root(&app)
+                .match_id("FFCanvas::pane-placeholder")
+                .find_all()
+                .is_empty(),
+            "{label}: placeholder must stay hidden with no project loaded"
         );
     }
 }

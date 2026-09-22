@@ -2986,6 +2986,12 @@ impl AppController {
         self.state.active().map(|tab| tab.checkpoints)
     }
 
+    /// Whether the active tab has a composite to show: at least one
+    /// checkpoint. `false` while no tab is active.
+    pub fn composite_ready(&self) -> bool {
+        self.checkpoint_count().is_some_and(|count| count > 0)
+    }
+
     /// Joins the worker thread if it has finished, moving the shell out of
     /// `Running`/`Cancelling` and, on completion, promoting the tab from
     /// `Unsaved` to `Opened` with its stack context re-read from the sealed

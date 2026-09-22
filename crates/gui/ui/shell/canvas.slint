@@ -7,6 +7,7 @@ import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
 import { FFEmptyState } from "empty_state.slint";
 import { FFErrorRow } from "../components/ff_error_row.slint";
+import { FFPanePlaceholder } from "../components/ff_pane_placeholder.slint";
 
 component FFPaneLabel inherits Rectangle {
     in property <string> label: "";
@@ -121,6 +122,9 @@ export component FFCanvas inherits Rectangle {
     in property <bool> undock-enabled: true;
     // Forwarded to both panes' chrome -- see `FFPane::project-loaded`.
     in property <bool> project-loaded: false;
+    // Whether the active tab has a composite -- governs the right pane's
+    // not-yet-fused placeholder.
+    in property <bool> composite-ready: false;
     // The one shared viewport's placement -- forwarded identically to
     // both panes below, which is what makes "one viewport
     // over two panes" structural rather than a synchronisation. The right
@@ -235,8 +239,8 @@ export component FFCanvas inherits Rectangle {
         y: ShellGeometry.pane-gutter;
         width: pane-left.width;
         height: pane-left.height;
-        source: root.zmap-source;
-        label: "Z-Map";
+        source: root.composite-source;
+        label: "Composite";
         undock-enabled: root.undock-enabled;
         project-loaded: root.project-loaded;
         image-x: root.image-x;
@@ -245,6 +249,12 @@ export component FFCanvas inherits Rectangle {
         image-h: root.image-h;
         pixelated: root.pixelated;
         undock-requested => { root.zmap-undock-requested(); }
+    }
+
+    pane-placeholder := FFPanePlaceholder {
+        x: pane-right.x + (pane-right.width - self.width) / 2;
+        y: pane-right.y + (pane-right.height - self.height) / 2;
+        visible: root.project-loaded && !root.composite-ready;
     }
 
     empty-state := FFEmptyState {
