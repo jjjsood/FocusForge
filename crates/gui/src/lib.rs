@@ -54,6 +54,11 @@ pub mod input_config;
 /// `src/bridge.rs`/`src/main.rs` reach its types directly.
 pub mod viewport;
 
+/// The diagnostics panel's view types, no `use slint::` anywhere in it.
+/// `pub` so `tests/controller.rs` and `src/bridge.rs` reach its types
+/// directly, the same way `input_map` and `viewport` do above.
+pub mod diagnostics;
+
 /// The `Settings` dock panel model, generated from `ParamDesc` alone -- no
 /// `use slint::` anywhere in it. `pub` so `tests/settings_panel.rs` reaches
 /// its types directly, the same way `tests/tab_scroll.rs` reaches

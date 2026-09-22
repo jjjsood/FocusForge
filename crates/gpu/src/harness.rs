@@ -46,9 +46,7 @@ pub struct GpuBackend {
     /// test uses to drive a deliberately tiny ceiling.
     budget: VramBudget,
     /// The settled budget and its provenance, reported through
-    /// [`Self::device_budget`] -- `crates/cli` turns this into
-    /// `StackReport`'s additive `max_device_bytes_in_flight` /
-    /// `device_budget_provenance` fields.
+    /// [`Self::device_budget`].
     device_budget: DeviceBudget,
 }
 
@@ -71,7 +69,7 @@ impl GpuBackend {
     /// refused all the way down to `crate::budget::PROBE_MIN_DEVICE_BYTES`:
     /// the device cannot serve even the smallest budget -- only this
     /// startup case falls back to the CPU path; a mid-run exhaustion after
-    /// this probe already succeeded does not).
+    /// this probe already succeeded does not.
     fn probed(device: &'static SharedDevice, ceiling: Option<u64>) -> Result<GpuBackend, GpuError> {
         let probe = WgpuAllocProbe::new(device.device());
         let device_budget = match probe_budget(&probe) {
@@ -108,8 +106,7 @@ impl GpuBackend {
         &self.budget
     }
 
-    /// The settled device-byte budget and where it came from -- `"cpu"`-path
-    /// runs never call this; `crates/cli/src/gpu.rs` is the one caller.
+    /// The settled device-byte budget and where it came from.
     pub fn device_budget(&self) -> DeviceBudget {
         self.device_budget
     }
@@ -325,12 +322,7 @@ impl TileBackend for GpuBackend {
     }
 
     fn device_lost(&self) -> bool {
-        // wgpu queues the device-lost callback and runs it from a poll, so
-        // without this non-blocking maintain a loss would only become
-        // visible at the next tile's own blocking readback -- one tile too
-        // late to keep off the device.
-        let _ = self.device.device().poll(wgpu::PollType::Poll);
-        errors::device_lost()
+        self.device.lost()
     }
 }
 
@@ -365,20 +357,13 @@ impl std::fmt::Display for GpuBackend {
     }
 }
 
-/// `OnceLock<Result<..>>`, not `OnceLock<GpuBackend>`: probing can itself
-/// fail (`GpuError::VramExhausted`), and this is the same
-/// initialiser-returns-its-error-instead-of-unwinding pattern
-/// `device::SHARED` already uses, for the same reason -- no lock poisons,
-/// every later caller observes the same stored `Err`.
+/// Stores the `Result` so a failed probe (`GpuError::VramExhausted`) never
+/// poisons the lock: every later caller sees the same `Err`.
 static GPU_BACKEND: OnceLock<Result<GpuBackend, GpuError>> = OnceLock::new();
 
 /// The process-wide GPU backend, probed once atop [`shared_device`] and
-/// capped to `max_vram` -- no test builds its own. **The first caller wins
-/// on the ceiling**: the probe and the cap both happen inside the
-/// [`OnceLock`]'s initializer, so a second call with a different `max_vram`
-/// reuses the first call's already-settled result rather than re-probing.
-/// `crates/cli` calls this exactly once per process, so this is never
-/// actually observed there.
+/// capped to `max_vram`. The first caller's `max_vram` wins: later calls
+/// reuse the settled result without re-probing.
 pub fn gpu_backend_capped(max_vram: Option<u64>) -> Result<&'static GpuBackend, &'static GpuError> {
     let device = shared_device()?;
     GPU_BACKEND
@@ -386,8 +371,7 @@ pub fn gpu_backend_capped(max_vram: Option<u64>) -> Result<&'static GpuBackend, 
         .as_ref()
 }
 
-/// [`gpu_backend_capped`] with no ceiling -- every existing caller that has
-/// no `--max-vram` value to apply.
+/// [`gpu_backend_capped`] with no ceiling.
 pub fn gpu_backend() -> Result<&'static GpuBackend, &'static GpuError> {
     gpu_backend_capped(None)
 }

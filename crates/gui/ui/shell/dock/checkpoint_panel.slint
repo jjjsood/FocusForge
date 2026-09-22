@@ -6,6 +6,7 @@
 // 32 px below that line, where `FFDock` draws its rule.
 
 import { Theme } from "../../theme.slint";
+import { FFButton } from "../../components/ff_button.slint";
 
 export component FFCheckpointPanel inherits Rectangle {
     callback checkpoint-export-requested();
@@ -32,42 +33,14 @@ export component FFCheckpointPanel inherits Rectangle {
             VerticalLayout {
                 alignment: center;
 
-                checkpoint-export := Rectangle {
-                    width: 122px;
-                    height: 24px;
-                    accessible-role: button;
-                    accessible-label: "Export image";
-                    accessible-enabled: false;
-                    background: Theme.surface-overlay;
-                    border-radius: Theme.radius-sm;
-
-                    HorizontalLayout {
-                        padding-left: Theme.space-2;
-                        spacing: Theme.space-1;
-                        alignment: start;
-
-                        VerticalLayout {
-                            alignment: center;
-                            Image {
-                                source: @image-url("../../../../../assets/icons/download.svg");
-                                colorize: Theme.text-disabled;
-                                width: Theme.icon-md;
-                                height: Theme.icon-md;
-                            }
-                        }
-                        Text {
-                            text: "Export image";
-                            color: Theme.text-disabled;
-                            font-size: Theme.text-body.size;
-                            font-weight: Theme.text-body.weight;
-                            vertical-alignment: center;
-                        }
-                    }
-
-                    TouchArea {
-                        enabled: false;
-                        clicked => { root.checkpoint-export-requested(); }
-                    }
+                checkpoint-export := FFButton {
+                    kind: "default";
+                    compact: true;
+                    has-icon: true;
+                    icon-source: @image-url("../../../../../assets/icons/download.svg");
+                    text: "Export image";
+                    enabled: false;
+                    clicked => { root.checkpoint-export-requested(); }
                 }
             }
         }

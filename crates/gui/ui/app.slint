@@ -17,8 +17,8 @@ import { FFCanvas } from "shell/canvas.slint";
 import { FFDock, SettingsRow, SectionHeadView, ImageRowView } from "shell/dock.slint";
 export { SettingsRow, SectionHeadView, ImageRowView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
-import { FFSettingsModal, InputRow } from "shell/settings_modal.slint";
-export { InputRow }
+import { FFSettingsModal, InputRow, FFManifestRow } from "shell/settings_modal.slint";
+export { InputRow, FFManifestRow }
 import { FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFToast } from "shell/dialogs.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
 export { ProjectCardView, RecentRowView }
@@ -335,14 +335,54 @@ export component AppWindow inherits Window {
         images-viewport-height-changed(h) => { root.images-viewport-height-changed(h); }
     }
 
+    if root.crash-notice-visible : crash-notice := FFToast {
+        x: ShellGeometry.pane-gutter;
+        y: ShellGeometry.strip-height + ShellGeometry.toolbar-height + ShellGeometry.pane-gutter;
+        toast-open: true;
+        message: root.crash-notice-title;
+        link-label: "Review";
+
+        dismissed => { root.crash-notice-dismissed(); }
+        link-activated => { root.crash-notice-review-requested(); }
+    }
+
     // Settings modal state -- pushed from Rust once at startup
     // (`src/main.rs`, `--settings-section`) and toggled through
     // `AppController::open_settings`/`close_settings`.
     in property <bool> settings-open: false;
     in property <[InputRow]> input-rows: [];
     in property <string> input-provenance: "";
+    in property <string> settings-section: "input-map";
     callback settings-open-requested();
     callback settings-close-requested();
+    callback settings-section-selected(string);
+
+    in property <[FFManifestRow]> diagnostics-rows: [];
+    in property <string> diagnostics-note: "";
+    in property <bool> diagnostics-include-minidumps: false;
+    in property <string> diagnostics-destination: "";
+    in property <string> diagnostics-status: "idle";
+    in property <string> diagnostics-message: "";
+    in property <string> diagnostics-primary-label: "Create bundle";
+    in property <bool> diagnostics-busy: false;
+    in property <bool> diagnostics-loading: false;
+    in property <length> diagnostics-manifest-scroll-offset: 0px;
+    in property <length> diagnostics-manifest-content-height: 0px;
+    in property <length> diagnostics-destination-scroll-offset: 0px;
+    callback diagnostics-minidumps-toggled(bool);
+    callback diagnostics-destination-edited(string);
+    callback diagnostics-destination-cursor-moved(length, length);
+    callback diagnostics-primary-clicked();
+    callback diagnostics-manifest-scrollbar-pointer(int, length);
+    callback diagnostics-manifest-scrollbar-dragged(length);
+    callback diagnostics-manifest-viewport-height-changed(length);
+    callback diagnostics-manifest-scrolled(length);
+
+    in property <bool> crash-notice-visible: false;
+    in property <string> crash-notice-title: "";
+    callback crash-notice-dismissed();
+    callback crash-notice-review-requested();
+
     // The bottom bar's zoom cluster -- governs both panes, which is why it
     // lives at the root rather than inside `FFPane`.
     // Greys out together with the rest of the chrome via the single
@@ -434,8 +474,30 @@ export component AppWindow inherits Window {
         settings-open: root.settings-open;
         input-rows: root.input-rows;
         input-provenance: root.input-provenance;
+        settings-section: root.settings-section;
+        diagnostics-rows: root.diagnostics-rows;
+        diagnostics-note: root.diagnostics-note;
+        diagnostics-include-minidumps: root.diagnostics-include-minidumps;
+        diagnostics-destination: root.diagnostics-destination;
+        diagnostics-status: root.diagnostics-status;
+        diagnostics-message: root.diagnostics-message;
+        diagnostics-primary-label: root.diagnostics-primary-label;
+        diagnostics-busy: root.diagnostics-busy;
+        diagnostics-loading: root.diagnostics-loading;
+        diagnostics-manifest-scroll-offset: root.diagnostics-manifest-scroll-offset;
+        diagnostics-manifest-content-height: root.diagnostics-manifest-content-height;
+        diagnostics-destination-scroll-offset: root.diagnostics-destination-scroll-offset;
 
         settings-close-requested => { root.settings-close-requested(); }
+        settings-section-selected(s) => { root.settings-section-selected(s); }
+        diagnostics-minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
+        diagnostics-destination-edited(t) => { root.diagnostics-destination-edited(t); }
+        diagnostics-destination-cursor-moved(x, w) => { root.diagnostics-destination-cursor-moved(x, w); }
+        diagnostics-primary-clicked => { root.diagnostics-primary-clicked(); }
+        diagnostics-manifest-scrollbar-pointer(kind, y) => { root.diagnostics-manifest-scrollbar-pointer(kind, y); }
+        diagnostics-manifest-scrollbar-dragged(y) => { root.diagnostics-manifest-scrollbar-dragged(y); }
+        diagnostics-manifest-viewport-height-changed(h) => { root.diagnostics-manifest-viewport-height-changed(h); }
+        diagnostics-manifest-scrolled(delta) => { root.diagnostics-manifest-scrolled(delta); }
     }
 
     // The one grouping question and the two refusals the entry path can

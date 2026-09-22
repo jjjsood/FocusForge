@@ -314,6 +314,141 @@ fn maximize_glyph_reflects_the_maximized_state() {
     );
 }
 
+/// `FFManifestList`'s own rect, found by type since the panel gives its one
+/// instance no local id.
+fn manifest_list_rect(app: &AppWindow) -> (f32, f32, f32, f32) {
+    let handle = ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFManifestList")
+        .find_first()
+        .expect("no FFManifestList element found");
+    let pos = handle.absolute_position();
+    let size = handle.size();
+    (pos.x, pos.y, size.width, size.height)
+}
+
+fn manifest_row(name: &str) -> focusforge_gui::FFManifestRow {
+    focusforge_gui::FFManifestRow {
+        name: name.into(),
+        value: "1 KB".into(),
+        not_redacted: false,
+    }
+}
+
+/// The footer sits at one position throughout every state the diagnostics
+/// panel can show, and the manifest list's own size never grows with its
+/// row count -- both load-bearing for the boards' "every row present in
+/// every state" layout.
+#[test]
+fn diagnostics_panel_footer_and_list_are_stable_across_states() {
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    app.set_settings_section("diagnostics".into());
+
+    let one_row = std::rc::Rc::new(slint::VecModel::from(vec![manifest_row("adapter.json")]));
+    app.set_diagnostics_rows(one_row.into());
+
+    let footer_id = "FFDiagnosticsPanel::footer";
+    let idle = rect(&app, footer_id);
+    let (_, _, idle_width, idle_height) = manifest_list_rect(&app);
+
+    app.set_diagnostics_include_minidumps(true);
+    assert_rect(&app, footer_id, idle);
+
+    app.set_diagnostics_status("existing-file".into());
+    app.set_diagnostics_message(
+        "This file already exists. Creating the bundle will overwrite it.".into(),
+    );
+    app.set_diagnostics_primary_label("Overwrite and create".into());
+    assert_rect(&app, footer_id, idle);
+
+    app.set_diagnostics_status("writing".into());
+    app.set_diagnostics_busy(true);
+    app.set_diagnostics_primary_label("Writing…".into());
+    assert_rect(&app, footer_id, idle);
+
+    app.set_diagnostics_status("written".into());
+    app.set_diagnostics_busy(false);
+    app.set_diagnostics_message("Bundle created successfully.".into());
+    app.set_diagnostics_primary_label("Create bundle".into());
+    assert_rect(&app, footer_id, idle);
+
+    app.set_diagnostics_status("failed".into());
+    app.set_diagnostics_message("Could not write the bundle. Nothing was written.".into());
+    app.set_diagnostics_primary_label("Create bundle".into());
+    assert_rect(&app, footer_id, idle);
+
+    let many_rows = std::rc::Rc::new(slint::VecModel::from(
+        (0..12)
+            .map(|i| manifest_row(&format!("entry-{i}.json")))
+            .collect::<Vec<_>>(),
+    ));
+    app.set_diagnostics_rows(many_rows.into());
+    let (_, _, width, height) = manifest_list_rect(&app);
+    assert!(
+        (width - idle_width).abs() < EPS && (height - idle_height).abs() < EPS,
+        "the manifest list's own size must not grow with the row count: got {width}x{height}, expected {idle_width}x{idle_height}"
+    );
+}
+
+/// While no scan has completed, the footer stays at its idle position and
+/// only the primary action disables -- the toggle and destination field are
+/// bound on `busy` alone and stay live throughout.
+#[test]
+fn diagnostics_panel_loading() {
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    app.set_settings_section("diagnostics".into());
+
+    let footer_id = "FFDiagnosticsPanel::footer";
+    let idle = rect(&app, footer_id);
+
+    let primary_id = "FFDiagnosticsPanel::bundle-primary";
+    let primary = || {
+        ElementQuery::from_root(&app)
+            .match_id(primary_id)
+            .find_first()
+            .unwrap_or_else(|| panic!("no element matched id {primary_id:?}"))
+    };
+    assert_eq!(primary().accessible_enabled(), Some(true));
+
+    app.set_diagnostics_loading(true);
+    assert_rect(&app, footer_id, idle);
+    assert_eq!(primary().accessible_enabled(), Some(false));
+
+    app.set_diagnostics_loading(false);
+    assert_eq!(primary().accessible_enabled(), Some(true));
+}
+
+/// The toast paints at the pane gutter under the tab strip and toolbar, at
+/// its fixed size, regardless of window width; with no notice pending, no
+/// element matches its id at all -- the conditional `if` never instantiates
+/// it, rather than leaving it merely invisible.
+#[test]
+fn crash_notice_placement_and_absence() {
+    let app = app_at(1440, 900);
+    assert!(
+        ElementQuery::from_root(&app)
+            .match_id("AppWindow::crash-notice")
+            .find_first()
+            .is_none(),
+        "no element must match the toast's id while no notice is pending"
+    );
+
+    app.set_crash_notice_visible(true);
+    app.set_crash_notice_title("1 crash found".into());
+    assert_rect(&app, "AppWindow::crash-notice", (16.0, 92.0, 300.0, 84.0));
+
+    let narrow = app_at(1200, 760);
+    narrow.set_crash_notice_visible(true);
+    narrow.set_crash_notice_title("1 crash found".into());
+    let (x, y, _, _) = rect(&narrow, "AppWindow::crash-notice");
+    assert!(
+        (x - 16.0).abs() < EPS && (y - 92.0).abs() < EPS,
+        "the toast's top-left must stay at the pane gutter regardless of window width: got ({x}, {y})"
+    );
+}
+
 /// The gear carries its own persistently-boxed background -- the "icon
 /// button" catalogue entry's default state already carries a visible box --
 /// rather than a bare `TouchArea`. It does **not** share the zoom
@@ -606,7 +741,7 @@ fn dock_without_a_project_says_so() {
     assert_rect(
         &app,
         "FFCheckpointPanel::checkpoint-export",
-        (1306.0, 94.0, 122.0, 24.0),
+        (1309.0, 93.0, 119.0, 26.0),
     );
     assert_eq!(label(&app, "FFDock::no-project-note"), "No project open.");
     let rule = rect(&app, "FFDock::checkpoint-rule");

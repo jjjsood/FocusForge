@@ -155,7 +155,10 @@ export component FFToast inherits Rectangle {
     // "failure" (default): a run's own toast. "info": a plain notice, such
     // as a folder open that skipped some of what it found.
     in property <string> tone: "failure";
+    // A second, optional line below the message; hidden when empty.
+    in property <string> link-label: "";
     callback dismissed();
+    callback link-activated();
 
     width: 300px;
     height: 84px;
@@ -187,6 +190,19 @@ export component FFToast inherits Rectangle {
         font-weight: Theme.text-title.weight;
         wrap: word-wrap;
         overflow: clip;
+    }
+
+    if root.link-label != "": link-area := TouchArea {
+        x: title.x;
+        y: title.y + title.height;
+        accessible-role: button;
+        clicked => { root.link-activated(); }
+
+        Text {
+            text: root.link-label;
+            color: Theme.accent-default;
+            font-size: Theme.text-body.size;
+        }
     }
 
     dismiss-area := TouchArea {

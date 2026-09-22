@@ -10,6 +10,9 @@ workspace = true
 
 [features]
 trace = ["focusforge-diagnostics/trace"]
+# A timed trigger that destroys the shared device mid-session, for the
+# lost-device response's own tests.
+gpu-tests = ["focusforge-gpu/gpu-tests"]
 # Development-only Slint UI inspection/control endpoint. The server is idle
 # unless its feature and `SLINT_MCP_PORT` are both set; see docs/guide/gui-mcp.md.
 mcp = ["slint/mcp"]
@@ -39,3 +42,6 @@ focusforge-core = { path = "../core", features = ["test-algorithms"] }
 i-slint-backend-testing = "~1.17"
 serde_json = "1"
 tempfile = "3"
+# Reading a written bundle back, with the same pinned feature set the
+# writer uses.
+zip = { version = "8.6.0", default-features = false }
