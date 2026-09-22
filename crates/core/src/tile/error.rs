@@ -97,19 +97,6 @@ pub enum TileError {
     #[error("crop buffer size mismatch: expected {expected} u16 samples, got {got}")]
     CropBufferSize { expected: usize, got: usize },
 
-    /// A consumer answering [`super::TileConsumer::supplies_own_pixels`]
-    /// `true` was run alongside a non-noop [`super::FramePreprocess`]: that
-    /// consumer's frame-tiles are never read by the scheduler, so the
-    /// preprocess hook would silently never run for them. Refused by name
-    /// rather than silently skipped -- whoever adds the first real
-    /// preprocess stage hits this instead of an invisible gap.
-    #[error(
-        "a consumer that supplies its own pixels cannot be combined with a non-noop \
-         FramePreprocess: its frame-tiles are never read, so the preprocess hook would \
-         never run for them"
-    )]
-    PixelSupplyingConsumerNeedsNoopPreprocess,
-
     /// A host-derived, uncapped memory budget (`HostBudget::refuses_below_
     /// one_tile_set`) is smaller than one tile set -- refused by name rather
     /// than silently floored or deadlocked. An

@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Process-level coverage of the stage cache's CLI surface --
-//! two-run reuse, the `--no-cache` bypass, `cache clear`, `--only` subset
-//! selection, the identity `review` prints, and the unknown-`--only`
-//! refusal.
+//! Process-level coverage of the stage cache's CLI surface -- two-run
+//! reuse, the `--no-cache` bypass, `cache`, `--only` subset selection, the
+//! identity `review` prints, and the unknown-`--only` refusal.
 //!
 //! Every test isolates `.scratch/` with its own per-process temp directory
-//! and `.current_dir(dir)`, exactly `crates/cli/tests/job_cli.rs`'s idiom:
-//! `.scratch/stage-cache/` is cwd-relative, so two concurrent test runs
-//! sharing one `target/` must never share a cache directory either.
+//! and `.current_dir(dir)`: `.scratch/stage-cache/` is cwd-relative, so two
+//! concurrent test runs sharing one `target/` must never share a cache
+//! directory either.
 //!
 //! `--algo laplacian --align-algo dummy-align` is the one recipe here that
 //! pays for a real fusion (a few seconds over `fixtures/mantis-512`);
@@ -147,7 +146,7 @@ fn cache_entry_count(cwd: &Path) -> usize {
 /// Every staged project directory under `<cwd>/.scratch/projects/` --
 /// `job_cli.rs`'s `staged_composites`, generalized to the directory rather
 /// than the one `composite.tif` inside it, since this file needs to prove
-/// the directory itself survives a `cache clear`.
+/// the directory itself survives a `cache`.
 fn staged_project_dirs(cwd: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(cwd.join(".scratch").join("projects"))
         .into_iter()
@@ -460,7 +459,7 @@ fn no_cache_flag_forces_a_recompute() {
 
 // --- cache clear --------------------------------------------------------
 
-/// `cache clear` empties the stage cache and touches nothing else: a
+/// `cache` empties the stage cache and touches nothing else: a
 /// cancelled run's resume ledger, the sealed project, the run manifest and
 /// the tile scheduler's staging directory under `.scratch/projects/` all
 /// survive byte for byte (or, for a directory, simply survive).
@@ -512,7 +511,7 @@ fn cache_clear_removes_entries_and_nothing_else() {
         "the leftover staging directory must be visible before the clear"
     );
 
-    let clear = run_cli_in(&cwd, &["cache", "clear", "--json"]);
+    let clear = run_cli_in(&cwd, &["cache", "--json"]);
     assert!(clear.success, "stderr: {}", clear.stderr);
     let clear_report: serde_json::Value = serde_json::from_str(&clear.stdout).expect("--json");
     assert_eq!(clear_report["removed"], 1);

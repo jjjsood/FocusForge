@@ -12,16 +12,6 @@ use crate::tile::Tile;
 /// the [`super::consumer::TileConsumer`].
 pub trait FramePreprocess: Send + Sync {
     fn preprocess(&self, frame: usize, tile: &mut Tile) -> Result<(), AlgorithmError>;
-
-    /// `true` when this stage is known to do nothing -- checkable rather
-    /// than assumed, so a consumer that supplies its own pixels (and
-    /// therefore never has its per-frame tile run through this hook) can be
-    /// refused by name the moment a real preprocess stage exists, instead of
-    /// silently skipping it. Default `false`: only [`NoopPreprocess`]
-    /// overrides it.
-    fn is_noop(&self) -> bool {
-        false
-    }
 }
 
 /// Leaves the tile untouched.
@@ -30,10 +20,6 @@ pub struct NoopPreprocess;
 impl FramePreprocess for NoopPreprocess {
     fn preprocess(&self, _frame: usize, _tile: &mut Tile) -> Result<(), AlgorithmError> {
         Ok(())
-    }
-
-    fn is_noop(&self) -> bool {
-        true
     }
 }
 

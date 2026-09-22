@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `focusforge-cli`: `info`, the command that makes a claim about a TIFF
-//! file or directory checkable -- byte order, strip layout and whether the
-//! mmap fast path applies, as human text or as `--json`; and `algorithms`,
-//! which lists every registered algorithm or prints one named algorithm's
-//! full parameter schema, validating `--set key=value` against it. `info`
-//! reads headers only: never `TiffStack`, never a tile, never a pixel.
+//! `focusforge-cli` subcommands: `stack` fuses TIFF frames into a project,
+//! `align` reports per-frame transforms without fusing; `export` turns a
+//! project into an image or Z-Map file, `review` lists results under a
+//! directory of projects; `info` reports TIFF metadata, `algorithms` lists
+//! registered algorithms and their schemas; `cache` clears the stage
+//! cache, `diagnostics` bundles logs and system info into one ZIP.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -18,7 +18,6 @@ use serde::Serialize;
 mod algorithms;
 mod align;
 mod bytes;
-mod cache;
 mod diagnostics;
 mod export;
 #[cfg(feature = "gpu")]
@@ -35,11 +34,7 @@ mod status;
 
 /// Resolves whether this run takes the GPU path or the CPU one:
 /// `#[cfg(feature = "gpu")]` delegates to [`gpu::resolve_backend`]; with the
-/// feature off, always [`stack::BackendChoice::cpu()`] -- `stack`/`align`
-/// probe for nothing and stay on the CPU path unconditionally. A crate-root
-/// `fn`, not `pub(crate)`: `stack` and `align` are descendant modules of
-/// this one, so a private item here is already visible to them (the same
-/// visibility `crate::fail` already relies on).
+/// feature off, always [`stack::BackendChoice::cpu()`].
 #[cfg(feature = "gpu")]
 fn resolve_backend(
     algorithm_id: &str,
@@ -110,9 +105,7 @@ enum Command {
     /// Fuse every TIFF frame of a directory into one **project** per
     /// detected stack, through a registered stacking algorithm. A run
     /// prepares projects for review; it does not export images -- run
-    /// `focusforge-cli export` for that. `--algo` is not marked required in
-    /// clap's sense even though it is required in practice -- see
-    /// `stack::run`'s doc comment for why.
+    /// `focusforge-cli export` for that.
     Stack {
         /// Directory of TIFF frames to fuse (non-recursive, descending into
         /// `<dir>/frames` when that subdirectory exists).
@@ -121,15 +114,12 @@ enum Command {
         /// each project beside its own frames.
         #[arg(short = 'o', long = "output", value_name = "DIR")]
         output: Option<PathBuf>,
-        /// Registered stacking algorithm id. Required, but never a clap
-        /// `required` field.
+        /// Registered stacking algorithm id (`focusforge-cli algorithms`
+        /// lists them). Required unless a `--preset` supplies `algo`.
         #[arg(long)]
         algo: Option<String>,
-        /// Gone: a project carries its own Z-Map. Still **declared**, and
-        /// hidden, purely so `stack::run` can refuse it by name and point
-        /// at `focusforge-cli export` -- removing it outright would leave
-        /// clap printing "unexpected argument '--zmap'", which tells a user
-        /// nothing about where their Z-Map went.
+        /// Hidden. Declared only so `stack` can refuse it by name and point
+        /// at `focusforge-cli export`; a project carries its own Z-Map.
         #[arg(long, hide = true)]
         zmap: Option<PathBuf>,
         /// Emit the frozen JSON report instead of human-readable text.
@@ -139,15 +129,12 @@ enum Command {
         set: set::SetArgs,
         #[command(flatten)]
         group_args: groups::GroupArgs,
-        /// Skip alignment: the tile reader stays the raw stack and the
-        /// output geometry stays full-frame. Defaults to `true`
-        /// (alignment on); `--no-align` is what turns it off (clap
-        /// `ArgAction::SetFalse`, no `default_value` -- clap-rs/clap#4370).
+        /// Skip alignment: frames are fused as read and the output keeps
+        /// the full frame.
         #[arg(long = "no-align", action = clap::ArgAction::SetFalse)]
         align: bool,
-        /// Skip the auto-crop: the output stays at the full frame extent
-        /// even when alignment is on. Defaults to `true` (crop applied);
-        /// `--no-crop` is what turns it off.
+        /// Skip the auto-crop: the output keeps the full frame extent even
+        /// when alignment is on.
         #[arg(long = "no-crop", action = clap::ArgAction::SetFalse)]
         crop: bool,
         /// Soften alignment failures to an identity fallback instead of
@@ -221,25 +208,19 @@ enum Command {
         #[arg(long = "dry-run")]
         dry_run: bool,
         /// Force the CPU path even when a usable GPU adapter is available.
-        /// Only present when the `gpu` feature is compiled in -- with it
-        /// off, this flag does not exist at all, not even as a no-op.
-        /// Defaults to `true` (the GPU path is used automatically);
-        /// `--no-gpu` is what turns it off (clap `ArgAction::SetFalse`, no
-        /// `default_value` -- clap-rs/clap#4370).
+        /// Only in builds with GPU support.
         #[cfg(feature = "gpu")]
         #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
         gpu: bool,
         /// Skip the stage cache: recompute the alignment even when a valid
-        /// entry exists, and leave no entry behind. Defaults to `true` (the
-        /// cache is used); `--no-cache` is what turns it off (clap
-        /// `ArgAction::SetFalse`, no `default_value` -- clap-rs/clap#4370).
+        /// entry exists, and store no new entry.
         #[arg(long = "no-cache", action = clap::ArgAction::SetFalse)]
         cache: bool,
     },
     /// Turn a project into an image file: the composite with `-o`, the
     /// Z-Map with `--zmap`, either or both in one invocation. At least one
-    /// of the two is required. This is the only thing in the workspace that
-    /// writes a TIFF from a stack result.
+    /// of the two is required. This is the only command that writes an
+    /// image.
     Export {
         /// The `.ffp` project to read.
         project: PathBuf,
@@ -269,9 +250,7 @@ enum Command {
         json: bool,
         /// Soften a failed frame to an identity fallback and exit 0,
         /// reporting the failure count on stderr, instead of refusing the
-        /// run. Strict (the default) is not a flag -- `--lax` has no
-        /// opposite to be confused with, unlike a `--no-strict` that would
-        /// imply a nonexistent `--strict`.
+        /// run.
         #[arg(long)]
         lax: bool,
         /// Write one warped TIFF per frame into this directory, at source
@@ -320,10 +299,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Manage the stage cache under `.scratch/stage-cache/`.
+    /// Remove every entry from the stage cache under
+    /// `.scratch/stage-cache/`. Never touches `.scratch/resume/` or any
+    /// project.
     Cache {
-        #[command(subcommand)]
-        action: cache::CacheAction,
+        /// Emit the frozen JSON report instead of human-readable text.
+        #[arg(long)]
+        json: bool,
     },
     /// Package this installation's logs, crash reports, system summary,
     /// graphics adapter record, effective configuration and version into
@@ -489,13 +471,44 @@ fn main() -> ExitCode {
             )
         }
         Command::Review { dir, json } => review::run(&dir, json),
-        Command::Cache { action } => cache::run(action),
+        Command::Cache { json } => cache_clear(json),
         Command::Diagnostics {
             output,
             include_minidumps,
             force,
         } => diagnostics::run(output.as_deref(), include_minidumps, force),
     }
+}
+
+/// The frozen `cache --json` schema.
+#[derive(Serialize)]
+struct CacheClearReport {
+    format: u32,
+    removed: usize,
+}
+
+fn cache_clear(json: bool) -> ExitCode {
+    let cache = match focusforge_core::job::StageCache::open(Path::new(".scratch")) {
+        Ok(cache) => cache,
+        Err(err) => return fail(err.to_string()),
+    };
+    let removed = match cache.clear() {
+        Ok(removed) => removed,
+        Err(err) => return fail(err.to_string()),
+    };
+    if json {
+        let report = CacheClearReport { format: 1, removed };
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(err) => return fail(format!("failed to serialize JSON: {err}")),
+        }
+    } else {
+        println!(
+            "removed {removed} stage cache entr{}",
+            if removed == 1 { "y" } else { "ies" }
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 /// One directory member's metadata, or the reason it has none.
