@@ -2763,6 +2763,33 @@ impl AppController {
         })
     }
 
+    /// Refuses a run whose recorded frame is no longer on disk, naming it
+    /// in the message -- shared by [`Self::start_fuse`] and the queue
+    /// promotion [`Self::settle_job`] runs.
+    fn refuse_missing_frame(&mut self, missing: &Path) {
+        self.refuse_message(format!(
+            "{} is no longer on disk. This project cannot be fused again until it is back.",
+            missing.display()
+        ));
+    }
+
+    /// If another run is live, enqueues tab `id` unless it already holds
+    /// the live run or a queue slot -- the shared tail of [`Self::start_fuse`]
+    /// and [`Self::retry_fuse`]. `None` when no run is live, so the caller
+    /// falls through to starting immediately.
+    fn try_enqueue(&mut self, id: u64) -> Option<bool> {
+        if !self.any_job_running() {
+            return None;
+        }
+        if self.job.tab_id == Some(id) || self.job.queue.contains(&id) {
+            return Some(false);
+        }
+        self.job.queue.push_back(id);
+        self.renumber_queue();
+        self.emit(ShellEvent::JobChanged);
+        Some(true)
+    }
+
     /// Starts a fuse run on the active tab, off the UI thread -- refuses
     /// while the tab carries a settings violation or a recorded frame is
     /// missing, checked before anything else so an invalid tab is never
@@ -2781,22 +2808,11 @@ impl AppController {
         }
         let frames = tab.included_frames();
         if let Some(missing) = frames.iter().find(|path| !path.is_file()) {
-            let message = format!(
-                "{} is no longer on disk. This project cannot be fused again until it is back.",
-                missing.display()
-            );
-            self.refuse_message(message);
+            self.refuse_missing_frame(missing);
             return false;
         }
-        if self.any_job_running() {
-            let id = tab.id;
-            if self.job.tab_id == Some(id) || self.job.queue.contains(&id) {
-                return false;
-            }
-            self.job.queue.push_back(id);
-            self.renumber_queue();
-            self.emit(ShellEvent::JobChanged);
-            return true;
+        if let Some(enqueued) = self.try_enqueue(tab.id) {
+            return enqueued;
         }
         let Some(request) = self.fuse_request_for(active) else {
             return false;
@@ -2887,15 +2903,9 @@ impl AppController {
         let Some(request) = tab.request.clone() else {
             return false;
         };
-        if self.any_job_running() {
-            let id = tab.id;
-            if self.job.tab_id == Some(id) || self.job.queue.contains(&id) {
-                return false;
-            }
-            self.job.queue.push_back(id);
-            self.renumber_queue();
-            self.emit(ShellEvent::JobChanged);
-            return true;
+        let id = tab.id;
+        if let Some(enqueued) = self.try_enqueue(id) {
+            return enqueued;
         }
         self.run_request(active, request);
         true
@@ -3095,11 +3105,7 @@ impl AppController {
                 .get(index)
                 .and_then(|tab| tab.included_frames().into_iter().find(|p| !p.is_file()));
             if let Some(missing) = missing {
-                let message = format!(
-                    "{} is no longer on disk. This project cannot be fused again until it is back.",
-                    missing.display()
-                );
-                self.refuse_message(message);
+                self.refuse_missing_frame(&missing);
                 continue;
             }
             let Some(request) = self.fuse_request_for(index) else {
