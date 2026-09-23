@@ -1030,8 +1030,8 @@ fn pane_placeholder_shows_only_until_the_first_fuse() {
 
         // A mid-run bottom-bar state must not move or hide the placeholder
         // -- it reads no run property.
-        app.set_stage_word("Fusing".into());
-        app.set_step_text("step 2 of 3".into());
+        app.set_stage_word("Aligning".into());
+        app.set_step_text("42 of 61".into());
         app.set_bar_fraction(0.62);
         app.set_bar_tone("running".into());
         let placeholder_after = ElementQuery::from_root(&app)

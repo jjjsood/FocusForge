@@ -89,10 +89,10 @@ const TOOLBAR_STATES: [&str; 5] = ["idle", "running", "paused", "cancelling", "f
 fn apply_toolbar_state_preview(app: &AppWindow, state: &str) {
     app.set_toolbar_run_state(state.into());
     let (stage_word, step_text, fraction, tone, eta) = match state {
-        "running" => ("Fusing", "step 2 of 3", 0.62, "running", "ETA 1:12"),
-        "paused" => ("Paused", "step 2 of 3", 0.62, "held", "ETA —"),
-        "cancelling" => ("Cancelling", "step 1 of 3", 0.0, "held", "ETA —"),
-        "failed" => ("Failed", "step 1 of 3", 0.28, "failed", "ETA —"),
+        "running" => ("Aligning", "42 of 61", 0.62, "running", "ETA 1:12"),
+        "paused" => ("Paused", "", 0.62, "held", "ETA —"),
+        "cancelling" => ("Cancelling", "", 0.0, "held", "ETA —"),
+        "failed" => ("Failed", "", 0.28, "failed", "ETA —"),
         _ => ("", "", 0.0, "held", ""),
     };
     app.set_stage_word(stage_word.into());

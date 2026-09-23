@@ -1826,18 +1826,9 @@ impl AppController {
         for (i, tab) in self.state.projects.iter().enumerate() {
             let fusing = running == Some(i);
             let frame_count = entry::tab_frame_count(&tab.project);
-            let fusing_step = if fusing {
-                let text = job::step_text(&tab.run, progress.as_ref());
-                (!text.is_empty()).then(|| {
-                    format!(
-                        "{}, {}",
-                        job::stage_word(&tab.run, progress.as_ref()).to_lowercase(),
-                        text
-                    )
-                })
-            } else {
-                None
-            };
+            let fusing_step = fusing
+                .then(|| job::phase_line(&tab.run, progress.as_ref()))
+                .flatten();
             let (x, y) = overlay::card_origin(cards.len(), columns);
             cards.push(CardView {
                 kind: "open".to_string(),
@@ -3147,7 +3138,7 @@ impl AppController {
         JobView {
             toolbar_run_state: job::toolbar_run_state(&run).to_string(),
             stage_word: job::stage_word(&run, progress.as_ref()),
-            step_text: job::step_text(&run, progress.as_ref()),
+            step_text: job::progress_text(&run, progress.as_ref()),
             eta_text: job::eta_text(&run, progress.as_ref()),
             bar_tone: job::bar_tone(&run).to_string(),
             fraction: job::bar_fraction(progress.as_ref()),
@@ -3199,11 +3190,11 @@ impl AppController {
             self.job.handle = Some(handle);
             return None;
         }
-        // Read before the observer is cleared below: the step this run was
+        // Read before the observer is cleared below: the phase this run was
         // on when it stopped is what a failure or cancellation card's own
         // stage line names.
         let progress = self.job.observer.as_ref().and_then(|o| o.last_progress());
-        let step = job::progress_step(progress.as_ref());
+        let phase = job::progress_phase(progress.as_ref());
         let tab_index = self.job.tab_id.take().and_then(|id| self.tab_index(id));
         let owner = tab_index.and_then(|i| self.state.projects.get(i));
         let request = owner.and_then(|tab| tab.request.clone());
@@ -3236,7 +3227,7 @@ impl AppController {
                         kind: FailureKind::Failed,
                         path,
                         title,
-                        stage: format!("FAILED WHILE {}", step_verb(step)),
+                        stage: format!("FAILED WHILE {}", phase.name().to_uppercase()),
                         reason: message.clone(),
                         meta: format!(
                             "{frame_count} {} · no project written",
@@ -3253,7 +3244,7 @@ impl AppController {
                         kind: FailureKind::Cancelled,
                         path,
                         title,
-                        stage: format!("STOPPED WHILE {}", step_verb(step)),
+                        stage: format!("STOPPED WHILE {}", phase.name().to_uppercase()),
                         reason: "You stopped this one. Nothing was written.".to_string(),
                         meta: format!(
                             "{frame_count} {} · stopped before writing",
@@ -4035,19 +4026,9 @@ fn not_a_project_card(path: PathBuf) -> FailureCard {
     }
 }
 
-/// `job::Step`'s own uppercase present-participle, for a failure or
-/// cancellation card's stage line (`"FAILED WHILE ALIGNING"`).
-fn step_verb(step: job::Step) -> &'static str {
-    match step {
-        job::Step::Align => "ALIGNING",
-        job::Step::Fuse => "FUSING",
-        job::Step::Write => "WRITING",
-    }
-}
-
 /// An open card's second meta line: `fusing_step` (already rendered, e.g.
-/// `"fusing, step 2 of 3"`) while a run is live against this tab, otherwise
-/// the checkpoint count -- `"no checkpoint yet"` at zero.
+/// `"aligning, 3 of 8"` or `"fusing"`) while a run is live against this tab,
+/// otherwise the checkpoint count -- `"no checkpoint yet"` at zero.
 fn open_card_meta(frame_count: u32, checkpoints: usize, fusing_step: Option<&str>) -> String {
     let frames = frame_word(frame_count as usize);
     if let Some(step) = fusing_step {

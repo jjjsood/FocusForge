@@ -305,6 +305,75 @@ fn running_project_shows_progress_on_its_card() {
     wait_for_settle(&mut controller, Duration::from_secs(120));
 }
 
+fn align_progress(align_done: usize, align_total: usize) -> focusforge_core::job::JobProgress {
+    use focusforge_core::job::JobStage;
+    focusforge_core::job::JobProgress {
+        stage: JobStage::Align,
+        units_done: 0,
+        unit_total: 0,
+        pixels_done: 0,
+        pixel_total: 0,
+        running: Duration::ZERO,
+        eta: None,
+        align_done,
+        align_total,
+    }
+}
+
+fn fuse_progress(units_done: usize, unit_total: usize) -> focusforge_core::job::JobProgress {
+    use focusforge_core::job::JobStage;
+    focusforge_core::job::JobProgress {
+        stage: JobStage::Fuse,
+        units_done,
+        unit_total,
+        pixels_done: 0,
+        pixel_total: 0,
+        running: Duration::ZERO,
+        eta: None,
+        align_done: 0,
+        align_total: 0,
+    }
+}
+
+#[test]
+fn live_card_meta_names_the_phase() {
+    use focusforge_gui::job::{self, RunState};
+
+    assert_eq!(
+        job::phase_line(&RunState::Running, Some(&align_progress(3, 8))).as_deref(),
+        Some("aligning, 3 of 8")
+    );
+    assert_eq!(
+        job::phase_line(&RunState::Running, Some(&align_progress(0, 0))).as_deref(),
+        Some("aligning")
+    );
+    assert_eq!(
+        job::phase_line(&RunState::Running, Some(&fuse_progress(4, 10))).as_deref(),
+        Some("fusing")
+    );
+    assert_eq!(
+        job::phase_line(&RunState::Running, Some(&fuse_progress(10, 10))).as_deref(),
+        Some("writing")
+    );
+
+    let mut controller = controller_with_frames("live_card_meta", 2);
+    assert!(controller.start_fuse());
+    let cards = controller.project_cards();
+    let card = card_by_kind(&cards, "open");
+    assert!(
+        card.meta_text.starts_with("2 frames · "),
+        "meta text must open with the frame count: {}",
+        card.meta_text
+    );
+    assert!(
+        !card.meta_text.contains("step"),
+        "meta text must never contain 'step': {}",
+        card.meta_text
+    );
+
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+}
+
 #[test]
 fn clicking_a_card_switches_to_it() {
     let mut controller = controller_with_frames("click_switch", 2);
