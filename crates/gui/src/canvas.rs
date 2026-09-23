@@ -9,6 +9,8 @@
 //! `crates/gui/src/gpu_canvas.rs`, the only module in the crate naming
 //! `wgpu` or `slint::wgpu_29`.
 
+use std::cell::Cell;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use focusforge_core::TiffError;
@@ -140,14 +142,40 @@ impl FrameSource {
             .map(|(_, stack)| stack.header(0).samples_per_pixel)
     }
 
-    /// Reads `rect`'s pixels into `out`. Callers check [`Self::dimensions`]
-    /// first, so a frame is always open by the time this runs.
-    pub fn read_into(&self, rect: Rect, out: &mut [u16]) -> Result<(), TiffError> {
+    /// Reads every `step`-th row and column of `rect` into `out`. Callers
+    /// check [`Self::dimensions`] first, so a frame is always open by the
+    /// time this runs.
+    pub fn read_into(
+        &self,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [u16],
+    ) -> Result<(), TiffError> {
         let (_, stack) = self
             .open
             .as_ref()
             .expect("read_into is only called once a frame is confirmed open");
-        stack.read_tile_into(0, rect, out)
+        stack.read_tile_step_into(0, rect, step, out)
+    }
+}
+
+/// Collapses many repaint requests into one scheduled repaint: `request`
+/// answers `true` only for the first request since the last `take`, which is
+/// the caller's cue to schedule the one repaint that will `take` it.
+#[derive(Debug, Default)]
+pub struct RepaintGate {
+    pending: Cell<bool>,
+}
+
+impl RepaintGate {
+    /// Marks a repaint as wanted; `true` when none was pending yet.
+    pub fn request(&self) -> bool {
+        !self.pending.replace(true)
+    }
+
+    /// Clears the pending mark; `true` when a repaint was pending.
+    pub fn take(&self) -> bool {
+        self.pending.replace(false)
     }
 }
 

@@ -11,6 +11,8 @@
 //! ~0.0005 source px, and the anchor criterion is stated in whole screen
 //! pixels, so `f64` costs nothing and removes the question.
 
+use std::num::NonZeroU32;
+
 /// One pane in canvas-ground logical pixels -- the coordinate space
 /// `TouchArea::mouse-x` reports in. Both panes are always the same size,
 /// differing only in `x`/`y` (`ui/shell/canvas.slint`), so every function
@@ -119,7 +121,7 @@ fn ladder_index(ladder: &[f64], scale: f64) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PaneDraw {
     /// `(x, y, width, height)` in source pixels -- what `crate::canvas`
-    /// hands the composite/Z-Map tile readers' own `read_tile_into`.
+    /// hands the composite/Z-Map tile readers' stepped reads.
     pub src: (u32, u32, u32, u32),
     /// `(x, y, width, height)` in pane-local logical px -- `FFPane::image-x/
     /// image-y/image-w/image-h`. The two panes share one viewport, not one
@@ -130,6 +132,20 @@ pub struct PaneDraw {
     pub dst: (f32, f32, f32, f32),
     /// `pixelated` at or above 100 %, `smooth` below it.
     pub pixelated: bool,
+    /// Every `step`-th source row and column of `src` is read:
+    /// `max(1, floor(1 / scale))`, so a zoomed-out draw reads at least one
+    /// sample per pane pixel and under two per axis, and 1 at or above 100 %.
+    pub step: NonZeroU32,
+}
+
+impl PaneDraw {
+    /// The decimated texture size, `src`'s sides divided by `step`, rounded
+    /// up. `extent * step` overshoots `src` by under one step, which is under
+    /// one logical pixel once stretched over `dst`.
+    pub fn extent(&self) -> (u32, u32) {
+        let step = self.step.get();
+        (self.src.2.div_ceil(step), self.src.3.div_ceil(step))
+    }
 }
 
 impl Viewport {
@@ -260,10 +276,13 @@ impl Viewport {
             ((sx1 - sx0) * self.scale) as f32,
             ((sy1 - sy0) * self.scale) as f32,
         );
+        // The epsilon lands the 50 % and 25 % stops on exactly 2 and 4.
+        let step = (1.0 / self.scale + 1e-6).floor().max(1.0) as u32;
         Some(PaneDraw {
             src,
             dst,
             pixelated: self.scale >= 1.0,
+            step: NonZeroU32::new(step).expect("step is clamped to at least 1"),
         })
     }
 

@@ -248,7 +248,8 @@ impl CanvasRenderer {
         self.last_frame = None;
     }
 
-    /// Re-reads and re-uploads `draw.src` for both planes, returning the two
+    /// Re-reads and re-uploads `draw.src` for both planes, every `draw.step`-th
+    /// row and column into a `draw.extent()`-sized texture, returning the two
     /// `slint::Image`s to bind to `FFPane::source`. A no-op (besides
     /// re-cloning the two already-current images) when `draw` is exactly
     /// what was last drawn -- a gesture that changes nothing costs nothing.
@@ -281,27 +282,34 @@ impl CanvasRenderer {
             height,
         };
 
-        let mut samples = vec![0u16; (width * height * samples_per_pixel) as usize];
-        composite.read_tile_into(0, rect, &mut samples).ok()?;
+        let (tex_w, tex_h) = draw.extent();
+        let texels = tex_w as usize * tex_h as usize;
+
+        let mut samples = vec![0u16; texels * samples_per_pixel as usize];
+        composite
+            .read_tile_step_into(0, rect, draw.step, &mut samples)
+            .ok()?;
         self.composite_pane.ensure_and_render(
             self.shared,
-            width,
-            height,
+            tex_w,
+            tex_h,
             &samples,
             samples_per_pixel,
             0,
         );
 
-        let mut indices = vec![0u16; (width * height) as usize];
-        zmap.read_tile_into(rect, &mut indices).ok()?;
+        let mut indices = vec![0u16; texels];
+        zmap.read_tile_step_into(rect, draw.step, &mut indices)
+            .ok()?;
         self.zmap_pane
-            .ensure_and_render(self.shared, width, height, &indices, 1, index_scale);
+            .ensure_and_render(self.shared, tex_w, tex_h, &indices, 1, index_scale);
 
         self.last_planes = Some(*draw);
         Some((self.composite_pane.image(), self.zmap_pane.image()))
     }
 
-    /// Re-reads and re-uploads `draw.src` for the frame pane, returning the
+    /// Re-reads and re-uploads `draw.src` for the frame pane, decimated as in
+    /// [`Self::redraw_planes`], returning the
     /// `slint::Image` to bind to `FFPane::source`. `None` with no frame
     /// open, when `draw.src` falls outside it, or the read fails;
     /// `self.last_frame` stays untouched on that path so a later, valid
@@ -325,12 +333,13 @@ impl CanvasRenderer {
             height,
         };
 
-        let mut samples = vec![0u16; (width * height * samples_per_pixel) as usize];
-        self.frame.read_into(rect, &mut samples).ok()?;
+        let (tex_w, tex_h) = draw.extent();
+        let mut samples = vec![0u16; tex_w as usize * tex_h as usize * samples_per_pixel as usize];
+        self.frame.read_into(rect, draw.step, &mut samples).ok()?;
         self.frame_pane.ensure_and_render(
             self.shared,
-            width,
-            height,
+            tex_w,
+            tex_h,
             &samples,
             samples_per_pixel,
             0,

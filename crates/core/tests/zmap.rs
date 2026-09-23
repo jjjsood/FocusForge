@@ -8,6 +8,7 @@
 
 mod common;
 
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use focusforge_core::io::{Rect, TiffError, TiffSpec, TiffWriter};
@@ -73,6 +74,67 @@ fn roundtrip_is_bit_identical() {
             .expect("read_tile_into must succeed");
     }
     assert_eq!(actual, expected, "round trip must be bit-identical");
+}
+
+#[test]
+fn stepped_read_is_the_step1_read_subsampled() {
+    let path = scratch_path("zmap_stepped.tif");
+    let width = 23;
+    let height = 19;
+    let frame_count = 7;
+    let info = ZMapInfo::new(width, height, frame_count).unwrap();
+    let map: Vec<u16> = (0..width * height)
+        .map(|i| {
+            if i % 5 == 0 {
+                NO_SOURCE
+            } else {
+                (i % frame_count) as u16
+            }
+        })
+        .collect();
+    let mut writer = ZMapWriter::create(&path, info).unwrap();
+    writer
+        .write_tile(
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            &map,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = ZMapReader::open(&path).unwrap();
+    let rect = Rect {
+        x: 2,
+        y: 1,
+        width: 21,
+        height: 18,
+    };
+    let mut full = vec![0u16; (rect.width * rect.height) as usize];
+    reader.read_tile_into(rect, &mut full).unwrap();
+    for step in [2u32, 3, 7] {
+        let expected: Vec<u16> = (0..rect.height)
+            .step_by(step as usize)
+            .flat_map(|r| {
+                (0..rect.width)
+                    .step_by(step as usize)
+                    .map(move |c| (r * rect.width + c) as usize)
+            })
+            .map(|i| full[i])
+            .collect();
+        assert!(
+            expected.contains(&NO_SOURCE),
+            "step {step} must keep NO_SOURCE"
+        );
+        let mut out = vec![0u16; expected.len()];
+        reader
+            .read_tile_step_into(rect, NonZeroU32::new(step).unwrap(), &mut out)
+            .unwrap();
+        assert_eq!(out, expected, "step {step}");
+    }
 }
 
 #[test]
@@ -163,9 +225,7 @@ fn rejects_a_three_channel_file() {
 #[test]
 fn rejects_file_with_out_of_range_index() {
     let path = scratch_path("zmap_bad_index.tif");
-    // Built with a raw TiffWriter -- ZMapWriter refuses to produce this
-    // file, which is exactly what makes the write-side and read-side
-    // validators two call sites of one function rather than one check.
+    // Built with a raw TiffWriter because ZMapWriter refuses this file.
     let width = 4;
     let height = 4;
     let mut writer = TiffWriter::create(

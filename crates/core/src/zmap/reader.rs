@@ -6,6 +6,7 @@
 //! is per-tile on [`ZMapReader::read_tile_into`], plus the explicit opt-in
 //! full scan [`ZMapReader::validate_all`].
 
+use std::num::NonZeroU32;
 use std::path::Path;
 
 use crate::io::TiffStack;
@@ -61,7 +62,20 @@ impl ZMapReader {
     /// `read_tile -> Tile` convenience: the caller owns the buffer, and this
     /// one accessor is what keeps the "no whole map" grep criterion honest.
     pub fn read_tile_into(&self, rect: Rect, out: &mut [u16]) -> Result<(), ZMapError> {
-        self.stack.read_tile_into(0, rect, out)?;
+        self.read_tile_step_into(rect, NonZeroU32::MIN, out)
+    }
+
+    /// Read every `step`-th row and column of `rect` into `out` (exactly
+    /// `rect.width.div_ceil(step) * rect.height.div_ceil(step)` `u16`s), then
+    /// validate them. Decimation picks indices, never blends them, so every
+    /// value returned is one the map holds.
+    pub fn read_tile_step_into(
+        &self,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [u16],
+    ) -> Result<(), ZMapError> {
+        self.stack.read_tile_step_into(0, rect, step, out)?;
         validate_tile(out, self.info.frame_count())?;
         Ok(())
     }

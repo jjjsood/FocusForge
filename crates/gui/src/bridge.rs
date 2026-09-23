@@ -17,7 +17,7 @@ use slint::winit_030::{CustomApplicationHandler, EventResult, WinitWindowAccesso
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
-use crate::canvas::CanvasFeed;
+use crate::canvas::{CanvasFeed, RepaintGate};
 use crate::controller::{
     AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, OpenOutcome,
     SettingsSection, ShellEvent, ShellMode,
@@ -258,9 +258,8 @@ pub fn repaint(
 
 /// Locks `controller`, runs `mutate` against it, then repaints if the
 /// window is still alive -- the "gesture becomes a redraw" tail shared by
-/// every viewport callback below (`on_canvas_scrolled`, `on_canvas_pointer`,
-/// `on_canvas_dragged`, `on_zoom_in_requested`, `on_zoom_out_requested`,
-/// `on_zoom_fit_requested`).
+/// the wheel and zoom-button callbacks below (`on_canvas_scrolled`,
+/// `on_zoom_in_requested`, `on_zoom_out_requested`, `on_zoom_fit_requested`).
 fn dispatch(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
@@ -271,6 +270,35 @@ fn dispatch(
     if let Some(app) = app_weak.upgrade() {
         repaint(&app, controller, canvas);
     }
+}
+
+/// [`dispatch`] for pointer events: `mutate` runs at once, the repaint is
+/// deferred to one zero-delay timer, so every pointer event delivered before
+/// it fires shares one repaint and a drag costs one per event-loop turn.
+fn dispatch_coalesced(
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+    app_weak: &slint::Weak<AppWindow>,
+    gate: &Rc<RepaintGate>,
+    mutate: impl FnOnce(&mut AppController),
+) {
+    mutate(&mut controller.lock().unwrap());
+    if !gate.request() {
+        return;
+    }
+    let (controller, canvas, app_weak, gate) = (
+        controller.clone(),
+        canvas.clone(),
+        app_weak.clone(),
+        gate.clone(),
+    );
+    slint::Timer::single_shot(Duration::ZERO, move || {
+        if gate.take()
+            && let Some(app) = app_weak.upgrade()
+        {
+            repaint(&app, &controller, &canvas);
+        }
+    });
 }
 
 /// Reads `FFCanvas`'s five geometry `out` properties (mirrored at the root)
@@ -1031,12 +1059,14 @@ pub fn install(
             });
         }
     });
+    let pointer_repaint = Rc::new(RepaintGate::default());
     app.on_canvas_pointer({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let gate = pointer_repaint.clone();
         move |btn, kind, x, y, ctrl, shift, alt| {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
+            dispatch_coalesced(&controller, &canvas, &app_weak, &gate, |controller| {
                 let mods = modifiers(controller, ctrl, shift, alt);
                 // `kind` is `ui/shell/canvas.slint`'s fold of `PointerEventKind`:
                 // 0 = Down, 1 = Up or Cancel, 2 = Move. `Move` fires on every
@@ -1058,9 +1088,15 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move |x, y| {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
-                controller.pointer_moved(x, y);
-            });
+            dispatch_coalesced(
+                &controller,
+                &canvas,
+                &app_weak,
+                &pointer_repaint,
+                |controller| {
+                    controller.pointer_moved(x, y);
+                },
+            );
         }
     });
     app.on_canvas_resized({

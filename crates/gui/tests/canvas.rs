@@ -13,8 +13,8 @@ use std::time::Duration;
 use focusforge_core::io::TiffHeader;
 use focusforge_gui::AppWindow;
 use focusforge_gui::canvas::{
-    CanvasFeed, DISPLAY_FORMAT, FrameSource, TextureSpec, draw_rect_fits, needs_realloc,
-    validate_display_format,
+    CanvasFeed, DISPLAY_FORMAT, FrameSource, RepaintGate, TextureSpec, draw_rect_fits,
+    needs_realloc, validate_display_format,
 };
 use focusforge_gui::viewport::PaneRect;
 use focusforge_gui::{AppController, OpenOutcome};
@@ -129,6 +129,18 @@ fn texture_is_reused_across_frames() {
         needs_realloc(None, a),
         "no current texture must trigger a (first) allocation"
     );
+}
+
+#[test]
+fn repaint_gate_collapses_requests_until_taken() {
+    let gate = RepaintGate::default();
+    assert!(gate.request(), "the first request schedules a repaint");
+    for _ in 0..100 {
+        assert!(!gate.request(), "later requests ride the scheduled one");
+    }
+    assert!(gate.take(), "the scheduled repaint finds a pending request");
+    assert!(!gate.take(), "taking twice finds nothing pending");
+    assert!(gate.request(), "the gate re-arms after a take");
 }
 
 /// The reported crash's own numbers: an 8192x5464 viewport rect against a
@@ -720,7 +732,7 @@ fn frame_steps_keep_one_handle() {
         for (i, path) in paths.iter().enumerate() {
             frame.set(path).expect("a reference-stack frame must open");
             frame
-                .read_into(rect, &mut buf)
+                .read_into(rect, std::num::NonZeroU32::MIN, &mut buf)
                 .expect("the visible rect must read");
             let rss = resident_bytes();
             peak = peak.max(rss);
@@ -743,6 +755,104 @@ fn frame_steps_keep_one_handle() {
             frame.path(),
             Some(paths.last().unwrap().as_path()),
             "only the last frame's handle must remain open"
+        );
+    }
+}
+
+/// The fit-zoom redraw cost on one full-size reference frame in a 566 x 377
+/// pane: the decimated read's sample count, and the wall-clock of the step-1
+/// and stepped reads at fit and of the 100 % read, plus the renderer's own
+/// `redraw_frame` when a GPU is present.
+#[test]
+#[ignore = "reads the reference stack, minutes"]
+fn fit_zoom_redraw_reads_a_pane_sized_image() {
+    use std::num::NonZeroU32;
+    use std::time::Instant;
+
+    use focusforge_gui::viewport::{ImageSize, fit};
+
+    let Some(stack_dir) = common::reference_stack_dir() else {
+        eprintln!("FOCUSFORGE_REFERENCE_STACK not set to a real directory; skipping");
+        return;
+    };
+    let first = focusforge_core::io::frame_paths(&stack_dir)
+        .expect("frame_paths must enumerate the directory")
+        .into_iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("IMG_"))
+        })
+        .expect("the reference stack holds source frames");
+    let mut frame = FrameSource::default();
+    frame.set(&first).expect("a reference frame must open");
+    let (w, h) = frame.dimensions().unwrap();
+    let spp = frame.samples_per_pixel().unwrap() as usize;
+    let img = ImageSize {
+        width: w,
+        height: h,
+    };
+    let pane = PaneRect {
+        x: 0.0,
+        y: 0.0,
+        width: 566.0,
+        height: 377.0,
+    };
+
+    let mut vp = fit(img, pane);
+    let at_fit = vp.draw(img, pane).expect("fit draws");
+    let rect_of = |d: &focusforge_gui::viewport::PaneDraw| focusforge_core::tile::Rect {
+        x: d.src.0,
+        y: d.src.1,
+        width: d.src.2,
+        height: d.src.3,
+    };
+    let (ew, eh) = at_fit.extent();
+    let stepped_samples = ew as usize * eh as usize * spp;
+    let full_samples = at_fit.src.2 as usize * at_fit.src.3 as usize * spp;
+    assert!(
+        stepped_samples < 1_000_000,
+        "fit reads {stepped_samples} samples"
+    );
+
+    let time_read = |rect, step: NonZeroU32, len: usize| {
+        let mut buf = vec![0u16; len];
+        let start = Instant::now();
+        frame.read_into(rect, step, &mut buf).expect("read");
+        start.elapsed()
+    };
+    // Warm the page cache once so both fit timings read from memory.
+    time_read(rect_of(&at_fit), NonZeroU32::MIN, full_samples);
+    let step1 = time_read(rect_of(&at_fit), NonZeroU32::MIN, full_samples);
+    let stepped = time_read(rect_of(&at_fit), at_fit.step, stepped_samples);
+
+    while vp.scale() < 1.0 - 1e-9 {
+        vp.zoom_steps(1, (283.0, 188.5), img, pane);
+    }
+    let at_100 = vp.draw(img, pane).unwrap();
+    let len_100 = at_100.src.2 as usize * at_100.src.3 as usize * spp;
+    let one_to_one = time_read(rect_of(&at_100), at_100.step, len_100);
+    eprintln!(
+        "{w}x{h} in 566x377: fit step {} reads {stepped_samples} samples ({ew}x{eh}) in \
+         {stepped:?}; step 1 reads {full_samples} in {step1:?}; 100 % reads {len_100} in \
+         {one_to_one:?}",
+        at_fit.step
+    );
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let mut renderer = focusforge_gui::gpu_canvas::CanvasRenderer::new(shared);
+    renderer
+        .set_frame(&first)
+        .expect("the renderer opens the frame");
+    for (label, draw) in [("fit", at_fit), ("100 %", at_100)] {
+        let start = Instant::now();
+        let drawn = renderer.redraw_frame(&draw);
+        eprintln!(
+            "redraw_frame at {label}: {:?} (CPU side, submit included), drawn: {}",
+            start.elapsed(),
+            drawn.is_some()
         );
     }
 }
