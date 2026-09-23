@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use focusforge_core::io::{
-    Group, GroupSignal, TiffError, TiffHeader, is_frame_path, one_group, propose,
+    Group, GroupSignal, TiffError, TiffHeader, is_frame_path, one_group, propose_with_progress,
 };
 use focusforge_core::params::StackContext;
 use focusforge_core::project::{PROJECT_EXTENSION, Project, ProjectError};
@@ -155,15 +155,19 @@ fn has_project_extension(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION))
 }
 
-/// Resolves one [`OpenTarget`] into an [`OpenOutcome`].
+/// Resolves one [`OpenTarget`] into an [`OpenOutcome`], reporting
+/// `progress(frames_read, frame_total)` as it goes -- the caller's worker
+/// thread is what turns this into a loading indicator's ticks.
 ///
-/// `Folder` proposes a grouping over `dir`: one group opens straight
-/// through, more than one raises the one question. `Frames` builds its
-/// project from exactly the files given, no sibling scan. `Project` reopens
-/// a saved `.ffp`.
-pub fn open(target: OpenTarget) -> OpenOutcome {
+/// `Folder` proposes a grouping over `dir`, reading one frame header per
+/// report; one group opens straight through, more than one raises the one
+/// question. `Frames` and `Project` read no frame headers at all, so each
+/// reports exactly once, already done. `Frames` builds its project from
+/// exactly the files given, no sibling scan. `Project` reopens a saved
+/// `.ffp`.
+pub fn open(target: OpenTarget, mut progress: impl FnMut(usize, usize)) -> OpenOutcome {
     match target {
-        OpenTarget::Folder(dir) => match propose(&dir) {
+        OpenTarget::Folder(dir) => match propose_with_progress(&dir, &mut progress) {
             Ok(proposal) => {
                 if proposal.groups.len() == 1 {
                     OpenOutcome::Opened(Opened {
@@ -188,17 +192,23 @@ pub fn open(target: OpenTarget) -> OpenOutcome {
             }
             Err(source) => OpenOutcome::Refused(EntryError::Read { path: dir, source }),
         },
-        OpenTarget::Frames { dir, frames } => OpenOutcome::Opened(Opened {
-            projects: vec![GuiProject::Unsaved(one_group(&dir, frames))],
-            skipped: Vec::new(),
-        }),
-        OpenTarget::Project(path) => match Project::open(&path) {
-            Ok(project) => OpenOutcome::Opened(Opened {
-                projects: vec![GuiProject::Opened(Box::new(project))],
+        OpenTarget::Frames { dir, frames } => {
+            progress(frames.len(), frames.len());
+            OpenOutcome::Opened(Opened {
+                projects: vec![GuiProject::Unsaved(one_group(&dir, frames))],
                 skipped: Vec::new(),
-            }),
-            Err(source) => OpenOutcome::Refused(EntryError::NotAProject { path, source }),
-        },
+            })
+        }
+        OpenTarget::Project(path) => {
+            progress(1, 1);
+            match Project::open(&path) {
+                Ok(project) => OpenOutcome::Opened(Opened {
+                    projects: vec![GuiProject::Opened(Box::new(project))],
+                    skipped: Vec::new(),
+                }),
+                Err(source) => OpenOutcome::Refused(EntryError::NotAProject { path, source }),
+            }
+        }
     }
 }
 

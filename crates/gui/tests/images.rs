@@ -47,7 +47,7 @@ fn controller_with_frames(name: &str, count: usize) -> AppController {
     }
     let mut controller = AppController::new();
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
     controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
@@ -72,7 +72,7 @@ fn controller_with_timed_frames(name: &str, count: usize) -> AppController {
     }
     let mut controller = AppController::new();
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
     controller
@@ -201,7 +201,7 @@ fn a_directory_with_a_prior_fuses_own_outputs_lists_only_its_real_frames() {
 
     let mut controller = AppController::new();
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
     let panel = controller.images_panel();
@@ -226,10 +226,10 @@ fn absent_capture_time_is_shown_as_absent() {
     // An untimed frame beside a timed one proposes two groups (one timed,
     // one `Untimed` signal) -- answer straight back into a single project,
     // the same as a user choosing "One project" would.
-    match controller.open_paths(&[root]) {
+    match common::open_and_settle(&mut controller, &[root]) {
         OpenOutcome::Opened(_) => {}
         OpenOutcome::Question(_, _) => {
-            controller.answer_question(OpenAs::OneProject);
+            common::answer_and_settle(&mut controller, OpenAs::OneProject);
         }
         OpenOutcome::Refused(_) => panic!("opening two tiny synthetic frames must not be refused"),
     }
@@ -284,7 +284,7 @@ fn controller_with_mantis64_frames(name: &str) -> AppController {
     }
     let mut controller = AppController::new();
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
     controller
@@ -614,7 +614,7 @@ fn mutations_are_stacking_mode_only() {
     }
     let mut controller = AppController::new_with_mode_for_test(ShellMode::Editor);
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
 
@@ -681,7 +681,7 @@ fn a_reopened_project_lists_its_sources() {
 
     let mut controller = AppController::new();
     assert!(matches!(
-        controller.open_paths(&[project_path]),
+        common::open_and_settle(&mut controller, &[project_path]),
         OpenOutcome::Opened(_)
     ));
     let panel = controller.images_panel();
@@ -709,7 +709,7 @@ fn an_unreachable_source_renders_greyed() {
 
     let mut controller = AppController::new();
     assert!(matches!(
-        controller.open_paths(&[project_path]),
+        common::open_and_settle(&mut controller, &[project_path]),
         OpenOutcome::Opened(_)
     ));
     let panel = controller.images_panel();
@@ -741,7 +741,7 @@ fn a_sealed_tab_reads_as_having_a_checkpoint() {
     let project_path = opened_project_path("sealed_tab_checkpoint_gate_frames", &controller);
     let mut reopened = AppController::new();
     assert!(matches!(
-        reopened.open_paths(&[project_path]),
+        common::open_and_settle(&mut reopened, &[project_path]),
         OpenOutcome::Opened(_)
     ));
     reopened.remove_frame(0);
@@ -882,7 +882,7 @@ fn sort_menu_and_drag_are_stacking_mode_only() {
     }
     let mut controller = AppController::new_with_mode_for_test(ShellMode::Editor);
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
     controller.toggle_images_sort_menu();
@@ -1332,7 +1332,7 @@ fn switching_tabs_dismisses_a_stale_frame_set_warning() {
         copy_frame(&root, &format!("{i:02}.tif"), i);
     }
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
     assert_eq!(

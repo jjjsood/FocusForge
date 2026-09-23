@@ -187,7 +187,7 @@ fn open_fixture_tab(
         .expect("fixture frame must copy");
     }
     assert!(matches!(
-        controller.open_paths(std::slice::from_ref(&root)),
+        common::open_and_settle(controller, std::slice::from_ref(&root)),
         OpenOutcome::Opened(_)
     ));
     root
@@ -496,7 +496,7 @@ fn opening_a_saved_project_feeds_its_own_planes() {
     // Reopening the sealed `.ffp` mid-session lands a third tab and must
     // load its own planes, not the tab it displaced.
     assert!(matches!(
-        controller.open_paths(&[ffp]),
+        common::open_and_settle(&mut controller, &[ffp]),
         OpenOutcome::Opened(_)
     ));
     assert_eq!(controller.active_project(), Some(2));

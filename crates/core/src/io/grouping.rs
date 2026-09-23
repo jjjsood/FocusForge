@@ -41,7 +41,7 @@ use super::tiff::stack::frame_paths;
 /// "seconds apart" within a stack, "minutes apart" between subjects.
 ///
 /// It gets no flag. `--groups` is the override; a second knob for the same
-/// fact is what §10's escalation framing argues against.
+/// fact would only duplicate it.
 pub const GROUP_GAP: Duration = Duration::from_secs(60);
 
 /// How deep the walk descends before giving up. Insurance against a symlink
@@ -149,14 +149,37 @@ pub struct Proposal {
 /// anywhere below it is `Err(TiffError::NoFrames)`, the same refusal a plain
 /// single-stack run over an empty directory already produces.
 pub fn propose(root: &Path) -> Result<Proposal, TiffError> {
+    propose_with_progress(root, |_, _| {})
+}
+
+/// [`propose`], reporting through `progress(frames_read, frame_total)` on
+/// every capture-time read -- what a large stack's caller drives a loading
+/// indicator from. `frame_total` is known once the directory walk itself
+/// finishes, before the first report; `propose` delegates here with a no-op
+/// observer, so it keeps its own signature and cost.
+pub fn propose_with_progress(
+    root: &Path,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<Proposal, TiffError> {
     let mut dirs = Vec::new();
     let mut skipped = Vec::new();
     collect_frame_dirs(root, 0, &mut dirs, &mut skipped)?;
 
+    let frame_total: usize = dirs.iter().map(|(_, frames)| frames.len()).sum();
+    let mut frames_read = 0usize;
+
     let mut groups = Vec::new();
     let mut time_signal_available = false;
     for (dir, frames) in dirs {
-        let timed: Vec<Option<CaptureTime>> = frames.iter().map(|p| capture_time(p)).collect();
+        let timed: Vec<Option<CaptureTime>> = frames
+            .iter()
+            .map(|p| {
+                let time = capture_time(p);
+                frames_read += 1;
+                progress(frames_read, frame_total);
+                time
+            })
+            .collect();
         if timed.iter().any(Option::is_some) {
             time_signal_available = true;
         }

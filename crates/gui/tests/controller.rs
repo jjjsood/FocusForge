@@ -28,33 +28,62 @@ fn is_single_root_call(body: &str) -> bool {
     if body.starts_with("root.") && body.ends_with(");") && body.matches(';').count() == 1 {
         return true;
     }
-    is_self_literal_assignment(body)
+    is_bare_literal_assignment(body) || is_conditional_literal_reset(body)
 }
 
-/// `self.<ident> = <literal>;` where `<ident>` is a single plain identifier
-/// (no `.`, no operator) and `<literal>` is `true`, `false`, a quoted string,
-/// or a number with an optional unit suffix (`1`, `0.5`, `1px`) -- never a
-/// bare identifier (which would be another property, e.g. `self.x = y;`) or
+/// `self.<ident> = <literal>;` or `<child-id>.<ident> = <literal>;` --
+/// exactly one dot, both sides plain identifiers, and `<literal>` is `true`,
+/// `false`, a quoted string, or a number with an optional unit suffix (`1`,
+/// `0.5`, `1px`) -- never a bare identifier (which would be another
+/// property, e.g. `self.x = y;`), a nested path (`self.x.y = 1;`), or
 /// anything with a call or an operator in it. See [`is_single_root_call`].
-fn is_self_literal_assignment(body: &str) -> bool {
-    let Some(rest) = body.strip_prefix("self.") else {
+fn is_bare_literal_assignment(body: &str) -> bool {
+    let Some((lhs, rhs_with_semi)) = body.split_once('=') else {
         return false;
     };
-    let Some((lhs, rhs_with_semi)) = rest.split_once('=') else {
+    let valid_ident = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    let [qualifier, ident] = lhs.trim().split('.').collect::<Vec<_>>()[..] else {
         return false;
     };
-    let lhs = lhs.trim();
-    if lhs.is_empty()
-        || !lhs
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    if !valid_ident(qualifier) || !valid_ident(ident) {
         return false;
     }
     let Some(rhs) = rhs_with_semi.trim().strip_suffix(';') else {
         return false;
     };
     body.matches(';').count() == 1 && is_literal_token(rhs.trim())
+}
+
+/// `if <property-path> { <bare-literal-assignment> }`, with no `else` and
+/// no other statement -- `<property-path>` is `self.<ident>` or
+/// `<child-id>.<ident>`, optionally negated with a leading `!`. The one
+/// branch this scan allows: a Slint-side gate resetting itself the moment
+/// the property it watches goes false. See [`is_single_root_call`].
+fn is_conditional_literal_reset(body: &str) -> bool {
+    let Some(rest) = body.strip_prefix("if ") else {
+        return false;
+    };
+    let Some((cond, rest)) = rest.split_once('{') else {
+        return false;
+    };
+    let cond = cond.trim().strip_prefix('!').unwrap_or(cond.trim()).trim();
+    let valid_ident = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    let cond_is_property_path = matches!(cond.split('.').collect::<Vec<_>>()[..], [q, i] if valid_ident(q) && valid_ident(i));
+    if !cond_is_property_path {
+        return false;
+    }
+    let Some(inner) = rest.trim().strip_suffix('}') else {
+        return false;
+    };
+    is_bare_literal_assignment(inner.trim())
 }
 
 /// `true`, `false`, a `"..."` string, or a number (`1`, `0.5`, `-3`) with an
@@ -122,6 +151,40 @@ fn is_single_root_call_allows_a_bare_self_literal_assignment() {
     assert!(
         !is_single_root_call("self.opacity = 1; self.height = 1;"),
         "two statements must still fail"
+    );
+}
+
+#[test]
+fn is_single_root_call_allows_a_named_childs_bare_literal_assignment() {
+    assert!(is_single_root_call("gate.shown = true;"));
+    assert!(is_single_root_call("gate.shown = false;"));
+    assert!(
+        !is_single_root_call("gate.shown = root.load_active;"),
+        "the right side must still be a literal, not another property"
+    );
+    assert!(
+        !is_single_root_call("gate.shown.nested = true;"),
+        "still exactly one dot, never a nested path"
+    );
+}
+
+#[test]
+fn is_single_root_call_allows_one_conditional_literal_reset() {
+    assert!(is_single_root_call(
+        "if !root.load_active {\n gate.shown = false;\n}"
+    ));
+    assert!(is_single_root_call("if self.on { self.on = false; }"));
+    assert!(
+        !is_single_root_call("if !root.load_active { gate.shown = false; } else { }"),
+        "an else branch must still fail"
+    );
+    assert!(
+        !is_single_root_call("if !root.load_active { gate.shown = root.load_active; }"),
+        "the inner assignment must still be a bare literal"
+    );
+    assert!(
+        !is_single_root_call("if !root.load_active { gate.shown = false; gate.other = true; }"),
+        "still exactly one statement inside"
     );
 }
 
@@ -330,10 +393,534 @@ fn controller_state_is_send_and_sync() {
     assert_send_sync::<AppController>();
 }
 
+// --- Background loads: the event sequence, the tick contract, the dropped
+// second request, and the thumbnail decode's own thread. ------------------
+
+use focusforge_gui::{OpenAs, OpenOutcome, job};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+fn load_tree(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp tree must be creatable");
+    dir
+}
+
+fn mantis_frame(index: usize) -> PathBuf {
+    common::workspace_root()
+        .join("fixtures")
+        .join("mantis-512")
+        .join("frames")
+        .join(format!("{index:02}.tif"))
+}
+
+fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
+    std::fs::create_dir_all(dest_dir).unwrap();
+    std::fs::copy(mantis_frame(source_index), dest_dir.join(name))
+        .expect("fixture frame must copy");
+}
+
+fn install_load_sink(controller: &mut AppController) -> Arc<Mutex<Vec<ShellEvent>>> {
+    let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = events.clone();
+    controller.set_sink(Arc::new(move |event| {
+        sink_events.lock().unwrap().push(event)
+    }));
+    events
+}
+
+/// A load returns before the worker has done anything, and only
+/// [`AppController::settle_open`] applies its result -- true for every entry
+/// shape: an unambiguous folder, a saved `.ffp`, and a multi-file drop.
+#[test]
+fn open_paths_returns_before_the_load_completes_and_lands_only_after_settle() {
+    let folder = load_tree("controller_shape_folder");
+    copy_frame(&folder, "00.tif", 0);
+    copy_frame(&folder, "01.tif", 1);
+
+    let project_dir = load_tree("controller_shape_project");
+    let project_path = {
+        use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
+        use focusforge_core::params::ParamValues;
+        use focusforge_core::project::{Metrics, SealRequest, seal};
+        use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+
+        let composite = project_dir.join("composite.tif");
+        let zmap = project_dir.join("zmap.tif");
+        let full = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let mut writer = TiffWriter::create(
+            &composite,
+            TiffSpec {
+                width: 4,
+                height: 4,
+                samples_per_pixel: 3,
+                description: Some("staged".to_string()),
+            },
+        )
+        .unwrap();
+        writer.write_tile(full, &[0u16; 4 * 4 * 3]).unwrap();
+        writer.finish().unwrap();
+        let mut map = ZMapWriter::create(&zmap, ZMapInfo::new(4, 4, 1).unwrap()).unwrap();
+        map.write_tile(full, &[0u16; 4 * 4]).unwrap();
+        map.finish().unwrap();
+        let project_path = project_dir.join("test.ffp");
+        seal(SealRequest {
+            project_path: &project_path,
+            staged_composite: &composite,
+            staged_zmap: &zmap,
+            sources: &[],
+            algorithm: "laplacian",
+            params: &ParamValues::new(),
+            align: None,
+            composite_description: "staged".to_string(),
+            label: None,
+            metrics: Metrics::default(),
+        })
+        .unwrap();
+        project_path
+    };
+
+    let frames_dir = load_tree("controller_shape_frames");
+    copy_frame(&frames_dir, "00.tif", 2);
+    copy_frame(&frames_dir, "01.tif", 3);
+    let frame_paths = vec![frames_dir.join("00.tif"), frames_dir.join("01.tif")];
+
+    for paths in [vec![folder], vec![project_path], frame_paths] {
+        let mut controller = AppController::new();
+        let handle = controller
+            .open_paths(&paths)
+            .expect("classifiable paths must start a load");
+        assert!(
+            controller.project_tabs().is_empty(),
+            "no tab before the worker has even joined"
+        );
+        assert!(controller.pending_question().is_none());
+        assert!(controller.last_refusal().is_none());
+
+        handle.join().expect("the worker must not panic");
+        assert!(
+            controller.project_tabs().is_empty(),
+            "no tab lands until settle_open is called, even after the worker finished"
+        );
+
+        let outcome = controller.settle_open();
+        assert!(matches!(outcome, Some(OpenOutcome::Opened(_))));
+        assert_eq!(controller.project_tabs().len(), 1);
+    }
+}
+
+/// Every progress tick carries `frames_read` of the tree's real `frame_total`
+/// (never the fixture's own), reads climb monotonically to completion, and
+/// none follows [`ShellEvent::LoadReady`]. The [`job::POLL`] spacing floor is
+/// checked between any ticks beyond the two every load guarantees (the first,
+/// unconditional one and the completion one, which always reports regardless
+/// of timing).
+#[test]
+fn load_progress_ticks_report_frames_of_the_real_total_and_never_after_ready() {
+    let two_subfolders = load_tree("controller_tick_two_subfolders");
+    copy_frame(&two_subfolders.join("subject-a"), "00.tif", 0);
+    copy_frame(&two_subfolders.join("subject-a"), "01.tif", 1);
+    copy_frame(&two_subfolders.join("subject-a"), "02.tif", 2);
+    copy_frame(&two_subfolders.join("subject-b"), "00.tif", 3);
+
+    let mantis_512 = common::workspace_root().join("fixtures").join("mantis-512");
+
+    for (label, root, expected_total) in [
+        ("two_subfolder_tree", two_subfolders, 4usize),
+        ("mantis_512_fixture", mantis_512, 8usize),
+    ] {
+        let mut controller = AppController::new();
+        let timed_events: Arc<Mutex<Vec<(Instant, ShellEvent)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_events = timed_events.clone();
+        controller.set_sink(Arc::new(move |event| {
+            sink_events.lock().unwrap().push((Instant::now(), event))
+        }));
+
+        let handle = controller.open_paths(&[root]).expect("a load must start");
+        handle.join().unwrap();
+        controller.settle_open();
+
+        let got = timed_events.lock().unwrap().clone();
+        assert_eq!(
+            got.first().map(|(_, e)| e),
+            Some(&ShellEvent::LoadStarted),
+            "{label}: must start with LoadStarted"
+        );
+        let ready_pos = got
+            .iter()
+            .position(|(_, e)| matches!(e, ShellEvent::LoadReady))
+            .unwrap_or_else(|| panic!("{label}: LoadReady must be raised"));
+        assert!(
+            !got[ready_pos + 1..]
+                .iter()
+                .any(|(_, e)| matches!(e, ShellEvent::LoadProgress { .. })),
+            "{label}: no tick after LoadReady"
+        );
+
+        let ticks: Vec<(Instant, u32, u32)> = got[..ready_pos]
+            .iter()
+            .filter_map(|(t, e)| match e {
+                ShellEvent::LoadProgress {
+                    frames_read,
+                    frame_total,
+                } => Some((*t, *frames_read, *frame_total)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !ticks.is_empty(),
+            "{label}: at least one tick between start and the settle marker"
+        );
+        for &(_, _, total) in &ticks {
+            assert_eq!(
+                total as usize, expected_total,
+                "{label}: frame_total must equal the tree's own frame count"
+            );
+        }
+        for w in ticks.windows(2) {
+            assert!(
+                w[1].1 >= w[0].1,
+                "{label}: frames_read must never go backwards"
+            );
+        }
+        assert_eq!(
+            ticks.last().unwrap().1 as usize,
+            expected_total,
+            "{label}: the last tick before settle must report full completion"
+        );
+
+        // The spacing floor: skip the final pair, since the completion tick
+        // always reports immediately once the last frame is read, whatever
+        // the elapsed time since the previous one.
+        if ticks.len() > 2 {
+            for w in ticks[..ticks.len() - 1].windows(2) {
+                assert!(
+                    w[1].0.duration_since(w[0].0) >= job::POLL,
+                    "{label}: two non-terminal ticks arrived less than the poll interval apart"
+                );
+            }
+        }
+    }
+}
+
+/// All three terminations arrive as exactly one of `ProjectsChanged` /
+/// `QuestionRaised` / `EntryRefused`, each preceded by exactly one
+/// `LoadStarted` and one `LoadReady`, and each leaves the load no longer
+/// in flight.
+#[test]
+fn every_termination_carries_one_start_one_ready_and_its_own_event() {
+    let opened_root = load_tree("controller_term_opened");
+    copy_frame(&opened_root, "00.tif", 0);
+    copy_frame(&opened_root, "01.tif", 1);
+
+    let question_root = load_tree("controller_term_question");
+    copy_frame(&question_root.join("subject-a"), "00.tif", 0);
+    copy_frame(&question_root.join("subject-b"), "00.tif", 1);
+
+    let refused_root = load_tree("controller_term_refused");
+
+    for (label, root) in [
+        ("opened", opened_root),
+        ("question", question_root),
+        ("refused", refused_root),
+    ] {
+        let mut controller = AppController::new();
+        let events = install_load_sink(&mut controller);
+
+        let handle = controller.open_paths(&[root]).expect("a load must start");
+        handle.join().unwrap();
+        assert!(
+            controller.load_in_flight(),
+            "{label}: still in flight until settle_open is called"
+        );
+        controller.settle_open();
+        assert!(
+            !controller.load_in_flight(),
+            "{label}: settle_open must clear the in-flight flag"
+        );
+
+        let got = events.lock().unwrap().clone();
+        assert_eq!(
+            got.iter()
+                .filter(|e| **e == ShellEvent::LoadStarted)
+                .count(),
+            1,
+            "{label}: exactly one LoadStarted, got {got:?}"
+        );
+        assert_eq!(
+            got.iter()
+                .filter(|e| matches!(e, ShellEvent::LoadReady))
+                .count(),
+            1,
+            "{label}: exactly one LoadReady, got {got:?}"
+        );
+        let terminations = got
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ShellEvent::ProjectsChanged
+                        | ShellEvent::QuestionRaised(_)
+                        | ShellEvent::EntryRefused(_)
+                )
+            })
+            .count();
+        assert_eq!(
+            terminations, 1,
+            "{label}: exactly one termination event, got {got:?}"
+        );
+    }
+}
+
+/// A second open request while one is in flight starts no second worker and
+/// is dropped outright: the call reports that nothing started, exactly one
+/// `LoadStarted` is seen, and the first load's own outcome is what settles.
+#[test]
+fn a_second_open_while_one_is_in_flight_is_dropped() {
+    let first = load_tree("controller_dropped_first");
+    copy_frame(&first, "00.tif", 0);
+    let second = load_tree("controller_dropped_second");
+    copy_frame(&second, "00.tif", 1);
+
+    let mut controller = AppController::new();
+    let events = install_load_sink(&mut controller);
+
+    let handle = controller
+        .open_paths(&[first])
+        .expect("the first load must start");
+    let dropped = controller.open_paths(&[second]);
+    assert!(
+        dropped.is_none(),
+        "a second open while one is in flight must start nothing"
+    );
+
+    handle.join().unwrap();
+    let outcome = controller.settle_open();
+    assert!(
+        matches!(outcome, Some(OpenOutcome::Opened(_))),
+        "the settled outcome must be the first load's own"
+    );
+
+    let starts = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| **e == ShellEvent::LoadStarted)
+        .count();
+    assert_eq!(starts, 1, "exactly one LoadStarted must ever be seen");
+}
+
+/// A freshly opened tab's thumbnail is decoded on the worker, alongside the
+/// header walk -- `settle_open`, called here on the caller's own thread,
+/// only assembles a tab from bytes already decoded, so its own duration
+/// stays far below a decode measurable on a large-enough frame, while the
+/// worker's join time reflects the real decode cost.
+#[test]
+fn thumbnail_decode_runs_on_the_worker_not_on_settle() {
+    use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
+
+    let root = load_tree("controller_thumbnail_worker");
+    let size = 3000u32;
+    let mut samples = vec![0u16; (size * size * 3) as usize];
+    for (i, s) in samples.iter_mut().enumerate() {
+        *s = (i % 65536) as u16;
+    }
+    let mut writer = TiffWriter::create(
+        &root.join("00.tif"),
+        TiffSpec {
+            width: size,
+            height: size,
+            samples_per_pixel: 3,
+            description: None,
+        },
+    )
+    .unwrap();
+    writer
+        .write_tile(
+            Rect {
+                x: 0,
+                y: 0,
+                width: size,
+                height: size,
+            },
+            &samples,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let mut controller = AppController::new();
+    let worker_start = Instant::now();
+    let handle = controller.open_paths(&[root]).expect("a load must start");
+    handle.join().unwrap();
+    let worker_elapsed = worker_start.elapsed();
+
+    let settle_start = Instant::now();
+    let outcome = controller.settle_open();
+    let settle_elapsed = settle_start.elapsed();
+
+    assert!(matches!(outcome, Some(OpenOutcome::Opened(_))));
+    assert!(
+        settle_elapsed < Duration::from_millis(50),
+        "settle_open must only assemble an already-decoded thumbnail: took {settle_elapsed:?}"
+    );
+    assert!(
+        worker_elapsed >= settle_elapsed,
+        "the worker's own duration must reflect the decode, not settle_open's: \
+         worker {worker_elapsed:?}, settle {settle_elapsed:?}"
+    );
+}
+
+/// The same proof, for the path that opens a tab from an answered grouping
+/// question rather than directly from `open_paths` -- two subject
+/// directories large enough that a decode on `settle_open`'s own thread
+/// would be measurable there instead.
+#[test]
+fn answer_question_thumbnail_decode_runs_on_the_worker_not_on_settle() {
+    use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
+
+    let root = load_tree("controller_question_thumbnail_worker");
+    let size = 3000u32;
+    let mut samples = vec![0u16; (size * size * 3) as usize];
+    for (i, s) in samples.iter_mut().enumerate() {
+        *s = (i % 65536) as u16;
+    }
+    for subject in ["subject-a", "subject-b"] {
+        let dir = root.join(subject);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut writer = TiffWriter::create(
+            &dir.join("00.tif"),
+            TiffSpec {
+                width: size,
+                height: size,
+                samples_per_pixel: 3,
+                description: None,
+            },
+        )
+        .unwrap();
+        writer
+            .write_tile(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: size,
+                    height: size,
+                },
+                &samples,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+    }
+
+    let mut controller = AppController::new();
+    let handle = controller.open_paths(&[root]).expect("a load must start");
+    handle.join().unwrap();
+    assert!(matches!(
+        controller.settle_open(),
+        Some(OpenOutcome::Question(..))
+    ));
+
+    let worker_start = Instant::now();
+    let handle = controller
+        .answer_question(OpenAs::NProjects)
+        .expect("answering the question must start a load");
+    handle.join().unwrap();
+    let worker_elapsed = worker_start.elapsed();
+
+    let settle_start = Instant::now();
+    let outcome = controller.settle_open();
+    let settle_elapsed = settle_start.elapsed();
+
+    assert!(matches!(outcome, Some(OpenOutcome::Opened(_))));
+    assert!(
+        settle_elapsed < Duration::from_millis(50),
+        "settle_open must only assemble an already-decoded thumbnail: took {settle_elapsed:?}"
+    );
+    assert!(
+        worker_elapsed >= settle_elapsed,
+        "the worker's own duration must reflect the decode, not settle_open's: \
+         worker {worker_elapsed:?}, settle {settle_elapsed:?}"
+    );
+}
+
+/// A worker's own failed thumbnail decode must not be retried in
+/// `settle_open`. The frame is truncated to just its header/IFD while the
+/// worker runs, so its decode fails; only after `handle.join()` is it
+/// repaired to a complete file, which a retry would decode successfully.
+#[test]
+fn a_failed_worker_thumbnail_decode_is_not_retried_on_settle() {
+    use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
+
+    let root = load_tree("controller_thumbnail_failure");
+    let size = 64u32;
+    let frame = root.join("00.tif");
+    let mut writer = TiffWriter::create(
+        &frame,
+        TiffSpec {
+            width: size,
+            height: size,
+            samples_per_pixel: 3,
+            description: None,
+        },
+    )
+    .unwrap();
+    let header_len = std::fs::metadata(&frame).unwrap().len() as usize;
+
+    let samples = vec![0u16; (size * size * 3) as usize];
+    writer
+        .write_tile(
+            Rect {
+                x: 0,
+                y: 0,
+                width: size,
+                height: size,
+            },
+            &samples,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let complete_bytes = std::fs::read(&frame).unwrap();
+    std::fs::write(&frame, &complete_bytes[..header_len]).unwrap();
+
+    let mut controller = AppController::new();
+    let handle = controller.open_paths(&[root]).expect("a load must start");
+    handle.join().unwrap();
+
+    // Repaired only now, after the worker's own decode already ran and
+    // failed against the truncated file -- a synchronous retry inside
+    // `settle_open` would find these bytes and succeed.
+    std::fs::write(&frame, &complete_bytes).unwrap();
+
+    let settle_start = Instant::now();
+    let outcome = controller.settle_open();
+    let settle_elapsed = settle_start.elapsed();
+
+    assert!(
+        matches!(outcome, Some(OpenOutcome::Opened(_))),
+        "a header-valid frame with unreadable pixels still opens"
+    );
+    assert!(
+        settle_elapsed < Duration::from_millis(50),
+        "a failed worker decode must not retry synchronously in settle_open: took {settle_elapsed:?}"
+    );
+    let cards = controller.project_cards();
+    assert_eq!(cards.len(), 1);
+    assert!(
+        cards[0].picture.is_none(),
+        "a retry would succeed against the now-repaired file -- \
+         the worker's own failure must be final, never retried"
+    );
+}
+
 // --- Diagnostics: manifest, write, destination, marking -------------------
 
 use focusforge_gui::diagnostics::{DiagnosticsStatus, size_text};
-use std::path::Path;
 
 /// A data directory: a live log and a rotated log numbered above it, and a
 /// crash directory holding one minidump with no sibling report.

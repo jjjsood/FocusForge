@@ -65,7 +65,7 @@ fn unambiguous_folder_opens_one_project() {
     copy_frame(&root, "01.tif", 1);
 
     let mut controller = AppController::new();
-    let outcome = controller.open_paths(&[root]);
+    let outcome = common::open_and_settle(&mut controller, &[root]);
     assert!(
         matches!(outcome, OpenOutcome::Opened(_)),
         "a single-directory tree with no ambiguity must open straight through"
@@ -82,7 +82,7 @@ fn ambiguous_folder_asks_once() {
     copy_frame(&root.join("subject-b"), "00.tif", 1);
 
     let mut controller = AppController::new();
-    match controller.open_paths(&[root]) {
+    match common::open_and_settle(&mut controller, &[root]) {
         OpenOutcome::Question(question, _proposal) => {
             assert_eq!(question.project_count, 2);
             assert_eq!(question.frame_count, 2);
@@ -112,10 +112,10 @@ fn both_answers_open_what_they_say() {
 
     let mut one = AppController::new();
     assert!(matches!(
-        one.open_paths(&[one_root]),
+        common::open_and_settle(&mut one, &[one_root]),
         OpenOutcome::Question(..)
     ));
-    one.answer_question(OpenAs::OneProject);
+    common::answer_and_settle(&mut one, OpenAs::OneProject);
     assert_eq!(
         one.project_tabs().len(),
         1,
@@ -129,10 +129,10 @@ fn both_answers_open_what_they_say() {
 
     let mut many = AppController::new();
     assert!(matches!(
-        many.open_paths(&[many_root]),
+        common::open_and_settle(&mut many, &[many_root]),
         OpenOutcome::Question(..)
     ));
-    many.answer_question(OpenAs::NProjects);
+    common::answer_and_settle(&mut many, OpenAs::NProjects);
     assert_eq!(
         many.project_tabs().len(),
         2,
@@ -151,12 +151,12 @@ fn drop_of_a_folder_matches_the_picker() {
     copy_frame(&root, "01.tif", 1);
 
     let mut picked = AppController::new();
-    picked.open_paths(std::slice::from_ref(&root));
+    common::open_and_settle(&mut picked, std::slice::from_ref(&root));
 
     let mut dropped = AppController::new();
     // A dropped folder arrives as one unexpanded path -- the same call the
     // picker makes.
-    dropped.open_paths(&[root]);
+    common::open_and_settle(&mut dropped, &[root]);
 
     assert_eq!(
         picked.project_tabs(),
@@ -178,7 +178,7 @@ fn drop_of_several_files_is_one_open() {
         root.join("01.tif"),
         root.join("02.tif"),
     ];
-    let outcome = controller.open_paths(&paths);
+    let outcome = common::open_and_settle(&mut controller, &paths);
     assert!(matches!(outcome, OpenOutcome::Opened(_)));
     assert_eq!(
         controller.project_tabs().len(),
@@ -195,7 +195,7 @@ fn drop_of_several_files_is_one_open() {
 fn empty_folder_is_refused_with_a_fix() {
     let root = tree("entry_empty_folder");
     let mut controller = AppController::new();
-    match controller.open_paths(&[root]) {
+    match common::open_and_settle(&mut controller, &[root]) {
         OpenOutcome::Refused(EntryError::NoReadableFrames { .. }) => {}
         OpenOutcome::Refused(other) => panic!("expected NoReadableFrames, got {other}"),
         _ => panic!("an empty folder must be refused"),
@@ -203,8 +203,62 @@ fn empty_folder_is_refused_with_a_fix() {
     let refusal = controller
         .last_refusal()
         .expect("a refusal message must be recorded");
-    assert!(refusal.contains(".tif") && refusal.contains(".tiff"));
-    assert!(refusal.contains("Pick another folder"));
+    assert_eq!(
+        refusal,
+        "FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none. \
+         Pick another folder…"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn unreadable_folder_is_refused_with_its_read_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tree("entry_unreadable_folder");
+    let writable = std::fs::metadata(&root).unwrap().permissions();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // The exact same call the entry path makes, so the expected message
+    // carries the OS's own real error text rather than a guessed one.
+    let read_err = std::fs::read_dir(&root).unwrap_err();
+    let expected = format!("{0}: {0}: {read_err}", root.display());
+
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&root));
+
+    std::fs::set_permissions(&root, writable).unwrap();
+
+    match outcome {
+        OpenOutcome::Refused(EntryError::Read { .. }) => {}
+        OpenOutcome::Refused(other) => panic!("expected Read, got {other}"),
+        _ => panic!("an unreadable folder must be refused"),
+    }
+    let refusal = controller
+        .last_refusal()
+        .expect("a refusal message must be recorded");
+    assert_eq!(refusal, expected);
+}
+
+#[test]
+fn a_path_that_is_neither_a_folder_nor_a_project_is_refused_by_name() {
+    let dir = tree("entry_unreadable_path");
+    let bad = dir.join("notes.txt");
+    std::fs::write(&bad, b"neither a frame nor a project").unwrap();
+
+    let mut controller = AppController::new();
+    // `classify` refuses inline, before any worker starts -- no load to
+    // wait for.
+    assert!(controller.open_paths(std::slice::from_ref(&bad)).is_none());
+    let refusal = controller
+        .last_refusal()
+        .expect("a refusal message must be recorded");
+    assert_eq!(
+        refusal,
+        format!(
+            "{}: not a folder of frames or a FocusForge project",
+            bad.display()
+        )
+    );
 }
 
 #[test]
@@ -215,7 +269,7 @@ fn skipped_subfolders_are_reported_not_failed() {
     std::fs::write(root.join("thumbs").join("readme.txt"), b"not a frame").unwrap();
 
     let mut controller = AppController::new();
-    let outcome = controller.open_paths(&[root]);
+    let outcome = common::open_and_settle(&mut controller, &[root]);
     assert!(matches!(outcome, OpenOutcome::Opened(_)));
     assert_eq!(controller.project_tabs().len(), 1);
     let notice = controller
@@ -263,7 +317,8 @@ fn no_grouping_vocabulary_after_the_answer() {
         }
     }
 
-    let empty_refusal = AppController::new().open_paths(&[tree("entry_no_group_empty")]);
+    let empty_refusal =
+        common::open_and_settle(&mut AppController::new(), &[tree("entry_no_group_empty")]);
     if let OpenOutcome::Refused(err) = empty_refusal {
         assert!(!err.to_string().to_lowercase().contains("group"));
     } else {
@@ -274,7 +329,7 @@ fn no_grouping_vocabulary_after_the_answer() {
     copy_frame(&ambiguous_root.join("subject-a"), "00.tif", 0);
     copy_frame(&ambiguous_root.join("subject-b"), "00.tif", 1);
     let mut controller = AppController::new();
-    match controller.open_paths(&[ambiguous_root]) {
+    match common::open_and_settle(&mut controller, &[ambiguous_root]) {
         OpenOutcome::Question(question, _) => {
             let rendered = format!(
                 "This folder reads as {} stacks of {} frames. Open as one project. Open as {} projects. Cancel",
@@ -348,9 +403,9 @@ fn tab_strip_scrolls_to_every_tab() {
     for i in 0..9 {
         copy_frame(&root.join(format!("subject-{i}")), "00.tif", i % 8);
     }
-    match controller.open_paths(&[root]) {
+    match common::open_and_settle(&mut controller, &[root]) {
         OpenOutcome::Question(..) => {
-            controller.answer_question(OpenAs::NProjects);
+            common::answer_and_settle(&mut controller, OpenAs::NProjects);
         }
         OpenOutcome::Opened(_) => {}
         OpenOutcome::Refused(err) => panic!("nine subject subdirectories must not refuse: {err}"),
@@ -425,7 +480,7 @@ fn a_single_tab_does_not_read_as_overflowing_before_any_resize() {
     copy_frame(&root, "00.tif", 0);
 
     let mut controller = AppController::new();
-    let outcome = controller.open_paths(&[root]);
+    let outcome = common::open_and_settle(&mut controller, &[root]);
     assert!(matches!(outcome, OpenOutcome::Opened(_)));
     assert_eq!(controller.project_tabs().len(), 1);
 
@@ -455,8 +510,8 @@ fn tab_scroll_changes_reach_the_sink_and_opening_scrolls_into_view() {
     }
     let mut controller = AppController::new();
     controller.set_tab_region_width(1254.0);
-    if let OpenOutcome::Question(..) = controller.open_paths(&[root]) {
-        controller.answer_question(OpenAs::NProjects);
+    if let OpenOutcome::Question(..) = common::open_and_settle(&mut controller, &[root]) {
+        common::answer_and_settle(&mut controller, OpenAs::NProjects);
     }
     assert_eq!(controller.project_tabs().len(), 10);
     assert!(controller.tabs_overflow());
@@ -583,7 +638,7 @@ fn a_saved_project_reopens_through_the_same_picker() {
     let project_path = seal_test_project(&dir);
 
     let mut controller = AppController::new();
-    let outcome = controller.open_paths(&[project_path]);
+    let outcome = common::open_and_settle(&mut controller, &[project_path]);
     assert!(matches!(outcome, OpenOutcome::Opened(_)));
     let tabs = controller.project_tabs();
     assert_eq!(tabs.len(), 1);
@@ -600,14 +655,18 @@ fn a_file_that_is_not_a_project_is_refused_by_name() {
     std::fs::write(&bad, b"not a zip container").unwrap();
 
     let mut controller = AppController::new();
-    match controller.open_paths(std::slice::from_ref(&bad)) {
-        OpenOutcome::Refused(EntryError::NotAProject { path, .. }) => {
+    let source = match common::open_and_settle(&mut controller, std::slice::from_ref(&bad)) {
+        OpenOutcome::Refused(EntryError::NotAProject { path, source }) => {
             assert_eq!(path, bad);
+            source
         }
         _ => panic!("a non-project .ffp must be refused as NotAProject"),
-    }
+    };
     let refusal = controller.last_refusal().unwrap();
-    assert!(refusal.contains("notes.ffp"));
+    assert_eq!(
+        refusal,
+        format!("{}: not a FocusForge project ({source})", bad.display())
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -624,12 +683,12 @@ fn each_tab_keeps_its_own_viewport() {
     let mut controller = AppController::new();
     let (left, right) = base_pane();
 
-    controller.open_paths(&[root_a]);
+    common::open_and_settle(&mut controller, &[root_a]);
     controller.set_pane_geometry(left, right);
     controller.zoom_in();
     let readout_a = controller.zoom_readout();
 
-    controller.open_paths(&[root_b]);
+    common::open_and_settle(&mut controller, &[root_b]);
     controller.set_pane_geometry(left, right);
     let readout_b_fresh = controller.zoom_readout();
     assert_ne!(
@@ -656,7 +715,7 @@ fn with_one_project(name: &str) -> AppController {
     copy_frame(&root, "00.tif", 0);
     let mut controller = AppController::new();
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
     controller
@@ -702,7 +761,7 @@ fn opening_a_folder_from_plus_appends_and_activates_the_first() {
     let root = tree("entry_plus_open");
     copy_frame(&root, "00.tif", 1);
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
 
@@ -734,14 +793,14 @@ fn a_multi_stack_open_from_plus_appends_all_in_order() {
     copy_frame(&root.join("subject-b"), "00.tif", 1);
     copy_frame(&root.join("subject-c"), "00.tif", 2);
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Question(..)
     ));
     assert!(
         controller.plus_selected(),
         "+ stays selected while the question is open"
     );
-    controller.answer_question(OpenAs::NProjects);
+    common::answer_and_settle(&mut controller, OpenAs::NProjects);
 
     let tabs = controller.project_tabs();
     assert_eq!(tabs.len(), 4, "1 project + 3 stacks appended");
@@ -793,8 +852,8 @@ fn with_four_projects(name: &str) -> focusforge_gui::AppController {
     copy_frame(&root.join("subject-a"), "00.tif", 0);
     copy_frame(&root.join("subject-b"), "00.tif", 1);
     copy_frame(&root.join("subject-c"), "00.tif", 2);
-    controller.open_paths(&[root]);
-    controller.answer_question(OpenAs::NProjects);
+    common::open_and_settle(&mut controller, &[root]);
+    common::answer_and_settle(&mut controller, OpenAs::NProjects);
     assert_eq!(controller.project_tabs().len(), 4);
     controller
 }
@@ -956,7 +1015,7 @@ fn answering_the_question_closes_its_dialog() {
     copy_frame(&root.join("subject-b"), "00.tif", 1);
 
     let controller = Arc::new(Mutex::new(AppController::new()));
-    let outcome = controller.lock().unwrap().open_paths(&[root]);
+    let outcome = common::open_and_settle(&mut controller.lock().unwrap(), &[root]);
     assert!(matches!(outcome, OpenOutcome::Question(..)));
     app.set_question_open(true);
     focusforge_gui::bridge::push_projects(&app, &controller);
@@ -990,10 +1049,10 @@ fn a_drop_onto_a_loaded_tab_appends_new_tabs() {
         copy_frame(&root.join(format!("subject-{i}")), "00.tif", i);
     }
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Question(..)
     ));
-    controller.answer_question(OpenAs::NProjects);
+    common::answer_and_settle(&mut controller, OpenAs::NProjects);
 
     let tabs = controller.project_tabs();
     assert_eq!(tabs.len(), 4);
@@ -1023,7 +1082,7 @@ fn a_drop_while_plus_is_selected_appends() {
     copy_frame(&root, "01.tif", 2);
     let dropped = vec![root.join("00.tif"), root.join("01.tif")];
     assert!(matches!(
-        controller.open_paths(&dropped),
+        common::open_and_settle(&mut controller, &dropped),
         OpenOutcome::Opened(_)
     ));
 

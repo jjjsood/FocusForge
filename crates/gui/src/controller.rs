@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::diagnostics::{
@@ -145,6 +145,18 @@ pub enum ShellEvent {
     /// The projects overlay's own state moved: opened, closed, its gallery
     /// scrolled, or its failure cards changed.
     OverlayChanged,
+    /// A background load ([`AppController::open_paths`]) started.
+    LoadStarted,
+    /// A background load ticked: how many frames its worker has read of how
+    /// many it found. The first tick a load raises carries the frame total;
+    /// before it, the total is unknown.
+    LoadProgress {
+        frames_read: u32,
+        frame_total: u32,
+    },
+    /// A background load's result is ready to settle
+    /// ([`AppController::settle_open`]).
+    LoadReady,
 }
 
 /// One live drag: which action it started and the last position seen, so
@@ -288,8 +300,21 @@ struct ProjectTab {
     request: Option<job::JobRequest>,
 }
 
+/// Whether a project's own load worker attempted to decode its thumbnail --
+/// [`ProjectTab::new`] must tell "no worker ran" from "a worker ran and the
+/// decode failed" apart, since only the first retries synchronously.
+enum ThumbnailSource {
+    /// No worker ran for this project's own load.
+    NotAttempted,
+    /// A worker ran; `None` is a failed decode, not a missing attempt.
+    Decoded(Option<Arc<overlay::Thumbnail>>),
+}
+
 impl ProjectTab {
-    fn new(mut project: GuiProject, id: u64) -> Self {
+    /// `thumbnail` reports what the load's own worker already did for this
+    /// project. [`ThumbnailSource::NotAttempted`] falls back to decoding it
+    /// right here; a worker's own failed decode opens the tab with none.
+    fn new(mut project: GuiProject, id: u64, thumbnail: ThumbnailSource) -> Self {
         let title = entry::tab_title(&project);
         let ctx = entry::tab_stack_context(&project);
         let image =
@@ -303,7 +328,12 @@ impl ProjectTab {
         let frames = entry::project_frames(&project);
         let excluded = vec![false; frames.len()];
         let selected = images::first_included(&excluded);
-        let thumbnail = overlay::render_thumbnail(&mut project, &frames).map(Arc::new);
+        let thumbnail = match thumbnail {
+            ThumbnailSource::Decoded(thumbnail) => thumbnail,
+            ThumbnailSource::NotAttempted => {
+                overlay::render_thumbnail(&mut project, &frames).map(Arc::new)
+            }
+        };
         ProjectTab {
             id,
             project,
@@ -506,6 +536,40 @@ struct ShellState {
     /// so the next [`AppController::canvas_feed`] reloads even though the
     /// owner index still compares equal.
     canvas_dirty: bool,
+    /// The in-flight background load, if any.
+    load: LoadSlot,
+}
+
+/// One load's worker result, parked here until
+/// [`AppController::settle_open`] resolves it -- the way a completed fuse
+/// run's own result is (`JobSlot`, below), minus the cancellation control a
+/// fuse run needs: a load either finishes or fails.
+#[derive(Default)]
+struct LoadSlot {
+    in_flight: bool,
+    outcome: Arc<Mutex<Option<LoadResult>>>,
+}
+
+/// [`AppController::open_paths`]'s worker outcome, plus the thumbnail it
+/// decoded for each opened project (in [`Opened::projects`] order, empty for
+/// a [`OpenOutcome::Question`]/[`OpenOutcome::Refused`]) -- decoded on the
+/// worker thread so [`AppController::settle_open`] never reads a frame's
+/// pixels on the event-loop thread.
+struct LoadResult {
+    outcome: OpenOutcome,
+    thumbnails: Vec<Option<Arc<overlay::Thumbnail>>>,
+}
+
+/// Decodes one thumbnail per project, in order -- what [`AppController::open_paths`]
+/// and [`AppController::answer_question`] both run on their own worker thread.
+fn decode_thumbnails(projects: &mut [GuiProject]) -> Vec<Option<Arc<overlay::Thumbnail>>> {
+    projects
+        .iter_mut()
+        .map(|project| {
+            let frames = entry::project_frames(project);
+            overlay::render_thumbnail(project, &frames).map(Arc::new)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -927,6 +991,22 @@ impl AppController {
         }
     }
 
+    /// Fits the active tab's viewport when it has none yet and a pane
+    /// geometry is known. A tab that becomes active without the canvas
+    /// resizing -- a load settling, a tab switch -- gets no
+    /// [`Self::set_pane_geometry`] call of its own to fit it.
+    pub fn fit_if_unfitted(&mut self) {
+        let Some((left, _)) = self.state.panes else {
+            return;
+        };
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        if let (Some(image), None) = (tab.image, &tab.viewport) {
+            tab.viewport = Some(crate::viewport::fit(image, left));
+        }
+    }
+
     /// One ladder step in, about the pane's centre -- a button has no
     /// cursor.
     pub fn zoom_in(&mut self) {
@@ -1196,34 +1276,124 @@ impl AppController {
     // -- The entry path: the picker, the drop route and `--open` all call
     // `open_paths`, so the two entrances and the flag cannot diverge. --
 
-    /// The one entry point for the picker (`src/picker.rs`), the drop
-    /// handler (`src/bridge.rs`) and `--open` (`src/main.rs`).
+    /// The one entry point for the picker, the drop handler and `--open`.
+    /// Classifies `paths` synchronously, then runs the directory walk,
+    /// header reads or project unzip on a spawned worker, reporting
+    /// [`ShellEvent::LoadStarted`]/[`ShellEvent::LoadProgress`]/[`ShellEvent::LoadReady`]
+    /// through the sink; [`Self::settle_open`] applies the worker's outcome.
     ///
-    /// The returned [`OpenOutcome::Opened`] always carries an empty
-    /// `projects` -- ownership of the opened [`GuiProject`]s moves onto this
-    /// controller's own tabs, which [`Self::project_tabs`],
-    /// [`Self::active_project`] and [`Self::frame_count`] read back; the
-    /// return value is a signal that the call resolved, not a second copy of
-    /// state the caller must track itself.
-    pub fn open_paths(&mut self, paths: &[PathBuf]) -> OpenOutcome {
-        match entry::classify(paths) {
-            Ok(target) => self.resolve_open(entry::open(target)),
-            Err(err) => self.refuse(err),
+    /// Returns the worker's join handle; `None` when nothing started -- a
+    /// load already in flight, or `paths` failed to classify.
+    pub fn open_paths(&mut self, paths: &[PathBuf]) -> Option<std::thread::JoinHandle<()>> {
+        if self.state.load.in_flight {
+            return None;
         }
+        let target = match entry::classify(paths) {
+            Ok(target) => target,
+            Err(err) => {
+                self.refuse(err);
+                return None;
+            }
+        };
+        self.state.load.in_flight = true;
+        self.emit(ShellEvent::LoadStarted);
+
+        let sink = self.sink.clone();
+        let outcome_slot = Arc::clone(&self.state.load.outcome);
+        Some(std::thread::spawn(move || {
+            let mut last_tick: Option<Instant> = None;
+            let mut outcome = entry::open(target, |frames_read, frame_total| {
+                let done = frame_total > 0 && frames_read == frame_total;
+                let due = last_tick.is_none_or(|tick| tick.elapsed() >= job::POLL);
+                if !(done || due) {
+                    return;
+                }
+                last_tick = Some(Instant::now());
+                if let Some(sink) = &sink {
+                    sink(ShellEvent::LoadProgress {
+                        frames_read: frames_read as u32,
+                        frame_total: frame_total as u32,
+                    });
+                }
+            });
+            // Decoded here, alongside the header walk, so `settle_open`
+            // never reads a frame's pixels on the event-loop thread --
+            // opening the reference stack's 44.8 MP first frame measured
+            // ~5s synchronously.
+            let thumbnails = match &mut outcome {
+                OpenOutcome::Opened(opened) => decode_thumbnails(&mut opened.projects),
+                OpenOutcome::Question(..) | OpenOutcome::Refused(_) => Vec::new(),
+            };
+            *outcome_slot
+                .lock()
+                .expect("no thread panicked while holding the load outcome") = Some(LoadResult {
+                outcome,
+                thumbnails,
+            });
+            if let Some(sink) = &sink {
+                sink(ShellEvent::LoadReady);
+            }
+        }))
     }
 
-    /// Answers the one pending grouping question. A no-op signalled as a
-    /// refusal when nothing is pending -- the UI only ever calls this while
-    /// [`Self::pending_question`] is `Some`.
-    pub fn answer_question(&mut self, answer: OpenAs) -> OpenOutcome {
+    /// Whether a background load started by [`Self::open_paths`] is still
+    /// running -- what gates the loading indicator and a second
+    /// [`Self::open_paths`] call while one is in flight.
+    pub fn load_in_flight(&self) -> bool {
+        self.state.load.in_flight
+    }
+
+    /// Picks up the parked outcome of a settled background load and resolves
+    /// it exactly as a synchronous open does -- `accept`/`refuse` raise
+    /// the same [`ShellEvent::ProjectsChanged`] / [`ShellEvent::QuestionRaised`]
+    /// / [`ShellEvent::EntryRefused`]. Clears the in-flight flag. `None` when
+    /// nothing is parked (called with no load having settled).
+    pub fn settle_open(&mut self) -> Option<OpenOutcome> {
+        let result = self
+            .state
+            .load
+            .outcome
+            .lock()
+            .expect("no thread panicked while holding the load outcome")
+            .take()?;
+        self.state.load.in_flight = false;
+        Some(self.resolve_open(result.outcome, result.thumbnails))
+    }
+
+    /// Answers the one pending grouping question, decoding the answer's own
+    /// thumbnails on a spawned worker -- the same shape [`Self::open_paths`]
+    /// uses, reported and settled through the same load slot. A no-op
+    /// refusal, raised inline, when nothing is pending -- the UI only ever
+    /// calls this while [`Self::pending_question`] is `Some`. Returns the
+    /// worker's join handle; `None` when nothing started.
+    pub fn answer_question(&mut self, answer: OpenAs) -> Option<std::thread::JoinHandle<()>> {
+        if self.state.load.in_flight {
+            return None;
+        }
         let Some((_, proposal)) = self.state.pending.take() else {
-            return OpenOutcome::Refused(EntryError::Unreadable {
+            self.refuse(EntryError::Unreadable {
                 path: PathBuf::new(),
             });
+            return None;
         };
-        self.resolve_open(OpenOutcome::Opened(entry::answer_question(
-            &proposal, answer,
-        )))
+        self.state.load.in_flight = true;
+        self.emit(ShellEvent::LoadStarted);
+
+        let sink = self.sink.clone();
+        let outcome_slot = Arc::clone(&self.state.load.outcome);
+        Some(std::thread::spawn(move || {
+            let mut opened = entry::answer_question(&proposal, answer);
+            let thumbnails = decode_thumbnails(&mut opened.projects);
+            *outcome_slot
+                .lock()
+                .expect("no thread panicked while holding the load outcome") = Some(LoadResult {
+                outcome: OpenOutcome::Opened(opened),
+                thumbnails,
+            });
+            if let Some(sink) = &sink {
+                sink(ShellEvent::LoadReady);
+            }
+        }))
     }
 
     /// Withdraws the pending question with no project opened. Clears
@@ -1259,11 +1429,19 @@ impl AppController {
         self.state.last_refusal.as_deref()
     }
 
-    fn resolve_open(&mut self, outcome: OpenOutcome) -> OpenOutcome {
+    /// `thumbnails` are the pictures the load's own worker already decoded
+    /// for `outcome`'s own projects -- both [`Self::open_paths`] and
+    /// [`Self::answer_question`] decode on their worker before parking the
+    /// outcome here, so [`ProjectTab::new`] never decodes one of its own.
+    fn resolve_open(
+        &mut self,
+        outcome: OpenOutcome,
+        thumbnails: Vec<Option<Arc<overlay::Thumbnail>>>,
+    ) -> OpenOutcome {
         match outcome {
             OpenOutcome::Opened(opened) => {
                 let skipped = opened.skipped.clone();
-                self.accept(opened);
+                self.accept(opened, thumbnails);
                 OpenOutcome::Opened(Opened {
                     projects: Vec::new(),
                     skipped,
@@ -1285,7 +1463,7 @@ impl AppController {
     /// project whose sources do not all resolve becomes a `Sources missing`
     /// one alongside its tab; a path that opens successfully clears any card
     /// already held for it.
-    fn accept(&mut self, opened: Opened) {
+    fn accept(&mut self, opened: Opened, thumbnails: Vec<Option<Arc<overlay::Thumbnail>>>) {
         self.state.notice = notice_line(&opened.skipped);
         self.state.last_refusal = None;
         for skipped in &opened.skipped {
@@ -1293,6 +1471,7 @@ impl AppController {
         }
         if !opened.projects.is_empty() {
             self.set_active_tab(Some(self.state.projects.len()));
+            self.close_projects_overlay();
             let opened_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -1326,10 +1505,17 @@ impl AppController {
                     });
                 }
             }
+            let mut thumbnails = thumbnails.into_iter();
             for project in opened.projects {
+                let source = match thumbnails.next() {
+                    Some(decoded) => ThumbnailSource::Decoded(decoded),
+                    None => ThumbnailSource::NotAttempted,
+                };
                 self.next_tab_id += 1;
                 let id = self.next_tab_id;
-                self.state.projects.push(ProjectTab::new(project, id));
+                self.state
+                    .projects
+                    .push(ProjectTab::new(project, id, source));
             }
         }
         self.settle_tab_scroll();
@@ -2569,6 +2755,7 @@ impl AppController {
         let mut new_tab = ProjectTab::new(
             entry::duplicate_as_unsaved(dir, name, tab.frames.clone()),
             id,
+            ThumbnailSource::NotAttempted,
         );
         new_tab.fuse_id = tab.fuse_id.clone();
         new_tab.align_id = tab.align_id.clone();

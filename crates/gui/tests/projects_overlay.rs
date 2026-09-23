@@ -53,7 +53,7 @@ fn open_frames(controller: &mut AppController, name: &str, count: usize) -> Path
         copy_frame(&root, &format!("{i:02}.tif"), i);
     }
     assert!(matches!(
-        controller.open_paths(std::slice::from_ref(&root)),
+        common::open_and_settle(controller, std::slice::from_ref(&root)),
         OpenOutcome::Opened(_)
     ));
     root
@@ -126,7 +126,7 @@ fn open_unalignable_frames(controller: &mut AppController, name: &str) -> PathBu
     write_synthetic_frame(&root.join("00.tif"), 64, false);
     write_synthetic_frame(&root.join("01.tif"), 64, true);
     assert!(matches!(
-        controller.open_paths(std::slice::from_ref(&root)),
+        common::open_and_settle(controller, std::slice::from_ref(&root)),
         OpenOutcome::Opened(_)
     ));
     controller.set_align_algorithm("pyramidal-ecc");
@@ -189,7 +189,7 @@ fn open_folder_with_a_skipped_subfolder(controller: &mut AppController, name: &s
     std::fs::create_dir_all(root.join("thumbs")).unwrap();
     std::fs::write(root.join("thumbs").join("readme.txt"), b"not a frame").unwrap();
     assert!(matches!(
-        controller.open_paths(std::slice::from_ref(&root)),
+        common::open_and_settle(controller, std::slice::from_ref(&root)),
         OpenOutcome::Opened(_)
     ));
     root
@@ -453,7 +453,7 @@ fn four_failure_cards_have_their_shapes() {
 
     let as_given = seal_as_given_project("four_kinds_as_given");
     assert!(matches!(
-        controller.open_paths(&[as_given]),
+        common::open_and_settle(&mut controller, &[as_given]),
         OpenOutcome::Opened(_)
     ));
 
@@ -523,7 +523,7 @@ fn no_card_shows_a_measure() {
     open_folder_with_a_skipped_subfolder(&mut controller, "no_measure_skip");
     let as_given = seal_as_given_project("no_measure_as_given");
     assert!(matches!(
-        controller.open_paths(&[as_given]),
+        common::open_and_settle(&mut controller, &[as_given]),
         OpenOutcome::Opened(_)
     ));
     open_unalignable_frames(&mut controller, "no_measure_fail");

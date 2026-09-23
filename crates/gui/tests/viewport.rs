@@ -51,7 +51,7 @@ fn mantis_512_dir() -> PathBuf {
 /// the frame headers.
 fn opened_controller() -> AppController {
     let mut controller = AppController::new();
-    controller.open_paths(&[mantis_512_dir()]);
+    common::open_and_settle(&mut controller, &[mantis_512_dir()]);
     controller.set_pane_geometry(
         PaneRect {
             x: 16.0,
@@ -67,6 +67,21 @@ fn opened_controller() -> AppController {
         },
     );
     controller
+}
+
+/// A tab that settles after the pane geometry was pushed gets no resize of
+/// its own; the draw path's fit is what gives it a viewport.
+#[test]
+fn a_tab_opened_after_the_geometry_push_fits_on_draw() {
+    let mut controller = AppController::new();
+    controller.set_pane_geometry(pane(566.0, 748.0), pane(566.0, 748.0));
+    common::open_and_settle(&mut controller, &[mantis_512_dir()]);
+    assert_eq!(controller.zoom_readout(), "");
+
+    controller.fit_if_unfitted();
+
+    assert!(!controller.zoom_readout().is_empty());
+    assert!(controller.frame_draw().is_some());
 }
 
 // ---------------------------------------------------------------------

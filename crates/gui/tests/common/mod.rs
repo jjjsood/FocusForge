@@ -10,6 +10,8 @@ use std::process::Command;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use focusforge_gui::{AppController, OpenAs, OpenOutcome};
+
 /// `crates/gui/../..` -- the workspace root.
 pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
@@ -170,6 +172,32 @@ pub fn gui_bin(test_name: &str) -> Command {
 #[allow(dead_code)]
 pub fn has_display() -> bool {
     std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+/// Starts a load, blocks until its worker finishes, and settles it --
+/// `AppController::open_paths` runs off-thread, so a test that needs the
+/// outcome synchronously waits for it here.
+#[allow(dead_code)]
+pub fn open_and_settle(controller: &mut AppController, paths: &[PathBuf]) -> OpenOutcome {
+    if let Some(handle) = controller.open_paths(paths) {
+        handle.join().expect("the load worker did not panic");
+    }
+    controller
+        .settle_open()
+        .expect("a load was started, so one outcome is parked")
+}
+
+/// Answers the pending grouping question, blocks until its worker finishes,
+/// and settles it -- `AppController::answer_question` runs off-thread too,
+/// the same as [`open_and_settle`].
+#[allow(dead_code)]
+pub fn answer_and_settle(controller: &mut AppController, answer: OpenAs) -> OpenOutcome {
+    if let Some(handle) = controller.answer_question(answer) {
+        handle.join().expect("the load worker did not panic");
+    }
+    controller
+        .settle_open()
+        .expect("a load was started, so one outcome is parked")
 }
 
 /// A `<root>/focusforge` data directory holding roughly `total_log_bytes`

@@ -168,6 +168,10 @@ export component FFCanvas inherits Rectangle {
     // either pane -- `tests/shell.rs`'s pane-geometry tests keep finding
     // `pane-left`/`pane-right` at their spec rects regardless.
     in property <bool> show-empty-state: true;
+    // A background load in flight: hides the empty state for that span, so
+    // its own text never bleeds around the loading indicator drawn over
+    // this same region.
+    in property <bool> load-active: false;
     callback open-folder-requested();
 
     // The pane geometry `AppController::set_pane_geometry` needs, read back
@@ -262,7 +266,7 @@ export component FFCanvas inherits Rectangle {
         y: 0px;
         width: 100%;
         height: 100%;
-        visible: root.show-empty-state;
+        visible: root.show-empty-state && !root.load-active;
         open-folder-requested => { root.open-folder-requested(); }
     }
 }

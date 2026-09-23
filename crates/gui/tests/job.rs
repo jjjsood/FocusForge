@@ -45,7 +45,7 @@ fn controller_with_frames(name: &str, count: usize) -> AppController {
     }
     let mut controller = AppController::new();
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
     controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
@@ -62,7 +62,7 @@ fn controller_with_two_tabs(name: &str) -> AppController {
         copy_frame(&root_b, &format!("{i:02}.tif"), i);
     }
     assert!(matches!(
-        controller.open_paths(&[root_b]),
+        common::open_and_settle(&mut controller, &[root_b]),
         OpenOutcome::Opened(_)
     ));
     controller.select_project(0);
@@ -79,7 +79,7 @@ fn controller_with_three_tabs(name: &str) -> AppController {
         copy_frame(&root_c, &format!("{i:02}.tif"), i);
     }
     assert!(matches!(
-        controller.open_paths(&[root_c]),
+        common::open_and_settle(&mut controller, &[root_c]),
         OpenOutcome::Opened(_)
     ));
     controller.select_project(0);
@@ -506,7 +506,7 @@ fn controller_with_unalignable_frames(name: &str) -> AppController {
     write_synthetic_frame(&root.join("01.tif"), 64, true);
     let mut controller = AppController::new();
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
     // Pinned rather than left at the tab's default seed: the flat frame's
@@ -842,7 +842,7 @@ fn a_reopened_project_reports_the_count_on_disk() {
     let project_path = opened_project_path("reopen_count_frames", &controller);
     let mut reopened = AppController::new();
     assert!(matches!(
-        reopened.open_paths(&[project_path]),
+        common::open_and_settle(&mut reopened, &[project_path]),
         OpenOutcome::Opened(_)
     ));
     assert_eq!(
@@ -979,7 +979,7 @@ fn an_absolute_but_present_source_still_re_fuses() {
 
     let mut controller = AppController::new();
     assert!(matches!(
-        controller.open_paths(&[project_path]),
+        common::open_and_settle(&mut controller, &[project_path]),
         OpenOutcome::Opened(_)
     ));
     controller.set_scratch_root_for_test(common::tree("as_given_scratch"));
@@ -1105,7 +1105,7 @@ fn add_unalignable_tab(controller: &mut AppController, name: &str, frame_count: 
         write_synthetic_frame(&root.join(format!("{i:02}.tif")), 64, true);
     }
     assert!(matches!(
-        controller.open_paths(&[root]),
+        common::open_and_settle(controller, &[root]),
         OpenOutcome::Opened(_)
     ));
     controller.set_align_algorithm("pyramidal-ecc");
@@ -1481,7 +1481,7 @@ fn a_run_keeps_its_tab_when_an_earlier_tab_closes() {
         copy_frame(&root_c, &format!("{i:02}.tif"), i);
     }
     assert!(matches!(
-        controller.open_paths(&[root_c]),
+        common::open_and_settle(&mut controller, &[root_c]),
         OpenOutcome::Opened(_)
     ));
 
@@ -1599,7 +1599,7 @@ fn an_invalid_tab_is_refused_rather_than_queued() {
         copy_frame(&root_b, &format!("{i:02}.tif"), i);
     }
     assert!(matches!(
-        controller.open_paths(&[root_b]),
+        common::open_and_settle(&mut controller, &[root_b]),
         OpenOutcome::Opened(_)
     ));
     controller.select_project(1);
@@ -1786,7 +1786,7 @@ fn retry_queues_while_another_run_is_live() {
         copy_frame(&survivor_root, &format!("{i:02}.tif"), i);
     }
     assert!(matches!(
-        controller.open_paths(&[survivor_root]),
+        common::open_and_settle(&mut controller, &[survivor_root]),
         OpenOutcome::Opened(_)
     ));
 
@@ -1856,7 +1856,7 @@ fn closing_the_owning_tab_mid_run_promotes_nothing() {
         copy_frame(&survivor_root, &format!("{i:02}.tif"), i);
     }
     assert!(matches!(
-        controller.open_paths(&[survivor_root]),
+        common::open_and_settle(&mut controller, &[survivor_root]),
         OpenOutcome::Opened(_)
     ));
 

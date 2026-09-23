@@ -25,7 +25,7 @@ fn mantis_512() -> PathBuf {
 
 /// Opens the fixture as one project, asserting it landed as one tab.
 fn open_mantis_512(controller: &mut AppController) {
-    let outcome = controller.open_paths(&[mantis_512()]);
+    let outcome = common::open_and_settle(controller, &[mantis_512()]);
     assert!(
         matches!(outcome, OpenOutcome::Opened(_)),
         "fixtures/mantis-512 must open as one project"

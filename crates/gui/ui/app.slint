@@ -21,6 +21,7 @@ import { FFSettingsModal, InputRow, FFManifestRow } from "shell/settings_modal.s
 export { InputRow, FFManifestRow }
 import { FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFToast } from "shell/dialogs.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
+import { FFLoadingIndicator } from "shell/loading.slint";
 export { ProjectCardView, RecentRowView }
 
 export component AppWindow inherits Window {
@@ -126,19 +127,24 @@ export component AppWindow inherits Window {
     // The transport's current run state: "idle" | "running" | "paused" |
     // "cancelling" | "failed".
     in property <string> toolbar-run-state: "idle";
-    in property <bool> fuse-enabled: true;
+    // `false` until Rust sets it: matches `fuse_enabled()`'s own default (no
+    // tab means nothing to fuse), so the toolbar reads disabled from the
+    // window's very first frame, before any project has ever opened.
+    in property <bool> fuse-enabled: false;
     // Another tab's run is live and this one holds no place in it -- the
     // next `Fuse stack` press here would enqueue rather than start.
     in property <bool> toolbar-would-queue: false;
 
-    // Hidden with no project open (or "+" selected over background tabs) --
-    // there is no run to transport. `canvas-ground` below grows into its row.
+    // Always occupies its row, so a tab mounting never shifts the canvas
+    // below it -- with no project open (or "+" selected over background
+    // tabs) `fuse-enabled` and `toolbar-run-state` already resolve to their
+    // inert values, so the row renders itself disabled without a separate
+    // hidden state.
     toolbar := FFToolbar {
         x: 0px;
         y: ShellGeometry.strip-height;
         width: root.width - ShellGeometry.dock-width;
-        height: root.show-empty-state ? 0px : ShellGeometry.toolbar-height;
-        visible: !root.show-empty-state;
+        height: ShellGeometry.toolbar-height;
         run-state: root.toolbar-run-state;
         fuse-enabled: root.fuse-enabled;
         would-queue: root.toolbar-would-queue;
@@ -148,9 +154,6 @@ export component AppWindow inherits Window {
         cancel-requested => { root.cancel-requested(); }
         retry-requested => { root.retry-requested(); }
     }
-
-    property <length> toolbar-visible-height: root.show-empty-state
-        ? 0px : ShellGeometry.toolbar-height;
 
     // Both images are `in` properties set from Rust
     // (`crates/gui/src/gpu_canvas.rs`) once a project is loaded -- the wgpu
@@ -215,9 +218,9 @@ export component AppWindow inherits Window {
 
     canvas-ground := FocusScope {
         x: 0px;
-        y: ShellGeometry.strip-height + root.toolbar-visible-height;
+        y: ShellGeometry.strip-height + ShellGeometry.toolbar-height;
         width: root.width - ShellGeometry.dock-width;
-        height: root.height - ShellGeometry.strip-height - root.toolbar-visible-height
+        height: root.height - ShellGeometry.strip-height - ShellGeometry.toolbar-height
             - ShellGeometry.bottom-bar-height;
 
         // `reject` so the chrome accelerators still reach the parent;
@@ -256,6 +259,7 @@ export component AppWindow inherits Window {
             frame-image-h: root.frame-image-h;
             pixelated: root.pixelated;
             show-empty-state: root.show-empty-state;
+            load-active: root.load-active;
 
             composite-undock-requested => { root.composite-undock-requested(); }
             zmap-undock-requested => { root.zmap-undock-requested(); }
@@ -430,6 +434,13 @@ export component AppWindow inherits Window {
     in property <float> bar-fraction: 0.0;
     in property <string> bar-tone: "running";
     in property <string> eta-text: "";
+
+    // Whether a background stack load is in flight
+    // (`AppController::open_paths`), pushed on every `LoadStarted`/`LoadReady`.
+    in property <bool> load-active: false;
+    // Whether the loading indicator's own show threshold has let it become
+    // visible -- read by a headless test, with no running window.
+    out property <bool> load-indicator-visible: loading-indicator.load-visible;
 
     bottom-bar := FFBottomBar {
         x: 0px;
@@ -620,6 +631,14 @@ export component AppWindow inherits Window {
         cancelled => { root.frame-warning-cancelled(); }
         secondary-pressed => { root.frame-warning-secondary-pressed(); }
         confirmed => { root.frame-warning-confirmed(); }
+    }
+
+    loading-indicator := FFLoadingIndicator {
+        x: canvas-ground.x;
+        y: canvas-ground.y;
+        width: canvas-ground.width;
+        height: canvas-ground.height;
+        load-active: root.load-active;
     }
 
     // `no-frame: true` above means the compositor draws no OS chrome, so

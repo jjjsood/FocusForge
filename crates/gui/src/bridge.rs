@@ -19,8 +19,8 @@ use winit::window::WindowId;
 
 use crate::canvas::CanvasFeed;
 use crate::controller::{
-    AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, SettingsSection,
-    ShellEvent, ShellMode,
+    AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, OpenOutcome,
+    SettingsSection, ShellEvent, ShellMode,
 };
 use crate::diagnostics::DiagnosticsStatus;
 use crate::generated::{
@@ -175,7 +175,9 @@ pub fn repaint(
 ) {
     let feed = {
         let loaded = canvas.borrow().tab();
-        controller.lock().unwrap().canvas_feed(loaded)
+        let mut controller = controller.lock().unwrap();
+        controller.fit_if_unfitted();
+        controller.canvas_feed(loaded)
     };
     match feed {
         CanvasFeed::Keep => {}
@@ -529,6 +531,41 @@ fn start_job_timer(
     *job_timer.borrow_mut() = Some(timer);
 }
 
+/// Polls [`AppController::load_in_flight`], opening each `queued` path once
+/// the one before it settles, then repaints -- the sink that settles a load
+/// cannot reach the canvas. Replaces (and so stops) any timer in `slot`.
+pub fn start_load_timer(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+    slot: &Rc<RefCell<Option<slint::Timer>>>,
+    queued: Vec<PathBuf>,
+) {
+    let mut queued = queued.into_iter();
+    let timer_slot = slot.clone();
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().load_in_flight() {
+            return;
+        }
+        if let Some(next) = queued.next() {
+            controller
+                .lock()
+                .unwrap()
+                .open_paths(std::slice::from_ref(&next));
+            return;
+        }
+        repaint(&app, &controller, &canvas);
+        if let Some(t) = timer_slot.borrow().as_ref() {
+            t.stop();
+        }
+    });
+    *slot.borrow_mut() = Some(timer);
+}
+
 /// `RowKind`'s own string reading -- the settings panel's `.slint` side
 /// branches on this, never on a `ParamKind` or an algorithm id.
 fn row_kind_str(kind: RowKind) -> &'static str {
@@ -759,6 +796,7 @@ pub struct DropHandler {
     canvas: Rc<RefCell<Canvas>>,
     app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>>,
     pending: Vec<PathBuf>,
+    load_timer: Rc<RefCell<Option<slint::Timer>>>,
 }
 
 impl DropHandler {
@@ -777,6 +815,7 @@ impl DropHandler {
             canvas,
             app_handle,
             pending: Vec::new(),
+            load_timer: Rc::new(RefCell::new(None)),
         }
     }
 }
@@ -800,42 +839,44 @@ impl CustomApplicationHandler for DropHandler {
         if !self.pending.is_empty() {
             let paths = std::mem::take(&mut self.pending);
             let _ = self.controller.lock().unwrap().open_paths(&paths);
-            // `repaint` reconciles the canvas with whatever became active --
-            // the same tail every other open path ends in, so a dropped
-            // project's own planes replace whatever the canvas held before,
-            // with no further gesture needed.
-            if let Some(app) = self
-                .app_handle
-                .borrow()
-                .as_ref()
-                .and_then(slint::Weak::upgrade)
-            {
-                repaint(&app, &self.controller, &self.canvas);
+            // The same settle-then-repaint tail every other open path ends
+            // in, so a dropped project's own planes replace whatever the
+            // canvas held before, with no further gesture needed.
+            if let Some(app_weak) = self.app_handle.borrow().clone() {
+                start_load_timer(
+                    app_weak,
+                    self.controller.clone(),
+                    self.canvas.clone(),
+                    &self.load_timer,
+                    Vec::new(),
+                );
             }
         }
         EventResult::Propagate
     }
 }
 
-/// Opens `path`, if the picker returned one, closes the projects overlay on
-/// a successful open, and repaints -- the rail's `New project`/`Open
-/// project…` actions and their `Ctrl+N`/`Ctrl+O` chrome-key twins share this
-/// one path.
+/// Opens `path`, if the picker returned one, and repaints once the load
+/// settles -- the rail's `New project`/`Open project…` actions and their
+/// `Ctrl+N`/`Ctrl+O` chrome-key twins share this one path. The projects
+/// overlay closes itself once the load settles onto a real tab
+/// (`AppController::accept`), the same as a successful open.
 fn open_from_picker(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
     app_weak: &slint::Weak<AppWindow>,
+    load_timer: &Rc<RefCell<Option<slint::Timer>>>,
     path: Option<PathBuf>,
 ) {
     let Some(path) = path else { return };
-    dispatch(controller, canvas, app_weak, |controller| {
-        if matches!(
-            controller.open_paths(&[path]),
-            crate::OpenOutcome::Opened(_)
-        ) {
-            controller.close_projects_overlay();
-        }
-    });
+    controller.lock().unwrap().open_paths(&[path]);
+    start_load_timer(
+        app_weak.clone(),
+        controller.clone(),
+        canvas.clone(),
+        load_timer,
+        Vec::new(),
+    );
 }
 
 /// Wires every callback in `app` to `controller`, and returns [`Installed`]
@@ -852,6 +893,7 @@ pub fn install(
 ) -> Installed {
     let job_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     let toast_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+    let load_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
 
     {
         let app_weak = app.as_weak();
@@ -1058,6 +1100,7 @@ pub fn install(
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let load_timer = load_timer.clone();
         move |text, ctrl, shift, alt| {
             let mods = {
                 let controller = controller.lock().unwrap();
@@ -1067,13 +1110,18 @@ pub fn install(
             match chrome {
                 ChromeKey::None => controller.lock().unwrap().key(true, text.as_str(), mods),
                 ChromeKey::Consumed => {}
-                ChromeKey::NewProject => {
-                    open_from_picker(&controller, &canvas, &app_weak, crate::picker::pick_entry())
-                }
+                ChromeKey::NewProject => open_from_picker(
+                    &controller,
+                    &canvas,
+                    &app_weak,
+                    &load_timer,
+                    crate::picker::pick_entry(),
+                ),
                 ChromeKey::OpenProject => open_from_picker(
                     &controller,
                     &canvas,
                     &app_weak,
+                    &load_timer,
                     crate::picker::pick_project(),
                 ),
             }
@@ -1244,20 +1292,22 @@ pub fn install(
         }
     });
 
-    // The entry path: the picker is a one-line forward, and `open_paths`'s
-    // own sink pushes every property this raises (`ShellEvent::ProjectsChanged`/
-    // `QuestionRaised`/`EntryRefused`); `dispatch`'s own repaint is what feeds
-    // the canvas for whichever tab the open landed on.
+    // The entry path: `open_paths`'s own sink pushes every property a load
+    // raises (`ShellEvent::LoadReady` and friends); the load timer's repaint
+    // feeds the canvas for whichever tab the open landed on.
     app.on_open_folder_requested({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let load_timer = load_timer.clone();
         move || {
-            if let Some(path) = crate::picker::pick_entry() {
-                dispatch(&controller, &canvas, &app_weak, |controller| {
-                    let _ = controller.open_paths(&[path]);
-                });
-            }
+            open_from_picker(
+                &controller,
+                &canvas,
+                &app_weak,
+                &load_timer,
+                crate::picker::pick_entry(),
+            )
         }
     });
     app.on_plus_clicked({
@@ -1308,20 +1358,48 @@ pub fn install(
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let load_timer = load_timer.clone();
         move || {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
-                let _ = controller.answer_question(OpenAs::OneProject);
-            });
+            let _ = controller
+                .lock()
+                .unwrap()
+                .answer_question(OpenAs::OneProject);
+            // The answer's decode runs on a worker, so nothing else pushes
+            // `question_open` before it settles -- closed here instead.
+            // When a load is already in flight, the question stays pending
+            // and the next `push_projects` reopens the dialog.
+            if let Some(app) = app_weak.upgrade() {
+                app.set_question_open(false);
+            }
+            start_load_timer(
+                app_weak.clone(),
+                controller.clone(),
+                canvas.clone(),
+                &load_timer,
+                Vec::new(),
+            );
         }
     });
     app.on_question_open_as_many({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let load_timer = load_timer.clone();
         move || {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
-                let _ = controller.answer_question(OpenAs::NProjects);
-            });
+            let _ = controller
+                .lock()
+                .unwrap()
+                .answer_question(OpenAs::NProjects);
+            if let Some(app) = app_weak.upgrade() {
+                app.set_question_open(false);
+            }
+            start_load_timer(
+                app_weak.clone(),
+                controller.clone(),
+                canvas.clone(),
+                &load_timer,
+                Vec::new(),
+            );
         }
     });
     app.on_question_cancelled({
@@ -1338,15 +1416,18 @@ pub fn install(
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let load_timer = load_timer.clone();
         move || {
             if let Some(app) = app_weak.upgrade() {
                 app.set_refusal_open(false);
             }
-            if let Some(path) = crate::picker::pick_entry() {
-                dispatch(&controller, &canvas, &app_weak, |controller| {
-                    let _ = controller.open_paths(&[path]);
-                });
-            }
+            open_from_picker(
+                &controller,
+                &canvas,
+                &app_weak,
+                &load_timer,
+                crate::picker::pick_entry(),
+            )
         }
     });
     app.on_skipped_notice_dismissed({
@@ -1561,17 +1642,28 @@ pub fn install(
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
-        move || open_from_picker(&controller, &canvas, &app_weak, crate::picker::pick_entry())
-    });
-    app.on_projects_open_project_requested({
-        let controller = controller.clone();
-        let canvas = canvas.clone();
-        let app_weak = app.as_weak();
+        let load_timer = load_timer.clone();
         move || {
             open_from_picker(
                 &controller,
                 &canvas,
                 &app_weak,
+                &load_timer,
+                crate::picker::pick_entry(),
+            )
+        }
+    });
+    app.on_projects_open_project_requested({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        let load_timer = load_timer.clone();
+        move || {
+            open_from_picker(
+                &controller,
+                &canvas,
+                &app_weak,
+                &load_timer,
                 crate::picker::pick_project(),
             )
         }
@@ -1812,5 +1904,25 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         }
         ShellEvent::ImagesChanged => push_images_panel(app, &controller.lock().unwrap()),
         ShellEvent::OverlayChanged => push_projects_overlay(app, &controller.lock().unwrap()),
+        // A background load's own three events (`AppController::open_paths`).
+        // The indicator's threshold and fade are the Slint region's own
+        // state, driven by `load-active` alone -- it shows no other part of
+        // a load's progress, so a tick has nothing to push.
+        ShellEvent::LoadStarted => app.set_load_active(true),
+        ShellEvent::LoadProgress { .. } => {}
+        ShellEvent::LoadReady => {
+            let outcome = controller.lock().unwrap().settle_open();
+            // Pushed synchronously, in the same step `load-active` clears --
+            // `settle_open`'s own sink push (`ProjectsChanged` and friends)
+            // only lands a turn later, which would render an empty-state
+            // frame in between.
+            match outcome {
+                Some(OpenOutcome::Opened(_)) => push_projects(app, controller),
+                Some(OpenOutcome::Question(question, _)) => push_question(app, &question),
+                Some(OpenOutcome::Refused(_)) => app.set_refusal_open(true),
+                None => {}
+            }
+            app.set_load_active(false);
+        }
     }
 }
