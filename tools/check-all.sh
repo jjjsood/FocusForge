@@ -51,11 +51,8 @@ case "$TAIL_LINES" in
   ''|*[!0-9]*) usage ;;
 esac
 
-# Before anything creates a log directory: until the first workspace item lands
-# there is no crate to check, and every gate below would report a confusing
-# red for a repository that is simply empty. A clean skip is the honest answer.
 [ -f Cargo.toml ] || {
-  echo "SKIP check-all: no Cargo.toml yet -- the first workspace item creates it"
+  echo "SKIP check-all: no Cargo.toml"
   exit 0
 }
 
@@ -89,6 +86,8 @@ run_gate "rustfmt"          cargo fmt --all --check
 run_gate "licenses"         tools/check-licenses.sh
 run_gate "fixture manifest" tools/check-fixtures.sh
 run_gate "fixture manifest selftest" tools/check-fixtures-selftest.sh
+run_gate "tiff-diff selftest" python3 tools/tiff-diff.py --selftest
+run_gate "rawtiff selftest" python3 tools/lib/rawtiff.py --selftest
 
 if [ "$STATIC_ONLY" -eq 0 ]; then
   # Build-only: proves the no-GPU path still compiles, test targets included.
@@ -119,22 +118,18 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   run_gate "synthetic alignment truth" tools/synth-align.sh
 
   # --- remaining gates --------------------------------------------------
-  run_gate "clippy"         tools/with-lock.sh build -- cargo clippy --workspace --all-targets --all-features -- -D warnings
+  # Default features only, not --all-features: that flag pulled in gpu-tests
+  # (the parity test tree), a third feature-fingerprint compiled on every run
+  # just to be linted, never run. Lint that tree explicitly when it changes:
+  # cargo clippy -p focusforge-gpu --features gpu-tests --all-targets -- -D warnings
+  run_gate "clippy"         tools/with-lock.sh build -- cargo clippy --workspace --all-targets -- -D warnings
 
   # FF_REQUIRE_SYNTH_ALIGN=1 turns the test's skip into a failure when the
   # artefact exists: a skip inside the gate must read as a bug, not a pass.
   REQUIRE_SYNTH=0
   [ -f .scratch/synth-align/measurement.json ] && REQUIRE_SYNTH=1
-  # nextest, not `cargo test`: it runs the workspace's ~40 test binaries in
-  # parallel processes instead of serially, cutting this stage from the sum
-  # of every binary's time down to roughly the slowest one. It cannot run
-  # doctests (a known nextest limitation, not a bug here), so those are a
-  # second, separate cargo test invocation right after. `gpu` is a default
-  # feature and the gpu crate's own suite already runs inside this stage
-  # today at ~0.02s for 36 tests -- cheap enough that nextest's added
-  # cross-binary parallelism is not a GPU contention risk the way an actual
-  # `--features gpu-tests` run is (that one stays outside this gate, and runs
-  # single-threaded).
+  # nextest runs binaries in parallel; doctests need the separate `cargo
+  # test --doc` invocation right after, since nextest cannot run them.
   #
   # A private TMPDIR, emptied first, so the stage after can see what the run
   # abandoned. /tmp is a bounded tmpfs on a current Linux desktop, which a
