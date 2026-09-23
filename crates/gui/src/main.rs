@@ -102,6 +102,44 @@ fn apply_toolbar_state_preview(app: &AppWindow, state: &str) {
     app.set_eta_text(eta.into());
 }
 
+/// Presses `Fuse stack` on each of `indices` in turn, the moment no
+/// background load (`--open`) is still in flight. A press fired while a
+/// load is still running targets a tab that does not exist yet and is
+/// silently dropped, since `--open`'s directory walk and thumbnail decode
+/// run off the event-loop thread and settle only once the window's own poll
+/// picks up their result.
+fn start_fuse_tabs_timer(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    slot: &Rc<RefCell<Option<slint::Timer>>>,
+    indices: Vec<usize>,
+) {
+    let timer_slot = slot.clone();
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        focusforge_gui::job::POLL,
+        move || {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            if controller.lock().unwrap().load_in_flight() {
+                return;
+            }
+            for index in &indices {
+                // The window's own callbacks, so a press here arms the poll
+                // timer exactly as a click on the button does.
+                app.invoke_tab_selected(*index as i32);
+                app.invoke_fuse_requested();
+            }
+            if let Some(t) = timer_slot.borrow().as_ref() {
+                t.stop();
+            }
+        },
+    );
+    *slot.borrow_mut() = Some(timer);
+}
+
 /// Parses `"WxH"`; `None` on anything else, including a missing or
 /// non-numeric dimension.
 fn parse_size(spec: &str) -> Option<(u32, u32)> {
@@ -482,11 +520,14 @@ fn run(args: &Args) -> ExitCode {
             controller.lock().unwrap().remove_frame(index);
         }
 
-        for index in &args.fuse_tabs {
-            // The window's own callbacks, so a press here arms the poll
-            // timer exactly as a click on the button does.
-            app.invoke_tab_selected(*index as i32);
-            app.invoke_fuse_requested();
+        let fuse_tabs_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+        if !args.fuse_tabs.is_empty() {
+            start_fuse_tabs_timer(
+                app.as_weak(),
+                controller.clone(),
+                &fuse_tabs_timer,
+                args.fuse_tabs.clone(),
+            );
         }
 
         run_window(app, args)
