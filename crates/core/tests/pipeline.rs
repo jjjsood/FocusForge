@@ -9,11 +9,11 @@
 mod common;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use focusforge_core::job::{ControlState, JobControl};
+use focusforge_core::job::{ControlState, JobControl, JobProgress};
 use focusforge_core::params::{ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{AlignRequest, FuseOutcome, FuseRequest, RunStage, StageObserver};
 use focusforge_core::registry;
@@ -202,4 +202,77 @@ fn paused_observer_is_called_once_per_segment() {
         1,
         "paused must be called exactly once for the one segment that paused"
     );
+}
+
+// ---------------------------------------------------------------------
+// The align stage's own frame counter.
+// ---------------------------------------------------------------------
+
+#[derive(Default)]
+struct AlignTickLog {
+    ticks: Mutex<Vec<(usize, usize)>>,
+}
+
+impl StageObserver for AlignTickLog {
+    fn tick(&self, progress: &JobProgress) {
+        self.ticks
+            .lock()
+            .expect("no panic while logging")
+            .push((progress.align_done, progress.align_total));
+    }
+}
+
+#[test]
+fn align_progress_counts_every_frame() {
+    for count in [2, 5] {
+        let align = AlignRequest {
+            algorithm: registry::find_align("dummy-align").expect("dummy-align must be registered"),
+            explicit: ParamValues::new(),
+            lax: false,
+        };
+        let mut request = base_request(
+            &format!("align_progress_{count}"),
+            mantis_frames(count),
+            ParamValues::new(),
+        );
+        request.align = Some(align);
+
+        let control = JobControl::new();
+        let observer = AlignTickLog::default();
+        let outcome =
+            focusforge_core::pipeline::run(&request, &observer, Arc::clone(&control), None)
+                .unwrap_or_else(|err| panic!("a {count}-frame run must complete: {err}"));
+        assert!(matches!(outcome, FuseOutcome::Completed(_)));
+
+        // A fast aligner may finish before the watcher's first tick, so the
+        // final tally is read from the control itself rather than from the
+        // last tick -- `align_done`/`align_total` are never reset once the
+        // align stage ends.
+        let final_progress = control.progress();
+        assert_eq!(final_progress.align_total, count);
+        assert_eq!(final_progress.align_done, count);
+
+        let ticks = observer.ticks.lock().expect("no panic while logging");
+        let mut previous_done = 0;
+        for &(done, total) in ticks.iter() {
+            if total == 0 {
+                continue; // a tick from before or after the align stage.
+            }
+            assert_eq!(total, count, "the total must not change mid-stage");
+            assert!(done <= total, "done must never exceed total");
+            assert!(done >= previous_done, "done must never decrease");
+            previous_done = done;
+        }
+    }
+
+    // No align stage at all: both counters stay at 0.
+    let request = base_request("align_progress_none", mantis_frames(2), ParamValues::new());
+    let control = JobControl::new();
+    let outcome =
+        focusforge_core::pipeline::run(&request, &NoopObserver, Arc::clone(&control), None)
+            .expect("a run with no align stage must complete");
+    assert!(matches!(outcome, FuseOutcome::Completed(_)));
+    let progress = control.progress();
+    assert_eq!(progress.align_done, 0);
+    assert_eq!(progress.align_total, 0);
 }

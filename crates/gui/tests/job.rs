@@ -595,6 +595,8 @@ fn steps_map_onto_engine_stages() {
         pixel_total: 0,
         running: Duration::ZERO,
         eta: None,
+        align_done: 0,
+        align_total: 0,
     };
     assert_eq!(
         current_step(&RunState::Running, Some(&aligning)),
@@ -610,6 +612,8 @@ fn steps_map_onto_engine_stages() {
         pixel_total: 0,
         running: Duration::ZERO,
         eta: None,
+        align_done: 0,
+        align_total: 0,
     };
     assert_eq!(
         current_step(&RunState::Running, Some(&fusing)),
@@ -624,6 +628,8 @@ fn steps_map_onto_engine_stages() {
         pixel_total: 0,
         running: Duration::ZERO,
         eta: None,
+        align_done: 0,
+        align_total: 0,
     };
     assert_eq!(
         current_step(&RunState::Running, Some(&sealing)),
@@ -636,6 +642,96 @@ fn steps_map_onto_engine_stages() {
     assert_eq!(current_step(&RunState::Running, None), Some(Step::Fuse));
     assert_eq!(current_step(&RunState::Idle, None), None);
     assert_eq!(current_step(&RunState::Paused, None), None);
+}
+
+// ---------------------------------------------------------------------
+// The align stage's step text and bar fraction carry the live frame count.
+// ---------------------------------------------------------------------
+
+fn align_progress(align_done: usize, align_total: usize) -> focusforge_core::job::JobProgress {
+    use focusforge_core::job::JobStage;
+    focusforge_core::job::JobProgress {
+        stage: JobStage::Align,
+        units_done: 0,
+        unit_total: 0,
+        pixels_done: 0,
+        pixel_total: 0,
+        running: Duration::ZERO,
+        eta: None,
+        align_done,
+        align_total,
+    }
+}
+
+fn fuse_progress(units_done: usize, unit_total: usize) -> focusforge_core::job::JobProgress {
+    use focusforge_core::job::JobStage;
+    focusforge_core::job::JobProgress {
+        stage: JobStage::Fuse,
+        units_done,
+        unit_total,
+        pixels_done: 0,
+        pixel_total: 0,
+        running: Duration::ZERO,
+        eta: None,
+        align_done: 0,
+        align_total: 0,
+    }
+}
+
+#[test]
+fn align_step_text_carries_the_frame_count() {
+    use focusforge_gui::job::{RunState, step_text};
+
+    let three_of_eight = align_progress(3, 8);
+    assert_eq!(step_text(&RunState::Running, Some(&three_of_eight)), "3/8");
+
+    let forty_two_of_sixty_one = align_progress(42, 61);
+    assert_eq!(
+        step_text(&RunState::Running, Some(&forty_two_of_sixty_one)),
+        "42/61"
+    );
+
+    // Fuse and write snapshots keep the three-step vocabulary, not a count.
+    let fusing = fuse_progress(2, 10);
+    assert_eq!(step_text(&RunState::Running, Some(&fusing)), "step 2 of 3");
+
+    let writing = fuse_progress(10, 10);
+    assert_eq!(step_text(&RunState::Running, Some(&writing)), "step 3 of 3");
+}
+
+#[test]
+fn align_bar_fraction_follows_the_frame_count() {
+    use focusforge_gui::job::bar_fraction;
+
+    assert_eq!(bar_fraction(Some(&align_progress(0, 8))), 0.0);
+    assert_eq!(bar_fraction(Some(&align_progress(1, 8))), 1.0 / 8.0);
+    assert_eq!(bar_fraction(Some(&align_progress(7, 8))), 7.0 / 8.0);
+
+    // The first fuse-stage snapshot follows the fuse units again.
+    let fusing = fuse_progress(2, 10);
+    assert_eq!(bar_fraction(Some(&fusing)), 0.2);
+}
+
+#[test]
+fn cached_and_absent_alignment_show_no_frame_count() {
+    use focusforge_gui::job::{RunState, bar_fraction, step_text};
+
+    // A cached alignment: `stage == Align`, but `align_total == 0` (no
+    // computed stage set a total) -- never `0/<n>`, and never a rendered
+    // `0/0`.
+    let cached = align_progress(0, 0);
+    assert_eq!(step_text(&RunState::Running, Some(&cached)), "step 1 of 3");
+    assert_eq!(bar_fraction(Some(&cached)), 0.0);
+
+    // A fuse snapshot that still carries a finished align stage's `8/8`
+    // shows no count -- only the fuse stage's own step text and fraction.
+    let mut finished_align_then_fusing = fuse_progress(0, 10);
+    finished_align_then_fusing.align_done = 8;
+    finished_align_then_fusing.align_total = 8;
+    assert_eq!(
+        step_text(&RunState::Running, Some(&finished_align_then_fusing)),
+        "step 2 of 3"
+    );
 }
 
 // ---------------------------------------------------------------------

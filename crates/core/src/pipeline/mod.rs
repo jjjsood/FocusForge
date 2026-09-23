@@ -133,8 +133,10 @@ pub struct FuseReport {
 }
 
 /// What one run's align stage carries the moment it starts, reported once
-/// through [`StageObserver::stage`] -- before any frame is registered, since
-/// alignment reports no unit progress of its own.
+/// through [`StageObserver::stage`] before any frame is registered. A
+/// computed alignment's own per-frame completion count follows through every
+/// [`StageObserver::tick`] afterwards, on [`JobProgress`]'s `align_done`/
+/// `align_total`.
 pub enum RunStage {
     Align { frames: usize, source: AlignSource },
     Fuse,
@@ -342,6 +344,7 @@ pub fn run(
                     frames: stack.len(),
                     source: AlignSource::Computed,
                 });
+                let frames_done = control.begin_align(stack.len());
                 let done = AtomicBool::new(false);
                 let poll = request.poll;
                 // Span context does not cross onto the watcher thread by
@@ -376,7 +379,10 @@ pub fn run(
                         &stack,
                         &align_values,
                         policy,
-                        &AlignDriverOptions::default(),
+                        &AlignDriverOptions {
+                            frames_done: Some(frames_done),
+                            ..Default::default()
+                        },
                     );
                     done.store(true, Ordering::SeqCst);
                     watcher.join().expect("align watcher thread must not panic");

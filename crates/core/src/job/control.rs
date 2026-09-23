@@ -66,6 +66,14 @@ pub struct JobControl {
     /// Offset from [`Self::epoch`] at which the executing segment started, or
     /// [`NO_SEGMENT`] when none is executing.
     segment_start_nanos: AtomicU64,
+    /// How many frames' registration has completed during the align stage --
+    /// shared with the driver through [`Self::begin_align`], since the
+    /// alignment side of a run credits it directly rather than through
+    /// [`Self::unit_completed`].
+    align_done: Arc<AtomicUsize>,
+    /// The frame count a computed align stage started with; `0` until
+    /// [`Self::begin_align`] is called.
+    align_total: AtomicUsize,
 }
 
 impl JobControl {
@@ -85,6 +93,8 @@ impl JobControl {
             running_nanos: AtomicU64::new(0),
             epoch: Instant::now(),
             segment_start_nanos: AtomicU64::new(NO_SEGMENT),
+            align_done: Arc::new(AtomicUsize::new(0)),
+            align_total: AtomicUsize::new(0),
         })
     }
 
@@ -132,6 +142,14 @@ impl JobControl {
         self.stage.store(stage.to_u8(), Ordering::SeqCst);
     }
 
+    /// Starts a computed align stage: stores `frames` as its total and hands
+    /// back the shared counter the alignment driver credits as each frame's
+    /// registration completes.
+    pub(crate) fn begin_align(&self, frames: usize) -> Arc<AtomicUsize> {
+        self.align_total.store(frames, Ordering::SeqCst);
+        Arc::clone(&self.align_done)
+    }
+
     /// A plain snapshot, returned by value -- polled, never pushed.
     ///
     /// Every field is **live**: `units_done`/`pixels_done` are credited by
@@ -153,6 +171,8 @@ impl JobControl {
             pixel_total,
             running,
             eta: eta(pixels_done, pixel_total, running),
+            align_done: self.align_done.load(Ordering::SeqCst),
+            align_total: self.align_total.load(Ordering::SeqCst),
         }
     }
 
@@ -323,6 +343,19 @@ mod tests {
         );
         assert_eq!(p2.units_done, 7);
         assert_eq!(p2.pixels_done, 700);
+    }
+
+    #[test]
+    fn begin_align_sets_the_total_and_hands_back_a_counter_progress_reads() {
+        let control = JobControl::new();
+        assert_eq!(control.progress().align_total, 0);
+
+        let counter = control.begin_align(8);
+        assert_eq!(control.progress().align_total, 8);
+        assert_eq!(control.progress().align_done, 0);
+
+        counter.fetch_add(3, Ordering::SeqCst);
+        assert_eq!(control.progress().align_done, 3);
     }
 
     #[test]

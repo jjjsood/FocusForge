@@ -298,6 +298,24 @@ pub fn current_step(state: &RunState, progress: Option<&JobProgress>) -> Option<
     }
 }
 
+/// The bottom bar's step-text slot: `"<done>/<total>"` while running a
+/// computed align stage (the bold stage word already names the phase, so the
+/// position text and the count don't both need to be here), otherwise
+/// [`Step::text`] -- empty outside a running state or with no progress to
+/// derive a step from.
+pub fn step_text(state: &RunState, progress: Option<&JobProgress>) -> String {
+    if matches!(state, RunState::Running)
+        && let Some(p) = progress
+        && p.stage == JobStage::Align
+        && p.align_total > 0
+    {
+        return format!("{}/{}", p.align_done, p.align_total);
+    }
+    current_step(state, progress)
+        .map(Step::text)
+        .unwrap_or_default()
+}
+
 /// `estimating` while `eta` is `None` and no unit has finished yet,
 /// `ETA M:SS` while running with a real estimate, `ETA —` once paused,
 /// cancelling or failed -- never a rendered zero.
@@ -315,10 +333,15 @@ pub fn eta_text(state: &RunState, progress: Option<&JobProgress>) -> String {
     }
 }
 
-/// The bar's fill fraction, `units_done / unit_total` of the whole job --
-/// `0.0` before the first unit or with no run at all.
+/// The bar's fill fraction: during a computed align stage,
+/// `align_done / align_total`, restarting from zero once the fuse stage
+/// begins; otherwise `units_done / unit_total` of the fuse job. `0.0` before
+/// the first unit, during a cached align stage, or with no run at all.
 pub fn bar_fraction(progress: Option<&JobProgress>) -> f32 {
     match progress {
+        Some(p) if p.stage == JobStage::Align && p.align_total > 0 => {
+            p.align_done as f32 / p.align_total as f32
+        }
         Some(p) if p.unit_total > 0 => p.units_done as f32 / p.unit_total as f32,
         _ => 0.0,
     }

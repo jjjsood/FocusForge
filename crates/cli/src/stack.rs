@@ -1223,7 +1223,7 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
             RunStage::Align {
                 frames,
                 source: AlignSource::Computed,
-            } => renderer.stage(&format!("align {frames} frames (no unit progress)")),
+            } => renderer.stage(&format!("align {frames} frames")),
             // A fuse-stage entry line, unconditional and immediate (`eta
             // --`, since no unit has finished yet): it gives a script or a
             // human watching a redirected log a fact the instant the job
@@ -1249,10 +1249,10 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
                 _ => self.control.pause(),
             }
         }
-        // Alignment reports no unit progress of its own (`stage`'s own
-        // "no unit progress" line already says so) -- a tick during it must
-        // not render a fuse-shaped line with a stale or zeroed total.
-        if progress.stage == focusforge_core::job::JobStage::Fuse {
+        // A tick outside the fuse stage and a cached or absent alignment
+        // (`align_total == 0`) carries a stale or zeroed total and must not
+        // render.
+        if progress.stage == focusforge_core::job::JobStage::Fuse || progress.align_total > 0 {
             self.renderer
                 .lock()
                 .expect("no thread panicked while rendering")

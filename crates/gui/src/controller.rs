@@ -1641,17 +1641,17 @@ impl AppController {
             let fusing = running == Some(i);
             let frame_count = entry::tab_frame_count(&tab.project);
             let fusing_step = if fusing {
-                job::current_step(&tab.run, progress.as_ref())
+                let text = job::step_text(&tab.run, progress.as_ref());
+                (!text.is_empty()).then(|| {
+                    format!(
+                        "{}, {}",
+                        job::stage_word(&tab.run, progress.as_ref()).to_lowercase(),
+                        text
+                    )
+                })
             } else {
                 None
-            }
-            .map(|step| {
-                format!(
-                    "{}, {}",
-                    job::stage_word(&tab.run, progress.as_ref()).to_lowercase(),
-                    step.text()
-                )
-            });
+            };
             let (x, y) = overlay::card_origin(cards.len(), columns);
             cards.push(CardView {
                 kind: "open".to_string(),
@@ -2960,9 +2960,7 @@ impl AppController {
         JobView {
             toolbar_run_state: job::toolbar_run_state(&run).to_string(),
             stage_word: job::stage_word(&run, progress.as_ref()),
-            step_text: job::current_step(&run, progress.as_ref())
-                .map(|s| s.text())
-                .unwrap_or_default(),
+            step_text: job::step_text(&run, progress.as_ref()),
             eta_text: job::eta_text(&run, progress.as_ref()),
             bar_tone: job::bar_tone(&run).to_string(),
             fraction: job::bar_fraction(progress.as_ref()),

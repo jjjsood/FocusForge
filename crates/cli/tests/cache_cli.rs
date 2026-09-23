@@ -13,8 +13,7 @@
 //! pays for a real fusion (a few seconds over `fixtures/mantis-512`);
 //! `dummy-align` reaches [`AlignStatus::Converged`] by construction, so no
 //! `--lax` is needed to keep the run from refusing. Every other test drives
-//! `dummy-stack --no-align`, milliseconds, the same dodge
-//! `crates/cli/tests/groups_cli.rs` and `review_cli.rs` already use.
+//! `dummy-stack --no-align`, milliseconds only.
 
 mod common;
 
@@ -212,8 +211,8 @@ fn leave_a_cancelled_run_ledger(cwd: &Path) -> PathBuf {
 
 /// Two `stack` runs over `fixtures/mantis-512` differing only in a fusion
 /// parameter (`--set levels=…`): the second reuses the cached alignment
-/// (`align_cached: true`, no `align … frames (no unit progress)` stage
-/// line), and the reused alignment fuses to a composite byte-identical to
+/// (`align_cached: true`, no computed `align … frames` stage line), and the
+/// reused alignment fuses to a composite byte-identical to
 /// what a cold `--no-cache` recompute of the very same parameters produces
 /// -- the correctness half of "reuses the cached alignment", since a cache
 /// hit that merely runs fast but fuses wrong is still a bug.
@@ -251,7 +250,7 @@ fn fusion_parameter_change_reuses_alignment() {
         "the first run must compute, not reuse"
     );
     assert!(
-        a.stderr.contains("align 8 frames (no unit progress)"),
+        a.stderr.lines().any(|l| l == "align 8 frames"),
         "stderr: {}",
         a.stderr
     );
@@ -279,7 +278,7 @@ fn fusion_parameter_change_reuses_alignment() {
         "changing only a fusion parameter must reuse the cached alignment: {b_report}"
     );
     assert!(
-        !b.stderr.contains("align 8 frames (no unit progress)"),
+        !b.stderr.lines().any(|l| l == "align 8 frames"),
         "a cache hit must not print the computed-alignment stage line: {}",
         b.stderr
     );
@@ -437,7 +436,7 @@ fn no_cache_flag_forces_a_recompute() {
         "--no-cache must force a recompute even though a valid entry exists"
     );
     assert!(
-        b.stderr.contains("align 8 frames (no unit progress)"),
+        b.stderr.lines().any(|l| l == "align 8 frames"),
         "stderr: {}",
         b.stderr
     );
