@@ -14,7 +14,7 @@ use focusforge_core::io::TiffHeader;
 use focusforge_gui::AppWindow;
 use focusforge_gui::canvas::{
     CanvasFeed, DISPLAY_FORMAT, FrameSource, RepaintGate, TextureSpec, draw_rect_fits,
-    needs_realloc, validate_display_format,
+    needs_realloc, truncate_pane_label, validate_display_format,
 };
 use focusforge_gui::viewport::PaneRect;
 use focusforge_gui::{AppController, OpenOutcome};
@@ -1071,4 +1071,46 @@ fn pane_placeholder_shows_only_until_the_first_fuse() {
             "{label}: placeholder must stay hidden with no project loaded"
         );
     }
+}
+
+#[test]
+fn pane_label_short_enough_passes_through_unchanged() {
+    assert_eq!(truncate_pane_label("Composite"), "Composite");
+}
+
+#[test]
+fn pane_label_too_long_keeps_its_tail() {
+    let name = "20260829-IMG_9800.tif";
+    let truncated = truncate_pane_label(name);
+    assert!(
+        truncated.chars().count() < name.chars().count(),
+        "{truncated:?} must be shorter than the untruncated {name:?}"
+    );
+    assert!(
+        truncated.ends_with("9800.tif"),
+        "{truncated:?} must keep the distinguishing tail of {name:?}"
+    );
+    assert!(
+        !truncated.contains("20260829-IMG_9"),
+        "{truncated:?} must not still carry the shared, non-distinguishing prefix"
+    );
+    assert_eq!(
+        truncated.matches('\u{2026}').count(),
+        1,
+        "{truncated:?} must mark the truncation with exactly one ellipsis"
+    );
+    assert!(
+        truncated.starts_with('\u{2026}'),
+        "{truncated:?} must lead with the ellipsis, since the head is what was dropped"
+    );
+}
+
+#[test]
+fn pane_label_at_the_budget_passes_through_unchanged() {
+    // A name exactly as long as two frames apart in the reference stack's
+    // own naming pattern -- neither shorter nor longer than the tail-kept
+    // case above by more than a couple of characters, so both sides of the
+    // budget boundary are covered.
+    let short = "9800.tif";
+    assert_eq!(truncate_pane_label(short), short);
 }

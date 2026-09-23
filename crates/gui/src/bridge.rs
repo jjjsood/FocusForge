@@ -17,7 +17,7 @@ use slint::winit_030::{CustomApplicationHandler, EventResult, WinitWindowAccesso
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
-use crate::canvas::{CanvasFeed, RepaintGate};
+use crate::canvas::{CanvasFeed, RepaintGate, truncate_pane_label};
 use crate::controller::{
     AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, OpenOutcome,
     SettingsSection, ShellEvent, ShellMode,
@@ -204,7 +204,7 @@ pub fn repaint(
 
     app.set_zoom_readout(readout.into());
     app.set_project_loaded(project_loaded);
-    app.set_frame_label(frame_label.into());
+    app.set_frame_label(truncate_pane_label(&frame_label).into());
     app.set_frame_message(canvas.borrow().frame_error().unwrap_or("").into());
 
     let frame_redrawn = frame_draw.and_then(|draw| {

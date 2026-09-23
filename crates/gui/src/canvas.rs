@@ -190,3 +190,24 @@ pub fn draw_rect_fits(frame: (u32, u32), src: (u32, u32, u32, u32)) -> bool {
         && x.checked_add(width).is_some_and(|xw| xw <= frame_width)
         && y.checked_add(height).is_some_and(|yh| yh <= frame_height)
 }
+
+/// Characters `FFPaneLabel`'s 120 px pill holds, at `Theme.text-body` size,
+/// with room left for the pill's own rounded edge -- measured against the
+/// shipped Inter body face, where the pill's own width fits roughly 20
+/// characters edge to edge.
+const PANE_LABEL_MAX_CHARS: usize = 16;
+
+/// Fits `label` inside `FFPaneLabel`'s pill by keeping its tail: a label
+/// short enough already passes through unchanged; a longer one is cut down
+/// to a fixed character budget with a leading `…` standing in for the
+/// dropped head, since a long filename's distinguishing part is its end,
+/// not its shared prefix.
+pub fn truncate_pane_label(label: &str) -> String {
+    let chars: Vec<char> = label.chars().collect();
+    if chars.len() <= PANE_LABEL_MAX_CHARS {
+        return label.to_string();
+    }
+    let kept = PANE_LABEL_MAX_CHARS - 1;
+    let tail: String = chars[chars.len() - kept..].iter().collect();
+    format!("\u{2026}{tail}")
+}
