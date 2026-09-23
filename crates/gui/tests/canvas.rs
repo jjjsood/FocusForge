@@ -1107,10 +1107,14 @@ fn pane_label_too_long_keeps_its_tail() {
 
 #[test]
 fn pane_label_at_the_budget_passes_through_unchanged() {
-    // A name exactly as long as two frames apart in the reference stack's
-    // own naming pattern -- neither shorter nor longer than the tail-kept
-    // case above by more than a couple of characters, so both sides of the
-    // budget boundary are covered.
-    let short = "9800.tif";
-    assert_eq!(truncate_pane_label(short), short);
+    let at_budget = "829-IMG_9800.tif";
+    assert_eq!(
+        at_budget.chars().count(),
+        16,
+        "fixture must sit at the budget"
+    );
+    assert_eq!(truncate_pane_label(at_budget), at_budget);
+
+    let one_over = "0829-IMG_9800.tif";
+    assert_eq!(truncate_pane_label(one_over), "\u{2026}29-IMG_9800.tif");
 }
