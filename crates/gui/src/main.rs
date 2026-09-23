@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use focusforge_gui::bridge::Canvas;
-use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, screenshot};
+use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, job, screenshot};
 use slint::ComponentHandle;
 
 #[derive(Parser)]
@@ -116,27 +116,23 @@ fn start_fuse_tabs_timer(
 ) {
     let timer_slot = slot.clone();
     let timer = slint::Timer::default();
-    timer.start(
-        slint::TimerMode::Repeated,
-        focusforge_gui::job::POLL,
-        move || {
-            let Some(app) = app_weak.upgrade() else {
-                return;
-            };
-            if controller.lock().unwrap().load_in_flight() {
-                return;
-            }
-            for index in &indices {
-                // The window's own callbacks, so a press here arms the poll
-                // timer exactly as a click on the button does.
-                app.invoke_tab_selected(*index as i32);
-                app.invoke_fuse_requested();
-            }
-            if let Some(t) = timer_slot.borrow().as_ref() {
-                t.stop();
-            }
-        },
-    );
+    timer.start(slint::TimerMode::Repeated, job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().load_in_flight() {
+            return;
+        }
+        for index in &indices {
+            // The window's own callbacks, so a press here arms the poll
+            // timer exactly as a click on the button does.
+            app.invoke_tab_selected(*index as i32);
+            app.invoke_fuse_requested();
+        }
+        if let Some(t) = timer_slot.borrow().as_ref() {
+            t.stop();
+        }
+    });
     *slot.borrow_mut() = Some(timer);
 }
 
