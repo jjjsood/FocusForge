@@ -44,14 +44,25 @@ The toolbar's transport button reads **Fuse stack** on a tab with two or
 more frames still to fuse; while a run is going it becomes **Pause**,
 **Cancel** and, once paused, **Resume**. A failed run offers **Retry**,
 which starts the same request again. Progress, the current stage and an ETA
-show along the bottom of the window while a run is live. Fusing a tab that
-was already opened from a project appends the new result rather than
-replacing it.
+show along the bottom of the window while a run is live.
 
 If the graphics device the window is using disappears (a driver reset, a
 GPU unplugged), the canvas stops updating and the window closes itself a
 moment later rather than hanging; see
 [`guide/diagnostics.md`](diagnostics.md) for where that is logged.
+
+## Saving a project
+
+A fuse in the window writes nothing next to the frames: the result is held
+in the tab only, and a re-fuse of an already-opened project holds its new
+result the same way rather than appending it on disk. A tab with anything
+held shows an `UNSAVED` chip in the tab strip; **Save project** (in the
+projects overlay's rail, and bound to Ctrl+S) writes every held checkpoint
+into one `.ffp`, in order, clearing the chip. On a tab's first save it
+proposes `<frames directory>/<group name>.ffp` through a save dialog; a tab
+already opened from a project writes back to that same file without asking.
+A failed save keeps every held checkpoint and reports why the write did not
+happen — nothing is lost.
 
 ## Switching between projects
 
@@ -61,7 +72,8 @@ cancelled, or whose frames are no longer where the project recorded them.
 Clicking an open card switches to that tab; clicking a failed one offers
 **Run again**, and a card missing its frames offers **Locate frames…**. A
 rail down the side carries the file-level actions — **New project**,
-**Open project…**, **Close project** — and a list of recently opened
+**Open project…**, **Close project**, **Save project** (enabled only once
+the active tab holds something unsaved) — and a list of recently opened
 projects.
 
 ## Keyboard and mouse bindings
