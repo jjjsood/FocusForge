@@ -629,7 +629,7 @@ fn step_leaves_the_rect_as_it_is_at_and_above_one_to_one() {
     }
 }
 
-/// The storage binding (128 MiB) and the old 1-D dispatch ceiling
+/// The storage binding (128 MiB) and the 1-D dispatch ceiling
 /// (65,535 workgroups of 64) that an undecimated fit draw of 8192 x 5464
 /// exceeds: 268,566,528 bytes, 44,761,088 texels.
 #[test]

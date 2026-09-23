@@ -90,7 +90,7 @@ component FFTab inherits FFStripBox {
     }
 
     // Anchored to the tab's full bounds so every child is centred in the
-    // full 30px height. Board padding: title at +12, the close glyph 12 in
+    // full 30px height. Padding: title at +12, the close glyph 12 in
     // from the right edge, UNSAVED 12 left of it.
     HorizontalLayout {
         x: 0px;
@@ -319,9 +319,9 @@ export component FFTabStrip inherits Rectangle {
         }
     }
 
-    // Right-anchored at the board's offsets: `glyph-first-x` is the first
-    // box's left edge at `base-width`, so the cluster keeps its right inset
-    // at any window width.
+    // Right-anchored: `glyph-first-x` is the first box's left edge at
+    // `base-width`, so the cluster keeps its right inset at any window
+    // width.
     window-glyphs := Rectangle {
         x: parent.width - (ShellGeometry.base-width - ShellGeometry.glyph-first-x);
         y: 0px;

@@ -469,11 +469,11 @@ fn tab_strip_scrolls_to_every_tab() {
 
 /// A freshly opened project must not read as overflowing before the strip's
 /// real width is ever pushed back from Slint. A `changed` handler fires
-/// only for a *later* change, never for
-/// the width's initial value, so a `tab_region_width` left at its untouched
-/// default silently understated the strip as narrower than it is -- one
-/// 228 px tab then read as overflowing a strip that was never actually
-/// measured, and both scroll arrows lit up over a single tab.
+/// only for a *later* change, never for the width's initial value, so a
+/// `tab_region_width` left at its untouched default would understate the
+/// strip as narrower than it is: one 228 px tab would read as overflowing
+/// a strip that was never actually measured, lighting both scroll arrows
+/// over a single tab.
 #[test]
 fn a_single_tab_does_not_read_as_overflowing_before_any_resize() {
     let root = tree("entry_single_tab_no_resize");
@@ -494,11 +494,7 @@ fn a_single_tab_does_not_read_as_overflowing_before_any_resize() {
     );
 }
 
-// ---------------------------------------------------------------------
-// Reopening a saved project through the same picker.
-/// An arrow click or a resize must tell the window: `scroll_tabs` and the
-/// strip-width setter once changed the offset silently, so the bridge never
-/// pushed it and the arrows looked dead.
+/// An arrow click or a resize must push the new offset to the window.
 #[test]
 fn tab_scroll_changes_reach_the_sink_and_opening_scrolls_into_view() {
     use focusforge_gui::{ShellEvent, max_tab_scroll, tab_content_width, tab_viewport_width};
@@ -579,6 +575,8 @@ fn tab_scroll_changes_reach_the_sink_and_opening_scrolls_into_view() {
     assert!(!controller.can_scroll_left() && !controller.can_scroll_right());
 }
 
+// ---------------------------------------------------------------------
+// Reopening a saved project through the same picker.
 // ---------------------------------------------------------------------
 
 /// Seals a minimal project into `dir`, returning its `.ffp` path.

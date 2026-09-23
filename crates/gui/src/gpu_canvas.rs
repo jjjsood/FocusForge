@@ -23,9 +23,9 @@ use crate::viewport::PaneDraw;
 
 /// One pane's wgpu-owned state: the display texture, and the `slint::Image`
 /// wrapping it -- re-created only when the texture is (re)allocated
-/// (`crate::canvas::needs_realloc`), never every frame (`try_from` takes
-/// the texture by value; the spike set the image property once at setup
-/// and never again).
+/// (`crate::canvas::needs_realloc`), never every frame: `try_from` takes
+/// the texture by value, so the image property is set once at setup and
+/// never again.
 #[derive(Default)]
 pub struct PaneTexture {
     display_texture: Option<DisplayTexture>,

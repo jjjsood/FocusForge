@@ -1863,9 +1863,9 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::WindowMaximizeToggled(maximized) => {
             app.window().set_maximized(maximized);
             // `AppWindow::window-maximized` is a plain `in` property, not the
-            // builtin (shadowable) `Window.maximized` -- see step 8's Notes
-            // on why native window state needs `app.window()` while chrome
-            // state the shell *draws from* needs a custom property. This is
+            // builtin (shadowable) `Window.maximized`: native window state
+            // needs `app.window()` while chrome state the shell *draws
+            // from* needs a custom property. This is
             // what the maximize glyph binding (`ui/shell/tab_strip.slint`)
             // reads to swap `square.svg` for `copy.svg`.
             app.set_window_maximized(maximized);

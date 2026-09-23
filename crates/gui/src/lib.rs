@@ -72,8 +72,7 @@ pub mod settings_panel;
 pub mod gpu_canvas;
 
 /// The Slint side of the seam, and the only module in the crate that names
-/// `winit`. `pub` so `src/main.rs` -- a separate crate target that consumes
-/// this library like any other caller -- can install it on an `AppWindow`.
+/// `winit`. `pub` so `src/main.rs` can install it on an `AppWindow`.
 pub mod bridge;
 
 /// Writes a `Window::take_snapshot()` buffer to a PNG file, for

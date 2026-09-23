@@ -194,9 +194,9 @@ fn select_backend(
 /// Deliberately no `set_rendering_notifier` (slint-ui/slint#12030). Returns
 /// the process exit code.
 ///
-/// The size timer fires at 50 ms, not step 13's literal 0 ms: measured on
-/// this Wayland session, a 0 ms delay still raced `show()`'s own initial
-/// layout commit and lost -- the written PNG's width silently reverted to
+/// The size timer fires at 50 ms, not a literal 0 ms: measured on this
+/// Wayland session, a 0 ms delay still raced `show()`'s own initial layout
+/// commit and lost -- the written PNG's width silently reverted to
 /// `preferred-width` while height applied correctly, the same asymmetry
 /// slint-ui/slint#13245 describes. 50 ms clears the race; the exit-after
 /// timer's own screenshot is what proves it.
@@ -305,9 +305,9 @@ fn resolve_config_dir(args: &Args) -> Option<PathBuf> {
 }
 
 /// Loads the input table, prints every refusal once on stderr, writes the
-/// defaults on first run, and installs it on `controller` and `app`.
-/// A refused or unwritable config file is never a reason the window
-/// fails to open.
+/// defaults on first run, and installs it on `controller` and `app`. A
+/// refused or unwritable config file is never a reason the window fails to
+/// open.
 fn install_input_table(
     controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
     app: &AppWindow,

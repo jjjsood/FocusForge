@@ -66,8 +66,8 @@ pub struct JobRequest {
     pub append: bool,
 }
 
-/// How often the pipeline's poll thread ticks progress -- the window's own
-/// frame clock, not inherited from any spike measurement.
+/// How often the pipeline's poll thread ticks progress -- the window's
+/// own frame clock.
 pub const POLL: Duration = Duration::from_millis(100);
 
 /// Moves `request` onto a worker thread and runs it to completion through

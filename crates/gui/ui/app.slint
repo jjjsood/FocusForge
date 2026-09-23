@@ -4,6 +4,8 @@
 // this file exports.
 
 import { Theme, TypeRole, ThemeProbe } from "theme.slint";
+// Re-exported so Rust can reach them through this file; `Primitives` stays
+// unreachable outside `theme.slint`.
 export { Theme, TypeRole, ThemeProbe }
 
 import { ThemeSheet } from "theme_sheet.slint";

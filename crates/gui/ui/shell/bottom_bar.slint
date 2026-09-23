@@ -19,8 +19,7 @@ component FFGearButton inherits Rectangle {
     callback pressed();
 
     // Matches the zoom cluster's own icon buttons for one shared baseline
-    // across the bar (`Theme.icon-md + 2 * Theme.space-2` = 32px), even
-    // though the gear does not share their component.
+    // across the bar (`Theme.icon-md + 2 * Theme.space-2` = 32px).
     width: Theme.icon-md + 2 * Theme.space-2;
     height: self.width;
     background: area.has-hover ? Theme.surface-hover : Theme.surface-overlay;

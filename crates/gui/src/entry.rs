@@ -8,7 +8,7 @@
 //! `crate::gpu_canvas` is the one naming `wgpu` and `crate::bridge` the one
 //! naming `winit`. The two entrances (the picker, the drop route) and
 //! `--open` all resolve through `classify` and `open` so they cannot
-//! diverge (item Objective).
+//! diverge.
 
 use std::path::{Path, PathBuf};
 
@@ -17,9 +17,8 @@ use focusforge_core::io::{
 };
 use focusforge_core::params::StackContext;
 use focusforge_core::project::{PROJECT_EXTENSION, Project, ProjectError};
-// Named here, and re-exported, so `controller.rs` can carry a `Proposal` in
-// its own pending-question state without naming `focusforge_core` itself
-// (`tests/shell.rs`'s crate-wide scan).
+// Re-exported so `controller.rs` can carry a `Proposal` in its own
+// pending-question state without naming `focusforge_core` itself.
 pub use focusforge_core::io::Proposal;
 
 /// What a set of paths (a picker result, a drop gesture, `--open`'s single
@@ -71,7 +70,7 @@ pub struct Opened {
 /// The three shapes opening a path set can take. `Question` carries the
 /// [`Proposal`] behind it alongside the question's own rendering summary,
 /// so the controller can answer it later without re-walking the directory
-/// (step 11's `pending: Option<(GroupingQuestion, Proposal)>`).
+/// (`pending: Option<(GroupingQuestion, Proposal)>`).
 pub enum OpenOutcome {
     Opened(Opened),
     Question(GroupingQuestion, Proposal),

@@ -167,7 +167,7 @@ export component FFCanvas inherits Rectangle {
     // The empty state: `true` while no tab is open.
     // Placed last (below) so it covers the canvas region without moving
     // either pane -- `tests/shell.rs`'s pane-geometry tests keep finding
-    // `pane-left`/`pane-right` at their spec rects regardless.
+    // `pane-left`/`pane-right` at their fixed rects regardless.
     in property <bool> show-empty-state: true;
     // A background load in flight: hides the empty state for that span, so
     // its own text never bleeds around the loading indicator drawn over
@@ -230,6 +230,7 @@ export component FFCanvas inherits Rectangle {
         undock-requested => { root.composite-undock-requested(); }
     }
 
+    // Centred inside the gutter between the panes, not added on top of it.
     pane-divider := Rectangle {
         x: pane-left.x + pane-left.width
             + (ShellGeometry.pane-gutter - ShellGeometry.pane-divider) / 2;

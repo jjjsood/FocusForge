@@ -299,7 +299,7 @@ fn controller_api_is_slint_free() {
 }
 
 #[test]
-fn editor_mode_is_unreachable_in_this_phase() {
+fn editor_mode_is_unreachable() {
     let mut controller = AppController::new();
     assert!(
         !controller.editor_enabled(),

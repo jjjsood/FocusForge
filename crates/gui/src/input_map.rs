@@ -448,8 +448,8 @@ impl ActionEvent {
     }
 }
 
-/// Whether a pointer-down, pointer-up (or cancel, folded into `Up` --
-/// step 10) or a bare pointer-move reached the dispatch point.
+/// Whether a pointer-down, pointer-up (or cancel, folded into `Up`) or a
+/// bare pointer-move reached the dispatch point.
 ///
 /// `Move` exists because Slint's `pointer-event` callback fires with
 /// `PointerEventKind::Move` on *every* mouse movement over a `TouchArea`,

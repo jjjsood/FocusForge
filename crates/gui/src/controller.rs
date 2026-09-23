@@ -756,8 +756,8 @@ impl AppController {
         self.state.mode
     }
 
-    /// Returns `false` and emits nothing for [`ShellMode::Editor`]: no editor
-    /// is implemented.
+    /// Returns `false` and emits nothing for [`ShellMode::Editor`]: there
+    /// is no editor to switch to.
     pub fn set_mode(&mut self, mode: ShellMode) -> bool {
         if mode == ShellMode::Editor {
             return false;
@@ -1136,7 +1136,7 @@ impl AppController {
 
     /// The one pointer-down/up entry point (also the Cancel path -- a
     /// cancelled grab is forwarded here as `PointerKind::Up` so a live drag
-    /// never gets stuck on, step 10). `Down` starts a drag on a
+    /// never gets stuck on). `Down` starts a drag on a
     /// `Trigger::Drag` hit or fires once on a `Trigger::Click` hit; `Up`
     /// ends any live drag.
     pub fn pointer(&mut self, kind: PointerKind, button: Button, x: f32, y: f32, mods: Modifiers) {

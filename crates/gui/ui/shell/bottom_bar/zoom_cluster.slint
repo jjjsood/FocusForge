@@ -33,8 +33,8 @@ export component FFZoomCluster inherits Rectangle {
     // and zoom-in, with no gap between them -- this is what makes the three
     // read as one element. Anonymous (not its own `component`), so
     // `zoom-out`/`zoom-in` keep the qualified ids `FFZoomCluster::zoom-out`
-    // / `zoom-in` scoped tests already rely on. Its height follows the icon
-    // buttons' own token-derived height, never a repeated literal.
+    // / `zoom-in`. Its height follows the icon buttons' own token-derived
+    // height, never a repeated literal.
     zoom-group := Rectangle {
         x: 0px;
         y: 0px;
@@ -56,9 +56,7 @@ export component FFZoomCluster inherits Rectangle {
             y: 0px;
             width: 56px;
             height: zoom-group.height;
-            // Dimmed the same way the zoom buttons are: the dash had no
-            // opacity of its own, so it would otherwise sit full-strength
-            // while its two neighbours were greyed.
+            // Dimmed the same way the zoom buttons are.
             opacity: root.project-loaded ? 1.0 : 0.5;
             // A project-less window has nothing to report a percentage
             // for -- an em dash rather than a blank space, matching the
