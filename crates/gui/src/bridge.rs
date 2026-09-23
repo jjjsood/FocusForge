@@ -764,6 +764,7 @@ fn thumbnail_image(thumbnail: Option<&crate::overlay::Thumbnail>) -> slint::Imag
 /// `ShellEvent::OverlayChanged` is performed.
 pub fn push_projects_overlay(app: &AppWindow, controller: &AppController) {
     app.set_projects_overlay_open(controller.projects_overlay_open());
+    app.set_projects_save_enabled(controller.save_enabled());
     app.set_gallery_heading(controller.gallery_heading().into());
     app.set_gallery_count_text(controller.gallery_count_text().into());
     let cards: Vec<GeneratedProjectCard> = controller
@@ -906,6 +907,34 @@ fn open_from_picker(
         load_timer,
         Vec::new(),
     );
+}
+
+/// Saves the active tab's held checkpoints -- `Save project` and its
+/// `Ctrl+S` twin. A failed save closes the projects overlay, so the failure
+/// toast that waits behind it shows at once.
+fn save_active_project(
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+    app_weak: &slint::Weak<AppWindow>,
+    toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
+) {
+    let failure = {
+        let mut controller = controller.lock().unwrap();
+        if controller.save_active_project(crate::picker::pick_save_project) {
+            None
+        } else {
+            controller.take_settled_failure()
+        }
+    };
+    let Some(app) = app_weak.upgrade() else {
+        return;
+    };
+    if let Some(message) = failure {
+        controller.lock().unwrap().close_projects_overlay();
+        open_job_toast(&app, message, toast_timer);
+    }
+    push_projects(&app, controller);
+    repaint(&app, controller, canvas);
 }
 
 /// Wires every callback in `app` to `controller`, and returns [`Installed`]
@@ -1138,6 +1167,7 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         let load_timer = load_timer.clone();
+        let toast_timer = toast_timer.clone();
         move |text, ctrl, shift, alt| {
             let mods = {
                 let controller = controller.lock().unwrap();
@@ -1161,6 +1191,9 @@ pub fn install(
                     &load_timer,
                     crate::picker::pick_project(),
                 ),
+                ChromeKey::SaveProject => {
+                    save_active_project(&controller, &canvas, &app_weak, &toast_timer)
+                }
             }
         }
     });
@@ -1704,6 +1737,13 @@ pub fn install(
                 crate::picker::pick_project(),
             )
         }
+    });
+    app.on_projects_save_project_requested({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        let toast_timer = toast_timer.clone();
+        move || save_active_project(&controller, &canvas, &app_weak, &toast_timer)
     });
     app.on_projects_close_project_requested({
         let controller = controller.clone();

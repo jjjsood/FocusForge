@@ -202,6 +202,105 @@ fn seal_staged(
     })
 }
 
+/// A finished run kept outside any container: its two planes as TIFF files
+/// plus everything [`seal_at`] and [`super::append_at`] record beside them.
+#[derive(Debug, Clone)]
+pub struct HeldCheckpoint {
+    pub composite: PathBuf,
+    pub zmap: PathBuf,
+    /// The composite's extent in pixels, after any crop.
+    pub width: u32,
+    pub height: u32,
+    /// In frame order, always -- the fingerprint depends on it.
+    pub sources: Vec<PathBuf>,
+    pub algorithm: String,
+    pub params: ParamValues,
+    pub align: Option<AlignRecord>,
+    /// Exactly the `ImageDescription` the composite carries.
+    pub composite_description: String,
+    pub metrics: Metrics,
+    /// Unix seconds, UTC, stamped when the run finished.
+    pub created_at: i64,
+}
+
+/// Writes `held`, in order and each with its own `created_at`, as one chain
+/// at `target` -- onto the project there when `onto_existing`. Built at a
+/// sibling temporary path, so relative sources resolve as at `target`, and
+/// renamed over it once; on error `target` is left as it was.
+pub fn seal_held(
+    target: &Path,
+    held: &[HeldCheckpoint],
+    onto_existing: bool,
+) -> Result<SealedProject, ProjectError> {
+    if held.is_empty() {
+        return Err(ProjectError::container(target, "no checkpoint to save"));
+    }
+    let mut name = target
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".saving");
+    let temp = target.with_file_name(name);
+    let result = seal_chain(target, &temp, held, onto_existing).and_then(|mut sealed| {
+        std::fs::rename(&temp, target).map_err(|source| ProjectError::io(target, source))?;
+        sealed.path = target.to_path_buf();
+        Ok(sealed)
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn seal_chain(
+    target: &Path,
+    temp: &Path,
+    held: &[HeldCheckpoint],
+    onto_existing: bool,
+) -> Result<SealedProject, ProjectError> {
+    if onto_existing {
+        std::fs::copy(target, temp).map_err(|source| ProjectError::io(target, source))?;
+    }
+    let mut sealed = None;
+    for (i, checkpoint) in held.iter().enumerate() {
+        let written = if i == 0 && !onto_existing {
+            seal_at(
+                SealRequest {
+                    project_path: temp,
+                    staged_composite: &checkpoint.composite,
+                    staged_zmap: &checkpoint.zmap,
+                    sources: &checkpoint.sources,
+                    algorithm: &checkpoint.algorithm,
+                    params: &checkpoint.params,
+                    align: checkpoint.align.clone(),
+                    composite_description: checkpoint.composite_description.clone(),
+                    label: None,
+                    metrics: checkpoint.metrics,
+                },
+                checkpoint.created_at,
+            )?
+        } else {
+            super::append_at(
+                super::AppendRequest {
+                    project_path: temp,
+                    staged_composite: &checkpoint.composite,
+                    staged_zmap: &checkpoint.zmap,
+                    sources: &checkpoint.sources,
+                    algorithm: &checkpoint.algorithm,
+                    params: &checkpoint.params,
+                    align: checkpoint.align.clone(),
+                    composite_description: checkpoint.composite_description.clone(),
+                    label: None,
+                    metrics: checkpoint.metrics,
+                },
+                checkpoint.created_at,
+            )?
+        };
+        sealed = Some(written);
+    }
+    Ok(sealed.expect("held is non-empty"))
+}
+
 /// The manifest's blob list: one record per **distinct** hash, in the order
 /// the container writes them. Two identical planes collapse to one entry in
 /// the archive, and the manifest must say the same thing the archive does.
@@ -258,7 +357,7 @@ pub(super) fn source_ref(path: &Path, project_dir: &Path) -> Result<SourceRef, P
 
 /// Unix seconds, UTC. `0` if the clock is before the epoch, which is not a
 /// state worth failing a finished stack over.
-pub(super) fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

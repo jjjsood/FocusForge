@@ -267,12 +267,15 @@ struct ProjectTab {
     /// reopened project's own on-disk chain length for an `Opened` one,
     /// incremented on every successful run ([`AppController::settle_job`])
     /// rather than inferred from which [`GuiProject`] variant the tab
-    /// happens to be in.
+    /// happens to be in. Counts held checkpoints too.
     checkpoints: usize,
+    /// Every checkpoint fused since the last save, oldest first -- in no
+    /// `.ffp` until [`AppController::save_active_project`] writes them.
+    held: Vec<job::HeldCheckpoint>,
     /// The ordered frame set a fuse actually consumes -- session-only, seeded
-    /// from [`entry::project_frames`] and re-seeded from it on every
-    /// successful run, so a fused tab's list always matches what it just
-    /// fused. `excluded` is the same length, `true` at every position whose
+    /// from [`entry::project_frames`] and re-seeded from the run's own frames
+    /// on every successful run, so a fused tab's list always matches what it
+    /// just fused. `excluded` is the same length, `true` at every position whose
     /// frame is left out of the next fuse without moving any other position.
     frames: Vec<PathBuf>,
     excluded: Vec<bool>,
@@ -286,8 +289,8 @@ struct ProjectTab {
     /// drag.
     frame_sort: Option<images::FrameSort>,
     /// This tab's own card picture -- primed once, right here for a fresh
-    /// tab and again in [`AppController::settle_job`] once a fuse seals it,
-    /// and never recomputed after that. `Arc`-shared rather than cloned per
+    /// tab and again in [`AppController::settle_job`] from each fused
+    /// composite. `Arc`-shared rather than cloned per
     /// push, since [`AppController::project_cards`] rebuilds far more often
     /// than a picture actually changes.
     thumbnail: Option<Arc<overlay::Thumbnail>>,
@@ -349,6 +352,7 @@ impl ProjectTab {
             errors: BTreeMap::new(),
             menu_open: None,
             checkpoints,
+            held: Vec::new(),
             frames,
             excluded,
             selected,
@@ -357,6 +361,12 @@ impl ProjectTab {
             run: job::RunState::Idle,
             request: None,
         }
+    }
+
+    /// Whether this tab holds work no `.ffp` contains: a never-saved
+    /// project, or any checkpoint fused since the last save.
+    fn unsaved(&self) -> bool {
+        matches!(self.project, GuiProject::Unsaved(_)) || !self.held.is_empty()
     }
 
     /// The frames a fuse of this tab would actually use -- `frames` with
@@ -420,8 +430,8 @@ pub struct RecentRow {
 }
 
 /// What a chrome key press means -- [`AppController::chrome_key`]'s return
-/// type. The two picker variants need `crate::bridge`'s event-loop thread,
-/// since the picker itself cannot run inside the controller.
+/// type. The picker and save variants need `crate::bridge`'s event-loop
+/// thread, since a dialog cannot run inside the controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromeKey {
     /// Not a chrome key press -- falls through to [`AppController::key`].
@@ -430,6 +440,8 @@ pub enum ChromeKey {
     Consumed,
     NewProject,
     OpenProject,
+    /// Save the active tab's held checkpoints.
+    SaveProject,
 }
 
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
@@ -660,11 +672,11 @@ pub struct AppController {
     /// hold its own clone and call it once the write is done.
     sink: Option<Arc<dyn Fn(ShellEvent) + Send + Sync>>,
     job: JobSlot,
-    /// Test-only override for `start_fuse`'s scratch root: unset, a run's
-    /// ledger and staging live under this crate's own `.scratch/`, exactly
-    /// where a real window's resumable state belongs; set, they live under
-    /// whatever directory the test handed in, so a test run never depends on
-    /// -- or collides with -- a shared directory.
+    /// Test-only override for the window's scratch root: unset, a run's
+    /// ledger, staging, held checkpoints and plane cache live under the
+    /// per-user data directory ([`AppController::scratch_root`]); set, they
+    /// live under whatever directory the test handed in, so a test run never
+    /// depends on -- or collides with -- a shared directory.
     scratch_root_for_test: Option<PathBuf>,
     /// The most recent run's own failure message, taken exactly once by
     /// [`Self::take_settled_failure`] -- what lets the failure toast
@@ -730,11 +742,22 @@ impl AppController {
         controller
     }
 
-    /// Test-only: redirects `start_fuse`'s scratch root away from this
-    /// crate's own `.scratch/`, so a test's ledger and staging never depend
-    /// on a directory other tests -- or a live window -- also write to.
+    /// Test-only: redirects the window's scratch root, so a test's ledger,
+    /// staging and held checkpoints never depend on a directory other tests
+    /// -- or a live window -- also write to.
     pub fn set_scratch_root_for_test(&mut self, root: PathBuf) {
         self.scratch_root_for_test = Some(root);
+    }
+
+    /// Where runs stage, held checkpoints wait for a save and opened
+    /// projects' planes are cached: `<data dir>/scratch`, or the OS temp
+    /// directory when no data directory resolves. Never beside the frames.
+    fn scratch_root(&self) -> PathBuf {
+        self.scratch_root_for_test.clone().unwrap_or_else(|| {
+            focusforge_diagnostics::data_dir_from_env()
+                .map(|dir| dir.join("scratch"))
+                .unwrap_or_else(|| std::env::temp_dir().join("focusforge-scratch"))
+        })
     }
 
     /// Installs the observer sink. `src/bridge.rs` is the only caller
@@ -1097,20 +1120,23 @@ impl AppController {
     }
 
     /// The active tab's viewport's visible source rect and its pane-local
-    /// projection over the sealed composite/Z-Map's own extent, for
+    /// projection over the newest composite/Z-Map's own extent -- the
+    /// newest held checkpoint's, else the opened project's -- for
     /// `crate::gpu_canvas::CanvasRenderer::redraw_planes` and the right
     /// `FFPane`'s placement properties. `None` while no tab is active, the
-    /// tab has nothing sealed yet, or before the first pane geometry
-    /// arrives.
+    /// tab has no checkpoint yet, or before the first pane geometry arrives.
     pub fn plane_draw(&self) -> Option<PaneDraw> {
         let tab = self.state.active()?;
-        let GuiProject::Opened(project) = &tab.project else {
-            return None;
-        };
-        let plane = &project.manifest().composite;
-        let image = ImageSize {
-            width: plane.width,
-            height: plane.height,
+        let image = match (tab.held.last(), &tab.project) {
+            (Some(held), _) => ImageSize {
+                width: held.width,
+                height: held.height,
+            },
+            (None, GuiProject::Opened(project)) => ImageSize {
+                width: project.manifest().composite.width,
+                height: project.manifest().composite.height,
+            },
+            (None, GuiProject::Unsaved(_)) => return None,
         };
         let (_, right) = self.state.panes?;
         tab.viewport.as_ref()?.draw(image, right)
@@ -1560,7 +1586,7 @@ impl AppController {
             .enumerate()
             .map(|(i, tab)| ProjectTabRow {
                 title: tab.title.clone(),
-                unsaved: matches!(tab.project, GuiProject::Unsaved(_)),
+                unsaved: tab.unsaved(),
                 selected: self.state.active == Some(i),
                 run_mark_icon: match &tab.run {
                     job::RunState::Queued { .. } => "ellipsis".to_string(),
@@ -1650,8 +1676,10 @@ impl AppController {
         self.state.last_close = Some(now);
         let closed = self.state.projects.remove(index);
         if let GuiProject::Opened(project) = &closed.project {
-            let _ = std::fs::remove_dir_all(job::plane_cache_dir(project.path()));
+            let _ =
+                std::fs::remove_dir_all(job::plane_cache_dir(&self.scratch_root(), project.path()));
         }
+        remove_held(&closed.held);
         // A closed tab leaves the queue by its own id -- no renumbering by
         // index is needed for the tabs behind it.
         self.job.queue.retain(|&id| id != closed.id);
@@ -1774,8 +1802,7 @@ impl AppController {
         match key.to_ascii_lowercase() {
             'n' => ChromeKey::NewProject,
             'o' => ChromeKey::OpenProject,
-            // `Save project` is visibly disabled until a tab has something
-            // sealable -- `Ctrl+S` is consumed and does nothing.
+            's' if self.save_enabled() => ChromeKey::SaveProject,
             's' => ChromeKey::Consumed,
             'w' => {
                 if let Some(i) = self.active_project() {
@@ -1833,7 +1860,7 @@ impl AppController {
             cards.push(CardView {
                 kind: "open".to_string(),
                 current: self.state.active == Some(i),
-                unsaved: matches!(tab.project, GuiProject::Unsaved(_)),
+                unsaved: tab.unsaved(),
                 fusing,
                 fusing_fraction: if fusing {
                     job::bar_fraction(progress.as_ref())
@@ -2732,14 +2759,14 @@ impl AppController {
         let Some(tab) = self.state.active() else {
             return false;
         };
-        let GuiProject::Opened(project) = &tab.project else {
-            return false;
+        let dir = match &tab.project {
+            GuiProject::Opened(project) => project
+                .path()
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default(),
+            GuiProject::Unsaved(group) => group.dir.clone(),
         };
-        let dir = project
-            .path()
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_default();
         let name = format!("{} copy", tab.title);
         self.next_tab_id += 1;
         let id = self.next_tab_id;
@@ -2916,19 +2943,19 @@ impl AppController {
     fn fuse_request_for(&self, index: usize) -> Option<job::JobRequest> {
         let tab = self.state.projects.get(index)?;
         let frames = tab.included_frames();
-        let append = matches!(tab.project, GuiProject::Opened(_));
         let project_path = match &tab.project {
             GuiProject::Unsaved(group) => group.dir.join(format!("{}.ffp", group.name)),
             GuiProject::Opened(project) => project.path().to_path_buf(),
         };
         let staging_key = format!("{}-{:x}", tab.title, path_digest(&project_path));
+        let scratch_root = self.scratch_root();
         Some(job::JobRequest {
             frames,
-            project_path,
-            scratch_root: self
-                .scratch_root_for_test
-                .clone()
-                .unwrap_or_else(|| PathBuf::from(".scratch")),
+            hold_dir: scratch_root
+                .join("held")
+                .join(&staging_key)
+                .join(tab.checkpoints.to_string()),
+            scratch_root,
             staging_key,
             fuse_id: tab.fuse_id.clone(),
             fuse_values: tab.fuse_values.clone(),
@@ -2937,7 +2964,6 @@ impl AppController {
             align_lax: false,
             crop: true,
             backend: None,
-            append,
         })
     }
 
@@ -2971,8 +2997,8 @@ impl AppController {
     /// Starts a fuse run on the active tab, off the UI thread -- refuses
     /// while the tab carries a settings violation or a recorded frame is
     /// missing, checked before anything else so an invalid tab is never
-    /// queued. An `Unsaved` tab seals its first checkpoint; an `Opened` tab
-    /// appends a new one. While another run is live, a valid press enqueues
+    /// queued. A completed run adds a held checkpoint to the tab and writes
+    /// no project. While another run is live, a valid press enqueues
     /// the tab instead. Returns whether a run started or was enqueued.
     pub fn start_fuse(&mut self) -> bool {
         let Some(active) = self.state.active else {
@@ -3179,11 +3205,10 @@ impl AppController {
     }
 
     /// Joins the worker thread if it has finished, moving the shell out of
-    /// `Running`/`Cancelling` and, on completion, promoting the tab from
-    /// `Unsaved` to `Opened` with its stack context re-read from the sealed
-    /// composite. Returns the two materialized plane paths for the bridge to
-    /// feed the canvas; `None` while still running or on any other outcome.
-    /// Never blocks.
+    /// `Running`/`Cancelling` and, on completion, adding the run's held
+    /// checkpoint to its tab. Returns the held composite and Z-Map paths for
+    /// the bridge to feed the canvas; `None` while still running or on any
+    /// other outcome. Never blocks.
     pub fn settle_job(&mut self) -> Option<(PathBuf, PathBuf)> {
         let handle = self.job.handle.take()?;
         if !handle.is_finished() {
@@ -3203,15 +3228,15 @@ impl AppController {
         self.job.control = None;
         self.job.observer = None;
         // With the owning tab gone (closed mid-run), this writes nothing --
-        // no tab is promoted, and no outcome lands on whichever tab happens
-        // to be active now.
+        // no tab gains a checkpoint, and no outcome lands on whichever tab
+        // happens to be active now.
         if let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) {
             tab.run = settled.state.clone();
         }
         if tab_index == self.state.active {
             // The run's own tab is the active one -- the canvas must reload
-            // even though the owner already matches, since the planes on
-            // disk just changed underneath it.
+            // even though the owner already matches, since its newest
+            // checkpoint just changed.
             self.state.canvas_dirty = true;
         }
         let tab_info = tab_index
@@ -3251,28 +3276,29 @@ impl AppController {
                             frame_word(frame_count)
                         ),
                         frames: frame_count,
-                        request,
+                        request: request.clone(),
                     });
                 }
             }
             _ => {}
         }
 
-        let planes = settled.opened.and_then(|(project, composite, zmap)| {
-            let tab = tab_index.and_then(|i| self.state.projects.get_mut(i))?;
+        let planes = settled.held.and_then(|held| {
+            let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) else {
+                remove_held(std::slice::from_ref(&held));
+                return None;
+            };
             let path = project_identity_path(&tab.project);
-            tab.project = GuiProject::Opened(Box::new(project));
-            tab.title = entry::tab_title(&tab.project);
-            tab.ctx = entry::tab_stack_context(&tab.project);
-            // `tab.image` is the source frames' own extent, set once at tab
-            // creation -- a fuse changes the sealed composite's size, never
-            // the frames', so it is not re-derived here.
             tab.checkpoints += 1;
-            tab.frames = entry::project_frames(&tab.project);
+            if let Some(request) = &request {
+                tab.frames = request.frames.clone();
+            }
             tab.excluded = vec![false; tab.frames.len()];
             tab.selected = images::first_included(&tab.excluded);
             tab.frame_sort = None;
-            tab.thumbnail = overlay::render_thumbnail(&mut tab.project, &tab.frames).map(Arc::new);
+            tab.thumbnail = overlay::render_thumbnail_from_frame(&held.composite).map(Arc::new);
+            let (composite, zmap) = (held.composite.clone(), held.zmap.clone());
+            tab.held.push(held);
             Some((path, composite, zmap))
         });
         let planes = planes.map(|(path, composite, zmap)| {
@@ -3311,17 +3337,74 @@ impl AppController {
         planes
     }
 
-    /// Materializes the active tab's own planes into its cache directory and
-    /// returns the two paths -- a no-op returning `None` for an
-    /// [`GuiProject::Unsaved`] tab, which has no sealed project to read yet.
-    /// What `--open <saved>.ffp` uses to feed the canvas with no run
-    /// involved.
+    /// The active tab's composite and Z-Map paths: its newest held
+    /// checkpoint's, else an opened project's planes materialized into its
+    /// cache directory. `None` for an [`GuiProject::Unsaved`] tab that holds
+    /// nothing yet.
     pub fn materialize_active_tab_planes(&mut self) -> Option<(PathBuf, PathBuf)> {
+        let scratch_root = self.scratch_root();
         let tab = self.state.active_mut()?;
+        if let Some(held) = tab.held.last() {
+            return Some((held.composite.clone(), held.zmap.clone()));
+        }
         let GuiProject::Opened(project) = &mut tab.project else {
             return None;
         };
-        job::materialize_planes(project).ok()
+        job::materialize_planes(project, &scratch_root).ok()
+    }
+
+    /// The active tab's checkpoints fused since its last save, oldest first;
+    /// empty with no active tab.
+    pub fn held_checkpoints(&self) -> &[job::HeldCheckpoint] {
+        self.active_project()
+            .and_then(|i| self.state.projects.get(i))
+            .map_or(&[], |tab| tab.held.as_slice())
+    }
+
+    /// Whether the active tab holds checkpoints no `.ffp` contains yet --
+    /// what enables `Save project` and its `Ctrl+S`.
+    pub fn save_enabled(&self) -> bool {
+        !self.held_checkpoints().is_empty()
+    }
+
+    /// Writes the active tab's held checkpoints into one `.ffp`: a never-saved
+    /// tab asks `pick`, proposing `<frames dir>/<group name>.ffp`; an opened
+    /// one appends to its own file. A failed write keeps everything held and
+    /// leaves [`Self::take_settled_failure`] a message. Returns whether it wrote.
+    pub fn save_active_project(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> bool {
+        let Some(index) = self.active_project() else {
+            return false;
+        };
+        let Some(tab) = self.state.projects.get(index) else {
+            return false;
+        };
+        if tab.held.is_empty() {
+            return false;
+        }
+        let (target, onto_existing) = match &tab.project {
+            GuiProject::Opened(project) => (project.path().to_path_buf(), true),
+            GuiProject::Unsaved(group) => {
+                match pick(&group.dir.join(format!("{}.ffp", group.name))) {
+                    Some(path) => (path, false),
+                    None => return false,
+                }
+            }
+        };
+        let project = match job::save_held(&target, &tab.held, onto_existing) {
+            Ok(project) => project,
+            Err(err) => {
+                self.settled_failure = Some(format!("Could not save {}: {err}", target.display()));
+                return false;
+            }
+        };
+        let tab = &mut self.state.projects[index];
+        tab.project = GuiProject::Opened(Box::new(project));
+        tab.title = entry::tab_title(&tab.project);
+        remove_held(&tab.held);
+        tab.held.clear();
+        self.state.canvas_dirty = true;
+        self.emit(ShellEvent::ProjectsChanged);
+        true
     }
 
     /// What the open renderer cell should do for the frame about to draw,
@@ -3329,7 +3412,7 @@ impl AppController {
     /// loaded). `Keep` when the owner already matches the active tab and
     /// nothing changed underneath it since; otherwise materializes the
     /// active tab's own planes and answers `Load`, or `Clear` when it has
-    /// none (no tab active, `+` selected, or nothing sealed yet).
+    /// none (no tab active, `+` selected, or nothing fused yet).
     pub fn canvas_feed(&mut self, loaded: Option<usize>) -> crate::canvas::CanvasFeed {
         if loaded == self.state.active && !self.state.canvas_dirty {
             return crate::canvas::CanvasFeed::Keep;
@@ -3980,6 +4063,20 @@ fn checkpoint_phrase(count: usize) -> String {
         "checkpoints"
     };
     format!("{count} {word}")
+}
+
+/// Removes each held checkpoint's own directory, and the tab's directory
+/// above it once that is empty.
+fn remove_held(held: &[job::HeldCheckpoint]) {
+    for checkpoint in held {
+        if let Some(dir) = checkpoint.composite.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+            if let Some(tab_dir) = dir.parent() {
+                // Fails, and so keeps the directory, while anything is left.
+                let _ = std::fs::remove_dir(tab_dir);
+            }
+        }
+    }
 }
 
 /// A path's own identity for a project or a card: an `Unsaved` tab's own

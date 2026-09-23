@@ -46,7 +46,7 @@ fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
 
 /// A fresh directory of `count` copied fixture frames, opened as one
 /// unsaved project on `controller`. Returns the frames' own directory --
-/// also where a fuse from this tab seals its `.ffp`, beside the frames.
+/// also where a save of this tab proposes its `.ffp`, beside the frames.
 fn open_frames(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
     let root = tree(&format!("{name}_frames"));
     for i in 0..count {
@@ -445,6 +445,7 @@ fn thumbnail_is_downsampled_once_and_cached() {
         .expect("a fused project must carry a picture");
     controller.toggle_projects_overlay();
 
+    assert!(controller.save_active_project(|proposed| Some(proposed.to_path_buf())));
     let project_file = find_project_file(&project_dir);
     std::fs::remove_file(&project_file).expect("the sealed project must be removable");
 
@@ -482,6 +483,7 @@ fn overlay_writes_nothing_to_the_project() {
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
 
+    assert!(controller.save_active_project(|proposed| Some(proposed.to_path_buf())));
     let project_file = find_project_file(&project_dir);
     let before_bytes = std::fs::read(&project_file).unwrap();
     let before_mtime = std::fs::metadata(&project_file)

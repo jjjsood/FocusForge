@@ -14,16 +14,18 @@ use std::time::{Duration, Instant};
 
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
-use focusforge_core::pipeline::{self, FuseOutcome, FuseRequest, StageObserver};
+use focusforge_core::pipeline::{self, FuseOutcome, FuseOutput, FuseRequest, StageObserver};
 use focusforge_core::project::{self, Project};
 use focusforge_core::registry;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+use focusforge_gui::canvas::CanvasFeed;
+use focusforge_gui::input_map::Modifiers;
 use focusforge_gui::job;
-use focusforge_gui::{AppController, OpenOutcome};
+use focusforge_gui::{AppController, ChromeKey, OpenOutcome};
 
 // ---------------------------------------------------------------------
 // Fixture helpers -- copies only, never the committed fixture directory
-// itself, since `start_fuse` seals a `.ffp` beside the frames it fuses.
+// itself, since a save writes a `.ffp` beside the frames it fused.
 // ---------------------------------------------------------------------
 
 fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
@@ -105,7 +107,7 @@ fn start_and_hold_at_pause(controller: &mut AppController, timeout: Duration) {
 }
 
 // ---------------------------------------------------------------------
-// A fuse run completes off the UI thread, seals, promotes, feeds
+// A fuse run completes off the UI thread, holds its checkpoint, feeds
 // the canvas.
 // ---------------------------------------------------------------------
 
@@ -129,8 +131,8 @@ fn fuse_runs_to_completion_off_the_ui_thread() {
         other => panic!("expected a completed fuse, got {other:?}"),
     }
     assert!(
-        !controller.project_tabs()[0].unsaved,
-        "a sealed run promotes the tab from Unsaved to Opened"
+        controller.project_tabs()[0].unsaved,
+        "a fused tab stays unsaved until it is saved"
     );
 }
 
@@ -179,8 +181,8 @@ fn gui_run_matches_the_cli_run() {
     );
     let request = FuseRequest {
         frames,
-        project_path: root.join("pinned.ffp"),
-        scratch_root: scratch,
+        output: FuseOutput::Seal(root.join("pinned.ffp")),
+        scratch_root: scratch.clone(),
         staging_key: "cli-match".to_string(),
         algorithm: registry::find_stack("laplacian").expect("laplacian must be registered"),
         explicit,
@@ -191,7 +193,6 @@ fn gui_run_matches_the_cli_run() {
         backend: None,
         resume: false,
         cache: true,
-        append: false,
         poll: Duration::from_millis(5),
     };
     struct Noop;
@@ -228,9 +229,13 @@ fn gui_run_matches_the_cli_run() {
         .unwrap()
         .samples;
     // The composite is a compressed blob inside the sealed `.ffp`, not a
-    // standalone file -- materialize it through the same path `settle_job`
-    // and `--open <saved>.ffp` already use.
-    let (_project, composite_path, _zmap_path) = job::open_and_materialize(&report.sealed.path)
+    // standalone file -- materialize it through the same path `--open
+    // <saved>.ffp` uses.
+    let pipeline::FuseProduct::Sealed(sealed) = &report.product else {
+        panic!("a seal request must report a sealed project");
+    };
+    let mut project = Project::open(&sealed.path).unwrap();
+    let (composite_path, _zmap_path) = job::materialize_planes(&mut project, &scratch)
         .expect("the sealed project's composite must materialize");
     let sealed = focusforge_core::io::TiffStack::open_files(&[composite_path]).unwrap();
     let sealed_samples = sealed
@@ -309,7 +314,7 @@ fn no_align_request(label: &str, frame_count: usize) -> FuseRequest {
         .collect();
     FuseRequest {
         frames,
-        project_path: root.join("project.ffp"),
+        output: FuseOutput::Seal(root.join("project.ffp")),
         scratch_root: common::tree(&format!("{label}_scratch")),
         staging_key: label.to_string(),
         algorithm: registry::find_stack("laplacian").expect("laplacian must be registered"),
@@ -321,7 +326,6 @@ fn no_align_request(label: &str, frame_count: usize) -> FuseRequest {
         backend: None,
         resume: false,
         cache: true,
-        append: false,
         poll: Duration::from_millis(5),
     }
 }
@@ -403,7 +407,10 @@ fn clean_cancel_preserves_resumable_state() {
     let scratch_root = request.scratch_root.clone();
     let staging_key = request.staging_key.clone();
     let frames = request.frames.clone();
-    let project_path = request.project_path.clone();
+    let FuseOutput::Seal(project_path) = &request.output else {
+        panic!("the request seals");
+    };
+    let project_path = project_path.clone();
 
     let control = focusforge_core::job::JobControl::new();
     // Cancelled before the driver ever runs -- deterministic, and still a
@@ -435,7 +442,7 @@ fn clean_cancel_preserves_resumable_state() {
     // dirs never collide with -- and wipe -- the state just asserted above.
     let mut resumed = no_align_request("cancel_preserve_second", 2);
     resumed.frames = frames;
-    resumed.project_path = project_path;
+    resumed.output = FuseOutput::Seal(project_path);
     resumed.scratch_root = scratch_root;
     resumed.staging_key = staging_key;
     resumed.resume = true;
@@ -833,15 +840,19 @@ fn fuse_stack_is_refused_while_a_field_is_in_violation() {
 }
 
 // ---------------------------------------------------------------------
-// Re-fusing an already-opened tab runs the pipeline again and appends a
-// checkpoint, instead of the press doing nothing.
+// Re-fusing an already-saved tab runs the pipeline again and holds a new
+// checkpoint, which the next save appends to the same file.
 // ---------------------------------------------------------------------
 
-fn opened_project_path(root_name: &str, controller: &AppController) -> PathBuf {
-    let title = controller.project_tabs()[0].title.clone();
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(root_name)
-        .join(format!("{title}.ffp"))
+/// Saves the active, never-saved tab to the path the save dialog proposes,
+/// and returns that path.
+fn save_to_proposed(controller: &mut AppController) -> PathBuf {
+    let mut target = None;
+    assert!(controller.save_active_project(|proposed| {
+        target = Some(proposed.to_path_buf());
+        target.clone()
+    }));
+    target.expect("a never-saved tab asks where to save")
 }
 
 #[test]
@@ -849,9 +860,10 @@ fn re_fusing_an_opened_tab_appends_a_checkpoint() {
     let mut controller = controller_with_frames("reopen_appends", 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    let project_path = save_to_proposed(&mut controller);
     assert!(
         !controller.project_tabs()[0].unsaved,
-        "the first run promotes Unsaved to Opened"
+        "a save opens the written project"
     );
 
     assert!(
@@ -866,6 +878,20 @@ fn re_fusing_an_opened_tab_appends_a_checkpoint() {
         other => panic!("expected a completed re-fuse, got {other:?}"),
     }
     assert_eq!(controller.checkpoint_count(), Some(2));
+    assert!(
+        controller.project_tabs()[0].unsaved,
+        "a re-fuse of a saved tab is unsaved again"
+    );
+
+    assert!(
+        controller.save_active_project(|_| panic!("a saved tab never asks where")),
+        "the second save writes the same file"
+    );
+    let chain = Project::open(&project_path)
+        .unwrap()
+        .checkpoint_chain()
+        .unwrap();
+    assert_eq!(chain.len(), 2);
 }
 
 // ---------------------------------------------------------------------
@@ -896,7 +922,7 @@ fn a_reopened_project_reports_the_count_on_disk() {
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(2));
 
-    let project_path = opened_project_path("reopen_count_frames", &controller);
+    let project_path = save_to_proposed(&mut controller);
     let mut reopened = AppController::new();
     assert!(matches!(
         common::open_and_settle(&mut reopened, &[project_path]),
@@ -1041,7 +1067,7 @@ fn re_fuse_is_refused_when_a_frame_is_missing() {
     assert!(controller.start_fuse());
     let planes = common::wait_for_settle(&mut controller, Duration::from_secs(120));
     assert!(planes.is_some());
-    assert!(!controller.project_tabs()[0].unsaved);
+    assert_eq!(controller.checkpoint_count(), Some(1));
 
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("missing_frame_frames");
     std::fs::remove_file(root.join("00.tif")).unwrap();
@@ -1062,9 +1088,8 @@ fn re_fuse_is_refused_when_a_frame_is_missing() {
 
 /// A sealed project whose sources are recorded outside its own directory --
 /// `AsGiven`, present on disk -- built directly through `project::seal`
-/// rather than through a run: only an externally-produced project (a
-/// `-o <dir>` CLI run) ever holds one, since the GUI's own runs always seal
-/// beside the frames they fuse.
+/// rather than through a run and a save, which proposes the frames' own
+/// directory.
 fn sealed_project_with_as_given_sources(name: &str) -> PathBuf {
     let project_dir = common::tree(&format!("{name}_project"));
     let frames_dir = common::tree(&format!("{name}_frames"));
@@ -1153,7 +1178,7 @@ fn a_second_run_reports_its_own_completion_time() {
         panic!("expected a completed fuse");
     };
 
-    let project_path = opened_project_path("second_run_time_frames", &controller);
+    let project_path = save_to_proposed(&mut controller);
     let project = Project::open(&project_path).unwrap();
     let expected = job::format_utc_hhmm(project.checkpoint().created_at);
     assert_eq!(
@@ -1383,9 +1408,10 @@ fn a_second_fuse_queues_and_then_runs() {
     controller.select_project(0);
     controller.pause_or_resume();
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
-    assert!(
-        !controller.project_tabs()[0].unsaved,
-        "the first tab seals a checkpoint"
+    assert_eq!(
+        controller.checkpoint_count(),
+        Some(1),
+        "the first tab holds a checkpoint"
     );
 
     // The queue promotes the second tab once the first settles.
@@ -1395,7 +1421,7 @@ fn a_second_fuse_queues_and_then_runs() {
         job::RunState::Fused { .. } => {}
         other => panic!("expected the queued tab to complete, got {other:?}"),
     }
-    assert!(!controller.project_tabs()[1].unsaved);
+    assert_eq!(controller.checkpoint_count(), Some(1));
 }
 
 #[test]
@@ -1484,9 +1510,10 @@ fn cancelling_a_queued_tab_spares_the_running_one_and_renumbers() {
         job::RunState::Idle,
         "the cancelled tab never ran"
     );
-    assert!(
-        controller.project_tabs()[1].unsaved,
-        "the cancelled tab never sealed a checkpoint"
+    assert_eq!(
+        controller.checkpoint_count(),
+        Some(0),
+        "the cancelled tab never gained a checkpoint"
     );
     controller.select_project(2);
     match controller.job_view().state {
@@ -1679,10 +1706,8 @@ fn a_queued_run_reads_the_settings_current_when_it_starts() {
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
 
-    let title = controller.project_tabs()[1].title.clone();
-    let project_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("queued_reads_current_settings_b_frames")
-        .join(format!("{title}.ffp"));
+    controller.select_project(1);
+    let project_path = save_to_proposed(&mut controller);
     let manifest = Project::open(&project_path).unwrap().manifest().clone();
     assert_eq!(
         manifest.params.get("score-radius"),
@@ -1732,7 +1757,7 @@ fn an_invalid_tab_is_refused_rather_than_queued() {
     let mut controller = controller_with_frames("invalid_frame_not_queued", 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
-    assert!(!controller.project_tabs()[0].unsaved);
+    assert_eq!(controller.checkpoint_count(), Some(1));
 
     let root_b = common::tree("invalid_frame_not_queued_b_frames");
     for i in 0..2 {
@@ -2034,4 +2059,292 @@ fn closing_the_owning_tab_mid_run_promotes_nothing() {
         other => panic!("expected the promoted queued run to complete, got {other:?}"),
     }
     assert_eq!(controller.checkpoint_count(), Some(1));
+}
+
+// ---------------------------------------------------------------------
+// A fuse writes no project: every checkpoint is held until the user saves,
+// and a save is the one path that creates or changes a `.ffp`.
+// ---------------------------------------------------------------------
+
+/// Every path under `dir`, relative to it, sorted -- a directory tree's
+/// whole state for a before/after comparison.
+fn listing(dir: &Path) -> Vec<PathBuf> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            out.push(path.strip_prefix(root).unwrap().to_path_buf());
+            if path.is_dir() {
+                walk(root, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// The frames directory `controller_with_frames(name, ..)` copied into.
+fn frames_dir(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_frames"))
+}
+
+fn fuse_and_settle(controller: &mut AppController) {
+    assert!(controller.start_fuse());
+    common::wait_for_settle(controller, Duration::from_secs(120)).expect("the fuse must complete");
+}
+
+#[test]
+fn a_first_fuse_writes_no_project_file() {
+    let root = common::tree("first_fuse_writes_nothing_frames");
+    for i in 0..3 {
+        std::fs::copy(
+            common::fixture_frame("mantis-64", i),
+            root.join(format!("{i:02}.tif")),
+        )
+        .unwrap();
+    }
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, std::slice::from_ref(&root)),
+        OpenOutcome::Opened(_)
+    ));
+    controller.set_scratch_root_for_test(common::tree("first_fuse_writes_nothing_scratch"));
+    let before = listing(&root);
+
+    fuse_and_settle(&mut controller);
+
+    assert_eq!(
+        listing(&root),
+        before,
+        "a fuse leaves the frames directory exactly as it was"
+    );
+    assert!(controller.project_tabs()[0].unsaved);
+    assert_eq!(controller.checkpoint_count(), Some(1));
+    match controller.canvas_feed(None) {
+        CanvasFeed::Load {
+            composite, zmap, ..
+        } => {
+            for plane in [&composite, &zmap] {
+                assert!(plane.is_file());
+                assert!(
+                    !plane.starts_with(&root),
+                    "{} is beside the frames",
+                    plane.display()
+                );
+            }
+        }
+        other => panic!("a fused tab must feed its held planes, got {other:?}"),
+    }
+    let cards = controller.project_cards();
+    let card = cards
+        .iter()
+        .find(|c| c.kind == "open")
+        .expect("the tab has a card");
+    assert!(card.picture.is_some());
+}
+
+#[test]
+fn re_fuse_holds_each_checkpoint_in_memory() {
+    let mut controller = controller_with_frames("re_fuse_holds", 2);
+    let root = frames_dir("re_fuse_holds");
+    let before = listing(&root);
+    for count in 1..=3 {
+        fuse_and_settle(&mut controller);
+        assert_eq!(controller.checkpoint_count(), Some(count));
+        assert_eq!(controller.held_checkpoints().len(), count);
+        assert_eq!(listing(&root), before, "after fuse {count}");
+    }
+}
+
+#[test]
+fn save_is_enabled_only_with_unsaved_checkpoints() {
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+    let mut controller = controller_with_frames("save_enabled", 2);
+    let root = frames_dir("save_enabled");
+    let before = listing(&root);
+
+    assert!(!controller.save_enabled(), "nothing fused yet");
+    controller.toggle_projects_overlay();
+    assert_eq!(controller.chrome_key("s", ctrl), ChromeKey::Consumed);
+    assert_eq!(listing(&root), before, "a consumed Ctrl+S writes nothing");
+    controller.toggle_projects_overlay();
+
+    fuse_and_settle(&mut controller);
+    assert!(controller.save_enabled());
+    controller.toggle_projects_overlay();
+    assert_eq!(controller.chrome_key("s", ctrl), ChromeKey::SaveProject);
+
+    save_to_proposed(&mut controller);
+    assert!(!controller.save_enabled(), "a save leaves nothing to save");
+    assert_eq!(controller.chrome_key("s", ctrl), ChromeKey::Consumed);
+}
+
+#[test]
+fn save_writes_every_held_checkpoint() {
+    let mut controller = controller_with_frames("save_every_held", 3);
+    let root = frames_dir("save_every_held");
+    fuse_and_settle(&mut controller);
+    controller.toggle_frame_excluded(2);
+    fuse_and_settle(&mut controller);
+
+    let held = controller.held_checkpoints().to_vec();
+    assert_eq!(held.len(), 2);
+    assert_ne!(held[0].sources, held[1].sources);
+
+    let title = controller.project_tabs()[0].title.clone();
+    let target = common::tree("save_every_held_elsewhere").join("saved.ffp");
+    let mut asked = Vec::new();
+    assert!(controller.save_active_project(|proposed| {
+        asked.push(proposed.to_path_buf());
+        Some(target.clone())
+    }));
+    assert_eq!(asked, [root.join(format!("{title}.ffp"))]);
+    assert!(target.is_file());
+    assert!(
+        !listing(&root)
+            .iter()
+            .any(|p| p.extension().is_some_and(|e| e == "ffp")),
+        "the file goes where the picker said, not beside the frames"
+    );
+
+    let chain = Project::open(&target).unwrap().checkpoint_chain().unwrap();
+    assert_eq!(chain.len(), 2);
+    for (checkpoint, held) in chain.iter().rev().zip(&held) {
+        assert_eq!(checkpoint.created_at, held.created_at);
+        assert_eq!(checkpoint.algorithm, held.algorithm);
+        assert_eq!(checkpoint.params, held.params);
+    }
+    assert_ne!(chain[0].stack_fingerprint, chain[1].stack_fingerprint);
+
+    assert!(!controller.project_tabs()[0].unsaved);
+    assert_eq!(controller.checkpoint_count(), Some(2));
+    for checkpoint in &held {
+        let dir = checkpoint.composite.parent().unwrap();
+        assert!(!dir.exists(), "{} survived the save", dir.display());
+        assert!(
+            !dir.parent().unwrap().exists(),
+            "the tab's held directory is emptied away"
+        );
+    }
+}
+
+#[test]
+fn refuse_after_save_leaves_the_file_untouched() {
+    let mut controller = controller_with_frames("refuse_after_save", 2);
+    fuse_and_settle(&mut controller);
+    let path = save_to_proposed(&mut controller);
+    let untouched = |path: &Path| {
+        (
+            std::fs::read(path).unwrap(),
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+        )
+    };
+
+    let before = untouched(&path);
+    fuse_and_settle(&mut controller);
+    assert_eq!(untouched(&path), before, "a re-fuse of a saved tab");
+    assert!(controller.project_tabs()[0].unsaved);
+    assert!(controller.save_active_project(|_| panic!("a saved tab never asks where")));
+    let chain_len = |path: &Path| {
+        Project::open(path)
+            .unwrap()
+            .checkpoint_chain()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(chain_len(&path), 2);
+
+    let mut reopened = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut reopened, std::slice::from_ref(&path)),
+        OpenOutcome::Opened(_)
+    ));
+    reopened.set_scratch_root_for_test(common::tree("refuse_after_save_reopened_scratch"));
+    assert!(!reopened.project_tabs()[0].unsaved);
+
+    let before = untouched(&path);
+    fuse_and_settle(&mut reopened);
+    fuse_and_settle(&mut reopened);
+    assert_eq!(untouched(&path), before, "a re-fuse of a reopened project");
+    assert!(reopened.project_tabs()[0].unsaved);
+    assert!(reopened.save_active_project(|_| panic!("an opened project never asks where")));
+    assert_eq!(chain_len(&path), 4, "two fuses since the last save");
+}
+
+#[cfg(unix)]
+fn set_read_only(dir: &Path, read_only: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if read_only { 0o555 } else { 0o755 };
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_save_keeps_the_project_in_memory() {
+    let mut controller = controller_with_frames("failed_save", 2);
+    fuse_and_settle(&mut controller);
+    let held_before: Vec<PathBuf> = controller
+        .held_checkpoints()
+        .iter()
+        .map(|h| h.composite.clone())
+        .collect();
+    let still_in_memory = |controller: &mut AppController| {
+        assert!(controller.project_tabs()[0].unsaved);
+        let held: Vec<PathBuf> = controller
+            .held_checkpoints()
+            .iter()
+            .map(|h| h.composite.clone())
+            .collect();
+        assert_eq!(held, held_before);
+        assert!(held.iter().all(|p| p.is_file()));
+        assert!(matches!(
+            controller.canvas_feed(None),
+            CanvasFeed::Load { .. }
+        ));
+    };
+
+    assert!(!controller.save_active_project(|_| None));
+    assert!(
+        controller.take_settled_failure().is_none(),
+        "a cancelled dialog is not a failure"
+    );
+    still_in_memory(&mut controller);
+
+    let empty = common::tree("failed_save_read_only_empty");
+    let target = empty.join("saved.ffp");
+    set_read_only(&empty, true);
+    let saved = controller.save_active_project(|_| Some(target.clone()));
+    let left = listing(&empty);
+    set_read_only(&empty, false);
+    assert!(!saved);
+    assert!(left.is_empty(), "nothing was left behind: {left:?}");
+    let message = controller
+        .take_settled_failure()
+        .expect("a failed save says why");
+    assert!(message.contains(&target.display().to_string()), "{message}");
+    assert!(message.contains("Permission denied"), "{message}");
+    still_in_memory(&mut controller);
+
+    let holding = common::tree("failed_save_read_only_existing");
+    let existing = holding.join("existing.ffp");
+    std::fs::write(&existing, b"an earlier project").unwrap();
+    set_read_only(&holding, true);
+    let saved = controller.save_active_project(|_| Some(existing.clone()));
+    let left = listing(&holding);
+    set_read_only(&holding, false);
+    assert!(!saved);
+    assert_eq!(left, [PathBuf::from("existing.ffp")]);
+    assert_eq!(std::fs::read(&existing).unwrap(), b"an earlier project");
+    let message = controller
+        .take_settled_failure()
+        .expect("a failed save says why");
+    assert!(
+        message.contains(&existing.display().to_string()),
+        "{message}"
+    );
+    still_in_memory(&mut controller);
 }

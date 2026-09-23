@@ -95,11 +95,15 @@ fn wait_for_settle(controller: &mut AppController, timeout: Duration) {
     }
 }
 
-fn opened_project_path(root_name: &str, controller: &AppController) -> PathBuf {
-    let title = controller.project_tabs()[0].title.clone();
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(root_name)
-        .join(format!("{title}.ffp"))
+/// Saves the active, never-saved tab to the path the save dialog proposes,
+/// and returns that path.
+fn save_to_proposed(controller: &mut AppController) -> PathBuf {
+    let mut target = None;
+    assert!(controller.save_active_project(|proposed| {
+        target = Some(proposed.to_path_buf());
+        target.clone()
+    }));
+    target.expect("a never-saved tab asks where to save")
 }
 
 /// Seals a project directly (no real fuse) over `sources`, returning its
@@ -738,7 +742,7 @@ fn a_sealed_tab_reads_as_having_a_checkpoint() {
         .expect("a checkpoint now exists, so removing must warn");
     assert!(warning.body.contains('1'));
 
-    let project_path = opened_project_path("sealed_tab_checkpoint_gate_frames", &controller);
+    let project_path = save_to_proposed(&mut controller);
     let mut reopened = AppController::new();
     assert!(matches!(
         common::open_and_settle(&mut reopened, &[project_path]),

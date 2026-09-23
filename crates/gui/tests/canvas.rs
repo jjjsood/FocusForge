@@ -143,8 +143,9 @@ fn repaint_gate_collapses_requests_until_taken() {
     assert!(gate.request(), "the gate re-arms after a take");
 }
 
-/// The reported crash's own numbers: an 8192x5464 viewport rect against a
-/// 501x508 composite is refused, an exact-fit and an interior rect are not.
+/// A rect far larger than a small composite: an 8192x5464 viewport rect
+/// against a 501x508 composite is refused, an exact-fit and an interior
+/// rect are not.
 #[test]
 fn a_read_past_the_composite_draws_nothing_instead_of_panicking() {
     assert!(
@@ -207,8 +208,8 @@ fn open_fixture_tab(
 
 /// A controller with two sealed tabs open -- tab 0 from `fixtures/mantis-64`
 /// (64x64), tab 1 from `fixtures/mantis-512` (512x512), the size mismatch
-/// the reported crash needs. Tab 1 is active on return, the same order a
-/// person opening a small project and then a large one would reach.
+/// a background run must survive. Tab 1 is active on return, the same
+/// order a person opening a small project and then a large one would reach.
 fn two_sealed_tabs(name: &str) -> AppController {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
@@ -235,9 +236,8 @@ fn load_path(controller: &mut AppController, loaded: Option<usize>) -> PathBuf {
 
 /// Fuses `background_set`'s own (first-opened) tab while `foreground_set`'s
 /// tab is active, asserting the active tab's already-loaded planes survive
-/// the background run's completion unchanged -- the reported crash's own
-/// sequence, minus the panic that no longer reproduces (asserted
-/// separately by `a_read_past_the_composite_draws_nothing_instead_of_panicking`).
+/// the background run's completion unchanged (asserted separately by
+/// `a_read_past_the_composite_draws_nothing_instead_of_panicking`).
 fn background_run_leaves_canvas_alone(name: &str, background_set: &str, foreground_set: &str) {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
@@ -494,6 +494,7 @@ fn opening_a_saved_project_feeds_its_own_planes() {
         .expect("the fuse must complete");
     let title = controller.project_tabs()[0].title.clone();
     let ffp = root.join(format!("{title}.ffp"));
+    assert!(controller.save_active_project(|proposed| Some(proposed.to_path_buf())));
     assert!(ffp.is_file());
 
     open_fixture_tab(&mut controller, "saved", "mantis-512", 3);
@@ -505,7 +506,7 @@ fn opening_a_saved_project_feeds_its_own_planes() {
         CanvasFeed::Load { tab: 1, .. }
     ));
 
-    // Reopening the sealed `.ffp` mid-session lands a third tab and must
+    // Reopening the saved `.ffp` mid-session lands a third tab and must
     // load its own planes, not the tab it displaced.
     assert!(matches!(
         common::open_and_settle(&mut controller, &[ffp]),
@@ -579,7 +580,7 @@ fn right_pane_uses_composite_extent() {
     );
     assert_ne!(
         plane.src, frame.src,
-        "the right pane must no longer be stretched across the source frames' extent"
+        "the right pane must not be stretched across the source frames' extent"
     );
 }
 
@@ -700,7 +701,6 @@ fn frame_steps_keep_one_handle() {
     #[cfg(target_os = "linux")]
     {
         let Some(stack_dir) = common::reference_stack_dir() else {
-            eprintln!("FOCUSFORGE_REFERENCE_STACK not set to a real directory; skipping");
             return;
         };
         let paths: Vec<PathBuf> = focusforge_core::io::frame_paths(&stack_dir)
@@ -772,7 +772,6 @@ fn fit_zoom_redraw_reads_a_pane_sized_image() {
     use focusforge_gui::viewport::{ImageSize, fit};
 
     let Some(stack_dir) = common::reference_stack_dir() else {
-        eprintln!("FOCUSFORGE_REFERENCE_STACK not set to a real directory; skipping");
         return;
     };
     let first = focusforge_core::io::frame_paths(&stack_dir)
@@ -925,7 +924,7 @@ fn pane_chrome_geometry() {
 /// for an undock control to undock, so both are hidden rather than drawn
 /// over an empty pane.
 /// `project-loaded` defaults to `false`, matching every window that has not
-/// yet run `bridge::repaint` -- see `src/bridge.rs::repaint`.
+/// yet run `bridge::repaint`.
 #[test]
 fn pane_chrome_hidden_without_a_project() {
     thread_local! {

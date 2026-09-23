@@ -15,7 +15,10 @@ use std::time::Duration;
 
 use focusforge_core::job::{ControlState, JobControl, JobProgress};
 use focusforge_core::params::{ParamValue, ParamValues, Provenance};
-use focusforge_core::pipeline::{AlignRequest, FuseOutcome, FuseRequest, RunStage, StageObserver};
+use focusforge_core::pipeline::{
+    AlignRequest, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, RunStage, StageObserver,
+};
+use focusforge_core::project::{self, Project};
 use focusforge_core::registry;
 
 fn mantis_frames(count: usize) -> Vec<PathBuf> {
@@ -43,7 +46,7 @@ fn base_request(label: &str, frames: Vec<PathBuf>, explicit: ParamValues) -> Fus
     let root = scratch(label);
     FuseRequest {
         frames,
-        project_path: root.join("project.ffp"),
+        output: FuseOutput::Seal(root.join("project.ffp")),
         scratch_root: root.join("scratch"),
         staging_key: label.to_string(),
         algorithm: registry::find_stack("laplacian").expect("laplacian must be registered"),
@@ -55,7 +58,6 @@ fn base_request(label: &str, frames: Vec<PathBuf>, explicit: ParamValues) -> Fus
         backend: None,
         resume: false,
         cache: true,
-        append: false,
         poll: Duration::from_millis(5),
     }
 }
@@ -275,4 +277,56 @@ fn align_progress_counts_every_frame() {
     let progress = control.progress();
     assert_eq!(progress.align_done, 0);
     assert_eq!(progress.align_total, 0);
+}
+
+#[test]
+fn a_held_run_seals_to_the_same_project() {
+    let frames = mantis_frames(3);
+
+    let hold_dir = scratch("held_run_hold");
+    let mut held_request = base_request("held_run", frames.clone(), ParamValues::new());
+    held_request.output = FuseOutput::Hold(hold_dir.clone());
+    let staging = held_request
+        .scratch_root
+        .join("projects")
+        .join(&held_request.staging_key);
+    let outcome =
+        focusforge_core::pipeline::run(&held_request, &NoopObserver, JobControl::new(), None)
+            .expect("a held run must complete");
+    let FuseOutcome::Completed(report) = outcome else {
+        panic!("expected a completed run");
+    };
+    assert!(report.tiles > 1, "the run must span more than one tile");
+    let FuseProduct::Held(held) = report.product else {
+        panic!("a hold request must report a held checkpoint");
+    };
+    assert_eq!(held.composite, hold_dir.join("composite.tif"));
+    assert_eq!(held.zmap, hold_dir.join("zmap.tif"));
+    assert!(held.composite.is_file() && held.zmap.is_file());
+    assert!(
+        !staging.exists(),
+        "the run's staging directory is cleaned up"
+    );
+
+    let target = scratch("held_run_saved").join("held.ffp");
+    project::seal_held(&target, std::slice::from_ref(&held), false)
+        .expect("the held checkpoint must seal");
+
+    let direct_request = base_request("direct_run", frames, ParamValues::new());
+    let outcome =
+        focusforge_core::pipeline::run(&direct_request, &NoopObserver, JobControl::new(), None)
+            .expect("a direct run must complete");
+    let FuseOutcome::Completed(report) = outcome else {
+        panic!("expected a completed run");
+    };
+    let FuseProduct::Sealed(sealed) = report.product else {
+        panic!("a seal request must report a sealed project");
+    };
+
+    let from_held = Project::open(&target).unwrap().manifest().clone();
+    let direct = Project::open(&sealed.path).unwrap().manifest().clone();
+    assert_eq!(from_held.algorithm, direct.algorithm);
+    assert_eq!(from_held.params, direct.params);
+    assert_eq!(from_held.sources, direct.sources);
+    assert_eq!(from_held.zmap.blob, direct.zmap.blob);
 }

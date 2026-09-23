@@ -17,6 +17,7 @@ export component FFProjectsOverlay inherits Rectangle {
     in property <length> gallery-content-height: 0px;
     in property <length> gallery-scroll-y: 0px;
     in property <[RecentRowView]> recent-rows: [];
+    in property <bool> save-enabled: false;
     callback card-clicked(int);
     callback card-action-clicked(int);
     callback card-close-clicked(int);
@@ -28,6 +29,7 @@ export component FFProjectsOverlay inherits Rectangle {
     callback new-project-requested();
     callback open-project-requested();
     callback close-project-requested();
+    callback save-project-requested();
     out property <length> gallery-width: gallery.viewport-width;
 
     visible: root.overlay-open;
@@ -70,10 +72,12 @@ export component FFProjectsOverlay inherits Rectangle {
         width: 300px;
         height: parent.height - 60px;
         recent: root.recent-rows;
+        save-enabled: root.save-enabled;
 
         new-project-requested => { root.new-project-requested(); }
         open-project-requested => { root.open-project-requested(); }
         close-project-requested => { root.close-project-requested(); }
+        save-project-requested => { root.save-project-requested(); }
     }
 
     Rectangle {

@@ -18,8 +18,8 @@ use crate::entry::GuiProject;
 use crate::job;
 
 /// The four ways a stack can fail to become an open project. Each carries
-/// its own fixed headline, tone and action -- the board's own copy, not
-/// derived from any error text.
+/// its own fixed headline, tone and action -- a fixed copy, not derived
+/// from any error text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     Failed,
@@ -99,8 +99,8 @@ pub struct CardView {
     pub y: f32,
 }
 
-/// A card's fixed footprint and the gap between neighbours -- the measured
-/// board geometry every card, however many, is laid out against.
+/// A card's fixed footprint and the gap between neighbours -- the fixed
+/// card geometry every card, however many, is laid out against.
 pub const CARD_WIDTH: f32 = 330.0;
 pub const CARD_HEIGHT: f32 = 252.0;
 pub const CARD_GAP: f32 = 24.0;
@@ -199,11 +199,11 @@ fn render_thumbnail_from_project(
     ))
 }
 
-/// An unfused tab's own first frame, downsampled and tone-mapped the same
-/// way -- read band by band from the loose, staged TIFF via
-/// [`TiffStack::read_tile_into`], never as a whole frame. `None` on any read
+/// A loose TIFF -- an unfused tab's first frame or a held composite --
+/// downsampled and tone-mapped the same way, read band by band via
+/// [`TiffStack::read_tile_into`], never as a whole image. `None` on any read
 /// failure.
-fn render_thumbnail_from_frame(first_frame: &Path) -> Option<Thumbnail> {
+pub(crate) fn render_thumbnail_from_frame(first_frame: &Path) -> Option<Thumbnail> {
     let stack = TiffStack::open_files(std::slice::from_ref(&first_frame.to_path_buf())).ok()?;
     let (width, height) = stack.dimensions();
     let samples_per_pixel = stack.header(0).samples_per_pixel;

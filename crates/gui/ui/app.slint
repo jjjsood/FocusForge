@@ -487,6 +487,8 @@ export component AppWindow inherits Window {
     callback projects-new-project-requested();
     callback projects-open-project-requested();
     callback projects-close-project-requested();
+    in property <bool> projects-save-enabled: false;
+    callback projects-save-project-requested();
     out property <length> gallery-width: projects-overlay.gallery-width;
 
     projects-overlay := FFProjectsOverlay {
@@ -501,6 +503,7 @@ export component AppWindow inherits Window {
         gallery-content-height: root.gallery-content-height;
         gallery-scroll-y: root.gallery-scroll-y;
         recent-rows: root.recent-rows;
+        save-enabled: root.projects-save-enabled;
 
         card-clicked(i) => { root.projects-card-clicked(i); }
         card-action-clicked(i) => { root.projects-card-action-clicked(i); }
@@ -513,6 +516,7 @@ export component AppWindow inherits Window {
         new-project-requested => { root.projects-new-project-requested(); }
         open-project-requested => { root.projects-open-project-requested(); }
         close-project-requested => { root.projects-close-project-requested(); }
+        save-project-requested => { root.projects-save-project-requested(); }
     }
 
     settings-modal := FFSettingsModal {

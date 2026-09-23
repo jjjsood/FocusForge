@@ -15,7 +15,9 @@ use std::time::{Duration, SystemTime};
 use focusforge_core::gpu::TileBackend;
 use focusforge_core::io::{COMPOSITE_FILENAME, ZMAP_FILENAME};
 use focusforge_core::params::ParamValues;
-use focusforge_core::pipeline::{self, AlignRequest, FuseRequest, RunStage, StageObserver};
+use focusforge_core::pipeline::{
+    self, AlignRequest, FuseOutput, FuseProduct, FuseRequest, RunStage, StageObserver,
+};
 use focusforge_core::project::{self, Plane, Project, ProjectError};
 use focusforge_core::registry;
 
@@ -23,6 +25,7 @@ use focusforge_core::registry;
 /// can hold and drive these through the `job::` path alone.
 pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
+pub use focusforge_core::project::HeldCheckpoint;
 
 /// The shell's own view of a fuse run -- the surface's six reachable
 /// states.
@@ -50,7 +53,9 @@ pub enum RunState {
 #[derive(Clone)]
 pub struct JobRequest {
     pub frames: Vec<PathBuf>,
-    pub project_path: PathBuf,
+    /// Where the finished composite and Z-Map are kept; the run writes no
+    /// project.
+    pub hold_dir: PathBuf,
     pub scratch_root: PathBuf,
     pub staging_key: String,
     pub fuse_id: String,
@@ -60,10 +65,6 @@ pub struct JobRequest {
     pub align_lax: bool,
     pub crop: bool,
     pub backend: Option<&'static dyn TileBackend>,
-    /// Write onto the tab's already-sealed project as a new checkpoint
-    /// instead of sealing a fresh container -- set for a re-fuse of an
-    /// already-opened tab, clear for a first fuse.
-    pub append: bool,
 }
 
 /// How often the pipeline's poll thread ticks progress -- the window's
@@ -93,7 +94,7 @@ pub fn spawn(
         });
         let fuse_request = FuseRequest {
             frames: request.frames,
-            project_path: request.project_path,
+            output: FuseOutput::Hold(request.hold_dir),
             scratch_root: request.scratch_root,
             staging_key: request.staging_key,
             algorithm,
@@ -105,7 +106,6 @@ pub fn spawn(
             backend: request.backend,
             resume: false,
             cache: true,
-            append: request.append,
             poll: POLL,
         };
         pipeline::run(&fuse_request, observer.as_ref(), control, None)
@@ -376,10 +376,10 @@ pub enum PlaneCacheError {
 }
 
 /// Where a project's materialized composite/Z-Map TIFFs live for the
-/// canvas: keyed by a short hash of its own `.ffp` path, since two tabs can
-/// share a project name.
-pub fn plane_cache_dir(project_path: &Path) -> PathBuf {
-    PathBuf::from(".scratch/planes").join(format!(
+/// canvas, under `scratch_root`: keyed by a short hash of its own `.ffp`
+/// path, since two tabs can share a project name.
+pub fn plane_cache_dir(scratch_root: &Path, project_path: &Path) -> PathBuf {
+    scratch_root.join("planes").join(format!(
         "{:016x}",
         crate::controller::path_digest(project_path)
     ))
@@ -399,8 +399,11 @@ fn is_fresh(path: &Path, ffp_modified: SystemTime) -> bool {
 /// directory ([`plane_cache_dir`]), skipping either file already newer than
 /// the project's own `.ffp` -- a reopened, previously-materialized project
 /// costs nothing.
-pub fn materialize_planes(project: &mut Project) -> Result<(PathBuf, PathBuf), PlaneCacheError> {
-    let dir = plane_cache_dir(project.path());
+pub fn materialize_planes(
+    project: &mut Project,
+    scratch_root: &Path,
+) -> Result<(PathBuf, PathBuf), PlaneCacheError> {
+    let dir = plane_cache_dir(scratch_root, project.path());
     std::fs::create_dir_all(&dir)?;
     let composite = dir.join(COMPOSITE_FILENAME);
     let zmap = dir.join(ZMAP_FILENAME);
@@ -414,54 +417,54 @@ pub fn materialize_planes(project: &mut Project) -> Result<(PathBuf, PathBuf), P
     Ok((composite, zmap))
 }
 
-/// Opens a sealed `.ffp` and materializes its planes -- what promotes a tab
-/// from `Unsaved` to `Opened` on a completed fuse, and what `--open
-/// <saved>.ffp` needs before it can feed the canvas.
-pub fn open_and_materialize(path: &Path) -> Result<(Project, PathBuf, PathBuf), PlaneCacheError> {
-    let mut project = Project::open(path)?;
-    let (composite, zmap) = materialize_planes(&mut project)?;
-    Ok((project, composite, zmap))
+/// Writes `held`, in order, as one checkpoint chain at `target` -- onto the
+/// project already there when `onto_existing` -- and opens the result. On
+/// failure `target` is left exactly as it was.
+pub fn save_held(
+    target: &Path,
+    held: &[HeldCheckpoint],
+    onto_existing: bool,
+) -> Result<Project, ProjectError> {
+    project::seal_held(target, held, onto_existing)?;
+    Project::open(target)
 }
 
 /// One completed worker thread's result, boiled down to the shell's next
-/// [`RunState`] and, on a genuine completion, the reopened project plus its
-/// two materialized plane paths.
+/// [`RunState`] and, on a genuine completion, the checkpoint the run holds.
 pub struct Settled {
     pub state: RunState,
-    pub opened: Option<(Project, PathBuf, PathBuf)>,
+    pub held: Option<HeldCheckpoint>,
 }
 
 /// Interprets a joined worker thread's result -- a panic and a pipeline
 /// error both become [`RunState::Failed`], a clean cancel returns to
 /// [`RunState::Idle`] (the engine already preserved its own resumable state
 /// on disk, per its own "reported, never controlled" contract), and a
-/// completion re-opens the sealed project and materializes its planes.
+/// completion hands back the held checkpoint.
 pub fn settle(result: std::thread::Result<Result<FuseOutcome, PipelineError>>) -> Settled {
     match result {
-        Ok(Ok(FuseOutcome::Completed(report))) => match open_and_materialize(&report.sealed.path) {
-            Ok((project, composite, zmap)) => {
-                let at = format_utc_hhmm(project.checkpoint().created_at);
-                Settled {
-                    state: RunState::Fused { at },
-                    opened: Some((project, composite, zmap)),
-                }
+        Ok(Ok(FuseOutcome::Completed(report))) => {
+            let FuseProduct::Held(held) = report.product else {
+                unreachable!("the window's runs always hold their result");
+            };
+            Settled {
+                state: RunState::Fused {
+                    at: format_utc_hhmm(held.created_at),
+                },
+                held: Some(held),
             }
-            Err(err) => Settled {
-                state: RunState::Failed(err.to_string()),
-                opened: None,
-            },
-        },
+        }
         Ok(Ok(FuseOutcome::Cancelled { .. })) => Settled {
             state: RunState::Idle,
-            opened: None,
+            held: None,
         },
         Ok(Err(err)) => Settled {
             state: RunState::Failed(err.to_string()),
-            opened: None,
+            held: None,
         },
         Err(_) => Settled {
             state: RunState::Failed("the fuse worker stopped unexpectedly".to_string()),
-            opened: None,
+            held: None,
         },
     }
 }

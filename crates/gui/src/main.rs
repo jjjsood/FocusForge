@@ -65,9 +65,15 @@ struct Args {
     #[arg(long)]
     images_sort_menu_open: bool,
     /// Opens the projects overlay at startup, for inspecting every state of
-    /// this surface with no click sequence.
+    /// this surface with no click sequence. With `--fuse-tabs`, it opens once
+    /// the last run settles instead.
     #[arg(long)]
     projects_overlay: bool,
+    /// Presses `Save project` once the last `--fuse-tabs` run settles,
+    /// accepting the proposed path without a dialog -- for inspecting the
+    /// saved state with no click sequence.
+    #[arg(long, requires = "fuse_tabs")]
+    save_active_project: bool,
     /// Requests removing the frame at this index right after `--open`, for
     /// inspecting the frame-set warning it raises on a checkpointed project
     /// with no click sequence.
@@ -76,7 +82,8 @@ struct Args {
     /// Selects these tab indices in turn and presses `Fuse stack` on each,
     /// right after `--open`, leaving the last one selected -- for
     /// inspecting a live run and the tabs queued behind it with no click
-    /// sequence. Comma-separated.
+    /// sequence. Comma-separated. An index repeated waits for every run to
+    /// settle before it is pressed again, so `0,0` fuses tab 0 twice.
     #[arg(long, value_delimiter = ',')]
     fuse_tabs: Vec<usize>,
 }
@@ -107,14 +114,21 @@ fn apply_toolbar_state_preview(app: &AppWindow, state: &str) {
 /// load is still running targets a tab that does not exist yet and is
 /// silently dropped, since `--open`'s directory walk and thumbnail decode
 /// run off the event-loop thread and settle only once the window's own poll
-/// picks up their result.
+/// picks up their result. An index already pressed waits until no run is
+/// pending, since a press on a tab already running or queued is ignored.
+/// Once every press is made and every run settled, `save` presses `Save
+/// project` on the proposed path and `overlay` opens the projects overlay.
 fn start_fuse_tabs_timer(
     app_weak: slint::Weak<AppWindow>,
     controller: Arc<Mutex<AppController>>,
     slot: &Rc<RefCell<Option<slint::Timer>>>,
     indices: Vec<usize>,
+    save: bool,
+    overlay: bool,
 ) {
     let timer_slot = slot.clone();
+    let mut pending: std::collections::VecDeque<usize> = indices.into();
+    let mut pressed: Vec<usize> = Vec::new();
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, job::POLL, move || {
         let Some(app) = app_weak.upgrade() else {
@@ -123,11 +137,28 @@ fn start_fuse_tabs_timer(
         if controller.lock().unwrap().load_in_flight() {
             return;
         }
-        for index in &indices {
+        while let Some(&index) = pending.front() {
+            if pressed.contains(&index) && controller.lock().unwrap().work_pending() {
+                return;
+            }
+            pending.pop_front();
+            pressed.push(index);
             // The window's own callbacks, so a press here arms the poll
             // timer exactly as a click on the button does.
-            app.invoke_tab_selected(*index as i32);
+            app.invoke_tab_selected(index as i32);
             app.invoke_fuse_requested();
+        }
+        if (save || overlay) && controller.lock().unwrap().work_pending() {
+            return;
+        }
+        if save {
+            controller
+                .lock()
+                .unwrap()
+                .save_active_project(|proposed| Some(proposed.to_path_buf()));
+        }
+        if overlay && !controller.lock().unwrap().projects_overlay_open() {
+            controller.lock().unwrap().toggle_projects_overlay();
         }
         if let Some(t) = timer_slot.borrow().as_ref() {
             t.stop();
@@ -508,7 +539,7 @@ fn run(args: &Args) -> ExitCode {
             controller.lock().unwrap().toggle_images_sort_menu();
         }
 
-        if args.projects_overlay {
+        if args.projects_overlay && args.fuse_tabs.is_empty() {
             controller.lock().unwrap().toggle_projects_overlay();
         }
 
@@ -523,6 +554,8 @@ fn run(args: &Args) -> ExitCode {
                 controller.clone(),
                 &fuse_tabs_timer,
                 args.fuse_tabs.clone(),
+                args.save_active_project,
+                args.projects_overlay,
             );
         }
 
