@@ -23,6 +23,7 @@ export global ShellGeometry {
     // 1180 - 3*16 = 1132, /2 = 566 (base); 940 - 3*16 = 892, /2 = 446 (min).
     out property <length> pane-gutter: 16px;
     out property <length> pane-divider: 2px;
+    out property <length> pane-placeholder-width: 220px;
 
     // The dock's three insets, drawn separately, not collapsed to one.
     out property <length> dock-band-inset: 6px;
@@ -43,7 +44,7 @@ export global ShellGeometry {
     out property <length> strip-box-width: 30px;
 
     // The four-square Projects-overlay button at the tab strip's far left:
-    // 8 px inset, the 30 px box, 8 px to the first tab (board: button x
+    // 8 px inset, the 30 px box, 8 px to the first tab (button x
     // 8..38, first tab x 46). The slot is everything left of the tabs.
     out property <length> projects-button-inset: 8px;
     out property <length> projects-button-slot: 46px;

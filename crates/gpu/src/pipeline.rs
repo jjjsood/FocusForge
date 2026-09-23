@@ -93,13 +93,10 @@ pub(crate) fn build_pipeline(
     }
 }
 
-/// Encodes one bind group over `entries`, one compute pass dispatching
-/// `ceil(invocation_count / 64)` workgroups of `pipeline`, and submits it --
-/// shared by every kernel family in this crate, `GpuBackend::self_check`
-/// included, so each kernel wrapper is only its own buffer/params setup. A
-/// zero invocation count dispatches nothing (a degenerate level-count-0
-/// caller should not reach this, but this is cheaper than asserting it
-/// never does).
+/// Encodes one bind group over `entries`, dispatches `ceil(invocation_count
+/// / 64)` workgroups of `pipeline` on x alone and submits it; the shared tail
+/// of every 1-D kernel. x is capped at 65,535 workgroups, so
+/// `invocation_count` must stay at or under 4,194,240. Zero dispatches nothing.
 pub(crate) fn run_pass(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -111,6 +108,50 @@ pub(crate) fn run_pass(
     if invocation_count == 0 {
         return;
     }
+    dispatch(
+        device,
+        queue,
+        pipeline,
+        entries,
+        [invocation_count.div_ceil(64), 1, 1],
+        label,
+    );
+}
+
+/// [`run_pass`] for a kernel with an 8 x 8 workgroup indexing
+/// `(global_id.x, global_id.y)`: dispatches `ceil(width / 8) x ceil(height / 8)`
+/// workgroups, so the ceiling is per axis rather than on the product. A zero
+/// side dispatches nothing.
+pub(crate) fn run_pass_2d(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &Pipeline,
+    entries: &[wgpu::BindGroupEntry],
+    width: u32,
+    height: u32,
+    label: &str,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    dispatch(
+        device,
+        queue,
+        pipeline,
+        entries,
+        [width.div_ceil(8), height.div_ceil(8), 1],
+        label,
+    );
+}
+
+fn dispatch(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &Pipeline,
+    entries: &[wgpu::BindGroupEntry],
+    [x, y, z]: [u32; 3],
+    label: &str,
+) {
     crate::errors::record_dispatch(label);
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(label),
@@ -126,7 +167,7 @@ pub(crate) fn run_pass(
         });
         pass.set_pipeline(&pipeline.compute);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(invocation_count.div_ceil(64), 1, 1);
+        pass.dispatch_workgroups(x, y, z);
     }
     queue.submit(Some(encoder.finish()));
 }

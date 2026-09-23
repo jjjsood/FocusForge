@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The token sheet `--theme-sheet` renders one row per named token group
-// (colour, type, spacing, radius, icon size). Kept out of `theme.slint`
-// itself: `crates/gui/tests/theme.rs`'s `no_type_role_fixes_a_width` forbids
-// the substring `width` anywhere in that file, and a swatch needs one.
+// Visual reference sheet for every design token and shared component,
+// rendered via `--theme-sheet`. Kept separate from `theme.slint`: a test
+// there forbids the substring `width` anywhere in that file, and a swatch
+// needs one.
 
 import { Theme, TypeRole } from "theme.slint";
+import { ShellGeometry } from "geometry.slint";
+import { FFIconButton } from "components/ff_icon_button.slint";
 import { FFSlider } from "components/ff_slider.slint";
 import { FFField } from "components/ff_field.slint";
 import { FFToggle } from "components/ff_toggle.slint";
@@ -19,6 +21,7 @@ import { FFRowLabel } from "components/ff_row_label.slint";
 import { FFRowText } from "components/ff_row_text.slint";
 import { FFButton } from "components/ff_button.slint";
 import { FFProgressBar } from "components/ff_progress_bar.slint";
+import { FFPanePlaceholder } from "components/ff_pane_placeholder.slint";
 import { FFSpinner } from "components/ff_spinner.slint";
 import { FFLoadingPanel } from "components/ff_loading_panel.slint";
 import { FFImageRow } from "components/ff_image_row.slint";
@@ -124,9 +127,13 @@ component IconSizeSample inherits Rectangle {
 export component ThemeSheet inherits Window {
     title: "FocusForge -- token sheet";
     preferred-width: 1100px;
-    preferred-height: 2760px;
+    preferred-height: 1000px;
     background: Theme.surface-base;
     default-font-family: Theme.font-family;
+
+    Flickable {
+        width: root.width;
+        height: root.height;
 
     VerticalLayout {
         padding: Theme.space-4;
@@ -218,6 +225,27 @@ export component ThemeSheet inherits Window {
             IconSizeSample { icon-size: Theme.icon-lg; label: "icon-lg"; }
             IconSizeSample { icon-size: Theme.icon-md; label: "icon-md"; }
             IconSizeSample { icon-size: Theme.icon-sm; label: "icon-sm"; }
+        }
+
+        GroupHeading { text: "Icon button"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            FFIconButton { icon: @image-url("../../../assets/icons/zoom-out.svg"); }
+            FFIconButton {
+                icon: @image-url("../../../assets/icons/arrow-up-down.svg");
+                glyph-size: Theme.icon-sm;
+                pad: Theme.space-1;
+            }
+            FFIconButton {
+                icon: @image-url("../../../assets/icons/x.svg");
+                width: ShellGeometry.strip-box-width;
+                height: ShellGeometry.strip-box-height;
+                recolor-on-hover: false;
+            }
+            FFIconButton {
+                icon: @image-url("../../../assets/icons/zoom-out.svg");
+                enabled: false;
+            }
         }
 
         GroupHeading { text: "FFManifestList"; }
@@ -372,6 +400,9 @@ export component ThemeSheet inherits Window {
             FFLoadingPanel { caption: "Loading…"; }
         }
 
+        GroupHeading { text: "Canvas: pane placeholder"; }
+        FFPanePlaceholder { }
+
         GroupHeading { text: "Images list: row"; }
         VerticalLayout {
             spacing: 0px;
@@ -409,6 +440,25 @@ export component ThemeSheet inherits Window {
                 name: "04.tif";
                 time-text: "14:16:04";
                 dragging: true;
+            }
+            FFImageRow {
+                width: 248px;
+                chip: Theme.status-success;
+                name: "05.tif";
+                time-text: "14:17:05";
+                selected: true;
+            }
+        }
+
+        Rectangle {
+            width: 200px;
+            height: 48px;
+            FFMenuList {
+                width: 200px;
+                choices: ["Name", "Capture time"];
+                choice-ids: ["name", "capture-time"];
+                show-choice-ids: false;
+                selected: "name";
             }
         }
 
@@ -454,15 +504,24 @@ export component ThemeSheet inherits Window {
                 confirm-label: "Remove and re-fuse";
             }
         }
+
+        GroupHeading { text: "Dialog: save, with a context line"; }
         Rectangle {
-            width: 200px;
-            height: 48px;
-            FFMenuList {
-                width: 200px;
-                choices: ["Name", "Capture time"];
-                choice-ids: ["name", "capture-time"];
-                show-choice-ids: false;
-                selected: "name";
+            width: 500px;
+            height: 320px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "save";
+                title: "Save this state first?";
+                context: "Closing IMG_9801-9861";
+                body: "2 checkpoints have been fused since the last save. They belong to no saved project.\n\nClosing without saving loses them.";
+                info: "Saving adds them to IMG_9801-9861.ffp.";
+                secondary-label: "Save and close";
+                confirm-label: "Close without saving";
+                confirm-kind: "danger";
             }
         }
 
@@ -496,7 +555,7 @@ export component ThemeSheet inherits Window {
                 fusing: true;
                 fusing-fraction: 0.42;
                 project-name: "IMG_9941-9977";
-                meta-text: "37 frames · fusing, step 2 of 3";
+                meta-text: "37 frames · aligning, 15 of 37";
             }
             FFProjectCard {
                 kind: "failed";
@@ -542,5 +601,6 @@ export component ThemeSheet inherits Window {
                 meta-text: "not read · not changed";
             }
         }
+    }
     }
 }

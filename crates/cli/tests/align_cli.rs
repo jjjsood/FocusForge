@@ -65,7 +65,7 @@ fn align_quiet_prints_no_progress() {
     // `--quiet` suppresses the stage line, never the `--lax` failure-count
     // warning: that is a diagnostic about the result, not progress.
     assert!(
-        !quiet.stderr.contains("frames (no unit progress)"),
+        !quiet.stderr.contains("align 8 frames"),
         "stderr: {}",
         quiet.stderr
     );
@@ -79,7 +79,7 @@ fn align_quiet_prints_no_progress() {
     ]);
     assert!(loud.success, "stderr: {}", loud.stderr);
     assert!(
-        loud.stderr.contains("frames (no unit progress)"),
+        loud.stderr.contains("align 8 frames"),
         "stderr: {}",
         loud.stderr
     );
@@ -110,7 +110,7 @@ fn align_prints_a_stage_line_on_stderr() {
     ]);
     assert!(out.success, "stderr: {}", out.stderr);
     assert!(
-        out.stderr.contains("align 8 frames (no unit progress)"),
+        out.stderr.contains("align 8 frames"),
         "stderr: {}",
         out.stderr
     );

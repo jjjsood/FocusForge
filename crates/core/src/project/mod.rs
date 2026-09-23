@@ -75,7 +75,7 @@ pub use manifest::{
     SourceResolution,
 };
 pub use review::ReviewMetrics;
-pub use seal::{SealRequest, SealedProject, seal, seal_at};
+pub use seal::{HeldCheckpoint, SealRequest, SealedProject, seal, seal_at, seal_held};
 
 /// Decompresses `which` into an uncompressed TIFF (the composite) or Z-Map
 /// file at `path`: writes a `.partial` sibling first and renames it onto
@@ -214,7 +214,7 @@ pub const HASH_ALGORITHM: &str = "blake3";
 const READ_BAND_BYTES: usize = 4 << 20;
 
 /// A project opened for reading: enough to prove the round-trip and to drive
-/// `focusforge-cli export`. Editing is not implemented by this type.
+/// `focusforge-cli export`. The GUI editor opens one for editing.
 pub struct Project {
     path: PathBuf,
     archive: zip::ZipArchive<File>,

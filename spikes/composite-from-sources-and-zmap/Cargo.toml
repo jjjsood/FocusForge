@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "composite-from-sources-and-zmap"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+focusforge-core = { path = "../../crates/core" }
+zstd = "0.14"

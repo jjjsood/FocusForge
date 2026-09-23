@@ -16,19 +16,7 @@ pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
-/// An optional data directory next to this checkout: three levels above
-/// the workspace root, or a sibling directory. `None` when neither exists,
-/// so a test that needs it skips rather than fails.
-pub fn sibling_data_root() -> Option<PathBuf> {
-    let candidates = [
-        workspace_root().join("..").join("..").join(".."),
-        workspace_root().join("..").join("reference-data"),
-    ];
-    candidates
-        .into_iter()
-        .find(|p| p.join("tools").join("lib").join("rawtiff.py").is_file())
-}
-
+/// `crates/core/../../fixtures` -- the workspace's committed fixture trees.
 pub fn fixtures_dir() -> PathBuf {
     workspace_root().join("fixtures")
 }

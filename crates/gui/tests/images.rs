@@ -95,11 +95,15 @@ fn wait_for_settle(controller: &mut AppController, timeout: Duration) {
     }
 }
 
-fn opened_project_path(root_name: &str, controller: &AppController) -> PathBuf {
-    let title = controller.project_tabs()[0].title.clone();
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(root_name)
-        .join(format!("{title}.ffp"))
+/// Saves the active, never-saved tab to the path the save dialog proposes,
+/// and returns that path.
+fn save_to_proposed(controller: &mut AppController) -> PathBuf {
+    let mut target = None;
+    assert!(controller.save_active_project(|proposed| {
+        target = Some(proposed.to_path_buf());
+        target.clone()
+    }));
+    target.expect("a never-saved tab asks where to save")
 }
 
 /// Seals a project directly (no real fuse) over `sources`, returning its
@@ -262,8 +266,148 @@ fn rows_carry_no_index() {
             excluded: _,
             unresolved: _,
             top: _,
+            selected: _,
         } = row;
     }
+}
+
+// ---------------------------------------------------------------------
+// Selection: exactly one frame selected, a position rather than an
+// identity, driving the left canvas pane.
+// ---------------------------------------------------------------------
+
+fn mantis64_frame(index: usize) -> PathBuf {
+    common::fixture_frame("mantis-64", index)
+}
+
+fn controller_with_mantis64_frames(name: &str) -> AppController {
+    let root = tree(&format!("{name}_frames"));
+    for i in 0..3 {
+        std::fs::copy(mantis64_frame(i), root.join(format!("{i:02}.tif")))
+            .expect("fixture frame must copy");
+    }
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[root]),
+        OpenOutcome::Opened(_)
+    ));
+    controller
+}
+
+/// The selected position, the path the canvas is fed and the panel's own
+/// `selected` flags are one value -- never index 0, the last row instead.
+#[test]
+fn frame_selection_drives_left_pane() {
+    let mut controller = controller_with_mantis64_frames("frame_selection_drives_left_pane");
+    let last = 2;
+    controller.select_frame(last);
+
+    let path = controller
+        .selected_frame_path()
+        .expect("a tab is open with frames to select");
+    assert_eq!(path.file_name().unwrap().to_str().unwrap(), "02.tif");
+    assert_eq!(controller.frame_pane_label(), "02.tif");
+
+    let panel = controller.images_panel();
+    for (i, row) in panel.rows.iter().enumerate() {
+        assert_eq!(
+            row.selected,
+            i == last,
+            "row {i}'s selected flag must match the position picked, not index 0"
+        );
+    }
+}
+
+/// One row carries `selected` after open, after removing the selected row,
+/// after removing down to the list's last remaining row, and after the
+/// post-run re-seed -- never zero, never two. Seeding a first-excluded set
+/// skips the excluded position, checked directly against the seed function
+/// tab creation and the post-run re-seed both call.
+#[test]
+fn selection_is_always_exactly_one() {
+    assert_eq!(
+        focusforge_gui::images::first_included(&[true, false, false]),
+        1,
+        "seeding must skip an excluded first frame"
+    );
+
+    fn selected_count(controller: &AppController) -> usize {
+        controller
+            .images_panel()
+            .rows
+            .iter()
+            .filter(|r| r.selected)
+            .count()
+    }
+
+    let mut controller = controller_with_timed_frames("selection_always_one", 3);
+    assert_eq!(selected_count(&controller), 1, "after open");
+
+    controller.select_frame(1);
+    controller.remove_frame(1);
+    assert_eq!(
+        selected_count(&controller),
+        1,
+        "after removing the selected row"
+    );
+
+    // Down to the last remaining row: select it, then remove it.
+    let last = controller.images_panel().rows.len() - 1;
+    controller.select_frame(last);
+    controller.remove_frame(last);
+    assert_eq!(
+        selected_count(&controller),
+        1,
+        "after removing the selected row when it was the list's last row"
+    );
+
+    // The post-run re-seed: a second fuse must land exactly one selected
+    // row again, regardless of what was selected before it started.
+    let mut controller = controller_with_frames("selection_always_one_run", 3);
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    controller.select_frame(2);
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert_eq!(selected_count(&controller), 1, "after the post-run re-seed");
+    assert!(
+        controller.images_panel().rows[0].selected,
+        "the re-seed lands on the first included frame"
+    );
+}
+
+/// Selection is a position, not an identity: the same frame stays selected
+/// across a manual reorder that moves it, and across removing a frame that
+/// now sits above it.
+#[test]
+fn selection_survives_reorder_and_remove() {
+    let mut controller = controller_with_timed_frames("selection_survives", 4);
+    controller.select_frame(2);
+    let selected_name = controller.frame_pane_label();
+    assert_eq!(selected_name, "02.tif");
+
+    // A manual drag from below the selection to above it.
+    controller.move_frame(3, 0);
+    assert_eq!(
+        controller.frame_pane_label(),
+        selected_name,
+        "the same frame stays selected across a reorder"
+    );
+
+    let panel = controller.images_panel();
+    let selected_pos = panel.rows.iter().position(|r| r.selected).unwrap();
+    assert!(
+        selected_pos > 0,
+        "the reorder must have left at least one row above the selection"
+    );
+
+    // Removing a frame above the (moved) selection.
+    controller.remove_frame(0);
+    assert_eq!(
+        controller.frame_pane_label(),
+        selected_name,
+        "the same frame stays selected across removing a frame above it"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -598,7 +742,7 @@ fn a_sealed_tab_reads_as_having_a_checkpoint() {
         .expect("a checkpoint now exists, so removing must warn");
     assert!(warning.body.contains('1'));
 
-    let project_path = opened_project_path("sealed_tab_checkpoint_gate_frames", &controller);
+    let project_path = save_to_proposed(&mut controller);
     let mut reopened = AppController::new();
     assert!(matches!(
         common::open_and_settle(&mut reopened, &[project_path]),
@@ -791,7 +935,8 @@ fn dragging_a_row_by_its_grip_reorders_it_through_the_real_window() {
         "images_grip_drag_wire",
         5,
     )));
-    let _installed = focusforge_gui::bridge::install(&app, controller.clone());
+    let _installed =
+        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
     app.set_project_loaded(true);
     focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
 
@@ -884,7 +1029,8 @@ fn dragging_a_row_by_its_grip_floats_a_copy_that_follows_the_cursor() {
         "images_grip_drag_ghost",
         5,
     )));
-    let _installed = focusforge_gui::bridge::install(&app, controller.clone());
+    let _installed =
+        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
     app.set_project_loaded(true);
     focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
 
@@ -1006,7 +1152,8 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
         "job_disables_images_and_settings",
         3,
     )));
-    let _installed = focusforge_gui::bridge::install(&app, controller.clone());
+    let _installed =
+        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
     app.set_project_loaded(true);
     app.set_dock_tab("images".into());
     let push = |c: &AppController| {
@@ -1226,7 +1373,8 @@ fn the_frame_set_warnings_footer_sits_at_the_panels_bottom_edge() {
     assert!(controller.pending_frame_change().is_some());
 
     let controller = Arc::new(Mutex::new(controller));
-    let _installed = focusforge_gui::bridge::install(&app, controller.clone());
+    let _installed =
+        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
     app.set_project_loaded(true);
     focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
 

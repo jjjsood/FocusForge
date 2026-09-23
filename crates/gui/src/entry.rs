@@ -8,7 +8,7 @@
 //! `crate::gpu_canvas` is the one naming `wgpu` and `crate::bridge` the one
 //! naming `winit`. The two entrances (the picker, the drop route) and
 //! `--open` all resolve through `classify` and `open` so they cannot
-//! diverge (item Objective).
+//! diverge.
 
 use std::path::{Path, PathBuf};
 
@@ -17,9 +17,8 @@ use focusforge_core::io::{
 };
 use focusforge_core::params::StackContext;
 use focusforge_core::project::{PROJECT_EXTENSION, Project, ProjectError};
-// Named here, and re-exported, so `controller.rs` can carry a `Proposal` in
-// its own pending-question state without naming `focusforge_core` itself
-// (`tests/shell.rs`'s crate-wide scan).
+// Re-exported so `controller.rs` can carry a `Proposal` in its own
+// pending-question state without naming `focusforge_core` itself.
 pub use focusforge_core::io::Proposal;
 
 /// What a set of paths (a picker result, a drop gesture, `--open`'s single
@@ -71,7 +70,7 @@ pub struct Opened {
 /// The three shapes opening a path set can take. `Question` carries the
 /// [`Proposal`] behind it alongside the question's own rendering summary,
 /// so the controller can answer it later without re-walking the directory
-/// (step 11's `pending: Option<(GroupingQuestion, Proposal)>`).
+/// (`pending: Option<(GroupingQuestion, Proposal)>`).
 pub enum OpenOutcome {
     Opened(Opened),
     Question(GroupingQuestion, Proposal),
@@ -285,6 +284,15 @@ pub fn project_frames(project: &GuiProject) -> Vec<PathBuf> {
             .map(|source| project.source_path(source))
             .collect(),
     }
+}
+
+/// A tab's own source-frame size, read from an actual frame's header --
+/// always the frames' own extent, never the sealed composite's (possibly
+/// cropped) one, for a fresh group and for a reopened project alike.
+pub fn tab_image_size(project: &GuiProject) -> Option<(u32, u32)> {
+    let frames = project_frames(project);
+    let header = TiffHeader::open(frames.first()?).ok()?;
+    Some((header.width, header.height))
 }
 
 /// A tab's frame count: the group's own frame count pre-fuse, the sealed

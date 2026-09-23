@@ -14,7 +14,7 @@ pub use readback::read_display_texture;
 use crate::device::SharedDevice;
 use crate::pack::pack_samples;
 use crate::pipeline::{
-    Pipeline, build_pipeline, run_pass, storage_entry, storage_texture_entry, uniform_entry,
+    Pipeline, build_pipeline, run_pass_2d, storage_entry, storage_texture_entry, uniform_entry,
 };
 use crate::transfer::create_storage_buffer;
 
@@ -156,7 +156,7 @@ pub fn render(
         .create_view(&wgpu::TextureViewDescriptor::default());
     let pipeline = tonemap_pipeline(device);
 
-    run_pass(
+    run_pass_2d(
         device,
         queue,
         &pipeline,
@@ -174,7 +174,8 @@ pub fn render(
                 resource: wgpu::BindingResource::TextureView(&view),
             },
         ],
-        target.width() * target.height(),
+        target.width(),
+        target.height(),
         "focusforge-gpu-display-tonemap",
     );
 }

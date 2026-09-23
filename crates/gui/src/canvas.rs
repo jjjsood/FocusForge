@@ -9,6 +9,31 @@
 //! `crates/gui/src/gpu_canvas.rs`, the only module in the crate naming
 //! `wgpu` or `slint::wgpu_29`.
 
+use std::cell::Cell;
+use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
+
+use focusforge_core::TiffError;
+use focusforge_core::io::TiffStack;
+use focusforge_core::tile::Rect;
+
+/// What the open renderer cell should do for the frame about to draw --
+/// [`crate::controller::AppController::canvas_feed`]'s answer, decided with
+/// no GPU and no window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanvasFeed {
+    /// The renderer already holds the active tab's planes; draw as is.
+    Keep,
+    /// No tab is active, or the active tab has nothing sealed to show yet.
+    Clear,
+    /// Open `composite`/`zmap` as `tab`'s own planes.
+    Load {
+        tab: usize,
+        composite: PathBuf,
+        zmap: PathBuf,
+    },
+}
+
 /// Which pane a piece of canvas state belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneSource {
@@ -74,4 +99,115 @@ pub fn check_pane_dimensions(composite: (u32, u32), zmap: (u32, u32)) -> Result<
     } else {
         Err(CanvasError::PaneDimensionsDiffer { composite, zmap })
     }
+}
+
+/// The one open source-frame handle the left canvas pane draws from -- never
+/// more than one [`TiffStack`] mapped at once. Sixty-one frames held open at
+/// the same time would map the whole reference stack, which is why
+/// [`Self::set`] drops whatever was open before mapping the next.
+#[derive(Default)]
+pub struct FrameSource {
+    open: Option<(PathBuf, TiffStack)>,
+}
+
+impl FrameSource {
+    /// Opens `path`, dropping whatever was open first. Nothing is left open
+    /// on failure.
+    pub fn set(&mut self, path: &Path) -> Result<(), TiffError> {
+        self.open = None;
+        let stack = TiffStack::open_files(std::slice::from_ref(&path.to_path_buf()))?;
+        self.open = Some((path.to_path_buf(), stack));
+        Ok(())
+    }
+
+    /// Drops the open handle, if any.
+    pub fn clear(&mut self) {
+        self.open = None;
+    }
+
+    /// The currently open frame's own path, if any.
+    pub fn path(&self) -> Option<&Path> {
+        self.open.as_ref().map(|(path, _)| path.as_path())
+    }
+
+    /// The open frame's `(width, height)`, if any.
+    pub fn dimensions(&self) -> Option<(u32, u32)> {
+        self.open.as_ref().map(|(_, stack)| stack.dimensions())
+    }
+
+    /// The open frame's samples per pixel, if any.
+    pub fn samples_per_pixel(&self) -> Option<u32> {
+        self.open
+            .as_ref()
+            .map(|(_, stack)| stack.header(0).samples_per_pixel)
+    }
+
+    /// Reads every `step`-th row and column of `rect` into `out`. Callers
+    /// check [`Self::dimensions`] first, so a frame is always open by the
+    /// time this runs.
+    pub fn read_into(
+        &self,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [u16],
+    ) -> Result<(), TiffError> {
+        let (_, stack) = self
+            .open
+            .as_ref()
+            .expect("read_into is only called once a frame is confirmed open");
+        stack.read_tile_step_into(0, rect, step, out)
+    }
+}
+
+/// Collapses many repaint requests into one scheduled repaint: `request`
+/// answers `true` only for the first request since the last `take`, which is
+/// the caller's cue to schedule the one repaint that will `take` it.
+#[derive(Debug, Default)]
+pub struct RepaintGate {
+    pending: Cell<bool>,
+}
+
+impl RepaintGate {
+    /// Marks a repaint as wanted; `true` when none was pending yet.
+    pub fn request(&self) -> bool {
+        !self.pending.replace(true)
+    }
+
+    /// Clears the pending mark; `true` when a repaint was pending.
+    pub fn take(&self) -> bool {
+        self.pending.replace(false)
+    }
+}
+
+/// Whether `src`'s rect lies fully inside a `frame`-sized image -- the same
+/// bound `TiffStack::read_tile_into` enforces, decided before any read
+/// happens so an out-of-range viewport rect never reaches the mmap.
+pub fn draw_rect_fits(frame: (u32, u32), src: (u32, u32, u32, u32)) -> bool {
+    let (frame_width, frame_height) = frame;
+    let (x, y, width, height) = src;
+    width > 0
+        && height > 0
+        && x.checked_add(width).is_some_and(|xw| xw <= frame_width)
+        && y.checked_add(height).is_some_and(|yh| yh <= frame_height)
+}
+
+/// Characters `FFPaneLabel`'s 120 px pill holds, at `Theme.text-body` size,
+/// with room left for the pill's own rounded edge -- measured against the
+/// shipped Inter body face, where the pill's own width fits roughly 20
+/// characters edge to edge.
+const PANE_LABEL_MAX_CHARS: usize = 16;
+
+/// Fits `label` inside `FFPaneLabel`'s pill by keeping its tail: a label
+/// short enough already passes through unchanged; a longer one is cut down
+/// to a fixed character budget with a leading `…` standing in for the
+/// dropped head, since a long filename's distinguishing part is its end,
+/// not its shared prefix.
+pub fn truncate_pane_label(label: &str) -> String {
+    let chars: Vec<char> = label.chars().collect();
+    if chars.len() <= PANE_LABEL_MAX_CHARS {
+        return label.to_string();
+    }
+    let kept = PANE_LABEL_MAX_CHARS - 1;
+    let tail: String = chars[chars.len() - kept..].iter().collect();
+    format!("\u{2026}{tail}")
 }

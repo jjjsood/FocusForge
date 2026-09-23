@@ -222,7 +222,7 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | `--status <PATH>` | append one NDJSON status record for this stack to this path |
 | `--dry-run` | resolve everything and print what would happen, without computing or writing anything |
 | `--no-gpu` | force the CPU path even when a usable GPU adapter is present; absent when the binary was built `--no-default-features` |
-| `--no-cache` | skip the stage cache: recompute alignment even when a valid entry exists, and leave no entry behind |
+| `--no-cache` | skip the stage cache: recompute the alignment even when a valid entry exists, and store no new entry |
 
 Every project carries a **Z-Map**: a single-channel 16-bit TIFF, stored
 inside the project alongside the composite, with one value per output pixel
@@ -291,8 +291,9 @@ what that policy is and why it defaults to strict. `backend` reads `"cpu"`
 because this example passes `--no-gpu`; omit it on a default build with a
 usable adapter present and it instead names the adapter, for example `NVIDIA
 GeForce RTX 5070 Ti (backend=Vulkan, driver=NVIDIA, driver_info=595.84)`.)
-`--quiet` suppresses only the per-tile progress line; the run summary above
-still prints. `stages`' `workers=?`/`peak=?` here mean `--no-align` never
+`--quiet` suppresses only the ticking progress line — per-frame while
+alignment runs, per-tile once fusion starts; the run summary above still
+prints. `stages`' `workers=?`/`peak=?` here mean `--no-align` never
 entered the alignment stage at all — a real run reports numbers instead
 (see below).
 

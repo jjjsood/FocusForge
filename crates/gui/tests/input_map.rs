@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use focusforge_gui::input_map::InputTable;
 use focusforge_gui::input_map::{
-    Action, ActionEvent, Button, DEFAULT_BINDINGS, Modifiers, PointerKind, Trigger,
+    Action, ActionEvent, Binding, Button, DEFAULT_BINDINGS, Modifiers, PointerKind, Trigger,
 };
 use focusforge_gui::{AppController, ShellEvent, ShellMode, input_config};
 
@@ -278,9 +278,8 @@ fn partial_out_of_order_single_row_config_leaves_other_rows_at_default() {
     );
 
     // Every other default trigger, including `wheel` itself, must resolve
-    // exactly as the defaults do -- this is the assertion that fails under
-    // the old positional merge, which clobbered `bindings[0]` (`wheel`)
-    // even though the file's one row named `alt+wheel`.
+    // exactly as the defaults do: the file's one custom row names
+    // `alt+wheel`, leaving plain `wheel` still bound to its default action.
     for binding in defaults.bindings.iter() {
         if binding.trigger == (Trigger::Wheel(Modifiers { alt: true, ..NONE })) {
             continue;
@@ -766,12 +765,83 @@ fn key_rows_resolve_with_their_modifiers() {
 }
 
 #[test]
+fn undo_and_redo_are_blocked_under_the_settings_modal() {
+    let mut editor = AppController::new_with_mode_for_test(ShellMode::Editor);
+    let (events, cb) = sink();
+    editor.set_sink(cb);
+
+    editor.open_settings();
+    editor.key(true, "z", Modifiers { ctrl: true, ..NONE });
+    editor.key(
+        true,
+        "z",
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            ..NONE
+        },
+    );
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "the default undo/redo chords must raise no event under Settings"
+    );
+    assert!(
+        editor.unimplemented_actions().is_empty(),
+        "a blocked fire is not recorded as unimplemented either"
+    );
+
+    // A custom binding of undo is blocked too, whatever key it is bound to.
+    let mut table = InputTable::default();
+    table.bindings.push(Binding {
+        trigger: Trigger::Key {
+            key: 'y',
+            mods: Modifiers { ctrl: true, ..NONE },
+        },
+        stacking: None,
+        editor: Some(Action::Undo),
+    });
+    editor.install_input_table(table, input_config::Provenance::Defaults);
+    editor.key(true, "y", Modifiers { ctrl: true, ..NONE });
+    assert!(events.lock().unwrap().is_empty());
+    assert!(editor.unimplemented_actions().is_empty());
+
+    editor.close_settings();
+    editor.key(true, "z", Modifiers { ctrl: true, ..NONE });
+    {
+        let got = events.lock().unwrap();
+        assert!(matches!(
+            &got[0],
+            ShellEvent::Input(ActionEvent::Fired {
+                action: Action::Undo,
+                ..
+            })
+        ));
+    }
+    events.lock().unwrap().clear();
+
+    editor.key(
+        true,
+        "z",
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            ..NONE
+        },
+    );
+    let got = events.lock().unwrap();
+    assert!(matches!(
+        &got[0],
+        ShellEvent::Input(ActionEvent::Fired {
+            action: Action::Redo,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn unimplemented_actions_are_named_not_silent() {
-    // `ZoomAtCursor`, `Pan` and `PanHorizontal` are `implemented() == true`;
-    // every trigger below is still driven, but the
-    // assertions at the bottom now split: the three implemented actions
-    // must no longer be recorded, the remaining seven still must be, by
-    // name.
+    // `ZoomAtCursor`, `Pan` and `PanHorizontal` are implemented and must
+    // not be recorded; the other seven must be, by name.
     let mut stacking = AppController::new();
     stacking.set_sink(Arc::new(|_| {}));
     stacking.wheel(0.0, 5.0, 0.0, 0.0, NONE); // ZoomAtCursor -- implemented

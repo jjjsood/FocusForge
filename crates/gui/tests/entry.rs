@@ -379,6 +379,7 @@ fn push_tabs(app: &focusforge_gui::AppWindow, controller: &AppController) {
             title: t.title.into(),
             unsaved: t.unsaved,
             selected: t.selected,
+            run_mark_icon: t.run_mark_icon.into(),
         })
         .collect();
     app.set_project_tabs(std::rc::Rc::new(slint::VecModel::from(tabs)).into());
@@ -468,11 +469,11 @@ fn tab_strip_scrolls_to_every_tab() {
 
 /// A freshly opened project must not read as overflowing before the strip's
 /// real width is ever pushed back from Slint. A `changed` handler fires
-/// only for a *later* change, never for
-/// the width's initial value, so a `tab_region_width` left at its untouched
-/// default silently understated the strip as narrower than it is -- one
-/// 228 px tab then read as overflowing a strip that was never actually
-/// measured, and both scroll arrows lit up over a single tab.
+/// only for a *later* change, never for the width's initial value, so a
+/// `tab_region_width` left at its untouched default would understate the
+/// strip as narrower than it is: one 228 px tab would read as overflowing
+/// a strip that was never actually measured, lighting both scroll arrows
+/// over a single tab.
 #[test]
 fn a_single_tab_does_not_read_as_overflowing_before_any_resize() {
     let root = tree("entry_single_tab_no_resize");
@@ -493,11 +494,7 @@ fn a_single_tab_does_not_read_as_overflowing_before_any_resize() {
     );
 }
 
-// ---------------------------------------------------------------------
-// Reopening a saved project through the same picker.
-/// An arrow click or a resize must tell the window: `scroll_tabs` and the
-/// strip-width setter once changed the offset silently, so the bridge never
-/// pushed it and the arrows looked dead.
+/// An arrow click or a resize must push the new offset to the window.
 #[test]
 fn tab_scroll_changes_reach_the_sink_and_opening_scrolls_into_view() {
     use focusforge_gui::{ShellEvent, max_tab_scroll, tab_content_width, tab_viewport_width};
@@ -578,6 +575,8 @@ fn tab_scroll_changes_reach_the_sink_and_opening_scrolls_into_view() {
     assert!(!controller.can_scroll_left() && !controller.can_scroll_right());
 }
 
+// ---------------------------------------------------------------------
+// Reopening a saved project through the same picker.
 // ---------------------------------------------------------------------
 
 /// Seals a minimal project into `dir`, returning its `.ffp` path.
@@ -739,7 +738,7 @@ fn plus_selects_the_new_project_placeholder() {
     let (left, right) = base_pane();
     controller.set_pane_geometry(left, right);
     assert_eq!(controller.zoom_readout(), "");
-    assert!(controller.pane_draw().is_none());
+    assert!(controller.frame_draw().is_none());
 }
 
 #[test]
@@ -1120,7 +1119,10 @@ fn a_double_click_on_a_close_glyph_closes_one_tab() {
         let mut four = with_four_projects(&format!("entry_double_click_close_{case}"));
         four.select_project(active);
         let controller = Arc::new(Mutex::new(four));
-        focusforge_gui::bridge::install(&app, controller.clone());
+        let canvas = std::rc::Rc::new(std::cell::RefCell::new(
+            focusforge_gui::bridge::Canvas::default(),
+        ));
+        focusforge_gui::bridge::install(&app, controller.clone(), canvas);
         let queued = Arc::new(Mutex::new(Vec::new()));
         controller.lock().unwrap().set_sink(Arc::new({
             let queued = queued.clone();
@@ -1138,6 +1140,7 @@ fn a_double_click_on_a_close_glyph_closes_one_tab() {
                         title: t.title.into(),
                         unsaved: t.unsaved,
                         selected: t.selected,
+                        run_mark_icon: t.run_mark_icon.into(),
                     })
                     .collect();
                 let flags = (c.tab_scroll_x(), c.tabs_overflow());

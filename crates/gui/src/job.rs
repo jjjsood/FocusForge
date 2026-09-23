@@ -15,7 +15,9 @@ use std::time::{Duration, SystemTime};
 use focusforge_core::gpu::TileBackend;
 use focusforge_core::io::{COMPOSITE_FILENAME, ZMAP_FILENAME};
 use focusforge_core::params::ParamValues;
-use focusforge_core::pipeline::{self, AlignRequest, FuseRequest, RunStage, StageObserver};
+use focusforge_core::pipeline::{
+    self, AlignRequest, FuseOutput, FuseProduct, FuseRequest, RunStage, StageObserver,
+};
 use focusforge_core::project::{self, Plane, Project, ProjectError};
 use focusforge_core::registry;
 
@@ -23,8 +25,9 @@ use focusforge_core::registry;
 /// can hold and drive these through the `job::` path alone.
 pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
+pub use focusforge_core::project::HeldCheckpoint;
 
-/// The shell's own view of a fuse run -- the surface's five reachable
+/// The shell's own view of a fuse run -- the surface's six reachable
 /// states.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RunState {
@@ -37,6 +40,11 @@ pub enum RunState {
     Fused {
         at: String,
     },
+    /// Waiting for the live run to settle -- `position` counts the live run
+    /// as 1, so the first waiting tab is `2`.
+    Queued {
+        position: usize,
+    },
 }
 
 /// Owned data for one fuse run, assembled under the controller lock and
@@ -45,7 +53,9 @@ pub enum RunState {
 #[derive(Clone)]
 pub struct JobRequest {
     pub frames: Vec<PathBuf>,
-    pub project_path: PathBuf,
+    /// Where the finished composite and Z-Map are kept; the run writes no
+    /// project.
+    pub hold_dir: PathBuf,
     pub scratch_root: PathBuf,
     pub staging_key: String,
     pub fuse_id: String,
@@ -55,14 +65,10 @@ pub struct JobRequest {
     pub align_lax: bool,
     pub crop: bool,
     pub backend: Option<&'static dyn TileBackend>,
-    /// Write onto the tab's already-sealed project as a new checkpoint
-    /// instead of sealing a fresh container -- set for a re-fuse of an
-    /// already-opened tab, clear for a first fuse.
-    pub append: bool,
 }
 
-/// How often the pipeline's poll thread ticks progress -- the window's own
-/// frame clock, not inherited from any spike measurement.
+/// How often the pipeline's poll thread ticks progress -- the window's
+/// own frame clock.
 pub const POLL: Duration = Duration::from_millis(100);
 
 /// Moves `request` onto a worker thread and runs it to completion through
@@ -88,7 +94,7 @@ pub fn spawn(
         });
         let fuse_request = FuseRequest {
             frames: request.frames,
-            project_path: request.project_path,
+            output: FuseOutput::Hold(request.hold_dir),
             scratch_root: request.scratch_root,
             staging_key: request.staging_key,
             algorithm,
@@ -100,7 +106,6 @@ pub fn spawn(
             backend: request.backend,
             resume: false,
             cache: true,
-            append: request.append,
             poll: POLL,
         };
         pipeline::run(&fuse_request, observer.as_ref(), control, None)
@@ -182,53 +187,55 @@ impl StageObserver for GuiObserver {
     }
 }
 
-/// The bar's three-step vocabulary, sourced from the run's own phases
-/// rather than the engine's two `JobStage` values: `Fuse` is the only step
-/// carrying `JobStage::Fuse` units, so no step here is fabricated from
-/// nothing.
+/// The run's own phases, in order. A phase declares its name and whether it
+/// counts frames ([`Phase::frames`]) -- the one place either is decided, so a
+/// phase added later needs only an arm here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Step {
-    Align,
-    Fuse,
-    Write,
+pub enum Phase {
+    Aligning,
+    Fusing,
+    Writing,
 }
 
-impl Step {
-    pub fn label(self) -> &'static str {
+impl Phase {
+    pub fn name(self) -> &'static str {
         match self {
-            Step::Align => "Align",
-            Step::Fuse => "Fuse",
-            Step::Write => "Write",
+            Phase::Aligning => "Aligning",
+            Phase::Fusing => "Fusing",
+            Phase::Writing => "Writing",
         }
     }
 
-    /// `"step N of 3"`.
-    pub fn text(self) -> String {
-        let n = match self {
-            Step::Align => 1,
-            Step::Fuse => 2,
-            Step::Write => 3,
-        };
-        format!("step {n} of 3")
+    /// `Some((done, total))` while `self` works per frame and `progress`
+    /// carries a non-zero total for it, `None` otherwise -- a cached or
+    /// resumed alignment included, since its total is `0`. `Aligning` is the
+    /// only phase with a frame total.
+    pub fn frames(self, progress: &JobProgress) -> Option<(usize, usize)> {
+        match self {
+            Phase::Aligning if progress.align_total > 0 => {
+                Some((progress.align_done, progress.align_total))
+            }
+            _ => None,
+        }
     }
 }
 
-/// Which [`Step`] `progress` is on: `Align` while the engine reports that
-/// stage, `Write` once every unit of the fuse stage is done (the seal, which
+/// Which [`Phase`] `progress` is on: `Aligning` while the engine reports that
+/// stage, `Writing` once every unit of the fuse stage is done (the seal, which
 /// the engine reports as no stage of its own -- `JobStage` has only
-/// `Align`/`Fuse`), `Fuse` otherwise -- including no progress at all yet.
-pub fn progress_step(progress: Option<&JobProgress>) -> Step {
+/// `Align`/`Fuse`), `Fusing` otherwise -- including no progress at all yet.
+pub fn progress_phase(progress: Option<&JobProgress>) -> Phase {
     match progress {
-        Some(p) if p.stage == JobStage::Align => Step::Align,
-        Some(p) if p.unit_total > 0 && p.units_done >= p.unit_total => Step::Write,
-        _ => Step::Fuse,
+        Some(p) if p.stage == JobStage::Align => Phase::Aligning,
+        Some(p) if p.unit_total > 0 && p.units_done >= p.unit_total => Phase::Writing,
+        _ => Phase::Fusing,
     }
 }
 
 /// The stage word the bar shows for `state`/`progress` -- `Aligning`,
 /// `Fusing`, `Writing`, `Paused`, `Cancelling`, `Failed` or a completed run's
 /// own `fused HH:MM`. `progress` picks between `Aligning`/`Fusing`/`Writing`
-/// while running, via `progress_step`.
+/// while running, via `progress_phase`.
 pub fn stage_word(state: &RunState, progress: Option<&JobProgress>) -> String {
     match state {
         RunState::Paused => "Paused".to_string(),
@@ -236,11 +243,8 @@ pub fn stage_word(state: &RunState, progress: Option<&JobProgress>) -> String {
         RunState::Failed(_) => "Failed".to_string(),
         RunState::Idle => String::new(),
         RunState::Fused { at } => format!("fused {at}"),
-        RunState::Running => match progress_step(progress) {
-            Step::Align => "Aligning".to_string(),
-            Step::Fuse => "Fusing".to_string(),
-            Step::Write => "Writing".to_string(),
-        },
+        RunState::Queued { position } => format!("Queued ({position})"),
+        RunState::Running => progress_phase(progress).name().to_string(),
     }
 }
 
@@ -253,6 +257,7 @@ pub fn toolbar_run_state(state: &RunState) -> &'static str {
         RunState::Paused => "paused",
         RunState::Cancelling => "cancelling",
         RunState::Failed(_) => "failed",
+        RunState::Queued { .. } => "queued",
     }
 }
 
@@ -276,17 +281,50 @@ pub fn is_live(state: &RunState) -> bool {
     )
 }
 
-/// The step this run is on, derived through the same `progress_step`
+/// The phase this run is on, derived through the same `progress_phase`
 /// classification [`stage_word`] uses -- never fabricated from a state the
 /// engine did not report.
-pub fn current_step(state: &RunState, progress: Option<&JobProgress>) -> Option<Step> {
+pub fn current_phase(state: &RunState, progress: Option<&JobProgress>) -> Option<Phase> {
     match state {
         RunState::Idle => None,
-        RunState::Paused | RunState::Cancelling | RunState::Failed(_) | RunState::Fused { .. } => {
-            None
-        }
-        RunState::Running => Some(progress_step(progress)),
+        RunState::Paused
+        | RunState::Cancelling
+        | RunState::Failed(_)
+        | RunState::Fused { .. }
+        | RunState::Queued { .. } => None,
+        RunState::Running => Some(progress_phase(progress)),
     }
+}
+
+/// The bottom bar's step-text slot: `"<done> of <total>"` while the current
+/// phase works per frame and `progress` carries a total for it
+/// ([`Phase::frames`]), empty for a name-only phase, outside a running state,
+/// or with no progress to derive a phase from.
+pub fn progress_text(state: &RunState, progress: Option<&JobProgress>) -> String {
+    let (Some(phase), Some(p)) = (current_phase(state, progress), progress) else {
+        return String::new();
+    };
+    phase
+        .frames(p)
+        .map(|(done, total)| format!("{done} of {total}"))
+        .unwrap_or_default()
+}
+
+/// The run's phase line for a card or overlay meta text: the lower-cased
+/// phase name, plus `, <k> of <N>` when [`progress_text`] has a frame count
+/// to show. `None` outside `Running` -- a name-only phase still returns
+/// `Some`, so it never falls back to some other line.
+pub fn phase_line(state: &RunState, progress: Option<&JobProgress>) -> Option<String> {
+    if !matches!(state, RunState::Running) {
+        return None;
+    }
+    let name = progress_phase(progress).name().to_lowercase();
+    let text = progress_text(state, progress);
+    Some(if text.is_empty() {
+        name
+    } else {
+        format!("{name}, {text}")
+    })
 }
 
 /// `estimating` while `eta` is `None` and no unit has finished yet,
@@ -295,7 +333,7 @@ pub fn current_step(state: &RunState, progress: Option<&JobProgress>) -> Option<
 pub fn eta_text(state: &RunState, progress: Option<&JobProgress>) -> String {
     match state {
         RunState::Paused | RunState::Cancelling | RunState::Failed(_) => "ETA —".to_string(),
-        RunState::Idle | RunState::Fused { .. } => String::new(),
+        RunState::Idle | RunState::Fused { .. } | RunState::Queued { .. } => String::new(),
         RunState::Running => match progress.and_then(|p| p.eta) {
             Some(eta) => {
                 let secs = eta.as_secs();
@@ -306,10 +344,15 @@ pub fn eta_text(state: &RunState, progress: Option<&JobProgress>) -> String {
     }
 }
 
-/// The bar's fill fraction, `units_done / unit_total` of the whole job --
-/// `0.0` before the first unit or with no run at all.
+/// The bar's fill fraction: during a computed align stage,
+/// `align_done / align_total`, restarting from zero once the fuse stage
+/// begins; otherwise `units_done / unit_total` of the fuse job. `0.0` before
+/// the first unit, during a cached align stage, or with no run at all.
 pub fn bar_fraction(progress: Option<&JobProgress>) -> f32 {
     match progress {
+        Some(p) if p.stage == JobStage::Align && p.align_total > 0 => {
+            p.align_done as f32 / p.align_total as f32
+        }
         Some(p) if p.unit_total > 0 => p.units_done as f32 / p.unit_total as f32,
         _ => 0.0,
     }
@@ -333,10 +376,10 @@ pub enum PlaneCacheError {
 }
 
 /// Where a project's materialized composite/Z-Map TIFFs live for the
-/// canvas: keyed by a short hash of its own `.ffp` path, since two tabs can
-/// share a project name.
-pub fn plane_cache_dir(project_path: &Path) -> PathBuf {
-    PathBuf::from(".scratch/planes").join(format!(
+/// canvas, under `scratch_root`: keyed by a short hash of its own `.ffp`
+/// path, since two tabs can share a project name.
+pub fn plane_cache_dir(scratch_root: &Path, project_path: &Path) -> PathBuf {
+    scratch_root.join("planes").join(format!(
         "{:016x}",
         crate::controller::path_digest(project_path)
     ))
@@ -356,8 +399,11 @@ fn is_fresh(path: &Path, ffp_modified: SystemTime) -> bool {
 /// directory ([`plane_cache_dir`]), skipping either file already newer than
 /// the project's own `.ffp` -- a reopened, previously-materialized project
 /// costs nothing.
-pub fn materialize_planes(project: &mut Project) -> Result<(PathBuf, PathBuf), PlaneCacheError> {
-    let dir = plane_cache_dir(project.path());
+pub fn materialize_planes(
+    project: &mut Project,
+    scratch_root: &Path,
+) -> Result<(PathBuf, PathBuf), PlaneCacheError> {
+    let dir = plane_cache_dir(scratch_root, project.path());
     std::fs::create_dir_all(&dir)?;
     let composite = dir.join(COMPOSITE_FILENAME);
     let zmap = dir.join(ZMAP_FILENAME);
@@ -371,54 +417,54 @@ pub fn materialize_planes(project: &mut Project) -> Result<(PathBuf, PathBuf), P
     Ok((composite, zmap))
 }
 
-/// Opens a sealed `.ffp` and materializes its planes -- what promotes a tab
-/// from `Unsaved` to `Opened` on a completed fuse, and what `--open
-/// <saved>.ffp` needs before it can feed the canvas.
-pub fn open_and_materialize(path: &Path) -> Result<(Project, PathBuf, PathBuf), PlaneCacheError> {
-    let mut project = Project::open(path)?;
-    let (composite, zmap) = materialize_planes(&mut project)?;
-    Ok((project, composite, zmap))
+/// Writes `held`, in order, as one checkpoint chain at `target` -- onto the
+/// project already there when `onto_existing` -- and opens the result. On
+/// failure `target` is left exactly as it was.
+pub fn save_held(
+    target: &Path,
+    held: &[HeldCheckpoint],
+    onto_existing: bool,
+) -> Result<Project, ProjectError> {
+    project::seal_held(target, held, onto_existing)?;
+    Project::open(target)
 }
 
 /// One completed worker thread's result, boiled down to the shell's next
-/// [`RunState`] and, on a genuine completion, the reopened project plus its
-/// two materialized plane paths.
+/// [`RunState`] and, on a genuine completion, the checkpoint the run holds.
 pub struct Settled {
     pub state: RunState,
-    pub opened: Option<(Project, PathBuf, PathBuf)>,
+    pub held: Option<HeldCheckpoint>,
 }
 
 /// Interprets a joined worker thread's result -- a panic and a pipeline
 /// error both become [`RunState::Failed`], a clean cancel returns to
 /// [`RunState::Idle`] (the engine already preserved its own resumable state
 /// on disk, per its own "reported, never controlled" contract), and a
-/// completion re-opens the sealed project and materializes its planes.
+/// completion hands back the held checkpoint.
 pub fn settle(result: std::thread::Result<Result<FuseOutcome, PipelineError>>) -> Settled {
     match result {
-        Ok(Ok(FuseOutcome::Completed(report))) => match open_and_materialize(&report.sealed.path) {
-            Ok((project, composite, zmap)) => {
-                let at = format_utc_hhmm(project.checkpoint().created_at);
-                Settled {
-                    state: RunState::Fused { at },
-                    opened: Some((project, composite, zmap)),
-                }
+        Ok(Ok(FuseOutcome::Completed(report))) => {
+            let FuseProduct::Held(held) = report.product else {
+                unreachable!("the window's runs always hold their result");
+            };
+            Settled {
+                state: RunState::Fused {
+                    at: format_utc_hhmm(held.created_at),
+                },
+                held: Some(held),
             }
-            Err(err) => Settled {
-                state: RunState::Failed(err.to_string()),
-                opened: None,
-            },
-        },
+        }
         Ok(Ok(FuseOutcome::Cancelled { .. })) => Settled {
             state: RunState::Idle,
-            opened: None,
+            held: None,
         },
         Ok(Err(err)) => Settled {
             state: RunState::Failed(err.to_string()),
-            opened: None,
+            held: None,
         },
         Err(_) => Settled {
             state: RunState::Failed("the fuse worker stopped unexpectedly".to_string()),
-            opened: None,
+            held: None,
         },
     }
 }

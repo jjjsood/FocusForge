@@ -2,7 +2,8 @@
 
 //! The align -> fuse -> seal spine: opens a stack, resolves its two
 //! algorithm schemas, aligns it, tiles and fuses it under
-//! [`Job`](crate::job::Job), and seals the result into a project.
+//! [`Job`](crate::job::Job), and seals the result into a project or holds
+//! it for a caller to seal later.
 //! `focusforge-cli` and the GUI are its only two callers, so a stack run
 //! means exactly one thing regardless of which front end started it.
 //!
@@ -31,7 +32,9 @@ use crate::job::{
     StageCache, StageKey, read_alignment,
 };
 use crate::params::{self, ParamValue, ParamValues, Provenance, ResolvedParams, StackContext};
-use crate::project::{self, AlignRecord, AppendRequest, Metrics, SealRequest, SealedProject};
+use crate::project::{
+    self, AlignRecord, AppendRequest, HeldCheckpoint, Metrics, SealRequest, SealedProject,
+};
 use crate::tile::{NoopPreprocess, TileConsumer, TileError, TileScheduler, TileSchedulerOptions};
 use crate::timing::{Stage, StageTimer, StageTimings};
 
@@ -52,7 +55,7 @@ pub struct AlignRequest {
 /// gets opened.
 pub struct FuseRequest {
     pub frames: Vec<PathBuf>,
-    pub project_path: PathBuf,
+    pub output: FuseOutput,
     pub scratch_root: PathBuf,
     /// Names this run's staging directory
     /// (`<scratch_root>/projects/<staging_key>`); the caller picks a key
@@ -68,15 +71,29 @@ pub struct FuseRequest {
     pub backend: Option<&'static dyn TileBackend>,
     pub resume: bool,
     pub cache: bool,
-    /// Write onto the existing project as a new checkpoint instead of
-    /// sealing a fresh container. Existence at `project_path` is
-    /// deliberately not the trigger: `focusforge-cli stack` over a folder
-    /// that already holds a project keeps overwriting it rather than
-    /// silently growing a chain.
-    pub append: bool,
     /// How often the poll thread this module owns calls
     /// [`StageObserver::tick`].
     pub poll: Duration,
+}
+
+/// Where a completed run's result goes.
+pub enum FuseOutput {
+    /// Seal a fresh project at this path, replacing any file there.
+    Seal(PathBuf),
+    /// Write onto the existing project at this path as a new checkpoint.
+    /// Existence at a path is deliberately not the trigger: `focusforge-cli
+    /// stack` over a folder that already holds a project keeps overwriting
+    /// it rather than silently growing a chain.
+    Append(PathBuf),
+    /// Write no project: move the composite and Z-Map into this directory
+    /// and report them as a [`HeldCheckpoint`] a caller seals later.
+    Hold(PathBuf),
+}
+
+/// What a completed run left behind, matching its [`FuseOutput`].
+pub enum FuseProduct {
+    Sealed(SealedProject),
+    Held(HeldCheckpoint),
 }
 
 /// How [`run`] ended: either the whole job completed and sealed, or a
@@ -102,7 +119,7 @@ pub struct FuseAlignReport {
 /// Everything a completed run produced, returned as data so every front end
 /// builds its own report from one source.
 pub struct FuseReport {
-    pub sealed: SealedProject,
+    pub product: FuseProduct,
     pub frame_count: usize,
     pub frames: Vec<String>,
     pub width: u32,
@@ -133,8 +150,10 @@ pub struct FuseReport {
 }
 
 /// What one run's align stage carries the moment it starts, reported once
-/// through [`StageObserver::stage`] -- before any frame is registered, since
-/// alignment reports no unit progress of its own.
+/// through [`StageObserver::stage`] before any frame is registered. A
+/// computed alignment's own per-frame completion count follows through every
+/// [`StageObserver::tick`] afterwards, on [`JobProgress`]'s `align_done`/
+/// `align_total`.
 pub enum RunStage {
     Align { frames: usize, source: AlignSource },
     Fuse,
@@ -202,12 +221,12 @@ pub enum PipelineError {
     Io(String),
 }
 
-/// Runs one stack from `request.frames` to a sealed project at
-/// `request.project_path`: opens the stack and checks uniformity, resolves
+/// Runs one stack from `request.frames` to the result `request.output`
+/// names: opens the stack and checks uniformity, resolves
 /// both schemas, aligns (ledger peek, then `stage_cache`, then a genuine
 /// solve), crops, builds the reader and the tile scheduler, stages under
 /// `<scratch_root>/projects/<staging_key>`, opens the resume ledger, runs
-/// [`Job`] to completion over `control` and seals. `control` is built by
+/// [`Job`] to completion over `control` and seals or holds. `control` is built by
 /// the caller **before** this call, so [`JobControl::set_stage`] covers both
 /// the align and the fuse stage with one object.
 pub fn run(
@@ -342,6 +361,7 @@ pub fn run(
                     frames: stack.len(),
                     source: AlignSource::Computed,
                 });
+                let frames_done = control.begin_align(stack.len());
                 let done = AtomicBool::new(false);
                 let poll = request.poll;
                 // Span context does not cross onto the watcher thread by
@@ -376,7 +396,10 @@ pub fn run(
                         &stack,
                         &align_values,
                         policy,
-                        &AlignDriverOptions::default(),
+                        &AlignDriverOptions {
+                            frames_done: Some(frames_done),
+                            ..Default::default()
+                        },
                     );
                     done.store(true, Ordering::SeqCst);
                     watcher.join().expect("align watcher thread must not panic");
@@ -396,9 +419,9 @@ pub fn run(
                 peak_align_workers = Some(solved.peak_workers);
                 let alignment = solved.alignment;
                 if !align_req.lax && alignment.failure_count() > 0 {
-                    return Err(PipelineError::Align(format!(
-                        "alignment failed for {} frame(s)",
-                        alignment.failure_count()
+                    return Err(PipelineError::Align(describe_align_failure(
+                        &alignment,
+                        &frame_names,
                     )));
                 }
                 // A cache write failure costs a missed optimisation next
@@ -650,9 +673,9 @@ pub fn run(
                 params: params::resolved_values(align_resolved),
                 reference: alignment.reference,
             });
-    let sealed = if request.append {
-        project::append(AppendRequest {
-            project_path: &request.project_path,
+    let product = match &request.output {
+        FuseOutput::Append(project_path) => project::append(AppendRequest {
+            project_path,
             staged_composite: &staged_composite,
             staged_zmap: &staged_zmap,
             sources: &request.frames,
@@ -663,9 +686,10 @@ pub fn run(
             label: None,
             metrics,
         })
-    } else {
-        project::seal(SealRequest {
-            project_path: &request.project_path,
+        .map(FuseProduct::Sealed)
+        .map_err(PipelineError::from),
+        FuseOutput::Seal(project_path) => project::seal(SealRequest {
+            project_path,
             staged_composite: &staged_composite,
             staged_zmap: &staged_zmap,
             sources: &request.frames,
@@ -676,13 +700,34 @@ pub fn run(
             label: None,
             metrics,
         })
+        .map(FuseProduct::Sealed)
+        .map_err(PipelineError::from),
+        FuseOutput::Hold(dir) => hold(
+            dir,
+            &staged_composite,
+            &staged_zmap,
+            HeldCheckpoint {
+                composite: dir.join(COMPOSITE_FILENAME),
+                zmap: dir.join(ZMAP_FILENAME),
+                width: applied_crop.map(|r| r.width).unwrap_or(width),
+                height: applied_crop.map(|r| r.height).unwrap_or(height),
+                sources: request.frames.clone(),
+                algorithm: request.algorithm.id().to_string(),
+                params: values.clone(),
+                align: align_record,
+                composite_description,
+                metrics,
+                created_at: project::seal::now_unix(),
+            },
+        )
+        .map(FuseProduct::Held),
     };
-    let sealed = match sealed {
-        Ok(sealed) => sealed,
+    let product = match product {
+        Ok(product) => product,
         Err(err) => {
             cleanup_staging(&staging);
             let _ = ledger.discard();
-            return Err(err.into());
+            return Err(err);
         }
     };
     cleanup_staging(&staging);
@@ -708,7 +753,7 @@ pub fn run(
         );
 
     Ok(FuseOutcome::Completed(Box::new(FuseReport {
-        sealed,
+        product,
         frame_count: stack.len(),
         frames: frame_names,
         width,
@@ -737,6 +782,21 @@ pub fn run(
         wall_seconds,
         metrics,
     })))
+}
+
+/// Moves the staged planes into `dir`, where `held` already names them.
+fn hold(
+    dir: &Path,
+    staged_composite: &Path,
+    staged_zmap: &Path,
+    held: HeldCheckpoint,
+) -> Result<HeldCheckpoint, PipelineError> {
+    let io =
+        |path: &Path, err: std::io::Error| PipelineError::Io(format!("{}: {err}", path.display()));
+    std::fs::create_dir_all(dir).map_err(|err| io(dir, err))?;
+    std::fs::rename(staged_composite, &held.composite).map_err(|err| io(&held.composite, err))?;
+    std::fs::rename(staged_zmap, &held.zmap).map_err(|err| io(&held.zmap, err))?;
+    Ok(held)
 }
 
 /// Runs `job` to completion, one segment at a time: [`StageObserver::tick`]
@@ -793,6 +853,47 @@ fn run_segment(
         }
         handle.join().expect("job segment thread must not panic")
     })
+}
+
+/// Names the lowest-indexed diverged frame and its divergence reason in
+/// plain words. States the total number of diverged frames only when more
+/// than one diverged.
+fn describe_align_failure(alignment: &StackAlignment, frame_names: &[String]) -> String {
+    use crate::algorithm::AlignStatus;
+
+    let mut failed = alignment.failed();
+    let first = failed
+        .next()
+        .expect("caller checks failure_count() > 0 before building this message");
+    let AlignStatus::Diverged(reason) = first.status else {
+        unreachable!("StackAlignment::failed only yields Diverged entries")
+    };
+    let name = frame_names
+        .get(first.frame)
+        .map(String::as_str)
+        .unwrap_or("<unnamed frame>");
+    let phrase = divergence_phrase(reason);
+    match failed.count() {
+        0 => format!("{name} failed to align: {phrase}"),
+        more => format!(
+            "{name} failed to align: {phrase} ({} frames total)",
+            more + 1
+        ),
+    }
+}
+
+/// Short, user-facing wording for each way a registration can diverge.
+fn divergence_phrase(reason: crate::align::DivergenceReason) -> &'static str {
+    use crate::align::DivergenceReason;
+
+    match reason {
+        DivergenceReason::SingularHessian => "the frame has too little texture to register",
+        DivergenceReason::LemmaOneRegion => "no further step would improve the match",
+        DivergenceReason::NonInvertibleIncrement => "the computed correction could not be inverted",
+        DivergenceReason::CorrelationDecreased => "the match grew worse instead of better",
+        DivergenceReason::TooFewValidSamples => "too few pixels overlapped to measure a match",
+        DivergenceReason::NonFiniteUpdate => "the computation produced an invalid result",
+    }
 }
 
 /// An all-identity [`StackAlignment`] over `frame_count` frames -- what a

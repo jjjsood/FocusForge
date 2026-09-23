@@ -14,7 +14,7 @@ trace = ["focusforge-diagnostics/trace"]
 # lost-device response's own tests.
 gpu-tests = ["focusforge-gpu/gpu-tests"]
 # Development-only Slint UI inspection/control endpoint. The server is idle
-# unless its feature and `SLINT_MCP_PORT` are both set; see docs/guide/gui-mcp.md.
+# unless its feature and `SLINT_MCP_PORT` are both set.
 mcp = ["slint/mcp"]
 
 [dependencies]

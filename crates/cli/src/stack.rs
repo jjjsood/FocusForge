@@ -89,19 +89,13 @@ pub struct StackReport {
     /// `HostFallback` (no probe ran, the stated default was used), or
     /// `Explicit` (`--max-vram` lowered it) -- `null` on the CPU path.
     pub device_budget_provenance: Option<Provenance>,
-    /// The device budget's own high-water count of tiles admitted at once
-    /// during **this group** -- scoped per group, the same footing as every
-    /// other field on this struct: group 2 of a multi-group run reports its
-    /// own peak, never a running maximum over the groups that preceded it in
-    /// the same process. `0` for a group that admitted no tile through the
-    /// device gate (fully served from the stage cache, say); `null` only on
-    /// the CPU path, never for "zero device work this group". Distinct from
-    /// `peak_in_flight`, which is the *host* scheduler's configured limit,
-    /// not a measurement, and is reported on both paths.
+    /// The device budget's high-water count of tiles admitted at once during
+    /// this group (per group, never a running maximum). `0` when no tile
+    /// went through the device; `null` on the CPU path.
     pub device_peak_in_flight: Option<usize>,
     /// `true` only when the alignment came out of the stage cache;
     /// `false` for a computed one, a `--resume` ledger-peeked one, or a
-    /// `--no-align` run. Additive field.
+    /// `--no-align` run.
     pub align_cached: bool,
     /// Wall-clock stage breakdown -- `setup`/`align`/`fuse`/`finalize` as
     /// seconds, `warp_write` always `null` (`stack` never enters it). Every
@@ -118,14 +112,10 @@ pub struct StackReport {
     /// cannot tell a resumed run from a genuinely fast alignment -- both
     /// spend a few milliseconds inside the stage and neither is a compute
     /// -- so this field, not that one, is what a later run compares before
-    /// reading a stage number as a real cost. Additive field.
+    /// reading a stage number as a real cost.
     pub align_source: String,
     /// The anchor arm's worker bound and the peak it actually reached --
-    /// `None` unless `align_source == "computed"`. A `"cached"`, `"resumed"`
-    /// or `"skipped"` run never calls `align_stack_with`, so it has no
-    /// worker count of its own; reporting one from a previous run's cache
-    /// entry would be a fabricated number, exactly the confusion
-    /// `align_source` exists to prevent. Additive fields.
+    /// `None` unless the alignment was computed this run.
     pub align_workers: Option<usize>,
     pub peak_align_workers: Option<usize>,
 }
@@ -137,9 +127,7 @@ pub struct StackReport {
 /// not a field on `DeviceBudgetReport`, because that number does not exist
 /// until the scheduler has run.
 pub trait DevicePeak {
-    /// Restarts the high-water interval [`Self::peak_in_flight`] reads back
-    /// -- see `run_group`'s single call site for why it sits immediately
-    /// before `job::drive` rather than at the top of the function.
+    /// Restarts the high-water interval [`Self::peak_in_flight`] reads back.
     fn reset_peak(&self);
     fn peak_in_flight(&self) -> usize;
 }
@@ -153,11 +141,9 @@ pub struct DeviceBudgetReport {
 }
 
 /// `resolve_backend`'s return value: a named struct rather than a growing
-/// tuple, since a third `Option<&'static dyn ...>` element would be a
-/// plausible `clippy::type_complexity` trip (warn-by-default, and the gate
-/// runs `clippy … -D warnings`). `backend` and `device_peak` coerce from the
-/// *same* `&'static GpuBackend` binding on the GPU path, so nothing re-enters
-/// the `GPU_BACKEND` `OnceLock` and no second probe or ceiling is observed.
+/// tuple of `Option`s. `backend` and `device_peak` coerce from the *same*
+/// `&'static GpuBackend` binding on the GPU path, so nothing re-enters the
+/// `GPU_BACKEND` `OnceLock` and no second probe or ceiling is observed.
 pub struct BackendChoice {
     pub backend: Option<&'static dyn TileBackend>,
     pub device_budget: Option<DeviceBudgetReport>,
@@ -282,9 +268,9 @@ pub fn run(
         Err(msg) => return refuse(msg),
     };
 
-    // Step 1a: the preset, ahead of everything else -- a malformed file is
-    // refused before a frame is opened, and its `algo` key is what step 2
-    // falls back to.
+    // The preset, ahead of everything else -- a malformed file is
+    // refused before a frame is opened, and its `algo` key is what
+    // algorithm resolution below falls back to.
     let file = match preset::load(preset_opts.preset) {
         Ok(preset) => preset,
         Err(msg) => return refuse(msg),
@@ -293,7 +279,7 @@ pub fn run(
         return refuse("--dry-run and --resume are incompatible: a dry run writes nothing, so there is nothing to resume into".to_string());
     }
 
-    // Step 2: resolve the algorithm first, before anything else -- an
+    // Resolve the algorithm first, before anything else -- an
     // unknown or missing id is refused before the input directory (which
     // may not even exist) is ever touched. `--algo` beats the preset's own
     // `algo` key: one rule, flag beats file.
@@ -325,7 +311,7 @@ pub fn run(
     let device_budget_report = choice.device_budget;
     let device_peak = choice.device_peak;
 
-    // Step 3: parse `--set` against that schema and overlay it on the
+    // Parse `--set` against that schema and overlay it on the
     // preset's `[stack]` table. An unknown key or an out-of-range value is
     // refused here -- from either source, with the same `ParamViolation`
     // rendering -- with the input directory still unread.
@@ -355,7 +341,7 @@ pub fn run(
         return refuse(msg);
     }
 
-    // Step 3b: the grouping, before any work starts. `propose` reads
+    // The grouping, before any work starts. `propose` reads
     // directory entries and header tags only -- no tile, no pixel -- and
     // `--groups` replaces its verdict wholesale.
     let walked = match propose(dir) {
@@ -389,7 +375,7 @@ pub fn run(
         return refuse(msg);
     }
 
-    // Step 9: `--only` subset selection. Identities are computed against
+    // `--only` subset selection. Identities are computed against
     // the **full** proposal, before any filtering -- a subset selection
     // must never change what a group is called, or a re-run could not be
     // matched back to the original record.
@@ -545,9 +531,8 @@ struct RunSetup<'a> {
 }
 
 /// What one group's run ended as. The outer driver owns every print of a
-/// document, so a single-group run emits exactly today's `StackReport` and
-/// a multi-group run emits one wrapping document instead of N concatenated
-/// ones.
+/// document, so a single-group run emits a `StackReport` and a multi-group
+/// run emits one wrapping document instead of N concatenated ones.
 enum GroupResult {
     Completed(Box<StackReport>),
     DryRun(Box<DryRunPlan>),
@@ -600,7 +585,7 @@ fn project_path(out_dir: Option<&Path>, group: &Group) -> PathBuf {
 /// "unexpected argument '--zmap'".
 fn zmap_flag_refusal(zmap: &Path) -> String {
     format!(
-        "a project carries its own Z-Map, so `--zmap {}` is gone from `stack`. \
+        "`stack` does not take `--zmap {}`: a project carries its own Z-Map. \
          Run `focusforge-cli export <project> --zmap {}` after the run.",
         zmap.display(),
         zmap.display()
@@ -769,11 +754,8 @@ pub(crate) fn manifest_path(out_dir: Option<&Path>, root: &Path) -> PathBuf {
     }
 }
 
-/// Prints whatever the run produced: for **one** group exactly today's
-/// document, for many a single wrapping one. `stack --json`'s standing
-/// contract is that *a* document on stdout means a completed run, so N
-/// concatenated documents is not an option, and hollowing out the frozen
-/// `StackReport` is not either (`DryRunPlan` is the precedent).
+/// Prints whatever the run produced: one group, a `StackReport`; several,
+/// one wrapping document (a document on stdout means a completed run).
 fn report_results(results: &[GroupResult], json: bool) {
     if results.len() == 1 {
         match &results[0] {
@@ -840,11 +822,10 @@ fn print_document<T: Serialize>(value: &T, json: bool, human: fn(&T) -> String) 
 /// One group's stack, from the checks before the run to the composite. The
 /// frames arrive as a slice instead of being enumerated here.
 ///
-/// Everything downstream already took a path slice
-/// (`TiffStack::open_files`), so a one-group proposal hands this function
-/// precisely `frame_paths(dir)`'s own vector, in its own order, which is
-/// what makes the single-stack equivalence true by construction rather than
-/// by a special case.
+/// Everything downstream already takes a path slice (`TiffStack::open_files`),
+/// so a one-group proposal hands this function precisely `frame_paths(dir)`'s
+/// own vector, in its own order, which is what makes the single-stack
+/// equivalence true by construction rather than by a special case.
 ///
 /// The per-group state lives here on purpose: one `StatusSink` (whose `Drop`
 /// assertion is per instance, so one record per group), one
@@ -894,12 +875,12 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     let status = StatusSink::new(preset_opts.status, identity, "stack");
     status.set_algorithm(algo.id());
 
-    // Step 4 (`--output`'s parent) is the outer driver's now: it is
-    // group-independent, and it must fire before the input directory is
-    // read at all, which grouping does.
+    // `--output`'s parent is the outer driver's: it is group-independent,
+    // and it must fire before the input directory is read at all, which
+    // grouping does.
     //
-    // Step 5: this group's frames, already enumerated by the proposal, and
-    // the strict uniformity guard. Opened here too (not only inside the
+    // This group's frames, already enumerated by the proposal, and the
+    // strict uniformity guard, are opened here too (not only inside the
     // driver) because `--write-preset` and `--dry-run` must report without
     // ever entering `focusforge_core::pipeline::run`.
     let paths = group.frames.clone();
@@ -929,7 +910,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         );
     }
 
-    // Step 6: refuse an output that is also an input frame.
+    // Refuse an output that is also an input frame.
     if let Some(name) = colliding_frame(output, &paths, &frame_names) {
         return failed(
             &status,
@@ -1091,7 +1072,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // The key is the group name plus a short digest of the project path it
     // will seal into. It must be stable across runs or `--resume` cannot
     // find its ledger (`ResumeStore::find` skips a candidate whose
-    // `composite_output` no longer exists) -- the same invocation always
+    // `composite_output` does not exist) -- the same invocation always
     // produces the same key. The digest is what keeps two *different* runs
     // that happen to propose the same group name apart: with the name
     // alone, two runs collecting into two different `-o` directories would
@@ -1105,7 +1086,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     );
     let request = focusforge_core::pipeline::FuseRequest {
         frames: paths.clone(),
-        project_path: output.to_path_buf(),
+        output: focusforge_core::pipeline::FuseOutput::Seal(output.to_path_buf()),
         scratch_root: PathBuf::from(".scratch"),
         staging_key,
         algorithm: algo,
@@ -1117,7 +1098,6 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         backend,
         resume: job_opts.resume,
         cache: job_opts.cache,
-        append: false,
         poll: job::POLL,
     };
 
@@ -1171,7 +1151,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             cancelled(&status, start)
         }
         Ok(focusforge_core::pipeline::FuseOutcome::Completed(report)) => {
-            let outputs = vec![report.sealed.path.display().to_string()];
+            let outputs = vec![sealed_path(&report)];
             status.completed(&outputs);
             let stack_report = build_stack_report(
                 dir,
@@ -1188,12 +1168,11 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     }
 }
 
-/// Translates [`focusforge_core::pipeline::StageObserver`] into this crate's
-/// existing terminal rendering and signal handling: `stage`/`tick` render
-/// through the shared, mutex-guarded [`ProgressRenderer`] (called from the
-/// driver's own poll thread, hence `Sync`); `tick` also folds a pending
-/// SIGINT/SIGUSR1 into the control it holds; `paused` blocks exactly the way
-/// the old `wait_for_resume_or_cancel` did.
+/// Translates [`focusforge_core::pipeline::StageObserver`] into terminal
+/// rendering and signal handling: `stage`/`tick` render through the shared
+/// [`ProgressRenderer`] (called from the driver's poll thread, hence `Sync`);
+/// `tick` folds a pending SIGINT/SIGUSR1 into the control; `paused` blocks
+/// until a resume or a cancel.
 struct CliObserver<'a> {
     renderer: Mutex<ProgressRenderer>,
     signals: &'a signals::Signals,
@@ -1223,7 +1202,7 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
             RunStage::Align {
                 frames,
                 source: AlignSource::Computed,
-            } => renderer.stage(&format!("align {frames} frames (no unit progress)")),
+            } => renderer.stage(&format!("align {frames} frames")),
             // A fuse-stage entry line, unconditional and immediate (`eta
             // --`, since no unit has finished yet): it gives a script or a
             // human watching a redirected log a fact the instant the job
@@ -1249,10 +1228,10 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
                 _ => self.control.pause(),
             }
         }
-        // Alignment reports no unit progress of its own (`stage`'s own
-        // "no unit progress" line already says so) -- a tick during it must
-        // not render a fuse-shaped line with a stale or zeroed total.
-        if progress.stage == focusforge_core::job::JobStage::Fuse {
+        // A tick outside the fuse stage and a cached or absent alignment
+        // (`align_total == 0`) carries a stale or zeroed total and must not
+        // render.
+        if progress.stage == focusforge_core::job::JobStage::Fuse || progress.align_total > 0 {
             self.renderer
                 .lock()
                 .expect("no thread panicked while rendering")
@@ -1284,6 +1263,16 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
     }
 }
 
+/// The project a CLI run sealed, displayed.
+fn sealed_path(report: &focusforge_core::pipeline::FuseReport) -> String {
+    match &report.product {
+        focusforge_core::pipeline::FuseProduct::Sealed(sealed) => sealed.path.display().to_string(),
+        focusforge_core::pipeline::FuseProduct::Held(_) => {
+            unreachable!("a seal request always reports a sealed project")
+        }
+    }
+}
+
 /// Assembles the frozen [`StackReport`] from the driver's
 /// [`focusforge_core::pipeline::FuseReport`] plus the facts only this crate
 /// knows: the input directory as the user wrote it, and the GPU-only device
@@ -1297,6 +1286,7 @@ fn build_stack_report(
     align_opts: &AlignOptions<'_>,
     report: focusforge_core::pipeline::FuseReport,
 ) -> StackReport {
+    let outputs = vec![sealed_path(&report)];
     let align = report.align.map(|a| {
         let failure_count = a.alignment.failure_count();
         let reference = a.alignment.reference;
@@ -1355,7 +1345,7 @@ fn build_stack_report(
         max_bytes_in_flight: report.max_bytes_in_flight,
         budget_provenance: report.budget_provenance,
         backed_off: report.backed_off,
-        outputs: vec![report.sealed.path.display().to_string()],
+        outputs,
         wall_seconds: report.wall_seconds,
         output_width: report.output_width,
         output_height: report.output_height,
@@ -1401,7 +1391,7 @@ fn check_output_dir(output: Option<&Path>) -> Result<(), String> {
     );
     if looks_like_an_image {
         message.push_str(
-            " A stacking run no longer writes an image: run \
+            " A stacking run writes projects, not images: run \
              `focusforge-cli export <project> -o <file>` afterwards.",
         );
     }
@@ -1479,12 +1469,8 @@ fn render(report: &StackReport) -> String {
     lines.join("\n")
 }
 
-/// One `stages:` fact -- `"{name}={value:.3}s"` for a stage that was
-/// entered, `"{name}=not-entered"` for one that was not. Never
-/// `"{name}=0.000s"` for a never-entered stage: that would read as work
-/// that happened instantly rather than work that never ran. Shared by
-/// [`render`] (`stack --json`'s human twin) and
-/// [`crate::align::render`] (`align --json`'s).
+/// One `stages:` fact: `"{name}={value:.3}s"` for an entered stage,
+/// `"{name}=not-entered"` otherwise (never `0.000s`, which reads as instant).
 pub(crate) fn stage_fact(name: &str, value: Option<f64>) -> String {
     match value {
         Some(seconds) => format!("{name}={seconds:.3}s"),
@@ -1564,12 +1550,8 @@ mod tests {
             width: 512,
             height: 512,
             samples_per_pixel: 3,
-            // A fictional id on purpose. This module is `crates/cli/src`,
-            // and the criterion that no algorithm id appears here is
-            // enforced by a literal `git grep` -- a gate with a
-            // documented exception for test data is not a gate. `render`
-            // formats whatever string it is handed, so a real id would
-            // buy the test nothing.
+            // A fictional id on purpose: no algorithm id appears anywhere in
+            // `crates/cli/src`, test data included.
             algorithm: "example-stack".to_string(),
             display_name: "Example Stacker".to_string(),
             params: vec![ParamReport {
@@ -1702,7 +1684,7 @@ mod tests {
         assert!(message.contains("export"), "{message}");
         assert!(message.contains("out.tif"), "{message}");
         // A non-image path that is not a directory is still refused, just
-        // without the migration sentence.
+        // without the export hint.
         let plain = check_output_dir(Some(Path::new("/definitely/not/here"))).unwrap_err();
         assert!(!plain.contains("export"), "{plain}");
         assert!(check_output_dir(None).is_ok(), "omitting -o is legal");

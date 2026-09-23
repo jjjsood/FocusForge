@@ -5,6 +5,7 @@
 //! is the unit in, and the unit out.
 
 use std::fs::File;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -131,6 +132,22 @@ impl TiffStack {
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), TiffError> {
+        self.read_tile_step_into(frame, rect, NonZeroU32::MIN, out)
+    }
+
+    /// Read every `step`-th row and column of `rect` from `frame` — rect rows
+    /// and columns `0, step, 2*step, …` — into `out`, nearest-neighbour:
+    /// every sample written is one the frame holds, none is averaged.
+    /// `out.len()` must equal exactly
+    /// `rect.width.div_ceil(step) * rect.height.div_ceil(step) * samples_per_pixel`;
+    /// `rect` itself is bounds-checked whole, as [`Self::read_tile_into`] does.
+    pub fn read_tile_step_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [u16],
+    ) -> Result<(), TiffError> {
         let header = &self.headers[frame];
         let path = &header.path;
 
@@ -153,7 +170,9 @@ impl TiffStack {
         }
 
         let spp = header.samples_per_pixel as usize;
-        let expected_len = rect.width as usize * rect.height as usize * spp;
+        let step = step.get();
+        let out_row_len = rect.width.div_ceil(step) as usize * spp;
+        let expected_len = out_row_len * rect.height.div_ceil(step) as usize;
         if out.len() != expected_len {
             return Err(TiffError::BufferSize {
                 expected: expected_len,
@@ -169,7 +188,7 @@ impl TiffStack {
         let rps = u64::from(header.rows_per_strip.max(1));
 
         let mut out_off = 0usize;
-        for r in rect.y..(rect.y + rect.height) {
+        for r in (rect.y..(rect.y + rect.height)).step_by(step as usize) {
             let r = u64::from(r);
             let strip = (r / rps) as usize;
             let row_in_strip = r % rps;
@@ -213,18 +232,35 @@ impl TiffStack {
                 return Err(past_eof(path));
             }
             let row_slice = &map[start as usize..end as usize];
+            let out_row = &mut out[out_off..out_off + out_row_len];
 
-            for (i, chunk) in row_slice.chunks_exact(2).enumerate() {
-                let sample = match header.byte_order {
-                    ByteOrder::Little => u16::from_le_bytes([chunk[0], chunk[1]]),
-                    ByteOrder::Big => u16::from_be_bytes([chunk[0], chunk[1]]),
-                };
-                out[out_off + i] = sample;
+            if step == 1 {
+                // The CPU pipeline's hot path: one flat per-sample loop.
+                for (i, chunk) in row_slice.chunks_exact(2).enumerate() {
+                    out_row[i] = decode_sample(header.byte_order, chunk);
+                }
+            } else {
+                let pixels = row_slice
+                    .chunks_exact(stride as usize)
+                    .step_by(step as usize);
+                for (dst, pixel) in out_row.chunks_exact_mut(spp).zip(pixels) {
+                    for (d, chunk) in dst.iter_mut().zip(pixel.chunks_exact(2)) {
+                        *d = decode_sample(header.byte_order, chunk);
+                    }
+                }
             }
-            out_off += rect.width as usize * spp;
+            out_off += out_row_len;
         }
 
         Ok(())
+    }
+}
+
+#[inline(always)]
+fn decode_sample(order: ByteOrder, chunk: &[u8]) -> u16 {
+    match order {
+        ByteOrder::Little => u16::from_le_bytes([chunk[0], chunk[1]]),
+        ByteOrder::Big => u16::from_be_bytes([chunk[0], chunk[1]]),
     }
 }
 

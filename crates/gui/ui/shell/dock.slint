@@ -24,6 +24,9 @@ export component FFDock inherits Rectangle {
     // has nothing to show, and draws the line `No project open.` in its
     // place instead.
     in property <bool> project-loaded: false;
+    // The checkpoints panel's own line -- the active tab's checkpoint count,
+    // or the empty-state wording. Set from Rust in `src/bridge.rs`.
+    in property <string> checkpoint-line: "None yet — fuse a stack";
 
     // The settings panel: generated entirely from the row list Rust hands
     // it, forwarded one line into `FFSettingsPanel`.
@@ -57,6 +60,7 @@ export component FFDock inherits Rectangle {
     callback images-add-frames-requested();
     callback images-sort-menu-toggled();
     callback images-sort-selected(string);
+    callback images-frame-selected(int);
     callback images-frame-excluded-toggled(int);
     callback images-frame-remove-requested(int);
     callback images-frame-grip-pointer(int, int, length);
@@ -81,6 +85,7 @@ export component FFDock inherits Rectangle {
         }
 
         checkpoint-panel := FFCheckpointPanel {
+            line: root.checkpoint-line;
             checkpoint-export-requested => { root.checkpoint-export-requested(); }
         }
 
@@ -137,6 +142,7 @@ export component FFDock inherits Rectangle {
         add-frames-requested => { root.images-add-frames-requested(); }
         sort-menu-toggled => { root.images-sort-menu-toggled(); }
         sort-selected(picked) => { root.images-sort-selected(picked); }
+        frame-selected(i) => { root.images-frame-selected(i); }
         frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
         frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
         frame-grip-pointer(i, kind, y) => { root.images-frame-grip-pointer(i, kind, y); }

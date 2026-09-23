@@ -208,7 +208,7 @@ fn entry_names(path: &Path) -> Vec<String> {
 }
 
 /// Copies `src` to `dst`, dropping one named entry entirely -- what produces
-/// a manifest that names a blob the archive no longer holds.
+/// a manifest that names a blob the archive does not hold.
 fn remove_entry(src: &Path, dst: &Path, entry: &str) {
     let mut archive = zip::ZipArchive::new(std::fs::File::open(src).unwrap()).unwrap();
     let names: Vec<String> = (0..archive.len())
@@ -405,4 +405,109 @@ fn an_append_is_reproducible() {
         std::fs::read(&copy_b).unwrap(),
         "two appends of the same inputs at the same instant are not byte-identical"
     );
+}
+
+// ---------------------------------------------------------------------
+// `seal_held`: a chain of checkpoints kept outside any container, written
+// as one atomic replace of the target.
+// ---------------------------------------------------------------------
+
+fn held_checkpoint(
+    dir: &Path,
+    sources: &[PathBuf],
+    variant: u16,
+    created_at: i64,
+) -> project::HeldCheckpoint {
+    let staging = dir.join(format!("held-{variant}"));
+    std::fs::create_dir_all(&staging).unwrap();
+    let (composite, zmap) = stage_planes(&staging, variant, variant);
+    project::HeldCheckpoint {
+        composite,
+        zmap,
+        width: W,
+        height: H,
+        sources: sources.to_vec(),
+        algorithm: "laplacian".to_string(),
+        params: params(),
+        align: None,
+        composite_description: "staged composite".to_string(),
+        metrics: Metrics::default(),
+        created_at,
+    }
+}
+
+/// Every file in `dir` whose name marks an unfinished write.
+fn leftover_temporaries(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".saving") || name.contains(".partial"))
+        .collect()
+}
+
+#[test]
+fn seal_held_keeps_each_checkpoints_created_at() {
+    let dir = tmp_dir("seal_held_created_at");
+    let sources = write_sources(&dir, 3);
+    let held = [
+        held_checkpoint(&dir, &sources, 1, 1_000),
+        held_checkpoint(&dir, &sources, 2, 2_000),
+    ];
+    let target = dir.join(format!("demo.{}", project::PROJECT_EXTENSION));
+    let sealed = project::seal_held(&target, &held, false).expect("seal_held must succeed");
+    assert_eq!(sealed.path, target);
+
+    let chain = Project::open(&target).unwrap().checkpoint_chain().unwrap();
+    let created: Vec<i64> = chain.iter().rev().map(|c| c.created_at).collect();
+    assert_eq!(created, [1_000, 2_000], "oldest first, each its own time");
+    assert!(leftover_temporaries(&dir).is_empty());
+}
+
+#[test]
+fn seal_held_onto_an_existing_project_extends_its_chain() {
+    let (dir, project_path, sources) = sealed("seal_held_onto_existing");
+    let root_id = Project::open(&project_path)
+        .unwrap()
+        .checkpoint()
+        .id
+        .clone();
+
+    let held = [held_checkpoint(&dir, &sources, 1, 3_000)];
+    project::seal_held(&project_path, &held, true).expect("seal_held must succeed");
+
+    let chain = Project::open(&project_path)
+        .unwrap()
+        .checkpoint_chain()
+        .unwrap();
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[0].created_at, 3_000);
+    assert_eq!(chain[0].parent.as_deref(), Some(root_id.as_str()));
+    assert!(leftover_temporaries(&dir).is_empty());
+}
+
+#[test]
+fn seal_held_failing_midway_leaves_the_target_untouched() {
+    let (dir, project_path, sources) = sealed("seal_held_fails");
+    let before = std::fs::read(&project_path).unwrap();
+
+    let first = held_checkpoint(&dir, &sources, 1, 3_000);
+    let second = held_checkpoint(&dir, &sources, 2, 4_000);
+    std::fs::remove_file(&second.composite).unwrap();
+
+    assert!(project::seal_held(&project_path, &[first, second], true).is_err());
+    assert_eq!(
+        std::fs::read(&project_path).unwrap(),
+        before,
+        "a failed save leaves the target byte-identical"
+    );
+    assert!(leftover_temporaries(&dir).is_empty());
+}
+
+#[test]
+fn seal_held_refuses_an_empty_chain() {
+    let dir = tmp_dir("seal_held_empty");
+    let target = dir.join(format!("demo.{}", project::PROJECT_EXTENSION));
+    assert!(project::seal_held(&target, &[], false).is_err());
+    assert!(!target.exists());
 }

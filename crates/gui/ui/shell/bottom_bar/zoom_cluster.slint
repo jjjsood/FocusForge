@@ -4,45 +4,12 @@
 // governing both panes, so it lives here rather than in either pane.
 
 import { Theme } from "../../theme.slint";
+import { FFIconButton } from "../../components/ff_icon_button.slint";
 
-component FFZoomIconButton inherits Rectangle {
-    in property <image> icon;
-    // Greyed and inert while no project is open -- there is no viewport to
-    // zoom, so a live-looking button next to a blank readout is misleading.
-    in property <bool> enabled: true;
-    callback pressed();
-
-    // Token-derived, not a bare literal: the icon plus a full `space-2` step
-    // of padding on every side. The previous 26px -- a 5px pad that matched
-    // no token -- read as too tight a frame around the glyph.
-    width: Theme.icon-md + 2 * Theme.space-2;
-    height: self.width;
-    // Transparent at rest -- the shared `zoom-group` background (below) is
-    // what reads as one element; only the hover highlight belongs to the
-    // button itself. Separate boxed buttons either side of a floating
-    // readout did not read as one control.
-    background: area.has-hover && root.enabled ? Theme.surface-hover : transparent;
-    border-radius: Theme.radius-sm;
-    opacity: root.enabled ? 1.0 : 0.5;
-    accessible-role: button;
-    accessible-enabled: root.enabled;
-
-    area := TouchArea {
-        enabled: root.enabled;
-        clicked => { root.pressed(); }
-    }
-    Image {
-        source: root.icon;
-        colorize: area.has-hover && root.enabled ? Theme.text-primary : Theme.text-secondary;
-        width: Theme.icon-md;
-        height: Theme.icon-md;
-    }
-}
-
-// The zoom button box is `Theme.icon-md + 2 * Theme.space-2` = 32px square
-// (see `FFZoomIconButton`), so the cluster's own height follows it rather
-// than a pinned 26px, and everything else in the cluster matches that
-// height for one shared baseline. At the bar's right end, mirroring the
+// The zoom button box is 32px square (`Theme.icon-md` plus a full
+// `Theme.space-2` pad on every side), so the cluster's own height follows
+// that token rather than a pinned value, and everything else in the cluster
+// matches it for one shared baseline. At the bar's right end, mirroring the
 // gear's `Theme.space-3` inset at the left: `zoom-group 120 (32+56+32, one
 // shared surface) | 16 | Fit 80` -- 120+16+80 = 216. Zoom-out, the readout
 // and zoom-in share one rounded surface -- the same track-plus-segments
@@ -66,8 +33,8 @@ export component FFZoomCluster inherits Rectangle {
     // and zoom-in, with no gap between them -- this is what makes the three
     // read as one element. Anonymous (not its own `component`), so
     // `zoom-out`/`zoom-in` keep the qualified ids `FFZoomCluster::zoom-out`
-    // / `zoom-in` scoped tests already rely on. Its height follows the icon
-    // buttons' own token-derived height, never a repeated literal.
+    // / `zoom-in`. Its height follows the icon buttons' own token-derived
+    // height, never a repeated literal.
     zoom-group := Rectangle {
         x: 0px;
         y: 0px;
@@ -76,12 +43,12 @@ export component FFZoomCluster inherits Rectangle {
         background: Theme.surface-overlay;
         border-radius: Theme.radius-sm;
 
-        zoom-out := FFZoomIconButton {
+        zoom-out := FFIconButton {
             x: 0px;
             y: 0px;
             enabled: root.project-loaded;
             icon: @image-url("../../../../../assets/icons/zoom-out.svg");
-            pressed => { root.zoom-out-requested(); }
+            triggered => { root.zoom-out-requested(); }
         }
 
         zoom-readout := Text {
@@ -89,9 +56,7 @@ export component FFZoomCluster inherits Rectangle {
             y: 0px;
             width: 56px;
             height: zoom-group.height;
-            // Dimmed the same way the zoom buttons are: the dash had no
-            // opacity of its own, so it would otherwise sit full-strength
-            // while its two neighbours were greyed.
+            // Dimmed the same way the zoom buttons are.
             opacity: root.project-loaded ? 1.0 : 0.5;
             // A project-less window has nothing to report a percentage
             // for -- an em dash rather than a blank space, matching the
@@ -105,12 +70,12 @@ export component FFZoomCluster inherits Rectangle {
             vertical-alignment: center;
         }
 
-        zoom-in := FFZoomIconButton {
+        zoom-in := FFIconButton {
             x: zoom-readout.x + zoom-readout.width;
             y: 0px;
             enabled: root.project-loaded;
             icon: @image-url("../../../../../assets/icons/zoom-in.svg");
-            pressed => { root.zoom-in-requested(); }
+            triggered => { root.zoom-in-requested(); }
         }
     }
 

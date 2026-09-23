@@ -16,6 +16,7 @@ use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::input_config::Provenance;
 use focusforge_gui::input_map::{Action, Binding, InputTable, Modifiers, Trigger};
 use focusforge_gui::overlay::CardView;
+use focusforge_gui::recent::RecentEntry;
 use focusforge_gui::{AppController, ChromeKey, OpenOutcome};
 
 // ---------------------------------------------------------------------
@@ -46,7 +47,7 @@ fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
 
 /// A fresh directory of `count` copied fixture frames, opened as one
 /// unsaved project on `controller`. Returns the frames' own directory --
-/// also where a fuse from this tab seals its `.ffp`, beside the frames.
+/// also where a save of this tab proposes its `.ffp`, beside the frames.
 fn open_frames(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
     let root = tree(&format!("{name}_frames"));
     for i in 0..count {
@@ -305,6 +306,75 @@ fn running_project_shows_progress_on_its_card() {
     wait_for_settle(&mut controller, Duration::from_secs(120));
 }
 
+fn align_progress(align_done: usize, align_total: usize) -> focusforge_core::job::JobProgress {
+    use focusforge_core::job::JobStage;
+    focusforge_core::job::JobProgress {
+        stage: JobStage::Align,
+        units_done: 0,
+        unit_total: 0,
+        pixels_done: 0,
+        pixel_total: 0,
+        running: Duration::ZERO,
+        eta: None,
+        align_done,
+        align_total,
+    }
+}
+
+fn fuse_progress(units_done: usize, unit_total: usize) -> focusforge_core::job::JobProgress {
+    use focusforge_core::job::JobStage;
+    focusforge_core::job::JobProgress {
+        stage: JobStage::Fuse,
+        units_done,
+        unit_total,
+        pixels_done: 0,
+        pixel_total: 0,
+        running: Duration::ZERO,
+        eta: None,
+        align_done: 0,
+        align_total: 0,
+    }
+}
+
+#[test]
+fn live_card_meta_names_the_phase() {
+    use focusforge_gui::job::{self, RunState};
+
+    assert_eq!(
+        job::phase_line(&RunState::Running, Some(&align_progress(3, 8))).as_deref(),
+        Some("aligning, 3 of 8")
+    );
+    assert_eq!(
+        job::phase_line(&RunState::Running, Some(&align_progress(0, 0))).as_deref(),
+        Some("aligning")
+    );
+    assert_eq!(
+        job::phase_line(&RunState::Running, Some(&fuse_progress(4, 10))).as_deref(),
+        Some("fusing")
+    );
+    assert_eq!(
+        job::phase_line(&RunState::Running, Some(&fuse_progress(10, 10))).as_deref(),
+        Some("writing")
+    );
+
+    let mut controller = controller_with_frames("live_card_meta", 2);
+    assert!(controller.start_fuse());
+    let cards = controller.project_cards();
+    let card = card_by_kind(&cards, "open");
+    assert!(
+        card.meta_text.starts_with("2 frames · "),
+        "meta text must open with the frame count: {}",
+        card.meta_text
+    );
+    assert!(
+        !card.meta_text.contains("step"),
+        "meta text must never contain 'step': {}",
+        card.meta_text
+    );
+
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+}
+
 #[test]
 fn clicking_a_card_switches_to_it() {
     let mut controller = controller_with_frames("click_switch", 2);
@@ -376,6 +446,7 @@ fn thumbnail_is_downsampled_once_and_cached() {
         .expect("a fused project must carry a picture");
     controller.toggle_projects_overlay();
 
+    assert!(controller.save_active_project(|proposed| Some(proposed.to_path_buf())));
     let project_file = find_project_file(&project_dir);
     std::fs::remove_file(&project_file).expect("the sealed project must be removable");
 
@@ -413,6 +484,7 @@ fn overlay_writes_nothing_to_the_project() {
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
 
+    assert!(controller.save_active_project(|proposed| Some(proposed.to_path_buf())));
     let project_file = find_project_file(&project_dir);
     let before_bytes = std::fs::read(&project_file).unwrap();
     let before_mtime = std::fs::metadata(&project_file)
@@ -569,7 +641,9 @@ fn no_control_acts_on_several_cards() {
         .unwrap_or(after.len());
     let section = common::strip_line_comments(&after[..end]);
 
-    let forbidden = ["Vec<usize>", "[usize]", "indices", "selected", "multi"];
+    // "selected" is deliberately not in this list: a single tab's own
+    // one-frame `selected` field is a scalar, not a batch of cards.
+    let forbidden = ["Vec<usize>", "[usize]", "indices", "multi"];
     let mut found = Vec::new();
     for needle in forbidden {
         if section.contains(needle) {
@@ -668,6 +742,25 @@ fn a_rebind_cannot_shadow_a_chrome_key() {
     }
     controller.install_input_table(table, Provenance::Defaults);
 
+    // The overlay closed: the rebind still cannot shadow the chords.
+    assert!(!controller.projects_overlay_open());
+    assert_eq!(controller.chrome_key("n", ctrl), ChromeKey::NewProject);
+    assert_eq!(controller.chrome_key("o", ctrl), ChromeKey::OpenProject);
+    assert_eq!(controller.chrome_key("s", ctrl), ChromeKey::Consumed);
+    let tabs_before = controller.project_tabs().len();
+    assert_eq!(controller.chrome_key("w", ctrl), ChromeKey::Consumed);
+    assert_eq!(
+        controller.project_tabs().len(),
+        tabs_before - 1,
+        "Ctrl+W closes a tab with the overlay closed too"
+    );
+
+    // A fresh tab for the overlay-open half of the test. Past
+    // `AppController::CLOSE_DEBOUNCE`, so this close is not the first one's
+    // double-click guard swallowing it.
+    open_frames(&mut controller, "rebind_shadow_reopen", 2);
+    std::thread::sleep(Duration::from_millis(350));
+
     controller.toggle_projects_overlay();
     assert_eq!(controller.chrome_key("n", ctrl), ChromeKey::NewProject);
     assert_eq!(controller.chrome_key("o", ctrl), ChromeKey::OpenProject);
@@ -680,6 +773,56 @@ fn a_rebind_cannot_shadow_a_chrome_key() {
         ChromeKey::Consumed
     );
     assert!(!controller.projects_overlay_open());
+}
+
+#[test]
+fn chrome_keys_work_with_the_overlay_closed() {
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+    let mut controller = controller_with_frames("closed_chords", 2);
+    assert!(!controller.projects_overlay_open());
+
+    assert_eq!(controller.chrome_key("n", ctrl), ChromeKey::NewProject);
+    assert_eq!(controller.chrome_key("N", ctrl), ChromeKey::NewProject);
+    assert_eq!(controller.chrome_key("o", ctrl), ChromeKey::OpenProject);
+    assert_eq!(controller.chrome_key("O", ctrl), ChromeKey::OpenProject);
+    assert_eq!(
+        controller.chrome_key("s", ctrl),
+        ChromeKey::Consumed,
+        "nothing fused yet"
+    );
+
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert_eq!(controller.chrome_key("s", ctrl), ChromeKey::SaveProject);
+    assert_eq!(controller.chrome_key("S", ctrl), ChromeKey::SaveProject);
+    assert!(controller.save_active_project(|proposed| Some(proposed.to_path_buf())));
+    assert!(!controller.save_enabled(), "the save leaves nothing held");
+
+    // Boundaries: `Esc`, a bare letter, `Ctrl+W` with zero tabs.
+    assert_eq!(
+        controller.chrome_key("\u{1b}", Modifiers::NONE),
+        ChromeKey::None
+    );
+    assert!(!controller.projects_overlay_open());
+    assert_eq!(controller.chrome_key("n", Modifiers::NONE), ChromeKey::None);
+
+    let tabs_before = controller.project_tabs().len();
+    assert_eq!(controller.chrome_key("w", ctrl), ChromeKey::Consumed);
+    assert_eq!(
+        controller.project_tabs().len(),
+        tabs_before - 1,
+        "Ctrl+W closes a tab with nothing to lose"
+    );
+    assert!(controller.pending_close().is_none());
+
+    assert_eq!(
+        controller.chrome_key("w", ctrl),
+        ChromeKey::Consumed,
+        "Ctrl+W with no project tab open must not panic"
+    );
 }
 
 #[test]
@@ -718,6 +861,227 @@ fn recent_list_persists_and_caps_at_five() {
     let mut after_corrupt = AppController::new();
     after_corrupt.install_recent(recent::load(&corrupt_dir), corrupt_dir);
     assert!(after_corrupt.recent_rows(0).is_empty());
+}
+
+// ---------------------------------------------------------------------
+// A click on a `Recent` row opens what that row names.
+// ---------------------------------------------------------------------
+
+#[test]
+fn recent_row_opens_its_target() {
+    let project_path = seal_as_given_project("recent_open_target");
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("recent_open_target_scratch"));
+    controller.install_recent(
+        vec![RecentEntry {
+            name: "demo".to_string(),
+            folder: project_path.parent().unwrap().to_path_buf(),
+            path: Some(project_path.clone()),
+            opened_at: 0,
+        }],
+        tree("recent_open_target_config"),
+    );
+    controller.toggle_projects_overlay();
+    assert!(controller.projects_overlay_open());
+
+    let handle = controller
+        .open_recent(0)
+        .expect("a target with no open tab must start a load, same as `Open project…`");
+    handle.join().expect("the load worker did not panic");
+    let outcome = controller.settle_open();
+    assert!(
+        matches!(outcome, Some(OpenOutcome::Opened(_))),
+        "the same outcome `Open project…` gives for this target"
+    );
+
+    assert_eq!(
+        controller.project_tabs().len(),
+        1,
+        "the opened project is added as a tab"
+    );
+    assert_eq!(
+        controller.active_project(),
+        Some(0),
+        "the first opened project is selected"
+    );
+    assert!(
+        !controller.projects_overlay_open(),
+        "a successful open closes the overlay"
+    );
+}
+
+#[test]
+fn recent_row_switches_to_an_open_tab() {
+    let (mut controller, first_dir) = controller_with_frames_and_dir("recent_switch", 2);
+    open_frames(&mut controller, "recent_switch_second", 2);
+    assert_eq!(controller.active_project(), Some(1));
+
+    controller.install_recent(
+        vec![RecentEntry {
+            name: "first".to_string(),
+            folder: first_dir.clone(),
+            path: Some(first_dir),
+            opened_at: 0,
+        }],
+        tree("recent_switch_config"),
+    );
+    controller.toggle_projects_overlay();
+
+    assert!(
+        controller.open_recent(0).is_none(),
+        "a target already open in a tab starts no new load"
+    );
+    assert_eq!(
+        controller.active_project(),
+        Some(0),
+        "the click switches to the tab already holding that target"
+    );
+    assert_eq!(
+        controller.project_tabs().len(),
+        2,
+        "no second tab is opened for the same target"
+    );
+    assert!(
+        !controller.projects_overlay_open(),
+        "switching tabs closes the overlay too"
+    );
+}
+
+#[test]
+fn recent_row_missing_target_is_refused() {
+    let mut controller = controller_with_frames("recent_missing_target", 1);
+    let missing_dir = tree("recent_missing_target_gone");
+    std::fs::remove_dir_all(&missing_dir).expect("the target must exist, then vanish");
+    controller.install_recent(
+        vec![RecentEntry {
+            name: "gone".to_string(),
+            folder: missing_dir.clone(),
+            path: Some(missing_dir.clone()),
+            opened_at: 0,
+        }],
+        tree("recent_missing_target_config"),
+    );
+    controller.toggle_projects_overlay();
+    let tabs_before = controller.project_tabs();
+    let active_before = controller.active_project();
+
+    assert!(
+        controller.open_recent(0).is_none(),
+        "a missing target starts no worker"
+    );
+    assert_eq!(
+        controller.project_tabs(),
+        tabs_before,
+        "the tab list is unchanged"
+    );
+    assert_eq!(
+        controller.active_project(),
+        active_before,
+        "the active tab is unchanged"
+    );
+
+    let mut baseline = AppController::new();
+    baseline.open_paths(&[missing_dir]);
+    assert_eq!(
+        controller.last_refusal(),
+        baseline.last_refusal(),
+        "the same refusal `open_paths` raises for the same missing path"
+    );
+}
+
+#[test]
+fn recent_row_out_of_range_or_busy_is_ignored() {
+    let mut controller = controller_with_frames("recent_out_of_range", 1);
+    controller.install_recent(
+        vec![RecentEntry {
+            name: "only".to_string(),
+            folder: tree("recent_out_of_range_folder"),
+            path: None,
+            opened_at: 0,
+        }],
+        tree("recent_out_of_range_config"),
+    );
+    let tabs_before = controller.project_tabs();
+    let active_before = controller.active_project();
+
+    assert!(
+        controller.open_recent(5).is_none(),
+        "an index past the end of the list starts no worker"
+    );
+    assert_eq!(controller.project_tabs(), tabs_before);
+    assert_eq!(controller.active_project(), active_before);
+
+    let busy_dir = tree("recent_out_of_range_busy_target");
+    copy_frame(&busy_dir, "00.tif", 0);
+    let second_dir = tree("recent_out_of_range_second_target");
+    copy_frame(&second_dir, "00.tif", 1);
+    let mut busy_controller = AppController::new();
+    busy_controller.set_scratch_root_for_test(tree("recent_out_of_range_busy_scratch"));
+    busy_controller.install_recent(
+        vec![RecentEntry {
+            name: "second".to_string(),
+            folder: second_dir.clone(),
+            path: Some(second_dir),
+            opened_at: 0,
+        }],
+        tree("recent_out_of_range_busy_config"),
+    );
+    let handle = busy_controller
+        .open_paths(&[busy_dir])
+        .expect("the first load must start");
+
+    assert!(
+        busy_controller.open_recent(0).is_none(),
+        "a click while a load is in flight starts no second worker"
+    );
+    assert!(
+        busy_controller.project_tabs().is_empty(),
+        "the dropped click adds no tab"
+    );
+
+    handle.join().expect("the load worker did not panic");
+    busy_controller.settle_open();
+}
+
+#[test]
+fn recent_file_without_path_still_opens() {
+    use focusforge_gui::recent;
+
+    let frames_dir = tree("recent_no_path_frames");
+    copy_frame(&frames_dir, "00.tif", 0);
+
+    let config_dir = tree("recent_no_path_config");
+    std::fs::write(
+        config_dir.join("recent.toml"),
+        format!(
+            "[[entries]]\nname = \"legacy\"\nfolder = {:?}\nopened_at = 0\n",
+            frames_dir
+        ),
+    )
+    .unwrap();
+
+    let entries = recent::load(&config_dir);
+    assert_eq!(entries.len(), 1, "an old-format file still loads its row");
+    assert_eq!(
+        entries[0].path, None,
+        "no `path` field means `None`, not a parse failure"
+    );
+
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("recent_no_path_scratch"));
+    controller.install_recent(entries, config_dir);
+    controller.toggle_projects_overlay();
+
+    let handle = controller
+        .open_recent(0)
+        .expect("a row with no `path` still starts a load, by `folder`");
+    handle.join().expect("the load worker did not panic");
+    let outcome = controller.settle_open();
+    assert!(
+        matches!(outcome, Some(OpenOutcome::Opened(_))),
+        "the folder opens the same as any other target"
+    );
+    assert_eq!(controller.project_tabs().len(), 1);
 }
 
 // ---------------------------------------------------------------------

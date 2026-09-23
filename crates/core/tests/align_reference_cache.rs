@@ -278,6 +278,7 @@ fn reference_frame_is_read_once_per_run() {
         FailurePolicy::Strict,
         &AlignDriverOptions {
             max_bytes_in_flight: 1,
+            ..Default::default()
         },
     )
     .expect("serial anchored run completes");
@@ -317,6 +318,7 @@ fn cached_transforms_match_uncached() {
         FailurePolicy::Strict,
         &AlignDriverOptions {
             max_bytes_in_flight: 1,
+            ..Default::default()
         },
     )
     .expect("serial anchored run completes");
@@ -418,6 +420,7 @@ fn two_runs_do_not_share_a_cache() {
         FailurePolicy::Strict,
         &AlignDriverOptions {
             max_bytes_in_flight: 1,
+            ..Default::default()
         },
     )
     .expect("first run completes");
@@ -438,6 +441,7 @@ fn two_runs_do_not_share_a_cache() {
         FailurePolicy::Strict,
         &AlignDriverOptions {
             max_bytes_in_flight: 1,
+            ..Default::default()
         },
     )
     .expect("second run completes");
@@ -480,6 +484,7 @@ fn prepared_state_is_dropped_when_the_run_ends() {
         FailurePolicy::Strict,
         &AlignDriverOptions {
             max_bytes_in_flight: 1,
+            ..Default::default()
         },
     )
     .expect("serial run completes");

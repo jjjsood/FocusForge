@@ -4,9 +4,6 @@ Product documentation for FocusForge: how to use it, and how its pieces fit
 together. Design rationale — what was chosen, what was rejected and why — is
 not here.
 
-Pages are added as the features they describe are built, so this index is
-short on purpose rather than incomplete.
-
 ## Guide
 
 Using FocusForge: shooting a stack, loading it, choosing an algorithm,
@@ -14,7 +11,7 @@ retouching the result.
 
 - [`guide/gui.md`](guide/gui.md) — opening a folder or a project in the
   window, the dock's `Images` and `Settings` panels, running and controlling
-  a fuse, and switching between open projects
+  a fuse, saving the held result, and switching between open projects
 - [`guide/stacking.md`](guide/stacking.md) — running `focusforge-cli stack`,
   choosing an algorithm, getting an image back with `export`, and getting the
   Z-Map

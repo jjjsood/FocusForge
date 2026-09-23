@@ -4,6 +4,8 @@
 // this file exports.
 
 import { Theme, TypeRole, ThemeProbe } from "theme.slint";
+// Re-exported so Rust can reach them through this file; `Primitives` stays
+// unreachable outside `theme.slint`.
 export { Theme, TypeRole, ThemeProbe }
 
 import { ThemeSheet } from "theme_sheet.slint";
@@ -19,7 +21,7 @@ export { SettingsRow, SectionHeadView, ImageRowView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFSettingsModal, InputRow, FFManifestRow } from "shell/settings_modal.slint";
 export { InputRow, FFManifestRow }
-import { FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFToast } from "shell/dialogs.slint";
+import { FFCloseGuard, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFToast } from "shell/dialogs.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
 export { ProjectCardView, RecentRowView }
@@ -131,6 +133,9 @@ export component AppWindow inherits Window {
     // tab means nothing to fuse), so the toolbar reads disabled from the
     // window's very first frame, before any project has ever opened.
     in property <bool> fuse-enabled: false;
+    // Another tab's run is live and this one holds no place in it -- the
+    // next `Fuse stack` press here would enqueue rather than start.
+    in property <bool> toolbar-would-queue: false;
 
     // Always occupies its row, so a tab mounting never shifts the canvas
     // below it -- with no project open (or "+" selected over background
@@ -144,6 +149,7 @@ export component AppWindow inherits Window {
         height: ShellGeometry.toolbar-height;
         run-state: root.toolbar-run-state;
         fuse-enabled: root.fuse-enabled;
+        would-queue: root.toolbar-would-queue;
 
         fuse-requested => { root.fuse-requested(); }
         pause-or-resume-requested => { root.pause-or-resume-requested(); }
@@ -156,12 +162,26 @@ export component AppWindow inherits Window {
     // texture is never computed here.
     in property <image> composite-source;
     in property <image> zmap-source;
+    // The selected source frame (`src/gpu_canvas.rs::redraw_frame`) -- the
+    // left pane's own image, label and refusal text, independent of the
+    // composite/Z-Map pair above.
+    in property <image> frame-source;
+    in property <string> frame-label: "";
+    in property <string> frame-message: "";
     in property <bool> canvas-undock-enabled: true;
     // Whether a project is open -- governs the pane chrome (label, undock)
     // and the bottom bar's zoom cluster together, so nothing offers an
     // action there is nothing yet to act on. Set from Rust alongside
     // `zoom-readout` in `src/bridge.rs::repaint`, `false` until then.
     in property <bool> project-loaded: false;
+    // Whether the active tab has a composite to show -- governs the right
+    // pane's not-yet-fused placeholder. Set from Rust alongside
+    // `project-loaded` in `src/bridge.rs::push_projects`.
+    in property <bool> composite-ready: false;
+    // The checkpoints panel's own line -- the active tab's checkpoint
+    // count, or the empty-state wording. Set from Rust alongside
+    // `composite-ready` in `src/bridge.rs::push_projects`.
+    in property <string> checkpoint-line: "None yet — fuse a stack";
     callback composite-undock-requested();
     callback zmap-undock-requested();
     // Forwarded from `FFCanvas`'s own callbacks of the same shape -- the
@@ -187,6 +207,13 @@ export component AppWindow inherits Window {
     in property <length> image-y;
     in property <length> image-w;
     in property <length> image-h;
+    // The left pane's own placement, drawn against the selected frame's
+    // extent rather than the composite/Z-Map's -- the two panes share one
+    // viewport's scale but not one image size.
+    in property <length> frame-image-x;
+    in property <length> frame-image-y;
+    in property <length> frame-image-w;
+    in property <length> frame-image-h;
     in property <bool> pixelated;
     callback canvas-resized();
     out property <length> canvas-pane-left-x: canvas.pane-left-x;
@@ -222,12 +249,20 @@ export component AppWindow inherits Window {
             height: 100%;
             composite-source: root.composite-source;
             zmap-source: root.zmap-source;
+            frame-source: root.frame-source;
+            frame-label: root.frame-label;
+            frame-message: root.frame-message;
             undock-enabled: root.canvas-undock-enabled;
             project-loaded: root.project-loaded;
+            composite-ready: root.composite-ready;
             image-x: root.image-x;
             image-y: root.image-y;
             image-w: root.image-w;
             image-h: root.image-h;
+            frame-image-x: root.frame-image-x;
+            frame-image-y: root.frame-image-y;
+            frame-image-w: root.frame-image-w;
+            frame-image-h: root.frame-image-h;
             pixelated: root.pixelated;
             show-empty-state: root.show-empty-state;
             load-active: root.load-active;
@@ -282,6 +317,7 @@ export component AppWindow inherits Window {
     callback images-add-frames-requested();
     callback images-sort-menu-toggled();
     callback images-sort-selected(string);
+    callback images-frame-selected(int);
     callback images-frame-excluded-toggled(int);
     callback images-frame-remove-requested(int);
     callback images-frame-grip-pointer(int, int, length);
@@ -299,6 +335,7 @@ export component AppWindow inherits Window {
         mode: root.mode;
         dock-tab: root.dock-tab;
         project-loaded: root.project-loaded;
+        checkpoint-line: root.checkpoint-line;
         settings-rows: root.settings-rows;
         settings-sticky: root.settings-sticky;
         settings-scroll-y: root.settings-scroll-y;
@@ -330,6 +367,7 @@ export component AppWindow inherits Window {
         images-add-frames-requested => { root.images-add-frames-requested(); }
         images-sort-menu-toggled => { root.images-sort-menu-toggled(); }
         images-sort-selected(picked) => { root.images-sort-selected(picked); }
+        images-frame-selected(i) => { root.images-frame-selected(i); }
         images-frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
         images-frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
         images-frame-grip-pointer(i, kind, y) => { root.images-frame-grip-pointer(i, kind, y); }
@@ -449,6 +487,9 @@ export component AppWindow inherits Window {
     callback projects-new-project-requested();
     callback projects-open-project-requested();
     callback projects-close-project-requested();
+    in property <bool> projects-save-enabled: false;
+    callback projects-save-project-requested();
+    callback projects-recent-clicked(int);
     out property <length> gallery-width: projects-overlay.gallery-width;
 
     projects-overlay := FFProjectsOverlay {
@@ -463,6 +504,7 @@ export component AppWindow inherits Window {
         gallery-content-height: root.gallery-content-height;
         gallery-scroll-y: root.gallery-scroll-y;
         recent-rows: root.recent-rows;
+        save-enabled: root.projects-save-enabled;
 
         card-clicked(i) => { root.projects-card-clicked(i); }
         card-action-clicked(i) => { root.projects-card-action-clicked(i); }
@@ -475,6 +517,8 @@ export component AppWindow inherits Window {
         new-project-requested => { root.projects-new-project-requested(); }
         open-project-requested => { root.projects-open-project-requested(); }
         close-project-requested => { root.projects-close-project-requested(); }
+        save-project-requested => { root.projects-save-project-requested(); }
+        recent-clicked(i) => { root.projects-recent-clicked(i); }
     }
 
     settings-modal := FFSettingsModal {
@@ -543,6 +587,16 @@ export component AppWindow inherits Window {
     callback frame-warning-cancelled();
     callback frame-warning-secondary-pressed();
     callback frame-warning-confirmed();
+    in property <bool> close-guard-open: false;
+    in property <string> close-guard-title: "Save this state first?";
+    in property <string> close-guard-context: "";
+    in property <string> close-guard-body: "";
+    in property <string> close-guard-info: "";
+    in property <string> close-guard-secondary-label: "Save and close";
+    in property <string> close-guard-confirm-label: "Close without saving";
+    callback close-guard-cancelled();
+    callback close-guard-secondary-pressed();
+    callback close-guard-confirmed();
 
     grouping-question := FFGroupingQuestion {
         x: 0px;
@@ -600,6 +654,23 @@ export component AppWindow inherits Window {
         cancelled => { root.frame-warning-cancelled(); }
         secondary-pressed => { root.frame-warning-secondary-pressed(); }
         confirmed => { root.frame-warning-confirmed(); }
+    }
+
+    close-guard := FFCloseGuard {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.close-guard-open;
+        title: root.close-guard-title;
+        context: root.close-guard-context;
+        body: root.close-guard-body;
+        info: root.close-guard-info;
+        secondary-label: root.close-guard-secondary-label;
+        confirm-label: root.close-guard-confirm-label;
+        cancelled => { root.close-guard-cancelled(); }
+        secondary-pressed => { root.close-guard-secondary-pressed(); }
+        confirmed => { root.close-guard-confirmed(); }
     }
 
     loading-indicator := FFLoadingIndicator {

@@ -31,8 +31,8 @@ fn mantis_512_dir() -> PathBuf {
 /// -- used as the spawned process's own working directory, so `.scratch/`
 /// lands here and never collides with another test's.
 ///
-/// Derefs to `Path`, so `&dir` and `dir.join(..)` read exactly as they did
-/// when this was a bare `PathBuf`.
+/// Derefs to `Path`, so `&dir` and `dir.join(..)` read exactly as a bare
+/// `PathBuf` would.
 struct TmpDir {
     path: PathBuf,
 }
@@ -128,7 +128,7 @@ fn read_work_line(reader: &mut impl BufRead, prefix: &str) -> String {
 
 /// Every line of the printed grouping proposal for a one-group run: the
 /// `grouping ...` header plus its indented group lines. What a whole-stderr
-/// assertion has to allow for now.
+/// assertion has to allow.
 fn strip_grouping(stderr: &str) -> String {
     stderr
         .lines()
@@ -232,7 +232,7 @@ fn interruptible_stack_args<'a>(dir: &'a str, output: &'a str) -> Vec<&'a str> {
         "1",
     ];
     // Without `--no-gpu`, `--algo laplacian` takes the GPU path automatically
-    // now that `gpu` is a default build feature, and every SIGINT/pause test
+    // because `gpu` is a default build feature, and every SIGINT/pause test
     // in this file depends on the CPU tile scheduler's own admission gate
     // and worker count -- a GPU run bypasses both. `--no-gpu` only exists
     // when this crate's own `gpu` feature is compiled in.
@@ -264,7 +264,7 @@ fn stack_output_is_unchanged_under_the_job_engine() {
         "--no-crop",
     ];
     // Without `--no-gpu`, `--algo laplacian` takes the GPU path automatically
-    // now that `gpu` is a default build feature, and the in-process oracle
+    // because `gpu` is a default build feature, and the in-process oracle
     // below is CPU-only -- GPU/CPU parity is <=1 LSB by contract, not
     // byte-identical, so this comparison needs both sides on the CPU path.
     if cfg!(feature = "gpu") {
@@ -309,9 +309,8 @@ fn stack_output_is_unchanged_under_the_job_engine() {
     scheduler.run(&NoopPreprocess, &consumer).unwrap();
     consumer.finish().unwrap();
 
-    // The composite now lives inside the project, so the comparison goes
-    // through `export` -- which is exactly the claim worth keeping: the
-    // container changed where the bytes live, not what they are.
+    // The composite lives inside the project, so the comparison goes
+    // through `export`.
     assert_eq!(
         read_pixels(&export_composite(&dir, &output)),
         read_pixels(&oracle_path),
@@ -465,7 +464,7 @@ fn quiet_prints_no_progress() {
         "--quiet",
     ];
     // Without `--no-gpu`, `--algo laplacian` takes the GPU path automatically
-    // now that `gpu` is a default build feature, and a GPU-unavailable
+    // because `gpu` is a default build feature, and a GPU-unavailable
     // fallback prints a warning to stderr regardless of `--quiet`, which this
     // test asserts is otherwise empty.
     if cfg!(feature = "gpu") {
@@ -520,8 +519,7 @@ mod unix_signals {
 
         assert_eq!(status.code(), Some(130), "status: {status:?}");
         assert!(!output.exists(), "named output must not exist");
-        // The resumable state is no longer a `.partial` beside the output:
-        // fusion stages its two planes under `.scratch/projects/<group>/`
+        // Fusion stages its two planes under `.scratch/projects/<group>/`
         // and the project is sealed from them only once the job completes,
         // so a cancel leaves the staged planes and the ledger, and nothing
         // at all beside the named path.
@@ -871,14 +869,9 @@ mod unix_signals {
         );
     }
 
-    /// Which compute backend produced the already-written tiles is part of
-    /// a ledger's identity: a run cancelled on the GPU path and resumed on
-    /// the CPU one (or the reverse) would silently finish one file out of
-    /// two different implementations. The default gate compiles no `gpu`
-    /// feature, so both runs here genuinely resolve `"cpu"` -- the recorded
-    /// value is edited between them, which is the only way to reach the
-    /// refusal without a GPU-feature build, and is exactly what a resume on
-    /// a differently-built binary would look like on disk.
+    /// The backend is part of a ledger's identity, so a resume on a
+    /// different backend is refused. Both runs here resolve `"cpu"`; the
+    /// recorded value is edited between them to reach the refusal.
     #[test]
     fn resume_with_a_changed_backend_fails() {
         let dir = tmp_dir("job_cli_resume_changed_backend");
@@ -1084,7 +1077,6 @@ mod unix_signals {
     #[ignore = "reads the 16 GB reference stack"]
     fn stack_reference_with_cancel_and_resume() {
         let Some(stack_dir) = common::reference_stack_dir() else {
-            eprintln!("reference stack not found; skipping");
             return;
         };
 
@@ -1223,7 +1215,10 @@ mod unix_signals {
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let align_line = read_work_line(&mut stderr, "align ");
         assert!(align_line.starts_with("align "), "{align_line}");
-        let fuse_line = read_line(&mut stderr);
+        // A live align tick may print more `align <done>/<total> frames`
+        // lines before the fuse stage begins; skip past them the same way
+        // the pre-work grouping block is skipped above.
+        let fuse_line = read_work_line(&mut stderr, "fuse ");
         assert!(fuse_line.starts_with("fuse "), "{fuse_line}");
         send(child.id(), "-INT");
         let status = child.wait().unwrap();

@@ -28,12 +28,12 @@ fn pinned_slint_and_wgpu_versions_resolve() {
     assert_eq!(
         locked_version(&lock, "slint").as_deref(),
         Some("1.17.1"),
-        "slint must resolve to 1.17.1, the spike's version"
+        "slint must resolve to 1.17.1"
     );
     assert_eq!(
         locked_version(&lock, "wgpu").as_deref(),
         Some("29.0.4"),
-        "wgpu must resolve to 29.0.4, the spike's version"
+        "wgpu must resolve to 29.0.4"
     );
 }
 

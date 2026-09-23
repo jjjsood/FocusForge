@@ -164,8 +164,8 @@ fn checkpoint_panel_shows_its_empty_state() {
 #[test]
 fn checkpoint_panel_touches_no_storage() {
     let controller = focusforge_gui::AppController::new();
-    // The crate legitimately has storage-touching code
-    // for the canvas -- reading a loaded project's composite/Z-Map TIFFs is
+    assert!(controller.checkpoints().is_empty());
+    assert!(!controller.export_enabled());
 
     // The canvas legitimately touches storage (a project's TIFFs),
     // `input_config.rs` is a config file, and `settings_panel.rs` is the one
@@ -337,8 +337,8 @@ fn manifest_row(name: &str) -> focusforge_gui::FFManifestRow {
 
 /// The footer sits at one position throughout every state the diagnostics
 /// panel can show, and the manifest list's own size never grows with its
-/// row count -- both load-bearing for the boards' "every row present in
-/// every state" layout.
+/// row count -- both load-bearing for "every row present in every state"
+/// layout.
 #[test]
 fn diagnostics_panel_footer_and_list_are_stable_across_states() {
     let app = app_at(1440, 900);
@@ -465,7 +465,7 @@ fn gear_has_its_own_persistent_box() {
         (w, h),
         (32.0, 32.0),
         "the gear's hit box must match the zoom cluster's own 32 x 32 baseline \
-         (Theme.icon-md + 2 * Theme.space-2), not the bare 20 px TouchArea it used to be"
+         (Theme.icon-md + 2 * Theme.space-2)"
     );
 
     let bottom_bar_slint =
@@ -482,9 +482,8 @@ fn gear_has_its_own_persistent_box() {
     );
 
     // `FFGearButton`'s default (non-hover) background must not be
-    // `transparent` -- that is the exact defect this pass fixed: a button
-    // with chrome only on hover reads as no button at all until the mouse
-    // finds it.
+    // `transparent`: a button with chrome only on hover reads as no button
+    // at all until the mouse finds it.
     let default_background = code
         .split("background: area.has-hover ? Theme.surface-hover : ")
         .nth(1)
@@ -544,7 +543,7 @@ fn scroll_arrows_are_bound_to_the_overflow_flags() {
 /// arrows and "+" -- is one `FFStripBox`, which draws the 1px
 /// `Theme.border-default` frame on its left, right and top edges. Sharing
 /// the component is what keeps their top edge, height and frame from
-/// drifting apart (the "+" once sat 3px lower than the tabs).
+/// drifting apart.
 #[test]
 fn every_strip_box_shares_one_framed_component() {
     let tab_strip_slint =
@@ -575,6 +574,77 @@ fn every_strip_box_shares_one_framed_component() {
         code.contains("component FFTabStripIconButton inherits FFStripBox {"),
         "the icon boxes must share FFStripBox with the tabs"
     );
+}
+
+/// The images panel header, the zoom cluster and the tab strip's window
+/// controls all draw their glyph buttons from one shared primitive, at the
+/// size and padding each call site sets -- not a copy declared locally.
+#[test]
+fn icon_button_is_a_shared_primitive() {
+    let primitive = fs::read_to_string(
+        common::ui_dir()
+            .join("components")
+            .join("ff_icon_button.slint"),
+    )
+    .unwrap();
+    let primitive_code = common::strip_line_comments(&primitive);
+    assert_eq!(
+        primitive_code.matches("export component").count(),
+        1,
+        "ff_icon_button.slint must export exactly one component"
+    );
+    assert!(primitive_code.contains("export component FFIconButton"));
+    for shell_import in ["shell/", "\"../shell"] {
+        assert!(
+            !primitive_code.contains(shell_import),
+            "a primitive must import no shell file"
+        );
+    }
+
+    for (region_path, needle) in [
+        (
+            common::ui_dir()
+                .join("shell")
+                .join("dock")
+                .join("images_panel.slint"),
+            "component FFImagesHeaderButton",
+        ),
+        (
+            common::ui_dir()
+                .join("shell")
+                .join("bottom_bar")
+                .join("zoom_cluster.slint"),
+            "component FFZoomIconButton",
+        ),
+        (
+            common::ui_dir().join("shell").join("tab_strip.slint"),
+            "component WindowGlyphButton",
+        ),
+    ] {
+        let region_code = common::strip_line_comments(&fs::read_to_string(&region_path).unwrap());
+        assert!(
+            !region_code.contains(needle),
+            "{}: must declare no glyph-button component of its own",
+            region_path.display()
+        );
+    }
+
+    for (width, height) in [(1440, 900), (1200, 760)] {
+        let app = app_at(width, height);
+        app.set_project_loaded(true);
+        for (id, side) in [
+            ("FFZoomCluster::zoom-out", 32.0),
+            ("FFImagesPanel::add-button", 22.0),
+            ("FFTabStrip::window-close", 30.0),
+        ] {
+            let (_, _, w, h) = rect(&app, id);
+            assert_eq!(
+                (w, h),
+                (side, side),
+                "{id}: must render {side}x{side} at window width {width}"
+            );
+        }
+    }
 }
 
 /// `FFTab`'s title/unsaved/close row must be anchored to the tab's full
@@ -731,7 +801,7 @@ fn dock_without_a_project_says_so() {
     let app = app_at(1440, 900);
 
     assert_eq!(
-        label(&app, "FFCheckpointPanel::checkpoint-empty-note"),
+        label(&app, "FFCheckpointPanel::checkpoint-note"),
         "None yet — fuse a stack"
     );
     assert_eq!(
@@ -809,8 +879,8 @@ fn transport() {
 fn bottom_bar_progress() {
     let app = app_at(1440, 900);
     app.set_project_loaded(true);
-    app.set_stage_word("Fusing".into());
-    app.set_step_text("step 2 of 3".into());
+    app.set_stage_word("Aligning".into());
+    app.set_step_text("42 of 61".into());
     app.set_bar_fraction(0.5);
     app.set_eta_text("ETA 1:12".into());
 
@@ -826,8 +896,8 @@ fn bottom_bar_progress() {
 
     let app_min = app_at(1200, 760);
     app_min.set_project_loaded(true);
-    app_min.set_stage_word("Fusing".into());
-    app_min.set_step_text("step 2 of 3".into());
+    app_min.set_stage_word("Aligning".into());
+    app_min.set_step_text("42 of 61".into());
     app_min.set_bar_fraction(0.5);
     app_min.set_eta_text("ETA 1:12".into());
 

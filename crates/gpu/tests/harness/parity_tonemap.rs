@@ -103,6 +103,79 @@ fn tonemap_matches_cpu() {
     );
 }
 
+/// A draw above 65,535 workgroups of 64 invocations (4,194,240 texels), with
+/// sides that are not multiples of the 8 x 8 workgroup, so the kernel's
+/// bounds guard runs on both axes. The golden 512 x 512 planes are tiled to
+/// size, sampled at `(x % 512, y % 512)`.
+#[test]
+fn tonemap_matches_cpu_above_the_one_dimensional_dispatch_ceiling() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+    let (width, height) = (2563u32, 2565u32);
+    assert!(width * height > 65_535 * 64);
+
+    let dir = golden_dir();
+    let composite =
+        TiffStack::open_files(&[dir.join("laplacian.tif")]).expect("open golden composite");
+    let tile = composite
+        .read_tile(
+            0,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 512,
+                height: 512,
+            },
+        )
+        .expect("read golden composite");
+    let zmap = ZMapReader::open(&dir.join("laplacian-zmap.tif")).expect("open golden zmap");
+    let mut zmap_tile = vec![0u16; 512 * 512];
+    zmap.read_tile_into(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        },
+        &mut zmap_tile,
+    )
+    .expect("read golden zmap");
+    let index_scale = zmap_index_scale(zmap.frame_count());
+
+    let tiled_pixel = |x: u32, y: u32| ((y % 512) * 512 + (x % 512)) as usize;
+    let mut samples = Vec::with_capacity((width * height * 3) as usize);
+    let mut indices = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let p = tiled_pixel(x, y);
+            samples.extend_from_slice(&tile.samples[p * 3..p * 3 + 3]);
+            indices.push(zmap_tile[p]);
+        }
+    }
+
+    for (label, src, spp, scale) in [
+        ("composite", &samples, 3u32, 0u32),
+        ("zmap", &indices, 1, index_scale),
+    ] {
+        let target = DisplayTexture::new(shared.device(), width, height);
+        render(shared, &target, src, spp, scale);
+        let gpu_bytes = read_display_texture(shared.device(), shared.queue(), &target);
+        let mut cpu_bytes = vec![0u8; (width * height * 4) as usize];
+        tonemap_cpu(src, width, height, spp, scale, &mut cpu_bytes);
+
+        let (worst, worst_index) = worst_delta(&gpu_bytes, &cpu_bytes);
+        println!(
+            "tonemap {label} {width}x{height} parity: worst |delta|={worst} at byte index \
+             {worst_index}"
+        );
+        assert_eq!(
+            worst, 0,
+            "expected bit-exact agreement -- integer-only on both sides"
+        );
+    }
+}
+
 #[test]
 fn tonemap_matches_cpu_at_the_extremes() {
     let Some(shared) = shared_device_or_skip() else {
@@ -117,8 +190,8 @@ fn tonemap_matches_cpu_at_the_extremes() {
         values.push(hi * 256 + 255);
     }
 
-    // A viewport width that is not a multiple of 64 -- what exercises
-    // `crates/gpu/src/display/readback.rs`'s row padding.
+    // A viewport width that is not a multiple of 64 px, so the readback's
+    // row padding is exercised.
     let width = 77u32;
     let pixel_count = values.len();
     let height = (pixel_count as u32).div_ceil(width);
