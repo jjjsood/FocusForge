@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// A modal dialog: a scrim, a card with an optional warning icon and title,
-// a body paragraph, an optional info line, and its own footer.
+// A modal dialog: a scrim, a card with an optional tone icon and title, an
+// optional context line, a body, an optional info line, and its own footer.
 
 import { Theme } from "../theme.slint";
 import { FFDialogFooter } from "ff_dialog_footer.slint";
 
 export component FFDialog inherits Rectangle {
     in property <bool> open: false;
-    // "warning" (a red top rule and triangle icon) | "plain".
+    // "warning" (a red top rule and triangle icon) | "save" (a save icon, no
+    // rule) | "plain".
     in property <string> tone: "plain";
     in property <string> title: "";
+    // Empty hides the context line under the title.
+    in property <string> context: "";
     in property <string> body: "";
     // Empty hides the info line.
     in property <string> info: "";
@@ -38,6 +41,11 @@ export component FFDialog inherits Rectangle {
         height: 300px;
         background: Theme.surface-raised;
         border-radius: Theme.radius-lg;
+        // Lifts the panel off the scrim -- the same recipe `FFLoadingPanel`
+        // and `FFImageRow`'s floating state use.
+        drop-shadow-color: Theme.surface-canvas.with-alpha(0.5);
+        drop-shadow-offset-y: Theme.space-1;
+        drop-shadow-blur: Theme.space-2;
 
         if root.tone == "warning": Rectangle {
             x: 0;
@@ -67,8 +75,14 @@ export component FFDialog inherits Rectangle {
                     if root.tone == "warning": Image {
                         source: @image-url("../../../../assets/icons/triangle-alert.svg");
                         colorize: Theme.status-failure;
-                        width: Theme.icon-md;
-                        height: Theme.icon-md;
+                        width: Theme.icon-lg;
+                        height: Theme.icon-lg;
+                    }
+                    if root.tone == "save": Image {
+                        source: @image-url("../../../../assets/icons/save.svg");
+                        colorize: Theme.text-secondary;
+                        width: Theme.icon-lg;
+                        height: Theme.icon-lg;
                     }
                     Text {
                         text: root.title;
@@ -81,11 +95,21 @@ export component FFDialog inherits Rectangle {
                     }
                 }
 
-                Text {
-                    text: root.body;
-                    color: Theme.text-secondary;
-                    font-size: Theme.text-body.size;
-                    wrap: word-wrap;
+                VerticalLayout {
+                    spacing: Theme.space-2;
+
+                    if root.context != "": Text {
+                        text: root.context;
+                        color: Theme.text-muted;
+                        font-size: Theme.text-body.size;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: root.body;
+                        color: Theme.text-secondary;
+                        font-size: Theme.text-body.size;
+                        wrap: word-wrap;
+                    }
                 }
 
                 Rectangle {
@@ -95,20 +119,17 @@ export component FFDialog inherits Rectangle {
 
                 if root.info != "": HorizontalLayout {
                     spacing: Theme.space-1;
-                    VerticalLayout {
-                        alignment: start;
-                        padding-top: 2px;
-                        Image {
-                            source: @image-url("../../../../assets/icons/info.svg");
-                            colorize: Theme.text-disabled;
-                            width: Theme.icon-sm;
-                            height: Theme.icon-sm;
-                        }
+                    Image {
+                        source: @image-url("../../../../assets/icons/info.svg");
+                        colorize: Theme.text-muted;
+                        width: Theme.icon-lg;
+                        height: Theme.icon-lg;
                     }
                     Text {
                         text: root.info;
-                        color: Theme.text-disabled;
+                        color: Theme.text-muted;
                         font-size: Theme.text-body.size;
+                        vertical-alignment: center;
                         wrap: word-wrap;
                         horizontal-stretch: 1;
                     }

@@ -25,11 +25,7 @@ struct Args {
     /// `--exit-after` fires.
     #[arg(long)]
     screenshot: Option<PathBuf>,
-    /// Resize the window to `WxH`, applied from a one-shot timer after
-    /// `show()` -- slint-ui/slint#13245. A 0 ms delay still races the
-    /// initial `show()` layout commit that reasserts `preferred-width` on
-    /// this host (measured: width silently reverted to 1440, height applied
-    /// correctly); 50 ms clears that race.
+    /// Resize the window to `WxH` shortly after it is shown.
     #[arg(long)]
     size: Option<String>,
     /// Renders the design-token specimen sheet instead of the shell.
@@ -41,11 +37,8 @@ struct Args {
     /// order, one `open_paths` call per path.
     #[arg(long, action = clap::ArgAction::Append)]
     open: Vec<PathBuf>,
-    /// Overrides where the input map is read from/written to --
-    /// `<DIR>/focusforge/input.toml`, mirroring what
-    /// `input_config::default_config_dir()` itself resolves to. Exists so a
-    /// test run never writes into the tester's own
-    /// `~/.config/focusforge/`.
+    /// Read and write the input map at `<DIR>/focusforge/input.toml`
+    /// instead of the platform config directory.
     #[arg(long)]
     config_dir: Option<PathBuf>,
     /// Opens the settings modal on the named section at startup:
@@ -74,6 +67,16 @@ struct Args {
     /// saved state with no click sequence.
     #[arg(long, requires = "fuse_tabs")]
     save_active_project: bool,
+    /// Asks to close the active tab once the last `--fuse-tabs` run settles,
+    /// as `Ctrl+W` does -- for inspecting the close question with no key
+    /// press.
+    #[arg(long, requires = "fuse_tabs")]
+    request_close: bool,
+    /// Asks to quit the window once the last `--fuse-tabs` run settles, as
+    /// the app-drawn window-close control does -- for inspecting the quit
+    /// question with no click.
+    #[arg(long, requires = "fuse_tabs")]
+    request_quit: bool,
     /// Requests removing the frame at this index right after `--open`, for
     /// inspecting the frame-set warning it raises on a checkpointed project
     /// with no click sequence.
@@ -109,6 +112,15 @@ fn apply_toolbar_state_preview(app: &AppWindow, state: &str) {
     app.set_eta_text(eta.into());
 }
 
+/// The post-fuse actions `start_fuse_tabs_timer` may run once every pressed
+/// tab settles, bundled to keep the function's argument count down.
+struct FuseTabsFollowUp {
+    save: bool,
+    close: bool,
+    quit: bool,
+    overlay: bool,
+}
+
 /// Presses `Fuse stack` on each of `indices` in turn, the moment no
 /// background load (`--open`) is still in flight. A press fired while a
 /// load is still running targets a tab that does not exist yet and is
@@ -123,9 +135,14 @@ fn start_fuse_tabs_timer(
     controller: Arc<Mutex<AppController>>,
     slot: &Rc<RefCell<Option<slint::Timer>>>,
     indices: Vec<usize>,
-    save: bool,
-    overlay: bool,
+    follow_up: FuseTabsFollowUp,
 ) {
+    let FuseTabsFollowUp {
+        save,
+        close,
+        quit,
+        overlay,
+    } = follow_up;
     let timer_slot = slot.clone();
     let mut pending: std::collections::VecDeque<usize> = indices.into();
     let mut pressed: Vec<usize> = Vec::new();
@@ -148,7 +165,7 @@ fn start_fuse_tabs_timer(
             app.invoke_tab_selected(index as i32);
             app.invoke_fuse_requested();
         }
-        if (save || overlay) && controller.lock().unwrap().work_pending() {
+        if (save || close || quit || overlay) && controller.lock().unwrap().work_pending() {
             return;
         }
         if save {
@@ -156,6 +173,15 @@ fn start_fuse_tabs_timer(
                 .lock()
                 .unwrap()
                 .save_active_project(|proposed| Some(proposed.to_path_buf()));
+        }
+        if close {
+            let mut controller = controller.lock().unwrap();
+            if let Some(i) = controller.active_project() {
+                controller.request_close(i);
+            }
+        }
+        if quit {
+            controller.lock().unwrap().window_close();
         }
         if overlay && !controller.lock().unwrap().projects_overlay_open() {
             controller.lock().unwrap().toggle_projects_overlay();
@@ -554,8 +580,12 @@ fn run(args: &Args) -> ExitCode {
                 controller.clone(),
                 &fuse_tabs_timer,
                 args.fuse_tabs.clone(),
-                args.save_active_project,
-                args.projects_overlay,
+                FuseTabsFollowUp {
+                    save: args.save_active_project,
+                    close: args.request_close,
+                    quit: args.request_quit,
+                    overlay: args.projects_overlay,
+                },
             );
         }
 

@@ -450,6 +450,18 @@ export component ThemeSheet inherits Window {
             }
         }
 
+        Rectangle {
+            width: 200px;
+            height: 48px;
+            FFMenuList {
+                width: 200px;
+                choices: ["Name", "Capture time"];
+                choice-ids: ["name", "capture-time"];
+                show-choice-ids: false;
+                selected: "name";
+            }
+        }
+
         GroupHeading { text: "Dialog footer"; }
         FFDialogFooter {
             width: 480px;
@@ -492,15 +504,24 @@ export component ThemeSheet inherits Window {
                 confirm-label: "Remove and re-fuse";
             }
         }
+
+        GroupHeading { text: "Dialog: save, with a context line"; }
         Rectangle {
-            width: 200px;
-            height: 48px;
-            FFMenuList {
-                width: 200px;
-                choices: ["Name", "Capture time"];
-                choice-ids: ["name", "capture-time"];
-                show-choice-ids: false;
-                selected: "name";
+            width: 500px;
+            height: 320px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "save";
+                title: "Save this state first?";
+                context: "Closing IMG_9801-9861";
+                body: "2 checkpoints have been fused since the last save. They belong to no saved project.\n\nClosing without saving loses them.";
+                info: "Saving adds them to IMG_9801-9861.ffp.";
+                secondary-label: "Save and close";
+                confirm-label: "Close without saving";
+                confirm-kind: "danger";
             }
         }
 

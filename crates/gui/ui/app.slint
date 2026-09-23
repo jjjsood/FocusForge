@@ -21,7 +21,7 @@ export { SettingsRow, SectionHeadView, ImageRowView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFSettingsModal, InputRow, FFManifestRow } from "shell/settings_modal.slint";
 export { InputRow, FFManifestRow }
-import { FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFToast } from "shell/dialogs.slint";
+import { FFCloseGuard, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFToast } from "shell/dialogs.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
 export { ProjectCardView, RecentRowView }
@@ -587,6 +587,16 @@ export component AppWindow inherits Window {
     callback frame-warning-cancelled();
     callback frame-warning-secondary-pressed();
     callback frame-warning-confirmed();
+    in property <bool> close-guard-open: false;
+    in property <string> close-guard-title: "Save this state first?";
+    in property <string> close-guard-context: "";
+    in property <string> close-guard-body: "";
+    in property <string> close-guard-info: "";
+    in property <string> close-guard-secondary-label: "Save and close";
+    in property <string> close-guard-confirm-label: "Close without saving";
+    callback close-guard-cancelled();
+    callback close-guard-secondary-pressed();
+    callback close-guard-confirmed();
 
     grouping-question := FFGroupingQuestion {
         x: 0px;
@@ -644,6 +654,23 @@ export component AppWindow inherits Window {
         cancelled => { root.frame-warning-cancelled(); }
         secondary-pressed => { root.frame-warning-secondary-pressed(); }
         confirmed => { root.frame-warning-confirmed(); }
+    }
+
+    close-guard := FFCloseGuard {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.close-guard-open;
+        title: root.close-guard-title;
+        context: root.close-guard-context;
+        body: root.close-guard-body;
+        info: root.close-guard-info;
+        secondary-label: root.close-guard-secondary-label;
+        confirm-label: root.close-guard-confirm-label;
+        cancelled => { root.close-guard-cancelled(); }
+        secondary-pressed => { root.close-guard-secondary-pressed(); }
+        confirmed => { root.close-guard-confirmed(); }
     }
 
     loading-indicator := FFLoadingIndicator {

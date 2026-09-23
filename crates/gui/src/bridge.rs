@@ -257,9 +257,7 @@ pub fn repaint(
 }
 
 /// Locks `controller`, runs `mutate` against it, then repaints if the
-/// window is still alive -- the "gesture becomes a redraw" tail shared by
-/// the wheel and zoom-button callbacks below (`on_canvas_scrolled`,
-/// `on_zoom_in_requested`, `on_zoom_out_requested`, `on_zoom_fit_requested`).
+/// window is still alive.
 fn dispatch(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
@@ -303,9 +301,8 @@ fn dispatch_coalesced(
 
 /// Reads `FFCanvas`'s five geometry `out` properties (mirrored at the root)
 /// and pushes them into the controller as the two panes' current rects.
-/// `pub` (the `main.rs` binary is a separate crate from this lib target) so
-/// `src/main.rs`'s startup push reads the same properties through the same
-/// function rather than re-listing them.
+/// `pub` so `src/main.rs`'s startup push reads the same properties through
+/// the same function rather than re-listing them.
 pub fn read_pane_geometry(app: &AppWindow) -> (PaneRect, PaneRect) {
     let y = app.get_canvas_pane_left_y();
     let width = app.get_canvas_pane_left_width();
@@ -424,6 +421,21 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     // `ProjectsChanged` push, so the dialog only needs to track whether a
     // question is still pending.
     app.set_question_open(controller.pending_question().is_some());
+    match controller
+        .pending_close()
+        .or_else(|| controller.pending_quit_copy())
+    {
+        Some(copy) => {
+            app.set_close_guard_title(copy.title.into());
+            app.set_close_guard_context(copy.context.into());
+            app.set_close_guard_body(copy.body.into());
+            app.set_close_guard_info(copy.info.into());
+            app.set_close_guard_secondary_label(copy.secondary_label.into());
+            app.set_close_guard_confirm_label(copy.confirm_label.into());
+            app.set_close_guard_open(true);
+        }
+        None => app.set_close_guard_open(false),
+    }
     // The dock's own gate for the tab row, the settings panel and the
     // "No project open." note (`ui/shell/dock.slint`) -- otherwise stuck at
     // whatever a canvas gesture (`repaint`, above) last set it to, since a
@@ -930,18 +942,19 @@ fn open_recent(
     );
 }
 
-/// Saves the active tab's held checkpoints -- `Save project` and its
-/// `Ctrl+S` twin. A failed save closes the projects overlay, so the failure
-/// toast that waits behind it shows at once.
-fn save_active_project(
+/// Runs one of the controller's saves -- `Save project`, its `Ctrl+S` twin
+/// and the close question's `Save and close`. A failed save closes the
+/// projects overlay, so the failure toast that waits behind it shows at once.
+fn save_project(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
     app_weak: &slint::Weak<AppWindow>,
     toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
+    save: impl FnOnce(&mut AppController) -> bool,
 ) {
     let failure = {
         let mut controller = controller.lock().unwrap();
-        if controller.save_active_project(crate::picker::pick_save_project) {
+        if save(&mut controller) {
             None
         } else {
             controller.take_settled_failure()
@@ -1004,6 +1017,21 @@ pub fn install(
     app.on_window_close_requested({
         let controller = controller.clone();
         move || controller.lock().unwrap().window_close()
+    });
+    // A native `WindowEvent::CloseRequested` (Alt+F4, taskbar close) reaches
+    // Slint's own hook, not the app-drawn x above; unregistered, it hides
+    // the window with no guard at all.
+    app.window().on_close_requested({
+        let controller = controller.clone();
+        move || {
+            let mut controller = controller.lock().unwrap();
+            controller.window_close();
+            if controller.pending_close().is_some() || controller.pending_quit_copy().is_some() {
+                slint::CloseRequestResponse::KeepWindowShown
+            } else {
+                slint::CloseRequestResponse::HideWindow
+            }
+        }
     });
     app.on_mode_selected({
         let controller = controller.clone();
@@ -1180,9 +1208,9 @@ pub fn install(
         let app_weak = app.as_weak();
         move || dispatch(&controller, &canvas, &app_weak, AppController::fit)
     });
-    // The five chrome keys are consulted before the rebindable table, so
-    // none of them can be shadowed by a user's `input.toml`
-    // (`AppController::chrome_key`).
+    // The five chrome keys are consulted before the rebindable table on
+    // every key press, whether or not the projects overlay is open, so none
+    // of them can be shadowed by a user's `input.toml`.
     app.on_canvas_key_pressed({
         let controller = controller.clone();
         let canvas = canvas.clone();
@@ -1213,7 +1241,9 @@ pub fn install(
                     crate::picker::pick_project(),
                 ),
                 ChromeKey::SaveProject => {
-                    save_active_project(&controller, &canvas, &app_weak, &toast_timer)
+                    save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
+                        c.save_active_project(crate::picker::pick_save_project)
+                    })
                 }
             }
         }
@@ -1423,7 +1453,7 @@ pub fn install(
         let app_weak = app.as_weak();
         move |i| {
             dispatch(&controller, &canvas, &app_weak, |controller| {
-                controller.close_project(i as usize);
+                controller.request_close(i as usize);
             })
         }
     });
@@ -1720,6 +1750,34 @@ pub fn install(
             }
         }
     });
+    app.on_close_guard_cancelled({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().close_guard_cancelled()
+    });
+    app.on_close_guard_secondary_pressed({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        let toast_timer = toast_timer.clone();
+        move || {
+            save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
+                c.close_guard_secondary_pressed(crate::picker::pick_save_project)
+            })
+        }
+    });
+    app.on_close_guard_confirmed({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch(
+                &controller,
+                &canvas,
+                &app_weak,
+                AppController::close_guard_confirmed,
+            )
+        }
+    });
     // The projects overlay: the tab strip's own toggle, the gallery's
     // scroll -- `FFScrollbar`'s twin wiring above -- and its cards' own
     // click-through.
@@ -1764,7 +1822,11 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         let toast_timer = toast_timer.clone();
-        move || save_active_project(&controller, &canvas, &app_weak, &toast_timer)
+        move || {
+            save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
+                c.save_active_project(crate::picker::pick_save_project)
+            })
+        }
     });
     app.on_projects_close_project_requested({
         let controller = controller.clone();
@@ -1773,7 +1835,7 @@ pub fn install(
         move || {
             dispatch(&controller, &canvas, &app_weak, |controller| {
                 if let Some(i) = controller.active_project() {
-                    controller.close_project(i);
+                    controller.request_close(i);
                 }
             });
         }
@@ -1803,7 +1865,7 @@ pub fn install(
         let app_weak = app.as_weak();
         move |i| {
             dispatch(&controller, &canvas, &app_weak, |controller| {
-                controller.close_project(i as usize);
+                controller.request_close(i as usize);
             })
         }
     });

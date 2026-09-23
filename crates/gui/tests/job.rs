@@ -21,7 +21,8 @@ use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::canvas::CanvasFeed;
 use focusforge_gui::input_map::Modifiers;
 use focusforge_gui::job;
-use focusforge_gui::{AppController, ChromeKey, OpenOutcome};
+use focusforge_gui::viewport::PaneRect;
+use focusforge_gui::{AppController, ChromeKey, OpenOutcome, ShellEvent};
 
 // ---------------------------------------------------------------------
 // Fixture helpers -- copies only, never the committed fixture directory
@@ -2184,6 +2185,134 @@ fn save_is_enabled_only_with_unsaved_checkpoints() {
 }
 
 #[test]
+fn ctrl_s_saves_with_the_overlay_closed() {
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+    let mut controller = controller_with_frames("ctrl_s_closed_overlay", 2);
+    let root = frames_dir("ctrl_s_closed_overlay");
+    let before = listing(&root);
+
+    assert!(!controller.projects_overlay_open());
+    assert_eq!(controller.chrome_key("s", ctrl), ChromeKey::Consumed);
+    assert_eq!(listing(&root), before, "a consumed Ctrl+S writes nothing");
+
+    fuse_and_settle(&mut controller);
+    assert_eq!(controller.chrome_key("s", ctrl), ChromeKey::SaveProject);
+
+    save_to_proposed(&mut controller);
+    assert_eq!(controller.chrome_key("s", ctrl), ChromeKey::Consumed);
+    assert!(!controller.projects_overlay_open());
+}
+
+#[test]
+fn file_chords_under_the_settings_modal() {
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+    let mut controller = controller_with_two_tabs("file_chords_settings_modal");
+    fuse_and_settle(&mut controller);
+    assert!(controller.save_enabled());
+
+    controller.open_settings();
+    assert_eq!(controller.chrome_key("n", ctrl), ChromeKey::Consumed);
+    assert_eq!(controller.chrome_key("o", ctrl), ChromeKey::Consumed);
+    assert_eq!(
+        controller.chrome_key("s", ctrl),
+        ChromeKey::Consumed,
+        "held checkpoints do not enable Ctrl+S under Settings"
+    );
+    assert!(
+        controller.save_enabled(),
+        "the consumed Ctrl+S wrote nothing"
+    );
+
+    controller.select_project(1);
+    let tabs_before = controller.project_tabs().len();
+    assert_eq!(
+        controller.chrome_key("w", ctrl),
+        ChromeKey::Consumed,
+        "Ctrl+W closes nothing on an idle tab under Settings"
+    );
+    assert_eq!(
+        controller.project_tabs().len(),
+        tabs_before,
+        "the tab is still open"
+    );
+
+    controller.close_settings();
+    controller.select_project(0);
+    assert_eq!(controller.chrome_key("n", ctrl), ChromeKey::NewProject);
+    assert_eq!(controller.chrome_key("s", ctrl), ChromeKey::SaveProject);
+
+    controller.select_project(1);
+    assert_eq!(
+        controller.chrome_key("w", ctrl),
+        ChromeKey::Consumed,
+        "Ctrl+W closes the idle tab once Settings is closed"
+    );
+    assert_eq!(controller.project_tabs().len(), tabs_before - 1);
+}
+
+#[test]
+fn wheel_actions_are_blocked_under_the_settings_modal() {
+    let mut controller = controller_with_frames("wheel_blocked_settings_modal", 3);
+    controller.set_pane_geometry(
+        PaneRect {
+            x: 0.0,
+            y: 0.0,
+            width: 566.0,
+            height: 748.0,
+        },
+        PaneRect {
+            x: 566.0,
+            y: 0.0,
+            width: 566.0,
+            height: 748.0,
+        },
+    );
+    controller.fit_if_unfitted();
+    let fitted = controller.zoom_readout();
+    assert!(
+        !fitted.is_empty(),
+        "a fitted viewport reads a non-empty zoom"
+    );
+
+    let events: std::sync::Arc<Mutex<Vec<ShellEvent>>> =
+        std::sync::Arc::new(Mutex::new(Vec::new()));
+    let sink_events = events.clone();
+    controller.set_sink(std::sync::Arc::new(move |event| {
+        sink_events.lock().unwrap().push(event)
+    }));
+
+    controller.open_settings();
+    controller.wheel(0.0, 60.0, 100.0, 100.0, Modifiers::NONE);
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "a wheel-triggered action must raise no event under Settings"
+    );
+    assert_eq!(
+        controller.zoom_readout(),
+        fitted,
+        "zoom must not change under Settings"
+    );
+
+    controller.close_settings();
+    controller.wheel(0.0, 60.0, 100.0, 100.0, Modifiers::NONE);
+    assert!(
+        !events.lock().unwrap().is_empty(),
+        "the same wheel event fires its action once Settings is closed"
+    );
+    assert_ne!(
+        controller.zoom_readout(),
+        fitted,
+        "zoom changes again once Settings is closed"
+    );
+}
+
+#[test]
 fn save_writes_every_held_checkpoint() {
     let mut controller = controller_with_frames("save_every_held", 3);
     let root = frames_dir("save_every_held");
@@ -2347,4 +2476,594 @@ fn a_failed_save_keeps_the_project_in_memory() {
         "{message}"
     );
     still_in_memory(&mut controller);
+}
+
+// ---------------------------------------------------------------------
+// The unsaved-close guard: every close path asks the same question when a
+// tab holds checkpoints no `.ffp` contains, and only then.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_close_asks_only_with_held_checkpoints() {
+    let mut controller = controller_with_three_tabs("asks_only_with_held");
+    controller.select_project(1);
+    fuse_and_settle(&mut controller);
+    controller.select_project(2);
+    fuse_and_settle(&mut controller);
+    save_to_proposed(&mut controller);
+
+    let mut now = Instant::now();
+    let tabs_before = controller.project_tabs().len();
+    controller.request_close_at(0, now);
+    assert!(
+        controller.pending_close().is_none(),
+        "a never-fused tab closes at once"
+    );
+    assert_eq!(controller.project_tabs().len(), tabs_before - 1);
+
+    now += Duration::from_secs(1);
+    let tabs_before = controller.project_tabs().len();
+    controller.request_close_at(1, now);
+    assert!(
+        controller.pending_close().is_none(),
+        "a fused-then-saved tab closes at once"
+    );
+    assert_eq!(controller.project_tabs().len(), tabs_before - 1);
+
+    now += Duration::from_secs(1);
+    let tabs_before = controller.project_tabs().len();
+    controller.request_close_at(0, now);
+    assert!(
+        controller.pending_close().is_some(),
+        "a fused, unsaved tab asks first"
+    );
+    assert_eq!(
+        controller.project_tabs().len(),
+        tabs_before,
+        "asking leaves the tab open"
+    );
+}
+
+#[test]
+fn every_close_path_asks_the_same_question() {
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+    let mut controller = controller_with_two_tabs("every_close_path_asks");
+    fuse_and_settle(&mut controller);
+    controller.select_project(1);
+    fuse_and_settle(&mut controller);
+    fuse_and_settle(&mut controller);
+
+    let title1 = controller.project_tabs()[1].title.clone();
+    assert_eq!(controller.chrome_key("w", ctrl), ChromeKey::Consumed);
+    let copy = controller
+        .pending_close()
+        .expect("Ctrl+W on the active, fused tab asks");
+    assert_eq!(copy.context, format!("Closing {title1}"));
+    assert!(
+        copy.body.starts_with("2 checkpoints have been fused"),
+        "{}",
+        copy.body
+    );
+    controller.cancel_close();
+
+    let title0 = controller.project_tabs()[0].title.clone();
+    controller.request_close(0);
+    let copy = controller
+        .pending_close()
+        .expect("request_close on the inactive, fused tab asks");
+    assert_eq!(copy.context, format!("Closing {title0}"));
+    assert!(
+        copy.body.starts_with("1 checkpoint has been fused"),
+        "{}",
+        copy.body
+    );
+}
+
+#[test]
+fn cancelling_a_close_keeps_everything() {
+    let mut controller = controller_with_frames("cancelling_a_close", 2);
+    fuse_and_settle(&mut controller);
+    let held_before: Vec<PathBuf> = controller
+        .held_checkpoints()
+        .iter()
+        .map(|h| h.composite.clone())
+        .collect();
+
+    controller.request_close(0);
+    assert!(controller.pending_close().is_some());
+    controller.cancel_close();
+
+    assert!(controller.pending_close().is_none());
+    assert_eq!(controller.project_tabs().len(), 1);
+    assert!(controller.save_enabled());
+    let held_after: Vec<PathBuf> = controller
+        .held_checkpoints()
+        .iter()
+        .map(|h| h.composite.clone())
+        .collect();
+    assert_eq!(held_after, held_before);
+    for path in &held_after {
+        assert!(
+            path.is_file(),
+            "{} must survive a cancelled close",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn closing_without_saving_drops_the_held_checkpoints() {
+    let mut controller = controller_with_frames("closing_without_saving", 2);
+    let root = frames_dir("closing_without_saving");
+    let before = listing(&root);
+    fuse_and_settle(&mut controller);
+    let held = controller.held_checkpoints().to_vec();
+    assert!(!held.is_empty());
+
+    controller.request_close(0);
+    assert!(controller.pending_close().is_some());
+    controller.close_without_saving();
+
+    assert!(controller.pending_close().is_none());
+    assert_eq!(controller.project_tabs().len(), 0);
+    assert_eq!(
+        listing(&root),
+        before,
+        "closing without saving leaves the frames directory untouched"
+    );
+    assert!(
+        !listing(&root)
+            .iter()
+            .any(|p| p.extension().is_some_and(|e| e == "ffp")),
+        "no .ffp was written"
+    );
+    for checkpoint in &held {
+        let dir = checkpoint.composite.parent().unwrap();
+        assert!(
+            !dir.exists(),
+            "{} survived closing without saving",
+            dir.display()
+        );
+    }
+}
+
+#[test]
+fn save_and_close_saves_that_tab_then_closes_it() {
+    let outer = "save_and_close_saves_that_tab";
+    let mut controller = controller_with_two_tabs(outer);
+    let root_b = frames_dir(&format!("{outer}_b"));
+
+    fuse_and_settle(&mut controller);
+    let title0 = controller.project_tabs()[0].title.clone();
+    let held0_before: Vec<PathBuf> = controller
+        .held_checkpoints()
+        .iter()
+        .map(|h| h.composite.clone())
+        .collect();
+
+    controller.select_project(1);
+    fuse_and_settle(&mut controller);
+    controller.select_project(0);
+
+    controller.request_close(1);
+    assert!(controller.pending_close().is_some());
+    let target = common::tree(&format!("{outer}_elsewhere")).join("tab1.ffp");
+    let mut asked = Vec::new();
+    assert!(controller.save_and_close(|proposed| {
+        asked.push(proposed.to_path_buf());
+        Some(target.clone())
+    }));
+    assert!(
+        asked[0].starts_with(&root_b),
+        "a never-saved tab proposes a path inside its own frames directory: {asked:?}"
+    );
+    assert!(target.is_file());
+    assert!(controller.pending_close().is_none());
+    assert_eq!(controller.project_tabs().len(), 1);
+    assert_eq!(
+        controller.project_tabs()[0].title,
+        title0,
+        "the other tab is untouched"
+    );
+    let held0_after: Vec<PathBuf> = controller
+        .held_checkpoints()
+        .iter()
+        .map(|h| h.composite.clone())
+        .collect();
+    assert_eq!(held0_after, held0_before);
+
+    // Past `AppController::CLOSE_DEBOUNCE`, so the next close is not the
+    // one just above's double-click guard swallowing it.
+    std::thread::sleep(Duration::from_millis(350));
+
+    // A cancelled picker leaves a never-saved, fused tab open with its
+    // checkpoints held.
+    let root_c = common::tree(&format!("{outer}_c_frames"));
+    for i in 0..2 {
+        copy_frame(&root_c, &format!("{i:02}.tif"), i);
+    }
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[root_c]),
+        OpenOutcome::Opened(_)
+    ));
+    let new_index = controller.project_tabs().len() - 1;
+    fuse_and_settle(&mut controller);
+    let tabs_before = controller.project_tabs().len();
+
+    controller.request_close(new_index);
+    assert!(controller.pending_close().is_some());
+    assert!(!controller.save_and_close(|_| None));
+    assert!(
+        controller.pending_close().is_none(),
+        "the question clears either way"
+    );
+    assert_eq!(
+        controller.project_tabs().len(),
+        tabs_before,
+        "a cancelled picker leaves the tab open"
+    );
+    assert!(!controller.held_checkpoints().is_empty());
+
+    // Reopening and re-fusing the tab saved above appends without asking.
+    assert!(matches!(
+        common::open_and_settle(&mut controller, std::slice::from_ref(&target)),
+        OpenOutcome::Opened(_)
+    ));
+    let reopened_index = controller.project_tabs().len() - 1;
+    fuse_and_settle(&mut controller);
+    let tabs_before = controller.project_tabs().len();
+
+    controller.request_close(reopened_index);
+    assert!(controller.pending_close().is_some());
+    assert!(controller.save_and_close(|_| panic!("an opened tab never asks where")));
+    assert_eq!(controller.project_tabs().len(), tabs_before - 1);
+
+    let chain = Project::open(&target).unwrap().checkpoint_chain().unwrap();
+    assert_eq!(
+        chain.len(),
+        2,
+        "the second fuse appended onto the same file"
+    );
+}
+
+#[test]
+fn chords_are_consumed_while_a_close_is_pending() {
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+    let mut controller = controller_with_frames("chords_consumed_pending", 2);
+    let root = frames_dir("chords_consumed_pending");
+    fuse_and_settle(&mut controller);
+    controller.request_close(0);
+    assert!(controller.pending_close().is_some());
+
+    let before = listing(&root);
+    let tabs_before = controller.project_tabs().len();
+    for key in ["n", "o", "s", "w"] {
+        assert_eq!(
+            controller.chrome_key(key, ctrl),
+            ChromeKey::Consumed,
+            "{key} while a close is pending"
+        );
+    }
+    assert_eq!(controller.project_tabs().len(), tabs_before);
+    assert_eq!(
+        listing(&root),
+        before,
+        "nothing is written while the question is open"
+    );
+    assert!(
+        controller.pending_close().is_some(),
+        "the question is still pending"
+    );
+}
+
+#[test]
+fn close_guard_is_pushed_to_the_window() {
+    use slint::ComponentHandle;
+
+    i_slint_backend_testing::init_no_event_loop();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+
+    let mut controller = controller_with_two_tabs("close_guard_pushed");
+    fuse_and_settle(&mut controller);
+    let now = Instant::now();
+    controller.request_close_at(0, now);
+    assert!(controller.pending_close().is_some());
+
+    let controller = std::sync::Arc::new(std::sync::Mutex::new(controller));
+    focusforge_gui::bridge::push_projects(&app, &controller);
+    assert!(app.get_close_guard_open());
+    assert!(!app.get_close_guard_body().is_empty());
+
+    controller.lock().unwrap().cancel_close();
+    focusforge_gui::bridge::push_projects(&app, &controller);
+    assert!(!app.get_close_guard_open());
+
+    let tabs_before = controller.lock().unwrap().project_tabs().len();
+    controller
+        .lock()
+        .unwrap()
+        .request_close_at(1, now + Duration::from_millis(100));
+    assert_eq!(
+        controller.lock().unwrap().project_tabs().len(),
+        tabs_before - 1,
+        "tab 1 has nothing held and closes at once"
+    );
+
+    let tabs_before = controller.lock().unwrap().project_tabs().len();
+    controller
+        .lock()
+        .unwrap()
+        .request_close_at(0, now + Duration::from_millis(200));
+    focusforge_gui::bridge::push_projects(&app, &controller);
+    assert!(
+        !app.get_close_guard_open(),
+        "inside the debounce, the request is ignored"
+    );
+    assert_eq!(
+        controller.lock().unwrap().project_tabs().len(),
+        tabs_before,
+        "a debounced request neither closes nor asks"
+    );
+}
+
+#[test]
+fn quit_asks_only_with_held_checkpoints() {
+    let mut controller = controller_with_two_tabs("quit_asks_only");
+
+    let events: std::sync::Arc<Mutex<Vec<ShellEvent>>> =
+        std::sync::Arc::new(Mutex::new(Vec::new()));
+    let sink_events = events.clone();
+    controller.set_sink(std::sync::Arc::new(move |event| {
+        sink_events.lock().unwrap().push(event)
+    }));
+
+    controller.window_close();
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, ShellEvent::WindowCloseRequested)),
+        "an all-idle window quits at once"
+    );
+    assert!(controller.pending_quit_copy().is_none());
+
+    events.lock().unwrap().clear();
+    fuse_and_settle(&mut controller);
+    let tabs_before = controller.project_tabs().len();
+    controller.window_close();
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, ShellEvent::WindowCloseRequested)),
+        "a window with a fused tab does not quit at once"
+    );
+    assert!(controller.pending_quit_copy().is_some());
+    assert_eq!(
+        controller.project_tabs().len(),
+        tabs_before,
+        "no tab is touched while the quit question is open"
+    );
+}
+
+#[test]
+fn cancelling_or_forcing_a_quit() {
+    let mut controller = controller_with_two_tabs("cancelling_or_forcing_a_quit");
+    fuse_and_settle(&mut controller);
+    let held0: Vec<PathBuf> = controller
+        .held_checkpoints()
+        .iter()
+        .map(|h| h.composite.clone())
+        .collect();
+    assert!(!held0.is_empty());
+
+    controller.select_project(1);
+    fuse_and_settle(&mut controller);
+    let held1: Vec<PathBuf> = controller
+        .held_checkpoints()
+        .iter()
+        .map(|h| h.composite.clone())
+        .collect();
+    assert!(!held1.is_empty());
+
+    controller.window_close();
+    assert!(controller.pending_quit_copy().is_some());
+    controller.cancel_quit();
+
+    assert!(controller.pending_quit_copy().is_none());
+    assert_eq!(controller.project_tabs().len(), 2);
+    controller.select_project(0);
+    assert_eq!(
+        controller
+            .held_checkpoints()
+            .iter()
+            .map(|h| h.composite.clone())
+            .collect::<Vec<_>>(),
+        held0,
+        "tab 0's held checkpoints survive Cancel"
+    );
+    controller.select_project(1);
+    assert_eq!(
+        controller
+            .held_checkpoints()
+            .iter()
+            .map(|h| h.composite.clone())
+            .collect::<Vec<_>>(),
+        held1,
+        "tab 1's held checkpoints survive Cancel"
+    );
+
+    let events: std::sync::Arc<Mutex<Vec<ShellEvent>>> =
+        std::sync::Arc::new(Mutex::new(Vec::new()));
+    let sink_events = events.clone();
+    controller.set_sink(std::sync::Arc::new(move |event| {
+        sink_events.lock().unwrap().push(event)
+    }));
+
+    controller.window_close();
+    assert!(controller.pending_quit_copy().is_some());
+    controller.quit_without_saving();
+
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, ShellEvent::WindowCloseRequested)),
+        "Quit without saving emits WindowCloseRequested"
+    );
+    assert!(controller.pending_quit_copy().is_none());
+    for path in held0.iter().chain(held1.iter()) {
+        assert!(
+            path.is_file(),
+            "{} must survive quitting without saving -- nothing is written or removed",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn save_all_and_quit_saves_every_unsaved_tab() {
+    let outer = "save_all_and_quit";
+    let mut controller = controller_with_two_tabs(outer);
+    let root_b = frames_dir(&format!("{outer}_b"));
+
+    // Tab 0: saved once, then re-fused so it holds one more unsaved
+    // checkpoint an opened project appends onto.
+    fuse_and_settle(&mut controller);
+    let target0 = save_to_proposed(&mut controller);
+    fuse_and_settle(&mut controller);
+    assert!(!controller.held_checkpoints().is_empty());
+
+    // Tab 1: never saved.
+    controller.select_project(1);
+    fuse_and_settle(&mut controller);
+    controller.select_project(0);
+
+    let target1 = common::tree(&format!("{outer}_elsewhere")).join("tab1.ffp");
+    let asked = std::cell::RefCell::new(Vec::new());
+    controller.window_close();
+    assert!(controller.pending_quit_copy().is_some());
+    assert!(controller.save_all_and_quit(|proposed| {
+        asked.borrow_mut().push(proposed.to_path_buf());
+        Some(target1.clone())
+    }));
+    let asked = asked.into_inner();
+
+    assert_eq!(
+        asked.len(),
+        1,
+        "the picker is asked only for the never-saved tab: {asked:?}"
+    );
+    assert!(
+        asked[0].starts_with(&root_b),
+        "a never-saved tab proposes a path inside its own frames directory: {asked:?}"
+    );
+    assert!(target1.is_file());
+    let chain0 = Project::open(&target0).unwrap().checkpoint_chain().unwrap();
+    assert_eq!(
+        chain0.len(),
+        2,
+        "the opened tab appended with no picker call"
+    );
+    assert!(controller.pending_quit_copy().is_none());
+    controller.select_project(0);
+    assert!(controller.held_checkpoints().is_empty());
+    controller.select_project(1);
+    assert!(controller.held_checkpoints().is_empty());
+
+    // A second run: tab 0 (opened, re-fused) saves first, then tab 1
+    // (never-saved) cancels the picker -- the quit is cancelled but tab 0's
+    // save earlier in this same run is not undone.
+    let outer2 = "save_all_and_quit_cancelled";
+    let mut controller = controller_with_two_tabs(outer2);
+    fuse_and_settle(&mut controller);
+    let target0b = save_to_proposed(&mut controller);
+    fuse_and_settle(&mut controller);
+    assert!(!controller.held_checkpoints().is_empty());
+
+    controller.select_project(1);
+    fuse_and_settle(&mut controller);
+    let held1_before: Vec<PathBuf> = controller
+        .held_checkpoints()
+        .iter()
+        .map(|h| h.composite.clone())
+        .collect();
+    assert!(!held1_before.is_empty());
+    controller.select_project(0);
+
+    controller.window_close();
+    assert!(controller.pending_quit_copy().is_some());
+    assert!(!controller.save_all_and_quit(|_| None));
+
+    assert!(
+        controller.pending_quit_copy().is_none(),
+        "the quit is cancelled either way"
+    );
+    let chain0b = Project::open(&target0b)
+        .unwrap()
+        .checkpoint_chain()
+        .unwrap();
+    assert_eq!(
+        chain0b.len(),
+        2,
+        "tab 0's save, already done this run, is not undone by the cancellation"
+    );
+    controller.select_project(0);
+    assert!(
+        controller.held_checkpoints().is_empty(),
+        "tab 0 is saved and no longer holds anything"
+    );
+    controller.select_project(1);
+    assert_eq!(
+        controller
+            .held_checkpoints()
+            .iter()
+            .map(|h| h.composite.clone())
+            .collect::<Vec<_>>(),
+        held1_before,
+        "tab 1's checkpoint stays held after the picker cancels"
+    );
+}
+
+#[test]
+fn quit_and_close_questions_cannot_overlap() {
+    let mut controller = controller_with_two_tabs("quit_and_close_cannot_overlap");
+    fuse_and_settle(&mut controller);
+    controller.select_project(1);
+    fuse_and_settle(&mut controller);
+    controller.select_project(0);
+
+    // `window_close` is a no-op while a close question is pending.
+    controller.request_close(0);
+    assert!(controller.pending_close().is_some());
+    let tabs_before = controller.project_tabs().len();
+    controller.window_close();
+    assert!(
+        controller.pending_quit_copy().is_none(),
+        "window_close is a no-op while a close question is pending"
+    );
+    assert_eq!(controller.project_tabs().len(), tabs_before);
+    controller.cancel_close();
+
+    // `request_close_at` is a no-op while a quit question is pending.
+    controller.window_close();
+    assert!(controller.pending_quit_copy().is_some());
+    let now = Instant::now();
+    let tabs_before = controller.project_tabs().len();
+    controller.request_close_at(1, now);
+    assert!(
+        controller.pending_close().is_none(),
+        "request_close_at is a no-op while a quit question is pending"
+    );
+    assert_eq!(controller.project_tabs().len(), tabs_before);
 }

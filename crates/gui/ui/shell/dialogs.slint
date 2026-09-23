@@ -229,3 +229,12 @@ export component FFFrameSetWarning inherits FFDialog {
     confirm-kind: "primary";
 }
 
+// Asked before closing a tab, or the window, with checkpoints no project
+// file contains; `AppController::pending_close` supplies the close-a-tab
+// title, context, body and info, `pending_quit_copy` the quit-the-window
+// ones, whichever is pending.
+export component FFCloseGuard inherits FFDialog {
+    tone: "save";
+    confirm-kind: "danger";
+}
+

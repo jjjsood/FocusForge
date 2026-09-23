@@ -742,6 +742,25 @@ fn a_rebind_cannot_shadow_a_chrome_key() {
     }
     controller.install_input_table(table, Provenance::Defaults);
 
+    // The overlay closed: the rebind still cannot shadow the chords.
+    assert!(!controller.projects_overlay_open());
+    assert_eq!(controller.chrome_key("n", ctrl), ChromeKey::NewProject);
+    assert_eq!(controller.chrome_key("o", ctrl), ChromeKey::OpenProject);
+    assert_eq!(controller.chrome_key("s", ctrl), ChromeKey::Consumed);
+    let tabs_before = controller.project_tabs().len();
+    assert_eq!(controller.chrome_key("w", ctrl), ChromeKey::Consumed);
+    assert_eq!(
+        controller.project_tabs().len(),
+        tabs_before - 1,
+        "Ctrl+W closes a tab with the overlay closed too"
+    );
+
+    // A fresh tab for the overlay-open half of the test. Past
+    // `AppController::CLOSE_DEBOUNCE`, so this close is not the first one's
+    // double-click guard swallowing it.
+    open_frames(&mut controller, "rebind_shadow_reopen", 2);
+    std::thread::sleep(Duration::from_millis(350));
+
     controller.toggle_projects_overlay();
     assert_eq!(controller.chrome_key("n", ctrl), ChromeKey::NewProject);
     assert_eq!(controller.chrome_key("o", ctrl), ChromeKey::OpenProject);
@@ -754,6 +773,56 @@ fn a_rebind_cannot_shadow_a_chrome_key() {
         ChromeKey::Consumed
     );
     assert!(!controller.projects_overlay_open());
+}
+
+#[test]
+fn chrome_keys_work_with_the_overlay_closed() {
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+    let mut controller = controller_with_frames("closed_chords", 2);
+    assert!(!controller.projects_overlay_open());
+
+    assert_eq!(controller.chrome_key("n", ctrl), ChromeKey::NewProject);
+    assert_eq!(controller.chrome_key("N", ctrl), ChromeKey::NewProject);
+    assert_eq!(controller.chrome_key("o", ctrl), ChromeKey::OpenProject);
+    assert_eq!(controller.chrome_key("O", ctrl), ChromeKey::OpenProject);
+    assert_eq!(
+        controller.chrome_key("s", ctrl),
+        ChromeKey::Consumed,
+        "nothing fused yet"
+    );
+
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert_eq!(controller.chrome_key("s", ctrl), ChromeKey::SaveProject);
+    assert_eq!(controller.chrome_key("S", ctrl), ChromeKey::SaveProject);
+    assert!(controller.save_active_project(|proposed| Some(proposed.to_path_buf())));
+    assert!(!controller.save_enabled(), "the save leaves nothing held");
+
+    // Boundaries: `Esc`, a bare letter, `Ctrl+W` with zero tabs.
+    assert_eq!(
+        controller.chrome_key("\u{1b}", Modifiers::NONE),
+        ChromeKey::None
+    );
+    assert!(!controller.projects_overlay_open());
+    assert_eq!(controller.chrome_key("n", Modifiers::NONE), ChromeKey::None);
+
+    let tabs_before = controller.project_tabs().len();
+    assert_eq!(controller.chrome_key("w", ctrl), ChromeKey::Consumed);
+    assert_eq!(
+        controller.project_tabs().len(),
+        tabs_before - 1,
+        "Ctrl+W closes a tab with nothing to lose"
+    );
+    assert!(controller.pending_close().is_none());
+
+    assert_eq!(
+        controller.chrome_key("w", ctrl),
+        ChromeKey::Consumed,
+        "Ctrl+W with no project tab open must not panic"
+    );
 }
 
 #[test]

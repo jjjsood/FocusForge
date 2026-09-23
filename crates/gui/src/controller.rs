@@ -40,11 +40,6 @@ use crate::settings_panel::{
 };
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
 
-// Re-exported so `tests/entry.rs` and `crate::bridge` reach these through
-// `focusforge_gui::{..}` the same way they reach `AppController` -- the
-// entry path's own types are declared in `crate::entry` (the one module
-// naming the core algorithm crate's grouping and project modules), never
-// here.
 pub use crate::entry::{
     EntryError, GroupingQuestion, GuiProject, OpenAs, OpenOutcome, Opened, Proposal,
 };
@@ -66,7 +61,7 @@ pub enum DockTab {
     Settings,
 }
 
-/// The settings modal's nav-rail sections, in board order. Four of the six
+/// The settings modal's nav-rail sections, top to bottom. Four of the six
 /// are disabled and cannot be selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsSection {
@@ -444,6 +439,23 @@ pub enum ChromeKey {
     SaveProject,
 }
 
+/// The close question's copy -- [`AppController::pending_close`]'s and
+/// [`AppController::pending_quit_copy`]'s return type. A single-tab close
+/// and a whole-window quit share one dialog, so the wording each proposes
+/// -- including its title and footer labels -- travels with the copy
+/// instead of living in `.slint`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseGuardCopy {
+    pub title: String,
+    /// The line under the title naming the tab, or the window for a quit.
+    pub context: String,
+    pub body: String,
+    /// Where the secondary answer writes.
+    pub info: String,
+    pub secondary_label: String,
+    pub confirm_label: String,
+}
+
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
 /// seam rather than re-cutting it.
 #[derive(Default)]
@@ -526,6 +538,15 @@ struct ShellState {
     drag_row: Option<DragRow>,
     /// Whether the projects overlay is open.
     overlay_open: bool,
+    /// The tab, by id, whose close waits on the "save first?" answer --
+    /// raised by [`AppController::request_close`] only when that tab holds
+    /// checkpoints no `.ffp` contains.
+    pending_close: Option<u64>,
+    /// Whether a window quit waits on the "quit without saving?" answer --
+    /// raised by [`AppController::window_close`] only when some tab holds
+    /// checkpoints no `.ffp` contains. Mutually exclusive with
+    /// `pending_close`: each is a no-op while the other question is open.
+    pending_quit: bool,
     /// Every card standing for a stack that did not become an open project
     /// this session -- cleared the moment its own path opens successfully.
     failures: Vec<FailureCard>,
@@ -720,10 +741,10 @@ pub struct JobView {
 impl AppController {
     /// `tab_region_width` starts at its `ShellGeometry.base-width` value,
     /// not zero: a `changed` handler fires only for a *later* change, never
-    /// for the width's initial value, so a zero default read a freshly
-    /// opened project's tab row as overflowing a strip nobody had measured
-    /// yet, lighting both scroll arrows over a single tab. The real width
-    /// still overwrites this the moment the window is ever resized.
+    /// for the width's initial value, so a zero default would read a
+    /// freshly opened project's tab row as overflowing a strip nobody had
+    /// measured yet. The real width still overwrites this the moment the
+    /// window is ever resized.
     pub fn new() -> Self {
         let mut controller = Self::default();
         controller.state.tab_region_width = Self::BASE_TAB_REGION_WIDTH;
@@ -835,8 +856,19 @@ impl AppController {
         self.emit(ShellEvent::WindowMaximizeToggled(self.state.maximized));
     }
 
-    pub fn window_close(&self) {
-        self.emit(ShellEvent::WindowCloseRequested);
+    /// Quits the window: with every tab's held checkpoints empty, closes it
+    /// at once. Otherwise raises [`Self::pending_quit_copy`] and touches no
+    /// tab. A no-op while a close question is open.
+    pub fn window_close(&mut self) {
+        if self.state.pending_close.is_some() {
+            return;
+        }
+        if self.state.projects.iter().all(|tab| tab.held.is_empty()) {
+            self.emit(ShellEvent::WindowCloseRequested);
+        } else {
+            self.state.pending_quit = true;
+            self.emit(ShellEvent::ProjectsChanged);
+        }
     }
 
     /// Never reachable while [`Self::export_enabled`] is always `false`,
@@ -1149,6 +1181,12 @@ impl AppController {
     /// `x`/`y` are the wheel's own cursor position -- `TouchArea` writes
     /// `mouse-x`/`mouse-y` before `scroll-event` is invoked.
     pub fn wheel(&mut self, delta_x: f32, delta_y: f32, x: f32, y: f32, mods: Modifiers) {
+        // Every wheel-triggered action -- zoom, pan, anything else a table
+        // row binds to `Trigger::Wheel` -- stays off under the Settings
+        // modal.
+        if self.state.settings_open {
+            return;
+        }
         self.state.input.last_pointer = (x, y);
         let (trigger, steps) = if delta_x.abs() > delta_y.abs() && !mods.shift {
             (Trigger::Wheel(mods.with_shift()), delta_x)
@@ -1243,6 +1281,11 @@ impl AppController {
         };
         let trigger = Trigger::Key { key, mods };
         if let Some(action) = self.state.input.table.action(&trigger, self.state.mode) {
+            // Undo and redo stay off under the Settings modal, whatever key
+            // they are bound to.
+            if self.state.settings_open && matches!(action, Action::Undo | Action::Redo) {
+                return;
+            }
             self.emit_action(ActionEvent::Fired { action, steps: 0.0 });
         }
     }
@@ -1650,36 +1693,68 @@ impl AppController {
         self.close_projects_overlay();
     }
 
-    /// Closes tab `index`, re-selecting its neighbour -- "+" when the last
-    /// tab closes, and "+" stays selected if it already was.
-    /// How long after a close further close requests are ignored: 300 ms.
-    /// A double-click on a tab's close glyph
-    /// otherwise closes two tabs -- the first click closes one, the next tab
-    /// slides under the pointer and the second click closes that one too.
+    /// How long after a close further close requests are ignored: 300 ms. A
+    /// double-click on a tab's close glyph otherwise closes two tabs -- the
+    /// first click closes one, the next tab slides under the pointer and the
+    /// second click closes that one too.
     pub const CLOSE_DEBOUNCE: Duration = Duration::from_millis(300);
 
-    /// [`Self::close_project_at`] at the current time -- what the tab
-    /// strip's close glyph calls (`src/bridge.rs`).
+    /// [`Self::close_project_at`] at the current time.
     pub fn close_project(&mut self, index: usize) {
         self.close_project_at(index, Instant::now());
     }
 
-    /// Closes tab `index` as of `now`, unless a close was acted on less than
-    /// [`Self::CLOSE_DEBOUNCE`] before. `now` is a parameter so tests step
-    /// the clock without sleeping.
+    /// Closes tab `index` as of `now` without asking, unless a close was
+    /// acted on less than [`Self::CLOSE_DEBOUNCE`] before. `now` is a
+    /// parameter so tests step the clock without sleeping.
     pub fn close_project_at(&mut self, index: usize, now: Instant) {
-        if index >= self.state.projects.len() {
+        if index < self.state.projects.len() && !self.close_debounced(now) {
+            self.remove_tab(index, now);
+        }
+    }
+
+    /// [`Self::request_close_at`] at the current time -- what every close
+    /// path of the window calls.
+    pub fn request_close(&mut self, index: usize) {
+        self.request_close_at(index, Instant::now());
+    }
+
+    /// Asks to close tab `index` as of `now`: a tab holding checkpoints no
+    /// `.ffp` contains raises [`Self::pending_close`] and stays open; any
+    /// other tab closes at once. A no-op out of range, inside
+    /// [`Self::CLOSE_DEBOUNCE`], or while a quit question is open.
+    pub fn request_close_at(&mut self, index: usize, now: Instant) {
+        if self.state.pending_quit {
             return;
         }
-        if self
-            .state
+        let Some(tab) = self.state.projects.get(index) else {
+            return;
+        };
+        if self.close_debounced(now) {
+            return;
+        }
+        if tab.held.is_empty() {
+            self.remove_tab(index, now);
+        } else {
+            self.state.pending_close = Some(tab.id);
+            self.emit(ShellEvent::ProjectsChanged);
+        }
+    }
+
+    fn close_debounced(&self, now: Instant) -> bool {
+        self.state
             .last_close
             .is_some_and(|last| now.saturating_duration_since(last) < Self::CLOSE_DEBOUNCE)
-        {
-            return;
-        }
+    }
+
+    /// Closes tab `index`, re-selecting its neighbour -- "+" when the last
+    /// tab closes, and "+" stays selected if it already was.
+    fn remove_tab(&mut self, index: usize, now: Instant) {
         self.state.last_close = Some(now);
         let closed = self.state.projects.remove(index);
+        if self.state.pending_close == Some(closed.id) {
+            self.state.pending_close = None;
+        }
         if let GuiProject::Opened(project) = &closed.project {
             let _ =
                 std::fs::remove_dir_all(job::plane_cache_dir(&self.scratch_root(), project.path()));
@@ -1814,12 +1889,14 @@ impl AppController {
         }
     }
 
-    /// A key press against the rail's own five shortcuts -- `Esc` and
+    /// A key press against the window's five fixed shortcuts -- `Esc` and
     /// `Ctrl+N/O/S/W` -- checked before [`Self::key`]'s rebindable table, so
-    /// none of the five can be shadowed by a user's rebind. Meaningful only
-    /// while the overlay is open, since that is the one surface these five
-    /// belong to; every other key press reads [`ChromeKey::None`] and falls
-    /// through unchanged.
+    /// none of the five can be shadowed by a user's rebind. The four
+    /// Ctrl-chords apply anywhere in the window, whether or not the overlay
+    /// is open; none of them acts while the Settings modal is open, nor
+    /// while a close question is open. `Esc` only closes an open overlay.
+    /// Every other key press reads [`ChromeKey::None`] and falls through
+    /// unchanged.
     pub fn chrome_key(&mut self, text: &str, mods: Modifiers) -> ChromeKey {
         let Some(key) = text.chars().next() else {
             return ChromeKey::None;
@@ -1831,21 +1908,28 @@ impl AppController {
             }
             return ChromeKey::None;
         }
-        if !self.state.overlay_open || !mods.ctrl {
+        if !mods.ctrl {
             return ChromeKey::None;
         }
-        match key.to_ascii_lowercase() {
+        let key = key.to_ascii_lowercase();
+        if !matches!(key, 'n' | 'o' | 's' | 'w') {
+            return ChromeKey::None;
+        }
+        if self.state.pending_close.is_some() || self.state.settings_open {
+            return ChromeKey::Consumed;
+        }
+        match key {
             'n' => ChromeKey::NewProject,
             'o' => ChromeKey::OpenProject,
             's' if self.save_enabled() => ChromeKey::SaveProject,
-            's' => ChromeKey::Consumed,
             'w' => {
                 if let Some(i) = self.active_project() {
-                    self.close_project(i);
+                    self.request_close(i);
                 }
                 ChromeKey::Consumed
             }
-            _ => ChromeKey::None,
+            // A disabled `Ctrl+S`.
+            _ => ChromeKey::Consumed,
         }
     }
 
@@ -2741,6 +2825,191 @@ impl AppController {
         ))
     }
 
+    /// The close question still open, if any: which tab, how many
+    /// checkpoints closing it loses, and where saving it would write.
+    pub fn pending_close(&self) -> Option<CloseGuardCopy> {
+        let id = self.state.pending_close?;
+        let tab = self.state.projects.iter().find(|tab| tab.id == id)?;
+        let n = tab.held.len();
+        let (body, them) = if n == 1 {
+            (
+                "1 checkpoint has been fused since the last save. It belongs to no saved \
+                 project.\n\nClosing without saving loses it."
+                    .to_string(),
+                "it",
+            )
+        } else {
+            (
+                format!(
+                    "{n} checkpoints have been fused since the last save. They belong to no \
+                     saved project.\n\nClosing without saving loses them."
+                ),
+                "them",
+            )
+        };
+        let info = match &tab.project {
+            GuiProject::Unsaved(_) => "Saving asks where to write the project file.".to_string(),
+            GuiProject::Opened(project) => format!(
+                "Saving adds {them} to {}.",
+                project
+                    .path()
+                    .file_name()
+                    .unwrap_or(project.path().as_os_str())
+                    .to_string_lossy()
+            ),
+        };
+        Some(CloseGuardCopy {
+            title: "Save this state first?".to_string(),
+            context: format!("Closing {}", tab.title),
+            body,
+            info,
+            secondary_label: "Save and close".to_string(),
+            confirm_label: "Close without saving".to_string(),
+        })
+    }
+
+    /// The pending close's tab index, clearing the question either way.
+    fn take_pending_close(&mut self) -> Option<usize> {
+        let id = self.state.pending_close.take()?;
+        self.state.projects.iter().position(|tab| tab.id == id)
+    }
+
+    /// `Cancel` on the close question: the tab stays open, all it holds kept.
+    pub fn cancel_close(&mut self) {
+        self.state.pending_close = None;
+        self.emit(ShellEvent::ProjectsChanged);
+    }
+
+    /// `Close without saving`: closes the asking tab and drops its held
+    /// checkpoints.
+    pub fn close_without_saving(&mut self) {
+        match self.take_pending_close() {
+            Some(index) => self.remove_tab(index, Instant::now()),
+            None => self.emit(ShellEvent::ProjectsChanged),
+        }
+    }
+
+    /// `Save and close`: saves the asking tab as [`Self::save_project_at`]
+    /// does, then closes it only if the save wrote. Returns whether it wrote;
+    /// the question is cleared either way.
+    pub fn save_and_close(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> bool {
+        let Some(index) = self.take_pending_close() else {
+            self.emit(ShellEvent::ProjectsChanged);
+            return false;
+        };
+        if !self.save_project_at(index, pick) {
+            self.emit(ShellEvent::ProjectsChanged);
+            return false;
+        }
+        self.remove_tab(index, Instant::now());
+        true
+    }
+
+    /// The quit question still open, if any: how many tabs hold checkpoints
+    /// no `.ffp` contains.
+    pub fn pending_quit_copy(&self) -> Option<CloseGuardCopy> {
+        if !self.state.pending_quit {
+            return None;
+        }
+        let n = self
+            .state
+            .projects
+            .iter()
+            .filter(|tab| !tab.held.is_empty())
+            .count();
+        let body = if n == 1 {
+            "1 project has unsaved work. Quitting now loses all of it.".to_string()
+        } else {
+            format!("{n} projects have unsaved work. Quitting now loses all of it.")
+        };
+        Some(CloseGuardCopy {
+            title: "Quit without saving?".to_string(),
+            context: "Quitting FocusForge".to_string(),
+            body,
+            info: String::new(),
+            secondary_label: "Save all and quit".to_string(),
+            confirm_label: "Quit without saving".to_string(),
+        })
+    }
+
+    /// `Cancel` on the quit question: every tab stays open, all it holds
+    /// kept.
+    pub fn cancel_quit(&mut self) {
+        self.state.pending_quit = false;
+        self.emit(ShellEvent::ProjectsChanged);
+    }
+
+    /// `Quit without saving`: closes the window, dropping every tab's held
+    /// checkpoints.
+    pub fn quit_without_saving(&mut self) {
+        self.state.pending_quit = false;
+        self.emit(ShellEvent::WindowCloseRequested);
+    }
+
+    /// `Save all and quit`: saves every tab holding checkpoints no `.ffp`
+    /// contains, in order, as [`Self::save_project_at`] does. The first save
+    /// that does not write stops the loop and cancels the quit -- whatever
+    /// already saved stays saved. Returns whether every save wrote.
+    pub fn save_all_and_quit(&mut self, pick: impl Fn(&Path) -> Option<PathBuf>) -> bool {
+        let indices: Vec<usize> = self
+            .state
+            .projects
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| !tab.held.is_empty())
+            .map(|(index, _)| index)
+            .collect();
+        for index in indices {
+            if !self.save_project_at(index, &pick) {
+                self.state.pending_quit = false;
+                self.emit(ShellEvent::ProjectsChanged);
+                return false;
+            }
+        }
+        self.state.pending_quit = false;
+        self.emit(ShellEvent::WindowCloseRequested);
+        true
+    }
+
+    /// The close guard's `Cancel`, whichever question is open -- a close
+    /// question if one is pending, otherwise a quit question. A no-op with
+    /// neither open.
+    pub fn close_guard_cancelled(&mut self) {
+        if self.state.pending_close.is_some() {
+            self.cancel_close();
+        } else if self.state.pending_quit {
+            self.cancel_quit();
+        }
+    }
+
+    /// The close guard's secondary answer, whichever question is open --
+    /// [`Self::save_and_close`] for a close question, [`Self::save_all_and_quit`]
+    /// for a quit question. `false` with neither open.
+    pub fn close_guard_secondary_pressed(
+        &mut self,
+        pick: impl Fn(&Path) -> Option<PathBuf>,
+    ) -> bool {
+        if self.state.pending_close.is_some() {
+            self.save_and_close(pick)
+        } else if self.state.pending_quit {
+            self.save_all_and_quit(pick)
+        } else {
+            false
+        }
+    }
+
+    /// The close guard's destructive answer, whichever question is open --
+    /// [`Self::close_without_saving`] for a close question,
+    /// [`Self::quit_without_saving`] for a quit question. A no-op with
+    /// neither open.
+    pub fn close_guard_confirmed(&mut self) {
+        if self.state.pending_close.is_some() {
+            self.close_without_saving();
+        } else if self.state.pending_quit {
+            self.quit_without_saving();
+        }
+    }
+
     /// Applies the pending frame-set change and re-fuses -- the ordinary
     /// [`Self::start_fuse`], which appends a checkpoint onto an
     /// already-`Opened` tab rather than discarding any. A no-op, returning
@@ -3402,14 +3671,21 @@ impl AppController {
         !self.held_checkpoints().is_empty()
     }
 
-    /// Writes the active tab's held checkpoints into one `.ffp`: a never-saved
+    /// [`Self::save_project_at`] on the active tab; `false` with none active.
+    pub fn save_active_project(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> bool {
+        self.active_project()
+            .is_some_and(|index| self.save_project_at(index, pick))
+    }
+
+    /// Writes tab `index`'s held checkpoints into one `.ffp`: a never-saved
     /// tab asks `pick`, proposing `<frames dir>/<group name>.ffp`; an opened
     /// one appends to its own file. A failed write keeps everything held and
     /// leaves [`Self::take_settled_failure`] a message. Returns whether it wrote.
-    pub fn save_active_project(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> bool {
-        let Some(index) = self.active_project() else {
-            return false;
-        };
+    pub fn save_project_at(
+        &mut self,
+        index: usize,
+        pick: impl FnOnce(&Path) -> Option<PathBuf>,
+    ) -> bool {
         let Some(tab) = self.state.projects.get(index) else {
             return false;
         };
