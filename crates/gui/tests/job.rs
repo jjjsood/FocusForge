@@ -579,13 +579,13 @@ fn the_failure_message_names_the_frame_and_the_reason() {
 }
 
 // ---------------------------------------------------------------------
-// The step vocabulary is derivable from what the engine reports.
+// The phase vocabulary is derivable from what the engine reports.
 // ---------------------------------------------------------------------
 
 #[test]
-fn steps_map_onto_engine_stages() {
+fn phases_map_onto_engine_stages() {
     use focusforge_core::job::{JobProgress, JobStage};
-    use focusforge_gui::job::{RunState, Step, current_step};
+    use focusforge_gui::job::{Phase, RunState, current_phase};
 
     let aligning = JobProgress {
         stage: JobStage::Align,
@@ -599,9 +599,9 @@ fn steps_map_onto_engine_stages() {
         align_total: 0,
     };
     assert_eq!(
-        current_step(&RunState::Running, Some(&aligning)),
-        Some(Step::Align),
-        "the engine's own Align stage must map onto the Align step"
+        current_phase(&RunState::Running, Some(&aligning)),
+        Some(Phase::Aligning),
+        "the engine's own Align stage must map onto the Aligning phase"
     );
 
     let fusing = JobProgress {
@@ -616,8 +616,8 @@ fn steps_map_onto_engine_stages() {
         align_total: 0,
     };
     assert_eq!(
-        current_step(&RunState::Running, Some(&fusing)),
-        Some(Step::Fuse)
+        current_phase(&RunState::Running, Some(&fusing)),
+        Some(Phase::Fusing)
     );
 
     let sealing = JobProgress {
@@ -632,16 +632,16 @@ fn steps_map_onto_engine_stages() {
         align_total: 0,
     };
     assert_eq!(
-        current_step(&RunState::Running, Some(&sealing)),
-        Some(Step::Write),
-        "a completed fuse stage with no engine stage of its own for the seal reads as Write"
+        current_phase(&RunState::Running, Some(&sealing)),
+        Some(Phase::Writing),
+        "a completed fuse stage with no engine stage of its own for the seal reads as Writing"
     );
 
-    // No step is fabricated for a state the engine never reported a
+    // No phase is fabricated for a state the engine never reported a
     // progress snapshot for.
-    assert_eq!(current_step(&RunState::Running, None), Some(Step::Fuse));
-    assert_eq!(current_step(&RunState::Idle, None), None);
-    assert_eq!(current_step(&RunState::Paused, None), None);
+    assert_eq!(current_phase(&RunState::Running, None), Some(Phase::Fusing));
+    assert_eq!(current_phase(&RunState::Idle, None), None);
+    assert_eq!(current_phase(&RunState::Paused, None), None);
 }
 
 // ---------------------------------------------------------------------
@@ -679,24 +679,41 @@ fn fuse_progress(units_done: usize, unit_total: usize) -> focusforge_core::job::
 }
 
 #[test]
-fn align_step_text_carries_the_frame_count() {
-    use focusforge_gui::job::{RunState, step_text};
+fn align_progress_text_counts_frames() {
+    use focusforge_gui::job::{RunState, progress_text};
 
     let three_of_eight = align_progress(3, 8);
-    assert_eq!(step_text(&RunState::Running, Some(&three_of_eight)), "3/8");
+    assert_eq!(
+        progress_text(&RunState::Running, Some(&three_of_eight)),
+        "3 of 8"
+    );
 
     let forty_two_of_sixty_one = align_progress(42, 61);
     assert_eq!(
-        step_text(&RunState::Running, Some(&forty_two_of_sixty_one)),
-        "42/61"
+        progress_text(&RunState::Running, Some(&forty_two_of_sixty_one)),
+        "42 of 61"
     );
+}
 
-    // Fuse and write snapshots keep the three-step vocabulary, not a count.
-    let fusing = fuse_progress(2, 10);
-    assert_eq!(step_text(&RunState::Running, Some(&fusing)), "step 2 of 3");
+#[test]
+fn fuse_progress_text_is_the_name_only() {
+    use focusforge_gui::job::{RunState, progress_text};
+
+    for (done, total) in [(0, 0), (4, 10), (10, 10)] {
+        assert_eq!(
+            progress_text(&RunState::Running, Some(&fuse_progress(done, total))),
+            "",
+            "a fuse snapshot at {done}/{total} must render no count"
+        );
+    }
+}
+
+#[test]
+fn write_progress_text_is_the_name_only() {
+    use focusforge_gui::job::{RunState, progress_text};
 
     let writing = fuse_progress(10, 10);
-    assert_eq!(step_text(&RunState::Running, Some(&writing)), "step 3 of 3");
+    assert_eq!(progress_text(&RunState::Running, Some(&writing)), "");
 }
 
 #[test]
@@ -713,25 +730,65 @@ fn align_bar_fraction_follows_the_frame_count() {
 }
 
 #[test]
-fn cached_and_absent_alignment_show_no_frame_count() {
-    use focusforge_gui::job::{RunState, bar_fraction, step_text};
+fn progress_text_without_a_total_is_the_name_only() {
+    use focusforge_gui::job::{RunState, bar_fraction, progress_text};
 
     // A cached alignment: `stage == Align`, but `align_total == 0` (no
-    // computed stage set a total) -- never `0/<n>`, and never a rendered
-    // `0/0`.
+    // computed stage set a total) -- never `0 of <n>`, and never a rendered
+    // `0 of 0`.
     let cached = align_progress(0, 0);
-    assert_eq!(step_text(&RunState::Running, Some(&cached)), "step 1 of 3");
+    assert_eq!(progress_text(&RunState::Running, Some(&cached)), "");
     assert_eq!(bar_fraction(Some(&cached)), 0.0);
 
+    // A fuse snapshot with no total yet -- the plan's totals not credited --
+    // renders no count, never `0 of 0` or `0 of N` with no basis.
+    let no_total = fuse_progress(0, 0);
+    assert_eq!(progress_text(&RunState::Running, Some(&no_total)), "");
+
     // A fuse snapshot that still carries a finished align stage's `8/8`
-    // shows no count -- only the fuse stage's own step text and fraction.
+    // shows no count -- only Aligning counts frames.
     let mut finished_align_then_fusing = fuse_progress(0, 10);
     finished_align_then_fusing.align_done = 8;
     finished_align_then_fusing.align_total = 8;
     assert_eq!(
-        step_text(&RunState::Running, Some(&finished_align_then_fusing)),
-        "step 2 of 3"
+        progress_text(&RunState::Running, Some(&finished_align_then_fusing)),
+        ""
     );
+}
+
+#[test]
+fn progress_text_never_names_a_step() {
+    use focusforge_gui::job::{RunState, progress_text};
+
+    let states = [
+        RunState::Idle,
+        RunState::Running,
+        RunState::Paused,
+        RunState::Cancelling,
+        RunState::Failed("stopped".to_string()),
+        RunState::Fused {
+            at: "12:00".to_string(),
+        },
+        RunState::Queued { position: 2 },
+    ];
+    let snapshots = [
+        None,
+        Some(align_progress(0, 0)),
+        Some(align_progress(3, 8)),
+        Some(fuse_progress(0, 0)),
+        Some(fuse_progress(0, 10)),
+        Some(fuse_progress(4, 10)),
+        Some(fuse_progress(10, 10)),
+    ];
+    for state in &states {
+        for snapshot in &snapshots {
+            let text = progress_text(state, snapshot.as_ref());
+            assert!(
+                !text.contains("step"),
+                "{state:?} over {snapshot:?} must never render the word 'step': {text:?}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

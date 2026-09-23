@@ -187,53 +187,55 @@ impl StageObserver for GuiObserver {
     }
 }
 
-/// The bar's three-step vocabulary, sourced from the run's own phases
-/// rather than the engine's two `JobStage` values: `Fuse` is the only step
-/// carrying `JobStage::Fuse` units, so no step here is fabricated from
-/// nothing.
+/// The run's own phases, in order. A phase declares its name and whether it
+/// counts frames ([`Phase::frames`]) -- the one place either is decided, so a
+/// phase added later needs only an arm here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Step {
-    Align,
-    Fuse,
-    Write,
+pub enum Phase {
+    Aligning,
+    Fusing,
+    Writing,
 }
 
-impl Step {
-    pub fn label(self) -> &'static str {
+impl Phase {
+    pub fn name(self) -> &'static str {
         match self {
-            Step::Align => "Align",
-            Step::Fuse => "Fuse",
-            Step::Write => "Write",
+            Phase::Aligning => "Aligning",
+            Phase::Fusing => "Fusing",
+            Phase::Writing => "Writing",
         }
     }
 
-    /// `"step N of 3"`.
-    pub fn text(self) -> String {
-        let n = match self {
-            Step::Align => 1,
-            Step::Fuse => 2,
-            Step::Write => 3,
-        };
-        format!("step {n} of 3")
+    /// `Some((done, total))` while `self` works per frame and `progress`
+    /// carries a non-zero total for it, `None` otherwise -- a cached or
+    /// resumed alignment included, since its total is `0`. `Aligning` is the
+    /// only phase with a frame total.
+    pub fn frames(self, progress: &JobProgress) -> Option<(usize, usize)> {
+        match self {
+            Phase::Aligning if progress.align_total > 0 => {
+                Some((progress.align_done, progress.align_total))
+            }
+            _ => None,
+        }
     }
 }
 
-/// Which [`Step`] `progress` is on: `Align` while the engine reports that
-/// stage, `Write` once every unit of the fuse stage is done (the seal, which
+/// Which [`Phase`] `progress` is on: `Aligning` while the engine reports that
+/// stage, `Writing` once every unit of the fuse stage is done (the seal, which
 /// the engine reports as no stage of its own -- `JobStage` has only
-/// `Align`/`Fuse`), `Fuse` otherwise -- including no progress at all yet.
-pub fn progress_step(progress: Option<&JobProgress>) -> Step {
+/// `Align`/`Fuse`), `Fusing` otherwise -- including no progress at all yet.
+pub fn progress_phase(progress: Option<&JobProgress>) -> Phase {
     match progress {
-        Some(p) if p.stage == JobStage::Align => Step::Align,
-        Some(p) if p.unit_total > 0 && p.units_done >= p.unit_total => Step::Write,
-        _ => Step::Fuse,
+        Some(p) if p.stage == JobStage::Align => Phase::Aligning,
+        Some(p) if p.unit_total > 0 && p.units_done >= p.unit_total => Phase::Writing,
+        _ => Phase::Fusing,
     }
 }
 
 /// The stage word the bar shows for `state`/`progress` -- `Aligning`,
 /// `Fusing`, `Writing`, `Paused`, `Cancelling`, `Failed` or a completed run's
 /// own `fused HH:MM`. `progress` picks between `Aligning`/`Fusing`/`Writing`
-/// while running, via `progress_step`.
+/// while running, via `progress_phase`.
 pub fn stage_word(state: &RunState, progress: Option<&JobProgress>) -> String {
     match state {
         RunState::Paused => "Paused".to_string(),
@@ -242,11 +244,7 @@ pub fn stage_word(state: &RunState, progress: Option<&JobProgress>) -> String {
         RunState::Idle => String::new(),
         RunState::Fused { at } => format!("fused {at}"),
         RunState::Queued { position } => format!("Queued ({position})"),
-        RunState::Running => match progress_step(progress) {
-            Step::Align => "Aligning".to_string(),
-            Step::Fuse => "Fusing".to_string(),
-            Step::Write => "Writing".to_string(),
-        },
+        RunState::Running => progress_phase(progress).name().to_string(),
     }
 }
 
@@ -283,10 +281,10 @@ pub fn is_live(state: &RunState) -> bool {
     )
 }
 
-/// The step this run is on, derived through the same `progress_step`
+/// The phase this run is on, derived through the same `progress_phase`
 /// classification [`stage_word`] uses -- never fabricated from a state the
 /// engine did not report.
-pub fn current_step(state: &RunState, progress: Option<&JobProgress>) -> Option<Step> {
+pub fn current_phase(state: &RunState, progress: Option<&JobProgress>) -> Option<Phase> {
     match state {
         RunState::Idle => None,
         RunState::Paused
@@ -294,26 +292,39 @@ pub fn current_step(state: &RunState, progress: Option<&JobProgress>) -> Option<
         | RunState::Failed(_)
         | RunState::Fused { .. }
         | RunState::Queued { .. } => None,
-        RunState::Running => Some(progress_step(progress)),
+        RunState::Running => Some(progress_phase(progress)),
     }
 }
 
-/// The bottom bar's step-text slot: `"<done>/<total>"` while running a
-/// computed align stage (the bold stage word already names the phase, so the
-/// position text and the count don't both need to be here), otherwise
-/// [`Step::text`] -- empty outside a running state or with no progress to
-/// derive a step from.
-pub fn step_text(state: &RunState, progress: Option<&JobProgress>) -> String {
-    if matches!(state, RunState::Running)
-        && let Some(p) = progress
-        && p.stage == JobStage::Align
-        && p.align_total > 0
-    {
-        return format!("{}/{}", p.align_done, p.align_total);
-    }
-    current_step(state, progress)
-        .map(Step::text)
+/// The bottom bar's step-text slot: `"<done> of <total>"` while the current
+/// phase works per frame and `progress` carries a total for it
+/// ([`Phase::frames`]), empty for a name-only phase, outside a running state,
+/// or with no progress to derive a phase from.
+pub fn progress_text(state: &RunState, progress: Option<&JobProgress>) -> String {
+    let (Some(phase), Some(p)) = (current_phase(state, progress), progress) else {
+        return String::new();
+    };
+    phase
+        .frames(p)
+        .map(|(done, total)| format!("{done} of {total}"))
         .unwrap_or_default()
+}
+
+/// The run's phase line for a card or overlay meta text: the lower-cased
+/// phase name, plus `, <k> of <N>` when [`progress_text`] has a frame count
+/// to show. `None` outside `Running` -- a name-only phase still returns
+/// `Some`, so it never falls back to some other line.
+pub fn phase_line(state: &RunState, progress: Option<&JobProgress>) -> Option<String> {
+    if !matches!(state, RunState::Running) {
+        return None;
+    }
+    let name = progress_phase(progress).name().to_lowercase();
+    let text = progress_text(state, progress);
+    Some(if text.is_empty() {
+        name
+    } else {
+        format!("{name}, {text}")
+    })
 }
 
 /// `estimating` while `eta` is `None` and no unit has finished yet,

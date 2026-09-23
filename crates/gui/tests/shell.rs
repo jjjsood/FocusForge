@@ -164,8 +164,8 @@ fn checkpoint_panel_shows_its_empty_state() {
 #[test]
 fn checkpoint_panel_touches_no_storage() {
     let controller = focusforge_gui::AppController::new();
-    // The crate legitimately has storage-touching code
-    // for the canvas -- reading a loaded project's composite/Z-Map TIFFs is
+    assert!(controller.checkpoints().is_empty());
+    assert!(!controller.export_enabled());
 
     // The canvas legitimately touches storage (a project's TIFFs),
     // `input_config.rs` is a config file, and `settings_panel.rs` is the one
@@ -337,8 +337,8 @@ fn manifest_row(name: &str) -> focusforge_gui::FFManifestRow {
 
 /// The footer sits at one position throughout every state the diagnostics
 /// panel can show, and the manifest list's own size never grows with its
-/// row count -- both load-bearing for the boards' "every row present in
-/// every state" layout.
+/// row count -- both load-bearing for "every row present in every state"
+/// layout.
 #[test]
 fn diagnostics_panel_footer_and_list_are_stable_across_states() {
     let app = app_at(1440, 900);
@@ -465,7 +465,7 @@ fn gear_has_its_own_persistent_box() {
         (w, h),
         (32.0, 32.0),
         "the gear's hit box must match the zoom cluster's own 32 x 32 baseline \
-         (Theme.icon-md + 2 * Theme.space-2), not the bare 20 px TouchArea it used to be"
+         (Theme.icon-md + 2 * Theme.space-2)"
     );
 
     let bottom_bar_slint =
@@ -482,9 +482,8 @@ fn gear_has_its_own_persistent_box() {
     );
 
     // `FFGearButton`'s default (non-hover) background must not be
-    // `transparent` -- that is the exact defect this pass fixed: a button
-    // with chrome only on hover reads as no button at all until the mouse
-    // finds it.
+    // `transparent`: a button with chrome only on hover reads as no button
+    // at all until the mouse finds it.
     let default_background = code
         .split("background: area.has-hover ? Theme.surface-hover : ")
         .nth(1)
@@ -544,7 +543,7 @@ fn scroll_arrows_are_bound_to_the_overflow_flags() {
 /// arrows and "+" -- is one `FFStripBox`, which draws the 1px
 /// `Theme.border-default` frame on its left, right and top edges. Sharing
 /// the component is what keeps their top edge, height and frame from
-/// drifting apart (the "+" once sat 3px lower than the tabs).
+/// drifting apart.
 #[test]
 fn every_strip_box_shares_one_framed_component() {
     let tab_strip_slint =
@@ -880,8 +879,8 @@ fn transport() {
 fn bottom_bar_progress() {
     let app = app_at(1440, 900);
     app.set_project_loaded(true);
-    app.set_stage_word("Fusing".into());
-    app.set_step_text("step 2 of 3".into());
+    app.set_stage_word("Aligning".into());
+    app.set_step_text("42 of 61".into());
     app.set_bar_fraction(0.5);
     app.set_eta_text("ETA 1:12".into());
 
@@ -897,8 +896,8 @@ fn bottom_bar_progress() {
 
     let app_min = app_at(1200, 760);
     app_min.set_project_loaded(true);
-    app_min.set_stage_word("Fusing".into());
-    app_min.set_step_text("step 2 of 3".into());
+    app_min.set_stage_word("Aligning".into());
+    app_min.set_step_text("42 of 61".into());
     app_min.set_bar_fraction(0.5);
     app_min.set_eta_text("ETA 1:12".into());
 
