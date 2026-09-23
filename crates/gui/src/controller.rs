@@ -1826,7 +1826,7 @@ impl AppController {
         for (i, tab) in self.state.projects.iter().enumerate() {
             let fusing = running == Some(i);
             let frame_count = entry::tab_frame_count(&tab.project);
-            let fusing_step = fusing
+            let phase_line = fusing
                 .then(|| job::phase_line(&tab.run, progress.as_ref()))
                 .flatten();
             let (x, y) = overlay::card_origin(cards.len(), columns);
@@ -1841,7 +1841,7 @@ impl AppController {
                     0.0
                 },
                 project_name: tab.title.clone(),
-                meta_text: open_card_meta(frame_count, tab.checkpoints, fusing_step.as_deref()),
+                meta_text: open_card_meta(frame_count, tab.checkpoints, phase_line.as_deref()),
                 headline: String::new(),
                 stage: String::new(),
                 reason: String::new(),
@@ -4026,13 +4026,13 @@ fn not_a_project_card(path: PathBuf) -> FailureCard {
     }
 }
 
-/// An open card's second meta line: `fusing_step` (already rendered, e.g.
+/// An open card's second meta line: `phase_line` (already rendered, e.g.
 /// `"aligning, 3 of 8"` or `"fusing"`) while a run is live against this tab,
 /// otherwise the checkpoint count -- `"no checkpoint yet"` at zero.
-fn open_card_meta(frame_count: u32, checkpoints: usize, fusing_step: Option<&str>) -> String {
+fn open_card_meta(frame_count: u32, checkpoints: usize, phase_line: Option<&str>) -> String {
     let frames = frame_word(frame_count as usize);
-    if let Some(step) = fusing_step {
-        return format!("{frame_count} {frames} · {step}");
+    if let Some(phase) = phase_line {
+        return format!("{frame_count} {frames} · {phase}");
     }
     if checkpoints == 0 {
         return format!("{frame_count} {frames} · no checkpoint yet");
