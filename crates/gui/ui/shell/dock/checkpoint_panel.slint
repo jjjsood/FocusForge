@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The checkpoint panel with no checkpoint yet: a 28 px heading row --
-// `CHECKPOINTS` left, an `Export image` button right, both at a 12 px inset
-// from the dock edges -- and the one muted line under it. The panel ends
-// 32 px below that line, where `FFDock` draws its rule.
+// The checkpoint panel: a 28 px heading row -- `CHECKPOINTS` left, an
+// `Export image` button right, both at a 12 px inset from the dock edges --
+// and the one muted line under it, reading the active tab's checkpoint
+// count. The panel ends 32 px below that line, where `FFDock` draws its
+// rule.
 
 import { Theme } from "../../theme.slint";
 import { FFButton } from "../../components/ff_button.slint";
 
 export component FFCheckpointPanel inherits Rectangle {
     callback checkpoint-export-requested();
+    in property <string> line: "None yet — fuse a stack";
 
     VerticalLayout {
         padding-left: Theme.space-1;
@@ -45,8 +47,8 @@ export component FFCheckpointPanel inherits Rectangle {
             }
         }
 
-        checkpoint-empty-note := Text {
-            text: "None yet — fuse a stack";
+        checkpoint-note := Text {
+            text: root.line;
             min-height: Theme.text-body.size * Theme.text-body.line-height;
             vertical-alignment: center;
             color: Theme.text-disabled;

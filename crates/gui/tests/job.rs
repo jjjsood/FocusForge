@@ -853,6 +853,89 @@ fn a_reopened_project_reports_the_count_on_disk() {
 }
 
 // ---------------------------------------------------------------------
+// The checkpoints panel's own line follows the active tab's real count:
+// the empty wording with no tab or none fused, the shared count phrase
+// once it has, updated by a tab switch and by every further fuse.
+// ---------------------------------------------------------------------
+
+#[test]
+fn checkpoint_panel_line_without_a_tab() {
+    let controller = AppController::new();
+    assert_eq!(
+        controller.checkpoint_panel_line(),
+        "None yet — fuse a stack"
+    );
+}
+
+#[test]
+fn checkpoint_panel_line_counts_each_run() {
+    let mut controller = controller_with_frames("panel_line_counts", 2);
+    assert_eq!(
+        controller.checkpoint_panel_line(),
+        "None yet — fuse a stack"
+    );
+
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert_eq!(controller.checkpoint_panel_line(), "1 checkpoint");
+    assert!(
+        controller.project_cards()[0]
+            .meta_text
+            .ends_with(&controller.checkpoint_panel_line()),
+        "the panel and the card must quote the same count phrase"
+    );
+
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert_eq!(controller.checkpoint_panel_line(), "2 checkpoints");
+    assert!(
+        controller.project_cards()[0]
+            .meta_text
+            .ends_with(&controller.checkpoint_panel_line()),
+        "the panel and the card must quote the same count phrase"
+    );
+}
+
+#[test]
+fn checkpoint_panel_line_follows_the_active_tab() {
+    let mut controller = controller_with_two_tabs("panel_line_follows");
+    controller.select_project(1);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert_eq!(controller.checkpoint_panel_line(), "1 checkpoint");
+
+    controller.select_project(0);
+    assert_eq!(
+        controller.checkpoint_panel_line(),
+        "None yet — fuse a stack"
+    );
+
+    controller.select_project(1);
+    assert_eq!(controller.checkpoint_panel_line(), "1 checkpoint");
+}
+
+#[test]
+fn checkpoint_panel_is_pushed_with_the_projects() {
+    use slint::ComponentHandle;
+
+    i_slint_backend_testing::init_no_event_loop();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+
+    let mut controller = controller_with_two_tabs("panel_line_pushed");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    let controller = std::sync::Arc::new(std::sync::Mutex::new(controller));
+
+    focusforge_gui::bridge::push_projects(&app, &controller);
+    assert_eq!(app.get_checkpoint_line(), "1 checkpoint");
+
+    controller.lock().unwrap().select_project(1);
+    focusforge_gui::bridge::push_projects(&app, &controller);
+    assert_eq!(app.get_checkpoint_line(), "None yet — fuse a stack");
+}
+
+// ---------------------------------------------------------------------
 // The fuse control is enabled at two or more frames, on an unfused and a
 // fused tab alike, and disabled below that; unreachable with "+" selected
 // or no tab.

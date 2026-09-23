@@ -3171,6 +3171,16 @@ impl AppController {
         self.state.active().map(|tab| tab.checkpoints)
     }
 
+    /// The checkpoints panel's own line: the active tab's checkpoint count in
+    /// the shared wording, or the empty-state line while no tab is active or
+    /// it holds none yet.
+    pub fn checkpoint_panel_line(&self) -> String {
+        match self.checkpoint_count() {
+            Some(count) if count > 0 => checkpoint_phrase(count),
+            _ => "None yet — fuse a stack".to_string(),
+        }
+    }
+
     /// Whether the active tab has a composite to show: at least one
     /// checkpoint. `false` while no tab is active.
     pub fn composite_ready(&self) -> bool {
@@ -3970,6 +3980,17 @@ fn frame_word(count: usize) -> &'static str {
     if count == 1 { "frame" } else { "frames" }
 }
 
+/// `"1 checkpoint"` / `"N checkpoints"` -- the open card's meta line and the
+/// checkpoints panel share this wording for a non-zero count.
+fn checkpoint_phrase(count: usize) -> String {
+    let word = if count == 1 {
+        "checkpoint"
+    } else {
+        "checkpoints"
+    };
+    format!("{count} {word}")
+}
+
 /// A path's own identity for a project or a card: an `Unsaved` tab's own
 /// source folder, a sealed one's `.ffp` file -- what a later successful open
 /// of the same path clears a failure card by.
@@ -4035,12 +4056,10 @@ fn open_card_meta(frame_count: u32, checkpoints: usize, fusing_step: Option<&str
     if checkpoints == 0 {
         return format!("{frame_count} {frames} · no checkpoint yet");
     }
-    let checkpoint_word = if checkpoints == 1 {
-        "checkpoint"
-    } else {
-        "checkpoints"
-    };
-    format!("{frame_count} {frames} · {checkpoints} {checkpoint_word}")
+    format!(
+        "{frame_count} {frames} · {}",
+        checkpoint_phrase(checkpoints)
+    )
 }
 
 /// The skipped-subfolder notice's text, `None` when nothing was skipped --

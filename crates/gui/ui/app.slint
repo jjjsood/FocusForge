@@ -176,6 +176,10 @@ export component AppWindow inherits Window {
     // pane's not-yet-fused placeholder. Set from Rust alongside
     // `project-loaded` in `src/bridge.rs::push_projects`.
     in property <bool> composite-ready: false;
+    // The checkpoints panel's own line -- the active tab's checkpoint
+    // count, or the empty-state wording. Set from Rust alongside
+    // `composite-ready` in `src/bridge.rs::push_projects`.
+    in property <string> checkpoint-line: "None yet — fuse a stack";
     callback composite-undock-requested();
     callback zmap-undock-requested();
     // Forwarded from `FFCanvas`'s own callbacks of the same shape -- the
@@ -329,6 +333,7 @@ export component AppWindow inherits Window {
         mode: root.mode;
         dock-tab: root.dock-tab;
         project-loaded: root.project-loaded;
+        checkpoint-line: root.checkpoint-line;
         settings-rows: root.settings-rows;
         settings-sticky: root.settings-sticky;
         settings-scroll-y: root.settings-scroll-y;

@@ -802,7 +802,7 @@ fn dock_without_a_project_says_so() {
     let app = app_at(1440, 900);
 
     assert_eq!(
-        label(&app, "FFCheckpointPanel::checkpoint-empty-note"),
+        label(&app, "FFCheckpointPanel::checkpoint-note"),
         "None yet — fuse a stack"
     );
     assert_eq!(

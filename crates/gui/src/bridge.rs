@@ -430,6 +430,7 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     // tab switch or close never fires one of its own.
     app.set_project_loaded(controller.active_project().is_some());
     app.set_composite_ready(controller.composite_ready());
+    app.set_checkpoint_line(controller.checkpoint_panel_line().into());
     app.set_plus_selected(controller.plus_selected());
     app.set_skipped_notice(controller.notice().unwrap_or_default().into());
     // The active tab may have changed with no `JobChanged`/poll event of its
