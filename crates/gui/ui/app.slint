@@ -489,6 +489,7 @@ export component AppWindow inherits Window {
     callback projects-close-project-requested();
     in property <bool> projects-save-enabled: false;
     callback projects-save-project-requested();
+    callback projects-recent-clicked(int);
     out property <length> gallery-width: projects-overlay.gallery-width;
 
     projects-overlay := FFProjectsOverlay {
@@ -517,6 +518,7 @@ export component AppWindow inherits Window {
         open-project-requested => { root.projects-open-project-requested(); }
         close-project-requested => { root.projects-close-project-requested(); }
         save-project-requested => { root.projects-save-project-requested(); }
+        recent-clicked(i) => { root.projects-recent-clicked(i); }
     }
 
     settings-modal := FFSettingsModal {

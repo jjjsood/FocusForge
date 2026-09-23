@@ -30,6 +30,7 @@ export component FFProjectsOverlay inherits Rectangle {
     callback open-project-requested();
     callback close-project-requested();
     callback save-project-requested();
+    callback recent-clicked(int);
     out property <length> gallery-width: gallery.viewport-width;
 
     visible: root.overlay-open;
@@ -78,6 +79,7 @@ export component FFProjectsOverlay inherits Rectangle {
         open-project-requested => { root.open-project-requested(); }
         close-project-requested => { root.close-project-requested(); }
         save-project-requested => { root.save-project-requested(); }
+        recent-clicked(i) => { root.recent-clicked(i); }
     }
 
     Rectangle {

@@ -16,6 +16,7 @@ use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::input_config::Provenance;
 use focusforge_gui::input_map::{Action, Binding, InputTable, Modifiers, Trigger};
 use focusforge_gui::overlay::CardView;
+use focusforge_gui::recent::RecentEntry;
 use focusforge_gui::{AppController, ChromeKey, OpenOutcome};
 
 // ---------------------------------------------------------------------
@@ -791,6 +792,227 @@ fn recent_list_persists_and_caps_at_five() {
     let mut after_corrupt = AppController::new();
     after_corrupt.install_recent(recent::load(&corrupt_dir), corrupt_dir);
     assert!(after_corrupt.recent_rows(0).is_empty());
+}
+
+// ---------------------------------------------------------------------
+// A click on a `Recent` row opens what that row names.
+// ---------------------------------------------------------------------
+
+#[test]
+fn recent_row_opens_its_target() {
+    let project_path = seal_as_given_project("recent_open_target");
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("recent_open_target_scratch"));
+    controller.install_recent(
+        vec![RecentEntry {
+            name: "demo".to_string(),
+            folder: project_path.parent().unwrap().to_path_buf(),
+            path: Some(project_path.clone()),
+            opened_at: 0,
+        }],
+        tree("recent_open_target_config"),
+    );
+    controller.toggle_projects_overlay();
+    assert!(controller.projects_overlay_open());
+
+    let handle = controller
+        .open_recent(0)
+        .expect("a target with no open tab must start a load, same as `Open project…`");
+    handle.join().expect("the load worker did not panic");
+    let outcome = controller.settle_open();
+    assert!(
+        matches!(outcome, Some(OpenOutcome::Opened(_))),
+        "the same outcome `Open project…` gives for this target"
+    );
+
+    assert_eq!(
+        controller.project_tabs().len(),
+        1,
+        "the opened project is added as a tab"
+    );
+    assert_eq!(
+        controller.active_project(),
+        Some(0),
+        "the first opened project is selected"
+    );
+    assert!(
+        !controller.projects_overlay_open(),
+        "a successful open closes the overlay"
+    );
+}
+
+#[test]
+fn recent_row_switches_to_an_open_tab() {
+    let (mut controller, first_dir) = controller_with_frames_and_dir("recent_switch", 2);
+    open_frames(&mut controller, "recent_switch_second", 2);
+    assert_eq!(controller.active_project(), Some(1));
+
+    controller.install_recent(
+        vec![RecentEntry {
+            name: "first".to_string(),
+            folder: first_dir.clone(),
+            path: Some(first_dir),
+            opened_at: 0,
+        }],
+        tree("recent_switch_config"),
+    );
+    controller.toggle_projects_overlay();
+
+    assert!(
+        controller.open_recent(0).is_none(),
+        "a target already open in a tab starts no new load"
+    );
+    assert_eq!(
+        controller.active_project(),
+        Some(0),
+        "the click switches to the tab already holding that target"
+    );
+    assert_eq!(
+        controller.project_tabs().len(),
+        2,
+        "no second tab is opened for the same target"
+    );
+    assert!(
+        !controller.projects_overlay_open(),
+        "switching tabs closes the overlay too"
+    );
+}
+
+#[test]
+fn recent_row_missing_target_is_refused() {
+    let mut controller = controller_with_frames("recent_missing_target", 1);
+    let missing_dir = tree("recent_missing_target_gone");
+    std::fs::remove_dir_all(&missing_dir).expect("the target must exist, then vanish");
+    controller.install_recent(
+        vec![RecentEntry {
+            name: "gone".to_string(),
+            folder: missing_dir.clone(),
+            path: Some(missing_dir.clone()),
+            opened_at: 0,
+        }],
+        tree("recent_missing_target_config"),
+    );
+    controller.toggle_projects_overlay();
+    let tabs_before = controller.project_tabs();
+    let active_before = controller.active_project();
+
+    assert!(
+        controller.open_recent(0).is_none(),
+        "a missing target starts no worker"
+    );
+    assert_eq!(
+        controller.project_tabs(),
+        tabs_before,
+        "the tab list is unchanged"
+    );
+    assert_eq!(
+        controller.active_project(),
+        active_before,
+        "the active tab is unchanged"
+    );
+
+    let mut baseline = AppController::new();
+    baseline.open_paths(&[missing_dir]);
+    assert_eq!(
+        controller.last_refusal(),
+        baseline.last_refusal(),
+        "the same refusal `open_paths` raises for the same missing path"
+    );
+}
+
+#[test]
+fn recent_row_out_of_range_or_busy_is_ignored() {
+    let mut controller = controller_with_frames("recent_out_of_range", 1);
+    controller.install_recent(
+        vec![RecentEntry {
+            name: "only".to_string(),
+            folder: tree("recent_out_of_range_folder"),
+            path: None,
+            opened_at: 0,
+        }],
+        tree("recent_out_of_range_config"),
+    );
+    let tabs_before = controller.project_tabs();
+    let active_before = controller.active_project();
+
+    assert!(
+        controller.open_recent(5).is_none(),
+        "an index past the end of the list starts no worker"
+    );
+    assert_eq!(controller.project_tabs(), tabs_before);
+    assert_eq!(controller.active_project(), active_before);
+
+    let busy_dir = tree("recent_out_of_range_busy_target");
+    copy_frame(&busy_dir, "00.tif", 0);
+    let second_dir = tree("recent_out_of_range_second_target");
+    copy_frame(&second_dir, "00.tif", 1);
+    let mut busy_controller = AppController::new();
+    busy_controller.set_scratch_root_for_test(tree("recent_out_of_range_busy_scratch"));
+    busy_controller.install_recent(
+        vec![RecentEntry {
+            name: "second".to_string(),
+            folder: second_dir.clone(),
+            path: Some(second_dir),
+            opened_at: 0,
+        }],
+        tree("recent_out_of_range_busy_config"),
+    );
+    let handle = busy_controller
+        .open_paths(&[busy_dir])
+        .expect("the first load must start");
+
+    assert!(
+        busy_controller.open_recent(0).is_none(),
+        "a click while a load is in flight starts no second worker"
+    );
+    assert!(
+        busy_controller.project_tabs().is_empty(),
+        "the dropped click adds no tab"
+    );
+
+    handle.join().expect("the load worker did not panic");
+    busy_controller.settle_open();
+}
+
+#[test]
+fn recent_file_without_path_still_opens() {
+    use focusforge_gui::recent;
+
+    let frames_dir = tree("recent_no_path_frames");
+    copy_frame(&frames_dir, "00.tif", 0);
+
+    let config_dir = tree("recent_no_path_config");
+    std::fs::write(
+        config_dir.join("recent.toml"),
+        format!(
+            "[[entries]]\nname = \"legacy\"\nfolder = {:?}\nopened_at = 0\n",
+            frames_dir
+        ),
+    )
+    .unwrap();
+
+    let entries = recent::load(&config_dir);
+    assert_eq!(entries.len(), 1, "an old-format file still loads its row");
+    assert_eq!(
+        entries[0].path, None,
+        "no `path` field means `None`, not a parse failure"
+    );
+
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("recent_no_path_scratch"));
+    controller.install_recent(entries, config_dir);
+    controller.toggle_projects_overlay();
+
+    let handle = controller
+        .open_recent(0)
+        .expect("a row with no `path` still starts a load, by `folder`");
+    handle.join().expect("the load worker did not panic");
+    let outcome = controller.settle_open();
+    assert!(
+        matches!(outcome, Some(OpenOutcome::Opened(_))),
+        "the folder opens the same as any other target"
+    );
+    assert_eq!(controller.project_tabs().len(), 1);
 }
 
 // ---------------------------------------------------------------------

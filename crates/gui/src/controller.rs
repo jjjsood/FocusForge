@@ -1504,7 +1504,12 @@ impl AppController {
                 .unwrap_or(0);
             for project in &opened.projects {
                 self.clear_failure(&project_identity_path(project));
-                self.record_recent(entry::tab_title(project), recent_folder(project), opened_at);
+                self.record_recent(
+                    entry::tab_title(project),
+                    recent_folder(project),
+                    Some(project_identity_path(project)),
+                    opened_at,
+                );
                 if let GuiProject::Opened(p) = project
                     && p.unresolved_sources().next().is_some()
                 {
@@ -1736,15 +1741,45 @@ impl AppController {
             .collect()
     }
 
-    /// Records `name`/`folder` at the front of the `Recent` list and
+    /// Records `name`/`folder`/`path` at the front of the `Recent` list and
     /// persists it, if a config directory resolved at startup. A write
     /// failure is silent: the `Recent` list is a convenience, never a
     /// reason to interrupt an open.
-    fn record_recent(&mut self, name: String, folder: PathBuf, opened_at: i64) {
-        recent::record(&mut self.state.recent, name, folder, opened_at);
+    fn record_recent(
+        &mut self,
+        name: String,
+        folder: PathBuf,
+        path: Option<PathBuf>,
+        opened_at: i64,
+    ) {
+        recent::record(&mut self.state.recent, name, folder, path, opened_at);
         if let Some(dir) = &self.state.recent_config_dir {
             let _ = recent::save(dir, &self.state.recent);
         }
+    }
+
+    /// Opens the `Recent` row at `index`: an already-open tab for that
+    /// target is selected instead of opened again, closing the overlay the
+    /// same as a fresh open; otherwise the target is opened through
+    /// [`Self::open_paths`], which itself refuses a target that no longer
+    /// exists. A no-op, starting no worker, when `index` is out of range or
+    /// a load is already in flight.
+    pub fn open_recent(&mut self, index: usize) -> Option<std::thread::JoinHandle<()>> {
+        if self.state.load.in_flight {
+            return None;
+        }
+        let entry = self.state.recent.get(index)?;
+        let target = entry.path.clone().unwrap_or_else(|| entry.folder.clone());
+        if let Some(tab_index) = self
+            .state
+            .projects
+            .iter()
+            .position(|t| project_identity_path(&t.project) == target)
+        {
+            self.select_project(tab_index);
+            return None;
+        }
+        self.open_paths(&[target])
     }
 
     /// Whether the projects overlay is open.

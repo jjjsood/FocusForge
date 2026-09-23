@@ -909,6 +909,27 @@ fn open_from_picker(
     );
 }
 
+/// Opens the `Recent` row at `index` through [`AppController::open_recent`]
+/// and repaints once it settles -- covers a fresh load, an in-place tab
+/// switch and a no-op alike, the same polling tail [`open_from_picker`]
+/// uses.
+fn open_recent(
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+    app_weak: &slint::Weak<AppWindow>,
+    load_timer: &Rc<RefCell<Option<slint::Timer>>>,
+    index: usize,
+) {
+    controller.lock().unwrap().open_recent(index);
+    start_load_timer(
+        app_weak.clone(),
+        controller.clone(),
+        canvas.clone(),
+        load_timer,
+        Vec::new(),
+    );
+}
+
 /// Saves the active tab's held checkpoints -- `Save project` and its
 /// `Ctrl+S` twin. A failed save closes the projects overlay, so the failure
 /// toast that waits behind it shows at once.
@@ -1765,6 +1786,15 @@ pub fn install(
             dispatch(&controller, &canvas, &app_weak, |controller| {
                 controller.select_gallery_card(i as usize);
             })
+        }
+    });
+    app.on_projects_recent_clicked({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        let load_timer = load_timer.clone();
+        move |i| {
+            open_recent(&controller, &canvas, &app_weak, &load_timer, i as usize);
         }
     });
     app.on_projects_card_close_clicked({

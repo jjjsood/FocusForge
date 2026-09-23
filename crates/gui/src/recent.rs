@@ -17,6 +17,11 @@ pub const MAX_ENTRIES: usize = 5;
 pub struct RecentEntry {
     pub name: String,
     pub folder: PathBuf,
+    /// The exact path a click on this row reopens: a project's own `.ffp`,
+    /// or an unsaved group's source folder. `None` for a row written before
+    /// this field existed, which a click reopens by `folder` instead.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
     /// Unix seconds.
     pub opened_at: i64,
 }
@@ -53,14 +58,26 @@ pub fn save(config_dir: &Path, entries: &[RecentEntry]) -> std::io::Result<()> {
 }
 
 /// Records a fresh open at the front of `entries`, dropping any existing
-/// entry for the same folder and capping the result at [`MAX_ENTRIES`].
-pub fn record(entries: &mut Vec<RecentEntry>, name: String, folder: PathBuf, opened_at: i64) {
-    entries.retain(|e| e.folder != folder);
+/// entry for the same target and capping the result at [`MAX_ENTRIES`].
+/// Two entries name the same target when both carry a `path` and those
+/// match; otherwise their `folder`s are compared.
+pub fn record(
+    entries: &mut Vec<RecentEntry>,
+    name: String,
+    folder: PathBuf,
+    path: Option<PathBuf>,
+    opened_at: i64,
+) {
+    entries.retain(|e| match (&path, &e.path) {
+        (Some(p), Some(ep)) => ep != p,
+        _ => e.folder != folder,
+    });
     entries.insert(
         0,
         RecentEntry {
             name,
             folder,
+            path,
             opened_at,
         },
     );

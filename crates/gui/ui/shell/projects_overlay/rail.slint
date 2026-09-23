@@ -61,9 +61,15 @@ component FFRailAction inherits Rectangle {
 
 component FFRecentRow inherits Rectangle {
     in property <RecentRowView> view;
+    callback triggered();
 
     height: 46px;
 
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.triggered(); }
+    }
     Text {
         text: root.view.name;
         color: Theme.text-primary;
@@ -106,6 +112,7 @@ export component FFProjectsRail inherits Rectangle {
     callback open-project-requested();
     callback save-project-requested();
     callback close-project-requested();
+    callback recent-clicked(int);
 
     background: transparent;
 
@@ -170,5 +177,6 @@ export component FFProjectsRail inherits Rectangle {
         y: 222px + i * 46px;
         width: parent.width;
         view: row;
+        triggered => { root.recent-clicked(i); }
     }
 }
