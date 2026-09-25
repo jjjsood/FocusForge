@@ -5,7 +5,7 @@
 //! A project is a zip holding exactly three kinds of entry:
 //!
 //! ```text
-//! $ unzip -l mantis-512.ffproj        # a real run over fixtures/mantis-512
+//! $ unzip -l mantis-512.ffp   # a real run over fixtures/mantis-512
 //!   Length      Date    Time    Name
 //! ---------  ---------- -----   ----
 //!      3804  1980-01-01 00:00   manifest.json
@@ -51,6 +51,7 @@
 //! Nothing here prints. Unresolved sources come back as **data**
 //! ([`Project::unresolved_sources`]) and reporting them is the CLI's.
 
+pub mod append;
 pub mod blob;
 pub mod checkpoint;
 pub mod container;
@@ -62,7 +63,9 @@ pub mod seal;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
+pub use append::{AppendRequest, append, append_at};
 pub use blob::{Plane, StagedBlob, hash_file, short_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, Op, Point};
 pub use container::{ProjectWriter, partial_path};
@@ -72,9 +75,127 @@ pub use manifest::{
     SourceResolution,
 };
 pub use review::ReviewMetrics;
-pub use seal::{SealRequest, SealedProject, seal, seal_at};
+pub use seal::{HeldCheckpoint, SealRequest, SealedProject, seal, seal_at, seal_held};
 
+/// Decompresses `which` into an uncompressed TIFF (the composite) or Z-Map
+/// file at `path`: writes a `.partial` sibling first and renames it onto
+/// `path` only once [`Project::read_plane_into`] has verified the blob's
+/// hash, so a tampered blob leaves nothing behind rather than a corrupt
+/// image.
+pub fn materialize_plane(
+    project: &mut Project,
+    which: Plane,
+    path: &Path,
+) -> Result<(), ProjectError> {
+    let plane_ref = project.plane(which).clone();
+    let partial = partial_path(path);
+    match which {
+        Plane::Composite => {
+            let writer = crate::io::TiffWriter::create(
+                &partial,
+                crate::io::TiffSpec {
+                    width: plane_ref.width,
+                    height: plane_ref.height,
+                    samples_per_pixel: plane_ref.samples_per_pixel,
+                    description: Some(plane_ref.description.clone()),
+                },
+            )
+            .map_err(|err| ProjectError::container(&partial, err))?;
+            stream_plane(project, which, &partial, path, writer)
+        }
+        Plane::ZMap => {
+            let info = crate::zmap::ZMapInfo::new(
+                plane_ref.width,
+                plane_ref.height,
+                plane_ref.frame_count,
+            )
+            .map_err(|err| ProjectError::container(&partial, err))?;
+            let writer = crate::zmap::ZMapWriter::create(&partial, info)
+                .map_err(|err| ProjectError::container(&partial, err))?;
+            stream_plane(project, which, &partial, path, writer)
+        }
+    }
+}
+
+/// The `finish()`/`write_tile()` half of both writers [`materialize_plane`]
+/// drives, so the streaming loop below has one shape rather than two
+/// near-copies.
+trait PlaneWriter {
+    fn write_tile(&mut self, rect: crate::io::Rect, samples: &[u16]) -> Result<(), String>;
+    fn finish(self) -> Result<(), String>;
+}
+
+impl PlaneWriter for crate::io::TiffWriter<std::fs::File> {
+    fn write_tile(&mut self, rect: crate::io::Rect, samples: &[u16]) -> Result<(), String> {
+        crate::io::TiffWriter::write_tile(self, rect, samples).map_err(|err| err.to_string())
+    }
+    fn finish(self) -> Result<(), String> {
+        crate::io::TiffWriter::finish(self).map_err(|err| err.to_string())
+    }
+}
+
+impl PlaneWriter for crate::zmap::ZMapWriter<std::fs::File> {
+    fn write_tile(&mut self, rect: crate::io::Rect, samples: &[u16]) -> Result<(), String> {
+        crate::zmap::ZMapWriter::write_tile(self, rect, samples).map_err(|err| err.to_string())
+    }
+    fn finish(self) -> Result<(), String> {
+        crate::zmap::ZMapWriter::finish(self).map_err(|err| err.to_string())
+    }
+}
+
+fn stream_plane<W: PlaneWriter>(
+    project: &mut Project,
+    which: Plane,
+    partial: &Path,
+    final_path: &Path,
+    mut writer: W,
+) -> Result<(), ProjectError> {
+    let mut failure: Option<String> = None;
+    let read = project.read_plane_into(which, &mut |band, rect| {
+        if failure.is_some() {
+            return;
+        }
+        if let Err(err) = writer.write_tile(rect, band) {
+            failure = Some(err);
+        }
+    });
+    let outcome = read.and_then(|()| match failure {
+        Some(err) => Err(ProjectError::container(final_path, err)),
+        None => writer
+            .finish()
+            .map_err(|err| ProjectError::container(final_path, err)),
+    });
+    let outcome = outcome.and_then(|()| {
+        std::fs::rename(partial, final_path).map_err(|err| ProjectError::io(final_path, err))
+    });
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(partial);
+    }
+    outcome
+}
+
+use crate::params::{ParamDesc, ParamKind, ParamValue};
 use crate::tile::Rect;
+
+/// The project-level parameter schema: values that describe how a project
+/// was prepared rather than any one algorithm's own settings. One
+/// descriptor today, `auto-crop`, a project value rather than an algorithm
+/// parameter -- rendered by the GUI's settings panel through the same
+/// generator every algorithm's schema goes through, and read by
+/// `focusforge-cli stack`'s `--no-crop` flag so the two never drift.
+pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
+    vec![ParamDesc {
+        id: "auto-crop".to_string(),
+        label: "Auto-crop".to_string(),
+        help: "Trims the composite and Z-Map to the region every aligned \
+               frame actually covers. Off keeps the full frame extent."
+            .to_string(),
+        kind: ParamKind::Bool,
+        default: ParamValue::Bool(true),
+        auto: None,
+        host_default: None,
+    }]
+});
 
 /// The on-disk format version this build writes and reads. A project
 /// declaring a **higher** one is refused by name rather than
@@ -82,7 +203,7 @@ use crate::tile::Rect;
 pub const FORMAT_VERSION: u32 = 1;
 
 /// The project file's extension.
-pub const PROJECT_EXTENSION: &str = "ffproj";
+pub const PROJECT_EXTENSION: &str = "ffp";
 
 /// The content-hash algorithm, named in every manifest rather than implied.
 pub const HASH_ALGORITHM: &str = "blake3";
@@ -93,7 +214,7 @@ pub const HASH_ALGORITHM: &str = "blake3";
 const READ_BAND_BYTES: usize = 4 << 20;
 
 /// A project opened for reading: enough to prove the round-trip and to drive
-/// `focusforge-cli export`. Editing is not implemented by this type.
+/// `focusforge-cli export`. The GUI editor opens one for editing.
 pub struct Project {
     path: PathBuf,
     archive: zip::ZipArchive<File>,
@@ -141,6 +262,12 @@ impl Project {
 
     pub fn checkpoint(&self) -> &Checkpoint {
         &self.checkpoint
+    }
+
+    /// The whole checkpoint chain, head first, walking [`Checkpoint::parent`]
+    /// down to the original parentless one.
+    pub fn checkpoint_chain(&mut self) -> Result<Vec<Checkpoint>, ProjectError> {
+        checkpoint_chain_from(&mut self.archive, &self.path, &self.checkpoint.id)
     }
 
     /// Where one recorded source is looked for: relative to the project's
@@ -277,7 +404,7 @@ impl Project {
     }
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(
+pub(super) fn read_json<T: serde::de::DeserializeOwned>(
     archive: &mut zip::ZipArchive<File>,
     path: &Path,
     entry: &str,
@@ -290,4 +417,51 @@ fn read_json<T: serde::de::DeserializeOwned>(
         .map_err(|source| ProjectError::io(path, source))?;
     serde_json::from_str(&text)
         .map_err(|err| ProjectError::container(path, format!("{entry}: {err}")))
+}
+
+/// The checkpoint chain reachable from `head_id`, head first: walks
+/// [`Checkpoint::parent`] down to the original parentless checkpoint. A
+/// repeated id names itself in a [`ProjectError::Container`] rather than
+/// looping forever.
+fn checkpoint_chain_from(
+    archive: &mut zip::ZipArchive<File>,
+    path: &Path,
+    head_id: &str,
+) -> Result<Vec<Checkpoint>, ProjectError> {
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut current_id = head_id.to_string();
+    loop {
+        if !seen.insert(current_id.clone()) {
+            return Err(ProjectError::container(
+                path,
+                format!("checkpoint chain names {current_id} more than once"),
+            ));
+        }
+        let checkpoint: Checkpoint =
+            read_json(archive, path, &format!("checkpoints/{current_id}.json"))?;
+        let parent = checkpoint.parent.clone();
+        chain.push(checkpoint);
+        match parent {
+            Some(next) => current_id = next,
+            None => return Ok(chain),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_params_holds_exactly_one_auto_crop_bool_descriptor() {
+        assert_eq!(PROJECT_PARAMS.len(), 1);
+        let desc = &PROJECT_PARAMS[0];
+        assert_eq!(desc.id, "auto-crop");
+        assert_eq!(desc.label, "Auto-crop");
+        assert_eq!(desc.kind, ParamKind::Bool);
+        assert_eq!(desc.default, ParamValue::Bool(true));
+        assert!(desc.auto.is_none());
+        assert!(desc.host_default.is_none());
+    }
 }

@@ -48,9 +48,8 @@ pub enum GpuError {
     TileTooLarge { detail: String },
 
     /// A readback (`crate::transfer::download_buffer`/`download_f32`)
-    /// failed: `device.poll` itself failed, the `map_async` callback never
-    /// fired, or the mapping it delivered was an error -- three panics
-    /// turned into one named, recoverable value.
+    /// failed: `device.poll` failed, the `map_async` callback never fired,
+    /// or the mapping it delivered was an error.
     #[error("readback failed: {detail}")]
     Readback { detail: String },
 
@@ -81,13 +80,9 @@ impl GpuError {
         }
     }
 
-    /// Builds a [`GpuError::TileTooLarge`] naming the shortfall
-    /// (`describe_shortfalls`, so the message names the limit, the
-    /// requested size and the device's own limit -- `shared.limits()` is
-    /// what wgpu actually validates against) plus the adapter's own
-    /// headroom (`adapter_limits`) and the place to raise it
-    /// (`crate::limits::required_limits`), so a refusal never reads as "some
-    /// buffer was too big" with no path forward.
+    /// Builds a [`GpuError::TileTooLarge`] naming each shortfall against the
+    /// device's limits (what wgpu validates), plus the adapter's headroom and
+    /// `crate::limits::required_limits` as the place to raise it.
     pub fn tile_too_large(shortfalls: &[LimitShortfall], adapter_limits: &wgpu::Limits) -> Self {
         GpuError::TileTooLarge {
             detail: format!(
@@ -179,12 +174,28 @@ impl SharedDevice {
     }
 
     /// What the adapter could offer if [`crate::limits::required_limits`]
-    /// were ever raised -- reported as headroom in the device-budget's
-    /// refusal message, never as the threshold itself (that is [`Self::limits`]).
-    /// `wgpu::Limits` by value, the same way `adapter.limits()` is already
-    /// used at `init`'s own shortfall check, above.
+    /// were raised: headroom for the refusal message, never the threshold
+    /// itself (that is [`Self::limits`]).
     pub fn adapter_limits(&self) -> wgpu::Limits {
         self.adapter.limits()
+    }
+
+    /// Whether this device has been lost. wgpu queues the device-lost
+    /// callback and only runs it from a later poll, so this polls first for
+    /// the freshest answer before reading the flag the callback set.
+    pub fn lost(&self) -> bool {
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        crate::errors::device_lost()
+    }
+
+    /// Destroys the device and polls once, so the device-lost callback --
+    /// queued rather than run synchronously by `destroy` -- has already
+    /// fired by the time this returns. For driving a loss in a test session
+    /// that never dispatches a kernel, where nothing else would ever poll.
+    #[cfg(feature = "gpu-tests")]
+    pub fn force_loss(&self) {
+        self.device.destroy();
+        let _ = self.device.poll(wgpu::PollType::Poll);
     }
 }
 

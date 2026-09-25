@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A glyph button: transparent at rest, `Theme.surface-hover` under the
+// pointer, one centred icon, `Theme.radius-sm` corners.
+
+import { Theme } from "../theme.slint";
+
+export component FFIconButton inherits Rectangle {
+    in property <image> icon;
+    in property <length> glyph-size: Theme.icon-md;
+    in property <length> pad: Theme.space-2;
+    // Half opacity and inert while false -- there is nothing this button can
+    // do.
+    in property <bool> enabled: true;
+    // Whether the pointer lifts the glyph to `Theme.text-primary` -- off for
+    // a glyph that must read the same colour at rest and under the pointer.
+    in property <bool> recolor-on-hover: true;
+    callback triggered();
+
+    width: root.glyph-size + 2 * root.pad;
+    height: self.width;
+    background: area.has-hover && root.enabled ? Theme.surface-hover : transparent;
+    border-radius: Theme.radius-sm;
+    opacity: root.enabled ? 1.0 : 0.5;
+    accessible-role: button;
+    accessible-enabled: root.enabled;
+
+    area := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.triggered(); }
+    }
+    Image {
+        source: root.icon;
+        colorize: root.recolor-on-hover && area.has-hover && root.enabled
+            ? Theme.text-primary
+            : Theme.text-secondary;
+        width: root.glyph-size;
+        height: root.glyph-size;
+    }
+}

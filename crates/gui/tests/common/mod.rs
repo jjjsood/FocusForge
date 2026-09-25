@@ -4,8 +4,18 @@
 //! from `CARGO_MANIFEST_DIR`, the idiom `crates/core/tests/common/mod.rs`
 //! already established -- never a literal `../..` string.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use focusforge_gui::{AppController, OpenAs, OpenOutcome};
+
+#[path = "../../../core/tests/common/reference_stack.rs"]
+mod reference_stack;
+#[allow(unused_imports)]
+pub use reference_stack::reference_stack_dir;
 
 /// `crates/gui/../..` -- the workspace root.
 pub fn workspace_root() -> PathBuf {
@@ -82,6 +92,62 @@ fn find_files_with_extension(dir: &Path, ext: &str) -> Vec<PathBuf> {
     out
 }
 
+/// `fixtures/<set>/frames/<index>.tif` -- `set` names a fixture directory
+/// under `fixtures/` (`"mantis-64"`, `"mantis-512"`), `index` the frame's own
+/// two-digit position in it.
+#[allow(dead_code)]
+pub fn fixture_frame(set: &str, index: usize) -> PathBuf {
+    workspace_root()
+        .join("fixtures")
+        .join(set)
+        .join("frames")
+        .join(format!("{index:02}.tif"))
+}
+
+/// A fresh, empty renderer cell for `bridge::install`, with no project's
+/// planes loaded yet.
+#[allow(dead_code)]
+pub fn empty_canvas() -> Rc<RefCell<focusforge_gui::bridge::Canvas>> {
+    Rc::new(RefCell::new(focusforge_gui::bridge::Canvas::default()))
+}
+
+/// A fresh, empty directory under `CARGO_TARGET_TMPDIR`, named `name` --
+/// removed first if an earlier run left one behind.
+#[allow(dead_code)]
+pub fn tree(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp tree must be creatable");
+    dir
+}
+
+/// Polls `settle_job` until it returns or no work is pending any more,
+/// returning the materialized plane paths from the call that actually
+/// settled it (if any). Tracks the worker/queue directly, not the active
+/// tab's own view of them, so this still waits out a run on a tab other than
+/// the one selected. The window's own timer does exactly this poll, just on
+/// a Slint `Timer` instead of a plain loop.
+#[allow(dead_code)]
+pub fn wait_for_settle(
+    controller: &mut focusforge_gui::AppController,
+    timeout: Duration,
+) -> Option<(PathBuf, PathBuf)> {
+    let start = Instant::now();
+    loop {
+        if let Some(planes) = controller.settle_job() {
+            return Some(planes);
+        }
+        if !controller.work_pending() {
+            return None;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "job did not settle within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// The built GUI, with `FOCUSFORGE_DATA_DIR` pointed at a fresh directory
 /// under `CARGO_TARGET_TMPDIR`, named for `test_name` and this process --
 /// mirrors `crates/cli/tests/common/mod.rs::cli_bin`, so a windowed test run
@@ -94,4 +160,62 @@ pub fn gui_bin(test_name: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_focusforge-gui"));
     cmd.env("FOCUSFORGE_DATA_DIR", &data_dir);
     cmd
+}
+
+/// `true` when this host can plausibly open a window -- a test that opens
+/// the real binary's window skips with an explicit line rather than
+/// reddening `cargo test --workspace` on a headless gate host.
+#[allow(dead_code)]
+pub fn has_display() -> bool {
+    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+/// Starts a load, blocks until its worker finishes, and settles it --
+/// `AppController::open_paths` runs off-thread, so a test that needs the
+/// outcome synchronously waits for it here.
+#[allow(dead_code)]
+pub fn open_and_settle(controller: &mut AppController, paths: &[PathBuf]) -> OpenOutcome {
+    if let Some(handle) = controller.open_paths(paths) {
+        handle.join().expect("the load worker did not panic");
+    }
+    controller
+        .settle_open()
+        .expect("a load was started, so one outcome is parked")
+}
+
+/// Answers the pending grouping question, blocks until its worker finishes,
+/// and settles it -- `AppController::answer_question` runs off-thread too,
+/// the same as [`open_and_settle`].
+#[allow(dead_code)]
+pub fn answer_and_settle(controller: &mut AppController, answer: OpenAs) -> OpenOutcome {
+    if let Some(handle) = controller.answer_question(answer) {
+        handle.join().expect("the load worker did not panic");
+    }
+    controller
+        .settle_open()
+        .expect("a load was started, so one outcome is parked")
+}
+
+/// A `<root>/focusforge` data directory holding roughly `total_log_bytes`
+/// across a live log and three rotated siblings, one JSON Lines record per
+/// line, plus one crash report -- large enough that a synchronous manifest
+/// scan over it costs measurable time.
+#[allow(dead_code)]
+pub fn seed_large_diagnostics_dir(root: &Path, total_log_bytes: usize) -> PathBuf {
+    let data = root.join("focusforge");
+    std::fs::create_dir_all(data.join("logs")).unwrap();
+    std::fs::create_dir_all(data.join("crashes")).unwrap();
+    let line = "{\"level\":\"INFO\",\"target\":\"focusforge_gui\",\"message\":\"tick\"}\n";
+    let lines_per_file = (total_log_bytes / 4) / line.len();
+    let content = line.repeat(lines_per_file);
+    std::fs::write(data.join("logs/focusforge.jsonl"), &content).unwrap();
+    for n in 1..=3 {
+        std::fs::write(data.join(format!("logs/focusforge.{n}.jsonl")), &content).unwrap();
+    }
+    std::fs::write(
+        data.join("crashes/20260918T010203Z-focusforge-gui-1.dmp"),
+        b"MDMP",
+    )
+    .unwrap();
+    data
 }

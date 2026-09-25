@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// One field's violation message, dropped in beside it.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFErrorRow inherits Text {
+    in property <string> message: "";
+    text: root.message;
+    color: Theme.status-failure;
+    font-size: Theme.text-section.size;
+    height: ShellGeometry.param-error-height;
+    vertical-alignment: center;
+    overflow: elide;
+
+    // Starts invisible and fades to full opacity once this instance actually
+    // mounts (a fresh error arriving via the `if row.kind == "error"` in
+    // `settings_panel.slint`, which drops in a new `FFErrorRow`, not an
+    // existing one changing its `message`), so a new error fades in rather
+    // than popping into place.
+    opacity: 0;
+    animate opacity { duration: Theme.motion-fast; easing: ease-out; }
+    init => { self.opacity = 1; }
+}

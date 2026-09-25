@@ -29,6 +29,15 @@ pub struct JobProgress {
     /// `end_segment` bracket exactly one segment's own elapsed time).
     pub running: Duration,
     pub eta: Option<Duration>,
+    /// How many frames' registration has completed during the align stage.
+    /// `0` outside a computed alignment (no align stage, a cached alignment,
+    /// or a resumed one) -- the counter is never reset once the stage ends,
+    /// so a snapshot taken during a later stage still carries the align
+    /// stage's own final tally.
+    pub align_done: usize,
+    /// The frame count a computed align stage started with, `0` when no
+    /// frame is being counted.
+    pub align_total: usize,
 }
 
 /// Area-weighted mean ETA:

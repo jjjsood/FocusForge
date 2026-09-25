@@ -13,7 +13,7 @@ focusforge-cli stack path/to/frames/ --algo laplacian
 of it when one exists. `--algo` picks the algorithm; see
 [`reference/cli.md`](../reference/cli.md#algorithms) for the full list and
 [`reference/cli.md`](../reference/cli.md#stack) for every flag. The project
-is written beside the frames as `<dir>/<dir-name>.ffproj`, or collected into
+is written beside the frames as `<dir>/<dir-name>.ffp`, or collected into
 a directory named with `-o`/`--output` — see
 [`guide/batch-runs.md`](batch-runs.md) for a folder holding more than one
 stack.
@@ -26,7 +26,7 @@ turn it off.
 ## Getting an image back
 
 ```bash
-focusforge-cli export path/to/frames/frames.ffproj -o out.tif --zmap zmap.tif
+focusforge-cli export path/to/frames/frames.ffp -o out.tif --zmap zmap.tif
 ```
 
 `export` reads a project and writes the composite (`-o`), the Z-Map
@@ -62,7 +62,7 @@ to write it out:
 
 ```bash
 focusforge-cli stack path/to/frames/ --algo depth-map
-focusforge-cli export path/to/frames/frames.ffproj --zmap zmap.tif
+focusforge-cli export path/to/frames/frames.ffp --zmap zmap.tif
 ```
 
 ## Using the GPU

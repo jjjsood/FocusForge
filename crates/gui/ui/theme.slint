@@ -6,6 +6,8 @@ import "../../../assets/fonts/Inter-Regular.ttf";
 import "../../../assets/fonts/Inter-Medium.ttf";
 import "../../../assets/fonts/Inter-SemiBold.ttf";
 
+// Not exported: the raw ramp stays unreachable from any other .slint file
+// or from Rust.
 global Primitives {
     // Neutral ramp (Darkroom, Ramp A, Deep) -- 12 steps.
     out property <color> neutral-950: #080808;
@@ -21,7 +23,7 @@ global Primitives {
     out property <color> neutral-100: #C8C8C8;
     out property <color> neutral-50: #F2F2F2;
 
-    // Accent ramp (orange) -- unchanged from assets/logo.svg.
+    // Accent ramp (orange) -- matching assets/logo.svg.
     out property <color> orange-400: #F08A55;
     out property <color> orange-500: #E8763A;
     out property <color> orange-600: #C85F28;
@@ -33,6 +35,8 @@ global Primitives {
     out property <color> green-500: #5AA469;
 }
 
+// No field sizes a control to fit an English string; `EnumVariant.label`
+// must stay free to translate to any length.
 export struct TypeRole {
     size: length,
     weight: int,
@@ -41,6 +45,11 @@ export struct TypeRole {
     uppercase: bool,
 }
 
+// Exported: every semantic colour is initialised from a `Primitives`
+// member, never from a hex literal directly. A token name's dots become
+// dashes and any internal camelCase becomes kebab-case, so
+// `text.onAccent` -> `text-on-accent`, which Slint's codegen turns into
+// `get_text_on_accent()` on the Rust side.
 export global Theme {
     // Surfaces
     out property <color> surface-canvas: Primitives.neutral-950;
@@ -113,8 +122,14 @@ export global Theme {
     out property <length> icon-lg: 20px;
     out property <length> icon-md: 16px;
     out property <length> icon-sm: 14px;
+
+    // Motion animates the tab strip's scroll. An easing cannot be a
+    // property, so every `animate` using motion-fast pairs it with ease-out.
+    out property <duration> motion-fast: 150ms;
+    // A slower fade for a notice that must be readable while it moves, not
+    // just acknowledged -- the failure toast's own appear/disappear.
+    out property <duration> motion-slow: 400ms;
 }
 
-// Empty on purpose: a handle so a test can reach a global. No UI surface
-// yet.
+// Empty on purpose: a handle so a test can reach a global.
 export component ThemeProbe inherits Window { }

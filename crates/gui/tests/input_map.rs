@@ -14,20 +14,20 @@ use std::sync::{Arc, Mutex};
 
 use focusforge_gui::input_map::InputTable;
 use focusforge_gui::input_map::{
-    Action, ActionEvent, Button, DEFAULT_BINDINGS, Modifiers, PointerKind, Trigger,
+    Action, ActionEvent, Binding, Button, DEFAULT_BINDINGS, Modifiers, PointerKind, Trigger,
 };
 use focusforge_gui::{AppController, ShellEvent, ShellMode, input_config};
 
 const NONE: Modifiers = Modifiers::NONE;
 
-type EventSink = Box<dyn Fn(ShellEvent) + Send + Sync>;
+type EventSink = Arc<dyn Fn(ShellEvent) + Send + Sync>;
 
 fn sink() -> (Arc<Mutex<Vec<ShellEvent>>>, EventSink) {
     let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_events = events.clone();
     (
         events,
-        Box::new(move |event| sink_events.lock().unwrap().push(event)),
+        Arc::new(move |event| sink_events.lock().unwrap().push(event)),
     )
 }
 
@@ -278,9 +278,8 @@ fn partial_out_of_order_single_row_config_leaves_other_rows_at_default() {
     );
 
     // Every other default trigger, including `wheel` itself, must resolve
-    // exactly as the defaults do -- this is the assertion that fails under
-    // the old positional merge, which clobbered `bindings[0]` (`wheel`)
-    // even though the file's one row named `alt+wheel`.
+    // exactly as the defaults do: the file's one custom row names
+    // `alt+wheel`, leaving plain `wheel` still bound to its default action.
     for binding in defaults.bindings.iter() {
         if binding.trigger == (Trigger::Wheel(Modifiers { alt: true, ..NONE })) {
             continue;
@@ -766,14 +765,85 @@ fn key_rows_resolve_with_their_modifiers() {
 }
 
 #[test]
+fn undo_and_redo_are_blocked_under_the_settings_modal() {
+    let mut editor = AppController::new_with_mode_for_test(ShellMode::Editor);
+    let (events, cb) = sink();
+    editor.set_sink(cb);
+
+    editor.open_settings();
+    editor.key(true, "z", Modifiers { ctrl: true, ..NONE });
+    editor.key(
+        true,
+        "z",
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            ..NONE
+        },
+    );
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "the default undo/redo chords must raise no event under Settings"
+    );
+    assert!(
+        editor.unimplemented_actions().is_empty(),
+        "a blocked fire is not recorded as unimplemented either"
+    );
+
+    // A custom binding of undo is blocked too, whatever key it is bound to.
+    let mut table = InputTable::default();
+    table.bindings.push(Binding {
+        trigger: Trigger::Key {
+            key: 'y',
+            mods: Modifiers { ctrl: true, ..NONE },
+        },
+        stacking: None,
+        editor: Some(Action::Undo),
+    });
+    editor.install_input_table(table, input_config::Provenance::Defaults);
+    editor.key(true, "y", Modifiers { ctrl: true, ..NONE });
+    assert!(events.lock().unwrap().is_empty());
+    assert!(editor.unimplemented_actions().is_empty());
+
+    editor.close_settings();
+    editor.key(true, "z", Modifiers { ctrl: true, ..NONE });
+    {
+        let got = events.lock().unwrap();
+        assert!(matches!(
+            &got[0],
+            ShellEvent::Input(ActionEvent::Fired {
+                action: Action::Undo,
+                ..
+            })
+        ));
+    }
+    events.lock().unwrap().clear();
+
+    editor.key(
+        true,
+        "z",
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            ..NONE
+        },
+    );
+    let got = events.lock().unwrap();
+    assert!(matches!(
+        &got[0],
+        ShellEvent::Input(ActionEvent::Fired {
+            action: Action::Redo,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn unimplemented_actions_are_named_not_silent() {
-    // `ZoomAtCursor`, `Pan` and `PanHorizontal` are `implemented() == true`;
-    // every trigger below is still driven, but the
-    // assertions at the bottom now split: the three implemented actions
-    // must no longer be recorded, the remaining seven still must be, by
-    // name.
+    // `ZoomAtCursor`, `Pan` and `PanHorizontal` are implemented and must
+    // not be recorded; the other seven must be, by name.
     let mut stacking = AppController::new();
-    stacking.set_sink(Box::new(|_| {}));
+    stacking.set_sink(Arc::new(|_| {}));
     stacking.wheel(0.0, 5.0, 0.0, 0.0, NONE); // ZoomAtCursor -- implemented
     stacking.wheel(0.0, 5.0, 0.0, 0.0, Modifiers { ctrl: true, ..NONE }); // StepSourceFrame
     stacking.wheel(
@@ -798,7 +868,7 @@ fn unimplemented_actions_are_named_not_silent() {
     ); // PickSourceUnderPointer
 
     let mut editor = AppController::new_with_mode_for_test(ShellMode::Editor);
-    editor.set_sink(Box::new(|_| {}));
+    editor.set_sink(Arc::new(|_| {}));
     editor.wheel(
         0.0,
         5.0,
@@ -851,12 +921,31 @@ fn unimplemented_actions_are_named_not_silent() {
 // One table, one dispatch point.
 // ---------------------------------------------------------------------
 
+/// Files whose own widget owns a raw gesture callback rather than routing
+/// through the canvas's rebindable zoom/pan/drag gesture table: the canvas
+/// itself, plus every scrollable panel and drag-based control (the slider
+/// and the scrollbar), each forwarding its callback body in one line to
+/// `AppController` and interpreting nothing in `.slint`.
+const RAW_GESTURE_CALLBACK_EXCEPTIONS: &[&str] = &[
+    "canvas.slint",
+    "ff_slider.slint",
+    "ff_scrollbar.slint",
+    "settings_panel.slint",
+    "images_panel.slint",
+    "ff_image_row.slint",
+    "gallery.slint",
+    "ff_manifest_list.slint",
+];
+
 #[test]
 fn no_handler_outside_the_dispatch_point() {
     let mut violations = Vec::new();
     for path in common::find_slint_files(&common::ui_dir()) {
-        let is_canvas = path.file_name().and_then(|n| n.to_str()) == Some("canvas.slint");
-        if is_canvas {
+        let is_exempt = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| RAW_GESTURE_CALLBACK_EXCEPTIONS.contains(&name));
+        if is_exempt {
             continue;
         }
         let contents = fs::read_to_string(&path).unwrap();
@@ -883,19 +972,25 @@ fn no_handler_outside_the_dispatch_point() {
 }
 
 #[test]
-fn nav_rail_has_one_entry_this_phase() {
+fn nav_rail_has_six_entries_four_disabled() {
     let path = common::ui_dir().join("shell").join("settings_modal.slint");
     let contents = fs::read_to_string(&path).unwrap();
     let code = common::strip_line_comments(&contents);
     assert_eq!(
         code.matches("FFNavRailEntry {").count(),
-        1,
-        "exactly one nav-rail entry"
+        6,
+        "the nav rail must carry all six sections"
     );
-    for disabled in ["Performance", "Storage", "General", "About"] {
+    for label in ["General", "Performance", "Storage", "About"] {
         assert!(
-            !code.contains(disabled),
-            "{disabled} must not appear yet"
+            code.contains(&format!("label: \"{label}\";")),
+            "{label} must be present"
+        );
+    }
+    for label in ["Input map", "Diagnostics"] {
+        assert!(
+            code.contains(&format!("label: \"{label}\";")),
+            "{label} must be present"
         );
     }
 }

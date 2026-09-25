@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// One continuous, fractional-fill track for a run's whole progress.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFProgressBar inherits Rectangle {
+    // 0.0..1.0 of the whole job, never per step.
+    in property <float> fraction: 0.0;
+    // "running" | "held" | "failed".
+    in property <string> tone: "running";
+    // A fixed-width segment sweeps back and forth instead of the
+    // fractional fill, for work whose length is unknown ahead of time.
+    in property <bool> indeterminate: false;
+
+    height: ShellGeometry.progress-bar-height;
+    border-radius: self.height / 2;
+    background: Theme.surface-overlay;
+    clip: true;
+
+    // Reads `animation-tick()` only while indeterminate, so a static bar
+    // never schedules a per-frame redraw for a sweep it isn't showing.
+    property <bool> sweep-right: root.indeterminate
+        ? mod(animation-tick() / 1ms, 1800.0) >= 900.0
+        : true;
+
+    fill := Rectangle {
+        height: 100%;
+        border-radius: parent.border-radius;
+        background: root.tone == "failed" ? Theme.status-failure
+            : root.tone == "held" ? Theme.border-strong
+            : Theme.accent-default;
+        width: root.indeterminate
+            ? parent.width * 0.35
+            : parent.width * max(0.0, min(1.0, root.fraction));
+        x: root.indeterminate ? (root.sweep-right ? parent.width - self.width : 0px) : 0px;
+
+        animate x { duration: 900ms; easing: ease-in-out; }
+        animate width { duration: 150ms; }
+    }
+}

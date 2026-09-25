@@ -42,6 +42,11 @@ $ focusforge-cli info some/folder
 The hint clears itself once you run `focusforge-cli diagnostics` — see
 below — which marks every crash it packages as reported.
 
+The GUI shows the same thing as a dismissible notice the next time you start
+it, naming how many crashes it found. Dismissing the notice or following it
+into Settings → Diagnostics and creating a bundle both mark that evidence
+reported, so it does not come back.
+
 ## Packaging a diagnostics bundle
 
 ```
@@ -71,3 +76,24 @@ no image data is ever included. Minidumps are left out by default — pass
 listing, since a minidump holds module paths and raw stack memory from the
 crashed process. `-o` names the output path (default: a dated ZIP in the
 current directory), and `--force` overwrites a path that already exists.
+
+### From the window
+
+Settings → Diagnostics shows the same file list `focusforge-cli diagnostics`
+prints for your data directory, each row's size in kilobytes below a
+megabyte and one decimal above. The list gathers that in the background, so
+it opens showing "Collecting…" rather than blocking the window, and the
+export button stays unavailable until it finishes; the minidump toggle and
+destination field stay editable throughout. "Include minidumps" is off by
+default; switch it on to add them to the bundle -- doing so re-gathers the
+list, since which files it would collect just changed -- and every minidump
+row is marked not redacted in the list, with a warning line explaining why.
+
+The destination field defaults to a dated ZIP beside your logs, and is
+editable. Creating the bundle checks the path first: a destination that
+already exists asks you to overwrite it before writing anything, and a
+destination that cannot be created (a bad path, a full disk) reports the
+failure with nothing left behind. The write runs in the background, so the
+window stays responsive while it does. A finished bundle can be exported
+again immediately — a fresh destination is filled in automatically, so
+there is no extra step between one export and the next.

@@ -256,7 +256,7 @@ def _root_readme(stack_dir: str, frame_names: list, date: str) -> str:
         "compared with a loose tolerance.",
         "- **`golden/*.tif`** is our own output, reviewed by a human and then frozen. "
         "It is a regression target: a change to it is a change in behaviour that "
-        "someone has to look at and accept. Compared with a tight tolerance.",
+        "someone has to look at and approve. Compared with a tight tolerance.",
         "",
         "A test that asserts an exact match against `reference.tif` is asserting that "
         "we reimplemented someone else's stacker, which is not a goal.",

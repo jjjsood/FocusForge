@@ -222,7 +222,7 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | `--status <PATH>` | append one NDJSON status record for this stack to this path |
 | `--dry-run` | resolve everything and print what would happen, without computing or writing anything |
 | `--no-gpu` | force the CPU path even when a usable GPU adapter is present; absent when the binary was built `--no-default-features` |
-| `--no-cache` | skip the stage cache: recompute alignment even when a valid entry exists, and leave no entry behind |
+| `--no-cache` | skip the stage cache: recompute the alignment even when a valid entry exists, and store no new entry |
 
 Every project carries a **Z-Map**: a single-channel 16-bit TIFF, stored
 inside the project alongside the composite, with one value per output pixel
@@ -275,7 +275,7 @@ levels = 4 (Auto)
 tile_size=512 levels=4 margin=48 tiles=1 in_flight_limit=32
 max_bytes_in_flight=20095898419 budget=Host backed_off=false
 backend: cpu
-wrote: .scratch/out/mantis-64.ffproj
+wrote: .scratch/out/mantis-64.ffp
 wall: 0.125s
 stages: setup=0.001s align=not-entered fuse=0.109s finalize=0.015s workers=? peak=?
 ```
@@ -291,8 +291,9 @@ what that policy is and why it defaults to strict. `backend` reads `"cpu"`
 because this example passes `--no-gpu`; omit it on a default build with a
 usable adapter present and it instead names the adapter, for example `NVIDIA
 GeForce RTX 5070 Ti (backend=Vulkan, driver=NVIDIA, driver_info=595.84)`.)
-`--quiet` suppresses only the per-tile progress line; the run summary above
-still prints. `stages`' `workers=?`/`peak=?` here mean `--no-align` never
+`--quiet` suppresses only the ticking progress line — per-frame while
+alignment runs, per-tile once fusion starts; the run summary above still
+prints. `stages`' `workers=?`/`peak=?` here mean `--no-align` never
 entered the alignment stage at all — a real run reports numbers instead
 (see below).
 
@@ -386,7 +387,7 @@ prevent.
   "max_bytes_in_flight": 20381420748,
   "budget_provenance": "Host",
   "backed_off": false,
-  "outputs": [".scratch/out/mantis-512.ffproj"],
+  "outputs": [".scratch/out/mantis-512.ffp"],
   "wall_seconds": 13.010864322,
   "output_width": 422,
   "output_height": 424,
@@ -637,7 +638,7 @@ Turns a project a `stack` run wrote into an image file: the composite with
 one is required. This is the only thing in the workspace that writes a TIFF
 from a stack result; the composite it writes is byte-identical to the plane
 the run staged. See [`reference/project-format.md`](project-format.md) for
-what `<PROJECT>` (a `.ffproj` file) holds.
+what `<PROJECT>` (a `.ffp` file) holds.
 
 | flag | meaning |
 |---|---|
@@ -646,12 +647,12 @@ what `<PROJECT>` (a `.ffproj` file) holds.
 | `--json` | emit the frozen JSON report instead of human-readable text |
 
 ```
-$ focusforge-cli export .scratch/out/mantis-64.ffproj -o .scratch/out.tif --zmap .scratch/zmap.tif
+$ focusforge-cli export .scratch/out/mantis-64.ffp -o .scratch/out.tif --zmap .scratch/zmap.tif
 warning: 3 source frame(s) unresolved -- not reachable from this project, either because the path was recorded as given or because it is no longer there. The export below is unaffected; re-fusing or retouching would not be:
   .../fixtures/mantis-64/frames/00.tif
   .../fixtures/mantis-64/frames/01.tif
   .../fixtures/mantis-64/frames/02.tif
-.scratch/out/mantis-64.ffproj
+.scratch/out/mantis-64.ffp
 60x60 3ch, 3 frames
 algorithm: laplacian
 unresolved sources: 3
@@ -680,11 +681,11 @@ focusforge-cli review [--json] <DIR>
 ```
 
 Reports one record per stack found under `<DIR>` — a `stack` run's `-o`
-output directory, or a plain directory of `.ffproj` files — without
+output directory, or a plain directory of `.ffp` files — without
 re-fusing, re-grouping or writing anything. When `<DIR>` holds a run
 manifest (`manifest.json`, written by every `stack` run), `review` reads it
 and lists every group the run attempted, a failed one included; otherwise it
-lists the `.ffproj` files it finds directly, non-recursively.
+lists the `.ffp` files it finds directly, non-recursively.
 
 ```
 $ focusforge-cli review .scratch/out
@@ -712,26 +713,17 @@ resolved).
 ## `cache`
 
 ```
-focusforge-cli cache <COMMAND>
+focusforge-cli cache [--json]
 ```
 
-Manages the stage cache under `.scratch/stage-cache/`, the store `stack`
-reads and writes to skip a repeated alignment solve — see
-[`guide/batch-runs.md`](../guide/batch-runs.md#the-stage-cache). One
-subcommand today:
-
-### `cache clear`
-
-```
-focusforge-cli cache clear [--json]
-```
-
-Removes every entry from the stage cache. Never touches `.scratch/resume/`
-or any project — a clear must never be able to destroy a cancelled run's
-recoverable work.
+Removes every entry from the stage cache under `.scratch/stage-cache/`, the
+store `stack` reads and writes to skip a repeated alignment solve — see
+[`guide/batch-runs.md`](../guide/batch-runs.md#the-stage-cache). Never touches
+`.scratch/resume/` or any project — a clear must never be able to destroy a
+cancelled run's recoverable work.
 
 ```
-$ focusforge-cli cache clear
+$ focusforge-cli cache
 removed 1 stage cache entry
 ```
 

@@ -119,7 +119,7 @@ A run's alignment result is kept in a stage cache under
 produced it, so a re-run that changes only a fusion parameter (`--only`
 plus `--set`) skips a costly re-solve. `--no-cache` skips the cache
 entirely for one run, reading nothing from it and leaving nothing behind;
-`focusforge-cli cache clear` empties it without touching any project or a
+`focusforge-cli cache` empties it without touching any project or a
 `--resume` run's own recoverable state.
 
 ## Reviewing the results
@@ -135,7 +135,7 @@ review projects/manifest.json: 2 results
 ```
 
 `review` reads a run's manifest (or, given a plain directory of projects, no
-manifest, the `.ffproj` files it finds) and reports one record per stack:
+manifest, the `.ffp` files it finds) and reports one record per stack:
 outcome, the sharpness ratio and Z-Map coherence a successful project
 recorded (`--` when absent), and the error a failed one carries — a failed
 stack in a batch is a visible record here, not a missing file. `review`
@@ -146,6 +146,6 @@ field list.
 ## Turning a project into an image
 
 `stack` prepares projects, it never writes an image file — run
-`focusforge-cli export <project>.ffproj -o out.tif --zmap zmap.tif` per
+`focusforge-cli export <project>.ffp -o out.tif --zmap zmap.tif` per
 project once you know which ones you want, as described in
 [`guide/stacking.md`](stacking.md#getting-an-image-back).

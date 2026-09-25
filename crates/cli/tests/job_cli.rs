@@ -31,8 +31,8 @@ fn mantis_512_dir() -> PathBuf {
 /// -- used as the spawned process's own working directory, so `.scratch/`
 /// lands here and never collides with another test's.
 ///
-/// Derefs to `Path`, so `&dir` and `dir.join(..)` read exactly as they did
-/// when this was a bare `PathBuf`.
+/// Derefs to `Path`, so `&dir` and `dir.join(..)` read exactly as a bare
+/// `PathBuf` would.
 struct TmpDir {
     path: PathBuf,
 }
@@ -128,7 +128,7 @@ fn read_work_line(reader: &mut impl BufRead, prefix: &str) -> String {
 
 /// Every line of the printed grouping proposal for a one-group run: the
 /// `grouping ...` header plus its indented group lines. What a whole-stderr
-/// assertion has to allow for now.
+/// assertion has to allow.
 fn strip_grouping(stderr: &str) -> String {
     stderr
         .lines()
@@ -232,7 +232,7 @@ fn interruptible_stack_args<'a>(dir: &'a str, output: &'a str) -> Vec<&'a str> {
         "1",
     ];
     // Without `--no-gpu`, `--algo laplacian` takes the GPU path automatically
-    // now that `gpu` is a default build feature, and every SIGINT/pause test
+    // because `gpu` is a default build feature, and every SIGINT/pause test
     // in this file depends on the CPU tile scheduler's own admission gate
     // and worker count -- a GPU run bypasses both. `--no-gpu` only exists
     // when this crate's own `gpu` feature is compiled in.
@@ -251,7 +251,7 @@ fn stack_output_is_unchanged_under_the_job_engine() {
     use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 
     let dir = tmp_dir("job_cli_output_unchanged");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let source = mantis_512_dir();
     let mut args = vec![
         "stack",
@@ -264,7 +264,7 @@ fn stack_output_is_unchanged_under_the_job_engine() {
         "--no-crop",
     ];
     // Without `--no-gpu`, `--algo laplacian` takes the GPU path automatically
-    // now that `gpu` is a default build feature, and the in-process oracle
+    // because `gpu` is a default build feature, and the in-process oracle
     // below is CPU-only -- GPU/CPU parity is <=1 LSB by contract, not
     // byte-identical, so this comparison needs both sides on the CPU path.
     if cfg!(feature = "gpu") {
@@ -309,9 +309,8 @@ fn stack_output_is_unchanged_under_the_job_engine() {
     scheduler.run(&NoopPreprocess, &consumer).unwrap();
     consumer.finish().unwrap();
 
-    // The composite now lives inside the project, so the comparison goes
-    // through `export` -- which is exactly the claim worth keeping: the
-    // container changed where the bytes live, not what they are.
+    // The composite lives inside the project, so the comparison goes
+    // through `export`.
     assert_eq!(
         read_pixels(&export_composite(&dir, &output)),
         read_pixels(&oracle_path),
@@ -322,7 +321,7 @@ fn stack_output_is_unchanged_under_the_job_engine() {
 #[test]
 fn progress_line_contains_units_stage_and_eta() {
     let dir = tmp_dir("job_cli_progress_line");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let mantis = mantis_512_dir();
     let out = run_cli_in(
         &dir,
@@ -366,7 +365,7 @@ fn fuse_counts(stderr: &str) -> Vec<(usize, usize)> {
 #[test]
 fn progress_advances_during_an_uninterrupted_run() {
     let dir = tmp_dir("job_cli_progress_advances");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let mantis = mantis_512_dir();
     let out = run_cli_in(
         &dir,
@@ -422,7 +421,7 @@ fn progress_advances_during_an_uninterrupted_run() {
 #[test]
 fn progress_to_a_file_has_no_escape_sequences() {
     let dir = tmp_dir("job_cli_progress_no_escapes");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let start = std::time::Instant::now();
     let mantis = mantis_512_dir();
     let out = run_cli_in(
@@ -451,7 +450,7 @@ fn progress_to_a_file_has_no_escape_sequences() {
 #[test]
 fn quiet_prints_no_progress() {
     let dir = tmp_dir("job_cli_quiet");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let source = mantis_512_dir();
     let mut args = vec![
         "stack",
@@ -465,7 +464,7 @@ fn quiet_prints_no_progress() {
         "--quiet",
     ];
     // Without `--no-gpu`, `--algo laplacian` takes the GPU path automatically
-    // now that `gpu` is a default build feature, and a GPU-unavailable
+    // because `gpu` is a default build feature, and a GPU-unavailable
     // fallback prints a warning to stderr regardless of `--quiet`, which this
     // test asserts is otherwise empty.
     if cfg!(feature = "gpu") {
@@ -502,7 +501,7 @@ mod unix_signals {
     #[test]
     fn sigint_cancels_cleanly() {
         let dir = tmp_dir("job_cli_sigint_cancel");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &dir,
@@ -520,8 +519,7 @@ mod unix_signals {
 
         assert_eq!(status.code(), Some(130), "status: {status:?}");
         assert!(!output.exists(), "named output must not exist");
-        // The resumable state is no longer a `.partial` beside the output:
-        // fusion stages its two planes under `.scratch/projects/<group>/`
+        // Fusion stages its two planes under `.scratch/projects/<group>/`
         // and the project is sealed from them only once the job completes,
         // so a cancel leaves the staged planes and the ledger, and nothing
         // at all beside the named path.
@@ -547,7 +545,7 @@ mod unix_signals {
     #[test]
     fn status_record_written_on_cancel() {
         let dir = tmp_dir("job_cli_status_cancel");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let status = dir.join("status.ndjson");
         let mantis = mantis_512_dir();
         let mut args = interruptible_stack_args(
@@ -577,7 +575,7 @@ mod unix_signals {
     #[test]
     fn sigint_then_resume_finishes_the_job() {
         let ref_dir = tmp_dir("job_cli_resume_reference");
-        let ref_output = ref_dir.join("mantis-512.ffproj");
+        let ref_output = ref_dir.join("mantis-512.ffp");
         let mantis_dir_ref = mantis_512_dir();
         let mut ref_args = vec![
             "stack",
@@ -602,7 +600,7 @@ mod unix_signals {
         assert!(ref_run.success, "stderr: {}", ref_run.stderr);
 
         let dir = tmp_dir("job_cli_resume_interrupted");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let mantis_dir = mantis_512_dir();
         let args = interruptible_stack_args(
             mantis_dir.to_str().unwrap(),
@@ -636,7 +634,7 @@ mod unix_signals {
     #[test]
     fn second_sigint_exits_immediately() {
         let dir = tmp_dir("job_cli_second_sigint");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &dir,
@@ -720,7 +718,7 @@ mod unix_signals {
     #[test]
     fn sigusr1_pauses_the_run_and_a_second_one_resumes_it() {
         let dir = tmp_dir("job_cli_sigusr1_pause");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &dir,
@@ -800,7 +798,7 @@ mod unix_signals {
     #[test]
     fn resume_without_state_fails_clearly() {
         let dir = tmp_dir("job_cli_resume_without_state");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let out = run_cli_in(
             &dir,
             &[
@@ -824,7 +822,7 @@ mod unix_signals {
     fn resume_with_changed_inputs_fails() {
         let dir = tmp_dir("job_cli_resume_changed_inputs");
         let stack_dir = copy_fixture_frames(&dir.join("stack"));
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let args = interruptible_stack_args(
             stack_dir.to_str().unwrap(),
             output.parent().unwrap().to_str().unwrap(),
@@ -871,18 +869,13 @@ mod unix_signals {
         );
     }
 
-    /// Which compute backend produced the already-written tiles is part of
-    /// a ledger's identity: a run cancelled on the GPU path and resumed on
-    /// the CPU one (or the reverse) would silently finish one file out of
-    /// two different implementations. The default gate compiles no `gpu`
-    /// feature, so both runs here genuinely resolve `"cpu"` -- the recorded
-    /// value is edited between them, which is the only way to reach the
-    /// refusal without a GPU-feature build, and is exactly what a resume on
-    /// a differently-built binary would look like on disk.
+    /// The backend is part of a ledger's identity, so a resume on a
+    /// different backend is refused. Both runs here resolve `"cpu"`; the
+    /// recorded value is edited between them to reach the refusal.
     #[test]
     fn resume_with_a_changed_backend_fails() {
         let dir = tmp_dir("job_cli_resume_changed_backend");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let mantis_dir = mantis_512_dir();
         let args = interruptible_stack_args(
             mantis_dir.to_str().unwrap(),
@@ -924,7 +917,7 @@ mod unix_signals {
     #[test]
     fn resume_with_changed_tile_size_fails() {
         let dir = tmp_dir("job_cli_resume_changed_tile_size");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let mantis_dir = mantis_512_dir();
         let mut base_args = vec![
             "stack",
@@ -971,7 +964,7 @@ mod unix_signals {
     fn exit_codes_distinguish_the_three_outcomes() {
         // Completed: 0.
         let ok_dir = tmp_dir("job_cli_exit_ok");
-        let ok_output = ok_dir.join("mantis-512.ffproj");
+        let ok_output = ok_dir.join("mantis-512.ffp");
         let ok = run_cli_in(
             &ok_dir,
             &[
@@ -989,7 +982,7 @@ mod unix_signals {
 
         // Failed: 1.
         let fail_dir = tmp_dir("job_cli_exit_fail");
-        let fail_output = fail_dir.join("mantis-512.ffproj");
+        let fail_output = fail_dir.join("mantis-512.ffp");
         let failed = run_cli_in(
             &fail_dir,
             &[
@@ -1005,7 +998,7 @@ mod unix_signals {
 
         // Cancelled: 130.
         let cancel_dir = tmp_dir("job_cli_exit_cancel");
-        let cancel_output = cancel_dir.join("mantis-512.ffproj");
+        let cancel_output = cancel_dir.join("mantis-512.ffp");
         let mantis = mantis_512_dir();
         let mut child = spawn_piped(
             &cancel_dir,
@@ -1084,7 +1077,6 @@ mod unix_signals {
     #[ignore = "reads the 16 GB reference stack"]
     fn stack_reference_with_cancel_and_resume() {
         let Some(stack_dir) = common::reference_stack_dir() else {
-            eprintln!("reference stack not found; skipping");
             return;
         };
 
@@ -1113,7 +1105,7 @@ mod unix_signals {
 
         // The interrupted run: SIGINT once a progress line shows the fuse
         // stage genuinely under way -- never a sleep.
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let args = [
             "stack",
             &frames_arg,
@@ -1196,7 +1188,7 @@ mod unix_signals {
         // is compared against the resumed run's `--json` report -- both drawn
         // from the same recorded `StackAlignment`, never two ECC solves.
         let dir = tmp_dir("job_cli_align_resume");
-        let output = dir.join("mantis-512.ffproj");
+        let output = dir.join("mantis-512.ffp");
         let mantis_dir = mantis_512_dir();
         let mut args = vec![
             "stack",
@@ -1223,7 +1215,10 @@ mod unix_signals {
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let align_line = read_work_line(&mut stderr, "align ");
         assert!(align_line.starts_with("align "), "{align_line}");
-        let fuse_line = read_line(&mut stderr);
+        // A live align tick may print more `align <done>/<total> frames`
+        // lines before the fuse stage begins; skip past them the same way
+        // the pre-work grouping block is skipped above.
+        let fuse_line = read_work_line(&mut stderr, "fuse ");
         assert!(fuse_line.starts_with("fuse "), "{fuse_line}");
         send(child.id(), "-INT");
         let status = child.wait().unwrap();
@@ -1316,7 +1311,7 @@ mod unix_signals {
 #[test]
 fn tuning_flags_reach_the_scheduler() {
     let default_dir = tmp_dir("job_cli_tuning_default");
-    let default_output = default_dir.join("mantis-512.ffproj");
+    let default_output = default_dir.join("mantis-512.ffp");
     let default_run = run_cli_in(
         &default_dir,
         &[
@@ -1335,7 +1330,7 @@ fn tuning_flags_reach_the_scheduler() {
     let default_report: serde_json::Value = serde_json::from_str(&default_run.stdout).unwrap();
 
     let tuned_dir = tmp_dir("job_cli_tuning_tuned");
-    let tuned_output = tuned_dir.join("mantis-512.ffproj");
+    let tuned_output = tuned_dir.join("mantis-512.ffp");
     let mantis = mantis_512_dir();
     let mut tuned_args = interruptible_stack_args(
         mantis.to_str().unwrap(),

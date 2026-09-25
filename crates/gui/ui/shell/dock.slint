@@ -1,137 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The dock: 260 px wide, from the tab strip to the bottom bar. Composes the
-// mode switch, the checkpoint panel and the dock tab row (each its own file
-// under `dock/`, per the shell-region split) with the dock's own chrome --
-// the edge rule, the checkpoint rule and the no-project note. The dock
-// tabs' own content (images list, settings panel) ships separately; this
-// file ships the row, not what is behind it.
+// The dock: from the tab strip to the bottom bar. Composes the mode switch,
+// the checkpoint panel and the dock tab row with the dock's own chrome.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
-
-export component FFModeSwitch inherits Rectangle {
-    callback mode-selected(string);
-    in property <bool> editor-enabled: false;
-    in property <string> mode: "stacking";
-
-    height: 28px;
-    background: Theme.surface-overlay;
-    border-radius: Theme.radius-md;
-
-    HorizontalLayout {
-        stacking-half := Rectangle {
-            background: root.mode == "stacking" ? Theme.accent-default : transparent;
-            border-radius: Theme.radius-md;
-            Text {
-                text: "Stacking";
-                horizontal-alignment: center;
-                color: root.mode == "stacking" ? Theme.text-on-accent : Theme.text-primary;
-            }
-            TouchArea {
-                clicked => { root.mode-selected("stacking"); }
-            }
-        }
-        editor-half := Rectangle {
-            opacity: root.editor-enabled ? 1.0 : 0.5;
-            background: root.mode == "editor" ? Theme.accent-default : transparent;
-            border-radius: Theme.radius-md;
-            Text {
-                text: "Editor";
-                horizontal-alignment: center;
-                color: Theme.text-disabled;
-            }
-            TouchArea {
-                enabled: root.editor-enabled;
-                clicked => { root.mode-selected("editor"); }
-            }
-        }
-    }
-}
-
-export component FFCheckpointPanel inherits Rectangle {
-    callback checkpoint-export-requested();
-
-    height: 72px;
-
-    VerticalLayout {
-        spacing: Theme.space-2;
-
-        heading-row := HorizontalLayout {
-            height: 20px;
-            alignment: space-between;
-
-            Text {
-                text: "Checkpoints";
-                color: Theme.text-secondary;
-                font-size: Theme.text-section.size;
-                font-weight: Theme.text-section.weight;
-            }
-
-            checkpoint-export := Rectangle {
-                width: 60px;
-                height: 20px;
-                accessible-role: button;
-                accessible-enabled: false;
-                background: Theme.surface-disabled;
-                border-radius: Theme.radius-sm;
-
-                Text {
-                    text: "Export";
-                    horizontal-alignment: center;
-                    color: Theme.text-disabled;
-                    font-size: Theme.text-body.size;
-                }
-
-                TouchArea {
-                    enabled: false;
-                    clicked => { root.checkpoint-export-requested(); }
-                }
-            }
-        }
-
-        Text {
-            text: "None yet — the first fuse writes one";
-            color: Theme.text-muted;
-            font-size: Theme.text-body.size;
-            wrap: word-wrap;
-        }
-    }
-}
-
-export component FFDockTabs inherits Rectangle {
-    callback tab-selected(string);
-    in property <string> active: "images";
-
-    height: 28px;
-
-    HorizontalLayout {
-        images-tab := Rectangle {
-            background: root.active == "images" ? Theme.surface-hover : transparent;
-            border-radius: Theme.radius-sm;
-            Text {
-                text: "Images";
-                horizontal-alignment: center;
-                color: Theme.text-primary;
-            }
-            TouchArea {
-                clicked => { root.tab-selected("images"); }
-            }
-        }
-        settings-tab := Rectangle {
-            background: root.active == "settings" ? Theme.surface-hover : transparent;
-            border-radius: Theme.radius-sm;
-            Text {
-                text: "Settings";
-                horizontal-alignment: center;
-                color: Theme.text-primary;
-            }
-            TouchArea {
-                clicked => { root.tab-selected("settings"); }
-            }
-        }
-    }
-}
+import { FFModeSwitch } from "dock/mode_switch.slint";
+import { FFCheckpointPanel } from "dock/checkpoint_panel.slint";
+import { FFDockTabs } from "dock/dock_tabs.slint";
+import { FFSettingsPanel, SettingsRow, SectionHeadView } from "dock/settings_panel.slint";
+export { SettingsRow, SectionHeadView }
+import { FFImagesPanel, ImageRowView } from "dock/images_panel.slint";
+export { ImageRowView }
 
 export component FFDock inherits Rectangle {
     callback mode-selected(string);
@@ -140,6 +20,54 @@ export component FFDock inherits Rectangle {
     in property <bool> editor-enabled: false;
     in property <string> mode: "stacking";
     in property <string> dock-tab: "images";
+    // Whether the active tab holds a project. Without one the dock tab row
+    // has nothing to show, and draws the line `No project open.` in its
+    // place instead.
+    in property <bool> project-loaded: false;
+    // The checkpoints panel's own line -- the active tab's checkpoint count,
+    // or the empty-state wording. Set from Rust in `src/bridge.rs`.
+    in property <string> checkpoint-line: "None yet — fuse a stack";
+
+    // The settings panel: generated entirely from the row list Rust hands
+    // it, forwarded one line into `FFSettingsPanel`.
+    in property <[SettingsRow]> settings-rows: [];
+    in property <SectionHeadView> settings-sticky: { visible: false, section: "", label: "", provenance: "default", push: 0px };
+    in property <length> settings-scroll-y: 0px;
+    in property <length> settings-content-height: 0px;
+    in property <bool> settings-enabled: true;
+    callback settings-param-changed(string, string, float);
+    callback settings-param-text-edited(string, string, string);
+    callback settings-algorithm-selected(string, string);
+    callback settings-reset-all();
+    callback settings-menu-toggled(string, string);
+    callback settings-scrolled(length);
+    callback settings-scrollbar-pointer(int, length);
+    callback settings-scrollbar-dragged(length);
+    callback settings-viewport-height-changed(length);
+
+    // The `Images` panel: forwarded the same way, one line into
+    // `FFImagesPanel`.
+    in property <[ImageRowView]> images-rows: [];
+    in property <string> images-header-text: "";
+    in property <length> images-scroll-y: 0px;
+    in property <length> images-content-height: 0px;
+    in property <string> images-sort: "";
+    in property <bool> images-sort-menu-open: false;
+    in property <int> images-dragging-row: -1;
+    in property <length> images-drag-offset: 0px;
+    in property <int> images-drag-target-row: -1;
+    in property <bool> images-enabled: true;
+    callback images-add-frames-requested();
+    callback images-sort-menu-toggled();
+    callback images-sort-selected(string);
+    callback images-frame-selected(int);
+    callback images-frame-excluded-toggled(int);
+    callback images-frame-remove-requested(int);
+    callback images-frame-grip-pointer(int, int, length);
+    callback images-scrolled(length);
+    callback images-scrollbar-pointer(int, length);
+    callback images-scrollbar-dragged(length);
+    callback images-viewport-height-changed(length);
 
     background: Theme.surface-raised;
 
@@ -157,12 +85,102 @@ export component FFDock inherits Rectangle {
         }
 
         checkpoint-panel := FFCheckpointPanel {
+            line: root.checkpoint-line;
             checkpoint-export-requested => { root.checkpoint-export-requested(); }
         }
 
         dock-tabs := FFDockTabs {
+            visible: root.project-loaded;
             active: root.dock-tab;
             tab-selected(t) => { root.dock-tab-selected(t); }
         }
+    }
+
+    settings-panel := FFSettingsPanel {
+        x: ShellGeometry.dock-content-inset;
+        y: dock-tabs.y + dock-tabs.height + Theme.space-2;
+        // The scrollbar sits flush on this panel's own right edge (see
+        // `ff_scrollbar.slint`'s `x: parent.width - self.width`), so this
+        // width is what puts that edge `dock-scrollbar-inset` from the
+        // dock's own right edge: the panel starts `dock-content-inset` in,
+        // and ends `dock-scrollbar-inset` short of the dock's far side.
+        width: ShellGeometry.dock-width - ShellGeometry.dock-content-inset - ShellGeometry.dock-scrollbar-inset;
+        height: parent.height - self.y - ShellGeometry.dock-content-inset;
+        visible: root.project-loaded && root.dock-tab == "settings";
+        rows: root.settings-rows;
+        sticky: root.settings-sticky;
+        scroll-y: root.settings-scroll-y;
+        content-height: root.settings-content-height;
+        enabled: root.settings-enabled;
+        param-changed(section, id, f) => { root.settings-param-changed(section, id, f); }
+        param-text-edited(section, id, text) => { root.settings-param-text-edited(section, id, text); }
+        algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
+        reset-all => { root.settings-reset-all(); }
+        menu-toggled(section, id) => { root.settings-menu-toggled(section, id); }
+        scrolled(delta) => { root.settings-scrolled(delta); }
+        scrollbar-pointer(kind, y) => { root.settings-scrollbar-pointer(kind, y); }
+        scrollbar-dragged(y) => { root.settings-scrollbar-dragged(y); }
+        viewport-height-changed(h) => { root.settings-viewport-height-changed(h); }
+    }
+
+    images-panel := FFImagesPanel {
+        x: ShellGeometry.dock-content-inset;
+        y: dock-tabs.y + dock-tabs.height + Theme.space-2;
+        width: ShellGeometry.dock-width - ShellGeometry.dock-content-inset - ShellGeometry.dock-scrollbar-inset;
+        height: parent.height - self.y - ShellGeometry.dock-content-inset;
+        visible: root.project-loaded && root.dock-tab == "images";
+        rows: root.images-rows;
+        header-text: root.images-header-text;
+        scroll-y: root.images-scroll-y;
+        content-height: root.images-content-height;
+        mutable: root.mode == "stacking" && root.images-enabled;
+        sort: root.images-sort;
+        sort-menu-open: root.images-sort-menu-open;
+        dragging-row: root.images-dragging-row;
+        drag-offset: root.images-drag-offset;
+        drag-target-row: root.images-drag-target-row;
+        add-frames-requested => { root.images-add-frames-requested(); }
+        sort-menu-toggled => { root.images-sort-menu-toggled(); }
+        sort-selected(picked) => { root.images-sort-selected(picked); }
+        frame-selected(i) => { root.images-frame-selected(i); }
+        frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
+        frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
+        frame-grip-pointer(i, kind, y) => { root.images-frame-grip-pointer(i, kind, y); }
+        scrolled(delta) => { root.images-scrolled(delta); }
+        scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
+        scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
+        viewport-height-changed(h) => { root.images-viewport-height-changed(h); }
+    }
+
+    no-project-note := Text {
+        x: ShellGeometry.dock-content-inset + Theme.space-1;
+        y: checkpoint-rule.y + checkpoint-rule.height + Theme.space-4;
+        height: Theme.text-body.size * Theme.text-body.line-height;
+        visible: !root.project-loaded;
+        text: "No project open.";
+        color: Theme.text-disabled;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        vertical-alignment: center;
+    }
+
+    // The rule under the checkpoint panel, full dock width -- 1 px of
+    // `border.default`.
+    checkpoint-rule := Rectangle {
+        x: 0px;
+        y: checkpoint-panel.y + checkpoint-panel.height;
+        width: parent.width;
+        height: 1px;
+        background: Theme.border-default;
+    }
+
+    // The 1 px rule at x 1180 that separates the dock from the toolbar and
+    // the canvas.
+    dock-edge := Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 1px;
+        height: parent.height;
+        background: Theme.border-default;
     }
 }

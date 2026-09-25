@@ -3,14 +3,12 @@
 //! Process-level coverage of `--preset`, `--write-preset`, `--status` and
 //! `--dry-run` on `focusforge-cli stack`.
 //!
-//! A new binary rather than more of `stack_cli.rs`, matching this crate's
-//! per-subject test layout. Every refusal path runs against `dummy-stack`
-//! (registered in this crate's test binary through `crates/cli/Cargo.toml`'s
-//! `[dev-dependencies]` feature, as `crates/cli/tests/algorithms_cmd.rs`
-//! documents) and never opens a tile. The byte-for-byte tests pay for a real
-//! `laplacian` fusion over `fixtures/mantis-512` with `--no-align --no-crop`,
-//! which is the cheapest invocation whose pixels actually depend on a
-//! parameter.
+//! Every refusal path runs against `dummy-stack` (registered in this crate's
+//! test binary through `crates/cli/Cargo.toml`'s `[dev-dependencies]`
+//! feature, as `crates/cli/tests/algorithms_cmd.rs` documents) and never
+//! opens a tile. The byte-for-byte tests pay for a real `laplacian` fusion
+//! over `fixtures/mantis-512` with `--no-align --no-crop`, which is the
+//! cheapest invocation whose pixels actually depend on a parameter.
 
 mod common;
 
@@ -89,12 +87,8 @@ fn read_bytes(path: &Path) -> Vec<u8> {
     std::fs::read(path).expect("output file must be readable")
 }
 
-/// The composite of `project`, exported beside it.
-///
-/// Two containers of the same stack are not byte-identical -- they carry
-/// different `created_at` stamps -- so every byte-level comparison here goes
-/// through `export`, which is the claim worth keeping anyway: the container
-/// changed where the payload lives, not what it is.
+/// The composite of `project`, exported beside it. Two containers of the
+/// same stack differ in `created_at`, so byte comparisons go through `export`.
 fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
     let exported = project.with_extension("exported.tif");
     let out = run_cli_in(
@@ -118,7 +112,7 @@ fn preset_file_matches_equivalent_set_flags() {
 
     let preset_dir = dir.join("preset-out");
     std::fs::create_dir_all(&preset_dir).unwrap();
-    let from_preset = preset_dir.join("mantis-512.ffproj");
+    let from_preset = preset_dir.join("mantis-512.ffp");
     let out = run_cli_in(
         &dir,
         &common::push_no_gpu(vec![
@@ -138,7 +132,7 @@ fn preset_file_matches_equivalent_set_flags() {
 
     let flags_dir = dir.join("flags-out");
     std::fs::create_dir_all(&flags_dir).unwrap();
-    let from_flags = flags_dir.join("mantis-512.ffproj");
+    let from_flags = flags_dir.join("mantis-512.ffp");
     let out = run_cli_in(
         &dir,
         &common::push_no_gpu(vec![
@@ -389,7 +383,7 @@ fn preset_supplies_the_algorithm_id() {
     let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("--json must parse");
     assert_eq!(report["algorithm"], "laplacian");
 
-    // Neither flag nor file: the existing refusal, now naming the preset key.
+    // Neither flag nor file: the refusal names the preset key.
     let empty = write_preset(&dir, "empty.toml", "[stack]\n");
     let out = run_cli_in(
         &dir,
@@ -422,7 +416,7 @@ fn written_preset_round_trips() {
     let written = dir.join("written.toml");
     let first_dir = dir.join("first-out");
     std::fs::create_dir_all(&first_dir).unwrap();
-    let first = first_dir.join("mantis-512.ffproj");
+    let first = first_dir.join("mantis-512.ffp");
     let out = run_cli_in(
         &dir,
         &common::push_no_gpu(vec![
@@ -453,7 +447,7 @@ fn written_preset_round_trips() {
 
     let second_dir = dir.join("second-out");
     std::fs::create_dir_all(&second_dir).unwrap();
-    let second = second_dir.join("mantis-512.ffproj");
+    let second = second_dir.join("mantis-512.ffp");
     let out = run_cli_in(
         &dir,
         &common::push_no_gpu(vec![
@@ -478,7 +472,7 @@ fn written_preset_round_trips() {
 #[test]
 fn dry_run_writes_nothing_and_succeeds() {
     let dir = tmp_dir("preset_cli_dry_run_writes_nothing");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let status = dir.join("status.ndjson");
     let out = run_cli_in(
         &dir,
@@ -526,7 +520,7 @@ fn dry_run_writes_nothing_and_succeeds() {
 
     assert!(!output.exists(), "a dry run writes no project");
     assert!(
-        !dir.join("mantis-512.ffproj.partial").exists(),
+        !dir.join("mantis-512.ffp.partial").exists(),
         "a dry run creates no .partial"
     );
     assert!(
@@ -555,9 +549,6 @@ fn dry_run_stops_before_alignment() {
             dir.to_str().unwrap(),
             "--algo",
             "laplacian",
-            // Two alignment algorithms are registered in this test binary
-            // (`dummy-align` and the real one), so the id is explicit here
-            // -- a dry run resolves the alignment half without running it.
             "--align-algo",
             "pyramidal-ecc",
             "--dry-run",
@@ -587,7 +578,7 @@ fn dry_run_stops_before_alignment() {
 #[test]
 fn dry_run_json_is_not_a_stack_report() {
     let dir = tmp_dir("preset_cli_dry_run_json");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let out = run_cli_in(
         &dir,
         &common::push_no_gpu(vec![
@@ -597,9 +588,6 @@ fn dry_run_json_is_not_a_stack_report() {
             output.parent().unwrap().to_str().unwrap(),
             "--algo",
             "laplacian",
-            // Two alignment algorithms are registered in this test binary
-            // (`dummy-align` and the real one), so the id is explicit here
-            // -- a dry run resolves the alignment half without running it.
             "--align-algo",
             "pyramidal-ecc",
             "--dry-run",
@@ -715,7 +703,7 @@ fn status_record_names_identity_outcome_and_path() {
     let dir = tmp_dir("preset_cli_status_completed");
     let mantis = mantis_512_dir();
     let status = dir.join("status.ndjson");
-    let output = dir.join("mantis-512.ffproj");
+    let output = dir.join("mantis-512.ffp");
     let out = run_cli_in(
         &dir,
         &[

@@ -2,15 +2,11 @@
 
 //! `pyramidal-ecc` (the [`AlignAlgorithm`]) and [`align_stack`] (the
 //! whole-stack driver), exercised against `fixtures/mantis-512` and
-//! synthetic in-memory readers. Opened the way `crates/core/tests/
-//! ecc_solver.rs` opens its fixture: `mod common;` plus
-//! `TiffStack::open(common::mantis_512_dir())`, never a relative literal.
+//! synthetic in-memory readers.
 //!
-//! Ground-truth pairs are built the same way `ecc_solver.rs` builds them:
-//! frame 3 (`03.tif`, the sharpest fixture frame) warped by a known
-//! [`Transform`], registered against its own unwarped self -- the only
-//! configuration where the "known" transform is actually known (see that
-//! file's module docs for why).
+//! Ground-truth pairs warp frame 3 (`03.tif`, the sharpest fixture frame) by
+//! a known [`Transform`] and register it against its own unwarped self --
+//! the only configuration where the "known" transform is actually known.
 
 mod common;
 
@@ -20,7 +16,10 @@ use focusforge_core::algorithm::{
     AlgorithmError, AlignAlgorithm, AlignContext, AlignStatus, TileReader,
 };
 use focusforge_core::align::warp::warp_from_tile;
-use focusforge_core::align::{FailurePolicy, PyramidalEcc, Transform, align_stack};
+use focusforge_core::align::{
+    DivergenceReason, EccLevelRecord, EccStatus, FailurePolicy, PyramidalEcc, Transform,
+    align_stack,
+};
 use focusforge_core::io::{FrameError, TiffError, TiffStack};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::tile::{Rect, Tile};
@@ -98,8 +97,7 @@ fn similarity_about(scale: f64, radians: f64, cx: f64, cy: f64) -> Transform {
     back.compose(&rot_scale).compose(&to_origin)
 }
 
-/// A deterministic xorshift32 PRNG -- never `rand`, mirroring the private
-/// generators already reimplemented per-file in this crate's own tests.
+/// Deterministic xorshift32 PRNG.
 struct XorShift32(u32);
 
 impl XorShift32 {
@@ -115,8 +113,7 @@ impl XorShift32 {
 
 /// A synthetic in-memory [`TileReader`] over an arbitrary number of
 /// same-sized frames, honouring the same exact-length and in-bounds
-/// contracts as [`focusforge_core::io::TiffStack::read_tile_into`] --
-/// mirrors `crates/core/src/algorithm/mod.rs`'s own test-only `VecReader`.
+/// contracts as [`focusforge_core::io::TiffStack::read_tile_into`].
 struct FramesReader {
     width: u32,
     height: u32,
@@ -677,6 +674,138 @@ fn rejects_out_of_range_parameters() {
         Err(AlgorithmError::Params(_)) => {}
         other => panic!("expected AlgorithmError::Params for epsilon-px=-1.0, got {other:?}"),
     }
+}
+
+/// Opens `fixtures/mantis-512` with its `StackContext` and fully resolved
+/// [`PyramidalEcc`] defaults -- the setup both whole-fixture tests below
+/// share.
+fn fixture_with_defaults() -> (TiffStack, StackContext, ParamValues) {
+    let stack = open_fixture();
+    let (width, height) = stack.dimensions();
+    let stack_ctx = StackContext::new(
+        stack.len(),
+        width,
+        height,
+        stack.header(0).samples_per_pixel,
+    );
+    let cfg = resolved_defaults(&stack_ctx);
+    (stack, stack_ctx, cfg)
+}
+
+/// Every non-reference fixture frame, traced level by level at fully
+/// resolved defaults. Prints one row per [`EccLevelRecord`], plus a diverged
+/// level's last few [`EccIteration`] rows.
+#[test]
+fn each_divergence_reports_its_pyramid_level() {
+    let (stack, stack_ctx, cfg) = fixture_with_defaults();
+    let reference = 3usize;
+    assert_eq!(reference, (stack.len() - 1) / 2, "middle of 8 frames is 3");
+    let ctx = AlignContext::new(stack_ctx, reference, &stack);
+
+    for frame in 0..stack.len() {
+        if frame == reference {
+            continue;
+        }
+        let mut levels: Vec<EccLevelRecord> = Vec::new();
+        let outcome = PyramidalEcc
+            .align_frame_traced(&ctx, frame, &cfg, &mut levels)
+            .expect("fixture frames register");
+        eprintln!(
+            "each_divergence_reports_its_pyramid_level: frame={frame} status={:?} \
+             iterations={} residual={}",
+            outcome.status, outcome.iterations, outcome.residual
+        );
+        for rec in &levels {
+            eprintln!(
+                "  level={} status={:?} iterations={} correlation={:.6} \
+                 valid_fraction={:.6} final_step={:?}",
+                rec.level,
+                rec.result.status,
+                rec.result.iterations,
+                rec.result.correlation,
+                rec.result.valid_fraction,
+                rec.result.final_step
+            );
+            if matches!(rec.result.status, EccStatus::Diverged(_)) {
+                let tail = rec.trace.len().min(5);
+                for it in &rec.trace[rec.trace.len() - tail..] {
+                    eprintln!(
+                        "    iteration correlation={:.6} valid_fraction={:.6} step={:.6}",
+                        it.correlation, it.valid_fraction, it.step
+                    );
+                }
+            }
+        }
+
+        let last = levels
+            .last()
+            .expect("at least the coarsest level is always solved");
+        assert_eq!(
+            AlignStatus::from(last.result.status),
+            outcome.status,
+            "frame {frame}: the reported status must be the last solved level's own status"
+        );
+        if matches!(last.result.status, EccStatus::Diverged(_)) {
+            assert!(
+                levels.iter().all(|rec| rec.level >= last.level),
+                "frame {frame}: a level finer than the one that diverged must not follow it: \
+                 {levels:?}"
+            );
+        }
+    }
+}
+
+/// The complete eight-frame fixture set at fully resolved defaults under
+/// strict policy. Frames 00, 01 and 07 diverge on this 512x512 crop for
+/// reasons written down beside [`each_divergence_reports_its_pyramid_level`]
+/// -- content the crop does not carry enough of, not a solver defect -- and
+/// every other frame converges.
+#[test]
+fn the_whole_checked_in_stack_aligns() {
+    let (stack, stack_ctx, cfg) = fixture_with_defaults();
+
+    let result = align_stack(
+        &PyramidalEcc,
+        stack_ctx,
+        &stack,
+        &cfg,
+        FailurePolicy::Strict,
+    )
+    .expect("the run completes even with diverging frames");
+
+    assert_eq!(result.reference, 3, "middle of 8 frames is (8-1)/2 = 3");
+    assert_eq!(result.frames.len(), 8);
+
+    let expected = [
+        AlignStatus::Diverged(DivergenceReason::LemmaOneRegion),
+        AlignStatus::Diverged(DivergenceReason::TooFewValidSamples),
+        AlignStatus::Converged,
+        AlignStatus::Converged,
+        AlignStatus::Converged,
+        AlignStatus::Converged,
+        AlignStatus::Converged,
+        AlignStatus::Diverged(DivergenceReason::CorrelationDecreased),
+    ];
+
+    for (i, frame) in result.frames.iter().enumerate() {
+        assert_eq!(frame.frame, i, "frames must be reported in stack order");
+        assert!(
+            !frame.fallback,
+            "strict policy never substitutes a transform: frame {i}: {frame:?}"
+        );
+        assert_eq!(frame.status, expected[i], "frame {i} status: {frame:?}");
+    }
+
+    let reference_frame = &result.frames[3];
+    assert_eq!(reference_frame.transform, Transform::identity());
+    assert_eq!(reference_frame.residual, 1.0);
+
+    assert_eq!(
+        result.failure_count(),
+        3,
+        "exactly the three documented divergences: {:?}",
+        result.frames
+    );
 }
 
 #[test]

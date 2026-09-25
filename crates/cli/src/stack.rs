@@ -8,30 +8,19 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use focusforge_core::algorithm::{AlignStatus, StackAlgorithm, TileReader};
-use focusforge_core::align::{
-    AlignDriverOptions, FrameAlignment, ReferencePolicy, StackAlignment, Transform, WarpingReader,
-    align_stack_with, auto_crop,
-};
-use focusforge_core::fuse::{
-    BackendFusionConsumer, FusionConsumer, FusionGeometry,
-    description::format_composite_description, laplacian::Laplacian,
-};
+use focusforge_core::algorithm::StackAlgorithm;
+use focusforge_core::align::ReferencePolicy;
 use focusforge_core::gpu::TileBackend;
-use focusforge_core::io::{FrameReader, Group, Proposal, Rect, TiffSpec, TiffStack, propose};
-use focusforge_core::job::{
-    AlignIdentity, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobOutcome, JobRecord,
-    RecordingConsumer, Resumable, ResumeStore, StackFingerprint, StageCache, StageKey,
-    read_alignment,
-};
+use focusforge_core::io::{FrameReader, Group, Proposal, Rect, TiffStack, propose};
+use focusforge_core::job::{JobControl, StageCache};
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance};
-use focusforge_core::project::{self, Metrics, PROJECT_EXTENSION};
+use focusforge_core::project::{self, PROJECT_EXTENSION};
 use focusforge_core::registry;
-use focusforge_core::tile::{NoopPreprocess, TileConsumer, TileScheduler, TileSchedulerOptions};
-use focusforge_core::timing::{Stage, StageTimer};
+use focusforge_core::tile::{TileScheduler, TileSchedulerOptions};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
@@ -100,19 +89,13 @@ pub struct StackReport {
     /// `HostFallback` (no probe ran, the stated default was used), or
     /// `Explicit` (`--max-vram` lowered it) -- `null` on the CPU path.
     pub device_budget_provenance: Option<Provenance>,
-    /// The device budget's own high-water count of tiles admitted at once
-    /// during **this group** -- scoped per group, the same footing as every
-    /// other field on this struct: group 2 of a multi-group run reports its
-    /// own peak, never a running maximum over the groups that preceded it in
-    /// the same process. `0` for a group that admitted no tile through the
-    /// device gate (fully served from the stage cache, say); `null` only on
-    /// the CPU path, never for "zero device work this group". Distinct from
-    /// `peak_in_flight`, which is the *host* scheduler's configured limit,
-    /// not a measurement, and is reported on both paths.
+    /// The device budget's high-water count of tiles admitted at once during
+    /// this group (per group, never a running maximum). `0` when no tile
+    /// went through the device; `null` on the CPU path.
     pub device_peak_in_flight: Option<usize>,
     /// `true` only when the alignment came out of the stage cache;
     /// `false` for a computed one, a `--resume` ledger-peeked one, or a
-    /// `--no-align` run. Additive field.
+    /// `--no-align` run.
     pub align_cached: bool,
     /// Wall-clock stage breakdown -- `setup`/`align`/`fuse`/`finalize` as
     /// seconds, `warp_write` always `null` (`stack` never enters it). Every
@@ -129,14 +112,10 @@ pub struct StackReport {
     /// cannot tell a resumed run from a genuinely fast alignment -- both
     /// spend a few milliseconds inside the stage and neither is a compute
     /// -- so this field, not that one, is what a later run compares before
-    /// reading a stage number as a real cost. Additive field.
+    /// reading a stage number as a real cost.
     pub align_source: String,
     /// The anchor arm's worker bound and the peak it actually reached --
-    /// `None` unless `align_source == "computed"`. A `"cached"`, `"resumed"`
-    /// or `"skipped"` run never calls `align_stack_with`, so it has no
-    /// worker count of its own; reporting one from a previous run's cache
-    /// entry would be a fabricated number, exactly the confusion
-    /// `align_source` exists to prevent. Additive fields.
+    /// `None` unless the alignment was computed this run.
     pub align_workers: Option<usize>,
     pub peak_align_workers: Option<usize>,
 }
@@ -148,9 +127,7 @@ pub struct StackReport {
 /// not a field on `DeviceBudgetReport`, because that number does not exist
 /// until the scheduler has run.
 pub trait DevicePeak {
-    /// Restarts the high-water interval [`Self::peak_in_flight`] reads back
-    /// -- see `run_group`'s single call site for why it sits immediately
-    /// before `job::drive` rather than at the top of the function.
+    /// Restarts the high-water interval [`Self::peak_in_flight`] reads back.
     fn reset_peak(&self);
     fn peak_in_flight(&self) -> usize;
 }
@@ -164,11 +141,9 @@ pub struct DeviceBudgetReport {
 }
 
 /// `resolve_backend`'s return value: a named struct rather than a growing
-/// tuple, since a third `Option<&'static dyn ...>` element would be a
-/// plausible `clippy::type_complexity` trip (warn-by-default, and the gate
-/// runs `clippy … -D warnings`). `backend` and `device_peak` coerce from the
-/// *same* `&'static GpuBackend` binding on the GPU path, so nothing re-enters
-/// the `GPU_BACKEND` `OnceLock` and no second probe or ceiling is observed.
+/// tuple of `Option`s. `backend` and `device_peak` coerce from the *same*
+/// `&'static GpuBackend` binding on the GPU path, so nothing re-enters the
+/// `GPU_BACKEND` `OnceLock` and no second probe or ceiling is observed.
 pub struct BackendChoice {
     pub backend: Option<&'static dyn TileBackend>,
     pub device_budget: Option<DeviceBudgetReport>,
@@ -199,7 +174,7 @@ pub struct StackAlignReport {
     pub alignments: Vec<AlignmentEntry>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ParamReport {
     pub id: String,
     pub value: ParamValue,
@@ -293,9 +268,9 @@ pub fn run(
         Err(msg) => return refuse(msg),
     };
 
-    // Step 1a: the preset, ahead of everything else -- a malformed file is
-    // refused before a frame is opened, and its `algo` key is what step 2
-    // falls back to.
+    // The preset, ahead of everything else -- a malformed file is
+    // refused before a frame is opened, and its `algo` key is what
+    // algorithm resolution below falls back to.
     let file = match preset::load(preset_opts.preset) {
         Ok(preset) => preset,
         Err(msg) => return refuse(msg),
@@ -304,7 +279,7 @@ pub fn run(
         return refuse("--dry-run and --resume are incompatible: a dry run writes nothing, so there is nothing to resume into".to_string());
     }
 
-    // Step 2: resolve the algorithm first, before anything else -- an
+    // Resolve the algorithm first, before anything else -- an
     // unknown or missing id is refused before the input directory (which
     // may not even exist) is ever touched. `--algo` beats the preset's own
     // `algo` key: one rule, flag beats file.
@@ -328,24 +303,15 @@ pub fn run(
         },
     };
 
-    // `Laplacian` (`crates/core/src/gpu.rs`'s own doc comment: "the WGSL
-    // twin of ... `Laplacian::fuse`"). Every other registered algorithm
-    // (`weighted-average`, `depth-map`, and any test-only one) has no GPU
-    // implementation and must stay on the CPU path regardless of whether a
-    // usable adapter exists -- resolving (and reporting) a backend at all is
-    // therefore gated on the selected algorithm's own id, compared against
-    // `Laplacian`'s own `id()` rather than a bare string literal repeated
-    // here.
-    let choice = if algo.id() == Laplacian.id() {
-        crate::resolve_backend(no_gpu, max_vram)
-    } else {
-        BackendChoice::cpu()
-    };
+    // This crate's GPU backend is a WGSL port of exactly one algorithm, so
+    // every other id stays on the CPU path -- `crate::resolve_backend`
+    // (`focusforge_gpu::harness::backend_for`) holds that gate itself.
+    let choice = crate::resolve_backend(algo.id(), no_gpu, max_vram);
     let backend = choice.backend;
     let device_budget_report = choice.device_budget;
     let device_peak = choice.device_peak;
 
-    // Step 3: parse `--set` against that schema and overlay it on the
+    // Parse `--set` against that schema and overlay it on the
     // preset's `[stack]` table. An unknown key or an out-of-range value is
     // refused here -- from either source, with the same `ParamViolation`
     // rendering -- with the input directory still unread.
@@ -375,7 +341,7 @@ pub fn run(
         return refuse(msg);
     }
 
-    // Step 3b: the grouping, before any work starts. `propose` reads
+    // The grouping, before any work starts. `propose` reads
     // directory entries and header tags only -- no tile, no pixel -- and
     // `--groups` replaces its verdict wholesale.
     let walked = match propose(dir) {
@@ -409,7 +375,7 @@ pub fn run(
         return refuse(msg);
     }
 
-    // Step 9: `--only` subset selection. Identities are computed against
+    // `--only` subset selection. Identities are computed against
     // the **full** proposal, before any filtering -- a subset selection
     // must never change what a group is called, or a re-run could not be
     // matched back to the original record.
@@ -565,9 +531,8 @@ struct RunSetup<'a> {
 }
 
 /// What one group's run ended as. The outer driver owns every print of a
-/// document, so a single-group run emits exactly today's `StackReport` and
-/// a multi-group run emits one wrapping document instead of N concatenated
-/// ones.
+/// document, so a single-group run emits a `StackReport` and a multi-group
+/// run emits one wrapping document instead of N concatenated ones.
 enum GroupResult {
     Completed(Box<StackReport>),
     DryRun(Box<DryRunPlan>),
@@ -620,7 +585,7 @@ fn project_path(out_dir: Option<&Path>, group: &Group) -> PathBuf {
 /// "unexpected argument '--zmap'".
 fn zmap_flag_refusal(zmap: &Path) -> String {
     format!(
-        "a project carries its own Z-Map, so `--zmap {}` is gone from `stack`. \
+        "`stack` does not take `--zmap {}`: a project carries its own Z-Map. \
          Run `focusforge-cli export <project> --zmap {}` after the run.",
         zmap.display(),
         zmap.display()
@@ -789,11 +754,8 @@ pub(crate) fn manifest_path(out_dir: Option<&Path>, root: &Path) -> PathBuf {
     }
 }
 
-/// Prints whatever the run produced: for **one** group exactly today's
-/// document, for many a single wrapping one. `stack --json`'s standing
-/// contract is that *a* document on stdout means a completed run, so N
-/// concatenated documents is not an option, and hollowing out the frozen
-/// `StackReport` is not either (`DryRunPlan` is the precedent).
+/// Prints whatever the run produced: one group, a `StackReport`; several,
+/// one wrapping document (a document on stdout means a completed run).
 fn report_results(results: &[GroupResult], json: bool) {
     if results.len() == 1 {
         match &results[0] {
@@ -860,11 +822,10 @@ fn print_document<T: Serialize>(value: &T, json: bool, human: fn(&T) -> String) 
 /// One group's stack, from the checks before the run to the composite. The
 /// frames arrive as a slice instead of being enumerated here.
 ///
-/// Everything downstream already took a path slice
-/// (`TiffStack::open_files`), so a one-group proposal hands this function
-/// precisely `frame_paths(dir)`'s own vector, in its own order, which is
-/// what makes the single-stack equivalence true by construction rather than
-/// by a special case.
+/// Everything downstream already takes a path slice (`TiffStack::open_files`),
+/// so a one-group proposal hands this function precisely `frame_paths(dir)`'s
+/// own vector, in its own order, which is what makes the single-stack
+/// equivalence true by construction rather than by a special case.
 ///
 /// The per-group state lives here on purpose: one `StatusSink` (whose `Drop`
 /// assertion is per instance, so one record per group), one
@@ -910,27 +871,23 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     let _stack = tracing::debug_span!("stack", identity = %identity).entered();
     // Inside the span, so a forced crash carries this run's own context.
     focusforge_diagnostics::force_crash("stack");
-    // One monotonic timer built from the same `Instant` `failed`/
-    // `cancelled` already use for `wall_seconds`, so a completed run's
-    // stage breakdown and its own `wall_seconds` share one clock exactly.
-    let mut timer = StageTimer::from_start(start);
-    timer.enter(Stage::Setup);
-    let mut renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.quiet));
+    let renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.quiet));
     let status = StatusSink::new(preset_opts.status, identity, "stack");
     status.set_algorithm(algo.id());
 
-    // Step 4 (`--output`'s parent) is the outer driver's now: it is
-    // group-independent, and it must fire before the input directory is
-    // read at all, which grouping does.
+    // `--output`'s parent is the outer driver's: it is group-independent,
+    // and it must fire before the input directory is read at all, which
+    // grouping does.
     //
-    // Step 5: this group's frames, already enumerated by the proposal, and
-    // the strict uniformity guard.
+    // This group's frames, already enumerated by the proposal, and the
+    // strict uniformity guard, are opened here too (not only inside the
+    // driver) because `--write-preset` and `--dry-run` must report without
+    // ever entering `focusforge_core::pipeline::run`.
     let paths = group.frames.clone();
     let stack = match TiffStack::open_files(&paths) {
         Ok(stack) => stack,
         Err(err) => return failed(&status, start, err),
     };
-    let frame_reader: &dyn FrameReader = &stack;
     let frame_names: Vec<String> = paths
         .iter()
         .map(|p| {
@@ -939,12 +896,13 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 .unwrap_or_else(|| p.display().to_string())
         })
         .collect();
+    let frame_reader: &dyn FrameReader = &stack;
     let frame_descs: Vec<(&str, &focusforge_core::io::FrameDesc)> = frame_names
         .iter()
         .enumerate()
         .map(|(i, name)| (name.as_str(), frame_reader.frame(i)))
         .collect();
-    let (uniform, detail) = crate::uniform_check(&frame_descs);
+    let (uniform, detail) = focusforge_core::pipeline::uniform_check(&frame_descs);
     if !uniform {
         return failed(
             &status,
@@ -953,7 +911,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         );
     }
 
-    // Step 6: refuse an output that is also an input frame.
+    // Refuse an output that is also an input frame.
     if let Some(name) = colliding_frame(output, &paths, &frame_names) {
         return failed(
             &status,
@@ -965,7 +923,8 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         );
     }
 
-    // Step 7: resolve parameters.
+    // Resolved here for the report/plan only; the real run re-resolves
+    // inside the driver against the frames it actually opens.
     let stack_ctx = frame_reader.stack_context();
     let (width, height) = (stack_ctx.width, stack_ctx.height);
     let spp = stack_ctx.samples_per_pixel;
@@ -973,81 +932,12 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         Ok(resolved) => resolved,
         Err(err) => return failed(&status, start, err),
     };
-    let values = params::resolved_values(&resolved);
 
-    // Bridges the resolved pyramid depth into the scheduler geometry via a
-    // trait method.
-    let levels = algo.tile_levels(&values);
-
-    // Header-only stack fingerprint -- cheap, needed both to peek a
-    // resumable ledger below and to build this run's own `JobRecord`, and
-    // as the stage cache key: one fingerprint, one definition, two
-    // consumers.
-    let fingerprint = StackFingerprint {
-        frames: (0..frame_reader.len())
-            .map(|i| FrameFingerprint::from(frame_reader.frame(i)))
-            .collect(),
-    };
-    let stage_cache = match StageCache::open(Path::new(".scratch")) {
-        Ok(cache) => cache,
-        Err(err) => return failed(&status, start, err.to_string()),
-    };
-
-    // Step 6: scheduler tuning flags, before alignment -- they reach the
-    // scheduler regardless of whether alignment runs at all.
-    let mut options = TileSchedulerOptions::new(".scratch");
-    options.levels = levels;
-    if let Some(tile_size) = job_opts.tile_size {
-        options.tile_size = tile_size;
-    }
-    // `--max-host-memory` is a ceiling only: it can lower the host-derived
-    // budget, never raise it (`capped_to`). Applied here, before alignment,
-    // so it is already in effect for the `--resume` peek below.
-    options.budget = options.budget.capped_to(max_host_memory);
-
-    // Alignment, between the stack algorithm's own parameters and the
-    // scheduler build. Computed *before* any output file exists: a
-    // strict-mode failure refuses here.
-    //
-    // `used_peeked_alignment`: when `--resume` finds a matching,
-    // already-recorded alignment under `.scratch/resume/`
-    // (`peek_resumable_crop_and_alignment`), `align_stack` is skipped
-    // entirely -- both its ~240s reference-scale cost and the stage line
-    // below -- and the ledger's own recorded `StackAlignment` is reused
-    // verbatim, so a resumed run's coordinates can never drift from the
-    // tiles the interrupted run already wrote. `crop_rect_value` below is
-    // *always* recomputed via `auto_crop`, peeked or not: it is cheap, pure
-    // geometry over whichever `StackAlignment` is in hand, so it never
-    // needs peeking of its own, and computing it consistently the same way
-    // every time is what keeps a resumed run's composite/Z-Map header
-    // byte-identical to the interrupted run's.
-    let mut align_identity: Option<AlignIdentity> = None;
-    let mut alignment_result: Option<(
-        &'static dyn focusforge_core::algorithm::AlignAlgorithm,
-        StackAlignment,
-        ParamValues,
-        Vec<ParamReport>,
-    )> = None;
-    let mut used_peeked_alignment = false;
-    // `true` only when the alignment came from the stage cache --
-    // never for a computed one, a ledger-peeked one, or a `--no-align` run.
-    let mut align_cached = false;
-    // `align_cached` alone cannot tell a `--resume` reuse from a genuinely
-    // fast compute (both are `false`), so this field names all four ways
-    // the align stage can be satisfied. Overwritten below the moment any
-    // non-`--no-align` path is taken; stays `"skipped"` only when
-    // `align_prepared` is `None`.
-    let mut align_source = "skipped".to_string();
-    // `Some` only in the "computed" arm below -- a cached, resumed or
-    // skipped alignment never earns a worker count.
-    let mut align_workers: Option<usize> = None;
-    let mut peak_align_workers: Option<usize> = None;
-
-    // Step 8.5a: *resolving* the alignment algorithm and its parameters is
-    // pure -- registry lookup, `--align-set`/`[align]` validation, `auto`
-    // evaluation -- and is split out from *running* `align_stack` below so
-    // `--write-preset` and `--dry-run` can report the alignment half without
-    // paying for the ECC solve (~240 s on the reference stack).
+    // Resolving the alignment algorithm and its parameters is pure --
+    // registry lookup, `--align-set`/`[align]` validation, `auto`
+    // evaluation -- and is split out from running alignment (inside the
+    // driver) so `--write-preset` and `--dry-run` can report the alignment
+    // half without paying for the ECC solve.
     let align_prepared = if align_opts.align {
         let align_algo = match resolve_align_algo(align_opts.algo.or(file.align_algo.as_deref())) {
             Ok(a) => a,
@@ -1074,7 +964,6 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             Ok(r) => r,
             Err(err) => return failed(&status, start, err),
         };
-        let align_values = params::resolved_values(&align_resolved);
         let align_params: Vec<ParamReport> = align_resolved
             .into_iter()
             .map(|(id, r)| ParamReport {
@@ -1083,7 +972,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 provenance: r.provenance,
             })
             .collect();
-        Some((align_algo, align_explicit, align_values, align_params))
+        Some((align_algo, align_explicit, align_params))
     } else {
         None
     };
@@ -1101,7 +990,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             stack: explicit.clone(),
             align: align_prepared
                 .as_ref()
-                .map(|(_, e, ..)| e.clone())
+                .map(|(_, e, _)| e.clone())
                 .unwrap_or_default(),
         };
         if let Err(msg) = preset::write(&written, path) {
@@ -1109,14 +998,19 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         }
     }
 
-    // `--dry-run`: resolve, report, exit 0 -- inserted **before** the
-    // alignment arm below, so `align_stack` (~240 s on the reference stack)
-    // never runs, and before the `.partial` files, the `ResumeStore` and the
-    // ledger further down, so nothing is created anywhere.
-    // `TileScheduler::new` is pure: it builds a `TilePlan` and divides the
-    // byte budget, touching no file (`crates/core/src/tile/scheduler.rs`).
+    // `--dry-run`: resolve, report, exit 0 -- never enters the driver, so
+    // alignment (~240 s on the reference stack) never runs and nothing is
+    // created anywhere. `TileScheduler::new` is pure: it builds a `TilePlan`
+    // and divides the byte budget, touching no file.
     if preset_opts.dry_run {
-        let scheduler = match TileScheduler::new(&stack, stack_ctx, spp, &options) {
+        let levels = algo.tile_levels(&params::resolved_values(&resolved));
+        let mut options = TileSchedulerOptions::new(".scratch");
+        options.levels = levels;
+        if let Some(tile_size) = job_opts.tile_size {
+            options.tile_size = tile_size;
+        }
+        options.budget = options.budget.capped_to(max_host_memory);
+        let scheduler = match TileScheduler::new(frame_reader, stack_ctx, spp, &options) {
             Ok(scheduler) => scheduler,
             Err(err) => return failed(&status, start, err),
         };
@@ -1126,7 +1020,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         let plan = DryRunPlan {
             dry_run: true,
             input: dir.display().to_string(),
-            frame_count: stack.len(),
+            frame_count: frame_reader.len(),
             width,
             height,
             samples_per_pixel: spp,
@@ -1142,17 +1036,10 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 .collect(),
             align: align_prepared
                 .as_ref()
-                .map(|(align_algo, _, _, params)| DryRunAlignPlan {
+                .map(|(align_algo, _, params)| DryRunAlignPlan {
                     algorithm: align_algo.id().to_string(),
                     display_name: align_algo.display_name().to_string(),
-                    params: params
-                        .iter()
-                        .map(|p| ParamReport {
-                            id: p.id.clone(),
-                            value: p.value.clone(),
-                            provenance: p.provenance,
-                        })
-                        .collect(),
+                    params: params.clone(),
                 }),
             tile_size: geometry.tile_size(),
             levels: geometry.levels(),
@@ -1173,435 +1060,65 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         return GroupResult::DryRun(Box::new(plan));
     }
 
-    timer.mark(Stage::Setup);
-    if let Some((align_algo, _, align_values, align_params)) = align_prepared {
-        timer.enter(Stage::Align);
-        // Step 5: resolved once, fed both to the identity below and to
-        // `align_stack` (never re-derived in the miss arm).
-        let policy = if align_opts.lax {
-            focusforge_core::align::FailurePolicy::IdentityFallback
-        } else {
-            focusforge_core::align::FailurePolicy::Strict
-        };
-        let identity = AlignIdentity {
-            algorithm: align_algo.id().to_string(),
-            params: align_values.clone(),
-            failure_policy: policy,
-        };
-        align_identity = Some(identity.clone());
-
-        let peeked = if job_opts.resume {
-            peek_resumable_crop_and_alignment(
-                Path::new(".scratch"),
-                &fingerprint,
-                options.tile_size,
-                options.levels,
-                algo.id(),
-                &values,
-                Some(&identity),
-            )
-        } else {
-            None
-        };
-
-        if let Some(peeked) = peeked.filter(|p| p.alignment.is_some()) {
-            let result = peeked.alignment.expect("filtered to Some above");
-            used_peeked_alignment = true;
-            align_source = "resumed".to_string();
-            alignment_result = Some((align_algo, result, align_values, align_params));
-        } else {
-            // Step 6: the stage cache lookup. Consulted only when the
-            // ledger peek above returned nothing (`--resume` with no
-            // matching ledger, or no `--resume` at all) -- ordering is
-            // fixed: a peeked alignment is the value the already-written
-            // tiles were produced against and always wins.
-            let stage_key = StageKey::align(&fingerprint, &identity);
-            let cache_hit = if job_opts.cache {
-                stage_cache.get_alignment(&stage_key)
-            } else {
-                None
-            };
-
-            if let Some(result) = cache_hit {
-                align_cached = true;
-                align_source = "cached".to_string();
-                renderer.stage(&format!(
-                    "align {} frames (reused from the stage cache)",
-                    stack.len()
-                ));
-                alignment_result = Some((align_algo, result, align_values, align_params));
-            } else {
-                // Step 9 (unnumbered in the align stage): `align_stack` has
-                // no unit boundary -- a scoped watcher thread prints the
-                // cancellation notice the moment a SIGINT is observed, so
-                // the terminal never looks hung for the whole alignment's
-                // wall time, and once it returns, a still-set cancel exits
-                // 130 before anything is created (below).
-                renderer.stage(&format!("align {} frames (no unit progress)", stack.len()));
-                let done = AtomicBool::new(false);
-                let solved = std::thread::scope(|scope| {
-                    let watcher = scope.spawn(|| {
-                        let mut warned = false;
-                        while !done.load(Ordering::SeqCst) {
-                            std::thread::sleep(job::POLL);
-                            if !warned && signals.cancel.load(Ordering::SeqCst) {
-                                let notice = "cancel requested -- alignment has no unit \
-                                     boundary; stopping at the fuse stage (Ctrl-C again to \
-                                     abort now)";
-                                eprintln!("{notice}");
-                                tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "{notice}");
-                                warned = true;
-                            }
-                        }
-                    });
-                    let result = align_stack_with(
-                        align_algo,
-                        stack_ctx,
-                        frame_reader,
-                        &align_values,
-                        policy,
-                        &AlignDriverOptions::default(),
-                    );
-                    done.store(true, Ordering::SeqCst);
-                    watcher.join().expect("align watcher thread must not panic");
-                    result
-                });
-                if signals.cancel.load(Ordering::SeqCst) {
-                    return cancelled(&status, start);
-                }
-                let run = match solved {
-                    Ok(r) => r,
-                    Err(err) => return failed(&status, start, err),
-                };
-                align_workers = Some(run.worker_limit);
-                peak_align_workers = Some(run.peak_workers);
-                let result = run.alignment;
-                if !align_opts.lax && result.failure_count() > 0 {
-                    let names: Vec<String> = result
-                        .failed()
-                        .map(|f| format!("{} ({:?})", frame_names[f.frame], f.status))
-                        .collect();
-                    return failed(
-                        &status,
-                        start,
-                        format!(
-                            "alignment failed for {} frame(s): {}",
-                            names.len(),
-                            names.join(", ")
-                        ),
-                    );
-                }
-                // A run about to refuse (above) caches nothing. A `put`
-                // failure warns on stderr and does not fail the run -- the
-                // posture `write_manifest`'s own caller already takes.
-                if job_opts.cache
-                    && let Err(err) = stage_cache.put_alignment(&stage_key, &paths, &result)
-                {
-                    eprintln!("warning: {err}");
-                    tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "warning: {err}");
-                }
-                align_source = "computed".to_string();
-                alignment_result = Some((align_algo, result, align_values, align_params));
-            }
+    // The real run: hand the whole align -> fuse -> seal spine to
+    // `focusforge_core::pipeline::run`, exactly the call `crates/gui`'s own
+    // worker makes -- one driver, two front ends.
+    let align_request = align_prepared.map(|(align_algo, align_explicit, _)| {
+        focusforge_core::pipeline::AlignRequest {
+            algorithm: align_algo,
+            explicit: align_explicit,
+            lax: align_opts.lax,
         }
-        // Marked only inside this arm: `--no-align` never enters this
-        // `if let` at all, so the stage stays `None` -- "not entered"
-        // rather than a near-zero measured span.
-        timer.mark(Stage::Align);
-    }
-    timer.enter(Stage::Fuse);
-
-    // The alignment used to compute the crop and to drive the tile reader:
-    // the real result when aligned, or an all-identity one otherwise --
-    // `--no-align` with the crop left on still trims the kernel-radius
-    // margin (the two flags are independent), and going through the same
-    // `auto_crop` call in both cases (peeked alignment or not: `auto_crop`
-    // is cheap, pure geometry, never the expensive part) is what guarantees
-    // the rect matches what `align --json` reports for the same stack, and
-    // what a resumed run recomputes identically to the interrupted run it
-    // continues.
-    let alignment_for_crop: StackAlignment = match &alignment_result {
-        Some((_, result, _, _)) => result.clone(),
-        None => identity_alignment_for_crop(stack.len()),
-    };
-    let crop_rect_value = match auto_crop(&alignment_for_crop, (width, height)) {
-        Ok(c) => c,
-        Err(err) => return failed(&status, start, err),
-    };
-    if align_opts.crop && crop_rect_value.is_none() {
-        return failed(&status, start, crate::align::empty_crop_refusal());
-    }
-    let applied_crop = if align_opts.crop {
-        crop_rect_value
-    } else {
-        None
-    };
-
-    let description = alignment_result
-        .as_ref()
-        .map(|(align_algo, result, values, _params)| {
-            let mode = values
-                .get("mode")
-                .and_then(ParamValue::as_enum)
-                .unwrap_or("n/a");
-            format_composite_description(
-                align_algo.id(),
-                result.reference,
-                mode,
-                crop_rect_value.map(|r| (r, align_opts.crop)),
-            )
-        });
-
-    let transforms: Vec<Transform> = alignment_for_crop
-        .frames
-        .iter()
-        .map(|f| f.transform)
-        .collect();
-    let warping_reader = WarpingReader::new(frame_reader, (width, height), spp, transforms.clone());
-
-    // Builds the scheduler over the warping reader -- bit-identical to
-    // `&stack` when every transform is identity (the decorator's own
-    // short-circuit), which is what keeps `--no-align --no-crop` byte for
-    // byte with the unaligned path. `TileError::NoInterior` fires here, if
-    // it fires at all, before any tile is read.
-    //
-    // With a backend selected, the scheduler is built over `&stack` (the
-    // raw reader) instead: the GPU path pulls its own footprint-grown
-    // source rects through `BackendFusionConsumer` and must not receive
-    // CPU-warped pixels.
-    //
-    // `options` is built far above, before alignment, so `--tile-size` and
-    // `--max-host-memory` are already in effect for the resume peek --
-    // never rebuilt here.
-    let reader: &dyn focusforge_core::algorithm::TileReader = match &backend {
-        Some(_) => frame_reader,
-        None => &warping_reader,
-    };
-    let scheduler = match TileScheduler::new(reader, stack_ctx, spp, &options) {
-        Ok(scheduler) => scheduler,
-        Err(err) => return failed(&status, start, err),
-    };
-
-    // Step 10: the staging area. Fusion still writes two TIFFs -- a project
-    // cannot be written tile by tile, because a blob's entry name *is* the
-    // content hash of the finished plane and zstd has no seekable format --
-    // and the project is sealed from them once the job completes.
-    //
-    // They live under `.scratch/`, never beside the target: `propose`'s walk
-    // descends into every subdirectory, so a staging *directory* left beside
-    // the frames by an interrupted run would be proposed as an extra group
-    // on the next run. Only the sealed container's `.partial` file sits
-    // beside the target, and a `.partial` file is invisible to that walk
-    // (`frame_paths` filters `*.tif`/`*.tiff`).
-    //
+    });
     // The key is the group name plus a short digest of the project path it
     // will seal into. It must be stable across runs or `--resume` cannot
     // find its ledger (`ResumeStore::find` skips a candidate whose
-    // `composite_output` no longer exists) -- the same invocation always
+    // `composite_output` does not exist) -- the same invocation always
     // produces the same key. The digest is what keeps two *different* runs
     // that happen to propose the same group name apart: with the name
     // alone, two runs collecting into two different `-o` directories would
     // fight over one staging directory, which is not a collision the user
     // asked for. With it, two runs collide exactly when they already share
     // an output path.
-    let staging = Path::new(".scratch/projects").join(format!(
+    let staging_key = format!(
         "{}-{}",
         group.name,
         project::short_hash(&output.display().to_string())
-    ));
-    if let Err(err) = std::fs::create_dir_all(&staging) {
-        return failed(
-            &status,
-            start,
-            format!("creating {}: {err}", staging.display()),
-        );
-    }
-    let staged_composite = staging.join("composite.tif");
-    let staged_zmap = staging.join("zmap.tif");
-
-    let geometry = FusionGeometry {
-        width,
-        height,
-        samples_per_pixel: spp,
-        frame_count: stack.len() as u32,
-        crop: applied_crop,
-        description: description.clone(),
+    );
+    let request = focusforge_core::pipeline::FuseRequest {
+        frames: paths.clone(),
+        output: focusforge_core::pipeline::FuseOutput::Seal(output.to_path_buf()),
+        scratch_root: PathBuf::from(".scratch"),
+        staging_key,
+        algorithm: algo,
+        explicit,
+        align: align_request,
+        crop: align_opts.crop,
+        tile_size: job_opts.tile_size,
+        max_host_memory,
+        backend,
+        resume: job_opts.resume,
+        cache: job_opts.cache,
+        poll: job::POLL,
     };
 
-    // Resolved **here**, in one place: the exact `ImageDescription` the
-    // staged composite carries, so the manifest records it and `export`
-    // re-emits a byte-identical file. `None` is `TiffWriter`'s own default,
-    // and guessing at that string rather than asking for it is how the two
-    // drift apart.
-    let composite_description = description
-        .clone()
-        .unwrap_or_else(TiffSpec::default_description);
-
-    // Resolved once: the ledger's identity and the report's `backend` field
-    // are the same fact, and a resume that compared a differently-spelled
-    // copy of it would refuse (or accept) for the wrong reason.
+    // Resolved once: the report's `backend` field, and the ledger's own
+    // identity inside the driver, are the same fact.
     let backend_id = backend
         .map(|b| b.info().to_string())
         .unwrap_or_else(|| "cpu".to_string());
 
-    // Step 7: the ledger, around the `.partial` discipline above.
-    // `composite_output` is the `.partial` path, never the final name --
-    // `ResumeStore::find` skips a candidate whose `composite_output` no
-    // longer exists, and the final name only appears after a successful
-    // rename.
-    let record = JobRecord {
-        format: JOB_RECORD_FORMAT,
-        fingerprint,
-        width,
-        height,
-        samples_per_pixel: spp,
-        frame_count: stack.len(),
-        tile_size: scheduler.plan().tile_size(),
-        levels: scheduler.plan().levels(),
-        stack_algorithm: algo.id().to_string(),
-        stack_params: values.clone(),
-        backend: backend_id.clone(),
-        align: align_identity,
-        crop: applied_crop,
-        composite_output: staged_composite.clone(),
-        zmap_output: Some(staged_zmap.clone()),
-    };
-    let resume_store = match ResumeStore::open(Path::new(".scratch")) {
-        Ok(store) => store,
+    let control = JobControl::new();
+    let stage_cache = match StageCache::open(Path::new(".scratch")) {
+        Ok(cache) => cache,
         Err(err) => return failed(&status, start, err.to_string()),
     };
-    let ledger = if job_opts.resume {
-        match resume_store.find(&record) {
-            Ok(Resumable::None) => {
-                return failed(
-                    &status,
-                    start,
-                    "no resumable state for this stack under .scratch/resume",
-                );
-            }
-            Ok(Resumable::Mismatch(mismatch)) => {
-                return failed(&status, start, mismatch.to_string());
-            }
-            Ok(Resumable::Ledger(ledger)) => ledger,
-            Err(err) => return failed(&status, start, err.to_string()),
-        }
-    } else {
-        // A non-resume run may legally disagree with old state -- a
-        // `Mismatch` here is not an error. Any matching ledger is
-        // discarded first: two cancelled runs over the same stack and
-        // output path would otherwise leave two ledgers, and
-        // `ResumeStore::find`'s pick among them is unspecified order.
-        match resume_store.find(&record) {
-            Ok(Resumable::Ledger(stale)) => {
-                if let Err(err) = stale.discard() {
-                    return failed(&status, start, err.to_string());
-                }
-            }
-            Ok(_) => {}
-            Err(err) => return failed(&status, start, err.to_string()),
-        }
-        match resume_store.begin(&record) {
-            Ok(ledger) => ledger,
-            Err(err) => return failed(&status, start, err.to_string()),
-        }
+    let observer = CliObserver {
+        renderer: Mutex::new(renderer),
+        signals,
+        control: Arc::clone(&control),
     };
 
-    // When no alignment was peeked, `align_stack` runs as usual and
-    // `ledger.record_alignment(&result)` records it at the align/fuse
-    // boundary. By construction, this is the *only* place that boundary can
-    // be: the ledger above is always either fresh (nothing recorded yet) or
-    // came from `find` after this run's own `record` already matched it in
-    // full including `align` identity, and a cancel can only ever happen
-    // once a ledger exists (`Job` -- hence any interruptible state -- is
-    // built after alignment resolves). A peeked alignment
-    // (`used_peeked_alignment`) is already the ledger's own recorded value
-    // and needs no re-recording.
-    if !used_peeked_alignment
-        && let Some((_, result, _, _)) = &alignment_result
-        && let Err(err) = ledger.record_alignment(result)
-    {
-        cleanup_staging(&staging);
-        let _ = ledger.discard();
-        return failed(&status, start, err.to_string());
-    }
-
-    // The resume composition -- `FusionConsumer::resume` when the ledger
-    // already recorded completed units, `FusionConsumer::create` otherwise;
-    // `Job::resuming`/`Job::new` to match. Both paths wrap the consumer in
-    // `RecordingConsumer` before handing it to `job::drive`.
-    let is_resuming = !ledger.completed().is_empty();
-    let (sink, surviving): (FusionConsumer, Option<Vec<usize>>) = if is_resuming {
-        match FusionConsumer::resume(
-            scheduler.plan(),
-            ledger.completed(),
-            algo,
-            values.clone(),
-            &staged_composite,
-            Some(&staged_zmap),
-            geometry.clone(),
-        ) {
-            Ok((sink, surviving)) => (sink, Some(surviving)),
-            Err(err) => {
-                cleanup_staging(&staging);
-                let _ = ledger.discard();
-                return failed(&status, start, err);
-            }
-        }
-    } else {
-        match FusionConsumer::create(
-            algo,
-            values.clone(),
-            &staged_composite,
-            Some(&staged_zmap),
-            geometry,
-        ) {
-            Ok(sink) => (sink, None),
-            Err(err) => {
-                cleanup_staging(&staging);
-                let _ = ledger.discard();
-                return failed(&status, start, err);
-            }
-        }
-    };
-
-    let mut job = match &surviving {
-        Some(surviving) => Job::resuming(&scheduler, surviving),
-        None => Job::new(&scheduler),
-    };
-    let control = job.control();
-    // A fuse-stage entry line, unconditional and immediate (`eta --`, since
-    // no unit has finished yet) -- same reasoning as the align stage line:
-    // it gives a script or a human watching a redirected log a fact the
-    // instant the job starts, and it is what lets a test drive its SIGINT
-    // off "the first line observed" rather than a sleep
-    // (`crates/cli/tests/job_cli.rs`'s own doc comment).
-    renderer.start(&control.progress());
-    // The GPU consumer, when one was resolved, sits *between* the ledger and
-    // the `FusionConsumer`: `BackendFusionConsumer` supplies its own pixels
-    // and writes through `sink`'s `write_output`, while `RecordingConsumer`
-    // stays the outermost wrapper so every unit the engine completes is
-    // recorded on either path. `RecordingConsumer` forwards
-    // `supplies_own_pixels`, so wrapping it does not put the scheduler's
-    // host read loop back.
-    let backend_consumer = backend.map(|b| {
-        BackendFusionConsumer::new(
-            b,
-            frame_reader,
-            (width, height),
-            transforms,
-            spp,
-            levels,
-            &sink,
-        )
-    });
-    let consumer: &dyn TileConsumer = match &backend_consumer {
-        Some(bc) => bc,
-        None => &sink,
-    };
-    let recording = RecordingConsumer {
-        inner: consumer,
-        ledger: &ledger,
-    };
     // Reset here, not earlier: the only `VramBudget::acquire` call site in
     // the tree is inside `GpuBackend::warp_fuse_tile`, reached only through
     // the driver's own `BackendFusionConsumer` below -- so this is the last
@@ -1610,140 +1127,184 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     if let Some(peak) = device_peak {
         peak.reset_peak();
     }
-    let outcome = match job::drive(
-        &mut job,
-        &control,
-        &NoopPreprocess,
-        &recording,
-        &mut renderer,
-        signals,
-    ) {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            // A genuine error: `Job::run` already called `consumer.abort()`
-            // on this exact path, so `consumer.finish()` must never be
-            // attempted here.
-            cleanup_staging(&staging);
-            let _ = ledger.discard();
-            return failed(&status, start, err);
-        }
-    };
 
-    // Step 10: the three outcomes.
-    if outcome == JobOutcome::Cancelled {
-        // On cancel, the `.partial` file
-        // and the ledger deliberately survive -- no `finish()`, no rename,
-        // no `cleanup_partials`. Nothing on stdout: the `--json` report
-        // means a completed run, the same way every existing failure path
-        // prints no JSON.
-        let notice = format!(
-            "cancelled -- {} of {} unit(s) done; resume with: {}",
-            control.progress().units_done,
-            control.progress().unit_total,
-            job::resume_recipe(argv)
-        );
-        eprintln!("{notice}");
-        tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "{notice}");
-        return cancelled(&status, start);
-    }
-    // Marked only past the cancel return above: a cancelled run's timer is
-    // dropped with `GroupResult::Cancelled`, never turned into
-    // `StageTimings`; folding `prepare` into `fuse` means this one mark
-    // also closes the scheduler build/staging/ledger-open span above.
-    timer.mark(Stage::Fuse);
-    timer.enter(Stage::Finalize);
-    debug_assert_eq!(
-        outcome,
-        JobOutcome::Completed,
-        "job::drive never returns Paused"
+    let outcome = focusforge_core::pipeline::run(
+        &request,
+        &observer,
+        Arc::clone(&control),
+        Some(&stage_cache),
     );
 
-    let final_progress = control.progress();
-    let in_flight_limit = scheduler.in_flight_limit();
-    let tiles = final_progress.unit_total;
-    // On the CPU path every tile read reads every frame
-    // (`crates/core/src/tile/scheduler.rs`'s per-tile loop), so this is the
-    // exact count, not an approximation. On the GPU path the scheduler
-    // short-circuits its host read loop entirely and reads no frame-tile
-    // through it, so the only frame tiles a GPU run reads are the ones
-    // `BackendFusionConsumer` read itself after a device loss -- every frame
-    // of every tile it finished on the host, and `0` for a run whose device
-    // stayed healthy.
-    let frame_tiles_read = match &backend_consumer {
-        Some(consumer) => consumer.fallback_tiles() * stack.len(),
-        None => tiles * stack.len(),
-    };
-    // `peak_in_flight`: `Job::run` does not expose the per-segment
-    // `TileRunReport` `TileScheduler::run` returns (the job layer discards
-    // it after folding `completed`/`stopped` into `JobOutcome`), so the
-    // true observed peak concurrency is not available through this engine
-    // without a `core` change. `in_flight_limit` is used as the reported
-    // value: an honest upper bound, exact whenever the run never dropped
-    // below the scheduler's configured concurrency.
-    let peak_in_flight = in_flight_limit;
-
-    if let Err(err) = sink.finish() {
-        cleanup_staging(&staging);
-        let _ = ledger.discard();
-        return failed(&status, start, err);
-    }
-
-    // Step 11: seal the two staged planes into one project. This is where
-    // the two renames used to be: same seam, same failure posture -- any
-    // error cleans the staging directory, discards the ledger and fails the
-    // group, leaving neither a project at the named path nor a `.partial`
-    // beside it.
-    renderer.stage("seal project");
-    let metrics = measure_metrics(&staged_composite, &paths);
-    let sealed = project::seal(project::SealRequest {
-        project_path: output,
-        staged_composite: &staged_composite,
-        staged_zmap: &staged_zmap,
-        sources: &paths,
-        algorithm: algo.id(),
-        params: &values,
-        align: alignment_result
-            .as_ref()
-            .map(
-                |(align_algo, result, align_values, _)| project::AlignRecord {
-                    algorithm: align_algo.id().to_string(),
-                    params: align_values.clone(),
-                    reference: result.reference,
-                },
-            ),
-        composite_description,
-        label: None,
-        metrics,
-    });
-    let sealed = match sealed {
-        Ok(sealed) => sealed,
-        Err(err) => {
-            cleanup_staging(&staging);
-            let _ = ledger.discard();
-            return failed(&status, start, err);
+    match outcome {
+        Ok(focusforge_core::pipeline::FuseOutcome::Cancelled {
+            units_done,
+            unit_total,
+        }) => {
+            // The `.partial` file and the ledger deliberately survive a
+            // clean cancel. Nothing on stdout: the `--json` report means a
+            // completed run, the same way every failure path prints none.
+            let notice = format!(
+                "cancelled -- {units_done} of {unit_total} unit(s) done; resume with: {}",
+                job::resume_recipe(argv)
+            );
+            eprintln!("{notice}");
+            tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "{notice}");
+            cancelled(&status, start)
         }
-    };
-    cleanup_staging(&staging);
-    if let Err(err) = ledger.discard() {
-        return failed(&status, start, err.to_string());
+        Ok(focusforge_core::pipeline::FuseOutcome::Completed(report)) => {
+            let outputs = vec![sealed_path(&report)];
+            status.completed(&outputs);
+            let stack_report = build_stack_report(
+                dir,
+                algo,
+                backend_id,
+                device_budget_report,
+                device_peak,
+                align_opts,
+                *report,
+            );
+            GroupResult::Completed(Box::new(stack_report))
+        }
+        Err(err) => failed(&status, start, err.to_string()),
     }
-    // The completion line stays a fixed sentence: it is
-    // what `job_cli.rs` watches for, and a measured number belongs in the
-    // report and the manifest rather than in a line a test matches on.
-    renderer.finish("stack complete");
+}
 
-    let outputs = vec![sealed.path.display().to_string()];
-    status.completed(&outputs);
+/// Translates [`focusforge_core::pipeline::StageObserver`] into terminal
+/// rendering and signal handling: `stage`/`tick` render through the shared
+/// [`ProgressRenderer`] (called from the driver's poll thread, hence `Sync`);
+/// `tick` folds a pending SIGINT/SIGUSR1 into the control; `paused` blocks
+/// until a resume or a cancel.
+struct CliObserver<'a> {
+    renderer: Mutex<ProgressRenderer>,
+    signals: &'a signals::Signals,
+    control: Arc<JobControl>,
+}
 
-    let align_report = alignment_result.map(|(align_algo, result, _values, params)| {
-        let failure_count = result.failure_count();
-        let reference = result.reference;
-        let reference_policy = result.policy;
-        let alignments = crate::align::alignment_entries(&result, &frame_names);
+impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
+    fn stage(&self, stage: focusforge_core::pipeline::RunStage) {
+        use focusforge_core::pipeline::{AlignSource, RunStage};
+        let mut renderer = self
+            .renderer
+            .lock()
+            .expect("no thread panicked while rendering");
+        match stage {
+            // A peeked (resumed) alignment prints nothing -- it cost no
+            // wall time and is not a stage a viewer is waiting through.
+            RunStage::Align {
+                source: AlignSource::Resumed,
+                ..
+            } => {}
+            RunStage::Align {
+                frames,
+                source: AlignSource::Cached,
+            } => renderer.stage(&format!(
+                "align {frames} frames (reused from the stage cache)"
+            )),
+            RunStage::Align {
+                frames,
+                source: AlignSource::Computed,
+            } => renderer.stage(&format!("align {frames} frames")),
+            // A fuse-stage entry line, unconditional and immediate (`eta
+            // --`, since no unit has finished yet): it gives a script or a
+            // human watching a redirected log a fact the instant the job
+            // starts.
+            RunStage::Fuse => renderer.start(&self.control.progress()),
+            RunStage::Seal => renderer.stage("seal project"),
+            // The completion line's exact wording is what `job_cli.rs`
+            // watches for.
+            RunStage::Finished => renderer.finish("stack complete"),
+        }
+    }
+
+    fn tick(&self, progress: &focusforge_core::job::JobProgress) {
+        // `cancel` is only ever *read* here -- see `crate::signals`'
+        // module docs for why resetting it would disarm the second-Ctrl-C
+        // kill.
+        if self.signals.cancel.load(Ordering::SeqCst) {
+            self.control.cancel();
+        }
+        if self.signals.pause.swap(false, Ordering::SeqCst) {
+            match self.control.state() {
+                focusforge_core::job::ControlState::PauseRequested => self.control.clear(),
+                _ => self.control.pause(),
+            }
+        }
+        // A tick outside the fuse stage and a cached or absent alignment
+        // (`align_total == 0`) carries a stale or zeroed total and must not
+        // render.
+        if progress.stage == focusforge_core::job::JobStage::Fuse || progress.align_total > 0 {
+            self.renderer
+                .lock()
+                .expect("no thread panicked while rendering")
+                .tick(progress);
+        }
+    }
+
+    fn paused(&self, control: &focusforge_core::job::JobControl) {
+        self.renderer
+            .lock()
+            .expect("no thread panicked while rendering")
+            .stage("paused -- send SIGUSR1 to resume (Ctrl-C to cancel)");
+        loop {
+            std::thread::sleep(job::POLL);
+            if self.signals.cancel.load(Ordering::SeqCst) {
+                control.cancel();
+                return;
+            }
+            if self.signals.pause.swap(false, Ordering::SeqCst) {
+                control.clear();
+                return;
+            }
+        }
+    }
+
+    fn notice(&self, message: &str) {
+        eprintln!("{message}");
+        tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "{message}");
+    }
+}
+
+/// The project a CLI run sealed, displayed.
+fn sealed_path(report: &focusforge_core::pipeline::FuseReport) -> String {
+    match &report.product {
+        focusforge_core::pipeline::FuseProduct::Sealed(sealed) => sealed.path.display().to_string(),
+        focusforge_core::pipeline::FuseProduct::Held(_) => {
+            unreachable!("a seal request always reports a sealed project")
+        }
+    }
+}
+
+/// Assembles the frozen [`StackReport`] from the driver's
+/// [`focusforge_core::pipeline::FuseReport`] plus the facts only this crate
+/// knows: the input directory as the user wrote it, and the GPU-only device
+/// budget/peak (`crates/core` never learns what VRAM is).
+fn build_stack_report(
+    dir: &Path,
+    algo: &'static dyn StackAlgorithm,
+    backend_id: String,
+    device_budget_report: Option<DeviceBudgetReport>,
+    device_peak: Option<&'static dyn DevicePeak>,
+    align_opts: &AlignOptions<'_>,
+    report: focusforge_core::pipeline::FuseReport,
+) -> StackReport {
+    let outputs = vec![sealed_path(&report)];
+    let align = report.align.map(|a| {
+        let failure_count = a.alignment.failure_count();
+        let reference = a.alignment.reference;
+        let reference_policy = a.alignment.policy;
+        let alignments = crate::align::alignment_entries(&a.alignment, &report.frames);
         StackAlignReport {
-            algorithm: align_algo.id().to_string(),
-            display_name: align_algo.display_name().to_string(),
-            params,
+            algorithm: a.algorithm_id,
+            display_name: a.display_name,
+            params: a
+                .params
+                .into_iter()
+                .map(|(id, r)| ParamReport {
+                    id,
+                    value: r.value,
+                    provenance: r.provenance,
+                })
+                .collect(),
             reference,
             reference_policy,
             failure_policy: if align_opts.lax { "lax" } else { "strict" }.to_string(),
@@ -1751,22 +1312,17 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             alignments,
         }
     });
-
-    timer.mark(Stage::Finalize);
-    let wall_seconds = timer.total_seconds();
-    let stages = timer.finish();
-
-    let plan = scheduler.plan();
-    let report = StackReport {
+    StackReport {
         input: dir.display().to_string(),
-        frame_count: stack.len(),
-        frames: frame_names,
-        width,
-        height,
-        samples_per_pixel: spp,
+        frame_count: report.frame_count,
+        frames: report.frames,
+        width: report.width,
+        height: report.height,
+        samples_per_pixel: report.samples_per_pixel,
         algorithm: algo.id().to_string(),
         display_name: algo.display_name().to_string(),
-        params: resolved
+        params: report
+            .stack_params
             .into_iter()
             .map(|(id, r)| ParamReport {
                 id,
@@ -1774,207 +1330,39 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 provenance: r.provenance,
             })
             .collect(),
-        tile_size: plan.tile_size(),
-        levels: plan.levels(),
-        margin: plan.margin(),
-        tiles,
-        frame_tiles_read,
-        in_flight_limit,
-        peak_in_flight,
-        max_bytes_in_flight: scheduler.budget().bytes(),
-        budget_provenance: scheduler.budget().provenance(),
-        backed_off: scheduler.final_in_flight_limit() < in_flight_limit,
+        tile_size: report.tile_size,
+        levels: report.levels,
+        margin: report.margin,
+        tiles: report.tiles,
+        frame_tiles_read: report.frame_tiles_read,
+        in_flight_limit: report.in_flight_limit,
+        // `Job::run` does not expose the per-segment `TileRunReport`
+        // `TileScheduler::run` returns, so the true observed peak
+        // concurrency is not available through this engine. The configured
+        // limit is reported instead: an honest upper bound, exact whenever
+        // the run never dropped below the scheduler's configured
+        // concurrency.
+        peak_in_flight: report.in_flight_limit,
+        max_bytes_in_flight: report.max_bytes_in_flight,
+        budget_provenance: report.budget_provenance,
+        backed_off: report.backed_off,
         outputs,
-        wall_seconds,
-        output_width: applied_crop.map(|r| r.width).unwrap_or(width),
-        output_height: applied_crop.map(|r| r.height).unwrap_or(height),
-        crop: applied_crop,
-        description,
-        align: align_report,
+        wall_seconds: report.wall_seconds,
+        output_width: report.output_width,
+        output_height: report.output_height,
+        crop: report.crop,
+        description: report.description,
+        align,
         backend: backend_id,
         max_device_bytes_in_flight: device_budget_report.as_ref().map(|r| r.max_device_bytes),
         device_budget_provenance: device_budget_report.as_ref().map(|r| r.provenance),
         device_peak_in_flight: device_peak.map(|p| p.peak_in_flight()),
-        align_cached,
-        stages,
-        align_source,
-        align_workers,
-        peak_align_workers,
-    };
-
-    GroupResult::Completed(Box::new(report))
-}
-
-/// The sharpness window's maximum side. A whole-plane Laplacian variance is
-/// not computable here: `laplacian_variance` is whole-buffer and
-/// `crates/core/src/io` forbids assembling a whole frame from tiles, and
-/// "max over every source frame" at whole-frame size would mean a second
-/// full stack read per run. A named central window is what the manifest
-/// records instead, honestly, beside the numbers.
-const LAPVAR_WINDOW: u32 = 2048;
-
-/// The composite's and the sharpest source frame's Laplacian variance over
-/// one **central window**, measured identically on both so the ratio
-/// `review` divides stays meaningful.
-///
-/// Bounded memory (~100 MB at 2048x2048x3) and exactly one tile read per
-/// source frame. Every failure is silence rather than a refusal: a metric
-/// that could not be measured must not turn a completed stack into a
-/// failed one, and `Option` is what says so in the manifest.
-fn measure_metrics(composite: &Path, sources: &[PathBuf]) -> Metrics {
-    let Ok(stack) = TiffStack::open_files(std::slice::from_ref(&composite.to_path_buf())) else {
-        return Metrics::default();
-    };
-    let (width, height) = FrameReader::dimensions(&stack);
-    let spp = stack.frame(0).samples_per_pixel;
-    let side_w = LAPVAR_WINDOW.min(width);
-    let side_h = LAPVAR_WINDOW.min(height);
-    let window = centered(width, height, side_w, side_h);
-    let composite_lapvar = lapvar(&stack, window, spp);
-
-    // Sequentially, one frame at a time: each open maps that frame, and 61
-    // concurrent mappings would exceed an 8 GB ceiling.
-    let mut max_input_lapvar: Option<f64> = None;
-    for path in sources {
-        let Ok(frame) = TiffStack::open_files(std::slice::from_ref(path)) else {
-            continue;
-        };
-        let (fw, fh) = FrameReader::dimensions(&frame);
-        if fw < side_w || fh < side_h {
-            continue;
-        }
-        let fspp = frame.frame(0).samples_per_pixel;
-        let rect = centered(fw, fh, side_w, side_h);
-        if let Some(value) = lapvar(&frame, rect, fspp) {
-            max_input_lapvar = Some(max_input_lapvar.map_or(value, |m: f64| m.max(value)));
-        }
+        align_cached: report.align_cached,
+        stages: report.stages,
+        align_source: report.align_source,
+        align_workers: report.align_workers,
+        peak_align_workers: report.peak_align_workers,
     }
-
-    Metrics {
-        composite_lapvar,
-        max_input_lapvar,
-        lapvar_window: composite_lapvar.map(|_| window),
-    }
-}
-
-/// The `side_w` x `side_h` rect centred in a `width` x `height` plane.
-fn centered(width: u32, height: u32, side_w: u32, side_h: u32) -> Rect {
-    Rect {
-        x: (width - side_w) / 2,
-        y: (height - side_h) / 2,
-        width: side_w,
-        height: side_h,
-    }
-}
-
-/// `laplacian_variance` over one window of frame 0 through `reader`, or `None`
-/// when that window cannot be read.
-fn lapvar(reader: &dyn TileReader, rect: Rect, spp: u32) -> Option<f64> {
-    let mut samples = vec![0u16; rect.width as usize * rect.height as usize * spp as usize];
-    reader.read_tile_into(0, rect, &mut samples).ok()?;
-    Some(focusforge_core::fuse::metrics::laplacian_variance(
-        &samples,
-        rect.width,
-        rect.height,
-        spp,
-    ))
-}
-
-/// An all-identity [`StackAlignment`] over `frame_count` frames: what
-/// `--no-align` feeds to `auto_crop` and the `WarpingReader`, so a crop
-/// still trims the kernel-radius margin even with alignment off, and the
-/// reader stays bit-identical to a direct read either way
-/// (`WarpingReader`'s own identity short-circuit).
-fn identity_alignment_for_crop(frame_count: usize) -> StackAlignment {
-    StackAlignment {
-        reference: 0,
-        policy: ReferencePolicy::Anchor,
-        frames: (0..frame_count)
-            .map(|i| FrameAlignment {
-                frame: i,
-                transform: Transform::identity(),
-                status: AlignStatus::Converged,
-                iterations: 0,
-                residual: 1.0,
-                fallback: false,
-            })
-            .collect(),
-    }
-}
-
-/// A resumable candidate's already-recorded `crop` and (if the ledger had
-/// already reached the fuse stage) `StackAlignment`, read directly off a
-/// matching `.scratch/resume/*/job.json` -- and that same ledger
-/// directory's `alignment.json`, when present -- so a `--resume` run can
-/// build a correct `JobRecord` for the authoritative `ResumeStore::find`
-/// call *without* first running `align_stack` to compute `crop` itself.
-/// Every field compared here (`fingerprint`, `tile_size`, `levels`,
-/// `stack_algorithm`, `stack_params`, `align` identity) is exactly what
-/// `ResumeStore::find` re-verifies afterward -- this function's own mistake
-/// costs only a missed optimization (falling back to running `align_stack`
-/// normally), never a wrong resume: nothing downstream trusts this peek's
-/// verdict on its own.
-fn peek_resumable_crop_and_alignment(
-    scratch_base: &Path,
-    fingerprint: &StackFingerprint,
-    tile_size: u32,
-    levels: u32,
-    stack_algorithm: &str,
-    stack_params: &ParamValues,
-    align_identity: Option<&AlignIdentity>,
-) -> Option<job::PeekedResume> {
-    let entries = std::fs::read_dir(scratch_base.join("resume")).ok()?;
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(dir.join("job.json")) else {
-            continue;
-        };
-        let Ok(candidate) = serde_json::from_str::<JobRecord>(&text) else {
-            continue;
-        };
-        if candidate.format != JOB_RECORD_FORMAT {
-            continue;
-        }
-        if !candidate.composite_output.exists() {
-            continue;
-        }
-        if &candidate.fingerprint != fingerprint {
-            continue;
-        }
-        if candidate.tile_size != tile_size || candidate.levels != levels {
-            continue;
-        }
-        if candidate.stack_algorithm != stack_algorithm {
-            continue;
-        }
-        if &candidate.stack_params != stack_params {
-            continue;
-        }
-        if candidate.align.as_ref() != align_identity {
-            continue;
-        }
-        // `read_alignment` decodes the same bit-exact `transform_bits` shape
-        // `alignment.json` is actually written in; any read failure
-        // (absent, unparsable) is treated as "no recorded alignment yet"
-        // here, same as everywhere else in this function.
-        let alignment = read_alignment(&dir.join("alignment.json")).ok().flatten();
-        return Some(job::PeekedResume { alignment });
-    }
-    None
-}
-
-/// Best-effort removal of one group's staging directory and both staged
-/// planes. Never fails the caller: a missing directory (the common case,
-/// when nothing was created yet) is not itself an error.
-///
-/// Called on **failure** and on success, never on cancel: a cancelled run
-/// deliberately keeps its staged planes *and* its ledger so `--resume` can
-/// continue.
-fn cleanup_staging(staging: &Path) {
-    let _ = std::fs::remove_dir_all(staging);
 }
 
 /// Refuses an `-o` that is not an existing directory.
@@ -2004,7 +1392,7 @@ fn check_output_dir(output: Option<&Path>) -> Result<(), String> {
     );
     if looks_like_an_image {
         message.push_str(
-            " A stacking run no longer writes an image: run \
+            " A stacking run writes projects, not images: run \
              `focusforge-cli export <project> -o <file>` afterwards.",
         );
     }
@@ -2082,12 +1470,8 @@ fn render(report: &StackReport) -> String {
     lines.join("\n")
 }
 
-/// One `stages:` fact -- `"{name}={value:.3}s"` for a stage that was
-/// entered, `"{name}=not-entered"` for one that was not. Never
-/// `"{name}=0.000s"` for a never-entered stage: that would read as work
-/// that happened instantly rather than work that never ran. Shared by
-/// [`render`] (`stack --json`'s human twin) and
-/// [`crate::align::render`] (`align --json`'s).
+/// One `stages:` fact: `"{name}={value:.3}s"` for an entered stage,
+/// `"{name}=not-entered"` otherwise (never `0.000s`, which reads as instant).
 pub(crate) fn stage_fact(name: &str, value: Option<f64>) -> String {
     match value {
         Some(seconds) => format!("{name}={seconds:.3}s"),
@@ -2167,12 +1551,8 @@ mod tests {
             width: 512,
             height: 512,
             samples_per_pixel: 3,
-            // A fictional id on purpose. This module is `crates/cli/src`,
-            // and the criterion that no algorithm id appears here is
-            // enforced by a literal `git grep` -- a gate with a
-            // documented exception for test data is not a gate. `render`
-            // formats whatever string it is handed, so a real id would
-            // buy the test nothing.
+            // A fictional id on purpose: no algorithm id appears anywhere in
+            // `crates/cli/src`, test data included.
             algorithm: "example-stack".to_string(),
             display_name: "Example Stacker".to_string(),
             params: vec![ParamReport {
@@ -2190,7 +1570,7 @@ mod tests {
             max_bytes_in_flight: 1 << 30,
             budget_provenance: Provenance::Host,
             backed_off: false,
-            outputs: vec!["mantis-512.ffproj".to_string()],
+            outputs: vec!["mantis-512.ffp".to_string()],
             wall_seconds: 1.5,
             output_width: 512,
             output_height: 512,
@@ -2234,7 +1614,7 @@ mod tests {
             "max_bytes_in_flight=1073741824",
             "budget=Host",
             "backed_off=false",
-            "wrote: mantis-512.ffproj",
+            "wrote: mantis-512.ffp",
             "wall: 1.500s",
             "backend: cpu",
             "stages:",
@@ -2305,7 +1685,7 @@ mod tests {
         assert!(message.contains("export"), "{message}");
         assert!(message.contains("out.tif"), "{message}");
         // A non-image path that is not a directory is still refused, just
-        // without the migration sentence.
+        // without the export hint.
         let plain = check_output_dir(Some(Path::new("/definitely/not/here"))).unwrap_err();
         assert!(!plain.contains("export"), "{plain}");
         assert!(check_output_dir(None).is_ok(), "omitting -o is legal");
@@ -2362,6 +1742,7 @@ mod tests {
             groups: vec![a, b],
             gap: std::time::Duration::from_secs(60),
             time_signal_available: false,
+            skipped: Vec::new(),
         };
         let identities = vec!["a".to_string(), "b".to_string()];
         let message = only_no_match_refusal("c", &proposal, &identities);
@@ -2384,50 +1765,43 @@ mod tests {
 
     #[test]
     fn merge_manifest_entries_keeps_unrelated_entries_and_replaces_matching_ones() {
-        let dir = std::env::temp_dir().join(format!("ff-stack-merge-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let guard = tempfile::TempDir::with_prefix("ff-stack-merge-test-").unwrap();
+        let dir = guard.path();
         let path = dir.join("manifest.json");
         let existing = groups::RunManifest {
             format: groups::MANIFEST_FORMAT,
             root: "root".to_string(),
             groups: vec![
-                sample_manifest_entry("a", "a.ffproj"),
-                sample_manifest_entry("b", "b.ffproj"),
+                sample_manifest_entry("a", "a.ffp"),
+                sample_manifest_entry("b", "b.ffp"),
             ],
         };
         std::fs::write(&path, serde_json::to_string(&existing).unwrap()).unwrap();
 
-        let fresh = vec![sample_manifest_entry("a", "a2.ffproj")];
+        let fresh = vec![sample_manifest_entry("a", "a2.ffp")];
         let merged = merge_manifest_entries(&path, "root", fresh);
         assert_eq!(merged.len(), 2);
         let a = merged.iter().find(|e| e.identity() == "a").unwrap();
-        assert_eq!(a.outputs, vec!["a2.ffproj".to_string()]);
+        assert_eq!(a.outputs, vec!["a2.ffp".to_string()]);
         let b = merged.iter().find(|e| e.identity() == "b").unwrap();
-        assert_eq!(b.outputs, vec!["b.ffproj".to_string()]);
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(b.outputs, vec!["b.ffp".to_string()]);
     }
 
     #[test]
     fn merge_manifest_entries_treats_a_mismatched_root_as_absent() {
-        let dir = std::env::temp_dir().join(format!(
-            "ff-stack-merge-mismatch-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
+        let guard = tempfile::TempDir::with_prefix("ff-stack-merge-mismatch-test-").unwrap();
+        let dir = guard.path();
         let path = dir.join("manifest.json");
         let existing = groups::RunManifest {
             format: groups::MANIFEST_FORMAT,
             root: "other-root".to_string(),
-            groups: vec![sample_manifest_entry("a", "a.ffproj")],
+            groups: vec![sample_manifest_entry("a", "a.ffp")],
         };
         std::fs::write(&path, serde_json::to_string(&existing).unwrap()).unwrap();
 
-        let fresh = vec![sample_manifest_entry("b", "b.ffproj")];
+        let fresh = vec![sample_manifest_entry("b", "b.ffp")];
         let merged = merge_manifest_entries(&path, "root", fresh);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].identity(), "b");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

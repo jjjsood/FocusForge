@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Process-level coverage of the stage cache's CLI surface --
-//! two-run reuse, the `--no-cache` bypass, `cache clear`, `--only` subset
-//! selection, the identity `review` prints, and the unknown-`--only`
-//! refusal.
+//! Process-level coverage of the stage cache's CLI surface -- two-run
+//! reuse, the `--no-cache` bypass, `cache`, `--only` subset selection, the
+//! identity `review` prints, and the unknown-`--only` refusal.
 //!
 //! Every test isolates `.scratch/` with its own per-process temp directory
-//! and `.current_dir(dir)`, exactly `crates/cli/tests/job_cli.rs`'s idiom:
-//! `.scratch/stage-cache/` is cwd-relative, so two concurrent test runs
-//! sharing one `target/` must never share a cache directory either.
+//! and `.current_dir(dir)`: `.scratch/stage-cache/` is cwd-relative, so two
+//! concurrent test runs sharing one `target/` must never share a cache
+//! directory either.
 //!
 //! `--algo laplacian --align-algo dummy-align` is the one recipe here that
 //! pays for a real fusion (a few seconds over `fixtures/mantis-512`);
 //! `dummy-align` reaches [`AlignStatus::Converged`] by construction, so no
 //! `--lax` is needed to keep the run from refusing. Every other test drives
-//! `dummy-stack --no-align`, milliseconds, the same dodge
-//! `crates/cli/tests/groups_cli.rs` and `review_cli.rs` already use.
+//! `dummy-stack --no-align`, milliseconds only.
 
 mod common;
 
@@ -147,7 +145,7 @@ fn cache_entry_count(cwd: &Path) -> usize {
 /// Every staged project directory under `<cwd>/.scratch/projects/` --
 /// `job_cli.rs`'s `staged_composites`, generalized to the directory rather
 /// than the one `composite.tif` inside it, since this file needs to prove
-/// the directory itself survives a `cache clear`.
+/// the directory itself survives a `cache`.
 fn staged_project_dirs(cwd: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(cwd.join(".scratch").join("projects"))
         .into_iter()
@@ -198,7 +196,7 @@ fn leave_a_cancelled_run_ledger(cwd: &Path) -> PathBuf {
         backend: "cpu".to_string(),
         align: None,
         crop: None,
-        composite_output: PathBuf::from("leftover.ffproj"),
+        composite_output: PathBuf::from("leftover.ffp"),
         zmap_output: None,
     };
     let store =
@@ -213,8 +211,8 @@ fn leave_a_cancelled_run_ledger(cwd: &Path) -> PathBuf {
 
 /// Two `stack` runs over `fixtures/mantis-512` differing only in a fusion
 /// parameter (`--set levels=…`): the second reuses the cached alignment
-/// (`align_cached: true`, no `align … frames (no unit progress)` stage
-/// line), and the reused alignment fuses to a composite byte-identical to
+/// (`align_cached: true`, no computed `align … frames` stage line), and the
+/// reused alignment fuses to a composite byte-identical to
 /// what a cold `--no-cache` recompute of the very same parameters produces
 /// -- the correctness half of "reuses the cached alignment", since a cache
 /// hit that merely runs fast but fuses wrong is still a bug.
@@ -252,7 +250,7 @@ fn fusion_parameter_change_reuses_alignment() {
         "the first run must compute, not reuse"
     );
     assert!(
-        a.stderr.contains("align 8 frames (no unit progress)"),
+        a.stderr.lines().any(|l| l == "align 8 frames"),
         "stderr: {}",
         a.stderr
     );
@@ -280,7 +278,7 @@ fn fusion_parameter_change_reuses_alignment() {
         "changing only a fusion parameter must reuse the cached alignment: {b_report}"
     );
     assert!(
-        !b.stderr.contains("align 8 frames (no unit progress)"),
+        !b.stderr.lines().any(|l| l == "align 8 frames"),
         "a cache hit must not print the computed-alignment stage line: {}",
         b.stderr
     );
@@ -313,8 +311,8 @@ fn fusion_parameter_change_reuses_alignment() {
     let c_report: serde_json::Value = serde_json::from_str(&c.stdout).expect("--json");
     assert_eq!(c_report["align_cached"], false);
 
-    let b_composite = export_composite(&cwd, &out_b.join("mantis-512.ffproj"));
-    let c_composite = export_composite(&cwd, &out_c.join("mantis-512.ffproj"));
+    let b_composite = export_composite(&cwd, &out_b.join("mantis-512.ffp"));
+    let c_composite = export_composite(&cwd, &out_c.join("mantis-512.ffp"));
     assert_eq!(
         read_pixels(&b_composite),
         read_pixels(&c_composite),
@@ -438,7 +436,7 @@ fn no_cache_flag_forces_a_recompute() {
         "--no-cache must force a recompute even though a valid entry exists"
     );
     assert!(
-        b.stderr.contains("align 8 frames (no unit progress)"),
+        b.stderr.lines().any(|l| l == "align 8 frames"),
         "stderr: {}",
         b.stderr
     );
@@ -449,8 +447,8 @@ fn no_cache_flag_forces_a_recompute() {
         "--no-cache must leave no entry behind"
     );
 
-    let a_composite = export_composite(&cwd, &out_a.join("mantis-512.ffproj"));
-    let b_composite = export_composite(&cwd, &out_b.join("mantis-512.ffproj"));
+    let a_composite = export_composite(&cwd, &out_a.join("mantis-512.ffp"));
+    let b_composite = export_composite(&cwd, &out_b.join("mantis-512.ffp"));
     assert_eq!(
         read_pixels(&a_composite),
         read_pixels(&b_composite),
@@ -460,7 +458,7 @@ fn no_cache_flag_forces_a_recompute() {
 
 // --- cache clear --------------------------------------------------------
 
-/// `cache clear` empties the stage cache and touches nothing else: a
+/// `cache` empties the stage cache and touches nothing else: a
 /// cancelled run's resume ledger, the sealed project, the run manifest and
 /// the tile scheduler's staging directory under `.scratch/projects/` all
 /// survive byte for byte (or, for a directory, simply survive).
@@ -495,7 +493,7 @@ fn cache_clear_removes_entries_and_nothing_else() {
     let ledger_dir = leave_a_cancelled_run_ledger(&cwd);
     let ledger_job_before = std::fs::read(ledger_dir.join("job.json")).unwrap();
 
-    let project_before = std::fs::read(out.join("mantis-512.ffproj")).unwrap();
+    let project_before = std::fs::read(out.join("mantis-512.ffp")).unwrap();
     let manifest_before = std::fs::read(out.join("manifest.json")).unwrap();
 
     // A completed run removes its staging directory, so build the one an
@@ -512,7 +510,7 @@ fn cache_clear_removes_entries_and_nothing_else() {
         "the leftover staging directory must be visible before the clear"
     );
 
-    let clear = run_cli_in(&cwd, &["cache", "clear", "--json"]);
+    let clear = run_cli_in(&cwd, &["cache", "--json"]);
     assert!(clear.success, "stderr: {}", clear.stderr);
     let clear_report: serde_json::Value = serde_json::from_str(&clear.stdout).expect("--json");
     assert_eq!(clear_report["removed"], 1);
@@ -529,7 +527,7 @@ fn cache_clear_removes_entries_and_nothing_else() {
         "a cancelled run's resume ledger must survive a cache clear byte for byte"
     );
     assert_eq!(
-        std::fs::read(out.join("mantis-512.ffproj")).unwrap(),
+        std::fs::read(out.join("mantis-512.ffp")).unwrap(),
         project_before,
         "the sealed project must survive a cache clear byte for byte"
     );
@@ -576,7 +574,7 @@ fn only_runs_the_named_results() {
         .unwrap()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "ffproj"))
+        .filter(|p| p.extension().is_some_and(|e| e == "ffp"))
         .collect();
     assert_eq!(projects.len(), 3, "one project per proposed group");
     let mtimes_before: Vec<(PathBuf, std::time::SystemTime)> = projects
@@ -751,7 +749,7 @@ fn unknown_only_value_fails_clearly() {
 
 /// Cache state never enters the project format or a user-visible output
 /// directory: no file under `-o` names the cache, and no byte sequence
-/// naming the cache appears inside the sealed `*.ffproj`. The store sits at
+/// naming the cache appears inside the sealed `*.ffp`. The store sits at
 /// `.scratch/stage-cache/`.
 #[test]
 fn the_cache_stays_in_the_scratch_directory() {
@@ -790,7 +788,7 @@ fn the_cache_stays_in_the_scratch_directory() {
         );
     }
 
-    let project_bytes = std::fs::read(out.join("mantis-512.ffproj")).unwrap();
+    let project_bytes = std::fs::read(out.join("mantis-512.ffp")).unwrap();
     let needle = b"stage-cache";
     assert!(
         !project_bytes

@@ -4,7 +4,7 @@
 //! and writes that one file -- the fourth file in the crate with a
 //! legitimate reason to touch storage
 //! (`crates/gui/tests/shell.rs`'s `checkpoint_panel_touches_no_storage`
-//! exclusion list, step 16). No `use slint::` anywhere in this file
+//! exclusion list). No `use slint::` anywhere in this file
 //! (`input_modules_are_slint_free`).
 
 use std::fs;
@@ -286,13 +286,9 @@ impl SerializedConfig {
 const HEADER: &str = "\
 # FocusForge input map.
 #
-# Each `trigger` must spell one of the nine bindings shipped below --
-# rebinding means reassigning one of THESE triggers' action, not naming a
-# device none of them already uses (a trigger spelling this file doesn't
-# already contain, such as \"right-click\", is refused, even though it is
-# valid spelling: wheel, left-drag, middle-drag, right-drag, left-click,
-# middle-click, right-click, or a single character, each optionally
-# prefixed by ctrl+/shift+/alt+/space+ in fixed order, e.g. \"ctrl+shift+z\").
+# Each `trigger` must be one of the bindings listed below; rebind by
+# changing its actions. A trigger this file does not already list is
+# refused.
 #
 # Accepted actions: zoom-at-cursor, step-source-frame, pan-horizontal,
 # overlay-opacity, pan, brush-size, brush-softness, undo, redo,

@@ -2,12 +2,7 @@
 
 //! `align_stack_with`'s anchor arm run in parallel, checked against the same
 //! arm run serially over the same input -- the behavioural counterpart of
-//! `align_parallel_memory.rs`'s memory test. Opens `fixtures/mantis-512` the
-//! way `crates/core/tests/align_algorithm.rs` does; the in-memory
-//! failure-policy reader is a duplicate of that file's own
-//! `FramesReader`/`XorShift32`, the same per-file reimplementation this
-//! crate's tests already practice rather than a shared dependency between
-//! two separate test binaries.
+//! `align_parallel_memory.rs`'s memory test.
 //!
 //! Every fixture-driven test here overrides `max-iterations` down to 40 from
 //! the shipped 400: an 8-frame fixture align at the shipped default costs
@@ -70,8 +65,8 @@ fn lowered_max_iterations(ctx: &StackContext) -> ParamValues {
     cfg
 }
 
-/// A deterministic xorshift32 PRNG, mirroring
-/// `crates/core/tests/align_algorithm.rs`'s own private generator.
+/// A deterministic xorshift32 PRNG, seeded with a fixed constant, local to
+/// this test file.
 struct XorShift32(u32);
 
 impl XorShift32 {
@@ -86,9 +81,7 @@ impl XorShift32 {
 }
 
 /// A synthetic in-memory [`TileReader`] over an arbitrary number of
-/// same-sized frames -- a duplicate of `align_algorithm.rs`'s own
-/// `FramesReader`, the per-file reimplementation this crate's tests already
-/// practice.
+/// same-sized frames.
 struct FramesReader {
     width: u32,
     height: u32,
@@ -167,6 +160,7 @@ fn parallel_anchor_matches_serial_transforms() {
         FailurePolicy::Strict,
         &AlignDriverOptions {
             max_bytes_in_flight: 1,
+            ..Default::default()
         },
     )
     .expect("serial run completes");
@@ -260,6 +254,7 @@ fn chain_mode_stays_serial() {
         FailurePolicy::Strict,
         &AlignDriverOptions {
             max_bytes_in_flight: 1,
+            ..Default::default()
         },
     )
     .expect("chain run completes under a 1-byte budget");
@@ -327,6 +322,7 @@ fn parallel_anchor_failure_policy_is_unchanged() {
             policy,
             &AlignDriverOptions {
                 max_bytes_in_flight: 1,
+                ..Default::default()
             },
         )
         .expect("serial run completes even with a failing frame");

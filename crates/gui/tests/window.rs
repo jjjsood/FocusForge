@@ -16,10 +16,7 @@ use std::process::Stdio;
 #[cfg(feature = "mcp")]
 use std::time::{Duration, Instant};
 
-/// `true` when this host can plausibly open a window.
-fn has_display() -> bool {
-    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
-}
+use common::has_display;
 
 #[test]
 fn screenshot_is_not_uniform() {
@@ -80,6 +77,58 @@ fn screenshot_is_not_uniform() {
         }
     }
     assert!(colours.len() > 1, "screenshot is a single uniform colour");
+}
+
+/// Closing the window while the background manifest scan is still in
+/// flight must exit cleanly: a ~20 MB seeded data directory keeps the scan
+/// running well past the 100 ms `--exit-after` deadline (a synchronous scan
+/// over the same shape of data measures around 0.7 s of wall time).
+#[test]
+fn window_closed_during_scan() {
+    if !has_display() {
+        println!("SKIP: window tests need DISPLAY or WAYLAND_DISPLAY");
+        return;
+    }
+
+    let mut cmd = common::gui_bin("window_closed_during_scan");
+    let ff_data_dir = cmd
+        .get_envs()
+        .find(|(k, _)| *k == "FOCUSFORGE_DATA_DIR")
+        .and_then(|(_, v)| v)
+        .map(std::path::PathBuf::from)
+        .expect("gui_bin always sets FOCUSFORGE_DATA_DIR");
+    common::seed_large_diagnostics_dir(&ff_data_dir, 20 * 1024 * 1024);
+    let crashes = ff_data_dir.join("focusforge").join("crashes");
+    let before: std::collections::BTreeSet<_> = std::fs::read_dir(&crashes)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+
+    let output = cmd
+        .args(["--exit-after", "100"])
+        .output()
+        .expect("failed to launch focusforge-gui");
+    assert!(
+        output.status.success(),
+        "focusforge-gui exited with {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after: std::collections::BTreeSet<_> = std::fs::read_dir(&crashes)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        before, after,
+        "closing mid-scan must leave no new crash report"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked at"),
+        "closing mid-scan must print no panic text, got: {stderr}"
+    );
 }
 
 #[cfg(feature = "mcp")]

@@ -46,7 +46,9 @@ pub struct Manifest {
     pub zmap: PlaneRef,
     pub blobs: Vec<BlobRecord>,
     pub metrics: Metrics,
-    /// The one checkpoint's id, i.e. `checkpoints/<id>.json`.
+    /// The head checkpoint's id, i.e. `checkpoints/<id>.json`. The rest of
+    /// the chain, if any, is reached by walking
+    /// [`super::checkpoint::Checkpoint::parent`] from there.
     pub checkpoint: String,
 }
 

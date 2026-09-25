@@ -5,6 +5,9 @@
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
+import { FFEmptyState } from "empty_state.slint";
+import { FFErrorRow } from "../components/ff_error_row.slint";
+import { FFPanePlaceholder } from "../components/ff_pane_placeholder.slint";
 
 component FFPaneLabel inherits Rectangle {
     in property <string> label: "";
@@ -21,6 +24,7 @@ component FFPaneLabel inherits Rectangle {
         font-weight: Theme.text-body.weight;
         horizontal-alignment: center;
         vertical-alignment: center;
+        overflow: elide;
     }
 }
 
@@ -50,6 +54,9 @@ component FFUndockControl inherits Rectangle {
 export component FFPane inherits Rectangle {
     in property <image> source;
     in property <string> label: "";
+    // The reader's own refusal text for `source`, if it could not be drawn
+    // -- shown centred in place of the image while non-empty.
+    in property <string> message: "";
     in property <bool> undock-enabled: true;
     // Whether a project is open -- the label and the undock control have
     // nothing to name or to undock before one is, so they are hidden rather
@@ -81,6 +88,14 @@ export component FFPane inherits Rectangle {
         image-rendering: root.pixelated ? ImageRendering.pixelated : ImageRendering.smooth;
     }
 
+    if root.message != "" : pane-message := FFErrorRow {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: parent.width - 2 * Theme.space-6;
+        message: root.message;
+        horizontal-alignment: center;
+    }
+
     pane-label := FFPaneLabel {
         x: 10px;
         y: 10px;
@@ -100,16 +115,30 @@ export component FFPane inherits Rectangle {
 export component FFCanvas inherits Rectangle {
     in property <image> composite-source;
     in property <image> zmap-source;
+    // The left pane's own source, label and refusal text -- see
+    // `FFPane::message`.
+    in property <image> frame-source;
+    in property <string> frame-label: "";
+    in property <string> frame-message: "";
     in property <bool> undock-enabled: true;
     // Forwarded to both panes' chrome -- see `FFPane::project-loaded`.
     in property <bool> project-loaded: false;
+    // Whether the active tab has a composite -- governs the right pane's
+    // not-yet-fused placeholder.
+    in property <bool> composite-ready: false;
     // The one shared viewport's placement -- forwarded identically to
     // both panes below, which is what makes "one viewport
-    // over two panes" structural rather than a synchronisation.
+    // over two panes" structural rather than a synchronisation. The right
+    // pane draws the sealed composite/Z-Map at this extent.
     in property <length> image-x;
     in property <length> image-y;
     in property <length> image-w;
     in property <length> image-h;
+    // The left pane's own placement, over the selected frame's extent.
+    in property <length> frame-image-x;
+    in property <length> frame-image-y;
+    in property <length> frame-image-w;
+    in property <length> frame-image-h;
     in property <bool> pixelated;
     callback composite-undock-requested();
     callback zmap-undock-requested();
@@ -134,6 +163,17 @@ export component FFCanvas inherits Rectangle {
     // the `out` properties itself, which also covers the initial value a
     // `changed` handler never fires for (`src/main.rs`'s own startup read).
     callback canvas-resized();
+
+    // The empty state: `true` while no tab is open.
+    // Placed last (below) so it covers the canvas region without moving
+    // either pane -- `tests/shell.rs`'s pane-geometry tests keep finding
+    // `pane-left`/`pane-right` at their fixed rects regardless.
+    in property <bool> show-empty-state: true;
+    // A background load in flight: hides the empty state for that span, so
+    // its own text never bleeds around the loading indicator drawn over
+    // this same region.
+    in property <bool> load-active: false;
+    callback open-folder-requested();
 
     // The pane geometry `AppController::set_pane_geometry` needs, read back
     // as plain property reads -- no arithmetic, `pane-gutter`/`pane-divider`
@@ -177,18 +217,20 @@ export component FFCanvas inherits Rectangle {
         y: ShellGeometry.pane-gutter;
         width: (parent.width - 3 * ShellGeometry.pane-gutter) / 2;
         height: parent.height - 2 * ShellGeometry.pane-gutter;
-        source: root.composite-source;
-        label: "Composite";
+        source: root.frame-source;
+        label: root.frame-label;
+        message: root.frame-message;
         undock-enabled: root.undock-enabled;
         project-loaded: root.project-loaded;
-        image-x: root.image-x;
-        image-y: root.image-y;
-        image-w: root.image-w;
-        image-h: root.image-h;
+        image-x: root.frame-image-x;
+        image-y: root.frame-image-y;
+        image-w: root.frame-image-w;
+        image-h: root.frame-image-h;
         pixelated: root.pixelated;
         undock-requested => { root.composite-undock-requested(); }
     }
 
+    // Centred inside the gutter between the panes, not added on top of it.
     pane-divider := Rectangle {
         x: pane-left.x + pane-left.width
             + (ShellGeometry.pane-gutter - ShellGeometry.pane-divider) / 2;
@@ -203,8 +245,8 @@ export component FFCanvas inherits Rectangle {
         y: ShellGeometry.pane-gutter;
         width: pane-left.width;
         height: pane-left.height;
-        source: root.zmap-source;
-        label: "Z-Map";
+        source: root.composite-source;
+        label: "Composite";
         undock-enabled: root.undock-enabled;
         project-loaded: root.project-loaded;
         image-x: root.image-x;
@@ -213,5 +255,20 @@ export component FFCanvas inherits Rectangle {
         image-h: root.image-h;
         pixelated: root.pixelated;
         undock-requested => { root.zmap-undock-requested(); }
+    }
+
+    pane-placeholder := FFPanePlaceholder {
+        x: pane-right.x + (pane-right.width - self.width) / 2;
+        y: pane-right.y + (pane-right.height - self.height) / 2;
+        visible: root.project-loaded && !root.composite-ready;
+    }
+
+    empty-state := FFEmptyState {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        visible: root.show-empty-state && !root.load-active;
+        open-folder-requested => { root.open-folder-requested(); }
     }
 }

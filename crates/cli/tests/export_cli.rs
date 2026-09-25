@@ -2,11 +2,9 @@
 
 //! `focusforge-cli export`: a project in, an image out.
 //!
-//! These are what prove the container changed the *destination* and not the
-//! *data*. One `laplacian` run over `fixtures/mantis-512` is shared through
-//! a `OnceLock` -- the same discipline `stack_cli.rs` uses -- and the
-//! library oracle beside it is the independent writer the exported composite
-//! is compared against, whole file for whole file.
+//! One `laplacian` run over `fixtures/mantis-512` is shared through a
+//! `OnceLock`; the library oracle beside it is the independent writer the
+//! exported composite is compared against, whole file for whole file.
 //!
 //! Every spawn isolates `.scratch/` with its own per-process temp directory
 //! and `.current_dir(dir)`: `stack`'s scratch tree is cwd-relative, so
@@ -55,7 +53,7 @@ fn only_project(dir: &Path) -> PathBuf {
         .unwrap()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "ffproj"))
+        .filter(|p| p.extension().is_some_and(|e| e == "ffp"))
         .collect();
     assert_eq!(found.len(), 1, "exactly one project expected in {dir:?}");
     found.pop().unwrap()
