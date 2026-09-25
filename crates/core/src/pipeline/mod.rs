@@ -50,7 +50,7 @@ pub struct AlignRequest {
 /// Everything one align-fuse-seal run needs, owned so it can cross a thread
 /// boundary. `frames` is the source list in frame order; `explicit` carries
 /// only the caller's own overrides, resolved once inside [`run`] against the
-/// [`StackContext`] built from `frames` itself -- never against a context
+/// [`StackContext`](crate::params::StackContext) built from `frames` itself -- never against a context
 /// the caller computed earlier, which could have drifted from what actually
 /// gets opened.
 pub struct FuseRequest {

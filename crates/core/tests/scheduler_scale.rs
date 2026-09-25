@@ -527,7 +527,7 @@ fn run_scale_leg(
     drop(consumer);
     let _ = std::fs::remove_file(&composite_path);
 
-    (scheduler.in_flight_limit(), peak, elapsed, vmhwm)
+    Some((scheduler.in_flight_limit(), peak, elapsed, vmhwm))
 }
 
 #[test]
@@ -545,7 +545,9 @@ fn scale_300_frames() {
          cannot discriminate a tiled implementation from a full-load one"
     );
 
-    let (in_flight, peak, elapsed, vmhwm) = run_scale_leg(300, 2);
+    let Some((in_flight, peak, elapsed, vmhwm)) = run_scale_leg(300, 2) else {
+        return;
+    };
     let extrapolated = elapsed.as_secs_f64() * 442.0 / SCALE_TILES as f64;
     println!(
         "scale_300_frames: in_flight_limit={in_flight} peak_live_heap={peak} B (ceiling \
@@ -570,7 +572,9 @@ fn scale_600_frames() {
          cannot discriminate a tiled implementation from a full-load one"
     );
 
-    let (in_flight, peak, elapsed, vmhwm) = run_scale_leg(600, 1);
+    let Some((in_flight, peak, elapsed, vmhwm)) = run_scale_leg(600, 1) else {
+        return;
+    };
     let extrapolated = elapsed.as_secs_f64() * 442.0 / SCALE_TILES as f64;
     println!(
         "scale_600_frames: in_flight_limit={in_flight} peak_live_heap={peak} B (ceiling \
