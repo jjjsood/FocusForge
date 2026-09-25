@@ -74,7 +74,20 @@ Clicking an open card switches to that tab; clicking a failed one offers
 rail down the side carries the file-level actions — **New project**,
 **Open project…**, **Close project**, **Save project** (enabled only once
 the active tab holds something unsaved) — and a list of recently opened
-projects.
+projects. Clicking a Recent row opens that project, or switches to its tab if
+it is already open.
+
+The four file actions also have fixed shortcuts that work anywhere in the
+window, not only with the overlay open: Ctrl+N (**New project**), Ctrl+O
+(**Open project…**), Ctrl+S (**Save project**) and Ctrl+W (**Close
+project**). They are not part of the rebindable input map, and they do
+nothing while the settings panel or a close or quit question is open.
+
+Closing a tab that holds unsaved checkpoints asks **Save this state first?**
+and offers **Save and close** or **Close without saving**. Quitting the
+window with unsaved work — including through the window manager, e.g.
+Alt+F4 — asks **Quit without saving?** and offers **Save all and quit** or
+**Quit without saving**. Dismissing either question leaves everything open.
 
 ## Keyboard and mouse bindings
 
