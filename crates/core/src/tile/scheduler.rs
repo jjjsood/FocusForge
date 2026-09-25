@@ -16,9 +16,7 @@
 //! deliberate rather than papered over: [`TileRunReport::frame_tiles_read`]
 //! is `0` on that path, because the scheduler genuinely read no frame-tile;
 //! and the (currently empty) [`FramePreprocess`] hook is never called for
-//! that tile, since there is no frame-tile to run it over --
-//! [`TileScheduler::run_tiles`] refuses outright (rather than silently
-//! skipping) when a non-noop `FramePreprocess` meets such a consumer.
+//! that tile, since there is no frame-tile to run it over.
 //!
 //! # Memory budget: an admission gate, not the thread count
 //!
@@ -210,8 +208,8 @@ pub struct TileRunReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlledRun {
     /// `report.tiles` is the count of tiles *submitted* to this call, not
-    /// necessarily the count that ran: on a stopped run (see `stopped`) it
-    /// is no longer that number.
+    /// necessarily the count that ran: on a stopped run (see `stopped`) the
+    /// two can differ.
     pub report: TileRunReport,
     /// `true` if [`TileControl::should_stop`] ended this call before every
     /// submitted tile ran.
@@ -269,9 +267,7 @@ fn bytes_per_tile_set(frame_count: usize, tile_size: u32, samples_per_pixel: u32
 /// scaling with it either -- the cap is a ceiling, not a target).
 ///
 /// `pub(crate)`, not private: `crate::tile::budget::HostBudgetGate` calls
-/// this directly to compute its own initial limit, rather than duplicating
-/// the arithmetic the way `crates/gpu/src/budget.rs` must (a different
-/// crate, which genuinely cannot reach a private `fn` here).
+/// this directly to compute its own initial limit.
 pub(crate) fn in_flight_for_budget(
     bytes_per_tile_set: u64,
     max_bytes_in_flight: u64,
@@ -403,10 +399,10 @@ impl<'a> TileScheduler<'a> {
 
     /// The controlled entry point [`run`](Self::run) and
     /// [`run_tiles`](Self::run_tiles) delegate to with [`NoControl`], and
-    /// `core::job::Job::run` drives directly. The body that used to be
-    /// `run_tiles`, plus a control check as the very first statement of the
-    /// per-tile closure (before `live.fetch_add`, so a skipped unit never
-    /// counts as in flight and never perturbs `peak_in_flight`), and
+    /// `core::job::Job::run` drives directly: the per-tile loop, with a
+    /// control check as the very first statement of the per-tile closure
+    /// (before `live.fetch_add`, so a skipped unit never counts as in
+    /// flight and never perturbs `peak_in_flight`), and
     /// per-index completion bookkeeping so a caller can resume from exactly
     /// the tiles this call did not finish. This is what makes
     /// "byte-identical with and without the engine" fall out of the shape
@@ -441,15 +437,7 @@ impl<'a> TileScheduler<'a> {
         consumer: &dyn TileConsumer,
         control: &dyn TileControl,
     ) -> Result<ControlledRun, TileError> {
-        // Deliberately here, not in the `run_tiles` wrapper above:
-        // `crate::job::Job::run` drives this method directly and never goes
-        // through `run_tiles`, so a guard living in the wrapper would leave
-        // the job-engine path silently accepting the combination this
-        // refuses.
         let supplies_own_pixels = consumer.supplies_own_pixels();
-        if supplies_own_pixels && !preprocess.is_noop() {
-            return Err(TileError::PixelSupplyingConsumerNeedsNoopPreprocess);
-        }
 
         let scratch = ScratchDir::create_in(&self.scratch_base)?;
         let scratch_path = scratch.path().to_path_buf();
@@ -507,7 +495,7 @@ impl<'a> TileScheduler<'a> {
                 |buf: &mut Vec<Tile>, planned: &PlannedTile| -> Result<(), RunStop> {
                     // The budget admission permit is acquired first, above
                     // the control check below: the rayon pool's own thread
-                    // count no longer tracks the budget (`pool_threads` is
+                    // count is independent of the budget (`pool_threads` is
                     // `available_parallelism()` unconditionally), so a stop
                     // check that ran *before* admission would let every pool
                     // thread past it before any of them blocks on the gate --

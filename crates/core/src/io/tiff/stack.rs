@@ -5,6 +5,7 @@
 //! is the unit in, and the unit out.
 
 use std::fs::File;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -131,6 +132,22 @@ impl TiffStack {
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), TiffError> {
+        self.read_tile_step_into(frame, rect, NonZeroU32::MIN, out)
+    }
+
+    /// Read every `step`-th row and column of `rect` from `frame` — rect rows
+    /// and columns `0, step, 2*step, …` — into `out`, nearest-neighbour:
+    /// every sample written is one the frame holds, none is averaged.
+    /// `out.len()` must equal exactly
+    /// `rect.width.div_ceil(step) * rect.height.div_ceil(step) * samples_per_pixel`;
+    /// `rect` itself is bounds-checked whole, as [`Self::read_tile_into`] does.
+    pub fn read_tile_step_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [u16],
+    ) -> Result<(), TiffError> {
         let header = &self.headers[frame];
         let path = &header.path;
 
@@ -153,7 +170,9 @@ impl TiffStack {
         }
 
         let spp = header.samples_per_pixel as usize;
-        let expected_len = rect.width as usize * rect.height as usize * spp;
+        let step = step.get();
+        let out_row_len = rect.width.div_ceil(step) as usize * spp;
+        let expected_len = out_row_len * rect.height.div_ceil(step) as usize;
         if out.len() != expected_len {
             return Err(TiffError::BufferSize {
                 expected: expected_len,
@@ -169,7 +188,7 @@ impl TiffStack {
         let rps = u64::from(header.rows_per_strip.max(1));
 
         let mut out_off = 0usize;
-        for r in rect.y..(rect.y + rect.height) {
+        for r in (rect.y..(rect.y + rect.height)).step_by(step as usize) {
             let r = u64::from(r);
             let strip = (r / rps) as usize;
             let row_in_strip = r % rps;
@@ -213,18 +232,35 @@ impl TiffStack {
                 return Err(past_eof(path));
             }
             let row_slice = &map[start as usize..end as usize];
+            let out_row = &mut out[out_off..out_off + out_row_len];
 
-            for (i, chunk) in row_slice.chunks_exact(2).enumerate() {
-                let sample = match header.byte_order {
-                    ByteOrder::Little => u16::from_le_bytes([chunk[0], chunk[1]]),
-                    ByteOrder::Big => u16::from_be_bytes([chunk[0], chunk[1]]),
-                };
-                out[out_off + i] = sample;
+            if step == 1 {
+                // The CPU pipeline's hot path: one flat per-sample loop.
+                for (i, chunk) in row_slice.chunks_exact(2).enumerate() {
+                    out_row[i] = decode_sample(header.byte_order, chunk);
+                }
+            } else {
+                let pixels = row_slice
+                    .chunks_exact(stride as usize)
+                    .step_by(step as usize);
+                for (dst, pixel) in out_row.chunks_exact_mut(spp).zip(pixels) {
+                    for (d, chunk) in dst.iter_mut().zip(pixel.chunks_exact(2)) {
+                        *d = decode_sample(header.byte_order, chunk);
+                    }
+                }
             }
-            out_off += rect.width as usize * spp;
+            out_off += out_row_len;
         }
 
         Ok(())
+    }
+}
+
+#[inline(always)]
+fn decode_sample(order: ByteOrder, chunk: &[u8]) -> u16 {
+    match order {
+        ByteOrder::Little => u16::from_le_bytes([chunk[0], chunk[1]]),
+        ByteOrder::Big => u16::from_be_bytes([chunk[0], chunk[1]]),
     }
 }
 
@@ -261,14 +297,7 @@ pub fn frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
             source,
         })?;
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let is_tiff = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"));
-        if !is_tiff {
+        if !path.is_file() || !is_frame_path(&path) {
             continue;
         }
         paths.push(path);
@@ -279,6 +308,31 @@ pub fn frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
         return Err(TiffError::NoFrames { path: scan_dir });
     }
     Ok(paths)
+}
+
+/// The composite plane every fuse writes beside its source frames.
+pub const COMPOSITE_FILENAME: &str = "composite.tif";
+/// The Z-Map plane every fuse writes beside its source frames.
+pub const ZMAP_FILENAME: &str = "zmap.tif";
+
+/// Whether `path` is a TIFF frame: `.tif`/`.tiff` by extension,
+/// case-insensitively, and not one of a project's own output files sitting
+/// beside its sources from an earlier fuse. The one place that filter is
+/// spelled -- [`frame_paths`] calls it, and so does the GUI's classification
+/// of a multi-file drop, rather than a second copy of the same check in
+/// `crates/gui`.
+pub fn is_frame_path(path: &Path) -> bool {
+    let is_tiff = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"));
+    if !is_tiff {
+        return false;
+    }
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) => name != COMPOSITE_FILENAME && name != ZMAP_FILENAME,
+        None => true,
+    }
 }
 
 /// Lenient uniformity: dimensions, bits per sample, samples per pixel,
@@ -357,4 +411,57 @@ fn map_file(path: &Path) -> Result<Mmap, TiffError> {
         source,
     })?;
     Ok(mmap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_frame_path_accepts_tif_and_tiff_case_insensitively() {
+        assert!(is_frame_path(Path::new("a.tif")));
+        assert!(is_frame_path(Path::new("a.TIF")));
+        assert!(is_frame_path(Path::new("a.tiff")));
+        assert!(is_frame_path(Path::new("a.TIFF")));
+        assert!(!is_frame_path(Path::new("a.png")));
+        assert!(!is_frame_path(Path::new("a")));
+    }
+
+    #[test]
+    fn is_frame_path_excludes_a_projects_own_output_files() {
+        assert!(!is_frame_path(Path::new(COMPOSITE_FILENAME)));
+        assert!(!is_frame_path(Path::new(ZMAP_FILENAME)));
+        assert!(!is_frame_path(Path::new("some/dir/composite.tif")));
+        assert!(!is_frame_path(Path::new("some/dir/zmap.tif")));
+    }
+
+    #[test]
+    fn frame_paths_excludes_a_prior_fuses_own_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["00.tif", "01.tif", "02.tif"] {
+            std::fs::write(
+                dir.path().join(name),
+                b"not a real tiff, frame_paths never reads it",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.path().join(COMPOSITE_FILENAME),
+            b"a prior fuse's own composite",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(ZMAP_FILENAME), b"a prior fuse's own zmap").unwrap();
+
+        let found = frame_paths(dir.path()).unwrap();
+        assert_eq!(
+            found.len(),
+            3,
+            "the project's own prior outputs must not count as source frames"
+        );
+        for path in &found {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert_ne!(name, COMPOSITE_FILENAME);
+            assert_ne!(name, ZMAP_FILENAME);
+        }
+    }
 }

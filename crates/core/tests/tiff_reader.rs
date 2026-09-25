@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use focusforge_core::algorithm::TileReader;
@@ -27,8 +28,7 @@ fn mantis_64_frame(name: &str) -> PathBuf {
 /// Copy `source` (a little-endian, classic-TIFF fixture frame) to `dest`,
 /// patching its `Compression` tag (259) from 1 to 5 in place. Built under
 /// `env!("CARGO_TARGET_TMPDIR")` at each call site -- never under
-/// `fixtures/`, which `tools/check-fixtures.sh` polices against exactly this
-/// kind of hand-edit.
+/// `fixtures/`.
 fn write_compressed_copy(source: &Path, dest: &Path) {
     let mut bytes = std::fs::read(source).expect("read fixture frame");
     assert_eq!(
@@ -305,6 +305,117 @@ fn reads_any_rows_per_strip() {
     assert_eq!(tile_rps1.samples, tile_rps8.samples);
 }
 
+/// Rows and columns `0, step, 2*step, …` of a step-1 read of `rect`.
+fn subsample(full: &[u16], rect: Rect, spp: usize, step: u32) -> Vec<u16> {
+    let mut out = Vec::new();
+    for row in (0..rect.height).step_by(step as usize) {
+        for col in (0..rect.width).step_by(step as usize) {
+            let at = (row as usize * rect.width as usize + col as usize) * spp;
+            out.extend_from_slice(&full[at..at + spp]);
+        }
+    }
+    out
+}
+
+fn stepped_len(rect: Rect, spp: usize, step: u32) -> usize {
+    rect.width.div_ceil(step) as usize * rect.height.div_ceil(step) as usize * spp
+}
+
+fn assert_stepped_matches_subsampled(stack: &TiffStack, frame: usize, rect: Rect) {
+    let spp = stack.header(frame).samples_per_pixel as usize;
+    let full = stack.read_tile(frame, rect).expect("step-1 read").samples;
+    for step in [2u32, 3, 7] {
+        let mut out = vec![0u16; stepped_len(rect, spp, step)];
+        stack
+            .read_tile_step_into(frame, rect, NonZeroU32::new(step).unwrap(), &mut out)
+            .unwrap_or_else(|e| panic!("step {step} read of {rect:?}: {e}"));
+        assert_eq!(
+            out,
+            subsample(&full, rect, spp, step),
+            "step {step} over {rect:?} of frame {frame}"
+        );
+    }
+}
+
+#[test]
+fn stepped_read_equals_subsampled_step1_read_on_mantis_512() {
+    let stack = TiffStack::open(mantis_512_dir()).expect("mantis-512 must open");
+    for frame in [0, stack.len() - 1] {
+        // Sides not multiples of 2, 3 or 7.
+        let rect = Rect {
+            x: 17,
+            y: 29,
+            width: 101,
+            height: 83,
+        };
+        assert_stepped_matches_subsampled(&stack, frame, rect);
+        // Flush against the right and bottom edge.
+        let edge = Rect {
+            x: 512 - 95,
+            y: 512 - 61,
+            width: 95,
+            height: 61,
+        };
+        assert_stepped_matches_subsampled(&stack, frame, edge);
+    }
+}
+
+#[test]
+fn stepped_read_covers_both_byte_orders_and_rows_per_strip() {
+    for name in ["reference.tif", "reference-MM-rps8.tif"] {
+        let stack = TiffStack::open_files(&[mantis_64_frame(name)]).unwrap();
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        };
+        assert_stepped_matches_subsampled(&stack, 0, whole);
+        let odd = Rect {
+            x: 5,
+            y: 3,
+            width: 59,
+            height: 61,
+        };
+        assert_stepped_matches_subsampled(&stack, 0, odd);
+    }
+}
+
+#[test]
+fn stepped_read_refuses_an_undecimated_buffer() {
+    let stack = TiffStack::open(mantis_512_dir()).expect("mantis-512 must open");
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 50,
+        height: 49,
+    };
+    let mut undecimated = vec![0u16; 50 * 49 * 3];
+    match stack.read_tile_step_into(0, rect, NonZeroU32::new(3).unwrap(), &mut undecimated) {
+        Err(TiffError::BufferSize { expected, got }) => {
+            assert_eq!(expected, 17 * 17 * 3);
+            assert_eq!(got, 50 * 49 * 3);
+        }
+        other => panic!("expected BufferSize, got {other:?}"),
+    }
+}
+
+#[test]
+fn stepped_read_keeps_the_out_of_bounds_refusal() {
+    let stack = TiffStack::open(mantis_512_dir()).expect("mantis-512 must open");
+    let past_bottom = Rect {
+        x: 0,
+        y: 500,
+        width: 10,
+        height: 13,
+    };
+    let mut out = vec![0u16; stepped_len(past_bottom, 3, 4)];
+    match stack.read_tile_step_into(0, past_bottom, NonZeroU32::new(4).unwrap(), &mut out) {
+        Err(TiffError::OutOfBounds { .. }) => {}
+        other => panic!("expected OutOfBounds, got {other:?}"),
+    }
+}
+
 #[test]
 fn refuses_mismatched_frames() {
     let paths = vec![
@@ -405,7 +516,6 @@ fn tiff_stack_is_a_tile_reader() {
 #[ignore = "reads the 16 GB reference stack"]
 fn reads_the_reference_stack() {
     let Some(stack_dir) = common::reference_stack_dir() else {
-        eprintln!("skip: reference stack not found");
         return;
     };
 

@@ -4,19 +4,27 @@
 // this file exports.
 
 import { Theme, TypeRole, ThemeProbe } from "theme.slint";
+// Re-exported so Rust can reach them through this file; `Primitives` stays
+// unreachable outside `theme.slint`.
 export { Theme, TypeRole, ThemeProbe }
 
 import { ThemeSheet } from "theme_sheet.slint";
 export { ThemeSheet }
 
 import { ShellGeometry } from "geometry.slint";
-import { FFTabStrip } from "shell/tab_strip.slint";
+import { FFTabStrip, ProjectTabView } from "shell/tab_strip.slint";
+export { ProjectTabView }
 import { FFToolbar } from "shell/toolbar.slint";
 import { FFCanvas } from "shell/canvas.slint";
-import { FFDock } from "shell/dock.slint";
+import { FFDock, SettingsRow, SectionHeadView, ImageRowView } from "shell/dock.slint";
+export { SettingsRow, SectionHeadView, ImageRowView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
-import { FFSettingsModal, InputRow } from "shell/settings_modal.slint";
-export { InputRow }
+import { FFSettingsModal, InputRow, FFManifestRow } from "shell/settings_modal.slint";
+export { InputRow, FFManifestRow }
+import { FFCloseGuard, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFToast } from "shell/dialogs.slint";
+import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
+import { FFLoadingIndicator } from "shell/loading.slint";
+export { ProjectCardView, RecentRowView }
 
 export component AppWindow inherits Window {
     // Every callback forwards one-for-one into `AppController` via
@@ -28,6 +36,11 @@ export component AppWindow inherits Window {
     callback mode-selected(string);
     callback dock-tab-selected(string);
     callback checkpoint-export-requested();
+    // The run's own transport, forwarded one-for-one from `FFToolbar` below.
+    callback fuse-requested();
+    callback pause-or-resume-requested();
+    callback cancel-requested();
+    callback retry-requested();
 
     // Every piece of state the shell shows is an `in` property set from
     // Rust, never computed here.
@@ -61,24 +74,87 @@ export component AppWindow inherits Window {
     // handler.
     forward-focus: canvas-ground;
 
+    // The entry path: the tab strip's own project list, scroll state, and
+    // the "+" forward. `open-folder-requested` is the empty state's button
+    // (the picker); the strip's "+" raises `plus-clicked`, which selects
+    // "+" itself.
+    in property <[ProjectTabView]> project-tabs: [];
+    in property <length> tab-scroll-x: 0px;
+    in property <bool> tabs-overflow: false;
+    in property <bool> can-scroll-left: false;
+    in property <bool> can-scroll-right: false;
+    in property <bool> show-empty-state: true;
+    in property <bool> plus-selected: true;
+    callback open-folder-requested();
+    callback plus-clicked();
+    callback tab-selected(int);
+    callback tab-closed(int);
+    callback tab-scroll-left();
+    callback tab-scroll-right();
+    callback tab-region-width-changed(length);
+    out property <length> tab-region-width: tab-strip.tabs-region-width;
+
+    // The projects overlay's own toggle: the tab strip's four-square button
+    // lights while it is open, and the same press or `Esc` closes it.
+    in property <bool> projects-overlay-open: false;
+    callback projects-overlay-toggled();
+
     tab-strip := FFTabStrip {
         x: 0px;
         y: 0px;
         width: root.width;
         height: ShellGeometry.strip-height;
         maximized: root.window-maximized;
+        tabs: root.project-tabs;
+        plus-selected: root.plus-selected;
+        tab-scroll-x: root.tab-scroll-x;
+        tabs-overflow: root.tabs-overflow;
+        can-scroll-left: root.can-scroll-left;
+        can-scroll-right: root.can-scroll-right;
+        projects-overlay-open: root.projects-overlay-open;
 
         window-drag-requested => { root.window-drag-requested(); }
         window-minimize-requested => { root.window-minimize-requested(); }
         window-maximize-toggled => { root.window-maximize-toggled(); }
         window-close-requested => { root.window-close-requested(); }
+        plus-clicked => { root.plus-clicked(); }
+        tab-selected(i) => { root.tab-selected(i); }
+        tab-closed(i) => { root.tab-closed(i); }
+        scroll-left => { root.tab-scroll-left(); }
+        scroll-right => { root.tab-scroll-right(); }
+        tabs-region-width-changed(w) => { root.tab-region-width-changed(w); }
+        projects-toggled => { root.projects-overlay-toggled(); }
     }
 
+    // The transport's current run state: "idle" | "running" | "paused" |
+    // "cancelling" | "failed".
+    in property <string> toolbar-run-state: "idle";
+    // `false` until Rust sets it: matches `fuse_enabled()`'s own default (no
+    // tab means nothing to fuse), so the toolbar reads disabled from the
+    // window's very first frame, before any project has ever opened.
+    in property <bool> fuse-enabled: false;
+    // Another tab's run is live and this one holds no place in it -- the
+    // next `Fuse stack` press here would enqueue rather than start.
+    in property <bool> toolbar-would-queue: false;
+
+    // Always occupies its row, so a tab mounting never shifts the canvas
+    // below it -- with no project open (or "+" selected over background
+    // tabs) `fuse-enabled` and `toolbar-run-state` already resolve to their
+    // inert values, so the row renders itself disabled without a separate
+    // hidden state.
     toolbar := FFToolbar {
         x: 0px;
         y: ShellGeometry.strip-height;
         width: root.width - ShellGeometry.dock-width;
         height: ShellGeometry.toolbar-height;
+        run-state: root.toolbar-run-state;
+        fuse-enabled: root.fuse-enabled;
+        would-queue: root.toolbar-would-queue;
+
+        fuse-requested => { root.fuse-requested(); }
+        pause-or-resume-requested => { root.pause-or-resume-requested(); }
+        cancel-requested => { root.cancel-requested(); }
+        retry-requested => { root.retry-requested(); }
     }
 
     // Both images are `in` properties set from Rust
@@ -86,12 +162,26 @@ export component AppWindow inherits Window {
     // texture is never computed here.
     in property <image> composite-source;
     in property <image> zmap-source;
+    // The selected source frame (`src/gpu_canvas.rs::redraw_frame`) -- the
+    // left pane's own image, label and refusal text, independent of the
+    // composite/Z-Map pair above.
+    in property <image> frame-source;
+    in property <string> frame-label: "";
+    in property <string> frame-message: "";
     in property <bool> canvas-undock-enabled: true;
     // Whether a project is open -- governs the pane chrome (label, undock)
     // and the bottom bar's zoom cluster together, so nothing offers an
     // action there is nothing yet to act on. Set from Rust alongside
     // `zoom-readout` in `src/bridge.rs::repaint`, `false` until then.
     in property <bool> project-loaded: false;
+    // Whether the active tab has a composite to show -- governs the right
+    // pane's not-yet-fused placeholder. Set from Rust alongside
+    // `project-loaded` in `src/bridge.rs::push_projects`.
+    in property <bool> composite-ready: false;
+    // The checkpoints panel's own line -- the active tab's checkpoint
+    // count, or the empty-state wording. Set from Rust alongside
+    // `composite-ready` in `src/bridge.rs::push_projects`.
+    in property <string> checkpoint-line: "None yet — fuse a stack";
     callback composite-undock-requested();
     callback zmap-undock-requested();
     // Forwarded from `FFCanvas`'s own callbacks of the same shape -- the
@@ -117,6 +207,13 @@ export component AppWindow inherits Window {
     in property <length> image-y;
     in property <length> image-w;
     in property <length> image-h;
+    // The left pane's own placement, drawn against the selected frame's
+    // extent rather than the composite/Z-Map's -- the two panes share one
+    // viewport's scale but not one image size.
+    in property <length> frame-image-x;
+    in property <length> frame-image-y;
+    in property <length> frame-image-w;
+    in property <length> frame-image-h;
     in property <bool> pixelated;
     callback canvas-resized();
     out property <length> canvas-pane-left-x: canvas.pane-left-x;
@@ -152,16 +249,27 @@ export component AppWindow inherits Window {
             height: 100%;
             composite-source: root.composite-source;
             zmap-source: root.zmap-source;
+            frame-source: root.frame-source;
+            frame-label: root.frame-label;
+            frame-message: root.frame-message;
             undock-enabled: root.canvas-undock-enabled;
             project-loaded: root.project-loaded;
+            composite-ready: root.composite-ready;
             image-x: root.image-x;
             image-y: root.image-y;
             image-w: root.image-w;
             image-h: root.image-h;
+            frame-image-x: root.frame-image-x;
+            frame-image-y: root.frame-image-y;
+            frame-image-w: root.frame-image-w;
+            frame-image-h: root.frame-image-h;
             pixelated: root.pixelated;
+            show-empty-state: root.show-empty-state;
+            load-active: root.load-active;
 
             composite-undock-requested => { root.composite-undock-requested(); }
             zmap-undock-requested => { root.zmap-undock-requested(); }
+            open-folder-requested => { root.open-folder-requested(); }
             canvas-scrolled(dx, dy, x, y, ctrl, shift, alt) => {
                 root.canvas-scrolled(dx, dy, x, y, ctrl, shift, alt);
             }
@@ -173,6 +281,51 @@ export component AppWindow inherits Window {
         }
     }
 
+    // The settings panel: pushed from `AppController::settings_panel`
+    // (`src/bridge.rs`) on every `ShellEvent::SettingsChanged`, forwarded
+    // one line into `FFDock`.
+    in property <[SettingsRow]> settings-rows: [];
+    in property <SectionHeadView> settings-sticky: { visible: false, section: "", label: "", provenance: "default", push: 0px };
+    in property <length> settings-scroll-y: 0px;
+    in property <length> settings-content-height: 0px;
+    in property <bool> settings-enabled: true;
+    callback settings-param-changed(string, string, float);
+    callback settings-param-text-edited(string, string, string);
+    callback settings-algorithm-selected(string, string);
+    callback settings-reset-all();
+    callback settings-menu-toggled(string, string);
+    callback settings-scrolled(length);
+    callback settings-scrollbar-pointer(int, length);
+    callback settings-scrollbar-dragged(length);
+    callback settings-viewport-height-changed(length);
+
+    // The `Images` panel: pushed from `AppController::images_panel`
+    // (`src/bridge.rs`) on every `ShellEvent::ImagesChanged`, forwarded
+    // one line into `FFDock`.
+    in property <[ImageRowView]> images-rows: [];
+    in property <string> images-header-text: "";
+    in property <length> images-scroll-y: 0px;
+    in property <length> images-content-height: 0px;
+    in property <string> images-sort: "";
+    in property <bool> images-sort-menu-open: false;
+    in property <int> images-dragging-row: -1;
+    in property <length> images-drag-offset: 0px;
+    in property <int> images-drag-target-row: -1;
+    // Whether the mutating controls (row grip/eye/bin, add, sort, drag) are
+    // reachable at all -- `false` while this tab's own job is running.
+    in property <bool> images-enabled: true;
+    callback images-add-frames-requested();
+    callback images-sort-menu-toggled();
+    callback images-sort-selected(string);
+    callback images-frame-selected(int);
+    callback images-frame-excluded-toggled(int);
+    callback images-frame-remove-requested(int);
+    callback images-frame-grip-pointer(int, int, length);
+    callback images-scrolled(length);
+    callback images-scrollbar-pointer(int, length);
+    callback images-scrollbar-dragged(length);
+    callback images-viewport-height-changed(length);
+
     dock := FFDock {
         x: root.width - ShellGeometry.dock-width;
         y: ShellGeometry.strip-height;
@@ -181,10 +334,58 @@ export component AppWindow inherits Window {
         editor-enabled: root.editor-enabled;
         mode: root.mode;
         dock-tab: root.dock-tab;
+        project-loaded: root.project-loaded;
+        checkpoint-line: root.checkpoint-line;
+        settings-rows: root.settings-rows;
+        settings-sticky: root.settings-sticky;
+        settings-scroll-y: root.settings-scroll-y;
+        settings-content-height: root.settings-content-height;
+        settings-enabled: root.settings-enabled;
+        images-rows: root.images-rows;
+        images-header-text: root.images-header-text;
+        images-scroll-y: root.images-scroll-y;
+        images-content-height: root.images-content-height;
+        images-sort: root.images-sort;
+        images-sort-menu-open: root.images-sort-menu-open;
+        images-dragging-row: root.images-dragging-row;
+        images-drag-offset: root.images-drag-offset;
+        images-drag-target-row: root.images-drag-target-row;
+        images-enabled: root.images-enabled;
 
         mode-selected(m) => { root.mode-selected(m); }
         dock-tab-selected(t) => { root.dock-tab-selected(t); }
         checkpoint-export-requested => { root.checkpoint-export-requested(); }
+        settings-param-changed(section, id, f) => { root.settings-param-changed(section, id, f); }
+        settings-param-text-edited(section, id, text) => { root.settings-param-text-edited(section, id, text); }
+        settings-algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
+        settings-reset-all => { root.settings-reset-all(); }
+        settings-menu-toggled(section, id) => { root.settings-menu-toggled(section, id); }
+        settings-scrolled(delta) => { root.settings-scrolled(delta); }
+        settings-scrollbar-pointer(kind, y) => { root.settings-scrollbar-pointer(kind, y); }
+        settings-scrollbar-dragged(y) => { root.settings-scrollbar-dragged(y); }
+        settings-viewport-height-changed(h) => { root.settings-viewport-height-changed(h); }
+        images-add-frames-requested => { root.images-add-frames-requested(); }
+        images-sort-menu-toggled => { root.images-sort-menu-toggled(); }
+        images-sort-selected(picked) => { root.images-sort-selected(picked); }
+        images-frame-selected(i) => { root.images-frame-selected(i); }
+        images-frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
+        images-frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
+        images-frame-grip-pointer(i, kind, y) => { root.images-frame-grip-pointer(i, kind, y); }
+        images-scrolled(delta) => { root.images-scrolled(delta); }
+        images-scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
+        images-scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
+        images-viewport-height-changed(h) => { root.images-viewport-height-changed(h); }
+    }
+
+    if root.crash-notice-visible : crash-notice := FFToast {
+        x: ShellGeometry.pane-gutter;
+        y: ShellGeometry.strip-height + ShellGeometry.toolbar-height + ShellGeometry.pane-gutter;
+        toast-open: true;
+        message: root.crash-notice-title;
+        link-label: "Review";
+
+        dismissed => { root.crash-notice-dismissed(); }
+        link-activated => { root.crash-notice-review-requested(); }
     }
 
     // Settings modal state -- pushed from Rust once at startup
@@ -193,14 +394,60 @@ export component AppWindow inherits Window {
     in property <bool> settings-open: false;
     in property <[InputRow]> input-rows: [];
     in property <string> input-provenance: "";
+    in property <string> settings-section: "input-map";
     callback settings-open-requested();
     callback settings-close-requested();
+    callback settings-section-selected(string);
+
+    in property <[FFManifestRow]> diagnostics-rows: [];
+    in property <string> diagnostics-note: "";
+    in property <bool> diagnostics-include-minidumps: false;
+    in property <string> diagnostics-destination: "";
+    in property <string> diagnostics-status: "idle";
+    in property <string> diagnostics-message: "";
+    in property <string> diagnostics-primary-label: "Create bundle";
+    in property <bool> diagnostics-busy: false;
+    in property <bool> diagnostics-loading: false;
+    in property <length> diagnostics-manifest-scroll-offset: 0px;
+    in property <length> diagnostics-manifest-content-height: 0px;
+    in property <length> diagnostics-destination-scroll-offset: 0px;
+    callback diagnostics-minidumps-toggled(bool);
+    callback diagnostics-destination-edited(string);
+    callback diagnostics-destination-cursor-moved(length, length);
+    callback diagnostics-primary-clicked();
+    callback diagnostics-manifest-scrollbar-pointer(int, length);
+    callback diagnostics-manifest-scrollbar-dragged(length);
+    callback diagnostics-manifest-viewport-height-changed(length);
+    callback diagnostics-manifest-scrolled(length);
+
+    in property <bool> crash-notice-visible: false;
+    in property <string> crash-notice-title: "";
+    callback crash-notice-dismissed();
+    callback crash-notice-review-requested();
+
     // The bottom bar's zoom cluster -- governs both panes, which is why it
     // lives at the root rather than inside `FFPane`.
+    // Greys out together with the rest of the chrome via the single
+    // `project-loaded` property declared above.
     in property <string> zoom-readout: "";
     callback zoom-in-requested();
     callback zoom-out-requested();
     callback zoom-fit-requested();
+
+    // The run's own words for the bottom bar's progress track -- pushed from
+    // Rust alongside the toolbar's `toolbar-run-state`, never computed here.
+    in property <string> stage-word: "";
+    in property <string> step-text: "";
+    in property <float> bar-fraction: 0.0;
+    in property <string> bar-tone: "running";
+    in property <string> eta-text: "";
+
+    // Whether a background stack load is in flight
+    // (`AppController::open_paths`), pushed on every `LoadStarted`/`LoadReady`.
+    in property <bool> load-active: false;
+    // Whether the loading indicator's own show threshold has let it become
+    // visible -- read by a headless test, with no running window.
+    out property <bool> load-indicator-visible: loading-indicator.load-visible;
 
     bottom-bar := FFBottomBar {
         x: 0px;
@@ -209,11 +456,69 @@ export component AppWindow inherits Window {
         height: ShellGeometry.bottom-bar-height;
         zoom-readout: root.zoom-readout;
         project-loaded: root.project-loaded;
+        stage-word: root.stage-word;
+        step-text: root.step-text;
+        bar-fraction: root.bar-fraction;
+        bar-tone: root.bar-tone;
+        eta-text: root.eta-text;
 
         settings-requested => { root.settings-open-requested(); }
         zoom-in-requested => { root.zoom-in-requested(); }
         zoom-out-requested => { root.zoom-out-requested(); }
         zoom-fit-requested => { root.zoom-fit-requested(); }
+    }
+
+    // The projects overlay's gallery: pushed from `AppController::project_cards`
+    // on every `ShellEvent::OverlayChanged`.
+    in property <string> gallery-heading: "Open projects";
+    in property <string> gallery-count-text: "";
+    in property <[ProjectCardView]> project-cards: [];
+    in property <length> gallery-content-height: 0px;
+    in property <length> gallery-scroll-y: 0px;
+    callback projects-card-clicked(int);
+    callback projects-card-action-clicked(int);
+    callback projects-card-close-clicked(int);
+    callback gallery-scrolled(length);
+    callback gallery-scrollbar-pointer(int, length);
+    callback gallery-scrollbar-dragged(length);
+    callback gallery-viewport-height-changed(length);
+    callback gallery-width-changed(length);
+    in property <[RecentRowView]> recent-rows: [];
+    callback projects-new-project-requested();
+    callback projects-open-project-requested();
+    callback projects-close-project-requested();
+    in property <bool> projects-save-enabled: false;
+    callback projects-save-project-requested();
+    callback projects-recent-clicked(int);
+    out property <length> gallery-width: projects-overlay.gallery-width;
+
+    projects-overlay := FFProjectsOverlay {
+        x: 0px;
+        y: ShellGeometry.strip-height;
+        width: root.width;
+        height: root.height - ShellGeometry.strip-height;
+        overlay-open: root.projects-overlay-open;
+        gallery-heading: root.gallery-heading;
+        gallery-count-text: root.gallery-count-text;
+        cards: root.project-cards;
+        gallery-content-height: root.gallery-content-height;
+        gallery-scroll-y: root.gallery-scroll-y;
+        recent-rows: root.recent-rows;
+        save-enabled: root.projects-save-enabled;
+
+        card-clicked(i) => { root.projects-card-clicked(i); }
+        card-action-clicked(i) => { root.projects-card-action-clicked(i); }
+        card-close-clicked(i) => { root.projects-card-close-clicked(i); }
+        gallery-scrolled(delta) => { root.gallery-scrolled(delta); }
+        gallery-scrollbar-pointer(kind, y) => { root.gallery-scrollbar-pointer(kind, y); }
+        gallery-scrollbar-dragged(y) => { root.gallery-scrollbar-dragged(y); }
+        gallery-viewport-height-changed(h) => { root.gallery-viewport-height-changed(h); }
+        gallery-width-changed(w) => { root.gallery-width-changed(w); }
+        new-project-requested => { root.projects-new-project-requested(); }
+        open-project-requested => { root.projects-open-project-requested(); }
+        close-project-requested => { root.projects-close-project-requested(); }
+        save-project-requested => { root.projects-save-project-requested(); }
+        recent-clicked(i) => { root.projects-recent-clicked(i); }
     }
 
     settings-modal := FFSettingsModal {
@@ -224,7 +529,170 @@ export component AppWindow inherits Window {
         settings-open: root.settings-open;
         input-rows: root.input-rows;
         input-provenance: root.input-provenance;
+        settings-section: root.settings-section;
+        diagnostics-rows: root.diagnostics-rows;
+        diagnostics-note: root.diagnostics-note;
+        diagnostics-include-minidumps: root.diagnostics-include-minidumps;
+        diagnostics-destination: root.diagnostics-destination;
+        diagnostics-status: root.diagnostics-status;
+        diagnostics-message: root.diagnostics-message;
+        diagnostics-primary-label: root.diagnostics-primary-label;
+        diagnostics-busy: root.diagnostics-busy;
+        diagnostics-loading: root.diagnostics-loading;
+        diagnostics-manifest-scroll-offset: root.diagnostics-manifest-scroll-offset;
+        diagnostics-manifest-content-height: root.diagnostics-manifest-content-height;
+        diagnostics-destination-scroll-offset: root.diagnostics-destination-scroll-offset;
 
         settings-close-requested => { root.settings-close-requested(); }
+        settings-section-selected(s) => { root.settings-section-selected(s); }
+        diagnostics-minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
+        diagnostics-destination-edited(t) => { root.diagnostics-destination-edited(t); }
+        diagnostics-destination-cursor-moved(x, w) => { root.diagnostics-destination-cursor-moved(x, w); }
+        diagnostics-primary-clicked => { root.diagnostics-primary-clicked(); }
+        diagnostics-manifest-scrollbar-pointer(kind, y) => { root.diagnostics-manifest-scrollbar-pointer(kind, y); }
+        diagnostics-manifest-scrollbar-dragged(y) => { root.diagnostics-manifest-scrollbar-dragged(y); }
+        diagnostics-manifest-viewport-height-changed(h) => { root.diagnostics-manifest-viewport-height-changed(h); }
+        diagnostics-manifest-scrolled(delta) => { root.diagnostics-manifest-scrolled(delta); }
+    }
+
+    // The one grouping question and the two refusals the entry path can
+    // produce.
+    in property <bool> question-open: false;
+    in property <int> question-frame-count: 0;
+    in property <int> question-project-count: 0;
+    callback question-open-as-one();
+    callback question-open-as-many();
+    callback question-cancelled();
+    in property <bool> refusal-open: false;
+    callback refusal-pick-another-folder();
+    in property <string> skipped-notice: "";
+    callback skipped-notice-dismissed();
+
+    // The failed run's own notice, over the canvas rather than in the
+    // bottom bar -- a job failure and a "some subfolders were skipped"
+    // notice are different messages and never share a slot. Opens on its
+    // own the moment a run fails; there is no button that reveals it.
+    in property <bool> job-toast-open: false;
+    in property <string> job-toast-message: "";
+    callback job-toast-dismissed();
+
+    // The one warning a frame-set change (add/reorder/remove) raises once
+    // its project already carries a checkpoint.
+    in property <bool> frame-warning-open: false;
+    in property <string> frame-warning-title: "";
+    in property <string> frame-warning-body: "";
+    in property <string> frame-warning-info: "";
+    in property <string> frame-warning-confirm-label: "Confirm";
+    in property <string> frame-warning-secondary-label: "";
+    callback frame-warning-cancelled();
+    callback frame-warning-secondary-pressed();
+    callback frame-warning-confirmed();
+    in property <bool> close-guard-open: false;
+    in property <string> close-guard-title: "Save this state first?";
+    in property <string> close-guard-context: "";
+    in property <string> close-guard-body: "";
+    in property <string> close-guard-info: "";
+    in property <string> close-guard-secondary-label: "Save and close";
+    in property <string> close-guard-confirm-label: "Close without saving";
+    callback close-guard-cancelled();
+    callback close-guard-secondary-pressed();
+    callback close-guard-confirmed();
+
+    grouping-question := FFGroupingQuestion {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        question-open: root.question-open;
+        frame-count: root.question-frame-count;
+        project-count: root.question-project-count;
+        open-as-one => { root.question-open-as-one(); }
+        open-as-many => { root.question-open-as-many(); }
+        cancelled => { root.question-cancelled(); }
+    }
+
+    refusal-dialog := FFRefusalDialog {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        refusal-open: root.refusal-open;
+        pick-another-folder => { root.refusal-pick-another-folder(); }
+    }
+
+    // Both toasts sit over the canvas, never the projects overlay: a toast
+    // open when the overlay opens waits, still armed, and reappears the
+    // moment the overlay closes -- neither flag its own toast clears.
+    skipped-toast := FFToast {
+        x: canvas-ground.x + Theme.space-3;
+        y: canvas-ground.y + Theme.space-3;
+        tone: "info";
+        toast-open: root.skipped-notice != "" && !root.projects-overlay-open;
+        message: root.skipped-notice;
+        dismissed => { root.skipped-notice-dismissed(); }
+    }
+
+    job-toast := FFToast {
+        x: canvas-ground.x + Theme.space-3;
+        y: canvas-ground.y + Theme.space-3;
+        toast-open: root.job-toast-open && !root.projects-overlay-open;
+        message: root.job-toast-message;
+        dismissed => { root.job-toast-dismissed(); }
+    }
+
+    frame-warning := FFFrameSetWarning {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.frame-warning-open;
+        title: root.frame-warning-title;
+        body: root.frame-warning-body;
+        info: root.frame-warning-info;
+        confirm-label: root.frame-warning-confirm-label;
+        secondary-label: root.frame-warning-secondary-label;
+        cancelled => { root.frame-warning-cancelled(); }
+        secondary-pressed => { root.frame-warning-secondary-pressed(); }
+        confirmed => { root.frame-warning-confirmed(); }
+    }
+
+    close-guard := FFCloseGuard {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.close-guard-open;
+        title: root.close-guard-title;
+        context: root.close-guard-context;
+        body: root.close-guard-body;
+        info: root.close-guard-info;
+        secondary-label: root.close-guard-secondary-label;
+        confirm-label: root.close-guard-confirm-label;
+        cancelled => { root.close-guard-cancelled(); }
+        secondary-pressed => { root.close-guard-secondary-pressed(); }
+        confirmed => { root.close-guard-confirmed(); }
+    }
+
+    loading-indicator := FFLoadingIndicator {
+        x: canvas-ground.x;
+        y: canvas-ground.y;
+        width: canvas-ground.width;
+        height: canvas-ground.height;
+        load-active: root.load-active;
+    }
+
+    // `no-frame: true` above means the compositor draws no OS chrome, so
+    // without this the window has no visible boundary against a dark
+    // desktop. Painted last (last child = topmost), non-interactive (no
+    // `TouchArea`) so it never steals a click meant for the chrome beneath
+    // it.
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: transparent;
+        border-width: 1px;
+        border-color: Theme.border-default;
     }
 }

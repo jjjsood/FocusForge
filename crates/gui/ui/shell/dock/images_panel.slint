@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The `Images` panel: a header (count, add, sort) and the scrolling frame
+// list.
+
+import { Theme } from "../../theme.slint";
+import { ShellGeometry } from "../../geometry.slint";
+import { FFImageRow } from "../../components/ff_image_row.slint";
+import { FFScrollbar } from "../../components/ff_scrollbar.slint";
+import { FFMenuList } from "../../components/ff_menu_list.slint";
+import { FFIconButton } from "../../components/ff_icon_button.slint";
+
+/// One row of the panel's flat list -- the `.slint` twin of
+/// `crate::images::ImageRow`.
+export struct ImageRowView {
+    chip: color,
+    name: string,
+    time-text: string,
+    excluded: bool,
+    unresolved: bool,
+    top: length,
+    selected: bool,
+}
+
+export component FFImagesPanel inherits Rectangle {
+    in property <[ImageRowView]> rows: [];
+    in property <string> header-text: "";
+    in property <length> scroll-y: 0px;
+    in property <length> content-height: 0px;
+    // Whether the mutating chrome (add, sort, per-row hover controls) shows
+    // at all.
+    in property <bool> mutable: true;
+    // The sort menu's own selection ("" | "name" | "capture-time") and
+    // whether it is open.
+    in property <string> sort: "";
+    in property <bool> sort-menu-open: false;
+    // The row currently being dragged, `-1` for none -- Slint has no
+    // `Option<int>`.
+    in property <int> dragging-row: -1;
+    // How far the floating copy of `dragging-row` has moved from its own
+    // slot since the grip was pressed.
+    in property <length> drag-offset: 0px;
+    // The row index the drag would land at if released right now, `-1`
+    // with no drag in progress. Equal to `dragging-row` itself means
+    // releasing now moves nothing, and no landing line is drawn.
+    in property <int> drag-target-row: -1;
+
+    callback add-frames-requested();
+    callback sort-menu-toggled();
+    callback sort-selected(string);
+    callback frame-selected(int);
+    callback frame-excluded-toggled(int);
+    callback frame-remove-requested(int);
+    callback frame-grip-pointer(int, int, length);
+    callback scrolled(length);
+    callback scrollbar-pointer(int, length);
+    callback scrollbar-dragged(length);
+    callback viewport-height-changed(length);
+
+    VerticalLayout {
+        spacing: Theme.space-2;
+
+        header-row := HorizontalLayout {
+            height: ShellGeometry.image-header-height;
+            alignment: space-between;
+
+            Text {
+                text: root.header-text;
+                color: Theme.text-secondary;
+                font-size: Theme.text-body.size;
+                font-weight: Theme.text-body.weight;
+                vertical-alignment: center;
+            }
+
+            if root.mutable: HorizontalLayout {
+                spacing: Theme.space-1;
+                add-button := FFIconButton {
+                    icon: @image-url("../../../../../assets/icons/folder-plus.svg");
+                    glyph-size: Theme.icon-sm;
+                    pad: Theme.space-1;
+                    triggered => { root.add-frames-requested(); }
+                }
+                sort-button := FFIconButton {
+                    icon: @image-url("../../../../../assets/icons/arrow-up-down.svg");
+                    glyph-size: Theme.icon-sm;
+                    pad: Theme.space-1;
+                    triggered => { root.sort-menu-toggled(); }
+                }
+            }
+        }
+
+        clip-area := Rectangle {
+            width: ShellGeometry.image-row-band-width;
+            clip: true;
+
+            changed height => { root.viewport-height-changed(self.height); }
+
+            hit-area := TouchArea {
+                width: 100%;
+                height: 100%;
+                scroll-event(event) => {
+                    root.scrolled(-event.delta-y);
+                    accept
+                }
+            }
+
+            content := Rectangle {
+                x: 0px;
+                y: -root.scroll-y;
+                width: ShellGeometry.image-row-band-width;
+                height: root.content-height;
+
+                for row[i] in root.rows: FFImageRow {
+                    x: 0px;
+                    y: row.top;
+                    width: ShellGeometry.image-row-band-width;
+                    chip: row.chip;
+                    name: row.name;
+                    time-text: row.time-text;
+                    excluded: row.excluded;
+                    unresolved: row.unresolved;
+                    selected: row.selected;
+                    mutable: root.mutable;
+                    dragging: root.mutable && i == root.dragging-row;
+                    clicked => { root.frame-selected(i); }
+                    exclude-toggled => { root.frame-excluded-toggled(i); }
+                    remove-requested => { root.frame-remove-requested(i); }
+                    grip-pointer(kind, y) => { root.frame-grip-pointer(i, kind, y); }
+                }
+            }
+        }
+    }
+
+    scrollbar := FFScrollbar {
+        x: parent.width - self.width;
+        y: clip-area.y;
+        height: clip-area.height;
+        content-height: root.content-height;
+        viewport-height: clip-area.height;
+        offset: root.scroll-y;
+        pointer(kind, y) => { root.scrollbar-pointer(kind, y); }
+        dragged(y) => { root.scrollbar-dragged(y); }
+    }
+
+    // The boundary a release would drop the dragged row on -- above
+    // `drag-target-row`'s own slot when the drag has moved it earlier in
+    // the list, below when later, matching the remove-then-insert
+    // semantics `move_frame` applies on release. Hidden when the target is
+    // the row's own slot, since releasing then moves nothing.
+    if root.dragging-row >= 0 && root.drag-target-row >= 0 && root.drag-target-row != root.dragging-row: landing-line := Rectangle {
+        x: 0px;
+        y: clip-area.y - root.scroll-y
+            + (root.drag-target-row > root.dragging-row
+                ? root.rows[root.drag-target-row].top + ShellGeometry.image-row-height
+                : root.rows[root.drag-target-row].top)
+            - ShellGeometry.pane-divider / 2;
+        width: ShellGeometry.image-row-band-width;
+        height: ShellGeometry.pane-divider;
+        background: Theme.accent-default;
+    }
+
+    // A floating copy of the row being dragged, positioned outside
+    // `clip-area`'s own clipping so it can pass over the rows on either
+    // side of it rather than being cut off at the list's edge. The row it
+    // was grabbed from stays in place underneath, showing where it will
+    // land.
+    if root.dragging-row >= 0 && root.dragging-row < root.rows.length: drag-ghost := FFImageRow {
+        x: 0px;
+        y: clip-area.y + root.rows[root.dragging-row].top - root.scroll-y + root.drag-offset;
+        width: ShellGeometry.image-row-band-width;
+        chip: root.rows[root.dragging-row].chip;
+        name: root.rows[root.dragging-row].name;
+        time-text: root.rows[root.dragging-row].time-text;
+        excluded: root.rows[root.dragging-row].excluded;
+        unresolved: root.rows[root.dragging-row].unresolved;
+        mutable: false;
+        dragging: true;
+        floating: true;
+    }
+
+    // Drawn last, over the row list -- the sort button's own two-entry
+    // menu. `selected: ""` (no sort yet, or a manual drag) leaves both
+    // entries unchecked.
+    if root.sort-menu-open: FFMenuList {
+        x: parent.width - ShellGeometry.scrollbar-width - self.width;
+        y: header-row.y + header-row.height + Theme.space-1;
+        width: ShellGeometry.image-row-content-width;
+        choices: ["Name", "Capture time"];
+        choice-ids: ["name", "capture-time"];
+        show-choice-ids: false;
+        selected: root.sort;
+        option-selected(picked) => { root.sort-selected(picked); }
+    }
+}

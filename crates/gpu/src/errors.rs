@@ -3,9 +3,9 @@
 //! The shared device's own error handlers, and the state they leave behind.
 //!
 //! With no matching error scope and no installed handler, wgpu routes an
-//! error into `default_error_handler`, which panics (`crate::vram`'s module
-//! docs). [`install_handlers`] replaces that with a log record, so a
-//! diagnosable failure never takes the process down.
+//! error into `default_error_handler`, which panics. [`install_handlers`]
+//! replaces that with a log record, so a diagnosable failure never takes
+//! the process down.
 //!
 //! Error scopes and the dispatch label are both **thread-local**: wgpu keys
 //! scopes by `ThreadId` and routes an error to the innermost matching scope
@@ -58,8 +58,11 @@ fn error_kind(error: &wgpu::Error) -> &'static str {
 
 /// `true` once the device-lost callback has fired. wgpu queues that
 /// callback and runs it from a later `Device::poll`, so a caller that wants
-/// the freshest answer polls first.
-pub(crate) fn device_lost() -> bool {
+/// the freshest answer polls first -- [`crate::device::SharedDevice::lost`]
+/// does; this bare read is for a caller on a hot path (a redraw) that must
+/// not poll on every call and relies on something else keeping the flag
+/// fresh.
+pub fn device_lost() -> bool {
     DEVICE_LOST.load(Ordering::SeqCst)
 }
 

@@ -3,14 +3,14 @@
 //! `focusforge-cli align`: computes and reports the per-frame transforms
 //! for a stack -- human text by default, a frozen `--json` document on
 //! request, and an optional per-frame warped-TIFF dump for a visual check
-//! before any fusion runs. A driver, not an implementer: every number here
-//! comes from `focusforge_core::align`.
+//! before any fusion runs. Every number here comes from
+//! `focusforge_core::align`.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use focusforge_core::algorithm::{AlignAlgorithm, TileReader};
+use focusforge_core::algorithm::{AlignAlgorithm, StackAlgorithm, TileReader};
 use focusforge_core::align::{
     AlignDriverOptions, FailurePolicy, ReferencePolicy, StackAlignment, Transform, WarpingReader,
     align_stack_with, auto_crop,
@@ -32,9 +32,8 @@ use crate::set::{merge_preset, parse_settings};
 use crate::stack::ParamReport;
 use crate::status::StatusSink;
 
-/// The options `stack` needs to drive its own alignment stage, bundled so
-/// `stack::run` stays under clippy's argument-count lint
-/// (`crate::fuse::FusionGeometry`'s own doc names the same reason).
+/// The alignment options `stack` passes down, bundled to keep
+/// `stack::run`'s argument count down.
 pub struct AlignOptions<'a> {
     pub align: bool,
     pub crop: bool,
@@ -101,13 +100,9 @@ pub struct AlignReport {
     /// no `--no-align`. Present so `align --json` and `stack --json` report
     /// their `align` stage the same way.
     pub align_source: String,
-    /// The anchor arm's worker bound and the peak it actually reached --
-    /// always `Some` here, since every `align` run computes (the same
-    /// reasoning `align_source`'s own doc gives for why it is always
-    /// `"computed"` on this command). `Option`, not a plain `usize`, so one
-    /// key name carries one type across both `align --json` and
-    /// `stack --json` (`AlignReport::align_source`'s own rustdoc makes the
-    /// same argument).
+    /// The anchor arm's worker bound and the peak it reached: always `Some`
+    /// here. `Option` so the key has one type in `align --json` and
+    /// `stack --json`.
     pub align_workers: Option<usize>,
     pub peak_align_workers: Option<usize>,
 }
@@ -247,7 +242,7 @@ pub fn run(
         .enumerate()
         .map(|(i, name)| (name.as_str(), stack.header(i)))
         .collect();
-    let (uniform, detail) = crate::uniform_check(&header_refs);
+    let (uniform, detail) = focusforge_core::pipeline::uniform_check(&header_refs);
     if !uniform {
         return sink.fail(detail.unwrap_or_else(|| "non-uniform frame set".to_string()));
     }
@@ -268,7 +263,7 @@ pub fn run(
     };
     timer.mark(Stage::Setup);
     timer.enter(Stage::Align);
-    renderer.stage(&format!("align {} frames (no unit progress)", stack.len()));
+    renderer.stage(&format!("align {} frames", stack.len()));
     let run = match align_stack_with(
         algo,
         stack_ctx,
@@ -294,7 +289,12 @@ pub fn run(
         // probing for an adapter on every run would be noise with nothing to
         // show for it. `align` also has no `--max-vram` flag of its own, so
         // there is no ceiling to thread through.
-        let backend = crate::resolve_backend(no_gpu, None).backend;
+        let backend = crate::resolve_backend(
+            focusforge_core::fuse::laplacian::Laplacian.id(),
+            no_gpu,
+            None,
+        )
+        .backend;
         if let Err(msg) = write_warped_frames(
             write_warped,
             &stack,
@@ -394,15 +394,12 @@ pub fn run(
 /// uncropped -- the crop is reported, not applied, on this path, so the
 /// uncovered rim stays visible for the manual check.
 ///
-/// With no backend, streams each frame in full-width bands of
-/// [`DEFAULT_TILE_SIZE`] rows through a [`WarpingReader`], the same
-/// streaming shape `PyramidalEcc::build_pyramid` uses -- never a whole-frame
-/// buffer. With a backend, cuts each band into [`DEFAULT_TILE_SIZE`]-wide
-/// chunks too: a full-width band at the reference stack's 8192 px needs a
-/// coordinate buffer of `8192 * 512 * 24 = 100.7 MB`
-/// (`crates/gpu/src/warp_coords.rs`), inside but uncomfortably near the
-/// `max_storage_buffer_binding_size = 128 MiB` floor this crate deliberately
-/// still runs at; [`DEFAULT_TILE_SIZE`]-wide chunks keep it at 6.3 MB.
+/// With no backend, each frame streams in full-width bands of
+/// [`DEFAULT_TILE_SIZE`] rows through a [`WarpingReader`]. With a backend,
+/// bands are also cut into [`DEFAULT_TILE_SIZE`]-wide chunks: a full-width
+/// band at the reference stack's 8192 px needs `8192 * 512 * 24 = 100.7 MB`,
+/// close to the `max_storage_buffer_binding_size = 128 MiB` floor this crate
+/// runs at; chunking keeps it at 6.3 MB.
 #[allow(clippy::too_many_arguments)]
 fn write_warped_frames(
     dir: &Path,
@@ -606,24 +603,4 @@ pub(crate) fn render(report: &AlignReport) -> String {
         report.wall_seconds,
     ));
     lines.join("\n")
-}
-
-/// The message an empty crop refuses `stack` with -- unit-tested here
-/// because no fixture produces disjoint footprints
-/// (`crates/core/src/align/crop.rs`'s own `disjoint_footprints_are_empty`
-/// covers the geometry).
-pub(crate) fn empty_crop_refusal() -> String {
-    "auto-crop is empty: the frames' footprints do not intersect; re-run with --no-crop".to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_crop_refusal_names_the_flag() {
-        let msg = empty_crop_refusal();
-        assert!(msg.contains("--no-crop"));
-        assert!(msg.contains("empty"));
-    }
 }

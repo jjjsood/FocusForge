@@ -21,8 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::groups;
 use crate::status::{STATUS_RECORD_FORMAT, StatusRecord};
 
-/// `review`'s wrapped-document schema version, additive-only from here
-/// forward.
+/// `review`'s wrapped-document schema version: fields are only ever added.
 pub const REVIEW_FORMAT: u32 = 1;
 
 /// One result's review record: identity, outcome and error through the same
@@ -33,20 +32,16 @@ pub struct ReviewRecord {
     pub base: StatusRecord,
     /// Absent, never zeroed, when a metric could not be produced -- a zero
     /// sorts like a bad result and an absent value does not.
-    /// `#[serde(default)]`, explicit rather than relying on serde 1.0.229's
-    /// implicit missing-`Option`-field behaviour (serde-rs/serde#2753): a
-    /// plain `StatusRecord` line, which carries none of this struct's three
-    /// added fields, must still decode as a `ReviewRecord`.
+    /// `#[serde(default)]`: a plain `StatusRecord` line, which carries none
+    /// of this struct's three added fields, must still decode as a
+    /// `ReviewRecord`.
     #[serde(default)]
     pub metrics: Option<ReviewMetrics>,
     /// Why `metrics` is absent. `None` exactly when `metrics` is `Some`.
     #[serde(default)]
     pub metrics_reason: Option<String>,
-    /// Every source this project cannot resolve. Present and empty is a
-    /// positive statement, the posture `crate::export::ExportReport`
-    /// already took. **Not** an `Option`, so `#[serde(default)]` is load
-    /// bearing here, not defensive: without it a missing field is a hard
-    /// deserialization error rather than an empty `Vec`.
+    /// Every source this project cannot resolve; empty when all resolve.
+    /// `#[serde(default)]` so a record without the field decodes as empty.
     #[serde(default)]
     pub unresolved_sources: Vec<String>,
 }
@@ -95,7 +90,7 @@ pub fn run(dir: &Path, json: bool) -> ExitCode {
 }
 
 /// Where `review` found its entries: a manifest, preferred, or a bare
-/// listing of `*.ffproj` files when no manifest is present.
+/// listing of `*.ffp` files when no manifest is present.
 enum ScanSource {
     Manifest {
         path: PathBuf,
@@ -107,7 +102,7 @@ enum ScanSource {
 /// Manifest-first: `<dir>/manifest.json` (the `-o` placement), else
 /// `<dir>/<dir-basename>-run.json` (the beside-the-frames placement,
 /// `crate::stack::manifest_path`'s own naming rule, mirrored rather than
-/// re-derived), else a non-recursive `*.ffproj` glob, sorted by file name so
+/// re-derived), else a non-recursive `*.ffp` glob, sorted by file name so
 /// output order is stable. Refuses, naming `stack`'s grouping flags, when
 /// none of the three is present -- `review` never walks frames and never
 /// groups.
@@ -227,8 +222,7 @@ fn no_metrics_record(
 
 /// One manifest entry's record. `outcome`, `error` and `wall_seconds` come
 /// from the manifest entry itself -- a `failed` group is a record because
-/// the manifest lists it, which is the whole mechanism behind §10's
-/// guarantee.
+/// the manifest lists it.
 fn record_from_manifest_entry(reviewed_dir: &Path, entry: &groups::ManifestEntry) -> ReviewRecord {
     let identity = entry.identity().to_string();
     if entry.outcome != "completed" {
@@ -264,7 +258,7 @@ fn record_from_manifest_entry(reviewed_dir: &Path, entry: &groups::ManifestEntry
     open_and_measure(identity, entry.wall_seconds, project_path)
 }
 
-/// A record built straight from a `*.ffproj` file when no manifest exists to
+/// A record built straight from a `*.ffp` file when no manifest exists to
 /// carry an identity or a wall time -- `review`'s own elapsed time is what
 /// `wall_seconds` reports here, since there is no other source for it.
 fn record_from_project_only(path: &Path) -> ReviewRecord {
@@ -362,8 +356,7 @@ fn open_and_measure(identity: String, wall_seconds: f64, project_path: PathBuf) 
 /// precision, not a formatter default: `{:.4}` for the ratio and the
 /// coherence fraction, `{:.3}s` for wall; the absent case prints `--`,
 /// never `0`. A `String`, not prints, so it is unit-testable without
-/// capturing stdout (`crate::groups::render_proposal`,
-/// `crate::export::render`).
+/// capturing stdout.
 fn render(source: &str, document: &ReviewDocument) -> String {
     let mut lines = vec![format!(
         "review {source}: {} result{}",
@@ -430,7 +423,7 @@ mod tests {
                         "good".to_string(),
                         "completed",
                         Some("laplacian".to_string()),
-                        vec!["good.ffproj".to_string()],
+                        vec!["good.ffp".to_string()],
                         1.5,
                         None,
                     ),
@@ -488,8 +481,8 @@ mod tests {
 
     #[test]
     fn resolve_output_uses_an_absolute_path_as_given() {
-        let resolved = resolve_output(Path::new("/reviewed"), "/absolute/thing.ffproj");
-        assert_eq!(resolved, PathBuf::from("/absolute/thing.ffproj"));
+        let resolved = resolve_output(Path::new("/reviewed"), "/absolute/thing.ffp");
+        assert_eq!(resolved, PathBuf::from("/absolute/thing.ffp"));
     }
 
     /// Every `--status` consumer and the GUI can decode a plain
@@ -504,7 +497,7 @@ mod tests {
             command: "stack".to_string(),
             outcome: "completed".to_string(),
             algorithm: Some("laplacian".to_string()),
-            outputs: vec!["mantis-512.ffproj".to_string()],
+            outputs: vec!["mantis-512.ffp".to_string()],
             wall_seconds: 12.5,
             error: None,
         };
@@ -521,7 +514,7 @@ mod tests {
                 "IMG_9801-9862".to_string(),
                 "completed",
                 Some("laplacian".to_string()),
-                vec!["IMG_9801-9862.ffproj".to_string()],
+                vec!["IMG_9801-9862.ffp".to_string()],
                 3.2,
                 None,
             ),

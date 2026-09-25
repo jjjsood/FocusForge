@@ -13,7 +13,6 @@
 //! is not a fallback here — the reference stack (61 frames at ~33 GB as
 //! `f32`, before pyramid levels) does not fit in memory, so a "just load the
 //! frame" method is not a shortcut, it is a way to run out of RAM.
-//! A crate-level grep for whole-frame reads enforces the rule above.
 
 mod error;
 mod grouping;
@@ -23,7 +22,10 @@ pub(crate) mod tiff;
 
 pub use crate::tile::{Rect, Tile};
 pub use error::{Refusal, TiffError};
-pub use grouping::{CaptureTime, GROUP_GAP, Group, GroupSignal, Proposal, propose};
+pub use grouping::{
+    CaptureTime, GROUP_GAP, Group, GroupSignal, Proposal, capture_time, one_group, propose,
+    propose_with_progress,
+};
 pub use tiff::header::{ByteOrder, TiffHeader};
-pub use tiff::stack::{TiffStack, frame_paths};
+pub use tiff::stack::{COMPOSITE_FILENAME, TiffStack, ZMAP_FILENAME, frame_paths, is_frame_path};
 pub use tiff::writer::{TiffSpec, TiffWriter};

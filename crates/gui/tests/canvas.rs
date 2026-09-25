@@ -7,9 +7,17 @@
 mod common;
 
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use focusforge_core::io::TiffHeader;
 use focusforge_gui::AppWindow;
-use focusforge_gui::canvas::{DISPLAY_FORMAT, TextureSpec, needs_realloc, validate_display_format};
+use focusforge_gui::canvas::{
+    CanvasFeed, DISPLAY_FORMAT, FrameSource, RepaintGate, TextureSpec, draw_rect_fits,
+    needs_realloc, truncate_pane_label, validate_display_format,
+};
+use focusforge_gui::viewport::PaneRect;
+use focusforge_gui::{AppController, OpenOutcome};
 use i_slint_backend_testing::ElementQuery;
 use slint::ComponentHandle;
 
@@ -37,8 +45,15 @@ fn display_path_has_no_readback() {
 
 #[test]
 fn no_cpu_tonemap_in_the_gui_crate() {
+    // `overlay.rs`'s own picture is a one-time 330x186 reduction of a
+    // project's stored composite, off the interactive display path this
+    // scan protects -- the one file allowed to tone-map on the CPU.
+    const EXEMPT: &str = "overlay.rs";
     let forbidden = ["tonemap_cpu", "reduce16to8"];
     for path in common::find_rust_files(&common::src_dir()) {
+        if path.file_name().and_then(|n| n.to_str()) == Some(EXEMPT) {
+            continue;
+        }
         let contents = fs::read_to_string(&path).unwrap();
         let stripped = common::strip_line_comments(&contents);
         for needle in forbidden {
@@ -55,65 +70,17 @@ fn no_cpu_tonemap_in_the_gui_crate() {
 /// The "one viewport over two panes" invariant, enforced by name in
 /// `canvas::check_pane_dimensions`, a pure function.
 #[test]
-fn open_project_refuses_a_composite_zmap_dimension_mismatch_by_name() {
-    use focusforge_core::io::{TiffSpec, TiffWriter};
-    use focusforge_core::tile::Rect;
-    use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
-    use focusforge_gui::AppController;
-    use focusforge_gui::canvas::CanvasError;
+fn check_pane_dimensions_refuses_a_composite_zmap_mismatch_by_name() {
+    use focusforge_gui::canvas::{CanvasError, check_pane_dimensions};
 
-    let dir = tempfile::tempdir().unwrap();
-    let golden = dir.path().join("golden");
-    fs::create_dir_all(&golden).unwrap();
-
-    let mut composite = TiffWriter::create(
-        &golden.join("laplacian.tif"),
-        TiffSpec {
-            width: 8,
-            height: 8,
-            samples_per_pixel: 3,
-            description: None,
-        },
-    )
-    .unwrap();
-    composite
-        .write_tile(
-            Rect {
-                x: 0,
-                y: 0,
-                width: 8,
-                height: 8,
-            },
-            &vec![0u16; 8 * 8 * 3],
-        )
-        .unwrap();
-    composite.finish().unwrap();
-
-    let mut zmap = ZMapWriter::create(
-        &golden.join("laplacian-zmap.tif"),
-        ZMapInfo::new(4, 4, 1).unwrap(),
-    )
-    .unwrap();
-    zmap.write_tile(
-        Rect {
-            x: 0,
-            y: 0,
-            width: 4,
-            height: 4,
-        },
-        &[0u16; 4 * 4],
-    )
-    .unwrap();
-    zmap.finish().unwrap();
-
-    let mut controller = AppController::new();
-    match controller.open_project(dir.path()) {
+    match check_pane_dimensions((8, 8), (4, 4)) {
         Err(CanvasError::PaneDimensionsDiffer { composite, zmap }) => {
             assert_eq!(composite, (8, 8));
             assert_eq!(zmap, (4, 4));
         }
         other => panic!("expected PaneDimensionsDiffer, got {other:?}"),
     }
+    assert!(check_pane_dimensions((8, 8), (8, 8)).is_ok());
 }
 
 #[test]
@@ -162,6 +129,731 @@ fn texture_is_reused_across_frames() {
         needs_realloc(None, a),
         "no current texture must trigger a (first) allocation"
     );
+}
+
+#[test]
+fn repaint_gate_collapses_requests_until_taken() {
+    let gate = RepaintGate::default();
+    assert!(gate.request(), "the first request schedules a repaint");
+    for _ in 0..100 {
+        assert!(!gate.request(), "later requests ride the scheduled one");
+    }
+    assert!(gate.take(), "the scheduled repaint finds a pending request");
+    assert!(!gate.take(), "taking twice finds nothing pending");
+    assert!(gate.request(), "the gate re-arms after a take");
+}
+
+/// A rect far larger than a small composite: an 8192x5464 viewport rect
+/// against a 501x508 composite is refused, an exact-fit and an interior
+/// rect are not.
+#[test]
+fn a_read_past_the_composite_draws_nothing_instead_of_panicking() {
+    assert!(
+        !draw_rect_fits((501, 508), (0, 0, 8192, 5464)),
+        "a rect far larger than the frame must be refused"
+    );
+    assert!(
+        draw_rect_fits((501, 508), (0, 0, 501, 508)),
+        "a rect exactly matching the frame must be accepted"
+    );
+    assert!(
+        draw_rect_fits((501, 508), (10, 10, 100, 100)),
+        "a rect strictly inside the frame must be accepted"
+    );
+    assert!(
+        !draw_rect_fits((501, 508), (450, 0, 100, 508)),
+        "a rect whose x + width overflows the frame's width must be refused"
+    );
+    assert!(
+        !draw_rect_fits((501, 508), (0, 450, 501, 100)),
+        "a rect whose y + height overflows the frame's height must be refused"
+    );
+    assert!(
+        !draw_rect_fits((501, 508), (0, 0, 0, 508)),
+        "a zero-width rect must be refused"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The renderer cell follows the active tab: routing tests over two real
+// projects of different sizes (`fixtures/mantis-64`, `fixtures/mantis-512`),
+// driven through `AppController` with no window and no GPU, asserting on
+// `canvas_feed`'s answer.
+// ---------------------------------------------------------------------
+
+/// Opens `fixtures/<set>`'s first `count` frames, copied under a fresh
+/// directory (never the committed fixture itself, since a fuse seals a
+/// `.ffp` beside its frames), as a new tab -- the newly opened tab becomes
+/// active. Returns the folder the tab was opened from.
+fn open_fixture_tab(
+    controller: &mut AppController,
+    name: &str,
+    set: &str,
+    count: usize,
+) -> PathBuf {
+    let root = common::tree(&format!("{name}_{set}_frames"));
+    for i in 0..count {
+        std::fs::copy(
+            common::fixture_frame(set, i),
+            root.join(format!("{i:02}.tif")),
+        )
+        .expect("fixture frame must copy");
+    }
+    assert!(matches!(
+        common::open_and_settle(controller, std::slice::from_ref(&root)),
+        OpenOutcome::Opened(_)
+    ));
+    root
+}
+
+/// A controller with two sealed tabs open -- tab 0 from `fixtures/mantis-64`
+/// (64x64), tab 1 from `fixtures/mantis-512` (512x512), the size mismatch
+/// a background run must survive. Tab 1 is active on return, the same
+/// order a person opening a small project and then a large one would reach.
+fn two_sealed_tabs(name: &str) -> AppController {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
+    open_fixture_tab(&mut controller, name, "mantis-64", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60))
+        .expect("the small fixture must fuse");
+    open_fixture_tab(&mut controller, name, "mantis-512", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120))
+        .expect("the large fixture must fuse");
+    controller
+}
+
+/// Calls `canvas_feed(loaded)`, panicking with the actual answer unless it
+/// is `Load`, and returns the composite path it carries -- what most of
+/// these tests use to confirm which tab's own planes just got loaded.
+fn load_path(controller: &mut AppController, loaded: Option<usize>) -> PathBuf {
+    match controller.canvas_feed(loaded) {
+        CanvasFeed::Load { composite, .. } => composite,
+        other => panic!("expected CanvasFeed::Load, got {other:?}"),
+    }
+}
+
+/// Fuses `background_set`'s own (first-opened) tab while `foreground_set`'s
+/// tab is active, asserting the active tab's already-loaded planes survive
+/// the background run's completion unchanged (asserted separately by
+/// `a_read_past_the_composite_draws_nothing_instead_of_panicking`).
+fn background_run_leaves_canvas_alone(name: &str, background_set: &str, foreground_set: &str) {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
+    open_fixture_tab(&mut controller, name, background_set, 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60))
+        .expect("the background tab's first fuse must complete");
+    open_fixture_tab(&mut controller, name, foreground_set, 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120))
+        .expect("the foreground tab's first fuse must complete");
+    assert_eq!(controller.active_project(), Some(1));
+
+    // A real repaint would already have loaded the active (foreground)
+    // tab's own planes by this point.
+    assert!(matches!(
+        controller.canvas_feed(None),
+        CanvasFeed::Load { tab: 1, .. }
+    ));
+
+    // Re-fuse the background tab while the foreground tab stays active.
+    controller.select_project(0);
+    assert!(controller.start_fuse());
+    controller.select_project(1);
+    assert_eq!(
+        controller.active_project(),
+        Some(1),
+        "switching tabs mid-run must not disturb which tab the run belongs to"
+    );
+    common::wait_for_settle(&mut controller, Duration::from_secs(60))
+        .expect("the background tab's run must still settle while another tab is active");
+
+    assert!(
+        matches!(controller.canvas_feed(Some(1)), CanvasFeed::Keep),
+        "a run completing on a background tab must leave the active tab's canvas alone"
+    );
+}
+
+#[test]
+fn a_background_run_completing_does_not_reload_the_active_tabs_canvas() {
+    background_run_leaves_canvas_alone("bg_small_under_large", "mantis-64", "mantis-512");
+    background_run_leaves_canvas_alone("bg_large_under_small", "mantis-512", "mantis-64");
+}
+
+#[test]
+fn a_foreground_run_completing_still_feeds_the_canvas() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree("fg_scratch"));
+    open_fixture_tab(&mut controller, "fg", "mantis-64", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60))
+        .expect("the first fuse must complete");
+
+    // The canvas already holds the (only, active) tab's planes.
+    assert!(matches!(
+        controller.canvas_feed(None),
+        CanvasFeed::Load { tab: 0, .. }
+    ));
+    assert!(matches!(controller.canvas_feed(Some(0)), CanvasFeed::Keep));
+
+    // A second run on the same, still-active tab: the owner already
+    // matches, but the planes on disk changed underneath it -- the case
+    // `Keep` alone cannot distinguish from the first run.
+    assert!(
+        controller.start_fuse(),
+        "pressing Fuse stack again on an Opened tab must run the pipeline again"
+    );
+    common::wait_for_settle(&mut controller, Duration::from_secs(60))
+        .expect("the second fuse must complete");
+    assert!(matches!(
+        controller.canvas_feed(Some(0)),
+        CanvasFeed::Load { tab: 0, .. }
+    ));
+}
+
+#[test]
+fn a_tab_switch_feeds_the_active_tabs_planes() {
+    let mut controller = two_sealed_tabs("switch");
+    let large = load_path(&mut controller, None);
+
+    controller.select_project(0);
+    let small = load_path(&mut controller, Some(1));
+    assert_ne!(
+        small, large,
+        "switching tabs must load the newly active tab's own planes"
+    );
+
+    controller.select_project(1);
+    let large_again = load_path(&mut controller, Some(0));
+    assert_eq!(
+        large_again, large,
+        "switching back must load the same tab's own planes again"
+    );
+}
+
+#[test]
+fn switching_to_an_unfused_tab_shows_no_stale_planes() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree("unfused_scratch"));
+    open_fixture_tab(&mut controller, "unfused", "mantis-64", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60))
+        .expect("the fuse must complete");
+    // The canvas now holds tab 0's planes.
+    let _ = load_path(&mut controller, None);
+
+    // A second tab, opened but never fused -- nothing sealed to show yet.
+    open_fixture_tab(&mut controller, "unfused", "mantis-512", 3);
+    assert_eq!(controller.active_project(), Some(1));
+    assert!(matches!(controller.canvas_feed(Some(0)), CanvasFeed::Clear));
+}
+
+#[test]
+fn closing_the_active_tab_feeds_the_neighbour() {
+    // The active tab itself closes; the tab that slides into its own raw
+    // index is a different project, so the coincidence of the index
+    // matching must not read as "nothing changed".
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree("close_active_scratch"));
+    open_fixture_tab(&mut controller, "close_active", "mantis-64", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60)).expect("tab 0 must fuse");
+    open_fixture_tab(&mut controller, "close_active", "mantis-512", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120)).expect("tab 1 must fuse");
+    open_fixture_tab(&mut controller, "close_active", "mantis-64", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60)).expect("tab 2 must fuse");
+
+    controller.select_project(1);
+    let middle = load_path(&mut controller, None);
+    controller.close_project(1);
+    assert_eq!(
+        controller.active_project(),
+        Some(1),
+        "closing the middle of three tabs re-selects the tab that slides into its place"
+    );
+    match controller.canvas_feed(Some(1)) {
+        CanvasFeed::Load { tab, composite, .. } => {
+            assert_eq!(tab, 1);
+            assert_ne!(
+                composite, middle,
+                "the tab that slides into the closed one's raw index must load its own \
+                 planes, not the just-closed tab's stale ones"
+            );
+        }
+        other => {
+            panic!("expected a reload after the close renumbered the active tab, got {other:?}")
+        }
+    }
+
+    // Tab 2 is active and loaded; closing tab 0 (not the active tab)
+    // renumbers tab 2 down to index 1 -- the same raw index a stale,
+    // unrelated load could have left behind.
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree("close_bg_scratch"));
+    open_fixture_tab(&mut controller, "close_bg", "mantis-64", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60)).expect("tab 0 must fuse");
+    open_fixture_tab(&mut controller, "close_bg", "mantis-64", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60)).expect("tab 1 must fuse");
+    open_fixture_tab(&mut controller, "close_bg", "mantis-512", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120)).expect("tab 2 must fuse");
+
+    let tab2 = load_path(&mut controller, None);
+    controller.close_project(0);
+    assert_eq!(
+        controller.active_project(),
+        Some(1),
+        "closing tab 0 while tab 2 is active renumbers it down to index 1"
+    );
+    // Simulates a canvas that still holds tab 1's own (stale) planes from
+    // an earlier switch never reconciled again before this close --
+    // exactly the raw index the renumbered active tab now also carries.
+    match controller.canvas_feed(Some(1)) {
+        CanvasFeed::Load { tab, composite, .. } => {
+            assert_eq!(tab, 1);
+            assert_eq!(
+                composite, tab2,
+                "the renumbered tab must load the project that was actually active before \
+                 the close, not whatever the coincidentally matching raw index last held"
+            );
+        }
+        other => panic!("expected a reload, got {other:?}"),
+    }
+}
+
+/// `composite_ready` follows the *active* tab's own checkpoint count: false
+/// with no tab active, false right after opening (no run yet), true once
+/// that tab's own fuse settles, false while a second, never-fused tab is
+/// active even though the first tab is fused, true again on returning to
+/// the fused tab.
+#[test]
+fn composite_ready_follows_the_active_tabs_own_fuse() {
+    let mut controller = AppController::new();
+    assert!(
+        !controller.composite_ready(),
+        "no active tab has no composite to show"
+    );
+
+    controller.set_scratch_root_for_test(common::tree("composite_ready_scratch"));
+    open_fixture_tab(&mut controller, "composite_ready", "mantis-64", 2);
+    assert!(
+        !controller.composite_ready(),
+        "a freshly opened tab has no composite until its first fuse"
+    );
+
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60))
+        .expect("the first fuse must complete");
+    assert!(
+        controller.composite_ready(),
+        "the active tab's own settled fuse must flip it true"
+    );
+    assert!(matches!(
+        controller.canvas_feed(None),
+        CanvasFeed::Load { tab: 0, .. }
+    ));
+
+    open_fixture_tab(&mut controller, "composite_ready", "mantis-512", 3);
+    assert!(
+        !controller.composite_ready(),
+        "a second, never-fused tab being active must read false, even though tab 0 is fused"
+    );
+
+    controller.select_project(0);
+    assert!(
+        controller.composite_ready(),
+        "returning to the fused tab must read true again"
+    );
+
+    controller.select_plus();
+    assert!(
+        !controller.composite_ready(),
+        "\"+\" selected must read false, even though tab 0 is fused"
+    );
+
+    controller.select_project(0);
+    assert!(
+        controller.composite_ready(),
+        "leaving \"+\" for the fused tab must read true again"
+    );
+}
+
+#[test]
+fn opening_a_saved_project_feeds_its_own_planes() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree("saved_scratch"));
+    let root = open_fixture_tab(&mut controller, "saved", "mantis-64", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60))
+        .expect("the fuse must complete");
+    let title = controller.project_tabs()[0].title.clone();
+    let ffp = root.join(format!("{title}.ffp"));
+    assert!(controller.save_active_project(|proposed| Some(proposed.to_path_buf())));
+    assert!(ffp.is_file());
+
+    open_fixture_tab(&mut controller, "saved", "mantis-512", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120))
+        .expect("the second fuse must complete");
+    assert!(matches!(
+        controller.canvas_feed(None),
+        CanvasFeed::Load { tab: 1, .. }
+    ));
+
+    // Reopening the saved `.ffp` mid-session lands a third tab and must
+    // load its own planes, not the tab it displaced.
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[ffp]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(controller.active_project(), Some(2));
+    match controller.canvas_feed(Some(1)) {
+        CanvasFeed::Load { tab, composite, .. } => {
+            assert_eq!(tab, 2);
+            assert!(composite.is_file());
+        }
+        other => {
+            panic!("opening a saved project mid-session must load its own planes, got {other:?}")
+        }
+    }
+}
+
+/// The right pane draws at the sealed composite's own extent, not the
+/// source frames': fuses a `mantis-512` tab (512x512 frames), whose
+/// alignment crop makes the composite smaller, and asserts `plane_draw`'s
+/// source rect stays bounded by the composite's own dimensions.
+#[test]
+fn right_pane_uses_composite_extent() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree("right_pane_extent_scratch"));
+    open_fixture_tab(&mut controller, "right_pane_extent", "mantis-512", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120))
+        .expect("the fuse must complete");
+
+    let composite_path = load_path(&mut controller, None);
+    let composite_header =
+        TiffHeader::open(&composite_path).expect("the sealed composite must have a real header");
+    assert!(
+        composite_header.width < 512 || composite_header.height < 512,
+        "the alignment crop must make the composite smaller than the 512x512 frames, got {}x{}",
+        composite_header.width,
+        composite_header.height
+    );
+
+    controller.set_pane_geometry(
+        PaneRect {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 600.0,
+        },
+        PaneRect {
+            x: 600.0,
+            y: 0.0,
+            width: 600.0,
+            height: 600.0,
+        },
+    );
+    controller.fit();
+
+    let frame = controller
+        .frame_draw()
+        .expect("a fused tab still has a frame pane to draw");
+    let plane = controller
+        .plane_draw()
+        .expect("a fused tab has a sealed plane to draw");
+
+    assert!(
+        plane.src.2 <= composite_header.width && plane.src.3 <= composite_header.height,
+        "the right pane's source rect {:?} must stay within the sealed composite's own extent \
+         {}x{}",
+        plane.src,
+        composite_header.width,
+        composite_header.height
+    );
+    assert_ne!(
+        plane.src, frame.src,
+        "the right pane must not be stretched across the source frames' extent"
+    );
+}
+
+/// A frame the mmap reader refuses (a compressed TIFF) shows the reader's
+/// own refusal text, and dropping into it still drops whatever was open
+/// before -- the drop-before-open rule holds even on a failed open.
+#[test]
+fn compressed_frame_shows_reader_refusal() {
+    let dir = common::tree("compressed_frame_refusal");
+    let good = common::fixture_frame("mantis-64", 0);
+    let compressed = dir.join("compressed.tif");
+    write_compressed_copy(&good, &compressed);
+
+    let mut frame = FrameSource::default();
+    frame
+        .set(&good)
+        .expect("the uncompressed fixture frame must open");
+    assert!(frame.path().is_some());
+
+    let err = frame
+        .set(&compressed)
+        .expect_err("a compressed frame must be refused");
+    assert!(
+        err.to_string()
+            .contains("Compression=5, only uncompressed (1) is supported"),
+        "the reader's own refusal text must reach the surface, got: {err}"
+    );
+    assert!(
+        frame.path().is_none(),
+        "a failed open must still drop whatever was open before it"
+    );
+}
+
+/// Copies `source` (a little-endian, classic-TIFF fixture frame) to `dest`,
+/// patching its `Compression` tag (259) from 1 to 5 in place.
+fn write_compressed_copy(source: &Path, dest: &Path) {
+    let mut bytes = fs::read(source).expect("read fixture frame");
+    assert_eq!(
+        &bytes[0..2],
+        b"II",
+        "fixture frame must be little-endian for this byte-level patch"
+    );
+    let ifd_offset = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let n_entries =
+        u16::from_le_bytes(bytes[ifd_offset..ifd_offset + 2].try_into().unwrap()) as usize;
+    let mut patched = false;
+    for i in 0..n_entries {
+        let entry_off = ifd_offset + 2 + i * 12;
+        let tag = u16::from_le_bytes(bytes[entry_off..entry_off + 2].try_into().unwrap());
+        if tag == 259 {
+            bytes[entry_off + 8..entry_off + 10].copy_from_slice(&5u16.to_le_bytes());
+            patched = true;
+            break;
+        }
+    }
+    assert!(
+        patched,
+        "Compression tag (259) not found in {}",
+        source.display()
+    );
+    fs::write(dest, bytes).expect("write compressed copy");
+}
+
+/// The drop-before-open rule with no GPU and no window: stepping over every
+/// frame of a fixture set leaves exactly one handle open (the last one), and
+/// a failed `set` leaves none open at all.
+#[test]
+fn frame_source_holds_one_frame() {
+    let mut frame = FrameSource::default();
+    for i in 0..3 {
+        frame
+            .set(&common::fixture_frame("mantis-64", i))
+            .expect("a fixture frame must open");
+    }
+    assert_eq!(
+        frame.path().unwrap().file_name().unwrap().to_str().unwrap(),
+        "02.tif",
+        "only the last-opened frame's handle must remain"
+    );
+    assert!(frame.dimensions().is_some());
+
+    let missing = PathBuf::from("/does/not/exist.tif");
+    assert!(frame.set(&missing).is_err());
+    assert!(
+        frame.path().is_none(),
+        "a failed set must leave no handle open at all"
+    );
+    assert!(frame.dimensions().is_none());
+}
+
+/// Reads the resident set size (bytes) from `/proc/self/statm`'s second
+/// field (pages), Linux-only -- this is the reference-stack step-through's
+/// own bound, exercised nowhere else.
+#[cfg(target_os = "linux")]
+fn resident_bytes() -> usize {
+    let statm = fs::read_to_string("/proc/self/statm").expect("/proc/self/statm must read");
+    let pages: usize = statm
+        .split_whitespace()
+        .nth(1)
+        .expect("statm must have a resident field")
+        .parse()
+        .expect("resident field must be a number");
+    pages * 4096
+}
+
+/// Steps `FrameSource` over all 61 frames of the reference stack, reading
+/// one bounded rect from each into a reused buffer, asserting resident
+/// memory stays flat rather than growing with the frame count -- the
+/// evidence that exactly one mmap is ever open at a time.
+#[test]
+#[ignore = "reads the reference stack, minutes"]
+fn frame_steps_keep_one_handle() {
+    #[cfg(not(target_os = "linux"))]
+    {
+        eprintln!("resident-memory measurement needs /proc/self/statm; skipping");
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(stack_dir) = common::reference_stack_dir() else {
+            return;
+        };
+        let paths: Vec<PathBuf> = focusforge_core::io::frame_paths(&stack_dir)
+            .expect("frame_paths must enumerate the directory")
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("IMG_"))
+            })
+            .collect();
+        assert_eq!(
+            paths.len(),
+            61,
+            "IMG_-filtered list must exclude Mantis_Stacked.tif"
+        );
+
+        let mut frame = FrameSource::default();
+        let rect = focusforge_core::tile::Rect {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        };
+        let mut buf = vec![0u16; 512 * 512 * 3];
+
+        let mut baseline = 0usize;
+        let mut peak = 0usize;
+        for (i, path) in paths.iter().enumerate() {
+            frame.set(path).expect("a reference-stack frame must open");
+            frame
+                .read_into(rect, std::num::NonZeroU32::MIN, &mut buf)
+                .expect("the visible rect must read");
+            let rss = resident_bytes();
+            peak = peak.max(rss);
+            if i == 0 {
+                baseline = rss;
+            }
+        }
+        let growth = peak.saturating_sub(baseline);
+        eprintln!(
+            "resident after frame 0: {baseline} bytes, peak across 61 frames: {peak} bytes, \
+             growth {growth} bytes"
+        );
+        assert!(
+            growth < 300 * 1024 * 1024,
+            "resident memory must stay flat while stepping through every frame: grew \
+             {growth} bytes ({} MB)",
+            growth / (1024 * 1024)
+        );
+        assert_eq!(
+            frame.path(),
+            Some(paths.last().unwrap().as_path()),
+            "only the last frame's handle must remain open"
+        );
+    }
+}
+
+/// The fit-zoom redraw cost on one full-size reference frame in a 566 x 377
+/// pane: the decimated read's sample count, and the wall-clock of the step-1
+/// and stepped reads at fit and of the 100 % read, plus the renderer's own
+/// `redraw_frame` when a GPU is present.
+#[test]
+#[ignore = "reads the reference stack, minutes"]
+fn fit_zoom_redraw_reads_a_pane_sized_image() {
+    use std::num::NonZeroU32;
+    use std::time::Instant;
+
+    use focusforge_gui::viewport::{ImageSize, fit};
+
+    let Some(stack_dir) = common::reference_stack_dir() else {
+        return;
+    };
+    let first = focusforge_core::io::frame_paths(&stack_dir)
+        .expect("frame_paths must enumerate the directory")
+        .into_iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("IMG_"))
+        })
+        .expect("the reference stack holds source frames");
+    let mut frame = FrameSource::default();
+    frame.set(&first).expect("a reference frame must open");
+    let (w, h) = frame.dimensions().unwrap();
+    let spp = frame.samples_per_pixel().unwrap() as usize;
+    let img = ImageSize {
+        width: w,
+        height: h,
+    };
+    let pane = PaneRect {
+        x: 0.0,
+        y: 0.0,
+        width: 566.0,
+        height: 377.0,
+    };
+
+    let mut vp = fit(img, pane);
+    let at_fit = vp.draw(img, pane).expect("fit draws");
+    let rect_of = |d: &focusforge_gui::viewport::PaneDraw| focusforge_core::tile::Rect {
+        x: d.src.0,
+        y: d.src.1,
+        width: d.src.2,
+        height: d.src.3,
+    };
+    let (ew, eh) = at_fit.extent();
+    let stepped_samples = ew as usize * eh as usize * spp;
+    let full_samples = at_fit.src.2 as usize * at_fit.src.3 as usize * spp;
+    assert!(
+        stepped_samples < 1_000_000,
+        "fit reads {stepped_samples} samples"
+    );
+
+    let time_read = |rect, step: NonZeroU32, len: usize| {
+        let mut buf = vec![0u16; len];
+        let start = Instant::now();
+        frame.read_into(rect, step, &mut buf).expect("read");
+        start.elapsed()
+    };
+    // Warm the page cache once so both fit timings read from memory.
+    time_read(rect_of(&at_fit), NonZeroU32::MIN, full_samples);
+    let step1 = time_read(rect_of(&at_fit), NonZeroU32::MIN, full_samples);
+    let stepped = time_read(rect_of(&at_fit), at_fit.step, stepped_samples);
+
+    while vp.scale() < 1.0 - 1e-9 {
+        vp.zoom_steps(1, (283.0, 188.5), img, pane);
+    }
+    let at_100 = vp.draw(img, pane).unwrap();
+    let len_100 = at_100.src.2 as usize * at_100.src.3 as usize * spp;
+    let one_to_one = time_read(rect_of(&at_100), at_100.step, len_100);
+    eprintln!(
+        "{w}x{h} in 566x377: fit step {} reads {stepped_samples} samples ({ew}x{eh}) in \
+         {stepped:?}; step 1 reads {full_samples} in {step1:?}; 100 % reads {len_100} in \
+         {one_to_one:?}",
+        at_fit.step
+    );
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let mut renderer = focusforge_gui::gpu_canvas::CanvasRenderer::new(shared);
+    renderer
+        .set_frame(&first)
+        .expect("the renderer opens the frame");
+    for (label, draw) in [("fit", at_fit), ("100 %", at_100)] {
+        let start = Instant::now();
+        let drawn = renderer.redraw_frame(&draw);
+        eprintln!(
+            "redraw_frame at {label}: {:?} (CPU side, submit included), drawn: {}",
+            start.elapsed(),
+            drawn.is_some()
+        );
+    }
 }
 
 const GEOMETRY_EPS: f32 = 0.5;
@@ -232,7 +924,7 @@ fn pane_chrome_geometry() {
 /// for an undock control to undock, so both are hidden rather than drawn
 /// over an empty pane.
 /// `project-loaded` defaults to `false`, matching every window that has not
-/// yet run `bridge::repaint` -- see `src/bridge.rs::repaint`.
+/// yet run `bridge::repaint`.
 #[test]
 fn pane_chrome_hidden_without_a_project() {
     thread_local! {
@@ -256,4 +948,172 @@ fn pane_chrome_hidden_without_a_project() {
             "{id}: must be hidden while no project is open"
         );
     }
+}
+
+/// The not-yet-fused placeholder is on screen exactly while a project is
+/// loaded and the active tab has no composite yet, 220 px wide and centred
+/// on `pane-right`'s own rect without covering its label, at both the base
+/// and the minimum window size -- and a mid-run set of bottom-bar
+/// properties changes neither its visibility nor its rect, since it reads
+/// no run state at all.
+#[test]
+fn pane_placeholder_shows_only_until_the_first_fuse() {
+    thread_local! {
+        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    INIT.with(|done| {
+        if !done.get() {
+            i_slint_backend_testing::init_no_event_loop();
+            done.set(true);
+        }
+    });
+    let app = AppWindow::new().unwrap();
+
+    for (label, width, height) in [("base", 1440, 900), ("minimum", 1200, 760)] {
+        app.window()
+            .set_size(slint::PhysicalSize::new(width, height));
+        app.set_project_loaded(true);
+        app.set_composite_ready(false);
+
+        let pane = ElementQuery::from_root(&app)
+            .match_id("FFCanvas::pane-right")
+            .find_first()
+            .unwrap_or_else(|| panic!("{label}: no element matched id \"FFCanvas::pane-right\""));
+        let pane_pos = pane.absolute_position();
+        let pane_size = pane.size();
+
+        let placeholder = ElementQuery::from_root(&app)
+            .match_id("FFCanvas::pane-placeholder")
+            .find_first()
+            .unwrap_or_else(|| {
+                panic!("{label}: placeholder must show while the active tab has no composite")
+            });
+        let p_pos = placeholder.absolute_position();
+        let p_size = placeholder.size();
+        assert!(
+            (p_size.width - 220.0).abs() < GEOMETRY_EPS,
+            "{label}: placeholder width {}, expected 220",
+            p_size.width
+        );
+        assert!(
+            (p_pos.x - (pane_pos.x + (pane_size.width - p_size.width) / 2.0)).abs() < GEOMETRY_EPS
+                && (p_pos.y - (pane_pos.y + (pane_size.height - p_size.height) / 2.0)).abs()
+                    < GEOMETRY_EPS,
+            "{label}: placeholder must be centred on pane-right's rect, got {p_pos:?} over pane \
+             {pane_pos:?} {pane_size:?}"
+        );
+
+        // The 120x22 label at pane-right's own +10/+10 must still be found,
+        // and the placeholder must not overlap it.
+        let label_el = ElementQuery::from_root(&app)
+            .match_id("FFPane::pane-label")
+            .find_all()
+            .into_iter()
+            .find(|el| {
+                let p = el.absolute_position();
+                (p.x - (pane_pos.x + 10.0)).abs() < GEOMETRY_EPS
+                    && (p.y - (pane_pos.y + 10.0)).abs() < GEOMETRY_EPS
+            })
+            .unwrap_or_else(|| panic!("{label}: no pane-label found at pane-right's +10/+10"));
+        let l_pos = label_el.absolute_position();
+        let l_size = label_el.size();
+        let disjoint = p_pos.x >= l_pos.x + l_size.width
+            || l_pos.x >= p_pos.x + p_size.width
+            || p_pos.y >= l_pos.y + l_size.height
+            || l_pos.y >= p_pos.y + p_size.height;
+        assert!(
+            disjoint,
+            "{label}: placeholder {p_pos:?} {p_size:?} must not overlap the pane label \
+             {l_pos:?} {l_size:?}"
+        );
+
+        // A mid-run bottom-bar state must not move or hide the placeholder
+        // -- it reads no run property.
+        app.set_stage_word("Aligning".into());
+        app.set_step_text("42 of 61".into());
+        app.set_bar_fraction(0.62);
+        app.set_bar_tone("running".into());
+        let placeholder_after = ElementQuery::from_root(&app)
+            .match_id("FFCanvas::pane-placeholder")
+            .find_first()
+            .unwrap_or_else(|| panic!("{label}: placeholder must still show mid-run"));
+        assert_eq!(
+            placeholder_after.absolute_position(),
+            p_pos,
+            "{label}: a mid-run bottom-bar state must not move the placeholder"
+        );
+        assert_eq!(
+            placeholder_after.size(),
+            p_size,
+            "{label}: a mid-run bottom-bar state must not resize the placeholder"
+        );
+        app.set_stage_word("".into());
+        app.set_step_text("".into());
+        app.set_bar_fraction(0.0);
+        app.set_bar_tone("".into());
+
+        app.set_composite_ready(true);
+        assert!(
+            ElementQuery::from_root(&app)
+                .match_id("FFCanvas::pane-placeholder")
+                .find_all()
+                .is_empty(),
+            "{label}: placeholder must be gone once the active tab has a composite"
+        );
+
+        app.set_project_loaded(false);
+        assert!(
+            ElementQuery::from_root(&app)
+                .match_id("FFCanvas::pane-placeholder")
+                .find_all()
+                .is_empty(),
+            "{label}: placeholder must stay hidden with no project loaded"
+        );
+    }
+}
+
+#[test]
+fn pane_label_short_enough_passes_through_unchanged() {
+    assert_eq!(truncate_pane_label("Composite"), "Composite");
+}
+
+#[test]
+fn pane_label_too_long_keeps_its_tail() {
+    let name = "20260829-IMG_9800.tif";
+    let truncated = truncate_pane_label(name);
+    assert!(
+        truncated.chars().count() < name.chars().count(),
+        "{truncated:?} must be shorter than the untruncated {name:?}"
+    );
+    assert!(
+        truncated.ends_with("9800.tif"),
+        "{truncated:?} must keep the distinguishing tail of {name:?}"
+    );
+    assert!(
+        !truncated.contains("20260829-IMG_9"),
+        "{truncated:?} must not still carry the shared, non-distinguishing prefix"
+    );
+    assert_eq!(
+        truncated.matches('\u{2026}').count(),
+        1,
+        "{truncated:?} must mark the truncation with exactly one ellipsis"
+    );
+    assert!(
+        truncated.starts_with('\u{2026}'),
+        "{truncated:?} must lead with the ellipsis, since the head is what was dropped"
+    );
+}
+
+#[test]
+fn pane_label_at_the_budget_passes_through_unchanged() {
+    let at_budget = "829-IMG_9800.tif";
+    assert_eq!(
+        at_budget.chars().count(),
+        16,
+        "fixture must sit at the budget"
+    );
+    assert_eq!(truncate_pane_label(at_budget), at_budget);
+
+    let one_over = "0829-IMG_9800.tif";
+    assert_eq!(truncate_pane_label(one_over), "\u{2026}29-IMG_9800.tif");
 }

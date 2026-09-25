@@ -40,7 +40,32 @@ impl Checkpoint {
     /// the same instant name the same checkpoint file, and no `uuid`
     /// dependency is needed to get a collision-free name.
     pub fn derive_id(stack_fingerprint: &str, zmap_blob: &str, created_at: i64) -> String {
+        Self::derive(None, stack_fingerprint, zmap_blob, created_at)
+    }
+
+    /// `blake3(parent ‖ stack_fingerprint ‖ zmap_blob ‖ created_at)`,
+    /// hex-truncated to 32 characters -- the parent is folded into the hash
+    /// so appending onto unchanged sources within the same wall-clock second
+    /// still derives an id distinct from the checkpoint it is parented on.
+    pub fn derive_child_id(
+        parent: &str,
+        stack_fingerprint: &str,
+        zmap_blob: &str,
+        created_at: i64,
+    ) -> String {
+        Self::derive(Some(parent), stack_fingerprint, zmap_blob, created_at)
+    }
+
+    fn derive(
+        parent: Option<&str>,
+        stack_fingerprint: &str,
+        zmap_blob: &str,
+        created_at: i64,
+    ) -> String {
         let mut hasher = blake3::Hasher::new();
+        if let Some(parent) = parent {
+            hasher.update(parent.as_bytes());
+        }
         hasher.update(stack_fingerprint.as_bytes());
         hasher.update(zmap_blob.as_bytes());
         hasher.update(&created_at.to_le_bytes());
@@ -90,8 +115,7 @@ pub enum Op {
     ResetRegion {
         /// `crate::tile::Rect` deliberately derives no `Default` (an empty
         /// rect is not a meaningful geometry anywhere else in the
-        /// workspace), so the op-field default is spelled here rather than
-        /// bought by widening a type five modules away.
+        /// workspace), so the op-field default is spelled here instead.
         #[serde(default = "empty_rect")]
         rect: Rect,
     },
@@ -126,6 +150,16 @@ mod tests {
         assert_ne!(a, Checkpoint::derive_id("fp", "blob", 43));
         assert_ne!(a, Checkpoint::derive_id("fp2", "blob", 42));
         assert_eq!(a.len(), 32);
+    }
+
+    #[test]
+    fn derive_child_id_differs_from_derive_id_and_per_parent() {
+        let plain = Checkpoint::derive_id("fp", "blob", 42);
+        let child_a = Checkpoint::derive_child_id("parent-a", "fp", "blob", 42);
+        let child_b = Checkpoint::derive_child_id("parent-b", "fp", "blob", 42);
+        assert_ne!(child_a, plain);
+        assert_ne!(child_a, child_b);
+        assert_eq!(child_a.len(), 32);
     }
 
     #[test]

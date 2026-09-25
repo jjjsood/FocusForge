@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A row's own inline text, styled like a resolved value rather than a caption.
+
+import { Theme } from "../theme.slint";
+
+export component FFRowText inherits Text {
+    color: Theme.text-primary;
+    font-size: Theme.text-value.size;
+    vertical-alignment: center;
+}

@@ -23,8 +23,8 @@ struct Params {
 @group(0) @binding(1) var<uniform> params: Params;
 @group(0) @binding(2) var dst: texture_storage_2d<rgba8unorm, write>;
 
-// The 4x4 ordered (Bayer) dither matrix -- `crate::display::BAYER_4X4`'s
-// WGSL twin, values `0..=15`.
+// The 4x4 ordered (Bayer) dither matrix -- the WGSL twin of
+// `focusforge_core::display::BAYER_4X4`, values `0..=15`.
 const BAYER_4X4 = array<u32, 16>(
     0u, 8u, 2u, 10u,
     12u, 4u, 14u, 6u,
@@ -32,15 +32,15 @@ const BAYER_4X4 = array<u32, 16>(
     15u, 7u, 13u, 5u,
 );
 
-// `crate::zmap::NO_SOURCE`'s WGSL twin: the reserved "no single source"
-// index.
+// `focusforge_core::zmap::NO_SOURCE`'s WGSL twin: the reserved "no single
+// source" index.
 const NO_SOURCE: u32 = 65535u;
 
 fn dither_threshold(x: u32, y: u32) -> u32 {
     return BAYER_4X4[(y % 4u) * 4u + (x % 4u)] * 16u + 8u;
 }
 
-// `crate::display::reduce16to8`'s WGSL twin.
+// `focusforge_core::display::reduce16to8`'s WGSL twin.
 fn reduce16to8(v: u32, x: u32, y: u32) -> u32 {
     let hi = v >> 8u;
     let lo = v & 0xffu;
@@ -61,14 +61,16 @@ fn sample_at(index: u32) -> u32 {
     return word >> 16u;
 }
 
-@compute @workgroup_size(64)
+// Dispatched 2-D, one invocation per `(x, y)`, so the workgroup-count ceiling
+// applies per axis rather than to the pixel count.
+@compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= params.width * params.height) {
+    let x = global_id.x;
+    let y = global_id.y;
+    if (x >= params.width || y >= params.height) {
         return;
     }
-    let x = i % params.width;
-    let y = i / params.width;
+    let i = y * params.width + x;
 
     var r: u32;
     var g: u32;

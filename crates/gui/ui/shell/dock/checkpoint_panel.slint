@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The checkpoint panel: a 28 px heading row -- `CHECKPOINTS` left, an
+// `Export image` button right, both at a 12 px inset from the dock edges --
+// and the one muted line under it, reading the active tab's checkpoint
+// count. The panel ends 32 px below that line, where `FFDock` draws its
+// rule.
+
+import { Theme } from "../../theme.slint";
+import { FFButton } from "../../components/ff_button.slint";
+
+export component FFCheckpointPanel inherits Rectangle {
+    callback checkpoint-export-requested();
+    in property <string> line: "None yet — fuse a stack";
+
+    VerticalLayout {
+        padding-left: Theme.space-1;
+        padding-right: Theme.space-1;
+        padding-top: Theme.space-3;
+        padding-bottom: Theme.space-8;
+
+        heading-row := HorizontalLayout {
+            height: 28px;
+            alignment: space-between;
+
+            Text {
+                text: "CHECKPOINTS";
+                color: Theme.text-secondary;
+                font-size: Theme.text-section.size;
+                font-weight: Theme.text-section.weight;
+                letter-spacing: Theme.text-section.letter-spacing;
+                vertical-alignment: center;
+            }
+
+            VerticalLayout {
+                alignment: center;
+
+                checkpoint-export := FFButton {
+                    kind: "default";
+                    compact: true;
+                    has-icon: true;
+                    icon-source: @image-url("../../../../../assets/icons/download.svg");
+                    text: "Export image";
+                    enabled: false;
+                    clicked => { root.checkpoint-export-requested(); }
+                }
+            }
+        }
+
+        checkpoint-note := Text {
+            text: root.line;
+            min-height: Theme.text-body.size * Theme.text-body.line-height;
+            vertical-alignment: center;
+            color: Theme.text-disabled;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            wrap: word-wrap;
+        }
+    }
+}

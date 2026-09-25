@@ -17,10 +17,8 @@ use std::fs;
 use focusforge_gui::{Theme, ThemeProbe};
 use slint::{Color, Global};
 
-/// A headless `ThemeProbe` instance, safe to call from any test in this
-/// file (and only this file's tests are run on one thread at a time by
-/// libtest by default; the `thread_local!` guard is what makes a second
-/// call from the *same* thread safe too).
+/// A headless `ThemeProbe` instance; the `thread_local!` guard makes a
+/// repeat call on the same thread safe.
 fn probe() -> ThemeProbe {
     thread_local! {
         static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -193,7 +191,7 @@ fn accent_is_the_only_brand_hue() {
         );
     }
 
-    // The accent itself is exactly #E8763A -- unchanged from assets/logo.svg.
+    // The accent itself is exactly #E8763A -- matching assets/logo.svg.
     assert_color(theme.get_accent_default(), 0xE8763A, "accent.default");
 }
 

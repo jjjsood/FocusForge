@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A raised card telling the viewer a canvas pane has nothing to show yet.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFPanePlaceholder inherits Rectangle {
+    width: ShellGeometry.pane-placeholder-width;
+    height: layout.preferred-height;
+    background: Theme.surface-raised;
+    border-radius: Theme.radius-lg;
+
+    layout := VerticalLayout {
+        padding: Theme.space-4;
+        spacing: Theme.space-2;
+
+        Text {
+            text: "Not fused yet";
+            color: Theme.text-primary;
+            font-size: Theme.text-title.size;
+            font-weight: Theme.text-title.weight;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "Fuse stack builds the composite here.";
+            color: Theme.text-muted;
+            font-size: Theme.text-value.size;
+            font-weight: Theme.text-value.weight;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+}

@@ -19,9 +19,8 @@ use focusforge_core::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometr
 use focusforge_core::gpu::{BackendInfo, TileBackend};
 use focusforge_core::io::TiffStack;
 use focusforge_core::params::{ParamValue, ParamValues, StackContext};
-use focusforge_core::tile::preprocess::FramePreprocess;
 use focusforge_core::tile::{
-    NoControl, Rect, Tile, TileConsumer, TileError, TileJob, TileScheduler, TileSchedulerOptions,
+    Rect, Tile, TileConsumer, TileJob, TileScheduler, TileSchedulerOptions,
 };
 
 fn scratch_base(label: &str) -> PathBuf {
@@ -60,16 +59,6 @@ impl TileConsumer for OwnPixelsProbe {
 
     fn supplies_own_pixels(&self) -> bool {
         true
-    }
-}
-
-/// A non-noop [`FramePreprocess`]: `is_noop` stays the trait's own default
-/// (`false`), which is the whole point of this stub.
-struct NotNoopPreprocess;
-
-impl FramePreprocess for NotNoopPreprocess {
-    fn preprocess(&self, _frame: usize, _tile: &mut Tile) -> Result<(), AlgorithmError> {
-        Ok(())
     }
 }
 
@@ -330,55 +319,6 @@ fn abort_drops_the_sinks_writers_through_the_backend_consumer() {
     );
 
     let _ = std::fs::remove_file(&composite_path);
-}
-
-#[test]
-fn a_non_noop_preprocess_is_refused_by_name_for_a_pixel_supplying_consumer() {
-    let stack = open_stack();
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
-    let stack_ctx = StackContext::new(stack.len(), width, height, spp);
-    let options = TileSchedulerOptions::new(scratch_base("refuse_non_noop"));
-    let scheduler =
-        TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
-
-    let err = scheduler
-        .run(&NotNoopPreprocess, &OwnPixelsProbe)
-        .expect_err("a non-noop preprocess must be refused for a pixel-supplying consumer");
-    assert!(
-        matches!(err, TileError::PixelSupplyingConsumerNeedsNoopPreprocess),
-        "expected PixelSupplyingConsumerNeedsNoopPreprocess, got {err:?}"
-    );
-}
-
-/// The same refusal, reached through `run_tiles_controlled` rather than
-/// `run`. `crate::job::Job::run` drives that method directly and never goes
-/// through `run_tiles`, so a guard living in the `run_tiles` wrapper would
-/// leave the job-engine path silently accepting the combination this
-/// refuses. Latent today -- `NoopPreprocess` is the only implementation in
-/// the tree -- which is exactly why it needs a test rather than a comment.
-#[test]
-fn the_non_noop_refusal_also_fires_on_the_controlled_entry_point() {
-    let stack = open_stack();
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
-    let stack_ctx = StackContext::new(stack.len(), width, height, spp);
-    let options = TileSchedulerOptions::new(scratch_base("refuse_non_noop_controlled"));
-    let scheduler =
-        TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
-
-    let err = scheduler
-        .run_tiles_controlled(
-            scheduler.plan().tiles(),
-            &NotNoopPreprocess,
-            &OwnPixelsProbe,
-            &NoControl,
-        )
-        .expect_err("a non-noop preprocess must be refused on the controlled path too");
-    assert!(
-        matches!(err, TileError::PixelSupplyingConsumerNeedsNoopPreprocess),
-        "expected PixelSupplyingConsumerNeedsNoopPreprocess, got {err:?}"
-    );
 }
 
 /// A backend that serves exactly two tiles and then reports its device

@@ -9,10 +9,9 @@
 //!
 //! `reference-policy` (`anchor` or `chain`) and `reference-frame` (`first`,
 //! `middle` or `last`) are read out of the resolved `cfg` as well-known
-//! keys with a default when absent -- the same pattern
-//! `StackAlgorithm::tile_levels`'s default body already uses for `"levels"`
-//! -- so an algorithm that declares neither still runs, anchored on the
-//! middle frame. `Middle` resolves to `(frame_count - 1) / 2`.
+//! keys with a default when absent, so an algorithm that declares neither
+//! still runs, anchored on the middle frame. `Middle` resolves to
+//! `(frame_count - 1) / 2`.
 //!
 //! **Anchor** builds one [`AlignContext`] against the reference, calling `align_frame` for every
 //! other frame across a driver-owned rayon pool from [`AlignDriverOptions::max_bytes_in_flight`],
@@ -39,12 +38,9 @@
 //! [`FailurePolicy::IdentityFallback`] that frame's transform is replaced
 //! by [`Transform::identity`] and `fallback` is set. In chain mode an
 //! identity fallback substitutes identity for **that hop only** before
-//! composing onto the prefix -- the frame inherits the same accumulated
-//! transform its predecessor had, which is not neighbour inheritance
-//! (rejected outright): neighbour inheritance would attribute a transform
-//! the solver never found, while this is the solver's own hop, set to "no
-//! motion" and then composed exactly like every other hop.
-
+//! composing onto the prefix, rather than inheriting the neighbour's
+//! transform outright.
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
@@ -149,12 +145,17 @@ pub struct AlignDriverOptions {
     /// may hold live in the anchor arm. See `workers_for_budget` (private to
     /// this module) for the arithmetic this bounds.
     pub max_bytes_in_flight: usize,
+    /// Bumped once per frame whose registration has completed, reference
+    /// frame included, in completion order -- `None` when the caller has
+    /// nowhere to report it.
+    pub frames_done: Option<Arc<AtomicUsize>>,
 }
 
 impl Default for AlignDriverOptions {
     fn default() -> Self {
         AlignDriverOptions {
             max_bytes_in_flight: DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT,
+            frames_done: None,
         }
     }
 }
@@ -182,13 +183,12 @@ pub fn bytes_shared_reference(stack: StackContext) -> u64 {
     plane * 4 / 3
 }
 
-/// The transient peak bytes one anchor-mode registration holds live **on top
-/// of** the one shared reference pyramid ([`bytes_shared_reference`]) -- the
-/// sibling of `crate::tile::scheduler::bytes_per_tile_set`, `pub` because two
-/// callers outside this module need it: the memory test
-/// (`crates/core/tests/align_parallel_memory.rs`) sizes its budgets from it,
-/// and a caller choosing [`AlignDriverOptions::max_bytes_in_flight`]
-/// deliberately is choosing a multiple of it.
+/// The transient peak bytes one anchor-mode registration holds live **on
+/// top of** the one shared reference pyramid ([`bytes_shared_reference`]) --
+/// the sibling of `crate::tile::scheduler::bytes_per_tile_set`, `pub`
+/// because the memory test sizes its budgets from it, and a caller choosing
+/// [`AlignDriverOptions::max_bytes_in_flight`] deliberately is choosing a
+/// multiple of it.
 ///
 /// ```text
 /// plane      = width * height * 4                      // f32 luma
@@ -286,6 +286,14 @@ fn reference_index(frame: ReferenceFrame, frame_count: usize) -> usize {
     }
 }
 
+/// Bumps `counter`, if there is one -- the one place every registration
+/// (anchor, pooled or chain hop) credits [`AlignDriverOptions::frames_done`].
+fn credit_frame_done(counter: Option<&AtomicUsize>) {
+    if let Some(counter) = counter {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// The identity [`FrameAlignment`] every reference frame gets, without a
 /// solver call.
 fn identity_alignment(frame: usize) -> FrameAlignment {
@@ -336,6 +344,7 @@ fn run_chain_leg(
     frames: &mut [Option<FrameAlignment>],
     indices: impl Iterator<Item = usize>,
     reference: usize,
+    frames_done: Option<&AtomicUsize>,
 ) -> Result<(), AlgorithmError> {
     let mut previous = reference;
     let mut prefix = Transform::identity();
@@ -358,6 +367,7 @@ fn run_chain_leg(
             residual: outcome.residual,
             fallback,
         });
+        credit_frame_done(frames_done);
         prefix = composed;
         previous = i;
     }
@@ -394,9 +404,9 @@ pub fn align_stack(
 /// `options.max_bytes_in_flight` and [`bytes_per_registration`], built and
 /// dropped inside this call -- it never coexists with the tile scheduler's
 /// own pool, which (on the `stack` path) is not built until after this call
-/// returns. When the budget floors to one worker, this runs today's serial
-/// loop verbatim rather than building a pool at all, which is also what
-/// keeps the byte-identity tests' reference side alive.
+/// returns. When the budget floors to one worker, this runs a serial loop
+/// rather than building a pool at all, which is also what keeps the
+/// byte-identity tests' reference side alive.
 ///
 /// Chain mode is **serial by construction** -- see the module docs -- and
 /// always reports `worker_limit: 1, peak_workers: 1`.
@@ -430,26 +440,26 @@ pub fn align_stack_with(
                 registrations,
             );
 
-            // One `AlignContext` per run, built once before the branch --
             // `prepare_run` is called exactly here, at most once per run,
-            // only in the anchor arm, so both sub-arms below share the same
-            // prepared reference pyramid from this single line. The `Arc`
-            // binding lives in this stack frame and is dropped when this
-            // function returns: that is the whole lifetime story for "the
-            // cache is scoped to one run", see the module docs.
+            // only in the anchor arm, so both sub-arms below share the
+            // same prepared reference pyramid from this single line. The
+            // `Arc` binding lives in this stack frame and drops when this
+            // function returns.
             let ctx = AlignContext::new(stack, reference, reader);
             let prepared = algorithm.prepare_run(&ctx, cfg)?;
             let ctx = ctx.with_prepared(prepared.as_deref());
+            credit_frame_done(options.frames_done.as_deref());
 
             if workers <= 1 {
-                // Today's loop, verbatim: no pool is built at all, and this
-                // is the byte-identity tests' reference side.
+                // Single worker: serial loop, no pool built. This is the
+                // byte-identity tests' reference side.
                 for (i, slot) in frames.iter_mut().enumerate() {
                     if i == reference {
                         continue;
                     }
                     let outcome = algorithm.align_frame(&ctx, i, cfg)?;
                     *slot = Some(anchored_alignment(i, outcome, failure));
+                    credit_frame_done(options.frames_done.as_deref());
                 }
                 (1, 1)
             } else {
@@ -466,20 +476,10 @@ pub fn align_stack_with(
                 let live = AtomicUsize::new(0);
                 let peak = AtomicUsize::new(0);
 
-                // One `Result` per slot, `collect()`ed into a `Vec` that
-                // `IndexedParallelIterator` restores to source order
-                // regardless of completion order (rayon 1.12.0). **Not**
-                // `try_for_each_init`: rayon 1.12.0 does not specify which
-                // of several concurrent errors it returns
-                // (`crate::tile::scheduler`'s own `RunStop` doc records the
-                // same fact), so a post-loop scan in ascending index order
-                // is what makes the returned error exactly the one the
-                // serial loop's `?` would have hit first. The cost is a
-                // failing run finishes every other frame before returning,
-                // instead of short-circuiting -- `align_frame` errors are
-                // malformed-params (refused before this loop) and I/O
-                // failures, not the common case; divergence is an `Ok`
-                // outcome, never an `Err`.
+                // One `Result` per slot, `collect()`ed into a `Vec` in
+                // source order, then scanned ascending so the returned
+                // error matches what the serial loop's `?` would have hit
+                // first.
                 // Span context does not cross onto a pool thread by itself:
                 // the caller's span is captured here and each frame span is
                 // parented to it explicitly, so an event raised while one
@@ -503,6 +503,7 @@ pub fn align_stack_with(
                                     .align_frame(&ctx, i, cfg)
                                     .map(|outcome| anchored_alignment(i, outcome, failure));
                                 live.fetch_sub(1, Ordering::SeqCst);
+                                credit_frame_done(options.frames_done.as_deref());
                                 Some(result)
                             })
                             .collect()
@@ -518,6 +519,7 @@ pub fn align_stack_with(
             }
         }
         ReferencePolicy::Chain => {
+            credit_frame_done(options.frames_done.as_deref());
             run_chain_leg(
                 algorithm,
                 stack,
@@ -527,6 +529,7 @@ pub fn align_stack_with(
                 &mut frames,
                 (reference + 1)..stack.frame_count,
                 reference,
+                options.frames_done.as_deref(),
             )?;
             run_chain_leg(
                 algorithm,
@@ -537,6 +540,7 @@ pub fn align_stack_with(
                 &mut frames,
                 (0..reference).rev(),
                 reference,
+                options.frames_done.as_deref(),
             )?;
             (1, 1)
         }
@@ -562,6 +566,7 @@ pub fn align_stack_with(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     use super::*;
     use crate::algorithm::AlignOutcome;
@@ -732,8 +737,7 @@ mod tests {
     fn worker_budget_arithmetic() {
         // The scheduler's own `budget_arithmetic_at_the_reference_scale`
         // shape: a plain division that floors, not yet clamped by anything.
-        // `shared_bytes = 0` is what proves the new parameter additive: the
-        // expected value is unchanged.
+        // `shared_bytes = 0` is what proves the parameter additive.
         let workers = workers_for_budget(0, 100, 250, 32, 60);
         assert_eq!(workers, 2);
     }
@@ -808,7 +812,7 @@ mod tests {
         let shared = bytes_shared_reference(stack);
         let bytes = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
         let workers = workers_for_budget(shared, bytes, DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT, 32, 60);
-        assert_eq!(workers, 4, "the decision's own 4-workers figure");
+        assert_eq!(workers, 4, "the shipped default's 4-worker figure");
     }
 
     #[test]
@@ -861,5 +865,150 @@ mod tests {
             "bytes_shared_reference {shared} must be within 5% of the real pyramid figure \
              {pyramid_bytes} (ratio {shared_ratio})"
         );
+    }
+
+    /// Records the shared counter's value as seen from inside each
+    /// `align_frame` call, and always converges.
+    struct RecordingAlign {
+        counter: Arc<AtomicUsize>,
+        seen: Mutex<Vec<usize>>,
+    }
+
+    impl AlignAlgorithm for RecordingAlign {
+        fn id(&self) -> &str {
+            "recording-align"
+        }
+        fn display_name(&self) -> &str {
+            "Recording Align"
+        }
+        fn params(&self) -> &[ParamDesc] {
+            &[]
+        }
+        fn align_frame(
+            &self,
+            _ctx: &AlignContext<'_>,
+            _frame: usize,
+            _cfg: &ParamValues,
+        ) -> Result<AlignOutcome, AlgorithmError> {
+            self.seen
+                .lock()
+                .expect("no panic while recording")
+                .push(self.counter.load(Ordering::SeqCst));
+            Ok(converged(Transform::identity()))
+        }
+    }
+
+    /// Converges every frame it is asked about, with no bookkeeping of its
+    /// own -- for tests that only care about the driver's own counter.
+    struct ConstAlign;
+
+    impl AlignAlgorithm for ConstAlign {
+        fn id(&self) -> &str {
+            "const-align"
+        }
+        fn display_name(&self) -> &str {
+            "Const Align"
+        }
+        fn params(&self) -> &[ParamDesc] {
+            &[]
+        }
+        fn align_frame(
+            &self,
+            _ctx: &AlignContext<'_>,
+            _frame: usize,
+            _cfg: &ParamValues,
+        ) -> Result<AlignOutcome, AlgorithmError> {
+            Ok(converged(Transform::identity()))
+        }
+    }
+
+    #[test]
+    fn align_progress_is_visible_mid_stage() {
+        // The serial arm (`max_bytes_in_flight: 1`) over a 6-frame stack
+        // anchored on the middle frame (index 2): the reference is credited
+        // before the loop starts, so the five registrations that follow
+        // (frames 0, 1, 3, 4, 5, in that order) each see the counter one
+        // higher than the last -- strictly rising, strictly between 0 and
+        // the frame count, ending at `frame_count - 1`.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let algo = RecordingAlign {
+            counter: Arc::clone(&counter),
+            seen: Mutex::new(Vec::new()),
+        };
+        let reader = NullReader;
+        let stack = StackContext::new(6, 8, 8, 1);
+        let cfg = cfg_with("anchor", "middle");
+        let options = AlignDriverOptions {
+            max_bytes_in_flight: 1,
+            frames_done: Some(Arc::clone(&counter)),
+        };
+
+        align_stack_with(&algo, stack, &reader, &cfg, FailurePolicy::Strict, &options)
+            .expect("the recording algorithm never errors");
+
+        let seen = algo.seen.lock().expect("no panic while recording").clone();
+        assert_eq!(seen, vec![1, 2, 3, 4, 5]);
+        assert_eq!(counter.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn align_progress_matches_across_worker_counts() {
+        let algo = ConstAlign;
+        let reader = NullReader;
+        for frame_count in [6usize, 9] {
+            let stack = StackContext::new(frame_count, 8, 8, 1);
+            for reference in ["middle", "first"] {
+                let anchor_cfg = cfg_with("anchor", reference);
+                let chain_cfg = cfg_with("chain", reference);
+
+                let serial_counter = Arc::new(AtomicUsize::new(0));
+                let serial = AlignDriverOptions {
+                    max_bytes_in_flight: 1,
+                    frames_done: Some(Arc::clone(&serial_counter)),
+                };
+                align_stack_with(
+                    &algo,
+                    stack,
+                    &reader,
+                    &anchor_cfg,
+                    FailurePolicy::Strict,
+                    &serial,
+                )
+                .expect("const algorithm never errors");
+                assert_eq!(serial_counter.load(Ordering::SeqCst), frame_count);
+
+                let pooled_counter = Arc::new(AtomicUsize::new(0));
+                let pooled = AlignDriverOptions {
+                    frames_done: Some(Arc::clone(&pooled_counter)),
+                    ..Default::default()
+                };
+                align_stack_with(
+                    &algo,
+                    stack,
+                    &reader,
+                    &anchor_cfg,
+                    FailurePolicy::Strict,
+                    &pooled,
+                )
+                .expect("const algorithm never errors");
+                assert_eq!(pooled_counter.load(Ordering::SeqCst), frame_count);
+
+                let chain_counter = Arc::new(AtomicUsize::new(0));
+                let chain = AlignDriverOptions {
+                    frames_done: Some(Arc::clone(&chain_counter)),
+                    ..Default::default()
+                };
+                align_stack_with(
+                    &algo,
+                    stack,
+                    &reader,
+                    &chain_cfg,
+                    FailurePolicy::Strict,
+                    &chain,
+                )
+                .expect("const algorithm never errors");
+                assert_eq!(chain_counter.load(Ordering::SeqCst), frame_count);
+            }
+        }
     }
 }

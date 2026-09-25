@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The empty state: the wordmark above one raised card holding the title, the
+// copy, the single filled "Open folder…" control and the drop caption with
+// its negative half. Placed as the last child of `FFCanvas`, opaque,
+// covering the canvas region without moving either pane -- `visible:
+// root.show-empty-state` keeps `tests/shell.rs`'s pane-geometry tests
+// finding `pane-left`/`pane-right` at their fixed rects regardless.
+//
+// Sizes, in a 1440 x 900 window: wordmark 288 wide at y 276, card 520 x 236
+// at (330, 381) with a 32 px inset, button 168 x 34. The wordmark-plus-card
+// group centres on the band under the tab strip and above the bottom bar
+// (y 36..856), which spans the toolbar's own row -- this component's rect
+// starts a full toolbar height below that band's top, so the group is
+// lifted back up by the same amount to land on the same centre.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFButton } from "../components/ff_button.slint";
+
+export component FFEmptyState inherits Rectangle {
+    callback open-folder-requested();
+
+    background: Theme.surface-base;
+
+    VerticalLayout {
+        x: 0px;
+        y: -ShellGeometry.toolbar-height;
+        width: 100%;
+        height: 100%;
+        alignment: center;
+        // 44 px, wordmark bottom to card top.
+        spacing: Theme.space-8 + Theme.space-3;
+
+        HorizontalLayout {
+            alignment: center;
+
+            wordmark := Image {
+                source: @image-url("../../../../assets/wordmark-horizontal-inverse.svg");
+                width: 288px;
+            }
+        }
+
+        HorizontalLayout {
+            alignment: center;
+
+            empty-card := Rectangle {
+                width: 520px;
+                background: Theme.surface-raised;
+                border-radius: Theme.radius-lg;
+
+                VerticalLayout {
+                    padding: Theme.space-8;
+                    spacing: Theme.space-6;
+
+                    VerticalLayout {
+                        spacing: Theme.space-3;
+
+                        empty-title := Text {
+                            text: "No project open";
+                            height: Theme.text-title.size * Theme.text-title.line-height;
+                            color: Theme.text-primary;
+                            font-size: Theme.text-title.size;
+                            font-weight: Theme.text-title.weight;
+                            vertical-alignment: center;
+                        }
+
+                        empty-body := Text {
+                            text: "Open a folder of frames. Each detected stack becomes its own project, in its own tab.";
+                            color: Theme.text-muted;
+                            font-size: Theme.text-body.size;
+                            font-weight: Theme.text-body.weight;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: Theme.space-3;
+
+                        HorizontalLayout {
+                            alignment: start;
+
+                            open-folder := FFButton {
+                                width: 168px;
+                                kind: "primary";
+                                text: "Open folder…";
+                                clicked => { root.open-folder-requested(); }
+                            }
+                        }
+
+                        drop-caption := Text {
+                            text: "Dropping a folder works on X11, macOS and Windows — not on native Wayland. Open folder… works everywhere.";
+                            color: Theme.text-disabled;
+                            font-size: Theme.text-body.size;
+                            font-weight: Theme.text-body.weight;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -6,7 +6,7 @@
 crates/core/   TIFF I/O, tiles, stacking and alignment algorithms, the
                Z-Map, the job engine (pause/resume/cancel over tile-sized
                work units), the stage cache, grouping proposals and the
-               `.ffproj` project container
+               `.ffp` project container
 crates/gpu/    the shared wgpu device, WGSL fusion/warp kernels and the
                tile-scheduler pipeline that runs them, behind the `gpu`
                feature (on by default). An allocate-and-back-off probe at
@@ -21,58 +21,56 @@ crates/diagnostics/ the shared `tracing` subscriber (stderr sink, rotating
                diagnostics bundle writer -- linked only by `crates/cli` and
                `crates/gui`, never by `crates/core` or `crates/gpu`
 crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
-               strip, settings modal), a wgpu-backed canvas that renders a
-               composite/Z-Map pair, and remappable keyboard/mouse
-               bindings. `--open <dir>` resolves the fixed development pair
-               `<dir>/golden/laplacian.tif` + `<dir>/golden/laplacian-zmap.tif`,
-               separate from the `.ffproj` container `stack` writes
+               strip, projects overlay, settings modal), a wgpu-backed
+               canvas that renders a composite/Z-Map pair, a fuse worker
+               that drives `crates/core`'s own job engine on a background
+               thread, a load worker that walks a folder and decodes a
+               thumbnail off the event-loop thread, and a keyboard/mouse
+               binding table read from `input.toml`
 spikes/        standalone, workspace-excluded feasibility spikes
 fixtures/      small checked-in TIFF crops used by the test suite
 ```
 
 ## Tech stack
 
-Rust, edition 2024, toolchain pinned to `1.95.0` (`rust-toolchain.toml`).
-`focusforge-core` depends on `memmap2`, `thiserror`, `inventory` (algorithm
-registration), `rayon`, `serde` and `serde_json`; `blake3` hashes project
-blobs, `zip`/`zstd` (compression backends off, `zip`'s clock feature off too,
-so two seals of the same inputs produce identical container bytes) read and
-write the `.ffproj` container, and `sysinfo` reads host memory for the
-adaptive tile-scheduler budget; `focusforge-gpu` declares
-`wgpu = "29.0.4"`, gated behind its own `gpu` Cargo feature, on by default on
-both `focusforge-gpu` and `focusforge-cli` (`--no-default-features` excludes
-it, so `cargo build --workspace --no-default-features` is the invocation
-that never needs a GPU or a Vulkan/Metal/DX12-capable driver); `focusforge-cli`
-adds `clap`, `serde`, `serde_json`, `toml` and `signal-hook` (SIGINT/SIGUSR1
-handling for `stack`'s pause/resume/cancel controls), and forwards the same
-`gpu` feature to enable `--no-gpu` and the automatic GPU path on
-`stack`/`align`. `focusforge-gui` depends on `slint = "~1.17"`
-(`default-features = false`, features `std`, `compat-1-2`, `backend-winit`,
-`renderer-femtovg-wgpu`, `unstable-wgpu-29` -- pinned to the same wgpu major
-`focusforge-gpu` declares -- and `unstable-winit-030`), plus `slint-build` as
-a build dependency and `i-slint-backend-testing` as a dev dependency; Inter
-ships bundled under `assets/fonts/` and the icon set is vendored from Lucide
-under `assets/icons/`. `focusforge-diagnostics` declares `tracing` and
-`tracing-subscriber` (with the `tracing-log` bridge, so `log`-crate records
-from `wgpu`/`naga` land in the same sinks) for the shared subscriber,
-`directories` for the platform data/config paths, `crash-handler` and
-`minidumper` for the native-crash sidecar, and `zip` (the same
-`default-features = false` build the `.ffproj` container uses) for the
-diagnostics bundle; `tracing-tracy` and `tracing-chrome` are pulled in only
-behind its own `trace` Cargo feature, which `focusforge-cli` and
-`focusforge-gui` forward. Every dependency's license is checked against an
-allowlist in `deny.toml` with `cargo deny check licenses` (install with
-`cargo install cargo-deny --locked`). **`libfontconfig1-dev` (Debian/Ubuntu
-naming) is a main-workspace build prerequisite**: `crates/gui` links Slint
-with `renderer-femtovg-wgpu`, which has a hard, code-side-unfixable
-dependency on fontconfig (slint-ui/slint discussion #12357), so a from-clean
-`cargo build --workspace` -- and therefore `tools/check-all.sh` -- needs it.
-There is no pkg-config-shim alternative; install the real package.
-`tools/check-all.sh`'s "synthetic alignment truth" gate stage needs numpy
-(`python3 -m pip install numpy`): it drives
-`spikes/synthetic-ground-truth/synth_stack.py --warp`, an independent numpy
-oracle for alignment accuracy that is deliberately never ported to Rust (see
-that script's and `tools/synth-align.sh`'s own headers for why).
+- Rust, edition 2024, toolchain pinned to `1.95.0` (`rust-toolchain.toml`).
+- `focusforge-core`: `memmap2`, `thiserror`, `inventory` (algorithm
+  registration), `rayon`, `serde`/`serde_json`, `blake3` (project-blob
+  hashing), `zip`/`zstd` for the `.ffp` container (compression backends and
+  `zip`'s clock feature both off, so two seals of the same inputs produce
+  identical container bytes), `sysinfo` (host memory for the adaptive
+  tile-scheduler budget).
+- `focusforge-gpu`: `wgpu = "29.0.4"`, gated behind its own `gpu` Cargo
+  feature, on by default on both `focusforge-gpu` and `focusforge-cli`;
+  `--no-default-features` excludes it, so `cargo build --workspace
+  --no-default-features` never needs a GPU or a Vulkan/Metal/DX12-capable
+  driver.
+- `focusforge-cli`: `clap`, `serde`/`serde_json`, `toml`, `signal-hook`
+  (SIGINT/SIGUSR1 handling for `stack`'s pause/resume/cancel controls), and
+  the same `gpu` feature forwarded to enable `--no-gpu` and the automatic
+  GPU path on `stack`/`align`.
+- `focusforge-gui`: `slint = "~1.17"` (`default-features = false`, features
+  `std`, `compat-1-2`, `backend-winit`, `renderer-femtovg-wgpu`,
+  `unstable-wgpu-29` pinned to the same wgpu major `focusforge-gpu`
+  declares, and `unstable-winit-030`), `slint-build` (build dependency),
+  `i-slint-backend-testing` (dev dependency), `clap`, `rfd` (native
+  folder/file picker), `toml`/`serde` (`input.toml` and the `Recent`
+  project list), `directories` (per-platform data/config paths), `png`
+  (`--screenshot`), `tracing`. Inter ships bundled under `assets/fonts/`;
+  the icon set is vendored from Lucide under `assets/icons/`.
+- `focusforge-diagnostics`: `tracing`/`tracing-subscriber` (with the
+  `tracing-log` bridge, so `log`-crate records from `wgpu`/`naga` land in
+  the same sinks), `directories`, `crash-handler`/`minidumper` (the
+  native-crash sidecar), `zip` (diagnostics bundle). `tracing-tracy` and
+  `tracing-chrome` are pulled in only behind its own `trace` Cargo feature,
+  which `focusforge-cli` and `focusforge-gui` forward.
+- Every dependency's license is checked against an allowlist in
+  `deny.toml` with `cargo deny check licenses` (install with `cargo install
+  cargo-deny --locked`).
+- Prerequisites: **`libfontconfig1-dev`** (Debian/Ubuntu naming) — Slint's
+  `renderer-femtovg-wgpu` renderer needs fontconfig. **numpy** (`python3 -m
+  pip install numpy`) — needed for the synthetic-alignment gate stage
+  (`spikes/synthetic-ground-truth/synth_stack.py --warp`).
 
 ## Tests
 
@@ -82,21 +80,25 @@ byte-order and strip-height variants, the writer's round trip back through
 the reader, the tile scheduler's memory budget, the Z-Map reader and
 writer, each stacking algorithm's fusion output, the pyramidal ECC solver
 and its warp and auto-crop stages, the job engine's pause/resume/cancel
-control loop, the stage cache, grouping proposals and the `.ffproj` project
+control loop, the stage cache, grouping proposals and the `.ffp` project
 container's read/write round trip, and the `focusforge-cli
 stack`/`align`/`algorithms`/`export`/`review`/`cache`/`diagnostics` commands
 end to end -- including a forced panic, a forced native crash and the
 crash notice on the next start, each driven by spawning the built binary as
 a child process so a deliberate crash never takes down the test runner --
 plus the fixture manifest. `crates/gui` has its own suite — the theme
-tokens, the plain-Rust shell and canvas state, the viewport arithmetic, and
-the input-remapping table and its `input.toml` file format run headlessly
+tokens, the plain-Rust shell and canvas state, the viewport arithmetic, the
+input-binding table and its `input.toml` file format, classifying a folder,
+a dropped set of frames or a saved project into tabs, the `Images` and
+`Settings` dock panels, the projects overlay's gallery and failure cards,
+and the fuse worker's pause/resume/cancel/retry states all run headlessly
 through `i-slint-backend-testing`, with no real window; a separate windowed
 suite launches the real binary and needs a compositor and a GPU adapter,
 skipping itself with a printed line on a host with neither. Fixtures under
 `fixtures/mantis-64` and `fixtures/mantis-512` are small, checksummed crops
-of a 61-frame macro stack, generated rather than hand-edited; regenerating
-them needs the full reference stack, which is not part of this repository.
+of a 61-frame macro stack, generated rather than hand-edited. Regenerating
+them, and the `#[ignore]`d tests that exercise the full stack, read its
+location from `FOCUSFORGE_REFERENCE_STACK`; unset, they skip.
 `crates/diagnostics` has its own suite covering the subscriber's per-target
 filters, the rotating log file, the `log`-crate bridge, the panic hook's
 report and flight recording, and the crash-notice bookkeeping and

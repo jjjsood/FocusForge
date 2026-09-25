@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Adapter selection, the single-device invariant, and the limits check --
-//! `#![cfg(feature = "gpu")]` lives on the crate-root `tests/harness.rs`.
+//! `#![cfg(feature = "gpu-tests")]` lives on the crate-root `tests/harness.rs`.
 
 use focusforge_gpu::device::{GpuError, adapter_report, shared_device, shared_device_or_skip};
 use focusforge_gpu::limits;
@@ -30,6 +30,17 @@ fn shared_device_is_a_single_process_wide_instance() {
     assert!(
         std::ptr::eq(first, second),
         "shared_device() must hand out the same instance on every call"
+    );
+}
+
+#[test]
+fn a_freshly_created_device_is_not_lost() {
+    let Some(device) = shared_device_or_skip() else {
+        return;
+    };
+    assert!(
+        !device.lost(),
+        "a device nothing has destroyed must not report itself lost"
     );
 }
 

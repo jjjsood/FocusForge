@@ -11,7 +11,7 @@
 //! for one dedicated test binary, never shipped as part of `crates/core`'s
 //! library crate -- the workspace's `unsafe_code = "deny"` lint
 //! (`Cargo.toml`) is about the shipped crate; the allow below is local to
-//! this one file, copied verbatim from `tile_scheduler_memory.rs`.
+//! this one file.
 #![allow(unsafe_code)]
 
 mod common;
@@ -83,10 +83,7 @@ fn peak_since_reset() -> usize {
     PEAK.load(Ordering::SeqCst)
 }
 
-/// This binary holds only one test, but the guard is kept anyway -- copied
-/// verbatim from `tile_scheduler_memory.rs`'s own rationale, and cheap
-/// insurance against a future sibling test landing in this file without
-/// re-deriving the reason it would need one.
+/// Serializes memory-measuring tests in this binary against each other.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn resolved_defaults(ctx: &StackContext) -> ParamValues {
@@ -126,9 +123,11 @@ fn peak_live_heap_tracks_the_worker_budget() {
     // it in once, then n worker-shares of the frame-side figure.
     let one_x = AlignDriverOptions {
         max_bytes_in_flight: (shared_reference + per_registration) as usize,
+        ..Default::default()
     };
     let three_x = AlignDriverOptions {
         max_bytes_in_flight: (shared_reference + per_registration * 3) as usize,
+        ..Default::default()
     };
 
     reset_peak();

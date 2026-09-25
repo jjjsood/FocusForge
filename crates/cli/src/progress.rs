@@ -3,15 +3,12 @@
 //! [`ProgressMode`] and [`ProgressRenderer`]: turns a polled
 //! [`focusforge_core::job::JobProgress`] into stderr text. Mode is chosen
 //! **once**, at construction, from `--quiet` and whether stderr is a
-//! terminal (`std::io::IsTerminal`, no new crate); nothing downstream
-//! re-checks. `core` never prints and never depends on a terminal -- this
-//! whole module is the presentation half of the split
-//! `crate::job`'s own docs name.
+//! terminal; nothing downstream re-checks. `core` never prints.
 
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use focusforge_core::job::JobProgress;
+use focusforge_core::job::{JobProgress, JobStage};
 
 /// Redraw interval for [`ProgressMode::Interactive`]'s single rewritten
 /// line.
@@ -38,12 +35,7 @@ pub enum ProgressMode {
 
 impl ProgressMode {
     /// `quiet` wins outright; otherwise [`Interactive`](Self::Interactive)
-    /// when stderr is a terminal, else [`Plain`](Self::Plain). A child
-    /// process spawned with a piped or file-redirected stderr is never a
-    /// terminal, so every process-level test in `crates/cli/tests/job_cli.rs`
-    /// exercises `Plain`; `Interactive`'s own formatting is covered by this
-    /// module's `#[cfg(test)]` unit tests instead, which construct it
-    /// explicitly.
+    /// when stderr is a terminal, else [`Plain`](Self::Plain).
     pub fn choose(quiet: bool) -> Self {
         if quiet {
             ProgressMode::Quiet
@@ -61,6 +53,12 @@ impl ProgressMode {
 /// sub-second estimate renders as `<1s` rather than a `0s` that would
 /// read as "finished" while units are still running.
 pub fn format_line(progress: &JobProgress) -> String {
+    if progress.stage == JobStage::Align && progress.align_total > 0 {
+        return format!(
+            "align {}/{} frames",
+            progress.align_done, progress.align_total
+        );
+    }
     let pct = if progress.unit_total > 0 {
         // Truncating integer division, not rounded: `fuse 12/64 tiles 18%`
         // is the worked example -- 12/64 = 18.75%, and the truncated
@@ -117,11 +115,7 @@ impl ProgressRenderer {
 
     /// Forces one immediate progress line, bypassing the rate limit, and
     /// resets the interval clock so the next [`Self::tick`] is gated a full
-    /// interval from now -- called exactly once, at fuse-stage entry
-    /// (`crates/cli/src/stack.rs`), so a line is available the instant the
-    /// job starts: a test can gate a SIGINT's kill point on it without a
-    /// sleep, and `eta --` (before any unit has finished) is observable
-    /// without waiting out a whole [`PLAIN_INTERVAL`].
+    /// interval from now.
     pub fn start(&mut self, progress: &JobProgress) {
         if self.mode == ProgressMode::Quiet {
             return;
@@ -187,9 +181,7 @@ impl ProgressRenderer {
     /// Rewrites the one interactive line: `\r`, the new text, then enough
     /// trailing spaces to blank out whatever was longer on the previous
     /// draw -- no ANSI escape sequence, so this is exactly as safe to run
-    /// against a non-terminal as any other write (never actually chosen for
-    /// one, since `ProgressMode::choose` only picks `Interactive` when
-    /// stderr genuinely is a terminal).
+    /// against a non-terminal as any other write.
     fn emit_interactive(&mut self, line: &str) {
         let pad = self.last_line_len.saturating_sub(line.len());
         eprint!("\r{line}{}", " ".repeat(pad));
@@ -225,6 +217,22 @@ mod tests {
             pixel_total: unit_total as u64,
             running: Duration::from_secs(1),
             eta,
+            align_done: 0,
+            align_total: 0,
+        }
+    }
+
+    fn align_progress(align_done: usize, align_total: usize) -> JobProgress {
+        JobProgress {
+            stage: JobStage::Align,
+            units_done: 0,
+            unit_total: 0,
+            pixels_done: 0,
+            pixel_total: 0,
+            running: Duration::from_secs(1),
+            eta: None,
+            align_done,
+            align_total,
         }
     }
 
@@ -247,11 +255,15 @@ mod tests {
     }
 
     #[test]
+    fn format_line_renders_the_align_frame_count() {
+        assert_eq!(format_line(&align_progress(3, 8)), "align 3/8 frames");
+        assert_eq!(format_line(&align_progress(61, 61)), "align 61/61 frames");
+    }
+
+    #[test]
     fn format_line_renders_a_sub_second_eta_as_less_than_one_second() {
-        // Now that progress is credited per completed unit, the last few
-        // ticks of a run carry a genuine sub-second ETA. Truncating that to
-        // `0s` would print the one string this renderer promises never to
-        // print -- and would read as "done" while units are still running.
+        // A sub-second ETA renders `<1s`, never `0s`: `0s` would read as
+        // "done" while units are still running.
         let line = format_line(&progress(24, 25, Some(Duration::from_millis(850))));
         assert!(line.contains("eta <1s"), "line was: {line}");
         assert!(!line.contains("eta 0s"), "line was: {line}");
@@ -263,7 +275,7 @@ mod tests {
         // contract at the type level: every method takes the fast `Quiet`
         // branch, which this test exercises for a panic/no-op guarantee.
         let mut renderer = ProgressRenderer::new(ProgressMode::Quiet);
-        renderer.stage("align 61 frames (no unit progress)");
+        renderer.stage("align 61 frames");
         renderer.tick(&progress(1, 10, Some(Duration::from_secs(1))));
         renderer.finish("done");
         assert_eq!(renderer.mode, ProgressMode::Quiet);

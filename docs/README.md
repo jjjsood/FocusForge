@@ -4,14 +4,14 @@ Product documentation for FocusForge: how to use it, and how its pieces fit
 together. Design rationale — what was chosen, what was rejected and why — is
 not here.
 
-Pages are added as the features they describe are built, so this index is
-short on purpose rather than incomplete.
-
 ## Guide
 
 Using FocusForge: shooting a stack, loading it, choosing an algorithm,
 retouching the result.
 
+- [`guide/gui.md`](guide/gui.md) — opening a folder or a project in the
+  window, the dock's `Images` and `Settings` panels, running and controlling
+  a fuse, saving the held result, and switching between open projects
 - [`guide/stacking.md`](guide/stacking.md) — running `focusforge-cli stack`,
   choosing an algorithm, getting an image back with `export`, and getting the
   Z-Map
@@ -25,8 +25,6 @@ retouching the result.
 - [`guide/diagnostics.md`](guide/diagnostics.md) — the log every run keeps,
   what a crash leaves behind, the notice on the next start, and packaging a
   diagnostics bundle
-- [`guide/gui-mcp.md`](guide/gui-mcp.md) — run Slint's local development MCP
-  endpoint for GUI inspection and interaction
 
 ## Reference
 
@@ -36,7 +34,7 @@ retouching the result.
 - [`reference/tiff-fast-path.md`](reference/tiff-fast-path.md) — the TIFF
   layout the reader accepts and the writer emits
 - [`reference/project-format.md`](reference/project-format.md) — the
-  `.ffproj` project container `stack` writes and `export`/`review` read
+  `.ffp` project container `stack` writes and `export`/`review` read
 
 Building from source, the repository layout and the test suite are in
 [`../CONTRIBUTING.md`](../CONTRIBUTING.md), not here — this tree is for using

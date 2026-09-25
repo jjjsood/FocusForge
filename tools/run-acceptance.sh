@@ -49,7 +49,7 @@
 #   ACCEPTANCE_FRAME_GLOB     glob for source frames within it (default:
 #                              *IMG_*.tif)
 #   ACCEPTANCE_EXPECTED_FRAMES expected *source* frame count found in
-#                              ACCEPTANCE_STACK_DIR after the Stacked
+#                              FOCUSFORGE_REFERENCE_STACK after the Stacked
 #                              exclusion (default: 61) -- a guard against a
 #                              glob mismatch, independent of how many farm
 #                              entries are actually built (see
@@ -127,6 +127,33 @@ TARGET_FRAMES="${ACCEPTANCE_TARGET_FRAMES:-$EXPECTED_FRAMES}"
 ALIGN="${ACCEPTANCE_ALIGN:-1}"
 CLI="${ACCEPTANCE_CLI:-target/release/focusforge-cli}"
 
+# --- resolve the source frame directory -------------------------------------
+# The reference stack's top level mixes the stacked result in with the 61
+# source frames, at a different byte order and rows-per-strip, so a 61-entry
+# symlink farm built below is stacked instead. Resolved before the CLI
+# staleness check so a bad variable is reported without a release build.
+if [ -z "${FOCUSFORGE_REFERENCE_STACK:-}" ]; then
+  echo "SKIP: FOCUSFORGE_REFERENCE_STACK is not set"
+  exit 0
+fi
+SRC_DIR="$FOCUSFORGE_REFERENCE_STACK"
+case "$SRC_DIR" in
+  /*) ;;
+  *) SRC_DIR="$REPO/$SRC_DIR" ;;
+esac
+if [ ! -d "$SRC_DIR" ]; then
+  echo "refuse: FOCUSFORGE_REFERENCE_STACK=$FOCUSFORGE_REFERENCE_STACK is not a directory" >&2
+  exit 1
+fi
+SRC_DIR="$(cd "$SRC_DIR" && pwd)"
+
+# A `frames/` subdirectory, when present, is where the actual frame files
+# live -- committed fixture trees (`fixtures/mantis-512`) are laid out this
+# way; the reference stack itself is not, so this is a no-op there.
+if [ -d "$SRC_DIR/frames" ]; then
+  SRC_DIR="$SRC_DIR/frames"
+fi
+
 # --- refuse to measure with a CLI older than the sources -------------------
 # Refuses a release binary older than the sources rather than rebuilding, so
 # a compile never lands in the measured wall clock and stale code is never
@@ -146,53 +173,6 @@ if [ -n "$newest_src" ]; then
   exit 1
 fi
 echo "OK: $CLI is newer than every workspace source"
-
-# --- resolve the source frame directory ------------------------------------
-#
-# frame_paths + uniform_check make stacking the source frame directory
-# directly impossible rather than merely ill-advised: it holds 62 *.tif
-# files, Mantis_Stacked.tif among them, and the byte-order/rows-per-strip
-# mismatch between it and the 61 source frames trips the strict uniformity
-# guard in crates/cli/src/main.rs before a tile is ever read. So the run
-# never points at that directory directly; it stacks a 61-entry symlink
-# farm built below, which also keeps the source frame directory untouched.
-if [ -n "${ACCEPTANCE_STACK_DIR:-}" ]; then
-  STACK="$ACCEPTANCE_STACK_DIR"
-  if [ ! -d "$STACK" ]; then
-    echo "refuse: ACCEPTANCE_STACK_DIR=$STACK is not a directory" >&2
-    exit 1
-  fi
-  STACK="$(cd "$STACK" && pwd)"
-else
-  HARNESS=""
-  for candidate in "$REPO/../../.." "$REPO/../reference-stack"; do
-    if [ -f "$candidate/tools/lib/rawtiff.py" ]; then
-      HARNESS="$(cd "$candidate" && pwd)"
-      break
-    fi
-  done
-
-  if [ -z "$HARNESS" ] || [ ! -d "$HARNESS/Stack" ]; then
-    echo "SKIP: no reachable reference stack next to this checkout (looked for" \
-         "tools/lib/rawtiff.py under \$REPO/../../.. and \$REPO/../reference-stack)"
-    exit 0
-  fi
-  STACK="$HARNESS/Stack"
-fi
-
-# The same convention `frame_paths` already
-# applies: a `frames/` subdirectory, when present, is where the
-# actual frame files live -- committed fixture trees (`fixtures/mantis-512`)
-# are laid out this way; the real reference stack directory is not, so this
-# is a no-op there.
-if [ -d "${STACK}/frames" ]; then
-  STACK="${STACK}/frames"
-fi
-
-if [ ! -x "$CLI" ]; then
-  echo "refuse: $CLI is not built -- run: cargo build --release -p focusforge-cli" >&2
-  exit 1
-fi
 
 limit_to_bytes() {
   # systemd's K/M/G/T suffixes are base-1024
@@ -219,7 +199,7 @@ build_farm() {
   mkdir -p "$OUT_DIR/frames"
 
   shopt -s nullglob
-  local candidates=( "$STACK"/$FRAME_GLOB )
+  local candidates=( "$SRC_DIR"/$FRAME_GLOB )
   shopt -u nullglob
 
   # The *source* list first, independent of how many farm entries are
@@ -238,14 +218,14 @@ build_farm() {
 
   if [ "$source_count" -ne "$EXPECTED_FRAMES" ]; then
     echo "refuse: expected $EXPECTED_FRAMES source frames matching" \
-         "ACCEPTANCE_FRAME_GLOB in $STACK, found $source_count" >&2
+         "ACCEPTANCE_FRAME_GLOB in $SRC_DIR, found $source_count" >&2
     # A zero count is almost always the glob, not a missing stack: the default
     # only matches the reference stack's own frame naming, so pointing this
     # script at any other frame directory needs ACCEPTANCE_FRAME_GLOB set
     # too. Say so here rather than leaving a correct refusal that reads as a
     # mystery.
     if [ "$source_count" -eq 0 ]; then
-      echo "hint: no file in $STACK matched ACCEPTANCE_FRAME_GLOB='$FRAME_GLOB'" >&2
+      echo "hint: no file in $SRC_DIR matched ACCEPTANCE_FRAME_GLOB='$FRAME_GLOB'" >&2
     fi
     exit 1
   fi
@@ -298,6 +278,9 @@ build_farm() {
 }
 
 # --- the run itself: identical command, different OUT ----------------------
+# `--no-crop` keeps the full extent `crates/cli/tests/acceptance.rs` compares.
+# `--lax` because a 61-frame sweep has divergent frames.
+# `ACCEPTANCE_ALIGN=0` measures the scheduler without alignment.
 #
 # Both locks: this reads target/release directly and drives the GPU.
 run_stack() {
@@ -325,7 +308,7 @@ run_stack() {
   # project through `export`, which is a seconds-long read of two blobs
   # rather than a second fusion.
   local project
-  project=$(find "$out" -maxdepth 1 -name '*.ffproj' -print -quit)
+  project=$(find "$out" -maxdepth 1 -name '*.ffp' -print -quit)
   if [ -z "$project" ]; then
     echo "refuse: the run wrote no project under $out" >&2
     return 1
