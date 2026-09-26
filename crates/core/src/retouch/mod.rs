@@ -6,11 +6,13 @@
 
 pub mod brush;
 pub mod session;
+pub mod zmap_io;
 
 use crate::tile::Rect;
 
 pub use brush::{apply, footprint};
 pub use session::EditSession;
+pub use zmap_io::{session_tile, write_edited};
 
 /// Failures validating or applying an op against a Z-Map.
 #[derive(Debug, thiserror::Error)]

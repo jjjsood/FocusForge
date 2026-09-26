@@ -26,6 +26,7 @@ mod groups;
 mod job;
 mod preset;
 mod progress;
+mod retouch;
 mod review;
 mod set;
 mod signals;
@@ -234,6 +235,30 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Apply an op list to a Z-Map and write the edited Z-Map. Every
+    /// editing capability is reachable through this command, headless.
+    Retouch {
+        /// The Z-Map to edit.
+        #[arg(long, value_name = "FILE")]
+        zmap: PathBuf,
+        /// The op list to apply, in the persisted `Op` JSON shape.
+        /// Positions in error messages count from 0 in list order.
+        #[arg(long, value_name = "FILE")]
+        ops: PathBuf,
+        /// Where to write the edited Z-Map. Required: no default output
+        /// path, and never the same file as `--zmap`.
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+        /// Undo this many ops off the end of the list before writing.
+        #[arg(long, default_value_t = 0)]
+        undo: usize,
+        /// Redo this many undone ops. Must not exceed `--undo`.
+        #[arg(long, default_value_t = 0)]
+        redo: usize,
+        /// Emit the frozen JSON report instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Compute and report the per-frame transforms for a stack: readable
     /// text by default, a frozen `--json` document on request, and an
     /// optional per-frame warped-TIFF dump for a visual check.
@@ -333,6 +358,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Algorithms { .. } => "algorithms",
         Command::Stack { .. } => "stack",
         Command::Export { .. } => "export",
+        Command::Retouch { .. } => "retouch",
         Command::Align { .. } => "align",
         Command::Review { .. } => "review",
         Command::Cache { .. } => "cache",
@@ -435,6 +461,14 @@ fn main() -> ExitCode {
             zmap,
             json,
         } => export::run(&project, output.as_deref(), zmap.as_deref(), json),
+        Command::Retouch {
+            zmap,
+            ops,
+            out,
+            undo,
+            redo,
+            json,
+        } => retouch::run(&zmap, &ops, &out, undo, redo, json),
         Command::Align {
             dir,
             algo,
