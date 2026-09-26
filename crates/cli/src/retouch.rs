@@ -149,12 +149,10 @@ pub fn run(
 
 /// Whether renaming onto `out` would replace the file `zmap` resolves to.
 ///
-/// An existing `out` is canonicalized whole, which catches `out` being the
-/// same symlink as `zmap`. `out` need not exist yet, so its parent directory
-/// is also canonicalized with the file name joined back on; that resolves
-/// every symlink and `..` in the directory chain the way the kernel will. An
-/// `out` whose parent does not exist cannot collide and fails later, when it
-/// is created.
+/// Canonicalizes `out` itself to catch a shared symlink, and canonicalizes
+/// its parent with the file name joined back on to catch a `..` detour or
+/// a symlinked directory before `out` exists. A missing parent cannot
+/// collide and fails later, at creation.
 fn out_collides_with_zmap(out: &Path, zmap: &Path) -> bool {
     let Ok(zmap) = std::fs::canonicalize(zmap) else {
         return false;

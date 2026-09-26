@@ -2,11 +2,9 @@
 
 //! `focusforge-cli retouch`: a Z-Map and an op list in, an edited Z-Map out.
 //!
-//! Every case builds its own fresh Z-Map (`fixtures/mantis-512/golden/laplacian-zmap.tif`,
-//! or a synthetic 37x23, 10-frame map written directly with `ZMapWriter`) so no test shares
-//! mutable state with another. The oracle throughout is `focusforge_core::retouch::apply`
-//! replayed over the whole input map, read with `ZMapReader` -- test-side only, never the
-//! command's own code path.
+//! Each test builds its own Z-Map so none share mutable state. The oracle is
+//! `focusforge_core::retouch::apply` replayed over the whole map -- test-side
+//! only, never the command's own code path.
 
 mod common;
 

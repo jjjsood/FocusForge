@@ -51,13 +51,10 @@ fn union_rect(a: Rect, b: Rect) -> Rect {
 
 /// Streams `base` in full-width bands of `rows_per_pass` rows, splicing in
 /// `session`'s tile wherever a band overlaps it, and writes each band to
-/// `out`. Returns how many pixels of the output differ from `base`.
-/// `rows_per_pass == 0` is [`ZMapError::RowsPerPassZero`], as in
-/// [`ZMapReader::validate_all`].
-///
-/// Precondition: `session` was opened over `base`'s own [`ZMapInfo`].
-/// `EditSession` exposes no `info()` to check this against; the caller
-/// builds both from the same reader, which is what makes it hold.
+/// `out`. Returns how many pixels changed; `rows_per_pass == 0` is
+/// [`ZMapError::RowsPerPassZero`]. Precondition: `session` was opened over
+/// `base`'s own [`ZMapInfo`] -- `EditSession` has no `info()` to check
+/// that against.
 pub fn write_edited<W: Write + Seek>(
     base: &ZMapReader,
     session: &EditSession,
