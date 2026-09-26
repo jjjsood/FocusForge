@@ -219,15 +219,10 @@ pub trait StackAlgorithm: Send + Sync + 'static {
     ///    from this same default, reading the identical resolved map `fuse`
     ///    itself reads its own `"levels"` entry from -- the same number from
     ///    the same place, which is the whole point: `fuse`'s pyramid depth
-    ///    and the scheduler's margin can no longer silently disagree.
+    ///    and the scheduler's margin remain synchronized.
     ///
-    /// An algorithm whose depth parameter is *not* called `"levels"`, or
-    /// whose margin requirement is not a simple pyramid depth, **overrides**
-    /// this method -- a visible, greppable claim about its own margin
-    /// requirement, in its own file, rather than an unnamed convention that
-    /// fails quietly the way the pre-this-decision code did (`laplacian`'s
-    /// pyramid depth and the scheduler's margin were computed from two
-    /// separately supplied numbers that nothing kept in agreement).
+    /// Algorithms whose depth parameter is not `"levels"`, or whose margin
+    /// differs from the pyramid depth, override this method.
     fn tile_levels(&self, cfg: &ParamValues) -> u32 {
         cfg.get("levels")
             .and_then(ParamValue::as_i64)

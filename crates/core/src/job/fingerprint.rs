@@ -290,13 +290,8 @@ mod tests {
     /// This fingerprint is not, and is not convertible to, the project
     /// manifest's content hash.
     ///
-    /// The guard used to be "this crate has no hashing dependency at all",
-    /// which stopped being the right one the moment `crate::project` added
-    /// blake3 for the manifest's own fingerprint -- a value that is
-    /// deliberately *different* from this one. The claim worth guarding was
-    /// never about the crate: it is that **this module** reaches for no
-    /// hash, so a `FrameFingerprint` has nothing to convert into and cannot
-    /// quietly drift into a content hash.
+    /// `FrameFingerprint` compares parsed headers and does not hash file
+    /// contents, so it cannot become a content hash.
     #[test]
     fn not_convertible_to_a_content_hash() {
         // The needles are assembled rather than written out, so this
