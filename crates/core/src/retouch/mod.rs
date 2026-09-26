@@ -5,10 +5,12 @@
 //! document this module edits is the map, never an image.
 
 pub mod brush;
+pub mod session;
 
 use crate::tile::Rect;
 
 pub use brush::{apply, footprint};
+pub use session::EditSession;
 
 /// Failures validating or applying an op against a Z-Map.
 #[derive(Debug, thiserror::Error)]

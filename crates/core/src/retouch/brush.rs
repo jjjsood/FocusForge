@@ -163,7 +163,7 @@ fn covers(stroke: &Stroke, x: u32, y: u32) -> bool {
     (1.0 - t) * 64.0 > bayer + 0.5
 }
 
-fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+pub(super) fn intersect(a: Rect, b: Rect) -> Option<Rect> {
     let x0 = a.x.max(b.x);
     let y0 = a.y.max(b.y);
     let x1 = (a.x + a.width).min(b.x + b.width);

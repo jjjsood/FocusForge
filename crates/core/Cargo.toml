@@ -27,6 +27,7 @@ zstd = "0.14"
 # subscriber.
 tracing-subscriber = "0.3.23"
 tempfile = "3"
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 
 [dependencies]
 blake3 = { version = "1.8.7", features = ["mmap", "rayon"] }
