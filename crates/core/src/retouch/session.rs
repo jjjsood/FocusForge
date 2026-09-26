@@ -568,12 +568,5 @@ mod tests {
         fn prop_random_op_sequences(actions in proptest::collection::vec(arb_action(), 0..300)) {
             check_sequence(&actions)?;
         }
-
-        #[test]
-        fn prop_transition_dirty_region_contains_every_change(
-            actions in proptest::collection::vec(arb_action(), 0..300)
-        ) {
-            check_sequence(&actions)?;
-        }
     }
 }
