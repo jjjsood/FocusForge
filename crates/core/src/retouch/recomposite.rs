@@ -336,12 +336,7 @@ mod tests {
     }
 
     fn splice_region(canvas: &mut [u16], canvas_width: u32, region: Rect, region_out: &[u16]) {
-        for row in 0..region.height {
-            let canvas_start = ((region.y + row) * canvas_width + region.x) as usize;
-            let region_start = (row * region.width) as usize;
-            canvas[canvas_start..canvas_start + region.width as usize]
-                .copy_from_slice(&region_out[region_start..region_start + region.width as usize]);
-        }
+        splice_region_spp(canvas, canvas_width, region, region_out, 1);
     }
 
     #[test]
