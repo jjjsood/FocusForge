@@ -93,15 +93,21 @@ struct Params {
     height: u32,
     samples_per_pixel: u32,
     index_scale: u32,
+    /// Only read by the `overlay` entry point; `render` leaves this at 0.
+    alpha: u32,
+    /// Only read by the `overlay` entry point; `render` leaves this at 0.
+    table_len: u32,
 }
 
 impl Params {
-    fn to_bytes(&self) -> [u8; 16] {
-        let mut bytes = [0u8; 16];
+    fn to_bytes(&self) -> [u8; 24] {
+        let mut bytes = [0u8; 24];
         bytes[0..4].copy_from_slice(&self.width.to_le_bytes());
         bytes[4..8].copy_from_slice(&self.height.to_le_bytes());
         bytes[8..12].copy_from_slice(&self.samples_per_pixel.to_le_bytes());
         bytes[12..16].copy_from_slice(&self.index_scale.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.alpha.to_le_bytes());
+        bytes[20..24].copy_from_slice(&self.table_len.to_le_bytes());
         bytes
     }
 }
@@ -118,6 +124,33 @@ fn tonemap_pipeline(device: &wgpu::Device) -> Pipeline {
             storage_texture_entry(2),
         ],
     )
+}
+
+fn overlay_pipeline(device: &wgpu::Device) -> Pipeline {
+    build_pipeline(
+        device,
+        WGSL_SRC,
+        "focusforge-gpu-display-overlay",
+        "overlay",
+        &[
+            storage_entry(0, true),
+            uniform_entry(1),
+            storage_texture_entry(2),
+            storage_entry(3, true),
+            storage_entry(4, true),
+        ],
+    )
+}
+
+/// Packs `table` into one little-endian `u32` per entry, `0x00BBGGRR` --
+/// the WGSL kernel's `color_table` layout.
+fn pack_table(table: &[[u8; 3]]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(table.len() * 4);
+    for &[r, g, b] in table {
+        let word = u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16);
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes
 }
 
 /// Runs the display kernel: packs `src`'s `u16` samples two-per-`u32`
@@ -148,6 +181,8 @@ pub fn render(
         height: target.height(),
         samples_per_pixel,
         index_scale,
+        alpha: 0,
+        table_len: 0,
     };
     let params_buffer = crate::pipeline::upload_params(device, queue, &params.to_bytes());
 
@@ -177,5 +212,93 @@ pub fn render(
         target.width(),
         target.height(),
         "focusforge-gpu-display-tonemap",
+    );
+}
+
+/// Blends `table`'s colour for each `indices` entry over `composite` at
+/// `alpha` (`0` transparent, `255` opaque) into `target`. `composite` is the
+/// recomposited three-sample-per-pixel image; `indices` are the Z-Map's raw
+/// `u16` samples in the same layout. `composite.len()` must equal
+/// `target.width() * target.height() * 3`; `indices.len()` must equal
+/// `target.width() * target.height()`.
+pub fn render_overlay(
+    shared: &SharedDevice,
+    target: &DisplayTexture,
+    composite: &[u16],
+    indices: &[u16],
+    table: &[[u8; 3]],
+    alpha: u8,
+) {
+    let device = shared.device();
+    let queue = shared.queue();
+
+    let packed_composite = pack_samples(composite);
+    let composite_buffer = create_storage_buffer(
+        device,
+        packed_composite.len() as u64,
+        "focusforge-gpu-overlay-composite",
+    );
+    queue.write_buffer(&composite_buffer, 0, &packed_composite);
+
+    let packed_indices = pack_samples(indices);
+    let indices_buffer = create_storage_buffer(
+        device,
+        packed_indices.len() as u64,
+        "focusforge-gpu-overlay-indices",
+    );
+    queue.write_buffer(&indices_buffer, 0, &packed_indices);
+
+    let packed_table = pack_table(table);
+    let table_buffer = create_storage_buffer(
+        device,
+        packed_table.len() as u64,
+        "focusforge-gpu-overlay-table",
+    );
+    queue.write_buffer(&table_buffer, 0, &packed_table);
+
+    let params = Params {
+        width: target.width(),
+        height: target.height(),
+        samples_per_pixel: 3,
+        index_scale: 0,
+        alpha: u32::from(alpha),
+        table_len: table.len() as u32,
+    };
+    let params_buffer = crate::pipeline::upload_params(device, queue, &params.to_bytes());
+
+    let view = target
+        .texture()
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let pipeline = overlay_pipeline(device);
+
+    run_pass_2d(
+        device,
+        queue,
+        &pipeline,
+        &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: composite_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: params_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: indices_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: table_buffer.as_entire_binding(),
+            },
+        ],
+        target.width(),
+        target.height(),
+        "focusforge-gpu-display-overlay",
     );
 }

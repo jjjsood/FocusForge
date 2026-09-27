@@ -263,6 +263,20 @@ enum Command {
         /// position: a per-pixel gather from `--frames`, CPU only.
         #[arg(long, value_name = "FILE", requires = "frames")]
         render: Option<PathBuf>,
+        /// Blend the rainbow overlay over the edited map's recomposited
+        /// image and write it as a PNG. Requires `--frames`, as `--render`
+        /// does.
+        #[arg(long, value_name = "FILE", requires = "frames")]
+        overlay: Option<PathBuf>,
+        /// The overlay's blend opacity: `0.0` leaves the composite
+        /// untouched, `1.0` is the palette colour alone.
+        #[arg(long, default_value_t = 0.65)]
+        opacity: f32,
+        /// Highlight this 0-based source index in the overlay -- the
+        /// numbering an op's `source_id` uses -- and desaturate every
+        /// other source, rather than the undivided wheel.
+        #[arg(long, value_name = "INDEX")]
+        solo: Option<u16>,
         /// Emit the frozen JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
@@ -477,6 +491,9 @@ fn main() -> ExitCode {
             redo,
             frames,
             render,
+            overlay,
+            opacity,
+            solo,
             json,
         } => retouch::run(
             &zmap,
@@ -486,6 +503,9 @@ fn main() -> ExitCode {
             redo,
             frames.as_deref(),
             render.as_deref(),
+            overlay.as_deref(),
+            opacity,
+            solo,
             json,
         ),
         Command::Align {

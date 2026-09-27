@@ -9,11 +9,12 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use focusforge_core::display::{alpha_from_opacity, overlay_cpu};
 use focusforge_core::io::{TiffSpec, TiffStack, TiffWriter, frame_paths};
 use focusforge_core::project::{self, Op};
 use focusforge_core::retouch::{self, EditSession};
 use focusforge_core::tile::Rect;
-use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
+use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter, overlay_table};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
@@ -35,6 +36,8 @@ pub struct RetouchReport {
     pub wall_seconds: f64,
     /// The `--render` output path, when one was written.
     pub rendered: Option<String>,
+    /// The `--overlay` output path, when one was written.
+    pub overlay: Option<String>,
 }
 
 /// Runs the subcommand: writes nothing until every op has been read,
@@ -48,6 +51,9 @@ pub fn run(
     redo: usize,
     frames: Option<&Path>,
     render_out: Option<&Path>,
+    overlay_out: Option<&Path>,
+    opacity: f32,
+    solo: Option<u16>,
     json: bool,
 ) -> ExitCode {
     let start = Instant::now();
@@ -79,6 +85,9 @@ pub fn run(
     if redo > undo {
         return fail(format!("--redo {redo} is greater than --undo ({undo})"));
     }
+    if !(0.0..=1.0).contains(&opacity) {
+        return fail(format!("--opacity {opacity} must be within [0, 1]"));
+    }
 
     let reader = match ZMapReader::open(zmap) {
         Ok(reader) => reader,
@@ -86,10 +95,22 @@ pub fn run(
     };
     let info = reader.info();
 
-    if let Some(render_path) = render_out {
-        let frames_dir =
-            frames.expect("clap `requires = \"frames\"` on --render guarantees --frames is set");
-        if let Err(exit) = validate_render_args(zmap, out, frames_dir, render_path, info) {
+    if let Some(solo_index) = solo
+        && u32::from(solo_index) >= info.frame_count()
+    {
+        return fail(format!(
+            "--solo {solo_index} is out of range for a {}-frame map",
+            info.frame_count()
+        ));
+    }
+
+    if render_out.is_some() || overlay_out.is_some() {
+        let frames_dir = frames.expect(
+            "clap `requires = \"frames\"` on --render/--overlay guarantees --frames is set",
+        );
+        if let Err(exit) =
+            validate_render_args(zmap, out, frames_dir, render_out, overlay_out, info)
+        {
             return exit;
         }
     }
@@ -142,16 +163,16 @@ pub fn run(
         return fail(format!("{}: {err}", out.display()));
     }
 
-    let rendered = match render_out {
-        Some(render_path) => {
-            let frames_dir = frames
-                .expect("clap `requires = \"frames\"` on --render guarantees --frames is set");
-            match write_render(out, frames_dir, render_path) {
-                Ok(path) => Some(path),
-                Err(exit) => return exit,
-            }
+    let (rendered, overlay) = if render_out.is_some() || overlay_out.is_some() {
+        let frames_dir = frames.expect(
+            "clap `requires = \"frames\"` on --render/--overlay guarantees --frames is set",
+        );
+        match write_render(out, frames_dir, render_out, overlay_out, opacity, solo) {
+            Ok(paths) => paths,
+            Err(exit) => return exit,
         }
-        None => None,
+    } else {
+        (None, None)
     };
 
     let report = RetouchReport {
@@ -163,6 +184,7 @@ pub fn run(
         wrote: out.display().to_string(),
         wall_seconds: start.elapsed().as_secs_f64(),
         rendered,
+        overlay,
     };
     if json {
         match serde_json::to_string_pretty(&report) {
@@ -210,28 +232,53 @@ fn resolve(path: &Path) -> Option<std::path::PathBuf> {
         .map(|parent| parent.join(name))
 }
 
-/// Checks `--render`'s inputs before anything is written: `render` must not
-/// collide with `zmap`, `out` or any source frame, and `--frames` must hold
-/// the frame count and dimensions `info` (the not-yet-edited map, which
-/// editing never resizes) claims.
+/// Checks `--render`'s and `--overlay`'s inputs before anything is
+/// written: neither may collide with `zmap`, `out`, the other, or any
+/// source frame, and `--frames` must hold the frame count and dimensions
+/// `info` (the not-yet-edited map, which editing never resizes) claims.
 fn validate_render_args(
     zmap: &Path,
     out: &Path,
     frames_dir: &Path,
-    render_path: &Path,
+    render_path: Option<&Path>,
+    overlay_path: Option<&Path>,
     info: ZMapInfo,
 ) -> Result<(), ExitCode> {
-    if would_replace(render_path, zmap) {
-        return Err(fail(format!(
-            "--render {} is also --zmap: refusing to overwrite the input",
-            render_path.display()
-        )));
+    if let Some(render_path) = render_path {
+        if would_replace(render_path, zmap) {
+            return Err(fail(format!(
+                "--render {} is also --zmap: refusing to overwrite the input",
+                render_path.display()
+            )));
+        }
+        if would_replace(render_path, out) {
+            return Err(fail(format!(
+                "--render {} is also --out: refusing to overwrite the edited map",
+                render_path.display()
+            )));
+        }
     }
-    if would_replace(render_path, out) {
-        return Err(fail(format!(
-            "--render {} is also --out: refusing to overwrite the edited map",
-            render_path.display()
-        )));
+    if let Some(overlay_path) = overlay_path {
+        if would_replace(overlay_path, zmap) {
+            return Err(fail(format!(
+                "--overlay {} is also --zmap: refusing to overwrite the input",
+                overlay_path.display()
+            )));
+        }
+        if would_replace(overlay_path, out) {
+            return Err(fail(format!(
+                "--overlay {} is also --out: refusing to overwrite the edited map",
+                overlay_path.display()
+            )));
+        }
+        if let Some(render_path) = render_path
+            && would_replace(overlay_path, render_path)
+        {
+            return Err(fail(format!(
+                "--overlay {} is also --render: refusing to overwrite it",
+                overlay_path.display()
+            )));
+        }
     }
 
     let paths = match frame_paths(frames_dir) {
@@ -239,10 +286,20 @@ fn validate_render_args(
         Err(err) => return Err(fail(err)),
     };
     for frame in &paths {
-        if would_replace(render_path, frame) {
+        if let Some(render_path) = render_path
+            && would_replace(render_path, frame)
+        {
             return Err(fail(format!(
                 "--render {} is also a source frame: refusing to overwrite it",
                 render_path.display()
+            )));
+        }
+        if let Some(overlay_path) = overlay_path
+            && would_replace(overlay_path, frame)
+        {
+            return Err(fail(format!(
+                "--overlay {} is also a source frame: refusing to overwrite it",
+                overlay_path.display()
             )));
         }
     }
@@ -268,11 +325,18 @@ fn validate_render_args(
     Ok(())
 }
 
-/// Recomposites the just-written `out` map against `frames_dir`, writing
-/// the 16-bit RGB TIFF `render` names. Collisions and frame-count/dimension
-/// mismatches are already refused by [`validate_render_args`] before `out`
-/// is written; this reopens both fresh and streams the render.
-fn write_render(out: &Path, frames_dir: &Path, render_path: &Path) -> Result<String, ExitCode> {
+/// Recomposites the just-written `out` map against `frames_dir` in one
+/// banded pass, writing `render_path` (16-bit RGB TIFF) and/or `overlay_path`
+/// (8-bit RGBA PNG, [`overlay_table`]'s colours blended at `opacity`).
+/// [`validate_render_args`] has already refused any collision or mismatch.
+fn write_render(
+    out: &Path,
+    frames_dir: &Path,
+    render_path: Option<&Path>,
+    overlay_path: Option<&Path>,
+    opacity: f32,
+    solo: Option<u16>,
+) -> Result<(Option<String>, Option<String>), ExitCode> {
     let paths = match frame_paths(frames_dir) {
         Ok(paths) => paths,
         Err(err) => return Err(fail(err)),
@@ -297,16 +361,33 @@ fn write_render(out: &Path, frames_dir: &Path, render_path: &Path) -> Result<Str
 
     let width = info.width();
     let height = info.height();
-    let partial = project::partial_path(render_path);
-    let spec = TiffSpec {
-        width,
-        height,
-        samples_per_pixel: spp,
-        description: None,
+
+    let tiff_partial = render_path.map(project::partial_path);
+    let mut tiff_writer = match &tiff_partial {
+        Some(partial) => {
+            let spec = TiffSpec {
+                width,
+                height,
+                samples_per_pixel: spp,
+                description: None,
+            };
+            match TiffWriter::create(partial, spec) {
+                Ok(writer) => Some(writer),
+                Err(err) => return Err(fail(err)),
+            }
+        }
+        None => None,
     };
-    let mut writer = match TiffWriter::create(&partial, spec) {
-        Ok(writer) => writer,
-        Err(err) => return Err(fail(err)),
+
+    let table = overlay_path.map(|_| overlay_table(stack.len() as u32, solo));
+    let alpha = alpha_from_opacity(opacity);
+    let mut overlay_buffer: Option<Vec<u8>> =
+        overlay_path.map(|_| vec![0u8; width as usize * height as usize * 4]);
+
+    let cleanup = |tiff_partial: &Option<std::path::PathBuf>| {
+        if let Some(partial) = tiff_partial {
+            let _ = std::fs::remove_file(partial);
+        }
     };
 
     let mut indices = vec![0u16; width as usize * ROWS_PER_PASS as usize];
@@ -322,7 +403,7 @@ fn write_render(out: &Path, frames_dir: &Path, render_path: &Path) -> Result<Str
         };
         let len = (width * band_height) as usize;
         if let Err(err) = reader.read_tile_into(band, &mut indices[..len]) {
-            let _ = std::fs::remove_file(&partial);
+            cleanup(&tiff_partial);
             return Err(fail(err));
         }
         if let Err(err) = retouch::recomposite(
@@ -331,24 +412,82 @@ fn write_render(out: &Path, frames_dir: &Path, render_path: &Path) -> Result<Str
             &sources,
             &mut samples[..len * spp as usize],
         ) {
-            let _ = std::fs::remove_file(&partial);
+            cleanup(&tiff_partial);
             return Err(fail(err));
         }
-        if let Err(err) = writer.write_tile(band, &samples[..len * spp as usize]) {
-            let _ = std::fs::remove_file(&partial);
+        if let Some(writer) = tiff_writer.as_mut()
+            && let Err(err) = writer.write_tile(band, &samples[..len * spp as usize])
+        {
+            cleanup(&tiff_partial);
             return Err(fail(err));
+        }
+        if let (Some(table), Some(buf)) = (&table, overlay_buffer.as_mut()) {
+            let band_offset = y as usize * width as usize * 4;
+            overlay_cpu(
+                &samples[..len * spp as usize],
+                &indices[..len],
+                width,
+                band_height,
+                table,
+                alpha,
+                &mut buf[band_offset..band_offset + len * 4],
+            );
         }
         y += band_height;
     }
-    if let Err(err) = writer.finish() {
+
+    let rendered = match (render_path, tiff_writer, &tiff_partial) {
+        (Some(render_path), Some(writer), Some(partial)) => {
+            if let Err(err) = writer.finish() {
+                cleanup(&tiff_partial);
+                return Err(fail(err));
+            }
+            if let Err(err) = std::fs::rename(partial, render_path) {
+                cleanup(&tiff_partial);
+                return Err(fail(format!("{}: {err}", render_path.display())));
+            }
+            Some(render_path.display().to_string())
+        }
+        _ => None,
+    };
+
+    let overlay = match (overlay_path, overlay_buffer) {
+        (Some(overlay_path), Some(buf)) => {
+            if let Err(err) = write_overlay_png(overlay_path, width, height, &buf) {
+                return Err(fail(err));
+            }
+            Some(overlay_path.display().to_string())
+        }
+        _ => None,
+    };
+
+    Ok((rendered, overlay))
+}
+
+/// Writes `buf` (RGBA8, `width * height * 4` bytes) to `path` as a PNG,
+/// through the same partial-then-rename pattern every other output in this
+/// command uses.
+fn write_overlay_png(path: &Path, width: u32, height: u32, buf: &[u8]) -> Result<(), String> {
+    let partial = project::partial_path(path);
+    let write = || -> Result<(), String> {
+        let file =
+            std::fs::File::create(&partial).map_err(|e| format!("{}: {e}", partial.display()))?;
+        let mut encoder = png::Encoder::new(file, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| format!("{}: {e}", partial.display()))?;
+        writer
+            .write_image_data(buf)
+            .map_err(|e| format!("{}: {e}", partial.display()))?;
+        Ok(())
+    };
+    if let Err(err) = write() {
         let _ = std::fs::remove_file(&partial);
-        return Err(fail(err));
+        return Err(err);
     }
-    if let Err(err) = std::fs::rename(&partial, render_path) {
-        let _ = std::fs::remove_file(&partial);
-        return Err(fail(format!("{}: {err}", render_path.display())));
-    }
-    Ok(render_path.display().to_string())
+    std::fs::rename(&partial, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// One op's refusal as `"op #i: <message>"`, except
@@ -382,6 +521,9 @@ fn render(report: &RetouchReport) -> String {
     if let Some(rendered) = &report.rendered {
         lines.push(format!("rendered: {rendered}"));
     }
+    if let Some(overlay) = &report.overlay {
+        lines.push(format!("overlay: {overlay}"));
+    }
     lines.join("\n")
 }
 
@@ -406,6 +548,7 @@ mod tests {
             wrote: "out.tif".to_string(),
             wall_seconds: 0.125,
             rendered: None,
+            overlay: None,
         });
         for needle in [
             "zmap: base.tif",

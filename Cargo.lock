@@ -1493,6 +1493,7 @@ dependencies = [
  "focusforge-core",
  "focusforge-diagnostics",
  "focusforge-gpu",
+ "png",
  "serde",
  "serde_json",
  "signal-hook",

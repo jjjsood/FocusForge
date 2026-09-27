@@ -11,11 +11,12 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use focusforge_core::display::tonemap_cpu;
 use focusforge_core::io::TiffStack;
 use focusforge_core::project::Op;
 use focusforge_core::retouch;
 use focusforge_core::tile::Rect;
-use focusforge_core::zmap::{NO_SOURCE, ZMapInfo, ZMapReader, ZMapWriter};
+use focusforge_core::zmap::{NO_SOURCE, ZMapInfo, ZMapReader, ZMapWriter, overlay_table};
 
 fn bin(test_name: &str) -> Command {
     common::cli_bin(test_name)
@@ -830,6 +831,264 @@ fn render_changes_only_the_footprint() {
                 }
             }
         }
+    }
+}
+
+fn read_rgba_png(path: &Path) -> (u32, u32, Vec<u8>) {
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()));
+    let mut reader = decoder.read_info().unwrap();
+    let info = reader.info();
+    let (width, height) = (info.width, info.height);
+    let mut buf = vec![0u8; reader.output_buffer_size().expect("PNG has no frames")];
+    reader.next_frame(&mut buf).unwrap();
+    (width, height, buf)
+}
+
+/// `--overlay` writes a PNG of the recomposited edit: opacity 0 equals
+/// `tonemap_cpu` of the `--render` TIFF, opacity 1 equals each edited
+/// index's palette colour, and `--solo` differs from the unsoloed image
+/// only where the index is not the soloed one. Bad inputs are refused with
+/// nothing written: opacity out of `[0, 1]`, an out-of-range `--solo`,
+/// `--overlay` without `--frames`, and `--overlay` naming `--out`.
+#[test]
+fn overlay_flags_render() {
+    let dir = common::tmp_dir("overlay_flags_render");
+    let zmap = common::fixtures_dir().join("mantis-512/golden/laplacian-zmap.tif");
+    let frames = common::fixtures_dir().join("mantis-512/frames");
+    let ops_path = common::fixtures_dir().join("retouch/stroke-list.json");
+
+    // Opacity 0 equals tonemap_cpu of --render's TIFF.
+    let out0 = dir.join("out-0.tif");
+    let render0 = dir.join("render-0.tif");
+    let overlay0 = dir.join("overlay-0.png");
+    let r0 = run_cli(
+        &dir,
+        &mut bin("overlay_opacity_0"),
+        &[
+            "retouch",
+            "--zmap",
+            zmap.to_str().unwrap(),
+            "--ops",
+            ops_path.to_str().unwrap(),
+            "--out",
+            out0.to_str().unwrap(),
+            "--frames",
+            frames.to_str().unwrap(),
+            "--render",
+            render0.to_str().unwrap(),
+            "--overlay",
+            overlay0.to_str().unwrap(),
+            "--opacity",
+            "0",
+        ],
+    );
+    assert!(r0.success, "stderr: {}", r0.stderr);
+
+    let (width, height, render_samples) = read_rgb_tiff(&render0);
+    let mut expected0 = vec![0u8; width as usize * height as usize * 4];
+    tonemap_cpu(&render_samples, width, height, 3, 0, &mut expected0);
+    let (png_width, png_height, actual0) = read_rgba_png(&overlay0);
+    assert_eq!((png_width, png_height), (width, height));
+    assert_eq!(
+        actual0, expected0,
+        "opacity 0 must equal tonemap_cpu's output"
+    );
+
+    // Opacity 1 equals each edited index's palette colour.
+    let out1 = dir.join("out-1.tif");
+    let overlay1 = dir.join("overlay-1.png");
+    let r1 = run_cli(
+        &dir,
+        &mut bin("overlay_opacity_1"),
+        &[
+            "retouch",
+            "--zmap",
+            zmap.to_str().unwrap(),
+            "--ops",
+            ops_path.to_str().unwrap(),
+            "--out",
+            out1.to_str().unwrap(),
+            "--frames",
+            frames.to_str().unwrap(),
+            "--overlay",
+            overlay1.to_str().unwrap(),
+            "--opacity",
+            "1",
+        ],
+    );
+    assert!(r1.success, "stderr: {}", r1.stderr);
+
+    let (info, edited_indices) = read_whole(&out1);
+    let table = overlay_table(info.frame_count(), None);
+    let (_, _, actual1) = read_rgba_png(&overlay1);
+    for i in 0..(width * height) as usize {
+        let expected = table[(usize::from(edited_indices[i])).min(table.len() - 1)];
+        assert_eq!(&actual1[i * 4..i * 4 + 3], &expected[..], "pixel {i}");
+    }
+
+    // --solo differs from the unsoloed image only where the index is not
+    // the soloed one.
+    let out65a = dir.join("out-65-a.tif");
+    let overlay65 = dir.join("overlay-65.png");
+    let r65 = run_cli(
+        &dir,
+        &mut bin("overlay_opacity_65"),
+        &[
+            "retouch",
+            "--zmap",
+            zmap.to_str().unwrap(),
+            "--ops",
+            ops_path.to_str().unwrap(),
+            "--out",
+            out65a.to_str().unwrap(),
+            "--frames",
+            frames.to_str().unwrap(),
+            "--overlay",
+            overlay65.to_str().unwrap(),
+            "--opacity",
+            "0.65",
+        ],
+    );
+    assert!(r65.success, "stderr: {}", r65.stderr);
+
+    let out65b = dir.join("out-65-b.tif");
+    let overlay65_solo = dir.join("overlay-65-solo.png");
+    let r65s = run_cli(
+        &dir,
+        &mut bin("overlay_opacity_65_solo"),
+        &[
+            "retouch",
+            "--zmap",
+            zmap.to_str().unwrap(),
+            "--ops",
+            ops_path.to_str().unwrap(),
+            "--out",
+            out65b.to_str().unwrap(),
+            "--frames",
+            frames.to_str().unwrap(),
+            "--overlay",
+            overlay65_solo.to_str().unwrap(),
+            "--opacity",
+            "0.65",
+            "--solo",
+            "3",
+        ],
+    );
+    assert!(r65s.success, "stderr: {}", r65s.stderr);
+
+    let (_, edited_indices_65) = read_whole(&out65a);
+    let (_, _, unsoloed) = read_rgba_png(&overlay65);
+    let (_, _, soloed) = read_rgba_png(&overlay65_solo);
+    let mut differs_elsewhere = false;
+    for i in 0..(width * height) as usize {
+        let up = &unsoloed[i * 4..i * 4 + 3];
+        let sp = &soloed[i * 4..i * 4 + 3];
+        if edited_indices_65[i] == 3 {
+            assert_eq!(up, sp, "solo must not change the soloed source's pixel {i}");
+        } else if up != sp {
+            differs_elsewhere = true;
+        }
+    }
+    assert!(
+        differs_elsewhere,
+        "solo must visibly desaturate at least one non-soloed pixel"
+    );
+
+    // Bad inputs are refused with nothing written.
+    {
+        let out = dir.join("refuse-opacity.tif");
+        let overlay = dir.join("refuse-opacity.png");
+        let output = run_cli(
+            &dir,
+            &mut bin("overlay_bad_opacity"),
+            &[
+                "retouch",
+                "--zmap",
+                zmap.to_str().unwrap(),
+                "--ops",
+                ops_path.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+                "--frames",
+                frames.to_str().unwrap(),
+                "--overlay",
+                overlay.to_str().unwrap(),
+                "--opacity",
+                "1.5",
+            ],
+        );
+        assert!(!output.success, "stdout: {}", output.stdout);
+        assert!(!overlay.exists());
+        assert!(!out.exists());
+    }
+    {
+        let out = dir.join("refuse-solo.tif");
+        let overlay = dir.join("refuse-solo.png");
+        let output = run_cli(
+            &dir,
+            &mut bin("overlay_bad_solo"),
+            &[
+                "retouch",
+                "--zmap",
+                zmap.to_str().unwrap(),
+                "--ops",
+                ops_path.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+                "--frames",
+                frames.to_str().unwrap(),
+                "--overlay",
+                overlay.to_str().unwrap(),
+                "--solo",
+                "8",
+            ],
+        );
+        assert!(!output.success, "stdout: {}", output.stdout);
+        assert!(!overlay.exists());
+        assert!(!out.exists());
+    }
+    {
+        let out = dir.join("refuse-no-frames.tif");
+        let overlay = dir.join("refuse-no-frames.png");
+        let output = run_cli(
+            &dir,
+            &mut bin("overlay_without_frames"),
+            &[
+                "retouch",
+                "--zmap",
+                zmap.to_str().unwrap(),
+                "--ops",
+                ops_path.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+                "--overlay",
+                overlay.to_str().unwrap(),
+            ],
+        );
+        assert!(!output.success, "stdout: {}", output.stdout);
+        assert!(!overlay.exists());
+    }
+    {
+        let out = dir.join("refuse-overlay-is-out.tif");
+        let output = run_cli(
+            &dir,
+            &mut bin("overlay_names_out"),
+            &[
+                "retouch",
+                "--zmap",
+                zmap.to_str().unwrap(),
+                "--ops",
+                ops_path.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+                "--frames",
+                frames.to_str().unwrap(),
+                "--overlay",
+                out.to_str().unwrap(),
+            ],
+        );
+        assert!(!output.success, "stdout: {}", output.stdout);
+        assert!(!out.exists());
     }
 }
 
