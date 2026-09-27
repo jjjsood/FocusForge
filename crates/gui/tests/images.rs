@@ -606,21 +606,25 @@ fn manual_order_clears_the_sort_selection() {
 // Stacking-mode-only.
 // ---------------------------------------------------------------------
 
+/// [`controller_with_mantis64_frames`], fused once and switched into editor
+/// mode through `set_mode`, the same path the mode switch takes.
+fn controller_in_editor_mode(name: &str) -> AppController {
+    let mut controller = controller_with_mantis64_frames(name);
+    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
+    // An algorithm that always converges keeps the fuse out of the test.
+    controller.set_align_algorithm("dummy-align");
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert!(
+        controller.set_mode(ShellMode::Editor),
+        "a fused tab enters editor mode"
+    );
+    controller
+}
+
 #[test]
 fn mutations_are_stacking_mode_only() {
-    // `AppController::set_mode` refuses `Editor` since no editor mode
-    // exists yet, so the mode is forced the way every other editor-gated
-    // test in this crate does. `open_paths` does not check mode, so the
-    // controller can hold a real project while forced into `Editor`.
-    let root = tree("mutations_stacking_only_frames");
-    for i in 0..3 {
-        write_timed(&root, &format!("{i:02}.tif"), Some("2026:08:29 10:00:00"));
-    }
-    let mut controller = AppController::new_with_mode_for_test(ShellMode::Editor);
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[root]),
-        OpenOutcome::Opened(_)
-    ));
+    let mut controller = controller_in_editor_mode("mutations_stacking_only");
 
     let before = controller.images_panel();
     controller.toggle_frame_excluded(0);
@@ -880,15 +884,7 @@ fn releasing_a_grip_drag_on_the_same_row_moves_nothing() {
 
 #[test]
 fn sort_menu_and_drag_are_stacking_mode_only() {
-    let root = tree("sort_and_drag_stacking_only_frames");
-    for i in 0..3 {
-        write_timed(&root, &format!("{i:02}.tif"), Some("2026:08:29 10:00:00"));
-    }
-    let mut controller = AppController::new_with_mode_for_test(ShellMode::Editor);
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[root]),
-        OpenOutcome::Opened(_)
-    ));
+    let mut controller = controller_in_editor_mode("sort_and_drag_stacking_only");
     controller.toggle_images_sort_menu();
     assert!(!controller.images_sort_menu_open());
     controller.frame_drag_pointer(0, PointerKind::Down, 0.0);

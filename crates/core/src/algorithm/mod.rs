@@ -191,6 +191,17 @@ pub trait StackAlgorithm: Send + Sync + 'static {
     fn params(&self) -> &[ParamDesc];
     fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError>;
 
+    /// Registered for tests only: resolvable by id, never chosen as a default.
+    fn test_only(&self) -> bool {
+        false
+    }
+
+    /// The family's default when a caller names no algorithm; see
+    /// `crate::registry::default_stack`.
+    fn is_default(&self) -> bool {
+        false
+    }
+
     /// How many pyramid levels the tile scheduler must size its read-rect
     /// margin for, given this algorithm's fully resolved `cfg`
     /// (`crate::params::resolve` plus `crate::params::resolved_values`,
@@ -285,6 +296,17 @@ pub trait AlignAlgorithm: Send + Sync + 'static {
         frame: usize,
         cfg: &ParamValues,
     ) -> Result<AlignOutcome, AlgorithmError>;
+
+    /// Registered for tests only: resolvable by id, never chosen as a default.
+    fn test_only(&self) -> bool {
+        false
+    }
+
+    /// The family's default when a caller names no algorithm; see
+    /// `crate::registry::default_align`.
+    fn is_default(&self) -> bool {
+        false
+    }
 
     /// Called **at most once per run**, by the driver, **only in the anchor
     /// arm**, before any [`align_frame`](Self::align_frame) call of that

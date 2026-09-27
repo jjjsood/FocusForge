@@ -155,6 +155,10 @@ impl StackAlgorithm for DepthMap {
         "Depth Map"
     }
 
+    fn is_default(&self) -> bool {
+        true
+    }
+
     fn params(&self) -> &[ParamDesc] {
         &PARAMS
     }
