@@ -59,7 +59,14 @@ fn tonemap_matches_cpu() {
         .expect("read golden composite");
 
     let target = DisplayTexture::new(shared.device(), width, height);
-    render(shared, &target, &composite_samples, spp, 0);
+    render(
+        shared.device(),
+        shared.queue(),
+        &target,
+        &composite_samples,
+        spp,
+        0,
+    );
     let gpu_bytes = read_display_texture(shared.device(), shared.queue(), &target);
 
     let mut cpu_bytes = vec![0u8; (width * height * 4) as usize];
@@ -89,7 +96,14 @@ fn tonemap_matches_cpu() {
     assert_eq!(index_scale, 9362, "frames=8 -> 65535 / 7");
 
     let ztarget = DisplayTexture::new(shared.device(), zwidth, zheight);
-    render(shared, &ztarget, &indices, 1, index_scale);
+    render(
+        shared.device(),
+        shared.queue(),
+        &ztarget,
+        &indices,
+        1,
+        index_scale,
+    );
     let zgpu_bytes = read_display_texture(shared.device(), shared.queue(), &ztarget);
 
     let mut zcpu_bytes = vec![0u8; (zwidth * zheight * 4) as usize];
@@ -159,7 +173,7 @@ fn tonemap_matches_cpu_above_the_one_dimensional_dispatch_ceiling() {
         ("zmap", &indices, 1, index_scale),
     ] {
         let target = DisplayTexture::new(shared.device(), width, height);
-        render(shared, &target, src, spp, scale);
+        render(shared.device(), shared.queue(), &target, src, spp, scale);
         let gpu_bytes = read_display_texture(shared.device(), shared.queue(), &target);
         let mut cpu_bytes = vec![0u8; (width * height * 4) as usize];
         tonemap_cpu(src, width, height, spp, scale, &mut cpu_bytes);
@@ -206,7 +220,7 @@ fn tonemap_matches_cpu_at_the_extremes() {
     }
 
     let target = DisplayTexture::new(shared.device(), width, height);
-    render(shared, &target, &samples, 3, 0);
+    render(shared.device(), shared.queue(), &target, &samples, 3, 0);
     let gpu_bytes = read_display_texture(shared.device(), shared.queue(), &target);
 
     let mut cpu_bytes = vec![0u8; total_pixels * 4];

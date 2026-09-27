@@ -11,7 +11,6 @@
 pub mod readback;
 pub use readback::read_display_texture;
 
-use crate::device::SharedDevice;
 use crate::pack::pack_samples;
 use crate::pipeline::{
     Pipeline, build_pipeline, run_pass_2d, storage_entry, storage_texture_entry, uniform_entry,
@@ -129,15 +128,13 @@ fn tonemap_pipeline(device: &wgpu::Device) -> Pipeline {
 /// `src.len()` must equal exactly
 /// `target.width() * target.height() * samples_per_pixel`.
 pub fn render(
-    shared: &SharedDevice,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
     target: &DisplayTexture,
     src: &[u16],
     samples_per_pixel: u32,
     index_scale: u32,
 ) {
-    let device = shared.device();
-    let queue = shared.queue();
-
     let packed = pack_samples(src);
     let src_buffer =
         create_storage_buffer(device, packed.len() as u64, "focusforge-gpu-display-src");

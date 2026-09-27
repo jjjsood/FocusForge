@@ -3,8 +3,7 @@
 //! The wgpu half of the canvas: texture creation and
 //! `slint::Image::try_from`, the only module in the crate naming `wgpu` or
 //! `slint::wgpu_29` -- the way `src/bridge.rs` is the only one naming
-//! `winit`. No `set_rendering_notifier` anywhere (slint-ui/slint#12030: the
-//! `Manual` device path does not need one). `CanvasRenderer` reads pixels
+//! `winit`. `CanvasRenderer` reads pixels
 //! tile-shaped off the mmap'd TIFF/Z-Map for whichever rect the viewport is
 //! currently showing and re-uploads a *sub*-rect per gesture.
 
@@ -15,8 +14,8 @@ use focusforge_core::display::zmap_index_scale;
 use focusforge_core::io::TiffStack;
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapError, ZMapReader};
-use focusforge_gpu::device::SharedDevice;
 use focusforge_gpu::display::{DisplayTexture, render};
+use slint::wgpu_29::wgpu;
 
 use crate::canvas::TextureSpec;
 use crate::viewport::PaneDraw;
@@ -43,9 +42,11 @@ impl PaneTexture {
     /// The single point where both a (re)allocation and a render happen, so
     /// one early return covers both halves of a lost device: no new
     /// `DisplayTexture` and no `render` call once the device is known gone.
+    #[allow(clippy::too_many_arguments)]
     fn ensure_and_render(
         &mut self,
-        shared: &SharedDevice,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
         width: u32,
         height: u32,
         src: &[u16],
@@ -57,7 +58,7 @@ impl PaneTexture {
         }
         let wanted = TextureSpec { width, height };
         if crate::canvas::needs_realloc(self.spec, wanted) {
-            let texture = DisplayTexture::new(shared.device(), width, height);
+            let texture = DisplayTexture::new(device, width, height);
             let imported = slint::Image::try_from(texture.texture().clone());
             self.apply_import(imported, texture, wanted);
         }
@@ -66,7 +67,7 @@ impl PaneTexture {
             // render into this frame, and the previous image is kept as-is.
             return;
         };
-        render(shared, texture, src, samples_per_pixel, index_scale);
+        render(device, queue, texture, src, samples_per_pixel, index_scale);
     }
 
     /// Applies the outcome of importing a newly (re)allocated texture. On
@@ -100,6 +101,32 @@ impl PaneTexture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU32;
+
+    fn golden_plane_files(fixtures: &std::path::Path) -> (PathBuf, PathBuf) {
+        let mut composite = None;
+        let mut zmap = None;
+        for entry in
+            std::fs::read_dir(fixtures.join("mantis-512/golden")).expect("golden directory opens")
+        {
+            let path = entry.expect("golden directory entry reads").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("tif") {
+                continue;
+            }
+            if ZMapReader::open(&path).is_ok() {
+                assert!(zmap.replace(path).is_none(), "one Z-Map golden is required");
+            } else {
+                assert!(
+                    composite.replace(path).is_none(),
+                    "one composite golden is required"
+                );
+            }
+        }
+        (
+            composite.expect("composite golden exists"),
+            zmap.expect("Z-Map golden exists"),
+        )
+    }
 
     #[test]
     fn import_failure_keeps_the_previous_image_and_records_the_spec() {
@@ -133,6 +160,70 @@ mod tests {
             "the same failing size must not be retried on the next redraw"
         );
     }
+
+    #[test]
+    fn lifecycle_keeps_readers_and_rebuilds_gpu_draws() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let frame = fixtures.join("mantis-64/frames/00.tif");
+        let (composite, zmap) = golden_plane_files(&fixtures);
+        let draw = PaneDraw {
+            src: (0, 0, 64, 64),
+            dst: (0.0, 0.0, 64.0, 64.0),
+            pixelated: false,
+            step: NonZeroU32::MIN,
+        };
+        let shared = focusforge_gpu::device::shared_device_or_skip()
+            .expect("this GPU lifecycle test requires a device");
+
+        let mut empty = CanvasRenderer::new();
+        empty.attach_device(shared.device().clone(), shared.queue().clone());
+        empty.detach_device();
+        empty.detach_device();
+        assert!(empty.device_queue().is_none());
+
+        let mut frame_only = CanvasRenderer::new();
+        frame_only.set_frame(&frame).expect("fixture frame opens");
+        assert!(frame_only.redraw_frame(&draw).is_none());
+        frame_only.attach_device(shared.device().clone(), shared.queue().clone());
+        assert!(frame_only.redraw_frame(&draw).is_some());
+        frame_only.detach_device();
+        frame_only.detach_device();
+        assert_eq!(frame_only.frame_path(), Some(frame.as_path()));
+        assert!(frame_only.frame_pane.display_texture.is_none());
+        assert!(frame_only.frame_pane.image.is_none());
+        assert!(frame_only.last_frame.is_none());
+        frame_only.attach_device(shared.device().clone(), shared.queue().clone());
+        assert!(frame_only.redraw_frame(&draw).is_some());
+
+        let mut planes_and_frame = CanvasRenderer::new();
+        planes_and_frame
+            .set_frame(&frame)
+            .expect("fixture frame opens");
+        planes_and_frame
+            .set_planes(&composite, &zmap)
+            .expect("fixture planes open");
+        assert!(planes_and_frame.redraw_frame(&draw).is_none());
+        assert!(planes_and_frame.redraw_planes(&draw).is_none());
+        planes_and_frame.attach_device(shared.device().clone(), shared.queue().clone());
+        assert!(planes_and_frame.redraw_frame(&draw).is_some());
+        assert!(planes_and_frame.redraw_planes(&draw).is_some());
+        planes_and_frame.detach_device();
+        planes_and_frame.detach_device();
+        assert_eq!(planes_and_frame.frame_path(), Some(frame.as_path()));
+        assert!(planes_and_frame.composite.is_some());
+        assert!(planes_and_frame.zmap.is_some());
+        assert!(planes_and_frame.composite_pane.display_texture.is_none());
+        assert!(planes_and_frame.composite_pane.image.is_none());
+        assert!(planes_and_frame.zmap_pane.display_texture.is_none());
+        assert!(planes_and_frame.zmap_pane.image.is_none());
+        assert!(planes_and_frame.frame_pane.display_texture.is_none());
+        assert!(planes_and_frame.frame_pane.image.is_none());
+        assert!(planes_and_frame.last_planes.is_none());
+        assert!(planes_and_frame.last_frame.is_none());
+        planes_and_frame.attach_device(shared.device().clone(), shared.queue().clone());
+        assert!(planes_and_frame.redraw_frame(&draw).is_some());
+        assert!(planes_and_frame.redraw_planes(&draw).is_some());
+    }
 }
 
 /// What can go wrong opening the two files a [`CanvasRenderer`] holds open
@@ -161,7 +252,8 @@ pub enum CanvasRendererError {
 /// The planes are optional: a tab with nothing sealed yet still gets a
 /// renderer, for its frame pane alone.
 pub struct CanvasRenderer {
-    shared: &'static SharedDevice,
+    device: Option<wgpu::Device>,
+    queue: Option<wgpu::Queue>,
     composite: Option<TiffStack>,
     zmap: Option<ZMapReader>,
     composite_pane: PaneTexture,
@@ -173,11 +265,18 @@ pub struct CanvasRenderer {
     last_frame: Option<PaneDraw>,
 }
 
+impl Default for CanvasRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CanvasRenderer {
     /// A renderer with nothing open yet.
-    pub fn new(shared: &'static SharedDevice) -> Self {
+    pub fn new() -> Self {
         Self {
-            shared,
+            device: None,
+            queue: None,
             composite: None,
             zmap: None,
             composite_pane: PaneTexture::default(),
@@ -188,6 +287,28 @@ impl CanvasRenderer {
             frame_pane: PaneTexture::default(),
             last_frame: None,
         }
+    }
+
+    /// Uses Slint's surface-compatible device for future canvas draws.
+    pub fn attach_device(&mut self, device: wgpu::Device, queue: wgpu::Queue) {
+        self.detach_device();
+        self.device = Some(device);
+        self.queue = Some(queue);
+    }
+
+    /// Releases resources bound to Slint's device while keeping source readers.
+    pub fn detach_device(&mut self) {
+        self.composite_pane = PaneTexture::default();
+        self.zmap_pane = PaneTexture::default();
+        self.frame_pane = PaneTexture::default();
+        self.last_planes = None;
+        self.last_frame = None;
+        self.device = None;
+        self.queue = None;
+    }
+
+    fn device_queue(&self) -> Option<(wgpu::Device, wgpu::Queue)> {
+        Some((self.device.as_ref()?.clone(), self.queue.as_ref()?.clone()))
     }
 
     /// Opens `composite`/`zmap` as this renderer's planes, replacing
@@ -257,6 +378,7 @@ impl CanvasRenderer {
     /// composite, or either read fails; `self.last_planes` stays untouched
     /// on that path so a later, valid rect still renders.
     pub fn redraw_planes(&mut self, draw: &PaneDraw) -> Option<(slint::Image, slint::Image)> {
+        let (device, queue) = self.device_queue()?;
         if self.composite.is_none() || self.zmap.is_none() {
             return None;
         }
@@ -290,7 +412,8 @@ impl CanvasRenderer {
             .read_tile_step_into(0, rect, draw.step, &mut samples)
             .ok()?;
         self.composite_pane.ensure_and_render(
-            self.shared,
+            &device,
+            &queue,
             tex_w,
             tex_h,
             &samples,
@@ -302,7 +425,7 @@ impl CanvasRenderer {
         zmap.read_tile_step_into(rect, draw.step, &mut indices)
             .ok()?;
         self.zmap_pane
-            .ensure_and_render(self.shared, tex_w, tex_h, &indices, 1, index_scale);
+            .ensure_and_render(&device, &queue, tex_w, tex_h, &indices, 1, index_scale);
 
         self.last_planes = Some(*draw);
         Some((self.composite_pane.image(), self.zmap_pane.image()))
@@ -317,6 +440,7 @@ impl CanvasRenderer {
     /// uses, at an index scale of 0 -- a source frame carries no Z-Map
     /// indices.
     pub fn redraw_frame(&mut self, draw: &PaneDraw) -> Option<slint::Image> {
+        let (device, queue) = self.device_queue()?;
         let frame_size = self.frame.dimensions()?;
         let samples_per_pixel = self.frame.samples_per_pixel()?;
         if self.last_frame.as_ref() == Some(draw) {
@@ -337,7 +461,8 @@ impl CanvasRenderer {
         let mut samples = vec![0u16; tex_w as usize * tex_h as usize * samples_per_pixel as usize];
         self.frame.read_into(rect, draw.step, &mut samples).ok()?;
         self.frame_pane.ensure_and_render(
-            self.shared,
+            &device,
+            &queue,
             tex_w,
             tex_h,
             &samples,
