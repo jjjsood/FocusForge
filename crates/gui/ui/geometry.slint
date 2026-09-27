@@ -110,4 +110,17 @@ export global ShellGeometry {
     out property <length> progress-bar-height: 4px;
     // The ETA's left edge, measured from the bottom bar's own right edge.
     out property <length> progress-eta-inset: 376px;
+
+    // The editor toolbar's own row -- every control shares
+    // `toolbar-button-height`/`toolbar-height` above.
+    out property <length> editor-toolbar-size-caption-x: 12px;
+    out property <length> editor-toolbar-size-track-x: 56px;
+    out property <length> editor-toolbar-soft-caption-x: 188px;
+    out property <length> editor-toolbar-soft-track-x: 236px;
+    out property <length> editor-toolbar-pipette-x: 376px;
+    out property <length> editor-toolbar-undo-x: 436px;
+    out property <length> editor-toolbar-redo-x: 468px;
+    out property <length> editor-toolbar-icon-width: 27px;
+    out property <length> editor-toolbar-save-checkpoint-x: 1004px;
+    out property <length> editor-toolbar-save-checkpoint-width: 163px;
 }

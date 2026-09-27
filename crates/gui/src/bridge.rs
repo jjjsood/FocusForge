@@ -173,6 +173,7 @@ pub fn repaint(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
 ) {
+    controller.lock().unwrap().flush_live_stroke();
     let feed = {
         let loaded = canvas.borrow().tab();
         let mut controller = controller.lock().unwrap();
@@ -206,6 +207,7 @@ pub fn repaint(
     app.set_project_loaded(project_loaded);
     app.set_frame_label(truncate_pane_label(&frame_label).into());
     app.set_frame_message(canvas.borrow().frame_error().unwrap_or("").into());
+    push_brush_cursor(app, &controller.lock().unwrap());
 
     let frame_redrawn = frame_draw.and_then(|draw| {
         let mut canvas = canvas.borrow_mut();
@@ -231,9 +233,11 @@ pub fn repaint(
     }
 
     let redrawn = plane_draw.and_then(|draw| {
+        let controller = controller.lock().unwrap();
+        let edited = controller.edited_view();
         let mut canvas = canvas.borrow_mut();
         let renderer = canvas.renderer.as_mut()?;
-        Some((draw, renderer.redraw_planes(&draw)?))
+        Some((draw, renderer.redraw_planes(&draw, edited)?))
     });
     match redrawn {
         Some((draw, (composite_image, zmap_image))) => {
@@ -761,6 +765,40 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     }
 }
 
+/// Pushes the editor toolbar's own state -- `AppController::brush_toolbar_view`
+/// -- the one place `ShellEvent::EditorChanged` is performed. Numeric
+/// readouts are formatted here, never in `.slint`.
+pub fn push_editor_toolbar(app: &AppWindow, controller: &AppController) {
+    let view = controller.brush_toolbar_view();
+    app.set_brush_size_text(format!("{:.0}", view.size).into());
+    app.set_brush_size_fraction(view.size_fraction);
+    app.set_brush_size_ceiling(view.size_ceiling as i32);
+    app.set_brush_soft_text(format!("{:.0}%", view.soft).into());
+    app.set_brush_soft_fraction(view.soft_fraction);
+    app.set_brush_picking(view.picking);
+    app.set_can_undo(view.can_undo);
+    app.set_can_redo(view.can_redo);
+}
+
+/// Pushes the brush cursor overlay's own view -- every repaint, since its
+/// extent also depends on the active tab's current zoom, which
+/// [`push_editor_toolbar`]'s own `EditorChanged` trigger does not cover.
+fn push_brush_cursor(app: &AppWindow, controller: &AppController) {
+    let Some(view) = controller.brush_cursor_view() else {
+        app.set_cursor_extent(0.0);
+        return;
+    };
+    app.set_cursor_extent(view.extent);
+    app.set_cursor_ring_commands(view.ring_commands.into());
+    app.set_cursor_core_commands(view.core_commands.into());
+    app.set_cursor_picking(view.picking);
+    app.set_cursor_pick_color(slint::Color::from_rgb_u8(
+        view.pick_color[0],
+        view.pick_color[1],
+        view.pick_color[2],
+    ));
+}
+
 /// Opens the Keep/Discard dialog while the active tab holds a parked run,
 /// naming its unaligned frames; closes it otherwise.
 fn push_divergence(app: &AppWindow, controller: &AppController) {
@@ -1073,6 +1111,33 @@ pub fn install(
     app.on_checkpoint_export_requested({
         let controller = controller.clone();
         move || controller.lock().unwrap().checkpoint_export_requested()
+    });
+    // The editor toolbar: each callback is a single forward into the
+    // controller method already driving the matching input-map row.
+    app.on_brush_size_fraction_changed({
+        let controller = controller.clone();
+        move |fraction| controller.lock().unwrap().set_brush_size_fraction(fraction)
+    });
+    app.on_brush_softness_fraction_changed({
+        let controller = controller.clone();
+        move |fraction| {
+            controller
+                .lock()
+                .unwrap()
+                .set_brush_softness_fraction(fraction)
+        }
+    });
+    app.on_pipette_toggled({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().toggle_pipette()
+    });
+    app.on_undo_requested({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().undo()
+    });
+    app.on_redo_requested({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().redo()
     });
     // The run's own transport. `fuse-requested`/`retry-requested` start the
     // poll timer that feeds the rest; `pause-or-resume-requested` and
@@ -2036,12 +2101,15 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::WindowCloseRequested => {
             let _ = app.window().hide();
         }
-        ShellEvent::ModeChanged(mode) => {
-            let mode = match mode {
+        ShellEvent::ModeChanged(shell_mode) => {
+            let mode = match shell_mode {
                 ShellMode::Stacking => "stacking",
                 ShellMode::Editor => "editor",
             };
             app.set_mode(mode.into());
+            if shell_mode == ShellMode::Editor {
+                push_editor_toolbar(app, &controller.lock().unwrap());
+            }
         }
         ShellEvent::DockTabSelected(tab) => {
             let tab = match tab {
@@ -2104,6 +2172,7 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             push_divergence(app, &controller);
         }
         ShellEvent::ImagesChanged => push_images_panel(app, &controller.lock().unwrap()),
+        ShellEvent::EditorChanged => push_editor_toolbar(app, &controller.lock().unwrap()),
         ShellEvent::OverlayChanged => push_projects_overlay(app, &controller.lock().unwrap()),
         // A background load's own three events (`AppController::open_paths`).
         // The indicator's threshold and fade are the Slint region's own

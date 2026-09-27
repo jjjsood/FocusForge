@@ -169,9 +169,11 @@ fn checkpoint_panel_touches_no_storage() {
 
     // The canvas legitimately touches storage (a project's TIFFs),
     // `input_config.rs` is a config file, and `settings_panel.rs` is the one
-    // module allowed to name the schema/registry crate. Excluded by name:
+    // module allowed to name the schema/registry crate; `brush.rs` builds
+    // the stored stroke's path in core's own point type. Excluded by name:
     // this test's own subject is the checkpoint panel, not the whole crate.
     let canvas_files = [
+        "brush.rs",
         "canvas.rs",
         "gpu_canvas.rs",
         "entry.rs",

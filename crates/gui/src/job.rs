@@ -12,16 +12,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
+use focusforge_core::TiffError;
 use focusforge_core::algorithm::{AlignAlgorithm, StackAlgorithm};
 use focusforge_core::gpu::TileBackend;
-use focusforge_core::io::{COMPOSITE_FILENAME, ZMAP_FILENAME};
+use focusforge_core::io::{COMPOSITE_FILENAME, TiffStack, ZMAP_FILENAME};
 use focusforge_core::params::ParamValues;
 use focusforge_core::pipeline::{
     self, AlignRequest, FuseOutput, FuseProduct, FuseRequest, RunStage, StageObserver,
 };
 use focusforge_core::project::{self, Plane, Project, ProjectError};
 use focusforge_core::registry::{self, LookupError};
-use focusforge_core::tile::Rect;
+use focusforge_core::retouch::{RetouchError, Sources};
+pub use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapError, ZMapReader};
 
 /// Re-exported so `crate::controller` -- which names no algorithm crate --
@@ -29,7 +31,9 @@ use focusforge_core::zmap::{ZMapError, ZMapReader};
 pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 pub use focusforge_core::project::HeldCheckpoint;
-pub use focusforge_core::retouch::EditSession;
+pub use focusforge_core::project::Op;
+pub use focusforge_core::retouch::{EditSession, footprint};
+pub use focusforge_core::zmap::{NO_SOURCE, source_color};
 
 /// The shell's own view of a fuse run -- the surface's six reachable
 /// states.
@@ -450,10 +454,55 @@ pub fn materialize_planes(
     Ok((composite, zmap))
 }
 
-/// Opens `zmap` and builds an [`EditSession`] over its whole map -- the same
-/// open-then-read sequence the `retouch` CLI subcommand uses, but over every
-/// pixel rather than an op list's footprint.
-pub fn open_edit_session(zmap: &Path) -> Result<EditSession, ZMapError> {
+/// What can go wrong opening a tab's editor state: its Z-Map or the raw
+/// source frames a stroke recomposites against.
+#[derive(Debug, thiserror::Error)]
+pub enum EditSessionError {
+    #[error(transparent)]
+    ZMap(#[from] ZMapError),
+    #[error(transparent)]
+    Frames(#[from] TiffError),
+}
+
+/// One tab's live editor state: its undo/redo session, the raw source
+/// frames a stroke recomposites against, the resident display cache the
+/// renderer overlays, and the in-progress stroke, if any.
+pub struct EditState {
+    pub session: EditSession,
+    pub sources: TiffStack,
+    pub tiles: crate::canvas::ResidentTiles,
+    pub stroke: Option<crate::brush::LiveStroke>,
+}
+
+/// A resident tile's default edge -- edits are small, so a fixed 256 px grid
+/// keeps memory proportional to the edited area.
+pub const RESIDENT_TILE_SIZE: u32 = 256;
+
+impl EditState {
+    /// Recomposites `region` into this tab's resident display tiles, from
+    /// its own edited indices and raw source frames read at origin
+    /// `(0, 0)`, as the `retouch` CLI subcommand reads them.
+    pub fn recomposite(&mut self, region: Rect) -> Result<(), RetouchError> {
+        let sources = Sources {
+            reader: &self.sources,
+            frame_count: self.sources.len() as u32,
+            samples_per_pixel: self.sources.header(0).samples_per_pixel,
+            origin: (0, 0),
+        };
+        self.tiles
+            .recomposite(region, self.session.indices(), &sources)
+    }
+}
+
+/// Opens `zmap` and `frames` and builds an [`EditState`] over the whole
+/// map: an [`EditSession`] seeded from every pixel, `frames` opened as the
+/// raw sources a stroke recomposites against, and an empty resident display
+/// cache gridded at `tile_size` px.
+pub fn open_edit_session(
+    zmap: &Path,
+    frames: &[PathBuf],
+    tile_size: u32,
+) -> Result<EditState, EditSessionError> {
     let reader = ZMapReader::open(zmap)?;
     let info = reader.info();
     let tile = Rect {
@@ -464,8 +513,22 @@ pub fn open_edit_session(zmap: &Path) -> Result<EditSession, ZMapError> {
     };
     let mut indices = vec![0u16; info.tile_len(tile)];
     reader.read_tile_into(tile, &mut indices)?;
-    Ok(EditSession::new(info, tile, indices)
-        .expect("a whole-map tile always fits its own map and its own tile_len"))
+    let session = EditSession::new(info, tile, indices)
+        .expect("a whole-map tile always fits its own map and its own tile_len");
+    let sources = TiffStack::open_files(frames)?;
+    let samples_per_pixel = sources.header(0).samples_per_pixel;
+    let tiles = crate::canvas::ResidentTiles::new(
+        tile_size,
+        info.width(),
+        info.height(),
+        samples_per_pixel,
+    );
+    Ok(EditState {
+        session,
+        sources,
+        tiles,
+        stroke: None,
+    })
 }
 
 /// Writes `held`, in order, as one checkpoint chain at `target` -- onto the

@@ -2155,3 +2155,961 @@ fn an_unresolved_align_id_is_refused_before_any_run() {
         focusforge_gui::job::RunState::Idle
     );
 }
+
+// ---------------------------------------------------------------------
+// The brush on a fused mantis-64 tab: strokes, brush controls, the cursor,
+// the pipette, undo/redo, the live preview and the commit pass.
+// ---------------------------------------------------------------------
+
+use std::num::NonZeroU32;
+
+use focusforge_core::io::{TiffSpec, TiffStack, TiffWriter};
+use focusforge_core::retouch::{EditSession, apply, footprint};
+use focusforge_core::zmap::{NO_SOURCE, ZMapWriter};
+use focusforge_gui::brush::LiveStroke;
+use focusforge_gui::canvas::overlay_edited;
+use focusforge_gui::input_map::{Button, Modifiers, PointerKind};
+use focusforge_gui::viewport::PaneRect;
+
+/// The mantis-64 frames' own extent; the fused composite and Z-Map are the
+/// frames' common area, a little smaller, anchored at the same origin.
+const FRAME: u32 = 64;
+/// Both panes are 256 x 320: the 64 x 64 frames fit at exactly 400 %, with
+/// a 32 px band above and below them, so every image point below that sits
+/// on a quarter-pixel grid maps to and from the screen without rounding.
+const LEFT: PaneRect = PaneRect {
+    x: 0.0,
+    y: 0.0,
+    width: 256.0,
+    height: 320.0,
+};
+const RIGHT: PaneRect = PaneRect {
+    x: 264.0,
+    y: 0.0,
+    width: 256.0,
+    height: 320.0,
+};
+const SCALE: f32 = 4.0;
+const BAND: f32 = 32.0;
+const NO_MODS: Modifiers = Modifiers::NONE;
+const CTRL: Modifiers = Modifiers {
+    ctrl: true,
+    ..Modifiers::NONE
+};
+const CTRL_SHIFT: Modifiers = Modifiers {
+    ctrl: true,
+    shift: true,
+    ..Modifiers::NONE
+};
+const SHIFT: Modifiers = Modifiers {
+    shift: true,
+    ..Modifiers::NONE
+};
+const ALT: Modifiers = Modifiers {
+    alt: true,
+    ..Modifiers::NONE
+};
+
+/// The active tab's whole fused map.
+fn map_rect(controller: &AppController) -> Rect {
+    controller.edit_session().unwrap().tile()
+}
+
+/// The screen point over the right pane whose paint point is image
+/// `(x, y)` -- pixel centres sit on integers.
+fn at(x: f32, y: f32) -> (f32, f32) {
+    (
+        RIGHT.x + (x + 0.5) * SCALE,
+        RIGHT.y + BAND + (y + 0.5) * SCALE,
+    )
+}
+
+/// A fused three-frame mantis-64 tab in editor mode, both panes installed,
+/// its resident display tiles 16 px so strokes cross tile edges.
+fn open_editor(name: &str) -> (AppController, PathBuf) {
+    let mut controller = controller_with_scratch(name);
+    let root = open_fused_tab(&mut controller, name, 3);
+    controller.set_resident_tile_size_for_test(16);
+    controller.set_pane_geometry(LEFT, RIGHT);
+    assert!(controller.set_mode(ShellMode::Editor));
+    let map = map_rect(&controller);
+    let draw = controller.plane_draw().expect("the fused tab draws");
+    assert_eq!(draw.src, (0, 0, map.width, map.height));
+    assert_eq!(
+        draw.dst,
+        (
+            0.0,
+            BAND,
+            map.width as f32 * SCALE,
+            map.height as f32 * SCALE
+        ),
+        "the whole composite at 400 %"
+    );
+    (controller, root)
+}
+
+/// Sets `Size` through its logarithmic slider.
+fn set_size(controller: &mut AppController, size: f32) {
+    let ceiling = controller.brush_toolbar_view().size_ceiling as f32;
+    controller.set_brush_size_fraction(size.ln() / ceiling.ln());
+}
+
+fn press(controller: &mut AppController, point: (f32, f32)) {
+    controller.pointer(PointerKind::Down, Button::Left, point.0, point.1, NO_MODS);
+}
+
+fn release(controller: &mut AppController, point: (f32, f32)) {
+    controller.pointer(PointerKind::Up, Button::Left, point.0, point.1, NO_MODS);
+}
+
+/// A left drag through image points `path`, one motion event per point.
+fn drag(controller: &mut AppController, path: &[(f32, f32)]) {
+    let screen: Vec<(f32, f32)> = path.iter().map(|&(x, y)| at(x, y)).collect();
+    press(controller, screen[0]);
+    for &(x, y) in &screen[1..] {
+        controller.pointer_moved(x, y);
+    }
+    release(controller, *screen.last().unwrap());
+}
+
+fn ops(controller: &AppController) -> Vec<Op> {
+    controller.edit_session().unwrap().ops().cloned().collect()
+}
+
+fn indices(controller: &AppController) -> Vec<u16> {
+    controller.edit_session().unwrap().indices().to_vec()
+}
+
+/// `rect` of the RGB TIFF at `path`.
+fn read_plane(path: &Path, rect: Rect) -> Vec<u16> {
+    let stack = TiffStack::open_files(&[path.to_path_buf()]).unwrap();
+    let mut plane = vec![0u16; (rect.width * rect.height * 3) as usize];
+    stack.read_tile_into(0, rect, &mut plane).unwrap();
+    plane
+}
+
+/// The tab's sealed planes and raw frames, read straight from disk.
+struct Sealed {
+    map: Rect,
+    indices: Vec<u16>,
+    composite: Vec<u16>,
+    frames: Vec<Vec<u16>>,
+}
+
+impl Sealed {
+    fn read(controller: &mut AppController, root: &Path) -> Self {
+        let map = map_rect(controller);
+        let frame = Rect {
+            x: 0,
+            y: 0,
+            width: FRAME,
+            height: FRAME,
+        };
+        let (composite, zmap) = controller.materialize_active_tab_planes().unwrap();
+        Sealed {
+            map,
+            indices: read_whole_zmap(&zmap),
+            composite: read_plane(&composite, map),
+            frames: (0..3)
+                .map(|i| read_plane(&root.join(format!("{i:02}.tif")), frame))
+                .collect(),
+        }
+    }
+
+    /// What the renderer shows at step 1 over the whole image: the
+    /// controller's own resident tiles overlaid on the sealed composite.
+    fn displayed(&self, controller: &AppController) -> Vec<u16> {
+        let view = controller.edited_view().unwrap();
+        let mut samples = self.composite.clone();
+        overlay_edited(
+            &mut samples,
+            &self.indices,
+            view.indices,
+            self.map,
+            NonZeroU32::MIN,
+            3,
+            view.tiles,
+        );
+        samples
+    }
+
+    /// The reference: the edited index's own frame pixel wherever it differs
+    /// from the sealed index, the sealed composite pixel elsewhere.
+    fn expected(&self, edited: &[u16]) -> Vec<u16> {
+        let mut out = self.composite.clone();
+        for (i, (&e, &s)) in edited.iter().zip(&self.indices).enumerate() {
+            if e != s {
+                let (x, y) = (i as u32 % self.map.width, i as u32 / self.map.width);
+                let f = ((y * FRAME + x) * 3) as usize;
+                out[i * 3..i * 3 + 3].copy_from_slice(&self.frames[e as usize][f..f + 3]);
+            }
+        }
+        out
+    }
+
+    fn assert_shown(&self, controller: &AppController, case: &str) {
+        let edited = indices(controller);
+        assert!(
+            self.displayed(controller) == self.expected(&edited),
+            "{case}: the displayed composite differs from the reference"
+        );
+    }
+}
+
+fn rounded(points: &[(f32, f32)]) -> Vec<Point> {
+    let mut out: Vec<Point> = Vec::new();
+    for &(x, y) in points {
+        let p = Point {
+            x: x.round() as i32,
+            y: y.round() as i32,
+        };
+        if out.last() != Some(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn dilate(rect: Rect, margin: u32, map: Rect) -> Rect {
+    let x0 = rect.x.saturating_sub(margin);
+    let y0 = rect.y.saturating_sub(margin);
+    let x1 = (rect.x + rect.width + margin).min(map.width);
+    let y1 = (rect.y + rect.height + margin).min(map.height);
+    Rect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    }
+}
+
+/// `corners` joined by straight runs, as `events` motion events spread
+/// evenly over the whole length; every corner is delivered exactly.
+fn polyline(corners: &[(f32, f32)], events: usize) -> Vec<(f32, f32)> {
+    let lengths: Vec<f32> = corners
+        .windows(2)
+        .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+        .collect();
+    let total: f32 = lengths.iter().sum();
+    let mut out = vec![corners[0]];
+    for (w, len) in corners.windows(2).zip(&lengths) {
+        let n = ((len / total) * events as f32).round().max(1.0) as usize;
+        for k in 1..=n {
+            let t = k as f32 / n as f32;
+            out.push(if k == n {
+                w[1]
+            } else {
+                (
+                    w[0].0 + (w[1].0 - w[0].0) * t,
+                    w[0].1 + (w[1].1 - w[0].1) * t,
+                )
+            });
+        }
+    }
+    out
+}
+
+#[test]
+fn drag_produces_one_brush_stroke() {
+    let (mut c, _) = open_editor("brush_one_stroke");
+    set_size(&mut c, 8.0);
+    c.set_brush_softness_fraction(0.25);
+    c.select_frame(2);
+    let radius = c.brush_toolbar_view().size / 2.0;
+
+    let line: Vec<(f32, f32)> = (0..=20)
+        .map(|i| (10.0 + 1.5 * i as f32, 10.0 + i as f32))
+        .collect();
+    drag(&mut c, &line);
+    assert_eq!(
+        ops(&c),
+        vec![Op::BrushStroke {
+            source_id: 2,
+            path: vec![Point { x: 10, y: 10 }, Point { x: 40, y: 30 }],
+            radius,
+            softness: 0.25,
+        }],
+        "one op, its straight path resampled down to its two ends"
+    );
+
+    drag(&mut c, &[(20.0, 21.0)]);
+    assert_eq!(
+        ops(&c).last(),
+        Some(&Op::BrushStroke {
+            source_id: 2,
+            path: vec![Point { x: 20, y: 21 }],
+            radius,
+            softness: 0.25,
+        }),
+        "a press-release with no motion is a one-point op"
+    );
+    assert_eq!(ops(&c).len(), 2);
+    let before = indices(&c);
+
+    press(&mut c, (100.0, 100.0));
+    c.pointer_moved(RIGHT.x + 50.0, 100.0);
+    c.flush_live_stroke();
+    release(&mut c, (RIGHT.x + 50.0, 100.0));
+    assert_eq!(ops(&c).len(), 2, "a drag starting on the left pane");
+
+    // In the band above the image, with a 1 px brush.
+    set_size(&mut c, 1.0);
+    press(&mut c, (RIGHT.x + 100.0, 8.0));
+    c.pointer_moved(RIGHT.x + 140.0, 20.0);
+    c.flush_live_stroke();
+    release(&mut c, (RIGHT.x + 140.0, 20.0));
+    assert_eq!(ops(&c).len(), 2, "a stroke wholly off the image");
+    assert_eq!(indices(&c), before);
+}
+
+#[test]
+fn path_is_resampled_not_event_rate_dependent() {
+    let (mut c, _) = open_editor("brush_event_rate");
+    let corners = [(8.25, 9.0), (40.75, 12.5), (22.5, 50.25), (55.0, 44.75)];
+    for size in [6.0f32, 13.0] {
+        set_size(&mut c, size);
+        drag(&mut c, &polyline(&corners, 40));
+        drag(&mut c, &polyline(&corners, 4000));
+        let ops = ops(&c);
+        let [.., coarse, fine] = ops.as_slice() else {
+            panic!("two strokes");
+        };
+        assert_eq!(coarse, fine, "size {size}: 40 and 4000 events");
+        let Op::BrushStroke { path, .. } = fine else {
+            panic!("a brush stroke");
+        };
+        assert!(path.len() < 40, "size {size}: {path:?}");
+        assert_eq!(path.first(), Some(&Point { x: 8, y: 9 }));
+        assert_eq!(path.last(), Some(&Point { x: 55, y: 45 }));
+    }
+}
+
+#[test]
+fn resampled_path_is_bounded_by_length() {
+    let (mut c, _) = open_editor("brush_bounded");
+    set_size(&mut c, 8.0);
+    let radius = c.brush_toolbar_view().size / 2.0;
+    let wobble: Vec<(f32, f32)> = (0..=4000)
+        .map(|i| {
+            let x = 5.0 + 53.0 * i as f32 / 4000.0;
+            (x, 32.0 + 10.0 * (x / 6.0).sin() + 0.3 * (x * 7.0).sin())
+        })
+        .collect();
+    let length: f32 = wobble
+        .windows(2)
+        .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+        .sum();
+    drag(&mut c, &wobble);
+    let Some(Op::BrushStroke { path, .. }) = ops(&c).pop() else {
+        panic!("one stroke");
+    };
+    let bound = length / (radius / 4.0) + 2.0;
+    assert!(
+        path.len() as f32 <= bound,
+        "{} points over a {length} px trace",
+        path.len()
+    );
+    assert!(path.len() < 100, "{} points", path.len());
+}
+
+/// Opens the first two mantis-64 frames cropped to `width` x `height` as a
+/// new active tab.
+fn open_cropped_tab(controller: &mut AppController, name: &str, width: u32, height: u32) {
+    let root = common::tree(&format!("{name}_frames"));
+    let crop = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    for i in 0..2 {
+        let stack = TiffStack::open_files(&[common::fixture_frame("mantis-64", i)]).unwrap();
+        let mut samples = vec![0u16; (width * height * 3) as usize];
+        stack.read_tile_into(0, crop, &mut samples).unwrap();
+        let spec = TiffSpec {
+            width,
+            height,
+            samples_per_pixel: 3,
+            description: None,
+        };
+        let mut writer = TiffWriter::create(&root.join(format!("{i:02}.tif")), spec).unwrap();
+        writer.write_tile(crop, &samples).unwrap();
+        writer.finish().unwrap();
+    }
+    assert!(matches!(
+        common::open_and_settle(controller, &[root]),
+        OpenOutcome::Opened(_)
+    ));
+}
+
+#[test]
+fn brush_controls_convert_to_storage_units() {
+    let (mut c, _) = open_editor("brush_units");
+    let size = |c: &AppController| c.brush_toolbar_view().size;
+    let soft = |c: &AppController| c.brush_toolbar_view().soft;
+    let map = map_rect(&c);
+    let ceiling = map.width.min(map.height);
+    assert!(
+        ceiling < FRAME,
+        "the fused image is the frames' common area"
+    );
+    let view = c.brush_toolbar_view();
+    assert_eq!(
+        (view.size_ceiling, view.size, view.soft),
+        (ceiling, ceiling as f32, 30.0),
+        "the ceiling is the fused image's shorter side, the default min(64, ceiling)"
+    );
+    let ceiling = ceiling as f32;
+
+    c.set_brush_size_fraction(0.5);
+    let view = c.brush_toolbar_view();
+    assert!((view.size - ceiling.sqrt()).abs() < 1e-3, "{}", view.size);
+    assert!((view.size_fraction - 0.5).abs() < 1e-5);
+    c.set_brush_size_fraction(1.0);
+    assert_eq!(size(&c), ceiling, "the track's right end is the ceiling");
+    c.set_brush_size_fraction(0.0);
+    assert_eq!(size(&c), 1.0);
+
+    let quarter_octave = 2f32.powf(0.25);
+    c.set_brush_size_fraction(0.5);
+    let s = size(&c);
+    c.wheel(0.0, 60.0, 0.0, 0.0, SHIFT);
+    assert!((size(&c) - s * quarter_octave).abs() < 1e-3);
+    c.wheel(0.0, -120.0, 0.0, 0.0, SHIFT);
+    assert!((size(&c) - s / quarter_octave).abs() < 1e-3);
+    c.set_brush_size_fraction(1.0);
+    c.wheel(0.0, 60.0, 0.0, 0.0, SHIFT);
+    assert_eq!(size(&c), ceiling, "clamped at the ceiling");
+    c.set_brush_size_fraction(0.0);
+    c.wheel(0.0, -60.0, 0.0, 0.0, SHIFT);
+    assert_eq!(size(&c), 1.0, "clamped at 1 px");
+
+    c.wheel(0.0, 60.0, 0.0, 0.0, ALT);
+    assert_eq!(soft(&c), 35.0);
+    c.set_brush_softness_fraction(1.0);
+    c.wheel(0.0, 60.0, 0.0, 0.0, ALT);
+    assert_eq!(soft(&c), 100.0, "clamped at 100");
+    c.set_brush_softness_fraction(0.0);
+    c.wheel(0.0, -60.0, 0.0, 0.0, ALT);
+    assert_eq!(soft(&c), 0.0, "clamped at 0");
+
+    c.set_brush_size_fraction(0.5);
+    c.set_brush_softness_fraction(0.4);
+    let view = c.brush_toolbar_view();
+    for press_at in [(17.0, 42.0), (17.4, 41.6)] {
+        drag(&mut c, &[press_at]);
+        assert_eq!(
+            ops(&c).last(),
+            Some(&Op::BrushStroke {
+                source_id: c.brush_source().unwrap(),
+                path: vec![Point { x: 17, y: 42 }],
+                radius: view.size / 2.0,
+                softness: view.soft / 100.0,
+            }),
+            "pressed at {press_at:?}"
+        );
+    }
+
+    c.select_frame(0);
+    c.wheel(0.0, 60.0, 0.0, 0.0, CTRL);
+    assert_eq!(c.brush_source(), Some(1), "Ctrl + Wheel steps the source");
+    c.wheel(0.0, 120.0, 0.0, 0.0, CTRL);
+    assert_eq!(c.brush_source(), Some(2), "clamped to the frame list");
+
+    let mut narrow = controller_with_scratch("brush_units_narrow");
+    open_cropped_tab(&mut narrow, "brush_units_narrow", 40, 24);
+    narrow.set_align_algorithm("dummy-align");
+    assert!(narrow.start_fuse());
+    settle_all(&mut narrow);
+    let held = narrow
+        .held_checkpoints()
+        .last()
+        .expect("the narrow tab fuses");
+    let narrow_ceiling = held.width.min(held.height);
+    assert!(held.width > held.height, "a non-square fused image");
+    let view = narrow.brush_toolbar_view();
+    assert_eq!(
+        (view.size_ceiling, view.size),
+        (narrow_ceiling, narrow_ceiling as f32)
+    );
+    narrow.set_brush_size_fraction(1.0);
+    assert_eq!(size(&narrow), narrow_ceiling as f32);
+}
+
+#[test]
+fn cursor_geometry_follows_radius_softness_and_zoom() {
+    let (mut c, _) = open_editor("brush_cursor");
+    c.set_brush_size_fraction(0.5);
+    c.set_brush_softness_fraction(0.25);
+    let radius = c.brush_toolbar_view().size / 2.0;
+    for scale in [4.0f32, 5.0] {
+        if scale == 5.0 {
+            c.zoom_in();
+        }
+        let draw = c.plane_draw().unwrap();
+        assert_eq!(draw.dst.2 / draw.src.2 as f32, scale);
+        let view = c.brush_cursor_view().unwrap();
+        let ring = radius * scale;
+        let core = radius * 0.75 * scale;
+        assert_eq!(view.extent, 2.0 * ring + 2.0);
+        assert!(
+            view.ring_commands
+                .contains(&format!("A {ring:.2} {ring:.2}")),
+            "{}",
+            view.ring_commands
+        );
+        assert!(view.ring_commands.matches('M').count() > 1, "dashed");
+        assert!(
+            view.core_commands
+                .contains(&format!("A {core:.2} {core:.2}")),
+            "{}",
+            view.core_commands
+        );
+    }
+
+    c.set_brush_softness_fraction(0.0);
+    let view = c.brush_cursor_view().unwrap();
+    let ring = radius * 5.0;
+    assert!(view.ring_commands.is_empty(), "no ring at softness 0");
+    assert_eq!(view.core_commands.matches('M').count(), 1);
+    assert!(
+        view.core_commands
+            .contains(&format!("A {ring:.2} {ring:.2}"))
+    );
+
+    c.set_brush_softness_fraction(0.5);
+    c.pointer(
+        PointerKind::Move,
+        Button::Left,
+        RIGHT.x + 20.0,
+        60.0,
+        NO_MODS,
+    );
+    let here = c.brush_cursor_view().unwrap();
+    c.pointer(
+        PointerKind::Move,
+        Button::Left,
+        RIGHT.x + 190.0,
+        250.0,
+        NO_MODS,
+    );
+    assert_eq!(
+        c.brush_cursor_view().unwrap(),
+        here,
+        "the pointer moves nothing"
+    );
+}
+
+#[test]
+fn pipette_reads_and_appends_nothing() {
+    let mut c = controller_with_scratch("brush_pipette");
+    open_fused_tab(&mut c, "brush_pipette", 3);
+    // An 8 x 8 block of `NO_SOURCE` in the sealed map's top-left corner.
+    let zmap = c.held_checkpoints().last().unwrap().zmap.clone();
+    let info = ZMapReader::open(&zmap).unwrap().info();
+    let (width, height) = (info.width(), info.height());
+    let mut sealed = read_whole_zmap(&zmap);
+    for y in 0..8 {
+        for x in 0..8 {
+            sealed[(y * width + x) as usize] = NO_SOURCE;
+        }
+    }
+    let map = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let mut writer = ZMapWriter::create(&zmap, info).unwrap();
+    writer.write_tile(map, &sealed).unwrap();
+    writer.finish().unwrap();
+    c.set_pane_geometry(LEFT, RIGHT);
+    assert!(c.set_mode(ShellMode::Editor));
+
+    set_size(&mut c, 4.0);
+    c.select_frame(1);
+    drag(&mut c, &[(40.0, 40.0), (50.0, 44.0)]);
+    c.select_frame(2);
+    drag(&mut c, &[(20.0, 50.0), (30.0, 55.0)]);
+    c.undo();
+    let state = |c: &AppController| (ops(c), indices(c), c.edit_session().unwrap().can_redo());
+    let before = state(&c);
+    assert!(before.2, "one stroke waits on the redo stack");
+    let edited = before.1.clone();
+    let differing = |source: u16| {
+        (8..height)
+            .flat_map(|y| (8..width).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                let index = edited[(y * width + x) as usize];
+                index != source && index != NO_SOURCE
+            })
+            .map(|(x, y)| ((x as f32, y as f32), edited[(y * width + x) as usize]))
+            .expect("the fused map names more than one source")
+    };
+    let off_image = (RIGHT.x + 100.0, 8.0);
+
+    c.toggle_pipette();
+    assert!(c.brush_toolbar_view().picking);
+    let (pixel, picked) = differing(c.brush_source().unwrap());
+    let events = record_events(&mut c);
+    drag(&mut c, &[pixel]);
+    assert_eq!(c.brush_source(), Some(picked), "the armed click picks");
+    assert!(!c.brush_toolbar_view().picking, "and disarms the pipette");
+    assert!(
+        events.lock().unwrap().contains(&ShellEvent::EditorChanged),
+        "the toolbar hears the disarm"
+    );
+    assert_eq!(state(&c), before);
+    c.toggle_pipette();
+    drag(&mut c, &[(30.0, 30.0), (40.0, 36.0), (50.0, 30.0)]);
+    assert_eq!(state(&c), before, "a drag with the pipette armed");
+    assert!(!c.brush_toolbar_view().picking);
+    let source = c.brush_source();
+    c.toggle_pipette();
+    drag(&mut c, &[(3.0, 3.0)]);
+    assert_eq!(c.brush_source(), source, "NO_SOURCE under the pointer");
+    assert!(!c.brush_toolbar_view().picking, "a missed pick disarms too");
+    c.toggle_pipette();
+    press(&mut c, off_image);
+    release(&mut c, off_image);
+    assert_eq!(c.brush_source(), source, "a point off the image");
+    assert!(!c.brush_toolbar_view().picking);
+
+    let alt_click = |c: &mut AppController, point: (f32, f32)| {
+        c.pointer(PointerKind::Down, Button::Left, point.0, point.1, ALT);
+        c.pointer(PointerKind::Up, Button::Left, point.0, point.1, ALT);
+    };
+    let (pixel, picked) = differing(c.brush_source().unwrap());
+    alt_click(&mut c, at(pixel.0, pixel.1));
+    assert_eq!(c.brush_source(), Some(picked), "Alt + click picks");
+    assert!(!c.brush_toolbar_view().picking, "without arming");
+    c.toggle_pipette();
+    let (pixel, picked) = differing(c.brush_source().unwrap());
+    alt_click(&mut c, at(pixel.0, pixel.1));
+    assert_eq!(c.brush_source(), Some(picked));
+    assert!(
+        c.brush_toolbar_view().picking,
+        "Alt + click leaves an armed pipette armed"
+    );
+    c.toggle_pipette();
+    alt_click(&mut c, at(3.0, 3.0));
+    alt_click(&mut c, off_image);
+    assert_eq!(c.brush_source(), Some(picked));
+    assert_eq!(state(&c), before);
+
+    c.key(true, "z", CTRL);
+    assert!(
+        ops(&c).is_empty(),
+        "Ctrl + Z undoes the stroke before the picks"
+    );
+    assert_eq!(c.brush_source(), Some(picked), "and leaves the pick");
+
+    c.toggle_pipette();
+    let (pixel, picked) = differing(c.brush_source().unwrap());
+    drag(&mut c, &[pixel]);
+    assert!(ops(&c).is_empty(), "the pick opens no stroke");
+    drag(&mut c, &[(40.0, 40.0), (50.0, 44.0)]);
+    assert!(
+        matches!(
+            ops(&c)[..],
+            [Op::BrushStroke { source_id, .. }] if source_id == picked
+        ),
+        "the next drag paints with the picked source: {:?}",
+        ops(&c)
+    );
+}
+
+#[test]
+fn held_alt_shows_the_pipette_cursor() {
+    let (mut c, _) = open_editor("brush_alt_cursor");
+    let hover = |c: &mut AppController, mods: Modifiers| {
+        let (x, y) = at(20.0, 30.0);
+        c.pointer(PointerKind::Move, Button::Left, x, y, mods);
+        c.brush_cursor_view().unwrap()
+    };
+    let idle = hover(&mut c, NO_MODS);
+    assert!(!idle.picking);
+
+    let held = hover(&mut c, ALT);
+    assert!(held.picking, "Alt held shows the pipette");
+    assert!(!c.brush_toolbar_view().picking, "without arming it");
+    assert_eq!(hover(&mut c, NO_MODS), idle, "Alt released");
+
+    hover(&mut c, ALT);
+    c.clear_input_modifiers();
+    assert_eq!(
+        c.brush_cursor_view().unwrap(),
+        idle,
+        "focus loss clears Alt"
+    );
+
+    c.toggle_pipette();
+    assert_eq!(hover(&mut c, NO_MODS), held, "the armed pipette, same view");
+    assert_eq!(hover(&mut c, ALT), held);
+}
+
+#[test]
+fn undo_redo_bindings_and_silent_discard() {
+    let (mut c, root) = open_editor("brush_undo_redo");
+    let sealed = Sealed::read(&mut c, &root);
+    set_size(&mut c, 6.0);
+    c.select_frame(1);
+    drag(&mut c, &[(10.0, 10.0), (30.0, 20.0)]);
+    c.select_frame(2);
+    drag(&mut c, &[(20.0, 40.0), (44.0, 30.0)]);
+    let both = ops(&c);
+    let after_both = indices(&c);
+
+    for (undo_key, redo_key) in [("z", "Z"), ("Z", "z")] {
+        c.key(true, undo_key, CTRL);
+        assert_eq!(ops(&c), both[..1], "undo as {undo_key:?}");
+        assert!(c.brush_toolbar_view().can_redo);
+        c.key(true, redo_key, CTRL_SHIFT);
+        assert_eq!(ops(&c), both, "redo as {redo_key:?}");
+        assert_eq!(indices(&c), after_both);
+    }
+
+    c.key(true, "z", CTRL);
+    c.key(true, "z", CTRL);
+    assert_eq!(indices(&c), sealed.indices, "undo is exact");
+    assert!(
+        sealed.displayed(&c) == sealed.composite,
+        "the original composite"
+    );
+    c.key(true, "z", CTRL_SHIFT);
+    assert_eq!(ops(&c), both[..1]);
+    assert!(c.edit_session().unwrap().can_redo());
+
+    let events = record_events(&mut c);
+    drag(&mut c, &[(12.0, 50.0), (20.0, 54.0)]);
+    assert!(
+        !c.edit_session().unwrap().can_redo(),
+        "a new stroke drops redo"
+    );
+    assert!(!c.brush_toolbar_view().can_redo);
+    let said: Vec<ShellEvent> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| !matches!(event, ShellEvent::Input(_)))
+        .cloned()
+        .collect();
+    assert_eq!(
+        said,
+        vec![ShellEvent::EditorChanged],
+        "nothing announces it"
+    );
+
+    let now = (ops(&c), indices(&c));
+    c.key(true, "z", CTRL_SHIFT);
+    assert_eq!((ops(&c), indices(&c)), now, "nothing left to redo");
+    sealed.assert_shown(&c, "after the new stroke");
+}
+
+#[test]
+fn stroke_commit_recomposites_its_tick_rects() {
+    let (mut c, root) = open_editor("brush_commit");
+    let sealed = Sealed::read(&mut c, &root);
+    set_size(&mut c, 20.0);
+    c.set_brush_softness_fraction(0.3);
+    c.select_frame(1);
+    let radius = c.brush_toolbar_view().size / 2.0;
+    let margin = (radius / 8.0).ceil() as u32 + 2;
+    let info = c.edit_session().unwrap().info();
+
+    // Zig-zag runs of about 1.7 px, shorter than the resample spacing
+    // (radius / 4 = 2.5 px), so the stored path cuts every corner, drifting
+    // diagonally across several 16 px tiles.
+    let zigzag: Vec<(f32, f32)> = (0..60)
+        .map(|i| {
+            let t = i as f32;
+            (6.0 + 0.6 * t, 20.0 + 0.4 * t + (i % 2) as f32 * 1.6)
+        })
+        .collect();
+    let screen: Vec<(f32, f32)> = zigzag.iter().map(|&(x, y)| at(x, y)).collect();
+    press(&mut c, screen[0]);
+    let mut ticks = Vec::new();
+    for chunk in screen[1..].chunks(7) {
+        for &(x, y) in chunk {
+            c.pointer_moved(x, y);
+        }
+        c.flush_live_stroke();
+        let tick = c.take_recomposited();
+        assert_eq!(tick.len(), 1, "one recomposite per flush");
+        ticks.extend(tick);
+    }
+    release(&mut c, *screen.last().unwrap());
+
+    let commit = c.take_recomposited();
+    let map = map_rect(&c);
+    let expected: Vec<Rect> = ticks.iter().map(|&r| dilate(r, margin, map)).collect();
+    assert_eq!(commit, expected, "one pass over the dilated tick rects");
+    let op = ops(&c).pop().unwrap();
+    let bbox = footprint(&op, info).unwrap().unwrap();
+    assert!(!commit.contains(&bbox), "never the stroke's bounding box");
+    sealed.assert_shown(&c, "after release");
+
+    c.undo();
+    assert_eq!(
+        c.take_recomposited(),
+        vec![bbox],
+        "undo recomposites its region"
+    );
+    sealed.assert_shown(&c, "after undo");
+    assert!(sealed.displayed(&c) == sealed.composite);
+    c.redo();
+    assert_eq!(
+        c.take_recomposited(),
+        vec![bbox],
+        "redo recomposites its region"
+    );
+    sealed.assert_shown(&c, "after redo");
+}
+
+#[test]
+fn every_edit_has_a_cli_equivalent() {
+    let (mut c, _) = open_editor("brush_cli");
+    set_size(&mut c, 6.0);
+    c.select_frame(1);
+    drag(&mut c, &[(10.0, 10.0), (30.0, 25.0), (12.0, 40.0)]);
+    c.select_frame(2);
+    drag(&mut c, &[(45.0, 45.0)]);
+    c.undo();
+    c.select_frame(0);
+    drag(&mut c, &[(50.0, 8.0), (20.0, 58.0)]);
+    let ops = ops(&c);
+    assert_eq!(ops.len(), 2);
+
+    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
+    let info = ZMapReader::open(&zmap).unwrap().info();
+    let mut replay = EditSession::new(info, map_rect(&c), read_whole_zmap(&zmap)).unwrap();
+    for op in &ops {
+        replay.append(op.clone()).unwrap();
+    }
+    assert_eq!(replay.indices(), c.edit_session().unwrap().indices());
+
+    let json = serde_json::to_string(&ops).unwrap();
+    let parsed: Vec<Op> = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, ops);
+}
+
+#[test]
+fn live_stroke_previews_each_new_segment() {
+    let (mut c, root) = open_editor("brush_live");
+    let sealed = Sealed::read(&mut c, &root);
+    set_size(&mut c, 10.0);
+    c.set_brush_softness_fraction(0.3);
+    c.select_frame(2);
+    drag(&mut c, &[(50.0, 10.0), (56.0, 14.0)]);
+    drag(&mut c, &[(8.0, 56.0)]);
+    c.undo();
+    c.select_frame(1);
+    c.take_recomposited();
+    let session = |c: &AppController| {
+        let s = c.edit_session().unwrap();
+        (
+            s.op_count(),
+            s.ops().cloned().collect::<Vec<_>>(),
+            s.can_redo(),
+        )
+    };
+    let before = session(&c);
+    assert!(before.2, "one stroke waits on the redo stack");
+    let before_indices = indices(&c);
+    let view = c.brush_toolbar_view();
+    let (source, radius, softness) = (1u16, view.size / 2.0, view.soft / 100.0);
+    let info = c.edit_session().unwrap().info();
+    let stroke = |path: Vec<Point>| Op::BrushStroke {
+        source_id: source,
+        path,
+        radius,
+        softness,
+    };
+
+    // A quarter-pixel trace, some steps sub-pixel, wandering across tiles.
+    let trace: Vec<(f32, f32)> = (0..45)
+        .map(|i| {
+            let t = i as f32;
+            let jog = if i % 3 == 0 { 1.25 } else { 0.0 };
+            (10.0 + 0.75 * t, 12.0 + 0.5 * (t * 0.5).floor() + jog)
+        })
+        .collect();
+    press(&mut c, at(trace[0].0, trace[0].1));
+    c.flush_live_stroke();
+    assert!(
+        c.take_recomposited().is_empty(),
+        "a flush with no motion recomposites nothing"
+    );
+
+    let mut flushed = 0;
+    for (k, end) in [4usize, 5, 13, 21, 22, 30, 44].into_iter().enumerate() {
+        for &(x, y) in &trace[flushed + 1..=end] {
+            let (sx, sy) = at(x, y);
+            c.pointer_moved(sx, sy);
+        }
+        if k == 2 {
+            let held = indices(&c);
+            c.key(true, "z", CTRL);
+            c.key(true, "z", CTRL_SHIFT);
+            assert_eq!(indices(&c), held, "undo/redo mid-drag change nothing");
+            assert_eq!(session(&c), before);
+            c.wheel(0.0, 60.0, 0.0, 0.0, SHIFT);
+            c.wheel(0.0, 60.0, 0.0, 0.0, ALT);
+            c.wheel(0.0, 60.0, 0.0, 0.0, CTRL);
+            assert_ne!(c.brush_toolbar_view().size, view.size);
+            assert_ne!(c.brush_toolbar_view().soft, view.soft);
+            assert_ne!(c.brush_source(), Some(source));
+        }
+        c.flush_live_stroke();
+        let segment = stroke(rounded(&trace[flushed..=end]));
+        let region = footprint(&segment, info).unwrap();
+        assert_eq!(
+            c.take_recomposited(),
+            region.into_iter().collect::<Vec<_>>(),
+            "flush {k}: exactly the new segment's footprint, once"
+        );
+        let mut painted = before_indices.clone();
+        apply(
+            &stroke(rounded(&trace[..=end])),
+            info,
+            sealed.map,
+            &mut painted,
+        )
+        .unwrap();
+        assert!(
+            indices(&c) == painted,
+            "flush {k}: the preview paints the rounded trace so far"
+        );
+        sealed.assert_shown(&c, &format!("flush {k}"));
+        assert_eq!(
+            session(&c),
+            before,
+            "flush {k}: the op list waits for release"
+        );
+        c.flush_live_stroke();
+        assert!(c.take_recomposited().is_empty(), "flush {k}: nothing new");
+        flushed = end;
+    }
+
+    release(&mut c, at(trace[44].0, trace[44].1));
+    let mut live = LiveStroke::new(source, radius, softness, trace[0].0, trace[0].1);
+    for w in trace.windows(2) {
+        live.push(w[1].0 - w[0].0, w[1].1 - w[0].1);
+    }
+    let committed = stroke(live.finish());
+    let (count, ops, can_redo) = session(&c);
+    assert_eq!(count, before.0 + 1, "exactly one op on release");
+    assert!(!can_redo);
+    assert_eq!(
+        ops.last(),
+        Some(&committed),
+        "the frozen source, radius and softness"
+    );
+    let mut fresh = EditSession::new(info, sealed.map, before_indices).unwrap();
+    fresh.append(committed).unwrap();
+    assert!(
+        indices(&c) == fresh.indices(),
+        "a fresh session with that op"
+    );
+    sealed.assert_shown(&c, "after release");
+}

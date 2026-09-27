@@ -168,6 +168,10 @@ pub struct CanvasRenderer {
     zmap_pane: PaneTexture,
     index_scale: Option<u32>,
     last_planes: Option<PaneDraw>,
+    /// The edited view's own generation at `last_planes`' redraw -- `None`
+    /// both when no edited view was drawn and when none is drawn now, so a
+    /// tab with no edit session still short-circuits a repeat draw.
+    last_planes_generation: Option<u64>,
     frame: crate::canvas::FrameSource,
     frame_pane: PaneTexture,
     last_frame: Option<PaneDraw>,
@@ -184,6 +188,7 @@ impl CanvasRenderer {
             zmap_pane: PaneTexture::default(),
             index_scale: None,
             last_planes: None,
+            last_planes_generation: None,
             frame: crate::canvas::FrameSource::default(),
             frame_pane: PaneTexture::default(),
             last_frame: None,
@@ -214,6 +219,7 @@ impl CanvasRenderer {
         self.composite_pane = PaneTexture::default();
         self.zmap_pane = PaneTexture::default();
         self.last_planes = None;
+        self.last_planes_generation = None;
         Ok(())
     }
 
@@ -225,6 +231,7 @@ impl CanvasRenderer {
         self.composite_pane = PaneTexture::default();
         self.zmap_pane = PaneTexture::default();
         self.last_planes = None;
+        self.last_planes_generation = None;
     }
 
     /// The frame pane's currently open path, if any.
@@ -248,19 +255,21 @@ impl CanvasRenderer {
         self.last_frame = None;
     }
 
-    /// Re-reads and re-uploads `draw.src` for both planes, every `draw.step`-th
-    /// row and column into a `draw.extent()`-sized texture, returning the two
-    /// `slint::Image`s to bind to `FFPane::source`. A no-op (besides
-    /// re-cloning the two already-current images) when `draw` is exactly
-    /// what was last drawn -- a gesture that changes nothing costs nothing.
-    /// `None` with no planes open, when `draw.src` falls outside the open
-    /// composite, or either read fails; `self.last_planes` stays untouched
-    /// on that path so a later, valid rect still renders.
-    pub fn redraw_planes(&mut self, draw: &PaneDraw) -> Option<(slint::Image, slint::Image)> {
+    /// Re-reads and re-uploads `draw.src` for both planes, decimated into a
+    /// `draw.extent()`-sized texture. `edited`, when present, overlays the
+    /// composite with the resident tiles' gathered pixel wherever its index
+    /// differs from the sealed one, and uploads its indices for the Z-Map.
+    /// `None` on an out-of-range or unopened read.
+    pub fn redraw_planes(
+        &mut self,
+        draw: &PaneDraw,
+        edited: Option<crate::canvas::EditedView>,
+    ) -> Option<(slint::Image, slint::Image)> {
         if self.composite.is_none() || self.zmap.is_none() {
             return None;
         }
-        if self.last_planes.as_ref() == Some(draw) {
+        let generation = edited.as_ref().map(|view| view.tiles.generation());
+        if self.last_planes.as_ref() == Some(draw) && self.last_planes_generation == generation {
             return Some((self.composite_pane.image(), self.zmap_pane.image()));
         }
         let composite = self.composite.as_ref()?;
@@ -289,6 +298,35 @@ impl CanvasRenderer {
         composite
             .read_tile_step_into(0, rect, draw.step, &mut samples)
             .ok()?;
+
+        let mut sealed_indices = vec![0u16; texels];
+        zmap.read_tile_step_into(rect, draw.step, &mut sealed_indices)
+            .ok()?;
+
+        let zmap_indices = match &edited {
+            Some(view) => {
+                let mut edited_indices = vec![0u16; texels];
+                crate::canvas::step_copy(
+                    view.indices,
+                    view.map_width,
+                    rect,
+                    draw.step,
+                    &mut edited_indices,
+                );
+                crate::canvas::overlay_edited(
+                    &mut samples,
+                    &sealed_indices,
+                    &edited_indices,
+                    rect,
+                    draw.step,
+                    samples_per_pixel,
+                    view.tiles,
+                );
+                edited_indices
+            }
+            None => sealed_indices,
+        };
+
         self.composite_pane.ensure_and_render(
             self.shared,
             tex_w,
@@ -297,14 +335,11 @@ impl CanvasRenderer {
             samples_per_pixel,
             0,
         );
-
-        let mut indices = vec![0u16; texels];
-        zmap.read_tile_step_into(rect, draw.step, &mut indices)
-            .ok()?;
         self.zmap_pane
-            .ensure_and_render(self.shared, tex_w, tex_h, &indices, 1, index_scale);
+            .ensure_and_render(self.shared, tex_w, tex_h, &zmap_indices, 1, index_scale);
 
         self.last_planes = Some(*draw);
+        self.last_planes_generation = generation;
         Some((self.composite_pane.image(), self.zmap_pane.image()))
     }
 

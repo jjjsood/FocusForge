@@ -8,6 +8,7 @@ import { ShellGeometry } from "../geometry.slint";
 import { FFEmptyState } from "empty_state.slint";
 import { FFErrorRow } from "../components/ff_error_row.slint";
 import { FFPanePlaceholder } from "../components/ff_pane_placeholder.slint";
+import { FFBrushCursor } from "../components/ff_brush_cursor.slint";
 
 component FFPaneLabel inherits Rectangle {
     in property <string> label: "";
@@ -72,10 +73,15 @@ export component FFPane inherits Rectangle {
     in property <length> image-w;
     in property <length> image-h;
     in property <bool> pixelated;
+    // Set on the right pane only, while editor mode is active -- marks it
+    // as the paint target.
+    in property <bool> accent-border: false;
     callback undock-requested();
 
     background: Theme.surface-canvas;
     border-radius: Theme.radius-md;
+    border-width: root.accent-border ? 1px : 0px;
+    border-color: Theme.accent-default;
     clip: true;
 
     Image {
@@ -140,6 +146,16 @@ export component FFCanvas inherits Rectangle {
     in property <length> frame-image-w;
     in property <length> frame-image-h;
     in property <bool> pixelated;
+    // Whether editor mode is active -- the right pane's accent border and
+    // the brush cursor both show only then.
+    in property <bool> editor-mode: false;
+    // The brush cursor's own `Path` geometry, already scaled to on-screen
+    // px -- see `AppController::brush_cursor_view`.
+    in property <length> cursor-extent;
+    in property <string> cursor-ring-commands;
+    in property <string> cursor-core-commands;
+    in property <bool> cursor-picking: false;
+    in property <color> cursor-pick-color;
     callback composite-undock-requested();
     callback zmap-undock-requested();
     // The one input dispatch point's gesture forwards. No other `.slint`
@@ -191,12 +207,23 @@ export component FFCanvas inherits Rectangle {
 
     background: Theme.surface-base;
 
+    // Whether the pointer sits over the right pane's own rect -- the brush
+    // cursor's visibility and the hidden system cursor both gate on this,
+    // not just `has-hover` over the whole canvas.
+    property <bool> pointer-over-right-pane: hit-area.mouse-x >= pane-right.x
+        && hit-area.mouse-x <= pane-right.x + pane-right.width
+        && hit-area.mouse-y >= pane-right.y
+        && hit-area.mouse-y <= pane-right.y + pane-right.height;
+    property <bool> show-brush-cursor: root.editor-mode && hit-area.has-hover
+        && root.pointer-over-right-pane;
+
     // First child so it spans the whole canvas region while the
     // later-declared panes and their `FFUndockControl` `TouchArea`s keep
     // z-order above it.
     hit-area := TouchArea {
         width: 100%;
         height: 100%;
+        mouse-cursor: root.show-brush-cursor ? MouseCursor.none : MouseCursor.default;
 
         scroll-event(event) => {
             root.canvas-scrolled(event.delta-x, event.delta-y, self.mouse-x, self.mouse-y,
@@ -254,6 +281,7 @@ export component FFCanvas inherits Rectangle {
         image-w: root.image-w;
         image-h: root.image-h;
         pixelated: root.pixelated;
+        accent-border: root.editor-mode;
         undock-requested => { root.zmap-undock-requested(); }
     }
 
@@ -261,6 +289,17 @@ export component FFCanvas inherits Rectangle {
         x: pane-right.x + (pane-right.width - self.width) / 2;
         y: pane-right.y + (pane-right.height - self.height) / 2;
         visible: root.project-loaded && !root.composite-ready;
+    }
+
+    brush-cursor := FFBrushCursor {
+        x: hit-area.mouse-x - self.width / 2;
+        y: hit-area.mouse-y - self.height / 2;
+        visible: root.show-brush-cursor;
+        extent: root.cursor-extent;
+        ring-commands: root.cursor-ring-commands;
+        core-commands: root.cursor-core-commands;
+        picking: root.cursor-picking;
+        pick-color: root.cursor-pick-color;
     }
 
     empty-state := FFEmptyState {

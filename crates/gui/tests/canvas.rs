@@ -1120,3 +1120,228 @@ fn pane_label_at_the_budget_passes_through_unchanged() {
     let one_over = "0829-IMG_9800.tif";
     assert_eq!(truncate_pane_label(one_over), "\u{2026}29-IMG_9800.tif");
 }
+
+// ---------------------------------------------------------------------
+// The edited view: resident recomposited tiles over the sealed planes.
+// ---------------------------------------------------------------------
+
+use std::num::NonZeroU32;
+
+use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
+use focusforge_core::retouch::Sources;
+use focusforge_gui::canvas::{ResidentTiles, overlay_edited, step_copy};
+
+const MAP: u32 = 64;
+const FRAMES: usize = 3;
+
+fn mantis64_stack() -> TiffStack {
+    let paths: Vec<PathBuf> = (0..FRAMES)
+        .map(|i| common::fixture_frame("mantis-64", i))
+        .collect();
+    TiffStack::open_files(&paths).expect("the mantis-64 frames open")
+}
+
+fn sources(stack: &TiffStack) -> Sources<'_> {
+    Sources {
+        reader: stack,
+        frame_count: FRAMES as u32,
+        samples_per_pixel: 3,
+        origin: (0, 0),
+    }
+}
+
+fn whole_map() -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        width: MAP,
+        height: MAP,
+    }
+}
+
+/// Every frame's whole plane, for per-pixel reference lookups.
+fn frame_planes(stack: &TiffStack) -> Vec<Vec<u16>> {
+    (0..FRAMES)
+        .map(|frame| {
+            let mut plane = vec![0u16; (MAP * MAP * 3) as usize];
+            stack
+                .read_tile_into(frame, whole_map(), &mut plane)
+                .unwrap();
+            plane
+        })
+        .collect()
+}
+
+fn contains(r: Rect, x: u32, y: u32) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+#[test]
+fn step_copy_matches_the_files_decimated_read() {
+    let (width, height) = (37u32, 29u32);
+    let plane: Vec<u16> = (0..width * height).map(|i| (i * 7 % 1013) as u16).collect();
+    let path = common::tree("step_copy_plane").join("plane.tif");
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let spec = TiffSpec {
+        width,
+        height,
+        samples_per_pixel: 1,
+        description: None,
+    };
+    let mut writer = TiffWriter::create(&path, spec).unwrap();
+    writer.write_tile(whole, &plane).unwrap();
+    writer.finish().unwrap();
+    let stack = TiffStack::open_files(&[path]).unwrap();
+
+    let rect = Rect {
+        x: 3,
+        y: 5,
+        width: 22,
+        height: 17,
+    };
+    for step in [1u32, 3] {
+        let step = NonZeroU32::new(step).unwrap();
+        let len = (rect.width.div_ceil(step.get()) * rect.height.div_ceil(step.get())) as usize;
+        let mut from_file = vec![0u16; len];
+        stack
+            .read_tile_step_into(0, rect, step, &mut from_file)
+            .unwrap();
+        let mut from_memory = vec![u16::MAX; len];
+        step_copy(&plane, width, rect, step, &mut from_memory);
+        assert_eq!(from_memory, from_file, "step {step}");
+    }
+}
+
+#[test]
+fn resident_tiles_allocate_only_the_tiles_a_region_meets() {
+    let stack = mantis64_stack();
+    let planes = frame_planes(&stack);
+    // A 13 px grid: the region below spans tiles (0..=1, 1..=2).
+    let mut tiles = ResidentTiles::new(13, MAP, MAP, 3);
+    let edited = vec![1u16; (MAP * MAP) as usize];
+    let sealed = vec![0u16; (MAP * MAP) as usize];
+    let region = Rect {
+        x: 10,
+        y: 20,
+        width: 10,
+        height: 10,
+    };
+    let generation = tiles.generation();
+    tiles
+        .recomposite(region, &edited, &sources(&stack))
+        .unwrap();
+    assert_eq!(tiles.generation(), generation + 1, "one bump per call");
+    assert_eq!(tiles.take_recomposited(), vec![region]);
+    assert!(tiles.take_recomposited().is_empty(), "the log drains");
+
+    // Every index differs from the sealed one, so the overlay shows each
+    // texel's resident pixel wherever a tile exists: the gather inside the
+    // region, the zeroed allocation elsewhere in the four tiles, and the
+    // sealed sentinel outside them.
+    const SENTINEL: u16 = 7777;
+    let mut samples = vec![SENTINEL; (MAP * MAP * 3) as usize];
+    overlay_edited(
+        &mut samples,
+        &sealed,
+        &edited,
+        whole_map(),
+        NonZeroU32::MIN,
+        3,
+        &tiles,
+    );
+    let four_tiles = Rect {
+        x: 0,
+        y: 13,
+        width: 26,
+        height: 26,
+    };
+    for y in 0..MAP {
+        for x in 0..MAP {
+            let i = ((y * MAP + x) * 3) as usize;
+            let expected: &[u16] = if contains(region, x, y) {
+                &planes[1][i..i + 3]
+            } else if contains(four_tiles, x, y) {
+                &[0, 0, 0]
+            } else {
+                &[SENTINEL; 3]
+            };
+            assert_eq!(&samples[i..i + 3], expected, "({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn overlay_keeps_sealed_pixels_where_index_unchanged() {
+    let stack = mantis64_stack();
+    let planes = frame_planes(&stack);
+    let sealed: Vec<u16> = (0..MAP * MAP)
+        .map(|i| ((i / 5) % FRAMES as u32) as u16)
+        .collect();
+    let mut edited = sealed.clone();
+    let region = Rect {
+        x: 9,
+        y: 14,
+        width: 23,
+        height: 19,
+    };
+    // Inside the region one diagonal band changes source; every other pixel
+    // there is gathered at its own sealed index, as a repaint with the
+    // sealed source leaves it.
+    for y in region.y..region.y + region.height {
+        for x in region.x..region.x + region.width {
+            let i = (y * MAP + x) as usize;
+            if (x + y) % 4 == 0 {
+                edited[i] = (sealed[i] + 1) % FRAMES as u16;
+            }
+        }
+    }
+    let mut tiles = ResidentTiles::new(16, MAP, MAP, 3);
+    tiles
+        .recomposite(region, &edited, &sources(&stack))
+        .unwrap();
+
+    // The sealed composite stands in as a sentinel no frame sample equals,
+    // so a gathered pixel in its place cannot hide.
+    let sealed_sample = |i: usize| 60000 + (i % 1000) as u16;
+    for step in [1u32, 2] {
+        let step = NonZeroU32::new(step).unwrap();
+        let out_w = MAP.div_ceil(step.get());
+        let texels = (out_w * out_w) as usize;
+        let mut sealed_step = vec![0u16; texels];
+        let mut edited_step = vec![0u16; texels];
+        step_copy(&sealed, MAP, whole_map(), step, &mut sealed_step);
+        step_copy(&edited, MAP, whole_map(), step, &mut edited_step);
+        let mut samples: Vec<u16> = (0..texels * 3).map(sealed_sample).collect();
+        overlay_edited(
+            &mut samples,
+            &sealed_step,
+            &edited_step,
+            whole_map(),
+            step,
+            3,
+            &tiles,
+        );
+        for ty in 0..out_w {
+            for tx in 0..out_w {
+                let (x, y) = (tx * step.get(), ty * step.get());
+                let t = (ty * out_w + tx) as usize;
+                let i = (y * MAP + x) as usize;
+                let expected: Vec<u16> = if edited[i] != sealed[i] {
+                    planes[edited[i] as usize][i * 3..i * 3 + 3].to_vec()
+                } else {
+                    (t * 3..t * 3 + 3).map(sealed_sample).collect()
+                };
+                assert_eq!(
+                    &samples[t * 3..t * 3 + 3],
+                    expected.as_slice(),
+                    "step {step} ({x}, {y})"
+                );
+            }
+        }
+    }
+}
