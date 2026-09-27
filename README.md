@@ -40,10 +40,11 @@ GNU General Public License v3.
   SIGUSR1 pauses one in place on Unix, and `--resume` picks a cancelled stack
   back up without redoing finished work
 - Directory-wide stack inspection (`focusforge-cli info`) — dimensions, depth,
-  byte order, compression, strip layout and a uniform-layout check across
-  every frame, plain text or `--json`
-- Flags an unsupported frame by name (compression, tiling, planar layout, a
-  bit depth other than 16) instead of silently misreading it
+  byte order, compression, layout and a uniform-layout check across every
+  frame, plain text or `--json`
+- Reads 16-bit unsigned chunky TIFF frames stored uncompressed, with LZW, or
+  with Deflate, in strip or tiled layouts; flags unsupported layouts by name
+  instead of silently misreading them
 - Fuses the `laplacian` algorithm on a GPU automatically when one is
   available, falling back to the CPU cleanly when it isn't; either path
   produces the same result, proven to match within 1 LSB at 16-bit

@@ -154,6 +154,16 @@ pub struct HostBudget {
     host_probed: bool,
 }
 
+/// The shares of one capped host budget used by decoded TIFF input and tile
+/// scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedCacheBudget {
+    /// Bytes available to decoded TIFF segments.
+    pub cache: HostBudget,
+    /// Bytes available to tile scheduling.
+    pub scheduler: HostBudget,
+}
+
 impl HostBudget {
     /// Derives a budget from host facts: [`HOST_BUDGET_SHARE_PERCENT`] of
     /// what the host currently reports available when the facts were
@@ -189,7 +199,8 @@ impl HostBudget {
     /// result is that ceiling, reported as `Explicit` -- a ceiling is a
     /// caller choice, not a host-derived one. A ceiling at or above the
     /// current budget changes nothing, including its provenance and its
-    /// `host_probed` bit: a ceiling never raises the budget.
+    /// `host_probed` bit: the phase's binding constraint ("the flag can
+    /// never raise the budget") expressed in one function.
     pub fn capped_to(self, ceiling: Option<u64>) -> Self {
         match ceiling {
             Some(ceiling) if ceiling < self.bytes => HostBudget {
@@ -198,6 +209,24 @@ impl HostBudget {
                 host_probed: self.host_probed,
             },
             _ => self,
+        }
+    }
+
+    /// Splits an already-capped budget between decoded TIFF segments and the
+    /// tile scheduler. The cache receives one quarter; the scheduler receives
+    /// the exact remainder while retaining this budget's source and pressure
+    /// behavior.
+    pub fn partition_for_decoded_cache(self) -> DecodedCacheBudget {
+        let cache_bytes = self.bytes / 4;
+        DecodedCacheBudget {
+            cache: HostBudget {
+                bytes: cache_bytes,
+                ..self
+            },
+            scheduler: HostBudget {
+                bytes: self.bytes - cache_bytes,
+                ..self
+            },
         }
     }
 

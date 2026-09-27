@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use memmap2::Mmap;
 
 use super::super::error::TiffError;
+use super::super::frame::{FrameDesc, FrameReader};
 use super::header::{ByteOrder, TAG_STRIP_OFFSETS, TiffHeader};
 use crate::tile::{Rect, Tile};
 
@@ -26,6 +27,7 @@ use crate::tile::{Rect, Tile};
 #[derive(Debug)]
 pub struct TiffStack {
     headers: Vec<TiffHeader>,
+    descs: Vec<FrameDesc>,
     maps: Vec<OnceLock<Mmap>>,
 }
 
@@ -69,8 +71,13 @@ impl TiffStack {
             }
             headers.push(header);
         }
+        let descs = headers.iter().map(FrameDesc::from).collect();
         let maps = headers.iter().map(|_| OnceLock::new()).collect();
-        Ok(TiffStack { headers, maps })
+        Ok(TiffStack {
+            headers,
+            descs,
+            maps,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -256,6 +263,20 @@ impl TiffStack {
     }
 }
 
+impl FrameReader for TiffStack {
+    fn len(&self) -> usize {
+        TiffStack::len(self)
+    }
+
+    fn dimensions(&self) -> (u32, u32) {
+        TiffStack::dimensions(self)
+    }
+
+    fn frame(&self, index: usize) -> &FrameDesc {
+        &self.descs[index]
+    }
+}
+
 #[inline(always)]
 fn decode_sample(order: ByteOrder, chunk: &[u8]) -> u16 {
     match order {
@@ -338,7 +359,7 @@ pub fn is_frame_path(path: &Path) -> bool {
 /// Lenient uniformity: dimensions, bits per sample, samples per pixel,
 /// photometric and planar configuration must agree with `first`. Byte order
 /// and `RowsPerStrip` are deliberately not compared.
-fn check_uniform(first: &TiffHeader, other: &TiffHeader) -> Result<(), TiffError> {
+pub(crate) fn check_uniform(first: &TiffHeader, other: &TiffHeader) -> Result<(), TiffError> {
     let mut detail = Vec::new();
     if first.width != other.width || first.height != other.height {
         detail.push(format!(
@@ -398,7 +419,7 @@ fn check_uniform(first: &TiffHeader, other: &TiffHeader) -> Result<(), TiffError
 /// the mapping keeps the underlying pages alive on its own.
 // SAFETY: contract above; the only `unsafe` call this crate makes.
 #[allow(unsafe_code)]
-fn map_file(path: &Path) -> Result<Mmap, TiffError> {
+pub(crate) fn map_file(path: &Path) -> Result<Mmap, TiffError> {
     let file = File::open(path).map_err(|source| TiffError::Io {
         path: path.to_path_buf(),
         source,

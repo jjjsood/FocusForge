@@ -21,7 +21,7 @@ use focusforge_core::align::warp::warp_from_tile;
 use focusforge_core::align::{
     AlignDriverOptions, FailurePolicy, PyramidalEcc, Transform, align_stack_with,
 };
-use focusforge_core::io::{TiffError, TiffStack};
+use focusforge_core::io::{FrameError, TiffError, TiffStack};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::tile::{Rect, Tile};
 
@@ -104,10 +104,12 @@ impl TileReader for FramesReader {
         };
         let expected = rect.width as usize * rect.height as usize * self.spp as usize;
         if out.len() != expected {
-            return Err(AlgorithmError::Tiff(TiffError::BufferSize {
-                expected,
-                got: out.len(),
-            }));
+            return Err(AlgorithmError::Frame(FrameError::Tiff(
+                TiffError::BufferSize {
+                    expected,
+                    got: out.len(),
+                },
+            )));
         }
         let in_bounds = rect
             .x
@@ -118,11 +120,13 @@ impl TileReader for FramesReader {
                 .checked_add(rect.height)
                 .is_some_and(|yh| yh <= self.height);
         if !in_bounds {
-            return Err(AlgorithmError::Tiff(TiffError::OutOfBounds {
-                path: PathBuf::from("<memory>"),
-                requested: rect,
-                frame: (self.width, self.height),
-            }));
+            return Err(AlgorithmError::Frame(FrameError::Tiff(
+                TiffError::OutOfBounds {
+                    path: PathBuf::from("<memory>"),
+                    requested: rect,
+                    frame: (self.width, self.height),
+                },
+            )));
         }
         let stride = self.width as usize * self.spp as usize;
         let row_len = rect.width as usize * self.spp as usize;

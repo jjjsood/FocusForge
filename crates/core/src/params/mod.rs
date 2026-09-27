@@ -79,12 +79,10 @@ impl ParamKind {
 /// `#[non_exhaustive]`: extended **in place** as further algorithms need
 /// fields. It must not move, or this module's own tests break.
 ///
-/// The fields here are exactly what [`crate::io::TiffStack`] already
-/// exposes: `frame_count` from `TiffStack::len()`, `width`/`height` from
-/// `TiffStack::dimensions()`, `samples_per_pixel` from
-/// `TiffStack::header(0).samples_per_pixel`. `core::params` does not depend
-/// on `core::io`; the caller wires the two together by constructing a
-/// `StackContext` from an open stack.
+/// The fields here are exactly what an opened frame set exposes: frame
+/// count, shared dimensions, and samples per pixel of frame 0. `core::params`
+/// does not depend on `core::io`; the caller constructs a `StackContext` from
+/// an open reader.
 ///
 /// `samples_per_pixel` is what lets an [`crate::algorithm::AlignAlgorithm`]
 /// size the exact-length buffer `AlignContext::read_tile_into` demands.
@@ -411,8 +409,8 @@ pub fn validate(schema: &[ParamDesc], values: &ParamValues) -> Result<(), ParamE
 /// kind — an `Int` accepted against a `Float` descriptor is stored as
 /// `Float`, so no consumer has to know the widening rule existed.
 ///
-/// A thin wrapper over [`resolve_in`] with a [`StackContext`] always
-/// supplied: `resolve_in(schema, values, Some(ctx),
+/// A thin wrapper over [`resolve_in`], kept so every existing call site
+/// compiles unchanged: `resolve_in(schema, values, Some(ctx),
 /// &crate::host::snapshot())`.
 pub fn resolve(
     schema: &[ParamDesc],

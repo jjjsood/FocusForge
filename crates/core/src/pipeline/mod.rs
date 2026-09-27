@@ -25,13 +25,15 @@ use crate::align::{
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use crate::gpu::TileBackend;
-use crate::io::{ByteOrder, COMPOSITE_FILENAME, Rect, TiffHeader, TiffStack, ZMAP_FILENAME};
+use crate::io::{
+    COMPOSITE_FILENAME, FrameDesc, FrameReader, Rect, TiffStack, ZMAP_FILENAME, open_frame_set,
+};
 use crate::job::{
     AlignIdentity, ControlState, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobControl, JobOutcome,
     JobProgress, JobRecord, JobStage, RecordingConsumer, Resumable, ResumeStore, StackFingerprint,
     StageCache, StageKey, read_alignment,
 };
-use crate::params::{self, ParamValue, ParamValues, Provenance, ResolvedParams, StackContext};
+use crate::params::{self, ParamValue, ParamValues, Provenance, ResolvedParams};
 use crate::project::{
     self, AlignRecord, AppendRequest, HeldCheckpoint, Metrics, SealRequest, SealedProject,
 };
@@ -50,7 +52,7 @@ pub struct AlignRequest {
 /// Everything one align-fuse-seal run needs, owned so it can cross a thread
 /// boundary. `frames` is the source list in frame order; `explicit` carries
 /// only the caller's own overrides, resolved once inside [`run`] against the
-/// [`StackContext`] built from `frames` itself -- never against a context
+/// [`StackContext`](crate::params::StackContext) built from `frames` itself -- never against a context
 /// the caller computed earlier, which could have drifted from what actually
 /// gets opened.
 pub struct FuseRequest {
@@ -239,8 +241,12 @@ pub fn run(
     let mut timer = StageTimer::from_start(start);
     timer.enter(Stage::Setup);
 
-    let stack = TiffStack::open_files(&request.frames)
+    let mut options = TileSchedulerOptions::new(&request.scratch_root);
+    options.budget = options.budget.capped_to(request.max_host_memory);
+    let opened = open_frame_set(&request.frames, options.budget)
         .map_err(|err| PipelineError::Input(err.to_string()))?;
+    options.budget = opened.scheduler_budget;
+    let frame_reader: &dyn FrameReader = &*opened.reader;
     let frame_names: Vec<String> = request
         .frames
         .iter()
@@ -250,38 +256,24 @@ pub fn run(
                 .unwrap_or_else(|| p.display().to_string())
         })
         .collect();
-    let header_refs: Vec<(&str, &TiffHeader)> = frame_names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| (name.as_str(), stack.header(i)))
-        .collect();
-    let (uniform, detail) = uniform_check(&header_refs);
-    if !uniform {
-        return Err(PipelineError::Input(
-            detail.unwrap_or_else(|| "non-uniform frame set".to_string()),
-        ));
-    }
-
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
-    let stack_ctx = StackContext::new(stack.len(), width, height, spp);
+    let stack_ctx = frame_reader.stack_context();
+    let (width, height) = (stack_ctx.width, stack_ctx.height);
+    let spp = stack_ctx.samples_per_pixel;
     let resolved = params::resolve(request.algorithm.params(), &request.explicit, &stack_ctx)
         .map_err(|err| PipelineError::Params(err.to_string()))?;
     let values = params::resolved_values(&resolved);
     let levels = request.algorithm.tile_levels(&values);
 
     let fingerprint = StackFingerprint {
-        frames: (0..stack.len())
-            .map(|i| FrameFingerprint::from(stack.header(i)))
+        frames: (0..frame_reader.len())
+            .map(|i| FrameFingerprint::from(frame_reader.frame(i)))
             .collect(),
     };
 
-    let mut options = TileSchedulerOptions::new(&request.scratch_root);
     options.levels = levels;
     if let Some(tile_size) = request.tile_size {
         options.tile_size = tile_size;
     }
-    options.budget = options.budget.capped_to(request.max_host_memory);
 
     timer.mark(Stage::Setup);
 
@@ -352,16 +344,16 @@ pub fn run(
                 align_cached = true;
                 align_source = "cached".to_string();
                 observer.stage(RunStage::Align {
-                    frames: stack.len(),
+                    frames: frame_reader.len(),
                     source: AlignSource::Cached,
                 });
                 alignment_result = Some((align_req.algorithm, align_resolved, policy, alignment));
             } else {
                 observer.stage(RunStage::Align {
-                    frames: stack.len(),
+                    frames: frame_reader.len(),
                     source: AlignSource::Computed,
                 });
-                let frames_done = control.begin_align(stack.len());
+                let frames_done = control.begin_align(frame_reader.len());
                 let done = AtomicBool::new(false);
                 let poll = request.poll;
                 // Span context does not cross onto the watcher thread by
@@ -393,7 +385,7 @@ pub fn run(
                     let result = align_stack_with(
                         align_req.algorithm,
                         stack_ctx,
-                        &stack,
+                        frame_reader,
                         &align_values,
                         policy,
                         &AlignDriverOptions {
@@ -443,7 +435,7 @@ pub fn run(
 
     let alignment_for_crop: StackAlignment = match &alignment_result {
         Some((_, _, _, alignment)) => alignment.clone(),
-        None => identity_alignment_for_crop(stack.len()),
+        None => identity_alignment_for_crop(frame_reader.len()),
     };
     let crop_rect_value = auto_crop(&alignment_for_crop, (width, height))
         .map_err(|err| PipelineError::Align(err.to_string()))?;
@@ -477,10 +469,10 @@ pub fn run(
         .iter()
         .map(|f| f.transform)
         .collect();
-    let warping_reader = WarpingReader::new(&stack, (width, height), spp, transforms.clone());
+    let warping_reader = WarpingReader::new(frame_reader, (width, height), spp, transforms.clone());
 
     let reader: &dyn TileReader = match &request.backend {
-        Some(_) => &stack,
+        Some(_) => frame_reader,
         None => &warping_reader,
     };
     let scheduler = TileScheduler::new(reader, stack_ctx, spp, &options)?;
@@ -498,7 +490,7 @@ pub fn run(
         width,
         height,
         samples_per_pixel: spp,
-        frame_count: stack.len() as u32,
+        frame_count: frame_reader.len() as u32,
         crop: applied_crop,
         description: description.clone(),
     };
@@ -516,7 +508,7 @@ pub fn run(
         width,
         height,
         samples_per_pixel: spp,
-        frame_count: stack.len(),
+        frame_count: frame_reader.len(),
         tile_size: scheduler.plan().tile_size(),
         levels: scheduler.plan().levels(),
         stack_algorithm: request.algorithm.id().to_string(),
@@ -614,7 +606,15 @@ pub fn run(
     observer.stage(RunStage::Fuse);
 
     let backend_consumer = request.backend.map(|b| {
-        BackendFusionConsumer::new(b, &stack, (width, height), transforms, spp, levels, &sink)
+        BackendFusionConsumer::new(
+            b,
+            frame_reader,
+            (width, height),
+            transforms,
+            spp,
+            levels,
+            &sink,
+        )
     });
     let consumer: &dyn TileConsumer = match &backend_consumer {
         Some(bc) => bc,
@@ -653,8 +653,8 @@ pub fn run(
     let in_flight_limit = scheduler.in_flight_limit();
     let tiles = final_progress.unit_total;
     let frame_tiles_read = match &backend_consumer {
-        Some(consumer) => consumer.fallback_tiles() * stack.len(),
-        None => tiles * stack.len(),
+        Some(consumer) => consumer.fallback_tiles() * frame_reader.len(),
+        None => tiles * frame_reader.len(),
     };
 
     if let Err(err) = sink.finish() {
@@ -664,7 +664,7 @@ pub fn run(
     }
 
     observer.stage(RunStage::Seal);
-    let metrics = measure_metrics(&staged_composite, &request.frames);
+    let metrics = measure_metrics(&staged_composite, frame_reader);
     let align_record =
         alignment_result
             .as_ref()
@@ -754,7 +754,7 @@ pub fn run(
 
     Ok(FuseOutcome::Completed(Box::new(FuseReport {
         product,
-        frame_count: stack.len(),
+        frame_count: frame_reader.len(),
         frames: frame_names,
         width,
         height,
@@ -991,29 +991,26 @@ const LAPVAR_WINDOW: u32 = 2048;
 /// one central window, measured identically on both. Every failure is
 /// silence rather than a refusal: a metric that could not be measured must
 /// not turn a completed run into a failed one.
-fn measure_metrics(composite: &Path, sources: &[PathBuf]) -> Metrics {
+fn measure_metrics(composite: &Path, sources: &dyn FrameReader) -> Metrics {
     let Ok(stack) = TiffStack::open_files(std::slice::from_ref(&composite.to_path_buf())) else {
         return Metrics::default();
     };
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
+    let (width, height) = FrameReader::dimensions(&stack);
+    let spp = stack.frame(0).samples_per_pixel;
     let side_w = LAPVAR_WINDOW.min(width);
     let side_h = LAPVAR_WINDOW.min(height);
     let window = centered(width, height, side_w, side_h);
-    let composite_lapvar = lapvar(&stack, window, spp);
+    let composite_lapvar = lapvar(&stack, 0, window, spp);
 
     let mut max_input_lapvar: Option<f64> = None;
-    for path in sources {
-        let Ok(frame) = TiffStack::open_files(std::slice::from_ref(path)) else {
-            continue;
-        };
-        let (fw, fh) = frame.dimensions();
+    for index in 0..sources.len() {
+        let (fw, fh) = sources.dimensions();
         if fw < side_w || fh < side_h {
             continue;
         }
-        let fspp = frame.header(0).samples_per_pixel;
+        let fspp = sources.frame(index).samples_per_pixel;
         let rect = centered(fw, fh, side_w, side_h);
-        if let Some(value) = lapvar(&frame, rect, fspp) {
+        if let Some(value) = lapvar(sources, index, rect, fspp) {
             max_input_lapvar = Some(max_input_lapvar.map_or(value, |m: f64| m.max(value)));
         }
     }
@@ -1034,9 +1031,9 @@ fn centered(width: u32, height: u32, side_w: u32, side_h: u32) -> Rect {
     }
 }
 
-fn lapvar(stack: &TiffStack, rect: Rect, spp: u32) -> Option<f64> {
+fn lapvar(reader: &dyn TileReader, frame: usize, rect: Rect, spp: u32) -> Option<f64> {
     let mut samples = vec![0u16; rect.width as usize * rect.height as usize * spp as usize];
-    stack.read_tile_into(0, rect, &mut samples).ok()?;
+    reader.read_tile_into(frame, rect, &mut samples).ok()?;
     Some(crate::fuse::metrics::laplacian_variance(
         &samples,
         rect.width,
@@ -1045,76 +1042,22 @@ fn lapvar(stack: &TiffStack, rect: Rect, spp: u32) -> Option<f64> {
     ))
 }
 
-fn pipeline_byte_order_str(order: ByteOrder) -> &'static str {
-    match order {
-        ByteOrder::Little => "II",
-        ByteOrder::Big => "MM",
-    }
-}
-
-fn pipeline_describe_layout(h: &TiffHeader) -> String {
-    format!(
-        "{}/rps={}",
-        pipeline_byte_order_str(h.byte_order),
-        h.rows_per_strip
-    )
-}
-
-fn pipeline_describe_layout_diff(h: &TiffHeader, other: &TiffHeader) -> String {
-    let mut s = pipeline_describe_layout(h);
-    if h.compression != other.compression {
-        s.push_str(&format!("/compression={}", h.compression));
-    }
-    if h.width != other.width || h.height != other.height {
-        s.push_str(&format!("/{}x{}", h.width, h.height));
-    }
-    if h.bits_per_sample != other.bits_per_sample {
-        s.push_str(&format!("/bits={:?}", h.bits_per_sample));
-    }
-    if h.samples_per_pixel != other.samples_per_pixel {
-        s.push_str(&format!("/samples={}", h.samples_per_pixel));
-    }
-    if h.photometric != other.photometric {
-        s.push_str(&format!("/photometric={}", h.photometric));
-    }
-    if h.planar_config != other.planar_config {
-        s.push_str(&format!("/planar={}", h.planar_config));
-    }
-    s
-}
-
-/// Whether every header shares one layout (width, height, bit depth,
-/// samples per pixel, byte order, `RowsPerStrip`, compression, planar
-/// config, photometric interpretation), and if not, which file is the
-/// outlier against the majority layout. Ties among equally common layouts
-/// favor the most-recently-seen group.
-pub fn uniform_check(headers: &[(&str, &TiffHeader)]) -> (bool, Option<String>) {
-    type Signature = (u32, u32, Vec<u16>, u32, ByteOrder, u32, u16, u16, u16);
-    fn signature(h: &TiffHeader) -> Signature {
-        (
-            h.width,
-            h.height,
-            h.bits_per_sample.to_vec(),
-            h.samples_per_pixel,
-            h.byte_order,
-            h.rows_per_strip,
-            h.compression,
-            h.planar_config,
-            h.photometric,
-        )
-    }
-
-    if headers.len() < 2 {
+/// Compare reader-provided layout fragments and report the outlier against
+/// the majority. Ties favor the most-recently-seen group.
+pub fn uniform_check(frames: &[(&str, &FrameDesc)]) -> (bool, Option<String>) {
+    if frames.len() < 2 {
         return (true, None);
     }
 
-    let mut groups: Vec<(Signature, usize)> = Vec::new();
-    for (_, h) in headers {
-        let sig = signature(h);
-        if let Some(group) = groups.iter_mut().find(|(gs, _)| *gs == sig) {
+    let mut groups: Vec<(&Vec<String>, usize)> = Vec::new();
+    for (_, desc) in frames {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|(signature, _)| **signature == desc.layout_signature)
+        {
             group.1 += 1;
         } else {
-            groups.push((sig, 1));
+            groups.push((&desc.layout_signature, 1));
         }
     }
 
@@ -1122,28 +1065,34 @@ pub fn uniform_check(headers: &[(&str, &TiffHeader)]) -> (bool, Option<String>) 
         return (true, None);
     }
 
-    let mut majority = groups[0].clone();
+    let mut majority = groups[0];
     for group in groups.iter().skip(1) {
         if group.1 >= majority.1 {
-            majority = group.clone();
+            majority = *group;
         }
     }
     let majority_sig = majority.0;
 
-    let outlier = headers
+    let outlier = frames
         .iter()
-        .find(|(_, h)| signature(h) != majority_sig)
-        .expect("groups.len() > 1 implies at least one non-majority header");
-    let majority_header = headers
+        .find(|(_, desc)| &desc.layout_signature != majority_sig)
+        .expect("groups.len() > 1 implies at least one non-majority frame");
+    let majority_desc = frames
         .iter()
-        .find(|(_, h)| signature(h) == majority_sig)
-        .expect("majority signature came from one of these headers");
+        .find(|(_, desc)| &desc.layout_signature == majority_sig)
+        .expect("majority signature came from one of these frames");
+
+    let mut outlier_detail = outlier.1.layout_label.clone();
+    for i in 2..outlier.1.layout_signature.len() {
+        if outlier.1.layout_signature[i] != majority_desc.1.layout_signature[i] {
+            outlier_detail.push('/');
+            outlier_detail.push_str(&outlier.1.layout_signature[i]);
+        }
+    }
 
     let detail = format!(
         "{} is {}, others {}",
-        outlier.0,
-        pipeline_describe_layout_diff(outlier.1, majority_header.1),
-        pipeline_describe_layout(majority_header.1)
+        outlier.0, outlier_detail, majority_desc.1.layout_label
     );
     (false, Some(detail))
 }

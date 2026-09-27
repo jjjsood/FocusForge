@@ -66,6 +66,55 @@ pub enum TiffError {
     #[error("{}: {refusal}", path.display())]
     Unsupported { path: PathBuf, refusal: Refusal },
 
+    /// The file is valid TIFF but outside the decoded segment reader's class.
+    #[error("{}: {field}={value} is not supported by the decoded TIFF reader", path.display())]
+    UnsupportedDecoded {
+        path: PathBuf,
+        field: &'static str,
+        value: String,
+    },
+
+    /// Segment tables or geometry cannot describe image samples safely.
+    #[error("{}: invalid segment layout: {detail}", path.display())]
+    SegmentLayout { path: PathBuf, detail: &'static str },
+
+    /// The requested segment does not exist.
+    #[error("{}: segment {index} is outside the segment table ({count} entries)", path.display())]
+    SegmentIndex {
+        path: PathBuf,
+        index: usize,
+        count: usize,
+    },
+
+    /// A segment's stored bytes run past the provided file bytes.
+    #[error("{}: segment {index} runs past end of file", path.display())]
+    SegmentPastEof { path: PathBuf, index: usize },
+
+    /// A segment's compressed stream is incomplete or malformed.
+    #[error("{}: segment {index} has an invalid compressed stream", path.display())]
+    SegmentStream { path: PathBuf, index: usize },
+
+    /// A decoded segment has a byte length different from its stored geometry.
+    #[error("{}: segment {index} decoded {got} bytes, expected {expected}", path.display())]
+    SegmentLength {
+        path: PathBuf,
+        index: usize,
+        got: usize,
+        expected: usize,
+    },
+
+    /// The decoded-segment cache cannot retain even one segment.
+    #[error("{}: decoded cache bound {bound} bytes is below required segment size {required} bytes", path.display())]
+    DecodedCacheTooSmall {
+        path: PathBuf,
+        bound: u64,
+        required: u64,
+    },
+
+    /// The requested frame does not exist in this opened set.
+    #[error("frame {index} is outside the opened frame set ({count} frames)")]
+    FrameIndex { index: usize, count: usize },
+
     /// Magic 43: BigTIFF, which this reader never supports.
     #[error("{}: BigTIFF (magic 43) is not supported, only classic TIFF (magic 42)", path.display())]
     BigTiff { path: PathBuf },
