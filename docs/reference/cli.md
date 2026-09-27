@@ -71,8 +71,8 @@ in well under a second.
 - A file that parses but falls outside the fast read path (see
   [`tiff-fast-path.md`](tiff-fast-path.md)) is reported normally, with
   `mmap fast path: no` and the reason named — this is not an error. Supported
-  compressed or tiled 16-bit frames use DecodedTiffStack; other unsupported
-  values name a refusal and have no serving reader.
+  16-bit LZW-, Deflate-, or tiled frames remain available for stacking;
+  unsupported values name a refusal.
 
 ### Human output
 
@@ -193,11 +193,9 @@ projects for review; it does not write an image file — run
 out-of-core scheduler bounded by a fixed memory budget, so the command never
 needs to hold a whole stack — or a whole frame — in RAM.
 
-An all-mmap-compatible set uses TiffStack. A set containing supported
-compressed or tiled 16-bit frames uses DecodedTiffStack, including mixed
-uncompressed/compressed sets. The decoded cache receives one quarter of the
-capped host budget and the scheduler receives the remainder; mmap-only sets
-keep the whole scheduler budget.
+`stack` accepts mixed uncompressed, LZW-compressed, Deflate-compressed, and
+tiled 16-bit unsigned chunky TIFF frames. Unsupported layouts stop the run
+with the frame and field named.
 
 **Alignment runs first, by default.** Before fusion, `stack` computes each
 frame's transform against a reference frame (the same solver `align` drives

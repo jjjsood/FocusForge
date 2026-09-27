@@ -1,10 +1,10 @@
 # TIFF fast path
 
-FocusForge's TIFF reader is zero-decode: for a file with `Compression = 1`
+FocusForge's fast TIFF path is zero-decode: for a file with `Compression = 1`
 (uncompressed), every row's bytes sit at a file offset that is computable
 straight from the header, so a tile is sliced directly out of a memory
-mapping with no frame ever fully decoded. This page is the exact contract
-for what the reader accepts, what it refuses, and what the writer produces.
+mapping with no frame ever fully decoded. This page describes that fast path
+and the writer's output.
 
 ## What the reader accepts
 
@@ -24,10 +24,11 @@ height, so a directory that mixes an `II`/`RowsPerStrip=1` frame with an
 `MM`/`RowsPerStrip=8` frame reads both frames correctly.
 
 A file that fails any of the six conditions above is not treated as broken:
-it parsed fine, but falls outside this reader's supported format, and the
-reason is reported by name — `focusforge-cli info` shows it as
-`mmap fast path: no — <reason>` and the same reason is available as the
-`refusal` field in `info --json`.
+`focusforge-cli info` shows `mmap fast path: no — <reason>` and the same
+reason is available as the `refusal` field in `info --json`. A 16-bit
+unsigned chunky Classic TIFF with LZW or Deflate compression, or a tiled
+layout, is read through the compatible TIFF path instead. Other layouts are
+refused by name when a stack is opened.
 
 ## What opening a stack checks across frames
 
