@@ -3,10 +3,10 @@
 //! Failures a [`super::StackAlgorithm`] or [`super::AlignAlgorithm`] work
 //! method can return.
 //!
-//! Every variant names its offending value. `#[error(transparent)]` on the
-//! wrapped variants forwards `Display` and `source()` straight through, so
-//! a tile failure keeps the source error's own message -- which already
-//! names the file.
+//! Modelled on `crate::io::error`: every variant names its offending value.
+//! `#[error(transparent)]` on the wrapped variants forwards `Display` and
+//! `source()` straight through, so a tile failure keeps the source error's
+//! own message -- which already names the file.
 
 /// Everything that can go wrong running a [`super::StackAlgorithm::fuse`] or
 /// [`super::AlignAlgorithm::align_frame`] work method.
@@ -14,6 +14,10 @@
 #[non_exhaustive]
 pub enum AlgorithmError {
     /// A read through the context's pixel source failed.
+    #[error(transparent)]
+    Frame(#[from] crate::io::FrameError),
+
+    /// Writing a TIFF output file failed.
     #[error(transparent)]
     Tiff(#[from] crate::io::TiffError),
 

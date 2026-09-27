@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! The tiled warp exercised against `fixtures/mantis-512` and synthetic
-//! `Tile`s.
+//! `Tile`s. Opened the way `crates/core/tests/pyramid.rs` opens its
+//! fixture: `mod common;` plus `TiffStack::open(common::mantis_512_dir())`,
+//! never a relative literal.
 
 mod common;
 
@@ -360,7 +362,7 @@ fn warping_reader_clamps_at_the_frame_edge() {
 
     // Some destination pixels map past the right edge (source x = dst.x +
     // 500 >= width), so their samples are zero -- proving the clamp
-    // happened and no `AlgorithmError::Tiff(TiffError::OutOfBounds)` was
+    // happened and no `AlgorithmError::Frame(FrameError::Tiff(TiffError::OutOfBounds))` was
     // raised for the whole tile.
     assert!(
         got.contains(&0),

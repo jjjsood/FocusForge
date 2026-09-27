@@ -146,6 +146,31 @@ fn the_settings_section_accepts_input_map_and_diagnostics() {
     }
 }
 
+#[test]
+fn settings_section_reports_the_stable_backend_line_without_adapter_identity() {
+    if !common::has_display() {
+        println!("SKIP: window tests need DISPLAY or WAYLAND_DISPLAY");
+        return;
+    }
+    let output = common::gui_bin("diagnostics_backend_line")
+        .args(["--settings-section", "input-map", "--exit-after", "500"])
+        .output()
+        .expect("failed to run focusforge-gui");
+    assert!(
+        output.status.success(),
+        "the settings window must exit successfully, got {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "resolved backend: winit, renderer: renderer-femtovg-wgpu (wgpu 29.0.4)"
+    );
+    assert!(
+        !stdout.contains("adapter"),
+        "startup output must not guess an adapter: {stdout}"
+    );
+}
+
 /// The trace's closing bracket is written from the flush guard's
 /// destructor, so a run that ends before any window exists still has to
 /// unwind out of `main` for the file to be readable.
@@ -265,6 +290,36 @@ fn device_loss_ends_the_session_with_a_project_open() {
 #[test]
 fn device_loss_ends_the_session_with_no_project_open() {
     assert_device_loss_response(&[]);
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn device_loss_leaves_no_screenshot() {
+    if !common::has_display() {
+        println!("SKIP: window tests need DISPLAY or WAYLAND_DISPLAY");
+        return;
+    }
+    let mut cmd = common::gui_bin("diagnostics_device_loss_screenshot");
+    let data_dir = cmd
+        .get_envs()
+        .find(|(key, _)| *key == "FOCUSFORGE_DATA_DIR")
+        .and_then(|(_, value)| value)
+        .map(std::path::PathBuf::from)
+        .expect("gui_bin always sets FOCUSFORGE_DATA_DIR");
+    let screenshot = data_dir.join("after-loss.png");
+    let output = cmd
+        .env("FF_FORCE_DEVICE_LOST_MS", "1500")
+        .args(["--exit-after", "15000", "--screenshot"])
+        .arg(&screenshot)
+        .output()
+        .expect("failed to run focusforge-gui");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        !screenshot.exists(),
+        "a known device loss must leave no screenshot at {}",
+        screenshot.display()
+    );
 }
 
 /// A native crash fires no panic hook: the monitor process the GUI spawns

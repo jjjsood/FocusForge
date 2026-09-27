@@ -14,7 +14,7 @@ use focusforge_core::algorithm::{
 };
 use focusforge_core::align::warp::warp_from_tile;
 use focusforge_core::align::{EccLevelRecord, EccStatus, PyramidalEcc, Transform};
-use focusforge_core::io::{TiffError, TiffStack};
+use focusforge_core::io::{FrameError, TiffError, TiffStack};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::tile::{Rect, Tile};
 
@@ -92,7 +92,9 @@ fn cfg_for(ctx: &StackContext, mode: &str, max_iterations: i64) -> ParamValues {
     cfg
 }
 
-/// A synthetic in-memory `TileReader` over same-sized frames.
+/// A synthetic in-memory `TileReader` over same-sized frames -- mirrors
+/// `align_algorithm.rs`'s own `FramesReader` (private per test binary, so
+/// reimplemented here rather than shared).
 struct FramesReader {
     width: u32,
     height: u32,
@@ -115,10 +117,12 @@ impl TileReader for FramesReader {
         };
         let expected = rect.width as usize * rect.height as usize * self.spp as usize;
         if out.len() != expected {
-            return Err(AlgorithmError::Tiff(TiffError::BufferSize {
-                expected,
-                got: out.len(),
-            }));
+            return Err(AlgorithmError::Frame(FrameError::Tiff(
+                TiffError::BufferSize {
+                    expected,
+                    got: out.len(),
+                },
+            )));
         }
         let in_bounds = rect
             .x
@@ -129,11 +133,13 @@ impl TileReader for FramesReader {
                 .checked_add(rect.height)
                 .is_some_and(|yh| yh <= self.height);
         if !in_bounds {
-            return Err(AlgorithmError::Tiff(TiffError::OutOfBounds {
-                path: PathBuf::from("<memory>"),
-                requested: rect,
-                frame: (self.width, self.height),
-            }));
+            return Err(AlgorithmError::Frame(FrameError::Tiff(
+                TiffError::OutOfBounds {
+                    path: PathBuf::from("<memory>"),
+                    requested: rect,
+                    frame: (self.width, self.height),
+                },
+            )));
         }
         let stride = self.width as usize * self.spp as usize;
         let row_len = rect.width as usize * self.spp as usize;
@@ -147,7 +153,8 @@ impl TileReader for FramesReader {
     }
 }
 
-/// `reference` is frame 0, `moving` is frame 1.
+/// `reference` is frame 0, `moving` is frame 1 -- the same convention
+/// `align_algorithm.rs::two_frame_reader` uses.
 fn two_frame_reader(
     width: u32,
     height: u32,
