@@ -127,6 +127,7 @@ use crate::align::transform::Transform;
 use crate::align::warp::catmull_rom_weights;
 use crate::fuse::pyramid::Plane;
 use crate::tile::Rect;
+use crate::timing::{TimingCounter, mark_timing_saturated, record_timing};
 
 /// The two degree-of-freedom parameterizations [`solve_level`] supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,6 +349,60 @@ fn central_diff_gradient(template: &Plane, x: u32, y: u32) -> (f32, f32) {
 /// `(ī_r zero-mean vector, Gt, v = C^-1 Gt, num, ‖ī_r‖^2)`, the return shape
 /// [`compute_ir_stats`] and the loop's full-overlap cache share.
 type IrStats<const K: usize> = (Vec<f64>, [f64; K], [f64; K], f64, f64);
+
+struct TimingBytes {
+    counter: TimingCounter,
+    bytes: u64,
+    operations: u64,
+    saturated: bool,
+}
+
+impl TimingBytes {
+    fn new(counter: TimingCounter) -> Self {
+        Self {
+            counter,
+            bytes: 0,
+            operations: 0,
+            saturated: false,
+        }
+    }
+
+    fn add(&mut self, bytes: usize) {
+        if bytes != 0 {
+            self.bytes = match self.bytes.checked_add(bytes as u64) {
+                Some(total) => total,
+                None => {
+                    self.saturated = true;
+                    u64::MAX
+                }
+            };
+            self.operations = match self.operations.checked_add(1) {
+                Some(total) => total,
+                None => {
+                    self.saturated = true;
+                    u64::MAX
+                }
+            };
+        }
+    }
+}
+
+impl Drop for TimingBytes {
+    fn drop(&mut self) {
+        if self.saturated {
+            mark_timing_saturated();
+        }
+        if self.bytes != 0 {
+            record_timing(self.counter, self.bytes);
+            let operations = match self.counter {
+                TimingCounter::AllocationBytes => TimingCounter::AllocationOperations,
+                TimingCounter::CopyBytes => TimingCounter::CopyOperations,
+                _ => return,
+            };
+            record_timing(operations, self.operations);
+        }
+    }
+}
 
 /// Template-only precompute, cached once full overlap is first observed:
 /// `Gt`, `v = C^-1 Gt`, `num = ‖ī_r‖^2 - Gt^t v` and the zero-mean template
@@ -581,11 +636,16 @@ fn solve_level_generic<const K: usize>(
     mut trace: Option<&mut Vec<EccIteration>>,
 ) -> Result<EccResult, AlignError> {
     let region_pixel_count = region.width as usize * region.height as usize;
+    let mut allocated = TimingBytes::new(TimingCounter::AllocationBytes);
+    let mut copied = TimingBytes::new(TimingCounter::CopyBytes);
 
     // ---- template precompute, once, outside the loop -------------------
     let mut positions = Vec::with_capacity(region_pixel_count);
     let mut template_values = Vec::with_capacity(region_pixel_count);
     let mut g_rows: Vec<[f64; K]> = Vec::with_capacity(region_pixel_count);
+    allocated.add(positions.capacity() * std::mem::size_of::<(f64, f64)>());
+    allocated.add(template_values.capacity() * std::mem::size_of::<f32>());
+    allocated.add(g_rows.capacity() * std::mem::size_of::<[f64; K]>());
     for dy in 0..region.height {
         for dx in 0..region.width {
             let x = region.x + dx;
@@ -618,6 +678,8 @@ fn solve_level_generic<const K: usize>(
             r
         })
         .collect();
+    let centered_bytes = g_centered.capacity() * std::mem::size_of::<[f64; K]>();
+    allocated.add(centered_bytes);
 
     let mut c = [[0.0f64; K]; K];
     for row in &g_centered {
@@ -673,6 +735,8 @@ fn solve_level_generic<const K: usize>(
     for _ in 0..params.max_iterations {
         // ---- sample the moving plane at W(x) for every x in region -----
         let mut iw_value: Vec<Option<f32>> = Vec::with_capacity(region_pixel_count);
+        let sample_bytes = iw_value.capacity() * std::mem::size_of::<Option<f32>>();
+        allocated.add(sample_bytes);
         let mut valid_count = 0usize;
         for &(x, y) in &positions {
             let s = sample_plane(moving, &w, x, y);
@@ -696,7 +760,10 @@ fn solve_level_generic<const K: usize>(
         // ---- ī_r, Gt, v, num: cached under guaranteed full overlap ------
         let (ir_zero, gt, v, num, ir_ss) = if full {
             if let Some(c) = &cached {
-                (c.ir_zero.clone(), c.gt, c.v, c.num, c.ir_ss)
+                let cloned = c.ir_zero.clone();
+                allocated.add(cloned.capacity() * std::mem::size_of::<f64>());
+                copied.add(cloned.len() * std::mem::size_of::<f64>());
+                (cloned, c.gt, c.v, c.num, c.ir_ss)
             } else {
                 let computed = compute_ir_stats(&template_values, &g_centered, &iw_value, c);
                 let Some((ir_zero, gt, v, num, ir_ss)) = computed else {
@@ -706,8 +773,12 @@ fn solve_level_generic<const K: usize>(
                         valid_fraction
                     );
                 };
+                allocated.add(ir_zero.capacity() * std::mem::size_of::<f64>());
+                let cached_ir_zero = ir_zero.clone();
+                allocated.add(cached_ir_zero.capacity() * std::mem::size_of::<f64>());
+                copied.add(cached_ir_zero.len() * std::mem::size_of::<f64>());
                 cached = Some(CachedTemplate {
-                    ir_zero: ir_zero.clone(),
+                    ir_zero: cached_ir_zero,
                     gt,
                     v,
                     num,
@@ -724,6 +795,7 @@ fn solve_level_generic<const K: usize>(
                     valid_fraction
                 );
             };
+            allocated.add(result.0.capacity() * std::mem::size_of::<f64>());
             result
         };
 
@@ -735,6 +807,8 @@ fn solve_level_generic<const K: usize>(
         let iw_mean = iw_sum / valid_count as f64;
 
         let mut iw_zero = vec![0.0f64; region_pixel_count];
+        let zero_bytes = iw_zero.capacity() * std::mem::size_of::<f64>();
+        allocated.add(zero_bytes);
         for (n, s) in iw_value.iter().enumerate() {
             if let Some(v) = s {
                 iw_zero[n] = f64::from(*v) - iw_mean;
@@ -929,6 +1003,18 @@ fn compute_ir_stats<const K: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_aggregate_saturation_is_retained_for_the_summary() {
+        let mut allocations = TimingBytes::new(TimingCounter::AllocationBytes);
+        allocations.bytes = u64::MAX - 1;
+        allocations.operations = u64::MAX;
+        allocations.add(2);
+
+        assert_eq!(allocations.bytes, u64::MAX);
+        assert_eq!(allocations.operations, u64::MAX);
+        assert!(allocations.saturated);
+    }
 
     fn constant_template(width: u32, height: u32, value: f32) -> Plane {
         Plane::from_f32(

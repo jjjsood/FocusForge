@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use focusforge_core::timing::measurement_scope;
+
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
     DiagnosticsView, clamp_manifest_scroll, manifest_content_height, size_text,
@@ -1354,6 +1356,7 @@ impl AppController {
     /// Returns the worker's join handle; `None` when nothing started -- a
     /// load already in flight, or `paths` failed to classify.
     pub fn open_paths(&mut self, paths: &[PathBuf]) -> Option<std::thread::JoinHandle<()>> {
+        let _scope = measurement_scope("gui_open_paths");
         if self.state.load.in_flight {
             return None;
         }
@@ -1418,6 +1421,7 @@ impl AppController {
     /// / [`ShellEvent::EntryRefused`]. Clears the in-flight flag. `None` when
     /// nothing is parked (called with no load having settled).
     pub fn settle_open(&mut self) -> Option<OpenOutcome> {
+        let _scope = measurement_scope("gui_settle_open");
         let result = self
             .state
             .load
@@ -3686,6 +3690,7 @@ impl AppController {
         index: usize,
         pick: impl FnOnce(&Path) -> Option<PathBuf>,
     ) -> bool {
+        let _scope = measurement_scope("gui_save_project");
         let Some(tab) = self.state.projects.get(index) else {
             return false;
         };
@@ -3725,6 +3730,7 @@ impl AppController {
     /// active tab's own planes and answers `Load`, or `Clear` when it has
     /// none (no tab active, `+` selected, or nothing fused yet).
     pub fn canvas_feed(&mut self, loaded: Option<usize>) -> crate::canvas::CanvasFeed {
+        let _scope = measurement_scope("gui_canvas_feed");
         if loaded == self.state.active && !self.state.canvas_dirty {
             return crate::canvas::CanvasFeed::Keep;
         }

@@ -9,6 +9,8 @@
 
 use std::path::{Path, PathBuf};
 
+use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
+
 use focusforge_core::TiffError;
 use focusforge_core::display::zmap_index_scale;
 use focusforge_core::io::TiffStack;
@@ -58,8 +60,14 @@ impl PaneTexture {
         }
         let wanted = TextureSpec { width, height };
         if crate::canvas::needs_realloc(self.spec, wanted) {
-            let texture = DisplayTexture::new(device, width, height);
-            let imported = slint::Image::try_from(texture.texture().clone());
+            let texture = {
+                let _scope = measurement_scope("gui_display_texture_allocate");
+                DisplayTexture::new(device, width, height)
+            };
+            let imported = {
+                let _scope = measurement_scope("gui_display_texture_import");
+                slint::Image::try_from(texture.texture().clone())
+            };
             self.apply_import(imported, texture, wanted);
         }
         let Some(texture) = self.display_texture.as_ref() else {
@@ -378,6 +386,7 @@ impl CanvasRenderer {
     /// composite, or either read fails; `self.last_planes` stays untouched
     /// on that path so a later, valid rect still renders.
     pub fn redraw_planes(&mut self, draw: &PaneDraw) -> Option<(slint::Image, slint::Image)> {
+        let _scope = measurement_scope("gui_plane_redraw");
         let (device, queue) = self.device_queue()?;
         if self.composite.is_none() || self.zmap.is_none() {
             return None;
@@ -408,6 +417,10 @@ impl CanvasRenderer {
         let texels = tex_w as usize * tex_h as usize;
 
         let mut samples = vec![0u16; texels * samples_per_pixel as usize];
+        record_timing(
+            TimingCounter::SampleBytes,
+            samples.len().saturating_mul(std::mem::size_of::<u16>()) as u64,
+        );
         composite
             .read_tile_step_into(0, rect, draw.step, &mut samples)
             .ok()?;
@@ -422,6 +435,10 @@ impl CanvasRenderer {
         );
 
         let mut indices = vec![0u16; texels];
+        record_timing(
+            TimingCounter::SampleBytes,
+            indices.len().saturating_mul(std::mem::size_of::<u16>()) as u64,
+        );
         zmap.read_tile_step_into(rect, draw.step, &mut indices)
             .ok()?;
         self.zmap_pane
@@ -440,6 +457,7 @@ impl CanvasRenderer {
     /// uses, at an index scale of 0 -- a source frame carries no Z-Map
     /// indices.
     pub fn redraw_frame(&mut self, draw: &PaneDraw) -> Option<slint::Image> {
+        let _scope = measurement_scope("gui_frame_redraw");
         let (device, queue) = self.device_queue()?;
         let frame_size = self.frame.dimensions()?;
         let samples_per_pixel = self.frame.samples_per_pixel()?;
@@ -459,6 +477,10 @@ impl CanvasRenderer {
 
         let (tex_w, tex_h) = draw.extent();
         let mut samples = vec![0u16; tex_w as usize * tex_h as usize * samples_per_pixel as usize];
+        record_timing(
+            TimingCounter::SampleBytes,
+            samples.len().saturating_mul(std::mem::size_of::<u16>()) as u64,
+        );
         self.frame.read_into(rect, draw.step, &mut samples).ok()?;
         self.frame_pane.ensure_and_render(
             &device,

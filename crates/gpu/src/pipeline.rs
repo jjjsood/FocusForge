@@ -4,6 +4,8 @@
 //! `Pipeline` type, bind-group-layout-entry helpers, the pipeline builder,
 //! the dispatch-and-submit helpers and the uniform-buffer upload helper.
 
+use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
+
 /// One compute pipeline plus the bind group layout it was built with.
 pub(crate) struct Pipeline {
     compute: wgpu::ComputePipeline,
@@ -66,6 +68,7 @@ pub(crate) fn build_pipeline(
     entry_point: &str,
     bindings: &[wgpu::BindGroupLayoutEntry],
 ) -> Pipeline {
+    let _scope = measurement_scope("gpu_pipeline_create");
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(wgsl_src.into()),
@@ -87,6 +90,7 @@ pub(crate) fn build_pipeline(
         compilation_options: Default::default(),
         cache: None,
     });
+    record_timing(TimingCounter::PipelineCreations, 1);
     Pipeline {
         compute,
         bind_group_layout,
@@ -105,6 +109,7 @@ pub(crate) fn run_pass(
     invocation_count: u32,
     label: &str,
 ) {
+    let _scope = measurement_scope("gpu_cpu_submit");
     if invocation_count == 0 {
         return;
     }
@@ -131,6 +136,7 @@ pub(crate) fn run_pass_2d(
     height: u32,
     label: &str,
 ) {
+    let _scope = measurement_scope("gpu_cpu_submit_2d");
     if width == 0 || height == 0 {
         return;
     }
@@ -170,6 +176,7 @@ fn dispatch(
         pass.dispatch_workgroups(x, y, z);
     }
     queue.submit(Some(encoder.finish()));
+    record_timing(TimingCounter::CpuSubmissions, 1);
 }
 
 /// A uniform buffer of exactly `bytes.len()` bytes: `create_buffer` +
@@ -181,6 +188,7 @@ pub(crate) fn upload_params(
     queue: &wgpu::Queue,
     bytes: &[u8],
 ) -> wgpu::Buffer {
+    let _scope = measurement_scope("gpu_param_upload");
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("focusforge-gpu-params"),
         size: bytes.len() as u64,
@@ -188,5 +196,6 @@ pub(crate) fn upload_params(
         mapped_at_creation: false,
     });
     queue.write_buffer(&buffer, 0, bytes);
+    record_timing(TimingCounter::UploadBytes, bytes.len() as u64);
     buffer
 }

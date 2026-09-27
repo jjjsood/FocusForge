@@ -575,7 +575,9 @@ fn main() -> ExitCode {
     // installs the hook that reports it.
     focusforge_diagnostics::force_crash("startup");
 
-    run(&Args::parse())
+    let result = run(&Args::parse());
+    focusforge_gui::bridge::finish_input_trace();
+    result
 }
 
 /// Everything the arguments ask for, from the first refusal through the

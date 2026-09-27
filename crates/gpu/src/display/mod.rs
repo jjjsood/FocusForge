@@ -11,6 +11,8 @@
 pub mod readback;
 pub use readback::read_display_texture;
 
+use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
+
 use crate::pack::pack_samples;
 use crate::pipeline::{
     Pipeline, build_pipeline, run_pass_2d, storage_entry, storage_texture_entry, uniform_entry,
@@ -119,6 +121,10 @@ fn tonemap_pipeline(device: &wgpu::Device) -> Pipeline {
     )
 }
 
+fn packed_upload_bytes(packed: &[u8]) -> u64 {
+    packed.len() as u64
+}
+
 /// Runs the display kernel: packs `src`'s `u16` samples two-per-`u32`
 /// (`crate::pack::pack_samples`), uploads them as a storage buffer, and
 /// dispatches one invocation per pixel of `target`, writing straight into
@@ -135,10 +141,21 @@ pub fn render(
     samples_per_pixel: u32,
     index_scale: u32,
 ) {
-    let packed = pack_samples(src);
-    let src_buffer =
-        create_storage_buffer(device, packed.len() as u64, "focusforge-gpu-display-src");
-    queue.write_buffer(&src_buffer, 0, &packed);
+    let _scope = measurement_scope("gpu_display_render");
+    let packed = {
+        let _scope = measurement_scope("gpu_display_pack");
+        pack_samples(src)
+    };
+    let packed_bytes = packed_upload_bytes(&packed);
+    record_timing(TimingCounter::PackedBytes, packed_bytes);
+    let src_buffer = {
+        let _scope = measurement_scope("gpu_display_upload");
+        let buffer =
+            create_storage_buffer(device, packed.len() as u64, "focusforge-gpu-display-src");
+        queue.write_buffer(&buffer, 0, &packed);
+        buffer
+    };
+    record_timing(TimingCounter::UploadBytes, packed_bytes);
 
     let params = Params {
         width: target.width(),
@@ -175,4 +192,19 @@ pub fn render(
         target.height(),
         "focusforge-gpu-display-tonemap",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::packed_upload_bytes;
+    use crate::pack::pack_samples;
+
+    #[test]
+    fn packed_source_byte_count_is_the_upload_byte_count_for_even_and_odd_samples() {
+        for (samples, expected) in [(&[1_u16, 2, 3, 4][..], 8), (&[1_u16, 2, 3, 4, 5][..], 12)] {
+            let packed = pack_samples(samples);
+            assert_eq!(packed.len(), expected);
+            assert_eq!(packed_upload_bytes(&packed), expected as u64);
+        }
+    }
 }

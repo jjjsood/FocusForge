@@ -9,6 +9,7 @@ use flate2::{Decompress, FlushDecompress, Status};
 use weezl::{BitOrder, LzwStatus, decode::Decoder};
 
 use crate::io::error::TiffError;
+use crate::timing::measurement_scope;
 
 use super::header::{ByteOrder, TiffHeader};
 
@@ -228,6 +229,7 @@ pub(crate) fn decode_segment(
     info: SegmentInfo,
     index: usize,
 ) -> Result<DecodedSegment, TiffError> {
+    let _scope = measurement_scope("tiff_segment_decode");
     let start = usize::try_from(info.offset).map_err(|_| TiffError::SegmentPastEof {
         path: header.path.clone(),
         index,

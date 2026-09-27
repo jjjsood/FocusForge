@@ -8,6 +8,7 @@ use crate::algorithm::{AlgorithmError, TileReader};
 use crate::align::Transform;
 use crate::align::warp::warp_tile;
 use crate::tile::Rect;
+use crate::timing::{TimingCounter, measurement_scope, record_timing};
 
 /// Warps every read through `inner` by a per-frame [`Transform`]
 /// (reference coordinates in, `inner`'s own frame coordinates out). Index
@@ -53,6 +54,7 @@ impl TileReader for WarpingReader<'_> {
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), AlgorithmError> {
+        let _scope = measurement_scope("warp_read");
         let t = self
             .transforms
             .get(frame)
@@ -97,6 +99,10 @@ impl TileReader for WarpingReader<'_> {
             });
         }
         out.copy_from_slice(&warped.tile.samples);
+        let bytes = std::mem::size_of_val(out) as u64;
+        record_timing(TimingCounter::WarpBytes, bytes);
+        record_timing(TimingCounter::CopyBytes, bytes);
+        record_timing(TimingCounter::CopyOperations, 1);
         Ok(())
     }
 }

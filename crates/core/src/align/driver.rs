@@ -49,6 +49,7 @@ use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, AlignStatus
 use crate::align::Transform;
 use crate::params::{ParamValue, ParamValues, StackContext};
 use crate::tile::plan::DEFAULT_TILE_SIZE;
+use crate::timing::{TimingCounter, measurement_scope, observe_timing_max, record_timing};
 
 /// Whether every frame registers against one anchor frame, or chains
 /// hop-by-hop through its neighbours toward the reference.
@@ -422,6 +423,11 @@ pub fn align_stack_with(
     let reference = reference_index(reference_frame_from_cfg(cfg), stack.frame_count);
 
     let mut frames: Vec<Option<FrameAlignment>> = vec![None; stack.frame_count];
+    let frame_bytes = frames.capacity() * std::mem::size_of::<Option<FrameAlignment>>();
+    if frame_bytes != 0 {
+        record_timing(TimingCounter::AllocationBytes, frame_bytes as u64);
+        record_timing(TimingCounter::AllocationOperations, 1);
+    }
     frames[reference] = Some(identity_alignment(reference));
 
     let (worker_limit, peak_workers) = match policy {
@@ -446,7 +452,10 @@ pub fn align_stack_with(
             // `Arc` binding lives in this stack frame and drops when this
             // function returns.
             let ctx = AlignContext::new(stack, reference, reader);
-            let prepared = algorithm.prepare_run(&ctx, cfg)?;
+            let prepared = {
+                let _prepare = measurement_scope("align_prepare");
+                algorithm.prepare_run(&ctx, cfg)?
+            };
             let ctx = ctx.with_prepared(prepared.as_deref());
             credit_frame_done(options.frames_done.as_deref());
 
@@ -457,6 +466,7 @@ pub fn align_stack_with(
                     if i == reference {
                         continue;
                     }
+                    let _solve = measurement_scope("align_solve");
                     let outcome = algorithm.align_frame(&ctx, i, cfg)?;
                     *slot = Some(anchored_alignment(i, outcome, failure));
                     credit_frame_done(options.frames_done.as_deref());
@@ -499,6 +509,7 @@ pub fn align_stack_with(
                                 let _frame = frame_span.enter();
                                 let cur = live.fetch_add(1, Ordering::SeqCst) + 1;
                                 peak.fetch_max(cur, Ordering::SeqCst);
+                                let _solve = measurement_scope("align_solve");
                                 let result = algorithm
                                     .align_frame(&ctx, i, cfg)
                                     .map(|outcome| anchored_alignment(i, outcome, failure));
@@ -551,6 +562,9 @@ pub fn align_stack_with(
         .enumerate()
         .map(|(i, f)| f.unwrap_or_else(|| panic!("frame {i} was never visited by align_stack")))
         .collect();
+
+    observe_timing_max(TimingCounter::WorkerLimit, worker_limit as u64);
+    observe_timing_max(TimingCounter::PeakWorkers, peak_workers as u64);
 
     Ok(AlignRun {
         alignment: StackAlignment {

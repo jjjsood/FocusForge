@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use focusforge_core::io::capture_time;
+use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
 use focusforge_core::zmap::source_color;
 
 /// A row's fixed height, top to top of the next row.
@@ -48,6 +49,7 @@ pub struct ImagesModel {
 /// read as "not excluded" for the missing tail -- a tab always keeps the two
 /// in lockstep, but a row builder should not panic on an untrusted slice.
 fn build_rows(frames: &[PathBuf], excluded: &[bool], selected: Option<usize>) -> Vec<ImageRow> {
+    let _scope = measurement_scope("gui_image_metadata");
     let total = frames.len().max(1) as u32;
     frames
         .iter()
@@ -57,6 +59,7 @@ fn build_rows(frames: &[PathBuf], excluded: &[bool], selected: Option<usize>) ->
             let time_text = if unresolved {
                 String::new()
             } else {
+                record_timing(TimingCounter::MetadataReads, 1);
                 capture_time(path)
                     .map(|t| time_of_day(&t.text))
                     .unwrap_or_default()

@@ -81,6 +81,7 @@ use crate::tile::plan::{DEFAULT_TILE_SIZE, PlannedTile, TilePlan};
 use crate::tile::preprocess::FramePreprocess;
 use crate::tile::scratch::ScratchDir;
 use crate::tile::{Tile, TileError};
+use crate::timing::{TimingCounter, measurement_scope, record_timing};
 
 /// The default pyramid depth: **5, a default, never a cap**. `levels` stays
 /// a live parameter -- a caller (`ParamDesc`, or a direct
@@ -522,6 +523,7 @@ impl<'a> TileScheduler<'a> {
                         rect = ?planned.interior()
                     );
                     let _tile = tile_span.enter();
+                    let _tile_total = measurement_scope("fusion_tile");
 
                     let cur = live.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(cur, Ordering::SeqCst);
@@ -531,6 +533,7 @@ impl<'a> TileScheduler<'a> {
 
                         if supplies_own_pixels {
                             let job = TileJob::without_frame_tiles(planned, &scratch_path);
+                            let _consume = measurement_scope("fusion_consume");
                             return consumer
                                 .consume(&job)
                                 .map_err(|source| TileError::Consumer {
@@ -544,7 +547,15 @@ impl<'a> TileScheduler<'a> {
 
                         for (frame, tile) in buf.iter_mut().enumerate() {
                             tile.rect = read_rect;
+                            let capacity = tile.samples.capacity();
                             tile.samples.resize(len, 0);
+                            if tile.samples.capacity() > capacity {
+                                record_timing(
+                                    TimingCounter::AllocationBytes,
+                                    (tile.samples.capacity() * std::mem::size_of::<u16>()) as u64,
+                                );
+                                record_timing(TimingCounter::AllocationOperations, 1);
+                            }
                             reader
                                 .read_tile_into(frame, read_rect, &mut tile.samples)
                                 .map_err(|source| TileError::Read {
@@ -571,6 +582,7 @@ impl<'a> TileScheduler<'a> {
 
                         let ctx = TileCtx::new(read_rect, buf);
                         let job = TileJob::new(planned, ctx, &scratch_path);
+                        let _consume = measurement_scope("fusion_consume");
                         consumer
                             .consume(&job)
                             .map_err(|source| TileError::Consumer {

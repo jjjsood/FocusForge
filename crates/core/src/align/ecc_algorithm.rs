@@ -43,6 +43,7 @@ use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, 
 use crate::registry::AlignRegistration;
 use crate::tile::plan::{DEFAULT_TILE_SIZE, MAX_LEVELS};
 use crate::tile::{Rect, Tile};
+use crate::timing::{TimingCounter, measurement_scope, record_timing};
 
 /// Solver-robustness threshold, not a user setting -- the same class as
 /// `crate::align`'s own `PIVOT_EPS` and `CORRELATION_SLACK`. `0.75` keeps
@@ -289,6 +290,7 @@ impl PyramidalEcc {
         frame: usize,
         depth: u32,
     ) -> Result<AlignPyramid, AlgorithmError> {
+        let _scope = measurement_scope("pyramid_prepare");
         let stack = ctx.stack();
         let (width, height, spp) = (stack.width, stack.height, stack.samples_per_pixel);
         let mut assembler = LumaAssembler::new(width, height);
@@ -304,6 +306,11 @@ impl PyramidalEcc {
             };
             let needed = width as usize * band_height as usize * spp as usize;
             let mut band = vec![0u16; needed];
+            let band_bytes = band.capacity() * std::mem::size_of::<u16>();
+            if band_bytes != 0 {
+                record_timing(TimingCounter::AllocationBytes, band_bytes as u64);
+                record_timing(TimingCounter::AllocationOperations, 1);
+            }
             ctx.read_tile_into(frame, rect, &mut band)?;
             let tile = Tile {
                 rect,
@@ -418,6 +425,7 @@ impl PyramidalEcc {
         let mut final_status = AlignStatus::Converged;
         let mut final_residual = 1.0f64;
 
+        let _scope = measurement_scope("ecc_solve");
         for k in (0..=depth).rev() {
             let level_ref = reference_pyramid.level(k as usize);
             let level_frame = frame_pyramid.level(k as usize);
