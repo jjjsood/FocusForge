@@ -562,8 +562,12 @@ fn start_job_timer(
         if settled.is_some() {
             push_projects(&app, &controller);
             repaint(&app, &controller, &canvas);
-        } else if let Some(message) = controller.lock().unwrap().take_settled_failure() {
-            open_job_toast(&app, message, &toast_timer);
+        } else if let Some(notification) = controller.lock().unwrap().take_settled_failure() {
+            open_job_toast(
+                &app,
+                notification.operation.summary().to_string(),
+                &toast_timer,
+            );
         }
         let view = controller.lock().unwrap().job_view();
         let live = controller.lock().unwrap().work_pending();
@@ -974,9 +978,13 @@ fn save_project(
     let Some(app) = app_weak.upgrade() else {
         return;
     };
-    if let Some(message) = failure {
+    if let Some(notification) = failure {
         controller.lock().unwrap().close_projects_overlay();
-        open_job_toast(&app, message, toast_timer);
+        open_job_toast(
+            &app,
+            notification.operation.summary().to_string(),
+            toast_timer,
+        );
     }
     push_projects(&app, controller);
     repaint(&app, controller, canvas);

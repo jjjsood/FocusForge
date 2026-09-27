@@ -556,6 +556,98 @@ fn failure_is_reported_and_retryable() {
     }
 }
 
+/// The failure toast's short summary follows the error's typed variant, not
+/// which `JobStage` the control happened to read: setup (a corrupted
+/// frame), alignment (the solver singular) and fusion (a scratch root that
+/// cannot stage) each append a notification naming the operation that
+/// actually failed, with the tab's own full message unchanged inside it.
+#[test]
+fn failure_summary_names_the_failed_operation() {
+    let alignment_operation;
+    let alignment_summary;
+    {
+        let mut controller = controller_with_unalignable_frames("summary_align");
+        assert!(controller.start_fuse());
+        common::wait_for_settle(&mut controller, Duration::from_secs(60));
+        let message = controller
+            .job_failure_message()
+            .expect("an unalignable stack must fail")
+            .to_string();
+        let notification = controller
+            .notifications()
+            .last()
+            .expect("the failed run must append a notification");
+        assert_eq!(notification.message, message);
+        alignment_operation = notification.operation;
+        alignment_summary = notification.operation.summary();
+        assert_eq!(alignment_operation, job::FailedOperation::Alignment);
+    }
+
+    let setup_operation;
+    let setup_summary;
+    {
+        let root = common::tree("summary_setup_frames");
+        copy_frame(&root, "00.tif", 0);
+        copy_frame(&root, "01.tif", 1);
+        let mut controller = AppController::new();
+        assert!(matches!(
+            common::open_and_settle(&mut controller, std::slice::from_ref(&root)),
+            OpenOutcome::Opened(_)
+        ));
+        controller.set_scratch_root_for_test(common::tree("summary_setup_scratch"));
+        // Still a file, so the missing-frame refusal never fires -- the
+        // failure has to come from actually opening it.
+        std::fs::write(root.join("01.tif"), b"not a tiff any more").unwrap();
+        assert!(controller.start_fuse());
+        common::wait_for_settle(&mut controller, Duration::from_secs(60));
+        let message = controller
+            .job_failure_message()
+            .expect("a corrupted frame must fail the run")
+            .to_string();
+        let notification = controller
+            .notifications()
+            .last()
+            .expect("the failed run must append a notification");
+        assert_eq!(notification.message, message);
+        setup_operation = notification.operation;
+        setup_summary = notification.operation.summary();
+        assert_eq!(setup_operation, job::FailedOperation::Setup);
+    }
+
+    let fusion_operation;
+    let fusion_summary;
+    {
+        let mut controller = controller_with_frames("summary_fusion", 2);
+        let scratch_parent = common::tree("summary_fusion_scratch");
+        let scratch_root = scratch_parent.join("as-file");
+        std::fs::write(&scratch_root, b"not a directory").unwrap();
+        controller.set_scratch_root_for_test(scratch_root);
+        assert!(controller.start_fuse());
+        common::wait_for_settle(&mut controller, Duration::from_secs(60));
+        let message = controller
+            .job_failure_message()
+            .expect("a scratch root that is a file must fail staging")
+            .to_string();
+        let notification = controller
+            .notifications()
+            .last()
+            .expect("the failed run must append a notification");
+        assert_eq!(notification.message, message);
+        fusion_operation = notification.operation;
+        fusion_summary = notification.operation.summary();
+        assert_eq!(fusion_operation, job::FailedOperation::Fusion);
+    }
+
+    let mut summaries = vec![alignment_summary, setup_summary, fusion_summary];
+    summaries.sort_unstable();
+    summaries.dedup();
+    assert_eq!(
+        summaries.len(),
+        3,
+        "the three summaries must be pairwise distinct"
+    );
+}
+
 #[test]
 fn the_failure_message_names_the_frame_and_the_reason() {
     let mut controller = controller_with_unalignable_frames("message");
@@ -1331,6 +1423,82 @@ fn two_failures_keep_their_own_messages_and_requests() {
         job::RunState::Failed(message_a),
         "tab A's own failure must survive tab B's retry"
     );
+}
+
+/// Notification records outlive the single-slot toast they came from: a
+/// second failure replaces the first, still-unread toast, a retry appends
+/// its own record, and switching tabs afterwards drops nothing. Every
+/// record keeps its own tab's title, path and full message.
+#[test]
+fn failure_notifications_outlive_the_toast() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree("outlive_scratch"));
+
+    add_unalignable_tab(&mut controller, "outlive_a", 2);
+    let title_a = controller.project_tabs()[0].title.clone();
+    let path_a = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("outlive_a_frames");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    let message_a = controller
+        .job_failure_message()
+        .expect("tab A must fail")
+        .to_string();
+
+    add_unalignable_tab(&mut controller, "outlive_b", 3);
+    let title_b = controller.project_tabs()[1].title.clone();
+    let path_b = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("outlive_b_frames");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    let message_b = controller
+        .job_failure_message()
+        .expect("tab B must fail")
+        .to_string();
+
+    // The second failure replaces the first, still-unread toast slot.
+    let taken = controller
+        .take_settled_failure()
+        .expect("the most recent failure must still be pending");
+    assert_eq!(taken.message, message_b);
+    assert!(
+        controller.take_settled_failure().is_none(),
+        "a taken failure does not reappear"
+    );
+
+    assert!(
+        controller.retry_fuse(),
+        "retry on the active tab must start a run"
+    );
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    let retry_message = controller
+        .job_failure_message()
+        .expect("the retried tab must fail the same way")
+        .to_string();
+
+    controller.select_project(0);
+
+    let notifications = controller.notifications();
+    assert_eq!(
+        notifications.len(),
+        3,
+        "every failure must be recorded, in order"
+    );
+
+    assert_eq!(notifications[0].message, message_a);
+    assert_eq!(notifications[0].operation, job::FailedOperation::Alignment);
+    assert_eq!(notifications[0].project_title, Some(title_a));
+    assert_eq!(notifications[0].project_path, Some(path_a));
+    assert_eq!(notifications[0].target, None);
+
+    for (notification, message) in [
+        (&notifications[1], &message_b),
+        (&notifications[2], &retry_message),
+    ] {
+        assert_eq!(notification.message, *message);
+        assert_eq!(notification.operation, job::FailedOperation::Alignment);
+        assert_eq!(notification.project_title, Some(title_b.clone()));
+        assert_eq!(notification.project_path, Some(path_b.clone()));
+        assert_eq!(notification.target, None);
+    }
 }
 
 #[test]
@@ -2441,6 +2609,10 @@ fn a_failed_save_keeps_the_project_in_memory() {
         controller.take_settled_failure().is_none(),
         "a cancelled dialog is not a failure"
     );
+    assert!(
+        controller.notifications().is_empty(),
+        "a cancelled dialog appends no record"
+    );
     still_in_memory(&mut controller);
 
     let empty = common::tree("failed_save_read_only_empty");
@@ -2451,11 +2623,22 @@ fn a_failed_save_keeps_the_project_in_memory() {
     set_read_only(&empty, false);
     assert!(!saved);
     assert!(left.is_empty(), "nothing was left behind: {left:?}");
-    let message = controller
+    let notification = controller
         .take_settled_failure()
         .expect("a failed save says why");
-    assert!(message.contains(&target.display().to_string()), "{message}");
-    assert!(message.contains("Permission denied"), "{message}");
+    assert_eq!(notification.operation, job::FailedOperation::Save);
+    assert_eq!(notification.target, Some(target.clone()));
+    assert!(
+        notification.message.contains(&target.display().to_string()),
+        "{}",
+        notification.message
+    );
+    assert!(
+        notification.message.contains("Permission denied"),
+        "{}",
+        notification.message
+    );
+    assert_eq!(controller.notifications().len(), 1);
     still_in_memory(&mut controller);
 
     let holding = common::tree("failed_save_read_only_existing");
@@ -2468,13 +2651,19 @@ fn a_failed_save_keeps_the_project_in_memory() {
     assert!(!saved);
     assert_eq!(left, [PathBuf::from("existing.ffp")]);
     assert_eq!(std::fs::read(&existing).unwrap(), b"an earlier project");
-    let message = controller
+    let notification = controller
         .take_settled_failure()
         .expect("a failed save says why");
+    assert_eq!(notification.operation, job::FailedOperation::Save);
+    assert_eq!(notification.target, Some(existing.clone()));
     assert!(
-        message.contains(&existing.display().to_string()),
-        "{message}"
+        notification
+            .message
+            .contains(&existing.display().to_string()),
+        "{}",
+        notification.message
     );
+    assert_eq!(controller.notifications().len(), 2);
     still_in_memory(&mut controller);
 }
 

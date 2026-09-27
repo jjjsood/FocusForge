@@ -27,6 +27,58 @@ pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 pub use focusforge_core::project::HeldCheckpoint;
 
+/// Which operation a failure belongs to, classified from the typed
+/// [`PipelineError`] variant rather than from [`JobStage`] or the message
+/// text: the control still reads [`JobStage::Align`] well past the align
+/// stage itself (crop, staging, the resume ledger and fusion-consumer
+/// creation all run under it too), and a raw error string is never parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedOperation {
+    /// The frames could not be opened, or the run's settings were rejected,
+    /// before any align or fuse work started.
+    Setup,
+    Alignment,
+    Fusion,
+    Save,
+}
+
+impl FailedOperation {
+    /// The failure toast's own short summary -- never the full error text.
+    pub fn summary(self) -> &'static str {
+        match self {
+            FailedOperation::Setup => "Setup failed",
+            FailedOperation::Alignment => "Alignment failed",
+            FailedOperation::Fusion => "Fusion failed",
+            FailedOperation::Save => "Save failed",
+        }
+    }
+}
+
+impl From<&PipelineError> for FailedOperation {
+    fn from(err: &PipelineError) -> Self {
+        match err {
+            PipelineError::Input(_) | PipelineError::Params(_) => FailedOperation::Setup,
+            PipelineError::Align(_) => FailedOperation::Alignment,
+            _ => FailedOperation::Fusion,
+        }
+    }
+}
+
+/// One failure's durable record: the complete text a toast never shows in
+/// full, plus the context to identify which project and (for a save) which
+/// target it belongs to. Appended, never edited or removed, so a later
+/// failure, a retry or a tab switch never drops what an earlier one
+/// recorded.
+#[derive(Debug, Clone)]
+pub struct Notification {
+    pub operation: FailedOperation,
+    pub message: String,
+    pub project_title: Option<String>,
+    pub project_path: Option<PathBuf>,
+    /// The save target, `None` for a run failure.
+    pub target: Option<PathBuf>,
+}
+
 /// The shell's own view of a fuse run -- the surface's six reachable
 /// states.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -431,9 +483,11 @@ pub fn save_held(
 
 /// One completed worker thread's result, boiled down to the shell's next
 /// [`RunState`] and, on a genuine completion, the checkpoint the run holds.
+/// `operation` is `Some` exactly when `state` is [`RunState::Failed`].
 pub struct Settled {
     pub state: RunState,
     pub held: Option<HeldCheckpoint>,
+    pub operation: Option<FailedOperation>,
 }
 
 /// Interprets a joined worker thread's result -- a panic and a pipeline
@@ -452,19 +506,26 @@ pub fn settle(result: std::thread::Result<Result<FuseOutcome, PipelineError>>) -
                     at: format_utc_hhmm(held.created_at),
                 },
                 held: Some(held),
+                operation: None,
             }
         }
         Ok(Ok(FuseOutcome::Cancelled { .. })) => Settled {
             state: RunState::Idle,
             held: None,
+            operation: None,
         },
-        Ok(Err(err)) => Settled {
-            state: RunState::Failed(err.to_string()),
-            held: None,
-        },
+        Ok(Err(err)) => {
+            let operation = FailedOperation::from(&err);
+            Settled {
+                state: RunState::Failed(err.to_string()),
+                held: None,
+                operation: Some(operation),
+            }
+        }
         Err(_) => Settled {
             state: RunState::Failed("the fuse worker stopped unexpectedly".to_string()),
             held: None,
+            operation: Some(FailedOperation::Fusion),
         },
     }
 }

@@ -699,11 +699,15 @@ pub struct AppController {
     /// live under whatever directory the test handed in, so a test run never
     /// depends on -- or collides with -- a shared directory.
     scratch_root_for_test: Option<PathBuf>,
-    /// The most recent run's own failure message, taken exactly once by
+    /// The most recent run or save failure, taken exactly once by
     /// [`Self::take_settled_failure`] -- what lets the failure toast
     /// announce the run that actually failed without reopening itself on
     /// every later poll.
-    settled_failure: Option<String>,
+    settled_failure: Option<job::Notification>,
+    /// Every run and save failure since the window opened, oldest first --
+    /// append-only, so a later failure replacing the toast's own slot, a
+    /// retry or a tab switch never drops what an earlier one recorded.
+    notifications: Vec<job::Notification>,
     /// The last id handed to a [`ProjectTab`] -- incremented before each
     /// use, so ids start at 1 and no two tabs ever share one.
     next_tab_id: u64,
@@ -3443,12 +3447,18 @@ impl AppController {
         }
     }
 
-    /// The most recent run's own failure message, taken exactly once --
-    /// `None` once already read, or with no failure to announce. What the
-    /// failure toast names, so it fires only for the run that actually
-    /// failed and never re-opens on a later poll.
-    pub fn take_settled_failure(&mut self) -> Option<String> {
+    /// The most recent run or save failure, taken exactly once -- `None`
+    /// once already read, or with no failure to announce. What the failure
+    /// toast names, so it fires only for the run that actually failed and
+    /// never re-opens on a later poll.
+    pub fn take_settled_failure(&mut self) -> Option<job::Notification> {
         self.settled_failure.take()
+    }
+
+    /// Every run and save failure since the window opened, oldest first,
+    /// kept after its toast has been dismissed.
+    pub fn notifications(&self) -> &[job::Notification] {
+        &self.notifications
     }
 
     /// The toolbar/bottom-bar surfaces' current view of the active tab's
@@ -3550,7 +3560,18 @@ impl AppController {
 
         match &settled.state {
             job::RunState::Failed(message) => {
-                self.settled_failure = Some(message.clone());
+                let operation = settled
+                    .operation
+                    .expect("settle() sets operation exactly when state is Failed");
+                let notification = job::Notification {
+                    operation,
+                    message: message.clone(),
+                    project_title: tab_info.as_ref().map(|(_, title)| title.clone()),
+                    project_path: tab_info.as_ref().map(|(path, _)| path.clone()),
+                    target: None,
+                };
+                self.notifications.push(notification.clone());
+                self.settled_failure = Some(notification);
                 if let Some((path, title)) = tab_info.clone() {
                     self.record_failure(FailureCard {
                         kind: FailureKind::Failed,
@@ -3704,7 +3725,15 @@ impl AppController {
         let project = match job::save_held(&target, &tab.held, onto_existing) {
             Ok(project) => project,
             Err(err) => {
-                self.settled_failure = Some(format!("Could not save {}: {err}", target.display()));
+                let notification = job::Notification {
+                    operation: job::FailedOperation::Save,
+                    message: format!("Could not save {}: {err}", target.display()),
+                    project_title: Some(tab.title.clone()),
+                    project_path: Some(project_identity_path(&tab.project)),
+                    target: Some(target.clone()),
+                };
+                self.notifications.push(notification.clone());
+                self.settled_failure = Some(notification);
                 return false;
             }
         };

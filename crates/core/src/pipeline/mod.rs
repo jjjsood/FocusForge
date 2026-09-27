@@ -406,7 +406,7 @@ pub fn run(
                         unit_total: 0,
                     });
                 }
-                let solved = solved?;
+                let solved = solved.map_err(|err| PipelineError::Align(err.to_string()))?;
                 align_workers = Some(solved.worker_limit);
                 peak_align_workers = Some(solved.peak_workers);
                 let alignment = solved.alignment;
