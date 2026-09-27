@@ -318,6 +318,100 @@ fn violation_text_drops_the_id_prefix() {
     assert!(!text.contains("pyramid-depth"), "got: {text}");
 }
 
+/// Each picker's selected id, `(fuse, align)`.
+fn picked_ids(controller: &AppController) -> (String, String) {
+    let panel = controller.settings_panel();
+    let picked = |section: &str| {
+        panel
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Picker && r.section == section)
+            .unwrap_or_else(|| panic!("no {section} picker row"))
+            .selected
+            .clone()
+    };
+    (picked("fuse"), picked("align"))
+}
+
+/// A sealed project recorded with no `align` and fused by `algorithm`.
+fn seal_without_align(name: &str, algorithm: &str) -> PathBuf {
+    use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
+    use focusforge_core::params::ParamValues;
+    use focusforge_core::project::{Metrics, SealRequest, seal};
+    use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+
+    let dir = common::tree(name);
+    let composite = dir.join("composite.tif");
+    let zmap = dir.join("zmap.tif");
+    let full = Rect {
+        x: 0,
+        y: 0,
+        width: 4,
+        height: 4,
+    };
+    let mut writer = TiffWriter::create(
+        &composite,
+        TiffSpec {
+            width: 4,
+            height: 4,
+            samples_per_pixel: 3,
+            description: Some("staged".to_string()),
+        },
+    )
+    .unwrap();
+    writer.write_tile(full, &[0u16; 4 * 4 * 3]).unwrap();
+    writer.finish().unwrap();
+    let mut map = ZMapWriter::create(&zmap, ZMapInfo::new(4, 4, 1).unwrap()).unwrap();
+    map.write_tile(full, &[0u16; 4 * 4]).unwrap();
+    map.finish().unwrap();
+    let project_path = dir.join("test.ffp");
+    seal(SealRequest {
+        project_path: &project_path,
+        staged_composite: &composite,
+        staged_zmap: &zmap,
+        sources: &[],
+        algorithm,
+        params: &ParamValues::new(),
+        align: None,
+        composite_description: "staged".to_string(),
+        label: None,
+        metrics: Metrics::default(),
+    })
+    .unwrap();
+    project_path
+}
+
+#[test]
+fn seeded_ids_are_never_test_only() {
+    let is_test_only = |id: &str| {
+        registry::find(id)
+            .unwrap_or_else(|e| panic!("seeded id {id:?} must resolve: {e}"))
+            .test_only()
+    };
+
+    let mut unsaved = AppController::new();
+    open_mantis_512(&mut unsaved);
+    let (fuse, align) = picked_ids(&unsaved);
+    assert!(!is_test_only(&fuse), "new tab seeded {fuse}");
+    assert!(!is_test_only(&align), "new tab seeded {align}");
+
+    let mut opened = AppController::new();
+    let project = seal_without_align("seeded_ids_no_align", "laplacian");
+    assert!(matches!(
+        common::open_and_settle(&mut opened, &[project]),
+        OpenOutcome::Opened(_)
+    ));
+    let (fuse, align) = picked_ids(&opened);
+    assert_eq!(
+        fuse, "laplacian",
+        "a manifest's own fuse id is kept verbatim"
+    );
+    assert!(
+        !is_test_only(&align),
+        "a manifest without align seeded {align}"
+    );
+}
+
 #[test]
 fn pickers_list_the_registry() {
     let mut controller = AppController::new();

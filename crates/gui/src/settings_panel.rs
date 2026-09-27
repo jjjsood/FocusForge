@@ -35,8 +35,8 @@ pub(crate) struct ActiveTabParams<'a> {
 }
 
 /// The Fuse/Align algorithm ids and explicit values a newly created tab
-/// starts with: the first id-sorted registry entry of each family with no
-/// explicit values for an unsaved project, or the sealed manifest's own
+/// starts with: each family's registry default with no explicit values for
+/// an unsaved project, or the sealed manifest's own
 /// algorithm/params for a reopened one -- every key on a reopened project
 /// therefore resolves `Explicit`, never `Default`. A manifest recorded with no
 /// `align` (a `--no-align` run) falls back to the same registry seeding an
@@ -67,21 +67,17 @@ pub(crate) fn seed_algorithm_state(
     }
 }
 
-/// The lowest id in the stack-algorithm registry -- already id-sorted, since
-/// [`registry::stack_algorithms`] iterates a `BTreeMap` keyed by id -- empty
-/// only if no stacking algorithm is registered at all, which the shipped
-/// registry never produces.
+/// [`registry::default_stack`]'s id, empty when the registry refuses to name
+/// one; a run on an empty id is refused before it starts.
 fn default_fuse_id() -> String {
-    registry::stack_algorithms()
-        .first()
+    registry::default_stack()
         .map(|a| a.id().to_string())
         .unwrap_or_default()
 }
 
 /// [`default_fuse_id`]'s twin for the alignment family.
 fn default_align_id() -> String {
-    registry::align_algorithms()
-        .first()
+    registry::default_align()
         .map(|a| a.id().to_string())
         .unwrap_or_default()
 }

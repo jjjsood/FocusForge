@@ -9,6 +9,9 @@ mod common;
 use std::fs;
 use std::sync::{Arc, Mutex};
 
+use focusforge_core::io::Rect;
+use focusforge_core::project::{Op, Point};
+use focusforge_core::zmap::ZMapReader;
 use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode};
 
 /// True when `body` (already trimmed) is exactly one statement of the form
@@ -298,33 +301,405 @@ fn controller_api_is_slint_free() {
     }
 }
 
-#[test]
-fn editor_mode_is_unreachable() {
-    let mut controller = AppController::new();
-    assert!(
-        !controller.editor_enabled(),
-        "editor_enabled() must be false"
-    );
+// ---------------------------------------------------------------------
+// Editor mode: entry, refusal, the per-tab edit session, the brush source
+// and the fall back to stacking.
+// ---------------------------------------------------------------------
 
+const SETTLE: Duration = Duration::from_secs(60);
+
+/// A controller whose ledger, staging and held checkpoints live under a
+/// fresh directory named for `name`.
+fn controller_with_scratch(name: &str) -> AppController {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
+    controller
+}
+
+/// Opens the first `count` `fixtures/mantis-64` frames, copied under a fresh
+/// directory, as a new active tab with no checkpoint. Returns that directory.
+fn open_mantis64_tab(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
+    let root = common::tree(&format!("{name}_frames"));
+    for i in 0..count {
+        fs::copy(
+            common::fixture_frame("mantis-64", i),
+            root.join(format!("{i:02}.tif")),
+        )
+        .expect("fixture frame must copy");
+    }
+    assert!(matches!(
+        common::open_and_settle(controller, std::slice::from_ref(&root)),
+        OpenOutcome::Opened(_)
+    ));
+    // Editor entry is under test, not alignment quality; an algorithm that
+    // always converges keeps every run clean.
+    controller.set_align_algorithm("dummy-align");
+    root
+}
+
+/// Settles every run, the live one and each one promoted from the queue.
+fn settle_all(controller: &mut AppController) {
+    while common::wait_for_settle(controller, SETTLE).is_some() {}
+}
+
+/// [`open_mantis64_tab`], then fuses it into one held checkpoint.
+fn open_fused_tab(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
+    let root = open_mantis64_tab(controller, name, count);
+    assert!(controller.start_fuse());
+    settle_all(controller);
+    assert_eq!(controller.checkpoint_count(), Some(1), "{name} must fuse");
+    root
+}
+
+/// Saves the active, never-saved tab to the path the save dialog proposes.
+fn save_to_proposed(controller: &mut AppController) -> PathBuf {
+    let mut target = None;
+    assert!(controller.save_active_project(|proposed| {
+        target = Some(proposed.to_path_buf());
+        target.clone()
+    }));
+    target.expect("a never-saved tab asks where to save")
+}
+
+/// Every event the controller emits from here on.
+fn record_events(controller: &mut AppController) -> Arc<Mutex<Vec<ShellEvent>>> {
     let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_events = events.clone();
     controller.set_sink(Arc::new(move |event| {
         sink_events.lock().unwrap().push(event)
     }));
+    events
+}
 
+/// Drains `events`, keeping only the modes each `ModeChanged` carried.
+fn take_mode_changes(events: &Mutex<Vec<ShellEvent>>) -> Vec<ShellMode> {
+    events
+        .lock()
+        .unwrap()
+        .drain(..)
+        .filter_map(|event| match event {
+            ShellEvent::ModeChanged(mode) => Some(mode),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The whole Z-Map at `path`, read straight from disk.
+fn read_whole_zmap(path: &Path) -> Vec<u16> {
+    let reader = ZMapReader::open(path).expect("the tab's Z-Map must open");
+    let info = reader.info();
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: info.width(),
+        height: info.height(),
+    };
+    let mut indices = vec![0u16; info.tile_len(whole)];
+    reader
+        .read_tile_into(whole, &mut indices)
+        .expect("the tab's Z-Map must read");
+    indices
+}
+
+fn one_dab(source_id: u16) -> Op {
+    Op::BrushStroke {
+        source_id,
+        path: vec![Point { x: 20, y: 20 }],
+        radius: 4.0,
+        softness: 0.0,
+    }
+}
+
+/// `set_mode(Editor)` refused: `false`, nothing emitted, still stacking.
+fn assert_editor_refused(controller: &mut AppController, case: &str) {
+    let events = record_events(controller);
     assert!(
         !controller.set_mode(ShellMode::Editor),
-        "set_mode(Editor) must return false"
+        "{case}: set_mode(Editor) must return false"
     );
     assert!(
         events.lock().unwrap().is_empty(),
-        "set_mode(Editor) must emit no ModeChanged"
+        "{case}: a refused set_mode(Editor) emits nothing"
     );
+    assert_eq!(controller.mode(), ShellMode::Stacking, "{case}");
+}
+
+#[test]
+fn editor_mode_enters_on_a_fused_tab() {
+    let mut controller = controller_with_scratch("editor_enters");
+    open_fused_tab(&mut controller, "editor_enters_held", 2);
+    let events = record_events(&mut controller);
+    assert!(controller.editor_enabled(), "a held checkpoint is editable");
+    assert!(controller.set_mode(ShellMode::Editor));
+    assert_eq!(controller.mode(), ShellMode::Editor);
     assert_eq!(
-        controller.mode(),
-        ShellMode::Stacking,
-        "mode must not have changed"
+        *events.lock().unwrap(),
+        vec![ShellEvent::ModeChanged(ShellMode::Editor)]
     );
+
+    assert!(controller.set_mode(ShellMode::Stacking));
+    let project_path = save_to_proposed(&mut controller);
+    let mut reopened = controller_with_scratch("editor_enters_reopened");
+    assert!(matches!(
+        common::open_and_settle(&mut reopened, &[project_path]),
+        OpenOutcome::Opened(_)
+    ));
+    let events = record_events(&mut reopened);
+    assert!(
+        reopened.editor_enabled(),
+        "a reopened project with a checkpoint is editable"
+    );
+    assert!(reopened.set_mode(ShellMode::Editor));
+    assert_eq!(reopened.mode(), ShellMode::Editor);
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![ShellEvent::ModeChanged(ShellMode::Editor)]
+    );
+}
+
+#[test]
+fn editor_mode_is_refused_without_fused_planes() {
+    let mut controller = controller_with_scratch("editor_refused");
+    assert!(!controller.editor_enabled(), "no active tab");
+    assert_editor_refused(&mut controller, "no active tab");
+
+    open_mantis64_tab(&mut controller, "editor_refused_unsaved", 3);
+    assert!(
+        !controller.editor_enabled(),
+        "an unsaved tab, no checkpoint"
+    );
+    assert_editor_refused(&mut controller, "an unsaved tab, no checkpoint");
+
+    // The predicate does no I/O, so planes that fail to materialize surface
+    // only in `set_mode` itself.
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    let project_path = save_to_proposed(&mut controller);
+    let mut reopened = controller_with_scratch("editor_refused_reopened");
+    assert!(matches!(
+        common::open_and_settle(&mut reopened, std::slice::from_ref(&project_path)),
+        OpenOutcome::Opened(_)
+    ));
+    fs::remove_file(&project_path).expect("the saved project must delete");
+    assert_editor_refused(&mut reopened, "planes that fail to materialize");
+}
+
+#[test]
+fn editor_mode_requires_the_fused_frame_set() {
+    let mut controller = controller_with_scratch("editor_frame_set");
+    let root = open_fused_tab(&mut controller, "editor_frame_set", 3);
+    assert!(controller.editor_enabled());
+
+    controller.toggle_frame_excluded(1);
+    assert!(
+        controller.editor_enabled(),
+        "an exclude keeps the frame set"
+    );
+    controller.toggle_frame_excluded(1);
+
+    // A missing frame refuses the re-fuse, so no newer checkpoint lands.
+    fs::remove_file(root.join("02.tif")).unwrap();
+    controller.move_frame(0, 1);
+    assert!(!controller.confirm_frame_change(), "the re-fuse is refused");
+    assert!(!controller.editor_enabled(), "after a confirmed Move");
+    assert_editor_refused(&mut controller, "after a confirmed Move");
+
+    controller.remove_frame(2);
+    assert!(controller.confirm_frame_change(), "the re-fuse starts");
+    assert!(!controller.editor_enabled(), "after a confirmed Remove");
+    assert_editor_refused(&mut controller, "after a confirmed Remove");
+    settle_all(&mut controller);
+    assert_eq!(controller.checkpoint_count(), Some(2));
+    assert!(
+        controller.editor_enabled(),
+        "a newer checkpoint over the current frame set is editable again"
+    );
+
+    controller.add_frames(&[root.join("never-written.tif")]);
+    assert!(!controller.confirm_frame_change(), "the re-fuse is refused");
+    assert!(!controller.editor_enabled(), "after a confirmed Add");
+    assert_editor_refused(&mut controller, "after a confirmed Add");
+}
+
+#[test]
+fn editor_mode_refuses_during_the_tabs_own_run() {
+    let mut controller = controller_with_scratch("editor_own_run");
+    open_fused_tab(&mut controller, "editor_own_run_a", 2);
+    open_fused_tab(&mut controller, "editor_own_run_b", 3);
+
+    controller.select_project(0);
+    assert!(controller.set_mode(ShellMode::Editor));
+    let events = record_events(&mut controller);
+    assert!(controller.start_fuse());
+    assert!(controller.job_running(), "tab 0's own run is live");
+    assert_eq!(
+        take_mode_changes(&events),
+        vec![ShellMode::Stacking],
+        "a run starting on the edited tab falls back once"
+    );
+    assert!(!controller.editor_enabled(), "while the tab's run is live");
+    assert_editor_refused(&mut controller, "while the tab's run is live");
+
+    controller.select_project(1);
+    assert!(
+        controller.editor_enabled(),
+        "another tab's run leaves this one editable"
+    );
+    assert!(controller.set_mode(ShellMode::Editor));
+    let events = record_events(&mut controller);
+    assert!(controller.start_fuse(), "enqueued behind tab 0's run");
+    assert!(matches!(
+        controller.job_view().state,
+        job::RunState::Queued { .. }
+    ));
+    assert_eq!(
+        take_mode_changes(&events),
+        vec![ShellMode::Stacking],
+        "queueing the edited tab falls back once"
+    );
+    assert!(!controller.editor_enabled(), "while the tab is queued");
+    assert_editor_refused(&mut controller, "while the tab is queued");
+
+    settle_all(&mut controller);
+    assert!(controller.editor_enabled(), "every run has settled");
+    assert!(controller.set_mode(ShellMode::Editor));
+}
+
+#[test]
+fn edit_session_is_per_tab_and_survives_mode_switches() {
+    let mut controller = controller_with_scratch("edit_session_per_tab");
+    open_fused_tab(&mut controller, "edit_session_per_tab_a", 2);
+    open_fused_tab(&mut controller, "edit_session_per_tab_b", 3);
+    assert!(controller.edit_session().is_none(), "none before entry");
+
+    assert!(controller.set_mode(ShellMode::Editor));
+    let (_, zmap_b) = controller.materialize_active_tab_planes().unwrap();
+    assert_eq!(
+        controller.edit_session().unwrap().indices(),
+        read_whole_zmap(&zmap_b).as_slice(),
+        "tab 1's session is its own whole Z-Map"
+    );
+
+    controller.select_project(0);
+    assert_eq!(controller.mode(), ShellMode::Editor);
+    let (_, zmap_a) = controller.materialize_active_tab_planes().unwrap();
+    assert_eq!(
+        controller.edit_session().unwrap().indices(),
+        read_whole_zmap(&zmap_a).as_slice(),
+        "tab 0's session is its own whole Z-Map"
+    );
+
+    controller
+        .edit_session_mut()
+        .unwrap()
+        .append(one_dab(1))
+        .expect("a dab inside the map applies");
+    assert!(controller.set_mode(ShellMode::Stacking));
+    assert!(controller.set_mode(ShellMode::Editor));
+    assert_eq!(
+        controller.edit_session().unwrap().op_count(),
+        1,
+        "the op survives Stacking and back"
+    );
+
+    controller.select_project(1);
+    assert_eq!(
+        controller.edit_session().unwrap().op_count(),
+        0,
+        "tab 1's session is untouched by tab 0's op"
+    );
+
+    controller.select_project(0);
+    save_to_proposed(&mut controller);
+    assert_eq!(
+        controller.edit_session().map(|session| session.op_count()),
+        Some(1),
+        "a save keeps the session"
+    );
+    assert!(controller.editor_enabled(), "a saved tab stays editable");
+}
+
+#[test]
+fn edit_session_follows_the_newest_planes() {
+    let mut controller = controller_with_scratch("edit_session_newest");
+    open_fused_tab(&mut controller, "edit_session_newest", 3);
+    assert!(controller.set_mode(ShellMode::Editor));
+    controller
+        .edit_session_mut()
+        .unwrap()
+        .append(one_dab(2))
+        .expect("a dab inside the map applies");
+
+    assert!(controller.set_mode(ShellMode::Stacking));
+    controller.toggle_frame_excluded(2);
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    assert_eq!(controller.checkpoint_count(), Some(2));
+
+    assert!(controller.set_mode(ShellMode::Editor));
+    let newest = controller.held_checkpoints().last().unwrap().zmap.clone();
+    let session = controller.edit_session().unwrap();
+    assert_eq!(session.op_count(), 0, "a fresh session, not the old one");
+    assert_eq!(session.indices(), read_whole_zmap(&newest).as_slice());
+}
+
+#[test]
+fn brush_source_is_the_selected_frame() {
+    let mut controller = controller_with_scratch("brush_source");
+    assert_eq!(controller.brush_source(), None, "no active tab");
+
+    open_mantis64_tab(&mut controller, "brush_source", 3);
+    assert_eq!(controller.brush_source(), Some(0));
+    controller.select_frame(2);
+    assert_eq!(controller.brush_source(), Some(2));
+
+    controller.select_plus();
+    assert_eq!(controller.brush_source(), None, "`+` is selected");
+}
+
+#[test]
+fn editor_mode_falls_back_when_the_tab_cannot_edit() {
+    let mut controller = controller_with_scratch("editor_fallback");
+    open_fused_tab(&mut controller, "editor_fallback_a", 2);
+    open_fused_tab(&mut controller, "editor_fallback_b", 3);
+    open_mantis64_tab(&mut controller, "editor_fallback_unsaved", 3);
+    let events = record_events(&mut controller);
+
+    controller.select_project(0);
+    assert!(controller.set_mode(ShellMode::Editor));
+    take_mode_changes(&events);
+    controller.select_project(1);
+    assert_eq!(controller.mode(), ShellMode::Editor);
+    assert!(
+        take_mode_changes(&events).is_empty(),
+        "two editable tabs switch without a ModeChanged"
+    );
+
+    controller.select_project(2);
+    assert_eq!(controller.mode(), ShellMode::Stacking);
+    assert_eq!(take_mode_changes(&events), vec![ShellMode::Stacking]);
+
+    controller.select_project(1);
+    assert!(controller.set_mode(ShellMode::Editor));
+    take_mode_changes(&events);
+    controller.select_plus();
+    assert_eq!(controller.mode(), ShellMode::Stacking);
+    assert_eq!(take_mode_changes(&events), vec![ShellMode::Stacking]);
+
+    controller.select_project(1);
+    assert!(controller.set_mode(ShellMode::Editor));
+    take_mode_changes(&events);
+    open_mantis64_tab(&mut controller, "editor_fallback_opened", 2);
+    assert_eq!(controller.mode(), ShellMode::Stacking);
+    assert_eq!(take_mode_changes(&events), vec![ShellMode::Stacking]);
+
+    // Closing tab 1 makes the unsaved tab 2 its successor.
+    controller.select_project(1);
+    assert!(controller.set_mode(ShellMode::Editor));
+    take_mode_changes(&events);
+    controller.close_project(1);
+    assert_eq!(controller.mode(), ShellMode::Stacking);
+    assert_eq!(take_mode_changes(&events), vec![ShellMode::Stacking]);
 }
 
 #[test]
@@ -1736,4 +2111,47 @@ fn crash_notice_cleared_by_a_bundle_write() {
         "a failed write must leave the notice showing"
     );
     assert_eq!(controller2.crash_notice_count(), 2);
+}
+
+/// A controller with `fixtures/mantis-512` open as one tab, its scratch root
+/// under `CARGO_TARGET_TMPDIR`. A first fuse writes nothing beside the frames.
+fn controller_on_mantis_512(name: &str) -> AppController {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
+    let mantis_512 = common::workspace_root().join("fixtures").join("mantis-512");
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[mantis_512]),
+        focusforge_gui::OpenOutcome::Opened(_)
+    ));
+    controller
+}
+
+#[test]
+fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
+    let mut controller = controller_on_mantis_512("default_fuse_mantis_512");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, std::time::Duration::from_secs(300));
+    assert!(
+        controller.job_failure_message().is_none(),
+        "a default fuse completes rather than failing"
+    );
+    assert_eq!(controller.checkpoint_count(), Some(0));
+    let names = ["00.tif", "01.tif", "07.tif"].map(String::from);
+    assert_eq!(controller.pending_divergence(), Some(&names[..]));
+}
+
+#[test]
+fn an_unresolved_align_id_is_refused_before_any_run() {
+    let mut controller = controller_on_mantis_512("unresolved_align_id");
+    controller.set_align_algorithm("");
+    assert!(!controller.start_fuse());
+    assert!(!controller.any_job_running());
+    assert!(
+        controller.last_refusal().is_some_and(|m| !m.is_empty()),
+        "the refusal must be reported"
+    );
+    assert_eq!(
+        controller.job_view().state,
+        focusforge_gui::job::RunState::Idle
+    );
 }

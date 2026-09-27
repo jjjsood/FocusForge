@@ -83,6 +83,33 @@ def _stats(a, b, tol: int):
     return worst, total / len(a), over
 
 
+def _bbox(a, b, tol: int, width: int, height: int, spp: int):
+    """Bounding rect `(x, y, w, h)` of pixels differing beyond `tol` in any
+    sample, or `None` when no pixel differs."""
+    if _np is not None:
+        diff = _np.abs(a.astype(_np.int64) - b.astype(_np.int64)).reshape(height, width, spp)
+        differs = (diff > tol).any(axis=2)
+        if not differs.any():
+            return None
+        ys, xs = _np.nonzero(differs)
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        return (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+    x0 = y0 = x1 = y1 = None
+    for pixel in range(width * height):
+        base = pixel * spp
+        if not any(abs(int(a[base + s]) - int(b[base + s])) > tol for s in range(spp)):
+            continue
+        x, y = pixel % width, pixel // width
+        x0 = x if x0 is None else min(x0, x)
+        x1 = x if x1 is None else max(x1, x)
+        y0 = y if y0 is None else min(y0, y)
+        y1 = y if y1 is None else max(y1, y)
+    if x0 is None:
+        return None
+    return (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+
+
 def _histogram(label: str, values, peak: int) -> None:
     counts = Counter(int(v) for v in values)
     total = sum(counts.values())
@@ -122,6 +149,10 @@ def _selftest() -> int:
     # one sample raised by exactly 5; every other sample identical
     off5 = bytearray(base)
     struct.pack_into("<H", off5, 0, 1005)
+    # two pixels differing, (5, 1) and (2, 3), everything else identical
+    two_px = bytearray(base)
+    for x, y in ((5, 1), (2, 3)):
+        struct.pack_into("<H", two_px, ((y * w + x) * 3) * 2, 4000)
 
     cases = []  # (label, argv, expected exit, substrings that must appear)
     with tempfile.TemporaryDirectory(prefix="tiff-diff-selftest-") as d:
@@ -129,6 +160,7 @@ def _selftest() -> int:
         rawtiff.write_tiff(p("a.tif"), w, h, base)
         rawtiff.write_tiff(p("a-copy.tif"), w, h, base)
         rawtiff.write_tiff(p("b5.tif"), w, h, bytes(off5))
+        rawtiff.write_tiff(p("two-px.tif"), w, h, bytes(two_px))
         rawtiff.write_tiff(p("wide.tif"), w * 2, h, rgb16(lambda x, y: (0, 0, 0), w * 2, h))
         rawtiff.write_tiff(p("z1.tif"), w, h, gray16(lambda x, y: x % 3), bits=16, spp=1)
         rawtiff.write_tiff(p("z2.tif"), w, h, gray16(lambda x, y: (x + 1) % 3), bits=16, spp=1)
@@ -152,6 +184,11 @@ def _selftest() -> int:
                       ["--zmap needs a single-channel index map"]))
         # a negative tolerance is a usage error, not a tolerance of zero
         cases.append(("negative tol", [p("a.tif"), p("a-copy.tif"), "--tol", "-1"], 2, []))
+        # --bbox reports the bounding rect of differing pixels
+        cases.append(("bbox single pixel", [p("a.tif"), p("b5.tif"), "--bbox"], 1,
+                      ["differing bbox: x=0 y=0 w=1 h=1"]))
+        cases.append(("bbox two pixels", [p("a.tif"), p("two-px.tif"), "--bbox"], 1,
+                      ["differing bbox: x=2 y=1 w=4 h=3"]))
 
         failed = 0
         for label, argv, want_exit, want_text in cases:
@@ -207,6 +244,11 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--force", action="store_true", help=f"allow inputs larger than {MAX_BYTES // 2**20} MB"
+    )
+    parser.add_argument(
+        "--bbox",
+        action="store_true",
+        help="print the bounding rect of pixels differing beyond --tol",
     )
     args = parser.parse_args(argv)
 
@@ -270,6 +312,14 @@ def main(argv=None) -> int:
         print(f"mean abs diff: {mean:.4f}")
         print(f"PSNR:          {psnr}")
         print(f"samples > tol({args.tol}): {over} of {len(a)}")
+
+    if args.bbox:
+        bbox = _bbox(a, b, args.tol, info_a.width, info_a.height, info_a.samples_per_pixel)
+        if bbox is None:
+            print("differing bbox: none")
+        else:
+            x, y, bw, bh = bbox
+            print(f"differing bbox: x={x} y={y} w={bw} h={bh}")
 
     if worst <= args.tol:
         print(f"OK: within tolerance {args.tol}")

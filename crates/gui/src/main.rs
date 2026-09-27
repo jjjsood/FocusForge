@@ -78,6 +78,11 @@ struct Args {
     /// question with no click.
     #[arg(long, requires = "fuse_tabs")]
     request_quit: bool,
+    /// Selects editor mode once the last `--fuse-tabs` run settles, as
+    /// clicking the mode switch's `Editor` segment does -- for inspecting
+    /// the editor surface with no click sequence.
+    #[arg(long, requires = "fuse_tabs")]
+    enter_editor: bool,
     /// Requests removing the frame at this index right after `--open`, for
     /// inspecting the frame-set warning it raises on a checkpointed project
     /// with no click sequence.
@@ -120,6 +125,7 @@ struct FuseTabsFollowUp {
     close: bool,
     quit: bool,
     overlay: bool,
+    enter_editor: bool,
 }
 
 /// Presses `Fuse stack` on each of `indices` in turn, the moment no
@@ -130,7 +136,8 @@ struct FuseTabsFollowUp {
 /// picks up their result. An index already pressed waits until no run is
 /// pending, since a press on a tab already running or queued is ignored.
 /// Once every press is made and every run settled, `save` presses `Save
-/// project` on the proposed path and `overlay` opens the projects overlay.
+/// project` on the proposed path, `overlay` opens the projects overlay, and
+/// `enter_editor` selects editor mode.
 fn start_fuse_tabs_timer(
     app_weak: slint::Weak<AppWindow>,
     controller: Arc<Mutex<AppController>>,
@@ -143,6 +150,7 @@ fn start_fuse_tabs_timer(
         close,
         quit,
         overlay,
+        enter_editor,
     } = follow_up;
     let timer_slot = slot.clone();
     let mut pending: std::collections::VecDeque<usize> = indices.into();
@@ -166,8 +174,13 @@ fn start_fuse_tabs_timer(
             app.invoke_tab_selected(index as i32);
             app.invoke_fuse_requested();
         }
-        if (save || close || quit || overlay) && controller.lock().unwrap().work_pending() {
+        if (save || close || quit || overlay || enter_editor)
+            && controller.lock().unwrap().work_pending()
+        {
             return;
+        }
+        if enter_editor {
+            app.invoke_mode_selected("editor".into());
         }
         if save {
             controller
@@ -693,6 +706,7 @@ fn run(args: &Args) -> ExitCode {
                     close: args.request_close,
                     quit: args.request_quit,
                     overlay: args.projects_overlay,
+                    enter_editor: args.enter_editor,
                 },
             );
         }
