@@ -5,12 +5,14 @@
 //! document this module edits is the map, never an image.
 
 pub mod brush;
+pub mod recomposite;
 pub mod session;
 pub mod zmap_io;
 
 use crate::tile::Rect;
 
 pub use brush::{apply, footprint};
+pub use recomposite::{Sources, named_frames, recomposite};
 pub use session::EditSession;
 pub use zmap_io::{session_tile, write_edited};
 
@@ -46,4 +48,8 @@ pub enum RetouchError {
     /// The index buffer handed to `apply` does not match the tile's area.
     #[error("index buffer holds {actual} entries, expected {expected}")]
     TileBufferSize { expected: usize, actual: usize },
+
+    /// A recomposite's source reader failed to produce a frame's pixels.
+    #[error(transparent)]
+    Source(#[from] crate::algorithm::AlgorithmError),
 }

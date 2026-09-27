@@ -255,6 +255,14 @@ enum Command {
         /// Redo this many undone ops. Must not exceed `--undo`.
         #[arg(long, default_value_t = 0)]
         redo: usize,
+        /// Directory of source frames to recomposite `--render` from.
+        /// Required by `--render`.
+        #[arg(long, value_name = "DIR")]
+        frames: Option<PathBuf>,
+        /// Write the recomposited image at the edited map's undo/redo
+        /// position: a per-pixel gather from `--frames`, CPU only.
+        #[arg(long, value_name = "FILE", requires = "frames")]
+        render: Option<PathBuf>,
         /// Emit the frozen JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
@@ -467,8 +475,19 @@ fn main() -> ExitCode {
             out,
             undo,
             redo,
+            frames,
+            render,
             json,
-        } => retouch::run(&zmap, &ops, &out, undo, redo, json),
+        } => retouch::run(
+            &zmap,
+            &ops,
+            &out,
+            undo,
+            redo,
+            frames.as_deref(),
+            render.as_deref(),
+            json,
+        ),
         Command::Align {
             dir,
             algo,

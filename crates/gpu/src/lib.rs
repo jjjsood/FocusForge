@@ -46,6 +46,11 @@ pub mod fuse;
 pub mod harness;
 #[cfg(feature = "gpu")]
 pub(crate) mod pipeline;
+/// The recomposite kernel: the WGSL twin of
+/// `focusforge_core::retouch::recomposite::recomposite`, one dispatch per
+/// named frame.
+#[cfg(feature = "gpu")]
+pub mod recomposite;
 #[cfg(feature = "gpu")]
 pub mod stack_tile;
 #[cfg(feature = "gpu")]

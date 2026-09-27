@@ -11,10 +11,11 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use focusforge_core::io::TiffStack;
 use focusforge_core::project::Op;
 use focusforge_core::retouch;
 use focusforge_core::tile::Rect;
-use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
+use focusforge_core::zmap::{NO_SOURCE, ZMapInfo, ZMapReader, ZMapWriter};
 
 fn bin(test_name: &str) -> Command {
     common::cli_bin(test_name)
@@ -716,4 +717,250 @@ fn out_naming_a_symlinked_input_is_refused() {
     assert!(!output.success, "stdout: {}", output.stdout);
     assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
     assert_eq!(std::fs::read(&target).unwrap(), before);
+}
+
+fn read_rgb_tiff(path: &Path) -> (u32, u32, Vec<u16>) {
+    let stack = TiffStack::open_files(&[path.to_path_buf()]).unwrap();
+    let (width, height) = stack.dimensions();
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let tile = stack.read_tile(0, rect).unwrap();
+    (width, height, tile.samples)
+}
+
+/// `--frames <dir> --render <file>` writes a 16-bit RGB TIFF: outside
+/// `retouch::session_tile` of the op list, identical to the `--undo <len>`
+/// render of the same list; inside, each pixel equals the frame its edited
+/// index names.
+#[test]
+fn render_changes_only_the_footprint() {
+    let dir = common::tmp_dir("render_changes_only_the_footprint");
+    let zmap = common::fixtures_dir().join("mantis-512/golden/laplacian-zmap.tif");
+    let frames = common::fixtures_dir().join("mantis-512/frames");
+    let ops_path = common::fixtures_dir().join("retouch/stroke-list.json");
+
+    let out_after = dir.join("out-after.tif");
+    let render_after = dir.join("render-after.tif");
+    let after = run_cli(
+        &dir,
+        &mut bin("render_after"),
+        &[
+            "retouch",
+            "--zmap",
+            zmap.to_str().unwrap(),
+            "--ops",
+            ops_path.to_str().unwrap(),
+            "--out",
+            out_after.to_str().unwrap(),
+            "--frames",
+            frames.to_str().unwrap(),
+            "--render",
+            render_after.to_str().unwrap(),
+        ],
+    );
+    assert!(after.success, "stderr: {}", after.stderr);
+
+    let out_before = dir.join("out-before.tif");
+    let render_before = dir.join("render-before.tif");
+    let before = run_cli(
+        &dir,
+        &mut bin("render_before"),
+        &[
+            "retouch",
+            "--zmap",
+            zmap.to_str().unwrap(),
+            "--ops",
+            ops_path.to_str().unwrap(),
+            "--out",
+            out_before.to_str().unwrap(),
+            "--undo",
+            "3",
+            "--frames",
+            frames.to_str().unwrap(),
+            "--render",
+            render_before.to_str().unwrap(),
+        ],
+    );
+    assert!(before.success, "stderr: {}", before.stderr);
+
+    let (info, edited_indices) = read_whole(&out_after);
+    let ops_text = std::fs::read_to_string(&ops_path).unwrap();
+    let all_ops: Vec<Op> = serde_json::from_str(&ops_text).unwrap();
+    let tile = retouch::session_tile(&all_ops, info).unwrap();
+
+    let (width, height, after_rgb) = read_rgb_tiff(&render_after);
+    let (_, _, before_rgb) = read_rgb_tiff(&render_before);
+    let stack = TiffStack::open(&frames).unwrap();
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let frame_samples: Vec<Vec<u16>> = (0..stack.len())
+        .map(|f| stack.read_tile(f, whole).unwrap().samples)
+        .collect();
+
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) as usize;
+            let inside =
+                x >= tile.x && x < tile.x + tile.width && y >= tile.y && y < tile.y + tile.height;
+            let px = &after_rgb[i * 3..i * 3 + 3];
+            if !inside {
+                assert_eq!(
+                    px,
+                    &before_rgb[i * 3..i * 3 + 3],
+                    "outside the footprint at ({x},{y})"
+                );
+            } else {
+                let index = edited_indices[i];
+                if index == NO_SOURCE {
+                    assert_eq!(px, [0, 0, 0], "NO_SOURCE pixel at ({x},{y})");
+                } else {
+                    assert_eq!(
+                        px,
+                        &frame_samples[index as usize][i * 3..i * 3 + 3],
+                        "pixel ({x},{y}) must equal frame {index}'s samples"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `--render` refuses: without `--frames` (clap); a frame count that
+/// differs from the map's; naming a not-yet-written `--out`; and (unix)
+/// reaching `--zmap` through a symlinked directory's `..`. Each leaves no
+/// render file.
+#[test]
+fn render_refuses_bad_inputs() {
+    let real_frames = common::fixtures_dir().join("mantis-512/frames");
+    let stroke_list = common::fixtures_dir().join("retouch/stroke-list.json");
+
+    // Without `--frames`, clap's `requires` refuses before anything runs.
+    {
+        let dir = common::tmp_dir("render_without_frames");
+        let zmap = synthetic_map(&dir, "base.tif");
+        let ops = write_ops(&dir, "ops.json", SYNTHETIC_STROKE_OPS);
+        let out = dir.join("out.tif");
+        let render = dir.join("render.tif");
+        let output = run_cli(
+            &dir,
+            &mut bin("render_without_frames"),
+            &[
+                "retouch",
+                "--zmap",
+                zmap.to_str().unwrap(),
+                "--ops",
+                ops.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+                "--render",
+                render.to_str().unwrap(),
+            ],
+        );
+        assert!(!output.success);
+        assert!(!render.exists());
+    }
+
+    // A 10-frame map against the 8 fixture frames is a frame-count mismatch.
+    {
+        let dir = common::tmp_dir("render_frame_count_mismatch");
+        let zmap = synthetic_map(&dir, "base.tif");
+        let ops = write_ops(&dir, "ops.json", SYNTHETIC_STROKE_OPS);
+        let out = dir.join("out.tif");
+        let render = dir.join("render.tif");
+        let output = run_cli(
+            &dir,
+            &mut bin("render_frame_count_mismatch"),
+            &[
+                "retouch",
+                "--zmap",
+                zmap.to_str().unwrap(),
+                "--ops",
+                ops.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+                "--frames",
+                real_frames.to_str().unwrap(),
+                "--render",
+                render.to_str().unwrap(),
+            ],
+        );
+        assert!(!output.success, "stdout: {}", output.stdout);
+        assert!(!render.exists());
+    }
+
+    // `--render` naming a not-yet-written `--out`.
+    {
+        let dir = common::tmp_dir("render_names_not_yet_written_out");
+        let golden_zmap = common::fixtures_dir().join("mantis-512/golden/laplacian-zmap.tif");
+        let out = dir.join("out.tif");
+        let output = run_cli(
+            &dir,
+            &mut bin("render_names_not_yet_written_out"),
+            &[
+                "retouch",
+                "--zmap",
+                golden_zmap.to_str().unwrap(),
+                "--ops",
+                stroke_list.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+                "--frames",
+                real_frames.to_str().unwrap(),
+                "--render",
+                out.to_str().unwrap(),
+            ],
+        );
+        assert!(!output.success, "stdout: {}", output.stdout);
+        assert!(
+            !out.exists(),
+            "the not-yet-written --out must stay unwritten"
+        );
+    }
+
+    // (unix) `--render` reaching `--zmap` through a symlinked directory's `..`.
+    #[cfg(unix)]
+    {
+        let dir = common::tmp_dir("render_reaches_zmap_through_symlinked_dir");
+        let deep = dir.join("deep");
+        std::fs::create_dir_all(deep.join("a")).unwrap();
+        let golden_zmap = common::fixtures_dir().join("mantis-512/golden/laplacian-zmap.tif");
+        let zmap = deep.join("base.tif");
+        std::fs::copy(&golden_zmap, &zmap).unwrap();
+        let before = std::fs::read(&zmap).unwrap();
+        let out = dir.join("out.tif");
+
+        std::os::unix::fs::symlink(deep.join("a"), dir.join("l")).unwrap();
+        let render_detour = dir.join("l").join("..").join("base.tif");
+        let output = run_cli(
+            &dir,
+            &mut bin("render_reaches_zmap_through_symlinked_dir"),
+            &[
+                "retouch",
+                "--zmap",
+                zmap.to_str().unwrap(),
+                "--ops",
+                stroke_list.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+                "--frames",
+                real_frames.to_str().unwrap(),
+                "--render",
+                render_detour.to_str().unwrap(),
+            ],
+        );
+        assert!(!output.success, "stdout: {}", output.stdout);
+        assert_eq!(
+            std::fs::read(&zmap).unwrap(),
+            before,
+            "the input Z-Map must never be overwritten by a render"
+        );
+    }
 }
