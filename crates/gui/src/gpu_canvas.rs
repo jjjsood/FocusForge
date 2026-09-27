@@ -265,12 +265,6 @@ pub struct CanvasRenderer {
     last_frame: Option<PaneDraw>,
 }
 
-impl Default for CanvasRenderer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CanvasRenderer {
     /// A renderer with nothing open yet.
     pub fn new() -> Self {
