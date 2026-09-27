@@ -25,7 +25,9 @@ use crate::align::{
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use crate::gpu::TileBackend;
-use crate::io::{COMPOSITE_FILENAME, FrameDesc, FrameReader, Rect, TiffStack, ZMAP_FILENAME};
+use crate::io::{
+    COMPOSITE_FILENAME, FrameDesc, FrameReader, Rect, TiffStack, ZMAP_FILENAME, open_frame_set,
+};
 use crate::job::{
     AlignIdentity, ControlState, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobControl, JobOutcome,
     JobProgress, JobRecord, JobStage, RecordingConsumer, Resumable, ResumeStore, StackFingerprint,
@@ -239,9 +241,12 @@ pub fn run(
     let mut timer = StageTimer::from_start(start);
     timer.enter(Stage::Setup);
 
-    let stack = TiffStack::open_files(&request.frames)
+    let mut options = TileSchedulerOptions::new(&request.scratch_root);
+    options.budget = options.budget.capped_to(request.max_host_memory);
+    let opened = open_frame_set(&request.frames, options.budget)
         .map_err(|err| PipelineError::Input(err.to_string()))?;
-    let frame_reader: &dyn FrameReader = &stack;
+    options.budget = opened.scheduler_budget;
+    let frame_reader: &dyn FrameReader = &*opened.reader;
     let frame_names: Vec<String> = request
         .frames
         .iter()
@@ -251,18 +256,6 @@ pub fn run(
                 .unwrap_or_else(|| p.display().to_string())
         })
         .collect();
-    let frame_descs: Vec<(&str, &FrameDesc)> = frame_names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| (name.as_str(), frame_reader.frame(i)))
-        .collect();
-    let (uniform, detail) = uniform_check(&frame_descs);
-    if !uniform {
-        return Err(PipelineError::Input(
-            detail.unwrap_or_else(|| "non-uniform frame set".to_string()),
-        ));
-    }
-
     let stack_ctx = frame_reader.stack_context();
     let (width, height) = (stack_ctx.width, stack_ctx.height);
     let spp = stack_ctx.samples_per_pixel;
@@ -277,12 +270,10 @@ pub fn run(
             .collect(),
     };
 
-    let mut options = TileSchedulerOptions::new(&request.scratch_root);
     options.levels = levels;
     if let Some(tile_size) = request.tile_size {
         options.tile_size = tile_size;
     }
-    options.budget = options.budget.capped_to(request.max_host_memory);
 
     timer.mark(Stage::Setup);
 
@@ -673,7 +664,7 @@ pub fn run(
     }
 
     observer.stage(RunStage::Seal);
-    let metrics = measure_metrics(&staged_composite, &request.frames);
+    let metrics = measure_metrics(&staged_composite, frame_reader);
     let align_record =
         alignment_result
             .as_ref()
@@ -1000,7 +991,7 @@ const LAPVAR_WINDOW: u32 = 2048;
 /// one central window, measured identically on both. Every failure is
 /// silence rather than a refusal: a metric that could not be measured must
 /// not turn a completed run into a failed one.
-fn measure_metrics(composite: &Path, sources: &[PathBuf]) -> Metrics {
+fn measure_metrics(composite: &Path, sources: &dyn FrameReader) -> Metrics {
     let Ok(stack) = TiffStack::open_files(std::slice::from_ref(&composite.to_path_buf())) else {
         return Metrics::default();
     };
@@ -1009,20 +1000,17 @@ fn measure_metrics(composite: &Path, sources: &[PathBuf]) -> Metrics {
     let side_w = LAPVAR_WINDOW.min(width);
     let side_h = LAPVAR_WINDOW.min(height);
     let window = centered(width, height, side_w, side_h);
-    let composite_lapvar = lapvar(&stack, window, spp);
+    let composite_lapvar = lapvar(&stack, 0, window, spp);
 
     let mut max_input_lapvar: Option<f64> = None;
-    for path in sources {
-        let Ok(frame) = TiffStack::open_files(std::slice::from_ref(path)) else {
-            continue;
-        };
-        let (fw, fh) = FrameReader::dimensions(&frame);
+    for index in 0..sources.len() {
+        let (fw, fh) = sources.dimensions();
         if fw < side_w || fh < side_h {
             continue;
         }
-        let fspp = frame.frame(0).samples_per_pixel;
+        let fspp = sources.frame(index).samples_per_pixel;
         let rect = centered(fw, fh, side_w, side_h);
-        if let Some(value) = lapvar(&frame, rect, fspp) {
+        if let Some(value) = lapvar(sources, index, rect, fspp) {
             max_input_lapvar = Some(max_input_lapvar.map_or(value, |m: f64| m.max(value)));
         }
     }
@@ -1043,9 +1031,9 @@ fn centered(width: u32, height: u32, side_w: u32, side_h: u32) -> Rect {
     }
 }
 
-fn lapvar(reader: &dyn TileReader, rect: Rect, spp: u32) -> Option<f64> {
+fn lapvar(reader: &dyn TileReader, frame: usize, rect: Rect, spp: u32) -> Option<f64> {
     let mut samples = vec![0u16; rect.width as usize * rect.height as usize * spp as usize];
-    reader.read_tile_into(0, rect, &mut samples).ok()?;
+    reader.read_tile_into(frame, rect, &mut samples).ok()?;
     Some(crate::fuse::metrics::laplacian_variance(
         &samples,
         rect.width,

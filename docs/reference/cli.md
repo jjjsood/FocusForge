@@ -70,7 +70,9 @@ in well under a second.
   directory with zero matching files is a hard error.
 - A file that parses but falls outside the fast read path (see
   [`tiff-fast-path.md`](tiff-fast-path.md)) is reported normally, with
-  `mmap fast path: no` and the reason named — this is not an error.
+  `mmap fast path: no` and the reason named — this is not an error. Supported
+  compressed or tiled 16-bit frames use DecodedTiffStack; other unsupported
+  values name a refusal and have no serving reader.
 
 ### Human output
 
@@ -82,6 +84,7 @@ path/to/frame.tif
   rows_per_strip=1 strips=64 file_size=25338
   description: FocusForge fixture mantis-64/00 from 20260829-IMG_9800.tif rect 4064,2700,64,64
   mmap fast path: yes
+  reader: TiffStack
 ```
 
 The `description:` line is only printed when the file carries an
@@ -133,6 +136,7 @@ is added, never renamed or removed, in later versions.
       "file_size": 25338,
       "description": "FocusForge fixture mantis-64/00 from 20260829-IMG_9800.tif rect 4064,2700,64,64",
       "mmap_fast_path": true,
+      "reader": "TiffStack",
       "refusal": null,
       "error": null
     }
@@ -171,6 +175,7 @@ parse as a TIFF at all):
 | `file_size` | on-disk size in bytes |
 | `description` | the TIFF `ImageDescription` tag, `null` when the file has none — a Z-Map carries its frame count here |
 | `mmap_fast_path` | whether the tile reader's fast path applies to this file |
+| `reader` | `"TiffStack"` for mmap-compatible frames, `"DecodedTiffStack"` for supported decoded frames, otherwise `null` |
 | `refusal` | `null` when `mmap_fast_path` is `true`, otherwise the reason it is not (compression, tiling, planar layout, bit depth or sample format) |
 | `error` | `null` on a successful parse, otherwise why the file could not be read as a TIFF at all |
 
@@ -187,6 +192,12 @@ projects for review; it does not write an image file — run
 [`export`](#export) for that. The frames are read tile by tile through an
 out-of-core scheduler bounded by a fixed memory budget, so the command never
 needs to hold a whole stack — or a whole frame — in RAM.
+
+An all-mmap-compatible set uses TiffStack. A set containing supported
+compressed or tiled 16-bit frames uses DecodedTiffStack, including mixed
+uncompressed/compressed sets. The decoded cache receives one quarter of the
+capped host budget and the scheduler receives the remainder; mmap-only sets
+keep the whole scheduler budget.
 
 **Alignment runs first, by default.** Before fusion, `stack` computes each
 frame's transform against a reference frame (the same solver `align` drives

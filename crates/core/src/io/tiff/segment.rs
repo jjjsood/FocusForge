@@ -217,6 +217,10 @@ pub(crate) fn segment_layout(header: &TiffHeader) -> Result<Vec<SegmentInfo>, Ti
     Ok(segments)
 }
 
+pub(crate) fn validate_decoded_header(header: &TiffHeader) -> Result<(), TiffError> {
+    segment_layout(header).map(|_| ())
+}
+
 /// Decode one pre-validated segment from borrowed file bytes.
 pub(crate) fn decode_segment(
     header: &TiffHeader,

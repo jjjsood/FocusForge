@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use focusforge_core::io::{ByteOrder, FrameDesc, TiffError, TiffHeader, frame_paths};
+use focusforge_core::io::{
+    ByteOrder, FrameDesc, TiffError, TiffHeader, classify_header, frame_paths,
+};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
@@ -529,6 +531,7 @@ struct FileReport {
     file_size: Option<u64>,
     description: Option<String>,
     mmap_fast_path: Option<bool>,
+    reader: Option<String>,
     refusal: Option<String>,
     error: Option<String>,
 }
@@ -655,6 +658,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 file_size: Some(h.file_size),
                 description: h.image_description.clone(),
                 mmap_fast_path: Some(h.refusal.is_none()),
+                reader: classify_header(h).ok().map(|kind| kind.name().to_string()),
                 refusal: h.refusal.as_ref().map(|r| r.to_string()),
                 error: None,
             },
@@ -674,6 +678,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 file_size: None,
                 description: None,
                 mmap_fast_path: None,
+                reader: None,
                 refusal: None,
                 error: Some(e.to_string()),
             },
@@ -728,6 +733,9 @@ fn print_human(report: &InfoReport) {
         match &file.refusal {
             None => println!("  mmap fast path: yes"),
             Some(refusal) => println!("  mmap fast path: no — {refusal}"),
+        }
+        if let Some(reader) = &file.reader {
+            println!("  reader: {reader}");
         }
     }
 

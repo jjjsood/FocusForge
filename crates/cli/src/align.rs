@@ -16,11 +16,11 @@ use focusforge_core::align::{
     align_stack_with, auto_crop,
 };
 use focusforge_core::gpu::TileBackend;
-use focusforge_core::io::{FrameReader, TiffSpec, TiffStack, TiffWriter, frame_paths};
+use focusforge_core::io::{FrameReader, TiffSpec, TiffWriter, frame_paths, open_frame_set};
 use focusforge_core::params;
 use focusforge_core::registry;
-use focusforge_core::tile::Rect;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
+use focusforge_core::tile::{Rect, TileSchedulerOptions};
 use focusforge_core::timing::{Stage, StageTimer};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
@@ -225,11 +225,11 @@ pub fn run(
         Ok(paths) => paths,
         Err(err) => return sink.fail(err),
     };
-    let stack = match TiffStack::open_files(&paths) {
-        Ok(stack) => stack,
+    let opened = match open_frame_set(&paths, TileSchedulerOptions::new(".scratch").budget) {
+        Ok(opened) => opened,
         Err(err) => return sink.fail(err),
     };
-    let frame_reader: &dyn FrameReader = &stack;
+    let frame_reader: &dyn FrameReader = &*opened.reader;
     let frame_names: Vec<String> = paths
         .iter()
         .map(|p| {
@@ -238,16 +238,6 @@ pub fn run(
                 .unwrap_or_else(|| p.display().to_string())
         })
         .collect();
-    let frame_descs: Vec<(&str, &focusforge_core::io::FrameDesc)> = frame_names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| (name.as_str(), frame_reader.frame(i)))
-        .collect();
-    let (uniform, detail) = focusforge_core::pipeline::uniform_check(&frame_descs);
-    if !uniform {
-        return sink.fail(detail.unwrap_or_else(|| "non-uniform frame set".to_string()));
-    }
-
     let stack_ctx = frame_reader.stack_context();
     let (width, height) = (stack_ctx.width, stack_ctx.height);
     let spp = stack_ctx.samples_per_pixel;

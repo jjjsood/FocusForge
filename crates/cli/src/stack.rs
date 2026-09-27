@@ -15,7 +15,7 @@ use std::time::Instant;
 use focusforge_core::algorithm::StackAlgorithm;
 use focusforge_core::align::ReferencePolicy;
 use focusforge_core::gpu::TileBackend;
-use focusforge_core::io::{FrameReader, Group, Proposal, Rect, TiffStack, propose};
+use focusforge_core::io::{FrameReader, Group, Proposal, Rect, open_frame_set, propose};
 use focusforge_core::job::{JobControl, StageCache};
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance};
 use focusforge_core::project::{self, PROJECT_EXTENSION};
@@ -211,6 +211,8 @@ pub struct DryRunPlan {
     pub margin: u32,
     pub tiles: usize,
     pub in_flight_limit: usize,
+    /// Host bytes available to the tile scheduler after input caching.
+    pub max_bytes_in_flight: u64,
     pub backend: String,
     /// The paths this invocation *would* write. None of them exists.
     pub would_write: Vec<String>,
@@ -822,10 +824,8 @@ fn print_document<T: Serialize>(value: &T, json: bool, human: fn(&T) -> String) 
 /// One group's stack, from the checks before the run to the composite. The
 /// frames arrive as a slice instead of being enumerated here.
 ///
-/// Everything downstream already takes a path slice (`TiffStack::open_files`),
-/// so a one-group proposal hands this function precisely `frame_paths(dir)`'s
-/// own vector, in its own order, which is what makes the single-stack
-/// equivalence true by construction rather than by a special case.
+/// Everything downstream receives this path slice in order, so a one-group
+/// proposal is equivalent to opening `frame_paths(dir)` directly.
 ///
 /// The per-group state lives here on purpose: one `StatusSink` (whose `Drop`
 /// assertion is per instance, so one record per group), one
@@ -884,8 +884,11 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // driver) because `--write-preset` and `--dry-run` must report without
     // ever entering `focusforge_core::pipeline::run`.
     let paths = group.frames.clone();
-    let stack = match TiffStack::open_files(&paths) {
-        Ok(stack) => stack,
+    let preflight_budget = TileSchedulerOptions::new(".scratch")
+        .budget
+        .capped_to(max_host_memory);
+    let opened = match open_frame_set(&paths, preflight_budget) {
+        Ok(opened) => opened,
         Err(err) => return failed(&status, start, err),
     };
     let frame_names: Vec<String> = paths
@@ -896,20 +899,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 .unwrap_or_else(|| p.display().to_string())
         })
         .collect();
-    let frame_reader: &dyn FrameReader = &stack;
-    let frame_descs: Vec<(&str, &focusforge_core::io::FrameDesc)> = frame_names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| (name.as_str(), frame_reader.frame(i)))
-        .collect();
-    let (uniform, detail) = focusforge_core::pipeline::uniform_check(&frame_descs);
-    if !uniform {
-        return failed(
-            &status,
-            start,
-            detail.unwrap_or_else(|| "non-uniform frame set".to_string()),
-        );
-    }
+    let frame_reader: &dyn FrameReader = &*opened.reader;
 
     // Refuse an output that is also an input frame.
     if let Some(name) = colliding_frame(output, &paths, &frame_names) {
@@ -1009,7 +999,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         if let Some(tile_size) = job_opts.tile_size {
             options.tile_size = tile_size;
         }
-        options.budget = options.budget.capped_to(max_host_memory);
+        options.budget = opened.scheduler_budget;
         let scheduler = match TileScheduler::new(frame_reader, stack_ctx, spp, &options) {
             Ok(scheduler) => scheduler,
             Err(err) => return failed(&status, start, err),
@@ -1046,6 +1036,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             margin: geometry.margin(),
             tiles: geometry.tiles().len(),
             in_flight_limit: scheduler.in_flight_limit(),
+            max_bytes_in_flight: opened.scheduler_budget.bytes(),
             backend: backend
                 .map(|b| b.info().to_string())
                 .unwrap_or_else(|| "cpu".to_string()),
