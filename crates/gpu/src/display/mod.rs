@@ -153,6 +153,30 @@ fn pack_table(table: &[[u8; 3]]) -> Vec<u8> {
     bytes
 }
 
+/// Uploads `bytes` into a new [`create_storage_buffer`] via
+/// `queue.write_buffer`.
+fn upload_storage(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    bytes: &[u8],
+    label: &str,
+) -> wgpu::Buffer {
+    let buffer = create_storage_buffer(device, bytes.len() as u64, label);
+    queue.write_buffer(&buffer, 0, bytes);
+    buffer
+}
+
+/// [`pack_samples`] plus [`upload_storage`], for the `u16` buffers both
+/// [`render`] and [`render_overlay`] send the kernel.
+fn upload_samples(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    data: &[u16],
+    label: &str,
+) -> wgpu::Buffer {
+    upload_storage(device, queue, &pack_samples(data), label)
+}
+
 /// Runs the display kernel: packs `src`'s `u16` samples two-per-`u32`
 /// (`crate::pack::pack_samples`), uploads them as a storage buffer, and
 /// dispatches one invocation per pixel of `target`, writing straight into
@@ -171,10 +195,7 @@ pub fn render(
     let device = shared.device();
     let queue = shared.queue();
 
-    let packed = pack_samples(src);
-    let src_buffer =
-        create_storage_buffer(device, packed.len() as u64, "focusforge-gpu-display-src");
-    queue.write_buffer(&src_buffer, 0, &packed);
+    let src_buffer = upload_samples(device, queue, src, "focusforge-gpu-display-src");
 
     let params = Params {
         width: target.width(),
@@ -232,29 +253,15 @@ pub fn render_overlay(
     let device = shared.device();
     let queue = shared.queue();
 
-    let packed_composite = pack_samples(composite);
-    let composite_buffer = create_storage_buffer(
+    let composite_buffer =
+        upload_samples(device, queue, composite, "focusforge-gpu-overlay-composite");
+    let indices_buffer = upload_samples(device, queue, indices, "focusforge-gpu-overlay-indices");
+    let table_buffer = upload_storage(
         device,
-        packed_composite.len() as u64,
-        "focusforge-gpu-overlay-composite",
-    );
-    queue.write_buffer(&composite_buffer, 0, &packed_composite);
-
-    let packed_indices = pack_samples(indices);
-    let indices_buffer = create_storage_buffer(
-        device,
-        packed_indices.len() as u64,
-        "focusforge-gpu-overlay-indices",
-    );
-    queue.write_buffer(&indices_buffer, 0, &packed_indices);
-
-    let packed_table = pack_table(table);
-    let table_buffer = create_storage_buffer(
-        device,
-        packed_table.len() as u64,
+        queue,
+        &pack_table(table),
         "focusforge-gpu-overlay-table",
     );
-    queue.write_buffer(&table_buffer, 0, &packed_table);
 
     let params = Params {
         width: target.width(),

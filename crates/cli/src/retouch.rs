@@ -232,6 +232,26 @@ fn resolve(path: &Path) -> Option<std::path::PathBuf> {
         .map(|parent| parent.join(name))
 }
 
+/// Refuses `--<flag> candidate` when it would overwrite `target`: an error
+/// naming `candidate` and `message_suffix` if [`would_replace`] says so,
+/// `Ok(())` if `candidate` is `None` or collides with nothing.
+fn refuse_if_collides(
+    candidate: Option<&Path>,
+    flag: &str,
+    target: &Path,
+    message_suffix: &str,
+) -> Result<(), ExitCode> {
+    if let Some(candidate) = candidate
+        && would_replace(candidate, target)
+    {
+        return Err(fail(format!(
+            "--{flag} {} is also {message_suffix}",
+            candidate.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Checks `--render`'s and `--overlay`'s inputs before anything is
 /// written: neither may collide with `zmap`, `out`, the other, or any
 /// source frame, and `--frames` must hold the frame count and dimensions
@@ -244,41 +264,37 @@ fn validate_render_args(
     overlay_path: Option<&Path>,
     info: ZMapInfo,
 ) -> Result<(), ExitCode> {
+    refuse_if_collides(
+        render_path,
+        "render",
+        zmap,
+        "--zmap: refusing to overwrite the input",
+    )?;
+    refuse_if_collides(
+        render_path,
+        "render",
+        out,
+        "--out: refusing to overwrite the edited map",
+    )?;
+    refuse_if_collides(
+        overlay_path,
+        "overlay",
+        zmap,
+        "--zmap: refusing to overwrite the input",
+    )?;
+    refuse_if_collides(
+        overlay_path,
+        "overlay",
+        out,
+        "--out: refusing to overwrite the edited map",
+    )?;
     if let Some(render_path) = render_path {
-        if would_replace(render_path, zmap) {
-            return Err(fail(format!(
-                "--render {} is also --zmap: refusing to overwrite the input",
-                render_path.display()
-            )));
-        }
-        if would_replace(render_path, out) {
-            return Err(fail(format!(
-                "--render {} is also --out: refusing to overwrite the edited map",
-                render_path.display()
-            )));
-        }
-    }
-    if let Some(overlay_path) = overlay_path {
-        if would_replace(overlay_path, zmap) {
-            return Err(fail(format!(
-                "--overlay {} is also --zmap: refusing to overwrite the input",
-                overlay_path.display()
-            )));
-        }
-        if would_replace(overlay_path, out) {
-            return Err(fail(format!(
-                "--overlay {} is also --out: refusing to overwrite the edited map",
-                overlay_path.display()
-            )));
-        }
-        if let Some(render_path) = render_path
-            && would_replace(overlay_path, render_path)
-        {
-            return Err(fail(format!(
-                "--overlay {} is also --render: refusing to overwrite it",
-                overlay_path.display()
-            )));
-        }
+        refuse_if_collides(
+            overlay_path,
+            "overlay",
+            render_path,
+            "--render: refusing to overwrite it",
+        )?;
     }
 
     let paths = match frame_paths(frames_dir) {
@@ -286,22 +302,18 @@ fn validate_render_args(
         Err(err) => return Err(fail(err)),
     };
     for frame in &paths {
-        if let Some(render_path) = render_path
-            && would_replace(render_path, frame)
-        {
-            return Err(fail(format!(
-                "--render {} is also a source frame: refusing to overwrite it",
-                render_path.display()
-            )));
-        }
-        if let Some(overlay_path) = overlay_path
-            && would_replace(overlay_path, frame)
-        {
-            return Err(fail(format!(
-                "--overlay {} is also a source frame: refusing to overwrite it",
-                overlay_path.display()
-            )));
-        }
+        refuse_if_collides(
+            render_path,
+            "render",
+            frame,
+            "a source frame: refusing to overwrite it",
+        )?;
+        refuse_if_collides(
+            overlay_path,
+            "overlay",
+            frame,
+            "a source frame: refusing to overwrite it",
+        )?;
     }
     let stack = match TiffStack::open_files(&paths) {
         Ok(stack) => stack,
