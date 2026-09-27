@@ -51,6 +51,9 @@ fn controller_with_frames(name: &str, count: usize) -> AppController {
         common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
+    // These tabs exercise queueing, saving and closing, not alignment
+    // quality; an algorithm that always converges keeps every run clean.
+    controller.set_align_algorithm("dummy-align");
     controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
     controller
 }
@@ -68,6 +71,7 @@ fn controller_with_two_tabs(name: &str) -> AppController {
         common::open_and_settle(&mut controller, &[root_b]),
         OpenOutcome::Opened(_)
     ));
+    controller.set_align_algorithm("dummy-align");
     controller.select_project(0);
     controller
 }
@@ -85,6 +89,7 @@ fn controller_with_three_tabs(name: &str) -> AppController {
         common::open_and_settle(&mut controller, &[root_c]),
         OpenOutcome::Opened(_)
     ));
+    controller.set_align_algorithm("dummy-align");
     controller.select_project(0);
     controller
 }
@@ -131,6 +136,10 @@ fn fuse_runs_to_completion_off_the_ui_thread() {
         job::RunState::Fused { .. } => {}
         other => panic!("expected a completed fuse, got {other:?}"),
     }
+    assert!(
+        controller.pending_divergence().is_none(),
+        "a run with no diverged frame asks nothing"
+    );
     assert!(
         controller.project_tabs()[0].unsaved,
         "a fused tab stays unsaved until it is saved"
@@ -503,11 +512,40 @@ fn write_synthetic_frame(path: &Path, size: u32, flat: bool) {
     writer.finish().unwrap();
 }
 
+/// Opens a new tab over `frame_count` textured synthetic frames, then
+/// overwrites the last one with bytes the TIFF reader refuses, so a fuse of
+/// it fails inside the pipeline. The tab becomes active.
+fn add_unreadable_tab(controller: &mut AppController, name: &str, frame_count: usize) {
+    let root = common::tree(&format!("{name}_frames"));
+    for i in 0..frame_count {
+        write_synthetic_frame(&root.join(format!("{i:02}.tif")), 64, false);
+    }
+    assert!(matches!(
+        common::open_and_settle(controller, std::slice::from_ref(&root)),
+        OpenOutcome::Opened(_)
+    ));
+    controller.set_align_algorithm("dummy-align");
+    std::fs::write(
+        root.join(format!("{:02}.tif", frame_count - 1)),
+        b"not a tiff",
+    )
+    .unwrap();
+}
+
+/// A controller with one tab over two frames, the second unreadable.
+fn controller_with_an_unreadable_frame(name: &str) -> AppController {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
+    add_unreadable_tab(&mut controller, name, 2);
+    controller
+}
+
 /// A controller with one unsaved project over two synthetic frames that
 /// `pyramidal-ecc` cannot align: a textured reference and a perfectly flat
 /// second frame, whose zero gradient drives the solver's Hessian singular
 /// (`focusforge_core::align::ecc`'s own divergence tests use the same
-/// construction).
+/// construction). Its fuse completes lax and parks, naming `01.tif`. The
+/// scratch root is `<name>_scratch` under `CARGO_TARGET_TMPDIR`.
 fn controller_with_unalignable_frames(name: &str) -> AppController {
     let root = common::tree(&format!("{name}_frames"));
     write_synthetic_frame(&root.join("00.tif"), 64, false);
@@ -517,17 +555,100 @@ fn controller_with_unalignable_frames(name: &str) -> AppController {
         common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
     ));
-    // Pinned rather than left at the tab's default seed: the flat frame's
-    // zero gradient is what drives `pyramidal-ecc`'s solver singular, and
-    // that failure mode is specific to this algorithm's own math.
+    // The flat frame's zero gradient drives this algorithm's own solver
+    // singular.
     controller.set_align_algorithm("pyramidal-ecc");
     controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
     controller
 }
 
+/// Every file under `scratch` that sits in a `held` directory.
+fn held_files(scratch: &Path) -> Vec<PathBuf> {
+    listing(scratch)
+        .into_iter()
+        .filter(|p| p.components().any(|c| c.as_os_str() == "held"))
+        .filter(|p| scratch.join(p).is_file())
+        .collect()
+}
+
+/// [`controller_with_unalignable_frames`], fused until its run parks.
+/// Returns the controller and its scratch root.
+fn parked_controller(name: &str) -> (AppController, PathBuf) {
+    let mut controller = controller_with_unalignable_frames(name);
+    assert!(controller.start_fuse());
+    assert!(
+        common::wait_for_settle(&mut controller, Duration::from_secs(60)).is_none(),
+        "a parked run feeds the canvas nothing"
+    );
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_scratch"));
+    (controller, scratch)
+}
+
+#[test]
+fn a_diverging_run_parks_naming_the_frame() {
+    let (controller, scratch) = parked_controller("parks");
+    assert_eq!(controller.job_view().state, job::RunState::Idle);
+    assert_eq!(controller.checkpoint_count(), Some(0));
+    assert!(controller.job_failure_message().is_none());
+    assert_eq!(
+        controller.pending_divergence(),
+        Some(&["01.tif".to_string()][..])
+    );
+    assert!(
+        !held_files(&scratch).is_empty(),
+        "the parked run's files stay on disk until a decision"
+    );
+}
+
+#[test]
+fn keep_commits_a_parked_run_like_a_clean_one() {
+    let (mut controller, _) = parked_controller("keep");
+    let planes = controller
+        .keep_fused()
+        .expect("a parked run is there to keep");
+    assert_eq!(controller.checkpoint_count(), Some(1));
+    assert!(matches!(
+        controller.job_view().state,
+        job::RunState::Fused { .. }
+    ));
+    assert!(controller.pending_divergence().is_none());
+    let held = controller.held_checkpoints().last().unwrap();
+    assert_eq!(planes, (held.composite.clone(), held.zmap.clone()));
+    assert_eq!(controller.materialize_active_tab_planes(), Some(planes));
+}
+
+#[test]
+fn discard_deletes_a_parked_run() {
+    let (mut controller, scratch) = parked_controller("discard");
+    controller.discard_fused();
+    assert_eq!(controller.checkpoint_count(), Some(0));
+    assert_eq!(controller.job_view().state, job::RunState::Idle);
+    assert!(controller.pending_divergence().is_none());
+    assert_eq!(held_files(&scratch), Vec::<PathBuf>::new());
+}
+
+#[test]
+fn closing_a_tab_deletes_its_parked_run() {
+    let (mut controller, scratch) = parked_controller("close_parked");
+    controller.request_close(0);
+    assert!(controller.pending_close().is_none());
+    assert_eq!(controller.project_tabs().len(), 0);
+    assert_eq!(held_files(&scratch), Vec::<PathBuf>::new());
+}
+
+#[test]
+fn a_parked_run_makes_quit_ask() {
+    let (mut controller, _) = parked_controller("quit_parked");
+    controller.window_close();
+    let copy = controller
+        .pending_quit_copy()
+        .expect("an undecided run is unsaved work");
+    assert!(copy.body.starts_with("1 project"), "{}", copy.body);
+}
+
 #[test]
 fn failure_is_reported_and_retryable() {
-    let mut controller = controller_with_unalignable_frames("failure");
+    let mut controller = controller_with_an_unreadable_frame("failure");
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60));
     assert!(!controller.job_running());
@@ -551,7 +672,7 @@ fn failure_is_reported_and_retryable() {
     match controller.job_view().state {
         job::RunState::Failed(_) => {}
         other => {
-            panic!("retrying the same unalignable frames must fail the same way, got {other:?}")
+            panic!("retrying the same unreadable frame must fail the same way, got {other:?}")
         }
     }
 }
@@ -563,23 +684,19 @@ fn failure_is_reported_and_retryable() {
 /// actually failed, with the tab's own full message unchanged inside it.
 #[test]
 fn failure_summary_names_the_failed_operation() {
+    // A GUI fuse no longer fails on a per-frame alignment divergence (lax
+    // mode parks it instead, see `controller_with_unalignable_frames`'s own
+    // doc comment), so the `Align` classification is checked directly against
+    // the error variant it actually comes from -- the solver's `Err` in
+    // `pipeline::run` -- rather than through an end-to-end GUI run.
     let alignment_operation;
     let alignment_summary;
     {
-        let mut controller = controller_with_unalignable_frames("summary_align");
-        assert!(controller.start_fuse());
-        common::wait_for_settle(&mut controller, Duration::from_secs(60));
-        let message = controller
-            .job_failure_message()
-            .expect("an unalignable stack must fail")
-            .to_string();
-        let notification = controller
-            .notifications()
-            .last()
-            .expect("the failed run must append a notification");
-        assert_eq!(notification.message, message);
-        alignment_operation = notification.operation;
-        alignment_summary = notification.operation.summary();
+        let operation = job::FailedOperation::from(&pipeline::PipelineError::Align(
+            "synthetic alignment failure".to_string(),
+        ));
+        alignment_operation = operation;
+        alignment_summary = operation.summary();
         assert_eq!(alignment_operation, job::FailedOperation::Alignment);
     }
 
@@ -649,8 +766,8 @@ fn failure_summary_names_the_failed_operation() {
 }
 
 #[test]
-fn the_failure_message_names_the_frame_and_the_reason() {
-    let mut controller = controller_with_unalignable_frames("message");
+fn the_failure_message_names_the_frame() {
+    let mut controller = controller_with_an_unreadable_frame("message");
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60));
     assert!(!controller.job_running());
@@ -658,23 +775,9 @@ fn the_failure_message_names_the_frame_and_the_reason() {
         .job_failure_message()
         .expect("a failed run must carry its own message")
         .to_string();
-
     assert!(
         message.contains("01.tif"),
-        "message must name the diverged frame's file name, got: {message}"
-    );
-    assert!(
-        !message.contains("SingularHessian"),
-        "message must spell the reason in words, not the status identifier, got: {message}"
-    );
-    assert!(
-        message.contains("too little texture to register"),
-        "the flat second frame's zero gradient drives a singular Hessian, so the message \
-         must carry that reason in words, got: {message}"
-    );
-    assert!(
-        !message.contains("total"),
-        "only one frame diverges here, so the message must not state a frame count: {message}"
+        "message must name the unreadable frame's file name, got: {message}"
     );
 }
 
@@ -1352,29 +1455,12 @@ fn a_fused_tab_keeps_its_own_completion_after_a_later_run() {
     );
 }
 
-/// A controller tab that cannot align: a textured reference frame and
-/// `frame_count - 1` perfectly flat ones, whose zero gradient drives
-/// `pyramidal-ecc`'s solver singular. Opens as a new tab, which becomes
-/// active.
-fn add_unalignable_tab(controller: &mut AppController, name: &str, frame_count: usize) {
-    let root = common::tree(&format!("{name}_frames"));
-    write_synthetic_frame(&root.join("00.tif"), 64, false);
-    for i in 1..frame_count {
-        write_synthetic_frame(&root.join(format!("{i:02}.tif")), 64, true);
-    }
-    assert!(matches!(
-        common::open_and_settle(controller, &[root]),
-        OpenOutcome::Opened(_)
-    ));
-    controller.set_align_algorithm("pyramidal-ecc");
-}
-
 #[test]
 fn two_failures_keep_their_own_messages_and_requests() {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(common::tree("two_failures_scratch"));
 
-    add_unalignable_tab(&mut controller, "two_failures_a", 2);
+    add_unreadable_tab(&mut controller, "two_failures_a", 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60));
     let message_a = controller
@@ -1382,7 +1468,7 @@ fn two_failures_keep_their_own_messages_and_requests() {
         .expect("tab A must carry its own failure message")
         .to_string();
 
-    add_unalignable_tab(&mut controller, "two_failures_b", 3);
+    add_unreadable_tab(&mut controller, "two_failures_b", 3);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60));
     let message_b = controller
@@ -1434,7 +1520,7 @@ fn failure_notifications_outlive_the_toast() {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(common::tree("outlive_scratch"));
 
-    add_unalignable_tab(&mut controller, "outlive_a", 2);
+    add_unreadable_tab(&mut controller, "outlive_a", 2);
     let title_a = controller.project_tabs()[0].title.clone();
     let path_a = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("outlive_a_frames");
     assert!(controller.start_fuse());
@@ -1444,7 +1530,7 @@ fn failure_notifications_outlive_the_toast() {
         .expect("tab A must fail")
         .to_string();
 
-    add_unalignable_tab(&mut controller, "outlive_b", 3);
+    add_unreadable_tab(&mut controller, "outlive_b", 3);
     let title_b = controller.project_tabs()[1].title.clone();
     let path_b = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("outlive_b_frames");
     assert!(controller.start_fuse());
@@ -1484,7 +1570,7 @@ fn failure_notifications_outlive_the_toast() {
     );
 
     assert_eq!(notifications[0].message, message_a);
-    assert_eq!(notifications[0].operation, job::FailedOperation::Alignment);
+    assert_eq!(notifications[0].operation, job::FailedOperation::Setup);
     assert_eq!(notifications[0].project_title, Some(title_a));
     assert_eq!(notifications[0].project_path, Some(path_a));
     assert_eq!(notifications[0].target, None);
@@ -1494,7 +1580,7 @@ fn failure_notifications_outlive_the_toast() {
         (&notifications[2], &retry_message),
     ] {
         assert_eq!(notification.message, *message);
-        assert_eq!(notification.operation, job::FailedOperation::Alignment);
+        assert_eq!(notification.operation, job::FailedOperation::Setup);
         assert_eq!(notification.project_title, Some(title_b.clone()));
         assert_eq!(notification.project_path, Some(path_b.clone()));
         assert_eq!(notification.target, None);
@@ -1820,6 +1906,7 @@ fn a_run_keeps_its_tab_when_an_earlier_tab_closes() {
         common::open_and_settle(&mut controller, &[root_c]),
         OpenOutcome::Opened(_)
     ));
+    controller.set_align_algorithm("dummy-align");
 
     // Tab 2 (four frames) runs; tabs 0 and 1 stay idle.
     controller.select_project(2);
@@ -2107,7 +2194,7 @@ fn the_strip_marks_the_fusing_tab_and_the_queued_ones() {
 fn retry_queues_while_another_run_is_live() {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(common::tree("retry_queues_scratch"));
-    add_unalignable_tab(&mut controller, "retry_queues_a", 2);
+    add_unreadable_tab(&mut controller, "retry_queues_a", 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60));
     match controller.job_view().state {
@@ -2182,7 +2269,7 @@ fn a_second_start_queues_while_a_run_is_live() {
 fn closing_the_owning_tab_mid_run_promotes_nothing() {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(common::tree("closing_mid_run_scratch"));
-    add_unalignable_tab(&mut controller, "closing_mid_run_a", 2);
+    add_unreadable_tab(&mut controller, "closing_mid_run_a", 2);
     // The survivor: a different frame count than tab A's, so a leaked value
     // could not pass by coincidence.
     let survivor_root = common::tree("closing_mid_run_b_frames");
@@ -2278,6 +2365,7 @@ fn a_first_fuse_writes_no_project_file() {
         common::open_and_settle(&mut controller, std::slice::from_ref(&root)),
         OpenOutcome::Opened(_)
     ));
+    controller.set_align_algorithm("dummy-align");
     controller.set_scratch_root_for_test(common::tree("first_fuse_writes_nothing_scratch"));
     let before = listing(&root);
 

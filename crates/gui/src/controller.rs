@@ -44,8 +44,10 @@ pub use crate::entry::{
     EntryError, GroupingQuestion, GuiProject, OpenAs, OpenOutcome, Opened, Proposal,
 };
 
-/// The stacking/editor mode switch's two positions. Editor is unreachable --
-/// `AppController::set_mode` enforces that, not the Slint side.
+/// The stacking/editor mode switch's two positions. Editor is reachable only
+/// on a tab whose planes are fused and whose frame list still matches them --
+/// `AppController::set_mode` and `editor_enabled` enforce that, not the
+/// Slint side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShellMode {
     #[default]
@@ -267,6 +269,10 @@ struct ProjectTab {
     /// Every checkpoint fused since the last save, oldest first -- in no
     /// `.ffp` until [`AppController::save_active_project`] writes them.
     held: Vec<job::HeldCheckpoint>,
+    /// A completed run whose alignment left frames unregistered, waiting for
+    /// [`AppController::keep_fused`] or [`AppController::discard_fused`];
+    /// not counted in `checkpoints` or `held` until kept.
+    parked: Option<ParkedRun>,
     /// The ordered frame set a fuse actually consumes -- session-only, seeded
     /// from [`entry::project_frames`] and re-seeded from the run's own frames
     /// on every successful run, so a fused tab's list always matches what it
@@ -296,6 +302,16 @@ struct ProjectTab {
     /// The request behind this tab's own last run, kept for `Retry` --
     /// `None` until a run is started on this tab.
     request: Option<job::JobRequest>,
+    /// This tab's own editor session, opened over its fused Z-Map on first
+    /// entry into editor mode -- `None` until then, and cleared whenever a
+    /// newer checkpoint replaces the planes it was opened over.
+    edit: Option<job::EditSession>,
+}
+
+/// A held checkpoint whose run diverged on `diverged`, by frame file name.
+struct ParkedRun {
+    held: job::HeldCheckpoint,
+    diverged: Vec<String>,
 }
 
 /// Whether a project's own load worker attempted to decode its thumbnail --
@@ -348,6 +364,7 @@ impl ProjectTab {
             menu_open: None,
             checkpoints,
             held: Vec::new(),
+            parked: None,
             frames,
             excluded,
             selected,
@@ -355,6 +372,7 @@ impl ProjectTab {
             thumbnail,
             run: job::RunState::Idle,
             request: None,
+            edit: None,
         }
     }
 
@@ -362,6 +380,12 @@ impl ProjectTab {
     /// project, or any checkpoint fused since the last save.
     fn unsaved(&self) -> bool {
         matches!(self.project, GuiProject::Unsaved(_)) || !self.held.is_empty()
+    }
+
+    /// Whether quitting now would lose a run of this tab: a held checkpoint,
+    /// or a parked run still waiting for Keep or Discard.
+    fn quit_loses_work(&self) -> bool {
+        !self.held.is_empty() || self.parked.is_some()
     }
 
     /// The frames a fuse of this tab would actually use -- `frames` with
@@ -373,6 +397,28 @@ impl ProjectTab {
             .filter(|(i, _)| !self.excluded.get(*i).copied().unwrap_or(false))
             .map(|(_, path)| path.clone())
             .collect()
+    }
+
+    /// Whether this tab can enter editor mode: at least one checkpoint, its
+    /// own run neither live nor waiting in the queue, and `frames` still
+    /// naming the frame set the fused planes were built from -- the newest
+    /// held checkpoint's own `sources`, or a reopened project's own manifest
+    /// when nothing is held.
+    fn can_edit(&self) -> bool {
+        if self.checkpoints == 0 {
+            return false;
+        }
+        if job::is_live(&self.run) || matches!(self.run, job::RunState::Queued { .. }) {
+            return false;
+        }
+        let fused = match self.held.last() {
+            Some(held) => held.sources.clone(),
+            None if matches!(self.project, GuiProject::Opened(_)) => {
+                entry::project_frames(&self.project)
+            }
+            None => return false,
+        };
+        self.frames == fused
     }
 
     /// Permutes `frames` and `excluded` together by `order` (each entry the
@@ -755,12 +801,9 @@ impl AppController {
         controller
     }
 
-    /// Test-only: a controller already in `mode`, bypassing
-    /// [`Self::set_mode`]'s guard against [`ShellMode::Editor`]. No
-    /// Slint callback reaches this constructor -- only `set_mode` is wired
-    /// in `src/bridge.rs` -- so the editor half stays unreachable from a
-    /// running window while its dispatch logic stays testable from
-    /// `cargo test` "by construction".
+    /// Test-only: a controller already in `mode` with no tab open, bypassing
+    /// [`Self::set_mode`]'s check for a fused active tab -- for tests of
+    /// editor-mode input dispatch that need no planes or edit session.
     pub fn new_with_mode_for_test(mode: ShellMode) -> Self {
         let mut controller = Self::new();
         controller.state.mode = mode;
@@ -804,10 +847,13 @@ impl AppController {
         self.state.mode
     }
 
-    /// Returns `false` and emits nothing for [`ShellMode::Editor`]: there
-    /// is no editor to switch to.
+    /// Returns `false` and emits nothing for [`ShellMode::Editor`] unless
+    /// [`Self::editor_enabled`] is `true`. Entering editor mode opens the
+    /// active tab's own edit session on first entry -- a failure to
+    /// materialize or open its Z-Map also returns `false` and emits nothing,
+    /// leaving the mode unchanged.
     pub fn set_mode(&mut self, mode: ShellMode) -> bool {
-        if mode == ShellMode::Editor {
+        if mode == ShellMode::Editor && !(self.editor_enabled() && self.ensure_edit_session()) {
             return false;
         }
         self.state.mode = mode;
@@ -815,9 +861,64 @@ impl AppController {
         true
     }
 
-    /// Always `false`.
+    /// Opens the active tab's edit session over its whole Z-Map unless the
+    /// tab already holds one. `false` with no active tab, or when its Z-Map
+    /// fails to materialize or open.
+    fn ensure_edit_session(&mut self) -> bool {
+        if self.state.active().is_some_and(|tab| tab.edit.is_some()) {
+            return true;
+        }
+        let Some((_, zmap)) = self.materialize_active_tab_planes() else {
+            return false;
+        };
+        let Ok(session) = job::open_edit_session(&zmap) else {
+            return false;
+        };
+        let Some(tab) = self.state.active_mut() else {
+            return false;
+        };
+        tab.edit = Some(session);
+        true
+    }
+
+    /// Whether the active tab can enter editor mode -- pure and I/O-free,
+    /// safe to push after any event that might change it (a tab switch, a
+    /// run settling, a project opening, a frame-set change).
     pub fn editor_enabled(&self) -> bool {
-        false
+        self.state.active().is_some_and(ProjectTab::can_edit)
+    }
+
+    /// The active tab's own edit session, once editor mode has opened one.
+    pub fn edit_session(&self) -> Option<&job::EditSession> {
+        self.state.active()?.edit.as_ref()
+    }
+
+    /// Mutable twin of [`Self::edit_session`] -- the seam an editor op
+    /// appends through.
+    pub fn edit_session_mut(&mut self) -> Option<&mut job::EditSession> {
+        self.state.active_mut()?.edit.as_mut()
+    }
+
+    /// In editor mode, gives a newly active editable tab its own edit
+    /// session; drops the window back to stacking, with exactly one
+    /// `ModeChanged(Stacking)`, when the active tab no longer satisfies
+    /// [`Self::editor_enabled`] or its session cannot open -- a switch away
+    /// from a fused tab, that tab's own run starting or being promoted, or a
+    /// confirmed frame-set change.
+    fn leave_editor_if_unfit(&mut self) {
+        if self.state.mode == ShellMode::Editor
+            && !(self.editor_enabled() && self.ensure_edit_session())
+        {
+            self.state.mode = ShellMode::Stacking;
+            self.emit(ShellEvent::ModeChanged(ShellMode::Stacking));
+        }
+    }
+
+    /// The brush's source index: the active tab's `selected` position, or
+    /// `None` with no active tab or a position past `u16::MAX`. Computed on
+    /// every call from `selected`; no field holds a copy.
+    pub fn brush_source(&self) -> Option<u16> {
+        u16::try_from(self.state.active()?.selected).ok()
     }
 
     pub fn dock_tab(&self) -> DockTab {
@@ -860,14 +961,14 @@ impl AppController {
         self.emit(ShellEvent::WindowMaximizeToggled(self.state.maximized));
     }
 
-    /// Quits the window: with every tab's held checkpoints empty, closes it
-    /// at once. Otherwise raises [`Self::pending_quit_copy`] and touches no
-    /// tab. A no-op while a close question is open.
+    /// Quits the window: with no tab holding a checkpoint or a parked run,
+    /// closes it at once. Otherwise raises [`Self::pending_quit_copy`] and
+    /// touches no tab. A no-op while a close question is open.
     pub fn window_close(&mut self) {
         if self.state.pending_close.is_some() {
             return;
         }
-        if self.state.projects.iter().all(|tab| tab.held.is_empty()) {
+        if !self.state.projects.iter().any(ProjectTab::quit_loses_work) {
             self.emit(ShellEvent::WindowCloseRequested);
         } else {
             self.state.pending_quit = true;
@@ -1670,6 +1771,7 @@ impl AppController {
             self.state.pending_frame_change = None;
         }
         self.state.active = active;
+        self.leave_editor_if_unfit();
     }
 
     /// "+": selects the pseudo-tab, leaving every project tab open and the
@@ -1764,6 +1866,9 @@ impl AppController {
                 std::fs::remove_dir_all(job::plane_cache_dir(&self.scratch_root(), project.path()));
         }
         remove_held(&closed.held);
+        if let Some(parked) = &closed.parked {
+            remove_held(std::slice::from_ref(&parked.held));
+        }
         // A closed tab leaves the queue by its own id -- no renumbering by
         // index is needed for the tabs behind it.
         self.job.queue.retain(|&id| id != closed.id);
@@ -1784,6 +1889,7 @@ impl AppController {
         if closed_was_active {
             self.state.pending_frame_change = None;
         }
+        self.leave_editor_if_unfit();
         // A close renumbers every later tab down by one, so an index-shaped
         // owner marker can end up comparing equal to a *different* tab --
         // force a reload rather than trust the comparison.
@@ -2910,7 +3016,7 @@ impl AppController {
     }
 
     /// The quit question still open, if any: how many tabs hold checkpoints
-    /// no `.ffp` contains.
+    /// no `.ffp` contains or a parked run nobody decided on.
     pub fn pending_quit_copy(&self) -> Option<CloseGuardCopy> {
         if !self.state.pending_quit {
             return None;
@@ -2919,7 +3025,7 @@ impl AppController {
             .state
             .projects
             .iter()
-            .filter(|tab| !tab.held.is_empty())
+            .filter(|tab| tab.quit_loses_work())
             .count();
         let body = if n == 1 {
             "1 project has unsaved work. Quitting now loses all of it.".to_string()
@@ -2947,6 +3053,7 @@ impl AppController {
     /// checkpoints.
     pub fn quit_without_saving(&mut self) {
         self.state.pending_quit = false;
+        self.remove_parked_runs();
         self.emit(ShellEvent::WindowCloseRequested);
     }
 
@@ -2971,6 +3078,7 @@ impl AppController {
             }
         }
         self.state.pending_quit = false;
+        self.remove_parked_runs();
         self.emit(ShellEvent::WindowCloseRequested);
         true
     }
@@ -3269,7 +3377,7 @@ impl AppController {
             fuse_values: tab.fuse_values.clone(),
             align_id: Some(tab.align_id.clone()),
             align_values: tab.align_values.clone(),
-            align_lax: false,
+            align_lax: true,
             crop: true,
             backend: None,
         })
@@ -3299,6 +3407,7 @@ impl AppController {
         self.job.queue.push_back(id);
         self.renumber_queue();
         self.emit(ShellEvent::JobChanged);
+        self.leave_editor_if_unfit();
         Some(true)
     }
 
@@ -3329,8 +3438,7 @@ impl AppController {
         let Some(request) = self.fuse_request_for(active) else {
             return false;
         };
-        self.run_request(active, request);
-        true
+        self.run_request(active, request)
     }
 
     /// Pauses a running job, or resumes a paused one -- a no-op while the
@@ -3419,23 +3527,40 @@ impl AppController {
         if let Some(enqueued) = self.try_enqueue(id) {
             return enqueued;
         }
-        self.run_request(active, request);
-        true
+        self.run_request(active, request)
     }
 
-    /// Starts `request` on tab `tab_index`, off the UI thread.
-    fn run_request(&mut self, tab_index: usize, request: job::JobRequest) {
+    /// Starts `request` on tab `tab_index`, off the UI thread, discarding a
+    /// run the tab still has parked. Refuses with a message, leaving the tab
+    /// as it was, when an algorithm id does not resolve. Returns whether the
+    /// run started.
+    fn run_request(&mut self, tab_index: usize, request: job::JobRequest) -> bool {
+        let algorithms = match job::resolve_request(&request) {
+            Ok(algorithms) => algorithms,
+            Err(message) => {
+                self.refuse_message(message);
+                return false;
+            }
+        };
         let control = job::JobControl::new();
         let observer = Arc::new(job::GuiObserver::new());
         self.job.control = Some(Arc::clone(&control));
         self.job.observer = Some(Arc::clone(&observer));
         self.job.tab_id = self.state.projects.get(tab_index).map(|tab| tab.id);
-        self.job.handle = Some(job::spawn(request.clone(), control, observer));
+        if let Some(tab) = self.state.projects.get_mut(tab_index) {
+            // The new run holds into the same directory the parked one uses.
+            if let Some(parked) = tab.parked.take() {
+                remove_held(std::slice::from_ref(&parked.held));
+            }
+        }
+        self.job.handle = Some(job::spawn(request.clone(), algorithms, control, observer));
         if let Some(tab) = self.state.projects.get_mut(tab_index) {
             tab.run = job::RunState::Running;
             tab.request = Some(request);
         }
         self.emit(ShellEvent::JobChanged);
+        self.leave_editor_if_unfit();
+        true
     }
 
     /// The active tab's own failed run message, `None` outside
@@ -3608,28 +3733,24 @@ impl AppController {
             _ => {}
         }
 
-        let planes = settled.held.and_then(|held| {
-            let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) else {
+        let owner = tab_index.filter(|&i| i < self.state.projects.len());
+        let planes = match (settled.held, owner) {
+            (None, _) => None,
+            (Some(held), None) => {
                 remove_held(std::slice::from_ref(&held));
-                return None;
-            };
-            let path = project_identity_path(&tab.project);
-            tab.checkpoints += 1;
-            if let Some(request) = &request {
-                tab.frames = request.frames.clone();
+                None
             }
-            tab.excluded = vec![false; tab.frames.len()];
-            tab.selected = images::first_included(&tab.excluded);
-            tab.frame_sort = None;
-            tab.thumbnail = overlay::render_thumbnail_from_frame(&held.composite).map(Arc::new);
-            let (composite, zmap) = (held.composite.clone(), held.zmap.clone());
-            tab.held.push(held);
-            Some((path, composite, zmap))
-        });
-        let planes = planes.map(|(path, composite, zmap)| {
-            self.clear_failure(&path);
-            (composite, zmap)
-        });
+            (Some(held), Some(index)) if !settled.diverged.is_empty() => {
+                let tab = &mut self.state.projects[index];
+                tab.run = job::RunState::Idle;
+                tab.parked = Some(ParkedRun {
+                    held,
+                    diverged: settled.diverged,
+                });
+                None
+            }
+            (Some(held), Some(index)) => Some(self.commit_held(index, held)),
+        };
         // Promotes the queue head: an id that no longer resolves (its tab
         // closed) or whose recorded frames are no longer all on disk is
         // dropped and refused, and the next id in line is tried. A popped
@@ -3654,12 +3775,75 @@ impl AppController {
             let Some(request) = self.fuse_request_for(index) else {
                 continue;
             };
-            self.run_request(index, request);
-            break;
+            if self.run_request(index, request) {
+                break;
+            }
         }
         self.renumber_queue();
         self.emit(ShellEvent::JobChanged);
         planes
+    }
+
+    /// Adds `held` to tab `index` as its newest checkpoint, re-seeding the
+    /// frame list from the tab's own last request, and returns its composite
+    /// and Z-Map paths for the canvas.
+    fn commit_held(&mut self, index: usize, held: job::HeldCheckpoint) -> (PathBuf, PathBuf) {
+        let tab = &mut self.state.projects[index];
+        let path = project_identity_path(&tab.project);
+        tab.checkpoints += 1;
+        if let Some(request) = &tab.request {
+            tab.frames = request.frames.clone();
+        }
+        tab.excluded = vec![false; tab.frames.len()];
+        tab.selected = images::first_included(&tab.excluded);
+        tab.frame_sort = None;
+        tab.edit = None;
+        tab.thumbnail = overlay::render_thumbnail_from_frame(&held.composite).map(Arc::new);
+        let planes = (held.composite.clone(), held.zmap.clone());
+        tab.held.push(held);
+        self.clear_failure(&path);
+        planes
+    }
+
+    /// The frames the active tab's parked run could not align, by file name;
+    /// `None` while it has no parked run.
+    pub fn pending_divergence(&self) -> Option<&[String]> {
+        let parked = self.state.active()?.parked.as_ref()?;
+        Some(parked.diverged.as_slice())
+    }
+
+    /// `Keep` on the active tab's parked run: commits it exactly as a run
+    /// without divergence commits, returning the planes the canvas reloads
+    /// from. `None` with nothing parked.
+    pub fn keep_fused(&mut self) -> Option<(PathBuf, PathBuf)> {
+        let index = self.state.active?;
+        let parked = self.state.projects.get_mut(index)?.parked.take()?;
+        let at = job::format_utc_hhmm(parked.held.created_at);
+        let planes = self.commit_held(index, parked.held);
+        self.state.projects[index].run = job::RunState::Fused { at };
+        self.state.canvas_dirty = true;
+        self.emit(ShellEvent::JobChanged);
+        Some(planes)
+    }
+
+    /// `Discard` on the active tab's parked run: deletes its held files and
+    /// leaves the tab `Idle` with its checkpoint count unchanged.
+    pub fn discard_fused(&mut self) {
+        let Some(parked) = self.state.active_mut().and_then(|tab| tab.parked.take()) else {
+            return;
+        };
+        remove_held(std::slice::from_ref(&parked.held));
+        self.emit(ShellEvent::JobChanged);
+    }
+
+    /// Deletes every tab's parked run -- what quitting does with a decision
+    /// nobody made.
+    fn remove_parked_runs(&mut self) {
+        for tab in &mut self.state.projects {
+            if let Some(parked) = tab.parked.take() {
+                remove_held(std::slice::from_ref(&parked.held));
+            }
+        }
     }
 
     /// The active tab's composite and Z-Map paths: its newest held

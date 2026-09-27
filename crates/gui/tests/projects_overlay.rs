@@ -9,7 +9,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
+use focusforge_core::io::Rect;
 use focusforge_core::params::ParamValues;
 use focusforge_core::project;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
@@ -78,59 +78,12 @@ fn controller_with_frames_and_dir(name: &str, count: usize) -> (AppController, P
     (controller, dir)
 }
 
-/// Writes a tiny 3-channel 16-bit TIFF: a diagonal gradient, or a perfectly
-/// flat field whose zero gradient drives `pyramidal-ecc`'s solver singular
-/// (`tests/job.rs`'s own construction).
-fn write_synthetic_frame(path: &Path, size: u32, flat: bool) {
-    let mut writer = TiffWriter::create(
-        path,
-        TiffSpec {
-            width: size,
-            height: size,
-            samples_per_pixel: 3,
-            description: None,
-        },
-    )
-    .unwrap();
-    let mut samples = vec![0u16; (size * size * 3) as usize];
-    if flat {
-        samples.fill(32768);
-    } else {
-        for y in 0..size {
-            for x in 0..size {
-                let v = (((x + y) * 65535 / (2 * size.max(1))) & 0xffff) as u16;
-                let base = ((y * size + x) * 3) as usize;
-                samples[base] = v;
-                samples[base + 1] = v;
-                samples[base + 2] = v;
-            }
-        }
-    }
-    writer
-        .write_tile(
-            Rect {
-                x: 0,
-                y: 0,
-                width: size,
-                height: size,
-            },
-            &samples,
-        )
-        .unwrap();
-    writer.finish().unwrap();
-}
-
-/// A controller with one unsaved project over two synthetic frames
-/// `pyramidal-ecc` cannot align.
-fn open_unalignable_frames(controller: &mut AppController, name: &str) -> PathBuf {
-    let root = tree(&format!("{name}_frames"));
-    write_synthetic_frame(&root.join("00.tif"), 64, false);
-    write_synthetic_frame(&root.join("01.tif"), 64, true);
-    assert!(matches!(
-        common::open_and_settle(controller, std::slice::from_ref(&root)),
-        OpenOutcome::Opened(_)
-    ));
-    controller.set_align_algorithm("pyramidal-ecc");
+/// [`open_frames`] over two frames, then overwrites the second with bytes
+/// the TIFF reader refuses, so a fuse of it fails inside the pipeline.
+fn open_unreadable_frames(controller: &mut AppController, name: &str) -> PathBuf {
+    let root = open_frames(controller, name, 2);
+    controller.set_align_algorithm("dummy-align");
+    std::fs::write(root.join("01.tif"), b"not a tiff").unwrap();
     root
 }
 
@@ -529,7 +482,7 @@ fn four_failure_cards_have_their_shapes() {
         OpenOutcome::Opened(_)
     ));
 
-    open_unalignable_frames(&mut controller, "four_kinds_fail");
+    open_unreadable_frames(&mut controller, "four_kinds_fail");
     controller.select_project(controller.project_tabs().len() - 1);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(60));
@@ -567,7 +520,7 @@ fn four_failure_cards_have_their_shapes() {
 fn a_failed_stack_is_present_not_absent() {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(tree("present_not_absent_scratch"));
-    open_unalignable_frames(&mut controller, "present_not_absent");
+    open_unreadable_frames(&mut controller, "present_not_absent");
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(60));
 
@@ -598,7 +551,7 @@ fn no_card_shows_a_measure() {
         common::open_and_settle(&mut controller, &[as_given]),
         OpenOutcome::Opened(_)
     ));
-    open_unalignable_frames(&mut controller, "no_measure_fail");
+    open_unreadable_frames(&mut controller, "no_measure_fail");
     controller.select_project(controller.project_tabs().len() - 1);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(60));

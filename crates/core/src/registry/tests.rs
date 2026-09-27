@@ -57,6 +57,55 @@ impl AlignAlgorithm for SyntheticAlign {
     }
 }
 
+/// An alignment entry carrying the two default-rule markers, for feeding
+/// [`default_in`].
+struct MarkedAlign {
+    id: &'static str,
+    test_only: bool,
+    default: bool,
+}
+
+impl AlignAlgorithm for MarkedAlign {
+    fn id(&self) -> &str {
+        self.id
+    }
+    fn display_name(&self) -> &str {
+        self.id
+    }
+    fn params(&self) -> &[ParamDesc] {
+        &[]
+    }
+    fn test_only(&self) -> bool {
+        self.test_only
+    }
+    fn is_default(&self) -> bool {
+        self.default
+    }
+    fn align_frame(
+        &self,
+        _ctx: &crate::algorithm::AlignContext<'_>,
+        _frame: usize,
+        _cfg: &ParamValues,
+    ) -> Result<crate::algorithm::AlignOutcome, crate::algorithm::AlgorithmError> {
+        unreachable!("synthetic algorithm is never run, only indexed")
+    }
+}
+
+const fn marked(id: &'static str, test_only: bool, default: bool) -> MarkedAlign {
+    MarkedAlign {
+        id,
+        test_only,
+        default,
+    }
+}
+
+static REAL_ZULU: MarkedAlign = marked("zulu", false, false);
+static REAL_MIKE: MarkedAlign = marked("mike", false, false);
+static REAL_MIKE_DEFAULT: MarkedAlign = marked("mike", false, true);
+static REAL_ZULU_DEFAULT: MarkedAlign = marked("zulu", false, true);
+static TEST_ONLY_ALFA: MarkedAlign = marked("alfa", true, false);
+static TEST_ONLY_BRAVO: MarkedAlign = marked("bravo", true, true);
+
 static SYN_STACK_A: SyntheticStack = SyntheticStack("alpha");
 static SYN_STACK_B: SyntheticStack = SyntheticStack("bravo");
 static SYN_STACK_DUP: SyntheticStack = SyntheticStack("shared-id");
@@ -246,6 +295,102 @@ fn lists_every_registered_algorithm() {
             "{} must have a non-empty schema",
             entry.id()
         );
+    }
+}
+
+// The default rule's inputs below are fed in descending id order, so a
+// `.first()` over them, or over the id-sorted listing, cannot pass.
+
+#[test]
+fn the_sole_real_align_entry_is_the_default_over_a_test_only_one() {
+    let entries = [
+        AlgorithmRef::Align(&REAL_ZULU),
+        AlgorithmRef::Align(&TEST_ONLY_ALFA),
+    ];
+    let default = default_in(entries, Family::Align).expect("one real entry is the default");
+    assert_eq!(default.id(), "zulu");
+}
+
+#[test]
+fn two_real_align_entries_are_refused_naming_both() {
+    let entries = [
+        AlgorithmRef::Align(&REAL_ZULU),
+        AlgorithmRef::Align(&REAL_MIKE),
+        AlgorithmRef::Align(&TEST_ONLY_ALFA),
+    ];
+    let err = default_in(entries, Family::Align).expect_err("two real entries are ambiguous");
+    let message = err.to_string();
+    assert!(
+        message.starts_with("multiple alignment algorithms are registered"),
+        "{message}"
+    );
+    assert!(
+        message.contains("zulu") && message.contains("mike"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("alfa"),
+        "a test-only entry is never a candidate: {message}"
+    );
+}
+
+#[test]
+fn only_test_only_align_entries_leave_no_default() {
+    // A test-only entry marked default still never counts.
+    let entries = [
+        AlgorithmRef::Align(&TEST_ONLY_BRAVO),
+        AlgorithmRef::Align(&TEST_ONLY_ALFA),
+    ];
+    let err = default_in(entries, Family::Align).expect_err("nothing real is registered");
+    assert_eq!(err.to_string(), "no alignment algorithm is registered");
+}
+
+#[test]
+fn a_stacking_entry_is_never_the_align_default() {
+    let entries = [AlgorithmRef::Stack(&SYN_STACK_A)];
+    let err = default_in(entries, Family::Align).expect_err("no align entry is registered");
+    assert_eq!(err.to_string(), "no alignment algorithm is registered");
+}
+
+#[test]
+fn the_marked_real_entry_wins_over_its_unmarked_siblings() {
+    let entries = [
+        AlgorithmRef::Align(&REAL_ZULU),
+        AlgorithmRef::Align(&REAL_MIKE_DEFAULT),
+        AlgorithmRef::Align(&TEST_ONLY_BRAVO),
+    ];
+    let default = default_in(entries, Family::Align).expect("one real entry is marked");
+    assert_eq!(default.id(), "mike");
+}
+
+#[test]
+fn two_marked_real_entries_are_refused_naming_them() {
+    let entries = [
+        AlgorithmRef::Align(&REAL_ZULU_DEFAULT),
+        AlgorithmRef::Align(&REAL_MIKE_DEFAULT),
+    ];
+    let err = default_in(entries, Family::Align).expect_err("two marked entries are ambiguous");
+    let message = err.to_string();
+    assert!(
+        message.contains("zulu") && message.contains("mike"),
+        "{message}"
+    );
+}
+
+#[cfg(feature = "test-algorithms")]
+#[test]
+fn the_real_registry_defaults_skip_the_test_only_entries() {
+    assert_eq!(
+        default_align().expect("one real align").id(),
+        "pyramidal-ecc"
+    );
+    assert_eq!(
+        default_stack().expect("depth-map is marked").id(),
+        "depth-map"
+    );
+    for entry in algorithms() {
+        let expected = matches!(entry.id(), "dummy-align" | "dummy-stack");
+        assert_eq!(entry.test_only(), expected, "{}", entry.id());
     }
 }
 

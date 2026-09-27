@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
+use focusforge_core::algorithm::{AlignAlgorithm, StackAlgorithm};
 use focusforge_core::gpu::TileBackend;
 use focusforge_core::io::{COMPOSITE_FILENAME, ZMAP_FILENAME};
 use focusforge_core::params::ParamValues;
@@ -19,13 +20,16 @@ use focusforge_core::pipeline::{
     self, AlignRequest, FuseOutput, FuseProduct, FuseRequest, RunStage, StageObserver,
 };
 use focusforge_core::project::{self, Plane, Project, ProjectError};
-use focusforge_core::registry;
+use focusforge_core::registry::{self, LookupError};
+use focusforge_core::tile::Rect;
+use focusforge_core::zmap::{ZMapError, ZMapReader};
 
 /// Re-exported so `crate::controller` -- which names no algorithm crate --
 /// can hold and drive these through the `job::` path alone.
 pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 pub use focusforge_core::project::HeldCheckpoint;
+pub use focusforge_core::retouch::EditSession;
 
 /// Which operation a failure belongs to, classified from the typed
 /// [`PipelineError`] variant rather than from [`JobStage`] or the message
@@ -123,33 +127,62 @@ pub struct JobRequest {
 /// own frame clock.
 pub const POLL: Duration = Duration::from_millis(100);
 
+/// The registered algorithms a [`JobRequest`]'s ids name, resolved before
+/// any thread starts.
+pub struct Algorithms {
+    fuse: &'static dyn StackAlgorithm,
+    align: Option<&'static dyn AlignAlgorithm>,
+}
+
+/// Resolves `request`'s algorithm ids, or the message a refused run shows.
+/// An empty id reports why the registry named no default, when it refused.
+pub fn resolve_request(request: &JobRequest) -> Result<Algorithms, String> {
+    fn lookup<T>(
+        id: &str,
+        find: fn(&str) -> Result<T, LookupError>,
+        default: fn() -> Result<T, LookupError>,
+    ) -> Result<T, String> {
+        find(id).map_err(|err| match default() {
+            Err(refusal) if id.is_empty() => refusal.to_string(),
+            _ => err.to_string(),
+        })
+    }
+    Ok(Algorithms {
+        fuse: lookup(
+            &request.fuse_id,
+            registry::find_stack,
+            registry::default_stack,
+        )?,
+        align: match &request.align_id {
+            Some(id) => Some(lookup(id, registry::find_align, registry::default_align)?),
+            None => None,
+        },
+    })
+}
+
 /// Moves `request` onto a worker thread and runs it to completion through
-/// `focusforge_core::pipeline::run`, reporting through `observer`. Returns
-/// the join handle; the caller is expected to read progress through
-/// `observer` rather than by joining eagerly.
+/// `focusforge_core::pipeline::run` with `algorithms` (from
+/// [`resolve_request`]), reporting through `observer`. Returns the join
+/// handle; the caller is expected to read progress through `observer` rather
+/// than by joining eagerly.
 pub fn spawn(
     request: JobRequest,
+    algorithms: Algorithms,
     control: Arc<JobControl>,
     observer: Arc<GuiObserver>,
 ) -> std::thread::JoinHandle<Result<FuseOutcome, PipelineError>> {
     std::thread::spawn(move || {
-        let algorithm = registry::find_stack(&request.fuse_id)
-            .expect("the tab's own fuse id is always a registered algorithm");
-        let align = request.align_id.map(|id| {
-            let algorithm = registry::find_align(&id)
-                .expect("the tab's own align id is always a registered algorithm");
-            AlignRequest {
-                algorithm,
-                explicit: request.align_values,
-                lax: request.align_lax,
-            }
+        let align = algorithms.align.map(|algorithm| AlignRequest {
+            algorithm,
+            explicit: request.align_values,
+            lax: request.align_lax,
         });
         let fuse_request = FuseRequest {
             frames: request.frames,
             output: FuseOutput::Hold(request.hold_dir),
             scratch_root: request.scratch_root,
             staging_key: request.staging_key,
-            algorithm,
+            algorithm: algorithms.fuse,
             explicit: request.fuse_values,
             align,
             crop: request.crop,
@@ -469,6 +502,24 @@ pub fn materialize_planes(
     Ok((composite, zmap))
 }
 
+/// Opens `zmap` and builds an [`EditSession`] over its whole map -- the same
+/// open-then-read sequence the `retouch` CLI subcommand uses, but over every
+/// pixel rather than an op list's footprint.
+pub fn open_edit_session(zmap: &Path) -> Result<EditSession, ZMapError> {
+    let reader = ZMapReader::open(zmap)?;
+    let info = reader.info();
+    let tile = Rect {
+        x: 0,
+        y: 0,
+        width: info.width(),
+        height: info.height(),
+    };
+    let mut indices = vec![0u16; info.tile_len(tile)];
+    reader.read_tile_into(tile, &mut indices)?;
+    Ok(EditSession::new(info, tile, indices)
+        .expect("a whole-map tile always fits its own map and its own tile_len"))
+}
+
 /// Writes `held`, in order, as one checkpoint chain at `target` -- onto the
 /// project already there when `onto_existing` -- and opens the result. On
 /// failure `target` is left exactly as it was.
@@ -482,12 +533,36 @@ pub fn save_held(
 }
 
 /// One completed worker thread's result, boiled down to the shell's next
-/// [`RunState`] and, on a genuine completion, the checkpoint the run holds.
+/// [`RunState`] and, on a genuine completion, the checkpoint the run holds
+/// and the names of the frames its alignment could not register.
 /// `operation` is `Some` exactly when `state` is [`RunState::Failed`].
 pub struct Settled {
     pub state: RunState,
     pub held: Option<HeldCheckpoint>,
+    pub diverged: Vec<String>,
     pub operation: Option<FailedOperation>,
+}
+
+/// The divergence dialog's body, naming the frames alignment could not
+/// register inline; past five names the rest are counted, not named.
+pub(crate) fn divergence_body(names: &[String]) -> String {
+    const NAMED: usize = 5;
+    let list = match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        _ if names.len() > NAMED => format!(
+            "{} and {} more",
+            names[..NAMED].join(", "),
+            names.len() - NAMED
+        ),
+        [head @ .., last] => format!("{} and {last}", head.join(", ")),
+    };
+    let (verb, rest) = if names.len() == 1 {
+        ("was", "it is")
+    } else {
+        ("were", "they are")
+    };
+    format!("{list} could not be aligned and {verb} fused as {rest}.")
 }
 
 /// Interprets a joined worker thread's result -- a panic and a pipeline
@@ -498,6 +573,12 @@ pub struct Settled {
 pub fn settle(result: std::thread::Result<Result<FuseOutcome, PipelineError>>) -> Settled {
     match result {
         Ok(Ok(FuseOutcome::Completed(report))) => {
+            let diverged = report
+                .align
+                .iter()
+                .flat_map(|align| align.alignment.failed())
+                .map(|frame| report.frames[frame.frame].clone())
+                .collect();
             let FuseProduct::Held(held) = report.product else {
                 unreachable!("the window's runs always hold their result");
             };
@@ -506,12 +587,14 @@ pub fn settle(result: std::thread::Result<Result<FuseOutcome, PipelineError>>) -
                     at: format_utc_hhmm(held.created_at),
                 },
                 held: Some(held),
+                diverged,
                 operation: None,
             }
         }
         Ok(Ok(FuseOutcome::Cancelled { .. })) => Settled {
             state: RunState::Idle,
             held: None,
+            diverged: Vec::new(),
             operation: None,
         },
         Ok(Err(err)) => {
@@ -519,12 +602,14 @@ pub fn settle(result: std::thread::Result<Result<FuseOutcome, PipelineError>>) -
             Settled {
                 state: RunState::Failed(err.to_string()),
                 held: None,
+                diverged: Vec::new(),
                 operation: Some(operation),
             }
         }
         Err(_) => Settled {
             state: RunState::Failed("the fuse worker stopped unexpectedly".to_string()),
             held: None,
+            diverged: Vec::new(),
             operation: Some(FailedOperation::Fusion),
         },
     }

@@ -82,6 +82,10 @@ impl StackAlgorithm for DummyStack {
         "Dummy Stack (test-only)"
     }
 
+    fn test_only(&self) -> bool {
+        true
+    }
+
     fn params(&self) -> &[ParamDesc] {
         &PARAMS
     }

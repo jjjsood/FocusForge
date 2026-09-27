@@ -43,27 +43,15 @@ pub struct AlignOptions<'a> {
 }
 
 /// Resolves the align algorithm `id` names, or -- when `id` is `None` --
-/// the sole registered alignment algorithm. Reads
-/// `registry::align_algorithms()` rather than naming any id, which is what
-/// keeps `crates/cli/src` free of every algorithm id.
-/// More than one registered algorithm with no id given is refused, loudly,
-/// naming every candidate -- that refusal is the entire argument for this
-/// default over a hardcoded one.
+/// `registry::default_align()`, which keeps `crates/cli/src` free of every
+/// algorithm id. Test-only registrations never count toward that default;
+/// ambiguity among the rest is refused naming every candidate.
 pub(crate) fn resolve_align_algo(id: Option<&str>) -> Result<&'static dyn AlignAlgorithm, String> {
     match id {
-        Some(id) => registry::find_align(id).map_err(|e| e.to_string()),
-        None => {
-            let algos = registry::align_algorithms();
-            match algos.as_slice() {
-                [] => Err("no alignment algorithm is registered".to_string()),
-                [only] => Ok(*only),
-                many => Err(format!(
-                    "multiple alignment algorithms are registered; pass an id to choose one: {}",
-                    many.iter().map(|a| a.id()).collect::<Vec<_>>().join(", ")
-                )),
-            }
-        }
+        Some(id) => registry::find_align(id),
+        None => registry::default_align(),
     }
+    .map_err(|e| e.to_string())
 }
 
 /// The frozen `align --json` document: fields are only ever added, the
@@ -594,4 +582,16 @@ pub(crate) fn render(report: &AlignReport) -> String {
         report.wall_seconds,
     ));
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_align_algo_without_an_id_skips_test_only_registrations() {
+        let algo = resolve_align_algo(None).expect("one real alignment algorithm is registered");
+        assert!(!algo.test_only(), "{} is test-only", algo.id());
+        assert_eq!(algo.id(), registry::default_align().unwrap().id());
+    }
 }

@@ -463,6 +463,7 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     push_settings_panel(app, &controller);
     push_images_panel(app, &controller);
     push_projects_overlay(app, &controller);
+    push_divergence(app, &controller);
 }
 
 /// Pushes the tab strip's own rows -- title, unsaved marker, selection and
@@ -573,6 +574,7 @@ fn start_job_timer(
         let live = controller.lock().unwrap().work_pending();
         push_job(&app, &view);
         push_projects_overlay(&app, &controller.lock().unwrap());
+        push_divergence(&app, &controller.lock().unwrap());
         if !live {
             // The run just settled -- the moment the images/settings panels'
             // own whole-panel disable must lift again.
@@ -722,6 +724,7 @@ pub fn push_settings_panel(app: &AppWindow, controller: &AppController) {
 /// Pushes the `Images` panel's whole state -- [`push_settings_panel`]'s
 /// twin.
 pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
+    app.set_editor_enabled(controller.editor_enabled());
     let panel = controller.images_panel();
     let rows: Vec<GeneratedImageRow> = panel
         .rows
@@ -770,6 +773,18 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
             app.set_frame_warning_secondary_label(secondary.into());
         }
         None => app.set_frame_warning_open(false),
+    }
+}
+
+/// Opens the Keep/Discard dialog while the active tab holds a parked run,
+/// naming its unaligned frames; closes it otherwise.
+fn push_divergence(app: &AppWindow, controller: &AppController) {
+    match controller.pending_divergence() {
+        Some(names) => {
+            app.set_divergence_body(job::divergence_body(names).into());
+            app.set_divergence_open(true);
+        }
+        None => app.set_divergence_open(false),
     }
 }
 
@@ -1769,6 +1784,22 @@ pub fn install(
             }
         }
     });
+    app.on_divergence_discarded({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().discard_fused()
+    });
+    app.on_divergence_kept({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().keep_fused();
+            if let Some(app) = app_weak.upgrade() {
+                push_projects(&app, &controller);
+                repaint(&app, &controller, &canvas);
+            }
+        }
+    });
     app.on_close_guard_cancelled({
         let controller = controller.clone();
         move || controller.lock().unwrap().close_guard_cancelled()
@@ -2089,6 +2120,7 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             push_settings_panel(app, &controller);
             push_images_panel(app, &controller);
             push_projects_overlay(app, &controller);
+            push_divergence(app, &controller);
         }
         ShellEvent::ImagesChanged => push_images_panel(app, &controller.lock().unwrap()),
         ShellEvent::OverlayChanged => push_projects_overlay(app, &controller.lock().unwrap()),
