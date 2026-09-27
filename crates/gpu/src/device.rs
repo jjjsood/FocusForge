@@ -126,9 +126,7 @@ impl From<AdapterPath<wgpu::Adapter>> for Result<wgpu::Adapter, GpuError> {
 /// The device/queue the crate shares, plus the adapter facts a caller needs
 /// to report or reason about (`info`, `limits`). Holds `instance` and
 /// `adapter` too so neither is dropped out from under the device, and so
-/// the `Manual` device-ownership path
-/// (`slint::wgpu_29::WGPUConfiguration::Manual`) can clone all four handles
-/// back out (`Self::instance`, `Self::adapter`).
+/// the headless compute path can report the selected adapter and limits.
 pub struct SharedDevice {
     instance: Instance,
     adapter: wgpu::Adapter,
@@ -140,9 +138,8 @@ pub struct SharedDevice {
 
 impl SharedDevice {
     /// The `wgpu::Instance` the device was created from. `wgpu::Instance` is
-    /// `Clone` in the pinned wgpu 29.0.4, so a caller taking
-    /// the `Manual` device-ownership path clones out rather than moving this
-    /// crate's own copy.
+    /// `Clone` in the pinned wgpu 29.0.4, so callers can retain their own
+    /// handle without moving this crate's copy.
     pub fn instance(&self) -> &wgpu::Instance {
         &self.instance
     }
@@ -167,8 +164,8 @@ impl SharedDevice {
 
     /// The limits the device was created with (`crate::limits::device_limits`):
     /// `required_limits()` with only the texture dimensions widened for
-    /// Slint's swapchain. wgpu validates allocations against these, so the
-    /// pre-dispatch refusal does too, not [`Self::adapter_limits`].
+    /// the selected adapter. wgpu validates allocations against these, so
+    /// the pre-dispatch refusal does too, not [`Self::adapter_limits`].
     pub fn limits(&self) -> &wgpu::Limits {
         &self.limits
     }

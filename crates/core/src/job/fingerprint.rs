@@ -1,21 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The header-only stack fingerprint a resume compares against: a plain
-//! comparison of the [`crate::io::TiffHeader`] fields already parsed for
-//! free -- no hash crate, no pixel read. Deliberately different from
-//! [`crate::project`]'s manifest fingerprint, a blake3 hash over every
-//! source file: this one finds a resumable ledger in milliseconds, that
-//! one says exactly which bytes a project was computed from.
+//! The header-only stack fingerprint a resume compares against
+//! is **cheap, two-tier**. This
+//! is the *scratch/resume* fingerprint -- a plain comparison of the
+//! [`crate::io::FrameDesc`] facts already parsed for free, no hash crate,
+//! no pixel read. It is
+//! deliberately a *different* value from [`crate::project`]'s manifest
+//! fingerprint, which is a real content hash (blake3) over every source
+//! file -- see this module's own `tests::not_convertible_to_a_content_hash`
+//! and [`crate::project::stack_fingerprint`]. Neither substitutes for the
+//! other: this one exists to find a resumable ledger in milliseconds, that
+//! one to say years later exactly which bytes a project was computed from.
+//! This is also distinct from the **checkpoint** fingerprint, documented in
+//! full at [`super::stage_cache`]'s own module docs: the checkpoint DAG
+//! reads [`crate::project::stack_fingerprint`], never this type -- two
+//! deliberately different values, not one value everywhere.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::io::TiffHeader;
+use crate::io::FrameDesc;
 
 /// One frame's identity, read straight off its already-parsed
-/// [`TiffHeader`] -- every named field, none of them requiring a pixel to
-/// be read.
+/// [`FrameDesc`] -- none of them requiring a pixel to be read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FrameFingerprint {
     pub path: PathBuf,
@@ -28,8 +36,8 @@ pub struct FrameFingerprint {
     pub strip_byte_counts: Vec<u64>,
 }
 
-impl From<&TiffHeader> for FrameFingerprint {
-    fn from(header: &TiffHeader) -> Self {
+impl From<&FrameDesc> for FrameFingerprint {
+    fn from(header: &FrameDesc) -> Self {
         FrameFingerprint {
             path: header.path.clone(),
             file_size: header.file_size,
@@ -151,6 +159,7 @@ impl StackFingerprint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::TiffHeader;
 
     fn frame(path: &str, width: u32) -> FrameFingerprint {
         FrameFingerprint {
@@ -210,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn from_tiff_header_reads_exactly_the_named_fields() {
+    fn from_frame_desc_reads_exactly_the_named_fields() {
         let header = TiffHeader {
             path: PathBuf::from("frame.tif"),
             width: 4,
@@ -221,7 +230,10 @@ mod tests {
             compression: 1,
             photometric: 2,
             planar_config: 1,
+            predictor: 1,
             rows_per_strip: 1,
+            tile_width: None,
+            tile_length: None,
             sample_format: Box::new([1, 1, 1]),
             image_description: Some("hello".to_string()),
             // Read by grouping, deliberately **not** by the
@@ -232,9 +244,12 @@ mod tests {
             file_size: 12345,
             strip_offsets: vec![10, 20, 30, 40],
             strip_byte_counts: vec![1, 2, 3, 4],
+            tile_offsets: vec![],
+            tile_byte_counts: vec![],
             refusal: None,
         };
-        let fp = FrameFingerprint::from(&header);
+        let desc = FrameDesc::from(&header);
+        let fp = FrameFingerprint::from(&desc);
         assert_eq!(fp.path, PathBuf::from("frame.tif"));
         assert_eq!(fp.file_size, 12345);
         assert_eq!(fp.image_description, Some("hello".to_string()));
@@ -243,16 +258,40 @@ mod tests {
         assert_eq!(fp.samples_per_pixel, 3);
         assert_eq!(fp.strip_offsets, vec![10, 20, 30, 40]);
         assert_eq!(fp.strip_byte_counts, vec![1, 2, 3, 4]);
+
+        #[derive(Serialize)]
+        struct LegacyFrameFingerprint {
+            path: PathBuf,
+            file_size: u64,
+            image_description: Option<String>,
+            width: u32,
+            height: u32,
+            samples_per_pixel: u32,
+            strip_offsets: Vec<u64>,
+            strip_byte_counts: Vec<u64>,
+        }
+
+        let legacy = LegacyFrameFingerprint {
+            path: header.path.clone(),
+            file_size: header.file_size,
+            image_description: header.image_description.clone(),
+            width: header.width,
+            height: header.height,
+            samples_per_pixel: header.samples_per_pixel,
+            strip_offsets: header.strip_offsets.clone(),
+            strip_byte_counts: header.strip_byte_counts.clone(),
+        };
+        assert_eq!(
+            serde_json::to_vec(&fp).expect("fingerprint must serialize"),
+            serde_json::to_vec(&legacy).expect("legacy fingerprint must serialize")
+        );
     }
 
     /// This fingerprint is not, and is not convertible to, the project
     /// manifest's content hash.
     ///
-    /// The claim worth guarding is not about the crate as a whole (which
-    /// does use blake3, for the manifest's own fingerprint): it is that
-    /// **this module** reaches for no hash, so a `FrameFingerprint` has
-    /// nothing to convert into and cannot quietly drift into a content
-    /// hash.
+    /// `FrameFingerprint` compares parsed headers and does not hash file
+    /// contents, so it cannot become a content hash.
     #[test]
     fn not_convertible_to_a_content_hash() {
         // The needles are assembled rather than written out, so this

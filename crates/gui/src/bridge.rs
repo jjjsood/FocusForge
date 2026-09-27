@@ -109,14 +109,29 @@ impl Canvas {
     }
 
     /// The open renderer, creating one first when this tab has never had
-    /// anything to draw. `None` only when the shared GPU device failed to
-    /// open.
-    fn renderer_mut(&mut self) -> Option<&mut CanvasRenderer> {
+    /// anything to draw. Its source readers remain available before Slint
+    /// finishes creating the surface-compatible device.
+    fn renderer_mut(&mut self) -> &mut CanvasRenderer {
         if self.renderer.is_none() {
-            let shared = focusforge_gpu::device::shared_device().ok()?;
-            self.renderer = Some(CanvasRenderer::new(shared));
+            self.renderer = Some(CanvasRenderer::new());
         }
-        self.renderer.as_mut()
+        self.renderer.as_mut().expect("renderer was inserted above")
+    }
+
+    /// Attaches Slint's device and queue after rendering setup.
+    pub fn attach_device(
+        &mut self,
+        device: slint::wgpu_29::wgpu::Device,
+        queue: slint::wgpu_29::wgpu::Queue,
+    ) {
+        self.renderer_mut().attach_device(device, queue);
+    }
+
+    /// Releases only canvas resources owned by Slint's device.
+    pub fn detach_device(&mut self) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.detach_device();
+        }
     }
 
     /// Opens `composite`/`zmap` as `tab`'s own planes, naming the failure on
@@ -129,9 +144,7 @@ impl Canvas {
     /// selected frame.
     fn load(&mut self, tab: usize, composite: &Path, zmap: &Path) {
         self.tab = Some(tab);
-        let Some(renderer) = self.renderer_mut() else {
-            return;
-        };
+        let renderer = self.renderer_mut();
         if let Err(err) = renderer.set_planes(composite, zmap) {
             eprintln!("failed to open the project's planes: {err}");
         }
@@ -142,9 +155,7 @@ impl Canvas {
     /// already open; `None` drops whatever frame was open. Keeps the
     /// reader's own refusal text on failure rather than a generic message.
     pub fn set_frame(&mut self, path: Option<&Path>) {
-        let Some(renderer) = self.renderer_mut() else {
-            return;
-        };
+        let renderer = self.renderer_mut();
         let Some(path) = path else {
             renderer.clear_frame();
             self.frame_error = None;

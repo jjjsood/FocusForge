@@ -30,7 +30,7 @@ thread_local! {
 
 /// Installs the device's uncaptured-error handler and its device-lost
 /// callback. Called once, on the one device this process creates.
-pub(crate) fn install_handlers(device: &wgpu::Device) {
+pub fn install_handlers(device: &wgpu::Device) {
     device.on_uncaptured_error(Arc::new(|error: wgpu::Error| {
         tracing::error!(
             kind = error_kind(&error),

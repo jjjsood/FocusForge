@@ -38,6 +38,7 @@ import mmap
 import os
 import struct
 import sys
+import zlib
 from dataclasses import dataclass, field
 
 
@@ -61,7 +62,11 @@ TAG_SAMPLES_PER_PIXEL = 277
 TAG_ROWS_PER_STRIP = 278
 TAG_STRIP_BYTE_COUNTS = 279
 TAG_PLANAR_CONFIG = 284
+TAG_PREDICTOR = 317
 TAG_TILE_WIDTH = 322
+TAG_TILE_LENGTH = 323
+TAG_TILE_OFFSETS = 324
+TAG_TILE_BYTE_COUNTS = 325
 TAG_SAMPLE_FORMAT = 339
 
 
@@ -296,6 +301,85 @@ def read_rect(path: str, x: int, y: int, w: int, h: int, info: TiffInfo | None =
     return bytes(out)
 
 
+def _lzw_encode(data: bytes) -> bytes:
+    """Encode TIFF's MSB-first LZW stream with clear and end codes."""
+    clear = 256
+    end = 257
+    codes = []
+    width = 9
+    next_code = 258
+    dictionary = {bytes([value]): value for value in range(256)}
+    codes.append((clear, width))
+    if not data:
+        codes.append((end, width))
+    else:
+        word = bytes([data[0]])
+        for value in data[1:]:
+            extended = word + bytes([value])
+            if extended in dictionary:
+                word = extended
+                continue
+            codes.append((dictionary[word], width))
+            if next_code < 4096:
+                dictionary[extended] = next_code
+                next_code += 1
+                if next_code == (1 << width) and width < 12:
+                    width += 1
+            else:
+                codes.append((clear, width))
+                dictionary = {bytes([item]): item for item in range(256)}
+                width = 9
+                next_code = 258
+            word = bytes([value])
+        codes.append((dictionary[word], width))
+        codes.append((end, width))
+
+    out = bytearray()
+    bits = 0
+    count = 0
+    for code, code_width in codes:
+        bits = (bits << code_width) | code
+        count += code_width
+        while count >= 8:
+            count -= 8
+            out.append((bits >> count) & 0xFF)
+    if count:
+        out.append((bits << (8 - count)) & 0xFF)
+    return bytes(out)
+
+
+def _horizontal_predict(data: bytes, width: int, height: int, spp: int, bits: int) -> bytes:
+    """Return predictor-2 differences from native little-endian packed samples."""
+    bps = bits // 8
+    row_bytes = width * spp * bps
+    out = bytearray(data)
+    if bits == 8:
+        for row in range(height):
+            start = row * row_bytes
+            for index in range(width * spp - 1, spp - 1, -1):
+                pos = start + index
+                out[pos] = (out[pos] - out[pos - spp]) & 0xFF
+        return bytes(out)
+    for row in range(height):
+        start = row * row_bytes
+        for index in range(width * spp - 1, spp - 1, -1):
+            pos = start + index * 2
+            previous = start + (index - spp) * 2
+            value = (
+                struct.unpack_from("<H", out, pos)[0]
+                - struct.unpack_from("<H", out, previous)[0]
+            ) & 0xFFFF
+            struct.pack_into("<H", out, pos, value)
+    return bytes(out)
+
+
+def _disk_bytes(data: bytes, bits: int, byte_order: str) -> bytes:
+    out = bytearray(data)
+    if bits == 16 and byte_order == "MM":
+        _swap16(out)
+    return bytes(out)
+
+
 def _build_tiff(
     width: int,
     height: int,
@@ -305,8 +389,11 @@ def _build_tiff(
     description: str | None,
     byte_order: str,
     rows_per_strip: int,
+    compression: int,
+    predictor: int,
+    tile: tuple[int, int] | None,
 ) -> bytes:
-    """Serialise a whole uncompressed strip TIFF. `pixels` is native little-endian."""
+    """Serialise chunky classic TIFF with optional compressed strips or tiles."""
     if bits not in (8, 16):
         raise ValueError(f"bits={bits}: only 8 or 16 supported")
     if spp < 1:
@@ -315,6 +402,12 @@ def _build_tiff(
         raise ValueError(f"byte_order={byte_order!r}: expected 'II' or 'MM'")
     if rows_per_strip < 1:
         raise ValueError(f"rows_per_strip={rows_per_strip}: must be positive")
+    if compression not in (1, 5, 8, 32946):
+        raise ValueError(f"compression={compression}: expected 1, 5, 8, or 32946")
+    if predictor not in (1, 2):
+        raise ValueError(f"predictor={predictor}: expected 1 or 2")
+    if tile is not None and (len(tile) != 2 or tile[0] < 1 or tile[1] < 1):
+        raise ValueError(f"tile={tile!r}: expected positive (width, height)")
     bps = bits // 8
     row_bytes = width * spp * bps
     if len(pixels) != row_bytes * height:
@@ -345,18 +438,26 @@ def _build_tiff(
     add(TAG_IMAGE_WIDTH, 4, [width])
     add(TAG_IMAGE_LENGTH, 4, [height])
     add(TAG_BITS_PER_SAMPLE, 3, [bits] * spp)
-    add(TAG_COMPRESSION, 3, [1])
+    add(TAG_COMPRESSION, 3, [compression])
     add(TAG_PHOTOMETRIC, 3, [photometric])
     if description is not None:
         add(TAG_IMAGE_DESCRIPTION, 2, description)
-    add(TAG_STRIP_OFFSETS, 4, [0] * n_strips)  # patched once the layout is known
     add(TAG_SAMPLES_PER_PIXEL, 3, [spp])
-    add(TAG_ROWS_PER_STRIP, 4, [rows_per_strip])
-    add(
-        TAG_STRIP_BYTE_COUNTS,
-        4,
-        [min(rows_per_strip, height - s * rows_per_strip) * row_bytes for s in range(n_strips)],
-    )
+    if predictor == 2:
+        add(TAG_PREDICTOR, 3, [predictor])
+    if tile is None:
+        add(TAG_STRIP_OFFSETS, 4, [0] * n_strips)
+        add(TAG_ROWS_PER_STRIP, 4, [rows_per_strip])
+        add(TAG_STRIP_BYTE_COUNTS, 4, [0] * n_strips)
+    else:
+        tile_width, tile_height = tile
+        tiles_across = (width + tile_width - 1) // tile_width
+        tiles_down = (height + tile_height - 1) // tile_height
+        n_tiles = tiles_across * tiles_down
+        add(TAG_TILE_WIDTH, 4, [tile_width])
+        add(TAG_TILE_LENGTH, 4, [tile_height])
+        add(TAG_TILE_OFFSETS, 4, [0] * n_tiles)
+        add(TAG_TILE_BYTE_COUNTS, 4, [0] * n_tiles)
     add(TAG_PLANAR_CONFIG, 3, [1])
     add(TAG_SAMPLE_FORMAT, 3, [1] * spp)
     entries.sort(key=lambda e: e[0])
@@ -373,14 +474,49 @@ def _build_tiff(
             cursor += len(data) + len(data) % 2
     pixel_start = cursor
 
-    # The patch is length-preserving (n_strips LONGs either way), so the layout
-    # computed above still holds.
-    for e in entries:
-        if e[0] == TAG_STRIP_OFFSETS:
-            e[3] = struct.pack(
-                f"{endian}{n_strips}I",
-                *[pixel_start + s * rows_per_strip * row_bytes for s in range(n_strips)],
-            )
+    segments = []
+    if tile is None:
+        for strip in range(n_strips):
+            first = strip * rows_per_strip
+            rows = min(rows_per_strip, height - first)
+            segment = pixels[first * row_bytes : (first + rows) * row_bytes]
+            segments.append((segment, width, rows))
+    else:
+        tile_width, tile_height = tile
+        for y in range(0, height, tile_height):
+            for x in range(0, width, tile_width):
+                segment = bytearray(tile_width * tile_height * spp * bps)
+                rows = min(tile_height, height - y)
+                columns = min(tile_width, width - x)
+                for row in range(rows):
+                    source = ((y + row) * width + x) * spp * bps
+                    target = row * tile_width * spp * bps
+                    segment[target : target + columns * spp * bps] = pixels[
+                        source : source + columns * spp * bps
+                    ]
+                segments.append((bytes(segment), tile_width, tile_height))
+
+    encoded = []
+    for segment, segment_width, segment_height in segments:
+        if predictor == 2:
+            segment = _horizontal_predict(segment, segment_width, segment_height, spp, bits)
+        segment = _disk_bytes(segment, bits, byte_order)
+        if compression == 5:
+            segment = _lzw_encode(segment)
+        elif compression in (8, 32946):
+            segment = zlib.compress(segment, level=9)
+        encoded.append(segment)
+
+    segment_offsets = []
+    cursor = pixel_start
+    for segment in encoded:
+        segment_offsets.append(cursor)
+        cursor += len(segment)
+    for entry in entries:
+        if entry[0] in (TAG_STRIP_OFFSETS, TAG_TILE_OFFSETS):
+            entry[3] = struct.pack(f"{endian}{len(segment_offsets)}I", *segment_offsets)
+        elif entry[0] in (TAG_STRIP_BYTE_COUNTS, TAG_TILE_BYTE_COUNTS):
+            entry[3] = struct.pack(f"{endian}{len(encoded)}I", *(len(segment) for segment in encoded))
 
     buf = bytearray(pixel_start)
     buf[0:2] = byte_order.encode("ascii")
@@ -397,10 +533,7 @@ def _build_tiff(
         pos += 12
     struct.pack_into(endian + "I", buf, pos, 0)  # no next IFD
 
-    body = bytearray(pixels)
-    if bps == 2 and byte_order == "MM":
-        _swap16(body)
-    return bytes(buf) + bytes(body)
+    return bytes(buf) + b"".join(encoded)
 
 
 def write_tiff(
@@ -414,8 +547,11 @@ def write_tiff(
     description: str | None = None,
     byte_order: str = "II",
     rows_per_strip: int = 1,
+    compression: int = 1,
+    predictor: int = 1,
+    tile: tuple[int, int] | None = None,
 ) -> None:
-    """Write an uncompressed chunky TIFF. `pixels` is always native little-endian.
+    """Write chunky classic TIFF. `pixels` is always native little-endian.
 
     Deterministic: the same arguments produce the same bytes, with no timestamp
     or generator tag anywhere, which is what lets `make-fixtures.sh --check`
@@ -433,7 +569,17 @@ def write_tiff(
     with open(path, "wb") as fh:
         fh.write(
             _build_tiff(
-                width, height, pixels, bits, spp, description, byte_order, rows_per_strip
+                width,
+                height,
+                pixels,
+                bits,
+                spp,
+                description,
+                byte_order,
+                rows_per_strip,
+                compression,
+                predictor,
+                tile,
             )
         )
 

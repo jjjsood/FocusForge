@@ -13,8 +13,8 @@
 //! **`device_limits` differs from `required_limits`.** `required_limits` is
 //! the adapter floor the compute kernels are measured against, checked in
 //! `crate::device::init`. `device_limits` is what the device is created
-//! with: that floor plus the adapter's texture resolution, because Slint's
-//! swapchain shares the device and `downlevel_defaults()` caps 2D at 2048 px.
+//! with: that floor plus the adapter's texture resolution, because
+//! `downlevel_defaults()` caps 2D at 2048 px.
 
 /// This crate's kernels use no optional `wgpu` feature.
 #[cfg(feature = "gpu")]
@@ -32,9 +32,8 @@ pub fn required_limits() -> wgpu::Limits {
 
 /// The limits the shared device is created with: [`required_limits`] with
 /// only `max_texture_dimension_{1d,2d,3d}` raised to the adapter's, since a
-/// maximised window can exceed `downlevel_defaults()`'s 2048 px. Every
-/// compute and buffer limit stays at `required_limits()`. Slint's
-/// `Automatic` device path does the same; the `Manual` path used here does not.
+/// maximised image can exceed `downlevel_defaults()`'s 2048 px. Every
+/// compute and buffer limit stays at `required_limits()`.
 #[cfg(feature = "gpu")]
 pub fn device_limits(adapter_limits: &wgpu::Limits) -> wgpu::Limits {
     wgpu::Limits::downlevel_defaults().using_resolution(adapter_limits.clone())

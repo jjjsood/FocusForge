@@ -12,8 +12,12 @@ workspace = true
 gpu = []
 test-algorithms = []
 
-# A dev-dependency on this very crate, the documented way to switch on the
-# `test-algorithms` feature for a package's own test targets.
+# A dev-dependency on this very crate, the documented way to switch a
+# feature on for a package's own test targets: `crates/core/tests/grouping.rs`
+# builds its capture-time trees with `io::test_frames`, which lives behind
+# `test-algorithms` (see that module for why it cannot be `#[cfg(test)]`).
+# Without this line every `cargo test -p focusforge-core --test grouping`
+# would have to carry `--features test-algorithms` by hand.
 [dev-dependencies]
 focusforge-core = { path = ".", features = ["test-algorithms"] }
 # `project_format.rs` reads a sealed container with an **independent**
@@ -31,11 +35,13 @@ proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 
 [dependencies]
 blake3 = { version = "1.8.7", features = ["mmap", "rayon"] }
+flate2 = "1.1.10"
 inventory = "0.3.24"
 memmap2 = "0.9.11"
 rayon = "1.12"
 thiserror = "2.0.20"
 tracing = "0.1.44"
+weezl = "0.1.12"
 serde = { version = "1", features = ["derive"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 serde_json = "1"

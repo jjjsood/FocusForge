@@ -70,6 +70,39 @@ class FixtureSet:
     mm_variant: bool = False
 
 
+@dataclass(frozen=True)
+class CompressedFixtureSet:
+    name: str
+    compression: int
+    codec: str
+    predictor: int
+    layout: str
+    byte_order: str
+
+
+def _compressed_sets() -> tuple[CompressedFixtureSet, ...]:
+    codecs = (("lzw", 5), ("deflate", 8), ("old-deflate", 32946))
+    return tuple(
+        CompressedFixtureSet(
+            name=f"mantis-64-{codec}-p{predictor}-{layout}-{byte_order.lower()}",
+            compression=compression,
+            codec=codec,
+            predictor=predictor,
+            layout=layout,
+            byte_order=byte_order,
+        )
+        for codec, compression in codecs
+        for predictor in (1, 2)
+        for layout in ("strip", "tile")
+        for byte_order in ("II", "MM")
+    )
+
+
+COMPRESSED_SETS = _compressed_sets()
+COMPRESSED_ROWS_PER_STRIP = 11
+COMPRESSED_TILE = (48, 48)
+
+
 SETS = (
     FixtureSet(
         name="mantis-64",
@@ -125,6 +158,9 @@ def _crop(
     description: str,
     byte_order: str = "II",
     rows_per_strip: int = 1,
+    compression: int = 1,
+    predictor: int = 1,
+    tile: tuple[int, int] | None = None,
 ) -> None:
     x, y, w, h = rect
     info = rawtiff.read_info(src)
@@ -139,6 +175,9 @@ def _crop(
         description=description,
         byte_order=byte_order,
         rows_per_strip=rows_per_strip,
+        compression=compression,
+        predictor=predictor,
+        tile=tile,
     )
 
 
@@ -227,12 +266,15 @@ def _root_readme(stack_dir: str, frame_names: list, date: str) -> str:
     for fset in SETS:
         _x, _y, w, h = fset.rect
         lines.append(f"| `{fset.name}` | {len(fset.indices)} | `{_rect_str(fset.rect)}` | {w}x{h} |")
+    for fset in COMPRESSED_SETS:
+        lines.append(f"| `{fset.name}` | 3 | `4064,2700,64,64` | 64x64 |")
     lines += [
         "",
         "Each set holds `frames/NN.tif` in focus order, `reference.tif`, and a "
         "`README.md` naming the source frame behind every `NN`. Outputs are "
-        "little-endian, uncompressed, chunky, one strip per row -- the shape the "
-        "mmap reader is written against.",
+        "little-endian, uncompressed, chunky, one strip per row. The `mantis-64-` "
+        "sets add LZW and deflate encodings in both byte orders, with strips or "
+        "zero-padded tiles and Predictor 1 or 2.",
         "",
         f"With one deliberate exception: `mantis-64/{MM_VARIANT_NAME}` is the "
         f"reference crop left in `{REFERENCE_NAME}`'s own layout (big-endian "
@@ -241,9 +283,8 @@ def _root_readme(stack_dir: str, frame_names: list, date: str) -> str:
         "on the real file. It holds the same samples as that set's "
         "`reference.tif` and differs from it on disk.",
         "",
-        f"The sources are the {len(frame_names)} frames of the reference stack plus "
-        f"`{REFERENCE_NAME}`. They live outside the repository and are not "
-        "redistributed here.",
+        "The source files are named in each set README. They live outside the "
+        "repository and are not redistributed here.",
         "",
         "## `reference.tif` is not a golden image",
         "",
@@ -261,24 +302,96 @@ def _root_readme(stack_dir: str, frame_names: list, date: str) -> str:
         "A test that asserts an exact match against `reference.tif` is asserting that "
         "we reimplemented someone else's stacker, which is not a goal.",
         "",
-        "## Regenerating",
+        "## Reproducibility",
         "",
-        "With `FOCUSFORGE_REFERENCE_STACK` pointing at the reference stack:",
-        "",
-        "```",
-        "tools/make-fixtures.sh                  # rewrite every set",
-        "tools/make-fixtures.sh --check          # verify, exit 1 on any difference",
-        "```",
-        "",
-        "`--check` regenerates into a temporary directory and compares byte for byte, "
-        "so it fails on a hand-edit as loudly as on a stale crop. `MANIFEST.sha256` "
-        "covers every file here and is what `tools/check-fixtures.sh` verifies in the "
-        "gate run.",
+        "Regeneration is byte-for-byte deterministic. `MANIFEST.sha256` covers every "
+        "file here; changed, missing, and unlisted files are errors.",
         "",
         "Never hand-edit anything in this tree.",
         "",
     ]
     return "\n".join(lines)
+
+
+def _compressed_readme(fset: CompressedFixtureSet) -> str:
+    if fset.layout == "strip":
+        layout = (
+            f"Strips use RowsPerStrip={COMPRESSED_ROWS_PER_STRIP}: six strips for 64 rows, "
+            "with nine rows in the final strip."
+        )
+    else:
+        layout = (
+            f"Tiles are {COMPRESSED_TILE[0]}x{COMPRESSED_TILE[1]}; the 64x64 image has four "
+            "tiles, and right/bottom edge cells are zero-padded outside the image border."
+        )
+    return "\n".join(
+        [
+            f"# Fixture set `{fset.name}`",
+            "",
+            (
+                "Re-encoding of `mantis-64`: `frames/00.tif`, `frames/01.tif`, and "
+                "`frames/02.tif` map directly to the same source files; `reference.tif` maps "
+                "to `mantis-64/reference.tif`."
+            ),
+            "",
+            (
+                f"TIFF Compression tag: **{fset.compression}** ({fset.codec}). Predictor: "
+                f"**{fset.predictor}**. Byte order: **{fset.byte_order}**. Layout: "
+                f"**{fset.layout}**."
+            ),
+            "",
+            layout,
+            "",
+        ]
+    )
+
+
+def _generate_compressed(source_fixtures: str, out_dir: str) -> list:
+    source_set = os.path.join(source_fixtures, "mantis-64")
+    source_files = [
+        *(os.path.join(source_set, "frames", f"{index:02d}.tif") for index in range(3)),
+        os.path.join(source_set, "reference.tif"),
+    ]
+    missing = [path for path in source_files if not os.path.isfile(path)]
+    if missing:
+        raise FixtureError("compressed fixtures need committed mantis-64 files: " + ", ".join(missing))
+
+    produced = []
+    for fset in COMPRESSED_SETS:
+        frames_dir = os.path.join(out_dir, fset.name, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        for index, source in enumerate(source_files[:3]):
+            rel = f"{fset.name}/frames/{index:02d}.tif"
+            _crop(
+                source,
+                os.path.join(out_dir, rel),
+                (0, 0, 64, 64),
+                f"FocusForge fixture {fset.name}/frames/{index:02d}",
+                byte_order=fset.byte_order,
+                rows_per_strip=COMPRESSED_ROWS_PER_STRIP,
+                compression=fset.compression,
+                predictor=fset.predictor,
+                tile=COMPRESSED_TILE if fset.layout == "tile" else None,
+            )
+            produced.append(rel)
+        rel = f"{fset.name}/reference.tif"
+        _crop(
+            source_files[3],
+            os.path.join(out_dir, rel),
+            (0, 0, 64, 64),
+            f"FocusForge fixture {fset.name}/reference",
+            byte_order=fset.byte_order,
+            rows_per_strip=COMPRESSED_ROWS_PER_STRIP,
+            compression=fset.compression,
+            predictor=fset.predictor,
+            tile=COMPRESSED_TILE if fset.layout == "tile" else None,
+        )
+        produced.append(rel)
+        rel = f"{fset.name}/README.md"
+        with open(os.path.join(out_dir, rel), "w", encoding="utf-8") as fh:
+            fh.write(_compressed_readme(fset))
+        produced.append(rel)
+    return produced
 
 
 def generate(stack_dir: str, out_dir: str, date: str) -> list:
@@ -344,11 +457,26 @@ def generate(stack_dir: str, out_dir: str, date: str) -> list:
             fh.write(_set_readme(fset, stack_dir, frame_names))
         produced.append(rel)
 
+    produced += _generate_compressed(out_dir, out_dir)
+
     rel = "README.md"
     with open(os.path.join(out_dir, rel), "w", encoding="utf-8") as fh:
         fh.write(_root_readme(stack_dir, frame_names, date))
     produced.append(rel)
 
+    write_manifest(out_dir)
+    produced.append("MANIFEST.sha256")
+    return sorted(produced)
+
+
+def generate_compressed(source_fixtures: str, out_dir: str, date: str) -> list:
+    """Write compressed mantis-64 variants from committed source fixtures."""
+    os.makedirs(out_dir, exist_ok=True)
+    produced = _generate_compressed(source_fixtures, out_dir)
+    frame_names = ["00.tif", "01.tif", "02.tif"]
+    with open(os.path.join(out_dir, "README.md"), "w", encoding="utf-8") as fh:
+        fh.write(_root_readme(source_fixtures, frame_names, date))
+    produced.append("README.md")
     write_manifest(out_dir)
     produced.append("MANIFEST.sha256")
     return sorted(produced)
@@ -382,59 +510,59 @@ def _normalized(path: str) -> bytes:
         return DATE_LINE_RE.sub(b"Generated: <date>", fh.read())
 
 
+def _check_generated(produced: list, out_dir: str, tmp: str) -> list:
+    differences = []
+    for rel in produced:
+        want = os.path.join(tmp, rel)
+        got = os.path.join(out_dir, rel)
+        if not os.path.exists(got):
+            differences.append(f"missing: {rel}")
+        elif rel == "MANIFEST.sha256" or rel.endswith("README.md"):
+            if rel == "MANIFEST.sha256":
+                def listed(path):
+                    with open(path, encoding="utf-8") as fh:
+                        return {
+                            line
+                            for line in fh.read().splitlines()
+                            if line and not line.endswith("  README.md")
+                        }
+
+                stale = listed(want) - listed(got)
+                if stale:
+                    differences.append(
+                        "MANIFEST.sha256: "
+                        + ", ".join(sorted(line.split("  ", 1)[-1] for line in stale))
+                        + " not listed with the regenerated hash"
+                    )
+            elif _normalized(want) != _normalized(got):
+                differences.append(f"differs: {rel}")
+        elif not filecmp.cmp(want, got, shallow=False):
+            differences.append(f"differs: {rel}")
+    return differences
+
+
+def _find_orphans(out_dir: str, expected: set, fixture_sets: tuple) -> list:
+    differences = []
+    for fset in fixture_sets:
+        frames_dir = os.path.join(out_dir, fset.name, "frames")
+        if not os.path.isdir(frames_dir):
+            continue
+        for name in sorted(os.listdir(frames_dir)):
+            rel = f"{fset.name}/frames/{name}"
+            if rel not in expected:
+                differences.append(f"orphan: {rel} is not produced by the generator")
+    return differences
+
+
 def check(stack_dir: str, out_dir: str) -> int:
     if not os.path.isdir(out_dir):
         print(f"FAIL: no fixture tree at {out_dir}")
         return 1
 
-    differences = []
     with tempfile.TemporaryDirectory(prefix="focusforge-fixtures-") as tmp:
         produced = generate(stack_dir, tmp, date="<date>")
-
-        for rel in produced:
-            want = os.path.join(tmp, rel)
-            got = os.path.join(out_dir, rel)
-            if not os.path.exists(got):
-                differences.append(f"missing: {rel}")
-            elif rel == "MANIFEST.sha256" or rel.endswith("README.md"):
-                # The manifest lists files this run did not produce (golden/), and
-                # the root README carries the generation date. Compare content with
-                # those two known-variable parts normalized away.
-                if rel == "MANIFEST.sha256":
-                    # The root README's own line is skipped: its hash covers the
-                    # generation date, which is compared on the file itself below.
-                    def listed(path):
-                        with open(path, encoding="utf-8") as fh:
-                            return {
-                                ln
-                                for ln in fh.read().splitlines()
-                                if ln and not ln.endswith("  README.md")
-                            }
-
-                    want_lines, got_lines = listed(want), listed(got)
-                    stale = want_lines - got_lines
-                    if stale:
-                        differences.append(
-                            "MANIFEST.sha256: "
-                            + ", ".join(sorted(ln.split("  ", 1)[-1] for ln in stale))
-                            + " not listed with the regenerated hash"
-                        )
-                elif _normalized(want) != _normalized(got):
-                    differences.append(f"differs: {rel}")
-            elif not filecmp.cmp(want, got, shallow=False):
-                differences.append(f"differs: {rel}")
-
-        # An index list that shrank leaves frames behind; the manifest would still
-        # verify them, so catch orphans against what the generator actually emits.
-        expected = set(produced)
-        for fset in SETS:
-            frames_dir = os.path.join(out_dir, fset.name, "frames")
-            if not os.path.isdir(frames_dir):
-                continue
-            for name in sorted(os.listdir(frames_dir)):
-                rel = f"{fset.name}/frames/{name}"
-                if rel not in expected:
-                    differences.append(f"orphan: {rel} is not produced by the generator")
+        differences = _check_generated(produced, out_dir, tmp)
+        differences += _find_orphans(out_dir, set(produced), (*SETS, *COMPRESSED_SETS))
 
     if differences:
         print(f"FAIL: {out_dir} does not match the generator")
@@ -445,6 +573,24 @@ def check(stack_dir: str, out_dir: str) -> int:
     return 0
 
 
+def check_compressed(source_fixtures: str, out_dir: str) -> int:
+    if not os.path.isdir(out_dir):
+        print(f"FAIL: no fixture tree at {out_dir}")
+        return 1
+    with tempfile.TemporaryDirectory(prefix="focusforge-compressed-fixtures-") as tmp:
+        shutil.copytree(source_fixtures, tmp, dirs_exist_ok=True)
+        produced = generate_compressed(source_fixtures, tmp, date="<date>")
+        differences = _check_generated(produced, out_dir, tmp)
+        differences += _find_orphans(out_dir, set(produced), COMPRESSED_SETS)
+    if differences:
+        print(f"FAIL: {out_dir} compressed fixtures do not match the generator")
+        for line in differences:
+            print(f"  - {line}")
+        return 1
+    print("OK: compressed fixtures match the generator")
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="make_fixtures.py",
@@ -452,6 +598,15 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--stack", default=DEFAULT_STACK, help="reference stack directory")
     parser.add_argument("--out", default=DEFAULT_OUT, help="fixtures directory to write")
+    parser.add_argument(
+        "--compressed-only",
+        action="store_true",
+        help="write or check compressed mantis-64 variants without the reference stack",
+    )
+    parser.add_argument(
+        "--source-fixtures",
+        help="committed fixture tree supplying the uncompressed mantis-64 source",
+    )
     parser.add_argument(
         "--check",
         action="store_true",
@@ -466,6 +621,16 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        if args.compressed_only and args.manifest_only:
+            raise FixtureError("--compressed-only and --manifest-only cannot be combined")
+        if args.compressed_only:
+            source = args.source_fixtures or args.out
+            if args.check:
+                return check_compressed(source, args.out)
+            produced = generate_compressed(source, args.out, date=datetime.date.today().isoformat())
+            total = sum(os.path.getsize(os.path.join(args.out, rel)) for rel in produced)
+            print(f"wrote {len(produced)} files ({total / 1024:.0f} KiB) to {args.out}")
+            return 0
         if args.manifest_only:
             listed = write_manifest(args.out)
             print(f"wrote MANIFEST.sha256 covering {len(listed)} files under {args.out}")

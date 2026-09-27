@@ -31,7 +31,9 @@ pub use error::AlgorithmError;
 /// *frame*, which is a per-pixel fact, not a per-sample one. Fields are
 /// public and there is no validating constructor here: the Z-Map as a
 /// document with its own storage and invariants lives in [`crate::zmap`]
-/// (`ZMapInfo`, `crate::zmap::validate_tile`, `crate::zmap::ZMapWriter`).
+/// (`ZMapInfo`, `crate::zmap::validate_tile`, `crate::zmap::ZMapWriter`) --
+/// a checked constructor on `TileOutput` itself still waits for its first
+/// real caller.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TileOutput {
     pub tile: Tile,
@@ -41,11 +43,13 @@ pub struct TileOutput {
 /// The per-tile view across every frame of a stack that
 /// [`StackAlgorithm::fuse`] reads from.
 ///
-/// Opaque on purpose: the backing is a materialized slice of already-read
-/// [`Tile`]s, reached only through this type's own methods, never the field
-/// directly. The field is named `tiles`, not `frames` -- these are
-/// frame-*tiles*, and [`Tile`] itself carries no frame index, so this
-/// context is what supplies one by position.
+/// Opaque on purpose: today's backing is a materialized slice of
+/// already-read [`Tile`]s, and a future scheduler may swap it for memmap'd
+/// scratch or a streaming source without touching a single algorithm body,
+/// because every call site below is identical either way. The field is
+/// named `tiles`, not `frames` -- these are frame-*tiles*, and [`Tile`]
+/// itself carries no frame index, so this context is what supplies one by
+/// position.
 pub struct TileCtx<'a> {
     rect: Rect,
     tiles: &'a [Tile],
@@ -109,11 +113,13 @@ pub trait TileReader: Send + Sync {
 ///
 /// `Send + Sync` on [`TileReader`] is what keeps `AlignContext<'_>` `Sync`,
 /// which is what lets `align_frame` run across frames under rayon. `Send +
-/// Sync` on the erased `prepared` value gives it the same guarantee: a `dyn
-/// Any + Send + Sync` behind a shared `&'a` reference is safe to read from
-/// multiple rayon workers at once, and neither type offers any way to
-/// mutate through a shared reference, so nothing here needs a lock. The
-/// reader field stays private -- no accessor.
+/// Sync` on the erased `prepared` value is the same argument applied a
+/// second time: a `dyn Any + Send + Sync` behind a shared `&'a` reference is
+/// exactly as safe to read from multiple rayon workers at once as the
+/// reader already is, and neither type offers any way to mutate through a
+/// shared reference, so there is nothing here that would need a lock.
+/// The reader field stays private -- no accessor -- so exposing one later is
+/// an additive change rather than a removal.
 pub struct AlignContext<'a> {
     stack: StackContext,
     reference: usize,
@@ -224,15 +230,10 @@ pub trait StackAlgorithm: Send + Sync + 'static {
     ///    from this same default, reading the identical resolved map `fuse`
     ///    itself reads its own `"levels"` entry from -- the same number from
     ///    the same place, which is the whole point: `fuse`'s pyramid depth
-    ///    and the scheduler's margin cannot silently disagree.
+    ///    and the scheduler's margin remain synchronized.
     ///
-    /// An algorithm whose depth parameter is *not* called `"levels"`, or
-    /// whose margin requirement is not a simple pyramid depth, **overrides**
-    /// this method -- a visible, greppable claim about its own margin
-    /// requirement, in its own file, rather than an unnamed convention that
-    /// fails quietly the way the pre-this-decision code did (`laplacian`'s
-    /// pyramid depth and the scheduler's margin were computed from two
-    /// separately supplied numbers that nothing kept in agreement).
+    /// Algorithms whose depth parameter is not `"levels"`, or whose margin
+    /// differs from the pyramid depth, override this method.
     fn tile_levels(&self, cfg: &ParamValues) -> u32 {
         cfg.get("levels")
             .and_then(ParamValue::as_i64)
@@ -245,9 +246,13 @@ pub trait StackAlgorithm: Send + Sync + 'static {
 ///
 /// `#[non_exhaustive]`: a divergence reason is inherently
 /// algorithm-specific -- `crate::align::DivergenceReason::LemmaOneRegion` is
-/// named after one paper's Lemma 1. `#[non_exhaustive]` on both this type
-/// and `DivergenceReason` is what lets each aligner name its own failure
-/// modes after its own mathematics.
+/// named after one paper's Lemma 1, and a second aligner will name its own
+/// failure modes after its own mathematics. That accumulation is
+/// deliberate and is exactly what `#[non_exhaustive]` on both this type and
+/// `DivergenceReason` is for; it is not a sign that the vocabulary needs
+/// generalizing away. A reader adding a second aligner should read the
+/// existing variant names as evidence of the pattern to follow, not as a
+/// defect to fix.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status", content = "reason", rename_all = "kebab-case")]
@@ -339,9 +344,9 @@ impl TileReader for crate::io::TiffStack {
         // direct call site -- a plain `self.read_tile_into(...)` here would
         // recurse into this very impl instead of reaching the inherent
         // method.
-        Ok(crate::io::TiffStack::read_tile_into(
-            self, frame, rect, out,
-        )?)
+        crate::io::TiffStack::read_tile_into(self, frame, rect, out)
+            .map_err(crate::io::FrameError::from)
+            .map_err(AlgorithmError::from)
     }
 }
 
@@ -352,7 +357,7 @@ mod tests {
 
     use super::*;
     use crate::align::Transform;
-    use crate::io::TiffError;
+    use crate::io::{FrameError, TiffError};
     use crate::params::{EnumVariant, ParamKind, ParamValue, Provenance};
 
     fn sample_tiles(frame_count: usize, width: u32, height: u32) -> (Rect, Vec<Tile>) {
@@ -414,8 +419,10 @@ mod tests {
         ]
     });
 
-    /// A test-only fusion algorithm; `id`/`display_name` are owned `String`s
-    /// so the accessors borrow from `&self`.
+    /// A test-only fusion algorithm. `id` and `display_name` are owned
+    /// `String` fields, not literals, so the trait's accessors genuinely
+    /// borrow from `&self` rather than returning `&'static str` in
+    /// disguise.
     struct DummyStack {
         id: String,
         display_name: String,
@@ -548,19 +555,23 @@ mod tests {
                     .checked_add(rect.height)
                     .is_some_and(|yh| yh <= self.height);
             if !in_bounds {
-                return Err(AlgorithmError::Tiff(TiffError::OutOfBounds {
-                    path: PathBuf::from("<memory>"),
-                    requested: rect,
-                    frame: (self.width, self.height),
-                }));
+                return Err(AlgorithmError::Frame(FrameError::Tiff(
+                    TiffError::OutOfBounds {
+                        path: PathBuf::from("<memory>"),
+                        requested: rect,
+                        frame: (self.width, self.height),
+                    },
+                )));
             }
 
             let expected_len = rect.width as usize * rect.height as usize * self.spp as usize;
             if out.len() != expected_len {
-                return Err(AlgorithmError::Tiff(TiffError::BufferSize {
-                    expected: expected_len,
-                    got: out.len(),
-                }));
+                return Err(AlgorithmError::Frame(FrameError::Tiff(
+                    TiffError::BufferSize {
+                        expected: expected_len,
+                        got: out.len(),
+                    },
+                )));
             }
 
             let frame_samples = &self.frames[frame];
@@ -769,7 +780,7 @@ mod tests {
             got: 1,
         };
         match &read_err {
-            AlgorithmError::Tiff(inner) => {
+            AlgorithmError::Frame(FrameError::Tiff(inner)) => {
                 assert_eq!(inner.to_string(), expected_source.to_string());
             }
             other => panic!("expected Tiff, got {other:?}"),
@@ -835,7 +846,7 @@ mod tests {
 
         let mut wrong = vec![0u16; 3];
         match ctx.read_tile_into(0, rect, &mut wrong) {
-            Err(AlgorithmError::Tiff(TiffError::BufferSize { .. })) => {}
+            Err(AlgorithmError::Frame(FrameError::Tiff(TiffError::BufferSize { .. }))) => {}
             other => panic!("expected BufferSize error, got {other:?}"),
         }
         assert_eq!(

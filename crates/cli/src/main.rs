@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use focusforge_core::io::{ByteOrder, TiffError, TiffHeader, frame_paths};
+use focusforge_core::io::{
+    ByteOrder, FrameDesc, TiffError, TiffHeader, classify_header, frame_paths,
+};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
@@ -602,6 +604,7 @@ struct FileReport {
     file_size: Option<u64>,
     description: Option<String>,
     mmap_fast_path: Option<bool>,
+    reader: Option<String>,
     refusal: Option<String>,
     error: Option<String>,
 }
@@ -698,7 +701,16 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
         .iter()
         .filter_map(|p| p.header.as_ref().ok().map(|h| (p.name.as_str(), h)))
         .collect();
-    let (uniform_layout, uniform_detail) = focusforge_core::pipeline::uniform_check(&ok_headers);
+    let descs: Vec<FrameDesc> = ok_headers
+        .iter()
+        .map(|(_, header)| FrameDesc::from(*header))
+        .collect();
+    let named_descs: Vec<(&str, &FrameDesc)> = ok_headers
+        .iter()
+        .zip(descs.iter())
+        .map(|((name, _), desc)| (*name, desc))
+        .collect();
+    let (uniform_layout, uniform_detail) = focusforge_core::pipeline::uniform_check(&named_descs);
 
     let files = parsed
         .iter()
@@ -719,6 +731,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 file_size: Some(h.file_size),
                 description: h.image_description.clone(),
                 mmap_fast_path: Some(h.refusal.is_none()),
+                reader: classify_header(h).ok().map(|kind| kind.name().to_string()),
                 refusal: h.refusal.as_ref().map(|r| r.to_string()),
                 error: None,
             },
@@ -738,6 +751,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 file_size: None,
                 description: None,
                 mmap_fast_path: None,
+                reader: None,
                 refusal: None,
                 error: Some(e.to_string()),
             },
@@ -793,6 +807,9 @@ fn print_human(report: &InfoReport) {
             None => println!("  mmap fast path: yes"),
             Some(refusal) => println!("  mmap fast path: no — {refusal}"),
         }
+        if let Some(reader) = &file.reader {
+            println!("  reader: {reader}");
+        }
     }
 
     if report.is_directory {
@@ -820,6 +837,32 @@ fn fail(message: impl std::fmt::Display) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn desc(label: &str, signature: &[&str]) -> FrameDesc {
+        FrameDesc {
+            path: PathBuf::from(label),
+            file_size: 0,
+            image_description: None,
+            width: 1,
+            height: 1,
+            samples_per_pixel: 1,
+            strip_offsets: Vec::new(),
+            strip_byte_counts: Vec::new(),
+            layout_label: signature[0..2].join("/"),
+            layout_signature: signature.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn neutral_layout_tie_uses_the_last_group_and_lists_suffixes() {
+        let a = desc("a", &["II", "rps=1", "compression=1", "4x4"]);
+        let b = desc("b", &["MM", "rps=8", "compression=5", "8x4"]);
+        let (_, detail) = focusforge_core::pipeline::uniform_check(&[("a", &a), ("b", &b)]);
+        assert_eq!(
+            detail.as_deref(),
+            Some("a is II/rps=1/compression=1/4x4, others MM/rps=8")
+        );
+    }
 
     /// `--no-crop`'s clap default and `PROJECT_PARAMS`'s `auto-crop`
     /// descriptor default are one source of truth. This test fails the

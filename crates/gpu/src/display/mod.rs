@@ -11,7 +11,6 @@
 pub mod readback;
 pub use readback::read_display_texture;
 
-use crate::device::SharedDevice;
 use crate::pack::pack_samples;
 use crate::pipeline::{
     Pipeline, build_pipeline, run_pass_2d, storage_entry, storage_texture_entry, uniform_entry,
@@ -186,15 +185,13 @@ fn upload_samples(
 /// `src.len()` must equal exactly
 /// `target.width() * target.height() * samples_per_pixel`.
 pub fn render(
-    shared: &SharedDevice,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
     target: &DisplayTexture,
     src: &[u16],
     samples_per_pixel: u32,
     index_scale: u32,
 ) {
-    let device = shared.device();
-    let queue = shared.queue();
-
     let src_buffer = upload_samples(device, queue, src, "focusforge-gpu-display-src");
 
     let params = Params {
@@ -243,16 +240,14 @@ pub fn render(
 /// `target.width() * target.height() * 3`; `indices.len()` must equal
 /// `target.width() * target.height()`.
 pub fn render_overlay(
-    shared: &SharedDevice,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
     target: &DisplayTexture,
     composite: &[u16],
     indices: &[u16],
     table: &[[u8; 3]],
     alpha: u8,
 ) {
-    let device = shared.device();
-    let queue = shared.queue();
-
     let composite_buffer =
         upload_samples(device, queue, composite, "focusforge-gpu-overlay-composite");
     let indices_buffer = upload_samples(device, queue, indices, "focusforge-gpu-overlay-indices");
