@@ -797,21 +797,25 @@ mod tests {
         let store = ResumeStore::open(&scratch).unwrap();
         let record = sample_record(&scratch, "out.tif");
 
+        let assert_close_drops_the_handle = |ledger: Ledger| {
+            let dir = ledger.dir().to_path_buf();
+            assert!(
+                !open_fd_targets_under(&dir).is_empty(),
+                "expected the units.log handle to be visible under /proc/self/fd before close()"
+            );
+            let closed_dir = ledger.close();
+            assert_eq!(closed_dir, dir);
+            assert!(
+                open_fd_targets_under(&dir).is_empty(),
+                "units.log handle must be closed before its directory is removed"
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        };
+
         // A freshly begun ledger with a recorded unit.
         let ledger = store.begin(&record).unwrap();
         ledger.record_unit(0).unwrap();
-        let dir = ledger.dir().to_path_buf();
-        assert!(
-            !open_fd_targets_under(&dir).is_empty(),
-            "expected the units.log handle to be visible under /proc/self/fd before close()"
-        );
-        let closed_dir = ledger.close();
-        assert_eq!(closed_dir, dir);
-        assert!(
-            open_fd_targets_under(&dir).is_empty(),
-            "units.log handle must be closed before its directory is removed"
-        );
-        fs::remove_dir_all(&dir).unwrap();
+        assert_close_drops_the_handle(ledger);
 
         // A ledger reopened through `find`, after a unit was recorded and
         // the first handle onto it dropped.
@@ -822,18 +826,7 @@ mod tests {
             Resumable::Ledger(ledger) => ledger,
             other => panic!("expected Resumable::Ledger, got {other:?}"),
         };
-        let dir = ledger.dir().to_path_buf();
-        assert!(
-            !open_fd_targets_under(&dir).is_empty(),
-            "expected the reopened units.log handle to be visible under /proc/self/fd before close()"
-        );
-        let closed_dir = ledger.close();
-        assert_eq!(closed_dir, dir);
-        assert!(
-            open_fd_targets_under(&dir).is_empty(),
-            "reopened units.log handle must be closed before its directory is removed"
-        );
-        fs::remove_dir_all(&dir).unwrap();
+        assert_close_drops_the_handle(ledger);
 
         let _ = fs::remove_dir_all(&scratch);
     }
