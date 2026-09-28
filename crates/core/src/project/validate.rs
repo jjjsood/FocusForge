@@ -138,11 +138,9 @@ impl PendingProject {
 impl Project {
     /// [`Project::open`] plus a source-content re-hash: `Ready` when every
     /// resolvable source still hashes to what it was recorded against,
-    /// `NeedsChoice` when one does not. Every internal caller (append,
-    /// branch, delete, replay, the GUI's job and entry paths) uses plain
-    /// [`Project::open`] instead, since re-hashing every source on every
-    /// edit would price a retouch commit at the size of the sources rather
-    /// than the map.
+    /// `NeedsChoice` when one does not. Internal callers use plain
+    /// [`Project::open`] instead, since re-hashing every source per edit
+    /// would price a retouch commit at the size of the sources, not the map.
     pub fn open_checked(path: &Path) -> Result<Opened, ProjectError> {
         let project = Project::open(path)?;
         let check = check_sources(&project.manifest.sources, |s| project.source_path(s))?;

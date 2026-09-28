@@ -1074,13 +1074,15 @@ fn read_checkpoint_json(path: &Path, id: &str) -> Value {
     serde_json::from_slice(&read_entry_bytes(path, &format!("checkpoints/{id}.json"))).unwrap()
 }
 
-/// Copies `src` to `dst`, replacing the named entries in `replace` and
-/// appending the entries in `add` -- a raw rewrite of a real container, so a
-/// test can inject a malformed link or a mismatched blob the production
-/// writer would never produce.
+/// Copies `src` to `dst`, dropping the entries named in `drop`, replacing
+/// the named entries in `replace` and appending the entries in `add` -- a
+/// raw rewrite of a real container, so a test can inject a malformed link,
+/// a mismatched blob or a missing entry the production writer would never
+/// produce.
 fn mutate_container(
     src: &Path,
     dst: &Path,
+    drop: &[&str],
     replace: &[(String, Vec<u8>)],
     add: &[(String, Vec<u8>)],
 ) {
@@ -1093,6 +1095,9 @@ fn mutate_container(
     let options =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for name in &names {
+        if drop.contains(&name.as_str()) {
+            continue;
+        }
         let mut bytes = Vec::new();
         archive
             .by_name(name)
@@ -1108,34 +1113,6 @@ fn mutate_container(
     for (name, bytes) in add {
         writer.start_file(name.as_str(), options).unwrap();
         writer.write_all(bytes).unwrap();
-    }
-    writer.finish().unwrap();
-}
-
-/// Copies `src` to `dst`, leaving `entry` out entirely -- what a blob or a
-/// manifest actually missing from the container looks like, never just a
-/// zero-length one.
-fn drop_entry(src: &Path, dst: &Path, entry: &str) {
-    use std::io::{Read, Write};
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(src).unwrap()).unwrap();
-    let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
-        .collect();
-    let mut writer = zip::write::ZipWriter::new(std::fs::File::create(dst).unwrap());
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for name in &names {
-        if name == entry {
-            continue;
-        }
-        let mut bytes = Vec::new();
-        archive
-            .by_name(name)
-            .unwrap()
-            .read_to_end(&mut bytes)
-            .unwrap();
-        writer.start_file(name.as_str(), options).unwrap();
-        writer.write_all(&bytes).unwrap();
     }
     writer.finish().unwrap();
 }
@@ -1172,6 +1149,7 @@ fn validation_states_are_reported() {
     mutate_container(
         &project_path,
         &future,
+        &[],
         &[(
             "manifest.json".to_string(),
             serde_json::to_vec_pretty(&manifest).unwrap(),
@@ -1189,10 +1167,13 @@ fn validation_states_are_reported() {
         .zmap_blob
         .clone();
     let missing_entry = dir.join("missing-entry.ffp");
-    drop_entry(
+    let missing_blob = format!("blobs/{head_hash}.zst");
+    mutate_container(
         &project_path,
         &missing_entry,
-        &format!("blobs/{head_hash}.zst"),
+        &[missing_blob.as_str()],
+        &[],
+        &[],
     );
     let output = run(&dir, &["history", "list", missing_entry.to_str().unwrap()]);
     assert_eq!(output.exit_code, Some(6));
@@ -1214,6 +1195,7 @@ fn validation_states_are_reported() {
     mutate_container(
         &project_path,
         &tampered,
+        &[],
         &[(format!("blobs/{head_hash}.zst"), swapped_bytes)],
         &[],
     );
@@ -1230,6 +1212,7 @@ fn validation_states_are_reported() {
     mutate_container(
         &project_path,
         &dangling,
+        &[],
         &[],
         &[(
             "checkpoints/orphan.json".to_string(),
@@ -1278,6 +1261,7 @@ fn validation_states_are_reported() {
     mutate_container(
         &ops_project,
         &ops_no_parent,
+        &[],
         &[(
             format!("checkpoints/{child_id}.json"),
             serde_json::to_vec_pretty(&orphan_ops).unwrap(),
