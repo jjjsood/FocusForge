@@ -306,6 +306,19 @@ struct ProjectTab {
     /// entry into editor mode -- `None` until then, and cleared whenever a
     /// newer checkpoint replaces the planes it was opened over.
     edit: Option<job::EditSession>,
+    /// This tab's own failed, cancelled or sources-missing run, if its most
+    /// recent attempt did not succeed -- `None` once a later success clears
+    /// it. Keyed by tab rather than by path so it survives an Unsaved ->
+    /// Opened identity change and disappears with the tab on close.
+    failure: Option<TabFailure>,
+}
+
+/// A run outcome recorded against its own tab rather than the project's
+/// identity path -- [`ProjectTab::failure`]'s payload.
+struct TabFailure {
+    kind: FailureKind,
+    stage: String,
+    reason: String,
 }
 
 /// A held checkpoint whose run diverged on `diverged`, by frame file name.
@@ -373,6 +386,7 @@ impl ProjectTab {
             run: job::RunState::Idle,
             request: None,
             edit: None,
+            failure: None,
         }
     }
 
@@ -593,8 +607,11 @@ struct ShellState {
     /// checkpoints no `.ffp` contains. Mutually exclusive with
     /// `pending_close`: each is a no-op while the other question is open.
     pending_quit: bool,
-    /// Every card standing for a stack that did not become an open project
-    /// this session -- cleared the moment its own path opens successfully.
+    /// Every `Not a project` card -- a path with no open project behind it
+    /// at all, cleared the moment that same path opens successfully. A
+    /// failed, cancelled or sources-missing run instead lives on its own
+    /// tab ([`ProjectTab::failure`]), since it always has an open project
+    /// behind it.
     failures: Vec<FailureCard>,
     /// The gallery's own scroll offset and viewport height --
     /// [`ShellState::images_scroll_y`]'s twin.
@@ -1634,9 +1651,9 @@ impl AppController {
     /// records the skipped-subfolder notice. New tabs always go at the end,
     /// whether "+" or a project tab was selected.
     /// Every skipped subfolder becomes a `Not a project` card; an opened
-    /// project whose sources do not all resolve becomes a `Sources missing`
-    /// one alongside its tab; a path that opens successfully clears any card
-    /// already held for it.
+    /// project whose sources do not all resolve gets a `Sources missing`
+    /// failure on its own tab; a path that opens successfully clears any
+    /// `Not a project` card already held for it.
     fn accept(&mut self, opened: Opened, thumbnails: Vec<Option<Arc<overlay::Thumbnail>>>) {
         self.state.notice = notice_line(&opened.skipped);
         self.state.last_refusal = None;
@@ -1650,51 +1667,36 @@ impl AppController {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            for project in &opened.projects {
-                self.clear_failure(&project_identity_path(project));
-                self.record_recent(
-                    entry::tab_title(project),
-                    recent_folder(project),
-                    Some(project_identity_path(project)),
-                    opened_at,
-                );
-                if let GuiProject::Opened(p) = project
-                    && p.unresolved_sources().next().is_some()
-                {
-                    let path = p.path().to_path_buf();
-                    let title = p
-                        .path()
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| p.path().display().to_string());
-                    let frame_count = p.manifest().composite.frame_count as usize;
-                    self.record_failure(FailureCard {
-                        kind: FailureKind::SourcesMissing,
-                        path,
-                        title,
-                        stage: "NOTHING TO SHOW".to_string(),
-                        reason: "The project points at frames that are not where it left them."
-                            .to_string(),
-                        meta: format!(
-                            "{frame_count} {} · project found, sources not",
-                            frame_word(frame_count)
-                        ),
-                        frames: frame_count,
-                        request: None,
-                    });
-                }
-            }
             let mut thumbnails = thumbnails.into_iter();
             for project in opened.projects {
+                self.clear_failure(&project_identity_path(&project));
+                self.record_recent(
+                    entry::tab_title(&project),
+                    recent_folder(&project),
+                    Some(project_identity_path(&project)),
+                    opened_at,
+                );
+                let sources_missing = if let GuiProject::Opened(p) = &project {
+                    p.unresolved_sources().next().is_some()
+                } else {
+                    false
+                };
                 let source = match thumbnails.next() {
                     Some(decoded) => ThumbnailSource::Decoded(decoded),
                     None => ThumbnailSource::NotAttempted,
                 };
                 self.next_tab_id += 1;
                 let id = self.next_tab_id;
-                self.state
-                    .projects
-                    .push(ProjectTab::new(project, id, source));
+                let mut tab = ProjectTab::new(project, id, source);
+                if sources_missing {
+                    tab.failure = Some(TabFailure {
+                        kind: FailureKind::SourcesMissing,
+                        stage: "NOTHING TO SHOW".to_string(),
+                        reason: "The project points at frames that are not where it left them."
+                            .to_string(),
+                    });
+                }
+                self.state.projects.push(tab);
             }
         }
         self.settle_tab_scroll();
@@ -2085,9 +2087,29 @@ impl AppController {
             let phase_line = fusing
                 .then(|| job::phase_line(&tab.run, progress.as_ref()))
                 .flatten();
+            // A live run takes priority over the failure panel; the failure
+            // stays underneath until a success clears it.
+            let showing_failure = tab.failure.as_ref().filter(|_| !job::is_live(&tab.run));
+            let (kind, headline, stage, reason, action_label) = match showing_failure {
+                Some(failure) => (
+                    failure.kind.card_kind().to_string(),
+                    failure.kind.headline().to_string(),
+                    failure.stage.clone(),
+                    failure.reason.clone(),
+                    failure.kind.action_label().to_string(),
+                ),
+                None => (
+                    "open".to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ),
+            };
             let (x, y) = overlay::card_origin(cards.len(), columns);
             cards.push(CardView {
-                kind: "open".to_string(),
+                kind,
+                opened: true,
                 current: self.state.active == Some(i),
                 unsaved: tab.unsaved(),
                 fusing,
@@ -2098,10 +2120,10 @@ impl AppController {
                 },
                 project_name: tab.title.clone(),
                 meta_text: open_card_meta(frame_count, tab.checkpoints, phase_line.as_deref()),
-                headline: String::new(),
-                stage: String::new(),
-                reason: String::new(),
-                action_label: String::new(),
+                headline,
+                stage,
+                reason,
+                action_label,
                 picture: tab.thumbnail.clone(),
                 x,
                 y,
@@ -2111,6 +2133,7 @@ impl AppController {
             let (x, y) = overlay::card_origin(cards.len(), columns);
             cards.push(CardView {
                 kind: failure.kind.card_kind().to_string(),
+                opened: false,
                 current: false,
                 unsaved: false,
                 fusing: false,
@@ -2129,15 +2152,17 @@ impl AppController {
         cards
     }
 
-    /// Records `card`, replacing any card already held for the same path.
+    /// Records a `Not a project` `card`, replacing any card already held for
+    /// the same path.
     fn record_failure(&mut self, card: FailureCard) {
         self.state.failures.retain(|c| c.path != card.path);
         self.state.failures.push(card);
         self.emit(ShellEvent::OverlayChanged);
     }
 
-    /// Clears any card held for `path` -- what a path opening successfully
-    /// does to whichever card, if any, stood for its last attempt.
+    /// Clears any `Not a project` card held for `path` -- what a path
+    /// opening successfully does to whichever such card stood for its last
+    /// attempt.
     fn clear_failure(&mut self, path: &Path) {
         let before = self.state.failures.len();
         self.state.failures.retain(|c| c.path != path);
@@ -2157,10 +2182,14 @@ impl AppController {
         self.select_project(index);
     }
 
-    /// The failure card at gallery index `index`'s own kind string, if any --
-    /// what `crate::bridge` reads before deciding whether its action needs
-    /// the folder picker.
+    /// The card at gallery index `index`'s own kind string, if it is showing
+    /// a failure -- what `crate::bridge` reads before deciding whether its
+    /// action needs the folder picker. Reads the tab's own failure for an
+    /// open project's card, the `Not a project` list for the rest.
     pub fn gallery_failure_kind(&self, index: usize) -> Option<&'static str> {
+        if let Some(tab) = self.state.projects.get(index) {
+            return tab.failure.as_ref().map(|f| f.kind.card_kind());
+        }
         let failure_index = index.checked_sub(self.state.projects.len())?;
         self.state
             .failures
@@ -2168,66 +2197,48 @@ impl AppController {
             .map(|f| f.kind.card_kind())
     }
 
-    /// `Run again` on a `Did not stack`/`Cancelled` card: re-runs that
-    /// card's own kept request, on its own tab. Refuses rather than
-    /// attributing the run to whatever tab happens to be active when that
-    /// project's tab is no longer open, and never more than one card's worth
-    /// of work: a no-op while any run is already live. Returns whether a run
-    /// started.
+    /// `Run again` on a `Did not stack`/`Cancelled` card: re-runs that tab's
+    /// own kept request. Never more than one card's worth of work: a no-op
+    /// while any run is already live, or with no matching failure, or with
+    /// no request kept for it. Returns whether a run started.
     pub fn run_gallery_action(&mut self, index: usize) -> bool {
         if self.any_job_running() {
             return false;
         }
-        let Some(failure_index) = index.checked_sub(self.state.projects.len()) else {
+        let Some(tab) = self.state.projects.get(index) else {
             return false;
         };
-        let Some(failure) = self.state.failures.get(failure_index) else {
+        let Some(failure) = &tab.failure else {
             return false;
         };
-        let Some(request) = failure.request.clone() else {
+        if !matches!(failure.kind, FailureKind::Failed | FailureKind::Cancelled) {
+            return false;
+        }
+        let Some(request) = tab.request.clone() else {
             return false;
         };
-        let path = failure.path.clone();
-        let Some(tab_index) = self
-            .state
-            .projects
-            .iter()
-            .position(|t| project_identity_path(&t.project) == path)
-        else {
-            return false;
-        };
-        self.state.active = Some(tab_index);
-        self.run_request(tab_index, request);
+        self.state.active = Some(index);
+        self.run_request(index, request);
         true
     }
 
-    /// `Locate frames…` on a `Sources missing` card: re-resolves that
-    /// project's own tab against `folder` in memory only -- no write, and no
-    /// touch of the sealed `.ffp`'s own fingerprint. Clears the card only
+    /// `Locate frames…` on a `Sources missing` card: re-resolves that tab's
+    /// own frames against `folder` in memory only -- no write, and no touch
+    /// of the sealed `.ffp`'s own fingerprint. Clears the tab's failure only
     /// once every source resolves; a folder missing some of them changes
     /// nothing, silently.
     pub fn locate_missing_sources(&mut self, index: usize, folder: PathBuf) {
-        let Some(failure_index) = index.checked_sub(self.state.projects.len()) else {
+        let Some(tab) = self.state.projects.get(index) else {
             return;
         };
-        let Some(failure) = self.state.failures.get(failure_index) else {
-            return;
-        };
-        if failure.kind != FailureKind::SourcesMissing {
-            return;
-        }
-        let path = failure.path.clone();
-        let Some(tab) = self
-            .state
-            .projects
-            .iter_mut()
-            .find(|t| project_identity_path(&t.project) == path)
-        else {
-            return;
-        };
+        let sources_missing =
+            matches!(&tab.failure, Some(f) if f.kind == FailureKind::SourcesMissing);
         let GuiProject::Opened(project) = &tab.project else {
             return;
         };
+        if !sources_missing {
+            return;
+        }
         let candidates: Vec<PathBuf> = project
             .manifest()
             .sources
@@ -2241,10 +2252,12 @@ impl AppController {
             })
             .collect();
         if candidates.iter().all(|p| p.is_file()) {
+            let tab = &mut self.state.projects[index];
             tab.excluded = vec![false; candidates.len()];
             tab.frames = candidates;
             tab.selected = images::first_included(&tab.excluded);
-            self.clear_failure(&path);
+            tab.failure = None;
+            self.emit(ShellEvent::OverlayChanged);
         }
     }
 
@@ -3662,7 +3675,6 @@ impl AppController {
         let phase = job::progress_phase(progress.as_ref());
         let tab_index = self.job.tab_id.take().and_then(|id| self.tab_index(id));
         let owner = tab_index.and_then(|i| self.state.projects.get(i));
-        let request = owner.and_then(|tab| tab.request.clone());
         let was_cancelling = owner.is_some_and(|tab| tab.run == job::RunState::Cancelling);
         let settled = job::settle(handle.join());
         self.job.control = None;
@@ -3682,7 +3694,6 @@ impl AppController {
         let tab_info = tab_index
             .and_then(|i| self.state.projects.get(i))
             .map(|tab| (project_identity_path(&tab.project), tab.title.clone()));
-        let frame_count = request.as_ref().map_or(0, |r| r.frames.len());
 
         match &settled.state {
             job::RunState::Failed(message) => {
@@ -3698,36 +3709,20 @@ impl AppController {
                 };
                 self.notifications.push(notification.clone());
                 self.settled_failure = Some(notification);
-                if let Some((path, title)) = tab_info.clone() {
-                    self.record_failure(FailureCard {
+                if let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) {
+                    tab.failure = Some(TabFailure {
                         kind: FailureKind::Failed,
-                        path,
-                        title,
                         stage: format!("FAILED WHILE {}", phase.name().to_uppercase()),
                         reason: message.clone(),
-                        meta: format!(
-                            "{frame_count} {} · no project written",
-                            frame_word(frame_count)
-                        ),
-                        frames: frame_count,
-                        request: request.clone(),
                     });
                 }
             }
             job::RunState::Idle if was_cancelling => {
-                if let Some((path, title)) = tab_info {
-                    self.record_failure(FailureCard {
+                if let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) {
+                    tab.failure = Some(TabFailure {
                         kind: FailureKind::Cancelled,
-                        path,
-                        title,
                         stage: format!("STOPPED WHILE {}", phase.name().to_uppercase()),
                         reason: "You stopped this one. Nothing was written.".to_string(),
-                        meta: format!(
-                            "{frame_count} {} · stopped before writing",
-                            frame_word(frame_count)
-                        ),
-                        frames: frame_count,
-                        request: request.clone(),
                     });
                 }
             }
@@ -3790,7 +3785,6 @@ impl AppController {
     /// and Z-Map paths for the canvas.
     fn commit_held(&mut self, index: usize, held: job::HeldCheckpoint) -> (PathBuf, PathBuf) {
         let tab = &mut self.state.projects[index];
-        let path = project_identity_path(&tab.project);
         tab.checkpoints += 1;
         if let Some(request) = &tab.request {
             tab.frames = request.frames.clone();
@@ -3800,9 +3794,9 @@ impl AppController {
         tab.frame_sort = None;
         tab.edit = None;
         tab.thumbnail = overlay::render_thumbnail_from_frame(&held.composite).map(Arc::new);
+        tab.failure = None;
         let planes = (held.composite.clone(), held.zmap.clone());
         tab.held.push(held);
-        self.clear_failure(&path);
         planes
     }
 
@@ -4643,8 +4637,6 @@ fn not_a_project_card(path: PathBuf) -> FailureCard {
         reason: "This folder holds something else. Nothing was read and nothing was changed."
             .to_string(),
         meta: "not read · not changed".to_string(),
-        frames: 0,
-        request: None,
     }
 }
 

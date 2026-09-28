@@ -552,6 +552,7 @@ export component ThemeSheet inherits Window {
             spacing: Theme.space-6;
             FFProjectCard {
                 kind: "open";
+                opened: true;
                 current: true;
                 unsaved: true;
                 project-name: "IMG_9801-9861";
@@ -559,6 +560,7 @@ export component ThemeSheet inherits Window {
             }
             FFProjectCard {
                 kind: "open";
+                opened: true;
                 fusing: true;
                 fusing-fraction: 0.42;
                 project-name: "IMG_9941-9977";
@@ -566,36 +568,41 @@ export component ThemeSheet inherits Window {
             }
             FFProjectCard {
                 kind: "failed";
+                opened: true;
+                current: true;
                 glyph: @image-url("../../../assets/icons/triangle-alert.svg");
                 headline: "Did not stack";
                 stage: "FAILED WHILE ALIGNING";
                 reason: "Frames 12 and 13 share no overlap. Alignment stopped there.";
                 action-label: "Run again";
                 project-name: "IMG_9862-9903";
-                meta-text: "42 frames · no project written";
+                meta-text: "42 frames · 1 checkpoint";
             }
         }
         HorizontalLayout {
             spacing: Theme.space-6;
             FFProjectCard {
                 kind: "sources-missing";
+                opened: true;
+                unsaved: true;
                 glyph: @image-url("../../../assets/icons/circle-alert.svg");
                 headline: "Sources missing";
                 stage: "NOTHING TO SHOW";
                 reason: "The project points at frames that are not where it left them.";
                 action-label: "Locate frames…";
                 project-name: "IMG_9978-9994";
-                meta-text: "17 frames · project found, sources not";
+                meta-text: "17 frames · 3 checkpoints";
             }
             FFProjectCard {
                 kind: "cancelled";
+                opened: true;
                 glyph: @image-url("../../../assets/icons/x.svg");
                 headline: "Cancelled";
                 stage: "STOPPED WHILE FUSING";
                 reason: "You stopped this one. Nothing was written.";
                 action-label: "Run again";
                 project-name: "IMG_10062-10090";
-                meta-text: "29 frames · stopped before writing";
+                meta-text: "29 frames · 2 checkpoints";
             }
             FFProjectCard {
                 kind: "not-a-project";

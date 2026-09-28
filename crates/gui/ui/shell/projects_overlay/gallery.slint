@@ -12,6 +12,7 @@ import { FFScrollbar } from "../../components/ff_scrollbar.slint";
 // positioned on the grid.
 export struct ProjectCardView {
     kind: string,
+    opened: bool,
     current: bool,
     unsaved: bool,
     fusing: bool,
@@ -114,6 +115,7 @@ export component FFProjectsGallery inherits Rectangle {
                 x: card.x;
                 y: card.y;
                 kind: card.kind;
+                opened: card.opened;
                 current: card.current;
                 unsaved: card.unsaved;
                 fusing: card.fusing;

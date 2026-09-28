@@ -814,6 +814,7 @@ pub fn push_projects_overlay(app: &AppWindow, controller: &AppController) {
         .into_iter()
         .map(|c| GeneratedProjectCard {
             kind: c.kind.into(),
+            opened: c.opened,
             current: c.current,
             unsaved: c.unsaved,
             fusing: c.fusing,

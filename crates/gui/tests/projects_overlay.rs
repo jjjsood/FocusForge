@@ -494,6 +494,11 @@ fn four_failure_cards_have_their_shapes() {
     wait_for_settle(&mut controller, Duration::from_secs(120));
 
     let cards = controller.project_cards();
+    assert_eq!(
+        cards.len(),
+        controller.project_tabs().len() + 1,
+        "one card per open tab, plus the one not-a-project card with no tab"
+    );
 
     let not_a_project = card_by_kind(&cards, "not-a-project");
     assert_eq!(not_a_project.headline, "Not a project");
@@ -501,40 +506,210 @@ fn four_failure_cards_have_their_shapes() {
         not_a_project.action_label, "",
         "Not a project has no action"
     );
+    assert!(!not_a_project.opened, "the only unopened card");
 
     let sources_missing = card_by_kind(&cards, "sources-missing");
     assert_eq!(sources_missing.headline, "Sources missing");
     assert_eq!(sources_missing.action_label, "Locate frames…");
+    assert!(sources_missing.opened, "merged onto its own open project");
 
     let failed = card_by_kind(&cards, "failed");
     assert_eq!(failed.headline, "Did not stack");
     assert_eq!(failed.action_label, "Run again");
     assert!(!failed.reason.is_empty());
+    assert!(failed.opened, "merged onto its own open project");
 
     let cancelled = card_by_kind(&cards, "cancelled");
     assert_eq!(cancelled.headline, "Cancelled");
     assert_eq!(cancelled.action_label, "Run again");
+    assert!(cancelled.opened, "merged onto its own open project");
+
+    assert_eq!(
+        controller.gallery_count_text(),
+        "5 · 1 did not open",
+        "did not open counts only the not-a-project card"
+    );
 }
 
 #[test]
-fn a_failed_stack_is_present_not_absent() {
+fn a_failed_stack_updates_the_open_tab_not_a_second_card() {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(tree("present_not_absent_scratch"));
     open_unreadable_frames(&mut controller, "present_not_absent");
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(60));
 
-    // The tab itself stays open; the failure must show up as a card too --
-    // a failed stack is a visible failure, not a gap in the gallery.
+    // The tab itself stays open; its own card takes on the failure instead
+    // of a second card appearing for the same attempt.
     assert_eq!(controller.project_tabs().len(), 1);
+    let cards = controller.project_cards();
+    assert_eq!(cards.len(), 1, "one tab, one card -- no duplicate");
+    let failure = card_by_kind(&cards, "failed");
+    assert_eq!(failure.headline, "Did not stack");
+    assert!(failure.opened);
+}
+
+#[test]
+fn a_failed_run_updates_its_own_card() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("abc_scratch"));
+    open_frames(&mut controller, "abc_a", 2);
+    let mid_dir = open_frames(&mut controller, "abc_mid", 3);
+    open_frames(&mut controller, "abc_c", 2);
+    std::fs::write(mid_dir.join("01.tif"), b"not a tiff").unwrap();
+
+    controller.select_project(1);
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(60));
+
+    let cards = controller.project_cards();
+    assert_eq!(cards.len(), 3, "one card per open tab, no duplicate");
+    assert_eq!(cards[0].kind, "open");
+    assert_eq!(cards[1].kind, "failed");
+    assert!(
+        cards[1].opened,
+        "the merged card stays its own open project's card"
+    );
+    assert!(cards[1].current, "the failed tab is still the active one");
+    assert_eq!(cards[2].kind, "open");
+    assert_eq!(controller.gallery_count_text(), "3 open");
+}
+
+#[test]
+fn a_failure_keeps_earlier_checkpoints() {
+    let (mut controller, dir) = controller_with_frames_and_dir("keeps_checkpoints", 2);
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(60));
+    assert_eq!(controller.checkpoint_count(), Some(1));
+
+    std::fs::write(dir.join("01.tif"), b"not a tiff").unwrap();
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(60));
+
+    assert_eq!(
+        controller.checkpoint_count(),
+        Some(1),
+        "the earlier checkpoint survives a later failure"
+    );
+    let cards = controller.project_cards();
+    let card = card_by_kind(&cards, "failed");
+    assert!(card.meta_text.ends_with("1 checkpoint"));
+    assert!(card.unsaved, "the held checkpoint keeps the tab unsaved");
+}
+
+#[test]
+fn run_again_stays_on_one_card_until_success() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("run_again_scratch"));
+    open_frames(&mut controller, "run_again_healthy", 2);
+    let fail_dir = open_unreadable_frames(&mut controller, "run_again_fail");
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(60));
+
+    assert!(
+        !controller.run_gallery_action(0),
+        "the healthy card's own tab carries no failure to replay"
+    );
+
+    assert!(controller.run_gallery_action(1));
+    wait_for_settle(&mut controller, Duration::from_secs(60));
+    assert_eq!(
+        controller.active_project(),
+        Some(1),
+        "run again makes its tab active"
+    );
+    assert_eq!(
+        controller.project_cards().len(),
+        2,
+        "still one card per tab"
+    );
+
+    assert!(controller.run_gallery_action(1));
+    wait_for_settle(&mut controller, Duration::from_secs(60));
+    assert_eq!(
+        controller.project_cards().len(),
+        2,
+        "a repeated failure updates the same card, not a new one"
+    );
+
+    std::fs::copy(mantis_frame(1), fail_dir.join("01.tif")).unwrap();
+    assert!(controller.run_gallery_action(1));
+    wait_for_settle(&mut controller, Duration::from_secs(60));
+    let cards = controller.project_cards();
+    assert_eq!(cards.len(), 2);
+    assert_eq!(cards[1].kind, "open");
+    assert_eq!(controller.checkpoint_count(), Some(1));
+}
+
+#[test]
+fn a_cancelled_run_stays_on_its_own_card() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("cancel_scratch"));
+    open_frames(&mut controller, "cancel_a", 2);
+    open_frames(&mut controller, "cancel_b", 2);
+    controller.select_project(1);
+    assert!(controller.start_fuse());
+    controller.cancel_fuse();
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+
     let cards = controller.project_cards();
     assert_eq!(
         cards.len(),
         2,
-        "one open tab, one failure card for the same attempt"
+        "one card per tab, no separate cancelled card"
     );
-    let failure = card_by_kind(&cards, "failed");
-    assert_eq!(failure.headline, "Did not stack");
+    let cancelled = card_by_kind(&cards, "cancelled");
+    assert!(cancelled.opened);
+    assert_eq!(cancelled.project_name, "cancel_b_frames");
+    assert_eq!(controller.gallery_count_text(), "2 open");
+}
+
+#[test]
+fn a_failure_survives_a_save_and_leaves_with_its_tab() {
+    let (mut controller, dir) = controller_with_frames_and_dir("survives_save", 2);
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(60));
+    assert_eq!(controller.checkpoint_count(), Some(1));
+
+    std::fs::write(dir.join("01.tif"), b"not a tiff").unwrap();
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(60));
+    assert_eq!(
+        card_by_kind(&controller.project_cards(), "failed").project_name,
+        "survives_save_frames"
+    );
+
+    assert!(controller.save_active_project(|proposed| Some(proposed.to_path_buf())));
+    let cards = controller.project_cards();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(
+        cards[0].kind, "failed",
+        "the failure survives the Unsaved -> Opened identity change"
+    );
+
+    controller.close_project(0);
+    assert!(
+        controller.project_cards().is_empty(),
+        "the failure leaves with its tab"
+    );
+}
+
+#[test]
+fn sources_missing_is_located_on_its_own_card() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("sources_missing_scratch"));
+    let project_path = seal_as_given_project("sources_missing");
+    let frames_dir =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("sources_missing_source_frames");
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[project_path]),
+        OpenOutcome::Opened(_)
+    ));
+
+    assert_eq!(controller.gallery_failure_kind(0), Some("sources-missing"));
+    controller.locate_missing_sources(0, frames_dir);
+    assert_eq!(controller.gallery_failure_kind(0), None);
+    assert_eq!(controller.project_cards()[0].kind, "open");
 }
 
 // ---------------------------------------------------------------------
