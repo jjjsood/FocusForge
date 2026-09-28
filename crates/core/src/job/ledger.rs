@@ -215,10 +215,14 @@ impl Ledger {
     /// Removes this ledger's whole directory -- called by a caller (the
     /// CLI) once its run's `finish()` has succeeded. A cancelled or crashed
     /// run's ledger is never discarded here: only a caller that knows its
-    /// own run is genuinely done calls this.
+    /// own run is genuinely done calls this. Closes the open `units.log`
+    /// handle before removing the directory: some filesystems refuse to
+    /// remove a directory that still holds an open file.
     pub fn discard(self) -> Result<(), ResumeError> {
-        fs::remove_dir_all(&self.dir).map_err(|source| ResumeError::Io {
-            path: self.dir.clone(),
+        let Ledger { dir, units_log, .. } = self;
+        drop(units_log);
+        fs::remove_dir_all(&dir).map_err(|source| ResumeError::Io {
+            path: dir.clone(),
             source,
         })
     }
@@ -765,6 +769,79 @@ mod tests {
         assert!(dir.is_dir());
         ledger.discard().unwrap();
         assert!(!dir.exists());
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn discard_removes_a_resumed_ledger_with_alignment() {
+        let scratch = tmp_dir("discard-resumed");
+        let store = ResumeStore::open(&scratch).unwrap();
+        let record = sample_record(&scratch, "out.tif");
+
+        let fresh = store.begin(&record).unwrap();
+        fresh.record_unit(0).unwrap();
+        let alignment = StackAlignment {
+            reference: 0,
+            policy: crate::align::ReferencePolicy::Anchor,
+            frames: vec![crate::align::FrameAlignment {
+                frame: 0,
+                transform: crate::align::Transform::identity(),
+                status: crate::algorithm::AlignStatus::Converged,
+                iterations: 0,
+                residual: 1.0,
+                fallback: false,
+            }],
+        };
+        fresh.record_alignment(&alignment).unwrap();
+        drop(fresh);
+
+        let resumed = match store.find(&record).unwrap() {
+            Resumable::Ledger(ledger) => ledger,
+            other => panic!("expected Resumable::Ledger, got {other:?}"),
+        };
+        let dir = resumed.dir().to_path_buf();
+        assert!(dir.is_dir());
+        resumed.discard().unwrap();
+        assert!(!dir.exists());
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discard_reports_a_removal_it_cannot_complete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tmp_dir("discard-unremovable");
+        let store = ResumeStore::open(&scratch).unwrap();
+        let record = sample_record(&scratch, "out.tif");
+        let ledger = store.begin(&record).unwrap();
+        let dir = ledger.dir().to_path_buf();
+
+        let foreign = dir.join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("stray"), b"x").unwrap();
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Root bypasses directory permissions, so the removal cannot fail there.
+        let probe = foreign.join("probe");
+        if fs::write(&probe, b"x").is_ok() {
+            let _ = fs::remove_file(&probe);
+            fs::set_permissions(&foreign, fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = fs::remove_dir_all(&scratch);
+            eprintln!("skipping: running as root, permissions do not block removal");
+            return;
+        }
+
+        match ledger.discard() {
+            Err(ResumeError::Io { path, .. }) => assert_eq!(path, dir),
+            other => panic!("expected ResumeError::Io naming {dir:?}, got {other:?}"),
+        }
+        assert!(
+            dir.exists(),
+            "a failed discard must leave the directory in place"
+        );
+
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o755)).unwrap();
         let _ = fs::remove_dir_all(&scratch);
     }
 
