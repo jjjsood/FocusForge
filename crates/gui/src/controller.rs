@@ -671,6 +671,10 @@ struct ShellState {
     notice: Option<String>,
     /// The most recent refusal's already-rendered message, if any.
     last_refusal: Option<String>,
+    /// Whether the "No frames here" refusal dialog is open -- raised by
+    /// [`AppController::refuse_message`], cleared by
+    /// [`AppController::dismiss_refusal`].
+    refusal_open: bool,
     /// The tab strip's scroll offset in pixels, always within
     /// [`clamp_tab_scroll`]'s range for the current tabs and viewport.
     tab_scroll_x: f32,
@@ -1505,15 +1509,16 @@ impl AppController {
         }
     }
 
-    /// The brush cursor overlay's own view: extent and path commands built
-    /// from the current brush size/softness scaled to on-screen px by the
-    /// active tab's own viewport, the pipette's own preview colour --
-    /// the Z-Map index under the pointer while armed or while `Alt` is
-    /// held, the selected source otherwise -- and `mirror_dx`, the offset
-    /// that carries either pane's cursor onto the other. `None` with no
-    /// active tab, an unfitted viewport, or before pane geometry is
-    /// installed (nothing to draw a cursor over, or no offset to compute).
+    /// The brush cursor overlay's own view: extent and path commands built from the current brush
+    /// size/softness scaled to on-screen px by the active tab's own viewport, the pipette's own
+    /// preview colour -- the Z-Map index under the pointer while armed or while `Alt` is held, the
+    /// selected source otherwise -- and `mirror_dx`, the offset that carries either pane's cursor
+    /// onto the other. `None` with no active tab, viewport or pane geometry, or while
+    /// [`Self::canvas_blocked`] holds.
     pub fn brush_cursor_view(&self) -> Option<BrushCursorView> {
+        if self.canvas_blocked() {
+            return None;
+        }
         let tab = self.state.active()?;
         let viewport = tab.viewport.as_ref()?;
         let (left, right) = self.state.panes?;
@@ -1994,9 +1999,9 @@ impl AppController {
     /// `mouse-x`/`mouse-y` before `scroll-event` is invoked.
     pub fn wheel(&mut self, delta_x: f32, delta_y: f32, x: f32, y: f32, mods: Modifiers) {
         // Every wheel-triggered action -- zoom, pan, anything else a table
-        // row binds to `Trigger::Wheel` -- stays off under the Settings
-        // modal.
-        if self.state.settings_open {
+        // row binds to `Trigger::Wheel` -- stays off while the canvas is
+        // blocked.
+        if self.canvas_blocked() {
             return;
         }
         self.state.input.last_pointer = (x, y);
@@ -2014,9 +2019,14 @@ impl AppController {
     /// cancelled grab is forwarded here as `PointerKind::Up` so a live drag
     /// never gets stuck on). `Down` starts a drag on a
     /// `Trigger::Drag` hit or fires once on a `Trigger::Click` hit; `Up`
-    /// ends any live drag.
+    /// ends any live drag. While the canvas is blocked, `Down` starts no
+    /// drag and fires no click, but `Up` still ends whatever drag was
+    /// already live, so nothing sticks on once the modal opened mid-stroke.
     pub fn pointer(&mut self, kind: PointerKind, button: Button, x: f32, y: f32, mods: Modifiers) {
         self.state.input.last_pointer = (x, y);
+        if self.canvas_blocked() && kind != PointerKind::Up {
+            return;
+        }
         match kind {
             PointerKind::Down => {
                 let drag_trigger = Trigger::Drag { button, mods };
@@ -2061,8 +2071,14 @@ impl AppController {
 
     /// Meaningful only while a drag is live. Deltas are differences
     /// between successive positions -- `PointerEvent` carries no movement
-    /// delta of its own (slint-ui/slint#13189).
+    /// delta of its own (slint-ui/slint#13189). While the canvas is
+    /// blocked, a live drag commits no further stamp -- it stays live, so
+    /// the next `pointer` `Up` still ends it, just with nothing added since
+    /// the modal opened.
     pub fn pointer_moved(&mut self, x: f32, y: f32) {
+        if self.canvas_blocked() {
+            return;
+        }
         let Some(drag) = &mut self.state.input.drag else {
             return;
         };
@@ -2087,7 +2103,7 @@ impl AppController {
             self.set_space_held(pressed);
             return;
         }
-        if !pressed {
+        if !pressed || self.canvas_blocked() {
             return;
         }
         let lowered = text.to_lowercase();
@@ -2096,11 +2112,6 @@ impl AppController {
         };
         let trigger = Trigger::Key { key, mods };
         if let Some(action) = self.state.input.table.action(&trigger, self.state.mode) {
-            // Undo and redo stay off under the Settings modal, whatever key
-            // they are bound to.
-            if self.state.settings_open && matches!(action, Action::Undo | Action::Redo) {
-                return;
-            }
             self.emit_action(ActionEvent::Fired { action, steps: 0.0 });
         }
     }
@@ -2156,6 +2167,26 @@ impl AppController {
     pub fn close_settings(&mut self) -> bool {
         self.state.settings_open = false;
         false
+    }
+
+    /// Whether one of the six dialogs that block the chrome accelerators is
+    /// open: Settings, the close/quit guard, the frame-set warning, the
+    /// Keep/Discard divergence dialog, the grouping question or the refusal
+    /// dialog.
+    pub fn modal_open(&self) -> bool {
+        self.state.settings_open
+            || self.state.pending_close.is_some()
+            || self.state.pending_quit
+            || self.state.pending_frame_change.is_some()
+            || self.pending_divergence().is_some()
+            || self.state.pending.is_some()
+            || self.state.refusal_open
+    }
+
+    /// Whether the canvas and the dock beneath it are blocked: a dialog from
+    /// [`Self::modal_open`] is open, or the Projects overlay is.
+    pub fn canvas_blocked(&self) -> bool {
+        self.modal_open() || self.state.overlay_open
     }
 
     // -- The entry path: the picker, the drop route and `--open` all call
@@ -2314,6 +2345,11 @@ impl AppController {
         self.state.last_refusal.as_deref()
     }
 
+    /// Closes the refusal dialog -- its own "Pick another folder…" button.
+    pub fn dismiss_refusal(&mut self) {
+        self.state.refusal_open = false;
+    }
+
     /// `thumbnails` are the pictures the load's own worker already decoded
     /// for `outcome`'s own projects -- both [`Self::open_paths`] and
     /// [`Self::answer_question`] decode on their worker before parking the
@@ -2436,6 +2472,7 @@ impl AppController {
     /// nothing there is an entry-path failure.
     pub fn refuse_message(&mut self, message: String) {
         self.state.last_refusal = Some(message.clone());
+        self.state.refusal_open = true;
         self.emit(ShellEvent::EntryRefused(message));
     }
 
@@ -2715,10 +2752,9 @@ impl AppController {
     /// `Ctrl+N/O/S/W` -- checked before [`Self::key`]'s rebindable table, so
     /// none of the five can be shadowed by a user's rebind. The four
     /// Ctrl-chords apply anywhere in the window, whether or not the overlay
-    /// is open; none of them acts while the Settings modal is open, nor
-    /// while a close question is open. `Esc` only closes an open overlay.
-    /// Every other key press reads [`ChromeKey::None`] and falls through
-    /// unchanged.
+    /// is open; none of them acts while [`Self::modal_open`] holds. `Esc`
+    /// only closes an open overlay. Every other key press reads
+    /// [`ChromeKey::None`] and falls through unchanged.
     pub fn chrome_key(&mut self, text: &str, mods: Modifiers) -> ChromeKey {
         let Some(key) = text.chars().next() else {
             return ChromeKey::None;
@@ -2737,7 +2773,7 @@ impl AppController {
         if !matches!(key, 'n' | 'o' | 's' | 'w') {
             return ChromeKey::None;
         }
-        if self.state.pending_close.is_some() || self.state.settings_open {
+        if self.modal_open() {
             return ChromeKey::Consumed;
         }
         match key {

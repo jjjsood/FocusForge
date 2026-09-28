@@ -16,18 +16,23 @@ use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode};
 
 /// True when `body` (already trimmed) is exactly one statement of the form
 /// `root.<ident>(...)`, an optional trailing `accept`/`reject` (`scroll-event`
-/// and the key handlers return an `EventResult`), a bare literal assignment
-/// (`self.<ident> = <literal>;` or `<child-id>.<ident> = <literal>;`), or one
+/// and the key handlers return an `EventResult`), a bare `accept`/`reject`
+/// alone (a scrim swallowing the event with nothing to forward), a bare
+/// literal assignment (`self.<ident> = <literal>;` or
+/// `<child-id>.<ident> = <literal>;`), or one
 /// `if <property-path> { <literal-assignment> }` with no `else` -- a small
 /// Slint-side gate resetting itself. Nothing else widens: two statements, a
 /// computed or forwarded right-hand side, or an `else` branch all still fail.
 fn is_single_root_call(body: &str) -> bool {
     let body = body.trim();
-    let body = body
+    let stripped = body
         .strip_suffix("accept")
         .or_else(|| body.strip_suffix("reject"))
-        .map(str::trim_end)
-        .unwrap_or(body);
+        .map(str::trim_end);
+    if stripped.is_some_and(str::is_empty) {
+        return true;
+    }
+    let body = stripped.unwrap_or(body);
     if body.starts_with("root.") && body.ends_with(");") && body.matches(';').count() == 1 {
         return true;
     }
@@ -122,6 +127,12 @@ fn is_single_root_call_allows_one_trailing_accept_or_reject() {
         !is_single_root_call("let x = 1; root.foo(); accept"),
         "a non-forward statement before the trailing token must still fail"
     );
+}
+
+#[test]
+fn is_single_root_call_allows_a_bare_accept_or_reject() {
+    assert!(is_single_root_call("accept"));
+    assert!(is_single_root_call("reject"));
 }
 
 #[test]
@@ -3828,4 +3839,366 @@ fn stroke_matches_left_pane() {
         recomposited, left_pixel,
         "the recomposited pixel must equal the left pane's own read at the same point"
     );
+}
+
+// ---------------------------------------------------------------------
+// A modal or the Projects overlay hides the brush cursor and blocks the
+// canvas beneath it.
+// ---------------------------------------------------------------------
+
+/// Raises the one grouping question from two single-frame subfolders --
+/// the same ambiguous shape a real folder scan produces, small fixture
+/// frames standing in for a user's own subject folders.
+fn raise_question(controller: &mut AppController, name: &str) {
+    let root = common::tree(&format!("{name}_question"));
+    for (subject, frame) in [("subject-a", 0usize), ("subject-b", 1)] {
+        let dir = root.join(subject);
+        fs::create_dir_all(&dir).unwrap();
+        fs::copy(
+            common::fixture_frame("mantis-64", frame),
+            dir.join("00.tif"),
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        common::open_and_settle(controller, &[root]),
+        OpenOutcome::Question(..)
+    ));
+}
+
+/// Raises the "No frames here" refusal from an empty folder -- whether
+/// classification refuses it synchronously or a worker settles it, either
+/// way [`AppController::last_refusal`] ends up `Some`.
+fn raise_refusal(controller: &mut AppController, name: &str) {
+    let root = common::tree(&format!("{name}_refusal"));
+    if let Some(handle) = controller.open_paths(&[root]) {
+        handle.join().expect("the load worker must not panic");
+        assert!(matches!(
+            controller.settle_open(),
+            Some(OpenOutcome::Refused(_))
+        ));
+    }
+    assert!(
+        controller.last_refusal().is_some(),
+        "an empty folder must refuse"
+    );
+}
+
+#[test]
+fn brush_cursor_hidden_under_every_modal() {
+    // Settings.
+    {
+        let (mut c, _) = open_editor("cursor_settings");
+        assert!(c.brush_cursor_view().is_some(), "settings: visible before");
+        c.open_settings();
+        assert!(c.brush_cursor_view().is_none(), "settings: armed=false");
+        c.toggle_pipette();
+        assert!(c.brush_cursor_view().is_none(), "settings: armed=true");
+        c.toggle_pipette();
+        c.close_settings();
+        assert!(
+            c.brush_cursor_view().is_some(),
+            "settings: visible after close"
+        );
+    }
+    // The close guard.
+    {
+        let (mut c, _) = open_editor("cursor_close_guard");
+        assert!(
+            c.brush_cursor_view().is_some(),
+            "close guard: visible before"
+        );
+        let index = c.active_project().unwrap();
+        c.request_close(index);
+        assert!(c.pending_close().is_some());
+        assert!(c.brush_cursor_view().is_none(), "close guard: armed=false");
+        c.toggle_pipette();
+        assert!(c.brush_cursor_view().is_none(), "close guard: armed=true");
+        c.toggle_pipette();
+        c.cancel_close();
+        assert!(
+            c.brush_cursor_view().is_some(),
+            "close guard: visible after close"
+        );
+    }
+    // The frame-set warning -- raised from Stacking mode (the only mode
+    // `remove_frame` accepts), cleared back into Editor before the checks:
+    // `brush_cursor_view` has no mode check of its own.
+    {
+        let (mut c, _) = open_editor("cursor_frame_warning");
+        assert!(
+            c.brush_cursor_view().is_some(),
+            "frame warning: visible before"
+        );
+        c.set_mode(ShellMode::Stacking);
+        c.remove_frame(0);
+        assert!(c.pending_frame_change().is_some());
+        assert!(c.set_mode(ShellMode::Editor));
+        assert!(
+            c.brush_cursor_view().is_none(),
+            "frame warning: armed=false"
+        );
+        c.toggle_pipette();
+        assert!(c.brush_cursor_view().is_none(), "frame warning: armed=true");
+        c.toggle_pipette();
+        c.cancel_frame_change();
+        assert!(
+            c.brush_cursor_view().is_some(),
+            "frame warning: visible after close"
+        );
+    }
+    // The grouping question.
+    {
+        let (mut c, _) = open_editor("cursor_question");
+        assert!(c.brush_cursor_view().is_some(), "question: visible before");
+        raise_question(&mut c, "cursor_question");
+        assert!(c.brush_cursor_view().is_none(), "question: armed=false");
+        c.toggle_pipette();
+        assert!(c.brush_cursor_view().is_none(), "question: armed=true");
+        c.toggle_pipette();
+        c.cancel_question();
+        assert!(
+            c.brush_cursor_view().is_some(),
+            "question: visible after close"
+        );
+    }
+    // The refusal dialog.
+    {
+        let (mut c, _) = open_editor("cursor_refusal");
+        assert!(c.brush_cursor_view().is_some(), "refusal: visible before");
+        raise_refusal(&mut c, "cursor_refusal");
+        assert!(c.brush_cursor_view().is_none(), "refusal: armed=false");
+        c.toggle_pipette();
+        assert!(c.brush_cursor_view().is_none(), "refusal: armed=true");
+        c.toggle_pipette();
+        c.dismiss_refusal();
+        assert!(
+            c.brush_cursor_view().is_some(),
+            "refusal: visible after close"
+        );
+    }
+    // The Projects overlay.
+    {
+        let (mut c, _) = open_editor("cursor_overlay");
+        assert!(c.brush_cursor_view().is_some(), "overlay: visible before");
+        c.toggle_projects_overlay();
+        assert!(c.brush_cursor_view().is_none(), "overlay: armed=false");
+        c.toggle_pipette();
+        assert!(c.brush_cursor_view().is_none(), "overlay: armed=true");
+        c.toggle_pipette();
+        c.toggle_projects_overlay();
+        assert!(
+            c.brush_cursor_view().is_some(),
+            "overlay: visible after close"
+        );
+    }
+    // Keep/Discard divergence, on a Stacking-mode tab: no test hook parks a
+    // divergent run on a tab already holding a checkpoint, and
+    // `brush_cursor_view` has no mode check either way.
+    {
+        let mut c = controller_on_mantis_512("cursor_divergence");
+        c.set_pane_geometry(LEFT, RIGHT);
+        assert!(
+            c.brush_cursor_view().is_some(),
+            "divergence: visible before"
+        );
+        assert!(c.start_fuse());
+        settle_all(&mut c);
+        assert!(c.pending_divergence().is_some());
+        assert!(c.brush_cursor_view().is_none(), "divergence: armed=false");
+        c.toggle_pipette();
+        assert!(c.brush_cursor_view().is_none(), "divergence: armed=true");
+        c.toggle_pipette();
+        assert!(c.keep_fused().is_some());
+        assert!(c.pending_divergence().is_none());
+        // `keep_fused` clears the viewport for a refit against the new
+        // checkpoint's own extent -- `fit_if_unfitted` is what every real
+        // repaint runs before drawing a cursor over it.
+        c.fit_if_unfitted();
+        assert!(
+            c.brush_cursor_view().is_some(),
+            "divergence: visible after Keep"
+        );
+    }
+}
+
+/// Records everything a canvas-blocking modal must leave untouched: zoom,
+/// pan, the selected source and the pipette's armed state.
+fn assert_wheel_key_pipette_blocked(c: &mut AppController, case: &str) {
+    let draw = c.plane_draw();
+    c.wheel(0.0, 60.0, 0.0, 0.0, NO_MODS);
+    assert_eq!(
+        c.plane_draw(),
+        draw,
+        "{case}: a plain wheel must not zoom or pan"
+    );
+
+    let source = c.brush_source();
+    c.wheel(0.0, 60.0, 0.0, 0.0, CTRL);
+    assert_eq!(
+        c.brush_source(),
+        source,
+        "{case}: Ctrl + wheel must not step the source"
+    );
+
+    let ops_before = c.edit_session().map(|session| session.ops().count());
+    c.key(true, "z", CTRL);
+    c.key(true, "Z", CTRL_SHIFT);
+    assert_eq!(
+        c.edit_session().map(|session| session.ops().count()),
+        ops_before,
+        "{case}: Ctrl + Z / Ctrl + Shift + Z must step nothing"
+    );
+
+    c.toggle_pipette();
+    assert!(c.brush_toolbar_view().picking);
+    press(c, at(30.0, 30.0));
+    release(c, at(30.0, 30.0));
+    assert!(
+        c.brush_toolbar_view().picking,
+        "{case}: a blocked click must not disarm the pipette"
+    );
+    c.toggle_pipette();
+}
+
+/// A brush drag over either pane, blocked: neither pane's press starts a
+/// stroke, so the edit session's own op count and index buffer -- the
+/// in-memory twin of the Z-Map a commit would write -- stay exactly as
+/// they were.
+fn assert_drag_blocked(c: &mut AppController, case: &str) {
+    let before_ops = ops(c);
+    let before_indices = indices(c);
+    press(c, at_pane(LEFT, 10.0, 10.0));
+    c.pointer_moved(at_pane(LEFT, 20.0, 15.0).0, at_pane(LEFT, 20.0, 15.0).1);
+    release(c, at_pane(LEFT, 20.0, 15.0));
+    press(c, at(10.0, 10.0));
+    c.pointer_moved(at(20.0, 15.0).0, at(20.0, 15.0).1);
+    release(c, at(20.0, 15.0));
+    assert_eq!(ops(c), before_ops, "{case}: a blocked drag must add no op");
+    assert_eq!(
+        indices(c),
+        before_indices,
+        "{case}: a blocked drag must not touch the Z-Map"
+    );
+}
+
+#[test]
+fn canvas_input_blocked_under_every_modal() {
+    {
+        let (mut c, _) = open_editor("blocked_settings");
+        c.open_settings();
+        assert_drag_blocked(&mut c, "settings");
+        assert_wheel_key_pipette_blocked(&mut c, "settings");
+        c.close_settings();
+    }
+    {
+        let (mut c, _) = open_editor("blocked_close_guard");
+        let index = c.active_project().unwrap();
+        c.request_close(index);
+        assert!(c.pending_close().is_some());
+        assert_drag_blocked(&mut c, "close guard");
+        assert_wheel_key_pipette_blocked(&mut c, "close guard");
+        c.cancel_close();
+    }
+    {
+        let (mut c, _) = open_editor("blocked_frame_warning");
+        c.set_mode(ShellMode::Stacking);
+        c.remove_frame(0);
+        assert!(c.pending_frame_change().is_some());
+        assert!(c.set_mode(ShellMode::Editor));
+        assert_drag_blocked(&mut c, "frame warning");
+        assert_wheel_key_pipette_blocked(&mut c, "frame warning");
+        c.cancel_frame_change();
+    }
+    {
+        let (mut c, _) = open_editor("blocked_question");
+        raise_question(&mut c, "blocked_question");
+        assert_drag_blocked(&mut c, "grouping question");
+        assert_wheel_key_pipette_blocked(&mut c, "grouping question");
+        c.cancel_question();
+    }
+    {
+        let (mut c, _) = open_editor("blocked_refusal");
+        raise_refusal(&mut c, "blocked_refusal");
+        assert_drag_blocked(&mut c, "refusal");
+        assert_wheel_key_pipette_blocked(&mut c, "refusal");
+        c.dismiss_refusal();
+    }
+    {
+        let (mut c, _) = open_editor("blocked_overlay");
+        c.toggle_projects_overlay();
+        assert_drag_blocked(&mut c, "projects overlay");
+        assert_wheel_key_pipette_blocked(&mut c, "projects overlay");
+        c.toggle_projects_overlay();
+    }
+    {
+        let mut c = controller_on_mantis_512("blocked_divergence");
+        c.set_pane_geometry(LEFT, RIGHT);
+        assert!(c.start_fuse());
+        settle_all(&mut c);
+        assert!(c.pending_divergence().is_some());
+        assert_wheel_key_pipette_blocked(&mut c, "divergence");
+        assert!(c.keep_fused().is_some());
+    }
+}
+
+#[test]
+fn modal_opening_mid_stroke_leaves_no_live_drag() {
+    let (mut c, _) = open_editor("modal_mid_stroke");
+    set_size(&mut c, 8.0);
+    c.select_frame(1);
+
+    // A live stroke, half drawn, then a modal opens mid-drag.
+    press(&mut c, at(10.0, 10.0));
+    c.pointer_moved(at(20.0, 15.0).0, at(20.0, 15.0).1);
+    c.open_settings();
+    // Further motion while blocked commits no further stamp.
+    c.pointer_moved(at(50.0, 40.0).0, at(50.0, 40.0).1);
+    release(&mut c, at(50.0, 40.0));
+    assert_eq!(
+        ops(&c),
+        vec![Op::BrushStroke {
+            source_id: 1,
+            path: vec![Point { x: 10, y: 10 }, Point { x: 20, y: 15 }],
+            radius: c.brush_toolbar_view().size / 2.0,
+            softness: c.brush_toolbar_view().soft_fraction,
+        }],
+        "the stroke ends on the next pointer-up, with nothing added after the modal opened"
+    );
+
+    // A press that arrives while the modal is still open starts no drag,
+    // so nothing is left live once it closes.
+    let before = ops(&c);
+    press(&mut c, at(30.0, 30.0));
+    c.pointer_moved(at(35.0, 32.0).0, at(35.0, 32.0).1);
+    release(&mut c, at(35.0, 32.0));
+    c.close_settings();
+    assert_eq!(
+        ops(&c),
+        before,
+        "a press under a modal must start no drag, and closing it must not resume one"
+    );
+}
+
+#[test]
+fn refusal_dialog_counts_as_modal() {
+    let mut controller = controller_on_mantis_512("refusal_modal");
+    controller.set_align_algorithm("");
+    assert!(!controller.modal_open(), "nothing raised yet");
+    assert!(!controller.canvas_blocked());
+
+    assert!(!controller.start_fuse());
+    assert!(
+        controller.last_refusal().is_some_and(|m| !m.is_empty()),
+        "the refusal must be reported"
+    );
+    assert!(
+        controller.modal_open(),
+        "a raised refusal counts as an open modal"
+    );
+    assert!(controller.canvas_blocked());
+
+    controller.dismiss_refusal();
+    assert!(!controller.modal_open(), "answering clears it");
+    assert!(!controller.canvas_blocked());
 }

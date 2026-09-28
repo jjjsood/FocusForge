@@ -1096,17 +1096,31 @@ pub fn install(
     });
     app.on_window_close_requested({
         let controller = controller.clone();
-        move || controller.lock().unwrap().window_close()
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.window_close();
+            });
+        }
     });
     // A native `WindowEvent::CloseRequested` (Alt+F4, taskbar close) reaches
     // Slint's own hook, not the app-drawn x above; unregistered, it hides
     // the window with no guard at all.
     app.window().on_close_requested({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
-            let mut controller = controller.lock().unwrap();
-            controller.window_close();
-            if controller.pending_close().is_some() || controller.pending_quit_copy().is_some() {
+            let keep_shown = {
+                let mut controller = controller.lock().unwrap();
+                controller.window_close();
+                controller.pending_close().is_some() || controller.pending_quit_copy().is_some()
+            };
+            if let Some(app) = app_weak.upgrade() {
+                repaint(&app, &controller, &canvas);
+            }
+            if keep_shown {
                 slint::CloseRequestResponse::KeepWindowShown
             } else {
                 slint::CloseRequestResponse::HideWindow
@@ -1391,21 +1405,25 @@ pub fn install(
     });
     app.on_settings_open_requested({
         let controller = controller.clone();
+        let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
             let open = controller.lock().unwrap().open_settings();
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_open(open);
+                repaint(&app, &controller, &canvas);
             }
         }
     });
     app.on_settings_close_requested({
         let controller = controller.clone();
+        let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
             let open = controller.lock().unwrap().close_settings();
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_open(open);
+                repaint(&app, &controller, &canvas);
             }
         }
     });
@@ -1620,6 +1638,7 @@ pub fn install(
             // and the next `push_projects` reopens the dialog.
             if let Some(app) = app_weak.upgrade() {
                 app.set_question_open(false);
+                repaint(&app, &controller, &canvas);
             }
             start_load_timer(
                 app_weak.clone(),
@@ -1642,6 +1661,7 @@ pub fn install(
                 .answer_question(OpenAs::NProjects);
             if let Some(app) = app_weak.upgrade() {
                 app.set_question_open(false);
+                repaint(&app, &controller, &canvas);
             }
             start_load_timer(
                 app_weak.clone(),
@@ -1654,11 +1674,13 @@ pub fn install(
     });
     app.on_question_cancelled({
         let controller = controller.clone();
+        let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
             controller.lock().unwrap().cancel_question();
             if let Some(app) = app_weak.upgrade() {
                 app.set_question_open(false);
+                repaint(&app, &controller, &canvas);
             }
         }
     });
@@ -1668,8 +1690,10 @@ pub fn install(
         let app_weak = app.as_weak();
         let load_timer = load_timer.clone();
         move || {
+            controller.lock().unwrap().dismiss_refusal();
             if let Some(app) = app_weak.upgrade() {
                 app.set_refusal_open(false);
+                repaint(&app, &controller, &canvas);
             }
             open_from_picker(
                 &controller,
@@ -1815,9 +1839,13 @@ pub fn install(
     });
     app.on_images_add_frames_requested({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
             if let Some(paths) = crate::picker::pick_frames() {
-                controller.lock().unwrap().add_frames(&paths);
+                dispatch(&controller, &canvas, &app_weak, |controller| {
+                    controller.add_frames(&paths);
+                });
             }
         }
     });
@@ -1827,12 +1855,16 @@ pub fn install(
     });
     app.on_images_sort_selected({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move |id| {
             let sort = match id.as_str() {
                 "capture-time" => crate::images::FrameSort::CaptureTime,
                 _ => crate::images::FrameSort::Name,
             };
-            controller.lock().unwrap().set_frame_sort(sort);
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.set_frame_sort(sort);
+            });
         }
     });
     app.on_images_frame_excluded_toggled({
@@ -1861,7 +1893,13 @@ pub fn install(
     });
     app.on_frame_warning_cancelled({
         let controller = controller.clone();
-        move || controller.lock().unwrap().cancel_frame_change()
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.cancel_frame_change();
+            });
+        }
     });
     app.on_frame_warning_confirmed({
         let controller = controller.clone();
@@ -1889,7 +1927,15 @@ pub fn install(
     });
     app.on_divergence_discarded({
         let controller = controller.clone();
-        move || controller.lock().unwrap().discard_fused()
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().discard_fused();
+            if let Some(app) = app_weak.upgrade() {
+                push_projects(&app, &controller);
+                repaint(&app, &controller, &canvas);
+            }
+        }
     });
     app.on_divergence_kept({
         let controller = controller.clone();
@@ -1905,7 +1951,13 @@ pub fn install(
     });
     app.on_close_guard_cancelled({
         let controller = controller.clone();
-        move || controller.lock().unwrap().close_guard_cancelled()
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.close_guard_cancelled();
+            });
+        }
     });
     app.on_close_guard_secondary_pressed({
         let controller = controller.clone();
@@ -1936,7 +1988,13 @@ pub fn install(
     // click-through.
     app.on_projects_overlay_toggled({
         let controller = controller.clone();
-        move || controller.lock().unwrap().toggle_projects_overlay()
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.toggle_projects_overlay();
+            });
+        }
     });
     // The rail's own actions: New/Open reuse the picker any other open path
     // uses; Close closes whichever tab is active, the same as `Ctrl+W` would.
@@ -2248,8 +2306,14 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             // frame in between.
             match outcome {
                 Some(OpenOutcome::Opened(_)) => push_projects(app, controller),
-                Some(OpenOutcome::Question(question, _)) => push_question(app, &question),
-                Some(OpenOutcome::Refused(_)) => app.set_refusal_open(true),
+                Some(OpenOutcome::Question(question, _)) => {
+                    push_question(app, &question);
+                    push_brush_cursor(app, &controller.lock().unwrap());
+                }
+                Some(OpenOutcome::Refused(_)) => {
+                    app.set_refusal_open(true);
+                    push_brush_cursor(app, &controller.lock().unwrap());
+                }
                 None => {}
             }
             app.set_load_active(false);
