@@ -2319,7 +2319,7 @@ use focusforge_core::zmap::{NO_SOURCE, ZMapWriter};
 use focusforge_gui::brush::LiveStroke;
 use focusforge_gui::canvas::overlay_edited;
 use focusforge_gui::input_map::{Button, Modifiers, PointerKind};
-use focusforge_gui::viewport::PaneRect;
+use focusforge_gui::viewport::{PaneDraw, PaneRect};
 
 /// The mantis-64 frames' own extent, which both panes draw at before any
 /// fuse. This fixture's fuse (3 frames, `dummy-align`'s integer x-shifts,
@@ -2377,9 +2377,16 @@ fn map_rect(controller: &AppController) -> Rect {
 /// The screen point over the right pane whose paint point is image
 /// `(x, y)` -- pixel centres sit on integers.
 fn at(x: f32, y: f32) -> (f32, f32) {
+    at_pane(RIGHT, x, y)
+}
+
+/// The screen point over `pane` whose paint point is image `(x, y)` -- both
+/// panes draw at one size and one source rect, so `at`'s own formula holds
+/// over either pane's rect, not just the right's.
+fn at_pane(pane: PaneRect, x: f32, y: f32) -> (f32, f32) {
     (
-        RIGHT.x + (x + 0.5) * SCALE,
-        RIGHT.y + BAND + (y + 0.5) * SCALE,
+        pane.x + (x + 0.5) * SCALE,
+        pane.y + BAND + (y + 0.5) * SCALE,
     )
 }
 
@@ -3026,6 +3033,238 @@ fn held_alt_shows_the_pipette_cursor() {
     c.toggle_pipette();
     assert_eq!(hover(&mut c, NO_MODS), held, "the armed pipette, same view");
     assert_eq!(hover(&mut c, ALT), held);
+}
+
+// ---------------------------------------------------------------------
+// The mirrored cursor: both panes' own `BrushCursorView.mirror_dx`.
+// ---------------------------------------------------------------------
+
+/// The image coordinate `point` (a screen position) maps to through `draw`,
+/// the own `PaneDraw` of the pane `pane` places it over -- the inverse of
+/// `Viewport::draw`'s forward projection, read pane-locally as `image-x`/
+/// `image-y` are (`FFPane`'s `Image` sits inside its own pane's rect).
+fn image_coord(draw: PaneDraw, pane: PaneRect, point: (f32, f32)) -> (f64, f64) {
+    let local = (point.0 - pane.x, point.1 - pane.y);
+    (
+        f64::from(draw.src.0)
+            + f64::from(local.0 - draw.dst.0) * f64::from(draw.src.2) / f64::from(draw.dst.2),
+        f64::from(draw.src.1)
+            + f64::from(local.1 - draw.dst.1) * f64::from(draw.src.3) / f64::from(draw.dst.3),
+    )
+}
+
+/// Hovers `point` (over pane `home`) and proves the mirrored centre --
+/// `point` shifted by `mirror_dx`, signed towards `other` -- lands inside
+/// `other` and maps, through `other`'s own `PaneDraw`, to the same image
+/// coordinate `home`'s own `PaneDraw` gives `point` itself.
+fn assert_scene_point_matches(
+    c: &mut AppController,
+    home: PaneRect,
+    other: PaneRect,
+    point: (f32, f32),
+    case: &str,
+) {
+    c.pointer(PointerKind::Move, Button::Left, point.0, point.1, NO_MODS);
+    let mirror_dx = c.brush_cursor_view().unwrap().mirror_dx;
+    let sign = if other.x > home.x { 1.0 } else { -1.0 };
+    let mirrored = (point.0 + sign * mirror_dx, point.1);
+    assert!(
+        mirrored.0 >= other.x
+            && mirrored.0 <= other.x + other.width
+            && mirrored.1 >= other.y
+            && mirrored.1 <= other.y + other.height,
+        "{case}: mirrored centre {mirrored:?} lies outside {other:?}"
+    );
+    let (home_draw, other_draw) = if home.x < other.x {
+        (c.frame_draw().unwrap(), c.plane_draw().unwrap())
+    } else {
+        (c.plane_draw().unwrap(), c.frame_draw().unwrap())
+    };
+    let home_point = image_coord(home_draw, home, point);
+    let other_point = image_coord(other_draw, other, mirrored);
+    assert!(
+        (home_point.0 - other_point.0).abs() < 1e-2 && (home_point.1 - other_point.1).abs() < 1e-2,
+        "{case}: home pane reads {home_point:?}, mirrored pane reads {other_point:?}"
+    );
+}
+
+/// At fit, one zoom step in, after a pan and with a wider gutter, hovering
+/// either pane places the other pane's mirrored centre over the same scene
+/// point -- proven by mapping both back to image space through each pane's
+/// own `PaneDraw`, so a hard-coded offset (rather than one following the
+/// installed rects) would fail once the gutter widens.
+#[test]
+fn mirrored_cursor_tracks_the_same_scene_point() {
+    let (mut c, _) = open_editor("mirrored_cursor_scene_point");
+    let points = [(10.0_f32, 12.0_f32), (40.0, 45.0)];
+    let mut right = RIGHT;
+
+    let check_stage = |c: &mut AppController, right: PaneRect, stage: &str| {
+        for &(ix, iy) in &points {
+            assert_scene_point_matches(
+                c,
+                right,
+                LEFT,
+                at_pane(right, ix, iy),
+                &format!("{stage}, hovering the right pane at ({ix}, {iy})"),
+            );
+            assert_scene_point_matches(
+                c,
+                LEFT,
+                right,
+                at_pane(LEFT, ix, iy),
+                &format!("{stage}, hovering the left pane at ({ix}, {iy})"),
+            );
+        }
+    };
+
+    check_stage(&mut c, right, "at fit");
+
+    c.zoom_in();
+    check_stage(&mut c, right, "one zoom step in");
+
+    c.wheel(0.0, 60.0, 0.0, 0.0, SHIFT);
+    check_stage(&mut c, right, "after a pan");
+
+    right = PaneRect {
+        x: RIGHT.x + 16.0,
+        ..RIGHT
+    };
+    c.set_pane_geometry(LEFT, right);
+    check_stage(&mut c, right, "a wider gutter");
+}
+
+/// The one `BrushCursorView` carries both cursors' geometry: size, softness
+/// and zoom change its extent/ring/core, but `mirror_dx` follows only the
+/// installed pane rects, not the brush or the pointer.
+#[test]
+fn mirrored_cursor_shares_geometry() {
+    let (mut c, _) = open_editor("mirrored_cursor_shares_geometry");
+    let before = c.brush_cursor_view().unwrap();
+
+    set_size(&mut c, 8.0);
+    let after_size = c.brush_cursor_view().unwrap();
+    assert_ne!(
+        after_size.extent, before.extent,
+        "size changes the shared geometry"
+    );
+    assert_eq!(
+        after_size.mirror_dx, before.mirror_dx,
+        "mirror_dx is independent of brush size"
+    );
+
+    c.set_brush_softness_fraction(0.75);
+    let after_soft = c.brush_cursor_view().unwrap();
+    assert_ne!(
+        after_soft.core_commands, after_size.core_commands,
+        "softness changes the core"
+    );
+    assert_eq!(
+        after_soft.mirror_dx, before.mirror_dx,
+        "mirror_dx is independent of softness"
+    );
+
+    c.zoom_in();
+    let after_zoom = c.brush_cursor_view().unwrap();
+    assert_ne!(
+        after_zoom.extent, after_soft.extent,
+        "zoom changes the shared geometry"
+    );
+    assert_eq!(
+        after_zoom.mirror_dx, before.mirror_dx,
+        "mirror_dx is independent of zoom"
+    );
+
+    let (x, y) = at(5.0, 5.0);
+    c.pointer(PointerKind::Move, Button::Left, x, y, NO_MODS);
+    assert_eq!(
+        c.brush_cursor_view().unwrap(),
+        after_zoom,
+        "the pointer moves neither the shared geometry nor mirror_dx"
+    );
+}
+
+/// With the pipette armed, the left pane's hover and the right pane's hover
+/// at that point shifted by `mirror_dx` preview the same colour, the one an
+/// Alt + click at the right-pane point then commits; none of arming,
+/// hovering both panes or the commit itself appends a stroke.
+#[test]
+fn mirrored_cursor_marks_the_pipette_point() {
+    let (mut c, _) = open_editor("mirrored_cursor_pipette");
+    let before = ops(&c);
+    assert!(before.is_empty(), "a fresh tab has no ops yet");
+
+    let left_point = at_pane(LEFT, 29.0, 30.0);
+    c.toggle_pipette();
+    c.pointer(
+        PointerKind::Move,
+        Button::Left,
+        left_point.0,
+        left_point.1,
+        NO_MODS,
+    );
+    let left_hover = c.brush_cursor_view().unwrap();
+    assert!(
+        left_hover.picking,
+        "hovering the left pane previews the pick while armed"
+    );
+
+    let right_point = (left_point.0 + left_hover.mirror_dx, left_point.1);
+    c.pointer(
+        PointerKind::Move,
+        Button::Left,
+        right_point.0,
+        right_point.1,
+        NO_MODS,
+    );
+    let right_hover = c.brush_cursor_view().unwrap();
+    assert_eq!(
+        right_hover.pick_color, left_hover.pick_color,
+        "the left point and its mirrored right point preview the same colour"
+    );
+    assert_eq!(
+        ops(&c),
+        before,
+        "arming and hovering both panes appends nothing"
+    );
+
+    c.pointer(
+        PointerKind::Down,
+        Button::Left,
+        right_point.0,
+        right_point.1,
+        ALT,
+    );
+    c.pointer(
+        PointerKind::Up,
+        Button::Left,
+        right_point.0,
+        right_point.1,
+        ALT,
+    );
+    let picked = c.brush_source().expect("Alt + click commits a pick");
+    assert_eq!(
+        left_hover.pick_color,
+        job::source_color(picked, c.frame_count().unwrap()),
+        "the preview matches the source the click commits"
+    );
+    assert_eq!(ops(&c), before, "the pick itself opens no stroke");
+}
+
+/// `brush_cursor_view` is `None` with no active tab, and stays `None` once a
+/// tab is active but before its first `set_pane_geometry` -- the one call
+/// that both fits the viewport and installs the panes, so a fresh tab covers
+/// the unfitted-viewport case and the no-panes-installed case at once.
+#[test]
+fn mirrored_cursor_absent_without_geometry() {
+    let mut c = controller_with_scratch("mirrored_cursor_absent");
+    assert!(c.brush_cursor_view().is_none(), "no active tab");
+
+    open_fused_tab(&mut c, "mirrored_cursor_absent", 3);
+    assert!(
+        c.brush_cursor_view().is_none(),
+        "an active tab before its first set_pane_geometry"
+    );
 }
 
 #[test]

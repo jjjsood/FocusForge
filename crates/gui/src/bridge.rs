@@ -813,6 +813,7 @@ fn push_brush_cursor(app: &AppWindow, controller: &AppController) {
         view.pick_color[1],
         view.pick_color[2],
     ));
+    app.set_cursor_mirror_dx(view.mirror_dx);
 }
 
 /// Opens the Keep/Discard dialog while the active tab holds a parked run,

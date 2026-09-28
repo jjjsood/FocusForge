@@ -79,6 +79,9 @@ export component AppWindow inherits Window {
     in property <string> cursor-core-commands;
     in property <bool> cursor-picking: false;
     in property <color> cursor-pick-color;
+    // The offset that carries either pane's cursor onto the other, at the
+    // same scene point.
+    in property <length> cursor-mirror-dx;
 
     no-frame: true;
     resize-border-width: 8px;
@@ -318,6 +321,7 @@ export component AppWindow inherits Window {
             cursor-core-commands: root.cursor-core-commands;
             cursor-picking: root.cursor-picking;
             cursor-pick-color: root.cursor-pick-color;
+            cursor-mirror-dx: root.cursor-mirror-dx;
 
             composite-undock-requested => { root.composite-undock-requested(); }
             zmap-undock-requested => { root.zmap-undock-requested(); }

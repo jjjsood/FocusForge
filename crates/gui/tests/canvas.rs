@@ -1088,6 +1088,131 @@ fn pane_placeholder_shows_only_until_the_first_fuse() {
     }
 }
 
+/// In Editor mode, hovering either pane shows both `FFBrushCursor`s at the
+/// expected centre -- the one under the pointer at the raw hover point, the
+/// other shifted by `cursor-mirror-dx` -- neither shows over the gutter or
+/// outside Editor mode, and each cursor's clip container matches its own
+/// pane's rect exactly.
+#[test]
+fn both_brush_cursors_follow_either_pane() {
+    thread_local! {
+        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    INIT.with(|done| {
+        if !done.get() {
+            i_slint_backend_testing::init_no_event_loop();
+            done.set(true);
+        }
+    });
+    let app = AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_project_loaded(true);
+    app.set_mode("editor".into());
+    app.set_cursor_extent(20.0);
+
+    let rect = |id: &str| {
+        let handle = ElementQuery::from_root(&app)
+            .match_id(format!("FFCanvas::{id}"))
+            .find_first()
+            .unwrap_or_else(|| panic!("no element matched id \"FFCanvas::{id}\""));
+        (handle.absolute_position(), handle.size())
+    };
+    let (left_pos, left_size) = rect("pane-left");
+    let (right_pos, _right_size) = rect("pane-right");
+    let mirror_dx = right_pos.x - left_pos.x;
+    app.set_cursor_mirror_dx(mirror_dx);
+
+    // Each clip container matches its own pane's rect exactly.
+    for (clip_id, pane_id) in [
+        ("brush-cursor-left-clip", "pane-left"),
+        ("brush-cursor-right-clip", "pane-right"),
+    ] {
+        let (clip_pos, clip_size) = rect(clip_id);
+        let (pane_pos, pane_size) = rect(pane_id);
+        assert!(
+            (clip_pos.x - pane_pos.x).abs() < GEOMETRY_EPS
+                && (clip_pos.y - pane_pos.y).abs() < GEOMETRY_EPS,
+            "{clip_id}: position {clip_pos:?}, expected {pane_pos:?}"
+        );
+        assert!(
+            (clip_size.width - pane_size.width).abs() < GEOMETRY_EPS
+                && (clip_size.height - pane_size.height).abs() < GEOMETRY_EPS,
+            "{clip_id}: size {clip_size:?}, expected {pane_size:?}"
+        );
+    }
+
+    let find_cursor = |id: &str| {
+        ElementQuery::from_root(&app)
+            .match_id(format!("FFCanvas::{id}"))
+            .find_first()
+    };
+    let center = |handle: &i_slint_backend_testing::ElementHandle| {
+        let p = handle.absolute_position();
+        let s = handle.size();
+        (p.x + s.width / 2.0, p.y + s.height / 2.0)
+    };
+    let move_to = |point: slint::LogicalPosition| {
+        app.window()
+            .dispatch_event(slint::platform::WindowEvent::PointerMoved { position: point });
+    };
+
+    // Hovering the left pane: the home cursor sits at the raw pointer, the
+    // mirrored one on the right pane at the pointer plus `mirror_dx`.
+    let left_point =
+        slint::LogicalPosition::new(left_pos.x + 40.0, left_pos.y + left_size.height / 2.0);
+    move_to(left_point);
+    let home = find_cursor("brush-cursor-left").expect("shows while hovering its own pane");
+    let mirrored = find_cursor("brush-cursor-right").expect("mirrors onto the other pane");
+    let (hx, hy) = center(&home);
+    assert!(
+        (hx - left_point.x).abs() < GEOMETRY_EPS && (hy - left_point.y).abs() < GEOMETRY_EPS,
+        "left cursor at the raw pointer, got ({hx}, {hy})"
+    );
+    let (mx, my) = center(&mirrored);
+    assert!(
+        (mx - (left_point.x + mirror_dx)).abs() < GEOMETRY_EPS
+            && (my - left_point.y).abs() < GEOMETRY_EPS,
+        "right cursor shifted by mirror_dx, got ({mx}, {my})"
+    );
+
+    // Hovering the right pane: the roles (and the sign of the shift) flip.
+    let right_point =
+        slint::LogicalPosition::new(right_pos.x + 40.0, left_pos.y + left_size.height / 2.0);
+    move_to(right_point);
+    let home = find_cursor("brush-cursor-right").expect("shows while hovering its own pane");
+    let mirrored = find_cursor("brush-cursor-left").expect("mirrors onto the other pane");
+    let (hx, hy) = center(&home);
+    assert!(
+        (hx - right_point.x).abs() < GEOMETRY_EPS && (hy - right_point.y).abs() < GEOMETRY_EPS,
+        "right cursor at the raw pointer, got ({hx}, {hy})"
+    );
+    let (mx, my) = center(&mirrored);
+    assert!(
+        (mx - (right_point.x - mirror_dx)).abs() < GEOMETRY_EPS
+            && (my - right_point.y).abs() < GEOMETRY_EPS,
+        "left cursor shifted by -mirror_dx, got ({mx}, {my})"
+    );
+
+    // Over the gutter, neither cursor shows.
+    let gutter_point = slint::LogicalPosition::new(
+        (left_pos.x + left_size.width + right_pos.x) / 2.0,
+        left_pos.y + left_size.height / 2.0,
+    );
+    move_to(gutter_point);
+    assert!(
+        find_cursor("brush-cursor-left").is_none() && find_cursor("brush-cursor-right").is_none(),
+        "both cursors hidden over the gutter"
+    );
+
+    // Outside Editor mode, neither shows even while hovering a pane.
+    app.set_mode("stacking".into());
+    move_to(left_point);
+    assert!(
+        find_cursor("brush-cursor-left").is_none() && find_cursor("brush-cursor-right").is_none(),
+        "both cursors hidden outside Editor mode"
+    );
+}
+
 #[test]
 fn pane_label_short_enough_passes_through_unchanged() {
     assert_eq!(truncate_pane_label("Composite"), "Composite");

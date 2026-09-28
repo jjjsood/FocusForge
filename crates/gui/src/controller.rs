@@ -276,6 +276,10 @@ pub struct BrushCursorView {
     /// the pointer while `picking`, or the current brush source otherwise --
     /// shown in the cursor's swatch.
     pub pick_color: [u8; 3],
+    /// The right pane's `x` minus the left pane's, logical px: the offset
+    /// that carries a cursor's centre from the pane it is over onto the
+    /// other pane, at the same scene point.
+    pub mirror_dx: f32,
 }
 
 /// The diagnostics panel's own state: the two directories a bundle is
@@ -1427,13 +1431,16 @@ impl AppController {
 
     /// The brush cursor overlay's own view: extent and path commands built
     /// from the current brush size/softness scaled to on-screen px by the
-    /// active tab's own viewport, and the pipette's own preview colour --
+    /// active tab's own viewport, the pipette's own preview colour --
     /// the Z-Map index under the pointer while armed or while `Alt` is
-    /// held, the selected source otherwise. `None` with no active tab or an unfitted viewport
-    /// (nothing to draw a cursor over).
+    /// held, the selected source otherwise -- and `mirror_dx`, the offset
+    /// that carries either pane's cursor onto the other. `None` with no
+    /// active tab, an unfitted viewport, or before pane geometry is
+    /// installed (nothing to draw a cursor over, or no offset to compute).
     pub fn brush_cursor_view(&self) -> Option<BrushCursorView> {
         let tab = self.state.active()?;
         let viewport = tab.viewport.as_ref()?;
+        let (left, right) = self.state.panes?;
         let (radius, softness) = self.brush_radius_softness();
         let scale = viewport.scale() as f32;
         let paths = brush::cursor_paths(radius * scale, softness);
@@ -1450,6 +1457,7 @@ impl AppController {
             core_commands: paths.core,
             picking,
             pick_color: job::source_color(source, sources),
+            mirror_dx: right.x - left.x,
         })
     }
 

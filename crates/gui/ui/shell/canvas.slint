@@ -140,7 +140,7 @@ export component FFCanvas inherits Rectangle {
     in property <length> image-y;
     in property <length> image-w;
     in property <length> image-h;
-    // The left pane's own placement, over the selected frame's extent.
+    // The left pane's own placement, over the same extent as the right pane.
     in property <length> frame-image-x;
     in property <length> frame-image-y;
     in property <length> frame-image-w;
@@ -156,6 +156,9 @@ export component FFCanvas inherits Rectangle {
     in property <string> cursor-core-commands;
     in property <bool> cursor-picking: false;
     in property <color> cursor-pick-color;
+    // The offset that carries either pane's cursor onto the other, at the
+    // same scene point.
+    in property <length> cursor-mirror-dx;
     callback composite-undock-requested();
     callback zmap-undock-requested();
     // The one input dispatch point's gesture forwards. No other `.slint`
@@ -207,15 +210,19 @@ export component FFCanvas inherits Rectangle {
 
     background: Theme.surface-base;
 
-    // Whether the pointer sits over the right pane's own rect -- the brush
-    // cursor's visibility and the hidden system cursor both gate on this,
-    // not just `has-hover` over the whole canvas.
+    // Whether the pointer sits over the right or left pane's own rect --
+    // both brush cursors' visibility and the hidden system cursor gate on
+    // hovering either, not just `has-hover` over the whole canvas.
     property <bool> pointer-over-right-pane: hit-area.mouse-x >= pane-right.x
         && hit-area.mouse-x <= pane-right.x + pane-right.width
         && hit-area.mouse-y >= pane-right.y
         && hit-area.mouse-y <= pane-right.y + pane-right.height;
+    property <bool> pointer-over-left-pane: hit-area.mouse-x >= pane-left.x
+        && hit-area.mouse-x <= pane-left.x + pane-left.width
+        && hit-area.mouse-y >= pane-left.y
+        && hit-area.mouse-y <= pane-left.y + pane-left.height;
     property <bool> show-brush-cursor: root.editor-mode && hit-area.has-hover
-        && root.pointer-over-right-pane;
+        && (root.pointer-over-left-pane || root.pointer-over-right-pane);
 
     // First child so it spans the whole canvas region while the
     // later-declared panes and their `FFUndockControl` `TouchArea`s keep
@@ -291,15 +298,44 @@ export component FFCanvas inherits Rectangle {
         visible: root.project-loaded && !root.composite-ready;
     }
 
-    brush-cursor := FFBrushCursor {
-        x: hit-area.mouse-x - self.width / 2;
-        y: hit-area.mouse-y - self.height / 2;
-        visible: root.show-brush-cursor;
-        extent: root.cursor-extent;
-        ring-commands: root.cursor-ring-commands;
-        core-commands: root.cursor-core-commands;
-        picking: root.cursor-picking;
-        pick-color: root.cursor-pick-color;
+    brush-cursor-left-clip := Rectangle {
+        x: pane-left.x;
+        y: pane-left.y;
+        width: pane-left.width;
+        height: pane-left.height;
+        clip: true;
+
+        brush-cursor-left := FFBrushCursor {
+            x: hit-area.mouse-x - pane-left.x
+                - (root.pointer-over-right-pane ? root.cursor-mirror-dx : 0px) - self.width / 2;
+            y: hit-area.mouse-y - pane-left.y - self.height / 2;
+            visible: root.show-brush-cursor;
+            extent: root.cursor-extent;
+            ring-commands: root.cursor-ring-commands;
+            core-commands: root.cursor-core-commands;
+            picking: root.cursor-picking;
+            pick-color: root.cursor-pick-color;
+        }
+    }
+
+    brush-cursor-right-clip := Rectangle {
+        x: pane-right.x;
+        y: pane-right.y;
+        width: pane-right.width;
+        height: pane-right.height;
+        clip: true;
+
+        brush-cursor-right := FFBrushCursor {
+            x: hit-area.mouse-x - pane-right.x
+                + (root.pointer-over-left-pane ? root.cursor-mirror-dx : 0px) - self.width / 2;
+            y: hit-area.mouse-y - pane-right.y - self.height / 2;
+            visible: root.show-brush-cursor;
+            extent: root.cursor-extent;
+            ring-commands: root.cursor-ring-commands;
+            core-commands: root.cursor-core-commands;
+            picking: root.cursor-picking;
+            pick-color: root.cursor-pick-color;
+        }
     }
 
     empty-state := FFEmptyState {
