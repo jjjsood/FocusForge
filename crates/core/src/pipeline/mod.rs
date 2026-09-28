@@ -364,19 +364,17 @@ pub fn run(
                 let solved = std::thread::scope(|scope| {
                     let watcher = scope.spawn(|| {
                         let _parent = parent.enter();
-                        // `align_stack_with` has no unit boundary of its
-                        // own, so a cancel requested while it runs is
-                        // otherwise invisible until it returns -- this is
-                        // the one place that can say so while it is still
-                        // running.
+                        // A cancel lands at `align_stack_with`'s next frame
+                        // boundary, after the registrations in flight
+                        // finish; this says so while they still run.
                         let mut warned = false;
                         while !done.load(Ordering::SeqCst) {
                             std::thread::sleep(poll);
                             observer.tick(&control.progress());
                             if !warned && control.state() == ControlState::CancelRequested {
                                 observer.notice(
-                                    "cancel requested -- alignment has no unit boundary; \
-                                     stopping at the fuse stage (Ctrl-C again to abort now)",
+                                    "cancel requested -- stopping alignment once the frames \
+                                     in flight finish (Ctrl-C again to abort now)",
                                 );
                                 warned = true;
                             }
@@ -390,6 +388,7 @@ pub fn run(
                         policy,
                         &AlignDriverOptions {
                             frames_done: Some(frames_done),
+                            control: Some(Arc::clone(&control)),
                             ..Default::default()
                         },
                     );
@@ -397,10 +396,12 @@ pub fn run(
                     watcher.join().expect("align watcher thread must not panic");
                     result
                 });
-                // Alignment has no unit boundary, so a cancel requested
-                // while it ran only ever lands once it returns -- the
-                // `Cancelling` interval the surface must show.
-                if control.state() == ControlState::CancelRequested {
+                // The driver reports a cancel it read at a frame boundary;
+                // one requested after the last registration started lands
+                // here, before the alignment reaches the stage cache.
+                if matches!(solved, Err(AlgorithmError::Cancelled))
+                    || control.state() == ControlState::CancelRequested
+                {
                     return Ok(FuseOutcome::Cancelled {
                         units_done: 0,
                         unit_total: 0,

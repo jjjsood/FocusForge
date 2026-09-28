@@ -8,13 +8,17 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use focusforge_core::job::{ControlState, JobControl, JobProgress};
-use focusforge_core::params::{ParamValue, ParamValues, Provenance};
+use focusforge_core::algorithm::{
+    AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus,
+};
+use focusforge_core::align::Transform;
+use focusforge_core::job::{ControlState, JobControl, JobProgress, StageCache};
+use focusforge_core::params::{ParamDesc, ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{
     AlignRequest, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, RunStage, StageObserver,
 };
@@ -141,9 +145,8 @@ fn cancel_before_the_first_fuse_unit_reports_align_stage() {
     request.tile_size = Some(480); // the ragged variant: 512 does not divide evenly.
 
     let control = JobControl::new();
-    // Requested before the driver ever runs: alignment still has to be
-    // reported (the engine's own "reported, never controlled" contract), and
-    // the cancel can only land once it returns.
+    // Requested before the driver ever runs: the align stage is still
+    // reported, and the cancel lands before its first registration.
     control.cancel();
     assert_eq!(control.state(), ControlState::CancelRequested);
 
@@ -167,6 +170,131 @@ fn cancel_before_the_first_fuse_unit_reports_align_stage() {
         vec!["align"],
         "the align stage must be reported, and no stage past it"
     );
+}
+
+/// Converges every frame and counts its `align_frame` calls; the call
+/// numbered `cancel_on` requests a cancel on `control` before it returns.
+/// Its schema is `pyramidal-ecc`'s, so a request can choose the reference
+/// policy.
+struct CancellingAlign {
+    control: Arc<JobControl>,
+    cancel_on: usize,
+    calls: AtomicUsize,
+}
+
+impl AlignAlgorithm for CancellingAlign {
+    fn id(&self) -> &str {
+        "cancelling-align"
+    }
+    fn display_name(&self) -> &str {
+        "Cancelling Align"
+    }
+    fn params(&self) -> &[ParamDesc] {
+        registry::find_align("pyramidal-ecc")
+            .expect("pyramidal-ecc must be registered")
+            .params()
+    }
+    fn align_frame(
+        &self,
+        _ctx: &AlignContext<'_>,
+        _frame: usize,
+        _cfg: &ParamValues,
+    ) -> Result<AlignOutcome, AlgorithmError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.cancel_on {
+            self.control.cancel();
+        }
+        Ok(AlignOutcome {
+            transform: Transform::identity(),
+            status: AlignStatus::Converged,
+            iterations: 1,
+            residual: 1.0,
+        })
+    }
+}
+
+/// Every file below `dir`, at any depth.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .flat_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                files_under(&path)
+            } else {
+                vec![path]
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn cancel_during_alignment_stops_at_a_frame_boundary() {
+    const CANCEL_ON: usize = 2;
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // More frames than the cancelling call plus one in-flight registration
+    // per other worker, so a cancel noticed only once alignment returns
+    // would register frames past that bound.
+    let frame_count = CANCEL_ON + workers + 8;
+    let frames: Vec<PathBuf> = mantis_frames(8)
+        .into_iter()
+        .cycle()
+        .take(frame_count)
+        .collect();
+
+    for (policy, bound) in [("anchor", CANCEL_ON + workers - 1), ("chain", CANCEL_ON)] {
+        let control = JobControl::new();
+        let algorithm: &'static CancellingAlign = Box::leak(Box::new(CancellingAlign {
+            control: Arc::clone(&control),
+            cancel_on: CANCEL_ON,
+            calls: AtomicUsize::new(0),
+        }));
+        let mut explicit = ParamValues::new();
+        explicit.insert(
+            "reference-policy".to_string(),
+            ParamValue::Enum(policy.to_string()),
+        );
+        let mut request = base_request(
+            &format!("cancel_mid_align_{policy}"),
+            frames.clone(),
+            ParamValues::new(),
+        );
+        request.align = Some(AlignRequest {
+            algorithm,
+            explicit,
+            lax: false,
+        });
+        let cache = StageCache::open(&request.scratch_root).expect("stage cache must open");
+
+        let outcome =
+            focusforge_core::pipeline::run(&request, &NoopObserver, control, Some(&cache))
+                .unwrap_or_else(|err| {
+                    panic!("{policy}: a cancel must not take the error path: {err}")
+                });
+
+        assert!(
+            matches!(
+                outcome,
+                FuseOutcome::Cancelled {
+                    units_done: 0,
+                    unit_total: 0
+                }
+            ),
+            "{policy}: a cancel during alignment must end the run as cancelled"
+        );
+        let calls = algorithm.calls.load(Ordering::SeqCst);
+        assert!(
+            calls <= bound,
+            "{policy}: {calls} registrations ran, but at most {bound} may once the cancel lands"
+        );
+        assert_eq!(
+            files_under(&request.scratch_root),
+            Vec::<PathBuf>::new(),
+            "{policy}: a cancelled alignment must write no stage-cache entry and no resume ledger"
+        );
+    }
 }
 
 #[derive(Default)]

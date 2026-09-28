@@ -3474,9 +3474,10 @@ impl AppController {
 
     /// Requests a cancel, or leaves the queue. A queued active tab is
     /// removed from the queue and returned to `Idle`, never touching the
-    /// live run's control. Otherwise the cancel lands only once alignment
-    /// returns, showing `Cancelling` for that interval. A no-op unless the
-    /// active tab is queued or is the one actually running.
+    /// live run's control. Otherwise the cancel lands at the next frame
+    /// boundary during alignment, or the next tile during fusion, showing
+    /// `Cancelling` until then. A no-op unless the active tab is queued or
+    /// is the one actually running.
     pub fn cancel_fuse(&mut self) {
         if let Some(id) = self.state.active().map(|tab| tab.id)
             && let Some(pos) = self.job.queue.iter().position(|&queued| queued == id)
