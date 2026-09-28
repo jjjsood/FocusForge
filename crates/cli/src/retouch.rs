@@ -146,8 +146,13 @@ pub fn run(
         Ok(writer) => writer,
         Err(err) => return fail(err),
     };
-    let pixels_changed = match retouch::write_edited(&reader, &session, ROWS_PER_PASS, &mut writer)
-    {
+    let pixels_changed = match retouch::write_edited(
+        &reader,
+        session.tile(),
+        session.indices(),
+        ROWS_PER_PASS,
+        &mut writer,
+    ) {
         Ok(changed) => changed,
         Err(err) => {
             let _ = std::fs::remove_file(&partial);

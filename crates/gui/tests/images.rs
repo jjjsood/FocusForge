@@ -154,6 +154,7 @@ fn seal_project_with_sources(dir: &Path, sources: &[PathBuf]) -> PathBuf {
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
+        crop: None,
         composite_description: "staged".to_string(),
         label: None,
         metrics: Metrics::default(),

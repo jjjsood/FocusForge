@@ -282,9 +282,16 @@ fn align_progress_counts_every_frame() {
 #[test]
 fn a_held_run_seals_to_the_same_project() {
     let frames = mantis_frames(3);
+    let align = AlignRequest {
+        algorithm: registry::find_align("dummy-align").expect("dummy-align must be registered"),
+        explicit: ParamValues::new(),
+        lax: false,
+    };
 
     let hold_dir = scratch("held_run_hold");
     let mut held_request = base_request("held_run", frames.clone(), ParamValues::new());
+    held_request.align = Some(align);
+    held_request.crop = true;
     held_request.output = FuseOutput::Hold(hold_dir.clone());
     let staging = held_request
         .scratch_root
@@ -312,7 +319,13 @@ fn a_held_run_seals_to_the_same_project() {
     project::seal_held(&target, std::slice::from_ref(&held), false)
         .expect("the held checkpoint must seal");
 
-    let direct_request = base_request("direct_run", frames, ParamValues::new());
+    let mut direct_request = base_request("direct_run", frames, ParamValues::new());
+    direct_request.align = Some(AlignRequest {
+        algorithm: registry::find_align("dummy-align").expect("dummy-align must be registered"),
+        explicit: ParamValues::new(),
+        lax: false,
+    });
+    direct_request.crop = true;
     let outcome =
         focusforge_core::pipeline::run(&direct_request, &NoopObserver, JobControl::new(), None)
             .expect("a direct run must complete");
@@ -325,6 +338,13 @@ fn a_held_run_seals_to_the_same_project() {
 
     let from_held = Project::open(&target).unwrap().manifest().clone();
     let direct = Project::open(&sealed.path).unwrap().manifest().clone();
+    assert_eq!(
+        from_held.align.as_ref().unwrap().transforms.len(),
+        3,
+        "one transform per frame"
+    );
+    assert_eq!(from_held.crop, direct.crop, "the same crop either way");
+    assert!(from_held.crop.is_some(), "the aligned frames must crop");
     assert_eq!(from_held.algorithm, direct.algorithm);
     assert_eq!(from_held.params, direct.params);
     assert_eq!(from_held.sources, direct.sources);

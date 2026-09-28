@@ -672,6 +672,7 @@ pub fn run(
                 algorithm: align_algo.id().to_string(),
                 params: params::resolved_values(align_resolved),
                 reference: alignment.reference,
+                transforms: alignment.frames.iter().map(|f| f.transform).collect(),
             });
     let product = match &request.output {
         FuseOutput::Append(project_path) => project::append(AppendRequest {
@@ -682,6 +683,7 @@ pub fn run(
             algorithm: request.algorithm.id(),
             params: &values,
             align: align_record,
+            crop: applied_crop,
             composite_description,
             label: None,
             metrics,
@@ -696,6 +698,7 @@ pub fn run(
             algorithm: request.algorithm.id(),
             params: &values,
             align: align_record,
+            crop: applied_crop,
             composite_description,
             label: None,
             metrics,
@@ -715,6 +718,7 @@ pub fn run(
                 algorithm: request.algorithm.id().to_string(),
                 params: values.clone(),
                 align: align_record,
+                crop: applied_crop,
                 composite_description,
                 metrics,
                 created_at: project::seal::now_unix(),

@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::align::Transform;
 use crate::params::ParamValues;
 use crate::tile::Rect;
 
@@ -50,6 +51,10 @@ pub struct Manifest {
     /// the chain, if any, is reached by walking
     /// [`super::checkpoint::Checkpoint::parent`] from there.
     pub checkpoint: String,
+    /// The composite's extent after any crop was applied. `None` when the
+    /// run kept the frames' full extent.
+    #[serde(default)]
+    pub crop: Option<Rect>,
 }
 
 /// The alignment half of a run, recorded so a project says how its frames
@@ -60,6 +65,9 @@ pub struct AlignRecord {
     pub params: ParamValues,
     /// Index into [`Manifest::sources`] of the reference frame.
     pub reference: usize,
+    /// One transform per source frame, index == frame index.
+    #[serde(default)]
+    pub transforms: Vec<Transform>,
 }
 
 /// Where one payload plane lives and what shape it has. The blob holds the

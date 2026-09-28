@@ -137,6 +137,7 @@ fn request<'a>(
         algorithm: "laplacian",
         params: values,
         align: None,
+        crop: None,
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),

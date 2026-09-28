@@ -42,9 +42,8 @@
 //!
 //! # What this format deliberately does not do
 //!
-//! No op log replay, no undo/redo, no checkpoint DAG, no sparse deltas, no
-//! branch-from-any-checkpoint, no browser. A project written here contains
-//! one parentless, op-less checkpoint.
+//! No undo/redo kept across a session, no checkpoint DAG beyond a single
+//! chain, no sparse deltas, no branch-from-any-checkpoint, no browser.
 //!
 //! # What `core` does not do
 //!
@@ -65,7 +64,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-pub use append::{AppendRequest, append, append_at};
+pub use append::{AppendRequest, append, append_at, append_ops, append_ops_at};
 pub use blob::{Plane, StagedBlob, hash_file, short_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, Op, Point};
 pub use container::{ProjectWriter, partial_path};
@@ -148,10 +147,40 @@ fn stream_plane<W: PlaneWriter>(
     which: Plane,
     partial: &Path,
     final_path: &Path,
+    writer: W,
+) -> Result<(), ProjectError> {
+    let plane_ref = project.plane(which).clone();
+    stream_plane_ref(project, &plane_ref, partial, final_path, writer)
+}
+
+/// Streams a Z-Map that is not necessarily the project's head: `checkpoint`
+/// names its own `zmap_blob`, read against the manifest's declared shape.
+/// What a `ResetRegion` needs to replay against an ancestor other than the
+/// immediate parent.
+pub fn materialize_zmap(
+    project: &mut Project,
+    checkpoint: &Checkpoint,
+    path: &Path,
+) -> Result<(), ProjectError> {
+    let mut plane_ref = project.manifest().zmap.clone();
+    plane_ref.blob = checkpoint.zmap_blob.clone();
+    let partial = partial_path(path);
+    let info = crate::zmap::ZMapInfo::new(plane_ref.width, plane_ref.height, plane_ref.frame_count)
+        .map_err(|err| ProjectError::container(&partial, err))?;
+    let writer = crate::zmap::ZMapWriter::create(&partial, info)
+        .map_err(|err| ProjectError::container(&partial, err))?;
+    stream_plane_ref(project, &plane_ref, &partial, path, writer)
+}
+
+fn stream_plane_ref<W: PlaneWriter>(
+    project: &mut Project,
+    plane_ref: &PlaneRef,
+    partial: &Path,
+    final_path: &Path,
     mut writer: W,
 ) -> Result<(), ProjectError> {
     let mut failure: Option<String> = None;
-    let read = project.read_plane_into(which, &mut |band, rect| {
+    let read = project.read_plane_ref_into(plane_ref, &mut |band, rect| {
         if failure.is_some() {
             return;
         }
@@ -337,6 +366,18 @@ impl Project {
         sink: &mut impl FnMut(&[u16], Rect),
     ) -> Result<(), ProjectError> {
         let plane = self.plane(which).clone();
+        self.read_plane_ref_into(&plane, sink)
+    }
+
+    /// [`Self::read_plane_into`]'s body, over an arbitrary [`PlaneRef`]
+    /// rather than one of `self.manifest`'s own two -- what
+    /// [`materialize_zmap`] uses to read a non-head checkpoint's own Z-Map
+    /// blob under the manifest's declared shape.
+    fn read_plane_ref_into(
+        &mut self,
+        plane: &PlaneRef,
+        sink: &mut impl FnMut(&[u16], Rect),
+    ) -> Result<(), ProjectError> {
         let entry = format!("blobs/{}.zst", plane.blob);
         let expected_len =
             plane.width as u64 * plane.height as u64 * plane.samples_per_pixel as u64 * 2;

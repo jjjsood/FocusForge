@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `checkpoints/<id>.json`: the one parentless, op-less checkpoint a freshly
-//! stacked project carries, plus all four [`Op`] variants fully defined and
-//! round-tripped here.
+//! `checkpoints/<id>.json`: one node of a checkpoint chain, plus all four
+//! [`Op`] variants fully defined and round-tripped here. A freshly stacked
+//! project's own checkpoint is parentless with an empty `ops`; a checkpoint
+//! `super::append::append_ops` seals carries both.
 //!
 //! The extension rule runs the opposite way from [`super::manifest`]:
 //! **every op field carries `#[serde(default)]`**, so a new field on a
@@ -15,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::params::ParamValues;
 use crate::tile::Rect;
 
-/// One node of a checkpoint chain. Here: always `parent: None`,
-/// always `ops: []`.
+/// One node of a checkpoint chain: `parent: None` and an empty `ops` for
+/// the checkpoint a fresh stack or a re-fuse writes; a checkpoint
+/// `super::append::append_ops` seals carries both instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub id: String,

@@ -127,6 +127,7 @@ fn seal_as_given_project(name: &str) -> PathBuf {
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
+        crop: None,
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: project::Metrics::default(),

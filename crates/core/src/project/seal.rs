@@ -31,6 +31,7 @@ use super::manifest::{
 };
 use super::{FORMAT_VERSION, HASH_ALGORITHM};
 use crate::params::ParamValues;
+use crate::tile::Rect;
 
 /// Everything one seal needs. Borrowed rather than owned: the caller
 /// already holds every one of these.
@@ -45,6 +46,8 @@ pub struct SealRequest<'a> {
     pub algorithm: &'a str,
     pub params: &'a ParamValues,
     pub align: Option<AlignRecord>,
+    /// The composite's extent after any crop was applied.
+    pub crop: Option<Rect>,
     /// Exactly the `ImageDescription` the staged composite carries, so
     /// `export` re-emits a byte-identical TIFF.
     pub composite_description: String,
@@ -166,6 +169,7 @@ fn seal_staged(
         blobs: blob_records(&composite_record, &zmap_record),
         metrics: request.metrics,
         checkpoint: checkpoint_id.clone(),
+        crop: request.crop,
     };
 
     let checkpoint = Checkpoint {
@@ -216,6 +220,8 @@ pub struct HeldCheckpoint {
     pub algorithm: String,
     pub params: ParamValues,
     pub align: Option<AlignRecord>,
+    /// The composite's extent after any crop was applied.
+    pub crop: Option<Rect>,
     /// Exactly the `ImageDescription` the composite carries.
     pub composite_description: String,
     pub metrics: Metrics,
@@ -273,6 +279,7 @@ fn seal_chain(
                     algorithm: &checkpoint.algorithm,
                     params: &checkpoint.params,
                     align: checkpoint.align.clone(),
+                    crop: checkpoint.crop,
                     composite_description: checkpoint.composite_description.clone(),
                     label: None,
                     metrics: checkpoint.metrics,
@@ -289,6 +296,7 @@ fn seal_chain(
                     algorithm: &checkpoint.algorithm,
                     params: &checkpoint.params,
                     align: checkpoint.align.clone(),
+                    crop: checkpoint.crop,
                     composite_description: checkpoint.composite_description.clone(),
                     label: None,
                     metrics: checkpoint.metrics,

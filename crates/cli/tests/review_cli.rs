@@ -276,6 +276,7 @@ fn seal_project(
         algorithm: "laplacian",
         params: &values,
         align: None,
+        crop: None,
         composite_description: "test composite".to_string(),
         label: None,
         metrics,

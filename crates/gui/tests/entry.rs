@@ -622,6 +622,7 @@ fn seal_test_project(dir: &Path) -> PathBuf {
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
+        crop: None,
         composite_description: "staged".to_string(),
         label: None,
         metrics: Metrics::default(),

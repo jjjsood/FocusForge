@@ -53,6 +53,20 @@ pub enum ProjectError {
         found: u32,
         supported: u32,
     },
+
+    /// An op refused before or during replay: its own 0-based index in the
+    /// list, and why.
+    #[error("op #{index}: {source}")]
+    Op {
+        index: usize,
+        #[source]
+        source: Box<crate::retouch::RetouchError>,
+    },
+
+    /// [`super::append::append_ops`] was handed an empty op list -- a
+    /// checkpoint sealing nothing is not a real record.
+    #[error("{}: an empty op list cannot be sealed", path.display())]
+    EmptyOpList { path: PathBuf },
 }
 
 impl ProjectError {
