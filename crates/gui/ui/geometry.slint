@@ -110,6 +110,22 @@ export global ShellGeometry {
     out property <length> progress-bar-height: 4px;
     // The ETA's left edge, measured from the bottom bar's own right edge.
     out property <length> progress-eta-inset: 376px;
+    // In editor mode the track ends well short of that, clearing the
+    // overlay cluster below; the ETA then sits right after the shortened
+    // track instead of at a fixed inset.
+    out property <length> progress-bar-editor-width-inset: 532px;
+
+    // The bottom bar's overlay cluster, editor-mode only, right of the
+    // (shortened) progress track and left of the zoom cluster. Its left edge
+    // sits at this inset from the bar's right edge; everything else in the
+    // cluster is an offset from that edge: toggle 60 | 12 | track
+    // (`overlay-track-width` wide) with the readout after it, then a 1 px
+    // rule 266 past the cluster's left edge, 21 px before the zoom cluster.
+    out property <length> overlay-cluster-inset: 516px;
+    out property <length> overlay-toggle-offset: 60px;
+    out property <length> overlay-track-offset: 108px;
+    out property <length> overlay-track-width: 100px;
+    out property <length> overlay-rule-offset: 266px;
 
     // The editor toolbar's own row -- every control shares
     // `toolbar-button-height`/`toolbar-height` above.

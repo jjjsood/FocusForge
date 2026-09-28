@@ -2,8 +2,9 @@
 //
 // A value slider with a numeric readout. `scale: "logarithmic"` adds a
 // decade-tick line below the track and is 14 px taller than the default
-// linear scale. `compact` is the bar form: a 72 px track 2 px high, a 10 px
-// thumb and the value as plain text instead of a field.
+// linear scale. `compact` is the bar form: a track 2 px high (`track-width`
+// wide, 72 px by default), a 10 px thumb and the value as plain text
+// instead of a field.
 
 import { Theme } from "../theme.slint";
 import { FFField } from "ff_field.slint";
@@ -15,6 +16,8 @@ export component FFSlider inherits Rectangle {
     in property <bool> disabled: false;
     in property <bool> invalid: false;
     in property <bool> compact: false;
+    // `compact`'s own track width; ignored outside `compact`.
+    in property <length> track-width: 72px;
     callback fraction-changed(float);
 
     height: root.scale == "logarithmic" ? 40px : 26px;
@@ -27,7 +30,7 @@ export component FFSlider inherits Rectangle {
         track := Rectangle {
             x: 0px;
             y: parent.height / 2 - self.height / 2;
-            width: root.compact ? 72px : parent.width - 70px;
+            width: root.compact ? root.track-width : parent.width - 70px;
             height: root.compact ? 2px : 4px;
             border-radius: self.height / 2;
             background: Theme.surface-overlay;
@@ -38,7 +41,7 @@ export component FFSlider inherits Rectangle {
                 width: parent.width * root.fraction;
                 height: parent.height;
                 border-radius: parent.border-radius;
-                background: root.invalid ? Theme.status-failure : Theme.accent-default;
+                background: root.disabled ? Theme.text-disabled : root.invalid ? Theme.status-failure : Theme.accent-default;
             }
 
             thumb := Rectangle {
@@ -47,7 +50,7 @@ export component FFSlider inherits Rectangle {
                 y: parent.height / 2 - self.height / 2;
                 x: parent.width * root.fraction - self.width / 2;
                 border-radius: self.height / 2;
-                background: root.invalid ? Theme.status-failure : Theme.accent-default;
+                background: root.disabled ? Theme.text-disabled : root.invalid ? Theme.status-failure : Theme.accent-default;
             }
 
             drag-area := TouchArea {

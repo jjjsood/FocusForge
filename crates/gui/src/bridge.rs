@@ -251,9 +251,13 @@ pub fn repaint(
     let redrawn = plane_draw.and_then(|draw| {
         let controller = controller.lock().unwrap();
         let edited = controller.edited_view();
+        let overlay = controller.overlay_draw();
         let mut canvas = canvas.borrow_mut();
         let renderer = canvas.renderer.as_mut()?;
-        Some((draw, renderer.redraw_planes(&draw, edited)?))
+        Some((
+            draw,
+            renderer.redraw_planes(&draw, edited, overlay.as_ref())?,
+        ))
     });
     match redrawn {
         Some((draw, (composite_image, zmap_image))) => {
@@ -737,7 +741,7 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
         .map(|row| GeneratedImageRow {
             chip: slint::Color::from_rgb_u8(row.chip[0], row.chip[1], row.chip[2]),
             name: row.name.clone().into(),
-            time_text: row.time_text.clone().into(),
+            time_text: row.trailing_text.clone().into(),
             excluded: row.excluded,
             unresolved: row.unresolved,
             top: row.top,
@@ -753,6 +757,7 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
         app.set_images_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
     }
     app.set_images_header_text(panel.header_text.into());
+    app.set_images_no_source_row(panel.no_source_row);
     app.set_images_content_height(panel.content_height);
     app.set_images_scroll_y(panel.scroll_y);
     let sort = match controller.frame_sort() {
@@ -794,6 +799,11 @@ pub fn push_editor_toolbar(app: &AppWindow, controller: &AppController) {
     app.set_brush_picking(view.picking);
     app.set_can_undo(view.can_undo);
     app.set_can_redo(view.can_redo);
+
+    let overlay = controller.overlay_view();
+    app.set_overlay_on(overlay.on);
+    app.set_overlay_fraction(overlay.opacity);
+    app.set_overlay_text(format!("{:.0}%", overlay.opacity * 100.0).into());
 }
 
 /// Pushes the brush cursor overlay's own view -- every repaint, since its
@@ -1142,6 +1152,28 @@ pub fn install(
                 .lock()
                 .unwrap()
                 .set_brush_softness_fraction(fraction)
+        }
+    });
+    // The bottom bar's overlay controls: both change what the `Composite`
+    // pane's next repaint blends in, so both go through `dispatch`.
+    app.on_overlay_toggled({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |on| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.set_overlay_on(on);
+            });
+        }
+    });
+    app.on_overlay_fraction_changed({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |fraction| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.set_overlay_opacity_fraction(fraction);
+            });
         }
     });
     app.on_pipette_toggled({
@@ -1744,10 +1776,18 @@ pub fn install(
         }
     });
 
-    // The `Images` panel's own scroll -- `FFScrollbar`'s twin wiring above.
-    app.on_images_scrolled({
+    // A plain wheel over the `Images` list steps the selected/brush-source
+    // frame -- the same effect `Ctrl + Wheel` over the canvas has, so this
+    // also needs a repaint.
+    app.on_images_frame_wheel({
         let controller = controller.clone();
-        move |delta| controller.lock().unwrap().scroll_images_panel(delta)
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |delta| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.images_list_wheel(delta);
+            });
+        }
     });
     app.on_images_scrollbar_pointer({
         let controller = controller.clone();
@@ -2127,6 +2167,9 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             if shell_mode == ShellMode::Editor {
                 push_editor_toolbar(app, &controller.lock().unwrap());
             }
+            // The legend replaces the ordinary `Images` list only in editor
+            // mode -- the list's own shape follows the mode switch.
+            push_images_panel(app, &controller.lock().unwrap());
         }
         ShellEvent::DockTabSelected(tab) => {
             let tab = match tab {

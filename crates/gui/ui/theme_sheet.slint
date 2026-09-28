@@ -25,6 +25,7 @@ import { FFPanePlaceholder } from "components/ff_pane_placeholder.slint";
 import { FFSpinner } from "components/ff_spinner.slint";
 import { FFLoadingPanel } from "components/ff_loading_panel.slint";
 import { FFImageRow } from "components/ff_image_row.slint";
+import { FFNoSourceRow } from "components/ff_no_source_row.slint";
 import { FFDialog } from "components/ff_dialog.slint";
 import { FFDialogFooter } from "components/ff_dialog_footer.slint";
 import { FFChip } from "components/ff_chip.slint";
@@ -589,6 +590,47 @@ export component ThemeSheet inherits Window {
                 time-text: "14:17:05";
                 selected: true;
             }
+        }
+
+        GroupHeading { text: "Images list: legend row"; }
+        VerticalLayout {
+            spacing: 0px;
+            FFImageRow {
+                width: 248px;
+                legend: true;
+                mutable: false;
+                chip: Theme.status-failure;
+                name: "IMG_9811";
+                time-text: "1";
+            }
+            FFImageRow {
+                width: 248px;
+                legend: true;
+                mutable: false;
+                chip: Theme.status-warning;
+                name: "IMG_9812";
+                time-text: "2";
+                hovered: true;
+            }
+            FFImageRow {
+                width: 248px;
+                legend: true;
+                mutable: false;
+                chip: Theme.accent-default;
+                name: "IMG_9815";
+                time-text: "";
+                unresolved: true;
+            }
+            FFImageRow {
+                width: 248px;
+                legend: true;
+                mutable: false;
+                chip: Theme.status-success;
+                name: "IMG_9816";
+                time-text: "6";
+                selected: true;
+            }
+            FFNoSourceRow { width: 248px; }
         }
 
         Rectangle {

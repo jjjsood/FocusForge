@@ -360,6 +360,7 @@ export component AppWindow inherits Window {
     // one line into `FFDock`.
     in property <[ImageRowView]> images-rows: [];
     in property <string> images-header-text: "";
+    in property <bool> images-no-source-row: false;
     in property <length> images-scroll-y: 0px;
     in property <length> images-content-height: 0px;
     in property <string> images-sort: "";
@@ -377,7 +378,7 @@ export component AppWindow inherits Window {
     callback images-frame-excluded-toggled(int);
     callback images-frame-remove-requested(int);
     callback images-frame-grip-pointer(int, int, length);
-    callback images-scrolled(length);
+    callback images-frame-wheel(length);
     callback images-scrollbar-pointer(int, length);
     callback images-scrollbar-dragged(length);
     callback images-viewport-height-changed(length);
@@ -399,6 +400,7 @@ export component AppWindow inherits Window {
         settings-enabled: root.settings-enabled;
         images-rows: root.images-rows;
         images-header-text: root.images-header-text;
+        images-no-source-row: root.images-no-source-row;
         images-scroll-y: root.images-scroll-y;
         images-content-height: root.images-content-height;
         images-sort: root.images-sort;
@@ -427,7 +429,7 @@ export component AppWindow inherits Window {
         images-frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
         images-frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
         images-frame-grip-pointer(i, kind, y) => { root.images-frame-grip-pointer(i, kind, y); }
-        images-scrolled(delta) => { root.images-scrolled(delta); }
+        images-frame-wheel(delta) => { root.images-frame-wheel(delta); }
         images-scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
         images-scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
         images-viewport-height-changed(h) => { root.images-viewport-height-changed(h); }
@@ -498,6 +500,13 @@ export component AppWindow inherits Window {
     in property <string> bar-tone: "running";
     in property <string> eta-text: "";
 
+    // The bottom bar's overlay controls, editor mode only.
+    in property <bool> overlay-on: false;
+    in property <float> overlay-fraction: 0.0;
+    in property <string> overlay-text: "";
+    callback overlay-toggled(bool);
+    callback overlay-fraction-changed(float);
+
     // Whether a background stack load is in flight
     // (`AppController::open_paths`), pushed on every `LoadStarted`/`LoadReady`.
     in property <bool> load-active: false;
@@ -517,11 +526,17 @@ export component AppWindow inherits Window {
         bar-fraction: root.bar-fraction;
         bar-tone: root.bar-tone;
         eta-text: root.eta-text;
+        editor-mode: root.mode == "editor";
+        overlay-on: root.overlay-on;
+        overlay-fraction: root.overlay-fraction;
+        overlay-text: root.overlay-text;
 
         settings-requested => { root.settings-open-requested(); }
         zoom-in-requested => { root.zoom-in-requested(); }
         zoom-out-requested => { root.zoom-out-requested(); }
         zoom-fit-requested => { root.zoom-fit-requested(); }
+        overlay-toggled(on) => { root.overlay-toggled(on); }
+        overlay-fraction-changed(f) => { root.overlay-fraction-changed(f); }
     }
 
     // The projects overlay's gallery: pushed from `AppController::project_cards`

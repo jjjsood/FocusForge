@@ -2797,11 +2797,11 @@ fn brush_controls_convert_to_storage_units() {
         );
     }
 
-    c.select_frame(0);
+    c.select_frame(2);
     c.wheel(0.0, 60.0, 0.0, 0.0, CTRL);
     assert_eq!(c.brush_source(), Some(1), "Ctrl + Wheel steps the source");
     c.wheel(0.0, 120.0, 0.0, 0.0, CTRL);
-    assert_eq!(c.brush_source(), Some(2), "clamped to the frame list");
+    assert_eq!(c.brush_source(), Some(0), "clamped to the frame list");
 
     let mut narrow = controller_with_scratch("brush_units_narrow");
     open_cropped_tab(&mut narrow, "brush_units_narrow", 40, 24);
@@ -2821,6 +2821,255 @@ fn brush_controls_convert_to_storage_units() {
     );
     narrow.set_brush_size_fraction(1.0);
     assert_eq!(size(&narrow), narrow_ceiling as f32);
+}
+
+#[test]
+fn plain_wheel_over_the_images_list_steps_the_source_frame_in_both_modes() {
+    let mut stacking = controller_with_scratch("images_wheel_stacking");
+    open_mantis64_tab(&mut stacking, "images_wheel_stacking", 3);
+    stacking.select_frame(2);
+    stacking.images_list_wheel(60.0);
+    assert_eq!(
+        stacking.frame_pane_label(),
+        "01.tif",
+        "plain wheel over the list steps the source in stacking mode, matching \
+         Ctrl + Wheel's own direction"
+    );
+    stacking.images_list_wheel(120.0);
+    assert_eq!(
+        stacking.frame_pane_label(),
+        "00.tif",
+        "clamped to the frame list"
+    );
+
+    let (mut editor, _) = open_editor("images_wheel_editor");
+    editor.select_frame(2);
+    editor.images_list_wheel(60.0);
+    assert_eq!(
+        editor.frame_pane_label(),
+        "01.tif \u{b7} source 2 of 3",
+        "the same wheel steps the source in editor mode too, with no Ctrl needed"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The editor's `Images` legend and the overlay controls.
+// ---------------------------------------------------------------------
+
+use focusforge_gui::canvas::OverlayDraw;
+use focusforge_gui::images::{FrameSort, ROW_HEIGHT};
+
+#[test]
+fn legend_rows_carry_the_z_map_palette() {
+    let mut c = controller_with_scratch("legend_palette");
+    open_fused_tab(&mut c, "legend_palette", 3);
+    // Excluded after the fuse: the Z-Map is unchanged, so the legend must
+    // still list, number and colour this frame like any other source.
+    c.toggle_frame_excluded(1);
+    assert!(c.set_mode(ShellMode::Editor));
+
+    let panel = c.images_panel();
+    let table = focusforge_core::zmap::overlay_table(3, None);
+    for (i, row) in panel.rows.iter().enumerate() {
+        assert_eq!(
+            row.chip, table[i],
+            "row {i}'s colour must come from the Z-Map palette"
+        );
+        assert_eq!(
+            row.chip,
+            focusforge_core::zmap::source_color(i as u16, 3),
+            "row {i} must equal source_color(i, n) with nothing soloed"
+        );
+        assert_eq!(row.trailing_text, (i + 1).to_string());
+    }
+    assert!(
+        !panel.rows[1].excluded,
+        "an exclusion made after the fuse changes no Z-Map source"
+    );
+}
+
+#[test]
+fn legend_header_states() {
+    let mut c = controller_with_scratch("legend_header");
+    open_fused_tab(&mut c, "legend_header", 3);
+    c.toggle_frame_excluded(1);
+    assert_eq!(
+        c.images_panel().header_text,
+        "3 frames \u{b7} 1 excluded",
+        "stacking keeps the exclusion count"
+    );
+
+    assert!(c.set_mode(ShellMode::Editor));
+    assert_eq!(
+        c.images_panel().header_text,
+        "3 frames",
+        "the editor drops the exclusion count"
+    );
+
+    // `images_panel()` runs a fused tab through this same pure builder --
+    // the singular form at `n = 1` needs no real fuse to prove.
+    let one =
+        focusforge_gui::images::build_model(&[PathBuf::from("00.tif")], &[false], None, 0.0, true);
+    assert_eq!(one.header_text, "1 frame");
+}
+
+#[test]
+fn legend_no_source_entry_is_pinned_and_unpaintable() {
+    let mut c = controller_with_scratch("legend_no_source");
+    open_fused_tab(&mut c, "legend_no_source", 3);
+    assert!(
+        !c.images_panel().no_source_row,
+        "stacking mode has no pinned entry"
+    );
+
+    assert!(c.set_mode(ShellMode::Editor));
+    let panel = c.images_panel();
+    assert!(
+        panel.no_source_row,
+        "the legend pins a NO_SOURCE entry below the list"
+    );
+    assert_eq!(panel.rows.len(), 3, "NO_SOURCE is not one of rows");
+    assert_eq!(panel.content_height, 3.0 * ROW_HEIGHT);
+
+    let before = c.brush_source();
+    c.select_frame(3);
+    assert_eq!(
+        before,
+        c.brush_source(),
+        "select_frame(N) past the frame list changes nothing"
+    );
+    // A pipette pick landing on `NO_SOURCE` leaving the source unchanged is
+    // covered by `pipette_reads_and_appends_nothing`.
+}
+
+#[test]
+fn legend_current_source_row_follows_all_inputs() {
+    let (mut c, _) = open_editor("legend_wash");
+    let selected_row = |c: &AppController| {
+        let panel = c.images_panel();
+        let selected: Vec<usize> = panel
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.selected)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(selected.len(), 1, "exactly one row carries the wash");
+        assert_eq!(
+            Some(selected[0] as u16),
+            c.brush_source(),
+            "the washed row is always the brush source"
+        );
+        selected[0]
+    };
+
+    c.select_frame(2);
+    assert_eq!(selected_row(&c), 2, "a row click moves the wash");
+
+    c.wheel(0.0, 60.0, 0.0, 0.0, CTRL);
+    assert_eq!(selected_row(&c), 1, "Ctrl + Wheel moves the wash");
+
+    let map = map_rect(&c);
+    let zmap = c.held_checkpoints().last().unwrap().zmap.clone();
+    let indices = read_whole_zmap(&zmap);
+    let differing = |current: u16| {
+        (0..map.height)
+            .flat_map(|y| (0..map.width).map(move |x| (x, y)))
+            .find_map(|(x, y)| {
+                let index = indices[(y * map.width + x) as usize];
+                (index != current && index != NO_SOURCE).then_some(((x as f32, y as f32), index))
+            })
+            .expect("the fused map names more than one source")
+    };
+
+    let (pixel, picked) = differing(c.brush_source().unwrap());
+    c.toggle_pipette();
+    drag(&mut c, &[pixel]);
+    assert_eq!(c.brush_source(), Some(picked), "the armed click picks");
+    assert_eq!(
+        selected_row(&c),
+        picked as usize,
+        "a pipette pick moves the wash"
+    );
+
+    let (pixel, picked) = differing(c.brush_source().unwrap());
+    let alt_click_point = at(pixel.0, pixel.1);
+    c.pointer(
+        PointerKind::Down,
+        Button::Left,
+        alt_click_point.0,
+        alt_click_point.1,
+        ALT,
+    );
+    c.pointer(
+        PointerKind::Up,
+        Button::Left,
+        alt_click_point.0,
+        alt_click_point.1,
+        ALT,
+    );
+    assert_eq!(c.brush_source(), Some(picked), "Alt + click picks");
+    assert_eq!(
+        selected_row(&c),
+        picked as usize,
+        "Alt + click moves the wash"
+    );
+}
+
+#[test]
+fn legend_has_no_mutation_affordances() {
+    let (mut c, _) = open_editor("legend_no_mutation");
+    let before = c.images_panel();
+    c.toggle_frame_excluded(0);
+    c.remove_frame(0);
+    c.move_frame(0, 1);
+    c.set_frame_sort(FrameSort::Name);
+    c.add_frames(&[PathBuf::from("/tmp/does-not-matter.tif")]);
+    assert_eq!(
+        c.images_panel(),
+        before,
+        "no mutation reaches the legend in editor mode"
+    );
+    assert!(c.pending_frame_change().is_none());
+}
+
+#[test]
+fn overlay_controls_match_the_render_parameters() {
+    let mut c = controller_with_scratch("overlay_params");
+    open_fused_tab(&mut c, "overlay_params", 3);
+    assert_eq!(
+        c.overlay_draw(),
+        None,
+        "stacking mode never draws the overlay"
+    );
+    assert!(
+        !c.overlay_view().on,
+        "a fresh session opens with the overlay off"
+    );
+    assert_eq!(c.overlay_view().opacity, 0.65, "65% once turned on");
+
+    assert!(c.set_mode(ShellMode::Editor));
+    assert_eq!(
+        c.overlay_draw(),
+        None,
+        "the fresh-session default stays off in editor mode too"
+    );
+
+    c.set_overlay_opacity_fraction(0.3);
+    assert_eq!(c.overlay_draw(), None, "still off");
+
+    c.set_overlay_on(true);
+    assert_eq!(
+        c.overlay_draw(),
+        Some(OverlayDraw {
+            table: focusforge_core::zmap::overlay_table(3, None),
+            alpha: focusforge_core::display::alpha_from_opacity(0.3),
+        }),
+        "matches focusforge-cli retouch --overlay --opacity's own blend, with no --solo"
+    );
+
+    c.set_overlay_on(false);
+    assert_eq!(c.overlay_draw(), None, "turning it back off");
 }
 
 #[test]

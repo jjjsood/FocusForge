@@ -175,7 +175,7 @@ fn list_shows_every_frame() {
     for (i, row) in panel.rows.iter().enumerate() {
         assert_eq!(row.name, format!("{i:02}.tif"));
         assert_eq!(
-            row.time_text, "10:00:00",
+            row.trailing_text, "10:00:00",
             "the row shows the time of day, not the full date"
         );
         assert!(!row.excluded);
@@ -239,8 +239,8 @@ fn absent_capture_time_is_shown_as_absent() {
         OpenOutcome::Refused(_) => panic!("opening two tiny synthetic frames must not be refused"),
     }
     let panel = controller.images_panel();
-    assert_eq!(panel.rows[0].time_text, "10:00:00");
-    assert_eq!(panel.rows[1].time_text, "", "no fabricated time");
+    assert_eq!(panel.rows[0].trailing_text, "10:00:00");
+    assert_eq!(panel.rows[1].trailing_text, "", "no fabricated time");
     // `ImagesModel` names every field it has -- there is no collective note
     // field to omit.
     let ImagesModel {
@@ -248,6 +248,7 @@ fn absent_capture_time_is_shown_as_absent() {
         header_text: _,
         content_height: _,
         scroll_y: _,
+        no_source_row: _,
     } = panel;
 }
 
@@ -263,7 +264,7 @@ fn rows_carry_no_index() {
         let ImageRow {
             chip: _,
             name: _,
-            time_text: _,
+            trailing_text: _,
             excluded: _,
             unresolved: _,
             top: _,

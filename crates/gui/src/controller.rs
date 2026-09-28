@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::brush;
-use crate::canvas::FrameView;
+use crate::canvas::{FrameView, OverlayDraw};
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
     DiagnosticsView, clamp_manifest_scroll, manifest_content_height, size_text,
@@ -221,6 +221,23 @@ impl Default for BrushState {
     }
 }
 
+/// The rainbow overlay's own state: window-wide, since the same values
+/// render for whichever tab is active. Starts off, at 65 % once turned on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OverlayState {
+    on: bool,
+    opacity: f32,
+}
+
+impl Default for OverlayState {
+    fn default() -> Self {
+        Self {
+            on: false,
+            opacity: 0.65,
+        }
+    }
+}
+
 /// `size = ceiling^fraction` -- the logarithmic slider mapping, so the
 /// track's right end is always the ceiling.
 fn size_from_fraction(fraction: f32, ceiling: u32) -> f32 {
@@ -261,6 +278,15 @@ pub struct BrushToolbarView {
     /// Whether the active tab's edit session has an op to undo/redo.
     pub can_undo: bool,
     pub can_redo: bool,
+}
+
+/// The bottom bar's overlay controls -- [`AppController::overlay_view`]'s
+/// return value. `opacity` is `0.0..=1.0`; the bar's own percentage readout
+/// is formatted by the caller.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverlayView {
+    pub on: bool,
+    pub opacity: f32,
 }
 
 /// The brush cursor overlay's own view -- [`AppController::brush_cursor_view`]'s
@@ -731,6 +757,9 @@ struct ShellState {
     canvas_dirty: bool,
     /// The in-flight background load, if any.
     load: LoadSlot,
+    /// The `Composite` pane's rainbow overlay -- window-wide (see
+    /// [`OverlayState`]).
+    overlay: OverlayState,
 }
 
 /// One load's worker result, parked here until
@@ -1114,6 +1143,42 @@ impl AppController {
         })
     }
 
+    /// The bottom bar's overlay controls.
+    pub fn overlay_view(&self) -> OverlayView {
+        OverlayView {
+            on: self.state.overlay.on,
+            opacity: self.state.overlay.opacity,
+        }
+    }
+
+    /// Turns the `Composite` pane's rainbow overlay on or off.
+    pub fn set_overlay_on(&mut self, on: bool) {
+        self.state.overlay.on = on;
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Sets the overlay's opacity, `0.0..=1.0`, clamped.
+    pub fn set_overlay_opacity_fraction(&mut self, fraction: f32) {
+        self.state.overlay.opacity = fraction.clamp(0.0, 1.0);
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// The `Composite` pane's overlay draw parameters, matching
+    /// `focusforge-cli retouch --overlay --opacity`'s own blend -- `None`
+    /// outside editor mode, with the overlay off, or before an edit session
+    /// has opened.
+    pub fn overlay_draw(&self) -> Option<OverlayDraw> {
+        if self.mode() != ShellMode::Editor || !self.state.overlay.on {
+            return None;
+        }
+        let tab = self.state.active()?;
+        tab.edit.as_ref()?;
+        Some(OverlayDraw::for_opacity(
+            tab.frames.len() as u32,
+            self.state.overlay.opacity,
+        ))
+    }
+
     /// In editor mode, gives a newly active editable tab its own edit
     /// session; drops the window back to stacking, with exactly one
     /// `ModeChanged(Stacking)`, when the active tab no longer satisfies
@@ -1358,12 +1423,15 @@ impl AppController {
         }
     }
 
-    /// `Ctrl + Wheel` in either mode: steps the left pane's selected frame,
-    /// clamped to the frame list. In editor mode this is also the brush
-    /// source, which reads `tab.selected` directly
+    /// `Ctrl + Wheel` over the canvas, or a plain wheel over the `Images`
+    /// list ([`Self::images_list_wheel`]): steps the left pane's selected
+    /// frame, clamped to the frame list. In editor mode this is also the
+    /// brush source, which reads `tab.selected` directly
     /// ([`AppController::brush_source`]).
     fn step_source_frame(&mut self, steps: f32) {
-        let detents = self.wheel_detents(Action::StepSourceFrame, steps);
+        // Negated: scrolling toward the user (positive `steps`) steps to an
+        // earlier frame, matching how the `Images` list itself scrolls.
+        let detents = self.wheel_detents(Action::StepSourceFrame, -steps);
         if detents == 0 {
             return;
         }
@@ -1376,6 +1444,14 @@ impl AppController {
         }
         let next = (tab.selected as i32 + detents).clamp(0, len as i32 - 1) as usize;
         self.select_frame(next);
+    }
+
+    /// A plain wheel over the `Images` list: the same effect `Ctrl + Wheel`
+    /// over the canvas has (`step_source_frame`) -- not gated on `Ctrl`,
+    /// `legend` or `mutable`, so it works identically in stacking and editor
+    /// mode.
+    pub fn images_list_wheel(&mut self, steps: f32) {
+        self.step_source_frame(steps);
     }
 
     /// The active tab's fused image's shorter side -- `Size`'s ceiling.
@@ -3261,8 +3337,9 @@ impl AppController {
     /// tab active ("+" selected).
     pub fn images_panel(&self) -> images::ImagesModel {
         let viewport_height = self.state.images_viewport_height;
+        let legend = self.mode() == ShellMode::Editor;
         let Some(tab) = self.state.active() else {
-            return images::build_model(&[], &[], None, 0.0);
+            return images::build_model(&[], &[], None, 0.0, legend);
         };
         let content_height = tab.frames.len() as f32 * images::ROW_HEIGHT;
         let scroll_y = settings_panel::clamp_panel_scroll(
@@ -3270,7 +3347,13 @@ impl AppController {
             content_height,
             viewport_height,
         );
-        images::build_model(&tab.frames, &tab.excluded, Some(tab.selected), scroll_y)
+        images::build_model(
+            &tab.frames,
+            &tab.excluded,
+            Some(tab.selected),
+            scroll_y,
+            legend,
+        )
     }
 
     /// The active tab's checkpoint count, `0` with none active -- what every
@@ -3873,12 +3956,6 @@ impl AppController {
         self.set_active_tab(Some(self.state.projects.len() - 1));
         self.emit(ShellEvent::ProjectsChanged);
         true
-    }
-
-    /// Scrolls the `Images` panel by `delta_px`, clamped to its current
-    /// content/viewport.
-    pub fn scroll_images_panel(&mut self, delta_px: f32) {
-        self.set_images_scroll(self.state.images_scroll_y + delta_px);
     }
 
     fn set_images_scroll(&mut self, offset_px: f32) {

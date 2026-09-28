@@ -17,9 +17,11 @@ use std::path::{Path, PathBuf};
 use focusforge_core::TiffError;
 use focusforge_core::algorithm::{AlgorithmError, read_tile_step_into};
 use focusforge_core::align::{Transform, WarpingReader};
+use focusforge_core::display::alpha_from_opacity;
 use focusforge_core::io::{FrameReader, open_frame_set};
 use focusforge_core::retouch::{RetouchError, Sources, recomposite as recomposite_region};
 use focusforge_core::tile::{HostBudget, Rect};
+use focusforge_core::zmap::overlay_table;
 
 /// What the open renderer cell should do for the frame about to draw --
 /// [`crate::controller::AppController::canvas_feed`]'s answer, decided with
@@ -405,6 +407,25 @@ pub struct EditedView<'a> {
     pub indices: &'a [u16],
     pub map_width: u32,
     pub tiles: &'a ResidentTiles,
+}
+
+/// The `Composite` pane's overlay draw parameters -- the same values
+/// `focusforge-cli retouch --overlay --opacity` blends with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverlayDraw {
+    pub table: Vec<[u8; 3]>,
+    pub alpha: u8,
+}
+
+impl OverlayDraw {
+    /// The overlay's own palette table for `sources` frames, with nothing
+    /// soloed, and `opacity`'s (`0.0..=1.0`) alpha.
+    pub fn for_opacity(sources: u32, opacity: f32) -> Self {
+        Self {
+            table: overlay_table(sources, None),
+            alpha: alpha_from_opacity(opacity),
+        }
+    }
 }
 
 /// Reads every `step`-th row and column of `rect` from an in-memory,
