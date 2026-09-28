@@ -216,7 +216,11 @@ impl Ledger {
     /// CLI) once its run's `finish()` has succeeded. A cancelled or crashed
     /// run's ledger is never discarded here: only a caller that knows its
     /// own run is genuinely done calls this.
+    ///
+    /// Drops `units_log` before removing: some filesystems refuse to
+    /// remove a directory that still holds an open file handle.
     pub fn discard(self) -> Result<(), ResumeError> {
+        drop(self.units_log);
         fs::remove_dir_all(&self.dir).map_err(|source| ResumeError::Io {
             path: self.dir.clone(),
             source,
