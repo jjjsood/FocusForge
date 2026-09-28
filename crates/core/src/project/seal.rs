@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::blob::{self, Plane, StagedBlob, ZSTD_LEVEL};
-use super::checkpoint::Checkpoint;
+use super::checkpoint::{Checkpoint, FuseRecord};
 use super::container::ProjectWriter;
 use super::error::ProjectError;
 use super::manifest::{
@@ -183,6 +183,13 @@ fn seal_staged(
         params: request.params.clone(),
         created_at,
         label: request.label.clone(),
+        fuse: Some(FuseRecord {
+            composite: manifest.composite.clone(),
+            align: manifest.align.clone(),
+            crop: manifest.crop,
+            sources: manifest.sources.clone(),
+            metrics: manifest.metrics,
+        }),
     };
 
     let mut writer = ProjectWriter::create(request.project_path)?;

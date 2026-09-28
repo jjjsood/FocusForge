@@ -42,8 +42,8 @@
 //!
 //! # What this format deliberately does not do
 //!
-//! No undo/redo kept across a session, no checkpoint DAG beyond a single
-//! chain, no branch-from-any-checkpoint, no browser.
+//! No undo/redo kept across a session, no merging two branches, no drawn
+//! tree or graph, no browser.
 //!
 //! # What `core` does not do
 //!
@@ -65,11 +65,11 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 pub use append::{
-    AppendRequest, SNAPSHOT_BYTE_BUDGET, SNAPSHOT_CHECKPOINT_CAP, ZMapChain, ZMapStorage, append,
-    append_at, append_ops, append_ops_at,
+    AppendRequest, Deleted, SNAPSHOT_BYTE_BUDGET, SNAPSHOT_CHECKPOINT_CAP, ZMapChain, ZMapStorage,
+    append, append_at, append_ops, append_ops_at, append_ops_onto, delete_checkpoint,
 };
 pub use blob::{Plane, StagedBlob, hash_file, short_hash, stack_fingerprint};
-pub use checkpoint::{Checkpoint, Op, Point};
+pub use checkpoint::{Checkpoint, FuseRecord, History, Op, Point};
 pub use container::{ProjectWriter, partial_path};
 pub use error::ProjectError;
 pub use manifest::{
@@ -278,7 +278,7 @@ fn materialize_zmap_onto_partial(
 /// them over the base in the order they were originally recorded. Bounded
 /// by `blobs.len()` steps: a chain that has not resolved by then can only be
 /// a cycle, which [`Manifest::blobs`] should never contain.
-fn resolve_chain<'a>(
+pub(super) fn resolve_chain<'a>(
     blobs: &'a [BlobRecord],
     target: &str,
     path: &Path,
@@ -395,11 +395,13 @@ pub struct Project {
     archive: zip::ZipArchive<File>,
     manifest: Manifest,
     checkpoint: Checkpoint,
+    history: History,
 }
 
 impl Project {
-    /// Opens `path`, reads its manifest and its single checkpoint, and
-    /// refuses a `format_version` newer than [`FORMAT_VERSION`].
+    /// Opens `path`, reads its manifest and every checkpoint into a
+    /// validated [`History`], and refuses a `format_version` newer than
+    /// [`FORMAT_VERSION`].
     pub fn open(path: &Path) -> Result<Self, ProjectError> {
         let file = File::open(path).map_err(|source| ProjectError::io(path, source))?;
         let mut archive =
@@ -413,17 +415,25 @@ impl Project {
                 supported: FORMAT_VERSION,
             });
         }
-        let checkpoint: Checkpoint = read_json(
-            &mut archive,
-            path,
-            &format!("checkpoints/{}.json", manifest.checkpoint),
-        )?;
+
+        let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+        let mut checkpoints = Vec::new();
+        for name in names {
+            if let Some(rest) = name.strip_prefix("checkpoints/")
+                && rest.ends_with(".json")
+            {
+                checkpoints.push(read_json::<Checkpoint>(&mut archive, path, &name)?);
+            }
+        }
+        let history = History::build(checkpoints, path)?;
+        let checkpoint = history.get(&manifest.checkpoint)?.clone();
 
         Ok(Project {
             path: path.to_path_buf(),
             archive,
             manifest,
             checkpoint,
+            history,
         })
     }
 
@@ -439,10 +449,59 @@ impl Project {
         &self.checkpoint
     }
 
+    /// Every checkpoint of this project, indexed and validated.
+    pub fn history(&self) -> &History {
+        &self.history
+    }
+
     /// The whole checkpoint chain, head first, walking [`Checkpoint::parent`]
     /// down to the original parentless one.
-    pub fn checkpoint_chain(&mut self) -> Result<Vec<Checkpoint>, ProjectError> {
-        checkpoint_chain_from(&mut self.archive, &self.path, &self.checkpoint.id)
+    pub fn checkpoint_chain(&self) -> Result<Vec<Checkpoint>, ProjectError> {
+        Ok(self
+            .history
+            .ancestors(&self.checkpoint.id)?
+            .into_iter()
+            .cloned()
+            .collect())
+    }
+
+    /// The composite, alignment, crop, sources and metrics of the fuse
+    /// `checkpoint` sits under: the nearest op-less ancestor's own
+    /// [`Checkpoint::fuse`] record, or -- only when that ancestor is also
+    /// the project's current head's fused ancestor -- the manifest's own
+    /// cached copy, for a project written before that field existed.
+    /// [`ProjectError::FuseStateUnknown`] otherwise.
+    pub fn fuse_state(&self, checkpoint: &str) -> Result<FuseRecord, ProjectError> {
+        let ancestor = self.fused_ancestor(checkpoint)?;
+        if let Some(record) = &ancestor.fuse {
+            return Ok(record.clone());
+        }
+        let head_ancestor = self.fused_ancestor(&self.checkpoint.id)?;
+        if ancestor.id == head_ancestor.id {
+            return Ok(FuseRecord {
+                composite: self.manifest.composite.clone(),
+                align: self.manifest.align.clone(),
+                crop: self.manifest.crop,
+                sources: self.manifest.sources.clone(),
+                metrics: self.manifest.metrics,
+            });
+        }
+        Err(ProjectError::FuseStateUnknown {
+            path: self.path.clone(),
+            checkpoint: checkpoint.to_string(),
+        })
+    }
+
+    /// The nearest ancestor of `id` (self included) whose `ops` is empty --
+    /// the checkpoint whose fuse `id`'s Z-Map renders against.
+    fn fused_ancestor(&self, id: &str) -> Result<&Checkpoint, ProjectError> {
+        self.history
+            .ancestors(id)?
+            .into_iter()
+            .find(|c| c.ops.is_empty())
+            .ok_or_else(|| {
+                ProjectError::container(&self.path, "no fused ancestor in the checkpoint chain")
+            })
     }
 
     /// The path from `checkpoint`'s own Z-Map back to its nearest full
@@ -700,36 +759,6 @@ pub(super) fn read_json<T: serde::de::DeserializeOwned>(
         .map_err(|source| ProjectError::io(path, source))?;
     serde_json::from_str(&text)
         .map_err(|err| ProjectError::container(path, format!("{entry}: {err}")))
-}
-
-/// The checkpoint chain reachable from `head_id`, head first: walks
-/// [`Checkpoint::parent`] down to the original parentless checkpoint. A
-/// repeated id names itself in a [`ProjectError::Container`] rather than
-/// looping forever.
-fn checkpoint_chain_from(
-    archive: &mut zip::ZipArchive<File>,
-    path: &Path,
-    head_id: &str,
-) -> Result<Vec<Checkpoint>, ProjectError> {
-    let mut chain = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut current_id = head_id.to_string();
-    loop {
-        if !seen.insert(current_id.clone()) {
-            return Err(ProjectError::container(
-                path,
-                format!("checkpoint chain names {current_id} more than once"),
-            ));
-        }
-        let checkpoint: Checkpoint =
-            read_json(archive, path, &format!("checkpoints/{current_id}.json"))?;
-        let parent = checkpoint.parent.clone();
-        chain.push(checkpoint);
-        match parent {
-            Some(next) => current_id = next,
-            None => return Ok(chain),
-        }
-    }
 }
 
 #[cfg(test)]

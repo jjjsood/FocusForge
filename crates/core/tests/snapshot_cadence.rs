@@ -148,8 +148,11 @@ fn sealed(name: &str, w: u32, h: u32, frames: u32) -> (PathBuf, PathBuf) {
     let sources = write_sources(&dir, 3, w, h);
     let values = params();
     let project_path = dir.join(format!("demo.{}", project::PROJECT_EXTENSION));
-    project::seal(request(&project_path, &composite, &zmap, &sources, &values))
-        .expect("seal must succeed");
+    project::seal_at(
+        request(&project_path, &composite, &zmap, &sources, &values),
+        1_700_000_000,
+    )
+    .expect("seal must succeed");
     (dir, project_path)
 }
 
@@ -229,6 +232,54 @@ fn root_checkpoint_is_always_full() {
         let chain = project.zmap_chain(&head).unwrap();
         assert_eq!(chain.deltas, 0, "{name}: root has no deltas behind it");
     }
+}
+
+#[test]
+fn root_checkpoint_is_always_full_over_a_branched_history() {
+    let (_dir, project_path) = sealed("snapshot_cadence_root_branched", 64, 48, 8);
+    let root_id = Project::open(&project_path)
+        .unwrap()
+        .checkpoint()
+        .id
+        .clone();
+
+    project::append_ops_at(
+        &project_path,
+        vec![stroke(1, 10, 10, 1.0)],
+        None,
+        1_700_000_000,
+        ZMapStorage::Smallest,
+    )
+    .unwrap();
+    project::append_ops_onto(
+        &project_path,
+        &root_id,
+        vec![stroke(2, 30, 20, 1.0)],
+        None,
+        1_700_000_010,
+        ZMapStorage::Smallest,
+    )
+    .unwrap();
+
+    let project = Project::open(&project_path).unwrap();
+    let root = project.history().get(&root_id).unwrap();
+    let record = project
+        .manifest()
+        .blobs
+        .iter()
+        .find(|b| b.hash == root.zmap_blob)
+        .expect("the root's zmap_blob must resolve to a blob record directly");
+    assert_eq!(
+        record.kind,
+        BlobKind::Full,
+        "a branched root must still be full"
+    );
+
+    let chain = project.zmap_chain(root).unwrap();
+    assert_eq!(
+        chain.deltas, 0,
+        "the root has no deltas behind it, branched or not"
+    );
 }
 
 #[test]

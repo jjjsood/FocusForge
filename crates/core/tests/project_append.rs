@@ -247,7 +247,7 @@ fn appending_parents_the_new_checkpoint_on_the_head() {
     let appended = append_once(&dir, &project_path, &sources, 1, 1);
     assert_ne!(appended.checkpoint, first_head);
 
-    let mut project = Project::open(&project_path).unwrap();
+    let project = Project::open(&project_path).unwrap();
     assert_eq!(project.checkpoint().id, appended.checkpoint);
     assert_eq!(
         project.checkpoint().parent.as_deref(),
@@ -281,7 +281,7 @@ fn an_earlier_checkpoint_and_its_blob_survive_an_append() {
         "the first checkpoint's own Z-Map blob must survive: {names:?}"
     );
 
-    let mut project = Project::open(&project_path).unwrap();
+    let project = Project::open(&project_path).unwrap();
     let chain = project.checkpoint_chain().unwrap();
     let root = chain.last().expect("a chain always has a root");
     assert_eq!(root.id, first_head);
@@ -308,7 +308,7 @@ fn the_chain_extends_past_two() {
     assert_ne!(third.checkpoint, second.checkpoint);
     assert_ne!(fourth.checkpoint, third.checkpoint);
 
-    let mut project = Project::open(&project_path).unwrap();
+    let project = Project::open(&project_path).unwrap();
     assert_eq!(project.checkpoint().id, fourth.checkpoint);
     let chain = project.checkpoint_chain().unwrap();
     let ids: Vec<&str> = chain.iter().map(|c| c.id.as_str()).collect();
@@ -326,13 +326,13 @@ fn the_chain_extends_past_two() {
 #[test]
 fn a_single_checkpoint_project_still_opens_and_can_be_appended_to() {
     let (dir, project_path, sources) = sealed("append_legacy");
-    let mut project = Project::open(&project_path).unwrap();
+    let project = Project::open(&project_path).unwrap();
     assert_eq!(project.checkpoint().parent, None);
     assert_eq!(project.checkpoint_chain().unwrap().len(), 1);
     drop(project);
 
     let appended = append_once(&dir, &project_path, &sources, 1, 1);
-    let mut reopened = Project::open(&project_path).unwrap();
+    let reopened = Project::open(&project_path).unwrap();
     assert_eq!(reopened.checkpoint().id, appended.checkpoint);
     assert_eq!(reopened.checkpoint_chain().unwrap().len(), 2);
 }

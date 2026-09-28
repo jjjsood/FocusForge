@@ -96,6 +96,44 @@ pub enum ProjectError {
         expected_width: u32,
         expected_height: u32,
     },
+
+    /// A checkpoint's `parent` names an id no checkpoint in the project
+    /// carries.
+    #[error("{}: checkpoint {checkpoint} names parent {parent}, which is not in this project", path.display())]
+    DanglingParent {
+        path: PathBuf,
+        checkpoint: String,
+        parent: String,
+    },
+
+    /// Walking `parent` links from `checkpoint` returns to a checkpoint
+    /// already on the path -- a cycle rather than a chain.
+    #[error("{}: checkpoint {checkpoint} sits in a parent cycle", path.display())]
+    ParentCycle { path: PathBuf, checkpoint: String },
+
+    /// An id handed to [`super::checkpoint::History::get`] names no
+    /// checkpoint in this project.
+    #[error("{}: no checkpoint named {id}", path.display())]
+    UnknownCheckpoint { path: PathBuf, id: String },
+
+    /// A delete named the project's one root checkpoint, which would leave
+    /// the format's required single checkpoint with nothing to name.
+    #[error(
+        "{}: checkpoint {checkpoint} is the project's root and cannot be deleted",
+        path.display()
+    )]
+    RootDelete { path: PathBuf, checkpoint: String },
+
+    /// `checkpoint`'s nearest fused ancestor carries no [`FuseRecord`] of
+    /// its own and is not the project's current head's fused ancestor, so
+    /// its composite, alignment, crop and sources cannot be recovered.
+    ///
+    /// [`FuseRecord`]: super::checkpoint::FuseRecord
+    #[error(
+        "{}: checkpoint {checkpoint}'s fuse state is unrecorded and cannot be recovered",
+        path.display()
+    )]
+    FuseStateUnknown { path: PathBuf, checkpoint: String },
 }
 
 impl ProjectError {
