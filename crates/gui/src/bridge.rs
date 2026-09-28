@@ -17,7 +17,7 @@ use slint::winit_030::{CustomApplicationHandler, EventResult, WinitWindowAccesso
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
-use crate::canvas::{CanvasFeed, RepaintGate, truncate_pane_label};
+use crate::canvas::{CanvasFeed, PaneSource, RepaintGate, truncate_pane_label};
 use crate::controller::{
     AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, OpenOutcome,
     SettingsSection, ShellEvent, ShellMode,
@@ -267,9 +267,17 @@ pub fn repaint(
         Some((draw, renderer.redraw_planes(&draw)?))
     });
     match redrawn {
-        Some((draw, (composite_image, zmap_image))) => {
-            app.set_composite_source(composite_image);
-            app.set_zmap_source(zmap_image);
+        Some((draw, (image, plane))) => {
+            match plane {
+                PaneSource::Composite => {
+                    app.set_composite_source(image);
+                    app.set_zmap_source(slint::Image::default());
+                }
+                PaneSource::ZMap => {
+                    app.set_zmap_source(image);
+                    app.set_composite_source(slint::Image::default());
+                }
+            }
             app.set_image_x(draw.dst.0);
             app.set_image_y(draw.dst.1);
             app.set_image_w(draw.dst.2);

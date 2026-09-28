@@ -13,7 +13,7 @@ pub use readback::read_display_texture;
 
 use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
 
-use crate::pack::pack_samples;
+use crate::pack::{pack_samples, pack_samples_into};
 use crate::pipeline::{
     Pipeline, build_pipeline, run_pass_2d, storage_entry, storage_texture_entry, uniform_entry,
 };
@@ -175,8 +175,8 @@ fn upload_storage(
 }
 
 /// [`pack_samples`] plus [`upload_storage`], for the `u16` buffers both
-/// [`render`] and [`render_overlay`] send the kernel. Packing is timed and
-/// byte-counted separately from the upload it feeds.
+/// [`DisplayRenderer::render`] and [`render_overlay`] send the kernel.
+/// Packing is timed and byte-counted separately from the upload it feeds.
 fn upload_samples(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -191,62 +191,133 @@ fn upload_samples(
     upload_storage(device, queue, &packed, label)
 }
 
-/// Runs the display kernel: packs `src`'s `u16` samples two-per-`u32`
-/// (`crate::pack::pack_samples`), uploads them as a storage buffer, and
-/// dispatches one invocation per pixel of `target`, writing straight into
-/// it. Calls no `download_*` and creates no `MAP_READ` buffer -- readback
-/// exists only in [`read_display_texture`], for the parity test.
-///
-/// `src.len()` must equal exactly
-/// `target.width() * target.height() * samples_per_pixel`.
-pub fn render(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    target: &DisplayTexture,
-    src: &[u16],
-    samples_per_pixel: u32,
-    index_scale: u32,
-) {
-    let _scope = measurement_scope("gpu_display_render");
-    let src_buffer = upload_samples(device, queue, src, "focusforge-gpu-display-src");
+/// The display kernel's pipeline, params buffer, source buffer and pack
+/// scratch, retained across calls to [`Self::render`] rather than rebuilt
+/// per frame -- one instance per attached device, shared by every pane that
+/// draws through it.
+pub struct DisplayRenderer {
+    pipeline: Pipeline,
+    params_buffer: wgpu::Buffer,
+    source_buffer: Option<wgpu::Buffer>,
+    source_capacity: u64,
+    pack_scratch: Vec<u8>,
+}
 
-    let params = Params {
-        width: target.width(),
-        height: target.height(),
-        samples_per_pixel,
-        index_scale,
-        alpha: 0,
-        table_len: 0,
-    };
-    let params_buffer = crate::pipeline::upload_params(device, queue, &params.to_bytes());
+impl DisplayRenderer {
+    /// Builds the tonemap pipeline and the fixed-size params buffer once;
+    /// the source buffer is created lazily on the first [`Self::render`],
+    /// once its byte length is known.
+    pub fn new(device: &wgpu::Device) -> Self {
+        let pipeline = tonemap_pipeline(device);
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("focusforge-gpu-display-params"),
+            size: 24,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        record_timing(TimingCounter::AllocationBytes, 24);
+        record_timing(TimingCounter::AllocationOperations, 1);
+        Self {
+            pipeline,
+            params_buffer,
+            source_buffer: None,
+            source_capacity: 0,
+            pack_scratch: Vec::new(),
+        }
+    }
 
-    let view = target
-        .texture()
-        .create_view(&wgpu::TextureViewDescriptor::default());
-    let pipeline = tonemap_pipeline(device);
+    /// Keeps the source buffer while `needed <= capacity <= 4 * needed`,
+    /// otherwise re-creates it at exactly `needed` bytes, so after every call
+    /// the retained capacity lies within `[needed, 4 * needed]` of the
+    /// current draw.
+    fn ensure_source_buffer(&mut self, device: &wgpu::Device, needed: u64) {
+        let reuse = self.source_buffer.is_some()
+            && needed <= self.source_capacity
+            && needed * 4 >= self.source_capacity;
+        if reuse {
+            return;
+        }
+        let buffer = create_storage_buffer(device, needed, "focusforge-gpu-display-src");
+        record_timing(TimingCounter::AllocationBytes, needed);
+        record_timing(TimingCounter::AllocationOperations, 1);
+        self.source_buffer = Some(buffer);
+        self.source_capacity = needed;
+    }
 
-    run_pass_2d(
-        device,
-        queue,
-        &pipeline,
-        &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: src_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: params_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(&view),
-            },
-        ],
-        target.width(),
-        target.height(),
-        "focusforge-gpu-display-tonemap",
-    );
+    /// Runs the display kernel: packs `src` (`crate::pack::pack_samples_into`,
+    /// into the retained scratch), uploads it into the retained source
+    /// buffer, and dispatches one invocation per pixel of `target`. Creates
+    /// no `MAP_READ` buffer -- readback exists only in
+    /// [`read_display_texture`]. `src.len()` must equal exactly
+    /// `target.width() * target.height() * samples_per_pixel`.
+    pub fn render(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target: &DisplayTexture,
+        src: &[u16],
+        samples_per_pixel: u32,
+        index_scale: u32,
+    ) {
+        let _scope = measurement_scope("gpu_display_render");
+        let packed_len = {
+            let _scope = measurement_scope("gpu_display_pack");
+            pack_samples_into(src, &mut self.pack_scratch);
+            self.pack_scratch.len() as u64
+        };
+        record_timing(TimingCounter::PackedBytes, packed_len);
+        self.ensure_source_buffer(device, packed_len);
+        {
+            let _scope = measurement_scope("gpu_display_upload");
+            let source_buffer = self
+                .source_buffer
+                .as_ref()
+                .expect("ensure_source_buffer always leaves a buffer set");
+            queue.write_buffer(source_buffer, 0, &self.pack_scratch);
+            record_timing(TimingCounter::UploadBytes, packed_len);
+        }
+
+        let params = Params {
+            width: target.width(),
+            height: target.height(),
+            samples_per_pixel,
+            index_scale,
+            alpha: 0,
+            table_len: 0,
+        };
+        queue.write_buffer(&self.params_buffer, 0, &params.to_bytes());
+
+        let view = target
+            .texture()
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        run_pass_2d(
+            device,
+            queue,
+            &self.pipeline,
+            &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self
+                        .source_buffer
+                        .as_ref()
+                        .expect("ensure_source_buffer always leaves a buffer set")
+                        .as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+            ],
+            target.width(),
+            target.height(),
+            "focusforge-gpu-display-tonemap",
+        );
+    }
 }
 
 /// Blends `table`'s colour for each `indices` entry over `composite` at

@@ -1108,6 +1108,263 @@ fn pane_label_too_long_keeps_its_tail() {
     );
 }
 
+// ---------------------------------------------------------------------
+// Display resource reuse and content-coverage skipping through
+// `CanvasRenderer`, with a real GPU device.
+// ---------------------------------------------------------------------
+
+/// The one composite/Z-Map golden pair under `fixtures/mantis-512/golden`.
+fn golden_plane_files() -> (PathBuf, PathBuf) {
+    let dir = common::workspace_root().join("fixtures/mantis-512/golden");
+    let mut composite = None;
+    let mut zmap = None;
+    for entry in fs::read_dir(&dir).expect("golden directory opens") {
+        let path = entry.expect("golden directory entry reads").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tif") {
+            continue;
+        }
+        if focusforge_core::zmap::ZMapReader::open(&path).is_ok() {
+            assert!(zmap.replace(path).is_none(), "one Z-Map golden is required");
+        } else {
+            assert!(
+                composite.replace(path).is_none(),
+                "one composite golden is required"
+            );
+        }
+    }
+    (
+        composite.expect("composite golden exists"),
+        zmap.expect("Z-Map golden exists"),
+    )
+}
+
+/// A warmup draw, then redraws covering every reuse/skip rule: an identical
+/// draw, a `dst`-only shift, a pan, a zoom, a plane switch to Z-Map and
+/// back, and a `set_planes`/`set_frame` on the unchanged draw -- asserting
+/// each step's own counter deltas, exactly one plane's bytes wherever a
+/// step reads. The golden draw's `src` has an odd width, decimated by a
+/// `step` of 2.
+#[test]
+fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
+    use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
+    use focusforge_gui::canvas::PaneSource;
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+    use focusforge_gui::viewport::PaneDraw;
+    use std::num::NonZeroU32;
+
+    // Timing accounting is process-global, so this runs alone in a child.
+    const CHILD: &str = "FOCUSFORGE_GUI_CANVAS_DISPLAY_REUSE_ACCOUNTING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args([
+            "--exact",
+            "display_resources_are_reused_and_unchanged_content_is_not_reread",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .status()
+        .expect("the isolated accounting test starts");
+        assert!(
+            status.success(),
+            "the isolated accounting test passes: {status}"
+        );
+        return;
+    }
+
+    enable_trace_accounting();
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+
+    let (composite_path, zmap_path) = golden_plane_files();
+    let frame_path = common::fixture_frame("mantis-64", 0);
+
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    renderer
+        .set_planes(&composite_path, &zmap_path)
+        .expect("golden planes open");
+    renderer
+        .set_frame(&frame_path)
+        .expect("fixture frame opens");
+
+    let golden = PaneDraw {
+        src: (3, 5, 37, 23),
+        dst: (0.0, 0.0, 37.0, 23.0),
+        pixelated: false,
+        step: NonZeroU32::new(2).unwrap(),
+    };
+    assert!(
+        golden.src.2 % 2 == 1,
+        "the golden draw must carry an odd width"
+    );
+
+    let samples_per_pixel = |path: &Path| {
+        let stack = focusforge_core::io::TiffStack::open_files(&[path.to_path_buf()])
+            .expect("fixture TIFF opens");
+        u64::from(stack.header(0).samples_per_pixel)
+    };
+    let composite_spp = samples_per_pixel(&composite_path);
+    let frame_spp = samples_per_pixel(&frame_path);
+    let zmap_spp = 1;
+
+    let counters = || {
+        let s = timing_snapshot().expect("trace accounting is enabled");
+        (
+            s.pipeline_creations,
+            s.allocation_operations,
+            s.sample_bytes,
+            s.converted_bytes,
+            s.upload_bytes,
+        )
+    };
+    type Counters = (u64, u64, u64, u64, u64);
+    let assert_steady = |before: Counters, after: Counters, label: &str| {
+        assert_eq!(
+            after.0 - before.0,
+            0,
+            "{label}: pipeline_creations must not grow"
+        );
+        assert_eq!(
+            after.1 - before.1,
+            0,
+            "{label}: allocation_operations must not grow"
+        );
+        assert_eq!(after.2 - before.2, 0, "{label}: sample_bytes must not grow");
+    };
+    let assert_nothing_read = |before: Counters, after: Counters, label: &str| {
+        assert_eq!(
+            after.3 - before.3,
+            0,
+            "{label}: converted_bytes must not grow"
+        );
+        assert_eq!(after.4 - before.4, 0, "{label}: upload_bytes must not grow");
+    };
+    // Exactly one plane's `draw.extent()` read as `u16` samples and uploaded
+    // packed two per `u32` word, the odd tail padded to a whole word.
+    let assert_one_plane =
+        |before: Counters, after: Counters, draw: &PaneDraw, spp: u64, label: &str| {
+            let (width, height) = draw.extent();
+            let samples = u64::from(width) * u64::from(height) * spp;
+            assert_eq!(
+                after.0 - before.0,
+                0,
+                "{label}: pipeline_creations must not grow"
+            );
+            assert_eq!(
+                after.3 - before.3,
+                samples * 2,
+                "{label}: converted_bytes must be exactly one plane's samples"
+            );
+            assert_eq!(
+                after.4 - before.4,
+                samples.div_ceil(2) * 4,
+                "{label}: upload_bytes must be exactly one plane's packed words"
+            );
+        };
+
+    // Warmup: builds the retained pipeline/buffers/scratch and both panes'
+    // own coverage.
+    assert!(renderer.redraw_planes(&golden).is_some());
+    assert!(renderer.redraw_frame(&golden).is_some());
+
+    // 1. An identical draw: no read, no upload, no allocation.
+    let before = counters();
+    assert!(renderer.redraw_planes(&golden).is_some());
+    assert!(renderer.redraw_frame(&golden).is_some());
+    let after = counters();
+    assert_steady(before, after, "identical draw");
+    assert_nothing_read(before, after, "identical draw");
+
+    // 2. A dst-only shift: same src/step, different placement -- still no
+    // read/upload, whatever dst/pixelated now are.
+    let shifted = PaneDraw {
+        dst: (10.0, 4.0, 37.0, 23.0),
+        pixelated: true,
+        ..golden
+    };
+    let before = counters();
+    assert!(renderer.redraw_planes(&shifted).is_some());
+    assert!(renderer.redraw_frame(&shifted).is_some());
+    let after = counters();
+    assert_steady(before, after, "dst-only shift");
+    assert_nothing_read(before, after, "dst-only shift");
+
+    // 3. A pan to a different src of the same extent: reads and uploads
+    // exactly the selected (composite) plane, then exactly the frame.
+    let panned = PaneDraw {
+        src: (4, 6, 37, 23),
+        dst: golden.dst,
+        ..golden
+    };
+    let before = counters();
+    assert!(renderer.redraw_planes(&panned).is_some());
+    let after = counters();
+    assert_one_plane(before, after, &panned, composite_spp, "pan");
+
+    let before = counters();
+    assert!(renderer.redraw_frame(&panned).is_some());
+    let after = counters();
+    assert_one_plane(before, after, &panned, frame_spp, "pan (frame)");
+
+    // 4. A zoom to a different step: reads and uploads again.
+    let zoomed = PaneDraw {
+        step: NonZeroU32::new(1).unwrap(),
+        ..panned
+    };
+    let before = counters();
+    assert!(renderer.redraw_planes(&zoomed).is_some());
+    let after = counters();
+    assert_one_plane(before, after, &zoomed, composite_spp, "zoom");
+
+    // 5. Selecting the Z-Map plane for the first time at this content reads
+    // and uploads exactly it.
+    renderer.select_plane(PaneSource::ZMap);
+    let before = counters();
+    let (_, plane) = renderer.redraw_planes(&zoomed).expect("Z-Map plane draws");
+    assert_eq!(plane, PaneSource::ZMap);
+    let after = counters();
+    assert_one_plane(before, after, &zoomed, zmap_spp, "first Z-Map select");
+
+    // Selecting back to Composite at the same content is a no-op: its own
+    // coverage is still current, and the Z-Map is not touched either.
+    renderer.select_plane(PaneSource::Composite);
+    let before = counters();
+    let (_, plane) = renderer
+        .redraw_planes(&zoomed)
+        .expect("composite plane draws");
+    assert_eq!(plane, PaneSource::Composite);
+    let after = counters();
+    assert_steady(before, after, "select back to composite");
+    assert_nothing_read(before, after, "select back to composite");
+
+    // 6. `set_planes` on the unchanged draw invalidates both panes' own
+    // coverage; the next draw (composite still selected) re-reads exactly
+    // that one plane.
+    renderer
+        .set_planes(&composite_path, &zmap_path)
+        .expect("golden planes re-open");
+    let before = counters();
+    let (_, plane) = renderer
+        .redraw_planes(&zoomed)
+        .expect("composite plane draws again");
+    assert_eq!(plane, PaneSource::Composite);
+    let after = counters();
+    assert_one_plane(before, after, &zoomed, composite_spp, "post set_planes");
+
+    // 7. `set_frame` on the frame's unchanged draw invalidates its coverage;
+    // the next frame draw re-reads exactly the frame.
+    renderer
+        .set_frame(&frame_path)
+        .expect("fixture frame re-opens");
+    let before = counters();
+    assert!(renderer.redraw_frame(&panned).is_some());
+    let after = counters();
+    assert_one_plane(before, after, &panned, frame_spp, "post set_frame");
+}
+
 #[test]
 fn pane_label_at_the_budget_passes_through_unchanged() {
     let at_budget = "829-IMG_9800.tif";

@@ -10,7 +10,9 @@ use focusforge_core::io::TiffStack;
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{NO_SOURCE, ZMapReader, overlay_table};
 use focusforge_gpu::device::shared_device_or_skip;
-use focusforge_gpu::display::{DisplayTexture, read_display_texture, render, render_overlay};
+use focusforge_gpu::display::{
+    DisplayRenderer, DisplayTexture, read_display_texture, render_overlay,
+};
 
 use crate::common;
 
@@ -58,8 +60,9 @@ fn tonemap_matches_cpu() {
         .read_tile_into(0, rect, &mut composite_samples)
         .expect("read golden composite");
 
+    let mut renderer = DisplayRenderer::new(shared.device());
     let target = DisplayTexture::new(shared.device(), width, height);
-    render(
+    renderer.render(
         shared.device(),
         shared.queue(),
         &target,
@@ -96,7 +99,7 @@ fn tonemap_matches_cpu() {
     assert_eq!(index_scale, 9362, "frames=8 -> 65535 / 7");
 
     let ztarget = DisplayTexture::new(shared.device(), zwidth, zheight);
-    render(
+    renderer.render(
         shared.device(),
         shared.queue(),
         &ztarget,
@@ -168,12 +171,13 @@ fn tonemap_matches_cpu_above_the_one_dimensional_dispatch_ceiling() {
         }
     }
 
+    let mut renderer = DisplayRenderer::new(shared.device());
     for (label, src, spp, scale) in [
         ("composite", &samples, 3u32, 0u32),
         ("zmap", &indices, 1, index_scale),
     ] {
         let target = DisplayTexture::new(shared.device(), width, height);
-        render(shared.device(), shared.queue(), &target, src, spp, scale);
+        renderer.render(shared.device(), shared.queue(), &target, src, spp, scale);
         let gpu_bytes = read_display_texture(shared.device(), shared.queue(), &target);
         let mut cpu_bytes = vec![0u8; (width * height * 4) as usize];
         tonemap_cpu(src, width, height, spp, scale, &mut cpu_bytes);
@@ -219,8 +223,9 @@ fn tonemap_matches_cpu_at_the_extremes() {
         chunk[2] = v;
     }
 
+    let mut renderer = DisplayRenderer::new(shared.device());
     let target = DisplayTexture::new(shared.device(), width, height);
-    render(shared.device(), shared.queue(), &target, &samples, 3, 0);
+    renderer.render(shared.device(), shared.queue(), &target, &samples, 3, 0);
     let gpu_bytes = read_display_texture(shared.device(), shared.queue(), &target);
 
     let mut cpu_bytes = vec![0u8; total_pixels * 4];
@@ -239,6 +244,52 @@ fn tonemap_matches_cpu_at_the_extremes() {
         cpu_bytes[white_pixel_byte], 255,
         "65535 must reduce to 255 (full white)"
     );
+}
+
+/// One [`DisplayRenderer`] reused across a large RGB draw, a small mono draw
+/// with an odd sample count, and back to a mid-size RGB draw -- a
+/// source-buffer shrink and grow plus a channel-count switch, all through
+/// the one retained state. Every draw stays bit-exact against `tonemap_cpu`.
+#[test]
+fn a_reused_renderer_matches_cpu_after_shrinking_and_switching_channels() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+    let mut renderer = DisplayRenderer::new(shared.device());
+
+    // (width, height, samples_per_pixel, index_scale) -- 77x13 = 1001
+    // samples, odd.
+    let draws: [(u32, u32, u32, u32); 3] =
+        [(2563, 2565, 3, 0), (77, 13, 1, 9362), (512, 512, 3, 0)];
+
+    for (width, height, spp, scale) in draws {
+        let total = (width * height * spp) as usize;
+        let samples: Vec<u16> = (0..total).map(|i| (i % 65536) as u16).collect();
+
+        let target = DisplayTexture::new(shared.device(), width, height);
+        renderer.render(
+            shared.device(),
+            shared.queue(),
+            &target,
+            &samples,
+            spp,
+            scale,
+        );
+        let gpu_bytes = read_display_texture(shared.device(), shared.queue(), &target);
+
+        let mut cpu_bytes = vec![0u8; (width * height * 4) as usize];
+        tonemap_cpu(&samples, width, height, spp, scale, &mut cpu_bytes);
+
+        let (worst, worst_index) = worst_delta(&gpu_bytes, &cpu_bytes);
+        println!(
+            "reused renderer {width}x{height} spp={spp}: worst |delta|={worst} at byte index \
+             {worst_index}"
+        );
+        assert_eq!(
+            worst, 0,
+            "expected bit-exact agreement -- integer-only on both sides"
+        );
+    }
 }
 
 /// The overlay entry point against `overlay_cpu`, on a crop of the golden
