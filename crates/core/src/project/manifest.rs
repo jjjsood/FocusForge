@@ -105,7 +105,8 @@ pub enum ByteOrderTag {
 /// One content-addressed blob. The blob-kind commitment is [`Self::kind`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlobRecord {
-    /// blake3 of the **uncompressed** bytes, hex.
+    /// blake3 of the **uncompressed** bytes, hex -- this blob's own entry
+    /// name, `blobs/<hash>.zst`.
     pub hash: String,
     /// Commitment 2. Never `#[serde(default)]`: a record without it is
     /// refused on open rather than silently read as `full`.
@@ -114,15 +115,28 @@ pub struct BlobRecord {
     pub compression: String,
     pub uncompressed_len: u64,
     pub compressed_len: u64,
+    /// [`BlobKind::SparseDelta`] only: the content hash of the map this
+    /// blob is a patch against. Additive, so a `full` record's JSON carries
+    /// neither this nor [`Self::target`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// [`BlobKind::SparseDelta`] only: the content hash of the map this
+    /// blob decodes to, applied over [`Self::base`]'s own materialized map --
+    /// never a checkpoint id and never an entry name of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
-/// What a blob contains. `#[non_exhaustive]` so a variant such as
-/// `SparseDelta` can be added without breaking existing matches.
+/// What a blob contains. `#[non_exhaustive]` so a future variant can be
+/// added without breaking existing matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum BlobKind {
     Full,
+    /// A patch against [`BlobRecord::base`]'s materialized map, decoding to
+    /// [`BlobRecord::target`].
+    SparseDelta,
 }
 
 /// One source frame, referenced -- never embedded.

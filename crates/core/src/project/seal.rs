@@ -29,7 +29,7 @@ use super::manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
     SourceResolution,
 };
-use super::{FORMAT_VERSION, HASH_ALGORITHM};
+use super::{HASH_ALGORITHM, format_version_for};
 use crate::params::ParamValues;
 use crate::tile::Rect;
 
@@ -137,9 +137,10 @@ fn seal_staged(
     let composite_record = record(&composite);
     let zmap_record = record(&zmap);
     let checkpoint_id = Checkpoint::derive_id(&stack_fingerprint, &zmap.hash, created_at);
+    let blobs = blob_records(&composite_record, &zmap_record);
 
     let manifest = Manifest {
-        format_version: FORMAT_VERSION,
+        format_version: format_version_for(&blobs),
         producer: format!("FocusForge {}", env!("CARGO_PKG_VERSION")),
         created_at,
         hash_algorithm: HASH_ALGORITHM.to_string(),
@@ -166,7 +167,7 @@ fn seal_staged(
             description: request.composite_description.clone(),
             frame_count,
         },
-        blobs: blob_records(&composite_record, &zmap_record),
+        blobs,
         metrics: request.metrics,
         checkpoint: checkpoint_id.clone(),
         crop: request.crop,
@@ -327,6 +328,8 @@ pub(super) fn record(blob: &StagedBlob) -> BlobRecord {
         compression: "zstd".to_string(),
         uncompressed_len: blob.uncompressed_len,
         compressed_len: blob.compressed_len,
+        base: None,
+        target: None,
     }
 }
 

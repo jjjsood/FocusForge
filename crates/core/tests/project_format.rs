@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::{
-    self, BlobKind, Checkpoint, FORMAT_VERSION, HASH_ALGORITHM, Metrics, Op, Plane, Point, Project,
-    SealRequest, SourceResolution, blob,
+    self, BlobKind, Checkpoint, FORMAT_VERSION, FULL_ONLY_FORMAT_VERSION, HASH_ALGORITHM, Metrics,
+    Op, Plane, Point, Project, SealRequest, SourceResolution, blob,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
@@ -235,7 +235,9 @@ fn container_layout_is_exactly_the_named_entries() {
 fn manifest_carries_a_format_version() {
     let (_dir, project_path) = sealed("project_format_version");
     let project = Project::open(&project_path).unwrap();
-    assert_eq!(project.manifest().format_version, FORMAT_VERSION);
+    // A fresh seal writes only `full` blobs, so it stays at the version an
+    // older, delta-unaware build still understands.
+    assert_eq!(project.manifest().format_version, FULL_ONLY_FORMAT_VERSION);
 
     // Present as a real JSON key, not merely as a Rust field: the promise
     // is about the bytes on disk.
@@ -251,7 +253,10 @@ fn manifest_carries_a_format_version() {
             .unwrap();
     }
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(value["format_version"], serde_json::json!(FORMAT_VERSION));
+    assert_eq!(
+        value["format_version"],
+        serde_json::json!(FULL_ONLY_FORMAT_VERSION)
+    );
     assert_eq!(value["hash_algorithm"], serde_json::json!(HASH_ALGORITHM));
 }
 

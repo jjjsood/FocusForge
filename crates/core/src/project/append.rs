@@ -22,10 +22,12 @@ use super::blob::{self, Plane, StagedBlob, ZSTD_LEVEL};
 use super::checkpoint::Checkpoint;
 use super::container::ProjectWriter;
 use super::error::ProjectError;
-use super::manifest::{AlignRecord, ByteOrderTag, Manifest, Metrics, PlaneRef};
+use super::manifest::{
+    AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef,
+};
 use super::read_json;
 use super::seal::{now_unix, record, source_ref};
-use super::{FORMAT_VERSION, HASH_ALGORITHM, Op, Project, SealedProject, materialize_zmap};
+use super::{HASH_ALGORITHM, Op, Project, SealedProject, format_version_for, materialize_zmap};
 use crate::params::ParamValues;
 use crate::retouch::{replay, write_edited};
 use crate::tile::Rect;
@@ -133,7 +135,7 @@ fn append_staged(
     }
 
     let manifest = Manifest {
-        format_version: FORMAT_VERSION,
+        format_version: format_version_for(&blobs),
         producer: format!("FocusForge {}", env!("CARGO_PKG_VERSION")),
         created_at,
         hash_algorithm: HASH_ALGORITHM.to_string(),
@@ -241,28 +243,44 @@ fn copy_forward(
     Ok(())
 }
 
+/// Whether [`append_ops`] stores a checkpoint's Z-Map as a patch against its
+/// parent's materialized map (whichever compresses smaller) or always
+/// stores it in full. Callers other than [`append_ops`] itself decide when
+/// each is appropriate; this type only names the two mechanisms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZMapStorage {
+    /// Store whichever of a full map and a patch against the parent
+    /// compresses smaller.
+    Smallest,
+    /// Always store the full map.
+    Full,
+}
+
 /// Seals `ops` as a new checkpoint onto `project_path`'s head, stamping the
 /// current wall clock. Refuses an empty list ([`ProjectError::EmptyOpList`])
 /// rather than writing an op-less checkpoint with no composite. Sources are
 /// never opened or rehashed: the new checkpoint's `stack_fingerprint`,
 /// `algorithm` and `params` are carried forward from the head unchanged, and
 /// the manifest's `composite` keeps naming the fused ancestor's plane -- only
-/// a new Z-Map blob is written.
+/// a new Z-Map blob is written, as whichever of [`ZMapStorage::Smallest`]'s
+/// two encodings compresses smaller.
 pub fn append_ops(
     project_path: &Path,
     ops: Vec<Op>,
     label: Option<String>,
 ) -> Result<SealedProject, ProjectError> {
-    append_ops_at(project_path, ops, label, now_unix())
+    append_ops_at(project_path, ops, label, now_unix(), ZMapStorage::Smallest)
 }
 
 /// [`append_ops`] with the creation timestamp supplied rather than read from
-/// the clock.
+/// the clock, and the Z-Map storage choice supplied rather than always
+/// [`ZMapStorage::Smallest`].
 pub fn append_ops_at(
     project_path: &Path,
     ops: Vec<Op>,
     label: Option<String>,
     created_at: i64,
+    storage: ZMapStorage,
 ) -> Result<SealedProject, ProjectError> {
     if ops.is_empty() {
         return Err(ProjectError::EmptyOpList {
@@ -283,7 +301,7 @@ pub fn append_ops_at(
     let staging = dir.join(staging_name);
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|err| ProjectError::io(&staging, err))?;
-    let result = append_ops_staged(project_path, &ops, label, created_at, &staging);
+    let result = append_ops_staged(project_path, &ops, label, created_at, &staging, storage);
     let _ = std::fs::remove_dir_all(&staging);
     result
 }
@@ -294,6 +312,7 @@ fn append_ops_staged(
     label: Option<String>,
     created_at: i64,
     staging: &Path,
+    storage: ZMapStorage,
 ) -> Result<SealedProject, ProjectError> {
     let mut project = Project::open(project_path)?;
     let head = project.checkpoint().clone();
@@ -367,19 +386,57 @@ fn append_ops_staged(
             .map_err(|err| ProjectError::container(&new_zmap_path, err))?;
     }
 
-    let zmap = blob::stage_plane(&new_zmap_path, Plane::ZMap, ZSTD_LEVEL, staging)?;
-    let zmap_record = record(&zmap);
+    let full = blob::stage_plane(&new_zmap_path, Plane::ZMap, ZSTD_LEVEL, staging)?;
+
+    // A patch against the parent's own materialized map, kept only when it
+    // compresses smaller than storing the whole map again -- never for
+    // `ZMapStorage::Full`, and never when the edit touched nearly every
+    // pixel, which a patch cannot beat.
+    let delta = match storage {
+        ZMapStorage::Smallest => {
+            let delta = blob::stage_delta(
+                info.width(),
+                info.height(),
+                tile,
+                &indices,
+                ZSTD_LEVEL,
+                staging,
+            )?;
+            (delta.compressed_len < full.compressed_len).then_some(delta)
+        }
+        ZMapStorage::Full => None,
+    };
+
+    let (stored, stored_record) = match &delta {
+        Some(delta) => (
+            delta,
+            BlobRecord {
+                hash: delta.hash.clone(),
+                kind: BlobKind::SparseDelta,
+                compression: "zstd".to_string(),
+                uncompressed_len: delta.uncompressed_len,
+                compressed_len: delta.compressed_len,
+                base: Some(head.zmap_blob.clone()),
+                target: Some(full.hash.clone()),
+            },
+        ),
+        None => (&full, record(&full)),
+    };
 
     let checkpoint_id =
-        Checkpoint::derive_child_id(&head.id, &head.stack_fingerprint, &zmap.hash, created_at);
+        Checkpoint::derive_child_id(&head.id, &head.stack_fingerprint, &full.hash, created_at);
 
     let mut blobs = manifest.blobs.clone();
-    if !blobs.iter().any(|b| b.hash == zmap_record.hash) {
-        blobs.push(zmap_record.clone());
+    let already_present = blobs.iter().any(|b| {
+        b.hash == stored_record.hash
+            || (stored_record.target.is_some() && b.target == stored_record.target)
+    });
+    if !already_present {
+        blobs.push(stored_record.clone());
     }
 
     let new_manifest = Manifest {
-        format_version: manifest.format_version,
+        format_version: format_version_for(&blobs),
         producer: manifest.producer.clone(),
         created_at,
         hash_algorithm: manifest.hash_algorithm.clone(),
@@ -390,7 +447,7 @@ fn append_ops_staged(
         sources: manifest.sources.clone(),
         composite: manifest.composite.clone(),
         zmap: PlaneRef {
-            blob: zmap.hash.clone(),
+            blob: full.hash.clone(),
             ..manifest.zmap.clone()
         },
         blobs,
@@ -403,7 +460,7 @@ fn append_ops_staged(
         id: checkpoint_id.clone(),
         parent: Some(head.id.clone()),
         ops: ops.to_vec(),
-        zmap_blob: zmap.hash.clone(),
+        zmap_blob: full.hash.clone(),
         stack_fingerprint: head.stack_fingerprint.clone(),
         algorithm: head.algorithm.clone(),
         params: head.params.clone(),
@@ -421,7 +478,7 @@ fn append_ops_staged(
         .map_err(|err| ProjectError::container(project_path, err))?;
     writer.add_text("manifest.json", &manifest_text)?;
     copy_forward(&mut old_archive, &mut writer, project_path)?;
-    writer.add_blob(&zmap.hash, &zmap.path)?;
+    writer.add_blob(&stored.hash, &stored.path)?;
     let checkpoint_text = serde_json::to_string_pretty(&checkpoint)
         .map_err(|err| ProjectError::container(project_path, err))?;
     writer.add_text(
@@ -440,7 +497,7 @@ fn append_ops_staged(
     Ok(SealedProject {
         path,
         composite: composite_record,
-        zmap: zmap_record,
+        zmap: stored_record,
         checkpoint: checkpoint_id,
     })
 }

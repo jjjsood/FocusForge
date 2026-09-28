@@ -67,6 +67,35 @@ pub enum ProjectError {
     /// checkpoint sealing nothing is not a real record.
     #[error("{}: an empty op list cannot be sealed", path.display())]
     EmptyOpList { path: PathBuf },
+
+    /// A stored patch names a base blob that has no record in this project
+    /// -- neither a full map nor a further patch. `blob` is the patch's own
+    /// hash, `base` the missing one it names.
+    #[error(
+        "{}: blob {blob} names base {base}, which is not present in this project",
+        path.display()
+    )]
+    PatchBaseMissing {
+        path: PathBuf,
+        blob: String,
+        base: String,
+    },
+
+    /// A stored patch's own declared map shape does not match this
+    /// project's Z-Map plane -- refused rather than applied.
+    #[error(
+        "{}: blob {blob} declares a {found_width}x{found_height} map, but this project's \
+         Z-Map is {expected_width}x{expected_height}",
+        path.display()
+    )]
+    PatchGeometryMismatch {
+        path: PathBuf,
+        blob: String,
+        found_width: u32,
+        found_height: u32,
+        expected_width: u32,
+        expected_height: u32,
+    },
 }
 
 impl ProjectError {

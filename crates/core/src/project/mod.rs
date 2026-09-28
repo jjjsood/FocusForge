@@ -43,7 +43,7 @@
 //! # What this format deliberately does not do
 //!
 //! No undo/redo kept across a session, no checkpoint DAG beyond a single
-//! chain, no sparse deltas, no branch-from-any-checkpoint, no browser.
+//! chain, no branch-from-any-checkpoint, no browser.
 //!
 //! # What `core` does not do
 //!
@@ -64,7 +64,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-pub use append::{AppendRequest, append, append_at, append_ops, append_ops_at};
+pub use append::{AppendRequest, ZMapStorage, append, append_at, append_ops, append_ops_at};
 pub use blob::{Plane, StagedBlob, hash_file, short_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, Op, Point};
 pub use container::{ProjectWriter, partial_path};
@@ -86,10 +86,10 @@ pub fn materialize_plane(
     which: Plane,
     path: &Path,
 ) -> Result<(), ProjectError> {
-    let plane_ref = project.plane(which).clone();
-    let partial = partial_path(path);
     match which {
         Plane::Composite => {
+            let plane_ref = project.plane(which).clone();
+            let partial = partial_path(path);
             let writer = crate::io::TiffWriter::create(
                 &partial,
                 crate::io::TiffSpec {
@@ -102,16 +102,12 @@ pub fn materialize_plane(
             .map_err(|err| ProjectError::container(&partial, err))?;
             stream_plane(project, which, &partial, path, writer)
         }
+        // The head's own Z-Map may be stored as a chain of patches over an
+        // ancestor's materialized map -- exactly what `materialize_zmap`
+        // already resolves for any checkpoint, head included.
         Plane::ZMap => {
-            let info = crate::zmap::ZMapInfo::new(
-                plane_ref.width,
-                plane_ref.height,
-                plane_ref.frame_count,
-            )
-            .map_err(|err| ProjectError::container(&partial, err))?;
-            let writer = crate::zmap::ZMapWriter::create(&partial, info)
-                .map_err(|err| ProjectError::container(&partial, err))?;
-            stream_plane(project, which, &partial, path, writer)
+            let head = project.checkpoint().clone();
+            materialize_zmap(project, &head, path)
         }
     }
 }
@@ -150,57 +146,187 @@ fn stream_plane<W: PlaneWriter>(
     writer: W,
 ) -> Result<(), ProjectError> {
     let plane_ref = project.plane(which).clone();
-    stream_plane_ref(project, &plane_ref, partial, final_path, writer)
+    let outcome = stream_bands(project, &plane_ref, final_path, writer)
+        .and_then(|writer| {
+            writer
+                .finish()
+                .map_err(|err| ProjectError::container(final_path, err))
+        })
+        .and_then(|()| {
+            std::fs::rename(partial, final_path).map_err(|err| ProjectError::io(final_path, err))
+        });
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(partial);
+    }
+    outcome
 }
 
-/// Streams a Z-Map that is not necessarily the project's head: `checkpoint`
-/// names its own `zmap_blob`, read against the manifest's declared shape.
-/// What a `ResetRegion` needs to replay against an ancestor other than the
-/// immediate parent.
-pub fn materialize_zmap(
-    project: &mut Project,
-    checkpoint: &Checkpoint,
-    path: &Path,
-) -> Result<(), ProjectError> {
-    let mut plane_ref = project.manifest().zmap.clone();
-    plane_ref.blob = checkpoint.zmap_blob.clone();
-    let partial = partial_path(path);
-    let info = crate::zmap::ZMapInfo::new(plane_ref.width, plane_ref.height, plane_ref.frame_count)
-        .map_err(|err| ProjectError::container(&partial, err))?;
-    let writer = crate::zmap::ZMapWriter::create(&partial, info)
-        .map_err(|err| ProjectError::container(&partial, err))?;
-    stream_plane_ref(project, &plane_ref, &partial, path, writer)
-}
-
-fn stream_plane_ref<W: PlaneWriter>(
+/// The `read_plane_ref_into`/`write_tile` loop [`stream_plane`] and
+/// [`materialize_zmap`] both drive, stopping short of `finish()` -- the
+/// step where their two callers part ways: one renames the `.partial`
+/// immediately afterward, the other still has patches to apply to it first.
+fn stream_bands<W: PlaneWriter>(
     project: &mut Project,
     plane_ref: &PlaneRef,
-    partial: &Path,
     final_path: &Path,
     mut writer: W,
-) -> Result<(), ProjectError> {
+) -> Result<W, ProjectError> {
     let mut failure: Option<String> = None;
-    let read = project.read_plane_ref_into(plane_ref, &mut |band, rect| {
+    project.read_plane_ref_into(plane_ref, &mut |band, rect| {
         if failure.is_some() {
             return;
         }
         if let Err(err) = writer.write_tile(rect, band) {
             failure = Some(err);
         }
-    });
-    let outcome = read.and_then(|()| match failure {
+    })?;
+    match failure {
         Some(err) => Err(ProjectError::container(final_path, err)),
-        None => writer
-            .finish()
-            .map_err(|err| ProjectError::container(final_path, err)),
-    });
-    let outcome = outcome.and_then(|()| {
-        std::fs::rename(partial, final_path).map_err(|err| ProjectError::io(final_path, err))
-    });
+        None => Ok(writer),
+    }
+}
+
+/// Streams a Z-Map that is not necessarily the project's head: `checkpoint`
+/// names its own `zmap_blob`, resolved against [`Manifest::blobs`] to
+/// either a `full` record read directly or a chain of `sparse-delta`
+/// records patched, oldest first, over their materialized base -- never
+/// more than one full map resident at a time. What a `ResetRegion` needs to
+/// replay against an ancestor other than the immediate parent, and what
+/// [`materialize_plane`]`(Plane::ZMap)` delegates to for the head.
+pub fn materialize_zmap(
+    project: &mut Project,
+    checkpoint: &Checkpoint,
+    path: &Path,
+) -> Result<(), ProjectError> {
+    let plane_ref = project.manifest().zmap.clone();
+    let blobs = project.manifest().blobs.clone();
+    let (base, deltas) = resolve_chain(&blobs, &checkpoint.zmap_blob, project.path())?;
+
+    let mut base_ref = plane_ref.clone();
+    base_ref.blob = base.hash.clone();
+
+    let partial = partial_path(path);
+    let info = crate::zmap::ZMapInfo::new(plane_ref.width, plane_ref.height, plane_ref.frame_count)
+        .map_err(|err| ProjectError::container(&partial, err))?;
+    let writer = crate::zmap::ZMapWriter::create(&partial, info)
+        .map_err(|err| ProjectError::container(&partial, err))?;
+
+    let outcome = materialize_zmap_onto_partial(
+        project, &base_ref, &deltas, &plane_ref, path, &partial, writer,
+    );
     if outcome.is_err() {
-        let _ = std::fs::remove_file(partial);
+        let _ = std::fs::remove_file(&partial);
     }
     outcome
+}
+
+fn materialize_zmap_onto_partial(
+    project: &mut Project,
+    base_ref: &PlaneRef,
+    deltas: &[&BlobRecord],
+    plane_ref: &PlaneRef,
+    final_path: &Path,
+    partial: &Path,
+    writer: crate::zmap::ZMapWriter<File>,
+) -> Result<(), ProjectError> {
+    let writer = stream_bands(project, base_ref, final_path, writer)?;
+    writer
+        .finish()
+        .map_err(|err| ProjectError::container(final_path, err))?;
+
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: plane_ref.width,
+        height: plane_ref.height,
+    };
+    let info = crate::zmap::ZMapInfo::new(plane_ref.width, plane_ref.height, plane_ref.frame_count)
+        .map_err(|err| ProjectError::container(final_path, err))?;
+
+    for delta in deltas {
+        let bytes = project.read_blob_whole(&delta.hash)?;
+        let decoded = blob::decode_delta(&bytes, final_path)?;
+        if decoded.map_width != plane_ref.width || decoded.map_height != plane_ref.height {
+            return Err(ProjectError::PatchGeometryMismatch {
+                path: final_path.to_path_buf(),
+                blob: delta.hash.clone(),
+                found_width: decoded.map_width,
+                found_height: decoded.map_height,
+                expected_width: plane_ref.width,
+                expected_height: plane_ref.height,
+            });
+        }
+        let mut patch_writer = crate::zmap::ZMapWriter::reopen(partial, info)
+            .map_err(|err| ProjectError::container(final_path, err))?;
+        patch_writer.seed_coverage(whole);
+        patch_writer
+            .write_tile(decoded.tile, &decoded.indices)
+            .map_err(|err| ProjectError::container(final_path, err))?;
+        patch_writer
+            .finish()
+            .map_err(|err| ProjectError::container(final_path, err))?;
+    }
+
+    std::fs::rename(partial, final_path).map_err(|err| ProjectError::io(final_path, err))
+}
+
+/// The one full [`BlobRecord`] `target` resolves to, plus every
+/// `sparse-delta` on the path to it, **oldest first** -- so a caller applies
+/// them over the base in the order they were originally recorded. Bounded
+/// by `blobs.len()` steps: a chain that has not resolved by then can only be
+/// a cycle, which [`Manifest::blobs`] should never contain.
+fn resolve_chain<'a>(
+    blobs: &'a [BlobRecord],
+    target: &str,
+    path: &Path,
+) -> Result<(&'a BlobRecord, Vec<&'a BlobRecord>), ProjectError> {
+    let mut newest_first: Vec<&BlobRecord> = Vec::new();
+    let mut current = target.to_string();
+    for _ in 0..=blobs.len() {
+        if let Some(full) = blobs
+            .iter()
+            .find(|b| b.kind == BlobKind::Full && b.hash == current)
+        {
+            let mut deltas = newest_first;
+            deltas.reverse();
+            return Ok((full, deltas));
+        }
+        let delta = blobs.iter().find(|b| {
+            b.kind == BlobKind::SparseDelta && b.target.as_deref() == Some(current.as_str())
+        });
+        match delta {
+            Some(delta) => {
+                let base = delta.base.clone().ok_or_else(|| {
+                    ProjectError::container(
+                        path,
+                        format!(
+                            "blob {} is stored as a patch with no base of its own",
+                            delta.hash
+                        ),
+                    )
+                })?;
+                newest_first.push(delta);
+                current = base;
+            }
+            None => {
+                return match newest_first.last() {
+                    Some(prev) => Err(ProjectError::PatchBaseMissing {
+                        path: path.to_path_buf(),
+                        blob: prev.hash.clone(),
+                        base: current,
+                    }),
+                    None => Err(ProjectError::container(
+                        path,
+                        format!("no blob record names {current}"),
+                    )),
+                };
+            }
+        }
+    }
+    Err(ProjectError::container(
+        path,
+        format!("blob {current} sits in a chain longer than this project's own blob list"),
+    ))
 }
 
 use crate::params::{ParamDesc, ParamKind, ParamValue};
@@ -229,7 +355,24 @@ pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
 /// The on-disk format version this build writes and reads. A project
 /// declaring a **higher** one is refused by name rather than
 /// half-understood; a lower one is accepted.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
+
+/// The format version a project keeps writing as long as every blob it
+/// holds is [`BlobKind::Full`] -- what stays openable by a build that has
+/// never heard of [`BlobKind::SparseDelta`].
+pub const FULL_ONLY_FORMAT_VERSION: u32 = 1;
+
+/// [`FULL_ONLY_FORMAT_VERSION`] while `blobs` holds only [`BlobKind::Full`]
+/// records, [`FORMAT_VERSION`] the moment any of them is not -- the format
+/// version decision folded into one place so every writer stamps the same
+/// answer.
+pub(crate) fn format_version_for(blobs: &[BlobRecord]) -> u32 {
+    if blobs.iter().all(|b| b.kind == BlobKind::Full) {
+        FULL_ONLY_FORMAT_VERSION
+    } else {
+        FORMAT_VERSION
+    }
+}
 
 /// The project file's extension.
 pub const PROJECT_EXTENSION: &str = "ffp";
@@ -365,8 +508,89 @@ impl Project {
         which: Plane,
         sink: &mut impl FnMut(&[u16], Rect),
     ) -> Result<(), ProjectError> {
+        if which == Plane::ZMap {
+            let head = self.checkpoint.clone();
+            let stored_whole = self
+                .manifest
+                .blobs
+                .iter()
+                .any(|b| b.kind == BlobKind::Full && b.hash == head.zmap_blob);
+            if !stored_whole {
+                return self.read_zmap_head_via_materialize(&head, sink);
+            }
+        }
         let plane = self.plane(which).clone();
         self.read_plane_ref_into(&plane, sink)
+    }
+
+    /// [`Self::read_plane_into`]`(Plane::ZMap)` when the head is stored as a
+    /// patch chain: materializes it into a uniquely named temp file (there
+    /// is no blob entry named by `zmap_blob` to stream directly), streams
+    /// that file back out in bands, then removes it either way.
+    fn read_zmap_head_via_materialize(
+        &mut self,
+        head: &Checkpoint,
+        sink: &mut impl FnMut(&[u16], Rect),
+    ) -> Result<(), ProjectError> {
+        let temp = std::env::temp_dir().join(format!(
+            "focusforge-zmap-{}-{}.tif",
+            std::process::id(),
+            head.zmap_blob
+        ));
+        let result = materialize_zmap(self, head, &temp).and_then(|()| {
+            let reader = crate::zmap::ZMapReader::open(&temp)
+                .map_err(|err| ProjectError::container(&temp, err))?;
+            let (width, height) = reader.dimensions();
+            let row_samples = width as usize;
+            let rows = (READ_BAND_BYTES / (row_samples * 2)).clamp(1, height as usize) as u32;
+            let mut buf = vec![0u16; row_samples * rows as usize];
+            let mut y = 0;
+            while y < height {
+                let band_rows = rows.min(height - y);
+                let rect = Rect {
+                    x: 0,
+                    y,
+                    width,
+                    height: band_rows,
+                };
+                let len = row_samples * band_rows as usize;
+                reader
+                    .read_tile_into(rect, &mut buf[..len])
+                    .map_err(|err| ProjectError::container(&temp, err))?;
+                sink(&buf[..len], rect);
+                y += band_rows;
+            }
+            Ok(())
+        });
+        let _ = std::fs::remove_file(&temp);
+        result
+    }
+
+    /// Reads and zstd-decompresses one blob entry whole, verifying its
+    /// blake3 hash against `expected_hash` -- for a patch blob, small
+    /// enough to hold entirely in memory unlike a payload plane's own
+    /// banded read.
+    fn read_blob_whole(&mut self, expected_hash: &str) -> Result<Vec<u8>, ProjectError> {
+        let entry = format!("blobs/{expected_hash}.zst");
+        let file = self
+            .archive
+            .by_name(&entry)
+            .map_err(|err| ProjectError::container(&self.path, format!("{entry}: {err}")))?;
+        let mut decoder = zstd::stream::read::Decoder::new(file)
+            .map_err(|source| ProjectError::io(&self.path, source))?;
+        let mut bytes = Vec::new();
+        decoder
+            .read_to_end(&mut bytes)
+            .map_err(|source| ProjectError::io(&self.path, source))?;
+        let actual = blake3::hash(&bytes).to_hex().to_string();
+        if actual != expected_hash {
+            return Err(ProjectError::HashMismatch {
+                path: self.path.clone(),
+                blob: expected_hash.to_string(),
+                actual,
+            });
+        }
+        Ok(bytes)
     }
 
     /// [`Self::read_plane_into`]'s body, over an arbitrary [`PlaneRef`]
