@@ -50,6 +50,7 @@ use crate::params::ParamValue;
 use super::fingerprint::{FrameFingerprint, StackFingerprint};
 use super::ledger::{ResumeError, write_atomic};
 use super::record::AlignIdentity;
+use crate::io::RawIdentity;
 
 /// The current on-disk entry format. Bump this, never the field shapes
 /// below, when an entry's meaning changes in a way an older reader must not
@@ -123,6 +124,8 @@ pub struct FrameKey {
     pub samples_per_pixel: u32,
     pub strip_offsets: Vec<u64>,
     pub strip_byte_counts: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_identity: Option<RawIdentity>,
 }
 
 impl From<&FrameFingerprint> for FrameKey {
@@ -135,6 +138,7 @@ impl From<&FrameFingerprint> for FrameKey {
             samples_per_pixel: fp.samples_per_pixel,
             strip_offsets: fp.strip_offsets.clone(),
             strip_byte_counts: fp.strip_byte_counts.clone(),
+            raw_identity: fp.raw_identity.clone(),
         }
     }
 }

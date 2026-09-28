@@ -1091,7 +1091,14 @@ pub fn uniform_check(frames: &[(&str, &FrameDesc)]) -> (bool, Option<String>) {
 
     let mut outlier_detail = outlier.1.layout_label.clone();
     for i in 2..outlier.1.layout_signature.len() {
-        if outlier.1.layout_signature[i] != majority_desc.1.layout_signature[i] {
+        if outlier.1.layout_signature[i]
+            != majority_desc
+                .1
+                .layout_signature
+                .get(i)
+                .map(String::as_str)
+                .unwrap_or("")
+        {
             outlier_detail.push('/');
             outlier_detail.push_str(&outlier.1.layout_signature[i]);
         }
@@ -1102,4 +1109,53 @@ pub fn uniform_check(frames: &[(&str, &FrameDesc)]) -> (bool, Option<String>) {
         outlier.0, outlier_detail, majority_desc.1.layout_label
     );
     (false, Some(detail))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn desc(label: &str, signature: &[&str]) -> FrameDesc {
+        FrameDesc {
+            path: label.into(),
+            file_size: 0,
+            image_description: None,
+            width: 1,
+            height: 1,
+            samples_per_pixel: 1,
+            strip_offsets: Vec::new(),
+            strip_byte_counts: Vec::new(),
+            raw_identity: None,
+            layout_label: signature[..2.min(signature.len())].join("/"),
+            layout_signature: signature.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn uniform_check_reports_raw_geometry_in_both_majority_directions_and_ties() {
+        let raw = desc("raw", &["raw/dng", "output=8x8"]);
+        let tiff = desc("tiff", &["II", "rps=1", "compression=1", "8x8"]);
+        let raw_other = desc("raw-other", &["raw/dng", "output=4x3"]);
+        for (frames, outlier) in [
+            (
+                vec![("raw", &raw), ("raw-again", &raw), ("tiff", &tiff)],
+                "tiff",
+            ),
+            (
+                vec![("tiff", &tiff), ("tiff-again", &tiff), ("raw", &raw)],
+                "raw",
+            ),
+            (vec![("raw", &raw), ("tiff", &tiff)], "raw"),
+            (vec![("tiff", &tiff), ("raw", &raw)], "tiff"),
+            (vec![("raw", &raw), ("raw-other", &raw_other)], "raw"),
+        ] {
+            let (uniform, detail) = uniform_check(&frames);
+            assert!(!uniform);
+            let detail = detail.expect("mixed layouts have a detail");
+            assert!(detail.contains(outlier));
+            if outlier == "raw" {
+                assert!(detail.contains("output="));
+            }
+        }
+    }
 }
