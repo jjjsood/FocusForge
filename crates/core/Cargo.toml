@@ -32,6 +32,7 @@ zstd = "0.14"
 tracing-subscriber = "0.3.23"
 tempfile = "3"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+sha2 = "0.10"
 
 [dependencies]
 blake3 = { version = "1.8.7", features = ["mmap", "rayon"] }
@@ -39,6 +40,7 @@ flate2 = "1.1.10"
 inventory = "0.3.24"
 memmap2 = "0.9.11"
 rayon = "1.12"
+rawler = "=0.8.0"
 thiserror = "2.0.20"
 tracing = "0.1.44"
 weezl = "0.1.12"

@@ -45,6 +45,10 @@ allow = ["BSL-1.0"]
 name = "libfuzzer-sys"
 allow = ["MIT", "Apache-2.0", "NCSA"]
 
+[[licenses.exceptions]]
+name = "rawler"
+allow = ["LGPL-2.1"]
+
 # Reached only through Slint; no fixed version exists. Revisit on a Slint bump.
 [advisories]
 ignore = [

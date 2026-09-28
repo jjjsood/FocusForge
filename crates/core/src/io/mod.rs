@@ -18,6 +18,7 @@ mod error;
 mod frame;
 mod frame_set;
 mod grouping;
+pub mod raw;
 #[cfg(feature = "test-algorithms")]
 pub mod test_frames;
 pub(crate) mod tiff;
@@ -30,6 +31,7 @@ pub use grouping::{
     CaptureTime, GROUP_GAP, Group, GroupSignal, Proposal, capture_time, one_group, propose,
     propose_with_progress,
 };
+pub use raw::{DEFAULT_RAW_CACHE_BYTES, RawError, RawMetadata, RawStack};
 pub use tiff::decoded::{CacheStats, DecodedTiffStack};
 pub use tiff::header::{ByteOrder, TiffHeader};
 pub use tiff::segment::{DecodedSegment, SegmentOrigin, TiffSegmentDecoder, TiffSegmentReader};

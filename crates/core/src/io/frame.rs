@@ -29,6 +29,9 @@ pub enum FrameError {
     /// A read through a TIFF-backed reader failed.
     #[error(transparent)]
     Tiff(#[from] crate::io::TiffError),
+    /// A read through a RAW-backed reader failed.
+    #[error(transparent)]
+    Raw(#[from] crate::io::RawError),
 }
 
 /// An opened set of frames and its tile-shaped pixel source.
