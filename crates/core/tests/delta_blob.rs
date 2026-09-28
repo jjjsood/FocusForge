@@ -574,12 +574,13 @@ fn missing_parent_blob_is_refused() {
             "uncompressed_len": 1, "compressed_len": 1,
             "base": base_hash, "target": target_hash,
         }),
-        None,
+        Some((delta_hash.as_str(), b"filler".to_vec())),
     );
 
-    let mut project = Project::open(&corrupt).unwrap();
-    let out = dir.join("missing-parent-out.tif");
-    let err = project::materialize_plane(&mut project, Plane::ZMap, &out).unwrap_err();
+    let err = match Project::open(&corrupt) {
+        Ok(_) => panic!("a corrupted head chain must be refused"),
+        Err(err) => err,
+    };
     match err {
         ProjectError::PatchBaseMissing { blob, base, .. } => {
             assert_eq!(blob, delta_hash);
@@ -587,8 +588,6 @@ fn missing_parent_blob_is_refused() {
         }
         other => panic!("expected PatchBaseMissing, got {other:?}"),
     }
-    assert!(!out.exists(), "no output file may be left");
-    assert!(!partial_path(&out).exists(), "no .partial may be left");
 }
 
 #[test]

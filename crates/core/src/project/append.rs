@@ -219,16 +219,19 @@ fn append_staged(
 /// Refuses (naming the missing blob) when the manifest declares a blob that
 /// has no matching zip entry -- what a raw [`copy_forward`] would otherwise
 /// silently drop, since it only ever copies entries that are actually there.
-fn verify_blobs_present(
+pub(super) fn verify_blobs_present(
     old_archive: &mut zip::ZipArchive<File>,
     old_manifest: &Manifest,
     path: &Path,
 ) -> Result<(), ProjectError> {
     for blob in &old_manifest.blobs {
         let name = format!("blobs/{}.zst", blob.hash);
-        old_archive
-            .by_name(&name)
-            .map_err(|err| ProjectError::container(path, format!("{name}: {err}")))?;
+        if old_archive.index_for_name(&name).is_none() {
+            return Err(ProjectError::MissingEntry {
+                path: path.to_path_buf(),
+                entry: name,
+            });
+        }
     }
     Ok(())
 }

@@ -288,6 +288,10 @@ enum Command {
     /// checkpoints. Every history operation is reachable through this
     /// command, headless.
     History {
+        /// Accept a project whose recorded source frames' content changed
+        /// since it was written, printing a warning instead of refusing.
+        #[arg(long = "accept-changed-sources", global = true)]
+        accept_changed_sources: bool,
         #[command(subcommand)]
         command: history::HistoryCommand,
     },
@@ -519,7 +523,10 @@ fn main() -> ExitCode {
             solo,
             json,
         ),
-        Command::History { command } => history::run(command),
+        Command::History {
+            command,
+            accept_changed_sources,
+        } => history::run(command, accept_changed_sources),
         Command::Align {
             dir,
             algo,
@@ -842,6 +849,12 @@ fn fail(message: impl std::fmt::Display) -> ExitCode {
     eprintln!("error: {message}");
     tracing::error!(target: MIRRORED_OUTPUT_TARGET, "error: {message}");
     ExitCode::FAILURE
+}
+
+fn fail_with_code(message: impl std::fmt::Display, code: u8) -> ExitCode {
+    eprintln!("error: {message}");
+    tracing::error!(target: MIRRORED_OUTPUT_TARGET, "error: {message}");
+    ExitCode::from(code)
 }
 
 #[cfg(test)]

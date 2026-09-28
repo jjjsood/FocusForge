@@ -58,9 +58,10 @@ pub mod error;
 pub mod manifest;
 pub mod review;
 pub mod seal;
+pub mod validate;
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -79,6 +80,9 @@ pub use manifest::{
 };
 pub use review::ReviewMetrics;
 pub use seal::{HeldCheckpoint, SealRequest, SealedProject, now_unix, seal, seal_at, seal_held};
+pub use validate::{
+    FingerprintMismatch, Opened, PendingProject, SourceCheck, Validation, check_sources,
+};
 
 /// Decompresses `which` into an uncompressed TIFF (the composite) or Z-Map
 /// file at `path`: writes a `.partial` sibling first and renames it onto
@@ -319,10 +323,10 @@ pub(super) fn resolve_chain<'a>(
                         blob: prev.hash.clone(),
                         base: current,
                     }),
-                    None => Err(ProjectError::container(
-                        path,
-                        format!("no blob record names {current}"),
-                    )),
+                    None => Err(ProjectError::MissingEntry {
+                        path: path.to_path_buf(),
+                        entry: format!("blobs/{current}.zst"),
+                    }),
                 };
             }
         }
@@ -397,25 +401,76 @@ pub struct Project {
     manifest: Manifest,
     checkpoint: Checkpoint,
     history: History,
+    /// Every blob hashed since open, in the order it was read: `(hash,
+    /// uncompressed bytes)`. Verification is lazy -- a blob outside this
+    /// list has not been checked yet.
+    verified: Vec<(String, u64)>,
+    /// The fingerprint mismatch [`PendingProject::proceed`] accepted to
+    /// produce this project, carried forward as a warning.
+    accepted_mismatch: Option<FingerprintMismatch>,
+}
+
+/// `manifest.json`'s `format_version` field alone, probed before the full
+/// [`Manifest`] parse so a future manifest that also renamed or dropped a
+/// field still gets [`ProjectError::FormatVersion`] rather than a generic
+/// parse failure.
+#[derive(serde::Deserialize)]
+struct ManifestVersionProbe {
+    format_version: u32,
 }
 
 impl Project {
-    /// Opens `path`, reads its manifest and every checkpoint into a
-    /// validated [`History`], and refuses a `format_version` newer than
-    /// [`FORMAT_VERSION`].
+    /// Opens `path`: refuses a foreign file, a truncated container or an
+    /// unsupported `format_version`; refuses a structurally broken history
+    /// (a missing blob, an unresolvable Z-Map chain, a `stack_fingerprint`
+    /// disagreeing with its sources); verifies the head's own Z-Map chain
+    /// by hash. Never reads a source frame.
     pub fn open(path: &Path) -> Result<Self, ProjectError> {
-        let file = File::open(path).map_err(|source| ProjectError::io(path, source))?;
-        let mut archive =
-            zip::ZipArchive::new(file).map_err(|err| ProjectError::container(path, err))?;
+        let mut file = File::open(path).map_err(|source| ProjectError::io(path, source))?;
+        let mut magic = [0u8; 4];
+        match file.read_exact(&mut magic) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(ProjectError::NotAProject {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(source) => return Err(ProjectError::io(path, source)),
+        }
+        if magic != *b"PK\x03\x04" && magic != *b"PK\x05\x06" {
+            return Err(ProjectError::NotAProject {
+                path: path.to_path_buf(),
+            });
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|source| ProjectError::io(path, source))?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|_| ProjectError::Truncated {
+            path: path.to_path_buf(),
+        })?;
 
-        let manifest: Manifest = read_json(&mut archive, path, "manifest.json")?;
-        if manifest.format_version > FORMAT_VERSION {
+        if archive.index_for_name("manifest.json").is_none() {
+            return Err(ProjectError::NotAProject {
+                path: path.to_path_buf(),
+            });
+        }
+        let mut manifest_text = String::new();
+        archive
+            .by_name("manifest.json")
+            .map_err(|err| ProjectError::container(path, format!("manifest.json: {err}")))?
+            .read_to_string(&mut manifest_text)
+            .map_err(|source| ProjectError::io(path, source))?;
+
+        if let Ok(probe) = serde_json::from_str::<ManifestVersionProbe>(&manifest_text)
+            && probe.format_version > FORMAT_VERSION
+        {
             return Err(ProjectError::FormatVersion {
                 path: path.to_path_buf(),
-                found: manifest.format_version,
+                found: probe.format_version,
                 supported: FORMAT_VERSION,
             });
         }
+        let manifest: Manifest = serde_json::from_str(&manifest_text)
+            .map_err(|err| ProjectError::container(path, format!("manifest.json: {err}")))?;
 
         let names: Vec<String> = archive.file_names().map(str::to_string).collect();
         let mut checkpoints = Vec::new();
@@ -427,15 +482,98 @@ impl Project {
             }
         }
         let history = History::build(checkpoints, path)?;
-        let checkpoint = history.get(&manifest.checkpoint)?.clone();
+        let checkpoint = history
+            .get(&manifest.checkpoint)
+            .map_err(|_| ProjectError::MissingEntry {
+                path: path.to_path_buf(),
+                entry: format!("checkpoints/{}.json", manifest.checkpoint),
+            })?
+            .clone();
 
-        Ok(Project {
+        append::verify_blobs_present(&mut archive, &manifest, path)?;
+        for c in history.all() {
+            resolve_chain(&manifest.blobs, &c.zmap_blob, path)?;
+            match &c.fuse {
+                Some(fuse) => {
+                    if !manifest.blobs.iter().any(|b| b.hash == fuse.composite.blob) {
+                        return Err(ProjectError::MissingEntry {
+                            path: path.to_path_buf(),
+                            entry: format!("blobs/{}.zst", fuse.composite.blob),
+                        });
+                    }
+                    if c.stack_fingerprint != blob::stack_fingerprint(&fuse.sources) {
+                        return Err(ProjectError::FingerprintDisagrees {
+                            path: path.to_path_buf(),
+                            checkpoint: c.id.clone(),
+                        });
+                    }
+                }
+                // A checkpoint with no fuse record and no ops is a fused
+                // checkpoint written before `Checkpoint::fuse` existed --
+                // its own fingerprint cannot be checked against anything.
+                None if c.ops.is_empty() => {}
+                None => {
+                    let Some(parent_id) = c.parent.as_deref() else {
+                        return Err(ProjectError::OpsWithoutParent {
+                            path: path.to_path_buf(),
+                            checkpoint: c.id.clone(),
+                        });
+                    };
+                    let parent = history.get(parent_id)?;
+                    if c.stack_fingerprint != parent.stack_fingerprint {
+                        return Err(ProjectError::FingerprintDisagrees {
+                            path: path.to_path_buf(),
+                            checkpoint: c.id.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        if manifest.stack_fingerprint != checkpoint.stack_fingerprint
+            || manifest.stack_fingerprint != blob::stack_fingerprint(&manifest.sources)
+        {
+            return Err(ProjectError::FingerprintDisagrees {
+                path: path.to_path_buf(),
+                checkpoint: checkpoint.id.clone(),
+            });
+        }
+
+        let (base, deltas) = resolve_chain(&manifest.blobs, &checkpoint.zmap_blob, path)?;
+        let mut base_ref = manifest.zmap.clone();
+        base_ref.blob = base.hash.clone();
+        let delta_hashes: Vec<String> = deltas.iter().map(|d| d.hash.clone()).collect();
+
+        let mut project = Project {
             path: path.to_path_buf(),
             archive,
             manifest,
             checkpoint,
             history,
-        })
+            verified: Vec::new(),
+            accepted_mismatch: None,
+        };
+        project.read_plane_ref_into(&base_ref, &mut |_, _| {})?;
+        for hash in &delta_hashes {
+            project.read_blob_whole(hash)?;
+        }
+        Ok(project)
+    }
+
+    /// Every blob hashed since open, in the order it was verified: `(hash,
+    /// uncompressed bytes)`. Verification is lazy, so a blob this project
+    /// has not read yet is not in this list.
+    pub fn verified_blobs(&self) -> &[(String, u64)] {
+        &self.verified
+    }
+
+    /// The fingerprint mismatch a [`PendingProject::proceed`] accepted to
+    /// produce this project, plus the count of sources this project cannot
+    /// resolve, as data rather than a printed message.
+    pub fn validation(&self) -> Validation {
+        Validation {
+            unresolved_sources: self.unresolved_sources().count(),
+            accepted_mismatch: self.accepted_mismatch.clone(),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -668,6 +806,8 @@ impl Project {
                 actual,
             });
         }
+        self.verified
+            .push((expected_hash.to_string(), bytes.len() as u64));
         Ok(bytes)
     }
 
@@ -743,6 +883,7 @@ impl Project {
                 actual,
             });
         }
+        self.verified.push((plane.blob.clone(), total));
         Ok(())
     }
 }

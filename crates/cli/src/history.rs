@@ -97,12 +97,16 @@ pub struct DeleteArgs {
     json: bool,
 }
 
-pub fn run(command: HistoryCommand) -> ExitCode {
+pub fn run(command: HistoryCommand, accept_changed_sources: bool) -> ExitCode {
     match command {
-        HistoryCommand::List(args) => list(&args.project, args.json),
-        HistoryCommand::Materialize(args) => {
-            materialize(&args.project, &args.checkpoint, &args.output, args.json)
-        }
+        HistoryCommand::List(args) => list(&args.project, args.json, accept_changed_sources),
+        HistoryCommand::Materialize(args) => materialize(
+            &args.project,
+            &args.checkpoint,
+            &args.output,
+            args.json,
+            accept_changed_sources,
+        ),
         HistoryCommand::Apply(args) => apply(
             &args.project,
             &args.ops,
@@ -110,14 +114,96 @@ pub fn run(command: HistoryCommand) -> ExitCode {
             args.save,
             args.output.as_deref(),
             args.json,
+            accept_changed_sources,
         ),
         HistoryCommand::Delete(args) => delete(
             &args.project,
             &args.checkpoint,
             args.with_descendants,
             args.json,
+            accept_changed_sources,
         ),
     }
+}
+
+/// Maps a refusal to its own exit code: 3 not a project, 4 truncated, 5 a
+/// `format_version` this build does not understand, 6 a missing entry, 7 a
+/// blob hash mismatch, 8 a structural link failure (a dangling parent, a
+/// parent cycle, a fingerprint disagreement, a missing patch base, ops with
+/// no parent to record them against). Anything else stays the generic 1.
+fn exit_code_for(err: &ProjectError) -> u8 {
+    match err {
+        ProjectError::NotAProject { .. } => 3,
+        ProjectError::Truncated { .. } => 4,
+        ProjectError::FormatVersion { .. } => 5,
+        ProjectError::MissingEntry { .. } => 6,
+        ProjectError::HashMismatch { .. } => 7,
+        ProjectError::DanglingParent { .. }
+        | ProjectError::ParentCycle { .. }
+        | ProjectError::FingerprintDisagrees { .. }
+        | ProjectError::PatchBaseMissing { .. }
+        | ProjectError::OpsWithoutParent { .. } => 8,
+        _ => 1,
+    }
+}
+
+/// `#<index> <path>` for each changed source, comma-separated -- what both
+/// the exit-9 refusal and an accepted mismatch's warning name.
+fn describe_changed(changed: &[(usize, PathBuf)]) -> String {
+    changed
+        .iter()
+        .map(|(index, path)| format!("#{index} {}", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Opens `project_path` the way every user-facing `history` subcommand does:
+/// [`Project::open_checked`], printing every warning it carries on stderr,
+/// and refusing on its own exit code rather than the generic one. A changed
+/// source exits 9 naming `--accept-changed-sources` unless
+/// `accept_changed_sources` is set, in which case it is accepted and its own
+/// warning line takes the refusal's place.
+fn open_for_history(
+    project_path: &Path,
+    accept_changed_sources: bool,
+) -> Result<Project, ExitCode> {
+    let opened = Project::open_checked(project_path)
+        .map_err(|err| fail_with_code(err.to_string(), exit_code_for(&err)))?;
+    let project = match opened {
+        project::Opened::Ready(project) => project,
+        project::Opened::NeedsChoice(pending) => {
+            if !accept_changed_sources {
+                return Err(fail_with_code(
+                    format!(
+                        "{} source frame(s) changed since this project was written: {} -- pass \
+                         --accept-changed-sources to proceed anyway; its Z-Map indices would \
+                         select pixels from frames it was not stacked from",
+                        pending.changed().len(),
+                        describe_changed(pending.changed()),
+                    ),
+                    9,
+                ));
+            }
+            pending.proceed()
+        }
+    };
+    let validation = project.validation();
+    if validation.unresolved_sources > 0 {
+        eprintln!(
+            "warning: {} source frame(s) unresolved -- the history and Z-Map are intact; \
+             viewing an edited checkpoint's image or re-fusing needs them",
+            validation.unresolved_sources
+        );
+    }
+    if let Some(mismatch) = &validation.accepted_mismatch {
+        eprintln!(
+            "warning: {} source frame(s) changed since this project was written: {} -- its \
+             Z-Map indices may select pixels from frames it was not stacked from",
+            mismatch.changed.len(),
+            describe_changed(&mismatch.changed),
+        );
+    }
+    Ok(project)
 }
 
 /// Resolves `id_or_prefix` to exactly one checkpoint of `history`: an exact
@@ -186,10 +272,10 @@ struct ListDocument {
     checkpoints: Vec<CheckpointRecord>,
 }
 
-fn list(project_path: &Path, json: bool) -> ExitCode {
-    let project = match Project::open(project_path) {
+fn list(project_path: &Path, json: bool, accept_changed_sources: bool) -> ExitCode {
+    let project = match open_for_history(project_path, accept_changed_sources) {
         Ok(project) => project,
-        Err(err) => return fail(err),
+        Err(exit) => return exit,
     };
     let checkpoints: Vec<CheckpointRecord> = project
         .history()
@@ -233,14 +319,20 @@ struct MaterializeReport {
     wall_seconds: f64,
 }
 
-fn materialize(project_path: &Path, checkpoint_id: &str, output: &Path, json: bool) -> ExitCode {
+fn materialize(
+    project_path: &Path,
+    checkpoint_id: &str,
+    output: &Path,
+    json: bool,
+    accept_changed_sources: bool,
+) -> ExitCode {
     let start = Instant::now();
     if let Err(exit) = refuse_if_names_project(output, project_path) {
         return exit;
     }
-    let mut project = match Project::open(project_path) {
+    let mut project = match open_for_history(project_path, accept_changed_sources) {
         Ok(project) => project,
-        Err(err) => return fail(err),
+        Err(exit) => return exit,
     };
     let checkpoint = match resolve_checkpoint(project.history(), project_path, checkpoint_id) {
         Ok(checkpoint) => checkpoint.clone(),
@@ -317,6 +409,7 @@ fn apply(
     save: bool,
     output: Option<&Path>,
     json: bool,
+    accept_changed_sources: bool,
 ) -> ExitCode {
     let start = Instant::now();
     if !save && output.is_none() {
@@ -338,9 +431,9 @@ fn apply(
     let ops_count = ops.len();
 
     let from_id = {
-        let project = match Project::open(project_path) {
+        let project = match open_for_history(project_path, accept_changed_sources) {
             Ok(project) => project,
-            Err(err) => return fail(err),
+            Err(exit) => return exit,
         };
         match from {
             Some(prefix) => match resolve_checkpoint(project.history(), project_path, prefix) {
@@ -428,11 +521,12 @@ fn delete(
     checkpoint_id: &str,
     with_descendants: bool,
     json: bool,
+    accept_changed_sources: bool,
 ) -> ExitCode {
     let target = {
-        let project = match Project::open(project_path) {
+        let project = match open_for_history(project_path, accept_changed_sources) {
             Ok(project) => project,
-            Err(err) => return fail(err),
+            Err(exit) => return exit,
         };
         let target = match resolve_checkpoint(project.history(), project_path, checkpoint_id) {
             Ok(checkpoint) => checkpoint.id.clone(),
@@ -475,4 +569,8 @@ fn delete(
 
 fn fail(message: impl std::fmt::Display) -> ExitCode {
     crate::fail(message)
+}
+
+fn fail_with_code(message: impl std::fmt::Display, code: u8) -> ExitCode {
+    crate::fail_with_code(message, code)
 }

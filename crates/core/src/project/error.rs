@@ -134,6 +134,44 @@ pub enum ProjectError {
         path.display()
     )]
     FuseStateUnknown { path: PathBuf, checkpoint: String },
+
+    /// `path` is not a FocusForge project: not a zip at all, or a zip with
+    /// no `manifest.json`.
+    #[error("{}: is not a FocusForge project", path.display())]
+    NotAProject { path: PathBuf },
+
+    /// `path` carries a valid zip signature but its central directory
+    /// cannot be read -- the file was cut short.
+    #[error(
+        "{}: is truncated or incomplete -- the file was cut short",
+        path.display()
+    )]
+    Truncated { path: PathBuf },
+
+    /// `entry` is named by a record -- a blob, a checkpoint -- but is not in
+    /// the container.
+    #[error("{}: is missing {entry}, which it references", path.display())]
+    MissingEntry { path: PathBuf, entry: String },
+
+    /// `checkpoint`'s own `stack_fingerprint` disagrees with the sources it
+    /// is recorded against: an op-bearing checkpoint's with its parent's, a
+    /// fused checkpoint's with its own [`FuseRecord::sources`], or the
+    /// manifest's with the head's and its own [`super::Manifest::sources`].
+    ///
+    /// [`FuseRecord::sources`]: super::checkpoint::FuseRecord::sources
+    #[error(
+        "{}: checkpoint {checkpoint}'s stack_fingerprint disagrees with the sources it is recorded against",
+        path.display()
+    )]
+    FingerprintDisagrees { path: PathBuf, checkpoint: String },
+
+    /// A checkpoint carries ops but no `fuse` record and no `parent` --
+    /// there is nothing for its `stack_fingerprint` to be checked against.
+    #[error(
+        "{}: checkpoint {checkpoint} carries ops but has no parent to record them against",
+        path.display()
+    )]
+    OpsWithoutParent { path: PathBuf, checkpoint: String },
 }
 
 impl ProjectError {
