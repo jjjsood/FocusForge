@@ -143,27 +143,29 @@ fn info_reports_local_canon_cr3() {
         return;
     };
     let samples = std::path::PathBuf::from(samples);
-    for (directory, model, geometry, crop, black, white, expected_capture) in [
+    for (directory, file, model, geometry, crop, black, white, expected_capture) in [
         (
             "canon-r5-mark-ii",
+            "canon-eos-r5-mark-ii_2026-09-26_125359.cr3",
             "EOS R5 Mark II",
             (8480, 5650, 8192, 5464),
             (272, 176),
             512.0,
             14888,
-            1790423639,
+            1790427239,
         ),
         (
             "canon-r7",
+            "canon-eos-r7_2025-01-10_220452.cr3",
             "EOS R7",
             (7128, 4732, 6960, 4640),
             (156, 84),
             2047.0,
             12735,
-            1736543092,
+            1736546692,
         ),
     ] {
-        let path = samples.join(directory).join("sample.cr3");
+        let path = samples.join(directory).join(file);
         assert!(
             path.is_file(),
             "configured local RAW sample is missing: {}",

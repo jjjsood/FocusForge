@@ -18,6 +18,11 @@ pub struct DngSpec {
     pub header_dimensions: Option<[u32; 2]>,
     /// Omit ImageWidth to exercise named metadata refusal.
     pub omit_width: bool,
+    pub capture_time: Option<String>,
+    pub modify_time: Option<String>,
+    pub serial_number: Option<String>,
+    pub make: String,
+    pub model: String,
     pub samples: Vec<u16>,
 }
 
@@ -34,6 +39,11 @@ impl DngSpec {
             active_area: None,
             header_dimensions: None,
             omit_width: false,
+            capture_time: None,
+            modify_time: None,
+            serial_number: None,
+            make: "FocusForge Test".to_string(),
+            model: "Synthetic Bayer".to_string(),
             samples,
         }
     }
@@ -62,20 +72,21 @@ pub fn write_dng(spec: &DngSpec, truncate_payload: bool) -> NamedTempFile {
         (1, 1),
     ];
     let [header_width, header_height] = spec.header_dimensions.unwrap_or([spec.width, spec.height]);
+    let has_exif = spec.capture_time.is_some() || spec.serial_number.is_some();
     let mut entries = vec![
         Entry::long(257, &[spec.height]),
         Entry::short(258, &[spec.bits]),
         Entry::short(259, &[1]),
         Entry::short(262, &[32803]),
-        Entry::ascii(271, "FocusForge Test"),
-        Entry::ascii(272, "Synthetic Bayer"),
+        Entry::ascii(271, &spec.make),
+        Entry::ascii(272, &spec.model),
         Entry::long(273, &[0]),
         Entry::short(277, &[1]),
         Entry::long(278, &[spec.height]),
         Entry::long(279, &[payload.len() as u32]),
         Entry::short(284, &[1]),
         Entry::byte(50706, &[1, 4, 0, 0]),
-        Entry::ascii(50708, "Synthetic Bayer"),
+        Entry::ascii(50708, &spec.model),
         Entry::byte(50710, &[0, 1, 2]),
         Entry::short(50711, &[1]),
         Entry::short(50713, &[2, 2]),
@@ -86,6 +97,12 @@ pub fn write_dng(spec: &DngSpec, truncate_payload: bool) -> NamedTempFile {
         Entry::short(33421, &[2, 2]),
         Entry::byte(33422, &spec.cfa),
     ];
+    if let Some(modify_time) = &spec.modify_time {
+        entries.push(Entry::ascii(306, modify_time));
+    }
+    if has_exif {
+        entries.push(Entry::long(34665, &[0]));
+    }
     if !spec.omit_width {
         entries.push(Entry::long(256, &[header_width]));
     }
@@ -116,6 +133,7 @@ pub fn write_dng(spec: &DngSpec, truncate_payload: bool) -> NamedTempFile {
 
     let mut extra = after_ifd;
     let mut strip_offset_field = None;
+    let mut exif_offset_field = None;
     for (index, entry) in entries.iter().enumerate() {
         let at = entry_start + index * 12;
         bytes[at..at + 2].copy_from_slice(&entry.tag.to_le_bytes());
@@ -134,6 +152,39 @@ pub fn write_dng(spec: &DngSpec, truncate_payload: bool) -> NamedTempFile {
         }
         if entry.tag == 273 {
             strip_offset_field = Some(at + 8);
+        }
+        if entry.tag == 34665 {
+            exif_offset_field = Some(at + 8);
+        }
+    }
+    if has_exif {
+        let exif_start = bytes.len();
+        bytes[exif_offset_field.expect("EXIF offset field")..][..4]
+            .copy_from_slice(&(exif_start as u32).to_le_bytes());
+        let mut exif_entries = Vec::new();
+        if let Some(capture_time) = &spec.capture_time {
+            exif_entries.push(Entry::ascii(36867, capture_time));
+        }
+        if let Some(serial_number) = &spec.serial_number {
+            exif_entries.push(Entry::ascii(42033, serial_number));
+        }
+        exif_entries.sort_by_key(|entry| entry.tag);
+        bytes.extend_from_slice(&(exif_entries.len() as u16).to_le_bytes());
+        let exif_entry_start = bytes.len();
+        bytes.resize(bytes.len() + exif_entries.len() * 12 + 4, 0);
+        let mut exif_extra = bytes.len();
+        for (index, entry) in exif_entries.iter().enumerate() {
+            let at = exif_entry_start + index * 12;
+            bytes[at..at + 2].copy_from_slice(&entry.tag.to_le_bytes());
+            bytes[at + 2..at + 4].copy_from_slice(&entry.kind.to_le_bytes());
+            bytes[at + 4..at + 8].copy_from_slice(&entry.count.to_le_bytes());
+            if entry.value.len() <= 4 {
+                bytes[at + 8..at + 8 + entry.value.len()].copy_from_slice(&entry.value);
+            } else {
+                bytes[at + 8..at + 12].copy_from_slice(&(exif_extra as u32).to_le_bytes());
+                bytes.extend_from_slice(&entry.value);
+                exif_extra += entry.value.len();
+            }
         }
     }
     let payload_offset = bytes.len() as u32;

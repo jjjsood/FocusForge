@@ -53,6 +53,7 @@ impl MemoryReader {
                 samples_per_pixel: 3,
                 strip_offsets: Vec::new(),
                 strip_byte_counts: Vec::new(),
+                raw_identity: None,
                 layout_label: "memory".to_string(),
                 layout_signature: vec!["memory".to_string()],
             })

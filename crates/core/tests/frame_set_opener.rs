@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 mod common;
+#[path = "common/raw_dng.rs"]
+mod raw_dng;
 
-use focusforge_core::io::{ReaderKind, TiffError, frame_paths, open_frame_set};
+use focusforge_core::io::{FrameError, ReaderKind, TiffError, frame_paths, open_frame_set};
 use focusforge_core::tile::HostBudget;
+use raw_dng::{DngSpec, write_dng};
 
 #[test]
 fn classification_picks_the_mmap_path_when_it_qualifies() {
@@ -49,11 +52,11 @@ fn budget_partition_is_applied_once() {
     let opened = open_frame_set(&paths, HostBudget::explicit(65_536)).unwrap();
     assert_eq!(opened.scheduler_budget.bytes(), 49_152);
     match open_frame_set(&paths, HostBudget::explicit(1)) {
-        Err(TiffError::DecodedCacheTooSmall {
+        Err(FrameError::Tiff(TiffError::DecodedCacheTooSmall {
             path,
             bound,
             required,
-        }) => {
+        })) => {
             assert_eq!(bound, 0);
             assert!(required > bound);
             assert!(path.ends_with("00.tif"));
@@ -67,7 +70,7 @@ fn budget_partition_is_applied_once() {
 fn incompatible_frames_are_rejected() {
     assert!(matches!(
         open_frame_set(&[], HostBudget::explicit(65_536)),
-        Err(TiffError::NoFrames { .. })
+        Err(FrameError::Tiff(TiffError::NoFrames { .. }))
     ));
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("frame-set-opener-{}", std::process::id()));
@@ -79,7 +82,7 @@ fn incompatible_frames_are_rejected() {
             std::slice::from_ref(&malformed),
             HostBudget::explicit(65_536)
         ),
-        Err(TiffError::NotATiff { .. })
+        Err(FrameError::Tiff(TiffError::NotATiff { .. }))
     ));
 
     let fixtures = common::fixtures_dir();
@@ -118,7 +121,7 @@ fn mixed_sets_decode_and_unsupported_headers_refuse() {
     let mismatch = fixtures.join("mantis-512/frames/00.tif");
     assert!(matches!(
         open_frame_set(&[mixed[0].clone(), mismatch], HostBudget::explicit(65_536)),
-        Err(TiffError::FrameMismatch { .. })
+        Err(FrameError::Tiff(TiffError::FrameMismatch { .. }))
     ));
 
     let source = fixtures.join("mantis-64-lzw-p1-strip-ii/frames/00.tif");
@@ -133,6 +136,33 @@ fn mixed_sets_decode_and_unsupported_headers_refuse() {
     };
     assert!(error.to_string().contains("Compression=7"), "{error}");
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn raw_sets_open_lazily_and_mixed_formats_name_the_differing_frame() {
+    let root = tempfile::tempdir().expect("temporary directory");
+    let source = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
+        true,
+    );
+    let raw = root.path().join("raw.dng");
+    std::fs::copy(source.path(), &raw).expect("copy RAW source");
+    let opened = open_frame_set(std::slice::from_ref(&raw), HostBudget::explicit(65_536))
+        .expect("metadata-only RAW must open");
+    assert_eq!(opened.kind, ReaderKind::Raw);
+    assert_eq!(opened.scheduler_budget.bytes(), 49_152);
+    assert_eq!(opened.reader.frame(0).path, raw);
+
+    let tiff = common::fixtures_dir().join("mantis-64/frames/00.tif");
+    let error = match open_frame_set(&[raw.clone(), tiff], HostBudget::explicit(65_536)) {
+        Ok(_) => panic!("RAW and TIFF must not mix"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        &error,
+        FrameError::MixedFormats { path, found: "TIFF", .. } if path.ends_with("00.tif")
+    ));
+    assert!(error.to_string().contains("raw.dng"));
 }
 
 fn patch_short_tag(bytes: &mut [u8], wanted_tag: u16, value: u16) {

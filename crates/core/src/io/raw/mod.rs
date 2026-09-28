@@ -8,7 +8,8 @@ use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::imgop::develop::{Intermediate, RawDevelop};
 use rawler::rawsource::RawSource;
 
-use super::{FrameDesc, FrameReader};
+use super::grouping::parse_exif_datetime;
+use super::{FrameDesc, FrameReader, RawIdentity};
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::tile::Rect;
 
@@ -29,6 +30,10 @@ pub struct RawMetadata {
     pub make: String,
     /// Camera model reported by the decoder.
     pub model: String,
+    /// Camera body serial when the source exposes one.
+    pub serial_number: Option<String>,
+    /// Original EXIF capture timestamp before it is converted for reporting.
+    pub capture_time_original: Option<String>,
     /// Capture time when the decoder can parse one.
     pub capture_time: Option<SystemTime>,
     /// Sensor width reported by the file header.
@@ -112,6 +117,18 @@ pub enum RawError {
         /// This frame's dimensions.
         found: (u32, u32),
     },
+    /// A frame disagrees with frame 0 on a RAW-only layout property.
+    #[error("{}: RAW {property} {found} differs from first frame {first}", path.display())]
+    MetadataMismatch {
+        /// File that differs.
+        path: PathBuf,
+        /// Property that differs.
+        property: &'static str,
+        /// First frame value.
+        first: String,
+        /// This frame value.
+        found: String,
+    },
     /// A requested frame index is outside the set.
     #[error("RAW frame {index} is outside the opened set ({count} frames)")]
     FrameIndex {
@@ -183,7 +200,17 @@ struct DecodedFrame {
 
 #[derive(Debug, Default)]
 struct Cache {
-    frame: Option<(usize, Arc<DecodedFrame>)>,
+    frames: Vec<(usize, Arc<DecodedFrame>, u64)>,
+    bytes: u64,
+}
+
+fn retained_bytes(frame: &DecodedFrame, path: &Path) -> Result<u64, RawError> {
+    u64::try_from(frame.samples.len())
+        .ok()
+        .and_then(|samples| samples.checked_mul(u64::try_from(std::mem::size_of::<u16>()).ok()?))
+        .ok_or_else(|| RawError::BudgetOverflow {
+            path: path.to_path_buf(),
+        })
 }
 
 /// A RAW frame set whose metadata is available before pixel development.
@@ -220,6 +247,43 @@ impl RawStack {
                     found,
                 });
             }
+            let first_metadata = &frames[0].metadata;
+            if (frame.metadata.make.as_str(), frame.metadata.model.as_str())
+                != (first_metadata.make.as_str(), first_metadata.model.as_str())
+            {
+                return Err(RawError::MetadataMismatch {
+                    path: path.clone(),
+                    property: "camera",
+                    first: format!("{}/{}", first_metadata.make, first_metadata.model),
+                    found: format!("{}/{}", frame.metadata.make, frame.metadata.model),
+                });
+            }
+            if (
+                &frame.metadata.cfa,
+                frame.metadata.cfa_width,
+                frame.metadata.cfa_height,
+            ) != (
+                &first_metadata.cfa,
+                first_metadata.cfa_width,
+                first_metadata.cfa_height,
+            ) {
+                return Err(RawError::MetadataMismatch {
+                    path: path.clone(),
+                    property: "CFA",
+                    first: format!(
+                        "{:?}/{}x{}",
+                        first_metadata.cfa,
+                        first_metadata.cfa_width.unwrap_or(0),
+                        first_metadata.cfa_height.unwrap_or(0)
+                    ),
+                    found: format!(
+                        "{:?}/{}x{}",
+                        frame.metadata.cfa,
+                        frame.metadata.cfa_width.unwrap_or(0),
+                        frame.metadata.cfa_height.unwrap_or(0)
+                    ),
+                });
+            }
             frames.push(frame);
         }
         Ok(Self {
@@ -247,13 +311,13 @@ impl RawStack {
     }
 
     fn decoded(&self, index: usize) -> Result<Arc<DecodedFrame>, RawError> {
-        if let Some((cached, frame)) = self
+        if let Some((_, frame, _)) = self
             .cache
             .lock()
             .expect("RAW cache mutex is not poisoned")
-            .frame
-            .as_ref()
-            && *cached == index
+            .frames
+            .iter()
+            .find(|(cached, _, _)| *cached == index)
         {
             return Ok(Arc::clone(frame));
         }
@@ -269,10 +333,12 @@ impl RawStack {
                 required,
             });
         }
-        self.cache
-            .lock()
-            .expect("RAW cache mutex is not poisoned")
-            .frame = None;
+        let mut cache = self.cache.lock().expect("RAW cache mutex is not poisoned");
+        while cache.bytes.saturating_add(required) > self.cache_bytes {
+            let (_, _, evicted) = cache.frames.remove(0);
+            cache.bytes -= evicted;
+        }
+        drop(cache);
         let decoded = Arc::new(develop(&frame.metadata.path)?);
         if (decoded.width, decoded.height) != (frame.desc.width, frame.desc.height) {
             return Err(RawError::GeometryChanged {
@@ -281,8 +347,14 @@ impl RawStack {
                 developed: (decoded.width, decoded.height),
             });
         }
+        let retained = retained_bytes(&decoded, &frame.metadata.path)?;
         let mut cache = self.cache.lock().expect("RAW cache mutex is not poisoned");
-        cache.frame = Some((index, Arc::clone(&decoded)));
+        while cache.bytes.saturating_add(retained) > self.cache_bytes {
+            let (_, _, evicted) = cache.frames.remove(0);
+            cache.bytes -= evicted;
+        }
+        cache.frames.push((index, Arc::clone(&decoded), retained));
+        cache.bytes += retained;
         Ok(decoded)
     }
 }
@@ -442,7 +514,14 @@ fn open_dng_inner(path: &Path) -> Result<RawFrame, RawError> {
         .map(|entry| entry.value.force_u32(0))
         .ok_or_else(|| missing_mandatory_tag(path, "ImageLength"))?;
     let general = seam(path, || decoder.raw_metadata(&source, &params))?;
-    let capture_time = general.last_modified().ok().flatten();
+    let capture_time_original = general.exif.date_time_original.clone();
+    let capture_time = capture_time_original
+        .as_deref()
+        .and_then(parse_exif_datetime)
+        .and_then(|time| u64::try_from(time.epoch_seconds).ok())
+        .and_then(|seconds| {
+            std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(seconds))
+        });
     let active_area = values_u32(raw.get_entry(50829_u16));
     let (active_x, active_y, active_width, active_height) = match active_area.as_deref() {
         None => (0, 0, width, height),
@@ -504,6 +583,8 @@ fn open_dng_inner(path: &Path) -> Result<RawFrame, RawError> {
         path: path.to_path_buf(),
         make: general.make,
         model: general.model,
+        serial_number: general.exif.serial_number.clone(),
+        capture_time_original,
         capture_time,
         raw_width: width,
         raw_height: height,
@@ -536,7 +617,7 @@ fn open_dng_inner(path: &Path) -> Result<RawFrame, RawError> {
             .map(|entry| entry.value.force_u16(1)),
         color_matrix: values_f32(raw.get_entry(50721_u16)),
     };
-    let desc = raw_desc(path, output_width, output_height);
+    let desc = raw_desc(&metadata);
     Ok(RawFrame { metadata, desc })
 }
 
@@ -583,11 +664,20 @@ fn open_dummy_inner(path: &Path) -> Result<RawFrame, RawError> {
             )
         })
         .unwrap_or((0, 0, image.width as u32, image.height as u32));
-    let capture_time = general.last_modified().ok().flatten();
+    let capture_time_original = general.exif.date_time_original.clone();
+    let capture_time = capture_time_original
+        .as_deref()
+        .and_then(parse_exif_datetime)
+        .and_then(|time| u64::try_from(time.epoch_seconds).ok())
+        .and_then(|seconds| {
+            std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(seconds))
+        });
     let metadata = RawMetadata {
         path: path.to_path_buf(),
         make: general.make,
         model: general.model,
+        serial_number: general.exif.serial_number.clone(),
+        capture_time_original,
         capture_time,
         raw_width: image.width as u32,
         raw_height: image.height as u32,
@@ -606,29 +696,59 @@ fn open_dummy_inner(path: &Path) -> Result<RawFrame, RawError> {
             .color_matrix_find_first([rawler::imgop::xyz::Illuminant::D65])
             .map(|(_, matrix)| matrix),
     };
-    let desc = raw_desc(path, output_width, output_height);
+    let desc = raw_desc(&metadata);
     Ok(RawFrame { metadata, desc })
 }
 
-fn raw_desc(path: &Path, width: u32, height: u32) -> FrameDesc {
-    let format = path
+fn raw_desc(metadata: &RawMetadata) -> FrameDesc {
+    let format = metadata
+        .path
         .extension()
         .and_then(|extension| extension.to_str())
         .map(|extension| extension.to_ascii_lowercase())
         .unwrap_or_else(|| "raw".to_string());
     FrameDesc {
-        path: path.to_path_buf(),
-        file_size: std::fs::metadata(path)
+        path: metadata.path.clone(),
+        file_size: std::fs::metadata(&metadata.path)
             .map(|metadata| metadata.len())
             .unwrap_or(0),
         image_description: None,
-        width,
-        height,
+        width: metadata.output_width,
+        height: metadata.output_height,
         samples_per_pixel: 3,
         strip_offsets: Vec::new(),
         strip_byte_counts: Vec::new(),
-        layout_label: format!("raw/{format}/output={width}x{height}"),
-        layout_signature: vec![format!("raw/{format}"), format!("output={width}x{height}")],
+        raw_identity: Some(RawIdentity {
+            make: metadata.make.clone(),
+            model: metadata.model.clone(),
+            serial_number: metadata.serial_number.clone(),
+            capture_time_original: metadata.capture_time_original.clone(),
+            raw_width: metadata.raw_width,
+            raw_height: metadata.raw_height,
+            black_levels: metadata.black_levels.clone(),
+            white_levels: metadata.white_levels.clone(),
+            cfa: metadata.cfa.clone(),
+            cfa_width: metadata.cfa_width,
+            cfa_height: metadata.cfa_height,
+        }),
+        layout_label: format!(
+            "raw/{format}/output={}x{}",
+            metadata.output_width, metadata.output_height
+        ),
+        layout_signature: vec![
+            format!("raw/{format}"),
+            format!(
+                "output={}x{}",
+                metadata.output_width, metadata.output_height
+            ),
+            format!("camera={}/{}", metadata.make, metadata.model),
+            format!(
+                "cfa={:?}/{}x{}",
+                metadata.cfa,
+                metadata.cfa_width.unwrap_or(0),
+                metadata.cfa_height.unwrap_or(0)
+            ),
+        ],
     }
 }
 

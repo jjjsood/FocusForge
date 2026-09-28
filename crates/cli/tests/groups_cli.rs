@@ -27,12 +27,15 @@
 //! fixed-name child of its cwd, so its basename is stable.
 
 mod common;
+#[path = "../../core/tests/common/raw_dng.rs"]
+mod raw_dng;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use focusforge_core::io::TiffStack;
 use focusforge_core::io::test_frames::write_frame_with_capture_time;
+use raw_dng::{DngSpec, write_dng};
 
 fn bin() -> Command {
     common::cli_bin("groups_cli")
@@ -358,6 +361,70 @@ fn write_groups_then_groups_round_trips() {
         "the header line names the file it came from: {}",
         from_file[0]
     );
+}
+
+#[test]
+fn mixed_raw_tiff_groups_round_trip_with_names_order_and_count() {
+    let input = common::tmp_dir("groups_cli_mixed_round_trip_input");
+    let out_dir = common::tmp_dir("groups_cli_mixed_round_trip_out");
+    let cwd = common::tmp_dir("groups_cli_mixed_round_trip_cwd");
+    let raw = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
+        true,
+    );
+    std::fs::copy(raw.path(), input.join("00.dng")).expect("copy RAW frame");
+    frame(&input, "01.tif", Some("2026:08:29 18:42:41"));
+    let groups = out_dir.join("mixed.toml");
+    let first = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            input.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--write-groups",
+            groups.to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
+    assert!(first.success, "stderr: {}", first.stderr);
+    let group_text = std::fs::read_to_string(&groups).expect("written groups");
+    assert_eq!(group_text.matches("[[group]]").count(), 2, "{group_text}");
+    assert!(group_text.contains("name = \"00\""), "{group_text}");
+    assert!(group_text.contains("name = \"01\""), "{group_text}");
+    assert!(
+        group_text.find("00.dng").expect("RAW frame")
+            < group_text.find("01.tif").expect("TIFF frame"),
+        "RAW partition must remain first: {group_text}"
+    );
+
+    let second = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            input.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--groups",
+            groups.to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
+    assert!(second.success, "stderr: {}", second.stderr);
+    let proposed = grouping_lines(&first.stderr);
+    let from_file = grouping_lines(&second.stderr);
+    assert_eq!(proposed[1..], from_file[1..]);
+    assert_eq!(proposed.len(), 3, "one header and two groups: {proposed:?}");
+    assert!(proposed[1].contains("raw/"), "{proposed:?}");
+    assert!(proposed[2].contains("tiff/"), "{proposed:?}");
 }
 
 /// The proposal block of a captured stderr: the `grouping ` line and every

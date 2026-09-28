@@ -16,7 +16,7 @@ GNU General Public License v3.
 
 ## Features
 
-- Fuses a directory of TIFF frames into a focus-stacked project
+- Fuses a directory of TIFF or supported RAW frames into a focus-stacked project
   (`focusforge-cli stack`), out-of-core so the stack never has to fit in RAM
 - Detects and proposes how a mixed folder of frames splits into separate
   stacks by capture time and directory structure, printed before the run and
@@ -93,10 +93,11 @@ CPU and `--no-gpu` does not exist as a flag.
 target/release/focusforge-cli info path/to/frames/
 ```
 
-Prints one block per TIFF in the directory — size, depth, byte order,
-compression, strip layout, whether the mmap fast path applies — followed by a
-frame count, total size and a uniform-layout verdict. Add `--json` for the
-same report as machine-readable JSON.
+Prints one block per frame in the directory. TIFF entries show size, depth,
+byte order, compression, strip layout and whether the mmap fast path applies;
+RAW entries show decoder metadata without developing pixels. The report ends
+with a frame count, total size and a uniform-layout verdict. Add `--json` for
+the same report as machine-readable JSON.
 
 ### Stack a folder
 

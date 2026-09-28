@@ -12,8 +12,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use focusforge_core::io::{
-    ByteOrder, FrameDesc, RAW_EXTENSIONS, RawMetadata, RawStack, TIFF_EXTENSIONS, TiffError,
-    TiffHeader, classify_header, frame_paths_for_extensions, has_extension, is_frame_path,
+    ByteOrder, FrameDesc, RAW_EXTENSIONS, RawMetadata, RawStack, TiffError, TiffHeader,
+    all_frame_paths, classify_header, has_extension, is_frame_path,
 };
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
@@ -732,10 +732,7 @@ fn is_raw_path(path: &Path) -> bool {
 }
 
 fn info_frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
-    let mut extensions = Vec::with_capacity(TIFF_EXTENSIONS.len() + RAW_EXTENSIONS.len());
-    extensions.extend_from_slice(TIFF_EXTENSIONS);
-    extensions.extend_from_slice(RAW_EXTENSIONS);
-    let paths = frame_paths_for_extensions(dir, &extensions)?;
+    let paths = all_frame_paths(dir)?;
     let paths: Vec<_> = paths
         .into_iter()
         .filter(|path| is_raw_path(path) || is_frame_path(path))
@@ -754,14 +751,14 @@ fn info_frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
 fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> InfoReport {
     enum Probe {
         Tiff(TiffHeader),
-        Raw(RawMetadata, FrameDesc),
+        Raw(RawMetadata, Box<FrameDesc>),
     }
 
     impl Probe {
         fn desc(&self) -> FrameDesc {
             match self {
                 Self::Tiff(header) => FrameDesc::from(header),
-                Self::Raw(_, desc) => desc.clone(),
+                Self::Raw(_, desc) => (**desc).clone(),
             }
         }
     }
@@ -789,7 +786,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                         let desc = stack.frame(0).cloned().ok_or(
                             focusforge_core::io::RawError::FrameIndex { index: 0, count: 0 },
                         )?;
-                        Ok(Probe::Raw(metadata, desc))
+                        Ok(Probe::Raw(metadata, Box::new(desc)))
                     })
                     .map_err(|error| error.to_string())
             } else {
@@ -1028,6 +1025,7 @@ mod tests {
             samples_per_pixel: 1,
             strip_offsets: Vec::new(),
             strip_byte_counts: Vec::new(),
+            raw_identity: None,
             layout_label: signature[0..2].join("/"),
             layout_signature: signature.iter().map(ToString::to_string).collect(),
         }

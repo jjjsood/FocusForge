@@ -22,10 +22,9 @@ fn raw_reader_opens_an_empty_path_list_as_a_named_error() {
 
 #[test]
 fn metadata_does_not_decode_pixels() {
-    let dng = write_dng(
-        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
-        true,
-    );
+    let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]);
+    spec.capture_time = Some("2026:08:29 18:42:41".to_string());
+    let dng = write_dng(&spec, true);
     let source = RawSource::new(dng.path()).expect("header-only source");
     let decoder = rawler::get_decoder(&source).expect("DNG decoder");
     let raw = decoder
@@ -58,7 +57,17 @@ fn metadata_does_not_decode_pixels() {
     );
     let reader = RawStack::open_files(&[PathBuf::from(dng.path())])
         .expect("payload-less DNG keeps metadata available");
-    assert_eq!(reader.metadata(0).expect("metadata").storage_bits, Some(12));
+    let metadata = reader.metadata(0).expect("metadata");
+    assert_eq!(metadata.storage_bits, Some(12));
+    assert_eq!(
+        metadata.capture_time_original.as_deref(),
+        Some("2026:08:29 18:42:41")
+    );
+    assert_eq!(
+        metadata.black_levels.as_deref(),
+        Some(&[64.0, 64.0, 64.0, 64.0][..])
+    );
+    assert_eq!(metadata.white_levels.as_deref(), Some(&[4095][..]));
     let mut output = vec![0; 3];
     assert!(
         reader
@@ -73,6 +82,49 @@ fn metadata_does_not_decode_pixels() {
                 &mut output,
             )
             .is_err()
+    );
+}
+
+#[test]
+fn metadata_uses_original_capture_time() {
+    let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]);
+    spec.capture_time = Some("2026:08:29 18:42:41".to_string());
+    spec.serial_number = Some("body-123".to_string());
+    let dng = write_dng(&spec, true);
+
+    let reader =
+        RawStack::open_files(&[PathBuf::from(dng.path())]).expect("metadata-only DNG must open");
+    let metadata = reader.metadata(0).expect("metadata");
+    assert_eq!(metadata.serial_number.as_deref(), Some("body-123"));
+    assert_eq!(
+        metadata
+            .capture_time
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs()),
+        Some(1_788_028_961),
+    );
+}
+
+#[test]
+fn raw_stack_names_the_first_cfa_disagreement() {
+    let first = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
+        true,
+    );
+    let second = write_dng(
+        &DngSpec::new(12, 64, 4095, [2, 1, 1, 0], vec![64; 64]),
+        true,
+    );
+    let error = RawStack::open_files(&[PathBuf::from(first.path()), PathBuf::from(second.path())])
+        .expect_err("different CFA must refuse");
+    assert!(matches!(
+        &error,
+        RawError::MetadataMismatch { property: "CFA", path, .. } if path == second.path()
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains(&second.path().display().to_string())
     );
 }
 
@@ -304,6 +356,58 @@ fn tiles_partition_the_developed_frame() {
             )
             .is_err()
     );
+}
+
+#[test]
+fn cache_retains_multiple_decoded_frames_within_budget() {
+    let root = tempfile::tempdir().expect("temporary directory");
+    let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![512; 256 * 256]);
+    spec.width = 256;
+    spec.height = 256;
+    let source = write_dng(&spec, false);
+    let first = root.path().join("00.dng");
+    let second = root.path().join("01.dng");
+    std::fs::copy(source.path(), &first).expect("copy first frame");
+    std::fs::copy(source.path(), &second).expect("copy second frame");
+    let peak = 256_u64 * 256 * 30 + std::fs::metadata(&first).expect("source size").len();
+    let retained = 256_u64 * 256 * 3 * 2;
+    let budget = peak + 2 * retained;
+    assert!(
+        budget < 2 * peak,
+        "budget must exclude a second decode peak"
+    );
+    let reader = RawStack::open_files_with_budget(&[first.clone(), second.clone()], budget)
+        .expect("metadata opens");
+    for frame in [0, 1] {
+        reader
+            .read_tile_into(
+                frame,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                &mut [0; 3],
+            )
+            .expect("develop frame");
+    }
+    std::fs::remove_file(&first).expect("remove first source");
+    std::fs::remove_file(&second).expect("remove second source");
+    for frame in [0, 1] {
+        reader
+            .read_tile_into(
+                frame,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                &mut [0; 3],
+            )
+            .expect("cached frame remains available");
+    }
 }
 
 #[test]
@@ -558,7 +662,10 @@ fn local_canon_cr3_smoke() {
         eprintln!("skip: FOCUSFORGE_RAW_LOCAL_SAMPLES is not set");
         return;
     };
-    for file in ["canon-r5-mark-ii/sample.cr3", "canon-r7/sample.cr3"] {
+    for file in [
+        "canon-r5-mark-ii/canon-eos-r5-mark-ii_2026-09-26_125359.cr3",
+        "canon-r7/canon-eos-r7_2025-01-10_220452.cr3",
+    ] {
         let path = PathBuf::from(&samples).join(file);
         assert!(
             path.is_file(),

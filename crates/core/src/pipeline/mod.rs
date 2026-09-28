@@ -1118,6 +1118,7 @@ mod tests {
             samples_per_pixel: 1,
             strip_offsets: Vec::new(),
             strip_byte_counts: Vec::new(),
+            raw_identity: None,
             layout_label: signature[..2.min(signature.len())].join("/"),
             layout_signature: signature.iter().map(ToString::to_string).collect(),
         }
