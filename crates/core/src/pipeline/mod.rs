@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, StackAlgorithm, TileReader};
 use crate::align::{
-    AlignDriverOptions, FailurePolicy, FrameAlignment, ReferencePolicy, StackAlignment, Transform,
-    WarpingReader, align_stack_with, auto_crop,
+    AlignDriverOptions, FailurePolicy, FrameAlignment, ReferencePolicy, Registration,
+    StackAlignment, Transform, WarpingReader, align_stack_with, auto_crop,
 };
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
@@ -469,6 +469,10 @@ pub fn run(
         .iter()
         .map(|f| f.transform)
         .collect();
+    let registration = Registration {
+        transforms: transforms.clone(),
+        crop: applied_crop,
+    };
     let warping_reader = WarpingReader::new(frame_reader, (width, height), spp, transforms.clone());
 
     let reader: &dyn TileReader = match &request.backend {
@@ -682,6 +686,7 @@ pub fn run(
             algorithm: request.algorithm.id(),
             params: &values,
             align: align_record,
+            registration: registration.clone(),
             composite_description,
             label: None,
             metrics,
@@ -696,6 +701,7 @@ pub fn run(
             algorithm: request.algorithm.id(),
             params: &values,
             align: align_record,
+            registration: registration.clone(),
             composite_description,
             label: None,
             metrics,
@@ -715,6 +721,7 @@ pub fn run(
                 algorithm: request.algorithm.id().to_string(),
                 params: values.clone(),
                 align: align_record,
+                registration: registration.clone(),
                 composite_description,
                 metrics,
                 created_at: project::seal::now_unix(),

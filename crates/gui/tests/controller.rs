@@ -853,6 +853,7 @@ fn open_paths_returns_before_the_load_completes_and_lands_only_after_settle() {
             algorithm: "laplacian",
             params: &ParamValues::new(),
             align: None,
+            registration: focusforge_core::align::Registration::default(),
             composite_description: "staged".to_string(),
             label: None,
             metrics: Metrics::default(),

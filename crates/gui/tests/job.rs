@@ -1235,6 +1235,7 @@ fn sealed_project_with_as_given_sources(name: &str) -> PathBuf {
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
+        registration: focusforge_core::align::Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: project::Metrics::default(),

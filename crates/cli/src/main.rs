@@ -233,6 +233,14 @@ enum Command {
         /// Write the Z-Map to this path.
         #[arg(long, value_name = "FILE")]
         zmap: Option<PathBuf>,
+        /// Write this source frame "as fused" -- warped by its recorded
+        /// transform and offset by the applied crop, at the composite's own
+        /// width and height. Requires `--frame-output`.
+        #[arg(long, value_name = "INDEX", requires = "frame_output")]
+        frame: Option<usize>,
+        /// Where to write the frame `--frame` names.
+        #[arg(long, value_name = "FILE")]
+        frame_output: Option<PathBuf>,
         /// Emit the frozen JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
@@ -483,8 +491,17 @@ fn main() -> ExitCode {
             project,
             output,
             zmap,
+            frame,
+            frame_output,
             json,
-        } => export::run(&project, output.as_deref(), zmap.as_deref(), json),
+        } => export::run(
+            &project,
+            output.as_deref(),
+            zmap.as_deref(),
+            frame,
+            frame_output.as_deref(),
+            json,
+        ),
         Command::Retouch {
             zmap,
             ops,
