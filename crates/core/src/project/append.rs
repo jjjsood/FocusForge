@@ -356,6 +356,25 @@ pub fn append_ops_onto(
             path: project_path.to_path_buf(),
         });
     }
+    let staging = fresh_staging_dir(project_path)?;
+    let result = append_ops_staged(
+        project_path,
+        parent,
+        &ops,
+        label,
+        created_at,
+        &staging,
+        storage,
+    );
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+/// A fresh, empty scratch directory next to `project_path`, named after it,
+/// for an op-replay to stage its intermediate blobs in. Callers remove it
+/// once they are done with it; a stale one from an earlier crashed run is
+/// cleared first.
+fn fresh_staging_dir(project_path: &Path) -> Result<PathBuf, ProjectError> {
     let dir = project_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -370,17 +389,7 @@ pub fn append_ops_onto(
     let staging = dir.join(staging_name);
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|err| ProjectError::io(&staging, err))?;
-    let result = append_ops_staged(
-        project_path,
-        parent,
-        &ops,
-        label,
-        created_at,
-        &staging,
-        storage,
-    );
-    let _ = std::fs::remove_dir_all(&staging);
-    result
+    Ok(staging)
 }
 
 /// [`replay_ops_to`] staged: opens the project, replays `ops` onto `parent`
@@ -394,15 +403,7 @@ fn replay_ops_to_staged(
     staging: &Path,
     out: &Path,
 ) -> Result<(), ProjectError> {
-    let mut project = Project::open(project_path)?;
-    let head = project.history().get(parent)?.clone();
-    let manifest = project.manifest().clone();
-    let info = ZMapInfo::new(
-        manifest.zmap.width,
-        manifest.zmap.height,
-        manifest.zmap.frame_count,
-    )
-    .map_err(|err| ProjectError::container(project_path, err))?;
+    let (mut project, head, _manifest, info) = open_at_checkpoint(project_path, parent)?;
 
     let partial = partial_path(out);
     let outcome = replay_ops_onto_zmap(&mut project, parent, &head, ops, info, staging, &partial)
@@ -427,20 +428,7 @@ pub fn replay_ops_to(
             path: project_path.to_path_buf(),
         });
     }
-    let dir = project_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let staging_name = format!(
-        "{}.ops-staging",
-        project_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    );
-    let staging = dir.join(staging_name);
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|err| ProjectError::io(&staging, err))?;
+    let staging = fresh_staging_dir(project_path)?;
     let result = replay_ops_to_staged(project_path, parent, &ops, &staging, out);
     let _ = std::fs::remove_dir_all(&staging);
     result
@@ -537,6 +525,26 @@ fn replay_ops_onto_zmap(
     Ok((tile, indices))
 }
 
+/// Opens `project_path`, resolves `parent` to its checkpoint and clones the
+/// container's manifest and Z-Map geometry -- the common start
+/// [`append_ops_staged`] and [`replay_ops_to_staged`] both need before
+/// replaying ops onto the head.
+fn open_at_checkpoint(
+    project_path: &Path,
+    parent: &str,
+) -> Result<(Project, Checkpoint, Manifest, ZMapInfo), ProjectError> {
+    let project = Project::open(project_path)?;
+    let head = project.history().get(parent)?.clone();
+    let manifest = project.manifest().clone();
+    let info = ZMapInfo::new(
+        manifest.zmap.width,
+        manifest.zmap.height,
+        manifest.zmap.frame_count,
+    )
+    .map_err(|err| ProjectError::container(project_path, err))?;
+    Ok((project, head, manifest, info))
+}
+
 fn append_ops_staged(
     project_path: &Path,
     parent: &str,
@@ -546,15 +554,7 @@ fn append_ops_staged(
     staging: &Path,
     storage: ZMapStorage,
 ) -> Result<SealedProject, ProjectError> {
-    let mut project = Project::open(project_path)?;
-    let head = project.history().get(parent)?.clone();
-    let manifest = project.manifest().clone();
-    let info = ZMapInfo::new(
-        manifest.zmap.width,
-        manifest.zmap.height,
-        manifest.zmap.frame_count,
-    )
-    .map_err(|err| ProjectError::container(project_path, err))?;
+    let (mut project, head, manifest, info) = open_at_checkpoint(project_path, parent)?;
 
     let new_zmap_path = staging.join("new-zmap.tif");
     let (tile, indices) = replay_ops_onto_zmap(
