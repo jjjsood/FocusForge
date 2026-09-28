@@ -4854,8 +4854,8 @@ fn frame_word(count: usize) -> &'static str {
     if count == 1 { "frame" } else { "frames" }
 }
 
-/// `"1 checkpoint"` / `"N checkpoints"` -- the open card's meta line and the
-/// checkpoints panel share this wording for a non-zero count.
+/// `"1 checkpoint"` / `"N checkpoints"` -- the open card's meta line's own
+/// wording for a non-zero count.
 fn checkpoint_phrase(count: usize) -> String {
     let word = if count == 1 {
         "checkpoint"

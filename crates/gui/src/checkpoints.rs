@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The checkpoint dock panel's own view model: day-grouped rows built from
-//! a project's saved history, in the local clock. Plain Rust, no
-//! `use slint::` -- `crate::controller` builds a
-//! [`CheckpointsModel`](crate::checkpoints::CheckpointsModel) from
-//! `History::all()` and hands it to `ui/shell/dock/checkpoint_panel.slint`'s
-//! `for` loop, the same shape `crate::images` already uses for the `Images`
-//! panel.
+//! The checkpoint dock panel's view model: day-grouped rows built from a
+//! project's saved history, in the local clock. Plain Rust, no `use
+//! slint::`; `crate::controller` builds a [`CheckpointsModel`] and hands it
+//! to `ui/shell/dock/checkpoint_panel.slint`'s `for` loop.
 
 use chrono::{Local, NaiveDate, TimeZone};
 
@@ -142,13 +139,12 @@ impl Row<'_> {
     }
 }
 
-/// Builds the panel's flat entry list from `checkpoints` (`History::all()`'s
-/// own newest-first order, ties already broken) merged with `held` (fused
-/// since the last save, not yet in any `.ffp`), the two ordered by
-/// `created_at` descending with a held row first on a tie -- day separators
-/// only when the merged list spans more than one local day, `today` the
-/// caller's reading of the local date. `selected` is compared against each
-/// row's own id (a saved row's stored id, a held row's `"held:<index>"`).
+/// Builds the panel's flat entry list: `checkpoints` merged with `held`
+/// (fused since the last save, not yet in any `.ffp`), ordered by
+/// `created_at` descending with a held row first on a tie. Day separators
+/// appear only when the merged list spans more than one local day, `today`
+/// being the caller's local date. `selected` matches a row's own id (a
+/// saved row's stored id, a held row's `"held:<index>"`).
 pub fn build_model(
     checkpoints: &[&Checkpoint],
     held: &[HeldCheckpoint],
