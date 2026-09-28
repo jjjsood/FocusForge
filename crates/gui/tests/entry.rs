@@ -213,20 +213,17 @@ fn empty_folder_is_refused_with_a_fix() {
 #[test]
 #[cfg(unix)]
 fn unreadable_folder_is_refused_with_its_read_error() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let root = tree("entry_unreadable_folder");
-    let writable = std::fs::metadata(&root).unwrap().permissions();
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let Some(root) = common::readonly_dir("entry_unreadable_folder", 0o000, |_| {}) else {
+        return;
+    };
     // The exact same call the entry path makes, so the expected message
     // carries the OS's own real error text rather than a guessed one.
-    let read_err = std::fs::read_dir(&root).unwrap_err();
+    let read_err = std::fs::read_dir(&*root).unwrap_err();
     let expected = format!("{0}: {0}: {read_err}", root.display());
 
     let mut controller = AppController::new();
-    let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&root));
-
-    std::fs::set_permissions(&root, writable).unwrap();
+    let path = root.to_path_buf();
+    let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&path));
 
     match outcome {
         OpenOutcome::Refused(EntryError::Read { .. }) => {}
