@@ -2615,11 +2615,8 @@ mod tests {
         assert_eq!(after.admitted, before.admitted + 10);
     }
 
-    /// The test above proves the accounting machinery; it never proves a
-    /// live callback reaches it -- calling `record_images_input` directly
-    /// would still pass if an Images callback were misrouted to `Other`.
-    /// This drives the real generated callbacks through an installed,
-    /// headless window instead.
+    /// Drives the real generated Images callbacks through an installed,
+    /// headless window, so a misrouted callback (e.g. to `Other`) fails it.
     #[test]
     fn images_callbacks_invoked_through_the_real_window_record_the_images_surface() {
         const CHILD: &str = "FOCUSFORGE_GUI_IMAGES_CALLBACK_TRACE_CHILD";
