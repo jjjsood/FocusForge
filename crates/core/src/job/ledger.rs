@@ -212,15 +212,25 @@ impl Ledger {
         &self.completed
     }
 
+    /// Drops the open `units.log` handle and returns this ledger's
+    /// directory -- the handle must close before anything removes the
+    /// directory it lives in, the same ordering `write_atomic` uses between
+    /// its temp file and its rename.
+    fn close(self) -> PathBuf {
+        let Ledger { dir, units_log, .. } = self;
+        drop(units_log);
+        dir
+    }
+
     /// Removes this ledger's whole directory -- called by a caller (the
     /// CLI) once its run's `finish()` has succeeded. A cancelled or crashed
     /// run's ledger is never discarded here: only a caller that knows its
-    /// own run is genuinely done calls this.
+    /// own run is genuinely done calls this. Closes the `units.log` handle
+    /// before removing the directory, so a filesystem that keeps an
+    /// unlinked-but-open file visible cannot see the directory as non-empty.
     pub fn discard(self) -> Result<(), ResumeError> {
-        fs::remove_dir_all(&self.dir).map_err(|source| ResumeError::Io {
-            path: self.dir.clone(),
-            source,
-        })
+        let dir = self.close();
+        fs::remove_dir_all(&dir).map_err(|source| ResumeError::Io { path: dir, source })
     }
 }
 
@@ -765,6 +775,66 @@ mod tests {
         assert!(dir.is_dir());
         ledger.discard().unwrap();
         assert!(!dir.exists());
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// The link targets, under `/proc/self/fd`, of this process's open
+    /// descriptors that resolve inside `dir`.
+    #[cfg(target_os = "linux")]
+    fn open_fd_targets_under(dir: &Path) -> Vec<StdPathBuf> {
+        fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| fs::read_link(entry.path()).ok())
+            .filter(|target| target.starts_with(dir))
+            .collect()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn discard_closes_the_log_before_removing() {
+        let scratch = tmp_dir("closes-log-first");
+        let store = ResumeStore::open(&scratch).unwrap();
+        let record = sample_record(&scratch, "out.tif");
+
+        // A freshly begun ledger with a recorded unit.
+        let ledger = store.begin(&record).unwrap();
+        ledger.record_unit(0).unwrap();
+        let dir = ledger.dir().to_path_buf();
+        assert!(
+            !open_fd_targets_under(&dir).is_empty(),
+            "expected the units.log handle to be visible under /proc/self/fd before close()"
+        );
+        let closed_dir = ledger.close();
+        assert_eq!(closed_dir, dir);
+        assert!(
+            open_fd_targets_under(&dir).is_empty(),
+            "units.log handle must be closed before its directory is removed"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+
+        // A ledger reopened through `find`, after a unit was recorded and
+        // the first handle onto it dropped.
+        let ledger = store.begin(&record).unwrap();
+        ledger.record_unit(0).unwrap();
+        drop(ledger);
+        let ledger = match store.find(&record).unwrap() {
+            Resumable::Ledger(ledger) => ledger,
+            other => panic!("expected Resumable::Ledger, got {other:?}"),
+        };
+        let dir = ledger.dir().to_path_buf();
+        assert!(
+            !open_fd_targets_under(&dir).is_empty(),
+            "expected the reopened units.log handle to be visible under /proc/self/fd before close()"
+        );
+        let closed_dir = ledger.close();
+        assert_eq!(closed_dir, dir);
+        assert!(
+            open_fd_targets_under(&dir).is_empty(),
+            "reopened units.log handle must be closed before its directory is removed"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+
         let _ = fs::remove_dir_all(&scratch);
     }
 
