@@ -774,6 +774,10 @@ pub struct AppController {
     /// The last id handed to a [`ProjectTab`] -- incremented before each
     /// use, so ids start at 1 and no two tabs ever share one.
     next_tab_id: u64,
+    /// Whether a fuse run may use the headless GPU backend at all -- `false`
+    /// by default, so a headless test controller never probes an adapter;
+    /// [`main`](crate) turns this on for the real window.
+    gpu_fusion: bool,
 }
 
 /// The single live worker, if any: the control/observer pair a background
@@ -3392,8 +3396,21 @@ impl AppController {
             align_values: tab.align_values.clone(),
             align_lax: true,
             crop: true,
-            backend: None,
+            gpu: self.gpu_fusion,
         })
+    }
+
+    /// Turns GPU-backed fusion on or off for every run this controller
+    /// starts from here on -- never mid-run.
+    pub fn set_gpu_fusion(&mut self, gpu_fusion: bool) {
+        self.gpu_fusion = gpu_fusion;
+    }
+
+    /// The live run's own [`job::resolve_backend`] account, `None` before it
+    /// has resolved or once the run has settled ([`Self::settle_job`] clears
+    /// the observer).
+    pub fn fusion_backend(&self) -> Option<String> {
+        self.job.observer.as_ref().and_then(|o| o.backend_line())
     }
 
     /// Refuses a run whose recorded frame is no longer on disk, naming it
