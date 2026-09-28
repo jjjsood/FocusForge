@@ -99,6 +99,9 @@ RAW entries show decoder metadata without developing pixels. The report ends
 with a frame count, total size and a uniform-layout verdict. Add `--json` for
 the same report as machine-readable JSON.
 
+RAW frames use `rawler` as the only decoder. Files it cannot read return an
+error; there is no decoder fallback.
+
 ### Stack a folder
 
 ```bash
