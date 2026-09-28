@@ -322,7 +322,11 @@ impl StageObserver for GuiObserver {
                 .wait_timeout(gate, POLL)
                 .expect("no thread panicked while holding the pause gate");
             gate = guard;
-            if timeout.timed_out() && control.state() == ControlState::CancelRequested {
+            if timeout.timed_out() && control.state() != ControlState::PauseRequested {
+                // A resume can clear the control and set the gate between
+                // the driver's state read and this call's own gate reset
+                // above -- a lost wake-up, caught within one more `POLL`
+                // rather than parking on a gate nothing will ever set.
                 return;
             }
         }

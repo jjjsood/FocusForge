@@ -10,14 +10,14 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use focusforge_core::algorithm::{
     AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus,
 };
 use focusforge_core::align::Transform;
-use focusforge_core::job::{ControlState, JobControl, JobProgress, StageCache};
+use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage, StageCache};
 use focusforge_core::params::{ParamDesc, ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{
     AlignRequest, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, RunStage, StageObserver,
@@ -288,6 +288,236 @@ fn cancel_during_alignment_stops_at_a_frame_boundary() {
         assert!(
             calls <= bound,
             "{policy}: {calls} registrations ran, but at most {bound} may once the cancel lands"
+        );
+        assert_eq!(
+            files_under(&request.scratch_root),
+            Vec::<PathBuf>::new(),
+            "{policy}: a cancelled alignment must write no stage-cache entry and no resume ledger"
+        );
+    }
+}
+
+/// Converges every frame and counts its `align_frame` calls, sharing that
+/// count with the test's own observer; the call numbered `pause_on`
+/// requests a pause on `control` before it returns. Its schema is
+/// `pyramidal-ecc`'s, so a request can choose the reference policy.
+struct PausingAlign {
+    control: Arc<JobControl>,
+    pause_on: usize,
+    calls: Arc<AtomicUsize>,
+}
+
+impl AlignAlgorithm for PausingAlign {
+    fn id(&self) -> &str {
+        "pausing-align"
+    }
+    fn display_name(&self) -> &str {
+        "Pausing Align"
+    }
+    fn params(&self) -> &[ParamDesc] {
+        registry::find_align("pyramidal-ecc")
+            .expect("pyramidal-ecc must be registered")
+            .params()
+    }
+    fn align_frame(
+        &self,
+        _ctx: &AlignContext<'_>,
+        _frame: usize,
+        _cfg: &ParamValues,
+    ) -> Result<AlignOutcome, AlgorithmError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.pause_on {
+            self.control.pause();
+        }
+        Ok(AlignOutcome {
+            transform: Transform::identity(),
+            status: AlignStatus::Converged,
+            iterations: 1,
+            residual: 1.0,
+        })
+    }
+}
+
+/// Records how many times [`StageObserver::paused`] was entered, asserts it
+/// lands mid-`JobStage::Align` with `calls` inside `bound`, samples `calls`
+/// before and after a 500 ms sleep to prove nothing registered during the
+/// hold, then clears the control so the run continues.
+struct PauseHoldObserver {
+    entries: AtomicUsize,
+    calls: Arc<AtomicUsize>,
+    bound: std::ops::RangeInclusive<usize>,
+}
+
+impl StageObserver for PauseHoldObserver {
+    fn paused(&self, control: &JobControl) {
+        self.entries.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            control.progress().stage,
+            JobStage::Align,
+            "paused must land while the align stage is still running"
+        );
+        let before = self.calls.load(Ordering::SeqCst);
+        assert!(
+            self.bound.contains(&before),
+            "paused entered after {before} registrations, it must enter after {:?}",
+            self.bound
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            self.calls.load(Ordering::SeqCst),
+            before,
+            "no further align_frame call may start during the hold"
+        );
+        control.clear();
+    }
+}
+
+/// The same [`StageObserver::paused`] contract, but cancelling instead of
+/// resuming -- a cancel requested against a run that is already held.
+/// Records `calls` as the hold begins.
+struct CancelOnPause {
+    calls: Arc<AtomicUsize>,
+    at_hold: OnceLock<usize>,
+}
+
+impl StageObserver for CancelOnPause {
+    fn paused(&self, control: &JobControl) {
+        self.at_hold
+            .set(self.calls.load(Ordering::SeqCst))
+            .expect("paused must be entered once");
+        control.cancel();
+    }
+}
+
+#[test]
+fn pause_during_alignment_stops_registering_frames() {
+    const PAUSE_ON: usize = 2;
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // Same shape as the cancel test's own sizing: enough frames that a
+    // pause noticed only once alignment returns would register frames past
+    // the bound below.
+    let frame_count = PAUSE_ON + workers + 8;
+    let frames: Vec<PathBuf> = mantis_frames(8)
+        .into_iter()
+        .cycle()
+        .take(frame_count)
+        .collect();
+
+    // The pausing call itself, plus at most one in-flight registration per
+    // other worker; the chain arm registers on one thread.
+    for (policy, bound) in [("anchor", PAUSE_ON + workers - 1), ("chain", PAUSE_ON)] {
+        let control = JobControl::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let algorithm: &'static PausingAlign = Box::leak(Box::new(PausingAlign {
+            control: Arc::clone(&control),
+            pause_on: PAUSE_ON,
+            calls: Arc::clone(&calls),
+        }));
+        let mut explicit = ParamValues::new();
+        explicit.insert(
+            "reference-policy".to_string(),
+            ParamValue::Enum(policy.to_string()),
+        );
+        let mut request = base_request(
+            &format!("pause_mid_align_{policy}"),
+            frames.clone(),
+            ParamValues::new(),
+        );
+        request.align = Some(AlignRequest {
+            algorithm,
+            explicit,
+            lax: false,
+        });
+
+        let observer = PauseHoldObserver {
+            entries: AtomicUsize::new(0),
+            calls: Arc::clone(&calls),
+            bound: PAUSE_ON..=bound,
+        };
+        let outcome = focusforge_core::pipeline::run(&request, &observer, control, None)
+            .unwrap_or_else(|err| {
+                panic!("{policy}: a paused-then-resumed run must not error: {err}")
+            });
+
+        assert!(
+            matches!(outcome, FuseOutcome::Completed(_)),
+            "{policy}: the run must complete once the hold clears"
+        );
+        assert_eq!(
+            observer.entries.load(Ordering::SeqCst),
+            1,
+            "{policy}: paused must be entered exactly once"
+        );
+    }
+}
+
+#[test]
+fn cancel_during_alignment_stops_at_a_frame_boundary_from_a_held_pause() {
+    const PAUSE_ON: usize = 2;
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let frame_count = PAUSE_ON + workers + 8;
+    let frames: Vec<PathBuf> = mantis_frames(8)
+        .into_iter()
+        .cycle()
+        .take(frame_count)
+        .collect();
+
+    for (policy, bound) in [("anchor", PAUSE_ON + workers - 1), ("chain", PAUSE_ON)] {
+        let control = JobControl::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let algorithm: &'static PausingAlign = Box::leak(Box::new(PausingAlign {
+            control: Arc::clone(&control),
+            pause_on: PAUSE_ON,
+            calls: Arc::clone(&calls),
+        }));
+        let mut explicit = ParamValues::new();
+        explicit.insert(
+            "reference-policy".to_string(),
+            ParamValue::Enum(policy.to_string()),
+        );
+        let mut request = base_request(
+            &format!("cancel_held_align_{policy}"),
+            frames.clone(),
+            ParamValues::new(),
+        );
+        request.align = Some(AlignRequest {
+            algorithm,
+            explicit,
+            lax: false,
+        });
+        let cache = StageCache::open(&request.scratch_root).expect("stage cache must open");
+        let observer = CancelOnPause {
+            calls: Arc::clone(&calls),
+            at_hold: OnceLock::new(),
+        };
+
+        let outcome = focusforge_core::pipeline::run(&request, &observer, control, Some(&cache))
+            .unwrap_or_else(|err| {
+                panic!("{policy}: a cancel from a held pause must not take the error path: {err}")
+            });
+
+        assert!(
+            matches!(
+                outcome,
+                FuseOutcome::Cancelled {
+                    units_done: 0,
+                    unit_total: 0
+                }
+            ),
+            "{policy}: a cancel requested while held must end the run as cancelled"
+        );
+        let calls_at_hold = *observer
+            .at_hold
+            .get()
+            .unwrap_or_else(|| panic!("{policy}: the run must have been held"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            calls_at_hold,
+            "{policy}: no align_frame call may start once the hold begins"
+        );
+        assert!(
+            (PAUSE_ON..=bound).contains(&calls_at_hold),
+            "{policy}: the hold began after {calls_at_hold} registrations, it must begin after \
+             {PAUSE_ON}..={bound}"
         );
         assert_eq!(
             files_under(&request.scratch_root),

@@ -408,6 +408,68 @@ fn cancel_during_align_shows_the_interval() {
 }
 
 // ---------------------------------------------------------------------
+// Pause holds a still-aligning run: no progress moves while it is held,
+// and a second press lets the same run finish.
+// ---------------------------------------------------------------------
+
+#[test]
+fn pause_during_alignment_holds_align_progress() {
+    let mut controller = controller_with_frames("pause_align", 8);
+    // `dummy-align` (`controller_with_frames`'s own default) finishes in
+    // microseconds; a real solver is what gives the hold something to
+    // catch mid-stage. Translation-only chain registration converges on
+    // every one of this fixture's eight frames, so the run fuses cleanly
+    // rather than parking on a diverged frame.
+    controller.set_align_algorithm("pyramidal-ecc");
+    controller.set_param_value("align", "mode", ParamValue::Enum("translation".to_string()));
+    controller.set_param_value(
+        "align",
+        "reference-policy",
+        ParamValue::Enum("chain".to_string()),
+    );
+    assert!(controller.start_fuse());
+
+    let start = Instant::now();
+    while !(controller.job_view().state == job::RunState::Running
+        && controller.job_view().stage_word == "Aligning")
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the run never reached the align stage within 60s"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    controller.pause_or_resume();
+    assert_eq!(controller.job_view().state, job::RunState::Paused);
+
+    let held = controller.job_view();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        controller.job_view(),
+        held,
+        "the align stage's own progress must not move while the hold is in effect"
+    );
+
+    controller.pause_or_resume();
+    // A paused view shows `Paused` in place of the stage word; the first
+    // view after resume reads the progress the hold froze, which must still
+    // be the align stage's.
+    assert_eq!(
+        controller.job_view().stage_word,
+        "Aligning",
+        "the hold must have landed in the align stage"
+    );
+    common::wait_for_settle(&mut controller, Duration::from_secs(120))
+        .expect("a resumed run must hand back its fused planes");
+    assert!(!controller.job_running());
+    match controller.job_view().state {
+        job::RunState::Fused { .. } => {}
+        other => panic!("a resumed run must settle as fused, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------
 // A clean cancel preserves the engine's resumable state.
 // ---------------------------------------------------------------------
 

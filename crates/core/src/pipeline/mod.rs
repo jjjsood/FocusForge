@@ -179,10 +179,12 @@ pub enum AlignSource {
 pub trait StageObserver: Sync {
     fn stage(&self, _stage: RunStage) {}
     fn tick(&self, _progress: &JobProgress) {}
-    /// Called once a fuse segment reports [`JobOutcome::Paused`]; blocks
-    /// until the front end resumes (`control.clear()`) or cancels
-    /// (`control.cancel()`) -- `focusforge-cli`'s own signal wait and the
-    /// GUI's condvar park are both implementations of this one method.
+    /// Called once a fuse segment reports [`JobOutcome::Paused`], or once
+    /// per pause held at an align-stage frame boundary; blocks until the
+    /// front end resumes (`control.clear()`) or cancels (`control.cancel()`)
+    /// -- `focusforge-cli`'s own signal wait and the GUI's condvar park are
+    /// both implementations of this one method. Always called from the
+    /// thread that called [`run`], never concurrently with itself.
     fn paused(&self, _control: &JobControl) {}
     /// A human-readable warning raised mid-run that a front end may surface
     /// however it sees fit -- `focusforge-cli`'s own implementation mirrors
@@ -364,12 +366,18 @@ pub fn run(
                 let solved = std::thread::scope(|scope| {
                     let watcher = scope.spawn(|| {
                         let _parent = parent.enter();
-                        // A cancel lands at `align_stack_with`'s next frame
-                        // boundary, after the registrations in flight
-                        // finish; this says so while they still run.
+                        // Pause and cancel both land at `align_stack_with`'s
+                        // next frame boundary, after the registrations in
+                        // flight finish. While a hold is in effect this
+                        // thread stops ticking, so `observer.paused` (run on
+                        // the caller's thread, below) is the only reader of
+                        // a front end's resume signal during the hold.
                         let mut warned = false;
                         while !done.load(Ordering::SeqCst) {
                             std::thread::sleep(poll);
+                            if control.state() == ControlState::PauseRequested {
+                                continue;
+                            }
                             observer.tick(&control.progress());
                             if !warned && control.state() == ControlState::CancelRequested {
                                 observer.notice(
@@ -389,6 +397,7 @@ pub fn run(
                         &AlignDriverOptions {
                             frames_done: Some(frames_done),
                             control: Some(Arc::clone(&control)),
+                            on_pause: Some(&|control| observer.paused(control)),
                             ..Default::default()
                         },
                     );
