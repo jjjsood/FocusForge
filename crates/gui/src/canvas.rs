@@ -14,11 +14,10 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
-use focusforge_core::TiffError;
 use focusforge_core::algorithm::{AlgorithmError, read_tile_step_into};
 use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::display::alpha_from_opacity;
-use focusforge_core::io::{FrameReader, open_frame_set};
+use focusforge_core::io::{FrameError, FrameReader, open_frame_set};
 use focusforge_core::retouch::{RetouchError, Sources, recomposite as recomposite_region};
 use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::overlay_table;
@@ -138,7 +137,7 @@ impl FrameSource {
         path: &Path,
         view: Option<FrameView>,
         budget: HostBudget,
-    ) -> Result<(), TiffError> {
+    ) -> Result<(), FrameError> {
         self.open = None;
         let set = open_frame_set(std::slice::from_ref(&path.to_path_buf()), budget)?;
         self.open = Some((path.to_path_buf(), set.reader, view));

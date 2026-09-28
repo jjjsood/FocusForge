@@ -12,11 +12,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
-use focusforge_core::TiffError;
 use focusforge_core::algorithm::{AlignAlgorithm, StackAlgorithm};
 use focusforge_core::align::WarpingReader;
 use focusforge_core::gpu::TileBackend;
-use focusforge_core::io::{COMPOSITE_FILENAME, FrameReader, ZMAP_FILENAME, open_frame_set};
+use focusforge_core::io::{
+    COMPOSITE_FILENAME, FrameError, FrameReader, ZMAP_FILENAME, open_frame_set,
+};
 use focusforge_core::params::ParamValues;
 use focusforge_core::pipeline::{
     self, AlignRequest, FuseOutput, FuseProduct, FuseRequest, RunStage, StageObserver,
@@ -462,14 +463,14 @@ pub fn materialize_planes(
     Ok((composite, zmap))
 }
 
-/// What can go wrong opening a tab's editor state: its Z-Map or the raw
-/// source frames a stroke recomposites against.
+/// What can go wrong opening a tab's editor state: its Z-Map or the source
+/// frames a stroke recomposites against.
 #[derive(Debug, thiserror::Error)]
 pub enum EditSessionError {
     #[error(transparent)]
     ZMap(#[from] ZMapError),
     #[error(transparent)]
-    Frames(#[from] TiffError),
+    Frames(#[from] FrameError),
 }
 
 /// One tab's live editor state: its undo/redo session, the frame set a

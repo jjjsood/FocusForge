@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use focusforge_core::TiffError;
 use focusforge_core::display::zmap_index_scale;
-use focusforge_core::io::TiffStack;
+use focusforge_core::io::{FrameError, TiffStack};
 use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::{ZMapError, ZMapReader};
 use focusforge_gpu::display::{DisplayTexture, render, render_overlay};
@@ -440,7 +440,7 @@ impl CanvasRenderer {
         path: &Path,
         view: Option<FrameView>,
         budget: HostBudget,
-    ) -> Result<(), TiffError> {
+    ) -> Result<(), FrameError> {
         let result = self.frame.set(path, view, budget);
         self.frame_pane = PaneTexture::default();
         self.last_frame = None;
