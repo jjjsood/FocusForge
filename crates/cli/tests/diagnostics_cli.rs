@@ -137,7 +137,7 @@ fn unwritable_data_directory_falls_back_to_stderr_alone() {
 /// A directory locked read-only through [`common::make_read_only`], so a
 /// `--status` path inside it is refused by the filesystem itself. `None`
 /// when the probe shows the filesystem does not enforce permissions.
-fn unwritable_dir(_label: &str) -> Option<tempfile::TempDir> {
+fn unwritable_dir() -> Option<tempfile::TempDir> {
     let dir = tempfile::tempdir().unwrap();
     if !common::make_read_only(dir.path()) {
         return None;
@@ -153,7 +153,7 @@ fn warn_and_refuse(
     label: &str,
     verbose: bool,
 ) -> Option<(std::process::Command, PathBuf, tempfile::TempDir)> {
-    let dir = unwritable_dir(label)?;
+    let dir = unwritable_dir()?;
     let status = dir.path().join("status.ndjson");
     let mut cmd = common::cli_bin(label);
     if verbose {
