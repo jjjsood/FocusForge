@@ -56,7 +56,7 @@ GNU General Public License v3.
   packages the evidence into one redacted ZIP, and the next start after a
   crash tells you it's there
 - A window (`focusforge-gui`) alongside the CLI: open a folder or a saved
-  project into a tab, watch the composite and its Z-Map side by side,
+  project into a tab, view the selected source frame beside the composite or Z-Map,
   choose an algorithm and edit its parameters from the same schema
   `focusforge-cli algorithms` prints, and run, pause, cancel or retry a
   fuse without leaving it
