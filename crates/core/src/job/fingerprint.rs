@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::io::FrameDesc;
+use crate::io::{FrameDesc, RawIdentity};
 
 /// One frame's identity, read straight off its already-parsed
 /// [`FrameDesc`] -- none of them requiring a pixel to be read.
@@ -34,6 +34,8 @@ pub struct FrameFingerprint {
     pub samples_per_pixel: u32,
     pub strip_offsets: Vec<u64>,
     pub strip_byte_counts: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_identity: Option<RawIdentity>,
 }
 
 impl From<&FrameDesc> for FrameFingerprint {
@@ -47,6 +49,7 @@ impl From<&FrameDesc> for FrameFingerprint {
             samples_per_pixel: header.samples_per_pixel,
             strip_offsets: header.strip_offsets.clone(),
             strip_byte_counts: header.strip_byte_counts.clone(),
+            raw_identity: header.raw_identity.clone(),
         }
     }
 }
@@ -151,6 +154,7 @@ impl StackFingerprint {
                 a.strip_byte_counts,
                 b.strip_byte_counts
             );
+            check_field!(i, b.path, "raw_identity", a.raw_identity, b.raw_identity);
         }
         Ok(())
     }
@@ -159,7 +163,7 @@ impl StackFingerprint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::TiffHeader;
+    use crate::io::{RawIdentity, TiffHeader};
 
     fn frame(path: &str, width: u32) -> FrameFingerprint {
         FrameFingerprint {
@@ -171,6 +175,7 @@ mod tests {
             samples_per_pixel: 3,
             strip_offsets: vec![1, 2, 3],
             strip_byte_counts: vec![4, 5, 6],
+            raw_identity: None,
         }
     }
 
@@ -201,6 +206,37 @@ mod tests {
         assert_eq!(err.found, "20");
         assert!(err.to_string().contains("a.tif"));
         assert!(err.to_string().contains("width"));
+    }
+
+    #[test]
+    fn raw_identity_is_compared_and_omitted_for_tiff() {
+        let mut a = frame("a.dng", 10);
+        a.raw_identity = Some(RawIdentity {
+            make: "Test".to_string(),
+            model: "Camera".to_string(),
+            serial_number: Some("one".to_string()),
+            capture_time_original: Some("2026:08:29 18:42:41".to_string()),
+            raw_width: 12,
+            raw_height: 10,
+            black_levels: Some(vec![64.0; 4]),
+            white_levels: Some(vec![4095]),
+            cfa: Some(vec![0, 1, 1, 2]),
+            cfa_width: Some(2),
+            cfa_height: Some(2),
+        });
+        let mut b = a.clone();
+        b.raw_identity.as_mut().expect("RAW identity").serial_number = Some("two".to_string());
+        let error = StackFingerprint { frames: vec![a] }
+            .compare(&StackFingerprint { frames: vec![b] })
+            .expect_err("RAW metadata must invalidate resume");
+        assert_eq!(error.field, "raw_identity");
+
+        let tiff = frame("a.tif", 10);
+        assert!(
+            !serde_json::to_string(&tiff)
+                .expect("TIFF fingerprint serializes")
+                .contains("raw_identity")
+        );
     }
 
     #[test]

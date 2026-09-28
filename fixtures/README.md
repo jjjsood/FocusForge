@@ -2,7 +2,7 @@
 
 Small crops of the reference focus stack, checked in so `cargo test` has real sensor data to work on without the 16 GB stack being anywhere near the repository.
 
-Generated: 2026-09-19
+Generated: 2026-09-28
 
 ## Sets
 
@@ -34,8 +34,11 @@ Generated: 2026-09-19
 | `mantis-64-old-deflate-p2-strip-mm` | 3 | `4064,2700,64,64` | 64x64 |
 | `mantis-64-old-deflate-p2-tile-ii` | 3 | `4064,2700,64,64` | 64x64 |
 | `mantis-64-old-deflate-p2-tile-mm` | 3 | `4064,2700,64,64` | 64x64 |
+| `blackmagic-micro-dng` | 1 | single DNG | 1952x1104 |
 
 Each set holds `frames/NN.tif` in focus order, `reference.tif`, and a `README.md` naming the source frame behind every `NN`. Outputs are little-endian, uncompressed, chunky, one strip per row. The `mantis-64-` sets add LZW and deflate encodings in both byte orders, with strips or zero-padded tiles and Predictor 1 or 2.
+
+`blackmagic-micro-dng` is one lossless-JPEG DNG camera frame with its own README; it has no `frames/` directory or `reference.tif`.
 
 With one deliberate exception: `mantis-64/reference-MM-rps8.tif` is the reference crop left in `Mantis_Stacked.tif`'s own layout (big-endian `MM`, RowsPerStrip=8). Normalizing every fixture would leave nothing here exercising the layout the reader meets on the real file. It holds the same samples as that set's `reference.tif` and differs from it on disk.
 

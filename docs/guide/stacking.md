@@ -1,7 +1,7 @@
 # Stacking a folder of frames
 
-`focusforge-cli stack` fuses a directory of TIFF frames — the same shape
-`focusforge-cli info` inspects — into a **project**, through a chosen
+`focusforge-cli stack` fuses a directory of TIFF or supported RAW frames —
+the same shape `focusforge-cli info` inspects — into a **project**, through a chosen
 algorithm. A run prepares a project for review; it does not write an image
 file. `focusforge-cli export` does that, as a separate step.
 
@@ -22,6 +22,14 @@ Before fusing, `stack` aligns the frames and crops the output to the region
 every one of them covers — both on by default. See
 [`guide/alignment.md`](alignment.md) for how that stage works and how to
 turn it off.
+
+## RAW frames
+
+RAW input uses `rawler`. Put one compatible RAW format in a directory and run
+the same command as for TIFF; `info` reports camera metadata before a stack
+run. TIFF and RAW frames form separate stacks, and a group that mixes them is
+refused before pixels are developed. A file the decoder cannot read reports an
+error; FocusForge has no alternate RAW decoder.
 
 ## Getting an image back
 
