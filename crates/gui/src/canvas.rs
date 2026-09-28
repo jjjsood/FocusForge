@@ -105,13 +105,10 @@ pub fn check_pane_dimensions(composite: (u32, u32), zmap: (u32, u32)) -> Result<
     }
 }
 
-/// The selected frame's own view onto a tab's newest fuse: the
-/// reference-to-frame [`Transform`] the fuse recorded for it, the crop's
-/// top-left in frame coordinates, and the composite's own extent -- what
-/// [`FrameSource::read_into`] warps every read through, so the left pane
-/// draws the same scene point at the same pane position as the composite.
-/// `None` at a [`FrameSource`] call site means the raw frame, read through
-/// identity at `(0, 0)`.
+/// A frame's reference-to-frame [`Transform`], crop origin and composite
+/// extent, as recorded by the fuse. [`FrameSource::read_into`] warps every
+/// read through this so the left pane lines up with the composite. `None`
+/// means the raw frame, read through identity at `(0, 0)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameView {
     pub transform: Transform,
