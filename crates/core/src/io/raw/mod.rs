@@ -536,20 +536,7 @@ fn open_dng_inner(path: &Path) -> Result<RawFrame, RawError> {
             .map(|entry| entry.value.force_u16(1)),
         color_matrix: values_f32(raw.get_entry(50721_u16)),
     };
-    let desc = FrameDesc {
-        path: path.to_path_buf(),
-        file_size: std::fs::metadata(path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0),
-        image_description: None,
-        width: output_width,
-        height: output_height,
-        samples_per_pixel: 3,
-        strip_offsets: Vec::new(),
-        strip_byte_counts: Vec::new(),
-        layout_label: "RAW".to_string(),
-        layout_signature: vec!["RAW developed RGB".to_string()],
-    };
+    let desc = raw_desc(path, output_width, output_height);
     Ok(RawFrame { metadata, desc })
 }
 
@@ -619,21 +606,25 @@ fn open_dummy_inner(path: &Path) -> Result<RawFrame, RawError> {
             .color_matrix_find_first([rawler::imgop::xyz::Illuminant::D65])
             .map(|(_, matrix)| matrix),
     };
-    let desc = FrameDesc {
+    let desc = raw_desc(path, output_width, output_height);
+    Ok(RawFrame { metadata, desc })
+}
+
+fn raw_desc(path: &Path, width: u32, height: u32) -> FrameDesc {
+    FrameDesc {
         path: path.to_path_buf(),
         file_size: std::fs::metadata(path)
             .map(|metadata| metadata.len())
             .unwrap_or(0),
         image_description: None,
-        width: output_width,
-        height: output_height,
+        width,
+        height,
         samples_per_pixel: 3,
         strip_offsets: Vec::new(),
         strip_byte_counts: Vec::new(),
         layout_label: "RAW".to_string(),
         layout_signature: vec!["RAW developed RGB".to_string()],
-    };
-    Ok(RawFrame { metadata, desc })
+    }
 }
 
 fn values_f32(entry: Option<&rawler::formats::tiff::Entry>) -> Option<Vec<f32>> {
