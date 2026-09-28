@@ -15,7 +15,7 @@ use crate::tile::Rect;
 use crate::zmap::ZMapError;
 
 pub use brush::{apply, footprint};
-pub use recomposite::{Sources, named_frames, recomposite};
+pub use recomposite::{Sources, named_frames, recomposite, recomposite_bands};
 pub use replay::{replay, replay_tile};
 pub use session::EditSession;
 pub use zmap_io::{session_tile, write_edited};

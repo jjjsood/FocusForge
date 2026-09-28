@@ -13,7 +13,6 @@ use focusforge_core::display::{alpha_from_opacity, overlay_cpu};
 use focusforge_core::io::{TiffSpec, TiffStack, TiffWriter, frame_paths};
 use focusforge_core::project::{self, Op};
 use focusforge_core::retouch::{self, EditSession};
-use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter, overlay_table};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
@@ -342,10 +341,27 @@ fn validate_render_args(
     Ok(())
 }
 
-/// Recomposites the just-written `out` map against `frames_dir` in one
-/// banded pass, writing `render_path` (16-bit RGB TIFF) and/or `overlay_path`
-/// (8-bit RGBA PNG, [`overlay_table`]'s colours blended at `opacity`).
-/// [`validate_render_args`] has already refused any collision or mismatch.
+/// A band-loop failure from [`retouch::recomposite_bands`]: either its own
+/// gather failed, or the sink writing the TIFF tile or overlay pixels did.
+struct RenderBandError(String);
+
+impl From<retouch::RetouchError> for RenderBandError {
+    fn from(err: retouch::RetouchError) -> Self {
+        RenderBandError(err.to_string())
+    }
+}
+
+impl std::fmt::Display for RenderBandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Recomposites the just-written `out` map against `frames_dir` through
+/// [`retouch::recomposite_bands`], writing `render_path` (16-bit RGB TIFF)
+/// and/or `overlay_path` (8-bit RGBA PNG, [`overlay_table`]'s colours
+/// blended at `opacity`). [`validate_render_args`] has already refused any
+/// collision or mismatch.
 fn write_render(
     out: &Path,
     frames_dir: &Path,
@@ -407,50 +423,35 @@ fn write_render(
         }
     };
 
-    let mut indices = vec![0u16; width as usize * ROWS_PER_PASS as usize];
-    let mut samples = vec![0u16; width as usize * ROWS_PER_PASS as usize * spp as usize];
-    let mut y = 0u32;
-    while y < height {
-        let band_height = ROWS_PER_PASS.min(height - y);
-        let band = Rect {
-            x: 0,
-            y,
-            width,
-            height: band_height,
-        };
-        let len = (width * band_height) as usize;
-        if let Err(err) = reader.read_tile_into(band, &mut indices[..len]) {
-            cleanup(&tiff_partial);
-            return Err(fail(err));
-        }
-        if let Err(err) = retouch::recomposite(
-            &indices[..len],
-            band,
-            &sources,
-            &mut samples[..len * spp as usize],
-        ) {
-            cleanup(&tiff_partial);
-            return Err(fail(err));
-        }
-        if let Some(writer) = tiff_writer.as_mut()
-            && let Err(err) = writer.write_tile(band, &samples[..len * spp as usize])
-        {
-            cleanup(&tiff_partial);
-            return Err(fail(err));
-        }
-        if let (Some(table), Some(buf)) = (&table, overlay_buffer.as_mut()) {
-            let band_offset = y as usize * width as usize * 4;
-            overlay_cpu(
-                &samples[..len * spp as usize],
-                &indices[..len],
-                width,
-                band_height,
-                table,
-                alpha,
-                &mut buf[band_offset..band_offset + len * 4],
-            );
-        }
-        y += band_height;
+    let result = retouch::recomposite_bands(
+        &reader,
+        &sources,
+        ROWS_PER_PASS,
+        |band, indices, samples| {
+            if let Some(writer) = tiff_writer.as_mut() {
+                writer
+                    .write_tile(band, samples)
+                    .map_err(|err| RenderBandError(err.to_string()))?;
+            }
+            if let (Some(table), Some(buf)) = (&table, overlay_buffer.as_mut()) {
+                let band_offset = band.y as usize * width as usize * 4;
+                let len = (band.width * band.height) as usize;
+                overlay_cpu(
+                    samples,
+                    indices,
+                    width,
+                    band.height,
+                    table,
+                    alpha,
+                    &mut buf[band_offset..band_offset + len * 4],
+                );
+            }
+            Ok::<(), RenderBandError>(())
+        },
+    );
+    if let Err(err) = result {
+        cleanup(&tiff_partial);
+        return Err(fail(err));
     }
 
     let rendered = match (render_path, tiff_writer, &tiff_partial) {

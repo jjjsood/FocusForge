@@ -164,8 +164,13 @@ fn sealed(name: &str, w: u32, h: u32, frames: u32) -> (PathBuf, PathBuf) {
 fn sealed_mantis(name: &str) -> (PathBuf, PathBuf) {
     let dir = tmp_dir(name);
     let mantis = common::mantis_512_dir();
-    let composite = mantis.join("golden").join("laplacian.tif");
-    let zmap = mantis.join("golden").join("laplacian-zmap.tif");
+    // Copied rather than staged straight from the fixture: `seal` stages its
+    // blobs beside `staged_composite`, and concurrent tests must not share
+    // that directory.
+    let composite = dir.join("golden-composite.tif");
+    std::fs::copy(mantis.join("golden").join("laplacian.tif"), &composite).unwrap();
+    let zmap = dir.join("golden-zmap.tif");
+    std::fs::copy(mantis.join("golden").join("laplacian-zmap.tif"), &zmap).unwrap();
     let sources: Vec<PathBuf> = (0..8)
         .map(|i| mantis.join("frames").join(format!("{i:02}.tif")))
         .collect();

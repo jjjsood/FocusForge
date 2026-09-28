@@ -210,7 +210,7 @@ fn open_for_history(
 /// id first, else the unique checkpoint whose id starts with it. An
 /// ambiguous prefix names every match; no match reuses
 /// [`ProjectError::UnknownCheckpoint`]'s own wording.
-fn resolve_checkpoint<'a>(
+pub(crate) fn resolve_checkpoint<'a>(
     history: &'a History,
     project_path: &Path,
     id_or_prefix: &str,

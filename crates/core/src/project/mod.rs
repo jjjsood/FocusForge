@@ -56,6 +56,7 @@ pub mod checkpoint;
 pub mod container;
 pub mod error;
 pub mod manifest;
+mod render;
 pub mod review;
 pub mod seal;
 pub mod validate;
@@ -78,6 +79,7 @@ pub use manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
     SourceResolution,
 };
+pub use render::{CheckpointImage, render_checkpoint};
 pub use review::ReviewMetrics;
 pub use seal::{HeldCheckpoint, SealRequest, SealedProject, now_unix, seal, seal_at, seal_held};
 pub use validate::{

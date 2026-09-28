@@ -234,6 +234,11 @@ enum Command {
         /// Write the Z-Map to this path.
         #[arg(long, value_name = "FILE")]
         zmap: Option<PathBuf>,
+        /// A checkpoint id or unique id prefix. Defaults to the head. A
+        /// fused checkpoint needs no source frames; an op-bearing one
+        /// re-reads and verifies its nearest fused ancestor's sources.
+        #[arg(long, value_name = "ID")]
+        checkpoint: Option<String>,
         /// Emit the frozen JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
@@ -496,8 +501,15 @@ fn main() -> ExitCode {
             project,
             output,
             zmap,
+            checkpoint,
             json,
-        } => export::run(&project, output.as_deref(), zmap.as_deref(), json),
+        } => export::run(
+            &project,
+            output.as_deref(),
+            zmap.as_deref(),
+            checkpoint.as_deref(),
+            json,
+        ),
         Command::Retouch {
             zmap,
             ops,

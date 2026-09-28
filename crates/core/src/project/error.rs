@@ -172,6 +172,29 @@ pub enum ProjectError {
         path.display()
     )]
     OpsWithoutParent { path: PathBuf, checkpoint: String },
+
+    /// A render of `checkpoint` needs its fused ancestor's sources, and
+    /// [`super::validate::check_sources`] found at least one missing or
+    /// changed: `detail` names each, one per line.
+    #[error(
+        "{}: checkpoint {checkpoint}'s sources cannot be read:\n{detail}",
+        path.display()
+    )]
+    RenderSourcesUnavailable {
+        path: PathBuf,
+        checkpoint: String,
+        detail: String,
+    },
+
+    /// A render of `checkpoint` needs its fused ancestor's per-frame
+    /// transforms, and its [`super::checkpoint::FuseRecord::align`] carries
+    /// none despite naming an alignment algorithm.
+    #[error(
+        "{}: checkpoint {checkpoint} cannot be rendered -- its alignment was not saved with it, \
+         so its source frames cannot be placed. Re-fuse this stack to record alignment.",
+        path.display()
+    )]
+    RenderAlignmentUnrecorded { path: PathBuf, checkpoint: String },
 }
 
 impl ProjectError {

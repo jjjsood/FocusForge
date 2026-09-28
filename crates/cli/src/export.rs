@@ -21,7 +21,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use focusforge_core::project::{self, Plane, Project};
+use focusforge_core::project::{self, Project};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
@@ -41,6 +41,9 @@ pub struct ExportReport {
     pub samples_per_pixel: u32,
     pub frame_count: u32,
     pub algorithm: String,
+    /// The checkpoint this export rendered: `--checkpoint`'s resolved id,
+    /// or the head's when it was omitted.
+    pub checkpoint: String,
     pub wall_seconds: f64,
 }
 
@@ -48,10 +51,13 @@ pub struct ExportReport {
 ///
 /// At least one of `-o`/`--zmap` is required **by name**, checked here so
 /// the error names the missing flag instead of clap's generic exit 2.
+/// `checkpoint` is an id or unique id prefix, resolved against the
+/// project's own history; `None` renders the head.
 pub fn run(
     project_path: &Path,
     output: Option<&Path>,
     zmap: Option<&Path>,
+    checkpoint: Option<&str>,
     json: bool,
 ) -> ExitCode {
     let start = Instant::now();
@@ -77,8 +83,9 @@ pub fn run(
     if !unresolved.is_empty() {
         let warning = format!(
             "warning: {} source frame(s) unresolved -- not reachable from this project, either \
-             because the path was recorded as given or because it is no longer there. The \
-             export below is unaffected; re-fusing or retouching would not be:",
+             because the path was recorded as given or because it is no longer there. A fused \
+             checkpoint's export is unaffected; an op-bearing checkpoint's needs them and may \
+             fail below:",
             unresolved.len()
         );
         eprintln!("{warning}");
@@ -88,19 +95,30 @@ pub fn run(
         tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "{warning}");
     }
 
-    let composite_ref = project.plane(Plane::Composite).clone();
-    let zmap_ref = project.plane(Plane::ZMap).clone();
-    let algorithm = project.manifest().algorithm.clone();
+    let resolved = match checkpoint {
+        Some(id_or_prefix) => {
+            crate::history::resolve_checkpoint(project.history(), project_path, id_or_prefix)
+        }
+        None => Ok(project.checkpoint()),
+    };
+    let checkpoint = match resolved {
+        Ok(checkpoint) => checkpoint.clone(),
+        Err(err) => return fail(err),
+    };
+    let record = match project.fuse_state(&checkpoint.id) {
+        Ok(record) => record,
+        Err(err) => return fail(err),
+    };
 
     let mut wrote = Vec::new();
     if let Some(path) = output {
-        if let Err(err) = project::materialize_plane(&mut project, Plane::Composite, path) {
+        if let Err(err) = project::render_checkpoint(&mut project, &checkpoint.id, path) {
             return fail(err);
         }
         wrote.push(path.display().to_string());
     }
     if let Some(path) = zmap {
-        if let Err(err) = project::materialize_plane(&mut project, Plane::ZMap, path) {
+        if let Err(err) = project::materialize_zmap(&mut project, &checkpoint, path) {
             return fail(err);
         }
         wrote.push(path.display().to_string());
@@ -110,11 +128,12 @@ pub fn run(
         project: project_path.display().to_string(),
         wrote,
         unresolved_sources: unresolved,
-        width: composite_ref.width,
-        height: composite_ref.height,
-        samples_per_pixel: composite_ref.samples_per_pixel,
-        frame_count: zmap_ref.frame_count,
-        algorithm,
+        width: record.composite.width,
+        height: record.composite.height,
+        samples_per_pixel: record.composite.samples_per_pixel,
+        frame_count: record.composite.frame_count,
+        algorithm: checkpoint.algorithm,
+        checkpoint: checkpoint.id,
         wall_seconds: start.elapsed().as_secs_f64(),
     };
     if json {
@@ -138,6 +157,7 @@ fn render(report: &ExportReport) -> String {
             report.width, report.height, report.samples_per_pixel, report.frame_count
         ),
         format!("algorithm: {}", report.algorithm),
+        format!("checkpoint: {}", report.checkpoint),
     ];
     if !report.unresolved_sources.is_empty() {
         lines.push(format!(
@@ -173,6 +193,7 @@ mod tests {
             samples_per_pixel: 3,
             frame_count: 8,
             algorithm: "example-stack".to_string(),
+            checkpoint: "abc123".to_string(),
             wall_seconds: 0.25,
         });
         for needle in [
@@ -181,6 +202,7 @@ mod tests {
             "3ch",
             "8 frames",
             "algorithm: example-stack",
+            "checkpoint: abc123",
             "unresolved sources: 1",
             "wrote: out.tif",
             "wrote: out-zmap.tif",
