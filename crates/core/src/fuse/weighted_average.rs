@@ -328,8 +328,10 @@ inventory::submit! { StackRegistration::new(&WeightedAverage) }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tile::Rect;
-    use crate::tile::plan::{DEFAULT_TILE_SIZE, margin_for_levels, min_tile_size_for_levels};
+    use crate::tile::plan::{
+        DEFAULT_TILE_SIZE, TilePlan, margin_for_levels, min_tile_size_for_levels,
+    };
+    use crate::tile::{Rect, TileError};
 
     fn rect(width: u32, height: u32) -> Rect {
         Rect {
@@ -377,6 +379,50 @@ mod tests {
             ParamValue::Float(weight_exponent),
         );
         cfg
+    }
+
+    fn declared_int_max(id: &str) -> i64 {
+        PARAMS
+            .iter()
+            .find(|parameter| parameter.id == id)
+            .and_then(|parameter| match &parameter.kind {
+                ParamKind::Int { max, .. } => Some(*max),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{id} must be declared as an integer parameter"))
+    }
+
+    #[test]
+    fn shipped_radius_range_defaults_and_endpoints_remain_validated() {
+        let radius = PARAMS
+            .iter()
+            .find(|parameter| parameter.id == "radius")
+            .expect("radius must be declared");
+        assert!(matches!(&radius.kind, ParamKind::Int { min: 0, max: 16 }));
+        assert_eq!(radius.default, ParamValue::Int(RADIUS_DEFAULT));
+
+        let algo = WeightedAverage;
+        let (width, height, spp) = (64, 64, 3);
+        let tiles = vec![tile_of(
+            width,
+            height,
+            spp,
+            checkerboard(width, height, spp),
+        )];
+        let ctx = TileCtx::new(rect(width, height), &tiles);
+        for radius in [0, 16] {
+            algo.fuse(&ctx, &cfg(radius, WEIGHT_EXPONENT_DEFAULT))
+                .unwrap_or_else(|error| panic!("radius={radius} must fuse: {error}"));
+        }
+        let error = algo
+            .fuse(&ctx, &cfg(17, WEIGHT_EXPONENT_DEFAULT))
+            .expect_err("radius=17 must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("radius: value 17 is outside the allowed range [0, 16]"),
+            "error: {error}"
+        );
     }
 
     #[test]
@@ -523,9 +569,14 @@ mod tests {
     ///
     /// A radius-8 window over a full 0..65535 checkerboard gives a score
     /// around 1e6. At `weight-exponent = 8.0` -- the declared maximum --
-    /// `1e6^8` is about `1e48`, which is infinity in `f32` (max ~3.4e38);
-    /// at that weight the declared range must not overflow to a black
-    /// pixel.
+    /// `1e6^8` is about `1e48`, which is infinity in `f32` (max ~3.4e38).
+    /// Before the weight was widened to `f64` this produced `inf / inf` in
+    /// the normalisation, i.e. `NaN`, which rounds to 0: a black pixel at
+    /// the sharpest point in the image, with no error raised anywhere.
+    ///
+    /// The declared range is part of the contract, so the whole of it has
+    /// to work. This is the criterion that was missing when the range was
+    /// declared.
     #[test]
     fn the_top_of_the_declared_range_does_not_overflow() {
         let (w, h, spp) = (32u32, 32u32, 1u32);
@@ -558,7 +609,8 @@ mod tests {
     #[test]
     fn declared_ranges_fit_the_shipped_geometry() {
         let algo = WeightedAverage;
-        for radius in 0..=16i64 {
+        let max_radius = declared_int_max("radius");
+        for radius in 0..=max_radius {
             let cfg = cfg(radius, 2.0);
             let levels = algo.tile_levels(&cfg);
             let reach = DETAIL_REACH + radius as u32;
@@ -573,6 +625,20 @@ mod tests {
                 min_tile_size_for_levels(levels)
             );
         }
+        let cfg = cfg(max_radius, WEIGHT_EXPONENT_DEFAULT);
+        let levels = algo.tile_levels(&cfg);
+        let minimum = min_tile_size_for_levels(levels);
+        assert!(
+            TilePlan::new(minimum, minimum, minimum, levels).is_ok(),
+            "radius={max_radius}: the reported minimum tile {minimum} must plan"
+        );
+        assert!(
+            matches!(
+                TilePlan::new(minimum, minimum, minimum - 1, levels),
+                Err(TileError::NoInterior { min_tile_size, .. }) if min_tile_size == minimum
+            ),
+            "radius={max_radius}: one pixel below the reported minimum {minimum} must be refused"
+        );
     }
 
     #[test]

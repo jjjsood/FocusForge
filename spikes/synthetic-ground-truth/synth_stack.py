@@ -39,6 +39,7 @@ NFRAMES = 8
 SIGMA_QUANT = 0.2  # blur-bank resolution, in sigma
 OUT = ".scratch/spike-synth"
 CLI = "./target/debug/focusforge-cli"
+HARNESS_LIB = "tools/lib"  # from the repository root; override with --harness
 
 ZMAP_UNSET = 0xFFFF  # core::zmap reserves u16::MAX
 
@@ -130,20 +131,26 @@ def scene_mantis():
 SCENES = {"easy": scene_easy, "hard": scene_hard, "mantis": scene_mantis}
 
 
-def depth_map():
+def depth_map(frames=NFRAMES, relief="standard"):
     """Continuous depth in [0, NFRAMES-1]: a tilted plane for smooth gradients,
     a spherical cap for curvature, and a hard step that generates the depth
     discontinuity a pyramid blend has to cope with."""
     yy, xx = np.mgrid[0:H, 0:W]
     u, v = xx / (W - 1.0), yy / (H - 1.0)
-    d = 0.55 * u + 0.25 * v
+    if relief == "shallow-tilt":
+        plane_u, plane_v = 0.275, 0.125
+    elif relief in ("standard", "steep-step"):
+        plane_u, plane_v = 0.55, 0.25
+    else:
+        raise ValueError(f"unknown relief: {relief}")
+    d = plane_u * u + plane_v * v
     cx, cy, r = 0.35, 0.65, 0.28
     rr = np.sqrt((u - cx) ** 2 + (v - cy) ** 2)
     cap = np.where(rr < r, np.sqrt(np.maximum(r * r - rr * rr, 0.0)) / r, 0.0)
     d = d + 0.45 * cap
-    d[STEP] += 0.45
+    d[STEP] += 0.90 if relief == "steep-step" else 0.45
     d = (d - d.min()) / (d.max() - d.min())
-    return d * (NFRAMES - 1)
+    return d * (frames - 1)
 
 
 STEP = (slice(80, 200), slice(300, 470))  # the hard depth step, for the error report
@@ -152,32 +159,37 @@ STEP = (slice(80, 200), slice(300, 470))  # the hard depth step, for the error r
 # ---------------------------------------------------------------- render
 
 
-def render(src, depth, sigma_step, noise_sd, seed=11):
+def render(src, depth, sigma_step, noise_sd, seed=11, frames=NFRAMES):
     """frames[k] = src defocused by sigma = sigma_step * |depth - k|.
 
     Blurring is done once into a bank of quantized sigmas and interpolated per
     pixel: the bank does not depend on k, so 8 frames cost one bank.
     """
-    sigmas = np.arange(0.0, sigma_step * (NFRAMES - 1) + SIGMA_QUANT, SIGMA_QUANT)
+    sigmas = np.arange(0.0, sigma_step * (frames - 1) + SIGMA_QUANT, SIGMA_QUANT)
     bank = np.stack([blur(src, s) for s in sigmas])
     rng = np.random.default_rng(seed)
     ys, xs = np.arange(H)[:, None], np.arange(W)[None, :]
-    frames = []
-    for k in range(NFRAMES):
+    rendered = []
+    for k in range(frames):
         pos = np.clip(sigma_step * np.abs(depth - k) / SIGMA_QUANT, 0, len(sigmas) - 1.0001)
         lo = pos.astype(np.int32)
         t = (pos - lo)[:, :, None]
         f = bank[lo, ys, xs, :] * (1 - t) + bank[lo + 1, ys, xs, :] * t
         if noise_sd > 0:
             f = f + rng.normal(0.0, noise_sd, f.shape)
-        frames.append(np.clip(np.rint(f), 0, 65535).astype(np.uint16))
-    return frames
+        rendered.append(np.clip(np.rint(f), 0, 65535).astype(np.uint16))
+    return rendered
 
 
 def write_rgb(path, arr):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     pixels = np.clip(np.rint(arr), 0, 65535).astype(np.uint16).tobytes()
     rawtiff.write_tiff(path, W, H, pixels, bits=16, spp=SPP)
+
+
+def write_depth(path, arr):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    rawtiff.write_tiff(path, W, H, arr.astype("<u2", copy=False).tobytes(), bits=16, spp=1)
 
 
 def read_tiff(path):
@@ -234,7 +246,7 @@ def block_mean_ssim(a, b):
 def gather(frames, zidx):
     """The composite a Z-Map implies: pick frame zidx[y, x] at every pixel."""
     ys, xs = np.mgrid[0:H, 0:W]
-    return np.stack(frames)[np.clip(zidx, 0, NFRAMES - 1), ys, xs, :]
+    return np.stack(frames)[np.clip(zidx, 0, len(frames) - 1), ys, xs, :]
 
 
 def score(comp, zidx, truth_img, truth_z):
@@ -330,11 +342,11 @@ def save_error_map(path, truth_z, zidx, err):
 # ---------------------------------------------------------------- driver
 
 
-def run_scene(name, src, depth, sigma_step, noise_sd, levels_list):
-    truth_z = np.clip(np.rint(depth), 0, NFRAMES - 1).astype(np.uint16)
+def run_scene(name, src, depth, sigma_step, noise_sd, levels_list, frames=NFRAMES):
+    truth_z = np.clip(np.rint(depth), 0, frames - 1).astype(np.uint16)
     truth_img = np.clip(np.rint(src), 0, 65535).astype(np.uint16)
-    frames = render(src, depth, sigma_step, noise_sd)
-    for k, f in enumerate(frames):
+    rendered = render(src, depth, sigma_step, noise_sd, frames=frames)
+    for k, f in enumerate(rendered):
         write_rgb(f"{OUT}/{name}/frames/{k:02d}.tif", f)
     write_rgb(f"{OUT}/{name}-truth.tif", src)
 
@@ -345,11 +357,11 @@ def run_scene(name, src, depth, sigma_step, noise_sd, levels_list):
     # Controls. These are the spike's own correctness check: the true Z-Map must
     # win outright and a random one must lose outright, or the scoring is broken
     # and nothing below it means anything.
-    show("CONTROL true z-map", score(gather(frames, truth_z), truth_z, truth_img, truth_z))
-    rz = np.random.default_rng(3).integers(0, NFRAMES, (H, W)).astype(np.uint16)
-    show("CONTROL random z-map", score(gather(frames, rz), rz, truth_img, truth_z))
+    show("CONTROL true z-map", score(gather(rendered, truth_z), truth_z, truth_img, truth_z))
+    rz = np.random.default_rng(3).integers(0, frames, (H, W)).astype(np.uint16)
+    show("CONTROL random z-map", score(gather(rendered, rz), rz, truth_img, truth_z))
     best = max(
-        (score(f, np.full((H, W), k, np.uint16), truth_img, truth_z) for k, f in enumerate(frames)),
+        (score(f, np.full((H, W), k, np.uint16), truth_img, truth_z) for k, f in enumerate(rendered)),
         key=lambda s: s["psnr"],
     )
     show("CONTROL best single frame", best)
@@ -412,7 +424,7 @@ def similarity_matrix(scale, rot_deg, tx, ty, cx, cy):
     return translate @ back @ rotscale @ to_origin
 
 
-def warp_transforms(amp, seed, reference):
+def warp_transforms(amp, seed, reference, frames=NFRAMES):
     """One reference-to-frame matrix per frame. Exact identity at `d == 0`
     (the reference frame), with NO rng draw consumed for it -- load-bearing
     for reproducibility, because it keeps every OTHER frame's draw
@@ -421,7 +433,7 @@ def warp_transforms(amp, seed, reference):
     rng = np.random.default_rng(seed)
     cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
     mats = []
-    for k in range(NFRAMES):
+    for k in range(frames):
         d = k - reference
         if d == 0:
             mats.append(np.eye(3))
@@ -447,7 +459,7 @@ def similarity_parts(m):
 
 def _cubic_kernel(x, a=-0.5):
     """The standard Keys cubic-convolution kernel, `a = -0.5` (Catmull-Rom) --
-    matching the Rust warp kernel. At `x = 1` this is exactly `0`
+    the kernel phase README decision 3 pins. At `x = 1` this is exactly `0`
     and at `x = 0` exactly `1`, which is what makes the impulse direction
     check exact arithmetic."""
     x = np.abs(x)
@@ -550,12 +562,14 @@ def run_synthetic_alignment(args):
     shutil.rmtree(out_dir, ignore_errors=True)
     os.makedirs(out_dir, exist_ok=True)
 
-    reference = (NFRAMES - 1) // 2  # 3 of 8, matches driver.rs's reference_index(Middle, 8)
-    depth = depth_map()
+    reference = (args.frames - 1) // 2
+    depth = depth_map(args.frames, args.relief)
     src = SCENES[args.scene]()
 
-    sharp_frames = render(src, depth, args.sigma_step, noise_sd=0.0, seed=args.seed)
-    mats = warp_transforms(args.warp, args.seed, reference)
+    sharp_frames = render(
+        src, depth, args.sigma_step, noise_sd=0.0, seed=args.seed, frames=args.frames
+    )
+    mats = warp_transforms(args.warp, args.seed, reference, frames=args.frames)
     warped = [resample(f.astype(np.float64), m) for f, m in zip(sharp_frames, mats)]
 
     noise_rng = np.random.default_rng(args.seed ^ 0x5A5A5A5A)
@@ -606,7 +620,7 @@ def run_synthetic_alignment(args):
         "width": W,
         "height": H,
         "samples_per_pixel": SPP,
-        "frame_count": NFRAMES,
+        "frame_count": args.frames,
         "reference": reference,
         "resampler": "independent numpy Catmull-Rom (a=-0.5), destination-driven via M^-1, edge-replicate clamp",
         "compose_order": ["defocus", "warp", "sensor-noise"],
@@ -677,6 +691,37 @@ def run_synthetic_alignment(args):
     )
 
 
+def run_unwarped_frames_only(args):
+    """Write registered frames, their sharp reference, and rounded depth truth."""
+    if args.scene == "all":
+        sys.exit("--frames-only requires one scene")
+    shutil.rmtree(args.out, ignore_errors=True)
+    os.makedirs(args.out, exist_ok=True)
+    depth = depth_map(args.frames, args.relief)
+    source = SCENES[args.scene]()
+    rendered = render(source, depth, args.sigma_step, args.noise, args.seed, args.frames)
+    for index, frame in enumerate(rendered):
+        write_rgb(os.path.join(args.out, "frames", f"{index:02d}.tif"), frame)
+    write_rgb(os.path.join(args.out, "reference.tif"), source)
+    truth = np.clip(np.rint(depth), 0, args.frames - 1).astype(np.uint16)
+    write_depth(os.path.join(args.out, "truth-zmap.tif"), truth)
+    metadata = {
+        "frames": args.frames,
+        "height": H,
+        "noise": args.noise,
+        "noise_seed": args.seed,
+        "relief": args.relief,
+        "scene": args.scene,
+        "sigma_step": args.sigma_step,
+        "texture_seed": 7,
+        "width": W,
+    }
+    with open(os.path.join(args.out, "truth.json"), "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(metadata, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    print(f"wrote {args.out}/frames/, reference.tif, truth-zmap.tif and truth.json (no CLI invoked)")
+
+
 def main():
     global OUT, rawtiff
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -686,39 +731,51 @@ def main():
                         "frames look alike, which is what a real fine-stepped stack does")
     p.add_argument("--noise", type=float, default=250.0, help="per-frame additive noise sd, in 16-bit counts")
     p.add_argument("--levels", default="1,2,3,4,5")
+    p.add_argument("--harness", default=HARNESS_LIB, help="path to this repository's tools/lib, relative to the working directory")
     p.add_argument("--warp", type=float, default=0.0,
                    help="misregistration amplitude; > 0 selects the ground-truth "
                         "alignment run and REPLACES the fusion-scoring run")
     p.add_argument("--seed", type=int, default=11,
                    help="seed for the per-frame warp model and the post-warp sensor noise")
+    p.add_argument("--frames", type=int, default=NFRAMES,
+                   help="number of focus planes (2 through 65535)")
+    p.add_argument("--relief", choices=("standard", "steep-step", "shallow-tilt"), default="standard",
+                   help="depth relief profile")
     p.add_argument("--out", default=OUT, help="output directory")
     p.add_argument("--algo", default="pyramidal-ecc",
                    help="alignment algorithm id passed to `align --algo` (--warp path only)")
     p.add_argument("--frames-only", action="store_true",
-                   help="render frames and truth.json only; invoke no CLI (--warp path only)")
+                   help="render frames and truth files without invoking the CLI")
     p.add_argument("--self-check", action="store_true",
                    help="run the direction verification alone and exit")
     a = p.parse_args()
+
+    if not 2 <= a.frames <= ZMAP_UNSET:
+        p.error("--frames must be an integer from 2 through 65535")
 
     if a.self_check:
         ok, _n, _loc = direction_check_impulse()
         sys.exit(0 if ok else 1)
 
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools", "lib"))
+    sys.path.insert(0, a.harness)
     import rawtiff  # noqa: PLC0415  -- needs the path set above
 
     if a.warp > 0:
         run_synthetic_alignment(a)
         return
 
+    if a.frames_only:
+        run_unwarped_frames_only(a)
+        return
+
     if not os.path.exists(CLI):
         sys.exit(f"{CLI} not found -- build the workspace first")
     OUT = a.out
     os.makedirs(OUT, exist_ok=True)
-    depth = depth_map()
+    depth = depth_map(a.frames, a.relief)
     for name in SCENES if a.scene == "all" else [a.scene]:
         run_scene(name, SCENES[name](), depth, a.sigma_step, a.noise,
-                  [int(x) for x in a.levels.split(",")])
+                  [int(x) for x in a.levels.split(",")], a.frames)
     print(f"\noutputs in {OUT}/")
 
 
