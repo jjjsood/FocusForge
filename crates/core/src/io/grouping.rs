@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use super::error::TiffError;
 use super::tiff::header::TiffHeader;
-use super::tiff::stack::frame_paths;
+use super::{RAW_EXTENSIONS, RawStack, all_frame_paths, has_extension};
 
 /// The capture-time gap that starts a new group: frames further apart than
 /// this belong to different stacks.
@@ -64,6 +64,22 @@ pub enum GroupSignal {
     /// that is `Mantis_Stacked.tif`, a result file sitting beside its own
     /// sources.
     Untimed,
+    /// A RAW partition with no readable capture time.
+    RawDirectory,
+    /// A RAW partition cut by capture-time gaps.
+    RawCaptureTime,
+    /// A RAW partition with one timed stack.
+    RawBoth,
+    /// Untimed RAW frames beside timed RAW frames.
+    RawUntimed,
+    /// A TIFF partition with no readable capture time.
+    TiffDirectory,
+    /// A TIFF partition cut by capture-time gaps.
+    TiffCaptureTime,
+    /// A TIFF partition with one timed stack.
+    TiffBoth,
+    /// Untimed TIFF frames beside timed TIFF frames.
+    TiffUntimed,
 }
 
 impl GroupSignal {
@@ -74,6 +90,28 @@ impl GroupSignal {
             GroupSignal::CaptureTime => "capture-time",
             GroupSignal::Both => "directory+capture-time",
             GroupSignal::Untimed => "untimed",
+            GroupSignal::RawDirectory => "raw/directory",
+            GroupSignal::RawCaptureTime => "raw/capture-time",
+            GroupSignal::RawBoth => "raw/directory+capture-time",
+            GroupSignal::RawUntimed => "raw/untimed",
+            GroupSignal::TiffDirectory => "tiff/directory",
+            GroupSignal::TiffCaptureTime => "tiff/capture-time",
+            GroupSignal::TiffBoth => "tiff/directory+capture-time",
+            GroupSignal::TiffUntimed => "tiff/untimed",
+        }
+    }
+
+    fn with_format(self, raw: bool) -> Self {
+        match (raw, self) {
+            (true, Self::Directory) => Self::RawDirectory,
+            (true, Self::CaptureTime) => Self::RawCaptureTime,
+            (true, Self::Both) => Self::RawBoth,
+            (true, Self::Untimed) => Self::RawUntimed,
+            (false, Self::Directory) => Self::TiffDirectory,
+            (false, Self::CaptureTime) => Self::TiffCaptureTime,
+            (false, Self::Both) => Self::TiffBoth,
+            (false, Self::Untimed) => Self::TiffUntimed,
+            (_, signal) => signal,
         }
     }
 }
@@ -98,7 +136,7 @@ pub struct Group {
     pub name: String,
     /// The directory its frames were enumerated from.
     pub dir: PathBuf,
-    /// In `frame_paths` order (bytewise by file name), always.
+    /// In `all_frame_paths` order (bytewise by file name), always.
     pub frames: Vec<PathBuf>,
     pub signal: GroupSignal,
     pub first_time: Option<CaptureTime>,
@@ -129,10 +167,10 @@ pub struct Proposal {
 ///
 /// Header tags and directory entries only -- never a tile, never a pixel.
 ///
-/// Walks depth-first, calling [`frame_paths`] at each directory: its
+/// Walks depth-first, calling [`all_frame_paths`] at each directory: its
 /// `NoFrames` is the **negative answer** ("no stack here"), so a thumbnails
 /// or export subdirectory is skipped rather than aborting the walk. Any
-/// other [`TiffError`] does abort. `frame_paths` also redirects a directory
+/// other [`TiffError`] does abort. `all_frame_paths` also redirects a directory
 /// holding a `frames/` subdirectory to that subdirectory, so the committed
 /// fixture layout proposes one group for `fixtures/mantis-512`, not two.
 ///
@@ -141,7 +179,7 @@ pub struct Proposal {
 /// most real intra-stack gaps are 0 s at second resolution and a sort keyed
 /// on time alone would leave the order of most frames to the sort's tie
 /// behaviour -- and then re-sorted by file name inside each group, restoring
-/// exactly `frame_paths`' own order.
+/// exactly `all_frame_paths`' own order.
 ///
 /// A frame whose capture time is absent, unparseable or whose header cannot
 /// be read at all is **untimed**: it groups by directory instead, and says
@@ -171,19 +209,55 @@ pub fn propose_with_progress(
     let mut groups = Vec::new();
     let mut time_signal_available = false;
     for (dir, frames) in dirs {
-        let timed: Vec<Option<CaptureTime>> = frames
+        let has_raw = frames
             .iter()
-            .map(|p| {
-                let time = capture_time(p);
-                frames_read += 1;
-                progress(frames_read, frame_total);
-                time
-            })
-            .collect();
-        if timed.iter().any(Option::is_some) {
-            time_signal_available = true;
+            .any(|path| has_extension(path, RAW_EXTENSIONS));
+        let has_tiff = frames
+            .iter()
+            .any(|path| !has_extension(path, RAW_EXTENSIONS));
+        let partitions: Vec<(bool, Vec<PathBuf>)> = if has_raw && has_tiff {
+            vec![
+                (
+                    true,
+                    frames
+                        .iter()
+                        .filter(|path| has_extension(path, RAW_EXTENSIONS))
+                        .cloned()
+                        .collect(),
+                ),
+                (
+                    false,
+                    frames
+                        .iter()
+                        .filter(|path| !has_extension(path, RAW_EXTENSIONS))
+                        .cloned()
+                        .collect(),
+                ),
+            ]
+        } else {
+            vec![(has_raw, frames)]
+        };
+        for (raw, frames) in partitions {
+            let timed: Vec<Option<CaptureTime>> = frames
+                .iter()
+                .map(|p| {
+                    let time = capture_time(p);
+                    frames_read += 1;
+                    progress(frames_read, frame_total);
+                    time
+                })
+                .collect();
+            if timed.iter().any(Option::is_some) {
+                time_signal_available = true;
+            }
+            let mut partition_groups = group_one_directory(&dir, &frames, &timed);
+            if has_raw && has_tiff {
+                for group in &mut partition_groups {
+                    group.signal = group.signal.with_format(raw);
+                }
+            }
+            groups.extend(partition_groups);
         }
-        groups.extend(group_one_directory(&dir, &frames, &timed));
     }
 
     if groups.is_empty() {
@@ -223,7 +297,7 @@ pub fn one_group(dir: &Path, frames: Vec<PathBuf>) -> Group {
 }
 
 /// Depth-first, bytewise by directory name, so a proposal is deterministic.
-/// A directory that `frame_paths` resolved through its own `frames/`
+/// A directory that `all_frame_paths` resolved through its own `frames/`
 /// subdirectory does not also get that subdirectory walked -- otherwise the
 /// fixture layout would propose the same frames twice. `skipped` collects
 /// every directory the walk gave up on silently: a `NoFrames` directory, or
@@ -239,12 +313,12 @@ fn collect_frame_dirs(
         return Ok(());
     }
 
-    match frame_paths(dir) {
+    match all_frame_paths(dir) {
         Ok(frames) => {
             let self_contained = dir.join("frames").is_dir();
             out.push((dir.to_path_buf(), frames));
             // A directory holding a `frames/` subdirectory **is** one stack
-            // -- that is what `frame_paths` means by redirecting into it --
+            // -- that is what `all_frame_paths` means by redirecting into it --
             // so its other subdirectories are that stack's own baggage
             // (`golden/`, `export/`), never further stacks. Walking them
             // would propose `fixtures/mantis-512/golden` as a second group
@@ -295,6 +369,14 @@ fn collect_frame_dirs(
 /// validator, and the run over that group reports the real error when it
 /// opens the stack.
 pub fn capture_time(path: &Path) -> Option<CaptureTime> {
+    if has_extension(path, RAW_EXTENSIONS) {
+        return RawStack::open_files(&[path.to_path_buf()])
+            .ok()?
+            .metadata(0)?
+            .capture_time_original
+            .as_deref()
+            .and_then(parse_exif_datetime);
+    }
     let header = TiffHeader::open(path).ok()?;
     parse_exif_datetime(header.date_time_original.as_deref()?)
 }
