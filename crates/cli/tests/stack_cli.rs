@@ -1080,14 +1080,14 @@ fn stage_timings_do_not_change_the_output() {
 /// a directory), lets fusion finish, and only fails when sealing tries
 /// to create the container's `.partial`.
 #[test]
+#[cfg(unix)]
 fn failed_seal_leaves_no_output() {
-    use std::os::unix::fs::PermissionsExt;
-
     let cwd = tmp_dir("failed_seal_leaves_no_output");
-    let out_dir = cwd.join("readonly");
-    std::fs::create_dir_all(&out_dir).unwrap();
-    let output = out_dir.join("mantis-512.ffp");
-    std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let output = out_dir.path().join("mantis-512.ffp");
+    if !common::make_read_only(out_dir.path()) {
+        return;
+    }
 
     let out = run_cli_in(
         &cwd,
@@ -1095,7 +1095,7 @@ fn failed_seal_leaves_no_output() {
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            out_dir.to_str().unwrap(),
+            out_dir.path().to_str().unwrap(),
             "--algo",
             "dummy-stack",
             "--no-align",
@@ -1104,7 +1104,7 @@ fn failed_seal_leaves_no_output() {
     );
     // Restore before asserting, so a failed assertion still leaves a
     // removable directory behind.
-    std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::make_writable(out_dir.path());
 
     assert!(
         !out.success,
@@ -1117,7 +1117,7 @@ fn failed_seal_leaves_no_output() {
         "no .partial may survive a failed seal"
     );
     assert!(
-        std::fs::read_dir(&out_dir).unwrap().next().is_none(),
+        std::fs::read_dir(out_dir.path()).unwrap().next().is_none(),
         "the failed seal left something behind in the output directory"
     );
 }

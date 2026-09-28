@@ -217,18 +217,26 @@ fn empty_folder_is_refused_with_a_fix() {
 fn unreadable_folder_is_refused_with_its_read_error() {
     use std::os::unix::fs::PermissionsExt;
 
-    let root = tree("entry_unreadable_folder");
-    let writable = std::fs::metadata(&root).unwrap().permissions();
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let writable = std::fs::metadata(root).unwrap().permissions();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o000)).unwrap();
     // The exact same call the entry path makes, so the expected message
     // carries the OS's own real error text rather than a guessed one.
-    let read_err = std::fs::read_dir(&root).unwrap_err();
+    let read_err = match std::fs::read_dir(root) {
+        Err(e) => e,
+        Ok(_) => {
+            std::fs::set_permissions(root, writable).unwrap();
+            eprintln!("skipping: {} does not enforce permissions", root.display());
+            return;
+        }
+    };
     let expected = format!("{0}: {0}: {read_err}", root.display());
 
     let mut controller = AppController::new();
-    let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&root));
+    let outcome = common::open_and_settle(&mut controller, &[root.to_path_buf()]);
 
-    std::fs::set_permissions(&root, writable).unwrap();
+    std::fs::set_permissions(root, writable).unwrap();
 
     match outcome {
         OpenOutcome::Refused(EntryError::Read { .. }) => {}

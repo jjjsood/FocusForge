@@ -104,20 +104,18 @@ fn json_lines_every_line_parses_as_an_object_with_the_required_keys() {
 #[test]
 fn unwritable_data_directory_falls_back_to_stderr_alone() {
     let mut cmd = common::cli_bin("diagnostics_cli_unwritable");
-    let data_dir = common::data_dir_of(&cmd);
-    std::fs::create_dir_all(&data_dir).unwrap();
-    let mut perms = std::fs::metadata(&data_dir).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
-    std::fs::set_permissions(&data_dir, perms).unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    cmd.env("FOCUSFORGE_DATA_DIR", data_dir.path());
+    if !common::make_read_only(data_dir.path()) {
+        return;
+    }
 
     let output = cmd
         .args(["info", fixture().to_str().unwrap()])
         .output()
         .expect("failed to run binary");
 
-    let mut restore = std::fs::metadata(&data_dir).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut restore, 0o755);
-    std::fs::set_permissions(&data_dir, restore).unwrap();
+    common::make_writable(data_dir.path());
 
     assert!(
         output.status.success(),
@@ -130,26 +128,33 @@ fn unwritable_data_directory_falls_back_to_stderr_alone() {
         "expected exactly one note line, got: {stderr}"
     );
     assert!(stderr.contains("no log file"));
-    assert!(!log_path(&data_dir).exists(), "no log file must be written");
+    assert!(
+        !log_path(data_dir.path()).exists(),
+        "no log file must be written"
+    );
 }
 
-/// A read-only directory under this binary's own temporary directory, so a
-/// `--status` path inside it is refused by the filesystem itself.
-fn unwritable_dir(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{label}-ro"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
-    std::fs::set_permissions(&dir, perms).unwrap();
-    dir
+/// A directory locked read-only through [`common::make_read_only`], so a
+/// `--status` path inside it is refused by the filesystem itself. `None`
+/// when the probe shows the filesystem does not enforce permissions.
+fn unwritable_dir(_label: &str) -> Option<tempfile::TempDir> {
+    let dir = tempfile::tempdir().unwrap();
+    if !common::make_read_only(dir.path()) {
+        return None;
+    }
+    Some(dir)
 }
 
 /// A `stack` invocation that warns (its `--status` path cannot be written)
 /// and then refuses (no `--algo`), so one spawn carries both a mirrored
-/// warning and a mirrored refusal.
-fn warn_and_refuse(label: &str, verbose: bool) -> (std::process::Command, PathBuf) {
-    let status = unwritable_dir(label).join("status.ndjson");
+/// warning and a mirrored refusal. `None` when the locked directory's probe
+/// shows the filesystem does not enforce permissions.
+fn warn_and_refuse(
+    label: &str,
+    verbose: bool,
+) -> Option<(std::process::Command, PathBuf, tempfile::TempDir)> {
+    let dir = unwritable_dir(label)?;
+    let status = dir.path().join("status.ndjson");
     let mut cmd = common::cli_bin(label);
     if verbose {
         cmd.arg("-v");
@@ -160,7 +165,7 @@ fn warn_and_refuse(label: &str, verbose: bool) -> (std::process::Command, PathBu
         "--status",
         status.to_str().unwrap(),
     ]);
-    (cmd, status)
+    Some((cmd, status, dir))
 }
 
 fn count_lines(stderr: &str, needle: &str) -> usize {
@@ -173,8 +178,11 @@ fn mirrored_output_prints_once() {
         ("diagnostics_cli_mirror_default", false),
         ("diagnostics_cli_mirror_verbose", true),
     ] {
-        let (mut cmd, status) = warn_and_refuse(label, verbose);
+        let Some((mut cmd, status, dir)) = warn_and_refuse(label, verbose) else {
+            return;
+        };
         let output = cmd.output().expect("failed to run binary");
+        common::make_writable(dir.path());
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         assert_eq!(
@@ -201,9 +209,12 @@ fn mirrored_output_prints_once() {
 
 #[test]
 fn refusal_reaches_the_log() {
-    let (mut cmd, status) = warn_and_refuse("diagnostics_cli_refusal_log", false);
+    let Some((mut cmd, status, dir)) = warn_and_refuse("diagnostics_cli_refusal_log", false) else {
+        return;
+    };
     let data_dir = common::data_dir_of(&cmd);
     let output = cmd.output().expect("failed to run binary");
+    common::make_writable(dir.path());
     assert!(!output.status.success());
 
     let path = log_path(&data_dir);

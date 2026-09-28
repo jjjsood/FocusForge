@@ -78,6 +78,38 @@ pub fn tmp_dir(name: &str) -> TmpDir {
     TmpDir { path }
 }
 
+/// Chmods `dir` to `0o555` and probes it with a write. If the filesystem
+/// ignores the permission bits, restores `0o755`, prints a skip line, and
+/// returns `false`; otherwise leaves `dir` locked and returns `true`.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+#[cfg(unix)]
+pub fn make_read_only(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = dir.join(".write-probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        make_writable(dir);
+        eprintln!("skipping: {} does not enforce permissions", dir.display());
+        return false;
+    }
+    true
+}
+
+/// Restores `dir` to `0o755` after [`make_read_only`].
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+#[cfg(unix)]
+pub fn make_writable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// Appends `--no-gpu` to `args` when this crate's own `gpu` feature is
 /// compiled in -- a no-op build has no such flag at all, not even as a
 /// no-op (`crates/cli/src/main.rs`'s own `#[cfg(feature = "gpu")]` on the
