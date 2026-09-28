@@ -67,6 +67,7 @@ use std::sync::LazyLock;
 pub use append::{
     AppendRequest, Deleted, SNAPSHOT_BYTE_BUDGET, SNAPSHOT_CHECKPOINT_CAP, ZMapChain, ZMapStorage,
     append, append_at, append_ops, append_ops_at, append_ops_onto, delete_checkpoint,
+    replay_ops_to,
 };
 pub use blob::{Plane, StagedBlob, hash_file, short_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, FuseRecord, History, Op, Point};
@@ -77,7 +78,7 @@ pub use manifest::{
     SourceResolution,
 };
 pub use review::ReviewMetrics;
-pub use seal::{HeldCheckpoint, SealRequest, SealedProject, seal, seal_at, seal_held};
+pub use seal::{HeldCheckpoint, SealRequest, SealedProject, now_unix, seal, seal_at, seal_held};
 
 /// Decompresses `which` into an uncompressed TIFF (the composite) or Z-Map
 /// file at `path`: writes a `.partial` sibling first and renames it onto

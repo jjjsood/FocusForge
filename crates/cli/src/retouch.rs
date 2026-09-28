@@ -210,7 +210,7 @@ pub fn run(
 /// `existing` cannot be canonicalized -- it does not exist yet, such as an
 /// `--out` not yet written -- it is resolved the same parent-plus-name way
 /// instead of being assumed collision-free.
-fn would_replace(target: &Path, existing: &Path) -> bool {
+pub(crate) fn would_replace(target: &Path, existing: &Path) -> bool {
     let Some(existing) = resolve(existing) else {
         return false;
     };

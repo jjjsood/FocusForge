@@ -1,0 +1,478 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! `focusforge-cli history`: every checkpoint operation reachable headless --
+//! list, materialize one to a file, apply an op list read from a file
+//! (previewing it, sealing it as a new checkpoint, or both), and delete a
+//! checkpoint.
+//!
+//! Each subcommand is a thin adapter over one `focusforge_core::project`
+//! entry point: argument parsing, a report and an exit code, no replay or
+//! storage logic of its own.
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Instant;
+
+use clap::{Args, Subcommand};
+use focusforge_core::project::{self, Checkpoint, History, Op, Project, ProjectError};
+use serde::{Deserialize, Serialize};
+
+use crate::retouch::would_replace;
+
+#[derive(Subcommand)]
+pub enum HistoryCommand {
+    /// List every checkpoint, newest first.
+    List(ListArgs),
+    /// Write one checkpoint's Z-Map to a file.
+    Materialize(MaterializeArgs),
+    /// Apply an op list onto a checkpoint: `--save` seals it as a new child,
+    /// `-o` writes the edited map without sealing. At least one is required;
+    /// given both, the map written is the sealed checkpoint's own.
+    Apply(ApplyArgs),
+    /// Delete a checkpoint. Refuses a checkpoint with descendants unless
+    /// `--with-descendants` is given, and always refuses the project's root.
+    Delete(DeleteArgs),
+}
+
+#[derive(Args)]
+pub struct ListArgs {
+    /// The project to list.
+    project: PathBuf,
+    /// Emit the frozen JSON document instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+pub struct MaterializeArgs {
+    /// The project to read.
+    project: PathBuf,
+    /// The checkpoint to materialize -- any unique prefix of its id.
+    #[arg(long)]
+    checkpoint: String,
+    /// Where to write the Z-Map.
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    output: PathBuf,
+    /// Emit the frozen JSON report instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+pub struct ApplyArgs {
+    /// The project to apply onto.
+    project: PathBuf,
+    /// The op list to apply: `{"format":1,"ops":[...]}`.
+    #[arg(long, value_name = "FILE")]
+    ops: PathBuf,
+    /// The checkpoint to apply onto -- any unique prefix of its id. Defaults
+    /// to the project's current head.
+    #[arg(long)]
+    from: Option<String>,
+    /// Seal the result as a new checkpoint, a child of `--from`.
+    #[arg(long)]
+    save: bool,
+    /// Write the edited Z-Map to this file. With `--save`, the map written
+    /// is the sealed checkpoint's own; alone, the map is never sealed.
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    output: Option<PathBuf>,
+    /// Emit the frozen JSON report instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+pub struct DeleteArgs {
+    /// The project to delete from.
+    project: PathBuf,
+    /// The checkpoint to delete -- any unique prefix of its id.
+    #[arg(long)]
+    checkpoint: String,
+    /// Also delete every descendant of the checkpoint. Required whenever
+    /// the checkpoint has any.
+    #[arg(long = "with-descendants")]
+    with_descendants: bool,
+    /// Emit the frozen JSON report instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+}
+
+pub fn run(command: HistoryCommand) -> ExitCode {
+    match command {
+        HistoryCommand::List(args) => list(&args.project, args.json),
+        HistoryCommand::Materialize(args) => {
+            materialize(&args.project, &args.checkpoint, &args.output, args.json)
+        }
+        HistoryCommand::Apply(args) => apply(
+            &args.project,
+            &args.ops,
+            args.from.as_deref(),
+            args.save,
+            args.output.as_deref(),
+            args.json,
+        ),
+        HistoryCommand::Delete(args) => delete(
+            &args.project,
+            &args.checkpoint,
+            args.with_descendants,
+            args.json,
+        ),
+    }
+}
+
+/// Resolves `id_or_prefix` to exactly one checkpoint of `history`: an exact
+/// id first, else the unique checkpoint whose id starts with it. An
+/// ambiguous prefix names every match; no match reuses
+/// [`ProjectError::UnknownCheckpoint`]'s own wording.
+fn resolve_checkpoint<'a>(
+    history: &'a History,
+    project_path: &Path,
+    id_or_prefix: &str,
+) -> Result<&'a Checkpoint, String> {
+    if let Ok(checkpoint) = history.get(id_or_prefix) {
+        return Ok(checkpoint);
+    }
+    let matches: Vec<&Checkpoint> = history
+        .all()
+        .into_iter()
+        .filter(|c| c.id.starts_with(id_or_prefix))
+        .collect();
+    match matches.as_slice() {
+        [] => Err(ProjectError::UnknownCheckpoint {
+            path: project_path.to_path_buf(),
+            id: id_or_prefix.to_string(),
+        }
+        .to_string()),
+        [only] => Ok(only),
+        many => Err(format!(
+            "{}: {id_or_prefix} matches {} checkpoints: {}",
+            project_path.display(),
+            many.len(),
+            many.iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Refuses `output` when it resolves to `project_path` itself, the same
+/// collision `retouch --out` refuses against `--zmap`.
+fn refuse_if_names_project(output: &Path, project_path: &Path) -> Result<(), ExitCode> {
+    if would_replace(output, project_path) {
+        return Err(fail(format!(
+            "-o {} is also the project file: refusing to overwrite it",
+            output.display()
+        )));
+    }
+    Ok(())
+}
+
+/// One checkpoint's listed identity: never a storage-kind field, which
+/// `--json` output must never reveal.
+#[derive(Serialize)]
+struct CheckpointRecord {
+    id: String,
+    parent: Option<String>,
+    algorithm: String,
+    created_at: i64,
+}
+
+/// `{"format":1,"checkpoints":[...]}`, matching `review`'s and `export`'s
+/// own wrapped-document convention.
+#[derive(Serialize)]
+struct ListDocument {
+    format: u32,
+    checkpoints: Vec<CheckpointRecord>,
+}
+
+fn list(project_path: &Path, json: bool) -> ExitCode {
+    let project = match Project::open(project_path) {
+        Ok(project) => project,
+        Err(err) => return fail(err),
+    };
+    let checkpoints: Vec<CheckpointRecord> = project
+        .history()
+        .all()
+        .into_iter()
+        .map(|c| CheckpointRecord {
+            id: c.id.clone(),
+            parent: c.parent.clone(),
+            algorithm: c.algorithm.clone(),
+            created_at: c.created_at,
+        })
+        .collect();
+    let document = ListDocument {
+        format: 1,
+        checkpoints,
+    };
+    if json {
+        match serde_json::to_string_pretty(&document) {
+            Ok(text) => println!("{text}"),
+            Err(err) => return fail(format!("failed to serialize JSON: {err}")),
+        }
+    } else {
+        for c in &document.checkpoints {
+            println!(
+                "{} parent={} algorithm={} created={}",
+                c.id,
+                c.parent.as_deref().unwrap_or("-"),
+                c.algorithm,
+                focusforge_diagnostics::rfc3339(c.created_at),
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+#[derive(Serialize)]
+struct MaterializeReport {
+    project: String,
+    checkpoint: String,
+    wrote: String,
+    wall_seconds: f64,
+}
+
+fn materialize(project_path: &Path, checkpoint_id: &str, output: &Path, json: bool) -> ExitCode {
+    let start = Instant::now();
+    if let Err(exit) = refuse_if_names_project(output, project_path) {
+        return exit;
+    }
+    let mut project = match Project::open(project_path) {
+        Ok(project) => project,
+        Err(err) => return fail(err),
+    };
+    let checkpoint = match resolve_checkpoint(project.history(), project_path, checkpoint_id) {
+        Ok(checkpoint) => checkpoint.clone(),
+        Err(message) => return fail(message),
+    };
+    if let Err(err) = project::materialize_zmap(&mut project, &checkpoint, output) {
+        return fail(err);
+    }
+    let report = MaterializeReport {
+        project: project_path.display().to_string(),
+        checkpoint: checkpoint.id,
+        wrote: output.display().to_string(),
+        wall_seconds: start.elapsed().as_secs_f64(),
+    };
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(err) => return fail(format!("failed to serialize JSON: {err}")),
+        }
+    } else {
+        println!(
+            "{}\nwrote: {} (checkpoint {})\nwall: {:.3}s",
+            report.project, report.wrote, report.checkpoint, report.wall_seconds
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// The op file's wrapped shape: `{"format":1,"ops":[...]}`. `format`
+/// defaults to 1, so a checkpoint's own JSON -- which carries an `ops` field
+/// among others -- reads as one; any other value, or a bare array (which
+/// does not deserialize as this struct at all), is refused by name.
+#[derive(Deserialize)]
+struct OpFile {
+    #[serde(default = "default_op_file_format")]
+    format: u32,
+    ops: Vec<Op>,
+}
+
+fn default_op_file_format() -> u32 {
+    1
+}
+
+fn read_op_file(path: &Path) -> Result<Vec<Op>, String> {
+    let file = std::fs::File::open(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let doc: OpFile = serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    if doc.format != 1 {
+        return Err(format!(
+            "{}: op file format {} is not supported (expected 1)",
+            path.display(),
+            doc.format
+        ));
+    }
+    Ok(doc.ops)
+}
+
+/// Never `SealedProject.zmap`, whose `BlobRecord.kind` would leak the
+/// storage kind.
+#[derive(Serialize)]
+struct ApplyReport {
+    project: String,
+    from: String,
+    checkpoint: Option<String>,
+    wrote: Option<String>,
+    ops: usize,
+    wall_seconds: f64,
+}
+
+fn apply(
+    project_path: &Path,
+    ops_path: &Path,
+    from: Option<&str>,
+    save: bool,
+    output: Option<&Path>,
+    json: bool,
+) -> ExitCode {
+    let start = Instant::now();
+    if !save && output.is_none() {
+        return fail(
+            "apply needs somewhere to put its result: --save to seal a checkpoint, \
+             -o <file> for the edited map, or both",
+        );
+    }
+    if let Some(output) = output
+        && let Err(exit) = refuse_if_names_project(output, project_path)
+    {
+        return exit;
+    }
+
+    let ops = match read_op_file(ops_path) {
+        Ok(ops) => ops,
+        Err(message) => return fail(message),
+    };
+    let ops_count = ops.len();
+
+    let from_id = {
+        let project = match Project::open(project_path) {
+            Ok(project) => project,
+            Err(err) => return fail(err),
+        };
+        match from {
+            Some(prefix) => match resolve_checkpoint(project.history(), project_path, prefix) {
+                Ok(checkpoint) => checkpoint.id.clone(),
+                Err(message) => return fail(message),
+            },
+            None => project.checkpoint().id.clone(),
+        }
+    };
+
+    let mut checkpoint_out: Option<String> = None;
+    let mut wrote_out: Option<String> = None;
+
+    if save {
+        let sealed = match project::append_ops_onto(
+            project_path,
+            &from_id,
+            ops,
+            None,
+            project::now_unix(),
+            project::ZMapStorage::Bounded,
+        ) {
+            Ok(sealed) => sealed,
+            Err(err) => return fail(err),
+        };
+        if let Some(output) = output {
+            let mut project = match Project::open(project_path) {
+                Ok(project) => project,
+                Err(err) => return fail(err),
+            };
+            let checkpoint = match project.history().get(&sealed.checkpoint) {
+                Ok(checkpoint) => checkpoint.clone(),
+                Err(err) => return fail(err),
+            };
+            if let Err(err) = project::materialize_zmap(&mut project, &checkpoint, output) {
+                return fail(err);
+            }
+            wrote_out = Some(output.display().to_string());
+        }
+        checkpoint_out = Some(sealed.checkpoint);
+    } else {
+        let output = output.expect("checked above: --save or -o is required");
+        if let Err(err) = project::replay_ops_to(project_path, &from_id, ops, output) {
+            return fail(err);
+        }
+        wrote_out = Some(output.display().to_string());
+    }
+
+    let report = ApplyReport {
+        project: project_path.display().to_string(),
+        from: from_id,
+        checkpoint: checkpoint_out,
+        wrote: wrote_out,
+        ops: ops_count,
+        wall_seconds: start.elapsed().as_secs_f64(),
+    };
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(err) => return fail(format!("failed to serialize JSON: {err}")),
+        }
+    } else {
+        println!(
+            "{}\nfrom: {}\ncheckpoint: {}\nwrote: {}\nops: {}\nwall: {:.3}s",
+            report.project,
+            report.from,
+            report.checkpoint.as_deref().unwrap_or("-"),
+            report.wrote.as_deref().unwrap_or("-"),
+            report.ops,
+            report.wall_seconds,
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+#[derive(Serialize)]
+struct DeleteReport {
+    project: String,
+    removed: Vec<String>,
+    head: String,
+}
+
+fn delete(
+    project_path: &Path,
+    checkpoint_id: &str,
+    with_descendants: bool,
+    json: bool,
+) -> ExitCode {
+    let target = {
+        let project = match Project::open(project_path) {
+            Ok(project) => project,
+            Err(err) => return fail(err),
+        };
+        let target = match resolve_checkpoint(project.history(), project_path, checkpoint_id) {
+            Ok(checkpoint) => checkpoint.id.clone(),
+            Err(message) => return fail(message),
+        };
+        let descendants = project.history().descendants(&target).len();
+        if descendants > 0 && !with_descendants {
+            return fail(format!(
+                "{target} has {descendants} descendant checkpoint(s) -- pass \
+                 --with-descendants to delete it and all of them"
+            ));
+        }
+        target
+    };
+
+    let deleted = match project::delete_checkpoint(project_path, &target) {
+        Ok(deleted) => deleted,
+        Err(err) => return fail(err),
+    };
+    let report = DeleteReport {
+        project: project_path.display().to_string(),
+        removed: deleted.removed,
+        head: deleted.head,
+    };
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(err) => return fail(format!("failed to serialize JSON: {err}")),
+        }
+    } else {
+        println!(
+            "{}\nremoved: {}\nhead: {}",
+            report.project,
+            report.removed.join(", "),
+            report.head
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+fn fail(message: impl std::fmt::Display) -> ExitCode {
+    crate::fail(message)
+}

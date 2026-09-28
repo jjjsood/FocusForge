@@ -25,6 +25,7 @@ mod export;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod groups;
+mod history;
 mod job;
 mod preset;
 mod progress;
@@ -283,6 +284,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List, materialize, apply an op list onto, or delete a project's
+    /// checkpoints. Every history operation is reachable through this
+    /// command, headless.
+    History {
+        #[command(subcommand)]
+        command: history::HistoryCommand,
+    },
     /// Compute and report the per-frame transforms for a stack: readable
     /// text by default, a frozen `--json` document on request, and an
     /// optional per-frame warped-TIFF dump for a visual check.
@@ -383,6 +391,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Stack { .. } => "stack",
         Command::Export { .. } => "export",
         Command::Retouch { .. } => "retouch",
+        Command::History { .. } => "history",
         Command::Align { .. } => "align",
         Command::Review { .. } => "review",
         Command::Cache { .. } => "cache",
@@ -510,6 +519,7 @@ fn main() -> ExitCode {
             solo,
             json,
         ),
+        Command::History { command } => history::run(command),
         Command::Align {
             dir,
             algo,
@@ -882,5 +892,13 @@ mod tests {
             .as_bool()
             .expect("auto-crop's default must be a bool");
         assert_eq!(crop, expected);
+    }
+
+    /// clap's own consistency check over the whole parser: every subcommand
+    /// and flag it declares actually builds into a valid `Command`.
+    #[test]
+    fn parser_is_consistent() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
     }
 }

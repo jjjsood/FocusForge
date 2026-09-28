@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use super::blob::{self, Plane, StagedBlob, ZSTD_LEVEL};
 use super::checkpoint::{Checkpoint, FuseRecord};
-use super::container::ProjectWriter;
+use super::container::{ProjectWriter, partial_path};
 use super::error::ProjectError;
 use super::manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef,
@@ -383,6 +383,69 @@ pub fn append_ops_onto(
     result
 }
 
+/// [`replay_ops_to`] staged: opens the project, replays `ops` onto `parent`
+/// through [`replay_ops_onto_zmap`], and writes the edited map to `out` via
+/// `.partial` then rename. Never opens [`ProjectWriter`]: the project file is
+/// not touched.
+fn replay_ops_to_staged(
+    project_path: &Path,
+    parent: &str,
+    ops: &[Op],
+    staging: &Path,
+    out: &Path,
+) -> Result<(), ProjectError> {
+    let mut project = Project::open(project_path)?;
+    let head = project.history().get(parent)?.clone();
+    let manifest = project.manifest().clone();
+    let info = ZMapInfo::new(
+        manifest.zmap.width,
+        manifest.zmap.height,
+        manifest.zmap.frame_count,
+    )
+    .map_err(|err| ProjectError::container(project_path, err))?;
+
+    let partial = partial_path(out);
+    let outcome = replay_ops_onto_zmap(&mut project, parent, &head, ops, info, staging, &partial)
+        .and_then(|_| std::fs::rename(&partial, out).map_err(|err| ProjectError::io(out, err)));
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    outcome
+}
+
+/// Replays `ops` onto `parent`'s materialized Z-Map and writes the edited
+/// map to `out`, without sealing a checkpoint. Refuses an empty list like
+/// [`append_ops_onto`]. Never opens the project file for writing.
+pub fn replay_ops_to(
+    project_path: &Path,
+    parent: &str,
+    ops: Vec<Op>,
+    out: &Path,
+) -> Result<(), ProjectError> {
+    if ops.is_empty() {
+        return Err(ProjectError::EmptyOpList {
+            path: project_path.to_path_buf(),
+        });
+    }
+    let dir = project_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let staging_name = format!(
+        "{}.ops-staging",
+        project_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    );
+    let staging = dir.join(staging_name);
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|err| ProjectError::io(&staging, err))?;
+    let result = replay_ops_to_staged(project_path, parent, &ops, &staging, out);
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
 /// The smaller-of-two choice [`ZMapStorage::Smallest`] and
 /// [`ZMapStorage::Bounded`] share once a delta is worth trying at all.
 fn stage_smallest_delta(
@@ -403,32 +466,26 @@ fn stage_smallest_delta(
     Ok((delta.compressed_len < full.compressed_len).then_some(delta))
 }
 
-fn append_ops_staged(
-    project_path: &Path,
+/// Replays `ops` onto `parent`'s materialized Z-Map inside `staging` and
+/// writes the edited full map to `new_zmap_path`. Returns the tile the edit
+/// touched and its resident indices, which [`append_ops_staged`]'s delta
+/// staging and [`replay_ops_to_staged`]'s plain write both need.
+fn replay_ops_onto_zmap(
+    project: &mut Project,
     parent: &str,
+    head: &Checkpoint,
     ops: &[Op],
-    label: Option<String>,
-    created_at: i64,
+    info: ZMapInfo,
     staging: &Path,
-    storage: ZMapStorage,
-) -> Result<SealedProject, ProjectError> {
-    let mut project = Project::open(project_path)?;
-    let head = project.history().get(parent)?.clone();
-    let manifest = project.manifest().clone();
-    let info = ZMapInfo::new(
-        manifest.zmap.width,
-        manifest.zmap.height,
-        manifest.zmap.frame_count,
-    )
-    .map_err(|err| ProjectError::container(project_path, err))?;
-
+    new_zmap_path: &Path,
+) -> Result<(Rect, Vec<u16>), ProjectError> {
     let tile = replay::replay_tile(ops, info).map_err(|(index, source)| ProjectError::Op {
         index,
         source: Box::new(source),
     })?;
 
     let head_zmap_path = staging.join("head-zmap.tif");
-    materialize_zmap(&mut project, &head, &head_zmap_path)?;
+    materialize_zmap(project, head, &head_zmap_path)?;
     let head_reader = ZMapReader::open(&head_zmap_path)
         .map_err(|err| ProjectError::container(&head_zmap_path, err))?;
 
@@ -441,7 +498,7 @@ fn append_ops_staged(
     let fused_path = if needs_fused && !head.ops.is_empty() {
         let fused_ancestor = project.fused_ancestor(parent)?.clone();
         let path = staging.join("fused-zmap.tif");
-        materialize_zmap(&mut project, &fused_ancestor, &path)?;
+        materialize_zmap(project, &fused_ancestor, &path)?;
         Some(path)
     } else {
         None
@@ -467,16 +524,48 @@ fn append_ops_staged(
         }
     })?;
 
-    let new_zmap_path = staging.join("new-zmap.tif");
     {
-        let mut writer = ZMapWriter::create(&new_zmap_path, info)
-            .map_err(|err| ProjectError::container(&new_zmap_path, err))?;
+        let mut writer = ZMapWriter::create(new_zmap_path, info)
+            .map_err(|err| ProjectError::container(new_zmap_path, err))?;
         write_edited(&head_reader, tile, &indices, ROWS_PER_PASS, &mut writer)
-            .map_err(|err| ProjectError::container(&new_zmap_path, err))?;
+            .map_err(|err| ProjectError::container(new_zmap_path, err))?;
         writer
             .finish()
-            .map_err(|err| ProjectError::container(&new_zmap_path, err))?;
+            .map_err(|err| ProjectError::container(new_zmap_path, err))?;
     }
+
+    Ok((tile, indices))
+}
+
+fn append_ops_staged(
+    project_path: &Path,
+    parent: &str,
+    ops: &[Op],
+    label: Option<String>,
+    created_at: i64,
+    staging: &Path,
+    storage: ZMapStorage,
+) -> Result<SealedProject, ProjectError> {
+    let mut project = Project::open(project_path)?;
+    let head = project.history().get(parent)?.clone();
+    let manifest = project.manifest().clone();
+    let info = ZMapInfo::new(
+        manifest.zmap.width,
+        manifest.zmap.height,
+        manifest.zmap.frame_count,
+    )
+    .map_err(|err| ProjectError::container(project_path, err))?;
+
+    let new_zmap_path = staging.join("new-zmap.tif");
+    let (tile, indices) = replay_ops_onto_zmap(
+        &mut project,
+        parent,
+        &head,
+        ops,
+        info,
+        staging,
+        &new_zmap_path,
+    )?;
 
     let full = blob::stage_plane(&new_zmap_path, Plane::ZMap, ZSTD_LEVEL, staging)?;
 

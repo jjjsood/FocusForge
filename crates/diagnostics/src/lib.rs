@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::prelude::*;
 
+pub use crash::rfc3339;
 pub use native::run_monitor;
 use ring::Ring;
 use rotating::RotatingFile;
