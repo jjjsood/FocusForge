@@ -494,7 +494,7 @@ impl Project {
 
     /// The nearest ancestor of `id` (self included) whose `ops` is empty --
     /// the checkpoint whose fuse `id`'s Z-Map renders against.
-    fn fused_ancestor(&self, id: &str) -> Result<&Checkpoint, ProjectError> {
+    pub(super) fn fused_ancestor(&self, id: &str) -> Result<&Checkpoint, ProjectError> {
         self.history
             .ancestors(id)?
             .into_iter()

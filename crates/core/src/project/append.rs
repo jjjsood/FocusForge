@@ -439,15 +439,7 @@ fn append_ops_staged(
 
     let needs_fused = ops.iter().any(|op| matches!(op, Op::ResetRegion { .. }));
     let fused_path = if needs_fused && !head.ops.is_empty() {
-        let fused_ancestor = project
-            .history()
-            .ancestors(parent)?
-            .into_iter()
-            .find(|c| c.ops.is_empty())
-            .cloned()
-            .ok_or_else(|| {
-                ProjectError::container(project_path, "no fused ancestor in the checkpoint chain")
-            })?;
+        let fused_ancestor = project.fused_ancestor(parent)?.clone();
         let path = staging.join("fused-zmap.tif");
         materialize_zmap(&mut project, &fused_ancestor, &path)?;
         Some(path)
