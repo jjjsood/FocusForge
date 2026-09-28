@@ -12,12 +12,12 @@ use std::path::{Path, PathBuf};
 use focusforge_core::TiffError;
 use focusforge_core::display::zmap_index_scale;
 use focusforge_core::io::TiffStack;
-use focusforge_core::tile::Rect;
+use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::{ZMapError, ZMapReader};
 use focusforge_gpu::display::{DisplayTexture, render};
 use slint::wgpu_29::wgpu;
 
-use crate::canvas::TextureSpec;
+use crate::canvas::{FrameView, TextureSpec};
 use crate::viewport::PaneDraw;
 
 /// One pane's wgpu-owned state: the display texture, and the `slint::Image`
@@ -182,7 +182,9 @@ mod tests {
         assert!(empty.device_queue().is_none());
 
         let mut frame_only = CanvasRenderer::new();
-        frame_only.set_frame(&frame).expect("fixture frame opens");
+        frame_only
+            .set_frame(&frame, None, crate::job::host_budget())
+            .expect("fixture frame opens");
         assert!(frame_only.redraw_frame(&draw).is_none());
         frame_only.attach_device(shared.device().clone(), shared.queue().clone());
         assert!(frame_only.redraw_frame(&draw).is_some());
@@ -197,7 +199,7 @@ mod tests {
 
         let mut planes_and_frame = CanvasRenderer::new();
         planes_and_frame
-            .set_frame(&frame)
+            .set_frame(&frame, None, crate::job::host_budget())
             .expect("fixture frame opens");
         planes_and_frame
             .set_planes(&composite, &zmap)
@@ -361,10 +363,21 @@ impl CanvasRenderer {
         self.frame.path()
     }
 
-    /// Opens `path` as the frame pane's source, dropping whatever was open
-    /// first. `Err` leaves nothing open.
-    pub fn set_frame(&mut self, path: &Path) -> Result<(), TiffError> {
-        let result = self.frame.set(path);
+    /// The frame pane's currently recorded view, if any.
+    pub fn frame_view(&self) -> Option<FrameView> {
+        self.frame.view()
+    }
+
+    /// Opens `path` as the frame pane's source under `budget`, dropping
+    /// whatever was open first, and records `view` for the next
+    /// [`Self::redraw_frame`] to warp through. `Err` leaves nothing open.
+    pub fn set_frame(
+        &mut self,
+        path: &Path,
+        view: Option<FrameView>,
+        budget: HostBudget,
+    ) -> Result<(), TiffError> {
+        let result = self.frame.set(path, view, budget);
         self.frame_pane = PaneTexture::default();
         self.last_frame = None;
         result

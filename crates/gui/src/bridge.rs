@@ -151,20 +151,22 @@ impl Canvas {
     }
 
     /// Opens `path` as the left pane's source, creating the renderer first
-    /// when this tab has never had planes to draw. A no-op when `path` is
-    /// already open; `None` drops whatever frame was open. Keeps the
-    /// reader's own refusal text on failure rather than a generic message.
-    pub fn set_frame(&mut self, path: Option<&Path>) {
+    /// when this tab has never had planes to draw. A no-op when `path` and
+    /// `view` are both already open -- so a new fuse over the same selected
+    /// path still reloads through its own, changed view. `None` drops
+    /// whatever frame was open. Keeps the reader's own refusal text on
+    /// failure rather than a generic message.
+    pub fn set_frame(&mut self, path: Option<&Path>, view: Option<crate::canvas::FrameView>) {
         let renderer = self.renderer_mut();
         let Some(path) = path else {
             renderer.clear_frame();
             self.frame_error = None;
             return;
         };
-        if renderer.frame_path() == Some(path) {
+        if renderer.frame_path() == Some(path) && renderer.frame_view() == view {
             return;
         }
-        match renderer.set_frame(path) {
+        match renderer.set_frame(path, view, job::host_budget()) {
             Ok(()) => self.frame_error = None,
             Err(err) => self.frame_error = Some(err.to_string()),
         }
@@ -201,10 +203,11 @@ pub fn repaint(
         } => canvas.borrow_mut().load(tab, &composite, &zmap),
     }
 
-    let (frame_path, frame_label, frame_draw, plane_draw, readout, project_loaded) = {
+    let (frame_path, frame_view, frame_label, frame_draw, plane_draw, readout, project_loaded) = {
         let controller = controller.lock().unwrap();
         (
             controller.selected_frame_path(),
+            controller.selected_frame_view(),
             controller.frame_pane_label(),
             controller.frame_draw(),
             controller.plane_draw(),
@@ -212,7 +215,9 @@ pub fn repaint(
             controller.active_project().is_some(),
         )
     };
-    canvas.borrow_mut().set_frame(frame_path.as_deref());
+    canvas
+        .borrow_mut()
+        .set_frame(frame_path.as_deref(), frame_view);
 
     app.set_zoom_readout(readout.into());
     app.set_project_loaded(project_loaded);

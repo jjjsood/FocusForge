@@ -15,9 +15,11 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use focusforge_core::TiffError;
-use focusforge_core::io::TiffStack;
+use focusforge_core::algorithm::{AlgorithmError, read_tile_step_into};
+use focusforge_core::align::{Transform, WarpingReader};
+use focusforge_core::io::{FrameReader, open_frame_set};
 use focusforge_core::retouch::{RetouchError, Sources, recomposite as recomposite_region};
-use focusforge_core::tile::Rect;
+use focusforge_core::tile::{HostBudget, Rect};
 
 /// What the open renderer cell should do for the frame about to draw --
 /// [`crate::controller::AppController::canvas_feed`]'s answer, decided with
@@ -103,22 +105,44 @@ pub fn check_pane_dimensions(composite: (u32, u32), zmap: (u32, u32)) -> Result<
     }
 }
 
+/// The selected frame's own view onto a tab's newest fuse: the
+/// reference-to-frame [`Transform`] the fuse recorded for it, the crop's
+/// top-left in frame coordinates, and the composite's own extent -- what
+/// [`FrameSource::read_into`] warps every read through, so the left pane
+/// draws the same scene point at the same pane position as the composite.
+/// `None` at a [`FrameSource`] call site means the raw frame, read through
+/// identity at `(0, 0)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameView {
+    pub transform: Transform,
+    pub origin: (u32, u32),
+    pub extent: (u32, u32),
+}
+
 /// The one open source-frame handle the left canvas pane draws from -- never
-/// more than one [`TiffStack`] mapped at once. Sixty-one frames held open at
+/// more than one frame set opened at once. Sixty-one frames held open at
 /// the same time would map the whole reference stack, which is why
-/// [`Self::set`] drops whatever was open before mapping the next.
+/// [`Self::set`] drops whatever was open before opening the next. Opened
+/// through [`open_frame_set`], so a compressed frame is shown exactly as the
+/// fuse itself would read it, not narrowed to the mmap fast path.
 #[derive(Default)]
 pub struct FrameSource {
-    open: Option<(PathBuf, TiffStack)>,
+    open: Option<(PathBuf, Box<dyn FrameReader>, Option<FrameView>)>,
 }
 
 impl FrameSource {
-    /// Opens `path`, dropping whatever was open first. Nothing is left open
-    /// on failure.
-    pub fn set(&mut self, path: &Path) -> Result<(), TiffError> {
+    /// Opens `path` under `budget`, dropping whatever was open first, and
+    /// records `view` for [`Self::read_into`] to warp through. Nothing is
+    /// left open on failure.
+    pub fn set(
+        &mut self,
+        path: &Path,
+        view: Option<FrameView>,
+        budget: HostBudget,
+    ) -> Result<(), TiffError> {
         self.open = None;
-        let stack = TiffStack::open_files(std::slice::from_ref(&path.to_path_buf()))?;
-        self.open = Some((path.to_path_buf(), stack));
+        let set = open_frame_set(std::slice::from_ref(&path.to_path_buf()), budget)?;
+        self.open = Some((path.to_path_buf(), set.reader, view));
         Ok(())
     }
 
@@ -129,35 +153,61 @@ impl FrameSource {
 
     /// The currently open frame's own path, if any.
     pub fn path(&self) -> Option<&Path> {
-        self.open.as_ref().map(|(path, _)| path.as_path())
+        self.open.as_ref().map(|(path, ..)| path.as_path())
     }
 
-    /// The open frame's `(width, height)`, if any.
+    /// The currently recorded view, if any.
+    pub fn view(&self) -> Option<FrameView> {
+        self.open.as_ref().and_then(|(_, _, view)| *view)
+    }
+
+    /// The frame-as-fused extent when a view is set, else the frame's own
+    /// size, if any frame is open.
     pub fn dimensions(&self) -> Option<(u32, u32)> {
-        self.open.as_ref().map(|(_, stack)| stack.dimensions())
+        self.open.as_ref().map(|(_, reader, view)| {
+            view.map(|v| v.extent)
+                .unwrap_or_else(|| reader.dimensions())
+        })
     }
 
     /// The open frame's samples per pixel, if any.
     pub fn samples_per_pixel(&self) -> Option<u32> {
         self.open
             .as_ref()
-            .map(|(_, stack)| stack.header(0).samples_per_pixel)
+            .map(|(_, reader, _)| reader.frame(0).samples_per_pixel)
     }
 
-    /// Reads every `step`-th row and column of `rect` into `out`. Callers
-    /// check [`Self::dimensions`] first, so a frame is always open by the
-    /// time this runs.
+    /// Reads every `step`-th row and column of `rect` into `out`, warped by
+    /// the recorded view's transform and offset by its crop origin -- an
+    /// identity transform at origin `(0, 0)` with no view set. Callers check
+    /// [`Self::dimensions`] first, so a frame is always open by the time
+    /// this runs.
     pub fn read_into(
         &self,
         rect: Rect,
         step: NonZeroU32,
         out: &mut [u16],
-    ) -> Result<(), TiffError> {
-        let (_, stack) = self
+    ) -> Result<(), AlgorithmError> {
+        let (_, reader, view) = self
             .open
             .as_ref()
             .expect("read_into is only called once a frame is confirmed open");
-        stack.read_tile_step_into(0, rect, step, out)
+        let (transform, origin) = view
+            .map(|v| (v.transform, v.origin))
+            .unwrap_or((Transform::identity(), (0, 0)));
+        let samples_per_pixel = reader.frame(0).samples_per_pixel;
+        let warped = WarpingReader::new(
+            &**reader,
+            reader.dimensions(),
+            samples_per_pixel,
+            vec![transform],
+        );
+        let shifted = Rect {
+            x: rect.x + origin.0,
+            y: rect.y + origin.1,
+            ..rect
+        };
+        read_tile_step_into(&warped, 0, shifted, step, samples_per_pixel, out)
     }
 }
 
@@ -362,8 +412,8 @@ pub struct EditedView<'a> {
 
 /// Reads every `step`-th row and column of `rect` from an in-memory,
 /// single-sample-per-pixel `plane` (row-major, `plane_width` wide) into
-/// `out` -- the same decimation [`TiffStack::read_tile_step_into`] applies
-/// to an mmap'd file, applied here to a resident buffer instead.
+/// `out` -- the same decimation `TiffStack::read_tile_step_into` applies to
+/// an mmap'd file, applied here to a resident buffer instead.
 pub fn step_copy(plane: &[u16], plane_width: u32, rect: Rect, step: NonZeroU32, out: &mut [u16]) {
     let step = step.get();
     let out_w = rect.width.div_ceil(step);

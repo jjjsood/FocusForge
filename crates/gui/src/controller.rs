@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::brush;
+use crate::canvas::FrameView;
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
     DiagnosticsView, clamp_manifest_scroll, manifest_content_height, size_text,
@@ -503,14 +504,27 @@ impl ProjectTab {
         if job::is_live(&self.run) || matches!(self.run, job::RunState::Queued { .. }) {
             return false;
         }
-        let fused = match self.held.last() {
-            Some(held) => held.sources.clone(),
-            None if matches!(self.project, GuiProject::Opened(_)) => {
-                entry::project_frames(&self.project)
-            }
-            None => return false,
+        let Some((fused, _)) = self.fused() else {
+            return false;
         };
         self.frames == fused
+    }
+
+    /// The sources and registration behind this tab's newest composite --
+    /// the newest held checkpoint's own `sources`/`registration`, or a
+    /// reopened project's own manifest when nothing is held. `None` for an
+    /// unsaved, never-fused tab.
+    fn fused(&self) -> Option<(Vec<PathBuf>, job::Registration)> {
+        match self.held.last() {
+            Some(held) => Some((held.sources.clone(), held.registration.clone())),
+            None => match &self.project {
+                GuiProject::Opened(project) => Some((
+                    entry::project_frames(&self.project),
+                    project.manifest().registration.clone(),
+                )),
+                GuiProject::Unsaved(_) => None,
+            },
+        }
     }
 
     /// Permutes `frames` and `excluded` together by `order` (each entry the
@@ -836,6 +850,14 @@ fn fused_image_size(tab: &ProjectTab) -> Option<ImageSize> {
     }
 }
 
+/// `tab`'s own image size for every viewport computation: the newest
+/// composite's extent once it has one ([`fused_image_size`]), else the raw
+/// frame's -- so both panes and every zoom/pan/fit computation share one
+/// size once a tab is fused.
+fn display_image(tab: &ProjectTab) -> Option<ImageSize> {
+    fused_image_size(tab).or(tab.image)
+}
+
 /// A one-sided margin so a scrolled cursor never sits flush against the
 /// field's own edge, capped at half the visible width for a very narrow
 /// field.
@@ -1018,13 +1040,22 @@ impl AppController {
         let Some((_, zmap)) = self.materialize_active_tab_planes() else {
             return false;
         };
-        let Some(frames) = self.state.active().map(|tab| tab.frames.clone()) else {
+        let Some(tab) = self.state.active() else {
+            return false;
+        };
+        let frames = tab.frames.clone();
+        // `can_edit` guarantees `tab.frames` equals the fused sources, in
+        // the same order, by the time editor mode is entered -- so indexing
+        // `registration`'s per-frame transforms by position here matches.
+        let Some((_, registration)) = tab.fused() else {
             return false;
         };
         let tile_size = self
             .resident_tile_size_for_test
             .unwrap_or(job::RESIDENT_TILE_SIZE);
-        let Ok(edit) = job::open_edit_session(&zmap, &frames, tile_size) else {
+        let Ok(edit) =
+            job::open_edit_session(&zmap, &frames, registration, tile_size, job::host_budget())
+        else {
             return false;
         };
         let Some(tab) = self.state.active_mut() else {
@@ -1314,7 +1345,9 @@ impl AppController {
             let Some(tab) = self.state.active_mut() else {
                 return;
             };
-            let Some(image) = tab.image else { return };
+            let Some(image) = display_image(tab) else {
+                return;
+            };
             if let Some(viewport) = tab.viewport.as_mut() {
                 viewport.zoom_steps(dir, anchor, image, left);
             }
@@ -1694,7 +1727,9 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        let Some(image) = tab.image else { return };
+        let Some(image) = display_image(tab) else {
+            return;
+        };
         let Some(viewport) = tab.viewport.as_mut() else {
             return;
         };
@@ -1735,7 +1770,7 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        let Some(image) = tab.image else {
+        let Some(image) = display_image(tab) else {
             return;
         };
         match tab.viewport.as_mut() {
@@ -1755,7 +1790,7 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        if let (Some(image), None) = (tab.image, &tab.viewport) {
+        if let (Some(image), None) = (display_image(tab), &tab.viewport) {
             tab.viewport = Some(crate::viewport::fit(image, left));
         }
     }
@@ -1778,7 +1813,9 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        let Some(image) = tab.image else { return };
+        let Some(image) = display_image(tab) else {
+            return;
+        };
         let Some(viewport) = tab.viewport.as_mut() else {
             return;
         };
@@ -1795,7 +1832,9 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        let Some(image) = tab.image else { return };
+        let Some(image) = display_image(tab) else {
+            return;
+        };
         tab.viewport = Some(crate::viewport::fit(image, left));
     }
 
@@ -1816,7 +1855,7 @@ impl AppController {
             return false;
         };
         let (Some(image), Some((left, _)), Some(viewport)) =
-            (tab.image, self.state.panes, tab.viewport.as_ref())
+            (display_image(tab), self.state.panes, tab.viewport.as_ref())
         else {
             return false;
         };
@@ -1830,7 +1869,7 @@ impl AppController {
             return false;
         };
         let (Some(image), Some((left, _)), Some(viewport)) =
-            (tab.image, self.state.panes, tab.viewport.as_ref())
+            (display_image(tab), self.state.panes, tab.viewport.as_ref())
         else {
             return false;
         };
@@ -1844,20 +1883,21 @@ impl AppController {
     /// frame size is known, or before the first pane geometry arrives.
     pub fn frame_draw(&self) -> Option<PaneDraw> {
         let tab = self.state.active()?;
-        let image = tab.image?;
+        let image = display_image(tab)?;
         let (left, _) = self.state.panes?;
         tab.viewport.as_ref()?.draw(image, left)
     }
 
     /// The active tab's viewport's visible source rect and its pane-local
     /// projection over the newest composite/Z-Map's own extent -- the
-    /// newest held checkpoint's, else the opened project's -- for
-    /// `crate::gpu_canvas::CanvasRenderer::redraw_planes` and the right
-    /// `FFPane`'s placement properties. `None` while no tab is active, the
-    /// tab has no checkpoint yet, or before the first pane geometry arrives.
+    /// newest held checkpoint's, else the opened project's, else (before any
+    /// fuse) the raw frame's own, the same `display_image` `frame_draw`
+    /// uses -- for `crate::gpu_canvas::CanvasRenderer::redraw_planes` and the
+    /// right `FFPane`'s placement properties. `None` while no tab is active
+    /// or before the first pane geometry arrives.
     pub fn plane_draw(&self) -> Option<PaneDraw> {
         let tab = self.state.active()?;
-        let image = fused_image_size(tab)?;
+        let image = display_image(tab)?;
         let (_, right) = self.state.panes?;
         tab.viewport.as_ref()?.draw(image, right)
     }
@@ -3270,6 +3310,27 @@ impl AppController {
         self.state.active()?.selected_frame().cloned()
     }
 
+    /// The selected frame's own view onto the active tab's newest fuse --
+    /// `None` before any fuse, when the left pane draws the raw frame. The
+    /// transform is looked up by path in the fused sources, identity for a
+    /// frame added to the tab after its last fuse.
+    pub fn selected_frame_view(&self) -> Option<FrameView> {
+        let tab = self.state.active()?;
+        let (sources, registration) = tab.fused()?;
+        let path = tab.selected_frame()?;
+        let transform = sources
+            .iter()
+            .position(|source| source == path)
+            .map(|i| registration.transform(i))
+            .unwrap_or_else(job::Transform::identity);
+        let extent = display_image(tab)?;
+        Some(FrameView {
+            transform,
+            origin: registration.origin(),
+            extent: (extent.width, extent.height),
+        })
+    }
+
     /// The left pane's label: the selected frame's file name, or empty with
     /// no tab active or nothing selected. In editor mode, appends the
     /// brush source's own position, 1-based, out of the tab's frame count
@@ -4389,6 +4450,11 @@ impl AppController {
         tab.thumbnail = overlay::render_thumbnail_from_frame(&held.composite).map(Arc::new);
         let planes = (held.composite.clone(), held.zmap.clone());
         tab.held.push(held);
+        // The new checkpoint's own extent may differ from what the viewport
+        // was fitted to (a first fuse's crop, a re-fuse over a changed frame
+        // set) -- refit on the next `fit_if_unfitted` rather than keep
+        // drawing the old extent's zoom/pan.
+        tab.viewport = None;
         self.clear_failure(&path);
         planes
     }

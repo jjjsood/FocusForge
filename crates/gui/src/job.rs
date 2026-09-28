@@ -14,8 +14,9 @@ use std::time::{Duration, SystemTime};
 
 use focusforge_core::TiffError;
 use focusforge_core::algorithm::{AlignAlgorithm, StackAlgorithm};
+use focusforge_core::align::WarpingReader;
 use focusforge_core::gpu::TileBackend;
-use focusforge_core::io::{COMPOSITE_FILENAME, TiffStack, ZMAP_FILENAME};
+use focusforge_core::io::{COMPOSITE_FILENAME, FrameReader, ZMAP_FILENAME, open_frame_set};
 use focusforge_core::params::ParamValues;
 use focusforge_core::pipeline::{
     self, AlignRequest, FuseOutput, FuseProduct, FuseRequest, RunStage, StageObserver,
@@ -23,11 +24,12 @@ use focusforge_core::pipeline::{
 use focusforge_core::project::{self, Plane, Project, ProjectError};
 use focusforge_core::registry::{self, LookupError};
 use focusforge_core::retouch::{RetouchError, Sources};
-pub use focusforge_core::tile::Rect;
+pub use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::{ZMapError, ZMapReader};
 
 /// Re-exported so `crate::controller` -- which names no algorithm crate --
 /// can hold and drive these through the `job::` path alone.
+pub use focusforge_core::align::{Registration, Transform};
 pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 pub use focusforge_core::project::HeldCheckpoint;
@@ -78,6 +80,12 @@ pub struct JobRequest {
 /// How often the pipeline's poll thread ticks progress -- the window's
 /// own frame clock.
 pub const POLL: Duration = Duration::from_millis(100);
+
+/// The host budget the frame pane and the edit session each open their
+/// readers against.
+pub fn host_budget() -> HostBudget {
+    HostBudget::host_derived(&focusforge_core::host::snapshot())
+}
 
 /// The registered algorithms a [`JobRequest`]'s ids name, resolved before
 /// any thread starts.
@@ -464,12 +472,14 @@ pub enum EditSessionError {
     Frames(#[from] TiffError),
 }
 
-/// One tab's live editor state: its undo/redo session, the raw source
-/// frames a stroke recomposites against, the resident display cache the
-/// renderer overlays, and the in-progress stroke, if any.
+/// One tab's live editor state: its undo/redo session, the frame set a
+/// stroke recomposites against and the registration warping each of its
+/// reads, the resident display cache the renderer overlays, and the
+/// in-progress stroke, if any.
 pub struct EditState {
     pub session: EditSession,
-    pub sources: TiffStack,
+    pub sources: Box<dyn FrameReader>,
+    pub registration: Registration,
     pub tiles: crate::canvas::ResidentTiles,
     pub stroke: Option<crate::brush::LiveStroke>,
 }
@@ -480,14 +490,20 @@ pub const RESIDENT_TILE_SIZE: u32 = 256;
 
 impl EditState {
     /// Recomposites `region` into this tab's resident display tiles, from
-    /// its own edited indices and raw source frames read at origin
-    /// `(0, 0)`, as the `retouch` CLI subcommand reads them.
+    /// its own edited indices and the frame-as-fused view: each source read
+    /// through its recorded transform, at the registration's own crop
+    /// origin -- the same view the left pane draws, so a stroke transfers
+    /// exactly what it showed.
     pub fn recomposite(&mut self, region: Rect) -> Result<(), RetouchError> {
+        let frame = self.sources.dimensions();
+        let samples_per_pixel = self.sources.frame(0).samples_per_pixel;
+        let transforms = self.registration.transforms(self.sources.len());
+        let warped = WarpingReader::new(&*self.sources, frame, samples_per_pixel, transforms);
         let sources = Sources {
-            reader: &self.sources,
+            reader: &warped,
             frame_count: self.sources.len() as u32,
-            samples_per_pixel: self.sources.header(0).samples_per_pixel,
-            origin: (0, 0),
+            samples_per_pixel,
+            origin: self.registration.origin(),
         };
         self.tiles
             .recomposite(region, self.session.indices(), &sources)
@@ -495,13 +511,16 @@ impl EditState {
 }
 
 /// Opens `zmap` and `frames` and builds an [`EditState`] over the whole
-/// map: an [`EditSession`] seeded from every pixel, `frames` opened as the
-/// raw sources a stroke recomposites against, and an empty resident display
-/// cache gridded at `tile_size` px.
+/// map: an [`EditSession`] seeded from every pixel, `frames` opened through
+/// [`open_frame_set`] as the frame set a stroke recomposites against
+/// (warped by `registration` at recomposite time), and an empty resident
+/// display cache gridded at `tile_size` px.
 pub fn open_edit_session(
     zmap: &Path,
     frames: &[PathBuf],
+    registration: Registration,
     tile_size: u32,
+    budget: HostBudget,
 ) -> Result<EditState, EditSessionError> {
     let reader = ZMapReader::open(zmap)?;
     let info = reader.info();
@@ -515,8 +534,8 @@ pub fn open_edit_session(
     reader.read_tile_into(tile, &mut indices)?;
     let session = EditSession::new(info, tile, indices)
         .expect("a whole-map tile always fits its own map and its own tile_len");
-    let sources = TiffStack::open_files(frames)?;
-    let samples_per_pixel = sources.header(0).samples_per_pixel;
+    let sources = open_frame_set(frames, budget)?.reader;
+    let samples_per_pixel = sources.frame(0).samples_per_pixel;
     let tiles = crate::canvas::ResidentTiles::new(
         tile_size,
         info.width(),
@@ -526,6 +545,7 @@ pub fn open_edit_session(
     Ok(EditState {
         session,
         sources,
+        registration,
         tiles,
         stroke: None,
     })

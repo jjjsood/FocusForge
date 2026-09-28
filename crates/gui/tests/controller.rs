@@ -2158,6 +2158,155 @@ fn an_unresolved_align_id_is_refused_before_any_run() {
 }
 
 // ---------------------------------------------------------------------
+// Both panes' shared geometry: one image size and one viewport, whichever
+// frame is selected, however the tab is zoomed or panned, and for a frame
+// added after the tab's last fuse.
+// ---------------------------------------------------------------------
+
+/// `frame_draw` and `plane_draw` return the same visible source rect and the
+/// same pane-local placement -- both panes drawing through the one shared
+/// [`focusforge_gui::viewport::Viewport`].
+fn assert_panes_correspond(controller: &AppController, case: &str) {
+    let frame = controller
+        .frame_draw()
+        .unwrap_or_else(|| panic!("{case}: frame_draw must draw"));
+    let plane = controller
+        .plane_draw()
+        .unwrap_or_else(|| panic!("{case}: plane_draw must draw"));
+    assert_eq!(frame.src, plane.src, "{case}: same visible source rect");
+    assert_eq!(frame.dst, plane.dst, "{case}: same pane-local placement");
+}
+
+/// On a tab holding a composite, `frame_draw` and `plane_draw` return the
+/// same image size and the same visible source rect for every zoom step and
+/// pan, whichever frame is selected; before the first fuse the left pane
+/// still uses the raw frame's size.
+#[test]
+fn frame_and_plane_panes_share_one_size_and_rect() {
+    let mut controller = controller_with_scratch("shared_pane_geometry");
+    open_mantis64_tab(&mut controller, "shared_pane_geometry", 3);
+    let left = PaneRect {
+        x: 0.0,
+        y: 0.0,
+        width: 300.0,
+        height: 300.0,
+    };
+    let right = PaneRect {
+        x: 308.0,
+        y: 0.0,
+        width: 300.0,
+        height: 300.0,
+    };
+    controller.set_pane_geometry(left, right);
+
+    assert_eq!(
+        controller.frame_draw().unwrap().src,
+        (0, 0, 64, 64),
+        "before any fuse the left pane draws the raw frame's own size"
+    );
+    assert_panes_correspond(
+        &controller,
+        "before any fuse (no composite exists yet to actually render)",
+    );
+
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    assert_eq!(controller.checkpoint_count(), Some(1));
+    // `commit_held` clears the viewport so the next fit re-derives it from
+    // the new composite's own extent; re-installing the same pane geometry
+    // re-fits it.
+    controller.set_pane_geometry(left, right);
+
+    for frame in 0..3 {
+        controller.select_frame(frame);
+        assert_panes_correspond(&controller, &format!("frame {frame} at fit"));
+
+        while !controller.at_max_zoom() {
+            controller.zoom_in();
+        }
+        assert_panes_correspond(&controller, &format!("frame {frame} at max zoom"));
+
+        while !controller.at_min_zoom() {
+            controller.zoom_out();
+        }
+        assert_panes_correspond(&controller, &format!("frame {frame} at min zoom"));
+
+        controller.fit();
+    }
+
+    controller.zoom_in();
+    controller.wheel(
+        0.0,
+        60.0,
+        0.0,
+        0.0,
+        Modifiers {
+            shift: true,
+            ..Modifiers::NONE
+        },
+    );
+    assert_panes_correspond(&controller, "after a pan");
+}
+
+/// A frame with no recorded transform (added to the tab after its last
+/// fuse) is drawn through identity at the composite's crop, so the panes
+/// still share one size.
+#[test]
+fn post_fuse_frame_uses_identity_at_the_composite_crop() {
+    let mut controller = controller_with_scratch("post_fuse_frame");
+    let root = open_fused_tab(&mut controller, "post_fuse_frame", 3);
+
+    // The `editor_mode_requires_the_fused_frame_set` pattern: a missing
+    // frame still lands in `tab.frames` (`apply_add_frames` runs
+    // unconditionally) but refuses the re-fuse `start_fuse` would need to
+    // give it its own transform, so the held checkpoint stays as it was.
+    controller.add_frames(&[root.join("never-written.tif")]);
+    assert!(
+        !controller.confirm_frame_change(),
+        "a missing frame refuses the re-fuse"
+    );
+    assert_eq!(
+        controller.checkpoint_count(),
+        Some(1),
+        "no newer checkpoint lands"
+    );
+
+    controller.select_frame(3);
+    let view = controller
+        .selected_frame_view()
+        .expect("a fused tab's selected frame always has a view");
+    assert_eq!(
+        view.transform,
+        job::Transform::identity(),
+        "a frame added after the fuse has no recorded transform"
+    );
+    let origin = controller
+        .held_checkpoints()
+        .last()
+        .unwrap()
+        .registration
+        .origin();
+    assert_eq!(view.origin, origin, "the composite's own crop origin");
+
+    controller.set_pane_geometry(
+        PaneRect {
+            x: 0.0,
+            y: 0.0,
+            width: 300.0,
+            height: 300.0,
+        },
+        PaneRect {
+            x: 308.0,
+            y: 0.0,
+            width: 300.0,
+            height: 300.0,
+        },
+    );
+    controller.fit();
+    assert_panes_correspond(&controller, "the added frame at identity");
+}
+
+// ---------------------------------------------------------------------
 // The brush on a fused mantis-64 tab: strokes, brush controls, the cursor,
 // the pipette, undo/redo, the live preview and the commit pass.
 // ---------------------------------------------------------------------
@@ -2172,26 +2321,35 @@ use focusforge_gui::canvas::overlay_edited;
 use focusforge_gui::input_map::{Button, Modifiers, PointerKind};
 use focusforge_gui::viewport::PaneRect;
 
-/// The mantis-64 frames' own extent; the fused composite and Z-Map are the
-/// frames' common area, a little smaller, anchored at the same origin.
+/// The mantis-64 frames' own extent, which both panes draw at before any
+/// fuse. This fixture's fuse (3 frames, `dummy-align`'s integer x-shifts,
+/// cropped) leaves a `MAP_WIDTH` x `MAP_HEIGHT` composite -- the frames'
+/// common area, a little smaller, anchored at a non-zero crop origin --
+/// which both panes draw at once the tab holds one.
 const FRAME: u32 = 64;
-/// Both panes are 256 x 320: the 64 x 64 frames fit at exactly 400 %, with
-/// a 32 px band above and below them, so every image point below that sits
-/// on a quarter-pixel grid maps to and from the screen without rounding.
+/// The composite this fixture's fuse always produces -- measured once
+/// against `open_fused_tab(name, 3)` over `mantis-64`, not re-derived per
+/// test.
+const MAP_WIDTH: u32 = 58;
+const MAP_HEIGHT: u32 = 60;
+const SCALE: f32 = 4.0;
+/// Each pane is `MAP_WIDTH` x `MAP_HEIGHT` at exactly 400 %, with a `BAND`
+/// px band above and below it, so every image point below that sits on a
+/// quarter-pixel grid maps to and from the screen without rounding.
+const PANE_WIDTH: f32 = MAP_WIDTH as f32 * SCALE;
+const BAND: f32 = (320.0 - MAP_HEIGHT as f32 * SCALE) / 2.0;
 const LEFT: PaneRect = PaneRect {
     x: 0.0,
     y: 0.0,
-    width: 256.0,
+    width: PANE_WIDTH,
     height: 320.0,
 };
 const RIGHT: PaneRect = PaneRect {
-    x: 264.0,
+    x: PANE_WIDTH + 8.0,
     y: 0.0,
-    width: 256.0,
+    width: PANE_WIDTH,
     height: 320.0,
 };
-const SCALE: f32 = 4.0;
-const BAND: f32 = 32.0;
 const NO_MODS: Modifiers = Modifiers::NONE;
 const CTRL: Modifiers = Modifiers {
     ctrl: true,
@@ -2289,12 +2447,14 @@ fn read_plane(path: &Path, rect: Rect) -> Vec<u16> {
     plane
 }
 
-/// The tab's sealed planes and raw frames, read straight from disk.
+/// The tab's sealed planes and raw frames, read straight from disk, plus the
+/// registration a stroke's own recomposite reads each raw frame through.
 struct Sealed {
     map: Rect,
     indices: Vec<u16>,
     composite: Vec<u16>,
     frames: Vec<Vec<u16>>,
+    registration: job::Registration,
 }
 
 impl Sealed {
@@ -2306,6 +2466,12 @@ impl Sealed {
             width: FRAME,
             height: FRAME,
         };
+        let registration = controller
+            .held_checkpoints()
+            .last()
+            .expect("a fused tab holds at least one checkpoint")
+            .registration
+            .clone();
         let (composite, zmap) = controller.materialize_active_tab_planes().unwrap();
         Sealed {
             map,
@@ -2314,6 +2480,7 @@ impl Sealed {
             frames: (0..3)
                 .map(|i| read_plane(&root.join(format!("{i:02}.tif")), frame))
                 .collect(),
+            registration,
         }
     }
 
@@ -2335,13 +2502,25 @@ impl Sealed {
     }
 
     /// The reference: the edited index's own frame pixel wherever it differs
-    /// from the sealed index, the sealed composite pixel elsewhere.
+    /// from the sealed index, the sealed composite pixel elsewhere -- each
+    /// frame pixel read at its own registered transform and the crop
+    /// origin, the same view [`focusforge_core::retouch::EditSession`]'s own
+    /// recomposite warps through. `dummy-align`'s shifts are exact integer
+    /// translations, so the mapped point always lands on a source pixel
+    /// centre with no rounding error.
     fn expected(&self, edited: &[u16]) -> Vec<u16> {
         let mut out = self.composite.clone();
+        let origin = self.registration.origin();
         for (i, (&e, &s)) in edited.iter().zip(&self.indices).enumerate() {
             if e != s {
                 let (x, y) = (i as u32 % self.map.width, i as u32 / self.map.width);
-                let f = ((y * FRAME + x) * 3) as usize;
+                let (rx, ry) = ((x + origin.0) as f64, (y + origin.1) as f64);
+                let (fx, fy) = self
+                    .registration
+                    .transform(e as usize)
+                    .map_point(rx, ry)
+                    .expect("dummy-align's integer shifts never cross the horizon");
+                let f = ((fy.round() as u32 * FRAME + fx.round() as u32) * 3) as usize;
                 out[i * 3..i * 3 + 3].copy_from_slice(&self.frames[e as usize][f..f + 3]);
             }
         }
@@ -3113,4 +3292,52 @@ fn live_stroke_previews_each_new_segment() {
         "a fresh session with that op"
     );
     sealed.assert_shown(&c, "after release");
+}
+
+/// A brush stroke that paints frame `i` recomposites the composite from the
+/// frame-as-fused view -- the recomposited pixel under the stroke equals a
+/// [`FrameSource`] read of that frame through `selected_frame_view` at the
+/// same point.
+///
+/// [`FrameSource`]: focusforge_gui::canvas::FrameSource
+#[test]
+fn stroke_matches_left_pane() {
+    let (mut c, root) = open_editor("stroke_matches_left_pane");
+    c.select_frame(2);
+    set_size(&mut c, 8.0);
+    drag(&mut c, &[(20.0, 20.0)]);
+
+    let sealed = Sealed::read(&mut c, &root);
+    let point = (20 * sealed.map.width + 20) as usize;
+    let recomposited = sealed.displayed(&c)[point * 3..point * 3 + 3].to_vec();
+
+    let view = c
+        .selected_frame_view()
+        .expect("a fused, editable tab's selected frame always has a view");
+    let mut source = focusforge_gui::canvas::FrameSource::default();
+    source
+        .set(
+            &c.selected_frame_path().unwrap(),
+            Some(view),
+            job::host_budget(),
+        )
+        .expect("the selected frame opens");
+    let mut left_pixel = vec![0u16; 3];
+    source
+        .read_into(
+            Rect {
+                x: 20,
+                y: 20,
+                width: 1,
+                height: 1,
+            },
+            NonZeroU32::MIN,
+            &mut left_pixel,
+        )
+        .expect("the left pane's own point reads");
+
+    assert_eq!(
+        recomposited, left_pixel,
+        "the recomposited pixel must equal the left pane's own read at the same point"
+    );
 }

@@ -16,6 +16,7 @@ use focusforge_gui::canvas::{
     CanvasFeed, DISPLAY_FORMAT, FrameSource, RepaintGate, TextureSpec, draw_rect_fits,
     needs_realloc, truncate_pane_label, validate_display_format,
 };
+use focusforge_gui::job;
 use focusforge_gui::viewport::PaneRect;
 use focusforge_gui::{AppController, OpenOutcome};
 use i_slint_backend_testing::ElementQuery;
@@ -527,10 +528,11 @@ fn opening_a_saved_project_feeds_its_own_planes() {
     }
 }
 
-/// The right pane draws at the sealed composite's own extent, not the
-/// source frames': fuses a `mantis-512` tab (512x512 frames), whose
-/// alignment crop makes the composite smaller, and asserts `plane_draw`'s
-/// source rect stays bounded by the composite's own dimensions.
+/// Both panes draw at the sealed composite's own extent once a tab holds
+/// one, not the raw source frames': fuses a `mantis-512` tab (512x512
+/// frames), whose alignment crop makes the composite smaller, and asserts
+/// `frame_draw` and `plane_draw` return the identical source rect, bounded
+/// by the composite's own dimensions.
 #[test]
 fn right_pane_uses_composite_extent() {
     let mut controller = AppController::new();
@@ -581,35 +583,37 @@ fn right_pane_uses_composite_extent() {
         composite_header.width,
         composite_header.height
     );
-    assert_ne!(
+    assert_eq!(
         plane.src, frame.src,
-        "the right pane must not be stretched across the source frames' extent"
+        "both panes must draw the same source rect once the tab holds a composite"
     );
 }
 
-/// A frame the mmap reader refuses (a compressed TIFF) shows the reader's
-/// own refusal text, and dropping into it still drops whatever was open
-/// before -- the drop-before-open rule holds even on a failed open.
+/// A frame whose compression neither the mmap reader nor the decoded reader
+/// supports ([`open_frame_set`] opens LZW, Deflate and Adobe-Deflate; JPEG
+/// is refused by both) shows the decoded reader's own refusal text, and
+/// dropping into it still drops whatever was open before -- the
+/// drop-before-open rule holds even on a failed open.
 #[test]
-fn compressed_frame_shows_reader_refusal() {
-    let dir = common::tree("compressed_frame_refusal");
+fn unsupported_compression_frame_shows_reader_refusal() {
+    let dir = common::tree("unsupported_compression_frame_refusal");
     let good = common::fixture_frame("mantis-64", 0);
-    let compressed = dir.join("compressed.tif");
-    write_compressed_copy(&good, &compressed);
+    let jpeg_tagged = dir.join("jpeg-tagged.tif");
+    write_compressed_copy(&good, &jpeg_tagged, 7);
 
     let mut frame = FrameSource::default();
     frame
-        .set(&good)
+        .set(&good, None, job::host_budget())
         .expect("the uncompressed fixture frame must open");
     assert!(frame.path().is_some());
 
     let err = frame
-        .set(&compressed)
-        .expect_err("a compressed frame must be refused");
+        .set(&jpeg_tagged, None, job::host_budget())
+        .expect_err("an unsupported compression must be refused");
     assert!(
         err.to_string()
-            .contains("Compression=5, only uncompressed (1) is supported"),
-        "the reader's own refusal text must reach the surface, got: {err}"
+            .contains("Compression=7 is not supported by the decoded TIFF reader"),
+        "the decoded reader's own refusal text must reach the surface, got: {err}"
     );
     assert!(
         frame.path().is_none(),
@@ -618,8 +622,8 @@ fn compressed_frame_shows_reader_refusal() {
 }
 
 /// Copies `source` (a little-endian, classic-TIFF fixture frame) to `dest`,
-/// patching its `Compression` tag (259) from 1 to 5 in place.
-fn write_compressed_copy(source: &Path, dest: &Path) {
+/// patching its `Compression` tag (259) to `compression` in place.
+fn write_compressed_copy(source: &Path, dest: &Path, compression: u16) {
     let mut bytes = fs::read(source).expect("read fixture frame");
     assert_eq!(
         &bytes[0..2],
@@ -634,7 +638,7 @@ fn write_compressed_copy(source: &Path, dest: &Path) {
         let entry_off = ifd_offset + 2 + i * 12;
         let tag = u16::from_le_bytes(bytes[entry_off..entry_off + 2].try_into().unwrap());
         if tag == 259 {
-            bytes[entry_off + 8..entry_off + 10].copy_from_slice(&5u16.to_le_bytes());
+            bytes[entry_off + 8..entry_off + 10].copy_from_slice(&compression.to_le_bytes());
             patched = true;
             break;
         }
@@ -655,7 +659,11 @@ fn frame_source_holds_one_frame() {
     let mut frame = FrameSource::default();
     for i in 0..3 {
         frame
-            .set(&common::fixture_frame("mantis-64", i))
+            .set(
+                &common::fixture_frame("mantis-64", i),
+                None,
+                job::host_budget(),
+            )
             .expect("a fixture frame must open");
     }
     assert_eq!(
@@ -666,7 +674,7 @@ fn frame_source_holds_one_frame() {
     assert!(frame.dimensions().is_some());
 
     let missing = PathBuf::from("/does/not/exist.tif");
-    assert!(frame.set(&missing).is_err());
+    assert!(frame.set(&missing, None, job::host_budget()).is_err());
     assert!(
         frame.path().is_none(),
         "a failed set must leave no handle open at all"
@@ -733,7 +741,9 @@ fn frame_steps_keep_one_handle() {
         let mut baseline = 0usize;
         let mut peak = 0usize;
         for (i, path) in paths.iter().enumerate() {
-            frame.set(path).expect("a reference-stack frame must open");
+            frame
+                .set(path, None, job::host_budget())
+                .expect("a reference-stack frame must open");
             frame
                 .read_into(rect, std::num::NonZeroU32::MIN, &mut buf)
                 .expect("the visible rect must read");
@@ -787,7 +797,9 @@ fn fit_zoom_redraw_reads_a_pane_sized_image() {
         })
         .expect("the reference stack holds source frames");
     let mut frame = FrameSource::default();
-    frame.set(&first).expect("a reference frame must open");
+    frame
+        .set(&first, None, job::host_budget())
+        .expect("a reference frame must open");
     let (w, h) = frame.dimensions().unwrap();
     let spp = frame.samples_per_pixel().unwrap() as usize;
     let img = ImageSize {
@@ -847,7 +859,7 @@ fn fit_zoom_redraw_reads_a_pane_sized_image() {
     let mut renderer = focusforge_gui::gpu_canvas::CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
     renderer
-        .set_frame(&first)
+        .set_frame(&first, None, job::host_budget())
         .expect("the renderer opens the frame");
     for (label, draw) in [("fit", at_fit), ("100 %", at_100)] {
         let start = Instant::now();
@@ -1344,5 +1356,56 @@ fn overlay_keeps_sealed_pixels_where_index_unchanged() {
                 );
             }
         }
+    }
+}
+
+/// `FrameSource` opens an LZW-compressed frame through `open_frame_set`,
+/// reading the same samples as its uncompressed original, at step 1 and
+/// step 2 -- the editor is not narrowed to the mmap fast path.
+#[test]
+fn compressed_frame_reads_the_same_samples_as_its_uncompressed_original() {
+    let uncompressed = common::fixture_frame("mantis-64", 0);
+    let compressed = common::fixture_frame("mantis-64-lzw-p2-strip-ii", 0);
+
+    for step in [
+        std::num::NonZeroU32::MIN,
+        std::num::NonZeroU32::new(2).unwrap(),
+    ] {
+        let mut plain = FrameSource::default();
+        plain
+            .set(&uncompressed, None, job::host_budget())
+            .expect("the uncompressed fixture frame must open");
+        let mut lzw = FrameSource::default();
+        lzw.set(&compressed, None, job::host_budget())
+            .expect("the LZW fixture frame must open through open_frame_set");
+
+        let (w, h) = plain
+            .dimensions()
+            .expect("the uncompressed frame has a size");
+        assert_eq!(
+            lzw.dimensions(),
+            Some((w, h)),
+            "step {step}: both readers report the same frame size"
+        );
+        let spp = plain.samples_per_pixel().expect("samples per pixel");
+        let rect = focusforge_core::tile::Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        let out_w = w.div_ceil(step.get());
+        let out_h = h.div_ceil(step.get());
+        let mut plain_out = vec![0u16; out_w as usize * out_h as usize * spp as usize];
+        let mut lzw_out = plain_out.clone();
+        plain
+            .read_into(rect, step, &mut plain_out)
+            .expect("the uncompressed frame reads");
+        lzw.read_into(rect, step, &mut lzw_out)
+            .expect("the LZW frame reads");
+        assert_eq!(
+            plain_out, lzw_out,
+            "step {step}: the LZW frame must read the same samples as its uncompressed original"
+        );
     }
 }
