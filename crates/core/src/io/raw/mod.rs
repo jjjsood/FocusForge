@@ -611,6 +611,11 @@ fn open_dummy_inner(path: &Path) -> Result<RawFrame, RawError> {
 }
 
 fn raw_desc(path: &Path, width: u32, height: u32) -> FrameDesc {
+    let format = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_else(|| "raw".to_string());
     FrameDesc {
         path: path.to_path_buf(),
         file_size: std::fs::metadata(path)
@@ -622,8 +627,8 @@ fn raw_desc(path: &Path, width: u32, height: u32) -> FrameDesc {
         samples_per_pixel: 3,
         strip_offsets: Vec::new(),
         strip_byte_counts: Vec::new(),
-        layout_label: "RAW".to_string(),
-        layout_signature: vec!["RAW developed RGB".to_string()],
+        layout_label: format!("raw/{format}/output={width}x{height}"),
+        layout_signature: vec![format!("raw/{format}"), format!("output={width}x{height}")],
     }
 }
 
