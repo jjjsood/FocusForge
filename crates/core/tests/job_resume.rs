@@ -20,7 +20,7 @@ use focusforge_core::algorithm::AlgorithmError;
 use focusforge_core::algorithm::AlignStatus;
 use focusforge_core::align::{FrameAlignment, ReferencePolicy, StackAlignment, Transform};
 use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
-use focusforge_core::io::TiffStack;
+use focusforge_core::io::{FrameReader, TiffStack};
 use focusforge_core::job::fingerprint::{FrameFingerprint, StackFingerprint};
 use focusforge_core::job::record::{JOB_RECORD_FORMAT, JobRecord};
 use focusforge_core::job::{Job, JobOutcome, Resumable, ResumeStore};
@@ -75,7 +75,7 @@ fn geometry(stack_ctx: StackContext) -> FusionGeometry {
 fn stack_fingerprint(stack: &TiffStack) -> StackFingerprint {
     StackFingerprint {
         frames: (0..stack.len())
-            .map(|i| FrameFingerprint::from(stack.header(i)))
+            .map(|i| FrameFingerprint::from(FrameReader::frame(stack, i)))
             .collect(),
     }
 }
@@ -106,8 +106,49 @@ fn job_record(
     }
 }
 
+#[test]
+fn resume_store_reads_a_ledger_with_a_header_shaped_fingerprint() {
+    let stack = open_stack();
+    let scratch = scratch_base("legacy-frame-fingerprint");
+    let composite = scratch.join("composite.tif");
+    std::fs::create_dir_all(&scratch).expect("scratch must exist");
+    std::fs::write(&composite, []).expect("output marker must exist");
+    let values = ParamValues::new();
+    let record = job_record(&stack, &values, &composite, None);
+    let mut legacy = serde_json::to_value(&record).expect("record must serialize");
+    legacy["fingerprint"] = serde_json::json!({
+        "frames": (0..stack.len()).map(|index| {
+            let header = stack.header(index);
+            serde_json::json!({
+                "path": header.path.clone(),
+                "file_size": header.file_size,
+                "image_description": header.image_description.clone(),
+                "width": header.width,
+                "height": header.height,
+                "samples_per_pixel": header.samples_per_pixel,
+                "strip_offsets": header.strip_offsets.clone(),
+                "strip_byte_counts": header.strip_byte_counts.clone(),
+            })
+        }).collect::<Vec<_>>(),
+    });
+    let ledger_dir = scratch.join("resume").join("legacy");
+    std::fs::create_dir_all(&ledger_dir).expect("legacy ledger directory must exist");
+    std::fs::write(
+        ledger_dir.join("job.json"),
+        serde_json::to_vec(&legacy).expect("legacy record must serialize"),
+    )
+    .expect("legacy job must write");
+    let store = ResumeStore::open(&scratch).expect("resume store must open");
+    assert!(matches!(
+        store.find(&record).expect("find must succeed"),
+        Resumable::Ledger(_)
+    ));
+}
+
 /// Blocks each `consume` call until [`Gate::release`] is called, and
-/// records when a call has begun.
+/// records when a call has begun -- same rendezvous shape as
+/// `crates/core/tests/job_engine.rs`'s `Gate`, duplicated here since
+/// integration test binaries share no code except `common`.
 struct Gate {
     started: Mutex<usize>,
     started_cvar: Condvar,
@@ -1023,6 +1064,7 @@ fn resume_after_a_clean_cancel_continues() {
 #[ignore = "reads the 16 GB reference stack"]
 fn resume_on_the_reference_stack() {
     let Some(stack_dir) = common::reference_stack_dir() else {
+        eprintln!("reference stack not found; skipping");
         return;
     };
 

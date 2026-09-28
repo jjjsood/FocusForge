@@ -17,6 +17,7 @@ export component FFDialog inherits Rectangle {
     in property <string> body: "";
     // Empty hides the info line.
     in property <string> info: "";
+    in property <string> cancel-label: "Cancel";
     in property <string> secondary-label: "";
     in property <string> confirm-label: "Confirm";
     in property <string> confirm-kind: "primary";
@@ -137,6 +138,7 @@ export component FFDialog inherits Rectangle {
             }
 
             FFDialogFooter {
+                cancel-label: root.cancel-label;
                 secondary-label: root.secondary-label;
                 confirm-label: root.confirm-label;
                 confirm-kind: root.confirm-kind;

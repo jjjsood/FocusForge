@@ -229,6 +229,16 @@ export component FFFrameSetWarning inherits FFDialog {
     confirm-kind: "primary";
 }
 
+// Asked after a run whose alignment left some frames unregistered, before
+// its checkpoint is committed; the body names those frames.
+export component FFDivergenceWarning inherits FFDialog {
+    tone: "warning";
+    title: "Keep this fused result?";
+    cancel-label: "Discard";
+    confirm-label: "Keep";
+    confirm-kind: "primary";
+}
+
 // Asked before closing a tab, or the window, with checkpoints no project
 // file contains; `AppController::pending_close` supplies the close-a-tab
 // title, context, body and info, `pending_quit_copy` the quit-the-window
@@ -237,4 +247,3 @@ export component FFCloseGuard inherits FFDialog {
     tone: "save";
     confirm-kind: "danger";
 }
-

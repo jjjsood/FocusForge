@@ -203,6 +203,9 @@ fn open_fixture_tab(
         common::open_and_settle(controller, std::slice::from_ref(&root)),
         OpenOutcome::Opened(_)
     ));
+    // Canvas feeding is under test, not alignment quality; an algorithm that
+    // always converges keeps every run clean.
+    controller.set_align_algorithm("dummy-align");
     root
 }
 
@@ -841,7 +844,8 @@ fn fit_zoom_redraw_reads_a_pane_sized_image() {
     let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
         return;
     };
-    let mut renderer = focusforge_gui::gpu_canvas::CanvasRenderer::new(shared);
+    let mut renderer = focusforge_gui::gpu_canvas::CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
     renderer
         .set_frame(&first)
         .expect("the renderer opens the frame");

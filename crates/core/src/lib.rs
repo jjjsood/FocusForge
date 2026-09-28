@@ -22,6 +22,7 @@ pub mod pipeline;
 mod pool;
 pub mod project;
 pub mod registry;
+pub mod retouch;
 pub mod tile;
 pub mod timing;
 pub mod zmap;

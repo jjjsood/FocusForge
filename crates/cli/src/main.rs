@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use focusforge_core::io::{ByteOrder, TiffError, TiffHeader, frame_paths};
+use focusforge_core::io::{
+    ByteOrder, FrameDesc, TiffError, TiffHeader, classify_header, frame_paths,
+};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
@@ -26,6 +28,7 @@ mod groups;
 mod job;
 mod preset;
 mod progress;
+mod retouch;
 mod review;
 mod set;
 mod signals;
@@ -234,6 +237,52 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Apply an op list to a Z-Map and write the edited Z-Map. Every
+    /// editing capability is reachable through this command, headless.
+    Retouch {
+        /// The Z-Map to edit.
+        #[arg(long, value_name = "FILE")]
+        zmap: PathBuf,
+        /// The op list to apply, in the persisted `Op` JSON shape.
+        /// Positions in error messages count from 0 in list order.
+        #[arg(long, value_name = "FILE")]
+        ops: PathBuf,
+        /// Where to write the edited Z-Map. Required: no default output
+        /// path, and never the same file as `--zmap`.
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+        /// Undo this many ops off the end of the list before writing.
+        #[arg(long, default_value_t = 0)]
+        undo: usize,
+        /// Redo this many undone ops. Must not exceed `--undo`.
+        #[arg(long, default_value_t = 0)]
+        redo: usize,
+        /// Directory of source frames to recomposite `--render` from.
+        /// Required by `--render`.
+        #[arg(long, value_name = "DIR")]
+        frames: Option<PathBuf>,
+        /// Write the recomposited image at the edited map's undo/redo
+        /// position: a per-pixel gather from `--frames`, CPU only.
+        #[arg(long, value_name = "FILE", requires = "frames")]
+        render: Option<PathBuf>,
+        /// Blend the rainbow overlay over the edited map's recomposited
+        /// image and write it as a PNG. Requires `--frames`, as `--render`
+        /// does.
+        #[arg(long, value_name = "FILE", requires = "frames")]
+        overlay: Option<PathBuf>,
+        /// The overlay's blend opacity: `0.0` leaves the composite
+        /// untouched, `1.0` is the palette colour alone.
+        #[arg(long, default_value_t = 0.65)]
+        opacity: f32,
+        /// Highlight this 0-based source index in the overlay -- the
+        /// numbering an op's `source_id` uses -- and desaturate every
+        /// other source, rather than the undivided wheel.
+        #[arg(long, value_name = "INDEX")]
+        solo: Option<u16>,
+        /// Emit the frozen JSON report instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Compute and report the per-frame transforms for a stack: readable
     /// text by default, a frozen `--json` document on request, and an
     /// optional per-frame warped-TIFF dump for a visual check.
@@ -333,6 +382,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Algorithms { .. } => "algorithms",
         Command::Stack { .. } => "stack",
         Command::Export { .. } => "export",
+        Command::Retouch { .. } => "retouch",
         Command::Align { .. } => "align",
         Command::Review { .. } => "review",
         Command::Cache { .. } => "cache",
@@ -435,6 +485,31 @@ fn main() -> ExitCode {
             zmap,
             json,
         } => export::run(&project, output.as_deref(), zmap.as_deref(), json),
+        Command::Retouch {
+            zmap,
+            ops,
+            out,
+            undo,
+            redo,
+            frames,
+            render,
+            overlay,
+            opacity,
+            solo,
+            json,
+        } => retouch::run(
+            &zmap,
+            &ops,
+            &out,
+            undo,
+            redo,
+            frames.as_deref(),
+            render.as_deref(),
+            overlay.as_deref(),
+            opacity,
+            solo,
+            json,
+        ),
         Command::Align {
             dir,
             algo,
@@ -529,6 +604,7 @@ struct FileReport {
     file_size: Option<u64>,
     description: Option<String>,
     mmap_fast_path: Option<bool>,
+    reader: Option<String>,
     refusal: Option<String>,
     error: Option<String>,
 }
@@ -625,7 +701,16 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
         .iter()
         .filter_map(|p| p.header.as_ref().ok().map(|h| (p.name.as_str(), h)))
         .collect();
-    let (uniform_layout, uniform_detail) = focusforge_core::pipeline::uniform_check(&ok_headers);
+    let descs: Vec<FrameDesc> = ok_headers
+        .iter()
+        .map(|(_, header)| FrameDesc::from(*header))
+        .collect();
+    let named_descs: Vec<(&str, &FrameDesc)> = ok_headers
+        .iter()
+        .zip(descs.iter())
+        .map(|((name, _), desc)| (*name, desc))
+        .collect();
+    let (uniform_layout, uniform_detail) = focusforge_core::pipeline::uniform_check(&named_descs);
 
     let files = parsed
         .iter()
@@ -646,6 +731,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 file_size: Some(h.file_size),
                 description: h.image_description.clone(),
                 mmap_fast_path: Some(h.refusal.is_none()),
+                reader: classify_header(h).ok().map(|kind| kind.name().to_string()),
                 refusal: h.refusal.as_ref().map(|r| r.to_string()),
                 error: None,
             },
@@ -665,6 +751,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 file_size: None,
                 description: None,
                 mmap_fast_path: None,
+                reader: None,
                 refusal: None,
                 error: Some(e.to_string()),
             },
@@ -720,6 +807,9 @@ fn print_human(report: &InfoReport) {
             None => println!("  mmap fast path: yes"),
             Some(refusal) => println!("  mmap fast path: no — {refusal}"),
         }
+        if let Some(reader) = &file.reader {
+            println!("  reader: {reader}");
+        }
     }
 
     if report.is_directory {
@@ -747,6 +837,32 @@ fn fail(message: impl std::fmt::Display) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn desc(label: &str, signature: &[&str]) -> FrameDesc {
+        FrameDesc {
+            path: PathBuf::from(label),
+            file_size: 0,
+            image_description: None,
+            width: 1,
+            height: 1,
+            samples_per_pixel: 1,
+            strip_offsets: Vec::new(),
+            strip_byte_counts: Vec::new(),
+            layout_label: signature[0..2].join("/"),
+            layout_signature: signature.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn neutral_layout_tie_uses_the_last_group_and_lists_suffixes() {
+        let a = desc("a", &["II", "rps=1", "compression=1", "4x4"]);
+        let b = desc("b", &["MM", "rps=8", "compression=5", "8x4"]);
+        let (_, detail) = focusforge_core::pipeline::uniform_check(&[("a", &a), ("b", &b)]);
+        assert_eq!(
+            detail.as_deref(),
+            Some("a is II/rps=1/compression=1/4x4, others MM/rps=8")
+        );
+    }
 
     /// `--no-crop`'s clap default and `PROJECT_PARAMS`'s `auto-crop`
     /// descriptor default are one source of truth. This test fails the

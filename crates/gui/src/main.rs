@@ -14,6 +14,7 @@ use clap::Parser;
 use focusforge_gui::bridge::Canvas;
 use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, job, screenshot};
 use slint::ComponentHandle;
+use slint::wgpu_29::wgpu;
 
 #[derive(Parser)]
 #[command(name = "focusforge-gui")]
@@ -77,6 +78,11 @@ struct Args {
     /// question with no click.
     #[arg(long, requires = "fuse_tabs")]
     request_quit: bool,
+    /// Selects editor mode once the last `--fuse-tabs` run settles, as
+    /// clicking the mode switch's `Editor` segment does -- for inspecting
+    /// the editor surface with no click sequence.
+    #[arg(long, requires = "fuse_tabs")]
+    enter_editor: bool,
     /// Requests removing the frame at this index right after `--open`, for
     /// inspecting the frame-set warning it raises on a checkpointed project
     /// with no click sequence.
@@ -119,6 +125,7 @@ struct FuseTabsFollowUp {
     close: bool,
     quit: bool,
     overlay: bool,
+    enter_editor: bool,
 }
 
 /// Presses `Fuse stack` on each of `indices` in turn, the moment no
@@ -129,7 +136,8 @@ struct FuseTabsFollowUp {
 /// picks up their result. An index already pressed waits until no run is
 /// pending, since a press on a tab already running or queued is ignored.
 /// Once every press is made and every run settled, `save` presses `Save
-/// project` on the proposed path and `overlay` opens the projects overlay.
+/// project` on the proposed path, `overlay` opens the projects overlay, and
+/// `enter_editor` selects editor mode.
 fn start_fuse_tabs_timer(
     app_weak: slint::Weak<AppWindow>,
     controller: Arc<Mutex<AppController>>,
@@ -142,6 +150,7 @@ fn start_fuse_tabs_timer(
         close,
         quit,
         overlay,
+        enter_editor,
     } = follow_up;
     let timer_slot = slot.clone();
     let mut pending: std::collections::VecDeque<usize> = indices.into();
@@ -165,8 +174,13 @@ fn start_fuse_tabs_timer(
             app.invoke_tab_selected(index as i32);
             app.invoke_fuse_requested();
         }
-        if (save || close || quit || overlay) && controller.lock().unwrap().work_pending() {
+        if (save || close || quit || overlay || enter_editor)
+            && controller.lock().unwrap().work_pending()
+        {
             return;
+        }
+        if enter_editor {
+            app.invoke_mode_selected("editor".into());
         }
         if save {
             controller
@@ -200,32 +214,32 @@ fn parse_size(spec: &str) -> Option<(u32, u32)> {
     Some((w.parse().ok()?, h.parse().ok()?))
 }
 
-/// Selects the pinned wgpu 29 backend before any window is created, on the
-/// `Manual` device-ownership path: `focusforge_gpu::device::shared_device()`
-/// is created first, then handed to Slint by value, which is what keeps the
-/// composite/Z-Map texture off the CPU round-trip. There is no
-/// CPU-tone-mapped and no `Automatic` fallback, so no usable adapter is the
-/// run's end: the named `GpuError` and the still-working command-line path
-/// are printed and `Err` carries the code the process ends with.
+/// Configures Slint's surface-compatible wgpu device with the compute limits
+/// the canvas needs.
+fn wgpu_settings() -> slint::wgpu_29::WGPUSettings {
+    let mut settings = slint::wgpu_29::WGPUSettings::default();
+    settings.device_required_features = focusforge_gpu::limits::REQUIRED_FEATURES;
+    settings.device_required_limits = focusforge_gpu::limits::required_limits();
+    settings
+}
+
+fn begin_lifecycle(generation: &std::cell::Cell<u64>) -> u64 {
+    let next = generation.get().wrapping_add(1);
+    generation.set(next);
+    next
+}
+
+fn teardown_is_current(generation: &std::cell::Cell<u64>, teardown: u64) -> bool {
+    generation.get() == teardown
+}
+
+/// Selects Slint's pinned wgpu 29 backend before any window is created.
 fn select_backend(
     controller: Arc<Mutex<AppController>>,
     canvas: Rc<RefCell<Canvas>>,
     app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>>,
 ) -> Result<(), ExitCode> {
-    let shared = match focusforge_gpu::device::shared_device() {
-        Ok(shared) => shared,
-        Err(err) => {
-            tracing::error!("{err}\nfocusforge-cli still works without a GPU adapter");
-            return Err(ExitCode::from(1));
-        }
-    };
-
-    let config = slint::wgpu_29::WGPUConfiguration::Manual {
-        instance: shared.instance().clone(),
-        adapter: shared.adapter().clone(),
-        device: shared.device().clone(),
-        queue: shared.queue().clone(),
-    };
+    let config = slint::wgpu_29::WGPUConfiguration::Automatic(wgpu_settings());
     // The drop route is installed on this *existing* `BackendSelector`
     // chain, before any window exists, which is why `controller` and
     // `canvas` are both built before `select_backend` runs rather than
@@ -243,13 +257,11 @@ fn select_backend(
     // The crate's feature set pins exactly one backend/renderer
     // combination, so "resolved" is what was compiled in.
     println!("resolved backend: winit, renderer: renderer-femtovg-wgpu (wgpu 29.0.4)");
-    println!("{}", focusforge_gpu::device::adapter_report(shared.info()));
     Ok(())
 }
 
 /// Installs the exit-after and resize timers, then runs the event loop.
-/// Deliberately no `set_rendering_notifier` (slint-ui/slint#12030). Returns
-/// the process exit code.
+/// Returns the process exit code.
 ///
 /// The size timer fires at 50 ms, not a literal 0 ms: measured on this
 /// Wayland session, a 0 ms delay still raced `show()`'s own initial layout
@@ -257,8 +269,88 @@ fn select_backend(
 /// `preferred-width` while height applied correctly, the same asymmetry
 /// slint-ui/slint#13245 describes. 50 ms clears the race; the exit-after
 /// timer's own screenshot is what proves it.
-fn run_window<T: ComponentHandle + 'static>(app: T, args: &Args) -> i32 {
+fn run_window<T: ComponentHandle + 'static>(
+    app: T,
+    args: &Args,
+    controller: Option<Arc<Mutex<AppController>>>,
+    canvas: Option<Rc<RefCell<Canvas>>>,
+    app_handle: Option<slint::Weak<AppWindow>>,
+) -> i32 {
     let exit_code = std::rc::Rc::new(std::cell::Cell::new(0i32));
+    let device: Rc<RefCell<Option<wgpu::Device>>> = Rc::new(RefCell::new(None));
+    let closing = Rc::new(std::cell::Cell::new(false));
+    let forced_loss = Rc::new(std::cell::Cell::new(false));
+    let loss_reported = Rc::new(std::cell::Cell::new(false));
+    let lifecycle = Rc::new(std::cell::Cell::new(0));
+
+    {
+        let device = device.clone();
+        let closing = closing.clone();
+        let lifecycle = lifecycle.clone();
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_handle = app_handle.clone();
+        if let Err(e) = app
+            .window()
+            .set_rendering_notifier(move |state, api| match state {
+                slint::RenderingState::RenderingSetup => {
+                    begin_lifecycle(&lifecycle);
+                    let slint::GraphicsAPI::WGPU29 {
+                        device: next,
+                        queue,
+                        ..
+                    } = api
+                    else {
+                        return;
+                    };
+                    focusforge_gpu::errors::install_handlers(next);
+                    *device.borrow_mut() = Some(next.clone());
+                    if let (Some(controller), Some(canvas), Some(app)) = (
+                        controller.as_ref(),
+                        canvas.as_ref(),
+                        app_handle.as_ref().and_then(|app| app.upgrade()),
+                    ) {
+                        canvas
+                            .borrow_mut()
+                            .attach_device(next.clone(), queue.clone());
+                        let controller = controller.clone();
+                        let canvas = canvas.clone();
+                        slint::Timer::single_shot(Duration::ZERO, move || {
+                            bridge::repaint(&app, &controller, &canvas);
+                        });
+                    }
+                }
+                slint::RenderingState::RenderingTeardown => {
+                    if closing.get() {
+                        return;
+                    }
+                    let teardown = lifecycle.get();
+                    let device = device.clone();
+                    let canvas = canvas.clone();
+                    let app_handle = app_handle.clone();
+                    let lifecycle = lifecycle.clone();
+                    slint::Timer::single_shot(Duration::ZERO, move || {
+                        if !teardown_is_current(&lifecycle, teardown) {
+                            return;
+                        }
+                        if let Some(app) = app_handle.and_then(|app| app.upgrade()) {
+                            app.set_frame_source(slint::Image::default());
+                            app.set_composite_source(slint::Image::default());
+                            app.set_zmap_source(slint::Image::default());
+                        }
+                        if let Some(canvas) = canvas {
+                            canvas.borrow_mut().detach_device();
+                        }
+                        *device.borrow_mut() = None;
+                    });
+                }
+                _ => {}
+            })
+        {
+            tracing::error!("could not register graphics notifier: {e}");
+            return 1;
+        }
+    }
 
     if let Some(spec) = args.size.clone() {
         let app_weak = app.as_weak();
@@ -279,9 +371,13 @@ fn run_window<T: ComponentHandle + 'static>(app: T, args: &Args) -> i32 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
     {
-        slint::Timer::single_shot(Duration::from_millis(ms), || {
-            if let Ok(shared) = focusforge_gpu::device::shared_device() {
-                shared.force_loss();
+        let device = device.clone();
+        let forced_loss = forced_loss.clone();
+        slint::Timer::single_shot(Duration::from_millis(ms), move || {
+            if let Some(device) = device.borrow().as_ref() {
+                forced_loss.set(true);
+                device.destroy();
+                let _ = device.poll(wgpu::PollType::Poll);
             }
         });
     }
@@ -290,6 +386,7 @@ fn run_window<T: ComponentHandle + 'static>(app: T, args: &Args) -> i32 {
         let app_weak = app.as_weak();
         let screenshot_path = args.screenshot.clone();
         let exit_code = exit_code.clone();
+        let closing = closing.clone();
         slint::Timer::single_shot(Duration::from_millis(ms), move || {
             if let Some(app) = app_weak.upgrade()
                 && let Some(path) = &screenshot_path
@@ -312,6 +409,7 @@ fn run_window<T: ComponentHandle + 'static>(app: T, args: &Args) -> i32 {
                 }
             }
 
+            closing.set(true);
             let _ = slint::quit_event_loop();
         });
     }
@@ -323,6 +421,9 @@ fn run_window<T: ComponentHandle + 'static>(app: T, args: &Args) -> i32 {
     let loss_timer = slint::Timer::default();
     {
         let exit_code = exit_code.clone();
+        let device = device.clone();
+        let closing = closing.clone();
+        let loss_reported = loss_reported.clone();
         let latched = std::cell::Cell::new(false);
         loss_timer.start(
             slint::TimerMode::Repeated,
@@ -331,22 +432,42 @@ fn run_window<T: ComponentHandle + 'static>(app: T, args: &Args) -> i32 {
                 if latched.get() {
                     return;
                 }
-                let Ok(shared) = focusforge_gpu::device::shared_device() else {
-                    return;
-                };
-                if shared.lost() {
+                if let Some(device) = device.borrow().as_ref().cloned() {
+                    let _ = device.poll(wgpu::PollType::Poll);
+                }
+                if focusforge_gpu::errors::device_lost() {
                     latched.set(true);
+                    loss_reported.set(true);
                     tracing::error!("ending the session: the graphics device is gone");
                     exit_code.set(3);
+                    closing.set(true);
                     let _ = slint::quit_event_loop();
                 }
             },
         );
     }
 
-    if let Err(e) = app.run() {
+    let run_result = app.run();
+    if let Some(app) = app_handle.and_then(|app| app.upgrade()) {
+        app.set_frame_source(slint::Image::default());
+        app.set_composite_source(slint::Image::default());
+        app.set_zmap_source(slint::Image::default());
+    }
+    if let Some(canvas) = canvas {
+        canvas.borrow_mut().detach_device();
+    }
+    *device.borrow_mut() = None;
+
+    if let Err(e) = run_result {
         tracing::error!("event loop exited with an error: {e}");
-        exit_code.set(1);
+        if focusforge_gpu::errors::device_lost() || forced_loss.get() {
+            if !loss_reported.replace(true) {
+                tracing::error!("ending the session: the graphics device is gone");
+            }
+            exit_code.set(3);
+        } else if exit_code.get() == 0 {
+            exit_code.set(1);
+        }
     }
     exit_code.get()
 }
@@ -512,7 +633,7 @@ fn run(args: &Args) -> ExitCode {
 
     let code = if args.theme_sheet {
         let sheet = ThemeSheet::new().expect("failed to instantiate ThemeSheet");
-        run_window(sheet, args)
+        run_window(sheet, args, None, None, None)
     } else {
         let app = AppWindow::new().expect("failed to instantiate AppWindow");
         *app_handle.borrow_mut() = Some(app.as_weak());
@@ -585,12 +706,70 @@ fn run(args: &Args) -> ExitCode {
                     close: args.request_close,
                     quit: args.request_quit,
                     overlay: args.projects_overlay,
+                    enter_editor: args.enter_editor,
                 },
             );
         }
 
-        run_window(app, args)
+        run_window(
+            app,
+            args,
+            Some(controller),
+            Some(canvas),
+            app_handle.borrow().clone(),
+        )
     };
 
     ExitCode::from(code as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wgpu_settings_change_only_the_required_device_values() {
+        let defaults = slint::wgpu_29::WGPUSettings::default();
+        let settings = wgpu_settings();
+
+        assert_eq!(
+            settings.device_required_features,
+            focusforge_gpu::limits::REQUIRED_FEATURES
+        );
+        assert_eq!(
+            settings.device_required_limits,
+            focusforge_gpu::limits::required_limits()
+        );
+        assert_eq!(settings.backends, defaults.backends);
+        assert_eq!(
+            format!("{:?}", settings.backend_options),
+            format!("{:?}", defaults.backend_options)
+        );
+        assert_eq!(settings.instance_flags, defaults.instance_flags);
+        assert_eq!(
+            format!("{:?}", settings.instance_memory_budget_thresholds),
+            format!("{:?}", defaults.instance_memory_budget_thresholds)
+        );
+        assert_eq!(settings.power_preference, defaults.power_preference);
+        assert_eq!(settings.device_label, defaults.device_label);
+        assert_eq!(
+            format!("{:?}", settings.device_experimental_features),
+            format!("{:?}", defaults.device_experimental_features)
+        );
+        assert_eq!(
+            format!("{:?}", settings.device_memory_hints),
+            format!("{:?}", defaults.device_memory_hints)
+        );
+    }
+
+    #[test]
+    fn newer_setup_keeps_a_queued_older_teardown_stale() {
+        let generation = std::cell::Cell::new(0);
+        let old_setup = begin_lifecycle(&generation);
+        let new_setup = begin_lifecycle(&generation);
+
+        assert_ne!(old_setup, new_setup);
+        assert!(!teardown_is_current(&generation, old_setup));
+        assert!(teardown_is_current(&generation, new_setup));
+    }
 }

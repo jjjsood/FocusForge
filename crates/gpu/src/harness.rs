@@ -394,9 +394,34 @@ pub fn backend_for(
         // function had never been called.
         return (None, String::new());
     }
-    let (path, result, message) = crate::adapter::choose_path(no_gpu, gpu_backend_capped(max_vram));
+    if no_gpu {
+        return (None, "--no-gpu given: forcing the CPU path".to_string());
+    }
+    let (path, result, message) = crate::adapter::choose_path(false, gpu_backend_capped(max_vram));
     match path {
         crate::adapter::PathChoice::Gpu => (result.ok(), message),
         crate::adapter::PathChoice::CpuFallback => (None, message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backend_for;
+    use focusforge_core::algorithm::StackAlgorithm;
+    use focusforge_core::fuse::laplacian::Laplacian;
+
+    #[test]
+    fn backend_for_cpu_selection() {
+        for max_vram in [None, Some(0)] {
+            let (backend, message) = backend_for(Laplacian.id(), true, max_vram);
+            assert!(backend.is_none());
+            assert_eq!(message, "--no-gpu given: forcing the CPU path");
+
+            for no_gpu in [false, true] {
+                let (backend, message) = backend_for("unsupported", no_gpu, max_vram);
+                assert!(backend.is_none());
+                assert!(message.is_empty());
+            }
+        }
     }
 }

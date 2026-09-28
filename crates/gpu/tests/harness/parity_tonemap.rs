@@ -5,12 +5,12 @@
 //! integer throughout on both sides -- so a non-zero delta is a
 //! finding to investigate, not tolerance to spend.
 
-use focusforge_core::display::{tonemap_cpu, zmap_index_scale};
+use focusforge_core::display::{overlay_cpu, tonemap_cpu, zmap_index_scale};
 use focusforge_core::io::TiffStack;
 use focusforge_core::tile::Rect;
-use focusforge_core::zmap::ZMapReader;
+use focusforge_core::zmap::{NO_SOURCE, ZMapReader, overlay_table};
 use focusforge_gpu::device::shared_device_or_skip;
-use focusforge_gpu::display::{DisplayTexture, read_display_texture, render};
+use focusforge_gpu::display::{DisplayTexture, read_display_texture, render, render_overlay};
 
 use crate::common;
 
@@ -59,7 +59,14 @@ fn tonemap_matches_cpu() {
         .expect("read golden composite");
 
     let target = DisplayTexture::new(shared.device(), width, height);
-    render(shared, &target, &composite_samples, spp, 0);
+    render(
+        shared.device(),
+        shared.queue(),
+        &target,
+        &composite_samples,
+        spp,
+        0,
+    );
     let gpu_bytes = read_display_texture(shared.device(), shared.queue(), &target);
 
     let mut cpu_bytes = vec![0u8; (width * height * 4) as usize];
@@ -89,7 +96,14 @@ fn tonemap_matches_cpu() {
     assert_eq!(index_scale, 9362, "frames=8 -> 65535 / 7");
 
     let ztarget = DisplayTexture::new(shared.device(), zwidth, zheight);
-    render(shared, &ztarget, &indices, 1, index_scale);
+    render(
+        shared.device(),
+        shared.queue(),
+        &ztarget,
+        &indices,
+        1,
+        index_scale,
+    );
     let zgpu_bytes = read_display_texture(shared.device(), shared.queue(), &ztarget);
 
     let mut zcpu_bytes = vec![0u8; (zwidth * zheight * 4) as usize];
@@ -159,7 +173,7 @@ fn tonemap_matches_cpu_above_the_one_dimensional_dispatch_ceiling() {
         ("zmap", &indices, 1, index_scale),
     ] {
         let target = DisplayTexture::new(shared.device(), width, height);
-        render(shared, &target, src, spp, scale);
+        render(shared.device(), shared.queue(), &target, src, spp, scale);
         let gpu_bytes = read_display_texture(shared.device(), shared.queue(), &target);
         let mut cpu_bytes = vec![0u8; (width * height * 4) as usize];
         tonemap_cpu(src, width, height, spp, scale, &mut cpu_bytes);
@@ -206,7 +220,7 @@ fn tonemap_matches_cpu_at_the_extremes() {
     }
 
     let target = DisplayTexture::new(shared.device(), width, height);
-    render(shared, &target, &samples, 3, 0);
+    render(shared.device(), shared.queue(), &target, &samples, 3, 0);
     let gpu_bytes = read_display_texture(shared.device(), shared.queue(), &target);
 
     let mut cpu_bytes = vec![0u8; total_pixels * 4];
@@ -225,4 +239,80 @@ fn tonemap_matches_cpu_at_the_extremes() {
         cpu_bytes[white_pixel_byte], 255,
         "65535 must reduce to 255 (full white)"
     );
+}
+
+/// The overlay entry point against `overlay_cpu`, on a crop of the golden
+/// composite + Z-Map whose sides are not multiples of 8, at every blend
+/// opacity the CLI exposes, with solo off and on, and with a couple of
+/// pixels forced to `NO_SOURCE`.
+#[test]
+fn overlay_parity_matches_cpu() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+
+    let dir = golden_dir();
+    let composite =
+        TiffStack::open_files(&[dir.join("laplacian.tif")]).expect("open golden composite");
+    let zmap = ZMapReader::open(&dir.join("laplacian-zmap.tif")).expect("open golden zmap");
+
+    let crop = Rect {
+        x: 3,
+        y: 5,
+        width: 37,
+        height: 23,
+    };
+    assert!(!crop.width.is_multiple_of(8) && !crop.height.is_multiple_of(8));
+
+    let mut composite_samples = vec![0u16; (crop.width * crop.height * 3) as usize];
+    composite
+        .read_tile_into(0, crop, &mut composite_samples)
+        .expect("read golden composite crop");
+    let mut indices = vec![0u16; (crop.width * crop.height) as usize];
+    zmap.read_tile_into(crop, &mut indices)
+        .expect("read golden zmap crop");
+    // Force a couple of pixels to NO_SOURCE, which the golden map does not
+    // itself contain.
+    indices[0] = NO_SOURCE;
+    indices[5] = NO_SOURCE;
+
+    let sources = zmap.frame_count();
+    for alpha in [0u8, 166, 255] {
+        for solo in [None, Some(3u16)] {
+            let table = overlay_table(sources, solo);
+
+            let target = DisplayTexture::new(shared.device(), crop.width, crop.height);
+            render_overlay(
+                shared.device(),
+                shared.queue(),
+                &target,
+                &composite_samples,
+                &indices,
+                &table,
+                alpha,
+            );
+            let gpu_bytes = read_display_texture(shared.device(), shared.queue(), &target);
+
+            let mut cpu_bytes = vec![0u8; (crop.width * crop.height * 4) as usize];
+            overlay_cpu(
+                &composite_samples,
+                &indices,
+                crop.width,
+                crop.height,
+                &table,
+                alpha,
+                &mut cpu_bytes,
+            );
+
+            let (worst, worst_index) = worst_delta(&gpu_bytes, &cpu_bytes);
+            println!(
+                "overlay parity alpha={alpha} solo={solo:?}: worst |delta|={worst} at byte \
+                 index {worst_index}"
+            );
+            assert_eq!(
+                worst, 0,
+                "expected bit-exact agreement -- integer-only on both sides"
+            );
+        }
+    }
 }

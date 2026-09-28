@@ -10,7 +10,7 @@ workspace = true
 
 [features]
 trace = ["focusforge-diagnostics/trace"]
-# A timed trigger that destroys the shared device mid-session, for the
+# A timed trigger that destroys the graphics device mid-session, for the
 # lost-device response's own tests.
 gpu-tests = ["focusforge-gpu/gpu-tests"]
 # Development-only Slint UI inspection/control endpoint. The server is idle

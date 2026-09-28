@@ -16,11 +16,11 @@ use focusforge_core::align::{
     align_stack_with, auto_crop,
 };
 use focusforge_core::gpu::TileBackend;
-use focusforge_core::io::{TiffSpec, TiffStack, TiffWriter, frame_paths};
-use focusforge_core::params::{self, StackContext};
+use focusforge_core::io::{FrameReader, TiffSpec, TiffWriter, frame_paths, open_frame_set};
+use focusforge_core::params;
 use focusforge_core::registry;
-use focusforge_core::tile::Rect;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
+use focusforge_core::tile::{Rect, TileSchedulerOptions};
 use focusforge_core::timing::{Stage, StageTimer};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
@@ -43,27 +43,15 @@ pub struct AlignOptions<'a> {
 }
 
 /// Resolves the align algorithm `id` names, or -- when `id` is `None` --
-/// the sole registered alignment algorithm. Reads
-/// `registry::align_algorithms()` rather than naming any id, which is what
-/// keeps `crates/cli/src` free of every algorithm id.
-/// More than one registered algorithm with no id given is refused, loudly,
-/// naming every candidate -- that refusal is the entire argument for this
-/// default over a hardcoded one.
+/// `registry::default_align()`, which keeps `crates/cli/src` free of every
+/// algorithm id. Test-only registrations never count toward that default;
+/// ambiguity among the rest is refused naming every candidate.
 pub(crate) fn resolve_align_algo(id: Option<&str>) -> Result<&'static dyn AlignAlgorithm, String> {
     match id {
-        Some(id) => registry::find_align(id).map_err(|e| e.to_string()),
-        None => {
-            let algos = registry::align_algorithms();
-            match algos.as_slice() {
-                [] => Err("no alignment algorithm is registered".to_string()),
-                [only] => Ok(*only),
-                many => Err(format!(
-                    "multiple alignment algorithms are registered; pass an id to choose one: {}",
-                    many.iter().map(|a| a.id()).collect::<Vec<_>>().join(", ")
-                )),
-            }
-        }
+        Some(id) => registry::find_align(id),
+        None => registry::default_align(),
     }
+    .map_err(|e| e.to_string())
 }
 
 /// The frozen `align --json` document: fields are only ever added, the
@@ -225,10 +213,11 @@ pub fn run(
         Ok(paths) => paths,
         Err(err) => return sink.fail(err),
     };
-    let stack = match TiffStack::open_files(&paths) {
-        Ok(stack) => stack,
+    let opened = match open_frame_set(&paths, TileSchedulerOptions::new(".scratch").budget) {
+        Ok(opened) => opened,
         Err(err) => return sink.fail(err),
     };
+    let frame_reader: &dyn FrameReader = &*opened.reader;
     let frame_names: Vec<String> = paths
         .iter()
         .map(|p| {
@@ -237,19 +226,9 @@ pub fn run(
                 .unwrap_or_else(|| p.display().to_string())
         })
         .collect();
-    let header_refs: Vec<(&str, &focusforge_core::io::TiffHeader)> = frame_names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| (name.as_str(), stack.header(i)))
-        .collect();
-    let (uniform, detail) = focusforge_core::pipeline::uniform_check(&header_refs);
-    if !uniform {
-        return sink.fail(detail.unwrap_or_else(|| "non-uniform frame set".to_string()));
-    }
-
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
-    let stack_ctx = StackContext::new(stack.len(), width, height, spp);
+    let stack_ctx = frame_reader.stack_context();
+    let (width, height) = (stack_ctx.width, stack_ctx.height);
+    let spp = stack_ctx.samples_per_pixel;
     let resolved = match params::resolve(algo.params(), &explicit, &stack_ctx) {
         Ok(resolved) => resolved,
         Err(err) => return sink.fail(err),
@@ -263,11 +242,11 @@ pub fn run(
     };
     timer.mark(Stage::Setup);
     timer.enter(Stage::Align);
-    renderer.stage(&format!("align {} frames", stack.len()));
+    renderer.stage(&format!("align {} frames", frame_reader.len()));
     let run = match align_stack_with(
         algo,
         stack_ctx,
-        &stack,
+        frame_reader,
         &values,
         policy,
         &AlignDriverOptions::default(),
@@ -297,7 +276,7 @@ pub fn run(
         .backend;
         if let Err(msg) = write_warped_frames(
             write_warped,
-            &stack,
+            frame_reader,
             &paths,
             &frame_names,
             &alignment,
@@ -320,7 +299,7 @@ pub fn run(
 
     let report = AlignReport {
         input: dir.display().to_string(),
-        frame_count: stack.len(),
+        frame_count: frame_reader.len(),
         frames: frame_names.clone(),
         width,
         height,
@@ -403,7 +382,7 @@ pub fn run(
 #[allow(clippy::too_many_arguments)]
 fn write_warped_frames(
     dir: &Path,
-    stack: &TiffStack,
+    stack: &dyn TileReader,
     paths: &[PathBuf],
     frame_names: &[String],
     alignment: &StackAlignment,
@@ -603,4 +582,16 @@ pub(crate) fn render(report: &AlignReport) -> String {
         report.wall_seconds,
     ));
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_align_algo_without_an_id_skips_test_only_registrations() {
+        let algo = resolve_align_algo(None).expect("one real alignment algorithm is registered");
+        assert!(!algo.test_only(), "{} is test-only", algo.id());
+        assert_eq!(algo.id(), registry::default_align().unwrap().id());
+    }
 }

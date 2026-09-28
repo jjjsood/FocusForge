@@ -8,7 +8,7 @@
 # indices, which rect -- live in tools/lib/make_fixtures.py, which is also
 # where a new set is added.
 #
-# Usage: tools/make-fixtures.sh [--stack DIR] [--out DIR] [--check|--manifest-only]
+# Usage: tools/make-fixtures.sh [--stack DIR] [--out DIR] [--check|--manifest-only|--compressed-only]
 #   --stack DIR       reference stack to cut from (default: $FOCUSFORGE_REFERENCE_STACK)
 #   --out DIR         fixture tree to write     (default: fixtures)
 #   --check           regenerate into a temporary directory and compare byte for
@@ -20,6 +20,10 @@
 #                     any fixture. Needs no reference stack, so it runs even when
 #                     the stack directory does not exist -- checked before the
 #                     SKIP below.
+#   --compressed-only write/check compressed mantis-64 variants from committed
+#                     fixtures without a reference stack.
+#   --source-fixtures DIR
+#                     fixture tree containing the uncompressed mantis-64 source.
 #
 # Exit: 0 generated / matched / re-hashed (or skipped -- no reference stack and
 # neither --check nor --manifest-only), 1 on a mismatch or a bad input, 2 on a
@@ -34,9 +38,11 @@ STACK_DIR=""
 OUT_DIR=""
 CHECK=0
 MANIFEST_ONLY=0
+COMPRESSED_ONLY=0
+SOURCE_FIXTURES=""
 
 usage() {
-  echo "usage: tools/make-fixtures.sh [--stack DIR] [--out DIR] [--check|--manifest-only]" >&2
+  echo "usage: tools/make-fixtures.sh [--stack DIR] [--out DIR] [--check|--manifest-only|--compressed-only]" >&2
   exit 2
 }
 
@@ -46,6 +52,8 @@ while [ "$#" -gt 0 ]; do
     --out) [ "$#" -ge 2 ] || usage; OUT_DIR="$2"; shift 2 ;;
     --check) CHECK=1; shift ;;
     --manifest-only) MANIFEST_ONLY=1; shift ;;
+    --compressed-only) COMPRESSED_ONLY=1; shift ;;
+    --source-fixtures) [ "$#" -ge 2 ] || usage; SOURCE_FIXTURES="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
@@ -58,6 +66,13 @@ OUT_DIR="${OUT_DIR:-$REPO/fixtures}"
 # stack, so it is handled before the "no reference stack" SKIP below.
 if [ "$MANIFEST_ONLY" -eq 1 ]; then
   exec python3 "$REPO/tools/lib/make_fixtures.py" --out "$OUT_DIR" --manifest-only
+fi
+
+if [ "$COMPRESSED_ONLY" -eq 1 ]; then
+  ARGS=(--out "$OUT_DIR" --compressed-only)
+  [ -n "$SOURCE_FIXTURES" ] && ARGS+=(--source-fixtures "$SOURCE_FIXTURES")
+  [ "$CHECK" -eq 1 ] && ARGS+=(--check)
+  exec python3 "$REPO/tools/lib/make_fixtures.py" "${ARGS[@]}"
 fi
 
 if [ -z "$STACK_DIR" ]; then

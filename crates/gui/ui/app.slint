@@ -21,7 +21,7 @@ export { SettingsRow, SectionHeadView, ImageRowView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFSettingsModal, InputRow, FFManifestRow } from "shell/settings_modal.slint";
 export { InputRow, FFManifestRow }
-import { FFCloseGuard, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFToast } from "shell/dialogs.slint";
+import { FFCloseGuard, FFDivergenceWarning, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFToast } from "shell/dialogs.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
 export { ProjectCardView, RecentRowView }
@@ -587,6 +587,12 @@ export component AppWindow inherits Window {
     callback frame-warning-cancelled();
     callback frame-warning-secondary-pressed();
     callback frame-warning-confirmed();
+
+    // Keep or discard a run whose alignment left some frames unregistered.
+    in property <bool> divergence-open: false;
+    in property <string> divergence-body: "";
+    callback divergence-discarded();
+    callback divergence-kept();
     in property <bool> close-guard-open: false;
     in property <string> close-guard-title: "Save this state first?";
     in property <string> close-guard-context: "";
@@ -654,6 +660,17 @@ export component AppWindow inherits Window {
         cancelled => { root.frame-warning-cancelled(); }
         secondary-pressed => { root.frame-warning-secondary-pressed(); }
         confirmed => { root.frame-warning-confirmed(); }
+    }
+
+    divergence-warning := FFDivergenceWarning {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.divergence-open;
+        body: root.divergence-body;
+        cancelled => { root.divergence-discarded(); }
+        confirmed => { root.divergence-kept(); }
     }
 
     close-guard := FFCloseGuard {
