@@ -12,7 +12,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use focusforge_core::io::{
-    ByteOrder, FrameDesc, TiffError, TiffHeader, classify_header, frame_paths,
+    ByteOrder, FrameDesc, RAW_EXTENSIONS, RawMetadata, RawStack, TiffError, TiffHeader,
+    all_frame_paths, classify_header, has_extension, is_frame_path,
 };
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
@@ -86,7 +87,7 @@ fn verbosity(cli: &Cli) -> i8 {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Print TIFF metadata for a file, or for every TIFF in a directory.
+    /// Print TIFF or RAW metadata for a file, or for every frame in a directory.
     Info {
         /// Path to a file or directory.
         path: PathBuf,
@@ -105,12 +106,12 @@ enum Command {
         #[command(flatten)]
         set: set::SetArgs,
     },
-    /// Fuse every TIFF frame of a directory into one **project** per
+    /// Fuse supported TIFF or RAW frames of a directory into one **project** per
     /// detected stack, through a registered stacking algorithm. A run
     /// prepares projects for review; it does not export images -- run
     /// `focusforge-cli export` for that.
     Stack {
-        /// Directory of TIFF frames to fuse (non-recursive, descending into
+        /// Directory of TIFF or supported RAW frames to fuse (non-recursive, descending into
         /// `<dir>/frames` when that subdirectory exists).
         dir: PathBuf,
         /// Directory to collect this run's projects into. Omit to write
@@ -606,7 +607,60 @@ struct FileReport {
     mmap_fast_path: Option<bool>,
     reader: Option<String>,
     refusal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw: Option<RawRecord>,
     error: Option<String>,
+}
+
+/// RAW metadata reported without developing image pixels.
+#[derive(Serialize)]
+struct RawRecord {
+    make: String,
+    model: String,
+    raw_width: u32,
+    raw_height: u32,
+    output_width: u32,
+    output_height: u32,
+    crop_x: u32,
+    crop_y: u32,
+    storage_bits: Option<u16>,
+    decoder_bits: Option<usize>,
+    black_levels: Option<Vec<f32>>,
+    white_levels: Option<Vec<u32>>,
+    cfa: Option<Vec<u8>>,
+    cfa_width: Option<u16>,
+    cfa_height: Option<u16>,
+    color_matrix: Option<Vec<f32>>,
+    capture_time_epoch_seconds: Option<u64>,
+    decoder: &'static str,
+}
+
+impl From<&RawMetadata> for RawRecord {
+    fn from(metadata: &RawMetadata) -> Self {
+        Self {
+            make: metadata.make.clone(),
+            model: metadata.model.clone(),
+            raw_width: metadata.raw_width,
+            raw_height: metadata.raw_height,
+            output_width: metadata.output_width,
+            output_height: metadata.output_height,
+            crop_x: metadata.crop_x,
+            crop_y: metadata.crop_y,
+            storage_bits: metadata.storage_bits,
+            decoder_bits: metadata.decoder_bits,
+            black_levels: metadata.black_levels.clone(),
+            white_levels: metadata.white_levels.clone(),
+            cfa: metadata.cfa.clone(),
+            cfa_width: metadata.cfa_width,
+            cfa_height: metadata.cfa_height,
+            color_matrix: metadata.color_matrix.clone(),
+            capture_time_epoch_seconds: metadata
+                .capture_time
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs()),
+            decoder: "rawler",
+        }
+    }
 }
 
 /// The frozen `info --json` schema. One shape for both a file and a
@@ -632,7 +686,7 @@ fn byte_order_str(order: ByteOrder) -> &'static str {
 }
 
 /// `info`'s two report-don't-refuse exceptions: a single named file that
-/// fails to parse structurally, and a directory with zero TIFFs. Both exit
+/// fails to parse structurally, and a directory with zero frames. Both exit
 /// 1 with `error: <TiffError>`; every other case -- a member of a listing,
 /// a policy refusal like an unsupported compression -- stays exit 0,
 /// refusal or failure carried as data instead.
@@ -644,12 +698,16 @@ fn info(path: &Path, json: bool) -> ExitCode {
 
     let is_directory = metadata.is_dir();
     let paths: Vec<PathBuf> = if is_directory {
-        match frame_paths(path) {
+        match info_frame_paths(path) {
             Ok(paths) => paths,
             Err(err) => return fail(err),
         }
     } else {
-        if let Err(err) = TiffHeader::open(path) {
+        if is_raw_path(path) {
+            if let Err(err) = RawStack::open_files(&[path.to_path_buf()]) {
+                return fail(err);
+            }
+        } else if let Err(err) = TiffHeader::open(path) {
             return fail(err);
         }
         vec![path.to_path_buf()]
@@ -669,14 +727,46 @@ fn info(path: &Path, json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn is_raw_path(path: &Path) -> bool {
+    has_extension(path, RAW_EXTENSIONS)
+}
+
+fn info_frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
+    let paths = all_frame_paths(dir)?;
+    let paths: Vec<_> = paths
+        .into_iter()
+        .filter(|path| is_raw_path(path) || is_frame_path(path))
+        .collect();
+    if paths.is_empty() {
+        return Err(TiffError::NoFrames {
+            path: dir.to_path_buf(),
+        });
+    }
+    Ok(paths)
+}
+
 /// Header-only probe of every path in `paths`, never `TiffStack` and never
 /// a tile: this is what lets an unreadable or policy-refused member end up
 /// as one report line instead of failing the whole command.
 fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> InfoReport {
+    enum Probe {
+        Tiff(TiffHeader),
+        Raw(RawMetadata, Box<FrameDesc>),
+    }
+
+    impl Probe {
+        fn desc(&self) -> FrameDesc {
+            match self {
+                Self::Tiff(header) => FrameDesc::from(header),
+                Self::Raw(_, desc) => (**desc).clone(),
+            }
+        }
+    }
+
     struct Parsed {
         path: PathBuf,
         name: String,
-        header: Result<TiffHeader, TiffError>,
+        probe: Result<Probe, String>,
     }
 
     let parsed: Vec<Parsed> = paths
@@ -686,8 +776,24 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
             name: p
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| p.display().to_string()),
-            header: TiffHeader::open(p),
+                .unwrap_or(p.display().to_string()),
+            probe: if is_raw_path(p) {
+                RawStack::open_files(std::slice::from_ref(p))
+                    .and_then(|stack| {
+                        let metadata = stack.metadata(0).cloned().ok_or(
+                            focusforge_core::io::RawError::FrameIndex { index: 0, count: 0 },
+                        )?;
+                        let desc = stack.frame(0).cloned().ok_or(
+                            focusforge_core::io::RawError::FrameIndex { index: 0, count: 0 },
+                        )?;
+                        Ok(Probe::Raw(metadata, Box::new(desc)))
+                    })
+                    .map_err(|error| error.to_string())
+            } else {
+                TiffHeader::open(p)
+                    .map(Probe::Tiff)
+                    .map_err(|error| error.to_string())
+            },
         })
         .collect();
 
@@ -695,27 +801,27 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
         .iter()
         .map(|p| std::fs::metadata(&p.path).map(|m| m.len()).unwrap_or(0))
         .sum();
-    let unreadable_count = parsed.iter().filter(|p| p.header.is_err()).count();
+    let unreadable_count = parsed.iter().filter(|p| p.probe.is_err()).count();
 
-    let ok_headers: Vec<(&str, &TiffHeader)> = parsed
+    let named_descs: Vec<(&str, FrameDesc)> = parsed
         .iter()
-        .filter_map(|p| p.header.as_ref().ok().map(|h| (p.name.as_str(), h)))
+        .filter_map(|p| {
+            p.probe
+                .as_ref()
+                .ok()
+                .map(|probe| (p.name.as_str(), probe.desc()))
+        })
         .collect();
-    let descs: Vec<FrameDesc> = ok_headers
+    let named_descs: Vec<(&str, &FrameDesc)> = named_descs
         .iter()
-        .map(|(_, header)| FrameDesc::from(*header))
-        .collect();
-    let named_descs: Vec<(&str, &FrameDesc)> = ok_headers
-        .iter()
-        .zip(descs.iter())
-        .map(|((name, _), desc)| (*name, desc))
+        .map(|(name, desc)| (*name, desc))
         .collect();
     let (uniform_layout, uniform_detail) = focusforge_core::pipeline::uniform_check(&named_descs);
 
     let files = parsed
         .iter()
-        .map(|p| match &p.header {
-            Ok(h) => FileReport {
+        .map(|p| match &p.probe {
+            Ok(Probe::Tiff(h)) => FileReport {
                 name: p.name.clone(),
                 path: p.path.display().to_string(),
                 width: Some(h.width),
@@ -733,6 +839,30 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 mmap_fast_path: Some(h.refusal.is_none()),
                 reader: classify_header(h).ok().map(|kind| kind.name().to_string()),
                 refusal: h.refusal.as_ref().map(|r| r.to_string()),
+                raw: None,
+                error: None,
+            },
+            Ok(Probe::Raw(metadata, _)) => FileReport {
+                name: p.name.clone(),
+                path: p.path.display().to_string(),
+                width: None,
+                height: None,
+                bits_per_sample: None,
+                samples_per_pixel: None,
+                byte_order: None,
+                compression: None,
+                photometric: None,
+                planar_config: None,
+                rows_per_strip: None,
+                strip_count: None,
+                file_size: std::fs::metadata(&p.path)
+                    .ok()
+                    .map(|metadata| metadata.len()),
+                description: None,
+                mmap_fast_path: None,
+                reader: Some("RawStack".to_string()),
+                refusal: None,
+                raw: Some(RawRecord::from(metadata)),
                 error: None,
             },
             Err(e) => FileReport {
@@ -753,7 +883,8 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 mmap_fast_path: None,
                 reader: None,
                 refusal: None,
-                error: Some(e.to_string()),
+                raw: None,
+                error: Some(e.clone()),
             },
         })
         .collect();
@@ -778,6 +909,37 @@ fn print_human(report: &InfoReport) {
         println!("{}", file.path);
         if let Some(err) = &file.error {
             println!("  error: {err}");
+            continue;
+        }
+        if let Some(raw) = &file.raw {
+            println!(
+                "  RAW {} {} raw={}x{} output={}x{} crop={},{} storage_bits={:?} decoder_bits={:?}",
+                raw.make,
+                raw.model,
+                raw.raw_width,
+                raw.raw_height,
+                raw.output_width,
+                raw.output_height,
+                raw.crop_x,
+                raw.crop_y,
+                raw.storage_bits,
+                raw.decoder_bits,
+            );
+            println!(
+                "  black={:?} white={:?}",
+                raw.black_levels, raw.white_levels
+            );
+            println!(
+                "  cfa={:?} {}x{} matrix={:?}",
+                raw.cfa,
+                raw.cfa_width.unwrap_or(0),
+                raw.cfa_height.unwrap_or(0),
+                raw.color_matrix
+            );
+            if let Some(capture_time) = raw.capture_time_epoch_seconds {
+                println!("  capture_time_epoch_seconds: {capture_time}");
+            }
+            println!("  decoder: {}", raw.decoder);
             continue;
         }
         println!(
@@ -814,10 +976,25 @@ fn print_human(report: &InfoReport) {
 
     if report.is_directory {
         println!();
-        println!(
-            "{} TIFFs, {} bytes total",
-            report.frame_count, report.total_bytes
-        );
+        let raw_count = report
+            .files
+            .iter()
+            .filter(|file| is_raw_path(Path::new(&file.path)))
+            .count();
+        if raw_count == 0 {
+            println!(
+                "{} TIFFs, {} bytes total",
+                report.frame_count, report.total_bytes
+            );
+        } else {
+            println!(
+                "{} frames ({} TIFF, {} RAW), {} bytes total",
+                report.frame_count,
+                report.frame_count - raw_count,
+                raw_count,
+                report.total_bytes
+            );
+        }
         match &report.uniform_detail {
             None => println!("uniform layout: yes"),
             Some(detail) => println!("uniform layout: no — {detail}"),
@@ -848,6 +1025,7 @@ mod tests {
             samples_per_pixel: 1,
             strip_offsets: Vec::new(),
             strip_byte_counts: Vec::new(),
+            raw_identity: None,
             layout_label: signature[0..2].join("/"),
             layout_signature: signature.iter().map(ToString::to_string).collect(),
         }

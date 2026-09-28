@@ -13,6 +13,7 @@ use memmap2::Mmap;
 
 use super::super::error::TiffError;
 use super::super::frame::{FrameDesc, FrameReader};
+use super::super::{TIFF_EXTENSIONS, frame_paths_for_extensions, has_extension};
 use super::header::{ByteOrder, TAG_STRIP_OFFSETS, TiffHeader};
 use crate::tile::{Rect, Tile};
 use crate::timing::{TimingCounter, measurement_scope, record_timing};
@@ -305,34 +306,20 @@ fn past_eof(path: &Path) -> TiffError {
 /// enumerated the same way by both, by construction rather than by a second
 /// copy of the rule.
 pub fn frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
-    let frames_sub = dir.join("frames");
-    let scan_dir = if frames_sub.is_dir() {
-        frames_sub
-    } else {
-        dir.to_path_buf()
-    };
-
-    let read_dir = std::fs::read_dir(&scan_dir).map_err(|source| TiffError::Io {
-        path: scan_dir.clone(),
-        source,
-    })?;
-
-    let mut paths = Vec::new();
-    for entry in read_dir {
-        let entry = entry.map_err(|source| TiffError::Io {
-            path: scan_dir.clone(),
-            source,
-        })?;
-        let path = entry.path();
-        if !path.is_file() || !is_frame_path(&path) {
-            continue;
-        }
-        paths.push(path);
-    }
-    paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-
+    let paths = frame_paths_for_extensions(dir, TIFF_EXTENSIONS)?;
+    let paths: Vec<_> = paths
+        .into_iter()
+        .filter(|path| is_frame_path(path))
+        .collect();
     if paths.is_empty() {
-        return Err(TiffError::NoFrames { path: scan_dir });
+        let frames = dir.join("frames");
+        return Err(TiffError::NoFrames {
+            path: if frames.is_dir() {
+                frames
+            } else {
+                dir.to_path_buf()
+            },
+        });
     }
     Ok(paths)
 }
@@ -349,11 +336,7 @@ pub const ZMAP_FILENAME: &str = "zmap.tif";
 /// of a multi-file drop, rather than a second copy of the same check in
 /// `crates/gui`.
 pub fn is_frame_path(path: &Path) -> bool {
-    let is_tiff = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"));
-    if !is_tiff {
+    if !has_extension(path, TIFF_EXTENSIONS) {
         return false;
     }
     match path.file_name().and_then(|n| n.to_str()) {

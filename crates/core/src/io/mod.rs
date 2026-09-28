@@ -18,18 +18,24 @@ mod error;
 mod frame;
 mod frame_set;
 mod grouping;
+mod paths;
+pub mod raw;
 #[cfg(feature = "test-algorithms")]
 pub mod test_frames;
 pub(crate) mod tiff;
 
 pub use crate::tile::{Rect, Tile};
 pub use error::{Refusal, TiffError};
-pub use frame::{FrameDesc, FrameError, FrameReader};
+pub use frame::{FrameDesc, FrameError, FrameReader, RawIdentity};
 pub use frame_set::{FrameSet, ReaderKind, classify_header, open_frame_set};
 pub use grouping::{
     CaptureTime, GROUP_GAP, Group, GroupSignal, Proposal, capture_time, one_group, propose,
     propose_with_progress,
 };
+pub use paths::{
+    RAW_EXTENSIONS, TIFF_EXTENSIONS, all_frame_paths, frame_paths_for_extensions, has_extension,
+};
+pub use raw::{DEFAULT_RAW_CACHE_BYTES, RawError, RawMetadata, RawStack};
 pub use tiff::decoded::{CacheStats, DecodedTiffStack};
 pub use tiff::header::{ByteOrder, TiffHeader};
 pub use tiff::segment::{DecodedSegment, SegmentOrigin, TiffSegmentDecoder, TiffSegmentReader};

@@ -132,6 +132,7 @@ impl From<&TiffHeader> for FrameDesc {
             samples_per_pixel: header.samples_per_pixel,
             strip_offsets: header.strip_offsets.clone(),
             strip_byte_counts: header.strip_byte_counts.clone(),
+            raw_identity: None,
             layout_label,
             layout_signature,
         }

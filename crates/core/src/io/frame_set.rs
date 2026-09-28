@@ -2,7 +2,10 @@
 
 use std::path::PathBuf;
 
-use super::{DecodedTiffStack, FrameReader, TiffError, TiffHeader, TiffStack};
+use super::{
+    DecodedTiffStack, FrameError, FrameReader, RAW_EXTENSIONS, RawStack, TiffError, TiffHeader,
+    TiffStack, has_extension,
+};
 use crate::tile::HostBudget;
 
 /// The reader selected for a frame set.
@@ -12,6 +15,8 @@ pub enum ReaderKind {
     Mmap,
     /// On-demand decoded reads for supported non-fast-path TIFFs.
     Decoded,
+    /// On-demand development for RAW frames.
+    Raw,
 }
 
 impl ReaderKind {
@@ -20,6 +25,7 @@ impl ReaderKind {
         match self {
             Self::Mmap => "TiffStack",
             Self::Decoded => "DecodedTiffStack",
+            Self::Raw => "RawStack",
         }
     }
 }
@@ -44,7 +50,36 @@ pub fn classify_header(header: &TiffHeader) -> Result<ReaderKind, TiffError> {
 }
 
 /// Open `paths` with the reader their headers permit.
-pub fn open_frame_set(paths: &[PathBuf], budget: HostBudget) -> Result<FrameSet, TiffError> {
+pub fn open_frame_set(paths: &[PathBuf], budget: HostBudget) -> Result<FrameSet, FrameError> {
+    let Some(first_path) = paths.first() else {
+        return Err(TiffError::NoFrames {
+            path: PathBuf::new(),
+        }
+        .into());
+    };
+    let first_is_raw = has_extension(first_path, RAW_EXTENSIONS);
+    for path in paths.iter().skip(1) {
+        let is_raw = has_extension(path, RAW_EXTENSIONS);
+        if is_raw != first_is_raw {
+            return Err(FrameError::MixedFormats {
+                first_path: first_path.clone(),
+                first: if first_is_raw { "RAW" } else { "TIFF" },
+                path: path.clone(),
+                found: if is_raw { "RAW" } else { "TIFF" },
+            });
+        }
+    }
+    if first_is_raw {
+        let shares = budget.partition_for_decoded_cache();
+        return Ok(FrameSet {
+            reader: Box::new(RawStack::open_files_with_budget(
+                paths,
+                shares.cache.bytes(),
+            )?),
+            kind: ReaderKind::Raw,
+            scheduler_budget: shares.scheduler,
+        });
+    }
     let mut kind = ReaderKind::Mmap;
     for path in paths {
         if classify_header(&TiffHeader::open(path)?)? == ReaderKind::Decoded {
@@ -66,5 +101,6 @@ pub fn open_frame_set(paths: &[PathBuf], budget: HostBudget) -> Result<FrameSet,
                 scheduler_budget: shares.scheduler,
             })
         }
+        ReaderKind::Raw => unreachable!("RAW paths return before TIFF classification"),
     }
 }
