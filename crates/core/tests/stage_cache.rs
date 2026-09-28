@@ -16,7 +16,7 @@ use focusforge_core::algorithm::AlignStatus;
 use focusforge_core::align::{
     FailurePolicy, FrameAlignment, ReferencePolicy, StackAlignment, Transform,
 };
-use focusforge_core::io::{FrameDesc, TiffHeader};
+use focusforge_core::io::{FrameDesc, RawIdentity, TiffHeader};
 use focusforge_core::job::{
     AlignIdentity, DRIVER_POLICY_FIELDS, FrameFingerprint, StackFingerprint, StageCache, StageKey,
 };
@@ -39,6 +39,7 @@ fn sample_frame(idx: usize) -> FrameFingerprint {
         samples_per_pixel: 3,
         strip_offsets: vec![8, 16],
         strip_byte_counts: vec![100, 100],
+        raw_identity: None,
     }
 }
 
@@ -132,6 +133,59 @@ fn changed_frame_is_a_miss() {
     changed_strips.frames[0].strip_byte_counts[0] += 1;
     let other_key = StageKey::align(&changed_strips, &identity);
     assert!(cache.get_alignment(&other_key).is_none());
+}
+
+#[test]
+fn raw_metadata_change_is_a_miss() {
+    let identity = sample_identity("ecc", FailurePolicy::Strict);
+    let mut original = sample_fingerprint(1);
+    original.frames[0].raw_identity = Some(RawIdentity {
+        make: "Test".to_string(),
+        model: "Camera".to_string(),
+        serial_number: Some("one".to_string()),
+        capture_time_original: Some("2026:08:29 18:42:41".to_string()),
+        raw_width: 12,
+        raw_height: 10,
+        black_levels: Some(vec![64.0; 4]),
+        white_levels: Some(vec![4095]),
+        cfa: Some(vec![0, 1, 1, 2]),
+        cfa_width: Some(2),
+        cfa_height: Some(2),
+    });
+    for (name, change) in [
+        (
+            "serial",
+            Box::new(|raw: &mut RawIdentity| raw.serial_number = Some("two".to_string()))
+                as Box<dyn Fn(&mut RawIdentity)>,
+        ),
+        (
+            "original time",
+            Box::new(|raw: &mut RawIdentity| {
+                raw.capture_time_original = Some("2026:08:29 18:42:42".to_string())
+            }),
+        ),
+        (
+            "black levels",
+            Box::new(|raw: &mut RawIdentity| raw.black_levels = Some(vec![65.0; 4])),
+        ),
+        (
+            "white levels",
+            Box::new(|raw: &mut RawIdentity| raw.white_levels = Some(vec![4094])),
+        ),
+    ] {
+        let mut changed = original.clone();
+        change(
+            changed.frames[0]
+                .raw_identity
+                .as_mut()
+                .expect("RAW identity"),
+        );
+        assert_ne!(
+            StageKey::align(&original, &identity).digest(),
+            StageKey::align(&changed, &identity).digest(),
+            "{name} must invalidate the stage key with every other fact fixed"
+        );
+    }
 }
 
 #[test]

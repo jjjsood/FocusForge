@@ -10,6 +10,8 @@
 //! `test-algorithms` feature this crate's own dev-dependency enables.
 
 mod common;
+#[path = "common/raw_dng.rs"]
+mod raw_dng;
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +19,7 @@ use focusforge_core::io::test_frames::{
     write_frame_with_capture_time, write_frame_with_only_tag_306,
 };
 use focusforge_core::io::{GROUP_GAP, GroupSignal, TiffError, propose};
+use raw_dng::{DngSpec, write_dng};
 
 fn tree(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -30,6 +33,23 @@ fn tree(name: &str) -> PathBuf {
 fn frame(dir: &Path, name: &str, when: Option<&str>) {
     std::fs::create_dir_all(dir).expect("frame directory must be creatable");
     write_frame_with_capture_time(&dir.join(name), 8, 4, when).expect("test frame must write");
+}
+
+fn raw_frame(dir: &Path, name: &str, when: Option<&str>) {
+    std::fs::create_dir_all(dir).expect("RAW frame directory must be creatable");
+    let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]);
+    spec.capture_time = when.map(str::to_string);
+    let source = write_dng(&spec, true);
+    std::fs::copy(source.path(), dir.join(name)).expect("RAW frame must copy");
+}
+
+fn raw_frame_with_modify_time(dir: &Path, name: &str, original: Option<&str>, modified: &str) {
+    std::fs::create_dir_all(dir).expect("RAW frame directory must be creatable");
+    let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]);
+    spec.capture_time = original.map(str::to_string);
+    spec.modify_time = Some(modified.to_string());
+    let source = write_dng(&spec, true);
+    std::fs::copy(source.path(), dir.join(name)).expect("RAW frame must copy");
 }
 
 fn names(group: &focusforge_core::io::Group) -> Vec<String> {
@@ -73,6 +93,43 @@ fn flat_directory_splits_on_the_capture_time_gap() {
         proposal.groups[0].last_time.as_ref().unwrap().text,
         "2026:08:29 18:42:43"
     );
+}
+
+#[test]
+fn raw_frames_group_by_capture_time() {
+    let dir = tree("grouping_raw_capture_time");
+    raw_frame(&dir, "IMG_0001.dng", Some("2026:08:29 18:42:41"));
+    raw_frame(&dir, "IMG_0002.dng", Some("2026:08:29 18:42:42"));
+    raw_frame(&dir, "IMG_0010.dng", Some("2026:08:29 19:02:55"));
+
+    let proposal = propose(&dir).expect("RAW frames must propose");
+    assert_eq!(proposal.groups.len(), 2);
+    assert_eq!(
+        names(&proposal.groups[0]),
+        vec!["IMG_0001.dng", "IMG_0002.dng"]
+    );
+    assert_eq!(names(&proposal.groups[1]), vec!["IMG_0010.dng"]);
+}
+
+#[test]
+fn mixed_formats_partition_before_capture_time() {
+    let dir = tree("grouping_mixed_formats");
+    raw_frame(&dir, "raw.dng", Some("2026:08:29 18:42:41"));
+    frame(&dir, "tiff.tif", Some("2026:08:29 18:42:41"));
+
+    let proposal = propose(&dir).expect("mixed directory must propose partitions");
+    assert_eq!(proposal.groups.len(), 2);
+    assert_eq!(proposal.groups[0].signal, GroupSignal::RawBoth);
+    assert_eq!(proposal.groups[1].signal, GroupSignal::TiffBoth);
+    assert_eq!(
+        proposal.groups[0].signal.label(),
+        "raw/directory+capture-time"
+    );
+    assert_eq!(
+        proposal.groups[1].signal.label(),
+        "tiff/directory+capture-time"
+    );
+    assert_ne!(proposal.groups[0].name, proposal.groups[1].name);
 }
 
 #[test]
@@ -149,6 +206,24 @@ fn missing_capture_time_falls_back_and_reports_it() {
         !proposal.time_signal_available,
         "the proposal must say the time signal was unavailable"
     );
+}
+
+#[test]
+fn raw_missing_or_malformed_original_time_ignores_modify_time() {
+    let dir = tree("grouping_raw_missing_original_time");
+    raw_frame_with_modify_time(&dir, "00.dng", None, "2026:09:11 23:20:52");
+    raw_frame_with_modify_time(
+        &dir,
+        "01.dng",
+        Some("not-a-timestamp"),
+        "2026:09:11 23:20:53",
+    );
+
+    let proposal = propose(&dir).expect("untimed RAW frames must still group");
+    assert_eq!(proposal.groups.len(), 1);
+    assert_eq!(proposal.groups[0].signal, GroupSignal::Directory);
+    assert_eq!(names(&proposal.groups[0]), ["00.dng", "01.dng"]);
+    assert!(!proposal.time_signal_available);
 }
 
 #[test]
