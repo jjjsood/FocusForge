@@ -24,9 +24,10 @@ the canvas once a load has been running for half a second.
 ## The window
 
 A tab strip runs across the top, one tab per open project plus a `+` tab for
-starting another. Below it, the canvas shows the active tab's composite and
-its Z-Map side by side; both panes pan and zoom together. A dock along the
-side switches between two tabs of its own:
+starting another. Below it, the left canvas pane shows the source frame
+selected in **Images**; the right pane shows the composite or Z-Map after a
+fuse. Both panes pan and zoom together. A dock along the side switches
+between two tabs of its own:
 
 - **Images** lists every frame in fuse order, with its legend color and
   capture time. A frame can be excluded from the next fuse without removing
