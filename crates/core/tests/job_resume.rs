@@ -891,7 +891,8 @@ fn discard_removes_the_store_entry() {
 #[test]
 fn discard_removes_a_ledger_find_opened() {
     let stack = open_stack();
-    let stack_ctx = StackContext::new(stack.len(), stack.dimensions().0, stack.dimensions().1, 3);
+    let (width, height) = stack.dimensions();
+    let stack_ctx = StackContext::new(stack.len(), width, height, 3);
     let values = resolved_laplacian_values(stack_ctx);
 
     let scratch = scratch_base("discard-find-opened");
