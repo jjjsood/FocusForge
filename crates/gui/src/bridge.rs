@@ -902,7 +902,7 @@ fn retained_strings(
     }
 }
 
-/// Pushes the settings panel's rows through [`sync_rows`], reusing each live
+/// Pushes the settings panel's rows through `sync_rows`, reusing each live
 /// row's choice models while their strings are unchanged. The one place
 /// `ShellEvent::SettingsChanged` is performed; also called from
 /// `push_projects` so a tab switch or close rebuilds the panel for the
@@ -1060,7 +1060,7 @@ fn thumbnail_image(thumbnail: Option<&Arc<Thumbnail>>, cached: &PictureCache) ->
 /// Pushes the projects overlay's whole state -- the one place
 /// `ShellEvent::OverlayChanged` is performed. A closed overlay publishes
 /// only that it is closed; opening it pushes again. Cards and Recent rows
-/// go through [`sync_rows`], and each picture keeps its handle until its
+/// go through `sync_rows`, and each picture keeps its handle until its
 /// thumbnail is replaced or its card leaves.
 pub fn push_projects_overlay(app: &AppWindow, controller: &AppController) {
     let _scope = measurement_scope("gui_projects_overlay");
