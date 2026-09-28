@@ -268,6 +268,7 @@ def _root_readme(stack_dir: str, frame_names: list, date: str) -> str:
         lines.append(f"| `{fset.name}` | {len(fset.indices)} | `{_rect_str(fset.rect)}` | {w}x{h} |")
     for fset in COMPRESSED_SETS:
         lines.append(f"| `{fset.name}` | 3 | `4064,2700,64,64` | 64x64 |")
+    lines.append("| `blackmagic-micro-dng` | 1 | single DNG | 1952x1104 |")
     lines += [
         "",
         "Each set holds `frames/NN.tif` in focus order, `reference.tif`, and a "
@@ -275,6 +276,9 @@ def _root_readme(stack_dir: str, frame_names: list, date: str) -> str:
         "little-endian, uncompressed, chunky, one strip per row. The `mantis-64-` "
         "sets add LZW and deflate encodings in both byte orders, with strips or "
         "zero-padded tiles and Predictor 1 or 2.",
+        "",
+        "`blackmagic-micro-dng` is one lossless-JPEG DNG camera frame with its own "
+        "README; it has no `frames/` directory or `reference.tif`.",
         "",
         f"With one deliberate exception: `mantis-64/{MM_VARIANT_NAME}` is the "
         f"reference crop left in `{REFERENCE_NAME}`'s own layout (big-endian "
