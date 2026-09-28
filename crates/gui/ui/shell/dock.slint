@@ -134,6 +134,7 @@ export component FFDock inherits Rectangle {
         scroll-y: root.images-scroll-y;
         content-height: root.images-content-height;
         mutable: root.mode == "stacking" && root.images-enabled;
+        enabled: root.images-enabled;
         sort: root.images-sort;
         sort-menu-open: root.images-sort-menu-open;
         dragging-row: root.images-dragging-row;

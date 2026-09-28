@@ -1596,6 +1596,113 @@ fn dragging_a_row_by_its_grip_floats_a_copy_that_follows_the_cursor() {
 }
 
 #[test]
+fn images_panel_disable_is_whole_panel() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_project_loaded(true);
+    app.set_dock_tab("images".into());
+
+    let panel_opacity = || {
+        ElementQuery::from_root(&app)
+            .match_id("FFDock::images-panel")
+            .find_first()
+            .expect("a loaded project on the images tab always shows the panel")
+            .computed_opacity()
+    };
+    let row_opacities = || {
+        ElementQuery::from_root(&app)
+            .match_id("FFImageRow::area")
+            .find_all()
+            .into_iter()
+            .map(|row| row.computed_opacity())
+            .collect::<Vec<_>>()
+    };
+
+    app.set_images_enabled(true);
+    assert_eq!(panel_opacity(), 1.0, "enabled draws at full opacity");
+    app.set_images_enabled(false);
+    assert_eq!(
+        panel_opacity(),
+        0.5,
+        "disabling reads as one whole-panel opacity drop, not a per-row one"
+    );
+    app.set_images_enabled(true);
+    assert_eq!(panel_opacity(), 1.0, "re-enabling restores full opacity");
+
+    let controller = controller_with_frames("images_panel_disable_is_whole_panel", 4);
+    focusforge_gui::bridge::push_images_panel(&app, &controller);
+    assert!(
+        !row_opacities().is_empty(),
+        "the pushed frames must show as rows"
+    );
+    assert_eq!(
+        panel_opacity(),
+        1.0,
+        "a loaded, unlocked list draws at full opacity"
+    );
+
+    app.set_images_enabled(false);
+    assert_eq!(
+        panel_opacity(),
+        0.5,
+        "disabling dims the panel with rows present"
+    );
+    assert!(
+        row_opacities().iter().all(|&o| o == 0.5),
+        "every row inherits the panel's dim, not just the panel background"
+    );
+    app.set_images_enabled(true);
+    assert_eq!(panel_opacity(), 1.0);
+    assert!(row_opacities().iter().all(|&o| o == 1.0));
+}
+
+#[test]
+fn images_panel_editor_mode_is_read_only_not_dimmed() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_project_loaded(true);
+    app.set_dock_tab("images".into());
+    app.set_mode("editor".into());
+
+    let panel_opacity = || {
+        ElementQuery::from_root(&app)
+            .match_id("FFDock::images-panel")
+            .find_first()
+            .expect("a loaded project on the images tab always shows the panel")
+            .computed_opacity()
+    };
+
+    app.set_images_enabled(true);
+    assert_eq!(
+        panel_opacity(),
+        1.0,
+        "editor mode's read-only list is not shown as locked"
+    );
+    assert!(
+        ElementQuery::from_root(&app)
+            .match_id("FFImagesPanel::add-button")
+            .find_first()
+            .is_none(),
+        "editor mode hides the mutating chrome regardless of the dim"
+    );
+
+    app.set_images_enabled(false);
+    assert_eq!(
+        panel_opacity(),
+        0.5,
+        "a job running in editor mode still dims the panel"
+    );
+}
+
+#[test]
 fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
@@ -1678,6 +1785,15 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
             .is_none(),
         "the add button must not show while this tab's own job is running"
     );
+    let images_opacity = ElementQuery::from_root(&app)
+        .match_id("FFDock::images-panel")
+        .find_first()
+        .expect("the images panel is always in the tree")
+        .computed_opacity();
+    assert_eq!(
+        images_opacity, 0.5,
+        "the images panel reads as one whole-panel disable while this tab's own job runs"
+    );
     app.set_dock_tab("settings".into());
     let settings_opacity = ElementQuery::from_root(&app)
         .match_id("FFDock::settings-panel")
@@ -1703,6 +1819,17 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+    push(&controller.lock().unwrap());
+    app.set_dock_tab("images".into());
+    let images_opacity = ElementQuery::from_root(&app)
+        .match_id("FFDock::images-panel")
+        .find_first()
+        .expect("the images panel is always in the tree")
+        .computed_opacity();
+    assert_eq!(
+        images_opacity, 1.0,
+        "the look follows the job's end, not a ui event"
+    );
 }
 
 // ---------------------------------------------------------------------
