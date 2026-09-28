@@ -203,13 +203,17 @@ pub struct FrameSetWarningCopy {
     pub new_project_button: bool,
     /// `Remove` only.
     pub exclude_instead_button: bool,
+    /// The duplicate question only.
+    pub keep_existing_button: bool,
 }
 
 impl FrameSetWarningCopy {
-    /// The secondary footer button's own label -- empty when neither
-    /// applies, which never happens for a real warning.
+    /// The secondary footer button's own label -- empty when none applies,
+    /// which never happens for a real warning.
     pub fn secondary_label(&self) -> &'static str {
-        if self.exclude_instead_button {
+        if self.keep_existing_button {
+            "Keep existing"
+        } else if self.exclude_instead_button {
             "Exclude instead"
         } else if self.new_project_button {
             "New project instead"
@@ -268,6 +272,32 @@ pub fn frame_set_warning_copy(
         default_button: DefaultButton::Cancel,
         new_project_button,
         exclude_instead_button,
+        keep_existing_button: false,
+    }
+}
+
+/// The duplicate question's copy: up to five conflicting frame names, then
+/// "and N more".
+pub fn duplicate_question_copy(names: &[String]) -> FrameSetWarningCopy {
+    let title = format!(
+        "Replace {} existing image{}?",
+        names.len(),
+        if names.len() == 1 { "" } else { "s" }
+    );
+    let body = if names.len() <= 5 {
+        names.join(", ")
+    } else {
+        format!("{} and {} more", names[..5].join(", "), names.len() - 5)
+    };
+    FrameSetWarningCopy {
+        title,
+        body,
+        info: "New images are added either way.".to_string(),
+        confirm_label: "Replace".to_string(),
+        default_button: DefaultButton::Cancel,
+        new_project_button: false,
+        exclude_instead_button: false,
+        keep_existing_button: true,
     }
 }
 
@@ -376,6 +406,34 @@ mod tests {
     fn add_and_reorder_secondary_label_offers_a_new_project() {
         let copy = frame_set_warning_copy(FrameSetChangeKind::Add, 1);
         assert_eq!(copy.secondary_label(), "New project instead");
+    }
+
+    #[test]
+    fn duplicate_question_copy_names_every_conflict_up_to_five() {
+        let names: Vec<String> = (0..5).map(|i| format!("{i:02}.tif")).collect();
+        let copy = duplicate_question_copy(&names);
+        assert_eq!(copy.title, "Replace 5 existing images?");
+        assert_eq!(copy.body, "00.tif, 01.tif, 02.tif, 03.tif, 04.tif");
+        assert!(copy.keep_existing_button);
+        assert_eq!(copy.secondary_label(), "Keep existing");
+    }
+
+    #[test]
+    fn duplicate_question_copy_caps_at_five_with_an_and_more_tail() {
+        let names: Vec<String> = (0..7).map(|i| format!("{i:02}.tif")).collect();
+        let copy = duplicate_question_copy(&names);
+        assert_eq!(copy.title, "Replace 7 existing images?");
+        assert_eq!(
+            copy.body,
+            "00.tif, 01.tif, 02.tif, 03.tif, 04.tif and 2 more"
+        );
+    }
+
+    #[test]
+    fn duplicate_question_copy_singular_wording_names_one() {
+        let copy = duplicate_question_copy(&["00.tif".to_string()]);
+        assert_eq!(copy.title, "Replace 1 existing image?");
+        assert_eq!(copy.body, "00.tif");
     }
 
     #[test]

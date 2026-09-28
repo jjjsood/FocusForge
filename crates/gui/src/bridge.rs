@@ -870,6 +870,10 @@ pub struct DropHandler {
     app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>>,
     pending: Vec<PathBuf>,
     load_timer: Rc<RefCell<Option<slint::Timer>>>,
+    /// Shared with `install`'s own failure toast -- one slot, so a blocked
+    /// drop's toast and a blocked add's toast never close each other's
+    /// auto-dismiss timer early.
+    toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 }
 
 impl DropHandler {
@@ -882,6 +886,7 @@ impl DropHandler {
         controller: Arc<Mutex<AppController>>,
         canvas: Rc<RefCell<Canvas>>,
         app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>>,
+        toast_timer: Rc<RefCell<Option<slint::Timer>>>,
     ) -> Self {
         DropHandler {
             controller,
@@ -889,6 +894,7 @@ impl DropHandler {
             app_handle,
             pending: Vec::new(),
             load_timer: Rc::new(RefCell::new(None)),
+            toast_timer,
         }
     }
 }
@@ -911,18 +917,28 @@ impl CustomApplicationHandler for DropHandler {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) -> EventResult {
         if !self.pending.is_empty() {
             let paths = std::mem::take(&mut self.pending);
-            let _ = self.controller.lock().unwrap().open_paths(&paths);
-            // The same settle-then-repaint tail every other open path ends
-            // in, so a dropped project's own planes replace whatever the
-            // canvas held before, with no further gesture needed.
-            if let Some(app_weak) = self.app_handle.borrow().clone() {
-                start_load_timer(
-                    app_weak,
-                    self.controller.clone(),
-                    self.canvas.clone(),
-                    &self.load_timer,
-                    Vec::new(),
-                );
+            let result = self.controller.lock().unwrap().drop_paths(&paths);
+            match result {
+                Ok(_) => {
+                    // The same settle-then-repaint tail every other open
+                    // path ends in, so a dropped project's own planes
+                    // replace whatever the canvas held before, with no
+                    // further gesture needed.
+                    if let Some(app_weak) = self.app_handle.borrow().clone() {
+                        start_load_timer(
+                            app_weak,
+                            self.controller.clone(),
+                            self.canvas.clone(),
+                            &self.load_timer,
+                            Vec::new(),
+                        );
+                    }
+                }
+                Err(refused) => {
+                    if let Some(app) = self.app_handle.borrow().clone().and_then(|w| w.upgrade()) {
+                        open_job_toast(&app, refused.to_string(), &self.toast_timer);
+                    }
+                }
             }
         }
         EventResult::Propagate
@@ -1017,9 +1033,9 @@ pub fn install(
     app: &AppWindow,
     controller: Arc<Mutex<AppController>>,
     canvas: Rc<RefCell<Canvas>>,
+    toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 ) -> Installed {
     let job_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
-    let toast_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     let load_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
 
     {
@@ -1713,9 +1729,16 @@ pub fn install(
     });
     app.on_images_add_frames_requested({
         let controller = controller.clone();
+        let app_weak = app.as_weak();
+        let toast_timer = toast_timer.clone();
         move || {
             if let Some(paths) = crate::picker::pick_frames() {
-                controller.lock().unwrap().add_frames(&paths);
+                let result = controller.lock().unwrap().add_frames(&paths);
+                if let Err(refused) = result
+                    && let Some(app) = app_weak.upgrade()
+                {
+                    open_job_toast(&app, refused.to_string(), &toast_timer);
+                }
             }
         }
     });
@@ -1775,10 +1798,10 @@ pub fn install(
         let controller = controller.clone();
         move || {
             let mut controller = controller.lock().unwrap();
-            let exclude = controller
-                .pending_frame_change()
-                .is_some_and(|copy| copy.exclude_instead_button);
-            if exclude {
+            let copy = controller.pending_frame_change();
+            if copy.as_ref().is_some_and(|c| c.keep_existing_button) {
+                controller.keep_existing();
+            } else if copy.is_some_and(|c| c.exclude_instead_button) {
                 controller.exclude_instead();
             } else {
                 controller.new_project_instead();
@@ -2144,6 +2167,15 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
                 None => {}
             }
             app.set_load_active(false);
+        }
+        // An import scan (`AppController::add_frames`) is ready to settle.
+        // Never touches the canvas: an add either stages a question or
+        // appends frames, neither of which the sink's own `Send + Sync`
+        // path can repaint through anyway.
+        ShellEvent::ImportReady => {
+            let mut controller = controller.lock().unwrap();
+            controller.settle_import();
+            push_images_panel(app, &controller);
         }
     }
 }

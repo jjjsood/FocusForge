@@ -41,7 +41,7 @@ use crate::settings_panel::{
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
 
 pub use crate::entry::{
-    EntryError, GroupingQuestion, GuiProject, OpenAs, OpenOutcome, Opened, Proposal,
+    EntryError, GroupingQuestion, GuiProject, ImportRefused, OpenAs, OpenOutcome, Opened, Proposal,
 };
 
 /// The stacking/editor mode switch's two positions. Editor is reachable only
@@ -154,6 +154,9 @@ pub enum ShellEvent {
     /// A background load's result is ready to settle
     /// ([`AppController::settle_open`]).
     LoadReady,
+    /// An import scan ([`AppController::add_frames`]) is ready to settle
+    /// ([`AppController::settle_import`]).
+    ImportReady,
 }
 
 /// One live drag: which action it started and the last position seen, so
@@ -634,6 +637,8 @@ struct ShellState {
     canvas_dirty: bool,
     /// The in-flight background load, if any.
     load: LoadSlot,
+    /// The in-flight additive import scan, if any.
+    import: ImportSlot,
 }
 
 /// One load's worker result, parked here until
@@ -668,6 +673,28 @@ fn decode_thumbnails(projects: &mut [GuiProject]) -> Vec<Option<Arc<overlay::Thu
         .collect()
 }
 
+/// One additive import's own worker result, parked here until
+/// [`AppController::settle_import`] resolves it -- [`LoadSlot`]'s twin for
+/// [`AppController::add_frames`] rather than a fresh open.
+#[derive(Default)]
+struct ImportSlot {
+    in_flight: bool,
+    outcome: Arc<Mutex<Option<ImportScan>>>,
+}
+
+/// [`AppController::add_frames`]'s worker outcome: the tab it scanned, a
+/// snapshot of that tab's own frame list as of the scan's start (what
+/// [`AppController::settle_import`] compares the tab's *current* frame list
+/// against, to discard a scan the tab moved on from), and the import
+/// resolved against it -- new frames to add, and each conflicting existing
+/// frame's own position paired with its incoming replacement.
+struct ImportScan {
+    tab_id: u64,
+    frames: Vec<PathBuf>,
+    add: Vec<PathBuf>,
+    replace: Vec<(usize, PathBuf)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct DragRow {
     from: usize,
@@ -677,12 +704,43 @@ struct DragRow {
     current_y: f32,
 }
 
+/// An import's resolved shape, staged for [`AppController::apply_add_frames`]:
+/// `add` are new, non-conflicting frames to append; `replace` is each
+/// conflicting existing frame's own position in the tab's frame list, paired
+/// with its incoming replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ImportPlan {
+    add: Vec<PathBuf>,
+    replace: Vec<(usize, PathBuf)>,
+}
+
+impl ImportPlan {
+    fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.replace.is_empty()
+    }
+
+    /// Drops every `replace` entry whose incoming path is already the frame
+    /// at that position -- re-accepting a replacement with the very file
+    /// already there changes nothing.
+    fn without_same_path_replacements(mut self, existing: &[PathBuf]) -> Self {
+        self.replace
+            .retain(|(position, path)| existing.get(*position) != Some(path));
+        self
+    }
+}
+
 /// [`ShellState::pending_frame_change`]'s payload: which action is waiting,
 /// and what it still needs applied once confirmed.
 #[derive(Debug, Clone, PartialEq)]
 enum PendingFrameChange {
-    Add(Vec<PathBuf>),
-    Move { from: usize, to: usize },
+    Add(ImportPlan),
+    /// An import whose scan found conflicts -- the duplicate question, shown
+    /// regardless of the tab's own checkpoint count.
+    Duplicates(ImportPlan),
+    Move {
+        from: usize,
+        to: usize,
+    },
     Sort(crate::images::FrameSort),
     Remove(usize),
 }
@@ -690,7 +748,9 @@ enum PendingFrameChange {
 impl PendingFrameChange {
     fn kind(&self) -> crate::images::FrameSetChangeKind {
         match self {
-            PendingFrameChange::Add(_) => crate::images::FrameSetChangeKind::Add,
+            PendingFrameChange::Add(_) | PendingFrameChange::Duplicates(_) => {
+                crate::images::FrameSetChangeKind::Add
+            }
             PendingFrameChange::Move { .. } => crate::images::FrameSetChangeKind::Move,
             PendingFrameChange::Sort(_) => crate::images::FrameSetChangeKind::Sort,
             PendingFrameChange::Remove(_) => crate::images::FrameSetChangeKind::Remove,
@@ -2707,32 +2767,128 @@ impl AppController {
             .unwrap_or_default()
     }
 
-    /// Adds `paths` to the active tab's frame list, appended in the order
-    /// given -- immediately, before the first checkpoint; behind the counted
-    /// warning once one exists. A no-op outside stacking mode or while this
-    /// tab's own job is running.
-    pub fn add_frames(&mut self, paths: &[PathBuf]) {
-        if self.mode() != ShellMode::Stacking
-            || paths.is_empty()
-            || self.state.active().is_none()
+    /// Adds `paths` to the active tab: hashes on a worker thread, then
+    /// [`Self::settle_import`] applies the scan. An [`ImportRefused`] leaves
+    /// the tab untouched.
+    pub fn add_frames(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> Result<Option<std::thread::JoinHandle<()>>, ImportRefused> {
+        let Some(tab) = self.state.active() else {
+            return Ok(None);
+        };
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        if self.mode() != ShellMode::Stacking {
+            return Err(ImportRefused::NotStacking);
+        }
+        if self.job_running() {
+            return Err(ImportRefused::JobRunning);
+        }
+        if self.state.import.in_flight {
+            return Err(ImportRefused::StillChecking);
+        }
+        let incoming = entry::expand_import(paths)?;
+        let tab_id = tab.id;
+        let frames = tab.frames.clone();
+
+        self.state.import.in_flight = true;
+        let sink = self.sink.clone();
+        let outcome_slot = Arc::clone(&self.state.import.outcome);
+        Ok(Some(std::thread::spawn(move || {
+            let (add, replace) = entry::diff_import(&frames, incoming);
+            *outcome_slot
+                .lock()
+                .expect("no thread panicked while holding the import outcome") = Some(ImportScan {
+                tab_id,
+                frames,
+                add,
+                replace,
+            });
+            if let Some(sink) = &sink {
+                sink(ShellEvent::ImportReady);
+            }
+        })))
+    }
+
+    /// Adds a drop to the active tab through [`Self::add_frames`]; with no
+    /// active tab, or for a lone saved project, opens it through
+    /// [`Self::open_paths`] instead.
+    pub fn drop_paths(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> Result<Option<std::thread::JoinHandle<()>>, ImportRefused> {
+        if self.state.active().is_some() && !entry::is_lone_project(paths) {
+            return self.add_frames(paths);
+        }
+        Ok(self.open_paths(paths))
+    }
+
+    /// Applies the scan [`Self::add_frames`] parked, only to the tab it
+    /// scanned and only while that tab is active, idle in Stacking mode and
+    /// its frame list unchanged; otherwise discards it.
+    pub fn settle_import(&mut self) {
+        let Some(scan) = self
+            .state
+            .import
+            .outcome
+            .lock()
+            .expect("no thread panicked while holding the import outcome")
+            .take()
+        else {
+            return;
+        };
+        self.state.import.in_flight = false;
+        let Some(index) = self.tab_index(scan.tab_id) else {
+            return;
+        };
+        if self.state.active != Some(index)
+            || self.mode() != ShellMode::Stacking
             || self.job_running()
+            || self.state.projects[index].frames != scan.frames
         {
             return;
         }
-        if self.frame_change_checkpoints() > 0 {
-            self.state.pending_frame_change = Some(PendingFrameChange::Add(paths.to_vec()));
+        let plan = ImportPlan {
+            add: scan.add,
+            replace: scan.replace,
+        };
+        if plan.replace.is_empty() {
+            self.stage_import(plan);
         } else {
-            self.apply_add_frames(paths);
+            self.state.pending_frame_change = Some(PendingFrameChange::Duplicates(plan));
+            self.emit(ShellEvent::ImagesChanged);
+        }
+    }
+
+    /// Stages a conflict-free import: nothing for an empty plan, the counted
+    /// "Add and re-fuse" warning once a checkpoint exists, or applies at
+    /// once before the first one. Always emits `ImagesChanged`, so an
+    /// answered duplicate question closes even when its plan is empty.
+    fn stage_import(&mut self, plan: ImportPlan) {
+        if !plan.is_empty() {
+            if self.frame_change_checkpoints() > 0 {
+                self.state.pending_frame_change = Some(PendingFrameChange::Add(plan));
+            } else {
+                self.apply_add_frames(&plan);
+            }
         }
         self.emit(ShellEvent::ImagesChanged);
     }
 
-    fn apply_add_frames(&mut self, paths: &[PathBuf]) {
+    fn apply_add_frames(&mut self, plan: &ImportPlan) {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        tab.frames.extend_from_slice(paths);
-        tab.excluded.extend(std::iter::repeat_n(false, paths.len()));
+        for (position, path) in &plan.replace {
+            if let Some(slot) = tab.frames.get_mut(*position) {
+                *slot = path.clone();
+            }
+        }
+        tab.frames.extend_from_slice(&plan.add);
+        tab.excluded
+            .extend(std::iter::repeat_n(false, plan.add.len()));
         tab.frame_sort = None;
     }
 
@@ -2940,9 +3096,20 @@ impl AppController {
 
     /// The frame-set-change warning still open, if any -- `None` whenever
     /// the active tab carries no checkpoint of its own to invalidate, since
-    /// there is nothing for a frame-set edit to disagree with.
+    /// there is nothing for a frame-set edit to disagree with. A pending
+    /// duplicate question shows regardless of checkpoint count: it is about
+    /// the import decision itself, not about re-fuse risk.
     pub fn pending_frame_change(&self) -> Option<images::FrameSetWarningCopy> {
         let pending = self.state.pending_frame_change.as_ref()?;
+        if let PendingFrameChange::Duplicates(plan) = pending {
+            let tab = self.state.active()?;
+            let names: Vec<String> = plan
+                .replace
+                .iter()
+                .filter_map(|&(position, _)| tab.frames.get(position).map(|p| images::file_name(p)))
+                .collect();
+            return Some(images::duplicate_question_copy(&names));
+        }
         if self.frame_change_checkpoints() == 0 {
             return None;
         }
@@ -3148,13 +3315,48 @@ impl AppController {
             return false;
         };
         match pending {
-            PendingFrameChange::Add(paths) => self.apply_add_frames(&paths),
+            PendingFrameChange::Add(plan) => self.apply_add_frames(&plan),
+            // The duplicate question's own confirm: stages the plan minus
+            // any replacement that would put back the very file already
+            // there, through the same checkpoint gate every other add
+            // goes through -- never a `start_fuse` here directly, so the
+            // checkpoint warning (if any) follows as its own step.
+            PendingFrameChange::Duplicates(plan) => {
+                let existing = self
+                    .state
+                    .active()
+                    .map(|tab| tab.frames.clone())
+                    .unwrap_or_default();
+                self.stage_import(plan.without_same_path_replacements(&existing));
+                return false;
+            }
             PendingFrameChange::Move { from, to } => self.apply_move_frame(from, to),
             PendingFrameChange::Sort(sort) => self.apply_sort(sort),
             PendingFrameChange::Remove(index) => self.apply_remove_frame(index),
         }
         self.emit(ShellEvent::ImagesChanged);
         self.start_fuse()
+    }
+
+    /// The duplicate question's non-destructive answer: keeps every
+    /// existing frame, staging only the incoming files that were not
+    /// conflicts (through the same checkpoint gate every other add goes
+    /// through). `false` with nothing pending, or nothing pending a
+    /// duplicate answer.
+    pub fn keep_existing(&mut self) -> bool {
+        match self.state.pending_frame_change.take() {
+            Some(PendingFrameChange::Duplicates(plan)) => {
+                self.stage_import(ImportPlan {
+                    add: plan.add,
+                    replace: Vec::new(),
+                });
+                true
+            }
+            other => {
+                self.state.pending_frame_change = other;
+                false
+            }
+        }
     }
 
     /// Withdraws the pending frame-set change with nothing applied -- the

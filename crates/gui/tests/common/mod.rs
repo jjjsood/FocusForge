@@ -196,6 +196,23 @@ pub fn answer_and_settle(controller: &mut AppController, answer: OpenAs) -> Open
         .expect("a load was started, so one outcome is parked")
 }
 
+/// Starts an additive import, blocks until its worker finishes, and settles
+/// it -- `AppController::add_frames` runs off-thread too, the same as
+/// [`open_and_settle`]. Propagates a refusal without joining or settling
+/// anything, since [`AppController::add_frames`] never spawns a worker for
+/// one.
+#[allow(dead_code)]
+pub fn add_and_settle(
+    controller: &mut AppController,
+    paths: &[PathBuf],
+) -> Result<(), focusforge_gui::entry::ImportRefused> {
+    if let Some(handle) = controller.add_frames(paths)? {
+        handle.join().expect("the import worker did not panic");
+    }
+    controller.settle_import();
+    Ok(())
+}
+
 /// A `<root>/focusforge` data directory holding roughly `total_log_bytes`
 /// across a live log and three rotated siblings, one JSON Lines record per
 /// line, plus one crash report -- large enough that a synchronous manifest

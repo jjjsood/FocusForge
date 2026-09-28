@@ -515,7 +515,15 @@ fn editor_mode_requires_the_fused_frame_set() {
         "a newer checkpoint over the current frame set is editable again"
     );
 
-    controller.add_frames(&[root.join("never-written.tif")]);
+    // The added file exists for `add_frames` but is deleted before
+    // `confirm_frame_change` re-fuses, so the Add path hits the "a
+    // referenced frame vanished" refusal.
+    let added = root.join("added.tif");
+    focusforge_core::io::test_frames::write_frame_with_capture_time(&added, 4, 4, None)
+        .expect("a synthetic frame must write");
+    common::add_and_settle(&mut controller, std::slice::from_ref(&added))
+        .expect("the add must not refuse");
+    fs::remove_file(&added).expect("the added frame must delete");
     assert!(!controller.confirm_frame_change(), "the re-fuse is refused");
     assert!(!controller.editor_enabled(), "after a confirmed Add");
     assert_editor_refused(&mut controller, "after a confirmed Add");

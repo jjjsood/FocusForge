@@ -10,13 +10,15 @@
 //! `--open` all resolve through `classify` and `open` so they cannot
 //! diverge.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use focusforge_core::io::{
-    Group, GroupSignal, TiffError, TiffHeader, is_frame_path, one_group, propose_with_progress,
+    Group, GroupSignal, TiffError, TiffHeader, frame_paths, is_frame_path, one_group,
+    propose_with_progress,
 };
 use focusforge_core::params::StackContext;
-use focusforge_core::project::{PROJECT_EXTENSION, Project, ProjectError};
+use focusforge_core::project::{PROJECT_EXTENSION, Project, ProjectError, hash_file};
 // Re-exported so `controller.rs` can carry a `Proposal` in its own
 // pending-question state without naming `focusforge_core` itself.
 pub use focusforge_core::io::Proposal;
@@ -111,6 +113,25 @@ pub enum EntryError {
     Unreadable { path: PathBuf },
 }
 
+/// Why an additive import refused, each carrying its own already-rendered
+/// toast message -- the blocked-add toast is a plain string, never a card
+/// or a dialog.
+#[derive(Debug, thiserror::Error)]
+pub enum ImportRefused {
+    /// Nothing in the import resolves to a folder or a TIFF frame.
+    #[error("No TIFF images to add")]
+    NoFrames { path: PathBuf },
+    /// The active tab is not in Stacking mode.
+    #[error("Switch to Stacking to add images")]
+    NotStacking,
+    /// The active tab's own job is running.
+    #[error("Adding images waits for the run to finish")]
+    JobRunning,
+    /// A previous import scan on this tab has not settled yet.
+    #[error("Still checking the last images added")]
+    StillChecking,
+}
+
 /// The one place the two entrances and `--open` agree on what a path set
 /// means.
 ///
@@ -152,6 +173,69 @@ fn has_project_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION))
+}
+
+/// Whether `paths` is exactly one saved project -- the one shape an
+/// additive drop still routes through the ordinary open path rather than
+/// adding to the active tab, matching [`classify`]'s own single-project
+/// case.
+pub fn is_lone_project(paths: &[PathBuf]) -> bool {
+    matches!(paths, [only] if only.is_file() && has_project_extension(only))
+}
+
+/// Expands an import's paths into frame files: directories through
+/// [`frame_paths`], files through [`is_frame_path`]; parent directories may
+/// differ. Any other path refuses the whole import.
+pub fn expand_import(paths: &[PathBuf]) -> Result<Vec<PathBuf>, ImportRefused> {
+    let mut frames = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            let found =
+                frame_paths(path).map_err(|_| ImportRefused::NoFrames { path: path.clone() })?;
+            frames.extend(found);
+        } else if path.is_file() && is_frame_path(path) {
+            frames.push(path.clone());
+        } else {
+            return Err(ImportRefused::NoFrames { path: path.clone() });
+        }
+    }
+    let mut seen = HashSet::new();
+    frames.retain(|p| seen.insert(p.clone()));
+    if frames.is_empty() {
+        return Err(ImportRefused::NoFrames {
+            path: paths.first().cloned().unwrap_or_default(),
+        });
+    }
+    Ok(frames)
+}
+
+/// Splits `incoming` by content hash into `(add, replace)`; `replace` pairs
+/// the matching frame's index in `existing` with the incoming path. A file
+/// that fails to hash is always added.
+pub fn diff_import(
+    existing: &[PathBuf],
+    incoming: Vec<PathBuf>,
+) -> (Vec<PathBuf>, Vec<(usize, PathBuf)>) {
+    let mut existing_by_hash: HashMap<String, usize> = HashMap::new();
+    for (i, frame) in existing.iter().enumerate() {
+        if let Ok(hash) = hash_file(frame) {
+            existing_by_hash.entry(hash).or_insert(i);
+        }
+    }
+    let mut add = Vec::new();
+    let mut replace = Vec::new();
+    let mut seen = HashSet::new();
+    for path in incoming {
+        match hash_file(&path) {
+            Ok(hash) if seen.insert(hash.clone()) => match existing_by_hash.get(&hash) {
+                Some(&position) => replace.push((position, path)),
+                None => add.push(path),
+            },
+            Ok(_) => {} // a repeat of an already-seen incoming file's content
+            Err(_) => add.push(path),
+        }
+    }
+    (add, replace)
 }
 
 /// Resolves one [`OpenTarget`] into an [`OpenOutcome`], reporting

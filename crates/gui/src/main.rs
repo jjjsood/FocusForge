@@ -238,6 +238,7 @@ fn select_backend(
     controller: Arc<Mutex<AppController>>,
     canvas: Rc<RefCell<Canvas>>,
     app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>>,
+    toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 ) -> Result<(), ExitCode> {
     let config = slint::wgpu_29::WGPUConfiguration::Automatic(wgpu_settings());
     // The drop route is installed on this *existing* `BackendSelector`
@@ -247,7 +248,10 @@ fn select_backend(
     if let Err(e) = slint::BackendSelector::new()
         .require_wgpu_29(config)
         .with_winit_custom_application_handler(bridge::DropHandler::new(
-            controller, canvas, app_handle,
+            controller,
+            canvas,
+            app_handle,
+            toast_timer,
         ))
         .select()
     {
@@ -629,7 +633,15 @@ fn run(args: &Args) -> ExitCode {
     let controller = Arc::new(Mutex::new(controller_state));
     let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
     let app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>> = Rc::new(RefCell::new(None));
-    if let Err(code) = select_backend(controller.clone(), canvas.clone(), app_handle.clone()) {
+    // Shared with `bridge::install`'s own failure toast, so a blocked drop
+    // and a blocked add never close each other's auto-dismiss timer early.
+    let toast_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+    if let Err(code) = select_backend(
+        controller.clone(),
+        canvas.clone(),
+        app_handle.clone(),
+        toast_timer.clone(),
+    ) {
         return code;
     }
 
@@ -643,7 +655,7 @@ fn run(args: &Args) -> ExitCode {
             controller,
             job_timer,
             toast_timer,
-        } = bridge::install(&app, controller, canvas.clone());
+        } = bridge::install(&app, controller, canvas.clone(), toast_timer);
         let _ = &job_timer;
         let _ = &toast_timer;
 
