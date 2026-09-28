@@ -106,12 +106,12 @@ enum Command {
         #[command(flatten)]
         set: set::SetArgs,
     },
-    /// Fuse every TIFF frame of a directory into one **project** per
+    /// Fuse supported TIFF or RAW frames of a directory into one **project** per
     /// detected stack, through a registered stacking algorithm. A run
     /// prepares projects for review; it does not export images -- run
     /// `focusforge-cli export` for that.
     Stack {
-        /// Directory of TIFF frames to fuse (non-recursive, descending into
+        /// Directory of TIFF or supported RAW frames to fuse (non-recursive, descending into
         /// `<dir>/frames` when that subdirectory exists).
         dir: PathBuf,
         /// Directory to collect this run's projects into. Omit to write

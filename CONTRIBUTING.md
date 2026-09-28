@@ -3,7 +3,7 @@
 ## Repository layout
 
 ```
-crates/core/   TIFF I/O, tiles, stacking and alignment algorithms, the
+crates/core/   TIFF and RAW I/O, tiles, stacking and alignment algorithms, the
                Z-Map, the job engine (pause/resume/cancel over tile-sized
                work units), the stage cache, grouping proposals and the
                `.ffp` project container
@@ -28,7 +28,7 @@ crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
                thumbnail off the event-loop thread, and a keyboard/mouse
                binding table read from `input.toml`
 spikes/        standalone, workspace-excluded feasibility spikes
-fixtures/      small checked-in TIFF crops used by the test suite
+fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the test suite
 ```
 
 ## Tech stack
@@ -39,7 +39,7 @@ fixtures/      small checked-in TIFF crops used by the test suite
   hashing), `zip`/`zstd` for the `.ffp` container (compression backends and
   `zip`'s clock feature both off, so two seals of the same inputs produce
   identical container bytes), `sysinfo` (host memory for the adaptive
-  tile-scheduler budget).
+  tile-scheduler budget), and `rawler` for RAW metadata and development.
 - `focusforge-gpu`: `wgpu = "29.0.4"`, gated behind its own `gpu` Cargo
   feature, on by default on both `focusforge-gpu` and `focusforge-cli`;
   `--no-default-features` excludes it, so `cargo build --workspace
@@ -99,7 +99,8 @@ skipping itself with a printed line on a host with neither. Fixtures under
 of a 61-frame macro stack, generated rather than hand-edited. Regenerating
 them, and the `#[ignore]`d tests that exercise the full stack, read its
 location from `FOCUSFORGE_REFERENCE_STACK`; unset, they skip.
-`crates/diagnostics` has its own suite covering the subscriber's per-target
+RAW metadata, directory grouping and decoding are covered with synthetic DNG
+fixtures. `crates/diagnostics` has its own suite covering the subscriber's per-target
 filters, the rotating log file, the `log`-crate bridge, the panic hook's
 report and flight recording, and the crash-notice bookkeeping and
 diagnostics bundle's redaction and manifest, each writing into its own

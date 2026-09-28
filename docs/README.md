@@ -12,9 +12,9 @@ retouching the result.
 - [`guide/gui.md`](guide/gui.md) — opening a folder or a project in the
   window, the dock's `Images` and `Settings` panels, running and controlling
   a fuse, saving the held result, and switching between open projects
-- [`guide/stacking.md`](guide/stacking.md) — running `focusforge-cli stack`,
-  choosing an algorithm, getting an image back with `export`, and getting the
-  Z-Map
+- [`guide/stacking.md`](guide/stacking.md) — stacking TIFF or supported RAW
+  frames, choosing an algorithm, getting an image back with `export`, and
+  getting the Z-Map
 - [`guide/alignment.md`](guide/alignment.md) — how `focusforge-cli
   align`/`stack` register frames before fusing, choosing a mode, and
   checking a result before committing to a full run

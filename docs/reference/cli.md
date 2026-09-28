@@ -184,9 +184,25 @@ will succeed.
 | `file_size` | on-disk size in bytes |
 | `description` | the TIFF `ImageDescription` tag, `null` when the file has none — a Z-Map carries its frame count here |
 | `mmap_fast_path` | whether the tile reader's fast path applies to this file |
-| `reader` | `"TiffStack"` for mmap-compatible frames, `"DecodedTiffStack"` for supported decoded frames, otherwise `null` |
+| `reader` | `"TiffStack"` for mmap-compatible frames, `"DecodedTiffStack"` for supported decoded TIFF frames, `"RawStack"` for RAW frames, otherwise `null` |
 | `refusal` | `null` when `mmap_fast_path` is `true`, otherwise the reason it is not (compression, tiling, planar layout, bit depth or sample format) |
-| `error` | `null` on a successful parse, otherwise why the file could not be read as a TIFF at all |
+| `error` | `null` on a successful parse, otherwise why the file could not be read |
+| `raw` | RAW metadata for a readable RAW file; absent for TIFF and unreadable files |
+
+The `raw` object contains:
+
+| field | meaning |
+|---|---|
+| `make`, `model` | camera maker and model reported by the decoder |
+| `raw_width`, `raw_height` | sensor image dimensions before the default crop |
+| `output_width`, `output_height` | developed-frame dimensions after the default crop |
+| `crop_x`, `crop_y` | default crop origin in sensor coordinates |
+| `storage_bits`, `decoder_bits` | file-header and decoder-native bit depths; either can be `null` |
+| `black_levels`, `white_levels` | decoder-native channel levels, or `null` when absent |
+| `cfa`, `cfa_width`, `cfa_height` | crop-relative CFA pattern and dimensions, or `null` when absent |
+| `color_matrix` | row-major XYZ-to-camera matrix, or `null` when absent |
+| `capture_time_epoch_seconds` | EXIF `DateTimeOriginal` as Unix epoch seconds, or `null` when absent or invalid |
+| `decoder` | `"rawler"` |
 
 ## `stack`
 
@@ -194,17 +210,18 @@ will succeed.
 focusforge-cli stack [OPTIONS] <DIR>
 ```
 
-Fuses every TIFF frame in `<DIR>` (non-recursive, descending into
+Fuses every TIFF or supported RAW frame in `<DIR>` (non-recursive, descending into
 `<DIR>/frames` when that subdirectory exists) into one **project** per
 detected stack, through a registered stacking algorithm. A run prepares
 projects for review; it does not write an image file — run
-[`export`](#export) for that. The frames are read tile by tile through an
-out-of-core scheduler bounded by a fixed memory budget, so the command never
-needs to hold a whole stack — or a whole frame — in RAM.
+[`export`](#export) for that. TIFF frames are read tile by tile through an
+out-of-core scheduler bounded by a memory budget. RAW decoding develops
+and caches whole frames within the host memory budget.
 
 `stack` accepts mixed uncompressed, LZW-compressed, Deflate-compressed, and
-tiled 16-bit unsigned chunky TIFF frames. Unsupported layouts stop the run
-with the frame and field named.
+tiled 16-bit unsigned chunky TIFF frames. RAW files use `rawler`; a stack
+cannot mix TIFF and RAW frames. Unsupported layouts or unreadable RAW files
+stop the run with the frame and reason named.
 
 **Alignment runs first, by default.** Before fusion, `stack` computes each
 frame's transform against a reference frame (the same solver `align` drives

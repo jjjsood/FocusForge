@@ -131,7 +131,8 @@ per detected stack. See [`docs/guide/gui.md`](docs/guide/gui.md).
 ## Documentation
 
 See [`docs/`](docs/README.md) for the full guide and reference, including
-every `focusforge-cli` subcommand and the TIFF layouts it reads and writes.
+every `focusforge-cli` subcommand, supported RAW input, and the TIFF layouts
+it reads and writes.
 
 ## Contributing
 
