@@ -8,5 +8,12 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
+# Full debug info for wgpu/slint dominates target size; line tables keep backtraces.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [workspace.lints.rust]
 unsafe_code = "deny"
