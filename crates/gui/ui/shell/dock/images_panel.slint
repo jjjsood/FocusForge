@@ -3,6 +3,7 @@
 // The `Images` panel: a header (count, add, sort) and the scrolling frame
 // list.
 
+import { ListView } from "std-widgets.slint";
 import { Theme } from "../../theme.slint";
 import { ShellGeometry } from "../../geometry.slint";
 import { FFImageRow } from "../../components/ff_image_row.slint";
@@ -18,15 +19,15 @@ export struct ImageRowView {
     time-text: string,
     excluded: bool,
     unresolved: bool,
-    top: length,
     selected: bool,
 }
 
 export component FFImagesPanel inherits Rectangle {
     in property <[ImageRowView]> rows: [];
     in property <string> header-text: "";
-    in property <length> scroll-y: 0px;
-    in property <length> content-height: 0px;
+    // The list's own `viewport-y` (zero or negative), written directly when
+    // the scrollbar or a content change moves it.
+    in-out property <length> list-viewport-y <=> list.viewport-y;
     // Whether the mutating chrome (add, sort, per-row hover controls) shows
     // at all.
     in property <bool> mutable: true;
@@ -51,11 +52,17 @@ export component FFImagesPanel inherits Rectangle {
     callback frame-selected(int);
     callback frame-excluded-toggled(int);
     callback frame-remove-requested(int);
+    // The gutter's raw pointer stream: row under the pointer, kind (0 = down,
+    // 1 = up, 2 = move) and `y` in list-content coordinates.
     callback frame-grip-pointer(int, int, length);
-    callback scrolled(length);
+    // The list's own scroll offset after it moved, wheel included.
+    callback viewport-scrolled(length);
     callback scrollbar-pointer(int, length);
     callback scrollbar-dragged(length);
     callback viewport-height-changed(length);
+
+    // The row under the pointer in the grip gutter.
+    property <int> gutter-row: floor((grip-overlay.mouse-y - list.viewport-y) / ShellGeometry.image-row-height);
 
     VerticalLayout {
         spacing: Theme.space-2;
@@ -89,55 +96,51 @@ export component FFImagesPanel inherits Rectangle {
             }
         }
 
-        clip-area := Rectangle {
+        list := ListView {
             width: ShellGeometry.image-row-band-width;
-            clip: true;
+            vertical-scrollbar-policy: always-off;
+            horizontal-scrollbar-policy: always-off;
 
-            changed height => { root.viewport-height-changed(self.height); }
+            changed visible-height => { root.viewport-height-changed(self.visible-height); }
+            changed viewport-y => { root.viewport-scrolled(-self.viewport-y); }
 
-            hit-area := TouchArea {
-                width: 100%;
-                height: 100%;
-                scroll-event(event) => {
-                    root.scrolled(-event.delta-y);
-                    accept
-                }
+            for row[i] in root.rows: FFImageRow {
+                chip: row.chip;
+                name: row.name;
+                time-text: row.time-text;
+                excluded: row.excluded;
+                unresolved: row.unresolved;
+                selected: row.selected;
+                mutable: root.mutable;
+                dragging: root.mutable && i == root.dragging-row;
+                hovered: grip-overlay.has-hover && i == root.gutter-row;
+                clicked => { root.frame-selected(i); }
+                exclude-toggled => { root.frame-excluded-toggled(i); }
+                remove-requested => { root.frame-remove-requested(i); }
             }
+        }
+    }
 
-            content := Rectangle {
-                x: 0px;
-                y: -root.scroll-y;
-                width: ShellGeometry.image-row-band-width;
-                height: root.content-height;
-
-                for row[i] in root.rows: FFImageRow {
-                    x: 0px;
-                    y: row.top;
-                    width: ShellGeometry.image-row-band-width;
-                    chip: row.chip;
-                    name: row.name;
-                    time-text: row.time-text;
-                    excluded: row.excluded;
-                    unresolved: row.unresolved;
-                    selected: row.selected;
-                    mutable: root.mutable;
-                    dragging: root.mutable && i == root.dragging-row;
-                    clicked => { root.frame-selected(i); }
-                    exclude-toggled => { root.frame-excluded-toggled(i); }
-                    remove-requested => { root.frame-remove-requested(i); }
-                    grip-pointer(kind, y) => { root.frame-grip-pointer(i, kind, y); }
-                }
-            }
+    // Owns a grip drag for its whole gesture, so the release still lands
+    // after the pointer leaves the list or the origin row scrolls away.
+    grip-overlay := TouchArea {
+        enabled: root.mutable;
+        x: 0px;
+        y: list.y;
+        width: ShellGeometry.image-row-content-inset;
+        height: list.visible-height;
+        pointer-event(event) => {
+            root.frame-grip-pointer(root.gutter-row, event.kind == PointerEventKind.down ? 0 : (event.kind == PointerEventKind.move ? 2 : 1), self.mouse-y - list.viewport-y);
         }
     }
 
     scrollbar := FFScrollbar {
         x: parent.width - self.width;
-        y: clip-area.y;
-        height: clip-area.height;
-        content-height: root.content-height;
-        viewport-height: clip-area.height;
-        offset: root.scroll-y;
+        y: list.y;
+        height: list.height;
+        content-height: list.viewport-height;
+        viewport-height: list.visible-height;
+        offset: -list.viewport-y;
         pointer(kind, y) => { root.scrollbar-pointer(kind, y); }
         dragged(y) => { root.scrollbar-dragged(y); }
     }
@@ -149,24 +152,20 @@ export component FFImagesPanel inherits Rectangle {
     // the row's own slot, since releasing then moves nothing.
     if root.dragging-row >= 0 && root.drag-target-row >= 0 && root.drag-target-row != root.dragging-row: landing-line := Rectangle {
         x: 0px;
-        y: clip-area.y - root.scroll-y
-            + (root.drag-target-row > root.dragging-row
-                ? root.rows[root.drag-target-row].top + ShellGeometry.image-row-height
-                : root.rows[root.drag-target-row].top)
+        y: list.y + list.viewport-y
+            + (root.drag-target-row > root.dragging-row ? root.drag-target-row + 1 : root.drag-target-row) * ShellGeometry.image-row-height
             - ShellGeometry.pane-divider / 2;
         width: ShellGeometry.image-row-band-width;
         height: ShellGeometry.pane-divider;
         background: Theme.accent-default;
     }
 
-    // A floating copy of the row being dragged, positioned outside
-    // `clip-area`'s own clipping so it can pass over the rows on either
-    // side of it rather than being cut off at the list's edge. The row it
-    // was grabbed from stays in place underneath, showing where it will
-    // land.
+    // A floating copy of the row being dragged, outside the list's clipping
+    // so it can pass over the rows on either side of it. The row it was
+    // grabbed from stays in place underneath.
     if root.dragging-row >= 0 && root.dragging-row < root.rows.length: drag-ghost := FFImageRow {
         x: 0px;
-        y: clip-area.y + root.rows[root.dragging-row].top - root.scroll-y + root.drag-offset;
+        y: list.y + root.dragging-row * ShellGeometry.image-row-height + list.viewport-y + root.drag-offset;
         width: ShellGeometry.image-row-band-width;
         chip: root.rows[root.dragging-row].chip;
         name: root.rows[root.dragging-row].name;

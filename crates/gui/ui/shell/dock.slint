@@ -49,8 +49,7 @@ export component FFDock inherits Rectangle {
     // `FFImagesPanel`.
     in property <[ImageRowView]> images-rows: [];
     in property <string> images-header-text: "";
-    in property <length> images-scroll-y: 0px;
-    in property <length> images-content-height: 0px;
+    in-out property <length> images-list-viewport-y: 0px;
     in property <string> images-sort: "";
     in property <bool> images-sort-menu-open: false;
     in property <int> images-dragging-row: -1;
@@ -64,7 +63,7 @@ export component FFDock inherits Rectangle {
     callback images-frame-excluded-toggled(int);
     callback images-frame-remove-requested(int);
     callback images-frame-grip-pointer(int, int, length);
-    callback images-scrolled(length);
+    callback images-viewport-scrolled(length);
     callback images-scrollbar-pointer(int, length);
     callback images-scrollbar-dragged(length);
     callback images-viewport-height-changed(length);
@@ -131,8 +130,7 @@ export component FFDock inherits Rectangle {
         visible: root.project-loaded && root.dock-tab == "images";
         rows: root.images-rows;
         header-text: root.images-header-text;
-        scroll-y: root.images-scroll-y;
-        content-height: root.images-content-height;
+        list-viewport-y <=> root.images-list-viewport-y;
         mutable: root.mode == "stacking" && root.images-enabled;
         sort: root.images-sort;
         sort-menu-open: root.images-sort-menu-open;
@@ -146,7 +144,7 @@ export component FFDock inherits Rectangle {
         frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
         frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
         frame-grip-pointer(i, kind, y) => { root.images-frame-grip-pointer(i, kind, y); }
-        scrolled(delta) => { root.images-scrolled(delta); }
+        viewport-scrolled(offset) => { root.images-viewport-scrolled(offset); }
         scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
         scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
         viewport-height-changed(h) => { root.images-viewport-height-changed(h); }

@@ -20,8 +20,9 @@ export component FFImageRow inherits Rectangle {
     // in the row's own chip colour plus a 4 px bar at the left edge;
     // `dragging`'s bar wins while a drag is in flight.
     in property <bool> selected: false;
-    // Forces the hover visual for the component sheet; a live row also
-    // shows it under the pointer.
+    // Forces the hover visual: the component sheet, and the panel while the
+    // pointer is over this row's grip gutter. A live row also shows it under
+    // the pointer.
     in property <bool> hovered: false;
     // Whether this row's grip/eye/bin ever show at all -- `false` for the
     // read-only shape a non-stacking surface reuses.
@@ -34,10 +35,6 @@ export component FFImageRow inherits Rectangle {
     callback exclude-toggled();
     callback remove-requested();
     callback clicked();
-    // The grip's own raw pointer stream (0 = down, 1 = up, 2 = move; the
-    // same fold `ff_scrollbar.slint`'s `pointer` uses), `y` relative to this
-    // row's own top edge -- the panel/controller decide what a drag means.
-    callback grip-pointer(int, length);
 
     height: ShellGeometry.image-row-height;
     opacity: root.floating ? 0.75 : 1.0;
@@ -47,11 +44,6 @@ export component FFImageRow inherits Rectangle {
 
     property <bool> interactive: !root.unresolved && root.mutable;
     property <bool> show-controls: root.interactive && !root.dragging && (root.hovered || area.has-hover);
-    // The grip's touch surface must stay mounted for the whole gesture it
-    // starts, including while `dragging` hides its icon -- tearing it down
-    // mid-grab (as `show-controls` alone would) drops the release the drag
-    // needs to land.
-    property <bool> grip-mounted: root.interactive && (root.dragging || root.hovered || area.has-hover);
     property <color> label-color: root.unresolved ? Theme.text-disabled
         : root.excluded ? Theme.text-muted
         : Theme.text-primary;
@@ -72,24 +64,15 @@ export component FFImageRow inherits Rectangle {
         height: 100%;
         clicked => { root.clicked(); }
 
-        // The grip -- the row's own drag handle, in the gutter before the
-        // chip.
-        if root.grip-mounted: grip-area := TouchArea {
-            x: 0;
-            width: ShellGeometry.image-row-content-inset;
-            height: 100%;
-            pointer-event(event) => {
-                root.grip-pointer(event.kind == PointerEventKind.down ? 0 : (event.kind == PointerEventKind.move ? 2 : 1), self.mouse-y);
-            }
-
-            if !root.dragging: Image {
-                source: @image-url("../../../../assets/icons/grip-vertical.svg");
-                colorize: Theme.text-muted;
-                width: Theme.icon-sm;
-                height: Theme.icon-sm;
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-            }
+        // The grip icon, in the gutter before the chip. The panel owns the
+        // gutter's pointer capture, so a drag outlives this row's instance.
+        if root.show-controls: Image {
+            source: @image-url("../../../../assets/icons/grip-vertical.svg");
+            colorize: Theme.text-muted;
+            width: Theme.icon-sm;
+            height: Theme.icon-sm;
+            x: (ShellGeometry.image-row-content-inset - self.width) / 2;
+            y: (parent.height - self.height) / 2;
         }
 
         // The eye and bin -- past the content column, in the trailing

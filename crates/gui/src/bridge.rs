@@ -335,7 +335,7 @@ fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::Mea
         | ShellEvent::EntryRefused(_)
         | ShellEvent::OverlayChanged => InputSurface::Gallery,
         ShellEvent::SettingsChanged => InputSurface::Settings,
-        ShellEvent::ImagesChanged => InputSurface::Images,
+        ShellEvent::ImagesChanged | ShellEvent::ImagesScrolled => InputSurface::Images,
         ShellEvent::WindowDragRequested
         | ShellEvent::WindowMinimizeRequested
         | ShellEvent::WindowCloseRequested
@@ -932,22 +932,40 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
             time_text: row.time_text.clone().into(),
             excluded: row.excluded,
             unresolved: row.unresolved,
-            top: row.top,
             selected: row.selected,
         })
         .collect();
-    record_timing(TimingCounter::RowUpdates, rows.len() as u64);
     let existing = app.get_images_rows();
-    if existing.row_count() == rows.len() {
-        for (i, row) in rows.into_iter().enumerate() {
-            existing.set_row_data(i, row);
+    let updates = match existing
+        .as_any()
+        .downcast_ref::<slint::VecModel<GeneratedImageRow>>()
+    {
+        Some(model) => {
+            let mut updates = 0;
+            while model.row_count() > rows.len() {
+                model.remove(model.row_count() - 1);
+                updates += 1;
+            }
+            for (i, row) in rows.into_iter().enumerate() {
+                if i >= model.row_count() {
+                    model.push(row);
+                    updates += 1;
+                } else if model.row_data(i).as_ref() != Some(&row) {
+                    model.set_row_data(i, row);
+                    updates += 1;
+                }
+            }
+            updates
         }
-    } else {
-        app.set_images_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
-    }
+        None => {
+            let count = rows.len();
+            app.set_images_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+            count
+        }
+    };
+    record_timing(TimingCounter::RowUpdates, updates as u64);
     app.set_images_header_text(panel.header_text.into());
-    app.set_images_content_height(panel.content_height);
-    app.set_images_scroll_y(panel.scroll_y);
+    app.set_images_list_viewport_y(-controller.images_scroll_y());
     let sort = match controller.frame_sort() {
         Some(crate::images::FrameSort::Name) => "name",
         Some(crate::images::FrameSort::CaptureTime) => "capture-time",
@@ -1985,11 +2003,15 @@ pub fn install(
     });
 
     // The `Images` panel's own scroll -- `FFScrollbar`'s twin wiring above.
-    app.on_images_scrolled({
+    // The list scrolls itself; the controller mirrors the offset. A move
+    // the scrollbar path already caused is not counted as a second input.
+    app.on_images_viewport_scrolled({
         let controller = controller.clone();
-        move |delta| {
-            record_images_input();
-            controller.lock().unwrap().scroll_images_panel(delta)
+        move |offset| {
+            if controller.lock().unwrap().images_viewport_scrolled(offset) {
+                record_images_input();
+                direct_publication_scope(InputSurface::Images);
+            }
         }
     });
     app.on_images_scrollbar_pointer({
@@ -2471,6 +2493,9 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             push_divergence(app, &controller);
         }
         ShellEvent::ImagesChanged => push_images_panel(app, &controller.lock().unwrap()),
+        ShellEvent::ImagesScrolled => {
+            app.set_images_list_viewport_y(-controller.lock().unwrap().images_scroll_y());
+        }
         ShellEvent::OverlayChanged => push_projects_overlay(app, &controller.lock().unwrap()),
         // A background load's own three events (`AppController::open_paths`).
         // The indicator's threshold and fade are the Slint region's own
@@ -2643,7 +2668,15 @@ mod tests {
         enable_trace_accounting();
 
         let app = super::AppWindow::new().unwrap();
-        let controller = Arc::new(Mutex::new(AppController::new()));
+        let mut opened = AppController::new();
+        let frames = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/mantis-512/frames");
+        if let Some(load) = opened.open_paths(&[frames]) {
+            load.join().expect("the load worker did not panic");
+        }
+        opened.settle_open().expect("the fixture load settles");
+        opened.set_images_viewport_height(crate::images::ROW_HEIGHT);
+        let controller = Arc::new(Mutex::new(opened));
         let canvas = std::rc::Rc::new(std::cell::RefCell::new(super::Canvas::default()));
         let _installed = super::install(&app, controller.clone(), canvas);
 
@@ -2659,6 +2692,26 @@ mod tests {
                 && batches[3].is_none()
                 && batches[4].is_none(),
             "neither callback may be recorded under any other surface: {batches:?}"
+        );
+
+        // A list scroll that moved is one Images input, published at once;
+        // the offset the controller already holds is no input at all.
+        app.invoke_images_viewport_scrolled(crate::images::ROW_HEIGHT);
+        app.invoke_images_viewport_scrolled(crate::images::ROW_HEIGHT);
+        app.invoke_images_frame_excluded_toggled(0);
+        let batches = finish_input_batches();
+        let toggle = batches[2].expect("the toggle records under the Images surface");
+        assert_eq!(
+            (toggle.count, toggle.first),
+            (1, images.last + 2),
+            "exactly one input between the two toggles: {batches:?}"
+        );
+        assert!(
+            batches[0].is_none()
+                && batches[1].is_none()
+                && batches[3].is_none()
+                && batches[4].is_none(),
+            "the scroll records under no other surface: {batches:?}"
         );
     }
 }
