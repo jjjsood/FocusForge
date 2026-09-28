@@ -1097,8 +1097,8 @@ fn a_drop_while_plus_is_selected_appends() {
 
 // ---------------------------------------------------------------------
 // The drop route itself (`AppController::drop_paths`): additive into an
-// already-open tab, still-opening for the shapes that never were additive,
-// and refused when adding is blocked.
+// already-open tab, opening outright for the shapes that never were
+// additive, and refused when adding is blocked.
 // ---------------------------------------------------------------------
 
 /// [`with_one_project`], fused once into one held checkpoint, with its

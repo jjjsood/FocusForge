@@ -208,7 +208,7 @@ pub struct FrameSetWarningCopy {
 }
 
 impl FrameSetWarningCopy {
-    /// The secondary footer button's own label -- empty when none applies,
+    /// The secondary footer button's label -- empty when none applies,
     /// which never happens for a real warning.
     pub fn secondary_label(&self) -> &'static str {
         if self.keep_existing_button {

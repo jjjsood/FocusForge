@@ -113,7 +113,7 @@ pub enum EntryError {
     Unreadable { path: PathBuf },
 }
 
-/// Why an additive import refused, each carrying its own already-rendered
+/// Why an additive import refused, each carrying an already-rendered
 /// toast message -- the blocked-add toast is a plain string, never a card
 /// or a dialog.
 #[derive(Debug, thiserror::Error)]
@@ -176,9 +176,8 @@ fn has_project_extension(path: &Path) -> bool {
 }
 
 /// Whether `paths` is exactly one saved project -- the one shape an
-/// additive drop still routes through the ordinary open path rather than
-/// adding to the active tab, matching [`classify`]'s own single-project
-/// case.
+/// additive drop routes through the ordinary open path rather than adding
+/// to the active tab, matching [`classify`]'s own single-project case.
 pub fn is_lone_project(paths: &[PathBuf]) -> bool {
     matches!(paths, [only] if only.is_file() && has_project_extension(only))
 }

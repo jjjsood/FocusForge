@@ -673,7 +673,7 @@ fn decode_thumbnails(projects: &mut [GuiProject]) -> Vec<Option<Arc<overlay::Thu
         .collect()
 }
 
-/// One additive import's own worker result, parked here until
+/// One additive import's worker result, parked here until
 /// [`AppController::settle_import`] resolves it -- [`LoadSlot`]'s twin for
 /// [`AppController::add_frames`] rather than a fresh open.
 #[derive(Default)]
@@ -682,12 +682,8 @@ struct ImportSlot {
     outcome: Arc<Mutex<Option<ImportScan>>>,
 }
 
-/// [`AppController::add_frames`]'s worker outcome: the tab it scanned, a
-/// snapshot of that tab's own frame list as of the scan's start (what
-/// [`AppController::settle_import`] compares the tab's *current* frame list
-/// against, to discard a scan the tab moved on from), and the import
-/// resolved against it -- new frames to add, and each conflicting existing
-/// frame's own position paired with its incoming replacement.
+/// [`AppController::add_frames`]'s worker outcome: the tab it scanned, that
+/// tab's frame list as of the scan's start, and the resolved import.
 struct ImportScan {
     tab_id: u64,
     frames: Vec<PathBuf>,
@@ -3316,11 +3312,8 @@ impl AppController {
         };
         match pending {
             PendingFrameChange::Add(plan) => self.apply_add_frames(&plan),
-            // The duplicate question's own confirm: stages the plan minus
-            // any replacement that would put back the very file already
-            // there, through the same checkpoint gate every other add
-            // goes through -- never a `start_fuse` here directly, so the
-            // checkpoint warning (if any) follows as its own step.
+            // Never calls `start_fuse` directly; stages through the same
+            // checkpoint gate every other add goes through.
             PendingFrameChange::Duplicates(plan) => {
                 let existing = self
                     .state
