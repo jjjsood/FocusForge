@@ -125,9 +125,12 @@ pub enum ShellEvent {
     /// asked once.
     QuestionRaised(GroupingQuestion),
     /// The settings panel's own state moved: a value, an algorithm choice,
-    /// a reset, an open menu or the scroll offset -- never a tab switch,
-    /// which `ProjectsChanged` already rebuilds the panel for.
+    /// a reset or an open menu -- never a tab switch, which
+    /// `ProjectsChanged` already rebuilds the panel for.
     SettingsChanged,
+    /// Only the settings panel's scroll offset or viewport height moved; no
+    /// row changed.
+    SettingsScrolled,
     /// An open attempt was refused. Carries its already-rendered message:
     /// `perform` (`crate::bridge`) must not format user-facing text.
     EntryRefused(String),
@@ -141,9 +144,12 @@ pub enum ShellEvent {
     ImagesChanged,
     /// Only the `Images` list's scroll offset moved; no row changed.
     ImagesScrolled,
-    /// The projects overlay's own state moved: opened, closed, its gallery
-    /// scrolled, or its failure cards changed.
+    /// The projects overlay's own state moved: opened, closed, its column
+    /// count, or its failure cards changed.
     OverlayChanged,
+    /// Only the gallery's scroll offset or viewport height moved; no card
+    /// changed.
+    GalleryScrolled,
     /// A background load ([`AppController::open_paths`]) started.
     LoadStarted,
     /// A background load ticked: how many frames its worker has read of how
@@ -2293,7 +2299,7 @@ impl AppController {
         let offset = settings_panel::clamp_panel_scroll(offset_px, content_height, viewport_height);
         if offset != self.state.gallery_scroll_y {
             self.state.gallery_scroll_y = offset;
-            self.emit(ShellEvent::OverlayChanged);
+            self.emit(ShellEvent::GalleryScrolled);
         }
     }
 
@@ -2353,7 +2359,7 @@ impl AppController {
             content_height,
             self.state.gallery_viewport_height,
         );
-        self.emit(ShellEvent::OverlayChanged);
+        self.emit(ShellEvent::GalleryScrolled);
     }
 
     pub fn gallery_scroll_y(&self) -> f32 {
@@ -2568,7 +2574,7 @@ impl AppController {
         let offset = settings_panel::clamp_panel_scroll(offset_px, content_height, viewport_height);
         if offset != self.state.settings_scroll_y {
             self.state.settings_scroll_y = offset;
-            self.emit(ShellEvent::SettingsChanged);
+            self.emit(ShellEvent::SettingsScrolled);
         }
     }
 
@@ -2636,7 +2642,7 @@ impl AppController {
             content_height,
             self.state.settings_viewport_height,
         );
-        self.emit(ShellEvent::SettingsChanged);
+        self.emit(ShellEvent::SettingsScrolled);
     }
 
     pub fn settings_scroll_y(&self) -> f32 {

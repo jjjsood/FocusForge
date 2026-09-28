@@ -38,7 +38,8 @@ use crate::generated::{
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
 use crate::job;
-use crate::settings_panel::{HeadingState, RowKind};
+use crate::overlay::Thumbnail;
+use crate::settings_panel::{HeadingState, PanelModel, RowKind};
 use crate::viewport::PaneRect;
 
 /// `slint::platform::PointerEventButton` -> `input_map::Button` -- the only
@@ -333,8 +334,9 @@ fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::Mea
         | ShellEvent::TabScrollChanged
         | ShellEvent::QuestionRaised(_)
         | ShellEvent::EntryRefused(_)
-        | ShellEvent::OverlayChanged => InputSurface::Gallery,
-        ShellEvent::SettingsChanged => InputSurface::Settings,
+        | ShellEvent::OverlayChanged
+        | ShellEvent::GalleryScrolled => InputSurface::Gallery,
+        ShellEvent::SettingsChanged | ShellEvent::SettingsScrolled => InputSurface::Settings,
         ShellEvent::ImagesChanged | ShellEvent::ImagesScrolled => InputSurface::Images,
         ShellEvent::WindowDragRequested
         | ShellEvent::WindowMinimizeRequested
@@ -844,62 +846,106 @@ fn heading_state_str(state: HeadingState) -> &'static str {
     }
 }
 
-/// Updates the settings panel's row model with `set_row_data` when the row
-/// count did not change, instead of handing `app` a freshly built
-/// `VecModel` every time: a fresh model resets the `for` loop's whole
-/// element tree, which drops a `TouchArea` mid-gesture and kills a slider
-/// drag after its first tick, where `set_row_data` keeps every element's
-/// identity. A row count change (a tab switch, an algorithm pick) still
-/// needs the fresh model, since the tree itself must grow or shrink. The
-/// one place `ShellEvent::SettingsChanged` is performed; also called from
+/// Brings the live `VecModel` behind `existing` to `rows` in place: trims or
+/// extends its tail and calls `set_row_data` only where a row differs, so an
+/// unchanged row keeps its element tree -- a fresh model would rebuild every
+/// row's tree and drop a `TouchArea` mid-gesture. Any other model is replaced
+/// through `install`. Returns how many rows were notified.
+fn sync_rows<T: Clone + PartialEq + 'static>(
+    existing: slint::ModelRc<T>,
+    rows: Vec<T>,
+    install: impl FnOnce(slint::ModelRc<T>),
+) -> usize {
+    let Some(model) = existing.as_any().downcast_ref::<slint::VecModel<T>>() else {
+        let count = rows.len();
+        install(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+        return count;
+    };
+    let mut updates = 0;
+    while model.row_count() > rows.len() {
+        model.remove(model.row_count() - 1);
+        updates += 1;
+    }
+    for (i, row) in rows.into_iter().enumerate() {
+        if i >= model.row_count() {
+            model.push(row);
+            updates += 1;
+        } else if model.row_data(i).as_ref() != Some(&row) {
+            model.set_row_data(i, row);
+            updates += 1;
+        }
+    }
+    updates
+}
+
+/// `live` when it already lists exactly `strings`, a fresh model otherwise:
+/// `ModelRc` equality is model identity, so only a kept model lets its row
+/// compare equal.
+fn retained_strings(
+    live: Option<slint::ModelRc<slint::SharedString>>,
+    strings: &[String],
+) -> slint::ModelRc<slint::SharedString> {
+    match live {
+        Some(model)
+            if model.row_count() == strings.len()
+                && model.iter().zip(strings).all(|(a, b)| a.as_str() == b) =>
+        {
+            model
+        }
+        _ => std::rc::Rc::new(slint::VecModel::from(
+            strings
+                .iter()
+                .map(slint::SharedString::from)
+                .collect::<Vec<_>>(),
+        ))
+        .into(),
+    }
+}
+
+/// Pushes the settings panel's rows through [`sync_rows`], reusing each live
+/// row's choice models while their strings are unchanged. The one place
+/// `ShellEvent::SettingsChanged` is performed; also called from
 /// `push_projects` so a tab switch or close rebuilds the panel for the
 /// newly active tab. `pub` so a test can push a real, unmodified row set
 /// and then edit one row's own text without going through a live event.
 pub fn push_settings_panel(app: &AppWindow, controller: &AppController) {
     let _scope = measurement_scope("gui_settings_rows");
     let panel = controller.settings_panel();
+    let existing = app.get_settings_rows();
     let rows: Vec<GeneratedSettingsRow> = panel
         .rows
         .iter()
-        .map(|row| GeneratedSettingsRow {
-            kind: row_kind_str(row.kind).into(),
-            section: row.section.clone().into(),
-            id: row.id.clone().into(),
-            label: row.label.clone().into(),
-            value_text: row.value_text.clone().into(),
-            fraction: row.fraction,
-            choices: std::rc::Rc::new(slint::VecModel::from(
-                row.choices
-                    .iter()
-                    .map(|s| s.clone().into())
-                    .collect::<Vec<slint::SharedString>>(),
-            ))
-            .into(),
-            choice_ids: std::rc::Rc::new(slint::VecModel::from(
-                row.choice_ids
-                    .iter()
-                    .map(|s| s.clone().into())
-                    .collect::<Vec<slint::SharedString>>(),
-            ))
-            .into(),
-            selected: row.selected.clone().into(),
-            menu_open: row.menu_open,
-            heading_state: heading_state_str(row.heading_state).into(),
-            top: row.top,
+        .enumerate()
+        .map(|(i, row)| {
+            let live = existing.row_data(i);
+            GeneratedSettingsRow {
+                kind: row_kind_str(row.kind).into(),
+                section: row.section.clone().into(),
+                id: row.id.clone().into(),
+                label: row.label.clone().into(),
+                value_text: row.value_text.clone().into(),
+                fraction: row.fraction,
+                choices: retained_strings(live.as_ref().map(|r| r.choices.clone()), &row.choices),
+                choice_ids: retained_strings(live.map(|r| r.choice_ids), &row.choice_ids),
+                selected: row.selected.clone().into(),
+                menu_open: row.menu_open,
+                heading_state: heading_state_str(row.heading_state).into(),
+                top: row.top,
+            }
         })
         .collect();
-    record_timing(TimingCounter::RowUpdates, rows.len() as u64);
-    let existing = app.get_settings_rows();
-    if existing.row_count() == rows.len() {
-        for (i, row) in rows.into_iter().enumerate() {
-            existing.set_row_data(i, row);
-        }
-    } else {
-        app.set_settings_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
-    }
+    let updates = sync_rows(existing, rows, |model| app.set_settings_rows(model));
+    record_timing(TimingCounter::RowUpdates, updates as u64);
     app.set_settings_content_height(panel.content_height);
-    app.set_settings_scroll_y(panel.scroll_y);
+    push_settings_scroll(app, &panel);
+    app.set_settings_enabled(!controller.job_running());
+}
 
+/// Pushes the settings panel's scroll offset and sticky heading alone -- the
+/// one place `ShellEvent::SettingsScrolled` is performed. Rows sit in content
+/// space, so a scroll moves no row.
+pub fn push_settings_scroll(app: &AppWindow, panel: &PanelModel) {
+    app.set_settings_scroll_y(panel.scroll_y);
     let sticky = panel.sticky.map(|i| &panel.rows[i]);
     app.set_settings_sticky(SectionHeadView {
         visible: sticky.is_some(),
@@ -914,7 +960,6 @@ pub fn push_settings_panel(app: &AppWindow, controller: &AppController) {
             .into(),
         push: panel.sticky_push,
     });
-    app.set_settings_enabled(!controller.job_running());
 }
 
 /// Pushes the `Images` panel's whole state -- [`push_settings_panel`]'s
@@ -935,34 +980,9 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
             selected: row.selected,
         })
         .collect();
-    let existing = app.get_images_rows();
-    let updates = match existing
-        .as_any()
-        .downcast_ref::<slint::VecModel<GeneratedImageRow>>()
-    {
-        Some(model) => {
-            let mut updates = 0;
-            while model.row_count() > rows.len() {
-                model.remove(model.row_count() - 1);
-                updates += 1;
-            }
-            for (i, row) in rows.into_iter().enumerate() {
-                if i >= model.row_count() {
-                    model.push(row);
-                    updates += 1;
-                } else if model.row_data(i).as_ref() != Some(&row) {
-                    model.set_row_data(i, row);
-                    updates += 1;
-                }
-            }
-            updates
-        }
-        None => {
-            let count = rows.len();
-            app.set_images_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
-            count
-        }
-    };
+    let updates = sync_rows(app.get_images_rows(), rows, |model| {
+        app.set_images_rows(model)
+    });
     record_timing(TimingCounter::RowUpdates, updates as u64);
     app.set_images_header_text(panel.header_text.into());
     app.set_images_list_viewport_y(-controller.images_scroll_y());
@@ -1004,15 +1024,32 @@ fn push_divergence(app: &AppWindow, controller: &AppController) {
     }
 }
 
-/// A card picture, converted into an actual Slint image -- the one place
-/// `crate::overlay::Thumbnail` crosses into `slint::Image`. A blank 1x1
-/// image with no picture yet -- `FFProjectCard` only draws it when
-/// `has-picture` is set, so its content never shows.
-fn thumbnail_image(thumbnail: Option<&crate::overlay::Thumbnail>) -> slint::Image {
-    let _scope = measurement_scope("gui_thumbnail");
+/// A converted card picture per thumbnail, keyed by the thumbnail's `Arc`:
+/// a thumbnail changes only by being replaced, and the held `Weak` keeps its
+/// address from being reused while it is cached.
+type PictureCache = Vec<(std::sync::Weak<Thumbnail>, slint::Image)>;
+
+thread_local! {
+    /// The pictures of the cards the open overlay last showed.
+    static PICTURES: RefCell<PictureCache> = const { RefCell::new(Vec::new()) };
+}
+
+/// A card picture as a Slint image -- the one place
+/// `crate::overlay::Thumbnail` crosses into `slint::Image`: the `cached`
+/// handle when this same thumbnail was converted before, a fresh conversion
+/// otherwise. A blank 1x1 image with no picture yet -- `FFProjectCard` only
+/// draws it when `has-picture` is set, so its content never shows.
+fn thumbnail_image(thumbnail: Option<&Arc<Thumbnail>>, cached: &PictureCache) -> slint::Image {
     let Some(thumbnail) = thumbnail else {
         return slint::Image::default();
     };
+    if let Some((_, image)) = cached
+        .iter()
+        .find(|(weak, _)| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(thumbnail)))
+    {
+        return image.clone();
+    }
+    let _scope = measurement_scope("gui_thumbnail");
     let mut buffer =
         slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(thumbnail.width, thumbnail.height);
     buffer.make_mut_bytes().copy_from_slice(&thumbnail.rgba);
@@ -1021,36 +1058,54 @@ fn thumbnail_image(thumbnail: Option<&crate::overlay::Thumbnail>) -> slint::Imag
 }
 
 /// Pushes the projects overlay's whole state -- the one place
-/// `ShellEvent::OverlayChanged` is performed.
+/// `ShellEvent::OverlayChanged` is performed. A closed overlay publishes
+/// only that it is closed; opening it pushes again. Cards and Recent rows
+/// go through [`sync_rows`], and each picture keeps its handle until its
+/// thumbnail is replaced or its card leaves.
 pub fn push_projects_overlay(app: &AppWindow, controller: &AppController) {
     let _scope = measurement_scope("gui_projects_overlay");
-    app.set_projects_overlay_open(controller.projects_overlay_open());
+    let open = controller.projects_overlay_open();
+    app.set_projects_overlay_open(open);
+    if !open {
+        return;
+    }
     app.set_projects_save_enabled(controller.save_enabled());
     app.set_gallery_heading(controller.gallery_heading().into());
     app.set_gallery_count_text(controller.gallery_count_text().into());
+    let cached = PICTURES.take();
+    let mut pictures = PictureCache::new();
     let cards: Vec<GeneratedProjectCard> = controller
         .project_cards()
         .into_iter()
-        .map(|c| GeneratedProjectCard {
-            kind: c.kind.into(),
-            current: c.current,
-            unsaved: c.unsaved,
-            fusing: c.fusing,
-            fusing_fraction: c.fusing_fraction,
-            project_name: c.project_name.into(),
-            meta_text: c.meta_text.into(),
-            headline: c.headline.into(),
-            stage: c.stage.into(),
-            reason: c.reason.into(),
-            action_label: c.action_label.into(),
-            has_picture: c.picture.is_some(),
-            picture: thumbnail_image(c.picture.as_deref()),
-            x: c.x,
-            y: c.y,
+        .map(|c| {
+            let picture = thumbnail_image(c.picture.as_ref(), &cached);
+            if let Some(thumbnail) = &c.picture {
+                pictures.push((Arc::downgrade(thumbnail), picture.clone()));
+            }
+            GeneratedProjectCard {
+                kind: c.kind.into(),
+                current: c.current,
+                unsaved: c.unsaved,
+                fusing: c.fusing,
+                fusing_fraction: c.fusing_fraction,
+                project_name: c.project_name.into(),
+                meta_text: c.meta_text.into(),
+                headline: c.headline.into(),
+                stage: c.stage.into(),
+                reason: c.reason.into(),
+                action_label: c.action_label.into(),
+                has_picture: c.picture.is_some(),
+                picture,
+                x: c.x,
+                y: c.y,
+            }
         })
         .collect();
-    record_timing(TimingCounter::RowUpdates, cards.len() as u64);
-    app.set_project_cards(std::rc::Rc::new(slint::VecModel::from(cards)).into());
+    PICTURES.set(pictures);
+    let updates = sync_rows(app.get_project_cards(), cards, |model| {
+        app.set_project_cards(model)
+    });
+    record_timing(TimingCounter::RowUpdates, updates as u64);
     app.set_gallery_content_height(controller.gallery_content_height_px());
     app.set_gallery_scroll_y(controller.gallery_scroll_y());
 
@@ -1067,8 +1122,10 @@ pub fn push_projects_overlay(app: &AppWindow, controller: &AppController) {
             date_text: r.date_text.into(),
         })
         .collect();
-    record_timing(TimingCounter::RowUpdates, recent.len() as u64);
-    app.set_recent_rows(std::rc::Rc::new(slint::VecModel::from(recent)).into());
+    let updates = sync_rows(app.get_recent_rows(), recent, |model| {
+        app.set_recent_rows(model)
+    });
+    record_timing(TimingCounter::RowUpdates, updates as u64);
 }
 
 /// Pushes a raised [`GroupingQuestion`] into `app`'s dialog properties.
@@ -2478,6 +2535,9 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::QuestionRaised(question) => push_question(app, &question),
         ShellEvent::EntryRefused(_) => app.set_refusal_open(true),
         ShellEvent::SettingsChanged => push_settings_panel(app, &controller.lock().unwrap()),
+        ShellEvent::SettingsScrolled => {
+            push_settings_scroll(app, &controller.lock().unwrap().settings_panel());
+        }
         ShellEvent::JobChanged => {
             let controller = controller.lock().unwrap();
             push_job(app, &controller.job_view());
@@ -2497,6 +2557,9 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             app.set_images_list_viewport_y(-controller.lock().unwrap().images_scroll_y());
         }
         ShellEvent::OverlayChanged => push_projects_overlay(app, &controller.lock().unwrap()),
+        ShellEvent::GalleryScrolled => {
+            app.set_gallery_scroll_y(controller.lock().unwrap().gallery_scroll_y());
+        }
         // A background load's own three events (`AppController::open_paths`).
         // The indicator's threshold and fade are the Slint region's own
         // state, driven by `load-active` alone -- it shows no other part of
