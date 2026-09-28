@@ -99,3 +99,8 @@ pub mod overlay;
 /// `use slint::` anywhere in it. `pub` so `src/main.rs` and
 /// `tests/projects_overlay.rs` reach it directly.
 pub mod recent;
+
+/// The checkpoint dock panel's own view model -- day-grouped rows built from
+/// a project's saved history. No `use slint::` anywhere in it. `pub` so
+/// `tests/checkpoint_panel.rs` reaches its types directly.
+pub mod checkpoints;

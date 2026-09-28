@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use focusforge_core::io::Rect;
 use focusforge_core::project::{Op, Point};
 use focusforge_core::zmap::ZMapReader;
+use focusforge_gui::input_map::PointerKind;
 use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode};
 
 /// True when `body` (already trimmed) is exactly one statement of the form
@@ -730,6 +731,115 @@ fn controller_events_reach_an_installed_sink() {
             ShellEvent::WindowCloseRequested,
         ],
         "events must reach the sink in the order they were raised"
+    );
+}
+
+/// A press on the drawn `Checkpoints` scrollbar thumb grabs it at the press
+/// offset instead of jumping the list: the thumb math reads the content
+/// height `checkpoints_panel()` builds, the same number the list draws
+/// with. Only a press on the track outside the thumb may jump.
+#[test]
+fn pressing_the_checkpoints_scrollbar_thumb_grabs_it_without_jumping() {
+    use focusforge_core::io::{TiffSpec, TiffWriter};
+    use focusforge_core::params::ParamValues;
+    use focusforge_core::project::{Metrics, SealRequest, ZMapStorage, append_ops_at, seal_at};
+    use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+
+    let dir = common::tree("checkpoints_scrollbar_thumb");
+    let composite = dir.join("composite.tif");
+    let zmap = dir.join("zmap.tif");
+    let full = Rect {
+        x: 0,
+        y: 0,
+        width: 4,
+        height: 4,
+    };
+    let mut writer = TiffWriter::create(
+        &composite,
+        TiffSpec {
+            width: 4,
+            height: 4,
+            samples_per_pixel: 3,
+            description: Some("staged".to_string()),
+        },
+    )
+    .unwrap();
+    writer.write_tile(full, &[0u16; 4 * 4 * 3]).unwrap();
+    writer.finish().unwrap();
+    let mut map = ZMapWriter::create(&zmap, ZMapInfo::new(4, 4, 1).unwrap()).unwrap();
+    map.write_tile(full, &[0u16; 4 * 4]).unwrap();
+    map.finish().unwrap();
+
+    // Ten same-day checkpoints -- no day separator, so `content_height` is
+    // exactly 10 * 40px = 400px, the fixed number the math below assumes.
+    let project_path = dir.join("scrollbar.ffp");
+    let noon = 1_756_468_800; // an arbitrary local noon
+    seal_at(
+        SealRequest {
+            project_path: &project_path,
+            staged_composite: &composite,
+            staged_zmap: &zmap,
+            sources: &[],
+            algorithm: "laplacian-pyramid",
+            params: &ParamValues::new(),
+            align: None,
+            crop: None,
+            composite_description: "staged".to_string(),
+            label: None,
+            metrics: Metrics::default(),
+        },
+        noon,
+    )
+    .unwrap();
+    for i in 1..10i64 {
+        let op = Op::BrushStroke {
+            source_id: 0,
+            path: vec![Point { x: 1, y: 1 }],
+            radius: 0.5,
+            softness: 0.0,
+        };
+        append_ops_at(
+            &project_path,
+            vec![op],
+            None,
+            noon + i * 60,
+            ZMapStorage::Bounded,
+        )
+        .unwrap_or_else(|err| panic!("checkpoint {i} must append: {err}"));
+    }
+
+    let mut controller = AppController::new();
+    common::open_and_settle(&mut controller, &[project_path]);
+    assert_eq!(controller.checkpoints_panel().content_height, 400.0);
+
+    // A 400px list in a 100px viewport, scrolled to its midpoint: thumb
+    // height 100*100/400 = 25px, thumb top 150*100/400 = 37.5px, so the
+    // thumb spans [37.5, 62.5).
+    controller.set_checkpoints_viewport_height(100.0);
+    controller.scroll_checkpoints_panel(150.0);
+    assert_eq!(controller.checkpoints_scroll_y(), 150.0);
+
+    // Press inside the thumb: no jump.
+    controller.checkpoints_scrollbar_pointer(PointerKind::Down, 50.0);
+    assert_eq!(
+        controller.checkpoints_scroll_y(),
+        150.0,
+        "a press on the thumb itself must not move the list"
+    );
+
+    // Dragging from there moves the list smoothly, by the drag delta.
+    controller.checkpoints_scrollbar_dragged(70.0);
+    assert_eq!(controller.checkpoints_scroll_y(), 230.0);
+    controller.checkpoints_scrollbar_pointer(PointerKind::Up, 70.0);
+
+    // A press on the track outside the thumb may jump.
+    controller.scroll_checkpoints_panel(150.0 - controller.checkpoints_scroll_y());
+    assert_eq!(controller.checkpoints_scroll_y(), 150.0);
+    controller.checkpoints_scrollbar_pointer(PointerKind::Down, 90.0);
+    assert_eq!(
+        controller.checkpoints_scroll_y(),
+        300.0,
+        "a press on the bare track may jump, clamped to the list's end"
     );
 }
 

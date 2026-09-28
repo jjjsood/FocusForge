@@ -415,6 +415,7 @@ fn gestures_come_from_the_input_map() {
         "ff_scrollbar.slint",
         "settings_panel.slint",
         "images_panel.slint",
+        "checkpoint_panel.slint",
         "ff_image_row.slint",
         "gallery.slint",
         "ff_manifest_list.slint",

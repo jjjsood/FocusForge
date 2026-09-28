@@ -163,15 +163,20 @@ fn checkpoint_panel_shows_its_empty_state() {
 
 #[test]
 fn checkpoint_panel_touches_no_storage() {
+    // Rows come only from an open project's history; with no tab there are
+    // none. A tab with a project shows its rows (`tests/checkpoint_panel.rs`).
     let controller = focusforge_gui::AppController::new();
-    assert!(controller.checkpoints().is_empty());
+    assert!(controller.checkpoints_panel().entries.is_empty());
     assert!(!controller.export_enabled());
 
     // The canvas legitimately touches storage (a project's TIFFs),
     // `input_config.rs` is a config file, and `settings_panel.rs` is the one
-    // module allowed to name the schema/registry crate. Excluded by name:
-    // this test's own subject is the checkpoint panel, not the whole crate.
+    // module allowed to name the schema/registry crate. `checkpoints.rs`
+    // reads the history the panel lists, beside `job.rs`, which reads its
+    // planes. Excluded by name: this test's own subject is the checkpoint
+    // panel, not the whole crate.
     let canvas_files = [
+        "checkpoints.rs",
         "canvas.rs",
         "gpu_canvas.rs",
         "entry.rs",
@@ -801,7 +806,7 @@ fn dock_without_a_project_says_so() {
     let app = app_at(1440, 900);
 
     assert_eq!(
-        label(&app, "FFCheckpointPanel::checkpoint-note"),
+        label(&app, "FFCheckpointPanel::empty-note"),
         "None yet — fuse a stack"
     );
     assert_eq!(

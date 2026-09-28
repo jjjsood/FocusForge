@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// One checkpoint list row: algorithm over timestamp; selected adds a raised
+// background and a left accent bar.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFCheckpointRow inherits Rectangle {
+    in property <string> algorithm;
+    in property <string> time-text;
+    in property <bool> selected: false;
+
+    callback clicked();
+
+    width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-band-inset;
+    height: ShellGeometry.checkpoint-row-height;
+    background: root.selected ? Theme.surface-hover : transparent;
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.clicked(); }
+    }
+
+    // The bar's own width is the gap between the band's inset and the
+    // content column's -- it sits exactly where the row's shared content
+    // edge already is.
+    property <length> bar-width: ShellGeometry.dock-content-inset - ShellGeometry.dock-band-inset;
+
+    if root.selected: Rectangle {
+        x: 0;
+        width: root.bar-width;
+        height: 100%;
+        background: Theme.accent-default;
+    }
+
+    VerticalLayout {
+        // Clear of the accent bar, whether or not this row draws one.
+        x: root.bar-width + Theme.space-3;
+        width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-content-inset - Theme.space-3;
+        height: 100%;
+        alignment: center;
+
+        Text {
+            text: root.algorithm;
+            color: Theme.text-primary;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            overflow: elide;
+        }
+        Text {
+            text: root.time-text;
+            color: Theme.text-muted;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            overflow: elide;
+        }
+    }
+}

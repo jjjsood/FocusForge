@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::checkpoints;
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
     DiagnosticsView, clamp_manifest_scroll, manifest_content_height, size_text,
@@ -74,14 +75,6 @@ pub enum SettingsSection {
     InputMap,
     Diagnostics,
     About,
-}
-
-/// The two fields a checkpoint row shows: the fusion algorithm used and when
-/// it ran. Left unpopulated until real checkpoint history exists.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckpointRow {
-    pub algorithm: String,
-    pub created_at: String,
 }
 
 /// Every event the shell can raise, reaching an installed sink through
@@ -139,6 +132,10 @@ pub enum ShellEvent {
     /// warning opened or closed -- never a tab switch, which
     /// `ProjectsChanged` already rebuilds the panel for.
     ImagesChanged,
+    /// The `Checkpoints` panel's own state moved: a row selected or the
+    /// scroll offset -- never a tab switch, which `ProjectsChanged` already
+    /// rebuilds the panel for.
+    CheckpointsChanged,
     /// The projects overlay's own state moved: opened, closed, its gallery
     /// scrolled, or its failure cards changed.
     OverlayChanged,
@@ -260,15 +257,16 @@ struct ProjectTab {
     errors: BTreeMap<String, ParamViolation>,
     /// The one open picker/enum menu's `"<section>:<id>"` key, if any.
     menu_open: Option<String>,
-    /// The project's real checkpoint count -- `0` for an `Unsaved` tab, the
-    /// reopened project's own on-disk chain length for an `Opened` one,
-    /// incremented on every successful run ([`AppController::settle_job`])
-    /// rather than inferred from which [`GuiProject`] variant the tab
-    /// happens to be in. Counts held checkpoints too.
-    checkpoints: usize,
     /// Every checkpoint fused since the last save, oldest first -- in no
     /// `.ffp` until [`AppController::save_active_project`] writes them.
     held: Vec<job::HeldCheckpoint>,
+    /// The checkpoint list's own current row, by its `checkpoints::
+    /// CheckpointEntry` id -- seeded to the newest saved checkpoint on open,
+    /// `None` for an `Unsaved` tab with nothing fused yet.
+    selected_checkpoint: Option<String>,
+    /// The current saved row's planes once asked for; reset whenever the
+    /// current row changes. Held rows never use it: they carry their own.
+    row_planes: Option<RowPlanes>,
     /// A completed run whose alignment left frames unregistered, waiting for
     /// [`AppController::keep_fused`] or [`AppController::discard_fused`];
     /// not counted in `checkpoints` or `held` until kept.
@@ -308,6 +306,36 @@ struct ProjectTab {
     edit: Option<job::EditSession>,
 }
 
+/// A saved row's planes, as far as they have got.
+enum RowPlanes {
+    /// An op-bearing row rendering on a worker; the canvas keeps what it
+    /// showed until it settles.
+    Pending,
+    Ready(PathBuf, PathBuf),
+    /// The right pane's refusal text, one entry per line.
+    Refused(Vec<String>),
+}
+
+/// What the active tab can show in the right pane right now.
+enum TabPlanes {
+    Ready(PathBuf, PathBuf),
+    Pending,
+    None,
+}
+
+/// The one op-bearing checkpoint render in flight, if any, and where its
+/// worker parks the result -- [`LoadSlot`]'s shape.
+#[derive(Default)]
+struct RenderSlot {
+    /// The tab (by id) and row the running worker renders.
+    in_flight: Option<(u64, String)>,
+    /// Set when a worker starts, until [`AppController::take_render_started`].
+    started: bool,
+    outcome: Arc<Mutex<Option<RenderOutcome>>>,
+}
+
+type RenderOutcome = Result<(PathBuf, PathBuf), Vec<String>>;
+
 /// A held checkpoint whose run diverged on `diverged`, by frame file name.
 struct ParkedRun {
     held: job::HeldCheckpoint,
@@ -335,9 +363,9 @@ impl ProjectTab {
             entry::tab_image_size(&project).map(|(width, height)| ImageSize { width, height });
         let (fuse_id, fuse_values, align_id, align_values) =
             settings_panel::seed_algorithm_state(&project);
-        let checkpoints = match &mut project {
-            GuiProject::Unsaved(_) => 0,
-            GuiProject::Opened(p) => p.checkpoint_chain().map(|chain| chain.len()).unwrap_or(1),
+        let selected_checkpoint = match &project {
+            GuiProject::Unsaved(_) => None,
+            GuiProject::Opened(p) => p.history().all().first().map(|c| c.id.clone()),
         };
         let frames = entry::project_frames(&project);
         let excluded = vec![false; frames.len()];
@@ -362,8 +390,9 @@ impl ProjectTab {
             project_values: ParamValues::new(),
             errors: BTreeMap::new(),
             menu_open: None,
-            checkpoints,
             held: Vec::new(),
+            selected_checkpoint,
+            row_planes: None,
             parked: None,
             frames,
             excluded,
@@ -399,13 +428,25 @@ impl ProjectTab {
             .collect()
     }
 
+    /// This tab's own checkpoint count: every checkpoint in the project's
+    /// full history (`History::all`, branch-complete rather than one
+    /// lineage) plus every checkpoint fused since the last save. `0` for an
+    /// `Unsaved` tab with nothing fused yet.
+    fn checkpoint_count(&self) -> usize {
+        let saved = match &self.project {
+            GuiProject::Opened(project) => project.history().all().len(),
+            GuiProject::Unsaved(_) => 0,
+        };
+        saved + self.held.len()
+    }
+
     /// Whether this tab can enter editor mode: at least one checkpoint, its
     /// own run neither live nor waiting in the queue, and `frames` still
     /// naming the frame set the fused planes were built from -- the newest
     /// held checkpoint's own `sources`, or a reopened project's own manifest
     /// when nothing is held.
     fn can_edit(&self) -> bool {
-        if self.checkpoints == 0 {
+        if self.checkpoint_count() == 0 {
             return false;
         }
         if job::is_live(&self.run) || matches!(self.run, job::RunState::Queued { .. }) {
@@ -508,7 +549,9 @@ pub struct CloseGuardCopy {
 struct ShellState {
     mode: ShellMode,
     dock_tab: DockTab,
-    checkpoints: Vec<CheckpointRow>,
+    checkpoints_scroll_y: f32,
+    checkpoints_viewport_height: f32,
+    checkpoints_scrollbar_drag: Option<f32>,
     maximized: bool,
     input: InputState,
     /// Every open project tab. Each tab owns its own image and viewport, so
@@ -617,6 +660,7 @@ struct ShellState {
     canvas_dirty: bool,
     /// The in-flight background load, if any.
     load: LoadSlot,
+    render: RenderSlot,
 }
 
 /// One load's worker result, parked here until
@@ -900,10 +944,13 @@ impl AppController {
     /// `ModeChanged(Stacking)`, when the active tab no longer satisfies
     /// [`Self::editor_enabled`] or its session cannot open -- a switch away
     /// from a fused tab, that tab's own run starting or being promoted, or a
-    /// confirmed frame-set change.
+    /// confirmed frame-set change. A tab whose current row still renders
+    /// keeps editor mode; its session opens once the render settles.
     fn leave_editor_if_unfit(&mut self) {
         if self.state.mode == ShellMode::Editor
-            && !(self.editor_enabled() && self.ensure_edit_session())
+            && !(self.editor_enabled()
+                && (self.ensure_edit_session()
+                    || matches!(self.active_tab_planes(), TabPlanes::Pending)))
         {
             self.state.mode = ShellMode::Stacking;
             self.emit(ShellEvent::ModeChanged(ShellMode::Stacking));
@@ -926,9 +973,113 @@ impl AppController {
         self.emit(ShellEvent::DockTabSelected(tab));
     }
 
-    /// Always empty -- the checkpoint panel's frame reads no storage.
-    pub fn checkpoints(&self) -> &[CheckpointRow] {
-        &self.state.checkpoints
+    /// Builds the whole `Checkpoints` panel for the active tab -- empty with
+    /// no tab active.
+    pub fn checkpoints_panel(&self) -> checkpoints::CheckpointsModel {
+        let today = checkpoints::today();
+        let viewport_height = self.state.checkpoints_viewport_height;
+        let Some(tab) = self.state.active() else {
+            return checkpoints::build_model(&[], &[], today, None, 0.0);
+        };
+        let saved = match &tab.project {
+            GuiProject::Opened(project) => project.history().all(),
+            GuiProject::Unsaved(_) => Vec::new(),
+        };
+        let selected = tab.selected_checkpoint.as_deref();
+        let content_height =
+            checkpoints::build_model(&saved, &tab.held, today, selected, 0.0).content_height;
+        let scroll_y = settings_panel::clamp_panel_scroll(
+            self.state.checkpoints_scroll_y,
+            content_height,
+            viewport_height,
+        );
+        checkpoints::build_model(&saved, &tab.held, today, selected, scroll_y)
+    }
+
+    /// Makes flat entry `index` of [`Self::checkpoints_panel`] the current
+    /// row and marks the canvas for its planes, which the next
+    /// [`Self::canvas_feed`] loads -- at once for a fused or held row, via a
+    /// background render for an op-bearing one. A no-op on a day separator,
+    /// past the list's end, with no tab active, on the current row unless it
+    /// was refused, and in editor mode while the session holds edits.
+    pub fn select_checkpoint_row(&mut self, index: usize) {
+        let Some(id) = self
+            .checkpoints_panel()
+            .entries
+            .get(index)
+            .and_then(|entry| entry.id.clone())
+        else {
+            return;
+        };
+        let editing = self.state.mode == ShellMode::Editor;
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        if tab.selected_checkpoint.as_deref() == Some(id.as_str())
+            && !matches!(tab.row_planes, Some(RowPlanes::Refused(_)))
+        {
+            return;
+        }
+        if editing && tab.edit.as_ref().is_some_and(|edit| edit.op_count() > 0) {
+            return;
+        }
+        tab.selected_checkpoint = Some(id);
+        tab.row_planes = None;
+        tab.edit = None;
+        self.state.canvas_dirty = true;
+        if editing {
+            self.ensure_edit_session();
+        }
+        self.emit(ShellEvent::CheckpointsChanged);
+    }
+
+    /// Picks up a settled background checkpoint render: the current row's
+    /// planes or its refusal, dropped when the row changed while it ran.
+    /// Returns `false` while the render is still running -- the poll's cue
+    /// to keep going.
+    pub fn settle_checkpoint_render(&mut self) -> bool {
+        let Some(outcome) = self
+            .state
+            .render
+            .outcome
+            .lock()
+            .expect("no thread panicked while holding the render outcome")
+            .take()
+        else {
+            return self.state.render.in_flight.is_none();
+        };
+        let Some((tab_id, key)) = self.state.render.in_flight.take() else {
+            return true;
+        };
+        if let Some(tab) = self.state.projects.iter_mut().find(|tab| tab.id == tab_id)
+            && tab.selected_checkpoint.as_deref() == Some(key.as_str())
+            && matches!(tab.row_planes, Some(RowPlanes::Pending))
+        {
+            tab.row_planes = Some(match outcome {
+                Ok((composite, zmap)) => RowPlanes::Ready(composite, zmap),
+                Err(lines) => RowPlanes::Refused(lines),
+            });
+        }
+        self.state.canvas_dirty = true;
+        if self.state.mode == ShellMode::Editor {
+            self.ensure_edit_session();
+        }
+        true
+    }
+
+    /// Whether a checkpoint render started since the last call -- the
+    /// bridge's cue to start polling [`Self::settle_checkpoint_render`].
+    pub fn take_render_started(&mut self) -> bool {
+        std::mem::take(&mut self.state.render.started)
+    }
+
+    /// The right pane's refusal text for the active tab's current row, one
+    /// entry per line; empty while it shows, or is rendering, an image.
+    pub fn composite_message_lines(&self) -> Vec<String> {
+        match self.state.active().and_then(|tab| tab.row_planes.as_ref()) {
+            Some(RowPlanes::Refused(lines)) => lines.clone(),
+            _ => Vec::new(),
+        }
     }
 
     /// Always `false` -- the checkpoint panel's `Export` stays disabled.
@@ -2093,7 +2244,11 @@ impl AppController {
                     0.0
                 },
                 project_name: tab.title.clone(),
-                meta_text: open_card_meta(frame_count, tab.checkpoints, phase_line.as_deref()),
+                meta_text: open_card_meta(
+                    frame_count,
+                    tab.checkpoint_count(),
+                    phase_line.as_deref(),
+                ),
                 headline: String::new(),
                 stage: String::new(),
                 reason: String::new(),
@@ -3276,6 +3431,88 @@ impl AppController {
         self.state.images_scroll_y
     }
 
+    /// Scrolls the `Checkpoints` list by `delta_px`, clamped to its current
+    /// content/viewport -- [`Self::scroll_images_panel`]'s twin.
+    pub fn scroll_checkpoints_panel(&mut self, delta_px: f32) {
+        self.set_checkpoints_scroll(self.state.checkpoints_scroll_y + delta_px);
+    }
+
+    /// [`Self::set_images_scroll`]'s twin.
+    fn set_checkpoints_scroll(&mut self, offset_px: f32) {
+        let content_height = self.checkpoints_panel().content_height;
+        let viewport_height = self.state.checkpoints_viewport_height;
+        let offset = settings_panel::clamp_panel_scroll(offset_px, content_height, viewport_height);
+        if offset != self.state.checkpoints_scroll_y {
+            self.state.checkpoints_scroll_y = offset;
+            self.emit(ShellEvent::CheckpointsChanged);
+        }
+    }
+
+    /// The `Checkpoints` panel scrollbar thumb's current `(top, height)` in
+    /// track-pixel space -- [`Self::images_scrollbar_thumb`]'s twin.
+    fn checkpoints_scrollbar_thumb(&self) -> (f32, f32) {
+        let content_height = self.checkpoints_panel().content_height;
+        let viewport_height = self.state.checkpoints_viewport_height;
+        if content_height <= 0.0 {
+            return (0.0, viewport_height);
+        }
+        let height = (viewport_height * viewport_height / content_height).max(16.0);
+        let top = self.state.checkpoints_scroll_y * viewport_height / content_height;
+        (top, height)
+    }
+
+    /// A press on the `Checkpoints` scrollbar -- [`Self::images_scrollbar_pointer`]'s
+    /// twin.
+    pub fn checkpoints_scrollbar_pointer(&mut self, kind: PointerKind, mouse_y: f32) {
+        match kind {
+            PointerKind::Down => {
+                let (thumb_top, thumb_height) = self.checkpoints_scrollbar_thumb();
+                if mouse_y >= thumb_top && mouse_y < thumb_top + thumb_height {
+                    self.state.checkpoints_scrollbar_drag = Some(mouse_y - thumb_top);
+                } else {
+                    let viewport_height = self.state.checkpoints_viewport_height.max(1.0);
+                    let content_height = self.checkpoints_panel().content_height;
+                    let target_top = mouse_y - thumb_height / 2.0;
+                    self.set_checkpoints_scroll(target_top * content_height / viewport_height);
+                    self.state.checkpoints_scrollbar_drag = Some(thumb_height / 2.0);
+                }
+            }
+            PointerKind::Up => self.state.checkpoints_scrollbar_drag = None,
+            PointerKind::Move => {}
+        }
+    }
+
+    /// The live `Checkpoints` scrollbar drag, if any -- [`Self::images_scrollbar_dragged`]'s
+    /// twin.
+    pub fn checkpoints_scrollbar_dragged(&mut self, mouse_y: f32) {
+        let Some(grab_offset) = self.state.checkpoints_scrollbar_drag else {
+            return;
+        };
+        let viewport_height = self.state.checkpoints_viewport_height.max(1.0);
+        let content_height = self.checkpoints_panel().content_height;
+        let target_top = mouse_y - grab_offset;
+        self.set_checkpoints_scroll(target_top * content_height / viewport_height);
+    }
+
+    /// The `Checkpoints` panel viewport's measured height -- pushed on
+    /// install and on every resize; re-clamps the scroll offset --
+    /// [`Self::set_images_viewport_height`]'s twin.
+    pub fn set_checkpoints_viewport_height(&mut self, height: f32) {
+        self.state.checkpoints_viewport_height = height.max(0.0);
+        let content_height = self.checkpoints_panel().content_height;
+        self.state.checkpoints_scroll_y = settings_panel::clamp_panel_scroll(
+            self.state.checkpoints_scroll_y,
+            content_height,
+            self.state.checkpoints_viewport_height,
+        );
+        self.emit(ShellEvent::CheckpointsChanged);
+    }
+
+    /// [`Self::images_scroll_y`]'s twin.
+    pub fn checkpoints_scroll_y(&self) -> f32 {
+        self.state.checkpoints_scroll_y
+    }
+
     /// The current index of the tab carrying id `id`, if it is still open --
     /// what lets the live-run slot and the queue outlive a close that shifts
     /// every later index down.
@@ -3366,7 +3603,7 @@ impl AppController {
             hold_dir: scratch_root
                 .join("held")
                 .join(&staging_key)
-                .join(tab.checkpoints.to_string()),
+                .join(tab.checkpoint_count().to_string()),
             scratch_root,
             staging_key,
             fuse_id: tab.fuse_id.clone(),
@@ -3614,17 +3851,13 @@ impl AppController {
     /// The active tab's checkpoint count -- real, incrementing on every
     /// successful run, `None` while no tab is active.
     pub fn checkpoint_count(&self) -> Option<usize> {
-        self.state.active().map(|tab| tab.checkpoints)
+        self.state.active().map(ProjectTab::checkpoint_count)
     }
 
-    /// The checkpoints panel's own line: the active tab's checkpoint count in
-    /// the shared wording, or the empty-state line while no tab is active or
-    /// it holds none yet.
+    /// The checkpoints panel's own empty-state line, shown in place of the
+    /// row list while no tab is active or it holds no checkpoint yet.
     pub fn checkpoint_panel_line(&self) -> String {
-        match self.checkpoint_count() {
-            Some(count) if count > 0 => checkpoint_phrase(count),
-            _ => "None yet — fuse a stack".to_string(),
-        }
+        "None yet — fuse a stack".to_string()
     }
 
     /// Whether the active tab has a composite to show: at least one
@@ -3769,7 +4002,6 @@ impl AppController {
     fn commit_held(&mut self, index: usize, held: job::HeldCheckpoint) -> (PathBuf, PathBuf) {
         let tab = &mut self.state.projects[index];
         let path = project_identity_path(&tab.project);
-        tab.checkpoints += 1;
         if let Some(request) = &tab.request {
             tab.frames = request.frames.clone();
         }
@@ -3779,6 +4011,8 @@ impl AppController {
         tab.edit = None;
         tab.thumbnail = overlay::render_thumbnail_from_frame(&held.composite).map(Arc::new);
         let planes = (held.composite.clone(), held.zmap.clone());
+        tab.selected_checkpoint = Some(checkpoints::held_key(tab.held.len()));
+        tab.row_planes = None;
         tab.held.push(held);
         self.clear_failure(&path);
         planes
@@ -3797,7 +4031,7 @@ impl AppController {
     pub fn keep_fused(&mut self) -> Option<(PathBuf, PathBuf)> {
         let index = self.state.active?;
         let parked = self.state.projects.get_mut(index)?.parked.take()?;
-        let at = job::format_utc_hhmm(parked.held.created_at);
+        let at = checkpoints::local_hhmm(parked.held.created_at);
         let planes = self.commit_held(index, parked.held);
         self.state.projects[index].run = job::RunState::Fused { at };
         self.state.canvas_dirty = true;
@@ -3825,20 +4059,86 @@ impl AppController {
         }
     }
 
-    /// The active tab's composite and Z-Map paths: its newest held
-    /// checkpoint's, else an opened project's planes materialized into its
-    /// cache directory. `None` for an [`GuiProject::Unsaved`] tab that holds
-    /// nothing yet.
+    /// The active tab's current row's composite and Z-Map paths: a held
+    /// row's own files, a saved row's pair in the plane cache. `None` with
+    /// no current row, while an op-bearing row renders, or once it refused.
     pub fn materialize_active_tab_planes(&mut self) -> Option<(PathBuf, PathBuf)> {
+        match self.active_tab_planes() {
+            TabPlanes::Ready(composite, zmap) => Some((composite, zmap)),
+            TabPlanes::Pending | TabPlanes::None => None,
+        }
+    }
+
+    /// [`Self::materialize_active_tab_planes`], telling a pending render
+    /// apart. A fused row is written synchronously -- a stored-composite
+    /// read. An op-bearing row starts the one background render, or waits
+    /// for the running one to settle first.
+    fn active_tab_planes(&mut self) -> TabPlanes {
         let scratch_root = self.scratch_root();
-        let tab = self.state.active_mut()?;
-        if let Some(held) = tab.held.last() {
-            return Some((held.composite.clone(), held.zmap.clone()));
+        let render_free = self.state.render.in_flight.is_none();
+        let Some(tab) = self.state.active_mut() else {
+            return TabPlanes::None;
+        };
+        let Some(key) = tab.selected_checkpoint.clone() else {
+            return TabPlanes::None;
+        };
+        if let Some(index) = checkpoints::held_index(&key) {
+            return tab.held.get(index).map_or(TabPlanes::None, |held| {
+                TabPlanes::Ready(held.composite.clone(), held.zmap.clone())
+            });
+        }
+        match &tab.row_planes {
+            Some(RowPlanes::Ready(composite, zmap)) => {
+                return TabPlanes::Ready(composite.clone(), zmap.clone());
+            }
+            Some(RowPlanes::Pending) => return TabPlanes::Pending,
+            Some(RowPlanes::Refused(_)) => return TabPlanes::None,
+            None => {}
         }
         let GuiProject::Opened(project) = &mut tab.project else {
-            return None;
+            return TabPlanes::None;
         };
-        job::materialize_planes(project, &scratch_root).ok()
+        match job::fused_checkpoint_planes(project, &scratch_root, &key) {
+            Ok(job::CheckpointPlanes::Ready(composite, zmap)) => {
+                tab.row_planes = Some(RowPlanes::Ready(composite.clone(), zmap.clone()));
+                TabPlanes::Ready(composite, zmap)
+            }
+            Err(err) => {
+                tab.row_planes = Some(RowPlanes::Refused(job::render_refusal_lines(&err)));
+                TabPlanes::None
+            }
+            Ok(job::CheckpointPlanes::NeedsRender) => {
+                if render_free {
+                    let project_path = project.path().to_path_buf();
+                    tab.row_planes = Some(RowPlanes::Pending);
+                    let tab_id = tab.id;
+                    self.start_checkpoint_render(tab_id, key, project_path, scratch_root);
+                }
+                TabPlanes::Pending
+            }
+        }
+    }
+
+    /// Renders `key` of the project at `project_path` on a spawned worker,
+    /// parking the result for [`Self::settle_checkpoint_render`].
+    fn start_checkpoint_render(
+        &mut self,
+        tab_id: u64,
+        key: String,
+        project_path: PathBuf,
+        scratch_root: PathBuf,
+    ) {
+        self.state.render.in_flight = Some((tab_id, key.clone()));
+        self.state.render.started = true;
+        let outcome = Arc::clone(&self.state.render.outcome);
+        std::thread::spawn(move || {
+            let result = job::render_outcome(std::panic::catch_unwind(|| {
+                job::render_checkpoint_planes(&project_path, &scratch_root, &key)
+            }));
+            *outcome
+                .lock()
+                .expect("no thread panicked while holding the render outcome") = Some(result);
+        });
     }
 
     /// The active tab's checkpoints fused since its last save, oldest first;
@@ -3893,6 +4193,8 @@ impl AppController {
             }
         };
         let tab = &mut self.state.projects[index];
+        tab.selected_checkpoint = project.history().all().first().map(|c| c.id.clone());
+        tab.row_planes = None;
         tab.project = GuiProject::Opened(Box::new(project));
         tab.title = entry::tab_title(&tab.project);
         remove_held(&tab.held);
@@ -3906,8 +4208,10 @@ impl AppController {
     /// given which tab it currently holds (`None` before anything has
     /// loaded). `Keep` when the owner already matches the active tab and
     /// nothing changed underneath it since; otherwise materializes the
-    /// active tab's own planes and answers `Load`, or `Clear` when it has
-    /// none (no tab active, `+` selected, or nothing fused yet).
+    /// active tab's own planes and answers `Load`; `Keep` too while the
+    /// active tab's current row renders over that tab's previous image, or
+    /// `Clear` when it has none (no tab active, `+` selected, nothing fused
+    /// yet, or its current row refused).
     pub fn canvas_feed(&mut self, loaded: Option<usize>) -> crate::canvas::CanvasFeed {
         if loaded == self.state.active && !self.state.canvas_dirty {
             return crate::canvas::CanvasFeed::Keep;
@@ -3916,13 +4220,14 @@ impl AppController {
         let Some(tab) = self.state.active else {
             return crate::canvas::CanvasFeed::Clear;
         };
-        match self.materialize_active_tab_planes() {
-            Some((composite, zmap)) => crate::canvas::CanvasFeed::Load {
+        match self.active_tab_planes() {
+            TabPlanes::Ready(composite, zmap) => crate::canvas::CanvasFeed::Load {
                 tab,
                 composite,
                 zmap,
             },
-            None => crate::canvas::CanvasFeed::Clear,
+            TabPlanes::Pending if loaded == Some(tab) => crate::canvas::CanvasFeed::Keep,
+            TabPlanes::Pending | TabPlanes::None => crate::canvas::CanvasFeed::Clear,
         }
     }
 

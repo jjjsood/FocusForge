@@ -24,9 +24,9 @@ use crate::controller::{
 };
 use crate::diagnostics::DiagnosticsStatus;
 use crate::generated::{
-    AppWindow, FFManifestRow, ImageRowView as GeneratedImageRow,
-    ProjectCardView as GeneratedProjectCard, ProjectTabView, RecentRowView as GeneratedRecentRow,
-    SectionHeadView, SettingsRow as GeneratedSettingsRow,
+    AppWindow, CheckpointEntryView as GeneratedCheckpointEntry, FFManifestRow,
+    ImageRowView as GeneratedImageRow, ProjectCardView as GeneratedProjectCard, ProjectTabView,
+    RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
 };
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
@@ -81,10 +81,12 @@ pub struct Installed {
 pub struct Canvas {
     renderer: Option<CanvasRenderer>,
     tab: Option<usize>,
-    /// The frame reader's own refusal, kept until a different frame opens
-    /// or the same one succeeds -- the left `FFPane`'s message line reads
-    /// this.
-    frame_error: Option<String>,
+    /// The left `FFPane`'s refusal lines, kept until a different frame opens
+    /// or the same one succeeds; empty while the frame shows.
+    frame_refusal: Vec<String>,
+    /// The frame that last failed to open; not retried until the selection
+    /// moves off it.
+    failed_frame: Option<PathBuf>,
 }
 
 impl Canvas {
@@ -93,10 +95,10 @@ impl Canvas {
         self.tab
     }
 
-    /// The open frame reader's own refusal text, if the last [`Self::set_frame`]
-    /// failed.
-    pub fn frame_error(&self) -> Option<&str> {
-        self.frame_error.as_deref()
+    /// Why the last [`Self::set_frame`] could not open its frame, one entry
+    /// per line; empty when it opened.
+    pub fn frame_refusal(&self) -> &[String] {
+        &self.frame_refusal
     }
 
     /// Drops the planes and forgets the owning tab; the frame half is left
@@ -152,23 +154,52 @@ impl Canvas {
 
     /// Opens `path` as the left pane's source, creating the renderer first
     /// when this tab has never had planes to draw. A no-op when `path` is
-    /// already open; `None` drops whatever frame was open. Keeps the
-    /// reader's own refusal text on failure rather than a generic message.
+    /// already open or is the frame that last failed; `None` drops whatever
+    /// frame was open. A failed open names the frame as missing or changed
+    /// ([`job::frame_refusal_lines`]).
     pub fn set_frame(&mut self, path: Option<&Path>) {
+        if path.is_some() && self.failed_frame.as_deref() == path {
+            return;
+        }
         let renderer = self.renderer_mut();
         let Some(path) = path else {
             renderer.clear_frame();
-            self.frame_error = None;
+            self.frame_refusal.clear();
+            self.failed_frame = None;
             return;
         };
         if renderer.frame_path() == Some(path) {
             return;
         }
         match renderer.set_frame(path) {
-            Ok(()) => self.frame_error = None,
-            Err(err) => self.frame_error = Some(err.to_string()),
+            Ok(()) => {
+                self.frame_refusal.clear();
+                self.failed_frame = None;
+            }
+            Err(_) => {
+                self.frame_refusal = job::frame_refusal_lines(path);
+                self.failed_frame = Some(path.to_path_buf());
+            }
         }
     }
+}
+
+/// A fresh model for `lines`, or `None` when `current` already holds them:
+/// a pane's message lines are replaced only on a change, since a fresh model
+/// re-mounts every line.
+fn changed_lines(
+    current: slint::ModelRc<slint::SharedString>,
+    lines: &[String],
+) -> Option<slint::ModelRc<slint::SharedString>> {
+    if current
+        .iter()
+        .map(|line| line.to_string())
+        .eq(lines.iter().cloned())
+    {
+        return None;
+    }
+    let lines: Vec<slint::SharedString> = lines.iter().map(|line| line.as_str().into()).collect();
+    Some(slint::ModelRc::new(slint::VecModel::from(lines)))
 }
 
 /// Reconciles the open renderer cell with the active tab
@@ -184,12 +215,23 @@ pub fn repaint(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
 ) {
-    let feed = {
+    let (feed, render_started, message_lines) = {
         let loaded = canvas.borrow().tab();
         let mut controller = controller.lock().unwrap();
         controller.fit_if_unfitted();
-        controller.canvas_feed(loaded)
+        let feed = controller.canvas_feed(loaded);
+        (
+            feed,
+            controller.take_render_started(),
+            controller.composite_message_lines(),
+        )
     };
+    if render_started {
+        poll_checkpoint_render(app.as_weak(), controller.clone(), canvas.clone());
+    }
+    if let Some(lines) = changed_lines(app.get_composite_message_lines(), &message_lines) {
+        app.set_composite_message_lines(lines);
+    }
     match feed {
         CanvasFeed::Keep => {}
         CanvasFeed::Clear => canvas.borrow_mut().clear(),
@@ -216,7 +258,12 @@ pub fn repaint(
     app.set_zoom_readout(readout.into());
     app.set_project_loaded(project_loaded);
     app.set_frame_label(truncate_pane_label(&frame_label).into());
-    app.set_frame_message(canvas.borrow().frame_error().unwrap_or("").into());
+    if let Some(lines) = changed_lines(
+        app.get_frame_message_lines(),
+        canvas.borrow().frame_refusal(),
+    ) {
+        app.set_frame_message_lines(lines);
+    }
 
     let frame_redrawn = frame_draw.and_then(|draw| {
         let mut canvas = canvas.borrow_mut();
@@ -265,6 +312,26 @@ pub fn repaint(
             app.set_image_h(0.0);
         }
     }
+}
+
+/// Polls [`AppController::settle_checkpoint_render`] every [`job::POLL`]
+/// until the background render settles, then repaints -- the render's
+/// worker cannot reach the canvas.
+fn poll_checkpoint_render(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+) {
+    slint::Timer::single_shot(job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().settle_checkpoint_render() {
+            repaint(&app, &controller, &canvas);
+        } else {
+            poll_checkpoint_render(app_weak, controller, canvas);
+        }
+    });
 }
 
 /// Locks `controller`, runs `mutate` against it, then repaints if the
@@ -462,6 +529,7 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     push_job(app, &controller.job_view());
     push_settings_panel(app, &controller);
     push_images_panel(app, &controller);
+    push_checkpoint_panel(app, &controller);
     push_projects_overlay(app, &controller);
     push_divergence(app, &controller);
 }
@@ -770,6 +838,42 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
         }
         None => app.set_frame_warning_open(false),
     }
+}
+
+/// Pushes the `Checkpoints` panel's whole state -- [`push_images_panel`]'s
+/// twin.
+pub fn push_checkpoint_panel(app: &AppWindow, controller: &AppController) {
+    let panel = controller.checkpoints_panel();
+    let rows: Vec<GeneratedCheckpointEntry> = panel
+        .entries
+        .iter()
+        .map(|entry| GeneratedCheckpointEntry {
+            kind: if entry.separator_label.is_some() {
+                "separator".into()
+            } else {
+                "row".into()
+            },
+            label: entry.separator_label.clone().unwrap_or_default().into(),
+            algorithm: entry.algorithm.clone().into(),
+            time_text: entry.time_text.clone().into(),
+            top: entry.top,
+            selected: entry.selected,
+            // No next separator sticks solid once reached; a value far
+            // past any real content height so the "pushed out" comparison
+            // never trips.
+            next_separator_top: entry.next_separator_top.unwrap_or(1.0e7),
+        })
+        .collect();
+    let existing = app.get_checkpoint_rows();
+    if existing.row_count() == rows.len() {
+        for (i, row) in rows.into_iter().enumerate() {
+            existing.set_row_data(i, row);
+        }
+    } else {
+        app.set_checkpoint_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    }
+    app.set_checkpoint_content_height(panel.content_height);
+    app.set_checkpoint_scroll_y(panel.scroll_y);
 }
 
 /// Opens the Keep/Discard dialog while the active tab holds a parked run,
@@ -1702,6 +1806,54 @@ pub fn install(
                 .set_images_viewport_height(height)
         }
     });
+    // The `Checkpoints` panel's own scroll and selection -- `FFScrollbar`'s
+    // twin wiring above.
+    app.on_checkpoint_scrolled({
+        let controller = controller.clone();
+        move |delta| controller.lock().unwrap().scroll_checkpoints_panel(delta)
+    });
+    app.on_checkpoint_scrollbar_pointer({
+        let controller = controller.clone();
+        move |kind, y| {
+            let kind = match kind {
+                0 => PointerKind::Down,
+                2 => PointerKind::Move,
+                _ => PointerKind::Up,
+            };
+            controller
+                .lock()
+                .unwrap()
+                .checkpoints_scrollbar_pointer(kind, y);
+        }
+    });
+    app.on_checkpoint_scrollbar_dragged({
+        let controller = controller.clone();
+        move |y| controller.lock().unwrap().checkpoints_scrollbar_dragged(y)
+    });
+    app.on_checkpoint_viewport_height_changed({
+        let controller = controller.clone();
+        move |height| {
+            controller
+                .lock()
+                .unwrap()
+                .set_checkpoints_viewport_height(height)
+        }
+    });
+    controller
+        .lock()
+        .unwrap()
+        .set_checkpoints_viewport_height(app.get_checkpoint_viewport_height());
+    app.on_checkpoint_selected({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |c| {
+                c.select_checkpoint_row(i as usize)
+            })
+        }
+    });
+
     app.on_images_add_frames_requested({
         let controller = controller.clone();
         move || {
@@ -2115,6 +2267,7 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             push_divergence(app, &controller);
         }
         ShellEvent::ImagesChanged => push_images_panel(app, &controller.lock().unwrap()),
+        ShellEvent::CheckpointsChanged => push_checkpoint_panel(app, &controller.lock().unwrap()),
         ShellEvent::OverlayChanged => push_projects_overlay(app, &controller.lock().unwrap()),
         // A background load's own three events (`AppController::open_paths`).
         // The indicator's threshold and fade are the Slint region's own

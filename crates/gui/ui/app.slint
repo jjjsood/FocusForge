@@ -16,8 +16,8 @@ import { FFTabStrip, ProjectTabView } from "shell/tab_strip.slint";
 export { ProjectTabView }
 import { FFToolbar } from "shell/toolbar.slint";
 import { FFCanvas } from "shell/canvas.slint";
-import { FFDock, SettingsRow, SectionHeadView, ImageRowView } from "shell/dock.slint";
-export { SettingsRow, SectionHeadView, ImageRowView }
+import { FFDock, SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView } from "shell/dock.slint";
+export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFSettingsModal, InputRow, FFManifestRow } from "shell/settings_modal.slint";
 export { InputRow, FFManifestRow }
@@ -167,7 +167,10 @@ export component AppWindow inherits Window {
     // composite/Z-Map pair above.
     in property <image> frame-source;
     in property <string> frame-label: "";
-    in property <string> frame-message: "";
+    // Each pane's refusal, one entry per line: the selected frame's on the
+    // left, the current checkpoint's on the right.
+    in property <[string]> frame-message-lines: [];
+    in property <[string]> composite-message-lines: [];
     in property <bool> canvas-undock-enabled: true;
     // Whether a project is open -- governs the pane chrome (label, undock)
     // and the bottom bar's zoom cluster together, so nothing offers an
@@ -182,6 +185,18 @@ export component AppWindow inherits Window {
     // count, or the empty-state wording. Set from Rust alongside
     // `composite-ready` in `src/bridge.rs::push_projects`.
     in property <string> checkpoint-line: "None yet — fuse a stack";
+    // The `Checkpoints` panel: pushed from `AppController::checkpoints_panel`
+    // (`src/bridge.rs`) on every `ShellEvent::CheckpointsChanged`, forwarded
+    // one line into `FFDock`.
+    in property <[CheckpointEntryView]> checkpoint-rows: [];
+    in property <length> checkpoint-scroll-y: 0px;
+    in property <length> checkpoint-content-height: 0px;
+    callback checkpoint-selected(int);
+    callback checkpoint-scrolled(length);
+    callback checkpoint-scrollbar-pointer(int, length);
+    callback checkpoint-scrollbar-dragged(length);
+    callback checkpoint-viewport-height-changed(length);
+    out property <length> checkpoint-viewport-height: dock.checkpoint-viewport-height;
     callback composite-undock-requested();
     callback zmap-undock-requested();
     // Forwarded from `FFCanvas`'s own callbacks of the same shape -- the
@@ -251,7 +266,8 @@ export component AppWindow inherits Window {
             zmap-source: root.zmap-source;
             frame-source: root.frame-source;
             frame-label: root.frame-label;
-            frame-message: root.frame-message;
+            frame-message-lines: root.frame-message-lines;
+            composite-message-lines: root.composite-message-lines;
             undock-enabled: root.canvas-undock-enabled;
             project-loaded: root.project-loaded;
             composite-ready: root.composite-ready;
@@ -336,6 +352,9 @@ export component AppWindow inherits Window {
         dock-tab: root.dock-tab;
         project-loaded: root.project-loaded;
         checkpoint-line: root.checkpoint-line;
+        checkpoint-rows: root.checkpoint-rows;
+        checkpoint-scroll-y: root.checkpoint-scroll-y;
+        checkpoint-content-height: root.checkpoint-content-height;
         settings-rows: root.settings-rows;
         settings-sticky: root.settings-sticky;
         settings-scroll-y: root.settings-scroll-y;
@@ -355,6 +374,11 @@ export component AppWindow inherits Window {
         mode-selected(m) => { root.mode-selected(m); }
         dock-tab-selected(t) => { root.dock-tab-selected(t); }
         checkpoint-export-requested => { root.checkpoint-export-requested(); }
+        checkpoint-selected(i) => { root.checkpoint-selected(i); }
+        checkpoint-scrolled(delta) => { root.checkpoint-scrolled(delta); }
+        checkpoint-scrollbar-pointer(kind, y) => { root.checkpoint-scrollbar-pointer(kind, y); }
+        checkpoint-scrollbar-dragged(y) => { root.checkpoint-scrollbar-dragged(y); }
+        checkpoint-viewport-height-changed(h) => { root.checkpoint-viewport-height-changed(h); }
         settings-param-changed(section, id, f) => { root.settings-param-changed(section, id, f); }
         settings-param-text-edited(section, id, text) => { root.settings-param-text-edited(section, id, text); }
         settings-algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }

@@ -25,6 +25,7 @@ import { FFPanePlaceholder } from "components/ff_pane_placeholder.slint";
 import { FFSpinner } from "components/ff_spinner.slint";
 import { FFLoadingPanel } from "components/ff_loading_panel.slint";
 import { FFImageRow } from "components/ff_image_row.slint";
+import { FFCheckpointRow } from "components/ff_checkpoint_row.slint";
 import { FFDialog } from "components/ff_dialog.slint";
 import { FFDialogFooter } from "components/ff_dialog_footer.slint";
 import { FFChip } from "components/ff_chip.slint";
@@ -447,6 +448,36 @@ export component ThemeSheet inherits Window {
                 name: "05.tif";
                 time-text: "14:17:05";
                 selected: true;
+            }
+        }
+
+        GroupHeading { text: "Checkpoints list: row"; }
+        VerticalLayout {
+            spacing: 0px;
+            FFSectionHeading {
+                width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-content-inset;
+                label: "TODAY";
+                compact: true;
+                opaque: false;
+            }
+            FFCheckpointRow {
+                algorithm: "Laplacian Pyramid";
+                time-text: "16:42:08";
+                selected: true;
+            }
+            FFCheckpointRow {
+                algorithm: "dwt-wavelet";
+                time-text: "15:58:30";
+            }
+            FFSectionHeading {
+                width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-content-inset;
+                label: "YESTERDAY";
+                compact: true;
+                opaque: false;
+            }
+            FFCheckpointRow {
+                algorithm: "Laplacian Pyramid";
+                time-text: "21:08:12";
             }
         }
 

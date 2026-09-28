@@ -245,8 +245,13 @@ fn gui_run_matches_the_cli_run() {
         panic!("a seal request must report a sealed project");
     };
     let mut project = Project::open(&sealed.path).unwrap();
-    let (composite_path, _zmap_path) = job::materialize_planes(&mut project, &scratch)
-        .expect("the sealed project's composite must materialize");
+    let head = project.checkpoint().id.clone();
+    let job::CheckpointPlanes::Ready(composite_path, _zmap_path) =
+        job::fused_checkpoint_planes(&mut project, &scratch, &head)
+            .expect("the sealed project's composite must materialize")
+    else {
+        panic!("a freshly fused head must need no render");
+    };
     let sealed = focusforge_core::io::TiffStack::open_files(&[composite_path]).unwrap();
     let sealed_samples = sealed
         .read_tile(
@@ -1059,7 +1064,7 @@ fn checkpoint_panel_line_without_a_tab() {
 }
 
 #[test]
-fn checkpoint_panel_line_counts_each_run() {
+fn checkpoint_panel_rows_count_each_run() {
     let mut controller = controller_with_frames("panel_line_counts", 2);
     assert_eq!(
         controller.checkpoint_panel_line(),
@@ -1068,32 +1073,30 @@ fn checkpoint_panel_line_counts_each_run() {
 
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
-    assert_eq!(controller.checkpoint_panel_line(), "1 checkpoint");
+    assert_eq!(controller.checkpoints_panel().row_count, 1);
     assert!(
         controller.project_cards()[0]
             .meta_text
-            .ends_with(&controller.checkpoint_panel_line()),
-        "the panel and the card must quote the same count phrase"
+            .ends_with("1 checkpoint")
     );
 
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
-    assert_eq!(controller.checkpoint_panel_line(), "2 checkpoints");
+    assert_eq!(controller.checkpoints_panel().row_count, 2);
     assert!(
         controller.project_cards()[0]
             .meta_text
-            .ends_with(&controller.checkpoint_panel_line()),
-        "the panel and the card must quote the same count phrase"
+            .ends_with("2 checkpoints")
     );
 }
 
 #[test]
-fn checkpoint_panel_line_follows_the_active_tab() {
+fn checkpoint_panel_rows_follow_the_active_tab() {
     let mut controller = controller_with_two_tabs("panel_line_follows");
     controller.select_project(1);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
-    assert_eq!(controller.checkpoint_panel_line(), "1 checkpoint");
+    assert_eq!(controller.checkpoints_panel().row_count, 1);
 
     controller.select_project(0);
     assert_eq!(
@@ -1102,7 +1105,7 @@ fn checkpoint_panel_line_follows_the_active_tab() {
     );
 
     controller.select_project(1);
-    assert_eq!(controller.checkpoint_panel_line(), "1 checkpoint");
+    assert_eq!(controller.checkpoints_panel().row_count, 1);
 }
 
 #[test]
@@ -1119,10 +1122,11 @@ fn checkpoint_panel_is_pushed_with_the_projects() {
     let controller = std::sync::Arc::new(std::sync::Mutex::new(controller));
 
     focusforge_gui::bridge::push_projects(&app, &controller);
-    assert_eq!(app.get_checkpoint_line(), "1 checkpoint");
+    assert_eq!(slint::Model::row_count(&app.get_checkpoint_rows()), 1);
 
     controller.lock().unwrap().select_project(1);
     focusforge_gui::bridge::push_projects(&app, &controller);
+    assert_eq!(slint::Model::row_count(&app.get_checkpoint_rows()), 0);
     assert_eq!(app.get_checkpoint_line(), "None yet — fuse a stack");
 }
 
@@ -1289,7 +1293,7 @@ fn a_second_run_reports_its_own_completion_time() {
 
     let project_path = save_to_proposed(&mut controller);
     let project = Project::open(&project_path).unwrap();
-    let expected = job::format_utc_hhmm(project.checkpoint().created_at);
+    let expected = focusforge_gui::checkpoints::local_hhmm(project.checkpoint().created_at);
     assert_eq!(
         at, expected,
         "the idle line must reflect the head checkpoint's own time"
