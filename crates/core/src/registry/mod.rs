@@ -125,6 +125,46 @@ impl AlgorithmRef {
             AlgorithmRef::Align(_) => Family::Align,
         }
     }
+
+    pub fn test_only(&self) -> bool {
+        match self {
+            AlgorithmRef::Stack(a) => a.test_only(),
+            AlgorithmRef::Align(a) => a.test_only(),
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        match self {
+            AlgorithmRef::Stack(a) => a.is_default(),
+            AlgorithmRef::Align(a) => a.is_default(),
+        }
+    }
+}
+
+/// The algorithm of `family` to use when a caller names none: among the
+/// entries that are not test-only, the one marked [`AlgorithmRef::is_default`],
+/// else the sole entry. Several unmarked entries, or several marked ones,
+/// are refused naming the candidates; id order never settles it. Pure, like
+/// [`index`].
+fn default_in<I>(entries: I, family: Family) -> Result<AlgorithmRef, LookupError>
+where
+    I: IntoIterator<Item = AlgorithmRef>,
+{
+    let real: Vec<AlgorithmRef> = entries
+        .into_iter()
+        .filter(|e| e.family() == family && !e.test_only())
+        .collect();
+    let marked: Vec<AlgorithmRef> = real.iter().copied().filter(|e| e.is_default()).collect();
+    let candidates = match (marked.as_slice(), real.as_slice()) {
+        ([one], _) => return Ok(*one),
+        ([], [only]) => return Ok(*only),
+        ([], all) => all,
+        (several, _) => several,
+    };
+    Err(LookupError::NoDefault {
+        family,
+        candidates: candidates.iter().map(|e| e.id().to_string()).collect(),
+    })
 }
 
 /// Builds an id-keyed index over `entries`, failing on the first id claimed
@@ -253,6 +293,25 @@ pub fn find_align(id: &str) -> Result<&'static dyn AlignAlgorithm, LookupError> 
             actual: Family::Stack,
             wanted: Family::Align,
         }),
+    }
+}
+
+/// The stacking algorithm to use when the caller names none; the rule is
+/// [`default_align`]'s.
+pub fn default_stack() -> Result<&'static dyn StackAlgorithm, LookupError> {
+    match default_in(index_of_registrations().values().copied(), Family::Stack)? {
+        AlgorithmRef::Stack(a) => Ok(a),
+        AlgorithmRef::Align(_) => unreachable!("default_in keeps only the requested family"),
+    }
+}
+
+/// The alignment algorithm to use when the caller names none: the one
+/// non-test-only registration marked default, else the sole non-test-only
+/// one; otherwise [`LookupError::NoDefault`].
+pub fn default_align() -> Result<&'static dyn AlignAlgorithm, LookupError> {
+    match default_in(index_of_registrations().values().copied(), Family::Align)? {
+        AlgorithmRef::Align(a) => Ok(a),
+        AlgorithmRef::Stack(_) => unreachable!("default_in keeps only the requested family"),
     }
 }
 

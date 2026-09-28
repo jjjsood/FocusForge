@@ -58,4 +58,24 @@ pub enum LookupError {
         actual: Family,
         wanted: Family,
     },
+
+    /// No id was given and the family has no single default: `candidates`
+    /// is empty when nothing non-test-only is registered, otherwise it names
+    /// every algorithm the caller could pick from.
+    #[error("{}", no_default_message(*family, candidates))]
+    NoDefault {
+        family: Family,
+        candidates: Vec<String>,
+    },
+}
+
+fn no_default_message(family: Family, candidates: &[String]) -> String {
+    if candidates.is_empty() {
+        format!("no {family} algorithm is registered")
+    } else {
+        format!(
+            "multiple {family} algorithms are registered; pass an id to choose one: {}",
+            candidates.join(", ")
+        )
+    }
 }

@@ -203,6 +203,9 @@ fn open_fixture_tab(
         common::open_and_settle(controller, std::slice::from_ref(&root)),
         OpenOutcome::Opened(_)
     ));
+    // Canvas feeding is under test, not alignment quality; an algorithm that
+    // always converges keeps every run clean.
+    controller.set_align_algorithm("dummy-align");
     root
 }
 

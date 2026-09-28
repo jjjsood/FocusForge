@@ -30,7 +30,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
-use focusforge_core::io::{Rect, TiffStack};
+use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::{self, ParamValues, StackContext};
 use focusforge_core::registry;
 use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
@@ -1124,6 +1124,12 @@ fn failed_seal_leaves_no_output() {
 
 #[test]
 fn refuses_a_non_uniform_frame_set() {
+    // `reference.tif` and `reference-MM-rps8.tif` are pixel-identical and
+    // differ only in byte order and RowsPerStrip -- exactly the two fields
+    // `check_uniform` deliberately does not compare (crates/core/src/io/tiff/
+    // stack.rs). A genuine mismatch needs a frame that differs in a field
+    // the check does cover, so this writes one at a different resolution
+    // rather than reusing that pair.
     let mantis_64 = common::fixtures_dir().join("mantis-64");
     let cwd = tmp_dir("refuses_a_non_uniform_frame_set");
     let frames = cwd.join("frames");
@@ -1133,11 +1139,30 @@ fn refuses_a_non_uniform_frame_set() {
         frames.join("reference.tif"),
     )
     .unwrap();
-    std::fs::copy(
-        mantis_64.join("reference-MM-rps8.tif"),
-        frames.join("reference-MM-rps8.tif"),
+
+    let outlier = frames.join("outlier.tif");
+    let mut writer = TiffWriter::create(
+        &outlier,
+        TiffSpec {
+            width: 32,
+            height: 32,
+            samples_per_pixel: 3,
+            description: None,
+        },
     )
-    .unwrap();
+    .expect("outlier writer must create");
+    writer
+        .write_tile(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 32,
+            },
+            &vec![0u16; 32 * 32 * 3],
+        )
+        .expect("outlier writer must accept its one tile");
+    writer.finish().expect("outlier writer must finish");
 
     let output = frames.join("mantis-512.ffp");
     let out = run_cli_in(
@@ -1157,7 +1182,7 @@ fn refuses_a_non_uniform_frame_set() {
         out.stdout, out.stderr
     );
     assert!(
-        out.stderr.contains("reference-MM-rps8.tif"),
+        out.stderr.contains("outlier.tif"),
         "must name the outlier: {}",
         out.stderr
     );

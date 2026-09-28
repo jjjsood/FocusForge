@@ -21,6 +21,8 @@ mod parity;
 mod parity_fusion;
 #[path = "harness/parity_pipeline.rs"]
 mod parity_pipeline;
+#[path = "harness/parity_recomposite.rs"]
+mod parity_recomposite;
 #[path = "harness/parity_tonemap.rs"]
 mod parity_tonemap;
 #[path = "harness/parity_warp.rs"]

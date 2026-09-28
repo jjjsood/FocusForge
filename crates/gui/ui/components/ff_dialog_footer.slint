@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// A dialog's own button row: `Cancel` at the left, an optional secondary
-// button and the confirm button grouped at the right.
+// A dialog's own button row: the quiet cancel button at the left, an
+// optional secondary button and the confirm button grouped at the right.
 
 import { Theme } from "../theme.slint";
 import { FFButton } from "ff_button.slint";
 
 export component FFDialogFooter inherits Rectangle {
+    in property <string> cancel-label: "Cancel";
     in property <string> secondary-label: "";
     in property <string> confirm-label: "Confirm";
     // "primary" | "danger" -- the confirm button's own tone.
@@ -23,7 +24,7 @@ export component FFDialogFooter inherits Rectangle {
         FFButton {
             width: 70px;
             kind: "quiet";
-            text: "Cancel";
+            text: root.cancel-label;
             clicked => { root.cancelled(); }
         }
 
