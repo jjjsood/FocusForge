@@ -69,7 +69,6 @@ fn write_frame(path: &Path, variant: u16) -> Vec<u16> {
 /// matches no source pixel, and an ancestor Z-Map cycling through the three
 /// frames.
 struct Root {
-    dir: PathBuf,
     project_path: PathBuf,
     source_paths: Vec<PathBuf>,
     transforms: Vec<Transform>,
@@ -150,7 +149,6 @@ fn seal_root(name: &str) -> Root {
     .expect("seal must succeed");
 
     Root {
-        dir,
         project_path,
         source_paths,
         transforms,
@@ -322,8 +320,6 @@ fn op_bearing_render_is_ancestor_composite_plus_splice() {
     );
     let flat = flatten(&bands);
     assert_eq!(flat, expected);
-
-    let _ = &root.dir;
 }
 
 #[test]

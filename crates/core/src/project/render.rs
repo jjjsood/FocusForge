@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Rendering any checkpoint's image, fused or op-bearing, band by band.
+//! Renders any checkpoint's image, fused or op-bearing, band by band.
 //!
-//! A fused checkpoint's image is its own [`FuseRecord::composite`], streamed
-//! straight out of the container. An op-bearing checkpoint's image is its
-//! nearest fused ancestor's composite with the pixels its replayed Z-Map
-//! disagrees with spliced in from a gather over the ancestor's aligned,
-//! cropped sources -- everywhere else, the ancestor's stored composite.
+//! A fused checkpoint streams its own [`FuseRecord::composite`]. An
+//! op-bearing checkpoint splices its nearest fused ancestor's composite,
+//! replacing pixels where its replayed Z-Map disagrees with a gather over
+//! the ancestor's aligned, cropped sources.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,11 +53,10 @@ type RenderSink<'a> = dyn FnMut(&[u16], Rect) -> Result<(), ProjectError> + 'a;
 
 impl CheckpointImage {
     /// Resolves `id` against `project`, refusing an unknown id
-    /// ([`ProjectError::UnknownCheckpoint`]), an older fuse with no record
-    /// ([`ProjectError::FuseStateUnknown`]), and -- for a checkpoint whose
-    /// nearest fused ancestor is not itself -- unrecorded alignment
-    /// ([`ProjectError::RenderAlignmentUnrecorded`]) or a source that is
-    /// missing or has changed on disk
+    /// ([`ProjectError::UnknownCheckpoint`]), a fuse ancestor with no
+    /// recorded state ([`ProjectError::FuseStateUnknown`]), unrecorded
+    /// alignment ([`ProjectError::RenderAlignmentUnrecorded`]), or sources
+    /// missing or changed on disk
     /// ([`ProjectError::RenderSourcesUnavailable`]).
     pub fn prepare(project: &Project, id: &str) -> Result<Self, ProjectError> {
         let checkpoint = project.history().get(id)?.clone();

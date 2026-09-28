@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Its own test binary, holding only the one memory test: a counting
-//! `#[global_allocator]` is process-wide, so it must never share a binary
-//! with a sibling test that would inflate its reading.
-//!
-//! # Safety
-//!
-//! `GlobalAlloc` is an `unsafe trait`; there is no way to measure live heap
-//! bytes without implementing it. Dev-only measurement scaffolding for this
-//! one test binary, never shipped as part of `crates/core`'s library crate.
+//! Its own test binary: a counting `#[global_allocator]` is process-wide,
+//! so it must never share a binary with a sibling test that would inflate
+//! its reading. Measuring live heap bytes requires implementing the
+//! `unsafe` `GlobalAlloc` trait below.
 #![allow(unsafe_code)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
