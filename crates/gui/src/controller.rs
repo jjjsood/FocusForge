@@ -434,11 +434,6 @@ impl ProjectTab {
         self.frames == fused
     }
 
-    /// Permutes `frames` and `excluded` together by `order` (each entry the
-    /// original index now at that position) -- what a manual drag and a sort
-    /// both apply, so an exclusion stays attached to the frame it was set on
-    /// rather than to a position. `selected` follows the same frame to its
-    /// new position.
     /// Reads the metadata of every frame `meta` does not hold yet.
     fn read_missing_meta(&mut self) {
         let missing: Vec<PathBuf> = self
@@ -450,6 +445,11 @@ impl ProjectTab {
         self.meta.extend(images::read_metadata(&missing));
     }
 
+    /// Permutes `frames` and `excluded` together by `order` (each entry the
+    /// original index now at that position) -- what a manual drag and a sort
+    /// both apply, so an exclusion stays attached to the frame it was set on
+    /// rather than to a position. `selected` follows the same frame to its
+    /// new position.
     fn reorder(&mut self, order: &[usize]) {
         let old_frames = std::mem::take(&mut self.frames);
         let old_excluded = std::mem::take(&mut self.excluded);
