@@ -240,8 +240,10 @@ inventory::submit! { StackRegistration::new(&DepthMap) }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tile::Rect;
-    use crate::tile::plan::{DEFAULT_TILE_SIZE, margin_for_levels, min_tile_size_for_levels};
+    use crate::tile::plan::{
+        DEFAULT_TILE_SIZE, TilePlan, margin_for_levels, min_tile_size_for_levels,
+    };
+    use crate::tile::{Rect, TileError};
 
     fn rect(width: u32, height: u32) -> Rect {
         Rect {
@@ -285,6 +287,66 @@ mod tests {
             ParamValue::Int(smoothing_radius),
         );
         cfg
+    }
+
+    fn declared_int_max(id: &str) -> i64 {
+        PARAMS
+            .iter()
+            .find(|parameter| parameter.id == id)
+            .and_then(|parameter| match &parameter.kind {
+                ParamKind::Int { max, .. } => Some(*max),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{id} must be declared as an integer parameter"))
+    }
+
+    #[test]
+    fn shipped_radius_ranges_defaults_and_endpoints_remain_validated() {
+        for (id, default) in [
+            ("score-radius", SCORE_RADIUS_DEFAULT),
+            ("smoothing-radius", SMOOTHING_RADIUS_DEFAULT),
+        ] {
+            let parameter = PARAMS
+                .iter()
+                .find(|parameter| parameter.id == id)
+                .unwrap_or_else(|| panic!("{id} must be declared"));
+            assert!(matches!(
+                &parameter.kind,
+                ParamKind::Int { min: 0, max: 16 }
+            ));
+            assert_eq!(parameter.default, ParamValue::Int(default));
+        }
+
+        let algo = DepthMap;
+        let (width, height, spp) = (64, 64, 3);
+        let tiles = vec![tile_of(
+            width,
+            height,
+            spp,
+            checkerboard(width, height, spp),
+        )];
+        let ctx = TileCtx::new(rect(width, height), &tiles);
+        for (score_radius, smoothing_radius) in [(0, 8), (4, 0), (16, 8), (4, 16), (16, 16)] {
+            algo.fuse(&ctx, &cfg(score_radius, smoothing_radius))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "score-radius={score_radius} smoothing-radius={smoothing_radius} must fuse: {error}"
+                    )
+                });
+        }
+        for (score_radius, smoothing_radius, parameter) in
+            [(17, 8, "score-radius"), (4, 17, "smoothing-radius")]
+        {
+            let error = algo
+                .fuse(&ctx, &cfg(score_radius, smoothing_radius))
+                .expect_err("one above the bound must be refused");
+            assert!(
+                error.to_string().contains(&format!(
+                    "{parameter}: value 17 is outside the allowed range [0, 16]"
+                )),
+                "error: {error}"
+            );
+        }
     }
 
     #[test]
@@ -384,8 +446,10 @@ mod tests {
     #[test]
     fn declared_ranges_fit_the_shipped_geometry() {
         let algo = DepthMap;
-        for score_radius in 0..=16i64 {
-            for smoothing_radius in 0..=16i64 {
+        let max_score_radius = declared_int_max("score-radius");
+        let max_smoothing_radius = declared_int_max("smoothing-radius");
+        for score_radius in 0..=max_score_radius {
+            for smoothing_radius in 0..=max_smoothing_radius {
                 let cfg = cfg(score_radius, smoothing_radius);
                 let levels = algo.tile_levels(&cfg);
                 let reach = DETAIL_REACH + score_radius as u32 + smoothing_radius as u32;
@@ -403,6 +467,22 @@ mod tests {
                 );
             }
         }
+        let cfg = cfg(max_score_radius, max_smoothing_radius);
+        let levels = algo.tile_levels(&cfg);
+        let minimum = min_tile_size_for_levels(levels);
+        assert!(
+            TilePlan::new(minimum, minimum, minimum, levels).is_ok(),
+            "score-radius={max_score_radius} smoothing-radius={max_smoothing_radius}: \
+             the reported minimum tile {minimum} must plan"
+        );
+        assert!(
+            matches!(
+                TilePlan::new(minimum, minimum, minimum - 1, levels),
+                Err(TileError::NoInterior { min_tile_size, .. }) if min_tile_size == minimum
+            ),
+            "score-radius={max_score_radius} smoothing-radius={max_smoothing_radius}: \
+             one pixel below the reported minimum {minimum} must be refused"
+        );
     }
 
     #[test]
