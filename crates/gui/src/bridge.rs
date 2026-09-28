@@ -27,6 +27,9 @@ use crate::diagnostics::{
     record_coalesced_input, record_destroyed_window, record_input, record_shared_input,
     take_published_input,
 };
+use crate::diagnostics::{
+    TimingCounter, measurement_scope, measurement_scope_with_fields, record_timing,
+};
 use crate::generated::{
     AppWindow, FFManifestRow, ImageRowView as GeneratedImageRow,
     ProjectCardView as GeneratedProjectCard, ProjectTabView, RecentRowView as GeneratedRecentRow,
@@ -37,9 +40,6 @@ use crate::input_map::{Button, Modifiers, PointerKind};
 use crate::job;
 use crate::settings_panel::{HeadingState, RowKind};
 use crate::viewport::PaneRect;
-use focusforge_core::timing::{
-    TimingCounter, measurement_scope, measurement_scope_with_fields, record_timing,
-};
 
 /// `slint::platform::PointerEventButton` -> `input_map::Button` -- the only
 /// place in the crate that names the Slint type.
@@ -319,9 +319,7 @@ fn direct_publication_scope(surface: InputSurface) {
     }
 }
 
-fn model_publication_scope(
-    event: &ShellEvent,
-) -> Option<focusforge_core::timing::MeasurementScope> {
+fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::MeasurementScope> {
     let surface = match event {
         ShellEvent::WindowMaximizeToggled(_)
         | ShellEvent::ModeChanged(_)
@@ -2501,7 +2499,7 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
+    use crate::diagnostics::{enable_trace_accounting, timing_snapshot};
 
     use super::{
         AppController, DockTab, ShellEvent, finish_input_trace, model_publication_scope,
@@ -2615,5 +2613,55 @@ mod tests {
         assert_eq!(finish_input_batches(), [None, None, None, None, None]);
         let after = timing_snapshot().expect("trace accounting remains enabled");
         assert_eq!(after.admitted, before.admitted + 10);
+    }
+
+    /// The test above proves the accounting machinery; it never proves a
+    /// live callback reaches it -- calling `record_images_input` directly
+    /// would still pass if an Images callback were misrouted to `Other`.
+    /// This drives the real generated callbacks through an installed,
+    /// headless window instead.
+    #[test]
+    fn images_callbacks_invoked_through_the_real_window_record_the_images_surface() {
+        const CHILD: &str = "FOCUSFORGE_GUI_IMAGES_CALLBACK_TRACE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("the test binary has a path"),
+            )
+            .args([
+                "--exact",
+                "bridge::tests::images_callbacks_invoked_through_the_real_window_record_the_images_surface",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("the isolated callback-routing test starts");
+            assert!(
+                status.success(),
+                "the isolated callback-routing test passes: {status}"
+            );
+            return;
+        }
+
+        i_slint_backend_testing::init_no_event_loop();
+        enable_trace_accounting();
+
+        let app = super::AppWindow::new().unwrap();
+        let controller = Arc::new(Mutex::new(AppController::new()));
+        let canvas = std::rc::Rc::new(std::cell::RefCell::new(super::Canvas::default()));
+        let _installed = super::install(&app, controller.clone(), canvas);
+
+        app.invoke_images_frame_excluded_toggled(0);
+        app.invoke_frame_warning_cancelled();
+
+        let batches = finish_input_batches();
+        let images = batches[2].expect("both real callbacks must record under the Images surface");
+        assert_eq!(images.count, 2);
+        assert!(
+            batches[0].is_none()
+                && batches[1].is_none()
+                && batches[3].is_none()
+                && batches[4].is_none(),
+            "neither callback may be recorded under any other surface: {batches:?}"
+        );
     }
 }

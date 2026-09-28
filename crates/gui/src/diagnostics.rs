@@ -10,6 +10,16 @@
 use std::cell::RefCell;
 
 use focusforge_core::timing::timing_enabled;
+/// The one re-export of `focusforge_core::timing` outside this module --
+/// every other GUI file reaches it through `crate::diagnostics`, never
+/// `focusforge_core` directly (`crates/gui/tests/shell.rs`'s
+/// `checkpoint_panel_touches_no_storage`).
+pub(crate) use focusforge_core::timing::{
+    MeasurementScope, TimingCounter, measurement_scope, measurement_scope_with_fields,
+    record_timing,
+};
+#[cfg(test)]
+pub(crate) use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
 
 thread_local! {
     static INPUT_TRACE: RefCell<InputTrace> = RefCell::new(InputTrace::default());

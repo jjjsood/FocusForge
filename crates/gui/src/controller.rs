@@ -22,11 +22,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use focusforge_core::timing::measurement_scope;
-
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
-    DiagnosticsView, clamp_manifest_scroll, manifest_content_height, size_text,
+    DiagnosticsView, clamp_manifest_scroll, manifest_content_height, measurement_scope, size_text,
 };
 use crate::entry;
 use crate::images;

@@ -168,15 +168,19 @@ fn checkpoint_panel_touches_no_storage() {
     assert!(!controller.export_enabled());
 
     // The canvas legitimately touches storage (a project's TIFFs),
-    // `input_config.rs` is a config file, and `settings_panel.rs` is the one
-    // module allowed to name the schema/registry crate. Excluded by name:
-    // this test's own subject is the checkpoint panel, not the whole crate.
+    // `input_config.rs` is a config file, `settings_panel.rs` is the one
+    // module allowed to name the schema/registry crate, and `diagnostics.rs`
+    // is the one module allowed to name the timing/measurement API --
+    // every other file reaches it through `crate::diagnostics`, never
+    // `focusforge_core` directly. Excluded by name: this test's own subject
+    // is the checkpoint panel, not the whole crate.
     let canvas_files = [
         "canvas.rs",
         "gpu_canvas.rs",
         "entry.rs",
         "input_config.rs",
         "settings_panel.rs",
+        "diagnostics.rs",
         "job.rs",
         "images.rs",
         "overlay.rs",
