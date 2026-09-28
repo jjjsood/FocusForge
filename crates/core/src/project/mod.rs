@@ -64,7 +64,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-pub use append::{AppendRequest, ZMapStorage, append, append_at, append_ops, append_ops_at};
+pub use append::{
+    AppendRequest, SNAPSHOT_BYTE_BUDGET, SNAPSHOT_CHECKPOINT_CAP, ZMapChain, ZMapStorage, append,
+    append_at, append_ops, append_ops_at,
+};
 pub use blob::{Plane, StagedBlob, hash_file, short_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, Op, Point};
 pub use container::{ProjectWriter, partial_path};
@@ -440,6 +443,21 @@ impl Project {
     /// down to the original parentless one.
     pub fn checkpoint_chain(&mut self) -> Result<Vec<Checkpoint>, ProjectError> {
         checkpoint_chain_from(&mut self.archive, &self.path, &self.checkpoint.id)
+    }
+
+    /// The path from `checkpoint`'s own Z-Map back to its nearest full
+    /// snapshot: the snapshot's own compressed size, and the count and
+    /// total compressed size of the deltas resolved on top of it. Never
+    /// refuses on length -- a chain longer than today's cap, written by an
+    /// older or newer build, must still open.
+    pub fn zmap_chain(&self, checkpoint: &Checkpoint) -> Result<ZMapChain, ProjectError> {
+        let (base, deltas) =
+            resolve_chain(&self.manifest.blobs, &checkpoint.zmap_blob, &self.path)?;
+        Ok(ZMapChain {
+            snapshot_bytes: base.compressed_len,
+            deltas: deltas.len(),
+            delta_bytes: deltas.iter().map(|d| d.compressed_len).sum(),
+        })
     }
 
     /// Where one recorded source is looked for: relative to the project's

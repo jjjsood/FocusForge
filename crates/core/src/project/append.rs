@@ -243,17 +243,55 @@ fn copy_forward(
     Ok(())
 }
 
-/// Whether [`append_ops`] stores a checkpoint's Z-Map as a patch against its
-/// parent's materialized map (whichever compresses smaller) or always
-/// stores it in full. Callers other than [`append_ops`] itself decide when
-/// each is appropriate; this type only names the two mechanisms.
+/// Whether a checkpoint's Z-Map is stored as a patch against its parent's
+/// materialized map (whichever compresses smaller), the same choice capped
+/// by the snapshot cadence, or always in full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZMapStorage {
     /// Store whichever of a full map and a patch against the parent
-    /// compresses smaller.
+    /// compresses smaller, with no cap on how long the resulting chain
+    /// grows.
     Smallest,
+    /// [`Self::Smallest`], except a full map is stored whenever the
+    /// parent's [`ZMapChain::needs_snapshot`] is true.
+    Bounded,
     /// Always store the full map.
     Full,
+}
+
+/// The byte-budget half of the snapshot cadence: a checkpoint is forced
+/// full once the deltas already written since the last snapshot outweigh
+/// that snapshot's own compressed size by this multiple. A ratio rather
+/// than a fixed byte count, so the same rule self-tunes across map sizes
+/// that differ by orders of magnitude instead of being tuned for one.
+pub const SNAPSHOT_BYTE_BUDGET: u64 = 1;
+
+/// The count half of the snapshot cadence: a checkpoint is forced full once
+/// this many deltas already follow the last snapshot, regardless of their
+/// bytes -- the case the byte budget alone cannot see, a long run of edits
+/// each too small to ever outweigh the snapshot.
+pub const SNAPSHOT_CHECKPOINT_CAP: usize = 32;
+
+/// What [`super::Project::zmap_chain`] reports about the path from a
+/// checkpoint's Z-Map back to its nearest full snapshot: the snapshot's own
+/// compressed size, and the count and total compressed size of the deltas
+/// resolved on top of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZMapChain {
+    pub snapshot_bytes: u64,
+    pub deltas: usize,
+    pub delta_bytes: u64,
+}
+
+impl ZMapChain {
+    /// Whether the cadence forces the next checkpoint on this chain to be a
+    /// full snapshot: [`SNAPSHOT_CHECKPOINT_CAP`] deltas already follow the
+    /// last snapshot, or their bytes already exceed it by
+    /// [`SNAPSHOT_BYTE_BUDGET`].
+    pub fn needs_snapshot(&self) -> bool {
+        self.deltas >= SNAPSHOT_CHECKPOINT_CAP
+            || self.delta_bytes > self.snapshot_bytes.saturating_mul(SNAPSHOT_BYTE_BUDGET)
+    }
 }
 
 /// Seals `ops` as a new checkpoint onto `project_path`'s head, stamping the
@@ -262,19 +300,20 @@ pub enum ZMapStorage {
 /// never opened or rehashed: the new checkpoint's `stack_fingerprint`,
 /// `algorithm` and `params` are carried forward from the head unchanged, and
 /// the manifest's `composite` keeps naming the fused ancestor's plane -- only
-/// a new Z-Map blob is written, as whichever of [`ZMapStorage::Smallest`]'s
-/// two encodings compresses smaller.
+/// a new Z-Map blob is written, as whichever of [`ZMapStorage::Bounded`]'s
+/// two encodings compresses smaller, or in full once the snapshot cadence
+/// requires it.
 pub fn append_ops(
     project_path: &Path,
     ops: Vec<Op>,
     label: Option<String>,
 ) -> Result<SealedProject, ProjectError> {
-    append_ops_at(project_path, ops, label, now_unix(), ZMapStorage::Smallest)
+    append_ops_at(project_path, ops, label, now_unix(), ZMapStorage::Bounded)
 }
 
 /// [`append_ops`] with the creation timestamp supplied rather than read from
 /// the clock, and the Z-Map storage choice supplied rather than always
-/// [`ZMapStorage::Smallest`].
+/// [`ZMapStorage::Bounded`].
 pub fn append_ops_at(
     project_path: &Path,
     ops: Vec<Op>,
@@ -304,6 +343,26 @@ pub fn append_ops_at(
     let result = append_ops_staged(project_path, &ops, label, created_at, &staging, storage);
     let _ = std::fs::remove_dir_all(&staging);
     result
+}
+
+/// The smaller-of-two choice [`ZMapStorage::Smallest`] and
+/// [`ZMapStorage::Bounded`] share once a delta is worth trying at all.
+fn stage_smallest_delta(
+    full: &StagedBlob,
+    info: ZMapInfo,
+    tile: Rect,
+    indices: &[u16],
+    staging: &Path,
+) -> Result<Option<StagedBlob>, ProjectError> {
+    let delta = blob::stage_delta(
+        info.width(),
+        info.height(),
+        tile,
+        indices,
+        ZSTD_LEVEL,
+        staging,
+    )?;
+    Ok((delta.compressed_len < full.compressed_len).then_some(delta))
 }
 
 fn append_ops_staged(
@@ -390,19 +449,17 @@ fn append_ops_staged(
 
     // A patch against the parent's own materialized map, kept only when it
     // compresses smaller than storing the whole map again -- never for
-    // `ZMapStorage::Full`, and never when the edit touched nearly every
-    // pixel, which a patch cannot beat.
+    // `ZMapStorage::Full`, never when the edit touched nearly every pixel,
+    // which a patch cannot beat, and never past `ZMapStorage::Bounded`'s
+    // snapshot cadence, which forces a full map instead.
     let delta = match storage {
-        ZMapStorage::Smallest => {
-            let delta = blob::stage_delta(
-                info.width(),
-                info.height(),
-                tile,
-                &indices,
-                ZSTD_LEVEL,
-                staging,
-            )?;
-            (delta.compressed_len < full.compressed_len).then_some(delta)
+        ZMapStorage::Smallest => stage_smallest_delta(&full, info, tile, &indices, staging)?,
+        ZMapStorage::Bounded => {
+            if project.zmap_chain(&head)?.needs_snapshot() {
+                None
+            } else {
+                stage_smallest_delta(&full, info, tile, &indices, staging)?
+            }
         }
         ZMapStorage::Full => None,
     };
