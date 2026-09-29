@@ -4785,7 +4785,8 @@ impl AppController {
 
     /// Adds `held` to tab `index` as its newest checkpoint, re-seeding the
     /// frame list from the tab's own last request, and returns its composite
-    /// and Z-Map paths for the canvas.
+    /// and Z-Map paths for the canvas. Switches the shell into Editor mode
+    /// when `index` is the tab currently in view.
     fn commit_held(&mut self, index: usize, held: job::HeldCheckpoint) -> (PathBuf, PathBuf) {
         let tab = &mut self.state.projects[index];
         tab.checkpoints += 1;
@@ -4805,7 +4806,17 @@ impl AppController {
         // set) -- refit on the next `fit_if_unfitted` rather than keep
         // drawing the old extent's zoom/pan.
         tab.viewport = None;
+        self.enter_editor_if_viewing(index);
         planes
+    }
+
+    /// Switches into Editor mode when `index` is the tab currently in view --
+    /// a fuse that commits on a tab the user has since navigated away from
+    /// leaves the shell where it is.
+    fn enter_editor_if_viewing(&mut self, index: usize) {
+        if self.state.active == Some(index) {
+            self.set_mode(ShellMode::Editor);
+        }
     }
 
     /// The frames the active tab's parked run could not align, by file name;

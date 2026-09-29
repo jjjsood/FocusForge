@@ -22,7 +22,7 @@ use focusforge_gui::canvas::CanvasFeed;
 use focusforge_gui::input_map::Modifiers;
 use focusforge_gui::job;
 use focusforge_gui::viewport::PaneRect;
-use focusforge_gui::{AppController, ChromeKey, OpenOutcome, ShellEvent};
+use focusforge_gui::{AppController, ChromeKey, OpenOutcome, ShellEvent, ShellMode};
 
 // ---------------------------------------------------------------------
 // Fixture helpers -- copies only, never the committed fixture directory
@@ -2411,6 +2411,10 @@ fn frames_dir(name: &str) -> PathBuf {
 fn fuse_and_settle(controller: &mut AppController) {
     assert!(controller.start_fuse());
     common::wait_for_settle(controller, Duration::from_secs(120)).expect("the fuse must complete");
+    // A commit now auto-enters Editor on the viewed tab; this file's tests
+    // build fixtures through repeated fuses and frame-set changes, which are
+    // Stacking-only, so back out to that baseline after every fuse.
+    controller.set_mode(ShellMode::Stacking);
 }
 
 #[test]
