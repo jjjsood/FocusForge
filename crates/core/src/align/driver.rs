@@ -47,6 +47,7 @@ use rayon::prelude::*;
 
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, AlignStatus, TileReader};
 use crate::align::Transform;
+use crate::job::{ControlState, JobControl};
 use crate::params::{ParamValue, ParamValues, StackContext};
 use crate::tile::plan::DEFAULT_TILE_SIZE;
 
@@ -139,8 +140,7 @@ pub const DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT: usize = 2 * (1 << 30);
 /// `crate::tile::TileSchedulerOptions`, minus its `scratch_base`: every
 /// field here is a pure number, so (unlike that type) this one carries a
 /// `Default`.
-#[derive(Debug, Clone)]
-pub struct AlignDriverOptions {
+pub struct AlignDriverOptions<'a> {
     /// How many bytes of concurrent [`bytes_per_registration`] this driver
     /// may hold live in the anchor arm. See `workers_for_budget` (private to
     /// this module) for the arithmetic this bounds.
@@ -149,13 +149,28 @@ pub struct AlignDriverOptions {
     /// frame included, in completion order -- `None` when the caller has
     /// nowhere to report it.
     pub frames_done: Option<Arc<AtomicUsize>>,
+    /// The run's control, read at the top of every frame's registration:
+    /// once it reads `CancelRequested`, no further registration starts, the
+    /// ones in flight finish, and the run returns
+    /// [`AlgorithmError::Cancelled`]. Once it reads `PauseRequested` **and**
+    /// [`Self::on_pause`] is set, the same boundary calls the hook and
+    /// re-checks after it returns, holding again while the state is still
+    /// `PauseRequested`. With no hook a pause is not honoured at all: the
+    /// run registers straight through it.
+    pub control: Option<Arc<JobControl>>,
+    /// Called once per pause, at the same frame boundary as `control`,
+    /// **on the thread that called [`align_stack_with`]** -- never from a
+    /// pool worker.
+    pub on_pause: Option<&'a (dyn Fn(&JobControl) + Sync)>,
 }
 
-impl Default for AlignDriverOptions {
+impl Default for AlignDriverOptions<'_> {
     fn default() -> Self {
         AlignDriverOptions {
             max_bytes_in_flight: DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT,
             frames_done: None,
+            control: None,
+            on_pause: None,
         }
     }
 }
@@ -294,6 +309,28 @@ fn credit_frame_done(counter: Option<&AtomicUsize>) {
     }
 }
 
+/// The frame-boundary check every registration site in every arm makes
+/// before it starts: [`AlgorithmError::Cancelled`] once `options.control`
+/// reads `CancelRequested`; a hold, calling `options.on_pause` and
+/// re-checking, for as long as it reads `PauseRequested` and a hook is set.
+/// A `control` with no hook set does not hold -- see
+/// [`AlignDriverOptions::on_pause`].
+fn wait_at_boundary(options: &AlignDriverOptions<'_>) -> Result<(), AlgorithmError> {
+    let Some(control) = options.control.as_deref() else {
+        return Ok(());
+    };
+    loop {
+        match control.state() {
+            ControlState::CancelRequested => return Err(AlgorithmError::Cancelled),
+            ControlState::PauseRequested => match options.on_pause {
+                Some(hook) => hook(control),
+                None => return Ok(()),
+            },
+            ControlState::Running => return Ok(()),
+        }
+    }
+}
+
 /// The identity [`FrameAlignment`] every reference frame gets, without a
 /// solver call.
 fn identity_alignment(frame: usize) -> FrameAlignment {
@@ -344,11 +381,12 @@ fn run_chain_leg(
     frames: &mut [Option<FrameAlignment>],
     indices: impl Iterator<Item = usize>,
     reference: usize,
-    frames_done: Option<&AtomicUsize>,
+    options: &AlignDriverOptions<'_>,
 ) -> Result<(), AlgorithmError> {
     let mut previous = reference;
     let mut prefix = Transform::identity();
     for i in indices {
+        wait_at_boundary(options)?;
         let ctx = AlignContext::new(stack, previous, reader);
         let outcome = algorithm.align_frame(&ctx, i, cfg)?;
         let diverged = matches!(outcome.status, AlignStatus::Diverged(_));
@@ -367,7 +405,7 @@ fn run_chain_leg(
             residual: outcome.residual,
             fallback,
         });
-        credit_frame_done(frames_done);
+        credit_frame_done(options.frames_done.as_deref());
         prefix = composed;
         previous = i;
     }
@@ -416,7 +454,7 @@ pub fn align_stack_with(
     reader: &dyn TileReader,
     cfg: &ParamValues,
     failure: FailurePolicy,
-    options: &AlignDriverOptions,
+    options: &AlignDriverOptions<'_>,
 ) -> Result<AlignRun, AlgorithmError> {
     let policy = reference_policy_from_cfg(cfg);
     let reference = reference_index(reference_frame_from_cfg(cfg), stack.frame_count);
@@ -457,6 +495,7 @@ pub fn align_stack_with(
                     if i == reference {
                         continue;
                     }
+                    wait_at_boundary(options)?;
                     let outcome = algorithm.align_frame(&ctx, i, cfg)?;
                     *slot = Some(anchored_alignment(i, outcome, failure));
                     credit_frame_done(options.frames_done.as_deref());
@@ -476,43 +515,77 @@ pub fn align_stack_with(
                 let live = AtomicUsize::new(0);
                 let peak = AtomicUsize::new(0);
 
-                // One `Result` per slot, `collect()`ed into a `Vec` in
-                // source order, then scanned ascending so the returned
-                // error matches what the serial loop's `?` would have hit
-                // first.
                 // Span context does not cross onto a pool thread by itself:
                 // the caller's span is captured here and each frame span is
                 // parented to it explicitly, so an event raised while one
                 // frame registers still names the run it belongs to.
                 let parent = tracing::Span::current();
 
-                let outcomes: Vec<Option<Result<FrameAlignment, AlgorithmError>>> =
-                    pool.install(|| {
-                        (0..stack.frame_count)
-                            .into_par_iter()
-                            .map(|i| {
-                                if i == reference {
-                                    return None;
-                                }
-                                let frame_span =
-                                    tracing::debug_span!(parent: &parent, "frame", index = i);
-                                let _frame = frame_span.enter();
-                                let cur = live.fetch_add(1, Ordering::SeqCst) + 1;
-                                peak.fetch_max(cur, Ordering::SeqCst);
-                                let result = algorithm
-                                    .align_frame(&ctx, i, cfg)
-                                    .map(|outcome| anchored_alignment(i, outcome, failure));
-                                live.fetch_sub(1, Ordering::SeqCst);
-                                credit_frame_done(options.frames_done.as_deref());
-                                Some(result)
-                            })
-                            .collect()
-                    });
+                // Every non-reference frame, ascending -- what one
+                // `pool.install` round below registers. A pause leaves some
+                // entries unregistered; they stay `pending` for the next
+                // round on the same pool, so no rayon worker ever blocks
+                // waiting out a hold.
+                let mut pending: Vec<usize> =
+                    (0..stack.frame_count).filter(|&i| i != reference).collect();
 
-                for (i, outcome) in outcomes.into_iter().enumerate() {
-                    if let Some(result) = outcome {
-                        frames[i] = Some(result?);
+                loop {
+                    // One `Result` per still-pending frame, `collect()`ed in
+                    // `pending`'s own (ascending) order, so the scan below
+                    // matches what the serial loop's `?` would have hit
+                    // first.
+                    let outcomes: Vec<Option<Result<FrameAlignment, AlgorithmError>>> = pool
+                        .install(|| {
+                            pending
+                                .par_iter()
+                                .map(
+                                    |&i| match options.control.as_deref().map(JobControl::state) {
+                                        Some(ControlState::CancelRequested) => {
+                                            Some(Err(AlgorithmError::Cancelled))
+                                        }
+                                        Some(ControlState::PauseRequested)
+                                            if options.on_pause.is_some() =>
+                                        {
+                                            None
+                                        }
+                                        _ => {
+                                            let frame_span = tracing::debug_span!(
+                                                parent: &parent,
+                                                "frame",
+                                                index = i
+                                            );
+                                            let _frame = frame_span.enter();
+                                            let cur = live.fetch_add(1, Ordering::SeqCst) + 1;
+                                            peak.fetch_max(cur, Ordering::SeqCst);
+                                            let result = algorithm.align_frame(&ctx, i, cfg).map(
+                                                |outcome| anchored_alignment(i, outcome, failure),
+                                            );
+                                            live.fetch_sub(1, Ordering::SeqCst);
+                                            credit_frame_done(options.frames_done.as_deref());
+                                            Some(result)
+                                        }
+                                    },
+                                )
+                                .collect()
+                        });
+
+                    let mut next_pending = Vec::new();
+                    for (&i, outcome) in pending.iter().zip(outcomes) {
+                        match outcome {
+                            Some(Ok(alignment)) => frames[i] = Some(alignment),
+                            Some(Err(err)) => return Err(err),
+                            None => next_pending.push(i),
+                        }
                     }
+                    pending = next_pending;
+                    if pending.is_empty() {
+                        break;
+                    }
+                    // Every in-flight registration above has already
+                    // returned (`install` only comes back once the whole
+                    // batch has), so this holds on the caller's thread,
+                    // never a pool worker.
+                    wait_at_boundary(options)?;
                 }
 
                 (workers, peak.load(Ordering::SeqCst))
@@ -529,7 +602,7 @@ pub fn align_stack_with(
                 &mut frames,
                 (reference + 1)..stack.frame_count,
                 reference,
-                options.frames_done.as_deref(),
+                options,
             )?;
             run_chain_leg(
                 algorithm,
@@ -540,7 +613,7 @@ pub fn align_stack_with(
                 &mut frames,
                 (0..reference).rev(),
                 reference,
-                options.frames_done.as_deref(),
+                options,
             )?;
             (1, 1)
         }
@@ -567,6 +640,7 @@ pub fn align_stack_with(
 mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use super::*;
     use crate::algorithm::AlignOutcome;
@@ -922,6 +996,264 @@ mod tests {
         }
     }
 
+    /// Converges every frame and counts its calls; the call numbered
+    /// `cancel_on` requests a cancel on `control` before it returns.
+    struct CancellingAlign {
+        control: Arc<JobControl>,
+        cancel_on: usize,
+        calls: AtomicUsize,
+    }
+
+    impl AlignAlgorithm for CancellingAlign {
+        fn id(&self) -> &str {
+            "cancelling-align"
+        }
+        fn display_name(&self) -> &str {
+            "Cancelling Align"
+        }
+        fn params(&self) -> &[ParamDesc] {
+            &[]
+        }
+        fn align_frame(
+            &self,
+            _ctx: &AlignContext<'_>,
+            _frame: usize,
+            _cfg: &ParamValues,
+        ) -> Result<AlignOutcome, AlgorithmError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.cancel_on {
+                self.control.cancel();
+            }
+            Ok(converged(Transform::identity()))
+        }
+    }
+
+    #[test]
+    fn cancel_stops_registering_at_a_frame_boundary_in_every_arm() {
+        const CANCEL_ON: usize = 2;
+        let reader = NullReader;
+        let stack = StackContext::new(20, 8, 8, 1);
+        let two_workers = bytes_shared_reference(stack) as usize
+            + 2 * bytes_per_registration(stack, DEFAULT_TILE_SIZE) as usize;
+        // (policy, budget, most calls allowed): the cancelling call, plus
+        // the one registration the other pooled worker may hold.
+        let arms = [
+            ("anchor", 1, CANCEL_ON),
+            ("anchor", two_workers, CANCEL_ON + 1),
+            ("chain", 1, CANCEL_ON),
+        ];
+        for (policy, max_bytes_in_flight, bound) in arms {
+            let control = JobControl::new();
+            let algo = CancellingAlign {
+                control: Arc::clone(&control),
+                cancel_on: CANCEL_ON,
+                calls: AtomicUsize::new(0),
+            };
+            let options = AlignDriverOptions {
+                max_bytes_in_flight,
+                control: Some(control),
+                ..Default::default()
+            };
+            let result = align_stack_with(
+                &algo,
+                stack,
+                &reader,
+                &cfg_with(policy, "middle"),
+                FailurePolicy::Strict,
+                &options,
+            );
+            assert!(
+                matches!(result, Err(AlgorithmError::Cancelled)),
+                "{policy} at {max_bytes_in_flight} bytes must report the cancel, got {:?}",
+                result.as_ref().err()
+            );
+            let calls = algo.calls.load(Ordering::SeqCst);
+            assert!(
+                calls <= bound,
+                "{policy} at {max_bytes_in_flight} bytes: {calls} registrations ran, at most {bound} may"
+            );
+        }
+    }
+
+    /// Converges every frame with a transform that is a pure translation by
+    /// the frame index -- a skipped, repeated or mis-slotted frame, or a
+    /// chain hop composed against the wrong predecessor, changes the result
+    /// -- and counts its `align_frame` calls; the call numbered `pause_on`
+    /// requests a pause on `control` before it returns.
+    struct PausingAlign {
+        control: Arc<JobControl>,
+        pause_on: usize,
+        calls: AtomicUsize,
+    }
+
+    impl AlignAlgorithm for PausingAlign {
+        fn id(&self) -> &str {
+            "pausing-align"
+        }
+        fn display_name(&self) -> &str {
+            "Pausing Align"
+        }
+        fn params(&self) -> &[ParamDesc] {
+            &[]
+        }
+        fn align_frame(
+            &self,
+            _ctx: &AlignContext<'_>,
+            frame: usize,
+            _cfg: &ParamValues,
+        ) -> Result<AlignOutcome, AlgorithmError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.pause_on {
+                self.control.pause();
+            }
+            Ok(converged(Transform::translation(frame as f64, 0.0)))
+        }
+    }
+
+    #[test]
+    fn pause_holds_at_a_frame_boundary_in_every_arm() {
+        const PAUSE_ON: usize = 2;
+        let reader = NullReader;
+        let stack = StackContext::new(20, 8, 8, 1);
+        let two_workers = bytes_shared_reference(stack) as usize
+            + 2 * bytes_per_registration(stack, DEFAULT_TILE_SIZE) as usize;
+        // The most `align_frame` calls that may have run when the hook is
+        // entered: the pausing call itself, plus one in-flight registration
+        // per other worker.
+        let arms = [
+            ("anchor", 1usize, PAUSE_ON),
+            ("anchor", two_workers, PAUSE_ON + 1),
+            ("chain", 1usize, PAUSE_ON),
+        ];
+        for (policy, max_bytes_in_flight, bound) in arms {
+            let control = JobControl::new();
+            let algo = PausingAlign {
+                control: Arc::clone(&control),
+                pause_on: PAUSE_ON,
+                calls: AtomicUsize::new(0),
+            };
+            let hook_entries = AtomicUsize::new(0);
+            let on_pause = |control: &JobControl| {
+                hook_entries.fetch_add(1, Ordering::SeqCst);
+                let before = algo.calls.load(Ordering::SeqCst);
+                assert!(
+                    (PAUSE_ON..=bound).contains(&before),
+                    "{policy} at {max_bytes_in_flight} bytes: the hook entered after {before} \
+                     registrations, it must enter after {PAUSE_ON}..={bound}"
+                );
+                std::thread::sleep(Duration::from_millis(500));
+                assert_eq!(
+                    algo.calls.load(Ordering::SeqCst),
+                    before,
+                    "{policy} at {max_bytes_in_flight} bytes: a registration started during \
+                     the hold"
+                );
+                control.clear();
+            };
+            let options = AlignDriverOptions {
+                max_bytes_in_flight,
+                control: Some(Arc::clone(&control)),
+                on_pause: Some(&on_pause),
+                ..Default::default()
+            };
+            align_stack_with(
+                &algo,
+                stack,
+                &reader,
+                &cfg_with(policy, "middle"),
+                FailurePolicy::Strict,
+                &options,
+            )
+            .unwrap_or_else(|err| {
+                panic!("{policy} at {max_bytes_in_flight} bytes must not error: {err}")
+            });
+            assert_eq!(
+                hook_entries.load(Ordering::SeqCst),
+                1,
+                "{policy} at {max_bytes_in_flight} bytes: the pause hook must be entered exactly \
+                 once"
+            );
+        }
+    }
+
+    #[test]
+    fn paused_alignment_resumes_to_the_same_result() {
+        let reader = NullReader;
+        let stack = StackContext::new(20, 8, 8, 1);
+        let two_workers = bytes_shared_reference(stack) as usize
+            + 2 * bytes_per_registration(stack, DEFAULT_TILE_SIZE) as usize;
+        // (policy, budget, pause_on): an interior call and the last
+        // registration, in each arm.
+        let arms = [
+            ("anchor", 1usize, 5usize),
+            ("anchor", 1usize, 19usize),
+            ("anchor", two_workers, 5usize),
+            ("anchor", two_workers, 19usize),
+            ("chain", 1usize, 5usize),
+            ("chain", 1usize, 19usize),
+        ];
+        for (policy, max_bytes_in_flight, pause_on) in arms {
+            let baseline_algo = PausingAlign {
+                control: JobControl::new(),
+                pause_on: usize::MAX,
+                calls: AtomicUsize::new(0),
+            };
+            let baseline_options = AlignDriverOptions {
+                max_bytes_in_flight,
+                ..Default::default()
+            };
+            let baseline = align_stack_with(
+                &baseline_algo,
+                stack,
+                &reader,
+                &cfg_with(policy, "middle"),
+                FailurePolicy::Strict,
+                &baseline_options,
+            )
+            .expect("the unpaused run must not error")
+            .alignment;
+
+            let control = JobControl::new();
+            let algo = PausingAlign {
+                control: Arc::clone(&control),
+                pause_on,
+                calls: AtomicUsize::new(0),
+            };
+            let on_pause = |control: &JobControl| control.clear();
+            let options = AlignDriverOptions {
+                max_bytes_in_flight,
+                control: Some(Arc::clone(&control)),
+                on_pause: Some(&on_pause),
+                ..Default::default()
+            };
+            let resumed = align_stack_with(
+                &algo,
+                stack,
+                &reader,
+                &cfg_with(policy, "middle"),
+                FailurePolicy::Strict,
+                &options,
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{policy} at {max_bytes_in_flight} bytes, pause_on {pause_on} must not \
+                     error: {err}"
+                )
+            })
+            .alignment;
+
+            assert_eq!(
+                resumed, baseline,
+                "{policy} at {max_bytes_in_flight} bytes, pause_on {pause_on}: a \
+                 paused-then-resumed run must equal the unpaused one"
+            );
+            assert_eq!(
+                algo.calls.load(Ordering::SeqCst),
+                stack.frame_count - 1,
+                "{policy} at {max_bytes_in_flight} bytes, pause_on {pause_on}: every \
+                 non-reference frame must register exactly once"
+            );
+        }
+    }
+
     #[test]
     fn align_progress_is_visible_mid_stage() {
         // The serial arm (`max_bytes_in_flight: 1`) over a 6-frame stack
@@ -941,6 +1273,7 @@ mod tests {
         let options = AlignDriverOptions {
             max_bytes_in_flight: 1,
             frames_done: Some(Arc::clone(&counter)),
+            ..Default::default()
         };
 
         align_stack_with(&algo, stack, &reader, &cfg, FailurePolicy::Strict, &options)
@@ -965,6 +1298,7 @@ mod tests {
                 let serial = AlignDriverOptions {
                     max_bytes_in_flight: 1,
                     frames_done: Some(Arc::clone(&serial_counter)),
+                    ..Default::default()
                 };
                 align_stack_with(
                     &algo,
