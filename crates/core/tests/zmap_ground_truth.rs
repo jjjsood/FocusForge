@@ -105,9 +105,18 @@ struct FusionResult {
     zmap: Vec<u16>,
 }
 
-fn selected_scene() -> &'static Scene {
+/// The selected scene, from `FOCUSFORGE_ZMAP_GROUND_TRUTH_DIR`.
+///
+/// Unset: prints one `skip:` line naming the variable and returns `None`. Set
+/// but the scene fails to load: panics, naming the problem -- unlike unset,
+/// that is a misconfiguration, not the normal no-scene-available case.
+fn selected_scene() -> Option<&'static Scene> {
+    if std::env::var_os(INPUT_DIR_ENV).is_none() {
+        eprintln!("skip: {INPUT_DIR_ENV} is not set");
+        return None;
+    }
     static SCENE: OnceLock<Scene> = OnceLock::new();
-    SCENE.get_or_init(|| load_selected_scene().unwrap_or_else(|error| panic!("{error}")))
+    Some(SCENE.get_or_init(|| load_selected_scene().unwrap_or_else(|error| panic!("{error}"))))
 }
 
 fn load_selected_scene() -> Result<Scene, String> {
@@ -540,13 +549,13 @@ fn run_fusion(scene: &Scene, algorithm_id: &str, explicit: &ParamValues) -> Fusi
     FusionResult { composite, zmap }
 }
 
-fn fusion_result() -> &'static FusionResult {
+fn fusion_result(scene: &Scene) -> &'static FusionResult {
     static RESULT: OnceLock<FusionResult> = OnceLock::new();
     RESULT.get_or_init(|| {
         let mut explicit = ParamValues::new();
         explicit.insert("score-radius".to_string(), ParamValue::Int(4));
         explicit.insert("smoothing-radius".to_string(), ParamValue::Int(8));
-        run_fusion(selected_scene(), "depth-map", &explicit)
+        run_fusion(scene, "depth-map", &explicit)
     })
 }
 
@@ -940,8 +949,10 @@ fn truth_mismatched_with_stack_is_refused_by_name() {
 
 #[test]
 fn index_error_is_asserted_against_a_measured_floor() {
-    let scene = selected_scene();
-    let result = fusion_result();
+    let Some(scene) = selected_scene() else {
+        return;
+    };
+    let result = fusion_result(scene);
     let (exact_fraction, mean_absolute_error, exact_count) = index_metrics(
         &scene.identity,
         &result.zmap,
@@ -971,7 +982,9 @@ fn index_error_is_asserted_against_a_measured_floor() {
 
 #[test]
 fn ground_truth_and_random_controls_bracket_every_candidate() {
-    let scene = selected_scene();
+    let Some(scene) = selected_scene() else {
+        return;
+    };
     let (truth_exact, truth_error, _) = index_metrics(
         &scene.identity,
         &scene.truth,
@@ -1002,7 +1015,9 @@ fn ground_truth_and_random_controls_bracket_every_candidate() {
 
 #[test]
 fn random_zmap_outscores_truth_on_laplacian_but_is_inaccurate() {
-    let scene = selected_scene();
+    let Some(scene) = selected_scene() else {
+        return;
+    };
     let random = seeded_random_indices(scene.truth.len(), scene.frames.len());
     let truth_composite = composite_for_indices(scene, &scene.truth).unwrap();
     let random_composite = composite_for_indices(scene, &random).unwrap();
