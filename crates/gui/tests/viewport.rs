@@ -693,3 +693,109 @@ fn rendering_switches_at_one_to_one() {
         "at or above 100% must be pixelated"
     );
 }
+
+// ---------------------------------------------------------------------
+// Wheel input repaints through the pointer gate, in an installed window.
+// ---------------------------------------------------------------------
+
+/// Three wheel notches arrive before the event loop turns: the window still
+/// shows the old readout, and the next zero-delay turn publishes the final
+/// viewport once.
+#[test]
+fn wheel_repaints_once_on_the_next_idle_turn() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    i_slint_backend_testing::init_no_event_loop();
+    let app = focusforge_gui::AppWindow::new().expect("the window builds");
+    let controller = Arc::new(Mutex::new(opened_controller()));
+    let canvas = common::empty_canvas();
+    let _installed = focusforge_gui::bridge::install(&app, controller.clone(), canvas.clone());
+    focusforge_gui::bridge::repaint(&app, &controller, &canvas);
+    let fitted = app.get_zoom_readout().to_string();
+    assert!(!fitted.is_empty(), "a repaint publishes the fit readout");
+
+    for _ in 0..3 {
+        app.invoke_canvas_scrolled(0.0, 60.0, 100.0, 100.0, false, false, false);
+    }
+
+    assert_eq!(
+        app.get_zoom_readout().as_str(),
+        fitted,
+        "the wheel does not repaint before the event loop turns"
+    );
+    i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+    let final_readout = controller.lock().unwrap().zoom_readout();
+    assert_ne!(final_readout, fitted, "the wheel zoomed the viewport");
+    assert_eq!(app.get_zoom_readout().as_str(), final_readout);
+}
+
+// ---------------------------------------------------------------------
+// Preview placement: where a retained texture lands under a new view.
+// ---------------------------------------------------------------------
+
+fn close(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32), label: &str) {
+    let pairs = [(a.0, b.0), (a.1, b.1), (a.2, b.2), (a.3, b.3)];
+    for (got, want) in pairs {
+        assert!((got - want).abs() < 0.01, "{label}: {a:?} vs {b:?}");
+    }
+}
+
+#[test]
+fn place_matches_dst_for_its_own_src() {
+    let cases = [
+        (image(8192, 5464), pane(566.0, 748.0)),
+        (image(1023, 769), pane(512.0, 512.0)),
+    ];
+    for (img, p) in cases {
+        let ladder = stops(img, p);
+        let mut vp = fit(img, p);
+        for (index, _) in ladder.iter().enumerate() {
+            let draw = vp.draw(img, p).expect("a fitted viewport draws");
+            assert_eq!(
+                draw.place(draw.src),
+                draw.dst,
+                "{img:?} {p:?} stop {index}: a texture on its own src sits at dst"
+            );
+            vp.zoom_steps(1, (p.width / 3.0, p.height / 3.0), img, p);
+            vp.pan_by(13.0, -9.0, img, p);
+        }
+    }
+}
+
+#[test]
+fn place_follows_a_pan_by_whole_pixels() {
+    let img = image(2048, 1536);
+    let p = pane(566.0, 748.0);
+    let mut vp = fit(img, p);
+    while (vp.scale() - 1.0).abs() > 1e-9 {
+        vp.zoom_steps(1, (0.0, 0.0), img, p);
+    }
+    vp.pan_by(-300.0, -300.0, img, p);
+    let before = vp.draw(img, p).expect("draws at 100 %");
+
+    vp.pan_by(-7.0, 5.0, img, p);
+    let panned = vp.draw(img, p).expect("draws after the pan");
+    let (x, y, w, h) = before.dst;
+    close(
+        panned.place(before.src),
+        (x - 7.0, y + 5.0, w, h),
+        "the retained rect follows the pan",
+    );
+
+    vp.zoom_steps(1, (100.0, 100.0), img, p);
+    let zoomed = vp.draw(img, p).expect("draws after a ladder step");
+    let (ox, oy) = vp.origin();
+    let scale = vp.scale();
+    let (sx, sy, sw, sh) = before.src;
+    close(
+        zoomed.place(before.src),
+        (
+            ((f64::from(sx) - ox) * scale) as f32,
+            ((f64::from(sy) - oy) * scale) as f32,
+            (f64::from(sw) * scale) as f32,
+            (f64::from(sh) * scale) as f32,
+        ),
+        "the retained rect scales with the zoom",
+    );
+}

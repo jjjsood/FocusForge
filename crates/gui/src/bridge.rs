@@ -17,7 +17,9 @@ use slint::winit_030::{CustomApplicationHandler, EventResult, WinitWindowAccesso
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
-use crate::canvas::{CanvasFeed, PaneSource, RepaintGate, truncate_pane_label};
+use crate::canvas::{
+    CanvasFeed, Pane, PaneJob, PaneSource, Preparer, RepaintGate, truncate_pane_label,
+};
 use crate::controller::{
     AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, OpenOutcome,
     SettingsSection, ShellEvent, ShellMode,
@@ -40,7 +42,7 @@ use crate::input_map::{Button, Modifiers, PointerKind};
 use crate::job;
 use crate::overlay::Thumbnail;
 use crate::settings_panel::{HeadingState, PanelModel, RowKind};
-use crate::viewport::PaneRect;
+use crate::viewport::{PaneDraw, PaneRect};
 
 /// `slint::platform::PointerEventButton` -> `input_map::Button` -- the only
 /// place in the crate that names the Slint type.
@@ -88,6 +90,8 @@ pub struct Installed {
 #[derive(Default)]
 pub struct Canvas {
     renderer: Option<CanvasRenderer>,
+    /// Reads the panes' samples off the event loop; set by [`install`].
+    preparer: Option<Preparer>,
     tab: Option<usize>,
     /// The frame reader's own refusal, kept until a different frame opens
     /// or the same one succeeds -- the left `FFPane`'s message line reads
@@ -177,16 +181,149 @@ impl Canvas {
             Err(err) => self.frame_error = Some(err.to_string()),
         }
     }
+
+    /// Hands the worker one request for every pane whose texture does not
+    /// yet show its draw; a request still pending is replaced by it.
+    fn request_reads(&mut self, frame: Option<&PaneDraw>, plane: Option<&PaneDraw>) {
+        let (Some(renderer), Some(preparer)) = (self.renderer.as_mut(), self.preparer.as_ref())
+        else {
+            return;
+        };
+        let jobs: Vec<PaneJob> = frame
+            .and_then(|draw| renderer.request_frame(draw))
+            .into_iter()
+            .chain(plane.and_then(|draw| renderer.request_planes(draw)))
+            .collect();
+        if !jobs.is_empty() {
+            preparer.submit(jobs);
+        }
+    }
+
+    /// Renders whatever the worker completed into the panes' textures;
+    /// `false` when nothing had completed.
+    fn publish_prepared(&mut self) -> bool {
+        let Some(done) = self.preparer.as_ref().and_then(Preparer::take) else {
+            return false;
+        };
+        if let Some(renderer) = self.renderer.as_mut() {
+            for prepared in &done {
+                let stamp = prepared.job.stamp;
+                let _scope = measurement_scope_with_fields(
+                    "gui_canvas_publish",
+                    stamp,
+                    stamp,
+                    1,
+                    0,
+                    false,
+                    0,
+                );
+                renderer.publish(&prepared.job, &prepared.samples);
+            }
+        }
+        if let Some(preparer) = self.preparer.as_ref() {
+            preparer.recycle(done);
+        }
+        true
+    }
+}
+
+thread_local! {
+    /// What the worker's wake runs on the event loop: publish, then show.
+    static PREPARED_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// Publishes the worker's completed reads and shows every pane where the
+/// controller's current view puts it.
+fn publish_completed(
+    app: &AppWindow,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+) {
+    if !canvas.borrow_mut().publish_prepared() {
+        return;
+    }
+    let (frame_draw, plane_draw) = {
+        let controller = controller.lock().unwrap();
+        (controller.frame_draw(), controller.plane_draw())
+    };
+    show_panes(app, &canvas.borrow(), frame_draw, plane_draw);
+    // The textures were rendered into in place; Slint sees no property change.
+    app.window().request_redraw();
+}
+
+/// Sets each pane's source and placement from the texture it already holds,
+/// scaled and offset to `frame_draw`/`plane_draw`; a pane holding nothing is
+/// cleared rather than left showing the previous tab.
+fn show_panes(
+    app: &AppWindow,
+    canvas: &Canvas,
+    frame_draw: Option<PaneDraw>,
+    plane_draw: Option<PaneDraw>,
+) {
+    let renderer = canvas.renderer.as_ref();
+    let frame = frame_draw.and_then(|draw| {
+        let placed = renderer?.placement(Pane::Frame, &draw)?;
+        Some((draw, placed))
+    });
+    match frame {
+        Some((draw, (image, dst))) => {
+            app.set_frame_source(image);
+            app.set_frame_image_x(dst.0);
+            app.set_frame_image_y(dst.1);
+            app.set_frame_image_w(dst.2);
+            app.set_frame_image_h(dst.3);
+            app.set_pixelated(draw.pixelated);
+        }
+        None => {
+            app.set_frame_source(slint::Image::default());
+            app.set_frame_image_x(0.0);
+            app.set_frame_image_y(0.0);
+            app.set_frame_image_w(0.0);
+            app.set_frame_image_h(0.0);
+        }
+    }
+
+    let planes = plane_draw.and_then(|draw| {
+        let renderer = renderer?;
+        let plane = renderer.plane();
+        let placed = renderer.placement(plane.into(), &draw)?;
+        Some((draw, plane, placed))
+    });
+    match planes {
+        Some((draw, plane, (image, dst))) => {
+            match plane {
+                PaneSource::Composite => {
+                    app.set_composite_source(image);
+                    app.set_zmap_source(slint::Image::default());
+                }
+                PaneSource::ZMap => {
+                    app.set_zmap_source(image);
+                    app.set_composite_source(slint::Image::default());
+                }
+            }
+            app.set_image_x(dst.0);
+            app.set_image_y(dst.1);
+            app.set_image_w(dst.2);
+            app.set_image_h(dst.3);
+            app.set_pixelated(draw.pixelated);
+        }
+        None => {
+            app.set_composite_source(slint::Image::default());
+            app.set_zmap_source(slint::Image::default());
+            app.set_image_x(0.0);
+            app.set_image_y(0.0);
+            app.set_image_w(0.0);
+            app.set_image_h(0.0);
+        }
+    }
 }
 
 /// Reconciles the open renderer cell with the active tab
-/// ([`AppController::canvas_feed`]) and the selected frame, then draws both
-/// panes: the left pane's re-rendered frame with its own label and refusal
-/// text, the right pane's re-rendered composite/Z-Map pair, each with its
-/// own placement, plus `zoom-readout` and `project-loaded`. The one place a
-/// gesture, an active-tab change or a completed run becomes a repaint. With
-/// nothing to draw, a pane's source and placement are cleared rather than
-/// left showing the previous tab.
+/// ([`AppController::canvas_feed`]) and the selected frame, then places both
+/// panes from the textures they hold, scaled and offset to the new view, plus
+/// the frame label, `zoom-readout` and `project-loaded`. Exact samples are
+/// read on the worker and shown by publish_completed; nothing here reads a
+/// source. A pane holding nothing is cleared, not left on the previous tab.
 pub fn repaint(
     app: &AppWindow,
     controller: &Arc<Mutex<AppController>>,
@@ -238,61 +375,10 @@ pub fn repaint(
     app.set_frame_label(truncate_pane_label(&frame_label).into());
     app.set_frame_message(canvas.borrow().frame_error().unwrap_or("").into());
 
-    let frame_redrawn = frame_draw.and_then(|draw| {
-        let mut canvas = canvas.borrow_mut();
-        let renderer = canvas.renderer.as_mut()?;
-        Some((draw, renderer.redraw_frame(&draw)?))
-    });
-    match frame_redrawn {
-        Some((draw, frame_image)) => {
-            app.set_frame_source(frame_image);
-            app.set_frame_image_x(draw.dst.0);
-            app.set_frame_image_y(draw.dst.1);
-            app.set_frame_image_w(draw.dst.2);
-            app.set_frame_image_h(draw.dst.3);
-            app.set_pixelated(draw.pixelated);
-        }
-        None => {
-            app.set_frame_source(slint::Image::default());
-            app.set_frame_image_x(0.0);
-            app.set_frame_image_y(0.0);
-            app.set_frame_image_w(0.0);
-            app.set_frame_image_h(0.0);
-        }
-    }
-
-    let redrawn = plane_draw.and_then(|draw| {
-        let mut canvas = canvas.borrow_mut();
-        let renderer = canvas.renderer.as_mut()?;
-        Some((draw, renderer.redraw_planes(&draw)?))
-    });
-    match redrawn {
-        Some((draw, (image, plane))) => {
-            match plane {
-                PaneSource::Composite => {
-                    app.set_composite_source(image);
-                    app.set_zmap_source(slint::Image::default());
-                }
-                PaneSource::ZMap => {
-                    app.set_zmap_source(image);
-                    app.set_composite_source(slint::Image::default());
-                }
-            }
-            app.set_image_x(draw.dst.0);
-            app.set_image_y(draw.dst.1);
-            app.set_image_w(draw.dst.2);
-            app.set_image_h(draw.dst.3);
-            app.set_pixelated(draw.pixelated);
-        }
-        None => {
-            app.set_composite_source(slint::Image::default());
-            app.set_zmap_source(slint::Image::default());
-            app.set_image_x(0.0);
-            app.set_image_y(0.0);
-            app.set_image_w(0.0);
-            app.set_image_h(0.0);
-        }
-    }
+    canvas
+        .borrow_mut()
+        .request_reads(frame_draw.as_ref(), plane_draw.as_ref());
+    show_panes(app, &canvas.borrow(), frame_draw, plane_draw);
 }
 
 /// Emits the final pending input batch before diagnostics closes its trace.
@@ -1320,6 +1406,27 @@ pub fn install(
         }));
     }
 
+    {
+        let app_weak = app.as_weak();
+        let controller = controller.clone();
+        let canvas_for_handler = canvas.clone();
+        PREPARED_HANDLER.with(|slot| {
+            *slot.borrow_mut() = Some(Rc::new(move || {
+                if let Some(app) = app_weak.upgrade() {
+                    publish_completed(&app, &controller, &canvas_for_handler);
+                }
+            }));
+        });
+        // Errors are ignored like the sink's: no event loop, nobody to wake.
+        canvas.borrow_mut().preparer = Some(Preparer::new(|| {
+            let _ = slint::invoke_from_event_loop(|| {
+                if let Some(handler) = PREPARED_HANDLER.with(|slot| slot.borrow().clone()) {
+                    handler();
+                }
+            });
+        }));
+    }
+
     app.on_window_drag_requested({
         let controller = controller.clone();
         move || {
@@ -1473,18 +1580,19 @@ pub fn install(
                 .undock_requested(crate::canvas::PaneSource::ZMap)
         }
     });
+    let pointer_repaint = Rc::new(RepaintGate::default());
     app.on_canvas_scrolled({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let gate = pointer_repaint.clone();
         move |delta_x, delta_y, x, y, ctrl, shift, alt| {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
+            dispatch_coalesced(&controller, &canvas, &app_weak, &gate, |controller| {
                 let mods = modifiers(controller, ctrl, shift, alt);
                 controller.wheel(delta_x, delta_y, x, y, mods);
             });
         }
     });
-    let pointer_repaint = Rc::new(RepaintGate::default());
     app.on_canvas_pointer({
         let controller = controller.clone();
         let canvas = canvas.clone();

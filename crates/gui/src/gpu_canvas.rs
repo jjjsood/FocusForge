@@ -9,18 +9,18 @@
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
+use focusforge_core::timing::measurement_scope;
 
 use focusforge_core::TiffError;
 use focusforge_core::display::zmap_index_scale;
 use focusforge_core::io::TiffStack;
-use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapError, ZMapReader};
 use focusforge_gpu::display::{DisplayRenderer, DisplayTexture};
 use slint::wgpu_29::wgpu;
 
-use crate::canvas::{PaneSource, TextureSpec};
+use crate::canvas::{Pane, PaneJob, PaneSource, StampFloor, TextureSpec, grow_scratch};
 use crate::viewport::PaneDraw;
 
 /// The exact content a [`PaneTexture`] was last drawn from: `draw.src` and
@@ -32,16 +32,25 @@ type Coverage = ((u32, u32, u32, u32), NonZeroU32);
 /// wrapping it -- re-created only when the texture is (re)allocated
 /// (`crate::canvas::needs_realloc`), never every frame: `try_from` takes
 /// the texture by value, so the image property is set once at setup and
-/// never again -- and the content coverage it was last drawn from.
+/// never again -- and the content coverage it was last drawn from, plus the
+/// stamp floor that refuses results issued before its content last changed.
 #[derive(Default)]
 pub struct PaneTexture {
     display_texture: Option<DisplayTexture>,
     spec: Option<TextureSpec>,
     image: Option<slint::Image>,
     coverage: Option<Coverage>,
+    floor: StampFloor,
 }
 
 impl PaneTexture {
+    /// An empty pane that refuses every stamp up to `stamp`.
+    fn fresh(stamp: u64) -> Self {
+        let mut pane = Self::default();
+        pane.floor.reset(stamp);
+        pane
+    }
+
     /// The `slint::Image` to bind to `FFPane::source` -- a default (empty)
     /// image before the first render.
     pub fn image(&self) -> slint::Image {
@@ -474,36 +483,19 @@ pub enum CanvasRendererError {
     },
 }
 
-/// Grows `scratch` to at least `len` elements, recording [`SampleBytes`]
-/// only when its capacity actually grows -- a draw whose sample count stays
-/// within an already-reached capacity costs nothing here.
-///
-/// [`SampleBytes`]: TimingCounter::SampleBytes
-fn grow_scratch(scratch: &mut Vec<u16>, len: usize) -> &mut [u16] {
-    let capacity_before = scratch.capacity();
-    scratch.resize(len, 0);
-    if scratch.capacity() > capacity_before {
-        record_timing(
-            TimingCounter::SampleBytes,
-            (scratch.capacity() * std::mem::size_of::<u16>()) as u64,
-        );
-    }
-    &mut scratch[..len]
-}
-
 /// The two planes' GPU-owned state, the frame pane's own, the one
-/// [`DisplayRenderer`] every pane draws through, and the one CPU sample
-/// scratch every read fills before it renders. `redraw_planes`/`redraw_frame`
-/// skip a pane's own read and render when its [`PaneTexture`] already covers
-/// the draw's `src`/`step`. The planes are optional: a tab with nothing
-/// sealed yet still gets a renderer, for its frame pane alone.
+/// [`DisplayRenderer`] every pane renders through, and the CPU scratch the
+/// synchronous redraws read into. A pane's read is a [`PaneJob`] (none when
+/// its [`PaneTexture`] already covers the draw) that [`Self::publish`] renders
+/// once its samples exist; the `redraw_*` methods do both in place. The planes
+/// are optional: a tab with nothing sealed still gets a frame pane.
 pub struct CanvasRenderer {
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
     display_renderer: Option<DisplayRenderer>,
     sample_scratch: Vec<u16>,
-    composite: Option<TiffStack>,
-    zmap: Option<ZMapReader>,
+    composite: Option<Arc<TiffStack>>,
+    zmap: Option<Arc<ZMapReader>>,
     composite_pane: PaneTexture,
     zmap_pane: PaneTexture,
     index_scale: Option<u32>,
@@ -512,6 +504,9 @@ pub struct CanvasRenderer {
     plane: PaneSource,
     frame: crate::canvas::FrameSource,
     frame_pane: PaneTexture,
+    /// The last stamp issued: every job takes the next one, and a reset
+    /// refuses everything up to the current value.
+    stamp: u64,
 }
 
 impl Default for CanvasRenderer {
@@ -536,11 +531,55 @@ impl CanvasRenderer {
             plane: PaneSource::Composite,
             frame: crate::canvas::FrameSource::default(),
             frame_pane: PaneTexture::default(),
+            stamp: 0,
         }
     }
 
-    /// Selects which plane [`Self::redraw_planes`] reads and renders.
+    fn next_stamp(&mut self) -> u64 {
+        self.stamp += 1;
+        self.stamp
+    }
+
+    /// Empties both plane panes and refuses every job issued so far for them.
+    fn reset_planes(&mut self) {
+        let stamp = self.next_stamp();
+        self.composite_pane = PaneTexture::fresh(stamp);
+        self.zmap_pane = PaneTexture::fresh(stamp);
+    }
+
+    /// Empties the frame pane and refuses every job issued so far for it.
+    fn reset_frame(&mut self) {
+        let stamp = self.next_stamp();
+        self.frame_pane = PaneTexture::fresh(stamp);
+    }
+
+    fn pane_mut(&mut self, pane: Pane) -> &mut PaneTexture {
+        match pane {
+            Pane::Frame => &mut self.frame_pane,
+            Pane::Composite => &mut self.composite_pane,
+            Pane::ZMap => &mut self.zmap_pane,
+        }
+    }
+
+    fn pane_ref(&self, pane: Pane) -> &PaneTexture {
+        match pane {
+            Pane::Frame => &self.frame_pane,
+            Pane::Composite => &self.composite_pane,
+            Pane::ZMap => &self.zmap_pane,
+        }
+    }
+
+    /// The plane [`Self::redraw_planes`] and [`Self::request_planes`] draw.
+    pub fn plane(&self) -> PaneSource {
+        self.plane
+    }
+
+    /// Selects which plane [`Self::redraw_planes`] reads and renders; jobs
+    /// issued for either plane before this call are refused.
     pub fn select_plane(&mut self, plane: PaneSource) {
+        let stamp = self.next_stamp();
+        self.composite_pane.floor.reset(stamp);
+        self.zmap_pane.floor.reset(stamp);
         self.plane = plane;
     }
 
@@ -556,9 +595,8 @@ impl CanvasRenderer {
 
     /// Releases resources bound to Slint's device while keeping source readers.
     pub fn detach_device(&mut self) {
-        self.composite_pane = PaneTexture::default();
-        self.zmap_pane = PaneTexture::default();
-        self.frame_pane = PaneTexture::default();
+        self.reset_planes();
+        self.reset_frame();
         self.display_renderer = None;
         self.device = None;
         self.queue = None;
@@ -587,10 +625,9 @@ impl CanvasRenderer {
             source,
         })?;
         self.index_scale = Some(zmap_index_scale(zmap.frame_count()));
-        self.composite = Some(composite);
-        self.zmap = Some(zmap);
-        self.composite_pane = PaneTexture::default();
-        self.zmap_pane = PaneTexture::default();
+        self.composite = Some(Arc::new(composite));
+        self.zmap = Some(Arc::new(zmap));
+        self.reset_planes();
         Ok(())
     }
 
@@ -599,8 +636,7 @@ impl CanvasRenderer {
         self.composite = None;
         self.zmap = None;
         self.index_scale = None;
-        self.composite_pane = PaneTexture::default();
-        self.zmap_pane = PaneTexture::default();
+        self.reset_planes();
     }
 
     /// The frame pane's currently open path, if any.
@@ -612,14 +648,143 @@ impl CanvasRenderer {
     /// first. `Err` leaves nothing open.
     pub fn set_frame(&mut self, path: &Path) -> Result<(), TiffError> {
         let result = self.frame.set(path);
-        self.frame_pane = PaneTexture::default();
+        self.reset_frame();
         result
     }
 
     /// Drops the open frame, if any.
     pub fn clear_frame(&mut self) {
         self.frame.clear();
-        self.frame_pane = PaneTexture::default();
+        self.reset_frame();
+    }
+
+    /// The job that brings the selected plane's pane to `draw`, `None` when
+    /// that pane already covers `draw.src`/`draw.step` (whatever `dst` and
+    /// `pixelated` now are; work still in flight for it is retired), with no
+    /// planes or device, or an out-of-bounds `draw.src`. The unselected plane
+    /// is never requested.
+    pub fn request_planes(&mut self, draw: &PaneDraw) -> Option<PaneJob> {
+        self.device.as_ref()?;
+        let composite = self.composite.as_ref()?.clone();
+        let zmap = self.zmap.as_ref()?.clone();
+        let pane = Pane::from(self.plane);
+        let (reader, index_scale): (Arc<dyn crate::canvas::PaneReader>, u32) = match pane {
+            Pane::ZMap => (zmap, self.index_scale?),
+            _ => (composite.clone(), 0),
+        };
+        let header = composite.header(0);
+        self.request(
+            pane,
+            draw,
+            (header.width, header.height),
+            reader,
+            index_scale,
+        )
+    }
+
+    /// The job that brings the frame pane to `draw`; `None` as
+    /// [`Self::request_planes`], with no frame open in place of no planes.
+    pub fn request_frame(&mut self, draw: &PaneDraw) -> Option<PaneJob> {
+        self.device.as_ref()?;
+        let frame_size = self.frame.dimensions()?;
+        let reader = self.frame.reader()?;
+        self.request(Pane::Frame, draw, frame_size, reader, 0)
+    }
+
+    fn request(
+        &mut self,
+        pane: Pane,
+        draw: &PaneDraw,
+        source_size: (u32, u32),
+        reader: Arc<dyn crate::canvas::PaneReader>,
+        index_scale: u32,
+    ) -> Option<PaneJob> {
+        let stamp = self.next_stamp();
+        let texture = self.pane_mut(pane);
+        if texture.covers(draw.src, draw.step) {
+            texture.floor.reset(stamp);
+            return None;
+        }
+        if !crate::canvas::draw_rect_fits(source_size, draw.src) {
+            return None;
+        }
+        Some(PaneJob {
+            pane,
+            draw: *draw,
+            stamp,
+            reader,
+            index_scale,
+        })
+    }
+
+    /// Renders `samples` (read for `job`) into the job's pane and returns
+    /// the pane's image. `None`, with nothing rendered or uploaded, when the
+    /// job is stale -- issued before a source, plane or device change or
+    /// before a newer job for the pane published -- or when there is no
+    /// device.
+    pub fn publish(&mut self, job: &PaneJob, samples: &[u16]) -> Option<slint::Image> {
+        let (device, queue) = self.device_queue()?;
+        if !self.pane_mut(job.pane).floor.accept(job.stamp) {
+            return None;
+        }
+        let renderer = self.display_renderer.as_mut()?;
+        let (width, height) = job.draw.extent();
+        let texture = match job.pane {
+            Pane::Frame => &mut self.frame_pane,
+            Pane::Composite => &mut self.composite_pane,
+            Pane::ZMap => &mut self.zmap_pane,
+        };
+        if texture.covers(job.draw.src, job.draw.step) {
+            return Some(texture.image());
+        }
+        texture.ensure_and_render(
+            renderer,
+            &device,
+            &queue,
+            width,
+            height,
+            samples,
+            job.reader.samples_per_pixel(),
+            job.index_scale,
+        );
+        texture.mark_covered(job.draw.src, job.draw.step);
+        Some(texture.image())
+    }
+
+    /// The image `pane` currently holds and where it lands under `draw`:
+    /// the texture drawn at its own last `src`, scaled and offset to the new
+    /// view. `None` while the pane holds nothing.
+    pub fn placement(
+        &self,
+        pane: Pane,
+        draw: &PaneDraw,
+    ) -> Option<(slint::Image, (f32, f32, f32, f32))> {
+        let texture = self.pane_ref(pane);
+        let (src, _) = texture.coverage?;
+        texture.image.as_ref()?;
+        Some((texture.image(), draw.place(src)))
+    }
+
+    /// Reads a job's samples into the shared scratch and publishes them.
+    fn read_and_publish(&mut self, job: PaneJob) -> Option<slint::Image> {
+        let (x, y, width, height) = job.draw.src;
+        let (tex_w, tex_h) = job.draw.extent();
+        let len = tex_w as usize * tex_h as usize * job.reader.samples_per_pixel() as usize;
+        let mut scratch = std::mem::take(&mut self.sample_scratch);
+        let samples = grow_scratch(&mut scratch, len);
+        let rect = focusforge_core::tile::Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let image = job
+            .reader
+            .read_step_into(rect, job.draw.step, samples)
+            .ok()
+            .and_then(|()| self.publish(&job, &scratch[..len]));
+        self.sample_scratch = scratch;
+        image
     }
 
     /// Re-reads and re-uploads `draw.src` for the currently selected plane
@@ -630,102 +795,12 @@ impl CanvasRenderer {
     /// read (coverage stays untouched on that path).
     pub fn redraw_planes(&mut self, draw: &PaneDraw) -> Option<(slint::Image, PaneSource)> {
         let _scope = measurement_scope("gui_plane_redraw");
-        if self.composite.is_none() || self.zmap.is_none() {
-            return None;
-        }
         let plane = self.plane;
-        let image = match plane {
-            PaneSource::Composite => self.redraw_composite(draw)?,
-            PaneSource::ZMap => self.redraw_zmap(draw)?,
+        let image = match self.request_planes(draw) {
+            Some(job) => self.read_and_publish(job)?,
+            None => self.covered_image(plane.into(), draw)?,
         };
         Some((image, plane))
-    }
-
-    fn redraw_composite(&mut self, draw: &PaneDraw) -> Option<slint::Image> {
-        let (device, queue) = self.device_queue()?;
-        if self.composite_pane.covers(draw.src, draw.step) {
-            return Some(self.composite_pane.image());
-        }
-        let composite = self.composite.as_ref()?;
-        let (x, y, width, height) = draw.src;
-        let (frame_size, samples_per_pixel) = {
-            let header = composite.header(0);
-            ((header.width, header.height), header.samples_per_pixel)
-        };
-        if !crate::canvas::draw_rect_fits(frame_size, draw.src) {
-            return None;
-        }
-        let rect = Rect {
-            x,
-            y,
-            width,
-            height,
-        };
-
-        let (tex_w, tex_h) = draw.extent();
-        let texels = tex_w as usize * tex_h as usize;
-        let samples = grow_scratch(
-            &mut self.sample_scratch,
-            texels * samples_per_pixel as usize,
-        );
-        composite
-            .read_tile_step_into(0, rect, draw.step, samples)
-            .ok()?;
-        let renderer = self.display_renderer.as_mut()?;
-        self.composite_pane.ensure_and_render(
-            renderer,
-            &device,
-            &queue,
-            tex_w,
-            tex_h,
-            samples,
-            samples_per_pixel,
-            0,
-        );
-        self.composite_pane.mark_covered(draw.src, draw.step);
-        Some(self.composite_pane.image())
-    }
-
-    fn redraw_zmap(&mut self, draw: &PaneDraw) -> Option<slint::Image> {
-        let (device, queue) = self.device_queue()?;
-        if self.zmap_pane.covers(draw.src, draw.step) {
-            return Some(self.zmap_pane.image());
-        }
-        let zmap = self.zmap.as_ref()?;
-        let index_scale = self.index_scale?;
-        let composite_size = {
-            let composite = self.composite.as_ref()?;
-            let header = composite.header(0);
-            (header.width, header.height)
-        };
-        if !crate::canvas::draw_rect_fits(composite_size, draw.src) {
-            return None;
-        }
-        let (x, y, width, height) = draw.src;
-        let rect = Rect {
-            x,
-            y,
-            width,
-            height,
-        };
-
-        let (tex_w, tex_h) = draw.extent();
-        let texels = tex_w as usize * tex_h as usize;
-        let indices = grow_scratch(&mut self.sample_scratch, texels);
-        zmap.read_tile_step_into(rect, draw.step, indices).ok()?;
-        let renderer = self.display_renderer.as_mut()?;
-        self.zmap_pane.ensure_and_render(
-            renderer,
-            &device,
-            &queue,
-            tex_w,
-            tex_h,
-            indices,
-            1,
-            index_scale,
-        );
-        self.zmap_pane.mark_covered(draw.src, draw.step);
-        Some(self.zmap_pane.image())
     }
 
     /// Re-reads and re-uploads `draw.src` for the frame pane, decimated as in
@@ -739,42 +814,15 @@ impl CanvasRenderer {
     /// indices.
     pub fn redraw_frame(&mut self, draw: &PaneDraw) -> Option<slint::Image> {
         let _scope = measurement_scope("gui_frame_redraw");
-        let (device, queue) = self.device_queue()?;
-        let frame_size = self.frame.dimensions()?;
-        let samples_per_pixel = self.frame.samples_per_pixel()?;
-        if self.frame_pane.covers(draw.src, draw.step) {
-            return Some(self.frame_pane.image());
+        match self.request_frame(draw) {
+            Some(job) => self.read_and_publish(job),
+            None => self.covered_image(Pane::Frame, draw),
         }
-        if !crate::canvas::draw_rect_fits(frame_size, draw.src) {
-            return None;
-        }
-        let (x, y, width, height) = draw.src;
-        let rect = Rect {
-            x,
-            y,
-            width,
-            height,
-        };
+    }
 
-        let (tex_w, tex_h) = draw.extent();
-        let texels = tex_w as usize * tex_h as usize;
-        let samples = grow_scratch(
-            &mut self.sample_scratch,
-            texels * samples_per_pixel as usize,
-        );
-        self.frame.read_into(rect, draw.step, samples).ok()?;
-        let renderer = self.display_renderer.as_mut()?;
-        self.frame_pane.ensure_and_render(
-            renderer,
-            &device,
-            &queue,
-            tex_w,
-            tex_h,
-            samples,
-            samples_per_pixel,
-            0,
-        );
-        self.frame_pane.mark_covered(draw.src, draw.step);
-        Some(self.frame_pane.image())
+    /// The pane's image when it already covers `draw`, `None` otherwise.
+    fn covered_image(&self, pane: Pane, draw: &PaneDraw) -> Option<slint::Image> {
+        let texture = self.pane_ref(pane);
+        texture.covers(draw.src, draw.step).then(|| texture.image())
     }
 }

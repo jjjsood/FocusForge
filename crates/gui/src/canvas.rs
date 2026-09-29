@@ -12,10 +12,15 @@
 use std::cell::Cell;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use focusforge_core::TiffError;
 use focusforge_core::io::TiffStack;
 use focusforge_core::tile::Rect;
+use focusforge_core::timing::{TimingCounter, record_timing};
+use focusforge_core::zmap::{ZMapError, ZMapReader};
+
+use crate::viewport::PaneDraw;
 
 /// What the open renderer cell should do for the frame about to draw --
 /// [`crate::controller::AppController::canvas_feed`]'s answer, decided with
@@ -107,7 +112,7 @@ pub fn check_pane_dimensions(composite: (u32, u32), zmap: (u32, u32)) -> Result<
 /// [`Self::set`] drops whatever was open before mapping the next.
 #[derive(Default)]
 pub struct FrameSource {
-    open: Option<(PathBuf, TiffStack)>,
+    open: Option<(PathBuf, Arc<TiffStack>)>,
 }
 
 impl FrameSource {
@@ -116,7 +121,7 @@ impl FrameSource {
     pub fn set(&mut self, path: &Path) -> Result<(), TiffError> {
         self.open = None;
         let stack = TiffStack::open_files(std::slice::from_ref(&path.to_path_buf()))?;
-        self.open = Some((path.to_path_buf(), stack));
+        self.open = Some((path.to_path_buf(), Arc::new(stack)));
         Ok(())
     }
 
@@ -140,6 +145,11 @@ impl FrameSource {
         self.open
             .as_ref()
             .map(|(_, stack)| stack.header(0).samples_per_pixel)
+    }
+
+    /// The open frame, shared with a preparation worker's reads.
+    pub fn reader(&self) -> Option<Arc<TiffStack>> {
+        self.open.as_ref().map(|(_, stack)| stack.clone())
     }
 
     /// Reads every `step`-th row and column of `rect` into `out`. Callers
@@ -210,4 +220,293 @@ pub fn truncate_pane_label(label: &str) -> String {
     let kept = PANE_LABEL_MAX_CHARS - 1;
     let tail: String = chars[chars.len() - kept..].iter().collect();
     format!("\u{2026}{tail}")
+}
+
+/// Grows `scratch` to at least `len` elements, recording [`SampleBytes`]
+/// only when its capacity actually grows -- a draw whose sample count stays
+/// within an already-reached capacity costs nothing here.
+///
+/// [`SampleBytes`]: TimingCounter::SampleBytes
+pub(crate) fn grow_scratch(scratch: &mut Vec<u16>, len: usize) -> &mut [u16] {
+    let capacity_before = scratch.capacity();
+    scratch.resize(len, 0);
+    if scratch.capacity() > capacity_before {
+        record_timing(
+            TimingCounter::SampleBytes,
+            (scratch.capacity() * std::mem::size_of::<u16>()) as u64,
+        );
+    }
+    &mut scratch[..len]
+}
+
+/// What went wrong reading one pane's samples.
+#[derive(Debug, thiserror::Error)]
+pub enum PaneReadError {
+    #[error(transparent)]
+    Tiff(#[from] TiffError),
+    #[error(transparent)]
+    ZMap(#[from] ZMapError),
+}
+
+/// A source one pane draws from, readable from a worker thread.
+pub trait PaneReader: Send + Sync {
+    /// Samples per pixel of what [`Self::read_step_into`] writes.
+    fn samples_per_pixel(&self) -> u32;
+
+    /// Reads every `step`-th row and column of `rect` into `out`
+    /// (`rect.width.div_ceil(step) * rect.height.div_ceil(step)` pixels).
+    fn read_step_into(
+        &self,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [u16],
+    ) -> Result<(), PaneReadError>;
+}
+
+impl PaneReader for TiffStack {
+    fn samples_per_pixel(&self) -> u32 {
+        self.header(0).samples_per_pixel
+    }
+
+    fn read_step_into(
+        &self,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [u16],
+    ) -> Result<(), PaneReadError> {
+        Ok(self.read_tile_step_into(0, rect, step, out)?)
+    }
+}
+
+impl PaneReader for ZMapReader {
+    fn samples_per_pixel(&self) -> u32 {
+        1
+    }
+
+    fn read_step_into(
+        &self,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [u16],
+    ) -> Result<(), PaneReadError> {
+        Ok(self.read_tile_step_into(rect, step, out)?)
+    }
+}
+
+/// The canvas surfaces that draw from a [`PaneReader`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Frame,
+    Composite,
+    ZMap,
+}
+
+impl From<PaneSource> for Pane {
+    fn from(plane: PaneSource) -> Self {
+        match plane {
+            PaneSource::Composite => Pane::Composite,
+            PaneSource::ZMap => Pane::ZMap,
+        }
+    }
+}
+
+/// One pane's view to read: what to read, the stamp it was issued under and
+/// what the display needs to render it.
+#[derive(Clone)]
+pub struct PaneJob {
+    pub pane: Pane,
+    pub draw: PaneDraw,
+    pub stamp: u64,
+    pub reader: Arc<dyn PaneReader>,
+    /// Z-Map index scale for the display kernel; 0 for image sources.
+    pub index_scale: u32,
+}
+
+/// A [`PaneJob`] with its samples read.
+pub struct Prepared {
+    pub job: PaneJob,
+    pub samples: Vec<u16>,
+}
+
+/// Accepts only stamps above the newest one it has seen or been reset to,
+/// so a result issued before a newer publish or a reset is refused whatever
+/// order results arrive in.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StampFloor(u64);
+
+impl StampFloor {
+    /// Whether `stamp` is above the floor; raises the floor to it if so.
+    pub fn accept(&mut self, stamp: u64) -> bool {
+        let fresh = stamp > self.0;
+        if fresh {
+            self.0 = stamp;
+        }
+        fresh
+    }
+
+    /// Refuses every stamp up to and including `stamp`.
+    pub fn reset(&mut self, stamp: u64) {
+        self.0 = self.0.max(stamp);
+    }
+}
+
+/// Buffers kept for reuse: one active request's worth plus the completed
+/// slot's, two panes each.
+const POOLED_BUFFERS: usize = 4;
+
+#[derive(Default)]
+struct PreparerState {
+    pending: Option<Vec<PaneJob>>,
+    done: Option<Vec<Prepared>>,
+    pool: Vec<Vec<u16>>,
+    shutdown: bool,
+    spawned: bool,
+}
+
+impl PreparerState {
+    fn pool_buffer(&mut self, buffer: Vec<u16>) {
+        if self.pool.len() < POOLED_BUFFERS {
+            self.pool.push(buffer);
+        }
+    }
+}
+
+struct PreparerShared {
+    state: Mutex<PreparerState>,
+    wakeup: Condvar,
+}
+
+impl PreparerShared {
+    fn lock(&self) -> MutexGuard<'_, PreparerState> {
+        self.state
+            .lock()
+            .expect("no code panics while holding the preparer lock")
+    }
+}
+
+/// Reads panes' samples off the calling thread: one active request, one
+/// replaceable newest pending request and one completed slot, all bounded.
+/// Dropping it stops the worker after its current read without waiting for
+/// it and without a wake.
+pub struct Preparer {
+    shared: Arc<PreparerShared>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Preparer {
+    /// `wake` runs on the worker thread each time the completed slot goes
+    /// from empty to full.
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            shared: Arc::new(PreparerShared {
+                state: Mutex::new(PreparerState::default()),
+                wakeup: Condvar::new(),
+            }),
+            wake: Arc::new(wake),
+        }
+    }
+
+    /// Replaces the pending request with `jobs`; never blocks on a read.
+    pub fn submit(&self, jobs: Vec<PaneJob>) {
+        let mut state = self.shared.lock();
+        state.pending = Some(jobs);
+        if !state.spawned {
+            state.spawned = true;
+            let shared = self.shared.clone();
+            let wake = self.wake.clone();
+            std::thread::Builder::new()
+                .name("canvas-prepare".into())
+                .spawn(move || prepare_loop(&shared, &*wake))
+                .expect("the OS starts the canvas preparation thread");
+        }
+        self.shared.wakeup.notify_one();
+    }
+
+    /// The newest completed request, if one landed since the last call.
+    pub fn take(&self) -> Option<Vec<Prepared>> {
+        self.shared.lock().done.take()
+    }
+
+    /// Hands consumed buffers back for the next request to read into.
+    pub fn recycle(&self, spent: Vec<Prepared>) {
+        let mut state = self.shared.lock();
+        for prepared in spent {
+            state.pool_buffer(prepared.samples);
+        }
+    }
+}
+
+impl Drop for Preparer {
+    fn drop(&mut self) {
+        self.shared.lock().shutdown = true;
+        self.shared.wakeup.notify_all();
+    }
+}
+
+fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
+    loop {
+        let (jobs, mut buffers) = {
+            let mut state = shared.lock();
+            let jobs = loop {
+                if state.shutdown {
+                    return;
+                }
+                if let Some(jobs) = state.pending.take() {
+                    break jobs;
+                }
+                state = shared
+                    .wakeup
+                    .wait(state)
+                    .expect("no code panics while holding the preparer lock");
+            };
+            let keep = state.pool.len().saturating_sub(jobs.len());
+            let buffers = state.pool.split_off(keep);
+            (jobs, buffers)
+        };
+        let prepared: Vec<Prepared> = jobs
+            .into_iter()
+            .filter_map(|job| read_job(job, buffers.pop().unwrap_or_default()))
+            .collect();
+
+        let mut state = shared.lock();
+        if state.shutdown {
+            return;
+        }
+        if prepared.is_empty() {
+            continue;
+        }
+        let was_empty = match state.done.replace(prepared) {
+            Some(replaced) => {
+                for stale in replaced {
+                    state.pool_buffer(stale.samples);
+                }
+                false
+            }
+            None => true,
+        };
+        drop(state);
+        if was_empty {
+            wake();
+        }
+    }
+}
+
+fn read_job(job: PaneJob, mut samples: Vec<u16>) -> Option<Prepared> {
+    let (x, y, width, height) = job.draw.src;
+    let (tex_w, tex_h) = job.draw.extent();
+    let len = tex_w as usize * tex_h as usize * job.reader.samples_per_pixel() as usize;
+    let out = grow_scratch(&mut samples, len);
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    match job.reader.read_step_into(rect, job.draw.step, out) {
+        Ok(()) => Some(Prepared { job, samples }),
+        Err(error) => {
+            tracing::warn!(%error, pane = ?job.pane, "pane read failed");
+            None
+        }
+    }
 }

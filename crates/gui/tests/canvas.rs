@@ -1378,3 +1378,584 @@ fn pane_label_at_the_budget_passes_through_unchanged() {
     let one_over = "0829-IMG_9800.tif";
     assert_eq!(truncate_pane_label(one_over), "\u{2026}29-IMG_9800.tif");
 }
+
+// ---------------------------------------------------------------------
+// The off-thread preparer: one active read, one newest pending request,
+// one completed slot; and the freshness floor that refuses stale results.
+// ---------------------------------------------------------------------
+
+mod preparing {
+    use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use focusforge_core::tile::Rect;
+    use focusforge_gui::canvas::{Pane, PaneJob, PaneReadError, PaneReader, Prepared, Preparer};
+    use focusforge_gui::viewport::PaneDraw;
+
+    pub const WAIT: Duration = Duration::from_secs(10);
+
+    /// One read the fake served: when it began and, once released, ended.
+    pub struct Served {
+        pub rect: Rect,
+        pub started: Instant,
+        pub ended: Option<Instant>,
+    }
+
+    /// A reader that logs every read and blocks each one until the test
+    /// sends a token.
+    pub struct FakeReader {
+        spp: u32,
+        pub log: Mutex<Vec<Served>>,
+        gate: Mutex<Receiver<()>>,
+    }
+
+    impl FakeReader {
+        pub fn new(spp: u32) -> (Arc<Self>, Sender<()>) {
+            let (release, gate) = channel();
+            let reader = Arc::new(Self {
+                spp,
+                log: Mutex::new(Vec::new()),
+                gate: Mutex::new(gate),
+            });
+            (reader, release)
+        }
+
+        pub fn reads(&self) -> usize {
+            self.log.lock().unwrap().len()
+        }
+
+        pub fn finished(&self) -> usize {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|served| served.ended.is_some())
+                .count()
+        }
+    }
+
+    impl PaneReader for FakeReader {
+        fn samples_per_pixel(&self) -> u32 {
+            self.spp
+        }
+
+        fn read_step_into(
+            &self,
+            rect: Rect,
+            _step: NonZeroU32,
+            out: &mut [u16],
+        ) -> Result<(), PaneReadError> {
+            self.log.lock().unwrap().push(Served {
+                rect,
+                started: Instant::now(),
+                ended: None,
+            });
+            self.gate
+                .lock()
+                .unwrap()
+                .recv()
+                .expect("the test keeps the release sender alive");
+            out.fill(rect.width as u16);
+            self.log.lock().unwrap().last_mut().unwrap().ended = Some(Instant::now());
+            Ok(())
+        }
+    }
+
+    /// A one-job request whose source width is `width` and whose stamp is
+    /// `stamp`, so a completion says which submit it came from.
+    pub fn job(reader: &Arc<FakeReader>, width: u32, stamp: u64) -> PaneJob {
+        PaneJob {
+            pane: Pane::Frame,
+            draw: PaneDraw {
+                src: (0, 0, width, 8),
+                dst: (0.0, 0.0, width as f32, 8.0),
+                pixelated: false,
+                step: NonZeroU32::MIN,
+            },
+            stamp,
+            reader: reader.clone(),
+            index_scale: 0,
+        }
+    }
+
+    pub fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + WAIT;
+        while !ready() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Polls `take` until a completion carrying `stamp` shows up; older
+    /// completions taken on the way go back to the pool.
+    pub fn take_stamp(preparer: &Preparer, stamp: u64) -> Vec<Prepared> {
+        let mut found = None;
+        wait_for("a completion", || {
+            let Some(done) = preparer.take() else {
+                return false;
+            };
+            if done.iter().any(|p| p.job.stamp == stamp) {
+                found = Some(done);
+                true
+            } else {
+                preparer.recycle(done);
+                false
+            }
+        });
+        found.unwrap()
+    }
+
+    pub fn counter() -> (Arc<AtomicUsize>, impl Fn() + Send + Sync + 'static) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let wake = {
+            let count = count.clone();
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        (count, wake)
+    }
+}
+
+#[test]
+fn preparer_keeps_one_active_and_the_newest_pending_request() {
+    use preparing::*;
+    let (reader, release) = FakeReader::new(1);
+    let preparer = focusforge_gui::canvas::Preparer::new(|| {});
+
+    preparer.submit(vec![job(&reader, 1, 1)]);
+    wait_for("the first read to start", || reader.reads() == 1);
+
+    let started = std::time::Instant::now();
+    for width in 2..=100 {
+        preparer.submit(vec![job(&reader, width, u64::from(width))]);
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "submitting while a read is blocked returns at once"
+    );
+
+    release.send(()).unwrap();
+    release.send(()).unwrap();
+    let done = take_stamp(&preparer, 100);
+
+    assert_eq!(reader.reads(), 2, "one active read plus the newest pending");
+    assert_eq!(done.len(), 1);
+    assert_eq!(
+        done[0].job.draw.src.2, 100,
+        "the second read is the last submit"
+    );
+    assert_eq!(reader.log.lock().unwrap()[1].rect.width, 100);
+}
+
+#[test]
+fn preparer_wakes_once_per_unconsumed_completion() {
+    use preparing::*;
+    let (reader, release) = FakeReader::new(1);
+    for _ in 0..3 {
+        release.send(()).unwrap();
+    }
+    let (wakes, wake) = counter();
+    let preparer = focusforge_gui::canvas::Preparer::new(wake);
+
+    preparer.submit(vec![job(&reader, 1, 1)]);
+    wait_for("the first wake", || {
+        wakes.load(std::sync::atomic::Ordering::SeqCst) == 1
+    });
+    preparer.submit(vec![job(&reader, 2, 2)]);
+    wait_for("the second read", || reader.finished() == 2);
+
+    let done = take_stamp(&preparer, 2);
+    assert_eq!(done.len(), 1, "take yields only the newest completion");
+    assert_eq!(
+        wakes.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a completion landing on a full slot wakes nobody"
+    );
+    assert!(preparer.take().is_none(), "the slot is empty after take");
+
+    preparer.submit(vec![job(&reader, 3, 3)]);
+    wait_for("the wake for an emptied slot", || {
+        wakes.load(std::sync::atomic::Ordering::SeqCst) == 2
+    });
+    take_stamp(&preparer, 3);
+}
+
+/// Timing accounting is process-global, so this runs alone in a child.
+#[test]
+fn preparer_reuses_its_buffers_across_a_burst() {
+    use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
+    use preparing::*;
+
+    const CHILD: &str = "FOCUSFORGE_GUI_PREPARER_BUFFER_ACCOUNTING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args([
+            "--exact",
+            "preparer_reuses_its_buffers_across_a_burst",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .status()
+        .expect("the isolated accounting test starts");
+        assert!(
+            status.success(),
+            "the isolated accounting test passes: {status}"
+        );
+        return;
+    }
+
+    enable_trace_accounting();
+    let sample_bytes = || {
+        timing_snapshot()
+            .expect("trace accounting is enabled")
+            .sample_bytes
+    };
+    let preparer = focusforge_gui::canvas::Preparer::new(|| {});
+    let mut stamp = 0;
+    for spp in [3, 1] {
+        let (reader, release) = FakeReader::new(spp);
+        for _ in 0..200 {
+            release.send(()).unwrap();
+        }
+        let request = |stamp: &mut u64, width: u32| {
+            *stamp += 1;
+            preparer.submit(vec![
+                job(&reader, width, *stamp),
+                job(&reader, width, *stamp),
+            ]);
+        };
+        let settle = |stamp: u64| preparer.recycle(take_stamp(&preparer, stamp));
+
+        // Warm-up reaches the full pipeline depth: a completion parked in
+        // the slot while a second one replaces it.
+        for round in 1..=2 {
+            request(&mut stamp, 64);
+            wait_for("the warm-up reads", || reader.finished() == 2 * round);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        settle(stamp);
+        let warm = sample_bytes();
+
+        for _ in 0..20 {
+            request(&mut stamp, 64);
+            settle(stamp);
+        }
+        for _ in 0..20 {
+            request(&mut stamp, 64);
+        }
+        settle(stamp);
+        assert_eq!(
+            sample_bytes() - warm,
+            0,
+            "spp {spp}: a burst of same-extent requests allocates no sample bytes"
+        );
+    }
+}
+
+#[test]
+fn preparer_starts_the_newest_request_without_delay() {
+    use preparing::*;
+    use std::time::{Duration, Instant};
+
+    let (reader, release) = FakeReader::new(1);
+    let preparer = focusforge_gui::canvas::Preparer::new(|| {});
+
+    let submitted = Instant::now();
+    preparer.submit(vec![job(&reader, 1, 1)]);
+    wait_for("the idle read to start", || reader.reads() == 1);
+    let idle_start = reader.log.lock().unwrap()[0].started;
+    assert!(
+        idle_start - submitted < Duration::from_millis(50),
+        "an idle worker starts at once: {:?}",
+        idle_start - submitted
+    );
+
+    preparer.submit(vec![job(&reader, 2, 2)]);
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(reader.reads(), 1, "the busy worker starts nothing else");
+    release.send(()).unwrap();
+    release.send(()).unwrap();
+    wait_for("the newest read to finish", || reader.finished() == 2);
+
+    let log = reader.log.lock().unwrap();
+    let first_end = log[0].ended.expect("the first read finished");
+    let gap = log[1].started.saturating_duration_since(first_end);
+    assert!(
+        log[1].started >= first_end && gap < Duration::from_millis(50),
+        "the newest read follows the active one's end: {gap:?}"
+    );
+}
+
+#[test]
+fn preparer_dropped_during_a_slow_read_wakes_nobody() {
+    use preparing::*;
+    let (reader, release) = FakeReader::new(1);
+    let (wakes, wake) = counter();
+    let preparer = focusforge_gui::canvas::Preparer::new(wake);
+
+    preparer.submit(vec![job(&reader, 1, 1)]);
+    wait_for("the read to start", || reader.reads() == 1);
+    drop(preparer);
+    release.send(()).unwrap();
+    wait_for("the read to finish", || reader.finished() == 1);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn stale_stamps_are_refused_in_any_arrival_order() {
+    use focusforge_gui::canvas::StampFloor;
+
+    let accepted = |floor: &mut StampFloor, stamps: &[u64]| -> Vec<u64> {
+        stamps
+            .iter()
+            .copied()
+            .filter(|&stamp| floor.accept(stamp))
+            .collect()
+    };
+    assert_eq!(accepted(&mut StampFloor::default(), &[1, 2, 3]), [1, 2, 3]);
+    assert_eq!(accepted(&mut StampFloor::default(), &[3, 2, 1]), [3]);
+    assert_eq!(
+        accepted(&mut StampFloor::default(), &[2, 1, 4, 3, 5, 5]),
+        [2, 4, 5]
+    );
+
+    let mut floor = StampFloor::default();
+    assert_eq!(accepted(&mut floor, &[1, 2]), [1, 2]);
+    floor.reset(10);
+    assert_eq!(
+        accepted(&mut floor, &[9, 10, 11, 8, 12]),
+        [11, 12],
+        "work issued before a reset is refused, whatever its order"
+    );
+}
+
+#[test]
+fn prepared_samples_match_a_direct_read() {
+    use focusforge_core::io::TiffStack;
+    use focusforge_core::tile::Rect;
+    use focusforge_core::zmap::ZMapReader;
+    use focusforge_gui::canvas::{Pane, PaneJob, PaneReader, Preparer};
+    use focusforge_gui::viewport::PaneDraw;
+    use preparing::take_stamp;
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+
+    let (composite_path, zmap_path) = golden_plane_files();
+    let frame_path = common::fixture_frame("mantis-64", 0);
+    let frame = Arc::new(TiffStack::open_files(&[frame_path]).expect("frame opens"));
+    let composite = Arc::new(TiffStack::open_files(&[composite_path]).expect("composite opens"));
+    let zmap = Arc::new(ZMapReader::open(&zmap_path).expect("Z-Map opens"));
+
+    let preparer = Preparer::new(|| {});
+    let mut stamp = 0;
+    let mut check = |pane: Pane,
+                     reader: Arc<dyn PaneReader>,
+                     size: (u32, u32),
+                     index_scale: u32,
+                     direct: &dyn Fn(Rect, NonZeroU32, &mut [u16])| {
+        let odd = |extent: u32| (extent - 4) | 1;
+        let rects = [(1, 3, odd(size.0), odd(size.1)), (0, 0, size.0, size.1)];
+        for (x, y, width, height) in rects {
+            for step in 1..=3 {
+                let step = NonZeroU32::new(step).unwrap();
+                let draw = PaneDraw {
+                    src: (x, y, width, height),
+                    dst: (0.0, 0.0, width as f32, height as f32),
+                    pixelated: false,
+                    step,
+                };
+                let (tex_w, tex_h) = draw.extent();
+                let mut expected =
+                    vec![
+                        0u16;
+                        tex_w as usize * tex_h as usize * reader.samples_per_pixel() as usize
+                    ];
+                let rect = Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                };
+                direct(rect, step, &mut expected);
+                stamp += 1;
+                preparer.submit(vec![PaneJob {
+                    pane,
+                    draw,
+                    stamp,
+                    reader: reader.clone(),
+                    index_scale,
+                }]);
+                let done = take_stamp(&preparer, stamp);
+                assert_eq!(
+                    done[0].samples, expected,
+                    "{pane:?} {:?} step {step}: worker samples equal a direct read",
+                    draw.src
+                );
+                preparer.recycle(done);
+            }
+        }
+    };
+
+    check(
+        Pane::Frame,
+        frame.clone(),
+        frame.dimensions(),
+        0,
+        &|rect, step, out| frame.read_tile_step_into(0, rect, step, out).unwrap(),
+    );
+    let composite_size = composite.dimensions();
+    check(
+        Pane::Composite,
+        composite.clone(),
+        composite_size,
+        0,
+        &|rect, step, out| composite.read_tile_step_into(0, rect, step, out).unwrap(),
+    );
+    check(
+        Pane::ZMap,
+        zmap.clone(),
+        composite_size,
+        1,
+        &|rect, step, out| zmap.read_tile_step_into(rect, step, out).unwrap(),
+    );
+}
+
+/// A job requested before a source switch, close, plane selection, device
+/// change or a newer publish renders and uploads nothing. Upload accounting
+/// is process-global, so this runs alone in a child.
+#[test]
+fn stale_results_render_nothing() {
+    use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
+    use focusforge_gui::canvas::{PaneJob, PaneSource};
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+    use focusforge_gui::viewport::PaneDraw;
+    use std::num::NonZeroU32;
+
+    const CHILD: &str = "FOCUSFORGE_GUI_STALE_RESULTS_ACCOUNTING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args([
+            "--exact",
+            "stale_results_render_nothing",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .status()
+        .expect("the isolated accounting test starts");
+        assert!(
+            status.success(),
+            "the isolated accounting test passes: {status}"
+        );
+        return;
+    }
+
+    enable_trace_accounting();
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let (composite_path, zmap_path) = golden_plane_files();
+    let frame_path = common::fixture_frame("mantis-64", 0);
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer.set_frame(&frame_path).unwrap();
+
+    let draw = |x: u32| PaneDraw {
+        src: (x, 5, 37, 23),
+        dst: (0.0, 0.0, 37.0, 23.0),
+        pixelated: false,
+        step: NonZeroU32::new(2).unwrap(),
+    };
+    let uploaded = || {
+        timing_snapshot()
+            .expect("trace accounting is enabled")
+            .upload_bytes
+    };
+    let samples = |job: &PaneJob| {
+        let (width, height) = job.draw.extent();
+        let mut samples =
+            vec![0u16; width as usize * height as usize * job.reader.samples_per_pixel() as usize];
+        let (x, y, w, h) = job.draw.src;
+        let rect = focusforge_core::tile::Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        job.reader
+            .read_step_into(rect, job.draw.step, &mut samples)
+            .expect("the fixture reads");
+        samples
+    };
+    let refused = |renderer: &mut CanvasRenderer, job: &PaneJob, label: &str| {
+        let before = uploaded();
+        assert!(
+            renderer.publish(job, &samples(job)).is_none(),
+            "{label}: the stale job is refused"
+        );
+        assert_eq!(uploaded(), before, "{label}: nothing is uploaded");
+    };
+    let accepted = |renderer: &mut CanvasRenderer, job: &PaneJob, label: &str| {
+        let before = uploaded();
+        assert!(
+            renderer.publish(job, &samples(job)).is_some(),
+            "{label}: the fresh job is accepted"
+        );
+        assert!(uploaded() > before, "{label}: the accepted job uploads");
+    };
+
+    // Older than a published view.
+    let older = renderer.request_frame(&draw(4)).expect("frame job");
+    let newer = renderer.request_frame(&draw(5)).expect("frame job");
+    accepted(&mut renderer, &newer, "newer frame view");
+    refused(&mut renderer, &older, "older frame view");
+
+    // Requesting a view the pane already shows retires work in flight.
+    let in_flight = renderer.request_frame(&draw(6)).expect("frame job");
+    assert!(renderer.request_frame(&draw(5)).is_none(), "already shown");
+    refused(
+        &mut renderer,
+        &in_flight,
+        "view retired by a covered request",
+    );
+
+    // A source switch.
+    let before_frame_switch = renderer.request_frame(&draw(7)).expect("frame job");
+    renderer.set_frame(&frame_path).unwrap();
+    refused(&mut renderer, &before_frame_switch, "set_frame");
+    let before_frame_close = renderer.request_frame(&draw(7)).expect("frame job");
+    renderer.clear_frame();
+    renderer.set_frame(&frame_path).unwrap();
+    refused(&mut renderer, &before_frame_close, "clear_frame");
+
+    let before_planes = renderer.request_planes(&draw(7)).expect("plane job");
+    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    refused(&mut renderer, &before_planes, "set_planes");
+    let before_clear = renderer.request_planes(&draw(7)).expect("plane job");
+    renderer.clear_planes();
+    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    refused(&mut renderer, &before_clear, "clear_planes");
+
+    // A plane selection.
+    let before_select = renderer.request_planes(&draw(7)).expect("plane job");
+    renderer.select_plane(PaneSource::ZMap);
+    refused(&mut renderer, &before_select, "select_plane");
+    let zmap_job = renderer.request_planes(&draw(7)).expect("Z-Map job");
+    accepted(&mut renderer, &zmap_job, "Z-Map after the selection");
+
+    // A device change.
+    let before_device = renderer.request_planes(&draw(8)).expect("plane job");
+    renderer.detach_device();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    refused(&mut renderer, &before_device, "detach and attach");
+}

@@ -146,6 +146,32 @@ impl PaneDraw {
         let step = self.step.get();
         (self.src.2.div_ceil(step), self.src.3.div_ceil(step))
     }
+
+    /// The pane-local rect a texture covering the source rect `src` occupies
+    /// under this draw's scale and offset; `place(self.src) == self.dst`.
+    pub fn place(&self, src: (u32, u32, u32, u32)) -> (f32, f32, f32, f32) {
+        let axis = |dst_pos: f32, dst_len: f32, own: (u32, u32), (pos, len): (u32, u32)| {
+            let scale = f64::from(dst_len) / f64::from(own.1);
+            let offset = (f64::from(pos) - f64::from(own.0)) * scale;
+            (
+                (f64::from(dst_pos) + offset) as f32,
+                (f64::from(dst_len) * f64::from(len) / f64::from(own.1)) as f32,
+            )
+        };
+        let (x, w) = axis(
+            self.dst.0,
+            self.dst.2,
+            (self.src.0, self.src.2),
+            (src.0, src.2),
+        );
+        let (y, h) = axis(
+            self.dst.1,
+            self.dst.3,
+            (self.src.1, self.src.3),
+            (src.1, src.3),
+        );
+        (x, y, w, h)
+    }
 }
 
 impl Viewport {
