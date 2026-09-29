@@ -29,7 +29,8 @@ use super::manifest::{
 use super::read_json;
 use super::seal::{now_unix, record, source_ref};
 use super::{
-    HASH_ALGORITHM, Op, Project, SealedProject, format_version_for, materialize_zmap, resolve_chain,
+    HASH_ALGORITHM, Op, Project, SealedProject, format_version_for, fused_extent, materialize_zmap,
+    resolve_chain,
 };
 use crate::params::ParamValues;
 use crate::retouch::{replay, write_edited};
@@ -539,18 +540,11 @@ fn open_at_checkpoint(
     let project = Project::open(project_path)?;
     let head = project.history().get(parent)?.clone();
     let manifest = project.manifest().clone();
-    let mut width = manifest.zmap.width;
-    let mut height = manifest.zmap.height;
-    let mut frame_count = manifest.zmap.frame_count;
-    match project.fuse_state(parent) {
-        Ok(record) => {
-            width = record.composite.width;
-            height = record.composite.height;
-            frame_count = record.composite.frame_count;
-        }
-        Err(ProjectError::FuseStateUnknown { .. }) => {}
-        Err(err) => return Err(err),
-    }
+    let (width, height, frame_count) = fused_extent(&project, parent)?.unwrap_or((
+        manifest.zmap.width,
+        manifest.zmap.height,
+        manifest.zmap.frame_count,
+    ));
     let info = ZMapInfo::new(width, height, frame_count)
         .map_err(|err| ProjectError::container(project_path, err))?;
     Ok((project, head, manifest, info))

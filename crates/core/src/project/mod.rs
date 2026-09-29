@@ -196,6 +196,23 @@ fn stream_bands<W: PlaneWriter>(
     }
 }
 
+/// `id`'s fused ancestor's composite extent, or `None` when `id` predates
+/// any fuse.
+pub(super) fn fused_extent(
+    project: &Project,
+    id: &str,
+) -> Result<Option<(u32, u32, u32)>, ProjectError> {
+    match project.fuse_state(id) {
+        Ok(record) => Ok(Some((
+            record.composite.width,
+            record.composite.height,
+            record.composite.frame_count,
+        ))),
+        Err(ProjectError::FuseStateUnknown { .. }) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// Streams a Z-Map that is not necessarily the project's head: `checkpoint`
 /// names its own `zmap_blob`, resolved against [`Manifest::blobs`] to
 /// either a `full` record read directly or a chain of `sparse-delta`
@@ -209,14 +226,10 @@ pub fn materialize_zmap(
     path: &Path,
 ) -> Result<(), ProjectError> {
     let mut plane_ref = project.manifest().zmap.clone();
-    match project.fuse_state(&checkpoint.id) {
-        Ok(record) => {
-            plane_ref.width = record.composite.width;
-            plane_ref.height = record.composite.height;
-            plane_ref.frame_count = record.composite.frame_count;
-        }
-        Err(ProjectError::FuseStateUnknown { .. }) => {}
-        Err(err) => return Err(err),
+    if let Some((width, height, frame_count)) = fused_extent(project, &checkpoint.id)? {
+        plane_ref.width = width;
+        plane_ref.height = height;
+        plane_ref.frame_count = frame_count;
     }
     let blobs = project.manifest().blobs.clone();
     let (base, deltas) = resolve_chain(&blobs, &checkpoint.zmap_blob, project.path())?;
