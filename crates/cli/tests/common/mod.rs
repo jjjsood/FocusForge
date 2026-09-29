@@ -128,10 +128,12 @@ pub fn data_dir_of(cmd: &Command) -> PathBuf {
 /// a filesystem where a mode change actually takes effect. Restores a
 /// writable mode before its own `TempDir` removes it.
 #[allow(dead_code)]
+#[cfg(unix)]
 pub struct ReadOnlyDir {
     dir: tempfile::TempDir,
 }
 
+#[cfg(unix)]
 impl std::ops::Deref for ReadOnlyDir {
     type Target = Path;
 
@@ -140,12 +142,14 @@ impl std::ops::Deref for ReadOnlyDir {
     }
 }
 
+#[cfg(unix)]
 impl Drop for ReadOnlyDir {
     fn drop(&mut self) {
         let _ = set_mode(self.dir.path(), 0o755);
     }
 }
 
+#[cfg(unix)]
 fn set_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
@@ -154,6 +158,7 @@ fn set_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
 /// Tries to create and remove a marker file in `dir`; `true` means the
 /// directory is still writable, so a mode change meant to block that either
 /// failed or has no effect on this filesystem.
+#[cfg(unix)]
 fn still_writable(dir: &Path) -> bool {
     let marker = dir.join(".readonly-probe");
     match std::fs::write(&marker, b"") {
@@ -170,6 +175,7 @@ fn still_writable(dir: &Path) -> bool {
 /// fails, undoes the mode change, prints a one-line skip notice to stderr,
 /// and returns `None`.
 #[allow(dead_code)]
+#[cfg(unix)]
 pub fn readonly_dir(label: &str, mode: u32, populate: impl FnOnce(&Path)) -> Option<ReadOnlyDir> {
     let dir = tempfile::Builder::new()
         .prefix(label)

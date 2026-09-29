@@ -101,6 +101,7 @@ fn json_lines_every_line_parses_as_an_object_with_the_required_keys() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn unwritable_data_directory_falls_back_to_stderr_alone() {
     let mut cmd = common::cli_bin("diagnostics_cli_unwritable");
@@ -132,6 +133,7 @@ fn unwritable_data_directory_falls_back_to_stderr_alone() {
 /// and then refuses (no `--algo`), so one spawn carries both a mirrored
 /// warning and a mirrored refusal. `None` when this filesystem does not
 /// enforce the read-only directory the warning depends on.
+#[cfg(unix)]
 fn warn_and_refuse(
     label: &str,
     verbose: bool,
@@ -155,6 +157,7 @@ fn count_lines(stderr: &str, needle: &str) -> usize {
     stderr.lines().filter(|line| line.contains(needle)).count()
 }
 
+#[cfg(unix)]
 #[test]
 fn mirrored_output_prints_once() {
     for (label, verbose) in [
@@ -189,6 +192,7 @@ fn mirrored_output_prints_once() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn refusal_reaches_the_log() {
     let Some((mut cmd, _dir, status)) = warn_and_refuse("diagnostics_cli_refusal_log", false)

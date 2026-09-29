@@ -146,6 +146,7 @@ fn previous_hook_chained() {
     assert!(path.is_file());
 }
 
+#[cfg(unix)]
 #[test]
 fn unwritable_crash_dir() {
     let Some(readonly) = common::readonly_dir("crash_cli_unwritable", 0o500, |_| {}) else {
