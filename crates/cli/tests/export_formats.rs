@@ -2,14 +2,9 @@
 
 //! `focusforge-cli export`'s per-format options: TIFF bit depth and
 //! compression, PNG bit depth and compression, JPEG quality and chroma
-//! subsampling, extension inference and every refusal.
-//!
-//! A small synthetic project stands in for `export_cli.rs`'s shared
-//! `fixtures/mantis-512` stack run: a single source frame carrying a smooth
-//! two-axis gradient, so compressed formats have something worth
-//! compressing and 8-bit rounding has something worth rounding, at a width
-//! that is not a multiple of 16 and a height spanning more than one
-//! export band.
+//! subsampling, extension inference and every refusal. A single-frame
+//! gradient project, sized off a multiple of 16 and spanning more than one
+//! export band, gives compression and 8-bit rounding something to do.
 
 mod common;
 

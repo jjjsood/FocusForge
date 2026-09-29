@@ -306,8 +306,10 @@ impl<W: Write + Seek> StripWriter<W> {
             self.cursor += 1;
         }
         let ifd_offset = self.cursor;
+        // `ifd_offset` is word-aligned above and the entry table's own
+        // length (2 + 12n + 4) is always even, so `cursor` starts even too.
         let mut cursor = ifd_offset + 2 + 12 * u64::from(n) + 4;
-        cursor += cursor % 2;
+        debug_assert!(cursor.is_multiple_of(2));
         let mut offsets: Vec<u64> = vec![0; entries.len()];
         for (i, (_, _, _, data)) in entries.iter().enumerate() {
             if data.len() > 4 {
