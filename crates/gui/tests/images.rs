@@ -82,10 +82,10 @@ fn wait_for_settle(controller: &mut AppController, timeout: Duration) {
     let start = Instant::now();
     loop {
         if controller.settle_job().is_some() {
-            return;
+            break;
         }
         if !job::is_live(&controller.job_view().state) {
-            return;
+            break;
         }
         assert!(
             start.elapsed() < timeout,
@@ -93,6 +93,11 @@ fn wait_for_settle(controller: &mut AppController, timeout: Duration) {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+    // A commit now auto-enters Editor on the viewed tab; this file's tests
+    // are about Stacking-mode frame curation, so back out to a known
+    // baseline (`controller_in_editor_mode` still enters Editor itself,
+    // right after this call, for the few tests that want it).
+    controller.set_mode(ShellMode::Stacking);
 }
 
 /// Saves the active, never-saved tab to the path the save dialog proposes,

@@ -4577,6 +4577,9 @@ impl AppController {
         // drawing the old extent's zoom/pan.
         tab.viewport = None;
         self.clear_failure(&path);
+        if self.state.active == Some(index) {
+            self.set_mode(ShellMode::Editor);
+        }
         planes
     }
 

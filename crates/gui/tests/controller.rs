@@ -499,6 +499,9 @@ fn editor_mode_is_refused_without_fused_planes() {
 fn editor_mode_requires_the_fused_frame_set() {
     let mut controller = controller_with_scratch("editor_frame_set");
     let root = open_fused_tab(&mut controller, "editor_frame_set", 3);
+    // A fuse now auto-enters Editor on the viewed tab; back out to Stacking
+    // so this test's own frame-management calls below (Stacking-only) run.
+    controller.set_mode(ShellMode::Stacking);
     assert!(controller.editor_enabled());
 
     controller.toggle_frame_excluded(1);
@@ -520,6 +523,7 @@ fn editor_mode_requires_the_fused_frame_set() {
     assert!(!controller.editor_enabled(), "after a confirmed Remove");
     assert_editor_refused(&mut controller, "after a confirmed Remove");
     settle_all(&mut controller);
+    controller.set_mode(ShellMode::Stacking);
     assert_eq!(controller.checkpoint_count(), Some(2));
     assert!(
         controller.editor_enabled(),
@@ -580,8 +584,13 @@ fn editor_mode_refuses_during_the_tabs_own_run() {
 fn edit_session_is_per_tab_and_survives_mode_switches() {
     let mut controller = controller_with_scratch("edit_session_per_tab");
     open_fused_tab(&mut controller, "edit_session_per_tab_a", 2);
+    controller.set_mode(ShellMode::Stacking);
     open_fused_tab(&mut controller, "edit_session_per_tab_b", 3);
-    assert!(controller.edit_session().is_none(), "none before entry");
+    // A fuse now auto-enters Editor on the viewed tab (tab 1, just fused),
+    // which opens its session at commit time, not lazily on a later manual
+    // entry -- back to Stacking so the manual (re-)entry below, and the
+    // per-tab isolation this test is actually about, are what's under test.
+    controller.set_mode(ShellMode::Stacking);
 
     assert!(controller.set_mode(ShellMode::Editor));
     let (_, zmap_b) = controller.materialize_active_tab_planes().unwrap();
@@ -2266,6 +2275,9 @@ fn frame_and_plane_panes_share_one_size_and_rect() {
 fn post_fuse_frame_uses_identity_at_the_composite_crop() {
     let mut controller = controller_with_scratch("post_fuse_frame");
     let root = open_fused_tab(&mut controller, "post_fuse_frame", 3);
+    // A fuse now auto-enters Editor on the viewed tab; back out to Stacking
+    // so `add_frames` below (Stacking-only) actually extends the frame set.
+    controller.set_mode(ShellMode::Stacking);
 
     // The `editor_mode_requires_the_fused_frame_set` pattern: a missing
     // frame still lands in `tab.frames` (`apply_add_frames` runs
@@ -2903,6 +2915,9 @@ fn legend_rows_carry_the_z_map_palette() {
 fn legend_header_states() {
     let mut c = controller_with_scratch("legend_header");
     open_fused_tab(&mut c, "legend_header", 3);
+    // A fuse now auto-enters Editor on the viewed tab; back out to Stacking
+    // so the "before" half of this test observes the Stacking-mode legend.
+    c.set_mode(ShellMode::Stacking);
     c.toggle_frame_excluded(1);
     assert_eq!(
         c.images_panel().header_text,
@@ -2928,6 +2943,9 @@ fn legend_header_states() {
 fn legend_no_source_entry_is_pinned_and_unpaintable() {
     let mut c = controller_with_scratch("legend_no_source");
     open_fused_tab(&mut c, "legend_no_source", 3);
+    // A fuse now auto-enters Editor on the viewed tab; back out to Stacking
+    // so the "before" half of this test observes the Stacking-mode legend.
+    c.set_mode(ShellMode::Stacking);
     assert!(
         !c.images_panel().no_source_row,
         "stacking mode has no pinned entry"
@@ -3150,7 +3168,21 @@ fn cursor_geometry_follows_radius_softness_and_zoom() {
 #[test]
 fn pipette_reads_and_appends_nothing() {
     let mut c = controller_with_scratch("brush_pipette");
-    open_fused_tab(&mut c, "brush_pipette", 3);
+    // Fused with a decoy tab active at settle time, so the auto-entry into
+    // Editor a commit now triggers skips tab 0 (it isn't the viewed tab) --
+    // its edit session must open fresh below, after the Z-Map is rewritten,
+    // not stale from commit time.
+    open_mantis64_tab(&mut c, "brush_pipette", 3);
+    assert!(c.start_fuse());
+    open_mantis64_tab(&mut c, "brush_pipette_decoy", 2);
+    settle_all(&mut c);
+    c.select_project(0);
+    assert_eq!(c.checkpoint_count(), Some(1), "brush_pipette must fuse");
+    assert_eq!(
+        c.mode(),
+        ShellMode::Stacking,
+        "tab 0 was not the viewed tab at settle"
+    );
     // An 8 x 8 block of `NO_SOURCE` in the sealed map's top-left corner.
     let zmap = c.held_checkpoints().last().unwrap().zmap.clone();
     let info = ZMapReader::open(&zmap).unwrap().info();
