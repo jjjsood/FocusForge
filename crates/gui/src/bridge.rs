@@ -1045,7 +1045,7 @@ fn open_recent(
 
 /// Runs one of the controller's saves -- `Save project`, its `Ctrl+S` twin
 /// and the close question's `Save and close`. A failed save closes the
-/// projects overlay, so the failure toast that waits behind it shows at once.
+/// projects overlay before opening the failure toast.
 fn save_project(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,

@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use focusforge_gui::{AppController, OpenAs, OpenOutcome};
@@ -139,6 +140,28 @@ pub fn wait_for_settle(
         }
         if !controller.work_pending() {
             return None;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "job did not settle within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Drives an installed window's own repeating job-poll timer
+/// ([`focusforge_gui::job::POLL`]) until the run it is polling settles, by
+/// alternating a mocked timer tick with a short real sleep. The fuse itself
+/// runs on a real worker thread, so `mock_elapsed_time` alone never unblocks
+/// it, and the timer tick locks `controller` itself, so the lock here is
+/// taken and released between ticks rather than held across the call.
+#[allow(dead_code)]
+pub fn settle_via_job_timer(controller: &Arc<Mutex<AppController>>, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        i_slint_backend_testing::mock_elapsed_time(focusforge_gui::job::POLL);
+        if !controller.lock().unwrap().work_pending() {
+            return;
         }
         assert!(
             start.elapsed() < timeout,

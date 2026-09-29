@@ -32,6 +32,8 @@ export component FFProjectsOverlay inherits Rectangle {
     callback save-project-requested();
     callback recent-clicked(int);
     out property <length> gallery-width: gallery.viewport-width;
+    out property <length> gallery-x: gallery.x;
+    out property <length> gallery-y: gallery.y;
 
     visible: root.overlay-open;
     background: Theme.surface-base;

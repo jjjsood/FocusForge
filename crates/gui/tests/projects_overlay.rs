@@ -642,6 +642,90 @@ fn run_again_stays_on_one_card_until_success() {
     assert_eq!(controller.checkpoint_count(), Some(1));
 }
 
+/// A window backend, initialized once per thread -- `AppWindow::new()`
+/// otherwise panics on a second call from the same thread.
+fn init_window_backend() {
+    thread_local! {
+        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    INIT.with(|done| {
+        if !done.get() {
+            i_slint_backend_testing::init_no_event_loop();
+            done.set(true);
+        }
+    });
+}
+
+/// Run again on a failed card, started from inside the open overview,
+/// announces its own failure there too: the overview stays open, the toast
+/// carries the operation's summary, and the card it re-ran still reads
+/// `failed` with one card per tab.
+#[test]
+fn run_again_failure_is_announced_over_the_overview() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("run_again_over_overview_scratch"));
+    open_frames(&mut controller, "run_again_over_overview_healthy", 2);
+    open_unreadable_frames(&mut controller, "run_again_over_overview_failing");
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+
+    // The first failure, from the tab's own Fuse stack -- let its toast
+    // expire so the second opening below is the one under test.
+    app.invoke_fuse_requested();
+    common::settle_via_job_timer(&controller, Duration::from_secs(60));
+    assert!(app.get_job_toast_open());
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(6100));
+    assert!(
+        !app.get_job_toast_open(),
+        "the first toast must have expired before the retry"
+    );
+
+    controller.lock().unwrap().toggle_projects_overlay();
+    focusforge_gui::bridge::push_projects_overlay(&app, &controller.lock().unwrap());
+
+    let failing_index = 1;
+    app.invoke_projects_card_action_clicked(failing_index as i32);
+    common::settle_via_job_timer(&controller, Duration::from_secs(60));
+
+    assert!(
+        app.get_job_toast_open(),
+        "Run again's own failure must be announced too"
+    );
+    assert_eq!(app.get_job_toast_message(), "Setup failed");
+    assert!(
+        app.get_projects_overlay_open(),
+        "the overview must stay open"
+    );
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(400));
+    let opacity = ElementQuery::from_root(&app)
+        .match_id("AppWindow::job-toast")
+        .find_first()
+        .expect("the toast is always in the tree")
+        .computed_opacity();
+    assert!(
+        opacity > 0.99,
+        "the toast must be visible over the overview, got opacity {opacity}"
+    );
+
+    let cards = controller.lock().unwrap().project_cards();
+    assert_eq!(cards.len(), 2, "still one card per tab");
+    assert_eq!(cards[failing_index].kind, "failed");
+}
+
 #[test]
 fn a_cancelled_run_stays_on_its_own_card() {
     let mut controller = AppController::new();

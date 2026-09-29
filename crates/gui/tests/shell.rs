@@ -451,6 +451,70 @@ fn crash_notice_placement_and_absence() {
     );
 }
 
+/// The failure toast paints over the gallery's gutter while the Projects
+/// overview is open, at the pane gutter otherwise, and (closed) never blocks
+/// a click on the card underneath it.
+#[test]
+fn failure_toast_placement_over_the_projects_overview() {
+    let app = app_at(1440, 900);
+    app.set_projects_overlay_open(true);
+    app.set_job_toast_open(true);
+    assert_rect(&app, "AppWindow::job-toast", (312.0, 108.0, 300.0, 84.0));
+
+    let narrow = app_at(1200, 760);
+    narrow.set_projects_overlay_open(true);
+    narrow.set_job_toast_open(true);
+    assert_rect(&narrow, "AppWindow::job-toast", (312.0, 108.0, 300.0, 84.0));
+
+    app.set_projects_overlay_open(false);
+    assert_rect(&app, "AppWindow::job-toast", (12.0, 88.0, 300.0, 84.0));
+
+    app.set_job_toast_open(false);
+    app.set_projects_overlay_open(true);
+    let card = focusforge_gui::ProjectCardView {
+        kind: "open".into(),
+        opened: true,
+        current: false,
+        unsaved: false,
+        fusing: false,
+        fusing_fraction: 0.0,
+        project_name: "demo".into(),
+        meta_text: "".into(),
+        headline: "".into(),
+        stage: "".into(),
+        reason: "".into(),
+        action_label: "".into(),
+        has_picture: false,
+        picture: slint::Image::default(),
+        x: 0.0,
+        y: 0.0,
+    };
+    app.set_project_cards(std::rc::Rc::new(slint::VecModel::from(vec![card])).into());
+    app.set_gallery_content_height(300.0);
+    let recorded = std::rc::Rc::new(std::cell::RefCell::new(None));
+    app.on_projects_card_clicked({
+        let recorded = recorded.clone();
+        move |i| *recorded.borrow_mut() = Some(i)
+    });
+    let position = slint::LogicalPosition::new(400.0, 170.0);
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerPressed {
+            position,
+            button: slint::platform::PointerEventButton::Left,
+        });
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerReleased {
+            position,
+            button: slint::platform::PointerEventButton::Left,
+        });
+    assert_eq!(
+        *recorded.borrow(),
+        Some(0),
+        "a point inside the closed toast's rect that is also inside the first \
+         card must still reach the card"
+    );
+}
+
 /// The gear carries its own persistently-boxed background -- the "icon
 /// button" catalogue entry's default state already carries a visible box --
 /// rather than a bare `TouchArea`. It does **not** share the zoom

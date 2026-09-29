@@ -1650,6 +1650,152 @@ fn failure_notifications_outlive_the_toast() {
     }
 }
 
+/// A window backend, initialized once per thread -- `AppWindow::new()`
+/// otherwise panics on a second call from the same thread.
+fn init_window_backend() {
+    thread_local! {
+        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    INIT.with(|done| {
+        if !done.get() {
+            i_slint_backend_testing::init_no_event_loop();
+            done.set(true);
+        }
+    });
+}
+
+/// A failure that settles while the Projects overview is open is announced
+/// through the failure toast regardless of which tab is active: the run
+/// starts on the tab that will fail, a different tab is then selected, and
+/// the toast still opens once the overview is up.
+#[test]
+fn failure_while_the_overview_is_open_is_announced() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+
+    let mut controller = controller_with_frames("overview_open_healthy", 3);
+    add_unreadable_tab(&mut controller, "overview_open_failing", 2);
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+
+    // The failing tab (index 1, made active by `add_unreadable_tab`) starts
+    // the run; a different tab is selected before it settles.
+    app.invoke_fuse_requested();
+    controller.lock().unwrap().select_project(0);
+    controller.lock().unwrap().toggle_projects_overlay();
+    focusforge_gui::bridge::push_projects_overlay(&app, &controller.lock().unwrap());
+
+    common::settle_via_job_timer(&controller, Duration::from_secs(60));
+
+    assert!(
+        app.get_job_toast_open(),
+        "a failure settling under the open overview must open the toast, \
+         regardless of which tab is active"
+    );
+    assert_eq!(app.get_job_toast_message(), "Setup failed");
+    assert!(
+        app.get_projects_overlay_open(),
+        "the overview must stay open"
+    );
+
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(400));
+    let opacity = ElementQuery::from_root(&app)
+        .match_id("AppWindow::job-toast")
+        .find_first()
+        .expect("the toast is always in the tree")
+        .computed_opacity();
+    assert!(
+        opacity > 0.99,
+        "the toast must fade in to fully visible, got opacity {opacity}"
+    );
+}
+
+/// Display time counts only visible time: the toast's 6 s auto-dismiss runs
+/// from the moment it opens, so a failure settling under the open overview
+/// stays visible for its whole display time once shown, and closing the
+/// overview afterwards never brings a stale, already-expired toast back.
+#[test]
+fn a_failure_toast_is_not_spent_while_hidden() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+
+    let controller = Arc::new(Mutex::new(controller_with_an_unreadable_frame(
+        "toast_not_spent_while_hidden",
+    )));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+
+    controller.lock().unwrap().toggle_projects_overlay();
+    focusforge_gui::bridge::push_projects_overlay(&app, &controller.lock().unwrap());
+
+    app.invoke_fuse_requested();
+    common::settle_via_job_timer(&controller, Duration::from_secs(60));
+    assert!(
+        app.get_job_toast_open(),
+        "the toast must open the moment the run settles, whether or not the overview is open"
+    );
+
+    let toast_opacity = || {
+        ElementQuery::from_root(&app)
+            .match_id("AppWindow::job-toast")
+            .find_first()
+            .expect("the toast is always in the tree")
+            .computed_opacity()
+    };
+
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(400));
+    assert!(
+        toast_opacity() > 0.99,
+        "the toast must be fully visible once its fade-in completes"
+    );
+
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(5100));
+    assert!(
+        app.get_job_toast_open(),
+        "the toast must still be open at 5.5 s, not expired unseen"
+    );
+    assert!(
+        toast_opacity() > 0.99,
+        "the toast must still be fully visible at 5.5 s"
+    );
+
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(600));
+    assert!(
+        !app.get_job_toast_open(),
+        "the toast must have auto-dismissed by 6.1 s"
+    );
+
+    controller.lock().unwrap().toggle_projects_overlay();
+    focusforge_gui::bridge::push_projects_overlay(&app, &controller.lock().unwrap());
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+    assert_eq!(
+        toast_opacity(),
+        0.0,
+        "closing the overview after the toast expired must not bring a stale toast back"
+    );
+}
+
 #[test]
 fn a_tab_switch_updates_the_bar_without_a_job_event() {
     use slint::ComponentHandle;
