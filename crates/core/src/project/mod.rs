@@ -55,6 +55,7 @@ pub mod blob;
 pub mod checkpoint;
 pub mod container;
 pub mod error;
+pub mod export;
 pub mod manifest;
 mod render;
 pub mod review;
@@ -75,11 +76,12 @@ pub use blob::{Plane, StagedBlob, hash_file, short_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, FuseRecord, History, Op, Point};
 pub use container::{ProjectWriter, partial_path};
 pub use error::ProjectError;
+pub use export::export_checkpoint;
 pub use manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
     SourceResolution,
 };
-pub use render::{CheckpointImage, export_checkpoint, render_checkpoint};
+pub use render::{CheckpointImage, render_checkpoint};
 pub use review::ReviewMetrics;
 pub use seal::{HeldCheckpoint, SealRequest, SealedProject, now_unix, seal, seal_at, seal_held};
 pub use validate::{

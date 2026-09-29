@@ -9,9 +9,11 @@
 //! Two properties this module exists to keep:
 //!
 //! - **The Z-Map gathers the image.** `-o` writes a per-pixel gather of the
-//!   checkpoint's own Z-Map over its verified source frames, the exact
-//!   `ImageDescription` the fuse recorded, the same twelve-tag IFD
-//!   `TiffWriter` always writes.
+//!   checkpoint's own Z-Map over its verified source frames, encoded as
+//!   `--format` and its per-format flags say. The default
+//!   (`--format tiff --tiff-bits 16 --tiff-compression none`, which an
+//!   extension-less or `.tif`/`.tiff` `-o` also selects) writes a
+//!   twelve-tag uncompressed IFD.
 //! - **A warning, never a silence.** A project whose sources cannot be
 //!   resolved relatively names every one of them on stderr and still writes
 //!   the image. `core` returns them as data; printing them is this
@@ -21,9 +23,127 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use clap::Args;
+use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::project::export::{ExportFormat, ExportOptions, params_for};
 use focusforge_core::project::{self, Project};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
+
+/// `--format` and every per-format flag `export` accepts. Flattened into
+/// `Command::Export`; each field is `Option<String>` so an absent flag
+/// falls back to its format's own `ParamDesc` default rather than clap's.
+#[derive(Args, Default)]
+pub struct FormatArgs {
+    /// The image format to write: `tiff`, `png` or `jpeg`. Inferred from
+    /// `-o`'s extension when omitted (`.tif`/`.tiff` -> tiff, `.png` -> png,
+    /// `.jpg`/`.jpeg` -> jpeg, no extension -> tiff, the default); refused
+    /// if it names a format other than a recognised extension's.
+    #[arg(long)]
+    format: Option<String>,
+    /// TIFF bit depth: `16` (default) or `8`. TIFF only.
+    #[arg(long = "tiff-bits", value_name = "BITS")]
+    tiff_bits: Option<String>,
+    /// TIFF strip compression: `none` (default), `lzw` or `deflate`. TIFF
+    /// only.
+    #[arg(long = "tiff-compression", value_name = "NAME")]
+    tiff_compression: Option<String>,
+    /// PNG bit depth: `16` (default) or `8`. PNG only.
+    #[arg(long = "png-bits", value_name = "BITS")]
+    png_bits: Option<String>,
+    /// PNG compression effort: `fast`, `default` (default) or `best`. PNG
+    /// only.
+    #[arg(long = "png-compression", value_name = "NAME")]
+    png_compression: Option<String>,
+    /// JPEG quality, 1-100, default 95. JPEG only.
+    #[arg(long = "jpeg-quality", value_name = "N")]
+    jpeg_quality: Option<String>,
+    /// JPEG chroma subsampling: `444` (default) or `420`. JPEG only.
+    #[arg(long = "jpeg-subsampling", value_name = "SPEC")]
+    jpeg_subsampling: Option<String>,
+}
+
+/// Every `FormatArgs` flag, paired with the `ParamDesc` id it fills, in
+/// declaration order.
+const FORMAT_FLAG_IDS: [&str; 6] = [
+    "tiff-bits",
+    "tiff-compression",
+    "png-bits",
+    "png-compression",
+    "jpeg-quality",
+    "jpeg-subsampling",
+];
+
+/// Resolves the format to encode as: `--format` when given, refused if it
+/// names a format other than a recognised extension's; otherwise the
+/// extension `-o` names; otherwise TIFF -- the default an extension-less
+/// path, or an unrecognised extension paired with an explicit `--format`,
+/// keeps.
+fn resolve_format(output: &Path, explicit: Option<&str>) -> Result<ExportFormat, String> {
+    let explicit = explicit
+        .map(|text| match text {
+            "tiff" => Ok(ExportFormat::Tiff),
+            "png" => Ok(ExportFormat::Png),
+            "jpeg" => Ok(ExportFormat::Jpeg),
+            other => Err(format!(
+                "--format: unknown format {other:?}, expected tiff, png or jpeg"
+            )),
+        })
+        .transpose()?;
+    let inferred = ExportFormat::from_extension(output);
+    match (explicit, inferred) {
+        (Some(fmt), Some(ext_fmt)) if fmt != ext_fmt => Err(format!(
+            "--format {} conflicts with {}'s extension, which names {}",
+            fmt.id(),
+            output.display(),
+            ext_fmt.id()
+        )),
+        (Some(fmt), _) => Ok(fmt),
+        (None, Some(ext_fmt)) => Ok(ext_fmt),
+        (None, None) if output.extension().is_some() => Err(format!(
+            "--format: {} has an unrecognised extension; pass --format tiff, png or jpeg",
+            output.display()
+        )),
+        (None, None) => Ok(ExportFormat::Tiff),
+    }
+}
+
+/// Resolves `args` into a validated `ExportOptions` for the format `output`
+/// selects: a flag belonging to another format is refused by name, and
+/// every given flag is parsed and range-checked through its own
+/// `ParamDesc` before `ExportOptions::from_values` fills the rest from that
+/// format's defaults.
+fn resolve_export_options(output: &Path, args: &FormatArgs) -> Result<ExportOptions, String> {
+    let format = resolve_format(output, args.format.as_deref())?;
+    let schema = params_for(format);
+    let given: [Option<&str>; 6] = [
+        args.tiff_bits.as_deref(),
+        args.tiff_compression.as_deref(),
+        args.png_bits.as_deref(),
+        args.png_compression.as_deref(),
+        args.jpeg_quality.as_deref(),
+        args.jpeg_subsampling.as_deref(),
+    ];
+    let mut values = ParamValues::new();
+    for (id, text) in FORMAT_FLAG_IDS.into_iter().zip(given) {
+        let Some(text) = text else { continue };
+        let Some(desc) = schema.iter().find(|d| d.id == id) else {
+            return Err(format!(
+                "--{id} is not an option of --format {}",
+                format.id()
+            ));
+        };
+        let value = ParamValue::parse(desc, text).map_err(|err| {
+            let rendered = err.to_string();
+            let rendered = rendered
+                .strip_prefix(&format!("{id}: "))
+                .unwrap_or(&rendered);
+            format!("--{id}: {rendered}")
+        })?;
+        values.insert(id.to_string(), value);
+    }
+    ExportOptions::from_values(format, &values).map_err(|err| err.to_string())
+}
 
 /// The frozen `export --json` schema, additive-only -- the same contract
 /// `InfoReport` and `StackReport` carry.
@@ -44,6 +164,12 @@ pub struct ExportReport {
     /// The checkpoint this export rendered: `--checkpoint`'s resolved id,
     /// or the head's when it was omitted.
     pub checkpoint: String,
+    /// The format `-o`'s image was encoded as. `null` when only `--zmap`
+    /// was written.
+    pub format: Option<String>,
+    /// Every descriptor id of `format`'s schema with its resolved value,
+    /// defaults included. `null` alongside `format`.
+    pub format_options: Option<ParamValues>,
     pub wall_seconds: f64,
 }
 
@@ -58,6 +184,7 @@ pub fn run(
     output: Option<&Path>,
     zmap: Option<&Path>,
     checkpoint: Option<&str>,
+    format: &FormatArgs,
     json: bool,
 ) -> ExitCode {
     let start = Instant::now();
@@ -67,6 +194,14 @@ pub fn run(
              --zmap <file> for the Z-Map, or both",
         );
     }
+
+    let export_options = match output {
+        Some(path) => match resolve_export_options(path, format) {
+            Ok(options) => Some(options),
+            Err(message) => return fail(message),
+        },
+        None => None,
+    };
 
     let mut project = match Project::open(project_path) {
         Ok(project) => project,
@@ -111,7 +246,10 @@ pub fn run(
 
     let mut wrote = Vec::new();
     if let Some(path) = output {
-        if let Err(err) = project::export_checkpoint(&mut project, &checkpoint.id, path) {
+        let options = export_options
+            .as_ref()
+            .expect("export_options is Some whenever output is Some");
+        if let Err(err) = project::export_checkpoint(&mut project, &checkpoint.id, path, options) {
             return fail(err);
         }
         wrote.push(path.display().to_string());
@@ -133,6 +271,8 @@ pub fn run(
         frame_count: record.composite.frame_count,
         algorithm: checkpoint.algorithm,
         checkpoint: checkpoint.id,
+        format: export_options.as_ref().map(|o| o.format().id().to_string()),
+        format_options: export_options.as_ref().map(|o| o.values()),
         wall_seconds: start.elapsed().as_secs_f64(),
     };
     if json {
@@ -158,6 +298,9 @@ fn render(report: &ExportReport) -> String {
         format!("algorithm: {}", report.algorithm),
         format!("checkpoint: {}", report.checkpoint),
     ];
+    if let Some(format) = &report.format {
+        lines.push(format!("format: {format}"));
+    }
     if !report.unresolved_sources.is_empty() {
         lines.push(format!(
             "unresolved sources: {}",
@@ -180,6 +323,95 @@ fn fail(message: impl std::fmt::Display) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use focusforge_core::project::export::JpegSubsampling;
+
+    #[test]
+    fn resolve_format_defaults_to_tiff_with_no_extension_and_no_flag() {
+        assert_eq!(
+            resolve_format(Path::new("out"), None),
+            Ok(ExportFormat::Tiff)
+        );
+    }
+
+    #[test]
+    fn resolve_format_infers_from_a_recognised_extension() {
+        assert_eq!(
+            resolve_format(Path::new("out.png"), None),
+            Ok(ExportFormat::Png)
+        );
+    }
+
+    #[test]
+    fn resolve_format_refuses_an_unrecognised_extension_with_no_flag() {
+        let err = resolve_format(Path::new("out.webp"), None).unwrap_err();
+        assert!(err.contains("--format"), "{err}");
+    }
+
+    #[test]
+    fn resolve_format_refuses_a_flag_that_contradicts_the_extension() {
+        let err = resolve_format(Path::new("out.jpg"), Some("tiff")).unwrap_err();
+        assert!(err.contains("--format"), "{err}");
+    }
+
+    #[test]
+    fn resolve_format_honours_an_explicit_flag_over_an_unrecognised_extension() {
+        assert_eq!(
+            resolve_format(Path::new("out.dng"), Some("tiff")),
+            Ok(ExportFormat::Tiff)
+        );
+    }
+
+    #[test]
+    fn resolve_format_refuses_an_unknown_flag_value() {
+        let err = resolve_format(Path::new("out.tif"), Some("webp")).unwrap_err();
+        assert!(err.contains("--format"), "{err}");
+    }
+
+    #[test]
+    fn resolve_export_options_defaults_to_tiff_16_none() {
+        let options = resolve_export_options(Path::new("out.tif"), &FormatArgs::default())
+            .expect("default flags must resolve");
+        assert_eq!(options, ExportOptions::default());
+    }
+
+    #[test]
+    fn resolve_export_options_refuses_a_flag_of_another_format() {
+        let args = FormatArgs {
+            jpeg_quality: Some("80".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_export_options(Path::new("out.tif"), &args).unwrap_err();
+        assert!(err.contains("--jpeg-quality"), "{err}");
+    }
+
+    #[test]
+    fn resolve_export_options_refuses_an_out_of_range_value_naming_the_flag() {
+        let args = FormatArgs {
+            format: Some("jpeg".to_string()),
+            jpeg_quality: Some("0".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_export_options(Path::new("out.jpg"), &args).unwrap_err();
+        assert!(err.starts_with("--jpeg-quality:"), "{err}");
+    }
+
+    #[test]
+    fn resolve_export_options_builds_a_full_jpeg_choice() {
+        let args = FormatArgs {
+            jpeg_quality: Some("80".to_string()),
+            jpeg_subsampling: Some("420".to_string()),
+            ..Default::default()
+        };
+        let options = resolve_export_options(Path::new("out.jpg"), &args)
+            .expect("valid jpeg flags must resolve");
+        assert_eq!(
+            options,
+            ExportOptions::Jpeg {
+                quality: 80,
+                subsampling: JpegSubsampling::S420,
+            }
+        );
+    }
 
     #[test]
     fn render_names_every_fact_one_per_line() {
@@ -193,6 +425,8 @@ mod tests {
             frame_count: 8,
             algorithm: "example-stack".to_string(),
             checkpoint: "abc123".to_string(),
+            format: Some("tiff".to_string()),
+            format_options: Some(ParamValues::new()),
             wall_seconds: 0.25,
         });
         for needle in [
@@ -202,6 +436,7 @@ mod tests {
             "8 frames",
             "algorithm: example-stack",
             "checkpoint: abc123",
+            "format: tiff",
             "unresolved sources: 1",
             "wrote: out.tif",
             "wrote: out-zmap.tif",

@@ -195,6 +195,42 @@ pub enum ProjectError {
         path.display()
     )]
     RenderAlignmentUnrecorded { path: PathBuf, checkpoint: String },
+
+    /// An [`super::export::ExportOptions`] value failed schema validation --
+    /// an option for another format, a value outside its range, or an
+    /// unknown enum variant.
+    #[error("export options: {source}")]
+    ExportOptions {
+        #[source]
+        source: crate::params::ParamError,
+    },
+
+    /// A JPEG export's image exceeds the format's 65535-pixel-per-side
+    /// limit. Refused at `prepare` time, before any pixel is rendered.
+    #[error(
+        "{}: {width}x{height} is too large for {format} (limit {limit}px per side)",
+        path.display()
+    )]
+    ExportTooLarge {
+        path: PathBuf,
+        format: String,
+        width: u32,
+        height: u32,
+        limit: u32,
+    },
+
+    /// A PNG or JPEG export's image carries a samples-per-pixel neither
+    /// format can encode (only 1 or 3 are supported). Refused at `prepare`
+    /// time, before any pixel is rendered. TIFF has no such limit.
+    #[error(
+        "{}: {format} cannot encode {samples_per_pixel} samples per pixel (only 1 or 3 are supported)",
+        path.display()
+    )]
+    ExportUnsupportedSamples {
+        path: PathBuf,
+        format: String,
+        samples_per_pixel: u32,
+    },
 }
 
 impl ProjectError {

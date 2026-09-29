@@ -132,8 +132,13 @@ fn exported_image_is_the_zmap_gather() {
     let mut project = Project::open(&shared.project).unwrap();
     let head = project.checkpoint().clone();
     let in_process = dir.join("in-process.tif");
-    project::export_checkpoint(&mut project, &head.id, &in_process)
-        .expect("in-process export must succeed");
+    project::export_checkpoint(
+        &mut project,
+        &head.id,
+        &in_process,
+        &project::export::ExportOptions::default(),
+    )
+    .expect("in-process export must succeed");
     assert!(
         std::fs::read(&out).unwrap() == std::fs::read(&in_process).unwrap(),
         "the CLI export must equal the in-process export byte for byte"
@@ -521,8 +526,13 @@ fn exports_every_checkpoint_of_a_branched_history() {
 
         let in_process_out = dir.join(format!("{label}-in-process.tif"));
         let mut project = Project::open(&branched.project_path).unwrap();
-        project::export_checkpoint(&mut project, id, &in_process_out)
-            .expect("in-process export must succeed");
+        project::export_checkpoint(
+            &mut project,
+            id,
+            &in_process_out,
+            &project::export::ExportOptions::default(),
+        )
+        .expect("in-process export must succeed");
         assert_eq!(
             std::fs::read(&cli_out).unwrap(),
             std::fs::read(&in_process_out).unwrap(),
@@ -653,8 +663,13 @@ fn plain_export_of_an_edited_head_renders_the_edit() {
 
     let mut project = Project::open(&branched.project_path).unwrap();
     let expected = dir.join("head-expected.tif");
-    project::export_checkpoint(&mut project, &branched.branch_b, &expected)
-        .expect("in-process export of the head must succeed");
+    project::export_checkpoint(
+        &mut project,
+        &branched.branch_b,
+        &expected,
+        &project::export::ExportOptions::default(),
+    )
+    .expect("in-process export of the head must succeed");
     assert_eq!(
         std::fs::read(&out).unwrap(),
         std::fs::read(&expected).unwrap(),

@@ -240,6 +240,10 @@ enum Command {
         /// source frames; `--zmap` alone needs none.
         #[arg(long, value_name = "ID")]
         checkpoint: Option<String>,
+        /// `--format` and its per-format flags: what `-o`'s image is
+        /// encoded as.
+        #[command(flatten)]
+        format: export::FormatArgs,
         /// Emit the frozen JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
@@ -503,12 +507,14 @@ fn main() -> ExitCode {
             output,
             zmap,
             checkpoint,
+            format,
             json,
         } => export::run(
             &project,
             output.as_deref(),
             zmap.as_deref(),
             checkpoint.as_deref(),
+            &format,
             json,
         ),
         Command::Retouch {
@@ -1103,5 +1109,68 @@ mod tests {
     fn parser_is_consistent() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// Every export `ParamDesc` id is a `--<id>` flag on `export` whose help
+    /// text names its default and every choice or numeric range -- the
+    /// same one-source-of-truth check `no_crop_flag_reads_the_project_schema`
+    /// runs for `auto-crop`.
+    #[test]
+    fn export_flags_read_the_export_schema() {
+        use clap::CommandFactory;
+        use focusforge_core::params::ParamKind;
+        use focusforge_core::project::export::{JPEG_PARAMS, PNG_PARAMS, TIFF_PARAMS};
+
+        let export_cmd = Cli::command()
+            .find_subcommand("export")
+            .expect("export subcommand must exist")
+            .clone();
+        for schema in [&*TIFF_PARAMS, &*PNG_PARAMS, &*JPEG_PARAMS] {
+            for desc in schema.iter() {
+                let arg = export_cmd
+                    .get_arguments()
+                    .find(|a| a.get_long() == Some(desc.id.as_str()))
+                    .unwrap_or_else(|| panic!("no --{} flag on export", desc.id));
+                let help = arg
+                    .get_help()
+                    .unwrap_or_else(|| panic!("--{} needs help text", desc.id))
+                    .to_string();
+                match &desc.kind {
+                    ParamKind::Enum { variants } => {
+                        for variant in variants {
+                            assert!(
+                                help.contains(&variant.id),
+                                "--{}'s help is missing choice {:?}: {help:?}",
+                                desc.id,
+                                variant.id
+                            );
+                        }
+                        let default = desc.default.as_enum().expect("enum default");
+                        assert!(
+                            help.contains(default),
+                            "--{}'s help is missing its default {:?}: {help:?}",
+                            desc.id,
+                            default
+                        );
+                    }
+                    ParamKind::Int { min, max } => {
+                        for bound in [min, max] {
+                            assert!(
+                                help.contains(&bound.to_string()),
+                                "--{}'s help is missing bound {bound}: {help:?}",
+                                desc.id
+                            );
+                        }
+                        let default = desc.default.as_i64().expect("int default");
+                        assert!(
+                            help.contains(&default.to_string()),
+                            "--{}'s help is missing its default {default}: {help:?}",
+                            desc.id
+                        );
+                    }
+                    other => panic!("unexpected export param kind for {}: {other:?}", desc.id),
+                }
+            }
+        }
     }
 }

@@ -5,9 +5,10 @@
 //! The view render ([`CheckpointImage::prepare`], [`render_checkpoint`])
 //! streams a fused checkpoint's own composite, splicing an op-bearing one's
 //! replayed-Z-Map edits over its nearest fused ancestor's composite. The
-//! export render ([`CheckpointImage::prepare_export`], [`export_checkpoint`])
-//! reads no stored composite: every checkpoint, fused included, gathers its
-//! own Z-Map over that ancestor's aligned, cropped sources.
+//! export render ([`CheckpointImage::prepare_export`],
+//! [`super::export::export_checkpoint`]) reads no stored composite: every
+//! checkpoint, fused included, gathers its own Z-Map over that ancestor's
+//! aligned, cropped sources.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -398,23 +399,16 @@ pub fn render_checkpoint(project: &mut Project, id: &str, path: &Path) -> Result
     write_tiff(project, &image, path)
 }
 
-/// The export render as a TIFF: [`CheckpointImage::prepare_export`] then
-/// [`CheckpointImage::render`], written through a `.partial` sibling of
-/// `path` exactly as [`render_checkpoint`] is.
-pub fn export_checkpoint(project: &mut Project, id: &str, path: &Path) -> Result<(), ProjectError> {
-    let image = CheckpointImage::prepare_export(project, id)?;
-    write_tiff(project, &image, path)
-}
-
-fn write_tiff(
+/// The default 16-bit uncompressed TIFF encoder: the view render's only
+/// encoder, and every export format's own `Tiff{Sixteen, None}` case.
+pub(super) fn write_tiff(
     project: &mut Project,
     image: &CheckpointImage,
     path: &Path,
 ) -> Result<(), ProjectError> {
-    let partial = partial_path(path);
-    let outcome = (|| -> Result<(), ProjectError> {
+    write_via_partial(path, |partial| {
         let mut writer = TiffWriter::create(
-            &partial,
+            partial,
             TiffSpec {
                 width: image.width,
                 height: image.height,
@@ -422,7 +416,7 @@ fn write_tiff(
                 description: Some(image.description.clone()),
             },
         )
-        .map_err(|err| ProjectError::container(&partial, err))?;
+        .map_err(|err| ProjectError::container(partial, err))?;
         image.render(project, &mut |band, rect| {
             writer
                 .write_tile(rect, band)
@@ -430,7 +424,21 @@ fn write_tiff(
         })?;
         writer
             .finish()
-            .map_err(|err| ProjectError::container(path, err))?;
+            .map_err(|err| ProjectError::container(path, err))
+    })
+}
+
+/// Writes through a `.partial` sibling of `path`, renamed onto it only once
+/// `encode` returns `Ok`; removed instead on any error, so a refused or
+/// interrupted write leaves nothing behind. Shared by the view render and
+/// every export format's encoder.
+pub(super) fn write_via_partial(
+    path: &Path,
+    encode: impl FnOnce(&Path) -> Result<(), ProjectError>,
+) -> Result<(), ProjectError> {
+    let partial = partial_path(path);
+    let outcome = (|| -> Result<(), ProjectError> {
+        encode(&partial)?;
         std::fs::rename(&partial, path).map_err(|err| ProjectError::io(path, err))
     })();
     if outcome.is_err() {

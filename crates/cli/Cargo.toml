@@ -33,6 +33,12 @@ tracing = "0.1.44"
 [dev-dependencies]
 focusforge-core = { path = "../core", features = ["test-algorithms"] }
 tempfile = "3"
+# An independent TIFF reader for `export_formats.rs`'s 8-bit round trip:
+# `core`'s own segment decoder refuses anything but 16 bits per sample.
+tiff = { version = "0.11.3", default-features = false, features = ["lzw", "deflate"] }
+# An independent JPEG decoder for `export_formats.rs`'s quality/subsampling
+# round trip.
+zune-jpeg = "0.5.15"
 # Reading a written bundle back, with the same pinned feature set the
 # writer uses.
 zip = { version = "8.6.0", default-features = false }

@@ -146,3 +146,6 @@ is used under its GPLv3 licensing option, which is what makes the whole
 application GPLv3 rather than a more permissive license; dependency licenses
 are held to a compatible allowlist and enforced by `cargo deny check
 licenses`.
+
+This software is based in part on the work of the Independent JPEG Group,
+carried by the `jpeg-encoder` crate's JPEG export path.
