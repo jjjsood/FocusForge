@@ -48,8 +48,8 @@ pub struct SealRequest<'a> {
     pub align: Option<AlignRecord>,
     /// The composite's extent after any crop was applied.
     pub crop: Option<Rect>,
-    /// Exactly the `ImageDescription` the staged composite carries, so
-    /// `export` re-emits a byte-identical TIFF.
+    /// The `ImageDescription` an export of the fused checkpoint's own
+    /// gather writes into its TIFF's IFD.
     pub composite_description: String,
     pub label: Option<String>,
     pub metrics: Metrics,

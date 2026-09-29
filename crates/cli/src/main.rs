@@ -222,22 +222,22 @@ enum Command {
         #[arg(long = "no-cache", action = clap::ArgAction::SetFalse)]
         cache: bool,
     },
-    /// Turn a project into an image file: the composite with `-o`, the
+    /// Turn a project into an image file: the image with `-o`, the
     /// Z-Map with `--zmap`, either or both in one invocation. At least one
     /// of the two is required. This is the only command that writes an
     /// image.
     Export {
         /// The `.ffp` project to read.
         project: PathBuf,
-        /// Write the composite to this path.
+        /// Write the image to this path.
         #[arg(short = 'o', long = "output", value_name = "FILE")]
         output: Option<PathBuf>,
         /// Write the Z-Map to this path.
         #[arg(long, value_name = "FILE")]
         zmap: Option<PathBuf>,
-        /// A checkpoint id or unique id prefix. Defaults to the head. A
-        /// fused checkpoint needs no source frames; an op-bearing one
-        /// re-reads and verifies its nearest fused ancestor's sources.
+        /// A checkpoint id or unique id prefix. Defaults to the head. Every
+        /// image export re-reads and verifies the nearest fused ancestor's
+        /// source frames; `--zmap` alone needs none.
         #[arg(long, value_name = "ID")]
         checkpoint: Option<String>,
         /// Emit the frozen JSON report instead of human-readable text.

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use focusforge_core::io::{TiffSpec, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::{
-    self, CheckpointImage, Metrics, Op, Project, SealRequest, ZMapStorage,
+    self, CheckpointImage, Metrics, Op, Project, ProjectError, SealRequest, ZMapStorage,
 };
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
@@ -99,10 +99,10 @@ fn full(width: u32, height: u32) -> Rect {
     }
 }
 
-/// An op-bearing checkpoint at `height`: a fused root plus one small edit on
-/// top, so [`CheckpointImage::render`] takes the splice path rather than
-/// the fused path's plain plane stream.
-fn seal_op_bearing(name: &str, height: u32) -> (PathBuf, String) {
+/// A fused root at `height` plus one small edit on top. Returns the project,
+/// the root's id and the op-bearing child's id, whose view render takes the
+/// splice path rather than the fused path's plain plane stream.
+fn seal_op_bearing(name: &str, height: u32) -> (PathBuf, String, String) {
     let dir = tmp_dir(name);
     let staging = dir.join("staging");
     std::fs::create_dir_all(&staging).unwrap();
@@ -189,20 +189,23 @@ fn seal_op_bearing(name: &str, height: u32) -> (PathBuf, String) {
     )
     .expect("append_ops_onto must succeed");
 
-    (project_path, child.checkpoint)
+    (project_path, sealed.checkpoint, child.checkpoint)
 }
 
-/// Peak live-heap growth across [`CheckpointImage::prepare`] plus
-/// [`CheckpointImage::render`] into a discarding sink, at `height`. Asserts
-/// the image spans more than one 4 MiB composite band, the case that
-/// exercises band-bounded memory rather than a single-shot allocation.
-fn peak_growth_for(height: u32) -> usize {
-    let (project_path, checkpoint_id) =
+type Prepare = fn(&Project, &str) -> Result<CheckpointImage, ProjectError>;
+
+/// Peak live-heap growth across `prepare` plus [`CheckpointImage::render`]
+/// into a discarding sink, at `height`, of the root (`fused`) or its
+/// op-bearing child. Asserts the image spans more than one band, the case
+/// that exercises band-bounded memory rather than a single-shot allocation.
+fn peak_growth_for(height: u32, prepare: Prepare, fused: bool) -> usize {
+    let (project_path, root_id, child_id) =
         seal_op_bearing(&format!("checkpoint_render_memory_{height}"), height);
+    let checkpoint_id = if fused { root_id } else { child_id };
     let mut project = Project::open(&project_path).unwrap();
 
     reset_peak();
-    let image = CheckpointImage::prepare(&project, &checkpoint_id).expect("prepare must succeed");
+    let image = prepare(&project, &checkpoint_id).expect("prepare must succeed");
     let mut bands = 0u32;
     image
         .render(&mut project, &mut |_samples, _rect| {
@@ -212,19 +215,29 @@ fn peak_growth_for(height: u32) -> usize {
         .expect("render must succeed");
     assert!(
         bands > 1,
-        "the image at height {height} must span more than one 4 MiB composite band"
+        "the image at height {height} must span more than one band"
     );
     peak_growth_since_reset()
 }
 
-#[test]
-fn peak_growth_is_independent_of_height() {
-    let short = peak_growth_for(1400);
-    let tall = peak_growth_for(5600);
+fn assert_independent_of_height(label: &str, prepare: Prepare, fused: bool, short_height: u32) {
+    let short = peak_growth_for(short_height, prepare, fused);
+    let tall = peak_growth_for(5600, prepare, fused);
     let diff = short.abs_diff(tall);
     assert!(
         diff < 1 << 20,
-        "peak growth differs by {diff} B between heights 1400 ({short} B) and 5600 ({tall} B) \
-         -- more than the 1 MiB budget, so the render is not staying band-bounded"
+        "{label}: peak growth differs by {diff} B between heights {short_height} ({short} B) and \
+         5600 ({tall} B) -- more than the 1 MiB budget, so the render is not staying band-bounded"
     );
+}
+
+// One test, so the two measurements never overlap under the process-wide
+// allocator count.
+#[test]
+fn peak_growth_is_independent_of_height() {
+    assert_independent_of_height("op-bearing view", CheckpointImage::prepare, false, 1400);
+    // Materializing the Z-Map reads it in 4 MiB bands, 2048 rows at this
+    // width, and dominates the export's peak; both heights span more than
+    // one such band.
+    assert_independent_of_height("fused export", CheckpointImage::prepare_export, true, 2800);
 }

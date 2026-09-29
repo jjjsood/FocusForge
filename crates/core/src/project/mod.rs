@@ -79,7 +79,7 @@ pub use manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
     SourceResolution,
 };
-pub use render::{CheckpointImage, render_checkpoint};
+pub use render::{CheckpointImage, export_checkpoint, render_checkpoint};
 pub use review::ReviewMetrics;
 pub use seal::{HeldCheckpoint, SealRequest, SealedProject, now_unix, seal, seal_at, seal_held};
 pub use validate::{
@@ -208,7 +208,16 @@ pub fn materialize_zmap(
     checkpoint: &Checkpoint,
     path: &Path,
 ) -> Result<(), ProjectError> {
-    let plane_ref = project.manifest().zmap.clone();
+    let mut plane_ref = project.manifest().zmap.clone();
+    match project.fuse_state(&checkpoint.id) {
+        Ok(record) => {
+            plane_ref.width = record.composite.width;
+            plane_ref.height = record.composite.height;
+            plane_ref.frame_count = record.composite.frame_count;
+        }
+        Err(ProjectError::FuseStateUnknown { .. }) => {}
+        Err(err) => return Err(err),
+    }
     let blobs = project.manifest().blobs.clone();
     let (base, deltas) = resolve_chain(&blobs, &checkpoint.zmap_blob, project.path())?;
 

@@ -539,12 +539,20 @@ fn open_at_checkpoint(
     let project = Project::open(project_path)?;
     let head = project.history().get(parent)?.clone();
     let manifest = project.manifest().clone();
-    let info = ZMapInfo::new(
-        manifest.zmap.width,
-        manifest.zmap.height,
-        manifest.zmap.frame_count,
-    )
-    .map_err(|err| ProjectError::container(project_path, err))?;
+    let mut width = manifest.zmap.width;
+    let mut height = manifest.zmap.height;
+    let mut frame_count = manifest.zmap.frame_count;
+    match project.fuse_state(parent) {
+        Ok(record) => {
+            width = record.composite.width;
+            height = record.composite.height;
+            frame_count = record.composite.frame_count;
+        }
+        Err(ProjectError::FuseStateUnknown { .. }) => {}
+        Err(err) => return Err(err),
+    }
+    let info = ZMapInfo::new(width, height, frame_count)
+        .map_err(|err| ProjectError::container(project_path, err))?;
     Ok((project, head, manifest, info))
 }
 
@@ -634,8 +642,13 @@ fn append_ops_staged(
         align: fuse.align.clone(),
         sources: fuse.sources.clone(),
         composite: fuse.composite.clone(),
+        // Same reasoning as `composite` above: this checkpoint's own Z-Map
+        // extent, not whatever the previously open manifest declared.
         zmap: PlaneRef {
             blob: full.hash.clone(),
+            width: fuse.composite.width,
+            height: fuse.composite.height,
+            frame_count: fuse.composite.frame_count,
             ..manifest.zmap.clone()
         },
         blobs,

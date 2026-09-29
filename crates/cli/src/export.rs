@@ -8,10 +8,10 @@
 //!
 //! Two properties this module exists to keep:
 //!
-//! - **Byte-identical.** The composite is re-emitted from manifest data --
-//!   the exact `ImageDescription` the run recorded, the same twelve-tag IFD
-//!   `TiffWriter` always writes -- so an exported file equals the plane
-//!   fusion staged, byte for byte.
+//! - **The Z-Map gathers the image.** `-o` writes a per-pixel gather of the
+//!   checkpoint's own Z-Map over its verified source frames, the exact
+//!   `ImageDescription` the fuse recorded, the same twelve-tag IFD
+//!   `TiffWriter` always writes.
 //! - **A warning, never a silence.** A project whose sources cannot be
 //!   resolved relatively names every one of them on stderr and still writes
 //!   the image. `core` returns them as data; printing them is this
@@ -63,7 +63,7 @@ pub fn run(
     let start = Instant::now();
     if output.is_none() && zmap.is_none() {
         return fail(
-            "export needs somewhere to write: -o <file> for the composite, \
+            "export needs somewhere to write: -o <file> for the image, \
              --zmap <file> for the Z-Map, or both",
         );
     }
@@ -83,9 +83,8 @@ pub fn run(
     if !unresolved.is_empty() {
         let warning = format!(
             "warning: {} source frame(s) unresolved -- not reachable from this project, either \
-             because the path was recorded as given or because it is no longer there. A fused \
-             checkpoint's export is unaffected; an op-bearing checkpoint's needs them and may \
-             fail below:",
+             because the path was recorded as given or because it is no longer there. An image \
+             export re-reads every source frame and fails below if one is missing or changed:",
             unresolved.len()
         );
         eprintln!("{warning}");
@@ -112,7 +111,7 @@ pub fn run(
 
     let mut wrote = Vec::new();
     if let Some(path) = output {
-        if let Err(err) = project::render_checkpoint(&mut project, &checkpoint.id, path) {
+        if let Err(err) = project::export_checkpoint(&mut project, &checkpoint.id, path) {
             return fail(err);
         }
         wrote.push(path.display().to_string());

@@ -86,8 +86,8 @@ pub struct PlaneRef {
     /// an undeclared endianness is one big-endian producer away from two
     /// hashes for one image.
     pub byte_order: ByteOrderTag,
-    /// The exact `ImageDescription` `export` re-emits, so an exported
-    /// composite is byte-identical to the plane fusion staged.
+    /// The exact `ImageDescription` an export of this plane writes into the
+    /// TIFF's IFD.
     pub description: String,
     /// The source-frame count. Z-Map meaning; carried on both planes so
     /// there is one shape rather than two.
