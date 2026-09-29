@@ -469,6 +469,17 @@ fn editor_mode_enters_on_a_fused_tab() {
 }
 
 #[test]
+fn fuse_auto_enters_editor_on_the_viewed_tab() {
+    let mut controller = controller_with_scratch("fuse_auto_editor");
+    open_fused_tab(&mut controller, "fuse_auto_editor", 3);
+    assert_eq!(
+        controller.mode(),
+        ShellMode::Editor,
+        "a fuse on the viewed tab enters Editor"
+    );
+}
+
+#[test]
 fn editor_mode_is_refused_without_fused_planes() {
     let mut controller = controller_with_scratch("editor_refused");
     assert!(!controller.editor_enabled(), "no active tab");

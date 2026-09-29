@@ -4556,7 +4556,8 @@ impl AppController {
 
     /// Adds `held` to tab `index` as its newest checkpoint, re-seeding the
     /// frame list from the tab's own last request, and returns its composite
-    /// and Z-Map paths for the canvas.
+    /// and Z-Map paths for the canvas. Switches the shell into Editor mode
+    /// when `index` is the tab currently in view.
     fn commit_held(&mut self, index: usize, held: job::HeldCheckpoint) -> (PathBuf, PathBuf) {
         let tab = &mut self.state.projects[index];
         let path = project_identity_path(&tab.project);
