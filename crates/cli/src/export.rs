@@ -29,7 +29,10 @@ use focusforge_core::align::WarpingReader;
 use focusforge_core::host;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter, open_frame_set};
 use focusforge_core::params::{ParamValue, ParamValues};
-use focusforge_core::project::export::{ExportFormat, ExportOptions, params_for};
+use focusforge_core::project::export::{
+    ExportFormat, ExportOptions, IccStatus, METADATA_PARAMS, MetadataOptions, MetadataOutcome,
+    MetadataStatus, params_for,
+};
 use focusforge_core::project::{self, FuseRecord, Project};
 use focusforge_core::tile::HostBudget;
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
@@ -69,6 +72,20 @@ pub struct FormatArgs {
     /// JPEG chroma subsampling: `444` (default) or `420`. JPEG only.
     #[arg(long = "jpeg-subsampling", value_name = "SPEC")]
     jpeg_subsampling: Option<String>,
+    /// Carry the alignment reference frame's EXIF: `on` (default) or `off`.
+    #[arg(long)]
+    exif: Option<String>,
+    /// Embed an ICC profile: `on` (default) or `off`.
+    #[arg(long)]
+    icc: Option<String>,
+    /// Carry the source frame's XMP packet verbatim: `on` or `off`
+    /// (default).
+    #[arg(long)]
+    xmp: Option<String>,
+    /// Carry the source frame's IPTC block verbatim: `on` or `off`
+    /// (default). Never written to PNG.
+    #[arg(long)]
+    iptc: Option<String>,
 }
 
 /// Every `FormatArgs` flag, paired with the `ParamDesc` id it fills, in
@@ -113,6 +130,91 @@ fn resolve_format(output: &Path, explicit: Option<&str>) -> Result<ExportFormat,
             output.display()
         )),
         (None, None) => Ok(ExportFormat::Tiff),
+    }
+}
+
+/// Every metadata switch, paired with the `METADATA_PARAMS` id it fills, in
+/// declaration order.
+const METADATA_FLAG_IDS: [&str; 4] = ["exif", "icc", "xmp", "iptc"];
+
+/// Maps `on`/`off` onto the `true`/`false` text `ParamValue::parse` accepts
+/// for a `Bool` descriptor, refusing any other word by the flag's own name.
+fn on_off(id: &str, text: &str) -> Result<&'static str, String> {
+    match text {
+        "on" => Ok("true"),
+        "off" => Ok("false"),
+        other => Err(format!("--{id}: expected on or off, got {other:?}")),
+    }
+}
+
+/// Resolves `args`' four metadata flags into a validated `MetadataOptions`,
+/// the same `on|off`-through-`ParamValue::parse` shape
+/// `resolve_export_options` uses for its own flags.
+fn resolve_metadata_options(args: &FormatArgs) -> Result<MetadataOptions, String> {
+    let given: [Option<&str>; 4] = [
+        args.exif.as_deref(),
+        args.icc.as_deref(),
+        args.xmp.as_deref(),
+        args.iptc.as_deref(),
+    ];
+    let mut values = ParamValues::new();
+    for (id, text) in METADATA_FLAG_IDS.into_iter().zip(given) {
+        let Some(text) = text else { continue };
+        let mapped = on_off(id, text)?;
+        let desc = METADATA_PARAMS
+            .iter()
+            .find(|d| d.id == id)
+            .expect("id in METADATA_PARAMS");
+        let value = ParamValue::parse(desc, mapped).map_err(|err| format!("--{id}: {err}"))?;
+        values.insert(id.to_string(), value);
+    }
+    MetadataOptions::from_values(&values).map_err(|err| err.to_string())
+}
+
+fn metadata_status_str(status: MetadataStatus) -> &'static str {
+    match status {
+        MetadataStatus::Off => "off",
+        MetadataStatus::Unsupported => "unsupported",
+        MetadataStatus::Absent => "absent",
+        MetadataStatus::Written => "written",
+        MetadataStatus::Skipped => "skipped",
+    }
+}
+
+fn icc_status_str(status: IccStatus) -> &'static str {
+    match status {
+        IccStatus::Off => "off",
+        IccStatus::Source => "source",
+        IccStatus::BuiltinSrgb => "builtin-srgb",
+        IccStatus::None => "none",
+        IccStatus::Skipped => "skipped",
+    }
+}
+
+/// [`MetadataOutcome`] rendered for the report: statuses as their fixed
+/// strings, the frame path as text.
+#[derive(Serialize)]
+pub struct MetadataReport {
+    pub frame: usize,
+    pub frame_path: String,
+    pub exif: String,
+    pub icc: String,
+    pub xmp: String,
+    pub iptc: String,
+    pub warnings: Vec<String>,
+}
+
+impl From<&MetadataOutcome> for MetadataReport {
+    fn from(outcome: &MetadataOutcome) -> Self {
+        MetadataReport {
+            frame: outcome.frame,
+            frame_path: outcome.frame_path.display().to_string(),
+            exif: metadata_status_str(outcome.exif).to_string(),
+            icc: icc_status_str(outcome.icc).to_string(),
+            xmp: metadata_status_str(outcome.xmp).to_string(),
+            iptc: metadata_status_str(outcome.iptc).to_string(),
+            warnings: outcome.warnings.clone(),
+        }
     }
 }
 
@@ -180,6 +282,9 @@ pub struct ExportReport {
     pub format_options: Option<ParamValues>,
     /// The source frame index written "as fused", if `--frame` was given.
     pub frame: Option<usize>,
+    /// EXIF, ICC, XMP and IPTC carry-over for the `-o` image, `null`
+    /// without one.
+    pub metadata: Option<MetadataReport>,
     pub wall_seconds: f64,
 }
 
@@ -217,6 +322,13 @@ pub fn run(
 
     let export_options = match output {
         Some(path) => match resolve_export_options(path, format) {
+            Ok(options) => Some(options),
+            Err(message) => return fail(message),
+        },
+        None => None,
+    };
+    let metadata_options = match output {
+        Some(_) => match resolve_metadata_options(format) {
             Ok(options) => Some(options),
             Err(message) => return fail(message),
         },
@@ -275,12 +387,24 @@ pub fn run(
     }
 
     let mut wrote = Vec::new();
+    let mut metadata_outcome: Option<MetadataOutcome> = None;
     if let Some(path) = output {
         let options = export_options
             .as_ref()
             .expect("export_options is Some whenever output is Some");
-        if let Err(err) = project::export_checkpoint(&mut project, &checkpoint.id, path, options) {
-            return fail(err);
+        let metadata = metadata_options
+            .as_ref()
+            .expect("metadata_options is Some whenever output is Some");
+        match project::export_checkpoint(&mut project, &checkpoint.id, path, options, metadata) {
+            Ok(outcome) => {
+                for warning in &outcome.warnings {
+                    let warning = format!("warning: {warning}");
+                    eprintln!("{warning}");
+                    tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "{warning}");
+                }
+                metadata_outcome = Some(outcome);
+            }
+            Err(err) => return fail(err),
         }
         wrote.push(path.display().to_string());
     }
@@ -310,6 +434,7 @@ pub fn run(
         format: export_options.as_ref().map(|o| o.format().id().to_string()),
         format_options: export_options.as_ref().map(|o| o.values()),
         frame,
+        metadata: metadata_outcome.as_ref().map(MetadataReport::from),
         wall_seconds: start.elapsed().as_secs_f64(),
     };
     if json {
@@ -340,6 +465,19 @@ fn render(report: &ExportReport) -> String {
     }
     if let Some(index) = report.frame {
         lines.push(format!("frame: {index}"));
+    }
+    if let Some(metadata) = &report.metadata {
+        lines.push(format!(
+            "metadata frame: {} ({})",
+            metadata.frame, metadata.frame_path
+        ));
+        lines.push(format!(
+            "metadata: exif={} icc={} xmp={} iptc={}",
+            metadata.exif, metadata.icc, metadata.xmp, metadata.iptc
+        ));
+        for warning in &metadata.warnings {
+            lines.push(format!("metadata warning: {warning}"));
+        }
     }
     if !report.unresolved_sources.is_empty() {
         lines.push(format!(
@@ -554,6 +692,7 @@ mod tests {
             format: Some("tiff".to_string()),
             format_options: Some(ParamValues::new()),
             frame: None,
+            metadata: None,
             wall_seconds: 0.25,
         });
         for needle in [
@@ -571,5 +710,78 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
+    }
+
+    #[test]
+    fn render_prints_the_metadata_lines_when_metadata_is_some() {
+        let text = render(&ExportReport {
+            project: "demo.ffp".to_string(),
+            wrote: vec!["out.tif".to_string()],
+            unresolved_sources: Vec::new(),
+            width: 64,
+            height: 64,
+            samples_per_pixel: 3,
+            frame_count: 2,
+            algorithm: "example-stack".to_string(),
+            checkpoint: "abc123".to_string(),
+            format: Some("tiff".to_string()),
+            format_options: Some(ParamValues::new()),
+            frame: None,
+            metadata: Some(MetadataReport {
+                frame: 1,
+                frame_path: "frame-01.tif".to_string(),
+                exif: "written".to_string(),
+                icc: "source".to_string(),
+                xmp: "off".to_string(),
+                iptc: "off".to_string(),
+                warnings: vec!["ICC profile exceeds JPEG's embedding limit; skipped".to_string()],
+            }),
+            wall_seconds: 0.1,
+        });
+        for needle in [
+            "metadata frame: 1 (frame-01.tif)",
+            "metadata: exif=written icc=source xmp=off iptc=off",
+            "metadata warning: ICC profile exceeds JPEG's embedding limit; skipped",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
+    }
+
+    #[test]
+    fn resolve_metadata_options_defaults_to_exif_and_icc_on() {
+        let options =
+            resolve_metadata_options(&FormatArgs::default()).expect("default flags must resolve");
+        assert_eq!(options, MetadataOptions::default());
+    }
+
+    #[test]
+    fn resolve_metadata_options_maps_on_off_through_every_flag() {
+        let args = FormatArgs {
+            exif: Some("off".to_string()),
+            icc: Some("off".to_string()),
+            xmp: Some("on".to_string()),
+            iptc: Some("on".to_string()),
+            ..Default::default()
+        };
+        let options = resolve_metadata_options(&args).expect("on/off flags must resolve");
+        assert_eq!(
+            options,
+            MetadataOptions {
+                exif: false,
+                icc: false,
+                xmp: true,
+                iptc: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_metadata_options_refuses_any_other_word_by_flag_name() {
+        let args = FormatArgs {
+            xmp: Some("maybe".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_metadata_options(&args).unwrap_err();
+        assert!(err.starts_with("--xmp:"), "{err}");
     }
 }

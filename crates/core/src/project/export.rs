@@ -6,10 +6,11 @@
 
 use std::cell::RefCell;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::mpsc;
 
+use chrono::Local;
 use jpeg_encoder::{Encoder, ImageBuffer, JpegColorType, SamplingFactor, rgb_to_ycbcr};
 use serde::{Deserialize, Serialize};
 
@@ -273,6 +274,204 @@ pub fn params_for(format: ExportFormat) -> &'static [ParamDesc] {
     }
 }
 
+/// The four metadata switches, shared across every export format.
+pub static METADATA_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
+    vec![
+        ParamDesc {
+            id: "exif".to_string(),
+            label: "Carry EXIF".to_string(),
+            help: "Carries the alignment reference frame's Make, Model, exposure fields and \
+                   capture time into the export, with the export's own size, tool and moment \
+                   written in."
+                .to_string(),
+            kind: ParamKind::Bool,
+            default: ParamValue::Bool(true),
+            auto: None,
+            host_default: None,
+        },
+        ParamDesc {
+            id: "icc".to_string(),
+            label: "Embed ICC profile".to_string(),
+            help: "Embeds the source frame's own colour profile, or a built-in sRGB profile \
+                   for a RAW source."
+                .to_string(),
+            kind: ParamKind::Bool,
+            default: ParamValue::Bool(true),
+            auto: None,
+            host_default: None,
+        },
+        ParamDesc {
+            id: "xmp".to_string(),
+            label: "Carry XMP".to_string(),
+            help: "Carries the source frame's XMP packet verbatim. Off by default: the \
+                   reference frames' XMP is the source tool's own edit history, which does not \
+                   describe the fused result."
+                .to_string(),
+            kind: ParamKind::Bool,
+            default: ParamValue::Bool(false),
+            auto: None,
+            host_default: None,
+        },
+        ParamDesc {
+            id: "iptc".to_string(),
+            label: "Carry IPTC".to_string(),
+            help: "Carries the source frame's IPTC block verbatim. Not written to PNG, which \
+                   has no IPTC chunk."
+                .to_string(),
+            kind: ParamKind::Bool,
+            default: ParamValue::Bool(false),
+            auto: None,
+            host_default: None,
+        },
+    ]
+});
+
+/// The four metadata switches [`export_checkpoint`] takes beside an
+/// [`ExportOptions`]: `exif` and `icc` default on, `xmp` and `iptc` default
+/// off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataOptions {
+    pub exif: bool,
+    pub icc: bool,
+    pub xmp: bool,
+    pub iptc: bool,
+}
+
+impl Default for MetadataOptions {
+    fn default() -> Self {
+        MetadataOptions {
+            exif: true,
+            icc: true,
+            xmp: false,
+            iptc: false,
+        }
+    }
+}
+
+impl MetadataOptions {
+    /// Resolves [`METADATA_PARAMS`]' defaults against `values`, validating
+    /// every entry the same way [`ExportOptions::from_values`] does.
+    pub fn from_values(values: &ParamValues) -> Result<Self, ProjectError> {
+        validate(&METADATA_PARAMS, values)
+            .map_err(|source| ProjectError::ExportOptions { source })?;
+        let resolved = |id: &str| -> bool {
+            values
+                .get(id)
+                .and_then(ParamValue::as_bool)
+                .unwrap_or_else(|| {
+                    METADATA_PARAMS
+                        .iter()
+                        .find(|d| d.id == id)
+                        .and_then(|d| d.default.as_bool())
+                        .expect("id in schema with a bool default")
+                })
+        };
+        Ok(MetadataOptions {
+            exif: resolved("exif"),
+            icc: resolved("icc"),
+            xmp: resolved("xmp"),
+            iptc: resolved("iptc"),
+        })
+    }
+
+    /// The inverse of [`Self::from_values`].
+    pub fn values(&self) -> ParamValues {
+        let mut out = ParamValues::new();
+        out.insert("exif".to_string(), ParamValue::Bool(self.exif));
+        out.insert("icc".to_string(), ParamValue::Bool(self.icc));
+        out.insert("xmp".to_string(), ParamValue::Bool(self.xmp));
+        out.insert("iptc".to_string(), ParamValue::Bool(self.iptc));
+        out
+    }
+}
+
+/// One metadata block's fate in an export, decided in this priority: a
+/// switched-off block is always `Off`; a combination its target format
+/// cannot hold (IPTC into PNG) is `Unsupported`; a block the source never
+/// had is `Absent`; otherwise `Written`, or `Skipped` when the resolved
+/// bytes did not fit the format's container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MetadataStatus {
+    #[default]
+    Off,
+    Unsupported,
+    Absent,
+    Written,
+    Skipped,
+}
+
+/// Where the embedded ICC profile came from, mirroring [`MetadataStatus`]
+/// for the one block with more than one non-`Written` source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IccStatus {
+    #[default]
+    Off,
+    Source,
+    BuiltinSrgb,
+    None,
+    Skipped,
+}
+
+/// [`export_checkpoint`]'s companion result: which source frame the EXIF
+/// and ICC came from, and every metadata block's outcome.
+#[derive(Debug, Clone)]
+pub struct MetadataOutcome {
+    pub frame: usize,
+    pub frame_path: PathBuf,
+    pub exif: MetadataStatus,
+    pub icc: IccStatus,
+    pub xmp: MetadataStatus,
+    pub iptc: MetadataStatus,
+    pub warnings: Vec<String>,
+}
+
+/// A format writer's own tally, before [`export_checkpoint`] adds the
+/// source read's warnings and the resolved frame.
+#[derive(Debug, Clone, Default)]
+struct MetadataBlocks {
+    exif: MetadataStatus,
+    icc: IccStatus,
+    xmp: MetadataStatus,
+    iptc: MetadataStatus,
+    warnings: Vec<String>,
+}
+
+fn block_status(on: bool, supported: bool, has_data: bool, skipped: bool) -> MetadataStatus {
+    if !on {
+        MetadataStatus::Off
+    } else if !supported {
+        MetadataStatus::Unsupported
+    } else if !has_data {
+        MetadataStatus::Absent
+    } else if skipped {
+        MetadataStatus::Skipped
+    } else {
+        MetadataStatus::Written
+    }
+}
+
+fn icc_status(on: bool, origin: io::IccOrigin, skipped: bool) -> IccStatus {
+    if !on {
+        return IccStatus::Off;
+    }
+    match origin {
+        io::IccOrigin::Off => IccStatus::Off,
+        io::IccOrigin::None => IccStatus::None,
+        io::IccOrigin::Source if skipped => IccStatus::Skipped,
+        io::IccOrigin::Source => IccStatus::Source,
+        io::IccOrigin::BuiltinSrgb if skipped => IccStatus::Skipped,
+        io::IccOrigin::BuiltinSrgb => IccStatus::BuiltinSrgb,
+    }
+}
+
+/// Nothing about `plan` needs writing at all: every block is either
+/// switched off or the source had nothing for it. The only case this
+/// unlocks is the TIFF 16-bit/uncompressed default staying on the
+/// metadata-free [`write_tiff`] path.
+fn plan_is_empty(plan: &io::MetadataPlan) -> bool {
+    !plan.has_exif && plan.icc_bytes.is_none() && !plan.has_xmp && !plan.has_iptc
+}
+
 impl ExportOptions {
     pub fn format(&self) -> ExportFormat {
         match self {
@@ -458,44 +657,109 @@ fn check_supported_samples(
 /// then renders `id` through the export render and writes it as `options`
 /// say: a `.partial` sibling of `path`, renamed onto it only once every band
 /// is written and removed instead on any error, exactly as the view render
-/// is.
+/// is. `metadata_options` resolves the alignment reference frame's EXIF,
+/// ICC, XMP and IPTC into the same file, never failing the export on its
+/// own: a damaged or missing block is named in the returned
+/// [`MetadataOutcome`] instead.
 pub fn export_checkpoint(
     project: &mut Project,
     id: &str,
     path: &Path,
     options: &ExportOptions,
-) -> Result<(), ProjectError> {
+    metadata_options: &MetadataOptions,
+) -> Result<MetadataOutcome, ProjectError> {
     validate(params_for(options.format()), &options.values())
         .map_err(|source| ProjectError::ExportOptions { source })?;
     let image = CheckpointImage::prepare_export(project, id)?;
     check_jpeg_size(options, image.width, image.height, path)?;
     check_supported_samples(options, image.samples_per_pixel, path)?;
-    match options {
+
+    let record = project.fuse_state(id)?;
+    let frame = record.align.as_ref().map_or(0, |a| a.reference);
+    let frame_path = project.source_path(&record.sources[frame]);
+    let source = io::read_source_metadata(&frame_path);
+    let now = Local::now().fixed_offset();
+    let plan = io::resolve_plan(
+        &source,
+        image.width,
+        image.height,
+        now,
+        metadata_options.exif,
+        metadata_options.icc,
+        metadata_options.xmp,
+        metadata_options.iptc,
+    );
+
+    let blocks = match options {
         ExportOptions::Tiff {
             bits: TiffBits::Sixteen,
             compression: TiffCompression::None,
-        } => write_tiff(project, &image, path),
-        ExportOptions::Tiff { bits, compression } => {
-            write_strip_tiff(project, &image, path, *bits, *compression)
+        } if plan_is_empty(&plan) => {
+            write_tiff(project, &image, path)?;
+            MetadataBlocks {
+                exif: block_status(metadata_options.exif, true, false, false),
+                icc: icc_status(metadata_options.icc, plan.icc, false),
+                xmp: block_status(metadata_options.xmp, true, false, false),
+                iptc: block_status(metadata_options.iptc, true, false, false),
+                warnings: Vec::new(),
+            }
         }
-        ExportOptions::Png { bits, compression } => {
-            write_png(project, &image, path, *bits, *compression)
-        }
+        ExportOptions::Tiff { bits, compression } => write_strip_tiff(
+            project,
+            &image,
+            path,
+            *bits,
+            *compression,
+            &plan,
+            metadata_options,
+        )?,
+        ExportOptions::Png { bits, compression } => write_png(
+            project,
+            &image,
+            path,
+            *bits,
+            *compression,
+            &plan,
+            metadata_options,
+        )?,
         ExportOptions::Jpeg {
             quality,
             subsampling,
-        } => write_jpeg(project, &image, path, *quality, *subsampling),
-    }
+        } => write_jpeg(
+            project,
+            &image,
+            path,
+            *quality,
+            *subsampling,
+            &plan,
+            metadata_options,
+        )?,
+    };
+
+    let mut warnings = source.warnings;
+    warnings.extend(blocks.warnings);
+    Ok(MetadataOutcome {
+        frame,
+        frame_path,
+        exif: blocks.exif,
+        icc: blocks.icc,
+        xmp: blocks.xmp,
+        iptc: blocks.iptc,
+        warnings,
+    })
 }
 
 /// 8- or 16-bit, compressed or uncompressed TIFF, through [`StripWriter`].
+#[allow(clippy::too_many_arguments)] // one flag/plan apiece; a struct wrapper would only rename this list
 fn write_strip_tiff(
     project: &mut Project,
     image: &CheckpointImage,
     path: &Path,
     bits: TiffBits,
     compression: TiffCompression,
-) -> Result<(), ProjectError> {
+    plan: &io::MetadataPlan,
+    metadata_options: &MetadataOptions,
+) -> Result<MetadataBlocks, ProjectError> {
     let bits_per_sample = match bits {
         TiffBits::Sixteen => 16,
         TiffBits::Eight => 8,
@@ -505,6 +769,22 @@ fn write_strip_tiff(
         TiffCompression::Lzw => StripCompression::Lzw,
         TiffCompression::Deflate => StripCompression::Deflate,
     };
+    let mut ifd0 = plan.tags.ifd0.clone();
+    if let Some(bytes) = &plan.icc_bytes {
+        ifd0.push(io::icc_tag_entry(bytes));
+    }
+    if let Some(bytes) = &plan.xmp_bytes {
+        ifd0.push(io::xmp_tag_entry(bytes));
+    }
+    if let Some(bytes) = &plan.iptc_bytes {
+        ifd0.push(io::iptc_tag_entry(bytes));
+    }
+    let metadata = io::MetadataTags {
+        ifd0,
+        exif: plan.tags.exif.clone(),
+        gps: plan.tags.gps.clone(),
+    };
+
     write_via_partial(path, |partial| {
         let mut writer = StripWriter::create(
             partial,
@@ -515,6 +795,7 @@ fn write_strip_tiff(
                 bits_per_sample,
                 compression,
                 description: Some(image.description.clone()),
+                metadata,
             },
         )
         .map_err(|err| ProjectError::container(partial, err))?;
@@ -533,19 +814,33 @@ fn write_strip_tiff(
             .finish()
             .map_err(|err| ProjectError::container(path, err))
             .map(|_| ())
+    })?;
+
+    Ok(MetadataBlocks {
+        exif: block_status(metadata_options.exif, true, plan.has_exif, false),
+        icc: icc_status(metadata_options.icc, plan.icc, false),
+        xmp: block_status(metadata_options.xmp, true, plan.has_xmp, false),
+        iptc: block_status(metadata_options.iptc, true, plan.has_iptc, false),
+        warnings: Vec::new(),
     })
 }
 
 /// 8- or 16-bit PNG, lossless, through the `png` crate's `StreamWriter` fed
 /// band by band. 16-bit samples are written big-endian, as the PNG spec
-/// requires.
+/// requires. EXIF goes to the `eXIf` chunk, ICC to `iCCP`, both through
+/// `png::Info`; XMP goes to an `iTXt` chunk, which needs valid UTF-8 text --
+/// a non-UTF-8 packet is skipped. PNG has no IPTC chunk, so that switch is
+/// always `Unsupported` here regardless of the source.
+#[allow(clippy::too_many_arguments)] // one flag/plan apiece; a struct wrapper would only rename this list
 fn write_png(
     project: &mut Project,
     image: &CheckpointImage,
     path: &Path,
     bits: PngBits,
     compression: PngCompression,
-) -> Result<(), ProjectError> {
+    plan: &io::MetadataPlan,
+    metadata_options: &MetadataOptions,
+) -> Result<MetadataBlocks, ProjectError> {
     let color = if image.samples_per_pixel >= 3 {
         png::ColorType::Rgb
     } else {
@@ -560,13 +855,43 @@ fn write_png(
         PngCompression::Default => png::Compression::Balanced,
         PngCompression::Best => png::Compression::High,
     };
+    let exif_bytes = plan.has_exif.then(|| io::exif_blob(&plan.tags));
+    let mut warnings = Vec::new();
+    let mut xmp_skipped = false;
+    let xmp_text =
+        plan.xmp_bytes
+            .as_ref()
+            .and_then(|bytes| match String::from_utf8(bytes.clone()) {
+                Ok(text) => Some(text),
+                Err(_) => {
+                    xmp_skipped = true;
+                    warnings.push(
+                        "XMP packet is not valid UTF-8, which PNG's iTXt chunk requires; skipped"
+                            .to_string(),
+                    );
+                    None
+                }
+            });
+
     write_via_partial(path, |partial| {
         let file = std::fs::File::create(partial).map_err(|err| ProjectError::io(partial, err))?;
-        let mut encoder =
-            png::Encoder::new(std::io::BufWriter::new(file), image.width, image.height);
-        encoder.set_color(color);
-        encoder.set_depth(depth);
+        let mut info = png::Info::with_size(image.width, image.height);
+        info.color_type = color;
+        info.bit_depth = depth;
+        if let Some(bytes) = &plan.icc_bytes {
+            info.icc_profile = Some(bytes.clone().into());
+        }
+        if let Some(bytes) = &exif_bytes {
+            info.exif_metadata = Some(bytes.clone().into());
+        }
+        let mut encoder = png::Encoder::with_info(std::io::BufWriter::new(file), info)
+            .map_err(|err| ProjectError::container(partial, err))?;
         encoder.set_compression(level);
+        if let Some(text) = &xmp_text {
+            encoder
+                .add_itxt_chunk("XML:com.adobe.xmp".to_string(), text.clone())
+                .map_err(|err| ProjectError::container(partial, err))?;
+        }
         let mut writer = encoder
             .write_header()
             .map_err(|err| ProjectError::container(partial, err))?;
@@ -592,19 +917,47 @@ fn write_png(
         writer
             .finish()
             .map_err(|err| ProjectError::container(path, err))
+    })?;
+
+    Ok(MetadataBlocks {
+        exif: block_status(metadata_options.exif, true, plan.has_exif, false),
+        icc: icc_status(metadata_options.icc, plan.icc, false),
+        xmp: block_status(metadata_options.xmp, true, plan.has_xmp, xmp_skipped),
+        iptc: block_status(metadata_options.iptc, false, plan.has_iptc, false),
+        warnings,
     })
+}
+
+/// Which of a JPEG export's four metadata blocks the encoder refused for
+/// exceeding its container's byte cap -- discovered only once the encoder
+/// thread actually calls `add_exif_metadata`/`add_icc_profile`/
+/// `add_app_segment`, so this is built there and read back after `join`.
+#[derive(Debug, Clone, Copy, Default)]
+struct JpegMetadataSkips {
+    exif: bool,
+    icc: bool,
+    xmp: bool,
+    iptc: bool,
 }
 
 /// 8-bit JPEG through `jpeg_encoder`. The calling thread converts and sends
 /// each band over a bounded channel while a scoped worker thread encodes
-/// row by row, so neither side holds the whole image resident.
+/// row by row, so neither side holds the whole image resident. EXIF goes
+/// through `add_exif_metadata` (APP1 `Exif`), ICC through `add_icc_profile`
+/// (APP2, chunked by the encoder itself), XMP through `add_app_segment`
+/// (a second APP1, `http://ns.adobe.com/xap/1.0/` prefixed) and IPTC
+/// through `add_app_segment` (APP13, a Photoshop `8BIM` resource) -- each
+/// skipped, not fatal, when the encoder refuses it for size.
+#[allow(clippy::too_many_arguments)] // one flag/plan apiece; a struct wrapper would only rename this list
 fn write_jpeg(
     project: &mut Project,
     image: &CheckpointImage,
     path: &Path,
     quality: i64,
     subsampling: JpegSubsampling,
-) -> Result<(), ProjectError> {
+    plan: &io::MetadataPlan,
+    metadata_options: &MetadataOptions,
+) -> Result<MetadataBlocks, ProjectError> {
     let width = image.width;
     let height = image.height;
     let samples_per_pixel = image.samples_per_pixel;
@@ -613,15 +966,38 @@ fn write_jpeg(
         JpegSubsampling::S444 => SamplingFactor::F_1_1,
         JpegSubsampling::S420 => SamplingFactor::F_2_2,
     };
+    let exif_bytes = plan.has_exif.then(|| io::exif_blob(&plan.tags));
+    let icc_bytes = plan.icc_bytes.clone();
+    let xmp_bytes = plan.xmp_bytes.clone();
+    let iptc_bytes = plan.iptc_bytes.clone();
+    let mut skips = JpegMetadataSkips::default();
+
     write_via_partial(path, |partial| {
         let file = std::fs::File::create(partial).map_err(|err| ProjectError::io(partial, err))?;
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
         let source = JpegRowSource::new(rx, width, height, samples_per_pixel);
-        let (render_result, encode_result) = std::thread::scope(|scope| {
+        let (render_result, encode_result, thread_skips) = std::thread::scope(|scope| {
             let handle = scope.spawn(move || {
                 let mut encoder = Encoder::new(std::io::BufWriter::new(file), quality);
                 encoder.set_sampling_factor(sampling_factor);
-                encoder.encode_image(source)
+                let mut skips = JpegMetadataSkips::default();
+                if let Some(bytes) = &exif_bytes {
+                    skips.exif = encoder.add_exif_metadata(bytes).is_err();
+                }
+                if let Some(bytes) = &icc_bytes {
+                    skips.icc = encoder.add_icc_profile(bytes).is_err();
+                }
+                if let Some(bytes) = &xmp_bytes {
+                    let mut segment = io::XMP_APP1_HEADER.to_vec();
+                    segment.extend_from_slice(bytes);
+                    skips.xmp = encoder.add_app_segment(1, segment).is_err();
+                }
+                if let Some(bytes) = &iptc_bytes {
+                    skips.iptc = encoder
+                        .add_app_segment(13, io::photoshop_iptc_segment(bytes))
+                        .is_err();
+                }
+                (encoder.encode_image(source), skips)
             });
             let render_result = image.render(project, &mut |band, _rect| {
                 let bytes: Vec<u8> = band.iter().map(|&v| to_8bit(v)).collect();
@@ -633,13 +1009,46 @@ fn write_jpeg(
                 })
             });
             drop(tx);
-            let encode_result = handle
-                .join()
-                .map_err(|_| ProjectError::container(partial, "the JPEG encoder thread panicked"))
-                .and_then(|result| result.map_err(|err| ProjectError::container(partial, err)));
-            (render_result, encode_result)
+            let (encode_result, thread_skips) = match handle.join() {
+                Ok((result, skips)) => (
+                    result.map_err(|err| ProjectError::container(partial, err)),
+                    skips,
+                ),
+                Err(_) => (
+                    Err(ProjectError::container(
+                        partial,
+                        "the JPEG encoder thread panicked",
+                    )),
+                    JpegMetadataSkips::default(),
+                ),
+            };
+            (render_result, encode_result, thread_skips)
         });
+        skips = thread_skips;
         render_result.and(encode_result)
+    })?;
+
+    let mut warnings = Vec::new();
+    if skips.exif {
+        warnings.push("EXIF blob exceeds JPEG's APP1 segment limit; skipped".to_string());
+    }
+    if skips.icc {
+        warnings.push("ICC profile exceeds JPEG's embedding limit; skipped".to_string());
+    }
+    if skips.xmp {
+        warnings
+            .push("XMP packet exceeds one JPEG APP1 segment (65502 bytes); skipped".to_string());
+    }
+    if skips.iptc {
+        warnings.push("IPTC block exceeds JPEG's APP13 segment limit; skipped".to_string());
+    }
+
+    Ok(MetadataBlocks {
+        exif: block_status(metadata_options.exif, true, plan.has_exif, skips.exif),
+        icc: icc_status(metadata_options.icc, plan.icc, skips.icc),
+        xmp: block_status(metadata_options.xmp, true, plan.has_xmp, skips.xmp),
+        iptc: block_status(metadata_options.iptc, true, plan.has_iptc, skips.iptc),
+        warnings,
     })
 }
 
@@ -971,5 +1380,59 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn metadata_options_from_values_values_round_trips_and_defaults_match_the_switches() {
+        let defaults = all_defaults(&METADATA_PARAMS);
+        let options = MetadataOptions::from_values(&defaults).unwrap();
+        assert_eq!(options, MetadataOptions::default());
+        assert_eq!(options.values(), defaults);
+        assert!(options.exif && options.icc && !options.xmp && !options.iptc);
+    }
+
+    #[test]
+    fn block_status_precedence_is_off_then_unsupported_then_absent_then_written_or_skipped() {
+        assert_eq!(block_status(false, true, true, false), MetadataStatus::Off);
+        assert_eq!(
+            block_status(true, false, true, false),
+            MetadataStatus::Unsupported
+        );
+        assert_eq!(
+            block_status(true, true, false, false),
+            MetadataStatus::Absent
+        );
+        assert_eq!(
+            block_status(true, true, true, false),
+            MetadataStatus::Written
+        );
+        assert_eq!(
+            block_status(true, true, true, true),
+            MetadataStatus::Skipped
+        );
+    }
+
+    #[test]
+    fn icc_status_reports_off_then_origin_or_skipped() {
+        assert_eq!(
+            icc_status(false, io::IccOrigin::Source, false),
+            IccStatus::Off
+        );
+        assert_eq!(
+            icc_status(true, io::IccOrigin::None, false),
+            IccStatus::None
+        );
+        assert_eq!(
+            icc_status(true, io::IccOrigin::Source, false),
+            IccStatus::Source
+        );
+        assert_eq!(
+            icc_status(true, io::IccOrigin::BuiltinSrgb, false),
+            IccStatus::BuiltinSrgb
+        );
+        assert_eq!(
+            icc_status(true, io::IccOrigin::Source, true),
+            IccStatus::Skipped
+        );
     }
 }

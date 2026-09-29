@@ -7,16 +7,24 @@
 //! export band, gives compression and 8-bit rounding something to do.
 
 mod common;
+#[path = "../../core/tests/common/raw_dng.rs"]
+mod raw_dng;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use focusforge_core::align::Registration;
-use focusforge_core::io::{Rect, SegmentOrigin, TiffSegmentReader, TiffSpec, TiffWriter};
+use focusforge_core::align::{Registration, Transform};
+use focusforge_core::io::test_frames::{
+    FrameMetadata, RawEntry, ascii_entry, longs_bo, rational_bo, write_frame_with_metadata,
+};
+use focusforge_core::io::{
+    ByteOrder, Rect, SegmentOrigin, TiffSegmentReader, TiffSpec, TiffWriter, read_source_metadata,
+};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::to_8bit;
-use focusforge_core::project::{self, Metrics, Op, Point, SealRequest, ZMapStorage};
+use focusforge_core::project::{self, AlignRecord, Metrics, Op, Point, SealRequest, ZMapStorage};
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+use raw_dng::{DngSpec, write_dng};
 
 fn bin() -> Command {
     common::cli_bin("export_formats")
@@ -915,4 +923,1063 @@ fn json_reports_format_and_options() {
     let report: serde_json::Value = serde_json::from_str(&r.stdout).expect("--json parses");
     assert_eq!(report["format"], serde_json::json!(null));
     assert_eq!(report["format_options"], serde_json::json!(null));
+}
+
+// ---------------------------------------------------------------------------
+// A source frame's EXIF, ICC, XMP and IPTC carried into export.
+// ---------------------------------------------------------------------------
+
+/// A source frame size for the metadata tests: distinct dimensions, smaller
+/// than [`EW`]/[`EH`] since these exercise metadata rather than banding.
+const MW: u32 = 48;
+const MH: u32 = 24;
+
+/// Bytes long enough (>4) to force out-of-line TIFF storage; not a real ICC
+/// profile, since every test here only checks byte-identity.
+fn test_icc(salt: u8) -> Vec<u8> {
+    (0..64u32).map(|i| (i as u8).wrapping_add(salt)).collect()
+}
+
+/// One GPS coordinate as three `RATIONAL`s (degrees, minutes, seconds).
+fn dms(deg: u32, min: u32, sec: u32) -> Vec<u8> {
+    [
+        rational_bo(ByteOrder::Little, deg, 1),
+        rational_bo(ByteOrder::Little, min, 1),
+        rational_bo(ByteOrder::Little, sec, 1),
+    ]
+    .concat()
+}
+
+/// A source frame carrying a realistic EXIF IFD (`Make`, `Model`,
+/// `DateTimeOriginal`, `ExposureTime`, `FNumber`) and a GPS IFD, plus
+/// whichever of an ICC profile, an XMP packet and an IPTC block are given.
+/// `exif_dims`, when given, is the size the source's own `ExifImageWidth`/
+/// `Height` claim -- deliberately different from an export's actual size,
+/// so the rewrite rule has something to prove.
+fn rich_frame_metadata(
+    make: &str,
+    exif_dims: Option<(u32, u32)>,
+    icc: Option<&[u8]>,
+    xmp: Option<&[u8]>,
+    iptc: Option<&[u8]>,
+) -> FrameMetadata {
+    let mut ifd0: Vec<RawEntry> = vec![
+        (271, 2, ascii_entry(make)),
+        (272, 2, ascii_entry("Test Body")),
+        (36867, 2, ascii_entry("2024:05:01 10:00:00")), // DateTimeOriginal
+    ];
+    if let Some(bytes) = icc {
+        ifd0.push((34675, 7, bytes.to_vec())); // ICC profile, UNDEFINED
+    }
+    if let Some(bytes) = xmp {
+        ifd0.push((700, 1, bytes.to_vec())); // XMP, BYTE
+    }
+    if let Some(bytes) = iptc {
+        ifd0.push((33723, 7, bytes.to_vec())); // IPTC, UNDEFINED
+    }
+    let mut exif: Vec<RawEntry> = vec![
+        (33434, 5, rational_bo(ByteOrder::Little, 1, 200)), // ExposureTime
+        (33437, 5, rational_bo(ByteOrder::Little, 28, 10)), // FNumber
+    ];
+    if let Some((w, h)) = exif_dims {
+        exif.push((40962, 4, longs_bo(ByteOrder::Little, &[w])));
+        exif.push((40963, 4, longs_bo(ByteOrder::Little, &[h])));
+    }
+    let gps: Vec<RawEntry> = vec![
+        (1, 2, ascii_entry("N")), // GPSLatitudeRef
+        (2, 5, dms(37, 46, 30)),  // GPSLatitude
+        (3, 2, ascii_entry("W")), // GPSLongitudeRef
+        (4, 5, dms(122, 25, 10)), // GPSLongitude
+    ];
+    FrameMetadata {
+        ifd0,
+        exif,
+        gps,
+        ..Default::default()
+    }
+}
+
+struct MetaSynth {
+    _dir: common::TmpDir,
+    project_path: PathBuf,
+    root: String,
+    child: String,
+    frame_paths: Vec<PathBuf>,
+}
+
+/// A project like [`Synth`] but whose sources are written through
+/// [`write_frame_with_metadata`] rather than the plain [`TiffWriter`], so
+/// each can carry its own EXIF/GPS/ICC/XMP/IPTC. The Z-Map is uniformly zero
+/// (frame 0 contributes every pixel) regardless of `align_reference`: the
+/// alignment reference and the Z-Map's own per-pixel source choice are
+/// independent, and an export only ever reads the former.
+fn build_metadata_synth(
+    name: &str,
+    frames: &[FrameMetadata],
+    align_reference: Option<usize>,
+) -> MetaSynth {
+    let dir = common::tmp_dir(name);
+    let staging = dir.join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+
+    let mut frame_paths = Vec::new();
+    for (i, meta) in frames.iter().enumerate() {
+        let path = dir.join(format!("frame-{i:02}.tif"));
+        write_frame_with_metadata(&path, MW, MH, meta).expect("source frame must write");
+        frame_paths.push(path);
+    }
+
+    let composite_path = staging.join("composite.tif");
+    write_tiff(
+        &composite_path,
+        MW,
+        MH,
+        3,
+        &gradient_samples(MW, MH, 3),
+        Some("staged composite"),
+    );
+    let zmap_path = staging.join("zmap.tif");
+    let mut map = ZMapWriter::create(
+        &zmap_path,
+        ZMapInfo::new(MW, MH, frame_paths.len() as u32).unwrap(),
+    )
+    .unwrap();
+    map.write_tile(full(MW, MH), &vec![0u16; (MW * MH) as usize])
+        .unwrap();
+    map.finish().unwrap();
+
+    let align = align_reference.map(|reference| AlignRecord {
+        algorithm: "test".to_string(),
+        params: ParamValues::new(),
+        reference,
+    });
+    let registration = if align.is_some() {
+        Registration {
+            transforms: vec![Transform::identity(); frame_paths.len()],
+            crop: None,
+        }
+    } else {
+        Registration::default()
+    };
+
+    let project_path = dir.join(format!("meta.{}", project::PROJECT_EXTENSION));
+    let sealed = project::seal(SealRequest {
+        project_path: &project_path,
+        staged_composite: &composite_path,
+        staged_zmap: &zmap_path,
+        sources: &frame_paths,
+        algorithm: "laplacian",
+        params: &ParamValues::new(),
+        align,
+        registration,
+        composite_description: "staged composite".to_string(),
+        label: None,
+        metrics: Metrics::default(),
+    })
+    .expect("seal must succeed");
+    let root = sealed.checkpoint;
+
+    let child = project::append_ops_onto(
+        &project_path,
+        &root,
+        vec![Op::BrushStroke {
+            source_id: 0,
+            path: vec![Point { x: 2, y: 2 }],
+            radius: 1.5,
+            softness: 0.0,
+        }],
+        None,
+        1,
+        ZMapStorage::Bounded,
+    )
+    .expect("append_ops_onto must succeed")
+    .checkpoint;
+
+    MetaSynth {
+        _dir: dir,
+        project_path,
+        root,
+        child,
+        frame_paths,
+    }
+}
+
+/// A one-source RAW project, sized to [`DngSpec::new`]'s own 8x8 default so
+/// its `samples` vector needs no resizing.
+fn build_raw_metadata_synth(name: &str, make: &str, model: &str) -> (common::TmpDir, PathBuf) {
+    let dir = common::tmp_dir(name);
+    let staging = dir.join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+
+    let mut spec = DngSpec::new(12, 0, 4095, [0, 1, 1, 2], vec![1000u16; 64]);
+    spec.make = make.to_string();
+    spec.model = model.to_string();
+    let dng = write_dng(&spec, false);
+    let frame_path = dir.join("00.dng");
+    std::fs::copy(dng.path(), &frame_path).expect("copy RAW frame");
+
+    let composite_path = staging.join("composite.tif");
+    write_tiff(
+        &composite_path,
+        8,
+        8,
+        3,
+        &gradient_samples(8, 8, 3),
+        Some("staged composite"),
+    );
+    let zmap_path = staging.join("zmap.tif");
+    let mut map = ZMapWriter::create(&zmap_path, ZMapInfo::new(8, 8, 1).unwrap()).unwrap();
+    map.write_tile(full(8, 8), &[0u16; 64]).unwrap();
+    map.finish().unwrap();
+
+    let project_path = dir.join(format!("raw.{}", project::PROJECT_EXTENSION));
+    project::seal(SealRequest {
+        project_path: &project_path,
+        staged_composite: &composite_path,
+        staged_zmap: &zmap_path,
+        sources: &[frame_path],
+        algorithm: "laplacian",
+        params: &ParamValues::new(),
+        align: None,
+        registration: Registration::default(),
+        composite_description: "staged composite".to_string(),
+        label: None,
+        metrics: Metrics::default(),
+    })
+    .expect("seal must succeed");
+    (dir, project_path)
+}
+
+/// Rewrites `tag`'s declared element count in `path`'s little-endian IFD0
+/// to `count`, without touching anything else in the file -- the "truncated
+/// entry" shape a reader must survive: a declared size the file no longer
+/// backs.
+fn corrupt_ifd0_entry_count(path: &Path, tag: u16, count: u32) {
+    let mut bytes = std::fs::read(path).unwrap();
+    assert_eq!(&bytes[0..2], b"II", "helper assumes a little-endian frame");
+    let ifd0_at = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let n = u16::from_le_bytes(bytes[ifd0_at..ifd0_at + 2].try_into().unwrap()) as usize;
+    for i in 0..n {
+        let e = ifd0_at + 2 + i * 12;
+        if u16::from_le_bytes(bytes[e..e + 2].try_into().unwrap()) == tag {
+            bytes[e + 4..e + 8].copy_from_slice(&count.to_le_bytes());
+            std::fs::write(path, &bytes).unwrap();
+            return;
+        }
+    }
+    panic!("tag {tag} not found in IFD0 of {}", path.display());
+}
+
+// --- reading embedded metadata back out of PNG/JPEG, independent of
+// `core`'s own writer -------------------------------------------------------
+
+/// One APPn JPEG segment's marker number (0 for APP0 .. 15 for APP15) and
+/// payload, excluding the 2-byte length field.
+fn jpeg_app_segments(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut i = 2; // past SOI
+    while i + 4 <= bytes.len() {
+        assert_eq!(bytes[i], 0xFF, "expected a marker at byte {i}");
+        let marker = bytes[i + 1];
+        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            i += 2;
+            continue;
+        }
+        if marker == 0xDA {
+            break; // start of scan: nothing of interest follows
+        }
+        let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+        if (0xE0..=0xEF).contains(&marker) {
+            out.push((marker - 0xE0, bytes[i + 4..i + 2 + len].to_vec()));
+        }
+        i += 2 + len;
+    }
+    out
+}
+
+/// The bytes of a JPEG's embedded `Exif\0\0` APP1 segment, sans header.
+fn jpeg_exif_blob(bytes: &[u8]) -> Option<Vec<u8>> {
+    jpeg_app_segments(bytes)
+        .into_iter()
+        .find_map(|(marker, payload)| {
+            (marker == 1 && payload.starts_with(b"Exif\0\0")).then(|| payload[6..].to_vec())
+        })
+}
+
+/// The JPEG's embedded ICC profile, reassembled from one or more APP2
+/// `ICC_PROFILE\0` segments in chunk order (the 1-indexed sequence byte at
+/// offset 12).
+fn jpeg_icc_profile(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut chunks: Vec<(u8, Vec<u8>)> = jpeg_app_segments(bytes)
+        .into_iter()
+        .filter_map(|(marker, payload)| {
+            (marker == 2 && payload.starts_with(b"ICC_PROFILE\0"))
+                .then(|| (payload[12], payload[14..].to_vec()))
+        })
+        .collect();
+    if chunks.is_empty() {
+        return None;
+    }
+    chunks.sort_by_key(|(seq, _)| *seq);
+    Some(chunks.into_iter().flat_map(|(_, data)| data).collect())
+}
+
+/// The JPEG's embedded XMP packet: the APP1 segment prefixed with the XMP
+/// namespace header rather than `Exif\0\0`.
+fn jpeg_xmp_packet(bytes: &[u8]) -> Option<Vec<u8>> {
+    const HEADER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+    jpeg_app_segments(bytes)
+        .into_iter()
+        .find_map(|(marker, payload)| {
+            (marker == 1 && payload.starts_with(HEADER)).then(|| payload[HEADER.len()..].to_vec())
+        })
+}
+
+/// The JPEG's embedded IPTC block, unwrapped from its APP13 `Photoshop
+/// 3.0\0` / `8BIM` 0x0404 resource -- exactly the shape
+/// `core::io::photoshop_iptc_segment` writes.
+fn jpeg_iptc_block(bytes: &[u8]) -> Option<Vec<u8>> {
+    jpeg_app_segments(bytes)
+        .into_iter()
+        .find_map(|(marker, payload)| {
+            if marker != 13 || !payload.starts_with(b"Photoshop 3.0\0") {
+                return None;
+            }
+            let rest = &payload[14..];
+            assert_eq!(&rest[0..4], b"8BIM");
+            assert_eq!(u16::from_be_bytes([rest[4], rest[5]]), 0x0404);
+            // A 2-byte empty Pascal name, then a 4-byte big-endian size.
+            let size = u32::from_be_bytes(rest[8..12].try_into().unwrap()) as usize;
+            Some(rest[12..12 + size].to_vec())
+        })
+}
+
+/// One IFD entry read back from a standalone EXIF blob.
+struct BlobEntry {
+    tag: u16,
+    value: Vec<u8>,
+}
+
+fn blob_field_size(field_type: u16) -> usize {
+    match field_type {
+        1 | 2 | 7 => 1,
+        3 | 8 => 2,
+        5 | 10 => 8,
+        _ => 4,
+    }
+}
+
+fn blob_read_ifd(bytes: &[u8], at: usize) -> Vec<BlobEntry> {
+    let n = u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
+    (0..n)
+        .map(|i| {
+            let e = at + 2 + i * 12;
+            let tag = u16::from_le_bytes([bytes[e], bytes[e + 1]]);
+            let field_type = u16::from_le_bytes([bytes[e + 2], bytes[e + 3]]);
+            let count = u32::from_le_bytes(bytes[e + 4..e + 8].try_into().unwrap());
+            let total = blob_field_size(field_type) * count as usize;
+            let value = if total <= 4 {
+                bytes[e + 8..e + 8 + total].to_vec()
+            } else {
+                let off = u32::from_le_bytes(bytes[e + 8..e + 12].try_into().unwrap()) as usize;
+                bytes[off..off + total].to_vec()
+            };
+            BlobEntry { tag, value }
+        })
+        .collect()
+}
+
+/// A standalone EXIF blob (a JPEG APP1 `Exif` segment sans header, or a PNG
+/// `eXIf` chunk -- the same `II`/IFD0-at-8 bytes `core::io::exif_blob`
+/// builds, always little-endian) split into its IFD0, EXIF sub-IFD and GPS
+/// sub-IFD entries, read independently of `core`'s own IFD reader.
+fn read_exif_blob(bytes: &[u8]) -> (Vec<BlobEntry>, Vec<BlobEntry>, Vec<BlobEntry>) {
+    assert_eq!(
+        &bytes[0..2],
+        b"II",
+        "core always writes a little-endian blob"
+    );
+    let ifd0_at = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let mut ifd0 = Vec::new();
+    let mut exif = Vec::new();
+    let mut gps = Vec::new();
+    for entry in blob_read_ifd(bytes, ifd0_at) {
+        let offset = || u32::from_le_bytes(entry.value[..4].try_into().unwrap()) as usize;
+        match entry.tag {
+            34665 => exif = blob_read_ifd(bytes, offset()),
+            34853 => gps = blob_read_ifd(bytes, offset()),
+            _ => ifd0.push(entry),
+        }
+    }
+    (ifd0, exif, gps)
+}
+
+/// The three IFDs a source's metadata reads back into, as plain `(tag,
+/// bytes)` pairs -- the one shape every format's read-back converges to, so
+/// TIFF/PNG/JPEG can be asserted against with the same helpers.
+struct Metadata {
+    ifd0: Vec<(u16, Vec<u8>)>,
+    exif: Vec<(u16, Vec<u8>)>,
+    gps: Vec<(u16, Vec<u8>)>,
+}
+
+impl Metadata {
+    fn find_ifd0(&self, tag: u16) -> Option<&[u8]> {
+        self.ifd0
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, v)| v.as_slice())
+    }
+    fn find_exif(&self, tag: u16) -> Option<&[u8]> {
+        self.exif
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, v)| v.as_slice())
+    }
+    fn find_gps(&self, tag: u16) -> Option<&[u8]> {
+        self.gps
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, v)| v.as_slice())
+    }
+}
+
+fn read_back_tiff(path: &Path) -> Metadata {
+    let m = read_source_metadata(path);
+    let cv =
+        |v: Vec<focusforge_core::io::TagEntry>| v.into_iter().map(|e| (e.tag, e.value)).collect();
+    Metadata {
+        ifd0: cv(m.ifd0),
+        exif: cv(m.exif),
+        gps: cv(m.gps),
+    }
+}
+
+fn read_back_blob(blob: &[u8]) -> Metadata {
+    let (ifd0, exif, gps) = read_exif_blob(blob);
+    let cv = |v: Vec<BlobEntry>| v.into_iter().map(|e| (e.tag, e.value)).collect();
+    Metadata {
+        ifd0: cv(ifd0),
+        exif: cv(exif),
+        gps: cv(gps),
+    }
+}
+
+fn read_back_png_exif(path: &Path) -> Metadata {
+    let file = std::fs::File::open(path).unwrap();
+    let decoder = png::Decoder::new(std::io::BufReader::new(file));
+    let reader = decoder.read_info().unwrap();
+    let bytes = reader
+        .info()
+        .exif_metadata
+        .clone()
+        .expect("PNG must carry an eXIf chunk")
+        .into_owned();
+    read_back_blob(&bytes)
+}
+
+fn read_back_jpeg_exif(path: &Path) -> Metadata {
+    let bytes = std::fs::read(path).unwrap();
+    let blob = jpeg_exif_blob(&bytes).expect("JPEG must carry an Exif APP1 segment");
+    read_back_blob(&blob)
+}
+
+// Every format carries the alignment reference frame's EXIF, with its own
+// size rewritten over whatever the source's EXIF dimension tags claimed.
+#[test]
+fn export_carries_source_exif_in_every_format() {
+    let meta = rich_frame_metadata("TestCam", Some((9999, 8888)), None, None, None);
+    let synth = build_metadata_synth("export_formats_exif_every_format", &[meta], None);
+    let cwd = synth.project_path.parent().unwrap();
+    let dir = common::tmp_dir("export_formats_exif_every_format_out");
+
+    let cases: &[(&str, &str, &[&str])] = &[
+        ("tiff", "16.tif", &["--tiff-bits", "16"]),
+        ("tiff", "8.tif", &["--tiff-bits", "8"]),
+        ("png", "16.png", &["--png-bits", "16"]),
+        ("png", "8.png", &["--png-bits", "8"]),
+        ("jpeg", "q.jpg", &[]),
+    ];
+    for (format, name, extra) in cases {
+        let out = dir.join(format!("{format}-{name}"));
+        let mut args = vec![
+            "export",
+            synth.project_path.to_str().unwrap(),
+            "--format",
+            format,
+            "-o",
+        ];
+        let out_str = out.to_str().unwrap();
+        args.push(out_str);
+        args.extend_from_slice(extra);
+        let r = run_cli_in(cwd, &args);
+        assert!(r.success, "{format}/{name}: {}", r.stderr);
+
+        let read = match *format {
+            "tiff" => read_back_tiff(&out),
+            "png" => read_back_png_exif(&out),
+            "jpeg" => read_back_jpeg_exif(&out),
+            other => panic!("unexpected format {other}"),
+        };
+
+        assert_eq!(
+            read.find_ifd0(271).unwrap(),
+            b"TestCam\0",
+            "{format}/{name}: Make"
+        );
+        assert_eq!(
+            read.find_ifd0(272).unwrap(),
+            b"Test Body\0",
+            "{format}/{name}: Model"
+        );
+        assert_eq!(
+            read.find_exif(36867).unwrap(),
+            b"2024:05:01 10:00:00\0",
+            "{format}/{name}: DateTimeOriginal"
+        );
+        assert_eq!(
+            read.find_exif(33434).unwrap(),
+            rational_bo(ByteOrder::Little, 1, 200),
+            "{format}/{name}: ExposureTime"
+        );
+        assert_eq!(
+            read.find_exif(33437).unwrap(),
+            rational_bo(ByteOrder::Little, 28, 10),
+            "{format}/{name}: FNumber"
+        );
+        assert_eq!(
+            read.find_gps(1).unwrap(),
+            b"N\0",
+            "{format}/{name}: GPSLatitudeRef"
+        );
+        assert_eq!(
+            read.find_gps(2).unwrap(),
+            dms(37, 46, 30),
+            "{format}/{name}: GPSLatitude"
+        );
+
+        let width = u32::from_le_bytes(read.find_exif(40962).unwrap()[..4].try_into().unwrap());
+        let height = u32::from_le_bytes(read.find_exif(40963).unwrap()[..4].try_into().unwrap());
+        assert_eq!(
+            (width, height),
+            (MW, MH),
+            "{format}/{name}: ExifImageWidth/Height must be the export's own size, \
+             not the source's declared (9999, 8888)"
+        );
+    }
+}
+
+// The EXIF frame is the fuse's alignment reference frame when aligned,
+// frame 0 when not -- for both a fused and an op-bearing checkpoint.
+#[test]
+fn export_exif_comes_from_the_reference_frame() {
+    let aligned = build_metadata_synth(
+        "export_formats_exif_reference_aligned",
+        &[
+            rich_frame_metadata("Frame0Cam", None, None, None, None),
+            rich_frame_metadata("Frame1Cam", None, None, None, None),
+        ],
+        Some(1),
+    );
+    let cwd = aligned.project_path.parent().unwrap();
+    let dir = common::tmp_dir("export_formats_exif_reference_aligned_out");
+    for (label, checkpoint) in [("root", &aligned.root), ("child", &aligned.child)] {
+        let out = dir.join(format!("{label}.tif"));
+        let r = run_cli_in(
+            cwd,
+            &[
+                "export",
+                aligned.project_path.to_str().unwrap(),
+                "--checkpoint",
+                checkpoint,
+                "-o",
+                out.to_str().unwrap(),
+                "--json",
+            ],
+        );
+        assert!(r.success, "{label}: {}", r.stderr);
+        let report: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+        assert_eq!(report["metadata"]["frame"], serde_json::json!(1), "{label}");
+        let frame_path = report["metadata"]["frame_path"].as_str().unwrap();
+        let expected_name = aligned.frame_paths[1]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(frame_path.ends_with(expected_name), "{label}: {frame_path}");
+        let read = read_back_tiff(&out);
+        assert_eq!(read.find_ifd0(271).unwrap(), b"Frame1Cam\0", "{label}");
+    }
+
+    let unaligned = build_metadata_synth(
+        "export_formats_exif_reference_unaligned",
+        &[
+            rich_frame_metadata("Frame0Cam", None, None, None, None),
+            rich_frame_metadata("Frame1Cam", None, None, None, None),
+        ],
+        None,
+    );
+    let out_dir = common::tmp_dir("export_formats_exif_reference_unaligned_out");
+    let out = out_dir.join("out.tif");
+    let r = run_cli_in(
+        unaligned.project_path.parent().unwrap(),
+        &[
+            "export",
+            unaligned.project_path.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(report["metadata"]["frame"], serde_json::json!(0));
+    let read = read_back_tiff(&out);
+    assert_eq!(read.find_ifd0(271).unwrap(), b"Frame0Cam\0");
+}
+
+// The embedded ICC profile follows the source -- byte-identical for a
+// TIFF source's own profile, the built-in sRGB for a RAW source, none for a
+// profileless TIFF source, off when the switch is off.
+#[test]
+fn export_icc_origin_follows_the_source() {
+    let icc = test_icc(7);
+    let with_profile = rich_frame_metadata("ICCCam", None, Some(&icc), None, None);
+    let synth = build_metadata_synth("export_formats_icc_source", &[with_profile], None);
+    let cwd = synth.project_path.parent().unwrap();
+    let dir = common::tmp_dir("export_formats_icc_source_out");
+
+    for (format, ext) in [("tiff", "tif"), ("png", "png"), ("jpeg", "jpg")] {
+        let out = dir.join(format!("{format}.{ext}"));
+        let r = run_cli_in(
+            cwd,
+            &[
+                "export",
+                synth.project_path.to_str().unwrap(),
+                "--format",
+                format,
+                "-o",
+                out.to_str().unwrap(),
+                "--json",
+            ],
+        );
+        assert!(r.success, "{format}: {}", r.stderr);
+        let report: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+        assert_eq!(
+            report["metadata"]["icc"],
+            serde_json::json!("source"),
+            "{format}"
+        );
+        let embedded = match format {
+            "tiff" => read_source_metadata(&out).icc.unwrap(),
+            "png" => {
+                let file = std::fs::File::open(&out).unwrap();
+                let decoder = png::Decoder::new(std::io::BufReader::new(file));
+                let reader = decoder.read_info().unwrap();
+                reader.info().icc_profile.clone().unwrap().into_owned()
+            }
+            "jpeg" => jpeg_icc_profile(&std::fs::read(&out).unwrap()).expect("APP2 ICC_PROFILE"),
+            other => panic!("unexpected format {other}"),
+        };
+        assert_eq!(embedded, icc, "{format}: ICC must be byte-identical");
+    }
+
+    // `--icc off`: no profile in any container.
+    let off_out = dir.join("off.tif");
+    let r = run_cli_in(
+        cwd,
+        &[
+            "export",
+            synth.project_path.to_str().unwrap(),
+            "--icc",
+            "off",
+            "-o",
+            off_out.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(report["metadata"]["icc"], serde_json::json!("off"));
+    assert!(read_source_metadata(&off_out).icc.is_none());
+
+    // A profileless TIFF source: no profile, origin `none`.
+    let without_profile = rich_frame_metadata("NoICCCam", None, None, None, None);
+    let bare = build_metadata_synth("export_formats_icc_none", &[without_profile], None);
+    let bare_out_dir = common::tmp_dir("export_formats_icc_none_out");
+    let bare_out = bare_out_dir.join("out.tif");
+    let r = run_cli_in(
+        bare.project_path.parent().unwrap(),
+        &[
+            "export",
+            bare.project_path.to_str().unwrap(),
+            "-o",
+            bare_out.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(report["metadata"]["icc"], serde_json::json!("none"));
+    assert!(read_source_metadata(&bare_out).icc.is_none());
+
+    // A RAW-sourced project: the built-in sRGB profile, EXIF carrying
+    // rawler's Make/Model.
+    let (raw_dir, raw_project) =
+        build_raw_metadata_synth("export_formats_icc_raw", "RawMake", "RawModel");
+    let raw_out = raw_dir.join("out.tif");
+    let r = run_cli_in(
+        raw_project.parent().unwrap(),
+        &[
+            "export",
+            raw_project.to_str().unwrap(),
+            "-o",
+            raw_out.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(report["metadata"]["icc"], serde_json::json!("builtin-srgb"));
+    let raw_read = read_back_tiff(&raw_out);
+    let raw_icc = read_source_metadata(&raw_out).icc.unwrap();
+    assert_eq!(raw_icc.len(), 456, "the built-in sRGB profile is 456 bytes");
+    assert_eq!(raw_read.find_ifd0(271).unwrap(), b"RawMake\0");
+    assert_eq!(raw_read.find_ifd0(272).unwrap(), b"RawModel\0");
+}
+
+// Every switch off writes nothing, byte for byte equal to the default
+// export of a metadata-free twin project with the same pixels, across
+// formats and options.
+#[test]
+fn export_metadata_switches_off_write_nothing() {
+    let rich = rich_frame_metadata(
+        "SwitchCam",
+        None,
+        Some(&test_icc(3)),
+        Some(b"<x:xmpmeta/>"),
+        Some(b"iptc-bytes"),
+    );
+    let rich_synth = build_metadata_synth("export_formats_switches_off_rich", &[rich], None);
+    let twin_synth = build_metadata_synth(
+        "export_formats_switches_off_twin",
+        &[FrameMetadata::default()],
+        None,
+    );
+
+    let dir = common::tmp_dir("export_formats_switches_off_out");
+    let combos: &[(&str, &[&str])] = &[
+        (
+            "tiff16.tif",
+            &[
+                "--format",
+                "tiff",
+                "--tiff-bits",
+                "16",
+                "--tiff-compression",
+                "none",
+            ],
+        ),
+        (
+            "tiff8-lzw.tif",
+            &[
+                "--format",
+                "tiff",
+                "--tiff-bits",
+                "8",
+                "--tiff-compression",
+                "lzw",
+            ],
+        ),
+        ("png16.png", &["--format", "png", "--png-bits", "16"]),
+        ("png8.png", &["--format", "png", "--png-bits", "8"]),
+        ("jpeg.jpg", &["--format", "jpeg"]),
+    ];
+    for (name, extra) in combos {
+        let rich_out = dir.join(format!("rich-{name}"));
+        let mut args = vec!["export", rich_synth.project_path.to_str().unwrap(), "-o"];
+        let rich_out_str = rich_out.to_str().unwrap();
+        args.push(rich_out_str);
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&[
+            "--exif", "off", "--icc", "off", "--xmp", "off", "--iptc", "off",
+        ]);
+        let r = run_cli_in(rich_synth.project_path.parent().unwrap(), &args);
+        assert!(r.success, "{name}: {}", r.stderr);
+
+        let twin_out = dir.join(format!("twin-{name}"));
+        let mut targs = vec!["export", twin_synth.project_path.to_str().unwrap(), "-o"];
+        let twin_out_str = twin_out.to_str().unwrap();
+        targs.push(twin_out_str);
+        targs.extend_from_slice(extra);
+        let r = run_cli_in(twin_synth.project_path.parent().unwrap(), &targs);
+        assert!(r.success, "{name} (twin): {}", r.stderr);
+
+        assert_eq!(
+            std::fs::read(&rich_out).unwrap(),
+            std::fs::read(&twin_out).unwrap(),
+            "{name}: every switch off must equal the metadata-free twin's default export"
+        );
+    }
+}
+
+// XMP and IPTC are opt-in, verbatim, per format, absent for a RAW
+// source, and skipped (with a warning) when too large for a JPEG APP1
+// segment.
+#[test]
+fn export_carries_xmp_and_iptc_when_asked() {
+    let xmp = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF/></x:xmpmeta>".to_vec();
+    let iptc = vec![0x1C, 0x02, 0x05, b'h', b'i'];
+
+    let source = rich_frame_metadata("XmpCam", None, None, Some(&xmp), Some(&iptc));
+    let synth = build_metadata_synth("export_formats_xmp_iptc", &[source], None);
+    let cwd = synth.project_path.parent().unwrap();
+    let dir = common::tmp_dir("export_formats_xmp_iptc_out");
+
+    // TIFF: both verbatim in 700/33723.
+    let tiff_out = dir.join("out.tif");
+    let r = run_cli_in(
+        cwd,
+        &[
+            "export",
+            synth.project_path.to_str().unwrap(),
+            "--xmp",
+            "on",
+            "--iptc",
+            "on",
+            "-o",
+            tiff_out.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(report["metadata"]["xmp"], serde_json::json!("written"));
+    assert_eq!(report["metadata"]["iptc"], serde_json::json!("written"));
+    let tiff_meta = read_source_metadata(&tiff_out);
+    assert_eq!(tiff_meta.xmp.as_deref(), Some(xmp.as_slice()));
+    assert_eq!(tiff_meta.iptc.as_deref(), Some(iptc.as_slice()));
+
+    // JPEG: XMP in a second APP1, IPTC in APP13.
+    let jpeg_out = dir.join("out.jpg");
+    let r = run_cli_in(
+        cwd,
+        &[
+            "export",
+            synth.project_path.to_str().unwrap(),
+            "--format",
+            "jpeg",
+            "--xmp",
+            "on",
+            "--iptc",
+            "on",
+            "-o",
+            jpeg_out.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(report["metadata"]["xmp"], serde_json::json!("written"));
+    assert_eq!(report["metadata"]["iptc"], serde_json::json!("written"));
+    let jpeg_bytes = std::fs::read(&jpeg_out).unwrap();
+    assert_eq!(jpeg_xmp_packet(&jpeg_bytes).unwrap(), xmp);
+    assert_eq!(jpeg_iptc_block(&jpeg_bytes).unwrap(), iptc);
+
+    // PNG: XMP in an iTXt chunk; PNG has no IPTC chunk, reported unsupported.
+    let png_out = dir.join("out.png");
+    let r = run_cli_in(
+        cwd,
+        &[
+            "export",
+            synth.project_path.to_str().unwrap(),
+            "--format",
+            "png",
+            "--xmp",
+            "on",
+            "--iptc",
+            "on",
+            "-o",
+            png_out.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(report["metadata"]["xmp"], serde_json::json!("written"));
+    assert_eq!(report["metadata"]["iptc"], serde_json::json!("unsupported"));
+    let file = std::fs::File::open(&png_out).unwrap();
+    let decoder = png::Decoder::new(std::io::BufReader::new(file));
+    let reader = decoder.read_info().unwrap();
+    let itxt = reader
+        .info()
+        .utf8_text
+        .iter()
+        .find(|c| c.keyword == "XML:com.adobe.xmp")
+        .expect("iTXt XMP chunk");
+    assert_eq!(itxt.get_text().unwrap().as_bytes(), xmp.as_slice());
+
+    // A RAW-sourced project carries neither: rawler surfaces no XMP packet.
+    let (raw_dir, raw_project) =
+        build_raw_metadata_synth("export_formats_xmp_iptc_raw", "RawMake", "RawModel");
+    let raw_out = raw_dir.join("out.tif");
+    let r = run_cli_in(
+        raw_project.parent().unwrap(),
+        &[
+            "export",
+            raw_project.to_str().unwrap(),
+            "--xmp",
+            "on",
+            "--iptc",
+            "on",
+            "-o",
+            raw_out.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(report["metadata"]["xmp"], serde_json::json!("absent"));
+    assert_eq!(report["metadata"]["iptc"], serde_json::json!("absent"));
+
+    // An XMP packet too large for one JPEG APP1 segment is skipped, with a
+    // warning naming the size.
+    let huge_xmp = vec![b'x'; 70_000];
+    let huge_source = rich_frame_metadata("HugeXmpCam", None, None, Some(&huge_xmp), None);
+    let huge_synth = build_metadata_synth("export_formats_xmp_huge", &[huge_source], None);
+    let huge_out_dir = common::tmp_dir("export_formats_xmp_huge_out");
+    let huge_out = huge_out_dir.join("out.jpg");
+    let r = run_cli_in(
+        huge_synth.project_path.parent().unwrap(),
+        &[
+            "export",
+            huge_synth.project_path.to_str().unwrap(),
+            "--format",
+            "jpeg",
+            "--xmp",
+            "on",
+            "-o",
+            huge_out.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(report["metadata"]["xmp"], serde_json::json!("skipped"));
+    assert!(
+        report["metadata"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("65502")),
+        "{report}"
+    );
+    assert!(jpeg_xmp_packet(&std::fs::read(&huge_out).unwrap()).is_none());
+}
+
+// A junk EXIF pointer or a truncated ICC entry still exports the
+// image, exits zero, and states the reason on stderr and in `--json`'s
+// `metadata.warnings`; a source whose only EXIF entry is a junk pointer
+// reports `exif: absent` and exactly one warning.
+#[test]
+fn export_survives_damaged_or_missing_source_metadata() {
+    // A junk EXIF pointer and nothing else: the frame carries no whitelisted
+    // IFD0 tag, no GPS, and its only 34665 entry resolves nowhere real.
+    let junk = FrameMetadata {
+        ifd0: vec![(34665, 4, longs_bo(ByteOrder::Little, &[0]))],
+        ..Default::default()
+    };
+    let junk_synth = build_metadata_synth("export_formats_survives_junk_pointer", &[junk], None);
+    let junk_out_dir = common::tmp_dir("export_formats_survives_junk_pointer_out");
+    let junk_out = junk_out_dir.join("out.tif");
+    let r = run_cli_in(
+        junk_synth.project_path.parent().unwrap(),
+        &[
+            "export",
+            junk_synth.project_path.to_str().unwrap(),
+            "-o",
+            junk_out.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.stderr.contains("EXIF sub-IFD"), "stderr: {}", r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(report["metadata"]["exif"], serde_json::json!("absent"));
+    let warnings = report["metadata"]["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{report}");
+    assert!(warnings[0].as_str().unwrap().contains("EXIF sub-IFD"));
+
+    // A truncated ICC entry: the corruption must happen before the project
+    // is sealed, since sealing hashes every source and a render refuses one
+    // whose hash has since changed.
+    let dir = common::tmp_dir("export_formats_survives_truncated_icc");
+    let staging = dir.join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let frame_path = dir.join("frame-00.tif");
+    write_frame_with_metadata(
+        &frame_path,
+        MW,
+        MH,
+        &FrameMetadata {
+            ifd0: vec![(34675, 7, test_icc(9))],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    corrupt_ifd0_entry_count(&frame_path, 34675, 0xFFFF_FFF0);
+
+    let composite_path = staging.join("composite.tif");
+    write_tiff(
+        &composite_path,
+        MW,
+        MH,
+        3,
+        &gradient_samples(MW, MH, 3),
+        Some("staged composite"),
+    );
+    let zmap_path = staging.join("zmap.tif");
+    let mut map = ZMapWriter::create(&zmap_path, ZMapInfo::new(MW, MH, 1).unwrap()).unwrap();
+    map.write_tile(full(MW, MH), &vec![0u16; (MW * MH) as usize])
+        .unwrap();
+    map.finish().unwrap();
+    let project_path = dir.join(format!("trunc.{}", project::PROJECT_EXTENSION));
+    project::seal(SealRequest {
+        project_path: &project_path,
+        staged_composite: &composite_path,
+        staged_zmap: &zmap_path,
+        sources: &[frame_path],
+        algorithm: "laplacian",
+        params: &ParamValues::new(),
+        align: None,
+        registration: Registration::default(),
+        composite_description: "staged composite".to_string(),
+        label: None,
+        metrics: Metrics::default(),
+    })
+    .expect("seal must succeed");
+
+    let out = dir.join("out.tif");
+    let r = run_cli_in(
+        project_path.parent().unwrap(),
+        &[
+            "export",
+            project_path.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.stderr.contains("ICC profile"), "stderr: {}", r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(report["metadata"]["icc"], serde_json::json!("none"));
+    assert!(
+        report["metadata"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("ICC profile")),
+        "{report}"
+    );
 }

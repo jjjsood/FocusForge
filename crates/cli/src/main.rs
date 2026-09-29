@@ -798,14 +798,14 @@ fn info_frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
 /// as one report line instead of failing the whole command.
 fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> InfoReport {
     enum Probe {
-        Tiff(TiffHeader),
-        Raw(RawMetadata, Box<FrameDesc>),
+        Tiff(Box<TiffHeader>),
+        Raw(Box<RawMetadata>, Box<FrameDesc>),
     }
 
     impl Probe {
         fn desc(&self) -> FrameDesc {
             match self {
-                Self::Tiff(header) => FrameDesc::from(header),
+                Self::Tiff(header) => FrameDesc::from(header.as_ref()),
                 Self::Raw(_, desc) => (**desc).clone(),
             }
         }
@@ -834,12 +834,12 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                         let desc = stack.frame(0).cloned().ok_or(
                             focusforge_core::io::RawError::FrameIndex { index: 0, count: 0 },
                         )?;
-                        Ok(Probe::Raw(metadata, Box::new(desc)))
+                        Ok(Probe::Raw(Box::new(metadata), Box::new(desc)))
                     })
                     .map_err(|error| error.to_string())
             } else {
                 TiffHeader::open(p)
-                    .map(Probe::Tiff)
+                    .map(|header| Probe::Tiff(Box::new(header)))
                     .map_err(|error| error.to_string())
             },
         })
@@ -910,7 +910,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 mmap_fast_path: None,
                 reader: Some("RawStack".to_string()),
                 refusal: None,
-                raw: Some(RawRecord::from(metadata)),
+                raw: Some(RawRecord::from(metadata.as_ref())),
                 error: None,
             },
             Err(e) => FileReport {

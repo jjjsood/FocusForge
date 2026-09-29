@@ -20,7 +20,8 @@ use weezl::BitOrder;
 use weezl::encode::Encoder as LzwEncoder;
 
 use super::super::error::TiffError;
-use super::header::{ByteOrder, TAG_STRIP_OFFSETS, TiffHeader};
+use super::super::metadata::{MetadataTags, TagEntry};
+use super::header::{ByteOrder, TAG_EXIF_IFD, TAG_GPS_IFD, TAG_STRIP_OFFSETS, TiffHeader};
 use crate::tile::Rect;
 
 const TAG_IMAGE_WIDTH: u16 = 256;
@@ -75,6 +76,10 @@ pub struct StripSpec {
     pub compression: StripCompression,
     /// `None` -> [`TiffSpec::default_description`].
     pub description: Option<String>,
+    /// Extra IFD0 entries plus EXIF and GPS sub-IFDs, merged into the IFD
+    /// [`StripWriter::finish`] writes. Empty by default: an export with
+    /// nothing to carry costs this writer nothing beyond the field itself.
+    pub metadata: MetadataTags,
 }
 
 /// Bytes per strip that keeps peak memory bounded regardless of image
@@ -103,6 +108,7 @@ pub struct StripWriter<W: Write + Seek> {
     /// Raw (pre-predictor) bytes of the strip in progress.
     strip_buf: Vec<u8>,
     cursor: u64,
+    metadata: MetadataTags,
 }
 
 impl StripWriter<File> {
@@ -131,6 +137,7 @@ impl<W: Write + Seek> StripWriter<W> {
             bits_per_sample,
             compression,
             description,
+            metadata,
         } = spec;
         let path = PathBuf::new();
         let description = description.unwrap_or_else(default_description);
@@ -165,6 +172,7 @@ impl<W: Write + Seek> StripWriter<W> {
             strip_byte_counts: Vec::new(),
             strip_buf: Vec::new(),
             cursor: 8,
+            metadata,
         })
     }
 
@@ -262,40 +270,90 @@ impl<W: Write + Seek> StripWriter<W> {
         let spp = self.samples_per_pixel;
         let n_strips = self.strip_offsets.len() as u32;
 
-        let entries: Vec<(u16, u16, u32, Vec<u8>)> = vec![
-            (TAG_IMAGE_WIDTH, 4, 1, longs(&[self.width])),
-            (TAG_IMAGE_LENGTH, 4, 1, longs(&[self.height])),
-            (
-                TAG_BITS_PER_SAMPLE,
-                3,
-                spp,
-                shorts(&vec![self.bits_per_sample; spp as usize]),
-            ),
-            (TAG_COMPRESSION, 3, 1, shorts(&[self.compression.tag()])),
-            (TAG_PHOTOMETRIC, 3, 1, shorts(&[photometric])),
-            (
-                TAG_IMAGE_DESCRIPTION,
-                2,
-                description_bytes.len() as u32,
-                description_bytes,
-            ),
-            (TAG_STRIP_OFFSETS, 4, n_strips, longs(&self.strip_offsets)),
-            (TAG_SAMPLES_PER_PIXEL, 3, 1, shorts(&[spp as u16])),
-            (TAG_ROWS_PER_STRIP, 4, 1, longs(&[self.rows_per_strip])),
-            (
-                TAG_STRIP_BYTE_COUNTS,
-                4,
-                n_strips,
-                longs(&self.strip_byte_counts),
-            ),
-            (TAG_PLANAR_CONFIG, 3, 1, shorts(&[1u16])),
-            (TAG_PREDICTOR, 3, 1, shorts(&[self.compression.predictor()])),
-            (TAG_SAMPLE_FORMAT, 3, spp, shorts(&vec![1u16; spp as usize])),
+        let mut entries: Vec<TagEntry> = vec![
+            TagEntry {
+                tag: TAG_IMAGE_WIDTH,
+                field_type: 4,
+                count: 1,
+                value: longs(&[self.width]),
+            },
+            TagEntry {
+                tag: TAG_IMAGE_LENGTH,
+                field_type: 4,
+                count: 1,
+                value: longs(&[self.height]),
+            },
+            TagEntry {
+                tag: TAG_BITS_PER_SAMPLE,
+                field_type: 3,
+                count: spp,
+                value: shorts(&vec![self.bits_per_sample; spp as usize]),
+            },
+            TagEntry {
+                tag: TAG_COMPRESSION,
+                field_type: 3,
+                count: 1,
+                value: shorts(&[self.compression.tag()]),
+            },
+            TagEntry {
+                tag: TAG_PHOTOMETRIC,
+                field_type: 3,
+                count: 1,
+                value: shorts(&[photometric]),
+            },
+            TagEntry {
+                tag: TAG_IMAGE_DESCRIPTION,
+                field_type: 2,
+                count: description_bytes.len() as u32,
+                value: description_bytes,
+            },
+            TagEntry {
+                tag: TAG_STRIP_OFFSETS,
+                field_type: 4,
+                count: n_strips,
+                value: longs(&self.strip_offsets),
+            },
+            TagEntry {
+                tag: TAG_SAMPLES_PER_PIXEL,
+                field_type: 3,
+                count: 1,
+                value: shorts(&[spp as u16]),
+            },
+            TagEntry {
+                tag: TAG_ROWS_PER_STRIP,
+                field_type: 4,
+                count: 1,
+                value: longs(&[self.rows_per_strip]),
+            },
+            TagEntry {
+                tag: TAG_STRIP_BYTE_COUNTS,
+                field_type: 4,
+                count: n_strips,
+                value: longs(&self.strip_byte_counts),
+            },
+            TagEntry {
+                tag: TAG_PLANAR_CONFIG,
+                field_type: 3,
+                count: 1,
+                value: shorts(&[1u16]),
+            },
+            TagEntry {
+                tag: TAG_PREDICTOR,
+                field_type: 3,
+                count: 1,
+                value: shorts(&[self.compression.predictor()]),
+            },
+            TagEntry {
+                tag: TAG_SAMPLE_FORMAT,
+                field_type: 3,
+                count: spp,
+                value: shorts(&vec![1u16; spp as usize]),
+            },
         ];
+        entries.extend(self.metadata.ifd0.iter().cloned());
 
-        let n = entries.len() as u32;
-        // Pad to a word boundary, the same way an out-of-line tag value is
-        // below: TIFF 6.0 requires the IFD to start on an even byte offset.
+        // Pad to a word boundary: TIFF 6.0 requires the IFD to start on an
+        // even byte offset.
         if !self.cursor.is_multiple_of(2) {
             self.sink
                 .write_all(&[0u8])
@@ -306,50 +364,13 @@ impl<W: Write + Seek> StripWriter<W> {
             self.cursor += 1;
         }
         let ifd_offset = self.cursor;
-        // `ifd_offset` is word-aligned above and the entry table's own
-        // length (2 + 12n + 4) is always even, so `cursor` starts even too.
-        let mut cursor = ifd_offset + 2 + 12 * u64::from(n) + 4;
-        debug_assert!(cursor.is_multiple_of(2));
-        let mut offsets: Vec<u64> = vec![0; entries.len()];
-        for (i, (_, _, _, data)) in entries.iter().enumerate() {
-            if data.len() > 4 {
-                offsets[i] = cursor;
-                cursor += data.len() as u64;
-                cursor += cursor % 2;
-            }
-        }
-
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&(n as u16).to_le_bytes());
-        for (i, (tag, field_type, count, data)) in entries.iter().enumerate() {
-            buf.extend_from_slice(&tag.to_le_bytes());
-            buf.extend_from_slice(&field_type.to_le_bytes());
-            buf.extend_from_slice(&count.to_le_bytes());
-            if data.len() <= 4 {
-                let mut inline = [0u8; 4];
-                inline[..data.len()].copy_from_slice(data);
-                buf.extend_from_slice(&inline);
-            } else {
-                buf.extend_from_slice(&(offsets[i] as u32).to_le_bytes());
-            }
-        }
-        buf.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
-        // Values that did not fit inline follow the entry table, each at its
-        // precomputed offset. `ifd_offset` is word-aligned above, so the
-        // entry table's own length (2 + 12n + 4, always even) lands `buf`
-        // exactly at that first offset with no further padding needed here.
-        let mut pos = ifd_offset + buf.len() as u64;
-        for (i, (_, _, _, data)) in entries.iter().enumerate() {
-            if data.len() > 4 {
-                debug_assert_eq!(offsets[i], pos);
-                buf.extend_from_slice(data);
-                if data.len() % 2 == 1 {
-                    buf.push(0);
-                }
-                pos += data.len() as u64;
-                pos += pos % 2;
-            }
-        }
+        let buf = ifd0_with_sub_ifds(
+            &entries,
+            &self.metadata.exif,
+            &self.metadata.gps,
+            ifd_offset,
+            0,
+        );
 
         self.sink.write_all(&buf).map_err(|source| TiffError::Io {
             path: self.path.clone(),
@@ -380,6 +401,127 @@ impl<W: Write + Seek> StripWriter<W> {
         }
         Ok(self.sink)
     }
+}
+
+/// One IFD's entry table plus its out-of-line values, starting at `at`
+/// (already word-aligned) and pointing `next` at the following IFD's offset
+/// (0 when there is none). An entry whose value fits in 4 bytes is stored
+/// inline; a longer one is appended after the entry table, in entry order,
+/// each padded to an even length -- the classic-TIFF layout `StripWriter`
+/// and [`crate::io::metadata::exif_blob`] both produce.
+pub(crate) fn ifd_bytes(entries: &[TagEntry], at: u64, next: u32) -> Vec<u8> {
+    debug_assert!(at.is_multiple_of(2));
+    let n = entries.len() as u32;
+    let mut cursor = at + 2 + 12 * u64::from(n) + 4;
+    debug_assert!(cursor.is_multiple_of(2));
+    let mut offsets: Vec<u64> = vec![0; entries.len()];
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.value.len() > 4 {
+            offsets[i] = cursor;
+            cursor += entry.value.len() as u64;
+            cursor += cursor % 2;
+        }
+    }
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(n as u16).to_le_bytes());
+    for (i, entry) in entries.iter().enumerate() {
+        buf.extend_from_slice(&entry.tag.to_le_bytes());
+        buf.extend_from_slice(&entry.field_type.to_le_bytes());
+        buf.extend_from_slice(&entry.count.to_le_bytes());
+        if entry.value.len() <= 4 {
+            let mut inline = [0u8; 4];
+            inline[..entry.value.len()].copy_from_slice(&entry.value);
+            buf.extend_from_slice(&inline);
+        } else {
+            buf.extend_from_slice(&(offsets[i] as u32).to_le_bytes());
+        }
+    }
+    buf.extend_from_slice(&next.to_le_bytes());
+    // Values that did not fit inline follow the entry table, each at its
+    // precomputed offset. `at` is word-aligned, so the entry table's own
+    // length (2 + 12n + 4, always even) lands `buf` exactly at that first
+    // offset with no further padding needed here.
+    let mut pos = at + buf.len() as u64;
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.value.len() > 4 {
+            debug_assert_eq!(offsets[i], pos);
+            buf.extend_from_slice(&entry.value);
+            if entry.value.len() % 2 == 1 {
+                buf.push(0);
+            }
+            pos += entry.value.len() as u64;
+            pos += pos % 2;
+        }
+    }
+    buf
+}
+
+/// IFD0 (sorted by tag, with a 34665/34853 pointer added for each non-empty
+/// sub-IFD) plus its EXIF and GPS sub-IFDs, laid out back to back from `at`
+/// through [`ifd_bytes`]. A pointer starts as a placeholder and is patched
+/// once its sub-IFD's offset is known -- the offset never depends on the
+/// pointer's own value. Shared by [`StripWriter::finish`] (`at` is the
+/// file's IFD0 offset) and [`crate::io::metadata::exif_blob`] (`at` is 8).
+pub(crate) fn ifd0_with_sub_ifds(
+    ifd0_entries: &[TagEntry],
+    exif: &[TagEntry],
+    gps: &[TagEntry],
+    at: u64,
+    next: u32,
+) -> Vec<u8> {
+    let mut ifd0: Vec<TagEntry> = ifd0_entries.to_vec();
+    if !exif.is_empty() {
+        ifd0.push(TagEntry {
+            tag: TAG_EXIF_IFD,
+            field_type: 4,
+            count: 1,
+            value: vec![0u8; 4],
+        });
+    }
+    if !gps.is_empty() {
+        ifd0.push(TagEntry {
+            tag: TAG_GPS_IFD,
+            field_type: 4,
+            count: 1,
+            value: vec![0u8; 4],
+        });
+    }
+    ifd0.sort_by_key(|entry| entry.tag);
+
+    let mut cursor = at + ifd_bytes(&ifd0, at, next).len() as u64;
+    let exif_bytes = if exif.is_empty() {
+        Vec::new()
+    } else {
+        let mut sorted = exif.to_vec();
+        sorted.sort_by_key(|entry| entry.tag);
+        let bytes = ifd_bytes(&sorted, cursor, 0);
+        for entry in &mut ifd0 {
+            if entry.tag == TAG_EXIF_IFD {
+                entry.value = (cursor as u32).to_le_bytes().to_vec();
+            }
+        }
+        cursor += bytes.len() as u64;
+        bytes
+    };
+    let gps_bytes = if gps.is_empty() {
+        Vec::new()
+    } else {
+        let mut sorted = gps.to_vec();
+        sorted.sort_by_key(|entry| entry.tag);
+        let bytes = ifd_bytes(&sorted, cursor, 0);
+        for entry in &mut ifd0 {
+            if entry.tag == TAG_GPS_IFD {
+                entry.value = (cursor as u32).to_le_bytes().to_vec();
+            }
+        }
+        bytes
+    };
+
+    let mut out = ifd_bytes(&ifd0, at, next);
+    out.extend_from_slice(&exif_bytes);
+    out.extend_from_slice(&gps_bytes);
+    out
 }
 
 /// Undoes-in-reverse: `decoded`'s row-major samples become their horizontal
@@ -1316,6 +1458,7 @@ mod strip_writer_tests {
             bits_per_sample: bits,
             compression,
             description: None,
+            metadata: MetadataTags::default(),
         }
     }
 
@@ -1529,5 +1672,85 @@ mod strip_writer_tests {
                 TiffHeader::parse(Path::new("test.tif"), &written).expect("must parse");
             }
         }
+    }
+
+    #[test]
+    fn finish_with_non_empty_metadata_reads_back_intact_beside_untouched_pixels() {
+        let width = 4;
+        let height = 3;
+        let spp = 1;
+        let samples = gradient_16(width, height, spp);
+        let bytes = bytes_16(&samples);
+
+        let metadata = MetadataTags {
+            ifd0: vec![TagEntry {
+                tag: 305, // Software
+                field_type: 2,
+                count: 13,
+                value: b"FocusForge 1\0".to_vec(),
+            }],
+            exif: vec![TagEntry {
+                tag: 33434, // ExposureTime, RATIONAL -- always out-of-line
+                field_type: 5,
+                count: 1,
+                value: [1u32.to_le_bytes(), 200u32.to_le_bytes()].concat(),
+            }],
+            gps: vec![TagEntry {
+                tag: 1, // GPSLatitudeRef
+                field_type: 2,
+                count: 2,
+                value: b"N\0".to_vec(),
+            }],
+        };
+        let mut spec = strip_spec(width, height, spp, 16, StripCompression::None);
+        spec.metadata = metadata.clone();
+
+        let mut writer = StripWriter::new(Cursor::new(Vec::new()), spec).unwrap();
+        writer.write_rows(&bytes).unwrap();
+        let sink = writer.finish().unwrap();
+        let written = sink.into_inner();
+
+        let (header, decoded) = decode_16(&written);
+        assert_eq!(decoded, samples, "pixels must survive metadata being added");
+
+        let ifd0_offset = u32::from_le_bytes(written[4..8].try_into().unwrap()) as u64;
+        let read = crate::io::tiff::header::read_tiff_metadata(
+            &written.as_slice(),
+            header.byte_order,
+            ifd0_offset,
+            Path::new("test.tif"),
+        );
+        assert!(read.warnings.is_empty(), "warnings: {:?}", read.warnings);
+        assert!(read.ifd0.contains(&metadata.ifd0[0]));
+        assert!(read.exif.contains(&metadata.exif[0]));
+        assert!(read.gps.contains(&metadata.gps[0]));
+    }
+
+    #[test]
+    fn finish_with_empty_metadata_writes_the_same_ifd_as_before_metadata_existed() {
+        // A `StripSpec::metadata` left at its default must cost the IFD nothing.
+        let width = 5;
+        let height = 4;
+        let spp = 1;
+        let samples = gradient_16(width, height, spp);
+        let bytes = bytes_16(&samples);
+
+        let mut writer = StripWriter::new(
+            Cursor::new(Vec::new()),
+            strip_spec(width, height, spp, 16, StripCompression::None),
+        )
+        .unwrap();
+        writer.write_rows(&bytes).unwrap();
+        let sink = writer.finish().unwrap();
+        let written = sink.into_inner();
+
+        let written_slice: &[u8] = &written;
+        let header = TiffHeader::parse(Path::new("test.tif"), &written_slice).expect("must parse");
+        let ifd0_offset = u32::from_le_bytes(written[4..8].try_into().unwrap()) as u64;
+        let n_entries =
+            u16::from_le_bytes(written[ifd0_offset as usize..][..2].try_into().unwrap());
+        assert_eq!(n_entries, 13, "the fixed 13-tag layout, no extras");
+        assert_eq!(header.width, width);
+        assert_eq!(header.height, height);
     }
 }

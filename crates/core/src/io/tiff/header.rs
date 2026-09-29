@@ -17,6 +17,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use super::super::error::{Refusal, TiffError};
+use super::super::metadata::{SourceKind, SourceMetadata, TagEntry};
 use crate::io::FrameDesc;
 
 // --- tags ---------------------------------------------------------------
@@ -39,11 +40,29 @@ const TAG_TILE_OFFSETS: u16 = 324;
 const TAG_TILE_BYTE_COUNTS: u16 = 325;
 const TAG_SAMPLE_FORMAT: u16 = 339;
 /// EXIF sub-IFD pointer: a `LONG` offset to a second IFD.
-const TAG_EXIF_IFD: u16 = 34665;
+pub(crate) const TAG_EXIF_IFD: u16 = 34665;
 /// EXIF `DateTimeOriginal` -- **capture** time, the tag grouping reads.
 /// Never `DateTime` (306), which on the reference data is darktable's
 /// *export* time, thirteen days after the shot.
 const TAG_DATE_TIME_ORIGINAL: u16 = 36867;
+/// GPS sub-IFD pointer: a `LONG` offset to a second IFD.
+pub(crate) const TAG_GPS_IFD: u16 = 34853;
+pub(crate) const TAG_ICC_PROFILE: u16 = 34675;
+pub(crate) const TAG_XMP: u16 = 700;
+pub(crate) const TAG_IPTC: u16 = 33723;
+/// EXIF's Interoperability IFD pointer, dropped: it names another sub-IFD
+/// this reader never follows.
+const TAG_INTEROP_IFD: u16 = 40965;
+/// The MakerNote, opaque and camera-specific; dropped rather than carried
+/// into an export it was never written to describe.
+const TAG_MAKER_NOTE: u16 = 37500;
+
+/// IFD0 tags an export carries: identity (Make, Model, Artist, Copyright),
+/// orientation and resolution, and the two tags the export rewrite later
+/// overwrites (Software, DateTime). Excludes `DocumentName` (269), which
+/// commonly holds the exporting tool's absolute file path, and every
+/// strip/tile/compression/pointer tag.
+const METADATA_IFD0_WHITELIST: &[u16] = &[271, 272, 274, 282, 283, 296, 305, 306, 315, 33432];
 
 /// TIFF field type -> byte size of one value.
 fn field_type_size(field_type: u16) -> Option<u32> {
@@ -191,6 +210,204 @@ fn read_ifd<S: ByteSource>(
     Ok(entries)
 }
 
+/// One open header's source, byte order, size and path, bundled so entry
+/// resolution and sub-IFD walks don't repeat them as separate arguments at
+/// every call: `read_tiff_metadata` resolves entries from IFD0 and from the
+/// EXIF/GPS sub-IFDs alike.
+struct IfdContext<'a, S: ByteSource> {
+    source: &'a S,
+    byte_order: ByteOrder,
+    file_size: u64,
+    path: &'a Path,
+}
+
+impl<S: ByteSource> IfdContext<'_, S> {
+    /// Resolve one entry's raw bytes: inline when total size <= 4 bytes,
+    /// otherwise seek to its offset.
+    fn resolve_bytes(&self, entry: &RawEntry) -> Result<Vec<u8>, TiffError> {
+        let Some(size) = field_type_size(entry.field_type) else {
+            return Ok(Vec::new());
+        };
+        let total = u64::from(size) * u64::from(entry.count);
+        if total <= 4 {
+            Ok(entry.payload[..total as usize].to_vec())
+        } else {
+            let offset = u64::from(self.byte_order.u32_at(&entry.payload).unwrap_or(0));
+            let past_eof = offset
+                .checked_add(total)
+                .is_none_or(|end| end > self.file_size);
+            if past_eof {
+                return Err(TiffError::ValuePastEof {
+                    path: self.path.to_path_buf(),
+                    tag: entry.tag,
+                });
+            }
+            let data = self.source.read_at(offset, total as usize).map_err(|_| {
+                TiffError::ValuePastEof {
+                    path: self.path.to_path_buf(),
+                    tag: entry.tag,
+                }
+            })?;
+            Ok(data.into_owned())
+        }
+    }
+
+    /// Read one sub-IFD at `offset`, keeping only the entries `keep`
+    /// accepts and resolving each to a little-endian [`TagEntry`]. A
+    /// failure at any point -- the sub-IFD itself unreadable, or one
+    /// entry's value past EOF -- becomes a message in `warnings` and that
+    /// much of the metadata is simply absent; `read_tiff_metadata` never
+    /// fails outright over a damaged sub-IFD.
+    fn read_tag_list(
+        &self,
+        offset: u64,
+        label: &str,
+        keep: impl Fn(u16) -> bool,
+        warnings: &mut Vec<String>,
+    ) -> Vec<TagEntry> {
+        let entries = match read_ifd(self.source, self.byte_order, offset, self.path) {
+            Ok(entries) => entries,
+            Err(err) => {
+                warnings.push(format!("{label}: {err}"));
+                return Vec::new();
+            }
+        };
+        entries
+            .iter()
+            .filter(|entry| keep(entry.tag))
+            .filter_map(|entry| match self.resolve_bytes(entry) {
+                Ok(bytes) => Some(to_tag_entry(self.byte_order, entry, bytes)),
+                Err(err) => {
+                    warnings.push(format!("{label} tag {}: {err}", entry.tag));
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+/// Byte-swap a resolved value to little-endian by TIFF field-type width
+/// (`SHORT` 2, `LONG`/`RATIONAL` half 4, `DOUBLE` 8); `BYTE`/`ASCII`/
+/// `UNDEFINED` never move. Never run this on the ICC/XMP/IPTC blobs, which
+/// stay opaque bytes even when mis-declared as `LONG`.
+fn swap_to_little_endian(byte_order: ByteOrder, field_type: u16, bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    if byte_order == ByteOrder::Little {
+        return out;
+    }
+    match field_type {
+        3 | 8 => out.chunks_exact_mut(2).for_each(|c| c.reverse()),
+        4 | 5 | 9 | 10 | 11 => out.chunks_exact_mut(4).for_each(|c| c.reverse()),
+        12 => out.chunks_exact_mut(8).for_each(|c| c.reverse()),
+        _ => {}
+    }
+    out
+}
+
+fn to_tag_entry(byte_order: ByteOrder, entry: &RawEntry, bytes: Vec<u8>) -> TagEntry {
+    TagEntry {
+        tag: entry.tag,
+        field_type: entry.field_type,
+        count: entry.count,
+        value: swap_to_little_endian(byte_order, entry.field_type, &bytes),
+    }
+}
+
+/// Read one TIFF-source frame's descriptive metadata: the IFD0 whitelist,
+/// the EXIF and GPS sub-IFDs, and the ICC/XMP/IPTC blocks as opaque bytes.
+/// IFD0's own `DateTimeOriginal` (36867) moves into the EXIF list rather
+/// than `ifd0`. Has no `Err` case: a damaged block becomes a warning, never
+/// a reason to fail the whole read.
+pub(crate) fn read_tiff_metadata<S: ByteSource>(
+    source: &S,
+    byte_order: ByteOrder,
+    ifd0_offset: u64,
+    path: &Path,
+) -> SourceMetadata {
+    let ctx = IfdContext {
+        source,
+        byte_order,
+        file_size: source.len(),
+        path,
+    };
+    let mut warnings = Vec::new();
+
+    let ifd0_entries = match read_ifd(source, byte_order, ifd0_offset, path) {
+        Ok(entries) => entries,
+        Err(err) => {
+            warnings.push(format!("IFD0: {err}"));
+            Vec::new()
+        }
+    };
+
+    let mut ifd0 = Vec::new();
+    let mut exif = Vec::new();
+    let mut exif_ifd_offset = None;
+    let mut gps_ifd_offset = None;
+    let mut icc = None;
+    let mut xmp = None;
+    let mut iptc = None;
+
+    let pointer_offset = |entry: &RawEntry| {
+        byte_order
+            .ints_at(entry.field_type, entry.count, &entry.payload)
+            .and_then(|v| v.first().copied())
+    };
+
+    for entry in &ifd0_entries {
+        match entry.tag {
+            TAG_EXIF_IFD => exif_ifd_offset = pointer_offset(entry),
+            TAG_GPS_IFD => gps_ifd_offset = pointer_offset(entry),
+            TAG_ICC_PROFILE => match ctx.resolve_bytes(entry) {
+                Ok(bytes) => icc = Some(bytes),
+                Err(err) => warnings.push(format!("ICC profile: {err}")),
+            },
+            TAG_XMP => match ctx.resolve_bytes(entry) {
+                Ok(bytes) => xmp = Some(bytes),
+                Err(err) => warnings.push(format!("XMP packet: {err}")),
+            },
+            TAG_IPTC => match ctx.resolve_bytes(entry) {
+                Ok(bytes) => iptc = Some(bytes),
+                Err(err) => warnings.push(format!("IPTC block: {err}")),
+            },
+            TAG_DATE_TIME_ORIGINAL => match ctx.resolve_bytes(entry) {
+                Ok(bytes) => exif.push(to_tag_entry(byte_order, entry, bytes)),
+                Err(err) => warnings.push(format!("DateTimeOriginal: {err}")),
+            },
+            tag if METADATA_IFD0_WHITELIST.contains(&tag) => match ctx.resolve_bytes(entry) {
+                Ok(bytes) => ifd0.push(to_tag_entry(byte_order, entry, bytes)),
+                Err(err) => warnings.push(format!("IFD0 tag {tag}: {err}")),
+            },
+            _ => {}
+        }
+    }
+
+    if let Some(offset) = exif_ifd_offset {
+        exif.extend(ctx.read_tag_list(
+            offset,
+            "EXIF sub-IFD",
+            |tag| tag != TAG_MAKER_NOTE && tag != TAG_INTEROP_IFD,
+            &mut warnings,
+        ));
+    }
+
+    let gps = match gps_ifd_offset {
+        Some(offset) => ctx.read_tag_list(offset, "GPS sub-IFD", |_| true, &mut warnings),
+        None => Vec::new(),
+    };
+
+    SourceMetadata {
+        ifd0,
+        exif,
+        gps,
+        icc,
+        xmp,
+        iptc,
+        kind: SourceKind::Tiff,
+        warnings,
+    }
+}
+
 /// A byte-addressable source a header can be parsed out of, without caring
 /// whether the bytes come from a `File` (the `open` path) or an in-memory
 /// slice (unit tests, and the mapping once it exists).
@@ -248,6 +465,9 @@ pub struct TiffHeader {
     pub width: u32,
     pub height: u32,
     pub byte_order: ByteOrder,
+    /// IFD0's file offset, for a metadata read over the same bytes this
+    /// header's own parse already located.
+    pub ifd_offset: u64,
     pub bits_per_sample: Box<[u16]>,
     pub samples_per_pixel: u32,
     pub compression: u16,
@@ -358,33 +578,11 @@ impl TiffHeader {
         }
 
         let entries = read_ifd(source, byte_order, ifd_offset, path)?;
-
-        // Resolve one entry's raw bytes: inline when total size <= 4 bytes,
-        // otherwise seek to its offset.
-        let resolve_bytes = |entry: &RawEntry| -> Result<Vec<u8>, TiffError> {
-            let Some(size) = field_type_size(entry.field_type) else {
-                return Ok(Vec::new());
-            };
-            let total = u64::from(size) * u64::from(entry.count);
-            if total <= 4 {
-                Ok(entry.payload[..total as usize].to_vec())
-            } else {
-                let offset = u64::from(byte_order.u32_at(&entry.payload).unwrap_or(0));
-                let past_eof = offset.checked_add(total).is_none_or(|end| end > file_size);
-                if past_eof {
-                    return Err(TiffError::ValuePastEof {
-                        path: path.to_path_buf(),
-                        tag: entry.tag,
-                    });
-                }
-                let data = source.read_at(offset, total as usize).map_err(|_| {
-                    TiffError::ValuePastEof {
-                        path: path.to_path_buf(),
-                        tag: entry.tag,
-                    }
-                })?;
-                Ok(data.into_owned())
-            }
+        let ctx = IfdContext {
+            source,
+            byte_order,
+            file_size,
+            path,
         };
 
         let find = |tag: u16| entries.iter().find(|e| e.tag == tag);
@@ -393,7 +591,7 @@ impl TiffHeader {
             match find(tag) {
                 None => Ok(None),
                 Some(entry) => {
-                    let bytes = resolve_bytes(entry)?;
+                    let bytes = ctx.resolve_bytes(entry)?;
                     Ok(byte_order.ints_at(entry.field_type, entry.count, &bytes))
                 }
             }
@@ -452,7 +650,7 @@ impl TiffHeader {
         let image_description = match find(TAG_IMAGE_DESCRIPTION) {
             None => None,
             Some(entry) => {
-                let bytes = resolve_bytes(entry)?;
+                let bytes = ctx.resolve_bytes(entry)?;
                 let text = bytes.split(|&b| b == 0).next().unwrap_or(&[]);
                 Some(String::from_utf8_lossy(text).into_owned())
             }
@@ -464,7 +662,7 @@ impl TiffHeader {
         // a junk sub-IFD pointer must not make an otherwise good stack
         // member unreadable.
         let read_ascii = |entry: &RawEntry| -> Option<String> {
-            let bytes = resolve_bytes(entry).ok()?;
+            let bytes = ctx.resolve_bytes(entry).ok()?;
             let text = bytes.split(|&b| b == 0).next().unwrap_or(&[]);
             Some(String::from_utf8_lossy(text).into_owned())
         };
@@ -531,6 +729,7 @@ impl TiffHeader {
             width,
             height,
             byte_order,
+            ifd_offset,
             bits_per_sample: bits_per_sample.into_boxed_slice(),
             samples_per_pixel,
             compression,
@@ -643,6 +842,93 @@ mod tests {
             pos += 12;
         }
         buf[pos..pos + 4].copy_from_slice(&long_bytes(order, 0));
+        buf
+    }
+
+    fn entry_ascii(tag: u16, s: &str) -> TestEntry {
+        let mut data = s.as_bytes().to_vec();
+        data.push(0);
+        TestEntry {
+            tag,
+            field_type: 2,
+            count: data.len() as u32,
+            data,
+        }
+    }
+
+    fn entry_rational(tag: u16, order: ByteOrder, num: u32, den: u32) -> TestEntry {
+        let mut data = Vec::new();
+        data.extend_from_slice(&long_bytes(order, num));
+        data.extend_from_slice(&long_bytes(order, den));
+        TestEntry {
+            tag,
+            field_type: 5,
+            count: 1,
+            data,
+        }
+    }
+
+    /// Encode one IFD (entry count, 12-byte entries, next-IFD offset, plus
+    /// out-of-line values) as it would sit starting at `base_offset` in a
+    /// file, so a caller can append it after other data and patch a pointer
+    /// entry elsewhere to `base_offset`.
+    fn encode_ifd_at(order: ByteOrder, base_offset: u32, entries: &[TestEntry]) -> Vec<u8> {
+        let n = entries.len();
+        let fixed_len = 2 + 12 * n as u32 + 4;
+        let mut cursor = base_offset + fixed_len;
+        let mut offsets = vec![0u32; n];
+        for (i, e) in entries.iter().enumerate() {
+            if e.data.len() > 4 {
+                offsets[i] = cursor;
+                cursor += e.data.len() as u32;
+                cursor += cursor % 2;
+            }
+        }
+        let mut buf = vec![0u8; (cursor - base_offset) as usize];
+        buf[0..2].copy_from_slice(&short_bytes(order, n as u16));
+        let mut pos = 2usize;
+        for (i, e) in entries.iter().enumerate() {
+            buf[pos..pos + 2].copy_from_slice(&short_bytes(order, e.tag));
+            buf[pos + 2..pos + 4].copy_from_slice(&short_bytes(order, e.field_type));
+            buf[pos + 4..pos + 8].copy_from_slice(&long_bytes(order, e.count));
+            if e.data.len() <= 4 {
+                buf[pos + 8..pos + 8 + e.data.len()].copy_from_slice(&e.data);
+            } else {
+                let off = offsets[i];
+                buf[pos + 8..pos + 12].copy_from_slice(&long_bytes(order, off));
+                let local = (off - base_offset) as usize;
+                buf[local..local + e.data.len()].copy_from_slice(&e.data);
+            }
+            pos += 12;
+        }
+        buf[pos..pos + 4].copy_from_slice(&long_bytes(order, 0));
+        buf
+    }
+
+    /// A classic TIFF whose IFD0 carries a pointer entry (already present in
+    /// `ifd0`, its 4-byte value still `0`) for each of `sub_ifds`, appended
+    /// after IFD0 and patched in once its offset is known -- the shape a
+    /// real EXIF/GPS sub-IFD pair has.
+    fn build_with_sub_ifds(
+        order: ByteOrder,
+        ifd0: &[TestEntry],
+        sub_ifds: &[(u16, Vec<TestEntry>)],
+    ) -> Vec<u8> {
+        let mut buf = build(order, 42, ifd0);
+        let mut pos = 10usize; // 8-byte file header + 2-byte entry count
+        let mut pointer_positions = std::collections::HashMap::new();
+        for e in ifd0 {
+            pointer_positions.insert(e.tag, pos + 8);
+            pos += 12;
+        }
+        for (pointer_tag, entries) in sub_ifds {
+            let offset = buf.len() as u32;
+            buf.extend_from_slice(&encode_ifd_at(order, offset, entries));
+            let value_pos = *pointer_positions
+                .get(pointer_tag)
+                .expect("pointer tag must be present in ifd0 entries");
+            buf[value_pos..value_pos + 4].copy_from_slice(&long_bytes(order, offset));
+        }
         buf
     }
 
@@ -848,5 +1134,95 @@ mod tests {
         assert_eq!(header.width, 4);
         assert_eq!(header.height, 4);
         assert_eq!(header.byte_order, ByteOrder::Little);
+    }
+
+    /// Build an IFD0 with a Make tag, a dropped DocumentName, and pointers
+    /// to one EXIF entry (a RATIONAL, so endian-swap actually matters) and
+    /// one GPS entry, in `order`.
+    fn metadata_fixture(order: ByteOrder) -> Vec<u8> {
+        let ifd0 = vec![
+            entry_ascii(271, "Canon"),
+            entry_ascii(269, "/home/user/export.tif"),
+            entry_long(TAG_EXIF_IFD, order, &[0]),
+            entry_long(TAG_GPS_IFD, order, &[0]),
+        ];
+        let exif = vec![entry_rational(33434, order, 1, 200)]; // ExposureTime
+        let gps = vec![entry_ascii(1, "N")]; // GPSLatitudeRef
+        build_with_sub_ifds(order, &ifd0, &[(TAG_EXIF_IFD, exif), (TAG_GPS_IFD, gps)])
+    }
+
+    #[test]
+    fn metadata_matches_across_byte_order() {
+        let little = metadata_fixture(ByteOrder::Little);
+        let big = metadata_fixture(ByteOrder::Big);
+        let meta_little = read_tiff_metadata(&little.as_slice(), ByteOrder::Little, 8, path());
+        let meta_big = read_tiff_metadata(&big.as_slice(), ByteOrder::Big, 8, path());
+
+        assert_eq!(meta_little.ifd0, meta_big.ifd0);
+        assert_eq!(meta_little.exif, meta_big.exif);
+        assert_eq!(meta_little.gps, meta_big.gps);
+        assert!(
+            meta_little.warnings.is_empty(),
+            "{:?}",
+            meta_little.warnings
+        );
+        assert!(meta_big.warnings.is_empty(), "{:?}", meta_big.warnings);
+
+        // Make (271) survives, DocumentName (269) does not.
+        assert!(meta_little.ifd0.iter().any(|e| e.tag == 271));
+        assert!(!meta_little.ifd0.iter().any(|e| e.tag == 269));
+
+        // ExposureTime (33434, RATIONAL) decodes to the same little-endian
+        // bytes from both a little- and a big-endian source: this is the
+        // part that only passes once the big-endian source is swapped.
+        let exposure = meta_little
+            .exif
+            .iter()
+            .find(|e| e.tag == 33434)
+            .expect("ExposureTime carried");
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        expected.extend_from_slice(&200u32.to_le_bytes());
+        assert_eq!(exposure.value, expected);
+
+        assert_eq!(meta_little.gps.len(), 1);
+        assert_eq!(meta_little.gps[0].tag, 1);
+        assert_eq!(meta_little.kind, SourceKind::Tiff);
+    }
+
+    #[test]
+    fn metadata_warns_instead_of_failing_on_junk_exif_pointer() {
+        let ifd0 = vec![entry_long(TAG_EXIF_IFD, ByteOrder::Little, &[999_999_999])];
+        let bytes = build(ByteOrder::Little, 42, &ifd0);
+        let meta = read_tiff_metadata(&bytes.as_slice(), ByteOrder::Little, 8, path());
+        assert!(meta.exif.is_empty());
+        assert!(
+            meta.warnings.iter().any(|w| w.contains("EXIF")),
+            "{:?}",
+            meta.warnings
+        );
+    }
+
+    #[test]
+    fn metadata_warns_instead_of_failing_on_icc_past_eof() {
+        // Declares 1000 UNDEFINED bytes but the file only has 8 there.
+        let icc_entry = TestEntry {
+            tag: TAG_ICC_PROFILE,
+            field_type: 7,
+            count: 1000,
+            data: vec![0u8; 8],
+        };
+        let bytes = build(ByteOrder::Little, 42, &[icc_entry]);
+        let meta = read_tiff_metadata(&bytes.as_slice(), ByteOrder::Little, 8, path());
+        assert!(meta.icc.is_none());
+        assert!(
+            meta.warnings.iter().any(|w| w.contains("ICC")),
+            "{:?}",
+            meta.warnings
+        );
+    }
+
+    fn path() -> &'static Path {
+        Path::new("test.tif")
     }
 }

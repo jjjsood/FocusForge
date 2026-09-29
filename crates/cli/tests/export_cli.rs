@@ -141,6 +141,7 @@ fn exported_image_is_the_zmap_gather() {
         &head.id,
         &in_process,
         &project::export::ExportOptions::default(),
+        &project::export::MetadataOptions::default(),
     )
     .expect("in-process export must succeed");
     assert!(
@@ -538,6 +539,7 @@ fn exports_every_checkpoint_of_a_branched_history() {
             id,
             &in_process_out,
             &project::export::ExportOptions::default(),
+            &project::export::MetadataOptions::default(),
         )
         .expect("in-process export must succeed");
         assert_eq!(
@@ -675,6 +677,7 @@ fn plain_export_of_an_edited_head_renders_the_edit() {
         &branched.branch_b,
         &expected,
         &project::export::ExportOptions::default(),
+        &project::export::MetadataOptions::default(),
     )
     .expect("in-process export of the head must succeed");
     assert_eq!(

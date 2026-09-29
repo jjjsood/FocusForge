@@ -261,6 +261,7 @@ mod tests {
             width: 4,
             height: 4,
             byte_order: crate::io::ByteOrder::Little,
+            ifd_offset: 0,
             bits_per_sample: Box::new([16, 16, 16]),
             samples_per_pixel: 3,
             compression: 1,

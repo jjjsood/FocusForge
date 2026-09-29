@@ -14,7 +14,8 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{TiffSpec, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::{
-    ExportOptions, JpegSubsampling, PngBits, PngCompression, TiffBits, TiffCompression,
+    ExportOptions, JpegSubsampling, MetadataOptions, PngBits, PngCompression, TiffBits,
+    TiffCompression,
 };
 use focusforge_core::project::{
     self, CheckpointImage, Metrics, Op, Project, ProjectError, SealRequest, ZMapStorage,
@@ -290,7 +291,14 @@ fn export_peak_growth(
 ) -> usize {
     let out = dir.join(name);
     reset_peak();
-    project::export_checkpoint(project, checkpoint_id, &out, options).expect("export must succeed");
+    project::export_checkpoint(
+        project,
+        checkpoint_id,
+        &out,
+        options,
+        &MetadataOptions::default(),
+    )
+    .expect("export must succeed");
     let growth = peak_growth_since_reset();
     let _ = std::fs::remove_file(&out);
     growth
@@ -483,8 +491,14 @@ fn png_and_jpeg_refuse_unsupported_samples_per_pixel() {
             ),
         ] {
             let out = dir.join(name);
-            let err = project::export_checkpoint(&mut project, &root_id, &out, &options)
-                .expect_err(&format!("spp={spp} {name} must be refused"));
+            let err = project::export_checkpoint(
+                &mut project,
+                &root_id,
+                &out,
+                &options,
+                &MetadataOptions::default(),
+            )
+            .expect_err(&format!("spp={spp} {name} must be refused"));
             assert!(
                 matches!(err, ProjectError::ExportUnsupportedSamples { .. }),
                 "spp={spp} {name}: {err}"
@@ -494,8 +508,14 @@ fn png_and_jpeg_refuse_unsupported_samples_per_pixel() {
 
         // TIFF has no such limit.
         let tiff_out = dir.join("out.tif");
-        project::export_checkpoint(&mut project, &root_id, &tiff_out, &ExportOptions::default())
-            .expect("TIFF must accept any samples-per-pixel");
+        project::export_checkpoint(
+            &mut project,
+            &root_id,
+            &tiff_out,
+            &ExportOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .expect("TIFF must accept any samples-per-pixel");
     }
 }
 
@@ -513,7 +533,14 @@ fn export_checkpoint_validates_options_built_directly_not_through_from_values() 
         quality: 300,
         subsampling: JpegSubsampling::S444,
     };
-    let err = project::export_checkpoint(&mut project, &root_id, &out, &options).unwrap_err();
+    let err = project::export_checkpoint(
+        &mut project,
+        &root_id,
+        &out,
+        &options,
+        &MetadataOptions::default(),
+    )
+    .unwrap_err();
     assert!(matches!(err, ProjectError::ExportOptions { .. }), "{err}");
     assert!(!out.exists());
 }
