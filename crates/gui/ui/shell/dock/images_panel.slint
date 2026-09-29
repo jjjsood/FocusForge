@@ -31,6 +31,9 @@ export component FFImagesPanel inherits Rectangle {
     // Whether the mutating chrome (add, sort, per-row hover controls) shows
     // at all.
     in property <bool> mutable: true;
+    // Whether the panel draws at full strength. False dims the whole panel
+    // to the same disabled look `FFSettingsPanel` uses during a job.
+    in property <bool> enabled: true;
     // The editor's read-only legend: every row is a mode of `FFImageRow`
     // rather than the mutable stacking-mode row, and the pinned `NO_SOURCE`
     // entry shows below the scrolled list.
@@ -65,6 +68,8 @@ export component FFImagesPanel inherits Rectangle {
     callback scrollbar-pointer(int, length);
     callback scrollbar-dragged(length);
     callback viewport-height-changed(length);
+
+    opacity: root.enabled ? 1.0 : 0.5;
 
     VerticalLayout {
         spacing: Theme.space-2;

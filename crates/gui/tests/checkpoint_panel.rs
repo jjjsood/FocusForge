@@ -59,8 +59,12 @@ fn a_fresh_window_press_on_the_drawn_thumb_does_not_jump() {
     write_history(&project_path, 10, 60);
     let controller = Arc::new(Mutex::new(AppController::new()));
     common::open_and_settle(&mut controller.lock().unwrap(), &[project_path]);
-    let _installed =
-        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
 
     let mut c = controller.lock().unwrap();
     assert_eq!(c.checkpoints_panel().content_height, 400.0);
@@ -680,8 +684,12 @@ fn installed_window(
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller));
-    let installed =
-        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
+    let installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
     focusforge_gui::bridge::push_projects(&app, &controller);
     // The dock's tab row shows only once a project is loaded, which the
     // canvas repaint reports.

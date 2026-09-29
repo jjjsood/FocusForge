@@ -721,9 +721,9 @@ export component AppWindow inherits Window {
         pick-another-folder => { root.refusal-pick-another-folder(); }
     }
 
-    // Both toasts sit over the canvas, never the projects overlay: a toast
-    // open when the overlay opens waits, still armed, and reappears the
-    // moment the overlay closes -- neither flag its own toast clears.
+    // The skipped-subfolders notice waits, still armed, until the overview
+    // closes -- it announces an import result, not a background failure, so
+    // losing it to the overview's own focus costs nothing.
     skipped-toast := FFToast {
         x: canvas-ground.x + Theme.space-3;
         y: canvas-ground.y + Theme.space-3;
@@ -733,10 +733,18 @@ export component AppWindow inherits Window {
         dismissed => { root.skipped-notice-dismissed(); }
     }
 
+    // The job toast shows over whichever surface is up: the gallery's own
+    // gutter while the Projects overview is open (declared after
+    // `projects-overlay` above so it paints on top), the pane gutter
+    // otherwise.
     job-toast := FFToast {
-        x: canvas-ground.x + Theme.space-3;
-        y: canvas-ground.y + Theme.space-3;
-        toast-open: root.job-toast-open && !root.projects-overlay-open;
+        x: root.projects-overlay-open
+            ? projects-overlay.x + projects-overlay.gallery-x + Theme.space-3
+            : canvas-ground.x + Theme.space-3;
+        y: root.projects-overlay-open
+            ? projects-overlay.y + projects-overlay.gallery-y + Theme.space-3
+            : canvas-ground.y + Theme.space-3;
+        toast-open: root.job-toast-open;
         message: root.job-toast-message;
         dismissed => { root.job-toast-dismissed(); }
     }

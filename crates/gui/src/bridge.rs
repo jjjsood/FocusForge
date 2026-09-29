@@ -645,8 +645,12 @@ fn start_job_timer(
         if settled.is_some() {
             push_projects(&app, &controller);
             repaint(&app, &controller, &canvas);
-        } else if let Some(message) = controller.lock().unwrap().take_settled_failure() {
-            open_job_toast(&app, message, &toast_timer);
+        } else if let Some(notification) = controller.lock().unwrap().take_settled_failure() {
+            open_job_toast(
+                &app,
+                notification.operation.summary().to_string(),
+                &toast_timer,
+            );
         }
         let view = controller.lock().unwrap().job_view();
         let live = controller.lock().unwrap().work_pending();
@@ -969,6 +973,7 @@ pub fn push_projects_overlay(app: &AppWindow, controller: &AppController) {
         .into_iter()
         .map(|c| GeneratedProjectCard {
             kind: c.kind.into(),
+            opened: c.opened,
             current: c.current,
             unsaved: c.unsaved,
             fusing: c.fusing,
@@ -1024,6 +1029,10 @@ pub struct DropHandler {
     app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>>,
     pending: Vec<PathBuf>,
     load_timer: Rc<RefCell<Option<slint::Timer>>>,
+    /// Shared with `install`'s own failure toast -- one slot, so a blocked
+    /// drop's toast and a blocked add's toast never close each other's
+    /// auto-dismiss timer early.
+    toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 }
 
 impl DropHandler {
@@ -1036,6 +1045,7 @@ impl DropHandler {
         controller: Arc<Mutex<AppController>>,
         canvas: Rc<RefCell<Canvas>>,
         app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>>,
+        toast_timer: Rc<RefCell<Option<slint::Timer>>>,
     ) -> Self {
         DropHandler {
             controller,
@@ -1043,6 +1053,7 @@ impl DropHandler {
             app_handle,
             pending: Vec::new(),
             load_timer: Rc::new(RefCell::new(None)),
+            toast_timer,
         }
     }
 }
@@ -1065,18 +1076,28 @@ impl CustomApplicationHandler for DropHandler {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) -> EventResult {
         if !self.pending.is_empty() {
             let paths = std::mem::take(&mut self.pending);
-            let _ = self.controller.lock().unwrap().open_paths(&paths);
-            // The same settle-then-repaint tail every other open path ends
-            // in, so a dropped project's own planes replace whatever the
-            // canvas held before, with no further gesture needed.
-            if let Some(app_weak) = self.app_handle.borrow().clone() {
-                start_load_timer(
-                    app_weak,
-                    self.controller.clone(),
-                    self.canvas.clone(),
-                    &self.load_timer,
-                    Vec::new(),
-                );
+            let result = self.controller.lock().unwrap().drop_paths(&paths);
+            match result {
+                Ok(_) => {
+                    // The same settle-then-repaint tail every other open
+                    // path ends in, so a dropped project's own planes
+                    // replace whatever the canvas held before, with no
+                    // further gesture needed.
+                    if let Some(app_weak) = self.app_handle.borrow().clone() {
+                        start_load_timer(
+                            app_weak,
+                            self.controller.clone(),
+                            self.canvas.clone(),
+                            &self.load_timer,
+                            Vec::new(),
+                        );
+                    }
+                }
+                Err(refused) => {
+                    if let Some(app) = self.app_handle.borrow().clone().and_then(|w| w.upgrade()) {
+                        open_job_toast(&app, refused.to_string(), &self.toast_timer);
+                    }
+                }
             }
         }
         EventResult::Propagate
@@ -1129,7 +1150,7 @@ fn open_recent(
 
 /// Runs one of the controller's saves -- `Save project`, its `Ctrl+S` twin
 /// and the close question's `Save and close`. A failed save closes the
-/// projects overlay, so the failure toast that waits behind it shows at once.
+/// projects overlay before opening the failure toast.
 fn save_project(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
@@ -1148,9 +1169,13 @@ fn save_project(
     let Some(app) = app_weak.upgrade() else {
         return;
     };
-    if let Some(message) = failure {
+    if let Some(notification) = failure {
         controller.lock().unwrap().close_projects_overlay();
-        open_job_toast(&app, message, toast_timer);
+        open_job_toast(
+            &app,
+            notification.operation.summary().to_string(),
+            toast_timer,
+        );
     }
     push_projects(&app, controller);
     repaint(&app, controller, canvas);
@@ -1167,9 +1192,9 @@ pub fn install(
     app: &AppWindow,
     controller: Arc<Mutex<AppController>>,
     canvas: Rc<RefCell<Canvas>>,
+    toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 ) -> Installed {
     let job_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
-    let toast_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     let load_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
 
     {
@@ -1994,11 +2019,18 @@ pub fn install(
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let toast_timer = toast_timer.clone();
         move || {
             if let Some(paths) = crate::picker::pick_frames() {
+                let mut refused = None;
                 dispatch(&controller, &canvas, &app_weak, |controller| {
-                    controller.add_frames(&paths);
+                    refused = controller.add_frames(&paths).err();
                 });
+                if let Some(refused) = refused
+                    && let Some(app) = app_weak.upgrade()
+                {
+                    open_job_toast(&app, refused.to_string(), &toast_timer);
+                }
             }
         }
     });
@@ -2068,10 +2100,10 @@ pub fn install(
         let controller = controller.clone();
         move || {
             let mut controller = controller.lock().unwrap();
-            let exclude = controller
-                .pending_frame_change()
-                .is_some_and(|copy| copy.exclude_instead_button);
-            if exclude {
+            let copy = controller.pending_frame_change();
+            if copy.as_ref().is_some_and(|c| c.keep_existing_button) {
+                controller.keep_existing();
+            } else if copy.is_some_and(|c| c.exclude_instead_button) {
                 controller.exclude_instead();
             } else {
                 controller.new_project_instead();
@@ -2471,6 +2503,15 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
                 None => {}
             }
             app.set_load_active(false);
+        }
+        // An import scan (`AppController::add_frames`) is ready to settle.
+        // Never touches the canvas: an add either stages a question or
+        // appends frames, neither of which the sink's own `Send + Sync`
+        // path can repaint through anyway.
+        ShellEvent::ImportReady => {
+            let mut controller = controller.lock().unwrap();
+            controller.settle_import();
+            push_images_panel(app, &controller);
         }
     }
 }

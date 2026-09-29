@@ -9,9 +9,11 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use focusforge_gui::entry::ImportRefused;
 use focusforge_gui::viewport::PaneRect;
-use focusforge_gui::{AppController, EntryError, OpenAs, OpenOutcome};
+use focusforge_gui::{AppController, EntryError, OpenAs, OpenOutcome, ShellMode};
 use slint::ComponentHandle;
 
 fn mantis_frame(index: usize) -> PathBuf {
@@ -1031,11 +1033,12 @@ fn answering_the_question_closes_its_dialog() {
     );
 }
 
-/// A drop while a loaded tab is active leaves it untouched and appends the
-/// dropped stack(s), the first one active and
-/// scrolled into view. The drop route is `open_paths` (`bridge::DropHandler`).
+/// Opening a folder while a loaded tab is active leaves it untouched and
+/// appends the opened stack(s), the first one active and scrolled into
+/// view -- `AppController::open_paths` directly, not the drop route
+/// (`AppController::drop_paths`, exercised by the `a_drop_*` tests below).
 #[test]
-fn a_drop_onto_a_loaded_tab_appends_new_tabs() {
+fn opening_a_folder_onto_a_loaded_tab_appends_new_tabs() {
     let mut controller = with_one_project("entry_drop_loaded_first");
     controller.set_tab_region_width(400.0);
     let first_title = controller.project_tabs()[0].title.clone();
@@ -1091,6 +1094,184 @@ fn a_drop_while_plus_is_selected_appends() {
 }
 
 // ---------------------------------------------------------------------
+// The drop route itself (`AppController::drop_paths`): additive into an
+// already-open tab, opening outright for the shapes that never were
+// additive, and refused when adding is blocked.
+// ---------------------------------------------------------------------
+
+/// [`with_one_project`], fused once into one held checkpoint, with its
+/// scratch root set and an always-converging align algorithm -- what a
+/// mid-run or outside-Stacking drop test needs to reach that state.
+fn with_fused_project(name: &str) -> AppController {
+    let root = tree(name);
+    copy_frame(&root, "00.tif", 0);
+    copy_frame(&root, "01.tif", 1);
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[root]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
+    controller.set_align_algorithm("dummy-align");
+    controller
+}
+
+#[test]
+fn a_drop_of_a_folder_with_a_frames_subfolder_adds_to_the_active_tab() {
+    let mut controller = with_one_project("entry_drop_frames_subfolder_first");
+    let before_tabs = controller.project_tabs().len();
+    let before_frames = controller.images_panel().rows.len();
+
+    let root = tree("entry_drop_frames_subfolder");
+    copy_frame(&root.join("frames"), "00.tif", 2);
+    copy_frame(&root.join("frames"), "01.tif", 3);
+
+    common::add_and_settle(&mut controller, &[root]).expect("an add onto an active tab");
+
+    assert_eq!(
+        controller.project_tabs().len(),
+        before_tabs,
+        "no new tab opens"
+    );
+    assert_eq!(controller.images_panel().rows.len(), before_frames + 2);
+}
+
+#[test]
+fn a_multi_file_drop_spanning_two_parent_directories_adds_to_the_active_tab() {
+    let mut controller = with_one_project("entry_drop_multi_parent_first");
+    let before_frames = controller.images_panel().rows.len();
+
+    let dir_a = tree("entry_drop_multi_parent_a");
+    let dir_b = tree("entry_drop_multi_parent_b");
+    copy_frame(&dir_a, "00.tif", 4);
+    copy_frame(&dir_b, "00.tif", 5);
+    let dropped = vec![dir_a.join("00.tif"), dir_b.join("00.tif")];
+
+    common::add_and_settle(&mut controller, &dropped).expect("an add onto an active tab");
+
+    assert_eq!(controller.project_tabs().len(), 1, "no new tab opens");
+    assert_eq!(controller.images_panel().rows.len(), before_frames + 2);
+}
+
+#[test]
+fn a_drop_of_a_lone_ffp_onto_an_active_tab_still_opens_its_own_tab() {
+    let mut controller = with_one_project("entry_drop_ffp_first");
+    let project_path = seal_test_project(&tree("entry_drop_ffp"));
+
+    let handle = controller
+        .drop_paths(&[project_path])
+        .expect("a lone project drop must not refuse");
+    if let Some(handle) = handle {
+        handle.join().expect("the load worker did not panic");
+    }
+    let outcome = controller
+        .settle_open()
+        .expect("a load was started, so one outcome is parked");
+    assert!(matches!(outcome, OpenOutcome::Opened(_)));
+    assert_eq!(
+        controller.project_tabs().len(),
+        2,
+        "the dropped project opens its own tab rather than adding to the active one"
+    );
+}
+
+#[test]
+fn a_drop_with_the_plus_tab_selected_still_opens_through_drop_paths() {
+    let mut controller = with_one_project("entry_drop_plus_route_first");
+    controller.select_plus();
+
+    let root = tree("entry_drop_plus_route");
+    copy_frame(&root, "00.tif", 6);
+    copy_frame(&root, "01.tif", 7);
+    let dropped = vec![root.join("00.tif"), root.join("01.tif")];
+
+    let handle = controller
+        .drop_paths(&dropped)
+        .expect("a plus-selected drop must not refuse");
+    if let Some(handle) = handle {
+        handle.join().expect("the load worker did not panic");
+    }
+    let outcome = controller
+        .settle_open()
+        .expect("a load was started, so one outcome is parked");
+    assert!(matches!(outcome, OpenOutcome::Opened(_)));
+
+    let tabs = controller.project_tabs();
+    assert_eq!(tabs.len(), 2, "the dropped frames append one tab");
+    assert!(tabs[1].selected);
+}
+
+#[test]
+fn a_drop_outside_stacking_mode_is_refused_and_changes_nothing() {
+    let mut controller = with_fused_project("entry_drop_outside_stacking");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert!(
+        controller.set_mode(ShellMode::Editor),
+        "a fused tab enters editor mode"
+    );
+    let before_frames = controller.frame_count();
+
+    let root = tree("entry_drop_outside_stacking_extra");
+    copy_frame(&root, "00.tif", 0);
+    let result = controller.drop_paths(&[root.join("00.tif")]);
+    assert!(matches!(result, Err(ImportRefused::NotStacking)));
+    assert_eq!(controller.project_tabs().len(), 1);
+    assert_eq!(controller.frame_count(), before_frames);
+}
+
+#[test]
+fn a_drop_while_this_tabs_job_is_running_is_refused_and_changes_nothing() {
+    let mut controller = with_fused_project("entry_drop_mid_run");
+    assert!(controller.start_fuse());
+    assert!(controller.job_running());
+    let before_frames = controller.frame_count();
+
+    let root = tree("entry_drop_mid_run_extra");
+    copy_frame(&root, "00.tif", 1);
+    let result = controller.drop_paths(&[root.join("00.tif")]);
+    assert!(matches!(result, Err(ImportRefused::JobRunning)));
+    assert_eq!(controller.frame_count(), before_frames);
+
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+}
+
+#[test]
+fn a_second_drop_while_the_first_scan_is_still_being_checked_is_refused() {
+    let mut controller = with_one_project("entry_drop_still_checking_first");
+    let before_frames = controller.frame_count();
+
+    let root_a = tree("entry_drop_still_checking_a");
+    copy_frame(&root_a, "00.tif", 2);
+    let handle = controller
+        .drop_paths(&[root_a.join("00.tif")])
+        .expect("the first drop must not refuse");
+    let handle = handle.expect("adding a real frame spawns a worker");
+
+    let root_b = tree("entry_drop_still_checking_b");
+    copy_frame(&root_b, "00.tif", 3);
+    let second = controller.drop_paths(&[root_b.join("00.tif")]);
+    assert!(matches!(second, Err(ImportRefused::StillChecking)));
+    assert_eq!(controller.frame_count(), before_frames);
+
+    handle.join().expect("the import worker did not panic");
+    controller.settle_import();
+}
+
+#[test]
+fn a_drop_of_neither_a_folder_nor_a_frame_is_refused_and_changes_nothing() {
+    let mut controller = with_one_project("entry_drop_non_tiff");
+    let dir = tree("entry_drop_non_tiff_extra");
+    let bad = dir.join("notes.txt");
+    std::fs::write(&bad, b"not a frame").unwrap();
+    let before_frames = controller.frame_count();
+
+    let result = controller.drop_paths(&[bad]);
+    assert!(matches!(result, Err(ImportRefused::NoFrames { .. })));
+    assert_eq!(controller.frame_count(), before_frames);
+}
+
+// ---------------------------------------------------------------------
 // One double-click on a tab's close glyph closes one tab.
 // ---------------------------------------------------------------------
 
@@ -1120,7 +1301,12 @@ fn a_double_click_on_a_close_glyph_closes_one_tab() {
         let canvas = std::rc::Rc::new(std::cell::RefCell::new(
             focusforge_gui::bridge::Canvas::default(),
         ));
-        focusforge_gui::bridge::install(&app, controller.clone(), canvas);
+        focusforge_gui::bridge::install(
+            &app,
+            controller.clone(),
+            canvas,
+            std::rc::Rc::new(std::cell::RefCell::new(None)),
+        );
         let queued = Arc::new(Mutex::new(Vec::new()));
         controller.lock().unwrap().set_sink(Arc::new({
             let queued = queued.clone();

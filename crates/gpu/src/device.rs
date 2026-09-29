@@ -179,10 +179,12 @@ impl SharedDevice {
 
     /// Whether this device has been lost. wgpu queues the device-lost
     /// callback and only runs it from a later poll, so this polls first for
-    /// the freshest answer before reading the flag the callback set.
+    /// the freshest answer before reading the flag the callback set -- the
+    /// compute-only flag, since this is the headless device, never the
+    /// render device's.
     pub fn lost(&self) -> bool {
         let _ = self.device.poll(wgpu::PollType::Poll);
-        crate::errors::device_lost()
+        crate::errors::compute_device_lost()
     }
 
     /// Destroys the device and polls once, so the device-lost callback --
@@ -264,7 +266,7 @@ fn init() -> Result<SharedDevice, GpuError> {
         trace: Trace::default(),
     }))?;
 
-    crate::errors::install_handlers(&device);
+    crate::errors::install_compute_handlers(&device);
 
     // Two records, not one: the adapter's identity is what a report is read
     // against, the limits are what a refused allocation is read against, and

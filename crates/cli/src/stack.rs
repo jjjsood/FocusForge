@@ -880,9 +880,11 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // grouping does.
     //
     // This group's frames, already enumerated by the proposal, and the
-    // strict uniformity guard, are opened here too (not only inside the
-    // driver) because `--write-preset` and `--dry-run` must report without
-    // ever entering `focusforge_core::pipeline::run`.
+    // lenient uniformity check (dimensions, bits per sample, samples per
+    // pixel, photometric and planar configuration; byte order and
+    // RowsPerStrip are not compared), are opened here too (not only inside
+    // the driver) because `--write-preset` and `--dry-run` must report
+    // without ever entering `focusforge_core::pipeline::run`.
     let paths = group.frames.clone();
     let preflight_budget = TileSchedulerOptions::new(".scratch")
         .budget

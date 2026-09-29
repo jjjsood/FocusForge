@@ -44,7 +44,7 @@ use crate::settings_panel::{
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
 
 pub use crate::entry::{
-    EntryError, GroupingQuestion, GuiProject, OpenAs, OpenOutcome, Opened, Proposal,
+    EntryError, GroupingQuestion, GuiProject, ImportRefused, OpenAs, OpenOutcome, Opened, Proposal,
 };
 
 /// The stacking/editor mode switch's two positions. Editor is reachable only
@@ -156,6 +156,9 @@ pub enum ShellEvent {
     /// A background load's result is ready to settle
     /// ([`AppController::settle_open`]).
     LoadReady,
+    /// An import scan ([`AppController::add_frames`]) is ready to settle
+    /// ([`AppController::settle_import`]).
+    ImportReady,
 }
 
 /// One live drag: which action it started and the last position seen, so
@@ -427,6 +430,19 @@ struct ProjectTab {
     /// entry into editor mode -- `None` until then, and cleared whenever a
     /// newer checkpoint replaces the planes it was opened over.
     edit: Option<job::EditState>,
+    /// This tab's own failed, cancelled or sources-missing run, if its most
+    /// recent attempt did not succeed -- `None` once a later success clears
+    /// it. Keyed by tab rather than by path so it survives an Unsaved ->
+    /// Opened identity change and disappears with the tab on close.
+    failure: Option<TabFailure>,
+}
+
+/// A run outcome recorded against its own tab rather than the project's
+/// identity path -- [`ProjectTab::failure`]'s payload.
+struct TabFailure {
+    kind: FailureKind,
+    stage: String,
+    reason: String,
 }
 
 /// A saved row's planes, as far as they have got.
@@ -525,6 +541,7 @@ impl ProjectTab {
             run: job::RunState::Idle,
             request: None,
             edit: None,
+            failure: None,
         }
     }
 
@@ -786,8 +803,11 @@ struct ShellState {
     /// checkpoints no `.ffp` contains. Mutually exclusive with
     /// `pending_close`: each is a no-op while the other question is open.
     pending_quit: bool,
-    /// Every card standing for a stack that did not become an open project
-    /// this session -- cleared the moment its own path opens successfully.
+    /// Every `Not a project` card -- a path with no open project behind it
+    /// at all, cleared the moment that same path opens successfully. A
+    /// failed, cancelled or sources-missing run instead lives on its own
+    /// tab ([`ProjectTab::failure`]), since it always has an open project
+    /// behind it.
     failures: Vec<FailureCard>,
     /// The gallery's own scroll offset and viewport height --
     /// [`ShellState::images_scroll_y`]'s twin.
@@ -811,6 +831,8 @@ struct ShellState {
     /// The in-flight background load, if any.
     load: LoadSlot,
     render: RenderSlot,
+    /// The in-flight additive import scan, if any.
+    import: ImportSlot,
     /// The `Composite` pane's rainbow overlay -- window-wide (see
     /// [`OverlayState`]).
     overlay: OverlayState,
@@ -848,6 +870,24 @@ fn decode_thumbnails(projects: &mut [GuiProject]) -> Vec<Option<Arc<overlay::Thu
         .collect()
 }
 
+/// One additive import's worker result, parked here until
+/// [`AppController::settle_import`] resolves it -- [`LoadSlot`]'s twin for
+/// [`AppController::add_frames`] rather than a fresh open.
+#[derive(Default)]
+struct ImportSlot {
+    in_flight: bool,
+    outcome: Arc<Mutex<Option<ImportScan>>>,
+}
+
+/// [`AppController::add_frames`]'s worker outcome: the tab it scanned, that
+/// tab's frame list as of the scan's start, and the resolved import.
+struct ImportScan {
+    tab_id: u64,
+    frames: Vec<PathBuf>,
+    add: Vec<PathBuf>,
+    replace: Vec<(usize, PathBuf)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct DragRow {
     from: usize,
@@ -857,12 +897,43 @@ struct DragRow {
     current_y: f32,
 }
 
+/// An import's resolved shape, staged for [`AppController::apply_add_frames`]:
+/// `add` are new, non-conflicting frames to append; `replace` is each
+/// conflicting existing frame's own position in the tab's frame list, paired
+/// with its incoming replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ImportPlan {
+    add: Vec<PathBuf>,
+    replace: Vec<(usize, PathBuf)>,
+}
+
+impl ImportPlan {
+    fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.replace.is_empty()
+    }
+
+    /// Drops every `replace` entry whose incoming path is already the frame
+    /// at that position -- re-accepting a replacement with the very file
+    /// already there changes nothing.
+    fn without_same_path_replacements(mut self, existing: &[PathBuf]) -> Self {
+        self.replace
+            .retain(|(position, path)| existing.get(*position) != Some(path));
+        self
+    }
+}
+
 /// [`ShellState::pending_frame_change`]'s payload: which action is waiting,
 /// and what it still needs applied once confirmed.
 #[derive(Debug, Clone, PartialEq)]
 enum PendingFrameChange {
-    Add(Vec<PathBuf>),
-    Move { from: usize, to: usize },
+    Add(ImportPlan),
+    /// An import whose scan found conflicts -- the duplicate question, shown
+    /// regardless of the tab's own checkpoint count.
+    Duplicates(ImportPlan),
+    Move {
+        from: usize,
+        to: usize,
+    },
     Sort(crate::images::FrameSort),
     Remove(usize),
 }
@@ -870,7 +941,9 @@ enum PendingFrameChange {
 impl PendingFrameChange {
     fn kind(&self) -> crate::images::FrameSetChangeKind {
         match self {
-            PendingFrameChange::Add(_) => crate::images::FrameSetChangeKind::Add,
+            PendingFrameChange::Add(_) | PendingFrameChange::Duplicates(_) => {
+                crate::images::FrameSetChangeKind::Add
+            }
             PendingFrameChange::Move { .. } => crate::images::FrameSetChangeKind::Move,
             PendingFrameChange::Sort(_) => crate::images::FrameSetChangeKind::Sort,
             PendingFrameChange::Remove(_) => crate::images::FrameSetChangeKind::Remove,
@@ -985,14 +1058,22 @@ pub struct AppController {
     /// Test-only override for the resident display tiles' edge, applied to
     /// every edit session opened afterwards.
     resident_tile_size_for_test: Option<u32>,
-    /// The most recent run's own failure message, taken exactly once by
+    /// The most recent run or save failure, taken exactly once by
     /// [`Self::take_settled_failure`] -- what lets the failure toast
     /// announce the run that actually failed without reopening itself on
     /// every later poll.
-    settled_failure: Option<String>,
+    settled_failure: Option<job::Notification>,
+    /// Every run and save failure since the window opened, oldest first --
+    /// append-only, so a later failure replacing the toast's own slot, a
+    /// retry or a tab switch never drops what an earlier one recorded.
+    notifications: Vec<job::Notification>,
     /// The last id handed to a [`ProjectTab`] -- incremented before each
     /// use, so ids start at 1 and no two tabs ever share one.
     next_tab_id: u64,
+    /// Whether a fuse run may use the headless GPU backend at all -- `false`
+    /// by default, so a headless test controller never probes an adapter;
+    /// [`main`](crate) turns this on for the real window.
+    gpu_fusion: bool,
 }
 
 /// The single live worker, if any: the control/observer pair a background
@@ -2543,9 +2624,9 @@ impl AppController {
     /// records the skipped-subfolder notice. New tabs always go at the end,
     /// whether "+" or a project tab was selected.
     /// Every skipped subfolder becomes a `Not a project` card; an opened
-    /// project whose sources do not all resolve becomes a `Sources missing`
-    /// one alongside its tab; a path that opens successfully clears any card
-    /// already held for it.
+    /// project whose sources do not all resolve gets a `Sources missing`
+    /// failure on its own tab; a path that opens successfully clears any
+    /// `Not a project` card already held for it.
     fn accept(&mut self, opened: Opened, thumbnails: Vec<Option<Arc<overlay::Thumbnail>>>) {
         self.state.notice = notice_line(&opened.skipped);
         self.state.last_refusal = None;
@@ -2559,51 +2640,36 @@ impl AppController {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            for project in &opened.projects {
-                self.clear_failure(&project_identity_path(project));
-                self.record_recent(
-                    entry::tab_title(project),
-                    recent_folder(project),
-                    Some(project_identity_path(project)),
-                    opened_at,
-                );
-                if let GuiProject::Opened(p) = project
-                    && p.unresolved_sources().next().is_some()
-                {
-                    let path = p.path().to_path_buf();
-                    let title = p
-                        .path()
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| p.path().display().to_string());
-                    let frame_count = p.manifest().composite.frame_count as usize;
-                    self.record_failure(FailureCard {
-                        kind: FailureKind::SourcesMissing,
-                        path,
-                        title,
-                        stage: "NOTHING TO SHOW".to_string(),
-                        reason: "The project points at frames that are not where it left them."
-                            .to_string(),
-                        meta: format!(
-                            "{frame_count} {} · project found, sources not",
-                            frame_word(frame_count)
-                        ),
-                        frames: frame_count,
-                        request: None,
-                    });
-                }
-            }
             let mut thumbnails = thumbnails.into_iter();
             for project in opened.projects {
+                self.clear_failure(&project_identity_path(&project));
+                self.record_recent(
+                    entry::tab_title(&project),
+                    recent_folder(&project),
+                    Some(project_identity_path(&project)),
+                    opened_at,
+                );
+                let sources_missing = if let GuiProject::Opened(p) = &project {
+                    p.unresolved_sources().next().is_some()
+                } else {
+                    false
+                };
                 let source = match thumbnails.next() {
                     Some(decoded) => ThumbnailSource::Decoded(decoded),
                     None => ThumbnailSource::NotAttempted,
                 };
                 self.next_tab_id += 1;
                 let id = self.next_tab_id;
-                self.state
-                    .projects
-                    .push(ProjectTab::new(project, id, source));
+                let mut tab = ProjectTab::new(project, id, source);
+                if sources_missing {
+                    tab.failure = Some(TabFailure {
+                        kind: FailureKind::SourcesMissing,
+                        stage: "NOTHING TO SHOW".to_string(),
+                        reason: "The project points at frames that are not where it left them."
+                            .to_string(),
+                    });
+                }
+                self.state.projects.push(tab);
             }
         }
         self.settle_tab_scroll();
@@ -2995,9 +3061,29 @@ impl AppController {
             let phase_line = fusing
                 .then(|| job::phase_line(&tab.run, progress.as_ref()))
                 .flatten();
+            // A live run takes priority over the failure panel; the failure
+            // stays underneath until a success clears it.
+            let showing_failure = tab.failure.as_ref().filter(|_| !job::is_live(&tab.run));
+            let (kind, headline, stage, reason, action_label) = match showing_failure {
+                Some(failure) => (
+                    failure.kind.card_kind().to_string(),
+                    failure.kind.headline().to_string(),
+                    failure.stage.clone(),
+                    failure.reason.clone(),
+                    failure.kind.action_label().to_string(),
+                ),
+                None => (
+                    "open".to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ),
+            };
             let (x, y) = overlay::card_origin(cards.len(), columns);
             cards.push(CardView {
-                kind: "open".to_string(),
+                kind,
+                opened: true,
                 current: self.state.active == Some(i),
                 unsaved: tab.unsaved(),
                 fusing,
@@ -3012,10 +3098,10 @@ impl AppController {
                     tab.checkpoint_count(),
                     phase_line.as_deref(),
                 ),
-                headline: String::new(),
-                stage: String::new(),
-                reason: String::new(),
-                action_label: String::new(),
+                headline,
+                stage,
+                reason,
+                action_label,
                 picture: tab.thumbnail.clone(),
                 x,
                 y,
@@ -3025,6 +3111,7 @@ impl AppController {
             let (x, y) = overlay::card_origin(cards.len(), columns);
             cards.push(CardView {
                 kind: failure.kind.card_kind().to_string(),
+                opened: false,
                 current: false,
                 unsaved: false,
                 fusing: false,
@@ -3043,15 +3130,17 @@ impl AppController {
         cards
     }
 
-    /// Records `card`, replacing any card already held for the same path.
+    /// Records a `Not a project` `card`, replacing any card already held for
+    /// the same path.
     fn record_failure(&mut self, card: FailureCard) {
         self.state.failures.retain(|c| c.path != card.path);
         self.state.failures.push(card);
         self.emit(ShellEvent::OverlayChanged);
     }
 
-    /// Clears any card held for `path` -- what a path opening successfully
-    /// does to whichever card, if any, stood for its last attempt.
+    /// Clears any `Not a project` card held for `path` -- what a path
+    /// opening successfully does to whichever such card stood for its last
+    /// attempt.
     fn clear_failure(&mut self, path: &Path) {
         let before = self.state.failures.len();
         self.state.failures.retain(|c| c.path != path);
@@ -3071,10 +3160,14 @@ impl AppController {
         self.select_project(index);
     }
 
-    /// The failure card at gallery index `index`'s own kind string, if any --
-    /// what `crate::bridge` reads before deciding whether its action needs
-    /// the folder picker.
+    /// The card at gallery index `index`'s own kind string, if it is showing
+    /// a failure -- what `crate::bridge` reads before deciding whether its
+    /// action needs the folder picker. Reads the tab's own failure for an
+    /// open project's card, the `Not a project` list for the rest.
     pub fn gallery_failure_kind(&self, index: usize) -> Option<&'static str> {
+        if let Some(tab) = self.state.projects.get(index) {
+            return tab.failure.as_ref().map(|f| f.kind.card_kind());
+        }
         let failure_index = index.checked_sub(self.state.projects.len())?;
         self.state
             .failures
@@ -3082,66 +3175,48 @@ impl AppController {
             .map(|f| f.kind.card_kind())
     }
 
-    /// `Run again` on a `Did not stack`/`Cancelled` card: re-runs that
-    /// card's own kept request, on its own tab. Refuses rather than
-    /// attributing the run to whatever tab happens to be active when that
-    /// project's tab is no longer open, and never more than one card's worth
-    /// of work: a no-op while any run is already live. Returns whether a run
-    /// started.
+    /// `Run again` on a `Did not stack`/`Cancelled` card: re-runs that tab's
+    /// own kept request. Never more than one card's worth of work: a no-op
+    /// while any run is already live, or with no matching failure, or with
+    /// no request kept for it. Returns whether a run started.
     pub fn run_gallery_action(&mut self, index: usize) -> bool {
         if self.any_job_running() {
             return false;
         }
-        let Some(failure_index) = index.checked_sub(self.state.projects.len()) else {
+        let Some(tab) = self.state.projects.get(index) else {
             return false;
         };
-        let Some(failure) = self.state.failures.get(failure_index) else {
+        let Some(failure) = &tab.failure else {
             return false;
         };
-        let Some(request) = failure.request.clone() else {
+        if !matches!(failure.kind, FailureKind::Failed | FailureKind::Cancelled) {
+            return false;
+        }
+        let Some(request) = tab.request.clone() else {
             return false;
         };
-        let path = failure.path.clone();
-        let Some(tab_index) = self
-            .state
-            .projects
-            .iter()
-            .position(|t| project_identity_path(&t.project) == path)
-        else {
-            return false;
-        };
-        self.state.active = Some(tab_index);
-        self.run_request(tab_index, request);
+        self.state.active = Some(index);
+        self.run_request(index, request);
         true
     }
 
-    /// `Locate frames…` on a `Sources missing` card: re-resolves that
-    /// project's own tab against `folder` in memory only -- no write, and no
-    /// touch of the sealed `.ffp`'s own fingerprint. Clears the card only
+    /// `Locate frames…` on a `Sources missing` card: re-resolves that tab's
+    /// own frames against `folder` in memory only -- no write, and no touch
+    /// of the sealed `.ffp`'s own fingerprint. Clears the tab's failure only
     /// once every source resolves; a folder missing some of them changes
     /// nothing, silently.
     pub fn locate_missing_sources(&mut self, index: usize, folder: PathBuf) {
-        let Some(failure_index) = index.checked_sub(self.state.projects.len()) else {
+        let Some(tab) = self.state.projects.get(index) else {
             return;
         };
-        let Some(failure) = self.state.failures.get(failure_index) else {
-            return;
-        };
-        if failure.kind != FailureKind::SourcesMissing {
-            return;
-        }
-        let path = failure.path.clone();
-        let Some(tab) = self
-            .state
-            .projects
-            .iter_mut()
-            .find(|t| project_identity_path(&t.project) == path)
-        else {
-            return;
-        };
+        let sources_missing =
+            matches!(&tab.failure, Some(f) if f.kind == FailureKind::SourcesMissing);
         let GuiProject::Opened(project) = &tab.project else {
             return;
         };
+        if !sources_missing {
+            return;
+        }
         let candidates: Vec<PathBuf> = project
             .manifest()
             .sources
@@ -3155,10 +3230,12 @@ impl AppController {
             })
             .collect();
         if candidates.iter().all(|p| p.is_file()) {
+            let tab = &mut self.state.projects[index];
             tab.excluded = vec![false; candidates.len()];
             tab.frames = candidates;
             tab.selected = images::first_included(&tab.excluded);
-            self.clear_failure(&path);
+            tab.failure = None;
+            self.emit(ShellEvent::OverlayChanged);
         }
     }
 
@@ -3649,32 +3726,128 @@ impl AppController {
         )
     }
 
-    /// Adds `paths` to the active tab's frame list, appended in the order
-    /// given -- immediately, before the first checkpoint; behind the counted
-    /// warning once one exists. A no-op outside stacking mode or while this
-    /// tab's own job is running.
-    pub fn add_frames(&mut self, paths: &[PathBuf]) {
-        if self.mode() != ShellMode::Stacking
-            || paths.is_empty()
-            || self.state.active().is_none()
+    /// Adds `paths` to the active tab: hashes on a worker thread, then
+    /// [`Self::settle_import`] applies the scan. An [`ImportRefused`] leaves
+    /// the tab untouched.
+    pub fn add_frames(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> Result<Option<std::thread::JoinHandle<()>>, ImportRefused> {
+        let Some(tab) = self.state.active() else {
+            return Ok(None);
+        };
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        if self.mode() != ShellMode::Stacking {
+            return Err(ImportRefused::NotStacking);
+        }
+        if self.job_running() {
+            return Err(ImportRefused::JobRunning);
+        }
+        if self.state.import.in_flight {
+            return Err(ImportRefused::StillChecking);
+        }
+        let incoming = entry::expand_import(paths)?;
+        let tab_id = tab.id;
+        let frames = tab.frames.clone();
+
+        self.state.import.in_flight = true;
+        let sink = self.sink.clone();
+        let outcome_slot = Arc::clone(&self.state.import.outcome);
+        Ok(Some(std::thread::spawn(move || {
+            let (add, replace) = entry::diff_import(&frames, incoming);
+            *outcome_slot
+                .lock()
+                .expect("no thread panicked while holding the import outcome") = Some(ImportScan {
+                tab_id,
+                frames,
+                add,
+                replace,
+            });
+            if let Some(sink) = &sink {
+                sink(ShellEvent::ImportReady);
+            }
+        })))
+    }
+
+    /// Adds a drop to the active tab through [`Self::add_frames`]; with no
+    /// active tab, or for a lone saved project, opens it through
+    /// [`Self::open_paths`] instead.
+    pub fn drop_paths(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> Result<Option<std::thread::JoinHandle<()>>, ImportRefused> {
+        if self.state.active().is_some() && !entry::is_lone_project(paths) {
+            return self.add_frames(paths);
+        }
+        Ok(self.open_paths(paths))
+    }
+
+    /// Applies the scan [`Self::add_frames`] parked, only to the tab it
+    /// scanned and only while that tab is active, idle in Stacking mode and
+    /// its frame list unchanged; otherwise discards it.
+    pub fn settle_import(&mut self) {
+        let Some(scan) = self
+            .state
+            .import
+            .outcome
+            .lock()
+            .expect("no thread panicked while holding the import outcome")
+            .take()
+        else {
+            return;
+        };
+        self.state.import.in_flight = false;
+        let Some(index) = self.tab_index(scan.tab_id) else {
+            return;
+        };
+        if self.state.active != Some(index)
+            || self.mode() != ShellMode::Stacking
             || self.job_running()
+            || self.state.projects[index].frames != scan.frames
         {
             return;
         }
-        if self.frame_change_checkpoints() > 0 {
-            self.state.pending_frame_change = Some(PendingFrameChange::Add(paths.to_vec()));
+        let plan = ImportPlan {
+            add: scan.add,
+            replace: scan.replace,
+        };
+        if plan.replace.is_empty() {
+            self.stage_import(plan);
         } else {
-            self.apply_add_frames(paths);
+            self.state.pending_frame_change = Some(PendingFrameChange::Duplicates(plan));
+            self.emit(ShellEvent::ImagesChanged);
+        }
+    }
+
+    /// Stages a conflict-free import: nothing for an empty plan, the counted
+    /// "Add and re-fuse" warning once a checkpoint exists, or applies at
+    /// once before the first one. Always emits `ImagesChanged`, so an
+    /// answered duplicate question closes even when its plan is empty.
+    fn stage_import(&mut self, plan: ImportPlan) {
+        if !plan.is_empty() {
+            if self.frame_change_checkpoints() > 0 {
+                self.state.pending_frame_change = Some(PendingFrameChange::Add(plan));
+            } else {
+                self.apply_add_frames(&plan);
+            }
         }
         self.emit(ShellEvent::ImagesChanged);
     }
 
-    fn apply_add_frames(&mut self, paths: &[PathBuf]) {
+    fn apply_add_frames(&mut self, plan: &ImportPlan) {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        tab.frames.extend_from_slice(paths);
-        tab.excluded.extend(std::iter::repeat_n(false, paths.len()));
+        for (position, path) in &plan.replace {
+            if let Some(slot) = tab.frames.get_mut(*position) {
+                *slot = path.clone();
+            }
+        }
+        tab.frames.extend_from_slice(&plan.add);
+        tab.excluded
+            .extend(std::iter::repeat_n(false, plan.add.len()));
         tab.frame_sort = None;
     }
 
@@ -3882,9 +4055,20 @@ impl AppController {
 
     /// The frame-set-change warning still open, if any -- `None` whenever
     /// the active tab carries no checkpoint of its own to invalidate, since
-    /// there is nothing for a frame-set edit to disagree with.
+    /// there is nothing for a frame-set edit to disagree with. A pending
+    /// duplicate question shows regardless of checkpoint count: it is about
+    /// the import decision itself, not about re-fuse risk.
     pub fn pending_frame_change(&self) -> Option<images::FrameSetWarningCopy> {
         let pending = self.state.pending_frame_change.as_ref()?;
+        if let PendingFrameChange::Duplicates(plan) = pending {
+            let tab = self.state.active()?;
+            let names: Vec<String> = plan
+                .replace
+                .iter()
+                .filter_map(|&(position, _)| tab.frames.get(position).map(|p| images::file_name(p)))
+                .collect();
+            return Some(images::duplicate_question_copy(&names));
+        }
         if self.frame_change_checkpoints() == 0 {
             return None;
         }
@@ -4090,13 +4274,45 @@ impl AppController {
             return false;
         };
         match pending {
-            PendingFrameChange::Add(paths) => self.apply_add_frames(&paths),
+            PendingFrameChange::Add(plan) => self.apply_add_frames(&plan),
+            // Never calls `start_fuse` directly; stages through the same
+            // checkpoint gate every other add goes through.
+            PendingFrameChange::Duplicates(plan) => {
+                let existing = self
+                    .state
+                    .active()
+                    .map(|tab| tab.frames.clone())
+                    .unwrap_or_default();
+                self.stage_import(plan.without_same_path_replacements(&existing));
+                return false;
+            }
             PendingFrameChange::Move { from, to } => self.apply_move_frame(from, to),
             PendingFrameChange::Sort(sort) => self.apply_sort(sort),
             PendingFrameChange::Remove(index) => self.apply_remove_frame(index),
         }
         self.emit(ShellEvent::ImagesChanged);
         self.start_fuse()
+    }
+
+    /// The duplicate question's non-destructive answer: keeps every
+    /// existing frame, staging only the incoming files that were not
+    /// conflicts (through the same checkpoint gate every other add goes
+    /// through). `false` with nothing pending, or nothing pending a
+    /// duplicate answer.
+    pub fn keep_existing(&mut self) -> bool {
+        match self.state.pending_frame_change.take() {
+            Some(PendingFrameChange::Duplicates(plan)) => {
+                self.stage_import(ImportPlan {
+                    add: plan.add,
+                    replace: Vec::new(),
+                });
+                true
+            }
+            other => {
+                self.state.pending_frame_change = other;
+                false
+            }
+        }
     }
 
     /// Withdraws the pending frame-set change with nothing applied -- the
@@ -4414,8 +4630,21 @@ impl AppController {
             align_values: tab.align_values.clone(),
             align_lax: true,
             crop: true,
-            backend: None,
+            gpu: self.gpu_fusion,
         })
+    }
+
+    /// Turns GPU-backed fusion on or off for every run this controller
+    /// starts from here on -- never mid-run.
+    pub fn set_gpu_fusion(&mut self, gpu_fusion: bool) {
+        self.gpu_fusion = gpu_fusion;
+    }
+
+    /// The live run's own [`job::resolve_backend`] account, `None` before it
+    /// has resolved or once the run has settled ([`Self::settle_job`] clears
+    /// the observer).
+    pub fn fusion_backend(&self) -> Option<String> {
+        self.job.observer.as_ref().and_then(|o| o.backend_line())
     }
 
     /// Refuses a run whose recorded frame is no longer on disk, naming it
@@ -4509,9 +4738,10 @@ impl AppController {
 
     /// Requests a cancel, or leaves the queue. A queued active tab is
     /// removed from the queue and returned to `Idle`, never touching the
-    /// live run's control. Otherwise the cancel lands only once alignment
-    /// returns, showing `Cancelling` for that interval. A no-op unless the
-    /// active tab is queued or is the one actually running.
+    /// live run's control. Otherwise the cancel lands at the next frame
+    /// boundary during alignment, or the next tile during fusion, showing
+    /// `Cancelling` until then. A no-op unless the active tab is queued or
+    /// is the one actually running.
     pub fn cancel_fuse(&mut self) {
         if let Some(id) = self.state.active().map(|tab| tab.id)
             && let Some(pos) = self.job.queue.iter().position(|&queued| queued == id)
@@ -4607,12 +4837,18 @@ impl AppController {
         }
     }
 
-    /// The most recent run's own failure message, taken exactly once --
-    /// `None` once already read, or with no failure to announce. What the
-    /// failure toast names, so it fires only for the run that actually
-    /// failed and never re-opens on a later poll.
-    pub fn take_settled_failure(&mut self) -> Option<String> {
+    /// The most recent run or save failure, taken exactly once -- `None`
+    /// once already read, or with no failure to announce. What the failure
+    /// toast names, so it fires only for the run that actually failed and
+    /// never re-opens on a later poll.
+    pub fn take_settled_failure(&mut self) -> Option<job::Notification> {
         self.settled_failure.take()
+    }
+
+    /// Every run and save failure since the window opened, oldest first,
+    /// kept after its toast has been dismissed.
+    pub fn notifications(&self) -> &[job::Notification] {
+        &self.notifications
     }
 
     /// The toolbar/bottom-bar surfaces' current view of the active tab's
@@ -4686,7 +4922,6 @@ impl AppController {
         let phase = job::progress_phase(progress.as_ref());
         let tab_index = self.job.tab_id.take().and_then(|id| self.tab_index(id));
         let owner = tab_index.and_then(|i| self.state.projects.get(i));
-        let request = owner.and_then(|tab| tab.request.clone());
         let was_cancelling = owner.is_some_and(|tab| tab.run == job::RunState::Cancelling);
         let settled = job::settle(handle.join());
         self.job.control = None;
@@ -4706,41 +4941,35 @@ impl AppController {
         let tab_info = tab_index
             .and_then(|i| self.state.projects.get(i))
             .map(|tab| (project_identity_path(&tab.project), tab.title.clone()));
-        let frame_count = request.as_ref().map_or(0, |r| r.frames.len());
 
         match &settled.state {
             job::RunState::Failed(message) => {
-                self.settled_failure = Some(message.clone());
-                if let Some((path, title)) = tab_info.clone() {
-                    self.record_failure(FailureCard {
+                let operation = settled
+                    .operation
+                    .expect("settle() sets operation exactly when state is Failed");
+                let notification = job::Notification {
+                    operation,
+                    message: message.clone(),
+                    project_title: tab_info.as_ref().map(|(_, title)| title.clone()),
+                    project_path: tab_info.as_ref().map(|(path, _)| path.clone()),
+                    target: None,
+                };
+                self.notifications.push(notification.clone());
+                self.settled_failure = Some(notification);
+                if let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) {
+                    tab.failure = Some(TabFailure {
                         kind: FailureKind::Failed,
-                        path,
-                        title,
                         stage: format!("FAILED WHILE {}", phase.name().to_uppercase()),
                         reason: message.clone(),
-                        meta: format!(
-                            "{frame_count} {} · no project written",
-                            frame_word(frame_count)
-                        ),
-                        frames: frame_count,
-                        request: request.clone(),
                     });
                 }
             }
             job::RunState::Idle if was_cancelling => {
-                if let Some((path, title)) = tab_info {
-                    self.record_failure(FailureCard {
+                if let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) {
+                    tab.failure = Some(TabFailure {
                         kind: FailureKind::Cancelled,
-                        path,
-                        title,
                         stage: format!("STOPPED WHILE {}", phase.name().to_uppercase()),
                         reason: "You stopped this one. Nothing was written.".to_string(),
-                        meta: format!(
-                            "{frame_count} {} · stopped before writing",
-                            frame_word(frame_count)
-                        ),
-                        frames: frame_count,
-                        request: request.clone(),
                     });
                 }
             }
@@ -4804,7 +5033,6 @@ impl AppController {
     /// when `index` is the tab currently in view.
     fn commit_held(&mut self, index: usize, held: job::HeldCheckpoint) -> (PathBuf, PathBuf) {
         let tab = &mut self.state.projects[index];
-        let path = project_identity_path(&tab.project);
         if let Some(request) = &tab.request {
             tab.frames = request.frames.clone();
         }
@@ -4813,6 +5041,7 @@ impl AppController {
         tab.frame_sort = None;
         tab.edit = None;
         tab.thumbnail = overlay::render_thumbnail_from_frame(&held.composite).map(Arc::new);
+        tab.failure = None;
         let planes = (held.composite.clone(), held.zmap.clone());
         tab.selected_checkpoint = Some(checkpoints::held_key(tab.held.len()));
         tab.row_planes = None;
@@ -4822,11 +5051,17 @@ impl AppController {
         // set) -- refit on the next `fit_if_unfitted` rather than keep
         // drawing the old extent's zoom/pan.
         tab.viewport = None;
-        self.clear_failure(&path);
+        self.enter_editor_if_viewing(index);
+        planes
+    }
+
+    /// Switches into Editor mode when `index` is the tab currently in view --
+    /// a fuse that commits on a tab the user has since navigated away from
+    /// leaves the shell where it is.
+    fn enter_editor_if_viewing(&mut self, index: usize) {
         if self.state.active == Some(index) {
             self.set_mode(ShellMode::Editor);
         }
-        planes
     }
 
     /// The frames the active tab's parked run could not align, by file name;
@@ -4999,7 +5234,15 @@ impl AppController {
         let project = match job::save_held(&target, &tab.held, onto_existing) {
             Ok(project) => project,
             Err(err) => {
-                self.settled_failure = Some(format!("Could not save {}: {err}", target.display()));
+                let notification = job::Notification {
+                    operation: job::FailedOperation::Save,
+                    message: format!("Could not save {}: {err}", target.display()),
+                    project_title: Some(tab.title.clone()),
+                    project_path: Some(project_identity_path(&tab.project)),
+                    target: Some(target.clone()),
+                };
+                self.notifications.push(notification.clone());
+                self.settled_failure = Some(notification);
                 return false;
             }
         };
@@ -5729,8 +5972,6 @@ fn not_a_project_card(path: PathBuf) -> FailureCard {
         reason: "This folder holds something else. Nothing was read and nothing was changed."
             .to_string(),
         meta: "not read · not changed".to_string(),
-        frames: 0,
-        request: None,
     }
 }
 
