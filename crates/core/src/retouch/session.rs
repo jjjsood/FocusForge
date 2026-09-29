@@ -25,6 +25,15 @@ struct Applied {
     before: Vec<u16>,
 }
 
+/// One outstanding preview: the same region/pre-image pair as [`Applied`],
+/// minus the op itself -- a preview is never undone or redone, only
+/// discarded.
+#[derive(Debug)]
+struct PreviewEntry {
+    region: Option<Rect>,
+    before: Vec<u16>,
+}
+
 /// An edit session over one caller-chosen resident tile -- the whole map or
 /// any sub-rect. Dies with the process: nothing here is durable.
 #[derive(Debug)]
@@ -36,6 +45,10 @@ pub struct EditSession {
     apply: ApplyFn,
     applied: Vec<Applied>,
     undone: Vec<Op>,
+    /// Outstanding previews, oldest first -- each op a live stroke ticked
+    /// through [`Self::preview`] before release, restored in reverse by
+    /// [`Self::discard_preview`]. Never touched by undo or redo.
+    preview: Vec<PreviewEntry>,
 }
 
 impl EditSession {
@@ -71,6 +84,7 @@ impl EditSession {
             apply,
             applied: Vec::new(),
             undone: Vec::new(),
+            preview: Vec::new(),
         })
     }
 
@@ -80,6 +94,10 @@ impl EditSession {
 
     pub fn tile(&self) -> Rect {
         self.tile
+    }
+
+    pub fn info(&self) -> ZMapInfo {
+        self.info
     }
 
     pub fn op_count(&self) -> usize {
@@ -94,31 +112,49 @@ impl EditSession {
         !self.undone.is_empty()
     }
 
+    /// Applied ops, oldest first -- undone ops are not included.
+    pub fn ops(&self) -> impl Iterator<Item = &Op> {
+        self.applied.iter().map(|applied| &applied.op)
+    }
+
     /// Applies `op` against the session's own footprint/apply pair,
-    /// recording its dirty region and pre-image. Every refusal happens
-    /// before the first write (the applier's own contract), so `applied`
-    /// and `indices` are untouched on `Err`.
-    fn apply_op(&mut self, op: Op) -> Result<Option<Rect>, RetouchError> {
-        let footprint = (self.footprint)(&op, self.info)?;
+    /// returning its dirty region and the region's pre-image. Every refusal
+    /// happens before the first write (the applier's own contract), so
+    /// `indices` is untouched on `Err`. Shared by [`Self::apply_op`]
+    /// (permanent) and [`Self::preview`] (undone by
+    /// [`Self::discard_preview`]).
+    fn apply_and_snapshot(&mut self, op: &Op) -> Result<(Option<Rect>, Vec<u16>), RetouchError> {
+        let footprint = (self.footprint)(op, self.info)?;
         let region = footprint.and_then(|f| brush::intersect(f, self.tile));
         let before = region.map(|r| self.extract(r)).unwrap_or_default();
-        (self.apply)(&op, self.info, self.tile, &mut self.indices)?;
+        (self.apply)(op, self.info, self.tile, &mut self.indices)?;
+        Ok((region, before))
+    }
+
+    /// Applies `op` permanently, recording its dirty region and pre-image on
+    /// `applied`.
+    fn apply_op(&mut self, op: Op) -> Result<Option<Rect>, RetouchError> {
+        let (region, before) = self.apply_and_snapshot(&op)?;
         self.applied.push(Applied { op, region, before });
         Ok(region)
     }
 
-    /// Appends `op`. On success, discards the redo stack regardless of
-    /// which of the four [`Op`] variants `op` is. On `Err`, the applied
-    /// list, the redo stack and `indices` are exactly as before.
+    /// Appends `op`. Discards an outstanding preview first, so a preview
+    /// never outlives the next op. On success, discards the redo stack
+    /// regardless of which of the four [`Op`] variants `op` is. On `Err`,
+    /// the applied list, the redo stack and `indices` are exactly as before.
     pub fn append(&mut self, op: Op) -> Result<Option<Rect>, RetouchError> {
+        self.discard_preview();
         let region = self.apply_op(op)?;
         self.undone.clear();
         Ok(region)
     }
 
-    /// Steps back one op, restoring its region's pre-image. `None` means
-    /// there was nothing applied to undo.
+    /// Steps back one op, restoring its region's pre-image. Discards an
+    /// outstanding preview first. `None` means there was nothing applied to
+    /// undo.
     pub fn undo(&mut self) -> Option<Option<Rect>> {
+        self.discard_preview();
         let applied = self.applied.pop()?;
         if let Some(region) = applied.region {
             self.restore(region, &applied.before);
@@ -127,15 +163,39 @@ impl EditSession {
         Some(applied.region)
     }
 
-    /// Re-applies the most recently undone op. `None` means there was
-    /// nothing undone to redo. Does not clear the redo stack -- it empties
-    /// only by exhaustion or by a new [`Self::append`].
+    /// Re-applies the most recently undone op. Discards an outstanding
+    /// preview first. `None` means there was nothing undone to redo. Does
+    /// not clear the redo stack -- it empties only by exhaustion or by a new
+    /// [`Self::append`].
     pub fn redo(&mut self) -> Option<Option<Rect>> {
+        self.discard_preview();
         let op = self.undone.pop()?;
         let region = self
             .apply_op(op)
             .expect("an op that applied to this state before applies to it again");
         Some(region)
+    }
+
+    /// Applies `op` without recording it on the permanent op list: pushes
+    /// its region/pre-image pair onto a separate preview stack instead of
+    /// `applied`, leaving `undone` untouched. [`Self::discard_preview`]
+    /// restores every outstanding preview in LIFO order; [`Self::append`],
+    /// [`Self::undo`] and [`Self::redo`] each discard one first.
+    pub fn preview(&mut self, op: &Op) -> Result<Option<Rect>, RetouchError> {
+        let (region, before) = self.apply_and_snapshot(op)?;
+        self.preview.push(PreviewEntry { region, before });
+        Ok(region)
+    }
+
+    /// Restores every outstanding preview, most recent first, undoing them
+    /// exactly as if they had never been applied. A no-op with nothing
+    /// outstanding.
+    pub fn discard_preview(&mut self) {
+        while let Some(entry) = self.preview.pop() {
+            if let Some(region) = entry.region {
+                self.restore(region, &entry.before);
+            }
+        }
     }
 
     /// Copies `region`'s rows out of `self.indices` (tile-local, row-major).
@@ -426,6 +486,129 @@ mod tests {
         let wrong_len = vec![0u16; info.tile_len(tile) + 1];
         let err = EditSession::new(info, tile, wrong_len).unwrap_err();
         assert!(matches!(err, RetouchError::TileBufferSize { .. }));
+    }
+
+    #[test]
+    fn ops_lists_applied_oldest_first_and_drops_undone() {
+        let info = info();
+        let tile = tile();
+        let ops = [
+            stroke_op(1, vec![pt(8, 5)], 2.0, 0.0),
+            stroke_op(2, vec![pt(12, 8), pt(20, 12)], 3.0, 0.5),
+            stroke_op(3, vec![pt(30, 18)], 1.5, 0.2),
+        ];
+        let mut session = EditSession::new(info, tile, base_indices(info, tile)).unwrap();
+        assert_eq!(session.ops().count(), 0);
+        for op in &ops {
+            session.append(op.clone()).unwrap();
+        }
+        assert_eq!(session.ops().cloned().collect::<Vec<_>>(), ops.to_vec());
+        session.undo();
+        assert_eq!(
+            session.ops().cloned().collect::<Vec<_>>(),
+            ops[..2].to_vec()
+        );
+        session.redo();
+        assert_eq!(session.ops().cloned().collect::<Vec<_>>(), ops.to_vec());
+    }
+
+    /// Everything a preview must leave alone, captured for comparison.
+    fn snapshot(session: &EditSession) -> (Vec<u16>, Vec<Op>, bool, bool) {
+        (
+            session.indices().to_vec(),
+            session.ops().cloned().collect(),
+            session.can_undo(),
+            session.can_redo(),
+        )
+    }
+
+    /// Two overlapping preview segments crossing the tile's left and top
+    /// edges, joined at a shared point as a live stroke's ticks are.
+    fn preview_segments() -> [Op; 2] {
+        [
+            stroke_op(9, vec![pt(2, 1), pt(14, 9)], 3.0, 0.3),
+            stroke_op(9, vec![pt(14, 9), pt(22, 4)], 3.0, 0.3),
+        ]
+    }
+
+    #[test]
+    fn preview_then_discard_restores_exactly() {
+        let info = info();
+        let tile = tile();
+        let mut session = EditSession::new(info, tile, base_indices(info, tile)).unwrap();
+        session
+            .append(stroke_op(4, vec![pt(10, 10), pt(16, 12)], 4.0, 0.0))
+            .unwrap();
+        session
+            .append(stroke_op(6, vec![pt(24, 6)], 3.0, 0.0))
+            .unwrap();
+        session.undo();
+        let before = snapshot(&session);
+        assert!(before.3, "the redo stack is non-empty going in");
+
+        let mut painted = session.indices().to_vec();
+        for op in &preview_segments() {
+            let region = session.preview(op).unwrap();
+            assert!(region.is_some(), "each segment touches the tile");
+            crate::retouch::brush::apply(op, info, tile, &mut painted).unwrap();
+            assert_eq!(session.indices(), painted.as_slice());
+            assert_eq!(session.ops().count(), before.1.len());
+            assert!(session.can_redo(), "a preview leaves the redo stack alone");
+        }
+        assert_ne!(session.indices(), before.0.as_slice());
+
+        session.discard_preview();
+        assert_eq!(snapshot(&session), before);
+        session.discard_preview();
+        assert_eq!(snapshot(&session), before, "a second discard is a no-op");
+    }
+
+    #[test]
+    fn preview_is_discarded_before_append_undo_and_redo() {
+        let info = info();
+        let tile = tile();
+        let first = stroke_op(4, vec![pt(10, 10), pt(16, 12)], 4.0, 0.0);
+        let second = stroke_op(6, vec![pt(12, 11)], 3.0, 0.0);
+
+        // Each case: the session with a preview outstanding must end exactly
+        // where the same call leaves a session that never previewed.
+        type Call = fn(&mut EditSession, &Op);
+        let cases: [(&str, Call); 3] = [
+            ("append", |s, op| {
+                s.append(op.clone()).unwrap();
+            }),
+            ("undo", |s, _| {
+                s.undo();
+            }),
+            ("redo", |s, _| {
+                s.redo();
+            }),
+        ];
+        for (name, call) in cases {
+            let mut plain = EditSession::new(info, tile, base_indices(info, tile)).unwrap();
+            plain.append(first.clone()).unwrap();
+            if name == "redo" {
+                plain.append(second.clone()).unwrap();
+                plain.undo();
+            }
+            let mut previewed = EditSession::new(info, tile, base_indices(info, tile)).unwrap();
+            previewed.append(first.clone()).unwrap();
+            if name == "redo" {
+                previewed.append(second.clone()).unwrap();
+                previewed.undo();
+            }
+            for op in &preview_segments() {
+                previewed.preview(op).unwrap();
+            }
+
+            call(&mut plain, &second);
+            call(&mut previewed, &second);
+            assert_eq!(snapshot(&previewed), snapshot(&plain), "{name}");
+
+            // Nothing of the preview is left for a later discard to restore.
+            previewed.discard_preview();
+            assert_eq!(snapshot(&previewed), snapshot(&plain), "{name}: discard");
+        }
     }
 
     /// Append a random valid stroke, or undo, or redo.

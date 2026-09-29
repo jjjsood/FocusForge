@@ -7,6 +7,9 @@ import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
 import { FFZoomCluster } from "bottom_bar/zoom_cluster.slint";
 import { FFProgressBar } from "../components/ff_progress_bar.slint";
+import { FFToggle } from "../components/ff_toggle.slint";
+import { FFSlider } from "../components/ff_slider.slint";
+import { FFRowText } from "../components/ff_row_text.slint";
 
 // The gear's own persistently-boxed button -- the "icon button" catalogue
 // entry, whose default state already carries a visible background. Not
@@ -55,6 +58,16 @@ export component FFBottomBar inherits Rectangle {
     // "running" | "held" | "failed" -- `FFProgressBar`'s own tone vocabulary.
     in property <string> bar-tone: "running";
     in property <string> eta-text: "";
+
+    // The overlay controls, editor mode only -- absent rather than
+    // disabled in stacking, so `if root.editor-mode` gates the whole
+    // cluster below.
+    in property <bool> editor-mode: false;
+    in property <bool> overlay-on: false;
+    in property <float> overlay-fraction: 0.0;
+    in property <string> overlay-text: "";
+    callback overlay-toggled(bool);
+    callback overlay-fraction-changed(float);
 
     height: ShellGeometry.bottom-bar-height;
     background: Theme.surface-raised;
@@ -107,19 +120,22 @@ export component FFBottomBar inherits Rectangle {
 
     // Stretches with the window so its right edge stays `Theme.space-4`
     // before the ETA at every width -- 798px at the 1440px base width,
-    // never a fixed literal.
+    // never a fixed literal. In editor mode the track ends well short of
+    // that, clearing the overlay cluster, rather than being hidden.
     progress-bar := FFProgressBar {
         x: ShellGeometry.progress-bar-x;
         y: (parent.height - self.height) / 2;
-        width: parent.width - ShellGeometry.progress-eta-inset - Theme.space-4
-            - ShellGeometry.progress-bar-x;
+        width: parent.width
+            - (root.editor-mode ? ShellGeometry.progress-bar-editor-width-inset : ShellGeometry.progress-eta-inset)
+            - Theme.space-4 - ShellGeometry.progress-bar-x;
         visible: root.project-loaded;
         fraction: root.bar-fraction;
         tone: root.bar-tone;
     }
 
     eta-text := Text {
-        x: parent.width - ShellGeometry.progress-eta-inset;
+        x: root.editor-mode ? progress-bar.x + progress-bar.width + Theme.space-4
+            : parent.width - ShellGeometry.progress-eta-inset;
         y: 0px;
         height: parent.height;
         visible: root.project-loaded && root.eta-text != "";
@@ -136,6 +152,38 @@ export component FFBottomBar inherits Rectangle {
         y: 0px;
         width: parent.width;
         height: 1px;
+        background: Theme.border-default;
+    }
+
+    if root.editor-mode: overlay-caption := FFRowText {
+        x: parent.width - ShellGeometry.overlay-cluster-inset;
+        height: parent.height;
+        text: "Overlay";
+        muted: true;
+    }
+    if root.editor-mode: overlay-toggle := FFToggle {
+        x: parent.width - ShellGeometry.overlay-cluster-inset + ShellGeometry.overlay-toggle-offset;
+        y: (parent.height - self.height) / 2;
+        on: root.overlay-on;
+        toggled => { root.overlay-toggled(!root.overlay-on); }
+    }
+    if root.editor-mode: overlay-slider := FFSlider {
+        x: parent.width - ShellGeometry.overlay-cluster-inset + ShellGeometry.overlay-track-offset;
+        y: (parent.height - self.height) / 2;
+        compact: true;
+        track-width: ShellGeometry.overlay-track-width;
+        disabled: !root.overlay-on;
+        fraction: root.overlay-fraction;
+        value-text: root.overlay-text;
+        fraction-changed(f) => { root.overlay-fraction-changed(f); }
+    }
+    // Mirrors `status-rule`'s own divider, separating the overlay cluster
+    // from the zoom cluster.
+    if root.editor-mode: Rectangle {
+        x: parent.width - ShellGeometry.overlay-cluster-inset + ShellGeometry.overlay-rule-offset;
+        y: (parent.height - self.height) / 2;
+        width: 1px;
+        height: 20px;
         background: Theme.border-default;
     }
 

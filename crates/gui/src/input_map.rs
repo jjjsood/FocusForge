@@ -176,8 +176,8 @@ impl fmt::Display for Trigger {
     }
 }
 
-/// The ten actions the table can name. `ZoomAtCursor`, `Pan` and
-/// `PanHorizontal` are implemented; the remaining seven are not.
+/// The eleven actions the table can name. Every action but `OverlayOpacity`
+/// is implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     ZoomAtCursor,
@@ -190,10 +190,11 @@ pub enum Action {
     Undo,
     Redo,
     PickSourceUnderPointer,
+    Paint,
 }
 
 impl Action {
-    pub const ALL: [Action; 10] = [
+    pub const ALL: [Action; 11] = [
         Action::ZoomAtCursor,
         Action::StepSourceFrame,
         Action::PanHorizontal,
@@ -204,17 +205,12 @@ impl Action {
         Action::Undo,
         Action::Redo,
         Action::PickSourceUnderPointer,
+        Action::Paint,
     ];
 
-    /// `true` for `ZoomAtCursor`, `Pan` and `PanHorizontal`; `false` for
-    /// the remaining seven: `StepSourceFrame`, `OverlayOpacity`,
-    /// `BrushSize`, `BrushSoftness`, `Undo`, `Redo`,
-    /// `PickSourceUnderPointer`.
+    /// `true` for every action but `OverlayOpacity`.
     pub fn implemented(&self) -> bool {
-        matches!(
-            self,
-            Action::ZoomAtCursor | Action::Pan | Action::PanHorizontal
-        )
+        !matches!(self, Action::OverlayOpacity)
     }
 }
 
@@ -223,7 +219,7 @@ impl Action {
 #[error(
     "unknown action {spelling:?} -- accepted actions: zoom-at-cursor, step-source-frame, \
      pan-horizontal, overlay-opacity, pan, brush-size, brush-softness, undo, redo, \
-     pick-source-under-pointer"
+     pick-source-under-pointer, paint"
 )]
 pub struct ActionParseError {
     pub spelling: String,
@@ -244,6 +240,7 @@ impl FromStr for Action {
             "undo" => Ok(Action::Undo),
             "redo" => Ok(Action::Redo),
             "pick-source-under-pointer" => Ok(Action::PickSourceUnderPointer),
+            "paint" => Ok(Action::Paint),
             _ => Err(ActionParseError {
                 spelling: s.to_string(),
             }),
@@ -264,6 +261,7 @@ impl fmt::Display for Action {
             Action::Undo => "undo",
             Action::Redo => "redo",
             Action::PickSourceUnderPointer => "pick-source-under-pointer",
+            Action::Paint => "paint",
         };
         write!(f, "{s}")
     }
@@ -279,9 +277,10 @@ pub struct Binding {
 
 const M: Modifiers = Modifiers::NONE;
 
-/// Nine trigger-keyed entries, presented as seven display rows;
+/// Ten trigger-keyed entries, presented as seven display rows -- the tenth
+/// (`Paint`'s drag) is a hidden row, absent from `DISPLAY_GROUPS`.
 /// `defaults_match_the_settled_table` asserts the mapping row for row.
-pub const DEFAULT_BINDINGS: [Binding; 9] = [
+pub const DEFAULT_BINDINGS: [Binding; 10] = [
     Binding {
         trigger: Trigger::Wheel(M),
         stacking: Some(Action::ZoomAtCursor),
@@ -345,6 +344,14 @@ pub const DEFAULT_BINDINGS: [Binding; 9] = [
         },
         stacking: Some(Action::PickSourceUnderPointer),
         editor: Some(Action::PickSourceUnderPointer),
+    },
+    Binding {
+        trigger: Trigger::Drag {
+            button: Button::Left,
+            mods: M,
+        },
+        stacking: None,
+        editor: Some(Action::Paint),
     },
 ];
 

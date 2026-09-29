@@ -30,6 +30,10 @@ export component FFImageRow inherits Rectangle {
     // slot -- softened and shadowed so it reads as lifted off the surface
     // instead of a second solid row.
     in property <bool> floating: false;
+    // The editor's read-only legend: the trailing column is a position
+    // number rather than a capture time -- `mutable` stays `false`
+    // throughout, so the grip/exclude/bin never show alongside it.
+    in property <bool> legend: false;
 
     callback exclude-toggled();
     callback remove-requested();
@@ -45,13 +49,13 @@ export component FFImageRow inherits Rectangle {
     drop-shadow-offset-y: Theme.space-1;
     drop-shadow-blur: Theme.space-2;
 
-    property <bool> interactive: !root.unresolved && root.mutable;
-    property <bool> show-controls: root.interactive && !root.dragging && (root.hovered || area.has-hover);
+    property <bool> interactive: !root.unresolved && (root.mutable || root.legend);
+    property <bool> show-controls: root.mutable && root.interactive && !root.dragging && (root.hovered || area.has-hover);
     // The grip's touch surface must stay mounted for the whole gesture it
     // starts, including while `dragging` hides its icon -- tearing it down
     // mid-grab (as `show-controls` alone would) drops the release the drag
     // needs to land.
-    property <bool> grip-mounted: root.interactive && (root.dragging || root.hovered || area.has-hover);
+    property <bool> grip-mounted: root.mutable && root.interactive && (root.dragging || root.hovered || area.has-hover);
     property <color> label-color: root.unresolved ? Theme.text-disabled
         : root.excluded ? Theme.text-muted
         : Theme.text-primary;

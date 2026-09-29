@@ -19,9 +19,15 @@ export component FFButton inherits Rectangle {
     in property <image> icon-source;
     in property <bool> has-icon: false;
     in property <bool> enabled: true;
+    // While true, a disabled button keeps its normal fill at full opacity
+    // and dims only the label to `Theme.text-disabled`, instead of halving
+    // the whole button's opacity.
+    in property <bool> dim-label-only: false;
     callback clicked();
 
-    property <color> label-color: (root.kind == "primary" || root.kind == "danger")
+    property <color> label-color: !root.enabled && root.dim-label-only
+        ? Theme.text-disabled
+        : (root.kind == "primary" || root.kind == "danger")
         ? Theme.text-on-accent
         : root.kind == "quiet" ? Theme.text-muted : Theme.text-primary;
 
@@ -38,7 +44,7 @@ export component FFButton inherits Rectangle {
         : Theme.surface-overlay;
     border-width: root.kind == "outlined" ? 1px : 0px;
     border-color: Theme.border-strong;
-    opacity: root.enabled ? 1.0 : 0.5;
+    opacity: root.dim-label-only ? 1.0 : (root.enabled ? 1.0 : 0.5);
 
     area := TouchArea {
         enabled: root.enabled;

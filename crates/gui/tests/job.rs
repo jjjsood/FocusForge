@@ -1385,6 +1385,7 @@ fn sealed_project_with_as_given_sources(name: &str) -> PathBuf {
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
+        registration: focusforge_core::align::Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: project::Metrics::default(),
@@ -2722,29 +2723,6 @@ fn refuse_after_save_leaves_the_file_untouched() {
     assert_eq!(chain_len(&path), 4, "two fuses since the last save");
 }
 
-/// Chmods `dir` `0o555`/`0o755`. Locking (`read_only: true`) probes with a
-/// write; when the probe still succeeds -- the temporary directory's
-/// filesystem ignores permission bits -- restores `0o755`, prints a neutral
-/// skip line naming `dir`, and returns `false`; the caller must return
-/// immediately. Otherwise returns `true`.
-#[cfg(unix)]
-fn set_read_only(dir: &Path, read_only: bool) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = if read_only { 0o555 } else { 0o755 };
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
-    if !read_only {
-        return true;
-    }
-    let probe = dir.join(".write-probe");
-    if std::fs::write(&probe, b"x").is_ok() {
-        let _ = std::fs::remove_file(&probe);
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        eprintln!("skipping: {} does not enforce permissions", dir.display());
-        return false;
-    }
-    true
-}
-
 #[cfg(unix)]
 #[test]
 fn a_failed_save_keeps_the_project_in_memory() {
@@ -2781,14 +2759,12 @@ fn a_failed_save_keeps_the_project_in_memory() {
     );
     still_in_memory(&mut controller);
 
-    let empty = tempfile::tempdir().unwrap();
-    let target = empty.path().join("saved.ffp");
-    if !set_read_only(empty.path(), true) {
+    let Some(empty) = common::readonly_dir("failed_save_read_only_empty", 0o555, |_| {}) else {
         return;
-    }
+    };
+    let target = empty.join("saved.ffp");
     let saved = controller.save_active_project(|_| Some(target.clone()));
-    let left = listing(empty.path());
-    set_read_only(empty.path(), false);
+    let left = listing(&empty);
     assert!(!saved);
     assert!(left.is_empty(), "nothing was left behind: {left:?}");
     let notification = controller
@@ -2809,15 +2785,14 @@ fn a_failed_save_keeps_the_project_in_memory() {
     assert_eq!(controller.notifications().len(), 1);
     still_in_memory(&mut controller);
 
-    let holding = tempfile::tempdir().unwrap();
-    let existing = holding.path().join("existing.ffp");
-    std::fs::write(&existing, b"an earlier project").unwrap();
-    if !set_read_only(holding.path(), true) {
+    let Some(holding) = common::readonly_dir("failed_save_read_only_existing", 0o555, |dir| {
+        std::fs::write(dir.join("existing.ffp"), b"an earlier project").unwrap();
+    }) else {
         return;
-    }
+    };
+    let existing = holding.join("existing.ffp");
     let saved = controller.save_active_project(|_| Some(existing.clone()));
-    let left = listing(holding.path());
-    set_read_only(holding.path(), false);
+    let left = listing(&holding);
     assert!(!saved);
     assert_eq!(left, [PathBuf::from("existing.ffp")]);
     assert_eq!(std::fs::read(&existing).unwrap(), b"an earlier project");

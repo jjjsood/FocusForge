@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::align::Registration;
 use crate::params::ParamValues;
 use crate::tile::Rect;
 
@@ -41,6 +42,11 @@ pub struct Manifest {
     pub params: ParamValues,
     /// `None` when the run was `--no-align`.
     pub align: Option<AlignRecord>,
+    /// Every frame's transform and the applied crop, so a frame can be read
+    /// "as fused" without re-deriving either. Additive: a manifest written
+    /// before this field existed opens with [`Registration::default`].
+    #[serde(default)]
+    pub registration: Registration,
     pub sources: Vec<SourceRef>,
     pub composite: PlaneRef,
     pub zmap: PlaneRef,

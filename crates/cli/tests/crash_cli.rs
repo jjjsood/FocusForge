@@ -146,15 +146,13 @@ fn previous_hook_chained() {
     assert!(path.is_file());
 }
 
-#[test]
 #[cfg(unix)]
+#[test]
 fn unwritable_crash_dir() {
-    let readonly = tempfile::tempdir().unwrap();
-    if !common::make_read_only(readonly.path()) {
+    let Some(readonly) = common::readonly_dir("crash_cli_unwritable", 0o500, |_| {}) else {
         return;
-    }
-
-    let data_dir = readonly.path().join("data");
+    };
+    let data_dir = readonly.join("data");
     let mut cmd = common::cli_bin("crash_cli_unwritable_run");
     let output = cmd
         .env("FOCUSFORGE_DATA_DIR", &data_dir)
@@ -162,8 +160,6 @@ fn unwritable_crash_dir() {
         .arg("algorithms")
         .output()
         .expect("failed to run the binary");
-
-    common::make_writable(readonly.path());
 
     assert_eq!(output.status.code(), Some(101));
     let stderr = String::from_utf8_lossy(&output.stderr);

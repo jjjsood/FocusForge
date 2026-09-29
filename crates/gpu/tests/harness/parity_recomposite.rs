@@ -4,6 +4,7 @@
 //! `fixtures/mantis-512`. The gather is a pure `u16` copy, integer
 //! throughout on both sides, so the expected worst |delta| is exactly 0.
 
+use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::retouch::recomposite::{Sources, recomposite as recomposite_cpu};
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{NO_SOURCE, ZMapReader};
@@ -96,6 +97,58 @@ fn recomposite_parity_matches_cpu() {
             "expected bit-exact agreement -- the gather is a pure u16 copy"
         );
     }
+}
+
+#[test]
+fn recomposite_parity_through_warped_reader_at_non_zero_origin() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+
+    let stack = focusforge_core::io::TiffStack::open(common::mantis_512_dir())
+        .expect("open fixture frames");
+    let zmap = ZMapReader::open(&golden_zmap_path()).expect("open golden zmap");
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let frame_count = zmap.frame_count();
+
+    // Integer shifts, alternating sign -- exact under the warp's
+    // Catmull-Rom kernel at a zero fractional part, the same reader the
+    // fuse itself builds.
+    let transforms: Vec<Transform> = (0..frame_count as usize)
+        .map(|i| {
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            Transform::translation(sign * 6.0, sign * -4.0)
+        })
+        .collect();
+    let warping = WarpingReader::new(&stack, (width, height), spp, transforms);
+
+    let origin = (5, 3);
+    let region = Rect {
+        x: 101,
+        y: 57,
+        width: 200,
+        height: 150,
+    };
+    let mut indices = vec![0u16; zmap.info().tile_len(region)];
+    zmap.read_tile_into(region, &mut indices)
+        .expect("read zmap region");
+
+    let sources = Sources {
+        reader: &warping,
+        frame_count,
+        samples_per_pixel: spp,
+        origin,
+    };
+    let (gpu_out, cpu_out) = run_both(&indices, region, &sources, shared);
+    let (worst, worst_index) = worst_delta(&gpu_out, &cpu_out);
+    println!(
+        "recomposite through a warped reader at origin {origin:?}: worst |delta|={worst} at sample index {worst_index}"
+    );
+    assert_eq!(
+        worst, 0,
+        "expected bit-exact agreement -- integer shifts are exact under the warp kernel"
+    );
 }
 
 #[test]

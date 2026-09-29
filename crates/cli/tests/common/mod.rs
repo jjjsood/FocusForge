@@ -78,38 +78,6 @@ pub fn tmp_dir(name: &str) -> TmpDir {
     TmpDir { path }
 }
 
-/// Chmods `dir` to `0o555` and probes it with a write. If the filesystem
-/// ignores the permission bits, restores `0o755`, prints a skip line, and
-/// returns `false`; otherwise leaves `dir` locked and returns `true`.
-///
-/// `#[allow(dead_code)]`: not every test binary in this crate calls this
-/// helper.
-#[allow(dead_code)]
-#[cfg(unix)]
-pub fn make_read_only(dir: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let probe = dir.join(".write-probe");
-    if std::fs::write(&probe, b"x").is_ok() {
-        let _ = std::fs::remove_file(&probe);
-        make_writable(dir);
-        eprintln!("skipping: {} does not enforce permissions", dir.display());
-        return false;
-    }
-    true
-}
-
-/// Restores `dir` to `0o755` after [`make_read_only`].
-///
-/// `#[allow(dead_code)]`: not every test binary in this crate calls this
-/// helper.
-#[allow(dead_code)]
-#[cfg(unix)]
-pub fn make_writable(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
-
 /// Appends `--no-gpu` to `args` when this crate's own `gpu` feature is
 /// compiled in -- a no-op build has no such flag at all, not even as a
 /// no-op (`crates/cli/src/main.rs`'s own `#[cfg(feature = "gpu")]` on the
@@ -154,4 +122,71 @@ pub fn data_dir_of(cmd: &Command) -> PathBuf {
         .and_then(|(_, v)| v)
         .map(PathBuf::from)
         .expect("cli_bin always sets FOCUSFORGE_DATA_DIR")
+}
+
+/// A directory built with `tempfile`, which honours `TMPDIR` and so lives on
+/// a filesystem where a mode change actually takes effect. Restores a
+/// writable mode before its own `TempDir` removes it.
+#[allow(dead_code)]
+#[cfg(unix)]
+pub struct ReadOnlyDir {
+    dir: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl std::ops::Deref for ReadOnlyDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnlyDir {
+    fn drop(&mut self) {
+        let _ = set_mode(self.dir.path(), 0o755);
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+}
+
+/// Tries to create and remove a marker file in `dir`; `true` means the
+/// directory is still writable, so a mode change meant to block that either
+/// failed or has no effect on this filesystem.
+#[cfg(unix)]
+fn still_writable(dir: &Path) -> bool {
+    let marker = dir.join(".readonly-probe");
+    match std::fs::write(&marker, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&marker);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// A fresh directory: `populate` fills it in while still writable, then
+/// `mode` is applied and proven to actually block writes. When that proof
+/// fails, undoes the mode change, prints a one-line skip notice to stderr,
+/// and returns `None`.
+#[allow(dead_code)]
+#[cfg(unix)]
+pub fn readonly_dir(label: &str, mode: u32, populate: impl FnOnce(&Path)) -> Option<ReadOnlyDir> {
+    let dir = tempfile::Builder::new()
+        .prefix(label)
+        .tempdir()
+        .expect("temp directory must be creatable");
+    populate(dir.path());
+    set_mode(dir.path(), mode).expect("mode must be settable");
+    if still_writable(dir.path()) {
+        let _ = set_mode(dir.path(), 0o755);
+        eprintln!("skipping {label}: this filesystem does not enforce directory permissions");
+        return None;
+    }
+    Some(ReadOnlyDir { dir })
 }

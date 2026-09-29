@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The `NO_SOURCE` legend entry: pinned below the editor's scrolling `Images`
+// list, never one of its numbered rows.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFNoSourceRow inherits Rectangle {
+    height: ShellGeometry.image-row-height;
+
+    HorizontalLayout {
+        x: ShellGeometry.image-row-content-inset;
+        width: ShellGeometry.image-row-content-width;
+        height: 100%;
+        spacing: Theme.space-2;
+
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: ShellGeometry.image-chip-size;
+                height: ShellGeometry.image-chip-size;
+                border-radius: Theme.radius-sm;
+                background: Theme.border-default;
+
+                Image {
+                    source: @image-url("../../../../assets/icons/minus.svg");
+                    colorize: Theme.text-muted;
+                    width: Theme.icon-sm;
+                    height: Theme.icon-sm;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                }
+            }
+        }
+
+        Text {
+            text: "No source";
+            color: Theme.text-muted;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+
+        Text {
+            text: "—";
+            color: Theme.text-muted;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+        }
+    }
+}

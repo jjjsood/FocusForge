@@ -15,15 +15,25 @@ export component FFIconButton inherits Rectangle {
     // Whether the pointer lifts the glyph to `Theme.text-primary` -- off for
     // a glyph that must read the same colour at rest and under the pointer.
     in property <bool> recolor-on-hover: true;
+    // The bar form: `Theme.surface-overlay` at rest while enabled; disabled
+    // it drops the fill and draws the glyph in `Theme.text-disabled` at full
+    // opacity.
+    in property <bool> filled: false;
+    // An armed toggle: accent fill, glyph in `Theme.text-on-accent`.
+    in property <bool> selected: false;
     callback triggered();
 
     width: root.glyph-size + 2 * root.pad;
     height: self.width;
-    background: area.has-hover && root.enabled ? Theme.surface-hover : transparent;
+    background: root.selected ? Theme.accent-default
+        : root.enabled && area.has-hover ? Theme.surface-hover
+        : root.enabled && root.filled ? Theme.surface-overlay
+        : transparent;
     border-radius: Theme.radius-sm;
-    opacity: root.enabled ? 1.0 : 0.5;
+    opacity: root.enabled || root.filled ? 1.0 : 0.5;
     accessible-role: button;
     accessible-enabled: root.enabled;
+    accessible-checked: root.selected;
 
     area := TouchArea {
         enabled: root.enabled;
@@ -31,8 +41,9 @@ export component FFIconButton inherits Rectangle {
     }
     Image {
         source: root.icon;
-        colorize: root.recolor-on-hover && area.has-hover && root.enabled
-            ? Theme.text-primary
+        colorize: root.selected ? Theme.text-on-accent
+            : !root.enabled && root.filled ? Theme.text-disabled
+            : root.recolor-on-hover && area.has-hover && root.enabled ? Theme.text-primary
             : Theme.text-secondary;
         width: root.glyph-size;
         height: root.glyph-size;

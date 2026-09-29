@@ -832,6 +832,23 @@ mod tests {
     }
 
     #[test]
+    fn discard_reports_the_directory_it_could_not_remove() {
+        let scratch = tmp_dir("discard-gone");
+        let store = ResumeStore::open(&scratch).unwrap();
+        let record = sample_record(&scratch, "out.tif");
+        let ledger = store.begin(&record).unwrap();
+        let dir = ledger.dir().to_path_buf();
+        // Removed out from under the ledger: `remove_dir_all` must still
+        // name this directory in its error, not panic or report success.
+        fs::remove_dir_all(&dir).unwrap();
+        match ledger.discard() {
+            Err(ResumeError::Io { path, .. }) => assert_eq!(path, dir),
+            other => panic!("expected ResumeError::Io naming {dir:?}, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
     fn alignment_round_trips_through_the_ledger() {
         let scratch = tmp_dir("alignment");
         let store = ResumeStore::open(&scratch).unwrap();

@@ -30,6 +30,7 @@ use super::manifest::{
     SourceResolution,
 };
 use super::{FORMAT_VERSION, HASH_ALGORITHM};
+use crate::align::Registration;
 use crate::params::ParamValues;
 
 /// Everything one seal needs. Borrowed rather than owned: the caller
@@ -45,6 +46,8 @@ pub struct SealRequest<'a> {
     pub algorithm: &'a str,
     pub params: &'a ParamValues,
     pub align: Option<AlignRecord>,
+    /// Every frame's transform and the applied crop.
+    pub registration: Registration,
     /// Exactly the `ImageDescription` the staged composite carries, so
     /// `export` re-emits a byte-identical TIFF.
     pub composite_description: String,
@@ -144,6 +147,7 @@ fn seal_staged(
         algorithm: request.algorithm.to_string(),
         params: request.params.clone(),
         align: request.align.clone(),
+        registration: request.registration.clone(),
         sources,
         composite: PlaneRef {
             blob: composite.hash.clone(),
@@ -216,6 +220,8 @@ pub struct HeldCheckpoint {
     pub algorithm: String,
     pub params: ParamValues,
     pub align: Option<AlignRecord>,
+    /// Every frame's transform and the applied crop.
+    pub registration: Registration,
     /// Exactly the `ImageDescription` the composite carries.
     pub composite_description: String,
     pub metrics: Metrics,
@@ -273,6 +279,7 @@ fn seal_chain(
                     algorithm: &checkpoint.algorithm,
                     params: &checkpoint.params,
                     align: checkpoint.align.clone(),
+                    registration: checkpoint.registration.clone(),
                     composite_description: checkpoint.composite_description.clone(),
                     label: None,
                     metrics: checkpoint.metrics,
@@ -289,6 +296,7 @@ fn seal_chain(
                     algorithm: &checkpoint.algorithm,
                     params: &checkpoint.params,
                     align: checkpoint.align.clone(),
+                    registration: checkpoint.registration.clone(),
                     composite_description: checkpoint.composite_description.clone(),
                     label: None,
                     metrics: checkpoint.metrics,

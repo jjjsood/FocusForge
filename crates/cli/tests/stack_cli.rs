@@ -1079,15 +1079,14 @@ fn stage_timings_do_not_change_the_output() {
 /// A read-only `-o` directory passes the checks before the run (it *is*
 /// a directory), lets fusion finish, and only fails when sealing tries
 /// to create the container's `.partial`.
-#[test]
 #[cfg(unix)]
+#[test]
 fn failed_seal_leaves_no_output() {
-    let cwd = tmp_dir("failed_seal_leaves_no_output");
-    let out_dir = tempfile::tempdir().unwrap();
-    let output = out_dir.path().join("mantis-512.ffp");
-    if !common::make_read_only(out_dir.path()) {
+    let Some(out_dir) = common::readonly_dir("failed_seal_leaves_no_output", 0o555, |_| {}) else {
         return;
-    }
+    };
+    let cwd = tmp_dir("failed_seal_leaves_no_output");
+    let output = out_dir.join("mantis-512.ffp");
 
     let out = run_cli_in(
         &cwd,
@@ -1095,16 +1094,13 @@ fn failed_seal_leaves_no_output() {
             "stack",
             mantis_512_dir().to_str().unwrap(),
             "-o",
-            out_dir.path().to_str().unwrap(),
+            out_dir.to_str().unwrap(),
             "--algo",
             "dummy-stack",
             "--no-align",
             "--no-crop",
         ],
     );
-    // Restore before asserting, so a failed assertion still leaves a
-    // removable directory behind.
-    common::make_writable(out_dir.path());
 
     assert!(
         !out.success,
@@ -1117,7 +1113,7 @@ fn failed_seal_leaves_no_output() {
         "no .partial may survive a failed seal"
     );
     assert!(
-        std::fs::read_dir(out_dir.path()).unwrap().next().is_none(),
+        std::fs::read_dir(&*out_dir).unwrap().next().is_none(),
         "the failed seal left something behind in the output directory"
     );
 }

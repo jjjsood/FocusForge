@@ -101,21 +101,19 @@ fn json_lines_every_line_parses_as_an_object_with_the_required_keys() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn unwritable_data_directory_falls_back_to_stderr_alone() {
     let mut cmd = common::cli_bin("diagnostics_cli_unwritable");
-    let data_dir = tempfile::tempdir().unwrap();
-    cmd.env("FOCUSFORGE_DATA_DIR", data_dir.path());
-    if !common::make_read_only(data_dir.path()) {
+    let Some(data_dir) = common::readonly_dir("diagnostics_cli_unwritable", 0o555, |_| {}) else {
         return;
-    }
+    };
+    cmd.env("FOCUSFORGE_DATA_DIR", &*data_dir);
 
     let output = cmd
         .args(["info", fixture().to_str().unwrap()])
         .output()
         .expect("failed to run binary");
-
-    common::make_writable(data_dir.path());
 
     assert!(
         output.status.success(),
@@ -128,33 +126,20 @@ fn unwritable_data_directory_falls_back_to_stderr_alone() {
         "expected exactly one note line, got: {stderr}"
     );
     assert!(stderr.contains("no log file"));
-    assert!(
-        !log_path(data_dir.path()).exists(),
-        "no log file must be written"
-    );
-}
-
-/// A directory locked read-only through [`common::make_read_only`], so a
-/// `--status` path inside it is refused by the filesystem itself. `None`
-/// when the probe shows the filesystem does not enforce permissions.
-fn unwritable_dir() -> Option<tempfile::TempDir> {
-    let dir = tempfile::tempdir().unwrap();
-    if !common::make_read_only(dir.path()) {
-        return None;
-    }
-    Some(dir)
+    assert!(!log_path(&data_dir).exists(), "no log file must be written");
 }
 
 /// A `stack` invocation that warns (its `--status` path cannot be written)
 /// and then refuses (no `--algo`), so one spawn carries both a mirrored
-/// warning and a mirrored refusal. `None` when the locked directory's probe
-/// shows the filesystem does not enforce permissions.
+/// warning and a mirrored refusal. `None` when this filesystem does not
+/// enforce the read-only directory the warning depends on.
+#[cfg(unix)]
 fn warn_and_refuse(
     label: &str,
     verbose: bool,
-) -> Option<(std::process::Command, PathBuf, tempfile::TempDir)> {
-    let dir = unwritable_dir()?;
-    let status = dir.path().join("status.ndjson");
+) -> Option<(std::process::Command, common::ReadOnlyDir, PathBuf)> {
+    let dir = common::readonly_dir(label, 0o555, |_| {})?;
+    let status = dir.join("status.ndjson");
     let mut cmd = common::cli_bin(label);
     if verbose {
         cmd.arg("-v");
@@ -165,24 +150,24 @@ fn warn_and_refuse(
         "--status",
         status.to_str().unwrap(),
     ]);
-    Some((cmd, status, dir))
+    Some((cmd, dir, status))
 }
 
 fn count_lines(stderr: &str, needle: &str) -> usize {
     stderr.lines().filter(|line| line.contains(needle)).count()
 }
 
+#[cfg(unix)]
 #[test]
 fn mirrored_output_prints_once() {
     for (label, verbose) in [
         ("diagnostics_cli_mirror_default", false),
         ("diagnostics_cli_mirror_verbose", true),
     ] {
-        let Some((mut cmd, status, dir)) = warn_and_refuse(label, verbose) else {
+        let Some((mut cmd, _dir, status)) = warn_and_refuse(label, verbose) else {
             return;
         };
         let output = cmd.output().expect("failed to run binary");
-        common::make_writable(dir.path());
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         assert_eq!(
@@ -207,14 +192,15 @@ fn mirrored_output_prints_once() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn refusal_reaches_the_log() {
-    let Some((mut cmd, status, dir)) = warn_and_refuse("diagnostics_cli_refusal_log", false) else {
+    let Some((mut cmd, _dir, status)) = warn_and_refuse("diagnostics_cli_refusal_log", false)
+    else {
         return;
     };
     let data_dir = common::data_dir_of(&cmd);
     let output = cmd.output().expect("failed to run binary");
-    common::make_writable(dir.path());
     assert!(!output.status.success());
 
     let path = log_path(&data_dir);

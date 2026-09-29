@@ -16,6 +16,8 @@
 
 mod error;
 
+use std::num::NonZeroU32;
+
 pub use crate::params::StackContext;
 use crate::params::{ParamDesc, ParamValue, ParamValues};
 use crate::tile::{Rect, Tile};
@@ -104,6 +106,58 @@ pub trait TileReader: Send + Sync {
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), AlgorithmError>;
+}
+
+/// Reads every `step`-th row and column of `rect` from `frame` through
+/// `reader`, same output contract as
+/// [`crate::io::TiffStack::read_tile_step_into`]: `out.len()` must equal
+/// `rect.width.div_ceil(step) * rect.height.div_ceil(step) *
+/// samples_per_pixel`. One 1-row read per sampled row, keeping every
+/// `step`-th column: `step` more reads, not `step^2`.
+pub fn read_tile_step_into(
+    reader: &dyn TileReader,
+    frame: usize,
+    rect: Rect,
+    step: NonZeroU32,
+    samples_per_pixel: u32,
+    out: &mut [u16],
+) -> Result<(), AlgorithmError> {
+    let step = step.get();
+    if step == 1 {
+        return reader.read_tile_into(frame, rect, out);
+    }
+
+    let spp = samples_per_pixel as usize;
+    let out_width = rect.width.div_ceil(step);
+    let out_height = rect.height.div_ceil(step);
+    let expected = out_width as usize * out_height as usize * spp;
+    if out.len() != expected {
+        return Err(AlgorithmError::Failed {
+            algorithm: "read_tile_step_into".to_string(),
+            detail: format!(
+                "buffer size mismatch: expected {expected} u16 samples, got {}",
+                out.len()
+            ),
+        });
+    }
+
+    let mut row_buf = vec![0u16; rect.width as usize * spp];
+    for out_row in 0..out_height {
+        let row_rect = Rect {
+            x: rect.x,
+            y: rect.y + out_row * step,
+            width: rect.width,
+            height: 1,
+        };
+        reader.read_tile_into(frame, row_rect, &mut row_buf)?;
+        let dest_start = (out_row * out_width) as usize * spp;
+        for out_col in 0..out_width {
+            let src = out_col as usize * step as usize * spp;
+            let dest = dest_start + out_col as usize * spp;
+            out[dest..dest + spp].copy_from_slice(&row_buf[src..src + spp]);
+        }
+    }
+    Ok(())
 }
 
 /// What an [`AlignAlgorithm::align_frame`] call sees: the facts about the

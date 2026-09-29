@@ -156,6 +156,12 @@ export component FFSettingsModal inherits Rectangle {
         width: 100%;
         height: 100%;
         background: Theme.surface-canvas.with-alpha(0.6);
+
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            scroll-event(e) => { accept }
+        }
     }
 
     panel := Rectangle {

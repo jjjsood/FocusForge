@@ -4,17 +4,18 @@
 
 ```
 crates/core/   TIFF and RAW I/O, tiles, stacking and alignment algorithms, the
-               Z-Map, the job engine (pause/resume/cancel over tile-sized
-               work units), the stage cache, grouping proposals and the
-               `.ffp` project container
+               Z-Map and its retouch op log (brush strokes, undo/redo, the
+               rainbow overlay palette), the job engine (pause/resume/cancel
+               over tile-sized work units), the stage cache, grouping
+               proposals and the `.ffp` project container
 crates/gpu/    the shared wgpu device, WGSL fusion/warp kernels and the
                tile-scheduler pipeline that runs them, behind the `gpu`
                feature (on by default). An allocate-and-back-off probe at
                startup discovers the device's usable VRAM budget, mirroring
                `crates/core`'s own host-memory budget one crate over
-crates/cli/    focusforge-cli, the headless interface: every algorithm and
+crates/cli/    focusforge-cli, the headless interface: every algorithm,
                every batch-run control (grouping, presets, resume, review,
-               the stage cache) is reachable here
+               the stage cache) and the retouch op list are reachable here
 crates/diagnostics/ the shared `tracing` subscriber (stderr sink, rotating
                JSON Lines file), the panic hook and its in-memory flight
                recorder, the native-crash monitor process and the
@@ -22,11 +23,12 @@ crates/diagnostics/ the shared `tracing` subscriber (stderr sink, rotating
                `crates/gui`, never by `crates/core` or `crates/gpu`
 crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
                strip, projects overlay, settings modal), a wgpu-backed
-               canvas that renders a composite/Z-Map pair, a fuse worker
-               that drives `crates/core`'s own job engine on a background
-               thread, a load worker that walks a folder and decodes a
-               thumbnail off the event-loop thread, and a keyboard/mouse
-               binding table read from `input.toml`
+               canvas that renders a composite/Z-Map pair and, in editor
+               mode, a brush and pipette over a live recomposite, a fuse
+               worker that drives `crates/core`'s own job engine on a
+               background thread, a load worker that walks a folder and
+               decodes a thumbnail off the event-loop thread, and a
+               keyboard/mouse binding table read from `input.toml`
 spikes/        standalone, workspace-excluded feasibility spikes
 fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the test suite
 ```
@@ -46,9 +48,9 @@ fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the tes
   --no-default-features` never needs a GPU or a Vulkan/Metal/DX12-capable
   driver.
 - `focusforge-cli`: `clap`, `serde`/`serde_json`, `toml`, `signal-hook`
-  (SIGINT/SIGUSR1 handling for `stack`'s pause/resume/cancel controls), and
-  the same `gpu` feature forwarded to enable `--no-gpu` and the automatic
-  GPU path on `stack`/`align`.
+  (SIGINT/SIGUSR1 handling for `stack`'s pause/resume/cancel controls), `png`
+  (`retouch --overlay`'s PNG output), and the same `gpu` feature forwarded
+  to enable `--no-gpu` and the automatic GPU path on `stack`/`align`.
 - `focusforge-gui`: `slint = "~1.17"` (`default-features = false`, features
   `std`, `compat-1-2`, `backend-winit`, `renderer-femtovg-wgpu`,
   `unstable-wgpu-29` pinned to the same wgpu major `focusforge-gpu`
@@ -81,18 +83,22 @@ the reader, the tile scheduler's memory budget, the Z-Map reader and
 writer, each stacking algorithm's fusion output, the pyramidal ECC solver
 and its warp and auto-crop stages, the job engine's pause/resume/cancel
 control loop, the stage cache, grouping proposals and the `.ffp` project
-container's read/write round trip, and the `focusforge-cli
-stack`/`align`/`algorithms`/`export`/`review`/`cache`/`diagnostics` commands
-end to end -- including a forced panic, a forced native crash and the
-crash notice on the next start, each driven by spawning the built binary as
-a child process so a deliberate crash never takes down the test runner --
-plus the fixture manifest. `crates/gui` has its own suite — the theme
-tokens, the plain-Rust shell and canvas state, the viewport arithmetic, the
-input-binding table and its `input.toml` file format, classifying a folder,
-a dropped set of frames or a saved project into tabs, the `Images` and
-`Settings` dock panels, the projects overlay's gallery and failure cards,
-and the fuse worker's pause/resume/cancel/retry states all run headlessly
-through `i-slint-backend-testing`, with no real window; a separate windowed
+container's read/write round trip, the retouch op log (brush strokes,
+undo/redo, the rainbow overlay palette) replayed against a whole-map
+oracle, and the `focusforge-cli
+stack`/`align`/`algorithms`/`export`/`retouch`/`review`/`cache`/`diagnostics`
+commands end to end -- including a forced panic, a forced native crash and
+the crash notice on the next start, each driven by spawning the built
+binary as a child process so a deliberate crash never takes down the test
+runner -- plus the fixture manifest. `crates/gui` has its own suite — the
+theme tokens, the plain-Rust shell and canvas state, the viewport
+arithmetic, the input-binding table and its `input.toml` file format,
+classifying a folder, a dropped set of frames or a saved project into tabs,
+the `Images` and `Settings` dock panels, editor mode's brush, pipette,
+undo/redo and overlay controls and its dual-pane cursor mirroring, the
+projects overlay's gallery and failure cards, and the fuse worker's
+pause/resume/cancel/retry states all run headlessly through
+`i-slint-backend-testing`, with no real window; a separate windowed
 suite launches the real binary and needs a compositor and a GPU adapter,
 skipping itself with a printed line on a host with neither. Fixtures under
 `fixtures/mantis-64` and `fixtures/mantis-512` are small, checksummed crops

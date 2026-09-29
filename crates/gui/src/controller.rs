@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::brush;
+use crate::canvas::{FrameView, OverlayDraw};
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
     DiagnosticsView, clamp_manifest_scroll, manifest_content_height, size_text,
@@ -139,6 +141,9 @@ pub enum ShellEvent {
     /// warning opened or closed -- never a tab switch, which
     /// `ProjectsChanged` already rebuilds the panel for.
     ImagesChanged,
+    /// The editor toolbar's own state moved: the brush size, its softness,
+    /// the pipette's armed state, or undo/redo availability.
+    EditorChanged,
     /// The projects overlay's own state moved: opened, closed, its gallery
     /// scrolled, or its failure cards changed.
     OverlayChanged,
@@ -179,13 +184,131 @@ struct InputState {
     table: InputTable,
     provenance: Provenance,
     space_held: bool,
+    /// `Alt` as the last hover move reported it -- shows the pipette cursor
+    /// while held; it arms nothing.
+    alt_held: bool,
     drag: Option<DragState>,
     unimplemented: Vec<Action>,
     last_pointer: (f32, f32),
     /// Accumulated wheel delta not yet spent into a ladder step -- one stop
     /// per accumulated 60 px. Reset on a sign change so reversing direction
-    /// never burns a leftover.
+    /// never burns a leftover, and whenever the resolved action differs from
+    /// `last_wheel_action`.
     wheel_accum: f32,
+    /// The action the previous wheel detent spent into, so switching from
+    /// one wheel-bound action to another mid-session never carries over a
+    /// leftover fraction of a step.
+    last_wheel_action: Option<Action>,
+}
+
+/// The brush's display state: `size` is a diameter in image px, `soft` a
+/// percentage -- the controller's one conversion point to storage units is
+/// [`AppController::brush_radius_softness`]. Every write clamps `size` to
+/// `1..=` the active tab's ceiling, and every reader clamps it again, so a
+/// tab switch to a smaller image takes effect on the next read without a
+/// hook of its own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BrushState {
+    size: f32,
+    soft: f32,
+    picking: bool,
+}
+
+impl Default for BrushState {
+    fn default() -> Self {
+        Self {
+            size: 64.0,
+            soft: 30.0,
+            picking: false,
+        }
+    }
+}
+
+/// The rainbow overlay's own state: window-wide, since the same values
+/// render for whichever tab is active. Starts off, at 65 % once turned on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OverlayState {
+    on: bool,
+    opacity: f32,
+}
+
+impl Default for OverlayState {
+    fn default() -> Self {
+        Self {
+            on: false,
+            opacity: 0.65,
+        }
+    }
+}
+
+/// `size = ceiling^fraction` -- the logarithmic slider mapping, so the
+/// track's right end is always the ceiling.
+fn size_from_fraction(fraction: f32, ceiling: u32) -> f32 {
+    let ceiling = (ceiling.max(1)) as f32;
+    if ceiling <= 1.0 {
+        1.0
+    } else {
+        ceiling.powf(fraction.clamp(0.0, 1.0))
+    }
+}
+
+/// [`size_from_fraction`]'s inverse -- the slider's own thumb position for
+/// the toolbar's current `size`.
+fn fraction_from_size(size: f32, ceiling: u32) -> f32 {
+    let ceiling = (ceiling.max(1)) as f32;
+    if ceiling <= 1.0 {
+        0.0
+    } else {
+        (size.max(1.0).ln() / ceiling.ln()).clamp(0.0, 1.0)
+    }
+}
+
+/// The editor toolbar's brush readout -- [`AppController::brush_toolbar_view`]'s
+/// return value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BrushToolbarView {
+    /// A diameter in image px, already clamped to `size_ceiling`.
+    pub size: f32,
+    /// `min(width, height)` of the active tab's fused image.
+    pub size_ceiling: u32,
+    /// The logarithmic slider's own thumb position, `0.0..=1.0`.
+    pub size_fraction: f32,
+    /// A percentage, `0.0..=100.0`.
+    pub soft: f32,
+    /// The linear slider's own thumb position, `0.0..=1.0`.
+    pub soft_fraction: f32,
+    pub picking: bool,
+    /// Whether the active tab's edit session has an op to undo/redo.
+    pub can_undo: bool,
+    pub can_redo: bool,
+}
+
+/// The bottom bar's overlay controls -- [`AppController::overlay_view`]'s
+/// return value. `opacity` is `0.0..=1.0`; the bar's own percentage readout
+/// is formatted by the caller.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverlayView {
+    pub on: bool,
+    pub opacity: f32,
+}
+
+/// The brush cursor overlay's own view -- [`AppController::brush_cursor_view`]'s
+/// return value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrushCursorView {
+    pub extent: f32,
+    pub ring_commands: String,
+    pub core_commands: String,
+    /// The pipette is armed or `Alt` is held.
+    pub picking: bool,
+    /// The colour a pick would land on right now -- the Z-Map source under
+    /// the pointer while `picking`, or the current brush source otherwise --
+    /// shown in the cursor's swatch.
+    pub pick_color: [u8; 3],
+    /// The right pane's `x` minus the left pane's, logical px: the offset
+    /// that carries a cursor's centre from the pane it is over onto the
+    /// other pane, at the same scene point.
+    pub mirror_dx: f32,
 }
 
 /// The diagnostics panel's own state: the two directories a bundle is
@@ -308,7 +431,7 @@ struct ProjectTab {
     /// This tab's own editor session, opened over its fused Z-Map on first
     /// entry into editor mode -- `None` until then, and cleared whenever a
     /// newer checkpoint replaces the planes it was opened over.
-    edit: Option<job::EditSession>,
+    edit: Option<job::EditState>,
     /// This tab's own failed, cancelled or sources-missing run, if its most
     /// recent attempt did not succeed -- `None` once a later success clears
     /// it. Keyed by tab rather than by path so it survives an Unsaved ->
@@ -428,14 +551,27 @@ impl ProjectTab {
         if job::is_live(&self.run) || matches!(self.run, job::RunState::Queued { .. }) {
             return false;
         }
-        let fused = match self.held.last() {
-            Some(held) => held.sources.clone(),
-            None if matches!(self.project, GuiProject::Opened(_)) => {
-                entry::project_frames(&self.project)
-            }
-            None => return false,
+        let Some((fused, _)) = self.fused() else {
+            return false;
         };
         self.frames == fused
+    }
+
+    /// The sources and registration behind this tab's newest composite --
+    /// the newest held checkpoint's own `sources`/`registration`, or a
+    /// reopened project's own manifest when nothing is held. `None` for an
+    /// unsaved, never-fused tab.
+    fn fused(&self) -> Option<(Vec<PathBuf>, job::Registration)> {
+        match self.held.last() {
+            Some(held) => Some((held.sources.clone(), held.registration.clone())),
+            None => match &self.project {
+                GuiProject::Opened(project) => Some((
+                    entry::project_frames(&self.project),
+                    project.manifest().registration.clone(),
+                )),
+                GuiProject::Unsaved(_) => None,
+            },
+        }
     }
 
     /// Permutes `frames` and `excluded` together by `order` (each entry the
@@ -528,6 +664,10 @@ struct ShellState {
     checkpoints: Vec<CheckpointRow>,
     maximized: bool,
     input: InputState,
+    /// The editor toolbar's own brush state -- shared by every tab, so a
+    /// stroke started in one editor session and finished after switching
+    /// tabs is unreachable (`Paint`'s drag reads the active tab only).
+    brush: BrushState,
     /// Every open project tab. Each tab owns its own image and viewport, so
     /// switching tabs keeps each tab's own zoom.
     projects: Vec<ProjectTab>,
@@ -548,6 +688,10 @@ struct ShellState {
     notice: Option<String>,
     /// The most recent refusal's already-rendered message, if any.
     last_refusal: Option<String>,
+    /// Whether the "No frames here" refusal dialog is open -- raised by
+    /// [`AppController::refuse_message`], cleared by
+    /// [`AppController::dismiss_refusal`].
+    refusal_open: bool,
     /// The tab strip's scroll offset in pixels, always within
     /// [`clamp_tab_scroll`]'s range for the current tabs and viewport.
     tab_scroll_x: f32,
@@ -639,6 +783,9 @@ struct ShellState {
     load: LoadSlot,
     /// The in-flight additive import scan, if any.
     import: ImportSlot,
+    /// The `Composite` pane's rainbow overlay -- window-wide (see
+    /// [`OverlayState`]).
+    overlay: OverlayState,
 }
 
 /// One load's worker result, parked here until
@@ -781,6 +928,46 @@ fn pane_contains(pane: PaneRect, x: f32, y: f32) -> bool {
     x >= pane.x && x <= pane.x + pane.width && y >= pane.y && y <= pane.y + pane.height
 }
 
+/// Widens `rect` by `margin` px on every side, clamped to `0..width` /
+/// `0..height` -- the commit pass's bound between a stroke's raw preview
+/// trace and its resampled, RDP'd committed path.
+fn dilate_rect(rect: job::Rect, margin: u32, width: u32, height: u32) -> job::Rect {
+    let x0 = rect.x.saturating_sub(margin);
+    let y0 = rect.y.saturating_sub(margin);
+    let x1 = (rect.x + rect.width + margin).min(width);
+    let y1 = (rect.y + rect.height + margin).min(height);
+    job::Rect {
+        x: x0,
+        y: y0,
+        width: x1.saturating_sub(x0),
+        height: y1.saturating_sub(y0),
+    }
+}
+
+/// The extent of `tab`'s newest composite/Z-Map -- its newest held
+/// checkpoint's, else its opened project's; `None` before any fuse.
+fn fused_image_size(tab: &ProjectTab) -> Option<ImageSize> {
+    match (tab.held.last(), &tab.project) {
+        (Some(held), _) => Some(ImageSize {
+            width: held.width,
+            height: held.height,
+        }),
+        (None, GuiProject::Opened(project)) => Some(ImageSize {
+            width: project.manifest().composite.width,
+            height: project.manifest().composite.height,
+        }),
+        (None, GuiProject::Unsaved(_)) => None,
+    }
+}
+
+/// `tab`'s own image size for every viewport computation: the newest
+/// composite's extent once it has one ([`fused_image_size`]), else the raw
+/// frame's -- so both panes and every zoom/pan/fit computation share one
+/// size once a tab is fused.
+fn display_image(tab: &ProjectTab) -> Option<ImageSize> {
+    fused_image_size(tab).or(tab.image)
+}
+
 /// A one-sided margin so a scrolled cursor never sits flush against the
 /// field's own edge, capped at half the visible width for a very narrow
 /// field.
@@ -818,6 +1005,9 @@ pub struct AppController {
     /// live under whatever directory the test handed in, so a test run never
     /// depends on -- or collides with -- a shared directory.
     scratch_root_for_test: Option<PathBuf>,
+    /// Test-only override for the resident display tiles' edge, applied to
+    /// every edit session opened afterwards.
+    resident_tile_size_for_test: Option<u32>,
     /// The most recent run or save failure, taken exactly once by
     /// [`Self::take_settled_failure`] -- what lets the failure toast
     /// announce the run that actually failed without reopening itself on
@@ -894,6 +1084,23 @@ impl AppController {
         self.scratch_root_for_test = Some(root);
     }
 
+    /// Test-only: grids every edit session opened afterwards at `size` px
+    /// instead of the default, so a small image's strokes cross tile edges.
+    pub fn set_resident_tile_size_for_test(&mut self, size: u32) {
+        self.resident_tile_size_for_test = Some(size);
+    }
+
+    /// Drains the active tab's log of every region recomposited into its
+    /// resident display tiles since the last call; empty with no edit
+    /// session.
+    pub fn take_recomposited(&mut self) -> Vec<job::Rect> {
+        self.state
+            .active_mut()
+            .and_then(|tab| tab.edit.as_mut())
+            .map(|edit| edit.tiles.take_recomposited())
+            .unwrap_or_default()
+    }
+
     /// Where runs stage, held checkpoints wait for a save and opened
     /// projects' planes are cached: `<data dir>/scratch`, or the OS temp
     /// directory when no data directory resolves. Never beside the frames.
@@ -933,14 +1140,17 @@ impl AppController {
         if mode == ShellMode::Editor && !(self.editor_enabled() && self.ensure_edit_session()) {
             return false;
         }
+        if mode != ShellMode::Editor {
+            self.discard_live_stroke();
+        }
         self.state.mode = mode;
         self.emit(ShellEvent::ModeChanged(mode));
         true
     }
 
-    /// Opens the active tab's edit session over its whole Z-Map unless the
-    /// tab already holds one. `false` with no active tab, or when its Z-Map
-    /// fails to materialize or open.
+    /// Opens the active tab's edit session over its whole Z-Map and its own
+    /// frames unless the tab already holds one. `false` with no active tab,
+    /// or when its Z-Map or its frames fail to materialize or open.
     fn ensure_edit_session(&mut self) -> bool {
         if self.state.active().is_some_and(|tab| tab.edit.is_some()) {
             return true;
@@ -948,14 +1158,45 @@ impl AppController {
         let Some((_, zmap)) = self.materialize_active_tab_planes() else {
             return false;
         };
-        let Ok(session) = job::open_edit_session(&zmap) else {
+        let Some(tab) = self.state.active() else {
+            return false;
+        };
+        let frames = tab.frames.clone();
+        // `can_edit` guarantees `tab.frames` equals the fused sources, in
+        // the same order, by the time editor mode is entered -- so indexing
+        // `registration`'s per-frame transforms by position here matches.
+        let Some((_, registration)) = tab.fused() else {
+            return false;
+        };
+        let tile_size = self
+            .resident_tile_size_for_test
+            .unwrap_or(job::RESIDENT_TILE_SIZE);
+        let Ok(edit) =
+            job::open_edit_session(&zmap, &frames, registration, tile_size, job::host_budget())
+        else {
             return false;
         };
         let Some(tab) = self.state.active_mut() else {
             return false;
         };
-        tab.edit = Some(session);
+        tab.edit = Some(edit);
         true
+    }
+
+    /// Discards the active tab's own in-progress stroke, if any: restores
+    /// its preview and drops it, so leaving the editor or switching tab
+    /// mid-drag never leaves a preview outstanding on a tab nobody is
+    /// drawing on anymore.
+    fn discard_live_stroke(&mut self) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(edit) = tab.edit.as_mut() else {
+            return;
+        };
+        if edit.stroke.take().is_some() {
+            edit.session.discard_preview();
+        }
     }
 
     /// Whether the active tab can enter editor mode -- pure and I/O-free,
@@ -967,13 +1208,60 @@ impl AppController {
 
     /// The active tab's own edit session, once editor mode has opened one.
     pub fn edit_session(&self) -> Option<&job::EditSession> {
-        self.state.active()?.edit.as_ref()
+        Some(&self.state.active()?.edit.as_ref()?.session)
     }
 
     /// Mutable twin of [`Self::edit_session`] -- the seam an editor op
     /// appends through.
     pub fn edit_session_mut(&mut self) -> Option<&mut job::EditSession> {
-        self.state.active_mut()?.edit.as_mut()
+        Some(&mut self.state.active_mut()?.edit.as_mut()?.session)
+    }
+
+    /// The active tab's edited view for the renderer's overlay -- `None`
+    /// before an edit session has opened.
+    pub fn edited_view(&self) -> Option<crate::canvas::EditedView<'_>> {
+        let edit = self.state.active()?.edit.as_ref()?;
+        Some(crate::canvas::EditedView {
+            indices: edit.session.indices(),
+            map_width: edit.session.tile().width,
+            tiles: &edit.tiles,
+        })
+    }
+
+    /// The bottom bar's overlay controls.
+    pub fn overlay_view(&self) -> OverlayView {
+        OverlayView {
+            on: self.state.overlay.on,
+            opacity: self.state.overlay.opacity,
+        }
+    }
+
+    /// Turns the `Composite` pane's rainbow overlay on or off.
+    pub fn set_overlay_on(&mut self, on: bool) {
+        self.state.overlay.on = on;
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Sets the overlay's opacity, `0.0..=1.0`, clamped.
+    pub fn set_overlay_opacity_fraction(&mut self, fraction: f32) {
+        self.state.overlay.opacity = fraction.clamp(0.0, 1.0);
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// The `Composite` pane's overlay draw parameters, matching
+    /// `focusforge-cli retouch --overlay --opacity`'s own blend -- `None`
+    /// outside editor mode, with the overlay off, or before an edit session
+    /// has opened.
+    pub fn overlay_draw(&self) -> Option<OverlayDraw> {
+        if self.mode() != ShellMode::Editor || !self.state.overlay.on {
+            return None;
+        }
+        let tab = self.state.active()?;
+        tab.edit.as_ref()?;
+        Some(OverlayDraw::for_opacity(
+            tab.frames.len() as u32,
+            self.state.overlay.opacity,
+        ))
     }
 
     /// In editor mode, gives a newly active editable tab its own edit
@@ -986,6 +1274,7 @@ impl AppController {
         if self.state.mode == ShellMode::Editor
             && !(self.editor_enabled() && self.ensure_edit_session())
         {
+            self.discard_live_stroke();
             self.state.mode = ShellMode::Stacking;
             self.emit(ShellEvent::ModeChanged(ShellMode::Stacking));
         }
@@ -1114,7 +1403,8 @@ impl AppController {
     /// The viewport half of dispatch: `ZoomAtCursor`
     /// spends the wheel's accumulated delta into ladder steps about the
     /// cursor; `PanHorizontal` and the drag-driven `Pan` both read straight
-    /// into [`crate::viewport::Viewport::pan_by`].
+    /// into [`crate::viewport::Viewport::pan_by`]. The editor half: the two
+    /// brush wheels, undo/redo, the pipette's click and the paint drag.
     fn apply_action(&mut self, event: &ActionEvent) {
         match *event {
             ActionEvent::Fired {
@@ -1130,42 +1420,471 @@ impl AppController {
                 dx,
                 dy,
             } => self.pan_viewport(dx, dy),
+            ActionEvent::Fired {
+                action: Action::StepSourceFrame,
+                steps,
+            } => self.step_source_frame(steps),
+            ActionEvent::Fired {
+                action: Action::BrushSize,
+                steps,
+            } => self.adjust_brush_size(steps),
+            ActionEvent::Fired {
+                action: Action::BrushSoftness,
+                steps,
+            } => self.adjust_brush_softness(steps),
+            ActionEvent::Fired {
+                action: Action::Undo,
+                ..
+            } => self.undo(),
+            ActionEvent::Fired {
+                action: Action::Redo,
+                ..
+            } => self.redo(),
+            ActionEvent::Fired {
+                action: Action::PickSourceUnderPointer,
+                ..
+            } => self.pick_source_under_pointer(),
+            ActionEvent::Start {
+                action: Action::Paint,
+                x,
+                y,
+            } => self.paint_start(x, y),
+            ActionEvent::Update {
+                action: Action::Paint,
+                dx,
+                dy,
+            } => self.paint_update(dx, dy),
+            ActionEvent::End {
+                action: Action::Paint,
+            } => self.paint_end(),
             _ => {}
         }
     }
 
-    /// Spends `steps` into whole 60 px ladder units, anchored at the last
-    /// known cursor position -- one stop per accumulated 60 px. The
-    /// accumulator resets on a sign change, so reversing direction never
-    /// burns a leftover.
-    fn zoom_wheel(&mut self, steps: f32) {
+    /// Spends `steps` of `action`'s own wheel gesture into whole 60 px
+    /// detents, anchored at the last known cursor position. The accumulator
+    /// resets on a sign change and whenever `action` differs from the
+    /// previous call's, so reversing direction, or switching from one
+    /// wheel-bound action to another, never burns a leftover.
+    fn wheel_detents(&mut self, action: Action, steps: f32) -> i32 {
         const DETENT: f32 = 60.0;
-        let Some((left, _)) = self.state.panes else {
-            return;
-        };
-        let anchor = self.anchor();
-
+        if self.state.input.last_wheel_action != Some(action) {
+            self.state.input.wheel_accum = 0.0;
+            self.state.input.last_wheel_action = Some(action);
+        }
         let accum = &mut self.state.input.wheel_accum;
         if *accum != 0.0 && accum.signum() != steps.signum() {
             *accum = 0.0;
         }
         *accum += steps;
+        let mut detents = 0;
+        while accum.abs() >= DETENT {
+            let dir = if *accum > 0.0 { 1 } else { -1 };
+            *accum -= DETENT * dir as f32;
+            detents += dir;
+        }
+        detents
+    }
 
-        while self.state.input.wheel_accum.abs() >= DETENT {
-            let dir = if self.state.input.wheel_accum > 0.0 {
-                1
-            } else {
-                -1
-            };
-            self.state.input.wheel_accum -= DETENT * dir as f32;
+    /// One ladder step per accumulated 60 px, about the last known cursor
+    /// position.
+    fn zoom_wheel(&mut self, steps: f32) {
+        let Some((left, _)) = self.state.panes else {
+            return;
+        };
+        let anchor = self.anchor();
+        let detents = self.wheel_detents(Action::ZoomAtCursor, steps);
+        let dir = detents.signum();
+        for _ in 0..detents.unsigned_abs() {
             let Some(tab) = self.state.active_mut() else {
                 return;
             };
-            let Some(image) = tab.image else { return };
+            let Some(image) = display_image(tab) else {
+                return;
+            };
             if let Some(viewport) = tab.viewport.as_mut() {
                 viewport.zoom_steps(dir, anchor, image, left);
             }
         }
+    }
+
+    /// `Ctrl + Wheel` over the canvas, or a plain wheel over the `Images`
+    /// list ([`Self::images_list_wheel`]): steps the left pane's selected
+    /// frame, clamped to the frame list. In editor mode this is also the
+    /// brush source, which reads `tab.selected` directly
+    /// ([`AppController::brush_source`]).
+    fn step_source_frame(&mut self, steps: f32) {
+        // Negated: scrolling toward the user (positive `steps`) steps to an
+        // earlier frame, matching how the `Images` list itself scrolls.
+        let detents = self.wheel_detents(Action::StepSourceFrame, -steps);
+        if detents == 0 {
+            return;
+        }
+        let Some(tab) = self.state.active() else {
+            return;
+        };
+        let len = tab.frames.len();
+        if len == 0 {
+            return;
+        }
+        let next = (tab.selected as i32 + detents).clamp(0, len as i32 - 1) as usize;
+        self.select_frame(next);
+    }
+
+    /// A plain wheel over the `Images` list: the same effect `Ctrl + Wheel`
+    /// over the canvas has (`step_source_frame`) -- not gated on `Ctrl`,
+    /// `legend` or `mutable`, so it works identically in stacking and editor
+    /// mode.
+    pub fn images_list_wheel(&mut self, steps: f32) {
+        self.step_source_frame(steps);
+    }
+
+    /// The active tab's fused image's shorter side -- `Size`'s ceiling.
+    /// `1` with no active tab or nothing fused yet, so the log-scale slider
+    /// formulas never divide by zero.
+    fn brush_size_ceiling(&self) -> u32 {
+        self.state
+            .active()
+            .and_then(fused_image_size)
+            .map(|image| image.width.min(image.height))
+            .unwrap_or(1)
+    }
+
+    /// `Shift + Wheel` in editor mode: one detent multiplies or divides
+    /// `Size` by `2^(1/4)`, clamped to `1..=ceiling`.
+    fn adjust_brush_size(&mut self, steps: f32) {
+        let detents = self.wheel_detents(Action::BrushSize, steps);
+        if detents == 0 {
+            return;
+        }
+        let ceiling = self.brush_size_ceiling();
+        let factor = 2f32.powf(0.25 * detents as f32);
+        self.state.brush.size = (self.state.brush.size * factor).clamp(1.0, ceiling as f32);
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// `Alt + Wheel` in editor mode: one detent moves `Soft` by 5 points,
+    /// clamped to `0..=100`.
+    fn adjust_brush_softness(&mut self, steps: f32) {
+        let detents = self.wheel_detents(Action::BrushSoftness, steps);
+        if detents == 0 {
+            return;
+        }
+        self.state.brush.soft = (self.state.brush.soft + 5.0 * detents as f32).clamp(0.0, 100.0);
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// The editor toolbar's brush readout.
+    pub fn brush_toolbar_view(&self) -> BrushToolbarView {
+        let ceiling = self.brush_size_ceiling();
+        let size = self.state.brush.size.clamp(1.0, ceiling as f32);
+        BrushToolbarView {
+            size,
+            size_ceiling: ceiling,
+            size_fraction: fraction_from_size(size, ceiling),
+            soft: self.state.brush.soft,
+            soft_fraction: self.state.brush.soft / 100.0,
+            picking: self.state.brush.picking,
+            can_undo: self.edit_session().is_some_and(job::EditSession::can_undo),
+            can_redo: self.edit_session().is_some_and(job::EditSession::can_redo),
+        }
+    }
+
+    /// The brush cursor overlay's own view: extent and path commands built from the current brush
+    /// size/softness scaled to on-screen px by the active tab's own viewport, the pipette's own
+    /// preview colour -- the Z-Map index under the pointer while armed or while `Alt` is held, the
+    /// selected source otherwise -- and `mirror_dx`, the offset that carries either pane's cursor
+    /// onto the other. `None` with no active tab, viewport or pane geometry, or while
+    /// [`Self::canvas_blocked`] holds.
+    pub fn brush_cursor_view(&self) -> Option<BrushCursorView> {
+        if self.canvas_blocked() {
+            return None;
+        }
+        let tab = self.state.active()?;
+        let viewport = tab.viewport.as_ref()?;
+        let (left, right) = self.state.panes?;
+        let (radius, softness) = self.brush_radius_softness();
+        let scale = viewport.scale() as f32;
+        let paths = brush::cursor_paths(radius * scale, softness);
+        let sources = tab.frames.len().max(1) as u32;
+        let picking = self.state.brush.picking || self.state.input.alt_held;
+        let hovered = picking
+            .then(|| self.source_index_at(self.anchor()))
+            .flatten()
+            .filter(|&source| source != job::NO_SOURCE);
+        let source = hovered.unwrap_or_else(|| u16::try_from(tab.selected).unwrap_or(u16::MAX));
+        Some(BrushCursorView {
+            extent: paths.extent,
+            ring_commands: paths.ring,
+            core_commands: paths.core,
+            picking,
+            pick_color: job::source_color(source, sources),
+            mirror_dx: right.x - left.x,
+        })
+    }
+
+    /// The slider's own callback: `fraction` is `0.0..=1.0` along the
+    /// logarithmic track.
+    pub fn set_brush_size_fraction(&mut self, fraction: f32) {
+        let ceiling = self.brush_size_ceiling();
+        self.state.brush.size = size_from_fraction(fraction, ceiling);
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// The slider's own callback: `fraction` is `0.0..=1.0` along the linear
+    /// track.
+    pub fn set_brush_softness_fraction(&mut self, fraction: f32) {
+        self.state.brush.soft = fraction.clamp(0.0, 1.0) * 100.0;
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Toggles the pipette's armed state.
+    pub fn toggle_pipette(&mut self) {
+        self.state.brush.picking = !self.state.brush.picking;
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// The brush's radius and softness in the storage units core's retouch
+    /// ops take -- the one conversion point from the toolbar's display
+    /// conventions.
+    fn brush_radius_softness(&self) -> (f32, f32) {
+        let ceiling = self.brush_size_ceiling();
+        let size = self.state.brush.size.clamp(1.0, ceiling as f32);
+        (size / 2.0, self.state.brush.soft / 100.0)
+    }
+
+    /// `Ctrl + Z`: steps the active tab's edit session back one op and
+    /// recomposites the region it returns. Ignored while a stroke is live.
+    pub fn undo(&mut self) {
+        self.undo_or_redo(job::EditSession::undo);
+    }
+
+    /// `Ctrl + Shift + Z`: re-applies the most recently undone op and
+    /// recomposites the region it returns. Ignored while a stroke is live.
+    pub fn redo(&mut self) {
+        self.undo_or_redo(job::EditSession::redo);
+    }
+
+    /// Shared by [`Self::undo`]/[`Self::redo`]: `step` is whichever of the
+    /// two returns `Some` (`None` inside meaning nothing visibly changed) or
+    /// `None` when there was nothing to step. A no-op while a stroke is
+    /// live.
+    fn undo_or_redo(&mut self, step: fn(&mut job::EditSession) -> Option<Option<job::Rect>>) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(edit) = tab.edit.as_mut() else {
+            return;
+        };
+        if edit.stroke.is_some() {
+            return;
+        }
+        let Some(region) = step(&mut edit.session) else {
+            return;
+        };
+        if let Some(region) = region
+            && let Err(err) = edit.recomposite(region)
+        {
+            tracing::error!(error = %err, "undo/redo recomposite failed");
+        }
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Reads the Z-Map index under `local` (pane-local coordinates) --
+    /// shared by [`Self::pick_source_at`] (which commits it as the brush
+    /// source) and [`Self::brush_cursor_view`] (which only previews its
+    /// colour). `None` off the image, off the active tab's tile, or with
+    /// nothing to read; callers decide what `NO_SOURCE` means to them.
+    fn source_index_at(&self, local: (f32, f32)) -> Option<u16> {
+        let tab = self.state.active()?;
+        let viewport = tab.viewport.as_ref()?;
+        let (sx, sy) = viewport.to_source(local);
+        if sx < 0.0 || sy < 0.0 {
+            return None;
+        }
+        let (x, y) = (sx.floor() as u32, sy.floor() as u32);
+        let session = tab.edit.as_ref().map(|edit| &edit.session)?;
+        let tile = session.tile();
+        if x >= tile.width || y >= tile.height {
+            return None;
+        }
+        let idx = (y * tile.width + x) as usize;
+        session.indices().get(idx).copied()
+    }
+
+    /// `Alt + click`, or the armed pipette's `Start`: reads the Z-Map index
+    /// under `local` (pane-local coordinates) and makes it the brush source.
+    /// `NO_SOURCE` and a point off the image leave the source unchanged.
+    fn pick_source_at(&mut self, local: (f32, f32)) {
+        let Some(source) = self.source_index_at(local) else {
+            return;
+        };
+        if source == job::NO_SOURCE {
+            return;
+        }
+        self.select_frame(source as usize);
+    }
+
+    /// `Alt + click`: picks without arming the pipette.
+    fn pick_source_under_pointer(&mut self) {
+        let local = self.anchor();
+        self.pick_source_at(local);
+    }
+
+    /// `Paint`'s `Start`. With the pipette armed, this is a pick that also
+    /// disarms it, and the rest of the drag is ignored (no
+    /// [`job::EditState::stroke`] is opened, so [`Self::paint_update`] has
+    /// nothing to push into). Otherwise, inside
+    /// the right pane only, opens a stroke at the pointer's source position,
+    /// freezing the brush's source, radius and softness for the stroke.
+    fn paint_start(&mut self, x: f32, y: f32) {
+        if self.state.brush.picking {
+            let local = self.anchor();
+            self.pick_source_at(local);
+            self.state.brush.picking = false;
+            self.emit(ShellEvent::EditorChanged);
+            return;
+        }
+        let Some((_, right)) = self.state.panes else {
+            return;
+        };
+        if !pane_contains(right, x, y) {
+            return;
+        }
+        let Some(source) = self.brush_source() else {
+            return;
+        };
+        let (radius, softness) = self.brush_radius_softness();
+        let local = (x - right.x, y - right.y);
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(viewport) = tab.viewport.as_ref() else {
+            return;
+        };
+        let (sx, sy) = viewport.to_source(local);
+        let Some(edit) = tab.edit.as_mut() else {
+            return;
+        };
+        edit.stroke = Some(brush::LiveStroke::new(
+            source,
+            radius,
+            softness,
+            sx as f32 - 0.5,
+            sy as f32 - 0.5,
+        ));
+    }
+
+    /// `Paint`'s `Update`: integrates a screen-space delta into the live
+    /// stroke's image-space trace. A no-op with no live stroke (a pipette
+    /// pick's drag, or a stroke that started outside the right pane).
+    fn paint_update(&mut self, dx: f32, dy: f32) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(viewport) = tab.viewport.as_ref() else {
+            return;
+        };
+        let scale = viewport.scale() as f32;
+        let Some(stroke) = tab.edit.as_mut().and_then(|edit| edit.stroke.as_mut()) else {
+            return;
+        };
+        stroke.push(dx / scale, dy / scale);
+    }
+
+    /// Called by every repaint before it reads anything else: takes the
+    /// active tab's live stroke's newest segment, if any, previews it and
+    /// recomposites exactly that segment's footprint into the resident
+    /// tiles -- one tick per repaint, never per motion event. A no-op with
+    /// no live stroke or no motion since the last flush.
+    pub fn flush_live_stroke(&mut self) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(edit) = tab.edit.as_mut() else {
+            return;
+        };
+        let Some(stroke) = edit.stroke.as_mut() else {
+            return;
+        };
+        let Some(segment) = stroke.take_segment() else {
+            return;
+        };
+        let op = job::Op::BrushStroke {
+            source_id: stroke.source(),
+            path: segment,
+            radius: stroke.radius(),
+            softness: stroke.softness(),
+        };
+        let region = edit
+            .session
+            .preview(&op)
+            .expect("a live stroke's own points are pre-clamped to what validate accepts");
+        let Some(region) = region else {
+            return;
+        };
+        if let Err(err) = edit.recomposite(region) {
+            tracing::error!(error = %err, "live-stroke preview recomposite failed");
+            return;
+        }
+        edit.stroke
+            .as_mut()
+            .expect("the stroke that produced this tick is still live")
+            .tick_rects
+            .push(region);
+    }
+
+    /// `Paint`'s `End`: flushes remaining motion, discards the preview, then
+    /// appends the stroke's resampled path unless its footprint is empty or
+    /// off-image. Recomposites the tick rects (dilated), or the appended
+    /// region itself when no tick fired (a press-release with no motion).
+    fn paint_end(&mut self) {
+        self.flush_live_stroke();
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(edit) = tab.edit.as_mut() else {
+            return;
+        };
+        edit.session.discard_preview();
+        let Some(stroke) = edit.stroke.take() else {
+            return;
+        };
+        let op = job::Op::BrushStroke {
+            source_id: stroke.source(),
+            path: stroke.finish(),
+            radius: stroke.radius(),
+            softness: stroke.softness(),
+        };
+        let has_footprint = job::footprint(&op, edit.session.info())
+            .ok()
+            .flatten()
+            .is_some();
+        if !has_footprint {
+            return;
+        }
+        let radius = stroke.radius();
+        let tick_rects = stroke.tick_rects;
+        let region = edit
+            .session
+            .append(op)
+            .expect("a live stroke's own points are pre-clamped to what validate accepts");
+        let Some(region) = region else { return };
+        let map = edit.session.tile();
+        if tick_rects.is_empty() {
+            if let Err(err) = edit.recomposite(region) {
+                tracing::error!(error = %err, "brush-stroke commit recomposite failed");
+            }
+        } else {
+            let margin = (radius / 8.0).ceil() as u32 + 2;
+            for rect in tick_rects {
+                let dilated = dilate_rect(rect, margin, map.width, map.height);
+                if let Err(err) = edit.recomposite(dilated) {
+                    tracing::error!(error = %err, "brush-stroke commit recomposite failed");
+                }
+            }
+        }
+        self.emit(ShellEvent::EditorChanged);
     }
 
     /// A screen-pixel pan on whichever pane the cursor is over -- both
@@ -1178,7 +1897,9 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        let Some(image) = tab.image else { return };
+        let Some(image) = display_image(tab) else {
+            return;
+        };
         let Some(viewport) = tab.viewport.as_mut() else {
             return;
         };
@@ -1219,7 +1940,7 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        let Some(image) = tab.image else {
+        let Some(image) = display_image(tab) else {
             return;
         };
         match tab.viewport.as_mut() {
@@ -1239,7 +1960,7 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        if let (Some(image), None) = (tab.image, &tab.viewport) {
+        if let (Some(image), None) = (display_image(tab), &tab.viewport) {
             tab.viewport = Some(crate::viewport::fit(image, left));
         }
     }
@@ -1262,7 +1983,9 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        let Some(image) = tab.image else { return };
+        let Some(image) = display_image(tab) else {
+            return;
+        };
         let Some(viewport) = tab.viewport.as_mut() else {
             return;
         };
@@ -1279,7 +2002,9 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        let Some(image) = tab.image else { return };
+        let Some(image) = display_image(tab) else {
+            return;
+        };
         tab.viewport = Some(crate::viewport::fit(image, left));
     }
 
@@ -1300,7 +2025,7 @@ impl AppController {
             return false;
         };
         let (Some(image), Some((left, _)), Some(viewport)) =
-            (tab.image, self.state.panes, tab.viewport.as_ref())
+            (display_image(tab), self.state.panes, tab.viewport.as_ref())
         else {
             return false;
         };
@@ -1314,7 +2039,7 @@ impl AppController {
             return false;
         };
         let (Some(image), Some((left, _)), Some(viewport)) =
-            (tab.image, self.state.panes, tab.viewport.as_ref())
+            (display_image(tab), self.state.panes, tab.viewport.as_ref())
         else {
             return false;
         };
@@ -1328,30 +2053,21 @@ impl AppController {
     /// frame size is known, or before the first pane geometry arrives.
     pub fn frame_draw(&self) -> Option<PaneDraw> {
         let tab = self.state.active()?;
-        let image = tab.image?;
+        let image = display_image(tab)?;
         let (left, _) = self.state.panes?;
         tab.viewport.as_ref()?.draw(image, left)
     }
 
     /// The active tab's viewport's visible source rect and its pane-local
     /// projection over the newest composite/Z-Map's own extent -- the
-    /// newest held checkpoint's, else the opened project's -- for
-    /// `crate::gpu_canvas::CanvasRenderer::redraw_planes` and the right
-    /// `FFPane`'s placement properties. `None` while no tab is active, the
-    /// tab has no checkpoint yet, or before the first pane geometry arrives.
+    /// newest held checkpoint's, else the opened project's, else (before any
+    /// fuse) the raw frame's own, the same `display_image` `frame_draw`
+    /// uses -- for `crate::gpu_canvas::CanvasRenderer::redraw_planes` and the
+    /// right `FFPane`'s placement properties. `None` while no tab is active
+    /// or before the first pane geometry arrives.
     pub fn plane_draw(&self) -> Option<PaneDraw> {
         let tab = self.state.active()?;
-        let image = match (tab.held.last(), &tab.project) {
-            (Some(held), _) => ImageSize {
-                width: held.width,
-                height: held.height,
-            },
-            (None, GuiProject::Opened(project)) => ImageSize {
-                width: project.manifest().composite.width,
-                height: project.manifest().composite.height,
-            },
-            (None, GuiProject::Unsaved(_)) => return None,
-        };
+        let image = display_image(tab)?;
         let (_, right) = self.state.panes?;
         tab.viewport.as_ref()?.draw(image, right)
     }
@@ -1364,9 +2080,9 @@ impl AppController {
     /// `mouse-x`/`mouse-y` before `scroll-event` is invoked.
     pub fn wheel(&mut self, delta_x: f32, delta_y: f32, x: f32, y: f32, mods: Modifiers) {
         // Every wheel-triggered action -- zoom, pan, anything else a table
-        // row binds to `Trigger::Wheel` -- stays off under the Settings
-        // modal.
-        if self.state.settings_open {
+        // row binds to `Trigger::Wheel` -- stays off while the canvas is
+        // blocked.
+        if self.canvas_blocked() {
             return;
         }
         self.state.input.last_pointer = (x, y);
@@ -1384,9 +2100,14 @@ impl AppController {
     /// cancelled grab is forwarded here as `PointerKind::Up` so a live drag
     /// never gets stuck on). `Down` starts a drag on a
     /// `Trigger::Drag` hit or fires once on a `Trigger::Click` hit; `Up`
-    /// ends any live drag.
+    /// ends any live drag. While the canvas is blocked, `Down` starts no
+    /// drag and fires no click, but `Up` still ends whatever drag was
+    /// already live, so nothing sticks on once the modal opened mid-stroke.
     pub fn pointer(&mut self, kind: PointerKind, button: Button, x: f32, y: f32, mods: Modifiers) {
         self.state.input.last_pointer = (x, y);
+        if self.canvas_blocked() && kind != PointerKind::Up {
+            return;
+        }
         match kind {
             PointerKind::Down => {
                 let drag_trigger = Trigger::Drag { button, mods };
@@ -1425,14 +2146,20 @@ impl AppController {
             // including the first movement of a drag. It carries no motion
             // of its own; `pointer_moved` is the real motion source, so a
             // live drag must not end here.
-            PointerKind::Move => {}
+            PointerKind::Move => self.state.input.alt_held = mods.alt,
         }
     }
 
     /// Meaningful only while a drag is live. Deltas are differences
     /// between successive positions -- `PointerEvent` carries no movement
-    /// delta of its own (slint-ui/slint#13189).
+    /// delta of its own (slint-ui/slint#13189). While the canvas is
+    /// blocked, a live drag commits no further stamp -- it stays live, so
+    /// the next `pointer` `Up` still ends it, just with nothing added since
+    /// the modal opened.
     pub fn pointer_moved(&mut self, x: f32, y: f32) {
+        if self.canvas_blocked() {
+            return;
+        }
         let Some(drag) = &mut self.state.input.drag else {
             return;
         };
@@ -1449,25 +2176,23 @@ impl AppController {
     /// The one entry point for both key callbacks. `" "` sets/clears
     /// `space_held` (idempotent, absorbing a held key's auto-repeat) and
     /// resolves no row of its own; any other press looks up
-    /// `Trigger::Key { key, mods }` -- a release resolves nothing.
+    /// `Trigger::Key { key, mods }` -- a release resolves nothing. `text` is
+    /// lowercased before the lookup: `Trigger::Key`'s `key` is always the
+    /// unshifted character, and Slint reports `"Z"` for `Ctrl+Shift+Z`.
     pub fn key(&mut self, pressed: bool, text: &str, mods: Modifiers) {
         if text == " " {
             self.set_space_held(pressed);
             return;
         }
-        if !pressed {
+        if !pressed || self.canvas_blocked() {
             return;
         }
-        let Some(key) = text.chars().next() else {
+        let lowered = text.to_lowercase();
+        let Some(key) = lowered.chars().next() else {
             return;
         };
         let trigger = Trigger::Key { key, mods };
         if let Some(action) = self.state.input.table.action(&trigger, self.state.mode) {
-            // Undo and redo stay off under the Settings modal, whatever key
-            // they are bound to.
-            if self.state.settings_open && matches!(action, Action::Undo | Action::Redo) {
-                return;
-            }
             self.emit_action(ActionEvent::Fired { action, steps: 0.0 });
         }
     }
@@ -1480,10 +2205,11 @@ impl AppController {
         self.state.input.space_held
     }
 
-    /// Called on focus loss so a Space held across an alt-tab does not
-    /// latch (slint-ui/slint#6263).
+    /// Called on focus loss so a Space or Alt held across an alt-tab does
+    /// not latch (slint-ui/slint#6263).
     pub fn clear_input_modifiers(&mut self) {
         self.state.input.space_held = false;
+        self.state.input.alt_held = false;
     }
 
     pub fn input_rows(&self) -> Vec<InputRowView> {
@@ -1522,6 +2248,26 @@ impl AppController {
     pub fn close_settings(&mut self) -> bool {
         self.state.settings_open = false;
         false
+    }
+
+    /// Whether one of the six dialogs that block the chrome accelerators is
+    /// open: Settings, the close/quit guard, the frame-set warning, the
+    /// Keep/Discard divergence dialog, the grouping question or the refusal
+    /// dialog.
+    pub fn modal_open(&self) -> bool {
+        self.state.settings_open
+            || self.state.pending_close.is_some()
+            || self.state.pending_quit
+            || self.state.pending_frame_change.is_some()
+            || self.pending_divergence().is_some()
+            || self.state.pending.is_some()
+            || self.state.refusal_open
+    }
+
+    /// Whether the canvas and the dock beneath it are blocked: a dialog from
+    /// [`Self::modal_open`] is open, or the Projects overlay is.
+    pub fn canvas_blocked(&self) -> bool {
+        self.modal_open() || self.state.overlay_open
     }
 
     // -- The entry path: the picker, the drop route and `--open` all call
@@ -1680,6 +2426,11 @@ impl AppController {
         self.state.last_refusal.as_deref()
     }
 
+    /// Closes the refusal dialog -- its own "Pick another folder…" button.
+    pub fn dismiss_refusal(&mut self) {
+        self.state.refusal_open = false;
+    }
+
     /// `thumbnails` are the pictures the load's own worker already decoded
     /// for `outcome`'s own projects -- both [`Self::open_paths`] and
     /// [`Self::answer_question`] decode on their worker before parking the
@@ -1787,6 +2538,7 @@ impl AppController {
     /// nothing there is an entry-path failure.
     pub fn refuse_message(&mut self, message: String) {
         self.state.last_refusal = Some(message.clone());
+        self.state.refusal_open = true;
         self.emit(ShellEvent::EntryRefused(message));
     }
 
@@ -1830,6 +2582,7 @@ impl AppController {
     /// list, not to whatever becomes active next.
     fn set_active_tab(&mut self, active: Option<usize>) {
         if self.state.active != active {
+            self.discard_live_stroke();
             self.state.pending_frame_change = None;
         }
         self.state.active = active;
@@ -2065,10 +2818,9 @@ impl AppController {
     /// `Ctrl+N/O/S/W` -- checked before [`Self::key`]'s rebindable table, so
     /// none of the five can be shadowed by a user's rebind. The four
     /// Ctrl-chords apply anywhere in the window, whether or not the overlay
-    /// is open; none of them acts while the Settings modal is open, nor
-    /// while a close question is open. `Esc` only closes an open overlay.
-    /// Every other key press reads [`ChromeKey::None`] and falls through
-    /// unchanged.
+    /// is open; none of them acts while [`Self::modal_open`] holds. `Esc`
+    /// only closes an open overlay. Every other key press reads
+    /// [`ChromeKey::None`] and falls through unchanged.
     pub fn chrome_key(&mut self, text: &str, mods: Modifiers) -> ChromeKey {
         let Some(key) = text.chars().next() else {
             return ChromeKey::None;
@@ -2087,7 +2839,7 @@ impl AppController {
         if !matches!(key, 'n' | 'o' | 's' | 'w') {
             return ChromeKey::None;
         }
-        if self.state.pending_close.is_some() || self.state.settings_open {
+        if self.modal_open() {
             return ChromeKey::Consumed;
         }
         match key {
@@ -2698,8 +3450,9 @@ impl AppController {
     /// tab active ("+" selected).
     pub fn images_panel(&self) -> images::ImagesModel {
         let viewport_height = self.state.images_viewport_height;
+        let legend = self.mode() == ShellMode::Editor;
         let Some(tab) = self.state.active() else {
-            return images::build_model(&[], &[], None, 0.0);
+            return images::build_model(&[], &[], None, 0.0, legend);
         };
         let content_height = tab.frames.len() as f32 * images::ROW_HEIGHT;
         let scroll_y = settings_panel::clamp_panel_scroll(
@@ -2707,7 +3460,13 @@ impl AppController {
             content_height,
             viewport_height,
         );
-        images::build_model(&tab.frames, &tab.excluded, Some(tab.selected), scroll_y)
+        images::build_model(
+            &tab.frames,
+            &tab.excluded,
+            Some(tab.selected),
+            scroll_y,
+            legend,
+        )
     }
 
     /// The active tab's checkpoint count, `0` with none active -- what every
@@ -2755,12 +3514,50 @@ impl AppController {
         self.state.active()?.selected_frame().cloned()
     }
 
+    /// The selected frame's own view onto the active tab's newest fuse --
+    /// `None` before any fuse, when the left pane draws the raw frame. The
+    /// transform is looked up by path in the fused sources, identity for a
+    /// frame added to the tab after its last fuse.
+    pub fn selected_frame_view(&self) -> Option<FrameView> {
+        let tab = self.state.active()?;
+        let (sources, registration) = tab.fused()?;
+        let path = tab.selected_frame()?;
+        let transform = sources
+            .iter()
+            .position(|source| source == path)
+            .map(|i| registration.transform(i))
+            .unwrap_or_else(job::Transform::identity);
+        let extent = display_image(tab)?;
+        Some(FrameView {
+            transform,
+            origin: registration.origin(),
+            extent: (extent.width, extent.height),
+        })
+    }
+
     /// The left pane's label: the selected frame's file name, or empty with
-    /// no tab active or nothing selected.
+    /// no tab active or nothing selected. In editor mode, appends the
+    /// brush source's own position, 1-based, out of the tab's frame count
+    /// (`tab.selected` is also the brush source).
     pub fn frame_pane_label(&self) -> String {
-        self.selected_frame_path()
+        let Some(name) = self
+            .selected_frame_path()
             .map(|path| images::file_name(&path))
-            .unwrap_or_default()
+        else {
+            return String::new();
+        };
+        if self.mode() != ShellMode::Editor {
+            return name;
+        }
+        let tab = self
+            .state
+            .active()
+            .expect("selected_frame_path returned Some, so an active tab exists");
+        format!(
+            "{name} · source {} of {}",
+            tab.selected + 1,
+            tab.frames.len()
+        )
     }
 
     /// Adds `paths` to the active tab: hashes on a worker thread, then
@@ -3413,12 +4210,6 @@ impl AppController {
         true
     }
 
-    /// Scrolls the `Images` panel by `delta_px`, clamped to its current
-    /// content/viewport.
-    pub fn scroll_images_panel(&mut self, delta_px: f32) {
-        self.set_images_scroll(self.state.images_scroll_y + delta_px);
-    }
-
     fn set_images_scroll(&mut self, offset_px: f32) {
         let content_height = self.images_panel().content_height;
         let viewport_height = self.state.images_viewport_height;
@@ -4009,6 +4800,11 @@ impl AppController {
         tab.failure = None;
         let planes = (held.composite.clone(), held.zmap.clone());
         tab.held.push(held);
+        // The new checkpoint's own extent may differ from what the viewport
+        // was fitted to (a first fuse's crop, a re-fuse over a changed frame
+        // set) -- refit on the next `fit_if_unfitted` rather than keep
+        // drawing the old extent's zoom/pan.
+        tab.viewport = None;
         planes
     }
 
