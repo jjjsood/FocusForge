@@ -137,7 +137,7 @@ fn request<'a>(
         algorithm: "laplacian",
         params: values,
         align: None,
-        crop: None,
+        registration: focusforge_core::align::Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -687,6 +687,27 @@ fn a_future_format_version_is_refused_by_name() {
         text.contains(&(FORMAT_VERSION + 1).to_string())
             && text.contains(&FORMAT_VERSION.to_string()),
         "the refusal must name both versions: {text}"
+    );
+}
+
+#[test]
+fn registration_missing_from_the_manifest_opens_as_default() {
+    let (_dir, project_path) = sealed("project_format_registration_default");
+    let without = project_path.with_extension("no-registration.ffp");
+    rewrite_entry(&project_path, &without, "manifest.json", |bytes| {
+        let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("registration")
+            .expect("the sealed manifest must carry a registration key to remove");
+        serde_json::to_vec_pretty(&value).unwrap()
+    });
+    let project = Project::open(&without).expect("a manifest without registration must still open");
+    assert_eq!(
+        project.manifest().registration,
+        focusforge_core::align::Registration::default(),
+        "a manifest written without the field must default it, not refuse the project"
     );
 }
 

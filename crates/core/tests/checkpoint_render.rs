@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use focusforge_core::algorithm::TileReader;
-use focusforge_core::align::Transform;
+use focusforge_core::align::{Registration, Transform};
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter, open_frame_set};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::{
@@ -116,7 +116,6 @@ fn seal_root(name: &str) -> Root {
         algorithm: "identity".to_string(),
         params: ParamValues::new(),
         reference: 0,
-        transforms: transforms.clone(),
     };
 
     let project_path = dir.join(format!("root.{}", project::PROJECT_EXTENSION));
@@ -128,7 +127,10 @@ fn seal_root(name: &str) -> Root {
         algorithm: "weighted_average",
         params: &ParamValues::new(),
         align: Some(align),
-        crop: Some(CROP),
+        registration: Registration {
+            transforms: transforms.clone(),
+            crop: Some(CROP),
+        },
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -214,9 +216,11 @@ fn seal_branched(name: &str) -> Branched {
             algorithm: "identity".to_string(),
             params: ParamValues::new(),
             reference: 0,
-            transforms: root.transforms.clone(),
         }),
-        crop: Some(CROP),
+        registration: Registration {
+            transforms: root.transforms.clone(),
+            crop: Some(CROP),
+        },
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -276,16 +280,13 @@ fn gather_oracle(
 
     let spp = record.composite.samples_per_pixel;
     let frames = record.sources.len();
-    let transforms = match &record.align {
-        Some(align) => align.transforms.clone(),
-        None => vec![Transform::identity(); frames],
-    };
+    let transforms = record.registration.transforms(frames);
     let warping = focusforge_core::align::WarpingReader::new(reader, frame, spp, transforms);
     let sources = Sources {
         reader: &warping,
         frame_count: frames as u32,
         samples_per_pixel: spp,
-        origin: record.crop.map(|r| (r.x, r.y)).unwrap_or((0, 0)),
+        origin: record.registration.origin(),
     };
     let mut gathered = vec![0u16; indices.len() * spp as usize];
     recomposite(&indices, full(width, height), &sources, &mut gathered).unwrap();
@@ -509,7 +510,7 @@ fn band_sink_receives_full_width_bands_in_order() {
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -629,7 +630,7 @@ fn export_render_reads_raw_sources() {
         algorithm: "weighted_average",
         params: &ParamValues::new(),
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),

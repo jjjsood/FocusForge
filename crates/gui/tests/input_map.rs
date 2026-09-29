@@ -38,7 +38,8 @@ fn sink() -> (Arc<Mutex<Vec<ShellEvent>>>, EventSink) {
 #[test]
 fn defaults_match_the_settled_table() {
     // Written out literally rather than derived from the code under test:
-    // seven displayed rows map to nine trigger keys, row for row.
+    // seven displayed rows map to the first nine trigger keys, row for row,
+    // and the tenth (the paint drag) is a hidden row.
     let expected = [
         (
             Trigger::Wheel(NONE),
@@ -110,6 +111,14 @@ fn defaults_match_the_settled_table() {
             Some(Action::PickSourceUnderPointer),
             Some(Action::PickSourceUnderPointer),
         ),
+        (
+            Trigger::Drag {
+                button: Button::Left,
+                mods: NONE,
+            },
+            None,
+            Some(Action::Paint),
+        ),
     ];
 
     assert_eq!(DEFAULT_BINDINGS.len(), expected.len());
@@ -124,10 +133,10 @@ fn defaults_match_the_settled_table() {
 
 #[test]
 fn modes_differ_only_by_declared_overrides() {
-    // Only the two wheel rows (Shift/Alt) and the undo/redo row differ --
-    // the table's explicit overrides. Every other row's stacking and
-    // editor columns must match.
-    let overridden = [2usize, 3, 6, 7];
+    // Only the two wheel rows (Shift/Alt), the undo/redo row and the paint
+    // drag differ -- the table's explicit overrides. Every other row's
+    // stacking and editor columns must match.
+    let overridden = [2usize, 3, 6, 7, 9];
     let table = InputTable::default();
     for (i, binding) in table.bindings.iter().enumerate() {
         if overridden.contains(&i) {
@@ -840,8 +849,8 @@ fn undo_and_redo_are_blocked_under_the_settings_modal() {
 
 #[test]
 fn unimplemented_actions_are_named_not_silent() {
-    // `ZoomAtCursor`, `Pan` and `PanHorizontal` are implemented and must
-    // not be recorded; the other seven must be, by name.
+    // Every action but `OverlayOpacity` is implemented and must not be
+    // recorded; `OverlayOpacity` must be, by name.
     let mut stacking = AppController::new();
     stacking.set_sink(Arc::new(|_| {}));
     stacking.wheel(0.0, 5.0, 0.0, 0.0, NONE); // ZoomAtCursor -- implemented
@@ -890,30 +899,176 @@ fn unimplemented_actions_are_named_not_silent() {
             ..NONE
         },
     ); // Redo
+    editor.pointer(PointerKind::Down, Button::Left, 0.0, 0.0, NONE); // Paint
+    editor.pointer_moved(4.0, 4.0);
+    editor.pointer(PointerKind::Up, Button::Left, 4.0, 4.0, NONE);
 
     let mut got: Vec<Action> = stacking.unimplemented_actions().to_vec();
     got.extend_from_slice(editor.unimplemented_actions());
-
-    let implemented = [Action::ZoomAtCursor, Action::Pan, Action::PanHorizontal];
-    for action in Action::ALL {
-        if implemented.contains(&action) {
-            assert!(
-                !got.contains(&action),
-                "{action} is implemented and must not be recorded as unimplemented"
-            );
-        } else {
-            assert!(
-                got.contains(&action),
-                "{action} was never recorded as unimplemented"
-            );
-        }
-    }
-    got.sort_by_key(Action::to_string);
-    got.dedup();
     assert_eq!(
-        got.len(),
-        Action::ALL.len() - implemented.len(),
-        "no duplicates expected: {got:?}"
+        got,
+        vec![Action::OverlayOpacity],
+        "only the overlay opacity wheel is unimplemented, recorded once"
+    );
+}
+
+/// The brush's `(size, soft)` as the editor toolbar reads them.
+fn brush(controller: &AppController) -> (f32, f32) {
+    let view = controller.brush_toolbar_view();
+    (view.size, view.soft)
+}
+
+/// The action every `ShellEvent::Input` in `events` carried, draining it.
+fn fired(events: &Mutex<Vec<ShellEvent>>) -> Vec<Action> {
+    events
+        .lock()
+        .unwrap()
+        .drain(..)
+        .filter_map(|event| match event {
+            ShellEvent::Input(input) => Some(input.action()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn edit_mode_overrides_are_table_driven() {
+    let ctrl = Modifiers { ctrl: true, ..NONE };
+    let shift = Modifiers {
+        shift: true,
+        ..NONE
+    };
+    let alt = Modifiers { alt: true, ..NONE };
+
+    let mut editor = AppController::new_with_mode_for_test(ShellMode::Editor);
+    let (events, cb) = sink();
+    editor.set_sink(cb);
+    let (_, soft) = brush(&editor);
+    editor.wheel(0.0, 60.0, 0.0, 0.0, alt);
+    assert_eq!(brush(&editor).1, soft + 5.0, "one detent moves Soft by 5");
+    editor.wheel(0.0, 30.0, 0.0, 0.0, alt);
+    assert_eq!(brush(&editor).1, soft + 5.0, "half a detent does nothing");
+    editor.wheel(0.0, 30.0, 0.0, 0.0, alt);
+    assert_eq!(
+        brush(&editor).1,
+        soft + 10.0,
+        "the second half completes it"
+    );
+    editor.wheel(0.0, -60.0, 0.0, 0.0, shift);
+    editor.wheel(0.0, 60.0, 0.0, 0.0, ctrl);
+    assert_eq!(brush(&editor).1, soft + 10.0, "size and source leave Soft");
+    assert_eq!(
+        fired(&events),
+        vec![
+            Action::BrushSoftness,
+            Action::BrushSoftness,
+            Action::BrushSoftness,
+            Action::BrushSize,
+            Action::StepSourceFrame,
+        ]
+    );
+    assert!(editor.unimplemented_actions().is_empty());
+
+    let mut view = AppController::new();
+    let (events, cb) = sink();
+    view.set_sink(cb);
+    let before = brush(&view);
+    view.wheel(0.0, 60.0, 0.0, 0.0, shift);
+    view.wheel(0.0, 60.0, 0.0, 0.0, alt);
+    view.wheel(0.0, 60.0, 0.0, 0.0, ctrl);
+    assert_eq!(brush(&view), before, "no view-mode wheel touches the brush");
+    assert_eq!(
+        fired(&events),
+        vec![
+            Action::PanHorizontal,
+            Action::OverlayOpacity,
+            Action::StepSourceFrame
+        ]
+    );
+    assert_eq!(view.unimplemented_actions(), [Action::OverlayOpacity]);
+
+    // A user file that rebinds `shift+wheel` in the editor column changes
+    // what the wheel does there, and nothing else.
+    let dir = tempfile::tempdir().unwrap();
+    let toml = format!(
+        "version = 1\n{}",
+        row_toml(
+            &Trigger::Wheel(shift).to_string(),
+            Some(Action::PanHorizontal),
+            Some(Action::BrushSoftness),
+        )
+    );
+    fs::write(dir.path().join("input.toml"), toml).unwrap();
+    let loaded = input_config::load(dir.path());
+    assert!(loaded.problems.is_empty());
+    let mut rebound = AppController::new_with_mode_for_test(ShellMode::Editor);
+    let (events, cb) = sink();
+    rebound.set_sink(cb);
+    rebound.install_input_table(loaded.table, loaded.provenance);
+    let (size, soft) = brush(&rebound);
+    rebound.wheel(0.0, 60.0, 0.0, 0.0, shift);
+    assert_eq!(brush(&rebound), (size, soft + 5.0));
+    assert_eq!(fired(&events), vec![Action::BrushSoftness]);
+}
+
+#[test]
+fn paint_drag_is_a_hidden_table_row() {
+    let left_drag = Trigger::Drag {
+        button: Button::Left,
+        mods: NONE,
+    };
+    let table = InputTable::default();
+    assert_eq!(
+        table.action(&left_drag, ShellMode::Editor),
+        Some(Action::Paint)
+    );
+    assert_eq!(table.action(&left_drag, ShellMode::Stacking), None);
+
+    let rows = table.display_rows();
+    assert_eq!(rows.len(), 7, "the settings table keeps its seven rows");
+    assert!(
+        rows.iter()
+            .all(|row| !format!("{} {} {}", row.input, row.stacking, row.editor).contains("paint")),
+        "the paint drag is not shown: {rows:?}"
+    );
+
+    let mut view = AppController::new();
+    let (events, cb) = sink();
+    view.set_sink(cb);
+    view.pointer(PointerKind::Down, Button::Left, 5.0, 5.0, NONE);
+    view.pointer_moved(9.0, 7.0);
+    view.pointer(PointerKind::Up, Button::Left, 9.0, 7.0, NONE);
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "a view-mode left drag does nothing"
+    );
+    assert!(view.unimplemented_actions().is_empty());
+
+    let mut editor = AppController::new_with_mode_for_test(ShellMode::Editor);
+    let (events, cb) = sink();
+    editor.set_sink(cb);
+    editor.pointer(PointerKind::Down, Button::Left, 5.0, 5.0, NONE);
+    editor.pointer_moved(9.0, 7.0);
+    editor.pointer(PointerKind::Up, Button::Left, 9.0, 7.0, NONE);
+    let got = events.lock().unwrap().clone();
+    assert!(
+        matches!(
+            got.as_slice(),
+            [
+                ShellEvent::Input(ActionEvent::Start {
+                    action: Action::Paint,
+                    ..
+                }),
+                ShellEvent::Input(ActionEvent::Update {
+                    action: Action::Paint,
+                    ..
+                }),
+                ShellEvent::Input(ActionEvent::End {
+                    action: Action::Paint
+                }),
+            ]
+        ),
+        "{got:?}"
     );
 }
 
@@ -923,9 +1078,11 @@ fn unimplemented_actions_are_named_not_silent() {
 
 /// Files whose own widget owns a raw gesture callback rather than routing
 /// through the canvas's rebindable zoom/pan/drag gesture table: the canvas
-/// itself, plus every scrollable panel and drag-based control (the slider
-/// and the scrollbar), each forwarding its callback body in one line to
-/// `AppController` and interpreting nothing in `.slint`.
+/// itself, every scrollable panel and drag-based control (the slider and
+/// the scrollbar), each forwarding its callback body in one line to
+/// `AppController` and interpreting nothing in `.slint`, plus every modal
+/// scrim and the Projects overlay's background, whose `scroll-event`
+/// swallows the wheel with a bare `accept` and forwards nothing.
 const RAW_GESTURE_CALLBACK_EXCEPTIONS: &[&str] = &[
     "canvas.slint",
     "ff_slider.slint",
@@ -936,6 +1093,10 @@ const RAW_GESTURE_CALLBACK_EXCEPTIONS: &[&str] = &[
     "ff_image_row.slint",
     "gallery.slint",
     "ff_manifest_list.slint",
+    "ff_dialog.slint",
+    "settings_modal.slint",
+    "dialogs.slint",
+    "projects_overlay.slint",
 ];
 
 #[test]

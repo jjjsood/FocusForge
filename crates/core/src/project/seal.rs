@@ -30,8 +30,8 @@ use super::manifest::{
     SourceResolution,
 };
 use super::{HASH_ALGORITHM, format_version_for};
+use crate::align::Registration;
 use crate::params::ParamValues;
-use crate::tile::Rect;
 
 /// Everything one seal needs. Borrowed rather than owned: the caller
 /// already holds every one of these.
@@ -46,8 +46,8 @@ pub struct SealRequest<'a> {
     pub algorithm: &'a str,
     pub params: &'a ParamValues,
     pub align: Option<AlignRecord>,
-    /// The composite's extent after any crop was applied.
-    pub crop: Option<Rect>,
+    /// Every frame's transform and the applied crop.
+    pub registration: Registration,
     /// The `ImageDescription` an export of the fused checkpoint's own
     /// gather writes into its TIFF's IFD.
     pub composite_description: String,
@@ -148,6 +148,7 @@ fn seal_staged(
         algorithm: request.algorithm.to_string(),
         params: request.params.clone(),
         align: request.align.clone(),
+        registration: request.registration.clone(),
         sources,
         composite: PlaneRef {
             blob: composite.hash.clone(),
@@ -170,7 +171,6 @@ fn seal_staged(
         blobs,
         metrics: request.metrics,
         checkpoint: checkpoint_id.clone(),
-        crop: request.crop,
     };
 
     let checkpoint = Checkpoint {
@@ -186,7 +186,7 @@ fn seal_staged(
         fuse: Some(FuseRecord {
             composite: manifest.composite.clone(),
             align: manifest.align.clone(),
-            crop: manifest.crop,
+            registration: manifest.registration.clone(),
             sources: manifest.sources.clone(),
             metrics: manifest.metrics,
         }),
@@ -228,8 +228,8 @@ pub struct HeldCheckpoint {
     pub algorithm: String,
     pub params: ParamValues,
     pub align: Option<AlignRecord>,
-    /// The composite's extent after any crop was applied.
-    pub crop: Option<Rect>,
+    /// Every frame's transform and the applied crop.
+    pub registration: Registration,
     /// Exactly the `ImageDescription` the composite carries.
     pub composite_description: String,
     pub metrics: Metrics,
@@ -287,7 +287,7 @@ fn seal_chain(
                     algorithm: &checkpoint.algorithm,
                     params: &checkpoint.params,
                     align: checkpoint.align.clone(),
-                    crop: checkpoint.crop,
+                    registration: checkpoint.registration.clone(),
                     composite_description: checkpoint.composite_description.clone(),
                     label: None,
                     metrics: checkpoint.metrics,
@@ -304,7 +304,7 @@ fn seal_chain(
                     algorithm: &checkpoint.algorithm,
                     params: &checkpoint.params,
                     align: checkpoint.align.clone(),
-                    crop: checkpoint.crop,
+                    registration: checkpoint.registration.clone(),
                     composite_description: checkpoint.composite_description.clone(),
                     label: None,
                     metrics: checkpoint.metrics,

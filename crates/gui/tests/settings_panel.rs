@@ -373,7 +373,7 @@ fn seal_without_align(name: &str, algorithm: &str) -> PathBuf {
         algorithm,
         params: &ParamValues::new(),
         align: None,
-        crop: None,
+        registration: focusforge_core::align::Registration::default(),
         composite_description: "staged".to_string(),
         label: None,
         metrics: Metrics::default(),

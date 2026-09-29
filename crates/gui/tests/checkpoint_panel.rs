@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{Datelike, Days, Local, NaiveDate};
+use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::{
@@ -126,7 +127,7 @@ fn write_chain(project_path: &Path, times: &[i64]) {
             algorithm: "laplacian-pyramid",
             params: &ParamValues::new(),
             align: None,
-            crop: None,
+            registration: Registration::default(),
             composite_description: "staged".to_string(),
             label: None,
             metrics: Metrics::default(),
@@ -227,7 +228,7 @@ fn held_at(created_at: i64) -> HeldCheckpoint {
         algorithm: "laplacian-pyramid".to_string(),
         params: ParamValues::new(),
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: String::new(),
         metrics: Metrics::default(),
         created_at,
@@ -320,7 +321,7 @@ fn build_edited(name: &str) -> Edited {
             algorithm: "laplacian-pyramid",
             params: &ParamValues::new(),
             align: None,
-            crop: None,
+            registration: Registration::default(),
             composite_description: "staged".to_string(),
             label: None,
             metrics: Metrics::default(),
@@ -576,23 +577,23 @@ fn a_failed_frame_is_named_and_not_reopened_per_repaint() {
         "Cannot show this frame:".to_string(),
         "missing: 00.tif".to_string(),
     ];
-    canvas.set_frame(Some(&path));
+    canvas.set_frame(Some(&path), None);
     assert_eq!(canvas.frame_refusal(), missing.as_slice());
 
     fs::copy(common::fixture_frame("mantis-64", 0), &path).unwrap();
-    canvas.set_frame(Some(&path));
+    canvas.set_frame(Some(&path), None);
     assert_eq!(
         canvas.frame_refusal(),
         missing.as_slice(),
         "a repaint of the same selection must not reopen the frame"
     );
-    canvas.set_frame(None);
-    canvas.set_frame(Some(&path));
+    canvas.set_frame(None, None);
+    canvas.set_frame(Some(&path), None);
     assert!(canvas.frame_refusal().is_empty());
 
     let junk = dir.join("01.tif");
     fs::write(&junk, b"not a tiff").unwrap();
-    canvas.set_frame(Some(&junk));
+    canvas.set_frame(Some(&junk), None);
     assert_eq!(
         canvas.frame_refusal(),
         [

@@ -10,6 +10,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use focusforge_core::align::Registration;
 use focusforge_core::io::{TiffSpec, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::{
@@ -168,7 +169,7 @@ fn seal_op_bearing(name: &str, height: u32) -> (PathBuf, String, String) {
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -412,7 +413,7 @@ fn seal_fused(name: &str, width: u32, height: u32, spp: u32, frames: u32) -> (Pa
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),

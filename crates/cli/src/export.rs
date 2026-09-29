@@ -19,16 +19,24 @@
 //!   the image. `core` returns them as data; printing them is this
 //!   module's.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::Args;
+use focusforge_core::algorithm::TileReader;
+use focusforge_core::align::WarpingReader;
+use focusforge_core::host;
+use focusforge_core::io::{Rect, TiffSpec, TiffWriter, open_frame_set};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::export::{ExportFormat, ExportOptions, params_for};
-use focusforge_core::project::{self, Project};
+use focusforge_core::project::{self, FuseRecord, Project};
+use focusforge_core::tile::HostBudget;
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
+
+/// Rows per streamed band, `export_frame`'s own band-wise write.
+const FRAME_BAND_ROWS: u32 = 256;
 
 /// `--format` and every per-format flag `export` accepts. Flattened into
 /// `Command::Export`; each field is `Option<String>` so an absent flag
@@ -165,34 +173,46 @@ pub struct ExportReport {
     /// or the head's when it was omitted.
     pub checkpoint: String,
     /// The format `-o`'s image was encoded as. `null` when only `--zmap`
-    /// was written.
+    /// or `--frame-output` was written.
     pub format: Option<String>,
     /// Every descriptor id of `format`'s schema with its resolved value,
     /// defaults included. `null` alongside `format`.
     pub format_options: Option<ParamValues>,
+    /// The source frame index written "as fused", if `--frame` was given.
+    pub frame: Option<usize>,
     pub wall_seconds: f64,
 }
 
 /// Runs the subcommand.
 ///
-/// At least one of `-o`/`--zmap` is required **by name**, checked here so
-/// the error names the missing flag instead of clap's generic exit 2.
+/// At least one of `-o`/`--zmap`/`--frame` is required **by name**, checked
+/// here so the error names the missing flag instead of clap's generic exit
+/// 2. `--frame-output` without `--frame` is refused the same way; `--frame`
+/// without `--frame-output` is already a clap usage error (`requires`).
 /// `checkpoint` is an id or unique id prefix, resolved against the
-/// project's own history; `None` renders the head.
+/// project's own history; `None` renders the head -- `--frame-output` reads
+/// the same resolved checkpoint's own fuse state, not the project's head.
+#[allow(clippy::too_many_arguments)] // one flag apiece; grouping them would only rename this list
 pub fn run(
     project_path: &Path,
     output: Option<&Path>,
     zmap: Option<&Path>,
     checkpoint: Option<&str>,
     format: &FormatArgs,
+    frame: Option<usize>,
+    frame_output: Option<&Path>,
     json: bool,
 ) -> ExitCode {
     let start = Instant::now();
-    if output.is_none() && zmap.is_none() {
+    if output.is_none() && zmap.is_none() && frame_output.is_none() {
         return fail(
             "export needs somewhere to write: -o <file> for the image, \
-             --zmap <file> for the Z-Map, or both",
+             --zmap <file> for the Z-Map, --frame <index> --frame-output <file> for one \
+             source frame, or any combination",
         );
+    }
+    if frame_output.is_some() && frame.is_none() {
+        return fail("--frame-output requires --frame <index>");
     }
 
     let export_options = match output {
@@ -244,6 +264,16 @@ pub fn run(
         Err(err) => return fail(err),
     };
 
+    let source_count = project.manifest().sources.len();
+    if let Some(index) = frame
+        && index >= source_count
+    {
+        return fail(format!(
+            "frame {index} is out of range: this project has frames 0-{}",
+            source_count.saturating_sub(1)
+        ));
+    }
+
     let mut wrote = Vec::new();
     if let Some(path) = output {
         let options = export_options
@@ -256,6 +286,12 @@ pub fn run(
     }
     if let Some(path) = zmap {
         if let Err(err) = project::materialize_zmap(&mut project, &checkpoint, path) {
+            return fail(err);
+        }
+        wrote.push(path.display().to_string());
+    }
+    if let (Some(index), Some(path)) = (frame, frame_output) {
+        if let Err(err) = export_frame(&project, &record, index, path) {
             return fail(err);
         }
         wrote.push(path.display().to_string());
@@ -273,6 +309,7 @@ pub fn run(
         checkpoint: checkpoint.id,
         format: export_options.as_ref().map(|o| o.format().id().to_string()),
         format_options: export_options.as_ref().map(|o| o.values()),
+        frame,
         wall_seconds: start.elapsed().as_secs_f64(),
     };
     if json {
@@ -301,6 +338,9 @@ fn render(report: &ExportReport) -> String {
     if let Some(format) = &report.format {
         lines.push(format!("format: {format}"));
     }
+    if let Some(index) = report.frame {
+        lines.push(format!("frame: {index}"));
+    }
     if !report.unresolved_sources.is_empty() {
         lines.push(format!(
             "unresolved sources: {}",
@@ -318,6 +358,92 @@ fn fail(message: impl std::fmt::Display) -> ExitCode {
     eprintln!("error: {message}");
     tracing::error!(target: MIRRORED_OUTPUT_TARGET, "error: {message}");
     ExitCode::FAILURE
+}
+
+/// Writes source frame `index` "as fused" to `path`: warped by its recorded
+/// transform and offset by the applied crop, at the resolved checkpoint's
+/// own composite width and height -- never the project's head unless that
+/// is what `--checkpoint` resolved to. `index` must already be checked in
+/// range.
+fn export_frame(
+    project: &Project,
+    record: &FuseRecord,
+    index: usize,
+    path: &Path,
+) -> Result<(), String> {
+    let composite = record.composite.clone();
+    let registration = record.registration.clone();
+    let paths: Vec<PathBuf> = project
+        .manifest()
+        .sources
+        .iter()
+        .map(|source| project.source_path(source))
+        .collect();
+
+    let budget = HostBudget::host_derived(&host::snapshot());
+    let frame_set = open_frame_set(&paths, budget).map_err(|err| err.to_string())?;
+    let frame_dims = frame_set.reader.dimensions();
+    let transforms = registration.transforms(frame_set.reader.len());
+    let reader = WarpingReader::new(
+        frame_set.reader.as_ref(),
+        frame_dims,
+        composite.samples_per_pixel,
+        transforms,
+    );
+    let origin = registration.origin();
+
+    let partial = project::partial_path(path);
+    let result = (|| {
+        let mut writer = TiffWriter::create(
+            &partial,
+            TiffSpec {
+                width: composite.width,
+                height: composite.height,
+                samples_per_pixel: composite.samples_per_pixel,
+                description: Some(composite.description.clone()),
+            },
+        )
+        .map_err(|err| err.to_string())?;
+
+        let spp = composite.samples_per_pixel;
+        let mut buf =
+            vec![0u16; composite.width as usize * FRAME_BAND_ROWS as usize * spp as usize];
+        let mut y = 0u32;
+        while y < composite.height {
+            let rows = FRAME_BAND_ROWS.min(composite.height - y);
+            let rect = Rect {
+                x: 0,
+                y,
+                width: composite.width,
+                height: rows,
+            };
+            let source_rect = Rect {
+                x: rect.x + origin.0,
+                y: rect.y + origin.1,
+                width: rect.width,
+                height: rect.height,
+            };
+            let len = (rect.width * rows * spp) as usize;
+            reader
+                .read_tile_into(index, source_rect, &mut buf[..len])
+                .map_err(|err| err.to_string())?;
+            writer
+                .write_tile(rect, &buf[..len])
+                .map_err(|err| err.to_string())?;
+            y += rows;
+        }
+        writer.finish().map_err(|err| err.to_string())
+    })();
+
+    match result.and_then(|()| {
+        std::fs::rename(&partial, path).map_err(|err| format!("{}: {err}", path.display()))
+    }) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = std::fs::remove_file(&partial);
+            Err(err)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -427,6 +553,7 @@ mod tests {
             checkpoint: "abc123".to_string(),
             format: Some("tiff".to_string()),
             format_options: Some(ParamValues::new()),
+            frame: None,
             wall_seconds: 0.25,
         });
         for needle in [

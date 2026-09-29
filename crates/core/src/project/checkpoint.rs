@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use super::error::ProjectError;
 use super::manifest::{AlignRecord, Metrics, PlaneRef, SourceRef};
+use crate::align::Registration;
 use crate::params::ParamValues;
 use crate::tile::Rect;
 
@@ -59,7 +60,8 @@ pub struct Checkpoint {
 pub struct FuseRecord {
     pub composite: PlaneRef,
     pub align: Option<AlignRecord>,
-    pub crop: Option<Rect>,
+    /// Every frame's transform and the applied crop.
+    pub registration: Registration,
     pub sources: Vec<SourceRef>,
     pub metrics: Metrics,
 }

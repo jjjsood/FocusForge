@@ -1096,15 +1096,14 @@ fn stage_timings_do_not_change_the_output() {
 /// A read-only `-o` directory passes the checks before the run (it *is*
 /// a directory), lets fusion finish, and only fails when sealing tries
 /// to create the container's `.partial`.
+#[cfg(unix)]
 #[test]
 fn failed_seal_leaves_no_output() {
-    use std::os::unix::fs::PermissionsExt;
-
+    let Some(out_dir) = common::readonly_dir("failed_seal_leaves_no_output", 0o555, |_| {}) else {
+        return;
+    };
     let cwd = tmp_dir("failed_seal_leaves_no_output");
-    let out_dir = cwd.join("readonly");
-    std::fs::create_dir_all(&out_dir).unwrap();
     let output = out_dir.join("mantis-512.ffp");
-    std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
     let out = run_cli_in(
         &cwd,
@@ -1119,9 +1118,6 @@ fn failed_seal_leaves_no_output() {
             "--no-crop",
         ],
     );
-    // Restore before asserting, so a failed assertion still leaves a
-    // removable directory behind.
-    std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     assert!(
         !out.success,
@@ -1134,7 +1130,7 @@ fn failed_seal_leaves_no_output() {
         "no .partial may survive a failed seal"
     );
     assert!(
-        std::fs::read_dir(&out_dir).unwrap().next().is_none(),
+        std::fs::read_dir(&*out_dir).unwrap().next().is_none(),
         "the failed seal left something behind in the output directory"
     );
 }

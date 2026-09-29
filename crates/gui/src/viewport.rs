@@ -159,6 +159,16 @@ impl Viewport {
         self.origin
     }
 
+    /// The source-space point under a pane-local point: `origin() + local /
+    /// scale()`.
+    pub fn to_source(&self, local: (f32, f32)) -> (f64, f64) {
+        let (ox, oy) = self.origin;
+        (
+            ox + f64::from(local.0) / self.scale,
+            oy + f64::from(local.1) / self.scale,
+        )
+    }
+
     /// The anchor-exact wheel zoom: `delta` ladder positions from the
     /// current one (saturating at both ends), `anchor` (pane-local) held
     /// fixed in source space across the change.

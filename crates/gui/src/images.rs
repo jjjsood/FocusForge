@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use focusforge_core::io::capture_time;
-use focusforge_core::zmap::source_color;
+use focusforge_core::zmap::{overlay_table, source_color};
 
 /// A row's fixed height, top to top of the next row.
 pub const ROW_HEIGHT: f32 = 26.0;
@@ -22,9 +22,10 @@ pub const ROW_HEIGHT: f32 = 26.0;
 pub struct ImageRow {
     pub chip: [u8; 3],
     pub name: String,
-    /// The recorded capture time, verbatim, or empty when absent or the
-    /// source is unresolved.
-    pub time_text: String,
+    /// The recorded capture time in stacking mode, or the row's 1-based
+    /// position in legend mode -- verbatim, or empty when a capture time is
+    /// absent or the source is unresolved.
+    pub trailing_text: String,
     pub excluded: bool,
     /// The recorded source is no longer a file on disk.
     pub unresolved: bool,
@@ -42,6 +43,9 @@ pub struct ImagesModel {
     pub header_text: String,
     pub content_height: f32,
     pub scroll_y: f32,
+    /// Legend mode only: the pinned `NO_SOURCE` entry shows below `rows`,
+    /// outside the scrolled list.
+    pub no_source_row: bool,
 }
 
 /// Builds one row per frame, in order. `excluded` shorter than `frames` is
@@ -64,12 +68,35 @@ fn build_rows(frames: &[PathBuf], excluded: &[bool], selected: Option<usize>) ->
             ImageRow {
                 chip: source_color(i as u16, total),
                 name: file_name(path),
-                time_text,
+                trailing_text: time_text,
                 excluded: excluded.get(i).copied().unwrap_or(false),
                 unresolved,
                 top: i as f32 * ROW_HEIGHT,
                 selected: selected == Some(i),
             }
+        })
+        .collect()
+}
+
+/// One legend row per frame, in position order -- editor mode only ever runs
+/// over the frame set its own Z-Map was fused from (`can_edit`'s own gate),
+/// so a position *is* its Z-Map source index and the exclusion mask is
+/// never consulted: excluding a frame after the fuse changes no index.
+/// `chip` is `overlay_table`'s colour for that index, no palette arithmetic.
+fn build_legend_rows(frames: &[PathBuf], selected: Option<usize>) -> Vec<ImageRow> {
+    let total = frames.len().max(1) as u32;
+    let table = overlay_table(total, None);
+    frames
+        .iter()
+        .enumerate()
+        .map(|(i, path)| ImageRow {
+            chip: table[i],
+            name: file_name(path),
+            trailing_text: (i + 1).to_string(),
+            excluded: false,
+            unresolved: !path.is_file(),
+            top: i as f32 * ROW_HEIGHT,
+            selected: selected == Some(i),
         })
         .collect()
 }
@@ -99,27 +126,44 @@ pub(crate) fn file_name(path: &Path) -> String {
 }
 
 /// Builds the whole panel model: the header count and the rows, at a given
-/// scroll offset already clamped by the caller.
+/// scroll offset already clamped by the caller. `legend` selects the
+/// editor's read-only legend (colour and position number from
+/// `build_legend_rows`) over stacking's own row builder (capture time,
+/// exclusion count).
 pub fn build_model(
     frames: &[PathBuf],
     excluded: &[bool],
     selected: Option<usize>,
     scroll_y: f32,
+    legend: bool,
 ) -> ImagesModel {
-    let rows = build_rows(frames, excluded, selected);
-    let excluded_count = rows.iter().filter(|r| r.excluded).count();
-    let header_text = format!(
-        "{} frame{} \u{b7} {} excluded",
-        rows.len(),
-        if rows.len() == 1 { "" } else { "s" },
-        excluded_count
-    );
+    let rows = if legend {
+        build_legend_rows(frames, selected)
+    } else {
+        build_rows(frames, excluded, selected)
+    };
+    let header_text = if legend {
+        format!(
+            "{} frame{}",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" }
+        )
+    } else {
+        let excluded_count = rows.iter().filter(|r| r.excluded).count();
+        format!(
+            "{} frame{} \u{b7} {} excluded",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" },
+            excluded_count
+        )
+    };
     let content_height = rows.len() as f32 * ROW_HEIGHT;
     ImagesModel {
         rows,
         header_text,
         content_height,
         scroll_y,
+        no_source_row: legend,
     }
 }
 
@@ -294,7 +338,7 @@ mod tests {
                 )
             })
             .collect();
-        let model = build_model(&frames, &[false, false, false], None, 0.0);
+        let model = build_model(&frames, &[false, false, false], None, 0.0, false);
         assert_eq!(model.rows.len(), 3);
         assert_eq!(model.header_text, "3 frames \u{b7} 0 excluded");
         // ImageRow's own fields are exhaustively named here -- there is no
@@ -310,16 +354,22 @@ mod tests {
             write_timed(dir.path(), "00.tif", Some("2026:08:29 10:00:00")),
             write_timed(dir.path(), "01.tif", None),
         ];
-        let model = build_model(&frames, &[false, false], None, 0.0);
-        assert_eq!(model.rows[1].time_text, "");
+        let model = build_model(&frames, &[false, false], None, 0.0, false);
+        assert_eq!(model.rows[1].trailing_text, "");
         assert!(!model.rows[1].unresolved);
     }
 
     #[test]
     fn an_unresolved_source_carries_no_fabricated_time() {
-        let model = build_model(&[PathBuf::from("/does/not/exist.tif")], &[false], None, 0.0);
+        let model = build_model(
+            &[PathBuf::from("/does/not/exist.tif")],
+            &[false],
+            None,
+            0.0,
+            false,
+        );
         assert!(model.rows[0].unresolved);
-        assert_eq!(model.rows[0].time_text, "");
+        assert_eq!(model.rows[0].trailing_text, "");
     }
 
     #[test]
@@ -334,7 +384,7 @@ mod tests {
                 )
             })
             .collect();
-        let model = build_model(&frames, &[true, false], None, 0.0);
+        let model = build_model(&frames, &[true, false], None, 0.0, false);
         assert_eq!(model.header_text, "2 frames \u{b7} 1 excluded");
     }
 

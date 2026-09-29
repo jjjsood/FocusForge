@@ -173,10 +173,12 @@ fn checkpoint_panel_touches_no_storage() {
     // `input_config.rs` is a config file, and `settings_panel.rs` is the one
     // module allowed to name the schema/registry crate. `checkpoints.rs`
     // reads the history the panel lists, beside `job.rs`, which reads its
-    // planes. Excluded by name: this test's own subject is the checkpoint
-    // panel, not the whole crate.
+    // planes, and `brush.rs`, which builds the stored stroke's path in
+    // core's own point type. Excluded by name: this test's own subject is
+    // the checkpoint panel, not the whole crate.
     let canvas_files = [
         "checkpoints.rs",
+        "brush.rs",
         "canvas.rs",
         "gpu_canvas.rs",
         "entry.rs",
@@ -959,4 +961,53 @@ fn loading_indicator_never_shows_for_a_load_that_ends_before_the_threshold() {
         !app.get_load_indicator_visible(),
         "a load that finished before the threshold must never flash the indicator"
     );
+}
+
+/// The bottom bar's overlay caption, toggle and slider are absent in
+/// stacking mode -- no element matches their ids at all, rather than merely
+/// hidden -- and all three appear in editor mode, the slider staying
+/// present (greyed by its own `disabled` binding) whether the overlay is on
+/// or off.
+#[test]
+fn overlay_controls_exist_in_editor_only() {
+    let app = app_at(1440, 900);
+    app.set_show_empty_state(false);
+
+    let present = |id: &str| {
+        ElementQuery::from_root(&app)
+            .match_id(id)
+            .find_first()
+            .is_some()
+    };
+    let ids = [
+        "FFBottomBar::overlay-caption",
+        "FFBottomBar::overlay-toggle",
+        "FFBottomBar::overlay-slider",
+    ];
+
+    for id in ids {
+        assert!(!present(id), "{id}: stacking mode has no overlay controls");
+    }
+
+    app.set_mode("editor".into());
+    for id in ids {
+        assert!(present(id), "{id}: editor mode shows the overlay controls");
+    }
+
+    app.set_overlay_on(false);
+    assert!(
+        present("FFBottomBar::overlay-slider"),
+        "the slider stays present, greyed, while the overlay is off"
+    );
+
+    app.set_overlay_on(true);
+    assert!(present("FFBottomBar::overlay-slider"));
+
+    app.set_mode("stacking".into());
+    for id in ids {
+        assert!(
+            !present(id),
+            "{id}: leaving editor mode removes the controls rather than disabling them"
+        );
+    }
 }

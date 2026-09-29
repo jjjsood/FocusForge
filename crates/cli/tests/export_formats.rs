@@ -11,6 +11,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, SegmentOrigin, TiffSegmentReader, TiffSpec, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::to_8bit;
@@ -150,7 +151,7 @@ fn build_synth(name: &str, spp: u32) -> Synth {
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -217,7 +218,7 @@ fn build_oversized(name: &str) -> (common::TmpDir, PathBuf) {
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),

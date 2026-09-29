@@ -19,12 +19,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
+use focusforge_core::algorithm::TileReader;
+use focusforge_core::align::{Registration, WarpingReader};
+use focusforge_core::io::{Rect, TiffHeader, TiffSpec, TiffStack, TiffWriter, open_frame_set};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::{
-    self, AlignRecord, AppendRequest, Metrics, Op, Point, Project, SealRequest, ZMapStorage,
+    self, AlignRecord, AppendRequest, Metrics, Op, Plane, Point, Project, SealRequest, ZMapStorage,
+    partial_path,
 };
 use focusforge_core::retouch::{Sources, recomposite};
+use focusforge_core::tile::HostBudget;
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
 fn bin() -> Command {
@@ -407,7 +411,7 @@ fn build_branched(name: &str) -> Branched {
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -437,12 +441,15 @@ fn build_branched(name: &str) -> Branched {
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
-        crop: Some(Rect {
-            x: 1,
-            y: 1,
-            width: RW,
-            height: RH,
-        }),
+        registration: Registration {
+            transforms: Vec::new(),
+            crop: Some(Rect {
+                x: 1,
+                y: 1,
+                width: RW,
+                height: RH,
+            }),
+        },
         composite_description: "re-fused composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -688,6 +695,173 @@ fn plain_export_of_an_edited_head_renders_the_edit() {
     );
 }
 
+// ---------------------------------------------------------------------
+// `--frame <INDEX> --frame-output <FILE>`: one source frame, as fused.
+// ---------------------------------------------------------------------
+
+/// One `stack` run that actually aligns and crops (`dummy-align`, the
+/// default `--crop`), so the exported frame's extent genuinely differs from
+/// a raw source frame's.
+struct AlignedProject {
+    cwd: common::TmpDir,
+    project: PathBuf,
+}
+
+fn aligned_project() -> &'static AlignedProject {
+    static ONCE: OnceLock<AlignedProject> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let cwd = common::tmp_dir("export_cli_aligned_stack");
+        let out = cwd.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let input = common::fixtures_dir().join("mantis-512");
+        let mut args = vec![
+            "stack".to_string(),
+            input.to_str().unwrap().to_string(),
+            "-o".to_string(),
+            out.to_str().unwrap().to_string(),
+            "--algo".to_string(),
+            "laplacian".to_string(),
+            "--align-algo".to_string(),
+            "dummy-align".to_string(),
+        ];
+        if cfg!(feature = "gpu") {
+            args.push("--no-gpu".to_string());
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = run_cli_in(&cwd, &args);
+        assert!(
+            result.success,
+            "an aligned, cropped stack must succeed -- stderr: {}",
+            result.stderr
+        );
+        let project = only_project(&out);
+        AlignedProject { cwd, project }
+    })
+}
+
+/// The frame-as-fused view of `index`, built directly through the library
+/// (never through `export`) -- the independent oracle `--frame` is checked
+/// against.
+fn oracle_fused_frame(project_path: &Path, index: usize) -> (u32, u32, u32, Vec<u16>) {
+    let project = Project::open(project_path).expect("open project");
+    let composite = project.plane(Plane::Composite).clone();
+    let registration = project.manifest().registration.clone();
+    let sources: Vec<PathBuf> = project
+        .manifest()
+        .sources
+        .iter()
+        .map(|source| project.source_path(source))
+        .collect();
+
+    let budget = HostBudget::host_derived(&focusforge_core::host::snapshot());
+    let frame_set = open_frame_set(&sources, budget).expect("open frame set");
+    let frame_dims = frame_set.reader.dimensions();
+    let transforms = registration.transforms(frame_set.reader.len());
+    let warping = WarpingReader::new(
+        frame_set.reader.as_ref(),
+        frame_dims,
+        composite.samples_per_pixel,
+        transforms,
+    );
+    let origin = registration.origin();
+    let rect = Rect {
+        x: origin.0,
+        y: origin.1,
+        width: composite.width,
+        height: composite.height,
+    };
+    let mut samples =
+        vec![0u16; (composite.width * composite.height * composite.samples_per_pixel) as usize];
+    warping
+        .read_tile_into(index, rect, &mut samples)
+        .expect("read the fused frame directly through the library");
+    (
+        composite.width,
+        composite.height,
+        composite.samples_per_pixel,
+        samples,
+    )
+}
+
+#[test]
+fn export_writes_one_frame_as_fused_at_the_composite_size() {
+    let shared = aligned_project();
+    let dir = common::tmp_dir("export_cli_frame");
+    let out = dir.join("frame-05.tif");
+    let result = run_cli_in(
+        &shared.cwd,
+        &[
+            "export",
+            shared.project.to_str().unwrap(),
+            "--frame",
+            "5",
+            "--frame-output",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(result.success, "stderr: {}", result.stderr);
+    assert!(out.exists(), "the frame TIFF must have been written");
+    assert!(
+        !partial_path(&out).exists(),
+        "no .partial must survive a successful export"
+    );
+
+    let header = TiffHeader::open(&out).expect("exported frame header");
+    let (expected_w, expected_h, expected_spp, expected_samples) =
+        oracle_fused_frame(&shared.project, 5);
+    assert_eq!(
+        (header.width, header.height),
+        (expected_w, expected_h),
+        "the exported frame must be at the composite's own extent"
+    );
+    assert_eq!(header.samples_per_pixel, expected_spp);
+
+    let exported = TiffStack::open_files(std::slice::from_ref(&out))
+        .expect("open the exported frame as a one-frame stack");
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: header.width,
+        height: header.height,
+    };
+    let got = exported
+        .read_tile(0, whole)
+        .expect("read the exported samples");
+    assert_eq!(
+        got.samples, expected_samples,
+        "the exported frame must equal the fused view of that frame"
+    );
+}
+
+#[test]
+fn export_frame_out_of_range_is_refused_and_writes_nothing() {
+    let shared = aligned_project();
+    let dir = common::tmp_dir("export_cli_frame_out_of_range");
+    let out = dir.join("none.tif");
+    let result = run_cli_in(
+        &shared.cwd,
+        &[
+            "export",
+            shared.project.to_str().unwrap(),
+            "--frame",
+            "999",
+            "--frame-output",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(!result.success, "an out-of-range frame must be refused");
+    assert!(
+        result.stderr.contains("999") && result.stderr.contains('0'),
+        "the refusal must name the valid range: {}",
+        result.stderr
+    );
+    assert!(!out.exists(), "no output file must be written");
+    assert!(
+        !partial_path(&out).exists(),
+        "no .partial must be left behind either"
+    );
+}
+
 #[test]
 fn export_zmap_of_a_checkpoint_matches_history_materialize() {
     let branched = build_branched("export_cli_zmap_checkpoint");
@@ -899,7 +1073,6 @@ fn build_unrecorded_alignment(name: &str) -> (common::TmpDir, PathBuf, String, S
         algorithm: "identity".to_string(),
         params: ParamValues::new(),
         reference: 0,
-        transforms: vec![],
     };
 
     let project_path = dir.join(format!("align.{}", project::PROJECT_EXTENSION));
@@ -911,7 +1084,7 @@ fn build_unrecorded_alignment(name: &str) -> (common::TmpDir, PathBuf, String, S
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: Some(align),
-        crop: None,
+        registration: Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -1139,4 +1312,45 @@ fn refused_checkpoint_export_leaves_nothing() {
         "a unique id prefix must resolve: stderr: {}",
         result.stderr
     );
+}
+
+#[test]
+fn export_frame_without_frame_output_is_a_clap_usage_error() {
+    let shared = aligned_project();
+    let result = run_cli_in(
+        &shared.cwd,
+        &["export", shared.project.to_str().unwrap(), "--frame", "0"],
+    );
+    assert!(
+        !result.success,
+        "--frame without --frame-output must be a usage error"
+    );
+    assert!(
+        result.stderr.contains("frame-output") || result.stderr.contains("frame_output"),
+        "clap's usage error must name the missing flag: {}",
+        result.stderr
+    );
+}
+
+#[test]
+fn export_frame_output_alone_is_refused_by_name() {
+    let shared = aligned_project();
+    let dir = common::tmp_dir("export_cli_frame_output_alone");
+    let out = dir.join("frame.tif");
+    let result = run_cli_in(
+        &shared.cwd,
+        &[
+            "export",
+            shared.project.to_str().unwrap(),
+            "--frame-output",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(!result.success, "--frame-output alone must be refused");
+    assert!(
+        result.stderr.contains("--frame"),
+        "the refusal must name --frame: {}",
+        result.stderr
+    );
+    assert!(!out.exists());
 }

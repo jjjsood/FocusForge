@@ -26,11 +26,13 @@ import { FFSpinner } from "components/ff_spinner.slint";
 import { FFLoadingPanel } from "components/ff_loading_panel.slint";
 import { FFImageRow } from "components/ff_image_row.slint";
 import { FFCheckpointRow } from "components/ff_checkpoint_row.slint";
+import { FFNoSourceRow } from "components/ff_no_source_row.slint";
 import { FFDialog } from "components/ff_dialog.slint";
 import { FFDialogFooter } from "components/ff_dialog_footer.slint";
 import { FFChip } from "components/ff_chip.slint";
 import { FFProjectCard } from "components/ff_project_card.slint";
 import { FFManifestList } from "components/ff_manifest_list.slint";
+import { FFBrushCursor } from "components/ff_brush_cursor.slint";
 import { FFToast } from "shell/dialogs.slint";
 
 component ColourSwatch inherits Rectangle {
@@ -171,6 +173,7 @@ export component ThemeSheet inherits Window {
             spacing: Theme.space-3;
             ColourSwatch { swatch: Theme.text-disabled; label: "text.disabled"; }
             ColourSwatch { swatch: Theme.text-on-accent; label: "text.onAccent"; }
+            ColourSwatch { swatch: Theme.cursor-ink; label: "cursor.ink"; }
         }
 
         GroupHeading { text: "Accent / Status"; }
@@ -246,6 +249,145 @@ export component ThemeSheet inherits Window {
             FFIconButton {
                 icon: @image-url("../../../assets/icons/zoom-out.svg");
                 enabled: false;
+            }
+        }
+
+        GroupHeading { text: "Editor toolbar: sliders, filled and selected icon buttons, inert button"; }
+        Rectangle {
+            height: ShellGeometry.toolbar-height;
+            background: Theme.surface-raised;
+
+            HorizontalLayout {
+                padding-left: Theme.space-3;
+                padding-right: Theme.space-3;
+                spacing: Theme.space-3;
+                alignment: start;
+
+                FFRowText { text: "Size"; width: 32px; muted: true; }
+                FFSlider {
+                    y: (parent.height - self.height) / 2;
+                    width: 120px;
+                    compact: true;
+                    fraction: 0.61;
+                    value-text: "64";
+                }
+                FFRowText { text: "Soft"; width: 32px; muted: true; }
+                FFSlider {
+                    y: (parent.height - self.height) / 2;
+                    width: 120px;
+                    compact: true;
+                    fraction: 0.3;
+                    value-text: "30%";
+                }
+                FFSlider {
+                    y: (parent.height - self.height) / 2;
+                    width: 120px;
+                    compact: true;
+                    fraction: 0.3;
+                    value-text: "30%";
+                    disabled: true;
+                }
+                FFIconButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 28px;
+                    height: ShellGeometry.toolbar-button-height;
+                    icon: @image-url("../../../assets/icons/pipette.svg");
+                    filled: true;
+                }
+                FFIconButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 28px;
+                    height: ShellGeometry.toolbar-button-height;
+                    icon: @image-url("../../../assets/icons/pipette.svg");
+                    filled: true;
+                    selected: true;
+                }
+                FFIconButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 28px;
+                    height: ShellGeometry.toolbar-button-height;
+                    icon: @image-url("../../../assets/icons/rotate-ccw.svg");
+                    filled: true;
+                }
+                FFIconButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 28px;
+                    height: ShellGeometry.toolbar-button-height;
+                    icon: @image-url("../../../assets/icons/rotate-cw.svg");
+                    filled: true;
+                    enabled: false;
+                }
+                FFIconButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 28px;
+                    height: ShellGeometry.toolbar-button-height;
+                    icon: @image-url("../../../assets/icons/undo-2.svg");
+                    filled: true;
+                }
+                FFIconButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 28px;
+                    height: ShellGeometry.toolbar-button-height;
+                    icon: @image-url("../../../assets/icons/redo-2.svg");
+                    filled: true;
+                    enabled: false;
+                }
+                FFButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 164px;
+                    compact: true;
+                    text: "Save checkpoint";
+                    enabled: false;
+                }
+                FFButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 164px;
+                    compact: true;
+                    text: "Save checkpoint";
+                    enabled: false;
+                    dim-label-only: true;
+                }
+            }
+        }
+
+        GroupHeading { text: "Brush cursor: hard / soft 55 % at radius 64 and 22, picking"; }
+        Rectangle {
+            height: 170px;
+            background: Theme.text-muted;
+
+            HorizontalLayout {
+                padding: Theme.space-4;
+                spacing: Theme.space-6;
+                alignment: start;
+
+                FFBrushCursor {
+                    y: (parent.height - self.height) / 2;
+                    extent: 130px;
+                    core-commands: "M 1 65 A 64 64 0 1 1 129 65 A 64 64 0 1 1 1 65";
+                }
+                FFBrushCursor {
+                    y: (parent.height - self.height) / 2;
+                    extent: 130px;
+                    ring-commands: "M 65.00 1.00 A 64 64 0 0 1 76.11 1.97 M 86.89 4.86 A 64 64 0 0 1 97.00 9.57 M 106.14 15.97 A 64 64 0 0 1 114.03 23.86 M 120.43 33.00 A 64 64 0 0 1 125.14 43.11 M 128.03 53.89 A 64 64 0 0 1 129.00 65.00 M 128.03 76.11 A 64 64 0 0 1 125.14 86.89 M 120.43 97.00 A 64 64 0 0 1 114.03 106.14 M 106.14 114.03 A 64 64 0 0 1 97.00 120.43 M 86.89 125.14 A 64 64 0 0 1 76.11 128.03 M 65.00 129.00 A 64 64 0 0 1 53.89 128.03 M 43.11 125.14 A 64 64 0 0 1 33.00 120.43 M 23.86 114.03 A 64 64 0 0 1 15.97 106.14 M 9.57 97.00 A 64 64 0 0 1 4.86 86.89 M 1.97 76.11 A 64 64 0 0 1 1.00 65.00 M 1.97 53.89 A 64 64 0 0 1 4.86 43.11 M 9.57 33.00 A 64 64 0 0 1 15.97 23.86 M 23.86 15.97 A 64 64 0 0 1 33.00 9.57 M 43.11 4.86 A 64 64 0 0 1 53.89 1.97";
+                    core-commands: "M 36.2 65 A 28.8 28.8 0 1 1 93.8 65 A 28.8 28.8 0 1 1 36.2 65";
+                }
+                FFBrushCursor {
+                    y: (parent.height - self.height) / 2;
+                    extent: 46px;
+                    core-commands: "M 1 23 A 22 22 0 1 1 45 23 A 22 22 0 1 1 1 23";
+                }
+                FFBrushCursor {
+                    y: (parent.height - self.height) / 2;
+                    extent: 46px;
+                    ring-commands: "M 23.00 1.00 A 22 22 0 0 1 34.00 3.95 M 42.05 12.00 A 22 22 0 0 1 45.00 23.00 M 42.05 34.00 A 22 22 0 0 1 34.00 42.05 M 23.00 45.00 A 22 22 0 0 1 12.00 42.05 M 3.95 34.00 A 22 22 0 0 1 1.00 23.00 M 3.95 12.00 A 22 22 0 0 1 12.00 3.95";
+                    core-commands: "M 13.1 23 A 9.9 9.9 0 1 1 32.9 23 A 9.9 9.9 0 1 1 13.1 23";
+                }
+                FFBrushCursor {
+                    y: (parent.height - self.height) / 2;
+                    extent: 46px;
+                    picking: true;
+                    pick-color: Theme.status-warning;
+                }
             }
         }
 
@@ -479,6 +621,47 @@ export component ThemeSheet inherits Window {
                 algorithm: "Laplacian Pyramid";
                 time-text: "21:08:12";
             }
+        }
+
+        GroupHeading { text: "Images list: legend row"; }
+        VerticalLayout {
+            spacing: 0px;
+            FFImageRow {
+                width: 248px;
+                legend: true;
+                mutable: false;
+                chip: Theme.status-failure;
+                name: "IMG_9811";
+                time-text: "1";
+            }
+            FFImageRow {
+                width: 248px;
+                legend: true;
+                mutable: false;
+                chip: Theme.status-warning;
+                name: "IMG_9812";
+                time-text: "2";
+                hovered: true;
+            }
+            FFImageRow {
+                width: 248px;
+                legend: true;
+                mutable: false;
+                chip: Theme.accent-default;
+                name: "IMG_9815";
+                time-text: "";
+                unresolved: true;
+            }
+            FFImageRow {
+                width: 248px;
+                legend: true;
+                mutable: false;
+                chip: Theme.status-success;
+                name: "IMG_9816";
+                time-text: "6";
+                selected: true;
+            }
+            FFNoSourceRow { width: 248px; }
         }
 
         Rectangle {

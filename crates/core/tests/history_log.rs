@@ -9,7 +9,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use focusforge_core::align::Transform;
+use focusforge_core::align::{Registration, Transform};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::{
     self, AlignRecord, Metrics, Op, Point, Project, SealRequest, materialize_zmap,
@@ -125,7 +125,7 @@ fn sealed(name: &str) -> (PathBuf, PathBuf, Vec<PathBuf>) {
         algorithm: "laplacian",
         params: &values,
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -162,9 +162,11 @@ fn sealed_with_align_and_crop(name: &str) -> (PathBuf, PathBuf, Vec<PathBuf>) {
             algorithm: "dummy-align".to_string(),
             params: ParamValues::new(),
             reference: 0,
-            transforms,
         }),
-        crop: Some(full(10, 8)),
+        registration: Registration {
+            transforms,
+            crop: Some(full(10, 8)),
+        },
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -351,7 +353,7 @@ fn sealing_a_checkpoint_mutates_no_existing_entry() {
         algorithm: "laplacian",
         params: &params(),
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -381,32 +383,25 @@ fn append_ops_refuses_an_empty_list() {
 fn alignment_and_crop_are_recorded() {
     let (_dir, project_path, _sources) = sealed_with_align_and_crop("history_log_align_crop");
     let manifest = Project::open(&project_path).unwrap().manifest().clone();
-    let align = manifest.align.as_ref().expect("align must round-trip");
-    assert_eq!(align.transforms.len(), FRAMES as usize);
-    assert_eq!(align.transforms[1].m[0][2], 7.0);
-    assert_eq!(align.transforms[2].m[0][2], 14.0);
-    assert_eq!(manifest.crop, Some(full(10, 8)));
+    manifest.align.as_ref().expect("align must round-trip");
+    assert_eq!(manifest.registration.transforms.len(), FRAMES as usize);
+    assert_eq!(manifest.registration.transforms[1].m[0][2], 7.0);
+    assert_eq!(manifest.registration.transforms[2].m[0][2], 14.0);
+    assert_eq!(manifest.registration.crop, Some(full(10, 8)));
 
     // `append_ops` carries both forward, unchanged.
     project::append_ops(&project_path, one_of_each_replayable_variant(), None)
         .expect("append_ops must succeed");
     let after = Project::open(&project_path).unwrap().manifest().clone();
     assert_eq!(after.align, manifest.align);
-    assert_eq!(after.crop, manifest.crop);
+    assert_eq!(after.registration, manifest.registration);
 
-    // A manifest JSON with neither field still opens, with both defaulted.
+    // A manifest JSON with the field missing still opens, defaulted.
     let mut value = serde_json::to_value(&manifest).unwrap();
     let object = value.as_object_mut().unwrap();
-    object.remove("crop");
-    object
-        .get_mut("align")
-        .unwrap()
-        .as_object_mut()
-        .unwrap()
-        .remove("transforms");
+    object.remove("registration");
     let reopened: focusforge_core::project::Manifest = serde_json::from_value(value).unwrap();
-    assert_eq!(reopened.crop, None);
-    assert_eq!(reopened.align.unwrap().transforms, Vec::new());
+    assert_eq!(reopened.registration, Registration::default());
 }
 
 /// Reads a checkpoint's Z-Map blob into a full-map index buffer.

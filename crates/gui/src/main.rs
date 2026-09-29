@@ -174,9 +174,10 @@ fn start_fuse_tabs_timer(
             app.invoke_tab_selected(index as i32);
             app.invoke_fuse_requested();
         }
-        if (save || close || quit || overlay || enter_editor)
-            && controller.lock().unwrap().work_pending()
-        {
+        if (save || close || quit || overlay || enter_editor) && {
+            let controller = controller.lock().unwrap();
+            controller.work_pending() || controller.pending_divergence().is_some()
+        } {
             return;
         }
         if enter_editor {

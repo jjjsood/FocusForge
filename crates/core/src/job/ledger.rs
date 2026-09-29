@@ -220,11 +220,9 @@ impl Ledger {
     /// Drops `units_log` before removing: some filesystems refuse to
     /// remove a directory that still holds an open file handle.
     pub fn discard(self) -> Result<(), ResumeError> {
-        drop(self.units_log);
-        fs::remove_dir_all(&self.dir).map_err(|source| ResumeError::Io {
-            path: self.dir.clone(),
-            source,
-        })
+        let Ledger { dir, units_log, .. } = self;
+        drop(units_log);
+        fs::remove_dir_all(&dir).map_err(|source| ResumeError::Io { path: dir, source })
     }
 }
 
@@ -769,6 +767,23 @@ mod tests {
         assert!(dir.is_dir());
         ledger.discard().unwrap();
         assert!(!dir.exists());
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn discard_reports_the_directory_it_could_not_remove() {
+        let scratch = tmp_dir("discard-gone");
+        let store = ResumeStore::open(&scratch).unwrap();
+        let record = sample_record(&scratch, "out.tif");
+        let ledger = store.begin(&record).unwrap();
+        let dir = ledger.dir().to_path_buf();
+        // Removed out from under the ledger: `remove_dir_all` must still
+        // name this directory in its error, not panic or report success.
+        fs::remove_dir_all(&dir).unwrap();
+        match ledger.discard() {
+            Err(ResumeError::Io { path, .. }) => assert_eq!(path, dir),
+            other => panic!("expected ResumeError::Io naming {dir:?}, got {other:?}"),
+        }
         let _ = fs::remove_dir_all(&scratch);
     }
 

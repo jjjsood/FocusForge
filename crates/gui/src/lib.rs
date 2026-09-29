@@ -28,6 +28,11 @@ pub use controller::*;
 /// reaches `AppController` above.
 pub mod canvas;
 
+/// A freehand stroke in progress, as plain Rust -- no `use slint::`
+/// anywhere in it. `pub` so `tests/controller.rs` reaches its types
+/// directly, the same way `canvas` does above.
+pub mod brush;
+
 /// The entry path: classifying a picker result, a drop, or `--open`'s path
 /// into a folder, a set of dropped frames, or a saved project, and turning
 /// that into per-tab project state. No `use slint::`

@@ -276,7 +276,7 @@ fn seal_project(
         algorithm: "laplacian",
         params: &values,
         align: None,
-        crop: None,
+        registration: focusforge_core::align::Registration::default(),
         composite_description: "test composite".to_string(),
         label: None,
         metrics,

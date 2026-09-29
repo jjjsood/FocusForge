@@ -646,7 +646,7 @@ impl Project {
             return Ok(FuseRecord {
                 composite: self.manifest.composite.clone(),
                 align: self.manifest.align.clone(),
-                crop: self.manifest.crop,
+                registration: self.manifest.registration.clone(),
                 sources: self.manifest.sources.clone(),
                 metrics: self.manifest.metrics,
             });

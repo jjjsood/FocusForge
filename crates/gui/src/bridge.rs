@@ -153,11 +153,13 @@ impl Canvas {
     }
 
     /// Opens `path` as the left pane's source, creating the renderer first
-    /// when this tab has never had planes to draw. A no-op when `path` is
-    /// already open or is the frame that last failed; `None` drops whatever
-    /// frame was open. A failed open names the frame as missing or changed
+    /// when this tab has never had planes to draw. A no-op when `path` and
+    /// `view` are both already open, or `path` is the frame that last
+    /// failed -- so a new fuse over the same selected path still reloads
+    /// through its own, changed view. `None` drops whatever frame was open.
+    /// A failed open names the frame as missing or changed
     /// ([`job::frame_refusal_lines`]).
-    pub fn set_frame(&mut self, path: Option<&Path>) {
+    pub fn set_frame(&mut self, path: Option<&Path>, view: Option<crate::canvas::FrameView>) {
         if path.is_some() && self.failed_frame.as_deref() == path {
             return;
         }
@@ -168,15 +170,16 @@ impl Canvas {
             self.failed_frame = None;
             return;
         };
-        if renderer.frame_path() == Some(path) {
+        if renderer.frame_path() == Some(path) && renderer.frame_view() == view {
             return;
         }
-        match renderer.set_frame(path) {
+        match renderer.set_frame(path, view, job::host_budget()) {
             Ok(()) => {
                 self.frame_refusal.clear();
                 self.failed_frame = None;
             }
-            Err(_) => {
+            Err(err) => {
+                eprintln!("failed to open the frame: {err}");
                 self.frame_refusal = job::frame_refusal_lines(path);
                 self.failed_frame = Some(path.to_path_buf());
             }
@@ -215,6 +218,7 @@ pub fn repaint(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
 ) {
+    controller.lock().unwrap().flush_live_stroke();
     let (feed, render_started, message_lines) = {
         let loaded = canvas.borrow().tab();
         let mut controller = controller.lock().unwrap();
@@ -242,10 +246,11 @@ pub fn repaint(
         } => canvas.borrow_mut().load(tab, &composite, &zmap),
     }
 
-    let (frame_path, frame_label, frame_draw, plane_draw, readout, project_loaded) = {
+    let (frame_path, frame_view, frame_label, frame_draw, plane_draw, readout, project_loaded) = {
         let controller = controller.lock().unwrap();
         (
             controller.selected_frame_path(),
+            controller.selected_frame_view(),
             controller.frame_pane_label(),
             controller.frame_draw(),
             controller.plane_draw(),
@@ -253,7 +258,9 @@ pub fn repaint(
             controller.active_project().is_some(),
         )
     };
-    canvas.borrow_mut().set_frame(frame_path.as_deref());
+    canvas
+        .borrow_mut()
+        .set_frame(frame_path.as_deref(), frame_view);
 
     app.set_zoom_readout(readout.into());
     app.set_project_loaded(project_loaded);
@@ -264,6 +271,7 @@ pub fn repaint(
     ) {
         app.set_frame_message_lines(lines);
     }
+    push_brush_cursor(app, &controller.lock().unwrap());
 
     let frame_redrawn = frame_draw.and_then(|draw| {
         let mut canvas = canvas.borrow_mut();
@@ -289,9 +297,15 @@ pub fn repaint(
     }
 
     let redrawn = plane_draw.and_then(|draw| {
+        let controller = controller.lock().unwrap();
+        let edited = controller.edited_view();
+        let overlay = controller.overlay_draw();
         let mut canvas = canvas.borrow_mut();
         let renderer = canvas.renderer.as_mut()?;
-        Some((draw, renderer.redraw_planes(&draw)?))
+        Some((
+            draw,
+            renderer.redraw_planes(&draw, edited, overlay.as_ref())?,
+        ))
     });
     match redrawn {
         Some((draw, (composite_image, zmap_image))) => {
@@ -796,7 +810,7 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
         .map(|row| GeneratedImageRow {
             chip: slint::Color::from_rgb_u8(row.chip[0], row.chip[1], row.chip[2]),
             name: row.name.clone().into(),
-            time_text: row.time_text.clone().into(),
+            time_text: row.trailing_text.clone().into(),
             excluded: row.excluded,
             unresolved: row.unresolved,
             top: row.top,
@@ -812,6 +826,7 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
         app.set_images_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
     }
     app.set_images_header_text(panel.header_text.into());
+    app.set_images_no_source_row(panel.no_source_row);
     app.set_images_content_height(panel.content_height);
     app.set_images_scroll_y(panel.scroll_y);
     let sort = match controller.frame_sort() {
@@ -874,6 +889,46 @@ pub fn push_checkpoint_panel(app: &AppWindow, controller: &AppController) {
     }
     app.set_checkpoint_content_height(panel.content_height);
     app.set_checkpoint_scroll_y(panel.scroll_y);
+}
+
+/// Pushes the editor toolbar's own state -- `AppController::brush_toolbar_view`
+/// -- the one place `ShellEvent::EditorChanged` is performed. Numeric
+/// readouts are formatted here, never in `.slint`.
+pub fn push_editor_toolbar(app: &AppWindow, controller: &AppController) {
+    let view = controller.brush_toolbar_view();
+    app.set_brush_size_text(format!("{:.0}", view.size).into());
+    app.set_brush_size_fraction(view.size_fraction);
+    app.set_brush_size_ceiling(view.size_ceiling as i32);
+    app.set_brush_soft_text(format!("{:.0}%", view.soft).into());
+    app.set_brush_soft_fraction(view.soft_fraction);
+    app.set_brush_picking(view.picking);
+    app.set_can_undo(view.can_undo);
+    app.set_can_redo(view.can_redo);
+
+    let overlay = controller.overlay_view();
+    app.set_overlay_on(overlay.on);
+    app.set_overlay_fraction(overlay.opacity);
+    app.set_overlay_text(format!("{:.0}%", overlay.opacity * 100.0).into());
+}
+
+/// Pushes the brush cursor overlay's own view -- every repaint, since its
+/// extent also depends on the active tab's current zoom, which
+/// [`push_editor_toolbar`]'s own `EditorChanged` trigger does not cover.
+fn push_brush_cursor(app: &AppWindow, controller: &AppController) {
+    let Some(view) = controller.brush_cursor_view() else {
+        app.set_cursor_extent(0.0);
+        return;
+    };
+    app.set_cursor_extent(view.extent);
+    app.set_cursor_ring_commands(view.ring_commands.into());
+    app.set_cursor_core_commands(view.core_commands.into());
+    app.set_cursor_picking(view.picking);
+    app.set_cursor_pick_color(slint::Color::from_rgb_u8(
+        view.pick_color[0],
+        view.pick_color[1],
+        view.pick_color[2],
+    ));
+    app.set_cursor_mirror_dx(view.mirror_dx);
 }
 
 /// Opens the Keep/Discard dialog while the active tab holds a parked run,
@@ -1146,17 +1201,31 @@ pub fn install(
     });
     app.on_window_close_requested({
         let controller = controller.clone();
-        move || controller.lock().unwrap().window_close()
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.window_close();
+            });
+        }
     });
     // A native `WindowEvent::CloseRequested` (Alt+F4, taskbar close) reaches
     // Slint's own hook, not the app-drawn x above; unregistered, it hides
     // the window with no guard at all.
     app.window().on_close_requested({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
-            let mut controller = controller.lock().unwrap();
-            controller.window_close();
-            if controller.pending_close().is_some() || controller.pending_quit_copy().is_some() {
+            let keep_shown = {
+                let mut controller = controller.lock().unwrap();
+                controller.window_close();
+                controller.pending_close().is_some() || controller.pending_quit_copy().is_some()
+            };
+            if let Some(app) = app_weak.upgrade() {
+                repaint(&app, &controller, &canvas);
+            }
+            if keep_shown {
                 slint::CloseRequestResponse::KeepWindowShown
             } else {
                 slint::CloseRequestResponse::HideWindow
@@ -1188,6 +1257,55 @@ pub fn install(
     app.on_checkpoint_export_requested({
         let controller = controller.clone();
         move || controller.lock().unwrap().checkpoint_export_requested()
+    });
+    // The editor toolbar: each callback is a single forward into the
+    // controller method already driving the matching input-map row.
+    app.on_brush_size_fraction_changed({
+        let controller = controller.clone();
+        move |fraction| controller.lock().unwrap().set_brush_size_fraction(fraction)
+    });
+    app.on_brush_softness_fraction_changed({
+        let controller = controller.clone();
+        move |fraction| {
+            controller
+                .lock()
+                .unwrap()
+                .set_brush_softness_fraction(fraction)
+        }
+    });
+    // The bottom bar's overlay controls: both change what the `Composite`
+    // pane's next repaint blends in, so both go through `dispatch`.
+    app.on_overlay_toggled({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |on| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.set_overlay_on(on);
+            });
+        }
+    });
+    app.on_overlay_fraction_changed({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |fraction| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.set_overlay_opacity_fraction(fraction);
+            });
+        }
+    });
+    app.on_pipette_toggled({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().toggle_pipette()
+    });
+    app.on_undo_requested({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().undo()
+    });
+    app.on_redo_requested({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().redo()
     });
     // The run's own transport. `fuse-requested`/`retry-requested` start the
     // poll timer that feeds the rest; `pause-or-resume-requested` and
@@ -1392,21 +1510,25 @@ pub fn install(
     });
     app.on_settings_open_requested({
         let controller = controller.clone();
+        let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
             let open = controller.lock().unwrap().open_settings();
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_open(open);
+                repaint(&app, &controller, &canvas);
             }
         }
     });
     app.on_settings_close_requested({
         let controller = controller.clone();
+        let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
             let open = controller.lock().unwrap().close_settings();
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_open(open);
+                repaint(&app, &controller, &canvas);
             }
         }
     });
@@ -1621,6 +1743,7 @@ pub fn install(
             // and the next `push_projects` reopens the dialog.
             if let Some(app) = app_weak.upgrade() {
                 app.set_question_open(false);
+                repaint(&app, &controller, &canvas);
             }
             start_load_timer(
                 app_weak.clone(),
@@ -1643,6 +1766,7 @@ pub fn install(
                 .answer_question(OpenAs::NProjects);
             if let Some(app) = app_weak.upgrade() {
                 app.set_question_open(false);
+                repaint(&app, &controller, &canvas);
             }
             start_load_timer(
                 app_weak.clone(),
@@ -1655,11 +1779,13 @@ pub fn install(
     });
     app.on_question_cancelled({
         let controller = controller.clone();
+        let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
             controller.lock().unwrap().cancel_question();
             if let Some(app) = app_weak.upgrade() {
                 app.set_question_open(false);
+                repaint(&app, &controller, &canvas);
             }
         }
     });
@@ -1669,8 +1795,10 @@ pub fn install(
         let app_weak = app.as_weak();
         let load_timer = load_timer.clone();
         move || {
+            controller.lock().unwrap().dismiss_refusal();
             if let Some(app) = app_weak.upgrade() {
                 app.set_refusal_open(false);
+                repaint(&app, &controller, &canvas);
             }
             open_from_picker(
                 &controller,
@@ -1777,10 +1905,18 @@ pub fn install(
         }
     });
 
-    // The `Images` panel's own scroll -- `FFScrollbar`'s twin wiring above.
-    app.on_images_scrolled({
+    // A plain wheel over the `Images` list steps the selected/brush-source
+    // frame -- the same effect `Ctrl + Wheel` over the canvas has, so this
+    // also needs a repaint.
+    app.on_images_frame_wheel({
         let controller = controller.clone();
-        move |delta| controller.lock().unwrap().scroll_images_panel(delta)
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |delta| {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.images_list_wheel(delta);
+            });
+        }
     });
     app.on_images_scrollbar_pointer({
         let controller = controller.clone();
@@ -1856,9 +1992,13 @@ pub fn install(
 
     app.on_images_add_frames_requested({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
             if let Some(paths) = crate::picker::pick_frames() {
-                controller.lock().unwrap().add_frames(&paths);
+                dispatch(&controller, &canvas, &app_weak, |controller| {
+                    controller.add_frames(&paths);
+                });
             }
         }
     });
@@ -1868,12 +2008,16 @@ pub fn install(
     });
     app.on_images_sort_selected({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move |id| {
             let sort = match id.as_str() {
                 "capture-time" => crate::images::FrameSort::CaptureTime,
                 _ => crate::images::FrameSort::Name,
             };
-            controller.lock().unwrap().set_frame_sort(sort);
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.set_frame_sort(sort);
+            });
         }
     });
     app.on_images_frame_excluded_toggled({
@@ -1902,7 +2046,13 @@ pub fn install(
     });
     app.on_frame_warning_cancelled({
         let controller = controller.clone();
-        move || controller.lock().unwrap().cancel_frame_change()
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.cancel_frame_change();
+            });
+        }
     });
     app.on_frame_warning_confirmed({
         let controller = controller.clone();
@@ -1930,7 +2080,15 @@ pub fn install(
     });
     app.on_divergence_discarded({
         let controller = controller.clone();
-        move || controller.lock().unwrap().discard_fused()
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().discard_fused();
+            if let Some(app) = app_weak.upgrade() {
+                push_projects(&app, &controller);
+                repaint(&app, &controller, &canvas);
+            }
+        }
     });
     app.on_divergence_kept({
         let controller = controller.clone();
@@ -1946,7 +2104,13 @@ pub fn install(
     });
     app.on_close_guard_cancelled({
         let controller = controller.clone();
-        move || controller.lock().unwrap().close_guard_cancelled()
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.close_guard_cancelled();
+            });
+        }
     });
     app.on_close_guard_secondary_pressed({
         let controller = controller.clone();
@@ -1977,7 +2141,13 @@ pub fn install(
     // click-through.
     app.on_projects_overlay_toggled({
         let controller = controller.clone();
-        move || controller.lock().unwrap().toggle_projects_overlay()
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.toggle_projects_overlay();
+            });
+        }
     });
     // The rail's own actions: New/Open reuse the picker any other open path
     // uses; Close closes whichever tab is active, the same as `Ctrl+W` would.
@@ -2199,12 +2369,18 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::WindowCloseRequested => {
             let _ = app.window().hide();
         }
-        ShellEvent::ModeChanged(mode) => {
-            let mode = match mode {
+        ShellEvent::ModeChanged(shell_mode) => {
+            let mode = match shell_mode {
                 ShellMode::Stacking => "stacking",
                 ShellMode::Editor => "editor",
             };
             app.set_mode(mode.into());
+            if shell_mode == ShellMode::Editor {
+                push_editor_toolbar(app, &controller.lock().unwrap());
+            }
+            // The legend replaces the ordinary `Images` list only in editor
+            // mode -- the list's own shape follows the mode switch.
+            push_images_panel(app, &controller.lock().unwrap());
         }
         ShellEvent::DockTabSelected(tab) => {
             let tab = match tab {
@@ -2268,6 +2444,7 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         }
         ShellEvent::ImagesChanged => push_images_panel(app, &controller.lock().unwrap()),
         ShellEvent::CheckpointsChanged => push_checkpoint_panel(app, &controller.lock().unwrap()),
+        ShellEvent::EditorChanged => push_editor_toolbar(app, &controller.lock().unwrap()),
         ShellEvent::OverlayChanged => push_projects_overlay(app, &controller.lock().unwrap()),
         // A background load's own three events (`AppController::open_paths`).
         // The indicator's threshold and fade are the Slint region's own
@@ -2283,8 +2460,14 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             // frame in between.
             match outcome {
                 Some(OpenOutcome::Opened(_)) => push_projects(app, controller),
-                Some(OpenOutcome::Question(question, _)) => push_question(app, &question),
-                Some(OpenOutcome::Refused(_)) => app.set_refusal_open(true),
+                Some(OpenOutcome::Question(question, _)) => {
+                    push_question(app, &question);
+                    push_brush_cursor(app, &controller.lock().unwrap());
+                }
+                Some(OpenOutcome::Refused(_)) => {
+                    app.set_refusal_open(true);
+                    push_brush_cursor(app, &controller.lock().unwrap());
+                }
                 None => {}
             }
             app.set_load_active(false);

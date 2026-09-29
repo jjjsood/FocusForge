@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::align::{Transform, WarpingReader};
+use crate::align::WarpingReader;
 use crate::io::{FrameSet, TiffSpec, TiffWriter, open_frame_set};
 use crate::retouch::{RetouchError, Sources, recomposite, recomposite_bands};
 use crate::tile::{HostBudget, Rect};
@@ -148,9 +148,7 @@ fn check_renderable(
     checkpoint: &Checkpoint,
     record: &FuseRecord,
 ) -> Result<(), ProjectError> {
-    if let Some(align) = &record.align
-        && align.transforms.len() != record.sources.len()
-    {
+    if record.align.is_some() && record.registration.transforms.len() != record.sources.len() {
         return Err(ProjectError::RenderAlignmentUnrecorded {
             path: project.path().to_path_buf(),
             checkpoint: checkpoint.id.clone(),
@@ -210,10 +208,7 @@ fn open_sources(
 /// `set`'s frames under `record`'s per-frame alignment (identity when the
 /// fuse was not aligned).
 fn warp<'a>(set: &'a FrameSet, record: &FuseRecord) -> WarpingReader<'a> {
-    let transforms = match &record.align {
-        Some(align) => align.transforms.clone(),
-        None => vec![Transform::identity(); record.sources.len()],
-    };
+    let transforms = record.registration.transforms(record.sources.len());
     WarpingReader::new(
         &*set.reader,
         set.reader.dimensions(),
@@ -227,7 +222,7 @@ fn gather_sources<'a>(warping: &'a WarpingReader<'a>, record: &FuseRecord) -> So
         reader: warping,
         frame_count: record.sources.len() as u32,
         samples_per_pixel: record.composite.samples_per_pixel,
-        origin: record.crop.map(|r| (r.x, r.y)).unwrap_or((0, 0)),
+        origin: record.registration.origin(),
     }
 }
 

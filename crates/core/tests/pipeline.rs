@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use focusforge_core::align::Transform;
 use focusforge_core::job::{ControlState, JobControl, JobProgress};
 use focusforge_core::params::{ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{
@@ -339,14 +340,174 @@ fn a_held_run_seals_to_the_same_project() {
     let from_held = Project::open(&target).unwrap().manifest().clone();
     let direct = Project::open(&sealed.path).unwrap().manifest().clone();
     assert_eq!(
-        from_held.align.as_ref().unwrap().transforms.len(),
+        from_held.registration.transforms.len(),
         3,
         "one transform per frame"
     );
-    assert_eq!(from_held.crop, direct.crop, "the same crop either way");
-    assert!(from_held.crop.is_some(), "the aligned frames must crop");
+    assert_eq!(
+        from_held.registration.crop, direct.registration.crop,
+        "the same crop either way"
+    );
+    assert!(
+        from_held.registration.crop.is_some(),
+        "the aligned frames must crop"
+    );
     assert_eq!(from_held.algorithm, direct.algorithm);
     assert_eq!(from_held.params, direct.params);
     assert_eq!(from_held.sources, direct.sources);
     assert_eq!(from_held.zmap.blob, direct.zmap.blob);
+}
+
+// ---------------------------------------------------------------------
+// `Registration`: every frame's transform and the applied crop survive
+// seal, hold and reseal, bit-for-bit.
+// ---------------------------------------------------------------------
+
+fn dummy_align_request() -> AlignRequest {
+    AlignRequest {
+        algorithm: registry::find_align("dummy-align").expect("dummy-align must be registered"),
+        explicit: ParamValues::new(),
+        lax: false,
+    }
+}
+
+/// Per-entry `f64::to_bits()` equality -- the bit-exact comparison the
+/// manifest's own encoding is meant to preserve.
+fn assert_transforms_bit_eq(actual: &[Transform], expected: &[Transform], what: &str) {
+    assert_eq!(actual.len(), expected.len(), "{what}: transform count");
+    for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+        for row in 0..3 {
+            for col in 0..3 {
+                assert_eq!(
+                    a.m[row][col].to_bits(),
+                    e.m[row][col].to_bits(),
+                    "{what}: frame {i} transform[{row}][{col}] bit pattern differs"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn registration_persists_through_seal_and_hold() {
+    let mut sealed_request =
+        base_request("registration_seal", mantis_frames(3), ParamValues::new());
+    sealed_request.align = Some(dummy_align_request());
+    sealed_request.crop = true;
+    let outcome =
+        focusforge_core::pipeline::run(&sealed_request, &NoopObserver, JobControl::new(), None)
+            .expect("an aligned, cropped run must complete");
+    let FuseOutcome::Completed(report) = outcome else {
+        panic!("expected a completed run");
+    };
+    let expected_transforms: Vec<Transform> = report
+        .align
+        .as_ref()
+        .expect("an aligned run reports its alignment")
+        .alignment
+        .frames
+        .iter()
+        .map(|f| f.transform)
+        .collect();
+    let expected_crop = report.crop.expect("a cropped run must report a crop");
+    let FuseProduct::Sealed(sealed) = report.product else {
+        panic!("expected a sealed project");
+    };
+    let manifest = Project::open(&sealed.path)
+        .expect("reopen sealed project")
+        .manifest()
+        .clone();
+    assert_transforms_bit_eq(
+        &manifest.registration.transforms,
+        &expected_transforms,
+        "sealed manifest",
+    );
+    assert_eq!(manifest.registration.crop, Some(expected_crop));
+    assert_eq!(
+        (manifest.composite.width, manifest.composite.height),
+        (expected_crop.width, expected_crop.height),
+        "the composite must be declared at the crop's own size"
+    );
+
+    // A held checkpoint, sealed later, carries the same shape of values.
+    let hold_dir = scratch("registration_hold");
+    let mut held_request = base_request(
+        "registration_hold_run",
+        mantis_frames(3),
+        ParamValues::new(),
+    );
+    held_request.align = Some(dummy_align_request());
+    held_request.crop = true;
+    held_request.output = FuseOutput::Hold(hold_dir.clone());
+    let outcome =
+        focusforge_core::pipeline::run(&held_request, &NoopObserver, JobControl::new(), None)
+            .expect("a held run must complete");
+    let FuseOutcome::Completed(held_report) = outcome else {
+        panic!("expected a completed run");
+    };
+    let held_expected_transforms: Vec<Transform> = held_report
+        .align
+        .as_ref()
+        .expect("an aligned run reports its alignment")
+        .alignment
+        .frames
+        .iter()
+        .map(|f| f.transform)
+        .collect();
+    let held_expected_crop = held_report.crop.expect("a cropped run must report a crop");
+    let FuseProduct::Held(held) = held_report.product else {
+        panic!("expected a held checkpoint");
+    };
+    assert_transforms_bit_eq(
+        &held.registration.transforms,
+        &held_expected_transforms,
+        "held checkpoint",
+    );
+    assert_eq!(held.registration.crop, Some(held_expected_crop));
+
+    let target = scratch("registration_hold_saved").join("held.ffp");
+    project::seal_held(&target, std::slice::from_ref(&held), false)
+        .expect("the held checkpoint must seal");
+    let sealed_from_held = Project::open(&target).expect("reopen").manifest().clone();
+    assert_transforms_bit_eq(
+        &sealed_from_held.registration.transforms,
+        &held_expected_transforms,
+        "manifest sealed from a held checkpoint",
+    );
+    assert_eq!(sealed_from_held.registration.crop, Some(held_expected_crop));
+}
+
+#[test]
+fn no_align_registration_is_identity_transforms_and_the_kernel_inset_crop() {
+    let mut request = base_request(
+        "registration_no_align",
+        mantis_frames(3),
+        ParamValues::new(),
+    );
+    request.crop = true;
+    let outcome = focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+        .expect("a no-align cropped run must complete");
+    let FuseOutcome::Completed(report) = outcome else {
+        panic!("expected a completed run");
+    };
+    let crop = report
+        .crop
+        .expect("the kernel-inset crop must still apply at identity, not None");
+    let FuseProduct::Sealed(sealed) = report.product else {
+        panic!("expected a sealed project");
+    };
+    let manifest = Project::open(&sealed.path)
+        .expect("reopen sealed project")
+        .manifest()
+        .clone();
+    assert_eq!(manifest.registration.crop, Some(crop));
+    assert_eq!(manifest.registration.transforms.len(), 3);
+    assert!(
+        manifest
+            .registration
+            .transforms
+            .iter()
+            .all(|t| *t == Transform::identity()),
+        "a --no-align run must record identity for every frame"
+    );
 }

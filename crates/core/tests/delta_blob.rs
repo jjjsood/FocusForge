@@ -10,6 +10,7 @@ mod common;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::{
@@ -133,7 +134,7 @@ fn request<'a>(
         algorithm: "laplacian",
         params: values,
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),

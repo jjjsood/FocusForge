@@ -33,6 +33,9 @@ GNU General Public License v3.
 - Reports outcome, sharpness and Z-Map coverage per stack after a run
   (`focusforge-cli review`), so a failed stack in a batch is a visible record
   rather than a missing file
+- Retouches a stack's Z-Map by hand — brush, pipette and a rainbow source
+  overlay, unlimited undo with redo discarded on a new edit — headless via
+  `focusforge-cli retouch` or with a mouse in the window's editor mode
 - Reusable parameter bundles (presets) and a re-run flag that fuses only the
   stacks you name, so tuning one stack after a batch run costs one re-run,
   not the whole folder again
@@ -58,8 +61,8 @@ GNU General Public License v3.
 - A window (`focusforge-gui`) alongside the CLI: open a folder or a saved
   project into a tab, view the selected source frame beside the composite or Z-Map,
   choose an algorithm and edit its parameters from the same schema
-  `focusforge-cli algorithms` prints, and run, pause, cancel or retry a
-  fuse without leaving it
+  `focusforge-cli algorithms` prints, run, pause, cancel or retry a fuse,
+  and switch into editor mode to retouch the result
 
 ## Quick start
 

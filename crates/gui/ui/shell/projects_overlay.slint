@@ -36,6 +36,15 @@ export component FFProjectsOverlay inherits Rectangle {
     visible: root.overlay-open;
     background: Theme.surface-base;
 
+    // Swallows a click or scroll over any background left exposed by the
+    // header, rail and gallery below -- `rail`/`gallery` sit above this in
+    // the tree and keep their own hits.
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        scroll-event(e) => { accept }
+    }
+
     header := Rectangle {
         x: 0px;
         y: 0px;

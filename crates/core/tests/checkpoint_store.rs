@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::{
@@ -139,7 +140,7 @@ fn seal_request<'a>(
         algorithm: "laplacian",
         params: values,
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -161,7 +162,7 @@ fn append_request<'a>(
         algorithm: "laplacian",
         params: values,
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "re-fused composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -882,7 +883,7 @@ fn branching_across_a_refuse_takes_that_fuses_planes() {
     assert_eq!(manifest.checkpoint, branched.checkpoint);
     assert_eq!(manifest.composite.blob, root_fuse.composite.blob);
     assert_eq!(manifest.align, root_fuse.align);
-    assert_eq!(manifest.crop, root_fuse.crop);
+    assert_eq!(manifest.registration.crop, root_fuse.registration.crop);
     assert_eq!(manifest.sources, root_fuse.sources);
     assert_ne!(manifest.composite.blob, refuse.composite.hash);
 }

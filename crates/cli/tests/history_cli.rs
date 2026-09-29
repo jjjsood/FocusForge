@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+use focusforge_core::align::Registration;
 use focusforge_core::io::{TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::{self, Checkpoint, Metrics, Op, Point, Project, SealRequest};
@@ -1045,7 +1046,7 @@ fn seal_synthetic_project(dir: &Path, seed: u16) -> PathBuf {
         algorithm: "laplacian",
         params: &values,
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),

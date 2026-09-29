@@ -11,6 +11,7 @@ mod common;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::{
@@ -129,7 +130,7 @@ fn seal_request<'a>(
         algorithm: "laplacian",
         params: values,
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -969,7 +970,7 @@ fn link_failures_are_structural_refusals() {
         algorithm: "laplacian",
         params: &values,
         align: None,
-        crop: None,
+        registration: Registration::default(),
         composite_description: "re-fused composite".to_string(),
         label: None,
         metrics: Metrics::default(),

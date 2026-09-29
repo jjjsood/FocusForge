@@ -32,6 +32,7 @@ use super::{
     HASH_ALGORITHM, Op, Project, SealedProject, format_version_for, fused_extent, materialize_zmap,
     resolve_chain,
 };
+use crate::align::Registration;
 use crate::params::ParamValues;
 use crate::retouch::{replay, write_edited};
 use crate::tile::Rect;
@@ -53,8 +54,8 @@ pub struct AppendRequest<'a> {
     pub algorithm: &'a str,
     pub params: &'a ParamValues,
     pub align: Option<AlignRecord>,
-    /// The composite's extent after any crop was applied.
-    pub crop: Option<Rect>,
+    /// Every frame's transform and the applied crop.
+    pub registration: Registration,
     /// Exactly the `ImageDescription` the staged composite carries.
     pub composite_description: String,
     pub label: Option<String>,
@@ -147,6 +148,7 @@ fn append_staged(
         algorithm: request.algorithm.to_string(),
         params: request.params.clone(),
         align: request.align.clone(),
+        registration: request.registration.clone(),
         sources,
         composite: PlaneRef {
             blob: composite.hash.clone(),
@@ -169,7 +171,6 @@ fn append_staged(
         blobs,
         metrics: request.metrics,
         checkpoint: checkpoint_id.clone(),
-        crop: request.crop,
     };
 
     let checkpoint = Checkpoint {
@@ -185,7 +186,7 @@ fn append_staged(
         fuse: Some(FuseRecord {
             composite: manifest.composite.clone(),
             align: manifest.align.clone(),
-            crop: manifest.crop,
+            registration: manifest.registration.clone(),
             sources: manifest.sources.clone(),
             metrics: manifest.metrics,
         }),
@@ -648,7 +649,7 @@ fn append_ops_staged(
         blobs,
         metrics: fuse.metrics,
         checkpoint: checkpoint_id.clone(),
-        crop: fuse.crop,
+        registration: fuse.registration.clone(),
     };
 
     let checkpoint = Checkpoint {
@@ -772,7 +773,7 @@ pub fn delete_checkpoint(project_path: &Path, id: &str) -> Result<Deleted, Proje
             },
             metrics: fuse.metrics,
             checkpoint: new_head.id.clone(),
-            crop: fuse.crop,
+            registration: fuse.registration.clone(),
             ..manifest.clone()
         }
     } else {
