@@ -69,13 +69,10 @@ pub struct MetadataTags {
 
 // --- export rewrite --------------------------------------------------------
 //
-// What an export must never carry verbatim: a source's `Software`,
-// `DateTime` and `OffsetTime` describe *its* export, not this one, and its
-// EXIF image-dimension tags may name a size a crop has since changed. Every
-// other entry -- `DateTimeOriginal` above all -- passes through untouched;
-// the TIFF-side read and the RAW-side mapping have already dropped what an
-// export must never carry at all (the MakerNote, the thumbnail, every
-// pointer/layout tag).
+// A source's `Software`, `DateTime` and `OffsetTime` describe *its* export,
+// not this one, and its EXIF image-dimension tags may name a size a crop has
+// since changed, so those are rewritten. Every other entry --
+// `DateTimeOriginal` above all -- passes through untouched.
 
 /// The export moment as EXIF `DateTime`/`DateTimeOriginal` text
 /// (`YYYY:MM:DD HH:MM:SS`), in `now`'s own zone.
@@ -93,12 +90,10 @@ fn set_entry(entries: &mut Vec<TagEntry>, entry: TagEntry) {
 
 /// Rewrites `source` for one export: `Software` (305) and `DateTime` (306)
 /// become the export's own identity and moment, `OffsetTime` (36880)
-/// becomes that moment's UTC offset (replacing whatever the source
-/// declared, possibly stale or wrong), and the EXIF image-dimension tags
+/// becomes that moment's UTC offset, and the EXIF image-dimension tags
 /// (40962/40963) become `width`/`height`. `now` is read once by the caller,
 /// not here: `chrono`'s local-time lookup is not safe to call concurrently
-/// with anything that mutates `TZ`, so a single early read is the only safe
-/// pattern.
+/// with anything that mutates `TZ`.
 pub(crate) fn rewrite(
     source: &SourceMetadata,
     width: u32,
@@ -148,12 +143,11 @@ pub(crate) fn exif_blob(tags: &MetadataTags) -> Vec<u8> {
 
 // --- RAW-source mapping ---------------------------------------------------
 //
-// rawler's typed `Exif`/`ExifGPS` (rawler-0.8.0, `src/exif.rs`) is the one
-// EXIF route every RAW format shares: only the DNG decoder exposes a raw
-// EXIF IFD, so a hand-written IFD walk like the TIFF reader's would miss
-// every other RAW format. The table below lists every field this project
-// carries; `ExifValue` gives each Rust type in `Exif`/`ExifGPS` one shared
-// TIFF encoding.
+// rawler's typed `Exif`/`ExifGPS` is the one EXIF route every RAW format
+// shares: only the DNG decoder exposes a raw EXIF IFD, so a hand-written IFD
+// walk like the TIFF reader's would miss every other RAW format.
+// `ExifValue` gives each Rust type in `Exif`/`ExifGPS` one shared TIFF
+// encoding.
 
 const FIELD_TYPE_BYTE: u16 = 1;
 const FIELD_TYPE_ASCII: u16 = 2;
@@ -343,11 +337,9 @@ const BUILTIN_SRGB_ICC: &[u8] = include_bytes!("srgb-v2-micro.icc");
 
 /// Maps rawler's typed EXIF onto this project's `SourceMetadata`: `make`
 /// and `model` (not part of `Exif`) go into IFD0 alongside `Orientation`,
-/// `Artist` and `Copyright`; every other `Exif`/`ExifGPS` field the table
-/// above lists goes into the EXIF or GPS list. A RAW source has no XMP or
-/// IPTC (rawler exposes no XMP/IPTC path from its RAW decoders) and gets the
-/// built-in sRGB profile rather than its own, since rawler develops every
-/// RAW format to sRGB before this project ever sees a pixel.
+/// `Artist` and `Copyright`; every other populated `Exif`/`ExifGPS` field
+/// goes into the EXIF or GPS list. A RAW source has no XMP or IPTC and gets
+/// the built-in sRGB profile rather than its own.
 pub(crate) fn exif_to_metadata(exif: &Exif, make: &str, model: &str) -> SourceMetadata {
     let mut ifd0 = Vec::new();
     if !make.is_empty() {
