@@ -20,7 +20,7 @@ use focusforge_core::zmap::{ZMapError, ZMapReader};
 use focusforge_gpu::display::{DisplayRenderer, DisplayTexture};
 use slint::wgpu_29::wgpu;
 
-use crate::canvas::{Pane, PaneJob, PaneSource, StampFloor, TextureSpec, grow_scratch};
+use crate::canvas::{Pane, PaneJob, PaneSource, StampFloor, TextureSpec};
 use crate::viewport::PaneDraw;
 
 /// The exact content a [`PaneTexture`] was last drawn from: `draw.src` and
@@ -767,22 +767,11 @@ impl CanvasRenderer {
 
     /// Reads a job's samples into the shared scratch and publishes them.
     fn read_and_publish(&mut self, job: PaneJob) -> Option<slint::Image> {
-        let (x, y, width, height) = job.draw.src;
-        let (tex_w, tex_h) = job.draw.extent();
-        let len = tex_w as usize * tex_h as usize * job.reader.samples_per_pixel() as usize;
         let mut scratch = std::mem::take(&mut self.sample_scratch);
-        let samples = grow_scratch(&mut scratch, len);
-        let rect = focusforge_core::tile::Rect {
-            x,
-            y,
-            width,
-            height,
-        };
         let image = job
-            .reader
-            .read_step_into(rect, job.draw.step, samples)
+            .read_into(&mut scratch)
             .ok()
-            .and_then(|()| self.publish(&job, &scratch[..len]));
+            .and_then(|()| self.publish(&job, &scratch));
         self.sample_scratch = scratch;
         image
     }

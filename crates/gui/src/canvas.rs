@@ -322,6 +322,23 @@ pub struct PaneJob {
     pub index_scale: u32,
 }
 
+impl PaneJob {
+    /// Sizes `samples` to the draw's texture and reads the job's source into it.
+    pub(crate) fn read_into(&self, samples: &mut Vec<u16>) -> Result<(), PaneReadError> {
+        let (x, y, width, height) = self.draw.src;
+        let (tex_w, tex_h) = self.draw.extent();
+        let len = tex_w as usize * tex_h as usize * self.reader.samples_per_pixel() as usize;
+        let out = grow_scratch(samples, len);
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        self.reader.read_step_into(rect, self.draw.step, out)
+    }
+}
+
 /// A [`PaneJob`] with its samples read.
 pub struct Prepared {
     pub job: PaneJob,
@@ -492,17 +509,7 @@ fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
 }
 
 fn read_job(job: PaneJob, mut samples: Vec<u16>) -> Option<Prepared> {
-    let (x, y, width, height) = job.draw.src;
-    let (tex_w, tex_h) = job.draw.extent();
-    let len = tex_w as usize * tex_h as usize * job.reader.samples_per_pixel() as usize;
-    let out = grow_scratch(&mut samples, len);
-    let rect = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
-    match job.reader.read_step_into(rect, job.draw.step, out) {
+    match job.read_into(&mut samples) {
         Ok(()) => Some(Prepared { job, samples }),
         Err(error) => {
             tracing::warn!(%error, pane = ?job.pane, "pane read failed");
