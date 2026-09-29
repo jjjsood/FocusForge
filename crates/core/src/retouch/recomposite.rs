@@ -204,6 +204,74 @@ mod tests {
         check_matches_reference(window, crop, (50, 70));
     }
 
+    /// An in-memory `TileReader` whose samples name their own frame and
+    /// source coordinate: `frame*10_000 + y*100 + x`, one sample per pixel.
+    struct TranslatingFrames;
+
+    impl TileReader for TranslatingFrames {
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [u16],
+        ) -> Result<(), AlgorithmError> {
+            for row in 0..rect.height {
+                for col in 0..rect.width {
+                    let x = rect.x + col;
+                    let y = rect.y + row;
+                    out[(row * rect.width + col) as usize] =
+                        (frame as u32 * 10_000 + y * 100 + x) as u16;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn gathers_through_a_warped_reader_at_a_non_zero_origin() {
+        use crate::align::{Transform, WarpingReader};
+
+        let frame_dims = (64u32, 64u32);
+        // Integer shifts of both signs, in x and y.
+        let shifts: [(i64, i64); 3] = [(0, 0), (4, -2), (-3, 5)];
+        let transforms: Vec<Transform> = shifts
+            .iter()
+            .map(|&(dx, dy)| Transform::translation(dx as f64, dy as f64))
+            .collect();
+        let inner = TranslatingFrames;
+        let warping = WarpingReader::new(&inner, frame_dims, 1, transforms);
+
+        let origin = (5u32, 3u32);
+        let region = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 15,
+        };
+        let indices = checker_indices(region.width, region.height, 3);
+        let sources = Sources {
+            reader: &warping,
+            frame_count: 3,
+            samples_per_pixel: 1,
+            origin,
+        };
+        let mut actual = vec![0u16; indices.len()];
+        recomposite(&indices, region, &sources, &mut actual).expect("recomposite");
+
+        for (i, &index) in indices.iter().enumerate() {
+            let x = region.x + (i as u32) % region.width;
+            let y = region.y + (i as u32) / region.width;
+            let (dx, dy) = shifts[index as usize];
+            let sx = (x + origin.0) as i64 + dx;
+            let sy = (y + origin.1) as i64 + dy;
+            let expected = (u32::from(index) * 10_000 + sy as u32 * 100 + sx as u32) as u16;
+            assert_eq!(
+                actual[i], expected,
+                "pixel {i} (frame {index}) must equal a direct shifted gather"
+            );
+        }
+    }
+
     /// An in-memory `TileReader` recording which frames it was asked for,
     /// producing samples `frame*1000 + x` so each gathered sample names its
     /// source frame and column, one sample per pixel (`spp == 1`).

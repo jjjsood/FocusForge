@@ -173,10 +173,10 @@ pub fn load(config_dir: &Path) -> Loaded {
         // and a partial or out-of-order file must never shift or delete an
         // unrelated row.
         //
-        // A trigger that parses but names none of the table's nine known
+        // A trigger that parses but names none of the table's ten known
         // triggers is refused the same way an unparseable spelling is: this
         // table's rows are display-indexed (`InputTable::display_rows`,
-        // `DEFAULT_BINDINGS`'s fixed nine-slot layout), so a trigger this
+        // `DEFAULT_BINDINGS`'s fixed ten-slot layout), so a trigger this
         // table has no row for cannot be shown in the settings modal, and
         // silently accepting it would show a table that does not match the
         // active bindings. Refusing is final -- "rebind" means reassigning
@@ -292,7 +292,7 @@ const HEADER: &str = "\
 #
 # Accepted actions: zoom-at-cursor, step-source-frame, pan-horizontal,
 # overlay-opacity, pan, brush-size, brush-softness, undo, redo,
-# pick-source-under-pointer.
+# pick-source-under-pointer, paint.
 #
 # Omit `stacking` or `editor` to leave that mode with no binding.
 ";

@@ -146,19 +146,12 @@ fn previous_hook_chained() {
     assert!(path.is_file());
 }
 
+#[cfg(unix)]
 #[test]
 fn unwritable_crash_dir() {
-    let base = common::tmp_dir("crash_cli_unwritable");
-    let readonly = base.join("readonly");
-    std::fs::create_dir_all(&readonly).unwrap();
-    let mut permissions = std::fs::metadata(&readonly).unwrap().permissions();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        permissions.set_mode(0o500);
-    }
-    std::fs::set_permissions(&readonly, permissions).unwrap();
-
+    let Some(readonly) = common::readonly_dir("crash_cli_unwritable", 0o500, |_| {}) else {
+        return;
+    };
     let data_dir = readonly.join("data");
     let mut cmd = common::cli_bin("crash_cli_unwritable_run");
     let output = cmd

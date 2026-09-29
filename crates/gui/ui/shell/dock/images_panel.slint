@@ -6,6 +6,7 @@
 import { Theme } from "../../theme.slint";
 import { ShellGeometry } from "../../geometry.slint";
 import { FFImageRow } from "../../components/ff_image_row.slint";
+import { FFNoSourceRow } from "../../components/ff_no_source_row.slint";
 import { FFScrollbar } from "../../components/ff_scrollbar.slint";
 import { FFMenuList } from "../../components/ff_menu_list.slint";
 import { FFIconButton } from "../../components/ff_icon_button.slint";
@@ -30,6 +31,11 @@ export component FFImagesPanel inherits Rectangle {
     // Whether the mutating chrome (add, sort, per-row hover controls) shows
     // at all.
     in property <bool> mutable: true;
+    // The editor's read-only legend: every row is a mode of `FFImageRow`
+    // rather than the mutable stacking-mode row, and the pinned `NO_SOURCE`
+    // entry shows below the scrolled list.
+    in property <bool> legend: false;
+    in property <bool> no-source-row: false;
     // The sort menu's own selection ("" | "name" | "capture-time") and
     // whether it is open.
     in property <string> sort: "";
@@ -52,7 +58,10 @@ export component FFImagesPanel inherits Rectangle {
     callback frame-excluded-toggled(int);
     callback frame-remove-requested(int);
     callback frame-grip-pointer(int, int, length);
-    callback scrolled(length);
+    // A plain wheel over the list -- steps the selected/brush-source frame,
+    // the same effect `Ctrl + Wheel` over the canvas has. Raw wheel delta,
+    // unnegated, matching `AppController::wheel`'s own convention.
+    callback frame-wheel(length);
     callback scrollbar-pointer(int, length);
     callback scrollbar-dragged(length);
     callback viewport-height-changed(length);
@@ -99,7 +108,7 @@ export component FFImagesPanel inherits Rectangle {
                 width: 100%;
                 height: 100%;
                 scroll-event(event) => {
-                    root.scrolled(-event.delta-y);
+                    root.frame-wheel(event.delta-y);
                     accept
                 }
             }
@@ -121,12 +130,28 @@ export component FFImagesPanel inherits Rectangle {
                     unresolved: row.unresolved;
                     selected: row.selected;
                     mutable: root.mutable;
+                    legend: root.legend;
                     dragging: root.mutable && i == root.dragging-row;
                     clicked => { root.frame-selected(i); }
                     exclude-toggled => { root.frame-excluded-toggled(i); }
                     remove-requested => { root.frame-remove-requested(i); }
                     grip-pointer(kind, y) => { root.frame-grip-pointer(i, kind, y); }
                 }
+            }
+        }
+
+        // Pinned below the scrolled list, outside `clip-area`'s own
+        // clipping and scroll offset -- `NO_SOURCE` never scrolls away.
+        if root.no-source-row: VerticalLayout {
+            width: ShellGeometry.image-row-band-width;
+
+            Rectangle {
+                height: 1px;
+                background: Theme.border-default;
+            }
+
+            FFNoSourceRow {
+                width: ShellGeometry.image-row-band-width;
             }
         }
     }

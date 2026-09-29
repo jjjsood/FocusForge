@@ -882,6 +882,45 @@ fn discard_removes_the_store_entry() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// A ledger reopened through [`ResumeStore::find`] holds its own
+/// `units.log` append handle, the same as a freshly [`ResumeStore::begin`]'d
+/// one -- `discard` must release it before removing the directory on a
+/// filesystem that turns an unlinked-but-open file into a hidden entry
+/// (FUSE mounts without `hard_remove`, this host's NTFS cargo target
+/// included), or the following `remove_dir_all` sees a non-empty directory.
+#[test]
+fn discard_removes_a_ledger_find_opened() {
+    let stack = open_stack();
+    let (width, height) = stack.dimensions();
+    let stack_ctx = StackContext::new(stack.len(), width, height, 3);
+    let values = resolved_laplacian_values(stack_ctx);
+
+    let scratch = scratch_base("discard-find-opened");
+    let composite_path = scratch.join("out.tif");
+    std::fs::create_dir_all(&scratch).unwrap();
+    std::fs::write(&composite_path, b"partial").unwrap();
+
+    let store = ResumeStore::open(&scratch).unwrap();
+    let record = job_record(&stack, &values, &composite_path, None);
+    let ledger = store.begin(&record).unwrap();
+    ledger.record_unit(0).unwrap();
+    drop(ledger);
+
+    let store2 = ResumeStore::open(&scratch).unwrap();
+    let ledger2 = match store2.find(&record).unwrap() {
+        Resumable::Ledger(ledger) => ledger,
+        other => panic!("expected Resumable::Ledger, got {other:?}"),
+    };
+    let dir = ledger2.dir().to_path_buf();
+    assert!(dir.is_dir());
+    ledger2.discard().unwrap();
+    assert!(
+        !dir.exists(),
+        "discard must remove the whole ledger directory, hidden entries included"
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 #[test]
 fn resume_reuses_the_recorded_alignment() {
     let stack = open_stack();

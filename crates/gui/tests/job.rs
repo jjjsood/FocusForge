@@ -1235,6 +1235,7 @@ fn sealed_project_with_as_given_sources(name: &str) -> PathBuf {
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
+        registration: focusforge_core::align::Registration::default(),
         composite_description: "staged composite".to_string(),
         label: None,
         metrics: project::Metrics::default(),
@@ -2497,13 +2498,6 @@ fn refuse_after_save_leaves_the_file_untouched() {
 }
 
 #[cfg(unix)]
-fn set_read_only(dir: &Path, read_only: bool) {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = if read_only { 0o555 } else { 0o755 };
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
-}
-
-#[cfg(unix)]
 #[test]
 fn a_failed_save_keeps_the_project_in_memory() {
     let mut controller = controller_with_frames("failed_save", 2);
@@ -2535,12 +2529,12 @@ fn a_failed_save_keeps_the_project_in_memory() {
     );
     still_in_memory(&mut controller);
 
-    let empty = common::tree("failed_save_read_only_empty");
+    let Some(empty) = common::readonly_dir("failed_save_read_only_empty", 0o555, |_| {}) else {
+        return;
+    };
     let target = empty.join("saved.ffp");
-    set_read_only(&empty, true);
     let saved = controller.save_active_project(|_| Some(target.clone()));
     let left = listing(&empty);
-    set_read_only(&empty, false);
     assert!(!saved);
     assert!(left.is_empty(), "nothing was left behind: {left:?}");
     let message = controller
@@ -2550,13 +2544,14 @@ fn a_failed_save_keeps_the_project_in_memory() {
     assert!(message.contains("Permission denied"), "{message}");
     still_in_memory(&mut controller);
 
-    let holding = common::tree("failed_save_read_only_existing");
+    let Some(holding) = common::readonly_dir("failed_save_read_only_existing", 0o555, |dir| {
+        std::fs::write(dir.join("existing.ffp"), b"an earlier project").unwrap();
+    }) else {
+        return;
+    };
     let existing = holding.join("existing.ffp");
-    std::fs::write(&existing, b"an earlier project").unwrap();
-    set_read_only(&holding, true);
     let saved = controller.save_active_project(|_| Some(existing.clone()));
     let left = listing(&holding);
-    set_read_only(&holding, false);
     assert!(!saved);
     assert_eq!(left, [PathBuf::from("existing.ffp")]);
     assert_eq!(std::fs::read(&existing).unwrap(), b"an earlier project");

@@ -11,13 +11,13 @@ use std::path::{Path, PathBuf};
 
 use focusforge_core::TiffError;
 use focusforge_core::display::zmap_index_scale;
-use focusforge_core::io::TiffStack;
-use focusforge_core::tile::Rect;
+use focusforge_core::io::{FrameError, TiffStack};
+use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::{ZMapError, ZMapReader};
-use focusforge_gpu::display::{DisplayTexture, render};
+use focusforge_gpu::display::{DisplayTexture, render, render_overlay};
 use slint::wgpu_29::wgpu;
 
-use crate::canvas::TextureSpec;
+use crate::canvas::{FrameView, OverlayDraw, TextureSpec};
 use crate::viewport::PaneDraw;
 
 /// One pane's wgpu-owned state: the display texture, and the `slint::Image`
@@ -39,9 +39,34 @@ impl PaneTexture {
         self.image.clone().unwrap_or_default()
     }
 
-    /// The single point where both a (re)allocation and a render happen, so
-    /// one early return covers both halves of a lost device: no new
-    /// `DisplayTexture` and no `render` call once the device is known gone.
+    /// (Re)allocates this pane's texture for `width` x `height` if needed,
+    /// importing it as the `slint::Image` [`Self::image`] returns -- the
+    /// allocation half [`Self::ensure_and_render`] and
+    /// [`Self::ensure_and_render_overlay`] both share. `None` once the
+    /// device is known gone, or when a freshly (re)allocated texture's
+    /// import fails; the previous image is kept either way.
+    fn ensure_texture(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> Option<&DisplayTexture> {
+        if focusforge_gpu::errors::device_lost() {
+            return None;
+        }
+        let wanted = TextureSpec { width, height };
+        if crate::canvas::needs_realloc(self.spec, wanted) {
+            let texture = DisplayTexture::new(device, width, height);
+            let imported = slint::Image::try_from(texture.texture().clone());
+            self.apply_import(imported, texture, wanted);
+        }
+        self.display_texture.as_ref()
+    }
+
+    /// The single point where both a (re)allocation and a plain render
+    /// happen, so one early return covers both halves of a lost device: no
+    /// new `DisplayTexture` and no `render` call once the device is known
+    /// gone.
     #[allow(clippy::too_many_arguments)]
     fn ensure_and_render(
         &mut self,
@@ -53,21 +78,37 @@ impl PaneTexture {
         samples_per_pixel: u32,
         index_scale: u32,
     ) {
-        if focusforge_gpu::errors::device_lost() {
-            return;
-        }
-        let wanted = TextureSpec { width, height };
-        if crate::canvas::needs_realloc(self.spec, wanted) {
-            let texture = DisplayTexture::new(device, width, height);
-            let imported = slint::Image::try_from(texture.texture().clone());
-            self.apply_import(imported, texture, wanted);
-        }
-        let Some(texture) = self.display_texture.as_ref() else {
-            // The only newly (re)allocated texture failed import: nothing to
-            // render into this frame, and the previous image is kept as-is.
+        let Some(texture) = self.ensure_texture(device, width, height) else {
             return;
         };
         render(device, queue, texture, src, samples_per_pixel, index_scale);
+    }
+
+    /// [`Self::ensure_and_render`]'s overlay-blend twin: the composite pane's
+    /// own render call when the rainbow overlay is on.
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_and_render_overlay(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        composite: &[u16],
+        indices: &[u16],
+        overlay: &OverlayDraw,
+    ) {
+        let Some(texture) = self.ensure_texture(device, width, height) else {
+            return;
+        };
+        render_overlay(
+            device,
+            queue,
+            texture,
+            composite,
+            indices,
+            &overlay.table,
+            overlay.alpha,
+        );
     }
 
     /// Applies the outcome of importing a newly (re)allocated texture. On
@@ -182,7 +223,9 @@ mod tests {
         assert!(empty.device_queue().is_none());
 
         let mut frame_only = CanvasRenderer::new();
-        frame_only.set_frame(&frame).expect("fixture frame opens");
+        frame_only
+            .set_frame(&frame, None, crate::job::host_budget())
+            .expect("fixture frame opens");
         assert!(frame_only.redraw_frame(&draw).is_none());
         frame_only.attach_device(shared.device().clone(), shared.queue().clone());
         assert!(frame_only.redraw_frame(&draw).is_some());
@@ -197,16 +240,16 @@ mod tests {
 
         let mut planes_and_frame = CanvasRenderer::new();
         planes_and_frame
-            .set_frame(&frame)
+            .set_frame(&frame, None, crate::job::host_budget())
             .expect("fixture frame opens");
         planes_and_frame
             .set_planes(&composite, &zmap)
             .expect("fixture planes open");
         assert!(planes_and_frame.redraw_frame(&draw).is_none());
-        assert!(planes_and_frame.redraw_planes(&draw).is_none());
+        assert!(planes_and_frame.redraw_planes(&draw, None, None).is_none());
         planes_and_frame.attach_device(shared.device().clone(), shared.queue().clone());
         assert!(planes_and_frame.redraw_frame(&draw).is_some());
-        assert!(planes_and_frame.redraw_planes(&draw).is_some());
+        assert!(planes_and_frame.redraw_planes(&draw, None, None).is_some());
         planes_and_frame.detach_device();
         planes_and_frame.detach_device();
         assert_eq!(planes_and_frame.frame_path(), Some(frame.as_path()));
@@ -222,7 +265,22 @@ mod tests {
         assert!(planes_and_frame.last_frame.is_none());
         planes_and_frame.attach_device(shared.device().clone(), shared.queue().clone());
         assert!(planes_and_frame.redraw_frame(&draw).is_some());
-        assert!(planes_and_frame.redraw_planes(&draw).is_some());
+        assert!(planes_and_frame.redraw_planes(&draw, None, None).is_some());
+
+        let overlay = crate::canvas::OverlayDraw {
+            table: focusforge_core::zmap::overlay_table(1, None),
+            alpha: focusforge_core::display::alpha_from_opacity(0.65),
+        };
+        assert!(
+            planes_and_frame
+                .redraw_planes(&draw, None, Some(&overlay))
+                .is_some(),
+            "the composite pane still draws with the overlay on"
+        );
+        assert!(
+            planes_and_frame.redraw_planes(&draw, None, None).is_some(),
+            "and turning it back off"
+        );
     }
 }
 
@@ -260,6 +318,14 @@ pub struct CanvasRenderer {
     zmap_pane: PaneTexture,
     index_scale: Option<u32>,
     last_planes: Option<PaneDraw>,
+    /// The edited view's own generation at `last_planes`' redraw -- `None`
+    /// both when no edited view was drawn and when none is drawn now, so a
+    /// tab with no edit session still short-circuits a repeat draw.
+    last_planes_generation: Option<u64>,
+    /// The overlay drawn at `last_planes` -- part of the same short-circuit
+    /// key, since turning the overlay on/off or changing its opacity must
+    /// redraw even when nothing else about `draw` changed.
+    last_overlay: Option<OverlayDraw>,
     frame: crate::canvas::FrameSource,
     frame_pane: PaneTexture,
     last_frame: Option<PaneDraw>,
@@ -283,6 +349,8 @@ impl CanvasRenderer {
             zmap_pane: PaneTexture::default(),
             index_scale: None,
             last_planes: None,
+            last_planes_generation: None,
+            last_overlay: None,
             frame: crate::canvas::FrameSource::default(),
             frame_pane: PaneTexture::default(),
             last_frame: None,
@@ -302,6 +370,8 @@ impl CanvasRenderer {
         self.zmap_pane = PaneTexture::default();
         self.frame_pane = PaneTexture::default();
         self.last_planes = None;
+        self.last_planes_generation = None;
+        self.last_overlay = None;
         self.last_frame = None;
         self.device = None;
         self.queue = None;
@@ -335,6 +405,8 @@ impl CanvasRenderer {
         self.composite_pane = PaneTexture::default();
         self.zmap_pane = PaneTexture::default();
         self.last_planes = None;
+        self.last_planes_generation = None;
+        self.last_overlay = None;
         Ok(())
     }
 
@@ -346,6 +418,8 @@ impl CanvasRenderer {
         self.composite_pane = PaneTexture::default();
         self.zmap_pane = PaneTexture::default();
         self.last_planes = None;
+        self.last_planes_generation = None;
+        self.last_overlay = None;
     }
 
     /// The frame pane's currently open path, if any.
@@ -353,10 +427,21 @@ impl CanvasRenderer {
         self.frame.path()
     }
 
-    /// Opens `path` as the frame pane's source, dropping whatever was open
-    /// first. `Err` leaves nothing open.
-    pub fn set_frame(&mut self, path: &Path) -> Result<(), TiffError> {
-        let result = self.frame.set(path);
+    /// The frame pane's currently recorded view, if any.
+    pub fn frame_view(&self) -> Option<FrameView> {
+        self.frame.view()
+    }
+
+    /// Opens `path` as the frame pane's source under `budget`, dropping
+    /// whatever was open first, and records `view` for the next
+    /// [`Self::redraw_frame`] to warp through. `Err` leaves nothing open.
+    pub fn set_frame(
+        &mut self,
+        path: &Path,
+        view: Option<FrameView>,
+        budget: HostBudget,
+    ) -> Result<(), FrameError> {
+        let result = self.frame.set(path, view, budget);
         self.frame_pane = PaneTexture::default();
         self.last_frame = None;
         result
@@ -369,20 +454,27 @@ impl CanvasRenderer {
         self.last_frame = None;
     }
 
-    /// Re-reads and re-uploads `draw.src` for both planes, every `draw.step`-th
-    /// row and column into a `draw.extent()`-sized texture, returning the two
-    /// `slint::Image`s to bind to `FFPane::source`. A no-op (besides
-    /// re-cloning the two already-current images) when `draw` is exactly
-    /// what was last drawn -- a gesture that changes nothing costs nothing.
-    /// `None` with no planes open, when `draw.src` falls outside the open
-    /// composite, or either read fails; `self.last_planes` stays untouched
-    /// on that path so a later, valid rect still renders.
-    pub fn redraw_planes(&mut self, draw: &PaneDraw) -> Option<(slint::Image, slint::Image)> {
+    /// Re-reads and re-uploads `draw.src` for both planes, decimated into a
+    /// `draw.extent()`-sized texture. `edited`, present, overlays the
+    /// composite with the resident tiles' gathered pixel wherever its index
+    /// differs, and uploads indices for the Z-Map. `overlay`, present on a
+    /// three-sample composite, blends the rainbow overlay in place of the
+    /// plain render. `None` on an out-of-range/unopened read or no device.
+    pub fn redraw_planes(
+        &mut self,
+        draw: &PaneDraw,
+        edited: Option<crate::canvas::EditedView>,
+        overlay: Option<&OverlayDraw>,
+    ) -> Option<(slint::Image, slint::Image)> {
         let (device, queue) = self.device_queue()?;
         if self.composite.is_none() || self.zmap.is_none() {
             return None;
         }
-        if self.last_planes.as_ref() == Some(draw) {
+        let generation = edited.as_ref().map(|view| view.tiles.generation());
+        if self.last_planes.as_ref() == Some(draw)
+            && self.last_planes_generation == generation
+            && self.last_overlay.as_ref() == overlay
+        {
             return Some((self.composite_pane.image(), self.zmap_pane.image()));
         }
         let composite = self.composite.as_ref()?;
@@ -411,23 +503,72 @@ impl CanvasRenderer {
         composite
             .read_tile_step_into(0, rect, draw.step, &mut samples)
             .ok()?;
-        self.composite_pane.ensure_and_render(
+
+        let mut sealed_indices = vec![0u16; texels];
+        zmap.read_tile_step_into(rect, draw.step, &mut sealed_indices)
+            .ok()?;
+
+        let zmap_indices = match &edited {
+            Some(view) => {
+                let mut edited_indices = vec![0u16; texels];
+                crate::canvas::step_copy(
+                    view.indices,
+                    view.map_width,
+                    rect,
+                    draw.step,
+                    &mut edited_indices,
+                );
+                crate::canvas::overlay_edited(
+                    &mut samples,
+                    &sealed_indices,
+                    &edited_indices,
+                    rect,
+                    draw.step,
+                    samples_per_pixel,
+                    view.tiles,
+                );
+                edited_indices
+            }
+            None => sealed_indices,
+        };
+
+        match overlay {
+            Some(overlay) if samples_per_pixel == 3 => {
+                self.composite_pane.ensure_and_render_overlay(
+                    &device,
+                    &queue,
+                    tex_w,
+                    tex_h,
+                    &samples,
+                    &zmap_indices,
+                    overlay,
+                );
+            }
+            _ => {
+                self.composite_pane.ensure_and_render(
+                    &device,
+                    &queue,
+                    tex_w,
+                    tex_h,
+                    &samples,
+                    samples_per_pixel,
+                    0,
+                );
+            }
+        }
+        self.zmap_pane.ensure_and_render(
             &device,
             &queue,
             tex_w,
             tex_h,
-            &samples,
-            samples_per_pixel,
-            0,
+            &zmap_indices,
+            1,
+            index_scale,
         );
 
-        let mut indices = vec![0u16; texels];
-        zmap.read_tile_step_into(rect, draw.step, &mut indices)
-            .ok()?;
-        self.zmap_pane
-            .ensure_and_render(&device, &queue, tex_w, tex_h, &indices, 1, index_scale);
-
         self.last_planes = Some(*draw);
+        self.last_planes_generation = generation;
+        self.last_overlay = overlay.cloned();
         Some((self.composite_pane.image(), self.zmap_pane.image()))
     }
 

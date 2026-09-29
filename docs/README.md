@@ -18,6 +18,9 @@ retouching the result.
 - [`guide/alignment.md`](guide/alignment.md) — how `focusforge-cli
   align`/`stack` register frames before fusing, choosing a mode, and
   checking a result before committing to a full run
+- [`guide/retouch.md`](guide/retouch.md) — editing a stack's Z-Map by hand,
+  from the op list `focusforge-cli retouch` applies to the window's brush,
+  pipette, overlay and undo/redo
 - [`guide/batch-runs.md`](guide/batch-runs.md) — stacking a folder that holds
   more than one stack: the grouping proposal and overriding it, presets,
   re-running one stack, cancelling and resuming a run, the stage cache, and
@@ -30,7 +33,7 @@ retouching the result.
 
 - [`reference/cli.md`](reference/cli.md) — every `focusforge-cli` subcommand
   and flag, and the `info --json`, `algorithms --json`, `stack --json`,
-  `export --json` and `review --json` schemas
+  `export --json`, `retouch --json` and `review --json` schemas
 - [`reference/tiff-fast-path.md`](reference/tiff-fast-path.md) — the TIFF
   layout the reader accepts and the writer emits
 - [`reference/project-format.md`](reference/project-format.md) — the

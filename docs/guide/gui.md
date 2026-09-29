@@ -65,6 +65,13 @@ already opened from a project writes back to that same file without asking.
 A failed save keeps every held checkpoint and reports why the write did not
 happen — nothing is lost.
 
+## Retouching a result
+
+Once a tab has fused, the **STACKING / EDITOR** switch in the dock lights up
+its **EDITOR** half; switching to it turns the right pane into a paintable
+composite with a brush, a pipette and a rainbow source legend. See
+[`guide/retouch.md`](retouch.md) for the full workflow.
+
 ## Switching between projects
 
 The projects overlay lists every open project as a card, plus a card for any
