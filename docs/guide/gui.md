@@ -32,7 +32,12 @@ between two tabs of its own:
 - **Images** lists every frame in fuse order, with its legend color and
   capture time. A frame can be excluded from the next fuse without removing
   it, removed outright, re-ordered by dragging its row, and sorted by name or
-  capture time.
+  capture time. Its header adds more frames through a file picker, and
+  dropping a folder or a set of frames onto a tab that already holds a
+  project adds them to it the same way, rather than opening a second project;
+  a frame that would replace one already in the stack asks before doing so.
+  The panel dims while its own tab's fuse is running, the same as
+  **Settings**.
 - **Settings** lists the alignment and fusion algorithms and the parameters
   each one declares, generated from the same parameter schema
   `focusforge-cli algorithms` prints — choosing a different algorithm or
@@ -45,7 +50,9 @@ The toolbar's transport button reads **Fuse stack** on a tab with two or
 more frames still to fuse; while a run is going it becomes **Pause**,
 **Cancel** and, once paused, **Resume**. A failed run offers **Retry**,
 which starts the same request again. Progress, the current stage and an ETA
-show along the bottom of the window while a run is live.
+show along the bottom of the window while a run is live. A failed run raises
+a toast naming which step it failed at — setup, alignment or fusion —
+rather than a generic failure message.
 
 If the graphics device the window is using disappears (a driver reset, a
 GPU unplugged), the canvas stops updating and the window closes itself a
