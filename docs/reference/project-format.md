@@ -19,7 +19,10 @@ the system clock. Two seals of the same inputs therefore produce byte-
 identical archives.
 
 - `manifest.json` — the algorithm, its resolved parameters, the source frame
-  paths, dimensions, and a `format_version` for forward compatibility.
+  paths, dimensions, each frame's solved alignment transform and the applied
+  crop, and a `format_version` for forward compatibility. `export --frame`
+  reads the transform and crop back to warp one source frame to the
+  composite's own extent.
 - `blobs/<hash>.zst` — the composite plane and the Z-Map plane, each named
   by a `blake3` hash taken over its uncompressed content, so a blob's name
   attests to what it holds.
