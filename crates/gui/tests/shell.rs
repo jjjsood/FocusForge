@@ -172,9 +172,11 @@ fn checkpoint_panel_touches_no_storage() {
     // module allowed to name the schema/registry crate, and `diagnostics.rs`
     // is the one module allowed to name the timing/measurement API --
     // every other file reaches it through `crate::diagnostics`, never
-    // `focusforge_core` directly. Excluded by name: this test's own subject
+    // `focusforge_core` directly; `brush.rs` builds the stored stroke's path
+    // in core's own point type. Excluded by name: this test's own subject
     // is the checkpoint panel, not the whole crate.
     let canvas_files = [
+        "brush.rs",
         "canvas.rs",
         "gpu_canvas.rs",
         "entry.rs",
@@ -450,6 +452,70 @@ fn crash_notice_placement_and_absence() {
     assert!(
         (x - 16.0).abs() < EPS && (y - 92.0).abs() < EPS,
         "the toast's top-left must stay at the pane gutter regardless of window width: got ({x}, {y})"
+    );
+}
+
+/// The failure toast paints over the gallery's gutter while the Projects
+/// overview is open, at the pane gutter otherwise, and (closed) never blocks
+/// a click on the card underneath it.
+#[test]
+fn failure_toast_placement_over_the_projects_overview() {
+    let app = app_at(1440, 900);
+    app.set_projects_overlay_open(true);
+    app.set_job_toast_open(true);
+    assert_rect(&app, "AppWindow::job-toast", (312.0, 108.0, 300.0, 84.0));
+
+    let narrow = app_at(1200, 760);
+    narrow.set_projects_overlay_open(true);
+    narrow.set_job_toast_open(true);
+    assert_rect(&narrow, "AppWindow::job-toast", (312.0, 108.0, 300.0, 84.0));
+
+    app.set_projects_overlay_open(false);
+    assert_rect(&app, "AppWindow::job-toast", (12.0, 88.0, 300.0, 84.0));
+
+    app.set_job_toast_open(false);
+    app.set_projects_overlay_open(true);
+    let card = focusforge_gui::ProjectCardView {
+        kind: "open".into(),
+        opened: true,
+        current: false,
+        unsaved: false,
+        fusing: false,
+        fusing_fraction: 0.0,
+        project_name: "demo".into(),
+        meta_text: "".into(),
+        headline: "".into(),
+        stage: "".into(),
+        reason: "".into(),
+        action_label: "".into(),
+        has_picture: false,
+        picture: slint::Image::default(),
+        x: 0.0,
+        y: 0.0,
+    };
+    app.set_project_cards(std::rc::Rc::new(slint::VecModel::from(vec![card])).into());
+    app.set_gallery_content_height(300.0);
+    let recorded = std::rc::Rc::new(std::cell::RefCell::new(None));
+    app.on_projects_card_clicked({
+        let recorded = recorded.clone();
+        move |i| *recorded.borrow_mut() = Some(i)
+    });
+    let position = slint::LogicalPosition::new(400.0, 170.0);
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerPressed {
+            position,
+            button: slint::platform::PointerEventButton::Left,
+        });
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerReleased {
+            position,
+            button: slint::platform::PointerEventButton::Left,
+        });
+    assert_eq!(
+        *recorded.borrow(),
+        Some(0),
+        "a point inside the closed toast's rect that is also inside the first \
+         card must still reach the card"
     );
 }
 
@@ -958,4 +1024,53 @@ fn loading_indicator_never_shows_for_a_load_that_ends_before_the_threshold() {
         !app.get_load_indicator_visible(),
         "a load that finished before the threshold must never flash the indicator"
     );
+}
+
+/// The bottom bar's overlay caption, toggle and slider are absent in
+/// stacking mode -- no element matches their ids at all, rather than merely
+/// hidden -- and all three appear in editor mode, the slider staying
+/// present (greyed by its own `disabled` binding) whether the overlay is on
+/// or off.
+#[test]
+fn overlay_controls_exist_in_editor_only() {
+    let app = app_at(1440, 900);
+    app.set_show_empty_state(false);
+
+    let present = |id: &str| {
+        ElementQuery::from_root(&app)
+            .match_id(id)
+            .find_first()
+            .is_some()
+    };
+    let ids = [
+        "FFBottomBar::overlay-caption",
+        "FFBottomBar::overlay-toggle",
+        "FFBottomBar::overlay-slider",
+    ];
+
+    for id in ids {
+        assert!(!present(id), "{id}: stacking mode has no overlay controls");
+    }
+
+    app.set_mode("editor".into());
+    for id in ids {
+        assert!(present(id), "{id}: editor mode shows the overlay controls");
+    }
+
+    app.set_overlay_on(false);
+    assert!(
+        present("FFBottomBar::overlay-slider"),
+        "the slider stays present, greyed, while the overlay is off"
+    );
+
+    app.set_overlay_on(true);
+    assert!(present("FFBottomBar::overlay-slider"));
+
+    app.set_mode("stacking".into());
+    for id in ids {
+        assert!(
+            !present(id),
+            "{id}: leaving editor mode removes the controls rather than disabling them"
+        );
+    }
 }

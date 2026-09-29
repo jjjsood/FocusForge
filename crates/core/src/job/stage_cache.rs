@@ -246,7 +246,7 @@ impl StageKey {
 /// Converts one `f64` matrix to its per-entry `f64::to_bits()` projection,
 /// and back -- the bit-exact encoding [`CachedFrameAlignment`] and the
 /// resume ledger's `super::ledger::LedgerAlignment` both use.
-fn transform_to_bits(t: &Transform) -> [[u64; 3]; 3] {
+pub(crate) fn transform_to_bits(t: &Transform) -> [[u64; 3]; 3] {
     let mut out = [[0u64; 3]; 3];
     for (row_out, row_in) in out.iter_mut().zip(t.m.iter()) {
         for (bits, value) in row_out.iter_mut().zip(row_in.iter()) {
@@ -256,7 +256,7 @@ fn transform_to_bits(t: &Transform) -> [[u64; 3]; 3] {
     out
 }
 
-fn transform_from_bits(bits: [[u64; 3]; 3]) -> Transform {
+pub(crate) fn transform_from_bits(bits: [[u64; 3]; 3]) -> Transform {
     let mut m = [[0.0f64; 3]; 3];
     for (row_out, row_in) in m.iter_mut().zip(bits.iter()) {
         for (value, bits) in row_out.iter_mut().zip(row_in.iter()) {

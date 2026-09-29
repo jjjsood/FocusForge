@@ -409,6 +409,8 @@ fn gestures_come_from_the_input_map() {
     // `AppController`, the same as the canvas's own gesture table -- this
     // single-dispatch-point rule governs the canvas's rebindable zoom/pan/
     // drag gestures specifically, not every interactive widget in the crate.
+    // Every modal scrim and the Projects overlay's background swallow the
+    // wheel with a bare `accept`, forwarding nothing.
     let raw_gesture_callback_exceptions = [
         "canvas.slint",
         "ff_slider.slint",
@@ -418,6 +420,10 @@ fn gestures_come_from_the_input_map() {
         "ff_image_row.slint",
         "gallery.slint",
         "ff_manifest_list.slint",
+        "ff_dialog.slint",
+        "settings_modal.slint",
+        "dialogs.slint",
+        "projects_overlay.slint",
     ];
     for path in common::find_slint_files(&common::ui_dir()) {
         if path
@@ -710,7 +716,12 @@ fn wheel_repaints_once_on_the_next_idle_turn() {
     let app = focusforge_gui::AppWindow::new().expect("the window builds");
     let controller = Arc::new(Mutex::new(opened_controller()));
     let canvas = common::empty_canvas();
-    let _installed = focusforge_gui::bridge::install(&app, controller.clone(), canvas.clone());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        canvas.clone(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
     focusforge_gui::bridge::repaint(&app, &controller, &canvas);
     let fitted = app.get_zoom_readout().to_string();
     assert!(!fitted.is_empty(), "a repaint publishes the fit readout");

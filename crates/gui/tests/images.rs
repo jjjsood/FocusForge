@@ -82,10 +82,10 @@ fn wait_for_settle(controller: &mut AppController, timeout: Duration) {
     let start = Instant::now();
     loop {
         if controller.settle_job().is_some() {
-            return;
+            break;
         }
         if !job::is_live(&controller.job_view().state) {
-            return;
+            break;
         }
         assert!(
             start.elapsed() < timeout,
@@ -93,6 +93,11 @@ fn wait_for_settle(controller: &mut AppController, timeout: Duration) {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+    // A commit now auto-enters Editor on the viewed tab; this file's tests
+    // are about Stacking-mode frame curation, so back out to a known
+    // baseline (`controller_in_editor_mode` still enters Editor itself,
+    // right after this call, for the few tests that want it).
+    controller.set_mode(ShellMode::Stacking);
 }
 
 /// Saves the active, never-saved tab to the path the save dialog proposes,
@@ -154,6 +159,7 @@ fn seal_project_with_sources(dir: &Path, sources: &[PathBuf]) -> PathBuf {
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
+        registration: focusforge_core::align::Registration::default(),
         composite_description: "staged".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -174,7 +180,7 @@ fn list_shows_every_frame() {
     for (i, row) in panel.rows.iter().enumerate() {
         assert_eq!(row.name, format!("{i:02}.tif"));
         assert_eq!(
-            row.time_text, "10:00:00",
+            row.trailing_text, "10:00:00",
             "the row shows the time of day, not the full date"
         );
         assert!(!row.excluded);
@@ -238,13 +244,14 @@ fn absent_capture_time_is_shown_as_absent() {
         OpenOutcome::Refused(_) => panic!("opening two tiny synthetic frames must not be refused"),
     }
     let panel = controller.images_panel();
-    assert_eq!(panel.rows[0].time_text, "10:00:00");
-    assert_eq!(panel.rows[1].time_text, "", "no fabricated time");
+    assert_eq!(panel.rows[0].trailing_text, "10:00:00");
+    assert_eq!(panel.rows[1].trailing_text, "", "no fabricated time");
     // `ImagesModel` names every field it has -- there is no collective note
     // field to omit.
     let ImagesModel {
         rows: _,
         header_text: _,
+        no_source_row: _,
     } = panel;
 }
 
@@ -260,7 +267,7 @@ fn rows_carry_no_index() {
         let ImageRow {
             chip: _,
             name: _,
-            time_text: _,
+            trailing_text: _,
             excluded: _,
             unresolved: _,
             selected: _,
@@ -463,7 +470,7 @@ fn curating_is_free_before_the_first_fuse() {
     assert_eq!(controller.checkpoint_count(), Some(0));
 
     let extra = write_timed(&tree("curating_is_free_extra"), "extra.tif", None);
-    controller.add_frames(&[extra]);
+    common::add_and_settle(&mut controller, &[extra]).expect("the add must not refuse");
     assert!(controller.pending_frame_change().is_none());
     assert_eq!(controller.images_panel().rows.len(), 4);
 
@@ -501,7 +508,7 @@ fn add_and_reorder_offer_a_new_project_with_the_same_settings() {
     wait_for_settle(&mut controller, Duration::from_secs(120));
 
     let extra = write_timed(&tree("add_reorder_extra"), "extra.tif", None);
-    controller.add_frames(&[extra]);
+    common::add_and_settle(&mut controller, &[extra]).expect("the add must not refuse");
     let add_warning = controller.pending_frame_change().unwrap();
     assert!(add_warning.new_project_button);
     assert!(!add_warning.exclude_instead_button);
@@ -567,6 +574,461 @@ fn confirming_a_pending_change_applies_it_and_re_fuses() {
 }
 
 // ---------------------------------------------------------------------
+// Additive import: duplicate identity by content, replace/keep/cancel.
+// ---------------------------------------------------------------------
+
+/// [`controller_with_frames`], opened twice over two fresh trees, both
+/// stacking-mode tabs -- the second one active, as any newly opened tab is.
+fn controller_with_two_projects(name: &str) -> AppController {
+    let root_a = tree(&format!("{name}_a"));
+    for i in 0..2 {
+        copy_frame(&root_a, &format!("{i:02}.tif"), i);
+    }
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[root_a]),
+        OpenOutcome::Opened(_)
+    ));
+    let root_b = tree(&format!("{name}_b"));
+    for i in 0..2 {
+        copy_frame(&root_b, &format!("{i:02}.tif"), i);
+    }
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[root_b]),
+        OpenOutcome::Opened(_)
+    ));
+    controller
+}
+
+#[test]
+fn import_of_a_renamed_copy_is_a_conflict_by_content() {
+    let mut controller = controller_with_frames("import_conflict_by_content", 2);
+    let extra_dir = tree("import_conflict_by_content_extra");
+    copy_frame(&extra_dir, "renamed.tif", 0);
+
+    common::add_and_settle(&mut controller, &[extra_dir.join("renamed.tif")])
+        .expect("the add must not refuse");
+
+    let warning = controller
+        .pending_frame_change()
+        .expect("a content-identical file must ask before replacing");
+    assert!(
+        warning.body.contains("00.tif"),
+        "names the existing conflicting frame, not the incoming one"
+    );
+    assert_eq!(
+        controller.images_panel().rows.len(),
+        2,
+        "nothing applied yet"
+    );
+}
+
+#[test]
+fn import_of_a_different_frame_under_an_existing_name_is_not_a_conflict() {
+    let mut controller = controller_with_frames("import_same_name_diff_content", 2);
+    let extra_dir = tree("import_same_name_diff_content_extra");
+    copy_frame(&extra_dir, "00.tif", 5);
+
+    common::add_and_settle(&mut controller, &[extra_dir.join("00.tif")])
+        .expect("the add must not refuse");
+
+    assert!(
+        controller.pending_frame_change().is_none(),
+        "a same-named, different-content file is not a conflict"
+    );
+    assert_eq!(
+        controller.images_panel().rows.len(),
+        3,
+        "the new file was added, not merged into the existing row"
+    );
+}
+
+#[test]
+fn import_collapses_identical_incoming_copies_into_one_row() {
+    let mut controller = controller_with_frames("import_collapse_incoming", 2);
+    let extra_dir = tree("import_collapse_incoming_extra");
+    copy_frame(&extra_dir, "copy-a.tif", 6);
+    copy_frame(&extra_dir, "copy-b.tif", 6);
+
+    common::add_and_settle(
+        &mut controller,
+        &[extra_dir.join("copy-a.tif"), extra_dir.join("copy-b.tif")],
+    )
+    .expect("the add must not refuse");
+
+    assert!(controller.pending_frame_change().is_none());
+    assert_eq!(
+        controller.images_panel().rows.len(),
+        3,
+        "two identical incoming files add one row, not two"
+    );
+}
+
+#[test]
+fn import_replace_puts_the_new_file_at_the_same_position_and_keeps_exclusion() {
+    let mut controller = controller_with_frames("import_replace_position", 3);
+    controller.toggle_frame_excluded(1);
+    assert!(controller.images_panel().rows[1].excluded);
+
+    let extra_dir = tree("import_replace_position_extra");
+    copy_frame(&extra_dir, "renamed-01.tif", 1);
+    copy_frame(&extra_dir, "new.tif", 6);
+
+    common::add_and_settle(
+        &mut controller,
+        &[extra_dir.join("renamed-01.tif"), extra_dir.join("new.tif")],
+    )
+    .expect("the add must not refuse");
+    assert!(controller.pending_frame_change().is_some());
+
+    assert!(
+        !controller.confirm_frame_change(),
+        "the duplicate question's own confirm never re-fuses directly"
+    );
+    assert!(controller.pending_frame_change().is_none());
+
+    let panel = controller.images_panel();
+    assert_eq!(panel.rows.len(), 4, "one replace in place, one new row");
+    assert_eq!(
+        panel.rows[1].name, "renamed-01.tif",
+        "the replacement lands at the same position"
+    );
+    assert!(
+        panel.rows[1].excluded,
+        "a replaced excluded frame stays excluded"
+    );
+}
+
+#[test]
+fn import_keep_existing_retains_the_conflict_and_still_adds_new_frames() {
+    let mut controller = controller_with_frames("import_keep_existing", 2);
+    let extra_dir = tree("import_keep_existing_extra");
+    copy_frame(&extra_dir, "renamed.tif", 0);
+    copy_frame(&extra_dir, "new.tif", 6);
+
+    common::add_and_settle(
+        &mut controller,
+        &[extra_dir.join("renamed.tif"), extra_dir.join("new.tif")],
+    )
+    .expect("the add must not refuse");
+    let existing_name = controller.images_panel().rows[0].name.clone();
+
+    assert!(controller.keep_existing());
+    assert!(controller.pending_frame_change().is_none());
+
+    let panel = controller.images_panel();
+    assert_eq!(
+        panel.rows.len(),
+        3,
+        "the new frame is added even when the conflict is declined"
+    );
+    assert_eq!(
+        panel.rows[0].name, existing_name,
+        "the existing frame is untouched"
+    );
+}
+
+#[test]
+fn import_cancel_leaves_the_project_unchanged() {
+    let mut controller = controller_with_frames("import_cancel", 2);
+    let before = controller.images_panel();
+
+    let extra_dir = tree("import_cancel_extra");
+    copy_frame(&extra_dir, "renamed.tif", 0);
+    copy_frame(&extra_dir, "new.tif", 6);
+
+    common::add_and_settle(
+        &mut controller,
+        &[extra_dir.join("renamed.tif"), extra_dir.join("new.tif")],
+    )
+    .expect("the add must not refuse");
+    assert!(controller.pending_frame_change().is_some());
+
+    controller.cancel_frame_change();
+    assert!(controller.pending_frame_change().is_none());
+    assert_eq!(
+        controller.images_panel(),
+        before,
+        "cancelling changes nothing"
+    );
+}
+
+#[test]
+fn import_all_declined_opens_no_checkpoint_warning_and_starts_no_run() {
+    let mut controller = controller_with_frames("import_all_declined", 2);
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert_eq!(controller.checkpoint_count(), Some(1));
+
+    let extra_dir = tree("import_all_declined_extra");
+    copy_frame(&extra_dir, "renamed.tif", 0);
+
+    common::add_and_settle(&mut controller, &[extra_dir.join("renamed.tif")])
+        .expect("the add must not refuse");
+    assert!(controller.pending_frame_change().is_some());
+
+    assert!(
+        controller.keep_existing(),
+        "declining the only conflict resolves to nothing"
+    );
+    assert!(
+        controller.pending_frame_change().is_none(),
+        "an empty resolved change never opens the checkpoint warning"
+    );
+    assert_eq!(controller.checkpoint_count(), Some(1), "no run started");
+}
+
+#[test]
+fn import_of_the_same_paths_accepted_resolves_to_nothing_and_never_re_fuses() {
+    let mut controller = controller_with_frames("import_same_paths_accepted", 2);
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert_eq!(controller.checkpoint_count(), Some(1));
+
+    let same_path = controller
+        .selected_frame_path()
+        .expect("a frame is always selected");
+
+    common::add_and_settle(&mut controller, &[same_path]).expect("the add must not refuse");
+    assert!(
+        controller.pending_frame_change().is_some(),
+        "re-dropping the very same file still asks first"
+    );
+
+    assert!(
+        !controller.confirm_frame_change(),
+        "a resolved-to-nothing import never re-fuses"
+    );
+    assert!(controller.pending_frame_change().is_none());
+    assert_eq!(controller.checkpoint_count(), Some(1), "no run started");
+    assert_eq!(controller.images_panel().rows.len(), 2, "nothing changed");
+}
+
+#[test]
+fn import_with_a_checkpoint_shows_the_duplicate_question_before_the_add_warning() {
+    let mut controller = controller_with_frames("import_checkpoint_order", 2);
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert_eq!(controller.checkpoint_count(), Some(1));
+
+    let extra_dir = tree("import_checkpoint_order_extra");
+    copy_frame(&extra_dir, "renamed.tif", 0);
+    copy_frame(&extra_dir, "new.tif", 6);
+
+    common::add_and_settle(
+        &mut controller,
+        &[extra_dir.join("renamed.tif"), extra_dir.join("new.tif")],
+    )
+    .expect("the add must not refuse");
+
+    let duplicate = controller
+        .pending_frame_change()
+        .expect("the duplicate question comes first");
+    assert!(
+        duplicate.keep_existing_button,
+        "this is the duplicate question, not the add warning"
+    );
+
+    assert!(
+        !controller.confirm_frame_change(),
+        "the duplicate question's own confirm never re-fuses directly"
+    );
+    let add_warning = controller
+        .pending_frame_change()
+        .expect("a checkpoint exists, so the ordinary add warning follows");
+    assert!(
+        !add_warning.keep_existing_button,
+        "the add warning follows the duplicate question, and is not it"
+    );
+    assert!(add_warning.new_project_button);
+}
+
+#[test]
+fn import_settled_after_a_tab_switch_lands_on_neither_tab() {
+    let mut controller = controller_with_two_projects("import_after_tab_switch");
+    assert_eq!(controller.active_project(), Some(1));
+
+    let extra_dir = tree("import_after_tab_switch_extra");
+    copy_frame(&extra_dir, "new.tif", 6);
+    let handle = controller
+        .add_frames(&[extra_dir.join("new.tif")])
+        .expect("the add must not refuse")
+        .expect("adding a real frame spawns a worker");
+    handle.join().expect("the import worker did not panic");
+
+    // The scan targeted tab 1; switch away from it before it settles.
+    controller.select_project(0);
+    controller.settle_import();
+
+    assert_eq!(
+        controller.images_panel().rows.len(),
+        2,
+        "tab 0 never asked for this import"
+    );
+    controller.select_project(1);
+    assert_eq!(
+        controller.images_panel().rows.len(),
+        2,
+        "the scan's own tab is no longer active, so it is discarded too"
+    );
+}
+
+#[test]
+fn import_settled_after_a_frame_was_removed_meanwhile_changes_nothing() {
+    let mut controller = controller_with_frames("import_after_frame_removed", 3);
+
+    let extra_dir = tree("import_after_frame_removed_extra");
+    copy_frame(&extra_dir, "new.tif", 6);
+    let handle = controller
+        .add_frames(&[extra_dir.join("new.tif")])
+        .expect("the add must not refuse")
+        .expect("adding a real frame spawns a worker");
+    handle.join().expect("the import worker did not panic");
+
+    // The frame set moved on while the scan was in flight.
+    controller.remove_frame(0);
+    assert_eq!(controller.images_panel().rows.len(), 2);
+
+    controller.settle_import();
+
+    assert_eq!(
+        controller.images_panel().rows.len(),
+        2,
+        "a scan over a since-changed frame list is discarded, not applied on top of it"
+    );
+    assert!(controller.pending_frame_change().is_none());
+}
+
+#[test]
+fn import_wiring_shows_the_duplicate_question_and_keep_existing_button() {
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+
+    let mut controller = controller_with_frames("import_wiring_duplicate", 2);
+    let extra_dir = tree("import_wiring_duplicate_extra");
+    copy_frame(&extra_dir, "renamed.tif", 0);
+    common::add_and_settle(&mut controller, &[extra_dir.join("renamed.tif")])
+        .expect("the add must not refuse");
+    assert!(controller.pending_frame_change().is_some());
+
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    // The bridge's sink needs a running event loop; a queue drained after
+    // the callback stands in for its `ShellEvent::ImagesChanged` push.
+    let queued = Arc::new(Mutex::new(Vec::new()));
+    controller.lock().unwrap().set_sink(Arc::new({
+        let queued = queued.clone();
+        move |e| queued.lock().unwrap().push(e)
+    }));
+    app.set_project_loaded(true);
+    focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+
+    assert!(app.get_frame_warning_open());
+    assert!(app.get_frame_warning_body().contains("00.tif"));
+    assert_eq!(app.get_frame_warning_secondary_label(), "Keep existing");
+
+    app.invoke_frame_warning_secondary_pressed();
+    if std::mem::take(&mut *queued.lock().unwrap())
+        .contains(&focusforge_gui::ShellEvent::ImagesChanged)
+    {
+        focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+    }
+    assert!(
+        !app.get_frame_warning_open(),
+        "Keep existing closes the question even when it adds nothing"
+    );
+
+    let c = controller.lock().unwrap();
+    assert!(
+        c.pending_frame_change().is_none(),
+        "Keep existing must clear the question"
+    );
+    assert_eq!(
+        c.images_panel().rows.len(),
+        2,
+        "no new frame in this import, so nothing is added either"
+    );
+}
+
+/// A mixed drop -- one renamed copy of an existing frame plus one new frame
+/// -- answered by clicking the dialog's own "Keep existing" button in a real
+/// window. The bridge's sink is swapped for a queue drained after the click,
+/// standing in for the running event loop's `ShellEvent::ImagesChanged` push.
+#[test]
+fn import_wiring_keep_existing_click_adds_the_new_frame_and_closes_the_question() {
+    use focusforge_gui::ShellEvent;
+    use i_slint_backend_testing::ElementQuery;
+    use slint::platform::{PointerEventButton, WindowEvent};
+    use slint::{ComponentHandle, Model};
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+
+    let mut controller = controller_with_frames("import_wiring_keep_click", 2);
+    let extra_dir = tree("import_wiring_keep_click_extra");
+    copy_frame(&extra_dir, "renamed.tif", 0);
+    copy_frame(&extra_dir, "new.tif", 6);
+    common::add_and_settle(
+        &mut controller,
+        &[extra_dir.join("renamed.tif"), extra_dir.join("new.tif")],
+    )
+    .expect("the add must not refuse");
+
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    let queued = Arc::new(Mutex::new(Vec::new()));
+    controller.lock().unwrap().set_sink(Arc::new({
+        let queued = queued.clone();
+        move |e| queued.lock().unwrap().push(e)
+    }));
+    app.set_project_loaded(true);
+    focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
+    assert!(app.get_frame_warning_open());
+
+    let button = ElementQuery::from_root(&app)
+        .match_predicate(|e| e.accessible_label().as_deref() == Some("Keep existing"))
+        .find_first()
+        .expect("the duplicate question shows a Keep existing button");
+    let at = element_center(&button);
+    app.window().dispatch_event(WindowEvent::PointerPressed {
+        position: at,
+        button: PointerEventButton::Left,
+    });
+    app.window().dispatch_event(WindowEvent::PointerReleased {
+        position: at,
+        button: PointerEventButton::Left,
+    });
+    if std::mem::take(&mut *queued.lock().unwrap()).contains(&ShellEvent::ImagesChanged) {
+        focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+    }
+
+    assert!(
+        !app.get_frame_warning_open(),
+        "Keep existing closes the question"
+    );
+    assert_eq!(
+        app.get_images_rows().row_count(),
+        3,
+        "the new frame is added even though the conflict is declined"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Sorting and manual order.
 // ---------------------------------------------------------------------
 
@@ -627,7 +1089,7 @@ fn mutations_are_stacking_mode_only() {
     controller.remove_frame(0);
     controller.move_frame(0, 1);
     controller.set_frame_sort(FrameSort::Name);
-    controller.add_frames(&[PathBuf::from("/tmp/does-not-matter.tif")]);
+    let _ = controller.add_frames(&[PathBuf::from("/tmp/does-not-matter.tif")]);
     assert_eq!(
         controller.images_panel(),
         before,
@@ -647,7 +1109,7 @@ fn mutations_are_refused_while_this_tabs_job_is_running() {
     controller.remove_frame(0);
     controller.move_frame(0, 1);
     controller.set_frame_sort(FrameSort::Name);
-    controller.add_frames(&[PathBuf::from("/tmp/does-not-matter.tif")]);
+    let _ = controller.add_frames(&[PathBuf::from("/tmp/does-not-matter.tif")]);
     controller.frame_drag_pointer(0, PointerKind::Down, 0.0);
     assert_eq!(
         controller.images_panel(),
@@ -764,7 +1226,7 @@ fn row_names_and_times(controller: &AppController) -> Vec<(String, String)> {
         .images_panel()
         .rows
         .into_iter()
-        .map(|r| (r.name, r.time_text))
+        .map(|r| (r.name, r.trailing_text))
         .collect()
 }
 
@@ -839,13 +1301,14 @@ fn added_frames_bring_their_own_capture_time() {
         "added.tif",
         Some("2026:08:29 10:00:07"),
     );
-    controller.add_frames(std::slice::from_ref(&extra));
+    common::add_and_settle(&mut controller, std::slice::from_ref(&extra))
+        .expect("the frame imports");
 
     let rows = controller.images_panel().rows;
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[2].name, "added.tif");
     assert!(!rows[2].unresolved);
-    assert_eq!(rows[2].time_text, "10:00:07");
+    assert_eq!(rows[2].trailing_text, "10:00:07");
 }
 
 #[test]
@@ -879,13 +1342,13 @@ fn relinking_refreshes_the_rows_metadata() {
     ));
     assert!(controller.images_panel().rows.iter().all(|r| r.unresolved));
 
-    // Index 1: the `Sources missing` card that follows the one open tab.
-    controller.locate_missing_sources(1, new_dir);
+    // The open tab itself carries the `Sources missing` failure.
+    controller.locate_missing_sources(0, new_dir);
     let rows = controller.images_panel().rows;
     assert!(rows.iter().all(|r| !r.unresolved), "{rows:?}");
     assert_eq!(
         rows.iter()
-            .map(|r| r.time_text.as_str())
+            .map(|r| r.trailing_text.as_str())
             .collect::<Vec<_>>(),
         vec!["11:00:00", "11:00:01"]
     );
@@ -910,7 +1373,7 @@ fn a_source_deleted_after_load_is_refused_on_fuse_then_shown_unresolved() {
 
     let row = &controller.images_panel().rows[1];
     assert!(!row.unresolved, "nothing polls the disk before use");
-    assert_eq!(row.time_text, "10:00:00");
+    assert_eq!(row.trailing_text, "10:00:00");
 
     assert!(!controller.start_fuse());
     let refusal = controller.last_refusal().expect("the fuse is refused");
@@ -1110,8 +1573,12 @@ fn dragging_a_row_by_its_grip_reorders_it_through_the_real_window() {
         "images_grip_drag_wire",
         5,
     )));
-    let _installed =
-        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
     app.set_project_loaded(true);
     focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
 
@@ -1196,8 +1663,12 @@ fn dragging_a_row_by_its_grip_floats_a_copy_that_follows_the_cursor() {
         "images_grip_drag_ghost",
         5,
     )));
-    let _installed =
-        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
     app.set_project_loaded(true);
     focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
 
@@ -1297,6 +1768,113 @@ fn dragging_a_row_by_its_grip_floats_a_copy_that_follows_the_cursor() {
 }
 
 #[test]
+fn images_panel_disable_is_whole_panel() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_project_loaded(true);
+    app.set_dock_tab("images".into());
+
+    let panel_opacity = || {
+        ElementQuery::from_root(&app)
+            .match_id("FFDock::images-panel")
+            .find_first()
+            .expect("a loaded project on the images tab always shows the panel")
+            .computed_opacity()
+    };
+    let row_opacities = || {
+        ElementQuery::from_root(&app)
+            .match_id("FFImageRow::area")
+            .find_all()
+            .into_iter()
+            .map(|row| row.computed_opacity())
+            .collect::<Vec<_>>()
+    };
+
+    app.set_images_enabled(true);
+    assert_eq!(panel_opacity(), 1.0, "enabled draws at full opacity");
+    app.set_images_enabled(false);
+    assert_eq!(
+        panel_opacity(),
+        0.5,
+        "disabling reads as one whole-panel opacity drop, not a per-row one"
+    );
+    app.set_images_enabled(true);
+    assert_eq!(panel_opacity(), 1.0, "re-enabling restores full opacity");
+
+    let controller = controller_with_frames("images_panel_disable_is_whole_panel", 4);
+    focusforge_gui::bridge::push_images_panel(&app, &controller);
+    assert!(
+        !row_opacities().is_empty(),
+        "the pushed frames must show as rows"
+    );
+    assert_eq!(
+        panel_opacity(),
+        1.0,
+        "a loaded, unlocked list draws at full opacity"
+    );
+
+    app.set_images_enabled(false);
+    assert_eq!(
+        panel_opacity(),
+        0.5,
+        "disabling dims the panel with rows present"
+    );
+    assert!(
+        row_opacities().iter().all(|&o| o == 0.5),
+        "every row inherits the panel's dim, not just the panel background"
+    );
+    app.set_images_enabled(true);
+    assert_eq!(panel_opacity(), 1.0);
+    assert!(row_opacities().iter().all(|&o| o == 1.0));
+}
+
+#[test]
+fn images_panel_editor_mode_is_read_only_not_dimmed() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_project_loaded(true);
+    app.set_dock_tab("images".into());
+    app.set_mode("editor".into());
+
+    let panel_opacity = || {
+        ElementQuery::from_root(&app)
+            .match_id("FFDock::images-panel")
+            .find_first()
+            .expect("a loaded project on the images tab always shows the panel")
+            .computed_opacity()
+    };
+
+    app.set_images_enabled(true);
+    assert_eq!(
+        panel_opacity(),
+        1.0,
+        "editor mode's read-only list is not shown as locked"
+    );
+    assert!(
+        ElementQuery::from_root(&app)
+            .match_id("FFImagesPanel::add-button")
+            .find_first()
+            .is_none(),
+        "editor mode hides the mutating chrome regardless of the dim"
+    );
+
+    app.set_images_enabled(false);
+    assert_eq!(
+        panel_opacity(),
+        0.5,
+        "a job running in editor mode still dims the panel"
+    );
+}
+
+#[test]
 fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
@@ -1312,8 +1890,12 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
         "job_disables_images_and_settings",
         3,
     )));
-    let _installed =
-        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
     app.set_project_loaded(true);
     app.set_dock_tab("images".into());
     let push = |c: &AppController| {
@@ -1373,6 +1955,15 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
             .is_none(),
         "the add button must not show while this tab's own job is running"
     );
+    let images_opacity = ElementQuery::from_root(&app)
+        .match_id("FFDock::images-panel")
+        .find_first()
+        .expect("the images panel is always in the tree")
+        .computed_opacity();
+    assert_eq!(
+        images_opacity, 0.5,
+        "the images panel reads as one whole-panel disable while this tab's own job runs"
+    );
     app.set_dock_tab("settings".into());
     let settings_opacity = ElementQuery::from_root(&app)
         .match_id("FFDock::settings-panel")
@@ -1398,6 +1989,17 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+    push(&controller.lock().unwrap());
+    app.set_dock_tab("images".into());
+    let images_opacity = ElementQuery::from_root(&app)
+        .match_id("FFDock::images-panel")
+        .find_first()
+        .expect("the images panel is always in the tree")
+        .computed_opacity();
+    assert_eq!(
+        images_opacity, 1.0,
+        "the look follows the job's end, not a ui event"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -1456,8 +2058,12 @@ fn scrolling_reads_nothing_and_selection_notifies_only_changed_rows() {
         "images_scroll_accounting",
         100,
     )));
-    let _installed =
-        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
     let events = Arc::new(Mutex::new(Vec::new()));
     controller.lock().unwrap().set_sink(Arc::new({
         let events = events.clone();
@@ -1485,7 +2091,6 @@ fn scrolling_reads_nothing_and_selection_notifies_only_changed_rows() {
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("images_scroll_accounting_frames"),
     )
     .unwrap();
-    let before = counters();
     events.lock().unwrap().clear();
 
     let list_center = element_center(&mounted(&app, "FFImagesPanel::list"));
@@ -1494,16 +2099,31 @@ fn scrolling_reads_nothing_and_selection_notifies_only_changed_rows() {
         delta_x: 0.0,
         delta_y: -100_000.0,
     });
-    let bottom = controller.lock().unwrap().images_scroll_y();
-    assert!(bottom > 0.0, "the wheel moved the list down");
-    assert!(labelled(&app, "99.tif") > 0 && labelled(&app, "01.tif") == 0);
+    let selected = || {
+        controller
+            .lock()
+            .unwrap()
+            .images_panel()
+            .rows
+            .iter()
+            .position(|r| r.selected)
+    };
+    assert_eq!(
+        controller.lock().unwrap().images_scroll_y(),
+        0.0,
+        "the wheel over a row steps frames and leaves the list where it is"
+    );
+    assert_eq!(selected(), Some(99), "the wheel stepped to the last frame");
     dispatch(WindowEvent::PointerScrolled {
         position: list_center,
         delta_x: 0.0,
         delta_y: 100_000.0,
     });
     assert_eq!(controller.lock().unwrap().images_scroll_y(), 0.0);
+    assert_eq!(selected(), Some(0), "the opposite wheel stepped back");
     assert!(labelled(&app, "01.tif") > 0 && labelled(&app, "99.tif") == 0);
+    let before = counters();
+    events.lock().unwrap().clear();
 
     let bar = mounted(&app, "FFImagesPanel::scrollbar");
     let (bar_pos, bar_size) = (bar.absolute_position(), bar.size());
@@ -1561,7 +2181,7 @@ fn scrolling_reads_nothing_and_selection_notifies_only_changed_rows() {
     let rows = controller.lock().unwrap().images_panel().rows;
     assert!(
         rows.iter()
-            .all(|r| !r.unresolved && r.time_text == "10:00:00"),
+            .all(|r| !r.unresolved && r.trailing_text == "10:00:00"),
         "deleted sources keep their cached metadata"
     );
 
@@ -1657,8 +2277,12 @@ fn a_thousand_rows_instantiate_only_the_visible_window() {
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller));
-    let _installed =
-        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
     app.set_project_loaded(true);
     app.set_dock_tab("images".into());
     let rows = ReadCountingRows::default();
@@ -1688,7 +2312,7 @@ fn a_thousand_rows_instantiate_only_the_visible_window() {
         at_top.len()
     );
 
-    list.scroll(0.0, -1.0e7);
+    app.set_images_list_viewport_y(-1.0e7);
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
     let shown = instantiated();
     let at_end = read.take();
@@ -1717,8 +2341,12 @@ fn a_grip_drag_survives_leaving_the_viewport_and_row_recycling() {
         "images_grip_drag_recycling",
         40,
     )));
-    let _installed =
-        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
     app.set_project_loaded(true);
     app.set_dock_tab("images".into());
     let settle = || {
@@ -1845,7 +2473,7 @@ fn exclude_instead_is_a_no_op_off_a_remove_warning() {
     wait_for_settle(&mut controller, Duration::from_secs(120));
 
     let extra = write_timed(&tree("exclude_instead_wrong_kind_extra"), "extra.tif", None);
-    controller.add_frames(&[extra]);
+    common::add_and_settle(&mut controller, &[extra]).expect("the add must not refuse");
     assert!(controller.pending_frame_change().is_some());
     assert!(!controller.exclude_instead());
     assert!(
@@ -1940,8 +2568,12 @@ fn the_frame_set_warnings_footer_sits_at_the_panels_bottom_edge() {
     assert!(controller.pending_frame_change().is_some());
 
     let controller = Arc::new(Mutex::new(controller));
-    let _installed =
-        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
     app.set_project_loaded(true);
     focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
 

@@ -374,6 +374,7 @@ fn seal_without_align(name: &str, algorithm: &str) -> PathBuf {
         algorithm,
         params: &ParamValues::new(),
         align: None,
+        registration: focusforge_core::align::Registration::default(),
         composite_description: "staged".to_string(),
         label: None,
         metrics: Metrics::default(),
@@ -606,8 +607,12 @@ fn settings_scrolling_notifies_no_row_and_edits_notify_only_changed_rows() {
     open_mantis_512(&mut controller);
     controller.set_align_algorithm("pyramidal-ecc");
     let controller = Arc::new(Mutex::new(controller));
-    let _installed =
-        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
     let events = Arc::new(Mutex::new(Vec::new()));
     controller.lock().unwrap().set_sink(Arc::new({
         let events = events.clone();
@@ -783,8 +788,12 @@ fn a_slider_drag_survives_a_panel_push() {
     open_mantis_512(&mut controller);
     controller.set_align_algorithm("pyramidal-ecc");
     let controller = Arc::new(Mutex::new(controller));
-    let _installed =
-        focusforge_gui::bridge::install(&app, controller.clone(), common::empty_canvas());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
     app.set_project_loaded(true);
     app.set_dock_tab("settings".into());
     let push = || {

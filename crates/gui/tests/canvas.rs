@@ -16,6 +16,7 @@ use focusforge_gui::canvas::{
     CanvasFeed, DISPLAY_FORMAT, FrameSource, RepaintGate, TextureSpec, draw_rect_fits,
     needs_realloc, truncate_pane_label, validate_display_format,
 };
+use focusforge_gui::job;
 use focusforge_gui::viewport::PaneRect;
 use focusforge_gui::{AppController, OpenOutcome};
 use i_slint_backend_testing::ElementQuery;
@@ -527,10 +528,11 @@ fn opening_a_saved_project_feeds_its_own_planes() {
     }
 }
 
-/// The right pane draws at the sealed composite's own extent, not the
-/// source frames': fuses a `mantis-512` tab (512x512 frames), whose
-/// alignment crop makes the composite smaller, and asserts `plane_draw`'s
-/// source rect stays bounded by the composite's own dimensions.
+/// Both panes draw at the sealed composite's own extent once a tab holds
+/// one, not the raw source frames': fuses a `mantis-512` tab (512x512
+/// frames), whose alignment crop makes the composite smaller, and asserts
+/// `frame_draw` and `plane_draw` return the identical source rect, bounded
+/// by the composite's own dimensions.
 #[test]
 fn right_pane_uses_composite_extent() {
     let mut controller = AppController::new();
@@ -581,35 +583,37 @@ fn right_pane_uses_composite_extent() {
         composite_header.width,
         composite_header.height
     );
-    assert_ne!(
+    assert_eq!(
         plane.src, frame.src,
-        "the right pane must not be stretched across the source frames' extent"
+        "both panes must draw the same source rect once the tab holds a composite"
     );
 }
 
-/// A frame the mmap reader refuses (a compressed TIFF) shows the reader's
-/// own refusal text, and dropping into it still drops whatever was open
-/// before -- the drop-before-open rule holds even on a failed open.
+/// A frame whose compression neither the mmap reader nor the decoded reader
+/// supports ([`open_frame_set`] opens LZW, Deflate and Adobe-Deflate; JPEG
+/// is refused by both) shows the decoded reader's own refusal text, and
+/// dropping into it still drops whatever was open before -- the
+/// drop-before-open rule holds even on a failed open.
 #[test]
-fn compressed_frame_shows_reader_refusal() {
-    let dir = common::tree("compressed_frame_refusal");
+fn unsupported_compression_frame_shows_reader_refusal() {
+    let dir = common::tree("unsupported_compression_frame_refusal");
     let good = common::fixture_frame("mantis-64", 0);
-    let compressed = dir.join("compressed.tif");
-    write_compressed_copy(&good, &compressed);
+    let jpeg_tagged = dir.join("jpeg-tagged.tif");
+    write_compressed_copy(&good, &jpeg_tagged, 7);
 
     let mut frame = FrameSource::default();
     frame
-        .set(&good)
+        .set(&good, None, job::host_budget())
         .expect("the uncompressed fixture frame must open");
     assert!(frame.path().is_some());
 
     let err = frame
-        .set(&compressed)
-        .expect_err("a compressed frame must be refused");
+        .set(&jpeg_tagged, None, job::host_budget())
+        .expect_err("an unsupported compression must be refused");
     assert!(
         err.to_string()
-            .contains("Compression=5, only uncompressed (1) is supported"),
-        "the reader's own refusal text must reach the surface, got: {err}"
+            .contains("Compression=7 is not supported by the decoded TIFF reader"),
+        "the decoded reader's own refusal text must reach the surface, got: {err}"
     );
     assert!(
         frame.path().is_none(),
@@ -618,8 +622,8 @@ fn compressed_frame_shows_reader_refusal() {
 }
 
 /// Copies `source` (a little-endian, classic-TIFF fixture frame) to `dest`,
-/// patching its `Compression` tag (259) from 1 to 5 in place.
-fn write_compressed_copy(source: &Path, dest: &Path) {
+/// patching its `Compression` tag (259) to `compression` in place.
+fn write_compressed_copy(source: &Path, dest: &Path, compression: u16) {
     let mut bytes = fs::read(source).expect("read fixture frame");
     assert_eq!(
         &bytes[0..2],
@@ -634,7 +638,7 @@ fn write_compressed_copy(source: &Path, dest: &Path) {
         let entry_off = ifd_offset + 2 + i * 12;
         let tag = u16::from_le_bytes(bytes[entry_off..entry_off + 2].try_into().unwrap());
         if tag == 259 {
-            bytes[entry_off + 8..entry_off + 10].copy_from_slice(&5u16.to_le_bytes());
+            bytes[entry_off + 8..entry_off + 10].copy_from_slice(&compression.to_le_bytes());
             patched = true;
             break;
         }
@@ -655,7 +659,11 @@ fn frame_source_holds_one_frame() {
     let mut frame = FrameSource::default();
     for i in 0..3 {
         frame
-            .set(&common::fixture_frame("mantis-64", i))
+            .set(
+                &common::fixture_frame("mantis-64", i),
+                None,
+                job::host_budget(),
+            )
             .expect("a fixture frame must open");
     }
     assert_eq!(
@@ -666,7 +674,7 @@ fn frame_source_holds_one_frame() {
     assert!(frame.dimensions().is_some());
 
     let missing = PathBuf::from("/does/not/exist.tif");
-    assert!(frame.set(&missing).is_err());
+    assert!(frame.set(&missing, None, job::host_budget()).is_err());
     assert!(
         frame.path().is_none(),
         "a failed set must leave no handle open at all"
@@ -733,7 +741,9 @@ fn frame_steps_keep_one_handle() {
         let mut baseline = 0usize;
         let mut peak = 0usize;
         for (i, path) in paths.iter().enumerate() {
-            frame.set(path).expect("a reference-stack frame must open");
+            frame
+                .set(path, None, job::host_budget())
+                .expect("a reference-stack frame must open");
             frame
                 .read_into(rect, std::num::NonZeroU32::MIN, &mut buf)
                 .expect("the visible rect must read");
@@ -787,7 +797,9 @@ fn fit_zoom_redraw_reads_a_pane_sized_image() {
         })
         .expect("the reference stack holds source frames");
     let mut frame = FrameSource::default();
-    frame.set(&first).expect("a reference frame must open");
+    frame
+        .set(&first, None, job::host_budget())
+        .expect("a reference frame must open");
     let (w, h) = frame.dimensions().unwrap();
     let spp = frame.samples_per_pixel().unwrap() as usize;
     let img = ImageSize {
@@ -847,7 +859,7 @@ fn fit_zoom_redraw_reads_a_pane_sized_image() {
     let mut renderer = focusforge_gui::gpu_canvas::CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
     renderer
-        .set_frame(&first)
+        .set_frame(&first, None, job::host_budget())
         .expect("the renderer opens the frame");
     for (label, draw) in [("fit", at_fit), ("100 %", at_100)] {
         let start = Instant::now();
@@ -1076,6 +1088,131 @@ fn pane_placeholder_shows_only_until_the_first_fuse() {
     }
 }
 
+/// In Editor mode, hovering either pane shows both `FFBrushCursor`s at the
+/// expected centre -- the one under the pointer at the raw hover point, the
+/// other shifted by `cursor-mirror-dx` -- neither shows over the gutter or
+/// outside Editor mode, and each cursor's clip container matches its own
+/// pane's rect exactly.
+#[test]
+fn both_brush_cursors_follow_either_pane() {
+    thread_local! {
+        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    INIT.with(|done| {
+        if !done.get() {
+            i_slint_backend_testing::init_no_event_loop();
+            done.set(true);
+        }
+    });
+    let app = AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_project_loaded(true);
+    app.set_mode("editor".into());
+    app.set_cursor_extent(20.0);
+
+    let rect = |id: &str| {
+        let handle = ElementQuery::from_root(&app)
+            .match_id(format!("FFCanvas::{id}"))
+            .find_first()
+            .unwrap_or_else(|| panic!("no element matched id \"FFCanvas::{id}\""));
+        (handle.absolute_position(), handle.size())
+    };
+    let (left_pos, left_size) = rect("pane-left");
+    let (right_pos, _right_size) = rect("pane-right");
+    let mirror_dx = right_pos.x - left_pos.x;
+    app.set_cursor_mirror_dx(mirror_dx);
+
+    // Each clip container matches its own pane's rect exactly.
+    for (clip_id, pane_id) in [
+        ("brush-cursor-left-clip", "pane-left"),
+        ("brush-cursor-right-clip", "pane-right"),
+    ] {
+        let (clip_pos, clip_size) = rect(clip_id);
+        let (pane_pos, pane_size) = rect(pane_id);
+        assert!(
+            (clip_pos.x - pane_pos.x).abs() < GEOMETRY_EPS
+                && (clip_pos.y - pane_pos.y).abs() < GEOMETRY_EPS,
+            "{clip_id}: position {clip_pos:?}, expected {pane_pos:?}"
+        );
+        assert!(
+            (clip_size.width - pane_size.width).abs() < GEOMETRY_EPS
+                && (clip_size.height - pane_size.height).abs() < GEOMETRY_EPS,
+            "{clip_id}: size {clip_size:?}, expected {pane_size:?}"
+        );
+    }
+
+    let find_cursor = |id: &str| {
+        ElementQuery::from_root(&app)
+            .match_id(format!("FFCanvas::{id}"))
+            .find_first()
+    };
+    let center = |handle: &i_slint_backend_testing::ElementHandle| {
+        let p = handle.absolute_position();
+        let s = handle.size();
+        (p.x + s.width / 2.0, p.y + s.height / 2.0)
+    };
+    let move_to = |point: slint::LogicalPosition| {
+        app.window()
+            .dispatch_event(slint::platform::WindowEvent::PointerMoved { position: point });
+    };
+
+    // Hovering the left pane: the home cursor sits at the raw pointer, the
+    // mirrored one on the right pane at the pointer plus `mirror_dx`.
+    let left_point =
+        slint::LogicalPosition::new(left_pos.x + 40.0, left_pos.y + left_size.height / 2.0);
+    move_to(left_point);
+    let home = find_cursor("brush-cursor-left").expect("shows while hovering its own pane");
+    let mirrored = find_cursor("brush-cursor-right").expect("mirrors onto the other pane");
+    let (hx, hy) = center(&home);
+    assert!(
+        (hx - left_point.x).abs() < GEOMETRY_EPS && (hy - left_point.y).abs() < GEOMETRY_EPS,
+        "left cursor at the raw pointer, got ({hx}, {hy})"
+    );
+    let (mx, my) = center(&mirrored);
+    assert!(
+        (mx - (left_point.x + mirror_dx)).abs() < GEOMETRY_EPS
+            && (my - left_point.y).abs() < GEOMETRY_EPS,
+        "right cursor shifted by mirror_dx, got ({mx}, {my})"
+    );
+
+    // Hovering the right pane: the roles (and the sign of the shift) flip.
+    let right_point =
+        slint::LogicalPosition::new(right_pos.x + 40.0, left_pos.y + left_size.height / 2.0);
+    move_to(right_point);
+    let home = find_cursor("brush-cursor-right").expect("shows while hovering its own pane");
+    let mirrored = find_cursor("brush-cursor-left").expect("mirrors onto the other pane");
+    let (hx, hy) = center(&home);
+    assert!(
+        (hx - right_point.x).abs() < GEOMETRY_EPS && (hy - right_point.y).abs() < GEOMETRY_EPS,
+        "right cursor at the raw pointer, got ({hx}, {hy})"
+    );
+    let (mx, my) = center(&mirrored);
+    assert!(
+        (mx - (right_point.x - mirror_dx)).abs() < GEOMETRY_EPS
+            && (my - right_point.y).abs() < GEOMETRY_EPS,
+        "left cursor shifted by -mirror_dx, got ({mx}, {my})"
+    );
+
+    // Over the gutter, neither cursor shows.
+    let gutter_point = slint::LogicalPosition::new(
+        (left_pos.x + left_size.width + right_pos.x) / 2.0,
+        left_pos.y + left_size.height / 2.0,
+    );
+    move_to(gutter_point);
+    assert!(
+        find_cursor("brush-cursor-left").is_none() && find_cursor("brush-cursor-right").is_none(),
+        "both cursors hidden over the gutter"
+    );
+
+    // Outside Editor mode, neither shows even while hovering a pane.
+    app.set_mode("stacking".into());
+    move_to(left_point);
+    assert!(
+        find_cursor("brush-cursor-left").is_none() && find_cursor("brush-cursor-right").is_none(),
+        "both cursors hidden outside Editor mode"
+    );
+}
+
 #[test]
 fn pane_label_short_enough_passes_through_unchanged() {
     assert_eq!(truncate_pane_label("Composite"), "Composite");
@@ -1187,7 +1324,7 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
         .set_planes(&composite_path, &zmap_path)
         .expect("golden planes open");
     renderer
-        .set_frame(&frame_path)
+        .set_frame(&frame_path, None, job::host_budget())
         .expect("fixture frame opens");
 
     let golden = PaneDraw {
@@ -1267,12 +1404,12 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
 
     // Warmup: builds the retained pipeline/buffers/scratch and both panes'
     // own coverage.
-    assert!(renderer.redraw_planes(&golden).is_some());
+    assert!(renderer.redraw_planes(&golden, None, None).is_some());
     assert!(renderer.redraw_frame(&golden).is_some());
 
     // 1. An identical draw: no read, no upload, no allocation.
     let before = counters();
-    assert!(renderer.redraw_planes(&golden).is_some());
+    assert!(renderer.redraw_planes(&golden, None, None).is_some());
     assert!(renderer.redraw_frame(&golden).is_some());
     let after = counters();
     assert_steady(before, after, "identical draw");
@@ -1286,7 +1423,7 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
         ..golden
     };
     let before = counters();
-    assert!(renderer.redraw_planes(&shifted).is_some());
+    assert!(renderer.redraw_planes(&shifted, None, None).is_some());
     assert!(renderer.redraw_frame(&shifted).is_some());
     let after = counters();
     assert_steady(before, after, "dst-only shift");
@@ -1300,7 +1437,7 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
         ..golden
     };
     let before = counters();
-    assert!(renderer.redraw_planes(&panned).is_some());
+    assert!(renderer.redraw_planes(&panned, None, None).is_some());
     let after = counters();
     assert_one_plane(before, after, &panned, composite_spp, "pan");
 
@@ -1315,7 +1452,7 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
         ..panned
     };
     let before = counters();
-    assert!(renderer.redraw_planes(&zoomed).is_some());
+    assert!(renderer.redraw_planes(&zoomed, None, None).is_some());
     let after = counters();
     assert_one_plane(before, after, &zoomed, composite_spp, "zoom");
 
@@ -1323,7 +1460,9 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     // and uploads exactly it.
     renderer.select_plane(PaneSource::ZMap);
     let before = counters();
-    let (_, plane) = renderer.redraw_planes(&zoomed).expect("Z-Map plane draws");
+    let (_, plane) = renderer
+        .redraw_planes(&zoomed, None, None)
+        .expect("Z-Map plane draws");
     assert_eq!(plane, PaneSource::ZMap);
     let after = counters();
     assert_one_plane(before, after, &zoomed, zmap_spp, "first Z-Map select");
@@ -1333,7 +1472,7 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     renderer.select_plane(PaneSource::Composite);
     let before = counters();
     let (_, plane) = renderer
-        .redraw_planes(&zoomed)
+        .redraw_planes(&zoomed, None, None)
         .expect("composite plane draws");
     assert_eq!(plane, PaneSource::Composite);
     let after = counters();
@@ -1348,7 +1487,7 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
         .expect("golden planes re-open");
     let before = counters();
     let (_, plane) = renderer
-        .redraw_planes(&zoomed)
+        .redraw_planes(&zoomed, None, None)
         .expect("composite plane draws again");
     assert_eq!(plane, PaneSource::Composite);
     let after = counters();
@@ -1357,7 +1496,7 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     // 7. `set_frame` on the frame's unchanged draw invalidates its coverage;
     // the next frame draw re-reads exactly the frame.
     renderer
-        .set_frame(&frame_path)
+        .set_frame(&frame_path, None, job::host_budget())
         .expect("fixture frame re-opens");
     let before = counters();
     assert!(renderer.redraw_frame(&panned).is_some());
@@ -1478,6 +1617,8 @@ mod preparing {
             stamp,
             reader: reader.clone(),
             index_scale: 0,
+            indices: None,
+            state: Default::default(),
         }
     }
 
@@ -1517,6 +1658,160 @@ mod preparing {
             }
         };
         (count, wake)
+    }
+}
+
+// ---------------------------------------------------------------------
+// The edited view: resident recomposited tiles over the sealed planes.
+// ---------------------------------------------------------------------
+
+use std::num::NonZeroU32;
+
+use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
+use focusforge_core::retouch::Sources;
+use focusforge_gui::canvas::{ResidentTiles, overlay_edited, step_copy};
+
+const MAP: u32 = 64;
+const FRAMES: usize = 3;
+
+fn mantis64_stack() -> TiffStack {
+    let paths: Vec<PathBuf> = (0..FRAMES)
+        .map(|i| common::fixture_frame("mantis-64", i))
+        .collect();
+    TiffStack::open_files(&paths).expect("the mantis-64 frames open")
+}
+
+fn sources(stack: &TiffStack) -> Sources<'_> {
+    Sources {
+        reader: stack,
+        frame_count: FRAMES as u32,
+        samples_per_pixel: 3,
+        origin: (0, 0),
+    }
+}
+
+fn whole_map() -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        width: MAP,
+        height: MAP,
+    }
+}
+
+/// Every frame's whole plane, for per-pixel reference lookups.
+fn frame_planes(stack: &TiffStack) -> Vec<Vec<u16>> {
+    (0..FRAMES)
+        .map(|frame| {
+            let mut plane = vec![0u16; (MAP * MAP * 3) as usize];
+            stack
+                .read_tile_into(frame, whole_map(), &mut plane)
+                .unwrap();
+            plane
+        })
+        .collect()
+}
+
+fn contains(r: Rect, x: u32, y: u32) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+#[test]
+fn step_copy_matches_the_files_decimated_read() {
+    let (width, height) = (37u32, 29u32);
+    let plane: Vec<u16> = (0..width * height).map(|i| (i * 7 % 1013) as u16).collect();
+    let path = common::tree("step_copy_plane").join("plane.tif");
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let spec = TiffSpec {
+        width,
+        height,
+        samples_per_pixel: 1,
+        description: None,
+    };
+    let mut writer = TiffWriter::create(&path, spec).unwrap();
+    writer.write_tile(whole, &plane).unwrap();
+    writer.finish().unwrap();
+    let stack = TiffStack::open_files(&[path]).unwrap();
+
+    let rect = Rect {
+        x: 3,
+        y: 5,
+        width: 22,
+        height: 17,
+    };
+    for step in [1u32, 3] {
+        let step = NonZeroU32::new(step).unwrap();
+        let len = (rect.width.div_ceil(step.get()) * rect.height.div_ceil(step.get())) as usize;
+        let mut from_file = vec![0u16; len];
+        stack
+            .read_tile_step_into(0, rect, step, &mut from_file)
+            .unwrap();
+        let mut from_memory = vec![u16::MAX; len];
+        step_copy(&plane, width, rect, step, &mut from_memory);
+        assert_eq!(from_memory, from_file, "step {step}");
+    }
+}
+
+#[test]
+fn resident_tiles_allocate_only_the_tiles_a_region_meets() {
+    let stack = mantis64_stack();
+    let planes = frame_planes(&stack);
+    // A 13 px grid: the region below spans tiles (0..=1, 1..=2).
+    let mut tiles = ResidentTiles::new(13, MAP, MAP, 3);
+    let edited = vec![1u16; (MAP * MAP) as usize];
+    let sealed = vec![0u16; (MAP * MAP) as usize];
+    let region = Rect {
+        x: 10,
+        y: 20,
+        width: 10,
+        height: 10,
+    };
+    let generation = tiles.generation();
+    tiles
+        .recomposite(region, &edited, &sources(&stack))
+        .unwrap();
+    assert_eq!(tiles.generation(), generation + 1, "one bump per call");
+    assert_eq!(tiles.take_recomposited(), vec![region]);
+    assert!(tiles.take_recomposited().is_empty(), "the log drains");
+
+    // Every index differs from the sealed one, so the overlay shows each
+    // texel's resident pixel wherever a tile exists: the gather inside the
+    // region, the zeroed allocation elsewhere in the four tiles, and the
+    // sealed sentinel outside them.
+    const SENTINEL: u16 = 7777;
+    let mut samples = vec![SENTINEL; (MAP * MAP * 3) as usize];
+    overlay_edited(
+        &mut samples,
+        &sealed,
+        &edited,
+        whole_map(),
+        NonZeroU32::MIN,
+        3,
+        &tiles,
+    );
+    let four_tiles = Rect {
+        x: 0,
+        y: 13,
+        width: 26,
+        height: 26,
+    };
+    for y in 0..MAP {
+        for x in 0..MAP {
+            let i = ((y * MAP + x) * 3) as usize;
+            let expected: &[u16] = if contains(region, x, y) {
+                &planes[1][i..i + 3]
+            } else if contains(four_tiles, x, y) {
+                &[0, 0, 0]
+            } else {
+                &[SENTINEL; 3]
+            };
+            assert_eq!(&samples[i..i + 3], expected, "({x}, {y})");
+        }
     }
 }
 
@@ -1792,6 +2087,8 @@ fn prepared_samples_match_a_direct_read() {
                     stamp,
                     reader: reader.clone(),
                     index_scale,
+                    indices: None,
+                    state: Default::default(),
                 }]);
                 let done = take_stamp(&preparer, stamp);
                 assert_eq!(
@@ -1868,7 +2165,9 @@ fn stale_results_render_nothing() {
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
     renderer.set_planes(&composite_path, &zmap_path).unwrap();
-    renderer.set_frame(&frame_path).unwrap();
+    renderer
+        .set_frame(&frame_path, None, job::host_budget())
+        .unwrap();
 
     let draw = |x: u32| PaneDraw {
         src: (x, 5, 37, 23),
@@ -1931,31 +2230,167 @@ fn stale_results_render_nothing() {
 
     // A source switch.
     let before_frame_switch = renderer.request_frame(&draw(7)).expect("frame job");
-    renderer.set_frame(&frame_path).unwrap();
+    renderer
+        .set_frame(&frame_path, None, job::host_budget())
+        .unwrap();
     refused(&mut renderer, &before_frame_switch, "set_frame");
     let before_frame_close = renderer.request_frame(&draw(7)).expect("frame job");
     renderer.clear_frame();
-    renderer.set_frame(&frame_path).unwrap();
+    renderer
+        .set_frame(&frame_path, None, job::host_budget())
+        .unwrap();
     refused(&mut renderer, &before_frame_close, "clear_frame");
 
-    let before_planes = renderer.request_planes(&draw(7)).expect("plane job");
+    let before_planes = renderer
+        .request_planes(&draw(7), None, None)
+        .expect("plane job");
     renderer.set_planes(&composite_path, &zmap_path).unwrap();
     refused(&mut renderer, &before_planes, "set_planes");
-    let before_clear = renderer.request_planes(&draw(7)).expect("plane job");
+    let before_clear = renderer
+        .request_planes(&draw(7), None, None)
+        .expect("plane job");
     renderer.clear_planes();
     renderer.set_planes(&composite_path, &zmap_path).unwrap();
     refused(&mut renderer, &before_clear, "clear_planes");
 
     // A plane selection.
-    let before_select = renderer.request_planes(&draw(7)).expect("plane job");
+    let before_select = renderer
+        .request_planes(&draw(7), None, None)
+        .expect("plane job");
     renderer.select_plane(PaneSource::ZMap);
     refused(&mut renderer, &before_select, "select_plane");
-    let zmap_job = renderer.request_planes(&draw(7)).expect("Z-Map job");
+    let zmap_job = renderer
+        .request_planes(&draw(7), None, None)
+        .expect("Z-Map job");
     accepted(&mut renderer, &zmap_job, "Z-Map after the selection");
 
     // A device change.
-    let before_device = renderer.request_planes(&draw(8)).expect("plane job");
+    let before_device = renderer
+        .request_planes(&draw(8), None, None)
+        .expect("plane job");
     renderer.detach_device();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
     refused(&mut renderer, &before_device, "detach and attach");
+}
+
+#[test]
+fn overlay_keeps_sealed_pixels_where_index_unchanged() {
+    let stack = mantis64_stack();
+    let planes = frame_planes(&stack);
+    let sealed: Vec<u16> = (0..MAP * MAP)
+        .map(|i| ((i / 5) % FRAMES as u32) as u16)
+        .collect();
+    let mut edited = sealed.clone();
+    let region = Rect {
+        x: 9,
+        y: 14,
+        width: 23,
+        height: 19,
+    };
+    // Inside the region one diagonal band changes source; every other pixel
+    // there is gathered at its own sealed index, as a repaint with the
+    // sealed source leaves it.
+    for y in region.y..region.y + region.height {
+        for x in region.x..region.x + region.width {
+            let i = (y * MAP + x) as usize;
+            if (x + y) % 4 == 0 {
+                edited[i] = (sealed[i] + 1) % FRAMES as u16;
+            }
+        }
+    }
+    let mut tiles = ResidentTiles::new(16, MAP, MAP, 3);
+    tiles
+        .recomposite(region, &edited, &sources(&stack))
+        .unwrap();
+
+    // The sealed composite stands in as a sentinel no frame sample equals,
+    // so a gathered pixel in its place cannot hide.
+    let sealed_sample = |i: usize| 60000 + (i % 1000) as u16;
+    for step in [1u32, 2] {
+        let step = NonZeroU32::new(step).unwrap();
+        let out_w = MAP.div_ceil(step.get());
+        let texels = (out_w * out_w) as usize;
+        let mut sealed_step = vec![0u16; texels];
+        let mut edited_step = vec![0u16; texels];
+        step_copy(&sealed, MAP, whole_map(), step, &mut sealed_step);
+        step_copy(&edited, MAP, whole_map(), step, &mut edited_step);
+        let mut samples: Vec<u16> = (0..texels * 3).map(sealed_sample).collect();
+        overlay_edited(
+            &mut samples,
+            &sealed_step,
+            &edited_step,
+            whole_map(),
+            step,
+            3,
+            &tiles,
+        );
+        for ty in 0..out_w {
+            for tx in 0..out_w {
+                let (x, y) = (tx * step.get(), ty * step.get());
+                let t = (ty * out_w + tx) as usize;
+                let i = (y * MAP + x) as usize;
+                let expected: Vec<u16> = if edited[i] != sealed[i] {
+                    planes[edited[i] as usize][i * 3..i * 3 + 3].to_vec()
+                } else {
+                    (t * 3..t * 3 + 3).map(sealed_sample).collect()
+                };
+                assert_eq!(
+                    &samples[t * 3..t * 3 + 3],
+                    expected.as_slice(),
+                    "step {step} ({x}, {y})"
+                );
+            }
+        }
+    }
+}
+
+/// `FrameSource` opens an LZW-compressed frame through `open_frame_set`,
+/// reading the same samples as its uncompressed original, at step 1 and
+/// step 2 -- the editor is not narrowed to the mmap fast path.
+#[test]
+fn compressed_frame_reads_the_same_samples_as_its_uncompressed_original() {
+    let uncompressed = common::fixture_frame("mantis-64", 0);
+    let compressed = common::fixture_frame("mantis-64-lzw-p2-strip-ii", 0);
+
+    for step in [
+        std::num::NonZeroU32::MIN,
+        std::num::NonZeroU32::new(2).unwrap(),
+    ] {
+        let mut plain = FrameSource::default();
+        plain
+            .set(&uncompressed, None, job::host_budget())
+            .expect("the uncompressed fixture frame must open");
+        let mut lzw = FrameSource::default();
+        lzw.set(&compressed, None, job::host_budget())
+            .expect("the LZW fixture frame must open through open_frame_set");
+
+        let (w, h) = plain
+            .dimensions()
+            .expect("the uncompressed frame has a size");
+        assert_eq!(
+            lzw.dimensions(),
+            Some((w, h)),
+            "step {step}: both readers report the same frame size"
+        );
+        let spp = plain.samples_per_pixel().expect("samples per pixel");
+        let rect = focusforge_core::tile::Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        let out_w = w.div_ceil(step.get());
+        let out_h = h.div_ceil(step.get());
+        let mut plain_out = vec![0u16; out_w as usize * out_h as usize * spp as usize];
+        let mut lzw_out = plain_out.clone();
+        plain
+            .read_into(rect, step, &mut plain_out)
+            .expect("the uncompressed frame reads");
+        lzw.read_into(rect, step, &mut lzw_out)
+            .expect("the LZW frame reads");
+        assert_eq!(
+            plain_out, lzw_out,
+            "step {step}: the LZW frame must read the same samples as its uncompressed original"
+        );
+    }
 }

@@ -7,6 +7,7 @@ import { ListView } from "std-widgets.slint";
 import { Theme } from "../../theme.slint";
 import { ShellGeometry } from "../../geometry.slint";
 import { FFImageRow } from "../../components/ff_image_row.slint";
+import { FFNoSourceRow } from "../../components/ff_no_source_row.slint";
 import { FFScrollbar } from "../../components/ff_scrollbar.slint";
 import { FFMenuList } from "../../components/ff_menu_list.slint";
 import { FFIconButton } from "../../components/ff_icon_button.slint";
@@ -31,6 +32,14 @@ export component FFImagesPanel inherits Rectangle {
     // Whether the mutating chrome (add, sort, per-row hover controls) shows
     // at all.
     in property <bool> mutable: true;
+    // Whether the panel draws at full strength. False dims the whole panel
+    // to the same disabled look `FFSettingsPanel` uses during a job.
+    in property <bool> enabled: true;
+    // The editor's read-only legend: every row is a mode of `FFImageRow`
+    // rather than the mutable stacking-mode row, and the pinned `NO_SOURCE`
+    // entry shows below the scrolled list.
+    in property <bool> legend: false;
+    in property <bool> no-source-row: false;
     // The sort menu's own selection ("" | "name" | "capture-time") and
     // whether it is open.
     in property <string> sort: "";
@@ -55,14 +64,20 @@ export component FFImagesPanel inherits Rectangle {
     // The gutter's raw pointer stream: row under the pointer, kind (0 = down,
     // 1 = up, 2 = move) and `y` in list-content coordinates.
     callback frame-grip-pointer(int, int, length);
-    // The list's own scroll offset after it moved, wheel included.
+    // The list's own scroll offset after it moved.
     callback viewport-scrolled(length);
+    // A plain wheel over a list row -- steps the selected/brush-source frame,
+    // the same effect `Ctrl + Wheel` over the canvas has. Raw wheel delta,
+    // unnegated, matching `AppController::wheel`'s own convention.
+    callback frame-wheel(length);
     callback scrollbar-pointer(int, length);
     callback scrollbar-dragged(length);
     callback viewport-height-changed(length);
 
     // The row under the pointer in the grip gutter.
     property <int> gutter-row: floor((grip-overlay.mouse-y - list.viewport-y) / ShellGeometry.image-row-height);
+
+    opacity: root.enabled ? 1.0 : 0.5;
 
     VerticalLayout {
         spacing: Theme.space-2;
@@ -112,11 +127,27 @@ export component FFImagesPanel inherits Rectangle {
                 unresolved: row.unresolved;
                 selected: row.selected;
                 mutable: root.mutable;
+                legend: root.legend;
                 dragging: root.mutable && i == root.dragging-row;
                 hovered: grip-overlay.has-hover && i == root.gutter-row;
                 clicked => { root.frame-selected(i); }
                 exclude-toggled => { root.frame-excluded-toggled(i); }
                 remove-requested => { root.frame-remove-requested(i); }
+                wheel(delta) => { root.frame-wheel(delta); }
+            }
+        }
+
+        // Pinned below the scrolled list -- `NO_SOURCE` never scrolls away.
+        if root.no-source-row: VerticalLayout {
+            width: ShellGeometry.image-row-band-width;
+
+            Rectangle {
+                height: 1px;
+                background: Theme.border-default;
+            }
+
+            FFNoSourceRow {
+                width: ShellGeometry.image-row-band-width;
             }
         }
     }
@@ -129,6 +160,10 @@ export component FFImagesPanel inherits Rectangle {
         y: list.y;
         width: ShellGeometry.image-row-content-inset;
         height: list.visible-height;
+        scroll-event(event) => {
+            root.frame-wheel(event.delta-y);
+            accept
+        }
         pointer-event(event) => {
             root.frame-grip-pointer(root.gutter-row, event.kind == PointerEventKind.down ? 0 : (event.kind == PointerEventKind.move ? 2 : 1), self.mouse-y - list.viewport-y);
         }

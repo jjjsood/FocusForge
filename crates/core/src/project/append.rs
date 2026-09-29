@@ -23,6 +23,7 @@ use super::manifest::{AlignRecord, ByteOrderTag, Manifest, Metrics, PlaneRef};
 use super::read_json;
 use super::seal::{now_unix, record, source_ref};
 use super::{FORMAT_VERSION, HASH_ALGORITHM, SealedProject};
+use crate::align::Registration;
 use crate::params::ParamValues;
 
 /// Everything one append needs -- [`super::seal::SealRequest`]'s own field
@@ -36,6 +37,8 @@ pub struct AppendRequest<'a> {
     pub algorithm: &'a str,
     pub params: &'a ParamValues,
     pub align: Option<AlignRecord>,
+    /// Every frame's transform and the applied crop.
+    pub registration: Registration,
     /// Exactly the `ImageDescription` the staged composite carries.
     pub composite_description: String,
     pub label: Option<String>,
@@ -128,6 +131,7 @@ fn append_staged(
         algorithm: request.algorithm.to_string(),
         params: request.params.clone(),
         align: request.align.clone(),
+        registration: request.registration.clone(),
         sources,
         composite: PlaneRef {
             blob: composite.hash.clone(),

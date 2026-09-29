@@ -13,7 +13,8 @@ focusforge-cli <COMMAND>
 | [`info`](#info) | prints TIFF or RAW metadata for a file or a directory of frames |
 | [`algorithms`](#algorithms) | lists registered algorithms, or prints one's full parameter schema |
 | [`stack`](#stack) | fuses a directory's frames into one project per detected stack |
-| [`export`](#export) | turns a project into a composite and/or Z-Map TIFF |
+| [`export`](#export) | turns a project into a composite, Z-Map and/or single-frame TIFF |
+| [`retouch`](#retouch) | applies an op list to a Z-Map and writes the edited map |
 | [`align`](#align) | computes and reports each frame's transform, without fusing |
 | [`review`](#review) | reports one record per project found under a directory or a run's output |
 | [`cache`](#cache) | manages the stage cache under `.scratch/stage-cache/` |
@@ -668,17 +669,20 @@ later versions, matching `info --json`'s own compatibility promise.
 focusforge-cli export [OPTIONS] <PROJECT>
 ```
 
-Turns a project a `stack` run wrote into an image file: the composite with
-`-o`, the Z-Map with `--zmap`, either or both in one invocation — at least
-one is required. This is the only thing in the workspace that writes a TIFF
-from a stack result; the composite it writes is byte-identical to the plane
-the run staged. See [`reference/project-format.md`](project-format.md) for
-what `<PROJECT>` (a `.ffp` file) holds.
+Turns a project a `stack` run wrote into image files: the composite with
+`-o`, the Z-Map with `--zmap`, one source frame warped and cropped to the
+composite's own extent with `--frame`/`--frame-output` — any combination,
+at least one required. The composite it writes is byte-identical to the
+plane the run staged. See
+[`reference/project-format.md`](project-format.md) for what `<PROJECT>` (a
+`.ffp` file) holds.
 
 | flag | meaning |
 |---|---|
 | `-o, --output <FILE>` | write the composite to this path |
 | `--zmap <FILE>` | write the Z-Map to this path |
+| `--frame <INDEX>` | write this 0-based source frame "as fused" — warped by its recorded alignment transform and offset by the applied crop, at the composite's own width and height. Requires `--frame-output` |
+| `--frame-output <FILE>` | where to write the frame `--frame` names |
 | `--json` | emit the frozen JSON report instead of human-readable text |
 
 ```
@@ -706,8 +710,56 @@ not the original frames.
 Frozen, additive-only, the same discipline as every other `--json` shape in
 this reference: `project`, `wrote` (final paths only), `unresolved_sources`
 (present and empty when every source resolved, not an omission), `width`,
-`height`, `samples_per_pixel`, `frame_count`, `algorithm` and
+`height`, `samples_per_pixel`, `frame_count`, `algorithm`, `frame` (the
+`--frame` index written, `null` when the flag was omitted) and
 `wall_seconds`.
+
+## `retouch`
+
+```
+focusforge-cli retouch [OPTIONS] --zmap <FILE> --ops <FILE> --out <FILE>
+```
+
+Applies an op list to a Z-Map and writes the edited map. Every editing
+capability the window offers is reachable through this one command,
+headless — see [`guide/retouch.md`](../guide/retouch.md) for the op list's
+JSON shape and a full walkthrough.
+
+| flag | meaning |
+|---|---|
+| `--zmap <FILE>` | the Z-Map to edit |
+| `--ops <FILE>` | the op list to apply, in the persisted `Op` JSON shape; positions in error messages count from 0 in list order |
+| `--out <FILE>` | where to write the edited Z-Map; required, and never the same file as `--zmap` |
+| `--undo <N>` | undo this many ops off the end of the list before writing (default `0`) |
+| `--redo <N>` | redo this many undone ops, never more than `--undo` (default `0`) |
+| `--frames <DIR>` | directory of source frames to recomposite `--render`/`--overlay` from; required by either |
+| `--render <FILE>` | write the recomposited image at the edited map's undo/redo position — a per-pixel gather from `--frames`, CPU only |
+| `--overlay <FILE>` | blend the rainbow overlay over the recomposited image and write it as an 8-bit RGBA PNG |
+| `--opacity <FLOAT>` | the overlay's blend opacity, `0.0`–`1.0` (default `0.65`) |
+| `--solo <INDEX>` | highlight this 0-based source index in the overlay — the numbering an op's `source_id` uses — and desaturate every other source |
+| `--json` | emit the frozen JSON report instead of human-readable text |
+
+```
+$ focusforge-cli retouch --zmap zmap.tif --ops stroke-list.json --out edited.tif
+zmap: zmap.tif
+ops: stroke-list.json (3 in list, 3 applied)
+pixels changed: 9608
+wrote: edited.tif
+wall: 0.035s
+```
+
+An op that fails to validate — an unsupported tag, or a value outside what
+the op accepts — refuses the whole run before anything is written, naming
+the op's 0-based position in the list. `--out` and any of `--render`/
+`--overlay` are refused if they would overwrite `--zmap`, each other, or a
+source frame.
+
+### `--json`
+
+Frozen, additive-only: `zmap`, `ops`, `ops_in_list`, `ops_applied`,
+`pixels_changed`, `wrote`, `wall_seconds`, `rendered` (the `--render` path
+written, `null` when omitted) and `overlay` (the `--overlay` path written,
+`null` when omitted).
 
 ## `review`
 

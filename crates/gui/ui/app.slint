@@ -15,6 +15,7 @@ import { ShellGeometry } from "geometry.slint";
 import { FFTabStrip, ProjectTabView } from "shell/tab_strip.slint";
 export { ProjectTabView }
 import { FFToolbar } from "shell/toolbar.slint";
+import { FFEditorToolbar } from "shell/editor_toolbar.slint";
 import { FFCanvas } from "shell/canvas.slint";
 import { FFDock, SettingsRow, SectionHeadView, ImageRowView } from "shell/dock.slint";
 export { SettingsRow, SectionHeadView, ImageRowView }
@@ -41,6 +42,12 @@ export component AppWindow inherits Window {
     callback pause-or-resume-requested();
     callback cancel-requested();
     callback retry-requested();
+    // The editor toolbar, forwarded one-for-one from `FFEditorToolbar` below.
+    callback brush-size-fraction-changed(float);
+    callback brush-softness-fraction-changed(float);
+    callback pipette-toggled();
+    callback undo-requested();
+    callback redo-requested();
 
     // Every piece of state the shell shows is an `in` property set from
     // Rust, never computed here.
@@ -54,6 +61,27 @@ export component AppWindow inherits Window {
     // accessor. This property is the separate, plain chrome state the tab
     // strip's maximize glyph draws from.
     in property <bool> window-maximized: false;
+    // The editor toolbar's own state, pushed from `AppController::brush_toolbar_view`
+    // (`src/bridge.rs`) on every `ShellEvent::EditorChanged`.
+    in property <string> brush-size-text: "";
+    in property <float> brush-size-fraction: 0.0;
+    in property <int> brush-size-ceiling: 1;
+    in property <string> brush-soft-text: "";
+    in property <float> brush-soft-fraction: 0.0;
+    in property <bool> brush-picking: false;
+    in property <bool> can-undo: false;
+    in property <bool> can-redo: false;
+    // The brush cursor's own `Path` geometry, pushed alongside the toolbar
+    // state above on every repaint (it also depends on the viewport's
+    // current zoom, which the toolbar state does not).
+    in property <length> cursor-extent;
+    in property <string> cursor-ring-commands;
+    in property <string> cursor-core-commands;
+    in property <bool> cursor-picking: false;
+    in property <color> cursor-pick-color;
+    // The offset that carries either pane's cursor onto the other, at the
+    // same scene point.
+    in property <length> cursor-mirror-dx;
 
     no-frame: true;
     resize-border-width: 8px;
@@ -142,7 +170,7 @@ export component AppWindow inherits Window {
     // tabs) `fuse-enabled` and `toolbar-run-state` already resolve to their
     // inert values, so the row renders itself disabled without a separate
     // hidden state.
-    toolbar := FFToolbar {
+    if root.mode != "editor": toolbar := FFToolbar {
         x: 0px;
         y: ShellGeometry.strip-height;
         width: root.width - ShellGeometry.dock-width;
@@ -155,6 +183,27 @@ export component AppWindow inherits Window {
         pause-or-resume-requested => { root.pause-or-resume-requested(); }
         cancel-requested => { root.cancel-requested(); }
         retry-requested => { root.retry-requested(); }
+    }
+
+    if root.mode == "editor": editor-toolbar := FFEditorToolbar {
+        x: 0px;
+        y: ShellGeometry.strip-height;
+        width: root.width - ShellGeometry.dock-width;
+        height: ShellGeometry.toolbar-height;
+        size-text: root.brush-size-text;
+        size-fraction: root.brush-size-fraction;
+        size-ceiling: root.brush-size-ceiling;
+        soft-text: root.brush-soft-text;
+        soft-fraction: root.brush-soft-fraction;
+        picking: root.brush-picking;
+        can-undo: root.can-undo;
+        can-redo: root.can-redo;
+
+        brush-size-fraction-changed(f) => { root.brush-size-fraction-changed(f); }
+        brush-softness-fraction-changed(f) => { root.brush-softness-fraction-changed(f); }
+        pipette-toggled => { root.pipette-toggled(); }
+        undo-requested => { root.undo-requested(); }
+        redo-requested => { root.redo-requested(); }
     }
 
     // Both images are `in` properties set from Rust
@@ -266,6 +315,13 @@ export component AppWindow inherits Window {
             pixelated: root.pixelated;
             show-empty-state: root.show-empty-state;
             load-active: root.load-active;
+            editor-mode: root.mode == "editor";
+            cursor-extent: root.cursor-extent;
+            cursor-ring-commands: root.cursor-ring-commands;
+            cursor-core-commands: root.cursor-core-commands;
+            cursor-picking: root.cursor-picking;
+            cursor-pick-color: root.cursor-pick-color;
+            cursor-mirror-dx: root.cursor-mirror-dx;
 
             composite-undock-requested => { root.composite-undock-requested(); }
             zmap-undock-requested => { root.zmap-undock-requested(); }
@@ -305,6 +361,7 @@ export component AppWindow inherits Window {
     in property <[ImageRowView]> images-rows: [];
     in property <string> images-header-text: "";
     in-out property <length> images-list-viewport-y: 0px;
+    in property <bool> images-no-source-row: false;
     in property <string> images-sort: "";
     in property <bool> images-sort-menu-open: false;
     in property <int> images-dragging-row: -1;
@@ -321,6 +378,7 @@ export component AppWindow inherits Window {
     callback images-frame-remove-requested(int);
     callback images-frame-grip-pointer(int, int, length);
     callback images-viewport-scrolled(length);
+    callback images-frame-wheel(length);
     callback images-scrollbar-pointer(int, length);
     callback images-scrollbar-dragged(length);
     callback images-viewport-height-changed(length);
@@ -343,6 +401,7 @@ export component AppWindow inherits Window {
         images-rows: root.images-rows;
         images-header-text: root.images-header-text;
         images-list-viewport-y <=> root.images-list-viewport-y;
+        images-no-source-row: root.images-no-source-row;
         images-sort: root.images-sort;
         images-sort-menu-open: root.images-sort-menu-open;
         images-dragging-row: root.images-dragging-row;
@@ -370,6 +429,7 @@ export component AppWindow inherits Window {
         images-frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
         images-frame-grip-pointer(i, kind, y) => { root.images-frame-grip-pointer(i, kind, y); }
         images-viewport-scrolled(offset) => { root.images-viewport-scrolled(offset); }
+        images-frame-wheel(delta) => { root.images-frame-wheel(delta); }
         images-scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
         images-scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
         images-viewport-height-changed(h) => { root.images-viewport-height-changed(h); }
@@ -440,6 +500,13 @@ export component AppWindow inherits Window {
     in property <string> bar-tone: "running";
     in property <string> eta-text: "";
 
+    // The bottom bar's overlay controls, editor mode only.
+    in property <bool> overlay-on: false;
+    in property <float> overlay-fraction: 0.0;
+    in property <string> overlay-text: "";
+    callback overlay-toggled(bool);
+    callback overlay-fraction-changed(float);
+
     // Whether a background stack load is in flight
     // (`AppController::open_paths`), pushed on every `LoadStarted`/`LoadReady`.
     in property <bool> load-active: false;
@@ -459,11 +526,17 @@ export component AppWindow inherits Window {
         bar-fraction: root.bar-fraction;
         bar-tone: root.bar-tone;
         eta-text: root.eta-text;
+        editor-mode: root.mode == "editor";
+        overlay-on: root.overlay-on;
+        overlay-fraction: root.overlay-fraction;
+        overlay-text: root.overlay-text;
 
         settings-requested => { root.settings-open-requested(); }
         zoom-in-requested => { root.zoom-in-requested(); }
         zoom-out-requested => { root.zoom-out-requested(); }
         zoom-fit-requested => { root.zoom-fit-requested(); }
+        overlay-toggled(on) => { root.overlay-toggled(on); }
+        overlay-fraction-changed(f) => { root.overlay-fraction-changed(f); }
     }
 
     // The projects overlay's gallery: pushed from `AppController::project_cards`
@@ -624,9 +697,9 @@ export component AppWindow inherits Window {
         pick-another-folder => { root.refusal-pick-another-folder(); }
     }
 
-    // Both toasts sit over the canvas, never the projects overlay: a toast
-    // open when the overlay opens waits, still armed, and reappears the
-    // moment the overlay closes -- neither flag its own toast clears.
+    // The skipped-subfolders notice waits, still armed, until the overview
+    // closes -- it announces an import result, not a background failure, so
+    // losing it to the overview's own focus costs nothing.
     skipped-toast := FFToast {
         x: canvas-ground.x + Theme.space-3;
         y: canvas-ground.y + Theme.space-3;
@@ -636,10 +709,18 @@ export component AppWindow inherits Window {
         dismissed => { root.skipped-notice-dismissed(); }
     }
 
+    // The job toast shows over whichever surface is up: the gallery's own
+    // gutter while the Projects overview is open (declared after
+    // `projects-overlay` above so it paints on top), the pane gutter
+    // otherwise.
     job-toast := FFToast {
-        x: canvas-ground.x + Theme.space-3;
-        y: canvas-ground.y + Theme.space-3;
-        toast-open: root.job-toast-open && !root.projects-overlay-open;
+        x: root.projects-overlay-open
+            ? projects-overlay.x + projects-overlay.gallery-x + Theme.space-3
+            : canvas-ground.x + Theme.space-3;
+        y: root.projects-overlay-open
+            ? projects-overlay.y + projects-overlay.gallery-y + Theme.space-3
+            : canvas-ground.y + Theme.space-3;
+        toast-open: root.job-toast-open;
         message: root.job-toast-message;
         dismissed => { root.job-toast-dismissed(); }
     }

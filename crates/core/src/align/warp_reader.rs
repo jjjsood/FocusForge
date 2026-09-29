@@ -4,11 +4,69 @@
 //! a per-frame transform without touching the scheduler. Not a
 //! [`crate::tile::FramePreprocess`] impl: that hook is unused here.
 
+use serde::{Deserialize, Serialize};
+
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::align::Transform;
 use crate::align::warp::warp_tile;
+use crate::job::stage_cache::{transform_from_bits, transform_to_bits};
 use crate::tile::Rect;
 use crate::timing::{TimingCounter, measurement_scope, record_timing};
+
+/// A stack's alignment: every frame's reference-to-frame [`Transform`] and
+/// the crop rect the fuse applied, if any. `transforms` is stored as each
+/// entry's `f64::to_bits()` projection, since JSON does not round-trip
+/// `f64` bit-for-bit by default.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Registration {
+    #[serde(with = "transform_bits")]
+    pub transforms: Vec<Transform>,
+    pub crop: Option<Rect>,
+}
+
+impl Registration {
+    /// Frame `i`'s transform, [`Transform::identity`] past the end.
+    pub fn transform(&self, i: usize) -> Transform {
+        self.transforms
+            .get(i)
+            .copied()
+            .unwrap_or_else(Transform::identity)
+    }
+
+    /// Every frame's transform, index == frame index, padded with
+    /// [`Transform::identity`] up to `frame_count`.
+    pub fn transforms(&self, frame_count: usize) -> Vec<Transform> {
+        (0..frame_count).map(|i| self.transform(i)).collect()
+    }
+
+    /// The crop's top-left corner in frame coordinates, `(0, 0)` when there
+    /// is no crop.
+    pub fn origin(&self) -> (u32, u32) {
+        self.crop.map(|r| (r.x, r.y)).unwrap_or((0, 0))
+    }
+
+    /// The composite's extent: the crop's size, or `frame` when there is no
+    /// crop.
+    pub fn extent(&self, frame: (u32, u32)) -> (u32, u32) {
+        self.crop.map(|r| (r.width, r.height)).unwrap_or(frame)
+    }
+}
+
+mod transform_bits {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{Transform, transform_from_bits, transform_to_bits};
+
+    pub fn serialize<S: Serializer>(transforms: &[Transform], s: S) -> Result<S::Ok, S::Error> {
+        let bits: Vec<[[u64; 3]; 3]> = transforms.iter().map(transform_to_bits).collect();
+        bits.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Transform>, D::Error> {
+        let bits: Vec<[[u64; 3]; 3]> = Vec::deserialize(d)?;
+        Ok(bits.into_iter().map(transform_from_bits).collect())
+    }
+}
 
 /// Warps every read through `inner` by a per-frame [`Transform`]
 /// (reference coordinates in, `inner`'s own frame coordinates out). Index

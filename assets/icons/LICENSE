@@ -1,8 +1,13 @@
-Lucide icons, vendored by name, upstream bytes unmodified.
+Lucide icons, vendored by name, upstream bytes unmodified except
+pipette-cursor.svg, whose paths carry a lighter stroke-width than upstream's
+for use in the brush cursor overlay only; pipette.svg keeps the unmodified
+glyph.
 
 Source: https://lucide.dev / https://github.com/lucide-icons/lucide
 Version vendored: 1.46.0 (upstream git tag `1.46.0`)
-Glyph count shipped: 36 -- one file per glyph, assets/icons/<lucide-name>.svg
+Glyph count shipped: 39 Lucide glyphs in 40 files -- one file per glyph,
+assets/icons/<lucide-name>.svg, plus pipette-cursor.svg, a stroke-width
+variant of pipette.svg
 
 The text below is upstream's own LICENSE file at that tag, reproduced verbatim
 (ISC, GPLv3-compatible and already allowed at deny.toml:21; the crate-level

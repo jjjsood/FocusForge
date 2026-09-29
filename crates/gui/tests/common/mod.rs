@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use focusforge_gui::{AppController, OpenAs, OpenOutcome};
@@ -148,6 +149,28 @@ pub fn wait_for_settle(
     }
 }
 
+/// Drives an installed window's own repeating job-poll timer
+/// ([`focusforge_gui::job::POLL`]) until the run it is polling settles, by
+/// alternating a mocked timer tick with a short real sleep. The fuse itself
+/// runs on a real worker thread, so `mock_elapsed_time` alone never unblocks
+/// it, and the timer tick locks `controller` itself, so the lock here is
+/// taken and released between ticks rather than held across the call.
+#[allow(dead_code)]
+pub fn settle_via_job_timer(controller: &Arc<Mutex<AppController>>, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        i_slint_backend_testing::mock_elapsed_time(focusforge_gui::job::POLL);
+        if !controller.lock().unwrap().work_pending() {
+            return;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "job did not settle within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// The built GUI, with `FOCUSFORGE_DATA_DIR` pointed at a fresh directory
 /// under `CARGO_TARGET_TMPDIR`, named for `test_name` and this process --
 /// mirrors `crates/cli/tests/common/mod.rs::cli_bin`, so a windowed test run
@@ -194,6 +217,90 @@ pub fn answer_and_settle(controller: &mut AppController, answer: OpenAs) -> Open
     controller
         .settle_open()
         .expect("a load was started, so one outcome is parked")
+}
+
+/// Starts an additive import, blocks until its worker finishes, and settles
+/// it -- `AppController::add_frames` runs off-thread too, the same as
+/// [`open_and_settle`]. Propagates a refusal without joining or settling
+/// anything, since [`AppController::add_frames`] never spawns a worker for
+/// one.
+#[allow(dead_code)]
+pub fn add_and_settle(
+    controller: &mut AppController,
+    paths: &[PathBuf],
+) -> Result<(), focusforge_gui::entry::ImportRefused> {
+    if let Some(handle) = controller.add_frames(paths)? {
+        handle.join().expect("the import worker did not panic");
+    }
+    controller.settle_import();
+    Ok(())
+}
+
+/// A directory built with `tempfile`, which honours `TMPDIR` and so lives on
+/// a filesystem where a mode change actually takes effect. Restores a
+/// writable mode before its own `TempDir` removes it.
+#[allow(dead_code)]
+#[cfg(unix)]
+pub struct ReadOnlyDir {
+    dir: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl std::ops::Deref for ReadOnlyDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnlyDir {
+    fn drop(&mut self) {
+        let _ = set_mode(self.dir.path(), 0o755);
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+}
+
+/// Tries to create and remove a marker file in `dir`; `true` means the
+/// directory is still writable, so a mode change meant to block that either
+/// failed or has no effect on this filesystem.
+#[cfg(unix)]
+fn still_writable(dir: &Path) -> bool {
+    let marker = dir.join(".readonly-probe");
+    match std::fs::write(&marker, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&marker);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// A fresh directory: `populate` fills it in while still writable, then
+/// `mode` is applied and proven to actually block writes. When that proof
+/// fails, undoes the mode change, prints a one-line skip notice to stderr,
+/// and returns `None`.
+#[allow(dead_code)]
+#[cfg(unix)]
+pub fn readonly_dir(label: &str, mode: u32, populate: impl FnOnce(&Path)) -> Option<ReadOnlyDir> {
+    let dir = tempfile::Builder::new()
+        .prefix(label)
+        .tempdir()
+        .expect("temp directory must be creatable");
+    populate(dir.path());
+    set_mode(dir.path(), mode).expect("mode must be settable");
+    if still_writable(dir.path()) {
+        let _ = set_mode(dir.path(), 0o755);
+        eprintln!("skipping {label}: this filesystem does not enforce directory permissions");
+        return None;
+    }
+    Some(ReadOnlyDir { dir })
 }
 
 /// A `<root>/focusforge` data directory holding roughly `total_log_bytes`

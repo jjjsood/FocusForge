@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::brush;
+use crate::canvas::{FrameView, OverlayDraw};
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
     DiagnosticsView, clamp_manifest_scroll, manifest_content_height, measurement_scope, size_text,
@@ -41,7 +43,7 @@ use crate::settings_panel::{
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
 
 pub use crate::entry::{
-    EntryError, GroupingQuestion, GuiProject, OpenAs, OpenOutcome, Opened, Proposal,
+    EntryError, GroupingQuestion, GuiProject, ImportRefused, OpenAs, OpenOutcome, Opened, Proposal,
 };
 
 /// The stacking/editor mode switch's two positions. Editor is reachable only
@@ -144,8 +146,11 @@ pub enum ShellEvent {
     ImagesChanged,
     /// Only the `Images` list's scroll offset moved; no row changed.
     ImagesScrolled,
-    /// The projects overlay's own state moved: opened, closed, its column
-    /// count, or its failure cards changed.
+    /// The editor toolbar's own state moved: the brush size, its softness,
+    /// the pipette's armed state, or undo/redo availability.
+    EditorChanged,
+    /// The projects overlay's own state moved: opened, closed, its gallery
+    /// scrolled, or its failure cards changed.
     OverlayChanged,
     /// Only the gallery's scroll offset or viewport height moved; no card
     /// changed.
@@ -162,6 +167,9 @@ pub enum ShellEvent {
     /// A background load's result is ready to settle
     /// ([`AppController::settle_open`]).
     LoadReady,
+    /// An import scan ([`AppController::add_frames`]) is ready to settle
+    /// ([`AppController::settle_import`]).
+    ImportReady,
 }
 
 /// One live drag: which action it started and the last position seen, so
@@ -184,13 +192,131 @@ struct InputState {
     table: InputTable,
     provenance: Provenance,
     space_held: bool,
+    /// `Alt` as the last hover move reported it -- shows the pipette cursor
+    /// while held; it arms nothing.
+    alt_held: bool,
     drag: Option<DragState>,
     unimplemented: Vec<Action>,
     last_pointer: (f32, f32),
     /// Accumulated wheel delta not yet spent into a ladder step -- one stop
     /// per accumulated 60 px. Reset on a sign change so reversing direction
-    /// never burns a leftover.
+    /// never burns a leftover, and whenever the resolved action differs from
+    /// `last_wheel_action`.
     wheel_accum: f32,
+    /// The action the previous wheel detent spent into, so switching from
+    /// one wheel-bound action to another mid-session never carries over a
+    /// leftover fraction of a step.
+    last_wheel_action: Option<Action>,
+}
+
+/// The brush's display state: `size` is a diameter in image px, `soft` a
+/// percentage -- the controller's one conversion point to storage units is
+/// [`AppController::brush_radius_softness`]. Every write clamps `size` to
+/// `1..=` the active tab's ceiling, and every reader clamps it again, so a
+/// tab switch to a smaller image takes effect on the next read without a
+/// hook of its own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BrushState {
+    size: f32,
+    soft: f32,
+    picking: bool,
+}
+
+impl Default for BrushState {
+    fn default() -> Self {
+        Self {
+            size: 64.0,
+            soft: 30.0,
+            picking: false,
+        }
+    }
+}
+
+/// The rainbow overlay's own state: window-wide, since the same values
+/// render for whichever tab is active. Starts off, at 65 % once turned on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OverlayState {
+    on: bool,
+    opacity: f32,
+}
+
+impl Default for OverlayState {
+    fn default() -> Self {
+        Self {
+            on: false,
+            opacity: 0.65,
+        }
+    }
+}
+
+/// `size = ceiling^fraction` -- the logarithmic slider mapping, so the
+/// track's right end is always the ceiling.
+fn size_from_fraction(fraction: f32, ceiling: u32) -> f32 {
+    let ceiling = (ceiling.max(1)) as f32;
+    if ceiling <= 1.0 {
+        1.0
+    } else {
+        ceiling.powf(fraction.clamp(0.0, 1.0))
+    }
+}
+
+/// [`size_from_fraction`]'s inverse -- the slider's own thumb position for
+/// the toolbar's current `size`.
+fn fraction_from_size(size: f32, ceiling: u32) -> f32 {
+    let ceiling = (ceiling.max(1)) as f32;
+    if ceiling <= 1.0 {
+        0.0
+    } else {
+        (size.max(1.0).ln() / ceiling.ln()).clamp(0.0, 1.0)
+    }
+}
+
+/// The editor toolbar's brush readout -- [`AppController::brush_toolbar_view`]'s
+/// return value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BrushToolbarView {
+    /// A diameter in image px, already clamped to `size_ceiling`.
+    pub size: f32,
+    /// `min(width, height)` of the active tab's fused image.
+    pub size_ceiling: u32,
+    /// The logarithmic slider's own thumb position, `0.0..=1.0`.
+    pub size_fraction: f32,
+    /// A percentage, `0.0..=100.0`.
+    pub soft: f32,
+    /// The linear slider's own thumb position, `0.0..=1.0`.
+    pub soft_fraction: f32,
+    pub picking: bool,
+    /// Whether the active tab's edit session has an op to undo/redo.
+    pub can_undo: bool,
+    pub can_redo: bool,
+}
+
+/// The bottom bar's overlay controls -- [`AppController::overlay_view`]'s
+/// return value. `opacity` is `0.0..=1.0`; the bar's own percentage readout
+/// is formatted by the caller.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverlayView {
+    pub on: bool,
+    pub opacity: f32,
+}
+
+/// The brush cursor overlay's own view -- [`AppController::brush_cursor_view`]'s
+/// return value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrushCursorView {
+    pub extent: f32,
+    pub ring_commands: String,
+    pub core_commands: String,
+    /// The pipette is armed or `Alt` is held.
+    pub picking: bool,
+    /// The colour a pick would land on right now -- the Z-Map source under
+    /// the pointer while `picking`, or the current brush source otherwise --
+    /// shown in the cursor's swatch.
+    pub pick_color: [u8; 3],
+    /// The right pane's `x` minus the left pane's, logical px: the offset
+    /// that carries a cursor's centre from the pane it is over onto the
+    /// other pane, at the same scene point.
+    pub mirror_dx: f32,
 }
 
 /// The diagnostics panel's own state: the two directories a bundle is
@@ -316,7 +442,20 @@ struct ProjectTab {
     /// This tab's own editor session, opened over its fused Z-Map on first
     /// entry into editor mode -- `None` until then, and cleared whenever a
     /// newer checkpoint replaces the planes it was opened over.
-    edit: Option<job::EditSession>,
+    edit: Option<job::EditState>,
+    /// This tab's own failed, cancelled or sources-missing run, if its most
+    /// recent attempt did not succeed -- `None` once a later success clears
+    /// it. Keyed by tab rather than by path so it survives an Unsaved ->
+    /// Opened identity change and disappears with the tab on close.
+    failure: Option<TabFailure>,
+}
+
+/// A run outcome recorded against its own tab rather than the project's
+/// identity path -- [`ProjectTab::failure`]'s payload.
+struct TabFailure {
+    kind: FailureKind,
+    stage: String,
+    reason: String,
 }
 
 /// A held checkpoint whose run diverged on `diverged`, by frame file name.
@@ -392,6 +531,7 @@ impl ProjectTab {
             run: job::RunState::Idle,
             request: None,
             edit: None,
+            failure: None,
         }
     }
 
@@ -430,12 +570,8 @@ impl ProjectTab {
         if job::is_live(&self.run) || matches!(self.run, job::RunState::Queued { .. }) {
             return false;
         }
-        let fused = match self.held.last() {
-            Some(held) => held.sources.clone(),
-            None if matches!(self.project, GuiProject::Opened(_)) => {
-                entry::project_frames(&self.project)
-            }
-            None => return false,
+        let Some((fused, _)) = self.fused() else {
+            return false;
         };
         self.frames == fused
     }
@@ -449,6 +585,23 @@ impl ProjectTab {
             .cloned()
             .collect();
         self.meta.extend(images::read_metadata(&missing));
+    }
+
+    /// The sources and registration behind this tab's newest composite --
+    /// the newest held checkpoint's own `sources`/`registration`, or a
+    /// reopened project's own manifest when nothing is held. `None` for an
+    /// unsaved, never-fused tab.
+    fn fused(&self) -> Option<(Vec<PathBuf>, job::Registration)> {
+        match self.held.last() {
+            Some(held) => Some((held.sources.clone(), held.registration.clone())),
+            None => match &self.project {
+                GuiProject::Opened(project) => Some((
+                    entry::project_frames(&self.project),
+                    project.manifest().registration.clone(),
+                )),
+                GuiProject::Unsaved(_) => None,
+            },
+        }
     }
 
     /// Permutes `frames` and `excluded` together by `order` (each entry the
@@ -541,6 +694,10 @@ struct ShellState {
     checkpoints: Vec<CheckpointRow>,
     maximized: bool,
     input: InputState,
+    /// The editor toolbar's own brush state -- shared by every tab, so a
+    /// stroke started in one editor session and finished after switching
+    /// tabs is unreachable (`Paint`'s drag reads the active tab only).
+    brush: BrushState,
     /// Every open project tab. Each tab owns its own image and viewport, so
     /// switching tabs keeps each tab's own zoom.
     projects: Vec<ProjectTab>,
@@ -561,6 +718,10 @@ struct ShellState {
     notice: Option<String>,
     /// The most recent refusal's already-rendered message, if any.
     last_refusal: Option<String>,
+    /// Whether the "No frames here" refusal dialog is open -- raised by
+    /// [`AppController::refuse_message`], cleared by
+    /// [`AppController::dismiss_refusal`].
+    refusal_open: bool,
     /// The tab strip's scroll offset in pixels, always within
     /// [`clamp_tab_scroll`]'s range for the current tabs and viewport.
     tab_scroll_x: f32,
@@ -623,8 +784,11 @@ struct ShellState {
     /// checkpoints no `.ffp` contains. Mutually exclusive with
     /// `pending_close`: each is a no-op while the other question is open.
     pending_quit: bool,
-    /// Every card standing for a stack that did not become an open project
-    /// this session -- cleared the moment its own path opens successfully.
+    /// Every `Not a project` card -- a path with no open project behind it
+    /// at all, cleared the moment that same path opens successfully. A
+    /// failed, cancelled or sources-missing run instead lives on its own
+    /// tab ([`ProjectTab::failure`]), since it always has an open project
+    /// behind it.
     failures: Vec<FailureCard>,
     /// The gallery's own scroll offset and viewport height --
     /// [`ShellState::images_scroll_y`]'s twin.
@@ -647,6 +811,11 @@ struct ShellState {
     canvas_dirty: bool,
     /// The in-flight background load, if any.
     load: LoadSlot,
+    /// The in-flight additive import scan, if any.
+    import: ImportSlot,
+    /// The `Composite` pane's rainbow overlay -- window-wide (see
+    /// [`OverlayState`]).
+    overlay: OverlayState,
 }
 
 /// One load's worker result, parked here until
@@ -689,6 +858,24 @@ fn decode_thumbnails(projects: &mut [GuiProject]) -> Vec<Preloaded> {
         .collect()
 }
 
+/// One additive import's worker result, parked here until
+/// [`AppController::settle_import`] resolves it -- [`LoadSlot`]'s twin for
+/// [`AppController::add_frames`] rather than a fresh open.
+#[derive(Default)]
+struct ImportSlot {
+    in_flight: bool,
+    outcome: Arc<Mutex<Option<ImportScan>>>,
+}
+
+/// [`AppController::add_frames`]'s worker outcome: the tab it scanned, that
+/// tab's frame list as of the scan's start, and the resolved import.
+struct ImportScan {
+    tab_id: u64,
+    frames: Vec<PathBuf>,
+    add: Vec<PathBuf>,
+    replace: Vec<(usize, PathBuf)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct DragRow {
     from: usize,
@@ -698,12 +885,43 @@ struct DragRow {
     current_y: f32,
 }
 
+/// An import's resolved shape, staged for [`AppController::apply_add_frames`]:
+/// `add` are new, non-conflicting frames to append; `replace` is each
+/// conflicting existing frame's own position in the tab's frame list, paired
+/// with its incoming replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ImportPlan {
+    add: Vec<PathBuf>,
+    replace: Vec<(usize, PathBuf)>,
+}
+
+impl ImportPlan {
+    fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.replace.is_empty()
+    }
+
+    /// Drops every `replace` entry whose incoming path is already the frame
+    /// at that position -- re-accepting a replacement with the very file
+    /// already there changes nothing.
+    fn without_same_path_replacements(mut self, existing: &[PathBuf]) -> Self {
+        self.replace
+            .retain(|(position, path)| existing.get(*position) != Some(path));
+        self
+    }
+}
+
 /// [`ShellState::pending_frame_change`]'s payload: which action is waiting,
 /// and what it still needs applied once confirmed.
 #[derive(Debug, Clone, PartialEq)]
 enum PendingFrameChange {
-    Add(Vec<PathBuf>),
-    Move { from: usize, to: usize },
+    Add(ImportPlan),
+    /// An import whose scan found conflicts -- the duplicate question, shown
+    /// regardless of the tab's own checkpoint count.
+    Duplicates(ImportPlan),
+    Move {
+        from: usize,
+        to: usize,
+    },
     Sort(crate::images::FrameSort),
     Remove(usize),
 }
@@ -711,7 +929,9 @@ enum PendingFrameChange {
 impl PendingFrameChange {
     fn kind(&self) -> crate::images::FrameSetChangeKind {
         match self {
-            PendingFrameChange::Add(_) => crate::images::FrameSetChangeKind::Add,
+            PendingFrameChange::Add(_) | PendingFrameChange::Duplicates(_) => {
+                crate::images::FrameSetChangeKind::Add
+            }
             PendingFrameChange::Move { .. } => crate::images::FrameSetChangeKind::Move,
             PendingFrameChange::Sort(_) => crate::images::FrameSetChangeKind::Sort,
             PendingFrameChange::Remove(_) => crate::images::FrameSetChangeKind::Remove,
@@ -744,6 +964,46 @@ pub(crate) fn path_digest(path: &std::path::Path) -> u64 {
 
 fn pane_contains(pane: PaneRect, x: f32, y: f32) -> bool {
     x >= pane.x && x <= pane.x + pane.width && y >= pane.y && y <= pane.y + pane.height
+}
+
+/// Widens `rect` by `margin` px on every side, clamped to `0..width` /
+/// `0..height` -- the commit pass's bound between a stroke's raw preview
+/// trace and its resampled, RDP'd committed path.
+fn dilate_rect(rect: job::Rect, margin: u32, width: u32, height: u32) -> job::Rect {
+    let x0 = rect.x.saturating_sub(margin);
+    let y0 = rect.y.saturating_sub(margin);
+    let x1 = (rect.x + rect.width + margin).min(width);
+    let y1 = (rect.y + rect.height + margin).min(height);
+    job::Rect {
+        x: x0,
+        y: y0,
+        width: x1.saturating_sub(x0),
+        height: y1.saturating_sub(y0),
+    }
+}
+
+/// The extent of `tab`'s newest composite/Z-Map -- its newest held
+/// checkpoint's, else its opened project's; `None` before any fuse.
+fn fused_image_size(tab: &ProjectTab) -> Option<ImageSize> {
+    match (tab.held.last(), &tab.project) {
+        (Some(held), _) => Some(ImageSize {
+            width: held.width,
+            height: held.height,
+        }),
+        (None, GuiProject::Opened(project)) => Some(ImageSize {
+            width: project.manifest().composite.width,
+            height: project.manifest().composite.height,
+        }),
+        (None, GuiProject::Unsaved(_)) => None,
+    }
+}
+
+/// `tab`'s own image size for every viewport computation: the newest
+/// composite's extent once it has one ([`fused_image_size`]), else the raw
+/// frame's -- so both panes and every zoom/pan/fit computation share one
+/// size once a tab is fused.
+fn display_image(tab: &ProjectTab) -> Option<ImageSize> {
+    fused_image_size(tab).or(tab.image)
 }
 
 /// A one-sided margin so a scrolled cursor never sits flush against the
@@ -783,14 +1043,25 @@ pub struct AppController {
     /// live under whatever directory the test handed in, so a test run never
     /// depends on -- or collides with -- a shared directory.
     scratch_root_for_test: Option<PathBuf>,
-    /// The most recent run's own failure message, taken exactly once by
+    /// Test-only override for the resident display tiles' edge, applied to
+    /// every edit session opened afterwards.
+    resident_tile_size_for_test: Option<u32>,
+    /// The most recent run or save failure, taken exactly once by
     /// [`Self::take_settled_failure`] -- what lets the failure toast
     /// announce the run that actually failed without reopening itself on
     /// every later poll.
-    settled_failure: Option<String>,
+    settled_failure: Option<job::Notification>,
+    /// Every run and save failure since the window opened, oldest first --
+    /// append-only, so a later failure replacing the toast's own slot, a
+    /// retry or a tab switch never drops what an earlier one recorded.
+    notifications: Vec<job::Notification>,
     /// The last id handed to a [`ProjectTab`] -- incremented before each
     /// use, so ids start at 1 and no two tabs ever share one.
     next_tab_id: u64,
+    /// Whether a fuse run may use the headless GPU backend at all -- `false`
+    /// by default, so a headless test controller never probes an adapter;
+    /// [`main`](crate) turns this on for the real window.
+    gpu_fusion: bool,
 }
 
 /// The single live worker, if any: the control/observer pair a background
@@ -851,6 +1122,23 @@ impl AppController {
         self.scratch_root_for_test = Some(root);
     }
 
+    /// Test-only: grids every edit session opened afterwards at `size` px
+    /// instead of the default, so a small image's strokes cross tile edges.
+    pub fn set_resident_tile_size_for_test(&mut self, size: u32) {
+        self.resident_tile_size_for_test = Some(size);
+    }
+
+    /// Drains the active tab's log of every region recomposited into its
+    /// resident display tiles since the last call; empty with no edit
+    /// session.
+    pub fn take_recomposited(&mut self) -> Vec<job::Rect> {
+        self.state
+            .active_mut()
+            .and_then(|tab| tab.edit.as_mut())
+            .map(|edit| edit.tiles.take_recomposited())
+            .unwrap_or_default()
+    }
+
     /// Where runs stage, held checkpoints wait for a save and opened
     /// projects' planes are cached: `<data dir>/scratch`, or the OS temp
     /// directory when no data directory resolves. Never beside the frames.
@@ -890,14 +1178,17 @@ impl AppController {
         if mode == ShellMode::Editor && !(self.editor_enabled() && self.ensure_edit_session()) {
             return false;
         }
+        if mode != ShellMode::Editor {
+            self.discard_live_stroke();
+        }
         self.state.mode = mode;
         self.emit(ShellEvent::ModeChanged(mode));
         true
     }
 
-    /// Opens the active tab's edit session over its whole Z-Map unless the
-    /// tab already holds one. `false` with no active tab, or when its Z-Map
-    /// fails to materialize or open.
+    /// Opens the active tab's edit session over its whole Z-Map and its own
+    /// frames unless the tab already holds one. `false` with no active tab,
+    /// or when its Z-Map or its frames fail to materialize or open.
     fn ensure_edit_session(&mut self) -> bool {
         if self.state.active().is_some_and(|tab| tab.edit.is_some()) {
             return true;
@@ -905,14 +1196,45 @@ impl AppController {
         let Some((_, zmap)) = self.materialize_active_tab_planes() else {
             return false;
         };
-        let Ok(session) = job::open_edit_session(&zmap) else {
+        let Some(tab) = self.state.active() else {
+            return false;
+        };
+        let frames = tab.frames.clone();
+        // `can_edit` guarantees `tab.frames` equals the fused sources, in
+        // the same order, by the time editor mode is entered -- so indexing
+        // `registration`'s per-frame transforms by position here matches.
+        let Some((_, registration)) = tab.fused() else {
+            return false;
+        };
+        let tile_size = self
+            .resident_tile_size_for_test
+            .unwrap_or(job::RESIDENT_TILE_SIZE);
+        let Ok(edit) =
+            job::open_edit_session(&zmap, &frames, registration, tile_size, job::host_budget())
+        else {
             return false;
         };
         let Some(tab) = self.state.active_mut() else {
             return false;
         };
-        tab.edit = Some(session);
+        tab.edit = Some(edit);
         true
+    }
+
+    /// Discards the active tab's own in-progress stroke, if any: restores
+    /// its preview and drops it, so leaving the editor or switching tab
+    /// mid-drag never leaves a preview outstanding on a tab nobody is
+    /// drawing on anymore.
+    fn discard_live_stroke(&mut self) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(edit) = tab.edit.as_mut() else {
+            return;
+        };
+        if edit.stroke.take().is_some() {
+            edit.session.discard_preview();
+        }
     }
 
     /// Whether the active tab can enter editor mode -- pure and I/O-free,
@@ -924,13 +1246,60 @@ impl AppController {
 
     /// The active tab's own edit session, once editor mode has opened one.
     pub fn edit_session(&self) -> Option<&job::EditSession> {
-        self.state.active()?.edit.as_ref()
+        Some(&self.state.active()?.edit.as_ref()?.session)
     }
 
     /// Mutable twin of [`Self::edit_session`] -- the seam an editor op
     /// appends through.
     pub fn edit_session_mut(&mut self) -> Option<&mut job::EditSession> {
-        self.state.active_mut()?.edit.as_mut()
+        Some(&mut self.state.active_mut()?.edit.as_mut()?.session)
+    }
+
+    /// The active tab's edited view for the renderer's overlay -- `None`
+    /// before an edit session has opened.
+    pub fn edited_view(&self) -> Option<crate::canvas::EditedView<'_>> {
+        let edit = self.state.active()?.edit.as_ref()?;
+        Some(crate::canvas::EditedView {
+            indices: edit.session.indices(),
+            map_width: edit.session.tile().width,
+            tiles: &edit.tiles,
+        })
+    }
+
+    /// The bottom bar's overlay controls.
+    pub fn overlay_view(&self) -> OverlayView {
+        OverlayView {
+            on: self.state.overlay.on,
+            opacity: self.state.overlay.opacity,
+        }
+    }
+
+    /// Turns the `Composite` pane's rainbow overlay on or off.
+    pub fn set_overlay_on(&mut self, on: bool) {
+        self.state.overlay.on = on;
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Sets the overlay's opacity, `0.0..=1.0`, clamped.
+    pub fn set_overlay_opacity_fraction(&mut self, fraction: f32) {
+        self.state.overlay.opacity = fraction.clamp(0.0, 1.0);
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// The `Composite` pane's overlay draw parameters, matching
+    /// `focusforge-cli retouch --overlay --opacity`'s own blend -- `None`
+    /// outside editor mode, with the overlay off, or before an edit session
+    /// has opened.
+    pub fn overlay_draw(&self) -> Option<OverlayDraw> {
+        if self.mode() != ShellMode::Editor || !self.state.overlay.on {
+            return None;
+        }
+        let tab = self.state.active()?;
+        tab.edit.as_ref()?;
+        Some(OverlayDraw::for_opacity(
+            tab.frames.len() as u32,
+            self.state.overlay.opacity,
+        ))
     }
 
     /// In editor mode, gives a newly active editable tab its own edit
@@ -943,6 +1312,7 @@ impl AppController {
         if self.state.mode == ShellMode::Editor
             && !(self.editor_enabled() && self.ensure_edit_session())
         {
+            self.discard_live_stroke();
             self.state.mode = ShellMode::Stacking;
             self.emit(ShellEvent::ModeChanged(ShellMode::Stacking));
         }
@@ -1071,7 +1441,8 @@ impl AppController {
     /// The viewport half of dispatch: `ZoomAtCursor`
     /// spends the wheel's accumulated delta into ladder steps about the
     /// cursor; `PanHorizontal` and the drag-driven `Pan` both read straight
-    /// into [`crate::viewport::Viewport::pan_by`].
+    /// into [`crate::viewport::Viewport::pan_by`]. The editor half: the two
+    /// brush wheels, undo/redo, the pipette's click and the paint drag.
     fn apply_action(&mut self, event: &ActionEvent) {
         match *event {
             ActionEvent::Fired {
@@ -1087,42 +1458,471 @@ impl AppController {
                 dx,
                 dy,
             } => self.pan_viewport(dx, dy),
+            ActionEvent::Fired {
+                action: Action::StepSourceFrame,
+                steps,
+            } => self.step_source_frame(steps),
+            ActionEvent::Fired {
+                action: Action::BrushSize,
+                steps,
+            } => self.adjust_brush_size(steps),
+            ActionEvent::Fired {
+                action: Action::BrushSoftness,
+                steps,
+            } => self.adjust_brush_softness(steps),
+            ActionEvent::Fired {
+                action: Action::Undo,
+                ..
+            } => self.undo(),
+            ActionEvent::Fired {
+                action: Action::Redo,
+                ..
+            } => self.redo(),
+            ActionEvent::Fired {
+                action: Action::PickSourceUnderPointer,
+                ..
+            } => self.pick_source_under_pointer(),
+            ActionEvent::Start {
+                action: Action::Paint,
+                x,
+                y,
+            } => self.paint_start(x, y),
+            ActionEvent::Update {
+                action: Action::Paint,
+                dx,
+                dy,
+            } => self.paint_update(dx, dy),
+            ActionEvent::End {
+                action: Action::Paint,
+            } => self.paint_end(),
             _ => {}
         }
     }
 
-    /// Spends `steps` into whole 60 px ladder units, anchored at the last
-    /// known cursor position -- one stop per accumulated 60 px. The
-    /// accumulator resets on a sign change, so reversing direction never
-    /// burns a leftover.
-    fn zoom_wheel(&mut self, steps: f32) {
+    /// Spends `steps` of `action`'s own wheel gesture into whole 60 px
+    /// detents, anchored at the last known cursor position. The accumulator
+    /// resets on a sign change and whenever `action` differs from the
+    /// previous call's, so reversing direction, or switching from one
+    /// wheel-bound action to another, never burns a leftover.
+    fn wheel_detents(&mut self, action: Action, steps: f32) -> i32 {
         const DETENT: f32 = 60.0;
-        let Some((left, _)) = self.state.panes else {
-            return;
-        };
-        let anchor = self.anchor();
-
+        if self.state.input.last_wheel_action != Some(action) {
+            self.state.input.wheel_accum = 0.0;
+            self.state.input.last_wheel_action = Some(action);
+        }
         let accum = &mut self.state.input.wheel_accum;
         if *accum != 0.0 && accum.signum() != steps.signum() {
             *accum = 0.0;
         }
         *accum += steps;
+        let mut detents = 0;
+        while accum.abs() >= DETENT {
+            let dir = if *accum > 0.0 { 1 } else { -1 };
+            *accum -= DETENT * dir as f32;
+            detents += dir;
+        }
+        detents
+    }
 
-        while self.state.input.wheel_accum.abs() >= DETENT {
-            let dir = if self.state.input.wheel_accum > 0.0 {
-                1
-            } else {
-                -1
-            };
-            self.state.input.wheel_accum -= DETENT * dir as f32;
+    /// One ladder step per accumulated 60 px, about the last known cursor
+    /// position.
+    fn zoom_wheel(&mut self, steps: f32) {
+        let Some((left, _)) = self.state.panes else {
+            return;
+        };
+        let anchor = self.anchor();
+        let detents = self.wheel_detents(Action::ZoomAtCursor, steps);
+        let dir = detents.signum();
+        for _ in 0..detents.unsigned_abs() {
             let Some(tab) = self.state.active_mut() else {
                 return;
             };
-            let Some(image) = tab.image else { return };
+            let Some(image) = display_image(tab) else {
+                return;
+            };
             if let Some(viewport) = tab.viewport.as_mut() {
                 viewport.zoom_steps(dir, anchor, image, left);
             }
         }
+    }
+
+    /// `Ctrl + Wheel` over the canvas, or a plain wheel over the `Images`
+    /// list ([`Self::images_list_wheel`]): steps the left pane's selected
+    /// frame, clamped to the frame list. In editor mode this is also the
+    /// brush source, which reads `tab.selected` directly
+    /// ([`AppController::brush_source`]).
+    fn step_source_frame(&mut self, steps: f32) {
+        // Negated: scrolling toward the user (positive `steps`) steps to an
+        // earlier frame, matching how the `Images` list itself scrolls.
+        let detents = self.wheel_detents(Action::StepSourceFrame, -steps);
+        if detents == 0 {
+            return;
+        }
+        let Some(tab) = self.state.active() else {
+            return;
+        };
+        let len = tab.frames.len();
+        if len == 0 {
+            return;
+        }
+        let next = (tab.selected as i32 + detents).clamp(0, len as i32 - 1) as usize;
+        self.select_frame(next);
+    }
+
+    /// A plain wheel over the `Images` list: the same effect `Ctrl + Wheel`
+    /// over the canvas has (`step_source_frame`) -- not gated on `Ctrl`,
+    /// `legend` or `mutable`, so it works identically in stacking and editor
+    /// mode.
+    pub fn images_list_wheel(&mut self, steps: f32) {
+        self.step_source_frame(steps);
+    }
+
+    /// The active tab's fused image's shorter side -- `Size`'s ceiling.
+    /// `1` with no active tab or nothing fused yet, so the log-scale slider
+    /// formulas never divide by zero.
+    fn brush_size_ceiling(&self) -> u32 {
+        self.state
+            .active()
+            .and_then(fused_image_size)
+            .map(|image| image.width.min(image.height))
+            .unwrap_or(1)
+    }
+
+    /// `Shift + Wheel` in editor mode: one detent multiplies or divides
+    /// `Size` by `2^(1/4)`, clamped to `1..=ceiling`.
+    fn adjust_brush_size(&mut self, steps: f32) {
+        let detents = self.wheel_detents(Action::BrushSize, steps);
+        if detents == 0 {
+            return;
+        }
+        let ceiling = self.brush_size_ceiling();
+        let factor = 2f32.powf(0.25 * detents as f32);
+        self.state.brush.size = (self.state.brush.size * factor).clamp(1.0, ceiling as f32);
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// `Alt + Wheel` in editor mode: one detent moves `Soft` by 5 points,
+    /// clamped to `0..=100`.
+    fn adjust_brush_softness(&mut self, steps: f32) {
+        let detents = self.wheel_detents(Action::BrushSoftness, steps);
+        if detents == 0 {
+            return;
+        }
+        self.state.brush.soft = (self.state.brush.soft + 5.0 * detents as f32).clamp(0.0, 100.0);
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// The editor toolbar's brush readout.
+    pub fn brush_toolbar_view(&self) -> BrushToolbarView {
+        let ceiling = self.brush_size_ceiling();
+        let size = self.state.brush.size.clamp(1.0, ceiling as f32);
+        BrushToolbarView {
+            size,
+            size_ceiling: ceiling,
+            size_fraction: fraction_from_size(size, ceiling),
+            soft: self.state.brush.soft,
+            soft_fraction: self.state.brush.soft / 100.0,
+            picking: self.state.brush.picking,
+            can_undo: self.edit_session().is_some_and(job::EditSession::can_undo),
+            can_redo: self.edit_session().is_some_and(job::EditSession::can_redo),
+        }
+    }
+
+    /// The brush cursor overlay's own view: extent and path commands built from the current brush
+    /// size/softness scaled to on-screen px by the active tab's own viewport, the pipette's own
+    /// preview colour -- the Z-Map index under the pointer while armed or while `Alt` is held, the
+    /// selected source otherwise -- and `mirror_dx`, the offset that carries either pane's cursor
+    /// onto the other. `None` with no active tab, viewport or pane geometry, or while
+    /// [`Self::canvas_blocked`] holds.
+    pub fn brush_cursor_view(&self) -> Option<BrushCursorView> {
+        if self.canvas_blocked() {
+            return None;
+        }
+        let tab = self.state.active()?;
+        let viewport = tab.viewport.as_ref()?;
+        let (left, right) = self.state.panes?;
+        let (radius, softness) = self.brush_radius_softness();
+        let scale = viewport.scale() as f32;
+        let paths = brush::cursor_paths(radius * scale, softness);
+        let sources = tab.frames.len().max(1) as u32;
+        let picking = self.state.brush.picking || self.state.input.alt_held;
+        let hovered = picking
+            .then(|| self.source_index_at(self.anchor()))
+            .flatten()
+            .filter(|&source| source != job::NO_SOURCE);
+        let source = hovered.unwrap_or_else(|| u16::try_from(tab.selected).unwrap_or(u16::MAX));
+        Some(BrushCursorView {
+            extent: paths.extent,
+            ring_commands: paths.ring,
+            core_commands: paths.core,
+            picking,
+            pick_color: job::source_color(source, sources),
+            mirror_dx: right.x - left.x,
+        })
+    }
+
+    /// The slider's own callback: `fraction` is `0.0..=1.0` along the
+    /// logarithmic track.
+    pub fn set_brush_size_fraction(&mut self, fraction: f32) {
+        let ceiling = self.brush_size_ceiling();
+        self.state.brush.size = size_from_fraction(fraction, ceiling);
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// The slider's own callback: `fraction` is `0.0..=1.0` along the linear
+    /// track.
+    pub fn set_brush_softness_fraction(&mut self, fraction: f32) {
+        self.state.brush.soft = fraction.clamp(0.0, 1.0) * 100.0;
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Toggles the pipette's armed state.
+    pub fn toggle_pipette(&mut self) {
+        self.state.brush.picking = !self.state.brush.picking;
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// The brush's radius and softness in the storage units core's retouch
+    /// ops take -- the one conversion point from the toolbar's display
+    /// conventions.
+    fn brush_radius_softness(&self) -> (f32, f32) {
+        let ceiling = self.brush_size_ceiling();
+        let size = self.state.brush.size.clamp(1.0, ceiling as f32);
+        (size / 2.0, self.state.brush.soft / 100.0)
+    }
+
+    /// `Ctrl + Z`: steps the active tab's edit session back one op and
+    /// recomposites the region it returns. Ignored while a stroke is live.
+    pub fn undo(&mut self) {
+        self.undo_or_redo(job::EditSession::undo);
+    }
+
+    /// `Ctrl + Shift + Z`: re-applies the most recently undone op and
+    /// recomposites the region it returns. Ignored while a stroke is live.
+    pub fn redo(&mut self) {
+        self.undo_or_redo(job::EditSession::redo);
+    }
+
+    /// Shared by [`Self::undo`]/[`Self::redo`]: `step` is whichever of the
+    /// two returns `Some` (`None` inside meaning nothing visibly changed) or
+    /// `None` when there was nothing to step. A no-op while a stroke is
+    /// live.
+    fn undo_or_redo(&mut self, step: fn(&mut job::EditSession) -> Option<Option<job::Rect>>) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(edit) = tab.edit.as_mut() else {
+            return;
+        };
+        if edit.stroke.is_some() {
+            return;
+        }
+        let Some(region) = step(&mut edit.session) else {
+            return;
+        };
+        if let Some(region) = region
+            && let Err(err) = edit.recomposite(region)
+        {
+            tracing::error!(error = %err, "undo/redo recomposite failed");
+        }
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Reads the Z-Map index under `local` (pane-local coordinates) --
+    /// shared by [`Self::pick_source_at`] (which commits it as the brush
+    /// source) and [`Self::brush_cursor_view`] (which only previews its
+    /// colour). `None` off the image, off the active tab's tile, or with
+    /// nothing to read; callers decide what `NO_SOURCE` means to them.
+    fn source_index_at(&self, local: (f32, f32)) -> Option<u16> {
+        let tab = self.state.active()?;
+        let viewport = tab.viewport.as_ref()?;
+        let (sx, sy) = viewport.to_source(local);
+        if sx < 0.0 || sy < 0.0 {
+            return None;
+        }
+        let (x, y) = (sx.floor() as u32, sy.floor() as u32);
+        let session = tab.edit.as_ref().map(|edit| &edit.session)?;
+        let tile = session.tile();
+        if x >= tile.width || y >= tile.height {
+            return None;
+        }
+        let idx = (y * tile.width + x) as usize;
+        session.indices().get(idx).copied()
+    }
+
+    /// `Alt + click`, or the armed pipette's `Start`: reads the Z-Map index
+    /// under `local` (pane-local coordinates) and makes it the brush source.
+    /// `NO_SOURCE` and a point off the image leave the source unchanged.
+    fn pick_source_at(&mut self, local: (f32, f32)) {
+        let Some(source) = self.source_index_at(local) else {
+            return;
+        };
+        if source == job::NO_SOURCE {
+            return;
+        }
+        self.select_frame(source as usize);
+    }
+
+    /// `Alt + click`: picks without arming the pipette.
+    fn pick_source_under_pointer(&mut self) {
+        let local = self.anchor();
+        self.pick_source_at(local);
+    }
+
+    /// `Paint`'s `Start`. With the pipette armed, this is a pick that also
+    /// disarms it, and the rest of the drag is ignored (no
+    /// [`job::EditState::stroke`] is opened, so [`Self::paint_update`] has
+    /// nothing to push into). Otherwise, inside
+    /// the right pane only, opens a stroke at the pointer's source position,
+    /// freezing the brush's source, radius and softness for the stroke.
+    fn paint_start(&mut self, x: f32, y: f32) {
+        if self.state.brush.picking {
+            let local = self.anchor();
+            self.pick_source_at(local);
+            self.state.brush.picking = false;
+            self.emit(ShellEvent::EditorChanged);
+            return;
+        }
+        let Some((_, right)) = self.state.panes else {
+            return;
+        };
+        if !pane_contains(right, x, y) {
+            return;
+        }
+        let Some(source) = self.brush_source() else {
+            return;
+        };
+        let (radius, softness) = self.brush_radius_softness();
+        let local = (x - right.x, y - right.y);
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(viewport) = tab.viewport.as_ref() else {
+            return;
+        };
+        let (sx, sy) = viewport.to_source(local);
+        let Some(edit) = tab.edit.as_mut() else {
+            return;
+        };
+        edit.stroke = Some(brush::LiveStroke::new(
+            source,
+            radius,
+            softness,
+            sx as f32 - 0.5,
+            sy as f32 - 0.5,
+        ));
+    }
+
+    /// `Paint`'s `Update`: integrates a screen-space delta into the live
+    /// stroke's image-space trace. A no-op with no live stroke (a pipette
+    /// pick's drag, or a stroke that started outside the right pane).
+    fn paint_update(&mut self, dx: f32, dy: f32) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(viewport) = tab.viewport.as_ref() else {
+            return;
+        };
+        let scale = viewport.scale() as f32;
+        let Some(stroke) = tab.edit.as_mut().and_then(|edit| edit.stroke.as_mut()) else {
+            return;
+        };
+        stroke.push(dx / scale, dy / scale);
+    }
+
+    /// Called by every repaint before it reads anything else: takes the
+    /// active tab's live stroke's newest segment, if any, previews it and
+    /// recomposites exactly that segment's footprint into the resident
+    /// tiles -- one tick per repaint, never per motion event. A no-op with
+    /// no live stroke or no motion since the last flush.
+    pub fn flush_live_stroke(&mut self) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(edit) = tab.edit.as_mut() else {
+            return;
+        };
+        let Some(stroke) = edit.stroke.as_mut() else {
+            return;
+        };
+        let Some(segment) = stroke.take_segment() else {
+            return;
+        };
+        let op = job::Op::BrushStroke {
+            source_id: stroke.source(),
+            path: segment,
+            radius: stroke.radius(),
+            softness: stroke.softness(),
+        };
+        let region = edit
+            .session
+            .preview(&op)
+            .expect("a live stroke's own points are pre-clamped to what validate accepts");
+        let Some(region) = region else {
+            return;
+        };
+        if let Err(err) = edit.recomposite(region) {
+            tracing::error!(error = %err, "live-stroke preview recomposite failed");
+            return;
+        }
+        edit.stroke
+            .as_mut()
+            .expect("the stroke that produced this tick is still live")
+            .tick_rects
+            .push(region);
+    }
+
+    /// `Paint`'s `End`: flushes remaining motion, discards the preview, then
+    /// appends the stroke's resampled path unless its footprint is empty or
+    /// off-image. Recomposites the tick rects (dilated), or the appended
+    /// region itself when no tick fired (a press-release with no motion).
+    fn paint_end(&mut self) {
+        self.flush_live_stroke();
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(edit) = tab.edit.as_mut() else {
+            return;
+        };
+        edit.session.discard_preview();
+        let Some(stroke) = edit.stroke.take() else {
+            return;
+        };
+        let op = job::Op::BrushStroke {
+            source_id: stroke.source(),
+            path: stroke.finish(),
+            radius: stroke.radius(),
+            softness: stroke.softness(),
+        };
+        let has_footprint = job::footprint(&op, edit.session.info())
+            .ok()
+            .flatten()
+            .is_some();
+        if !has_footprint {
+            return;
+        }
+        let radius = stroke.radius();
+        let tick_rects = stroke.tick_rects;
+        let region = edit
+            .session
+            .append(op)
+            .expect("a live stroke's own points are pre-clamped to what validate accepts");
+        let Some(region) = region else { return };
+        let map = edit.session.tile();
+        if tick_rects.is_empty() {
+            if let Err(err) = edit.recomposite(region) {
+                tracing::error!(error = %err, "brush-stroke commit recomposite failed");
+            }
+        } else {
+            let margin = (radius / 8.0).ceil() as u32 + 2;
+            for rect in tick_rects {
+                let dilated = dilate_rect(rect, margin, map.width, map.height);
+                if let Err(err) = edit.recomposite(dilated) {
+                    tracing::error!(error = %err, "brush-stroke commit recomposite failed");
+                }
+            }
+        }
+        self.emit(ShellEvent::EditorChanged);
     }
 
     /// A screen-pixel pan on whichever pane the cursor is over -- both
@@ -1135,7 +1935,9 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        let Some(image) = tab.image else { return };
+        let Some(image) = display_image(tab) else {
+            return;
+        };
         let Some(viewport) = tab.viewport.as_mut() else {
             return;
         };
@@ -1176,7 +1978,7 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        let Some(image) = tab.image else {
+        let Some(image) = display_image(tab) else {
             return;
         };
         match tab.viewport.as_mut() {
@@ -1196,7 +1998,7 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        if let (Some(image), None) = (tab.image, &tab.viewport) {
+        if let (Some(image), None) = (display_image(tab), &tab.viewport) {
             tab.viewport = Some(crate::viewport::fit(image, left));
         }
     }
@@ -1219,7 +2021,9 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        let Some(image) = tab.image else { return };
+        let Some(image) = display_image(tab) else {
+            return;
+        };
         let Some(viewport) = tab.viewport.as_mut() else {
             return;
         };
@@ -1236,7 +2040,9 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        let Some(image) = tab.image else { return };
+        let Some(image) = display_image(tab) else {
+            return;
+        };
         tab.viewport = Some(crate::viewport::fit(image, left));
     }
 
@@ -1257,7 +2063,7 @@ impl AppController {
             return false;
         };
         let (Some(image), Some((left, _)), Some(viewport)) =
-            (tab.image, self.state.panes, tab.viewport.as_ref())
+            (display_image(tab), self.state.panes, tab.viewport.as_ref())
         else {
             return false;
         };
@@ -1271,7 +2077,7 @@ impl AppController {
             return false;
         };
         let (Some(image), Some((left, _)), Some(viewport)) =
-            (tab.image, self.state.panes, tab.viewport.as_ref())
+            (display_image(tab), self.state.panes, tab.viewport.as_ref())
         else {
             return false;
         };
@@ -1285,30 +2091,21 @@ impl AppController {
     /// frame size is known, or before the first pane geometry arrives.
     pub fn frame_draw(&self) -> Option<PaneDraw> {
         let tab = self.state.active()?;
-        let image = tab.image?;
+        let image = display_image(tab)?;
         let (left, _) = self.state.panes?;
         tab.viewport.as_ref()?.draw(image, left)
     }
 
     /// The active tab's viewport's visible source rect and its pane-local
     /// projection over the newest composite/Z-Map's own extent -- the
-    /// newest held checkpoint's, else the opened project's -- for
-    /// `crate::gpu_canvas::CanvasRenderer::redraw_planes` and the right
-    /// `FFPane`'s placement properties. `None` while no tab is active, the
-    /// tab has no checkpoint yet, or before the first pane geometry arrives.
+    /// newest held checkpoint's, else the opened project's, else (before any
+    /// fuse) the raw frame's own, the same `display_image` `frame_draw`
+    /// uses -- for `crate::gpu_canvas::CanvasRenderer::redraw_planes` and the
+    /// right `FFPane`'s placement properties. `None` while no tab is active
+    /// or before the first pane geometry arrives.
     pub fn plane_draw(&self) -> Option<PaneDraw> {
         let tab = self.state.active()?;
-        let image = match (tab.held.last(), &tab.project) {
-            (Some(held), _) => ImageSize {
-                width: held.width,
-                height: held.height,
-            },
-            (None, GuiProject::Opened(project)) => ImageSize {
-                width: project.manifest().composite.width,
-                height: project.manifest().composite.height,
-            },
-            (None, GuiProject::Unsaved(_)) => return None,
-        };
+        let image = display_image(tab)?;
         let (_, right) = self.state.panes?;
         tab.viewport.as_ref()?.draw(image, right)
     }
@@ -1321,9 +2118,9 @@ impl AppController {
     /// `mouse-x`/`mouse-y` before `scroll-event` is invoked.
     pub fn wheel(&mut self, delta_x: f32, delta_y: f32, x: f32, y: f32, mods: Modifiers) {
         // Every wheel-triggered action -- zoom, pan, anything else a table
-        // row binds to `Trigger::Wheel` -- stays off under the Settings
-        // modal.
-        if self.state.settings_open {
+        // row binds to `Trigger::Wheel` -- stays off while the canvas is
+        // blocked.
+        if self.canvas_blocked() {
             return;
         }
         self.state.input.last_pointer = (x, y);
@@ -1341,9 +2138,14 @@ impl AppController {
     /// cancelled grab is forwarded here as `PointerKind::Up` so a live drag
     /// never gets stuck on). `Down` starts a drag on a
     /// `Trigger::Drag` hit or fires once on a `Trigger::Click` hit; `Up`
-    /// ends any live drag.
+    /// ends any live drag. While the canvas is blocked, `Down` starts no
+    /// drag and fires no click, but `Up` still ends whatever drag was
+    /// already live, so nothing sticks on once the modal opened mid-stroke.
     pub fn pointer(&mut self, kind: PointerKind, button: Button, x: f32, y: f32, mods: Modifiers) {
         self.state.input.last_pointer = (x, y);
+        if self.canvas_blocked() && kind != PointerKind::Up {
+            return;
+        }
         match kind {
             PointerKind::Down => {
                 let drag_trigger = Trigger::Drag { button, mods };
@@ -1382,14 +2184,20 @@ impl AppController {
             // including the first movement of a drag. It carries no motion
             // of its own; `pointer_moved` is the real motion source, so a
             // live drag must not end here.
-            PointerKind::Move => {}
+            PointerKind::Move => self.state.input.alt_held = mods.alt,
         }
     }
 
     /// Meaningful only while a drag is live. Deltas are differences
     /// between successive positions -- `PointerEvent` carries no movement
-    /// delta of its own (slint-ui/slint#13189).
+    /// delta of its own (slint-ui/slint#13189). While the canvas is
+    /// blocked, a live drag commits no further stamp -- it stays live, so
+    /// the next `pointer` `Up` still ends it, just with nothing added since
+    /// the modal opened.
     pub fn pointer_moved(&mut self, x: f32, y: f32) {
+        if self.canvas_blocked() {
+            return;
+        }
         let Some(drag) = &mut self.state.input.drag else {
             return;
         };
@@ -1406,25 +2214,23 @@ impl AppController {
     /// The one entry point for both key callbacks. `" "` sets/clears
     /// `space_held` (idempotent, absorbing a held key's auto-repeat) and
     /// resolves no row of its own; any other press looks up
-    /// `Trigger::Key { key, mods }` -- a release resolves nothing.
+    /// `Trigger::Key { key, mods }` -- a release resolves nothing. `text` is
+    /// lowercased before the lookup: `Trigger::Key`'s `key` is always the
+    /// unshifted character, and Slint reports `"Z"` for `Ctrl+Shift+Z`.
     pub fn key(&mut self, pressed: bool, text: &str, mods: Modifiers) {
         if text == " " {
             self.set_space_held(pressed);
             return;
         }
-        if !pressed {
+        if !pressed || self.canvas_blocked() {
             return;
         }
-        let Some(key) = text.chars().next() else {
+        let lowered = text.to_lowercase();
+        let Some(key) = lowered.chars().next() else {
             return;
         };
         let trigger = Trigger::Key { key, mods };
         if let Some(action) = self.state.input.table.action(&trigger, self.state.mode) {
-            // Undo and redo stay off under the Settings modal, whatever key
-            // they are bound to.
-            if self.state.settings_open && matches!(action, Action::Undo | Action::Redo) {
-                return;
-            }
             self.emit_action(ActionEvent::Fired { action, steps: 0.0 });
         }
     }
@@ -1437,10 +2243,11 @@ impl AppController {
         self.state.input.space_held
     }
 
-    /// Called on focus loss so a Space held across an alt-tab does not
-    /// latch (slint-ui/slint#6263).
+    /// Called on focus loss so a Space or Alt held across an alt-tab does
+    /// not latch (slint-ui/slint#6263).
     pub fn clear_input_modifiers(&mut self) {
         self.state.input.space_held = false;
+        self.state.input.alt_held = false;
     }
 
     pub fn input_rows(&self) -> Vec<InputRowView> {
@@ -1479,6 +2286,26 @@ impl AppController {
     pub fn close_settings(&mut self) -> bool {
         self.state.settings_open = false;
         false
+    }
+
+    /// Whether one of the six dialogs that block the chrome accelerators is
+    /// open: Settings, the close/quit guard, the frame-set warning, the
+    /// Keep/Discard divergence dialog, the grouping question or the refusal
+    /// dialog.
+    pub fn modal_open(&self) -> bool {
+        self.state.settings_open
+            || self.state.pending_close.is_some()
+            || self.state.pending_quit
+            || self.state.pending_frame_change.is_some()
+            || self.pending_divergence().is_some()
+            || self.state.pending.is_some()
+            || self.state.refusal_open
+    }
+
+    /// Whether the canvas and the dock beneath it are blocked: a dialog from
+    /// [`Self::modal_open`] is open, or the Projects overlay is.
+    pub fn canvas_blocked(&self) -> bool {
+        self.modal_open() || self.state.overlay_open
     }
 
     // -- The entry path: the picker, the drop route and `--open` all call
@@ -1639,6 +2466,11 @@ impl AppController {
         self.state.last_refusal.as_deref()
     }
 
+    /// Closes the refusal dialog -- its own "Pick another folder…" button.
+    pub fn dismiss_refusal(&mut self) {
+        self.state.refusal_open = false;
+    }
+
     /// `thumbnails` are the pictures the load's own worker already decoded
     /// for `outcome`'s own projects -- both [`Self::open_paths`] and
     /// [`Self::answer_question`] decode on their worker before parking the
@@ -1666,9 +2498,9 @@ impl AppController {
     /// records the skipped-subfolder notice. New tabs always go at the end,
     /// whether "+" or a project tab was selected.
     /// Every skipped subfolder becomes a `Not a project` card; an opened
-    /// project whose sources do not all resolve becomes a `Sources missing`
-    /// one alongside its tab; a path that opens successfully clears any card
-    /// already held for it.
+    /// project whose sources do not all resolve gets a `Sources missing`
+    /// failure on its own tab; a path that opens successfully clears any
+    /// `Not a project` card already held for it.
     fn accept(&mut self, opened: Opened, thumbnails: Vec<Preloaded>) {
         self.state.notice = notice_line(&opened.skipped);
         self.state.last_refusal = None;
@@ -1682,51 +2514,36 @@ impl AppController {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            for project in &opened.projects {
-                self.clear_failure(&project_identity_path(project));
-                self.record_recent(
-                    entry::tab_title(project),
-                    recent_folder(project),
-                    Some(project_identity_path(project)),
-                    opened_at,
-                );
-                if let GuiProject::Opened(p) = project
-                    && p.unresolved_sources().next().is_some()
-                {
-                    let path = p.path().to_path_buf();
-                    let title = p
-                        .path()
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| p.path().display().to_string());
-                    let frame_count = p.manifest().composite.frame_count as usize;
-                    self.record_failure(FailureCard {
-                        kind: FailureKind::SourcesMissing,
-                        path,
-                        title,
-                        stage: "NOTHING TO SHOW".to_string(),
-                        reason: "The project points at frames that are not where it left them."
-                            .to_string(),
-                        meta: format!(
-                            "{frame_count} {} · project found, sources not",
-                            frame_word(frame_count)
-                        ),
-                        frames: frame_count,
-                        request: None,
-                    });
-                }
-            }
             let mut thumbnails = thumbnails.into_iter();
             for project in opened.projects {
+                self.clear_failure(&project_identity_path(&project));
+                self.record_recent(
+                    entry::tab_title(&project),
+                    recent_folder(&project),
+                    Some(project_identity_path(&project)),
+                    opened_at,
+                );
+                let sources_missing = if let GuiProject::Opened(p) = &project {
+                    p.unresolved_sources().next().is_some()
+                } else {
+                    false
+                };
                 let (source, meta) = match thumbnails.next() {
                     Some((decoded, meta)) => (ThumbnailSource::Decoded(decoded), Some(meta)),
                     None => (ThumbnailSource::NotAttempted, None),
                 };
                 self.next_tab_id += 1;
                 let id = self.next_tab_id;
-                self.state
-                    .projects
-                    .push(ProjectTab::new(project, id, source, meta));
+                let mut tab = ProjectTab::new(project, id, source, meta);
+                if sources_missing {
+                    tab.failure = Some(TabFailure {
+                        kind: FailureKind::SourcesMissing,
+                        stage: "NOTHING TO SHOW".to_string(),
+                        reason: "The project points at frames that are not where it left them."
+                            .to_string(),
+                    });
+                }
+                self.state.projects.push(tab);
             }
         }
         self.settle_tab_scroll();
@@ -1757,6 +2574,7 @@ impl AppController {
     /// nothing there is an entry-path failure.
     pub fn refuse_message(&mut self, message: String) {
         self.state.last_refusal = Some(message.clone());
+        self.state.refusal_open = true;
         self.emit(ShellEvent::EntryRefused(message));
     }
 
@@ -1800,6 +2618,7 @@ impl AppController {
     /// list, not to whatever becomes active next.
     fn set_active_tab(&mut self, active: Option<usize>) {
         if self.state.active != active {
+            self.discard_live_stroke();
             self.state.pending_frame_change = None;
         }
         self.state.active = active;
@@ -2035,10 +2854,9 @@ impl AppController {
     /// `Ctrl+N/O/S/W` -- checked before [`Self::key`]'s rebindable table, so
     /// none of the five can be shadowed by a user's rebind. The four
     /// Ctrl-chords apply anywhere in the window, whether or not the overlay
-    /// is open; none of them acts while the Settings modal is open, nor
-    /// while a close question is open. `Esc` only closes an open overlay.
-    /// Every other key press reads [`ChromeKey::None`] and falls through
-    /// unchanged.
+    /// is open; none of them acts while [`Self::modal_open`] holds. `Esc`
+    /// only closes an open overlay. Every other key press reads
+    /// [`ChromeKey::None`] and falls through unchanged.
     pub fn chrome_key(&mut self, text: &str, mods: Modifiers) -> ChromeKey {
         let Some(key) = text.chars().next() else {
             return ChromeKey::None;
@@ -2057,7 +2875,7 @@ impl AppController {
         if !matches!(key, 'n' | 'o' | 's' | 'w') {
             return ChromeKey::None;
         }
-        if self.state.pending_close.is_some() || self.state.settings_open {
+        if self.modal_open() {
             return ChromeKey::Consumed;
         }
         match key {
@@ -2117,9 +2935,29 @@ impl AppController {
             let phase_line = fusing
                 .then(|| job::phase_line(&tab.run, progress.as_ref()))
                 .flatten();
+            // A live run takes priority over the failure panel; the failure
+            // stays underneath until a success clears it.
+            let showing_failure = tab.failure.as_ref().filter(|_| !job::is_live(&tab.run));
+            let (kind, headline, stage, reason, action_label) = match showing_failure {
+                Some(failure) => (
+                    failure.kind.card_kind().to_string(),
+                    failure.kind.headline().to_string(),
+                    failure.stage.clone(),
+                    failure.reason.clone(),
+                    failure.kind.action_label().to_string(),
+                ),
+                None => (
+                    "open".to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ),
+            };
             let (x, y) = overlay::card_origin(cards.len(), columns);
             cards.push(CardView {
-                kind: "open".to_string(),
+                kind,
+                opened: true,
                 current: self.state.active == Some(i),
                 unsaved: tab.unsaved(),
                 fusing,
@@ -2130,10 +2968,10 @@ impl AppController {
                 },
                 project_name: tab.title.clone(),
                 meta_text: open_card_meta(frame_count, tab.checkpoints, phase_line.as_deref()),
-                headline: String::new(),
-                stage: String::new(),
-                reason: String::new(),
-                action_label: String::new(),
+                headline,
+                stage,
+                reason,
+                action_label,
                 picture: tab.thumbnail.clone(),
                 x,
                 y,
@@ -2143,6 +2981,7 @@ impl AppController {
             let (x, y) = overlay::card_origin(cards.len(), columns);
             cards.push(CardView {
                 kind: failure.kind.card_kind().to_string(),
+                opened: false,
                 current: false,
                 unsaved: false,
                 fusing: false,
@@ -2161,15 +3000,17 @@ impl AppController {
         cards
     }
 
-    /// Records `card`, replacing any card already held for the same path.
+    /// Records a `Not a project` `card`, replacing any card already held for
+    /// the same path.
     fn record_failure(&mut self, card: FailureCard) {
         self.state.failures.retain(|c| c.path != card.path);
         self.state.failures.push(card);
         self.emit(ShellEvent::OverlayChanged);
     }
 
-    /// Clears any card held for `path` -- what a path opening successfully
-    /// does to whichever card, if any, stood for its last attempt.
+    /// Clears any `Not a project` card held for `path` -- what a path
+    /// opening successfully does to whichever such card stood for its last
+    /// attempt.
     fn clear_failure(&mut self, path: &Path) {
         let before = self.state.failures.len();
         self.state.failures.retain(|c| c.path != path);
@@ -2189,10 +3030,14 @@ impl AppController {
         self.select_project(index);
     }
 
-    /// The failure card at gallery index `index`'s own kind string, if any --
-    /// what `crate::bridge` reads before deciding whether its action needs
-    /// the folder picker.
+    /// The card at gallery index `index`'s own kind string, if it is showing
+    /// a failure -- what `crate::bridge` reads before deciding whether its
+    /// action needs the folder picker. Reads the tab's own failure for an
+    /// open project's card, the `Not a project` list for the rest.
     pub fn gallery_failure_kind(&self, index: usize) -> Option<&'static str> {
+        if let Some(tab) = self.state.projects.get(index) {
+            return tab.failure.as_ref().map(|f| f.kind.card_kind());
+        }
         let failure_index = index.checked_sub(self.state.projects.len())?;
         self.state
             .failures
@@ -2200,66 +3045,48 @@ impl AppController {
             .map(|f| f.kind.card_kind())
     }
 
-    /// `Run again` on a `Did not stack`/`Cancelled` card: re-runs that
-    /// card's own kept request, on its own tab. Refuses rather than
-    /// attributing the run to whatever tab happens to be active when that
-    /// project's tab is no longer open, and never more than one card's worth
-    /// of work: a no-op while any run is already live. Returns whether a run
-    /// started.
+    /// `Run again` on a `Did not stack`/`Cancelled` card: re-runs that tab's
+    /// own kept request. Never more than one card's worth of work: a no-op
+    /// while any run is already live, or with no matching failure, or with
+    /// no request kept for it. Returns whether a run started.
     pub fn run_gallery_action(&mut self, index: usize) -> bool {
         if self.any_job_running() {
             return false;
         }
-        let Some(failure_index) = index.checked_sub(self.state.projects.len()) else {
+        let Some(tab) = self.state.projects.get(index) else {
             return false;
         };
-        let Some(failure) = self.state.failures.get(failure_index) else {
+        let Some(failure) = &tab.failure else {
             return false;
         };
-        let Some(request) = failure.request.clone() else {
+        if !matches!(failure.kind, FailureKind::Failed | FailureKind::Cancelled) {
+            return false;
+        }
+        let Some(request) = tab.request.clone() else {
             return false;
         };
-        let path = failure.path.clone();
-        let Some(tab_index) = self
-            .state
-            .projects
-            .iter()
-            .position(|t| project_identity_path(&t.project) == path)
-        else {
-            return false;
-        };
-        self.state.active = Some(tab_index);
-        self.run_request(tab_index, request);
+        self.state.active = Some(index);
+        self.run_request(index, request);
         true
     }
 
-    /// `Locate frames…` on a `Sources missing` card: re-resolves that
-    /// project's own tab against `folder` in memory only -- no write, and no
-    /// touch of the sealed `.ffp`'s own fingerprint. Clears the card only
+    /// `Locate frames…` on a `Sources missing` card: re-resolves that tab's
+    /// own frames against `folder` in memory only -- no write, and no touch
+    /// of the sealed `.ffp`'s own fingerprint. Clears the tab's failure only
     /// once every source resolves; a folder missing some of them changes
     /// nothing, silently.
     pub fn locate_missing_sources(&mut self, index: usize, folder: PathBuf) {
-        let Some(failure_index) = index.checked_sub(self.state.projects.len()) else {
+        let Some(tab) = self.state.projects.get(index) else {
             return;
         };
-        let Some(failure) = self.state.failures.get(failure_index) else {
-            return;
-        };
-        if failure.kind != FailureKind::SourcesMissing {
-            return;
-        }
-        let path = failure.path.clone();
-        let Some(tab) = self
-            .state
-            .projects
-            .iter_mut()
-            .find(|t| project_identity_path(&t.project) == path)
-        else {
-            return;
-        };
+        let sources_missing =
+            matches!(&tab.failure, Some(f) if f.kind == FailureKind::SourcesMissing);
         let GuiProject::Opened(project) = &tab.project else {
             return;
         };
+        if !sources_missing {
+            return;
+        }
         let candidates: Vec<PathBuf> = project
             .manifest()
             .sources
@@ -2273,11 +3100,13 @@ impl AppController {
             })
             .collect();
         if candidates.iter().all(|p| p.is_file()) {
+            let tab = &mut self.state.projects[index];
             tab.meta.extend(images::read_metadata(&candidates));
             tab.excluded = vec![false; candidates.len()];
             tab.frames = candidates;
             tab.selected = images::first_included(&tab.excluded);
-            self.clear_failure(&path);
+            tab.failure = None;
+            self.emit(ShellEvent::OverlayChanged);
         }
     }
 
@@ -2657,10 +3486,17 @@ impl AppController {
     /// Builds the whole `Images` panel for the active tab -- empty with no
     /// tab active ("+" selected).
     pub fn images_panel(&self) -> images::ImagesModel {
+        let legend = self.mode() == ShellMode::Editor;
         let Some(tab) = self.state.active() else {
-            return images::build_model(&[], &[], None, &HashMap::new());
+            return images::build_model(&[], &[], None, legend, &HashMap::new());
         };
-        images::build_model(&tab.frames, &tab.excluded, Some(tab.selected), &tab.meta)
+        images::build_model(
+            &tab.frames,
+            &tab.excluded,
+            Some(tab.selected),
+            legend,
+            &tab.meta,
+        )
     }
 
     fn images_content_height(&self) -> f32 {
@@ -2714,40 +3550,174 @@ impl AppController {
         self.state.active()?.selected_frame().cloned()
     }
 
-    /// The left pane's label: the selected frame's file name, or empty with
-    /// no tab active or nothing selected.
-    pub fn frame_pane_label(&self) -> String {
-        self.selected_frame_path()
-            .map(|path| images::file_name(&path))
-            .unwrap_or_default()
+    /// The selected frame's own view onto the active tab's newest fuse --
+    /// `None` before any fuse, when the left pane draws the raw frame. The
+    /// transform is looked up by path in the fused sources, identity for a
+    /// frame added to the tab after its last fuse.
+    pub fn selected_frame_view(&self) -> Option<FrameView> {
+        let tab = self.state.active()?;
+        let (sources, registration) = tab.fused()?;
+        let path = tab.selected_frame()?;
+        let transform = sources
+            .iter()
+            .position(|source| source == path)
+            .map(|i| registration.transform(i))
+            .unwrap_or_else(job::Transform::identity);
+        let extent = display_image(tab)?;
+        Some(FrameView {
+            transform,
+            origin: registration.origin(),
+            extent: (extent.width, extent.height),
+        })
     }
 
-    /// Adds `paths` to the active tab's frame list, appended in the order
-    /// given -- immediately, before the first checkpoint; behind the counted
-    /// warning once one exists. A no-op outside stacking mode or while this
-    /// tab's own job is running.
-    pub fn add_frames(&mut self, paths: &[PathBuf]) {
-        if self.mode() != ShellMode::Stacking
-            || paths.is_empty()
-            || self.state.active().is_none()
+    /// The left pane's label: the selected frame's file name, or empty with
+    /// no tab active or nothing selected. In editor mode, appends the
+    /// brush source's own position, 1-based, out of the tab's frame count
+    /// (`tab.selected` is also the brush source).
+    pub fn frame_pane_label(&self) -> String {
+        let Some(name) = self
+            .selected_frame_path()
+            .map(|path| images::file_name(&path))
+        else {
+            return String::new();
+        };
+        if self.mode() != ShellMode::Editor {
+            return name;
+        }
+        let tab = self
+            .state
+            .active()
+            .expect("selected_frame_path returned Some, so an active tab exists");
+        format!(
+            "{name} · source {} of {}",
+            tab.selected + 1,
+            tab.frames.len()
+        )
+    }
+
+    /// Adds `paths` to the active tab: hashes on a worker thread, then
+    /// [`Self::settle_import`] applies the scan. An [`ImportRefused`] leaves
+    /// the tab untouched.
+    pub fn add_frames(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> Result<Option<std::thread::JoinHandle<()>>, ImportRefused> {
+        let Some(tab) = self.state.active() else {
+            return Ok(None);
+        };
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        if self.mode() != ShellMode::Stacking {
+            return Err(ImportRefused::NotStacking);
+        }
+        if self.job_running() {
+            return Err(ImportRefused::JobRunning);
+        }
+        if self.state.import.in_flight {
+            return Err(ImportRefused::StillChecking);
+        }
+        let incoming = entry::expand_import(paths)?;
+        let tab_id = tab.id;
+        let frames = tab.frames.clone();
+
+        self.state.import.in_flight = true;
+        let sink = self.sink.clone();
+        let outcome_slot = Arc::clone(&self.state.import.outcome);
+        Ok(Some(std::thread::spawn(move || {
+            let (add, replace) = entry::diff_import(&frames, incoming);
+            *outcome_slot
+                .lock()
+                .expect("no thread panicked while holding the import outcome") = Some(ImportScan {
+                tab_id,
+                frames,
+                add,
+                replace,
+            });
+            if let Some(sink) = &sink {
+                sink(ShellEvent::ImportReady);
+            }
+        })))
+    }
+
+    /// Adds a drop to the active tab through [`Self::add_frames`]; with no
+    /// active tab, or for a lone saved project, opens it through
+    /// [`Self::open_paths`] instead.
+    pub fn drop_paths(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> Result<Option<std::thread::JoinHandle<()>>, ImportRefused> {
+        if self.state.active().is_some() && !entry::is_lone_project(paths) {
+            return self.add_frames(paths);
+        }
+        Ok(self.open_paths(paths))
+    }
+
+    /// Applies the scan [`Self::add_frames`] parked, only to the tab it
+    /// scanned and only while that tab is active, idle in Stacking mode and
+    /// its frame list unchanged; otherwise discards it.
+    pub fn settle_import(&mut self) {
+        let Some(scan) = self
+            .state
+            .import
+            .outcome
+            .lock()
+            .expect("no thread panicked while holding the import outcome")
+            .take()
+        else {
+            return;
+        };
+        self.state.import.in_flight = false;
+        let Some(index) = self.tab_index(scan.tab_id) else {
+            return;
+        };
+        if self.state.active != Some(index)
+            || self.mode() != ShellMode::Stacking
             || self.job_running()
+            || self.state.projects[index].frames != scan.frames
         {
             return;
         }
-        if self.frame_change_checkpoints() > 0 {
-            self.state.pending_frame_change = Some(PendingFrameChange::Add(paths.to_vec()));
+        let plan = ImportPlan {
+            add: scan.add,
+            replace: scan.replace,
+        };
+        if plan.replace.is_empty() {
+            self.stage_import(plan);
         } else {
-            self.apply_add_frames(paths);
+            self.state.pending_frame_change = Some(PendingFrameChange::Duplicates(plan));
+            self.emit(ShellEvent::ImagesChanged);
+        }
+    }
+
+    /// Stages a conflict-free import: nothing for an empty plan, the counted
+    /// "Add and re-fuse" warning once a checkpoint exists, or applies at
+    /// once before the first one. Always emits `ImagesChanged`, so an
+    /// answered duplicate question closes even when its plan is empty.
+    fn stage_import(&mut self, plan: ImportPlan) {
+        if !plan.is_empty() {
+            if self.frame_change_checkpoints() > 0 {
+                self.state.pending_frame_change = Some(PendingFrameChange::Add(plan));
+            } else {
+                self.apply_add_frames(&plan);
+            }
         }
         self.emit(ShellEvent::ImagesChanged);
     }
 
-    fn apply_add_frames(&mut self, paths: &[PathBuf]) {
+    fn apply_add_frames(&mut self, plan: &ImportPlan) {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        tab.frames.extend_from_slice(paths);
-        tab.excluded.extend(std::iter::repeat_n(false, paths.len()));
+        for (position, path) in &plan.replace {
+            if let Some(slot) = tab.frames.get_mut(*position) {
+                *slot = path.clone();
+            }
+        }
+        tab.frames.extend_from_slice(&plan.add);
+        tab.excluded
+            .extend(std::iter::repeat_n(false, plan.add.len()));
         tab.frame_sort = None;
         tab.read_missing_meta();
     }
@@ -2963,9 +3933,20 @@ impl AppController {
 
     /// The frame-set-change warning still open, if any -- `None` whenever
     /// the active tab carries no checkpoint of its own to invalidate, since
-    /// there is nothing for a frame-set edit to disagree with.
+    /// there is nothing for a frame-set edit to disagree with. A pending
+    /// duplicate question shows regardless of checkpoint count: it is about
+    /// the import decision itself, not about re-fuse risk.
     pub fn pending_frame_change(&self) -> Option<images::FrameSetWarningCopy> {
         let pending = self.state.pending_frame_change.as_ref()?;
+        if let PendingFrameChange::Duplicates(plan) = pending {
+            let tab = self.state.active()?;
+            let names: Vec<String> = plan
+                .replace
+                .iter()
+                .filter_map(|&(position, _)| tab.frames.get(position).map(|p| images::file_name(p)))
+                .collect();
+            return Some(images::duplicate_question_copy(&names));
+        }
         if self.frame_change_checkpoints() == 0 {
             return None;
         }
@@ -3171,13 +4152,45 @@ impl AppController {
             return false;
         };
         match pending {
-            PendingFrameChange::Add(paths) => self.apply_add_frames(&paths),
+            PendingFrameChange::Add(plan) => self.apply_add_frames(&plan),
+            // Never calls `start_fuse` directly; stages through the same
+            // checkpoint gate every other add goes through.
+            PendingFrameChange::Duplicates(plan) => {
+                let existing = self
+                    .state
+                    .active()
+                    .map(|tab| tab.frames.clone())
+                    .unwrap_or_default();
+                self.stage_import(plan.without_same_path_replacements(&existing));
+                return false;
+            }
             PendingFrameChange::Move { from, to } => self.apply_move_frame(from, to),
             PendingFrameChange::Sort(sort) => self.apply_sort(sort),
             PendingFrameChange::Remove(index) => self.apply_remove_frame(index),
         }
         self.emit(ShellEvent::ImagesChanged);
         self.start_fuse()
+    }
+
+    /// The duplicate question's non-destructive answer: keeps every
+    /// existing frame, staging only the incoming files that were not
+    /// conflicts (through the same checkpoint gate every other add goes
+    /// through). `false` with nothing pending, or nothing pending a
+    /// duplicate answer.
+    pub fn keep_existing(&mut self) -> bool {
+        match self.state.pending_frame_change.take() {
+            Some(PendingFrameChange::Duplicates(plan)) => {
+                self.stage_import(ImportPlan {
+                    add: plan.add,
+                    replace: Vec::new(),
+                });
+                true
+            }
+            other => {
+                self.state.pending_frame_change = other;
+                false
+            }
+        }
     }
 
     /// Withdraws the pending frame-set change with nothing applied -- the
@@ -3423,8 +4436,21 @@ impl AppController {
             align_values: tab.align_values.clone(),
             align_lax: true,
             crop: true,
-            backend: None,
+            gpu: self.gpu_fusion,
         })
+    }
+
+    /// Turns GPU-backed fusion on or off for every run this controller
+    /// starts from here on -- never mid-run.
+    pub fn set_gpu_fusion(&mut self, gpu_fusion: bool) {
+        self.gpu_fusion = gpu_fusion;
+    }
+
+    /// The live run's own [`job::resolve_backend`] account, `None` before it
+    /// has resolved or once the run has settled ([`Self::settle_job`] clears
+    /// the observer).
+    pub fn fusion_backend(&self) -> Option<String> {
+        self.job.observer.as_ref().and_then(|o| o.backend_line())
     }
 
     /// Refuses a run whose recorded frame is no longer on disk, naming it
@@ -3525,9 +4551,10 @@ impl AppController {
 
     /// Requests a cancel, or leaves the queue. A queued active tab is
     /// removed from the queue and returned to `Idle`, never touching the
-    /// live run's control. Otherwise the cancel lands only once alignment
-    /// returns, showing `Cancelling` for that interval. A no-op unless the
-    /// active tab is queued or is the one actually running.
+    /// live run's control. Otherwise the cancel lands at the next frame
+    /// boundary during alignment, or the next tile during fusion, showing
+    /// `Cancelling` until then. A no-op unless the active tab is queued or
+    /// is the one actually running.
     pub fn cancel_fuse(&mut self) {
         if let Some(id) = self.state.active().map(|tab| tab.id)
             && let Some(pos) = self.job.queue.iter().position(|&queued| queued == id)
@@ -3623,12 +4650,18 @@ impl AppController {
         }
     }
 
-    /// The most recent run's own failure message, taken exactly once --
-    /// `None` once already read, or with no failure to announce. What the
-    /// failure toast names, so it fires only for the run that actually
-    /// failed and never re-opens on a later poll.
-    pub fn take_settled_failure(&mut self) -> Option<String> {
+    /// The most recent run or save failure, taken exactly once -- `None`
+    /// once already read, or with no failure to announce. What the failure
+    /// toast names, so it fires only for the run that actually failed and
+    /// never re-opens on a later poll.
+    pub fn take_settled_failure(&mut self) -> Option<job::Notification> {
         self.settled_failure.take()
+    }
+
+    /// Every run and save failure since the window opened, oldest first,
+    /// kept after its toast has been dismissed.
+    pub fn notifications(&self) -> &[job::Notification] {
+        &self.notifications
     }
 
     /// The toolbar/bottom-bar surfaces' current view of the active tab's
@@ -3706,7 +4739,6 @@ impl AppController {
         let phase = job::progress_phase(progress.as_ref());
         let tab_index = self.job.tab_id.take().and_then(|id| self.tab_index(id));
         let owner = tab_index.and_then(|i| self.state.projects.get(i));
-        let request = owner.and_then(|tab| tab.request.clone());
         let was_cancelling = owner.is_some_and(|tab| tab.run == job::RunState::Cancelling);
         let settled = job::settle(handle.join());
         self.job.control = None;
@@ -3726,41 +4758,35 @@ impl AppController {
         let tab_info = tab_index
             .and_then(|i| self.state.projects.get(i))
             .map(|tab| (project_identity_path(&tab.project), tab.title.clone()));
-        let frame_count = request.as_ref().map_or(0, |r| r.frames.len());
 
         match &settled.state {
             job::RunState::Failed(message) => {
-                self.settled_failure = Some(message.clone());
-                if let Some((path, title)) = tab_info.clone() {
-                    self.record_failure(FailureCard {
+                let operation = settled
+                    .operation
+                    .expect("settle() sets operation exactly when state is Failed");
+                let notification = job::Notification {
+                    operation,
+                    message: message.clone(),
+                    project_title: tab_info.as_ref().map(|(_, title)| title.clone()),
+                    project_path: tab_info.as_ref().map(|(path, _)| path.clone()),
+                    target: None,
+                };
+                self.notifications.push(notification.clone());
+                self.settled_failure = Some(notification);
+                if let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) {
+                    tab.failure = Some(TabFailure {
                         kind: FailureKind::Failed,
-                        path,
-                        title,
                         stage: format!("FAILED WHILE {}", phase.name().to_uppercase()),
                         reason: message.clone(),
-                        meta: format!(
-                            "{frame_count} {} · no project written",
-                            frame_word(frame_count)
-                        ),
-                        frames: frame_count,
-                        request: request.clone(),
                     });
                 }
             }
             job::RunState::Idle if was_cancelling => {
-                if let Some((path, title)) = tab_info {
-                    self.record_failure(FailureCard {
+                if let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) {
+                    tab.failure = Some(TabFailure {
                         kind: FailureKind::Cancelled,
-                        path,
-                        title,
                         stage: format!("STOPPED WHILE {}", phase.name().to_uppercase()),
                         reason: "You stopped this one. Nothing was written.".to_string(),
-                        meta: format!(
-                            "{frame_count} {} · stopped before writing",
-                            frame_word(frame_count)
-                        ),
-                        frames: frame_count,
-                        request: request.clone(),
                     });
                 }
             }
@@ -3820,10 +4846,10 @@ impl AppController {
 
     /// Adds `held` to tab `index` as its newest checkpoint, re-seeding the
     /// frame list from the tab's own last request, and returns its composite
-    /// and Z-Map paths for the canvas.
+    /// and Z-Map paths for the canvas. Switches the shell into Editor mode
+    /// when `index` is the tab currently in view.
     fn commit_held(&mut self, index: usize, held: job::HeldCheckpoint) -> (PathBuf, PathBuf) {
         let tab = &mut self.state.projects[index];
-        let path = project_identity_path(&tab.project);
         tab.checkpoints += 1;
         if let Some(request) = &tab.request {
             tab.frames = request.frames.clone();
@@ -3834,10 +4860,25 @@ impl AppController {
         tab.read_missing_meta();
         tab.edit = None;
         tab.thumbnail = overlay::render_thumbnail_from_frame(&held.composite).map(Arc::new);
+        tab.failure = None;
         let planes = (held.composite.clone(), held.zmap.clone());
         tab.held.push(held);
-        self.clear_failure(&path);
+        // The new checkpoint's own extent may differ from what the viewport
+        // was fitted to (a first fuse's crop, a re-fuse over a changed frame
+        // set) -- refit on the next `fit_if_unfitted` rather than keep
+        // drawing the old extent's zoom/pan.
+        tab.viewport = None;
+        self.enter_editor_if_viewing(index);
         planes
+    }
+
+    /// Switches into Editor mode when `index` is the tab currently in view --
+    /// a fuse that commits on a tab the user has since navigated away from
+    /// leaves the shell where it is.
+    fn enter_editor_if_viewing(&mut self, index: usize) {
+        if self.state.active == Some(index) {
+            self.set_mode(ShellMode::Editor);
+        }
     }
 
     /// The frames the active tab's parked run could not align, by file name;
@@ -3945,7 +4986,15 @@ impl AppController {
         let project = match job::save_held(&target, &tab.held, onto_existing) {
             Ok(project) => project,
             Err(err) => {
-                self.settled_failure = Some(format!("Could not save {}: {err}", target.display()));
+                let notification = job::Notification {
+                    operation: job::FailedOperation::Save,
+                    message: format!("Could not save {}: {err}", target.display()),
+                    project_title: Some(tab.title.clone()),
+                    project_path: Some(project_identity_path(&tab.project)),
+                    target: Some(target.clone()),
+                };
+                self.notifications.push(notification.clone());
+                self.settled_failure = Some(notification);
                 return false;
             }
         };
@@ -4671,8 +5720,6 @@ fn not_a_project_card(path: PathBuf) -> FailureCard {
         reason: "This folder holds something else. Nothing was read and nothing was changed."
             .to_string(),
         meta: "not read · not changed".to_string(),
-        frames: 0,
-        request: None,
     }
 }
 

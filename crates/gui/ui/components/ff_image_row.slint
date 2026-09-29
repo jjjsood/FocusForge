@@ -31,10 +31,17 @@ export component FFImageRow inherits Rectangle {
     // slot -- softened and shadowed so it reads as lifted off the surface
     // instead of a second solid row.
     in property <bool> floating: false;
+    // The editor's read-only legend: the trailing column is a position
+    // number rather than a capture time -- `mutable` stays `false`
+    // throughout, so the grip/exclude/bin never show alongside it.
+    in property <bool> legend: false;
 
     callback exclude-toggled();
     callback remove-requested();
     callback clicked();
+    // A plain wheel over the row, raw delta. Handled here so the enclosing
+    // list never scrolls on it.
+    callback wheel(length);
 
     height: ShellGeometry.image-row-height;
     opacity: root.floating ? 0.75 : 1.0;
@@ -42,8 +49,8 @@ export component FFImageRow inherits Rectangle {
     drop-shadow-offset-y: Theme.space-1;
     drop-shadow-blur: Theme.space-2;
 
-    property <bool> interactive: !root.unresolved && root.mutable;
-    property <bool> show-controls: root.interactive && !root.dragging && (root.hovered || area.has-hover);
+    property <bool> interactive: !root.unresolved && (root.mutable || root.legend);
+    property <bool> show-controls: root.mutable && root.interactive && !root.dragging && (root.hovered || area.has-hover);
     property <color> label-color: root.unresolved ? Theme.text-disabled
         : root.excluded ? Theme.text-muted
         : Theme.text-primary;
@@ -63,6 +70,10 @@ export component FFImageRow inherits Rectangle {
         width: 100%;
         height: 100%;
         clicked => { root.clicked(); }
+        scroll-event(event) => {
+            root.wheel(event.delta-y);
+            accept
+        }
 
         // The grip icon, in the gutter before the chip. The panel owns the
         // gutter's pointer capture, so a drag outlives this row's instance.
@@ -109,6 +120,15 @@ export component FFImageRow inherits Rectangle {
                     y: (parent.height - self.height) / 2;
                 }
             }
+        }
+    }
+
+    // A disabled `area` takes no wheel, so a greyed row keeps the enclosing
+    // list from scrolling on it through this sink.
+    if root.unresolved: TouchArea {
+        scroll-event(event) => {
+            root.wheel(event.delta-y);
+            accept
         }
     }
 

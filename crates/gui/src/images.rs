@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use focusforge_core::io::{CaptureTime, capture_time};
 use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
-use focusforge_core::zmap::source_color;
+use focusforge_core::zmap::{overlay_table, source_color};
 
 /// A row's fixed height, top to top of the next row.
 pub const ROW_HEIGHT: f32 = 26.0;
@@ -24,9 +24,10 @@ pub const ROW_HEIGHT: f32 = 26.0;
 pub struct ImageRow {
     pub chip: [u8; 3],
     pub name: String,
-    /// The recorded capture time, verbatim, or empty when absent or the
-    /// source is unresolved.
-    pub time_text: String,
+    /// The recorded capture time in stacking mode, or the row's 1-based
+    /// position in legend mode -- verbatim, or empty when a capture time is
+    /// absent or the source is unresolved.
+    pub trailing_text: String,
     pub excluded: bool,
     /// The recorded source is no longer a file on disk.
     pub unresolved: bool,
@@ -39,6 +40,9 @@ pub struct ImageRow {
 pub struct ImagesModel {
     pub rows: Vec<ImageRow>,
     pub header_text: String,
+    /// Legend mode only: the pinned `NO_SOURCE` entry shows below `rows`,
+    /// outside the scrolled list.
+    pub no_source_row: bool,
 }
 
 /// What the `Images` list shows about one source file, read once from disk
@@ -88,7 +92,7 @@ fn build_rows(
             ImageRow {
                 chip: source_color(i as u16, total),
                 name: file_name(path),
-                time_text: resolved
+                trailing_text: resolved
                     .and_then(|m| m.time.as_ref())
                     .map(|t| time_of_day(&t.text))
                     .unwrap_or_default(),
@@ -96,6 +100,32 @@ fn build_rows(
                 unresolved: resolved.is_none(),
                 selected: selected == Some(i),
             }
+        })
+        .collect()
+}
+
+/// One legend row per frame, in position order -- editor mode only ever runs
+/// over the frame set its own Z-Map was fused from (`can_edit`'s own gate),
+/// so a position *is* its Z-Map source index and the exclusion mask is
+/// never consulted: excluding a frame after the fuse changes no index.
+/// `chip` is `overlay_table`'s colour for that index, no palette arithmetic.
+fn build_legend_rows(
+    frames: &[PathBuf],
+    selected: Option<usize>,
+    meta: &HashMap<PathBuf, FrameMeta>,
+) -> Vec<ImageRow> {
+    let total = frames.len().max(1) as u32;
+    let table = overlay_table(total, None);
+    frames
+        .iter()
+        .enumerate()
+        .map(|(i, path)| ImageRow {
+            chip: table[i],
+            name: file_name(path),
+            trailing_text: (i + 1).to_string(),
+            excluded: false,
+            unresolved: meta.get(path).is_none_or(|m| m.unresolved),
+            selected: selected == Some(i),
         })
         .collect()
 }
@@ -125,22 +155,41 @@ pub(crate) fn file_name(path: &Path) -> String {
 }
 
 /// Builds the whole panel model, the header count and the rows, without
-/// touching the disk.
+/// touching the disk. `legend` selects the editor's read-only legend (colour
+/// and position number from `build_legend_rows`) over stacking's own row
+/// builder (capture time, exclusion count).
 pub fn build_model(
     frames: &[PathBuf],
     excluded: &[bool],
     selected: Option<usize>,
+    legend: bool,
     meta: &HashMap<PathBuf, FrameMeta>,
 ) -> ImagesModel {
-    let rows = build_rows(frames, excluded, selected, meta);
-    let excluded_count = rows.iter().filter(|r| r.excluded).count();
-    let header_text = format!(
-        "{} frame{} \u{b7} {} excluded",
-        rows.len(),
-        if rows.len() == 1 { "" } else { "s" },
-        excluded_count
-    );
-    ImagesModel { rows, header_text }
+    let rows = if legend {
+        build_legend_rows(frames, selected, meta)
+    } else {
+        build_rows(frames, excluded, selected, meta)
+    };
+    let header_text = if legend {
+        format!(
+            "{} frame{}",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" }
+        )
+    } else {
+        let excluded_count = rows.iter().filter(|r| r.excluded).count();
+        format!(
+            "{} frame{} \u{b7} {} excluded",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" },
+            excluded_count
+        )
+    };
+    ImagesModel {
+        rows,
+        header_text,
+        no_source_row: legend,
+    }
 }
 
 /// The `Name` / `Capture time` sort menu's two entries -- and nothing else.
@@ -226,13 +275,17 @@ pub struct FrameSetWarningCopy {
     pub new_project_button: bool,
     /// `Remove` only.
     pub exclude_instead_button: bool,
+    /// The duplicate question only.
+    pub keep_existing_button: bool,
 }
 
 impl FrameSetWarningCopy {
-    /// The secondary footer button's own label -- empty when neither
-    /// applies, which never happens for a real warning.
+    /// The secondary footer button's label -- empty when none applies,
+    /// which never happens for a real warning.
     pub fn secondary_label(&self) -> &'static str {
-        if self.exclude_instead_button {
+        if self.keep_existing_button {
+            "Keep existing"
+        } else if self.exclude_instead_button {
             "Exclude instead"
         } else if self.new_project_button {
             "New project instead"
@@ -291,6 +344,32 @@ pub fn frame_set_warning_copy(
         default_button: DefaultButton::Cancel,
         new_project_button,
         exclude_instead_button,
+        keep_existing_button: false,
+    }
+}
+
+/// The duplicate question's copy: up to five conflicting frame names, then
+/// "and N more".
+pub fn duplicate_question_copy(names: &[String]) -> FrameSetWarningCopy {
+    let title = format!(
+        "Replace {} existing image{}?",
+        names.len(),
+        if names.len() == 1 { "" } else { "s" }
+    );
+    let body = if names.len() <= 5 {
+        names.join(", ")
+    } else {
+        format!("{} and {} more", names[..5].join(", "), names.len() - 5)
+    };
+    FrameSetWarningCopy {
+        title,
+        body,
+        info: "New images are added either way.".to_string(),
+        confirm_label: "Replace".to_string(),
+        default_button: DefaultButton::Cancel,
+        new_project_button: false,
+        exclude_instead_button: false,
+        keep_existing_button: true,
     }
 }
 
@@ -321,6 +400,7 @@ mod tests {
             &frames,
             &[false, false, false],
             None,
+            false,
             &read_metadata(&frames),
         );
         assert_eq!(model.rows.len(), 3);
@@ -339,11 +419,11 @@ mod tests {
         std::fs::remove_file(&frames[0]).unwrap();
         std::fs::remove_file(&frames[1]).unwrap();
         meta.remove(&frames[1]);
-        let model = build_model(&frames, &[false, false], None, &meta);
+        let model = build_model(&frames, &[false, false], None, false, &meta);
         assert!(!model.rows[0].unresolved);
-        assert_eq!(model.rows[0].time_text, "10:00:00");
+        assert_eq!(model.rows[0].trailing_text, "10:00:00");
         assert!(model.rows[1].unresolved);
-        assert_eq!(model.rows[1].time_text, "");
+        assert_eq!(model.rows[1].trailing_text, "");
     }
 
     #[test]
@@ -353,17 +433,23 @@ mod tests {
             write_timed(dir.path(), "00.tif", Some("2026:08:29 10:00:00")),
             write_timed(dir.path(), "01.tif", None),
         ];
-        let model = build_model(&frames, &[false, false], None, &read_metadata(&frames));
-        assert_eq!(model.rows[1].time_text, "");
+        let model = build_model(
+            &frames,
+            &[false, false],
+            None,
+            false,
+            &read_metadata(&frames),
+        );
+        assert_eq!(model.rows[1].trailing_text, "");
         assert!(!model.rows[1].unresolved);
     }
 
     #[test]
     fn an_unresolved_source_carries_no_fabricated_time() {
         let frames = [PathBuf::from("/does/not/exist.tif")];
-        let model = build_model(&frames, &[false], None, &read_metadata(&frames));
+        let model = build_model(&frames, &[false], None, false, &read_metadata(&frames));
         assert!(model.rows[0].unresolved);
-        assert_eq!(model.rows[0].time_text, "");
+        assert_eq!(model.rows[0].trailing_text, "");
     }
 
     #[test]
@@ -378,7 +464,13 @@ mod tests {
                 )
             })
             .collect();
-        let model = build_model(&frames, &[true, false], None, &read_metadata(&frames));
+        let model = build_model(
+            &frames,
+            &[true, false],
+            None,
+            false,
+            &read_metadata(&frames),
+        );
         assert_eq!(model.header_text, "2 frames \u{b7} 1 excluded");
     }
 
@@ -445,6 +537,34 @@ mod tests {
     fn add_and_reorder_secondary_label_offers_a_new_project() {
         let copy = frame_set_warning_copy(FrameSetChangeKind::Add, 1);
         assert_eq!(copy.secondary_label(), "New project instead");
+    }
+
+    #[test]
+    fn duplicate_question_copy_names_every_conflict_up_to_five() {
+        let names: Vec<String> = (0..5).map(|i| format!("{i:02}.tif")).collect();
+        let copy = duplicate_question_copy(&names);
+        assert_eq!(copy.title, "Replace 5 existing images?");
+        assert_eq!(copy.body, "00.tif, 01.tif, 02.tif, 03.tif, 04.tif");
+        assert!(copy.keep_existing_button);
+        assert_eq!(copy.secondary_label(), "Keep existing");
+    }
+
+    #[test]
+    fn duplicate_question_copy_caps_at_five_with_an_and_more_tail() {
+        let names: Vec<String> = (0..7).map(|i| format!("{i:02}.tif")).collect();
+        let copy = duplicate_question_copy(&names);
+        assert_eq!(copy.title, "Replace 7 existing images?");
+        assert_eq!(
+            copy.body,
+            "00.tif, 01.tif, 02.tif, 03.tif, 04.tif and 2 more"
+        );
+    }
+
+    #[test]
+    fn duplicate_question_copy_singular_wording_names_one() {
+        let copy = duplicate_question_copy(&["00.tif".to_string()]);
+        assert_eq!(copy.title, "Replace 1 existing image?");
+        assert_eq!(copy.body, "00.tif");
     }
 
     #[test]

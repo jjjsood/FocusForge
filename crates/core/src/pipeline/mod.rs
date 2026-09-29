@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, StackAlgorithm, TileReader};
 use crate::align::{
-    AlignDriverOptions, FailurePolicy, FrameAlignment, ReferencePolicy, StackAlignment, Transform,
-    WarpingReader, align_stack_with, auto_crop,
+    AlignDriverOptions, FailurePolicy, FrameAlignment, ReferencePolicy, Registration,
+    StackAlignment, Transform, WarpingReader, align_stack_with, auto_crop,
 };
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
@@ -179,10 +179,12 @@ pub enum AlignSource {
 pub trait StageObserver: Sync {
     fn stage(&self, _stage: RunStage) {}
     fn tick(&self, _progress: &JobProgress) {}
-    /// Called once a fuse segment reports [`JobOutcome::Paused`]; blocks
-    /// until the front end resumes (`control.clear()`) or cancels
-    /// (`control.cancel()`) -- `focusforge-cli`'s own signal wait and the
-    /// GUI's condvar park are both implementations of this one method.
+    /// Called once a fuse segment reports [`JobOutcome::Paused`], or once
+    /// per pause held at an align-stage frame boundary; blocks until the
+    /// front end resumes (`control.clear()`) or cancels (`control.cancel()`)
+    /// -- `focusforge-cli`'s own signal wait and the GUI's condvar park are
+    /// both implementations of this one method. Always called from the
+    /// thread that called [`run`], never concurrently with itself.
     fn paused(&self, _control: &JobControl) {}
     /// A human-readable warning raised mid-run that a front end may surface
     /// however it sees fit -- `focusforge-cli`'s own implementation mirrors
@@ -364,19 +366,23 @@ pub fn run(
                 let solved = std::thread::scope(|scope| {
                     let watcher = scope.spawn(|| {
                         let _parent = parent.enter();
-                        // `align_stack_with` has no unit boundary of its
-                        // own, so a cancel requested while it runs is
-                        // otherwise invisible until it returns -- this is
-                        // the one place that can say so while it is still
-                        // running.
+                        // Pause and cancel both land at `align_stack_with`'s
+                        // next frame boundary, after the registrations in
+                        // flight finish. While a hold is in effect this
+                        // thread stops ticking, so `observer.paused` (run on
+                        // the caller's thread, below) is the only reader of
+                        // a front end's resume signal during the hold.
                         let mut warned = false;
                         while !done.load(Ordering::SeqCst) {
                             std::thread::sleep(poll);
+                            if control.state() == ControlState::PauseRequested {
+                                continue;
+                            }
                             observer.tick(&control.progress());
                             if !warned && control.state() == ControlState::CancelRequested {
                                 observer.notice(
-                                    "cancel requested -- alignment has no unit boundary; \
-                                     stopping at the fuse stage (Ctrl-C again to abort now)",
+                                    "cancel requested -- stopping alignment once the frames \
+                                     in flight finish (Ctrl-C again to abort now)",
                                 );
                                 warned = true;
                             }
@@ -390,6 +396,8 @@ pub fn run(
                         policy,
                         &AlignDriverOptions {
                             frames_done: Some(frames_done),
+                            control: Some(Arc::clone(&control)),
+                            on_pause: Some(&|control| observer.paused(control)),
                             ..Default::default()
                         },
                     );
@@ -397,16 +405,18 @@ pub fn run(
                     watcher.join().expect("align watcher thread must not panic");
                     result
                 });
-                // Alignment has no unit boundary, so a cancel requested
-                // while it ran only ever lands once it returns -- the
-                // `Cancelling` interval the surface must show.
-                if control.state() == ControlState::CancelRequested {
+                // The driver reports a cancel it read at a frame boundary;
+                // one requested after the last registration started lands
+                // here, before the alignment reaches the stage cache.
+                if matches!(solved, Err(AlgorithmError::Cancelled))
+                    || control.state() == ControlState::CancelRequested
+                {
                     return Ok(FuseOutcome::Cancelled {
                         units_done: 0,
                         unit_total: 0,
                     });
                 }
-                let solved = solved?;
+                let solved = solved.map_err(|err| PipelineError::Align(err.to_string()))?;
                 align_workers = Some(solved.worker_limit);
                 peak_align_workers = Some(solved.peak_workers);
                 let alignment = solved.alignment;
@@ -469,6 +479,10 @@ pub fn run(
         .iter()
         .map(|f| f.transform)
         .collect();
+    let registration = Registration {
+        transforms: transforms.clone(),
+        crop: applied_crop,
+    };
     let warping_reader = WarpingReader::new(frame_reader, (width, height), spp, transforms.clone());
 
     let reader: &dyn TileReader = match &request.backend {
@@ -682,6 +696,7 @@ pub fn run(
             algorithm: request.algorithm.id(),
             params: &values,
             align: align_record,
+            registration: registration.clone(),
             composite_description,
             label: None,
             metrics,
@@ -696,6 +711,7 @@ pub fn run(
             algorithm: request.algorithm.id(),
             params: &values,
             align: align_record,
+            registration: registration.clone(),
             composite_description,
             label: None,
             metrics,
@@ -715,6 +731,7 @@ pub fn run(
                 algorithm: request.algorithm.id().to_string(),
                 params: values.clone(),
                 align: align_record,
+                registration: registration.clone(),
                 composite_description,
                 metrics,
                 created_at: project::seal::now_unix(),
