@@ -12,6 +12,8 @@ use std::process::Command;
 
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 
+use common::mantis_512_dir;
+
 fn bin() -> Command {
     common::cli_bin("cli")
 }
@@ -27,10 +29,6 @@ fn spawn_in(dir: &Path, args: &[&str]) -> std::process::Output {
         .current_dir(dir)
         .output()
         .expect("failed to run binary")
-}
-
-fn mantis_512_dir() -> PathBuf {
-    common::fixtures_dir().join("mantis-512")
 }
 
 fn mantis_64_dir() -> PathBuf {

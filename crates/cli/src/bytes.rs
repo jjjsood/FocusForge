@@ -54,63 +54,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_gib() {
-        assert_eq!(parse_byte_size("8GiB").unwrap(), 8u64 << 30);
+    fn accepts_binary_decimal_bare_and_spaced_forms() {
+        for (input, expected) in [
+            ("8GiB", 8u64 << 30),
+            ("512MiB", 512u64 << 20),
+            ("1000MB", 1_000_000_000),
+            ("4096", 4096),
+            ("1 GiB", 1u64 << 30),
+        ] {
+            assert_eq!(parse_byte_size(input), Ok(expected), "input {input:?}");
+        }
     }
 
     #[test]
-    fn accepts_mib() {
-        assert_eq!(parse_byte_size("512MiB").unwrap(), 512u64 << 20);
-    }
-
-    #[test]
-    fn accepts_decimal_mb() {
-        assert_eq!(parse_byte_size("1000MB").unwrap(), 1_000_000_000);
-    }
-
-    #[test]
-    fn accepts_a_bare_integer_as_bytes() {
-        assert_eq!(parse_byte_size("4096").unwrap(), 4096);
-    }
-
-    #[test]
-    fn accepts_whitespace_between_the_number_and_the_suffix() {
-        assert_eq!(parse_byte_size("1 GiB").unwrap(), 1u64 << 30);
-    }
-
-    #[test]
-    fn refuses_an_unknown_suffix_naming_accepted_ones() {
-        let err = parse_byte_size("8Gigs").unwrap_err();
-        assert!(err.contains("GiB"), "{err}");
-    }
-
-    #[test]
-    fn refuses_a_bare_single_letter_suffix() {
-        let err = parse_byte_size("8G").unwrap_err();
-        assert!(err.contains("GiB"), "{err}");
-    }
-
-    #[test]
-    fn refuses_a_negative_value() {
-        let err = parse_byte_size("-1").unwrap_err();
-        assert!(err.contains("GiB"), "{err}");
-    }
-
-    #[test]
-    fn refuses_a_float() {
-        let err = parse_byte_size("1.5GiB").unwrap_err();
-        assert!(err.contains("GiB"), "{err}");
-    }
-
-    #[test]
-    fn refuses_a_u64_overflow() {
-        let err = parse_byte_size("99999999999999999999").unwrap_err();
-        assert!(err.contains("GiB"), "{err}");
-    }
-
-    #[test]
-    fn refuses_a_multiplied_overflow() {
-        let err = parse_byte_size("18446744073709551615GiB").unwrap_err();
-        assert!(err.contains("GiB"), "{err}");
+    fn refuses_malformed_sizes_naming_the_accepted_suffixes() {
+        for input in [
+            "8Gigs",
+            "8G",
+            "-1",
+            "1.5GiB",
+            "99999999999999999999",
+            "18446744073709551615GiB",
+        ] {
+            let err = parse_byte_size(input).unwrap_err();
+            assert!(err.contains("GiB"), "input {input:?}: {err}");
+        }
     }
 }

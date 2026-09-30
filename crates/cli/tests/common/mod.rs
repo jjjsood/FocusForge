@@ -7,6 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use focusforge_core::io::{Rect, TiffStack};
+
 #[path = "../../../core/tests/common/reference_stack.rs"]
 mod reference_stack;
 #[allow(unused_imports)]
@@ -122,6 +124,82 @@ pub fn data_dir_of(cmd: &Command) -> PathBuf {
         .and_then(|(_, v)| v)
         .map(PathBuf::from)
         .expect("cli_bin always sets FOCUSFORGE_DATA_DIR")
+}
+
+/// `crates/cli/../../fixtures/mantis-512` -- the 512-pixel, multi-frame
+/// fixture tree.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+pub fn mantis_512_dir() -> PathBuf {
+    fixtures_dir().join("mantis-512")
+}
+
+/// The finished process's status and both byte streams, decoded lossily.
+///
+/// `#[allow(dead_code)]`: each integration test file compiles this shared
+/// module into its own binary crate, and not every one reads every field.
+#[allow(dead_code)]
+pub struct CliOutput {
+    pub success: bool,
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl From<std::process::Output> for CliOutput {
+    fn from(output: std::process::Output) -> Self {
+        CliOutput {
+            success: output.status.success(),
+            code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    }
+}
+
+/// Runs `cmd` with `args` and `dir` as its working directory to completion.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+pub fn run_in(cmd: &mut Command, dir: &Path, args: &[&str]) -> CliOutput {
+    cmd.args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run binary")
+        .into()
+}
+
+/// The rectangle covering a `width` x `height` image.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+pub fn full_rect(width: u32, height: u32) -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    }
+}
+
+/// Whole-image read: samples, width, height, samples-per-pixel.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+pub fn read_whole(path: &Path) -> (Vec<u16>, u32, u32, u32) {
+    let stack = TiffStack::open_files(&[path.to_path_buf()]).expect("output must reopen");
+    let (w, h) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let samples = stack
+        .read_tile(0, full_rect(w, h))
+        .expect("read must succeed")
+        .samples;
+    (samples, w, h, spp)
 }
 
 /// A directory built with `tempfile`, which honours `TMPDIR` and so lives on
