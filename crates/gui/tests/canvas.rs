@@ -144,6 +144,36 @@ fn repaint_gate_collapses_requests_until_taken() {
     assert!(gate.request(), "the gate re-arms after a take");
 }
 
+#[test]
+fn undo_and_redo_refresh_window_without_another_pointer_event() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+
+    i_slint_backend_testing::init_no_event_loop();
+    let app = AppWindow::new().unwrap();
+    let controller = Arc::new(Mutex::new(AppController::new()));
+    let canvas = Rc::new(RefCell::new(focusforge_gui::bridge::Canvas::default()));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        canvas,
+        Rc::new(RefCell::new(None)),
+    );
+    let expected = controller.lock().unwrap().zoom_readout();
+
+    for action in [
+        Box::new(|| app.invoke_undo_requested()) as Box<dyn Fn()>,
+        Box::new(|| app.invoke_redo_requested()),
+        Box::new(|| app.invoke_canvas_key_pressed("z".into(), true, false, false)),
+        Box::new(|| app.invoke_canvas_key_pressed("z".into(), true, true, false)),
+    ] {
+        app.set_zoom_readout("stale".into());
+        action();
+        assert_eq!(app.get_zoom_readout(), expected);
+    }
+}
+
 /// A rect far larger than a small composite: an 8192x5464 viewport rect
 /// against a 501x508 composite is refused, an exact-fit and an interior
 /// rect are not.
