@@ -48,6 +48,8 @@ pub struct PartialFile {
 }
 
 impl PartialFile {
+    /// Guards `<final_path>.partial`; nothing is created until the caller
+    /// writes to [`Self::path`].
     pub fn new(final_path: &Path) -> Self {
         PartialFile {
             partial: partial_path(final_path),
@@ -153,9 +155,8 @@ impl ProjectWriter {
     /// Finishes the archive, flushes it to disk and renames the partial onto
     /// the named path.
     ///
-    /// A failed seal leaves neither a project nor a temp file on **every**
-    /// error path, including one that returns through a `?` three
-    /// functions down: the [`PartialFile`] removes the partial on drop.
+    /// A failed seal leaves neither a project nor a temp file on any error
+    /// path: the [`PartialFile`] removes the partial on drop.
     pub fn finish(self) -> Result<PathBuf, ProjectError> {
         let ProjectWriter { zip, partial, .. } = self;
         let file = zip
