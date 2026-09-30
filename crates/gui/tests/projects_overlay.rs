@@ -1112,7 +1112,7 @@ fn recent_list_persists_and_caps_at_five() {
     assert!(recent::load(&missing_dir).is_empty());
 
     let corrupt_dir = tree("recent_corrupt");
-    std::fs::write(corrupt_dir.join("recent.toml"), b"not valid toml {{{").unwrap();
+    std::fs::write(corrupt_dir.join("settings.toml"), b"not valid toml {{{").unwrap();
     assert!(
         recent::load(&corrupt_dir).is_empty(),
         "an unparsable file must read as an empty list, not a panic"

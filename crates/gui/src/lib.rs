@@ -49,10 +49,15 @@ pub mod picker;
 /// `tests/input_map.rs` reaches its types directly.
 pub mod input_map;
 
-/// The input table's file format: load/write `input.toml`, no
-/// `use slint::`. `pub` so `src/main.rs` and `tests/input_map.rs` reach it
-/// directly.
+/// The input table's file format: load/write the `[input]` table of
+/// `settings.toml`, no `use slint::`. `pub` so `src/main.rs` and
+/// `tests/input_map.rs` reach it directly.
 pub mod input_config;
+
+/// The one settings file every table saves through: `settings.toml`,
+/// shared by `recent` and `input_config`. No `use slint::`. `pub` so
+/// `tests/settings_file.rs` reaches it directly.
+pub mod settings;
 
 /// The viewport as pure arithmetic: no `use slint::`, no `use wgpu::`, and no
 /// dependency on the core algorithm crate. `pub` so `tests/viewport.rs` and

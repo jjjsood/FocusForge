@@ -158,7 +158,7 @@ fn modes_differ_only_by_declared_overrides() {
 // ---------------------------------------------------------------------
 
 fn row_toml(trigger: &str, stacking: Option<Action>, editor: Option<Action>) -> String {
-    let mut s = format!("\n[[bindings]]\ntrigger = \"{trigger}\"\n");
+    let mut s = format!("\n[[input.bindings]]\ntrigger = \"{trigger}\"\n");
     if let Some(a) = stacking {
         s.push_str(&format!("stacking = \"{a}\"\n"));
     }
@@ -181,7 +181,7 @@ fn user_file_overrides_a_default() {
     let dir = tempfile::tempdir().unwrap();
     let defaults = InputTable::default();
 
-    let mut toml = String::from("version = 1\n");
+    let mut toml = String::from("[input]\nversion = 1\n");
     for (i, binding) in defaults.bindings.iter().enumerate() {
         if i == 8 {
             // Left absent on purpose -- must keep its default.
@@ -196,7 +196,7 @@ fn user_file_overrides_a_default() {
         };
         toml.push_str(&row_toml(&binding.trigger.to_string(), stacking, editor));
     }
-    fs::write(dir.path().join("input.toml"), &toml).unwrap();
+    fs::write(dir.path().join("settings.toml"), &toml).unwrap();
 
     let loaded = input_config::load(dir.path());
     assert!(
@@ -253,8 +253,8 @@ fn partial_out_of_order_single_row_config_leaves_other_rows_at_default() {
     // clobber `bindings[0]` (the wheel row) regardless of which trigger
     // the lone row actually named.
     let dir = tempfile::tempdir().unwrap();
-    let toml = "version = 1\n\n[[bindings]]\ntrigger = \"alt+wheel\"\nstacking = \"pan\"\neditor = \"brush-softness\"\n";
-    fs::write(dir.path().join("input.toml"), toml).unwrap();
+    let toml = "[input]\nversion = 1\n\n[[input.bindings]]\ntrigger = \"alt+wheel\"\nstacking = \"pan\"\neditor = \"brush-softness\"\n";
+    fs::write(dir.path().join("settings.toml"), toml).unwrap();
 
     let loaded = input_config::load(dir.path());
     assert!(
@@ -325,15 +325,29 @@ fn missing_config_is_not_an_error() {
 #[test]
 fn first_run_writes_the_defaults() {
     let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("input.toml");
-    assert!(!target.exists());
+    let target = dir.path().join("settings.toml");
+    // An `[recent]` table already in the file must survive the write.
+    fs::write(
+        &target,
+        "[recent]\n[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\nopened_at = 1\n",
+    )
+    .unwrap();
 
     let written = input_config::write_defaults(dir.path()).unwrap();
     assert_eq!(written, target);
     assert!(written.exists());
     let contents = fs::read_to_string(&written).unwrap();
+    assert!(contents.contains("[input]"));
     assert!(contents.contains("version = 1"));
     assert!(contents.contains("trigger = \"wheel\""));
+    assert!(
+        contents.contains("# FocusForge input map."),
+        "the header comment block must be written: {contents}"
+    );
+    assert!(
+        contents.contains("[recent]") && contents.contains("name = \"a\""),
+        "an existing [recent] table must survive: {contents}"
+    );
 }
 
 #[test]
@@ -353,7 +367,10 @@ fn written_defaults_round_trip() {
     );
     assert_eq!(loaded.table, InputTable::default());
     match loaded.provenance {
-        input_config::Provenance::File { overridden, .. } => assert_eq!(overridden, 0),
+        input_config::Provenance::File { path, overridden } => {
+            assert_eq!(overridden, 0);
+            assert_eq!(path, dir.path().join("settings.toml"));
+        }
         other => panic!("expected Provenance::File, got {other:?}"),
     }
 }
@@ -361,8 +378,8 @@ fn written_defaults_round_trip() {
 #[test]
 fn unsupported_version_is_refused_and_not_rewritten() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("input.toml");
-    let original = "version = 2\n\n[[bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\neditor = \"zoom-at-cursor\"\n";
+    let path = dir.path().join("settings.toml");
+    let original = "[input]\nversion = 2\n\n[[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\neditor = \"zoom-at-cursor\"\n";
     fs::write(&path, original).unwrap();
 
     let loaded = input_config::load(dir.path());
@@ -376,7 +393,7 @@ fn unsupported_version_is_refused_and_not_rewritten() {
             supported,
         } => {
             assert_eq!(p, &path);
-            assert_eq!(*line, 1);
+            assert_eq!(*line, 2);
             assert_eq!(*found, 2);
             assert_eq!(*supported, 1);
         }
@@ -414,15 +431,20 @@ fn unwritable_config_dir_is_not_fatal() {
     assert_eq!(loaded.table, InputTable::default());
 }
 
-/// Writes `toml` to a fresh `input.toml`, loads it, and asserts the load
-/// fell back to the defaults with exactly one problem -- the common shape
-/// every case below shares. Returns that problem alongside the path it was
-/// written to, so a caller can still check a path- or spelling-specific
-/// field.
+/// Writes `toml` (the bare top-level shape: `version = ...`,
+/// `[[bindings]]`) as `settings.toml`'s `[input]` table, loads it, and
+/// asserts the load fell back to the defaults with exactly one problem --
+/// the common shape every case below shares. Returns that problem alongside
+/// the path it was written to, so a caller can still check a path- or
+/// spelling-specific field.
 fn expect_one_problem(toml: &str) -> (PathBuf, input_config::ConfigError) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("input.toml");
-    fs::write(&path, toml).unwrap();
+    let path = dir.path().join("settings.toml");
+    let body = format!(
+        "[input]\n{}",
+        toml.replace("[[bindings]]", "[[input.bindings]]")
+    );
+    fs::write(&path, body).unwrap();
     let loaded = input_config::load(dir.path());
     assert_eq!(loaded.table, InputTable::default());
     assert_eq!(
@@ -991,14 +1013,14 @@ fn edit_mode_overrides_are_table_driven() {
     // what the wheel does there, and nothing else.
     let dir = tempfile::tempdir().unwrap();
     let toml = format!(
-        "version = 1\n{}",
+        "[input]\nversion = 1\n{}",
         row_toml(
             &Trigger::Wheel(shift).to_string(),
             Some(Action::PanHorizontal),
             Some(Action::BrushSoftness),
         )
     );
-    fs::write(dir.path().join("input.toml"), toml).unwrap();
+    fs::write(dir.path().join("settings.toml"), toml).unwrap();
     let loaded = input_config::load(dir.path());
     assert!(loaded.problems.is_empty());
     let mut rebound = AppController::new_with_mode_for_test(ShellMode::Editor);
@@ -1178,7 +1200,7 @@ fn canvas_ground_receives_forward_focus() {
 
 #[test]
 fn input_modules_are_slint_free() {
-    for file in ["input_map.rs", "input_config.rs"] {
+    for file in ["input_map.rs", "input_config.rs", "settings.rs"] {
         let path = common::src_dir().join(file);
         let contents = fs::read_to_string(&path).unwrap();
         let code = common::strip_line_comments(&contents);

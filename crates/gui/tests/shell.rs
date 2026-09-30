@@ -188,6 +188,7 @@ fn checkpoint_panel_touches_no_storage() {
         "images.rs",
         "overlay.rs",
         "recent.rs",
+        "settings.rs",
     ];
     for path in common::find_rust_files(&common::src_dir()) {
         if path

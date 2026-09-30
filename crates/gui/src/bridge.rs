@@ -1532,7 +1532,7 @@ pub fn install(
     });
     // The five chrome keys are consulted before the rebindable table on
     // every key press, whether or not the projects overlay is open, so none
-    // of them can be shadowed by a user's `input.toml`.
+    // of them can be shadowed by a user's `settings.toml` `[input]` table.
     app.on_canvas_key_pressed({
         let controller = controller.clone();
         let canvas = canvas.clone();

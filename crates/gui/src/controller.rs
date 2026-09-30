@@ -926,7 +926,9 @@ struct ShellState {
     /// successful open. `None` config dir (its own resolution failed) means
     /// entries are tracked in memory for the session but never persisted.
     recent: Vec<recent::RecentEntry>,
-    recent_config_dir: Option<PathBuf>,
+    /// The directory every table's save writes `settings.toml` into,
+    /// installed once at startup for every table alongside `[recent]`.
+    config_dir: Option<PathBuf>,
     /// The active tab's planes changed underneath the open renderer cell --
     /// a background run settling on it or a close renumbering the tabs --
     /// so the next [`AppController::canvas_feed`] reloads even though the
@@ -3314,14 +3316,15 @@ impl AppController {
     // -- The projects overlay: its toggle, its gallery and the rail's
     // actions the overlay itself does not draw. --
 
-    /// Installs the `Recent` list loaded at startup and the directory it
-    /// persists to -- `main.rs`'s own read, mirroring
-    /// `install_input_table`; this crate's one exception to "no fs touch in
-    /// `controller.rs`" is [`recent::save`]/[`recent::load`] themselves,
-    /// which live in `crate::recent`, not here.
+    /// Installs the `Recent` list loaded at startup and the config
+    /// directory every table's save writes `settings.toml` into --
+    /// `main.rs`'s own read, mirroring `install_input_table`; this crate's
+    /// one exception to "no fs touch in `controller.rs`" is
+    /// [`recent::save`]/[`recent::load`] themselves, which live in
+    /// `crate::recent`, not here.
     pub fn install_recent(&mut self, entries: Vec<recent::RecentEntry>, config_dir: PathBuf) {
         self.state.recent = entries;
-        self.state.recent_config_dir = Some(config_dir);
+        self.state.config_dir = Some(config_dir);
     }
 
     /// The rail's own `Recent` rows, dates rendered against `now_unix` --
@@ -3340,8 +3343,8 @@ impl AppController {
 
     /// Records `name`/`folder`/`path` at the front of the `Recent` list and
     /// persists it, if a config directory resolved at startup. A write
-    /// failure is silent: the `Recent` list is a convenience, never a
-    /// reason to interrupt an open.
+    /// failure is logged but never a reason to interrupt an open: the
+    /// `Recent` list stays correct in memory for the rest of the session.
     fn record_recent(
         &mut self,
         name: String,
@@ -3350,9 +3353,23 @@ impl AppController {
         opened_at: i64,
     ) {
         recent::record(&mut self.state.recent, name, folder, path, opened_at);
-        if let Some(dir) = &self.state.recent_config_dir {
-            let _ = recent::save(dir, &self.state.recent);
+        if let Some(dir) = &self.state.config_dir
+            && let Err(e) = recent::save(dir, &self.state.recent)
+        {
+            tracing::warn!(error = %e, "the Recent list could not be saved");
         }
+    }
+
+    /// Test-only wrapper to exercise
+    /// a save failure without driving a whole project open.
+    pub fn record_recent_for_test(
+        &mut self,
+        name: String,
+        folder: PathBuf,
+        path: Option<PathBuf>,
+        opened_at: i64,
+    ) {
+        self.record_recent(name, folder, path, opened_at);
     }
 
     /// Opens the `Recent` row at `index`: an already-open tab for that

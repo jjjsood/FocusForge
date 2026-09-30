@@ -38,8 +38,8 @@ struct Args {
     /// order, one `open_paths` call per path.
     #[arg(long, action = clap::ArgAction::Append)]
     open: Vec<PathBuf>,
-    /// Read and write the input map at `<DIR>/focusforge/input.toml`
-    /// instead of the platform config directory.
+    /// Read and write the input map at `<DIR>/focusforge/settings.toml`'s
+    /// `[input]` table instead of the platform config directory.
     #[arg(long)]
     config_dir: Option<PathBuf>,
     /// Opens the settings modal on the named section at startup:

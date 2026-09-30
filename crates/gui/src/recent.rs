@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The `Recent` list's own file: TOML at `<config_dir>/recent.toml`, capped
-//! at [`MAX_ENTRIES`](crate::recent::MAX_ENTRIES), most recent first. No
-//! `use slint::` anywhere in this file, mirroring `crate::input_config`.
+//! The `Recent` list's own table: `[recent]` in `<config_dir>/settings.toml`,
+//! capped at [`MAX_ENTRIES`](crate::recent::MAX_ENTRIES), most recent first.
+//! No `use slint::` anywhere in this file, mirroring `crate::input_config`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::settings;
 
 /// The most entries the file ever holds.
 pub const MAX_ENTRIES: usize = 5;
@@ -32,29 +34,53 @@ struct RecentFile {
     entries: Vec<RecentEntry>,
 }
 
-/// Loads the list from `<config_dir>/recent.toml`. A missing file or a
-/// parse failure both read as an empty list -- there is nothing here worth
-/// refusing a whole file over, unlike `input_config::load`'s bindings.
-pub fn load(config_dir: &Path) -> Vec<RecentEntry> {
-    let path = config_dir.join("recent.toml");
-    let Ok(src) = fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    toml::from_str::<RecentFile>(&src)
-        .map(|f| f.entries)
-        .unwrap_or_default()
+#[derive(Debug, Default, Deserialize)]
+struct SettingsWrapper {
+    #[serde(default)]
+    recent: Option<RecentFile>,
 }
 
-/// Writes `entries` to `<config_dir>/recent.toml`, creating `config_dir` if
-/// needed.
-pub fn save(config_dir: &Path, entries: &[RecentEntry]) -> std::io::Result<()> {
-    fs::create_dir_all(config_dir)?;
-    let path = config_dir.join("recent.toml");
-    let body = toml::to_string_pretty(&RecentFile {
+/// Loads `[recent]` from `settings.toml`. Any failure -- the table absent,
+/// broken, or the file unreadable -- reads as an empty list; there is
+/// nothing here worth refusing a whole file over, unlike
+/// `input_config::load`'s bindings. A user with no `[recent]` table but an
+/// old `recent.toml` keeps their list: read once and written into
+/// `settings.toml`, the old file left untouched.
+pub fn load(config_dir: &Path) -> Vec<RecentEntry> {
+    let (_, read_result) = settings::read(config_dir);
+    let src = match read_result {
+        Ok(text) => text.unwrap_or_default(),
+        // The file exists but could not even be read as UTF-8 -- treated
+        // the same as broken, never as absent, so it is never migrated
+        // onto or overwritten.
+        Err(_) => return Vec::new(),
+    };
+
+    if let Ok(SettingsWrapper {
+        recent: Some(file), ..
+    }) = toml::from_str::<SettingsWrapper>(&src)
+    {
+        return file.entries;
+    }
+
+    if !settings::has_table(&src, "recent")
+        && let Ok(old) = fs::read_to_string(config_dir.join("recent.toml"))
+        && let Ok(file) = toml::from_str::<RecentFile>(&old)
+    {
+        let _ = settings::write_table(config_dir, "recent", settings::to_table(&file));
+        return file.entries;
+    }
+
+    Vec::new()
+}
+
+/// Writes `entries` as `settings.toml`'s `[recent]` table, creating
+/// `config_dir` if needed. Every other table in the file is left as it was.
+pub fn save(config_dir: &Path, entries: &[RecentEntry]) -> Result<PathBuf, settings::WriteError> {
+    let table = settings::to_table(&RecentFile {
         entries: entries.to_vec(),
-    })
-    .expect("RecentFile always serialises");
-    fs::write(path, body)
+    });
+    settings::write_table(config_dir, "recent", table)
 }
 
 /// Records a fresh open at the front of `entries`, dropping any existing

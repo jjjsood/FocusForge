@@ -28,7 +28,7 @@ crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
                worker that drives `crates/core`'s own job engine on a
                background thread, a load worker that walks a folder and
                decodes a thumbnail off the event-loop thread, and a
-               keyboard/mouse binding table read from `input.toml`
+               keyboard/mouse binding table read from `settings.toml`
 spikes/        standalone, workspace-excluded feasibility spikes
 fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the test suite
 ```
@@ -56,8 +56,9 @@ fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the tes
   `unstable-wgpu-29` pinned to the same wgpu major `focusforge-gpu`
   declares, and `unstable-winit-030`), `slint-build` (build dependency),
   `i-slint-backend-testing` (dev dependency), `clap`, `rfd` (native
-  folder/file picker), `toml`/`serde` (`input.toml` and the `Recent`
-  project list), `directories` (per-platform data/config paths), `png`
+  folder/file picker), `toml`/`toml_edit`/`serde` (`settings.toml`'s
+  `[recent]` and `[input]` tables), `directories` (per-platform data/config
+  paths), `png`
   (`--screenshot`), `tracing`. Inter ships bundled under `assets/fonts/`;
   the icon set is vendored from Lucide under `assets/icons/`.
 - `focusforge-diagnostics`: `tracing`/`tracing-subscriber` (with the
@@ -92,7 +93,7 @@ the crash notice on the next start, each driven by spawning the built
 binary as a child process so a deliberate crash never takes down the test
 runner -- plus the fixture manifest. `crates/gui` has its own suite — the
 theme tokens, the plain-Rust shell and canvas state, the viewport
-arithmetic, the input-binding table and its `input.toml` file format,
+arithmetic, the input-binding table and its `settings.toml` file format,
 classifying a folder, a dropped set of frames or a saved project into tabs,
 the `Images` and `Settings` dock panels, editor mode's brush, pipette,
 undo/redo and overlay controls and its dual-pane cursor mirroring, the

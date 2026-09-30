@@ -29,6 +29,7 @@ focusforge-core = { path = "../core" }
 focusforge-diagnostics = { path = "../diagnostics" }
 focusforge-gpu = { path = "../gpu", features = ["gpu"] }
 toml = "1"
+toml_edit = "0.25"
 serde = { version = "1", features = ["derive"] }
 directories = "6"
 rfd = "0.17.2"
