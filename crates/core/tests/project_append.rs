@@ -563,8 +563,8 @@ fn written(ids: &[Option<String>], i: usize) -> &str {
 }
 
 #[test]
-fn seal_held_keeps_each_checkpoints_created_at() {
-    let dir = tmp_dir("seal_held_created_at");
+fn seal_chain_keeps_each_checkpoints_created_at() {
+    let dir = tmp_dir("seal_chain_created_at");
     let sources = write_sources(&dir, 3);
     let held = [
         held_checkpoint(&dir, &sources, 1, 1_000),
@@ -582,8 +582,8 @@ fn seal_held_keeps_each_checkpoints_created_at() {
 }
 
 #[test]
-fn seal_held_onto_an_existing_project_extends_its_chain() {
-    let (dir, project_path, sources) = sealed("seal_held_onto_existing");
+fn seal_chain_onto_an_existing_project_extends_its_chain() {
+    let (dir, project_path, sources) = sealed("seal_chain_onto_existing");
     let root_id = head_of(&project_path);
 
     let held = [held_checkpoint(&dir, &sources, 1, 3_000)];
@@ -600,8 +600,8 @@ fn seal_held_onto_an_existing_project_extends_its_chain() {
 }
 
 #[test]
-fn seal_held_failing_midway_leaves_the_target_untouched() {
-    let (dir, project_path, sources) = sealed("seal_held_fails");
+fn seal_chain_failing_midway_leaves_the_target_untouched() {
+    let (dir, project_path, sources) = sealed("seal_chain_fails");
     let before = std::fs::read(&project_path).unwrap();
 
     let first = held_checkpoint(&dir, &sources, 1, 3_000);
@@ -618,8 +618,8 @@ fn seal_held_failing_midway_leaves_the_target_untouched() {
 }
 
 #[test]
-fn seal_held_refuses_an_empty_chain() {
-    let dir = tmp_dir("seal_held_empty");
+fn seal_chain_refuses_an_empty_chain() {
+    let dir = tmp_dir("seal_chain_empty");
     let target = dir.join(format!("demo.{}", project::PROJECT_EXTENSION));
     assert!(seal_chain(&target, &[], false).is_err());
     assert!(!target.exists());

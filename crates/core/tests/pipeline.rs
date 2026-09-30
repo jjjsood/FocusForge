@@ -45,7 +45,7 @@ fn scratch(label: &str) -> PathBuf {
 }
 
 /// Seals `held` as the root of a new project at `target`.
-fn seal_held_alone(target: &Path, held: &project::HeldCheckpoint) {
+fn seal_chain_alone(target: &Path, held: &project::HeldCheckpoint) {
     let entry = project::InMemoryCheckpoint {
         kind: project::InMemoryKind::Fused(held.clone()),
         parent: None,
@@ -683,7 +683,7 @@ fn a_held_run_seals_to_the_same_project() {
     );
 
     let target = scratch("held_run_saved").join("held.ffp");
-    seal_held_alone(&target, &held);
+    seal_chain_alone(&target, &held);
 
     let mut direct_request = base_request("direct_run", frames, ParamValues::new());
     direct_request.align = Some(AlignRequest {
@@ -831,7 +831,7 @@ fn registration_persists_through_seal_and_hold() {
     assert_eq!(held.registration.crop, Some(held_expected_crop));
 
     let target = scratch("registration_hold_saved").join("held.ffp");
-    seal_held_alone(&target, &held);
+    seal_chain_alone(&target, &held);
     let sealed_from_held = Project::open(&target).expect("reopen").manifest().clone();
     assert_transforms_bit_eq(
         &sealed_from_held.registration.transforms,
