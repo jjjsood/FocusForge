@@ -156,10 +156,6 @@ impl HostFacts {
     }
 }
 
-/// The fallback snapshot as a value, for a caller that wants it without
-/// spelling out [`HostFacts::fallback`].
-pub const FALLBACK_FACTS: HostFacts = HostFacts::fallback();
-
 /// The substitution seam: anything that can answer "what does the host
 /// have right now". [`SysinfoProbe`] is the real, re-readable probe;
 /// [`FixedFacts`] is a fabricated-values test double, reached the same way
@@ -396,7 +392,6 @@ mod tests {
         assert_eq!(facts.logical_cores(), 1);
         assert_eq!(facts.usable_memory(), 0);
         assert_eq!(facts.usable_available(), 0);
-        assert_eq!(FALLBACK_FACTS, facts);
     }
 
     #[test]

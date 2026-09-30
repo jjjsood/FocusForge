@@ -193,12 +193,6 @@ pub trait StageObserver: Sync {
     fn notice(&self, _message: &str) {}
 }
 
-/// A [`StageObserver`] that does nothing -- what a caller with no
-/// presentation layer of its own (a test) passes.
-pub struct NoopObserver;
-
-impl StageObserver for NoopObserver {}
-
 /// Every early exit from the spine, typed by the stage that raised it.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

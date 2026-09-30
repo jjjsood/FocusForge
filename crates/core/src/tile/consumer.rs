@@ -52,12 +52,6 @@ impl<'a> TileJob<'a> {
         &self.ctx
     }
 
-    /// `true` when this job's context carries at least one frame-tile --
-    /// `false` for a job built through [`Self::without_frame_tiles`].
-    pub fn has_frame_tiles(&self) -> bool {
-        self.ctx.frame_count() > 0
-    }
-
     /// The rectangle this job's tile alone owns in the assembled output.
     pub fn interior(&self) -> Rect {
         self.tile.interior()
