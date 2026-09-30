@@ -1325,7 +1325,6 @@ mod tests {
         .expect("valid solver inputs");
 
         assert_eq!(result.status, EccStatus::Converged, "result: {result:?}");
-        // The exact recorded result, bit for bit.
         let bits = (
             result.transform.m.map(|row| row.map(f64::to_bits)),
             result.iterations,
