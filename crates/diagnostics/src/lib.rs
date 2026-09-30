@@ -160,11 +160,11 @@ fn stderr_default_level(verbosity: i8) -> LevelFilter {
 /// third-party TRACE chatter out of a release build's file (a compile-time
 /// `tracing` cap cannot see records arriving through this bridge) and off
 /// the timing budget.
-fn bridge_cap(verbosity: i8) -> log::LevelFilter {
+fn bridge_cap(verbosity: i8) -> tracing_log::log::LevelFilter {
     if verbosity >= 2 {
-        log::LevelFilter::Debug
+        tracing_log::log::LevelFilter::Debug
     } else {
-        log::LevelFilter::Warn
+        tracing_log::log::LevelFilter::Warn
     }
 }
 

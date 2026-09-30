@@ -1645,7 +1645,6 @@ dependencies = [
  "crash-handler",
  "directories",
  "focusforge-core",
- "log",
  "minidumper",
  "rayon",
  "sadness-generator",
