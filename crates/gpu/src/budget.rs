@@ -224,8 +224,8 @@ pub fn buffer_limit_shortfalls(
     out
 }
 
-/// The device-side VRAM working-set budget: a byte count, where it came
-/// from, and whether a live probe set it. Mirrors `HostBudget`.
+/// The device-side VRAM working-set budget: a byte count and where it came
+/// from. Mirrors `HostBudget`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceBudget {
     bytes: u64,
