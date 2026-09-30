@@ -134,8 +134,8 @@ impl Canvas {
         }
     }
 
-    /// Opens `composite`/`zmap` as `tab`'s own planes, naming the failure on
-    /// stderr rather than panicking: a plane the pipeline itself just wrote
+    /// Opens `composite`/`zmap` as `tab`'s own planes, logging failures rather
+    /// than panicking: a plane the pipeline itself just wrote
     /// failing to reopen is an environment problem (a full disk, a
     /// permissions change), not a bug worth crashing the window over. `tab`
     /// is recorded even when the open fails, so an unreadable plane file is
@@ -146,7 +146,7 @@ impl Canvas {
         self.tab = Some(tab);
         let renderer = self.renderer_mut();
         if let Err(err) = renderer.set_planes(composite, zmap) {
-            eprintln!("failed to open the project's planes: {err}");
+            tracing::error!("failed to open the project's planes: {err}");
         }
     }
 
