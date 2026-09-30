@@ -461,10 +461,11 @@ fn run_window<T: ComponentHandle + 'static>(
     if let Some(canvas) = canvas {
         canvas.borrow_mut().detach_device();
     }
-    *device.borrow_mut() = None;
-
     if let Err(e) = run_result {
         tracing::error!("event loop exited with an error: {e}");
+        if let Some(device) = device.borrow().as_ref().cloned() {
+            let _ = device.poll(wgpu::PollType::Poll);
+        }
         if focusforge_gpu::errors::device_lost() || forced_loss.get() {
             if !loss_reported.replace(true) {
                 tracing::error!("ending the session: the graphics device is gone");
@@ -474,6 +475,7 @@ fn run_window<T: ComponentHandle + 'static>(
             exit_code.set(1);
         }
     }
+    *device.borrow_mut() = None;
     exit_code.get()
 }
 
