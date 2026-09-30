@@ -237,6 +237,27 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     ]
 });
 
+/// Bytes of reference templates a run retains, over every level the
+/// pyramid can have (`ceil(dim / 2^k)`, `k` up to [`MAX_LEVELS`]): per
+/// solve-region pixel a value (4 B), a four-column Jacobian (32 B) and the
+/// full-overlap term (8 B), the rotation-scale mode being the larger one.
+pub(crate) fn retained_template_bytes(width: u32, height: u32) -> u64 {
+    (0..=MAX_LEVELS)
+        .map(|k| {
+            let region =
+                PyramidalEcc::solve_region(width.div_ceil(1 << k), height.div_ceil(1 << k));
+            region.width as u64 * region.height as u64 * (4 + 8 * 4 + 8)
+        })
+        .sum()
+}
+
+/// Bytes one solve allocates besides the templates: three 8-byte-per-pixel
+/// vectors over the level-0 solve region, the largest of any level.
+pub(crate) fn solve_scratch_bytes(width: u32, height: u32) -> u64 {
+    let region = PyramidalEcc::solve_region(width, height);
+    region.width as u64 * region.height as u64 * 24
+}
+
 /// The Pyramidal ECC alignment algorithm. See the module docs for the
 /// coarse-to-fine loop and the solve region.
 pub struct PyramidalEcc;
@@ -680,6 +701,17 @@ mod tests {
                 height: 384,
             }
         );
+    }
+
+    #[test]
+    fn retained_templates_sum_the_solve_regions_of_every_level() {
+        // Level regions at 8192x5464: 1253x836 on levels 0-2 (the sample
+        // budget binds), then the 0.75 share of each halved level; 44 bytes
+        // per pixel (values, Jacobian, full-overlap terms).
+        assert_eq!(retained_template_bytes(8192, 5464), 161_361_640);
+        assert_eq!(retained_template_bytes(512, 512), 8_650_400);
+        assert_eq!(solve_scratch_bytes(512, 512), 24 * 384 * 384);
+        assert_eq!(solve_scratch_bytes(8192, 5464), 24 * 1253 * 836);
     }
 
     #[test]

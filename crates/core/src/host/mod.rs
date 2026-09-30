@@ -125,10 +125,12 @@ impl HostFacts {
         self.origin
     }
 
-    /// This process's resident set size, in bytes, as of the read that
-    /// produced this snapshot -- `None` when the process lookup failed or on
-    /// [`HostFacts::fallback`]. A `None` here disarms a consumer's back-off
-    /// logic rather than failing anything.
+    /// This process's anonymous resident memory, in bytes, as of the read
+    /// that produced this snapshot: heap and stacks, without file-backed
+    /// pages such as mapped frames. Where the platform does not separate the
+    /// two, the whole resident set. `None` when the process lookup failed or
+    /// on [`HostFacts::fallback`]. A `None` here disarms a consumer's
+    /// back-off logic rather than failing anything.
     pub fn process_rss(&self) -> Option<u64> {
         self.process_rss
     }
@@ -243,6 +245,15 @@ impl HostProbe for SysinfoProbe {
     }
 }
 
+/// The `RssAnon` figure of a process status text, in bytes: anonymous
+/// resident memory, without file-backed pages such as mapped frames. `None`
+/// when the line is absent or malformed.
+fn anonymous_rss(status: &str) -> Option<u64> {
+    let line = status.lines().find_map(|l| l.strip_prefix("RssAnon:"))?;
+    let kilobytes: u64 = line.trim().strip_suffix("kB")?.trim().parse().ok()?;
+    kilobytes.checked_mul(1024)
+}
+
 /// Reads the applicable cgroup memory limit, preferring the **process's
 /// own** cgroup scope over the root cgroup: `System::cgroup_limits` sees
 /// only the root cgroup and therefore misses a `systemd-run`/container
@@ -268,6 +279,15 @@ fn read_process_facts(sys: &mut System) -> (Option<u64>, Option<u64>, Option<u64
             rss = Some(process.memory());
             process_cgroup_limits = process.cgroup_limits();
         }
+    }
+    // Mapped frame pages are file-backed and reclaimable; only anonymous
+    // memory is pressure this run caused, so it replaces the whole set
+    // wherever the platform reports it.
+    if let Some(anonymous) = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| anonymous_rss(&status))
+    {
+        rss = Some(anonymous);
     }
     // The process's own cgroup scope wins when it has one; the root scope
     // (`System::cgroup_limits`) is the fallback used both when the process
@@ -315,6 +335,29 @@ pub fn os_description() -> OsDescription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anonymous_rss_reads_the_anonymous_line_in_kilobytes() {
+        let status =
+            "Name:\tfocusforge\nVmRSS:\t  9000 kB\nRssAnon:\t  2048 kB\nRssFile:\t  6952 kB\n";
+        assert_eq!(anonymous_rss(status), Some(2048 * 1024));
+    }
+
+    #[test]
+    fn anonymous_rss_is_none_without_the_line_or_a_number() {
+        assert_eq!(anonymous_rss("Name:\tfocusforge\nVmRSS:\t9000 kB\n"), None);
+        assert_eq!(anonymous_rss("RssAnon:\tlots kB\n"), None);
+        assert_eq!(anonymous_rss(""), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_process_reports_anonymous_resident_memory_on_linux() {
+        let facts = SysinfoProbe::new().facts();
+        let anonymous = facts.process_rss().expect("Linux exposes RssAnon");
+        assert!(anonymous > 0);
+        assert!(anonymous <= facts.total_memory());
+    }
 
     #[test]
     fn probing_this_machine_returns_a_nonzero_total() {

@@ -842,3 +842,64 @@ fn no_align_registration_is_identity_transforms_and_the_kernel_inset_crop() {
         "a --no-align run must record identity for every frame"
     );
 }
+
+/// The pipeline divides its capped host budget into alignment workers: a
+/// larger cap runs more workers, the alignment and the composite bytes do
+/// not depend on the cap, and the reported accounted bytes follow the worker count.
+#[test]
+fn the_host_cap_sets_the_alignment_workers_but_not_the_alignment() {
+    use focusforge_core::align::{bytes_per_registration, bytes_shared_reference};
+    use focusforge_core::params::StackContext;
+    use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
+
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let stack = StackContext::new(4, 512, 512, 3);
+    let shared = bytes_shared_reference(stack);
+    let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
+
+    let run_with_cap = |label: &str, cap: u64| {
+        let mut explicit = ParamValues::new();
+        explicit.insert("max-iterations".to_string(), ParamValue::Int(20));
+        let mut request = base_request(label, mantis_frames(4), ParamValues::new());
+        request.align = Some(AlignRequest {
+            algorithm: registry::find_align("pyramidal-ecc").expect("pyramidal-ecc registered"),
+            explicit,
+            lax: true,
+        });
+        request.cache = false;
+        request.output = FuseOutput::Hold(scratch(&format!("{label}_hold")));
+        request.max_host_memory = Some(cap);
+        match focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+            .expect("the capped run completes")
+        {
+            FuseOutcome::Completed(report) => report,
+            _ => panic!("the run must complete"),
+        }
+    };
+
+    let one = run_with_cap("cap_one_worker", 1);
+    let two = run_with_cap("cap_two_workers", shared + 2 * per_registration);
+    assert_eq!(one.align_workers, Some(1));
+    assert_eq!(two.align_workers, Some(available.min(2)));
+    for report in [&one, &two] {
+        let workers = report.align_workers.unwrap() as u64;
+        assert_eq!(
+            report.align_accounted_bytes,
+            Some(shared + workers * per_registration)
+        );
+    }
+    let frames = |report: &focusforge_core::pipeline::FuseReport| {
+        format!(
+            "{:?}",
+            report.align.as_ref().expect("aligned").alignment.frames
+        )
+    };
+    assert_eq!(frames(&one), frames(&two));
+    let composite = |report: &focusforge_core::pipeline::FuseReport| match &report.product {
+        FuseProduct::Held(held) => std::fs::read(&held.composite).expect("composite is readable"),
+        FuseProduct::Sealed(_) => panic!("the run holds its checkpoint"),
+    };
+    assert_eq!(composite(&one), composite(&two));
+}

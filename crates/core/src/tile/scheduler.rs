@@ -294,6 +294,7 @@ pub struct TileScheduler<'a> {
     scratch_base: PathBuf,
     in_flight: usize,
     pool_threads: usize,
+    bytes_per_tile_set: u64,
     budget: HostBudget,
     gate: HostBudgetGate,
 }
@@ -314,7 +315,8 @@ impl<'a> TileScheduler<'a> {
         let pool_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let bytes = bytes_per_tile_set(stack.frame_count, options.tile_size, samples_per_pixel);
+        let bytes = bytes_per_tile_set(stack.frame_count, options.tile_size, samples_per_pixel)
+            + reader.read_scratch_bytes(options.tile_size, options.tile_size);
 
         if options.budget.refuses_below_one_tile_set()
             && bytes > 0
@@ -339,6 +341,7 @@ impl<'a> TileScheduler<'a> {
             scratch_base: options.scratch_base.clone(),
             in_flight,
             pool_threads,
+            bytes_per_tile_set: bytes,
             budget: options.budget,
             gate,
         })
@@ -354,6 +357,12 @@ impl<'a> TileScheduler<'a> {
     /// limit during a run -- see `TileRunReport::final_in_flight_limit`.
     pub fn in_flight_limit(&self) -> usize {
         self.in_flight
+    }
+
+    /// The bytes one in-flight tile set is accounted at: every frame's tile
+    /// plus the reader's per-read scratch.
+    pub fn bytes_per_tile_set(&self) -> u64 {
+        self.bytes_per_tile_set
     }
 
     /// The rayon pool's own thread count -- `available_parallelism()`,

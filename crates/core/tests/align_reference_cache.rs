@@ -23,8 +23,8 @@ use focusforge_core::align::{
 };
 use focusforge_core::io::TiffStack;
 use focusforge_core::params::{self, ParamDesc, ParamValue, ParamValues, StackContext};
-use focusforge_core::tile::Rect;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
+use focusforge_core::tile::{HostBudget, Rect};
 
 fn open_fixture() -> TiffStack {
     TiffStack::open(common::mantis_512_dir()).expect("opening fixtures/mantis-512")
@@ -429,7 +429,7 @@ fn reference_frame_is_read_once_per_run() {
         &cfg,
         FailurePolicy::Strict,
         &AlignDriverOptions {
-            max_bytes_in_flight: 1,
+            budget: HostBudget::explicit(1),
             ..Default::default()
         },
     )
@@ -469,7 +469,7 @@ fn cached_transforms_match_uncached() {
         &cfg,
         FailurePolicy::Strict,
         &AlignDriverOptions {
-            max_bytes_in_flight: 1,
+            budget: HostBudget::explicit(1),
             ..Default::default()
         },
     )
@@ -571,7 +571,7 @@ fn two_runs_do_not_share_a_cache() {
         &cfg_first,
         FailurePolicy::Strict,
         &AlignDriverOptions {
-            max_bytes_in_flight: 1,
+            budget: HostBudget::explicit(1),
             ..Default::default()
         },
     )
@@ -592,7 +592,7 @@ fn two_runs_do_not_share_a_cache() {
         &cfg_second,
         FailurePolicy::Strict,
         &AlignDriverOptions {
-            max_bytes_in_flight: 1,
+            budget: HostBudget::explicit(1),
             ..Default::default()
         },
     )
@@ -635,7 +635,7 @@ fn prepared_state_is_dropped_when_the_run_ends() {
         &cfg,
         FailurePolicy::Strict,
         &AlignDriverOptions {
-            max_bytes_in_flight: 1,
+            budget: HostBudget::explicit(1),
             ..Default::default()
         },
     )

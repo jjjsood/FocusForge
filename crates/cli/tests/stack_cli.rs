@@ -717,6 +717,7 @@ fn report_json_has_every_field() {
         "in_flight_limit",
         "peak_in_flight",
         "max_bytes_in_flight",
+        "accounted_bytes_in_flight",
         "budget_provenance",
         "backed_off",
         "outputs",
@@ -724,6 +725,7 @@ fn report_json_has_every_field() {
         "stages",
         "align_workers",
         "peak_align_workers",
+        "align_accounted_bytes",
         "device_peak_in_flight",
     ] {
         assert!(report.get(key).is_some(), "missing key {key:?} in {report}");
@@ -860,6 +862,12 @@ fn max_host_memory_lowers_never_raises_and_does_not_move_pixels() {
     let capped_report: serde_json::Value =
         serde_json::from_str(&capped.stdout).expect("--json must parse");
     assert_eq!(capped_report["max_bytes_in_flight"], 4_194_304);
+    assert!(
+        capped_report["accounted_bytes_in_flight"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "the scheduler's accounted bytes must be reported: {capped_report}"
+    );
     assert_eq!(capped_report["budget_provenance"], "Explicit");
 
     let mut uncapped_args = common_args(&uncapped_dir);

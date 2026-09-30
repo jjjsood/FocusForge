@@ -107,6 +107,14 @@ pub trait TileReader: Send + Sync {
         out: &mut [u16],
     ) -> Result<(), AlgorithmError>;
 
+    /// The heap bytes one [`Self::read_tile_into`] of a `width x height` rect
+    /// allocates besides `out`: decode buffers, warp sources and the like.
+    /// Memory the reader keeps resident between reads (a decoded-segment
+    /// cache) is not scratch. Readers that allocate nothing keep the default.
+    fn read_scratch_bytes(&self, _width: u32, _height: u32) -> u64 {
+        0
+    }
+
     /// Every `step`-th row and column of `rect`, as [`read_tile_step_into`].
     /// A reader that can drop unsampled columns while it converts overrides
     /// this; the default reads each sampled row whole.

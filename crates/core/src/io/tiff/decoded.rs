@@ -415,6 +415,9 @@ pub struct DecodedTiffStack {
     frames: Vec<Frame>,
     cache: SegmentCache,
     cache_bytes: u64,
+    /// Heap one segment decode allocates: the decoded byte buffer plus the
+    /// unconverted sample vector, both sized by the largest stored segment.
+    decode_scratch_bytes: u64,
 }
 
 impl DecodedTiffStack {
@@ -434,6 +437,7 @@ impl DecodedTiffStack {
         }
         let mut frames: Vec<Frame> = Vec::with_capacity(paths.len());
         let mut required = None;
+        let mut largest_stored = 0u64;
         for path in paths {
             let file = File::open(path).map_err(|source| TiffError::Io {
                 path: path.clone(),
@@ -445,6 +449,7 @@ impl DecodedTiffStack {
             }
             let segments = segment_layout(&header)?;
             for segment in &segments {
+                largest_stored = largest_stored.max(stored_segment_bytes(&header, *segment)?);
                 let bytes = segment_bytes(&header, *segment)?;
                 if required
                     .as_ref()
@@ -472,6 +477,7 @@ impl DecodedTiffStack {
             frames,
             cache: SegmentCache::default(),
             cache_bytes,
+            decode_scratch_bytes: 2 * largest_stored + 1,
         })
     }
 
@@ -591,6 +597,10 @@ impl FrameReader for DecodedTiffStack {
 }
 
 impl TileReader for DecodedTiffStack {
+    fn read_scratch_bytes(&self, _width: u32, _height: u32) -> u64 {
+        self.decode_scratch_bytes
+    }
+
     fn read_tile_into(
         &self,
         frame: usize,
@@ -601,6 +611,17 @@ impl TileReader for DecodedTiffStack {
             .map_err(crate::io::FrameError::from)
             .map_err(AlgorithmError::from)
     }
+}
+
+fn stored_segment_bytes(header: &TiffHeader, info: SegmentInfo) -> Result<u64, TiffError> {
+    u64::from(info.stored_width)
+        .checked_mul(u64::from(info.stored_height))
+        .and_then(|bytes| bytes.checked_mul(u64::from(header.samples_per_pixel)))
+        .and_then(|bytes| bytes.checked_mul(2))
+        .ok_or_else(|| TiffError::SegmentLayout {
+            path: header.path.clone(),
+            detail: "stored segment byte length overflows",
+        })
 }
 
 fn segment_bytes(header: &TiffHeader, info: SegmentInfo) -> Result<u64, TiffError> {

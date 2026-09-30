@@ -402,3 +402,88 @@ fn too_small_host_budget_is_refused_by_name() {
     );
     assert!(rendered.contains("stack fewer frames"), "{rendered}");
 }
+
+/// A zero-filling reader that reports a fixed scratch cost per read.
+struct ScratchReader(u64);
+
+impl TileReader for ScratchReader {
+    fn read_tile_into(
+        &self,
+        _frame: usize,
+        _rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        out.fill(0);
+        Ok(())
+    }
+
+    fn read_scratch_bytes(&self, _width: u32, _height: u32) -> u64 {
+        self.0
+    }
+}
+
+/// The host refusal compares the budget with the tile set plus the reader's
+/// per-read scratch, not the frame tiles alone.
+#[test]
+fn host_refusal_counts_reader_scratch() {
+    // usable_available = 2_000_000 B; budget = 40% = 800_000 B, above the
+    // 786_432 B of frame tiles and below the 1_786_432 B with scratch.
+    let facts = HostFacts::new(4_000_000, 2_000_000, None, None, 4);
+    let scratch_base =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_scratch_refusal");
+    let mut options = TileSchedulerOptions::with_host_facts(scratch_base, &facts);
+    options.tile_size = 128;
+    options.levels = 0;
+    let stack_ctx = StackContext::new(8, 128, 128, 3);
+
+    assert!(TileScheduler::new(&ZeroReader, stack_ctx, 3, &options).is_ok());
+    let reader = ScratchReader(1_000_000);
+    match TileScheduler::new(&reader, stack_ctx, 3, &options) {
+        Err(TileError::HostMemoryTooSmall {
+            budget_bytes,
+            bytes_per_tile_set,
+            ..
+        }) => {
+            assert_eq!(budget_bytes, 800_000);
+            assert_eq!(bytes_per_tile_set, 1_786_432);
+        }
+        Ok(_) => panic!("scratch must count towards the host refusal"),
+        Err(other) => panic!("expected HostMemoryTooSmall, got {other:?}"),
+    }
+}
+
+/// A scaling warp reads a wider footprint than the tile it delivers, so the
+/// same explicit budget admits fewer tile sets than an identity warp does.
+#[test]
+fn a_scale_warp_lowers_the_in_flight_limit() {
+    use focusforge_core::align::{Transform, WarpingReader};
+
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if available < 2 {
+        eprintln!("host reports one logical core; the in-flight limit cannot exceed 1");
+        return;
+    }
+    let frame_count = 8usize;
+    let bytes_per_tile_set = frame_count as u64 * 128 * 128 * 3 * 2;
+    let limit_for = |transform: Transform, name: &str| {
+        let reader = WarpingReader::new(&ZeroReader, (512, 512), 3, vec![transform; frame_count]);
+        let scratch_base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+        let mut options =
+            TileSchedulerOptions::explicit_budget(scratch_base, 2 * bytes_per_tile_set);
+        options.tile_size = 128;
+        options.levels = 0;
+        let stack_ctx = StackContext::new(frame_count, 512, 512, 3);
+        TileScheduler::new(&reader, stack_ctx, 3, &options)
+            .expect("scheduler must build")
+            .in_flight_limit()
+    };
+    let identity = limit_for(Transform::identity(), "tile_scheduler_memory_warp_identity");
+    let scaled = limit_for(
+        Transform::similarity(1.5, 0.0, 0.0, 0.0),
+        "tile_scheduler_memory_warp_scale",
+    );
+    assert_eq!(identity, 2);
+    assert!(scaled < identity, "scaled {scaled} vs identity {identity}");
+}

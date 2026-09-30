@@ -5,9 +5,13 @@ mod common;
 use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::time::Duration;
 
+use focusforge_core::algorithm::{AlgorithmError, TileReader};
 use focusforge_core::host::{FixedFacts, HostFacts, HostProbe};
 use focusforge_core::io::{DecodedTiffStack, FrameReader, Rect, TiffError, TiffStack};
-use focusforge_core::tile::HostBudget;
+use focusforge_core::params::StackContext;
+use focusforge_core::tile::{
+    HostBudget, NoopPreprocess, TileConsumer, TileJob, TileScheduler, TileSchedulerOptions,
+};
 use rayon::ThreadPoolBuilder;
 
 fn compressed_set(name: &str) -> std::path::PathBuf {
@@ -773,4 +777,95 @@ fn boundary_errors_release_waiters() {
     ));
     assert!(good.join().unwrap().is_ok());
     std::fs::remove_file(malformed).unwrap();
+}
+
+/// The largest decoded segment a set holds, read off the refusal an empty
+/// cache gives.
+fn largest_segment_bytes(paths: &[std::path::PathBuf]) -> u64 {
+    match DecodedTiffStack::open_files(paths, 0).unwrap_err() {
+        TiffError::DecodedCacheTooSmall { required, .. } => required,
+        other => panic!("expected DecodedCacheTooSmall, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_scratch_is_twice_the_largest_stored_segment_plus_one() {
+    let fixtures = common::fixtures_dir();
+    let frame = |set: &str, name: &str| fixtures.join(set).join("frames").join(name);
+    let sets = [
+        vec![frame("mantis-64-deflate-p1-strip-ii", "00.tif")],
+        vec![frame("mantis-64-lzw-p1-tile-ii", "00.tif")],
+        vec![
+            frame("mantis-64", "00.tif"),
+            frame("mantis-64-lzw-p1-strip-ii", "01.tif"),
+            frame("mantis-64-deflate-p2-tile-mm", "02.tif"),
+        ],
+    ];
+    for paths in sets {
+        let largest = largest_segment_bytes(&paths);
+        let reader = DecodedTiffStack::open_files(&paths, largest).unwrap();
+        assert_eq!(
+            TileReader::read_scratch_bytes(&reader, 64, 64),
+            2 * largest + 1,
+            "{paths:?}"
+        );
+    }
+}
+
+/// One tile's frame-0 samples, keyed by its read rectangle (row, column).
+type TileSamples = ((u32, u32), Vec<u16>);
+
+/// Records every tile's frame-0 samples.
+struct CollectingConsumer {
+    tiles: Mutex<Vec<TileSamples>>,
+}
+
+impl TileConsumer for CollectingConsumer {
+    fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
+        let rect = job.read_rect();
+        let samples = job.ctx().frame(0)?.samples.clone();
+        self.tiles.lock().unwrap().push(((rect.y, rect.x), samples));
+        Ok(())
+    }
+}
+
+fn scheduled_tiles(reader: &dyn TileReader, name: &str) -> Vec<TileSamples> {
+    let scratch = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let mut options = TileSchedulerOptions::explicit_budget(scratch, 1 << 30);
+    options.tile_size = 32;
+    options.levels = 0;
+    let scheduler =
+        TileScheduler::new(reader, StackContext::new(1, 64, 64, 3), 3, &options).unwrap();
+    if std::thread::available_parallelism().is_ok_and(|n| n.get() >= 2) {
+        assert!(scheduler.in_flight_limit() >= 2);
+    }
+    let consumer = CollectingConsumer {
+        tiles: Mutex::default(),
+    };
+    scheduler.run(&NoopPreprocess, &consumer).unwrap();
+    let mut tiles = consumer.tiles.into_inner().unwrap();
+    tiles.sort_by_key(|(key, _)| *key);
+    tiles
+}
+
+#[test]
+fn scheduler_over_a_one_segment_cache_completes_and_matches_the_twin() {
+    let fixtures = common::fixtures_dir();
+    let compressed = fixtures
+        .join("mantis-64-lzw-p1-tile-ii")
+        .join("frames")
+        .join("00.tif");
+    let twin =
+        TiffStack::open_files(&[fixtures.join("mantis-64").join("frames").join("00.tif")]).unwrap();
+    let reader = DecodedTiffStack::open_files(&[compressed], 13_824).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let actual = scheduled_tiles(&reader, "decoded_one_segment");
+        let expected = scheduled_tiles(&twin, "decoded_one_segment_twin");
+        done_tx.send((actual, expected)).unwrap();
+    });
+    let (actual, expected) = done_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the scheduler run must not deadlock on a one-segment cache");
+    assert_eq!(actual, expected);
 }
