@@ -72,12 +72,18 @@ impl ByteOrder {
         }
     }
 
+    /// Decode one `u16` stored in this byte order.
+    #[inline(always)]
+    pub(crate) fn u16_from(self, bytes: [u8; 2]) -> u16 {
+        match self {
+            ByteOrder::Little => u16::from_le_bytes(bytes),
+            ByteOrder::Big => u16::from_be_bytes(bytes),
+        }
+    }
+
     fn u16_at(self, bytes: &[u8]) -> Option<u16> {
         let arr: [u8; 2] = bytes.get(0..2)?.try_into().ok()?;
-        Some(match self {
-            ByteOrder::Little => u16::from_le_bytes(arr),
-            ByteOrder::Big => u16::from_be_bytes(arr),
-        })
+        Some(self.u16_from(arr))
     }
 
     fn u32_at(self, bytes: &[u8]) -> Option<u32> {

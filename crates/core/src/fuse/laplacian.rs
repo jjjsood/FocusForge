@@ -179,7 +179,8 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
-use crate::fuse::{Plane, PyramidError, build, collapse, max_levels};
+use crate::fuse::error::{algorithm_error, missing_key};
+use crate::fuse::{Plane, build, collapse, max_levels};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
 use crate::registry::StackRegistration;
 use crate::tile::Tile;
@@ -216,17 +217,6 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         host_default: None,
     }]
 });
-
-/// Wraps a [`PyramidError`] as this algorithm's own [`AlgorithmError::Failed`]
-/// -- `PyramidError` is not one of [`AlgorithmError`]'s `#[from]` variants
-/// by design (`crate::fuse::error`'s module docs), so every caller wraps it
-/// with the algorithm's own id.
-fn wrap_pyramid_error(source: PyramidError) -> AlgorithmError {
-    AlgorithmError::Failed {
-        algorithm: "laplacian".to_string(),
-        detail: source.to_string(),
-    }
-}
 
 /// Clamp-to-edge on one axis, the same rule
 /// [`crate::fuse::pyramid::reduce`] and [`crate::fuse::pyramid::expand`]
@@ -336,12 +326,7 @@ impl StackAlgorithm for Laplacian {
         let levels = cfg
             .get("levels")
             .and_then(ParamValue::as_i64)
-            .ok_or_else(|| AlgorithmError::Failed {
-                algorithm: "laplacian".to_string(),
-                detail: "resolved values are missing `levels`; call crate::params::resolve \
-                         before fuse"
-                    .to_string(),
-            })? as u32;
+            .ok_or_else(|| missing_key("laplacian", "levels"))? as u32;
 
         let rect = ctx.rect();
         let width = rect.width;
@@ -363,8 +348,8 @@ impl StackAlgorithm for Laplacian {
 
         // Frame 0's pyramid is the running best -- streaming, never
         // `frame_count` pyramids at once.
-        let mut best =
-            build(&frame0.samples, width, height, spp, levels).map_err(wrap_pyramid_error)?;
+        let mut best = build(&frame0.samples, width, height, spp, levels)
+            .map_err(algorithm_error("laplacian"))?;
 
         let mut best_scores: Vec<Vec<f32>> = best
             .levels()
@@ -384,8 +369,8 @@ impl StackAlgorithm for Laplacian {
         let spp_usize = spp as usize;
         for f in 1..frame_count {
             let tile = ctx.frame(f)?;
-            let current =
-                build(&tile.samples, width, height, spp, levels).map_err(wrap_pyramid_error)?;
+            let current = build(&tile.samples, width, height, spp, levels)
+                .map_err(algorithm_error("laplacian"))?;
 
             for (sum, &value) in residual_sum
                 .iter_mut()
@@ -428,7 +413,7 @@ impl StackAlgorithm for Laplacian {
         let mut samples = vec![0u16; width as usize * height as usize * spp_usize];
         collapsed
             .to_u16_into(&mut samples)
-            .map_err(wrap_pyramid_error)?;
+            .map_err(algorithm_error("laplacian"))?;
 
         // Level-0 winner is the Z-Map; `levels >= 1` is enforced by the
         // schema, so `winner` always has at least one entry.
@@ -436,12 +421,8 @@ impl StackAlgorithm for Laplacian {
             .into_iter()
             .next()
             .expect("levels >= 1 (enforced by the schema) guarantees a level-0 winner plane");
-        crate::zmap::validate_tile(&zmap, frame_count as u32).map_err(|source| {
-            AlgorithmError::Failed {
-                algorithm: "laplacian".to_string(),
-                detail: source.to_string(),
-            }
-        })?;
+        crate::zmap::validate_tile(&zmap, frame_count as u32)
+            .map_err(algorithm_error("laplacian"))?;
 
         Ok(TileOutput {
             tile: Tile {

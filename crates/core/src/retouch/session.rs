@@ -125,7 +125,7 @@ impl EditSession {
     /// [`Self::discard_preview`]).
     fn apply_and_snapshot(&mut self, op: &Op) -> Result<(Option<Rect>, Vec<u16>), RetouchError> {
         let footprint = (self.footprint)(op, self.info)?;
-        let region = footprint.and_then(|f| brush::intersect(f, self.tile));
+        let region = footprint.and_then(|f| f.intersect(self.tile));
         let before = region.map(|r| self.extract(r)).unwrap_or_default();
         (self.apply)(op, self.info, self.tile, &mut self.indices)?;
         Ok((region, before))

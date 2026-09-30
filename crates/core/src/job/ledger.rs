@@ -234,6 +234,18 @@ impl Ledger {
     }
 }
 
+/// The text of `path`, or `None` when the file does not exist.
+fn read_opt(path: &Path) -> Result<Option<String>, ResumeError> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ResumeError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// Read `path` back as the sorted set of completed unit indices, tolerating
 /// a torn trailing record.
 ///
@@ -250,15 +262,8 @@ impl Ledger {
 /// mid-file corruption given the ordering rule above, but "stop, don't
 /// guess" is the right response if one is ever found.
 fn read_completed_units(path: &Path) -> Result<Vec<usize>, ResumeError> {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => {
-            return Err(ResumeError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
+    let Some(content) = read_opt(path)? else {
+        return Ok(Vec::new());
     };
     let complete_portion = match content.rfind('\n') {
         Some(pos) => &content[..pos],
@@ -300,15 +305,8 @@ struct LedgerAlignment {
 /// function does rather than parsing `StackAlignment` straight off the
 /// wire, which does not match the on-disk field names.
 pub fn read_alignment(path: &Path) -> Result<Option<StackAlignment>, ResumeError> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(ResumeError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
+    let Some(text) = read_opt(path)? else {
+        return Ok(None);
     };
     let encoded: LedgerAlignment =
         serde_json::from_str(&text).map_err(|source| ResumeError::Json {

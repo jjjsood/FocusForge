@@ -56,7 +56,7 @@
 use std::sync::LazyLock;
 
 use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
-use crate::fuse::PyramidError;
+use crate::fuse::error::{algorithm_error, missing_key};
 use crate::fuse::laplacian::score_plane;
 use crate::fuse::pyramid::Plane;
 use crate::fuse::sharpness::{DETAIL_REACH, detail_plane, levels_for_margin};
@@ -97,22 +97,6 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         },
     ]
 });
-
-fn wrap_pyramid_error(source: PyramidError) -> AlgorithmError {
-    AlgorithmError::Failed {
-        algorithm: "depth-map".to_string(),
-        detail: source.to_string(),
-    }
-}
-
-fn missing_key(key: &str) -> AlgorithmError {
-    AlgorithmError::Failed {
-        algorithm: "depth-map".to_string(),
-        detail: format!(
-            "resolved values are missing `{key}`; call crate::params::resolve before fuse"
-        ),
-    }
-}
 
 /// A second windowed-sum pass over a one-channel score plane -- exactly
 /// [`score_plane`], applied to a synthetic one-`samples_per_pixel` [`Plane`]
@@ -165,14 +149,14 @@ impl StackAlgorithm for DepthMap {
 
     fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError> {
         crate::params::validate(self.params(), cfg)?;
-        let score_radius = cfg
-            .get("score-radius")
-            .and_then(ParamValue::as_i64)
-            .ok_or_else(|| missing_key("score-radius"))? as u32;
-        let smoothing_radius = cfg
-            .get("smoothing-radius")
-            .and_then(ParamValue::as_i64)
-            .ok_or_else(|| missing_key("smoothing-radius"))? as u32;
+        let score_radius =
+            cfg.get("score-radius")
+                .and_then(ParamValue::as_i64)
+                .ok_or_else(|| missing_key("depth-map", "score-radius"))? as u32;
+        let smoothing_radius =
+            cfg.get("smoothing-radius")
+                .and_then(ParamValue::as_i64)
+                .ok_or_else(|| missing_key("depth-map", "smoothing-radius"))? as u32;
 
         let rect = ctx.rect();
         let (width, height) = (rect.width, rect.height);
@@ -188,8 +172,8 @@ impl StackAlgorithm for DepthMap {
 
         for f in 0..frame_count {
             let tile = ctx.frame(f)?;
-            let detail =
-                detail_plane(&tile.samples, width, height, spp).map_err(wrap_pyramid_error)?;
+            let detail = detail_plane(&tile.samples, width, height, spp)
+                .map_err(algorithm_error("depth-map"))?;
             let raw_score = score_plane(&detail, score_radius);
             let smoothed = box_smooth(&raw_score, width, height, smoothing_radius);
 
@@ -207,12 +191,8 @@ impl StackAlgorithm for DepthMap {
             }
         }
 
-        crate::zmap::validate_tile(&winner, frame_count as u32).map_err(|source| {
-            AlgorithmError::Failed {
-                algorithm: "depth-map".to_string(),
-                detail: source.to_string(),
-            }
-        })?;
+        crate::zmap::validate_tile(&winner, frame_count as u32)
+            .map_err(algorithm_error("depth-map"))?;
 
         Ok(TileOutput {
             tile: Tile {

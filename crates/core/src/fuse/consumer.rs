@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::algorithm::{AlgorithmError, StackAlgorithm};
+use crate::fuse::error::algorithm_error;
 use crate::io::{TiffSpec, TiffWriter};
 use crate::params::ParamValues;
 use crate::tile::{Rect, TileConsumer, TileJob, TilePlan};
@@ -80,20 +81,6 @@ impl FusionGeometry {
     }
 }
 
-/// Wraps `source` as this `algorithm`'s own [`AlgorithmError::Failed`] --
-/// the one error shape every fallible call in this module converges on,
-/// from `ZMapInfo::new` failing to `TiffWriter::write_tile` refusing a
-/// tile. Takes `algorithm` first (not `self`) so `create`, `reopen` and
-/// `resume` can use it before a `FusionConsumer` exists.
-fn algorithm_error<E: std::fmt::Display>(
-    algorithm: &'static dyn StackAlgorithm,
-) -> impl Fn(E) -> AlgorithmError {
-    move |source| AlgorithmError::Failed {
-        algorithm: algorithm.id().to_string(),
-        detail: source.to_string(),
-    }
-}
-
 impl FusionConsumer {
     /// Creates the composite output file, and the Z-Map output file when
     /// `zmap_path` is `Some`, writing every created file's header now, ready
@@ -129,9 +116,9 @@ impl FusionConsumer {
         let zmap = match zmap_path {
             Some(zmap_path) => {
                 let zmap_info = ZMapInfo::new(out_rect.width, out_rect.height, frame_count)
-                    .map_err(algorithm_error(algorithm))?;
-                let writer =
-                    ZMapWriter::create(zmap_path, zmap_info).map_err(algorithm_error(algorithm))?;
+                    .map_err(algorithm_error(algorithm.id()))?;
+                let writer = ZMapWriter::create(zmap_path, zmap_info)
+                    .map_err(algorithm_error(algorithm.id()))?;
                 Some(writer)
             }
             None => None,
@@ -188,9 +175,9 @@ impl FusionConsumer {
         let zmap = match zmap_path {
             Some(zmap_path) => {
                 let zmap_info = ZMapInfo::new(out_rect.width, out_rect.height, frame_count)
-                    .map_err(algorithm_error(algorithm))?;
-                let mut writer =
-                    ZMapWriter::reopen(zmap_path, zmap_info).map_err(algorithm_error(algorithm))?;
+                    .map_err(algorithm_error(algorithm.id()))?;
+                let mut writer = ZMapWriter::reopen(zmap_path, zmap_info)
+                    .map_err(algorithm_error(algorithm.id()))?;
                 for &rect in covered {
                     writer.seed_coverage(rect);
                 }
@@ -300,7 +287,7 @@ impl FusionConsumer {
         // there is nowhere for it to go), and a tile straddling the crop's
         // edge writes only its inside part.
         let target = match self.crop {
-            Some(crop) => match intersect(interior, crop) {
+            Some(crop) => match interior.intersect(crop) {
                 Some(clipped) => clipped,
                 None => return Ok(()),
             },
@@ -312,7 +299,7 @@ impl FusionConsumer {
         output
             .tile
             .crop_into(target, &mut cropped_composite)
-            .map_err(algorithm_error(self.algorithm))?;
+            .map_err(algorithm_error(self.algorithm.id()))?;
 
         // The same arithmetic `reopen`'s coverage-seeding uses, via the one
         // shared `written_rect` function -- never a second, independently
@@ -332,7 +319,7 @@ impl FusionConsumer {
             crop_zmap_into(&output.zmap, job.read_rect(), target, &mut cropped_zmap);
             zmap_writer
                 .write_tile(target_written, &cropped_zmap)
-                .map_err(algorithm_error(self.algorithm))?;
+                .map_err(algorithm_error(self.algorithm.id()))?;
         }
 
         Ok(())
@@ -349,7 +336,8 @@ impl FusionConsumer {
             .expect("composite writer present");
         composite.finish()?;
         if let Some(zmap) = self.zmap.lock().unwrap().take() {
-            zmap.finish().map_err(algorithm_error(self.algorithm))?;
+            zmap.finish()
+                .map_err(algorithm_error(self.algorithm.id()))?;
         }
         Ok(())
     }
@@ -372,27 +360,9 @@ fn crop_zmap_into(zmap: &[u16], read_rect: Rect, interior: Rect, out: &mut [u16]
     }
 }
 
-/// The overlap of `a` and `b`, both in absolute frame coordinates. `None`
-/// for an empty (or non-overlapping) intersection.
-fn intersect(a: Rect, b: Rect) -> Option<Rect> {
-    let x0 = a.x.max(b.x);
-    let y0 = a.y.max(b.y);
-    let x1 = (a.x + a.width).min(b.x + b.width);
-    let y1 = (a.y + a.height).min(b.y + b.height);
-    if x1 <= x0 || y1 <= y0 {
-        return None;
-    }
-    Some(Rect {
-        x: x0,
-        y: y0,
-        width: x1 - x0,
-        height: y1 - y0,
-    })
-}
-
 /// `rect`, translated by `-(crop.x, crop.y)` when `crop` is `Some` --
 /// absolute frame coordinates in, output-file coordinates out. `rect` must
-/// already lie inside `crop` (guaranteed by [`intersect`] above), so the
+/// already lie inside `crop` (guaranteed by [`Rect::intersect`]), so the
 /// subtraction never underflows.
 fn translate_for_crop(rect: Rect, crop: Option<Rect>) -> Rect {
     match crop {
@@ -407,7 +377,7 @@ fn translate_for_crop(rect: Rect, crop: Option<Rect>) -> Rect {
 }
 
 /// The rectangle one tile's `interior` is actually written at in the output
-/// files, given an optional crop -- `intersect(interior, crop)` then
+/// files, given an optional crop -- [`Rect::intersect`] then
 /// [`translate_for_crop`], factored out of [`FusionConsumer::consume`] so a
 /// resume's [`FusionConsumer::reopen`] seeds coverage with **exactly** the
 /// same arithmetic `consume` used to write it in the first place. `None`
@@ -415,7 +385,7 @@ fn translate_for_crop(rect: Rect, crop: Option<Rect>) -> Rect {
 /// so there is nothing to seed.
 pub(crate) fn written_rect(interior: Rect, crop: Option<Rect>) -> Option<Rect> {
     let target = match crop {
-        Some(crop) => intersect(interior, crop)?,
+        Some(crop) => interior.intersect(crop)?,
         None => interior,
     };
     Some(translate_for_crop(target, crop))
