@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::crash::{crash_dir, now_seconds, read_dir_sorted, rfc3339};
+use crate::crash::{crash_dir, read_dir_sorted, rfc3339};
 
 /// The marker's extension. It is neither of the two extensions a bundle
 /// collects, so a marker is never bundled and never counted as a crash of
@@ -48,7 +48,7 @@ pub fn mark_reported(data_dir: &Path, crashes: &[String]) -> std::io::Result<()>
     }
     let dir = crash_dir(data_dir);
     let mut failure = std::fs::create_dir_all(&dir).err();
-    let marked_at = rfc3339(now_seconds());
+    let marked_at = rfc3339(focusforge_core::project::seal::now_unix());
     for id in crashes {
         if let Err(e) = std::fs::write(dir.join(format!("{id}.{MARKER_EXTENSION}")), &marked_at) {
             failure.get_or_insert(e);

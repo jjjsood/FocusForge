@@ -75,27 +75,17 @@ impl std::fmt::Display for FrameCount {
 /// The first disagreement [`StackFingerprint::compare`] found, as data: the
 /// frame, the field, and both values -- never a bare bool, so a refusal can
 /// name what changed.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[error(
+    "frame {frame} ({}): {field} changed: expected {expected}, found {found}",
+    path.display()
+)]
 pub struct FingerprintMismatch {
     pub frame: usize,
     pub path: PathBuf,
     pub field: &'static str,
     pub expected: String,
     pub found: String,
-}
-
-impl std::fmt::Display for FingerprintMismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "frame {} ({}): {} changed: expected {}, found {}",
-            self.frame,
-            self.path.display(),
-            self.field,
-            self.expected,
-            self.found
-        )
-    }
 }
 
 /// A whole stack's identity: one [`FrameFingerprint`] per frame, in frame

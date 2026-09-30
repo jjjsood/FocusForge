@@ -6,6 +6,7 @@
 //! checks per pixel in raster order, not from the corners, so a
 //! `SourceTileTooSmall` carries the CPU twin's exact `needed` rect.
 
+use focusforge_core::align::warp::clamp_tap;
 use focusforge_core::align::{AlignError, Transform};
 use focusforge_core::tile::Rect;
 
@@ -45,13 +46,6 @@ const UNCOVERED: Coord = Coord {
 pub struct WarpCoords {
     pub coords: Vec<Coord>,
     pub covered: Vec<bool>,
-}
-
-/// Clamps a signed tap coordinate to `0..dim` (clamp-to-edge) -- the same
-/// rule `crates/core`'s private `clamp_tap` gives.
-#[inline]
-fn clamp_tap(v: i64, dim: u32) -> i64 {
-    v.clamp(0, dim as i64 - 1)
 }
 
 /// `warp_from_tile_into`'s per-pixel head, stopping short of sampling: per

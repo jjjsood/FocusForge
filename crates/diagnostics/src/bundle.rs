@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
-use crate::crash::{crash_dir, now_seconds, read_dir_sorted, rfc3339};
+use crate::crash::{crash_dir, read_dir_sorted, rfc3339};
 
 /// What the home directory and the user name are replaced with.
 const HOME_PLACEHOLDER: &str = "[home]";
@@ -196,42 +196,23 @@ pub struct Written {
 }
 
 /// Why a bundle could not be written.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum BundleError {
     /// The output path exists and overwriting was not asked for.
+    #[error("{} exists", .0.display())]
     OutputExists(PathBuf),
     /// A file could not be read, created or renamed.
+    #[error("{}: {source}", path.display())]
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
     /// The archive itself refused an entry.
+    #[error("{}: {source}", path.display())]
     Archive {
         path: PathBuf,
         source: zip::result::ZipError,
     },
-}
-
-impl std::fmt::Display for BundleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BundleError::OutputExists(path) => {
-                write!(f, "{} exists", path.display())
-            }
-            BundleError::Io { path, source } => write!(f, "{}: {source}", path.display()),
-            BundleError::Archive { path, source } => write!(f, "{}: {source}", path.display()),
-        }
-    }
-}
-
-impl std::error::Error for BundleError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            BundleError::OutputExists(_) => None,
-            BundleError::Io { source, .. } => Some(source),
-            BundleError::Archive { source, .. } => Some(source),
-        }
-    }
 }
 
 /// Resolves every entry the bundle will hold. Reads the data directory and
@@ -462,7 +443,7 @@ fn version(excluded: &[String]) -> serde_json::Value {
     serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "commit": env!("FOCUSFORGE_COMMIT_HASH"),
-        "created": rfc3339(now_seconds()),
+        "created": rfc3339(focusforge_core::project::seal::now_unix()),
         "excluded": excluded,
     })
 }
@@ -472,26 +453,26 @@ fn version(excluded: &[String]) -> serde_json::Value {
 pub fn default_file_name() -> String {
     format!(
         "focusforge-diagnostics-{}.zip",
-        crate::crash::utc_stamp(now_seconds())
+        crate::crash::utc_stamp(focusforge_core::project::seal::now_unix())
     )
 }
 
 /// Writes exactly `manifest`'s entries to `path`, applying `redaction` to
 /// every entry marked redacted as its bytes are produced. Refuses an
-/// existing `path` unless `force`; a failure leaves nothing behind at
-/// `path`.
+/// existing `path` unless `force`, and any `path` without a file name; a
+/// failure leaves nothing behind at `path`.
 pub fn write(
     manifest: &Manifest,
     path: &Path,
     force: bool,
     redaction: &Redaction,
 ) -> Result<Written, BundleError> {
-    if path.exists() && !force {
+    if path.file_name().is_none() || (path.exists() && !force) {
         return Err(BundleError::OutputExists(path.to_path_buf()));
     }
-    let partial = Partial::create(path)?;
-    let file = File::create(&partial.path).map_err(|source| BundleError::Io {
-        path: partial.path.clone(),
+    let partial = focusforge_core::project::container::PartialFile::new(path);
+    let file = File::create(partial.path()).map_err(|source| BundleError::Io {
+        path: partial.path().to_path_buf(),
         source,
     })?;
     let mut zip = ZipWriter::new(file);
@@ -501,7 +482,7 @@ pub fn write(
     for entry in &manifest.entries {
         zip.start_file(&entry.name, options)
             .map_err(|source| BundleError::Archive {
-                path: partial.path.clone(),
+                path: partial.path().to_path_buf(),
                 source,
             })?;
         match &entry.source {
@@ -509,13 +490,13 @@ pub fn write(
                 let body = redaction.apply(text);
                 zip.write_all(body.as_bytes())
                     .map_err(|source| BundleError::Io {
-                        path: partial.path.clone(),
+                        path: partial.path().to_path_buf(),
                         source,
                     })?;
             }
             EntrySource::File(source_path) => {
                 if entry.redacted {
-                    copy_redacted(source_path, &mut zip, redaction, &partial.path)?;
+                    copy_redacted(source_path, &mut zip, redaction, partial.path())?;
                 } else {
                     let mut source = File::open(source_path).map_err(|source| BundleError::Io {
                         path: source_path.clone(),
@@ -532,16 +513,17 @@ pub fn write(
     }
 
     let file = zip.finish().map_err(|source| BundleError::Archive {
-        path: partial.path.clone(),
+        path: partial.path().to_path_buf(),
         source,
     })?;
     file.sync_all().map_err(|source| BundleError::Io {
-        path: partial.path.clone(),
+        path: partial.path().to_path_buf(),
         source,
     })?;
     drop(file);
-    std::fs::rename(&partial.path, path).map_err(|source| BundleError::Io {
-        path: partial.path.clone(),
+    let partial_at = partial.path().to_path_buf();
+    partial.commit().map_err(|source| BundleError::Io {
+        path: partial_at,
         source,
     })?;
     Ok(Written {
@@ -582,31 +564,6 @@ fn copy_redacted(
                 path: partial.to_path_buf(),
                 source,
             })?;
-    }
-}
-
-/// `<path>.partial` beside the output, removed again unless the rename onto
-/// the output path took it away first.
-struct Partial {
-    path: PathBuf,
-}
-
-impl Partial {
-    fn create(final_path: &Path) -> Result<Self, BundleError> {
-        let name = final_path
-            .file_name()
-            .ok_or_else(|| BundleError::OutputExists(final_path.to_path_buf()))?;
-        let mut partial = name.to_os_string();
-        partial.push(".partial");
-        Ok(Partial {
-            path: final_path.with_file_name(partial),
-        })
-    }
-}
-
-impl Drop for Partial {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -869,6 +826,25 @@ mod tests {
 
         write(&manifest, &out, true, &Redaction::default()).unwrap();
         assert_eq!(archive_names(&out).len(), 4);
+    }
+
+    #[test]
+    fn an_output_path_without_a_file_name_is_refused_and_touches_no_partial() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("data")).unwrap();
+        let unrelated = root.path().join(".partial");
+        std::fs::write(&unrelated, "unrelated").unwrap();
+        let manifest = manifest(&Options::default());
+
+        let refused = write(
+            &manifest,
+            &root.path().join("data").join(".."),
+            true,
+            &Redaction::default(),
+        );
+
+        assert!(matches!(refused, Err(BundleError::OutputExists(_))));
+        assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "unrelated");
     }
 
     #[test]

@@ -38,13 +38,48 @@ pub fn partial_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// A `<final_path>.partial` file beside `final_path`: dropping the guard
+/// removes it, [`Self::commit`] renames it onto the final path. The caller
+/// creates the file at [`Self::path`] and closes it before the guard drops.
+#[derive(Debug)]
+pub struct PartialFile {
+    partial: PathBuf,
+    final_path: PathBuf,
+}
+
+impl PartialFile {
+    pub fn new(final_path: &Path) -> Self {
+        PartialFile {
+            partial: partial_path(final_path),
+            final_path: final_path.to_path_buf(),
+        }
+    }
+
+    /// Where to write.
+    pub fn path(&self) -> &Path {
+        &self.partial
+    }
+
+    /// Renames the partial onto the final path.
+    pub fn commit(self) -> std::io::Result<()> {
+        std::fs::rename(&self.partial, &self.final_path)
+    }
+}
+
+impl Drop for PartialFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.partial);
+    }
+}
+
 /// Writes one project container. Entries go in a fixed order -- the
 /// manifest, then the blobs, then the checkpoint -- so two seals of the same
 /// inputs produce identical bytes.
 pub struct ProjectWriter {
-    zip: Option<ZipWriter<File>>,
-    partial: PathBuf,
-    final_path: PathBuf,
+    // Declared before `partial`: the archive handle closes before the guard
+    // removes the file.
+    zip: ZipWriter<File>,
+    partial: PartialFile,
     written: BTreeSet<String>,
 }
 
@@ -52,12 +87,12 @@ impl ProjectWriter {
     /// Opens `<final_path>.partial` for writing. Nothing appears at
     /// `final_path` until [`Self::finish`] succeeds.
     pub fn create(final_path: &Path) -> Result<Self, ProjectError> {
-        let partial = partial_path(final_path);
-        let file = File::create(&partial).map_err(|source| ProjectError::io(&partial, source))?;
+        let at = partial_path(final_path);
+        let file = File::create(&at).map_err(|source| ProjectError::io(&at, source))?;
+        let partial = PartialFile::new(final_path);
         Ok(ProjectWriter {
-            zip: Some(ZipWriter::new(file)),
+            zip: ZipWriter::new(file),
             partial,
-            final_path: final_path.to_path_buf(),
             written: BTreeSet::new(),
         })
     }
@@ -68,11 +103,12 @@ impl ProjectWriter {
 
     /// Adds one text entry -- `manifest.json` or `checkpoints/<id>.json`.
     pub fn add_text(&mut self, name: &str, text: &str) -> Result<(), ProjectError> {
-        let zip = self.zip.as_mut().expect("writer is live until finish");
-        zip.start_file(name, Self::options())
-            .map_err(|err| ProjectError::container(&self.partial, err))?;
-        zip.write_all(text.as_bytes())
-            .map_err(|source| ProjectError::io(&self.partial, source))?;
+        self.zip
+            .start_file(name, Self::options())
+            .map_err(|err| ProjectError::container(self.partial.path(), err))?;
+        self.zip
+            .write_all(text.as_bytes())
+            .map_err(|source| ProjectError::io(self.partial.path(), source))?;
         self.written.insert(name.to_string());
         Ok(())
     }
@@ -87,11 +123,12 @@ impl ProjectWriter {
         if self.written.contains(&name) {
             return Ok(());
         }
-        let zip = self.zip.as_mut().expect("writer is live until finish");
-        zip.start_file(&name, Self::options())
-            .map_err(|err| ProjectError::container(&self.partial, err))?;
+        self.zip
+            .start_file(&name, Self::options())
+            .map_err(|err| ProjectError::container(self.partial.path(), err))?;
         let mut source = File::open(compressed).map_err(|err| ProjectError::io(compressed, err))?;
-        std::io::copy(&mut source, zip).map_err(|err| ProjectError::io(compressed, err))?;
+        std::io::copy(&mut source, &mut self.zip)
+            .map_err(|err| ProjectError::io(compressed, err))?;
         self.written.insert(name);
         Ok(())
     }
@@ -104,38 +141,35 @@ impl ProjectWriter {
         if self.written.contains(name) {
             return Ok(());
         }
-        let zip = self.zip.as_mut().expect("writer is live until finish");
-        zip.start_file(name, Self::options())
-            .map_err(|err| ProjectError::container(&self.partial, err))?;
-        std::io::copy(source, zip).map_err(|err| ProjectError::io(&self.partial, err))?;
+        self.zip
+            .start_file(name, Self::options())
+            .map_err(|err| ProjectError::container(self.partial.path(), err))?;
+        std::io::copy(source, &mut self.zip)
+            .map_err(|err| ProjectError::io(self.partial.path(), err))?;
         self.written.insert(name.to_string());
         Ok(())
     }
 
     /// Finishes the archive, flushes it to disk and renames the partial onto
     /// the named path.
-    pub fn finish(mut self) -> Result<PathBuf, ProjectError> {
-        let zip = self.zip.take().expect("writer is live until finish");
+    ///
+    /// A failed seal leaves neither a project nor a temp file on **every**
+    /// error path, including one that returns through a `?` three
+    /// functions down: the [`PartialFile`] removes the partial on drop.
+    pub fn finish(self) -> Result<PathBuf, ProjectError> {
+        let ProjectWriter { zip, partial, .. } = self;
         let file = zip
             .finish()
-            .map_err(|err| ProjectError::container(&self.partial, err))?;
+            .map_err(|err| ProjectError::container(partial.path(), err))?;
         file.sync_all()
-            .map_err(|source| ProjectError::io(&self.partial, source))?;
+            .map_err(|source| ProjectError::io(partial.path(), source))?;
         drop(file);
-        std::fs::rename(&self.partial, &self.final_path)
-            .map_err(|source| ProjectError::io(&self.partial, source))?;
-        Ok(self.final_path.clone())
-    }
-}
-
-impl Drop for ProjectWriter {
-    /// Removes the partial unless [`Self::finish`] already renamed it away.
-    /// This is what makes "a failed seal leaves neither a project nor a
-    /// temp file" true on **every** error path, including one that returns
-    /// through a `?` three functions down.
-    fn drop(&mut self) {
-        self.zip.take();
-        let _ = std::fs::remove_file(&self.partial);
+        let partial_at = partial.path().to_path_buf();
+        let final_path = partial.final_path.clone();
+        partial
+            .commit()
+            .map_err(|source| ProjectError::io(&partial_at, source))?;
+        Ok(final_path)
     }
 }
 
@@ -149,5 +183,41 @@ mod tests {
             partial_path(Path::new("/tmp/demo.ffp")),
             Path::new("/tmp/demo.ffp.partial")
         );
+    }
+
+    #[test]
+    fn partial_file_drop_removes_the_partial_and_leaves_no_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("out.tar.tif");
+        let guard = PartialFile::new(&final_path);
+        assert_eq!(guard.path(), dir.path().join("out.tar.tif.partial"));
+        std::fs::write(guard.path(), b"half a file").unwrap();
+        drop(guard);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn project_writer_create_failure_leaves_a_preexisting_partial_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("demo.ffp");
+        let partial = partial_path(&final_path);
+        std::fs::write(&partial, b"someone else's file").unwrap();
+        let mut perms = std::fs::metadata(&partial).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&partial, perms).unwrap();
+
+        assert!(ProjectWriter::create(&final_path).is_err());
+        assert!(partial.exists());
+    }
+
+    #[test]
+    fn partial_file_commit_leaves_the_final_file_and_no_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("out.tar.tif");
+        let guard = PartialFile::new(&final_path);
+        std::fs::write(guard.path(), b"whole file").unwrap();
+        guard.commit().unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"whole file");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

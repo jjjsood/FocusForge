@@ -221,58 +221,48 @@ fn export_frame(project: &Project, index: usize, path: &Path) -> Result<(), Stri
     );
     let origin = registration.origin();
 
-    let partial = project::partial_path(path);
-    let result = (|| {
-        let mut writer = TiffWriter::create(
-            &partial,
-            TiffSpec {
-                width: composite.width,
-                height: composite.height,
-                samples_per_pixel: composite.samples_per_pixel,
-                description: Some(composite.description.clone()),
-            },
-        )
-        .map_err(|err| err.to_string())?;
+    let partial = project::container::PartialFile::new(path);
+    let mut writer = TiffWriter::create(
+        partial.path(),
+        TiffSpec {
+            width: composite.width,
+            height: composite.height,
+            samples_per_pixel: composite.samples_per_pixel,
+            description: Some(composite.description.clone()),
+        },
+    )
+    .map_err(|err| err.to_string())?;
 
-        let spp = composite.samples_per_pixel;
-        let mut buf =
-            vec![0u16; composite.width as usize * FRAME_BAND_ROWS as usize * spp as usize];
-        let mut y = 0u32;
-        while y < composite.height {
-            let rows = FRAME_BAND_ROWS.min(composite.height - y);
-            let rect = Rect {
-                x: 0,
-                y,
-                width: composite.width,
-                height: rows,
-            };
-            let source_rect = Rect {
-                x: rect.x + origin.0,
-                y: rect.y + origin.1,
-                width: rect.width,
-                height: rect.height,
-            };
-            let len = (rect.width * rows * spp) as usize;
-            reader
-                .read_tile_into(index, source_rect, &mut buf[..len])
-                .map_err(|err| err.to_string())?;
-            writer
-                .write_tile(rect, &buf[..len])
-                .map_err(|err| err.to_string())?;
-            y += rows;
-        }
-        writer.finish().map_err(|err| err.to_string())
-    })();
-
-    match result.and_then(|()| {
-        std::fs::rename(&partial, path).map_err(|err| format!("{}: {err}", path.display()))
-    }) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = std::fs::remove_file(&partial);
-            Err(err)
-        }
+    let spp = composite.samples_per_pixel;
+    let mut buf = vec![0u16; composite.width as usize * FRAME_BAND_ROWS as usize * spp as usize];
+    let mut y = 0u32;
+    while y < composite.height {
+        let rows = FRAME_BAND_ROWS.min(composite.height - y);
+        let rect = Rect {
+            x: 0,
+            y,
+            width: composite.width,
+            height: rows,
+        };
+        let source_rect = Rect {
+            x: rect.x + origin.0,
+            y: rect.y + origin.1,
+            width: rect.width,
+            height: rect.height,
+        };
+        let len = (rect.width * rows * spp) as usize;
+        reader
+            .read_tile_into(index, source_rect, &mut buf[..len])
+            .map_err(|err| err.to_string())?;
+        writer
+            .write_tile(rect, &buf[..len])
+            .map_err(|err| err.to_string())?;
+        y += rows;
     }
+    writer.finish().map_err(|err| err.to_string())?;
+    partial
+        .commit()
+        .map_err(|err| format!("{}: {err}", path.display()))
 }
 
 #[cfg(test)]

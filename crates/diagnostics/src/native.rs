@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use crash_handler::{CrashContext, CrashEventResult, CrashHandler};
 use minidumper::{Client, LoopAction, MinidumpBinary, Server, ServerHandler, SocketName};
 
-use crate::crash::{CRASH_REPORT_FORMAT, create_new_numbered, now_seconds, report_stem, rfc3339};
+use crate::crash::{CRASH_REPORT_FORMAT, create_new_numbered, report_stem, rfc3339};
 
 /// Set on a re-spawned process to make it the monitor for the socket its
 /// value names. The reserved value [`CAPTURE_OFF`] instead runs the
@@ -54,27 +54,16 @@ const MESSAGE_PROCESS_INFO: u32 = 1;
 const MESSAGE_SIGNAL: u32 = 2;
 
 /// Why native-crash capture could not be set up.
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
+    #[error("the monitor process could not be started: {0}")]
     Spawn(io::Error),
+    #[error("the monitor process exited before accepting a connection")]
     MonitorGone,
+    #[error("the monitor process could not be reached: {0}")]
     Connect(minidumper::Error),
+    #[error("the crash handler could not be installed: {0}")]
     Attach(crash_handler::Error),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Spawn(e) => write!(f, "the monitor process could not be started: {e}"),
-            Error::MonitorGone => {
-                write!(
-                    f,
-                    "the monitor process exited before accepting a connection"
-                )
-            }
-            Error::Connect(e) => write!(f, "the monitor process could not be reached: {e}"),
-            Error::Attach(e) => write!(f, "the crash handler could not be installed: {e}"),
-        }
-    }
 }
 
 /// Keeps the crash handler installed and the monitor process alive. On drop
@@ -238,7 +227,7 @@ impl ServerHandler for Monitor {
                 "the crashed process sent no process information",
             )
         })?;
-        let seconds = now_seconds();
+        let seconds = focusforge_core::project::seal::now_unix();
         self.crashed_at.store(seconds, Ordering::SeqCst);
         let stem = report_stem(seconds, &info.binary, info.pid);
         create_new_numbered(&info.crash_dir, &stem, "dmp")

@@ -480,26 +480,20 @@ fn write_render(
 /// through the same partial-then-rename pattern every other output in this
 /// command uses.
 fn write_overlay_png(path: &Path, width: u32, height: u32, buf: &[u8]) -> Result<(), String> {
-    let partial = project::partial_path(path);
-    let write = || -> Result<(), String> {
-        let file =
-            std::fs::File::create(&partial).map_err(|e| format!("{}: {e}", partial.display()))?;
-        let mut encoder = png::Encoder::new(file, width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e| format!("{}: {e}", partial.display()))?;
-        writer
-            .write_image_data(buf)
-            .map_err(|e| format!("{}: {e}", partial.display()))?;
-        Ok(())
-    };
-    if let Err(err) = write() {
-        let _ = std::fs::remove_file(&partial);
-        return Err(err);
-    }
-    std::fs::rename(&partial, path).map_err(|e| format!("{}: {e}", path.display()))
+    let partial = project::container::PartialFile::new(path);
+    let at = partial.path().display();
+    let file = std::fs::File::create(partial.path()).map_err(|e| format!("{at}: {e}"))?;
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|e| format!("{at}: {e}"))?;
+    writer
+        .write_image_data(buf)
+        .map_err(|e| format!("{at}: {e}"))?;
+    drop(writer);
+    partial
+        .commit()
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// One op's refusal as `"op #i: <message>"`, except
