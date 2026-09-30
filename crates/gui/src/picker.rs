@@ -54,6 +54,38 @@ pub fn pick_save_project(proposed: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Opens the OS save dialog filtered to TIFF, starting at `proposed`'s
+/// directory and name -- the export modal's own destination picker,
+/// mirroring [`pick_save_project`]. A chosen name without the extension
+/// gets `.tif`. `None` on cancel (or a missing dialog backend, rfd#320).
+pub fn pick_save_image(proposed: &Path) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new()
+        .set_title("Export image")
+        .add_filter("TIFF image", &["tif", "tiff"]);
+    if let Some(dir) = proposed.parent() {
+        dialog = dialog.set_directory(dir);
+    }
+    if let Some(name) = proposed.file_name() {
+        dialog = dialog.set_file_name(name.to_string_lossy());
+    }
+    ensure_tif_extension(dialog.save_file()?)
+}
+
+/// `path` unchanged when it already carries a (case-insensitive) `.tif`/
+/// `.tiff` extension, `.tif` appended to its file name otherwise.
+fn ensure_tif_extension(path: PathBuf) -> Option<PathBuf> {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff"))
+    {
+        Some(path)
+    } else {
+        let mut name = path.file_name()?.to_os_string();
+        name.push(".tif");
+        Some(path.with_file_name(name))
+    }
+}
+
 /// Opens the OS file picker, multi-select, filtered to TIFF frames -- the
 /// `Images` panel's Add path. `None` on cancel (or a missing dialog backend,
 /// rfd#320), the same as its two siblings.
@@ -62,4 +94,29 @@ pub fn pick_frames() -> Option<Vec<PathBuf>> {
         .set_title("Add frames")
         .add_filter("TIFF frames", &["tif", "tiff"])
         .pick_files()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_tif_extension_appends_only_when_missing() {
+        assert_eq!(
+            ensure_tif_extension(PathBuf::from("/out/mantis")),
+            Some(PathBuf::from("/out/mantis.tif"))
+        );
+        assert_eq!(
+            ensure_tif_extension(PathBuf::from("/out/mantis.tif")),
+            Some(PathBuf::from("/out/mantis.tif"))
+        );
+        assert_eq!(
+            ensure_tif_extension(PathBuf::from("/out/mantis.TIFF")),
+            Some(PathBuf::from("/out/mantis.TIFF"))
+        );
+        assert_eq!(
+            ensure_tif_extension(PathBuf::from("/out/mantis.png")),
+            Some(PathBuf::from("/out/mantis.png.tif"))
+        );
+    }
 }

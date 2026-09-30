@@ -26,7 +26,7 @@ use focusforge_core::project::{self, Project, ProjectError};
 use focusforge_core::registry::{self, LookupError};
 use focusforge_core::retouch::{RetouchError, Sources};
 pub use focusforge_core::tile::{HostBudget, Rect};
-use focusforge_core::zmap::{ZMapError, ZMapReader};
+use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader, ZMapWriter};
 
 /// Re-exported so `crate::controller` -- which names no algorithm crate --
 /// can hold and drive these through the `job::` path alone.
@@ -662,6 +662,161 @@ pub fn render_outcome(
         Err(_) => {
             eprintln!("a checkpoint render panicked");
             Err(vec!["Cannot show this checkpoint.".to_string()])
+        }
+    }
+}
+
+/// What the export modal writes: the tab's current position, resolved on
+/// the calling thread so the worker needs nothing but this and a
+/// destination.
+pub enum ExportSource {
+    /// A saved checkpoint: reopens `project_path` and calls
+    /// [`project::export_checkpoint`].
+    Saved { project_path: PathBuf, id: String },
+    /// A held row's own state -- not yet in any `.ffp`.
+    Held(HeldCheckpoint),
+    /// The active tab's edit session applied over its current row: a clone
+    /// of `EditSession::indices()`, the map's own shape, and the row's own
+    /// sources/registration/reference/description (`ProjectTab::fused()`
+    /// for the first two).
+    Live {
+        width: u32,
+        height: u32,
+        indices: Vec<u16>,
+        sources: Vec<PathBuf>,
+        registration: Registration,
+        reference: usize,
+        description: String,
+    },
+}
+
+/// [`export_position`]'s own error: a project/render failure, or writing a
+/// live export's temp Z-Map.
+#[derive(Debug, thiserror::Error)]
+pub enum ExportError {
+    #[error(transparent)]
+    Project(#[from] ProjectError),
+    #[error(transparent)]
+    ZMap(#[from] ZMapError),
+}
+
+/// A process-wide counter, so two live exports started in the same process
+/// never share a temp Z-Map path.
+static NEXT_EXPORT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Writes `source`'s image to `path` as the default TIFF (16-bit
+/// uncompressed, EXIF and ICC on) -- the export modal's own worker body,
+/// run off the UI thread. A held row's or a live edit session's export
+/// changes nothing about the project: no checkpoint is written, no `.ffp`
+/// touched, and a live export's temp Z-Map is removed whether the write
+/// finishes or fails.
+pub fn export_position(source: ExportSource, path: &Path) -> Result<(), ExportError> {
+    let options = project::export::ExportOptions::default();
+    let metadata = project::export::MetadataOptions::default();
+    match source {
+        ExportSource::Saved { project_path, id } => {
+            let mut project = Project::open(&project_path)?;
+            project::export_checkpoint(&mut project, &id, path, &options, &metadata)?;
+        }
+        ExportSource::Held(held) => {
+            let zmap_source = project::ZmapSource {
+                reference: held.align.as_ref().map_or(0, |a| a.reference),
+                sources: held.sources,
+                registration: held.registration,
+                description: held.composite_description,
+            };
+            project::export_zmap(&held.zmap, &zmap_source, path, &options, &metadata)?;
+        }
+        ExportSource::Live {
+            width,
+            height,
+            indices,
+            sources,
+            registration,
+            reference,
+            description,
+        } => {
+            let temp = std::env::temp_dir().join(format!(
+                "focusforge-export-{}-{}.tif",
+                std::process::id(),
+                NEXT_EXPORT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let write = (|| -> Result<(), ExportError> {
+                let info = ZMapInfo::new(width, height, sources.len() as u32)?;
+                let mut writer = ZMapWriter::create(&temp, info)?;
+                writer.write_tile(
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    },
+                    &indices,
+                )?;
+                writer.finish()?;
+                let zmap_source = project::ZmapSource {
+                    sources,
+                    registration,
+                    reference,
+                    description,
+                };
+                project::export_zmap(&temp, &zmap_source, path, &options, &metadata)?;
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(&temp);
+            write?;
+        }
+    }
+    Ok(())
+}
+
+/// An export worker's result as the controller keeps it: `Ok` once written,
+/// or the modal's own refusal lines -- [`render_outcome`]'s counterpart. A
+/// panicked worker refuses with the generic line rather than leaving the
+/// modal writing forever.
+pub fn export_outcome(
+    result: std::thread::Result<Result<(), ExportError>>,
+) -> Result<(), Vec<String>> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(export_refusal_lines(&err)),
+        Err(_) => {
+            eprintln!("an export panicked");
+            Err(vec!["Cannot export this position.".to_string()])
+        }
+    }
+}
+
+/// One `"<name> — missing"` / `"<name> — changed"` line -- [`frame_line`]'s
+/// counterpart for the export modal, which shows no `state: ` prefix.
+fn export_frame_line(line: &str) -> String {
+    let Some((state, rest)) = line.split_once(": ") else {
+        return line.to_string();
+    };
+    let path = rest.split(" (found at ").next().unwrap_or(rest);
+    let name = Path::new(path)
+        .file_name()
+        .map_or(path.into(), |name| name.to_string_lossy());
+    format!("{name} — {state}")
+}
+
+/// The export modal's own refusal lines: one per source for a missing or
+/// changed frame (a saved checkpoint's own recorded sources, or a held/live
+/// export's plain paths, which can only ever be `missing`), naming the
+/// underlying cause for anything else -- an unwritable destination above
+/// all.
+pub fn export_refusal_lines(err: &ExportError) -> Vec<String> {
+    match err {
+        ExportError::Project(ProjectError::RenderSourcesUnavailable { detail, .. })
+        | ExportError::Project(ProjectError::ExportSourcesUnavailable { detail, .. }) => {
+            detail.lines().map(export_frame_line).collect()
+        }
+        ExportError::Project(ProjectError::ExportWriteFailed { path, source }) => {
+            vec![format!("Can't write {}: {source}", path.display())]
+        }
+        _ => {
+            eprintln!("failed to export a checkpoint: {err}");
+            vec!["Cannot export this position.".to_string()]
         }
     }
 }

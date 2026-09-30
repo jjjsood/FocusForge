@@ -1093,9 +1093,8 @@ const RAW_GESTURE_CALLBACK_EXCEPTIONS: &[&str] = &[
     "ff_image_row.slint",
     "gallery.slint",
     "ff_manifest_list.slint",
-    "ff_dialog.slint",
+    "ff_modal_panel.slint",
     "settings_modal.slint",
-    "dialogs.slint",
     "projects_overlay.slint",
 ];
 

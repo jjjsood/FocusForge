@@ -33,6 +33,10 @@ import { FFChip } from "components/ff_chip.slint";
 import { FFProjectCard } from "components/ff_project_card.slint";
 import { FFManifestList } from "components/ff_manifest_list.slint";
 import { FFBrushCursor } from "components/ff_brush_cursor.slint";
+import { FFStatusGlyph } from "components/ff_status_glyph.slint";
+import { FFHeading } from "components/ff_heading.slint";
+import { FFDivider } from "components/ff_divider.slint";
+import { FFSegmented } from "components/ff_segmented.slint";
 import { FFToast } from "shell/dialogs.slint";
 
 component ColourSwatch inherits Rectangle {
@@ -789,6 +793,26 @@ export component ThemeSheet inherits Window {
                 confirm-kind: "danger";
             }
         }
+
+        GroupHeading { text: "Dialog: header status glyph"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFStatusGlyph { kind: "swatch"; }
+            FFStatusGlyph { kind: "circle"; }
+        }
+
+        GroupHeading { text: "Dialog: heading"; }
+        VerticalLayout {
+            spacing: Theme.space-2;
+            FFHeading { text: "Export image"; }
+            FFHeading { text: "Can't export this position"; tone: "failure"; size: "body"; }
+        }
+
+        GroupHeading { text: "Dialog: divider"; }
+        FFDivider { width: 300px; }
+
+        GroupHeading { text: "Dialog: segmented selector"; }
+        FFSegmented { width: 168px; segments: ["TIFF", "JPEG"]; selected: "TIFF"; }
 
         GroupHeading { text: "Projects overlay: chip"; }
         HorizontalLayout {

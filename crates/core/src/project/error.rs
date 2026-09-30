@@ -231,6 +231,27 @@ pub enum ProjectError {
         format: String,
         samples_per_pixel: u32,
     },
+
+    /// [`super::render::CheckpointImage::prepare_zmap`] found at least one of
+    /// `source.sources` missing on disk: `detail` names each, one per line,
+    /// `missing: <path>`. There is no stored fingerprint to compare a
+    /// present file against, unlike a checkpoint's own recorded sources, so
+    /// this never reports `changed`.
+    #[error(
+        "{}: this export's sources cannot be read:\n{detail}",
+        path.display()
+    )]
+    ExportSourcesUnavailable { path: PathBuf, detail: String },
+
+    /// The export could not be written: its temporary `.partial` file
+    /// could not be created or finished, or the finished file could not be
+    /// renamed onto it.
+    #[error("{}: could not be written: {source}", path.display())]
+    ExportWriteFailed {
+        path: PathBuf,
+        #[source]
+        source: Box<ProjectError>,
+    },
 }
 
 impl ProjectError {

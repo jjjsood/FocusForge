@@ -1981,7 +1981,7 @@ fn the_frame_set_warnings_footer_sits_at_the_panels_bottom_edge() {
     focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
 
     let panel = ElementQuery::from_root(&app)
-        .match_id("FFDialog::panel")
+        .match_id("FFModalPanel::panel")
         .find_first()
         .expect("the frame-set warning's own panel must be in the tree while it is open");
     let footer = ElementQuery::from_root(&app)

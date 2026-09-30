@@ -5,8 +5,10 @@
 
 import { Theme } from "../theme.slint";
 import { FFDialogFooter } from "ff_dialog_footer.slint";
+import { FFModalPanel } from "ff_modal_panel.slint";
+import { FFDivider } from "ff_divider.slint";
 
-export component FFDialog inherits Rectangle {
+export component FFDialog inherits FFModalPanel {
     in property <bool> open: false;
     // "warning" (a red top rule and triangle icon) | "caution" (an amber top
     // rule and circle icon) | "save" (a save icon, no rule) | "plain".
@@ -17,8 +19,6 @@ export component FFDialog inherits Rectangle {
     in property <string> body: "";
     // Empty hides the info line.
     in property <string> info: "";
-    in property <length> panel-width: 480px;
-    in property <length> panel-height: 300px;
     in property <string> cancel-label: "Cancel";
     in property <string> secondary-label: "";
     in property <string> confirm-label: "Confirm";
@@ -27,146 +27,101 @@ export component FFDialog inherits Rectangle {
     callback secondary-pressed();
     callback confirmed();
 
-    visible: root.open;
-    width: 100%;
-    height: 100%;
+    modal-open: root.open;
+    tone-rule: root.tone == "warning" ? "warning" : root.tone == "caution" ? "caution" : "none";
 
-    scrim := Rectangle {
-        width: 100%;
-        height: 100%;
-        background: Theme.surface-canvas.with-alpha(0.6);
+    VerticalLayout {
+        padding: Theme.space-4;
+        spacing: Theme.space-3;
 
-        TouchArea {
-            width: 100%;
-            height: 100%;
-            scroll-event(e) => { accept }
-        }
-    }
-
-    panel := Rectangle {
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        width: root.panel-width;
-        height: root.panel-height;
-        background: Theme.surface-raised;
-        border-radius: Theme.radius-lg;
-        // Lifts the panel off the scrim -- the same recipe `FFLoadingPanel`
-        // and `FFImageRow`'s floating state use.
-        drop-shadow-color: Theme.surface-canvas.with-alpha(0.5);
-        drop-shadow-offset-y: Theme.space-1;
-        drop-shadow-blur: Theme.space-2;
-
-        if root.tone == "warning": Rectangle {
-            x: 0;
-            y: 0;
-            width: 100%;
-            height: 2px;
-            background: Theme.status-failure;
-        }
-        if root.tone == "caution": Rectangle {
-            x: 0;
-            y: 0;
-            width: 100%;
-            height: 2px;
-            background: Theme.status-warning;
-        }
-
+        // Everything above the footer, packed from the top and given
+        // the whole panel's leftover height -- however little of it
+        // the body actually uses, the footer below stays pinned to the
+        // panel's own bottom edge instead of floating wherever the
+        // content happens to end.
         VerticalLayout {
-            padding: Theme.space-4;
             spacing: Theme.space-3;
+            alignment: start;
+            vertical-stretch: 1;
 
-            // Everything above the footer, packed from the top and given
-            // the whole panel's leftover height -- however little of it
-            // the body actually uses, the footer below stays pinned to the
-            // panel's own bottom edge instead of floating wherever the
-            // content happens to end.
+            HorizontalLayout {
+                spacing: Theme.space-2;
+
+                if root.tone == "warning": Image {
+                    source: @image-url("../../../../assets/icons/triangle-alert.svg");
+                    colorize: Theme.status-failure;
+                    width: Theme.icon-lg;
+                    height: Theme.icon-lg;
+                }
+                if root.tone == "caution": Image {
+                    source: @image-url("../../../../assets/icons/circle-alert.svg");
+                    colorize: Theme.status-warning;
+                    width: Theme.icon-lg;
+                    height: Theme.icon-lg;
+                }
+                if root.tone == "save": Image {
+                    source: @image-url("../../../../assets/icons/save.svg");
+                    colorize: Theme.text-secondary;
+                    width: Theme.icon-lg;
+                    height: Theme.icon-lg;
+                }
+                Text {
+                    text: root.title;
+                    color: Theme.text-primary;
+                    font-size: Theme.text-title.size;
+                    font-weight: Theme.text-title.weight;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+            }
+
             VerticalLayout {
-                spacing: Theme.space-3;
-                alignment: start;
-                vertical-stretch: 1;
+                spacing: Theme.space-2;
 
-                HorizontalLayout {
-                    spacing: Theme.space-2;
-
-                    if root.tone == "warning": Image {
-                        source: @image-url("../../../../assets/icons/triangle-alert.svg");
-                        colorize: Theme.status-failure;
-                        width: Theme.icon-lg;
-                        height: Theme.icon-lg;
-                    }
-                    if root.tone == "caution": Image {
-                        source: @image-url("../../../../assets/icons/circle-alert.svg");
-                        colorize: Theme.status-warning;
-                        width: Theme.icon-lg;
-                        height: Theme.icon-lg;
-                    }
-                    if root.tone == "save": Image {
-                        source: @image-url("../../../../assets/icons/save.svg");
-                        colorize: Theme.text-secondary;
-                        width: Theme.icon-lg;
-                        height: Theme.icon-lg;
-                    }
-                    Text {
-                        text: root.title;
-                        color: Theme.text-primary;
-                        font-size: Theme.text-title.size;
-                        font-weight: Theme.text-title.weight;
-                        vertical-alignment: center;
-                        wrap: word-wrap;
-                        horizontal-stretch: 1;
-                    }
+                if root.context != "": Text {
+                    text: root.context;
+                    color: Theme.text-muted;
+                    font-size: Theme.text-body.size;
+                    wrap: word-wrap;
                 }
-
-                VerticalLayout {
-                    spacing: Theme.space-2;
-
-                    if root.context != "": Text {
-                        text: root.context;
-                        color: Theme.text-muted;
-                        font-size: Theme.text-body.size;
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: root.body;
-                        color: Theme.text-secondary;
-                        font-size: Theme.text-body.size;
-                        wrap: word-wrap;
-                    }
-                }
-
-                Rectangle {
-                    height: 1px;
-                    background: Theme.border-default;
-                }
-
-                if root.info != "": HorizontalLayout {
-                    spacing: Theme.space-1;
-                    Image {
-                        source: @image-url("../../../../assets/icons/info.svg");
-                        colorize: Theme.text-muted;
-                        width: Theme.icon-lg;
-                        height: Theme.icon-lg;
-                    }
-                    Text {
-                        text: root.info;
-                        color: Theme.text-muted;
-                        font-size: Theme.text-body.size;
-                        vertical-alignment: center;
-                        wrap: word-wrap;
-                        horizontal-stretch: 1;
-                    }
+                Text {
+                    text: root.body;
+                    color: Theme.text-secondary;
+                    font-size: Theme.text-body.size;
+                    wrap: word-wrap;
                 }
             }
 
-            FFDialogFooter {
-                cancel-label: root.cancel-label;
-                secondary-label: root.secondary-label;
-                confirm-label: root.confirm-label;
-                confirm-kind: root.confirm-kind;
-                cancelled => { root.cancelled(); }
-                secondary-pressed => { root.secondary-pressed(); }
-                confirmed => { root.confirmed(); }
+            FFDivider { }
+
+            if root.info != "": HorizontalLayout {
+                spacing: Theme.space-1;
+                Image {
+                    source: @image-url("../../../../assets/icons/info.svg");
+                    colorize: Theme.text-muted;
+                    width: Theme.icon-lg;
+                    height: Theme.icon-lg;
+                }
+                Text {
+                    text: root.info;
+                    color: Theme.text-muted;
+                    font-size: Theme.text-body.size;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
             }
+        }
+
+        FFDialogFooter {
+            cancel-label: root.cancel-label;
+            secondary-label: root.secondary-label;
+            confirm-label: root.confirm-label;
+            confirm-kind: root.confirm-kind;
+            cancelled => { root.cancelled(); }
+            secondary-pressed => { root.secondary-pressed(); }
+            confirmed => { root.confirmed(); }
         }
     }
 }

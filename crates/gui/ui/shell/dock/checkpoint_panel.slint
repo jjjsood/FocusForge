@@ -38,6 +38,7 @@ export component FFCheckpointPanel inherits Rectangle {
     out property <length> viewport-height: list-wrap.height;
     // The empty-state line, shown only while `rows` is empty.
     in property <string> line: "None yet — fuse a stack";
+    in property <bool> export-enabled: false;
     in property <[CheckpointEntryView]> rows: [];
     // The list's own scroll offset and total row height -- both computed in
     // Rust, the `FFImagesPanel` `scroll-y`/`content-height` twins.
@@ -77,7 +78,7 @@ export component FFCheckpointPanel inherits Rectangle {
                     has-icon: true;
                     icon-source: @image-url("../../../../../assets/icons/download.svg");
                     text: "Export image";
-                    enabled: false;
+                    enabled: root.export-enabled;
                     clicked => { root.checkpoint-export-requested(); }
                 }
             }

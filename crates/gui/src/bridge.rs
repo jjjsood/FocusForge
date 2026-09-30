@@ -348,6 +348,22 @@ fn poll_checkpoint_render(
     });
 }
 
+/// Polls [`AppController::settle_export`] every [`job::POLL`] until the
+/// background export write settles, then pushes the modal's own state --
+/// [`poll_checkpoint_render`]'s twin for [`job::export_position`].
+fn poll_export(app_weak: slint::Weak<AppWindow>, controller: Arc<Mutex<AppController>>) {
+    slint::Timer::single_shot(job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().settle_export() {
+            push_export_dialog(&app, &controller.lock().unwrap());
+        } else {
+            poll_export(app_weak, controller);
+        }
+    });
+}
+
 /// Locks `controller`, runs `mutate` against it, then repaints if the
 /// window is still alive.
 fn dispatch(
@@ -862,6 +878,7 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
 /// Pushes the `Checkpoints` panel's whole state -- [`push_images_panel`]'s
 /// twin.
 pub fn push_checkpoint_panel(app: &AppWindow, controller: &AppController) {
+    app.set_checkpoint_export_enabled(controller.export_enabled());
     let panel = controller.checkpoints_panel();
     let rows: Vec<GeneratedCheckpointEntry> = panel
         .entries
@@ -1282,6 +1299,38 @@ pub fn install(
     app.on_checkpoint_export_requested({
         let controller = controller.clone();
         move || controller.lock().unwrap().checkpoint_export_requested()
+    });
+    app.on_export_confirmed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            // The refused state's confirm button reads "Locate frames…" and
+            // needs a folder, not a save destination -- the same
+            // locate-by-hash flow the missing-sources notice already runs,
+            // re-attempting the export once it settles
+            // (`AppController::settle_locate`).
+            if controller.lock().unwrap().export_stage() == "refused" {
+                if let Some(folder) = crate::picker::pick_entry() {
+                    controller.lock().unwrap().export_locate_frames(folder);
+                }
+                return;
+            }
+            let started = {
+                let mut controller = controller.lock().unwrap();
+                controller.export_confirmed(crate::picker::pick_save_image);
+                controller.take_export_started()
+            };
+            if let Some(app) = app_weak.upgrade() {
+                push_export_dialog(&app, &controller.lock().unwrap());
+            }
+            if started {
+                poll_export(app_weak.clone(), controller.clone());
+            }
+        }
+    });
+    app.on_export_cancelled({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().cancel_export()
     });
     // The editor toolbar: each callback is a single forward into the
     // controller method already driving the matching input-map row.
@@ -2473,6 +2522,24 @@ fn push_project_dialogs(app: &AppWindow, controller: &AppController) {
     );
 }
 
+/// Pushes the export modal's own state -- every place it can newly open,
+/// change stage or close. `pub` so a test can call it directly, the same
+/// reason [`push_projects`] is.
+pub fn push_export_dialog(app: &AppWindow, controller: &AppController) {
+    app.set_export_open(controller.export_open());
+    let (context, what) = controller.export_copy().unwrap_or(("", ""));
+    app.set_export_context(context.into());
+    app.set_export_what(what.into());
+    app.set_export_stage(controller.export_stage().into());
+    app.set_export_writing_file_name(controller.export_destination_name().into());
+    let lines: Vec<slint::SharedString> = controller
+        .export_refusal_lines()
+        .iter()
+        .map(|line| line.as_str().into())
+        .collect();
+    app.set_export_refusal_lines(slint::ModelRc::new(slint::VecModel::from(lines)));
+}
+
 /// Performs one [`ShellEvent`] against the window. The only function in the
 /// crate that names `winit`.
 fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: ShellEvent) {
@@ -2523,9 +2590,10 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             };
             app.set_dock_tab(tab.into());
         }
-        // Never reachable while `export_enabled()` is always `false` --
-        // but the window has nothing to do with it either way.
-        ShellEvent::CheckpointExportRequested => {}
+        // Every place the export modal opens, changes stage or closes.
+        ShellEvent::CheckpointExportRequested => {
+            push_export_dialog(app, &controller.lock().unwrap());
+        }
         // Never reachable while `undock_enabled()` is always `true` with
         // both panes docked.
         ShellEvent::PaneUndockRequested(_) => {}
@@ -2640,10 +2708,19 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         // the refusal dialog through `settle_locate`'s own
         // `refuse_message`, which raises its own `EntryRefused` event.
         ShellEvent::LocateReady => {
-            let mut controller = controller.lock().unwrap();
-            controller.settle_locate();
-            push_projects_overlay(app, &controller);
-            push_project_dialogs(app, &controller);
+            let started = {
+                let mut controller = controller.lock().unwrap();
+                controller.settle_locate();
+                push_projects_overlay(app, &controller);
+                push_project_dialogs(app, &controller);
+                // A refused export waiting on this same verification may
+                // have just been retried (`AppController::retry_export`).
+                push_export_dialog(app, &controller);
+                controller.take_export_started()
+            };
+            if started {
+                poll_export(app.as_weak(), controller.clone());
+            }
         }
     }
 }

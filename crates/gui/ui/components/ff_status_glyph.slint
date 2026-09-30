@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A dialog header's small status indicator: a neutral rounded swatch, or a
+// filled circle for an alert state.
+
+import { Theme } from "../theme.slint";
+
+export component FFStatusGlyph inherits Rectangle {
+    // "swatch" (a neutral rounded square) | "circle" (a filled alert dot).
+    in property <string> kind: "swatch";
+
+    width: Theme.icon-lg;
+    height: Theme.icon-lg;
+    border-radius: root.kind == "circle" ? self.height / 2 : Theme.radius-sm;
+    background: root.kind == "circle" ? Theme.status-failure : Theme.text-disabled;
+}

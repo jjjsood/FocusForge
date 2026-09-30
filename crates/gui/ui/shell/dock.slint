@@ -28,6 +28,7 @@ export component FFDock inherits Rectangle {
     // The checkpoints panel's own empty-state line, shown in place of the
     // row list below while it is empty. Set from Rust in `src/bridge.rs`.
     in property <string> checkpoint-line: "None yet — fuse a stack";
+    in property <bool> checkpoint-export-enabled: false;
     // The checkpoints panel's own list, forwarded the same way as the
     // `Images` panel's rows below.
     in property <[CheckpointEntryView]> checkpoint-rows: [];
@@ -109,6 +110,7 @@ export component FFDock inherits Rectangle {
 
         checkpoint-panel := FFCheckpointPanel {
             line: root.checkpoint-line;
+            export-enabled: root.checkpoint-export-enabled;
             rows: root.checkpoint-rows;
             scroll-y: root.checkpoint-scroll-y;
             content-height: root.checkpoint-content-height;

@@ -755,6 +755,9 @@ fn controller_events_reach_an_installed_sink() {
     controller.window_minimize();
     controller.window_maximize_toggle();
     controller.select_dock_tab(DockTab::Settings);
+    // `checkpoint_export_requested` is a no-op (no `CheckpointExportRequested`
+    // raised) with no active tab; its positive case is
+    // `tests/checkpoint_export.rs::export_button_opens_the_modal_for_the_current_position`.
     controller.checkpoint_export_requested();
     controller.window_close();
 
@@ -766,7 +769,6 @@ fn controller_events_reach_an_installed_sink() {
             ShellEvent::WindowMinimizeRequested,
             ShellEvent::WindowMaximizeToggled(true),
             ShellEvent::DockTabSelected(DockTab::Settings),
-            ShellEvent::CheckpointExportRequested,
             ShellEvent::WindowCloseRequested,
         ],
         "events must reach the sink in the order they were raised"

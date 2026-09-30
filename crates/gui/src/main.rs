@@ -54,6 +54,11 @@ struct Args {
     /// `running`, `paused`, `cancelling` or `failed`.
     #[arg(long)]
     toolbar_state: Option<String>,
+    /// Opens the export modal at startup with literal preview text, for
+    /// inspecting a state no click sequence quickly reaches: `ready`,
+    /// `writing` or `refused`.
+    #[arg(long)]
+    export_dialog_preview: Option<String>,
     /// Opens the `Images` panel's sort menu at startup, for inspecting it
     /// with no click sequence.
     #[arg(long)]
@@ -88,6 +93,13 @@ struct Args {
     /// with no click sequence.
     #[arg(long)]
     frame_remove_warning: Option<usize>,
+    /// Presses `Export image` on the active tab's current row once `--open`
+    /// settles, confirming with the proposed destination -- a real export
+    /// through `AppController`/`job::export_position`, not
+    /// `--export-dialog-preview`'s literal text, for inspecting an actual
+    /// refusal (or a real success) with no click sequence.
+    #[arg(long)]
+    export_active_row: bool,
     /// Selects these tab indices in turn and presses `Fuse stack` on each,
     /// right after `--open`, leaving the last one selected -- for
     /// inspecting a live run and the tabs queued behind it with no click
@@ -116,6 +128,30 @@ fn apply_toolbar_state_preview(app: &AppWindow, state: &str) {
     app.set_bar_fraction(fraction);
     app.set_bar_tone(tone.into());
     app.set_eta_text(eta.into());
+}
+
+/// Sets the export modal's own state directly, with no controller or
+/// worker behind it -- `apply_toolbar_state_preview`'s twin, for inspecting
+/// the writing/refused states no click sequence quickly reaches.
+fn apply_export_dialog_preview(app: &AppWindow, stage: &str) {
+    app.set_export_open(true);
+    app.set_export_context("mantis-512.ffp · ORB · 2026-09-28 14:32".into());
+    app.set_export_what("Exporting the saved checkpoint you selected.".into());
+    app.set_export_stage(stage.into());
+    app.set_export_writing_file_name(if stage == "writing" {
+        "mantis-512-checkpoint-3.tif".into()
+    } else {
+        slint::SharedString::default()
+    });
+    let lines: Vec<slint::SharedString> = if stage == "refused" {
+        vec![
+            "mantis_014.tif — missing".into(),
+            "mantis_037.tif — changed since this checkpoint was fused".into(),
+        ]
+    } else {
+        Vec::new()
+    };
+    app.set_export_refusal_lines(slint::ModelRc::new(slint::VecModel::from(lines)));
 }
 
 /// The post-fuse actions `start_fuse_tabs_timer` may run once every pressed
@@ -200,6 +236,53 @@ fn start_fuse_tabs_timer(
         }
         if overlay && !controller.lock().unwrap().projects_overlay_open() {
             controller.lock().unwrap().toggle_projects_overlay();
+        }
+        if let Some(t) = timer_slot.borrow().as_ref() {
+            t.stop();
+        }
+    });
+    *slot.borrow_mut() = Some(timer);
+}
+
+/// Presses `Export image` and confirms with the proposed destination once
+/// the `--open`ed project settles, then polls the real worker
+/// (`AppController::settle_export`) to completion and repaints --
+/// `--export-active-row`'s own timer, `start_fuse_tabs_timer`'s pattern for
+/// one press instead of several.
+fn start_export_active_row_timer(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    slot: &Rc<RefCell<Option<slint::Timer>>>,
+) {
+    let timer_slot = slot.clone();
+    let mut pressed = false;
+    let mut started = false;
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if !pressed {
+            if controller.lock().unwrap().load_in_flight() {
+                return;
+            }
+            let mut controller = controller.lock().unwrap();
+            controller.checkpoint_export_requested();
+            controller.export_confirmed(|proposed| Some(proposed.to_path_buf()));
+            started = controller.take_export_started();
+            pressed = true;
+            bridge::push_export_dialog(&app, &controller);
+            if !started && let Some(t) = timer_slot.borrow().as_ref() {
+                t.stop();
+            }
+            return;
+        }
+        if started {
+            let done = controller.lock().unwrap().settle_export();
+            bridge::push_export_dialog(&app, &controller.lock().unwrap());
+            if !done {
+                return;
+            }
         }
         if let Some(t) = timer_slot.borrow().as_ref() {
             t.stop();
@@ -668,6 +751,9 @@ fn run(args: &Args) -> ExitCode {
         if let Some(state) = &args.toolbar_state {
             apply_toolbar_state_preview(&app, state.as_str());
         }
+        if let Some(stage) = &args.export_dialog_preview {
+            apply_export_dialog_preview(&app, stage.as_str());
+        }
 
         // Each load runs on its own worker thread; a refusal reaches the
         // window's own refusal dialog. Only the first `--open` path starts
@@ -707,6 +793,16 @@ fn run(args: &Args) -> ExitCode {
 
         if let Some(index) = args.frame_remove_warning {
             controller.lock().unwrap().remove_frame(index);
+        }
+
+        let export_active_row_timer: Rc<RefCell<Option<slint::Timer>>> =
+            Rc::new(RefCell::new(None));
+        if args.export_active_row && !args.open.is_empty() {
+            start_export_active_row_timer(
+                app.as_weak(),
+                controller.clone(),
+                &export_active_row_timer,
+            );
         }
 
         let fuse_tabs_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));

@@ -19,7 +19,7 @@ use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, 
 
 use super::Project;
 use super::error::ProjectError;
-use super::render::{CheckpointImage, write_tiff, write_via_partial};
+use super::render::{CheckpointImage, Renderer, ZmapSource, write_tiff, write_via_partial};
 
 /// The largest side JPEG can encode: SOF0's width/height fields are 16 bits.
 const JPEG_MAX_SIDE: u32 = 65535;
@@ -668,16 +668,67 @@ pub fn export_checkpoint(
     options: &ExportOptions,
     metadata_options: &MetadataOptions,
 ) -> Result<MetadataOutcome, ProjectError> {
-    validate(params_for(options.format()), &options.values())
-        .map_err(|source| ProjectError::ExportOptions { source })?;
     let image = CheckpointImage::prepare_export(project, id)?;
-    check_jpeg_size(options, image.width, image.height, path)?;
-    check_supported_samples(options, image.samples_per_pixel, path)?;
-
     let record = project.fuse_state(id)?;
     let frame = record.align.as_ref().map_or(0, |a| a.reference);
     let frame_path = project.source_path(&record.sources[frame]);
-    let source = io::read_source_metadata(&frame_path);
+    encode(
+        &image,
+        &mut |sink| image.render(project, sink),
+        frame,
+        &frame_path,
+        path,
+        options,
+        metadata_options,
+    )
+}
+
+/// The live export render, over a Z-Map file `zmap` (a held row's staged
+/// map, or an edit session's Z-Map written to a temp file) plus `source`'s
+/// placement, rather than a checkpoint history entry -- otherwise exactly
+/// [`export_checkpoint`]'s own validation, metadata resolution and
+/// `.partial` discipline, through the one shared `encode` path.
+pub fn export_zmap(
+    zmap: &Path,
+    source: &ZmapSource,
+    path: &Path,
+    options: &ExportOptions,
+    metadata_options: &MetadataOptions,
+) -> Result<MetadataOutcome, ProjectError> {
+    let image = CheckpointImage::prepare_zmap(zmap, source)?;
+    let frame = source.reference;
+    let frame_path = source.sources[frame].clone();
+    encode(
+        &image,
+        &mut |sink| image.render_external(sink),
+        frame,
+        &frame_path,
+        path,
+        options,
+        metadata_options,
+    )
+}
+
+/// Validates `options`, writes `image` through `render` as `options` say (a
+/// `.partial` sibling of `path`, renamed onto it only once complete), and
+/// resolves `frame_path`'s metadata into the same file -- a damaged or
+/// missing block is named in the returned [`MetadataOutcome`], never fatal.
+/// Shared by [`export_checkpoint`] and [`export_zmap`].
+fn encode(
+    image: &CheckpointImage,
+    render: &mut Renderer<'_>,
+    frame: usize,
+    frame_path: &Path,
+    path: &Path,
+    options: &ExportOptions,
+    metadata_options: &MetadataOptions,
+) -> Result<MetadataOutcome, ProjectError> {
+    validate(params_for(options.format()), &options.values())
+        .map_err(|source| ProjectError::ExportOptions { source })?;
+    check_jpeg_size(options, image.width, image.height, path)?;
+    check_supported_samples(options, image.samples_per_pixel, path)?;
+
+    let source = io::read_source_metadata(frame_path);
     let now = Local::now().fixed_offset();
     let plan = io::resolve_plan(
         &source,
@@ -695,7 +746,7 @@ pub fn export_checkpoint(
             bits: TiffBits::Sixteen,
             compression: TiffCompression::None,
         } if plan_is_empty(&plan) => {
-            write_tiff(project, &image, path)?;
+            write_tiff(image, render, path)?;
             MetadataBlocks {
                 exif: block_status(metadata_options.exif, true, false, false),
                 icc: icc_status(metadata_options.icc, plan.icc, false),
@@ -705,8 +756,8 @@ pub fn export_checkpoint(
             }
         }
         ExportOptions::Tiff { bits, compression } => write_strip_tiff(
-            project,
-            &image,
+            image,
+            render,
             path,
             *bits,
             *compression,
@@ -714,8 +765,8 @@ pub fn export_checkpoint(
             metadata_options,
         )?,
         ExportOptions::Png { bits, compression } => write_png(
-            project,
-            &image,
+            image,
+            render,
             path,
             *bits,
             *compression,
@@ -726,8 +777,8 @@ pub fn export_checkpoint(
             quality,
             subsampling,
         } => write_jpeg(
-            project,
-            &image,
+            image,
+            render,
             path,
             *quality,
             *subsampling,
@@ -740,7 +791,7 @@ pub fn export_checkpoint(
     warnings.extend(blocks.warnings);
     Ok(MetadataOutcome {
         frame,
-        frame_path,
+        frame_path: frame_path.to_path_buf(),
         exif: blocks.exif,
         icc: blocks.icc,
         xmp: blocks.xmp,
@@ -752,8 +803,8 @@ pub fn export_checkpoint(
 /// 8- or 16-bit, compressed or uncompressed TIFF, through [`StripWriter`].
 #[allow(clippy::too_many_arguments)] // one flag/plan apiece; a struct wrapper would only rename this list
 fn write_strip_tiff(
-    project: &mut Project,
     image: &CheckpointImage,
+    render: &mut Renderer<'_>,
     path: &Path,
     bits: TiffBits,
     compression: TiffCompression,
@@ -800,7 +851,7 @@ fn write_strip_tiff(
         )
         .map_err(|err| ProjectError::container(partial, err))?;
         let mut row_bytes: Vec<u8> = Vec::new();
-        image.render(project, &mut |band, _rect| {
+        render(&mut |band, _rect| {
             row_bytes.clear();
             match bits {
                 TiffBits::Sixteen => row_bytes.extend(band.iter().flat_map(|v| v.to_le_bytes())),
@@ -833,8 +884,8 @@ fn write_strip_tiff(
 /// always `Unsupported` here regardless of the source.
 #[allow(clippy::too_many_arguments)] // one flag/plan apiece; a struct wrapper would only rename this list
 fn write_png(
-    project: &mut Project,
     image: &CheckpointImage,
+    render: &mut Renderer<'_>,
     path: &Path,
     bits: PngBits,
     compression: PngCompression,
@@ -900,7 +951,7 @@ fn write_png(
             let mut stream = writer
                 .stream_writer()
                 .map_err(|err| ProjectError::container(partial, err))?;
-            image.render(project, &mut |band, _rect| {
+            render(&mut |band, _rect| {
                 row_bytes.clear();
                 match bits {
                     PngBits::Sixteen => row_bytes.extend(band.iter().flat_map(|v| v.to_be_bytes())),
@@ -950,8 +1001,8 @@ struct JpegMetadataSkips {
 /// skipped, not fatal, when the encoder refuses it for size.
 #[allow(clippy::too_many_arguments)] // one flag/plan apiece; a struct wrapper would only rename this list
 fn write_jpeg(
-    project: &mut Project,
     image: &CheckpointImage,
+    render: &mut Renderer<'_>,
     path: &Path,
     quality: i64,
     subsampling: JpegSubsampling,
@@ -999,7 +1050,7 @@ fn write_jpeg(
                 }
                 (encoder.encode_image(source), skips)
             });
-            let render_result = image.render(project, &mut |band, _rect| {
+            let render_result = render(&mut |band, _rect| {
                 let bytes: Vec<u8> = band.iter().map(|&v| to_8bit(v)).collect();
                 tx.send(bytes).map_err(|_| {
                     ProjectError::container(

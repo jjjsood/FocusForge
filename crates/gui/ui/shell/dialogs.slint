@@ -8,8 +8,21 @@
 
 import { Theme } from "../theme.slint";
 import { FFDialog } from "../components/ff_dialog.slint";
+import { FFDialogFooter } from "../components/ff_dialog_footer.slint";
+import { FFRowText } from "../components/ff_row_text.slint";
+import { FFSectionHeading } from "../components/ff_section_heading.slint";
+import { FFMenu } from "../components/ff_menu.slint";
+import { FFToggle } from "../components/ff_toggle.slint";
+import { FFSpinner } from "../components/ff_spinner.slint";
+import { FFProgressBar } from "../components/ff_progress_bar.slint";
+import { FFErrorRow } from "../components/ff_error_row.slint";
+import { FFModalPanel } from "../components/ff_modal_panel.slint";
+import { FFStatusGlyph } from "../components/ff_status_glyph.slint";
+import { FFDivider } from "../components/ff_divider.slint";
+import { FFHeading } from "../components/ff_heading.slint";
+import { FFSegmented } from "../components/ff_segmented.slint";
 
-export component FFGroupingQuestion inherits Rectangle {
+export component FFGroupingQuestion inherits FFModalPanel {
     in property <bool> question-open: false;
     in property <int> frame-count: 0;
     in property <int> project-count: 0;
@@ -17,144 +30,106 @@ export component FFGroupingQuestion inherits Rectangle {
     callback open-as-many();
     callback cancelled();
 
-    visible: root.question-open;
+    modal-open: root.question-open;
+    panel-width: 480px;
+    panel-height: 200px;
 
-    scrim := Rectangle {
-        width: 100%;
-        height: 100%;
-        background: Theme.surface-canvas.with-alpha(0.6);
+    VerticalLayout {
+        padding: Theme.space-4;
+        spacing: Theme.space-3;
 
-        TouchArea {
-            width: 100%;
-            height: 100%;
-            scroll-event(e) => { accept }
+        body := Text {
+            text: "This folder reads as " + root.project-count + " stacks of "
+                + root.frame-count + " frames.";
+            color: Theme.text-primary;
+            font-size: Theme.text-body.size;
+            wrap: word-wrap;
         }
-    }
 
-    panel := Rectangle {
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        width: 480px;
-        height: 200px;
-        background: Theme.surface-raised;
-        border-radius: Theme.radius-lg;
+        HorizontalLayout {
+            spacing: Theme.space-2;
 
-        VerticalLayout {
-            padding: Theme.space-4;
-            spacing: Theme.space-3;
-
-            body := Text {
-                text: "This folder reads as " + root.project-count + " stacks of "
-                    + root.frame-count + " frames.";
-                color: Theme.text-primary;
-                font-size: Theme.text-body.size;
-                wrap: word-wrap;
-            }
-
-            HorizontalLayout {
-                spacing: Theme.space-2;
-
-                one-button := Rectangle {
-                    height: 36px;
-                    background: Theme.accent-default;
-                    border-radius: Theme.radius-sm;
-                    TouchArea { clicked => { root.open-as-one(); } }
-                    Text {
-                        text: "Open as one project";
-                        color: Theme.text-primary;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        width: 100%;
-                        height: 100%;
-                    }
-                }
-                many-button := Rectangle {
-                    height: 36px;
-                    background: Theme.surface-hover;
-                    border-radius: Theme.radius-sm;
-                    TouchArea { clicked => { root.open-as-many(); } }
-                    Text {
-                        text: "Open as " + root.project-count + " projects";
-                        color: Theme.text-primary;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        width: 100%;
-                        height: 100%;
-                    }
-                }
-            }
-
-            cancel-area := TouchArea {
-                height: 24px;
-                clicked => { root.cancelled(); }
-                Text {
-                    text: "Cancel";
-                    color: Theme.text-muted;
-                    horizontal-alignment: center;
-                }
-            }
-        }
-    }
-}
-
-export component FFRefusalDialog inherits Rectangle {
-    in property <bool> refusal-open: false;
-    in property <string> title: "No frames here";
-    in property <string> body: "FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.";
-    in property <string> button-label: "Pick another folder…";
-    callback pick-another-folder();
-
-    visible: root.refusal-open;
-
-    scrim := Rectangle {
-        width: 100%;
-        height: 100%;
-        background: Theme.surface-canvas.with-alpha(0.6);
-
-        TouchArea {
-            width: 100%;
-            height: 100%;
-            scroll-event(e) => { accept }
-        }
-    }
-
-    panel := Rectangle {
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        width: 420px;
-        height: 180px;
-        background: Theme.surface-raised;
-        border-radius: Theme.radius-lg;
-
-        VerticalLayout {
-            padding: Theme.space-4;
-            spacing: Theme.space-3;
-
-            Text {
-                text: root.title;
-                color: Theme.text-primary;
-                font-size: Theme.text-title.size;
-                font-weight: Theme.text-title.weight;
-            }
-            Text {
-                text: root.body;
-                color: Theme.text-secondary;
-                font-size: Theme.text-body.size;
-                wrap: word-wrap;
-            }
-            pick-area := Rectangle {
+            one-button := Rectangle {
                 height: 36px;
                 background: Theme.accent-default;
                 border-radius: Theme.radius-sm;
-                TouchArea { clicked => { root.pick-another-folder(); } }
+                TouchArea { clicked => { root.open-as-one(); } }
                 Text {
-                    text: root.button-label;
+                    text: "Open as one project";
                     color: Theme.text-primary;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                     width: 100%;
                     height: 100%;
                 }
+            }
+            many-button := Rectangle {
+                height: 36px;
+                background: Theme.surface-hover;
+                border-radius: Theme.radius-sm;
+                TouchArea { clicked => { root.open-as-many(); } }
+                Text {
+                    text: "Open as " + root.project-count + " projects";
+                    color: Theme.text-primary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+            }
+        }
+
+        cancel-area := TouchArea {
+            height: 24px;
+            clicked => { root.cancelled(); }
+            Text {
+                text: "Cancel";
+                color: Theme.text-muted;
+                horizontal-alignment: center;
+            }
+        }
+    }
+}
+
+export component FFRefusalDialog inherits FFModalPanel {
+    in property <bool> refusal-open: false;
+    in property <string> title: "No frames here";
+    in property <string> body: "FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.";
+    in property <string> button-label: "Pick another folder…";
+    callback pick-another-folder();
+
+    modal-open: root.refusal-open;
+    panel-width: 420px;
+    panel-height: 180px;
+
+    VerticalLayout {
+        padding: Theme.space-4;
+        spacing: Theme.space-3;
+
+        Text {
+            text: root.title;
+            color: Theme.text-primary;
+            font-size: Theme.text-title.size;
+            font-weight: Theme.text-title.weight;
+        }
+        Text {
+            text: root.body;
+            color: Theme.text-secondary;
+            font-size: Theme.text-body.size;
+            wrap: word-wrap;
+        }
+        pick-area := Rectangle {
+            height: 36px;
+            background: Theme.accent-default;
+            border-radius: Theme.radius-sm;
+            TouchArea { clicked => { root.pick-another-folder(); } }
+            Text {
+                text: root.button-label;
+                color: Theme.text-primary;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: 100%;
+                height: 100%;
             }
         }
     }
@@ -291,4 +266,238 @@ export component FFSourcesMissing inherits FFDialog {
     cancel-label: "Close";
     confirm-label: "Locate frames…";
     confirm-kind: "default";
+}
+
+// The checkpoint panel's `Export image` modal: the tab's current position
+// as a TIFF, no destination field of its own -- confirming opens the OS
+// save dialog directly. Its content is richer than `FFDialog`'s one string
+// body, so it composes `FFModalPanel` directly rather than `FFDialog`. The
+// three states share one fixed-height content slot, so the panel never
+// resizes across them.
+export component FFExportDialog inherits FFModalPanel {
+    in property <bool> export-open: false;
+    in property <string> context: "";
+    in property <string> what: "";
+    // "ready" | "writing" | "refused".
+    in property <string> stage: "ready";
+    // The chosen destination's own file name, named only while writing.
+    in property <string> writing-file-name: "";
+    in property <[string]> refusal-lines: [];
+    callback cancelled();
+    callback confirmed();
+
+    modal-open: root.export-open;
+    panel-width: 560px;
+    panel-height: 365px;
+    clip-panel: true;
+    tone-rule: root.stage == "refused" ? "warning" : "none";
+
+    FFStatusGlyph {
+        x: Theme.space-4;
+        y: Theme.space-4;
+        kind: root.stage == "refused" ? "circle" : "swatch";
+    }
+
+    title-text := FFHeading {
+        x: 44px;
+        y: Theme.space-4;
+        width: 500px;
+        height: 22px;
+        text: "Export image";
+    }
+
+    context-text := FFRowText {
+        x: Theme.space-4;
+        y: title-text.y + title-text.height + Theme.space-3;
+        width: 528px;
+        height: 16px;
+        muted: true;
+        text: root.context;
+        overflow: elide;
+    }
+    what-text := FFRowText {
+        x: Theme.space-4;
+        y: context-text.y + context-text.height + Theme.space-2;
+        width: 528px;
+        height: 32px;
+        text: root.what;
+        wrap: word-wrap;
+    }
+
+    top-divider := FFDivider {
+        x: Theme.space-4;
+        y: what-text.y + what-text.height + Theme.space-3;
+        width: 528px;
+    }
+
+    // Zero-size anchor: every stage's content slot starts here, a fixed
+    // `Theme.space-3` below the divider, and the footer starts a fixed
+    // 184px past it regardless of which slot is showing -- the one span
+    // that never resizes across ready/writing/refused.
+    content-top := Rectangle {
+        x: 0px;
+        y: top-divider.y + top-divider.height + Theme.space-3;
+        width: 0px;
+        height: 0px;
+    }
+
+    if root.stage == "ready": Rectangle {
+        x: Theme.space-4;
+        y: content-top.y;
+        width: 528px;
+        height: 184px;
+
+        format-label := FFRowText {
+            x: 0px;
+            y: 0px;
+            width: 100px;
+            height: 28px;
+            text: "Format";
+        }
+        FFSegmented {
+            x: 78px;
+            y: 0px;
+            width: 168px;
+            segments: ["TIFF", "JPEG"];
+            selected: "TIFF";
+        }
+
+        tiff-settings-heading := FFSectionHeading {
+            x: 0px;
+            y: format-label.y + format-label.height + Theme.space-2;
+            width: 528px;
+            compact: true;
+            opaque: false;
+            provenance: "explicit";
+            label: "TIFF SETTINGS";
+        }
+
+        // 2px: `FFSectionHeading`'s own compact height leaves no
+        // token-sized gap to the row below it.
+        bitdepth-label := FFRowText {
+            x: 0px;
+            y: tiff-settings-heading.y + tiff-settings-heading.height + 2px;
+            width: 100px;
+            height: 28px;
+            text: "Bit depth";
+        }
+        FFMenu {
+            x: 78px;
+            y: bitdepth-label.y;
+            width: 110px;
+            label: "16-bit";
+        }
+
+        compression-label := FFRowText {
+            x: 0px;
+            y: bitdepth-label.y + bitdepth-label.height + Theme.space-2;
+            width: 100px;
+            height: 28px;
+            text: "Compression";
+        }
+        FFMenu {
+            x: 78px;
+            y: compression-label.y;
+            width: 110px;
+            label: "None";
+        }
+
+        metadata-heading := FFSectionHeading {
+            x: 0px;
+            y: compression-label.y + compression-label.height + Theme.space-3;
+            width: 528px;
+            compact: true;
+            opaque: false;
+            provenance: "explicit";
+            label: "METADATA";
+        }
+
+        // 2px, the same leftover as `tiff-settings-heading`'s own.
+        metadata-label := FFRowText {
+            x: 44px;
+            y: metadata-heading.y + metadata-heading.height + 2px;
+            width: 484px;
+            height: 24px;
+            text: "Metadata";
+        }
+        FFToggle {
+            x: 0px;
+            // 2px above the label's own top: a toggle's knob sits taller
+            // than a text row's cap-height, so this aligns their centers.
+            y: metadata-label.y - 2px;
+            on: true;
+            disabled: true;
+        }
+    }
+
+    if root.stage == "writing": Rectangle {
+        x: Theme.space-4;
+        y: content-top.y;
+        width: 528px;
+        height: 184px;
+
+        spinner := FFSpinner {
+            x: 0px;
+            y: 0px;
+            width: 20px;
+            height: 20px;
+        }
+        writing-heading := FFHeading {
+            x: 28px;
+            y: 0px;
+            width: 500px;
+            height: 22px;
+            text: "Writing image…";
+        }
+        progress := FFProgressBar {
+            x: 0px;
+            y: writing-heading.y + writing-heading.height + Theme.space-2;
+            width: 528px;
+            indeterminate: true;
+        }
+        FFRowText {
+            x: 0px;
+            y: progress.y + progress.height + Theme.space-2;
+            width: 528px;
+            height: 32px;
+            muted: true;
+            text: "Writing " + root.writing-file-name + " — this can take a few minutes for a large stack.";
+            wrap: word-wrap;
+        }
+    }
+
+    if root.stage == "refused": Rectangle {
+        x: Theme.space-4;
+        y: content-top.y;
+        width: 528px;
+        height: 184px;
+
+        refused-heading := FFHeading {
+            x: 0px;
+            y: 0px;
+            width: 528px;
+            height: 18px;
+            tone: "failure";
+            size: "body";
+            text: "Can't export this position";
+        }
+        for line[i] in root.refusal-lines: FFErrorRow {
+            x: 0px;
+            y: refused-heading.y + refused-heading.height + Theme.space-2 + i * Theme.space-4;
+            width: 528px;
+            message: "• " + line;
+        }
+    }
+
+    FFDialogFooter {
+        x: Theme.space-4;
+        y: content-top.y + 184px;
+        width: 528px;
+        dimmed: root.stage == "writing";
+        cancel-label: root.stage == "refused" ? "Close" : "Cancel";
+        confirm-label: root.stage == "refused" ? "Locate frames…" : "Export";
+        confirm-kind: root.stage == "refused" ? "default" : "primary";
+        cancelled => { root.cancelled(); }
+        confirmed => { root.confirmed(); }
+    }
 }

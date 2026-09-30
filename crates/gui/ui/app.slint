@@ -22,7 +22,7 @@ export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFSettingsModal, InputRow, FFManifestRow } from "shell/settings_modal.slint";
 export { InputRow, FFManifestRow }
-import { FFCloseGuard, FFDivergenceWarning, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing, FFToast } from "shell/dialogs.slint";
+import { FFCloseGuard, FFDivergenceWarning, FFExportDialog, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing, FFToast } from "shell/dialogs.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
 export { ProjectCardView, RecentRowView }
@@ -234,6 +234,7 @@ export component AppWindow inherits Window {
     // count, or the empty-state wording. Set from Rust alongside
     // `composite-ready` in `src/bridge.rs::push_projects`.
     in property <string> checkpoint-line: "None yet — fuse a stack";
+    in property <bool> checkpoint-export-enabled: false;
     // The `Checkpoints` panel: pushed from `AppController::checkpoints_panel`
     // (`src/bridge.rs`) on every `ShellEvent::CheckpointsChanged`, forwarded
     // one line into `FFDock`.
@@ -409,6 +410,7 @@ export component AppWindow inherits Window {
         dock-tab: root.dock-tab;
         project-loaded: root.project-loaded;
         checkpoint-line: root.checkpoint-line;
+        checkpoint-export-enabled: root.checkpoint-export-enabled;
         checkpoint-rows: root.checkpoint-rows;
         checkpoint-scroll-y: root.checkpoint-scroll-y;
         checkpoint-content-height: root.checkpoint-content-height;
@@ -682,6 +684,16 @@ export component AppWindow inherits Window {
     in property <string> skipped-notice: "";
     callback skipped-notice-dismissed();
 
+    // The checkpoint panel's `Export image` modal.
+    in property <bool> export-open: false;
+    in property <string> export-context: "";
+    in property <string> export-what: "";
+    in property <string> export-stage: "ready";
+    in property <string> export-writing-file-name: "";
+    in property <[string]> export-refusal-lines: [];
+    callback export-confirmed();
+    callback export-cancelled();
+
     // The failed run's own notice, over the canvas rather than in the
     // bottom bar -- a job failure and a "some subfolders were skipped"
     // notice are different messages and never share a slot. Opens on its
@@ -754,6 +766,21 @@ export component AppWindow inherits Window {
         body: root.sources-missing-body;
         confirmed => { root.sources-missing-locate-frames(); }
         cancelled => { root.sources-missing-closed(); }
+    }
+
+    export-dialog := FFExportDialog {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        export-open: root.export-open;
+        context: root.export-context;
+        what: root.export-what;
+        stage: root.export-stage;
+        writing-file-name: root.export-writing-file-name;
+        refusal-lines: root.export-refusal-lines;
+        confirmed => { root.export-confirmed(); }
+        cancelled => { root.export-cancelled(); }
     }
 
     // Declared after the mismatch and sources-missing dialogs so a refusal

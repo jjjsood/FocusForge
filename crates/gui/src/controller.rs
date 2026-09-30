@@ -492,6 +492,79 @@ struct RenderSlot {
 
 type RenderOutcome = Result<(PathBuf, PathBuf), Vec<String>>;
 
+/// The export modal's own state: which tab it names, the context/what
+/// lines already composed for its row (per-kind prose, not a separate
+/// "kind" label -- the kind is named through this prose, never through its
+/// own badge), and how far the write itself has got.
+struct ExportDialog {
+    tab_id: u64,
+    context: String,
+    what: String,
+    stage: ExportStage,
+    /// The chosen destination's own file name -- set once the picker
+    /// returns a path, empty before then; the writing state's caption
+    /// names it.
+    destination_name: String,
+    /// The chosen destination's full path, set alongside
+    /// `destination_name` -- kept so a refused export can be retried at the
+    /// same path once `Locate frames…` resolves its sources, without
+    /// prompting the save dialog again.
+    destination: Option<PathBuf>,
+}
+
+/// Which position an export modal names -- the three kinds its own
+/// context/what copy tells apart.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportKind {
+    Saved,
+    Held,
+    Live,
+}
+
+/// The export modal's own context/what copy for `kind`: a saved or live
+/// row names its algorithm and local time, a held row does not -- it has
+/// neither yet, only its own "just fused" state.
+fn export_copy_for(
+    kind: ExportKind,
+    project_file: &str,
+    algorithm: &str,
+    timestamp: &str,
+) -> (String, String) {
+    match kind {
+        ExportKind::Saved => (
+            format!("{project_file} · {algorithm} · {timestamp}"),
+            "Exporting the saved checkpoint you selected.".to_string(),
+        ),
+        ExportKind::Held => (
+            format!("{project_file} · unsaved fuse result, held in this tab"),
+            "Exporting the unsaved fuse result held in this tab.".to_string(),
+        ),
+        ExportKind::Live => (
+            format!("{project_file} · unsaved edits on {algorithm} · {timestamp}"),
+            "Exporting your current unsaved retouch edits.".to_string(),
+        ),
+    }
+}
+
+enum ExportStage {
+    Ready,
+    Writing,
+    Refused(Vec<String>),
+}
+
+/// An export write's own outcome, as [`ExportSlot`] parks it: written, or
+/// the modal's own refusal lines.
+type ExportOutcome = Result<(), Vec<String>>;
+
+/// The one export write in flight, if any, and where its worker parks the
+/// result -- [`RenderSlot`]'s twin for [`job::export_position`].
+#[derive(Default)]
+struct ExportSlot {
+    in_flight: Option<u64>,
+    started: bool,
+    outcome: Arc<Mutex<Option<ExportOutcome>>>,
+}
+
 /// A held checkpoint whose run diverged on `diverged`, by frame file name.
 struct ParkedRun {
     held: job::HeldCheckpoint,
@@ -862,6 +935,10 @@ struct ShellState {
     /// The in-flight background load, if any.
     load: LoadSlot,
     render: RenderSlot,
+    /// The open export modal, if any -- [`AppController::checkpoint_export_requested`].
+    export_dialog: Option<ExportDialog>,
+    /// The in-flight export write, if any.
+    export: ExportSlot,
     /// The in-flight additive import scan, if any.
     import: ImportSlot,
     /// The in-flight `Locate frames…` verification, if any.
@@ -1513,9 +1590,12 @@ impl AppController {
         }
     }
 
-    /// Always `false` -- the checkpoint panel's `Export` stays disabled.
+    /// Whether the active tab has a current position to export: a saved
+    /// row, a held row (including in a never-saved tab), or a tab with
+    /// unsealed edits over one -- exactly when its own `ProjectTab::fused`
+    /// resolves.
     pub fn export_enabled(&self) -> bool {
-        false
+        self.state.active().is_some_and(|tab| tab.fused().is_some())
     }
 
     /// The tab strip's pointer-down, forwarded from `window-drag-requested`.
@@ -1554,10 +1634,207 @@ impl AppController {
         }
     }
 
-    /// Never reachable while [`Self::export_enabled`] is always `false`,
-    /// but declared so the seam exists to wire without moving anything.
-    pub fn checkpoint_export_requested(&self) {
+    /// Opens the export modal for the active tab's current position:
+    /// `tab.edit` with unsealed ops, else its selected held row, else its
+    /// selected saved row -- the same precedence row-selection locking
+    /// already relies on (`ProjectTab::edit` is cleared on any row
+    /// change). A no-op with nothing to export.
+    pub fn checkpoint_export_requested(&mut self) {
+        let Some(tab) = self.state.active() else {
+            return;
+        };
+        let Some(dialog) = export_dialog_for(tab) else {
+            return;
+        };
+        self.state.export_dialog = Some(dialog);
         self.emit(ShellEvent::CheckpointExportRequested);
+    }
+
+    /// Closes the export modal without writing anything -- its own Cancel.
+    pub fn cancel_export(&mut self) {
+        if self.state.export_dialog.take().is_some() {
+            self.emit(ShellEvent::CheckpointExportRequested);
+        }
+    }
+
+    /// Confirms the open export modal: asks `pick` for a destination (the
+    /// OS save dialog, `picker::pick_save_image`'s own pattern, mirroring
+    /// [`Self::save_active_project`]), then starts the write on a worker.
+    /// A no-op with no dialog open; the dialog stays exactly as it was when
+    /// `pick` returns `None` (the user cancelled the save dialog).
+    pub fn export_confirmed(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) {
+        let Some(dialog) = self.state.export_dialog.as_ref() else {
+            return;
+        };
+        if !matches!(dialog.stage, ExportStage::Ready) {
+            // Reached only for the writing state: its confirm button is
+            // dimmed but still clickable, so this closes the modal rather
+            // than starting a second write. The refused state's confirm is
+            // routed to `export_locate_frames` before this method is ever
+            // called.
+            self.cancel_export();
+            return;
+        }
+        let tab_id = dialog.tab_id;
+        let Some(tab) = self.state.projects.iter().find(|t| t.id == tab_id) else {
+            self.state.export_dialog = None;
+            return;
+        };
+        let Some(source) = export_source_for(tab) else {
+            self.state.export_dialog = None;
+            return;
+        };
+        let proposed = export_proposed_path(tab);
+        let Some(path) = pick(&proposed) else {
+            return;
+        };
+        let destination_name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        if let Some(dialog) = self.state.export_dialog.as_mut() {
+            dialog.stage = ExportStage::Writing;
+            dialog.destination_name = destination_name;
+            dialog.destination = Some(path.clone());
+        }
+        self.start_export(tab_id, source, path);
+        self.emit(ShellEvent::CheckpointExportRequested);
+    }
+
+    /// The refused export modal's own `Locate frames…`: verifies `folder`
+    /// against the exporting tab's recorded sources the same way the
+    /// missing-sources notice does ([`Self::locate_sources_notice`]), so
+    /// [`Self::settle_locate`] can re-attempt the export once they resolve.
+    /// `None` with no refused export dialog open, or while a previous
+    /// verification is still running.
+    pub fn export_locate_frames(&mut self, folder: PathBuf) -> Option<std::thread::JoinHandle<()>> {
+        let dialog = self.state.export_dialog.as_ref()?;
+        if !matches!(dialog.stage, ExportStage::Refused(_)) {
+            return None;
+        }
+        let tab_id = dialog.tab_id;
+        self.locate_frames(entry::LocateTarget::Tab(tab_id), folder)
+    }
+
+    /// Re-attempts a refused export at the same destination path once
+    /// `Locate frames…` ([`Self::export_locate_frames`]) has resolved
+    /// `tab_id`'s sources. Closes the modal instead if the tab, its current
+    /// position or the destination it started from is gone by the time this
+    /// runs.
+    fn retry_export(&mut self, tab_id: u64) {
+        let Some(destination) = self
+            .state
+            .export_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.destination.clone())
+        else {
+            return;
+        };
+        let Some(tab) = self.state.projects.iter().find(|t| t.id == tab_id) else {
+            self.state.export_dialog = None;
+            return;
+        };
+        let Some(source) = export_source_for(tab) else {
+            self.state.export_dialog = None;
+            return;
+        };
+        if let Some(dialog) = self.state.export_dialog.as_mut() {
+            dialog.stage = ExportStage::Writing;
+        }
+        self.start_export(tab_id, source, destination);
+        self.emit(ShellEvent::CheckpointExportRequested);
+    }
+
+    /// Starts `source`'s export to `path` on a spawned worker, parking the
+    /// result for [`Self::settle_export`]. Always starts a fresh outcome
+    /// slot: a worker left running past its own dialog's Cancel keeps
+    /// writing, but a later export's `settle_export` reads only the slot its
+    /// own worker was handed, never a still-running one's stale result.
+    fn start_export(&mut self, tab_id: u64, source: job::ExportSource, path: PathBuf) {
+        self.state.export.in_flight = Some(tab_id);
+        self.state.export.started = true;
+        self.state.export.outcome = Arc::new(Mutex::new(None));
+        let outcome = Arc::clone(&self.state.export.outcome);
+        std::thread::spawn(move || {
+            let result = job::export_outcome(std::panic::catch_unwind(|| {
+                job::export_position(source, &path)
+            }));
+            *outcome
+                .lock()
+                .expect("no thread panicked while holding the export outcome") = Some(result);
+        });
+    }
+
+    /// Picks up a settled export worker: closes the modal on success, or
+    /// moves it into its refused state with the cause. `false` while still
+    /// writing -- the poll's cue to keep going.
+    pub fn settle_export(&mut self) -> bool {
+        let Some(outcome) = self
+            .state
+            .export
+            .outcome
+            .lock()
+            .expect("no thread panicked while holding the export outcome")
+            .take()
+        else {
+            return self.state.export.in_flight.is_none();
+        };
+        self.state.export.in_flight = None;
+        match outcome {
+            Ok(()) => self.state.export_dialog = None,
+            Err(lines) => {
+                if let Some(dialog) = self.state.export_dialog.as_mut() {
+                    dialog.stage = ExportStage::Refused(lines);
+                }
+            }
+        }
+        self.emit(ShellEvent::CheckpointExportRequested);
+        true
+    }
+
+    /// Whether an export write started since the last call -- the bridge's
+    /// cue to start polling [`Self::settle_export`].
+    pub fn take_export_started(&mut self) -> bool {
+        std::mem::take(&mut self.state.export.started)
+    }
+
+    /// Whether the export modal is open.
+    pub fn export_open(&self) -> bool {
+        self.state.export_dialog.is_some()
+    }
+
+    /// The open export modal's own context and what lines, already
+    /// composed for its row -- `None` when it is closed.
+    pub fn export_copy(&self) -> Option<(&str, &str)> {
+        let dialog = self.state.export_dialog.as_ref()?;
+        Some((dialog.context.as_str(), dialog.what.as_str()))
+    }
+
+    /// The open export modal's own stage: `"ready"` / `"writing"` /
+    /// `"refused"` -- `"ready"` (the harmless default) when it is closed.
+    pub fn export_stage(&self) -> &'static str {
+        match self.state.export_dialog.as_ref().map(|d| &d.stage) {
+            Some(ExportStage::Ready) | None => "ready",
+            Some(ExportStage::Writing) => "writing",
+            Some(ExportStage::Refused(_)) => "refused",
+        }
+    }
+
+    /// The chosen destination's own file name, named only while writing.
+    pub fn export_destination_name(&self) -> &str {
+        self.state
+            .export_dialog
+            .as_ref()
+            .map_or("", |d| d.destination_name.as_str())
+    }
+
+    /// The export modal's refusal text, one entry per line; empty unless
+    /// its last write refused.
+    pub fn export_refusal_lines(&self) -> &[String] {
+        match self.state.export_dialog.as_ref().map(|d| &d.stage) {
+            Some(ExportStage::Refused(lines)) => lines,
+            _ => &[],
+        }
     }
 
     /// `"Composite"` / `"Z-Map"` -- the label's geometry is fixed
@@ -3461,6 +3738,10 @@ impl AppController {
                             self.state.sources_notice = None;
                         }
                         self.emit(ShellEvent::OverlayChanged);
+                    }
+                    if matches!(&self.state.export_dialog, Some(d) if d.tab_id == id && matches!(d.stage, ExportStage::Refused(_)))
+                    {
+                        self.retry_export(id);
                     }
                 }
             },
@@ -6171,6 +6452,133 @@ fn remove_held(held: &[job::HeldCheckpoint]) {
             }
         }
     }
+}
+
+/// The selected row's own kind, algorithm, created-at, EXIF/ICC reference
+/// index and composite description -- everything [`export_dialog_for`] and
+/// [`export_source_for`] both need before either branches on whether the
+/// tab has unsealed edits on top of it.
+struct RowExportInfo {
+    held: bool,
+    algorithm: String,
+    created_at: i64,
+    reference: usize,
+    description: String,
+}
+
+fn row_export_info(tab: &ProjectTab) -> Option<RowExportInfo> {
+    let key = tab.selected_checkpoint.as_deref()?;
+    if let Some(index) = checkpoints::held_index(key) {
+        let held = tab.held.get(index)?;
+        return Some(RowExportInfo {
+            held: true,
+            algorithm: held.algorithm.clone(),
+            created_at: held.created_at,
+            reference: held.align.as_ref().map_or(0, |a| a.reference),
+            description: held.composite_description.clone(),
+        });
+    }
+    let GuiProject::Opened(project) = &tab.project else {
+        return None;
+    };
+    let checkpoint = project.history().get(key).ok()?;
+    let record = project.fuse_state(key).ok()?;
+    Some(RowExportInfo {
+        held: false,
+        algorithm: checkpoint.algorithm.clone(),
+        created_at: checkpoint.created_at,
+        reference: record.align.as_ref().map_or(0, |a| a.reference),
+        description: record.composite.description.clone(),
+    })
+}
+
+/// The export modal's own state for `tab`'s current position, `None` when
+/// it has none.
+fn export_dialog_for(tab: &ProjectTab) -> Option<ExportDialog> {
+    let editing = tab
+        .edit
+        .as_ref()
+        .is_some_and(|edit| edit.session.op_count() > 0);
+    let info = row_export_info(tab)?;
+    let kind = if editing {
+        ExportKind::Live
+    } else if info.held {
+        ExportKind::Held
+    } else {
+        ExportKind::Saved
+    };
+    let project_file = export_project_label(&tab.project);
+    let algorithm = checkpoints::algorithm_label(&info.algorithm);
+    let timestamp = checkpoints::local_date_and_time(info.created_at);
+    let (context, what) = export_copy_for(kind, &project_file, &algorithm, &timestamp);
+    Some(ExportDialog {
+        tab_id: tab.id,
+        context,
+        what,
+        stage: ExportStage::Ready,
+        destination_name: String::new(),
+        destination: None,
+    })
+}
+
+/// The export modal's own project-file name: an opened project's `.ffp`
+/// file name with its extension, or a never-saved tab's own group name (no
+/// extension -- there is no file yet).
+fn export_project_label(project: &GuiProject) -> String {
+    match project {
+        GuiProject::Unsaved(group) => group.name.clone(),
+        GuiProject::Opened(project) => project
+            .path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| project.path().display().to_string()),
+    }
+}
+
+/// The worker's own export source for `tab`'s current position -- unsealed
+/// edits over the selected row's Z-Map when the edit session holds any op,
+/// otherwise the row itself, held or saved.
+fn export_source_for(tab: &ProjectTab) -> Option<job::ExportSource> {
+    let info = row_export_info(tab)?;
+    if let Some(edit) = tab.edit.as_ref().filter(|edit| edit.session.op_count() > 0) {
+        let (sources, registration) = tab.fused()?;
+        let tile = edit.session.tile();
+        return Some(job::ExportSource::Live {
+            width: tile.width,
+            height: tile.height,
+            indices: edit.session.indices().to_vec(),
+            sources,
+            registration,
+            reference: info.reference,
+            description: info.description,
+        });
+    }
+    let key = tab.selected_checkpoint.as_deref()?;
+    if info.held {
+        let index = checkpoints::held_index(key)?;
+        return Some(job::ExportSource::Held(tab.held.get(index)?.clone()));
+    }
+    let GuiProject::Opened(project) = &tab.project else {
+        return None;
+    };
+    Some(job::ExportSource::Saved {
+        project_path: project.path().to_path_buf(),
+        id: key.to_string(),
+    })
+}
+
+/// The export save dialog's own starting point: `<project dir>/<tab
+/// title>.tif` -- built from the tab's own title, not the project file's
+/// name, so no extension of the identity path is ever touched.
+fn export_proposed_path(tab: &ProjectTab) -> PathBuf {
+    let dir = match &tab.project {
+        GuiProject::Unsaved(group) => group.dir.clone(),
+        GuiProject::Opened(project) => project
+            .path()
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+    };
+    dir.join(format!("{}.tif", tab.title))
 }
 
 /// A path's own identity for a project or a card: an `Unsaved` tab's own

@@ -76,12 +76,12 @@ pub use blob::{Plane, StagedBlob, hash_file, short_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, FuseRecord, History, Op, Point};
 pub use container::{ProjectWriter, partial_path};
 pub use error::ProjectError;
-pub use export::export_checkpoint;
+pub use export::{export_checkpoint, export_zmap};
 pub use manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
     SourceResolution,
 };
-pub use render::{CheckpointImage, render_checkpoint};
+pub use render::{CheckpointImage, ZmapSource, render_checkpoint};
 pub use review::ReviewMetrics;
 pub use seal::{HeldCheckpoint, SealRequest, SealedProject, now_unix, seal, seal_at, seal_held};
 pub use validate::{

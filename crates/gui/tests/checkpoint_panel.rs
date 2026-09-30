@@ -714,6 +714,10 @@ fn single_checkpoint_and_empty_states() {
     let panel = controller.checkpoints_panel();
     assert_eq!(panel.entries.len(), 1, "one row and no separator");
     assert!(panel.entries[0].selected);
+    assert!(
+        controller.export_enabled(),
+        "a saved row's current position must be exportable"
+    );
     let (app, _controller, _installed) = installed_window(controller);
     assert!(!has_element(&app, "FFCheckpointPanel::empty-note"));
 

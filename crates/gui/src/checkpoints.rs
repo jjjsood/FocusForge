@@ -67,6 +67,14 @@ pub fn local_hhmmss(unix_secs: i64) -> String {
         .unwrap_or_default()
 }
 
+/// `unix_secs` as local `"2026-09-28 14:32"` -- the export modal's own
+/// full date-and-time format, unlike the list row's relative day label.
+pub fn local_date_and_time(unix_secs: i64) -> String {
+    local_datetime(unix_secs)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
 /// `unix_secs` as local `"HH:MM"` -- the bottom bar's own format, in the
 /// machine's own zone rather than UTC.
 pub fn local_hhmm(unix_secs: i64) -> String {
@@ -101,8 +109,9 @@ fn day_label(date: NaiveDate, today: NaiveDate) -> String {
 /// The algorithm registry's own display name for `id`, or `id` itself when
 /// unregistered -- `settings_panel`'s own picker-label resolution, applied
 /// to a checkpoint's stored algorithm id instead of the active tab's fuse
-/// picker.
-fn algorithm_label(id: &str) -> String {
+/// picker. `pub(crate)`: any module naming a checkpoint's algorithm reads it
+/// through this, never the registry directly.
+pub(crate) fn algorithm_label(id: &str) -> String {
     registry::find_stack(id)
         .map(|a| a.display_name().to_string())
         .unwrap_or_else(|_| id.to_string())

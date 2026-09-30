@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::align::WarpingReader;
+use crate::align::{Registration, WarpingReader};
 use crate::io::{FrameSet, TiffSpec, TiffWriter, open_frame_set};
 use crate::retouch::{RetouchError, Sources, recomposite, recomposite_bands};
 use crate::tile::{HostBudget, Rect};
@@ -57,11 +57,40 @@ enum Body {
         checkpoint: Box<Checkpoint>,
         record: Box<FuseRecord>,
     },
+    /// Gathers a caller-supplied Z-Map file over `source`'s sources -- no
+    /// project is read at all. Only [`CheckpointImage::prepare_zmap`]
+    /// produces this variant, and only [`CheckpointImage::render_external`]
+    /// reads it.
+    External {
+        zmap_path: PathBuf,
+        source: ZmapSource,
+    },
+}
+
+/// A Z-Map file's placement: the sources it was gathered from, in frame
+/// order, and their alignment -- the live counterpart of a checkpoint's own
+/// [`FuseRecord`], for a Z-Map that has no project of its own (a held row's
+/// staged map, or an edit session's Z-Map written to a temp file).
+#[derive(Debug, Clone)]
+pub struct ZmapSource {
+    pub sources: Vec<PathBuf>,
+    pub registration: Registration,
+    /// Index into `sources` the export's EXIF and ICC are read from.
+    pub reference: usize,
+    /// The exact `ImageDescription` the export's TIFF IFD (or another
+    /// format's equivalent field) carries.
+    pub description: String,
 }
 
 /// The band sink every render path hands its bands to: samples plus the
 /// rect they cover, in image coordinates.
-type RenderSink<'a> = dyn FnMut(&[u16], Rect) -> Result<(), ProjectError> + 'a;
+pub(super) type RenderSink<'a> = dyn FnMut(&[u16], Rect) -> Result<(), ProjectError> + 'a;
+
+/// Bound to whatever produced the [`CheckpointImage`] being written -- a
+/// live project or a caller-supplied Z-Map file -- so a writer function
+/// need not know which; built once per render/export call as `|sink|
+/// image.render(...)`.
+pub(super) type Renderer<'a> = dyn FnMut(&mut RenderSink<'_>) -> Result<(), ProjectError> + 'a;
 
 impl CheckpointImage {
     fn shaped(composite: &PlaneRef, body: Body) -> Self {
@@ -120,9 +149,36 @@ impl CheckpointImage {
         ))
     }
 
+    /// The live export render, over a Z-Map file the caller already has
+    /// (a held row's staged map, or an edit session's Z-Map written to a
+    /// temp file) rather than a checkpoint history entry. Refuses a missing
+    /// or unreadable source the way [`open_frame_set`] does; there is no
+    /// stored fingerprint to check against, since `source.sources` are
+    /// plain paths rather than hash-committed [`super::manifest::SourceRef`]s.
+    pub fn prepare_zmap(zmap_path: &Path, source: &ZmapSource) -> Result<Self, ProjectError> {
+        let zmap =
+            ZMapReader::open(zmap_path).map_err(|err| ProjectError::container(zmap_path, err))?;
+        let (width, height) = zmap.dimensions();
+        check_zmap_sources(&source.sources, zmap_path)?;
+        let set = open_sources(&source.sources, zmap_path)?;
+        let samples_per_pixel = set.reader.stack_context().samples_per_pixel;
+        Ok(CheckpointImage {
+            width,
+            height,
+            samples_per_pixel,
+            description: source.description.clone(),
+            body: Body::External {
+                zmap_path: zmap_path.to_path_buf(),
+                source: source.clone(),
+            },
+        })
+    }
+
     /// Streams the image top-to-bottom, full-width band by band. `sink`
     /// receives each band's samples and the rect they cover, in image
-    /// coordinates.
+    /// coordinates. Only for an image [`Self::prepare`] or
+    /// [`Self::prepare_export`] produced; [`Self::render_external`] is
+    /// [`Self::prepare_zmap`]'s counterpart.
     pub fn render(
         &self,
         project: &mut Project,
@@ -136,6 +192,20 @@ impl CheckpointImage {
                 ancestor,
             } => render_op_bearing(project, checkpoint, ancestor_checkpoint, ancestor, sink),
             Body::Gather { checkpoint, record } => render_gather(project, checkpoint, record, sink),
+            Body::External { .. } => {
+                unreachable!(
+                    "only prepare_zmap produces an External body, rendered through render_external"
+                )
+            }
+        }
+    }
+
+    /// [`Self::render`]'s counterpart for an image [`Self::prepare_zmap`]
+    /// produced: no project is read.
+    pub fn render_external(&self, sink: &mut RenderSink<'_>) -> Result<(), ProjectError> {
+        match &self.body {
+            Body::External { zmap_path, source } => render_external_body(zmap_path, source, sink),
+            _ => unreachable!("only an External body is rendered through render_external"),
         }
     }
 }
@@ -177,20 +247,45 @@ fn check_renderable(
     Ok(())
 }
 
-/// Opens `record`'s sources with the reader their headers permit (mmap
-/// TIFF, decoded TIFF or RAW) and checks them against the record's shape.
-fn open_sources(
+/// Refuses `paths` (a live export's sources, plain paths with no stored
+/// fingerprint) when any is missing on disk, one `missing: <path>` line
+/// each -- [`check_renderable`]'s counterpart for a Z-Map that has no
+/// checkpoint of its own to record a `changed` state against.
+fn check_zmap_sources(paths: &[PathBuf], zmap_path: &Path) -> Result<(), ProjectError> {
+    let detail: Vec<String> = paths
+        .iter()
+        .filter(|path| !path.is_file())
+        .map(|path| format!("missing: {}", path.display()))
+        .collect();
+    if detail.is_empty() {
+        return Ok(());
+    }
+    Err(ProjectError::ExportSourcesUnavailable {
+        path: zmap_path.to_path_buf(),
+        detail: detail.join("\n"),
+    })
+}
+
+/// Opens `paths` with the reader their headers permit (mmap TIFF, decoded
+/// TIFF or RAW). `context_path` names the error when opening fails -- the
+/// project's own path for a checkpoint's sources, the Z-Map file's for a
+/// caller-supplied one, which has no project of its own.
+fn open_sources(paths: &[PathBuf], context_path: &Path) -> Result<FrameSet, ProjectError> {
+    open_frame_set(paths, HostBudget::host_derived(&crate::host::snapshot()))
+        .map_err(|err| ProjectError::container(context_path, err))
+}
+
+/// [`open_sources`] plus the shape check a checkpoint's own recorded fuse
+/// state can make (a caller-supplied Z-Map has no such expectation to check
+/// against): the opened stack must hold exactly `record.sources.len()`
+/// frames at `record.composite.samples_per_pixel`.
+fn open_checkpoint_sources(
     project: &Project,
     checkpoint: &Checkpoint,
+    paths: &[PathBuf],
     record: &FuseRecord,
 ) -> Result<FrameSet, ProjectError> {
-    let paths: Vec<PathBuf> = record
-        .sources
-        .iter()
-        .map(|s| project.source_path(s))
-        .collect();
-    let set = open_frame_set(&paths, HostBudget::host_derived(&crate::host::snapshot()))
-        .map_err(|err| ProjectError::container(project.path(), err))?;
+    let set = open_sources(paths, project.path())?;
     if set.reader.len() != record.sources.len()
         || set.reader.stack_context().samples_per_pixel != record.composite.samples_per_pixel
     {
@@ -205,24 +300,35 @@ fn open_sources(
     Ok(set)
 }
 
-/// `set`'s frames under `record`'s per-frame alignment (identity when the
-/// fuse was not aligned).
-fn warp<'a>(set: &'a FrameSet, record: &FuseRecord) -> WarpingReader<'a> {
-    let transforms = record.registration.transforms(record.sources.len());
+/// `set`'s frames under `registration`'s per-frame alignment (identity when
+/// there is none), for a stack of `frame_count` frames each holding
+/// `samples_per_pixel` samples.
+fn warp<'a>(
+    set: &'a FrameSet,
+    registration: &Registration,
+    frame_count: usize,
+    samples_per_pixel: u32,
+) -> WarpingReader<'a> {
+    let transforms = registration.transforms(frame_count);
     WarpingReader::new(
         &*set.reader,
         set.reader.dimensions(),
-        record.composite.samples_per_pixel,
+        samples_per_pixel,
         transforms,
     )
 }
 
-fn gather_sources<'a>(warping: &'a WarpingReader<'a>, record: &FuseRecord) -> Sources<'a> {
+fn gather_sources<'a>(
+    warping: &'a WarpingReader<'a>,
+    frame_count: u32,
+    samples_per_pixel: u32,
+    registration: &Registration,
+) -> Sources<'a> {
     Sources {
         reader: warping,
-        frame_count: record.sources.len() as u32,
-        samples_per_pixel: record.composite.samples_per_pixel,
-        origin: record.registration.origin(),
+        frame_count,
+        samples_per_pixel,
+        origin: registration.origin(),
     }
 }
 
@@ -286,9 +392,24 @@ fn render_gather(
         materialize_zmap(project, checkpoint, &zmap_path)?;
         let zmap =
             ZMapReader::open(&zmap_path).map_err(|err| ProjectError::container(&zmap_path, err))?;
-        let set = open_sources(project, checkpoint, record)?;
-        let warping = warp(&set, record);
-        let sources = gather_sources(&warping, record);
+        let paths: Vec<PathBuf> = record
+            .sources
+            .iter()
+            .map(|s| project.source_path(s))
+            .collect();
+        let set = open_checkpoint_sources(project, checkpoint, &paths, record)?;
+        let warping = warp(
+            &set,
+            &record.registration,
+            record.sources.len(),
+            record.composite.samples_per_pixel,
+        );
+        let sources = gather_sources(
+            &warping,
+            record.sources.len() as u32,
+            record.composite.samples_per_pixel,
+            &record.registration,
+        );
         recomposite_bands(&zmap, &sources, GATHER_ROWS, |rect, _, samples| {
             sink(samples, rect).map_err(GatherError::Sink)
         })
@@ -299,6 +420,40 @@ fn render_gather(
     })();
     let _ = std::fs::remove_file(&zmap_path);
     outcome
+}
+
+/// `zmap_path`'s Z-Map, gathered band by band over `source`'s sources --
+/// [`render_gather`]'s counterpart for a Z-Map that is not a checkpoint's
+/// own materialized one, so there is no temp file of this function's own to
+/// clean up.
+fn render_external_body(
+    zmap_path: &Path,
+    source: &ZmapSource,
+    sink: &mut RenderSink<'_>,
+) -> Result<(), ProjectError> {
+    let zmap =
+        ZMapReader::open(zmap_path).map_err(|err| ProjectError::container(zmap_path, err))?;
+    let set = open_sources(&source.sources, zmap_path)?;
+    let samples_per_pixel = set.reader.stack_context().samples_per_pixel;
+    let warping = warp(
+        &set,
+        &source.registration,
+        source.sources.len(),
+        samples_per_pixel,
+    );
+    let sources = gather_sources(
+        &warping,
+        source.sources.len() as u32,
+        samples_per_pixel,
+        &source.registration,
+    );
+    recomposite_bands(&zmap, &sources, GATHER_ROWS, |rect, _, samples| {
+        sink(samples, rect).map_err(GatherError::Sink)
+    })
+    .map_err(|err| match err {
+        GatherError::Retouch(err) => ProjectError::container(zmap_path, err),
+        GatherError::Sink(err) => err,
+    })
 }
 
 /// The ancestor's stored composite, with every pixel whose replayed index
@@ -324,9 +479,24 @@ fn render_op_bearing(
         let ancestor_reader = ZMapReader::open(&ancestor_zmap_path)
             .map_err(|err| ProjectError::container(&ancestor_zmap_path, err))?;
 
-        let set = open_sources(project, checkpoint, ancestor)?;
-        let warping = warp(&set, ancestor);
-        let sources = gather_sources(&warping, ancestor);
+        let paths: Vec<PathBuf> = ancestor
+            .sources
+            .iter()
+            .map(|s| project.source_path(s))
+            .collect();
+        let set = open_checkpoint_sources(project, checkpoint, &paths, ancestor)?;
+        let warping = warp(
+            &set,
+            &ancestor.registration,
+            ancestor.sources.len(),
+            ancestor.composite.samples_per_pixel,
+        );
+        let sources = gather_sources(
+            &warping,
+            ancestor.sources.len() as u32,
+            ancestor.composite.samples_per_pixel,
+            &ancestor.registration,
+        );
 
         let mut failure: Option<ProjectError> = None;
         let mut checkpoint_idx: Vec<u16> = Vec::new();
@@ -391,14 +561,16 @@ fn render_op_bearing(
 /// error, so a refused or interrupted render leaves nothing behind.
 pub fn render_checkpoint(project: &mut Project, id: &str, path: &Path) -> Result<(), ProjectError> {
     let image = CheckpointImage::prepare(project, id)?;
-    write_tiff(project, &image, path)
+    write_tiff(&image, &mut |sink| image.render(project, sink), path)
 }
 
 /// The default 16-bit uncompressed TIFF encoder: the view render's only
 /// encoder, and every export format's own `Tiff{Sixteen, None}` case.
+/// `render` streams `image`'s bands -- bound to whatever produced it, a
+/// live project or a caller-supplied Z-Map file.
 pub(super) fn write_tiff(
-    project: &mut Project,
     image: &CheckpointImage,
+    render: &mut Renderer<'_>,
     path: &Path,
 ) -> Result<(), ProjectError> {
     write_via_partial(path, |partial| {
@@ -412,7 +584,7 @@ pub(super) fn write_tiff(
             },
         )
         .map_err(|err| ProjectError::container(partial, err))?;
-        image.render(project, &mut |band, rect| {
+        render(&mut |band, rect| {
             writer
                 .write_tile(rect, band)
                 .map_err(|err| ProjectError::container(path, err))
@@ -426,7 +598,11 @@ pub(super) fn write_tiff(
 /// Writes through a `.partial` sibling of `path`, renamed onto it only once
 /// `encode` returns `Ok`; removed instead on any error, so a refused or
 /// interrupted write leaves nothing behind. Shared by the view render and
-/// every export format's encoder.
+/// every export format's encoder. Any failure -- creating or finishing the
+/// `.partial` file, or the final rename -- comes back as
+/// [`ProjectError::ExportWriteFailed`], so a caller can tell "the
+/// destination could not be written" apart from every other render failure
+/// without inspecting what `encode` did internally.
 pub(super) fn write_via_partial(
     path: &Path,
     encode: impl FnOnce(&Path) -> Result<(), ProjectError>,
@@ -439,5 +615,8 @@ pub(super) fn write_via_partial(
     if outcome.is_err() {
         let _ = std::fs::remove_file(&partial);
     }
-    outcome
+    outcome.map_err(|err| ProjectError::ExportWriteFailed {
+        path: path.to_path_buf(),
+        source: Box::new(err),
+    })
 }

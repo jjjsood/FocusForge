@@ -421,9 +421,8 @@ fn gestures_come_from_the_input_map() {
         "ff_image_row.slint",
         "gallery.slint",
         "ff_manifest_list.slint",
-        "ff_dialog.slint",
+        "ff_modal_panel.slint",
         "settings_modal.slint",
-        "dialogs.slint",
         "projects_overlay.slint",
     ];
     for path in common::find_slint_files(&common::ui_dir()) {
