@@ -106,8 +106,8 @@ pub enum WriteError {
 /// Replaces `settings.toml`'s `[<key>]` table with `table` and writes the
 /// file back, creating `config_dir` if needed. Every other top-level
 /// table, hand edits included, is left exactly as it was. A file that does
-/// not parse as TOML at all, or cannot even be read as UTF-8, is refused
-/// rather than overwritten.
+/// not parse as TOML at all, or cannot be read (permissions, non-UTF-8
+/// bytes, a directory in its place), is refused rather than overwritten.
 pub fn write_table(config_dir: &Path, key: &str, mut table: Table) -> Result<PathBuf, WriteError> {
     fs::create_dir_all(config_dir).map_err(|source| WriteError::CreateDir {
         path: config_dir.to_path_buf(),

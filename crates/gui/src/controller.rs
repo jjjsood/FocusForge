@@ -3360,8 +3360,8 @@ impl AppController {
         }
     }
 
-    /// Test-only wrapper to exercise
-    /// a save failure without driving a whole project open.
+    /// Test-only wrapper to exercise a save failure without driving a
+    /// whole project open.
     pub fn record_recent_for_test(
         &mut self,
         name: String,

@@ -55,8 +55,9 @@ pub mod input_map;
 pub mod input_config;
 
 /// The one settings file every table saves through: `settings.toml`,
-/// shared by `recent` and `input_config`. No `use slint::`. `pub` so
-/// `tests/settings_file.rs` reaches it directly.
+/// shared by `recent` and `input_config`. No `use slint::`. `pub` because
+/// `settings::WriteError` appears in `recent::save`'s return type and in
+/// `input_config::ConfigError::CouldNotWrite`.
 pub mod settings;
 
 /// The viewport as pure arithmetic: no `use slint::`, no `use wgpu::`, and no

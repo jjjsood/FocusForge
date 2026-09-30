@@ -50,9 +50,9 @@ pub fn load(config_dir: &Path) -> Vec<RecentEntry> {
     let (_, read_result) = settings::read(config_dir);
     let src = match read_result {
         Ok(text) => text.unwrap_or_default(),
-        // The file exists but could not even be read as UTF-8 -- treated
-        // the same as broken, never as absent, so it is never migrated
-        // onto or overwritten.
+        // The file exists but could not be read (permissions, non-UTF-8
+        // bytes, a directory in its place) -- treated the same as broken,
+        // never as absent, so it is never migrated onto or overwritten.
         Err(_) => return Vec::new(),
     };
 
