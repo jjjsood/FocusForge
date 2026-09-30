@@ -263,6 +263,158 @@ fn assert_frames_match_outcomes(
     }
 }
 
+/// One outcome as exact bits and its status, so a recorded run and a later
+/// one compare without a tolerance.
+fn outcome_fingerprint(outcome: &AlignOutcome) -> String {
+    let m: Vec<String> = outcome
+        .transform
+        .m
+        .iter()
+        .flatten()
+        .map(|v| format!("{:016x}", v.to_bits()))
+        .collect();
+    format!(
+        "m=[{}] status={:?} iterations={} residual={:016x}",
+        m.join(","),
+        outcome.status,
+        outcome.iterations,
+        outcome.residual.to_bits()
+    )
+}
+
+/// The middle frame, the shipped `reference-frame` default on eight frames.
+const MIDDLE_FRAME: usize = 4;
+
+fn recorded_fingerprints(mode: &str) -> Vec<String> {
+    let stack = open_fixture();
+    let stack_ctx = stack_context(&stack);
+    let mut cfg = resolved_defaults(&stack_ctx);
+    cfg.insert("mode".to_string(), ParamValue::Enum(mode.to_string()));
+    uncached_outcomes(stack_ctx, &stack, MIDDLE_FRAME, &cfg)
+        .iter()
+        .map(outcome_fingerprint)
+        .collect()
+}
+
+/// Per-frame outcomes at the shipped defaults, pinned to recorded values; the
+/// fixture's diverging frames are part of the record.
+#[test]
+fn per_frame_outcomes_match_the_recorded_run() {
+    assert_eq!(recorded_fingerprints("translation"), RECORDED_TRANSLATION);
+    assert_eq!(
+        recorded_fingerprints("rotation-scale"),
+        RECORDED_ROTATION_SCALE
+    );
+}
+
+const RECORDED_TRANSLATION: [&str; 8] = [
+    "m=[3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000] status=Diverged(TooFewValidSamples) iterations=1 residual=bfa2f68153100307",
+    "m=[3ff0000000000000,0000000000000000,405e79928eb0cc64,0000000000000000,3ff0000000000000,c04dd0b77f3439d3,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=97 residual=3feedf50c93314a9",
+    "m=[3ff0000000000000,0000000000000000,40406ed2099f4461,0000000000000000,3ff0000000000000,c03781cf47018f24,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=24 residual=3feeed3c02c537d1",
+    "m=[3ff0000000000000,0000000000000000,c033282750597487,0000000000000000,3ff0000000000000,4022e7f01941cb16,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=40 residual=3fee231a6fcd16dd",
+    "m=[3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=0 residual=3ff0000000000000",
+    "m=[3ff0000000000000,0000000000000000,c01c68c547073ca6,0000000000000000,3ff0000000000000,c0307fd3bf078940,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=40 residual=3fefe9b4000c2c23",
+    "m=[3ff0000000000000,0000000000000000,c02b203db9af8ce9,0000000000000000,3ff0000000000000,403d85bde72e20a3,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=105 residual=3fef1d4b415f674a",
+    "m=[3ff0000000000000,0000000000000000,4035e64d6fd19b15,0000000000000000,3ff0000000000000,4038cd26c9f30cef,0000000000000000,0000000000000000,3ff0000000000000] status=Diverged(CorrelationDecreased) iterations=6 residual=3fed8e1afae6eb4e",
+];
+const RECORDED_ROTATION_SCALE: [&str; 8] = [
+    "m=[3fd2f08090a14c09,bf816516ffa13062,40715b33b68a89f5,3f816516ffa13062,3fd2f08090a14c09,405a91b7c1dd18fe,0000000000000000,0000000000000000,3fefffffffffffff] status=Diverged(CorrelationDecreased) iterations=12 residual=3fea7dac85df34d0",
+    "m=[3ff148659462033a,bf932b345d397cce,4059d8dd1b568789,3f932b345d397cce,3ff148659462033a,c054b5031df0dff9,0000000000000000,0000000000000000,3feffffffffffffe] status=Diverged(TooFewValidSamples) iterations=8 residual=3fef215af392f665",
+    "m=[3feff1e64f9a5733,3f3a06ca8b062e31,4040a6059a848072,bf3a06ca8b062e31,3feff1e64f9a5733,c036fd1f6de646f8,0000000000000000,0000000000000000,3fefffffffffffee] status=Converged iterations=57 residual=3feeed150dd1f063",
+    "m=[3fee67308b9e8d9d,bf79bd285e0f37e3,bfd4aa1ec2c32024,3f79bd285e0f37e3,3fee67308b9e8d9d,40340e29866da4e4,0000000000000000,0000000000000000,3fefffffffffffef] status=Converged iterations=76 residual=3fee226a74074281",
+    "m=[3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=0 residual=3ff0000000000000",
+    "m=[3ff04cb4f2b3c422,3f6a27c898fda3aa,c02d68aed42d4ace,bf6a27c898fda3aa,3ff04cb4f2b3c422,c03482920e4bf6a5,0000000000000000,0000000000000000,3feffffffffffffb] status=Converged iterations=47 residual=3fefec3a4ae9be66",
+    "m=[3ff167913b3ba24f,3f8a11d6cae283f3,c04a076430894b1d,bf8a11d6cae283f3,3ff167913b3ba24f,402171d3255e14ed,0000000000000000,0000000000000000,3feffffffffffffc] status=Converged iterations=122 residual=3fef4bc1770c814e",
+    "m=[3ff335c793f82172,3f8656598da4b88a,c055e04ee5ca9eb5,bf8656598da4b88a,3ff335c793f82172,c040c0382c84cec3,0000000000000000,0000000000000000,3fefffffffffffaa] status=HitCap iterations=881 residual=3fee38d67a98212e",
+];
+
+/// Fingerprints of `frames` aligned against `reference` of `stack` under
+/// `cfg`, with `prepared` attached to the context.
+fn outcomes_with(
+    stack: &TiffStack,
+    reference: usize,
+    cfg: &ParamValues,
+    prepared: Option<&(dyn std::any::Any + Send + Sync)>,
+    frames: &[usize],
+) -> Vec<String> {
+    let ctx = AlignContext::new(stack_context(stack), reference, stack).with_prepared(prepared);
+    frames
+        .iter()
+        .map(|&frame| {
+            outcome_fingerprint(
+                &PyramidalEcc
+                    .align_frame(&ctx, frame, cfg)
+                    .expect("align_frame must not error"),
+            )
+        })
+        .collect()
+}
+
+/// Prepares a run over `prepared_stack` at `prepared_reference` and
+/// `prepared_cfg`, then aligns `frames` of `run_stack` against
+/// `run_reference` under `run_cfg` with that value attached. The outcomes
+/// must equal the ones with nothing prepared.
+fn assert_mismatched_prepared_is_ignored(
+    (prepared_stack, prepared_reference, prepared_cfg): (&TiffStack, usize, &ParamValues),
+    (run_stack, run_reference, run_cfg): (&TiffStack, usize, &ParamValues),
+    frames: &[usize],
+) {
+    let prepared = PyramidalEcc
+        .prepare_run(
+            &AlignContext::new(
+                stack_context(prepared_stack),
+                prepared_reference,
+                prepared_stack,
+            ),
+            prepared_cfg,
+        )
+        .expect("prepare_run completes")
+        .expect("pyramidal-ecc prepares its reference");
+    let with = outcomes_with(run_stack, run_reference, run_cfg, Some(&*prepared), frames);
+    let without = outcomes_with(run_stack, run_reference, run_cfg, None, frames);
+    assert_eq!(with, without);
+}
+
+#[test]
+fn prepared_for_another_reference_frame_is_ignored() {
+    let stack = open_fixture();
+    let cfg = lowered_max_iterations(&stack_context(&stack));
+    assert_mismatched_prepared_is_ignored((&stack, 4, &cfg), (&stack, 2, &cfg), &[1, 6]);
+}
+
+#[test]
+fn prepared_for_another_mode_is_ignored() {
+    let stack = open_fixture();
+    let cfg = lowered_max_iterations(&stack_context(&stack));
+    let mut translation = cfg.clone();
+    translation.insert(
+        "mode".to_string(),
+        ParamValue::Enum("translation".to_string()),
+    );
+    assert_mismatched_prepared_is_ignored((&stack, 4, &translation), (&stack, 4, &cfg), &[1, 6]);
+}
+
+#[test]
+fn prepared_for_another_pyramid_depth_is_ignored() {
+    let stack = open_fixture();
+    let cfg = lowered_max_iterations(&stack_context(&stack));
+    let mut shallow = cfg.clone();
+    shallow.insert("pyramid-depth".to_string(), ParamValue::Int(2));
+    assert_ne!(cfg.get("pyramid-depth"), shallow.get("pyramid-depth"));
+    assert_mismatched_prepared_is_ignored((&stack, 4, &shallow), (&stack, 4, &cfg), &[1, 6]);
+}
+
+#[test]
+fn prepared_for_another_stack_size_is_ignored() {
+    let large = open_fixture();
+    let small = TiffStack::open(common::fixtures_dir().join("mantis-64"))
+        .expect("opening fixtures/mantis-64");
+    assert_ne!(large.dimensions(), small.dimensions());
+    let mut cfg = lowered_max_iterations(&stack_context(&small));
+    cfg.insert("pyramid-depth".to_string(), ParamValue::Int(1));
+    assert_mismatched_prepared_is_ignored((&large, 4, &cfg), (&small, 1, &cfg), &[0, 2]);
+}
+
 #[test]
 fn reference_frame_is_read_once_per_run() {
     let stack = open_fixture();
