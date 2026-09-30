@@ -211,8 +211,9 @@ impl FrameSource {
 }
 
 /// Reads every `step`-th row and column of `rect` from `reader`'s frame 0,
-/// warped by `view`'s transform and offset by its crop origin -- identity at
-/// origin `(0, 0)` when `view` is `None`.
+/// warped by `view`'s transform and offset by its crop origin. Without a
+/// `view` the frame is read directly: an identity warp returns the same
+/// samples but reads and converts about twice the data.
 fn read_warped(
     reader: &dyn FrameReader,
     view: Option<FrameView>,
@@ -220,10 +221,11 @@ fn read_warped(
     step: NonZeroU32,
     out: &mut [u16],
 ) -> Result<(), AlgorithmError> {
-    let (transform, origin) = view
-        .map(|v| (v.transform, v.origin))
-        .unwrap_or((Transform::identity(), (0, 0)));
     let samples_per_pixel = reader.frame(0).samples_per_pixel;
+    let Some(view) = view else {
+        return reader.read_tile_step_into(0, rect, step, samples_per_pixel, out);
+    };
+    let (transform, origin) = (view.transform, view.origin);
     let warped = WarpingReader::new(
         reader,
         reader.dimensions(),

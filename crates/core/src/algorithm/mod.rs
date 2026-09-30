@@ -106,6 +106,20 @@ pub trait TileReader: Send + Sync {
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), AlgorithmError>;
+
+    /// Every `step`-th row and column of `rect`, as [`read_tile_step_into`].
+    /// A reader that can drop unsampled columns while it converts overrides
+    /// this; the default reads each sampled row whole.
+    fn read_tile_step_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        step: NonZeroU32,
+        samples_per_pixel: u32,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        read_tile_step_into(self, frame, rect, step, samples_per_pixel, out)
+    }
 }
 
 /// Reads every `step`-th row and column of `rect` from `frame` through
@@ -114,8 +128,8 @@ pub trait TileReader: Send + Sync {
 /// `rect.width.div_ceil(step) * rect.height.div_ceil(step) *
 /// samples_per_pixel`. One 1-row read per sampled row, keeping every
 /// `step`-th column: `step` more reads, not `step^2`.
-pub fn read_tile_step_into(
-    reader: &dyn TileReader,
+pub fn read_tile_step_into<R: TileReader + ?Sized>(
+    reader: &R,
     frame: usize,
     rect: Rect,
     step: NonZeroU32,
@@ -399,6 +413,19 @@ impl TileReader for crate::io::TiffStack {
         // recurse into this very impl instead of reaching the inherent
         // method.
         crate::io::TiffStack::read_tile_into(self, frame, rect, out)
+            .map_err(crate::io::FrameError::from)
+            .map_err(AlgorithmError::from)
+    }
+
+    fn read_tile_step_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        step: NonZeroU32,
+        _samples_per_pixel: u32,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        crate::io::TiffStack::read_tile_step_into(self, frame, rect, step, out)
             .map_err(crate::io::FrameError::from)
             .map_err(AlgorithmError::from)
     }
