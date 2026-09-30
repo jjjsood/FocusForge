@@ -90,6 +90,7 @@ fn ambiguous_folder_asks_once() {
             assert_eq!(question.frame_count, 2);
         }
         OpenOutcome::Opened(_) => panic!("two directories must ask, not open straight through"),
+        OpenOutcome::Mismatch(_) => panic!("opening a folder must never raise a mismatch"),
         OpenOutcome::Refused(err) => panic!("must not refuse: {err}"),
     }
     assert!(
@@ -407,6 +408,7 @@ fn tab_strip_scrolls_to_every_tab() {
             common::answer_and_settle(&mut controller, OpenAs::NProjects);
         }
         OpenOutcome::Opened(_) => {}
+        OpenOutcome::Mismatch(_) => panic!("opening a folder must never raise a mismatch"),
         OpenOutcome::Refused(err) => panic!("nine subject subdirectories must not refuse: {err}"),
     }
     assert_eq!(controller.project_tabs().len(), 9);
@@ -653,18 +655,14 @@ fn a_file_that_is_not_a_project_is_refused_by_name() {
     std::fs::write(&bad, b"not a zip container").unwrap();
 
     let mut controller = AppController::new();
-    let source = match common::open_and_settle(&mut controller, std::slice::from_ref(&bad)) {
-        OpenOutcome::Refused(EntryError::NotAProject { path, source }) => {
+    match common::open_and_settle(&mut controller, std::slice::from_ref(&bad)) {
+        OpenOutcome::Refused(EntryError::ProjectRefused { path, .. }) => {
             assert_eq!(path, bad);
-            source
         }
-        _ => panic!("a non-project .ffp must be refused as NotAProject"),
+        _ => panic!("a non-project .ffp must be refused as ProjectRefused"),
     };
     let refusal = controller.last_refusal().unwrap();
-    assert_eq!(
-        refusal,
-        format!("{}: not a FocusForge project ({source})", bad.display())
-    );
+    assert_eq!(refusal, "This file is not a FocusForge project.");
 }
 
 // ---------------------------------------------------------------------

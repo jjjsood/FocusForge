@@ -236,6 +236,22 @@ pub fn add_and_settle(
     Ok(())
 }
 
+/// Starts a `Locate frames…` verification, blocks until its worker
+/// finishes, and settles it -- `AppController::locate_frames` runs
+/// off-thread too, the same as [`open_and_settle`]. A no-op with nothing to
+/// verify against.
+#[allow(dead_code)]
+pub fn locate_and_settle(
+    controller: &mut AppController,
+    target: focusforge_gui::entry::LocateTarget,
+    folder: PathBuf,
+) {
+    if let Some(handle) = controller.locate_frames(target, folder) {
+        handle.join().expect("the locate worker did not panic");
+    }
+    controller.settle_locate();
+}
+
 /// A directory built with `tempfile`, which honours `TMPDIR` and so lives on
 /// a filesystem where a mode change actually takes effect. Restores a
 /// writable mode before its own `TempDir` removes it.

@@ -19,8 +19,8 @@ use winit::window::WindowId;
 
 use crate::canvas::{CanvasFeed, RepaintGate, truncate_pane_label};
 use crate::controller::{
-    AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, OpenOutcome,
-    SettingsSection, ShellEvent, ShellMode,
+    AppController, ChromeKey, DockTab, GroupingQuestion, JobView, LocateTarget, OpenAs,
+    OpenOutcome, SettingsSection, ShellEvent, ShellMode,
 };
 use crate::diagnostics::DiagnosticsStatus;
 use crate::generated::{
@@ -1820,18 +1820,74 @@ pub fn install(
         let app_weak = app.as_weak();
         let load_timer = load_timer.clone();
         move || {
+            // Only the folder-empty refusal offers a folder picker; every
+            // other refusal's button just closes, read before
+            // `dismiss_refusal` would clear it.
+            let is_folder_empty = controller.lock().unwrap().refusal_title().is_none();
             controller.lock().unwrap().dismiss_refusal();
             if let Some(app) = app_weak.upgrade() {
                 app.set_refusal_open(false);
                 repaint(&app, &controller, &canvas);
             }
-            open_from_picker(
-                &controller,
-                &canvas,
-                &app_weak,
-                &load_timer,
-                crate::picker::pick_entry(),
-            )
+            if is_folder_empty {
+                open_from_picker(
+                    &controller,
+                    &canvas,
+                    &app_weak,
+                    &load_timer,
+                    crate::picker::pick_entry(),
+                )
+            }
+        }
+    });
+    app.on_mismatch_open_anyway({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().open_anyway();
+            if let Some(app) = app_weak.upgrade() {
+                push_projects(&app, &controller);
+                push_project_dialogs(&app, &controller.lock().unwrap());
+            }
+        }
+    });
+    app.on_mismatch_locate_frames({
+        let controller = controller.clone();
+        move || {
+            if let Some(folder) = crate::picker::pick_entry() {
+                controller
+                    .lock()
+                    .unwrap()
+                    .locate_frames(LocateTarget::Mismatch, folder);
+            }
+        }
+    });
+    app.on_mismatch_cancelled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().cancel_mismatch();
+            if let Some(app) = app_weak.upgrade() {
+                push_project_dialogs(&app, &controller.lock().unwrap());
+            }
+        }
+    });
+    app.on_sources_missing_locate_frames({
+        let controller = controller.clone();
+        move || {
+            if let Some(folder) = crate::picker::pick_entry() {
+                controller.lock().unwrap().locate_sources_notice(folder);
+            }
+        }
+    });
+    app.on_sources_missing_closed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().close_sources_notice();
+            if let Some(app) = app_weak.upgrade() {
+                push_project_dialogs(&app, &controller.lock().unwrap());
+            }
         }
     });
     app.on_skipped_notice_dismissed({
@@ -2280,8 +2336,12 @@ pub fn install(
             let kind = controller.lock().unwrap().gallery_failure_kind(i);
             match kind {
                 Some("sources-missing") => {
-                    if let Some(folder) = crate::picker::pick_entry() {
-                        controller.lock().unwrap().locate_missing_sources(i, folder);
+                    let tab_id = controller.lock().unwrap().tab_id_at(i);
+                    if let (Some(tab_id), Some(folder)) = (tab_id, crate::picker::pick_entry()) {
+                        controller
+                            .lock()
+                            .unwrap()
+                            .locate_frames(LocateTarget::Tab(tab_id), folder);
                     }
                 }
                 Some("failed") | Some("cancelled") => {
@@ -2371,6 +2431,48 @@ pub fn install(
     }
 }
 
+/// Pushes the refusal, fingerprint-mismatch and missing-sources dialogs'
+/// own state -- every place any of the three can newly show or close.
+fn push_project_dialogs(app: &AppWindow, controller: &AppController) {
+    match controller.mismatch_copy() {
+        Some((_, body, file_name)) => {
+            app.set_mismatch_context(file_name.into());
+            app.set_mismatch_body(body.into());
+            app.set_mismatch_open(true);
+        }
+        None => app.set_mismatch_open(false),
+    }
+    match controller.sources_notice() {
+        Some((_, body, file_name)) => {
+            app.set_sources_missing_context(file_name.into());
+            app.set_sources_missing_body(body.into());
+            app.set_sources_missing_open(true);
+        }
+        None => app.set_sources_missing_open(false),
+    }
+    let folder_empty_refusal = controller.refusal_title().is_none();
+    app.set_refusal_title(
+        controller
+            .refusal_title()
+            .unwrap_or("No frames here")
+            .into(),
+    );
+    app.set_refusal_body(
+        controller
+            .last_refusal()
+            .unwrap_or("FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.")
+            .into(),
+    );
+    app.set_refusal_button_label(
+        if folder_empty_refusal {
+            "Pick another folder…"
+        } else {
+            "Close"
+        }
+        .into(),
+    );
+}
+
 /// Performs one [`ShellEvent`] against the window. The only function in the
 /// crate that names `winit`.
 fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: ShellEvent) {
@@ -2455,10 +2557,17 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         // The three entry-path events. `EntryRefused`'s
         // message is already rendered by `AppController::refuse`, never
         // formatted here.
-        ShellEvent::ProjectsChanged => push_projects(app, controller),
+        ShellEvent::ProjectsChanged => {
+            push_projects(app, controller);
+            push_project_dialogs(app, &controller.lock().unwrap());
+        }
         ShellEvent::TabScrollChanged => push_tab_scroll(app, &controller.lock().unwrap()),
         ShellEvent::QuestionRaised(question) => push_question(app, &question),
-        ShellEvent::EntryRefused(_) => app.set_refusal_open(true),
+        ShellEvent::MismatchRaised => push_project_dialogs(app, &controller.lock().unwrap()),
+        ShellEvent::EntryRefused(_) => {
+            app.set_refusal_open(true);
+            push_project_dialogs(app, &controller.lock().unwrap());
+        }
         ShellEvent::SettingsChanged => push_settings_panel(app, &controller.lock().unwrap()),
         ShellEvent::JobChanged => {
             let controller = controller.lock().unwrap();
@@ -2477,7 +2586,11 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::ImagesChanged => push_images_panel(app, &controller.lock().unwrap()),
         ShellEvent::CheckpointsChanged => push_checkpoint_panel(app, &controller.lock().unwrap()),
         ShellEvent::EditorChanged => push_editor_toolbar(app, &controller.lock().unwrap()),
-        ShellEvent::OverlayChanged => push_projects_overlay(app, &controller.lock().unwrap()),
+        ShellEvent::OverlayChanged => {
+            let controller = controller.lock().unwrap();
+            push_projects_overlay(app, &controller);
+            push_project_dialogs(app, &controller);
+        }
         // A background load's own three events (`AppController::open_paths`).
         // The indicator's threshold and fade are the Slint region's own
         // state, driven by `load-active` alone -- it shows no other part of
@@ -2496,9 +2609,18 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
                     push_question(app, &question);
                     push_brush_cursor(app, &controller.lock().unwrap());
                 }
+                // A fingerprint mismatch opens no tab: `pending_mismatch`
+                // carries what the mismatch dialog needs.
+                Some(OpenOutcome::Mismatch(_)) => {
+                    let controller = controller.lock().unwrap();
+                    push_project_dialogs(app, &controller);
+                    push_brush_cursor(app, &controller);
+                }
                 Some(OpenOutcome::Refused(_)) => {
                     app.set_refusal_open(true);
-                    push_brush_cursor(app, &controller.lock().unwrap());
+                    let controller = controller.lock().unwrap();
+                    push_project_dialogs(app, &controller);
+                    push_brush_cursor(app, &controller);
                 }
                 None => {}
             }
@@ -2512,6 +2634,16 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             let mut controller = controller.lock().unwrap();
             controller.settle_import();
             push_images_panel(app, &controller);
+        }
+        // A `Locate frames…` verification (`AppController::locate_frames`)
+        // is ready to settle -- relocates the target's frames, or raises
+        // the refusal dialog through `settle_locate`'s own
+        // `refuse_message`, which raises its own `EntryRefused` event.
+        ShellEvent::LocateReady => {
+            let mut controller = controller.lock().unwrap();
+            controller.settle_locate();
+            push_projects_overlay(app, &controller);
+            push_project_dialogs(app, &controller);
         }
     }
 }

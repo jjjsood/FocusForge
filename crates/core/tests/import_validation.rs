@@ -1075,3 +1075,35 @@ fn located_frames_are_checked_by_content() {
     assert_eq!(right.unresolved.len(), 0);
     assert_eq!(right.changed.len(), 0);
 }
+
+#[test]
+fn relocated_sources_are_read_from_the_located_folder() {
+    let (dir, project_path) = sealed("import_validation_relocate_sources", 32, 24, 3);
+    let copy_dir = tmp_dir("import_validation_relocate_sources_copy");
+    let copied_project = copy_dir.join(project_path.file_name().unwrap());
+    std::fs::copy(&project_path, &copied_project).unwrap();
+    // Frames are deliberately not copied alongside `copied_project`.
+
+    let mut project = match Project::open_checked(&copied_project).unwrap() {
+        Opened::Ready(project) => project,
+        Opened::NeedsChoice(_) => panic!("moving the project must not change any frame's content"),
+    };
+    let head_id = project.checkpoint().id.clone();
+    assert!(
+        project::CheckpointImage::prepare_export(&project, &head_id).is_err(),
+        "export must refuse sources it cannot find"
+    );
+
+    let before = std::fs::read(&copied_project).unwrap();
+    project.relocate_sources(dir.clone());
+    let image = project::CheckpointImage::prepare_export(&project, &head_id)
+        .expect("a located folder must resolve every source");
+    image
+        .render(&mut project, &mut |_samples, _rect| Ok(()))
+        .expect("render must read the located folder's frames");
+    assert_eq!(
+        std::fs::read(&copied_project).unwrap(),
+        before,
+        ".ffp bytes must be unchanged by relocation"
+    );
+}

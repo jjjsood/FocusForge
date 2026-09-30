@@ -726,6 +726,50 @@ export component ThemeSheet inherits Window {
             }
         }
 
+        GroupHeading { text: "Dialog: caution"; }
+        Rectangle {
+            width: 560px;
+            height: 350px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "caution";
+                panel-width: 540px;
+                panel-height: 330px;
+                title: "The frames are no longer there";
+                context: "demo.ffp";
+                body: "A project remembers its frames by path. 2 of 3 cannot be found in this location.\n\nHistory and Z-Map are complete. Fused results still show; edited checkpoints and re-fusing need the frames.";
+                info: "The Projects overlay shows the same condition as a \"Sources missing\" card.";
+                cancel-label: "Close";
+                confirm-label: "Locate frames…";
+                confirm-kind: "default";
+            }
+        }
+
+        GroupHeading { text: "Dialog: warning, danger confirm (600×362)"; }
+        Rectangle {
+            width: 620px;
+            height: 382px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "warning";
+                panel-width: 600px;
+                panel-height: 362px;
+                title: "The source frames are not the same";
+                context: "demo.ffp";
+                body: "The project was made over 3 frames. The frames in this location give a different fingerprint.\n\nThe Z-Map records, for every pixel, which frame it came from — by that frame's place in the row. If the row is wrong, every retouch points at the wrong frame.";
+                info: "Finding the original frames again opens the project unchanged.";
+                secondary-label: "Locate frames…";
+                confirm-label: "Open anyway";
+                confirm-kind: "danger";
+            }
+        }
+
         GroupHeading { text: "Dialog: save, with a context line"; }
         Rectangle {
             width: 500px;

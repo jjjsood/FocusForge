@@ -22,7 +22,7 @@ export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFSettingsModal, InputRow, FFManifestRow } from "shell/settings_modal.slint";
 export { InputRow, FFManifestRow }
-import { FFCloseGuard, FFDivergenceWarning, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFToast } from "shell/dialogs.slint";
+import { FFCloseGuard, FFDivergenceWarning, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing, FFToast } from "shell/dialogs.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
 export { ProjectCardView, RecentRowView }
@@ -659,7 +659,26 @@ export component AppWindow inherits Window {
     callback question-open-as-many();
     callback question-cancelled();
     in property <bool> refusal-open: false;
+    in property <string> refusal-title: "No frames here";
+    in property <string> refusal-body: "FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.";
+    in property <string> refusal-button-label: "Pick another folder…";
     callback refusal-pick-another-folder();
+
+    // A saved project's source content disagrees with its recorded
+    // fingerprint; the project stays unopened until a choice is made.
+    in property <bool> mismatch-open: false;
+    in property <string> mismatch-context: "";
+    in property <string> mismatch-body: "";
+    callback mismatch-open-anyway();
+    callback mismatch-locate-frames();
+    callback mismatch-cancelled();
+
+    // An opened project's sources cannot all be resolved from here.
+    in property <bool> sources-missing-open: false;
+    in property <string> sources-missing-context: "";
+    in property <string> sources-missing-body: "";
+    callback sources-missing-locate-frames();
+    callback sources-missing-closed();
     in property <string> skipped-notice: "";
     callback skipped-notice-dismissed();
 
@@ -712,12 +731,44 @@ export component AppWindow inherits Window {
         cancelled => { root.question-cancelled(); }
     }
 
+    mismatch-dialog := FFFingerprintMismatch {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.mismatch-open;
+        context: root.mismatch-context;
+        body: root.mismatch-body;
+        confirmed => { root.mismatch-open-anyway(); }
+        secondary-pressed => { root.mismatch-locate-frames(); }
+        cancelled => { root.mismatch-cancelled(); }
+    }
+
+    sources-missing-dialog := FFSourcesMissing {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.sources-missing-open;
+        context: root.sources-missing-context;
+        body: root.sources-missing-body;
+        confirmed => { root.sources-missing-locate-frames(); }
+        cancelled => { root.sources-missing-closed(); }
+    }
+
+    // Declared after the mismatch and sources-missing dialogs so a refusal
+    // raised by a failed `Locate frames…` (either one's own trigger) always
+    // paints on top of whichever dialog is still open underneath it, rather
+    // than being fully occluded by it.
     refusal-dialog := FFRefusalDialog {
         x: 0px;
         y: 0px;
         width: root.width;
         height: root.height;
         refusal-open: root.refusal-open;
+        title: root.refusal-title;
+        body: root.refusal-body;
+        button-label: root.refusal-button-label;
         pick-another-folder => { root.refusal-pick-another-folder(); }
     }
 

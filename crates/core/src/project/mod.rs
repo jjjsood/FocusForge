@@ -434,6 +434,9 @@ pub struct Project {
     /// The fingerprint mismatch [`PendingProject::proceed`] accepted to
     /// produce this project, carried forward as a warning.
     accepted_mismatch: Option<FingerprintMismatch>,
+    /// A folder [`Self::relocate_sources`] pointed every source at, in
+    /// memory only -- never written to the `.ffp`.
+    relocated: Option<PathBuf>,
 }
 
 /// `manifest.json`'s `format_version` field alone, probed before the full
@@ -577,6 +580,7 @@ impl Project {
             history,
             verified: Vec::new(),
             accepted_mismatch: None,
+            relocated: None,
         };
         project.read_plane_ref_into(&base_ref, &mut |_, _| {})?;
         for hash in &delta_hashes {
@@ -684,10 +688,19 @@ impl Project {
         })
     }
 
-    /// Where one recorded source is looked for: relative to the project's
-    /// own directory when it was recorded as a descendant, otherwise the
-    /// absolute path exactly as it was given.
+    /// Where one recorded source is looked for: under a located folder
+    /// ([`Self::relocate_sources`]) when one is set, by its recorded file
+    /// name; otherwise relative to the project's own directory when it was
+    /// recorded as a descendant, or the absolute path exactly as it was
+    /// given.
     pub fn source_path(&self, source: &SourceRef) -> PathBuf {
+        if let Some(folder) = &self.relocated {
+            let name = Path::new(&source.path)
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(&source.path));
+            return folder.join(name);
+        }
         match source.resolution {
             SourceResolution::Relative => self
                 .path
@@ -696,6 +709,14 @@ impl Project {
                 .join(&source.path),
             SourceResolution::AsGiven => PathBuf::from(&source.path),
         }
+    }
+
+    /// Points every recorded source at `folder`, by file name, in memory
+    /// only -- nothing is written to the `.ffp`. What a `Locate frames…`
+    /// resolution applies once the folder has been verified
+    /// ([`check_sources`]) against the sources' recorded content.
+    pub fn relocate_sources(&mut self, folder: PathBuf) {
+        self.relocated = Some(folder);
     }
 
     /// Every source this project cannot resolve, for either of the two

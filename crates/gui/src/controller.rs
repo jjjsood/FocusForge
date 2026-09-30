@@ -44,7 +44,8 @@ use crate::settings_panel::{
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
 
 pub use crate::entry::{
-    EntryError, GroupingQuestion, GuiProject, ImportRefused, OpenAs, OpenOutcome, Opened, Proposal,
+    EntryError, GroupingQuestion, GuiProject, ImportRefused, LocateTarget, OpenAs, OpenOutcome,
+    Opened, PendingOpen, Proposal,
 };
 
 /// The stacking/editor mode switch's two positions. Editor is reachable only
@@ -119,6 +120,9 @@ pub enum ShellEvent {
     /// A folder read as more than one stack -- the one grouping question,
     /// asked once.
     QuestionRaised(GroupingQuestion),
+    /// A saved project's source content no longer matches the fingerprint
+    /// it was recorded with -- the mismatch dialog, raised once.
+    MismatchRaised,
     /// The settings panel's own state moved: a value, an algorithm choice,
     /// a reset, an open menu or the scroll offset -- never a tab switch,
     /// which `ProjectsChanged` already rebuilds the panel for.
@@ -159,6 +163,9 @@ pub enum ShellEvent {
     /// An import scan ([`AppController::add_frames`]) is ready to settle
     /// ([`AppController::settle_import`]).
     ImportReady,
+    /// A `Locate frames…` verification ([`AppController::locate_frames`]) is
+    /// ready to settle ([`AppController::settle_locate`]).
+    LocateReady,
 }
 
 /// One live drag: which action it started and the last position seen, so
@@ -443,6 +450,16 @@ struct TabFailure {
     kind: FailureKind,
     stage: String,
     reason: String,
+}
+
+/// The missing-sources dialog's own payload: which tab it names, its
+/// counts ([`overlay::sources_missing_body`]) and the project's file name
+/// for its context line.
+struct SourcesNotice {
+    tab_id: u64,
+    missing: usize,
+    total: usize,
+    file_name: String,
 }
 
 /// A saved row's planes, as far as they have got.
@@ -733,14 +750,28 @@ struct ShellState {
     /// [`AppController::cancel_question`], which is what makes "asked once"
     /// a property of the state machine rather than of the dialog.
     pending: Option<(GroupingQuestion, Proposal)>,
+    /// A fingerprint mismatch raised by [`AppController::open_paths`],
+    /// blocking until [`AppController::open_anyway`] or
+    /// [`AppController::cancel_mismatch`] -- no tab exists for it while
+    /// this is `Some`.
+    pending_mismatch: Option<PendingOpen>,
     /// The skipped-subfolder notice from the most recent open, if any.
     notice: Option<String>,
     /// The most recent refusal's already-rendered message, if any.
     last_refusal: Option<String>,
+    /// The most recent refusal's own title, `Some` only for a project or
+    /// locate refusal -- `None` keeps the folder-empty dialog's fixed
+    /// "No frames here" title and `Pick another folder…` action.
+    refusal_title: Option<String>,
     /// Whether the "No frames here" refusal dialog is open -- raised by
     /// [`AppController::refuse_message`], cleared by
     /// [`AppController::dismiss_refusal`].
     refusal_open: bool,
+    /// A missing-sources notice: which tab it's about, its counted sentence
+    /// and file name -- set by [`AppController::accept`] when an opened
+    /// project's sources are missing and no mismatch was just accepted.
+    /// Cleared by [`AppController::close_sources_notice`].
+    sources_notice: Option<SourcesNotice>,
     /// The tab strip's scroll offset in pixels, always within
     /// [`clamp_tab_scroll`]'s range for the current tabs and viewport.
     tab_scroll_x: f32,
@@ -833,6 +864,8 @@ struct ShellState {
     render: RenderSlot,
     /// The in-flight additive import scan, if any.
     import: ImportSlot,
+    /// The in-flight `Locate frames…` verification, if any.
+    locate: LocateSlot,
     /// The `Composite` pane's rainbow overlay -- window-wide (see
     /// [`OverlayState`]).
     overlay: OverlayState,
@@ -886,6 +919,23 @@ struct ImportScan {
     frames: Vec<PathBuf>,
     add: Vec<PathBuf>,
     replace: Vec<(usize, PathBuf)>,
+}
+
+/// One `Locate frames…` verification's own in-flight slot -- [`ImportSlot`]'s
+/// twin for [`AppController::locate_frames`]: every content hash it runs
+/// happens on this worker, never the event loop.
+#[derive(Default)]
+struct LocateSlot {
+    in_flight: bool,
+    outcome: Arc<Mutex<Option<LocateScan>>>,
+}
+
+/// [`AppController::locate_frames`]'s worker outcome: what it verified
+/// against, the folder it verified and what `entry::verify_folder` found.
+struct LocateScan {
+    target: entry::LocateTarget,
+    folder: PathBuf,
+    result: Result<Vec<PathBuf>, entry::LocateRefused>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2481,7 +2531,9 @@ impl AppController {
             // ~5s synchronously.
             let thumbnails = match &mut outcome {
                 OpenOutcome::Opened(opened) => decode_thumbnails(&mut opened.projects),
-                OpenOutcome::Question(..) | OpenOutcome::Refused(_) => Vec::new(),
+                OpenOutcome::Question(..) | OpenOutcome::Mismatch(_) | OpenOutcome::Refused(_) => {
+                    Vec::new()
+                }
             };
             *outcome_slot
                 .lock()
@@ -2588,7 +2640,16 @@ impl AppController {
         self.state.last_refusal.as_deref()
     }
 
-    /// Closes the refusal dialog -- its own "Pick another folder…" button.
+    /// The active refusal's own title, `None` while the folder-empty
+    /// refusal is showing -- it keeps its own fixed "No frames here" title
+    /// and `Pick another folder…` action; every other refusal shows this
+    /// title with a `Close` button instead.
+    pub fn refusal_title(&self) -> Option<&str> {
+        self.state.refusal_title.as_deref()
+    }
+
+    /// Closes the refusal dialog -- its own "Pick another folder…" button,
+    /// or `Close` for every other refusal.
     pub fn dismiss_refusal(&mut self) {
         self.state.refusal_open = false;
     }
@@ -2616,8 +2677,86 @@ impl AppController {
                 self.emit(ShellEvent::QuestionRaised(question.clone()));
                 OpenOutcome::Question(question, proposal)
             }
+            OpenOutcome::Mismatch(pending_open) => {
+                let echo = Box::new(pending_open.echo());
+                self.state.pending_mismatch = Some(*pending_open);
+                self.emit(ShellEvent::MismatchRaised);
+                OpenOutcome::Mismatch(echo)
+            }
             OpenOutcome::Refused(err) => self.refuse(err),
         }
+    }
+
+    /// The pending fingerprint mismatch, if [`Self::open_paths`] raised one
+    /// -- what the mismatch dialog reads before the user chooses.
+    pub fn pending_mismatch(&self) -> Option<&PendingOpen> {
+        self.state.pending_mismatch.as_ref()
+    }
+
+    /// The pending mismatch's own copy, if one is raised: title, body and
+    /// file name -- what the mismatch dialog reads.
+    pub fn mismatch_copy(&self) -> Option<(&'static str, String, &str)> {
+        self.state.pending_mismatch.as_ref().map(|p| {
+            (
+                overlay::MISMATCH_TITLE,
+                overlay::mismatch_body(p.frame_count()),
+                p.file_name.as_str(),
+            )
+        })
+    }
+
+    /// `Open anyway`: accepts the pending mismatch and opens the project
+    /// unchanged, the same way a fresh open lands a tab. A no-op with
+    /// nothing pending.
+    pub fn open_anyway(&mut self) {
+        let Some(pending) = self.state.pending_mismatch.take() else {
+            return;
+        };
+        let project = pending.proceed();
+        self.accept(
+            Opened {
+                projects: vec![project],
+                skipped: Vec::new(),
+            },
+            Vec::new(),
+        );
+    }
+
+    /// Dismisses the mismatch dialog with no project opened: `PendingProject`
+    /// never proceeds without an explicit choice.
+    pub fn cancel_mismatch(&mut self) {
+        self.state.pending_mismatch = None;
+        self.emit(ShellEvent::OverlayChanged);
+    }
+
+    /// The pending missing-sources notice's own copy, if accepting an open
+    /// raised one: title, body and file name -- what the missing-sources
+    /// dialog reads.
+    pub fn sources_notice(&self) -> Option<(&'static str, String, &str)> {
+        self.state.sources_notice.as_ref().map(|n| {
+            (
+                overlay::SOURCES_MISSING_TITLE,
+                overlay::sources_missing_body(n.missing, n.total),
+                n.file_name.as_str(),
+            )
+        })
+    }
+
+    /// The missing-sources dialog's own `Close`: dismisses the notice; the
+    /// project stays open exactly as it is.
+    pub fn close_sources_notice(&mut self) {
+        self.state.sources_notice = None;
+        self.emit(ShellEvent::OverlayChanged);
+    }
+
+    /// `Locate frames…` on the missing-sources dialog itself, for the tab
+    /// [`Self::sources_notice`] names. A no-op with no notice pending.
+    pub fn locate_sources_notice(
+        &mut self,
+        folder: PathBuf,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        let tab_id = self.state.sources_notice.as_ref()?.tab_id;
+        self.locate_frames(entry::LocateTarget::Tab(tab_id), folder)
     }
 
     /// Places every opened project in a tab, selects the first of them, and
@@ -2649,11 +2788,14 @@ impl AppController {
                     Some(project_identity_path(&project)),
                     opened_at,
                 );
-                let sources_missing = if let GuiProject::Opened(p) = &project {
-                    p.unresolved_sources().next().is_some()
+                let missing = if let GuiProject::Opened(p) = &project {
+                    let (missing, total) = entry::missing_sources(p);
+                    (missing > 0)
+                        .then(|| (missing, total, p.validation().accepted_mismatch.is_some()))
                 } else {
-                    false
+                    None
                 };
+                let file_name = entry::tab_title(&project);
                 let source = match thumbnails.next() {
                     Some(decoded) => ThumbnailSource::Decoded(decoded),
                     None => ThumbnailSource::NotAttempted,
@@ -2661,13 +2803,23 @@ impl AppController {
                 self.next_tab_id += 1;
                 let id = self.next_tab_id;
                 let mut tab = ProjectTab::new(project, id, source);
-                if sources_missing {
+                if let Some((missing, total, accepted_mismatch)) = missing {
                     tab.failure = Some(TabFailure {
                         kind: FailureKind::SourcesMissing,
                         stage: "NOTHING TO SHOW".to_string(),
-                        reason: "The project points at frames that are not where it left them."
-                            .to_string(),
+                        reason: overlay::sources_missing_sentence(missing, total),
                     });
+                    // A project that just landed through `Open anyway` shows no
+                    // second modal for the same open -- its card still carries
+                    // the sentence.
+                    if !accepted_mismatch {
+                        self.state.sources_notice = Some(SourcesNotice {
+                            tab_id: id,
+                            missing,
+                            total,
+                            file_name,
+                        });
+                    }
                 }
                 self.state.projects.push(tab);
             }
@@ -2692,14 +2844,20 @@ impl AppController {
             _ => {}
         }
         self.refuse_message(message);
+        if matches!(&err, EntryError::ProjectRefused { .. }) {
+            self.state.refusal_title = Some("This project cannot be opened".to_string());
+        }
         OpenOutcome::Refused(err)
     }
 
     /// Refuses with an already-rendered message and no [`EntryError`] behind
     /// it -- what a re-fuse's own frame-reachability check uses, since
-    /// nothing there is an entry-path failure.
+    /// nothing there is an entry-path failure. Clears any earlier refusal's
+    /// own title, so a caller with one of its own sets it right after this
+    /// call; every other refusal keeps the folder-empty dialog's fixed copy.
     pub fn refuse_message(&mut self, message: String) {
         self.state.last_refusal = Some(message.clone());
+        self.state.refusal_title = None;
         self.state.refusal_open = true;
         self.emit(ShellEvent::EntryRefused(message));
     }
@@ -3200,42 +3358,116 @@ impl AppController {
         true
     }
 
-    /// `Locate frames…` on a `Sources missing` card: re-resolves that tab's
-    /// own frames against `folder` in memory only -- no write, and no touch
-    /// of the sealed `.ffp`'s own fingerprint. Clears the tab's failure only
-    /// once every source resolves; a folder missing some of them changes
-    /// nothing, silently.
-    pub fn locate_missing_sources(&mut self, index: usize, folder: PathBuf) {
-        let Some(tab) = self.state.projects.get(index) else {
-            return;
-        };
-        let sources_missing =
-            matches!(&tab.failure, Some(f) if f.kind == FailureKind::SourcesMissing);
-        let GuiProject::Opened(project) = &tab.project else {
-            return;
-        };
-        if !sources_missing {
-            return;
+    /// Verifies `folder` against `target`'s recorded sources by content
+    /// hash, off the event loop (a reference-scale stack is tens of
+    /// gigabytes). [`Self::settle_locate`] applies a verified folder or
+    /// raises the refusal dialog for a refused one. `None` with nothing to
+    /// verify against, or while a previous verification is still running.
+    pub fn locate_frames(
+        &mut self,
+        target: entry::LocateTarget,
+        folder: PathBuf,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        if self.state.locate.in_flight {
+            return None;
         }
-        let candidates: Vec<PathBuf> = project
-            .manifest()
-            .sources
-            .iter()
-            .map(|source| {
-                let name = Path::new(&source.path)
-                    .file_name()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(&source.path));
-                folder.join(name)
-            })
-            .collect();
-        if candidates.iter().all(|p| p.is_file()) {
-            let tab = &mut self.state.projects[index];
-            tab.excluded = vec![false; candidates.len()];
-            tab.frames = candidates;
-            tab.selected = images::first_included(&tab.excluded);
-            tab.failure = None;
-            self.emit(ShellEvent::OverlayChanged);
+        let sources = match target {
+            entry::LocateTarget::Mismatch => self.state.pending_mismatch.as_ref()?.sources.clone(),
+            entry::LocateTarget::Tab(id) => {
+                let index = self.tab_index(id)?;
+                let tab = &self.state.projects[index];
+                let GuiProject::Opened(project) = &tab.project else {
+                    return None;
+                };
+                project.manifest().sources.clone()
+            }
+        };
+        self.state.locate.in_flight = true;
+        let sink = self.sink.clone();
+        let outcome_slot = Arc::clone(&self.state.locate.outcome);
+        Some(std::thread::spawn(move || {
+            let result = entry::verify_folder(&sources, &folder);
+            *outcome_slot
+                .lock()
+                .expect("no thread panicked while holding the locate outcome") = Some(LocateScan {
+                target,
+                folder,
+                result,
+            });
+            if let Some(sink) = &sink {
+                sink(ShellEvent::LocateReady);
+            }
+        }))
+    }
+
+    /// Whether a background `Locate frames…` verification is still running.
+    pub fn locate_in_flight(&self) -> bool {
+        self.state.locate.in_flight
+    }
+
+    /// Picks up the parked outcome of a settled [`Self::locate_frames`] and
+    /// applies it: a verified folder relocates the target's frames and
+    /// clears its failure and notice; a refused one raises the refusal
+    /// dialog, leaving the card, frames and pending mismatch untouched.
+    pub fn settle_locate(&mut self) {
+        let Some(scan) = self
+            .state
+            .locate
+            .outcome
+            .lock()
+            .expect("no thread panicked while holding the locate outcome")
+            .take()
+        else {
+            return;
+        };
+        self.state.locate.in_flight = false;
+        match scan.result {
+            Ok(paths) => match scan.target {
+                entry::LocateTarget::Mismatch => {
+                    if let Some(pending) = self.state.pending_mismatch.take() {
+                        match entry::reopen_relocated(&pending.path, scan.folder) {
+                            Some(project) => {
+                                self.accept(
+                                    Opened {
+                                        projects: vec![project],
+                                        skipped: Vec::new(),
+                                    },
+                                    Vec::new(),
+                                );
+                            }
+                            None => {
+                                self.refuse_message(format!(
+                                    "{} could not be reopened after its frames were located.",
+                                    pending.file_name
+                                ));
+                                self.state.refusal_title =
+                                    Some("This project cannot be opened".to_string());
+                            }
+                        }
+                    }
+                }
+                entry::LocateTarget::Tab(id) => {
+                    if let Some(index) = self.tab_index(id)
+                        && let Some(tab) = self.state.projects.get_mut(index)
+                    {
+                        if let GuiProject::Opened(project) = &mut tab.project {
+                            project.relocate_sources(scan.folder);
+                        }
+                        tab.excluded = vec![false; paths.len()];
+                        tab.frames = paths;
+                        tab.selected = images::first_included(&tab.excluded);
+                        tab.failure = None;
+                        if matches!(&self.state.sources_notice, Some(n) if n.tab_id == id) {
+                            self.state.sources_notice = None;
+                        }
+                        self.emit(ShellEvent::OverlayChanged);
+                    }
+                }
+            },
+            Err(refused) => {
+                self.refuse_message(refused.message());
+                self.state.refusal_title = Some("These are not the project's frames".to_string());
+            }
         }
     }
 
@@ -4536,6 +4768,14 @@ impl AppController {
     /// every later index down.
     fn tab_index(&self, id: u64) -> Option<usize> {
         self.state.projects.iter().position(|tab| tab.id == id)
+    }
+
+    /// The id of the tab currently at tab-strip index `index`, if any --
+    /// resolved once, before starting a `Locate frames…` verification whose
+    /// own worker thread must survive a later close or reorder shifting
+    /// that index.
+    pub fn tab_id_at(&self, index: usize) -> Option<u64> {
+        self.state.projects.get(index).map(|tab| tab.id)
     }
 
     /// The tab a worker thread is actually running against, if any --

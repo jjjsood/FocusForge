@@ -87,9 +87,11 @@ fn open_unreadable_frames(controller: &mut AppController, name: &str) -> PathBuf
     root
 }
 
-/// A sealed project whose sources live outside its own directory --
-/// `AsGiven`, which `Project::unresolved_sources` always reports regardless
-/// of whether the frames are still on disk.
+/// A sealed project whose sources live outside its own directory
+/// (`AsGiven`) and are then deleted from that location, so the GUI's own
+/// counted `missing_sources` -- which counts only what is actually
+/// unreachable, not core's `AsGiven`-inclusive `unresolved_sources` --
+/// genuinely reports them missing rather than merely `AsGiven`.
 fn seal_as_given_project(name: &str) -> PathBuf {
     let project_dir = tree(&format!("{name}_project"));
     let frames_dir = tree(&format!("{name}_source_frames"));
@@ -133,6 +135,9 @@ fn seal_as_given_project(name: &str) -> PathBuf {
         metrics: project::Metrics::default(),
     })
     .expect("seal must succeed");
+    for source in &sources {
+        std::fs::remove_file(source).unwrap();
+    }
     project_path
 }
 
@@ -792,9 +797,50 @@ fn sources_missing_is_located_on_its_own_card() {
     ));
 
     assert_eq!(controller.gallery_failure_kind(0), Some("sources-missing"));
-    controller.locate_missing_sources(0, frames_dir);
+
+    // The right folder, byte-identical to what the project was sealed
+    // over -- `copy_frame` always copies from the same golden fixture, so
+    // recreating it here reproduces the same content hash.
+    std::fs::create_dir_all(&frames_dir).unwrap();
+    for i in 0..2 {
+        copy_frame(&frames_dir, &format!("{i:02}.tif"), i);
+    }
+    let tab_id = controller.tab_id_at(0).unwrap();
+    common::locate_and_settle(
+        &mut controller,
+        focusforge_gui::entry::LocateTarget::Tab(tab_id),
+        frames_dir,
+    );
     assert_eq!(controller.gallery_failure_kind(0), None);
     assert_eq!(controller.project_cards()[0].kind, "open");
+}
+
+#[test]
+fn locate_frames_refuses_a_folder_of_different_content() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("sources_missing_wrong_scratch"));
+    let project_path = seal_as_given_project("sources_missing_wrong");
+    let wrong_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("sources_missing_wrong_folder");
+    std::fs::create_dir_all(&wrong_dir).unwrap();
+    std::fs::write(wrong_dir.join("00.tif"), b"not the right bytes").unwrap();
+    std::fs::write(wrong_dir.join("01.tif"), b"not the right bytes either").unwrap();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[project_path]),
+        OpenOutcome::Opened(_)
+    ));
+
+    let tab_id = controller.tab_id_at(0).unwrap();
+    common::locate_and_settle(
+        &mut controller,
+        focusforge_gui::entry::LocateTarget::Tab(tab_id),
+        wrong_dir,
+    );
+    assert_eq!(
+        controller.gallery_failure_kind(0),
+        Some("sources-missing"),
+        "a folder of different content must not clear the card"
+    );
+    assert!(controller.last_refusal().is_some());
 }
 
 // ---------------------------------------------------------------------

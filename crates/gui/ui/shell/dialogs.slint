@@ -99,6 +99,9 @@ export component FFGroupingQuestion inherits Rectangle {
 
 export component FFRefusalDialog inherits Rectangle {
     in property <bool> refusal-open: false;
+    in property <string> title: "No frames here";
+    in property <string> body: "FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.";
+    in property <string> button-label: "Pick another folder…";
     callback pick-another-folder();
 
     visible: root.refusal-open;
@@ -128,13 +131,13 @@ export component FFRefusalDialog inherits Rectangle {
             spacing: Theme.space-3;
 
             Text {
-                text: "No frames here";
+                text: root.title;
                 color: Theme.text-primary;
                 font-size: Theme.text-title.size;
                 font-weight: Theme.text-title.weight;
             }
             Text {
-                text: "FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.";
+                text: root.body;
                 color: Theme.text-secondary;
                 font-size: Theme.text-body.size;
                 wrap: word-wrap;
@@ -145,7 +148,7 @@ export component FFRefusalDialog inherits Rectangle {
                 border-radius: Theme.radius-sm;
                 TouchArea { clicked => { root.pick-another-folder(); } }
                 Text {
-                    text: "Pick another folder…";
+                    text: root.button-label;
                     color: Theme.text-primary;
                     horizontal-alignment: center;
                     vertical-alignment: center;
@@ -258,4 +261,34 @@ export component FFDivergenceWarning inherits FFDialog {
 export component FFCloseGuard inherits FFDialog {
     tone: "save";
     confirm-kind: "danger";
+}
+
+// A saved project's source content no longer matches the fingerprint it
+// was recorded with, blocking the open until a choice is made;
+// `AppController::mismatch_copy` supplies the context and body. `Open
+// anyway` is a `status.failure`-styled (`confirm-kind: "danger"`) confirm,
+// as `FFCloseGuard`'s own is.
+export component FFFingerprintMismatch inherits FFDialog {
+    tone: "warning";
+    panel-width: 600px;
+    panel-height: 362px;
+    title: "The source frames are not the same";
+    info: "Finding the original frames again opens the project unchanged.";
+    secondary-label: "Locate frames…";
+    confirm-label: "Open anyway";
+    confirm-kind: "danger";
+}
+
+// An opened project's sources cannot all be resolved from here;
+// `AppController::sources_notice` supplies the context and body. The
+// project is already open, so its dismiss is `Close`, not `Cancel`.
+export component FFSourcesMissing inherits FFDialog {
+    tone: "caution";
+    panel-width: 540px;
+    panel-height: 330px;
+    title: "The frames are no longer there";
+    info: "The Projects overlay shows the same condition as a \"Sources missing\" card.";
+    cancel-label: "Close";
+    confirm-label: "Locate frames…";
+    confirm-kind: "default";
 }

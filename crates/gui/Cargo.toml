@@ -46,3 +46,5 @@ tempfile = "3"
 # Reading a written bundle back, with the same pinned feature set the
 # writer uses.
 zip = { version = "8.6.0", default-features = false }
+# Corrupting a blob's compressed bytes without breaking its zstd framing.
+zstd = "0.14"

@@ -241,6 +241,7 @@ fn absent_capture_time_is_shown_as_absent() {
         OpenOutcome::Question(_, _) => {
             common::answer_and_settle(&mut controller, OpenAs::OneProject);
         }
+        OpenOutcome::Mismatch(_) => panic!("opening a folder must never raise a mismatch"),
         OpenOutcome::Refused(_) => panic!("opening two tiny synthetic frames must not be refused"),
     }
     let panel = controller.images_panel();
