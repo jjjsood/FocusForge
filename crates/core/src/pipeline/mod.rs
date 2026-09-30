@@ -282,6 +282,9 @@ pub fn run(
     if let Some(tile_size) = request.tile_size {
         options.tile_size = tile_size;
     }
+    if let Some(backend) = request.backend {
+        options.tile_size = options.tile_size.min(backend.max_tile_size(spp));
+    }
 
     timer.mark(Stage::Setup);
 

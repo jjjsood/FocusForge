@@ -99,8 +99,10 @@ pub(crate) fn build_pipeline(
 
 /// Encodes one bind group over `entries`, dispatches `ceil(invocation_count
 /// / 64)` workgroups of `pipeline` on x alone and submits it; the shared tail
-/// of every 1-D kernel. x is capped at 65,535 workgroups, so
-/// `invocation_count` must stay at or under 4,194,240. Zero dispatches nothing.
+/// of every 1-D kernel. A count past the device's
+/// `max_compute_workgroups_per_dimension` fails validation, so every tile
+/// entry point refuses one first (`crate::budget::dispatch_limit_shortfall`).
+/// Zero dispatches nothing.
 pub(crate) fn run_pass(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -189,6 +191,7 @@ pub(crate) fn upload_params(
     bytes: &[u8],
 ) -> wgpu::Buffer {
     let _scope = measurement_scope("gpu_param_upload");
+    record_timing(TimingCounter::BufferCreations, 1);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("focusforge-gpu-params"),
         size: bytes.len() as u64,

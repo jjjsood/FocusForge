@@ -84,6 +84,10 @@ pub enum TimingCounter {
     PipelineCreations,
     /// CPU queue submissions.
     CpuSubmissions,
+    /// GPU buffers created by the CPU.
+    BufferCreations,
+    /// Bytes copied from GPU buffers back to the host.
+    ReadbackBytes,
 }
 
 impl TimingCounter {
@@ -109,6 +113,8 @@ impl TimingCounter {
             Self::UploadBytes => "upload_bytes",
             Self::PipelineCreations => "pipeline_creations",
             Self::CpuSubmissions => "cpu_submissions",
+            Self::BufferCreations => "buffer_creations",
+            Self::ReadbackBytes => "readback_bytes",
         }
     }
 }
@@ -138,6 +144,8 @@ pub struct TimingSnapshot {
     pub upload_bytes: u64,
     pub pipeline_creations: u64,
     pub cpu_submissions: u64,
+    pub buffer_creations: u64,
+    pub readback_bytes: u64,
     pub gpu_execution_available: bool,
     pub presentation_available: bool,
     pub saturated: bool,
@@ -167,6 +175,8 @@ struct TimingState {
     upload_bytes: AtomicU64,
     pipeline_creations: AtomicU64,
     cpu_submissions: AtomicU64,
+    buffer_creations: AtomicU64,
+    readback_bytes: AtomicU64,
     saturated: AtomicBool,
     summary_emitted: AtomicBool,
 }
@@ -197,6 +207,8 @@ impl TimingState {
             upload_bytes: AtomicU64::new(0),
             pipeline_creations: AtomicU64::new(0),
             cpu_submissions: AtomicU64::new(0),
+            buffer_creations: AtomicU64::new(0),
+            readback_bytes: AtomicU64::new(0),
             saturated: AtomicBool::new(false),
             summary_emitted: AtomicBool::new(false),
         }
@@ -240,6 +252,8 @@ impl TimingState {
             TimingCounter::UploadBytes => &self.upload_bytes,
             TimingCounter::PipelineCreations => &self.pipeline_creations,
             TimingCounter::CpuSubmissions => &self.cpu_submissions,
+            TimingCounter::BufferCreations => &self.buffer_creations,
+            TimingCounter::ReadbackBytes => &self.readback_bytes,
         };
         saturating_add(slot, value, &self.saturated);
     }
@@ -280,6 +294,8 @@ impl TimingState {
             upload_bytes: self.upload_bytes.load(Ordering::Relaxed),
             pipeline_creations: self.pipeline_creations.load(Ordering::Relaxed),
             cpu_submissions: self.cpu_submissions.load(Ordering::Relaxed),
+            buffer_creations: self.buffer_creations.load(Ordering::Relaxed),
+            readback_bytes: self.readback_bytes.load(Ordering::Relaxed),
             gpu_execution_available: false,
             presentation_available: false,
             saturated: self.saturated.load(Ordering::Relaxed),
@@ -440,6 +456,8 @@ pub fn emit_timing_summary() {
         upload_bytes = snapshot.upload_bytes,
         pipeline_creations = snapshot.pipeline_creations,
         cpu_submissions = snapshot.cpu_submissions,
+        buffer_creations = snapshot.buffer_creations,
+        readback_bytes = snapshot.readback_bytes,
         gpu_execution_available = snapshot.gpu_execution_available,
         presentation_available = snapshot.presentation_available,
         saturated = snapshot.saturated,
@@ -667,6 +685,25 @@ mod accounting_tests {
         assert!(snapshot.saturated);
         assert!(state.begin_summary());
         assert!(!state.begin_summary());
+    }
+
+    #[test]
+    fn buffer_creations_and_readback_bytes_accumulate_and_saturate() {
+        let state = TimingState::new(2);
+
+        state.add(TimingCounter::BufferCreations, 2);
+        state.add(TimingCounter::BufferCreations, 3);
+        state.add(TimingCounter::ReadbackBytes, 1 << 20);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.buffer_creations, 5);
+        assert_eq!(snapshot.readback_bytes, 1 << 20);
+        assert!(!snapshot.saturated);
+
+        state.add(TimingCounter::ReadbackBytes, u64::MAX);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.readback_bytes, u64::MAX);
+        assert_eq!(snapshot.buffer_creations, 5);
+        assert!(snapshot.saturated);
     }
 }
 

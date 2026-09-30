@@ -229,6 +229,42 @@ pub fn buffer_limit_shortfalls(
     out
 }
 
+/// Invocations per workgroup in every 1-D kernel (`@workgroup_size(64)`).
+const INVOCATIONS_PER_WORKGROUP: u64 = 64;
+
+/// The `max_compute_workgroups_per_dimension` shortfall of a 1-D dispatch of
+/// `invocations` invocations, or `None` when it fits: `crate::pipeline::run_pass`
+/// dispatches `ceil(invocations / 64)` workgroups on x alone.
+pub fn dispatch_limit_shortfall(
+    invocations: u64,
+    max_workgroups_per_dimension: u32,
+) -> Option<LimitShortfall> {
+    let required = invocations.div_ceil(INVOCATIONS_PER_WORKGROUP);
+    (required > u64::from(max_workgroups_per_dimension)).then_some(LimitShortfall {
+        limit: "max_compute_workgroups_per_dimension",
+        required,
+        available: u64::from(max_workgroups_per_dimension),
+    })
+}
+
+/// The largest square read-rect side that both [`dispatch_limit_shortfall`]
+/// (one invocation per sample, `side * side * samples_per_pixel`) and
+/// [`buffer_limit_shortfalls`] (over [`largest_buffer_bytes`] for a warped
+/// tile) accept under the given limits.
+pub fn max_tile_side(
+    samples_per_pixel: u32,
+    max_workgroups_per_dimension: u32,
+    max_storage_buffer_binding_size: u64,
+    max_buffer_size: u64,
+) -> u32 {
+    let spp = samples_per_pixel.max(1);
+    let by_dispatch =
+        u64::from(max_workgroups_per_dimension) * INVOCATIONS_PER_WORKGROUP / u64::from(spp);
+    let bytes_per_pixel = largest_buffer_bytes(1, 1, spp, true);
+    let by_buffer = max_storage_buffer_binding_size.min(max_buffer_size) / bytes_per_pixel;
+    u32::try_from(by_dispatch.min(by_buffer).isqrt()).unwrap_or(u32::MAX)
+}
+
 /// The device-side VRAM working-set budget: a byte count, where it came
 /// from, and whether a live probe set it. Mirrors `HostBudget`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -686,6 +722,80 @@ mod tests {
     fn buffer_limit_shortfalls_is_empty_when_in_budget() {
         let shortfalls = buffer_limit_shortfalls(64 << 20, 128 << 20, 256 << 20);
         assert!(shortfalls.is_empty());
+    }
+
+    const DEFAULT_BINDING: u64 = 128 << 20;
+    const DEFAULT_BUFFER: u64 = 256 << 20;
+    const DEFAULT_WORKGROUPS: u32 = 65_535;
+
+    #[test]
+    fn max_tile_side_under_default_limits_is_dispatch_bound() {
+        for (spp, side) in [(1, 2047), (3, 1182), (4, 1023)] {
+            assert_eq!(
+                max_tile_side(spp, DEFAULT_WORKGROUPS, DEFAULT_BINDING, DEFAULT_BUFFER),
+                side,
+                "samples per pixel {spp}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_tile_side_is_buffer_bound_when_workgroups_are_plentiful() {
+        assert_eq!(
+            max_tile_side(3, u32::MAX, DEFAULT_BINDING, DEFAULT_BUFFER),
+            2364
+        );
+        // The smaller of the two buffer limits binds.
+        assert_eq!(
+            max_tile_side(3, u32::MAX, DEFAULT_BUFFER, DEFAULT_BINDING),
+            2364
+        );
+    }
+
+    #[test]
+    fn max_tile_side_under_a_tiny_workgroup_limit() {
+        assert_eq!(max_tile_side(1, 16, DEFAULT_BINDING, DEFAULT_BUFFER), 32);
+        assert_eq!(max_tile_side(3, 16, DEFAULT_BINDING, DEFAULT_BUFFER), 18);
+    }
+
+    #[test]
+    fn max_tile_side_is_the_largest_side_both_checks_accept() {
+        for spp in [1, 3, 4] {
+            let side = max_tile_side(spp, DEFAULT_WORKGROUPS, DEFAULT_BINDING, DEFAULT_BUFFER);
+            let accepts = |side: u32| {
+                dispatch_limit_shortfall(
+                    u64::from(side) * u64::from(side) * u64::from(spp),
+                    DEFAULT_WORKGROUPS,
+                )
+                .is_none()
+                    && buffer_limit_shortfalls(
+                        largest_buffer_bytes(side, side, spp, true),
+                        DEFAULT_BINDING,
+                        DEFAULT_BUFFER,
+                    )
+                    .is_empty()
+            };
+            assert!(accepts(side), "spp {spp}: {side} must be accepted");
+            assert!(
+                !accepts(side + 1),
+                "spp {spp}: {} must be refused",
+                side + 1
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_limit_shortfall_is_none_at_the_limit_and_names_it_one_past() {
+        assert_eq!(
+            dispatch_limit_shortfall(4_194_240, DEFAULT_WORKGROUPS),
+            None
+        );
+        assert_eq!(dispatch_limit_shortfall(0, DEFAULT_WORKGROUPS), None);
+        let past = dispatch_limit_shortfall(4_194_241, DEFAULT_WORKGROUPS)
+            .expect("one invocation past the limit needs one workgroup more");
+        assert_eq!(past.limit, "max_compute_workgroups_per_dimension");
+        assert_eq!(past.required, 65_536);
+        assert_eq!(past.available, 65_535);
     }
 
     #[test]

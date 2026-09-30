@@ -290,6 +290,8 @@ fn chrome_trace_nesting() {
         "upload_bytes",
         "pipeline_creations",
         "cpu_submissions",
+        "buffer_creations",
+        "readback_bytes",
     ] {
         let _ = summary_u64(summary[0], field);
     }

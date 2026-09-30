@@ -57,6 +57,13 @@ pub trait TileBackend: Send + Sync {
         false
     }
 
+    /// The largest side, in pixels, of a square read rect this backend accepts
+    /// at `samples_per_pixel`; the tile planner never plans a larger tile.
+    /// Defaults to no limit.
+    fn max_tile_size(&self, _samples_per_pixel: u32) -> u32 {
+        u32::MAX
+    }
+
     /// Read `rect` of `frame` through `reader`, apply a trivial per-sample
     /// gain on the GPU, and return the result. Exists only to exercise the
     /// upload/dispatch/readback path -- this trait's other methods,

@@ -14,16 +14,22 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use focusforge_core::algorithm::{
-    AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus,
+    AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus, StackAlgorithm,
+    TileCtx, TileOutput, TileReader,
 };
-use focusforge_core::align::Transform;
+use focusforge_core::align::warp::WarpedTile;
+use focusforge_core::align::{AlignError, Transform};
+use focusforge_core::fuse::laplacian::Laplacian;
+use focusforge_core::gpu::{BackendInfo, TileBackend};
 use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage, StageCache};
 use focusforge_core::params::{ParamDesc, ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{
-    AlignRequest, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, RunStage, StageObserver,
+    AlignRequest, FuseOutcome, FuseOutput, FuseProduct, FuseReport, FuseRequest, PipelineError,
+    RunStage, StageObserver,
 };
 use focusforge_core::project::{self, Project};
 use focusforge_core::registry;
+use focusforge_core::tile::{Rect, Tile, TileError};
 
 fn mantis_frames(count: usize) -> Vec<PathBuf> {
     let dir = common::mantis_512_dir().join("frames");
@@ -902,4 +908,181 @@ fn the_host_cap_sets_the_alignment_workers_but_not_the_alignment() {
         FuseProduct::Sealed(_) => panic!("the run holds its checkpoint"),
     };
     assert_eq!(composite(&one), composite(&two));
+}
+
+// ---------------------------------------------------------------------
+// A backend's own tile-size ceiling lowers the planned tile size.
+// ---------------------------------------------------------------------
+
+/// A host-fusion [`TileBackend`] that accepts read rects up to `cap` pixels
+/// on a side.
+struct CappedBackend {
+    cap: u32,
+}
+
+impl TileBackend for CappedBackend {
+    fn info(&self) -> BackendInfo {
+        BackendInfo {
+            name: "capped-stub".into(),
+            backend: "capped-stub".into(),
+            driver: "capped-stub".into(),
+            driver_info: "capped-stub".into(),
+        }
+    }
+
+    fn max_tile_size(&self, _samples_per_pixel: u32) -> u32 {
+        self.cap
+    }
+
+    fn self_check(
+        &self,
+        _reader: &dyn TileReader,
+        _frame: usize,
+        _rect: Rect,
+        _samples_per_pixel: u32,
+        _gain: f32,
+    ) -> Result<Tile, AlgorithmError> {
+        unimplemented!("the pipeline never calls the self-check")
+    }
+
+    fn fuse_tile(
+        &self,
+        _reader: &dyn TileReader,
+        _frame_count: usize,
+        _rect: Rect,
+        _samples_per_pixel: u32,
+        _levels: u32,
+    ) -> Result<TileOutput, AlgorithmError> {
+        unimplemented!("the pipeline fuses through warp_fuse_tile")
+    }
+
+    fn warp_tile(
+        &self,
+        _reader: &dyn TileReader,
+        _frame_index: usize,
+        _frame: (u32, u32),
+        _samples_per_pixel: u32,
+        _dst: Rect,
+        _transform: &Transform,
+    ) -> Result<WarpedTile, AlignError> {
+        unimplemented!("the pipeline fuses through warp_fuse_tile")
+    }
+
+    fn warp_fuse_tile(
+        &self,
+        reader: &dyn TileReader,
+        _frame: (u32, u32),
+        transforms: &[Transform],
+        rect: Rect,
+        samples_per_pixel: u32,
+        levels: u32,
+    ) -> Result<TileOutput, AlgorithmError> {
+        assert!(
+            rect.width <= self.cap && rect.height <= self.cap,
+            "a read rect of {}x{} exceeds the backend's cap of {}",
+            rect.width,
+            rect.height,
+            self.cap
+        );
+        let mut tiles = Vec::with_capacity(transforms.len());
+        for (i, t) in transforms.iter().enumerate() {
+            assert_eq!(*t, Transform::identity(), "no alignment runs here");
+            let mut samples = vec![0u16; (rect.width * rect.height * samples_per_pixel) as usize];
+            reader.read_tile_into(i, rect, &mut samples)?;
+            tiles.push(Tile {
+                rect,
+                samples_per_pixel,
+                samples,
+            });
+        }
+        let ctx = TileCtx::new(rect, &tiles);
+        let mut cfg = ParamValues::new();
+        cfg.insert("levels".to_string(), ParamValue::Int(i64::from(levels)));
+        Laplacian.fuse(&ctx, &cfg)
+    }
+}
+
+fn capped_backend(cap: u32) -> &'static dyn TileBackend {
+    Box::leak(Box::new(CappedBackend { cap }))
+}
+
+/// A held run's report with the bytes of the composite and Z-Map it wrote.
+struct HeldRun {
+    report: Box<FuseReport>,
+    composite: Vec<u8>,
+    zmap: Vec<u8>,
+}
+
+/// Runs a held fuse over three frames.
+fn held_run(
+    label: &str,
+    tile_size: u32,
+    levels: i64,
+    backend: Option<&'static dyn TileBackend>,
+) -> Result<HeldRun, PipelineError> {
+    let mut explicit = ParamValues::new();
+    explicit.insert("levels".to_string(), ParamValue::Int(levels));
+    let mut request = base_request(label, mantis_frames(3), explicit);
+    request.output = FuseOutput::Hold(scratch(&format!("{label}_hold")));
+    request.tile_size = Some(tile_size);
+    request.backend = backend;
+    let FuseOutcome::Completed(report) =
+        focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)?
+    else {
+        panic!("expected a completed run");
+    };
+    let FuseProduct::Held(held) = &report.product else {
+        panic!("a hold request must report a held checkpoint");
+    };
+    let composite = std::fs::read(&held.composite).expect("composite must be readable");
+    let zmap = std::fs::read(&held.zmap).expect("z-map must be readable");
+    Ok(HeldRun {
+        report,
+        composite,
+        zmap,
+    })
+}
+
+#[test]
+fn a_backend_cap_lowers_the_planned_tile_size() {
+    let capped =
+        held_run("cap_256_backend", 448, 3, Some(capped_backend(256))).expect("a capped run");
+    assert_eq!(capped.report.tile_size, 256);
+
+    let plain = held_run("cap_256_plain", 256, 3, None).expect("a backend-free run at 256");
+    assert_eq!(plain.report.tile_size, 256);
+    assert!(
+        capped.report.tiles > 1 && capped.report.tiles == plain.report.tiles,
+        "ragged edge tiles: {} capped vs {} plain",
+        capped.report.tiles,
+        plain.report.tiles
+    );
+    assert!(
+        capped.composite == plain.composite,
+        "the capped run must write the composite a backend-free run at 256 writes"
+    );
+    assert!(
+        capped.zmap == plain.zmap,
+        "the capped run must write the Z-Map a backend-free run at 256 writes"
+    );
+}
+
+#[test]
+fn no_backend_keeps_the_requested_tile_size() {
+    let run = held_run("cap_none", 448, 3, None).expect("a backend-free run at 448");
+    assert_eq!(run.report.tile_size, 448);
+}
+
+#[test]
+fn a_cap_below_the_levels_minimum_fails_with_no_interior() {
+    let Err(err) = held_run("cap_64", 448, 5, Some(capped_backend(64))) else {
+        panic!("a 64-pixel cap leaves no interior at five levels");
+    };
+    assert!(
+        matches!(
+            err,
+            PipelineError::Tile(TileError::NoInterior { tile_size: 64, .. })
+        ),
+        "unexpected error: {err}"
+    );
 }

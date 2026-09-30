@@ -138,9 +138,16 @@ fn validation_error_names_the_kernel() {
 
     let device = shared.device();
     captured.clear();
-    focusforge_gpu::errors::with_validation_scope(device, || {
+    let outcome = focusforge_gpu::errors::with_validation_scope(device, || {
         let _buffer = device.create_buffer(&oversized_buffer(device));
     });
+    match outcome {
+        Err(focusforge_gpu::device::GpuError::KernelValidation { kernel, detail }) => {
+            assert_eq!(kernel, "focusforge-gpu-harness-pass");
+            assert!(detail.contains("maximum buffer size"), "detail: {detail}");
+        }
+        other => panic!("a validation error must fail the scope, got {other:?}"),
+    }
 
     let records = error_records(&captured);
     let named = records
