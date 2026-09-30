@@ -104,6 +104,16 @@ impl EditSession {
         self.applied.len()
     }
 
+    /// Makes the current map the session's new origin: outstanding previews
+    /// are discarded, then every applied and undone op is forgotten, so
+    /// nothing is left to undo or redo and [`Self::op_count`] is 0. The
+    /// indices and tile are kept.
+    pub fn rebase(&mut self) {
+        self.discard_preview();
+        self.applied.clear();
+        self.undone.clear();
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.applied.is_empty()
     }
@@ -320,6 +330,37 @@ mod tests {
         }
         assert!(!session.can_undo());
         assert_eq!(session.indices(), base.as_slice());
+    }
+
+    #[test]
+    fn rebase_keeps_the_map_and_forgets_undo_and_redo() {
+        let info = info();
+        let tile = tile();
+        let base = base_indices(info, tile);
+        let mut session = EditSession::new(info, tile, base).unwrap();
+        session
+            .append(stroke_op(1, vec![pt(6, 4)], 2.0, 0.0))
+            .unwrap();
+        session
+            .append(stroke_op(2, vec![pt(12, 9)], 2.0, 0.0))
+            .unwrap();
+        session.undo().unwrap();
+        let before = session.indices().to_vec();
+
+        session.rebase();
+
+        assert_eq!(session.indices(), before.as_slice());
+        assert_eq!(session.tile(), tile);
+        assert_eq!(session.op_count(), 0);
+        assert!(!session.can_undo() && !session.can_redo());
+
+        session
+            .append(stroke_op(3, vec![pt(20, 14)], 2.0, 0.0))
+            .unwrap();
+        assert_ne!(session.indices(), before.as_slice());
+        session.undo().unwrap();
+        assert_eq!(session.indices(), before.as_slice());
+        assert!(session.undo().is_none(), "undo stops at the rebased map");
     }
 
     #[test]

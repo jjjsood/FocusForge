@@ -33,8 +33,10 @@ use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader, ZMapWriter};
 pub use focusforge_core::align::{Registration, Transform};
 pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
-pub use focusforge_core::project::HeldCheckpoint;
 pub use focusforge_core::project::Op;
+pub use focusforge_core::project::{
+    FullMapCheckpoint, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef,
+};
 pub use focusforge_core::retouch::{EditSession, footprint};
 pub use focusforge_core::zmap::{NO_SOURCE, source_color};
 
@@ -930,7 +932,24 @@ pub fn save_held(
     held: &[HeldCheckpoint],
     onto_existing: bool,
 ) -> Result<Project, ProjectError> {
-    project::seal_held(target, held, onto_existing)?;
+    let head = if onto_existing {
+        Some(Project::open(target)?.checkpoint().id.clone())
+    } else {
+        None
+    };
+    let entries: Vec<InMemoryCheckpoint> = held
+        .iter()
+        .enumerate()
+        .map(|(i, checkpoint)| InMemoryCheckpoint {
+            kind: InMemoryKind::Fused(checkpoint.clone()),
+            parent: match (i, &head) {
+                (0, None) => None,
+                (0, Some(head)) => Some(ParentRef::Saved(head.clone())),
+                (i, _) => Some(ParentRef::Entry(i - 1)),
+            },
+        })
+        .collect();
+    project::seal_in_memory(target, &entries, &[], onto_existing)?;
     Project::open(target)
 }
 

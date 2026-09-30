@@ -2,8 +2,8 @@
 
 //! `focusforge-cli history`: every checkpoint operation reachable headless --
 //! list, materialize one to a file, apply an op list read from a file
-//! (previewing it, sealing it as a new checkpoint, or both), and delete a
-//! checkpoint.
+//! (previewing it, sealing it as a new checkpoint, or both), seal a Z-Map
+//! file as a new checkpoint, and delete a checkpoint.
 //!
 //! Each subcommand is a thin adapter over one `focusforge_core::project`
 //! entry point: argument parsing, a report and an exit code, no replay or
@@ -29,6 +29,8 @@ pub enum HistoryCommand {
     /// `-o` writes the edited map without sealing. At least one is required;
     /// given both, the map written is the sealed checkpoint's own.
     Apply(ApplyArgs),
+    /// Seal a Z-Map file as a new checkpoint, a child of `--from`.
+    Snapshot(SnapshotArgs),
     /// Delete a checkpoint. Refuses a checkpoint with descendants unless
     /// `--with-descendants` is given, and always refuses the project's root.
     Delete(DeleteArgs),
@@ -82,6 +84,22 @@ pub struct ApplyArgs {
 }
 
 #[derive(Args)]
+pub struct SnapshotArgs {
+    /// The project to seal into.
+    project: PathBuf,
+    /// The Z-Map file to seal.
+    #[arg(long, value_name = "FILE")]
+    zmap: PathBuf,
+    /// The checkpoint to seal under -- any unique prefix of its id. Defaults
+    /// to the project's current head.
+    #[arg(long)]
+    from: Option<String>,
+    /// Emit the frozen JSON report instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 pub struct DeleteArgs {
     /// The project to delete from.
     project: PathBuf,
@@ -113,6 +131,13 @@ pub fn run(command: HistoryCommand, accept_changed_sources: bool) -> ExitCode {
             args.from.as_deref(),
             args.save,
             args.output.as_deref(),
+            args.json,
+            accept_changed_sources,
+        ),
+        HistoryCommand::Snapshot(args) => snapshot(
+            &args.project,
+            &args.zmap,
+            args.from.as_deref(),
             args.json,
             accept_changed_sources,
         ),
@@ -504,6 +529,78 @@ fn apply(
             report.wrote.as_deref().unwrap_or("-"),
             report.ops,
             report.wall_seconds,
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// Never `SealedProject.zmap`, whose `BlobRecord.kind` would leak the
+/// storage kind.
+#[derive(Serialize)]
+struct SnapshotReport {
+    project: String,
+    from: String,
+    checkpoint: String,
+    wall_seconds: f64,
+}
+
+fn snapshot(
+    project_path: &Path,
+    zmap: &Path,
+    from: Option<&str>,
+    json: bool,
+    accept_changed_sources: bool,
+) -> ExitCode {
+    let start = Instant::now();
+    let project = match open_for_history(project_path, accept_changed_sources) {
+        Ok(project) => project,
+        Err(exit) => return exit,
+    };
+    let parent = match from {
+        Some(prefix) => match resolve_checkpoint(project.history(), project_path, prefix) {
+            Ok(checkpoint) => checkpoint.clone(),
+            Err(message) => return fail(message),
+        },
+        None => project.checkpoint().clone(),
+    };
+    let fuse = match project.fuse_state(&parent.id) {
+        Ok(fuse) => fuse,
+        Err(err) => return fail(err),
+    };
+    let sources = fuse
+        .sources
+        .iter()
+        .map(|source| project.source_path(source))
+        .collect();
+    let map = project::FullMapCheckpoint {
+        zmap: zmap.to_path_buf(),
+        algorithm: parent.algorithm,
+        params: parent.params,
+        fuse,
+        sources,
+        created_at: project::now_unix(),
+    };
+    drop(project);
+    let sealed = match project::append_zmap_onto(project_path, &parent.id, &map) {
+        Ok(sealed) => sealed,
+        Err(err) => return fail(err),
+    };
+
+    let report = SnapshotReport {
+        project: project_path.display().to_string(),
+        from: parent.id,
+        checkpoint: sealed.checkpoint,
+        wall_seconds: start.elapsed().as_secs_f64(),
+    };
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(err) => return fail(format!("failed to serialize JSON: {err}")),
+        }
+    } else {
+        println!(
+            "{}\nfrom: {}\ncheckpoint: {}\nwall: {:.3}s",
+            report.project, report.from, report.checkpoint, report.wall_seconds,
         );
     }
     ExitCode::SUCCESS

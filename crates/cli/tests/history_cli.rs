@@ -895,12 +895,123 @@ fn output_does_not_reveal_storage_kind() {
 }
 
 #[test]
+fn a_zmap_snapshot_seals_under_its_parent() {
+    let (dir, project) = fresh_project("a_zmap_snapshot_seals_under_its_parent");
+    let root = root_id(&project);
+    let before_bytes = std::fs::read(&project).unwrap();
+    let twin = dir.join("twin");
+    std::fs::create_dir_all(&twin).unwrap();
+    let twin_project = twin.join(project.file_name().unwrap());
+    std::fs::write(&twin_project, &before_bytes).unwrap();
+
+    // A map every index of which is valid: what an edit of the root writes.
+    let ops = write_op_file(
+        &dir,
+        "ops.json",
+        &op_file(&serde_json::to_value(three_strokes()).unwrap()),
+    );
+    let map = dir.join("given.tif");
+    let output = run(
+        &dir,
+        &[
+            "history",
+            "apply",
+            project.to_str().unwrap(),
+            "--ops",
+            ops.to_str().unwrap(),
+            "-o",
+            map.to_str().unwrap(),
+        ],
+    );
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let output = run(
+        &dir,
+        &[
+            "history",
+            "snapshot",
+            project.to_str().unwrap(),
+            "--zmap",
+            map.to_str().unwrap(),
+            "--from",
+            &root,
+            "--json",
+        ],
+    );
+    assert!(output.success, "stderr: {}", output.stderr);
+    let report: Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(report["from"], root);
+    let id = report["checkpoint"].as_str().unwrap().to_string();
+    let checkpoint = read_checkpoint(&project, &id);
+    assert_eq!(checkpoint.parent.as_deref(), Some(root.as_str()));
+    assert!(checkpoint.ops.is_empty() && checkpoint.fuse.is_some());
+
+    let materialized = dir.join("materialized.tif");
+    let output = run(
+        &dir,
+        &[
+            "history",
+            "materialize",
+            project.to_str().unwrap(),
+            "--checkpoint",
+            &id,
+            "-o",
+            materialized.to_str().unwrap(),
+        ],
+    );
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert_eq!(
+        std::fs::read(&materialized).unwrap(),
+        std::fs::read(&map).unwrap()
+    );
+
+    // The core call at the same instant writes the same file.
+    let opened = Project::open(&twin_project).unwrap();
+    let root_checkpoint = opened.history().get(&root).unwrap().clone();
+    let fuse = opened.fuse_state(&root).unwrap();
+    let sources = fuse.sources.iter().map(|s| opened.source_path(s)).collect();
+    let full_map = project::FullMapCheckpoint {
+        zmap: map.clone(),
+        algorithm: root_checkpoint.algorithm,
+        params: root_checkpoint.params,
+        fuse,
+        sources,
+        created_at: checkpoint.created_at,
+    };
+    drop(opened);
+    let sealed = project::append_zmap_onto(&twin_project, &root, &full_map).unwrap();
+    assert_eq!(sealed.checkpoint, id);
+    assert_eq!(
+        std::fs::read(&twin_project).unwrap(),
+        std::fs::read(&project).unwrap(),
+        "the CLI and the core call write the same project"
+    );
+
+    // An id the project does not contain is refused and changes nothing.
+    let unchanged = std::fs::read(&project).unwrap();
+    let output = run(
+        &dir,
+        &[
+            "history",
+            "snapshot",
+            project.to_str().unwrap(),
+            "--zmap",
+            map.to_str().unwrap(),
+            "--from",
+            "no-such-checkpoint",
+        ],
+    );
+    assert!(!output.success);
+    assert_eq!(std::fs::read(&project).unwrap(), unchanged);
+}
+
+#[test]
 fn help_lists_every_command() {
     let dir = common::tmp_dir("help_lists_every_command");
 
     let output = run(&dir, &["history", "--help"]);
     assert!(output.success);
-    for name in ["list", "materialize", "apply", "delete"] {
+    for name in ["list", "materialize", "apply", "snapshot", "delete"] {
         assert!(
             output.stdout.contains(name),
             "history --help missing {name}: {}",
@@ -908,13 +1019,14 @@ fn help_lists_every_command() {
         );
     }
 
-    let subcommand_flags: [(&str, &[&str]); 4] = [
+    let subcommand_flags: [(&str, &[&str]); 5] = [
         ("list", &["--json"]),
         ("materialize", &["--checkpoint", "--output", "--json"]),
         (
             "apply",
             &["--ops", "--from", "--save", "--output", "--json"],
         ),
+        ("snapshot", &["--zmap", "--from", "--json"]),
         ("delete", &["--checkpoint", "--with-descendants", "--json"]),
     ];
     for (sub, flags) in subcommand_flags {

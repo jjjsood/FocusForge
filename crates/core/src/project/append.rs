@@ -24,10 +24,11 @@ use super::checkpoint::{Checkpoint, FuseRecord};
 use super::container::{ProjectWriter, partial_path};
 use super::error::ProjectError;
 use super::manifest::{
-    AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef,
+    AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
 };
 use super::read_json;
-use super::seal::{now_unix, record, source_ref};
+use super::render::{CheckpointImage, ZmapSource, write_tiff};
+use super::seal::{FullMapCheckpoint, now_unix, record, source_ref};
 use super::{
     HASH_ALGORITHM, Op, Project, SealedProject, format_version_for, fused_extent, materialize_zmap,
     resolve_chain,
@@ -75,6 +76,17 @@ pub fn append_at(
     request: AppendRequest<'_>,
     created_at: i64,
 ) -> Result<SealedProject, ProjectError> {
+    append_onto(request, None, created_at)
+}
+
+/// [`append_at`] under an explicit `parent` checkpoint instead of the
+/// project's head; `None` is the head. The caller has checked that `parent`
+/// exists.
+pub(super) fn append_onto(
+    request: AppendRequest<'_>,
+    parent: Option<&str>,
+    created_at: i64,
+) -> Result<SealedProject, ProjectError> {
     let staging = request
         .staged_composite
         .parent()
@@ -82,7 +94,7 @@ pub fn append_at(
         .unwrap_or(Path::new("."))
         .to_path_buf();
     let mut staged: Vec<StagedBlob> = Vec::new();
-    let result = append_staged(&request, created_at, &staging, &mut staged);
+    let result = append_staged(&request, parent, created_at, &staging, &mut staged);
     for blob in &staged {
         blob.remove();
     }
@@ -91,6 +103,7 @@ pub fn append_at(
 
 fn append_staged(
     request: &AppendRequest<'_>,
+    parent: Option<&str>,
     created_at: i64,
     staging: &Path,
     staged: &mut Vec<StagedBlob>,
@@ -104,7 +117,6 @@ fn append_staged(
     for path in request.sources {
         sources.push(source_ref(path, project_dir)?);
     }
-    let stack_fingerprint = blob::stack_fingerprint(&sources);
 
     let composite = blob::stage_plane(
         request.staged_composite,
@@ -117,20 +129,74 @@ fn append_staged(
     staged.push(zmap.clone());
     let frame_count = blob::zmap_frame_count(request.staged_zmap)?;
 
-    let composite_record = record(&composite);
-    let zmap_record = record(&zmap);
+    write_fused(FusedWrite {
+        project_path: request.project_path,
+        parent,
+        composite: &composite,
+        zmap: &zmap,
+        frame_count,
+        sources,
+        algorithm: request.algorithm,
+        params: request.params,
+        align: request.align.clone(),
+        registration: request.registration.clone(),
+        composite_description: request.composite_description.clone(),
+        label: request.label.clone(),
+        metrics: request.metrics,
+        created_at,
+    })
+}
 
-    let old_file = File::open(request.project_path)
-        .map_err(|err| ProjectError::io(request.project_path, err))?;
-    let mut old_archive = zip::ZipArchive::new(old_file)
-        .map_err(|err| ProjectError::container(request.project_path, err))?;
-    let old_manifest: Manifest =
-        read_json(&mut old_archive, request.project_path, "manifest.json")?;
-    verify_blobs_present(&mut old_archive, &old_manifest, request.project_path)?;
-    let old_head_id = old_manifest.checkpoint.clone();
+/// A fused checkpoint whose planes are already staged: what
+/// [`write_fused`] records under its parent.
+struct FusedWrite<'a> {
+    project_path: &'a Path,
+    /// `None` is the project's head.
+    parent: Option<&'a str>,
+    composite: &'a StagedBlob,
+    zmap: &'a StagedBlob,
+    frame_count: u32,
+    sources: Vec<SourceRef>,
+    algorithm: &'a str,
+    params: &'a ParamValues,
+    align: Option<AlignRecord>,
+    registration: Registration,
+    composite_description: String,
+    label: Option<String>,
+    metrics: Metrics,
+    created_at: i64,
+}
+
+fn write_fused(write: FusedWrite<'_>) -> Result<SealedProject, ProjectError> {
+    let FusedWrite {
+        project_path,
+        parent,
+        composite,
+        zmap,
+        frame_count,
+        sources,
+        algorithm,
+        params,
+        align,
+        registration,
+        composite_description,
+        label,
+        metrics,
+        created_at,
+    } = write;
+    let stack_fingerprint = blob::stack_fingerprint(&sources);
+    let composite_record = record(composite);
+    let zmap_record = record(zmap);
+
+    let old_file = File::open(project_path).map_err(|err| ProjectError::io(project_path, err))?;
+    let mut old_archive =
+        zip::ZipArchive::new(old_file).map_err(|err| ProjectError::container(project_path, err))?;
+    let old_manifest: Manifest = read_json(&mut old_archive, project_path, "manifest.json")?;
+    verify_blobs_present(&mut old_archive, &old_manifest, project_path)?;
+    let parent_id = parent.map_or_else(|| old_manifest.checkpoint.clone(), str::to_string);
 
     let checkpoint_id =
-        Checkpoint::derive_child_id(&old_head_id, &stack_fingerprint, &zmap.hash, created_at);
+        Checkpoint::derive_child_id(&parent_id, &stack_fingerprint, &zmap.hash, created_at);
 
     let mut blobs = old_manifest.blobs.clone();
     for rec in [composite_record.clone(), zmap_record.clone()] {
@@ -145,10 +211,10 @@ fn append_staged(
         created_at,
         hash_algorithm: HASH_ALGORITHM.to_string(),
         stack_fingerprint: stack_fingerprint.clone(),
-        algorithm: request.algorithm.to_string(),
-        params: request.params.clone(),
-        align: request.align.clone(),
-        registration: request.registration.clone(),
+        algorithm: algorithm.to_string(),
+        params: params.clone(),
+        align,
+        registration,
         sources,
         composite: PlaneRef {
             blob: composite.hash.clone(),
@@ -156,7 +222,7 @@ fn append_staged(
             height: composite.height,
             samples_per_pixel: composite.samples_per_pixel,
             byte_order: ByteOrderTag::Little,
-            description: request.composite_description.clone(),
+            description: composite_description.clone(),
             frame_count,
         },
         zmap: PlaneRef {
@@ -165,24 +231,24 @@ fn append_staged(
             height: zmap.height,
             samples_per_pixel: 1,
             byte_order: ByteOrderTag::Little,
-            description: request.composite_description.clone(),
+            description: composite_description,
             frame_count,
         },
         blobs,
-        metrics: request.metrics,
+        metrics,
         checkpoint: checkpoint_id.clone(),
     };
 
     let checkpoint = Checkpoint {
         id: checkpoint_id.clone(),
-        parent: Some(old_head_id),
+        parent: Some(parent_id),
         ops: Vec::new(),
         zmap_blob: zmap.hash.clone(),
         stack_fingerprint,
-        algorithm: request.algorithm.to_string(),
-        params: request.params.clone(),
+        algorithm: algorithm.to_string(),
+        params: params.clone(),
         created_at,
-        label: request.label.clone(),
+        label,
         fuse: Some(FuseRecord {
             composite: manifest.composite.clone(),
             align: manifest.align.clone(),
@@ -192,17 +258,15 @@ fn append_staged(
         }),
     };
 
-    let mut writer = ProjectWriter::create(request.project_path)?;
+    let mut writer = ProjectWriter::create(project_path)?;
     let manifest_text = serde_json::to_string_pretty(&manifest)
-        .map_err(|err| ProjectError::container(request.project_path, err))?;
+        .map_err(|err| ProjectError::container(project_path, err))?;
     writer.add_text("manifest.json", &manifest_text)?;
-    copy_forward(&mut old_archive, &mut writer, request.project_path, |_| {
-        true
-    })?;
+    copy_forward(&mut old_archive, &mut writer, project_path, |_| true)?;
     writer.add_blob(&composite.hash, &composite.path)?;
     writer.add_blob(&zmap.hash, &zmap.path)?;
     let checkpoint_text = serde_json::to_string_pretty(&checkpoint)
-        .map_err(|err| ProjectError::container(request.project_path, err))?;
+        .map_err(|err| ProjectError::container(project_path, err))?;
     writer.add_text(
         &format!("checkpoints/{checkpoint_id}.json"),
         &checkpoint_text,
@@ -215,6 +279,60 @@ fn append_staged(
         composite: composite_record,
         zmap: zmap_record,
         checkpoint: checkpoint_id,
+    })
+}
+
+/// Seals a Z-Map file as a new checkpoint under `parent`, stored like a
+/// re-fuse: the map as a full blob, a composite gathered from it over
+/// `map.sources`, no ops and a fuse record. Refuses an unknown `parent`
+/// before anything is written.
+pub fn append_zmap_onto(
+    project_path: &Path,
+    parent: &str,
+    map: &FullMapCheckpoint,
+) -> Result<SealedProject, ProjectError> {
+    Project::open(project_path)?.history().get(parent)?;
+    let staging = fresh_staging_dir(project_path)?;
+    let result = append_zmap_staged(project_path, parent, map, &staging);
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+fn append_zmap_staged(
+    project_path: &Path,
+    parent: &str,
+    map: &FullMapCheckpoint,
+    staging: &Path,
+) -> Result<SealedProject, ProjectError> {
+    let source = ZmapSource {
+        sources: map.sources.clone(),
+        registration: map.fuse.registration.clone(),
+        reference: map.fuse.align.as_ref().map_or(0, |a| a.reference),
+        description: map.fuse.composite.description.clone(),
+    };
+    let image = CheckpointImage::prepare_zmap(&map.zmap, &source)?;
+    let gathered = staging.join("composite.tif");
+    write_tiff(&image, &mut |sink| image.render_external(sink), &gathered)?;
+
+    let composite = blob::stage_plane(&gathered, Plane::Composite, ZSTD_LEVEL, staging)?;
+    let zmap = blob::stage_plane(&map.zmap, Plane::ZMap, ZSTD_LEVEL, staging)?;
+    let frame_count = blob::zmap_frame_count(&map.zmap)?;
+
+    write_fused(FusedWrite {
+        project_path,
+        parent: Some(parent),
+        composite: &composite,
+        zmap: &zmap,
+        frame_count,
+        sources: map.fuse.sources.clone(),
+        algorithm: &map.algorithm,
+        params: &map.params,
+        align: map.fuse.align.clone(),
+        registration: map.fuse.registration.clone(),
+        composite_description: map.fuse.composite.description.clone(),
+        label: None,
+        metrics: map.fuse.metrics,
+        created_at: map.created_at,
     })
 }
 

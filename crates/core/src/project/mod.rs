@@ -69,8 +69,8 @@ use std::sync::LazyLock;
 
 pub use append::{
     AppendRequest, Deleted, SNAPSHOT_BYTE_BUDGET, SNAPSHOT_CHECKPOINT_CAP, ZMapChain, ZMapStorage,
-    append, append_at, append_ops, append_ops_at, append_ops_onto, delete_checkpoint,
-    replay_ops_to,
+    append, append_at, append_ops, append_ops_at, append_ops_onto, append_zmap_onto,
+    delete_checkpoint, replay_ops_to,
 };
 pub use blob::{Plane, StagedBlob, hash_file, short_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, FuseRecord, History, Op, Point};
@@ -83,7 +83,10 @@ pub use manifest::{
 };
 pub use render::{CheckpointImage, ZmapSource, render_checkpoint};
 pub use review::ReviewMetrics;
-pub use seal::{HeldCheckpoint, SealRequest, SealedProject, now_unix, seal, seal_at, seal_held};
+pub use seal::{
+    FullMapCheckpoint, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, SealRequest,
+    SealedProject, now_unix, seal, seal_at, seal_in_memory,
+};
 pub use validate::{
     FingerprintMismatch, Opened, PendingProject, SourceCheck, Validation, check_sources,
 };
