@@ -34,4 +34,9 @@ pub enum AlgorithmError {
     /// variants name.
     #[error("{algorithm}: {detail}")]
     Failed { algorithm: String, detail: String },
+
+    /// The run's control requested a cancel before every frame was
+    /// registered; the driver started no registration after reading it.
+    #[error("alignment cancelled")]
+    Cancelled,
 }

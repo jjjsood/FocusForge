@@ -408,6 +408,68 @@ fn cancel_during_align_shows_the_interval() {
 }
 
 // ---------------------------------------------------------------------
+// Pause holds a still-aligning run: no progress moves while it is held,
+// and a second press lets the same run finish.
+// ---------------------------------------------------------------------
+
+#[test]
+fn pause_during_alignment_holds_align_progress() {
+    let mut controller = controller_with_frames("pause_align", 8);
+    // `dummy-align` (`controller_with_frames`'s own default) finishes in
+    // microseconds; a real solver is what gives the hold something to
+    // catch mid-stage. Translation-only chain registration converges on
+    // every one of this fixture's eight frames, so the run fuses cleanly
+    // rather than parking on a diverged frame.
+    controller.set_align_algorithm("pyramidal-ecc");
+    controller.set_param_value("align", "mode", ParamValue::Enum("translation".to_string()));
+    controller.set_param_value(
+        "align",
+        "reference-policy",
+        ParamValue::Enum("chain".to_string()),
+    );
+    assert!(controller.start_fuse());
+
+    let start = Instant::now();
+    while !(controller.job_view().state == job::RunState::Running
+        && controller.job_view().stage_word == "Aligning")
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the run never reached the align stage within 60s"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    controller.pause_or_resume();
+    assert_eq!(controller.job_view().state, job::RunState::Paused);
+
+    let held = controller.job_view();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        controller.job_view(),
+        held,
+        "the align stage's own progress must not move while the hold is in effect"
+    );
+
+    controller.pause_or_resume();
+    // A paused view shows `Paused` in place of the stage word; the first
+    // view after resume reads the progress the hold froze, which must still
+    // be the align stage's.
+    assert_eq!(
+        controller.job_view().stage_word,
+        "Aligning",
+        "the hold must have landed in the align stage"
+    );
+    common::wait_for_settle(&mut controller, Duration::from_secs(120))
+        .expect("a resumed run must hand back its fused planes");
+    assert!(!controller.job_running());
+    match controller.job_view().state {
+        job::RunState::Fused { .. } => {}
+        other => panic!("a resumed run must settle as fused, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------
 // A clean cancel preserves the engine's resumable state.
 // ---------------------------------------------------------------------
 
@@ -675,6 +737,94 @@ fn failure_is_reported_and_retryable() {
             panic!("retrying the same unreadable frame must fail the same way, got {other:?}")
         }
     }
+}
+
+/// The failure toast's short summary follows the error's typed variant, not
+/// which `JobStage` the control happened to read: setup (a corrupted
+/// frame), alignment (the solver singular) and fusion (a scratch root that
+/// cannot stage) each append a notification naming the operation that
+/// actually failed, with the tab's own full message unchanged inside it.
+#[test]
+fn failure_summary_names_the_failed_operation() {
+    // A GUI fuse no longer fails on a per-frame alignment divergence (lax
+    // mode parks it instead, see `controller_with_unalignable_frames`'s own
+    // doc comment), so the `Align` classification is checked directly against
+    // the error variant it actually comes from -- the solver's `Err` in
+    // `pipeline::run` -- rather than through an end-to-end GUI run.
+    let alignment_operation;
+    let alignment_summary;
+    {
+        let operation = job::FailedOperation::from(&pipeline::PipelineError::Align(
+            "synthetic alignment failure".to_string(),
+        ));
+        alignment_operation = operation;
+        alignment_summary = operation.summary();
+        assert_eq!(alignment_operation, job::FailedOperation::Alignment);
+    }
+
+    let setup_operation;
+    let setup_summary;
+    {
+        let root = common::tree("summary_setup_frames");
+        copy_frame(&root, "00.tif", 0);
+        copy_frame(&root, "01.tif", 1);
+        let mut controller = AppController::new();
+        assert!(matches!(
+            common::open_and_settle(&mut controller, std::slice::from_ref(&root)),
+            OpenOutcome::Opened(_)
+        ));
+        controller.set_scratch_root_for_test(common::tree("summary_setup_scratch"));
+        // Still a file, so the missing-frame refusal never fires -- the
+        // failure has to come from actually opening it.
+        std::fs::write(root.join("01.tif"), b"not a tiff any more").unwrap();
+        assert!(controller.start_fuse());
+        common::wait_for_settle(&mut controller, Duration::from_secs(60));
+        let message = controller
+            .job_failure_message()
+            .expect("a corrupted frame must fail the run")
+            .to_string();
+        let notification = controller
+            .notifications()
+            .last()
+            .expect("the failed run must append a notification");
+        assert_eq!(notification.message, message);
+        setup_operation = notification.operation;
+        setup_summary = notification.operation.summary();
+        assert_eq!(setup_operation, job::FailedOperation::Setup);
+    }
+
+    let fusion_operation;
+    let fusion_summary;
+    {
+        let mut controller = controller_with_frames("summary_fusion", 2);
+        let scratch_parent = common::tree("summary_fusion_scratch");
+        let scratch_root = scratch_parent.join("as-file");
+        std::fs::write(&scratch_root, b"not a directory").unwrap();
+        controller.set_scratch_root_for_test(scratch_root);
+        assert!(controller.start_fuse());
+        common::wait_for_settle(&mut controller, Duration::from_secs(60));
+        let message = controller
+            .job_failure_message()
+            .expect("a scratch root that is a file must fail staging")
+            .to_string();
+        let notification = controller
+            .notifications()
+            .last()
+            .expect("the failed run must append a notification");
+        assert_eq!(notification.message, message);
+        fusion_operation = notification.operation;
+        fusion_summary = notification.operation.summary();
+        assert_eq!(fusion_operation, job::FailedOperation::Fusion);
+    }
+
+    let mut summaries = vec![alignment_summary, setup_summary, fusion_summary];
+    summaries.sort_unstable();
+    summaries.dedup();
+    assert_eq!(
+        summaries.len(),
+        3,
+        "the three summaries must be pairwise distinct"
+    );
 }
 
 #[test]
@@ -1421,6 +1571,228 @@ fn two_failures_keep_their_own_messages_and_requests() {
         controller.job_view().state,
         job::RunState::Failed(message_a),
         "tab A's own failure must survive tab B's retry"
+    );
+}
+
+/// Notification records outlive the single-slot toast they came from: a
+/// second failure replaces the first, still-unread toast, a retry appends
+/// its own record, and switching tabs afterwards drops nothing. Every
+/// record keeps its own tab's title, path and full message.
+#[test]
+fn failure_notifications_outlive_the_toast() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree("outlive_scratch"));
+
+    add_unreadable_tab(&mut controller, "outlive_a", 2);
+    let title_a = controller.project_tabs()[0].title.clone();
+    let path_a = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("outlive_a_frames");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    let message_a = controller
+        .job_failure_message()
+        .expect("tab A must fail")
+        .to_string();
+
+    add_unreadable_tab(&mut controller, "outlive_b", 3);
+    let title_b = controller.project_tabs()[1].title.clone();
+    let path_b = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("outlive_b_frames");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    let message_b = controller
+        .job_failure_message()
+        .expect("tab B must fail")
+        .to_string();
+
+    // The second failure replaces the first, still-unread toast slot.
+    let taken = controller
+        .take_settled_failure()
+        .expect("the most recent failure must still be pending");
+    assert_eq!(taken.message, message_b);
+    assert!(
+        controller.take_settled_failure().is_none(),
+        "a taken failure does not reappear"
+    );
+
+    assert!(
+        controller.retry_fuse(),
+        "retry on the active tab must start a run"
+    );
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    let retry_message = controller
+        .job_failure_message()
+        .expect("the retried tab must fail the same way")
+        .to_string();
+
+    controller.select_project(0);
+
+    let notifications = controller.notifications();
+    assert_eq!(
+        notifications.len(),
+        3,
+        "every failure must be recorded, in order"
+    );
+
+    assert_eq!(notifications[0].message, message_a);
+    assert_eq!(notifications[0].operation, job::FailedOperation::Setup);
+    assert_eq!(notifications[0].project_title, Some(title_a));
+    assert_eq!(notifications[0].project_path, Some(path_a));
+    assert_eq!(notifications[0].target, None);
+
+    for (notification, message) in [
+        (&notifications[1], &message_b),
+        (&notifications[2], &retry_message),
+    ] {
+        assert_eq!(notification.message, *message);
+        assert_eq!(notification.operation, job::FailedOperation::Setup);
+        assert_eq!(notification.project_title, Some(title_b.clone()));
+        assert_eq!(notification.project_path, Some(path_b.clone()));
+        assert_eq!(notification.target, None);
+    }
+}
+
+/// A window backend, initialized once per thread -- `AppWindow::new()`
+/// otherwise panics on a second call from the same thread.
+fn init_window_backend() {
+    thread_local! {
+        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    INIT.with(|done| {
+        if !done.get() {
+            i_slint_backend_testing::init_no_event_loop();
+            done.set(true);
+        }
+    });
+}
+
+/// A failure that settles while the Projects overview is open is announced
+/// through the failure toast regardless of which tab is active: the run
+/// starts on the tab that will fail, a different tab is then selected, and
+/// the toast still opens once the overview is up.
+#[test]
+fn failure_while_the_overview_is_open_is_announced() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+
+    let mut controller = controller_with_frames("overview_open_healthy", 3);
+    add_unreadable_tab(&mut controller, "overview_open_failing", 2);
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+
+    // The failing tab (index 1, made active by `add_unreadable_tab`) starts
+    // the run; a different tab is selected before it settles.
+    app.invoke_fuse_requested();
+    controller.lock().unwrap().select_project(0);
+    controller.lock().unwrap().toggle_projects_overlay();
+    focusforge_gui::bridge::push_projects_overlay(&app, &controller.lock().unwrap());
+
+    common::settle_via_job_timer(&controller, Duration::from_secs(60));
+
+    assert!(
+        app.get_job_toast_open(),
+        "a failure settling under the open overview must open the toast, \
+         regardless of which tab is active"
+    );
+    assert_eq!(app.get_job_toast_message(), "Setup failed");
+    assert!(
+        app.get_projects_overlay_open(),
+        "the overview must stay open"
+    );
+
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(400));
+    let opacity = ElementQuery::from_root(&app)
+        .match_id("AppWindow::job-toast")
+        .find_first()
+        .expect("the toast is always in the tree")
+        .computed_opacity();
+    assert!(
+        opacity > 0.99,
+        "the toast must fade in to fully visible, got opacity {opacity}"
+    );
+}
+
+/// Display time counts only visible time: the toast's 6 s auto-dismiss runs
+/// from the moment it opens, so a failure settling under the open overview
+/// stays visible for its whole display time once shown, and closing the
+/// overview afterwards never brings a stale, already-expired toast back.
+#[test]
+fn a_failure_toast_is_not_spent_while_hidden() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+
+    let controller = Arc::new(Mutex::new(controller_with_an_unreadable_frame(
+        "toast_not_spent_while_hidden",
+    )));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+
+    controller.lock().unwrap().toggle_projects_overlay();
+    focusforge_gui::bridge::push_projects_overlay(&app, &controller.lock().unwrap());
+
+    app.invoke_fuse_requested();
+    common::settle_via_job_timer(&controller, Duration::from_secs(60));
+    assert!(
+        app.get_job_toast_open(),
+        "the toast must open the moment the run settles, whether or not the overview is open"
+    );
+
+    let toast_opacity = || {
+        ElementQuery::from_root(&app)
+            .match_id("AppWindow::job-toast")
+            .find_first()
+            .expect("the toast is always in the tree")
+            .computed_opacity()
+    };
+
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(400));
+    assert!(
+        toast_opacity() > 0.99,
+        "the toast must be fully visible once its fade-in completes"
+    );
+
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(5100));
+    assert!(
+        app.get_job_toast_open(),
+        "the toast must still be open at 5.5 s, not expired unseen"
+    );
+    assert!(
+        toast_opacity() > 0.99,
+        "the toast must still be fully visible at 5.5 s"
+    );
+
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(600));
+    assert!(
+        !app.get_job_toast_open(),
+        "the toast must have auto-dismissed by 6.1 s"
+    );
+
+    controller.lock().unwrap().toggle_projects_overlay();
+    focusforge_gui::bridge::push_projects_overlay(&app, &controller.lock().unwrap());
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+    assert_eq!(
+        toast_opacity(),
+        0.0,
+        "closing the overview after the toast expired must not bring a stale toast back"
     );
 }
 
@@ -2531,6 +2903,10 @@ fn a_failed_save_keeps_the_project_in_memory() {
         controller.take_settled_failure().is_none(),
         "a cancelled dialog is not a failure"
     );
+    assert!(
+        controller.notifications().is_empty(),
+        "a cancelled dialog appends no record"
+    );
     still_in_memory(&mut controller);
 
     let Some(empty) = common::readonly_dir("failed_save_read_only_empty", 0o555, |_| {}) else {
@@ -2541,11 +2917,22 @@ fn a_failed_save_keeps_the_project_in_memory() {
     let left = listing(&empty);
     assert!(!saved);
     assert!(left.is_empty(), "nothing was left behind: {left:?}");
-    let message = controller
+    let notification = controller
         .take_settled_failure()
         .expect("a failed save says why");
-    assert!(message.contains(&target.display().to_string()), "{message}");
-    assert!(message.contains("Permission denied"), "{message}");
+    assert_eq!(notification.operation, job::FailedOperation::Save);
+    assert_eq!(notification.target, Some(target.clone()));
+    assert!(
+        notification.message.contains(&target.display().to_string()),
+        "{}",
+        notification.message
+    );
+    assert!(
+        notification.message.contains("Permission denied"),
+        "{}",
+        notification.message
+    );
+    assert_eq!(controller.notifications().len(), 1);
     still_in_memory(&mut controller);
 
     let Some(holding) = common::readonly_dir("failed_save_read_only_existing", 0o555, |dir| {
@@ -2559,13 +2946,19 @@ fn a_failed_save_keeps_the_project_in_memory() {
     assert!(!saved);
     assert_eq!(left, [PathBuf::from("existing.ffp")]);
     assert_eq!(std::fs::read(&existing).unwrap(), b"an earlier project");
-    let message = controller
+    let notification = controller
         .take_settled_failure()
         .expect("a failed save says why");
+    assert_eq!(notification.operation, job::FailedOperation::Save);
+    assert_eq!(notification.target, Some(existing.clone()));
     assert!(
-        message.contains(&existing.display().to_string()),
-        "{message}"
+        notification
+            .message
+            .contains(&existing.display().to_string()),
+        "{}",
+        notification.message
     );
+    assert_eq!(controller.notifications().len(), 2);
     still_in_memory(&mut controller);
 }
 
@@ -3157,4 +3550,789 @@ fn quit_and_close_questions_cannot_overlap() {
         "request_close_at is a no-op while a quit question is pending"
     );
     assert_eq!(controller.project_tabs().len(), tabs_before);
+}
+
+// ---------------------------------------------------------------------
+// `job::resolve_backend`'s own wording, and `AppController::fusion_backend`
+// reporting the same line from every entry point that reaches `job::spawn`.
+// No GPU needed: every tab here keeps the registry's default `depth-map`
+// algorithm, which `backend_for` refuses before ever probing an adapter.
+// ---------------------------------------------------------------------
+
+#[test]
+fn fusion_backend_off_reports_gpu_disabled() {
+    let (backend, line) = job::resolve_backend("depth-map", false);
+    assert!(backend.is_none());
+    assert_eq!(line, "fusion backend: cpu — GPU processing is off");
+}
+
+#[test]
+fn fusion_backend_on_depth_map_reports_no_gpu_implementation() {
+    let (backend, line) = job::resolve_backend("depth-map", true);
+    assert!(backend.is_none());
+    assert_eq!(
+        line,
+        "fusion backend: cpu — depth-map has no GPU implementation"
+    );
+}
+
+#[test]
+fn fusion_backend_on_dummy_stack_reports_no_gpu_implementation() {
+    let (backend, line) = job::resolve_backend("dummy-stack", true);
+    assert!(backend.is_none());
+    assert_eq!(
+        line,
+        "fusion backend: cpu — dummy-stack has no GPU implementation"
+    );
+}
+
+/// Polls `AppController::fusion_backend()` until the worker thread it was
+/// just handed has resolved and stored its own line.
+fn wait_for_backend_line(controller: &AppController, timeout: Duration) -> String {
+    let start = Instant::now();
+    loop {
+        if let Some(line) = controller.fusion_backend() {
+            return line;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "no fusion backend line was reported within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+const DEPTH_MAP_CPU_LINE: &str = "fusion backend: cpu — depth-map has no GPU implementation";
+
+#[test]
+fn fusion_backend_reports_on_a_paused_direct_start() {
+    let mut controller = controller_with_frames("fusion_backend_direct", 2);
+    controller.set_gpu_fusion(true);
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+    assert_eq!(
+        wait_for_backend_line(&controller, Duration::from_secs(30)),
+        DEPTH_MAP_CPU_LINE
+    );
+}
+
+#[test]
+fn fusion_backend_reports_on_queue_promotion() {
+    let mut controller = controller_with_two_tabs("fusion_backend_queue");
+    controller.set_gpu_fusion(true);
+    start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
+
+    controller.select_project(1);
+    assert!(
+        controller.start_fuse(),
+        "a press on the second tab while the first runs must enqueue it"
+    );
+
+    controller.select_project(0);
+    controller.pause_or_resume();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+
+    // The queue promotion inside `settle_job` has just spawned tab 1's own
+    // worker; its `resolve_backend` line lands moments later.
+    assert_eq!(
+        wait_for_backend_line(&controller, Duration::from_secs(30)),
+        DEPTH_MAP_CPU_LINE
+    );
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+}
+
+#[test]
+fn fusion_backend_reports_on_retry() {
+    let mut controller = controller_with_an_unreadable_frame("fusion_backend_retry");
+    controller.set_gpu_fusion(true);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+
+    assert!(controller.retry_fuse(), "a failed run must be retryable");
+    assert_eq!(
+        wait_for_backend_line(&controller, Duration::from_secs(30)),
+        DEPTH_MAP_CPU_LINE
+    );
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+}
+
+#[test]
+fn fusion_backend_reports_on_run_gallery_action() {
+    let mut controller = controller_with_an_unreadable_frame("fusion_backend_gallery_action");
+    controller.set_gpu_fusion(true);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+
+    assert!(
+        controller.run_gallery_action(0),
+        "a `Run again` press on a failed card's own kept request must start a run"
+    );
+    assert_eq!(
+        wait_for_backend_line(&controller, Duration::from_secs(30)),
+        DEPTH_MAP_CPU_LINE
+    );
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+}
+
+// A Laplacian run with GPU fusion on matches the same frames' CPU run: every
+// Z-Map index the two runs disagree on is a proven near-tie, a pixel where
+// perturbing the frames' warped samples by ±1 LSB flips the level-0 winner,
+// and the composite stays within ±1 LSB except where such a flip, at level 0
+// or at a coarser pyramid level, is proven.
+
+#[cfg(feature = "gpu-tests")]
+mod gpu_fusion {
+    use super::*;
+    use focusforge_core::algorithm::TileReader;
+    use focusforge_core::align::{
+        AlignDriverOptions, FailurePolicy, WarpingReader, align_stack_with, auto_crop,
+    };
+    use focusforge_core::fuse::laplacian::{score_plane, score_radius};
+    use focusforge_core::fuse::pyramid;
+    use focusforge_core::io::{FrameReader, TiffStack};
+    use std::collections::HashMap;
+
+    const LSB_TOLERANCE: i32 = 1;
+
+    #[derive(Clone)]
+    struct Run {
+        composite: Vec<u16>,
+        zmap: Vec<u16>,
+        held: job::HeldCheckpoint,
+    }
+
+    /// Fuses `frame_count` mantis-512 frames on `laplacian` through a fresh
+    /// controller (`dummy-align`, deterministic), GPU or host, with frame
+    /// `excluded` switched off first. Returns the run's composite samples,
+    /// Z-Map indices and held checkpoint.
+    fn run_laplacian(name: &str, frame_count: usize, excluded: Option<usize>, gpu: bool) -> Run {
+        let mut controller = controller_with_frames(name, frame_count);
+        if let Some(index) = excluded {
+            controller.toggle_frame_excluded(index);
+            assert!(controller.images_panel().rows[index].excluded);
+        }
+        controller.set_fuse_algorithm("laplacian");
+        controller.set_gpu_fusion(gpu);
+        assert!(controller.start_fuse());
+        if gpu {
+            let line = wait_for_backend_line(&controller, Duration::from_secs(120));
+            assert!(
+                line.starts_with("fusion backend: gpu — "),
+                "a GPU fusion run must actually resolve the GPU path: {line}"
+            );
+        }
+        let planes = common::wait_for_settle(&mut controller, Duration::from_secs(300));
+        let (composite_path, zmap_path) = planes.unwrap_or_else(|| {
+            panic!(
+                "a completed Laplacian run must hand back its planes, got {:?}",
+                controller.job_view().state
+            )
+        });
+        let held = controller
+            .held_checkpoints()
+            .last()
+            .cloned()
+            .expect("a completed run is held until saved");
+        assert_eq!(
+            held.sources.len(),
+            frame_count - usize::from(excluded.is_some()),
+            "the run must fuse exactly the included frames"
+        );
+
+        let stack = TiffStack::open_files(&[composite_path]).unwrap();
+        let (width, height) = stack.dimensions();
+        assert_eq!((width, height), (held.width, held.height));
+        let composite = stack
+            .read_tile(0, full_rect(width, height))
+            .unwrap()
+            .samples;
+
+        let reader = focusforge_core::zmap::ZMapReader::open(&zmap_path).unwrap();
+        let tile = full_rect(width, height);
+        let mut zmap = vec![0u16; reader.info().tile_len(tile)];
+        reader.read_tile_into(tile, &mut zmap).unwrap();
+
+        Run {
+            composite,
+            zmap,
+            held,
+        }
+    }
+
+    fn full_rect(width: u32, height: u32) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    /// A run's frames re-aligned, warped and scored exactly as its fusion
+    /// scored them: every frame's warped samples and windowed score at every
+    /// pyramid level over the whole canvas, and the crop that maps a Z-Map
+    /// pixel onto it.
+    struct NearTieProof {
+        samples: Vec<Vec<u16>>,
+        /// `scores[level][frame]`, one value per pixel of that level.
+        scores: Vec<Vec<Vec<f32>>>,
+        width: u32,
+        height: u32,
+        spp: u32,
+        levels: u32,
+        crop: Rect,
+    }
+
+    impl NearTieProof {
+        fn for_run(held: &job::HeldCheckpoint) -> NearTieProof {
+            let stack = TiffStack::open_files(&held.sources).unwrap();
+            let ctx = stack.stack_context();
+            let (width, height, spp) = (ctx.width, ctx.height, ctx.samples_per_pixel);
+            let align = held.align.as_ref().expect("the run records its alignment");
+            let aligner = registry::find_align(&align.algorithm).unwrap();
+            let alignment = align_stack_with(
+                aligner,
+                ctx,
+                &stack,
+                &align.params,
+                FailurePolicy::IdentityFallback,
+                &AlignDriverOptions::default(),
+            )
+            .unwrap()
+            .alignment;
+            assert_eq!(alignment.reference, align.reference);
+            let crop = auto_crop(&alignment, (width, height))
+                .unwrap()
+                .expect("the run was cropped, so its alignment leaves an interior");
+            assert_eq!((crop.width, crop.height), (held.width, held.height));
+            let levels =
+                held.params
+                    .get("levels")
+                    .and_then(ParamValue::as_i64)
+                    .expect("a Laplacian run records its resolved depth") as u32;
+            let transforms = alignment.frames.iter().map(|f| f.transform).collect();
+            let reader = WarpingReader::new(&stack, (width, height), spp, transforms);
+
+            let mut proof = NearTieProof {
+                samples: Vec::new(),
+                scores: vec![Vec::new(); levels as usize],
+                width,
+                height,
+                spp,
+                levels,
+                crop,
+            };
+            for frame in 0..held.sources.len() {
+                let mut samples = vec![0u16; (width * height * spp) as usize];
+                reader
+                    .read_tile_into(frame, full_rect(width, height), &mut samples)
+                    .unwrap();
+                let pyramid = pyramid::build(&samples, width, height, spp, levels).unwrap();
+                for level in 0..levels {
+                    let scores =
+                        score_plane(&pyramid.levels()[level as usize], proof.radius(level));
+                    proof.scores[level as usize].push(scores);
+                }
+                proof.samples.push(samples);
+            }
+            proof
+        }
+
+        fn radius(&self, level: u32) -> u32 {
+            score_radius(self.levels, level)
+        }
+
+        /// The canvas pixel under Z-Map pixel `p`.
+        fn canvas_pixel(&self, p: usize) -> usize {
+            let x = self.crop.x as usize + p % self.crop.width as usize;
+            let y = self.crop.y as usize + p / self.crop.width as usize;
+            y * self.width as usize + x
+        }
+
+        /// The pixel of pyramid level `level` that canvas pixel `q` lies in.
+        fn level_pixel(&self, q: usize, level: u32) -> usize {
+            let x = (q % self.width as usize) >> level;
+            let y = (q / self.width as usize) >> level;
+            y * self.width.div_ceil(1 << level) as usize + x
+        }
+
+        /// The canvas pixel at the origin of level `level`'s pixel `m`.
+        fn canvas_origin(&self, m: usize, level: u32) -> usize {
+            let level_width = self.width.div_ceil(1 << level) as usize;
+            ((m / level_width) << level) * self.width as usize + ((m % level_width) << level)
+        }
+
+        /// Every pixel of pyramid level `level` whose collapse footprint
+        /// reaches canvas pixel `q`: `expand` spreads level pixel `m` over the
+        /// canvas pixels within `2(2^level - 1)` of `2^level · m` per axis.
+        fn reaching_pixels(&self, q: usize, level: u32) -> Vec<usize> {
+            let step = 1i64 << level;
+            let reach = 2 * (step - 1);
+            let level_width = i64::from(self.width.div_ceil(1 << level));
+            let level_height = i64::from(self.height.div_ceil(1 << level));
+            let span = |c: i64, len: i64| {
+                let lo = -(reach - c).div_euclid(step);
+                let hi = (c + reach).div_euclid(step);
+                lo.max(0)..=hi.min(len - 1)
+            };
+            let xs = span((q % self.width as usize) as i64, level_width);
+            span((q / self.width as usize) as i64, level_height)
+                .flat_map(|my| xs.clone().map(move |mx| (my * level_width + mx) as usize))
+                .collect()
+        }
+
+        /// Level `level`'s best two frames at level pixel `m`, lowest frame
+        /// first on a tie, and the winner's margin over the runner-up.
+        fn top_two(&self, level: u32, m: usize) -> (usize, usize, f32) {
+            let scores = &self.scores[level as usize];
+            let mut frames: Vec<usize> = (0..scores.len()).collect();
+            frames.sort_by(|&a, &b| scores[b][m].total_cmp(&scores[a][m]));
+            let (winner, runner_up) = (frames[0], frames[1]);
+            (winner, runner_up, scores[winner][m] - scores[runner_up][m])
+        }
+
+        /// Laplacian levels `0..=level` of `base` with every
+        /// `(pixel, delta)` in `deltas` applied to all channels, clamped to
+        /// `u16`. Level `k` depends only on the Gaussians up to `k + 1`.
+        fn laplacian(&self, base: &[u16], deltas: &[(usize, i32)], level: u32) -> pyramid::Pyramid {
+            let mut samples = base.to_vec();
+            for &(pixel, delta) in deltas {
+                for c in 0..self.spp as usize {
+                    let i = pixel * self.spp as usize + c;
+                    samples[i] = (i32::from(samples[i]) + delta).clamp(0, 65535) as u16;
+                }
+            }
+            pyramid::build(&samples, self.width, self.height, self.spp, level + 1).unwrap()
+        }
+
+        /// Frame `base`'s level-`level` score at level pixel `m` with
+        /// `deltas` applied, through the real `score_plane`.
+        fn perturbed_score(
+            &self,
+            base: &[u16],
+            deltas: &[(usize, i32)],
+            level: u32,
+            m: usize,
+        ) -> f32 {
+            let pyramid = self.laplacian(base, deltas, level);
+            score_plane(&pyramid.levels()[level as usize], self.radius(level))[m]
+        }
+
+        /// The winner at level pixel `m` of level `level`, lowest frame
+        /// winning a tie as the Laplacian selection does, with frame
+        /// `replaced`'s score there read as `replaced_score`.
+        fn winner_with(&self, level: u32, m: usize, replaced: usize, replaced_score: f32) -> usize {
+            let scores = &self.scores[level as usize];
+            let score = |f: usize| {
+                if f == replaced {
+                    replaced_score
+                } else {
+                    scores[f][m]
+                }
+            };
+            (1..scores.len()).fold(0, |best, f| if score(f) > score(best) { f } else { best })
+        }
+
+        /// Z-Map pixels where `other` disagrees with `cpu` and no ±1 LSB
+        /// perturbation of the frames' warped samples reaches `other`'s
+        /// pick from the CPU winner at level 0, plus the total disagreement
+        /// count.
+        fn unproven_disagreements(&self, other: &[u16], cpu: &[u16]) -> (usize, Vec<usize>) {
+            let differing: Vec<usize> = (0..cpu.len()).filter(|&p| other[p] != cpu[p]).collect();
+            let unproven = differing
+                .iter()
+                .copied()
+                .filter(|&p| {
+                    let q = self.canvas_pixel(p);
+                    !self.reachable_near_tie(0, q, cpu[p] as usize, other[p] as usize)
+                })
+                .collect();
+            (differing.len(), unproven)
+        }
+
+        /// A level `1..levels` with a pixel whose collapse footprint reaches
+        /// canvas pixel `q` and where a ±1 LSB perturbation moves the
+        /// selection off its winner toward its runner-up, narrowest margins
+        /// tried first. No run records coarser winners, so each level's top
+        /// two scores stand in for them. `proven` caches each
+        /// `(level, pixel)` verdict across calls.
+        fn coarser_near_tie(
+            &self,
+            q: usize,
+            proven: &mut HashMap<(u32, usize), bool>,
+        ) -> Option<u32> {
+            let mut candidates: Vec<(u32, usize)> = (1..self.levels)
+                .flat_map(|level| {
+                    self.reaching_pixels(q, level)
+                        .into_iter()
+                        .map(move |m| (level, m))
+                })
+                .collect();
+            candidates.sort_by(|&(ka, a), &(kb, b)| {
+                self.top_two(ka, a).2.total_cmp(&self.top_two(kb, b).2)
+            });
+            candidates.into_iter().find_map(|(level, m)| {
+                let found = *proven.entry((level, m)).or_insert_with(|| {
+                    let (winner, runner_up, margin) = self.top_two(level, m);
+                    let origin = self.canvas_origin(m, level);
+                    let found = self.reachable_near_tie(level, origin, winner, runner_up);
+                    let level_width = self.width.div_ceil(1 << level) as usize;
+                    println!(
+                        "level {level} pixel ({}, {}): winner {winner} runner-up {runner_up} \
+                         margin {margin} reachable near-tie {found}",
+                        m % level_width,
+                        m / level_width
+                    );
+                    found
+                });
+                found.then_some(level)
+            })
+        }
+
+        /// Whether a ±1 LSB perturbation of the warped samples moves the
+        /// level-`level` winner over canvas pixel `q` off `winner`: first
+        /// each frame's own sample at `q` alone, then every sample in the
+        /// level-0 score window around `q` at once, `winner` pushed to its
+        /// lowest score and `challenger` to its highest.
+        fn reachable_near_tie(
+            &self,
+            level: u32,
+            q: usize,
+            winner: usize,
+            challenger: usize,
+        ) -> bool {
+            let m = self.level_pixel(q, level);
+            for (frame, base) in self.samples.iter().enumerate() {
+                for delta in [1, -1] {
+                    let perturbed = self.perturbed_score(base, &[(q, delta)], level, m);
+                    if self.winner_with(level, m, frame, perturbed) != winner {
+                        return true;
+                    }
+                }
+            }
+            self.window_extreme(level, winner, q, false)
+                < self.window_extreme(level, challenger, q, true)
+        }
+
+        /// Frame `frame`'s level-`level` score over canvas pixel `q` with
+        /// every sample of the level-0 score window around `q` moved 1 LSB
+        /// in whichever direction, tried alone, pushes the score up
+        /// (`raise`) or down.
+        fn window_extreme(&self, level: u32, frame: usize, q: usize, raise: bool) -> f32 {
+            let base = &self.samples[frame];
+            let m = self.level_pixel(q, level);
+            let baseline = self.scores[level as usize][frame][m];
+            let r = i64::from(self.radius(0));
+            let (qx, qy) = (
+                (q % self.width as usize) as i64,
+                (q / self.width as usize) as i64,
+            );
+            let mut taps: Vec<usize> = (-r..=r)
+                .flat_map(|dy| (-r..=r).map(move |dx| (dx, dy)))
+                .map(|(dx, dy)| {
+                    let x = (qx + dx).clamp(0, i64::from(self.width) - 1) as usize;
+                    let y = (qy + dy).clamp(0, i64::from(self.height) - 1) as usize;
+                    y * self.width as usize + x
+                })
+                .collect();
+            taps.sort_unstable();
+            taps.dedup();
+            let probe = |tap: usize| {
+                let plus = self.score_at(&self.laplacian(base, &[(tap, 1)], level), level, m);
+                let minus = self.score_at(&self.laplacian(base, &[(tap, -1)], level), level, m);
+                let plus_wins = if raise { plus >= minus } else { plus <= minus };
+                let (delta, score) = if plus_wins { (1, plus) } else { (-1, minus) };
+                let helps = if raise {
+                    score > baseline
+                } else {
+                    score < baseline
+                };
+                helps.then_some((tap, delta))
+            };
+            // Each probe rebuilds a whole-canvas pyramid; spread them over
+            // the cores.
+            let workers = std::thread::available_parallelism().map_or(1, usize::from);
+            let deltas: Vec<(usize, i32)> = std::thread::scope(|s| {
+                let probe = &probe;
+                let handles: Vec<_> = taps
+                    .chunks(taps.len().div_ceil(workers))
+                    .map(|chunk| {
+                        s.spawn(move || chunk.iter().filter_map(|&t| probe(t)).collect::<Vec<_>>())
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("a tap probe does not panic"))
+                    .collect()
+            });
+            self.perturbed_score(base, &deltas, level, m)
+        }
+
+        /// `score_plane`'s window sum at level pixel `m` alone, for ranking
+        /// single-tap probes; only the summation order differs from
+        /// `score_plane`.
+        fn score_at(&self, pyramid: &pyramid::Pyramid, level: u32, m: usize) -> f32 {
+            let plane = &pyramid.levels()[level as usize];
+            let (width, height) = (plane.width() as usize, plane.height() as usize);
+            let data = plane.data();
+            let spp = self.spp as usize;
+            let r = i64::from(self.radius(level));
+            let (mx, my) = ((m % width) as i64, (m / width) as i64);
+            let mut acc = 0.0f32;
+            for dy in -r..=r {
+                let y = (my + dy).clamp(0, height as i64 - 1) as usize;
+                for dx in -r..=r {
+                    let x = (mx + dx).clamp(0, width as i64 - 1) as usize;
+                    let i = (y * width + x) * spp;
+                    for v in &data[i..i + spp] {
+                        acc += v.abs();
+                    }
+                }
+            }
+            acc
+        }
+
+        /// Every composite sample of `other` more than `LSB_TOLERANCE` off
+        /// `cpu`'s, as `((x, y), delta)`, at a pixel no proven near-tie
+        /// explains. A pixel whose Z-Map indices differ counts as proven:
+        /// callers first require [`Self::unproven_disagreements`] to be
+        /// empty. Where the indices agree, some level `1..levels` must prove
+        /// a near-tie at a pixel whose collapse footprint reaches it.
+        fn unexplained_composite(&self, other: &Run, cpu: &Run) -> Vec<((usize, usize), i32)> {
+            let spp = cpu.composite.len() / cpu.zmap.len();
+            let width = cpu.held.width as usize;
+            let mut explained = vec![0usize; self.levels as usize];
+            let mut proven = HashMap::new();
+            let mut over_bound = Vec::new();
+            for p in 0..cpu.zmap.len() {
+                let deltas: Vec<i32> = (p * spp..(p + 1) * spp)
+                    .map(|i| (i32::from(other.composite[i]) - i32::from(cpu.composite[i])).abs())
+                    .collect();
+                if deltas.iter().all(|&d| d <= LSB_TOLERANCE) {
+                    continue;
+                }
+                let level = if other.zmap[p] != cpu.zmap[p] {
+                    Some(0)
+                } else {
+                    self.coarser_near_tie(self.canvas_pixel(p), &mut proven)
+                };
+                match level {
+                    Some(level) => explained[level as usize] += 1,
+                    None => over_bound.extend(
+                        deltas
+                            .into_iter()
+                            .filter(|&d| d > LSB_TOLERANCE)
+                            .map(|d| ((p % width, p / width), d)),
+                    ),
+                }
+            }
+            println!("pixels over {LSB_TOLERANCE} LSB explained per level: {explained:?}");
+            over_bound
+        }
+    }
+
+    /// Fails unless the reconstructed scores pick exactly the CPU run's
+    /// Z-Map, so the near-tie proof reads the scores that run selected on.
+    fn assert_scores_reproduce(cpu_zmap: &[u16], proof: &NearTieProof) {
+        let mismatched = (0..cpu_zmap.len())
+            .filter(|&p| {
+                let q = proof.canvas_pixel(p);
+                proof.winner_with(0, q, 0, proof.scores[0][0][q]) != cpu_zmap[p] as usize
+            })
+            .count();
+        assert_eq!(
+            mismatched, 0,
+            "the reconstructed level-0 scores must select the CPU run's own Z-Map"
+        );
+    }
+
+    #[test]
+    fn zmap_parity_rejects_a_disagreement_no_near_tie_explains() {
+        let cpu = run_laplacian("zmap_parity_rejects", 2, None, false);
+        let proof = NearTieProof::for_run(&cpu.held);
+        assert_scores_reproduce(&cpu.zmap, &proof);
+
+        // The pixel whose winner leads the other frame by the widest margin,
+        // relabelled to that other frame with the composite left untouched.
+        let (p, loser) = (0..cpu.zmap.len())
+            .map(|p| {
+                let q = proof.canvas_pixel(p);
+                let winner = cpu.zmap[p] as usize;
+                let loser = 1 - winner;
+                (
+                    p,
+                    loser,
+                    proof.scores[0][winner][q] - proof.scores[0][loser][q],
+                )
+            })
+            .max_by(|a, b| a.2.total_cmp(&b.2))
+            .map(|(p, loser, _)| (p, loser))
+            .unwrap();
+        let mut relabelled = cpu.zmap.clone();
+        relabelled[p] = loser as u16;
+
+        let (differing, unproven) = proof.unproven_disagreements(&relabelled, &cpu.zmap);
+        assert_eq!(differing, 1);
+        assert_eq!(unproven, [p], "a wide-margin relabel is no near-tie");
+    }
+
+    #[test]
+    fn composite_parity_rejects_a_delta_no_coarser_near_tie_explains() {
+        let cpu = run_laplacian("composite_parity_rejects", 2, None, false);
+        let proof = NearTieProof::for_run(&cpu.held);
+        assert_scores_reproduce(&cpu.zmap, &proof);
+
+        // The pixel whose narrowest winner-over-loser margin across the
+        // coarser pixels reaching it is the widest, its composite moved by
+        // 10 LSB with the Z-Map left untouched.
+        let margin = |p: usize| {
+            let q = proof.canvas_pixel(p);
+            (1..proof.levels)
+                .flat_map(|level| {
+                    let scores = &proof.scores[level as usize];
+                    proof
+                        .reaching_pixels(q, level)
+                        .into_iter()
+                        .map(move |m| (scores[0][m] - scores[1][m]).abs())
+                })
+                .fold(f32::INFINITY, f32::min)
+        };
+        let p = (0..cpu.zmap.len())
+            .map(|p| (p, margin(p)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(p, _)| p)
+            .unwrap();
+        let spp = cpu.composite.len() / cpu.zmap.len();
+        let mut shifted = cpu.clone();
+        for sample in &mut shifted.composite[p * spp..(p + 1) * spp] {
+            *sample = if *sample > 32768 {
+                *sample - 10
+            } else {
+                *sample + 10
+            };
+        }
+
+        let width = cpu.held.width as usize;
+        let expected: Vec<_> = (0..spp).map(|_| ((p % width, p / width), 10)).collect();
+        assert_eq!(
+            proof.unexplained_composite(&shifted, &cpu),
+            expected,
+            "a composite delta where every level has a wide margin is no near-tie"
+        );
+    }
+
+    #[test]
+    fn composite_parity_exempts_a_delta_a_neighbouring_coarse_near_tie_reaches() {
+        let cpu = run_laplacian("composite_parity_reach", 2, None, false);
+        let proof = NearTieProof::for_run(&cpu.held);
+        assert_scores_reproduce(&cpu.zmap, &proof);
+
+        // The narrowest-margin level-1 pixel whose whole footprint lies in
+        // the Z-Map, and the footprint pixel outside its own block whose
+        // own coarser pixels have the widest narrowest margin.
+        let (width, crop) = (proof.width as usize, proof.crop);
+        let zmap_pixel = |q: usize| {
+            let (x, y) = (q % width, q / width);
+            let inside = (crop.x as usize..(crop.x + crop.width) as usize).contains(&x)
+                && (crop.y as usize..(crop.y + crop.height) as usize).contains(&y);
+            inside.then(|| (y - crop.y as usize) * crop.width as usize + x - crop.x as usize)
+        };
+        let footprint = |origin: usize| -> Vec<usize> {
+            let (x, y) = ((origin % width) as i64, (origin / width) as i64);
+            (-2..=2)
+                .flat_map(|dy| (-2..=2).map(move |dx| (dx, dy)))
+                .map(|(dx, dy)| {
+                    let (x, y) = (x + dx, y + dy);
+                    (x >= 0 && y >= 0 && (x as usize) < width)
+                        .then(|| y as usize * width + x as usize)
+                })
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_default()
+        };
+        let tie = (0..proof.scores[1][0].len())
+            .filter(|&m| {
+                let q = footprint(proof.canvas_origin(m, 1));
+                q.len() == 25 && q.iter().all(|&q| zmap_pixel(q).is_some())
+            })
+            .min_by(|&a, &b| proof.top_two(1, a).2.total_cmp(&proof.top_two(1, b).2))
+            .unwrap();
+        let origin = proof.canvas_origin(tie, 1);
+        let (winner, runner_up, _) = proof.top_two(1, tie);
+        assert!(
+            proof.reachable_near_tie(1, origin, winner, runner_up),
+            "the narrowest level-1 margin must be a reachable near-tie"
+        );
+        let own_margin = |q: usize| {
+            (1..proof.levels)
+                .map(|level| proof.top_two(level, proof.level_pixel(q, level)).2)
+                .fold(f32::INFINITY, f32::min)
+        };
+        let q = footprint(origin)
+            .into_iter()
+            .filter(|&q| proof.level_pixel(q, 1) != tie)
+            .max_by(|&a, &b| own_margin(a).total_cmp(&own_margin(b)))
+            .unwrap();
+        let p = zmap_pixel(q).unwrap();
+
+        let spp = cpu.composite.len() / cpu.zmap.len();
+        let mut shifted = cpu.clone();
+        for sample in &mut shifted.composite[p * spp..(p + 1) * spp] {
+            *sample = if *sample > 32768 {
+                *sample - 10
+            } else {
+                *sample + 10
+            };
+        }
+        let unexplained = proof.unexplained_composite(&shifted, &cpu);
+        assert!(
+            unexplained.is_empty(),
+            "a composite delta inside a coarser near-tie's collapse footprint is explained, \
+             got {unexplained:?}"
+        );
+    }
+
+    fn assert_gpu_matches_cpu(name: &str, frame_count: usize, excluded: Option<usize>) {
+        let gpu = run_laplacian(&format!("{name}_gpu"), frame_count, excluded, true);
+        let cpu = run_laplacian(&format!("{name}_cpu"), frame_count, excluded, false);
+        assert_eq!(gpu.held.sources.len(), cpu.held.sources.len());
+        assert_eq!(
+            (gpu.held.width, gpu.held.height),
+            (cpu.held.width, cpu.held.height),
+            "both runs must fuse the same canvas"
+        );
+
+        let proof = NearTieProof::for_run(&cpu.held);
+        assert_scores_reproduce(&cpu.zmap, &proof);
+        let (differing, unproven) = proof.unproven_disagreements(&gpu.zmap, &cpu.zmap);
+        assert!(
+            unproven.is_empty(),
+            "{} of {differing} differing Z-Map indices are no ±1 LSB-reachable near-tie: \
+             pixels {unproven:?}",
+            unproven.len()
+        );
+
+        // A flipped near-tie composites a different, equally valid frame whose
+        // value can differ by hundreds of LSB, so pixels a proof covers are
+        // exempt from the bound; every other pixel must stay within it.
+        let over_bound = proof.unexplained_composite(&gpu, &cpu);
+        println!(
+            "gpu fusion parity ({name}): {differing} differing Z-Map index(es), all near-ties"
+        );
+        assert!(
+            over_bound.is_empty(),
+            "GPU/CPU composite must stay within {LSB_TOLERANCE} LSB wherever no near-tie is \
+             proven; {} sample(s) over, ((x, y), delta): {:?}",
+            over_bound.len(),
+            &over_bound[..over_bound.len().min(40)]
+        );
+    }
+
+    #[test]
+    fn gpu_fusion_matches_cpu_on_the_full_mantis_512_stack() {
+        assert_gpu_matches_cpu("gpu_fusion_full", 8, None);
+    }
+
+    #[test]
+    fn gpu_fusion_matches_cpu_with_one_frame_excluded() {
+        assert_gpu_matches_cpu("gpu_fusion_excluded", 8, Some(3));
+    }
 }

@@ -116,6 +116,11 @@ impl JobControl {
     /// `TileScheduler::in_flight_limit()` further units complete, and
     /// exactly at most 1 when a scheduler is budgeted down to a single
     /// permit.
+    ///
+    /// During the align stage the unit is one frame's registration instead
+    /// of one fuse tile: each align worker tests this state before it
+    /// starts registering a frame, so at most one further registration per
+    /// align worker completes after the store.
     pub fn pause(&self) {
         let _ = self.state.compare_exchange(
             RUNNING,

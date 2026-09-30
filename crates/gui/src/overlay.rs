@@ -15,7 +15,6 @@ use focusforge_core::project::Plane;
 use focusforge_core::tile::Rect;
 
 use crate::entry::GuiProject;
-use crate::job;
 
 /// The four ways a stack can fail to become an open project. Each carries
 /// its own fixed headline, tone and action -- a fixed copy, not derived
@@ -58,10 +57,9 @@ impl FailureKind {
     }
 }
 
-/// One card standing for a stack that did not become an open project.
+/// One `Not a project` card: a path with no open project behind it at all.
 /// `path` is what a later successful open of the same path clears the card
-/// by; `request` is `Some` for the two kinds a job produced, so `Run again`
-/// replays that one card's own work rather than the most recent job.
+/// by.
 pub struct FailureCard {
     pub kind: FailureKind,
     pub path: PathBuf,
@@ -69,8 +67,6 @@ pub struct FailureCard {
     pub stage: String,
     pub reason: String,
     pub meta: String,
-    pub frames: usize,
-    pub request: Option<job::JobRequest>,
 }
 
 /// The plain-Rust mirror of `FFProjectCard`'s own properties, positioned on
@@ -79,6 +75,9 @@ pub struct FailureCard {
 pub struct CardView {
     /// "open" | "failed" | "cancelled" | "sources-missing" | "not-a-project".
     pub kind: String,
+    /// Has an open project behind it -- true for every tab's own card, false
+    /// for a `state.failures` entry with no open project.
+    pub opened: bool,
     pub current: bool,
     pub unsaved: bool,
     pub fusing: bool,

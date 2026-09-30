@@ -38,6 +38,58 @@ pub use focusforge_core::project::Op;
 pub use focusforge_core::retouch::{EditSession, footprint};
 pub use focusforge_core::zmap::{NO_SOURCE, source_color};
 
+/// Which operation a failure belongs to, classified from the typed
+/// [`PipelineError`] variant rather than from [`JobStage`] or the message
+/// text: the control still reads [`JobStage::Align`] well past the align
+/// stage itself (crop, staging, the resume ledger and fusion-consumer
+/// creation all run under it too), and a raw error string is never parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedOperation {
+    /// The frames could not be opened, or the run's settings were rejected,
+    /// before any align or fuse work started.
+    Setup,
+    Alignment,
+    Fusion,
+    Save,
+}
+
+impl FailedOperation {
+    /// The failure toast's own short summary -- never the full error text.
+    pub fn summary(self) -> &'static str {
+        match self {
+            FailedOperation::Setup => "Setup failed",
+            FailedOperation::Alignment => "Alignment failed",
+            FailedOperation::Fusion => "Fusion failed",
+            FailedOperation::Save => "Save failed",
+        }
+    }
+}
+
+impl From<&PipelineError> for FailedOperation {
+    fn from(err: &PipelineError) -> Self {
+        match err {
+            PipelineError::Input(_) | PipelineError::Params(_) => FailedOperation::Setup,
+            PipelineError::Align(_) => FailedOperation::Alignment,
+            _ => FailedOperation::Fusion,
+        }
+    }
+}
+
+/// One failure's durable record: the complete text a toast never shows in
+/// full, plus the context to identify which project and (for a save) which
+/// target it belongs to. Appended, never edited or removed, so a later
+/// failure, a retry or a tab switch never drops what an earlier one
+/// recorded.
+#[derive(Debug, Clone)]
+pub struct Notification {
+    pub operation: FailedOperation,
+    pub message: String,
+    pub project_title: Option<String>,
+    pub project_path: Option<PathBuf>,
+    /// The save target, `None` for a run failure.
+    pub target: Option<PathBuf>,
+}
+
 /// The shell's own view of a fuse run -- the surface's six reachable
 /// states.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -75,7 +127,10 @@ pub struct JobRequest {
     pub align_values: ParamValues,
     pub align_lax: bool,
     pub crop: bool,
-    pub backend: Option<&'static dyn TileBackend>,
+    /// Whether this run may use the headless GPU backend at all -- resolved
+    /// against the real device only inside [`spawn`], on the worker thread,
+    /// never here.
+    pub gpu: bool,
 }
 
 /// How often the pipeline's poll thread ticks progress -- the window's
@@ -121,9 +176,40 @@ pub fn resolve_request(request: &JobRequest) -> Result<Algorithms, String> {
     })
 }
 
+/// Resolves whether a run of `fuse_id` may use the headless GPU backend, and
+/// a one-line account of the choice either way. `gpu = false` reports the
+/// policy without probing an adapter; a device already lost earlier this
+/// session falls back to the host rather than reusing it.
+pub fn resolve_backend(fuse_id: &str, gpu: bool) -> (Option<&'static dyn TileBackend>, String) {
+    if !gpu {
+        return (
+            None,
+            "fusion backend: cpu — GPU processing is off".to_string(),
+        );
+    }
+    let (backend, message) = focusforge_gpu::harness::backend_for(fuse_id, false, None);
+    match backend {
+        Some(backend) if backend.device_lost() => (
+            None,
+            "fusion backend: cpu — the GPU device was lost earlier in this session".to_string(),
+        ),
+        Some(backend) => (
+            Some(backend as &'static dyn TileBackend),
+            format!("fusion backend: gpu — {message}"),
+        ),
+        None if message.is_empty() => (
+            None,
+            format!("fusion backend: cpu — {fuse_id} has no GPU implementation"),
+        ),
+        None => (None, format!("fusion backend: cpu — {message}")),
+    }
+}
+
 /// Moves `request` onto a worker thread and runs it to completion through
 /// `focusforge_core::pipeline::run` with `algorithms` (from
-/// [`resolve_request`]), reporting through `observer`. Returns the join
+/// [`resolve_request`]), reporting through `observer`. Resolves the
+/// processing backend first thing on this thread ([`resolve_backend`]), so
+/// the first adapter probe never runs on the UI thread. Returns the join
 /// handle; the caller is expected to read progress through `observer` rather
 /// than by joining eagerly.
 pub fn spawn(
@@ -133,6 +219,9 @@ pub fn spawn(
     observer: Arc<GuiObserver>,
 ) -> std::thread::JoinHandle<Result<FuseOutcome, PipelineError>> {
     std::thread::spawn(move || {
+        let (backend, backend_line) = resolve_backend(&request.fuse_id, request.gpu);
+        tracing::info!("{backend_line}");
+        observer.set_backend_line(backend_line);
         let align = algorithms.align.map(|algorithm| AlignRequest {
             algorithm,
             explicit: request.align_values,
@@ -149,7 +238,7 @@ pub fn spawn(
             crop: request.crop,
             tile_size: None,
             max_host_memory: None,
-            backend: request.backend,
+            backend,
             resume: false,
             cache: true,
             poll: POLL,
@@ -166,6 +255,9 @@ pub struct GuiObserver {
     last_progress: Mutex<Option<JobProgress>>,
     pause_gate: Mutex<bool>,
     condvar: Condvar,
+    /// [`resolve_backend`]'s own account of this run's processing backend,
+    /// set once from the worker thread before the pipeline starts.
+    backend_line: Mutex<Option<String>>,
 }
 
 impl GuiObserver {
@@ -174,6 +266,7 @@ impl GuiObserver {
             last_progress: Mutex::new(None),
             pause_gate: Mutex::new(false),
             condvar: Condvar::new(),
+            backend_line: Mutex::new(None),
         }
     }
 
@@ -184,6 +277,22 @@ impl GuiObserver {
             .last_progress
             .lock()
             .expect("no thread panicked while holding the progress lock")
+    }
+
+    /// [`resolve_backend`]'s line for this run, once [`spawn`] has resolved
+    /// it -- `None` before that point.
+    pub fn backend_line(&self) -> Option<String> {
+        self.backend_line
+            .lock()
+            .expect("no thread panicked while holding the backend-line lock")
+            .clone()
+    }
+
+    fn set_backend_line(&self, line: String) {
+        *self
+            .backend_line
+            .lock()
+            .expect("no thread panicked while holding the backend-line lock") = Some(line);
     }
 
     /// Wakes a parked [`StageObserver::paused`] call -- what the toolbar's
@@ -226,7 +335,11 @@ impl StageObserver for GuiObserver {
                 .wait_timeout(gate, POLL)
                 .expect("no thread panicked while holding the pause gate");
             gate = guard;
-            if timeout.timed_out() && control.state() == ControlState::CancelRequested {
+            if timeout.timed_out() && control.state() != ControlState::PauseRequested {
+                // A resume can clear the control and set the gate between
+                // the driver's state read and this call's own gate reset
+                // above -- a lost wake-up, caught within one more `POLL`
+                // rather than parking on a gate nothing will ever set.
                 return;
             }
         }
@@ -567,10 +680,12 @@ pub fn save_held(
 /// One completed worker thread's result, boiled down to the shell's next
 /// [`RunState`] and, on a genuine completion, the checkpoint the run holds
 /// and the names of the frames its alignment could not register.
+/// `operation` is `Some` exactly when `state` is [`RunState::Failed`].
 pub struct Settled {
     pub state: RunState,
     pub held: Option<HeldCheckpoint>,
     pub diverged: Vec<String>,
+    pub operation: Option<FailedOperation>,
 }
 
 /// The divergence dialog's body, naming the frames alignment could not
@@ -618,22 +733,29 @@ pub fn settle(result: std::thread::Result<Result<FuseOutcome, PipelineError>>) -
                 },
                 held: Some(held),
                 diverged,
+                operation: None,
             }
         }
         Ok(Ok(FuseOutcome::Cancelled { .. })) => Settled {
             state: RunState::Idle,
             held: None,
             diverged: Vec::new(),
+            operation: None,
         },
-        Ok(Err(err)) => Settled {
-            state: RunState::Failed(err.to_string()),
-            held: None,
-            diverged: Vec::new(),
-        },
+        Ok(Err(err)) => {
+            let operation = FailedOperation::from(&err);
+            Settled {
+                state: RunState::Failed(err.to_string()),
+                held: None,
+                diverged: Vec::new(),
+                operation: Some(operation),
+            }
+        }
         Err(_) => Settled {
             state: RunState::Failed("the fuse worker stopped unexpectedly".to_string()),
             held: None,
             diverged: Vec::new(),
+            operation: Some(FailedOperation::Fusion),
         },
     }
 }

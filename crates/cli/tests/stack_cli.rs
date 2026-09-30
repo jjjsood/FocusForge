@@ -1185,6 +1185,102 @@ fn refuses_a_non_uniform_frame_set() {
     assert!(!output.exists());
 }
 
+/// `reference.tif` (RowsPerStrip=1, II) and `reference-MM-rps8.tif`
+/// (RowsPerStrip=8, MM) are pixel-identical; `stack` accepts the mixed set
+/// and its composite matches two copies of `reference.tif` alone. Neither
+/// fixture carries capture-time metadata, so both land in one group.
+#[test]
+fn mixed_byte_order_and_rows_per_strip() {
+    let mantis_64 = common::fixtures_dir().join("mantis-64");
+    let cwd = tmp_dir("mixed_byte_order_and_rows_per_strip");
+
+    let mixed_dir = cwd.join("mixed");
+    std::fs::create_dir_all(&mixed_dir).unwrap();
+    std::fs::copy(
+        mantis_64.join("reference.tif"),
+        mixed_dir.join("reference.tif"),
+    )
+    .unwrap();
+    std::fs::copy(
+        mantis_64.join("reference-MM-rps8.tif"),
+        mixed_dir.join("reference-MM-rps8.tif"),
+    )
+    .unwrap();
+
+    let baseline_dir = cwd.join("baseline");
+    std::fs::create_dir_all(&baseline_dir).unwrap();
+    std::fs::copy(
+        mantis_64.join("reference.tif"),
+        baseline_dir.join("reference-a.tif"),
+    )
+    .unwrap();
+    std::fs::copy(
+        mantis_64.join("reference.tif"),
+        baseline_dir.join("reference-b.tif"),
+    )
+    .unwrap();
+
+    let find_project = |dir: &Path| -> PathBuf {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "ffp"))
+            .expect("stack must write exactly one project")
+    };
+
+    let mixed_out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mixed_dir.to_str().unwrap(),
+            "-o",
+            mixed_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+        ],
+    );
+    assert!(
+        mixed_out.success,
+        "stdout: {} stderr: {}",
+        mixed_out.stdout, mixed_out.stderr
+    );
+
+    let baseline_out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            baseline_dir.to_str().unwrap(),
+            "-o",
+            baseline_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+        ],
+    );
+    assert!(
+        baseline_out.success,
+        "stdout: {} stderr: {}",
+        baseline_out.stdout, baseline_out.stderr
+    );
+
+    let mixed_project = find_project(&mixed_dir);
+    let baseline_project = find_project(&baseline_dir);
+    let (mixed_composite, _) = export_both(&cwd, &mixed_project);
+    let (baseline_composite, _) = export_both(&cwd, &baseline_project);
+    let (mixed_samples, mw, mh, mspp) = read_whole(&mixed_composite);
+    let (baseline_samples, bw, bh, bspp) = read_whole(&baseline_composite);
+
+    assert_eq!((mw, mh, mspp), (bw, bh, bspp));
+    assert_eq!(
+        mixed_samples, baseline_samples,
+        "mixed byte order/RowsPerStrip must not change the composite"
+    );
+}
+
 /// `stack` computes transforms and warps frame tiles through them before
 /// fusing: an aligned run must produce a different composite than the
 /// unaligned one. `--align-algo pyramidal-ecc --lax` is explicit because
