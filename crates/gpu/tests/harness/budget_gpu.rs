@@ -319,11 +319,10 @@ fn sample_allocator<T>(
 }
 
 /// One 512x512 warped tile fused from 8, 32 and 128 frames (frame `i` read as
-/// frame `i % 8`). The growth over baseline stays within the model, which
-/// takes no frame count, and differs by under 4 MiB over the three runs: the
-/// allocator takes one 1.57 MB step whose frame count varies between runs. A
-/// device that stopped freeing per-frame buffers would grow by a plane or
-/// more per frame, over 100 MiB across the 120 extra frames. Figures are
+/// frame `i % 8`) stays within the model, which takes no frame count; the
+/// three peaks differ by under 4 MiB (one 1.57 MB allocator step that lands at
+/// a different frame count per run). A device that kept per-frame buffers
+/// would grow over 100 MiB across the 120 extra frames. Figures are
 /// device-wide: run it alone (`--test-threads=1`).
 #[test]
 fn device_peak_is_flat_in_frame_count() {

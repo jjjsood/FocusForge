@@ -16,7 +16,7 @@
 //! promise that a dropped `wgpu::Buffer` is reclaimed before a later poll,
 //! yet on wgpu 29.0.4 the device peak of a tile measures flat in frame count
 //! (8, 32 and 128 frames), so [`device_bytes_per_tile`] takes no frame count
-//! and sits at about twice the measured peak. The flatness test in
+//! and sits at about 1.8 times the measured peak. The flatness test in
 //! `tests/harness/budget_gpu.rs` fails if a driver stops reclaiming.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
