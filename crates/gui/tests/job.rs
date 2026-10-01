@@ -679,7 +679,7 @@ fn keep_commits_a_parked_run_like_a_clean_one() {
         job::RunState::Fused { .. }
     ));
     assert!(controller.pending_divergence().is_none());
-    let held = controller.held_checkpoints().last().unwrap();
+    let held = controller.held_checkpoints().last().cloned().unwrap();
     assert_eq!(planes, (held.composite.clone(), held.zmap.clone()));
     assert_eq!(controller.materialize_active_tab_planes(), Some(planes));
 }

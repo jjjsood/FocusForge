@@ -35,7 +35,7 @@ pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 pub use focusforge_core::project::Op;
 pub use focusforge_core::project::{
-    FullMapCheckpoint, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef,
+    FullMapCheckpoint, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, now_unix,
 };
 pub use focusforge_core::retouch::{EditSession, footprint};
 pub use focusforge_core::zmap::{NO_SOURCE, source_color};
@@ -744,18 +744,7 @@ pub fn export_position(source: ExportSource, path: &Path) -> Result<(), ExportEr
                 NEXT_EXPORT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             let write = (|| -> Result<(), ExportError> {
-                let info = ZMapInfo::new(width, height, sources.len() as u32)?;
-                let mut writer = ZMapWriter::create(&temp, info)?;
-                writer.write_tile(
-                    Rect {
-                        x: 0,
-                        y: 0,
-                        width,
-                        height,
-                    },
-                    &indices,
-                )?;
-                writer.finish()?;
+                write_zmap(&temp, width, height, sources.len() as u32, &indices)?;
                 let zmap_source = project::ZmapSource {
                     sources,
                     registration,
@@ -769,6 +758,30 @@ pub fn export_position(source: ExportSource, path: &Path) -> Result<(), ExportEr
             write?;
         }
     }
+    Ok(())
+}
+
+/// Writes `indices`, a whole `width` x `height` map over `frame_count`
+/// sources, as the Z-Map file at `path`.
+pub fn write_zmap(
+    path: &Path,
+    width: u32,
+    height: u32,
+    frame_count: u32,
+    indices: &[u16],
+) -> Result<(), ZMapError> {
+    let info = ZMapInfo::new(width, height, frame_count)?;
+    let mut writer = ZMapWriter::create(path, info)?;
+    writer.write_tile(
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
+        indices,
+    )?;
+    writer.finish()?;
     Ok(())
 }
 
@@ -924,33 +937,19 @@ pub fn open_edit_session(
     })
 }
 
-/// Writes `held`, in order, as one checkpoint chain at `target` -- onto the
-/// project already there when `onto_existing` -- and opens the result. On
-/// failure `target` is left exactly as it was.
-pub fn save_held(
+/// Writes `entries`, each under its own parent, and applies `deletes` at
+/// `target` -- onto the project already there when `onto_existing` -- then
+/// opens the result. Returns it with the id written per entry (`None` for an
+/// entry under a deleted checkpoint). On failure `target` is left exactly as
+/// it was.
+pub fn save_in_memory(
     target: &Path,
-    held: &[HeldCheckpoint],
+    entries: &[InMemoryCheckpoint],
+    deletes: &[String],
     onto_existing: bool,
-) -> Result<Project, ProjectError> {
-    let head = if onto_existing {
-        Some(Project::open(target)?.checkpoint().id.clone())
-    } else {
-        None
-    };
-    let entries: Vec<InMemoryCheckpoint> = held
-        .iter()
-        .enumerate()
-        .map(|(i, checkpoint)| InMemoryCheckpoint {
-            kind: InMemoryKind::Fused(checkpoint.clone()),
-            parent: match (i, &head) {
-                (0, None) => None,
-                (0, Some(head)) => Some(ParentRef::Saved(head.clone())),
-                (i, _) => Some(ParentRef::Entry(i - 1)),
-            },
-        })
-        .collect();
-    project::seal_in_memory(target, &entries, &[], onto_existing)?;
-    Project::open(target)
+) -> Result<(Project, Vec<Option<String>>), ProjectError> {
+    let ids = project::seal_in_memory(target, entries, deletes, onto_existing)?;
+    Ok((Project::open(target)?, ids))
 }
 
 /// One completed worker thread's result, boiled down to the shell's next

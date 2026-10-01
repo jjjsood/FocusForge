@@ -2658,8 +2658,16 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             push_divergence(app, &controller);
         }
         ShellEvent::ImagesChanged => push_images_panel(app, &controller.lock().unwrap()),
-        ShellEvent::CheckpointsChanged => push_checkpoint_panel(app, &controller.lock().unwrap()),
-        ShellEvent::EditorChanged => push_editor_toolbar(app, &controller.lock().unwrap()),
+        ShellEvent::CheckpointsChanged => {
+            let controller = controller.lock().unwrap();
+            push_checkpoint_panel(app, &controller);
+            app.set_projects_save_enabled(controller.save_enabled());
+        }
+        ShellEvent::EditorChanged => {
+            let controller = controller.lock().unwrap();
+            push_editor_toolbar(app, &controller);
+            app.set_projects_save_enabled(controller.save_enabled());
+        }
         ShellEvent::OverlayChanged => {
             let controller = controller.lock().unwrap();
             push_projects_overlay(app, &controller);

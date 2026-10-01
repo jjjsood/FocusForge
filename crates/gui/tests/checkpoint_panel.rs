@@ -15,8 +15,8 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::{
-    HeldCheckpoint, Metrics, Op, Point, Project, ProjectError, SealRequest, ZMapStorage,
-    append_ops_at, append_ops_onto, render_checkpoint, seal_at,
+    HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point, Project, ProjectError,
+    SealRequest, ZMapStorage, append_ops_at, append_ops_onto, render_checkpoint, seal_at,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 use focusforge_gui::bridge::Canvas;
@@ -222,8 +222,8 @@ fn row_ids(model: &checkpoints::CheckpointsModel) -> Vec<String> {
         .collect()
 }
 
-fn held_at(created_at: i64) -> HeldCheckpoint {
-    HeldCheckpoint {
+fn held_at(created_at: i64) -> InMemoryCheckpoint {
+    let held = HeldCheckpoint {
         composite: PathBuf::from("composite.tif"),
         zmap: PathBuf::from("zmap.tif"),
         width: 4,
@@ -236,6 +236,10 @@ fn held_at(created_at: i64) -> HeldCheckpoint {
         composite_description: String::new(),
         metrics: Metrics::default(),
         created_at,
+    };
+    InMemoryCheckpoint {
+        kind: InMemoryKind::Fused(held),
+        parent: None,
     }
 }
 

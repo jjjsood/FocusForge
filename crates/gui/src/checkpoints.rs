@@ -8,7 +8,7 @@
 use chrono::{Local, NaiveDate, TimeZone};
 
 use focusforge_core::project::Checkpoint;
-pub use focusforge_core::project::HeldCheckpoint;
+pub use focusforge_core::project::{InMemoryCheckpoint, InMemoryKind, ParentRef};
 use focusforge_core::registry;
 
 /// A row's own height, top to top of the next row.
@@ -122,49 +122,81 @@ pub(crate) fn algorithm_label(id: &str) -> String {
 /// kinds uniformly.
 enum Row<'a> {
     Saved(&'a Checkpoint),
-    Held(usize, &'a HeldCheckpoint),
+    Held {
+        index: usize,
+        created_at: i64,
+        algorithm: String,
+    },
 }
 
 impl Row<'_> {
     fn created_at(&self) -> i64 {
         match self {
             Row::Saved(c) => c.created_at,
-            Row::Held(_, h) => h.created_at,
+            Row::Held { created_at, .. } => *created_at,
         }
     }
 
     fn id(&self) -> String {
         match self {
             Row::Saved(c) => c.id.clone(),
-            Row::Held(index, _) => held_key(*index),
+            Row::Held { index, .. } => held_key(*index),
         }
     }
 
     fn algorithm(&self) -> &str {
         match self {
             Row::Saved(c) => &c.algorithm,
-            Row::Held(_, h) => &h.algorithm,
+            Row::Held { algorithm, .. } => algorithm,
         }
     }
 }
 
+/// The algorithm `held[index]` carries once written: a fused or full-map
+/// entry's own, an op-bearing one's parent chain's (the checkpoint it is
+/// replayed onto). Empty when the chain does not resolve.
+fn held_algorithm(index: usize, held: &[InMemoryCheckpoint], saved: &[&Checkpoint]) -> String {
+    let Some(entry) = held.get(index) else {
+        return String::new();
+    };
+    match &entry.kind {
+        InMemoryKind::Fused(fused) => fused.algorithm.clone(),
+        InMemoryKind::FullMap(map) => map.algorithm.clone(),
+        InMemoryKind::Ops { .. } => match &entry.parent {
+            Some(ParentRef::Entry(parent)) if *parent < index => {
+                held_algorithm(*parent, held, saved)
+            }
+            Some(ParentRef::Saved(id)) => saved
+                .iter()
+                .find(|c| &c.id == id)
+                .map(|c| c.algorithm.clone())
+                .unwrap_or_default(),
+            _ => String::new(),
+        },
+    }
+}
+
 /// Builds the panel's flat entry list: `checkpoints` merged with `held`
-/// (fused since the last save, not yet in any `.ffp`), ordered by
+/// (in memory since the last save, not yet in any `.ffp`), ordered by
 /// `created_at` descending with a held row first on a tie. Day separators
 /// appear only when the merged list spans more than one local day, `today`
 /// being the caller's local date. `selected` matches a row's own id (a
 /// saved row's stored id, a held row's `"held:<index>"`).
 pub fn build_model(
     checkpoints: &[&Checkpoint],
-    held: &[HeldCheckpoint],
+    held: &[InMemoryCheckpoint],
     today: NaiveDate,
     selected: Option<&str>,
     scroll_y: f32,
 ) -> CheckpointsModel {
     let mut rows: Vec<Row> = checkpoints.iter().map(|c| Row::Saved(c)).collect();
-    rows.extend(held.iter().enumerate().map(|(i, h)| Row::Held(i, h)));
+    rows.extend(held.iter().enumerate().map(|(index, entry)| Row::Held {
+        index,
+        created_at: entry.created_at(),
+        algorithm: held_algorithm(index, held, checkpoints),
+    }));
     // A held row sorts before a saved one at the same `created_at`: `false <
-    // true`, so `Row::Held`'s `0` rank stays ahead of `Row::Saved`'s `1`.
+    // true`, so a held row's `0` rank stays ahead of `Row::Saved`'s `1`.
     rows.sort_by(|a, b| {
         b.created_at()
             .cmp(&a.created_at())
@@ -323,5 +355,73 @@ mod tests {
         let model = build_model(&[&b, &a], &[], today, Some("a"), 0.0);
         let selected: Vec<bool> = model.entries.iter().map(|e| e.selected).collect();
         assert_eq!(selected, vec![false, true]);
+    }
+
+    #[test]
+    fn an_in_memory_op_row_reads_as_its_written_checkpoint() {
+        use focusforge_core::project::{
+            ByteOrderTag, FullMapCheckpoint, FuseRecord, InMemoryCheckpoint, InMemoryKind, Metrics,
+            ParentRef, PlaneRef,
+        };
+        use std::path::PathBuf;
+        let noon = 1_756_468_800;
+        let mut saved = checkpoint("a", noon - 2 * 86_400);
+        saved.algorithm = "saved-algorithm".to_string();
+        let ops_at = noon - 60;
+        let map_at = noon;
+        let held = [
+            InMemoryCheckpoint {
+                kind: InMemoryKind::Ops {
+                    ops: Vec::new(),
+                    created_at: ops_at,
+                },
+                parent: Some(ParentRef::Saved("a".to_string())),
+            },
+            InMemoryCheckpoint {
+                kind: InMemoryKind::FullMap(FullMapCheckpoint {
+                    zmap: PathBuf::new(),
+                    algorithm: "its-own-algorithm".to_string(),
+                    params: Default::default(),
+                    fuse: FuseRecord {
+                        composite: PlaneRef {
+                            blob: String::new(),
+                            width: 1,
+                            height: 1,
+                            samples_per_pixel: 3,
+                            byte_order: ByteOrderTag::Little,
+                            description: String::new(),
+                            frame_count: 1,
+                        },
+                        align: None,
+                        registration: Default::default(),
+                        sources: Vec::new(),
+                        metrics: Metrics::default(),
+                    },
+                    sources: Vec::new(),
+                    created_at: map_at,
+                }),
+                parent: Some(ParentRef::Entry(0)),
+            },
+        ];
+        let today = local_datetime(noon).unwrap().date_naive();
+        let model = build_model(&[&saved], &held, today, None, 0.0);
+
+        let rows: Vec<&CheckpointEntry> = model
+            .entries
+            .iter()
+            .filter(|e| e.separator_label.is_none())
+            .collect();
+        let ids: Vec<&str> = rows.iter().filter_map(|e| e.id.as_deref()).collect();
+        assert_eq!(ids, ["held:1", "held:0", "a"], "newest first");
+        assert_eq!(rows[0].time_text, local_hhmmss(map_at));
+        assert_eq!(rows[1].time_text, local_hhmmss(ops_at));
+        assert_eq!(rows[0].algorithm, "its-own-algorithm");
+        assert_eq!(rows[1].algorithm, "saved-algorithm");
+        let labels: Vec<&str> = model
+            .entries
+            .iter()
+            .filter_map(|e| e.separator_label.as_deref())
+            .collect();
+        assert_eq!(labels.len(), 2, "today's rows, then the saved row's day");
     }
 }
