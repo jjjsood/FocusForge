@@ -8,6 +8,7 @@
 use chrono::{Local, NaiveDate, TimeZone};
 
 use focusforge_core::project::Checkpoint;
+use focusforge_core::project::Op;
 pub use focusforge_core::project::{InMemoryCheckpoint, InMemoryKind, ParentRef};
 use focusforge_core::registry;
 
@@ -46,6 +47,67 @@ pub(crate) fn held_key(index: usize) -> String {
 /// [`held_key`]'s index back; `None` for a saved checkpoint's id.
 pub(crate) fn held_index(key: &str) -> Option<usize> {
     key.strip_prefix("held:")?.parse().ok()
+}
+
+/// The ops of in-memory entry `index` and of the op-bearing entries it
+/// descends from, oldest first, up to the first fused entry or saved
+/// checkpoint. `None` when `index` is not an op-bearing entry or the chain
+/// runs through a full-map entry.
+pub(crate) fn stroke_chain(held: &[InMemoryCheckpoint], index: usize) -> Option<Vec<Op>> {
+    let mut levels = Vec::new();
+    let mut entry = held.get(index)?;
+    while let InMemoryKind::Ops { ops, .. } = &entry.kind {
+        levels.push(ops);
+        match &entry.parent {
+            Some(ParentRef::Entry(parent)) => entry = held.get(*parent)?,
+            _ => break,
+        }
+    }
+    if levels.is_empty() || matches!(entry.kind, InMemoryKind::FullMap(_)) {
+        return None;
+    }
+    Some(levels.into_iter().rev().flatten().cloned().collect())
+}
+
+/// Op kinds in the order a summary lists them; the last catches any op kind
+/// the list does not name.
+const OP_NAMES: [(&str, &str); 5] = [
+    ("brush stroke", "brush strokes"),
+    ("fill", "fills"),
+    ("region reset", "region resets"),
+    ("re-fuse", "re-fuses"),
+    ("other change", "other changes"),
+];
+
+/// The counted phrase a question about unsaved ops opens with, in digits and
+/// grouped by kind: "12 brush strokes and 2 fills".
+pub(crate) fn op_summary<'a>(ops: impl IntoIterator<Item = &'a Op>) -> String {
+    let mut counts = [0usize; OP_NAMES.len()];
+    for op in ops {
+        counts[match op {
+            Op::BrushStroke { .. } => 0,
+            Op::FloodFill { .. } => 1,
+            Op::ResetRegion { .. } => 2,
+            Op::Refuse { .. } => 3,
+            _ => 4,
+        }] += 1;
+    }
+    counted_phrase(counts)
+}
+
+/// `counts` per [`OP_NAMES`] kind as "A", "A and B" or "A, B and C".
+fn counted_phrase(counts: [usize; OP_NAMES.len()]) -> String {
+    let parts: Vec<String> = counts
+        .iter()
+        .zip(OP_NAMES)
+        .filter(|(count, _)| **count > 0)
+        .map(|(count, (one, many))| format!("{count} {}", if *count == 1 { one } else { many }))
+        .collect();
+    match parts.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
 }
 
 /// The checkpoint panel's whole state -- entries and the scroll offset
@@ -423,5 +485,174 @@ mod tests {
             .filter_map(|e| e.separator_label.as_deref())
             .collect();
         assert_eq!(labels.len(), 2, "today's rows, then the saved row's day");
+    }
+
+    fn stroke(x: i32) -> Op {
+        Op::BrushStroke {
+            source_id: 0,
+            path: vec![focusforge_core::project::Point { x, y: 0 }],
+            radius: 1.0,
+            softness: 0.0,
+        }
+    }
+
+    fn fill() -> Op {
+        Op::FloodFill {
+            seed: Default::default(),
+            source_id: 0,
+            tolerance: 0.0,
+        }
+    }
+
+    fn reset() -> Op {
+        Op::ResetRegion {
+            rect: focusforge_core::io::Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+        }
+    }
+
+    fn refuse() -> Op {
+        Op::Refuse {
+            algorithm: "a-stack-algorithm".to_string(),
+            params: Default::default(),
+        }
+    }
+
+    #[test]
+    fn an_op_summary_counts_in_digits_per_kind() {
+        assert_eq!(op_summary(&[stroke(0)]), "1 brush stroke");
+        assert_eq!(
+            op_summary(&[stroke(0), stroke(1), stroke(2)]),
+            "3 brush strokes"
+        );
+        assert_eq!(
+            op_summary(&[stroke(0), fill(), stroke(1)]),
+            "2 brush strokes and 1 fill",
+            "interleaved kinds still count per kind"
+        );
+        assert_eq!(
+            op_summary(&[reset(), stroke(0), refuse(), refuse()]),
+            "1 brush stroke, 1 region reset and 2 re-fuses"
+        );
+        assert_eq!(
+            op_summary(&[stroke(0), fill(), reset(), refuse()]),
+            "1 brush stroke, 1 fill, 1 region reset and 1 re-fuse"
+        );
+        assert_eq!(op_summary(&[]), "");
+    }
+
+    #[test]
+    fn an_op_kind_the_list_does_not_name_reads_as_other_changes() {
+        assert_eq!(counted_phrase([0, 0, 0, 0, 1]), "1 other change");
+        assert_eq!(
+            counted_phrase([2, 0, 0, 0, 3]),
+            "2 brush strokes and 3 other changes"
+        );
+    }
+
+    fn ops_entry(ops: Vec<Op>, parent: Option<ParentRef>) -> InMemoryCheckpoint {
+        InMemoryCheckpoint {
+            kind: InMemoryKind::Ops { ops, created_at: 0 },
+            parent,
+        }
+    }
+
+    fn fused_entry() -> InMemoryCheckpoint {
+        use focusforge_core::project::{HeldCheckpoint, Metrics};
+        use std::path::PathBuf;
+        InMemoryCheckpoint {
+            kind: InMemoryKind::Fused(HeldCheckpoint {
+                composite: PathBuf::new(),
+                zmap: PathBuf::new(),
+                width: 1,
+                height: 1,
+                sources: Vec::new(),
+                algorithm: "a-stack-algorithm".to_string(),
+                params: Default::default(),
+                align: None,
+                registration: Default::default(),
+                composite_description: String::new(),
+                metrics: Metrics::default(),
+                created_at: 0,
+            }),
+            parent: None,
+        }
+    }
+
+    fn full_map_entry(parent: Option<ParentRef>) -> InMemoryCheckpoint {
+        use focusforge_core::project::{
+            ByteOrderTag, FullMapCheckpoint, FuseRecord, Metrics, PlaneRef,
+        };
+        use std::path::PathBuf;
+        InMemoryCheckpoint {
+            kind: InMemoryKind::FullMap(FullMapCheckpoint {
+                zmap: PathBuf::new(),
+                algorithm: "a-stack-algorithm".to_string(),
+                params: Default::default(),
+                fuse: FuseRecord {
+                    composite: PlaneRef {
+                        blob: String::new(),
+                        width: 1,
+                        height: 1,
+                        samples_per_pixel: 3,
+                        byte_order: ByteOrderTag::Little,
+                        description: String::new(),
+                        frame_count: 1,
+                    },
+                    align: None,
+                    registration: Default::default(),
+                    sources: Vec::new(),
+                    metrics: Metrics::default(),
+                },
+                sources: Vec::new(),
+                created_at: 0,
+            }),
+            parent,
+        }
+    }
+
+    #[test]
+    fn a_stroke_chain_is_the_ops_down_to_the_base_oldest_first() {
+        let saved = Some(ParentRef::Saved("a".to_string()));
+        let held = [
+            fused_entry(),
+            ops_entry(vec![stroke(1)], Some(ParentRef::Entry(0))),
+            ops_entry(vec![stroke(2), fill()], Some(ParentRef::Entry(1))),
+            ops_entry(vec![stroke(3)], saved),
+        ];
+        assert_eq!(
+            stroke_chain(&held, 1),
+            Some(vec![stroke(1)]),
+            "over a fused entry"
+        );
+        assert_eq!(
+            stroke_chain(&held, 3),
+            Some(vec![stroke(3)]),
+            "over a saved id"
+        );
+        assert_eq!(
+            stroke_chain(&held, 2),
+            Some(vec![stroke(1), stroke(2), fill()]),
+            "two levels deep, oldest first"
+        );
+    }
+
+    #[test]
+    fn only_an_op_bearing_chain_of_entries_is_a_stroke_chain() {
+        let held = [
+            fused_entry(),
+            full_map_entry(Some(ParentRef::Entry(0))),
+            ops_entry(vec![stroke(1)], Some(ParentRef::Entry(1))),
+            ops_entry(vec![stroke(2)], Some(ParentRef::Entry(2))),
+        ];
+        assert_eq!(stroke_chain(&held, 0), None, "a fused entry");
+        assert_eq!(stroke_chain(&held, 1), None, "a full-map entry");
+        assert_eq!(stroke_chain(&held, 2), None, "through a full-map entry");
+        assert_eq!(stroke_chain(&held, 3), None, "two levels through it");
+        assert_eq!(stroke_chain(&held, 9), None, "no such entry");
     }
 }

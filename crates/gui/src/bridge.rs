@@ -532,6 +532,7 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     match controller
         .pending_close()
         .or_else(|| controller.pending_quit_copy())
+        .or_else(|| controller.pending_restore_copy())
     {
         Some(copy) => {
             app.set_close_guard_title(copy.title.into());
@@ -925,6 +926,7 @@ pub fn push_editor_toolbar(app: &AppWindow, controller: &AppController) {
     app.set_brush_picking(view.picking);
     app.set_can_undo(view.can_undo);
     app.set_can_redo(view.can_redo);
+    app.set_can_save_checkpoint(view.can_save_checkpoint);
 
     let overlay = controller.overlay_view();
     app.set_overlay_on(overlay.on);
@@ -1262,7 +1264,9 @@ pub fn install(
             let keep_shown = {
                 let mut controller = controller.lock().unwrap();
                 controller.window_close();
-                controller.pending_close().is_some() || controller.pending_quit_copy().is_some()
+                controller.pending_close().is_some()
+                    || controller.pending_quit_copy().is_some()
+                    || controller.pending_restore_copy().is_some()
             };
             if let Some(app) = app_weak.upgrade() {
                 repaint(&app, &controller, &canvas);
@@ -1378,6 +1382,16 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || dispatch(&controller, &canvas, &app_weak, AppController::undo)
+    });
+    app.on_save_checkpoint_requested({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.save_checkpoint();
+            });
+        }
     });
     app.on_redo_requested({
         let controller = controller.clone();

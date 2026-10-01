@@ -2625,6 +2625,22 @@ struct Sealed {
 
 impl Sealed {
     fn read(controller: &mut AppController, root: &Path) -> Self {
+        let registration = controller
+            .held_checkpoints()
+            .last()
+            .expect("a fused tab holds at least one checkpoint")
+            .registration
+            .clone();
+        Self::read_with(controller, root, registration)
+    }
+
+    /// [`Self::read`] for a tab whose checkpoints are saved, so the
+    /// registration of the row in view is given.
+    fn read_with(
+        controller: &mut AppController,
+        root: &Path,
+        registration: job::Registration,
+    ) -> Self {
         let map = map_rect(controller);
         let frame = Rect {
             x: 0,
@@ -2632,12 +2648,6 @@ impl Sealed {
             width: FRAME,
             height: FRAME,
         };
-        let registration = controller
-            .held_checkpoints()
-            .last()
-            .expect("a fused tab holds at least one checkpoint")
-            .registration
-            .clone();
         let (composite, zmap) = controller.materialize_active_tab_planes().unwrap();
         Sealed {
             map,
@@ -4765,4 +4775,57 @@ fn a_save_that_does_not_write_loses_nothing() {
 
     let path = save_to_proposed(&mut controller);
     assert_eq!(saved_ids(&path).len(), 2, "a retry writes the same history");
+}
+
+/// Editing from an older, non-head checkpoint recomposites through that
+/// checkpoint's own registration: the head here was fused without alignment
+/// or crop, the root with both.
+#[test]
+fn an_older_checkpoint_edits_through_its_own_registration() {
+    let name = "older_registration";
+    let mut controller = controller_with_scratch(name);
+    let frames = open_fused_tab(&mut controller, name, 3);
+    let path = save_to_proposed(&mut controller);
+    let mut controller = reopen(&path, "older_registration_reopened");
+    controller.set_align_algorithm("pyramidal-ecc");
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    // The real aligner cannot register these frames, so its result waits on
+    // the Keep/Discard question.
+    assert!(controller.pending_divergence().is_some());
+    controller.keep_fused().expect("the parked result is kept");
+    assert!(controller.save_active_project(|_| None));
+
+    let project = saved(&path);
+    let head = project.checkpoint().clone();
+    let root = head.parent.clone().expect("the second fuse is a child");
+    let root_registration = project.fuse_state(&root).unwrap().registration;
+    let head_registration = project.fuse_state(&head.id).unwrap().registration;
+    assert_ne!(
+        root_registration, head_registration,
+        "the two checkpoints are registered apart"
+    );
+
+    controller.set_resident_tile_size_for_test(16);
+    controller.set_pane_geometry(LEFT, RIGHT);
+    controller.select_checkpoint_row(row_index(&controller, &root));
+    controller.fit();
+    enter_editor(&mut controller);
+    assert_eq!(map_rect(&controller).width, MAP_WIDTH, "the root's own map");
+    controller.select_frame(1);
+    let view = controller.selected_frame_view().unwrap();
+    assert_eq!(view.origin, root_registration.origin());
+
+    let sealed = Sealed::read_with(&mut controller, &frames, root_registration);
+    set_size(&mut controller, 6.0);
+    drag(&mut controller, &[(10.0, 10.0), (30.0, 20.0)]);
+    assert_ne!(indices(&controller), sealed.indices, "the stroke painted");
+    sealed.assert_shown(&controller, "an older checkpoint's edit");
+
+    // The head's registration would have drawn something else.
+    let wrong = Sealed::read_with(&mut controller, &frames, head_registration);
+    assert!(
+        wrong.displayed(&controller) != wrong.expected(&indices(&controller)),
+        "the check can tell the two registrations apart"
+    );
 }

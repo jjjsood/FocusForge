@@ -285,6 +285,8 @@ pub struct BrushToolbarView {
     /// Whether the active tab's edit session has an op to undo/redo.
     pub can_undo: bool,
     pub can_redo: bool,
+    /// Whether the active tab's session holds ops: what `Save checkpoint` keeps.
+    pub can_save_checkpoint: bool,
 }
 
 /// The bottom bar's overlay controls -- [`AppController::overlay_view`]'s
@@ -794,6 +796,29 @@ impl ProjectTab {
         }
     }
 
+    /// The key the selected row's planes are rendered and cached under: an
+    /// op-bearing in-memory row shows its nearest saved ancestor's planes,
+    /// every other row its own.
+    fn plane_key(&self) -> Option<String> {
+        let key = self.selected_checkpoint.as_deref()?;
+        let on_entry = checkpoints::held_index(key)
+            .and_then(|index| self.held.get(index))
+            .is_some_and(|entry| fused_of(entry).is_none());
+        match self.resolve_row(key) {
+            Some(RowBase::Saved(id)) if on_entry => Some(id),
+            _ => Some(key.to_string()),
+        }
+    }
+
+    /// Whether the selected row is an in-memory entry holding ops.
+    fn on_ops_row(&self) -> bool {
+        self.selected_checkpoint
+            .as_deref()
+            .and_then(checkpoints::held_index)
+            .and_then(|index| self.held.get(index))
+            .is_some_and(|entry| matches!(entry.kind, job::InMemoryKind::Ops { .. }))
+    }
+
     /// Whether the edit session holds ops its origin does not.
     fn live_modified(&self) -> bool {
         self.edit
@@ -1003,6 +1028,10 @@ struct ShellState {
     /// checkpoints no `.ffp` contains. Mutually exclusive with
     /// `pending_close`: each is a no-op while the other question is open.
     pending_quit: bool,
+    /// The tab, by id, and the row key a click on a checkpoint waits to
+    /// restore while the "save this state first?" answer is open -- raised
+    /// only when that tab's live holds ops.
+    pending_restore: Option<(u64, String)>,
     /// Every `Not a project` card -- a path with no open project behind it
     /// at all, cleared the moment that same path opens successfully. A
     /// failed, cancelled or sources-missing run instead lives on its own
@@ -1446,7 +1475,7 @@ impl AppController {
         let tile_size = self
             .resident_tile_size_for_test
             .unwrap_or(job::RESIDENT_TILE_SIZE);
-        let Ok(edit) =
+        let Ok(mut edit) =
             job::open_edit_session(&zmap, &frames, registration, tile_size, job::host_budget())
         else {
             return false;
@@ -1454,6 +1483,28 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return false;
         };
+        if let Some(chain) = tab
+            .selected_checkpoint
+            .as_deref()
+            .and_then(checkpoints::held_index)
+            .and_then(|index| checkpoints::stroke_chain(&tab.held, index))
+        {
+            for op in chain {
+                match edit.session.append(op) {
+                    Ok(Some(region)) => {
+                        if let Err(err) = edit.recomposite(region) {
+                            tracing::error!(error = %err, "restored stroke recomposite failed");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::error!(error = %err, "restored stroke could not be applied");
+                        break;
+                    }
+                }
+            }
+            edit.session.rebase();
+        }
         tab.edit = Some(edit);
         true
     }
@@ -1597,13 +1648,16 @@ impl AppController {
         checkpoints::build_model(&saved, &tab.held, today, selected, scroll_y)
     }
 
-    /// Makes flat entry `index` of [`Self::checkpoints_panel`] the current
-    /// row and marks the canvas for its planes, which the next
-    /// [`Self::canvas_feed`] loads -- at once for a fused or held row, via a
-    /// background render for an op-bearing one. A no-op on a day separator,
-    /// past the list's end, with no tab active, on the current row unless it
-    /// was refused, and in editor mode while the session holds edits.
+    /// Restores flat entry `index` of [`Self::checkpoints_panel`]: it becomes
+    /// the current row and live a copy of it. While live holds ops the restore
+    /// waits on [`Self::pending_restore_copy`]'s answer, the current row
+    /// included. A no-op on a separator, a full-map in-memory row, past the
+    /// end, while a dialog is open, and on the current row when live has no
+    /// ops (unless its planes were refused).
     pub fn select_checkpoint_row(&mut self, index: usize) {
+        if self.modal_open() {
+            return;
+        }
         let Some(id) = self
             .checkpoints_panel()
             .entries
@@ -1612,13 +1666,20 @@ impl AppController {
         else {
             return;
         };
-        let editing = self.state.mode == ShellMode::Editor;
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        if checkpoints::held_index(&id)
-            .is_some_and(|index| tab.held.get(index).and_then(fused_of).is_none())
-        {
+        if checkpoints::held_index(&id).is_some_and(|index| {
+            !matches!(
+                tab.held.get(index).map(|entry| &entry.kind),
+                Some(job::InMemoryKind::Fused(_) | job::InMemoryKind::Ops { .. })
+            )
+        }) {
+            return;
+        }
+        if tab.live_modified() {
+            self.state.pending_restore = Some((tab.id, id));
+            self.emit(ShellEvent::ProjectsChanged);
             return;
         }
         if tab.selected_checkpoint.as_deref() == Some(id.as_str())
@@ -1626,22 +1687,32 @@ impl AppController {
         {
             return;
         }
-        if editing
-            && tab
-                .edit
-                .as_ref()
-                .is_some_and(|edit| edit.session.op_count() > 0)
-        {
+        self.restore_row(id);
+    }
+
+    /// Makes row `key` of the active tab the current row, drops its session
+    /// and, in editor mode or on an op-bearing row, opens it over the row's
+    /// planes. The planes already known are kept when the row is unchanged.
+    fn restore_row(&mut self, key: String) {
+        let editing = self.state.mode == ShellMode::Editor;
+        let Some(tab) = self.state.active_mut() else {
             return;
+        };
+        let unchanged = tab.selected_checkpoint.as_deref() == Some(key.as_str());
+        let dropped_session = tab.edit.take().is_some();
+        tab.selected_checkpoint = Some(key);
+        let on_ops_row = tab.on_ops_row();
+        if !unchanged || matches!(tab.row_planes, Some(RowPlanes::Refused(_))) {
+            tab.row_planes = None;
         }
-        tab.selected_checkpoint = Some(id);
-        tab.row_planes = None;
-        tab.edit = None;
         self.state.canvas_dirty = true;
-        if editing {
+        if editing || on_ops_row {
             self.ensure_edit_session();
         }
         self.emit(ShellEvent::CheckpointsChanged);
+        if dropped_session {
+            self.emit(ShellEvent::EditorChanged);
+        }
     }
 
     /// Picks up a settled background checkpoint render: the current row's
@@ -1663,7 +1734,7 @@ impl AppController {
             return true;
         };
         if let Some(tab) = self.state.projects.iter_mut().find(|tab| tab.id == tab_id)
-            && tab.selected_checkpoint.as_deref() == Some(key.as_str())
+            && tab.plane_key().as_deref() == Some(key.as_str())
             && matches!(tab.row_planes, Some(RowPlanes::Pending))
         {
             tab.row_planes = Some(match outcome {
@@ -1672,7 +1743,8 @@ impl AppController {
             });
         }
         self.state.canvas_dirty = true;
-        if self.state.mode == ShellMode::Editor {
+        let on_ops_row = self.state.active().is_some_and(ProjectTab::on_ops_row);
+        if self.state.mode == ShellMode::Editor || on_ops_row {
             self.ensure_edit_session();
         }
         true
@@ -1724,9 +1796,9 @@ impl AppController {
 
     /// Quits the window: with no tab holding a checkpoint or a parked run,
     /// closes it at once. Otherwise raises [`Self::pending_quit_copy`] and
-    /// touches no tab. A no-op while a close question is open.
+    /// touches no tab. A no-op while a close or restore question is open.
     pub fn window_close(&mut self) {
-        if self.state.pending_close.is_some() {
+        if self.state.pending_close.is_some() || self.state.pending_restore.is_some() {
             return;
         }
         if !self.state.projects.iter().any(ProjectTab::quit_loses_work) {
@@ -2179,6 +2251,7 @@ impl AppController {
             picking: self.state.brush.picking,
             can_undo: self.edit_session().is_some_and(job::EditSession::can_undo),
             can_redo: self.edit_session().is_some_and(job::EditSession::can_redo),
+            can_save_checkpoint: self.edit_session().is_some_and(|s| s.op_count() > 0),
         }
     }
 
@@ -2842,14 +2915,15 @@ impl AppController {
         false
     }
 
-    /// Whether one of the six dialogs that block the chrome accelerators is
-    /// open: Settings, the close/quit guard, the frame-set warning, the
-    /// Keep/Discard divergence dialog, the grouping question or the refusal
-    /// dialog.
+    /// Whether one of the seven dialogs that block the chrome accelerators is
+    /// open: Settings, the close/quit guard, the restore question, the
+    /// frame-set warning, the Keep/Discard divergence dialog, the grouping
+    /// question or the refusal dialog.
     pub fn modal_open(&self) -> bool {
         self.state.settings_open
             || self.state.pending_close.is_some()
             || self.state.pending_quit
+            || self.state.pending_restore.is_some()
             || self.state.pending_frame_change.is_some()
             || self.pending_divergence().is_some()
             || self.state.pending.is_some()
@@ -3343,9 +3417,9 @@ impl AppController {
     /// Asks to close tab `index` as of `now`: a tab holding checkpoints no
     /// `.ffp` contains raises [`Self::pending_close`] and stays open; any
     /// other tab closes at once. A no-op out of range, inside
-    /// [`Self::CLOSE_DEBOUNCE`], or while a quit question is open.
+    /// [`Self::CLOSE_DEBOUNCE`], or while a quit or restore question is open.
     pub fn request_close_at(&mut self, index: usize, now: Instant) {
-        if self.state.pending_quit {
+        if self.state.pending_quit || self.state.pending_restore.is_some() {
             return;
         }
         let Some(tab) = self.state.projects.get(index) else {
@@ -3375,6 +3449,14 @@ impl AppController {
         let closed = self.state.projects.remove(index);
         if self.state.pending_close == Some(closed.id) {
             self.state.pending_close = None;
+        }
+        if self
+            .state
+            .pending_restore
+            .as_ref()
+            .is_some_and(|(id, _)| *id == closed.id)
+        {
+            self.state.pending_restore = None;
         }
         if let GuiProject::Opened(project) = &closed.project {
             let _ =
@@ -4752,6 +4834,50 @@ impl AppController {
         })
     }
 
+    /// The restore question still open, if any: the ops it would drop, the
+    /// row it would restore and what each answer does.
+    pub fn pending_restore_copy(&self) -> Option<CloseGuardCopy> {
+        let (id, key) = self.state.pending_restore.as_ref()?;
+        let tab = self.state.active().filter(|tab| tab.id == *id)?;
+        let ops: Vec<&job::Op> = tab.edit.as_ref()?.session.ops().collect();
+        let panel = self.checkpoints_panel();
+        let target = panel
+            .entries
+            .iter()
+            .find(|entry| entry.id.as_deref() == Some(key.as_str()))?;
+        let (happened, belongs, them) = if ops.len() == 1 {
+            ("has", "It belongs", "it")
+        } else {
+            ("have", "They belong", "them")
+        };
+        Some(CloseGuardCopy {
+            title: "Save this state first?".to_string(),
+            context: format!("Restoring {} · {}", target.algorithm, target.time_text),
+            body: format!(
+                "{} {happened} happened since the last checkpoint. {belongs} to no saved \
+                 state.\n\nSave {them} as a checkpoint first, then restore — or restore \
+                 and discard your changes, which loses {them}.",
+                checkpoints::op_summary(ops)
+            ),
+            info: "A saved state lands at the top of the list, like any other.".to_string(),
+            secondary_label: "Save first, then restore".to_string(),
+            confirm_label: "Discard and restore".to_string(),
+        })
+    }
+
+    /// Clears the restore question, returning the index of its tab -- `None`
+    /// when that tab is no longer the active one, so no answer restores
+    /// anything -- and its row key.
+    fn take_pending_restore(&mut self) -> Option<(Option<usize>, String)> {
+        let (id, key) = self.state.pending_restore.take()?;
+        self.emit(ShellEvent::ProjectsChanged);
+        let index = self
+            .state
+            .active
+            .filter(|&i| self.state.projects.get(i).is_some_and(|tab| tab.id == id));
+        Some((index, key))
+    }
+
     /// The pending close's tab index, clearing the question either way.
     fn take_pending_close(&mut self) -> Option<usize> {
         let id = self.state.pending_close.take()?;
@@ -4861,7 +4987,9 @@ impl AppController {
     /// question if one is pending, otherwise a quit question. A no-op with
     /// neither open.
     pub fn close_guard_cancelled(&mut self) {
-        if self.state.pending_close.is_some() {
+        if self.state.pending_restore.is_some() {
+            self.take_pending_restore();
+        } else if self.state.pending_close.is_some() {
             self.cancel_close();
         } else if self.state.pending_quit {
             self.cancel_quit();
@@ -4875,7 +5003,14 @@ impl AppController {
         &mut self,
         pick: impl Fn(&Path) -> Option<PathBuf>,
     ) -> bool {
-        if self.state.pending_close.is_some() {
+        if let Some((tab, key)) = self.take_pending_restore() {
+            if let Some(index) = tab
+                && self.snapshot_live(index)
+            {
+                self.restore_row(key);
+            }
+            false
+        } else if self.state.pending_close.is_some() {
             self.save_and_close(pick)
         } else if self.state.pending_quit {
             self.save_all_and_quit(pick)
@@ -4889,7 +5024,11 @@ impl AppController {
     /// [`Self::quit_without_saving`] for a quit question. A no-op with
     /// neither open.
     pub fn close_guard_confirmed(&mut self) {
-        if self.state.pending_close.is_some() {
+        if let Some((tab, key)) = self.take_pending_restore() {
+            if tab.is_some() {
+                self.restore_row(key);
+            }
+        } else if self.state.pending_close.is_some() {
             self.close_without_saving();
         } else if self.state.pending_quit {
             self.quit_without_saving();
@@ -5761,7 +5900,7 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return TabPlanes::None;
         };
-        let Some(key) = tab.selected_checkpoint.clone() else {
+        let Some(mut key) = tab.selected_checkpoint.clone() else {
             return TabPlanes::None;
         };
         if let Some(index) = checkpoints::held_index(&key) {
@@ -5776,27 +5915,19 @@ impl AppController {
             if let Some(RowPlanes::Ready(composite, zmap)) = &tab.row_planes {
                 return TabPlanes::Ready(composite.clone(), zmap.clone());
             }
-            return match tab.resolve_row(&key) {
-                Some(RowBase::Held(base)) => tab
-                    .held
-                    .get(base)
-                    .and_then(fused_of)
-                    .map_or(TabPlanes::None, |held| {
-                        TabPlanes::Ready(held.composite.clone(), held.zmap.clone())
-                    }),
-                Some(RowBase::Saved(id)) => match &mut tab.project {
-                    GuiProject::Opened(project) => {
-                        match job::fused_checkpoint_planes(project, &scratch_root, &id) {
-                            Ok(job::CheckpointPlanes::Ready(composite, zmap)) => {
-                                TabPlanes::Ready(composite, zmap)
-                            }
-                            _ => TabPlanes::None,
-                        }
-                    }
-                    GuiProject::Unsaved(_) => TabPlanes::None,
-                },
-                None => TabPlanes::None,
-            };
+            match tab.resolve_row(&key) {
+                Some(RowBase::Held(base)) => {
+                    return tab
+                        .held
+                        .get(base)
+                        .and_then(fused_of)
+                        .map_or(TabPlanes::None, |held| {
+                            TabPlanes::Ready(held.composite.clone(), held.zmap.clone())
+                        });
+                }
+                Some(RowBase::Saved(id)) => key = id,
+                None => return TabPlanes::None,
+            }
         }
         match &tab.row_planes {
             Some(RowPlanes::Ready(composite, zmap)) => {
@@ -5997,6 +6128,12 @@ impl AppController {
         tab.pending_deletes.push(id.to_string());
         self.emit(ShellEvent::CheckpointsChanged);
         true
+    }
+
+    /// [`Self::snapshot_live`] on the active tab; `false` with none active.
+    pub fn save_checkpoint(&mut self) -> bool {
+        self.active_project()
+            .is_some_and(|index| self.snapshot_live(index))
     }
 
     /// [`Self::save_project_at`] on the active tab; `false` with none active.

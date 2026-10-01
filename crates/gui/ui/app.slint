@@ -48,6 +48,7 @@ export component AppWindow inherits Window {
     callback pipette-toggled();
     callback undo-requested();
     callback redo-requested();
+    callback save-checkpoint-requested();
 
     // Every piece of state the shell shows is an `in` property set from
     // Rust, never computed here.
@@ -71,6 +72,7 @@ export component AppWindow inherits Window {
     in property <bool> brush-picking: false;
     in property <bool> can-undo: false;
     in property <bool> can-redo: false;
+    in property <bool> can-save-checkpoint: false;
     // The brush cursor's own `Path` geometry, pushed alongside the toolbar
     // state above on every repaint (it also depends on the viewport's
     // current zoom, which the toolbar state does not).
@@ -198,12 +200,14 @@ export component AppWindow inherits Window {
         picking: root.brush-picking;
         can-undo: root.can-undo;
         can-redo: root.can-redo;
+        can-save-checkpoint: root.can-save-checkpoint;
 
         brush-size-fraction-changed(f) => { root.brush-size-fraction-changed(f); }
         brush-softness-fraction-changed(f) => { root.brush-softness-fraction-changed(f); }
         pipette-toggled => { root.pipette-toggled(); }
         undo-requested => { root.undo-requested(); }
         redo-requested => { root.redo-requested(); }
+        save-checkpoint-requested => { root.save-checkpoint-requested(); }
     }
 
     // Both images are `in` properties set from Rust
