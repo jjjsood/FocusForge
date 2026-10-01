@@ -44,7 +44,7 @@ use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, 
 use crate::registry::AlignRegistration;
 use crate::tile::plan::{DEFAULT_TILE_SIZE, MAX_LEVELS};
 use crate::tile::{Rect, Tile};
-use crate::timing::{TimingCounter, measurement_scope, record_timing};
+use crate::timing::{TimingCounter, measurement_scope, record_level_iterations, record_timing};
 
 /// Solver-robustness threshold, not a user setting -- the same class as
 /// `crate::align`'s own `PIVOT_EPS` and `CORRELATION_SLACK`. `0.75` keeps
@@ -492,6 +492,7 @@ impl PyramidalEcc {
                 }
                 None => solve_prepared(template, level_frame, &seed, &params, None),
             };
+            record_level_iterations(k, result.iterations);
             total_iterations += result.iterations;
             final_residual = result.correlation;
 

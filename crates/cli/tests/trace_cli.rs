@@ -33,12 +33,16 @@ fn thread_ids_named(events: &[Value], prefix: &str) -> Vec<u64> {
         .collect()
 }
 
-fn timing_value(event: &Value) -> Option<u64> {
-    event["args"]["value"].as_u64().or_else(|| {
-        event["args"]["value"]
+fn timing_value_of(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
             .as_str()
             .and_then(|value| value.trim_matches('"').parse().ok())
     })
+}
+
+fn timing_value(event: &Value) -> Option<u64> {
+    timing_value_of(&event["args"]["value"])
 }
 
 fn timing_counter_total(events: &[Value], counter: &str) -> u64 {
@@ -360,6 +364,93 @@ fn chrome_trace_nesting() {
         "at least four tile spans on a named pool thread, got {on_pool} of {} across {pool:?}",
         tiles.len()
     );
+}
+
+/// A traced `align --json` records, per frame, one iteration count per
+/// pyramid level, and the counts add up to the frame's reported total.
+#[test]
+fn level_iterations() {
+    const DEPTH: usize = 2;
+    let dir = common::tmp_dir("trace_levels");
+    let trace_path = dir.join("trace.json");
+    let fixture = common::fixtures_dir().join("mantis-64");
+    let fixture = fixture.to_string_lossy().into_owned();
+
+    let args = common::push_no_gpu(vec![
+        "align",
+        &fixture,
+        "--algo",
+        "pyramidal-ecc",
+        "--set",
+        "pyramid-depth=2",
+        "--lax",
+        "--quiet",
+        "--json",
+    ]);
+    let output = common::cli_bin("trace_levels")
+        .args(&args)
+        .env("FOCUSFORGE_TRACE_FILE", &trace_path)
+        .output()
+        .expect("failed to run focusforge-cli");
+    assert!(
+        output.status.success(),
+        "the run must succeed, got {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("align --json prints one document");
+    let events: Vec<Value> = serde_json::from_slice(
+        &std::fs::read(&trace_path).unwrap_or_else(|e| panic!("no trace: {e}")),
+    )
+    .expect("the trace is one closed JSON array");
+
+    // Each level record sits inside its frame's span on one thread.
+    let mut current: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut per_frame: std::collections::BTreeMap<u64, Vec<u64>> = Default::default();
+    for event in &events {
+        let tid = event["tid"].as_u64().expect("every entry names a tid");
+        match (event["ph"].as_str(), event["name"].as_str()) {
+            (Some("B"), Some("frame")) => {
+                let index = timing_value_of(&event["args"]["index"]).expect("frame index");
+                current.insert(tid, index);
+            }
+            (Some("E"), Some("frame")) => {
+                current.remove(&tid);
+            }
+            (Some("B"), Some("timing_level")) => {
+                let frame = current
+                    .get(&tid)
+                    .copied()
+                    .expect("a level record sits inside a frame span");
+                let iterations =
+                    timing_value_of(&event["args"]["iterations"]).expect("level iterations");
+                per_frame.entry(frame).or_default().push(iterations);
+            }
+            _ => {}
+        }
+    }
+
+    let alignments = report["alignments"].as_array().expect("alignments");
+    assert!(
+        !per_frame.is_empty(),
+        "at least one frame records its levels"
+    );
+    for entry in alignments {
+        let frame = entry["frame"].as_u64().expect("frame index");
+        let reported = entry["iterations"].as_u64().expect("iterations");
+        let levels = per_frame.get(&frame).map(Vec::as_slice).unwrap_or(&[]);
+        assert!(
+            levels.len() <= DEPTH + 1,
+            "frame {frame}: at most {} level records, got {levels:?}",
+            DEPTH + 1
+        );
+        assert_eq!(
+            levels.iter().sum::<u64>(),
+            reported,
+            "frame {frame}: level iterations {levels:?} must sum to the reported {reported}"
+        );
+    }
 }
 
 #[test]

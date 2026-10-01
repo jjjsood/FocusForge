@@ -398,6 +398,17 @@ pub fn record_timing(counter: TimingCounter, value: u64) {
     }
 }
 
+/// Records the solver iterations one pyramid level spent, as a trace span
+/// nested under the frame being solved.
+pub fn record_level_iterations(level: u32, iterations: u32) {
+    let Some(state) = timing() else {
+        return;
+    };
+    if state.admit() {
+        let _record = tracing::debug_span!("timing_level", level, iterations).entered();
+    }
+}
+
 /// Records the largest observed worker value for a processing run.
 pub fn observe_timing_max(counter: TimingCounter, value: u64) {
     let Some(state) = timing() else {
