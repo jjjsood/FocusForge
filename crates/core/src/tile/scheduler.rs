@@ -268,8 +268,7 @@ enum RunStop {
 /// `bytes_per_tile_set` for `frame_count` frames of `width x height` read
 /// rects at `samples_per_pixel` samples, `u16` (2 bytes) each.
 ///
-/// The caller passes the **outer** tile size clamped to the frame, and that
-/// is the whole subtlety here.
+/// The caller passes the **outer** tile size clamped to the frame.
 /// [`TilePlan::new`] derives `raw_interior = tile_size - 2 * margin`, then
 /// gives each tile a read rect of `interior + margin` on every side -- so
 /// the read rect reconstitutes `tile_size` and never exceeds it. A margin

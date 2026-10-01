@@ -33,7 +33,7 @@
 //!
 //! The argmax runs over eligible frames: those whose coverage mask
 //! ([`crate::algorithm::TileCtx::coverage`]), eroded by the full reach of its score,
-//! `DETAIL_REACH + score-radius + smoothing-radius` (`4 + 2 + 3` at the
+//! `DETAIL_REACH + score-radius + smoothing-radius` (`4 + 4 + 8` at the
 //! defaults; `sharpness::eligible`), is true at `p`. A pixel with no eligible frame is
 //! [`crate::zmap::NO_SOURCE`] with zero samples.
 //!
