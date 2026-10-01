@@ -6571,10 +6571,10 @@ impl AppController {
             .selected_checkpoint
             .as_deref()
             .and_then(|row| tab.saved_row_key(row, &ids, keep.as_ref()));
-        if let Some((row, _)) = &tab.fresh_checkpoint
-            && let Some(saved) = tab.saved_row_key(row, &ids, keep.as_ref())
+        if let Some((row, generation)) = tab.fresh_checkpoint.clone()
+            && let Some(saved) = tab.saved_row_key(&row, &ids, keep.as_ref())
         {
-            tab.fresh_checkpoint.as_mut().expect("matched above").0 = saved;
+            tab.fresh_checkpoint = Some((saved, generation));
         }
         tab.selected_checkpoint =
             next.or_else(|| project.history().visible().first().map(|c| c.id.clone()));
