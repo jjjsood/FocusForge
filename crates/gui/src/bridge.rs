@@ -3284,13 +3284,12 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         // Never reachable while `undock_enabled()` is always `true` with
         // both panes docked.
         ShellEvent::PaneUndockRequested(_) => {}
-        // A no-op here: the viewport
-        // mutation itself already happened synchronously inside
-        // `AppController::emit_action` before this event was even raised,
-        // and the repaint it needs runs on the
-        // *callback* path (`repaint`, above), not through the sink --
-        // `perform` runs off a `Send + Sync` closure that can hold neither
-        // an `Rc` nor the GPU state `CanvasRenderer` needs.
+        // A no-op here: the viewport mutation already happened synchronously
+        // inside `AppController::emit_action` before this event was raised,
+        // and the repaint it needs runs on the callback path (`repaint`,
+        // above), not through the sink -- `perform` runs off a
+        // `Send + Sync` closure that can hold neither an `Rc` nor the GPU
+        // state `CanvasRenderer` needs.
         ShellEvent::Input(_) => {}
         // A write's outcome updates the controller's own state first -- the
         // thread that produced it holds no lock on `self` -- then rebuilds

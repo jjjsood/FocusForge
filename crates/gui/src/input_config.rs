@@ -244,8 +244,8 @@ fn validate(parsed: ConfigFile, src: &str, path: PathBuf) -> Loaded {
         // active bindings. Refusing is final -- "rebind" means reassigning
         // one of the shipped triggers' action, not naming a device none of
         // them already uses.
-        // An `alt+wheel` row written by an earlier build is skipped without a
-        // problem, so the rest of that file still applies.
+        // An `alt+wheel` row is skipped without an error, so the rest of the
+        // file still applies.
         if trigger
             == Trigger::Wheel(Modifiers {
                 alt: true,

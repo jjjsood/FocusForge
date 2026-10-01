@@ -2,8 +2,9 @@
 
 //! The input table, the loader and the one dispatch point, driven through
 //! `AppController` with no window and no fixture images. `Ctrl + Wheel`
-//! and `Shift + Wheel` are proven here rather than through a window: slint 1.17.1's testing backend can synthesize a wheel or a drag
-//! but neither carries keyboard modifiers (slint-ui/slint#13244).
+//! and `Shift + Wheel` are proven here rather than through a window: slint
+//! 1.17.1's testing backend can synthesize a wheel or a drag but neither
+//! carries keyboard modifiers (slint-ui/slint#13244).
 
 mod common;
 
@@ -319,10 +320,9 @@ fn partial_out_of_order_single_row_config_leaves_other_rows_at_default() {
 }
 
 #[test]
-fn earlier_alt_wheel_row_is_ignored() {
-    // A file written by an earlier build carries an `alt+wheel` row; it
-    // loads without a problem, its other rows apply, and `Alt + Wheel`
-    // stays unbound.
+fn alt_wheel_row_is_ignored() {
+    // A file carrying an `alt+wheel` row loads without an error, its other
+    // rows apply, and `Alt + Wheel` stays unbound.
     let dir = tempfile::tempdir().unwrap();
     let toml = format!(
         "[input]\nversion = 1\n{}{}",
