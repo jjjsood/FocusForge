@@ -383,7 +383,6 @@ export component AppWindow inherits Window {
     in property <[ImageRowView]> images-rows: [];
     in property <string> images-header-text: "";
     in-out property <length> images-list-viewport-y: 0px;
-    in property <bool> images-no-source-row: false;
     in property <string> images-sort: "";
     in property <bool> images-sort-menu-open: false;
     in property <int> images-dragging-row: -1;
@@ -427,7 +426,6 @@ export component AppWindow inherits Window {
         images-rows: root.images-rows;
         images-header-text: root.images-header-text;
         images-list-viewport-y <=> root.images-list-viewport-y;
-        images-no-source-row: root.images-no-source-row;
         images-sort: root.images-sort;
         images-sort-menu-open: root.images-sort-menu-open;
         images-dragging-row: root.images-dragging-row;
@@ -532,7 +530,8 @@ export component AppWindow inherits Window {
     in property <string> bar-tone: "running";
     in property <string> eta-text: "";
 
-    // The bottom bar's overlay controls, editor mode only.
+    // The bottom bar's overlay controls; disabled without a finished fuse.
+    in property <bool> overlay-available: false;
     in property <bool> overlay-on: false;
     in property <float> overlay-fraction: 0.0;
     in property <string> overlay-text: "";
@@ -558,7 +557,7 @@ export component AppWindow inherits Window {
         bar-fraction: root.bar-fraction;
         bar-tone: root.bar-tone;
         eta-text: root.eta-text;
-        editor-mode: root.mode == "editor";
+        overlay-available: root.overlay-available;
         overlay-on: root.overlay-on;
         overlay-fraction: root.overlay-fraction;
         overlay-text: root.overlay-text;

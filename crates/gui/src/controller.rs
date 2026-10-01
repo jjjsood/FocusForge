@@ -200,7 +200,6 @@ struct InputState {
     /// while held; it arms nothing.
     alt_held: bool,
     drag: Option<DragState>,
-    unimplemented: Vec<Action>,
     last_pointer: (f32, f32),
     /// Accumulated wheel delta not yet spent into a ladder step -- one stop
     /// per accumulated 60 px. Reset on a sign change so reversing direction
@@ -1678,6 +1677,12 @@ impl AppController {
         }
     }
 
+    /// Whether the overlay can be drawn: the active tab's selected row
+    /// resolves to a fuse. The bottom bar greys the controls otherwise.
+    pub fn overlay_available(&self) -> bool {
+        self.state.active().is_some_and(|tab| tab.fused().is_some())
+    }
+
     /// Turns the `Composite` pane's rainbow overlay on or off.
     pub fn set_overlay_on(&mut self, on: bool) {
         self.state.overlay.on = on;
@@ -1691,17 +1696,16 @@ impl AppController {
     }
 
     /// The `Composite` pane's overlay draw parameters, matching
-    /// `focusforge-cli retouch --overlay --opacity`'s own blend -- `None`
-    /// outside editor mode, with the overlay off, or before an edit session
-    /// has opened.
+    /// `focusforge-cli retouch --overlay --opacity`'s own blend, in either
+    /// mode -- `None` with the overlay off or when the active tab's selected
+    /// row has no fuse. The table spans that fuse's sources.
     pub fn overlay_draw(&self) -> Option<OverlayDraw> {
-        if self.mode() != ShellMode::Editor || !self.state.overlay.on {
+        if !self.state.overlay.on {
             return None;
         }
-        let tab = self.state.active()?;
-        tab.edit.as_ref()?;
+        let sources = self.state.active()?.fused()?.0.len();
         Some(OverlayDraw::for_opacity(
-            tab.frames.len() as u32,
+            sources as u32,
             self.state.overlay.opacity,
         ))
     }
@@ -2173,18 +2177,10 @@ impl AppController {
         self.state.input.provenance = provenance;
     }
 
-    /// Records `event`'s action as unimplemented (by name, never silently)
-    /// when there is no implementation for it; an implemented one is
-    /// applied instead ([`Self::apply_action`]). Either way
-    /// [`ShellEvent::Input`] is raised -- nothing is both dropped and
-    /// unrecorded, and nothing stops being emitted.
+    /// Applies `event` ([`Self::apply_action`]) and raises
+    /// [`ShellEvent::Input`].
     fn emit_action(&mut self, event: ActionEvent) {
-        let action = event.action();
-        if action.implemented() {
-            self.apply_action(&event);
-        } else if !self.state.input.unimplemented.contains(&action) {
-            self.state.input.unimplemented.push(action);
-        }
+        self.apply_action(&event);
         self.emit(ShellEvent::Input(event));
     }
 
@@ -2351,7 +2347,7 @@ impl AppController {
         self.emit(ShellEvent::EditorChanged);
     }
 
-    /// `Alt + Wheel` in editor mode: one detent moves `Soft` by 5 points,
+    /// The `BrushSoftness` wheel action: one detent moves `Soft` by 5 points,
     /// clamped to `0..=100`.
     fn adjust_brush_softness(&mut self, steps: f32) {
         let detents = self.wheel_detents(Action::BrushSoftness, steps);
@@ -3035,10 +3031,6 @@ impl AppController {
                 )
             }
         }
-    }
-
-    pub fn unimplemented_actions(&self) -> &[Action] {
-        &self.state.input.unimplemented
     }
 
     pub fn open_settings(&mut self) -> bool {

@@ -2510,6 +2510,20 @@ const ALT: Modifiers = Modifiers {
     ..Modifiers::NONE
 };
 
+/// Binds `Alt + Wheel` to the brush softness in editor mode; the shipped
+/// table leaves softness without a wheel binding.
+fn bind_softness_to_alt_wheel(controller: &mut AppController) {
+    use focusforge_gui::input_config::Provenance;
+    use focusforge_gui::input_map::{Action, Binding, InputTable, Trigger};
+    let mut table = InputTable::default();
+    table.bindings.push(Binding {
+        trigger: Trigger::Wheel(ALT),
+        stacking: None,
+        editor: Some(Action::BrushSoftness),
+    });
+    controller.install_input_table(table, Provenance::Defaults);
+}
+
 /// The active tab's whole fused map.
 fn map_rect(controller: &AppController) -> Rect {
     controller.edit_session().unwrap().tile()
@@ -2922,6 +2936,15 @@ fn brush_controls_convert_to_storage_units() {
     c.wheel(0.0, -60.0, 0.0, 0.0, SHIFT);
     assert_eq!(size(&c), 1.0, "clamped at 1 px");
 
+    assert_eq!(
+        {
+            c.wheel(0.0, 60.0, 0.0, 0.0, ALT);
+            soft(&c)
+        },
+        30.0,
+        "the shipped table binds no wheel to softness"
+    );
+    bind_softness_to_alt_wheel(&mut c);
     c.wheel(0.0, 60.0, 0.0, 0.0, ALT);
     assert_eq!(soft(&c), 35.0);
     c.set_brush_softness_fraction(1.0);
@@ -3074,24 +3097,13 @@ fn legend_header_states() {
 }
 
 #[test]
-fn legend_no_source_entry_is_pinned_and_unpaintable() {
+fn legend_lists_only_frames_and_rejects_a_position_past_them() {
     let mut c = controller_with_scratch("legend_no_source");
     open_fused_tab(&mut c, "legend_no_source", 3);
-    // A fuse now auto-enters Editor on the viewed tab; back out to Stacking
-    // so the "before" half of this test observes the Stacking-mode legend.
     c.set_mode(ShellMode::Stacking);
-    assert!(
-        !c.images_panel().no_source_row,
-        "stacking mode has no pinned entry"
-    );
-
     assert!(c.set_mode(ShellMode::Editor));
     let panel = c.images_panel();
-    assert!(
-        panel.no_source_row,
-        "the legend pins a NO_SOURCE entry below the list"
-    );
-    assert_eq!(panel.rows.len(), 3, "NO_SOURCE is not one of rows");
+    assert_eq!(panel.rows.len(), 3, "the legend holds one row per frame");
 
     let before = c.brush_source();
     c.select_frame(3);
@@ -3201,14 +3213,106 @@ fn legend_has_no_mutation_affordances() {
     assert!(c.pending_frame_change().is_none());
 }
 
+/// The `Composite` overlay's draw for `sources` fused sources at `opacity`.
+fn overlay_for(sources: u32, opacity: f32) -> OverlayDraw {
+    OverlayDraw {
+        table: focusforge_core::zmap::overlay_table(sources, None),
+        alpha: focusforge_core::display::alpha_from_opacity(opacity),
+    }
+}
+
+#[test]
+fn overlay_draws_in_stacking_on_a_fused_tab() {
+    let mut c = controller_with_scratch("overlay_stacking");
+    open_fused_tab(&mut c, "overlay_stacking", 3);
+    assert!(c.set_mode(ShellMode::Editor));
+    c.set_overlay_opacity_fraction(0.3);
+    c.set_overlay_on(true);
+    let in_editor = c.overlay_draw();
+
+    assert!(c.set_mode(ShellMode::Stacking));
+    assert_eq!(c.mode(), ShellMode::Stacking);
+    assert!(c.overlay_available());
+    assert_eq!(c.overlay_draw(), Some(overlay_for(3, 0.3)));
+    assert_eq!(
+        c.overlay_draw(),
+        in_editor,
+        "stacking draws what editor mode draws for the same state"
+    );
+}
+
+#[test]
+fn overlay_unavailable_without_a_finished_fuse() {
+    let mut c = controller_with_scratch("overlay_unavailable");
+    c.set_overlay_on(true);
+    assert!(!c.overlay_available(), "no tab");
+    assert_eq!(c.overlay_draw(), None, "no tab, toggle on");
+
+    open_mantis64_tab(&mut c, "overlay_unavailable", 3);
+    assert_eq!(c.checkpoint_count(), Some(0));
+    assert!(!c.overlay_available(), "frames added, never fused");
+    assert_eq!(c.overlay_draw(), None, "no checkpoint, toggle on");
+
+    assert!(c.start_fuse());
+    assert!(!c.overlay_available(), "the first fuse is still running");
+    assert_eq!(c.overlay_draw(), None, "first fuse running, toggle on");
+    settle_all(&mut c);
+    assert!(c.overlay_available(), "the fuse finished");
+    assert!(c.overlay_draw().is_some());
+}
+
+#[test]
+fn overlay_follows_the_active_tab() {
+    let mut c = controller_with_scratch("overlay_tabs");
+    open_fused_tab(&mut c, "overlay_tabs_fused", 3);
+    assert!(c.set_mode(ShellMode::Stacking));
+    c.set_overlay_on(true);
+    assert_eq!(c.overlay_draw(), Some(overlay_for(3, 0.65)));
+
+    open_mantis64_tab(&mut c, "overlay_tabs_unfused", 2);
+    assert_eq!(c.active_project(), Some(1));
+    assert!(!c.overlay_available());
+    assert_eq!(c.overlay_draw(), None, "the unfused tab draws nothing");
+    assert!(c.overlay_view().on, "the toggle is untouched");
+
+    c.select_project(0);
+    assert!(c.overlay_available());
+    assert_eq!(
+        c.overlay_draw(),
+        Some(overlay_for(3, 0.65)),
+        "back on the fused tab the overlay draws again"
+    );
+}
+
+#[test]
+fn overlay_counts_fused_sources_not_frames() {
+    let mut c = controller_with_scratch("overlay_sources");
+    open_fused_tab(&mut c, "overlay_sources", 2);
+    assert!(c.set_mode(ShellMode::Stacking));
+    c.set_overlay_on(true);
+
+    common::add_and_settle(&mut c, &[common::fixture_frame("mantis-64", 2)])
+        .expect("the add must not refuse");
+    assert!(c.pending_frame_change().is_some(), "a checkpoint exists");
+    assert!(c.confirm_frame_change());
+    assert_eq!(c.images_panel().rows.len(), 3, "the frame was added");
+    assert_eq!(
+        c.overlay_draw(),
+        Some(overlay_for(2, 0.65)),
+        "the table stays sized by the fused sources"
+    );
+}
+
 #[test]
 fn overlay_controls_match_the_render_parameters() {
     let mut c = controller_with_scratch("overlay_params");
     open_fused_tab(&mut c, "overlay_params", 3);
+    assert!(c.set_mode(ShellMode::Stacking));
+    assert_eq!(c.mode(), ShellMode::Stacking);
     assert_eq!(
         c.overlay_draw(),
         None,
-        "stacking mode never draws the overlay"
+        "stacking mode draws nothing until the toggle is on"
     );
     assert!(
         !c.overlay_view().on,
@@ -3863,6 +3967,7 @@ fn live_stroke_previews_each_new_segment() {
             s.can_redo(),
         )
     };
+    bind_softness_to_alt_wheel(&mut c);
     let before = session(&c);
     assert!(before.2, "one stroke waits on the redo stack");
     let before_indices = indices(&c);

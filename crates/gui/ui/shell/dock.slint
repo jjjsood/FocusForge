@@ -64,9 +64,6 @@ export component FFDock inherits Rectangle {
     in property <[ImageRowView]> images-rows: [];
     in property <string> images-header-text: "";
     in-out property <length> images-list-viewport-y: 0px;
-    // The editor's read-only legend: the pinned `NO_SOURCE` entry shows
-    // below the list.
-    in property <bool> images-no-source-row: false;
     in property <string> images-sort: "";
     in property <bool> images-sort-menu-open: false;
     in property <int> images-dragging-row: -1;
@@ -171,7 +168,6 @@ export component FFDock inherits Rectangle {
         rows: root.images-rows;
         header-text: root.images-header-text;
         list-viewport-y <=> root.images-list-viewport-y;
-        no-source-row: root.images-no-source-row;
         mutable: root.mode == "stacking" && root.images-enabled;
         enabled: root.images-enabled;
         legend: root.mode == "editor";

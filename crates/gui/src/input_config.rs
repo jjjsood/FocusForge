@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use toml::Spanned;
 use toml_edit::DocumentMut;
 
-use crate::input_map::{Action, Binding, DEFAULT_BINDINGS, InputTable, Trigger};
+use crate::input_map::{Action, Binding, DEFAULT_BINDINGS, InputTable, Modifiers, Trigger};
 use crate::settings;
 
 /// The only `version` this build accepts. A file naming a higher version is
@@ -235,15 +235,25 @@ fn validate(parsed: ConfigFile, src: &str, path: PathBuf) -> Loaded {
         // and a partial or out-of-order file must never shift or delete an
         // unrelated row.
         //
-        // A trigger that parses but names none of the table's ten known
+        // A trigger that parses but names none of the table's nine known
         // triggers is refused the same way an unparseable spelling is: this
         // table's rows are display-indexed (`InputTable::display_rows`,
-        // `DEFAULT_BINDINGS`'s fixed ten-slot layout), so a trigger this
+        // `DEFAULT_BINDINGS`'s fixed nine-slot layout), so a trigger this
         // table has no row for cannot be shown in the settings modal, and
         // silently accepting it would show a table that does not match the
         // active bindings. Refusing is final -- "rebind" means reassigning
         // one of the shipped triggers' action, not naming a device none of
         // them already uses.
+        // An `alt+wheel` row written by an earlier build is skipped without a
+        // problem, so the rest of that file still applies.
+        if trigger
+            == Trigger::Wheel(Modifiers {
+                alt: true,
+                ..Modifiers::NONE
+            })
+        {
+            continue;
+        }
         let Some(default_index) = DEFAULT_BINDINGS.iter().position(|b| b.trigger == trigger) else {
             problems.push(ConfigError::UnknownTrigger {
                 path: path.clone(),
@@ -352,9 +362,8 @@ const HEADER: &str = "\
 # changing its actions. A trigger this table does not already list is
 # refused.
 #
-# Accepted actions: zoom-at-cursor, step-source-frame, pan-horizontal,
-# overlay-opacity, pan, brush-size, brush-softness, undo, redo,
-# pick-source-under-pointer, paint.
+# Accepted actions: zoom-at-cursor, step-source-frame, pan-horizontal, pan,
+# brush-size, brush-softness, undo, redo, pick-source-under-pointer, paint.
 #
 # Omit `stacking` or `editor` to leave that mode with no binding.
 ";

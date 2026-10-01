@@ -215,7 +215,6 @@ fn absent_capture_time_is_shown_as_absent() {
     let ImagesModel {
         rows: _,
         header_text: _,
-        no_source_row: _,
     } = panel;
 }
 

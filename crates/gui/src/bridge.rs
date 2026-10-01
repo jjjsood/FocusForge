@@ -894,6 +894,7 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     // tab switch or close never fires one of its own.
     app.set_project_loaded(controller.active_project().is_some());
     app.set_composite_ready(controller.composite_ready());
+    push_overlay_controls(app, &controller);
     app.set_checkpoint_line(controller.checkpoint_panel_line().into());
     app.set_plus_selected(controller.plus_selected());
     app.set_skipped_notice(controller.notice().unwrap_or_default().into());
@@ -1254,7 +1255,6 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     record_timing(TimingCounter::RowUpdates, updates as u64);
     app.set_images_header_text(panel.header_text.into());
     app.set_images_list_viewport_y(-controller.images_scroll_y());
-    app.set_images_no_source_row(panel.no_source_row);
     let sort = match controller.frame_sort() {
         Some(crate::images::FrameSort::Name) => "name",
         Some(crate::images::FrameSort::CaptureTime) => "capture-time",
@@ -1333,8 +1333,14 @@ pub fn push_editor_toolbar(app: &AppWindow, controller: &AppController) {
     app.set_can_undo(view.can_undo);
     app.set_can_redo(view.can_redo);
     app.set_can_save_checkpoint(view.can_save_checkpoint);
+    push_overlay_controls(app, controller);
+}
 
+/// Pushes the bottom bar's overlay controls: state, opacity readout and
+/// whether the active tab has a fuse to draw over.
+fn push_overlay_controls(app: &AppWindow, controller: &AppController) {
     let overlay = controller.overlay_view();
+    app.set_overlay_available(controller.overlay_available());
     app.set_overlay_on(overlay.on);
     app.set_overlay_fraction(overlay.opacity);
     app.set_overlay_text(format!("{:.0}%", overlay.opacity * 100.0).into());
@@ -3278,7 +3284,7 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         // Never reachable while `undock_enabled()` is always `true` with
         // both panes docked.
         ShellEvent::PaneUndockRequested(_) => {}
-        // A no-op here regardless of `Action::implemented()`: the viewport
+        // A no-op here: the viewport
         // mutation itself already happened synchronously inside
         // `AppController::emit_action` before this event was even raised,
         // and the repaint it needs runs on the
