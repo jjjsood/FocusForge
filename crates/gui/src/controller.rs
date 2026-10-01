@@ -6265,8 +6265,9 @@ impl AppController {
     /// one `.ffp`, after keeping a modified live as a checkpoint. A never-saved
     /// tab asks `pick` (proposing `<frames dir>/<group name>.ffp`); an opened
     /// one rewrites its own file. The edit session survives, rebased, and the
-    /// current row stays stored even when it was deleted. A failed write keeps everything in memory and
-    /// leaves [`Self::take_settled_failure`] a message. Returns whether it wrote.
+    /// current row stays stored even when it was deleted. A failed write keeps
+    /// everything in memory and leaves [`Self::take_settled_failure`] a
+    /// message. Returns whether it wrote.
     fn save_project_at(
         &mut self,
         index: usize,
