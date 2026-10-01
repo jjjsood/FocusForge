@@ -20,12 +20,6 @@ test-algorithms = []
 # would have to carry `--features test-algorithms` by hand.
 [dev-dependencies]
 focusforge-core = { path = ".", features = ["test-algorithms"] }
-# `project_format.rs` reads a sealed container with an **independent**
-# reader and rehashes payloads itself, rather than trusting the writer's own
-# accessors to describe what it wrote.
-blake3 = { version = "1.8.7", features = ["mmap", "rayon"] }
-zip = { version = "8.6.0", default-features = false }
-zstd = "0.14"
 # `tracing_spans.rs` installs a capturing layer of its own. Product code in
 # this crate raises events through the facade and never installs a
 # subscriber.

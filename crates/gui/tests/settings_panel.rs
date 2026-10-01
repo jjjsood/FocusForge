@@ -8,6 +8,7 @@ mod common;
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use focusforge_core::params::{ParamKind, ParamValue, ParamViolation};
 use focusforge_core::registry;
@@ -531,6 +532,310 @@ fn panel_scrolls_and_the_heading_sticks() {
         panel.sticky.is_some(),
         "a heading must be stuck after scrolling past it"
     );
+}
+
+fn init_window_backend() {
+    thread_local! {
+        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    INIT.with(|done| {
+        if !done.get() {
+            i_slint_backend_testing::init_no_event_loop();
+            done.set(true);
+        }
+    });
+}
+
+fn mounted(app: &focusforge_gui::AppWindow, id: &str) -> i_slint_backend_testing::ElementHandle {
+    i_slint_backend_testing::ElementQuery::from_root(app)
+        .match_id(id)
+        .find_first()
+        .unwrap_or_else(|| panic!("{id} is mounted"))
+}
+
+fn element_center(handle: &i_slint_backend_testing::ElementHandle) -> slint::LogicalPosition {
+    let pos = handle.absolute_position();
+    let size = handle.size();
+    slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0)
+}
+
+/// Indices whose shown row differs between `old` and `new`, over the rows
+/// both hold; a row's `choices` compare by model identity.
+fn changed_rows<T: PartialEq>(old: &[T], new: &[T]) -> Vec<usize> {
+    old.iter()
+        .zip(new)
+        .enumerate()
+        .filter(|(_, (o, n))| o != n)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+#[test]
+fn settings_scrolling_notifies_no_row_and_edits_notify_only_changed_rows() {
+    use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
+    use focusforge_gui::ShellEvent;
+    use slint::platform::{PointerEventButton, WindowEvent};
+    use slint::{ComponentHandle, Model};
+    use std::sync::{Arc, Mutex};
+
+    // Timing accounting is process-global, so this runs alone in a child.
+    const CHILD: &str = "FOCUSFORGE_GUI_SETTINGS_ACCOUNTING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args([
+            "--exact",
+            "settings_scrolling_notifies_no_row_and_edits_notify_only_changed_rows",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .status()
+        .expect("the isolated accounting test starts");
+        assert!(
+            status.success(),
+            "the isolated accounting test passes: {status}"
+        );
+        return;
+    }
+
+    enable_trace_accounting();
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.set_align_algorithm("pyramidal-ecc");
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    let events = Arc::new(Mutex::new(Vec::new()));
+    controller.lock().unwrap().set_sink(Arc::new({
+        let events = events.clone();
+        move |event| events.lock().unwrap().push(event)
+    }));
+    app.set_project_loaded(true);
+    app.set_dock_tab("settings".into());
+
+    // What the event loop does with each captured event.
+    let perform = || {
+        let drained: Vec<ShellEvent> = events.lock().unwrap().drain(..).collect();
+        for event in &drained {
+            let controller = controller.lock().unwrap();
+            match event {
+                ShellEvent::SettingsScrolled => {
+                    focusforge_gui::bridge::push_settings_scroll(&app, &controller.settings_panel())
+                }
+                ShellEvent::SettingsChanged => {
+                    focusforge_gui::bridge::push_settings_panel(&app, &controller)
+                }
+                _ => {}
+            }
+        }
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
+        drained
+    };
+    let dispatch = |event: WindowEvent| {
+        app.window().dispatch_event(event);
+        perform()
+    };
+    let row_updates = || {
+        timing_snapshot()
+            .expect("trace accounting is enabled")
+            .row_updates
+    };
+    let shown = || app.get_settings_rows().iter().collect::<Vec<_>>();
+    let assert_scroll_mirrored = || {
+        let panel = controller.lock().unwrap().settings_panel();
+        assert_eq!(app.get_settings_scroll_y(), panel.scroll_y);
+        let sticky = app.get_settings_sticky();
+        assert_eq!(sticky.visible, panel.sticky.is_some());
+        if let Some(i) = panel.sticky {
+            assert_eq!(sticky.label.as_str(), panel.rows[i].label);
+            assert_eq!(sticky.push, panel.sticky_push);
+        }
+        panel.sticky_push != 0.0
+    };
+
+    focusforge_gui::bridge::push_settings_panel(&app, &controller.lock().unwrap());
+    perform();
+    controller
+        .lock()
+        .unwrap()
+        .set_settings_viewport_height(200.0);
+    perform();
+    let before = row_updates();
+    let model = app.get_settings_rows();
+
+    // Wheel down in small steps, so the sticky heading's push is crossed.
+    let hit_center = element_center(&mounted(&app, "FFSettingsPanel::hit-area"));
+    let mut seen = Vec::new();
+    let mut pushed = false;
+    loop {
+        let offset = controller.lock().unwrap().settings_scroll_y();
+        seen.extend(dispatch(WindowEvent::PointerScrolled {
+            position: hit_center,
+            delta_x: 0.0,
+            delta_y: -4.0,
+        }));
+        pushed |= assert_scroll_mirrored();
+        if controller.lock().unwrap().settings_scroll_y() == offset {
+            break;
+        }
+    }
+    assert!(
+        controller.lock().unwrap().settings_scroll_y() > 0.0,
+        "the wheel moved the panel"
+    );
+    assert!(pushed, "some step pushed the sticky heading up");
+
+    // A press on the bare track above the thumb jumps back to the top.
+    let bar = mounted(&app, "FFSettingsPanel::scrollbar");
+    let top = slint::LogicalPosition::new(element_center(&bar).x, bar.absolute_position().y + 1.0);
+    for event in [
+        WindowEvent::PointerMoved { position: top },
+        WindowEvent::PointerPressed {
+            position: top,
+            button: PointerEventButton::Left,
+        },
+        WindowEvent::PointerReleased {
+            position: top,
+            button: PointerEventButton::Left,
+        },
+    ] {
+        seen.extend(dispatch(event));
+    }
+    assert_eq!(controller.lock().unwrap().settings_scroll_y(), 0.0);
+    assert_scroll_mirrored();
+
+    controller
+        .lock()
+        .unwrap()
+        .set_settings_viewport_height(260.0);
+    seen.extend(perform());
+    assert_scroll_mirrored();
+
+    assert_eq!(row_updates(), before, "scrolling notifies no row");
+    assert!(!seen.contains(&ShellEvent::SettingsChanged), "{seen:?}");
+    assert!(seen.contains(&ShellEvent::SettingsScrolled), "{seen:?}");
+
+    // Each edit notifies exactly the rows whose shown data differ.
+    let edit = |change: &dyn Fn(&mut AppController)| {
+        let old = shown();
+        change(&mut controller.lock().unwrap());
+        let before = row_updates();
+        perform();
+        let new = shown();
+        let changed = changed_rows(&old, &new);
+        let touched = changed.len() + old.len().abs_diff(new.len());
+        assert_eq!(row_updates() - before, touched as u64);
+        assert!(app.get_settings_rows() == model, "the row model is kept");
+        (old, new, changed)
+    };
+    let slider = shown()
+        .iter()
+        .position(|r| ["linear-float", "log-float", "int"].contains(&r.kind.as_str()))
+        .expect("pyramidal-ecc has a slider");
+    let (section, id, start) = {
+        let row = &shown()[slider];
+        (row.section.to_string(), row.id.to_string(), row.fraction)
+    };
+    let far = if start < 0.5 { 0.9 } else { 0.1 };
+    let (_, _, first) = edit(&|c| c.set_param_fraction(&section, &id, far));
+    assert!(first.contains(&slider), "{first:?}");
+    let (_, _, second) = edit(&|c| c.set_param_fraction(&section, &id, 0.5));
+    assert_eq!(second, vec![slider]);
+
+    let menu = shown()
+        .iter()
+        .position(|r| r.kind == "enum")
+        .expect("pyramidal-ecc has an enum field");
+    let (section, id) = {
+        let row = &shown()[menu];
+        (row.section.to_string(), row.id.to_string())
+    };
+    let (old, new, toggled) = edit(&|c| c.toggle_param_menu_for(&section, &id));
+    assert_eq!(toggled, vec![menu]);
+    assert!(new[menu].menu_open);
+    assert!(new[menu].choices == old[menu].choices, "choices kept");
+
+    let mut resized = false;
+    for algorithm in focusforge_core::registry::align_algorithms() {
+        if algorithm.id() == "pyramidal-ecc" {
+            continue;
+        }
+        let (old, new, _) = edit(&|c| c.set_align_algorithm(algorithm.id()));
+        resized |= old.len() != new.len();
+    }
+    assert!(resized, "some align algorithm changes the row count");
+}
+
+/// A slider drag keeps its grab across a panel push between two moves.
+#[test]
+fn a_slider_drag_survives_a_panel_push() {
+    use slint::ComponentHandle;
+    use slint::platform::{PointerEventButton, WindowEvent};
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.set_align_algorithm("pyramidal-ecc");
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    app.set_dock_tab("settings".into());
+    let push = || {
+        focusforge_gui::bridge::push_settings_panel(&app, &controller.lock().unwrap());
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
+    };
+    push();
+    let fractions = || {
+        controller
+            .lock()
+            .unwrap()
+            .settings_panel()
+            .rows
+            .iter()
+            .map(|r| r.fraction)
+            .collect::<Vec<_>>()
+    };
+
+    let area = mounted(&app, "FFSlider::drag-area");
+    let (pos, size) = (area.absolute_position(), area.size());
+    let at =
+        |f: f32| slint::LogicalPosition::new(pos.x + size.width * f, pos.y + size.height / 2.0);
+    let start = fractions();
+    app.window()
+        .dispatch_event(WindowEvent::PointerMoved { position: at(0.2) });
+    app.window().dispatch_event(WindowEvent::PointerPressed {
+        position: at(0.2),
+        button: PointerEventButton::Left,
+    });
+    app.window()
+        .dispatch_event(WindowEvent::PointerMoved { position: at(0.4) });
+    let first = fractions();
+    assert_ne!(first, start, "the first move changes the value");
+    push();
+    app.window()
+        .dispatch_event(WindowEvent::PointerMoved { position: at(0.7) });
+    let second = fractions();
+    app.window().dispatch_event(WindowEvent::PointerReleased {
+        position: at(0.7),
+        button: PointerEventButton::Left,
+    });
+    assert_ne!(second, first, "the move after the push still drags");
 }
 
 #[test]

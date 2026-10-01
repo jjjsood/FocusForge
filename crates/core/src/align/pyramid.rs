@@ -12,26 +12,16 @@
 //!
 //! # Residency
 //!
-//! A pairwise registration holds exactly two frames' pyramids live, level 0
-//! included -- 179 MB per frame at level 0 (8192 x 5464 `f32`) plus 59.7 MB
-//! for levels 1..N, **477 MB steady-state for the pair**. The **transient**
-//! peak is higher still, ~622 MB, with the assembler's own buffer and
-//! [`Plane::from_f32`]'s copy of it also live for one frame at a time --
-//! [`crate::align::driver::bytes_per_registration`] is the one place that
-//! full figure is computed, term by term. Levels are streamed in from tiles
-//! ([`LumaAssembler`], one `f32` write per pixel, no whole-frame buffer in
-//! the *reader*) and then held in RAM as whole [`Plane`]s for the pairwise
-//! solve. `level(0)` is retained -- the level-0-omitted variant is not
-//! built.
+//! A frame's pyramid holds level 0 (179 MB at 8192 x 5464 `f32`) plus
+//! 59.7 MB for levels 1..N, about 239 MB. [`LumaAssembler::finish`] moves
+//! its buffer into level 0, so no second whole-plane copy is live.
 //!
-//! An anchored run holds the reference frame's pyramid only **once**, for
-//! the whole run, not once per registration: a registration holds one
-//! *shared* reference pyramid
-//! ([`crate::align::driver::bytes_shared_reference`], a per-run constant)
-//! plus its own frame-side transient
-//! ([`crate::align::driver::bytes_per_registration`], per worker). Their sum
-//! is still the ~622 MB figure above -- the split changes who pays for the
-//! reference pyramid's residency, not the total.
+//! An anchored run holds one *shared* term for the whole run
+//! ([`crate::align::driver::bytes_shared_reference`]): the reference pyramid
+//! plus the reference templates the solver retains per level. Each concurrent
+//! registration adds its own frame pyramid and solve scratch
+//! ([`crate::align::driver::bytes_per_registration`]). At the reference
+//! scale that is about 400 MB shared and 264 MB per registration.
 
 use crate::align::error::AlignError;
 use crate::fuse::PyramidError;
@@ -95,9 +85,10 @@ impl LumaAssembler {
     }
 
     /// Finalizes assembly into a single-channel [`Plane`]
-    /// ([`Plane::from_f32`], `samples_per_pixel = 1`).
+    /// ([`Plane::from_f32_vec`], `samples_per_pixel = 1`): the plane owns the
+    /// assembler's buffer, no second copy is made.
     pub fn finish(self) -> Result<Plane, PyramidError> {
-        Plane::from_f32(&self.data, self.width, self.height, 1)
+        Plane::from_f32_vec(self.data, self.width, self.height, 1)
     }
 }
 
@@ -176,6 +167,16 @@ mod tests {
             for &v in level.data() {
                 assert_eq!(v, 1234.5f32, "level {k} did not survive as a constant");
             }
+        }
+    }
+
+    #[test]
+    fn finish_moves_the_assembler_buffer_into_the_plane() {
+        for (width, height) in [(13u32, 13u32), (7, 5)] {
+            let assembler = LumaAssembler::new(width, height);
+            let buffer = assembler.data.as_ptr();
+            let plane = assembler.finish().unwrap();
+            assert_eq!(plane.data().as_ptr(), buffer, "{width}x{height} was copied");
         }
     }
 

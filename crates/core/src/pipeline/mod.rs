@@ -135,6 +135,9 @@ pub struct FuseReport {
     pub frame_tiles_read: usize,
     pub in_flight_limit: usize,
     pub max_bytes_in_flight: u64,
+    /// The bytes the scheduler accounted for at its in-flight limit:
+    /// `in_flight_limit` tile sets, reader scratch included.
+    pub accounted_bytes_in_flight: u64,
     pub budget_provenance: Provenance,
     pub backed_off: bool,
     pub output_width: u32,
@@ -146,6 +149,9 @@ pub struct FuseReport {
     pub align_source: String,
     pub align_workers: Option<usize>,
     pub peak_align_workers: Option<usize>,
+    /// The bytes the align stage accounted for (shared reference data plus
+    /// one registration per worker); `None` when no alignment was computed.
+    pub align_accounted_bytes: Option<u64>,
     pub stages: StageTimings,
     pub wall_seconds: f64,
     pub metrics: Metrics,
@@ -192,12 +198,6 @@ pub trait StageObserver: Sync {
     /// crate and never decides how (or whether) a message is displayed.
     fn notice(&self, _message: &str) {}
 }
-
-/// A [`StageObserver`] that does nothing -- what a caller with no
-/// presentation layer of its own (a test) passes.
-pub struct NoopObserver;
-
-impl StageObserver for NoopObserver {}
 
 /// Every early exit from the spine, typed by the stage that raised it.
 #[derive(Debug, thiserror::Error)]
@@ -276,6 +276,9 @@ pub fn run(
     if let Some(tile_size) = request.tile_size {
         options.tile_size = tile_size;
     }
+    if let Some(backend) = request.backend {
+        options.tile_size = options.tile_size.min(backend.max_tile_size(spp));
+    }
 
     timer.mark(Stage::Setup);
 
@@ -290,6 +293,7 @@ pub fn run(
     let mut align_source = "skipped".to_string();
     let mut align_workers: Option<usize> = None;
     let mut peak_align_workers: Option<usize> = None;
+    let mut align_accounted_bytes: Option<u64> = None;
 
     if let Some(align_req) = &request.align {
         timer.enter(Stage::Align);
@@ -395,10 +399,10 @@ pub fn run(
                         &align_values,
                         policy,
                         &AlignDriverOptions {
+                            budget: options.budget,
                             frames_done: Some(frames_done),
                             control: Some(Arc::clone(&control)),
                             on_pause: Some(&|control| observer.paused(control)),
-                            ..Default::default()
                         },
                     );
                     done.store(true, Ordering::SeqCst);
@@ -419,6 +423,7 @@ pub fn run(
                 let solved = solved.map_err(|err| PipelineError::Align(err.to_string()))?;
                 align_workers = Some(solved.worker_limit);
                 peak_align_workers = Some(solved.peak_workers);
+                align_accounted_bytes = Some(solved.accounted_bytes);
                 let alignment = solved.alignment;
                 if !align_req.lax && alignment.failure_count() > 0 {
                     return Err(PipelineError::Align(describe_align_failure(
@@ -784,6 +789,7 @@ pub fn run(
         frame_tiles_read,
         in_flight_limit,
         max_bytes_in_flight: scheduler.budget().bytes(),
+        accounted_bytes_in_flight: in_flight_limit as u64 * scheduler.bytes_per_tile_set(),
         budget_provenance: scheduler.budget().provenance(),
         backed_off: scheduler.final_in_flight_limit() < in_flight_limit,
         output_width: applied_crop.map(|r| r.width).unwrap_or(width),
@@ -795,6 +801,7 @@ pub fn run(
         align_source,
         align_workers,
         peak_align_workers,
+        align_accounted_bytes,
         stages,
         wall_seconds,
         metrics,

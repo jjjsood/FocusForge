@@ -19,31 +19,12 @@ use focusforge_gui::overlay::CardView;
 use focusforge_gui::recent::RecentEntry;
 use focusforge_gui::{AppController, ChromeKey, OpenOutcome};
 
+use common::{controller_with_frames, copy_frame, tree};
+
 // ---------------------------------------------------------------------
 // Fixture helpers -- copies only, mirroring `tests/job.rs` and
 // `tests/entry.rs`.
 // ---------------------------------------------------------------------
-
-fn mantis_frame(index: usize) -> PathBuf {
-    common::workspace_root()
-        .join("fixtures")
-        .join("mantis-512")
-        .join("frames")
-        .join(format!("{index:02}.tif"))
-}
-
-fn tree(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp tree must be creatable");
-    dir
-}
-
-fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
-    std::fs::create_dir_all(dest_dir).unwrap();
-    std::fs::copy(mantis_frame(source_index), dest_dir.join(name))
-        .expect("fixture frame must copy");
-}
 
 /// A fresh directory of `count` copied fixture frames, opened as one
 /// unsaved project on `controller`. Returns the frames' own directory --
@@ -58,15 +39,6 @@ fn open_frames(controller: &mut AppController, name: &str, count: usize) -> Path
         OpenOutcome::Opened(_)
     ));
     root
-}
-
-/// A controller with one unsaved project over `count` copied fixture
-/// frames, its own scratch root under `CARGO_TARGET_TMPDIR`.
-fn controller_with_frames(name: &str, count: usize) -> AppController {
-    let mut controller = AppController::new();
-    open_frames(&mut controller, name, count);
-    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
-    controller
 }
 
 /// [`controller_with_frames`], plus the frames directory itself -- for a
@@ -104,7 +76,7 @@ fn seal_as_given_project(name: &str) -> PathBuf {
 
     let staging = tree(&format!("{name}_staging"));
     let composite = staging.join("composite.tif");
-    std::fs::copy(mantis_frame(0), &composite).unwrap();
+    std::fs::copy(common::fixture_frame("mantis-512", 0), &composite).unwrap();
     let zmap = staging.join("zmap.tif");
     let mut writer = ZMapWriter::create(&zmap, ZMapInfo::new(4, 4, 2).unwrap()).unwrap();
     writer
@@ -638,7 +610,11 @@ fn run_again_stays_on_one_card_until_success() {
         "a repeated failure updates the same card, not a new one"
     );
 
-    std::fs::copy(mantis_frame(1), fail_dir.join("01.tif")).unwrap();
+    std::fs::copy(
+        common::fixture_frame("mantis-512", 1),
+        fail_dir.join("01.tif"),
+    )
+    .unwrap();
     assert!(controller.run_gallery_action(1));
     wait_for_settle(&mut controller, Duration::from_secs(60));
     let cards = controller.project_cards();
@@ -1385,4 +1361,317 @@ fn gallery_lays_out_and_scrolls() {
         0.0,
         "scroll clamps at the top"
     );
+}
+
+// ---------------------------------------------------------------------
+// Scrolling and progress reuse every picture; a hidden overlay publishes
+// nothing until it opens again.
+// ---------------------------------------------------------------------
+
+fn element_center(handle: &i_slint_backend_testing::ElementHandle) -> slint::LogicalPosition {
+    let pos = handle.absolute_position();
+    let size = handle.size();
+    slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0)
+}
+
+/// Runs the calling test again alone in a child process -- timing
+/// accounting is process-global. Returns true in the parent, which is done.
+fn ran_in_child(test: &str) -> bool {
+    const CHILD: &str = "FOCUSFORGE_GUI_OVERLAY_ACCOUNTING_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return false;
+    }
+    let status =
+        std::process::Command::new(std::env::current_exe().expect("the test binary has a path"))
+            .args(["--exact", test, "--test-threads=1"])
+            .env(CHILD, "1")
+            .status()
+            .expect("the isolated accounting test starts");
+    assert!(
+        status.success(),
+        "the isolated accounting test passes: {status}"
+    );
+    true
+}
+
+/// `(row_updates, thumbnail_bytes)` so far.
+fn overlay_counters() -> (u64, u64) {
+    let snapshot = focusforge_core::timing::timing_snapshot().expect("trace accounting is enabled");
+    (snapshot.row_updates, snapshot.thumbnail_bytes)
+}
+
+type Captured = std::sync::Arc<std::sync::Mutex<Vec<focusforge_gui::ShellEvent>>>;
+
+/// A 1100x500 window over three two-frame projects with project 0 active,
+/// the bridge installed and every event captured rather than performed.
+fn overlay_window(
+    name: &str,
+    recent_dir: Option<&Path>,
+) -> (
+    focusforge_gui::AppWindow,
+    std::sync::Arc<std::sync::Mutex<AppController>>,
+    Captured,
+    focusforge_gui::bridge::Installed,
+) {
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    focusforge_core::timing::enable_trace_accounting();
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1100, 500));
+    let mut controller = AppController::new();
+    if let Some(dir) = recent_dir {
+        controller.install_recent(focusforge_gui::recent::load(dir), dir.to_path_buf());
+    }
+    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
+    for i in 0..3 {
+        open_frames(&mut controller, &format!("{name}_{i}"), 2);
+    }
+    controller.select_project(0);
+    let controller = Arc::new(Mutex::new(controller));
+    let installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    let events: Captured = Arc::new(Mutex::new(Vec::new()));
+    controller.lock().unwrap().set_sink(Arc::new({
+        let events = events.clone();
+        move |event| events.lock().unwrap().push(event)
+    }));
+    app.set_project_loaded(true);
+    (app, controller, events, installed)
+}
+
+fn shown_pictures(app: &focusforge_gui::AppWindow) -> Vec<slint::Image> {
+    use slint::Model;
+    app.get_project_cards().iter().map(|c| c.picture).collect()
+}
+
+#[test]
+fn gallery_scrolling_and_progress_reuse_every_picture() {
+    use focusforge_gui::ShellEvent;
+    use slint::platform::{PointerEventButton, WindowEvent};
+    use slint::{ComponentHandle, Model};
+
+    if ran_in_child("gallery_scrolling_and_progress_reuse_every_picture") {
+        return;
+    }
+    let (app, controller, events, _installed) = overlay_window("gallery_reuse", None);
+    let push = || {
+        focusforge_gui::bridge::push_projects_overlay(&app, &controller.lock().unwrap());
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
+    };
+    // What the event loop does with each captured event.
+    let perform = || {
+        let drained: Vec<ShellEvent> = events.lock().unwrap().drain(..).collect();
+        for event in &drained {
+            match event {
+                ShellEvent::GalleryScrolled => {
+                    app.set_gallery_scroll_y(controller.lock().unwrap().gallery_scroll_y())
+                }
+                ShellEvent::OverlayChanged => push(),
+                _ => {}
+            }
+        }
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
+        drained
+    };
+    let dispatch = |event: WindowEvent| {
+        app.window().dispatch_event(event);
+        perform()
+    };
+
+    controller.lock().unwrap().toggle_projects_overlay();
+    perform();
+    perform();
+    let before = overlay_counters();
+    let pictures = shown_pictures(&app);
+    assert_eq!(pictures.len(), 3);
+
+    let hit = i_slint_backend_testing::ElementQuery::from_root(&app)
+        .match_id("FFProjectsGallery::hit-area")
+        .find_first()
+        .expect("the open gallery is mounted");
+    let mut seen = dispatch(WindowEvent::PointerScrolled {
+        position: element_center(&hit),
+        delta_x: 0.0,
+        delta_y: -100_000.0,
+    });
+    let bottom = controller.lock().unwrap().gallery_scroll_y();
+    assert!(bottom > 0.0, "the wheel moved the gallery");
+    assert_eq!(app.get_gallery_scroll_y(), bottom);
+
+    // A press on the bare track above the thumb jumps back to the top. The
+    // gallery's bar is the nearest one right of its viewport.
+    let (hit_pos, hit_size) = (hit.absolute_position(), hit.size());
+    let right = hit_pos.x + hit_size.width;
+    let track = i_slint_backend_testing::ElementQuery::from_root(&app)
+        .match_id("FFScrollbar::track-area")
+        .find_all()
+        .into_iter()
+        .filter(|t| {
+            let c = element_center(t);
+            c.x > right && c.y > hit_pos.y && c.y < hit_pos.y + hit_size.height
+        })
+        .min_by(|a, b| element_center(a).x.total_cmp(&element_center(b).x))
+        .expect("the gallery scrollbar is mounted");
+    let top =
+        slint::LogicalPosition::new(element_center(&track).x, track.absolute_position().y + 1.0);
+    for event in [
+        WindowEvent::PointerMoved { position: top },
+        WindowEvent::PointerPressed {
+            position: top,
+            button: PointerEventButton::Left,
+        },
+        WindowEvent::PointerReleased {
+            position: top,
+            button: PointerEventButton::Left,
+        },
+    ] {
+        seen.extend(dispatch(event));
+    }
+    assert_eq!(controller.lock().unwrap().gallery_scroll_y(), 0.0);
+    assert_eq!(app.get_gallery_scroll_y(), 0.0);
+
+    controller
+        .lock()
+        .unwrap()
+        .set_gallery_viewport_height(120.0);
+    seen.extend(perform());
+
+    assert_eq!(overlay_counters(), before, "scrolling touches no card");
+    assert!(!seen.contains(&ShellEvent::OverlayChanged), "{seen:?}");
+    assert!(seen.contains(&ShellEvent::GalleryScrolled), "{seen:?}");
+    assert!(shown_pictures(&app) == pictures);
+
+    // A live fuse on project 0: progress pushes convert nothing.
+    assert!(controller.lock().unwrap().start_fuse());
+    let mut saw_progress = false;
+    let start = std::time::Instant::now();
+    while controller.lock().unwrap().settle_job().is_none() {
+        push();
+        saw_progress |= app.get_project_cards().row_data(0).unwrap().fusing;
+        assert_eq!(overlay_counters().1, before.1, "progress converts nothing");
+        assert!(shown_pictures(&app) == pictures);
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "the fuse settles"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(saw_progress, "a push showed the running card");
+    push();
+    let settled = shown_pictures(&app);
+    let thumbnail = u64::from(
+        focusforge_gui::overlay::THUMBNAIL_WIDTH * focusforge_gui::overlay::THUMBNAIL_HEIGHT * 4,
+    );
+    assert_eq!(overlay_counters().1 - before.1, thumbnail);
+    assert!(
+        settled[0] != pictures[0],
+        "the fused card's picture changed"
+    );
+    assert!(
+        settled[1..] == pictures[1..],
+        "no other card's picture changed"
+    );
+
+    // Closing project 1 drops its card and its cached handle alone.
+    let closed = controller.lock().unwrap().project_cards()[1]
+        .picture
+        .clone()
+        .expect("an open project has a picture");
+    assert!(
+        std::sync::Arc::weak_count(&closed) > 0,
+        "the handle is cached"
+    );
+    controller.lock().unwrap().close_project(1);
+    push();
+    let remaining = shown_pictures(&app);
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining[0] == settled[0] && remaining[1] == settled[2]);
+    assert_eq!(
+        std::sync::Arc::weak_count(&closed),
+        0,
+        "its handle is released"
+    );
+}
+
+#[test]
+fn a_hidden_overlay_publishes_nothing_until_reopened() {
+    use slint::Model;
+
+    if ran_in_child("a_hidden_overlay_publishes_nothing_until_reopened") {
+        return;
+    }
+    let recent_dir = tree("hidden_overlay_recent");
+    let (app, controller, _events, _installed) =
+        overlay_window("hidden_overlay", Some(&recent_dir));
+    let push = || {
+        focusforge_gui::bridge::push_projects_overlay(&app, &controller.lock().unwrap());
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
+    };
+    controller.lock().unwrap().toggle_projects_overlay();
+    push();
+    controller.lock().unwrap().toggle_projects_overlay();
+    push();
+    assert!(!app.get_projects_overlay_open());
+    let before = overlay_counters();
+
+    controller.lock().unwrap().select_project(2);
+    push();
+    assert!(controller.lock().unwrap().start_fuse());
+    let start = std::time::Instant::now();
+    while controller.lock().unwrap().settle_job().is_none() {
+        push();
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "the fuse settles"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    push();
+    assert_eq!(
+        overlay_counters(),
+        before,
+        "a hidden overlay publishes nothing"
+    );
+
+    controller.lock().unwrap().toggle_projects_overlay();
+    push();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let controller = controller.lock().unwrap();
+    let expected = controller.project_cards();
+    let shown: Vec<_> = app.get_project_cards().iter().collect();
+    assert_eq!(shown.len(), expected.len());
+    for (card, want) in shown.iter().zip(&expected) {
+        assert_eq!(card.current, want.current);
+        assert_eq!(card.fusing, want.fusing);
+        assert_eq!(card.fusing_fraction, want.fusing_fraction);
+        assert_eq!(card.meta_text.as_str(), want.meta_text);
+    }
+    assert!(expected[2].current, "the selection made while hidden shows");
+    let recent: Vec<_> = app
+        .get_recent_rows()
+        .iter()
+        .map(|r| {
+            (
+                r.name.to_string(),
+                r.folder.to_string(),
+                r.date_text.to_string(),
+            )
+        })
+        .collect();
+    let want: Vec<_> = controller
+        .recent_rows(now)
+        .into_iter()
+        .map(|r| (r.name, r.folder, r.date_text))
+        .collect();
+    assert!(!want.is_empty(), "the opened projects are recent");
+    assert_eq!(recent, want);
 }

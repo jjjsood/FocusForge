@@ -127,6 +127,7 @@ use crate::align::transform::Transform;
 use crate::align::warp::catmull_rom_weights;
 use crate::fuse::pyramid::Plane;
 use crate::tile::Rect;
+use crate::timing::{TimingCounter, mark_timing_saturated, measurement_scope, record_timing};
 
 /// The two degree-of-freedom parameterizations [`solve_level`] supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,19 +346,157 @@ fn central_diff_gradient(template: &Plane, x: u32, y: u32) -> (f32, f32) {
     (gx, gy)
 }
 
-/// `(ī_r zero-mean vector, Gt, v = C^-1 Gt, num, ‖ī_r‖^2)`, the return shape
-/// [`compute_ir_stats`] and the loop's full-overlap cache share.
-type IrStats<const K: usize> = (Vec<f64>, [f64; K], [f64; K], f64, f64);
+/// `(Gt, v = C^-1 Gt, num, ‖ī_r‖^2)`, the scalars [`compute_ir_stats`]
+/// returns next to the zero-mean template vector it fills.
+type IrStats<const K: usize> = ([f64; K], [f64; K], f64, f64);
 
-/// Template-only precompute, cached once full overlap is first observed:
-/// `Gt`, `v = C^-1 Gt`, `num = ‖ī_r‖^2 - Gt^t v` and the zero-mean template
-/// vector itself (needed for ρ's cross term every iteration).
-struct CachedTemplate<const K: usize> {
+struct TimingBytes {
+    counter: TimingCounter,
+    bytes: u64,
+    operations: u64,
+    saturated: bool,
+}
+
+impl TimingBytes {
+    fn new(counter: TimingCounter) -> Self {
+        Self {
+            counter,
+            bytes: 0,
+            operations: 0,
+            saturated: false,
+        }
+    }
+
+    fn add(&mut self, bytes: usize) {
+        if bytes != 0 {
+            self.bytes = match self.bytes.checked_add(bytes as u64) {
+                Some(total) => total,
+                None => {
+                    self.saturated = true;
+                    u64::MAX
+                }
+            };
+            self.operations = match self.operations.checked_add(1) {
+                Some(total) => total,
+                None => {
+                    self.saturated = true;
+                    u64::MAX
+                }
+            };
+        }
+    }
+}
+
+impl Drop for TimingBytes {
+    fn drop(&mut self) {
+        if self.saturated {
+            mark_timing_saturated();
+        }
+        if self.bytes != 0 {
+            record_timing(self.counter, self.bytes);
+            let operations = match self.counter {
+                TimingCounter::AllocationBytes => TimingCounter::AllocationOperations,
+                TimingCounter::CopyBytes => TimingCounter::CopyOperations,
+                _ => return,
+            };
+            record_timing(operations, self.operations);
+        }
+    }
+}
+
+/// The template statistics under full overlap, where every sample is valid
+/// and they depend on the template alone: `Gt`, `v = C^-1 Gt`,
+/// `num = ‖ī_r‖^2 - Gt^t v` and the zero-mean template vector itself (needed
+/// for ρ's cross term every iteration).
+struct FullOverlapStats<const K: usize> {
     ir_zero: Vec<f64>,
     gt: [f64; K],
     v: [f64; K],
     num: f64,
     ir_ss: f64,
+}
+
+/// Everything a solve needs from the template that does not depend on the
+/// moving plane, for `K` degrees of freedom.
+struct TemplateData<const K: usize> {
+    /// Template values over the region, row-major.
+    values: Vec<f32>,
+    /// Column-centred Jacobian rows, one per region pixel.
+    g_centered: Vec<[f64; K]>,
+    /// `C = Ḡ^t Ḡ`.
+    c: [[f64; K]; K],
+    /// `C` has no usable pivot: a flat, textureless template.
+    singular: bool,
+    /// `None` when `C` is singular or `v = C^-1 Gt` failed.
+    full_overlap: Option<FullOverlapStats<K>>,
+}
+
+enum TemplateKind {
+    Translation(TemplateData<2>),
+    Similarity(TemplateData<4>),
+}
+
+/// A template plane prepared for one region and mode: values, Jacobian,
+/// normal matrix and full-overlap statistics, all pure functions of those
+/// inputs. Built once, it serves every solve against any moving plane.
+pub(crate) struct EccTemplate {
+    region: Rect,
+    kind: TemplateKind,
+}
+
+impl EccTemplate {
+    /// Prepares `template` over `region`, after the region checks
+    /// [`solve_level`] documents.
+    pub(crate) fn prepare(
+        template: &Plane,
+        region: Rect,
+        mode: EccMode,
+    ) -> Result<Self, AlignError> {
+        if region.width == 0 || region.height == 0 {
+            return Err(AlignError::RegionTooSmall { region });
+        }
+        let valid_x_hi = template.width().saturating_sub(1);
+        let valid_y_hi = template.height().saturating_sub(1);
+        let region_ok = region.x >= 1
+            && region.y >= 1
+            && region.x + region.width <= valid_x_hi
+            && region.y + region.height <= valid_y_hi;
+        if !region_ok {
+            return Err(AlignError::RegionOutOfBounds {
+                region,
+                plane: (template.width(), template.height()),
+            });
+        }
+
+        let _scope = measurement_scope("ecc_template_prepare");
+        let kind = match mode {
+            EccMode::Translation => {
+                TemplateKind::Translation(prepare_data::<2>(template, region, |gx, gy, _x, _y| {
+                    [f64::from(gx), f64::from(gy)]
+                }))
+            }
+            EccMode::Similarity => {
+                let (cx, cy) = similarity_centre(region);
+                TemplateKind::Similarity(prepare_data::<4>(template, region, |gx, gy, x, y| {
+                    similarity_jacobian_row(gx, gy, x, y, cx, cy)
+                }))
+            }
+        };
+        Ok(Self { region, kind })
+    }
+
+    pub(crate) fn region(&self) -> Rect {
+        self.region
+    }
+}
+
+/// The centre of `region` the similarity Jacobian is measured from and its
+/// increment is conjugated about.
+fn similarity_centre(region: Rect) -> (f64, f64) {
+    (
+        region.x as f64 + (region.width as f64 - 1.0) / 2.0,
+        region.y as f64 + (region.height as f64 - 1.0) / 2.0,
+    )
 }
 
 /// Recovers the [`Transform`] mapping `template`'s pixel coordinates into
@@ -418,7 +557,7 @@ pub fn solve_level_traced(
 /// The validation and mode dispatch shared by [`solve_level`] and
 /// [`solve_level_traced`]. `trace` is `None` on the plain path, so tracing
 /// costs the untraced caller no allocation and no branch of real work beyond
-/// one `Option` check per iteration inside [`solve_level_generic`].
+/// one `Option` check per iteration inside [`solve_prepared`].
 fn solve_level_dispatch(
     template: &Plane,
     region: Rect,
@@ -458,51 +597,44 @@ fn solve_level_dispatch(
             moving_spp: moving.samples_per_pixel(),
         });
     }
-    if region.width == 0 || region.height == 0 {
-        return Err(AlignError::RegionTooSmall { region });
-    }
-    let valid_x_hi = template.width().saturating_sub(1);
-    let valid_y_hi = template.height().saturating_sub(1);
-    let region_ok = region.x >= 1
-        && region.y >= 1
-        && region.x + region.width <= valid_x_hi
-        && region.y + region.height <= valid_y_hi;
-    if !region_ok {
-        return Err(AlignError::RegionOutOfBounds {
-            region,
-            plane: (template.width(), template.height()),
-        });
-    }
+    let prepared = EccTemplate::prepare(template, region, mode)?;
+    Ok(solve_prepared(&prepared, moving, initial, params, trace))
+}
 
-    match mode {
-        EccMode::Translation => solve_level_generic::<2>(
-            template,
+/// Solves against a prepared template. `moving` must be single-channel and
+/// `params` well-formed; [`solve_level`] checks both, and the pyramid's luma
+/// planes satisfy the first by construction.
+pub(crate) fn solve_prepared(
+    template: &EccTemplate,
+    moving: &Plane,
+    initial: &Transform,
+    params: &EccParams,
+    trace: Option<&mut Vec<EccIteration>>,
+) -> EccResult {
+    let region = template.region;
+    match &template.kind {
+        TemplateKind::Translation(data) => solve_generic::<2>(
+            data,
             region,
             moving,
             initial,
             params,
-            |gx, gy, _x, _y| [f64::from(gx), f64::from(gy)],
             |dp: &[f64; 2]| Transform::translation(dp[0], dp[1]),
             trace,
         ),
-        EccMode::Similarity => {
-            // The Jacobian's `x, y` are centred on `region`'s own centre,
-            // not measured from the image origin -- see
-            // `similarity_jacobian_row`'s doc comment for why -- and the
+        TemplateKind::Similarity(data) => {
+            // The Jacobian was centred on `region`'s own centre, not
+            // measured from the image origin -- see
+            // `similarity_jacobian_row`'s doc comment for why -- so the
             // recovered increment is conjugated back to image coordinates
-            // about the same centre in `similarity_delta`. The two must
-            // share exactly this `(cx, cy)`, which is why both closures
-            // below capture it from the same two `let`s rather than each
-            // recomputing it.
-            let cx = region.x as f64 + (region.width as f64 - 1.0) / 2.0;
-            let cy = region.y as f64 + (region.height as f64 - 1.0) / 2.0;
-            solve_level_generic::<4>(
-                template,
+            // about the same centre.
+            let (cx, cy) = similarity_centre(region);
+            solve_generic::<4>(
+                data,
                 region,
                 moving,
                 initial,
                 params,
-                move |gx, gy, x, y| similarity_jacobian_row(gx, gy, x, y, cx, cy),
                 move |dp: &[f64; 4]| similarity_delta(dp, cx, cy),
                 trace,
             )
@@ -560,47 +692,35 @@ fn similarity_delta(dp: &[f64; 4], cx: f64, cy: f64) -> Transform {
         .compose(&Transform::translation(-cx, -cy))
 }
 
-/// The shared solve, generic over the parameterization's degree of freedom
-/// `K`. `jacobian_row(grad_x, grad_y, x, y)` builds one row of `G` (never
-/// *column*-centred here -- that happens below, uniformly for every mode;
-/// a mode whose conditioning needs `x, y` themselves centred, as
-/// [`EccMode::Similarity`] does, does that internally, see
-/// [`similarity_jacobian_row`]); `build_delta(&Δp)` builds `ΔW` from a
-/// solved increment (paired with any such internal centring by conjugating
-/// the result back, see [`similarity_delta`]). See the module docs for
-/// every equation used here.
-#[allow(clippy::too_many_arguments)]
-fn solve_level_generic<const K: usize>(
+/// The template precompute for `K` degrees of freedom.
+/// `jacobian_row(grad_x, grad_y, x, y)` builds one row of `G`; the column
+/// centring happens here, uniformly for every mode (a mode that needs `x, y`
+/// centred, as [`EccMode::Similarity`] does, does that in the closure, see
+/// [`similarity_jacobian_row`]). The module docs give every equation.
+fn prepare_data<const K: usize>(
     template: &Plane,
     region: Rect,
-    moving: &Plane,
-    initial: &Transform,
-    params: &EccParams,
     jacobian_row: impl Fn(f32, f32, f64, f64) -> [f64; K],
-    build_delta: impl Fn(&[f64; K]) -> Transform,
-    mut trace: Option<&mut Vec<EccIteration>>,
-) -> Result<EccResult, AlignError> {
+) -> TemplateData<K> {
     let region_pixel_count = region.width as usize * region.height as usize;
+    let mut allocated = TimingBytes::new(TimingCounter::AllocationBytes);
 
-    // ---- template precompute, once, outside the loop -------------------
-    let mut positions = Vec::with_capacity(region_pixel_count);
-    let mut template_values = Vec::with_capacity(region_pixel_count);
-    let mut g_rows: Vec<[f64; K]> = Vec::with_capacity(region_pixel_count);
+    let mut values: Vec<f32> = Vec::with_capacity(region_pixel_count);
+    let mut g_centered: Vec<[f64; K]> = Vec::with_capacity(region_pixel_count);
+    allocated.add(values.capacity() * std::mem::size_of::<f32>());
+    allocated.add(g_centered.capacity() * std::mem::size_of::<[f64; K]>());
     for dy in 0..region.height {
         for dx in 0..region.width {
             let x = region.x + dx;
             let y = region.y + dy;
             let (gx, gy) = central_diff_gradient(template, x, y);
-            let (xf, yf) = (x as f64, y as f64);
-            positions.push((xf, yf));
-            template_values
-                .push(template.data()[y as usize * template.width() as usize + x as usize]);
-            g_rows.push(jacobian_row(gx, gy, xf, yf));
+            values.push(template.data()[y as usize * template.width() as usize + x as usize]);
+            g_centered.push(jacobian_row(gx, gy, x as f64, y as f64));
         }
     }
 
     let mut col_mean = [0.0f64; K];
-    for row in &g_rows {
+    for row in &g_centered {
         for k in 0..K {
             col_mean[k] += row[k];
         }
@@ -608,16 +728,11 @@ fn solve_level_generic<const K: usize>(
     for m in &mut col_mean {
         *m /= region_pixel_count as f64;
     }
-    let g_centered: Vec<[f64; K]> = g_rows
-        .iter()
-        .map(|row| {
-            let mut r = [0.0f64; K];
-            for k in 0..K {
-                r[k] = row[k] - col_mean[k];
-            }
-            r
-        })
-        .collect();
+    for row in &mut g_centered {
+        for k in 0..K {
+            row[k] -= col_mean[k];
+        }
+    }
 
     let mut c = [[0.0f64; K]; K];
     for row in &g_centered {
@@ -630,8 +745,52 @@ fn solve_level_generic<const K: usize>(
 
     // A flat, textureless template makes `C` the zero matrix: the pivot
     // test fires here, before ρ is ever formed.
-    if solve_linear(c, [0.0f64; K]).is_none() {
-        return Ok(EccResult {
+    let singular = solve_linear(c, [0.0f64; K]).is_none();
+    let full_overlap = if singular {
+        None
+    } else {
+        let mut ir_zero = vec![0.0f64; region_pixel_count];
+        allocated.add(ir_zero.capacity() * std::mem::size_of::<f64>());
+        compute_ir_stats(&values, &g_centered, None, c, &mut ir_zero).map(|(gt, v, num, ir_ss)| {
+            FullOverlapStats {
+                ir_zero,
+                gt,
+                v,
+                num,
+                ir_ss,
+            }
+        })
+    };
+
+    TemplateData {
+        values,
+        g_centered,
+        c,
+        singular,
+        full_overlap,
+    }
+}
+
+/// The shared solve against a prepared template, for `K` degrees of freedom.
+/// `build_delta(&Δp)` builds `ΔW` from a solved increment (conjugated back
+/// where the Jacobian was centred, see [`similarity_delta`]). The
+/// per-iteration working vectors are allocated once, before the loop, and
+/// overwritten in full on every iteration. The module docs give every
+/// equation.
+fn solve_generic<const K: usize>(
+    data: &TemplateData<K>,
+    region: Rect,
+    moving: &Plane,
+    initial: &Transform,
+    params: &EccParams,
+    build_delta: impl Fn(&[f64; K]) -> Transform,
+    mut trace: Option<&mut Vec<EccIteration>>,
+) -> EccResult {
+    let region_pixel_count = data.values.len();
+    let c = data.c;
+
+    if data.singular {
+        return EccResult {
             transform: *initial,
             status: EccStatus::Diverged(DivergenceReason::SingularHessian),
             iterations: 0,
@@ -639,15 +798,22 @@ fn solve_level_generic<const K: usize>(
             valid_samples: 0,
             valid_fraction: 0.0,
             final_step: None,
-        });
+        };
     }
+
+    let mut allocated = TimingBytes::new(TimingCounter::AllocationBytes);
+    let mut iw_value: Vec<Option<f32>> = vec![None; region_pixel_count];
+    let mut iw_zero = vec![0.0f64; region_pixel_count];
+    let mut ir_zero_partial = vec![0.0f64; region_pixel_count];
+    allocated.add(iw_value.capacity() * std::mem::size_of::<Option<f32>>());
+    allocated.add(iw_zero.capacity() * std::mem::size_of::<f64>());
+    allocated.add(ir_zero_partial.capacity() * std::mem::size_of::<f64>());
 
     // ---- iteration state -------------------------------------------------
     let mut w = *initial;
     let mut best_transform = *initial;
     let mut best_correlation = -1.0f64;
     let mut iterations_done = 0u32;
-    let mut cached: Option<CachedTemplate<K>> = None;
     // The step measure of the last iteration that reached the termination
     // comparison -- `None` until then, so a divergence before any iteration
     // completes reports no step. Declared here, with the other
@@ -658,7 +824,7 @@ fn solve_level_generic<const K: usize>(
 
     macro_rules! diverge {
         ($reason:expr, $valid_samples:expr, $valid_fraction:expr) => {
-            return Ok(EccResult {
+            return EccResult {
                 transform: best_transform,
                 status: EccStatus::Diverged($reason),
                 iterations: iterations_done,
@@ -666,20 +832,23 @@ fn solve_level_generic<const K: usize>(
                 valid_samples: $valid_samples,
                 valid_fraction: $valid_fraction,
                 final_step: last_step,
-            });
+            };
         };
     }
 
     for _ in 0..params.max_iterations {
         // ---- sample the moving plane at W(x) for every x in region -----
-        let mut iw_value: Vec<Option<f32>> = Vec::with_capacity(region_pixel_count);
         let mut valid_count = 0usize;
-        for &(x, y) in &positions {
-            let s = sample_plane(moving, &w, x, y);
-            if s.is_some() {
-                valid_count += 1;
+        let mut n = 0usize;
+        for y in region.y..region.y + region.height {
+            for x in region.x..region.x + region.width {
+                let s = sample_plane(moving, &w, x as f64, y as f64);
+                if s.is_some() {
+                    valid_count += 1;
+                }
+                iw_value[n] = s;
+                n += 1;
             }
-            iw_value.push(s);
         }
         let valid_fraction = valid_count as f64 / region_pixel_count as f64;
 
@@ -693,38 +862,32 @@ fn solve_level_generic<const K: usize>(
 
         let full = has_full_overlap(valid_count, region_pixel_count);
 
-        // ---- ī_r, Gt, v, num: cached under guaranteed full overlap ------
-        let (ir_zero, gt, v, num, ir_ss) = if full {
-            if let Some(c) = &cached {
-                (c.ir_zero.clone(), c.gt, c.v, c.num, c.ir_ss)
-            } else {
-                let computed = compute_ir_stats(&template_values, &g_centered, &iw_value, c);
-                let Some((ir_zero, gt, v, num, ir_ss)) = computed else {
-                    diverge!(
-                        DivergenceReason::SingularHessian,
-                        valid_count,
-                        valid_fraction
-                    );
-                };
-                cached = Some(CachedTemplate {
-                    ir_zero: ir_zero.clone(),
-                    gt,
-                    v,
-                    num,
-                    ir_ss,
-                });
-                (ir_zero, gt, v, num, ir_ss)
-            }
-        } else {
-            let computed = compute_ir_stats(&template_values, &g_centered, &iw_value, c);
-            let Some(result) = computed else {
+        // ---- ī_r, Gt, v, num: borrowed under guaranteed full overlap ----
+        let (ir_zero, gt, v, num, ir_ss): (&[f64], _, _, _, _) = if full {
+            let Some(stats) = &data.full_overlap else {
                 diverge!(
                     DivergenceReason::SingularHessian,
                     valid_count,
                     valid_fraction
                 );
             };
-            result
+            (&stats.ir_zero, stats.gt, stats.v, stats.num, stats.ir_ss)
+        } else {
+            let computed = compute_ir_stats(
+                &data.values,
+                &data.g_centered,
+                Some(&iw_value),
+                c,
+                &mut ir_zero_partial,
+            );
+            let Some((gt, v, num, ir_ss)) = computed else {
+                diverge!(
+                    DivergenceReason::SingularHessian,
+                    valid_count,
+                    valid_fraction
+                );
+            };
+            (&ir_zero_partial, gt, v, num, ir_ss)
         };
 
         // ---- ī_w, Gw, cross ---------------------------------------------
@@ -734,11 +897,8 @@ fn solve_level_generic<const K: usize>(
         }
         let iw_mean = iw_sum / valid_count as f64;
 
-        let mut iw_zero = vec![0.0f64; region_pixel_count];
-        for (n, s) in iw_value.iter().enumerate() {
-            if let Some(v) = s {
-                iw_zero[n] = f64::from(*v) - iw_mean;
-            }
+        for (zero, s) in iw_zero.iter_mut().zip(&iw_value) {
+            *zero = s.map_or(0.0, |v| f64::from(v) - iw_mean);
         }
 
         let mut gw = [0.0f64; K];
@@ -748,8 +908,8 @@ fn solve_level_generic<const K: usize>(
             if iw_value[n].is_none() {
                 continue;
             }
-            for k in 0..K {
-                gw[k] += g_centered[n][k] * iw_zero[n];
+            for (acc, g) in gw.iter_mut().zip(&data.g_centered[n]) {
+                *acc += g * iw_zero[n];
             }
             iw_ss += iw_zero[n] * iw_zero[n];
             cross += ir_zero[n] * iw_zero[n];
@@ -859,7 +1019,7 @@ fn solve_level_generic<const K: usize>(
         iterations_done += 1;
 
         if step < params.epsilon_px {
-            return Ok(EccResult {
+            return EccResult {
                 transform: w,
                 status: EccStatus::Converged,
                 iterations: iterations_done,
@@ -867,11 +1027,11 @@ fn solve_level_generic<const K: usize>(
                 valid_samples: valid_count,
                 valid_fraction,
                 final_step: Some(step),
-            });
+            };
         }
 
         if iterations_done == params.max_iterations {
-            return Ok(EccResult {
+            return EccResult {
                 transform: w,
                 status: EccStatus::HitCap,
                 iterations: iterations_done,
@@ -879,38 +1039,42 @@ fn solve_level_generic<const K: usize>(
                 valid_samples: valid_count,
                 valid_fraction,
                 final_step: Some(step),
-            });
+            };
         }
     }
 
     unreachable!("the loop above always returns by max_iterations")
 }
 
-/// Computes `(ī_r zero-mean vector, Gt, v = C^-1 Gt, num, ‖ī_r‖^2)` over the
-/// positions where `iw_value` is `Some` -- "the current overlap", per the
-/// module docs. `None` propagates [`DivergenceReason::SingularHessian`]
-/// from [`solve_linear`] (should not happen once the pre-loop check on `c`
-/// has passed, but never propagated as a panic either way).
+/// Fills `ir_zero` with the zero-mean template vector and computes
+/// `(Gt, v = C^-1 Gt, num, ‖ī_r‖^2)` over the positions where `valid` is
+/// `Some` -- "the current overlap", per the module docs -- or over every
+/// position when `valid` is `None`. Invalid positions hold `0.0`. `None`
+/// means [`solve_linear`] found `C` singular.
 fn compute_ir_stats<const K: usize>(
     template_values: &[f32],
     g_centered: &[[f64; K]],
-    iw_value: &[Option<f32>],
+    valid: Option<&[Option<f32>]>,
     c: [[f64; K]; K],
+    ir_zero: &mut [f64],
 ) -> Option<IrStats<K>> {
-    let valid_count = iw_value.iter().filter(|v| v.is_some()).count();
+    let is_valid = |n: usize| valid.is_none_or(|samples| samples[n].is_some());
+    let valid_count = valid.map_or(template_values.len(), |samples| {
+        samples.iter().filter(|v| v.is_some()).count()
+    });
     let mut ir_mean = 0.0f64;
-    for (n, s) in iw_value.iter().enumerate() {
-        if s.is_some() {
-            ir_mean += f64::from(template_values[n]);
+    for (n, &value) in template_values.iter().enumerate() {
+        if is_valid(n) {
+            ir_mean += f64::from(value);
         }
     }
     ir_mean /= valid_count as f64;
 
-    let mut ir_zero = vec![0.0f64; template_values.len()];
     let mut gt = [0.0f64; K];
     let mut ir_ss = 0.0f64;
     for n in 0..template_values.len() {
-        if iw_value[n].is_none() {
+        if !is_valid(n) {
+            ir_zero[n] = 0.0;
             continue;
         }
         let v = f64::from(template_values[n]) - ir_mean;
@@ -923,12 +1087,24 @@ fn compute_ir_stats<const K: usize>(
 
     let v = solve_linear(c, gt)?;
     let num = ir_ss - dot(&gt, &v);
-    Some((ir_zero, gt, v, num, ir_ss))
+    Some((gt, v, num, ir_ss))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_aggregate_saturation_is_retained_for_the_summary() {
+        let mut allocations = TimingBytes::new(TimingCounter::AllocationBytes);
+        allocations.bytes = u64::MAX - 1;
+        allocations.operations = u64::MAX;
+        allocations.add(2);
+
+        assert_eq!(allocations.bytes, u64::MAX);
+        assert_eq!(allocations.operations, u64::MAX);
+        assert!(allocations.saturated);
+    }
 
     fn constant_template(width: u32, height: u32, value: f32) -> Plane {
         Plane::from_f32(
@@ -1095,6 +1271,21 @@ mod tests {
         (template, moving)
     }
 
+    /// Transform, iterations, correlation, valid samples and final step of
+    /// the partial-overlap solve below, as exact bits.
+    type Bits = ([[u64; 3]; 3], u32, u64, usize, Option<u64>);
+    const RECORDED_PARTIAL_OVERLAP: Bits = (
+        [
+            [4607182418800017408, 0, 4625196980213793450],
+            [0, 4607182418800017408, 13758940349299114195],
+            [0, 0, 4607182418800017408],
+        ],
+        40,
+        4607182418785924539,
+        3540,
+        Some(4546068755340786267),
+    );
+
     #[test]
     fn partial_overlap_recomputes_and_still_recovers() {
         let (width, height) = (SINUSOID_WIDTH, SINUSOID_HEIGHT);
@@ -1134,6 +1325,14 @@ mod tests {
         .expect("valid solver inputs");
 
         assert_eq!(result.status, EccStatus::Converged, "result: {result:?}");
+        let bits = (
+            result.transform.m.map(|row| row.map(f64::to_bits)),
+            result.iterations,
+            result.correlation.to_bits(),
+            result.valid_samples,
+            result.final_step.map(f64::to_bits),
+        );
+        assert_eq!(bits, RECORDED_PARTIAL_OVERLAP);
         assert!(
             result.valid_fraction < 1.0,
             "the converged iteration had full overlap -- this test does not \
@@ -1519,7 +1718,7 @@ mod tests {
     }
 
     /// The permanent guard for the similarity Jacobian's conditioning
-    /// defect: the same normal-matrix construction [`solve_level_generic`]
+    /// defect: the same normal-matrix construction [`prepare_data`]
     /// uses, driven directly (no image sampling, no solver loop -- a pure
     /// linear-algebra check, ~0.04s), at a small region offset and a large
     /// one.
@@ -1559,7 +1758,7 @@ mod tests {
             })
             .collect();
 
-        // Builds `C = Ḡ^tḠ` exactly the way `solve_level_generic` does
+        // Builds `C = Ḡ^tḠ` exactly the way `prepare_data` does
         // (column-mean-centred `g_rows`, then the outer-product sum), for
         // a region placed at `(offset_x, offset_y)` in some larger image.
         let normal_matrix = |offset_x: u32, offset_y: u32| -> [[f64; 4]; 4] {

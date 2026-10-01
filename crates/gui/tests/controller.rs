@@ -926,26 +926,7 @@ use focusforge_gui::{OpenAs, OpenOutcome, job};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-fn load_tree(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp tree must be creatable");
-    dir
-}
-
-fn mantis_frame(index: usize) -> PathBuf {
-    common::workspace_root()
-        .join("fixtures")
-        .join("mantis-512")
-        .join("frames")
-        .join(format!("{index:02}.tif"))
-}
-
-fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
-    std::fs::create_dir_all(dest_dir).unwrap();
-    std::fs::copy(mantis_frame(source_index), dest_dir.join(name))
-        .expect("fixture frame must copy");
-}
+use common::{copy_frame, tree};
 
 fn install_load_sink(controller: &mut AppController) -> Arc<Mutex<Vec<ShellEvent>>> {
     let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -961,11 +942,11 @@ fn install_load_sink(controller: &mut AppController) -> Arc<Mutex<Vec<ShellEvent
 /// shape: an unambiguous folder, a saved `.ffp`, and a multi-file drop.
 #[test]
 fn open_paths_returns_before_the_load_completes_and_lands_only_after_settle() {
-    let folder = load_tree("controller_shape_folder");
+    let folder = tree("controller_shape_folder");
     copy_frame(&folder, "00.tif", 0);
     copy_frame(&folder, "01.tif", 1);
 
-    let project_dir = load_tree("controller_shape_project");
+    let project_dir = tree("controller_shape_project");
     let project_path = {
         use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
         use focusforge_core::params::ParamValues;
@@ -1013,7 +994,7 @@ fn open_paths_returns_before_the_load_completes_and_lands_only_after_settle() {
         project_path
     };
 
-    let frames_dir = load_tree("controller_shape_frames");
+    let frames_dir = tree("controller_shape_frames");
     copy_frame(&frames_dir, "00.tif", 2);
     copy_frame(&frames_dir, "01.tif", 3);
     let frame_paths = vec![frames_dir.join("00.tif"), frames_dir.join("01.tif")];
@@ -1050,7 +1031,7 @@ fn open_paths_returns_before_the_load_completes_and_lands_only_after_settle() {
 /// of timing).
 #[test]
 fn load_progress_ticks_report_frames_of_the_real_total_and_never_after_ready() {
-    let two_subfolders = load_tree("controller_tick_two_subfolders");
+    let two_subfolders = tree("controller_tick_two_subfolders");
     copy_frame(&two_subfolders.join("subject-a"), "00.tif", 0);
     copy_frame(&two_subfolders.join("subject-a"), "01.tif", 1);
     copy_frame(&two_subfolders.join("subject-a"), "02.tif", 2);
@@ -1142,15 +1123,15 @@ fn load_progress_ticks_report_frames_of_the_real_total_and_never_after_ready() {
 /// in flight.
 #[test]
 fn every_termination_carries_one_start_one_ready_and_its_own_event() {
-    let opened_root = load_tree("controller_term_opened");
+    let opened_root = tree("controller_term_opened");
     copy_frame(&opened_root, "00.tif", 0);
     copy_frame(&opened_root, "01.tif", 1);
 
-    let question_root = load_tree("controller_term_question");
+    let question_root = tree("controller_term_question");
     copy_frame(&question_root.join("subject-a"), "00.tif", 0);
     copy_frame(&question_root.join("subject-b"), "00.tif", 1);
 
-    let refused_root = load_tree("controller_term_refused");
+    let refused_root = tree("controller_term_refused");
 
     for (label, root) in [
         ("opened", opened_root),
@@ -1210,9 +1191,9 @@ fn every_termination_carries_one_start_one_ready_and_its_own_event() {
 /// `LoadStarted` is seen, and the first load's own outcome is what settles.
 #[test]
 fn a_second_open_while_one_is_in_flight_is_dropped() {
-    let first = load_tree("controller_dropped_first");
+    let first = tree("controller_dropped_first");
     copy_frame(&first, "00.tif", 0);
-    let second = load_tree("controller_dropped_second");
+    let second = tree("controller_dropped_second");
     copy_frame(&second, "00.tif", 1);
 
     let mut controller = AppController::new();
@@ -1252,7 +1233,7 @@ fn a_second_open_while_one_is_in_flight_is_dropped() {
 fn thumbnail_decode_runs_on_the_worker_not_on_settle() {
     use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 
-    let root = load_tree("controller_thumbnail_worker");
+    let root = tree("controller_thumbnail_worker");
     let size = 3000u32;
     let mut samples = vec![0u16; (size * size * 3) as usize];
     for (i, s) in samples.iter_mut().enumerate() {
@@ -1311,7 +1292,7 @@ fn thumbnail_decode_runs_on_the_worker_not_on_settle() {
 fn answer_question_thumbnail_decode_runs_on_the_worker_not_on_settle() {
     use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 
-    let root = load_tree("controller_question_thumbnail_worker");
+    let root = tree("controller_question_thumbnail_worker");
     let size = 3000u32;
     let mut samples = vec![0u16; (size * size * 3) as usize];
     for (i, s) in samples.iter_mut().enumerate() {
@@ -1383,7 +1364,7 @@ fn answer_question_thumbnail_decode_runs_on_the_worker_not_on_settle() {
 fn a_failed_worker_thumbnail_decode_is_not_retried_on_settle() {
     use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 
-    let root = load_tree("controller_thumbnail_failure");
+    let root = tree("controller_thumbnail_failure");
     let size = 64u32;
     let frame = root.join("00.tif");
     let mut writer = TiffWriter::create(
@@ -3027,7 +3008,7 @@ fn plain_wheel_over_the_images_list_steps_the_source_frame_in_both_modes() {
 // ---------------------------------------------------------------------
 
 use focusforge_gui::canvas::OverlayDraw;
-use focusforge_gui::images::{FrameSort, ROW_HEIGHT};
+use focusforge_gui::images::FrameSort;
 
 #[test]
 fn legend_rows_carry_the_z_map_palette() {
@@ -3081,8 +3062,13 @@ fn legend_header_states() {
 
     // `images_panel()` runs a fused tab through this same pure builder --
     // the singular form at `n = 1` needs no real fuse to prove.
-    let one =
-        focusforge_gui::images::build_model(&[PathBuf::from("00.tif")], &[false], None, 0.0, true);
+    let one = focusforge_gui::images::build_model(
+        &[PathBuf::from("00.tif")],
+        &[false],
+        None,
+        true,
+        &std::collections::HashMap::new(),
+    );
     assert_eq!(one.header_text, "1 frame");
 }
 
@@ -3105,7 +3091,6 @@ fn legend_no_source_entry_is_pinned_and_unpaintable() {
         "the legend pins a NO_SOURCE entry below the list"
     );
     assert_eq!(panel.rows.len(), 3, "NO_SOURCE is not one of rows");
-    assert_eq!(panel.content_height, 3.0 * ROW_HEIGHT);
 
     let before = c.brush_source();
     c.select_frame(3);

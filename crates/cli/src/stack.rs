@@ -59,6 +59,10 @@ pub struct StackReport {
     pub peak_in_flight: usize,
     /// The host in-flight-byte budget actually in force for this run.
     pub max_bytes_in_flight: u64,
+    /// The bytes the scheduler accounted for at its in-flight limit
+    /// (`in_flight_limit` tile sets, reader scratch included): the figure
+    /// compared with `max_bytes_in_flight`, never with resident memory.
+    pub accounted_bytes_in_flight: u64,
     /// Where that budget came from: `Host` (adaptive), `HostFallback` (the
     /// probe degraded), or `Explicit` (`--max-host-memory` lowered it).
     pub budget_provenance: Provenance,
@@ -118,6 +122,10 @@ pub struct StackReport {
     /// `None` unless the alignment was computed this run.
     pub align_workers: Option<usize>,
     pub peak_align_workers: Option<usize>,
+    /// The bytes the alignment accounted for (shared reference data plus one
+    /// registration per worker) -- `None` unless the alignment was computed
+    /// this run.
+    pub align_accounted_bytes: Option<u64>,
 }
 
 /// A narrow, `crates/gpu`-free handle on a `GpuBackend`'s realized tile
@@ -1337,6 +1345,7 @@ fn build_stack_report(
         // concurrency.
         peak_in_flight: report.in_flight_limit,
         max_bytes_in_flight: report.max_bytes_in_flight,
+        accounted_bytes_in_flight: report.accounted_bytes_in_flight,
         budget_provenance: report.budget_provenance,
         backed_off: report.backed_off,
         outputs,
@@ -1355,6 +1364,7 @@ fn build_stack_report(
         align_source: report.align_source,
         align_workers: report.align_workers,
         peak_align_workers: report.peak_align_workers,
+        align_accounted_bytes: report.align_accounted_bytes,
     }
 }
 
@@ -1427,8 +1437,11 @@ fn render(report: &StackReport) -> String {
         report.tile_size, report.levels, report.margin, report.tiles, report.in_flight_limit,
     ));
     lines.push(format!(
-        "max_bytes_in_flight={} budget={:?} backed_off={}",
-        report.max_bytes_in_flight, report.budget_provenance, report.backed_off,
+        "max_bytes_in_flight={} accounted_bytes_in_flight={} budget={:?} backed_off={}",
+        report.max_bytes_in_flight,
+        report.accounted_bytes_in_flight,
+        report.budget_provenance,
+        report.backed_off,
     ));
     lines.push(format!("backend: {}", report.backend));
     if let (
@@ -1561,6 +1574,7 @@ mod tests {
             in_flight_limit: 5,
             peak_in_flight: 4,
             max_bytes_in_flight: 1 << 30,
+            accounted_bytes_in_flight: 1 << 29,
             budget_provenance: Provenance::Host,
             backed_off: false,
             outputs: vec!["mantis-512.ffp".to_string()],
@@ -1585,6 +1599,7 @@ mod tests {
             align_source: "computed".to_string(),
             align_workers: Some(3),
             peak_align_workers: Some(3),
+            align_accounted_bytes: Some(1 << 28),
         }
     }
 
@@ -1605,6 +1620,7 @@ mod tests {
             "tiles=4",
             "in_flight_limit=5",
             "max_bytes_in_flight=1073741824",
+            "accounted_bytes_in_flight=536870912",
             "budget=Host",
             "backed_off=false",
             "wrote: mantis-512.ffp",

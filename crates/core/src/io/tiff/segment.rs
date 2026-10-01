@@ -9,8 +9,9 @@ use flate2::{Decompress, FlushDecompress, Status};
 use weezl::{BitOrder, LzwStatus, decode::Decoder};
 
 use crate::io::error::TiffError;
+use crate::timing::measurement_scope;
 
-use super::header::{ByteOrder, TiffHeader};
+use super::header::TiffHeader;
 
 /// Where a TIFF segment is stored in its image grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +229,7 @@ pub(crate) fn decode_segment(
     info: SegmentInfo,
     index: usize,
 ) -> Result<DecodedSegment, TiffError> {
+    let _scope = measurement_scope("tiff_segment_decode");
     let start = usize::try_from(info.offset).map_err(|_| TiffError::SegmentPastEof {
         path: header.path.clone(),
         index,
@@ -421,10 +423,7 @@ fn samples_and_crop(
     let stored_width = info.stored_width as usize;
     let mut decoded = Vec::with_capacity(raw.len() / 2);
     for pair in raw.chunks_exact(2) {
-        decoded.push(match header.byte_order {
-            ByteOrder::Little => u16::from_le_bytes([pair[0], pair[1]]),
-            ByteOrder::Big => u16::from_be_bytes([pair[0], pair[1]]),
-        });
+        decoded.push(header.byte_order.u16_from([pair[0], pair[1]]));
     }
     if header.predictor == 2 {
         for row in decoded.chunks_exact_mut(stored_width * spp) {

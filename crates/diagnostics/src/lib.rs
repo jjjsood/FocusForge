@@ -86,6 +86,8 @@ pub struct Diagnostics {
     /// running this destructor leaves an unterminated file.
     #[cfg(feature = "trace")]
     _chrome: Option<tracing_chrome::FlushGuard>,
+    #[cfg(feature = "trace")]
+    trace_accounting: bool,
 }
 
 impl Diagnostics {
@@ -93,6 +95,15 @@ impl Diagnostics {
     /// not be opened.
     pub fn log_path(&self) -> Option<&Path> {
         self.log_path.as_deref()
+    }
+}
+
+impl Drop for Diagnostics {
+    fn drop(&mut self) {
+        #[cfg(feature = "trace")]
+        if self.trace_accounting {
+            focusforge_core::timing::emit_timing_summary();
+        }
     }
 }
 
@@ -161,11 +172,11 @@ fn stderr_default_level(verbosity: i8) -> LevelFilter {
 /// third-party TRACE chatter out of a release build's file (a compile-time
 /// `tracing` cap cannot see records arriving through this bridge) and off
 /// the timing budget.
-fn bridge_cap(verbosity: i8) -> log::LevelFilter {
+fn bridge_cap(verbosity: i8) -> tracing_log::log::LevelFilter {
     if verbosity >= 2 {
-        log::LevelFilter::Debug
+        tracing_log::log::LevelFilter::Debug
     } else {
-        log::LevelFilter::Warn
+        tracing_log::log::LevelFilter::Warn
     }
 }
 
@@ -283,9 +294,16 @@ pub fn init(options: &Options) -> Diagnostics {
     #[cfg(feature = "trace")]
     let chrome = trace::chrome();
     #[cfg(feature = "trace")]
+    let trace_accounting = chrome.layer.is_some();
+    #[cfg(feature = "trace")]
     let subscriber = subscriber.with(chrome.layer).with(trace::tracy());
 
     subscriber.init();
+
+    #[cfg(feature = "trace")]
+    if trace_accounting {
+        focusforge_core::timing::enable_trace_accounting();
+    }
 
     // After `.init()`: a warning raised before the subscriber is installed
     // reaches no sink at all.
@@ -335,6 +353,8 @@ pub fn init(options: &Options) -> Diagnostics {
         _native: guard,
         #[cfg(feature = "trace")]
         _chrome: chrome.guard,
+        #[cfg(feature = "trace")]
+        trace_accounting,
     }
 }
 

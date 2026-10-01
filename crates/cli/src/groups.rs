@@ -169,9 +169,7 @@ pub fn to_file(proposal: &Proposal) -> GroupsFile {
 
 /// Serializes the proposal to `path` in the format [`load`] reads.
 pub fn write(proposal: &Proposal, path: &Path) -> Result<(), String> {
-    let text = toml::to_string_pretty(&to_file(proposal))
-        .map_err(|err| format!("{}: serializing the grouping: {err}", path.display()))?;
-    std::fs::write(path, text).map_err(|err| format!("{}: {err}", path.display()))
+    crate::preset::write_toml(path, &to_file(proposal), "the grouping")
 }
 
 /// Replaces `walked` with the grouping `path` names.
@@ -182,9 +180,7 @@ pub fn write(proposal: &Proposal, path: &Path) -> Result<(), String> {
 /// group lists. Comparison is by `std::path::absolute` of `root.join(entry)`
 /// -- lexical normalization, which needs no file to exist.
 pub fn load(path: &Path, root: &Path, walked: &Proposal) -> Result<Proposal, String> {
-    let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    let file: GroupsFile =
-        toml::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))?;
+    let file: GroupsFile = crate::preset::read_toml(path)?;
     if file.format != GROUPS_FILE_FORMAT {
         return Err(format!(
             "{}: unsupported grouping file format {} (this build reads {GROUPS_FILE_FORMAT})",

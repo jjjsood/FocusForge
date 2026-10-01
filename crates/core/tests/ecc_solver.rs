@@ -12,7 +12,7 @@ mod common;
 
 use focusforge_core::align::warp::warp_from_tile;
 use focusforge_core::align::{
-    DivergenceReason, EccMode, EccParams, EccStatus, Transform, solve_level,
+    DivergenceReason, EccMode, EccParams, EccResult, EccStatus, Transform, solve_level,
 };
 use focusforge_core::fuse::Plane;
 use focusforge_core::fuse::metrics::luma;
@@ -589,3 +589,104 @@ fn capture_range_is_measured() {
         "measured capture range moved -- the default pyramid depth is derived from this number"
     );
 }
+
+/// Every field of an [`EccResult`] as exact bits, so a recorded run and a
+/// later one compare without a tolerance.
+fn fingerprint(result: &EccResult) -> String {
+    let m: Vec<String> = result
+        .transform
+        .m
+        .iter()
+        .flatten()
+        .map(|v| format!("{:016x}", v.to_bits()))
+        .collect();
+    let step = result
+        .final_step
+        .map_or("none".to_string(), |s| format!("{:016x}", s.to_bits()));
+    format!(
+        "m=[{}] status={:?} iterations={} correlation={:016x} valid_samples={} step={}",
+        m.join(","),
+        result.status,
+        result.iterations,
+        result.correlation.to_bits(),
+        result.valid_samples,
+        step
+    )
+}
+
+/// The solver's exact output on four inputs, pinned bit for bit: buffer reuse
+/// must not move a single bit.
+#[test]
+fn results_are_bit_identical_to_the_recorded_run() {
+    let (tile, width, height) = frame_3_tile();
+    let rect = full_rect(width, height);
+    let plane = luma_plane(&tile, width, height);
+    let region = default_region();
+    let params = default_params();
+    let solve = |template: &Plane, moving: &Plane, mode: EccMode| {
+        solve_level(
+            template,
+            region,
+            moving,
+            &Transform::identity(),
+            mode,
+            &params,
+        )
+        .expect("valid solver inputs")
+    };
+
+    let identity = solve(&plane, &plane, EccMode::Translation);
+
+    let shifted = warp_from_tile(
+        &tile,
+        (width, height),
+        rect,
+        &Transform::translation(6.5, -4.25),
+    )
+    .expect("translation stays well inside the frame");
+    let translation = solve(
+        &luma_plane(&shifted.tile, width, height),
+        &plane,
+        EccMode::Translation,
+    );
+
+    let (cx, cy) = (
+        (region.x + region.width / 2) as f64,
+        (region.y + region.height / 2) as f64,
+    );
+    let turned = warp_from_tile(
+        &tile,
+        (width, height),
+        rect,
+        &similarity_about(1.002, 2.0f64.to_radians(), cx, cy),
+    )
+    .expect("rotation+scale stays well inside the frame");
+    let rotation_scale = solve(
+        &luma_plane(&turned.tile, width, height),
+        &plane,
+        EccMode::Similarity,
+    );
+
+    let mut rng = XorShift32(0x5EED_1234);
+    let noise: Vec<f32> = (0..(width as usize * height as usize))
+        .map(|_| (rng.next() % 65536) as f32)
+        .collect();
+    let noise_plane = Plane::from_f32(&noise, width, height, 1).expect("noise plane");
+    let divergence = solve(&plane, &noise_plane, EccMode::Translation);
+
+    let actual = [
+        fingerprint(&identity),
+        fingerprint(&translation),
+        fingerprint(&rotation_scale),
+        fingerprint(&divergence),
+    ];
+    assert_eq!(actual, RECORDED_RESULTS);
+}
+
+/// Identity, translation, rotation+scale, divergence.
+const RECORDED_RESULTS: [&str; 4] = [
+    "m=[3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=1 correlation=3ff0000000000000 valid_samples=147456 step=0000000000000000",
+    "m=[3ff0000000000000,0000000000000000,401a00003d341317,0000000000000000,3ff0000000000000,c011000009d34765,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=10 correlation=3fefffffff9de874 valid_samples=147456 step=3efc92d0f3c18f9b",
+    "m=[3ff005b11f4ece4e,bfa1e77e79cafc1b,4021315a01879686,3fa1e77e79cafc1b,3ff005b11f4ece4e,c0229da29f1d8bcb,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=9 correlation=3fefffffffc8b5c2 valid_samples=147456 step=3f01ba54d84a77dd",
+    "m=[3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000] status=Diverged(TooFewValidSamples) iterations=1 correlation=3f30383c0d31099b valid_samples=0 step=40823578dcfcc01b",
+];

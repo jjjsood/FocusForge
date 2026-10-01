@@ -105,6 +105,17 @@ pub fn fixture_frame(set: &str, index: usize) -> PathBuf {
         .join(format!("{index:02}.tif"))
 }
 
+/// Copies `mantis-512` fixture frame `source_index` into `dest_dir` as `name`.
+#[allow(dead_code)]
+pub fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
+    std::fs::create_dir_all(dest_dir).unwrap();
+    std::fs::copy(
+        fixture_frame("mantis-512", source_index),
+        dest_dir.join(name),
+    )
+    .expect("fixture frame must copy");
+}
+
 /// A fresh, empty renderer cell for `bridge::install`, with no project's
 /// planes loaded yet.
 #[allow(dead_code)]
@@ -120,6 +131,24 @@ pub fn tree(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp tree must be creatable");
     dir
+}
+
+/// A controller with one unsaved project open over `count` copied
+/// `mantis-512` frames (`00.tif`, `01.tif`, ... in fixture order), its own
+/// scratch root under `CARGO_TARGET_TMPDIR`.
+#[allow(dead_code)]
+pub fn controller_with_frames(name: &str, count: usize) -> AppController {
+    let root = tree(&format!("{name}_frames"));
+    for i in 0..count {
+        copy_frame(&root, &format!("{i:02}.tif"), i);
+    }
+    let mut controller = AppController::new();
+    assert!(matches!(
+        open_and_settle(&mut controller, &[root]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
+    controller
 }
 
 /// Polls `settle_job` until it returns or no work is pending any more,

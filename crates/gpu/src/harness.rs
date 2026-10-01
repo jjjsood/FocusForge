@@ -17,7 +17,7 @@ use focusforge_core::tile::{Rect, Tile};
 
 use crate::budget::{
     DeviceBudget, ProbeOutcome, VramBudget, buffer_limit_shortfalls, device_bytes_per_tile,
-    largest_buffer_bytes, probe_budget,
+    dispatch_limit_shortfall, largest_buffer_bytes, max_tile_side, probe_budget,
 };
 use crate::device::{GpuError, SharedDevice, block_on, shared_device};
 use crate::errors;
@@ -26,7 +26,7 @@ use crate::pack::{packed_len, unpack_samples};
 use crate::pipeline::{
     Pipeline, build_pipeline, run_pass, storage_entry, uniform_entry, upload_params,
 };
-use crate::transfer::{download_buffer, upload_tile};
+use crate::transfer::{create_storage_buffer, download_buffer, upload_tile};
 use crate::vram::WgpuAllocProbe;
 use crate::warp::{self, WarpPipelines};
 
@@ -72,7 +72,7 @@ impl GpuBackend {
     /// this probe already succeeded does not.
     fn probed(device: &'static SharedDevice, ceiling: Option<u64>) -> Result<GpuBackend, GpuError> {
         let probe = WgpuAllocProbe::new(device.device());
-        let device_budget = match probe_budget(&probe) {
+        let device_budget = match probe_budget(|bytes| probe.try_reserve(bytes)) {
             ProbeOutcome::Settled { bytes, .. } => DeviceBudget::probed(bytes),
             ProbeOutcome::Exhausted { floor, detail } => {
                 return Err(GpuError::VramExhausted {
@@ -111,6 +111,39 @@ impl GpuBackend {
         self.device_budget
     }
 
+    /// Refuses a `width x height` read rect at `samples_per_pixel` whose
+    /// largest buffer or widest 1-D dispatch (one invocation per sample) the
+    /// device's limits cannot take -- what wgpu validates a dispatch against,
+    /// not the adapter's own headroom, which the message only names.
+    fn check_tile(
+        &self,
+        width: u32,
+        height: u32,
+        samples_per_pixel: u32,
+        warped: bool,
+    ) -> Result<(), GpuError> {
+        let limits = self.device.limits();
+        let largest = largest_buffer_bytes(width, height, samples_per_pixel, warped);
+        let mut shortfalls = buffer_limit_shortfalls(
+            largest,
+            limits.max_storage_buffer_binding_size,
+            limits.max_buffer_size,
+        );
+        let invocations = u64::from(width) * u64::from(height) * u64::from(samples_per_pixel);
+        shortfalls.extend(dispatch_limit_shortfall(
+            invocations,
+            limits.max_compute_workgroups_per_dimension,
+        ));
+        if shortfalls.is_empty() {
+            Ok(())
+        } else {
+            Err(GpuError::tile_too_large(
+                &shortfalls,
+                &self.device.adapter_limits(),
+            ))
+        }
+    }
+
     fn pipeline(&self) -> &Pipeline {
         self.pipeline.get_or_init(|| {
             build_pipeline(
@@ -133,6 +166,16 @@ impl TileBackend for GpuBackend {
         self.device.info().clone()
     }
 
+    fn max_tile_size(&self, samples_per_pixel: u32) -> u32 {
+        let limits = self.device.limits();
+        max_tile_side(
+            samples_per_pixel,
+            limits.max_compute_workgroups_per_dimension,
+            limits.max_storage_buffer_binding_size,
+            limits.max_buffer_size,
+        )
+    }
+
     fn self_check(
         &self,
         reader: &dyn TileReader,
@@ -141,6 +184,7 @@ impl TileBackend for GpuBackend {
         samples_per_pixel: u32,
         gain: f32,
     ) -> Result<Tile, AlgorithmError> {
+        self.check_tile(rect.width, rect.height, samples_per_pixel, false)?;
         let sample_count = (rect.width * rect.height * samples_per_pixel) as usize;
         let mut samples = vec![0u16; sample_count];
         reader.read_tile_into(frame, rect, &mut samples)?;
@@ -157,12 +201,7 @@ impl TileBackend for GpuBackend {
         let byte_len = u64::from(word_count) * 4;
 
         let src_buffer = upload_tile(device, queue, &tile);
-        let dst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("focusforge-gpu-harness-dst"),
-            size: byte_len,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let dst_buffer = create_storage_buffer(device, byte_len, "focusforge-gpu-harness-dst");
 
         let mut params = [0u8; 16];
         params[0..4].copy_from_slice(&word_count.to_le_bytes());
@@ -212,6 +251,7 @@ impl TileBackend for GpuBackend {
         samples_per_pixel: u32,
         levels: u32,
     ) -> Result<TileOutput, AlgorithmError> {
+        self.check_tile(rect.width, rect.height, samples_per_pixel, false)?;
         fuse::fuse_tile_gpu(
             self.device,
             reader,
@@ -232,6 +272,7 @@ impl TileBackend for GpuBackend {
         dst: Rect,
         transform: &Transform,
     ) -> Result<WarpedTile, AlignError> {
+        self.check_tile(dst.width, dst.height, samples_per_pixel, true)?;
         warp::warp_tile_gpu(
             self.device,
             &self.warp_pipelines,
@@ -264,21 +305,7 @@ impl TileBackend for GpuBackend {
             levels,
             warped,
         );
-        let largest = largest_buffer_bytes(rect.width, rect.height, samples_per_pixel, warped);
-
-        // Checked against the *device's* limits -- what wgpu actually
-        // validates an allocation against -- with the adapter's own
-        // headroom named in the refusal message, not used as the threshold.
-        let device_limits = self.device.limits();
-        let shortfalls = buffer_limit_shortfalls(
-            largest,
-            device_limits.max_storage_buffer_binding_size,
-            device_limits.max_buffer_size,
-        );
-        if !shortfalls.is_empty() {
-            let err = GpuError::tile_too_large(&shortfalls, &self.device.adapter_limits());
-            return Err(err.into());
-        }
+        self.check_tile(rect.width, rect.height, samples_per_pixel, warped)?;
 
         let _permit = self.budget.acquire(bytes);
 
@@ -313,7 +340,9 @@ impl TileBackend for GpuBackend {
                 .into()),
                 None => result,
             }
-        });
+        })
+        .map_err(AlgorithmError::from)
+        .and_then(std::convert::identity);
 
         #[cfg(feature = "gpu-tests")]
         forced_device_loss(device);
@@ -345,15 +374,6 @@ fn forced_device_loss(device: &wgpu::Device) {
     if FUSED_TILES.fetch_add(1, Ordering::SeqCst) + 1 == after {
         device.destroy();
         let _ = device.poll(wgpu::PollType::Poll);
-    }
-}
-
-impl std::fmt::Display for GpuBackend {
-    /// Delegates to [`GpuBackend::info`]'s own `Display` -- what lets
-    /// `crate::adapter::choose_path`'s `A: fmt::Display` bound name the real
-    /// adapter on the GPU arm, in `crates/cli/src/gpu.rs`.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.info())
     }
 }
 
@@ -397,18 +417,47 @@ pub fn backend_for(
     if no_gpu {
         return (None, "--no-gpu given: forcing the CPU path".to_string());
     }
-    let (path, result, message) = crate::adapter::choose_path(false, gpu_backend_capped(max_vram));
-    match path {
-        crate::adapter::PathChoice::Gpu => (result.ok(), message),
-        crate::adapter::PathChoice::CpuFallback => (None, message),
+    match gpu_backend_capped(max_vram) {
+        Ok(backend) => (
+            Some(backend),
+            format!("adapter selected: {}; using the GPU path", backend.info()),
+        ),
+        Err(err) => (None, cpu_fallback_line(err)),
     }
+}
+
+/// Reason-led, because [`GpuError::VramExhausted`] (an adapter that cannot
+/// serve the minimum budget) falls back here exactly like a missing adapter.
+fn cpu_fallback_line(reason: &GpuError) -> String {
+    format!("{reason}; continuing on the CPU path")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::backend_for;
+    use super::{backend_for, cpu_fallback_line};
+    use crate::device::GpuError;
     use focusforge_core::algorithm::StackAlgorithm;
     use focusforge_core::fuse::laplacian::Laplacian;
+
+    #[test]
+    fn cpu_fallback_line_leads_with_the_reason() {
+        let exhausted = GpuError::VramExhausted {
+            floor_bytes: 268_435_456,
+            detail: "allocation refused".to_string(),
+        };
+        assert_eq!(
+            cpu_fallback_line(&exhausted),
+            "device cannot serve even the minimum VRAM budget of 268435456 bytes: \
+             allocation refused; continuing on the CPU path"
+        );
+        let no_adapter = GpuError::NoAdapter {
+            reason: "no backend available".to_string(),
+        };
+        assert_eq!(
+            cpu_fallback_line(&no_adapter),
+            "no usable GPU adapter: no backend available; continuing on the CPU path"
+        );
+    }
 
     #[test]
     fn backend_for_cpu_selection() {

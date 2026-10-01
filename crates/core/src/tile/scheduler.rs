@@ -81,6 +81,7 @@ use crate::tile::plan::{DEFAULT_TILE_SIZE, PlannedTile, TilePlan};
 use crate::tile::preprocess::FramePreprocess;
 use crate::tile::scratch::ScratchDir;
 use crate::tile::{Tile, TileError};
+use crate::timing::{TimingCounter, measurement_scope, record_timing};
 
 /// The default pyramid depth: **5, a default, never a cap**. `levels` stays
 /// a live parameter -- a caller (`ParamDesc`, or a direct
@@ -293,6 +294,7 @@ pub struct TileScheduler<'a> {
     scratch_base: PathBuf,
     in_flight: usize,
     pool_threads: usize,
+    bytes_per_tile_set: u64,
     budget: HostBudget,
     gate: HostBudgetGate,
 }
@@ -313,7 +315,8 @@ impl<'a> TileScheduler<'a> {
         let pool_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let bytes = bytes_per_tile_set(stack.frame_count, options.tile_size, samples_per_pixel);
+        let bytes = bytes_per_tile_set(stack.frame_count, options.tile_size, samples_per_pixel)
+            + reader.read_scratch_bytes(options.tile_size, options.tile_size);
 
         if options.budget.refuses_below_one_tile_set()
             && bytes > 0
@@ -338,6 +341,7 @@ impl<'a> TileScheduler<'a> {
             scratch_base: options.scratch_base.clone(),
             in_flight,
             pool_threads,
+            bytes_per_tile_set: bytes,
             budget: options.budget,
             gate,
         })
@@ -353,6 +357,12 @@ impl<'a> TileScheduler<'a> {
     /// limit during a run -- see `TileRunReport::final_in_flight_limit`.
     pub fn in_flight_limit(&self) -> usize {
         self.in_flight
+    }
+
+    /// The bytes one in-flight tile set is accounted at: every frame's tile
+    /// plus the reader's per-read scratch.
+    pub fn bytes_per_tile_set(&self) -> u64 {
+        self.bytes_per_tile_set
     }
 
     /// The rayon pool's own thread count -- `available_parallelism()`,
@@ -522,6 +532,7 @@ impl<'a> TileScheduler<'a> {
                         rect = ?planned.interior()
                     );
                     let _tile = tile_span.enter();
+                    let _tile_total = measurement_scope("fusion_tile");
 
                     let cur = live.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(cur, Ordering::SeqCst);
@@ -531,6 +542,7 @@ impl<'a> TileScheduler<'a> {
 
                         if supplies_own_pixels {
                             let job = TileJob::without_frame_tiles(planned, &scratch_path);
+                            let _consume = measurement_scope("fusion_consume");
                             return consumer
                                 .consume(&job)
                                 .map_err(|source| TileError::Consumer {
@@ -544,7 +556,15 @@ impl<'a> TileScheduler<'a> {
 
                         for (frame, tile) in buf.iter_mut().enumerate() {
                             tile.rect = read_rect;
+                            let capacity = tile.samples.capacity();
                             tile.samples.resize(len, 0);
+                            if tile.samples.capacity() > capacity {
+                                record_timing(
+                                    TimingCounter::AllocationBytes,
+                                    (tile.samples.capacity() * std::mem::size_of::<u16>()) as u64,
+                                );
+                                record_timing(TimingCounter::AllocationOperations, 1);
+                            }
                             reader
                                 .read_tile_into(frame, read_rect, &mut tile.samples)
                                 .map_err(|source| TileError::Read {
@@ -571,6 +591,7 @@ impl<'a> TileScheduler<'a> {
 
                         let ctx = TileCtx::new(read_rect, buf);
                         let job = TileJob::new(planned, ctx, &scratch_path);
+                        let _consume = measurement_scope("fusion_consume");
                         consumer
                             .consume(&job)
                             .map_err(|source| TileError::Consumer {

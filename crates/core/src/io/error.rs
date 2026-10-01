@@ -8,7 +8,6 @@
 //! operation actually returns — either a wrapped [`Refusal`] or one of the
 //! structural failures (bad magic, truncated IFD, a value past EOF, …).
 
-use std::fmt;
 use std::path::PathBuf;
 
 use crate::tile::Rect;
@@ -18,42 +17,23 @@ use crate::tile::Rect;
 /// the format this reader handles — so this is carried as data on a
 /// successfully parsed [`crate::io::TiffHeader`] rather than only as an
 /// error variant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
     /// `Compression` tag value other than 1 (uncompressed).
+    #[error("Compression={0}, only uncompressed (1) is supported")]
     Compressed(u16),
     /// A `TileWidth` tag is present: the file is tiled, not strip-based.
+    #[error("tiled TIFF (TileWidth present), only strip-based layout is supported")]
     Tiled,
     /// `PlanarConfiguration` other than 1 (chunky).
+    #[error("PlanarConfiguration={0}, only chunky (1) is supported")]
     Planar(u16),
     /// `BitsPerSample` other than all-16.
+    #[error("BitsPerSample={0:?}, only 16-bit is supported")]
     BitDepth(Box<[u16]>),
     /// `SampleFormat` other than 1 (unsigned integer).
+    #[error("SampleFormat={0}, only unsigned integer (1) is supported")]
     SampleFormat(u16),
-}
-
-impl fmt::Display for Refusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Refusal::Compressed(c) => {
-                write!(f, "Compression={c}, only uncompressed (1) is supported")
-            }
-            Refusal::Tiled => write!(
-                f,
-                "tiled TIFF (TileWidth present), only strip-based layout is supported"
-            ),
-            Refusal::Planar(p) => {
-                write!(f, "PlanarConfiguration={p}, only chunky (1) is supported")
-            }
-            Refusal::BitDepth(bits) => {
-                write!(f, "BitsPerSample={bits:?}, only 16-bit is supported")
-            }
-            Refusal::SampleFormat(sf) => write!(
-                f,
-                "SampleFormat={sf}, only unsigned integer (1) is supported"
-            ),
-        }
-    }
 }
 
 /// Everything that can go wrong opening a stack or reading a tile.

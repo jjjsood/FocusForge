@@ -40,18 +40,23 @@
 
 # The lock directory has to be the ONE physical location every checkout's
 # `target` symlink points into. Walk up from the resolved link to the
-# `cargo-target` directory itself (not into a pool slot below it, so every
-# slot shares the same build/gpu lock) and keep `.locks` one level above it,
-# next to the pool.
+# `cargo-target` directory itself (not into a pool slot below it), then use
+# its containing Git checkout when present. Non-Git pools keep `.locks` next
+# to the pool.
 _lock_dir() {
   if [ -L target ]; then
-    local p
+    local p pool repo
     p="$(readlink -f target)"
     for _ in 1 2 3; do
       [ "$(basename "$p")" = "cargo-target" ] && break
       p="$(dirname "$p")"
     done
-    echo "$(dirname "$p")/.locks"
+    pool="$(dirname "$p")"
+    repo="$(
+      env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+        git -C "$pool" rev-parse --show-toplevel 2>/dev/null
+    )" || repo=""
+    echo "${repo:-$pool}/.locks"
   else
     # No shared-target symlink -- most likely a plain checkout. A local
     # .locks/ still makes the function safe to call, it just isn't shared

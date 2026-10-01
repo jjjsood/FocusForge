@@ -7,6 +7,24 @@
 //! is what builds one, from `focusforge_diagnostics::bundle`'s
 //! manifest-then-write API.
 
+use std::cell::RefCell;
+
+use focusforge_core::timing::timing_enabled;
+/// The one re-export of `focusforge_core::timing` outside this module --
+/// every other GUI file reaches it through `crate::diagnostics`, never
+/// `focusforge_core` directly (`crates/gui/tests/shell.rs`'s
+/// `checkpoint_panel_touches_no_storage`).
+pub(crate) use focusforge_core::timing::{
+    MeasurementScope, TimingCounter, measurement_scope, measurement_scope_with_fields,
+    record_timing,
+};
+#[cfg(test)]
+pub(crate) use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
+
+thread_local! {
+    static INPUT_TRACE: RefCell<InputTrace> = RefCell::new(InputTrace::default());
+}
+
 /// One row of the file list: a name, its value column already rendered as
 /// text, and whether it carries unredacted binary content.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -105,5 +123,393 @@ pub fn size_text(bytes: u64) -> String {
         format!("{} KB", (bytes as f64 / 1024.0).round() as u64)
     } else {
         format!("{:.1} MB", bytes as f64 / MB as f64)
+    }
+}
+
+/// One bounded batch of input received before a publication attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InputBatch {
+    pub(crate) first: u64,
+    pub(crate) last: u64,
+    pub(crate) count: u64,
+    pub(crate) coalesced: u64,
+    pub(crate) incomplete: bool,
+    pub(crate) publication: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputSurface {
+    Canvas,
+    Settings,
+    Images,
+    Gallery,
+    Other,
+}
+
+#[derive(Debug, Default)]
+struct PendingInput {
+    first: Option<u64>,
+    last: Option<u64>,
+    count: u64,
+    coalesced: u64,
+}
+
+impl PendingInput {
+    fn record(&mut self, sequence: u64) {
+        self.first.get_or_insert(sequence);
+        self.last = Some(sequence);
+        self.count = self.count.saturating_add(1);
+    }
+
+    fn drain(&mut self, incomplete: bool, publication: u64) -> Option<InputBatch> {
+        let batch = InputBatch {
+            first: self.first?,
+            last: self.last.expect("pending input has a last sequence"),
+            count: self.count,
+            coalesced: self.coalesced,
+            incomplete,
+            publication,
+        };
+        *self = Self::default();
+        Some(batch)
+    }
+}
+
+/// Scalar input accounting kept independently of the rendering toolkit.
+#[derive(Debug, Default)]
+pub(crate) struct InputTrace {
+    next: u64,
+    publication: u64,
+    canvas: PendingInput,
+    settings: PendingInput,
+    images: PendingInput,
+    gallery: PendingInput,
+    other: PendingInput,
+    destroyed_windows: u64,
+    incomplete: bool,
+}
+
+impl InputTrace {
+    pub(crate) fn record_input(&mut self, surface: InputSurface) -> u64 {
+        if self.next == u64::MAX {
+            self.incomplete = true;
+            return self.next;
+        }
+        self.next = self.next.saturating_add(1);
+        let sequence = self.next;
+        self.pending_mut(surface).record(sequence);
+        sequence
+    }
+
+    pub(crate) fn record_shared_input(
+        &mut self,
+        primary: InputSurface,
+        secondary: InputSurface,
+    ) -> u64 {
+        if self.next == u64::MAX {
+            self.incomplete = true;
+            return self.next;
+        }
+        let sequence = self.record_input(primary);
+        if primary != secondary {
+            self.pending_mut(secondary).record(sequence);
+        }
+        sequence
+    }
+
+    pub(crate) fn record_coalesced(&mut self, surface: InputSurface) {
+        let pending = self.pending_mut(surface);
+        pending.coalesced = pending.coalesced.saturating_add(1);
+    }
+
+    pub(crate) fn record_destroyed_window(&mut self) -> [Option<InputBatch>; 5] {
+        self.destroyed_windows = self.destroyed_windows.saturating_add(1);
+        self.finish()
+    }
+
+    pub(crate) fn publish(&mut self, surface: InputSurface) -> Option<InputBatch> {
+        self.pending(surface).first?;
+        self.publication = self.publication.saturating_add(1);
+        let incomplete = self.incomplete;
+        let publication = self.publication;
+        self.pending_mut(surface).drain(incomplete, publication)
+    }
+
+    pub(crate) fn finish(&mut self) -> [Option<InputBatch>; 5] {
+        [
+            self.canvas.drain(self.incomplete, 0),
+            self.settings.drain(self.incomplete, 0),
+            self.images.drain(self.incomplete, 0),
+            self.gallery.drain(self.incomplete, 0),
+            self.other.drain(self.incomplete, 0),
+        ]
+    }
+
+    fn pending(&self, surface: InputSurface) -> &PendingInput {
+        match surface {
+            InputSurface::Canvas => &self.canvas,
+            InputSurface::Settings => &self.settings,
+            InputSurface::Images => &self.images,
+            InputSurface::Gallery => &self.gallery,
+            InputSurface::Other => &self.other,
+        }
+    }
+
+    fn pending_mut(&mut self, surface: InputSurface) -> &mut PendingInput {
+        match surface {
+            InputSurface::Canvas => &mut self.canvas,
+            InputSurface::Settings => &mut self.settings,
+            InputSurface::Images => &mut self.images,
+            InputSurface::Gallery => &mut self.gallery,
+            InputSurface::Other => &mut self.other,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn destroyed_windows(&self) -> u64 {
+        self.destroyed_windows
+    }
+}
+
+pub(crate) fn record_input(surface: InputSurface) -> u64 {
+    if timing_enabled() {
+        INPUT_TRACE.with(|trace| trace.borrow_mut().record_input(surface))
+    } else {
+        0
+    }
+}
+
+pub(crate) fn record_shared_input(primary: InputSurface, secondary: InputSurface) -> u64 {
+    if timing_enabled() {
+        INPUT_TRACE.with(|trace| trace.borrow_mut().record_shared_input(primary, secondary))
+    } else {
+        0
+    }
+}
+
+pub(crate) fn input_trace_incomplete() -> bool {
+    timing_enabled().then(|| INPUT_TRACE.with(|trace| trace.borrow().incomplete)) == Some(true)
+}
+
+pub(crate) fn record_coalesced_input(surface: InputSurface) {
+    if timing_enabled() {
+        INPUT_TRACE.with(|trace| trace.borrow_mut().record_coalesced(surface));
+    }
+}
+
+pub(crate) fn record_destroyed_window() -> [Option<InputBatch>; 5] {
+    if timing_enabled() {
+        return INPUT_TRACE.with(|trace| trace.borrow_mut().record_destroyed_window());
+    }
+    [None, None, None, None, None]
+}
+
+pub(crate) fn take_published_input(surface: InputSurface) -> Option<InputBatch> {
+    timing_enabled().then(|| INPUT_TRACE.with(|trace| trace.borrow_mut().publish(surface)))?
+}
+
+pub(crate) fn finish_input_batches() -> [Option<InputBatch>; 5] {
+    if timing_enabled() {
+        INPUT_TRACE.with(|trace| trace.borrow_mut().finish())
+    } else {
+        [None, None, None, None, None]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InputBatch, InputSurface, InputTrace};
+
+    #[test]
+    fn input_trace_keeps_bursts_and_terminal_drains_disjoint() {
+        let mut trace = InputTrace::default();
+
+        trace.record_input(InputSurface::Settings);
+        trace.record_input(InputSurface::Images);
+        trace.record_input(InputSurface::Gallery);
+        assert_eq!(
+            trace.publish(InputSurface::Canvas),
+            None,
+            "a canvas repaint cannot publish input that belongs to another surface"
+        );
+        assert_eq!(
+            trace.publish(InputSurface::Settings),
+            Some(InputBatch {
+                first: 1,
+                last: 1,
+                count: 1,
+                coalesced: 0,
+                incomplete: false,
+                publication: 1,
+            })
+        );
+        assert_eq!(
+            trace.publish(InputSurface::Images),
+            Some(InputBatch {
+                first: 2,
+                last: 2,
+                count: 1,
+                coalesced: 0,
+                incomplete: false,
+                publication: 2,
+            })
+        );
+        assert_eq!(
+            trace.publish(InputSurface::Gallery),
+            Some(InputBatch {
+                first: 3,
+                last: 3,
+                count: 1,
+                coalesced: 0,
+                incomplete: false,
+                publication: 3,
+            })
+        );
+
+        trace.record_input(InputSurface::Canvas);
+        assert_eq!(
+            trace.record_destroyed_window(),
+            [
+                Some(InputBatch {
+                    first: 4,
+                    last: 4,
+                    count: 1,
+                    coalesced: 0,
+                    incomplete: false,
+                    publication: 0,
+                }),
+                None,
+                None,
+                None,
+                None
+            ]
+        );
+        assert_eq!(trace.finish(), [None, None, None, None, None]);
+        assert_eq!(trace.destroyed_windows(), 1);
+
+        trace.record_input(InputSurface::Canvas);
+        assert_eq!(
+            trace.publish(InputSurface::Canvas),
+            Some(InputBatch {
+                first: 5,
+                last: 5,
+                count: 1,
+                coalesced: 0,
+                incomplete: false,
+                publication: 4,
+            })
+        );
+        trace.record_input(InputSurface::Settings);
+        assert_eq!(
+            trace.finish(),
+            [
+                None,
+                Some(InputBatch {
+                    first: 6,
+                    last: 6,
+                    count: 1,
+                    coalesced: 0,
+                    incomplete: false,
+                    publication: 0,
+                }),
+                None,
+                None,
+                None
+            ]
+        );
+
+        trace.next = u64::MAX - 1;
+        assert_eq!(trace.record_input(InputSurface::Settings), u64::MAX);
+        assert_eq!(trace.record_input(InputSurface::Settings), u64::MAX);
+        assert_eq!(
+            trace.finish(),
+            [
+                None,
+                Some(InputBatch {
+                    first: u64::MAX,
+                    last: u64::MAX,
+                    count: 1,
+                    coalesced: 0,
+                    incomplete: true,
+                    publication: 0,
+                }),
+                None,
+                None,
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn input_trace_shares_one_callback_sequence_across_two_surfaces() {
+        let mut trace = InputTrace::default();
+
+        assert_eq!(
+            trace.record_shared_input(InputSurface::Gallery, InputSurface::Canvas),
+            1
+        );
+        assert_eq!(
+            trace.publish(InputSurface::Gallery),
+            Some(InputBatch {
+                first: 1,
+                last: 1,
+                count: 1,
+                coalesced: 0,
+                incomplete: false,
+                publication: 1,
+            })
+        );
+        assert_eq!(
+            trace.publish(InputSurface::Canvas),
+            Some(InputBatch {
+                first: 1,
+                last: 1,
+                count: 1,
+                coalesced: 0,
+                incomplete: false,
+                publication: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn input_trace_keeps_coalesced_bursts_across_two_drains() {
+        let mut trace = InputTrace::default();
+
+        trace.record_input(InputSurface::Canvas);
+        trace.record_input(InputSurface::Canvas);
+        trace.record_coalesced(InputSurface::Canvas);
+        trace.record_coalesced(InputSurface::Canvas);
+        assert_eq!(
+            trace.publish(InputSurface::Canvas),
+            Some(InputBatch {
+                first: 1,
+                last: 2,
+                count: 2,
+                coalesced: 2,
+                incomplete: false,
+                publication: 1,
+            })
+        );
+
+        trace.record_input(InputSurface::Canvas);
+        trace.record_coalesced(InputSurface::Canvas);
+        assert_eq!(
+            trace.finish(),
+            [
+                Some(InputBatch {
+                    first: 3,
+                    last: 3,
+                    count: 1,
+                    coalesced: 1,
+                    incomplete: false,
+                    publication: 0,
+                }),
+                None,
+                None,
+                None,
+                None,
+            ]
+        );
     }
 }

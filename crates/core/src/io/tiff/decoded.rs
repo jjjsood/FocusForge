@@ -16,6 +16,7 @@ use super::segment::{DecodedSegment, SegmentInfo, SegmentOrigin, decode_segment,
 use super::stack::{check_uniform, frame_paths, map_file};
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::tile::{HostBudget, Rect, Tile};
+use crate::timing::{TimingCounter, measurement_scope, record_timing};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 /// Cache counters for decoded TIFF segments.
@@ -124,6 +125,7 @@ impl SegmentCache {
                     .expect("resident cache entry exists")
                     .used_at = tick;
                 state.stats.hits += 1;
+                record_timing(TimingCounter::CacheHits, 1);
                 return Ok(segment);
             }
             if state.entries.contains_key(&key) {
@@ -177,6 +179,7 @@ impl SegmentCache {
                 .max(state.stats.resident_bytes);
             state.stats.misses += 1;
             state.stats.decodes += 1;
+            record_timing(TimingCounter::CacheMisses, 1);
             let tick = Self::next_tick(&mut state);
             state.entries.insert(
                 key,
@@ -192,6 +195,14 @@ impl SegmentCache {
             let mut state = self.state.lock().expect("cache mutex is not poisoned");
             match decoded {
                 Ok(decoded) => {
+                    record_timing(
+                        TimingCounter::DecodedBytes,
+                        decoded
+                            .samples
+                            .len()
+                            .saturating_mul(std::mem::size_of::<u16>())
+                            as u64,
+                    );
                     let segment = Arc::new(decoded);
                     let tick = Self::next_tick(&mut state);
                     let entry = state.entries.get_mut(&key).expect("loading entry exists");
@@ -404,6 +415,9 @@ pub struct DecodedTiffStack {
     frames: Vec<Frame>,
     cache: SegmentCache,
     cache_bytes: u64,
+    /// Heap one segment decode allocates: the decoded byte buffer plus the
+    /// unconverted sample vector, both sized by the largest stored segment.
+    decode_scratch_bytes: u64,
 }
 
 impl DecodedTiffStack {
@@ -423,6 +437,7 @@ impl DecodedTiffStack {
         }
         let mut frames: Vec<Frame> = Vec::with_capacity(paths.len());
         let mut required = None;
+        let mut largest_stored = 0u64;
         for path in paths {
             let file = File::open(path).map_err(|source| TiffError::Io {
                 path: path.clone(),
@@ -434,6 +449,7 @@ impl DecodedTiffStack {
             }
             let segments = segment_layout(&header)?;
             for segment in &segments {
+                largest_stored = largest_stored.max(stored_segment_bytes(&header, *segment)?);
                 let bytes = segment_bytes(&header, *segment)?;
                 if required
                     .as_ref()
@@ -461,6 +477,7 @@ impl DecodedTiffStack {
             frames,
             cache: SegmentCache::default(),
             cache_bytes,
+            decode_scratch_bytes: 2 * largest_stored + 1,
         })
     }
 
@@ -513,6 +530,7 @@ impl DecodedTiffStack {
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), TiffError> {
+        let _scope = measurement_scope("decoded_tiff_read");
         let frame_data = self.frame(frame)?;
         validate_rect(&frame_data.header, rect)?;
         let expected = expected_len(rect, frame_data.header.samples_per_pixel)?;
@@ -579,6 +597,10 @@ impl FrameReader for DecodedTiffStack {
 }
 
 impl TileReader for DecodedTiffStack {
+    fn read_scratch_bytes(&self, _width: u32, _height: u32) -> u64 {
+        self.decode_scratch_bytes
+    }
+
     fn read_tile_into(
         &self,
         frame: usize,
@@ -589,6 +611,17 @@ impl TileReader for DecodedTiffStack {
             .map_err(crate::io::FrameError::from)
             .map_err(AlgorithmError::from)
     }
+}
+
+fn stored_segment_bytes(header: &TiffHeader, info: SegmentInfo) -> Result<u64, TiffError> {
+    u64::from(info.stored_width)
+        .checked_mul(u64::from(info.stored_height))
+        .and_then(|bytes| bytes.checked_mul(u64::from(header.samples_per_pixel)))
+        .and_then(|bytes| bytes.checked_mul(2))
+        .ok_or_else(|| TiffError::SegmentLayout {
+            path: header.path.clone(),
+            detail: "stored segment byte length overflows",
+        })
 }
 
 fn segment_bytes(header: &TiffHeader, info: SegmentInfo) -> Result<u64, TiffError> {
@@ -671,5 +704,10 @@ fn copy_intersection(
             * spp;
         let len = (end_x - start_x) as usize * spp;
         out[destination..destination + len].copy_from_slice(&segment.samples[source..source + len]);
+        record_timing(
+            TimingCounter::CopyBytes,
+            len.saturating_mul(std::mem::size_of::<u16>()) as u64,
+        );
+        record_timing(TimingCounter::CopyOperations, 1);
     }
 }

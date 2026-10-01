@@ -7,9 +7,11 @@
 //! it to `ui/shell/dock/images_panel.slint`'s `for` loop; the schema/registry
 //! crate is named here so `crate::controller` never has to.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use focusforge_core::io::capture_time;
+use focusforge_core::io::{CaptureTime, capture_time};
+use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
 use focusforge_core::zmap::{overlay_table, source_color};
 
 /// A row's fixed height, top to top of the next row.
@@ -29,49 +31,73 @@ pub struct ImageRow {
     pub excluded: bool,
     /// The recorded source is no longer a file on disk.
     pub unresolved: bool,
-    pub top: f32,
     /// Whether this is the frame the left canvas pane draws.
     pub selected: bool,
 }
 
-/// The `Images` panel's whole state -- header, rows and the scroll offset
-/// [`crate::settings_panel::clamp_panel_scroll`] already clamps for the
-/// settings panel.
+/// The `Images` panel's whole state: header and rows.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ImagesModel {
     pub rows: Vec<ImageRow>,
     pub header_text: String,
-    pub content_height: f32,
-    pub scroll_y: f32,
     /// Legend mode only: the pinned `NO_SOURCE` entry shows below `rows`,
     /// outside the scrolled list.
     pub no_source_row: bool,
 }
 
-/// Builds one row per frame, in order. `excluded` shorter than `frames` is
-/// read as "not excluded" for the missing tail -- a tab always keeps the two
-/// in lockstep, but a row builder should not panic on an untrusted slice.
-fn build_rows(frames: &[PathBuf], excluded: &[bool], selected: Option<usize>) -> Vec<ImageRow> {
+/// What the `Images` list shows about one source file, read once from disk
+/// and keyed by the source's path so it follows the file through sorting
+/// and reordering.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FrameMeta {
+    pub time: Option<CaptureTime>,
+    /// The source was not a file on disk when last read.
+    pub unresolved: bool,
+}
+
+/// Reads each path's existence and capture time, one header read per
+/// existing file.
+pub fn read_metadata(paths: &[PathBuf]) -> HashMap<PathBuf, FrameMeta> {
+    let _scope = measurement_scope("gui_image_metadata");
+    paths
+        .iter()
+        .map(|path| {
+            let unresolved = !path.is_file();
+            let time = if unresolved {
+                None
+            } else {
+                record_timing(TimingCounter::MetadataReads, 1);
+                capture_time(path)
+            };
+            (path.clone(), FrameMeta { time, unresolved })
+        })
+        .collect()
+}
+
+/// Builds one row per frame, in order, from `meta` alone; a path absent from
+/// `meta` renders as unresolved. `excluded` shorter than `frames` is read as
+/// "not excluded" for the missing tail.
+fn build_rows(
+    frames: &[PathBuf],
+    excluded: &[bool],
+    selected: Option<usize>,
+    meta: &HashMap<PathBuf, FrameMeta>,
+) -> Vec<ImageRow> {
     let total = frames.len().max(1) as u32;
     frames
         .iter()
         .enumerate()
         .map(|(i, path)| {
-            let unresolved = !path.is_file();
-            let time_text = if unresolved {
-                String::new()
-            } else {
-                capture_time(path)
-                    .map(|t| time_of_day(&t.text))
-                    .unwrap_or_default()
-            };
+            let resolved = meta.get(path).filter(|m| !m.unresolved);
             ImageRow {
                 chip: source_color(i as u16, total),
                 name: file_name(path),
-                trailing_text: time_text,
+                trailing_text: resolved
+                    .and_then(|m| m.time.as_ref())
+                    .map(|t| time_of_day(&t.text))
+                    .unwrap_or_default(),
                 excluded: excluded.get(i).copied().unwrap_or(false),
-                unresolved,
-                top: i as f32 * ROW_HEIGHT,
+                unresolved: resolved.is_none(),
                 selected: selected == Some(i),
             }
         })
@@ -83,7 +109,11 @@ fn build_rows(frames: &[PathBuf], excluded: &[bool], selected: Option<usize>) ->
 /// so a position *is* its Z-Map source index and the exclusion mask is
 /// never consulted: excluding a frame after the fuse changes no index.
 /// `chip` is `overlay_table`'s colour for that index, no palette arithmetic.
-fn build_legend_rows(frames: &[PathBuf], selected: Option<usize>) -> Vec<ImageRow> {
+fn build_legend_rows(
+    frames: &[PathBuf],
+    selected: Option<usize>,
+    meta: &HashMap<PathBuf, FrameMeta>,
+) -> Vec<ImageRow> {
     let total = frames.len().max(1) as u32;
     let table = overlay_table(total, None);
     frames
@@ -94,8 +124,7 @@ fn build_legend_rows(frames: &[PathBuf], selected: Option<usize>) -> Vec<ImageRo
             name: file_name(path),
             trailing_text: (i + 1).to_string(),
             excluded: false,
-            unresolved: !path.is_file(),
-            top: i as f32 * ROW_HEIGHT,
+            unresolved: meta.get(path).is_none_or(|m| m.unresolved),
             selected: selected == Some(i),
         })
         .collect()
@@ -125,22 +154,21 @@ pub(crate) fn file_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// Builds the whole panel model: the header count and the rows, at a given
-/// scroll offset already clamped by the caller. `legend` selects the
-/// editor's read-only legend (colour and position number from
-/// `build_legend_rows`) over stacking's own row builder (capture time,
-/// exclusion count).
+/// Builds the whole panel model, the header count and the rows, without
+/// touching the disk. `legend` selects the editor's read-only legend (colour
+/// and position number from `build_legend_rows`) over stacking's own row
+/// builder (capture time, exclusion count).
 pub fn build_model(
     frames: &[PathBuf],
     excluded: &[bool],
     selected: Option<usize>,
-    scroll_y: f32,
     legend: bool,
+    meta: &HashMap<PathBuf, FrameMeta>,
 ) -> ImagesModel {
     let rows = if legend {
-        build_legend_rows(frames, selected)
+        build_legend_rows(frames, selected, meta)
     } else {
-        build_rows(frames, excluded, selected)
+        build_rows(frames, excluded, selected, meta)
     };
     let header_text = if legend {
         format!(
@@ -157,12 +185,9 @@ pub fn build_model(
             excluded_count
         )
     };
-    let content_height = rows.len() as f32 * ROW_HEIGHT;
     ImagesModel {
         rows,
         header_text,
-        content_height,
-        scroll_y,
         no_source_row: legend,
     }
 }
@@ -177,8 +202,12 @@ pub enum FrameSort {
 /// The permutation `sort` produces over `frames`, each entry the original
 /// index now at that position. A frame with no readable capture time sorts
 /// after every timed frame, in its original relative order, when sorting by
-/// `CaptureTime`.
-pub fn sort_order(frames: &[PathBuf], sort: FrameSort) -> Vec<usize> {
+/// `CaptureTime`. Capture times come from `meta`, never from the disk.
+pub fn sort_order(
+    frames: &[PathBuf],
+    sort: FrameSort,
+    meta: &HashMap<PathBuf, FrameMeta>,
+) -> Vec<usize> {
     let mut order: Vec<usize> = (0..frames.len()).collect();
     match sort {
         FrameSort::Name => {
@@ -186,10 +215,9 @@ pub fn sort_order(frames: &[PathBuf], sort: FrameSort) -> Vec<usize> {
         }
         FrameSort::CaptureTime => order.sort_by(|&a, &b| {
             let time = |i: usize| {
-                frames[i]
-                    .is_file()
-                    .then(|| capture_time(&frames[i]))
-                    .flatten()
+                meta.get(&frames[i])
+                    .filter(|m| !m.unresolved)
+                    .and_then(|m| m.time.as_ref())
             };
             match (time(a), time(b)) {
                 (Some(x), Some(y)) => x.epoch_seconds.cmp(&y.epoch_seconds),
@@ -368,13 +396,34 @@ mod tests {
                 )
             })
             .collect();
-        let model = build_model(&frames, &[false, false, false], None, 0.0, false);
+        let model = build_model(
+            &frames,
+            &[false, false, false],
+            None,
+            false,
+            &read_metadata(&frames),
+        );
         assert_eq!(model.rows.len(), 3);
         assert_eq!(model.header_text, "3 frames \u{b7} 0 excluded");
-        // ImageRow's own fields are exhaustively named here -- there is no
-        // index field to omit.
-        let ImageRow { top, .. } = &model.rows[1];
-        assert_eq!(*top, ROW_HEIGHT);
+        assert_ne!(model.rows[0].chip, model.rows[1].chip);
+    }
+
+    #[test]
+    fn rows_come_from_the_metadata_map_not_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let frames = vec![
+            write_timed(dir.path(), "00.tif", Some("2026:08:29 10:00:00")),
+            write_timed(dir.path(), "01.tif", Some("2026:08:29 11:30:00")),
+        ];
+        let mut meta = read_metadata(&frames);
+        std::fs::remove_file(&frames[0]).unwrap();
+        std::fs::remove_file(&frames[1]).unwrap();
+        meta.remove(&frames[1]);
+        let model = build_model(&frames, &[false, false], None, false, &meta);
+        assert!(!model.rows[0].unresolved);
+        assert_eq!(model.rows[0].trailing_text, "10:00:00");
+        assert!(model.rows[1].unresolved);
+        assert_eq!(model.rows[1].trailing_text, "");
     }
 
     #[test]
@@ -384,20 +433,21 @@ mod tests {
             write_timed(dir.path(), "00.tif", Some("2026:08:29 10:00:00")),
             write_timed(dir.path(), "01.tif", None),
         ];
-        let model = build_model(&frames, &[false, false], None, 0.0, false);
+        let model = build_model(
+            &frames,
+            &[false, false],
+            None,
+            false,
+            &read_metadata(&frames),
+        );
         assert_eq!(model.rows[1].trailing_text, "");
         assert!(!model.rows[1].unresolved);
     }
 
     #[test]
     fn an_unresolved_source_carries_no_fabricated_time() {
-        let model = build_model(
-            &[PathBuf::from("/does/not/exist.tif")],
-            &[false],
-            None,
-            0.0,
-            false,
-        );
+        let frames = [PathBuf::from("/does/not/exist.tif")];
+        let model = build_model(&frames, &[false], None, false, &read_metadata(&frames));
         assert!(model.rows[0].unresolved);
         assert_eq!(model.rows[0].trailing_text, "");
     }
@@ -414,14 +464,23 @@ mod tests {
                 )
             })
             .collect();
-        let model = build_model(&frames, &[true, false], None, 0.0, false);
+        let model = build_model(
+            &frames,
+            &[true, false],
+            None,
+            false,
+            &read_metadata(&frames),
+        );
         assert_eq!(model.header_text, "2 frames \u{b7} 1 excluded");
     }
 
     #[test]
     fn sort_by_name_is_lexicographic() {
         let frames = vec![PathBuf::from("b.tif"), PathBuf::from("a.tif")];
-        assert_eq!(sort_order(&frames, FrameSort::Name), vec![1, 0]);
+        assert_eq!(
+            sort_order(&frames, FrameSort::Name, &HashMap::new()),
+            vec![1, 0]
+        );
     }
 
     #[test]
@@ -432,7 +491,29 @@ mod tests {
             write_timed(dir.path(), "untimed.tif", None),
             write_timed(dir.path(), "earlier.tif", Some("2026:08:29 10:00:00")),
         ];
-        assert_eq!(sort_order(&frames, FrameSort::CaptureTime), vec![2, 0, 1]);
+        let meta = read_metadata(&frames);
+        assert_eq!(
+            sort_order(&frames, FrameSort::CaptureTime, &meta),
+            vec![2, 0, 1]
+        );
+    }
+
+    #[test]
+    fn sort_by_capture_time_reads_the_cached_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let frames = vec![
+            write_timed(dir.path(), "a.tif", Some("2026:08:29 12:00:00")),
+            write_timed(dir.path(), "b.tif", Some("2026:08:29 09:00:00")),
+            write_timed(dir.path(), "c.tif", Some("2026:08:29 10:00:00")),
+        ];
+        let meta = read_metadata(&frames);
+        for path in &frames {
+            std::fs::remove_file(path).unwrap();
+        }
+        assert_eq!(
+            sort_order(&frames, FrameSort::CaptureTime, &meta),
+            vec![1, 2, 0]
+        );
     }
 
     #[test]

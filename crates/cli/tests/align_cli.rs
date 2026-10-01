@@ -12,43 +12,20 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::process::Command;
+
+use common::{CliOutput, mantis_512_dir, tmp_dir};
 
 fn bin() -> Command {
     common::cli_bin("align_cli")
 }
 
-fn mantis_512_dir() -> PathBuf {
-    common::fixtures_dir().join("mantis-512")
-}
-
-fn tmp_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
-}
-
-fn tmp_dir(name: &str) -> PathBuf {
-    let dir = tmp_path(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-struct CliOutput {
-    success: bool,
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
 fn run_cli(args: &[&str]) -> CliOutput {
-    let output = bin().args(args).output().expect("failed to run binary");
-    CliOutput {
-        success: output.status.success(),
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    bin()
+        .args(args)
+        .output()
+        .expect("failed to run binary")
+        .into()
 }
 
 #[test]
@@ -193,6 +170,7 @@ fn align_json_schema_is_stable() {
         "align_source",
         "align_workers",
         "peak_align_workers",
+        "align_accounted_bytes",
     ] {
         assert!(report.get(key).is_some(), "missing key {key:?} in {report}");
     }
@@ -278,6 +256,48 @@ fn worker_limit_in_report() {
             "{key}={value} must be in 1..={ceiling}: {report}"
         );
     }
+}
+
+/// `--max-host-memory` lowers the budget the alignment driver divides into
+/// workers, and the report states the bytes it accounted for.
+#[test]
+fn max_host_memory_bounds_the_alignment_workers() {
+    use focusforge_core::align::{bytes_per_registration, bytes_shared_reference};
+    use focusforge_core::params::StackContext;
+    use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
+
+    let stack = StackContext::new(8, 512, 512, 3);
+    let shared = bytes_shared_reference(stack);
+    let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1) as u64;
+
+    let workers_at = |cap: u64| {
+        let out = run_cli(&[
+            "align",
+            mantis_512_dir().to_str().unwrap(),
+            "--algo",
+            "pyramidal-ecc",
+            "--lax",
+            "--json",
+            "--set",
+            "max-iterations=20",
+            "--max-host-memory",
+            &cap.to_string(),
+        ]);
+        assert!(out.success, "stderr: {}", out.stderr);
+        let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+        let workers = report["align_workers"].as_u64().expect("align_workers");
+        let accounted = report["align_accounted_bytes"]
+            .as_u64()
+            .expect("align_accounted_bytes");
+        assert_eq!(accounted, shared + workers * per_registration, "{report}");
+        workers
+    };
+
+    assert_eq!(workers_at(1), 1, "a floored budget runs one worker");
+    assert_eq!(workers_at(shared + 2 * per_registration), available.min(2));
 }
 
 /// Structural, not magnitude-based: `mode=translation` moves only 2 degrees

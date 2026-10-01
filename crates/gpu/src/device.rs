@@ -14,7 +14,6 @@ use wgpu::{
     MemoryHints, PowerPreference, RequestAdapterOptions, Trace,
 };
 
-use crate::adapter::{AdapterPath, classify_adapter, skip_message};
 use crate::limits::{LimitShortfall, describe_shortfalls, device_limits, required_limits};
 
 /// The `for_resource_creation` threshold, as a percent of a heap's own
@@ -41,11 +40,18 @@ pub enum GpuError {
     #[error("failed to create wgpu device: {0}")]
     RequestDevice(#[from] wgpu::RequestDeviceError),
 
-    /// A tile's own largest single buffer would exceed a hard device limit
-    /// (`crate::budget::buffer_limit_shortfalls`), refused before dispatch
-    /// rather than surfacing as a wgpu validation panic.
-    #[error("tile needs a buffer this device cannot allocate: {detail}")]
+    /// A tile's largest single buffer or its dispatch would exceed a hard
+    /// device limit (`crate::budget::buffer_limit_shortfalls`,
+    /// `crate::budget::dispatch_limit_shortfall`), refused before any read or
+    /// allocation rather than surfacing as a wgpu validation error.
+    #[error("tile exceeds a device limit: {detail}")]
     TileTooLarge { detail: String },
+
+    /// A dispatch failed wgpu validation inside
+    /// [`crate::errors::with_validation_scope`], so its output buffers were
+    /// never written.
+    #[error("kernel {kernel} failed validation: {detail}")]
+    KernelValidation { kernel: String, detail: String },
 
     /// A readback (`crate::transfer::download_buffer`/`download_f32`)
     /// failed: `device.poll` failed, the `map_async` callback never fired,
@@ -63,8 +69,8 @@ pub enum GpuError {
 
     /// [`crate::budget::probe_budget`] backed all the way down to
     /// [`crate::budget::PROBE_MIN_DEVICE_BYTES`] without a single accepted
-    /// reservation: the device cannot serve even the smallest budget. Maps
-    /// to [`crate::adapter::PathChoice::CpuFallback`] via `choose_path`,
+    /// reservation: the device cannot serve even the smallest budget.
+    /// `crate::harness::backend_for` falls back to the CPU path on it,
     /// exactly like [`GpuError::NoAdapter`].
     #[error("device cannot serve even the minimum VRAM budget of {floor_bytes} bytes: {detail}")]
     VramExhausted { floor_bytes: u64, detail: String },
@@ -87,10 +93,12 @@ impl GpuError {
         GpuError::TileTooLarge {
             detail: format!(
                 "{}; the adapter itself allows up to max_storage_buffer_binding_size={} \
-                 max_buffer_size={} -- raise crate::limits::required_limits() to use more",
+                 max_buffer_size={} max_compute_workgroups_per_dimension={} -- raise \
+                 crate::limits::required_limits() to use more",
                 describe_shortfalls(shortfalls),
                 adapter_limits.max_storage_buffer_binding_size,
                 adapter_limits.max_buffer_size,
+                adapter_limits.max_compute_workgroups_per_dimension,
             ),
         }
     }
@@ -110,15 +118,6 @@ impl From<GpuError> for focusforge_core::align::AlignError {
     fn from(err: GpuError) -> Self {
         focusforge_core::align::AlignError::Backend {
             detail: err.to_string(),
-        }
-    }
-}
-
-impl From<AdapterPath<wgpu::Adapter>> for Result<wgpu::Adapter, GpuError> {
-    fn from(path: AdapterPath<wgpu::Adapter>) -> Self {
-        match path {
-            AdapterPath::Present(adapter) => Ok(adapter),
-            AdapterPath::Absent { reason } => Err(GpuError::NoAdapter { reason }),
         }
     }
 }
@@ -233,13 +232,14 @@ fn init() -> Result<SharedDevice, GpuError> {
     // explicitly rather than leaving it to the platform's own default; a
     // software adapter is never silently selected
     // (`force_fallback_adapter: false`).
-    let adapter_result = block_on(instance.request_adapter(&RequestAdapterOptions {
+    let adapter = block_on(instance.request_adapter(&RequestAdapterOptions {
         power_preference: PowerPreference::HighPerformance,
         force_fallback_adapter: false,
         compatible_surface: None,
-    }));
-    let adapter: Result<wgpu::Adapter, GpuError> = classify_adapter(adapter_result).into();
-    let adapter = adapter?;
+    }))
+    .map_err(|err| GpuError::NoAdapter {
+        reason: err.to_string(),
+    })?;
 
     let adapter_limits = adapter.limits();
     let shortfalls = crate::limits::shortfalls(&required_limits(), &adapter_limits);
@@ -306,15 +306,15 @@ pub fn shared_device() -> Result<&'static SharedDevice, &'static GpuError> {
     SHARED.get_or_init(init).as_ref()
 }
 
-/// `shared_device()`, but on failure prints [`skip_message`] and returns
-/// `None` instead of propagating the error -- the one place a test learns
-/// there is no GPU. Tests call this and `return` early so a skip prints a
-/// reason instead of failing or silently passing.
+/// `shared_device()`, but on failure prints `SKIP: no usable GPU adapter --
+/// <error>` and returns `None` instead of propagating the error -- the one
+/// place a test learns there is no GPU. Tests call this and `return` early so
+/// a skip prints a reason instead of failing or silently passing.
 pub fn shared_device_or_skip() -> Option<&'static SharedDevice> {
     match shared_device() {
         Ok(device) => Some(device),
         Err(err) => {
-            println!("{}", skip_message(&err.to_string()));
+            println!("SKIP: no usable GPU adapter -- {err}");
             None
         }
     }

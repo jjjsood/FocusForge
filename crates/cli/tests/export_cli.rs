@@ -31,27 +31,14 @@ use focusforge_core::retouch::{Sources, recomposite};
 use focusforge_core::tile::HostBudget;
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
+use common::CliOutput;
+
 fn bin() -> Command {
     common::cli_bin("export_cli")
 }
 
-struct CliOutput {
-    success: bool,
-    stdout: String,
-    stderr: String,
-}
-
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
-    let output = bin()
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("failed to run binary");
-    CliOutput {
-        success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    common::run_in(&mut bin(), dir, args)
 }
 
 fn only_project(dir: &Path) -> PathBuf {

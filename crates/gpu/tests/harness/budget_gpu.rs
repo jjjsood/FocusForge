@@ -241,3 +241,132 @@ fn allocator_report_matches_the_prediction() {
         }
     }
 }
+
+/// A reader no refused tile may ever reach.
+struct UnreadableReader;
+
+impl TileReader for UnreadableReader {
+    fn read_tile_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        _out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        panic!("a refused tile must not read frame {frame} rect {rect:?}");
+    }
+}
+
+#[test]
+fn a_rect_past_the_dispatch_limit_is_refused_by_every_entry_point() {
+    if focusforge_gpu::device::shared_device_or_skip().is_none() {
+        return;
+    }
+    let backend = gpu_backend().expect("gpu backend");
+    let spp = 3;
+    let side = backend.max_tile_size(spp) + 1;
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: side,
+        height: side,
+    };
+    let transforms = non_identity_transforms(2);
+    let reads_before = focusforge_gpu::transfer::readback_count();
+
+    let refusals = [
+        (
+            "self_check",
+            backend
+                .self_check(&UnreadableReader, 0, rect, spp, 1.0)
+                .err()
+                .map(|err| err.to_string()),
+        ),
+        (
+            "fuse_tile",
+            backend
+                .fuse_tile(&UnreadableReader, 2, rect, spp, LEVELS)
+                .err()
+                .map(|err| err.to_string()),
+        ),
+        (
+            "warp_tile",
+            backend
+                .warp_tile(
+                    &UnreadableReader,
+                    1,
+                    (side, side),
+                    spp,
+                    rect,
+                    &transforms[1],
+                )
+                .err()
+                .map(|err| err.to_string()),
+        ),
+        (
+            "warp_fuse_tile",
+            backend
+                .warp_fuse_tile(
+                    &UnreadableReader,
+                    (side, side),
+                    &transforms,
+                    rect,
+                    spp,
+                    LEVELS,
+                )
+                .err()
+                .map(|err| err.to_string()),
+        ),
+    ];
+    for (entry, refusal) in refusals {
+        let message = refusal.unwrap_or_else(|| panic!("{entry} accepted a {side}x{side} rect"));
+        assert!(
+            message.contains("max_compute_workgroups_per_dimension"),
+            "{entry} must name the dispatch limit, got: {message}"
+        );
+    }
+    assert_eq!(focusforge_gpu::transfer::readback_count(), reads_before);
+}
+
+#[test]
+fn identical_tiles_cost_identical_transfers_and_allocations() {
+    let Some(_shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    focusforge_core::timing::enable_trace_accounting();
+    let backend = gpu_backend().expect("gpu backend");
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("open mantis-512 fixture");
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let transforms = non_identity_transforms(stack.len());
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 256,
+        height: 256,
+    };
+
+    let mut deltas = Vec::new();
+    for _ in 0..2 {
+        let before = focusforge_core::timing::timing_snapshot().expect("accounting is enabled");
+        backend
+            .warp_fuse_tile(&stack, (width, height), &transforms, rect, spp, LEVELS)
+            .expect("warp_fuse_tile must succeed");
+        let after = focusforge_core::timing::timing_snapshot().expect("accounting is enabled");
+        deltas.push((
+            after.buffer_creations - before.buffer_creations,
+            after.upload_bytes - before.upload_bytes,
+            after.readback_bytes - before.readback_bytes,
+        ));
+    }
+
+    assert_eq!(deltas[0], deltas[1], "the same tile must cost the same");
+    let (creations, uploads, readbacks) = deltas[0];
+    assert!(creations > 0 && uploads > 0);
+    let pixels = u64::from(rect.width) * u64::from(rect.height);
+    let composite = focusforge_gpu::pack::packed_len(pixels as usize * spp as usize) as u64;
+    assert_eq!(
+        readbacks,
+        composite + 8 * pixels,
+        "a tile reads back its packed composite and its Z-Map"
+    );
+}

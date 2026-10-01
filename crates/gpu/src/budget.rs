@@ -5,12 +5,12 @@
 //! scheduler's host-memory budget. Names no `wgpu` type, so it is not
 //! feature-gated.
 //!
-//! **Probe, with a constant fallback.** wgpu 29.0.4 exposes no adapter
-//! memory size (gfx-rs/wgpu#2447), so [`probe_budget`] allocates and backs
-//! off: [`PROBE_START_MULTIPLE`] x [`DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`],
-//! halved per refusal down to [`PROBE_MIN_DEVICE_BYTES`], at most
-//! [`PROBE_MAX_ATTEMPTS`] tries. [`DeviceBudget::fallback`] is the constant
-//! when no probe ran; [`buffer_limit_shortfalls`] checks single buffers.
+//! **Probe.** wgpu 29.0.4 exposes no adapter memory size
+//! (gfx-rs/wgpu#2447), so [`probe_budget`] allocates and backs off:
+//! [`PROBE_START_MULTIPLE`] x [`DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`], halved
+//! per refusal down to [`PROBE_MIN_DEVICE_BYTES`], at most
+//! [`PROBE_MAX_ATTEMPTS`] tries. [`buffer_limit_shortfalls`] checks single
+//! buffers.
 //!
 //! **Every byte a tile allocates counts, not a live high-water mark.**
 //! Dropping a `wgpu::Buffer` does not promise immediate reclamation, and the
@@ -39,11 +39,6 @@ fn plane(w: u64, h: u64, spp: u64) -> u64 {
 /// samples, exactly [`crate::pack::packed_len`]'s own byte length.
 fn packed(w: u64, h: u64, spp: u64) -> u64 {
     packed_len((w * h * spp) as usize) as u64
-}
-
-/// `w*h` -- a pixel count, no sample factor.
-fn pix(w: u64, h: u64) -> u64 {
-    w * h
 }
 
 /// `(w_k, h_k)` for `k = 0..=levels`: `dims[0]` is the tile's own
@@ -79,7 +74,7 @@ fn per_frame_bytes(width: u32, height: u32, spp: u32, levels: u32, warped: bool)
 
     if warped {
         // Coord array, 24 bytes/destination pixel.
-        total += 24 * pix(w0, h0);
+        total += 24 * w0 * h0;
         // Re-uploaded source; a model, not a bound, for a large transform
         // whose `Transform::source_footprint` read rect exceeds the
         // destination rect.
@@ -105,7 +100,7 @@ fn per_frame_bytes(width: u32, height: u32, spp: u32, levels: u32, warped: bool)
         // Laplacian.
         total += plane(wk, hk, spp64);
         // Score rows + cols.
-        total += 2 * 4 * pix(wk, hk);
+        total += 2 * 4 * wk * hk;
     }
 
     total
@@ -124,7 +119,7 @@ fn once_per_tile_bytes(width: u32, height: u32, spp: u32, levels: u32) -> u64 {
 
     // Running best level + interleaved (score, winner) plane, per level.
     for &(wk, hk) in dims.iter().take(levels as usize) {
-        total += plane(wk, hk, spp64) + 8 * pix(wk, hk);
+        total += plane(wk, hk, spp64) + 8 * wk * hk;
     }
 
     // Residual sum, at the coarsest level.
@@ -144,7 +139,7 @@ fn once_per_tile_bytes(width: u32, height: u32, spp: u32, levels: u32) -> u64 {
 
     // Two readback staging buffers.
     total += packed(w0, h0, spp64);
-    total += 8 * pix(w0, h0);
+    total += 8 * w0 * h0;
 
     total
 }
@@ -185,7 +180,7 @@ pub fn largest_buffer_bytes(width: u32, height: u32, spp: u32, warped: bool) -> 
     let w0 = u64::from(width);
     let h0 = u64::from(height);
     if warped {
-        24 * pix(w0, h0)
+        24 * w0 * h0
     } else {
         plane(w0, h0, u64::from(spp))
     }
@@ -229,13 +224,48 @@ pub fn buffer_limit_shortfalls(
     out
 }
 
-/// The device-side VRAM working-set budget: a byte count, where it came
-/// from, and whether a live probe set it. Mirrors `HostBudget`.
+/// Invocations per workgroup in every 1-D kernel (`@workgroup_size(64)`).
+const INVOCATIONS_PER_WORKGROUP: u64 = 64;
+
+/// The `max_compute_workgroups_per_dimension` shortfall of a 1-D dispatch of
+/// `invocations` invocations, or `None` when it fits: `crate::pipeline::run_pass`
+/// dispatches `ceil(invocations / 64)` workgroups on x alone.
+pub fn dispatch_limit_shortfall(
+    invocations: u64,
+    max_workgroups_per_dimension: u32,
+) -> Option<LimitShortfall> {
+    let required = invocations.div_ceil(INVOCATIONS_PER_WORKGROUP);
+    (required > u64::from(max_workgroups_per_dimension)).then_some(LimitShortfall {
+        limit: "max_compute_workgroups_per_dimension",
+        required,
+        available: u64::from(max_workgroups_per_dimension),
+    })
+}
+
+/// The largest square read-rect side that both [`dispatch_limit_shortfall`]
+/// (one invocation per sample, `side * side * samples_per_pixel`) and
+/// [`buffer_limit_shortfalls`] (over [`largest_buffer_bytes`] for a warped
+/// tile) accept under the given limits.
+pub fn max_tile_side(
+    samples_per_pixel: u32,
+    max_workgroups_per_dimension: u32,
+    max_storage_buffer_binding_size: u64,
+    max_buffer_size: u64,
+) -> u32 {
+    let spp = samples_per_pixel.max(1);
+    let by_dispatch =
+        u64::from(max_workgroups_per_dimension) * INVOCATIONS_PER_WORKGROUP / u64::from(spp);
+    let bytes_per_pixel = largest_buffer_bytes(1, 1, spp, true);
+    let by_buffer = max_storage_buffer_binding_size.min(max_buffer_size) / bytes_per_pixel;
+    u32::try_from(by_dispatch.min(by_buffer).isqrt()).unwrap_or(u32::MAX)
+}
+
+/// The device-side VRAM working-set budget: a byte count and where it came
+/// from. Mirrors `HostBudget`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceBudget {
     bytes: u64,
     provenance: Provenance,
-    probed: bool,
 }
 
 impl DeviceBudget {
@@ -244,17 +274,6 @@ impl DeviceBudget {
         DeviceBudget {
             bytes,
             provenance: Provenance::Host,
-            probed: true,
-        }
-    }
-
-    /// The degraded answer: [`DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`], used
-    /// when no probe ran at all.
-    pub fn fallback() -> Self {
-        DeviceBudget {
-            bytes: DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT,
-            provenance: Provenance::HostFallback,
-            probed: false,
         }
     }
 
@@ -266,7 +285,6 @@ impl DeviceBudget {
         DeviceBudget {
             bytes,
             provenance: Provenance::Explicit,
-            probed: false,
         }
     }
 
@@ -278,7 +296,6 @@ impl DeviceBudget {
             Some(ceiling) if ceiling < self.bytes => DeviceBudget {
                 bytes: ceiling,
                 provenance: Provenance::Explicit,
-                probed: self.probed,
             },
             _ => self,
         }
@@ -291,20 +308,6 @@ impl DeviceBudget {
     pub fn provenance(&self) -> Provenance {
         self.provenance
     }
-
-    /// Whether this budget was actually set by a live probe.
-    pub fn was_probed(&self) -> bool {
-        self.probed
-    }
-}
-
-/// The seam a real allocation attempt goes through, so the probe logic is
-/// testable without a GPU. `WgpuAllocProbe` (the `vram` module) is the real
-/// implementor; this module's tests drive a fake.
-pub trait DeviceAllocProbe {
-    /// Attempts to reserve `bytes` on the device, returning `Err` naming why
-    /// on refusal.
-    fn try_reserve(&self, bytes: u64) -> Result<(), String>;
 }
 
 /// The optimistic starting multiple of [`DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`]
@@ -342,11 +345,13 @@ pub enum ProbeOutcome {
 /// DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT`, halving on each refusal down to
 /// `PROBE_MIN_DEVICE_BYTES`, for at most `PROBE_MAX_ATTEMPTS` attempts. The
 /// request never grows after a refusal, so it cannot oscillate.
-pub fn probe_budget(probe: &dyn DeviceAllocProbe) -> ProbeOutcome {
+/// `try_reserve` attempts to reserve that many bytes on the device and
+/// returns `Err` naming why on refusal.
+pub fn probe_budget(mut try_reserve: impl FnMut(u64) -> Result<(), String>) -> ProbeOutcome {
     let mut request = PROBE_START_MULTIPLE * DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT;
     let mut last_detail = String::new();
     for attempt in 1..=PROBE_MAX_ATTEMPTS {
-        match probe.try_reserve(request) {
+        match try_reserve(request) {
             Ok(()) => {
                 return ProbeOutcome::Settled {
                     bytes: request,
@@ -471,13 +476,6 @@ mod tests {
     }
 
     #[test]
-    fn fallback_reports_the_stated_constant_and_host_fallback_provenance() {
-        let budget = DeviceBudget::fallback();
-        assert_eq!(budget.bytes(), DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT);
-        assert_eq!(budget.provenance(), Provenance::HostFallback);
-    }
-
-    #[test]
     fn capped_to_lowers_when_the_ceiling_is_smaller() {
         let budget = DeviceBudget::probed(1_000).capped_to(Some(100));
         assert_eq!(budget.bytes(), 100);
@@ -500,7 +498,7 @@ mod tests {
 
     // --- probe_budget ---
 
-    /// A scripted [`DeviceAllocProbe`]: refuses any request strictly above
+    /// A scripted reservation: refuses any request strictly above
     /// `accepts_up_to`, recording every requested byte count it was asked
     /// to try.
     struct FakeProbe {
@@ -515,9 +513,7 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
             }
         }
-    }
 
-    impl DeviceAllocProbe for FakeProbe {
         fn try_reserve(&self, bytes: u64) -> Result<(), String> {
             self.requests.lock().unwrap().push(bytes);
             if bytes <= self.accepts_up_to {
@@ -531,7 +527,7 @@ mod tests {
     #[test]
     fn probe_settles_immediately_when_the_optimistic_start_is_accepted() {
         let probe = FakeProbe::new(u64::MAX);
-        let outcome = probe_budget(&probe);
+        let outcome = probe_budget(|bytes| probe.try_reserve(bytes));
         match outcome {
             ProbeOutcome::Settled { bytes, attempts } => {
                 assert_eq!(
@@ -552,7 +548,7 @@ mod tests {
         // and settle there.
         let ceiling = PROBE_START_MULTIPLE * DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT / 2;
         let probe = FakeProbe::new(ceiling);
-        let outcome = probe_budget(&probe);
+        let outcome = probe_budget(|bytes| probe.try_reserve(bytes));
         match outcome {
             ProbeOutcome::Settled { bytes, attempts } => {
                 assert_eq!(bytes, ceiling);
@@ -567,7 +563,7 @@ mod tests {
         // Never accepts anything -- the worst case for both the attempt
         // bound and monotonicity.
         let probe = FakeProbe::new(0);
-        let outcome = probe_budget(&probe);
+        let outcome = probe_budget(|bytes| probe.try_reserve(bytes));
         let requests = probe.requests.lock().unwrap().clone();
         assert!(
             requests.len() as u32 <= PROBE_MAX_ATTEMPTS,
@@ -592,7 +588,7 @@ mod tests {
     #[test]
     fn refused_all_the_way_down_yields_exhausted_naming_the_floor() {
         let probe = FakeProbe::new(0);
-        let outcome = probe_budget(&probe);
+        let outcome = probe_budget(|bytes| probe.try_reserve(bytes));
         match outcome {
             ProbeOutcome::Exhausted { floor, detail } => {
                 assert_eq!(floor, PROBE_MIN_DEVICE_BYTES);
@@ -686,6 +682,80 @@ mod tests {
     fn buffer_limit_shortfalls_is_empty_when_in_budget() {
         let shortfalls = buffer_limit_shortfalls(64 << 20, 128 << 20, 256 << 20);
         assert!(shortfalls.is_empty());
+    }
+
+    const DEFAULT_BINDING: u64 = 128 << 20;
+    const DEFAULT_BUFFER: u64 = 256 << 20;
+    const DEFAULT_WORKGROUPS: u32 = 65_535;
+
+    #[test]
+    fn max_tile_side_under_default_limits_is_dispatch_bound() {
+        for (spp, side) in [(1, 2047), (3, 1182), (4, 1023)] {
+            assert_eq!(
+                max_tile_side(spp, DEFAULT_WORKGROUPS, DEFAULT_BINDING, DEFAULT_BUFFER),
+                side,
+                "samples per pixel {spp}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_tile_side_is_buffer_bound_when_workgroups_are_plentiful() {
+        assert_eq!(
+            max_tile_side(3, u32::MAX, DEFAULT_BINDING, DEFAULT_BUFFER),
+            2364
+        );
+        // The smaller of the two buffer limits binds.
+        assert_eq!(
+            max_tile_side(3, u32::MAX, DEFAULT_BUFFER, DEFAULT_BINDING),
+            2364
+        );
+    }
+
+    #[test]
+    fn max_tile_side_under_a_tiny_workgroup_limit() {
+        assert_eq!(max_tile_side(1, 16, DEFAULT_BINDING, DEFAULT_BUFFER), 32);
+        assert_eq!(max_tile_side(3, 16, DEFAULT_BINDING, DEFAULT_BUFFER), 18);
+    }
+
+    #[test]
+    fn max_tile_side_is_the_largest_side_both_checks_accept() {
+        for spp in [1, 3, 4] {
+            let side = max_tile_side(spp, DEFAULT_WORKGROUPS, DEFAULT_BINDING, DEFAULT_BUFFER);
+            let accepts = |side: u32| {
+                dispatch_limit_shortfall(
+                    u64::from(side) * u64::from(side) * u64::from(spp),
+                    DEFAULT_WORKGROUPS,
+                )
+                .is_none()
+                    && buffer_limit_shortfalls(
+                        largest_buffer_bytes(side, side, spp, true),
+                        DEFAULT_BINDING,
+                        DEFAULT_BUFFER,
+                    )
+                    .is_empty()
+            };
+            assert!(accepts(side), "spp {spp}: {side} must be accepted");
+            assert!(
+                !accepts(side + 1),
+                "spp {spp}: {} must be refused",
+                side + 1
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_limit_shortfall_is_none_at_the_limit_and_names_it_one_past() {
+        assert_eq!(
+            dispatch_limit_shortfall(4_194_240, DEFAULT_WORKGROUPS),
+            None
+        );
+        assert_eq!(dispatch_limit_shortfall(0, DEFAULT_WORKGROUPS), None);
+        let past = dispatch_limit_shortfall(4_194_241, DEFAULT_WORKGROUPS)
+            .expect("one invocation past the limit needs one workgroup more");
+        assert_eq!(past.limit, "max_compute_workgroups_per_dimension");
+        assert_eq!(past.required, 65_536);
+        assert_eq!(past.available, 65_535);
     }
 
     #[test]

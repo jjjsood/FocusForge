@@ -111,7 +111,7 @@ pub struct WarpedTile {
 /// Clamps a signed tap coordinate to `0..dim` (clamp-to-edge), returning it
 /// as `i64` for further arithmetic.
 #[inline]
-fn clamp_tap(v: i64, dim: u32) -> i64 {
+pub fn clamp_tap(v: i64, dim: u32) -> i64 {
     v.clamp(0, dim as i64 - 1)
 }
 

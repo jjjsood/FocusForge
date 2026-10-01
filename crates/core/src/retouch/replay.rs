@@ -102,7 +102,7 @@ pub fn replay(
                 changed += brush::apply(op, info, tile, indices).map_err(|err| (index, err))?;
             }
             Op::ResetRegion { .. } => {
-                let Some(overlap) = brush::intersect(region, tile) else {
+                let Some(overlap) = region.intersect(tile) else {
                     continue;
                 };
                 let mut buf = vec![0u16; info.tile_len(overlap)];

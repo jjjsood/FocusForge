@@ -19,76 +19,14 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+use common::{CliOutput, mantis_512_dir, tmp_dir};
+
 fn bin() -> Command {
     common::cli_bin("job_cli")
 }
 
-fn mantis_512_dir() -> PathBuf {
-    common::fixtures_dir().join("mantis-512")
-}
-
-/// A fresh, empty directory, removed again when the test that made it ends
-/// -- used as the spawned process's own working directory, so `.scratch/`
-/// lands here and never collides with another test's.
-///
-/// Derefs to `Path`, so `&dir` and `dir.join(..)` read exactly as a bare
-/// `PathBuf` would.
-struct TmpDir {
-    path: PathBuf,
-}
-
-impl std::ops::Deref for TmpDir {
-    type Target = Path;
-
-    fn deref(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        // A failed test keeps its evidence -- the partials, the ledger and
-        // the outputs are exactly what a failure needs to be diagnosed.
-        if std::thread::panicking() {
-            return;
-        }
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-/// **Named per process, not just per test.** `CARGO_TARGET_TMPDIR` is inside
-/// the shared `target/`, so concurrent test runs get the *same* path for the
-/// same test name, and the `remove_dir_all` below would delete another run's
-/// live `.scratch/resume/` ledger mid-run (`stack` then exits 1 with `No such
-/// file or directory`). Running this binary twice at once failed 3 rounds out
-/// of 3 without the pid in the name, and 0 out of 3 with it.
-fn tmp_dir(name: &str) -> TmpDir {
-    let path =
-        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).unwrap();
-    TmpDir { path }
-}
-
-struct CliOutput {
-    success: bool,
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
-    let output = bin()
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("failed to run binary");
-    CliOutput {
-        success: output.status.success(),
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    common::run_in(&mut bin(), dir, args)
 }
 
 fn spawn_piped(dir: &Path, args: &[&str]) -> Child {

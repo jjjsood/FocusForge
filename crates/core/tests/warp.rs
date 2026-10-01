@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use focusforge_core::algorithm::{AlgorithmError, TileReader};
 use focusforge_core::align::warp::{warp_from_tile, warp_tile};
-use focusforge_core::align::{AlignError, Transform, WarpingReader};
+use focusforge_core::align::{
+    AlignError, KERNEL_RADIUS, SourceFootprint, Transform, WarpingReader,
+};
 use focusforge_core::io::TiffStack;
 use focusforge_core::tile::{Rect, Tile};
 
@@ -653,5 +655,93 @@ fn bicubic_overshoot_is_clamped() {
     assert!(
         found_ringing,
         "expected at least one warped sample to ring outside its own 4-tap window"
+    );
+}
+
+/// Reports one byte of scratch per pixel of the rect it is asked about.
+struct PixelScratchReader;
+
+impl TileReader for PixelScratchReader {
+    fn read_tile_into(
+        &self,
+        _frame: usize,
+        _rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        out.fill(0);
+        Ok(())
+    }
+
+    fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
+        u64::from(width) * u64::from(height)
+    }
+}
+
+/// The scratch the warp of a centred `rect` allocates, worked out from the
+/// footprint the warp itself reads.
+fn expected_warp_scratch(t: &Transform, frame: (u32, u32), spp: u64, rect: (u32, u32)) -> u64 {
+    let dst = Rect {
+        x: (frame.0 - rect.0) / 2,
+        y: (frame.1 - rect.1) / 2,
+        width: rect.0,
+        height: rect.1,
+    };
+    let SourceFootprint::Covers { read, .. } = t.source_footprint(dst, frame).unwrap() else {
+        panic!("the centred rect must land inside the frame");
+    };
+    let footprint = u64::from(read.width) * u64::from(read.height);
+    footprint * spp * 2 + u64::from(rect.0) * u64::from(rect.1) * (spp * 2 + 1) + footprint
+}
+
+#[test]
+fn warp_scratch_of_identity_is_the_inner_scratch() {
+    let reader = WarpingReader::new(
+        &PixelScratchReader,
+        (512, 512),
+        3,
+        vec![Transform::identity(); 3],
+    );
+    assert_eq!(reader.read_scratch_bytes(64, 64), 64 * 64);
+}
+
+#[test]
+fn warp_scratch_of_a_translation_adds_the_kernel_margin() {
+    let t = Transform::translation(5.5, 3.25);
+    let reader = WarpingReader::new(
+        &PixelScratchReader,
+        (512, 512),
+        3,
+        vec![Transform::identity(), t],
+    );
+    let scratch = reader.read_scratch_bytes(64, 64);
+    assert_eq!(scratch, expected_warp_scratch(&t, (512, 512), 3, (64, 64)));
+    let margin = u64::from(2 * KERNEL_RADIUS);
+    assert!(
+        scratch > (64 + margin) * (64 + margin) * 3 * 2,
+        "the footprint must exceed the destination rect by the kernel margin: {scratch}"
+    );
+}
+
+#[test]
+fn warp_scratch_of_a_scaling_similarity_exceeds_a_translation() {
+    let scale = Transform::similarity(1.5, 0.0, 0.0, 0.0);
+    let shift = Transform::translation(5.5, 3.25);
+    let scaled = WarpingReader::new(&PixelScratchReader, (512, 512), 3, vec![scale]);
+    let shifted = WarpingReader::new(&PixelScratchReader, (512, 512), 3, vec![shift]);
+    assert_eq!(
+        scaled.read_scratch_bytes(64, 64),
+        expected_warp_scratch(&scale, (512, 512), 3, (64, 64))
+    );
+    assert!(scaled.read_scratch_bytes(64, 64) > shifted.read_scratch_bytes(64, 64));
+}
+
+#[test]
+fn warp_scratch_footprint_is_clamped_to_the_frame() {
+    let scale = Transform::similarity(1.5, 0.0, 0.0, 0.0);
+    let reader = WarpingReader::new(&PixelScratchReader, (64, 64), 3, vec![scale]);
+    let frame_pixels = 64u64 * 64;
+    assert_eq!(
+        reader.read_scratch_bytes(64, 64),
+        frame_pixels * 3 * 2 + frame_pixels * (3 * 2 + 1) + frame_pixels
     );
 }

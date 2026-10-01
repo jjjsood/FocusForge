@@ -36,52 +36,10 @@ use focusforge_core::registry;
 use focusforge_core::retouch::{Sources, recomposite};
 use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 
+use common::{CliOutput, TmpDir, full_rect, mantis_512_dir, read_whole, tmp_dir};
+
 fn bin() -> Command {
     common::cli_bin("stack_cli")
-}
-
-fn mantis_512_dir() -> PathBuf {
-    common::fixtures_dir().join("mantis-512")
-}
-
-/// A fresh, empty directory, removed again when the test that made it ends
-/// -- used as the spawned process's own working directory, so `.scratch/`
-/// lands here and never collides with another test's.
-///
-/// Derefs to `Path`, so `&dir` and `dir.join(..)` work directly.
-struct TmpDir {
-    path: PathBuf,
-}
-
-impl std::ops::Deref for TmpDir {
-    type Target = Path;
-
-    fn deref(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        // A failed test keeps its evidence -- the partials, the ledger and
-        // the outputs are exactly what a failure needs to be diagnosed.
-        if std::thread::panicking() {
-            return;
-        }
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-/// **Named per process, not just per test.** `CARGO_TARGET_TMPDIR` gives two
-/// concurrent `cargo test` runs the *same* path for the same test name, so
-/// `remove_dir_all` below could delete a concurrent run's live
-/// `.scratch/resume/` ledger -- reproduced 3 rounds out of 3 without the pid.
-fn tmp_dir(name: &str) -> TmpDir {
-    let path =
-        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).unwrap();
-    TmpDir { path }
 }
 
 /// Both payloads of `project`, exported beside it as `<stem>-composite.tif`
@@ -114,45 +72,8 @@ fn partial_of(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-fn full_rect(width: u32, height: u32) -> Rect {
-    Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    }
-}
-
-fn read_whole(path: &Path) -> (Vec<u16>, u32, u32, u32) {
-    let stack = TiffStack::open_files(&[path.to_path_buf()]).expect("output must reopen");
-    let (w, h) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
-    let samples = stack
-        .read_tile(0, full_rect(w, h))
-        .expect("read must succeed")
-        .samples;
-    (samples, w, h, spp)
-}
-
-struct CliOutput {
-    success: bool,
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
-    let output = bin()
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("failed to run binary");
-    CliOutput {
-        success: output.status.success(),
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    common::run_in(&mut bin(), dir, args)
 }
 
 /// The one `laplacian` run driven through the built binary: `-o` and no
@@ -734,6 +655,7 @@ fn report_json_has_every_field() {
         "in_flight_limit",
         "peak_in_flight",
         "max_bytes_in_flight",
+        "accounted_bytes_in_flight",
         "budget_provenance",
         "backed_off",
         "outputs",
@@ -741,6 +663,7 @@ fn report_json_has_every_field() {
         "stages",
         "align_workers",
         "peak_align_workers",
+        "align_accounted_bytes",
         "device_peak_in_flight",
     ] {
         assert!(report.get(key).is_some(), "missing key {key:?} in {report}");
@@ -877,6 +800,12 @@ fn max_host_memory_lowers_never_raises_and_does_not_move_pixels() {
     let capped_report: serde_json::Value =
         serde_json::from_str(&capped.stdout).expect("--json must parse");
     assert_eq!(capped_report["max_bytes_in_flight"], 4_194_304);
+    assert!(
+        capped_report["accounted_bytes_in_flight"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "the scheduler's accounted bytes must be reported: {capped_report}"
+    );
     assert_eq!(capped_report["budget_provenance"], "Explicit");
 
     let mut uncapped_args = common_args(&uncapped_dir);

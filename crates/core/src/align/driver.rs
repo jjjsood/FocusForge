@@ -14,7 +14,7 @@
 //! `(frame_count - 1) / 2`.
 //!
 //! **Anchor** builds one [`AlignContext`] against the reference, calling `align_frame` for every
-//! other frame across a driver-owned rayon pool from [`AlignDriverOptions::max_bytes_in_flight`],
+//! other frame across a driver-owned rayon pool sized from [`AlignDriverOptions::budget`],
 //! built and dropped here so it never overlaps the tile scheduler's pool. **Chain** walks outward
 //! both ways, rebuilding an `AlignContext` per hop and composing `T_i = T_hop.compose(&T_previous)`
 //! -- hop **after** prefix, since [`Transform::compose`] applies its right operand first -- serial
@@ -47,9 +47,12 @@ use rayon::prelude::*;
 
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, AlignStatus, TileReader};
 use crate::align::Transform;
+use crate::align::ecc_algorithm::{retained_template_bytes, solve_scratch_bytes};
 use crate::job::{ControlState, JobControl};
 use crate::params::{ParamValue, ParamValues, StackContext};
+use crate::tile::HostBudget;
 use crate::tile::plan::DEFAULT_TILE_SIZE;
+use crate::timing::{TimingCounter, measurement_scope, observe_timing_max, record_timing};
 
 /// Whether every frame registers against one anchor frame, or chains
 /// hop-by-hop through its neighbours toward the reference.
@@ -129,22 +132,23 @@ impl StackAlignment {
     }
 }
 
-/// The shipped default alignment worker budget: 2 GiB.
-///
-/// Ships as a **share**, not an arithmetic ceiling:
-/// [`AlignDriverOptions::max_bytes_in_flight`] is the field a caller with a
-/// measured multi-worker budget raises, not a new constant here.
+/// The library default alignment budget: 2 GiB, used by
+/// [`AlignDriverOptions::default`]. The pipeline and the CLI pass the host
+/// budget they resolved instead.
 pub const DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT: usize = 2 * (1 << 30);
 
-/// The alignment driver's own memory budget -- the model is
-/// `crate::tile::TileSchedulerOptions`, minus its `scratch_base`: every
-/// field here is a pure number, so (unlike that type) this one carries a
-/// `Default`.
+/// The alignment driver's own options -- the model is
+/// `crate::tile::TileSchedulerOptions`, minus its `scratch_base`. Unlike that
+/// type it carries a `Default`: an explicit
+/// [`DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT`] budget and no control hooks.
 pub struct AlignDriverOptions<'a> {
-    /// How many bytes of concurrent [`bytes_per_registration`] this driver
-    /// may hold live in the anchor arm. See `workers_for_budget` (private to
-    /// this module) for the arithmetic this bounds.
-    pub max_bytes_in_flight: usize,
+    /// The host memory this driver may account: the shared reference data
+    /// once, plus [`bytes_per_registration`] per anchor worker. A
+    /// host-derived budget below the shared data plus one registration
+    /// refuses the run ([`AlgorithmError::HostMemoryTooSmall`]); any other
+    /// budget floors to one worker. See `workers_for_budget` (private to this
+    /// module) for the arithmetic.
+    pub budget: HostBudget,
     /// Bumped once per frame whose registration has completed, reference
     /// frame included, in completion order -- `None` when the caller has
     /// nowhere to report it.
@@ -167,7 +171,7 @@ pub struct AlignDriverOptions<'a> {
 impl Default for AlignDriverOptions<'_> {
     fn default() -> Self {
         AlignDriverOptions {
-            max_bytes_in_flight: DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT,
+            budget: HostBudget::explicit(DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT as u64),
             frames_done: None,
             control: None,
             on_pause: None,
@@ -175,60 +179,48 @@ impl Default for AlignDriverOptions<'_> {
     }
 }
 
-/// The bytes the anchor arm's **shared** reference pyramid holds live, once
-/// per run rather than once per worker -- a per-run constant instead of a
-/// term inside every registration's own figure. The sibling of
-/// [`bytes_per_registration`], which is what remains per worker once this
-/// term is pulled out.
+/// The bytes an anchor run holds live once, however many workers there are:
+/// the reference pyramid and the reference templates the solver retains for
+/// every level.
 ///
 /// ```text
-/// plane                  = width * height * 4    // f32 luma
-/// bytes_shared_reference  = plane * 4 / 3         // level 0 + sum of levels 1..N, ratio 1/4 each
+/// plane                   = width * height * 4   // f32 luma
+/// pyramid                 = plane * 4 / 3        // level 0 + levels 1..N, ratio 1/4 each
+/// bytes_shared_reference  = pyramid + retained_template_bytes(width, height)
 /// ```
 ///
 /// The `4/3` is the infinite geometric sum `1 + 1/4 + 1/16 + ...`, so the
-/// figure is an upper bound independent of `pyramid-depth`. At 8192x5464x3
-/// this evaluates to ~238.7 MB; at the 512x512x3 fixture, ~1.4 MB.
-/// `bytes_shared_reference(stack) + bytes_per_registration(stack,
-/// DEFAULT_TILE_SIZE)` equals the 622 MB figure
-/// `the_split_sums_to_622_mb_at_the_reference_scale` checks, so the two
-/// functions can never silently drift into describing different physics.
+/// pyramid figure is an upper bound independent of pyramid depth. At
+/// 8192x5464x3 the pyramid is ~238.7 MB and the templates ~161.4 MB, ~400.1 MB
+/// together; at the 512x512x3 fixture ~10.0 MB. The templates are priced in
+/// rotation-scale mode; a translation run retains less.
 pub fn bytes_shared_reference(stack: StackContext) -> u64 {
     let plane = stack.width as u64 * stack.height as u64 * 4;
-    plane * 4 / 3
+    plane * 4 / 3 + retained_template_bytes(stack.width, stack.height)
 }
 
-/// The transient peak bytes one anchor-mode registration holds live **on
-/// top of** the one shared reference pyramid ([`bytes_shared_reference`]) --
-/// the sibling of `crate::tile::scheduler::bytes_per_tile_set`, `pub`
-/// because the memory test sizes its budgets from it, and a caller choosing
-/// [`AlignDriverOptions::max_bytes_in_flight`] deliberately is choosing a
-/// multiple of it.
+/// The bytes one anchor-mode registration holds live **on top of** the
+/// shared term ([`bytes_shared_reference`]) -- the sibling of
+/// `crate::tile::scheduler::bytes_per_tile_set`, `pub` because the memory
+/// test sizes its budgets from it.
 ///
 /// ```text
 /// plane      = width * height * 4                      // f32 luma
-/// assembler  = plane                                    // LumaAssembler::data
-/// copy       = plane                                    // Plane::from_f32 copies
-/// band       = width * band_rows * spp * 2
-/// bytes_per_registration = assembler + copy + band
+/// pyramid    = plane * 4 / 3                           // the frame's own pyramid
+/// band       = width * band_rows * spp * 2             // streamed input rows
+/// scratch    = solve_scratch_bytes(width, height)      // per-solve vectors
+/// bytes_per_registration = pyramid + max(band, scratch)
 /// ```
 ///
 /// `band_rows` is `DEFAULT_TILE_SIZE`, the band height
-/// `PyramidalEcc::build_pyramid` streams with. The peak is **transient, not
-/// steady-state**: it is the instant inside the frame-side `build_pyramid`
-/// call when the shared reference pyramid, the assembler's `Vec<f32>`,
-/// `Plane::from_f32`'s copy of it and one band buffer are all live at once.
-/// Exactly one reference pyramid exists per run, not one per concurrent
-/// registration -- its term lives in [`bytes_shared_reference`], a
-/// per-**run** constant, not here. At 8192x5464x3 this evaluates to
-/// ~383.3 MB (179.0 + 179.0 + 25.2); at the 512x512x3 fixture, ~3.67 MB.
-/// + 179.0 + 25.2); at the 512x512x3 fixture, ~3.67 MB.
+/// `PyramidalEcc::build_pyramid` streams with. The luma plane is moved into
+/// the pyramid rather than copied, and the band is dropped before the solve
+/// allocates its scratch, so the two never coexist. At 8192x5464x3 this is
+/// ~263.9 MB; at the 512x512x3 fixture ~4.9 MB.
 pub fn bytes_per_registration(stack: StackContext, band_rows: u32) -> u64 {
     let plane = stack.width as u64 * stack.height as u64 * 4;
-    let assembler = plane;
-    let copy = plane;
     let band = stack.width as u64 * band_rows as u64 * stack.samples_per_pixel as u64 * 2;
-    assembler + copy + band
+    plane * 4 / 3 + band.max(solve_scratch_bytes(stack.width, stack.height))
 }
 
 /// The pure arithmetic behind the anchor arm's worker count: mirrors
@@ -238,22 +230,21 @@ pub fn bytes_per_registration(stack: StackContext, band_rows: u32) -> u64 {
 /// scheduler has no equivalent for: capped at `registrations`, the number of
 /// non-reference frames there are to register.
 ///
-/// `shared_bytes` (the run's one shared reference pyramid,
-/// [`bytes_shared_reference`]) is subtracted from `max_bytes_in_flight`
-/// **once**, before dividing by the per-worker `bytes_per_registration` --
-/// `saturating_sub`, so a budget smaller than the shared pyramid floors to
-/// one worker instead of underflowing.
-/// additive.
+/// `shared_bytes` (the run's one shared reference data, the pyramid plus the
+/// retained templates, [`bytes_shared_reference`]) is subtracted from
+/// `budget_bytes` **once**, before dividing by the per-worker
+/// `bytes_per_registration` -- `saturating_sub`, so a budget smaller than the
+/// shared data floors to one worker instead of underflowing.
 fn workers_for_budget(
     shared_bytes: u64,
     bytes_per_registration: u64,
-    max_bytes_in_flight: usize,
+    budget_bytes: u64,
     available_parallelism: usize,
     registrations: usize,
 ) -> usize {
     let available_parallelism = available_parallelism.max(1);
     let registrations = registrations.max(1);
-    let remaining = (max_bytes_in_flight as u64).saturating_sub(shared_bytes);
+    let remaining = budget_bytes.saturating_sub(shared_bytes);
     let raw = remaining
         .checked_div(bytes_per_registration)
         .map(|quotient| quotient.max(1))
@@ -273,6 +264,10 @@ pub struct AlignRun {
     pub alignment: StackAlignment,
     pub worker_limit: usize,
     pub peak_workers: usize,
+    /// The bytes this run accounted for: the shared reference data plus
+    /// `worker_limit` registrations. An explicit budget below one
+    /// registration still runs one worker, so this can exceed the budget.
+    pub accounted_bytes: u64,
 }
 
 fn reference_policy_from_cfg(cfg: &ParamValues) -> ReferencePolicy {
@@ -439,7 +434,7 @@ pub fn align_stack(
 /// the anchor arm's worker count bounded by `options`. See the module docs.
 ///
 /// The anchor arm runs across a driver-owned rayon pool sized from
-/// `options.max_bytes_in_flight` and [`bytes_per_registration`], built and
+/// `options.budget` and [`bytes_per_registration`], built and
 /// dropped inside this call -- it never coexists with the tile scheduler's
 /// own pool, which (on the `stack` path) is not built until after this call
 /// returns. When the budget floors to one worker, this runs a serial loop
@@ -460,20 +455,35 @@ pub fn align_stack_with(
     let reference = reference_index(reference_frame_from_cfg(cfg), stack.frame_count);
 
     let mut frames: Vec<Option<FrameAlignment>> = vec![None; stack.frame_count];
+    let frame_bytes = frames.capacity() * std::mem::size_of::<Option<FrameAlignment>>();
+    if frame_bytes != 0 {
+        record_timing(TimingCounter::AllocationBytes, frame_bytes as u64);
+        record_timing(TimingCounter::AllocationOperations, 1);
+    }
     frames[reference] = Some(identity_alignment(reference));
 
+    let shared_bytes = bytes_shared_reference(stack);
+    let mut registration_bytes = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
     let (worker_limit, peak_workers) = match policy {
         ReferencePolicy::Anchor => {
             let registrations = stack.frame_count.saturating_sub(1);
-            let shared_bytes = bytes_shared_reference(stack);
-            let bytes = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
+            registration_bytes += reader.read_scratch_bytes(stack.width, DEFAULT_TILE_SIZE);
+            let budget_bytes = options.budget.bytes();
+            if options.budget.refuses_below_one_tile_set()
+                && budget_bytes < shared_bytes + registration_bytes
+            {
+                return Err(AlgorithmError::HostMemoryTooSmall {
+                    budget_bytes,
+                    required_bytes: shared_bytes + registration_bytes,
+                });
+            }
             let available_parallelism = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1);
             let workers = workers_for_budget(
                 shared_bytes,
-                bytes,
-                options.max_bytes_in_flight,
+                registration_bytes,
+                budget_bytes,
                 available_parallelism,
                 registrations,
             );
@@ -484,7 +494,10 @@ pub fn align_stack_with(
             // `Arc` binding lives in this stack frame and drops when this
             // function returns.
             let ctx = AlignContext::new(stack, reference, reader);
-            let prepared = algorithm.prepare_run(&ctx, cfg)?;
+            let prepared = {
+                let _prepare = measurement_scope("align_prepare");
+                algorithm.prepare_run(&ctx, cfg)?
+            };
             let ctx = ctx.with_prepared(prepared.as_deref());
             credit_frame_done(options.frames_done.as_deref());
 
@@ -496,6 +509,7 @@ pub fn align_stack_with(
                         continue;
                     }
                     wait_at_boundary(options)?;
+                    let _solve = measurement_scope("align_solve");
                     let outcome = algorithm.align_frame(&ctx, i, cfg)?;
                     *slot = Some(anchored_alignment(i, outcome, failure));
                     credit_frame_done(options.frames_done.as_deref());
@@ -557,6 +571,7 @@ pub fn align_stack_with(
                                             let _frame = frame_span.enter();
                                             let cur = live.fetch_add(1, Ordering::SeqCst) + 1;
                                             peak.fetch_max(cur, Ordering::SeqCst);
+                                            let _solve = measurement_scope("align_solve");
                                             let result = algorithm.align_frame(&ctx, i, cfg).map(
                                                 |outcome| anchored_alignment(i, outcome, failure),
                                             );
@@ -625,6 +640,9 @@ pub fn align_stack_with(
         .map(|(i, f)| f.unwrap_or_else(|| panic!("frame {i} was never visited by align_stack")))
         .collect();
 
+    observe_timing_max(TimingCounter::WorkerLimit, worker_limit as u64);
+    observe_timing_max(TimingCounter::PeakWorkers, peak_workers as u64);
+
     Ok(AlignRun {
         alignment: StackAlignment {
             reference,
@@ -633,6 +651,7 @@ pub fn align_stack_with(
         },
         worker_limit,
         peak_workers,
+        accounted_bytes: shared_bytes + worker_limit as u64 * registration_bytes,
     })
 }
 
@@ -824,7 +843,7 @@ mod tests {
 
     #[test]
     fn worker_budget_caps_at_available_parallelism() {
-        let workers = workers_for_budget(0, 1, usize::MAX, 4, 60);
+        let workers = workers_for_budget(0, 1, u64::MAX, 4, 60);
         assert_eq!(workers, 4);
     }
 
@@ -833,7 +852,7 @@ mod tests {
         // The scheduler has no equivalent of this clamp: a tile plan always
         // outnumbers its workers, an 8-frame fixture on a 32-core host does
         // not.
-        let workers = workers_for_budget(0, 1, usize::MAX, 32, 7);
+        let workers = workers_for_budget(0, 1, u64::MAX, 32, 7);
         assert_eq!(workers, 7);
     }
 
@@ -848,9 +867,9 @@ mod tests {
         // The bound is never looser than the arithmetic itself allows, even
         // when neither clamp binds.
         let bytes = 1_000u64;
-        let budget = 250_000usize;
+        let budget = 250_000u64;
         let workers = workers_for_budget(0, bytes, budget, 1_000, 1_000);
-        assert!(workers as u64 <= budget as u64 / bytes);
+        assert!(workers as u64 <= budget / bytes);
     }
 
     #[test]
@@ -864,29 +883,54 @@ mod tests {
     }
 
     #[test]
-    fn the_split_sums_to_622_mb_at_the_reference_scale() {
-        // `bytes_shared_reference(stack) + bytes_per_registration(stack,
-        // DEFAULT_TILE_SIZE)` must equal the 622 MB total
-        // `crate::align::pyramid`'s module docs quote.
+    fn the_split_sums_to_664_mb_at_the_reference_scale() {
+        // Shared: the reference pyramid plus the retained templates.
+        // Per registration: the frame pyramid plus the larger of the band
+        // buffer and the solve scratch (equal to within 25 KB here).
         let stack = StackContext::new(61, 8192, 5464, 3);
-        let sum = bytes_shared_reference(stack) + bytes_per_registration(stack, DEFAULT_TILE_SIZE);
-        let ratio = sum as f64 / 622_000_000f64;
+        let shared = bytes_shared_reference(stack);
+        let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
+        assert_eq!(shared, 238_725_802 + 161_361_640);
+        assert_eq!(per_registration, 238_725_802 + 8192 * 512 * 3 * 2);
+        let ratio = (shared + per_registration) as f64 / 664_000_000f64;
         assert!(
             (ratio - 1.0).abs() < 0.01,
-            "bytes_shared_reference + bytes_per_registration = {sum} is not within 1% of 622 MB"
+            "shared + per registration = {} is not within 1% of 664 MB",
+            shared + per_registration
         );
     }
 
     #[test]
     fn worker_budget_at_the_reference_scale() {
         // Pinned with an explicit `available_parallelism` and registration
-        // count, so this assertion never depends on the host: the default
-        // budget yields 4 workers at the reference scale.
+        // count, so this assertion never depends on the host: the library
+        // default budget yields 6 workers at the reference scale.
         let stack = StackContext::new(61, 8192, 5464, 3);
         let shared = bytes_shared_reference(stack);
         let bytes = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
-        let workers = workers_for_budget(shared, bytes, DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT, 32, 60);
-        assert_eq!(workers, 4, "the shipped default's 4-worker figure");
+        let workers = workers_for_budget(
+            shared,
+            bytes,
+            DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT as u64,
+            32,
+            60,
+        );
+        assert_eq!(workers, 6);
+    }
+
+    #[test]
+    fn single_sample_stacks_are_priced_by_templates_and_pyramids() {
+        // At 6000x4000x1 the band is 6.1 MB against a 25.2 MB solve scratch,
+        // and the templates and pyramids carry the rest.
+        let stack = StackContext::new(20, 6000, 4000, 1);
+        let shared = bytes_shared_reference(stack);
+        let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
+        assert_eq!(shared, 128_000_000 + 141_772_400);
+        assert_eq!(per_registration, 128_000_000 + 25_160_256);
+        let band = 6000u64 * DEFAULT_TILE_SIZE as u64 * 2;
+        assert!(band * 4 < per_registration - 128_000_000);
+        let workers = workers_for_budget(shared, per_registration, 2 << 30, 32, 19);
+        assert_eq!(workers, 12);
     }
 
     #[test]
@@ -906,19 +950,18 @@ mod tests {
         let pyramid_bytes: u64 = (0..pyramid.level_count())
             .map(|k| pyramid.level(k).data().len() as u64 * 4)
             .sum();
-        let plane = width as u64 * height as u64 * 4;
-        // The assembler's own buffer plus `Plane::from_f32`'s copy of it --
-        // the frame-side figure `bytes_per_registration` owns.
-        let assembler_and_copy = plane * 2;
+        // The solve scratch: three vectors of 24 bytes per pixel over the
+        // 384 x 384 level-0 solve region.
+        let solve_scratch = 24 * 384 * 384u64;
         let band = width as u64 * DEFAULT_TILE_SIZE as u64 * spp as u64 * 2;
-        let floor = assembler_and_copy + band;
+        let floor = pyramid_bytes + band.max(solve_scratch);
 
         let stack = StackContext::new(8, width, height, spp);
         let bpr = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
 
         assert!(
             bpr >= floor,
-            "budget {bpr} must be >= the real assembler+copy+band figure {floor}"
+            "budget {bpr} must be >= the real frame pyramid + scratch figure {floor}"
         );
         let ratio = bpr as f64 / floor as f64;
         assert!(
@@ -926,19 +969,117 @@ mod tests {
             "budget {bpr} must be within 5% of the real figure {floor} (ratio {ratio})"
         );
 
-        // `bytes_shared_reference` is the term that left: it must still be
-        // an upper bound on the real, once-per-run pyramid's own size.
         let shared = bytes_shared_reference(stack);
         assert!(
             shared >= pyramid_bytes,
             "bytes_shared_reference {shared} must be >= the real pyramid figure {pyramid_bytes}"
         );
-        let shared_ratio = shared as f64 / pyramid_bytes as f64;
+    }
+
+    fn anchor_stack() -> StackContext {
+        StackContext::new(4, 512, 512, 3)
+    }
+
+    #[test]
+    fn a_host_derived_budget_below_the_minimum_refuses_before_any_registration() {
+        // usable_available = 100 B, so the budget is 40 B.
+        let facts = crate::host::HostFacts::new(1_000, 100, None, None, 4);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let algo = RecordingAlign {
+            counter,
+            seen: Mutex::new(Vec::new()),
+        };
+        let options = AlignDriverOptions {
+            budget: HostBudget::host_derived(&facts),
+            ..Default::default()
+        };
+        let stack = anchor_stack();
+        let error = align_stack_with(
+            &algo,
+            stack,
+            &NullReader,
+            &cfg_with("anchor", "middle"),
+            FailurePolicy::Strict,
+            &options,
+        )
+        .expect_err("a budget of 40 B cannot hold the shared term");
+        let required =
+            bytes_shared_reference(stack) + bytes_per_registration(stack, DEFAULT_TILE_SIZE);
         assert!(
-            shared_ratio <= 1.05,
-            "bytes_shared_reference {shared} must be within 5% of the real pyramid figure \
-             {pyramid_bytes} (ratio {shared_ratio})"
+            matches!(
+                error,
+                AlgorithmError::HostMemoryTooSmall { budget_bytes: 40, required_bytes }
+                    if required_bytes == required
+            ),
+            "{error:?}"
         );
+        assert!(algo.seen.lock().unwrap().is_empty(), "no registration ran");
+    }
+
+    #[test]
+    fn an_explicit_budget_below_the_minimum_floors_to_one_worker_and_completes() {
+        let algo = ConstAlign;
+        let options = AlignDriverOptions {
+            budget: HostBudget::explicit(1),
+            ..Default::default()
+        };
+        let run = align_stack_with(
+            &algo,
+            anchor_stack(),
+            &NullReader,
+            &cfg_with("anchor", "middle"),
+            FailurePolicy::Strict,
+            &options,
+        )
+        .expect("an explicit budget is floored, never refused");
+        assert_eq!(run.worker_limit, 1);
+    }
+
+    #[test]
+    fn a_host_derived_budget_above_the_minimum_runs() {
+        // usable_available = 1 GiB, so the budget is about 430 MB.
+        let facts = crate::host::HostFacts::new(1 << 31, 1 << 30, None, None, 4);
+        let options = AlignDriverOptions {
+            budget: HostBudget::host_derived(&facts),
+            ..Default::default()
+        };
+        align_stack_with(
+            &ConstAlign,
+            anchor_stack(),
+            &NullReader,
+            &cfg_with("anchor", "middle"),
+            FailurePolicy::Strict,
+            &options,
+        )
+        .expect("the budget covers the shared term and one registration");
+    }
+
+    #[test]
+    fn the_run_reports_the_bytes_it_accounted() {
+        let stack = StackContext::new(8, 512, 512, 3);
+        let shared = bytes_shared_reference(stack);
+        let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
+        let options = AlignDriverOptions {
+            budget: HostBudget::explicit(shared + 2 * per_registration),
+            ..Default::default()
+        };
+        for (policy, workers_at_most) in [("anchor", 2), ("chain", 1)] {
+            let run = align_stack_with(
+                &ConstAlign,
+                stack,
+                &NullReader,
+                &cfg_with(policy, "middle"),
+                FailurePolicy::Strict,
+                &options,
+            )
+            .unwrap();
+            assert!(run.worker_limit <= workers_at_most, "{policy}");
+            assert_eq!(
+                run.accounted_bytes,
+                shared + run.worker_limit as u64 * per_registration,
+                "{policy}"
+            );
+        }
     }
 
     /// Records the shared counter's value as seen from inside each
@@ -1049,7 +1190,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
             };
             let options = AlignDriverOptions {
-                max_bytes_in_flight,
+                budget: HostBudget::explicit(max_bytes_in_flight as u64),
                 control: Some(control),
                 ..Default::default()
             };
@@ -1149,7 +1290,7 @@ mod tests {
                 control.clear();
             };
             let options = AlignDriverOptions {
-                max_bytes_in_flight,
+                budget: HostBudget::explicit(max_bytes_in_flight as u64),
                 control: Some(Arc::clone(&control)),
                 on_pause: Some(&on_pause),
                 ..Default::default()
@@ -1197,7 +1338,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
             };
             let baseline_options = AlignDriverOptions {
-                max_bytes_in_flight,
+                budget: HostBudget::explicit(max_bytes_in_flight as u64),
                 ..Default::default()
             };
             let baseline = align_stack_with(
@@ -1219,7 +1360,7 @@ mod tests {
             };
             let on_pause = |control: &JobControl| control.clear();
             let options = AlignDriverOptions {
-                max_bytes_in_flight,
+                budget: HostBudget::explicit(max_bytes_in_flight as u64),
                 control: Some(Arc::clone(&control)),
                 on_pause: Some(&on_pause),
                 ..Default::default()
@@ -1271,7 +1412,7 @@ mod tests {
         let stack = StackContext::new(6, 8, 8, 1);
         let cfg = cfg_with("anchor", "middle");
         let options = AlignDriverOptions {
-            max_bytes_in_flight: 1,
+            budget: HostBudget::explicit(1),
             frames_done: Some(Arc::clone(&counter)),
             ..Default::default()
         };
@@ -1296,7 +1437,7 @@ mod tests {
 
                 let serial_counter = Arc::new(AtomicUsize::new(0));
                 let serial = AlignDriverOptions {
-                    max_bytes_in_flight: 1,
+                    budget: HostBudget::explicit(1),
                     frames_done: Some(Arc::clone(&serial_counter)),
                     ..Default::default()
                 };

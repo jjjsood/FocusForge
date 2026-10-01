@@ -21,11 +21,10 @@
 //! \[harness_gain.wgsl\] via \[harness\], and \[warp_bicubic.wgsl\] via
 //! \[warp\].
 //!
-//! `wgpu` is optional (`gpu = ["dep:wgpu", "dep:thiserror"]`): [`adapter`],
-//! [`pack`], [`warp_coords`], [`budget`] and [`limits`] compile without it;
+//! `wgpu` is optional (`gpu = ["dep:wgpu", "dep:thiserror"]`): [`pack`],
+//! [`warp_coords`], [`budget`] and [`limits`] compile without it;
 //! inside [`limits`], only what names a `wgpu` type is gated.
 
-pub mod adapter;
 pub mod budget;
 pub mod limits;
 pub mod pack;

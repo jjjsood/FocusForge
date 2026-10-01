@@ -20,13 +20,14 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use focusforge_core::algorithm::AlignAlgorithm;
+use focusforge_core::algorithm::{AlignAlgorithm, AlignContext};
 use focusforge_core::align::{
     AlignDriverOptions, FailurePolicy, PyramidalEcc, align_stack_with, bytes_per_registration,
     bytes_shared_reference,
 };
 use focusforge_core::io::TiffStack;
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
+use focusforge_core::tile::HostBudget;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -122,11 +123,11 @@ fn peak_live_heap_tracks_the_worker_budget() {
     // term is a per-run constant, not a per-worker one -- both budgets add
     // it in once, then n worker-shares of the frame-side figure.
     let one_x = AlignDriverOptions {
-        max_bytes_in_flight: (shared_reference + per_registration) as usize,
+        budget: HostBudget::explicit(shared_reference + per_registration),
         ..Default::default()
     };
     let three_x = AlignDriverOptions {
-        max_bytes_in_flight: (shared_reference + per_registration * 3) as usize,
+        budget: HostBudget::explicit(shared_reference + per_registration * 3),
         ..Default::default()
     };
 
@@ -184,4 +185,98 @@ fn peak_live_heap_tracks_the_worker_budget() {
         serial.alignment.frames, parallel.alignment.frames,
         "the byte-identity property must hold at fixture scale here too"
     );
+}
+
+fn open_fixture(name: &str) -> (TiffStack, StackContext) {
+    let stack = TiffStack::open(common::fixtures_dir().join(name))
+        .unwrap_or_else(|err| panic!("{name} must open: {err}"));
+    let (width, height) = stack.dimensions();
+    let ctx = StackContext::new(
+        stack.len(),
+        width,
+        height,
+        stack.header(0).samples_per_pixel,
+    );
+    (stack, ctx)
+}
+
+fn config(ctx: &StackContext, mode: &str, policy: &str) -> ParamValues {
+    let mut cfg = resolved_defaults(ctx);
+    cfg.insert("mode".to_string(), ParamValue::Enum(mode.to_string()));
+    cfg.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum(policy.to_string()),
+    );
+    cfg.insert("max-iterations".to_string(), ParamValue::Int(40));
+    cfg
+}
+
+/// What the shared reference data really holds once `prepare_run` returns:
+/// at most the accounted figure, and close to it in rotation-scale mode,
+/// where the templates are largest.
+#[test]
+fn retained_heap_after_prepare_run_matches_the_shared_figure() {
+    let _guard = SERIAL.lock().unwrap();
+    for name in ["mantis-512", "mantis-64"] {
+        let (stack, ctx) = open_fixture(name);
+        let shared = bytes_shared_reference(ctx);
+        for mode in ["translation", "rotation-scale"] {
+            let cfg = config(&ctx, mode, "anchor");
+            let before = LIVE.load(Ordering::SeqCst);
+            let prepared = PyramidalEcc
+                .prepare_run(&AlignContext::new(ctx, 0, &stack), &cfg)
+                .expect("prepare_run succeeds");
+            let retained = (LIVE.load(Ordering::SeqCst) - before) as u64;
+            assert!(
+                retained <= shared,
+                "{name} {mode}: retained {retained} B exceeds the shared figure {shared} B"
+            );
+            if mode == "rotation-scale" && name == "mantis-512" {
+                assert!(
+                    retained as f64 >= shared as f64 * 0.9,
+                    "{name}: retained {retained} B is more than 10% under the shared figure \
+                     {shared} B"
+                );
+            }
+            drop(prepared);
+        }
+    }
+}
+
+/// One worker never holds more than the shared data plus one registration.
+#[test]
+fn serial_peak_stays_within_shared_plus_one_registration() {
+    let _guard = SERIAL.lock().unwrap();
+    for name in ["mantis-512", "mantis-64"] {
+        let (stack, ctx) = open_fixture(name);
+        let accounted =
+            bytes_shared_reference(ctx) + bytes_per_registration(ctx, DEFAULT_TILE_SIZE);
+        for mode in ["translation", "rotation-scale"] {
+            for policy in ["anchor", "chain"] {
+                let cfg = config(&ctx, mode, policy);
+                let options = AlignDriverOptions {
+                    budget: HostBudget::explicit(1),
+                    ..Default::default()
+                };
+                let before = LIVE.load(Ordering::SeqCst);
+                reset_peak();
+                let run = align_stack_with(
+                    &PyramidalEcc,
+                    ctx,
+                    &stack,
+                    &cfg,
+                    FailurePolicy::IdentityFallback,
+                    &options,
+                )
+                .expect("the run completes");
+                let peak = (peak_since_reset() - before) as u64;
+                assert_eq!(run.worker_limit, 1);
+                assert!(
+                    peak <= accounted,
+                    "{name} {mode} {policy}: peak live heap {peak} B exceeds shared + one \
+                     registration {accounted} B"
+                );
+            }
+        }
+    }
 }

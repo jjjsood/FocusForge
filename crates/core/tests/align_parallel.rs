@@ -23,7 +23,7 @@ use focusforge_core::align::{
 };
 use focusforge_core::io::{FrameError, TiffError, TiffStack};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
-use focusforge_core::tile::{Rect, Tile};
+use focusforge_core::tile::{HostBudget, Rect, Tile};
 
 const FRAME_3: usize = 3;
 
@@ -159,7 +159,7 @@ fn parallel_anchor_matches_serial_transforms() {
         &cfg,
         FailurePolicy::Strict,
         &AlignDriverOptions {
-            max_bytes_in_flight: 1,
+            budget: HostBudget::explicit(1),
             ..Default::default()
         },
     )
@@ -253,7 +253,7 @@ fn chain_mode_stays_serial() {
         &cfg,
         FailurePolicy::Strict,
         &AlignDriverOptions {
-            max_bytes_in_flight: 1,
+            budget: HostBudget::explicit(1),
             ..Default::default()
         },
     )
@@ -321,7 +321,7 @@ fn parallel_anchor_failure_policy_is_unchanged() {
             &cfg,
             policy,
             &AlignDriverOptions {
-                max_bytes_in_flight: 1,
+                budget: HostBudget::explicit(1),
                 ..Default::default()
             },
         )

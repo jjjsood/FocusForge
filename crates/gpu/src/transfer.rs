@@ -15,6 +15,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use focusforge_core::tile::Tile;
+use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
 
 use crate::device::GpuError;
 use crate::pack::{pack_samples, packed_len};
@@ -36,6 +37,7 @@ pub fn readback_count() -> u64 {
 /// bytes, labelled `label`, with the same usage flags as [`upload_tile`].
 /// Callers that need zeros write them explicitly.
 pub fn create_storage_buffer(device: &wgpu::Device, byte_len: u64, label: &str) -> wgpu::Buffer {
+    record_timing(TimingCounter::BufferCreations, 1);
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: byte_len,
@@ -58,6 +60,7 @@ pub fn upload_f32(device: &wgpu::Device, queue: &wgpu::Queue, data: &[f32]) -> w
     let buffer =
         create_storage_buffer(device, bytes.len() as u64, "focusforge-gpu-fuse-f32-upload");
     queue.write_buffer(&buffer, 0, &bytes);
+    record_timing(TimingCounter::UploadBytes, bytes.len() as u64);
     buffer
 }
 
@@ -90,15 +93,9 @@ pub fn upload_tile(device: &wgpu::Device, queue: &wgpu::Queue, tile: &Tile) -> w
     let packed = pack_samples(&tile.samples);
     debug_assert_eq!(packed.len(), packed_len(tile.samples.len()));
 
-    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("focusforge-gpu-tile-upload"),
-        size: packed.len() as u64,
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
+    let buffer = create_storage_buffer(device, packed.len() as u64, "focusforge-gpu-tile-upload");
     queue.write_buffer(&buffer, 0, &packed);
+    record_timing(TimingCounter::UploadBytes, packed.len() as u64);
     buffer
 }
 
@@ -113,6 +110,7 @@ pub fn download_buffer(
     byte_len: u64,
 ) -> Result<Vec<u8>, GpuError> {
     READBACK_COUNT.fetch_add(1, Ordering::SeqCst);
+    record_timing(TimingCounter::BufferCreations, 1);
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("focusforge-gpu-readback-staging"),
         size: byte_len,
@@ -131,11 +129,14 @@ pub fn download_buffer(
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = tx.send(result);
     });
-    device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .map_err(|err| GpuError::Readback {
-            detail: format!("device.poll failed while waiting for readback map: {err}"),
-        })?;
+    {
+        let _wait = measurement_scope("gpu_readback_wait");
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|err| GpuError::Readback {
+                detail: format!("device.poll failed while waiting for readback map: {err}"),
+            })?;
+    }
     rx.recv()
         .map_err(|_| GpuError::Readback {
             detail: "map_async callback never fired".to_string(),
@@ -146,5 +147,6 @@ pub fn download_buffer(
 
     let data = slice.get_mapped_range().to_vec();
     staging.unmap();
+    record_timing(TimingCounter::ReadbackBytes, byte_len);
     Ok(data)
 }

@@ -20,6 +20,8 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::device::GpuError;
+
 /// Set by the render device's device-lost callback and never cleared: a lost
 /// device stays lost for the life of the process, and no new device is
 /// created. The render device is Slint's own -- [`install_handlers`], called
@@ -104,24 +106,31 @@ pub(crate) fn record_dispatch(label: &str) {
     });
 }
 
-/// Runs `f` inside a `Validation` error scope, logging a captured error
-/// with the kernel this thread last dispatched.
+/// Runs `f` inside a `Validation` error scope. A captured error is logged and
+/// returned as [`GpuError::KernelValidation`]: `f`'s value came from buffers a
+/// failed dispatch never wrote, so it is discarded.
 ///
 /// The `kernel` field names the dispatch in flight, which is the dispatch
 /// that raised the error for every validation failure wgpu reports from
 /// inside a compute pass. A validation error raised by a plain buffer
 /// allocation between two passes is attributed to the pass before it.
-pub fn with_validation_scope<T>(device: &wgpu::Device, f: impl FnOnce() -> T) -> T {
+pub fn with_validation_scope<T>(
+    device: &wgpu::Device,
+    f: impl FnOnce() -> T,
+) -> Result<T, GpuError> {
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let value = f();
-    if let Some(error) = crate::device::block_on(scope.pop()) {
-        LAST_DISPATCH.with_borrow(|kernel| {
-            tracing::error!(
-                kernel = %kernel,
-                detail = %error,
-                "graphics kernel failed validation"
-            );
-        });
-    }
-    value
+    let Some(error) = crate::device::block_on(scope.pop()) else {
+        return Ok(value);
+    };
+    let kernel = LAST_DISPATCH.with_borrow(|kernel| kernel.clone());
+    tracing::error!(
+        kernel = %kernel,
+        detail = %error,
+        "graphics kernel failed validation"
+    );
+    Err(GpuError::KernelValidation {
+        kernel,
+        detail: error.to_string(),
+    })
 }

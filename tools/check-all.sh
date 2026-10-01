@@ -86,6 +86,7 @@ run_gate "rustfmt"          cargo fmt --all --check
 run_gate "licenses"         tools/check-licenses.sh
 run_gate "fixture manifest" tools/check-fixtures.sh
 run_gate "fixture manifest selftest" tools/check-fixtures-selftest.sh
+run_gate "lock directory selftest" tools/with-lock-selftest.sh
 run_gate "tiff-diff selftest" python3 tools/tiff-diff.py --selftest
 run_gate "rawtiff selftest" python3 tools/lib/rawtiff.py --selftest
 

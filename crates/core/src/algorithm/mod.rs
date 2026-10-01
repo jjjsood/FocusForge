@@ -106,6 +106,28 @@ pub trait TileReader: Send + Sync {
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), AlgorithmError>;
+
+    /// The heap bytes one [`Self::read_tile_into`] of a `width x height` rect
+    /// allocates besides `out`: decode buffers, warp sources and the like.
+    /// Memory the reader keeps resident between reads (a decoded-segment
+    /// cache) is not scratch. Readers that allocate nothing keep the default.
+    fn read_scratch_bytes(&self, _width: u32, _height: u32) -> u64 {
+        0
+    }
+
+    /// Every `step`-th row and column of `rect`, as [`read_tile_step_into`].
+    /// A reader that can drop unsampled columns while it converts overrides
+    /// this; the default reads each sampled row whole.
+    fn read_tile_step_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        step: NonZeroU32,
+        samples_per_pixel: u32,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        read_tile_step_into(self, frame, rect, step, samples_per_pixel, out)
+    }
 }
 
 /// Reads every `step`-th row and column of `rect` from `frame` through
@@ -114,8 +136,8 @@ pub trait TileReader: Send + Sync {
 /// `rect.width.div_ceil(step) * rect.height.div_ceil(step) *
 /// samples_per_pixel`. One 1-row read per sampled row, keeping every
 /// `step`-th column: `step` more reads, not `step^2`.
-pub fn read_tile_step_into(
-    reader: &dyn TileReader,
+pub fn read_tile_step_into<R: TileReader + ?Sized>(
+    reader: &R,
     frame: usize,
     rect: Rect,
     step: NonZeroU32,
@@ -277,8 +299,8 @@ pub trait StackAlgorithm: Send + Sync + 'static {
     ///    parameter, so `cfg` (which `crate::params::resolve` fills with
     ///    exactly one entry per *declared* parameter, nothing else) never
     ///    carries that key -- the default answers `0`, i.e. no margin, with
-    ///    no work from the algorithm's author. Weighted Average and the
-    ///    Depth Map inherit this without ever thinking about margins.
+    ///    no work from the algorithm's author. (Weighted Average and the
+    ///    Depth Map override it with a margin derived from their radii.)
     /// 2. **An algorithm that does build a pyramid and spells its depth
     ///    parameter `"levels"`** (`laplacian` does) gets the right answer
     ///    from this same default, reading the identical resolved map `fuse`
@@ -399,6 +421,19 @@ impl TileReader for crate::io::TiffStack {
         // recurse into this very impl instead of reaching the inherent
         // method.
         crate::io::TiffStack::read_tile_into(self, frame, rect, out)
+            .map_err(crate::io::FrameError::from)
+            .map_err(AlgorithmError::from)
+    }
+
+    fn read_tile_step_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        step: NonZeroU32,
+        _samples_per_pixel: u32,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        crate::io::TiffStack::read_tile_step_into(self, frame, rect, step, out)
             .map_err(crate::io::FrameError::from)
             .map_err(AlgorithmError::from)
     }

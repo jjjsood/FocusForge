@@ -43,27 +43,18 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::algorithm::AlgorithmError;
 use crate::align::{ReferencePolicy, StackAlignment};
+use crate::tile::scratch::unique_child_dir;
 use crate::tile::{TileConsumer, TileJob};
 
 use super::fingerprint::{FingerprintMismatch, FrameCount};
 use super::record::JobRecord;
 use super::stage_cache::CachedFrameAlignment;
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// How many `create_dir` collisions [`unique_child_dir`] tolerates before
-/// giving up -- same bound and same rationale as
-/// `crate::tile::scratch::MAX_RETRIES`.
-const MAX_RETRIES: u32 = 64;
 
 /// Everything that can go wrong opening a [`ResumeStore`], beginning or
 /// finding a [`Ledger`], or recording into one.
@@ -234,6 +225,18 @@ impl Ledger {
     }
 }
 
+/// The text of `path`, or `None` when the file does not exist.
+fn read_opt(path: &Path) -> Result<Option<String>, ResumeError> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ResumeError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// Read `path` back as the sorted set of completed unit indices, tolerating
 /// a torn trailing record.
 ///
@@ -250,15 +253,8 @@ impl Ledger {
 /// mid-file corruption given the ordering rule above, but "stop, don't
 /// guess" is the right response if one is ever found.
 fn read_completed_units(path: &Path) -> Result<Vec<usize>, ResumeError> {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => {
-            return Err(ResumeError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
+    let Some(content) = read_opt(path)? else {
+        return Ok(Vec::new());
     };
     let complete_portion = match content.rfind('\n') {
         Some(pos) => &content[..pos],
@@ -300,15 +296,8 @@ struct LedgerAlignment {
 /// function does rather than parsing `StackAlignment` straight off the
 /// wire, which does not match the on-disk field names.
 pub fn read_alignment(path: &Path) -> Result<Option<StackAlignment>, ResumeError> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(ResumeError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
+    let Some(text) = read_opt(path)? else {
+        return Ok(None);
     };
     let encoded: LedgerAlignment =
         serde_json::from_str(&text).map_err(|source| ResumeError::Json {
@@ -361,35 +350,6 @@ pub(super) fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), R
     })
 }
 
-/// Creates a uniquely named child directory under `base`, using
-/// `create_dir` (which fails rather than silently reusing an existing
-/// directory) in a bounded retry loop -- the same naming rule as
-/// `crate::tile::scratch::ScratchDir::create_in`
-/// (`focusforge-<pid>-<nanos>-<counter>`), **without** its `Drop`: a resume
-/// directory is durable state, not a run-scoped temporary.
-fn unique_child_dir(base: &Path) -> Result<PathBuf, ResumeError> {
-    fs::create_dir_all(base).map_err(|source| ResumeError::Io {
-        path: base.to_path_buf(),
-        source,
-    })?;
-    let pid = process::id();
-    let mut last_err = None;
-    for _ in 0..MAX_RETRIES {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = base.join(format!("focusforge-{pid}-{nanos}-{counter}"));
-        match fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(source) => last_err = Some((candidate, source)),
-        }
-    }
-    let (path, source) = last_err.expect("MAX_RETRIES > 0");
-    Err(ResumeError::Io { path, source })
-}
-
 /// Compares one identity field of a candidate ledger's [`JobRecord`] against
 /// the freshly computed one, returning a [`Resumable::Mismatch`] on the
 /// first disagreement -- the same "refuse, name what changed" posture as
@@ -431,7 +391,9 @@ impl ResumeStore {
     /// design, besides [`Ledger::record_alignment`] -- and an empty
     /// `units.log` opened for append.
     pub fn begin(&self, record: &JobRecord) -> Result<Ledger, ResumeError> {
-        let dir = unique_child_dir(&self.root)?;
+        // A resume directory is durable state: no guard removes it.
+        let dir = unique_child_dir(&self.root)
+            .map_err(|(path, source)| ResumeError::Io { path, source })?;
         write_atomic(&dir.join("job.json"), record)?;
         Ledger::open(dir)
     }
@@ -590,6 +552,10 @@ mod tests {
     use super::*;
     use crate::job::fingerprint::StackFingerprint;
     use std::path::PathBuf as StdPathBuf;
+    use std::process;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn sample_record(scratch: &Path, output_name: &str) -> JobRecord {
         let output = scratch.join(output_name);
@@ -682,6 +648,20 @@ mod tests {
             }
             other => panic!("expected a backend mismatch, got {other:?}"),
         }
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn two_begins_under_one_store_get_distinct_directories() {
+        let scratch = tmp_dir("distinct-dirs");
+        let store = ResumeStore::open(&scratch).unwrap();
+        let record = sample_record(&scratch, "out.tif");
+        let first = store.begin(&record).unwrap();
+        let second = store.begin(&record).unwrap();
+        assert_ne!(first.dir(), second.dir());
+        assert!(first.dir().join("job.json").is_file());
+        assert!(second.dir().join("job.json").is_file());
+        drop((first, second));
         let _ = fs::remove_dir_all(&scratch);
     }
 
@@ -845,6 +825,79 @@ mod tests {
             Err(ResumeError::Io { path, .. }) => assert_eq!(path, dir),
             other => panic!("expected ResumeError::Io naming {dir:?}, got {other:?}"),
         }
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn discard_removes_a_resumed_ledger_with_alignment() {
+        let scratch = tmp_dir("discard-resumed");
+        let store = ResumeStore::open(&scratch).unwrap();
+        let record = sample_record(&scratch, "out.tif");
+
+        let fresh = store.begin(&record).unwrap();
+        fresh.record_unit(0).unwrap();
+        let alignment = StackAlignment {
+            reference: 0,
+            policy: crate::align::ReferencePolicy::Anchor,
+            frames: vec![crate::align::FrameAlignment {
+                frame: 0,
+                transform: crate::align::Transform::identity(),
+                status: crate::algorithm::AlignStatus::Converged,
+                iterations: 0,
+                residual: 1.0,
+                fallback: false,
+            }],
+        };
+        fresh.record_alignment(&alignment).unwrap();
+        drop(fresh);
+
+        let resumed = match store.find(&record).unwrap() {
+            Resumable::Ledger(ledger) => ledger,
+            other => panic!("expected Resumable::Ledger, got {other:?}"),
+        };
+        let dir = resumed.dir().to_path_buf();
+        assert!(dir.is_dir());
+        resumed.discard().unwrap();
+        assert!(!dir.exists());
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discard_reports_a_removal_it_cannot_complete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tmp_dir("discard-unremovable");
+        let store = ResumeStore::open(&scratch).unwrap();
+        let record = sample_record(&scratch, "out.tif");
+        let ledger = store.begin(&record).unwrap();
+        let dir = ledger.dir().to_path_buf();
+
+        let foreign = dir.join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("stray"), b"x").unwrap();
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Root bypasses directory permissions, so the removal cannot fail there.
+        let probe = foreign.join("probe");
+        if fs::write(&probe, b"x").is_ok() {
+            let _ = fs::remove_file(&probe);
+            fs::set_permissions(&foreign, fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = fs::remove_dir_all(&scratch);
+            eprintln!("skipping: running as root, permissions do not block removal");
+            return;
+        }
+
+        match ledger.discard() {
+            Err(ResumeError::Io { path, .. }) => assert_eq!(path, dir),
+            other => panic!("expected ResumeError::Io naming {dir:?}, got {other:?}"),
+        }
+        assert!(
+            dir.exists(),
+            "a failed discard must leave the directory in place"
+        );
+
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o755)).unwrap();
         let _ = fs::remove_dir_all(&scratch);
     }
 

@@ -22,30 +22,15 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use common::CliOutput;
+
 fn bin() -> Command {
     common::cli_bin("project_cli")
 }
 
-struct CliOutput {
-    success: bool,
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
 /// Runs the binary with `cwd` as its working directory.
 fn run_cli_in(cwd: &Path, args: &[&str]) -> CliOutput {
-    let output = bin()
-        .current_dir(cwd)
-        .args(args)
-        .output()
-        .expect("failed to run binary");
-    CliOutput {
-        success: output.status.success(),
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    common::run_in(&mut bin(), cwd, args)
 }
 
 /// Every file under `dir`, recursively, as paths relative to it.

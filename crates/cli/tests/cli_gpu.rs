@@ -25,35 +25,10 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use focusforge_core::io::{Rect, TiffStack};
+use common::{CliOutput, mantis_512_dir, read_whole};
 
 fn bin() -> Command {
     common::cli_bin("cli_gpu")
-}
-
-fn mantis_512_dir() -> PathBuf {
-    common::fixtures_dir().join("mantis-512")
-}
-
-fn full_rect(width: u32, height: u32) -> Rect {
-    Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    }
-}
-
-/// Whole-image read: samples, width, height, samples-per-pixel.
-fn read_whole(path: &Path) -> (Vec<u16>, u32, u32, u32) {
-    let stack = TiffStack::open_files(&[path.to_path_buf()]).expect("output must reopen");
-    let (w, h) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
-    let samples = stack
-        .read_tile(0, full_rect(w, h))
-        .expect("read must succeed")
-        .samples;
-    (samples, w, h, spp)
 }
 
 /// The largest absolute per-sample difference between two same-length
@@ -66,28 +41,8 @@ fn max_abs_diff(a: &[u16], b: &[u16]) -> i32 {
         .unwrap_or(0)
 }
 
-struct CliOutput {
-    success: bool,
-    stdout: String,
-    stderr: String,
-}
-
-fn cli_output(output: std::process::Output) -> CliOutput {
-    CliOutput {
-        success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
-
 fn run(dir: &Path, args: &[&str]) -> CliOutput {
-    cli_output(
-        bin()
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("failed to run binary"),
-    )
+    common::run_in(&mut bin(), dir, args)
 }
 
 /// Shared `stack` invocation for the `--max-vram` tests below: laplacian +
@@ -161,7 +116,7 @@ fn run_with_no_adapter(dir: &Path, args: &[&str]) -> Option<CliOutput> {
         .env("WGPU_BACKEND", "dx12")
         .output()
         .expect("failed to run binary");
-    Some(cli_output(output))
+    Some(CliOutput::from(output))
 }
 
 /// A `stack` run with a usable adapter (no flag, the GPU path) must produce
@@ -786,7 +741,7 @@ fn device_lost_falls_back() {
     // it all four tiles are in flight at once and the destroy lands after
     // the last of them has already been fused.
     let gpu_args = device_loss_stack_args(&gpu_dir, &["--max-vram", "1MiB"]);
-    let gpu = cli_output(
+    let gpu = CliOutput::from(
         cmd.args(gpu_args.iter().map(String::as_str))
             .current_dir(&*cwd)
             .env("FF_FORCE_DEVICE_LOST", "1")
@@ -857,7 +812,7 @@ fn adapter_logged_once() {
 
     let mut cmd = common::cli_bin("cli_gpu_adapter_logged");
     let data_dir = common::data_dir_of(&cmd);
-    let output = cli_output(
+    let output = CliOutput::from(
         cmd.args([
             "stack",
             root.to_str().unwrap(),

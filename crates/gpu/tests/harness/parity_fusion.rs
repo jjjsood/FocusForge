@@ -20,17 +20,13 @@ use focusforge_gpu::harness::gpu_backend;
 use focusforge_gpu::pack::{packed_len, unpack_samples};
 use focusforge_gpu::transfer::{create_storage_buffer, download_buffer, download_f32, upload_f32};
 
-use crate::common;
+use crate::common::{open_stack, worst_delta};
 
 /// `128 * f32::EPSILON`: the near-tie bound -- the separable score is 68
 /// `f32` adds per pixel at `radius = 8`, so two independently accumulated
 /// pipelines can differ by at most ~68 ulps of the score, rounded up to a
 /// power of two.
 const NEAR_TIE_REL: f32 = 128.0 * f32::EPSILON;
-
-fn open_stack() -> TiffStack {
-    TiffStack::open(common::mantis_512_dir()).expect("open mantis-512 fixture")
-}
 
 fn read_tile(stack: &TiffStack, frame: usize, rect: Rect, spp: u32) -> Tile {
     let mut samples = vec![0u16; (rect.width * rect.height * spp) as usize];
@@ -300,24 +296,6 @@ fn run_comparison(rect: Rect, levels: u32) -> Comparison {
     }
 }
 
-fn worst_composite_delta(cmp: &Comparison) -> (i32, usize) {
-    let mut worst = 0i32;
-    let mut worst_index = 0usize;
-    for (i, (&g, &c)) in cmp
-        .gpu_composite
-        .iter()
-        .zip(cmp.cpu_composite.iter())
-        .enumerate()
-    {
-        let delta = (i32::from(g) - i32::from(c)).abs();
-        if delta > worst {
-            worst = delta;
-            worst_index = i;
-        }
-    }
-    (worst, worst_index)
-}
-
 /// For a Z-Map pixel where the GPU and CPU disagree: the CPU's own
 /// level-0 winning and runner-up scores at that pixel, recomputed from
 /// every frame's own pyramid.
@@ -376,7 +354,7 @@ fn composite_matches_cpu_within_one_lsb() {
         height: 352,
     };
     let cmp = run_comparison(rect, 5);
-    let (worst, worst_index) = worst_composite_delta(&cmp);
+    let (worst, worst_index) = worst_delta(&cmp.gpu_composite, &cmp.cpu_composite);
     println!("composite parity: worst |delta|={worst} at sample index {worst_index}");
     assert!(
         worst <= 1,
@@ -413,13 +391,153 @@ fn overlap_edge_tile_matches_cpu() {
         height: 352,
     };
     let cmp = run_comparison(rect, 5);
-    let (worst, worst_index) = worst_composite_delta(&cmp);
+    let (worst, worst_index) = worst_delta(&cmp.gpu_composite, &cmp.cpu_composite);
     println!("overlap-edge composite parity: worst |delta|={worst} at sample index {worst_index}");
     assert!(
         worst <= 1,
         "overlap-edge composite parity exceeded 1 LSB: worst={worst} at index {worst_index}"
     );
     assert_zmap_exact_or_near_tie(&cmp);
+}
+
+/// Whole frames held in memory, each `width` pixels wide at `spp` samples.
+struct InMemoryFrames {
+    frames: Vec<Vec<u16>>,
+    width: u32,
+    spp: u32,
+}
+
+impl InMemoryFrames {
+    /// One `width x height` frame per entry of `sources`, each repeating that
+    /// `mantis-512` frame across the canvas.
+    fn repeating_mantis(sources: &[usize], width: u32, height: u32) -> Self {
+        let stack = open_stack();
+        let spp = stack.header(0).samples_per_pixel;
+        let source_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        };
+        let frames = sources
+            .iter()
+            .map(|&frame| {
+                let source = read_tile(&stack, frame, source_rect, spp).samples;
+                let mut samples = Vec::with_capacity((width * height * spp) as usize);
+                for y in 0..height {
+                    for x in 0..width {
+                        let at = (((y % 512) * 512 + x % 512) * spp) as usize;
+                        samples.extend_from_slice(&source[at..at + spp as usize]);
+                    }
+                }
+                samples
+            })
+            .collect();
+        InMemoryFrames { frames, width, spp }
+    }
+}
+
+impl TileReader for InMemoryFrames {
+    fn read_tile_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), focusforge_core::algorithm::AlgorithmError> {
+        let row_len = (rect.width * self.spp) as usize;
+        for row in 0..rect.height {
+            let from = (((rect.y + row) * self.width + rect.x) * self.spp) as usize;
+            let to = row as usize * row_len;
+            out[to..to + row_len].copy_from_slice(&self.frames[frame][from..from + row_len]);
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn tile_at_the_dispatch_limit_matches_cpu() {
+    let Some(_shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let backend = gpu_backend().expect("gpu backend");
+    let spp = 3;
+    let levels = 5;
+    // The widest square read rect the device accepts, one row short so the
+    // height is odd at the full-resolution level.
+    let side = backend.max_tile_size(spp);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: side,
+        height: side - 1,
+    };
+    let reader = InMemoryFrames::repeating_mantis(&[0, 2], side, side);
+    let tiles: Vec<Tile> = (0..2)
+        .map(|frame| {
+            let mut samples = vec![0u16; (rect.width * rect.height * spp) as usize];
+            reader
+                .read_tile_into(frame, rect, &mut samples)
+                .expect("read in-memory tile");
+            Tile {
+                rect,
+                samples_per_pixel: spp,
+                samples,
+            }
+        })
+        .collect();
+
+    let mut cfg = ParamValues::new();
+    cfg.insert("levels".to_string(), ParamValue::Int(i64::from(levels)));
+    let cpu = Laplacian
+        .fuse(&TileCtx::new(rect, &tiles), &cfg)
+        .expect("cpu fuse");
+    let gpu = backend
+        .fuse_tile(&reader, 2, rect, spp, levels)
+        .expect("gpu fuse_tile at the dispatch limit");
+
+    // Each frame's level-0 score plane, built once for every differing pixel.
+    let radius = score_radius(levels, 0);
+    let scores: Vec<Vec<f32>> = tiles
+        .iter()
+        .map(|tile| {
+            let pyr =
+                pyramid::build(&tile.samples, rect.width, rect.height, spp, levels).expect("build");
+            score_plane(&pyr.levels()[0], radius)
+        })
+        .collect();
+    let mut near_ties = std::collections::HashSet::new();
+    for (pixel, (&c, &g)) in cpu.zmap.iter().zip(&gpu.zmap).enumerate() {
+        if c == g {
+            continue;
+        }
+        let mut at: Vec<f32> = scores.iter().map(|plane| plane[pixel]).collect();
+        at.sort_by(|a, b| b.partial_cmp(a).expect("scores are always finite"));
+        assert!(
+            at[0] - at[1] <= NEAR_TIE_REL * at[0],
+            "pixel {pixel} differs (gpu={g}, cpu={c}) but is not a proven near-tie: {at:?}"
+        );
+        near_ties.insert(pixel);
+    }
+    println!(
+        "at-limit z-map parity: {} differing index(es), all proven near-ties",
+        near_ties.len()
+    );
+
+    // A near-tie picks another source, so its own samples may differ by more
+    // than a rounding step; every other sample stays within 1 LSB.
+    let worst = cpu
+        .tile
+        .samples
+        .chunks_exact(spp as usize)
+        .zip(gpu.tile.samples.chunks_exact(spp as usize))
+        .enumerate()
+        .filter(|(pixel, _)| !near_ties.contains(pixel))
+        .flat_map(|(_, (cpu, gpu))| cpu.iter().zip(gpu))
+        .map(|(&c, &g)| (i32::from(c) - i32::from(g)).abs())
+        .max()
+        .expect("a non-empty composite");
+    println!("at-limit composite parity: worst |delta|={worst} outside near-tie pixels");
+    assert!(worst <= 1, "composite parity exceeded 1 LSB: worst={worst}");
 }
 
 #[test]
@@ -436,7 +554,7 @@ fn interior_tile_matches_cpu() {
         height: 200,
     };
     let cmp = run_comparison(rect, 3);
-    let (worst, worst_index) = worst_composite_delta(&cmp);
+    let (worst, worst_index) = worst_delta(&cmp.gpu_composite, &cmp.cpu_composite);
     println!("interior composite parity: worst |delta|={worst} at sample index {worst_index}");
     assert!(
         worst <= 1,

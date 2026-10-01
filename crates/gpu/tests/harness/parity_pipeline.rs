@@ -22,7 +22,7 @@ use focusforge_core::zmap::ZMapReader;
 use focusforge_gpu::harness::{GpuBackend, gpu_backend};
 use focusforge_gpu::transfer::readback_count;
 
-use crate::common;
+use crate::common::open_stack;
 
 /// `128 * f32::EPSILON` -- the `parity_fusion.rs` near-tie bound, printed
 /// as a diagnostic beside the reachability verdict, which is what classifies.
@@ -76,10 +76,6 @@ fn level_pixel(pixel: usize, width: u32, level: u32) -> LevelPixel {
         raw_pixel: pixel,
         mapped_pixel,
     }
-}
-
-fn open_stack() -> TiffStack {
-    TiffStack::open(common::mantis_512_dir()).expect("open mantis-512 fixture")
 }
 
 fn scratch_base(label: &str) -> PathBuf {

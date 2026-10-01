@@ -20,7 +20,7 @@ use focusforge_core::params::{ParamDesc, ParamValues, StackContext};
 use focusforge_core::tile::{
     NoopPreprocess, TileConsumer, TileJob, TileScheduler, TileSchedulerOptions,
 };
-use focusforge_core::timing::{Stage, StageTimer};
+use focusforge_core::timing::{Stage, StageTimer, measurement_scope};
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
@@ -280,6 +280,25 @@ fn a_stage_span_covers_exactly_its_own_interval() {
         !has(&events[2], "stage"),
         "a stage span outlived its mark: {:?}",
         events[2]
+    );
+}
+
+#[test]
+fn timing_scopes_are_absent_before_diagnostics_enables_them() {
+    let captured = captured();
+    let root = "timing_disabled";
+    let root_span = tracing::debug_span!("root", root);
+    let _root = root_span.enter();
+    let scope = measurement_scope("tiff_read");
+    tracing::debug!("ordinary event");
+    drop(scope);
+
+    assert!(
+        captured
+            .spans_under(root)
+            .into_iter()
+            .all(|chain| !has(&chain, "timing")),
+        "timing scopes must not create trace records before diagnostics enables them"
     );
 }
 

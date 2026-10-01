@@ -40,22 +40,20 @@ mod status;
 /// Resolves whether this run takes the GPU path or the CPU one:
 /// `#[cfg(feature = "gpu")]` delegates to [`gpu::resolve_backend`]; with the
 /// feature off, always [`stack::BackendChoice::cpu()`].
-#[cfg(feature = "gpu")]
 fn resolve_backend(
     algorithm_id: &str,
     no_gpu: bool,
     max_vram: Option<u64>,
 ) -> stack::BackendChoice {
-    gpu::resolve_backend(algorithm_id, no_gpu, max_vram)
-}
-
-#[cfg(not(feature = "gpu"))]
-fn resolve_backend(
-    _algorithm_id: &str,
-    _no_gpu: bool,
-    _max_vram: Option<u64>,
-) -> stack::BackendChoice {
-    stack::BackendChoice::cpu()
+    #[cfg(feature = "gpu")]
+    {
+        gpu::resolve_backend(algorithm_id, no_gpu, max_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (algorithm_id, no_gpu, max_vram);
+        stack::BackendChoice::cpu()
+    }
 }
 
 /// FocusForge command-line interface.
@@ -339,6 +337,17 @@ enum Command {
         write_warped: Option<PathBuf>,
         #[command(flatten)]
         set: set::SetArgs,
+        /// A **ceiling only** on the adaptive host-memory budget the
+        /// alignment workers are sized from: it can lower the budget the
+        /// host-derived estimate resolved to, and can never raise it. Omit
+        /// it entirely and the budget is derived from the host. Accepts
+        /// suffixed sizes (`8GiB`, `512MiB`, `4096`).
+        #[arg(
+            long = "max-host-memory",
+            value_name = "SIZE",
+            value_parser = crate::bytes::parse_byte_size
+        )]
+        max_host_memory: Option<u64>,
         /// Print no progress at all. `align` has no fuse-tile units to
         /// count: this suppresses only the one stage line `align`
         /// otherwise prints.
@@ -566,6 +575,7 @@ fn main() -> ExitCode {
             lax,
             write_warped,
             set,
+            max_host_memory,
             quiet,
             preset,
             write_preset,
@@ -584,6 +594,7 @@ fn main() -> ExitCode {
                 lax,
                 write_warped.as_deref(),
                 &set,
+                max_host_memory,
                 quiet,
                 &preset::PresetOptions {
                     preset: preset.as_deref(),
