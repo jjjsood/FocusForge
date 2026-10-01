@@ -136,25 +136,21 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "radius".to_string(),
             label: "Radius".to_string(),
-            help: "Sharpness-window radius, in level-0 pixels: how far the \
-                   per-pixel weight looks for local detail before blending. \
-                   A detail-scale property, not resolution-derived -- no \
-                   `auto` hook, like `laplacian`'s own `SCORE_RADIUS` \
-                   constant."
+            help: "How far, in pixels, each pixel looks around itself to judge \
+                   how sharp it is."
                 .to_string(),
             kind: ParamKind::Int { min: 0, max: 16 },
             default: ParamValue::Int(RADIUS_DEFAULT),
+            advanced: true,
             auto: None,
             host_default: None,
         },
         ParamDesc {
             id: "weight-exponent".to_string(),
-            label: "Weight Exponent".to_string(),
-            help: "How aggressively the blend favours locally sharper \
-                   frames: `1.0` is the plainest reading of \"weighted \
-                   average\", higher values walk the blend toward \
-                   selection. A taste knob, not resolution-derived -- no \
-                   `auto` hook."
+            label: "Sharp-source preference".to_string(),
+            help: "How strongly the sharpest frame is preferred where frames \
+                   overlap: low values blend smoothly, high values lean \
+                   toward picking the sharpest source."
                 .to_string(),
             kind: ParamKind::Float {
                 min: 1.0,
@@ -163,6 +159,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
                 logarithmic: false,
             },
             default: ParamValue::Float(WEIGHT_EXPONENT_DEFAULT),
+            advanced: false,
             auto: None,
             host_default: None,
         },
@@ -191,7 +188,7 @@ impl StackAlgorithm for WeightedAverage {
     }
 
     fn display_name(&self) -> &str {
-        "Weighted Average"
+        "Soft transitions (weighted average)"
     }
 
     fn params(&self) -> &[ParamDesc] {

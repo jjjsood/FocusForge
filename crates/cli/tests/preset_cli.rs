@@ -810,3 +810,40 @@ fn written_preset_holds_explicit_values_only() {
         "an Auto-resolved value must not be frozen into the preset:\n{text}"
     );
 }
+
+/// A preset naming `depth-map` resolves that algorithm's own schema: an
+/// explicit value is reported as such and an untouched one keeps its default.
+#[test]
+fn a_preset_naming_depth_map_runs_its_schema() {
+    let dir = tmp_dir("preset_cli_depth_map_schema");
+    let preset = write_preset(
+        &dir,
+        "p.toml",
+        "algo = \"depth-map\"\n[stack]\nscore-radius = 9\n",
+    );
+    let out = run_cli_in(
+        &dir,
+        &common::push_no_gpu(vec![
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            dir.to_str().unwrap(),
+            "--preset",
+            preset.to_str().unwrap(),
+            "--align-algo",
+            "pyramidal-ecc",
+            "--dry-run",
+        ]),
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(
+        out.stdout.contains("score-radius = 9 (Explicit)"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("smoothing-radius = 8"),
+        "stdout: {}",
+        out.stdout
+    );
+}

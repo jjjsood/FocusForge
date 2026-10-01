@@ -79,26 +79,24 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "score-radius".to_string(),
             label: "Score Radius".to_string(),
-            help: "Sharpness-measure window radius, in level-0 pixels -- the \
-                   same kind of window `laplacian` and `weighted-average` \
-                   use. A detail-scale property, not resolution-derived."
+            help: "How far, in pixels, each pixel looks around itself to judge \
+                   how sharp it is."
                 .to_string(),
             kind: ParamKind::Int { min: 0, max: 16 },
             default: ParamValue::Int(SCORE_RADIUS_DEFAULT),
+            advanced: true,
             auto: None,
             host_default: None,
         },
         ParamDesc {
             id: "smoothing-radius".to_string(),
             label: "Smoothing Radius".to_string(),
-            help: "A second windowed pass, over the sharpness measure \
-                   itself rather than over pixel detail, that makes the \
-                   depth surface -- and therefore the Z-Map -- coherent at \
-                   a larger scale. A detail-scale property, not \
-                   resolution-derived."
+            help: "How far, in pixels, the sharpness map is smoothed so that \
+                   neighbouring pixels agree on which frame is in focus."
                 .to_string(),
             kind: ParamKind::Int { min: 0, max: 16 },
             default: ParamValue::Int(SMOOTHING_RADIUS_DEFAULT),
+            advanced: true,
             auto: None,
             host_default: None,
         },
@@ -143,10 +141,10 @@ impl StackAlgorithm for DepthMap {
     }
 
     fn display_name(&self) -> &str {
-        "Depth Map"
+        "Focus map (depth map)"
     }
 
-    fn is_default(&self) -> bool {
+    fn advanced(&self) -> bool {
         true
     }
 

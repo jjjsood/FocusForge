@@ -187,11 +187,12 @@ pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     vec![ParamDesc {
         id: "auto-crop".to_string(),
         label: "Auto-crop".to_string(),
-        help: "Trims the composite and Z-Map to the region every aligned \
-               frame actually covers. Off keeps the full frame extent."
+        help: "Trims the result to the area every aligned frame covers; turn \
+               it off to keep the full frame."
             .to_string(),
         kind: ParamKind::Bool,
         default: ParamValue::Bool(true),
+        advanced: false,
         auto: None,
         host_default: None,
     }]

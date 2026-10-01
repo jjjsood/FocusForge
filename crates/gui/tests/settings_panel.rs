@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use focusforge_core::params::{ParamKind, ParamValue, ParamViolation};
+use focusforge_core::params::{ParamKind, ParamValue, ParamValues, ParamViolation};
 use focusforge_core::registry;
 use focusforge_gui::settings_panel::{
     HeadingState, PANEL_CONTENT_WIDTH, PARAM_ERROR_HEIGHT, PARAM_LABEL_HEIGHT, PARAM_ROW_BOOL,
@@ -336,8 +336,27 @@ fn picked_ids(controller: &AppController) -> (String, String) {
 
 /// A sealed project recorded with no `align` and fused by `algorithm`.
 fn seal_without_align(name: &str, algorithm: &str) -> PathBuf {
+    seal_with_params(name, algorithm, &ParamValues::new())
+}
+
+/// [`seal_without_align`] recording `params` as the run's explicit settings.
+fn seal_with_params(name: &str, algorithm: &str, params: &ParamValues) -> PathBuf {
+    seal_with_registration(
+        name,
+        algorithm,
+        params,
+        focusforge_core::align::Registration::default(),
+    )
+}
+
+/// [`seal_with_params`] recording `registration`, the crop a run applied.
+fn seal_with_registration(
+    name: &str,
+    algorithm: &str,
+    params: &ParamValues,
+    registration: focusforge_core::align::Registration,
+) -> PathBuf {
     use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
-    use focusforge_core::params::ParamValues;
     use focusforge_core::project::{Metrics, SealRequest, seal};
     use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
@@ -372,15 +391,65 @@ fn seal_without_align(name: &str, algorithm: &str) -> PathBuf {
         staged_zmap: &zmap,
         sources: &[],
         algorithm,
-        params: &ParamValues::new(),
+        params,
         align: None,
-        registration: focusforge_core::align::Registration::default(),
+        registration,
         composite_description: "staged".to_string(),
         label: None,
         metrics: Metrics::default(),
     })
     .unwrap();
     project_path
+}
+
+/// The active tab's crop-section `auto-crop` toggle, `"true"` or `"false"`.
+fn auto_crop_selected(controller: &AppController) -> String {
+    controller
+        .settings_panel()
+        .rows
+        .into_iter()
+        .find(|r| r.section == "crop" && r.id == "auto-crop")
+        .expect("the crop section has an auto-crop row")
+        .selected
+}
+
+#[test]
+fn reopened_uncropped_project_shows_auto_crop_off() {
+    let mut controller = AppController::new();
+    let project = seal_without_align("reopened_uncropped", "laplacian");
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[project]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(auto_crop_selected(&controller), "false");
+}
+
+#[test]
+fn reopened_cropped_project_shows_auto_crop_on() {
+    use focusforge_core::align::Registration;
+    use focusforge_core::io::Rect;
+
+    let mut controller = AppController::new();
+    let registration = Registration {
+        transforms: Vec::new(),
+        crop: Some(Rect {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 2,
+        }),
+    };
+    let project = seal_with_registration(
+        "reopened_cropped",
+        "laplacian",
+        &ParamValues::new(),
+        registration,
+    );
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[project]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(auto_crop_selected(&controller), "true");
 }
 
 #[test]
@@ -1008,5 +1077,209 @@ fn no_algorithm_id_in_the_gui() {
     assert!(
         offenders.is_empty(),
         "no algorithm id may appear anywhere in crates/gui: {offenders:?}"
+    );
+}
+
+/// The fuse row `id`'s shown value.
+fn fuse_value(controller: &AppController, id: &str) -> String {
+    let panel = controller.settings_panel();
+    field_rows(&panel.rows, "fuse")
+        .into_iter()
+        .find(|r| r.id == id)
+        .unwrap_or_else(|| panic!("no fuse row {id}"))
+        .value_text
+        .clone()
+}
+
+/// A fuse parameter's declared default, as the row shows it.
+fn fuse_default_text(algorithm: &str, id: &str) -> String {
+    let desc = registry::find(algorithm)
+        .expect("registered")
+        .params()
+        .iter()
+        .find(|d| d.id == id)
+        .expect("declared")
+        .default
+        .clone();
+    match desc {
+        ParamValue::Int(v) => v.to_string(),
+        ParamValue::Float(v) => format!("{v}"),
+        other => panic!("unexpected default {other:?}"),
+    }
+}
+
+fn reset_all_enabled(controller: &AppController) -> bool {
+    controller
+        .settings_panel()
+        .rows
+        .iter()
+        .find(|r| r.kind == RowKind::ResetAll)
+        .expect("the reset-all row")
+        .selected
+        == "true"
+}
+
+#[test]
+fn new_tab_and_empty_panel_default_to_details() {
+    let default = registry::default_stack().expect("a default is marked");
+    assert_eq!(default.id(), "laplacian");
+
+    let fuse_picker = |controller: &AppController| {
+        controller
+            .settings_panel()
+            .rows
+            .into_iter()
+            .find(|r| r.kind == RowKind::Picker && r.section == "fuse")
+            .expect("fuse picker row")
+    };
+
+    let empty = AppController::new();
+    let picker = fuse_picker(&empty);
+    assert_eq!(picker.selected, default.id());
+    assert_eq!(picker.value_text, default.display_name());
+
+    let mut tab = AppController::new();
+    open_mantis_512(&mut tab);
+    let picker = fuse_picker(&tab);
+    assert_eq!(picker.selected, default.id());
+    assert_eq!(picker.value_text, default.display_name());
+}
+
+#[test]
+fn switching_methods_remembers_each_methods_values() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+
+    controller.set_fuse_algorithm("laplacian");
+    controller.set_param_value("fuse", "levels", ParamValue::Int(3));
+    controller.set_fuse_algorithm("weighted-average");
+    controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(4.0));
+    controller.set_fuse_algorithm("depth-map");
+    controller.set_param_value("fuse", "score-radius", ParamValue::Int(7));
+
+    for _ in 0..2 {
+        controller.set_fuse_algorithm("laplacian");
+        assert_eq!(fuse_value(&controller, "levels"), "3");
+        controller.set_fuse_algorithm("weighted-average");
+        assert_eq!(fuse_value(&controller, "weight-exponent"), "4");
+        assert_eq!(
+            fuse_value(&controller, "radius"),
+            fuse_default_text("weighted-average", "radius"),
+            "a value never set stays at its default"
+        );
+        controller.set_fuse_algorithm("depth-map");
+        assert_eq!(fuse_value(&controller, "score-radius"), "7");
+        assert_eq!(
+            fuse_value(&controller, "smoothing-radius"),
+            fuse_default_text("depth-map", "smoothing-radius")
+        );
+    }
+}
+
+#[test]
+fn a_violation_is_not_remembered_with_a_method() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    let has_error = |c: &AppController| {
+        c.settings_panel()
+            .rows
+            .iter()
+            .any(|r| r.kind == RowKind::Error && r.section == "fuse")
+    };
+
+    controller.set_fuse_algorithm("depth-map");
+    controller.set_param_value("fuse", "smoothing-radius", ParamValue::Int(2));
+    controller.set_param_text("fuse", "score-radius", "99");
+    assert!(has_error(&controller), "the typed violation shows");
+
+    controller.set_fuse_algorithm("weighted-average");
+    assert!(!has_error(&controller), "the violation stays behind");
+    controller.set_fuse_algorithm("depth-map");
+    assert!(!has_error(&controller), "and is not restored");
+    assert_eq!(
+        fuse_value(&controller, "score-radius"),
+        fuse_default_text("depth-map", "score-radius"),
+        "the rejected text was never a value"
+    );
+    assert_eq!(
+        fuse_value(&controller, "smoothing-radius"),
+        "2",
+        "the valid value beside it is kept"
+    );
+}
+
+#[test]
+fn reselecting_the_current_method_keeps_its_values() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.set_fuse_algorithm("weighted-average");
+    controller.set_param_value("fuse", "radius", ParamValue::Int(3));
+
+    controller.set_fuse_algorithm("weighted-average");
+
+    assert_eq!(fuse_value(&controller, "radius"), "3");
+    assert_eq!(
+        heading(&controller.settings_panel().rows, "fuse").heading_state,
+        HeadingState::Explicit
+    );
+}
+
+#[test]
+fn reset_all_forgets_remembered_methods() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.set_fuse_algorithm("weighted-average");
+    controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(4.0));
+    controller.set_fuse_algorithm("laplacian");
+
+    assert_eq!(
+        heading(&controller.settings_panel().rows, "fuse").heading_state,
+        HeadingState::Default,
+        "the shown method itself has no value"
+    );
+    assert!(
+        reset_all_enabled(&controller),
+        "a remembered value keeps reset-all enabled"
+    );
+
+    controller.reset_all_sections();
+    assert!(!reset_all_enabled(&controller));
+    controller.set_fuse_algorithm("weighted-average");
+    assert_eq!(
+        fuse_value(&controller, "weight-exponent"),
+        fuse_default_text("weighted-average", "weight-exponent")
+    );
+}
+
+#[test]
+fn reopened_project_remembers_only_its_sealed_method() {
+    let mut params = ParamValues::new();
+    params.insert("weight-exponent".to_string(), ParamValue::Float(5.0));
+    let project = seal_with_params("reopen_remembers_sealed", "weighted-average", &params);
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[project]),
+        OpenOutcome::Opened(_)
+    ));
+
+    assert_eq!(picked_ids(&controller).0, "weighted-average");
+    assert_eq!(fuse_value(&controller, "weight-exponent"), "5");
+
+    controller.set_fuse_algorithm("laplacian");
+    assert_eq!(
+        heading(&controller.settings_panel().rows, "fuse").heading_state,
+        HeadingState::Default,
+        "another method starts from defaults"
+    );
+    controller.set_fuse_algorithm("depth-map");
+    assert_eq!(
+        fuse_value(&controller, "score-radius"),
+        fuse_default_text("depth-map", "score-radius")
+    );
+    controller.set_fuse_algorithm("weighted-average");
+    assert_eq!(
+        fuse_value(&controller, "weight-exponent"),
+        "5",
+        "the sealed method's values come back"
     );
 }

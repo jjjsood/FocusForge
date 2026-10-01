@@ -175,16 +175,15 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     vec![ParamDesc {
         id: "levels".to_string(),
         label: "Levels".to_string(),
-        help: "Laplacian pyramid depth: how many detail levels are selected \
-               and blended before the coarsest residual. `auto` derives a \
-               depth from the stack's resolution, capped by the depth the \
-               tile geometry can actually plan."
+        help: "How many layers of detail are compared and blended; the automatic \
+               value suits the image size."
             .to_string(),
         kind: ParamKind::Int {
             min: 1,
             max: MAX_LEVELS as i64,
         },
         default: ParamValue::Int(DEFAULT_LEVELS as i64),
+        advanced: true,
         auto: Some(Arc::new(auto_levels)),
         host_default: None,
     }]
@@ -358,7 +357,11 @@ impl StackAlgorithm for Laplacian {
     }
 
     fn display_name(&self) -> &str {
-        "Laplacian Pyramid"
+        "Details (Laplacian pyramid)"
+    }
+
+    fn is_default(&self) -> bool {
+        true
     }
 
     fn params(&self) -> &[ParamDesc] {

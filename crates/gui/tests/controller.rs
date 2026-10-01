@@ -355,7 +355,20 @@ fn settle_all(controller: &mut AppController) {
 
 /// [`open_mantis64_tab`], then fuses it into one held checkpoint.
 fn open_fused_tab(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
+    open_fused_tab_on(controller, name, count, None)
+}
+
+/// [`open_fused_tab`] on fuse method `method` instead of the default.
+fn open_fused_tab_on(
+    controller: &mut AppController,
+    name: &str,
+    count: usize,
+    method: Option<&str>,
+) -> PathBuf {
     let root = open_mantis64_tab(controller, name, count);
+    if let Some(method) = method {
+        controller.set_fuse_algorithm(method);
+    }
     assert!(controller.start_fuse());
     settle_all(controller);
     assert_eq!(controller.checkpoint_count(), Some(1), "{name} must fuse");
@@ -2421,8 +2434,13 @@ fn at_pane(pane: PaneRect, x: f32, y: f32) -> (f32, f32) {
 /// A fused three-frame mantis-64 tab in editor mode, both panes installed,
 /// its resident display tiles 16 px so strokes cross tile edges.
 fn open_editor(name: &str) -> (AppController, PathBuf) {
+    open_editor_on(name, None)
+}
+
+/// [`open_editor`] over a run of fuse method `method` instead of the default.
+fn open_editor_on(name: &str, method: Option<&str>) -> (AppController, PathBuf) {
     let mut controller = controller_with_scratch(name);
-    let root = open_fused_tab(&mut controller, name, 3);
+    let root = open_fused_tab_on(&mut controller, name, 3, method);
     controller.set_resident_tile_size_for_test(16);
     controller.set_pane_geometry(LEFT, RIGHT);
     assert!(controller.set_mode(ShellMode::Editor));
@@ -3848,7 +3866,9 @@ fn live_stroke_previews_each_new_segment() {
 /// [`FrameSource`]: focusforge_gui::canvas::FrameSource
 #[test]
 fn stroke_matches_left_pane() {
-    let (mut c, root) = open_editor("stroke_matches_left_pane");
+    // The Z-Map names the source of every pixel only for a method that
+    // selects pixels; a pyramid blend mixes neighbours at coarse levels.
+    let (mut c, root) = open_editor_on("stroke_matches_left_pane", Some("depth-map"));
     c.select_frame(2);
     set_size(&mut c, 8.0);
     drag(&mut c, &[(20.0, 20.0)]);
@@ -4248,4 +4268,70 @@ fn refusal_dialog_counts_as_modal() {
     controller.dismiss_refusal();
     assert!(!controller.modal_open(), "answering clears it");
     assert!(!controller.canvas_blocked());
+}
+
+/// The fuse row `id`'s shown value on the active tab.
+fn active_fuse_value(controller: &AppController, id: &str) -> String {
+    controller
+        .settings_panel()
+        .rows
+        .into_iter()
+        .find(|r| r.section == "fuse" && r.id == id)
+        .unwrap_or_else(|| panic!("no fuse row {id}"))
+        .value_text
+}
+
+/// The crop section's `auto-crop` toggle on the active tab.
+fn active_crop_selected(controller: &AppController) -> String {
+    controller
+        .settings_panel()
+        .rows
+        .into_iter()
+        .find(|r| r.section == "crop" && r.id == "auto-crop")
+        .expect("the crop section has an auto-crop row")
+        .selected
+}
+
+#[test]
+fn duplicated_tab_keeps_crop_and_remembered_values() {
+    use focusforge_core::params::ParamValue;
+
+    let mut controller = common::controller_with_frames("duplicate_keeps_remembered", 2);
+    controller.set_fuse_algorithm("weighted-average");
+    controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(4.0));
+    controller.set_fuse_algorithm("depth-map");
+    controller.set_param_value("fuse", "score-radius", ParamValue::Int(7));
+    controller.set_param_value("crop", "auto-crop", ParamValue::Bool(false));
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, std::time::Duration::from_secs(120));
+
+    assert_eq!(controller.checkpoint_count(), Some(1), "the run completed");
+    assert!(controller.set_mode(ShellMode::Stacking));
+    controller.remove_frame(0);
+    assert!(controller.pending_frame_change().is_some());
+    assert!(controller.new_project_instead());
+    assert_eq!(controller.project_tabs().len(), 2);
+
+    assert_eq!(
+        active_crop_selected(&controller),
+        "false",
+        "the copy keeps the crop choice"
+    );
+    assert_eq!(active_fuse_value(&controller, "score-radius"), "7");
+    controller.set_fuse_algorithm("weighted-average");
+    assert_eq!(
+        active_fuse_value(&controller, "weight-exponent"),
+        "4",
+        "the copy carries the values remembered for other methods"
+    );
+    controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(6.0));
+
+    controller.select_project(0);
+    assert_eq!(active_fuse_value(&controller, "score-radius"), "7");
+    controller.set_fuse_algorithm("weighted-average");
+    assert_eq!(
+        active_fuse_value(&controller, "weight-exponent"),
+        "4",
+        "editing the copy leaves the original's remembered values alone"
+    );
 }

@@ -155,7 +155,7 @@ fn render_listing(algorithms: &[AlgorithmReport<'_>]) -> String {
 }
 
 /// One block per parameter: kind (range or variants), default, the resolved
-/// value/provenance pair, and whether an `auto` hook exists. `has_auto` is
+/// value/provenance pair, its help sentence on its own line, and whether an `auto` hook exists. `has_auto` is
 /// reported as `auto: present, not evaluated` or `auto: none` — never as a
 /// resolved value, since no `auto` hook is ever invoked here.
 fn render_schema(algo: &AlgorithmReport<'_>) -> String {
@@ -172,6 +172,7 @@ fn render_schema(algo: &AlgorithmReport<'_>) -> String {
             serde_json::to_string(&p.value).unwrap_or_else(|_| "?".to_string()),
             p.provenance,
         ));
+        lines.push(format!("    {}", p.desc.help));
         lines.push(format!(
             "    auto: {}",
             if p.has_auto {

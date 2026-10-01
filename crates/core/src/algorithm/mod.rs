@@ -433,6 +433,12 @@ pub trait StackAlgorithm: Send + Sync + 'static {
         false
     }
 
+    /// Whether a front end may keep this algorithm out of its first-view
+    /// choices. The registry default is never advanced.
+    fn advanced(&self) -> bool {
+        false
+    }
+
     /// What the tile scheduler must plan around a tile for this algorithm's
     /// fully resolved `cfg` (`crate::params::resolve` plus
     /// `crate::params::resolved_values`, same as `fuse` receives): the pixel
@@ -627,6 +633,7 @@ mod tests {
                     logarithmic: false,
                 },
                 default: ParamValue::Float(0.0),
+                advanced: false,
                 auto: Some(Arc::new(|ctx: &StackContext| {
                     ParamValue::Float(ctx.frame_count as f64)
                 })),
@@ -649,6 +656,7 @@ mod tests {
                     ],
                 },
                 default: ParamValue::Enum("fast".to_string()),
+                advanced: false,
                 auto: None,
                 host_default: None,
             },

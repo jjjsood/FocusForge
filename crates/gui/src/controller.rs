@@ -389,6 +389,9 @@ struct ProjectTab {
     fuse_values: ParamValues,
     align_values: ParamValues,
     project_values: ParamValues,
+    /// The explicit values of every method this tab switched away from,
+    /// keyed by `settings_panel::menu_key(section, id)`; in memory only.
+    remembered: BTreeMap<String, ParamValues>,
     /// One violation per offending `"<section>:<id>"` key -- what lets two
     /// fields carry a message at the same time.
     errors: BTreeMap<String, ParamViolation>,
@@ -489,7 +492,7 @@ impl ProjectTab {
         let ctx = entry::tab_stack_context(&project);
         let image =
             entry::tab_image_size(&project).map(|(width, height)| ImageSize { width, height });
-        let (fuse_id, fuse_values, align_id, align_values) =
+        let (fuse_id, fuse_values, align_id, align_values, project_values) =
             settings_panel::seed_algorithm_state(&project);
         let checkpoints = match &mut project {
             GuiProject::Unsaved(_) => 0,
@@ -516,7 +519,8 @@ impl ProjectTab {
             align_id,
             fuse_values,
             align_values,
-            project_values: ParamValues::new(),
+            project_values,
+            remembered: BTreeMap::new(),
             errors: BTreeMap::new(),
             menu_open: None,
             checkpoints,
@@ -3236,6 +3240,7 @@ impl AppController {
                 align_id: &tab.align_id,
                 align_values: &tab.align_values,
                 project_values: &tab.project_values,
+                remembered: &tab.remembered,
             });
         let mut rows = settings_panel::build_rows(active);
         settings_panel::assign_tops(&mut rows);
@@ -3300,10 +3305,12 @@ impl AppController {
         self.emit(ShellEvent::SettingsChanged);
     }
 
-    /// Selects a Fuse or Align algorithm, clearing that section's values
-    /// and errors -- a fresh algorithm resolves its own schema from
-    /// scratch, never carrying over a stray value the previous one
-    /// happened to share an id with.
+    /// Selects a Fuse or Align algorithm. The section's explicit values stay
+    /// with the algorithm they were set on: switching away stashes them and
+    /// switching back restores them, while an algorithm never selected
+    /// before resolves its own schema from scratch. The section's errors do
+    /// not follow the switch. Selecting the current algorithm changes
+    /// nothing.
     pub fn set_fuse_algorithm(&mut self, id: &str) {
         self.set_algorithm("fuse", id);
     }
@@ -3316,12 +3323,25 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        match section {
-            "fuse" => tab.fuse_id = id.to_string(),
-            "align" => tab.align_id = id.to_string(),
+        let current = match section {
+            "fuse" => &mut tab.fuse_id,
+            "align" => &mut tab.align_id,
             _ => return,
+        };
+        if current == id {
+            return;
         }
-        tab_values_mut(tab, section).clear();
+        let previous = std::mem::replace(current, id.to_string());
+        let stashed = std::mem::take(tab_values_mut(tab, section));
+        let restored = tab
+            .remembered
+            .remove(&settings_panel::menu_key(section, id))
+            .unwrap_or_default();
+        *tab_values_mut(tab, section) = restored;
+        if !stashed.is_empty() {
+            tab.remembered
+                .insert(settings_panel::menu_key(section, &previous), stashed);
+        }
         let prefix = format!("{section}:");
         tab.errors.retain(|k, _| !k.starts_with(&prefix));
         self.emit(ShellEvent::SettingsChanged);
@@ -3339,6 +3359,7 @@ impl AppController {
         tab.fuse_values.clear();
         tab.align_values.clear();
         tab.project_values.clear();
+        tab.remembered.clear();
         tab.errors.clear();
         self.emit(ShellEvent::SettingsChanged);
     }
@@ -4241,6 +4262,8 @@ impl AppController {
         new_tab.align_id = tab.align_id.clone();
         new_tab.fuse_values = tab.fuse_values.clone();
         new_tab.align_values = tab.align_values.clone();
+        new_tab.project_values = tab.project_values.clone();
+        new_tab.remembered = tab.remembered.clone();
         self.state.projects.push(new_tab);
         self.set_active_tab(Some(self.state.projects.len() - 1));
         self.emit(ShellEvent::ProjectsChanged);
@@ -4427,7 +4450,7 @@ impl AppController {
             align_id: Some(tab.align_id.clone()),
             align_values: tab.align_values.clone(),
             align_lax: true,
-            crop: true,
+            crop: settings_panel::auto_crop_enabled(&tab.project_values),
             gpu: self.gpu_fusion,
         })
     }

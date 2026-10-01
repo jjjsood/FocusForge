@@ -32,23 +32,25 @@ pub(crate) struct ActiveTabParams<'a> {
     pub align_id: &'a str,
     pub align_values: &'a ParamValues,
     pub project_values: &'a ParamValues,
+    /// Values kept for methods other than the selected ones.
+    pub remembered: &'a BTreeMap<String, ParamValues>,
 }
 
-/// The Fuse/Align algorithm ids and explicit values a newly created tab
-/// starts with: each family's registry default with no explicit values for
-/// an unsaved project, or the sealed manifest's own
-/// algorithm/params for a reopened one -- every key on a reopened project
-/// therefore resolves `Explicit`, never `Default`. A manifest recorded with no
-/// `align` (a `--no-align` run) falls back to the same registry seeding an
-/// unsaved tab gets.
+/// The Fuse/Align algorithm ids and explicit values, then the explicit
+/// project values, a newly created tab starts with: registry defaults and
+/// no values for an unsaved project, the sealed manifest's own for a
+/// reopened one (every key resolves `Explicit`). A manifest with no `align`
+/// seeds the registry default there; one whose run applied no crop seeds
+/// `auto-crop` off.
 pub(crate) fn seed_algorithm_state(
     project: &GuiProject,
-) -> (String, ParamValues, String, ParamValues) {
+) -> (String, ParamValues, String, ParamValues, ParamValues) {
     match project {
         GuiProject::Unsaved(_) => (
             default_fuse_id(),
             ParamValues::new(),
             default_align_id(),
+            ParamValues::new(),
             ParamValues::new(),
         ),
         GuiProject::Opened(opened) => {
@@ -57,14 +59,30 @@ pub(crate) fn seed_algorithm_state(
                 Some(record) => (record.algorithm.clone(), record.params.clone()),
                 None => (default_align_id(), ParamValues::new()),
             };
+            let mut project_values = ParamValues::new();
+            if manifest.registration.crop.is_none() {
+                project_values.insert("auto-crop".to_string(), ParamValue::Bool(false));
+            }
             (
                 manifest.algorithm.clone(),
                 manifest.params.clone(),
                 align_id,
                 align_values,
+                project_values,
             )
         }
     }
+}
+
+/// Whether a run trims to the area every aligned frame covers: the explicit
+/// `auto-crop` value, else the project schema's default.
+pub(crate) fn auto_crop_enabled(project_values: &ParamValues) -> bool {
+    let schema = &focusforge_core::project::PROJECT_PARAMS[0];
+    project_values
+        .get(&schema.id)
+        .unwrap_or(&schema.default)
+        .as_bool()
+        .expect("auto-crop is a Bool parameter")
 }
 
 /// [`registry::default_stack`]'s id, empty when the registry refuses to name
@@ -485,7 +503,8 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
 
     let any_explicit = rows
         .iter()
-        .any(|r| r.kind == RowKind::SectionHeading && r.heading_state == HeadingState::Explicit);
+        .any(|r| r.kind == RowKind::SectionHeading && r.heading_state == HeadingState::Explicit)
+        || active.as_ref().is_some_and(|a| !a.remembered.is_empty());
     rows.push(SettingsRow {
         kind: RowKind::ResetAll,
         section: String::new(),

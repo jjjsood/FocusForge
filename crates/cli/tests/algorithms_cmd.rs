@@ -192,3 +192,74 @@ fn listing_is_never_an_error() {
         "stdout must never be empty, whether or not algorithms are linked in"
     );
 }
+
+/// The real stack ids, found through the registry so no id is spelled here:
+/// every non-test stack algorithm.
+fn real_stack_ids() -> Vec<String> {
+    let ids: Vec<String> = registry::stack_algorithms()
+        .iter()
+        .filter(|a| !a.test_only())
+        .map(|a| a.id().to_string())
+        .collect();
+    assert_eq!(ids.len(), 3, "three real stack algorithms: {ids:?}");
+    ids
+}
+
+/// Each parameter's help is printed on its own indented line directly under
+/// the parameter's header line. The schemas differ in length, so a fixed
+/// line offset cannot satisfy all of them.
+#[test]
+fn a_schema_prints_each_parameters_help_under_it() {
+    let mut lengths = Vec::new();
+    for id in real_stack_ids() {
+        let output = bin()
+            .args(["algorithms", &id])
+            .output()
+            .expect("failed to run binary");
+        assert!(output.status.success(), "{id}: {:?}", output.status);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        let entry = registry::find(&id).expect("registered");
+        lengths.push(entry.params().len());
+        for desc in entry.params() {
+            let header = lines
+                .iter()
+                .position(|l| l.starts_with(&format!("  {}: ", desc.id)))
+                .unwrap_or_else(|| panic!("{id}: no header for {} in {stdout}", desc.id));
+            assert_eq!(
+                lines.get(header + 1).copied(),
+                Some(format!("    {}", desc.help).as_str()),
+                "{id}/{}: help is the line under the header: {stdout}",
+                desc.id
+            );
+        }
+    }
+    lengths.sort_unstable();
+    lengths.dedup();
+    assert!(
+        lengths.len() > 1,
+        "the schemas differ in length: {lengths:?}"
+    );
+}
+
+/// `--json` keeps `help` and carries `advanced` for every parameter.
+#[test]
+fn json_carries_help_and_advanced_per_parameter() {
+    for id in real_stack_ids() {
+        let output = bin()
+            .args(["algorithms", &id, "--json"])
+            .output()
+            .expect("failed to run binary");
+        assert!(output.status.success(), "{id}: {:?}", output.status);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+        let params = report["algorithms"][0]["params"]
+            .as_array()
+            .expect("params array");
+        let entry = registry::find(&id).expect("registered");
+        assert_eq!(params.len(), entry.params().len(), "{id}");
+        for (json, desc) in params.iter().zip(entry.params()) {
+            assert_eq!(json["help"], desc.help.as_str(), "{id}/{}", desc.id);
+            assert_eq!(json["advanced"], desc.advanced, "{id}/{}", desc.id);
+        }
+    }
+}
