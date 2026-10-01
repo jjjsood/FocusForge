@@ -51,8 +51,7 @@ pub(crate) fn held_index(key: &str) -> Option<usize> {
 
 /// The ops of in-memory entry `index` and of the op-bearing entries it
 /// descends from, oldest first, up to the first fused entry or saved
-/// checkpoint. `None` when `index` is not an op-bearing entry or the chain
-/// runs through a full-map entry.
+/// checkpoint. `None` when `index` is not an op-bearing entry.
 pub(crate) fn stroke_chain(held: &[InMemoryCheckpoint], index: usize) -> Option<Vec<Op>> {
     let mut levels = Vec::new();
     let mut entry = held.get(index)?;
@@ -63,7 +62,7 @@ pub(crate) fn stroke_chain(held: &[InMemoryCheckpoint], index: usize) -> Option<
             _ => break,
         }
     }
-    if levels.is_empty() || matches!(entry.kind, InMemoryKind::FullMap(_)) {
+    if levels.is_empty() {
         return None;
     }
     Some(levels.into_iter().rev().flatten().cloned().collect())
@@ -214,16 +213,14 @@ impl Row<'_> {
     }
 }
 
-/// The algorithm `held[index]` carries once written: a fused or full-map
-/// entry's own, an op-bearing one's parent chain's (the checkpoint it is
-/// replayed onto). Empty when the chain does not resolve.
+/// The algorithm `held[index]` carries once written: a fused entry's own, an
+/// op-bearing one's parent chain's (the checkpoint it is replayed onto). Empty when the chain does not resolve.
 fn held_algorithm(index: usize, held: &[InMemoryCheckpoint], saved: &[&Checkpoint]) -> String {
     let Some(entry) = held.get(index) else {
         return String::new();
     };
     match &entry.kind {
         InMemoryKind::Fused(fused) => fused.algorithm.clone(),
-        InMemoryKind::FullMap(map) => map.algorithm.clone(),
         InMemoryKind::Ops { .. } => match &entry.parent {
             Some(ParentRef::Entry(parent)) if *parent < index => {
                 held_algorithm(*parent, held, saved)
@@ -339,6 +336,7 @@ mod tests {
             created_at,
             label: None,
             fuse: None,
+            hidden: false,
         }
     }
 
@@ -421,11 +419,7 @@ mod tests {
 
     #[test]
     fn an_in_memory_op_row_reads_as_its_written_checkpoint() {
-        use focusforge_core::project::{
-            ByteOrderTag, FullMapCheckpoint, FuseRecord, InMemoryCheckpoint, InMemoryKind, Metrics,
-            ParentRef, PlaneRef,
-        };
-        use std::path::PathBuf;
+        use focusforge_core::project::{InMemoryCheckpoint, InMemoryKind, ParentRef};
         let noon = 1_756_468_800;
         let mut saved = checkpoint("a", noon - 2 * 86_400);
         saved.algorithm = "saved-algorithm".to_string();
@@ -440,28 +434,10 @@ mod tests {
                 parent: Some(ParentRef::Saved("a".to_string())),
             },
             InMemoryCheckpoint {
-                kind: InMemoryKind::FullMap(FullMapCheckpoint {
-                    zmap: PathBuf::new(),
-                    algorithm: "its-own-algorithm".to_string(),
-                    params: Default::default(),
-                    fuse: FuseRecord {
-                        composite: PlaneRef {
-                            blob: String::new(),
-                            width: 1,
-                            height: 1,
-                            samples_per_pixel: 3,
-                            byte_order: ByteOrderTag::Little,
-                            description: String::new(),
-                            frame_count: 1,
-                        },
-                        align: None,
-                        registration: Default::default(),
-                        sources: Vec::new(),
-                        metrics: Metrics::default(),
-                    },
-                    sources: Vec::new(),
+                kind: InMemoryKind::Ops {
+                    ops: Vec::new(),
                     created_at: map_at,
-                }),
+                },
                 parent: Some(ParentRef::Entry(0)),
             },
         ];
@@ -477,7 +453,7 @@ mod tests {
         assert_eq!(ids, ["held:1", "held:0", "a"], "newest first");
         assert_eq!(rows[0].time_text, local_hhmmss(map_at));
         assert_eq!(rows[1].time_text, local_hhmmss(ops_at));
-        assert_eq!(rows[0].algorithm, "its-own-algorithm");
+        assert_eq!(rows[0].algorithm, "saved-algorithm");
         assert_eq!(rows[1].algorithm, "saved-algorithm");
         let labels: Vec<&str> = model
             .entries
@@ -583,38 +559,6 @@ mod tests {
         }
     }
 
-    fn full_map_entry(parent: Option<ParentRef>) -> InMemoryCheckpoint {
-        use focusforge_core::project::{
-            ByteOrderTag, FullMapCheckpoint, FuseRecord, Metrics, PlaneRef,
-        };
-        use std::path::PathBuf;
-        InMemoryCheckpoint {
-            kind: InMemoryKind::FullMap(FullMapCheckpoint {
-                zmap: PathBuf::new(),
-                algorithm: "a-stack-algorithm".to_string(),
-                params: Default::default(),
-                fuse: FuseRecord {
-                    composite: PlaneRef {
-                        blob: String::new(),
-                        width: 1,
-                        height: 1,
-                        samples_per_pixel: 3,
-                        byte_order: ByteOrderTag::Little,
-                        description: String::new(),
-                        frame_count: 1,
-                    },
-                    align: None,
-                    registration: Default::default(),
-                    sources: Vec::new(),
-                    metrics: Metrics::default(),
-                },
-                sources: Vec::new(),
-                created_at: 0,
-            }),
-            parent,
-        }
-    }
-
     #[test]
     fn a_stroke_chain_is_the_ops_down_to_the_base_oldest_first() {
         let saved = Some(ParentRef::Saved("a".to_string()));
@@ -645,14 +589,14 @@ mod tests {
     fn only_an_op_bearing_chain_of_entries_is_a_stroke_chain() {
         let held = [
             fused_entry(),
-            full_map_entry(Some(ParentRef::Entry(0))),
-            ops_entry(vec![stroke(1)], Some(ParentRef::Entry(1))),
-            ops_entry(vec![stroke(2)], Some(ParentRef::Entry(2))),
+            ops_entry(vec![stroke(1)], Some(ParentRef::Entry(0))),
         ];
         assert_eq!(stroke_chain(&held, 0), None, "a fused entry");
-        assert_eq!(stroke_chain(&held, 1), None, "a full-map entry");
-        assert_eq!(stroke_chain(&held, 2), None, "through a full-map entry");
-        assert_eq!(stroke_chain(&held, 3), None, "two levels through it");
+        assert_eq!(
+            stroke_chain(&held, 1),
+            Some(vec![stroke(1)]),
+            "up to the fused entry"
+        );
         assert_eq!(stroke_chain(&held, 9), None, "no such entry");
     }
 }

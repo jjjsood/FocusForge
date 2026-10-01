@@ -2,8 +2,8 @@
 
 //! `focusforge-cli history`: every checkpoint operation reachable headless --
 //! list, materialize one to a file, apply an op list read from a file
-//! (previewing it, sealing it as a new checkpoint, or both), seal a Z-Map
-//! file as a new checkpoint, and delete a checkpoint.
+//! (previewing it, sealing it as a new checkpoint, or both), and delete a
+//! checkpoint.
 //!
 //! Each subcommand is a thin adapter over one `focusforge_core::project`
 //! entry point: argument parsing, a report and an exit code, no replay or
@@ -21,7 +21,7 @@ use crate::retouch::would_replace;
 
 #[derive(Subcommand)]
 pub enum HistoryCommand {
-    /// List every checkpoint, newest first.
+    /// List every visible checkpoint, newest first.
     List(ListArgs),
     /// Write one checkpoint's Z-Map to a file.
     Materialize(MaterializeArgs),
@@ -29,10 +29,8 @@ pub enum HistoryCommand {
     /// `-o` writes the edited map without sealing. At least one is required;
     /// given both, the map written is the sealed checkpoint's own.
     Apply(ApplyArgs),
-    /// Seal a Z-Map file as a new checkpoint, a child of `--from`.
-    Snapshot(SnapshotArgs),
-    /// Delete a checkpoint. Refuses a checkpoint with descendants unless
-    /// `--with-descendants` is given, and always refuses the project's root.
+    /// Delete one checkpoint: it is hidden, and removed from the file once no
+    /// visible checkpoint is built on it. Refuses the last visible checkpoint.
     Delete(DeleteArgs),
 }
 
@@ -84,32 +82,12 @@ pub struct ApplyArgs {
 }
 
 #[derive(Args)]
-pub struct SnapshotArgs {
-    /// The project to seal into.
-    project: PathBuf,
-    /// The Z-Map file to seal.
-    #[arg(long, value_name = "FILE")]
-    zmap: PathBuf,
-    /// The checkpoint to seal under -- any unique prefix of its id. Defaults
-    /// to the project's current head.
-    #[arg(long)]
-    from: Option<String>,
-    /// Emit the frozen JSON report instead of human-readable text.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Args)]
 pub struct DeleteArgs {
     /// The project to delete from.
     project: PathBuf,
     /// The checkpoint to delete -- any unique prefix of its id.
     #[arg(long)]
     checkpoint: String,
-    /// Also delete every descendant of the checkpoint. Required whenever
-    /// the checkpoint has any.
-    #[arg(long = "with-descendants")]
-    with_descendants: bool,
     /// Emit the frozen JSON report instead of human-readable text.
     #[arg(long)]
     json: bool,
@@ -134,17 +112,9 @@ pub fn run(command: HistoryCommand, accept_changed_sources: bool) -> ExitCode {
             args.json,
             accept_changed_sources,
         ),
-        HistoryCommand::Snapshot(args) => snapshot(
-            &args.project,
-            &args.zmap,
-            args.from.as_deref(),
-            args.json,
-            accept_changed_sources,
-        ),
         HistoryCommand::Delete(args) => delete(
             &args.project,
             &args.checkpoint,
-            args.with_descendants,
             args.json,
             accept_changed_sources,
         ),
@@ -231,20 +201,22 @@ fn open_for_history(
     Ok(project)
 }
 
-/// Resolves `id_or_prefix` to exactly one checkpoint of `history`: an exact
-/// id first, else the unique checkpoint whose id starts with it. An
-/// ambiguous prefix names every match; no match reuses
-/// [`ProjectError::UnknownCheckpoint`]'s own wording.
+/// Resolves `id_or_prefix` to exactly one visible checkpoint of `history`: an
+/// exact id first, else the unique visible checkpoint whose id starts with
+/// it. An ambiguous prefix names every match; no match, and a hidden id,
+/// reuse [`ProjectError::UnknownCheckpoint`]'s own wording.
 pub(crate) fn resolve_checkpoint<'a>(
     history: &'a History,
     project_path: &Path,
     id_or_prefix: &str,
 ) -> Result<&'a Checkpoint, String> {
-    if let Ok(checkpoint) = history.get(id_or_prefix) {
+    if let Ok(checkpoint) = history.get(id_or_prefix)
+        && !checkpoint.hidden
+    {
         return Ok(checkpoint);
     }
     let matches: Vec<&Checkpoint> = history
-        .all()
+        .visible()
         .into_iter()
         .filter(|c| c.id.starts_with(id_or_prefix))
         .collect();
@@ -302,13 +274,19 @@ fn list(project_path: &Path, json: bool, accept_changed_sources: bool) -> ExitCo
         Ok(project) => project,
         Err(exit) => return exit,
     };
-    let checkpoints: Vec<CheckpointRecord> = project
-        .history()
-        .all()
+    let history = project.history();
+    let checkpoints: Vec<CheckpointRecord> = history
+        .visible()
         .into_iter()
         .map(|c| CheckpointRecord {
             id: c.id.clone(),
-            parent: c.parent.clone(),
+            parent: history
+                .ancestors(&c.id)
+                .expect("open validated every parent link")
+                .into_iter()
+                .skip(1)
+                .find(|ancestor| !ancestor.hidden)
+                .map(|ancestor| ancestor.id.clone()),
             algorithm: c.algorithm.clone(),
             created_at: c.created_at,
         })
@@ -534,81 +512,10 @@ fn apply(
     ExitCode::SUCCESS
 }
 
-/// Never `SealedProject.zmap`, whose `BlobRecord.kind` would leak the
-/// storage kind.
-#[derive(Serialize)]
-struct SnapshotReport {
-    project: String,
-    from: String,
-    checkpoint: String,
-    wall_seconds: f64,
-}
-
-fn snapshot(
-    project_path: &Path,
-    zmap: &Path,
-    from: Option<&str>,
-    json: bool,
-    accept_changed_sources: bool,
-) -> ExitCode {
-    let start = Instant::now();
-    let project = match open_for_history(project_path, accept_changed_sources) {
-        Ok(project) => project,
-        Err(exit) => return exit,
-    };
-    let parent = match from {
-        Some(prefix) => match resolve_checkpoint(project.history(), project_path, prefix) {
-            Ok(checkpoint) => checkpoint.clone(),
-            Err(message) => return fail(message),
-        },
-        None => project.checkpoint().clone(),
-    };
-    let fuse = match project.fuse_state(&parent.id) {
-        Ok(fuse) => fuse,
-        Err(err) => return fail(err),
-    };
-    let sources = fuse
-        .sources
-        .iter()
-        .map(|source| project.source_path(source))
-        .collect();
-    let map = project::FullMapCheckpoint {
-        zmap: zmap.to_path_buf(),
-        algorithm: parent.algorithm,
-        params: parent.params,
-        fuse,
-        sources,
-        created_at: project::now_unix(),
-    };
-    drop(project);
-    let sealed = match project::append_zmap_onto(project_path, &parent.id, &map) {
-        Ok(sealed) => sealed,
-        Err(err) => return fail(err),
-    };
-
-    let report = SnapshotReport {
-        project: project_path.display().to_string(),
-        from: parent.id,
-        checkpoint: sealed.checkpoint,
-        wall_seconds: start.elapsed().as_secs_f64(),
-    };
-    if json {
-        match serde_json::to_string_pretty(&report) {
-            Ok(text) => println!("{text}"),
-            Err(err) => return fail(format!("failed to serialize JSON: {err}")),
-        }
-    } else {
-        println!(
-            "{}\nfrom: {}\ncheckpoint: {}\nwall: {:.3}s",
-            report.project, report.from, report.checkpoint, report.wall_seconds,
-        );
-    }
-    ExitCode::SUCCESS
-}
-
 #[derive(Serialize)]
 struct DeleteReport {
     project: String,
+    hidden: String,
     removed: Vec<String>,
     head: String,
 }
@@ -616,7 +523,6 @@ struct DeleteReport {
 fn delete(
     project_path: &Path,
     checkpoint_id: &str,
-    with_descendants: bool,
     json: bool,
     accept_changed_sources: bool,
 ) -> ExitCode {
@@ -625,18 +531,10 @@ fn delete(
             Ok(project) => project,
             Err(exit) => return exit,
         };
-        let target = match resolve_checkpoint(project.history(), project_path, checkpoint_id) {
+        match resolve_checkpoint(project.history(), project_path, checkpoint_id) {
             Ok(checkpoint) => checkpoint.id.clone(),
             Err(message) => return fail(message),
-        };
-        let descendants = project.history().descendants(&target).len();
-        if descendants > 0 && !with_descendants {
-            return fail(format!(
-                "{target} has {descendants} descendant checkpoint(s) -- pass \
-                 --with-descendants to delete it and all of them"
-            ));
         }
-        target
     };
 
     let deleted = match project::delete_checkpoint(project_path, &target) {
@@ -645,6 +543,7 @@ fn delete(
     };
     let report = DeleteReport {
         project: project_path.display().to_string(),
+        hidden: deleted.hidden,
         removed: deleted.removed,
         head: deleted.head,
     };
@@ -655,8 +554,9 @@ fn delete(
         }
     } else {
         println!(
-            "{}\nremoved: {}\nhead: {}",
+            "{}\nhidden: {}\nremoved: {}\nhead: {}",
             report.project,
+            report.hidden,
             report.removed.join(", "),
             report.head
         );

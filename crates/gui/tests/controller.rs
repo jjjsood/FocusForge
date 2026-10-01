@@ -4652,7 +4652,8 @@ fn a_pending_delete_is_applied_by_the_project_save() {
     assert!(controller.save_active_project(|_| None));
     assert_eq!(saved_ids(&path).len(), 3);
 
-    // A fuse finishing on a pending-deleted row lands under its survivor.
+    // A fuse finishing on a pending-deleted row lands under it; the save
+    // hides the row and keeps it.
     let (path, chain) = saved_chain("pending_delete_fuse", &[20]);
     let mut controller = reopen(&path, "pending_delete_fuse_reopened");
     controller.set_align_algorithm("dummy-align");
@@ -4661,19 +4662,19 @@ fn a_pending_delete_is_applied_by_the_project_save() {
     settle_all(&mut controller);
     assert!(controller.save_active_project(|_| None));
     let project = saved(&path);
-    assert_eq!(project.history().all().len(), 2);
+    assert_eq!(project.history().all().len(), 3);
     assert!(
-        project.history().get(&chain[1]).is_err(),
-        "the delete applied"
+        project.history().get(&chain[1]).unwrap().hidden,
+        "the delete applied and the row stays stored"
     );
     assert_eq!(
         project.checkpoint().parent.as_deref(),
-        Some(chain[0].as_str())
+        Some(chain[1].as_str())
     );
 }
 
 #[test]
-fn the_next_checkpoint_after_a_deleted_origin_is_a_full_map_child() {
+fn edits_on_a_row_queued_for_delete_are_saved_under_it() {
     let (path, chain) = saved_chain("deleted_origin", &[20, 40]);
     let mut controller = reopen(&path, "deleted_origin_reopened");
     enter_editor(&mut controller);
@@ -4684,20 +4685,21 @@ fn the_next_checkpoint_after_a_deleted_origin_is_a_full_map_child() {
 
     let project = saved(&path);
     assert!(
-        project.history().get(&chain[2]).is_err(),
-        "the origin is gone"
+        project.history().get(&chain[2]).unwrap().hidden,
+        "the origin is hidden and stays stored"
     );
-    assert_eq!(project.history().all().len(), 3);
+    assert!(project.history().visible().iter().all(|c| c.id != chain[2]));
+    assert_eq!(project.history().all().len(), 4);
     let added = project.checkpoint().clone();
-    assert_eq!(added.parent.as_deref(), Some(chain[1].as_str()));
-    assert!(added.ops.is_empty(), "a full map, not an op list");
+    assert_eq!(added.parent.as_deref(), Some(chain[2].as_str()));
+    assert!(!added.ops.is_empty(), "an op list over the hidden row");
     assert_eq!(saved_map(&path, &added.id, "deleted_origin_map"), painted);
     assert_eq!(current_row(&controller), Some(added.id));
     assert_eq!(controller.edit_session().unwrap().op_count(), 0);
 }
 
 #[test]
-fn a_snapshot_taken_during_a_fuse_keeps_its_own_directory() {
+fn a_snapshot_during_a_fuse_holds_no_files() {
     let (path, chain) = saved_chain("snapshot_during_fuse", &[20]);
     let mut controller = reopen(&path, "snapshot_during_fuse_reopened");
     controller.set_align_algorithm("dummy-align");
@@ -4706,7 +4708,7 @@ fn a_snapshot_taken_during_a_fuse_keeps_its_own_directory() {
     paint(&mut controller, 40);
 
     assert!(controller.start_fuse());
-    assert!(controller.snapshot_live(0), "a full-map entry is taken");
+    assert!(controller.snapshot_live(0), "an op-bearing entry is taken");
     settle_all(&mut controller);
 
     let held = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -4719,8 +4721,8 @@ fn a_snapshot_taken_during_a_fuse_keeps_its_own_directory() {
     assert_eq!(tab_dirs.len(), 1, "one tab holds files");
     assert_eq!(
         fs::read_dir(&tab_dirs[0]).unwrap().count(),
-        2,
-        "the snapshot and the fuse each own a directory"
+        1,
+        "only the fuse owns a directory"
     );
 }
 

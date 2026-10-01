@@ -401,7 +401,7 @@ struct ProjectTab {
     /// The one open picker/enum menu's `"<section>:<id>"` key, if any.
     menu_open: Option<String>,
     /// Every checkpoint kept in memory since the last save, oldest first --
-    /// fused, op-bearing and full-map ones alike, in no `.ffp` until
+    /// fused and op-bearing ones alike, in no `.ffp` until
     /// [`AppController::save_active_project`] writes them. A parent is an
     /// index into this list or a saved checkpoint's id.
     held: Vec<job::InMemoryCheckpoint>,
@@ -632,7 +632,7 @@ impl ProjectTab {
             settings_panel::seed_algorithm_state(&project);
         let selected_checkpoint = match &project {
             GuiProject::Unsaved(_) => None,
-            GuiProject::Opened(p) => p.history().all().first().map(|c| c.id.clone()),
+            GuiProject::Opened(p) => p.history().visible().first().map(|c| c.id.clone()),
         };
         let frames = entry::project_frames(&project);
         let excluded = vec![false; frames.len()];
@@ -699,13 +699,13 @@ impl ProjectTab {
             .collect()
     }
 
-    /// This tab's own checkpoint count: every checkpoint in the project's
-    /// full history (`History::all`, branch-complete rather than one
+    /// This tab's own checkpoint count: every visible checkpoint in the
+    /// project's history (`History::visible`, branch-complete rather than one
     /// lineage) plus every checkpoint fused since the last save. `0` for an
     /// `Unsaved` tab with nothing fused yet.
     fn checkpoint_count(&self) -> usize {
         let saved = match &self.project {
-            GuiProject::Opened(project) => project.history().all().len(),
+            GuiProject::Opened(project) => project.history().visible().len(),
             GuiProject::Unsaved(_) => 0,
         };
         saved + self.held.len()
@@ -747,11 +747,8 @@ impl ProjectTab {
     /// tab, or when the selected row does not resolve.
     fn fused(&self) -> Option<(Vec<PathBuf>, job::Registration)> {
         let key = self.selected_checkpoint.as_deref()?;
-        let Some(index) = checkpoints::held_index(key) else {
+        if checkpoints::held_index(key).is_none() {
             return self.saved_fused(key);
-        };
-        if let job::InMemoryKind::FullMap(map) = &self.held.get(index)?.kind {
-            return Some((map.sources.clone(), map.fuse.registration.clone()));
         }
         match self.resolve_row(key)? {
             RowBase::Held(base) => {
@@ -815,15 +812,15 @@ impl ProjectTab {
         }
     }
 
-    /// Where a checkpoint taken from the current row is recorded: the row's
-    /// own entry, or the saved row -- its nearest surviving ancestor while a
-    /// pending delete removes it. `None` with no current row.
+    /// Where a checkpoint taken from the current row is recorded: under the
+    /// row itself, a saved checkpoint or an in-memory entry. `None` with no
+    /// current row.
     fn row_parent(&self) -> Option<job::ParentRef> {
         let key = self.selected_checkpoint.as_deref()?;
-        match checkpoints::held_index(key) {
-            Some(index) => Some(job::ParentRef::Entry(index)),
-            None => self.surviving_row(key).map(job::ParentRef::Saved),
-        }
+        Some(match checkpoints::held_index(key) {
+            Some(index) => job::ParentRef::Entry(index),
+            None => job::ParentRef::Saved(key.to_string()),
+        })
     }
 
     /// The key the selected row's planes are rendered and cached under: an
@@ -1668,7 +1665,7 @@ impl AppController {
             return checkpoints::build_model(&[], &[], today, None, 0.0);
         };
         let saved = match &tab.project {
-            GuiProject::Opened(project) => project.history().all(),
+            GuiProject::Opened(project) => project.history().visible(),
             GuiProject::Unsaved(_) => Vec::new(),
         };
         let selected = tab.selected_checkpoint.as_deref();
@@ -1685,7 +1682,7 @@ impl AppController {
     /// Restores flat entry `index` of [`Self::checkpoints_panel`]: it becomes
     /// the current row and live a copy of it. While live holds ops the restore
     /// waits on [`Self::pending_restore_copy`]'s answer, the current row
-    /// included. A no-op on a separator, a full-map in-memory row, past the
+    /// included. A no-op on a separator, past the
     /// end, while a dialog is open, and on the current row when live has no
     /// ops (unless its planes were refused).
     pub fn select_checkpoint_row(&mut self, index: usize) {
@@ -5435,7 +5432,7 @@ impl AppController {
         let tab = self.state.projects.get(index)?;
         let frames = tab.included_frames();
         let scratch_root = self.scratch_root();
-        let (staging_key, hold_dir) = hold_dir_for(tab, &scratch_root, "fused");
+        let (staging_key, hold_dir) = hold_dir_for(tab, &scratch_root);
         Some(job::JobRequest {
             frames,
             hold_dir,
@@ -5964,7 +5961,7 @@ impl AppController {
             if let Some(held) = fused_of(entry) {
                 return TabPlanes::Ready(held.composite.clone(), held.zmap.clone());
             }
-            // An op-bearing or full-map row shows the planes it was taken
+            // An op-bearing row shows the planes it was taken
             // from; the session's resident tiles carry its edits.
             if let Some(RowPlanes::Ready(composite, zmap)) = &tab.row_planes {
                 return TabPlanes::Ready(composite.clone(), zmap.clone());
@@ -6057,13 +6054,11 @@ impl AppController {
     }
 
     /// Keeps tab `index`'s live -- its origin's Z-Map with the session's ops
-    /// -- as a checkpoint in memory: an op-bearing one under the current row,
-    /// or a full-map one under the nearest surviving ancestor while a pending
-    /// delete removes the current row. The session is rebased onto it and it
-    /// becomes the current row. `false`, changing nothing, when live is
-    /// unmodified or the checkpoint cannot be taken.
+    /// -- as an op-bearing checkpoint in memory under the current row. The
+    /// session is rebased onto it and it becomes the current row. `false`,
+    /// changing nothing, when live is unmodified or the checkpoint cannot be
+    /// taken.
     pub fn snapshot_live(&mut self, index: usize) -> bool {
-        let scratch_root = self.scratch_root();
         let shown = if self.state.active == Some(index) {
             match self.active_tab_planes() {
                 TabPlanes::Ready(composite, zmap) => Some(RowPlanes::Ready(composite, zmap)),
@@ -6075,60 +6070,18 @@ impl AppController {
         let Some(tab) = self.state.projects.get_mut(index) else {
             return false;
         };
-        let (Some(edit), Some(row)) = (tab.edit.as_ref(), tab.selected_checkpoint.clone()) else {
+        let Some(edit) = tab.edit.as_ref() else {
             return false;
         };
         if edit.session.op_count() == 0 {
             return false;
         }
-        let created_at = job::now_unix();
         let Some(parent) = tab.row_parent() else {
             return false;
         };
-        let detached = checkpoints::held_index(&row).is_none()
-            && tab.surviving_row(&row).as_deref() != Some(row.as_str());
-        let kind = if detached {
-            let GuiProject::Opened(project) = &tab.project else {
-                return false;
-            };
-            let (Ok(origin), Ok(fuse), Some((sources, _))) = (
-                project.history().get(&row),
-                project.fuse_state(&row),
-                tab.fused(),
-            ) else {
-                return false;
-            };
-            let info = edit.session.info();
-            let zmap = hold_dir_for(tab, &scratch_root, "map").1.join("zmap.tif");
-            let written = zmap
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .is_ok()
-                && job::write_zmap(
-                    &zmap,
-                    info.width(),
-                    info.height(),
-                    info.frame_count(),
-                    edit.session.indices(),
-                )
-                .is_ok();
-            if !written {
-                remove_hold_dir_of(&zmap);
-                return false;
-            }
-            job::InMemoryKind::FullMap(job::FullMapCheckpoint {
-                zmap,
-                algorithm: origin.algorithm.clone(),
-                params: origin.params.clone(),
-                fuse,
-                sources,
-                created_at,
-            })
-        } else {
-            job::InMemoryKind::Ops {
-                ops: edit.session.ops().cloned().collect(),
-                created_at,
-            }
+        let kind = job::InMemoryKind::Ops {
+            ops: edit.session.ops().cloned().collect(),
+            created_at: job::now_unix(),
         };
         if let Some(edit) = tab.edit.as_mut() {
             edit.session.rebase();
@@ -6245,7 +6198,7 @@ impl AppController {
         let current = tab.selected_checkpoint.clone();
         let (next, row_deleted) = match current.as_deref() {
             Some(row) => match checkpoints::held_index(row) {
-                Some(entry) => (ids.get(entry).cloned().flatten(), false),
+                Some(entry) => (ids.get(entry).cloned(), false),
                 None => {
                     let survivor = tab.surviving_row(row);
                     let deleted = survivor.as_deref() != Some(row);
@@ -6258,7 +6211,7 @@ impl AppController {
             tab.edit = None;
         }
         tab.selected_checkpoint =
-            next.or_else(|| project.history().all().first().map(|c| c.id.clone()));
+            next.or_else(|| project.history().visible().first().map(|c| c.id.clone()));
         tab.row_planes = None;
         tab.project = GuiProject::Opened(Box::new(project));
         tab.title = entry::tab_title(&tab.project);
@@ -6950,10 +6903,8 @@ fn checkpoint_phrase(count: usize) -> String {
 }
 
 /// The staging key and the directory under `scratch_root` where the next
-/// in-memory checkpoint of `kind` (`"fused"` or `"map"`) on `tab` holds its
-/// files. The kind keeps a full-map snapshot taken while a fuse runs from
-/// sharing the fuse's directory.
-fn hold_dir_for(tab: &ProjectTab, scratch_root: &Path, kind: &str) -> (String, PathBuf) {
+/// fused in-memory checkpoint on `tab` holds its files.
+fn hold_dir_for(tab: &ProjectTab, scratch_root: &Path) -> (String, PathBuf) {
     let project_path = match &tab.project {
         GuiProject::Unsaved(group) => group.dir.join(format!("{}.ffp", group.name)),
         GuiProject::Opened(project) => project.path().to_path_buf(),
@@ -6962,7 +6913,7 @@ fn hold_dir_for(tab: &ProjectTab, scratch_root: &Path, kind: &str) -> (String, P
     let hold_dir = scratch_root
         .join("held")
         .join(&staging_key)
-        .join(format!("{kind}-{}", tab.checkpoint_count()));
+        .join(format!("fused-{}", tab.checkpoint_count()));
     (staging_key, hold_dir)
 }
 
@@ -6986,12 +6937,11 @@ fn remove_held(held: &[job::HeldCheckpoint]) {
 }
 
 /// [`remove_held`] for every in-memory entry that keeps files: a fused
-/// entry's planes, a full-map entry's Z-Map.
+/// entry's planes.
 fn remove_in_memory(entries: &[job::InMemoryCheckpoint]) {
     for entry in entries {
         match &entry.kind {
             job::InMemoryKind::Fused(held) => remove_hold_dir_of(&held.composite),
-            job::InMemoryKind::FullMap(map) => remove_hold_dir_of(&map.zmap),
             job::InMemoryKind::Ops { .. } => {}
         }
     }
@@ -7003,7 +6953,7 @@ fn remove_in_memory(entries: &[job::InMemoryCheckpoint]) {
 /// tab has unsealed edits on top of it.
 struct RowExportInfo {
     held: bool,
-    /// An op-bearing or full-map in-memory row: exported from the edit
+    /// An op-bearing in-memory row: exported from the edit
     /// session, never from a file.
     live: bool,
     algorithm: String,
@@ -7037,13 +6987,6 @@ fn row_export_info(tab: &ProjectTab) -> Option<RowExportInfo> {
         reference,
         description,
     };
-    if let job::InMemoryKind::FullMap(map) = &entry.kind {
-        return Some(live(
-            map.algorithm.clone(),
-            map.fuse.align.as_ref().map_or(0, |a| a.reference),
-            map.fuse.composite.description.clone(),
-        ));
-    }
     match tab.resolve_row(key)? {
         RowBase::Held(base) => {
             let held = fused_of(tab.held.get(base)?)?;

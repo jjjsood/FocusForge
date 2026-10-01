@@ -486,7 +486,7 @@ fn seal_chain(
     target: &Path,
     held: &[project::HeldCheckpoint],
     onto_existing: bool,
-) -> Result<Vec<Option<String>>, project::ProjectError> {
+) -> Result<Vec<String>, project::ProjectError> {
     let entries: Vec<project::InMemoryCheckpoint> = held
         .iter()
         .enumerate()
@@ -558,10 +558,6 @@ fn all_ids(path: &Path) -> Vec<String> {
     ids
 }
 
-fn written(ids: &[Option<String>], i: usize) -> &str {
-    ids[i].as_deref().expect("the entry is written")
-}
-
 #[test]
 fn seal_chain_keeps_each_checkpoints_created_at() {
     let dir = tmp_dir("seal_chain_created_at");
@@ -573,7 +569,6 @@ fn seal_chain_keeps_each_checkpoints_created_at() {
     let target = dir.join(format!("demo.{}", project::PROJECT_EXTENSION));
     let ids = seal_chain(&target, &held, false).expect("seal_in_memory must succeed");
     assert_eq!(ids.len(), 2);
-    assert!(ids.iter().all(Option::is_some), "one id per entry");
 
     let chain = Project::open(&target).unwrap().checkpoint_chain().unwrap();
     let created: Vec<i64> = chain.iter().rev().map(|c| c.created_at).collect();
@@ -643,19 +638,19 @@ fn sealing_in_memory_checkpoints_writes_each_under_its_own_parent() {
     ];
     let ids = project::seal_in_memory(&target, &entries, &[], false).unwrap();
     assert_eq!(ids.len(), 4);
-    assert_eq!(parent_of(&target, written(&ids, 0)), None);
+    assert_eq!(parent_of(&target, ids[0].as_str()), None);
     assert_eq!(
-        parent_of(&target, written(&ids, 1)).as_deref(),
-        Some(written(&ids, 0))
+        parent_of(&target, ids[1].as_str()).as_deref(),
+        Some(ids[0].as_str())
     );
     assert_eq!(
-        parent_of(&target, written(&ids, 2)).as_deref(),
-        Some(written(&ids, 0)),
+        parent_of(&target, ids[2].as_str()).as_deref(),
+        Some(ids[0].as_str()),
         "a fused entry is written under its own parent, not the newest checkpoint"
     );
     assert_eq!(
-        parent_of(&target, written(&ids, 3)).as_deref(),
-        Some(written(&ids, 2))
+        parent_of(&target, ids[3].as_str()).as_deref(),
+        Some(ids[2].as_str())
     );
     assert_eq!(all_ids(&target).len(), 4);
     assert!(leftover_temporaries(&dir).is_empty());
@@ -680,15 +675,15 @@ fn sealing_in_memory_checkpoints_writes_each_under_its_own_parent() {
     ];
     let ids = project::seal_in_memory(&project_path, &entries, &[], true).unwrap();
     assert_eq!(
-        parent_of(&project_path, written(&ids, 0)).as_deref(),
+        parent_of(&project_path, ids[0].as_str()).as_deref(),
         Some(root.as_str())
     );
     assert_eq!(
-        parent_of(&project_path, written(&ids, 1)).as_deref(),
-        Some(written(&ids, 0))
+        parent_of(&project_path, ids[1].as_str()).as_deref(),
+        Some(ids[0].as_str())
     );
     assert_eq!(
-        parent_of(&project_path, written(&ids, 2)).as_deref(),
+        parent_of(&project_path, ids[2].as_str()).as_deref(),
         Some(root.as_str()),
         "a fused entry whose parent is not the head is written under that parent"
     );
@@ -729,12 +724,12 @@ fn an_in_memory_op_checkpoint_materializes_to_its_replay() {
     };
     let cases: [(usize, &str, &[Op]); 3] = [
         (0, root.as_str(), &first_ops),
-        (1, written(&ids, 0), &second_ops),
-        (3, written(&ids, 2), &third_ops),
+        (1, ids[0].as_str(), &second_ops),
+        (3, ids[2].as_str(), &third_ops),
     ];
     for (entry, parent, ops) in cases {
         let expected = replay(parent, ops);
-        let got = materialized(&project_path, written(&ids, entry));
+        let got = materialized(&project_path, ids[entry].as_str());
         assert_ne!(
             got,
             materialized(&project_path, parent),
@@ -748,7 +743,7 @@ fn an_in_memory_op_checkpoint_materializes_to_its_replay() {
         assert_eq!(
             project
                 .history()
-                .get(written(&ids, entry))
+                .get(ids[entry].as_str())
                 .unwrap()
                 .created_at,
             created_at
@@ -826,6 +821,7 @@ struct Branched {
     root: String,
     a: String,
     b: String,
+    c: String,
 }
 
 fn branched(name: &str) -> Branched {
@@ -845,7 +841,7 @@ fn branched(name: &str) -> Branched {
         .checkpoint
     };
     let b = onto(&a, stroke(1, 5, 5), 2_000);
-    onto(&a, stroke(2, 30, 30), 2_100);
+    let c = onto(&a, stroke(2, 30, 30), 2_100);
     Branched {
         dir,
         path,
@@ -853,48 +849,72 @@ fn branched(name: &str) -> Branched {
         root,
         a,
         b,
+        c,
     }
 }
 
+fn visible_sorted(path: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = Project::open(path)
+        .unwrap()
+        .history()
+        .visible()
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
+    ids.sort();
+    ids
+}
+
 #[test]
-fn sealing_applies_pending_deletes_in_the_same_write() {
-    // Delete a: its descendants and an in-memory child of b go too, and the
-    // head (c) is repointed to the root.
-    let t = branched("in_memory_deletes");
-    let lone = [ops_entry(vec![stroke(3, 10, 10)], 3_000, saved(&t.b))];
-    let ids = project::seal_in_memory(&t.path, &lone, std::slice::from_ref(&t.a), true).unwrap();
-    assert_eq!(ids, [None]);
+fn sealing_hides_pending_deletes_and_writes_entries_under_them() {
+    // Delete a: it stays stored (b and c are built on it), and the entries
+    // under a and under b are written where they were recorded.
+    let t = branched("in_memory_hides");
+    let entries = [
+        ops_entry(vec![stroke(3, 10, 10)], 3_000, saved(&t.b)),
+        ops_entry(vec![stroke(1, 20, 20)], 3_100, saved(&t.a)),
+        ops_entry(vec![stroke(2, 25, 25)], 3_200, ParentRef::Entry(0)),
+    ];
+    let ids: Vec<String> =
+        project::seal_in_memory(&t.path, &entries, std::slice::from_ref(&t.a), true).unwrap();
+    assert_eq!(ids.len(), 3);
+    assert_eq!(parent_of(&t.path, &ids[0]).as_deref(), Some(t.b.as_str()));
+    assert_eq!(parent_of(&t.path, &ids[1]).as_deref(), Some(t.a.as_str()));
+    assert_eq!(
+        parent_of(&t.path, &ids[2]).as_deref(),
+        Some(ids[0].as_str())
+    );
+    assert_eq!(all_ids(&t.path).len(), 7);
+    let mut visible = vec![t.root.clone(), t.b.clone(), t.c.clone()];
+    visible.extend(ids.iter().cloned());
+    visible.sort();
+    assert_eq!(visible_sorted(&t.path), visible);
+    assert!(
+        Project::open(&t.path)
+            .unwrap()
+            .history()
+            .get(&t.a)
+            .unwrap()
+            .hidden
+    );
+    assert!(visible.contains(&head_of(&t.path)));
+
+    // A delete with nothing visible left under it removes the checkpoint.
+    let t = branched("in_memory_hides_leaf");
+    let ids = project::seal_in_memory(&t.path, &[], std::slice::from_ref(&t.b), true).unwrap();
+    assert!(ids.is_empty());
+    assert!(!all_ids(&t.path).contains(&t.b));
+    assert_eq!(all_ids(&t.path).len(), 3);
+
+    // Hidden first, collected with its last visible descendant.
+    let t = branched("in_memory_hides_all_below");
+    let deletes = [t.a.clone(), t.b.clone(), t.c.clone()];
+    project::seal_in_memory(&t.path, &[], &deletes, true).unwrap();
     assert_eq!(all_ids(&t.path), std::slice::from_ref(&t.root));
     assert_eq!(head_of(&t.path), t.root);
 
-    // The same with a second entry under the root, which is written.
-    let t = branched("in_memory_deletes_two");
-    let entries = [
-        ops_entry(vec![stroke(3, 10, 10)], 3_000, saved(&t.b)),
-        fused_entry(
-            held_checkpoint(&t.dir, &t.sources, 2, 3_100),
-            Some(saved(&t.root)),
-        ),
-        ops_entry(vec![stroke(2, 20, 20)], 3_200, ParentRef::Entry(0)),
-    ];
-    let ids = project::seal_in_memory(&t.path, &entries, std::slice::from_ref(&t.a), true).unwrap();
-    assert_eq!(ids[0], None);
-    assert_eq!(ids[2], None, "a child of a skipped entry is skipped");
-    let kept = written(&ids, 1).to_string();
-    let mut expected = vec![t.root.clone(), kept.clone()];
-    expected.sort();
-    assert_eq!(all_ids(&t.path), expected);
-    assert_eq!(parent_of(&t.path, &kept).as_deref(), Some(t.root.as_str()));
-    assert_eq!(head_of(&t.path), kept);
-
-    // b is already under a: accepted.
-    let t = branched("in_memory_deletes_nested");
-    let ids = project::seal_in_memory(&t.path, &[], &[t.a.clone(), t.b.clone()], true).unwrap();
-    assert!(ids.is_empty());
-    assert_eq!(all_ids(&t.path), std::slice::from_ref(&t.root));
-
     // Refusals leave the bytes alone.
-    let t = branched("in_memory_deletes_refused");
+    let t = branched("in_memory_hides_refused");
     let before = std::fs::read(&t.path).unwrap();
     let entry = || {
         [fused_entry(
@@ -904,7 +924,6 @@ fn sealing_applies_pending_deletes_in_the_same_write() {
     };
     for (what, deletes, onto_existing) in [
         ("unknown id", vec!["nope".to_string()], true),
-        ("the root", vec![t.root.clone()], true),
         ("a delete on a new project", vec![t.a.clone()], false),
     ] {
         assert!(
@@ -913,6 +932,9 @@ fn sealing_applies_pending_deletes_in_the_same_write() {
         );
         assert_eq!(std::fs::read(&t.path).unwrap(), before, "{what}");
     }
+    let everything = [t.root.clone(), t.a.clone(), t.b.clone(), t.c.clone()];
+    assert!(project::seal_in_memory(&t.path, &[], &everything, true).is_err());
+    assert_eq!(std::fs::read(&t.path).unwrap(), before, "every visible");
     // A failure midway with a delete pending.
     let broken = entry();
     let project::InMemoryKind::Fused(held) = &broken[0].kind else {
@@ -922,115 +944,4 @@ fn sealing_applies_pending_deletes_in_the_same_write() {
     assert!(project::seal_in_memory(&t.path, &broken, std::slice::from_ref(&t.a), true).is_err());
     assert_eq!(std::fs::read(&t.path).unwrap(), before);
     assert!(leftover_temporaries(&t.dir).is_empty());
-}
-
-#[test]
-fn a_full_map_checkpoint_materializes_to_the_given_map() {
-    let dir = tmp_dir("full_map_checkpoint");
-    let staging = dir.join("staging");
-    std::fs::create_dir_all(&staging).unwrap();
-    let sources = write_sources(&dir, FRAMES as usize);
-    let values = params();
-    let project_path = dir.join(format!("demo.{}", project::PROJECT_EXTENSION));
-    let (composite, zmap) = stage_planes(&staging, 0, 0);
-    project::seal(seal_request(
-        &project_path,
-        &composite,
-        &zmap,
-        &sources,
-        &values,
-    ))
-    .unwrap();
-    let root = head_of(&project_path);
-    let a = append_once(&dir, &project_path, &sources, 1, 1).checkpoint;
-    let fuse = Project::open(&project_path)
-        .unwrap()
-        .fuse_state(&a)
-        .unwrap();
-
-    // A map that equals neither the root's nor a's.
-    let given = dir.join("given.tif");
-    let samples = zmap_samples(2);
-    assert_ne!(samples, read_map(&zmap));
-    assert_ne!(samples, materialized(&project_path, &a));
-    let mut writer = ZMapWriter::create(&given, ZMapInfo::new(W, H, FRAMES).unwrap()).unwrap();
-    writer.write_tile(full(W, H), &samples).unwrap();
-    writer.finish().unwrap();
-
-    // The gather reads copies of the frames, not the recorded paths.
-    let copies = dir.join("copies");
-    std::fs::create_dir_all(&copies).unwrap();
-    let copied: Vec<PathBuf> = sources
-        .iter()
-        .map(|s| {
-            let to = copies.join(s.file_name().unwrap());
-            std::fs::copy(s, &to).unwrap();
-            to
-        })
-        .collect();
-    let map = project::FullMapCheckpoint {
-        zmap: given.clone(),
-        algorithm: "laplacian".to_string(),
-        params: values.clone(),
-        fuse: fuse.clone(),
-        sources: copied.clone(),
-        created_at: 9_000,
-    };
-
-    let before = std::fs::read(&project_path).unwrap();
-    assert!(project::append_zmap_onto(&project_path, "nope", &map).is_err());
-    assert_eq!(std::fs::read(&project_path).unwrap(), before);
-
-    let id = project::append_zmap_onto(&project_path, &root, &map)
-        .unwrap()
-        .checkpoint;
-    let mut project = Project::open(&project_path).unwrap();
-    let checkpoint = project.history().get(&id).unwrap().clone();
-    assert_eq!(checkpoint.parent.as_deref(), Some(root.as_str()));
-    assert!(checkpoint.ops.is_empty());
-    let written_fuse = checkpoint.fuse.clone().expect("stored like a re-fuse");
-    assert_eq!(written_fuse.sources, fuse.sources);
-    assert_eq!(written_fuse.registration, fuse.registration);
-    assert_eq!(checkpoint.created_at, 9_000);
-    let record = project
-        .manifest()
-        .blobs
-        .iter()
-        .find(|b| b.hash == checkpoint.zmap_blob)
-        .unwrap();
-    assert_eq!(record.kind, project::BlobKind::Full);
-    assert_eq!(materialized(&project_path, &id), samples);
-
-    let stored = dir.join("stored.tif");
-    project::render_checkpoint(&mut project, &id, &stored).unwrap();
-    let expected = dir.join("expected.tif");
-    let source = project::ZmapSource {
-        sources: copied,
-        registration: fuse.registration.clone(),
-        reference: 0,
-        description: fuse.composite.description.clone(),
-    };
-    let image = project::CheckpointImage::prepare_zmap(&given, &source).unwrap();
-    let mut out = TiffWriter::create(
-        &expected,
-        TiffSpec {
-            width: W,
-            height: H,
-            samples_per_pixel: SPP,
-            description: Some(fuse.composite.description.clone()),
-        },
-    )
-    .unwrap();
-    image
-        .render_external(&mut |band, rect| {
-            out.write_tile(rect, band).unwrap();
-            Ok(())
-        })
-        .unwrap();
-    out.finish().unwrap();
-    assert_eq!(
-        std::fs::read(&stored).unwrap(),
-        std::fs::read(&expected).unwrap(),
-        "the stored composite is the gather of the given map"
-    );
 }

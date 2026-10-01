@@ -7,13 +7,14 @@
 
 mod common;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
     self, AppendRequest, Metrics, Op, Point, Project, ProjectError, SealRequest, ZMapStorage,
 };
@@ -476,54 +477,6 @@ fn leaf_delete_touches_nothing_else() {
 }
 
 #[test]
-fn delete_takes_descendants_and_reports_the_count() {
-    let (_dir, project_path) = sealed("checkpoint_store_delete_descendants", 48, 32, 6);
-
-    let a = project::append_ops_at(
-        &project_path,
-        vec![stroke(1, 5, 5, 1.0)],
-        None,
-        1_700_000_000,
-        ZMapStorage::Full,
-    )
-    .unwrap()
-    .checkpoint;
-    let a2 = project::append_ops_at(
-        &project_path,
-        vec![stroke(2, 6, 6, 1.0)],
-        None,
-        1_700_000_010,
-        ZMapStorage::Full,
-    )
-    .unwrap()
-    .checkpoint;
-
-    let project = Project::open(&project_path).unwrap();
-    let preview: HashSet<String> = project
-        .history()
-        .descendants(&a)
-        .into_iter()
-        .map(|c| c.id.clone())
-        .collect();
-    assert_eq!(preview, HashSet::from([a2.clone()]));
-    drop(project);
-
-    let before = read_whole_file(&project_path);
-    let project = Project::open(&project_path).unwrap();
-    let _ = project.history().descendants(&a);
-    drop(project);
-    assert_eq!(
-        before,
-        read_whole_file(&project_path),
-        "a preview must not write"
-    );
-
-    let deleted = project::delete_checkpoint(&project_path, &a).unwrap();
-    let removed: HashSet<String> = deleted.removed.into_iter().collect();
-    assert_eq!(removed, HashSet::from([a, a2]));
-}
-
-#[test]
 fn shared_blob_survives_a_delete() {
     let (dir, project_path) = sealed("checkpoint_store_shared_blob", 48, 32, 6);
     let root_id = Project::open(&project_path)
@@ -777,24 +730,6 @@ fn delete_of_the_head_repoints_to_the_newest_survivor() {
 }
 
 #[test]
-fn deleting_the_root_is_refused() {
-    let (_dir, project_path) = sealed("checkpoint_store_root_delete", 32, 24, 4);
-    let root_id = Project::open(&project_path)
-        .unwrap()
-        .checkpoint()
-        .id
-        .clone();
-    let before = read_whole_file(&project_path);
-
-    let e = err(project::delete_checkpoint(&project_path, &root_id));
-    assert!(matches!(
-        e,
-        ProjectError::RootDelete { checkpoint, .. } if checkpoint == root_id
-    ));
-    assert_eq!(before, read_whole_file(&project_path));
-}
-
-#[test]
 fn append_after_branching_keeps_every_sibling() {
     let (_dir, project_path) = sealed("checkpoint_store_append_keeps_siblings", 48, 32, 6);
     let root_id = Project::open(&project_path)
@@ -967,4 +902,327 @@ fn unrecorded_fuse_is_refused_by_name() {
         ProjectError::FuseStateUnknown { checkpoint, .. } if checkpoint == root_id
     ));
     assert_eq!(before, read_whole_file(&stripped));
+}
+
+/// Every zip entry but the manifest, by name: what a delete must leave
+/// alone for each checkpoint it does not touch.
+fn entries_but_manifest(path: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+    let names: Vec<String> = archive
+        .file_names()
+        .filter(|name| *name != "manifest.json")
+        .map(str::to_string)
+        .collect();
+    names
+        .into_iter()
+        .map(|name| {
+            let mut bytes = Vec::new();
+            archive
+                .by_name(&name)
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
+            (name, bytes)
+        })
+        .collect()
+}
+
+/// A re-fuse written under the head: a fused checkpoint with its own
+/// composite and a full Z-Map.
+fn refuse_onto_head(dir: &Path, project_path: &Path, salt: u32, created_at: i64) -> String {
+    let project = Project::open(project_path).unwrap();
+    let sources: Vec<PathBuf> = project
+        .manifest()
+        .sources
+        .iter()
+        .map(|s| project.source_path(s))
+        .collect();
+    drop(project);
+    let values = params();
+    let staging = dir.join(format!("refuse-staging-{salt}"));
+    std::fs::create_dir_all(&staging).unwrap();
+    let (composite, zmap) = stage_planes(&staging, "refuse", 48, 32, sources.len() as u32, salt);
+    project::append_at(
+        append_request(project_path, &composite, &zmap, &sources, &values),
+        created_at,
+    )
+    .unwrap()
+    .checkpoint
+}
+
+fn append_bounded(project_path: &Path, ops: Vec<Op>, created_at: i64) -> project::SealedProject {
+    project::append_ops_at(project_path, ops, None, created_at, ZMapStorage::Bounded).unwrap()
+}
+
+fn visible_ids(project_path: &Path) -> HashSet<String> {
+    let project = Project::open(project_path).unwrap();
+    project
+        .history()
+        .visible()
+        .into_iter()
+        .map(|c| c.id.clone())
+        .collect()
+}
+
+#[test]
+fn deleting_a_leaf_removes_it_and_shrinks_the_file() {
+    let (_dir, project_path) = sealed("checkpoint_store_leaf_shrinks", 48, 32, 6);
+    let root_id = Project::open(&project_path)
+        .unwrap()
+        .checkpoint()
+        .id
+        .clone();
+    let leaf = append_bounded(&project_path, vec![stroke(1, 5, 5, 1.0)], 1_700_000_000);
+    assert_eq!(
+        leaf.zmap.kind,
+        project::BlobKind::SparseDelta,
+        "the leaf is a delta child"
+    );
+
+    let size_before = read_whole_file(&project_path).len();
+    let entries_before = entries_but_manifest(&project_path);
+    let deleted = project::delete_checkpoint(&project_path, &leaf.checkpoint).unwrap();
+    assert_eq!(deleted.hidden, leaf.checkpoint);
+    assert_eq!(deleted.removed, vec![leaf.checkpoint.clone()]);
+    assert_eq!(deleted.head, root_id);
+
+    let project = Project::open(&project_path).unwrap();
+    assert!(
+        project
+            .history()
+            .all()
+            .iter()
+            .all(|c| c.id != leaf.checkpoint)
+    );
+    let names = archive_entry_names(&project_path);
+    assert!(!names.contains(&format!("checkpoints/{}.json", leaf.checkpoint)));
+    assert!(!names.contains(&format!("blobs/{}.zst", leaf.zmap.hash)));
+    assert!(read_whole_file(&project_path).len() < size_before);
+
+    let mut expected = entries_before;
+    expected.remove(&format!("checkpoints/{}.json", leaf.checkpoint));
+    expected.remove(&format!("blobs/{}.zst", leaf.zmap.hash));
+    assert_eq!(
+        expected,
+        entries_but_manifest(&project_path),
+        "every other entry is byte-identical"
+    );
+}
+
+#[test]
+fn hiding_a_parent_keeps_its_child_byte_identical() {
+    let (dir, project_path) = sealed("checkpoint_store_hide_parent", 48, 32, 6);
+    let root_created_at = Project::open(&project_path)
+        .unwrap()
+        .checkpoint()
+        .created_at;
+    let parent = refuse_onto_head(&dir, &project_path, 71, root_created_at + 10);
+    let child = append_bounded(
+        &project_path,
+        vec![stroke(2, 6, 6, 1.0)],
+        root_created_at + 20,
+    );
+    assert_eq!(child.zmap.kind, project::BlobKind::SparseDelta);
+
+    let outputs = |tag: &str| {
+        let mut project = Project::open(&project_path).unwrap();
+        let checkpoint = project.history().get(&child.checkpoint).unwrap().clone();
+        let zmap = dir.join(format!("{tag}-zmap.tif"));
+        let render = dir.join(format!("{tag}-render.tif"));
+        let export = dir.join(format!("{tag}-export.tif"));
+        project::materialize_zmap(&mut project, &checkpoint, &zmap).unwrap();
+        project::render_checkpoint(&mut project, &child.checkpoint, &render).unwrap();
+        project::export_checkpoint(
+            &mut project,
+            &child.checkpoint,
+            &export,
+            &ExportOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .unwrap();
+        [zmap, render, export].map(|p| std::fs::read(p).unwrap())
+    };
+    let outputs_before = outputs("before");
+    let entries_before = entries_but_manifest(&project_path);
+
+    let deleted = project::delete_checkpoint(&project_path, &parent).unwrap();
+    assert_eq!(deleted.hidden, parent);
+    assert!(deleted.removed.is_empty());
+    assert_eq!(deleted.head, child.checkpoint);
+
+    let project = Project::open(&project_path).unwrap();
+    assert!(!visible_ids(&project_path).contains(&parent));
+    assert!(project.history().get(&parent).unwrap().hidden);
+    drop(project);
+    let size_after_hide = read_whole_file(&project_path).len();
+
+    let parent_json = format!("checkpoints/{parent}.json");
+    let mut expected = entries_before;
+    let original_json = expected.remove(&parent_json).unwrap();
+    let mut after = entries_but_manifest(&project_path);
+    let rewritten = after.remove(&parent_json).unwrap();
+    assert_eq!(
+        expected, after,
+        "the parent's blobs and every other entry stay byte-identical"
+    );
+    let mut original: serde_json::Value = serde_json::from_slice(&original_json).unwrap();
+    original["hidden"] = true.into();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&rewritten).unwrap(),
+        original,
+        "only the hidden flag changes"
+    );
+
+    assert_eq!(outputs_before, outputs("after"));
+
+    let deleted = project::delete_checkpoint(&project_path, &child.checkpoint).unwrap();
+    let removed: HashSet<String> = deleted.removed.into_iter().collect();
+    assert_eq!(removed, HashSet::from([parent, child.checkpoint]));
+    assert!(read_whole_file(&project_path).len() < size_after_hide);
+}
+
+#[test]
+fn the_last_visible_checkpoint_cannot_be_deleted() {
+    let (_dir, project_path) = sealed("checkpoint_store_last_visible", 48, 32, 6);
+    let root_id = Project::open(&project_path)
+        .unwrap()
+        .checkpoint()
+        .id
+        .clone();
+    let before = read_whole_file(&project_path);
+    let e = err(project::delete_checkpoint(&project_path, &root_id));
+    assert!(matches!(
+        &e,
+        ProjectError::LastVisibleDelete { checkpoint, .. } if *checkpoint == root_id
+    ));
+    assert!(e.to_string().contains(&root_id));
+    assert_eq!(before, read_whole_file(&project_path));
+
+    let child = append_bounded(&project_path, vec![stroke(1, 5, 5, 1.0)], 1_700_000_000).checkpoint;
+    let deleted = project::delete_checkpoint(&project_path, &root_id).unwrap();
+    assert_eq!(deleted.hidden, root_id);
+    assert!(deleted.removed.is_empty(), "the child is built on the root");
+    assert_eq!(visible_ids(&project_path), HashSet::from([child.clone()]));
+
+    let before = read_whole_file(&project_path);
+    let e = err(project::delete_checkpoint(&project_path, &child));
+    assert!(matches!(
+        e,
+        ProjectError::LastVisibleDelete { checkpoint, .. } if checkpoint == child
+    ));
+    for unknown in [root_id.as_str(), "no-such-checkpoint"] {
+        let e = err(project::delete_checkpoint(&project_path, unknown));
+        assert!(
+            matches!(&e, ProjectError::UnknownCheckpoint { id, .. } if id == unknown),
+            "{unknown}: {e}"
+        );
+    }
+    assert_eq!(before, read_whole_file(&project_path));
+}
+
+#[test]
+fn the_head_moves_to_the_newest_visible_checkpoint() {
+    let (dir, project_path) = sealed("checkpoint_store_head_moves", 48, 32, 6);
+    let root_created_at = Project::open(&project_path)
+        .unwrap()
+        .checkpoint()
+        .created_at;
+    let parent = refuse_onto_head(&dir, &project_path, 71, root_created_at + 10);
+    let parent_composite = Project::open(&project_path)
+        .unwrap()
+        .manifest()
+        .composite
+        .blob
+        .clone();
+    let child = append_bounded(
+        &project_path,
+        vec![stroke(1, 5, 5, 1.0)],
+        root_created_at + 20,
+    );
+    let head = append_bounded(
+        &project_path,
+        vec![stroke(2, 6, 6, 1.0)],
+        root_created_at + 30,
+    );
+
+    let manifest_before = read_entry_bytes(&project_path, "manifest.json");
+    let deleted = project::delete_checkpoint(&project_path, &parent).unwrap();
+    assert_eq!(deleted.head, head.checkpoint, "a visible head stays");
+    assert_eq!(
+        manifest_before,
+        read_entry_bytes(&project_path, "manifest.json"),
+        "hiding a non-head leaves the manifest as it was"
+    );
+
+    let deleted = project::delete_checkpoint(&project_path, &head.checkpoint).unwrap();
+    assert_eq!(deleted.head, child.checkpoint);
+    assert_eq!(deleted.removed, vec![head.checkpoint.clone()]);
+
+    let project = Project::open(&project_path).unwrap();
+    assert!(project.history().get(&parent).unwrap().hidden);
+    let manifest = project.manifest();
+    assert_eq!(manifest.checkpoint, child.checkpoint);
+    assert_eq!(
+        manifest.zmap.blob,
+        project.history().get(&child.checkpoint).unwrap().zmap_blob
+    );
+    assert_eq!(
+        manifest.composite.blob, parent_composite,
+        "rebuilt from the hidden fused ancestor"
+    );
+    assert_eq!(project.checkpoint().id, child.checkpoint);
+}
+
+#[test]
+fn hidden_checkpoints_survive_a_reopen() {
+    let (dir, project_path) = sealed("checkpoint_store_hidden_reopen", 48, 32, 6);
+    let root_id = Project::open(&project_path)
+        .unwrap()
+        .checkpoint()
+        .id
+        .clone();
+    let root_created_at = Project::open(&project_path)
+        .unwrap()
+        .checkpoint()
+        .created_at;
+    let parent = refuse_onto_head(&dir, &project_path, 71, root_created_at + 10);
+    let child = append_bounded(
+        &project_path,
+        vec![stroke(1, 5, 5, 1.0)],
+        root_created_at + 20,
+    )
+    .checkpoint;
+    project::delete_checkpoint(&project_path, &parent).unwrap();
+
+    let project = Project::open(&project_path).unwrap();
+    assert_eq!(project.checkpoint().id, child);
+    assert_eq!(
+        visible_ids(&project_path),
+        HashSet::from([root_id.clone(), child.clone()])
+    );
+    let hidden: Vec<&str> = project
+        .history()
+        .all()
+        .into_iter()
+        .filter(|c| c.hidden)
+        .map(|c| c.id.as_str())
+        .collect();
+    assert_eq!(hidden, vec![parent.as_str()]);
+    assert_eq!(project.history().ancestors(&child).unwrap().len(), 3);
+
+    assert!(
+        read_checkpoint_json(&project_path, &parent)["hidden"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        read_checkpoint_json(&project_path, &child)
+            .get("hidden")
+            .is_none()
+    );
+    assert!(
+        read_checkpoint_json(&project_path, &root_id)
+            .get("hidden")
+            .is_none()
+    );
 }

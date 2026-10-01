@@ -116,13 +116,13 @@ pub enum ProjectError {
     #[error("{}: no checkpoint named {id}", path.display())]
     UnknownCheckpoint { path: PathBuf, id: String },
 
-    /// A delete named the project's one root checkpoint, which would leave
-    /// the format's required single checkpoint with nothing to name.
+    /// A delete named the only checkpoint still visible, which would leave
+    /// the project with nothing to show or stand on.
     #[error(
-        "{}: checkpoint {checkpoint} is the project's root and cannot be deleted",
+        "{}: checkpoint {checkpoint} is the last visible checkpoint and cannot be deleted",
         path.display()
     )]
-    RootDelete { path: PathBuf, checkpoint: String },
+    LastVisibleDelete { path: PathBuf, checkpoint: String },
 
     /// `checkpoint`'s nearest fused ancestor carries no [`FuseRecord`] of
     /// its own and is not the project's current head's fused ancestor, so

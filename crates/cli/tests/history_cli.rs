@@ -468,121 +468,215 @@ fn sealing_from_an_older_checkpoint_branches() {
     assert_eq!(parent_of(&child_b_id), Value::String(root));
 }
 
-#[test]
-fn delete_with_descendants_needs_confirmation() {
-    let (dir, project) = fresh_project("delete_with_descendants_needs_confirmation");
-    let root = root_id(&project);
-
+/// Seals the three strokes under the project's head (or `from`), returning
+/// the new checkpoint's id.
+fn seal_strokes(dir: &Path, project: &Path, from: Option<&str>) -> String {
     let ops = write_op_file(
-        &dir,
+        dir,
         "ops.json",
         &op_file(&serde_json::to_value(three_strokes()).unwrap()),
     );
-    let seal = |dir: &Path, project: &Path, from: Option<&str>| -> String {
-        let mut args = vec![
-            "history",
-            "apply",
-            project.to_str().unwrap(),
-            "--ops",
-            ops.to_str().unwrap(),
-        ];
-        if let Some(from) = from {
-            args.push("--from");
-            args.push(from);
-        }
-        args.push("--save");
-        args.push("--json");
-        let output = run(dir, &args);
-        assert!(output.success, "stderr: {}", output.stderr);
-        let report: Value = serde_json::from_str(&output.stdout).unwrap();
-        report["checkpoint"].as_str().unwrap().to_string()
-    };
-
-    let child = seal(&dir, &project, None);
-    let grandchild = seal(&dir, &project, None);
-
-    // Deleting a leaf succeeds and reports it.
-    let output = run(
-        &dir,
-        &[
-            "history",
-            "delete",
-            project.to_str().unwrap(),
-            "--checkpoint",
-            &grandchild,
-            "--json",
-        ],
-    );
+    let mut args = vec![
+        "history",
+        "apply",
+        project.to_str().unwrap(),
+        "--ops",
+        ops.to_str().unwrap(),
+    ];
+    if let Some(from) = from {
+        args.push("--from");
+        args.push(from);
+    }
+    args.push("--save");
+    args.push("--json");
+    let output = run(dir, &args);
     assert!(output.success, "stderr: {}", output.stderr);
     let report: Value = serde_json::from_str(&output.stdout).unwrap();
-    assert_eq!(
-        report["removed"].as_array().unwrap(),
-        &[Value::String(grandchild.clone())]
-    );
+    report["checkpoint"].as_str().unwrap().to_string()
+}
 
-    // `child` now has no descendants; reseal one so the next delete has
-    // exactly one to refuse over.
-    let grandchild_2 = seal(&dir, &project, Some(&child));
-
-    let before = std::fs::read(&project).unwrap();
+fn listed(dir: &Path, project: &Path) -> Vec<Value> {
     let output = run(
-        &dir,
-        &[
-            "history",
-            "delete",
-            project.to_str().unwrap(),
-            "--checkpoint",
-            &child,
-        ],
-    );
-    assert!(!output.success);
-    assert!(
-        output.stderr.contains('1'),
-        "stderr must name the descendant count: {}",
-        output.stderr
-    );
-    assert_eq!(std::fs::read(&project).unwrap(), before);
-
-    let output = run(
-        &dir,
-        &[
-            "history",
-            "delete",
-            project.to_str().unwrap(),
-            "--checkpoint",
-            &child,
-            "--with-descendants",
-            "--json",
-        ],
-    );
-    assert!(output.success, "stderr: {}", output.stderr);
-    let report: Value = serde_json::from_str(&output.stdout).unwrap();
-    let removed: Vec<String> = report["removed"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
-    assert!(removed.contains(&child));
-    assert!(removed.contains(&grandchild_2));
-
-    let output = run(
-        &dir,
+        dir,
         &["history", "list", project.to_str().unwrap(), "--json"],
     );
     assert!(output.success, "stderr: {}", output.stderr);
     let doc: Value = serde_json::from_str(&output.stdout).unwrap();
-    let ids: Vec<String> = doc["checkpoints"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| c["id"].as_str().unwrap().to_string())
-        .collect();
-    assert!(!ids.contains(&child));
-    assert!(!ids.contains(&grandchild_2));
-    assert!(ids.contains(&root));
+    doc["checkpoints"].as_array().unwrap().clone()
+}
 
-    // The root is always refused.
+#[test]
+fn delete_hides_one_checkpoint_like_core() {
+    let (dir, project) = fresh_project("delete_hides_one_checkpoint_like_core");
+    let root = root_id(&project);
+    let middle = seal_strokes(&dir, &project, None);
+    let tip = seal_strokes(&dir, &project, None);
+    assert_eq!(
+        read_checkpoint(&project, &tip).parent.as_deref(),
+        Some(middle.as_str())
+    );
+
+    let twin = dir.join("twin");
+    std::fs::create_dir_all(&twin).unwrap();
+    let twin_project = twin.join(project.file_name().unwrap());
+    std::fs::copy(&project, &twin_project).unwrap();
+
+    let before_map = dir.join("tip-before.tif");
+    let before_export = dir.join("tip-before-export.tif");
+    let project_arg = project.to_str().unwrap();
+    for args in [
+        vec!["history", "materialize", project_arg],
+        vec!["export", project_arg],
+    ] {
+        let path = if args[0] == "export" {
+            &before_export
+        } else {
+            &before_map
+        };
+        let mut args = args;
+        args.extend(["--checkpoint", &tip, "-o", path.to_str().unwrap()]);
+        let output = run(&dir, &args);
+        assert!(output.success, "{args:?} stderr: {}", output.stderr);
+    }
+
+    let output = run(
+        &dir,
+        &[
+            "history",
+            "delete",
+            project.to_str().unwrap(),
+            "--checkpoint",
+            &middle,
+            "--json",
+        ],
+    );
+    assert!(output.success, "stderr: {}", output.stderr);
+    let report: Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(report["hidden"], middle);
+    assert!(report["removed"].as_array().unwrap().is_empty());
+    assert_eq!(report["head"], tip);
+
+    project::delete_checkpoint(&twin_project, &middle).unwrap();
+    assert_eq!(
+        std::fs::read(&project).unwrap(),
+        std::fs::read(&twin_project).unwrap(),
+        "the CLI and the core call write the same project"
+    );
+
+    // The list omits the hidden one and shows the nearest visible ancestor.
+    let records = listed(&dir, &project);
+    let ids: Vec<&str> = records.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [tip.as_str(), root.as_str()]);
+    assert_eq!(records[0]["parent"], root);
+    assert!(records[1]["parent"].is_null());
+    let output = run(&dir, &["history", "list", project.to_str().unwrap()]);
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(!output.stdout.contains(&middle), "{}", output.stdout);
+    assert!(output.stdout.contains(&format!("{tip} parent={root}")));
+
+    // The tip still renders the same.
+    let after_map = dir.join("tip-after.tif");
+    let after_export = dir.join("tip-after-export.tif");
+    let output = run(
+        &dir,
+        &[
+            "history",
+            "materialize",
+            project.to_str().unwrap(),
+            "--checkpoint",
+            &tip,
+            "-o",
+            after_map.to_str().unwrap(),
+        ],
+    );
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert_eq!(
+        std::fs::read(&before_map).unwrap(),
+        std::fs::read(&after_map).unwrap()
+    );
+    let output = run(
+        &dir,
+        &[
+            "export",
+            project.to_str().unwrap(),
+            "--checkpoint",
+            &tip,
+            "-o",
+            after_export.to_str().unwrap(),
+        ],
+    );
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert_eq!(
+        std::fs::read(&before_export).unwrap(),
+        std::fs::read(&after_export).unwrap()
+    );
+
+    // A hidden id, whole or as a prefix only it matches, resolves to nothing.
+    let nowhere = dir.join("hidden.tif");
+    let prefix = &middle[..middle.len() - 1];
+    assert!(
+        !ids.iter().any(|id| id.starts_with(prefix)),
+        "the prefix names the hidden checkpoint alone"
+    );
+    let before = std::fs::read(&project).unwrap();
+    for reference in [middle.as_str(), prefix] {
+        for args in [
+            vec!["history", "materialize", project.to_str().unwrap()],
+            vec!["export", project.to_str().unwrap()],
+        ] {
+            let mut args = args;
+            args.extend(["--checkpoint", reference, "-o", nowhere.to_str().unwrap()]);
+            let output = run(&dir, &args);
+            assert!(!output.success, "{args:?}");
+            assert!(
+                output.stderr.contains("no checkpoint named"),
+                "{}",
+                output.stderr
+            );
+            assert!(!nowhere.exists());
+        }
+        let output = run(
+            &dir,
+            &[
+                "history",
+                "delete",
+                project.to_str().unwrap(),
+                "--checkpoint",
+                reference,
+            ],
+        );
+        assert!(!output.success);
+    }
+    assert_eq!(std::fs::read(&project).unwrap(), before);
+}
+
+#[test]
+fn delete_reports_what_it_removed_in_text() {
+    let (dir, project) = fresh_project("delete_reports_what_it_removed_in_text");
+    let root = root_id(&project);
+    let leaf = seal_strokes(&dir, &project, None);
+    let output = run(
+        &dir,
+        &[
+            "history",
+            "delete",
+            project.to_str().unwrap(),
+            "--checkpoint",
+            &leaf,
+        ],
+    );
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stdout.contains(&format!("hidden: {leaf}")));
+    assert!(output.stdout.contains(&format!("removed: {leaf}")));
+    assert!(output.stdout.contains(&format!("head: {root}")));
+}
+
+#[test]
+fn delete_refuses_the_last_visible_checkpoint() {
+    let (dir, project) = fresh_project("delete_refuses_the_last_visible_checkpoint");
+    let root = root_id(&project);
+    let before = std::fs::read(&project).unwrap();
+
     let output = run(
         &dir,
         &[
@@ -594,6 +688,31 @@ fn delete_with_descendants_needs_confirmation() {
         ],
     );
     assert!(!output.success);
+    assert!(
+        output.stderr.contains(&root) && output.stderr.contains("last visible"),
+        "stderr: {}",
+        output.stderr
+    );
+    assert_eq!(std::fs::read(&project).unwrap(), before);
+
+    let output = run(
+        &dir,
+        &[
+            "history",
+            "delete",
+            project.to_str().unwrap(),
+            "--checkpoint",
+            &root,
+            "--with-descendants",
+        ],
+    );
+    assert!(!output.success);
+    assert!(
+        output.stderr.contains("--with-descendants"),
+        "{}",
+        output.stderr
+    );
+    assert_eq!(std::fs::read(&project).unwrap(), before);
 }
 
 #[test]
@@ -895,123 +1014,12 @@ fn output_does_not_reveal_storage_kind() {
 }
 
 #[test]
-fn a_zmap_snapshot_seals_under_its_parent() {
-    let (dir, project) = fresh_project("a_zmap_snapshot_seals_under_its_parent");
-    let root = root_id(&project);
-    let before_bytes = std::fs::read(&project).unwrap();
-    let twin = dir.join("twin");
-    std::fs::create_dir_all(&twin).unwrap();
-    let twin_project = twin.join(project.file_name().unwrap());
-    std::fs::write(&twin_project, &before_bytes).unwrap();
-
-    // A map every index of which is valid: what an edit of the root writes.
-    let ops = write_op_file(
-        &dir,
-        "ops.json",
-        &op_file(&serde_json::to_value(three_strokes()).unwrap()),
-    );
-    let map = dir.join("given.tif");
-    let output = run(
-        &dir,
-        &[
-            "history",
-            "apply",
-            project.to_str().unwrap(),
-            "--ops",
-            ops.to_str().unwrap(),
-            "-o",
-            map.to_str().unwrap(),
-        ],
-    );
-    assert!(output.success, "stderr: {}", output.stderr);
-
-    let output = run(
-        &dir,
-        &[
-            "history",
-            "snapshot",
-            project.to_str().unwrap(),
-            "--zmap",
-            map.to_str().unwrap(),
-            "--from",
-            &root,
-            "--json",
-        ],
-    );
-    assert!(output.success, "stderr: {}", output.stderr);
-    let report: Value = serde_json::from_str(&output.stdout).unwrap();
-    assert_eq!(report["from"], root);
-    let id = report["checkpoint"].as_str().unwrap().to_string();
-    let checkpoint = read_checkpoint(&project, &id);
-    assert_eq!(checkpoint.parent.as_deref(), Some(root.as_str()));
-    assert!(checkpoint.ops.is_empty() && checkpoint.fuse.is_some());
-
-    let materialized = dir.join("materialized.tif");
-    let output = run(
-        &dir,
-        &[
-            "history",
-            "materialize",
-            project.to_str().unwrap(),
-            "--checkpoint",
-            &id,
-            "-o",
-            materialized.to_str().unwrap(),
-        ],
-    );
-    assert!(output.success, "stderr: {}", output.stderr);
-    assert_eq!(
-        std::fs::read(&materialized).unwrap(),
-        std::fs::read(&map).unwrap()
-    );
-
-    // The core call at the same instant writes the same file.
-    let opened = Project::open(&twin_project).unwrap();
-    let root_checkpoint = opened.history().get(&root).unwrap().clone();
-    let fuse = opened.fuse_state(&root).unwrap();
-    let sources = fuse.sources.iter().map(|s| opened.source_path(s)).collect();
-    let full_map = project::FullMapCheckpoint {
-        zmap: map.clone(),
-        algorithm: root_checkpoint.algorithm,
-        params: root_checkpoint.params,
-        fuse,
-        sources,
-        created_at: checkpoint.created_at,
-    };
-    drop(opened);
-    let sealed = project::append_zmap_onto(&twin_project, &root, &full_map).unwrap();
-    assert_eq!(sealed.checkpoint, id);
-    assert_eq!(
-        std::fs::read(&twin_project).unwrap(),
-        std::fs::read(&project).unwrap(),
-        "the CLI and the core call write the same project"
-    );
-
-    // An id the project does not contain is refused and changes nothing.
-    let unchanged = std::fs::read(&project).unwrap();
-    let output = run(
-        &dir,
-        &[
-            "history",
-            "snapshot",
-            project.to_str().unwrap(),
-            "--zmap",
-            map.to_str().unwrap(),
-            "--from",
-            "no-such-checkpoint",
-        ],
-    );
-    assert!(!output.success);
-    assert_eq!(std::fs::read(&project).unwrap(), unchanged);
-}
-
-#[test]
 fn help_lists_every_command() {
     let dir = common::tmp_dir("help_lists_every_command");
 
     let output = run(&dir, &["history", "--help"]);
     assert!(output.success);
-    for name in ["list", "materialize", "apply", "snapshot", "delete"] {
+    for name in ["list", "materialize", "apply", "delete"] {
         assert!(
             output.stdout.contains(name),
             "history --help missing {name}: {}",
@@ -1019,15 +1027,14 @@ fn help_lists_every_command() {
         );
     }
 
-    let subcommand_flags: [(&str, &[&str]); 5] = [
+    let subcommand_flags: [(&str, &[&str]); 4] = [
         ("list", &["--json"]),
         ("materialize", &["--checkpoint", "--output", "--json"]),
         (
             "apply",
             &["--ops", "--from", "--save", "--output", "--json"],
         ),
-        ("snapshot", &["--zmap", "--from", "--json"]),
-        ("delete", &["--checkpoint", "--with-descendants", "--json"]),
+        ("delete", &["--checkpoint", "--json"]),
     ];
     for (sub, flags) in subcommand_flags {
         let output = run(&dir, &["history", sub, "--help"]);

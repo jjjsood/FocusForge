@@ -35,7 +35,7 @@ pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 pub use focusforge_core::project::Op;
 pub use focusforge_core::project::{
-    FullMapCheckpoint, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, now_unix,
+    HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, now_unix,
 };
 pub use focusforge_core::retouch::{EditSession, footprint};
 pub use focusforge_core::zmap::{NO_SOURCE, source_color};
@@ -939,15 +939,14 @@ pub fn open_edit_session(
 
 /// Writes `entries`, each under its own parent, and applies `deletes` at
 /// `target` -- onto the project already there when `onto_existing` -- then
-/// opens the result. Returns it with the id written per entry (`None` for an
-/// entry under a deleted checkpoint). On failure `target` is left exactly as
-/// it was.
+/// opens the result. Returns it with the id written per entry. On failure
+/// `target` is left exactly as it was.
 pub fn save_in_memory(
     target: &Path,
     entries: &[InMemoryCheckpoint],
     deletes: &[String],
     onto_existing: bool,
-) -> Result<(Project, Vec<Option<String>>), ProjectError> {
+) -> Result<(Project, Vec<String>), ProjectError> {
     let ids = project::seal_in_memory(target, entries, deletes, onto_existing)?;
     Ok((Project::open(target)?, ids))
 }

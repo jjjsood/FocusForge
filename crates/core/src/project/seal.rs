@@ -18,7 +18,6 @@
 //! its algorithm named, and the fully serialized [`Checkpoint`] --
 //! `parent: None`, `ops: []` -- it writes beside them.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -180,6 +179,7 @@ fn seal_staged(
             sources: manifest.sources.clone(),
             metrics: manifest.metrics,
         }),
+        hidden: false,
     };
 
     let mut writer = ProjectWriter::create(request.project_path)?;
@@ -236,32 +236,15 @@ pub enum ParentRef {
     Entry(usize),
 }
 
-/// A Z-Map file together with the fuse it was built under, written as a
-/// checkpoint of its own by [`append_zmap_onto`](super::append_zmap_onto).
-#[derive(Debug, Clone)]
-pub struct FullMapCheckpoint {
-    pub zmap: PathBuf,
-    pub algorithm: String,
-    pub params: ParamValues,
-    /// The fuse the map was built under: its sources, alignment, crop and
-    /// metrics are stored with the checkpoint.
-    pub fuse: FuseRecord,
-    /// The source frames the composite is gathered from, resolved and in
-    /// frame order. `fuse.sources` is stored as given.
-    pub sources: Vec<PathBuf>,
-    /// Unix seconds, UTC.
-    pub created_at: i64,
-}
-
 /// What an in-memory checkpoint holds.
 #[derive(Debug, Clone)]
+// A project holds a handful of entries; boxing the fuse would touch every constructor.
+#[allow(clippy::large_enum_variant)]
 pub enum InMemoryKind {
     /// A finished fuse's planes.
     Fused(HeldCheckpoint),
     /// Ops replayed over the parent's Z-Map.
     Ops { ops: Vec<Op>, created_at: i64 },
-    /// A whole Z-Map, stored like a re-fuse.
-    FullMap(FullMapCheckpoint),
 }
 
 /// One checkpoint kept outside any container, with the parent it is written
@@ -278,30 +261,29 @@ impl InMemoryCheckpoint {
         match &self.kind {
             InMemoryKind::Fused(held) => held.created_at,
             InMemoryKind::Ops { created_at, .. } => *created_at,
-            InMemoryKind::FullMap(map) => map.created_at,
         }
     }
 }
 
-/// Writes `entries` in order, each under its own parent, then removes the
-/// saved checkpoints `deletes` names with their descendants, in one rename
-/// over `target` (onto the project there when `onto_existing`). Returns the
-/// id written per entry, `None` under a deleted checkpoint. On error `target`
-/// is left as it was; bad parents and deletes are refused before any write.
+/// Writes `entries` in order, each under its own parent, then hides the
+/// saved checkpoints `deletes` names (see [`super::delete_checkpoint`]), in
+/// one rename over `target` (onto the project there when `onto_existing`).
+/// Returns the id written per entry. On error `target` is left as it was;
+/// bad parents and unknown deletes are refused before any write.
 pub fn seal_in_memory(
     target: &Path,
     entries: &[InMemoryCheckpoint],
     deletes: &[String],
     onto_existing: bool,
-) -> Result<Vec<Option<String>>, ProjectError> {
-    let plan = plan_in_memory(target, entries, deletes, onto_existing)?;
+) -> Result<Vec<String>, ProjectError> {
+    plan_in_memory(target, entries, deletes, onto_existing)?;
     let mut name = target
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_default();
     name.push(".saving");
     let temp = target.with_file_name(name);
-    let result = write_in_memory(target, &temp, entries, &plan, onto_existing).and_then(|ids| {
+    let result = write_in_memory(target, &temp, entries, deletes, onto_existing).and_then(|ids| {
         std::fs::rename(&temp, target).map_err(|source| ProjectError::io(target, source))?;
         Ok(ids)
     });
@@ -311,20 +293,12 @@ pub fn seal_in_memory(
     result
 }
 
-/// What [`seal_in_memory`] settles before writing.
-struct InMemoryPlan {
-    /// Entries under a deleted checkpoint or under a skipped entry.
-    skipped: Vec<bool>,
-    /// The deletes still to apply: none is a descendant of another.
-    deletes: Vec<String>,
-}
-
 fn plan_in_memory(
     target: &Path,
     entries: &[InMemoryCheckpoint],
     deletes: &[String],
     onto_existing: bool,
-) -> Result<InMemoryPlan, ProjectError> {
+) -> Result<(), ProjectError> {
     let refuse = |message: String| ProjectError::container(target, message);
     if entries.is_empty() && (deletes.is_empty() || !onto_existing) {
         return Err(refuse("no checkpoint to save".to_string()));
@@ -371,77 +345,30 @@ fn plan_in_memory(
         }
     }
 
-    let mut removed: HashSet<String> = HashSet::new();
-    let mut kept_deletes: Vec<String> = Vec::new();
     if let Some(project) = &opened {
-        let history = project.history();
-        let mut reach: Vec<HashSet<String>> = Vec::with_capacity(deletes.len());
         for id in deletes {
-            if history.get(id)?.parent.is_none() {
-                return Err(ProjectError::RootDelete {
-                    path: target.to_path_buf(),
-                    checkpoint: id.clone(),
-                });
-            }
-            reach.push(
-                history
-                    .descendants(id)
-                    .into_iter()
-                    .map(|c| c.id.clone())
-                    .collect(),
-            );
-        }
-        for (i, id) in deletes.iter().enumerate() {
-            removed.insert(id.clone());
-            removed.extend(reach[i].iter().cloned());
-            let under_another = reach
-                .iter()
-                .enumerate()
-                .any(|(j, below)| j != i && below.contains(id));
-            if !under_another && !kept_deletes.contains(id) {
-                kept_deletes.push(id.clone());
-            }
+            project.history().get(id)?;
         }
     }
-
-    let mut skipped = vec![false; entries.len()];
-    for (i, entry) in entries.iter().enumerate() {
-        skipped[i] = match &entry.parent {
-            Some(ParentRef::Saved(id)) => removed.contains(id),
-            Some(ParentRef::Entry(j)) => skipped[*j],
-            None => false,
-        };
-    }
-    Ok(InMemoryPlan {
-        skipped,
-        deletes: kept_deletes,
-    })
+    Ok(())
 }
 
 fn write_in_memory(
     target: &Path,
     temp: &Path,
     entries: &[InMemoryCheckpoint],
-    plan: &InMemoryPlan,
+    deletes: &[String],
     onto_existing: bool,
-) -> Result<Vec<Option<String>>, ProjectError> {
+) -> Result<Vec<String>, ProjectError> {
     if onto_existing {
         std::fs::copy(target, temp).map_err(|source| ProjectError::io(target, source))?;
     }
-    let mut ids: Vec<Option<String>> = Vec::with_capacity(entries.len());
-    for (i, entry) in entries.iter().enumerate() {
-        if plan.skipped[i] {
-            ids.push(None);
-            continue;
-        }
+    let mut ids: Vec<String> = Vec::with_capacity(entries.len());
+    for entry in entries {
         let parent: Option<String> = match &entry.parent {
             None => None,
             Some(ParentRef::Saved(id)) => Some(id.clone()),
-            Some(ParentRef::Entry(j)) => Some(
-                ids[*j]
-                    .clone()
-                    .expect("an entry whose parent was skipped is skipped"),
-            ),
+            Some(ParentRef::Entry(j)) => Some(ids[*j].clone()),
         };
         let id = match &entry.kind {
             InMemoryKind::Fused(held) => write_fused(temp, held, parent.as_deref())?,
@@ -456,18 +383,10 @@ fn write_in_memory(
                 )?
                 .checkpoint
             }
-            InMemoryKind::FullMap(map) => {
-                super::append_zmap_onto(
-                    temp,
-                    parent.as_deref().expect("a full-map entry has a parent"),
-                    map,
-                )?
-                .checkpoint
-            }
         };
-        ids.push(Some(id));
+        ids.push(id);
     }
-    for id in &plan.deletes {
+    for id in deletes {
         super::delete_checkpoint(temp, id)?;
     }
     Ok(ids)

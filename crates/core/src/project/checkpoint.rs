@@ -49,6 +49,11 @@ pub struct Checkpoint {
     /// before this field carries `None` on every fused checkpoint it holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse: Option<FuseRecord>,
+    /// Set by a delete: the checkpoint no longer shows in a listing, but
+    /// stays stored while a visible checkpoint is built on it. A project
+    /// written before this field has every checkpoint visible.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
 }
 
 /// One fused checkpoint's own planes: what [`super::seal::seal_at`] and a
@@ -275,12 +280,11 @@ impl History {
         d
     }
 
-    /// The newest checkpoint by [`Self::all`]'s own order.
-    pub fn newest(&self) -> &Checkpoint {
-        self.all()
-            .into_iter()
-            .next()
-            .expect("a project always holds at least one checkpoint")
+    /// [`Self::all`] without the hidden checkpoints: what a listing shows.
+    pub fn visible(&self) -> Vec<&Checkpoint> {
+        let mut all = self.all();
+        all.retain(|c| !c.hidden);
+        all
     }
 
     /// `id` and every ancestor above it, self first, down to the root.
@@ -372,6 +376,7 @@ mod tests {
             created_at: 1,
             label: None,
             fuse: None,
+            hidden: false,
         };
         let text = serde_json::to_string(&checkpoint).unwrap();
         assert_eq!(
@@ -392,6 +397,7 @@ mod tests {
             created_at,
             label: None,
             fuse: None,
+            hidden: false,
         }
     }
 
@@ -485,5 +491,37 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(two_cycle, ProjectError::ParentCycle { .. }));
+    }
+
+    #[test]
+    fn history_visible_skips_a_hidden_checkpoint_the_other_walks_keep() {
+        let mut mid = bare("mid", Some("root"), 2);
+        mid.hidden = true;
+        let history = History::build(
+            vec![bare("root", None, 1), mid, bare("leaf", Some("mid"), 3)],
+            Path::new("p"),
+        )
+        .unwrap();
+        assert_eq!(ids(history.visible()), vec!["leaf", "root"]);
+        assert_eq!(ids(history.all()), vec!["leaf", "mid", "root"]);
+        assert!(history.get("mid").unwrap().hidden);
+        assert_eq!(
+            ids(history.ancestors("leaf").unwrap()),
+            ["leaf", "mid", "root"]
+        );
+    }
+
+    #[test]
+    fn the_hidden_flag_is_written_only_when_set_and_defaults_to_visible() {
+        let mut checkpoint = bare("a", None, 1);
+        let visible = serde_json::to_string(&checkpoint).unwrap();
+        assert!(!visible.contains("hidden"));
+        let read: Checkpoint = serde_json::from_str(&visible).unwrap();
+        assert!(!read.hidden);
+
+        checkpoint.hidden = true;
+        let hidden = serde_json::to_string(&checkpoint).unwrap();
+        assert!(hidden.contains(r#""hidden":true"#));
+        assert!(serde_json::from_str::<Checkpoint>(&hidden).unwrap().hidden);
     }
 }
