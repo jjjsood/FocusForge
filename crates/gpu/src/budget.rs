@@ -111,9 +111,8 @@ fn per_frame_bytes(width: u32, height: u32, spp: u32, levels: u32, warped: bool)
 /// Every byte one `warp_fuse_tile_gpu` call allocates on the device exactly
 /// once per tile, independent of frame count: the running best level and its
 /// interleaved `(score, winner)` plane per level, the residual sum and its
-/// eligible-frame count, the
-/// collapse's expand-and-add per level, the packed output, and the tile's
-/// two readback staging buffers.
+/// eligible-frame count, the collapse's expand-and-add per level, the packed
+/// output, and the tile's two readback staging buffers.
 fn once_per_tile_bytes(width: u32, height: u32, spp: u32, levels: u32) -> u64 {
     let dims = level_dims(width, height, levels);
     let spp64 = u64::from(spp);
