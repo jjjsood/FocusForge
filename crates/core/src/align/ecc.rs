@@ -105,9 +105,9 @@
 //! returned) and **hit the cap** otherwise. **Diverged** (see
 //! [`DivergenceReason`]) returns the best-ρ transform seen, never the last.
 //!
-//! The step measure replaces the raw `‖Δp‖`, which in similarity mode mixes
-//! dimensionless `c`, `s` with pixel-valued `tx`, `ty` and could not be scaled
-//! between pyramid levels.
+//! The raw `‖Δp‖` is not used: in similarity mode it mixes dimensionless
+//! `c`, `s` with pixel-valued `tx`, `ty` and cannot be scaled between pyramid
+//! levels.
 //!
 //! Sample arithmetic is `f32`; every accumulation (means, dot products,
 //! `C`, `Ḡ^t ·`) and the normal-equation solve are `f64`. The loop is
