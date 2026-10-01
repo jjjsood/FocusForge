@@ -349,6 +349,11 @@ fn upload_u32(device: &wgpu::Device, queue: &wgpu::Queue, values: &[u32]) -> wgp
     buffer
 }
 
+/// Whether `mask` excludes no pixel, so the exclude pass would change nothing.
+fn all_true(mask: &[bool]) -> bool {
+    mask.iter().all(|&ok| ok)
+}
+
 fn upload_mask(device: &wgpu::Device, queue: &wgpu::Queue, mask: &[bool]) -> wgpu::Buffer {
     let values: Vec<u32> = mask.iter().map(|&ok| u32::from(ok)).collect();
     upload_u32(device, queue, &values)
@@ -392,9 +397,14 @@ pub(crate) fn fuse_planes_gpu(
 
     for frame in 0..frame_count {
         let (base, covered) = source(frame)?;
+        // A frame whose every eligibility mask is all-true takes the unmasked
+        // path: no upload, no exclude pass, a plain `+1` residual count.
         let masks = covered
             .as_deref()
-            .map(|covered| EligibleMasks::new(covered, rect.width, rect.height, levels));
+            .map(|covered| EligibleMasks::new(covered, rect.width, rect.height, levels))
+            .filter(|masks| {
+                !masks.levels.iter().all(|m| all_true(m)) || !all_true(&masks.residual)
+            });
         any_masked |= masks.is_some();
         let gaussians = gaussian_levels_gpu(device, queue, pipelines, base, levels);
 
@@ -432,7 +442,7 @@ pub(crate) fn fuse_planes_gpu(
             let score = select::score(
                 device, queue, pipelines, &laplacian, g_k_width, g_k_height, g_k_spp, radius,
             );
-            if let Some(masks) = &masks {
+            if let Some(masks) = masks.as_ref().filter(|masks| !all_true(&masks.levels[k])) {
                 select::exclude(
                     device,
                     queue,
@@ -504,7 +514,7 @@ pub(crate) fn fuse_planes_gpu(
         if residual_counts.is_empty() {
             residual_counts = vec![0; (residual_width * residual_height) as usize];
         }
-        match &masks {
+        match masks.as_ref().filter(|masks| !all_true(&masks.residual)) {
             Some(masks) => {
                 select::exclude(
                     device,

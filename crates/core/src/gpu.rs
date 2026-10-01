@@ -64,6 +64,23 @@ pub trait TileBackend: Send + Sync {
         u32::MAX
     }
 
+    /// Why one `width` x `height` tile at `samples_per_pixel`, pyramid depth
+    /// `levels` and `transforms` (the shape [`Self::warp_fuse_tile`] takes)
+    /// cannot run on this backend's device, as a message naming the host
+    /// path the run continues on; `None` when it fits. A caller that gets
+    /// `Some` fuses on the host instead of calling this backend. Defaults to
+    /// `None`, for a backend with no budget of its own.
+    fn tile_budget_shortfall(
+        &self,
+        _width: u32,
+        _height: u32,
+        _samples_per_pixel: u32,
+        _levels: u32,
+        _transforms: &[Transform],
+    ) -> Option<String> {
+        None
+    }
+
     /// Read `rect` of `frame` through `reader`, apply a trivial per-sample
     /// gain on the GPU, and return the result. Exists only to exercise the
     /// upload/dispatch/readback path -- this trait's other methods,

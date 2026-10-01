@@ -12,11 +12,12 @@
 //! [`PROBE_MAX_ATTEMPTS`] tries. [`buffer_limit_shortfalls`] checks single
 //! buffers.
 //!
-//! **Every byte a tile allocates counts, not a live high-water mark.**
-//! Dropping a `wgpu::Buffer` does not promise immediate reclamation, and the
-//! pipeline polls only at its two per-tile readbacks (composite, Z-Map), so
-//! [`device_bytes_per_tile`] treats every intermediate as live for the
-//! whole tile. Conservative; the allocator-report test prints the measurement.
+//! **One frame's intermediates plus the tile's fixed buffers.** wgpu does not
+//! promise that a dropped `wgpu::Buffer` is reclaimed before a later poll,
+//! yet on wgpu 29.0.4 the device peak of a tile measures flat in frame count
+//! (8, 32 and 128 frames), so [`device_bytes_per_tile`] takes no frame count
+//! and sits at about twice the measured peak. The flatness test in
+//! `tests/harness/budget_gpu.rs` fails if a driver stops reclaiming.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -148,31 +149,33 @@ fn once_per_tile_bytes(width: u32, height: u32, spp: u32, levels: u32) -> u64 {
     total
 }
 
-/// Every byte one `crate::stack_tile::warp_fuse_tile_gpu` call allocates on
-/// the device for a tile of `frame_count` frames, a `width x height`
-/// destination rect at `spp` samples per pixel and `levels` pyramid depth --
-/// `frame_count * per_frame + once_per_tile`, `u64` throughout (no `as u32`
-/// narrowing). `warped` is a single flag for the whole tile, not per frame:
-/// an approximation in the conservative direction, since an all-identity
-/// tile allocates strictly less than this.
+/// The device bytes one `crate::stack_tile::warp_fuse_tile_gpu` call holds
+/// at its peak for a `width x height` rect at `spp` samples per pixel and
+/// `levels` pyramid depth, independent of frame count: one frame's
+/// intermediates plus the tile's fixed buffers. A 512x512, 3 spp, 5-level
+/// warped tile peaks at 29.0 MB over the allocator baseline; the model says
+/// 53.1 MB. `warped` is one flag for the whole tile, in the conservative direction.
 ///
-/// Two documented exclusions: the 16-32 B uniform params buffer each
-/// dispatch allocates (`crate::pipeline::upload_params`, roughly 13 per
-/// level per frame) is under 0.1% of the sum and is left out; and the
-/// warped-source term above is a model, not a bound, for the same reason
-/// named there. Both exclusions are dominated by orders of magnitude by
-/// every other term, which is what keeps the sum conservative overall.
-pub fn device_bytes_per_tile(
-    frame_count: usize,
-    width: u32,
-    height: u32,
-    spp: u32,
-    levels: u32,
-    warped: bool,
-) -> u64 {
+/// Two exclusions: the 16-32 B uniform params buffer each dispatch allocates
+/// (`crate::pipeline::upload_params`, roughly 13 per level per frame) is
+/// under 0.1% of the sum, and the warped-source term is a model, not a bound,
+/// for the reason named there. Every other term dominates both by orders of
+/// magnitude.
+pub fn device_bytes_per_tile(width: u32, height: u32, spp: u32, levels: u32, warped: bool) -> u64 {
     let per_frame = per_frame_bytes(width, height, spp, levels, warped);
     let once = once_per_tile_bytes(width, height, spp, levels);
-    (frame_count as u64) * per_frame + once
+    per_frame + once
+}
+
+/// The account of a `width x height` tile whose `bytes` exceed the device
+/// `budget` and so runs on the host; `None` when it fits.
+pub fn tile_shortfall_message(width: u32, height: u32, bytes: u64, budget: u64) -> Option<String> {
+    (bytes > budget).then(|| {
+        format!(
+            "one {width}x{height} tile needs {bytes} B on the device, above the device budget of \
+             {budget} B; continuing on the CPU path"
+        )
+    })
 }
 
 /// The single largest buffer one `warp_fuse_tile_gpu` call allocates, at any
@@ -468,7 +471,10 @@ impl VramBudget {
 mod tests {
     use super::*;
     use crate::limits::describe_shortfalls;
-    use focusforge_core::params::Provenance;
+    use focusforge_core::algorithm::StackAlgorithm;
+    use focusforge_core::fuse::laplacian::Laplacian;
+    use focusforge_core::params::{ParamValue, ParamValues, Provenance};
+    use focusforge_core::tile::TilePlan;
 
     // --- DeviceBudget ---
 
@@ -610,36 +616,93 @@ mod tests {
 
     #[test]
     fn device_bytes_per_tile_at_fixture_scale() {
-        // 8 frames, 512x512, 3 spp, 5 levels, warped -- the geometry
-        // `budget_gpu.rs`'s serialization test drives.
-        let bytes = device_bytes_per_tile(8, 512, 512, 3, 5, true);
-        assert_eq!(bytes, 265_844_736);
+        // 512x512, 3 spp, 5 levels, warped -- the geometry `budget_gpu.rs`'s
+        // serialization and allocator tests drive.
+        let bytes = device_bytes_per_tile(512, 512, 3, 5, true);
+        assert_eq!(bytes, 53_098_496);
     }
 
     #[test]
     fn fixture_scale_in_flight_is_an_exact_count_at_least_two() {
-        let bytes = device_bytes_per_tile(8, 512, 512, 3, 5, true);
+        let bytes = device_bytes_per_tile(512, 512, 3, 5, true);
         let in_flight = tiles_in_flight_for_budget(bytes, DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT, 32);
-        assert_eq!(in_flight, 4);
+        assert_eq!(in_flight, 20);
         assert!(
             in_flight >= 2,
             "the GPU test needs a permit count to collapse"
         );
     }
 
+    /// Largest allocator-report delta over baseline measured for one 512x512
+    /// 3 spp warped tile (RTX 5070 Ti, wgpu 29.0.4), at 8, 32 and 128 frames.
+    const MEASURED_TILE_PEAK_BYTES: u64 = 29_007_120;
+
     #[test]
-    fn device_bytes_per_tile_at_reference_scale_exceeds_the_default_ceiling() {
-        // 61 frames, same per-tile geometry.
-        let bytes = device_bytes_per_tile(61, 512, 512, 3, 5, true);
-        assert_eq!(bytes, 1_876_637_696);
-        assert!(bytes > DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT);
+    fn device_bytes_per_tile_is_about_twice_the_measured_peak() {
+        let bytes = device_bytes_per_tile(512, 512, 3, 5, true);
+        let tenths = bytes * 10 / MEASURED_TILE_PEAK_BYTES;
+        assert!(
+            (18..=22).contains(&tenths),
+            "{bytes} B is {tenths}/10 x the measured peak"
+        );
     }
 
     #[test]
-    fn reference_scale_floors_at_one_never_zero() {
-        let bytes = device_bytes_per_tile(61, 512, 512, 3, 5, true);
-        let in_flight = tiles_in_flight_for_budget(bytes, DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT, 32);
-        assert_eq!(in_flight, 1);
+    fn device_bytes_per_tile_scales_with_the_rect() {
+        assert_eq!(device_bytes_per_tile(704, 704, 3, 5, true), 100_389_344);
+        assert_eq!(device_bytes_per_tile(300, 187, 3, 5, true), 11_383_524);
+        assert_eq!(device_bytes_per_tile(512, 512, 3, 5, false), 43_836_416);
+    }
+
+    #[test]
+    fn a_tile_above_the_budget_names_its_bytes_and_the_host_path() {
+        assert_eq!(
+            tile_shortfall_message(512, 256, 53_098_496, 53_098_496),
+            None
+        );
+        let message = tile_shortfall_message(512, 256, 53_098_497, 53_098_496)
+            .expect("one byte over the budget is a shortfall");
+        assert_eq!(
+            message,
+            "one 512x256 tile needs 53098497 B on the device, above the device budget of \
+             53098496 B; continuing on the CPU path"
+        );
+    }
+
+    /// The 576 px read-rect size and the `--max-vram` value (55 MB) the
+    /// device-peak and device-loss CLI tests run with on the 512x512 fixture
+    /// at five levels.
+    #[test]
+    fn the_cli_one_tile_cap_covers_the_asked_rect_and_stays_below_two_planned_tiles() {
+        const TILE_SIZE: u32 = 576;
+        const CAP: u64 = 55_000_000;
+        const LEVELS: i64 = 5;
+
+        let mut cfg = ParamValues::new();
+        cfg.insert("levels".to_string(), ParamValue::Int(LEVELS));
+        let support = Laplacian.tile_support(&cfg);
+        let plan = TilePlan::new(512, 512, TILE_SIZE, support).expect("the fixture plans");
+        assert!(plan.len() > 1, "{} tiles", plan.len());
+
+        // The rect `pipeline::run` asks about; a warped run costs more than
+        // an unwarped one, so the warped figure is the one the cap covers.
+        let asked = TILE_SIZE.min(512);
+        let asked_bytes = device_bytes_per_tile(asked, asked, 3, LEVELS as u32, true);
+        assert!(asked_bytes <= CAP, "{asked_bytes} B above the cap");
+
+        // The cheapest planned read rect is an unwarped one; two of them
+        // must not fit.
+        let cheapest = plan
+            .tiles()
+            .iter()
+            .map(|t| {
+                let read = t.read();
+                device_bytes_per_tile(read.width, read.height, 3, LEVELS as u32, false)
+            })
+            .min()
+            .expect("the plan has tiles");
+        assert!(CAP < 2 * cheapest, "{CAP} B admits two {cheapest} B tiles");
+        assert_eq!(tiles_in_flight_for_budget(cheapest, CAP, 32), 1);
     }
 
     #[test]
@@ -812,51 +875,5 @@ mod tests {
         // The second interval is measured on its own, not as the max over
         // both.
         assert_eq!(budget.peak_in_flight(), 1);
-    }
-
-    /// Pins the `--max-vram` ceiling `crates/cli/tests/cli_gpu.rs`'s
-    /// `device_peak_in_flight_is_scoped_to_its_own_group` uses (`64MiB`),
-    /// against the *ragged* read rects a 512x512 frame plans into at
-    /// `--tile-size 256 --set levels=4` (176/256/208 px per axis via
-    /// `axis_partition`, an 80 px margin at 4 levels): every combination of
-    /// those three sizes on each axis is one tile's read rect in that plan's
-    /// 5x5 grid. `spp = 3`, `levels = 4`, `warped = false` (the CLI test runs
-    /// `--no-align`, so the warp flag is false).
-    #[test]
-    fn max_vram_ceiling_floors_the_heavy_group_at_one_tile_for_every_ragged_rect() {
-        const CEILING: u64 = 64 << 20; // the literal `--max-vram` value the CLI test passes
-        const RECT_SIZES: [u32; 3] = [176, 256, 208];
-        const SPP: u32 = 3;
-        const LEVELS: u32 = 4;
-        const CAP: usize = 32;
-
-        // The 2-frame group's most expensive rect still admits at least two
-        // tiles at once -- not a running max, an actual concurrency.
-        let mut max_bytes_2 = 0u64;
-        let mut min_bytes_16 = u64::MAX;
-        for &w in &RECT_SIZES {
-            for &h in &RECT_SIZES {
-                let bytes_2 = device_bytes_per_tile(2, w, h, SPP, LEVELS, false);
-                let bytes_16 = device_bytes_per_tile(16, w, h, SPP, LEVELS, false);
-                max_bytes_2 = max_bytes_2.max(bytes_2);
-                min_bytes_16 = min_bytes_16.min(bytes_16);
-                // Every ragged rect floors the 16-frame group at exactly one
-                // tile -- including its cheapest rect, the tightest case.
-                assert_eq!(
-                    tiles_in_flight_for_budget(bytes_16, CEILING, CAP),
-                    1,
-                    "w={w} h={h} bytes_16={bytes_16} must floor at one tile"
-                );
-            }
-        }
-        assert!(
-            tiles_in_flight_for_budget(max_bytes_2, CEILING, CAP) >= 2,
-            "the 2-frame group's heaviest rect ({max_bytes_2} bytes) must still admit \
-             two or more tiles under a {CEILING}-byte ceiling"
-        );
-        // Both bounds hold with margin, not by a hair: sanity-check the
-        // window this literal ceiling sits inside.
-        assert!(2 * max_bytes_2 <= CEILING);
-        assert!(CEILING < 2 * min_bytes_16);
     }
 }

@@ -10,8 +10,9 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use focusforge_core::algorithm::{AlgorithmError, TileReader};
 use focusforge_core::align::Transform;
@@ -20,6 +21,7 @@ use focusforge_core::io::TiffStack;
 use focusforge_core::params::StackContext;
 use focusforge_core::tile::{NoopPreprocess, Rect, TileConsumer, TileJob, TileScheduler};
 use focusforge_gpu::budget::device_bytes_per_tile;
+use focusforge_gpu::device::SharedDevice;
 use focusforge_gpu::harness::{GpuBackend, gpu_backend};
 
 use crate::common;
@@ -126,13 +128,45 @@ fn tiny_budget_serializes_tiles_and_keeps_the_result() {
     let tiny_backend = GpuBackend::with_max_device_bytes(1).expect("tiny gpu backend");
     let tiny_result = run_plan(&tiny_backend, "tiny");
 
-    // The fixture-scale per-tile byte cost (8 frames, 512x512x3, warped).
-    let bytes = device_bytes_per_tile(8, 512, 512, 3, LEVELS, true);
+    // The fixture-scale per-tile byte cost (512x512x3, warped).
+    let bytes = device_bytes_per_tile(512, 512, 3, LEVELS, true);
     assert_eq!(tiny_backend.budget().peak_in_flight(), 1);
     assert_eq!(tiny_backend.budget().limit_for(bytes), 1);
     assert_eq!(
         default_result, tiny_result,
         "a tiny device budget must not change a single tile's composite samples or Z-Map"
+    );
+}
+
+/// A device budget exactly one tile's model bytes asks no fallback; one byte
+/// less names the tile's bytes and the CPU path; identity transforms cost less
+/// than warped ones.
+#[test]
+fn a_tile_above_the_device_budget_reports_a_shortfall() {
+    if focusforge_gpu::device::shared_device_or_skip().is_none() {
+        return;
+    }
+    let transforms = non_identity_transforms(2);
+    let bytes = device_bytes_per_tile(512, 512, 3, LEVELS, true);
+
+    let at_budget = GpuBackend::with_max_device_bytes(bytes).expect("gpu backend");
+    assert_eq!(
+        at_budget.tile_budget_shortfall(512, 512, 3, LEVELS, &transforms),
+        None
+    );
+
+    let below = GpuBackend::with_max_device_bytes(bytes - 1).expect("gpu backend");
+    let message = below
+        .tile_budget_shortfall(512, 512, 3, LEVELS, &transforms)
+        .expect("a budget one byte short is a shortfall");
+    assert!(message.contains(&format!("needs {bytes} B")), "{message}");
+    assert!(message.contains("CPU path"), "{message}");
+
+    // Identity transforms cost less than warped ones.
+    let identity = vec![Transform::identity(); 2];
+    assert_eq!(
+        below.tile_budget_shortfall(512, 512, 3, LEVELS, &identity),
+        None
     );
 }
 
@@ -186,15 +220,71 @@ fn allocator_report_matches_the_prediction() {
         width,
         height,
     };
-    let predicted = device_bytes_per_tile(frame_count, width, height, spp, LEVELS, true);
+    let predicted = device_bytes_per_tile(width, height, spp, LEVELS, true);
 
+    let (sample, output) = sample_allocator(shared, || {
+        backend
+            .warp_fuse_tile(&stack, (width, height), &transforms, rect, spp, LEVELS)
+            .expect("warp_fuse_tile must succeed")
+    });
+    assert_eq!(output.zmap.len(), (width * height) as usize);
+
+    match sample {
+        Some(sample) => {
+            println!(
+                "allocator report (device-wide, concurrent tests share this device -- a \
+                 measurement, not a bound): baseline={} peak={} delta={} predicted={}",
+                sample.baseline,
+                sample.peak,
+                sample.peak.saturating_sub(sample.baseline),
+                predicted
+            );
+        }
+        None => {
+            println!(
+                "allocator report unavailable: Device::generate_allocator_report() returned \
+                 None on this backend (skip reason: the adapter uses the portability path, \
+                 not native Vulkan)"
+            );
+        }
+    }
+}
+
+/// Serves frame `i` as frame `i % stack.len()`, so a stack of any length is
+/// backed by the same few frames on disk.
+struct CyclingReader<'a> {
+    stack: &'a TiffStack,
+}
+
+impl TileReader for CyclingReader<'_> {
+    fn read_tile_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        TileReader::read_tile_into(self.stack, frame % self.stack.len(), rect, out)
+    }
+}
+
+/// The device allocator's total before a run, its highest value seen while the
+/// run executed, and the run's wall time.
+struct AllocatorSample {
+    baseline: u64,
+    peak: u64,
+    wall: Duration,
+}
+
+/// Runs `run` on this thread while a background thread polls the allocator
+/// report, so a mid-run peak is not missed between the last dispatch and the
+/// tail readback. The sample is `None` when the backend has no allocator report.
+fn sample_allocator<T>(
+    shared: &'static SharedDevice,
+    run: impl FnOnce() -> T,
+) -> (Option<AllocatorSample>, T) {
     let baseline = shared.device().generate_allocator_report();
-
-    // A background thread samples the allocator report while the one
-    // dispatch runs synchronously on this thread, so a mid-tile peak isn't
-    // missed between the last dispatch and the tail readback.
-    let running = std::sync::Arc::new(AtomicBool::new(true));
-    let peak_seen = std::sync::Arc::new(AtomicU64::new(0));
+    let running = Arc::new(AtomicBool::new(true));
+    let peak_seen = Arc::new(AtomicU64::new(0));
     let sampler = {
         let running = running.clone();
         let peak_seen = peak_seen.clone();
@@ -208,35 +298,89 @@ fn allocator_report_matches_the_prediction() {
         })
     };
 
-    let output = backend
-        .warp_fuse_tile(&stack, (width, height), &transforms, rect, spp, LEVELS)
-        .expect("warp_fuse_tile must succeed");
-    assert_eq!(output.zmap.len(), (width * height) as usize);
+    let started = Instant::now();
+    let result = run();
+    let wall = started.elapsed();
 
     running.store(false, Ordering::SeqCst);
     sampler.join().expect("sampler thread must not panic");
     let after = shared.device().generate_allocator_report();
 
-    match (baseline, after) {
-        (Some(baseline), Some(after)) => {
-            let peak = peak_seen
+    let sample = baseline
+        .zip(after)
+        .map(|(baseline, after)| AllocatorSample {
+            baseline: baseline.total_allocated_bytes,
+            peak: peak_seen
                 .load(Ordering::SeqCst)
-                .max(after.total_allocated_bytes);
-            let delta = peak.saturating_sub(baseline.total_allocated_bytes);
-            println!(
-                "allocator report (device-wide, concurrent tests share this device -- a \
-                 measurement, not a bound): baseline={} peak={} delta={} predicted={}",
-                baseline.total_allocated_bytes, peak, delta, predicted
-            );
-        }
-        _ => {
+                .max(after.total_allocated_bytes),
+            wall,
+        });
+    (sample, result)
+}
+
+/// One 512x512 warped tile fused from 8, 32 and 128 frames (frame `i` read as
+/// frame `i % 8`). The growth over baseline stays within the model, which
+/// takes no frame count, and differs by under 4 MiB over the three runs: the
+/// allocator takes one 1.57 MB step whose frame count varies between runs. A
+/// device that stopped freeing per-frame buffers would grow by a plane or
+/// more per frame, over 100 MiB across the 120 extra frames. Figures are
+/// device-wide: run it alone (`--test-threads=1`).
+#[test]
+fn device_peak_is_flat_in_frame_count() {
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let backend = gpu_backend().expect("gpu backend");
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("open mantis-512 fixture");
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let reader = CyclingReader { stack: &stack };
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+
+    let predicted = device_bytes_per_tile(width, height, spp, LEVELS, true);
+    let mut deltas = Vec::new();
+    for frame_count in [8, 32, 128] {
+        let transforms = non_identity_transforms(frame_count);
+        let (sample, output) = sample_allocator(shared, || {
+            backend
+                .warp_fuse_tile(&reader, (width, height), &transforms, rect, spp, LEVELS)
+                .expect("warp_fuse_tile must succeed")
+        });
+        assert_eq!(output.zmap.len(), (width * height) as usize);
+        let Some(sample) = sample else {
             println!(
                 "allocator report unavailable: Device::generate_allocator_report() returned \
-                 None on this backend (skip reason: the adapter uses the portability path, \
-                 not native Vulkan)"
+                 None on this backend; the device peak cannot be measured"
             );
-        }
+            return;
+        };
+        let delta = sample.peak.saturating_sub(sample.baseline);
+        println!(
+            "frames={frame_count} baseline={} peak={} delta={delta} predicted={predicted} \
+             tile_wall_s={:.3}",
+            sample.baseline,
+            sample.peak,
+            sample.wall.as_secs_f64()
+        );
+        deltas.push(delta);
     }
+
+    let (min, max) = deltas
+        .iter()
+        .fold((u64::MAX, 0), |(min, max), &d| (min.min(d), max.max(d)));
+    assert!(
+        max - min < 4 << 20,
+        "the device peak over baseline grew with the frame count: {deltas:?}"
+    );
+    assert!(
+        max <= predicted,
+        "a tile peaks at {max} B over baseline, above the model's {predicted} B"
+    );
 }
 
 /// A reader no refused tile may ever reach.
@@ -365,5 +509,57 @@ fn identical_tiles_cost_identical_transfers_and_allocations() {
         readbacks,
         composite + 8 * pixels,
         "a tile reads back its packed composite and its Z-Map"
+    );
+}
+
+/// A coverage mask with no uncovered pixel selects nothing out, so it costs no
+/// eligibility upload: the tile moves the same bytes and creates the same
+/// buffers as one fused without masks, and its output is identical.
+#[test]
+fn an_all_true_mask_costs_no_upload() {
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    focusforge_core::timing::enable_trace_accounting();
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("open mantis-512 fixture");
+    let spp = stack.header(0).samples_per_pixel;
+    let frame_count = stack.len();
+    let rect = Rect {
+        x: 64,
+        y: 32,
+        width: 256,
+        height: 192,
+    };
+    let pipelines = focusforge_gpu::fuse::FusionPipelines::new();
+    let full = vec![Some(vec![true; (rect.width * rect.height) as usize]); frame_count];
+    let run = |coverage: &[Option<Vec<bool>>]| {
+        let before = focusforge_core::timing::timing_snapshot().expect("accounting is enabled");
+        let output = focusforge_gpu::fuse::fuse_tile_gpu(
+            shared,
+            &stack,
+            &pipelines,
+            frame_count,
+            rect,
+            spp,
+            LEVELS,
+            coverage,
+        )
+        .expect("fuse_tile_gpu must succeed");
+        let after = focusforge_core::timing::timing_snapshot().expect("accounting is enabled");
+        let cost = (
+            after.upload_bytes - before.upload_bytes,
+            after.buffer_creations - before.buffer_creations,
+        );
+        (output, cost)
+    };
+
+    let (unmasked, unmasked_cost) = run(&[]);
+    let (masked, masked_cost) = run(&full);
+
+    assert_eq!(masked.tile.samples, unmasked.tile.samples);
+    assert_eq!(masked.zmap, unmasked.zmap);
+    assert_eq!(
+        masked_cost, unmasked_cost,
+        "(upload_bytes, buffer_creations) of an all-true mask must equal the unmasked tile's"
     );
 }

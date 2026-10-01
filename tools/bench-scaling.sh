@@ -11,10 +11,12 @@
 #   Budget axis: --max-host-memory (CPU) / --max-vram (GPU) swept to 6
 #              points that are exact multiples of one tile's accounted host
 #              bytes (a probe run's accounted_bytes_in_flight / in_flight_limit)
-#              / device_bytes_per_tile (GPU: 254,661,632 B at 8 frames).
-#              The byte VALUES stay fixed across the frame axis; a host
-#              tile's bytes do not depend on frame count, so the CPU
-#              in-flight limit must be the same at 8, 16 and 32 frames.
+#              / device_bytes_per_tile (GPU: 53,098,496 B for a 512x512
+#              warped tile at any frame count).
+#              The byte VALUES stay fixed across the frame axis; neither a
+#              host tile's bytes nor a device tile's depend on frame count,
+#              so the CPU and GPU in-flight limits must be the same at 8, 16
+#              and 32 frames.
 #   Frame axis: 8 (the real fixture), 16, 32 frames -- 16/32 built by
 #              duplicating the 8 real fixtures/mantis-512 frames cyclically
 #              into $OUT/frames-{16,32}/frames/ (bytewise-sorted names,
@@ -106,7 +108,7 @@ done
 
 echo "Running GPU grid (6 budget points x 3 frame counts) ..." >&2
 for target in 1 2 4 8 16 32; do
-  bytes=$((254661632 * target))
+  bytes=$((53098496 * target))
   for frames in 8 16 32; do
     dir="$(dir_for "$frames")"
     run "gpu-${target}-f${frames}" "$dir" --max-vram "${bytes}"

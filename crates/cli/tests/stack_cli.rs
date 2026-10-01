@@ -676,16 +676,15 @@ fn report_json_has_every_field() {
         "peak_align_workers",
         "align_accounted_bytes",
         "device_peak_in_flight",
+        "gpu_fallback",
     ] {
         assert!(report.get(key).is_some(), "missing key {key:?} in {report}");
     }
     // `dummy-stack` never resolves a backend, so this is the CPU half of the
-    // check even on a `gpu` build: the field must be exactly `null`.
-    assert_eq!(
-        report["device_peak_in_flight"],
-        serde_json::Value::Null,
-        "report: {report}"
-    );
+    // check even on a `gpu` build: both fields must be exactly `null`.
+    for key in ["device_peak_in_flight", "gpu_fallback"] {
+        assert_eq!(report[key], serde_json::Value::Null, "report: {report}");
+    }
     let params = report["params"].as_array().expect("params array");
     assert!(!params.is_empty());
     for p in params {

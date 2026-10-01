@@ -145,6 +145,10 @@ pub struct FuseReport {
     pub accounted_bytes_in_flight: u64,
     pub budget_provenance: Provenance,
     pub backed_off: bool,
+    /// Why the run fused on the host although the request carried a backend:
+    /// the backend's own account of the tile that did not fit its device.
+    /// `None` when the backend ran, or the request carried none.
+    pub gpu_fallback: Option<String>,
     pub output_width: u32,
     pub output_height: u32,
     pub crop: Option<Rect>,
@@ -506,7 +510,22 @@ pub fn run(
     };
     let warping_reader = WarpingReader::new(frame_reader, (width, height), spp, transforms.clone());
 
-    let reader: &dyn TileReader = match &request.backend {
+    // The scheduler's own per-tile rect: the largest read rect it plans.
+    let gpu_fallback = request.backend.and_then(|b| {
+        b.tile_budget_shortfall(
+            options.tile_size.min(width),
+            options.tile_size.min(height),
+            spp,
+            support.decimation_levels,
+            &transforms,
+        )
+    });
+    if let Some(message) = &gpu_fallback {
+        observer.notice(message);
+    }
+    let backend = request.backend.filter(|_| gpu_fallback.is_none());
+
+    let reader: &dyn TileReader = match &backend {
         Some(_) => frame_reader,
         None => &warping_reader,
     };
@@ -532,8 +551,7 @@ pub fn run(
     let composite_description = description
         .clone()
         .unwrap_or_else(crate::io::TiffSpec::default_description);
-    let backend_id = request
-        .backend
+    let backend_id = backend
         .map(|b| b.info().to_string())
         .unwrap_or_else(|| "cpu".to_string());
 
@@ -640,7 +658,7 @@ pub fn run(
     );
     observer.stage(RunStage::Fuse);
 
-    let backend_consumer = request.backend.map(|b| {
+    let backend_consumer = backend.map(|b| {
         BackendFusionConsumer::new(
             b,
             frame_reader,
@@ -809,6 +827,7 @@ pub fn run(
         accounted_bytes_in_flight: in_flight_limit as u64 * scheduler.bytes_per_tile(),
         budget_provenance: scheduler.budget().provenance(),
         backed_off: scheduler.final_in_flight_limit() < in_flight_limit,
+        gpu_fallback,
         output_width: applied_crop.map(|r| r.width).unwrap_or(width),
         output_height: applied_crop.map(|r| r.height).unwrap_or(height),
         crop: applied_crop,

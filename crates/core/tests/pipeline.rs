@@ -915,9 +915,13 @@ fn the_host_cap_sets_the_alignment_workers_but_not_the_alignment() {
 // ---------------------------------------------------------------------
 
 /// A host-fusion [`TileBackend`] that accepts read rects up to `cap` pixels
-/// on a side.
+/// on a side. With a `shortfall` it reports that message for every tile it is
+/// asked about and fails any fuse call, so a run that reaches it is a bug;
+/// `asked` records the rects it was asked about.
 struct CappedBackend {
     cap: u32,
+    shortfall: Option<String>,
+    asked: Mutex<Vec<(u32, u32)>>,
 }
 
 impl TileBackend for CappedBackend {
@@ -932,6 +936,18 @@ impl TileBackend for CappedBackend {
 
     fn max_tile_size(&self, _samples_per_pixel: u32) -> u32 {
         self.cap
+    }
+
+    fn tile_budget_shortfall(
+        &self,
+        width: u32,
+        height: u32,
+        _samples_per_pixel: u32,
+        _levels: u32,
+        _transforms: &[Transform],
+    ) -> Option<String> {
+        self.asked.lock().unwrap().push((width, height));
+        self.shortfall.clone()
     }
 
     fn self_check(
@@ -978,6 +994,10 @@ impl TileBackend for CappedBackend {
         levels: u32,
     ) -> Result<TileOutput, AlgorithmError> {
         assert!(
+            self.shortfall.is_none(),
+            "a backend that reports a shortfall must never fuse"
+        );
+        assert!(
             rect.width <= self.cap && rect.height <= self.cap,
             "a read rect of {}x{} exceeds the backend's cap of {}",
             rect.width,
@@ -1002,8 +1022,28 @@ impl TileBackend for CappedBackend {
     }
 }
 
+fn leaked_backend(cap: u32, shortfall: Option<&str>) -> &'static CappedBackend {
+    Box::leak(Box::new(CappedBackend {
+        cap,
+        shortfall: shortfall.map(str::to_string),
+        asked: Mutex::new(Vec::new()),
+    }))
+}
+
 fn capped_backend(cap: u32) -> &'static dyn TileBackend {
-    Box::leak(Box::new(CappedBackend { cap }))
+    leaked_backend(cap, None)
+}
+
+/// Collects every notice a run raises.
+#[derive(Default)]
+struct NoticeObserver {
+    notices: Mutex<Vec<String>>,
+}
+
+impl StageObserver for NoticeObserver {
+    fn notice(&self, message: &str) {
+        self.notices.lock().unwrap().push(message.to_string());
+    }
 }
 
 /// A held run's report with the bytes of the composite and Z-Map it wrote.
@@ -1020,6 +1060,16 @@ fn held_run(
     levels: i64,
     backend: Option<&'static dyn TileBackend>,
 ) -> Result<HeldRun, PipelineError> {
+    held_run_observed(label, tile_size, levels, backend, &NoopObserver)
+}
+
+fn held_run_observed(
+    label: &str,
+    tile_size: u32,
+    levels: i64,
+    backend: Option<&'static dyn TileBackend>,
+    observer: &dyn StageObserver,
+) -> Result<HeldRun, PipelineError> {
     let mut explicit = ParamValues::new();
     explicit.insert("levels".to_string(), ParamValue::Int(levels));
     let mut request = base_request(label, mantis_frames(3), explicit);
@@ -1027,7 +1077,7 @@ fn held_run(
     request.tile_size = Some(tile_size);
     request.backend = backend;
     let FuseOutcome::Completed(report) =
-        focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)?
+        focusforge_core::pipeline::run(&request, observer, JobControl::new(), None)?
     else {
         panic!("expected a completed run");
     };
@@ -1085,4 +1135,32 @@ fn a_cap_below_the_levels_minimum_fails_with_no_interior() {
         ),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+fn gpu_fallback_runs_on_the_host_and_reports_why() {
+    let message = "one 256x256 tile needs more than the device holds; continuing on the CPU path";
+    let plain = held_run("fallback_plain", 256, 3, None).expect("a backend-free run at 256");
+    assert!(plain.report.gpu_fallback.is_none());
+
+    let short = leaked_backend(u32::MAX, Some(message));
+    let observer = NoticeObserver::default();
+    let run = held_run_observed("fallback_256", 256, 3, Some(short), &observer)
+        .expect("a run the backend cannot hold falls back to the host");
+    assert_eq!(run.report.gpu_fallback.as_deref(), Some(message));
+    assert_eq!(*observer.notices.lock().unwrap(), [message]);
+    assert!(run.report.tiles > 1, "ragged tiles: {}", run.report.tiles);
+    assert!(run.composite == plain.composite, "composite on the host");
+    assert!(run.zmap == plain.zmap, "Z-Map on the host");
+    assert_eq!(*short.asked.lock().unwrap(), [(256, 256)]);
+
+    let wide = leaked_backend(u32::MAX, Some(message));
+    held_run("fallback_704", 704, 3, Some(wide)).expect("a 704 tile on a 512 px frame");
+    assert_eq!(*wide.asked.lock().unwrap(), [(512, 512)]);
+
+    let fits = leaked_backend(u32::MAX, None);
+    let run = held_run("fallback_fits", 256, 3, Some(fits)).expect("a backend that fits");
+    assert!(run.report.gpu_fallback.is_none());
+    assert_eq!(*fits.asked.lock().unwrap(), [(256, 256)]);
+    assert!(run.composite == plain.composite);
 }

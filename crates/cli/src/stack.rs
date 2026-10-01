@@ -101,6 +101,11 @@ pub struct StackReport {
     /// this group (per group, never a running maximum). `0` when no tile
     /// went through the device; `null` on the CPU path.
     pub device_peak_in_flight: Option<usize>,
+    /// Why the run fused on the host although a device was available: the
+    /// message naming the tile that did not fit the device budget. `null`
+    /// when the device ran, or no device was in use. On a fallback `backend`
+    /// is `cpu` and the three device fields above are `null`.
+    pub gpu_fallback: Option<String>,
     /// `true` only when the alignment came out of the stage cache;
     /// `false` for a computed one, a `--resume` ledger-peeked one, or a
     /// `--no-align` run.
@@ -1293,6 +1298,13 @@ fn build_stack_report(
     report: focusforge_core::pipeline::FuseReport,
 ) -> StackReport {
     let outputs = vec![sealed_path(&report)];
+    // A run that fell back never touched the device: its budget and peak
+    // describe a path that did not run.
+    let (backend_id, device_budget_report, device_peak) = if report.gpu_fallback.is_some() {
+        ("cpu".to_string(), None, None)
+    } else {
+        (backend_id, device_budget_report, device_peak)
+    };
     let align = report.align.map(|a| {
         let failure_count = a.alignment.failure_count();
         let reference = a.alignment.reference;
@@ -1364,6 +1376,7 @@ fn build_stack_report(
         max_device_bytes_in_flight: device_budget_report.as_ref().map(|r| r.max_device_bytes),
         device_budget_provenance: device_budget_report.as_ref().map(|r| r.provenance),
         device_peak_in_flight: device_peak.map(|p| p.peak_in_flight()),
+        gpu_fallback: report.gpu_fallback,
         align_cached: report.align_cached,
         stages: report.stages,
         align_source: report.align_source,
@@ -1595,6 +1608,7 @@ mod tests {
             max_device_bytes_in_flight: None,
             device_budget_provenance: None,
             device_peak_in_flight: None,
+            gpu_fallback: None,
             align_cached: false,
             stages: focusforge_core::timing::StageTimings {
                 setup: Some(0.012),
