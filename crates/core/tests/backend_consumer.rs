@@ -416,17 +416,18 @@ impl TileBackend for LosingBackend {
         }
         let warping = WarpingReader::new(reader, frame, samples_per_pixel, transforms.to_vec());
         let mut tiles = Vec::with_capacity(transforms.len());
+        let mut coverage = Vec::with_capacity(transforms.len());
         for i in 0..transforms.len() {
             let mut samples =
                 vec![0u16; rect.width as usize * rect.height as usize * samples_per_pixel as usize];
-            warping.read_tile_into(i, rect, &mut samples)?;
+            coverage.push(warping.read_tile_coverage_into(i, rect, &mut samples)?);
             tiles.push(Tile {
                 rect,
                 samples_per_pixel,
                 samples,
             });
         }
-        let ctx = TileCtx::new(rect, &tiles);
+        let ctx = TileCtx::new(rect, &tiles).with_coverage(&coverage);
         let mut cfg = ParamValues::new();
         cfg.insert("levels".to_string(), ParamValue::Int(levels as i64));
         Laplacian.fuse(&ctx, &cfg)
@@ -507,25 +508,9 @@ fn device_loss_finishes_the_run_on_the_host() {
         "the plan must hold more tiles than the backend serves, got {planned}"
     );
 
-    let (fallback_tiles, partially_covered) = {
+    let fallback_tiles = {
         let scheduler =
             TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
-        // Tiles with a partly covered footprint never reach the backend, so
-        // they count as fallbacks only when they come after the loss.
-        let partially_covered = scheduler
-            .plan()
-            .tiles()
-            .iter()
-            .filter(|tile| {
-                transforms.iter().any(|t| {
-                    *t != Transform::identity()
-                        && !matches!(
-                            t.source_footprint(tile.read(), (width, height)),
-                            Ok(SourceFootprint::Covers { clamped: false, .. })
-                        )
-                })
-            })
-            .count();
         let sink =
             FusionConsumer::create(&Laplacian, values.clone(), &fallback_path, None, geometry)
                 .expect("create must succeed");
@@ -545,15 +530,13 @@ fn device_loss_finishes_the_run_on_the_host() {
         let fallback_tiles = consumer.fallback_tiles();
         drop(consumer);
         sink.finish().expect("finish must succeed");
-        (fallback_tiles, partially_covered)
+        fallback_tiles
     };
 
-    let after_loss = planned - HEALTHY_TILES;
-    assert!(
-        (after_loss - partially_covered..=after_loss).contains(&fallback_tiles),
-        "every tile past the two the backend served must have been read on the host \
-         ({fallback_tiles} fallbacks, {after_loss} tiles after the loss, \
-         {partially_covered} of them routed to the host regardless)"
+    assert_eq!(
+        fallback_tiles,
+        planned - HEALTHY_TILES,
+        "every tile past the two the backend served must have been read on the host"
     );
     assert_eq!(
         std::fs::read(&host_path).expect("read host composite"),
@@ -562,11 +545,10 @@ fn device_loss_finishes_the_run_on_the_host() {
     );
 }
 
-/// A tile whose warped footprint reaches past a frame edge is fused on the
-/// host with its coverage mask; the backend only ever sees fully covered
-/// tiles, and that routing is not a device-loss fallback.
+/// A tile whose warped footprint reaches past a frame edge still goes to the
+/// backend: none is read on the host while the device is healthy.
 #[test]
-fn tiles_with_a_clamped_footprint_are_fused_on_the_host() {
+fn tiles_with_a_clamped_footprint_reach_the_backend() {
     let stack = open_stack();
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
@@ -633,34 +615,27 @@ fn tiles_with_a_clamped_footprint_are_fused_on_the_host() {
     assert_eq!(
         consumer.fallback_tiles(),
         0,
-        "host routing is not a device loss"
+        "a healthy device leaves no tile to the host"
     );
     drop(consumer);
     sink.finish().expect("finish must succeed");
 
     let rects = backend.rects.lock().unwrap();
-    assert!(
-        !rects.is_empty() && rects.len() < planned,
-        "some tiles reach the backend and some do not: {} of {planned}",
-        rects.len()
+    assert_eq!(
+        rects.len(),
+        planned,
+        "every planned tile reaches the backend"
     );
-    for rect in rects.iter() {
-        for t in &transforms {
-            if *t == Transform::identity() {
-                continue;
-            }
-            assert!(
-                matches!(
-                    t.source_footprint(*rect, (width, height)),
-                    Ok(SourceFootprint::Covers { clamped: false, .. })
-                ),
-                "the backend was handed a partially covered tile {rect:?}"
-            );
-        }
-    }
+    assert!(
+        rects.iter().any(|rect| matches!(
+            transforms[3].source_footprint(*rect, (width, height)),
+            Ok(SourceFootprint::Covers { clamped: true, .. } | SourceFootprint::Outside)
+        )),
+        "the plan must include a tile whose footprint reaches past the source frame"
+    );
     assert_eq!(
         std::fs::read(&host_path).unwrap(),
         std::fs::read(&routed_path).unwrap(),
-        "host-routed edge tiles must reproduce the pure host run"
+        "a coverage-aware backend must reproduce the pure host run"
     );
 }

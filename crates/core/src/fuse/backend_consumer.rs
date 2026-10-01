@@ -12,10 +12,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::algorithm::{AlgorithmError, TileCtx, TileReader};
-use crate::align::{SourceFootprint, Transform, WarpingReader};
+use crate::align::{Transform, WarpingReader};
 use crate::fuse::FusionConsumer;
 use crate::gpu::TileBackend;
-use crate::tile::{Rect, Tile, TileConsumer, TileJob};
+use crate::tile::{Tile, TileConsumer, TileJob};
 
 /// Joins a [`TileBackend`] to a [`FusionConsumer`] sink: `consume` calls
 /// [`TileBackend::warp_fuse_tile`] over the **raw** `reader` (never a
@@ -24,9 +24,7 @@ use crate::tile::{Rect, Tile, TileConsumer, TileJob};
 ///
 /// A tile whose backend reports its device lost is finished on the host
 /// instead, through [`WarpingReader`] and the sink's own
-/// [`TileConsumer::consume`]. So is a tile where a non-identity frame's
-/// footprint reaches past the source frame, because the backend keeps no
-/// coverage; only the first case counts in [`Self::fallback_tiles`].
+/// [`TileConsumer::consume`], and counts in [`Self::fallback_tiles`].
 pub struct BackendFusionConsumer<'a> {
     backend: &'a dyn TileBackend,
     reader: &'a dyn TileReader,
@@ -76,9 +74,8 @@ impl<'a> BackendFusionConsumer<'a> {
     /// never had a backend at all.
     ///
     /// Frames are read through [`TileReader::read_tile_coverage_into`], so
-    /// the sink sees the coverage a warp leaves. `device_lost` selects whether
-    /// the tile counts toward [`Self::fallback_tiles`].
-    fn consume_on_host(&self, job: &TileJob<'_>, device_lost: bool) -> Result<(), AlgorithmError> {
+    /// the sink sees the coverage a warp leaves.
+    fn consume_on_host(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
         let rect = job.read_rect();
         let len = rect.width as usize * rect.height as usize * self.samples_per_pixel as usize;
         let warping = WarpingReader::new(
@@ -98,35 +95,17 @@ impl<'a> BackendFusionConsumer<'a> {
                 samples,
             });
         }
-        if device_lost {
-            self.fallback_tiles.fetch_add(1, Ordering::Relaxed);
-        }
+        self.fallback_tiles.fetch_add(1, Ordering::Relaxed);
         let ctx = TileCtx::new(rect, &tiles).with_coverage(&coverage);
         self.sink
             .consume(&TileJob::new(job.tile(), ctx, job.scratch()))
-    }
-
-    /// Whether a warped frame reaches past the source frame anywhere under
-    /// `rect`. The device warp keeps no coverage, so such a tile is fused on
-    /// the host. A footprint that cannot be bounded counts as reaching past.
-    fn partially_covered(&self, rect: Rect) -> bool {
-        self.transforms.iter().any(|t| {
-            *t != Transform::identity()
-                && !matches!(
-                    t.source_footprint(rect, self.frame),
-                    Ok(SourceFootprint::Covers { clamped: false, .. })
-                )
-        })
     }
 }
 
 impl TileConsumer for BackendFusionConsumer<'_> {
     fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
         if self.backend.device_lost() {
-            return self.consume_on_host(job, true);
-        }
-        if self.partially_covered(job.read_rect()) {
-            return self.consume_on_host(job, false);
+            return self.consume_on_host(job);
         }
         let output = match self.backend.warp_fuse_tile(
             self.reader,
@@ -144,7 +123,7 @@ impl TileConsumer for BackendFusionConsumer<'_> {
             // and propagates.
             Err(err) => {
                 if self.backend.device_lost() {
-                    return self.consume_on_host(job, true);
+                    return self.consume_on_host(job);
                 }
                 return Err(err);
             }

@@ -11,7 +11,7 @@ use focusforge_core::align::Transform;
 use focusforge_core::tile::{Rect, Tile};
 
 use crate::device::SharedDevice;
-use crate::fuse::{FusionPipelines, GpuPlane, fuse_planes_gpu, plane_from_packed};
+use crate::fuse::{FrameSource, FusionPipelines, fuse_planes_gpu, plane_from_packed};
 use crate::transfer::upload_tile;
 use crate::warp::{WarpPipelines, warp_tile_dispatch};
 
@@ -23,6 +23,9 @@ use crate::warp::{WarpPipelines, warp_tile_dispatch};
 /// already carries. An identity entry is the identical short-circuit "read
 /// `rect` directly" -- no dispatch, just an upload and a
 /// `plane_from_packed` join, exactly the same join a warped frame gets.
+///
+/// A warped frame with uncovered pixels hands its coverage mask to fusion,
+/// which excludes it where the Laplacian reach touches those pixels.
 #[allow(clippy::too_many_arguments)]
 pub fn warp_fuse_tile_gpu(
     shared: &SharedDevice,
@@ -39,9 +42,9 @@ pub fn warp_fuse_tile_gpu(
     let queue = shared.queue();
     let frame_count = transforms.len();
 
-    let mut source = |i: usize| -> Result<GpuPlane, AlgorithmError> {
+    let mut source = |i: usize| -> Result<FrameSource, AlgorithmError> {
         let t = &transforms[i];
-        let packed = if *t == Transform::identity() {
+        let (packed, covered) = if *t == Transform::identity() {
             let mut samples =
                 vec![0u16; rect.width as usize * rect.height as usize * samples_per_pixel as usize];
             reader.read_tile_into(i, rect, &mut samples)?;
@@ -50,9 +53,9 @@ pub fn warp_fuse_tile_gpu(
                 samples_per_pixel,
                 samples,
             };
-            upload_tile(device, queue, &tile)
+            (upload_tile(device, queue, &tile), None)
         } else {
-            let (buffer, _covered) = warp_tile_dispatch(
+            let (buffer, covered) = warp_tile_dispatch(
                 shared,
                 warp_pipelines,
                 reader,
@@ -66,9 +69,9 @@ pub fn warp_fuse_tile_gpu(
                 algorithm: "warp".to_string(),
                 detail: source.to_string(),
             })?;
-            buffer
+            (buffer, covered.contains(&false).then_some(covered))
         };
-        Ok(plane_from_packed(
+        let plane = plane_from_packed(
             device,
             queue,
             fuse_pipelines,
@@ -76,7 +79,8 @@ pub fn warp_fuse_tile_gpu(
             rect.width,
             rect.height,
             samples_per_pixel,
-        ))
+        );
+        Ok((plane, covered))
     };
 
     fuse_planes_gpu(

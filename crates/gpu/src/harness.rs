@@ -260,6 +260,7 @@ impl TileBackend for GpuBackend {
             rect,
             samples_per_pixel,
             levels,
+            &[],
         )
     }
 

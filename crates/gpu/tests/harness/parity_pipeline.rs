@@ -1040,16 +1040,19 @@ fn assert_zmap_exact_or_near_tie(
 /// `backend` is a parameter so the same comparison runs at two device
 /// budgets ([`gpu_stack_matches_cpu_stack_at_probed_budget`],
 /// [`gpu_stack_matches_cpu_stack_at_a_forced_one_tile_budget`]).
-fn assert_gpu_matches_cpu_stack(label: &str, backend: &dyn TileBackend) {
+fn assert_gpu_matches_cpu_stack(
+    label: &str,
+    backend: &dyn TileBackend,
+    transforms: Vec<Transform>,
+) -> Vec<u16> {
     let stack = open_stack();
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
     let frame_count = stack.len();
-    let transforms = non_identity_transforms(frame_count);
 
     let cpu = run_cpu(&format!("{label}_composite"), transforms.clone());
     let Some(gpu) = run_gpu(&format!("{label}_composite"), transforms.clone(), backend) else {
-        return;
+        return Vec::new();
     };
 
     let (cpu_samples, cw, ch, cspp) = read_composite(&cpu.composite_path);
@@ -1285,6 +1288,7 @@ fn assert_gpu_matches_cpu_stack(label: &str, backend: &dyn TileBackend) {
         "whole-pipeline composite parity exceeded 1 LSB at a pixel that is neither a proven \
          near-tie nor explained by warp-noise propagation: worst={worst} at index {worst_index}"
     );
+    gpu_zmap
 }
 
 #[test]
@@ -1293,7 +1297,8 @@ fn gpu_stack_matches_cpu_stack_at_probed_budget() {
         return;
     }
     let backend = gpu_backend().expect("gpu backend");
-    assert_gpu_matches_cpu_stack("probed_budget", backend);
+    let transforms = non_identity_transforms(open_stack().len());
+    assert_gpu_matches_cpu_stack("probed_budget", backend, transforms);
 }
 
 /// The same comparison, forced onto a one-tile-in-flight `GpuBackend`
@@ -1306,7 +1311,65 @@ fn gpu_stack_matches_cpu_stack_at_a_forced_one_tile_budget() {
         return;
     }
     let backend = GpuBackend::with_max_device_bytes(1).expect("tiny gpu backend");
-    assert_gpu_matches_cpu_stack("tiny_budget", &backend);
+    let transforms = non_identity_transforms(open_stack().len());
+    assert_gpu_matches_cpu_stack("tiny_budget", &backend, transforms);
+}
+
+/// A translation of frame 3 by `(-12.5, 0)` leaves a wide uncovered band at
+/// its right edge, and the similarity leaves thin uncovered rims; in both
+/// the GPU stack matches the CPU stack and never names a frame at a pixel
+/// that frame's warp does not cover.
+#[test]
+fn gpu_stack_matches_cpu_stack_with_uncovered_borders() {
+    if focusforge_gpu::device::shared_device_or_skip().is_none() {
+        return;
+    }
+    let backend = gpu_backend().expect("gpu backend");
+    let stack = open_stack();
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let frame_count = stack.len();
+    let mut shifted = vec![Transform::identity(); frame_count];
+    shifted[3] = Transform::translation(-12.5, 0.0);
+    for (label, transforms) in [
+        ("uncovered_translation", shifted),
+        ("uncovered_similarity", non_identity_transforms(frame_count)),
+    ] {
+        let zmap = assert_gpu_matches_cpu_stack(label, backend, transforms.clone());
+        let reader = WarpingReader::new(&stack, (width, height), spp, transforms);
+        let canvas = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let mut scratch = vec![0u16; (width * height * spp) as usize];
+        let mut uncovered_pixels = 0usize;
+        for frame in 0..frame_count {
+            let Some(covered) = reader
+                .read_tile_coverage_into(frame, canvas, &mut scratch)
+                .expect("read coverage")
+            else {
+                continue;
+            };
+            uncovered_pixels += covered.iter().filter(|&&c| !c).count();
+            let named = zmap
+                .iter()
+                .zip(&covered)
+                .filter(|&(&z, &c)| usize::from(z) == frame && !c)
+                .count();
+            assert_eq!(
+                named, 0,
+                "{label}: the GPU Z-Map names frame {frame} at {named} pixel(s) its warp does \
+                 not cover"
+            );
+        }
+        assert!(
+            uncovered_pixels > 0,
+            "{label}: the transforms must leave pixels uncovered"
+        );
+        println!("{label}: {uncovered_pixels} uncovered frame pixels, none named by the Z-Map");
+    }
 }
 
 /// See [`assert_gpu_matches_cpu_stack`]'s own doc comment: `backend` is a

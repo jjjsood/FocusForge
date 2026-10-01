@@ -191,7 +191,7 @@ use std::sync::{Arc, LazyLock};
 use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
 use crate::fuse::error::{algorithm_error, missing_key};
 use crate::fuse::sharpness::eligible;
-use crate::fuse::{Plane, Pyramid, build, collapse, max_levels};
+use crate::fuse::{Plane, build, collapse, max_levels};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
 use crate::registry::StackRegistration;
 use crate::tile::Tile;
@@ -331,34 +331,36 @@ fn residual_reach(levels: u32) -> u32 {
 
 /// Where one frame takes part, per pyramid level and for the residual: its
 /// coverage mask eroded by that level's reach, read at each level pixel's
-/// level-0 position `(2^k x, 2^k y)`.
-struct EligibleMasks {
-    levels: Vec<Vec<bool>>,
-    residual: Vec<bool>,
+/// level-0 position `(2^k x, 2^k y)`. Level dimensions follow the
+/// `ceil(n / 2)` chain [`crate::fuse::pyramid::reduce`] uses.
+pub struct EligibleMasks {
+    /// One mask per Laplacian level, row-major at that level's dimensions.
+    pub levels: Vec<Vec<bool>>,
+    /// The mask at the residual's dimensions.
+    pub residual: Vec<bool>,
 }
 
 impl EligibleMasks {
-    fn new(covered: &[bool], width: u32, height: u32, levels: u32, shape: &Pyramid) -> Self {
-        let sampled = |reach: u32, k: u32, plane: &Plane| {
+    /// `covered` is the row-major `width * height` coverage of one frame.
+    pub fn new(covered: &[bool], width: u32, height: u32, levels: u32) -> Self {
+        let sampled = |reach: u32, k: u32| {
             let eroded = eligible(covered, width, height, reach);
-            let mut out = Vec::with_capacity(plane.width() as usize * plane.height() as usize);
-            for y in 0..plane.height() {
+            let (level_width, level_height) = (width.div_ceil(1 << k), height.div_ceil(1 << k));
+            let mut out = Vec::with_capacity(level_width as usize * level_height as usize);
+            for y in 0..level_height {
                 let row = clamp_edge(i64::from(y) << k, height) as usize * width as usize;
                 out.extend(
-                    (0..plane.width())
+                    (0..level_width)
                         .map(|x| eroded[row + clamp_edge(i64::from(x) << k, width) as usize]),
                 );
             }
             out
         };
         Self {
-            levels: shape
-                .levels()
-                .iter()
-                .enumerate()
-                .map(|(k, plane)| sampled(level_reach(levels, k as u32), k as u32, plane))
+            levels: (0..levels)
+                .map(|k| sampled(level_reach(levels, k), k))
                 .collect(),
-            residual: sampled(residual_reach(levels), levels, shape.residual()),
+            residual: sampled(residual_reach(levels), levels),
         }
     }
 }
@@ -430,7 +432,7 @@ impl StackAlgorithm for Laplacian {
         // start as "no source" with zero coefficients and a `-inf` score.
         if let Some(masks) = ctx
             .coverage(0)
-            .map(|covered| EligibleMasks::new(covered, width, height, levels, &best))
+            .map(|covered| EligibleMasks::new(covered, width, height, levels))
         {
             for k in 0..levels as usize {
                 for (p, &ok) in masks.levels[k].iter().enumerate() {
@@ -455,7 +457,7 @@ impl StackAlgorithm for Laplacian {
                 .map_err(algorithm_error("laplacian"))?;
             let masks = ctx
                 .coverage(f)
-                .map(|covered| EligibleMasks::new(covered, width, height, levels, &current));
+                .map(|covered| EligibleMasks::new(covered, width, height, levels));
 
             for (i, (sum, &value)) in residual_sum
                 .iter_mut()
@@ -886,6 +888,24 @@ mod tests {
         let masked = fuse_masked(&tiles, &[full.clone(), full.clone(), full], 3, w, h);
         assert_eq!(masked.tile.samples, plain.tile.samples);
         assert_eq!(masked.zmap, plain.zmap);
+    }
+
+    #[test]
+    fn eligible_masks_follow_the_pyramid_dimensions() {
+        for (w, h, levels) in [(75u32, 47u32, 3u32), (355, 227, 5)] {
+            let covered = vec![true; (w * h) as usize];
+            let masks = EligibleMasks::new(&covered, w, h, levels);
+            let pyramid = build(&vec![0u16; (w * h) as usize], w, h, 1, levels).unwrap();
+            assert_eq!(masks.levels.len(), levels as usize);
+            for (mask, plane) in masks.levels.iter().zip(pyramid.levels()) {
+                assert_eq!(mask.len(), (plane.width() * plane.height()) as usize);
+            }
+            let residual = pyramid.residual();
+            assert_eq!(
+                masks.residual.len(),
+                (residual.width() * residual.height()) as usize
+            );
+        }
     }
 
     #[test]

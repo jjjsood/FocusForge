@@ -79,6 +79,8 @@ fn per_frame_bytes(width: u32, height: u32, spp: u32, levels: u32, warped: bool)
         // whose `Transform::source_footprint` read rect exceeds the
         // destination rect.
         total += packed(w0, h0, spp64);
+        // Eligibility mask (one `u32` per pixel) per level and for the residual.
+        total += dims.iter().map(|&(w, h)| 4 * w * h).sum::<u64>();
     }
 
     // The `f32` base plane, via `plane_from_packed`.
@@ -108,7 +110,8 @@ fn per_frame_bytes(width: u32, height: u32, spp: u32, levels: u32, warped: bool)
 
 /// Every byte one `warp_fuse_tile_gpu` call allocates on the device exactly
 /// once per tile, independent of frame count: the running best level and its
-/// interleaved `(score, winner)` plane per level, the residual sum, the
+/// interleaved `(score, winner)` plane per level, the residual sum and its
+/// eligible-frame count, the
 /// collapse's expand-and-add per level, the packed output, and the tile's
 /// two readback staging buffers.
 fn once_per_tile_bytes(width: u32, height: u32, spp: u32, levels: u32) -> u64 {
@@ -125,6 +128,8 @@ fn once_per_tile_bytes(width: u32, height: u32, spp: u32, levels: u32) -> u64 {
     // Residual sum, at the coarsest level.
     let (wl, hl) = dims[levels as usize];
     total += plane(wl, hl, spp64);
+    // Eligible-frame count per residual pixel.
+    total += 4 * wl * hl;
 
     // Collapse: expand pair + add, per level.
     for k in 0..(levels as usize) {
@@ -609,7 +614,7 @@ mod tests {
         // 8 frames, 512x512, 3 spp, 5 levels, warped -- the geometry
         // `budget_gpu.rs`'s serialization test drives.
         let bytes = device_bytes_per_tile(8, 512, 512, 3, 5, true);
-        assert_eq!(bytes, 254_661_632);
+        assert_eq!(bytes, 265_844_736);
     }
 
     #[test]
@@ -627,7 +632,7 @@ mod tests {
     fn device_bytes_per_tile_at_reference_scale_exceeds_the_default_ceiling() {
         // 61 frames, same per-tile geometry.
         let bytes = device_bytes_per_tile(61, 512, 512, 3, 5, true);
-        assert_eq!(bytes, 1_791_373_312);
+        assert_eq!(bytes, 1_876_637_696);
         assert!(bytes > DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT);
     }
 
