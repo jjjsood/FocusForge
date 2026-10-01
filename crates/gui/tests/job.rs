@@ -24,19 +24,12 @@ use focusforge_gui::job;
 use focusforge_gui::viewport::PaneRect;
 use focusforge_gui::{AppController, ChromeKey, OpenOutcome, ShellEvent, ShellMode};
 
+use common::copy_frame;
+
 // ---------------------------------------------------------------------
 // Fixture helpers -- copies only, never the committed fixture directory
 // itself, since a save writes a `.ffp` beside the frames it fused.
 // ---------------------------------------------------------------------
-
-fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
-    std::fs::create_dir_all(dest_dir).unwrap();
-    std::fs::copy(
-        common::fixture_frame("mantis-512", source_index),
-        dest_dir.join(name),
-    )
-    .expect("fixture frame must copy");
-}
 
 /// A controller with one unsaved project open over `count` copied fixture
 /// frames (named `00.tif`, `01.tif`, ... in fixture order), its own scratch
