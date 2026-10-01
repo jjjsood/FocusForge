@@ -32,9 +32,11 @@ pub(crate) fn eligible(covered: &[bool], width: u32, height: u32, reach: u32) ->
     // Marks each slot of `line` whose `r`-neighbourhood holds a `true`, by prefix counts.
     fn smear(line: &mut [bool], r: usize, prefix: &mut Vec<u32>) {
         prefix.clear();
-        prefix.push(0);
+        let mut count = 0;
+        prefix.push(count);
         for &uncovered in line.iter() {
-            prefix.push(prefix.last().unwrap() + u32::from(uncovered));
+            count += u32::from(uncovered);
+            prefix.push(count);
         }
         for (i, slot) in line.iter_mut().enumerate() {
             let (lo, hi) = (i.saturating_sub(r), (i + r + 1).min(prefix.len() - 1));
