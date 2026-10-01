@@ -36,25 +36,21 @@
 //! # Level-0 windows
 //!
 //! Level 0 is never resident. The reference template is prepared from the
-//! region grown by one pixel, and each frame's level-0 solve reads only the
+//! region grown by one pixel; each frame's level-0 solve reads only the
 //! window `Transform::source_footprint` names for the seed, grown by
 //! [`LEVEL0_WINDOW_MARGIN_PX`] and held within [`LEVEL0_WINDOW_LIMIT_PX`] of
 //! the region. Coordinates stay full-frame, so a solve whose samples all fall
 //! inside the window is bit-identical to one over the whole plane. A result
 //! whose footprint leaves the window counts one
-//! [`TimingCounter::Level0WindowMisses`] and is solved once more over the
-//! window regrown to cover seed and result; a result that still leaves the
-//! capped window is kept and counted again.
+//! [`TimingCounter::Level0WindowMisses`] and is solved again over a window
+//! regrown to cover seed and result (counted again if still capped).
 //!
 //! # The off-centre check
 //!
-//! After a level-0 `Converged` or `HitCap` solve, the fitted transform is
-//! evaluated at up to eight patches on a 3x3 grid of centres, without fitting
-//! them: one translation iteration per patch, whose step measure is the
-//! patch's residual in level-0 pixels. A frame where most usable patches
-//! exceed [`VALIDATION_TOLERANCE_PX`] is reported
-//! [`crate::align::DivergenceReason::ValidationFailed`] with its fitted
-//! transform kept.
+//! After a level-0 `Converged` or `HitCap` solve, `PyramidalEcc::validate`
+//! evaluates the fit at up to eight off-centre patches; a frame where most
+//! usable ones exceed [`VALIDATION_TOLERANCE_PX`] is reported
+//! [`crate::align::DivergenceReason::ValidationFailed`], fit kept.
 
 use std::sync::{Arc, LazyLock};
 
