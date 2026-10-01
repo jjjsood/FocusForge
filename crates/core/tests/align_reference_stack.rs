@@ -160,6 +160,7 @@ fn the_reference_stack_reports_a_per_frame_alignment_outcome() {
 
     let mut converged = 0usize;
     let mut hit_cap = 0usize;
+    let mut stalled = 0usize;
     let mut diverged = 0usize;
     for (i, frame) in alignment.frames.iter().enumerate() {
         assert_eq!(frame.frame, i, "frames must be recorded in frame order");
@@ -179,6 +180,13 @@ fn the_reference_stack_reports_a_per_frame_alignment_outcome() {
                     frame.iterations, frame.residual
                 );
             }
+            AlignStatus::Stalled => {
+                stalled += 1;
+                println!(
+                    "frame={i} name={name} status=stalled iterations={} residual={:.6}",
+                    frame.iterations, frame.residual
+                );
+            }
             AlignStatus::Diverged(reason) => {
                 diverged += 1;
                 println!(
@@ -192,11 +200,12 @@ fn the_reference_stack_reports_a_per_frame_alignment_outcome() {
     }
     println!(
         "the_reference_stack_reports_a_per_frame_alignment_outcome: wall={elapsed:?} \
-         converged={converged} hit_cap={hit_cap} diverged={diverged} reference={}",
+         converged={converged} hit_cap={hit_cap} stalled={stalled} diverged={diverged} \
+         reference={}",
         alignment.reference
     );
     assert_eq!(
-        converged + hit_cap + diverged,
+        converged + hit_cap + stalled + diverged,
         61,
         "every frame must be accounted for"
     );

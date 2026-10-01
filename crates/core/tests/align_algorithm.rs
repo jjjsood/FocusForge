@@ -412,7 +412,12 @@ fn coarse_to_fine_beats_single_level() {
     let driven = PyramidalEcc
         .align_frame(&ctx, 1, &cfg_with("translation", 3, 100))
         .expect("valid solver inputs");
-    assert_eq!(driven.status, AlignStatus::Converged, "outcome: {driven:?}");
+    // A level that reaches the cap makes the frame `HitCap`; only a divergence
+    // would mean the pyramid failed to recover the shift.
+    assert!(
+        !matches!(driven.status, AlignStatus::Diverged(_)),
+        "outcome: {driven:?}"
+    );
     let error = corner_error(&driven.transform, &w_true, default_region());
     eprintln!("coarse_to_fine_beats_single_level: driven (depth=3) corner error = {error} px");
     assert!(
@@ -744,15 +749,25 @@ fn each_divergence_reports_its_pyramid_level() {
             assert!(
                 matches!(
                     AlignStatus::from(last.result.status),
-                    AlignStatus::Converged | AlignStatus::HitCap
+                    AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
                 ),
                 "frame {frame}: only a solve that finished can fail the off-centre check: {levels:?}"
             );
         } else {
+            let severity = |s: AlignStatus| match s {
+                AlignStatus::Converged => 0,
+                AlignStatus::HitCap => 1,
+                AlignStatus::Stalled => 2,
+                _ => 3,
+            };
+            let worst = levels
+                .iter()
+                .map(|rec| AlignStatus::from(rec.result.status))
+                .max_by_key(|&s| severity(s))
+                .expect("at least the coarsest level is always solved");
             assert_eq!(
-                AlignStatus::from(last.result.status),
-                outcome.status,
-                "frame {frame}: the reported status must be the last solved level's own status"
+                worst, outcome.status,
+                "frame {frame}: the reported status must be the worst level status"
             );
         }
         if matches!(last.result.status, EccStatus::Diverged(_)) {

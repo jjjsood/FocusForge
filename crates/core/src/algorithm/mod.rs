@@ -335,8 +335,12 @@ pub trait StackAlgorithm: Send + Sync + 'static {
 pub enum AlignStatus {
     /// The solver's step measure fell below its convergence threshold.
     Converged,
-    /// The solver's iteration cap was reached with no convergence.
+    /// The solver's iteration cap was reached with no convergence, and the
+    /// last steps were still shrinking.
     HitCap,
+    /// The solver's iteration cap was reached and its last steps were flat or
+    /// oscillating; the best transform found is kept.
+    Stalled,
     /// Registration failed; see [`crate::align::DivergenceReason`].
     Diverged(crate::align::DivergenceReason),
 }
@@ -346,6 +350,7 @@ impl From<crate::align::EccStatus> for AlignStatus {
         match status {
             crate::align::EccStatus::Converged => AlignStatus::Converged,
             crate::align::EccStatus::HitCap => AlignStatus::HitCap,
+            crate::align::EccStatus::Stalled => AlignStatus::Stalled,
             crate::align::EccStatus::Diverged(reason) => AlignStatus::Diverged(reason),
         }
     }
@@ -448,6 +453,18 @@ mod tests {
     use crate::align::Transform;
     use crate::io::{FrameError, TiffError};
     use crate::params::{EnumVariant, ParamKind, ParamValue, Provenance};
+
+    #[test]
+    fn a_stalled_status_serialises_as_its_kebab_name() {
+        let json = serde_json::to_string(&AlignStatus::Stalled).expect("serialise");
+        assert_eq!(json, r#"{"status":"stalled"}"#);
+        let back: AlignStatus = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back, AlignStatus::Stalled);
+        assert_eq!(
+            AlignStatus::from(crate::align::EccStatus::Stalled),
+            AlignStatus::Stalled
+        );
+    }
 
     fn sample_tiles(frame_count: usize, width: u32, height: u32) -> (Rect, Vec<Tile>) {
         let rect = Rect {

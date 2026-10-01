@@ -98,24 +98,16 @@
 //!
 //! ## Termination
 //!
-//! Three signals: **converged** when the step measure -- the maximum, over
-//! `region`'s four corners `x`, of `‖ΔW^-1(x) - x‖` in template pixels --
-//! falls below [`EccParams::epsilon_px`]; **hit the cap** at
-//! [`EccParams::max_iterations`] with no convergence; **diverged**, for a
-//! singular Hessian, the Lemma 1 region, a non-invertible increment, too
-//! few valid samples, a non-finite update, or a correlation that falls
-//! more than a documented slack below the best ρ seen so far
-//! ([`DivergenceReason::CorrelationDecreased`]). The step measure is used
-//! rather than the raw `‖Δp‖`: in similarity mode that norm mixes
-//! dimensionless `c`, `s` against pixel-valued `tx`, `ty`, so one epsilon
-//! would mean two different things per mode, and could not be scaled
-//! between pyramid levels the way a pixel corner displacement can. On
-//! divergence, the returned transform is the **best-ρ transform seen**,
-//! never the last one tried.
+//! **Converged** when the step measure -- the maximum, over `region`'s four
+//! corners `x`, of `‖ΔW^-1(x) - x‖` in template pixels -- falls below
+//! [`EccParams::epsilon_px`]; at [`EccParams::max_iterations`] without that,
+//! **stalled** if the last ten steps are flat or oscillating (best-ρ transform
+//! returned) and **hit the cap** otherwise. **Diverged** (see
+//! [`DivergenceReason`]) returns the best-ρ transform seen, never the last.
 //!
-//! The shipped default, `max-iterations = 400`, converges all 61
-//! reference frames -- none hits the cap, the slowest needing 332
-//! iterations -- for `+31 s` on a `182 s` alignment pass (`+17%`).
+//! The step measure replaces the raw `‖Δp‖`, which in similarity mode mixes
+//! dimensionless `c`, `s` with pixel-valued `tx`, `ty` and could not be scaled
+//! between pyramid levels.
 //!
 //! Sample arithmetic is `f32`; every accumulation (means, dot products,
 //! `C`, `Ḡ^t ·`) and the normal-equation solve are `f64`. The loop is
@@ -185,10 +177,39 @@ pub enum DivergenceReason {
 pub enum EccStatus {
     /// The step measure fell below [`EccParams::epsilon_px`].
     Converged,
-    /// [`EccParams::max_iterations`] was reached with no convergence.
+    /// [`EccParams::max_iterations`] was reached with no convergence and the
+    /// steps were not flat or oscillating.
     HitCap,
+    /// [`EccParams::max_iterations`] was reached and the last ten
+    /// steps were flat or oscillating: more iterations would not converge.
+    /// The result is the best-ρ transform seen.
+    Stalled,
     /// Registration failed; see [`DivergenceReason`].
     Diverged(DivergenceReason),
+}
+
+/// Steps a capped level must have behind it before it can be called stalled.
+const STALL_WINDOW: usize = 10;
+
+/// Whether the last [`STALL_WINDOW`] step measures, oldest first, stopped
+/// shrinking: flat (`max / min <= 1.05`) or changing direction at least three
+/// times.
+fn is_stalled(window: &[f64; STALL_WINDOW]) -> bool {
+    let max = window.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let min = window.iter().copied().fold(f64::INFINITY, f64::min);
+    if min > 0.0 && max / min <= 1.05 {
+        return true;
+    }
+    let mut diffs = window.windows(2).map(|w| w[1] - w[0]);
+    let mut previous = diffs.next().expect("a window holds several steps");
+    let mut flips = 0;
+    for d in diffs {
+        if d * previous < 0.0 {
+            flips += 1;
+        }
+        previous = d;
+    }
+    flips >= 3
 }
 
 /// The outcome of one [`solve_level`] call.
@@ -196,13 +217,13 @@ pub enum EccStatus {
 pub struct EccResult {
     /// Reference-to-frame, template as reference: a caller warps the
     /// moving image onto the template with this matrix directly, no
-    /// inversion. On [`EccStatus::Diverged`] this is the **best-ρ
-    /// transform seen**, not the last one tried.
+    /// inversion. On [`EccStatus::Diverged`] and [`EccStatus::Stalled`] this
+    /// is the **best-ρ transform seen**, not the last one tried.
     pub transform: Transform,
     pub status: EccStatus,
     pub iterations: u32,
     /// ρ ∈ `[-1, 1]`, paired with `transform` (the ρ that transform itself
-    /// achieved, or the best-seen ρ on divergence) -- never an RMS.
+    /// achieved, or the best-seen ρ on divergence or a stall) -- never an RMS.
     pub correlation: f64,
     pub valid_samples: usize,
     pub valid_fraction: f64,
@@ -847,6 +868,8 @@ fn solve_generic<const K: usize>(
     // the macro's body resolves locals at its *definition* site, so
     // `last_step` must already be in scope where `diverge!` is defined.
     let mut last_step: Option<f64> = None;
+    // The last `STALL_WINDOW` step measures, oldest first.
+    let mut recent_steps = [0.0f64; STALL_WINDOW];
 
     macro_rules! diverge {
         ($reason:expr, $valid_samples:expr, $valid_fraction:expr) => {
@@ -1032,6 +1055,8 @@ fn solve_generic<const K: usize>(
             }
         }
         last_step = Some(step);
+        recent_steps.rotate_left(1);
+        recent_steps[STALL_WINDOW - 1] = step;
         if let Some(t) = trace.as_deref_mut() {
             t.push(EccIteration {
                 iteration: iterations_done + 1,
@@ -1057,11 +1082,16 @@ fn solve_generic<const K: usize>(
         }
 
         if iterations_done == params.max_iterations {
+            let stalled = iterations_done as usize >= STALL_WINDOW && is_stalled(&recent_steps);
             return EccResult {
-                transform: w,
-                status: EccStatus::HitCap,
+                transform: if stalled { best_transform } else { w },
+                status: if stalled {
+                    EccStatus::Stalled
+                } else {
+                    EccStatus::HitCap
+                },
                 iterations: iterations_done,
-                correlation: rho,
+                correlation: if stalled { best_correlation } else { rho },
                 valid_samples: valid_count,
                 valid_fraction,
                 final_step: Some(step),
@@ -1429,6 +1459,87 @@ mod tests {
             height: 30,
         };
         (template, moving, region, w_true)
+    }
+
+    /// Ten steps shrinking by `ratio` each, from 1.0.
+    fn geometric_window(ratio: f64) -> [f64; STALL_WINDOW] {
+        std::array::from_fn(|i| ratio.powi(i as i32))
+    }
+
+    #[test]
+    fn a_flat_window_is_stalled() {
+        let window: [f64; STALL_WINDOW] = std::array::from_fn(|i| 1.0 + 0.03 * i as f64 / 9.0);
+        assert!(is_stalled(&window));
+    }
+
+    #[test]
+    fn an_oscillating_window_is_stalled_though_magnitudes_decrease() {
+        // Four direction flips, first to last ratio far above the flat band.
+        let window = [1.0, 0.9, 0.95, 0.8, 0.85, 0.7, 0.6, 0.5, 0.4, 0.3];
+        assert!(is_stalled(&window));
+    }
+
+    #[test]
+    fn a_shrinking_window_is_not_stalled() {
+        assert!(!is_stalled(&geometric_window(0.8)));
+    }
+
+    #[test]
+    fn a_shrinking_window_with_one_uptick_is_not_stalled() {
+        let mut window = geometric_window(0.8);
+        window[5] = window[4] * 1.1;
+        assert!(!is_stalled(&window));
+    }
+
+    /// A template that no translation of the moving plane reproduces (fixed
+    /// pseudo-random speckle) and an epsilon of zero for all practical
+    /// purposes: the steps settle at a floor and stop shrinking, so the level
+    /// reports `Stalled` and returns the best correlation it saw.
+    #[test]
+    fn a_capped_level_whose_steps_stop_shrinking_is_stalled() {
+        let (width, height) = (SINUSOID_WIDTH, SINUSOID_HEIGHT);
+        let (clean, moving, region, _w_true) = hit_cap_setup();
+        let speckled: Vec<f32> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let clean = sample_plane(
+                    &clean,
+                    (0, 0),
+                    &Transform::identity(),
+                    f64::from(x),
+                    f64::from(y),
+                )
+                .unwrap_or(0.0);
+                let hash =
+                    ((f64::from(x) * 12.9898 + f64::from(y) * 78.233).sin() * 43758.5453).fract();
+                clean + 150.0 * hash as f32
+            })
+            .collect();
+        let template = Plane::from_f32(&speckled, width, height, 1).unwrap();
+        let params = EccParams {
+            max_iterations: 60,
+            epsilon_px: 1e-300,
+            min_valid_fraction: 0.99,
+        };
+        let mut trace = Vec::new();
+        let result = solve_level_traced(
+            &template,
+            region,
+            &moving,
+            &Transform::identity(),
+            EccMode::Translation,
+            &params,
+            &mut trace,
+        )
+        .expect("valid solver inputs");
+        assert_eq!(result.status, EccStatus::Stalled, "{result:?}");
+        assert_eq!(result.iterations, 60);
+        let best = trace
+            .iter()
+            .map(|i| i.correlation)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert_eq!(result.correlation, best, "{result:?}");
+        assert_eq!(trace.last().map(|i| i.step), result.final_step);
     }
 
     /// The bracketing check: pins [`EccResult::final_step`] as *the operand

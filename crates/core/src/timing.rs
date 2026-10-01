@@ -423,14 +423,14 @@ pub fn record_timing(counter: TimingCounter, value: u64) {
     }
 }
 
-/// Records the solver iterations one pyramid level spent, as a trace span
-/// nested under the frame being solved.
-pub fn record_level_iterations(level: u32, iterations: u32) {
+/// Records the solver iterations one pyramid level spent and how the level
+/// ended, as a trace span nested under the frame being solved.
+pub fn record_level_iterations(level: u32, iterations: u32, status: &str) {
     let Some(state) = timing() else {
         return;
     };
     if state.admit() {
-        let _record = tracing::debug_span!("timing_level", level, iterations).entered();
+        let _record = tracing::debug_span!("timing_level", level, iterations, status).entered();
     }
 }
 

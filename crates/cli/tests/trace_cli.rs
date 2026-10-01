@@ -366,8 +366,8 @@ fn chrome_trace_nesting() {
     );
 }
 
-/// A traced `align --json` records, per frame, one iteration count per
-/// pyramid level, and the counts add up to the frame's reported total.
+/// A traced `align --json` records, per frame, one iteration count and status
+/// per pyramid level, and the counts add up to the frame's reported total.
 #[test]
 fn level_iterations() {
     const DEPTH: usize = 2;
@@ -426,6 +426,15 @@ fn level_iterations() {
                 let iterations =
                     timing_value_of(&event["args"]["iterations"]).expect("level iterations");
                 per_frame.entry(frame).or_default().push(iterations);
+                let status = event["args"]["status"]
+                    .as_str()
+                    .map(|s| s.trim_matches('"'))
+                    .expect("a level record names its status");
+                assert!(
+                    matches!(status, "converged" | "hit-cap" | "stalled")
+                        || status.starts_with("diverged-"),
+                    "frame {frame}: unknown level status {status:?}"
+                );
             }
             _ => {}
         }

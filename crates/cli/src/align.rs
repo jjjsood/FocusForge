@@ -527,6 +527,7 @@ fn status_text(status: &focusforge_core::algorithm::AlignStatus) -> String {
     match status {
         focusforge_core::algorithm::AlignStatus::Converged => "converged".to_string(),
         focusforge_core::algorithm::AlignStatus::HitCap => "hit-cap".to_string(),
+        focusforge_core::algorithm::AlignStatus::Stalled => "stalled".to_string(),
         focusforge_core::algorithm::AlignStatus::Diverged(reason) => {
             format!("diverged({reason:?})")
         }
@@ -599,6 +600,12 @@ pub(crate) fn render(report: &AlignReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stalled_frame_renders_stalled() {
+        use focusforge_core::algorithm::AlignStatus;
+        assert_eq!(status_text(&AlignStatus::Stalled), "stalled");
+    }
 
     #[test]
     fn resolve_align_algo_without_an_id_skips_test_only_registrations() {

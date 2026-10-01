@@ -13,7 +13,9 @@ use focusforge_core::algorithm::{
     AlgorithmError, AlignAlgorithm, AlignContext, AlignStatus, TileReader,
 };
 use focusforge_core::align::warp::warp_from_tile;
-use focusforge_core::align::{EccLevelRecord, EccStatus, PyramidalEcc, Transform};
+use focusforge_core::align::{
+    DivergenceReason, EccLevelRecord, EccStatus, PyramidalEcc, Transform,
+};
 use focusforge_core::io::{FrameError, TiffError, TiffStack};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::tile::{Rect, Tile};
@@ -194,6 +196,19 @@ fn reference_index(setting: &str, frame_count: usize) -> usize {
     }
 }
 
+/// `Converged` < `HitCap` < `Stalled` < `Diverged`.
+fn severity(status: &AlignStatus) -> u8 {
+    match status {
+        AlignStatus::Converged => 0,
+        AlignStatus::HitCap => 1,
+        AlignStatus::Stalled => 2,
+        other => {
+            assert!(matches!(other, AlignStatus::Diverged(_)), "{other:?}");
+            3
+        }
+    }
+}
+
 /// One printed row of the distance-from-epsilon and step-trajectory
 /// per-level measurements.
 fn print_level_row(mode: &str, frame: usize, rec: &EccLevelRecord, epsilon_px: f64) {
@@ -224,7 +239,6 @@ fn hit_cap_frames_report_their_distance_from_epsilon() {
     let anchor = reference_index("middle", frame_count);
     assert_eq!(anchor, 3, "middle of 8 frames is (8-1)/2 = 3");
 
-    let epsilon_px = 1e-4;
     for mode in ["translation", "rotation-scale"] {
         let cfg = cfg_for(&stack_ctx, mode, 50);
         for frame in 0..frame_count {
@@ -241,24 +255,35 @@ fn hit_cap_frames_report_their_distance_from_epsilon() {
                  outcome.status={:?} outcome.iterations={}",
                 outcome.status, outcome.iterations
             );
+            let mut worst = AlignStatus::Converged;
             for rec in &levels {
+                // Levels above 0 stop at 100x the shipped `1e-4`.
+                let epsilon_px = if rec.level > 0 { 1e-4 * 100.0 } else { 1e-4 };
                 print_level_row(mode, frame, rec, epsilon_px);
+                let step = rec.result.final_step;
                 match rec.result.status {
-                    EccStatus::HitCap => assert!(
-                        rec.result.final_step.expect("HitCap always reports a step") >= epsilon_px,
-                        "mode={mode} frame={frame} level={}: HitCap but final_step < epsilon_px",
+                    EccStatus::HitCap | EccStatus::Stalled => assert!(
+                        step.expect("a capped level always reports a step") >= epsilon_px,
+                        "mode={mode} frame={frame} level={}: capped but final_step < threshold",
                         rec.level
                     ),
                     EccStatus::Converged => assert!(
-                        rec.result
-                            .final_step
-                            .expect("Converged always reports a step")
-                            < epsilon_px,
-                        "mode={mode} frame={frame} level={}: Converged but final_step >= epsilon_px",
+                        step.expect("Converged always reports a step") < epsilon_px,
+                        "mode={mode} frame={frame} level={}: Converged but final_step >= threshold",
                         rec.level
                     ),
                     EccStatus::Diverged(_) => {}
                 }
+                let level = AlignStatus::from(rec.result.status);
+                if severity(&level) > severity(&worst) {
+                    worst = level;
+                }
+            }
+            if outcome.status != AlignStatus::Diverged(DivergenceReason::ValidationFailed) {
+                assert_eq!(
+                    outcome.status, worst,
+                    "mode={mode} frame={frame}: the frame reports the worst level status"
+                );
             }
         }
     }
@@ -336,7 +361,7 @@ fn hit_cap_step_trajectory_is_classified() {
                 .align_frame_traced(&ctx, frame, &cfg, &mut levels)
                 .expect("fixture frames register");
             for rec in &levels {
-                if rec.result.status != EccStatus::HitCap {
+                if !matches!(rec.result.status, EccStatus::HitCap | EccStatus::Stalled) {
                     continue;
                 }
                 let steps: Vec<f64> = rec.trace.iter().map(|it| it.step).collect();
@@ -400,7 +425,7 @@ fn raising_the_cap_is_measured_not_assumed() {
             let outcome = PyramidalEcc
                 .align_frame(&ctx, frame, &default_cfg)
                 .expect("fixture frames register");
-            if outcome.status == AlignStatus::HitCap {
+            if matches!(outcome.status, AlignStatus::HitCap | AlignStatus::Stalled) {
                 hit_cap_frames.push(frame);
             }
         }
@@ -564,7 +589,7 @@ fn hit_cap_against_distance_from_the_anchor() {
     // Contingency table: distance -> counts of Converged / HitCap / Diverged.
     let max_distance = rows.iter().map(|(d, _)| *d).max().unwrap_or(0);
     for d in 0..=max_distance {
-        let (mut converged, mut hit_cap, mut diverged) = (0u32, 0u32, 0u32);
+        let (mut converged, mut hit_cap, mut stalled, mut diverged) = (0u32, 0u32, 0u32, 0u32);
         for (dist, status) in &rows {
             if *dist != d {
                 continue;
@@ -572,14 +597,15 @@ fn hit_cap_against_distance_from_the_anchor() {
             match status {
                 AlignStatus::Converged => converged += 1,
                 AlignStatus::HitCap => hit_cap += 1,
+                AlignStatus::Stalled => stalled += 1,
                 AlignStatus::Diverged(_) => diverged += 1,
                 other => panic!("unhandled AlignStatus variant: {other:?}"),
             }
         }
-        if converged + hit_cap + diverged > 0 {
+        if converged + hit_cap + stalled + diverged > 0 {
             println!(
                 "hit_cap_against_distance_from_the_anchor: |frame-anchor|={d} converged={converged} \
-                 hit_cap={hit_cap} diverged={diverged}"
+                 hit_cap={hit_cap} stalled={stalled} diverged={diverged}"
             );
         }
     }

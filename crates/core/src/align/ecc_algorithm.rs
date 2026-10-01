@@ -12,10 +12,11 @@
 //! rect, seeded from the previous
 //! (coarser) level's result rescaled by `S = Transform::similarity(2.0,
 //! 0.0, 0.0, 0.0)`: `seed_{k-1} = S.compose(&result_k).compose(&S_inv)`.
-//! `epsilon-px` is passed unscaled at every level -- it is a step measure
-//! in that level's own pixels, so the same threshold means "this level's
-//! own milli-pixel" everywhere, and a finer level always refines what a
-//! coarser one left. A [`crate::align::EccStatus::Diverged`] status at any
+//! `epsilon-px` is a step measure in the level's own pixels and applies as
+//! given at level 0, which produces the result; levels above 0 stop at
+//! [`COARSE_EPSILON_FACTOR`] times it, since level 0 refines what they leave.
+//! A frame's status is the worst over its levels (`Converged` < `HitCap` <
+//! `Stalled` < `Diverged`). A [`crate::align::EccStatus::Diverged`] status at any
 //! level ends the loop there (the seed for finer levels would be
 //! worthless), but the best-ρ transform that level found is still rescaled
 //! all the way to level-0 coordinates, so a caller always gets a level-0
@@ -47,7 +48,7 @@
 //!
 //! # The off-centre check
 //!
-//! After a level-0 `Converged` or `HitCap` solve, `PyramidalEcc::validate`
+//! After a frame that did not diverge, `PyramidalEcc::validate`
 //! evaluates the fit at up to eight off-centre patches; a frame where most
 //! usable ones exceed [`VALIDATION_TOLERANCE_PX`] is reported
 //! [`crate::align::DivergenceReason::ValidationFailed`], fit kept.
@@ -111,6 +112,14 @@ fn patch_window_extent(side: u32) -> u32 {
 /// partial-overlap solve rather than a
 /// [`crate::align::DivergenceReason::TooFewValidSamples`] refusal.
 const MIN_VALID_FRACTION: f64 = 0.75;
+
+/// Levels above 0 stop at this multiple of `epsilon-px`; level 0, which
+/// produces the result, stops at `epsilon-px` itself. Solver-robustness
+/// threshold, not a user setting. On the 61-frame 44.8 MP reference stack 100x
+/// cut iterations 8,114 to 5,762 and solve time 322 to 245 thread-seconds, and
+/// moved no transform by more than 0.0001 px at the solve region's corners
+/// (0.0004 px at the frame's); 10x cut the iterations to 6,891.
+const COARSE_EPSILON_FACTOR: f64 = 100.0;
 
 /// The fraction of each level axis [`PyramidalEcc::solve_region`] covers,
 /// before the [`MAX_REGION_PIXELS`] budget shrink.
@@ -198,12 +207,13 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             id: "max-iterations".to_string(),
             label: "Max Iterations".to_string(),
             help: "The per-level iteration cap. A level that reaches it stops \
-                   short of `epsilon-px` and reports `HitCap`, keeping the best \
-                   transform it found rather than failing. Frames that converge \
-                   earlier stop on `epsilon-px` and pay nothing. On a 61-frame \
-                   44.8 MP stack a cap of 50 left 23 frames short (0.048-0.521 \
-                   px residual); 400 converges all 61, the slowest at 332 \
-                   iterations, for +31 s on a 182 s alignment pass."
+                   short of `epsilon-px` and reports `HitCap`, keeping its last \
+                   transform rather than failing; when its last ten steps were \
+                   flat or oscillating it reports `Stalled` and keeps the best \
+                   correlation transform instead. \
+                   Frames that converge earlier stop on `epsilon-px` and pay \
+                   nothing. On a 61-frame 44.8 MP stack no level needed more \
+                   than 202 iterations."
                 .to_string(),
             kind: ParamKind::Int { min: 1, max: 1000 },
             default: ParamValue::Int(400),
@@ -215,7 +225,8 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             label: "Epsilon (px)".to_string(),
             help: "Maximum corner displacement in level pixels -- the \
                    per-iteration step measure the solver converges to, not \
-                   a correlation threshold."
+                   a correlation threshold. Applies at full resolution; \
+                   coarser levels stop at 100 times it."
                 .to_string(),
             kind: ParamKind::Float {
                 min: 1e-9,
@@ -722,6 +733,10 @@ impl PyramidalEcc {
         let mut final_status = AlignStatus::Converged;
         let mut final_residual = 1.0f64;
         let mut window_misses = 0u32;
+        let coarse_params = EccParams {
+            epsilon_px: params.epsilon_px * COARSE_EPSILON_FACTOR,
+            ..*params
+        };
 
         let _scope = measurement_scope("ecc_solve");
         for k in (0..=depth).rev() {
@@ -748,7 +763,7 @@ impl PyramidalEcc {
                     frame_pyramid.level(k as usize),
                     (0, 0),
                     &seed,
-                    params,
+                    &coarse_params,
                     trace.as_mut(),
                 )
             };
@@ -759,7 +774,7 @@ impl PyramidalEcc {
                     trace: trace.unwrap_or_default(),
                 });
             }
-            record_level_iterations(k, result.iterations);
+            record_level_iterations(k, result.iterations, &level_status_label(result.status));
             total_iterations += result.iterations;
             final_residual = result.correlation;
 
@@ -772,7 +787,7 @@ impl PyramidalEcc {
                 at_level0 = up.compose(&at_level0).compose(&down);
             }
             final_transform = at_level0;
-            final_status = result.status.into();
+            final_status = worse_status(final_status, result.status.into());
 
             match result.status {
                 EccStatus::Diverged(_) => break,
@@ -787,7 +802,7 @@ impl PyramidalEcc {
             record_timing(TimingCounter::Level0WindowMisses, u64::from(window_misses));
         }
 
-        if matches!(final_status, AlignStatus::Converged | AlignStatus::HitCap) {
+        if !matches!(final_status, AlignStatus::Diverged(_)) {
             let _scope = measurement_scope("ecc_validate");
             let check = reference.validate(ctx, frame, &final_transform, params)?;
             if check.flagged() {
@@ -824,6 +839,35 @@ struct Escalation {
     rerun: bool,
     /// The seeded pass did not diverge and its outcome is the one reported.
     accepted: bool,
+}
+
+/// A level's outcome as a kebab-case trace label: `converged`, `hit-cap`,
+/// `stalled` or `diverged-<reason>`.
+fn level_status_label(status: EccStatus) -> String {
+    match status {
+        EccStatus::Converged => "converged".to_string(),
+        EccStatus::HitCap => "hit-cap".to_string(),
+        EccStatus::Stalled => "stalled".to_string(),
+        EccStatus::Diverged(reason) => {
+            let reason = serde_json::to_value(reason).expect("a divergence reason serialises");
+            format!(
+                "diverged-{}",
+                reason.as_str().expect("a unit variant is a string")
+            )
+        }
+    }
+}
+
+/// The worse of two level statuses: `Converged` < `HitCap` < `Stalled` <
+/// `Diverged`; the first wins a tie.
+fn worse_status(a: AlignStatus, b: AlignStatus) -> AlignStatus {
+    let rank = |s: AlignStatus| match s {
+        AlignStatus::Converged => 0,
+        AlignStatus::HitCap => 1,
+        AlignStatus::Stalled => 2,
+        AlignStatus::Diverged(_) => 3,
+    };
+    if rank(b) > rank(a) { b } else { a }
 }
 
 /// The finest pyramid level within `depth` whose long side is at most
@@ -1168,7 +1212,7 @@ impl PreparedReference {
                     check.usable += 1;
                     check.failed += 1;
                 }
-                EccStatus::Converged | EccStatus::HitCap => {
+                EccStatus::Converged | EccStatus::HitCap | EccStatus::Stalled => {
                     check.usable += 1;
                     let step = r.final_step.unwrap_or(f64::INFINITY);
                     worst = worst.max(step);
@@ -1741,7 +1785,7 @@ mod tests {
         assert_eq!(with, without);
         assert!(matches!(
             with.status,
-            AlignStatus::Converged | AlignStatus::HitCap
+            AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
         ));
     }
 
@@ -1811,13 +1855,64 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_reports_the_worst_status_over_its_levels() {
+        let diverged = AlignStatus::Diverged(DivergenceReason::LemmaOneRegion);
+        let ladder = [
+            AlignStatus::Converged,
+            AlignStatus::HitCap,
+            AlignStatus::Stalled,
+            diverged,
+        ];
+        for (i, &low) in ladder.iter().enumerate() {
+            for &high in &ladder[i..] {
+                assert_eq!(worse_status(low, high), high, "{low:?} then {high:?}");
+                assert_eq!(worse_status(high, low), high, "{high:?} then {low:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn coarse_levels_stop_at_a_hundred_times_epsilon_and_level_zero_at_epsilon() {
+        let mem = reader(W, H, &[(0.0, 0.0), (3.0, -2.0)], false);
+        let ctx = AlignContext::new(StackContext::new(2, W, H, 1), 0, &mem);
+        let reference = PreparedReference::build(&ctx, 0, EccMode::Translation, 2).unwrap();
+        let pyramid = PyramidalEcc::build_pyramid(&ctx, 1, 2).unwrap();
+        let params = EccParams {
+            epsilon_px: 1e-3,
+            ..test_params(400)
+        };
+        let attempt = PyramidalEcc::solve_from(
+            &ctx,
+            1,
+            &reference,
+            &pyramid,
+            2,
+            &params,
+            Transform::identity(),
+            true,
+        )
+        .unwrap();
+        let coarse_steps: Vec<f64> = attempt
+            .records
+            .iter()
+            .filter(|r| r.level > 0)
+            .map(|r| r.result.final_step.expect("a solved level has a step"))
+            .collect();
+        assert!(coarse_steps.iter().all(|&s| s < 0.1), "{coarse_steps:?}");
+        assert!(coarse_steps.iter().any(|&s| s >= 1e-3), "{coarse_steps:?}");
+        let level0 = attempt.records.last().expect("level 0 is solved");
+        assert_eq!(level0.level, 0);
+        assert!(level0.result.final_step.expect("a step") < 1e-3);
+    }
+
+    #[test]
     fn a_converging_frame_never_runs_the_detector() {
         let mem = reader(W, H, &[(0.0, 0.0), (3.0, -2.0)], false);
         for mode in [EccMode::Translation, EccMode::Similarity] {
             let (reference, attempt, escalation) = registered(&mem, mode, 2, 1);
             assert!(matches!(
                 attempt.status,
-                AlignStatus::Converged | AlignStatus::HitCap
+                AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
             ));
             assert_eq!(escalation, Escalation::default(), "{mode:?}");
             assert!(reference.features.get().is_none(), "{mode:?}");
@@ -1846,7 +1941,10 @@ mod tests {
             );
             assert!(reference.features.get().is_some());
             assert!(
-                matches!(attempt.status, AlignStatus::Converged | AlignStatus::HitCap),
+                matches!(
+                    attempt.status,
+                    AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
+                ),
                 "{mode:?}: {attempt:?}"
             );
             let (scale, radians, tx, ty) = attempt.transform.similarity_parts();
@@ -1977,7 +2075,7 @@ mod tests {
         assert_eq!(with, without);
         assert!(matches!(
             with.status,
-            AlignStatus::Converged | AlignStatus::HitCap
+            AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
         ));
     }
 }
