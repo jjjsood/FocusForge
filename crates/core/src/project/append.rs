@@ -775,14 +775,12 @@ pub struct Deleted {
     pub head: String,
 }
 
-/// Hides `id`, then physically removes every hidden checkpoint no visible
-/// checkpoint is built on, with the blobs only those needed; nothing is
-/// re-parented. Refuses an unknown or already hidden `id`
-/// ([`ProjectError::UnknownCheckpoint`]) and the last visible checkpoint
-/// ([`ProjectError::LastVisibleDelete`]) before writing. When the head goes,
-/// the newest visible checkpoint becomes the head and the manifest is rebuilt
-/// from it via [`Project::fuse_state`], which refuses by name
-/// ([`ProjectError::FuseStateUnknown`]) when its fuse cannot be recovered.
+/// Hides `id`, then removes every hidden checkpoint no visible one is built
+/// on, with the blobs only those needed; nothing is re-parented. Refuses an
+/// unknown or hidden `id` ([`ProjectError::UnknownCheckpoint`]) and the last
+/// visible checkpoint ([`ProjectError::LastVisibleDelete`]) before writing.
+/// When the head goes, the newest visible checkpoint becomes the head and the
+/// manifest is rebuilt from it ([`Project::fuse_state`]).
 pub fn delete_checkpoint(project_path: &Path, id: &str) -> Result<Deleted, ProjectError> {
     let project = Project::open(project_path)?;
     let history = project.history();
