@@ -58,6 +58,22 @@ fn ceil_div(a: u32, b: u32) -> usize {
     a.div_ceil(b) as usize
 }
 
+/// The off-centre patches of a 512 px frame: a 3x3 grid without its middle.
+const PATCH_COUNT: usize = 8;
+
+/// Reads one registration makes of a frame's own pixels up to its solve: the
+/// level-1 bands (each output band of `DEFAULT_TILE_SIZE / 2` rows reads its
+/// rows plus halo), without the level-0 window or patches.
+fn streamed_band_reads(stack: &StackContext) -> usize {
+    ceil_div(stack.height.div_ceil(2), DEFAULT_TILE_SIZE / 2)
+}
+
+/// The reference frame is read as bands, one level-0 template window and one
+/// window per patch template -- once per run, whatever the registration count.
+fn reference_reads(stack: &StackContext) -> usize {
+    streamed_band_reads(stack) + 1 + PATCH_COUNT
+}
+
 /// Wraps another [`TileReader`], counting `read_tile_into` calls per frame
 /// index. One `AtomicUsize` per frame, so concurrent registrations (the
 /// rayon anchor sub-arm) count correctly with no lock.
@@ -307,21 +323,48 @@ fn per_frame_outcomes_match_the_recorded_run() {
     );
 }
 
+/// A fingerprint without its status token: the transform, iteration count and
+/// residual bits alone.
+fn without_status(fingerprint: &str) -> String {
+    fingerprint
+        .split_whitespace()
+        .filter(|token| !token.starts_with("status="))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The transform, iteration count and residual of every frame stay bit for bit
+/// what the recorded run produced, whatever status the off-centre check adds.
+#[test]
+fn transforms_iterations_and_residuals_match_the_recorded_run() {
+    for (mode, recorded) in [
+        ("translation", RECORDED_TRANSLATION),
+        ("rotation-scale", RECORDED_ROTATION_SCALE),
+    ] {
+        let now: Vec<String> = recorded_fingerprints(mode)
+            .iter()
+            .map(|f| without_status(f))
+            .collect();
+        let then: Vec<String> = recorded.iter().map(|f| without_status(f)).collect();
+        assert_eq!(now, then, "{mode}");
+    }
+}
+
 const RECORDED_TRANSLATION: [&str; 8] = [
     "m=[3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000] status=Diverged(TooFewValidSamples) iterations=1 residual=bfa2f68153100307",
-    "m=[3ff0000000000000,0000000000000000,405e79928eb0cc64,0000000000000000,3ff0000000000000,c04dd0b77f3439d3,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=97 residual=3feedf50c93314a9",
+    "m=[3ff0000000000000,0000000000000000,405e79928eb0cc64,0000000000000000,3ff0000000000000,c04dd0b77f3439d3,0000000000000000,0000000000000000,3ff0000000000000] status=Diverged(ValidationFailed) iterations=97 residual=3feedf50c93314a9",
     "m=[3ff0000000000000,0000000000000000,40406ed2099f4461,0000000000000000,3ff0000000000000,c03781cf47018f24,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=24 residual=3feeed3c02c537d1",
-    "m=[3ff0000000000000,0000000000000000,c033282750597487,0000000000000000,3ff0000000000000,4022e7f01941cb16,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=40 residual=3fee231a6fcd16dd",
+    "m=[3ff0000000000000,0000000000000000,c033282750597487,0000000000000000,3ff0000000000000,4022e7f01941cb16,0000000000000000,0000000000000000,3ff0000000000000] status=Diverged(ValidationFailed) iterations=40 residual=3fee231a6fcd16dd",
     "m=[3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=0 residual=3ff0000000000000",
     "m=[3ff0000000000000,0000000000000000,c01c68c547073ca6,0000000000000000,3ff0000000000000,c0307fd3bf078940,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=40 residual=3fefe9b4000c2c23",
-    "m=[3ff0000000000000,0000000000000000,c02b203db9af8ce9,0000000000000000,3ff0000000000000,403d85bde72e20a3,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=105 residual=3fef1d4b415f674a",
+    "m=[3ff0000000000000,0000000000000000,c02b203db9af8ce9,0000000000000000,3ff0000000000000,403d85bde72e20a3,0000000000000000,0000000000000000,3ff0000000000000] status=Diverged(ValidationFailed) iterations=105 residual=3fef1d4b415f674a",
     "m=[3ff0000000000000,0000000000000000,4035e64d6fd19b15,0000000000000000,3ff0000000000000,4038cd26c9f30cef,0000000000000000,0000000000000000,3ff0000000000000] status=Diverged(CorrelationDecreased) iterations=6 residual=3fed8e1afae6eb4e",
 ];
 const RECORDED_ROTATION_SCALE: [&str; 8] = [
     "m=[3fd2f08090a14c09,bf816516ffa13062,40715b33b68a89f5,3f816516ffa13062,3fd2f08090a14c09,405a91b7c1dd18fe,0000000000000000,0000000000000000,3fefffffffffffff] status=Diverged(CorrelationDecreased) iterations=12 residual=3fea7dac85df34d0",
     "m=[3ff148659462033a,bf932b345d397cce,4059d8dd1b568789,3f932b345d397cce,3ff148659462033a,c054b5031df0dff9,0000000000000000,0000000000000000,3feffffffffffffe] status=Diverged(TooFewValidSamples) iterations=8 residual=3fef215af392f665",
     "m=[3feff1e64f9a5733,3f3a06ca8b062e31,4040a6059a848072,bf3a06ca8b062e31,3feff1e64f9a5733,c036fd1f6de646f8,0000000000000000,0000000000000000,3fefffffffffffee] status=Converged iterations=57 residual=3feeed150dd1f063",
-    "m=[3fee67308b9e8d9d,bf79bd285e0f37e3,bfd4aa1ec2c32024,3f79bd285e0f37e3,3fee67308b9e8d9d,40340e29866da4e4,0000000000000000,0000000000000000,3fefffffffffffef] status=Converged iterations=76 residual=3fee226a74074281",
+    "m=[3fee67308b9e8d9d,bf79bd285e0f37e3,bfd4aa1ec2c32024,3f79bd285e0f37e3,3fee67308b9e8d9d,40340e29866da4e4,0000000000000000,0000000000000000,3fefffffffffffef] status=Diverged(ValidationFailed) iterations=76 residual=3fee226a74074281",
     "m=[3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=0 residual=3ff0000000000000",
     "m=[3ff04cb4f2b3c422,3f6a27c898fda3aa,c02d68aed42d4ace,bf6a27c898fda3aa,3ff04cb4f2b3c422,c03482920e4bf6a5,0000000000000000,0000000000000000,3feffffffffffffb] status=Converged iterations=47 residual=3fefec3a4ae9be66",
     "m=[3ff167913b3ba24f,3f8a11d6cae283f3,c04a076430894b1d,bf8a11d6cae283f3,3ff167913b3ba24f,402171d3255e14ed,0000000000000000,0000000000000000,3feffffffffffffc] status=Converged iterations=122 residual=3fef4bc1770c814e",
@@ -435,23 +478,26 @@ fn reference_frame_is_read_once_per_run() {
     )
     .expect("serial anchored run completes");
 
-    let expected_band_reads = ceil_div(stack_ctx.height, DEFAULT_TILE_SIZE);
+    let bands = streamed_band_reads(&stack_ctx);
     let reference = run.alignment.reference;
 
     assert_eq!(
         reader.reads_for(reference),
-        expected_band_reads,
-        "the cached reference frame must be read exactly once (in bands), not once per \
-         registration"
+        reference_reads(&stack_ctx),
+        "the cached reference frame must be read once (bands, level-0 window, patch \
+         windows), not once per registration"
     );
     for i in 0..stack_ctx.frame_count {
         if i == reference {
             continue;
         }
-        assert_eq!(
-            reader.reads_for(i),
-            expected_band_reads,
-            "non-reference frame {i}'s own read count must be unchanged"
+        // Bands always; a frame that reaches level 0 adds its window, and one
+        // that converges there adds at most one window per patch.
+        let reads = reader.reads_for(i);
+        assert!(
+            (bands..=bands + 1 + PATCH_COUNT).contains(&reads),
+            "non-reference frame {i} made {reads} reads, expected {bands} to {}",
+            bands + 1 + PATCH_COUNT
         );
     }
 }
@@ -556,7 +602,7 @@ fn chain_mode_prepares_nothing() {
 fn two_runs_do_not_share_a_cache() {
     let stack = open_fixture();
     let stack_ctx = stack_context(&stack);
-    let expected_band_reads = ceil_div(stack_ctx.height, DEFAULT_TILE_SIZE);
+    let expected_band_reads = reference_reads(&stack_ctx);
 
     let mut cfg_first = lowered_max_iterations(&stack_ctx);
     cfg_first.insert(

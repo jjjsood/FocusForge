@@ -643,6 +643,43 @@ fn align_progress_counts_every_frame() {
     assert_eq!(progress.align_total, 0);
 }
 
+/// Frame 06 of the fixture solves with an 11% zoom against frame 03 that the
+/// off-centre check rejects. The strict default refuses the run and names that
+/// frame with the check's own wording; frames 03..=06 leave it the only failure.
+#[test]
+fn the_strict_default_refuses_a_frame_the_off_centre_check_rejects() {
+    let mut explicit = ParamValues::new();
+    explicit.insert(
+        "reference-frame".to_string(),
+        ParamValue::Enum("first".to_string()),
+    );
+    let mut request = base_request(
+        "strict_off_centre",
+        mantis_frames(8)[3..=6].to_vec(),
+        ParamValues::new(),
+    );
+    request.align = Some(AlignRequest {
+        algorithm: registry::find_align("pyramidal-ecc").expect("pyramidal-ecc registered"),
+        explicit,
+        lax: false,
+    });
+    request.cache = false;
+
+    let result = focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None);
+    let Err(PipelineError::Align(detail)) = result else {
+        panic!("the strict default must refuse the rejected frame");
+    };
+    assert!(detail.contains("06.tif"), "{detail}");
+    assert!(
+        detail.contains("the alignment does not hold away from the centre of the frame"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("frames total"),
+        "only one frame fails: {detail}"
+    );
+}
+
 #[test]
 fn a_held_run_seals_to_the_same_project() {
     let frames = mantis_frames(3);

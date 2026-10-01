@@ -67,7 +67,7 @@ echo "OK: fact present -- mmap fast path: yes"
 
 # `align`, cheap: `--algo pyramidal-ecc` is explicit because the all-targets
 # debug build also registers a test algorithm, which makes the bare default
-# ambiguous. `--lax` because frames 0, 1 and 7 of this fixture diverge
+# ambiguous. `--lax` because frames 0, 1, 6 and 7 of this fixture diverge
 # against the middle anchor. Never a `stack` invocation here: that is
 # minutes of debug-profile fusion this cheap gate must not pay for.
 echo "+ $CLI align fixtures/mantis-512 --algo pyramidal-ecc --lax --json"
@@ -81,10 +81,11 @@ printf '%s' "$ALIGN_OUT" | grep -q '"reference": 3' \
   || { echo "FAIL: fixture e2e -- align missing fact: reference 3" >&2; exit 1; }
 echo "OK: fact present -- align reference: 3"
 
-# Frames 0, 1 and 7 diverge against the middle anchor.
-printf '%s' "$ALIGN_OUT" | grep -q '"failure_count": 3' \
-  || { echo "FAIL: fixture e2e -- align missing fact: failure_count 3" >&2; exit 1; }
-echo "OK: fact present -- align failure_count: 3 (per-frame divergence, recorded)"
+# Frames 0, 1 and 7 diverge against the middle anchor; frame 6 (scale 1.1075)
+# is flagged validation-failed by the off-centre check.
+printf '%s' "$ALIGN_OUT" | grep -q '"failure_count": 4' \
+  || { echo "FAIL: fixture e2e -- align missing fact: failure_count 4" >&2; exit 1; }
+echo "OK: fact present -- align failure_count: 4 (per-frame divergence, recorded)"
 
 # --lax must not appear in README.md or docs/: it is a recipe flag, not the
 # recommended invocation.

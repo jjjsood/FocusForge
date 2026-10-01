@@ -2157,7 +2157,7 @@ fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
         "a default fuse completes rather than failing"
     );
     assert_eq!(controller.checkpoint_count(), Some(0));
-    let names = ["00.tif", "01.tif", "07.tif"].map(String::from);
+    let names = ["00.tif", "01.tif", "06.tif", "07.tif"].map(String::from);
     assert_eq!(controller.pending_divergence(), Some(&names[..]));
 }
 

@@ -917,6 +917,9 @@ fn divergence_phrase(reason: crate::align::DivergenceReason) -> &'static str {
         DivergenceReason::CorrelationDecreased => "the match grew worse instead of better",
         DivergenceReason::TooFewValidSamples => "too few pixels overlapped to measure a match",
         DivergenceReason::NonFiniteUpdate => "the computation produced an invalid result",
+        DivergenceReason::ValidationFailed => {
+            "the alignment does not hold away from the centre of the frame"
+        }
     }
 }
 
@@ -1131,6 +1134,24 @@ pub fn uniform_check(frames: &[(&str, &FrameDesc)]) -> (bool, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_failed_has_its_own_phrase() {
+        use crate::align::DivergenceReason;
+
+        let phrase = divergence_phrase(DivergenceReason::ValidationFailed);
+        for other in [
+            DivergenceReason::SingularHessian,
+            DivergenceReason::LemmaOneRegion,
+            DivergenceReason::NonInvertibleIncrement,
+            DivergenceReason::CorrelationDecreased,
+            DivergenceReason::TooFewValidSamples,
+            DivergenceReason::NonFiniteUpdate,
+        ] {
+            assert_ne!(phrase, divergence_phrase(other));
+        }
+        assert!(phrase.contains("away from the centre"), "{phrase}");
+    }
 
     fn desc(label: &str, signature: &[&str]) -> FrameDesc {
         FrameDesc {

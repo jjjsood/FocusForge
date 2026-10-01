@@ -88,6 +88,9 @@ pub enum TimingCounter {
     BufferCreations,
     /// Bytes copied from GPU buffers back to the host.
     ReadbackBytes,
+    /// Registrations whose level-0 result left the bounded frame window the
+    /// solve read.
+    Level0WindowMisses,
 }
 
 impl TimingCounter {
@@ -115,6 +118,7 @@ impl TimingCounter {
             Self::CpuSubmissions => "cpu_submissions",
             Self::BufferCreations => "buffer_creations",
             Self::ReadbackBytes => "readback_bytes",
+            Self::Level0WindowMisses => "level0_window_misses",
         }
     }
 }
@@ -146,6 +150,7 @@ pub struct TimingSnapshot {
     pub cpu_submissions: u64,
     pub buffer_creations: u64,
     pub readback_bytes: u64,
+    pub level0_window_misses: u64,
     pub gpu_execution_available: bool,
     pub presentation_available: bool,
     pub saturated: bool,
@@ -177,6 +182,7 @@ struct TimingState {
     cpu_submissions: AtomicU64,
     buffer_creations: AtomicU64,
     readback_bytes: AtomicU64,
+    level0_window_misses: AtomicU64,
     saturated: AtomicBool,
     summary_emitted: AtomicBool,
 }
@@ -209,6 +215,7 @@ impl TimingState {
             cpu_submissions: AtomicU64::new(0),
             buffer_creations: AtomicU64::new(0),
             readback_bytes: AtomicU64::new(0),
+            level0_window_misses: AtomicU64::new(0),
             saturated: AtomicBool::new(false),
             summary_emitted: AtomicBool::new(false),
         }
@@ -254,6 +261,7 @@ impl TimingState {
             TimingCounter::CpuSubmissions => &self.cpu_submissions,
             TimingCounter::BufferCreations => &self.buffer_creations,
             TimingCounter::ReadbackBytes => &self.readback_bytes,
+            TimingCounter::Level0WindowMisses => &self.level0_window_misses,
         };
         saturating_add(slot, value, &self.saturated);
     }
@@ -296,6 +304,7 @@ impl TimingState {
             cpu_submissions: self.cpu_submissions.load(Ordering::Relaxed),
             buffer_creations: self.buffer_creations.load(Ordering::Relaxed),
             readback_bytes: self.readback_bytes.load(Ordering::Relaxed),
+            level0_window_misses: self.level0_window_misses.load(Ordering::Relaxed),
             gpu_execution_available: false,
             presentation_available: false,
             saturated: self.saturated.load(Ordering::Relaxed),
@@ -469,6 +478,7 @@ pub fn emit_timing_summary() {
         cpu_submissions = snapshot.cpu_submissions,
         buffer_creations = snapshot.buffer_creations,
         readback_bytes = snapshot.readback_bytes,
+        level0_window_misses = snapshot.level0_window_misses,
         gpu_execution_available = snapshot.gpu_execution_available,
         presentation_available = snapshot.presentation_available,
         saturated = snapshot.saturated,
@@ -713,6 +723,9 @@ mod accounting_tests {
         state.add(TimingCounter::ReadbackBytes, u64::MAX);
         let snapshot = state.snapshot();
         assert_eq!(snapshot.readback_bytes, u64::MAX);
+
+        state.add(TimingCounter::Level0WindowMisses, 2);
+        assert_eq!(state.snapshot().level0_window_misses, 2);
         assert_eq!(snapshot.buffer_creations, 5);
         assert!(snapshot.saturated);
     }

@@ -399,9 +399,8 @@ fn pause_during_alignment_holds_align_progress() {
     let mut controller = controller_with_frames("pause_align", 8);
     // `dummy-align` (`controller_with_frames`'s own default) finishes in
     // microseconds; a real solver is what gives the hold something to
-    // catch mid-stage. Translation-only chain registration converges on
-    // every one of this fixture's eight frames, so the run fuses cleanly
-    // rather than parking on a diverged frame.
+    // catch mid-stage. Translation-only chain registration flags two of this
+    // fixture's frames as validation-failed, so the run parks and is kept.
     controller.set_align_algorithm("pyramidal-ecc");
     controller.set_param_value("align", "mode", ParamValue::Enum("translation".to_string()));
     controller.set_param_value(
@@ -442,9 +441,14 @@ fn pause_during_alignment_holds_align_progress() {
         "Aligning",
         "the hold must have landed in the align stage"
     );
-    common::wait_for_settle(&mut controller, Duration::from_secs(120))
-        .expect("a resumed run must hand back its fused planes");
+    assert!(
+        common::wait_for_settle(&mut controller, Duration::from_secs(120)).is_none(),
+        "the resumed run parks on the frames the check flags"
+    );
     assert!(!controller.job_running());
+    controller
+        .keep_fused()
+        .expect("a resumed run must hand back its fused planes");
     match controller.job_view().state {
         job::RunState::Fused { .. } => {}
         other => panic!("a resumed run must settle as fused, got {other:?}"),
@@ -2471,6 +2475,8 @@ fn closing_the_owning_tab_mid_run_promotes_nothing() {
         common::open_and_settle(&mut controller, &[survivor_root]),
         OpenOutcome::Opened(_)
     ));
+    // An algorithm that always converges keeps the survivor's fuse clean.
+    controller.set_align_algorithm("dummy-align");
 
     controller.select_project(0);
     assert!(controller.start_fuse());

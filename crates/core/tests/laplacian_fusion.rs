@@ -394,7 +394,7 @@ fn extract_window(samples: &[u16], full_width: u32, rect: Rect, spp: u32) -> Vec
 /// **Recorded only, nothing asserted.** `reference.tif` is another
 /// stacker's composite from a different alignment and fusion, so no
 /// SSIM/PSNR comparison isolates alignment: giving each composite its own
-/// best integer shift (+/-8 px) over the full crop margin still leaves the
+/// best integer shift (up to +/-8 px, within the crop margin) still leaves the
 /// unaligned composite ahead on both metrics, with both optima pinned at
 /// the search boundary. Both composites' raw and best-shift numbers print.
 #[test]
@@ -446,12 +446,22 @@ fn composite_similarity_to_reference_is_recorded() {
 
     // Symmetric: the same +/-8 px search run once per composite, each
     // against its own best-matching reference window.
-    const SEARCH: i32 = 8;
+    // Capped at the real crop margin so shifted windows stay inside the frame.
+    let search = [
+        crop.x,
+        crop.y,
+        rw - crop.x - crop.width,
+        rh - crop.y - crop.height,
+    ]
+    .into_iter()
+    .min()
+    .expect("four margins")
+    .min(8) as i32;
     let best_shift_search = |composite: &[u16], spp: u32, unshifted_ssim: f64| {
         let mut best_shift = (0i32, 0i32);
         let mut best_ssim = unshifted_ssim;
-        for dy in -SEARCH..=SEARCH {
-            for dx in -SEARCH..=SEARCH {
+        for dy in -search..=search {
+            for dx in -search..=search {
                 if dx == 0 && dy == 0 {
                     continue;
                 }

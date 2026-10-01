@@ -175,6 +175,9 @@ pub enum DivergenceReason {
     TooFewValidSamples,
     /// `Δp`, the step measure, or ρ was non-finite.
     NonFiniteUpdate,
+    /// The fit converged, but the same transform leaves a residual above the
+    /// tolerance at most of the usable patches away from the solve region.
+    ValidationFailed,
 }
 
 /// How a [`solve_level`] run ended.
@@ -296,14 +299,17 @@ fn dot<const K: usize>(a: &[f64; K], b: &[f64; K]) -> f64 {
 /// horizontal-then-vertical accumulation order. `None` when `t.map_point`
 /// fails or the mapped point's whole 4x4 tap window does not lie entirely
 /// inside `moving` -- see the module docs' "Sampling and out-of-domain
-/// handling".
-fn sample_plane(moving: &Plane, t: &Transform, x: f64, y: f64) -> Option<f32> {
+/// handling". `moving` is a window of the frame whose top-left pixel sits at
+/// `origin` in full-frame coordinates; `(x, y)` and `t` stay full-frame, and
+/// the tap-window test is against the window.
+fn sample_plane(moving: &Plane, origin: (u32, u32), t: &Transform, x: f64, y: f64) -> Option<f32> {
     let (sx, sy) = t.map_point(x, y)?;
     let width = moving.width() as i64;
     let height = moving.height() as i64;
+    let (x0, y0) = (i64::from(origin.0), i64::from(origin.1));
     let ix = sx.floor() as i64;
     let iy = sy.floor() as i64;
-    if ix - 1 < 0 || ix + 2 > width - 1 || iy - 1 < 0 || iy + 2 > height - 1 {
+    if ix - 1 < x0 || ix + 2 > x0 + width - 1 || iy - 1 < y0 || iy + 2 > y0 + height - 1 {
         return None;
     }
 
@@ -314,7 +320,7 @@ fn sample_plane(moving: &Plane, t: &Transform, x: f64, y: f64) -> Option<f32> {
 
     let data = moving.data();
     let stride = width;
-    let sample = |col: i64, row: i64| -> f32 { data[(row * stride + col) as usize] };
+    let sample = |col: i64, row: i64| -> f32 { data[((row - y0) * stride + (col - x0)) as usize] };
 
     let cols = [ix - 1, ix, ix + 1, ix + 2];
     let rows = [iy - 1, iy, iy + 1, iy + 2];
@@ -334,13 +340,14 @@ fn sample_plane(moving: &Plane, t: &Transform, x: f64, y: f64) -> Option<f32> {
 }
 
 /// Central-difference gradient `(T[x+1] - T[x-1]) / 2` on each axis, at
-/// template pixel `(x, y)`. Caller must guarantee `1 <= x <= width - 2` and
-/// `1 <= y <= height - 2` (the valid-region-only discipline
+/// full-frame pixel `(x, y)` of a template window whose top-left pixel sits at
+/// `origin`. Caller must guarantee the pixel and its four neighbours lie in
+/// the window (the valid-region-only discipline
 /// `crate::fuse::metrics::laplacian_variance` already uses).
-fn central_diff_gradient(template: &Plane, x: u32, y: u32) -> (f32, f32) {
+fn central_diff_gradient(template: &Plane, origin: (u32, u32), x: u32, y: u32) -> (f32, f32) {
     let w = template.width() as usize;
     let data = template.data();
-    let idx = |xx: u32, yy: u32| yy as usize * w + xx as usize;
+    let idx = |xx: u32, yy: u32| (yy - origin.1) as usize * w + (xx - origin.0) as usize;
     let gx = (data[idx(x + 1, y)] - data[idx(x - 1, y)]) / 2.0;
     let gy = (data[idx(x, y + 1)] - data[idx(x, y - 1)]) / 2.0;
     (gx, gy)
@@ -446,21 +453,22 @@ pub(crate) struct EccTemplate {
 
 impl EccTemplate {
     /// Prepares `template` over `region`, after the region checks
-    /// [`solve_level`] documents.
+    /// [`solve_level`] documents. `template` is a window of the frame whose
+    /// top-left pixel sits at `origin`; `region` stays in full-frame
+    /// coordinates, so a window and the whole plane prepare identical data.
     pub(crate) fn prepare(
         template: &Plane,
+        origin: (u32, u32),
         region: Rect,
         mode: EccMode,
     ) -> Result<Self, AlignError> {
         if region.width == 0 || region.height == 0 {
             return Err(AlignError::RegionTooSmall { region });
         }
-        let valid_x_hi = template.width().saturating_sub(1);
-        let valid_y_hi = template.height().saturating_sub(1);
-        let region_ok = region.x >= 1
-            && region.y >= 1
-            && region.x + region.width <= valid_x_hi
-            && region.y + region.height <= valid_y_hi;
+        let region_ok = region.x > origin.0
+            && region.y > origin.1
+            && region.x + region.width < origin.0 + template.width()
+            && region.y + region.height < origin.1 + template.height();
         if !region_ok {
             return Err(AlignError::RegionOutOfBounds {
                 region,
@@ -470,16 +478,20 @@ impl EccTemplate {
 
         let _scope = measurement_scope("ecc_template_prepare");
         let kind = match mode {
-            EccMode::Translation => {
-                TemplateKind::Translation(prepare_data::<2>(template, region, |gx, gy, _x, _y| {
-                    [f64::from(gx), f64::from(gy)]
-                }))
-            }
+            EccMode::Translation => TemplateKind::Translation(prepare_data::<2>(
+                template,
+                origin,
+                region,
+                |gx, gy, _x, _y| [f64::from(gx), f64::from(gy)],
+            )),
             EccMode::Similarity => {
                 let (cx, cy) = similarity_centre(region);
-                TemplateKind::Similarity(prepare_data::<4>(template, region, |gx, gy, x, y| {
-                    similarity_jacobian_row(gx, gy, x, y, cx, cy)
-                }))
+                TemplateKind::Similarity(prepare_data::<4>(
+                    template,
+                    origin,
+                    region,
+                    |gx, gy, x, y| similarity_jacobian_row(gx, gy, x, y, cx, cy),
+                ))
             }
         };
         Ok(Self { region, kind })
@@ -597,16 +609,26 @@ fn solve_level_dispatch(
             moving_spp: moving.samples_per_pixel(),
         });
     }
-    let prepared = EccTemplate::prepare(template, region, mode)?;
-    Ok(solve_prepared(&prepared, moving, initial, params, trace))
+    let prepared = EccTemplate::prepare(template, (0, 0), region, mode)?;
+    Ok(solve_prepared(
+        &prepared,
+        moving,
+        (0, 0),
+        initial,
+        params,
+        trace,
+    ))
 }
 
 /// Solves against a prepared template. `moving` must be single-channel and
 /// `params` well-formed; [`solve_level`] checks both, and the pyramid's luma
-/// planes satisfy the first by construction.
+/// planes satisfy the first by construction. `moving` is a window whose
+/// top-left pixel sits at `moving_origin` in full-frame coordinates; a sample
+/// whose 4x4 taps leave the window is invalid.
 pub(crate) fn solve_prepared(
     template: &EccTemplate,
     moving: &Plane,
+    moving_origin: (u32, u32),
     initial: &Transform,
     params: &EccParams,
     trace: Option<&mut Vec<EccIteration>>,
@@ -616,7 +638,7 @@ pub(crate) fn solve_prepared(
         TemplateKind::Translation(data) => solve_generic::<2>(
             data,
             region,
-            moving,
+            (moving, moving_origin),
             initial,
             params,
             |dp: &[f64; 2]| Transform::translation(dp[0], dp[1]),
@@ -632,7 +654,7 @@ pub(crate) fn solve_prepared(
             solve_generic::<4>(
                 data,
                 region,
-                moving,
+                (moving, moving_origin),
                 initial,
                 params,
                 move |dp: &[f64; 4]| similarity_delta(dp, cx, cy),
@@ -699,6 +721,7 @@ fn similarity_delta(dp: &[f64; 4], cx: f64, cy: f64) -> Transform {
 /// [`similarity_jacobian_row`]). The module docs give every equation.
 fn prepare_data<const K: usize>(
     template: &Plane,
+    origin: (u32, u32),
     region: Rect,
     jacobian_row: impl Fn(f32, f32, f64, f64) -> [f64; K],
 ) -> TemplateData<K> {
@@ -713,8 +736,11 @@ fn prepare_data<const K: usize>(
         for dx in 0..region.width {
             let x = region.x + dx;
             let y = region.y + dy;
-            let (gx, gy) = central_diff_gradient(template, x, y);
-            values.push(template.data()[y as usize * template.width() as usize + x as usize]);
+            let (gx, gy) = central_diff_gradient(template, origin, x, y);
+            values.push(
+                template.data()
+                    [(y - origin.1) as usize * template.width() as usize + (x - origin.0) as usize],
+            );
             g_centered.push(jacobian_row(gx, gy, x as f64, y as f64));
         }
     }
@@ -780,7 +806,7 @@ fn prepare_data<const K: usize>(
 fn solve_generic<const K: usize>(
     data: &TemplateData<K>,
     region: Rect,
-    moving: &Plane,
+    (moving, moving_origin): (&Plane, (u32, u32)),
     initial: &Transform,
     params: &EccParams,
     build_delta: impl Fn(&[f64; K]) -> Transform,
@@ -842,7 +868,7 @@ fn solve_generic<const K: usize>(
         let mut n = 0usize;
         for y in region.y..region.y + region.height {
             for x in region.x..region.x + region.width {
-                let s = sample_plane(moving, &w, x as f64, y as f64);
+                let s = sample_plane(moving, moving_origin, &w, x as f64, y as f64);
                 if s.is_some() {
                     valid_count += 1;
                 }
@@ -1095,6 +1121,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validation_failed_round_trips_as_kebab_case() {
+        let json = serde_json::to_string(&DivergenceReason::ValidationFailed).unwrap();
+        assert_eq!(json, "\"validation-failed\"");
+        let back: DivergenceReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, DivergenceReason::ValidationFailed);
+    }
+
+    #[test]
     fn local_aggregate_saturation_is_retained_for_the_summary() {
         let mut allocations = TimingBytes::new(TimingCounter::AllocationBytes);
         allocations.bytes = u64::MAX - 1;
@@ -1263,7 +1297,7 @@ mod tests {
         let mut template_data = vec![0.0f32; width as usize * height as usize];
         for y in 0..height {
             for x in 0..width {
-                let sampled = sample_plane(&moving, w_true, f64::from(x), f64::from(y));
+                let sampled = sample_plane(&moving, (0, 0), w_true, f64::from(x), f64::from(y));
                 template_data[(y * width + x) as usize] = sampled.unwrap_or(0.0);
             }
         }
