@@ -31,23 +31,12 @@ use common::copy_frame;
 // itself, since a save writes a `.ffp` beside the frames it fused.
 // ---------------------------------------------------------------------
 
-/// A controller with one unsaved project open over `count` copied fixture
-/// frames (named `00.tif`, `01.tif`, ... in fixture order), its own scratch
-/// root under `CARGO_TARGET_TMPDIR`.
+/// [`common::controller_with_frames`] on the `dummy-align` algorithm: these
+/// tabs exercise queueing, saving and closing, not alignment quality, and an
+/// algorithm that always converges keeps every run clean.
 fn controller_with_frames(name: &str, count: usize) -> AppController {
-    let root = common::tree(&format!("{name}_frames"));
-    for i in 0..count {
-        copy_frame(&root, &format!("{i:02}.tif"), i);
-    }
-    let mut controller = AppController::new();
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[root]),
-        OpenOutcome::Opened(_)
-    ));
-    // These tabs exercise queueing, saving and closing, not alignment
-    // quality; an algorithm that always converges keeps every run clean.
+    let mut controller = common::controller_with_frames(name, count);
     controller.set_align_algorithm("dummy-align");
-    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
     controller
 }
 
