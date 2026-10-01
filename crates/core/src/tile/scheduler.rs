@@ -5,7 +5,7 @@
 //! sized from the machine and from `RAYON_NUM_THREADS`), and hands every tile
 //! to a [`TileConsumer`] as an on-demand [`TileCtx`]: frame `f`'s matching
 //! tile is read through a [`TileReader`] when the consumer reaches it, passed
-//! through the (currently empty) [`FramePreprocess`] hook, and overwritten by
+//! through the [`FramePreprocess`] hook, and overwritten by
 //! the next frame. A tile therefore holds one frame-tile and one coverage
 //! mask, never one per frame.
 //!
@@ -16,8 +16,8 @@
 //! nothing here -- it pulls its own, possibly footprint-grown, source rects
 //! instead of the scheduler's own destination read rect. Two consequences
 //! follow: [`TileRunReport::frame_tiles_read`] is `0` on that path, because
-//! the scheduler genuinely read no frame-tile; and the (currently empty)
-//! [`FramePreprocess`] hook is never called for that tile.
+//! the scheduler genuinely read no frame-tile; and the [`FramePreprocess`]
+//! hook is never called for that tile.
 //!
 //! # Memory budget: an admission gate, not the thread count
 //!
