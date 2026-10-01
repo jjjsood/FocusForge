@@ -31,6 +31,7 @@ and numpy installed:
 ```
 python3 spikes/guided-filter-fusion/gff_fusion.py --self-check
 python3 spikes/guided-filter-fusion/gff_fusion.py cases --out .scratch/gff --candidate
+python3 spikes/guided-filter-fusion/gff_fusion.py cases --out .scratch/gff-eq --cases gain-ramp,gain-offset,flicker --equalize both --candidate
 python3 spikes/guided-filter-fusion/gff_fusion.py fuse DIR -o OUT.tif [--scale S] [--tile T --margin M]
 python3 spikes/guided-filter-fusion/gff_fusion.py score CASE_DIR OUT.tif
 python3 spikes/guided-filter-fusion/gff_fusion.py reach
@@ -43,20 +44,41 @@ python3 spikes/guided-filter-fusion/gff_fusion.py montage OUT.png --rect Y0,Y1,X
   (`--break uniform-weights`, `ignore-mask`, `per-channel-guide`). It also fuses identical constant and
   edge stacks, which must come back unchanged. Exit 0 means every run behaved.
 - `cases` builds registered synthetic stacks with `spikes/synthetic-ground-truth/synth_stack.py --frames-only`
-  (cases `halo`, `flat`, `easy`, `hairs`, `tint`, `border`, and `align-border`, whose invalid-border mask comes from
-  `focusforge-cli align --json` transforms), runs each baseline as `stack ... --no-align --no-crop --no-gpu` then
-  `export`, scores every composite and prints per-metric spread over the seeds. `--tile-size` is the size of the
-  read rectangle, whose interior is the tile minus twice the method's margin, so a one-tile whole-image control needs
-  an interior of at least the image size (`512` gives four tiles at 512x512; `640` suffices at 512x512 with a margin-12 method; larger is safe, the default is `1024`).
+  (cases `halo`, `flat`, `easy`, `hairs`, `tint`, `border`, the brightness-drift cases `gain-ramp`, `gain-offset`, `flicker`, and
+  `align-border`, whose invalid-border mask comes from `focusforge-cli align --json` transforms), runs each baseline as
+  `stack ... --no-align --no-crop --no-gpu` then `export`, scores every composite and prints per-metric spread over the
+  seeds. `--tile-size` is the size of the read rectangle; the tile margins (160/80/40 px for Laplacian, 12 and 16 px for
+  Weighted Average and Depth Map) make a tiled run equal to a one-tile run, so it changes no method's output. `1024` at
+  512x512 (interior 704) and `2048` at a 1024x1024 crop stay one-tile controls.
   `--candidate` adds the prototype. `mantis` runs `fixtures/mantis-512` and `stack-crop` a crop of the large reference
   stack (`--rect X,Y,W,H`, `--crop-frames`); neither has a truth image, so they write a side-by-side `montage.png`
   instead of metrics.
+- `--equalize off|on|both` (default `off`) adds a per-frame brightness equalization before fusion. `on` writes
+  `equalized/` beside each case (frames, `masks.npy` copy and `equalize.json`) and every method reads it; `both` runs the
+  two arms on identical frames, tags each row with its `arm`, adds `vs_off` (max absolute difference, differing samples,
+  mean absolute difference over the OFF mean) to each ON row and prints an ON-minus-OFF table. The default leaves cases,
+  commands and outputs unchanged.
 - `fuse --tile T --margin M` assembles the result tile by tile with `M` px of context; compare it with the
   whole-image output using `tools/tiff-diff.py`.
 - `reach` puts an impulse in one frame of a constant two-frame stack and prints the farthest pixel whose weight
   moves, per threshold.
 - `scale` renders N-frame synthetic stacks, runs the prototype in a fresh process and the baselines under
   `/usr/bin/time -v`, and records wall time, peak RSS and frame reads.
+
+## Equalization
+
+`equalize(dir, out_dir)` gives every frame one gain shared by all channels: the median of reference luma over frame
+luma (channel mean of the encoded values) on pixels that are valid in both frames (from `masks.npy`, never from
+`sample == 0`) and whose reference luma lies in 5 % to 95 % of 65535. The reference is frame `n // 2` (gain 1). A frame
+with fewer than 1000 usable pixels gets gain 1 and is flagged `thin`. The applied gain is clipped to `[0.8, 1.25]`,
+multiplies the encoded values and saturates at 65535 without wrap; invalid pixels stay zero. `equalize.json` records the
+reference, band, bound and, per frame, the estimated and applied gain, the clamp flag, `samples_used` and
+`samples_saturated`. `--self-check` also recovers known gains on a tiny stack and requires each deliberately broken
+estimator (`wrong-reference`, `ignore-mask`, `unbounded-gain`) to be caught.
+
+The drift cases are the `halo` frames with a per-frame gain and offset applied after noise (frame 4 unchanged):
+`gain-ramp` (gain 0.92 to 1.06), `gain-offset` (the same ramp plus -300 to +225 counts) and `flicker` (alternating
+1 +/- 0.06 and one 0.72 dip whose correction exceeds the bound). A gain cannot remove an additive offset.
 
 Every subcommand prints JSON with the command line it ran.
 
@@ -65,7 +87,8 @@ Every subcommand prints JSON with the command line it ran.
 All against the case's `reference.tif`, over pixels with at least one valid source: `psnr` and block `ssim` as in
 `synth_stack.py`; `halo_rms` (+/-8 px band around the depth step), `flat_std` (flat patch), `hair_ret` (line contrast
 retained against the reference), `chroma_err` (mean `|channel/luma - reference channel/luma|` over unclipped pixels),
-`border_pull` (shortfall below the darkest valid source at pixels that also have an invalid source).
+`border_pull` (shortfall below the darkest valid source at pixels that also have an invalid source), `psnr_lvl` (`psnr`
+after the one global gain that best fits the composite to the reference, so a level offset does not count).
 
 ## Dependencies and data
 

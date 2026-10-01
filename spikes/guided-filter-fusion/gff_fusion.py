@@ -4,6 +4,7 @@
 Subcommands (run from the repository root, workspace built):
 
     cases    build synthetic/real cases, run the three baselines, score them
+             (--equalize off|on|both adds per-frame brightness equalization before fusion)
     fuse     fuse one frame directory with the guided-filter prototype
     score    score a composite against a case's reference
     reach    measure the prototype's filter support with an impulse
@@ -24,6 +25,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import zlib
 
@@ -40,6 +42,8 @@ CLI = os.path.join(ROOT, "target", "debug", "focusforge-cli")
 SYNTH = os.path.join(ROOT, "spikes", "synthetic-ground-truth", "synth_stack.py")
 ALGOS = ["weighted-average", "laplacian", "depth-map"]
 BREAKS = ["uniform-weights", "ignore-mask", "per-channel-guide"]
+EQ_BREAKS = ["wrong-reference", "ignore-mask", "unbounded-gain"]
+EQ_BAND, EQ_BOUND, EQ_MIN_SAMPLES = (0.05, 0.95), (0.8, 1.25), 1000
 EPS_BASE, EPS_DET = 0.3, 1e-6
 FULL = 65535.0
 
@@ -92,7 +96,11 @@ def metrics(comp, ref, meta, src=None):
             valid |= src.read(k)[1]
     Lc, Lr = c.mean(2), r.mean(2)
     mse = ((c - r) ** 2)[valid].mean()
-    m = dict(psnr=float("inf") if mse == 0 else float(10 * np.log10(FULL**2 / mse)))
+    psnr = lambda e: float("inf") if e == 0 else float(10 * np.log10(FULL**2 / e))  # noqa: E731
+    m = dict(psnr=psnr(mse))
+    # Level-invariant: PSNR after the one global gain that least-squares fits the composite to the truth.
+    g = (c * r)[valid].sum() / max((c * c)[valid].sum(), 1e-12)
+    m["psnr_lvl"] = psnr(((np.clip(g * c, 0, FULL) - r) ** 2)[valid].mean())
     filled = np.where(valid[..., None], comp, ref)
     m["ssim"] = ss.block_mean_ssim(filled, ref)
     if meta.get("halo"):
@@ -188,6 +196,38 @@ def write_u16(path, arr):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     a = np.clip(np.rint(arr), 0, 65535).astype("<u2")
     rawtiff.write_tiff(path, a.shape[1], a.shape[0], a.tobytes(), bits=16, spp=a.shape[2])
+
+
+def equalize(d, out_dir, brk=None):
+    """Write brightness-equalized copies of the frames of `d` under `out_dir` and return the record.
+
+    One gain per frame, shared by all channels: the median of reference luma over frame luma on
+    pixels valid in both whose reference luma lies in the mid-tone band `EQ_BAND`. The reference
+    is frame n // 2. The applied gain is clipped to `EQ_BOUND` (a frame with fewer than
+    `EQ_MIN_SAMPLES` usable pixels gets gain 1 and is flagged `thin`), multiplies the encoded
+    values and saturates at 65535. `brk` names a deliberately broken variant (negative control).
+    """
+    src = open_source(d)
+    ref = 0 if brk == "wrong-reference" else src.n // 2
+    fr, mr = src.read(ref)
+    lr = fr.mean(2) * FULL
+    band = (lr >= EQ_BAND[0] * FULL) & (lr <= EQ_BAND[1] * FULL)
+    frames = []
+    for k, path in enumerate(src.paths):
+        f, m = src.read(k)
+        valid = band if brk == "ignore-mask" else band & m & mr
+        used = int(valid.sum())
+        est = float(np.median(lr[valid] / np.maximum(f.mean(2)[valid] * FULL, 1))) if used >= EQ_MIN_SAMPLES else 1.0
+        applied = est if brk == "unbounded-gain" else float(np.clip(est, *EQ_BOUND))
+        scaled = f * FULL * applied
+        write_u16(os.path.join(out_dir, "frames", os.path.basename(path)), scaled)
+        frames.append(dict(frame=os.path.basename(path), estimated=est, applied=applied, clamped=applied != est,
+                           thin=used < EQ_MIN_SAMPLES, samples_used=used, samples_saturated=int((np.rint(scaled) > 65535).sum())))
+    if src.has_masks:
+        shutil.copy(os.path.join(d, "masks.npy"), os.path.join(out_dir, "masks.npy"))
+    rec = dict(reference=ref, band=list(EQ_BAND), bound=list(EQ_BOUND), min_samples=EQ_MIN_SAMPLES, brk=brk, frames=frames)
+    json.dump(rec, open(os.path.join(out_dir, "equalize.json"), "w"), indent=1)
+    return rec
 
 
 # ---------------------------------------------------------------- prototype
@@ -369,6 +409,66 @@ def tiny_stack(kind):
     return ArraySource(frames, masks), ref, dict(hairs=SELF_HAIRS)
 
 
+# Correction factors that bring each frame of `eq_stack` to the reference frame (index 2).
+EQ_TRUTH = [1.1, 1.4, 1.0, 1.2, 0.9]
+EQ_GAIN_TOL = 0.005
+EQ_PATCH = (slice(4, 12), slice(50, 58))
+
+
+def eq_stack(d):
+    """48x64, N=5 smooth mid-tone texture; frame k is the reference divided by EQ_TRUTH[k].
+
+    Frame 0 has 40 invalid columns (62 % of the frame) holding the constant 18000, a
+    mid-tone value, with its mask False. Frame 3 holds a near-white patch the reference
+    does not have, which saturates when the frame is scaled up.
+    """
+    rng = np.random.default_rng(7)
+    tex = ss.blur(rng.normal(0, 1, (48, 64, 3)), 1.0)
+    base = (tex - tex.min()) / (tex.max() - tex.min()) * 30000 + 15000
+    frames, masks = [], np.ones((5, 48, 64), bool)
+    for k, g in enumerate(EQ_TRUTH):
+        f = np.rint(base / g)
+        if k == 0:
+            f[:, :40], masks[0, :, :40] = 18000, False
+        if k == 3:
+            f[EQ_PATCH] = 62000
+        write_u16(os.path.join(d, "frames", f"{k:02d}.tif"), f)
+    np.save(os.path.join(d, "masks.npy"), masks)
+
+
+def self_check_equalizer():
+    """The honest equalizer recovers the known gains; each broken variant must trip its detector."""
+    lo, hi = EQ_BOUND
+    ok = True
+    for brk, expect in [(None, set()), ("wrong-reference", {"gain_err"}), ("ignore-mask", {"gain_err"}),
+                        ("unbounded-gain", {"bound"})]:
+        with tempfile.TemporaryDirectory() as tmp:
+            eq_stack(tmp)
+            rec = equalize(tmp, os.path.join(tmp, "out"), brk)
+            est = np.array([f["estimated"] for f in rec["frames"]])
+            app = np.array([f["applied"] for f in rec["frames"]])
+            patch = read_u16(os.path.join(tmp, "out", "frames", "03.tif"))[EQ_PATCH]
+            got = {k for k, v in dict(
+                gain_err=np.abs(est - EQ_TRUTH).max() > EQ_GAIN_TOL,
+                bound=(app < lo - 1e-9).any() or (app > hi + 1e-9).any(),
+                clamp=not (rec["frames"][1]["clamped"] and abs(app[1] - hi) < 1e-9),
+                wrap=bool((patch != 65535).any()) or rec["frames"][3]["samples_saturated"] == 0).items() if v}
+            good = got == expect if brk is None else expect <= got
+            ok &= good
+            print(f"eq    {brk or 'honest':18} {'ok  ' if good else 'FAIL'} fired={sorted(got)} expected={sorted(expect)} "
+                  f"max gain error={np.abs(est - EQ_TRUTH).max():.4f} applied={np.round(app, 3).tolist()}")
+    return ok
+
+
+def self_check_level():
+    """A composite that is an exact scalar multiple of the truth scores high on `psnr_lvl`, low on `psnr`."""
+    ref = tiny_stack("plain")[1]
+    m = metrics(np.rint(ref * 0.9).astype(np.uint16), ref, {})
+    ok = m["psnr_lvl"] > 80 and m["psnr"] < 35
+    print(f"level {'ok  ' if ok else 'FAIL'} scalar multiple 0.9: psnr_lvl={m['psnr_lvl']:.2f} psnr={m['psnr']:.2f}")
+    return ok
+
+
 def self_check():
     """Every detector must stay silent on the honest prototype and fire on its broken variant."""
     fires = lambda m: {  # noqa: E731
@@ -399,6 +499,8 @@ def self_check():
         dev = int(np.abs(comp.astype(np.int64) - img).max())
         ok &= dev <= 1
         print(f"{name:5} identical frames  {'ok  ' if dev <= 1 else 'FAIL'} max deviation {dev} counts")
+    ok &= self_check_equalizer()
+    ok &= self_check_level()
     print("self-check", "passed" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -406,7 +508,9 @@ def self_check():
 # ---------------------------------------------------------------- cases
 
 CASES = {"halo": ("hard", 250), "flat": ("hard", 1000), "easy": ("easy", 250),
-         "hairs": ("hard", 250), "tint": ("hard", 250), "border": ("hard", 250)}
+         "hairs": ("hard", 250), "tint": ("hard", 250), "border": ("hard", 250),
+         "gain-ramp": ("hard", 250), "gain-offset": ("hard", 250), "flicker": ("hard", 250)}
+DEFAULT_CASES = "halo,flat,easy,hairs,tint,border"
 HAIRS_512 = [("h", (460, 461), (454, 456), (464, 466), (30, 100)), ("h", (460, 461), (454, 456), (464, 466), (130, 190)),
              ("v", (110, 112), (104, 106), (116, 118), (415, 450)), ("v", (110, 112), (104, 106), (116, 118), (470, 495))]
 STRIPS = {2: (slice(None), slice(0, 30)), 5: (slice(0, 20), slice(None)), 6: (slice(None), slice(482, 512))}
@@ -430,6 +534,25 @@ def transform_mask(m, h, w):
     with np.errstate(divide="ignore", invalid="ignore"):
         ux, uy = (m[0][0] * x + m[0][1] * y + m[0][2]) / d, (m[1][0] * x + m[1][1] * y + m[1][2]) / d
     return (d > 1e-6) & (ux >= 0) & (ux <= w - 1) & (uy >= 0) & (uy <= h - 1)
+
+
+def drift(name, seed, n):
+    """Per-frame (gain, offset in counts) of a brightness-drift case; frame n // 2 stays at (1, 0).
+
+    `gain-ramp`: gain linear in the frame index, 0.92 at frame 0. `gain-offset`: the same ramp
+    plus an offset linear in the index (-300 at frame 0). `flicker`: alternating 1 +/- 0.06 with
+    a 0.01 jitter, frame 0 a dip to 0.72, so its correction (1.39) exceeds the equalizer bound.
+    """
+    m = n // 2
+    t = (np.arange(n) - m) / max(m, n - 1 - m)
+    if name == "flicker":
+        gain = 1 + 0.06 * (-1.0) ** np.arange(n) + np.random.default_rng(seed + 100).uniform(-0.01, 0.01, n)
+        gain[0] = 0.72
+    else:
+        gain = 1 + 0.08 * t
+    offset = 300.0 * t if name == "gain-offset" else np.zeros(n)
+    gain[m], offset[m] = 1.0, 0.0
+    return gain, offset
 
 
 def build_case(name, seed, n, root):
@@ -472,6 +595,11 @@ def build_case(name, seed, n, root):
             rng = np.random.default_rng(seed + 100)
             for p in paths[:n]:
                 write_u16(p, read_u16(p) * ((1 + rng.uniform(-0.05, 0.05)) * (1 + rng.uniform(-0.03, 0.03, 3))))
+        if name in ("gain-ramp", "gain-offset", "flicker"):
+            gain, offset = drift(name, seed, n)
+            meta["drift"] = dict(gain=gain.tolist(), offset=offset.tolist())
+            for p, g, o in zip(paths[:n], gain, offset):
+                write_u16(p, read_u16(p) * g + o)
         if name == "border":
             masks = np.ones((n, h, w), bool)
             for k, (ys, xs) in STRIPS.items():
@@ -528,12 +656,30 @@ def aggregate(rows):
     g = {}
     for r in rows:
         for k, v in r["metrics"].items():
-            g.setdefault((r["case"], k, r["algo"]), []).append(v)
-    lines = ["case metric algo | per seed | mean spread(max-min) sd"]
-    for (case, k, algo), v in sorted(g.items()):
+            g.setdefault((r["case"], k, r["algo"], r["arm"]), []).append(v)
+    lines = ["case metric algo arm | per seed | mean spread(max-min) sd"]
+    for (case, k, algo, arm), v in sorted(g.items()):
         v = np.array(v)
-        lines.append(f"{case:7} {k:11} {algo:17} | " + " ".join(f"{x:10.4f}" for x in v)
+        lines.append(f"{case:11} {k:11} {algo:17} {arm:3} | " + " ".join(f"{x:10.4f}" for x in v)
                      + f" | {v.mean():10.4f} {v.max() - v.min():9.4f} {v.std(ddof=1) if len(v) > 1 else 0:9.4f}")
+    return "\n".join(lines)
+
+
+def aggregate_delta(rows):
+    """ON minus OFF per case, metric and method over the seeds, then the composite differences."""
+    key = lambda r: (r["case"], r["seed"], r["algo"])  # noqa: E731
+    off = {key(r): r for r in rows if r["arm"] == "off"}
+    pairs = [(off[key(r)], r) for r in rows if r["arm"] == "on" and key(r) in off]
+    g = {}
+    for o, n in pairs:
+        for k, v in n.get("metrics", {}).items():
+            g.setdefault((n["case"], k, n["algo"]), []).append(v - o["metrics"][k])
+    lines = ["case metric algo | on minus off per seed | mean"]
+    for (case, k, algo), v in sorted(g.items()):
+        lines.append(f"{case:11} {k:11} {algo:17} | " + " ".join(f"{x:+10.4f}" for x in v) + f" | {np.mean(v):+10.4f}")
+    lines.append("case seed algo | max abs sample difference, differing samples, mean abs / OFF mean (ON vs OFF composite)")
+    lines += [f"{n['case']:11} {n['seed']:3} {n['algo']:17} | {n['vs_off']['max_abs']:6} {n['vs_off']['differing']:9} "
+              f"{n['vs_off']['rel_mean_abs']:.5f}" for _, n in pairs]
     return "\n".join(lines)
 
 
@@ -543,29 +689,44 @@ def cmd_cases(a):
     seeds = [int(x) for x in a.seeds.split(",")]
     metas = [build_case(c, s, a.frames, a.out) for c in names if c in CASES or c == "align-border" for s in seeds]
     metas += real_cases(names, a.out, tuple(int(x) for x in a.rect.split(",")), a.crop_frames)
+    arms = ["off", "on"] if a.equalize == "both" else [a.equalize]
     rows = []
     for meta in metas:
-        d = meta["dir"]
-        work = d if meta["reference"] else os.path.join(a.out, meta["case"])
+        work = meta["dir"] if meta["reference"] else os.path.join(a.out, meta["case"])
         os.makedirs(work, exist_ok=True)
-        src = open_source(d)
         comps, case_rows = {}, []
-        for algo in a.methods.split(","):
-            b = run_baseline(d, algo, a.tile_size, work)
-            comps[algo] = b.pop("comp")
-            case_rows.append(dict(case=meta["case"], seed=meta["seed"], algo=algo, tile=a.tile_size, **b))
-        if a.candidate:
-            t0 = time.time()
-            out, cov = fuse_stack(src, a.scale, a.brk)
-            comps["gff"] = os.path.join(work, "gff.tif")
-            write_u16(comps["gff"], out)
-            case_rows.append(dict(case=meta["case"], seed=meta["seed"], algo="gff", scale=a.scale, brk=a.brk,
-                                  uncovered=int((~cov).sum()), wall_s=round(time.time() - t0, 3)))
-        for r in case_rows:
-            r["comp"] = comps[r["algo"]]
-            if meta["reference"]:
-                r["metrics"] = metrics(read_u16(r["comp"]).astype(np.uint16), read_u16(meta["reference"]).astype(np.uint16), meta, src)
-            print(json.dumps(r), flush=True)
+        for arm in arms:
+            d, awork, tag = meta["dir"], work, ""
+            if arm == "on":
+                d = awork = os.path.join(work, "equalized")
+                equalize(meta["dir"], d)
+                tag = "-eq"
+            src = open_source(d)
+            arm_rows = []
+            for algo in a.methods.split(","):
+                b = run_baseline(d, algo, a.tile_size, awork)
+                comps[algo + tag] = b.pop("comp")
+                arm_rows.append(dict(case=meta["case"], seed=meta["seed"], algo=algo, arm=arm, tile=a.tile_size, **b))
+            if a.candidate:
+                t0 = time.time()
+                out, cov = fuse_stack(src, a.scale, a.brk)
+                comps["gff" + tag] = os.path.join(awork, "gff.tif")
+                write_u16(comps["gff" + tag], out)
+                arm_rows.append(dict(case=meta["case"], seed=meta["seed"], algo="gff", arm=arm, scale=a.scale, brk=a.brk,
+                                     uncovered=int((~cov).sum()), wall_s=round(time.time() - t0, 3)))
+            for r in arm_rows:
+                r["comp"] = comps[r["algo"] + tag]
+                if arm == "on":
+                    r["equalize"] = os.path.join(d, "equalize.json")
+                if meta["reference"]:
+                    r["metrics"] = metrics(read_u16(r["comp"]).astype(np.uint16), read_u16(meta["reference"]).astype(np.uint16), meta, src)
+                if arm == "on" and "off" in arms:
+                    off = read_u16(comps[r["algo"]])
+                    diff = np.rint(np.abs(read_u16(r["comp"]) - off))
+                    r["vs_off"] = dict(max_abs=int(diff.max()), differing=int((diff > 0).sum()),
+                                       rel_mean_abs=float(diff.mean() / max(off.mean(), 1)))
+                print(json.dumps(r), flush=True)
+            case_rows += arm_rows
         rows += case_rows
         if not meta["reference"]:
             rect = (0, min(src.h, 256), 0, min(src.w, 256)) if src.h < 700 else (src.h // 2 - 128, src.h // 2 + 128, src.w // 2 - 128, src.w // 2 + 128)
@@ -574,6 +735,8 @@ def cmd_cases(a):
             print(json.dumps(dict(case=meta["case"], montage=png, order=list(comps), rect=list(rect))), flush=True)
     json.dump(rows, open(os.path.join(a.out, "results.json"), "w"), indent=1)
     print("# aggregate\n" + aggregate([r for r in rows if r.get("metrics")]))
+    if "on" in arms and "off" in arms:
+        print("# on minus off\n" + aggregate_delta(rows))
 
 
 # ---------------------------------------------------------------- fuse / score / montage
@@ -683,7 +846,8 @@ def main():
     sub = p.add_subparsers(dest="cmd")
     c = sub.add_parser("cases", help="build cases, run the baselines (and with --candidate the prototype), score them")
     c.add_argument("--out", required=True)
-    c.add_argument("--cases", default="halo,flat,easy,hairs,tint,border", help=f"{','.join(CASES)},align-border,mantis,stack-crop")
+    c.add_argument("--cases", default=DEFAULT_CASES, help=f"{','.join(CASES)},align-border,mantis,stack-crop")
+    c.add_argument("--equalize", choices=["off", "on", "both"], default="off", help="per-frame brightness equalization before fusion")
     c.add_argument("--seeds", default="11,12,13")
     c.add_argument("--frames", type=int, default=8)
     c.add_argument("--methods", default=",".join(ALGOS))
