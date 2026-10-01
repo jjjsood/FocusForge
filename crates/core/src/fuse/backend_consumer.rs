@@ -28,9 +28,6 @@ use crate::tile::{Tile, TileConsumer, TileJob};
 pub struct BackendFusionConsumer<'a> {
     backend: &'a dyn TileBackend,
     reader: &'a dyn TileReader,
-    /// The host path's pixel source, over the same frames and transforms
-    /// the backend warps itself.
-    warping: WarpingReader<'a>,
     frame: (u32, u32),
     transforms: Vec<Transform>,
     samples_per_pixel: u32,
@@ -49,11 +46,9 @@ impl<'a> BackendFusionConsumer<'a> {
         levels: u32,
         sink: &'a FusionConsumer,
     ) -> Self {
-        let warping = WarpingReader::new(reader, frame, samples_per_pixel, transforms.clone());
         BackendFusionConsumer {
             backend,
             reader,
-            warping,
             frame,
             transforms,
             samples_per_pixel,
@@ -80,10 +75,16 @@ impl<'a> BackendFusionConsumer<'a> {
     fn consume_on_host(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
         let rect = job.read_rect();
         let len = rect.width as usize * rect.height as usize * self.samples_per_pixel as usize;
+        let warping = WarpingReader::new(
+            self.reader,
+            self.frame,
+            self.samples_per_pixel,
+            self.transforms.clone(),
+        );
         let mut tiles = Vec::with_capacity(self.transforms.len());
         for frame in 0..self.transforms.len() {
             let mut samples = vec![0u16; len];
-            self.warping.read_tile_into(frame, rect, &mut samples)?;
+            warping.read_tile_into(frame, rect, &mut samples)?;
             tiles.push(Tile {
                 rect,
                 samples_per_pixel: self.samples_per_pixel,

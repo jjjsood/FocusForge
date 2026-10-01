@@ -39,22 +39,20 @@ mod status;
 /// Resolves whether this run takes the GPU path or the CPU one:
 /// `#[cfg(feature = "gpu")]` delegates to [`gpu::resolve_backend`]; with the
 /// feature off, always [`stack::BackendChoice::cpu()`].
-#[cfg(feature = "gpu")]
 fn resolve_backend(
     algorithm_id: &str,
     no_gpu: bool,
     max_vram: Option<u64>,
 ) -> stack::BackendChoice {
-    gpu::resolve_backend(algorithm_id, no_gpu, max_vram)
-}
-
-#[cfg(not(feature = "gpu"))]
-fn resolve_backend(
-    _algorithm_id: &str,
-    _no_gpu: bool,
-    _max_vram: Option<u64>,
-) -> stack::BackendChoice {
-    stack::BackendChoice::cpu()
+    #[cfg(feature = "gpu")]
+    {
+        gpu::resolve_backend(algorithm_id, no_gpu, max_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (algorithm_id, no_gpu, max_vram);
+        stack::BackendChoice::cpu()
+    }
 }
 
 /// FocusForge command-line interface.

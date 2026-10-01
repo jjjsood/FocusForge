@@ -65,17 +65,6 @@ pub struct SealedProject {
     pub checkpoint: String,
 }
 
-impl SealedProject {
-    /// `uncompressed / compressed` for one blob -- the measured ratio, never
-    /// an assumed one.
-    pub fn compression_ratio(record: &BlobRecord) -> f64 {
-        if record.compressed_len == 0 {
-            return 0.0;
-        }
-        record.uncompressed_len as f64 / record.compressed_len as f64
-    }
-}
-
 /// Seals a finished run into a project at `request.project_path`, stamping
 /// the current wall clock.
 pub fn seal(request: SealRequest<'_>) -> Result<SealedProject, ProjectError> {
@@ -365,7 +354,7 @@ pub(super) fn source_ref(path: &Path, project_dir: &Path) -> Result<SourceRef, P
 
 /// Unix seconds, UTC. `0` if the clock is before the epoch, which is not a
 /// state worth failing a finished stack over.
-pub(crate) fn now_unix() -> i64 {
+pub fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

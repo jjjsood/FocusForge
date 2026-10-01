@@ -108,7 +108,7 @@
 use std::sync::LazyLock;
 
 use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
-use crate::fuse::PyramidError;
+use crate::fuse::error::{algorithm_error, missing_key};
 use crate::fuse::laplacian::score_plane;
 use crate::fuse::pyramid::Plane;
 use crate::fuse::sharpness::{DETAIL_REACH, detail_plane, levels_for_margin};
@@ -164,22 +164,6 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     ]
 });
 
-fn wrap_pyramid_error(source: PyramidError) -> AlgorithmError {
-    AlgorithmError::Failed {
-        algorithm: "weighted-average".to_string(),
-        detail: source.to_string(),
-    }
-}
-
-fn missing_key(key: &str) -> AlgorithmError {
-    AlgorithmError::Failed {
-        algorithm: "weighted-average".to_string(),
-        detail: format!(
-            "resolved values are missing `{key}`; call crate::params::resolve before fuse"
-        ),
-    }
-}
-
 /// The Weighted Average fusion algorithm. See the module docs for the
 /// weight, the blend, the degenerate rule and the Z-Map semantics.
 pub struct WeightedAverage;
@@ -214,11 +198,12 @@ impl StackAlgorithm for WeightedAverage {
         let radius = cfg
             .get("radius")
             .and_then(ParamValue::as_i64)
-            .ok_or_else(|| missing_key("radius"))? as u32;
+            .ok_or_else(|| missing_key("weighted-average", "radius"))? as u32;
         let weight_exponent = cfg
             .get("weight-exponent")
             .and_then(ParamValue::as_f64)
-            .ok_or_else(|| missing_key("weight-exponent"))? as f32;
+            .ok_or_else(|| missing_key("weighted-average", "weight-exponent"))?
+            as f32;
 
         let rect = ctx.rect();
         let (width, height) = (rect.width, rect.height);
@@ -240,8 +225,8 @@ impl StackAlgorithm for WeightedAverage {
 
         for f in 0..frame_count {
             let tile = ctx.frame(f)?;
-            let detail =
-                detail_plane(&tile.samples, width, height, spp).map_err(wrap_pyramid_error)?;
+            let detail = detail_plane(&tile.samples, width, height, spp)
+                .map_err(algorithm_error("weighted-average"))?;
             let scores = score_plane(&detail, radius);
 
             for p in 0..pixel_count {
@@ -289,19 +274,15 @@ impl StackAlgorithm for WeightedAverage {
         // the pinned `floor(clamp(v, 0, 65535) + 0.5)` expression is the
         // only place a `f32` sample becomes a `u16` one.
         let mut plane = Plane::from_u16(&vec![0u16; pixel_count * spp_usize], width, height, spp)
-            .map_err(wrap_pyramid_error)?;
+            .map_err(algorithm_error("weighted-average"))?;
         plane.data_mut().copy_from_slice(&blended);
         let mut samples = vec![0u16; pixel_count * spp_usize];
         plane
             .to_u16_into(&mut samples)
-            .map_err(wrap_pyramid_error)?;
+            .map_err(algorithm_error("weighted-average"))?;
 
-        crate::zmap::validate_tile(&winner, frame_count as u32).map_err(|source| {
-            AlgorithmError::Failed {
-                algorithm: "weighted-average".to_string(),
-                detail: source.to_string(),
-            }
-        })?;
+        crate::zmap::validate_tile(&winner, frame_count as u32)
+            .map_err(algorithm_error("weighted-average"))?;
 
         Ok(TileOutput {
             tile: Tile {

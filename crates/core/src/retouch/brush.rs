@@ -163,22 +163,6 @@ fn covers(stroke: &Stroke, x: u32, y: u32) -> bool {
     (1.0 - t) * 64.0 > bayer + 0.5
 }
 
-pub(super) fn intersect(a: Rect, b: Rect) -> Option<Rect> {
-    let x0 = a.x.max(b.x);
-    let y0 = a.y.max(b.y);
-    let x1 = (a.x + a.width).min(b.x + b.width);
-    let y1 = (a.y + a.height).min(b.y + b.height);
-    if x1 <= x0 || y1 <= y0 {
-        return None;
-    }
-    Some(Rect {
-        x: x0,
-        y: y0,
-        width: x1 - x0,
-        height: y1 - y0,
-    })
-}
-
 /// Applies `op` over `tile` (an `info.tile_len(tile)`-long slice of `tile`'s
 /// own indices, row-major), writing `source_id` where the stroke covers a
 /// pixel. Returns how many pixels differed from their prior value. Every
@@ -205,7 +189,7 @@ pub fn apply(
     let Some(footprint) = stroke_footprint(&stroke, info) else {
         return Ok(0);
     };
-    let Some(region) = intersect(tile, footprint) else {
+    let Some(region) = tile.intersect(footprint) else {
         return Ok(0);
     };
     let mut changed = 0u64;

@@ -27,6 +27,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime};
 
+use common::{CliOutput, mantis_512_dir};
 use focusforge_core::io::{TiffSpec, TiffWriter, test_frames::write_frame_with_capture_time};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::{self, Metrics, PROJECT_EXTENSION, SealRequest};
@@ -45,42 +46,23 @@ fn snapshot_bin(dir: &Path) -> PathBuf {
     dst
 }
 
-fn cli_output(output: std::process::Output) -> CliOutput {
-    CliOutput {
-        success: output.status.success(),
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
-
 /// `dir` is already a fresh, per-test working directory (see the module
 /// doc comment), so its own `ff-data` subdirectory is a fresh data
 /// directory too -- never the tester's real one.
 fn run_bin(dir: &Path, path: &Path, args: &[&str]) -> CliOutput {
-    cli_output(
-        Command::new(path)
-            .args(args)
-            .current_dir(dir)
-            .env("FOCUSFORGE_DATA_DIR", dir.join("ff-data"))
-            .output()
-            .expect("failed to run binary"),
+    common::run_in(
+        Command::new(path).env("FOCUSFORGE_DATA_DIR", dir.join("ff-data")),
+        dir,
+        args,
     )
 }
 
-struct CliOutput {
-    success: bool,
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
-    run_bin(dir, Path::new(env!("CARGO_BIN_EXE_focusforge-cli")), args)
-}
-
-fn mantis_512_dir() -> PathBuf {
-    common::fixtures_dir().join("mantis-512")
+    common::run_in(
+        common::cli_bin("review_cli").env("FOCUSFORGE_DATA_DIR", dir.join("ff-data")),
+        dir,
+        args,
+    )
 }
 
 /// The one `laplacian` run this file pays for: `fixtures/mantis-512`, no

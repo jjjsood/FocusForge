@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The real allocate-and-back-off probe over a live `wgpu::Device` --
-//! `crate::budget::DeviceAllocProbe`'s only real implementor. Feature-gated
+//! The real allocate-and-back-off probe over a live `wgpu::Device`, the
+//! reservation `crate::budget::probe_budget` drives. Feature-gated
 //! (`gpu`), registered in `lib.rs`'s `#[cfg(feature = "gpu")]` block, unlike
 //! `crate::budget` itself which stays wgpu-free so its arithmetic is
 //! unit-tested without a GPU.
@@ -13,10 +13,9 @@
 //! push made before the allocation loop. The pop future is ready on first
 //! poll, so `crate::device::block_on` resolves it immediately.
 
-use crate::budget::DeviceAllocProbe;
 use crate::device::block_on;
 
-/// Wraps a live `&wgpu::Device`: [`DeviceAllocProbe::try_reserve`] actually
+/// Wraps a live `&wgpu::Device`: [`WgpuAllocProbe::try_reserve`] actually
 /// allocates `bytes` worth of `COPY_DST`-only buffers (never `STORAGE`, so
 /// only `max_buffer_size` applies, not the smaller
 /// `max_storage_buffer_binding_size` -- `crate::limits`), chunked at the
@@ -30,10 +29,10 @@ impl<'a> WgpuAllocProbe<'a> {
     pub fn new(device: &'a wgpu::Device) -> Self {
         WgpuAllocProbe { device }
     }
-}
 
-impl DeviceAllocProbe for WgpuAllocProbe<'_> {
-    fn try_reserve(&self, bytes: u64) -> Result<(), String> {
+    /// Attempts to reserve `bytes` on the device, returning `Err` naming why
+    /// on refusal.
+    pub fn try_reserve(&self, bytes: u64) -> Result<(), String> {
         let device = self.device;
         let chunk = device.limits().max_buffer_size.max(1);
 

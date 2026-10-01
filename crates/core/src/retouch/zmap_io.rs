@@ -84,7 +84,7 @@ pub fn write_edited<W: Write + Seek>(
         let len = width as usize * band_height as usize;
         base.read_tile_into(band, &mut buf[..len])?;
 
-        if let Some(overlap) = brush::intersect(band, tile) {
+        if let Some(overlap) = band.intersect(tile) {
             for row in overlap.y..overlap.y + overlap.height {
                 let band_start = ((row - band.y) * width + overlap.x) as usize;
                 let session_start = ((row - tile.y) * tile.width + (overlap.x - tile.x)) as usize;

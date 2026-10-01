@@ -87,14 +87,26 @@ pub fn load(path: Option<&Path>) -> Result<Preset, String> {
     let Some(path) = path else {
         return Ok(Preset::default());
     };
-    let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    toml::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))
+    read_toml(path)
 }
 
 /// Serializes `preset` to `path`, creating or truncating it.
 pub fn write(preset: &Preset, path: &Path) -> Result<(), String> {
-    let text = toml::to_string_pretty(preset)
-        .map_err(|err| format!("{}: serializing the preset: {err}", path.display()))?;
+    write_toml(path, preset, "the preset")
+}
+
+/// Reads and parses the TOML file at `path`; both failures render as
+/// `"<path>: <detail>"`.
+pub(crate) fn read_toml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    toml::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+/// Serializes `value` to `path`, creating or truncating it. A serialization
+/// failure reads `"<path>: serializing <what>: <detail>"`.
+pub(crate) fn write_toml<T: Serialize>(path: &Path, value: &T, what: &str) -> Result<(), String> {
+    let text = toml::to_string_pretty(value)
+        .map_err(|err| format!("{}: serializing {what}: {err}", path.display()))?;
     std::fs::write(path, text).map_err(|err| format!("{}: {err}", path.display()))
 }
 

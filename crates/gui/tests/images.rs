@@ -15,44 +15,7 @@ use focusforge_gui::input_map::PointerKind;
 use focusforge_gui::job;
 use focusforge_gui::{AppController, OpenAs, OpenOutcome, ShellMode};
 
-// ---------------------------------------------------------------------
-// Fixture helpers.
-// ---------------------------------------------------------------------
-
-fn mantis_frame(index: usize) -> PathBuf {
-    common::workspace_root()
-        .join("fixtures")
-        .join("mantis-512")
-        .join("frames")
-        .join(format!("{index:02}.tif"))
-}
-
-fn tree(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp tree must be creatable");
-    dir
-}
-
-fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
-    std::fs::create_dir_all(dest_dir).unwrap();
-    std::fs::copy(mantis_frame(source_index), dest_dir.join(name))
-        .expect("fixture frame must copy");
-}
-
-fn controller_with_frames(name: &str, count: usize) -> AppController {
-    let root = tree(&format!("{name}_frames"));
-    for i in 0..count {
-        copy_frame(&root, &format!("{i:02}.tif"), i);
-    }
-    let mut controller = AppController::new();
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[root]),
-        OpenOutcome::Opened(_)
-    ));
-    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
-    controller
-}
+use common::{controller_with_frames, copy_frame, tree};
 
 fn write_timed(dir: &Path, name: &str, when: Option<&str>) -> PathBuf {
     let path = dir.join(name);

@@ -24,37 +24,19 @@ use focusforge_gui::job;
 use focusforge_gui::viewport::PaneRect;
 use focusforge_gui::{AppController, ChromeKey, OpenOutcome, ShellEvent, ShellMode};
 
+use common::copy_frame;
+
 // ---------------------------------------------------------------------
 // Fixture helpers -- copies only, never the committed fixture directory
 // itself, since a save writes a `.ffp` beside the frames it fused.
 // ---------------------------------------------------------------------
 
-fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
-    std::fs::create_dir_all(dest_dir).unwrap();
-    std::fs::copy(
-        common::fixture_frame("mantis-512", source_index),
-        dest_dir.join(name),
-    )
-    .expect("fixture frame must copy");
-}
-
-/// A controller with one unsaved project open over `count` copied fixture
-/// frames (named `00.tif`, `01.tif`, ... in fixture order), its own scratch
-/// root under `CARGO_TARGET_TMPDIR`.
+/// [`common::controller_with_frames`] on the `dummy-align` algorithm: these
+/// tabs exercise queueing, saving and closing, not alignment quality, and an
+/// algorithm that always converges keeps every run clean.
 fn controller_with_frames(name: &str, count: usize) -> AppController {
-    let root = common::tree(&format!("{name}_frames"));
-    for i in 0..count {
-        copy_frame(&root, &format!("{i:02}.tif"), i);
-    }
-    let mut controller = AppController::new();
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[root]),
-        OpenOutcome::Opened(_)
-    ));
-    // These tabs exercise queueing, saving and closing, not alignment
-    // quality; an algorithm that always converges keeps every run clean.
+    let mut controller = common::controller_with_frames(name, count);
     controller.set_align_algorithm("dummy-align");
-    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
     controller
 }
 

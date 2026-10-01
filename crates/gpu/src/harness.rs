@@ -72,7 +72,7 @@ impl GpuBackend {
     /// this probe already succeeded does not.
     fn probed(device: &'static SharedDevice, ceiling: Option<u64>) -> Result<GpuBackend, GpuError> {
         let probe = WgpuAllocProbe::new(device.device());
-        let device_budget = match probe_budget(&probe) {
+        let device_budget = match probe_budget(|bytes| probe.try_reserve(bytes)) {
             ProbeOutcome::Settled { bytes, .. } => DeviceBudget::probed(bytes),
             ProbeOutcome::Exhausted { floor, detail } => {
                 return Err(GpuError::VramExhausted {
@@ -377,15 +377,6 @@ fn forced_device_loss(device: &wgpu::Device) {
     }
 }
 
-impl std::fmt::Display for GpuBackend {
-    /// Delegates to [`GpuBackend::info`]'s own `Display` -- what lets
-    /// `crate::adapter::choose_path`'s `A: fmt::Display` bound name the real
-    /// adapter on the GPU arm, in `crates/cli/src/gpu.rs`.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.info())
-    }
-}
-
 /// Stores the `Result` so a failed probe (`GpuError::VramExhausted`) never
 /// poisons the lock: every later caller sees the same `Err`.
 static GPU_BACKEND: OnceLock<Result<GpuBackend, GpuError>> = OnceLock::new();
@@ -426,18 +417,47 @@ pub fn backend_for(
     if no_gpu {
         return (None, "--no-gpu given: forcing the CPU path".to_string());
     }
-    let (path, result, message) = crate::adapter::choose_path(false, gpu_backend_capped(max_vram));
-    match path {
-        crate::adapter::PathChoice::Gpu => (result.ok(), message),
-        crate::adapter::PathChoice::CpuFallback => (None, message),
+    match gpu_backend_capped(max_vram) {
+        Ok(backend) => (
+            Some(backend),
+            format!("adapter selected: {}; using the GPU path", backend.info()),
+        ),
+        Err(err) => (None, cpu_fallback_line(err)),
     }
+}
+
+/// Reason-led, because [`GpuError::VramExhausted`] (an adapter that cannot
+/// serve the minimum budget) falls back here exactly like a missing adapter.
+fn cpu_fallback_line(reason: &GpuError) -> String {
+    format!("{reason}; continuing on the CPU path")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::backend_for;
+    use super::{backend_for, cpu_fallback_line};
+    use crate::device::GpuError;
     use focusforge_core::algorithm::StackAlgorithm;
     use focusforge_core::fuse::laplacian::Laplacian;
+
+    #[test]
+    fn cpu_fallback_line_leads_with_the_reason() {
+        let exhausted = GpuError::VramExhausted {
+            floor_bytes: 268_435_456,
+            detail: "allocation refused".to_string(),
+        };
+        assert_eq!(
+            cpu_fallback_line(&exhausted),
+            "device cannot serve even the minimum VRAM budget of 268435456 bytes: \
+             allocation refused; continuing on the CPU path"
+        );
+        let no_adapter = GpuError::NoAdapter {
+            reason: "no backend available".to_string(),
+        };
+        assert_eq!(
+            cpu_fallback_line(&no_adapter),
+            "no usable GPU adapter: no backend available; continuing on the CPU path"
+        );
+    }
 
     #[test]
     fn backend_for_cpu_selection() {

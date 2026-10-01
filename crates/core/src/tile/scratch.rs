@@ -23,6 +23,31 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// rather than looping forever.
 const MAX_RETRIES: u32 = 64;
 
+/// Creates `base` (and its ancestors) if needed, then a unique child
+/// directory `focusforge-<pid>-<nanos>-<counter>` under it, using
+/// `create_dir` (which fails rather than silently reusing an existing
+/// directory) in a bounded retry loop. The directory is not removed on
+/// drop; the error carries the path that failed.
+pub(crate) fn unique_child_dir(base: &Path) -> Result<PathBuf, (PathBuf, std::io::Error)> {
+    fs::create_dir_all(base).map_err(|source| (base.to_path_buf(), source))?;
+
+    let pid = process::id();
+    let mut last_err = None;
+    for _ in 0..MAX_RETRIES {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = base.join(format!("focusforge-{pid}-{nanos}-{counter}"));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(source) => last_err = Some((candidate, source)),
+        }
+    }
+    Err(last_err.expect("MAX_RETRIES > 0"))
+}
+
 /// A uniquely named, run-scoped directory under some `base`, removed
 /// (recursively, best-effort) when this value is dropped.
 #[derive(Debug)]
@@ -40,32 +65,12 @@ impl ScratchDir {
     /// rather than silently reusing an existing directory) in a bounded
     /// retry loop.
     pub fn create_in(base: &Path) -> Result<Self, TileError> {
-        fs::create_dir_all(base).map_err(|source| TileError::Scratch {
-            path: base.to_path_buf(),
-            source,
-        })?;
-
-        let pid = process::id();
-        let mut last_err = None;
-        for _ in 0..MAX_RETRIES {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let candidate = base.join(format!("focusforge-{pid}-{nanos}-{counter}"));
-            match fs::create_dir(&candidate) {
-                Ok(()) => {
-                    return Ok(ScratchDir {
-                        path: candidate,
-                        closed: false,
-                    });
-                }
-                Err(source) => last_err = Some((candidate, source)),
-            }
-        }
-        let (path, source) = last_err.expect("MAX_RETRIES > 0");
-        Err(TileError::Scratch { path, source })
+        let path =
+            unique_child_dir(base).map_err(|(path, source)| TileError::Scratch { path, source })?;
+        Ok(ScratchDir {
+            path,
+            closed: false,
+        })
     }
 
     /// The directory's path, valid until this value is dropped or

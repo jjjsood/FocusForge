@@ -15,66 +15,14 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use common::{CliOutput, mantis_512_dir, tmp_dir};
+
 fn bin() -> Command {
     common::cli_bin("preset_cli")
 }
 
-fn mantis_512_dir() -> PathBuf {
-    common::fixtures_dir().join("mantis-512")
-}
-
-/// A fresh, empty directory used as the spawned process's working directory,
-/// so `.scratch/` lands there and never collides with another test's.
-/// Named per process, not just per test: `CARGO_TARGET_TMPDIR` resolves
-/// into a `target/` shared across concurrent test runs.
-struct TmpDir {
-    path: PathBuf,
-}
-
-impl std::ops::Deref for TmpDir {
-    type Target = Path;
-
-    fn deref(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            return;
-        }
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-fn tmp_dir(name: &str) -> TmpDir {
-    let path =
-        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).unwrap();
-    TmpDir { path }
-}
-
-struct CliOutput {
-    success: bool,
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
-    let output = bin()
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("failed to run binary");
-    CliOutput {
-        success: output.status.success(),
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    common::run_in(&mut bin(), dir, args)
 }
 
 fn write_preset(dir: &Path, name: &str, text: &str) -> PathBuf {

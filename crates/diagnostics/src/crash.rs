@@ -9,7 +9,6 @@ use std::io::{self, Write};
 use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ring::Ring;
 
@@ -79,7 +78,7 @@ fn write_report(
     backtrace: &str,
     ring: Vec<String>,
 ) -> Option<PathBuf> {
-    let seconds = now_seconds();
+    let seconds = focusforge_core::project::seal::now_unix();
     let location = info.location();
     let report = serde_json::json!({
         "format": CRASH_REPORT_FORMAT,
@@ -147,14 +146,6 @@ pub(crate) fn utc_stamp(unix_seconds: i64) -> String {
     let (year, month, day) = civil_from_unix(unix_seconds);
     let (hour, minute, second) = time_of_day(unix_seconds);
     format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
-}
-
-/// Now, as whole seconds since the Unix epoch.
-pub(crate) fn now_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// The same instant as an RFC 3339 UTC timestamp.

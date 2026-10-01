@@ -1674,11 +1674,15 @@ pub fn install(
     });
     app.on_undo_requested({
         let controller = controller.clone();
-        move || controller.lock().unwrap().undo()
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || dispatch(&controller, &canvas, &app_weak, AppController::undo)
     });
     app.on_redo_requested({
         let controller = controller.clone();
-        move || controller.lock().unwrap().redo()
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || dispatch(&controller, &canvas, &app_weak, AppController::redo)
     });
     // The run's own transport. `fuse-requested`/`retry-requested` start the
     // poll timer that feeds the rest; `pause-or-resume-requested` and
@@ -1857,10 +1861,9 @@ pub fn install(
             };
             let chrome = controller.lock().unwrap().chrome_key(text.as_str(), mods);
             match chrome {
-                ChromeKey::None => {
-                    record_direct_input();
-                    controller.lock().unwrap().key(true, text.as_str(), mods)
-                }
+                ChromeKey::None => dispatch(&controller, &canvas, &app_weak, |controller| {
+                    controller.key(true, text.as_str(), mods);
+                }),
                 ChromeKey::Consumed => record_gallery_input(),
                 ChromeKey::NewProject => {
                     record_surface_input(InputSurface::Other);

@@ -59,20 +59,7 @@ fn harness_kernel_matches_cpu_twin() {
 
     assert_eq!(gpu_tile.samples.len(), cpu_tile.samples.len());
 
-    let mut worst_delta: i32 = 0;
-    let mut worst_index = 0usize;
-    for (i, (g, c)) in gpu_tile
-        .samples
-        .iter()
-        .zip(cpu_tile.samples.iter())
-        .enumerate()
-    {
-        let delta = (i32::from(*g) - i32::from(*c)).abs();
-        if delta > worst_delta {
-            worst_delta = delta;
-            worst_index = i;
-        }
-    }
+    let (worst_delta, worst_index) = common::worst_delta(&gpu_tile.samples, &cpu_tile.samples);
 
     println!("parity: worst |delta|={worst_delta} at sample index {worst_index}");
     assert!(

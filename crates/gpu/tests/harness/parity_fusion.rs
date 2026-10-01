@@ -20,17 +20,13 @@ use focusforge_gpu::harness::gpu_backend;
 use focusforge_gpu::pack::{packed_len, unpack_samples};
 use focusforge_gpu::transfer::{create_storage_buffer, download_buffer, download_f32, upload_f32};
 
-use crate::common;
+use crate::common::{open_stack, worst_delta};
 
 /// `128 * f32::EPSILON`: the near-tie bound -- the separable score is 68
 /// `f32` adds per pixel at `radius = 8`, so two independently accumulated
 /// pipelines can differ by at most ~68 ulps of the score, rounded up to a
 /// power of two.
 const NEAR_TIE_REL: f32 = 128.0 * f32::EPSILON;
-
-fn open_stack() -> TiffStack {
-    TiffStack::open(common::mantis_512_dir()).expect("open mantis-512 fixture")
-}
 
 fn read_tile(stack: &TiffStack, frame: usize, rect: Rect, spp: u32) -> Tile {
     let mut samples = vec![0u16; (rect.width * rect.height * spp) as usize];
@@ -300,24 +296,6 @@ fn run_comparison(rect: Rect, levels: u32) -> Comparison {
     }
 }
 
-fn worst_composite_delta(cmp: &Comparison) -> (i32, usize) {
-    let mut worst = 0i32;
-    let mut worst_index = 0usize;
-    for (i, (&g, &c)) in cmp
-        .gpu_composite
-        .iter()
-        .zip(cmp.cpu_composite.iter())
-        .enumerate()
-    {
-        let delta = (i32::from(g) - i32::from(c)).abs();
-        if delta > worst {
-            worst = delta;
-            worst_index = i;
-        }
-    }
-    (worst, worst_index)
-}
-
 /// For a Z-Map pixel where the GPU and CPU disagree: the CPU's own
 /// level-0 winning and runner-up scores at that pixel, recomputed from
 /// every frame's own pyramid.
@@ -376,7 +354,7 @@ fn composite_matches_cpu_within_one_lsb() {
         height: 352,
     };
     let cmp = run_comparison(rect, 5);
-    let (worst, worst_index) = worst_composite_delta(&cmp);
+    let (worst, worst_index) = worst_delta(&cmp.gpu_composite, &cmp.cpu_composite);
     println!("composite parity: worst |delta|={worst} at sample index {worst_index}");
     assert!(
         worst <= 1,
@@ -413,7 +391,7 @@ fn overlap_edge_tile_matches_cpu() {
         height: 352,
     };
     let cmp = run_comparison(rect, 5);
-    let (worst, worst_index) = worst_composite_delta(&cmp);
+    let (worst, worst_index) = worst_delta(&cmp.gpu_composite, &cmp.cpu_composite);
     println!("overlap-edge composite parity: worst |delta|={worst} at sample index {worst_index}");
     assert!(
         worst <= 1,
@@ -576,7 +554,7 @@ fn interior_tile_matches_cpu() {
         height: 200,
     };
     let cmp = run_comparison(rect, 3);
-    let (worst, worst_index) = worst_composite_delta(&cmp);
+    let (worst, worst_index) = worst_delta(&cmp.gpu_composite, &cmp.cpu_composite);
     println!("interior composite parity: worst |delta|={worst} at sample index {worst_index}");
     assert!(
         worst <= 1,
