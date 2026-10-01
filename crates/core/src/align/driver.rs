@@ -47,7 +47,9 @@ use rayon::prelude::*;
 
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, AlignStatus, TileReader};
 use crate::align::Transform;
-use crate::align::ecc_algorithm::{retained_template_bytes, solve_scratch_bytes};
+use crate::align::ecc_algorithm::{
+    retained_template_bytes, seed_scratch_bytes, solve_scratch_bytes,
+};
 use crate::job::{ControlState, JobControl};
 use crate::params::{ParamValue, ParamValues, StackContext};
 use crate::tile::HostBudget;
@@ -181,7 +183,8 @@ impl Default for AlignDriverOptions<'_> {
 
 /// The bytes an anchor run holds live once, however many workers there are:
 /// the reference's coarse pyramid, the reference templates the solver retains
-/// for every level and the off-centre patch templates.
+/// for every level, the off-centre patch templates and the reference's feature
+/// set, detected at most once per run.
 ///
 /// ```text
 /// plane                   = width * height * 4   // f32 luma
@@ -192,9 +195,10 @@ impl Default for AlignDriverOptions<'_> {
 /// The `1/3` is the infinite geometric sum `1/4 + 1/16 + ...`, so the
 /// pyramid figure is an upper bound independent of pyramid depth; level 0 is
 /// never resident. At 8192x5464x3 the coarse pyramid is ~59.7 MB, the level
-/// templates ~161.4 MB and the patch templates ~33.0 MB, ~254.1 MB together;
-/// at the 512x512x3 fixture ~15.2 MB. The templates are priced in
-/// rotation-scale mode; a translation run retains less.
+/// templates ~161.4 MB, the patch templates ~33.0 MB and the feature set
+/// 0.14 MB, ~254.3 MB together; at the 512x512x3 fixture ~15.3 MB. The
+/// templates are priced in rotation-scale mode; a translation run retains
+/// less.
 pub fn bytes_shared_reference(stack: StackContext) -> u64 {
     let plane = stack.width as u64 * stack.height as u64 * 4;
     plane / 3 + retained_template_bytes(stack.width, stack.height)
@@ -211,23 +215,33 @@ pub fn bytes_shared_reference(stack: StackContext) -> u64 {
 /// rows       = band_rows + 5                           // input rows of one band, with its halo
 /// stream     = width * rows * (2 * spp + 7)            // u16 band, f32 luma band, reduce passes
 /// solve      = solve_scratch_bytes(width, height, spp) // per-solve vectors and windows
-/// bytes_per_registration = coarse + max(stream, solve)
+/// seed       = seed_scratch_bytes(width, height, spp)  // detector scale space, frame features
+/// bytes_per_registration = coarse + max(stream, solve, seed)
 /// ```
 ///
 /// `band_rows` is `DEFAULT_TILE_SIZE`, the input band height
 /// `PyramidalEcc::build_pyramid` streams with. The streaming buffers are
-/// dropped before the solve allocates its own, so the two never coexist. At
-/// 8192x5464x3 this is ~114.7 MB; at the 512x512x3 fixture ~7.8 MB.
+/// dropped before the solve allocates its own, so the two never coexist, and
+/// the escalation runs after the solve's buffers are gone. At 8192x5464x3 this
+/// is ~114.7 MB (the detector searches level 4, 512x342, for 33.8 MB); at the
+/// 512x512x3 fixture ~53.4 MB, nearly all of it the detector's scale space on
+/// the whole frame.
 pub fn bytes_per_registration(stack: StackContext, band_rows: u32) -> u64 {
     let plane = stack.width as u64 * stack.height as u64 * 4;
     let rows = band_rows as u64 + 5;
     let stream = stack.width as u64 * rows * (2 * stack.samples_per_pixel as u64 + 7);
     plane / 3
-        + stream.max(solve_scratch_bytes(
-            stack.width,
-            stack.height,
-            stack.samples_per_pixel,
-        ))
+        + stream
+            .max(solve_scratch_bytes(
+                stack.width,
+                stack.height,
+                stack.samples_per_pixel,
+            ))
+            .max(seed_scratch_bytes(
+                stack.width,
+                stack.height,
+                stack.samples_per_pixel,
+            ))
 }
 
 /// The pure arithmetic behind the anchor arm's worker count: mirrors
@@ -892,13 +906,13 @@ mod tests {
     #[test]
     fn the_split_sums_to_369_mb_at_the_reference_scale() {
         // Shared: the reference's coarse pyramid, the retained level
-        // templates and the patch templates. Per registration: the frame's
+        // templates, the patch templates and the feature set. Per registration: the frame's
         // coarse pyramid plus the streaming band, which outweighs the solve
         // scratch and windows (54.9 MB).
         let stack = StackContext::new(61, 8192, 5464, 3);
         let shared = bytes_shared_reference(stack);
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
-        assert_eq!(shared, 59_681_450 + 161_361_640 + 33_030_144);
+        assert_eq!(shared, 59_681_450 + 161_361_640 + 33_030_144 + 2000 * 72);
         assert_eq!(per_registration, 59_681_450 + 8192 * 517 * 13);
         let ratio = (shared + per_registration) as f64 / 369_000_000f64;
         assert!(
@@ -935,7 +949,7 @@ mod tests {
         let shared = bytes_shared_reference(stack);
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
         let patches = 8 * 384 * 384 * 28;
-        assert_eq!(shared, 32_000_000 + 141_772_400 + patches);
+        assert_eq!(shared, 32_000_000 + 141_772_400 + patches + 2000 * 72);
         let solve = 24 * 1254 * 836 + 1766 * 1348 * 6 + 772 * 772 * 6;
         let stream = 6000 * (DEFAULT_TILE_SIZE as u64 + 5) * 9;
         assert!(solve > stream);
@@ -953,7 +967,7 @@ mod tests {
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
         let plane = 8192u64 * 5464 * 4;
         let patches = 8 * 384 * 384 * 28;
-        assert_eq!(shared, plane / 3 + 161_361_640 + patches);
+        assert_eq!(shared, plane / 3 + 161_361_640 + patches + 2000 * 72);
         let stream = 8192 * (DEFAULT_TILE_SIZE as u64 + 5) * 13;
         let solve = 24 * 1253 * 836 + 1765 * 1348 * 10 + 772 * 772 * 10;
         assert!(stream > solve);
@@ -993,7 +1007,10 @@ mod tests {
         let solve = 24 * 384 * 384u64 + 512 * 512 * 10 + 260 * 260 * 10;
         let rows = DEFAULT_TILE_SIZE as u64 + 5;
         let stream = width as u64 * rows * (2 * spp as u64 + 7);
-        let floor = pyramid_bytes + stream.max(solve);
+        // The escalation's detector runs on the whole frame: 192 bytes of
+        // scale space per pixel, the frame read in and 2000 features.
+        let seed = 512 * 512 * (192 + 10) + 2000 * 72;
+        let floor = pyramid_bytes + stream.max(solve).max(seed);
 
         let stack = StackContext::new(8, width, height, spp);
         let bpr = bytes_per_registration(stack, DEFAULT_TILE_SIZE);

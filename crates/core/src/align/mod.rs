@@ -18,6 +18,7 @@ mod driver;
 mod ecc;
 mod ecc_algorithm;
 mod error;
+mod feature_seed;
 mod pyramid;
 mod transform;
 pub mod warp;
@@ -35,6 +36,9 @@ pub use ecc::{
 };
 pub use ecc_algorithm::{EccLevelRecord, PyramidalEcc};
 pub use error::AlignError;
+pub use feature_seed::{
+    FeatureSeedError, Features, SeedFit, detector_threshold, fit_between, seed_between,
+};
 pub use pyramid::{AlignPyramid, LumaAssembler, max_levels};
 pub use transform::{KERNEL_RADIUS, SourceFootprint, Transform};
 pub use warp_reader::{Registration, WarpingReader};

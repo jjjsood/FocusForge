@@ -91,6 +91,10 @@ pub enum TimingCounter {
     /// Registrations whose level-0 result left the bounded frame window the
     /// solve read.
     Level0WindowMisses,
+    /// Diverged registrations that ran the feature detector for a seeded re-run.
+    FeatureSeedAttempts,
+    /// Feature-seeded re-runs whose outcome replaced the identity-start one.
+    FeatureSeedsAccepted,
 }
 
 impl TimingCounter {
@@ -119,6 +123,8 @@ impl TimingCounter {
             Self::BufferCreations => "buffer_creations",
             Self::ReadbackBytes => "readback_bytes",
             Self::Level0WindowMisses => "level0_window_misses",
+            Self::FeatureSeedAttempts => "feature_seed_attempts",
+            Self::FeatureSeedsAccepted => "feature_seeds_accepted",
         }
     }
 }
@@ -151,6 +157,8 @@ pub struct TimingSnapshot {
     pub buffer_creations: u64,
     pub readback_bytes: u64,
     pub level0_window_misses: u64,
+    pub feature_seed_attempts: u64,
+    pub feature_seeds_accepted: u64,
     pub gpu_execution_available: bool,
     pub presentation_available: bool,
     pub saturated: bool,
@@ -183,6 +191,8 @@ struct TimingState {
     buffer_creations: AtomicU64,
     readback_bytes: AtomicU64,
     level0_window_misses: AtomicU64,
+    feature_seed_attempts: AtomicU64,
+    feature_seeds_accepted: AtomicU64,
     saturated: AtomicBool,
     summary_emitted: AtomicBool,
 }
@@ -216,6 +226,8 @@ impl TimingState {
             buffer_creations: AtomicU64::new(0),
             readback_bytes: AtomicU64::new(0),
             level0_window_misses: AtomicU64::new(0),
+            feature_seed_attempts: AtomicU64::new(0),
+            feature_seeds_accepted: AtomicU64::new(0),
             saturated: AtomicBool::new(false),
             summary_emitted: AtomicBool::new(false),
         }
@@ -262,6 +274,8 @@ impl TimingState {
             TimingCounter::BufferCreations => &self.buffer_creations,
             TimingCounter::ReadbackBytes => &self.readback_bytes,
             TimingCounter::Level0WindowMisses => &self.level0_window_misses,
+            TimingCounter::FeatureSeedAttempts => &self.feature_seed_attempts,
+            TimingCounter::FeatureSeedsAccepted => &self.feature_seeds_accepted,
         };
         saturating_add(slot, value, &self.saturated);
     }
@@ -305,6 +319,8 @@ impl TimingState {
             buffer_creations: self.buffer_creations.load(Ordering::Relaxed),
             readback_bytes: self.readback_bytes.load(Ordering::Relaxed),
             level0_window_misses: self.level0_window_misses.load(Ordering::Relaxed),
+            feature_seed_attempts: self.feature_seed_attempts.load(Ordering::Relaxed),
+            feature_seeds_accepted: self.feature_seeds_accepted.load(Ordering::Relaxed),
             gpu_execution_available: false,
             presentation_available: false,
             saturated: self.saturated.load(Ordering::Relaxed),
@@ -479,6 +495,8 @@ pub fn emit_timing_summary() {
         buffer_creations = snapshot.buffer_creations,
         readback_bytes = snapshot.readback_bytes,
         level0_window_misses = snapshot.level0_window_misses,
+        feature_seed_attempts = snapshot.feature_seed_attempts,
+        feature_seeds_accepted = snapshot.feature_seeds_accepted,
         gpu_execution_available = snapshot.gpu_execution_available,
         presentation_available = snapshot.presentation_available,
         saturated = snapshot.saturated,
@@ -706,6 +724,26 @@ mod accounting_tests {
         assert!(snapshot.saturated);
         assert!(state.begin_summary());
         assert!(!state.begin_summary());
+    }
+
+    #[test]
+    fn the_feature_seed_counters_accumulate_and_snapshot() {
+        let state = TimingState::new(2);
+
+        state.add(TimingCounter::FeatureSeedAttempts, 3);
+        state.add(TimingCounter::FeatureSeedAttempts, 1);
+        state.add(TimingCounter::FeatureSeedsAccepted, 2);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.feature_seed_attempts, 4);
+        assert_eq!(snapshot.feature_seeds_accepted, 2);
+        assert_eq!(
+            TimingCounter::FeatureSeedAttempts.name(),
+            "feature_seed_attempts"
+        );
+        assert_eq!(
+            TimingCounter::FeatureSeedsAccepted.name(),
+            "feature_seeds_accepted"
+        );
     }
 
     #[test]

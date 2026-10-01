@@ -52,14 +52,16 @@
 //! usable ones exceed [`VALIDATION_TOLERANCE_PX`] is reported
 //! [`crate::align::DivergenceReason::ValidationFailed`], fit kept.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus};
 use crate::align::ecc::{EccTemplate, solve_prepared};
+use crate::align::feature_seed::{MAX_FEATURES, SEED_PROXY_LONG_SIDE};
 use crate::align::pyramid::StreamError;
 use crate::align::{
     AlignError, AlignPyramid, DivergenceReason, EccIteration, EccMode, EccParams, EccResult,
-    EccStatus, KERNEL_RADIUS, LumaAssembler, SourceFootprint, Transform,
+    EccStatus, Features, KERNEL_RADIUS, LumaAssembler, SeedFit, SourceFootprint, Transform,
+    fit_between,
 };
 use crate::fuse::pyramid::Plane;
 use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
@@ -329,11 +331,20 @@ fn patch_grid(width: u32, height: u32) -> Vec<Rect> {
     grid
 }
 
+/// Bytes one set of features holds at most: a keypoint (two `f64`) and a
+/// 64-byte descriptor per feature.
+const FEATURE_SET_BYTES: u64 = MAX_FEATURES as u64 * (64 + 8);
+
+/// Bytes of scale space the detector allocates per pixel of the level it
+/// searches: nine `f32` images per evolution step over four octaves of four
+/// sublevels.
+const DETECTOR_BYTES_PER_PX: u64 = 192;
+
 /// Bytes of reference templates a run retains, over every level the
 /// pyramid can have (`ceil(dim / 2^k)`, `k` up to [`MAX_LEVELS`]): per
 /// solve-region pixel a value (4 B), a four-column Jacobian (32 B) and the
 /// full-overlap term (8 B), the rotation-scale mode being the larger one --
-/// plus the off-centre patch templates.
+/// plus the off-centre patch templates and the reference's feature set.
 pub(crate) fn retained_template_bytes(width: u32, height: u32) -> u64 {
     let levels: u64 = (0..=MAX_LEVELS)
         .map(|k| {
@@ -346,7 +357,24 @@ pub(crate) fn retained_template_bytes(width: u32, height: u32) -> u64 {
         .iter()
         .map(|p| p.width as u64 * p.height as u64 * PATCH_TEMPLATE_BYTES_PER_PX)
         .sum();
-    levels + patches
+    levels + patches + FEATURE_SET_BYTES
+}
+
+/// Bytes one escalation allocates besides the pyramids: the detector's scale
+/// space over the seed level, that level's own read at `4 + 2 * spp` bytes per
+/// pixel when it is level 0, and the frame's feature set. Zero for a frame no
+/// level of which is small enough to search.
+pub(crate) fn seed_scratch_bytes(width: u32, height: u32, spp: u32) -> u64 {
+    let Some(level) = seed_level(width, height, MAX_LEVELS) else {
+        return 0;
+    };
+    let px = u64::from(width.div_ceil(1 << level)) * u64::from(height.div_ceil(1 << level));
+    let read = if level == 0 {
+        px * (4 + 2 * u64::from(spp))
+    } else {
+        0
+    };
+    px * DETECTOR_BYTES_PER_PX + read + FEATURE_SET_BYTES
 }
 
 /// Bytes one solve allocates besides the templates: three 8-byte-per-pixel
@@ -471,7 +499,7 @@ impl PyramidalEcc {
         ctx: &AlignContext<'_>,
         frame: usize,
         cfg: &ParamValues,
-        mut levels: Option<&mut Vec<EccLevelRecord>>,
+        levels: Option<&mut Vec<EccLevelRecord>>,
     ) -> Result<AlignOutcome, AlgorithmError> {
         crate::params::validate(self.params(), cfg)?;
 
@@ -529,12 +557,166 @@ impl PyramidalEcc {
                 &built
             }
         };
-        let frame_pyramid = Self::build_pyramid(ctx, frame, depth)?;
+        let (attempt, escalation) =
+            Self::register(ctx, frame, reference, depth, &params, levels.is_some())?;
+        if escalation.attempted {
+            record_timing(TimingCounter::FeatureSeedAttempts, 1);
+        }
+        if escalation.accepted {
+            record_timing(TimingCounter::FeatureSeedsAccepted, 1);
+        }
+        if let Some(out) = levels {
+            out.extend(attempt.records);
+        }
+        Ok(AlignOutcome {
+            transform: attempt.transform,
+            status: attempt.status,
+            iterations: attempt.iterations,
+            residual: attempt.residual,
+        })
+    }
 
+    /// Registers `frame` against the reference from an identity start. A frame
+    /// that diverges gets exactly one more run, from a feature-based seed, and
+    /// that run's outcome replaces the first only when it does not diverge.
+    fn register(
+        ctx: &AlignContext<'_>,
+        frame: usize,
+        reference: &PreparedReference,
+        depth: u32,
+        params: &EccParams,
+        traced: bool,
+    ) -> Result<(Attempt, Escalation), AlgorithmError> {
+        let frame_pyramid = Self::build_pyramid(ctx, frame, depth)?;
+        let first = Self::solve_from(
+            ctx,
+            frame,
+            reference,
+            &frame_pyramid,
+            depth,
+            params,
+            Transform::identity(),
+            traced,
+        )?;
+        let mut escalation = Escalation::default();
+        if !matches!(first.status, AlignStatus::Diverged(_)) {
+            return Ok((first, escalation));
+        }
+        let Some(seed) = Self::feature_seed(
+            ctx,
+            frame,
+            reference,
+            &frame_pyramid,
+            depth,
+            &mut escalation,
+        )?
+        else {
+            return Ok((first, escalation));
+        };
+        escalation.rerun = true;
+        let seeded = Self::solve_from(
+            ctx,
+            frame,
+            reference,
+            &frame_pyramid,
+            depth,
+            params,
+            seed,
+            traced,
+        )?;
+        if matches!(seeded.status, AlignStatus::Diverged(_)) {
+            return Ok((first, escalation));
+        }
+        escalation.accepted = true;
+        Ok((seeded, escalation))
+    }
+
+    /// A start for the coarsest level, in its pixels, fitted from matched
+    /// features between the reference and `frame` on the seed level; `None`
+    /// when no level within `depth` is small enough to search, the detector
+    /// refuses a level, or the fit fails the inlier and coverage gates.
+    fn feature_seed(
+        ctx: &AlignContext<'_>,
+        frame: usize,
+        reference: &PreparedReference,
+        frame_pyramid: &AlignPyramid,
+        depth: u32,
+        escalation: &mut Escalation,
+    ) -> Result<Option<Transform>, AlgorithmError> {
+        let stack = ctx.stack();
+        let Some(level) = seed_level(stack.width, stack.height, depth) else {
+            return Ok(None);
+        };
+        escalation.attempted = true;
+        let _scope = measurement_scope("feature_seed");
+        let Some(reference_features) = reference
+            .features
+            .get_or_init(|| detect_level(ctx, reference.reference, &reference.pyramid, level))
+            .as_ref()
+            .map_err(wrap_error)?
+        else {
+            return Ok(None);
+        };
+        let Some(frame_features) = detect_level(ctx, frame, frame_pyramid, level)? else {
+            return Ok(None);
+        };
+        let dims = (
+            stack.width.div_ceil(1 << level),
+            stack.height.div_ceil(1 << level),
+        );
+        let fit = fit_between(reference_features, &frame_features, dims);
+        tracing::debug!(
+            level,
+            keypoints_reference = reference_features.len(),
+            keypoints_frame = frame_features.len(),
+            matches = fit.map_or(0, |f| f.matches),
+            inliers = fit.map_or(0, |f| f.inliers),
+            occupied_cells = fit.map_or(0, |f| f.occupied_cells),
+            "feature seed"
+        );
+        let Some(fit) = fit.filter(SeedFit::accepted) else {
+            return Ok(None);
+        };
+        let lifted = lift_seed(&fit.transform, level, depth);
+        Ok(Some(match reference.mode {
+            EccMode::Similarity => lifted,
+            // A translation template never updates rotation or scale, so the
+            // seed keeps only its displacement at the coarsest region's centre.
+            EccMode::Translation => {
+                let region = reference.templates[depth as usize]
+                    .as_ref()
+                    .map_err(wrap_error)?
+                    .region();
+                let cx = f64::from(region.x) + (f64::from(region.width) - 1.0) / 2.0;
+                let cy = f64::from(region.y) + (f64::from(region.height) - 1.0) / 2.0;
+                let m = lifted.m;
+                Transform::translation(
+                    m[0][0] * cx + m[0][1] * cy + m[0][2] - cx,
+                    m[1][0] * cx + m[1][1] * cy + m[1][2] - cy,
+                )
+            }
+        }))
+    }
+
+    /// One coarse-to-fine pass from `start`, a transform in the coarsest
+    /// level's pixels, then the off-centre check on a fit that converged. With
+    /// `traced`, the attempt carries one [`EccLevelRecord`] per level solved.
+    #[allow(clippy::too_many_arguments)]
+    fn solve_from(
+        ctx: &AlignContext<'_>,
+        frame: usize,
+        reference: &PreparedReference,
+        frame_pyramid: &AlignPyramid,
+        depth: u32,
+        params: &EccParams,
+        start: Transform,
+        traced: bool,
+    ) -> Result<Attempt, AlgorithmError> {
         let up = Transform::similarity(2.0, 0.0, 0.0, 0.0);
         let down = Transform::similarity(0.5, 0.0, 0.0, 0.0);
 
-        let mut seed = Transform::identity();
+        let mut seed = start;
+        let mut records = Vec::new();
         let mut total_iterations = 0u32;
         let mut final_transform = Transform::identity();
         let mut final_status = AlignStatus::Converged;
@@ -547,14 +729,14 @@ impl PyramidalEcc {
                 .as_ref()
                 .map_err(wrap_error)?;
 
-            let mut trace = levels.is_some().then(Vec::new);
+            let mut trace = traced.then(Vec::new);
             let result = if k == 0 {
                 let solved = solve_level0(
                     ctx,
                     frame,
                     template,
                     &seed,
-                    &params,
+                    params,
                     LEVEL0_WINDOW_MARGIN_PX,
                     trace.as_mut(),
                 )?;
@@ -566,12 +748,12 @@ impl PyramidalEcc {
                     frame_pyramid.level(k as usize),
                     (0, 0),
                     &seed,
-                    &params,
+                    params,
                     trace.as_mut(),
                 )
             };
-            if let Some(recs) = levels.as_deref_mut() {
-                recs.push(EccLevelRecord {
+            if traced {
+                records.push(EccLevelRecord {
                     level: k,
                     result,
                     trace: trace.unwrap_or_default(),
@@ -607,18 +789,90 @@ impl PyramidalEcc {
 
         if matches!(final_status, AlignStatus::Converged | AlignStatus::HitCap) {
             let _scope = measurement_scope("ecc_validate");
-            let check = reference.validate(ctx, frame, &final_transform, &params)?;
+            let check = reference.validate(ctx, frame, &final_transform, params)?;
             if check.flagged() {
                 final_status = AlignStatus::Diverged(DivergenceReason::ValidationFailed);
             }
         }
 
-        Ok(AlignOutcome {
+        Ok(Attempt {
             transform: final_transform,
             status: final_status,
             iterations: total_iterations,
             residual: final_residual,
+            records,
         })
+    }
+}
+
+/// One coarse-to-fine pass's outcome and, when traced, its per-level records.
+#[derive(Debug)]
+struct Attempt {
+    transform: Transform,
+    status: AlignStatus,
+    iterations: u32,
+    residual: f64,
+    records: Vec<EccLevelRecord>,
+}
+
+/// What escalating a diverged frame did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Escalation {
+    /// The detector ran on the frame.
+    attempted: bool,
+    /// The fit passed the gates and a seeded pass ran.
+    rerun: bool,
+    /// The seeded pass did not diverge and its outcome is the one reported.
+    accepted: bool,
+}
+
+/// The finest pyramid level within `depth` whose long side is at most
+/// [`SEED_PROXY_LONG_SIDE`]; `None` when no level qualifies, so a frame is
+/// never searched at a size the accounting does not price.
+fn seed_level(width: u32, height: u32, depth: u32) -> Option<u32> {
+    (0..=depth)
+        .find(|&k| width.div_ceil(1 << k).max(height.div_ceil(1 << k)) <= SEED_PROXY_LONG_SIDE)
+}
+
+/// A transform in level-`from` pixels as the solver's coarsest level (`depth`)
+/// sees it: the inverse of the seed hand-off between levels.
+fn lift_seed(seed: &Transform, from: u32, depth: u32) -> Transform {
+    let up = Transform::similarity(2.0, 0.0, 0.0, 0.0);
+    let down = Transform::similarity(0.5, 0.0, 0.0, 0.0);
+    (from..depth).fold(*seed, |t, _| down.compose(&t).compose(&up))
+}
+
+/// Features of `frame` at pyramid `level` (level 0 is read whole, only when
+/// [`seed_level`] chose it); `None` when the detector refuses the plane.
+fn detect_level(
+    ctx: &AlignContext<'_>,
+    frame: usize,
+    pyramid: &AlignPyramid,
+    level: u32,
+) -> Result<Option<Features>, AlgorithmError> {
+    let whole;
+    let plane = if level == 0 {
+        let stack = ctx.stack();
+        whole = read_luma_window(
+            ctx,
+            frame,
+            Rect {
+                x: 0,
+                y: 0,
+                width: stack.width,
+                height: stack.height,
+            },
+        )?;
+        &whole
+    } else {
+        pyramid.level(level as usize)
+    };
+    match Features::detect(plane) {
+        Ok(features) => Ok(Some(features)),
+        Err(refused) => {
+            tracing::debug!(%refused, "no feature seed");
+            Ok(None)
+        }
     }
 }
 
@@ -815,6 +1069,10 @@ struct PreparedReference {
     /// `run` reports it per frame.
     templates: Vec<Result<EccTemplate, AlignError>>,
     patches: Vec<PatchTemplate>,
+    /// The reference's features on the seed level, detected by the first
+    /// escalation of a run and shared by the rest; `None` when the detector
+    /// refuses that level.
+    features: OnceLock<Result<Option<Features>, AlgorithmError>>,
 }
 
 impl PreparedReference {
@@ -860,6 +1118,7 @@ impl PreparedReference {
             pyramid,
             templates,
             patches,
+            features: OnceLock::new(),
         })
     }
 
@@ -991,6 +1250,7 @@ inventory::submit! { AlignRegistration::new(&PyramidalEcc) }
 mod tests {
     use super::*;
     use crate::algorithm::TileReader;
+    use crate::align::feature_seed::test_scene::blob_scene;
     use crate::align::pyramid::max_levels;
 
     #[test]
@@ -1093,14 +1353,14 @@ mod tests {
         // budget binds), then the 0.75 share of each halved level; 44 bytes
         // per pixel (values, Jacobian, full-overlap terms).
         // The eight 384 px (128 px at 512) patch templates, 28 bytes per
-        // pixel, come on top.
+        // pixel, and the reference's 2000 features (72 bytes each) come on top.
         assert_eq!(
             retained_template_bytes(8192, 5464),
-            161_361_640 + 8 * 384 * 384 * 28
+            161_361_640 + 8 * 384 * 384 * 28 + 2000 * 72
         );
         assert_eq!(
             retained_template_bytes(512, 512),
-            8_650_400 + 8 * 128 * 128 * 28
+            8_650_400 + 8 * 128 * 128 * 28 + 2000 * 72
         );
     }
 
@@ -1119,6 +1379,27 @@ mod tests {
         assert_eq!(
             solve_scratch_bytes(8192, 5464, 1),
             24 * 1253 * 836 + 1765 * 1348 * 6 + 772 * 772 * 6
+        );
+    }
+
+    #[test]
+    fn seed_scratch_prices_the_detector_on_the_seed_level() {
+        // 8192x5464 is searched on level 4 (512x342): 192 bytes per pixel of
+        // scale space plus the frame's 2000 features (72 bytes each).
+        assert_eq!(
+            seed_scratch_bytes(8192, 5464, 3),
+            512 * 342 * 192 + 2000 * 72
+        );
+        // A 512 px frame is searched whole at level 0, which is also read
+        // in: `4 + 2 * spp` bytes per pixel.
+        assert_eq!(
+            seed_scratch_bytes(512, 512, 3),
+            512 * 512 * (192 + 10) + 2000 * 72
+        );
+        assert_eq!(
+            seed_scratch_bytes(1 << 26, 1 << 26, 1),
+            0,
+            "no level to search"
         );
     }
 
@@ -1476,5 +1757,227 @@ mod tests {
         // sqrt(2^20 / (6144*4098)) and flooring yields exactly this.
         assert_eq!(region.width, 1253);
         assert_eq!(region.height, 836);
+    }
+
+    /// Frames of the blob scene, each moved by its shift: feature-rich, unlike
+    /// the smooth sinusoid scene, whose near-periodic detail matches wrongly.
+    fn blob_reader(shifts: &[(f64, f64)]) -> MemReader {
+        MemReader {
+            width: W,
+            frames: shifts
+                .iter()
+                .map(|&(sx, sy)| {
+                    blob_scene(W, H, &Transform::translation(sx, sy), 1.0)
+                        .iter()
+                        .map(|&v| v.clamp(0.0, 65535.0) as u16)
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
+    /// Frame `frame` of `mem` registered at `depth` in `mode` against frame
+    /// 0: the reference, the outcome and what the escalation did.
+    fn registered(
+        mem: &MemReader,
+        mode: EccMode,
+        depth: u32,
+        frame: usize,
+    ) -> (PreparedReference, Attempt, Escalation) {
+        let ctx = AlignContext::new(StackContext::new(mem.frames.len(), W, H, 1), 0, mem);
+        let reference = PreparedReference::build(&ctx, 0, mode, depth).unwrap();
+        let (attempt, escalation) =
+            PyramidalEcc::register(&ctx, frame, &reference, depth, &test_params(400), false)
+                .unwrap();
+        (reference, attempt, escalation)
+    }
+
+    /// The identity-start attempt alone: what a frame gets with no escalation.
+    fn unseeded(mem: &MemReader, mode: EccMode, depth: u32, frame: usize) -> Attempt {
+        let ctx = AlignContext::new(StackContext::new(mem.frames.len(), W, H, 1), 0, mem);
+        let reference = PreparedReference::build(&ctx, 0, mode, depth).unwrap();
+        let pyramid = PyramidalEcc::build_pyramid(&ctx, frame, depth).unwrap();
+        PyramidalEcc::solve_from(
+            &ctx,
+            frame,
+            &reference,
+            &pyramid,
+            depth,
+            &test_params(400),
+            Transform::identity(),
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_converging_frame_never_runs_the_detector() {
+        let mem = reader(W, H, &[(0.0, 0.0), (3.0, -2.0)], false);
+        for mode in [EccMode::Translation, EccMode::Similarity] {
+            let (reference, attempt, escalation) = registered(&mem, mode, 2, 1);
+            assert!(matches!(
+                attempt.status,
+                AlignStatus::Converged | AlignStatus::HitCap
+            ));
+            assert_eq!(escalation, Escalation::default(), "{mode:?}");
+            assert!(reference.features.get().is_none(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn a_shift_past_the_identity_starts_reach_converges_seeded_in_both_modes() {
+        let mem = blob_reader(&[(0.0, 0.0), (150.0, -90.0)]);
+        for mode in [EccMode::Translation, EccMode::Similarity] {
+            let first = unseeded(&mem, mode, 2, 1);
+            assert!(
+                matches!(first.status, AlignStatus::Diverged(_)),
+                "{mode:?}: {first:?}"
+            );
+
+            let (reference, attempt, escalation) = registered(&mem, mode, 2, 1);
+            assert_eq!(
+                escalation,
+                Escalation {
+                    attempted: true,
+                    rerun: true,
+                    accepted: true
+                },
+                "{mode:?}"
+            );
+            assert!(reference.features.get().is_some());
+            assert!(
+                matches!(attempt.status, AlignStatus::Converged | AlignStatus::HitCap),
+                "{mode:?}: {attempt:?}"
+            );
+            let (scale, radians, tx, ty) = attempt.transform.similarity_parts();
+            assert!(
+                (tx - 150.0).abs() < 0.05 && (ty + 90.0).abs() < 0.05,
+                "{mode:?}: ({tx}, {ty})"
+            );
+            if mode == EccMode::Translation {
+                assert_eq!((scale, radians), (1.0, 0.0), "a pure translation");
+            }
+        }
+    }
+
+    #[test]
+    fn a_quasi_periodic_scene_keeps_its_identity_start_outcome() {
+        // The smooth sinusoid scene matches a half-turn of itself on a
+        // fifth of the matches: not a seed.
+        let mem = reader(W, H, &[(0.0, 0.0), (150.0, -90.0)], false);
+        let (_, attempt, escalation) = registered(&mem, EccMode::Similarity, 2, 1);
+        let first = unseeded(&mem, EccMode::Similarity, 2, 1);
+        assert!(
+            matches!(first.status, AlignStatus::Diverged(_)),
+            "{first:?}"
+        );
+        assert_eq!(
+            escalation,
+            Escalation {
+                attempted: true,
+                rerun: false,
+                accepted: false
+            }
+        );
+        assert_eq!(attempt.transform, first.transform);
+    }
+
+    #[test]
+    fn a_frame_with_no_features_keeps_its_identity_start_outcome() {
+        let mut mem = reader(W, H, &[(0.0, 0.0), (0.0, 0.0)], false);
+        mem.frames[1] = vec![30000; (W * H) as usize];
+        let (_, attempt, escalation) = registered(&mem, EccMode::Similarity, 2, 1);
+        let first = unseeded(&mem, EccMode::Similarity, 2, 1);
+        assert!(
+            matches!(first.status, AlignStatus::Diverged(_)),
+            "{first:?}"
+        );
+        assert_eq!(
+            escalation,
+            Escalation {
+                attempted: true,
+                rerun: false,
+                accepted: false
+            }
+        );
+        assert_eq!(
+            (
+                attempt.transform,
+                attempt.status,
+                attempt.iterations,
+                attempt.residual
+            ),
+            (
+                first.transform,
+                first.status,
+                first.iterations,
+                first.residual
+            )
+        );
+    }
+
+    #[test]
+    fn the_seed_lift_round_trips_at_depths_one_to_four() {
+        let up = Transform::similarity(2.0, 0.0, 0.0, 0.0);
+        let down = Transform::similarity(0.5, 0.0, 0.0, 0.0);
+        let seed = Transform::translation(310.0, -120.0)
+            .compose(&Transform::similarity(1.03, 0.04, 0.0, 0.0));
+        for depth in 1..=4u32 {
+            for from in 0..=depth {
+                let lifted = lift_seed(&seed, from, depth);
+                let mut back = lifted;
+                for _ in from..depth {
+                    back = up.compose(&back).compose(&down);
+                }
+                for (a, b) in back.m.iter().flatten().zip(seed.m.iter().flatten()) {
+                    assert!((a - b).abs() < 1e-9, "depth {depth} from {from}");
+                }
+            }
+        }
+        let lifted = lift_seed(&Transform::translation(80.0, -40.0), 1, 4);
+        assert_eq!(lifted, Transform::translation(10.0, -5.0));
+    }
+
+    #[test]
+    fn the_seed_level_is_the_finest_one_within_the_proxy_size() {
+        assert_eq!(seed_level(512, 512, 3), Some(0));
+        assert_eq!(seed_level(1031, 777, 3), Some(2));
+        assert_eq!(seed_level(1031, 777, 1), None, "level 1 is 516 px");
+        assert_eq!(seed_level(8192, 5464, 6), Some(4));
+        assert_eq!(seed_level(8192, 5464, 3), None);
+        assert_eq!(seed_level(2049, 1367, 5), Some(3));
+    }
+
+    #[test]
+    fn a_driver_prepared_reference_gives_the_same_seeded_outcome_as_none() {
+        let mem = blob_reader(&[(0.0, 0.0), (150.0, -90.0)]);
+        let stack = StackContext::new(2, W, H, 1);
+        let ctx = AlignContext::new(stack, 0, &mem);
+        let mut cfg = crate::params::resolved_values(
+            &crate::params::resolve(PyramidalEcc.params(), &ParamValues::new(), &stack).unwrap(),
+        );
+        cfg.insert("pyramid-depth".to_string(), ParamValue::Int(2));
+        cfg.insert(
+            "mode".to_string(),
+            ParamValue::Enum("translation".to_string()),
+        );
+
+        let prepared = PyramidalEcc.prepare_run(&ctx, &cfg).unwrap().unwrap();
+        let shared = prepared.downcast_ref::<PreparedReference>().unwrap();
+        assert!(shared.features.get().is_none(), "preparing detects nothing");
+        let with = PyramidalEcc
+            .align_frame(
+                &AlignContext::new(stack, 0, &mem).with_prepared(Some(&*prepared)),
+                1,
+                &cfg,
+            )
+            .unwrap();
+        assert!(shared.features.get().is_some());
+        let without = PyramidalEcc.align_frame(&ctx, 1, &cfg).unwrap();
+        assert_eq!(with, without);
+        assert!(matches!(
+            with.status,
+            AlignStatus::Converged | AlignStatus::HitCap
+        ));
     }
 }

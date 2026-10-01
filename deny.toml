@@ -63,6 +63,11 @@ ignore = [
     { id = "RUSTSEC-2026-0192", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint version bump" },
 ]
 
+# `akaze` is taken from the one git revision that carries the detector fixes
+# its last crates.io release lacks (crates/core/Cargo.toml).
+[sources]
+allow-git = ["https://github.com/rust-cv/cv"]
+
 # wgpu is pinned to one major version by Slint's `unstable-wgpu-29` feature
 # (crates/gpu/src/lib.rs); this bans a second wgpu major by name.
 [[bans.deny]]
