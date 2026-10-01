@@ -413,6 +413,10 @@ struct ProjectTab {
     /// CheckpointEntry` id -- seeded to the newest saved checkpoint on open,
     /// `None` for an `Unsaved` tab with nothing fused yet.
     selected_checkpoint: Option<String>,
+    /// The row a checkpoint creation just added while this tab was in view,
+    /// by list id, with the creation's generation. A save rewrites the id
+    /// and keeps the generation.
+    fresh_checkpoint: Option<(String, u64)>,
     /// The current saved row's planes once asked for; reset whenever the
     /// current row changes. Held rows never use it: they carry their own.
     row_planes: Option<RowPlanes>,
@@ -664,6 +668,7 @@ impl ProjectTab {
             pending_deletes: Vec::new(),
             viewed: Vec::new(),
             selected_checkpoint,
+            fresh_checkpoint: None,
             row_planes: None,
             parked: None,
             frames,
@@ -829,6 +834,24 @@ impl ProjectTab {
                 job::ParentRef::Saved(id) => return Some(RowBase::Saved(id.clone())),
             }
         }
+    }
+
+    /// The id list row `row` carries once a save wrote this tab's held
+    /// entries as `ids`: a held row's saved id, a saved row's own. `None`
+    /// for a held row the save did not write.
+    fn saved_row_key(
+        &self,
+        row: &str,
+        ids: &[String],
+        keep: Option<&job::ParentRef>,
+    ) -> Option<String> {
+        let Some(entry) = checkpoints::held_index(row) else {
+            return Some(row.to_string());
+        };
+        // `ids` holds one id per written entry.
+        let kept = job::kept_entries(&self.held, &self.pending_deletes, keep);
+        ids.get(kept[..entry].iter().filter(|written| **written).count())
+            .cloned()
     }
 
     /// Where a checkpoint taken from the current row is recorded: under the
@@ -1439,6 +1462,10 @@ pub struct AppController {
     /// The last id handed to a [`ProjectTab`] -- incremented before each
     /// use, so ids start at 1 and no two tabs ever share one.
     next_tab_id: u64,
+    /// The generation of the newest checkpoint creation on a tab in view.
+    checkpoint_generation: u64,
+    /// The newest generation [`Self::take_checkpoint_flash`] handed out.
+    checkpoint_flash_played: u64,
     /// Whether a fuse run may use the headless GPU backend at all -- `false`
     /// by default, so a headless test controller never probes an adapter;
     /// [`main`](crate) turns this on for the real window.
@@ -1763,7 +1790,16 @@ impl AppController {
             content_height,
             viewport_height,
         );
-        checkpoints::build_model(&saved, &tab.held, pending, today, selected, scroll_y)
+        let mut model =
+            checkpoints::build_model(&saved, &tab.held, pending, today, selected, scroll_y);
+        if let Some((key, generation)) = &tab.fresh_checkpoint {
+            for entry in &mut model.entries {
+                if entry.id.as_ref() == Some(key) {
+                    entry.fresh = Some(*generation);
+                }
+            }
+        }
+        model
     }
 
     /// Restores flat entry `index` of [`Self::checkpoints_panel`]: it becomes
@@ -6122,8 +6158,36 @@ impl AppController {
         // set) -- refit on the next `fit_if_unfitted` rather than keep
         // drawing the old extent's zoom/pan.
         tab.viewport = None;
+        self.mark_fresh_checkpoint(index);
         self.enter_editor_if_viewing(index);
         planes
+    }
+
+    /// Marks tab `index`'s selected row as just created, with a generation
+    /// above every earlier one. Does nothing for a tab not in view, which
+    /// then never flashes.
+    fn mark_fresh_checkpoint(&mut self, index: usize) {
+        if self.state.active != Some(index) {
+            return;
+        }
+        let Some(key) = self.state.projects[index].selected_checkpoint.clone() else {
+            return;
+        };
+        self.checkpoint_generation += 1;
+        self.state.projects[index].fresh_checkpoint = Some((key, self.checkpoint_generation));
+    }
+
+    /// The generation of the active tab's fresh row when the panel has not
+    /// shown it yet, once: every later call returns `None` until a new
+    /// checkpoint is created.
+    pub fn take_checkpoint_flash(&mut self) -> Option<u64> {
+        let (_, generation) = self.state.active()?.fresh_checkpoint.as_ref()?;
+        let generation = *generation;
+        if generation <= self.checkpoint_flash_played {
+            return None;
+        }
+        self.checkpoint_flash_played = generation;
+        Some(generation)
     }
 
     /// Switches into Editor mode when `index` is the tab currently in view --
@@ -6338,6 +6402,7 @@ impl AppController {
         });
         tab.selected_checkpoint = Some(checkpoints::held_key(tab.held.len() - 1));
         tab.row_planes = shown;
+        self.mark_fresh_checkpoint(index);
         self.emit(ShellEvent::CheckpointsChanged);
         self.emit(ShellEvent::EditorChanged);
         true
@@ -6502,19 +6567,15 @@ impl AppController {
             }
         };
         let tab = &mut self.state.projects[index];
-        let next =
-            tab.selected_checkpoint
-                .as_deref()
-                .and_then(|row| match checkpoints::held_index(row) {
-                    Some(entry) => {
-                        // `ids` holds one id per written entry.
-                        let kept =
-                            job::kept_entries(&tab.held, &tab.pending_deletes, keep.as_ref());
-                        ids.get(kept[..entry].iter().filter(|written| **written).count())
-                            .cloned()
-                    }
-                    None => Some(row.to_string()),
-                });
+        let next = tab
+            .selected_checkpoint
+            .as_deref()
+            .and_then(|row| tab.saved_row_key(row, &ids, keep.as_ref()));
+        if let Some((row, _)) = &tab.fresh_checkpoint
+            && let Some(saved) = tab.saved_row_key(row, &ids, keep.as_ref())
+        {
+            tab.fresh_checkpoint.as_mut().expect("matched above").0 = saved;
+        }
         tab.selected_checkpoint =
             next.or_else(|| project.history().visible().first().map(|c| c.id.clone()));
         tab.row_planes = None;

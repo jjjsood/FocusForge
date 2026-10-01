@@ -854,7 +854,7 @@ pub fn install_crash_notice(controller: &Arc<Mutex<AppController>>, app: &AppWin
 /// so a test can call it directly without a real event loop (`install`'s
 /// sink needs one; this function does not).
 pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
-    let controller = controller.lock().unwrap();
+    let mut controller = controller.lock().unwrap();
     push_tab_rows(app, &controller);
     push_tab_scroll(app, &controller);
     app.set_show_empty_state(controller.active_project().is_none());
@@ -904,7 +904,7 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     push_job(app, &controller.job_view());
     push_settings_panel(app, &controller);
     push_images_panel(app, &controller);
-    push_checkpoint_panel(app, &controller);
+    push_checkpoint_panel(app, &mut controller);
     push_projects_overlay(app, &controller);
     push_divergence(app, &controller);
 }
@@ -1283,9 +1283,10 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
 
 /// Pushes the `Checkpoints` panel's whole state -- [`push_images_panel`]'s
 /// twin.
-pub fn push_checkpoint_panel(app: &AppWindow, controller: &AppController) {
+pub fn push_checkpoint_panel(app: &AppWindow, controller: &mut AppController) {
     app.set_checkpoint_export_enabled(controller.export_enabled());
     let panel = controller.checkpoints_panel();
+    let flash = controller.take_checkpoint_flash();
     let rows: Vec<GeneratedCheckpointEntry> = panel
         .entries
         .iter()
@@ -1300,6 +1301,7 @@ pub fn push_checkpoint_panel(app: &AppWindow, controller: &AppController) {
             time_text: entry.time_text.clone().into(),
             top: entry.top,
             selected: entry.selected,
+            flash: flash.is_some() && entry.fresh == flash,
             deletable: panel.row_count > 1,
             // No next separator sticks solid once reached; a value far
             // past any real content height so the "pushed out" comparison
@@ -3345,8 +3347,8 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             app.set_images_list_viewport_y(-controller.lock().unwrap().images_scroll_y());
         }
         ShellEvent::CheckpointsChanged => {
-            let controller = controller.lock().unwrap();
-            push_checkpoint_panel(app, &controller);
+            let mut controller = controller.lock().unwrap();
+            push_checkpoint_panel(app, &mut controller);
             app.set_projects_save_enabled(controller.save_enabled());
         }
         ShellEvent::EditorChanged => {

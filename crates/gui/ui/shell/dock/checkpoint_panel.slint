@@ -21,6 +21,8 @@ export struct CheckpointEntryView {
     time-text: string,
     top: length,
     selected: bool,
+    // Plays the row's one-shot flash.
+    flash: bool,
     // Whether the row offers its delete control.
     deletable: bool,
     // A separator's own next separator's `top`; a very large value with no
@@ -142,6 +144,7 @@ export component FFCheckpointPanel inherits Rectangle {
                     algorithm: row.algorithm;
                     time-text: row.time-text;
                     selected: row.selected;
+                    flash: row.flash;
                     deletable: row.deletable;
                     clicked => { root.checkpoint-selected(i); }
                     delete-requested => { root.checkpoint-delete-requested(i); }

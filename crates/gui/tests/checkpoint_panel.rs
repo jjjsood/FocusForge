@@ -27,7 +27,7 @@ use focusforge_gui::{
     AppController, AppWindow, OpenOutcome, ShellEvent, ShellMode, checkpoints, job,
 };
 use i_slint_backend_testing::ElementQuery;
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Model};
 
 /// Writes a 47-checkpoint project spanning several local days to the repo's
 /// own `.scratch/checkpoint-long-history/long.ffp`, for a manual scroll
@@ -1904,4 +1904,386 @@ fn deletes_and_views_leave_no_files_behind() {
         cache_dirs(name, "planes").contains(&viewed[5]),
         "the current row's planes stay"
     );
+}
+
+// ---------------------------------------------------------------------
+// The fresh-row flash.
+// ---------------------------------------------------------------------
+
+/// Every entry the panel marks fresh, as `(id, generation)`.
+fn fresh_entries(controller: &AppController) -> Vec<(String, u64)> {
+    controller
+        .checkpoints_panel()
+        .entries
+        .into_iter()
+        .filter_map(|entry| Some((entry.id?, entry.fresh?)))
+        .collect()
+}
+
+/// The one fresh entry, asserting there is exactly one.
+fn only_fresh(controller: &AppController) -> (String, u64) {
+    let fresh = fresh_entries(controller);
+    assert_eq!(fresh.len(), 1, "exactly one fresh row, got {fresh:?}");
+    fresh.into_iter().next().unwrap()
+}
+
+/// An unsaved tab over three copied `mantis-64` frames, not yet fused.
+fn open_frames_tab(controller: &mut AppController, name: &str) {
+    let frames = common::tree(&format!("{name}_frames"));
+    for i in 0..3 {
+        fs::copy(
+            common::fixture_frame("mantis-64", i),
+            frames.join(format!("{i:02}.tif")),
+        )
+        .expect("fixture frame must copy");
+    }
+    common::open_and_settle(controller, &[frames]);
+    controller.set_align_algorithm("dummy-align");
+}
+
+fn settle_runs(controller: &mut AppController) {
+    while common::wait_for_settle(controller, Duration::from_secs(60)).is_some() {}
+}
+
+/// Every creation path marks exactly the row it adds, with a generation above
+/// every earlier one.
+#[test]
+fn a_new_checkpoint_row_is_the_only_fresh_row() {
+    let (project, mut controller) = editor_on_head("checkpoint_panel_fresh_paths");
+    assert!(
+        fresh_entries(&controller).is_empty(),
+        "opening flashes nothing"
+    );
+
+    // `Save checkpoint`.
+    paint(&mut controller, stroke(1, 1, 0));
+    assert!(controller.save_checkpoint());
+    let (key, mut last) = only_fresh(&controller);
+    assert_eq!(key, "held:0");
+    assert!(last > 0);
+    paint(&mut controller, stroke(2, 1, 0));
+    assert!(controller.save_checkpoint());
+    let (key, generation) = only_fresh(&controller);
+    assert_eq!(key, "held:1");
+    assert!(generation > last, "a later creation has a later generation");
+    last = generation;
+
+    // A project save with modified live: the snapshot it takes is the new row.
+    paint(&mut controller, stroke(3, 1, 1));
+    assert!(controller.save_active_project(|_| None));
+    let (key, generation) = only_fresh(&controller);
+    assert!(generation > last);
+    assert!(
+        saved_ids(&project.project).contains(&key),
+        "the fresh row carries its saved id after the save"
+    );
+    last = generation;
+
+    // The restore guard's "save current" answer: the row appears while the
+    // restore moves the selection elsewhere.
+    paint(&mut controller, stroke(1, 2, 2));
+    click(&mut controller, &project.root);
+    assert!(!controller.close_guard_secondary_pressed(|_| None));
+    let (key, generation) = only_fresh(&controller);
+    assert!(generation > last);
+    assert_eq!(key, "held:0");
+    assert_eq!(
+        current_row(&controller).as_deref(),
+        Some(project.root.as_str()),
+        "the fresh row is not the selected one"
+    );
+    assert!(
+        controller
+            .checkpoints_panel()
+            .entries
+            .iter()
+            .all(|entry| entry.separator_label.is_none() || entry.fresh.is_none()),
+        "separators are never fresh"
+    );
+
+    // A fuse finishing, then the fuse guard's "save current" answer before a
+    // second fuse.
+    let mut fused = fused_tab("checkpoint_panel_fresh_fuse", 1);
+    let (key, first) = only_fresh(&fused);
+    assert_eq!(key, "held:0");
+    enter_editor(&mut fused);
+    paint(&mut fused, stroke(10, 10, 1));
+    assert!(!fused.start_fuse(), "unsaved strokes ask first");
+    assert!(fused.close_guard_secondary_pressed(|_| None));
+    let (key, snapshot) = only_fresh(&fused);
+    assert_eq!(key, "held:1", "the snapshot is the fresh row");
+    assert!(snapshot > first);
+    settle_runs(&mut fused);
+    let (key, generation) = only_fresh(&fused);
+    assert_eq!(key, "held:2", "the second fuse's row replaces it");
+    assert!(generation > snapshot);
+
+    // The parked divergence's `Keep`.
+    let mut parked = AppController::new();
+    parked.set_scratch_root_for_test(common::tree("checkpoint_panel_fresh_keep_scratch"));
+    let mantis_512 = common::workspace_root().join("fixtures").join("mantis-512");
+    common::open_and_settle(&mut parked, &[mantis_512]);
+    assert!(parked.start_fuse());
+    common::wait_for_settle(&mut parked, Duration::from_secs(300));
+    assert!(parked.pending_divergence().is_some());
+    assert!(
+        fresh_entries(&parked).is_empty(),
+        "a parked run is no row yet"
+    );
+    assert!(parked.keep_fused().is_some());
+    assert_eq!(only_fresh(&parked).0, "held:0");
+}
+
+/// Nothing that merely redraws the list starts or replays a flash.
+#[test]
+fn redrawing_the_list_starts_no_flash() {
+    let (project, mut controller) = editor_on_head("checkpoint_panel_fresh_redraw");
+    paint(&mut controller, stroke(1, 1, 0));
+    assert!(controller.save_checkpoint());
+    let (_, generation) = only_fresh(&controller);
+    assert_eq!(controller.take_checkpoint_flash(), Some(generation));
+    assert_eq!(controller.take_checkpoint_flash(), None, "once only");
+
+    let quiet = |controller: &mut AppController, what: &str| {
+        assert_eq!(
+            controller.take_checkpoint_flash(),
+            None,
+            "{what} starts no flash"
+        );
+        let generations: Vec<u64> = fresh_entries(controller).iter().map(|f| f.1).collect();
+        assert_eq!(generations, [generation], "{what} keeps the generation");
+    };
+
+    // A project save that writes no new snapshot converts the row to its saved
+    // id and keeps its generation.
+    assert!(controller.save_active_project(|_| None));
+    let (key, saved_generation) = only_fresh(&controller);
+    assert_eq!(saved_generation, generation);
+    assert_eq!(
+        key,
+        added_id(&project.project, &[&project.root, &project.edited])
+    );
+    quiet(&mut controller, "a project save");
+
+    // Selecting and restoring rows, scrolling and a queued delete.
+    click(&mut controller, &project.root);
+    quiet(&mut controller, "selecting a row");
+    click(&mut controller, &key);
+    quiet(&mut controller, "selecting the fresh row");
+    controller.scroll_checkpoints_panel(30.0);
+    quiet(&mut controller, "scrolling");
+    confirm(&mut controller, &project.edited);
+    quiet(&mut controller, "queuing a delete");
+
+    // Opening another project and switching tabs.
+    let other = build_edited("checkpoint_panel_fresh_redraw_other");
+    common::open_and_settle(&mut controller, &[other.project]);
+    assert!(fresh_entries(&controller).is_empty());
+    assert_eq!(
+        controller.take_checkpoint_flash(),
+        None,
+        "opening a project"
+    );
+    controller.select_project(0);
+    quiet(&mut controller, "switching back to the tab");
+    controller.select_project(1);
+    assert_eq!(controller.take_checkpoint_flash(), None, "switching away");
+}
+
+/// A background fuse, a snapshot with nothing to keep and a failed save.
+#[test]
+fn flash_boundaries_background_tab_empty_snapshot_failed_save() {
+    // A fuse finishing on a tab not in view marks nothing, then or later.
+    let name = "checkpoint_panel_fresh_background";
+    let mut controller = scratch_controller(name);
+    open_frames_tab(&mut controller, &format!("{name}_a"));
+    open_frames_tab(&mut controller, &format!("{name}_b"));
+    controller.select_project(0);
+    assert!(controller.start_fuse());
+    controller.select_project(1);
+    settle_runs(&mut controller);
+    assert_eq!(controller.active_project(), Some(1));
+    assert!(fresh_entries(&controller).is_empty());
+    assert_eq!(controller.take_checkpoint_flash(), None);
+    controller.select_project(0);
+    assert_eq!(controller.checkpoint_count(), Some(1), "the fuse committed");
+    assert!(fresh_entries(&controller).is_empty());
+    assert_eq!(
+        controller.take_checkpoint_flash(),
+        None,
+        "switching to it shows no flash"
+    );
+
+    // Nothing to keep: no row, no marker.
+    let (_project, mut empty) = editor_on_head("checkpoint_panel_fresh_empty");
+    assert!(!empty.save_checkpoint());
+    assert!(fresh_entries(&empty).is_empty());
+    assert_eq!(empty.take_checkpoint_flash(), None);
+
+    // A failed write keeps the snapshot row, and it flashes once.
+    let mut failing = fused_tab("checkpoint_panel_fresh_failed", 1);
+    enter_editor(&mut failing);
+    let before = only_fresh(&failing).1;
+    paint(&mut failing, stroke(10, 10, 1));
+    let Some(blocked) = common::readonly_dir("fresh_failed_save", 0o555, |_| {}) else {
+        return;
+    };
+    let target = blocked.join("project.ffp");
+    assert!(!failing.save_active_project(|_| Some(target.clone())));
+    assert_eq!(
+        failing.checkpoint_count(),
+        Some(2),
+        "both rows stay in memory"
+    );
+    let (key, generation) = only_fresh(&failing);
+    assert_eq!(key, "held:1");
+    assert!(generation > before);
+    assert_eq!(failing.take_checkpoint_flash(), Some(generation));
+    assert_eq!(failing.take_checkpoint_flash(), None);
+}
+
+/// The tint opacity of every checkpoint row, in list order.
+fn flash_tints(app: &AppWindow) -> Vec<f32> {
+    ElementQuery::from_root(app)
+        .match_id("FFCheckpointRow::flash-tint")
+        .find_all()
+        .iter()
+        .map(|tint| tint.computed_opacity())
+        .collect()
+}
+
+/// The model rows that carry `flash`.
+fn flashing_rows(app: &AppWindow) -> Vec<usize> {
+    let rows = app.get_checkpoint_rows();
+    (0..rows.row_count())
+        .filter(|&i| rows.row_data(i).unwrap().flash)
+        .collect()
+}
+
+/// Moves the mocked clock on in 25 ms frames: one jump would start a timer's
+/// animation at the end of the jump.
+fn advance(ms: u64) {
+    i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+    for _ in 0..ms / 25 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(25));
+    }
+}
+
+fn lit(tints: &[f32]) -> usize {
+    tints.iter().filter(|opacity| **opacity > 0.0).count()
+}
+
+/// Paints one stroke and presses `Save checkpoint` on the windowed controller.
+fn save_checkpoint_in_window(
+    app: &AppWindow,
+    controller: &Arc<Mutex<AppController>>,
+    stroke_at: i32,
+) {
+    {
+        let mut controller = controller.lock().unwrap();
+        paint(&mut controller, stroke(stroke_at, 1, 0));
+        assert!(controller.save_checkpoint());
+    }
+    focusforge_gui::bridge::push_projects(app, controller);
+}
+
+/// The tint is on the new row's first frame, still there inside the first
+/// `motion-fast`, and gone by `motion-slow`; a second creation flashes only the
+/// new row and a repeated push starts nothing.
+#[test]
+fn the_fresh_row_flash_fades_out_once() {
+    let (_project, controller) = editor_on_head("checkpoint_panel_fresh_fade");
+    let (app, controller, _installed) = installed_window(controller);
+    advance(0);
+    assert_eq!(
+        lit(&flash_tints(&app)),
+        0,
+        "no row is tinted before a creation"
+    );
+
+    save_checkpoint_in_window(&app, &controller, 1);
+    assert_eq!(flashing_rows(&app).len(), 1);
+    advance(0);
+    assert_eq!(lit(&flash_tints(&app)), 1, "tinted on the first frame");
+
+    // A second push with the same rows plays and stops nothing.
+    advance(75);
+    focusforge_gui::bridge::push_projects(&app, &controller);
+    assert!(flashing_rows(&app).is_empty(), "the flag is sent once");
+    assert_eq!(lit(&flash_tints(&app)), 1, "tinted at 75 ms");
+    advance(325);
+    assert_eq!(lit(&flash_tints(&app)), 0, "gone at 400 ms");
+
+    // A second creation during a flash flashes the new row only.
+    save_checkpoint_in_window(&app, &controller, 2);
+    advance(100);
+    save_checkpoint_in_window(&app, &controller, 3);
+    assert_eq!(
+        flashing_rows(&app).len(),
+        1,
+        "only the newest row is flagged"
+    );
+    advance(0);
+    assert_eq!(
+        lit(&flash_tints(&app)),
+        1,
+        "only the new row is tinted, at once"
+    );
+    advance(400);
+    assert_eq!(lit(&flash_tints(&app)), 0, "every tint is gone at 400 ms");
+}
+
+/// What a click on `id` leaves behind: the current row (the root by label,
+/// since ids differ between projects), the live ops and whether a question
+/// opened.
+fn after_click(
+    controller: &mut AppController,
+    project: &Edited,
+    id: &str,
+) -> (String, usize, bool) {
+    click(controller, id);
+    let current = current_row(controller).expect("a current row");
+    let label = if current == project.root {
+        "root".to_string()
+    } else {
+        current
+    };
+    (
+        label,
+        live_ops(controller),
+        controller.pending_restore_copy().is_some(),
+    )
+}
+
+/// Clicks during the flash select exactly as they do when nothing flashes.
+#[test]
+fn clicking_during_the_flash_behaves_as_without_it() {
+    let (plain_project, mut plain) = editor_on_head("checkpoint_panel_fresh_click_plain");
+    paint(&mut plain, stroke(1, 1, 0));
+    assert!(plain.save_checkpoint());
+    let plain_selected = selected_rows(&plain);
+    let plain_clicks = [
+        after_click(&mut plain, &plain_project, &plain_project.root),
+        after_click(&mut plain, &plain_project, "held:0"),
+    ];
+
+    let (project, controller) = editor_on_head("checkpoint_panel_fresh_click_flash");
+    let (app, controller, _installed) = installed_window(controller);
+    advance(0);
+    save_checkpoint_in_window(&app, &controller, 1);
+    advance(75);
+    assert_eq!(lit(&flash_tints(&app)), 1, "the flash is playing");
+    let mut controller = controller.lock().unwrap();
+    assert_eq!(selected_rows(&controller), plain_selected);
+    let clicks = [
+        after_click(&mut controller, &project, &project.root),
+        after_click(&mut controller, &project, "held:0"),
+    ];
+    assert_eq!(clicks, plain_clicks);
+    assert_eq!(
+        only_fresh(&controller).0,
+        "held:0",
+        "a click does not move the fresh marker"
+    );
+    wait_for_render(&mut controller);
 }

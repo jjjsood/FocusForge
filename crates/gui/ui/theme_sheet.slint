@@ -633,6 +633,22 @@ export component ThemeSheet inherits Window {
             }
         }
 
+        GroupHeading { text: "Checkpoints list: fresh row, tint at its peak"; }
+        VerticalLayout {
+            spacing: 0px;
+            FFCheckpointRow {
+                algorithm: "Laplacian Pyramid";
+                time-text: "16:43:01";
+                selected: true;
+                flash-held: true;
+            }
+            FFCheckpointRow {
+                algorithm: "dwt-wavelet";
+                time-text: "15:58:30";
+                deletable: true;
+            }
+        }
+
         GroupHeading { text: "Checkpoints list: last row, hovered"; }
         FFCheckpointRow {
             algorithm: "Laplacian Pyramid";

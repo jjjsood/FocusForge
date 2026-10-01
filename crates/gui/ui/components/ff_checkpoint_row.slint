@@ -2,7 +2,8 @@
 //
 // One checkpoint list row: algorithm over timestamp; selected adds a raised
 // background and a left accent bar; a hovered deletable row shows a trash
-// control at its right edge.
+// control at its right edge; a fresh row appears under one short accent tint
+// that holds, then fades on its own.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
@@ -15,6 +16,10 @@ export component FFCheckpointRow inherits Rectangle {
     in property <bool> deletable: false;
     // Draws the hover look without a pointer.
     in property <bool> hovered: false;
+    // Plays the tint once when set; clearing it never cuts a running tint short.
+    in property <bool> flash: false;
+    // Draws the tint's peak without fading, as `hovered` does for the hover look.
+    in property <bool> flash-held: false;
 
     callback clicked();
     callback delete-requested();
@@ -22,6 +27,36 @@ export component FFCheckpointRow inherits Rectangle {
     width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-band-inset;
     height: ShellGeometry.checkpoint-row-height;
     background: root.selected || root.hovered || area.has-hover ? Theme.surface-hover : transparent;
+
+    // Set in `init`, so a fresh row's first frame is already at the peak; only
+    // the fall animates.
+    property <bool> flashing: false;
+
+    init => {
+        if root.flash {
+            root.flashing = true;
+        }
+    }
+    changed flash => {
+        if root.flash {
+            root.flashing = true;
+        }
+    }
+
+    // First child: under the trash, the accent bar and the text.
+    flash-tint := Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Theme.accent-default.with-alpha(0.15);
+        opacity: (root.flashing || root.flash-held) ? 1 : 0;
+        animate opacity { duration: Theme.motion-fast; easing: ease-out; }
+
+        Timer {
+            interval: Theme.motion-fast;
+            running: root.flashing;
+            triggered => { root.flashing = false; }
+        }
+    }
 
     // Nested rather than a sibling: Slint delivers a pointer move to exactly
     // one item, so a sibling TouchArea would occlude `area.has-hover` once the

@@ -37,6 +37,9 @@ pub struct CheckpointEntry {
     /// when the next day pushes it out, so the view need not search the
     /// list to find it.
     pub next_separator_top: Option<f32>,
+    /// The creation generation of a row a checkpoint creation just added;
+    /// `None` for every other entry.
+    pub fresh: Option<u64>,
 }
 
 /// A held row's own key into `ProjectTab::held`, stable until a save.
@@ -297,6 +300,7 @@ pub fn build_model(
                 selected: false,
                 id: None,
                 next_separator_top: None,
+                fresh: None,
             });
             top += SEPARATOR_HEIGHT;
             last_date = Some(date);
@@ -310,6 +314,7 @@ pub fn build_model(
             selected: selected == Some(id.as_str()),
             id: Some(id),
             next_separator_top: None,
+            fresh: None,
         });
         top += ROW_HEIGHT;
     }
