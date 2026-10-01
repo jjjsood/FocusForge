@@ -19,6 +19,8 @@ export component FFDialog inherits FFModalPanel {
     in property <string> body: "";
     // Empty hides the info line.
     in property <string> info: "";
+    // Whether a rule separates the body from the info line.
+    in property <bool> divider: true;
     in property <string> cancel-label: "Cancel";
     in property <string> secondary-label: "";
     in property <string> confirm-label: "Confirm";
@@ -93,7 +95,7 @@ export component FFDialog inherits FFModalPanel {
                 }
             }
 
-            FFDivider { }
+            if root.divider: FFDivider { }
 
             if root.info != "": HorizontalLayout {
                 spacing: Theme.space-1;

@@ -405,8 +405,11 @@ struct ProjectTab {
     /// [`AppController::save_active_project`] writes them. A parent is an
     /// index into this list or a saved checkpoint's id.
     held: Vec<job::InMemoryCheckpoint>,
-    /// Saved checkpoints whose deletion waits for the next project save.
-    pending_deletes: Vec<String>,
+    /// Rows (saved or in memory) whose deletion waits for the next project
+    /// save; the list already leaves them out.
+    pending_deletes: Vec<job::ParentRef>,
+    /// Saved checkpoint ids whose planes sit in the plane cache, newest last.
+    viewed: Vec<String>,
     /// The checkpoint list's own current row, by its `checkpoints::
     /// CheckpointEntry` id -- seeded to the newest saved checkpoint on open,
     /// `None` for an `Unsaved` tab with nothing fused yet.
@@ -660,6 +663,7 @@ impl ProjectTab {
             menu_open: None,
             held: Vec::new(),
             pending_deletes: Vec::new(),
+            viewed: Vec::new(),
             selected_checkpoint,
             row_planes: None,
             parked: None,
@@ -793,25 +797,6 @@ impl ProjectTab {
         }
     }
 
-    /// `id`, or -- while a pending delete removes it -- the nearest saved
-    /// ancestor that survives the next save.
-    fn surviving_row(&self, id: &str) -> Option<String> {
-        let GuiProject::Opened(project) = &self.project else {
-            return Some(id.to_string());
-        };
-        if self.pending_deletes.is_empty() {
-            return Some(id.to_string());
-        }
-        let chain = project.history().ancestors(id).ok()?;
-        match chain
-            .iter()
-            .rposition(|c| self.pending_deletes.contains(&c.id))
-        {
-            None => Some(id.to_string()),
-            Some(rootmost) => chain.get(rootmost + 1).map(|c| c.id.clone()),
-        }
-    }
-
     /// Where a checkpoint taken from the current row is recorded: under the
     /// row itself, a saved checkpoint or an in-memory entry. `None` with no
     /// current row.
@@ -851,6 +836,52 @@ impl ProjectTab {
         self.edit
             .as_ref()
             .is_some_and(|edit| edit.session.op_count() > 0)
+    }
+
+    /// Removes the files of every fused in-memory entry a project save would
+    /// not write: deleted, not the current row and no written entry's parent.
+    fn free_unneeded_held(&self) {
+        let kept = job::kept_entries(
+            &self.held,
+            &self.pending_deletes,
+            self.row_parent().as_ref(),
+        );
+        for (entry, kept) in self.held.iter().zip(kept) {
+            if let (false, job::InMemoryKind::Fused(held)) = (kept, &entry.kind) {
+                remove_hold_dir_of(&held.composite);
+            }
+        }
+    }
+
+    /// Plane-cache directories kept per tab: the current row's and the last
+    /// three viewed.
+    const VIEWED_PLANES: usize = 4;
+
+    /// Records that saved checkpoint `id`'s planes sit in the plane cache and
+    /// removes the oldest viewed ones past [`Self::VIEWED_PLANES`].
+    fn note_viewed(&mut self, scratch_root: &Path, id: &str) {
+        self.viewed.retain(|viewed| viewed != id);
+        self.viewed.push(id.to_string());
+        while self.viewed.len() > Self::VIEWED_PLANES {
+            let oldest = self.viewed.remove(0);
+            self.remove_cached_planes(scratch_root, &oldest);
+        }
+    }
+
+    /// Removes saved checkpoint `id`'s cached planes unless they are the
+    /// current row's.
+    fn remove_cached_planes(&mut self, scratch_root: &Path, id: &str) {
+        if self.plane_key().as_deref() == Some(id) {
+            return;
+        }
+        self.viewed.retain(|viewed| viewed != id);
+        if let GuiProject::Opened(project) = &self.project {
+            let _ = std::fs::remove_dir_all(job::checkpoint_plane_dir(
+                scratch_root,
+                project.path(),
+                id,
+            ));
+        }
     }
 
     /// Whether a project save has anything to write: an in-memory
@@ -1059,6 +1090,9 @@ struct ShellState {
     /// restore while the "save this state first?" answer is open -- raised
     /// only when that tab's live holds ops.
     pending_restore: Option<(u64, String)>,
+    /// The tab, by id, and the row key whose delete waits on the quiet
+    /// "Delete this checkpoint?" answer.
+    pending_checkpoint_delete: Option<(u64, String)>,
     /// Every `Not a project` card -- a path with no open project behind it
     /// at all, cleared the moment that same path opens successfully. A
     /// failed, cancelled or sources-missing run instead lives on its own
@@ -1662,21 +1696,23 @@ impl AppController {
         let today = checkpoints::today();
         let viewport_height = self.state.checkpoints_viewport_height;
         let Some(tab) = self.state.active() else {
-            return checkpoints::build_model(&[], &[], today, None, 0.0);
+            return checkpoints::build_model(&[], &[], &[], today, None, 0.0);
         };
         let saved = match &tab.project {
-            GuiProject::Opened(project) => project.history().visible(),
+            GuiProject::Opened(project) => project.history().all(),
             GuiProject::Unsaved(_) => Vec::new(),
         };
         let selected = tab.selected_checkpoint.as_deref();
+        let pending = &tab.pending_deletes;
         let content_height =
-            checkpoints::build_model(&saved, &tab.held, today, selected, 0.0).content_height;
+            checkpoints::build_model(&saved, &tab.held, pending, today, selected, 0.0)
+                .content_height;
         let scroll_y = settings_panel::clamp_panel_scroll(
             self.state.checkpoints_scroll_y,
             content_height,
             viewport_height,
         );
-        checkpoints::build_model(&saved, &tab.held, today, selected, scroll_y)
+        checkpoints::build_model(&saved, &tab.held, pending, today, selected, scroll_y)
     }
 
     /// Restores flat entry `index` of [`Self::checkpoints_panel`]: it becomes
@@ -1732,6 +1768,7 @@ impl AppController {
         let unchanged = tab.selected_checkpoint.as_deref() == Some(key.as_str());
         let dropped_session = tab.edit.take().is_some();
         tab.selected_checkpoint = Some(key);
+        tab.free_unneeded_held();
         let on_ops_row = tab.on_ops_row();
         if !unchanged || matches!(tab.row_planes, Some(RowPlanes::Refused(_))) {
             tab.row_planes = None;
@@ -1764,12 +1801,16 @@ impl AppController {
         let Some((tab_id, key)) = self.state.render.in_flight.take() else {
             return true;
         };
+        let scratch_root = self.scratch_root();
         if let Some(tab) = self.state.projects.iter_mut().find(|tab| tab.id == tab_id)
             && tab.plane_key().as_deref() == Some(key.as_str())
             && matches!(tab.row_planes, Some(RowPlanes::Pending))
         {
             tab.row_planes = Some(match outcome {
-                Ok((composite, zmap)) => RowPlanes::Ready(composite, zmap),
+                Ok((composite, zmap)) => {
+                    tab.note_viewed(&scratch_root, &key);
+                    RowPlanes::Ready(composite, zmap)
+                }
                 Err(lines) => RowPlanes::Refused(lines),
             });
         }
@@ -1829,7 +1870,10 @@ impl AppController {
     /// closes it at once. Otherwise raises [`Self::pending_quit_copy`] and
     /// touches no tab. A no-op while a close or restore question is open.
     pub fn window_close(&mut self) {
-        if self.state.pending_close.is_some() || self.state.pending_restore.is_some() {
+        if self.state.pending_close.is_some()
+            || self.state.pending_restore.is_some()
+            || self.state.pending_checkpoint_delete.is_some()
+        {
             return;
         }
         if !self.state.projects.iter().any(ProjectTab::quit_loses_work) {
@@ -2951,6 +2995,7 @@ impl AppController {
             || self.state.pending_close.is_some()
             || self.state.pending_quit
             || self.state.pending_restore.is_some()
+            || self.state.pending_checkpoint_delete.is_some()
             || self.state.pending_frame_change.is_some()
             || self.pending_divergence().is_some()
             || self.state.pending.is_some()
@@ -3444,7 +3489,10 @@ impl AppController {
     /// other tab closes at once. A no-op out of range, inside
     /// [`Self::CLOSE_DEBOUNCE`], or while a quit or restore question is open.
     pub fn request_close_at(&mut self, index: usize, now: Instant) {
-        if self.state.pending_quit || self.state.pending_restore.is_some() {
+        if self.state.pending_quit
+            || self.state.pending_restore.is_some()
+            || self.state.pending_checkpoint_delete.is_some()
+        {
             return;
         }
         let Some(tab) = self.state.projects.get(index) else {
@@ -3482,6 +3530,14 @@ impl AppController {
             .is_some_and(|(id, _)| *id == closed.id)
         {
             self.state.pending_restore = None;
+        }
+        if self
+            .state
+            .pending_checkpoint_delete
+            .as_ref()
+            .is_some_and(|(id, _)| *id == closed.id)
+        {
+            self.state.pending_checkpoint_delete = None;
         }
         if let GuiProject::Opened(project) = &closed.project {
             let _ =
@@ -5872,6 +5928,7 @@ impl AppController {
             kind: job::InMemoryKind::Fused(held),
             parent,
         });
+        tab.free_unneeded_held();
         // The new checkpoint's own extent may differ from what the viewport
         // was fitted to (a first fuse's crop, a re-fuse over a changed frame
         // set) -- refit on the next `fit_if_unfitted` rather than keep
@@ -5993,6 +6050,7 @@ impl AppController {
         };
         match job::fused_checkpoint_planes(project, &scratch_root, &key) {
             Ok(job::CheckpointPlanes::Ready(composite, zmap)) => {
+                tab.note_viewed(&scratch_root, &key);
                 tab.row_planes = Some(RowPlanes::Ready(composite.clone(), zmap.clone()));
                 TabPlanes::Ready(composite, zmap)
             }
@@ -6097,44 +6155,98 @@ impl AppController {
         true
     }
 
-    /// Queues the deletion of saved checkpoint `id` (and, with it, its
-    /// descendants) on the active tab; the next project save applies it.
-    /// `false`, changing nothing, for an unknown id, the root, a checkpoint
-    /// already going, one an in-memory checkpoint descends from, and one
-    /// whose removal would leave the live origin without a fuse state to
-    /// snapshot against.
+    /// Queues the deletion of listed row `id` (a saved id or `held:<n>`) on
+    /// the active tab, removing exactly that row from the list; the next
+    /// project save applies it. `false`, changing nothing, for a key the list
+    /// does not show (unknown, hidden or already queued) and for the last
+    /// listed row.
     pub fn queue_checkpoint_delete(&mut self, id: &str) -> bool {
+        let panel = self.checkpoints_panel();
+        if panel.row_count <= 1 || !panel.entries.iter().any(|e| e.id.as_deref() == Some(id)) {
+            return false;
+        }
         let Some(tab) = self.state.active_mut() else {
             return false;
         };
-        let GuiProject::Opened(project) = &tab.project else {
-            return false;
-        };
-        let history = project.history();
-        let Ok(checkpoint) = history.get(id) else {
-            return false;
-        };
-        if checkpoint.parent.is_none() || tab.surviving_row(id).as_deref() != Some(id) {
-            return false;
-        }
-        let below = |saved: &str| {
-            history
-                .ancestors(saved)
-                .is_ok_and(|chain| chain.iter().any(|c| c.id == id))
-        };
-        let under_entry = tab
-            .held
-            .iter()
-            .any(|e| matches!(&e.parent, Some(job::ParentRef::Saved(saved)) if below(saved)));
-        let origin_unreadable = tab.selected_checkpoint.as_deref().is_some_and(|row| {
-            checkpoints::held_index(row).is_none() && below(row) && project.fuse_state(row).is_err()
+        tab.pending_deletes.push(match checkpoints::held_index(id) {
+            Some(index) => job::ParentRef::Entry(index),
+            None => job::ParentRef::Saved(id.to_string()),
         });
-        if under_entry || origin_unreadable {
-            return false;
-        }
-        tab.pending_deletes.push(id.to_string());
         self.emit(ShellEvent::CheckpointsChanged);
         true
+    }
+
+    /// Opens the delete question for flat entry `index` of
+    /// [`Self::checkpoints_panel`]. A no-op on a separator, past the end,
+    /// with one row listed and while a dialog is open.
+    pub fn request_checkpoint_delete(&mut self, index: usize) {
+        if self.modal_open() {
+            return;
+        }
+        let panel = self.checkpoints_panel();
+        let Some(id) = panel.entries.get(index).and_then(|entry| entry.id.clone()) else {
+            return;
+        };
+        let Some(tab) = self.state.active() else {
+            return;
+        };
+        if panel.row_count <= 1 {
+            return;
+        }
+        self.state.pending_checkpoint_delete = Some((tab.id, id));
+        self.emit(ShellEvent::ProjectsChanged);
+    }
+
+    /// The delete question still open, if any: the row's `algorithm · time`
+    /// and the sentence on what stays.
+    pub fn pending_checkpoint_delete_copy(&self) -> Option<(String, String)> {
+        let (id, key) = self.state.pending_checkpoint_delete.as_ref()?;
+        self.state.active().filter(|tab| tab.id == *id)?;
+        let panel = self.checkpoints_panel();
+        let row = panel
+            .entries
+            .iter()
+            .find(|entry| entry.id.as_deref() == Some(key.as_str()))?;
+        let others = panel.row_count - 1;
+        let body = if others == 1 {
+            "The other checkpoint is untouched, and the stack is not fused again.".to_string()
+        } else {
+            format!(
+                "The other {others} checkpoints are untouched, and the stack is not fused again."
+            )
+        };
+        Some((format!("{} · {}", row.algorithm, row.time_text), body))
+    }
+
+    /// Closes the delete question without changing anything.
+    pub fn cancel_checkpoint_delete(&mut self) {
+        if self.state.pending_checkpoint_delete.take().is_some() {
+            self.emit(ShellEvent::ProjectsChanged);
+        }
+    }
+
+    /// Answers the delete question: queues the row's deletion and frees what
+    /// nothing needs any more. The canvas, the edit session and the render
+    /// are left alone.
+    pub fn confirm_checkpoint_delete(&mut self) {
+        let Some((tab_id, key)) = self.state.pending_checkpoint_delete.take() else {
+            return;
+        };
+        self.emit(ShellEvent::ProjectsChanged);
+        if self.state.active().is_none_or(|tab| tab.id != tab_id)
+            || !self.queue_checkpoint_delete(&key)
+        {
+            return;
+        }
+        let scratch_root = self.scratch_root();
+        let tab = self
+            .state
+            .active_mut()
+            .expect("the delete was queued on the active tab");
+        tab.free_unneeded_held();
+        if checkpoints::held_index(&key).is_none() {
+            tab.remove_cached_planes(&scratch_root, &key);
+        }
     }
 
     /// [`Self::snapshot_live`] on the active tab; `false` with none active.
@@ -6152,8 +6264,8 @@ impl AppController {
     /// Writes tab `index`'s in-memory checkpoints and pending deletes into
     /// one `.ffp`, after keeping a modified live as a checkpoint. A never-saved
     /// tab asks `pick` (proposing `<frames dir>/<group name>.ffp`); an opened
-    /// one rewrites its own file. The edit session survives, rebased, unless
-    /// its row was deleted. A failed write keeps everything in memory and
+    /// one rewrites its own file. The edit session survives, rebased, and the
+    /// current row stays stored even when it was deleted. A failed write keeps everything in memory and
     /// leaves [`Self::take_settled_failure`] a message. Returns whether it wrote.
     fn save_project_at(
         &mut self,
@@ -6185,31 +6297,35 @@ impl AppController {
             return false;
         }
         let tab = &self.state.projects[index];
-        let (project, ids) =
-            match job::save_in_memory(&target, &tab.held, &tab.pending_deletes, onto_existing) {
-                Ok(saved) => saved,
-                Err(err) => {
-                    self.report_failed_save(index, &target, err.to_string());
-                    self.emit(ShellEvent::CheckpointsChanged);
-                    return false;
-                }
-            };
-        let tab = &mut self.state.projects[index];
-        let current = tab.selected_checkpoint.clone();
-        let (next, row_deleted) = match current.as_deref() {
-            Some(row) => match checkpoints::held_index(row) {
-                Some(entry) => (ids.get(entry).cloned(), false),
-                None => {
-                    let survivor = tab.surviving_row(row);
-                    let deleted = survivor.as_deref() != Some(row);
-                    (survivor, deleted)
-                }
-            },
-            None => (None, false),
+        let keep = tab.row_parent();
+        let (project, ids) = match job::save_in_memory(
+            &target,
+            &tab.held,
+            &tab.pending_deletes,
+            keep.as_ref(),
+            onto_existing,
+        ) {
+            Ok(saved) => saved,
+            Err(err) => {
+                self.report_failed_save(index, &target, err.to_string());
+                self.emit(ShellEvent::CheckpointsChanged);
+                return false;
+            }
         };
-        if row_deleted {
-            tab.edit = None;
-        }
+        let tab = &mut self.state.projects[index];
+        let next =
+            tab.selected_checkpoint
+                .as_deref()
+                .and_then(|row| match checkpoints::held_index(row) {
+                    Some(entry) => {
+                        // `ids` holds one id per written entry.
+                        let kept =
+                            job::kept_entries(&tab.held, &tab.pending_deletes, keep.as_ref());
+                        ids.get(kept[..entry].iter().filter(|written| **written).count())
+                            .cloned()
+                    }
+                    None => Some(row.to_string()),
+                });
         tab.selected_checkpoint =
             next.or_else(|| project.history().visible().first().map(|c| c.id.clone()));
         tab.row_planes = None;

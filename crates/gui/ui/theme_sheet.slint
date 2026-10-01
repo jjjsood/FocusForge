@@ -37,7 +37,7 @@ import { FFStatusGlyph } from "components/ff_status_glyph.slint";
 import { FFHeading } from "components/ff_heading.slint";
 import { FFDivider } from "components/ff_divider.slint";
 import { FFSegmented } from "components/ff_segmented.slint";
-import { FFToast } from "shell/dialogs.slint";
+import { FFToast, FFCheckpointDelete } from "shell/dialogs.slint";
 
 component ColourSwatch inherits Rectangle {
     in property <color> swatch;
@@ -614,6 +614,13 @@ export component ThemeSheet inherits Window {
             FFCheckpointRow {
                 algorithm: "dwt-wavelet";
                 time-text: "15:58:30";
+                deletable: true;
+                hovered: true;
+            }
+            FFCheckpointRow {
+                algorithm: "dwt-wavelet";
+                time-text: "15:12:44";
+                deletable: true;
             }
             FFSectionHeading {
                 width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-content-inset;
@@ -625,6 +632,15 @@ export component ThemeSheet inherits Window {
                 algorithm: "Laplacian Pyramid";
                 time-text: "21:08:12";
             }
+        }
+
+        GroupHeading { text: "Checkpoints list: last row, hovered"; }
+        FFCheckpointRow {
+            algorithm: "Laplacian Pyramid";
+            time-text: "16:42:08";
+            selected: true;
+            hovered: true;
+            deletable: false;
         }
 
         GroupHeading { text: "Images list: legend row"; }
@@ -771,6 +787,20 @@ export component ThemeSheet inherits Window {
                 secondary-label: "Locate frames…";
                 confirm-label: "Open anyway";
                 confirm-kind: "danger";
+            }
+        }
+
+        GroupHeading { text: "Dialog: delete a checkpoint"; }
+        Rectangle {
+            width: 580px;
+            height: 336px;
+            clip: true;
+            FFCheckpointDelete {
+                width: 100%;
+                height: 100%;
+                open: true;
+                context: "Laplacian Pyramid · 15:47:02";
+                body: "The other 3 checkpoints are untouched, and the stack is not fused again.";
             }
         }
 

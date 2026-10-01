@@ -238,6 +238,19 @@ export component FFCloseGuard inherits FFDialog {
     confirm-kind: "danger";
 }
 
+// Asked before a checkpoint is deleted; `AppController` supplies the
+// context (`algorithm · HH:MM:SS`) and the body with the other-checkpoint
+// count.
+export component FFCheckpointDelete inherits FFDialog {
+    tone: "plain";
+    divider: false;
+    panel-width: 560px;
+    panel-height: 316px;
+    title: "Delete this checkpoint?";
+    confirm-label: "Delete";
+    confirm-kind: "danger";
+}
+
 // A saved project's source content no longer matches the fingerprint it
 // was recorded with, blocking the open until a choice is made;
 // `AppController::mismatch_copy` supplies the context and body. `Open

@@ -265,28 +265,52 @@ impl InMemoryCheckpoint {
     }
 }
 
-/// Writes `entries` in order, each under its own parent, then hides the
-/// saved checkpoints `deletes` names (see [`super::delete_checkpoint`]), in
-/// one rename over `target` (onto the project there when `onto_existing`).
-/// Returns the id written per entry. On error `target` is left as it was;
-/// bad parents and unknown deletes are refused before any write.
+/// Which of `entries` [`seal_in_memory`] writes: every one except an entry
+/// `deletes` names that is not `keep` and that no written entry is recorded
+/// under.
+pub fn kept_entries(
+    entries: &[InMemoryCheckpoint],
+    deletes: &[ParentRef],
+    keep: Option<&ParentRef>,
+) -> Vec<bool> {
+    let mut written = vec![true; entries.len()];
+    for i in (0..entries.len()).rev() {
+        let this = ParentRef::Entry(i);
+        written[i] = !deletes.contains(&this)
+            || keep == Some(&this)
+            || entries[i + 1..]
+                .iter()
+                .zip(&written[i + 1..])
+                .any(|(entry, written)| *written && entry.parent.as_ref() == Some(&this));
+    }
+    written
+}
+
+/// Writes the [`kept_entries`], each under its own parent, hides `deletes`
+/// (see [`super::delete_checkpoint`]) and removes hidden checkpoints nothing
+/// visible is built on, sparing `keep` and its ancestors: one rename over
+/// `target` (onto the project there when `onto_existing`). Returns the id
+/// written per written entry. On error `target` is left as it was; bad
+/// references and unknown deletes are refused before any write.
 pub fn seal_in_memory(
     target: &Path,
     entries: &[InMemoryCheckpoint],
-    deletes: &[String],
+    deletes: &[ParentRef],
+    keep: Option<&ParentRef>,
     onto_existing: bool,
 ) -> Result<Vec<String>, ProjectError> {
-    plan_in_memory(target, entries, deletes, onto_existing)?;
+    plan_in_memory(target, entries, deletes, keep, onto_existing)?;
     let mut name = target
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_default();
     name.push(".saving");
     let temp = target.with_file_name(name);
-    let result = write_in_memory(target, &temp, entries, deletes, onto_existing).and_then(|ids| {
-        std::fs::rename(&temp, target).map_err(|source| ProjectError::io(target, source))?;
-        Ok(ids)
-    });
+    let result =
+        write_in_memory(target, &temp, entries, deletes, keep, onto_existing).and_then(|ids| {
+            std::fs::rename(&temp, target).map_err(|source| ProjectError::io(target, source))?;
+            Ok(ids)
+        });
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
@@ -296,17 +320,13 @@ pub fn seal_in_memory(
 fn plan_in_memory(
     target: &Path,
     entries: &[InMemoryCheckpoint],
-    deletes: &[String],
+    deletes: &[ParentRef],
+    keep: Option<&ParentRef>,
     onto_existing: bool,
 ) -> Result<(), ProjectError> {
     let refuse = |message: String| ProjectError::container(target, message);
     if entries.is_empty() && (deletes.is_empty() || !onto_existing) {
         return Err(refuse("no checkpoint to save".to_string()));
-    }
-    if !onto_existing && !deletes.is_empty() {
-        return Err(refuse(
-            "a new project has no saved checkpoint to delete".to_string(),
-        ));
     }
     let opened = if onto_existing {
         Some(Project::open(target)?)
@@ -345,10 +365,24 @@ fn plan_in_memory(
         }
     }
 
-    if let Some(project) = &opened {
-        for id in deletes {
-            project.history().get(id)?;
+    for reference in deletes.iter().chain(keep) {
+        match (reference, &opened) {
+            (ParentRef::Entry(i), _) if *i >= entries.len() => {
+                return Err(refuse(format!("checkpoint {i} is not in the list")));
+            }
+            (ParentRef::Entry(_), _) => {}
+            (ParentRef::Saved(id), Some(project)) => {
+                project.history().get(id)?;
+            }
+            (ParentRef::Saved(id), None) => {
+                return Err(refuse(format!(
+                    "saved checkpoint {id} is named, but there is no saved project"
+                )));
+            }
         }
+    }
+    if !onto_existing && !kept_entries(entries, deletes, keep)[0] {
+        return Err(refuse("no checkpoint to save".to_string()));
     }
     Ok(())
 }
@@ -357,18 +391,24 @@ fn write_in_memory(
     target: &Path,
     temp: &Path,
     entries: &[InMemoryCheckpoint],
-    deletes: &[String],
+    deletes: &[ParentRef],
+    keep: Option<&ParentRef>,
     onto_existing: bool,
 ) -> Result<Vec<String>, ProjectError> {
     if onto_existing {
         std::fs::copy(target, temp).map_err(|source| ProjectError::io(target, source))?;
     }
-    let mut ids: Vec<String> = Vec::with_capacity(entries.len());
-    for entry in entries {
+    let kept = kept_entries(entries, deletes, keep);
+    let mut ids: Vec<Option<String>> = vec![None; entries.len()];
+    for (i, entry) in entries.iter().enumerate().filter(|(i, _)| kept[*i]) {
         let parent: Option<String> = match &entry.parent {
             None => None,
             Some(ParentRef::Saved(id)) => Some(id.clone()),
-            Some(ParentRef::Entry(j)) => Some(ids[*j].clone()),
+            Some(ParentRef::Entry(j)) => Some(
+                ids[*j]
+                    .clone()
+                    .expect("an entry kept for its child is written before it"),
+            ),
         };
         let id = match &entry.kind {
             InMemoryKind::Fused(held) => write_fused(temp, held, parent.as_deref())?,
@@ -384,12 +424,23 @@ fn write_in_memory(
                 .checkpoint
             }
         };
-        ids.push(id);
+        ids[i] = Some(id);
     }
-    for id in deletes {
-        super::delete_checkpoint(temp, id)?;
+    let keep_id: Option<&str> = keep.map(|reference| match reference {
+        ParentRef::Saved(id) => id.as_str(),
+        ParentRef::Entry(i) => ids[*i].as_deref().expect("the pinned entry is written"),
+    });
+    for delete in deletes {
+        let id = match delete {
+            ParentRef::Saved(id) => Some(id.as_str()),
+            ParentRef::Entry(i) => ids[*i].as_deref(),
+        };
+        if let Some(id) = id {
+            super::append::hide_and_collect(temp, Some(id), keep_id)?;
+        }
     }
-    Ok(ids)
+    super::append::hide_and_collect(temp, None, keep_id)?;
+    Ok(ids.into_iter().flatten().collect())
 }
 
 /// Writes one fused checkpoint into `temp`: as a new project's root when

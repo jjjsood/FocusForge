@@ -203,13 +203,13 @@ fn rows_match_the_core_listing() {
     // A held checkpoint at the newest saved time sorts first; one between
     // the root and its children sorts between them.
     let today = checkpoints::today();
-    let tied = checkpoints::build_model(&saved, &[held_at(t0 + 60)], today, None, 0.0);
+    let tied = checkpoints::build_model(&saved, &[held_at(t0 + 60)], &[], today, None, 0.0);
     assert_eq!(
         row_ids(&tied)[0],
         "held:0",
         "a held row goes first on a tie"
     );
-    let between = checkpoints::build_model(&saved, &[held_at(t0 + 30)], today, None, 0.0);
+    let between = checkpoints::build_model(&saved, &[held_at(t0 + 30)], &[], today, None, 0.0);
     let ids = row_ids(&between);
     assert_eq!(ids[..3], listing[..3]);
     assert_eq!(ids[3], "held:0");
@@ -1425,4 +1425,502 @@ fn long_history_scrolls_in_a_four_row_list() {
         assert_eq!(current, 1, "one sticky header at offset {offset}");
         offset += 7.0;
     }
+}
+
+// ---------------------------------------------------------------------
+// Deleting a checkpoint.
+// ---------------------------------------------------------------------
+
+const T0: i64 = 1_756_468_800;
+
+/// `build_edited`'s root and head plus one more child of the root, newest of
+/// the three; returns the project and that child's id.
+fn three_saved(name: &str) -> (Edited, String) {
+    let edited = build_edited(name);
+    let child = append_ops_onto(
+        &edited.project,
+        &edited.root,
+        vec![stroke(4, 0, 2)],
+        None,
+        T0 + 120,
+        ZMapStorage::Bounded,
+    )
+    .unwrap()
+    .checkpoint;
+    (edited, child)
+}
+
+fn open_three(name: &str) -> (Edited, String, AppController) {
+    let (edited, child) = three_saved(name);
+    let mut controller = scratch_controller(name);
+    common::open_and_settle(&mut controller, std::slice::from_ref(&edited.project));
+    (edited, child, controller)
+}
+
+/// An unsaved tab over three copied frames with `fuses` in-memory fused
+/// checkpoints, the newest one current.
+fn fused_tab(name: &str, fuses: usize) -> AppController {
+    let frames = common::tree(&format!("{name}_frames"));
+    for i in 0..3 {
+        fs::copy(
+            common::fixture_frame("mantis-64", i),
+            frames.join(format!("{i:02}.tif")),
+        )
+        .expect("fixture frame must copy");
+    }
+    let mut controller = scratch_controller(name);
+    common::open_and_settle(&mut controller, &[frames]);
+    controller.set_align_algorithm("dummy-align");
+    for _ in 0..fuses {
+        assert!(controller.start_fuse());
+        while common::wait_for_settle(&mut controller, Duration::from_secs(60)).is_some() {}
+    }
+    assert_eq!(controller.checkpoint_count(), Some(fuses));
+    controller
+}
+
+/// Opens the delete question on row `id`.
+fn request(controller: &mut AppController, id: &str) {
+    let row = row_index(controller, id);
+    controller.request_checkpoint_delete(row);
+}
+
+/// Opens the delete question on row `id` and answers `Delete`.
+fn confirm(controller: &mut AppController, id: &str) {
+    request(controller, id);
+    assert!(
+        controller.pending_checkpoint_delete_copy().is_some(),
+        "the question for {id} opens"
+    );
+    controller.confirm_checkpoint_delete();
+    assert!(!controller.modal_open());
+}
+
+/// The names of the directories directly under `dir`, sorted.
+fn subdirs(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The directories under the tab-level directory of `kind` (`held` or
+/// `planes`) in the scratch root `scratch_controller(name)` made.
+fn cache_dirs(name: &str, kind: &str) -> Vec<String> {
+    let kind_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("{name}_scratch"))
+        .join(kind);
+    let mut dirs: Vec<String> = subdirs(&kind_dir)
+        .iter()
+        .flat_map(|tab| subdirs(&kind_dir.join(tab)))
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// Clicks row `id` and waits until its planes are ready; returns their
+/// composite's samples.
+fn settled_image(controller: &mut AppController, id: &str) -> Vec<u16> {
+    click(controller, id);
+    for _ in 0..2 {
+        if let Some((composite, _)) = controller.materialize_active_tab_planes() {
+            return samples(&composite);
+        }
+        wait_for_render(controller);
+    }
+    let (composite, _) = controller
+        .materialize_active_tab_planes()
+        .expect("the planes settle");
+    samples(&composite)
+}
+
+/// The panel's rows, request by request: every row of a list of two or more
+/// opens the question, a list of one opens nothing.
+#[test]
+fn every_row_is_deletable_until_one_is_left() {
+    let name = "checkpoint_panel_delete_rows";
+    let (project, child, mut controller) = open_three(name);
+    enter_editor(&mut controller);
+    paint(&mut controller, stroke(1, 1, 0));
+    assert!(controller.save_checkpoint());
+    let rows = ["held:0", &child, &project.edited, &project.root];
+    let current = current_row(&controller);
+    assert_eq!(current.as_deref(), Some("held:0"));
+    for id in rows {
+        request(&mut controller, id);
+        assert!(
+            controller.pending_checkpoint_delete_copy().is_some(),
+            "{id}"
+        );
+        assert!(controller.modal_open());
+        assert_eq!(
+            current_row(&controller),
+            current,
+            "a request selects nothing"
+        );
+        controller.cancel_checkpoint_delete();
+        assert!(!controller.modal_open());
+    }
+
+    let mut lone = fused_tab("checkpoint_panel_delete_lone", 1);
+    request(&mut lone, "held:0");
+    assert!(lone.pending_checkpoint_delete_copy().is_none());
+    assert!(!lone.modal_open());
+
+    for id in [&project.root, &project.edited, &child] {
+        confirm(&mut controller, id);
+    }
+    request(&mut controller, "held:0");
+    assert!(controller.pending_checkpoint_delete_copy().is_none());
+    assert!(!controller.modal_open());
+}
+
+/// The question's words: the row's own `algorithm · time`, the count of what
+/// stays in digits (singular for one), and no word about how anything is kept.
+#[test]
+fn deleting_asks_one_quiet_question() {
+    let name = "checkpoint_panel_delete_copy";
+    let (project, child, mut controller) = open_three(name);
+    enter_editor(&mut controller);
+    paint(&mut controller, stroke(1, 1, 0));
+    assert!(controller.save_checkpoint());
+    let words = ["delta", "snapshot", "blob", "stored", "hidden"];
+    let check = |controller: &mut AppController, id: &str, others: &str| {
+        request(controller, id);
+        let (context, body) = controller
+            .pending_checkpoint_delete_copy()
+            .expect("the question is open");
+        let row = controller
+            .checkpoints_panel()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id.as_deref() == Some(id))
+            .unwrap();
+        assert_eq!(context, format!("{} · {}", row.algorithm, row.time_text));
+        assert_eq!(body, others);
+        for text in [&context, &body] {
+            assert!(words.iter().all(|word| !text.to_lowercase().contains(word)));
+        }
+        controller.cancel_checkpoint_delete();
+    };
+    let three = "The other 3 checkpoints are untouched, and the stack is not fused again.";
+    check(&mut controller, &project.root, three);
+    check(&mut controller, "held:0", three);
+    confirm(&mut controller, &child);
+    confirm(&mut controller, &project.edited);
+    check(
+        &mut controller,
+        &project.root,
+        "The other checkpoint is untouched, and the stack is not fused again.",
+    );
+
+    // The dialog itself: plain, no divider, no info line, 560 x 316.
+    let source = fs::read_to_string(common::ui_dir().join("shell/dialogs.slint")).unwrap();
+    let dialog = source
+        .split("export component FFCheckpointDelete")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("the dialog is declared");
+    for needle in [
+        "tone: \"plain\"",
+        "divider: false",
+        "panel-width: 560px",
+        "panel-height: 316px",
+        "title: \"Delete this checkpoint?\"",
+        "confirm-label: \"Delete\"",
+        "confirm-kind: \"danger\"",
+    ] {
+        assert!(dialog.contains(needle), "{needle}");
+    }
+    assert!(!dialog.contains("info:"));
+    assert!(
+        words
+            .iter()
+            .all(|word| !dialog.to_lowercase().contains(word))
+    );
+}
+
+#[test]
+fn a_confirmed_delete_removes_exactly_that_row() {
+    let name = "checkpoint_panel_delete_exact";
+    let project = build_edited(name);
+    // `c` is created before `b`; both are children of the head `a`.
+    for (at, x) in [(T0 + 180, 0), (T0 + 120, 4)] {
+        append_ops_onto(
+            &project.project,
+            &project.edited,
+            vec![stroke(x, 0, 2)],
+            None,
+            at,
+            ZMapStorage::Bounded,
+        )
+        .unwrap();
+    }
+    let mut controller = scratch_controller(name);
+    common::open_and_settle(&mut controller, std::slice::from_ref(&project.project));
+    click(&mut controller, &project.edited);
+    enter_editor(&mut controller);
+    paint(&mut controller, stroke(1, 1, 0));
+    assert!(controller.save_checkpoint());
+    let before = row_ids(&controller.checkpoints_panel());
+    assert_eq!(before.len(), 5);
+    assert_eq!(before[0], "held:0");
+    let bytes = fs::read(&project.project).unwrap();
+    let mtime = fs::metadata(&project.project).unwrap().modified().unwrap();
+    let panel = controller.checkpoints_panel();
+    assert!(controller.save_enabled());
+
+    request(&mut controller, &project.edited);
+    controller.cancel_checkpoint_delete();
+    assert_eq!(controller.checkpoints_panel(), panel);
+    assert!(controller.save_enabled());
+    assert_eq!(fs::read(&project.project).unwrap(), bytes);
+
+    confirm(&mut controller, &project.edited);
+    let expected: Vec<String> = before
+        .iter()
+        .filter(|id| **id != project.edited)
+        .cloned()
+        .collect();
+    assert_eq!(row_ids(&controller.checkpoints_panel()), expected);
+    assert_eq!(current_row(&controller).as_deref(), Some("held:0"));
+    assert_eq!(fs::read(&project.project).unwrap(), bytes);
+    assert_eq!(
+        fs::metadata(&project.project).unwrap().modified().unwrap(),
+        mtime
+    );
+    assert!(controller.save_enabled(), "the delete waits for a save");
+
+    assert!(controller.save_active_project(|_| None));
+    let reopened = Project::open(&project.project).unwrap();
+    let visible: Vec<String> = reopened
+        .history()
+        .visible()
+        .iter()
+        .map(|checkpoint| checkpoint.id.clone())
+        .collect();
+    assert_eq!(row_ids(&controller.checkpoints_panel()), visible);
+    assert_eq!(visible.len(), 4);
+    assert!(!visible.contains(&project.edited));
+    let child = current_row(&controller).expect("the entry's row stays current");
+    assert_eq!(
+        parent_of(&project.project, &child).as_deref(),
+        Some(project.edited.as_str()),
+        "the entry recorded under the deleted row is in the list"
+    );
+
+    paint(&mut controller, stroke(2, 2, 1));
+    assert!(controller.save_checkpoint());
+    let with_entry = row_ids(&controller.checkpoints_panel());
+    confirm(&mut controller, "held:0");
+    let after = row_ids(&controller.checkpoints_panel());
+    assert_eq!(after, with_entry[1..], "the entry leaves at once");
+}
+
+/// A delete is not an edit: the canvas, the session and its ops stay put at
+/// the answer and across the save that writes it, and the row live stands on
+/// stays usable as a parent.
+#[test]
+fn deleting_never_changes_live_or_the_canvas() {
+    let name = "checkpoint_panel_delete_live";
+    let (project, child, mut controller) = open_three(name);
+    controller.set_resident_tile_size_for_test(2);
+    enter_editor(&mut controller);
+    loaded_composite(controller.canvas_feed(None));
+    paint(&mut controller, stroke(1, 1, 0));
+    paint(&mut controller, stroke(3, 1, 1));
+    let indices = live_indices(&controller);
+    let image = {
+        let (composite, _) = controller
+            .materialize_active_tab_planes()
+            .expect("the current row's planes are ready");
+        samples(&composite)
+    };
+    let events = record_events(&mut controller);
+    controller.take_render_started();
+    let untouched = |controller: &mut AppController| {
+        assert!(matches!(controller.canvas_feed(Some(0)), CanvasFeed::Keep));
+        assert_eq!(live_ops(controller), 2);
+        assert!(controller.edit_session().unwrap().can_undo());
+        assert_eq!(live_indices(controller), indices);
+        assert!(!controller.take_render_started());
+        let seen = events.lock().unwrap();
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, ShellEvent::EditorChanged))
+        );
+    };
+
+    confirm(&mut controller, &child);
+    untouched(&mut controller);
+    assert_eq!(current_row(&controller), None, "no row is highlighted");
+    confirm(&mut controller, &project.edited);
+    untouched(&mut controller);
+
+    assert!(controller.save_active_project(|_| None));
+    assert!(controller.edit_session().is_some());
+    assert_eq!(live_indices(&controller), indices);
+    let kept = saved_ids(&project.project);
+    assert!(kept.contains(&child), "the row live stands on stays stored");
+    let current = current_row(&controller).expect("live's row is listed again");
+    let out = common::tree("checkpoint_panel_delete_live_expected");
+    assert_eq!(
+        rendered(&project.project, &child, &out.join("child.tif")),
+        image,
+        "the planes live stands on are the same bytes"
+    );
+
+    paint(&mut controller, stroke(2, 2, 1));
+    assert!(controller.save_checkpoint());
+    assert!(controller.save_active_project(|_| None));
+    let known: Vec<&str> = kept.iter().map(String::as_str).collect();
+    let newest = added_id(&project.project, &known);
+    let saved = Project::open(&project.project).unwrap();
+    let checkpoint = saved.history().get(&newest).unwrap();
+    assert_eq!(checkpoint.ops.last(), Some(&stroke(2, 2, 1)));
+    assert_eq!(checkpoint.parent.as_deref(), Some(current.as_str()));
+
+    // Stacking mode over an in-memory fused current row.
+    let mut stacking = fused_tab("checkpoint_panel_delete_live_stacking", 2);
+    assert!(stacking.set_mode(ShellMode::Stacking));
+    let events = record_events(&mut stacking);
+    loaded_composite(stacking.canvas_feed(None));
+    stacking.take_render_started();
+    confirm(&mut stacking, "held:1");
+    assert!(matches!(stacking.canvas_feed(Some(0)), CanvasFeed::Keep));
+    assert!(!stacking.take_render_started());
+    assert_eq!(live_ops(&stacking), 0);
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, ShellEvent::EditorChanged))
+    );
+}
+
+#[test]
+fn deletes_refuse_only_unknown_queued_or_last() {
+    let name = "checkpoint_panel_delete_refuse";
+    let (project, child, mut controller) = open_three(name);
+    enter_editor(&mut controller);
+    paint(&mut controller, stroke(1, 1, 0));
+    assert!(controller.save_checkpoint());
+    let rows = controller.checkpoints_panel();
+    assert!(!controller.queue_checkpoint_delete("nope"));
+    assert!(!controller.queue_checkpoint_delete("held:9"));
+    assert_eq!(controller.checkpoints_panel(), rows);
+    // `child` has the in-memory row recorded under it; the root is a root.
+    assert!(controller.queue_checkpoint_delete(&child));
+    assert!(
+        !controller.queue_checkpoint_delete(&child),
+        "already queued"
+    );
+    assert!(controller.queue_checkpoint_delete(&project.root));
+    assert!(controller.queue_checkpoint_delete(&project.edited));
+    assert!(
+        !controller.queue_checkpoint_delete("held:0"),
+        "the last row"
+    );
+    assert_eq!(row_ids(&controller.checkpoints_panel()), ["held:0"]);
+    assert!(controller.save_active_project(|_| None));
+    assert!(
+        !controller.queue_checkpoint_delete(&child),
+        "a hidden row is not listed"
+    );
+
+    // Under another dialog a request opens nothing.
+    let (project, _, mut controller) = open_three("checkpoint_panel_delete_modal");
+    enter_editor(&mut controller);
+    paint(&mut controller, stroke(1, 1, 0));
+    assert!(controller.save_checkpoint());
+    controller.request_close_at(0, Instant::now());
+    assert!(controller.modal_open());
+    request(&mut controller, &project.root);
+    assert!(controller.pending_checkpoint_delete_copy().is_none());
+    controller.close_guard_cancelled();
+    paint(&mut controller, stroke(2, 2, 1));
+    click(&mut controller, &project.root);
+    assert!(controller.pending_restore_copy().is_some());
+    request(&mut controller, &project.edited);
+    assert!(controller.pending_checkpoint_delete_copy().is_none());
+    controller.close_guard_cancelled();
+
+    // While its own question is open the chrome is blocked.
+    request(&mut controller, &project.root);
+    let copy = controller.pending_checkpoint_delete_copy();
+    assert!(copy.is_some() && controller.modal_open());
+    request(&mut controller, &project.edited);
+    assert_eq!(controller.pending_checkpoint_delete_copy(), copy);
+    controller.select_checkpoint_row(row_index(&controller, &project.edited));
+    assert!(controller.pending_restore_copy().is_none());
+    controller.request_close_at(0, Instant::now());
+    assert!(controller.pending_close().is_none());
+    controller.cancel_checkpoint_delete();
+    assert!(!controller.modal_open());
+}
+
+#[test]
+fn deletes_and_views_leave_no_files_behind() {
+    // Nothing built on a row, or live not on it: its directory goes at the answer.
+    let name = "checkpoint_panel_files_free";
+    let mut controller = fused_tab(name, 3);
+    assert_eq!(cache_dirs(name, "held"), ["fused-0", "fused-1", "fused-2"]);
+    click(&mut controller, "held:0");
+    confirm(&mut controller, "held:2");
+    assert_eq!(cache_dirs(name, "held"), ["fused-0", "fused-1"]);
+    confirm(&mut controller, "held:1");
+    assert_eq!(cache_dirs(name, "held"), ["fused-0"]);
+
+    // A listed row built on it, then live standing on it, keep the files
+    // until a restore elsewhere.
+    let name = "checkpoint_panel_files_keep";
+    let mut controller = fused_tab(name, 3);
+    confirm(&mut controller, "held:1");
+    assert_eq!(cache_dirs(name, "held").len(), 3, "held:2 is built on it");
+    confirm(&mut controller, "held:2");
+    assert_eq!(cache_dirs(name, "held").len(), 3, "live stands on held:2");
+    click(&mut controller, "held:0");
+    assert_eq!(cache_dirs(name, "held"), ["fused-0"]);
+
+    // Six viewed saved rows leave four directories; a deleted viewed row's
+    // directory goes at the answer unless it is the current row's.
+    let name = "checkpoint_panel_files_planes";
+    let (project, child) = three_saved(name);
+    let mut viewed = vec![project.root.clone(), project.edited.clone(), child];
+    for (i, at) in [T0 + 180, T0 + 240, T0 + 300].into_iter().enumerate() {
+        viewed.push(
+            append_ops_onto(
+                &project.project,
+                &project.root,
+                vec![stroke(i as i32, 2, 2)],
+                None,
+                at,
+                ZMapStorage::Bounded,
+            )
+            .unwrap()
+            .checkpoint,
+        );
+    }
+    let mut controller = scratch_controller(name);
+    common::open_and_settle(&mut controller, std::slice::from_ref(&project.project));
+    for id in &viewed {
+        settled_image(&mut controller, id);
+    }
+    let mut last_four: Vec<String> = viewed[2..].to_vec();
+    last_four.sort();
+    assert_eq!(cache_dirs(name, "planes"), last_four);
+    confirm(&mut controller, &viewed[3]);
+    assert!(!cache_dirs(name, "planes").contains(&viewed[3]));
+    confirm(&mut controller, &viewed[5]);
+    assert!(
+        cache_dirs(name, "planes").contains(&viewed[5]),
+        "the current row's planes stay"
+    );
 }

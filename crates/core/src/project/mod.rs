@@ -85,7 +85,7 @@ pub use render::{CheckpointImage, ZmapSource, render_checkpoint};
 pub use review::ReviewMetrics;
 pub use seal::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, SealRequest, SealedProject,
-    now_unix, seal, seal_at, seal_in_memory,
+    kept_entries, now_unix, seal, seal_at, seal_in_memory,
 };
 pub use validate::{
     FingerprintMismatch, Opened, PendingProject, SourceCheck, Validation, check_sources,

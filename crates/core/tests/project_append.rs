@@ -501,7 +501,7 @@ fn seal_chain(
             fused_entry(checkpoint.clone(), parent)
         })
         .collect();
-    project::seal_in_memory(target, &entries, &[], onto_existing)
+    project::seal_in_memory(target, &entries, &[], None, onto_existing)
 }
 
 /// Every file in `dir` whose name marks an unfinished write.
@@ -636,7 +636,7 @@ fn sealing_in_memory_checkpoints_writes_each_under_its_own_parent() {
         ),
         ops_entry(vec![stroke(3, 20, 20)], 1_300, ParentRef::Entry(2)),
     ];
-    let ids = project::seal_in_memory(&target, &entries, &[], false).unwrap();
+    let ids = project::seal_in_memory(&target, &entries, &[], None, false).unwrap();
     assert_eq!(ids.len(), 4);
     assert_eq!(parent_of(&target, ids[0].as_str()), None);
     assert_eq!(
@@ -673,7 +673,7 @@ fn sealing_in_memory_checkpoints_writes_each_under_its_own_parent() {
             Some(saved(&root)),
         ),
     ];
-    let ids = project::seal_in_memory(&project_path, &entries, &[], true).unwrap();
+    let ids = project::seal_in_memory(&project_path, &entries, &[], None, true).unwrap();
     assert_eq!(
         parent_of(&project_path, ids[0].as_str()).as_deref(),
         Some(root.as_str())
@@ -711,7 +711,7 @@ fn an_in_memory_op_checkpoint_materializes_to_its_replay() {
         ),
         ops_entry(third_ops.clone(), 7_300, ParentRef::Entry(2)),
     ];
-    let ids = project::seal_in_memory(&project_path, &entries, &[], true).unwrap();
+    let ids = project::seal_in_memory(&project_path, &entries, &[], None, true).unwrap();
 
     let replay = |parent: &str, ops: &[Op]| {
         let info = ZMapInfo::new(W, H, FRAMES).unwrap();
@@ -783,7 +783,7 @@ fn sealing_in_memory_checkpoints_refuses_a_bad_parent_and_leaves_the_target_unto
     ];
     for (what, entries) in refused {
         assert!(
-            project::seal_in_memory(&project_path, &entries, &[], true).is_err(),
+            project::seal_in_memory(&project_path, &entries, &[], None, true).is_err(),
             "{what} must be refused"
         );
         assert_eq!(
@@ -800,15 +800,15 @@ fn sealing_in_memory_checkpoints_refuses_a_bad_parent_and_leaves_the_target_unto
         fused_entry(second.clone(), Some(ParentRef::Entry(0))),
     ];
     std::fs::remove_file(&second.composite).unwrap();
-    assert!(project::seal_in_memory(&project_path, &entries, &[], true).is_err());
+    assert!(project::seal_in_memory(&project_path, &entries, &[], None, true).is_err());
     assert_eq!(std::fs::read(&project_path).unwrap(), before);
     assert!(leftover_temporaries(&dir).is_empty());
 
     // A project that does not exist yet: nothing to write, nothing created.
     let target = dir.join(format!("fresh.{}", project::PROJECT_EXTENSION));
-    assert!(project::seal_in_memory(&target, &[], &[], false).is_err());
+    assert!(project::seal_in_memory(&target, &[], &[], None, false).is_err());
     let parented = [fused_entry(held(4, 1_000), Some(saved(&root)))];
-    assert!(project::seal_in_memory(&target, &parented, &[], false).is_err());
+    assert!(project::seal_in_memory(&target, &parented, &[], None, false).is_err());
     assert!(!target.exists());
     assert!(leftover_temporaries(&dir).is_empty());
 }
@@ -876,7 +876,7 @@ fn sealing_hides_pending_deletes_and_writes_entries_under_them() {
         ops_entry(vec![stroke(2, 25, 25)], 3_200, ParentRef::Entry(0)),
     ];
     let ids: Vec<String> =
-        project::seal_in_memory(&t.path, &entries, std::slice::from_ref(&t.a), true).unwrap();
+        project::seal_in_memory(&t.path, &entries, &[saved(&t.a)], None, true).unwrap();
     assert_eq!(ids.len(), 3);
     assert_eq!(parent_of(&t.path, &ids[0]).as_deref(), Some(t.b.as_str()));
     assert_eq!(parent_of(&t.path, &ids[1]).as_deref(), Some(t.a.as_str()));
@@ -901,15 +901,15 @@ fn sealing_hides_pending_deletes_and_writes_entries_under_them() {
 
     // A delete with nothing visible left under it removes the checkpoint.
     let t = branched("in_memory_hides_leaf");
-    let ids = project::seal_in_memory(&t.path, &[], std::slice::from_ref(&t.b), true).unwrap();
+    let ids = project::seal_in_memory(&t.path, &[], &[saved(&t.b)], None, true).unwrap();
     assert!(ids.is_empty());
     assert!(!all_ids(&t.path).contains(&t.b));
     assert_eq!(all_ids(&t.path).len(), 3);
 
     // Hidden first, collected with its last visible descendant.
     let t = branched("in_memory_hides_all_below");
-    let deletes = [t.a.clone(), t.b.clone(), t.c.clone()];
-    project::seal_in_memory(&t.path, &[], &deletes, true).unwrap();
+    let deletes = [saved(&t.a), saved(&t.b), saved(&t.c)];
+    project::seal_in_memory(&t.path, &[], &deletes, None, true).unwrap();
     assert_eq!(all_ids(&t.path), std::slice::from_ref(&t.root));
     assert_eq!(head_of(&t.path), t.root);
 
@@ -923,17 +923,17 @@ fn sealing_hides_pending_deletes_and_writes_entries_under_them() {
         )]
     };
     for (what, deletes, onto_existing) in [
-        ("unknown id", vec!["nope".to_string()], true),
-        ("a delete on a new project", vec![t.a.clone()], false),
+        ("unknown id", vec![saved("nope")], true),
+        ("a delete on a new project", vec![saved(&t.a)], false),
     ] {
         assert!(
-            project::seal_in_memory(&t.path, &entry(), &deletes, onto_existing).is_err(),
+            project::seal_in_memory(&t.path, &entry(), &deletes, None, onto_existing).is_err(),
             "{what}"
         );
         assert_eq!(std::fs::read(&t.path).unwrap(), before, "{what}");
     }
-    let everything = [t.root.clone(), t.a.clone(), t.b.clone(), t.c.clone()];
-    assert!(project::seal_in_memory(&t.path, &[], &everything, true).is_err());
+    let everything = [saved(&t.root), saved(&t.a), saved(&t.b), saved(&t.c)];
+    assert!(project::seal_in_memory(&t.path, &[], &everything, None, true).is_err());
     assert_eq!(std::fs::read(&t.path).unwrap(), before, "every visible");
     // A failure midway with a delete pending.
     let broken = entry();
@@ -941,7 +941,123 @@ fn sealing_hides_pending_deletes_and_writes_entries_under_them() {
         unreachable!("the entry is fused")
     };
     std::fs::remove_file(&held.composite).unwrap();
-    assert!(project::seal_in_memory(&t.path, &broken, std::slice::from_ref(&t.a), true).is_err());
+    assert!(project::seal_in_memory(&t.path, &broken, &[saved(&t.a)], None, true).is_err());
     assert_eq!(std::fs::read(&t.path).unwrap(), before);
     assert!(leftover_temporaries(&t.dir).is_empty());
+}
+
+fn is_hidden(path: &Path, id: &str) -> bool {
+    Project::open(path)
+        .unwrap()
+        .history()
+        .get(id)
+        .unwrap()
+        .hidden
+}
+
+/// A fused entry whose planes are gone, so writing it would fail.
+fn unreadable_entry(
+    dir: &Path,
+    sources: &[PathBuf],
+    variant: u16,
+    parent: Option<ParentRef>,
+) -> project::InMemoryCheckpoint {
+    let held = held_checkpoint(dir, sources, variant, 4_000 + i64::from(variant));
+    std::fs::remove_file(&held.composite).unwrap();
+    std::fs::remove_file(&held.zmap).unwrap();
+    fused_entry(held, parent)
+}
+
+#[test]
+fn sealing_keeps_the_pinned_row_and_skips_unneeded_entries() {
+    // The pin on a hidden saved row keeps it stored; the next save without
+    // the pin collects it.
+    let t = branched("pin_saved");
+    project::seal_in_memory(&t.path, &[], &[saved(&t.b)], Some(&saved(&t.b)), true).unwrap();
+    assert!(all_ids(&t.path).contains(&t.b));
+    assert!(is_hidden(&t.path, &t.b));
+    let later = [ops_entry(vec![stroke(3, 40, 40)], 5_000, saved(&t.c))];
+    project::seal_in_memory(&t.path, &later, &[], None, true).unwrap();
+    assert!(
+        !all_ids(&t.path).contains(&t.b),
+        "the unpinned row is collected"
+    );
+
+    // A pinned op-bearing row keeps its hidden parent stored too.
+    let t = branched("pin_with_hidden_parent");
+    let deletes = [saved(&t.a), saved(&t.b)];
+    project::seal_in_memory(&t.path, &[], &deletes, Some(&saved(&t.b)), true).unwrap();
+    assert!(is_hidden(&t.path, &t.a) && is_hidden(&t.path, &t.b));
+    let mut visible = vec![t.root.clone(), t.c.clone()];
+    visible.sort();
+    assert_eq!(visible_sorted(&t.path), visible);
+
+    // A deleted entry nothing builds on is not written, and its planes are
+    // never read.
+    let t = branched("skip_unneeded");
+    let entries = [
+        unreadable_entry(&t.dir, &t.sources, 5, Some(saved(&t.root))),
+        ops_entry(vec![stroke(3, 10, 10)], 6_000, saved(&t.c)),
+    ];
+    let deletes = [ParentRef::Entry(0)];
+    assert_eq!(
+        project::kept_entries(&entries, &deletes, None),
+        [false, true]
+    );
+    let ids = project::seal_in_memory(&t.path, &entries, &deletes, None, true).unwrap();
+    assert_eq!(ids.len(), 1, "one id per written entry");
+    assert_eq!(all_ids(&t.path).len(), 5);
+
+    // A deleted entry a written one is built on is stored hidden.
+    let t = branched("hidden_entry");
+    let entries = [
+        ops_entry(vec![stroke(3, 10, 10)], 6_000, saved(&t.c)),
+        ops_entry(vec![stroke(1, 20, 20)], 6_100, ParentRef::Entry(0)),
+    ];
+    let deletes = [ParentRef::Entry(0)];
+    assert_eq!(
+        project::kept_entries(&entries, &deletes, None),
+        [true, true]
+    );
+    let ids = project::seal_in_memory(&t.path, &entries, &deletes, None, true).unwrap();
+    assert_eq!(ids.len(), 2);
+    assert!(is_hidden(&t.path, &ids[0]));
+    assert!(!is_hidden(&t.path, &ids[1]));
+
+    // Pinned, an entry nothing builds on is stored hidden.
+    let t = branched("pinned_entry");
+    let entries = [
+        ops_entry(vec![stroke(3, 10, 10)], 6_000, saved(&t.c)),
+        ops_entry(vec![stroke(1, 20, 20)], 6_100, saved(&t.b)),
+    ];
+    let deletes = [ParentRef::Entry(0)];
+    let keep = ParentRef::Entry(0);
+    assert_eq!(
+        project::kept_entries(&entries, &deletes, Some(&keep)),
+        [true, true]
+    );
+    let ids = project::seal_in_memory(&t.path, &entries, &deletes, Some(&keep), true).unwrap();
+    assert_eq!(ids.len(), 2);
+    assert!(
+        is_hidden(&t.path, &ids[0]),
+        "the pinned entry is stored hidden"
+    );
+    assert_eq!(all_ids(&t.path).len(), 6);
+
+    // A new project: a hidden root with a written child, and a skipped leaf.
+    let (dir, _, sources) = sealed("pin_new_project");
+    let entries = [
+        fused_entry(held_checkpoint(&dir, &sources, 7, 7_000), None),
+        fused_entry(
+            held_checkpoint(&dir, &sources, 8, 7_100),
+            Some(ParentRef::Entry(0)),
+        ),
+        unreadable_entry(&dir, &sources, 9, Some(ParentRef::Entry(1))),
+    ];
+    let deletes = [ParentRef::Entry(0), ParentRef::Entry(2)];
+    let target = dir.join(format!("fresh.{}", project::PROJECT_EXTENSION));
+    let ids = project::seal_in_memory(&target, &entries, &deletes, None, false).unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(all_ids(&target).len(), 2);
+    assert!(is_hidden(&target, &ids[0]));
 }

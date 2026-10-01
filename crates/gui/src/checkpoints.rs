@@ -237,23 +237,35 @@ fn held_algorithm(index: usize, held: &[InMemoryCheckpoint], saved: &[&Checkpoin
 
 /// Builds the panel's flat entry list: `checkpoints` merged with `held`
 /// (in memory since the last save, not yet in any `.ffp`), ordered by
-/// `created_at` descending with a held row first on a tie. Day separators
+/// `created_at` descending with a held row first on a tie. A hidden saved
+/// checkpoint and every row `pending` names are left out (`checkpoints` and
+/// `held` stay whole for the parent lookups). Day separators
 /// appear only when the merged list spans more than one local day, `today`
 /// being the caller's local date. `selected` matches a row's own id (a
 /// saved row's stored id, a held row's `"held:<index>"`).
 pub fn build_model(
     checkpoints: &[&Checkpoint],
     held: &[InMemoryCheckpoint],
+    pending: &[ParentRef],
     today: NaiveDate,
     selected: Option<&str>,
     scroll_y: f32,
 ) -> CheckpointsModel {
-    let mut rows: Vec<Row> = checkpoints.iter().map(|c| Row::Saved(c)).collect();
-    rows.extend(held.iter().enumerate().map(|(index, entry)| Row::Held {
-        index,
-        created_at: entry.created_at(),
-        algorithm: held_algorithm(index, held, checkpoints),
-    }));
+    let mut rows: Vec<Row> = checkpoints
+        .iter()
+        .filter(|c| !c.hidden && !pending.contains(&ParentRef::Saved(c.id.clone())))
+        .map(|c| Row::Saved(c))
+        .collect();
+    rows.extend(
+        held.iter()
+            .enumerate()
+            .filter(|(index, _)| !pending.contains(&ParentRef::Entry(*index)))
+            .map(|(index, entry)| Row::Held {
+                index,
+                created_at: entry.created_at(),
+                algorithm: held_algorithm(index, held, checkpoints),
+            }),
+    );
     // A held row sorts before a saved one at the same `created_at`: `false <
     // true`, so a held row's `0` rank stays ahead of `Row::Saved`'s `1`.
     rows.sort_by(|a, b| {
@@ -346,7 +358,7 @@ mod tests {
         let a = checkpoint("a", noon);
         let b = checkpoint("b", noon + 60);
         let today = local_datetime(noon).unwrap().date_naive();
-        let model = build_model(&[&b, &a], &[], today, None, 0.0);
+        let model = build_model(&[&b, &a], &[], &[], today, None, 0.0);
         assert!(
             model.entries.iter().all(|e| e.separator_label.is_none()),
             "a single-day list must draw no separator"
@@ -360,7 +372,7 @@ mod tests {
         let today_cp = checkpoint("a", noon);
         let older_cp = checkpoint("b", noon - 3 * 86_400);
         let today = local_datetime(noon).unwrap().date_naive();
-        let model = build_model(&[&today_cp, &older_cp], &[], today, None, 0.0);
+        let model = build_model(&[&today_cp, &older_cp], &[], &[], today, None, 0.0);
         let labels: Vec<&str> = model
             .entries
             .iter()
@@ -377,7 +389,7 @@ mod tests {
         let mut c = checkpoint("a", 1_756_468_800);
         c.algorithm = "not-a-real-algorithm".to_string();
         let today = local_datetime(c.created_at).unwrap().date_naive();
-        let model = build_model(&[&c], &[], today, None, 0.0);
+        let model = build_model(&[&c], &[], &[], today, None, 0.0);
         assert_eq!(model.entries[0].algorithm, "not-a-real-algorithm");
     }
 
@@ -390,6 +402,7 @@ mod tests {
         let today = local_datetime(noon).unwrap().date_naive();
         let model = build_model(
             &[&today_cp, &yesterday_cp, &older_cp],
+            &[],
             &[],
             today,
             None,
@@ -412,7 +425,7 @@ mod tests {
         let a = checkpoint("a", 1_756_468_800);
         let b = checkpoint("b", 1_756_468_860);
         let today = local_datetime(a.created_at).unwrap().date_naive();
-        let model = build_model(&[&b, &a], &[], today, Some("a"), 0.0);
+        let model = build_model(&[&b, &a], &[], &[], today, Some("a"), 0.0);
         let selected: Vec<bool> = model.entries.iter().map(|e| e.selected).collect();
         assert_eq!(selected, vec![false, true]);
     }
@@ -442,7 +455,7 @@ mod tests {
             },
         ];
         let today = local_datetime(noon).unwrap().date_naive();
-        let model = build_model(&[&saved], &held, today, None, 0.0);
+        let model = build_model(&[&saved], &held, &[], today, None, 0.0);
 
         let rows: Vec<&CheckpointEntry> = model
             .entries
@@ -461,6 +474,45 @@ mod tests {
             .filter_map(|e| e.separator_label.as_deref())
             .collect();
         assert_eq!(labels.len(), 2, "today's rows, then the saved row's day");
+    }
+
+    #[test]
+    fn queued_and_hidden_rows_leave_the_list_and_keep_every_other_key() {
+        use focusforge_core::project::{InMemoryCheckpoint, InMemoryKind, ParentRef};
+        let noon = 1_756_468_800;
+        let mut hidden = checkpoint("a", noon - 500);
+        hidden.algorithm = "hidden-algorithm".to_string();
+        hidden.hidden = true;
+        let b = checkpoint("b", noon - 400);
+        let c = checkpoint("c", noon - 300);
+        let ops = |parent: ParentRef, created_at: i64| InMemoryCheckpoint {
+            kind: InMemoryKind::Ops {
+                ops: Vec::new(),
+                created_at,
+            },
+            parent: Some(parent),
+        };
+        let held = [
+            ops(ParentRef::Saved("a".to_string()), noon - 200),
+            ops(ParentRef::Entry(0), noon - 100),
+            ops(ParentRef::Saved("b".to_string()), noon),
+        ];
+        let pending = [ParentRef::Saved("c".to_string()), ParentRef::Entry(1)];
+        let today = local_datetime(noon).unwrap().date_naive();
+        let model = build_model(&[&hidden, &b, &c], &held, &pending, today, None, 0.0);
+
+        let rows: Vec<&CheckpointEntry> = model
+            .entries
+            .iter()
+            .filter(|e| e.separator_label.is_none())
+            .collect();
+        let ids: Vec<&str> = rows.iter().filter_map(|e| e.id.as_deref()).collect();
+        assert_eq!(ids, ["held:2", "held:0", "b"]);
+        assert_eq!(model.row_count, 3);
+        assert_eq!(
+            rows[1].algorithm, "hidden-algorithm",
+            "an op row names its hidden parent's algorithm"
+        );
     }
 
     fn stroke(x: i32) -> Op {

@@ -35,7 +35,7 @@ pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 pub use focusforge_core::project::Op;
 pub use focusforge_core::project::{
-    HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, now_unix,
+    HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, kept_entries, now_unix,
 };
 pub use focusforge_core::retouch::{EditSession, footprint};
 pub use focusforge_core::zmap::{NO_SOURCE, source_color};
@@ -549,6 +549,11 @@ fn is_fresh(path: &Path, ffp_modified: SystemTime) -> bool {
         .unwrap_or(false)
 }
 
+/// The directory holding checkpoint `id`'s planes in the project's plane cache.
+pub fn checkpoint_plane_dir(scratch_root: &Path, project_path: &Path, id: &str) -> PathBuf {
+    plane_cache_dir(scratch_root, project_path).join(id)
+}
+
 /// Checkpoint `id`'s own composite and Z-Map paths in the project's plane
 /// cache: one directory per checkpoint, so showing another row never
 /// overwrites the planes already on screen.
@@ -557,7 +562,7 @@ fn checkpoint_plane_paths(
     project_path: &Path,
     id: &str,
 ) -> (PathBuf, PathBuf) {
-    let dir = plane_cache_dir(scratch_root, project_path).join(id);
+    let dir = checkpoint_plane_dir(scratch_root, project_path, id);
     (dir.join(COMPOSITE_FILENAME), dir.join(ZMAP_FILENAME))
 }
 
@@ -939,15 +944,17 @@ pub fn open_edit_session(
 
 /// Writes `entries`, each under its own parent, and applies `deletes` at
 /// `target` -- onto the project already there when `onto_existing` -- then
-/// opens the result. Returns it with the id written per entry. On failure
-/// `target` is left exactly as it was.
+/// opens the result. `keep` stays stored even when deleted. Returns it with
+/// the id written per entry [`kept_entries`] keeps. On failure `target` is
+/// left exactly as it was.
 pub fn save_in_memory(
     target: &Path,
     entries: &[InMemoryCheckpoint],
-    deletes: &[String],
+    deletes: &[ParentRef],
+    keep: Option<&ParentRef>,
     onto_existing: bool,
 ) -> Result<(Project, Vec<String>), ProjectError> {
-    let ids = project::seal_in_memory(target, entries, deletes, onto_existing)?;
+    let ids = project::seal_in_memory(target, entries, deletes, keep, onto_existing)?;
     Ok((Project::open(target)?, ids))
 }
 

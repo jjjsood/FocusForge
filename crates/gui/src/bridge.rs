@@ -879,6 +879,14 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
         }
         None => app.set_close_guard_open(false),
     }
+    match controller.pending_checkpoint_delete_copy() {
+        Some((context, body)) => {
+            app.set_checkpoint_delete_context(context.into());
+            app.set_checkpoint_delete_body(body.into());
+            app.set_checkpoint_delete_open(true);
+        }
+        None => app.set_checkpoint_delete_open(false),
+    }
     // The dock's own gate for the tab row, the settings panel and the
     // "No project open." note (`ui/shell/dock.slint`) -- otherwise stuck at
     // whatever a canvas gesture (`repaint`, above) last set it to, since a
@@ -1271,6 +1279,7 @@ pub fn push_checkpoint_panel(app: &AppWindow, controller: &AppController) {
             time_text: entry.time_text.clone().into(),
             top: entry.top,
             selected: entry.selected,
+            deletable: panel.row_count > 1,
             // No next separator sticks solid once reached; a value far
             // past any real content height so the "pushed out" comparison
             // never trips.
@@ -1718,6 +1727,7 @@ pub fn install(
                 controller.pending_close().is_some()
                     || controller.pending_quit_copy().is_some()
                     || controller.pending_restore_copy().is_some()
+                    || controller.pending_checkpoint_delete_copy().is_some()
             };
             if let Some(app) = app_weak.upgrade() {
                 repaint(&app, &controller, &canvas);
@@ -2691,6 +2701,37 @@ pub fn install(
         move |i| {
             dispatch(&controller, &canvas, &app_weak, |c| {
                 c.select_checkpoint_row(i as usize)
+            })
+        }
+    });
+
+    app.on_checkpoint_delete_requested({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |c| {
+                c.request_checkpoint_delete(i as usize)
+            })
+        }
+    });
+    app.on_checkpoint_delete_cancelled({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch_gallery(&controller, &canvas, &app_weak, |c| {
+                c.cancel_checkpoint_delete()
+            })
+        }
+    });
+    app.on_checkpoint_delete_confirmed({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch_gallery(&controller, &canvas, &app_weak, |c| {
+                c.confirm_checkpoint_delete()
             })
         }
     });

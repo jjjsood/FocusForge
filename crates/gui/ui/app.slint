@@ -22,7 +22,7 @@ export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFSettingsModal, InputRow, FFManifestRow } from "shell/settings_modal.slint";
 export { InputRow, FFManifestRow }
-import { FFCloseGuard, FFDivergenceWarning, FFExportDialog, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing, FFToast } from "shell/dialogs.slint";
+import { FFCheckpointDelete, FFCloseGuard, FFDivergenceWarning, FFExportDialog, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing, FFToast } from "shell/dialogs.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
 export { ProjectCardView, RecentRowView }
@@ -246,6 +246,7 @@ export component AppWindow inherits Window {
     in property <length> checkpoint-scroll-y: 0px;
     in property <length> checkpoint-content-height: 0px;
     callback checkpoint-selected(int);
+    callback checkpoint-delete-requested(int);
     callback checkpoint-scrolled(length);
     callback checkpoint-scrollbar-pointer(int, length);
     callback checkpoint-scrollbar-dragged(length);
@@ -438,6 +439,7 @@ export component AppWindow inherits Window {
         dock-tab-selected(t) => { root.dock-tab-selected(t); }
         checkpoint-export-requested => { root.checkpoint-export-requested(); }
         checkpoint-selected(i) => { root.checkpoint-selected(i); }
+        checkpoint-delete-requested(i) => { root.checkpoint-delete-requested(i); }
         checkpoint-scrolled(delta) => { root.checkpoint-scrolled(delta); }
         checkpoint-scrollbar-pointer(kind, y) => { root.checkpoint-scrollbar-pointer(kind, y); }
         checkpoint-scrollbar-dragged(y) => { root.checkpoint-scrollbar-dragged(y); }
@@ -733,6 +735,11 @@ export component AppWindow inherits Window {
     callback close-guard-cancelled();
     callback close-guard-secondary-pressed();
     callback close-guard-confirmed();
+    in property <bool> checkpoint-delete-open: false;
+    in property <string> checkpoint-delete-context: "";
+    in property <string> checkpoint-delete-body: "";
+    callback checkpoint-delete-cancelled();
+    callback checkpoint-delete-confirmed();
 
     grouping-question := FFGroupingQuestion {
         x: 0px;
@@ -873,6 +880,18 @@ export component AppWindow inherits Window {
         cancelled => { root.close-guard-cancelled(); }
         secondary-pressed => { root.close-guard-secondary-pressed(); }
         confirmed => { root.close-guard-confirmed(); }
+    }
+
+    checkpoint-delete := FFCheckpointDelete {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.checkpoint-delete-open;
+        context: root.checkpoint-delete-context;
+        body: root.checkpoint-delete-body;
+        cancelled => { root.checkpoint-delete-cancelled(); }
+        confirmed => { root.checkpoint-delete-confirmed(); }
     }
 
     loading-indicator := FFLoadingIndicator {

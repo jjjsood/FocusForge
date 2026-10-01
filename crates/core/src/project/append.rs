@@ -782,20 +782,40 @@ pub struct Deleted {
 /// When the head goes, the newest visible checkpoint becomes the head and the
 /// manifest is rebuilt from it ([`Project::fuse_state`]).
 pub fn delete_checkpoint(project_path: &Path, id: &str) -> Result<Deleted, ProjectError> {
+    let (removed, head) = hide_and_collect(project_path, Some(id), None)?;
+    Ok(Deleted {
+        hidden: id.to_string(),
+        removed,
+        head,
+    })
+}
+
+/// [`delete_checkpoint`]'s body: hides `hide` when given, then removes every
+/// hidden checkpoint nothing visible is built on, returning the ids removed
+/// and the head. `keep` counts as visible for that removal, so it and its
+/// ancestors stay stored even when hidden. With nothing to hide and nothing
+/// to remove, the file is not written.
+pub(super) fn hide_and_collect(
+    project_path: &Path,
+    hide: Option<&str>,
+    keep: Option<&str>,
+) -> Result<(Vec<String>, String), ProjectError> {
     let project = Project::open(project_path)?;
     let history = project.history();
-    let target = history.get(id)?;
-    if target.hidden {
-        return Err(ProjectError::UnknownCheckpoint {
-            path: project_path.to_path_buf(),
-            id: id.to_string(),
-        });
-    }
-    if history.visible().len() == 1 {
-        return Err(ProjectError::LastVisibleDelete {
-            path: project_path.to_path_buf(),
-            checkpoint: id.to_string(),
-        });
+    let target = hide.map(|id| history.get(id)).transpose()?;
+    if let (Some(id), Some(target)) = (hide, target) {
+        if target.hidden {
+            return Err(ProjectError::UnknownCheckpoint {
+                path: project_path.to_path_buf(),
+                id: id.to_string(),
+            });
+        }
+        if history.visible().len() == 1 {
+            return Err(ProjectError::LastVisibleDelete {
+                path: project_path.to_path_buf(),
+                checkpoint: id.to_string(),
+            });
+        }
     }
 
     let hidden_set: HashSet<&str> = history
@@ -803,7 +823,8 @@ pub fn delete_checkpoint(project_path: &Path, id: &str) -> Result<Deleted, Proje
         .into_iter()
         .filter(|c| c.hidden)
         .map(|c| c.id.as_str())
-        .chain([id])
+        .chain(hide)
+        .filter(|id| Some(*id) != keep)
         .collect();
     let removed: Vec<String> = history
         .all()
@@ -818,6 +839,9 @@ pub fn delete_checkpoint(project_path: &Path, id: &str) -> Result<Deleted, Proje
         .map(|c| c.id.clone())
         .collect();
     let removed_set: HashSet<&str> = removed.iter().map(String::as_str).collect();
+    if hide.is_none() && removed.is_empty() {
+        return Ok((removed, project.checkpoint().id.clone()));
+    }
 
     let all = history.all();
     let survivors: Vec<Checkpoint> = all
@@ -833,12 +857,13 @@ pub fn delete_checkpoint(project_path: &Path, id: &str) -> Result<Deleted, Proje
 
     let manifest = project.manifest().clone();
     let old_head_id = project.checkpoint().id.clone();
-    let head_gone = old_head_id == id || removed_set.contains(old_head_id.as_str());
+    let head_gone =
+        hide == Some(old_head_id.as_str()) || removed_set.contains(old_head_id.as_str());
 
     let new_manifest = if head_gone {
         let new_head = survivors
             .iter()
-            .find(|c| !c.hidden && c.id != id)
+            .find(|c| !c.hidden && Some(c.id.as_str()) != hide)
             .expect("a visible checkpoint other than the target remains");
         let fuse = project.fuse_state(&new_head.id)?;
         Manifest {
@@ -880,20 +905,20 @@ pub fn delete_checkpoint(project_path: &Path, id: &str) -> Result<Deleted, Proje
     let dropped_checkpoint_names: HashSet<String> = removed
         .iter()
         .map(String::as_str)
-        .chain([id])
+        .chain(hide)
         .map(|id| format!("checkpoints/{id}.json"))
         .collect();
-    let hidden_text = if removed_set.contains(id) {
-        None
-    } else {
-        let hidden = Checkpoint {
-            hidden: true,
-            ..target.clone()
-        };
-        Some(
-            serde_json::to_string_pretty(&hidden)
-                .map_err(|err| ProjectError::container(project_path, err))?,
-        )
+    let hidden_text = match (hide, target) {
+        (Some(id), Some(target)) if !removed_set.contains(id) => {
+            let hidden = Checkpoint {
+                hidden: true,
+                ..target.clone()
+            };
+            let text = serde_json::to_string_pretty(&hidden)
+                .map_err(|err| ProjectError::container(project_path, err))?;
+            Some((id, text))
+        }
+        _ => None,
     };
 
     let final_manifest = Manifest {
@@ -919,16 +944,12 @@ pub fn delete_checkpoint(project_path: &Path, id: &str) -> Result<Deleted, Proje
         }
         true
     })?;
-    if let Some(text) = hidden_text {
+    if let Some((id, text)) = hidden_text {
         writer.add_text(&format!("checkpoints/{id}.json"), &text)?;
     }
     writer.finish()?;
 
-    Ok(Deleted {
-        hidden: id.to_string(),
-        removed,
-        head: final_manifest.checkpoint,
-    })
+    Ok((removed, final_manifest.checkpoint))
 }
 
 /// Every blob hash `checkpoints` reaches: each one's resolved Z-Map chain

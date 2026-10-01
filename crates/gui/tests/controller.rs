@@ -4603,12 +4603,11 @@ fn save_is_enabled_only_with_something_to_write() {
 #[test]
 fn a_pending_delete_is_applied_by_the_project_save() {
     let (path, chain) = saved_chain("pending_delete", &[20, 40]);
-    let (root, a, b) = (&chain[0], &chain[1], &chain[2]);
+    let b = &chain[2];
     let mut controller = reopen(&path, "pending_delete_reopened");
     assert_eq!(current_row(&controller), Some(b.clone()));
     assert!(!controller.save_enabled());
 
-    assert!(!controller.queue_checkpoint_delete(root), "the root stays");
     assert!(!controller.queue_checkpoint_delete("no-such-checkpoint"));
     assert!(!controller.save_enabled(), "refusals change nothing");
 
@@ -4630,27 +4629,62 @@ fn a_pending_delete_is_applied_by_the_project_save() {
     assert!(controller.save_enabled(), "the delete is still queued");
     fs::remove_dir(&blocker).unwrap();
 
+    // The current row's delete leaves it stored hidden and unlisted.
     assert!(controller.save_active_project(|_| None));
-    assert_eq!(saved_ids(&path).len(), 2);
-    assert!(!saved_ids(&path).contains(b));
-    assert_eq!(current_row(&controller), Some(a.clone()));
-    assert!(
-        controller.edit_session().is_none(),
-        "no session on the survivor"
-    );
+    assert_eq!(saved_ids(&path).len(), 3);
+    let project = saved(&path);
+    assert!(project.history().get(b).unwrap().hidden);
+    assert!(project.history().visible().iter().all(|c| &c.id != b));
+    assert_eq!(current_row(&controller), None);
     assert!(!controller.save_enabled());
 
-    // A checkpoint an in-memory entry sits under is not deletable.
-    let mut controller = reopen(&path, "pending_delete_entry");
-    enter_editor(&mut controller);
-    paint(&mut controller, 30);
-    assert!(controller.snapshot_live(0));
+    // The root is deletable; the last listed row is not.
+    let (path, chain) = saved_chain("pending_delete_root", &[20, 40]);
+    let mut controller = reopen(&path, "pending_delete_root_reopened");
+    assert!(controller.queue_checkpoint_delete(&chain[0]));
+    assert!(controller.queue_checkpoint_delete(&chain[1]));
     assert!(
-        !controller.queue_checkpoint_delete(a),
-        "an entry descends from it"
+        !controller.queue_checkpoint_delete(&chain[2]),
+        "the last listed row stays"
     );
     assert!(controller.save_active_project(|_| None));
     assert_eq!(saved_ids(&path).len(), 3);
+    let project = saved(&path);
+    let visible: Vec<&str> = project
+        .history()
+        .visible()
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    assert_eq!(visible, [chain[2].as_str()]);
+
+    // A delete leaves the edit session open.
+    let (path, chain) = saved_chain("pending_delete_session", &[20]);
+    let mut controller = reopen(&path, "pending_delete_session_reopened");
+    enter_editor(&mut controller);
+    assert!(controller.queue_checkpoint_delete(&chain[1]));
+    assert!(controller.save_active_project(|_| None));
+    assert!(controller.edit_session().is_some());
+    assert_eq!(current_row(&controller), None);
+    // Live still stands on the deleted row: a stroke lands under it.
+    paint(&mut controller, 50);
+    assert!(controller.save_active_project(|_| None));
+    assert_eq!(
+        saved(&path).checkpoint().parent.as_deref(),
+        Some(chain[1].as_str())
+    );
+
+    // A checkpoint an in-memory entry sits under is deletable; the save
+    // writes the entry under it.
+    let (path, chain) = saved_chain("pending_delete_entry", &[20, 40]);
+    let mut controller = reopen(&path, "pending_delete_entry_reopened");
+    enter_editor(&mut controller);
+    paint(&mut controller, 30);
+    assert!(controller.snapshot_live(0));
+    assert!(controller.queue_checkpoint_delete(&chain[1]));
+    assert!(controller.save_active_project(|_| None));
+    assert_eq!(saved_ids(&path).len(), 4);
+    assert!(saved(&path).history().get(&chain[1]).unwrap().hidden);
 
     // A fuse finishing on a pending-deleted row lands under it; the save
     // hides the row and keeps it.

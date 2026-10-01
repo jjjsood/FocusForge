@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // One checkpoint list row: algorithm over timestamp; selected adds a raised
-// background and a left accent bar.
+// background and a left accent bar; a hovered deletable row shows a trash
+// control at its right edge.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
@@ -10,17 +11,41 @@ export component FFCheckpointRow inherits Rectangle {
     in property <string> algorithm;
     in property <string> time-text;
     in property <bool> selected: false;
+    // Whether the row offers a delete control while hovered.
+    in property <bool> deletable: false;
+    // Draws the hover look without a pointer.
+    in property <bool> hovered: false;
 
     callback clicked();
+    callback delete-requested();
 
     width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-band-inset;
     height: ShellGeometry.checkpoint-row-height;
-    background: root.selected ? Theme.surface-hover : transparent;
+    background: root.selected || root.hovered || area.has-hover ? Theme.surface-hover : transparent;
 
-    TouchArea {
+    // Nested rather than a sibling: Slint delivers a pointer move to exactly
+    // one item, so a sibling TouchArea would occlude `area.has-hover` once the
+    // pointer reaches the trash.
+    area := TouchArea {
         width: 100%;
         height: 100%;
         clicked => { root.clicked(); }
+
+        // Clear of the list's scrollbar track, which sits flush on the row's
+        // right edge.
+        if root.deletable && (root.hovered || area.has-hover): TouchArea {
+            width: Theme.icon-sm;
+            height: Theme.icon-sm;
+            x: parent.width - self.width - Theme.space-1 - ShellGeometry.scrollbar-width;
+            y: (parent.height - self.height) / 2;
+            clicked => { root.delete-requested(); }
+            Image {
+                source: @image-url("../../../../assets/icons/trash.svg");
+                colorize: Theme.status-failure;
+                width: 100%;
+                height: 100%;
+            }
+        }
     }
 
     // The bar's own width is the gap between the band's inset and the

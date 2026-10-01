@@ -56,7 +56,8 @@ fn seal_chain_alone(target: &Path, held: &project::HeldCheckpoint) {
         kind: project::InMemoryKind::Fused(held.clone()),
         parent: None,
     };
-    project::seal_in_memory(target, &[entry], &[], false).expect("the held checkpoint must seal");
+    project::seal_in_memory(target, &[entry], &[], None, false)
+        .expect("the held checkpoint must seal");
 }
 
 /// A request over `frames`, no alignment, the golden tile geometry unless
