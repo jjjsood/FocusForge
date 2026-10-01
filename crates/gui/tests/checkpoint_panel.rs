@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{Datelike, Days, Local, NaiveDate};
+use common::{enter_editor, paint};
 use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
@@ -507,27 +508,6 @@ fn stroke(x: i32, y: i32, source_id: u16) -> Op {
         path: vec![Point { x, y }],
         radius: 0.5,
         softness: 0.0,
-    }
-}
-
-fn paint(controller: &mut AppController, op: Op) {
-    controller
-        .edit_session_mut()
-        .expect("the tab has an edit session")
-        .append(op)
-        .expect("a stroke inside the map applies");
-}
-
-/// `set_mode(Editor)`, waiting out the render an op-bearing row needs first.
-fn enter_editor(controller: &mut AppController) {
-    let start = Instant::now();
-    while !controller.set_mode(ShellMode::Editor) {
-        assert!(
-            start.elapsed() < Duration::from_secs(60),
-            "the editor did not open"
-        );
-        controller.settle_checkpoint_render();
-        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -1720,6 +1700,7 @@ fn a_confirmed_delete_removes_exactly_that_row() {
     confirm(&mut controller, "held:0");
     let after = row_ids(&controller.checkpoints_panel());
     assert_eq!(after, with_entry[1..], "the entry leaves at once");
+    wait_for_render(&mut controller);
 }
 
 /// A delete is not an edit: the canvas, the session and its ops stay put at

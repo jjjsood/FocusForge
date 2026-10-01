@@ -867,6 +867,7 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
         .pending_close()
         .or_else(|| controller.pending_quit_copy())
         .or_else(|| controller.pending_restore_copy())
+        .or_else(|| controller.pending_fuse_copy())
     {
         Some(copy) => {
             app.set_close_guard_title(copy.title.into());
@@ -1030,6 +1031,26 @@ fn start_job_timer(
         }
     });
     *job_timer.borrow_mut() = Some(timer);
+}
+
+/// Starts the job poll timer when an answer to a dialog left a run live or
+/// queued -- the fuse question's answers start one from a dialog callback.
+fn poll_if_work_pending(
+    app_weak: &slint::Weak<AppWindow>,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+    job_timer: &Rc<RefCell<Option<slint::Timer>>>,
+    toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
+) {
+    if controller.lock().unwrap().work_pending() {
+        start_job_timer(
+            app_weak.clone(),
+            controller.clone(),
+            canvas.clone(),
+            job_timer.clone(),
+            toast_timer.clone(),
+        );
+    }
 }
 
 /// Polls [`AppController::load_in_flight`], opening each `queued` path once
@@ -1727,6 +1748,7 @@ pub fn install(
                 controller.pending_close().is_some()
                     || controller.pending_quit_copy().is_some()
                     || controller.pending_restore_copy().is_some()
+                    || controller.pending_fuse_copy().is_some()
                     || controller.pending_checkpoint_delete_copy().is_some()
             };
             if let Some(app) = app_weak.upgrade() {
@@ -2825,10 +2847,13 @@ pub fn install(
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let job_timer = job_timer.clone();
+        let toast_timer = toast_timer.clone();
         move || {
             dispatch(&controller, &canvas, &app_weak, |controller| {
                 controller.confirm_frame_change();
             });
+            poll_if_work_pending(&app_weak, &controller, &canvas, &job_timer, &toast_timer);
         }
     });
     app.on_frame_warning_secondary_pressed({
@@ -2886,25 +2911,30 @@ pub fn install(
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let job_timer = job_timer.clone();
         let toast_timer = toast_timer.clone();
         move || {
             record_gallery_input();
             save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
                 c.close_guard_secondary_pressed(crate::picker::pick_save_project)
-            })
+            });
+            poll_if_work_pending(&app_weak, &controller, &canvas, &job_timer, &toast_timer);
         }
     });
     app.on_close_guard_confirmed({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let job_timer = job_timer.clone();
+        let toast_timer = toast_timer.clone();
         move || {
             dispatch_gallery(
                 &controller,
                 &canvas,
                 &app_weak,
                 AppController::close_guard_confirmed,
-            )
+            );
+            poll_if_work_pending(&app_weak, &controller, &canvas, &job_timer, &toast_timer);
         }
     });
     // The projects overlay: the tab strip's own toggle, the gallery's

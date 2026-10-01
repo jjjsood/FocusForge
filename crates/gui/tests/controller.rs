@@ -672,7 +672,8 @@ fn edit_session_follows_the_newest_planes() {
 
     assert!(controller.set_mode(ShellMode::Stacking));
     controller.toggle_frame_excluded(2);
-    assert!(controller.start_fuse());
+    assert!(!controller.start_fuse(), "a dab in live asks first");
+    controller.close_guard_confirmed();
     settle_all(&mut controller);
     assert_eq!(controller.checkpoint_count(), Some(2));
 
@@ -4739,9 +4740,9 @@ fn a_snapshot_during_a_fuse_holds_no_files() {
     controller.set_align_algorithm("dummy-align");
     enter_editor(&mut controller);
     assert!(controller.queue_checkpoint_delete(&chain[1]));
-    paint(&mut controller, 40);
 
     assert!(controller.start_fuse());
+    paint(&mut controller, 40);
     assert!(controller.snapshot_live(0), "an op-bearing entry is taken");
     settle_all(&mut controller);
 

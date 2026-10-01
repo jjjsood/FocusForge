@@ -680,16 +680,39 @@ impl ProjectTab {
         }
     }
 
-    /// Whether this tab holds work no `.ffp` contains: a never-saved
-    /// project, or any checkpoint fused since the last save.
-    fn unsaved(&self) -> bool {
-        matches!(self.project, GuiProject::Unsaved(_)) || !self.held.is_empty()
+    /// What closing this tab would lose besides a modified live: the
+    /// in-memory checkpoints the list still shows, and the queued deletes of
+    /// saved checkpoints.
+    fn unsaved_parts(&self) -> (usize, usize) {
+        let listed = (0..self.held.len())
+            .filter(|&index| !self.pending_deletes.contains(&job::ParentRef::Entry(index)))
+            .count();
+        let deletes = self
+            .pending_deletes
+            .iter()
+            .filter(|parent| matches!(parent, job::ParentRef::Saved(_)))
+            .count();
+        (listed, deletes)
     }
 
-    /// Whether quitting now would lose a run of this tab: a held checkpoint,
-    /// or a parked run still waiting for Keep or Discard.
+    /// Whether closing this tab loses something the user can see: a modified
+    /// live, a listed in-memory checkpoint or a queued delete of a saved one.
+    fn loses_on_close(&self) -> bool {
+        let (listed, deletes) = self.unsaved_parts();
+        self.live_modified() || listed > 0 || deletes > 0
+    }
+
+    /// Whether this tab holds work no `.ffp` contains: a never-saved
+    /// project, or anything [`Self::loses_on_close`] names.
+    fn unsaved(&self) -> bool {
+        matches!(self.project, GuiProject::Unsaved(_)) || self.loses_on_close()
+    }
+
+    /// Whether quitting now would lose work of this tab: what
+    /// [`Self::loses_on_close`] names, or a parked run still waiting for Keep
+    /// or Discard.
     fn quit_loses_work(&self) -> bool {
-        !self.held.is_empty() || self.parked.is_some()
+        self.loses_on_close() || self.parked.is_some()
     }
 
     /// The frames a fuse of this tab would actually use -- `frames` with
@@ -713,6 +736,18 @@ impl ProjectTab {
             GuiProject::Unsaved(_) => 0,
         };
         saved + self.held.len()
+    }
+
+    /// The number of rows the checkpoint list shows: visible saved
+    /// checkpoints less the queued deletes of saved ones, plus the listed
+    /// in-memory ones.
+    fn listed_checkpoint_count(&self) -> usize {
+        let saved = match &self.project {
+            GuiProject::Opened(project) => project.history().visible().len(),
+            GuiProject::Unsaved(_) => 0,
+        };
+        let (listed, deletes) = self.unsaved_parts();
+        saved.saturating_sub(deletes) + listed
     }
 
     /// Whether this tab can enter editor mode: at least one checkpoint, its
@@ -954,6 +989,14 @@ pub enum ChromeKey {
     SaveProject,
 }
 
+/// The press a fuse question interrupted -- what its answers start again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FuseEntry {
+    Fuse,
+    Retry,
+    RunAgain,
+}
+
 /// The close question's copy -- [`AppController::pending_close`]'s and
 /// [`AppController::pending_quit_copy`]'s return type. A single-tab close
 /// and a whole-window quit share one dialog, so the wording each proposes
@@ -1078,14 +1121,18 @@ struct ShellState {
     /// Whether the projects overlay is open.
     overlay_open: bool,
     /// The tab, by id, whose close waits on the "save first?" answer --
-    /// raised by [`AppController::request_close`] only when that tab holds
-    /// checkpoints no `.ffp` contains.
+    /// raised by [`AppController::request_close`] only when closing that tab
+    /// loses something ([`ProjectTab::loses_on_close`]).
     pending_close: Option<u64>,
     /// Whether a window quit waits on the "quit without saving?" answer --
-    /// raised by [`AppController::window_close`] only when some tab holds
-    /// checkpoints no `.ffp` contains. Mutually exclusive with
+    /// raised by [`AppController::window_close`] only when some tab would
+    /// lose work ([`ProjectTab::quit_loses_work`]). Mutually exclusive with
     /// `pending_close`: each is a no-op while the other question is open.
     pending_quit: bool,
+    /// The tab, by id, and the press a fuse waits on while the "save your
+    /// edits first?" answer is open -- raised only when that tab's live holds
+    /// ops.
+    pending_fuse: Option<(u64, FuseEntry)>,
     /// The tab, by id, and the row key a click on a checkpoint waits to
     /// restore while the "save this state first?" answer is open -- raised
     /// only when that tab's live holds ops.
@@ -1866,11 +1913,13 @@ impl AppController {
         self.emit(ShellEvent::WindowMaximizeToggled(self.state.maximized));
     }
 
-    /// Quits the window: with no tab holding a checkpoint or a parked run,
-    /// closes it at once. Otherwise raises [`Self::pending_quit_copy`] and
-    /// touches no tab. A no-op while a close or restore question is open.
+    /// Quits the window: with no tab holding unsaved work or a parked run
+    /// waiting for Keep or Discard, closes it at once. Otherwise raises
+    /// [`Self::pending_quit_copy`] and touches no tab. A no-op while a close,
+    /// fuse or restore question is open.
     pub fn window_close(&mut self) {
         if self.state.pending_close.is_some()
+            || self.state.pending_fuse.is_some()
             || self.state.pending_restore.is_some()
             || self.state.pending_checkpoint_delete.is_some()
         {
@@ -2413,6 +2462,7 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
+        let was_unsaved = tab.unsaved();
         let Some(edit) = tab.edit.as_mut() else {
             return;
         };
@@ -2426,6 +2476,9 @@ impl AppController {
             && let Err(err) = edit.recomposite(region)
         {
             tracing::error!(error = %err, "undo/redo recomposite failed");
+        }
+        if tab.unsaved() != was_unsaved {
+            self.emit(ShellEvent::ProjectsChanged);
         }
         self.emit(ShellEvent::EditorChanged);
     }
@@ -2583,6 +2636,7 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
+        let was_unsaved = tab.unsaved();
         let Some(edit) = tab.edit.as_mut() else {
             return;
         };
@@ -2609,7 +2663,15 @@ impl AppController {
             .session
             .append(op)
             .expect("a live stroke's own points are pre-clamped to what validate accepts");
-        let Some(region) = region else { return };
+        // Only the stroke that lights the unsaved mark changes what the tab
+        // strip and the project card show.
+        let lit = !was_unsaved;
+        let Some(region) = region else {
+            if lit {
+                self.emit(ShellEvent::ProjectsChanged);
+            }
+            return;
+        };
         let map = edit.session.tile();
         if tick_rects.is_empty() {
             if let Err(err) = edit.recomposite(region) {
@@ -2623,6 +2685,9 @@ impl AppController {
                     tracing::error!(error = %err, "brush-stroke commit recomposite failed");
                 }
             }
+        }
+        if lit {
+            self.emit(ShellEvent::ProjectsChanged);
         }
         self.emit(ShellEvent::EditorChanged);
     }
@@ -2986,14 +3051,15 @@ impl AppController {
         false
     }
 
-    /// Whether one of the seven dialogs that block the chrome accelerators is
-    /// open: Settings, the close/quit guard, the restore question, the
-    /// frame-set warning, the Keep/Discard divergence dialog, the grouping
-    /// question or the refusal dialog.
+    /// Whether one of the dialogs that block the chrome accelerators is
+    /// open: Settings, the close/quit guard, the fuse and restore questions,
+    /// the frame-set warning, the Keep/Discard divergence dialog, the
+    /// grouping question or the refusal dialog.
     pub fn modal_open(&self) -> bool {
         self.state.settings_open
             || self.state.pending_close.is_some()
             || self.state.pending_quit
+            || self.state.pending_fuse.is_some()
             || self.state.pending_restore.is_some()
             || self.state.pending_checkpoint_delete.is_some()
             || self.state.pending_frame_change.is_some()
@@ -3484,12 +3550,14 @@ impl AppController {
         self.request_close_at(index, Instant::now());
     }
 
-    /// Asks to close tab `index` as of `now`: a tab holding checkpoints no
-    /// `.ffp` contains raises [`Self::pending_close`] and stays open; any
-    /// other tab closes at once. A no-op out of range, inside
-    /// [`Self::CLOSE_DEBOUNCE`], or while a quit or restore question is open.
+    /// Asks to close tab `index` as of `now`: a tab with a modified live, an
+    /// in-memory checkpoint or a queued delete raises [`Self::pending_close`]
+    /// and stays open; any other tab closes at once. A no-op out of range,
+    /// inside [`Self::CLOSE_DEBOUNCE`], or while a quit, fuse or restore
+    /// question is open.
     pub fn request_close_at(&mut self, index: usize, now: Instant) {
         if self.state.pending_quit
+            || self.state.pending_fuse.is_some()
             || self.state.pending_restore.is_some()
             || self.state.pending_checkpoint_delete.is_some()
         {
@@ -3501,7 +3569,7 @@ impl AppController {
         if self.close_debounced(now) {
             return;
         }
-        if tab.held.is_empty() {
+        if !tab.loses_on_close() {
             self.remove_tab(index, now);
         } else {
             self.state.pending_close = Some(tab.id);
@@ -3522,6 +3590,13 @@ impl AppController {
         let closed = self.state.projects.remove(index);
         if self.state.pending_close == Some(closed.id) {
             self.state.pending_close = None;
+        }
+        if self
+            .state
+            .pending_fuse
+            .is_some_and(|(id, _)| id == closed.id)
+        {
+            self.state.pending_fuse = None;
         }
         if self
             .state
@@ -3811,7 +3886,7 @@ impl AppController {
                 project_name: tab.title.clone(),
                 meta_text: open_card_meta(
                     frame_count,
-                    tab.checkpoint_count(),
+                    tab.listed_checkpoint_count(),
                     phase_line.as_deref(),
                 ),
                 headline,
@@ -3894,8 +3969,16 @@ impl AppController {
     /// `Run again` on a `Did not stack`/`Cancelled` card: re-runs that tab's
     /// own kept request. Never more than one card's worth of work: a no-op
     /// while any run is already live, or with no matching failure, or with
-    /// no request kept for it. Returns whether a run started.
+    /// no request kept for it. A tab whose live holds ops raises
+    /// [`Self::pending_fuse_copy`] instead and returns `false`. Returns
+    /// whether a run started.
     pub fn run_gallery_action(&mut self, index: usize) -> bool {
+        self.run_gallery_action_at(index, false)
+    }
+
+    /// [`Self::run_gallery_action`]; `confirmed` skips the question about
+    /// unsaved ops.
+    fn run_gallery_action_at(&mut self, index: usize, confirmed: bool) -> bool {
         if self.any_job_running() {
             return false;
         }
@@ -3911,6 +3994,9 @@ impl AppController {
         let Some(request) = tab.request.clone() else {
             return false;
         };
+        if !confirmed && self.ask_before_fuse(index, FuseEntry::RunAgain) {
+            return false;
+        }
         self.state.active = Some(index);
         self.run_request(index, request);
         true
@@ -4880,47 +4966,97 @@ impl AppController {
         ))
     }
 
-    /// The close question still open, if any: which tab, how many
-    /// checkpoints closing it loses, and where saving it would write.
+    /// The close question still open, if any: which tab, what closing it
+    /// loses -- strokes in live, in-memory checkpoints, queued deletes -- and
+    /// where saving it would write.
     pub fn pending_close(&self) -> Option<CloseGuardCopy> {
         let id = self.state.pending_close?;
         let tab = self.state.projects.iter().find(|tab| tab.id == id)?;
-        let n = tab.held.len();
-        let (body, them) = if n == 1 {
-            (
-                "1 checkpoint has been fused since the last save. It belongs to no saved \
-                 project.\n\nClosing without saving loses it."
-                    .to_string(),
-                "it",
-            )
+        let (listed, deletes) = tab.unsaved_parts();
+        let ops: Vec<&job::Op> = tab
+            .edit
+            .as_ref()
+            .map(|edit| edit.session.ops().collect())
+            .unwrap_or_default();
+        let mut parts = Vec::new();
+        if !ops.is_empty() {
+            parts.push(unsaved_ops(ops.iter().copied()));
+        }
+        if listed > 0 {
+            parts.push(format!(
+                "{listed} unsaved checkpoint{}",
+                if listed == 1 { "" } else { "s" }
+            ));
+        }
+        if deletes > 0 {
+            parts.push(format!(
+                "{deletes} checkpoint{} to delete",
+                if deletes == 1 { "" } else { "s" }
+            ));
+        }
+        let them = if ops.len() + listed == 1 {
+            "it"
         } else {
-            (
-                format!(
-                    "{n} checkpoints have been fused since the last save. They belong to no \
-                     saved project.\n\nClosing without saving loses them."
-                ),
-                "them",
-            )
+            "them"
         };
         let info = match &tab.project {
             GuiProject::Unsaved(_) => "Saving asks where to write the project file.".to_string(),
-            GuiProject::Opened(project) => format!(
-                "Saving adds {them} to {}.",
-                project
+            GuiProject::Opened(project) => {
+                let file = project
                     .path()
                     .file_name()
                     .unwrap_or(project.path().as_os_str())
-                    .to_string_lossy()
-            ),
+                    .to_string_lossy();
+                if deletes > 0 {
+                    format!("Saving writes these changes to {file}.")
+                } else {
+                    format!("Saving adds {them} to {file}.")
+                }
+            }
         };
         Some(CloseGuardCopy {
             title: "Save this state first?".to_string(),
             context: format!("Closing {}", tab.title),
-            body,
+            body: format!("{}.", parts.join(", ")),
             info,
             secondary_label: "Save and close".to_string(),
-            confirm_label: "Close without saving".to_string(),
+            confirm_label: "Close anyway".to_string(),
         })
+    }
+
+    /// The fuse question still open, if any: the ops a fuse would lose and
+    /// what each answer does.
+    pub fn pending_fuse_copy(&self) -> Option<CloseGuardCopy> {
+        let (id, _) = self.state.pending_fuse?;
+        let tab = self.state.projects.iter().find(|tab| tab.id == id)?;
+        let ops: Vec<&job::Op> = tab.edit.as_ref()?.session.ops().collect();
+        Some(CloseGuardCopy {
+            title: "Save your edits first?".to_string(),
+            context: format!("Fusing {}", tab.title),
+            body: format!("{} will be lost.", unsaved_ops(ops)),
+            info: String::new(),
+            secondary_label: "Save and fuse".to_string(),
+            confirm_label: "Fuse anyway".to_string(),
+        })
+    }
+
+    /// Clears the fuse question, returning its tab's index -- `None` when the
+    /// tab is gone -- and the press it interrupted.
+    fn take_pending_fuse(&mut self) -> Option<(Option<usize>, FuseEntry)> {
+        let (id, entry) = self.state.pending_fuse.take()?;
+        self.emit(ShellEvent::ProjectsChanged);
+        let index = self.state.projects.iter().position(|tab| tab.id == id);
+        Some((index, entry))
+    }
+
+    /// Repeats `entry` on tab `index` without asking again. Returns whether
+    /// a run started or was enqueued.
+    fn resume_fuse(&mut self, index: usize, entry: FuseEntry) -> bool {
+        match entry {
+            FuseEntry::Fuse => self.start_fuse_at(index, true),
+            FuseEntry::Retry => self.retry_fuse_at(index, true),
+            FuseEntry::RunAgain => self.run_gallery_action_at(index, true),
+        }
     }
 
     /// The restore question still open, if any: the ops it would drop, the
@@ -5004,8 +5140,9 @@ impl AppController {
         true
     }
 
-    /// The quit question still open, if any: how many tabs hold checkpoints
-    /// no `.ffp` contains or a parked run nobody decided on.
+    /// The quit question still open, if any: how many tabs hold unsaved work
+    /// -- a modified live, an in-memory checkpoint, a queued delete -- or a
+    /// parked run nobody decided on.
     pub fn pending_quit_copy(&self) -> Option<CloseGuardCopy> {
         if !self.state.pending_quit {
             return None;
@@ -5046,8 +5183,8 @@ impl AppController {
         self.emit(ShellEvent::WindowCloseRequested);
     }
 
-    /// `Save all and quit`: saves every tab holding checkpoints no `.ffp`
-    /// contains, in order, as `save_project_at` does. The first save
+    /// `Save all and quit`: saves every tab that would lose work on close, in
+    /// order, as `save_project_at` does. The first save
     /// that does not write stops the loop and cancels the quit -- whatever
     /// already saved stays saved. Returns whether every save wrote.
     pub fn save_all_and_quit(&mut self, pick: impl Fn(&Path) -> Option<PathBuf>) -> bool {
@@ -5056,7 +5193,7 @@ impl AppController {
             .projects
             .iter()
             .enumerate()
-            .filter(|(_, tab)| !tab.held.is_empty())
+            .filter(|(_, tab)| tab.loses_on_close())
             .map(|(index, _)| index)
             .collect();
         for index in indices {
@@ -5072,11 +5209,13 @@ impl AppController {
         true
     }
 
-    /// The close guard's `Cancel`, whichever question is open -- a close
-    /// question if one is pending, otherwise a quit question. A no-op with
-    /// neither open.
+    /// The close guard's `Cancel`, whichever question is open -- the fuse or
+    /// restore question, a close question, otherwise a quit question. A no-op
+    /// with none open.
     pub fn close_guard_cancelled(&mut self) {
-        if self.state.pending_restore.is_some() {
+        if self.state.pending_fuse.is_some() {
+            self.take_pending_fuse();
+        } else if self.state.pending_restore.is_some() {
             self.take_pending_restore();
         } else if self.state.pending_close.is_some() {
             self.cancel_close();
@@ -5086,13 +5225,20 @@ impl AppController {
     }
 
     /// The close guard's secondary answer, whichever question is open --
-    /// [`Self::save_and_close`] for a close question, [`Self::save_all_and_quit`]
-    /// for a quit question. `false` with neither open.
+    /// [`Self::snapshot_live`] then the interrupted fuse for the fuse
+    /// question, [`Self::save_and_close`] for a close question,
+    /// [`Self::save_all_and_quit`] for a quit question. `false` with none
+    /// open, and for a fuse question when no run started or was queued.
     pub fn close_guard_secondary_pressed(
         &mut self,
         pick: impl Fn(&Path) -> Option<PathBuf>,
     ) -> bool {
-        if let Some((tab, key)) = self.take_pending_restore() {
+        if let Some((index, entry)) = self.take_pending_fuse() {
+            match index {
+                Some(index) if self.snapshot_live(index) => self.resume_fuse(index, entry),
+                _ => false,
+            }
+        } else if let Some((tab, key)) = self.take_pending_restore() {
             if let Some(index) = tab
                 && self.snapshot_live(index)
             {
@@ -5109,11 +5255,16 @@ impl AppController {
     }
 
     /// The close guard's destructive answer, whichever question is open --
+    /// the interrupted fuse for the fuse question,
     /// [`Self::close_without_saving`] for a close question,
-    /// [`Self::quit_without_saving`] for a quit question. A no-op with
-    /// neither open.
+    /// [`Self::quit_without_saving`] for a quit question. A no-op with none
+    /// open.
     pub fn close_guard_confirmed(&mut self) {
-        if let Some((tab, key)) = self.take_pending_restore() {
+        if let Some((index, entry)) = self.take_pending_fuse() {
+            if let Some(index) = index {
+                self.resume_fuse(index, entry);
+            }
+        } else if let Some((tab, key)) = self.take_pending_restore() {
             if tab.is_some() {
                 self.restore_row(key);
             }
@@ -5534,6 +5685,29 @@ impl AppController {
         self.emit(ShellEvent::ImagesChanged);
     }
 
+    /// Whether tab `id` holds the live run or a place in the queue.
+    fn holds_run_slot(&self, id: u64) -> bool {
+        self.any_job_running() && (self.job.tab_id == Some(id) || self.job.queue.contains(&id))
+    }
+
+    /// Raises the fuse question when a press of `entry` on tab `index` would
+    /// start or queue a run over a modified live. `true` when the press is
+    /// handled -- asked, or swallowed while another question is open -- and
+    /// nothing may start.
+    fn ask_before_fuse(&mut self, index: usize, entry: FuseEntry) -> bool {
+        let Some(tab) = self.state.projects.get(index) else {
+            return false;
+        };
+        if !tab.live_modified() || self.holds_run_slot(tab.id) {
+            return false;
+        }
+        if !self.modal_open() {
+            self.state.pending_fuse = Some((tab.id, entry));
+            self.emit(ShellEvent::ProjectsChanged);
+        }
+        true
+    }
+
     /// If another run is live, enqueues tab `id` unless it already holds
     /// the live run or a queue slot -- the shared tail of [`Self::start_fuse`]
     /// and [`Self::retry_fuse`]. `None` when no run is live, so the caller
@@ -5542,7 +5716,7 @@ impl AppController {
         if !self.any_job_running() {
             return None;
         }
-        if self.job.tab_id == Some(id) || self.job.queue.contains(&id) {
+        if self.holds_run_slot(id) {
             return Some(false);
         }
         self.job.queue.push_back(id);
@@ -5557,29 +5731,41 @@ impl AppController {
     /// missing, checked before anything else so an invalid tab is never
     /// queued. A completed run adds a held checkpoint to the tab and writes
     /// no project. While another run is live, a valid press enqueues
-    /// the tab instead. Returns whether a run started or was enqueued.
+    /// the tab instead. A tab whose live holds ops raises
+    /// [`Self::pending_fuse_copy`] instead and returns `false`; its answers
+    /// start the run. Returns whether a run started or was enqueued.
     pub fn start_fuse(&mut self) -> bool {
-        let Some(active) = self.state.active else {
-            return false;
-        };
-        let Some(tab) = self.state.active() else {
+        match self.state.active {
+            Some(active) => self.start_fuse_at(active, false),
+            None => false,
+        }
+    }
+
+    /// [`Self::start_fuse`] on tab `index`; `confirmed` skips the question
+    /// about unsaved ops.
+    fn start_fuse_at(&mut self, index: usize, confirmed: bool) -> bool {
+        let Some(tab) = self.state.projects.get(index) else {
             return false;
         };
         if !tab.errors.is_empty() {
             return false;
         }
+        let id = tab.id;
         let frames = tab.included_frames();
         if let Some(missing) = frames.iter().find(|path| !path.is_file()) {
             self.refuse_missing_frame(missing);
             return false;
         }
-        if let Some(enqueued) = self.try_enqueue(tab.id) {
+        if !confirmed && self.ask_before_fuse(index, FuseEntry::Fuse) {
+            return false;
+        }
+        if let Some(enqueued) = self.try_enqueue(id) {
             return enqueued;
         }
-        let Some(request) = self.fuse_request_for(active) else {
+        let Some(request) = self.fuse_request_for(index) else {
             return false;
         };
-        self.run_request(active, request)
+        self.run_request(index, request)
     }
 
     /// Pauses a running job, or resumes a paused one -- a no-op while the
@@ -5654,22 +5840,32 @@ impl AppController {
     /// no notion of retry. Enqueues behind another live run rather than
     /// refusing, same as [`Self::start_fuse`]; the stored request is reused
     /// unchanged, since a failed run's own request was valid enough to have
-    /// started once.
+    /// started once. A tab whose live holds ops raises
+    /// [`Self::pending_fuse_copy`] instead and returns `false`.
     pub fn retry_fuse(&mut self) -> bool {
-        let Some(active) = self.state.active else {
-            return false;
-        };
-        let Some(tab) = self.state.projects.get(active) else {
+        match self.state.active {
+            Some(active) => self.retry_fuse_at(active, false),
+            None => false,
+        }
+    }
+
+    /// [`Self::retry_fuse`] on tab `index`; `confirmed` skips the question
+    /// about unsaved ops.
+    fn retry_fuse_at(&mut self, index: usize, confirmed: bool) -> bool {
+        let Some(tab) = self.state.projects.get(index) else {
             return false;
         };
         let Some(request) = tab.request.clone() else {
             return false;
         };
         let id = tab.id;
+        if !confirmed && self.ask_before_fuse(index, FuseEntry::Retry) {
+            return false;
+        }
         if let Some(enqueued) = self.try_enqueue(id) {
             return enqueued;
         }
-        self.run_request(active, request)
+        self.run_request(index, request)
     }
 
     /// Starts `request` on tab `tab_index`, off the UI thread, discarding a
@@ -7273,6 +7469,16 @@ fn not_a_project_card(path: PathBuf) -> FailureCard {
         reason: "This folder holds something else. Nothing was read and nothing was changed."
             .to_string(),
         meta: "not read · not changed".to_string(),
+    }
+}
+
+/// [`checkpoints::op_summary`] with "unsaved" after the first count:
+/// "2 unsaved brush strokes".
+fn unsaved_ops<'a>(ops: impl IntoIterator<Item = &'a job::Op>) -> String {
+    let summary = checkpoints::op_summary(ops);
+    match summary.split_once(' ') {
+        Some((count, rest)) => format!("{count} unsaved {rest}"),
+        None => summary,
     }
 }
 

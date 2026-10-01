@@ -2601,3 +2601,44 @@ fn write_the_61_frame_manual_evidence_tree() {
     // composite/Z-Map ever sitting beside the source frames.
     seal_project_with_sources(&dir.join("sealed"), &sources);
 }
+
+/// Confirming a frame-set change in the window starts a re-fuse that settles
+/// through the window's own job timer.
+#[test]
+fn confirming_a_frame_change_in_the_window_settles_its_refuse() {
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    let mut controller = controller_with_frames("frame_change_refuse_window", 3);
+    controller.set_align_algorithm("dummy-align");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120)).expect("the fuse settles");
+    controller.set_mode(ShellMode::Stacking);
+    controller.remove_frame(1);
+    assert!(controller.pending_frame_change().is_some());
+
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+    assert!(app.get_frame_warning_open());
+
+    app.invoke_frame_warning_confirmed();
+    assert!(controller.lock().unwrap().any_job_running());
+    let start = Instant::now();
+    while controller.lock().unwrap().any_job_running() {
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "the window's job timer never settled the re-fuse"
+        );
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(controller.lock().unwrap().checkpoint_count(), Some(2));
+}
