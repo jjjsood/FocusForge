@@ -114,48 +114,26 @@
 //! `f32` score plane and one `u16` winner plane per level -- independent of
 //! `frame_count`.
 //!
-//! # Tiling and the composite seam
+//! # Tiling
 //!
-//! The composite seam is not boundable. A tiled
-//! run's Z-Map is *exactly* equal to an untiled run's; its composite is
-//! not, and cannot be made so by a bigger margin at fixed tile geometry.
-//! The reason is cone arithmetic, not implementation slack:
+//! A tiled run's composite and Z-Map equal an untiled run's byte for byte,
+//! at any tile size the planner accepts. Every interior pixel reads
+//! bit-identical samples in both runs, combined in the same order on the
+//! same decimation grid, because the planned margin covers the whole
+//! dependency cone of a composite pixel:
 //!
-//! - A level-`k` selection at pixel `p` depends on Laplacian coefficients
-//!   within `build`'s reach for `N` levels, `2*(2^N - 1)`, plus that
-//!   level's own score window reach, `2^k * r_k` (the window is `r_k`
-//!   level-`k` pixels wide, each covering `2^k` level-0 pixels): the cone
-//!   is `2*(2^N - 1) + 2^k * r_k`. At the shipped `N = 5` that cone is
-//!   **70 px at every level except level 4, where it is 78 px** -- `r_k`
-//!   halves as `2^k` doubles, so each level spends the same 8 px of
-//!   headroom, except level 4 where `r_4 = 1` (the `max(1, ...)` clamp
-//!   binds) while `2^4 = 16` still multiplies it. **78 px is the worst
-//!   case, so `MEASURED_MARGIN` does not need to move.** Every one of
-//!   these cones sits inside the 96 px margin
-//!   `MEASURED_MARGIN[5]` (rounded by [`crate::tile::plan::margin_for_levels`])
-//!   publishes, so every interior pixel's *selection* reads bit-identical
-//!   samples in the tiled and untiled runs, combined in the same order on
-//!   the same decimation grid -- the Z-Map is exact at every level, and
-//!   therefore at level 0, the Z-Map itself.
-//! - A composite pixel is not the selection; it is `collapse`'s output,
-//!   which adds its own `2*(2^N - 1)` px reach (62 px at `N = 5`) on top of
-//!   *every* level's selection that contributed to it -- not only level 0.
-//!   Using the true worst-case selection cone (78 px, from level 4) rather
-//!   than level 0's alone, the composite's worst-case dependency band is
-//!   `78 + 62 = 140` px, which sits outside the 96 px margin: a selection
-//!   inside that band of the tile boundary may legitimately differ between
-//!   the tiled and untiled runs, and a flipped selection swaps in a
-//!   full-magnitude Laplacian coefficient from a different frame -- a
-//!   discrete decision flip, not a leaked value.
+//! - A level-`k` selection at `p` reads coefficients within `build`'s reach,
+//!   `2*(2^N - 1)`, plus that level's score window `2^k * r_k`: 70 px at every
+//!   level but level 4 at `N = 5`, where the `max(1, ...)` clamp makes it 78.
+//! - `collapse` adds its own `2*(2^N - 1)` on top: the composite cone is
+//!   `78 + 62 = 140` px at `N = 5`, 68 at 4, 36 at 3. Coverage depends on the
+//!   global pixel position and adds nothing beyond it.
 //!
-//! `MEASURED_MARGIN` bounds *content leakage*: how far a sample's own value
-//! can drift between a tiled and untiled read. It does not and cannot bound
-//! a *discrete decision flip* -- no margin, at any size short of covering
-//! the full 140 px composite cone, makes the composite tile-invariant.
-//! Raising the margin to 160 px (covering 140, aligned to the `2^5 = 32`
-//! decimation grid) would make both halves exact, at a cost: `min_tile_size`
-//! becomes `4 * 160 + 64 = 704`, so the default 512 px tile would fall
-//! below the minimum planning tile entirely.
+//! [`Laplacian::tile_support`] reports that cone as the reach and the planner
+//! rounds it up to the `2^N` decimation grid: a 160 px margin at `N = 5`, 80
+//! at 4, 40 at 3. A selection flip at an interior edge is discrete, so no
+//! smaller margin is exact. [`score_radius`] keeps reading the pyramid-only
+//! [`crate::tile::plan::margin_for_levels`].
 //!
 //! | level `k` | cone at fixed radius 1, `62 + 2^k` | cone with `W = 8`, `62 + 2^k * r_k` |
 //! |---|---|---|
@@ -164,27 +142,6 @@
 //! | 2 | 66 | 70 |
 //! | 3 | 70 | 70 |
 //! | 4 | **78** | **78** |
-//!
-//! **The chosen rule adds nothing to the worst-case cone.** `r_k` halves as
-//! `2^k` doubles, so every level spends the same 8 px of headroom, except
-//! level 4 where the `max(1, ...)` clamp holds `r_4` at 1 while `2^4 = 16`
-//! still multiplies it -- the binding worst case is level 4's 78 px.
-//! `MEASURED_MARGIN` does not move,
-//! `min_tile_size` does not move, and the default 512 px tile still carries
-//! 5 levels.
-//!
-//! The control that proves the pyramid and residual math are sound rather
-//! than merely lucky: identical frames at the same geometry give an
-//! observed composite difference of exactly 0 (no selection can flip when
-//! every frame ties), isolating the 96..140 px divergence to selection
-//! alone. This is not a defect specific to this algorithm, but it is
-//! narrower than "any selection algorithm": the band exists because
-//! `collapse`'s 62 px reach stacks on top of the selection cone. An
-//! algorithm that selects per pixel and then **copies source samples**
-//! rather than collapsing a pyramid has a composite fully determined by
-//! its own Z-Map -- `composite[p] == frames[zmap[p]][p]` -- so where that
-//! Z-Map is exact under tiling, so is the composite. The property
-//! travels with `collapse`, not with selection.
 
 use std::sync::{Arc, LazyLock};
 
@@ -195,16 +152,19 @@ use crate::fuse::{Plane, build, collapse, max_levels};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
 use crate::registry::StackRegistration;
 use crate::tile::Tile;
-use crate::tile::plan::{DEFAULT_TILE_SIZE, MAX_LEVELS, margin_for_levels, max_levels_for_tile};
+use crate::tile::plan::{
+    DEFAULT_TILE_SIZE, MAX_LEVELS, TileSupport, margin_for_levels, max_levels_for_tile,
+};
 use crate::tile::scheduler::DEFAULT_LEVELS;
 use crate::zmap::NO_SOURCE;
 
 /// `auto_levels(ctx) = min(fuse::max_levels(ctx.width, ctx.height),
 /// tile::plan::max_levels_for_tile(DEFAULT_TILE_SIZE)).max(1)` -- the hook
-/// must never propose a depth the shipped tile geometry cannot plan. The
-/// second term is a constant (`5`, since `min_tile_size_for_levels(5) ==
-/// 448 <= 512 < min_tile_size_for_levels(6) == 832`), so resolution only
-/// moves this value below a small minimum dimension.
+/// must never propose a depth the baseline tile geometry cannot plan. The
+/// second term is a constant (`5`, since the measured minimum tile
+/// `min_tile_size_for_levels(5) == 448 <= 512 < min_tile_size_for_levels(6)
+/// == 832`), so resolution only moves this value below a small minimum
+/// dimension.
 fn auto_levels(ctx: &StackContext) -> ParamValue {
     let by_resolution = max_levels(ctx.width, ctx.height);
     let by_tile_geometry = max_levels_for_tile(DEFAULT_TILE_SIZE);
@@ -327,6 +287,19 @@ fn level_reach(levels: u32, k: u32) -> u32 {
 /// reads samples: `build`'s reach, `2*(2^N - 1)`.
 fn residual_reach(levels: u32) -> u32 {
     2 * ((1u32 << levels) - 1)
+}
+
+/// The level-0 distance a composite pixel of a `levels`-deep pyramid depends
+/// on: the widest selection cone (any level's `level_reach`, or the
+/// residual's) plus `collapse`'s own reach.
+fn composite_reach(levels: u32) -> u32 {
+    let levels = levels.min(MAX_LEVELS);
+    let selection = (0..levels)
+        .map(|k| level_reach(levels, k))
+        .max()
+        .unwrap_or(0)
+        .max(residual_reach(levels));
+    selection + residual_reach(levels)
 }
 
 /// Where one frame takes part, per pyramid level and for the residual: its
@@ -524,6 +497,20 @@ impl StackAlgorithm for Laplacian {
             },
             zmap,
         })
+    }
+
+    /// The composite's dependency cone (`composite_reach`) on the `levels`
+    /// decimation grid.
+    fn tile_support(&self, cfg: &ParamValues) -> TileSupport {
+        let levels = cfg
+            .get("levels")
+            .and_then(ParamValue::as_i64)
+            .map(|levels| levels.max(0) as u32)
+            .unwrap_or(0);
+        TileSupport {
+            reach_px: composite_reach(levels),
+            decimation_levels: levels,
+        }
     }
 }
 
@@ -754,7 +741,7 @@ mod tests {
 
     #[test]
     fn selection_reach_fits_the_measured_margin() {
-        // The load-bearing inequality the "Tiling and the composite seam"
+        // The load-bearing inequality the "Tiling"
         // rustdoc states: every level's selection cone must fit inside the
         // margin the tile planner actually guarantees, at every level
         // count -- not just the shipped `levels = 5`. A later change to
@@ -793,6 +780,27 @@ mod tests {
                 .flat_map(|_| (0..w).map(move |x| x >= border))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn tile_support_covers_the_composite_cone() {
+        for (levels, reach, margin) in [(3i64, 36, 40), (4, 68, 80), (5, 140, 160)] {
+            let support = Laplacian.tile_support(&cfg_with_levels(levels));
+            assert_eq!(support.reach_px, reach, "levels {levels}");
+            assert_eq!(support.decimation_levels, levels as u32);
+            assert_eq!(support.margin(), margin, "levels {levels}");
+        }
+        for levels in 1..=MAX_LEVELS {
+            let support = Laplacian.tile_support(&cfg_with_levels(i64::from(levels)));
+            assert!(support.margin() >= support.reach_px);
+            assert!(support.margin() >= margin_for_levels(levels));
+        }
+        assert_eq!(
+            Laplacian
+                .tile_support(&cfg_with_levels(5))
+                .default_tile_size(),
+            704
+        );
     }
 
     #[test]

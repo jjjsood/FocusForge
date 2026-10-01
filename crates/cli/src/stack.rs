@@ -1007,9 +1007,9 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // created anywhere. `TileScheduler::new` is pure: it builds a `TilePlan`
     // and divides the byte budget, touching no file.
     if preset_opts.dry_run {
-        let levels = algo.tile_levels(&params::resolved_values(&resolved));
+        let support = algo.tile_support(&params::resolved_values(&resolved));
         let mut options = TileSchedulerOptions::new(".scratch");
-        options.levels = levels;
+        options.apply_support(support);
         if let Some(tile_size) = job_opts.tile_size {
             options.tile_size = tile_size;
         }

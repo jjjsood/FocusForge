@@ -32,9 +32,9 @@
 //! # Coverage
 //!
 //! The argmax runs over eligible frames: those whose coverage mask
-//! ([`crate::algorithm::TileCtx::coverage`]), eroded by `DETAIL_REACH +
-//! score-radius + smoothing-radius` (`sharpness::eligible`),
-//! is true at `p`. A pixel with no eligible frame is
+//! ([`crate::algorithm::TileCtx::coverage`]), eroded by the full reach of its score,
+//! `DETAIL_REACH + score-radius + smoothing-radius` (`4 + 2 + 3` at the
+//! defaults; `sharpness::eligible`), is true at `p`. A pixel with no eligible frame is
 //! [`crate::zmap::NO_SOURCE`] with zero samples.
 //!
 //! # The composite *is* the Z-Map
@@ -49,17 +49,14 @@
 //! sample already sits inside the read rect the margin guarantees, with
 //! nothing added on top.
 //!
-//! # Reach and `tile_levels`
+//! # Reach and `tile_support`
 //!
 //! The measure's window reads `score-radius` px; the smoothing pass reads a
 //! further `smoothing-radius` px of the *score* plane, which itself needed
-//! `crate::fuse::sharpness::DETAIL_REACH` (`2`) to exist at all: total
-//! reach `2 + score-radius + smoothing-radius`, `14` at the shipped
-//! defaults. [`DepthMap::tile_levels`] overrides the trait's default with
-//! `crate::fuse::sharpness::levels_for_margin` of that reach -- `3` at the
-//! defaults, from a pyramid this algorithm only ever builds to **one**
-//! level. The `levels=3` `focusforge-cli stack --algo depth-map` reports is
-//! therefore a reach-derived override, not a pyramid depth.
+//! `crate::fuse::sharpness::DETAIL_REACH` (`4`) to exist at all: total
+//! reach `4 + score-radius + smoothing-radius`, `16` at the shipped
+//! defaults. [`DepthMap::tile_support`] reports that reach on a one-level
+//! (2 px) decimation grid, the only pyramid depth this algorithm builds.
 
 use std::sync::LazyLock;
 
@@ -67,12 +64,11 @@ use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
 use crate::fuse::error::{algorithm_error, missing_key};
 use crate::fuse::laplacian::score_plane;
 use crate::fuse::pyramid::Plane;
-use crate::fuse::sharpness::{
-    DETAIL_REACH, detail_plane, eligible as sharpness_eligible, levels_for_margin,
-};
+use crate::fuse::sharpness::{DETAIL_REACH, detail_plane, eligible as sharpness_eligible};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues};
 use crate::registry::StackRegistration;
 use crate::tile::Tile;
+use crate::tile::plan::TileSupport;
 use crate::zmap::NO_SOURCE;
 
 const SCORE_RADIUS_DEFAULT: i64 = 4;
@@ -226,14 +222,13 @@ impl StackAlgorithm for DepthMap {
         })
     }
 
-    /// This algorithm's reach is expressible as a level count, but not as
-    /// its own level count -- it builds a one-level pyramid per frame yet
-    /// must report enough levels for `margin_for_levels` to cover
-    /// `2 + score-radius + smoothing-radius`.
-    fn tile_levels(&self, cfg: &ParamValues) -> u32 {
-        let score_radius = Self::score_radius(cfg);
-        let smoothing_radius = Self::smoothing_radius(cfg);
-        levels_for_margin(DETAIL_REACH + score_radius + smoothing_radius)
+    /// `4 + score-radius + smoothing-radius` on the one-level decimation
+    /// grid of its detail plane.
+    fn tile_support(&self, cfg: &ParamValues) -> TileSupport {
+        TileSupport {
+            reach_px: DETAIL_REACH + Self::score_radius(cfg) + Self::smoothing_radius(cfg),
+            decimation_levels: 1,
+        }
     }
 }
 
@@ -242,9 +237,7 @@ inventory::submit! { StackRegistration::new(&DepthMap) }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tile::plan::{
-        DEFAULT_TILE_SIZE, TilePlan, margin_for_levels, min_tile_size_for_levels,
-    };
+    use crate::tile::plan::{DEFAULT_TILE_SIZE, TilePlan, margin_for_levels};
     use crate::tile::{Rect, TileError};
 
     fn rect(width: u32, height: u32) -> Rect {
@@ -285,7 +278,7 @@ mod tests {
             .flat_map(|_| (0..w).map(|x| x >= uncovered_columns))
             .collect();
         let out = fuse_masked(&[flat, checker.clone()], &[None, Some(mask)], w, h);
-        let reach = DETAIL_REACH + 2 + 3;
+        let reach = 4 + 2 + 3;
         let first_eligible = uncovered_columns + reach;
         for y in 4..12 {
             for x in 0..w {
@@ -515,34 +508,33 @@ mod tests {
         let max_smoothing_radius = declared_int_max("smoothing-radius");
         for score_radius in 0..=max_score_radius {
             for smoothing_radius in 0..=max_smoothing_radius {
-                let cfg = cfg(score_radius, smoothing_radius);
-                let levels = algo.tile_levels(&cfg);
+                let support = algo.tile_support(&cfg(score_radius, smoothing_radius));
                 let reach = DETAIL_REACH + score_radius as u32 + smoothing_radius as u32;
-                assert!(
-                    margin_for_levels(levels) >= reach,
+                assert_eq!(support.reach_px, reach);
+                assert_eq!(
+                    support.margin(),
+                    reach.next_multiple_of(2).max(margin_for_levels(1)),
                     "score_radius={score_radius} smoothing_radius={smoothing_radius}: \
-                     margin_for_levels({levels}) = {} < reach {reach}",
-                    margin_for_levels(levels)
+                     the margin is the reach on the 2 px grid"
                 );
                 assert!(
-                    min_tile_size_for_levels(levels) <= DEFAULT_TILE_SIZE,
+                    support.min_tile_size() <= DEFAULT_TILE_SIZE,
                     "score_radius={score_radius} smoothing_radius={smoothing_radius}: \
-                     min_tile_size_for_levels({levels}) = {} > {DEFAULT_TILE_SIZE}",
-                    min_tile_size_for_levels(levels)
+                     min_tile_size {} > {DEFAULT_TILE_SIZE}",
+                    support.min_tile_size()
                 );
             }
         }
-        let cfg = cfg(max_score_radius, max_smoothing_radius);
-        let levels = algo.tile_levels(&cfg);
-        let minimum = min_tile_size_for_levels(levels);
+        let support = algo.tile_support(&cfg(max_score_radius, max_smoothing_radius));
+        let minimum = support.min_tile_size();
         assert!(
-            TilePlan::new(minimum, minimum, minimum, levels).is_ok(),
+            TilePlan::new(minimum, minimum, minimum, support).is_ok(),
             "score-radius={max_score_radius} smoothing-radius={max_smoothing_radius}: \
              the reported minimum tile {minimum} must plan"
         );
         assert!(
             matches!(
-                TilePlan::new(minimum, minimum, minimum - 1, levels),
+                TilePlan::new(minimum, minimum, minimum - 1, support),
                 Err(TileError::NoInterior { min_tile_size, .. }) if min_tile_size == minimum
             ),
             "score-radius={max_score_radius} smoothing-radius={max_smoothing_radius}: \
@@ -551,13 +543,16 @@ mod tests {
     }
 
     #[test]
-    fn tile_levels_falls_back_to_the_default_radii_when_absent() {
+    fn tile_support_falls_back_to_the_default_radii_when_absent() {
         let algo = DepthMap;
         assert_eq!(
-            algo.tile_levels(&ParamValues::new()),
-            levels_for_margin(
-                DETAIL_REACH + SCORE_RADIUS_DEFAULT as u32 + SMOOTHING_RADIUS_DEFAULT as u32
-            )
+            algo.tile_support(&ParamValues::new()),
+            TileSupport {
+                reach_px: DETAIL_REACH
+                    + SCORE_RADIUS_DEFAULT as u32
+                    + SMOOTHING_RADIUS_DEFAULT as u32,
+                decimation_levels: 1,
+            }
         );
     }
 }

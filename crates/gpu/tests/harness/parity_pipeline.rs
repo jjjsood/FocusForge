@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Whole-pipeline parity over `fixtures/mantis-512` (8 frames, 512x512, 4
-//! tiles at `tile_size = 512, levels = 5`): CPU (`FusionConsumer` +
-//! `WarpingReader`) against GPU (`BackendFusionConsumer`), with non-identity
-//! transforms so the warp stage is compared. A differing pixel is exempt only
+//! Whole-pipeline parity over `fixtures/mantis-512` (8 frames, 512x512, 2x2
+//! tiles at `tile_size = 512, levels = 5`, 160 px margin): CPU
+//! (`FusionConsumer` + `WarpingReader`) against GPU (`BackendFusionConsumer`),
+//! with non-identity transforms so the warp stage is compared. A differing pixel is exempt only
 //! when proven: a ±1 LSB-reachable near-tie at some pyramid level, or the
 //! warp's ±1 LSB tolerance propagated through `collapse` (one or two sources).
 
@@ -29,6 +29,22 @@ use crate::common::open_stack;
 const NEAR_TIE_REL: f32 = 128.0 * f32::EPSILON;
 
 const LEVELS: u32 = 5;
+
+fn laplacian_cfg() -> ParamValues {
+    let mut cfg = ParamValues::new();
+    cfg.insert("levels".to_string(), ParamValue::Int(LEVELS as i64));
+    cfg
+}
+
+/// Scheduler options planning the Laplacian's own support (reach and depth)
+/// at the default tile size.
+pub(crate) fn laplacian_options(scratch: PathBuf) -> TileSchedulerOptions {
+    let support = Laplacian.tile_support(&laplacian_cfg());
+    let mut options = TileSchedulerOptions::new(scratch);
+    options.levels = support.decimation_levels;
+    options.reach_px = support.reach_px;
+    options
+}
 
 /// Canvas `(width, height, spp)` as one `Copy` value.
 #[derive(Clone, Copy)]
@@ -121,16 +137,14 @@ fn run_cpu(label: &str, transforms: Vec<Transform>) -> RunOutputs {
     let stack_ctx = StackContext::new(frame_count, width, height, spp);
 
     let reader = WarpingReader::new(&stack, (width, height), spp, transforms);
-    let mut options = TileSchedulerOptions::new(scratch_base(&format!("{label}_cpu")));
-    options.levels = LEVELS;
+    let options = laplacian_options(scratch_base(&format!("{label}_cpu")));
     let scheduler =
         TileScheduler::new(&reader, stack_ctx, spp, &options).expect("scheduler must build");
 
     let composite_path = tmp_path(&format!("parity_pipeline_{label}_cpu_composite.tif"));
     let zmap_path = tmp_path(&format!("parity_pipeline_{label}_cpu_zmap.tif"));
 
-    let mut cfg = ParamValues::new();
-    cfg.insert("levels".to_string(), ParamValue::Int(LEVELS as i64));
+    let cfg = laplacian_cfg();
     let consumer = FusionConsumer::create(
         &Laplacian,
         cfg,
@@ -176,16 +190,14 @@ fn run_gpu(
     let frame_count = stack.len();
     let stack_ctx = StackContext::new(frame_count, width, height, spp);
 
-    let mut options = TileSchedulerOptions::new(scratch_base(&format!("{label}_gpu")));
-    options.levels = LEVELS;
+    let options = laplacian_options(scratch_base(&format!("{label}_gpu")));
     let scheduler =
         TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
 
     let composite_path = tmp_path(&format!("parity_pipeline_{label}_gpu_composite.tif"));
     let zmap_path = tmp_path(&format!("parity_pipeline_{label}_gpu_zmap.tif"));
 
-    let mut cfg = ParamValues::new();
-    cfg.insert("levels".to_string(), ParamValue::Int(LEVELS as i64));
+    let cfg = laplacian_cfg();
     let sink = FusionConsumer::create(
         &Laplacian,
         cfg,
@@ -811,8 +823,7 @@ fn rebuild_composite_pixel_with_perturbations(
         })
         .collect();
     let ctx = TileCtx::new(rect, &tiles);
-    let mut cfg = ParamValues::new();
-    cfg.insert("levels".to_string(), ParamValue::Int(LEVELS as i64));
+    let cfg = laplacian_cfg();
     let output = Laplacian
         .fuse(&ctx, &cfg)
         .expect("cpu fuse must succeed for the warp-noise-propagation probe");

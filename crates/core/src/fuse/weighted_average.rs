@@ -72,8 +72,8 @@
 //! `den(p) == 0.0` can only mean every term was `0.0`, checked exactly.
 //!
 //! A frame is eligible at `p` when its coverage mask
-//! ([`crate::algorithm::TileCtx::coverage`]), eroded by `DETAIL_REACH +
-//! radius` (`sharpness::eligible`), is true there. An
+//! ([`crate::algorithm::TileCtx::coverage`]), eroded by the full reach of its
+//! weight, `DETAIL_REACH + radius` (`sharpness::eligible`), is true there. An
 //! ineligible frame adds nothing; a pixel with no eligible frame is
 //! [`crate::zmap::NO_SOURCE`] with zero samples.
 //!
@@ -89,26 +89,24 @@
 //! one place in the project where that gap is real rather than
 //! theoretical.
 //!
-//! # Reach and `tile_levels`
+//! # Reach and `tile_support`
 //!
 //! A windowed weight of radius `r` reads `r` px of its own neighbourhood
-//! plus `crate::fuse::sharpness::DETAIL_REACH` (`2`) for the one-level
-//! build-plus-expand underneath it: `2 + r`. [`WeightedAverage::tile_levels`]
-//! overrides the trait's default (which would answer `0`, since this
-//! schema declares no key named `"levels"`) with
-//! `crate::fuse::sharpness::levels_for_margin(2 + radius)` -- `2` at the
-//! default `radius = 8`.
+//! plus `crate::fuse::sharpness::DETAIL_REACH` (`4`) for the one-level
+//! reduce-and-expand underneath it: `4 + r`. [`WeightedAverage::tile_support`]
+//! reports that reach on a one-level (2 px) decimation grid, overriding the
+//! trait's default (no reach, since this schema declares no key named
+//! `"levels"`): the planned margin is `4 + radius` rounded up to the grid.
 //!
 //! # Tiling
 //!
 //! Neither a pyramid nor `collapse` survives past the per-pixel blend --
 //! every output sample is a weighted combination of samples the read rect
-//! already holds, all within `2 + radius` px of `p`. Where that reach sits
-//! inside the scheduler's margin (always, given the override above), the
-//! composite **and** the Z-Map are bit-exact between a tiled and an
-//! untiled run -- unlike `laplacian`'s composite, which additionally passes
-//! through `collapse` and is therefore not (see
-//! `crate::fuse::laplacian`'s "Tiling and the composite seam" section).
+//! already holds, all within `4 + radius` px of `p`. That reach sits inside
+//! the planned margin, so the composite **and** the Z-Map are bit-exact
+//! between a tiled and an untiled run; `laplacian` reaches the same
+//! guarantee with a margin that also covers `collapse` (see
+//! `crate::fuse::laplacian`'s "Tiling" section).
 
 use std::sync::LazyLock;
 
@@ -116,12 +114,11 @@ use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
 use crate::fuse::error::{algorithm_error, missing_key};
 use crate::fuse::laplacian::score_plane;
 use crate::fuse::pyramid::Plane;
-use crate::fuse::sharpness::{
-    DETAIL_REACH, detail_plane, eligible as sharpness_eligible, levels_for_margin,
-};
+use crate::fuse::sharpness::{DETAIL_REACH, detail_plane, eligible as sharpness_eligible};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues};
 use crate::registry::StackRegistration;
 use crate::tile::Tile;
+use crate::tile::plan::TileSupport;
 use crate::zmap::NO_SOURCE;
 
 const RADIUS_DEFAULT: i64 = 8;
@@ -178,7 +175,7 @@ pub struct WeightedAverage;
 
 impl WeightedAverage {
     /// `radius`, read out of `cfg` with the descriptor's own default as the
-    /// fallback -- `tile_levels` has no `Result`, so it cannot report a
+    /// fallback -- `tile_support` has no `Result`, so it cannot report a
     /// missing key the way `fuse` does.
     fn radius(cfg: &ParamValues) -> u32 {
         cfg.get("radius")
@@ -314,13 +311,13 @@ impl StackAlgorithm for WeightedAverage {
         })
     }
 
-    /// This algorithm builds no pyramid at all, but its windowed weight
-    /// still has a nonzero reach (`crate::fuse::sharpness::DETAIL_REACH +
-    /// radius`), so it cannot inherit the trait's default (which would
-    /// answer `0`, since this schema declares no `"levels"` key).
-    fn tile_levels(&self, cfg: &ParamValues) -> u32 {
-        let radius = Self::radius(cfg);
-        levels_for_margin(DETAIL_REACH + radius)
+    /// The windowed weight's reach (`crate::fuse::sharpness::DETAIL_REACH +
+    /// radius`) on the one-level decimation grid of its detail plane.
+    fn tile_support(&self, cfg: &ParamValues) -> TileSupport {
+        TileSupport {
+            reach_px: DETAIL_REACH + Self::radius(cfg),
+            decimation_levels: 1,
+        }
     }
 }
 
@@ -329,9 +326,7 @@ inventory::submit! { StackRegistration::new(&WeightedAverage) }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tile::plan::{
-        DEFAULT_TILE_SIZE, TilePlan, margin_for_levels, min_tile_size_for_levels,
-    };
+    use crate::tile::plan::{DEFAULT_TILE_SIZE, TilePlan, margin_for_levels};
     use crate::tile::{Rect, TileError};
 
     fn rect(width: u32, height: u32) -> Rect {
@@ -401,6 +396,26 @@ mod tests {
             let out = fuse_masked(&tiles, &masks, w, h);
             assert!(out.zmap.iter().all(|&z| z == 1), "spp {spp}");
             assert!(out.tile.samples.iter().all(|&s| s == 300), "spp {spp}");
+        }
+    }
+
+    #[test]
+    fn a_masked_frame_is_eligible_only_beyond_its_detail_reach_and_radius() {
+        let (w, h) = (48u32, 16u32);
+        let flat = masked_tile(w, h, 1, |_, _, _| 1_000);
+        let checker = masked_tile(w, h, 1, |x, y, _| if (x + y) % 2 == 0 { 0 } else { 60_000 });
+        let uncovered_columns = 8u32;
+        let mask: Vec<bool> = (0..h)
+            .flat_map(|_| (0..w).map(|x| x >= uncovered_columns))
+            .collect();
+        let out = fuse_masked(&[flat, checker], &[None, Some(mask)], w, h);
+        // The detail plane reads 4 px (reduce plus expand), the weight window 2 (radius).
+        let first_eligible = uncovered_columns + 4 + 2;
+        for y in 4..12 {
+            for x in 0..w {
+                let expected = if x < first_eligible { 0 } else { 1 };
+                assert_eq!(out.zmap[(y * w + x) as usize], expected, "({x}, {y})");
+            }
         }
     }
 
@@ -737,30 +752,29 @@ mod tests {
         let algo = WeightedAverage;
         let max_radius = declared_int_max("radius");
         for radius in 0..=max_radius {
-            let cfg = cfg(radius, 2.0);
-            let levels = algo.tile_levels(&cfg);
+            let support = algo.tile_support(&cfg(radius, 2.0));
             let reach = DETAIL_REACH + radius as u32;
-            assert!(
-                margin_for_levels(levels) >= reach,
-                "radius={radius}: margin_for_levels({levels}) = {} < reach {reach}",
-                margin_for_levels(levels)
+            assert_eq!(support.reach_px, reach);
+            assert_eq!(
+                support.margin(),
+                reach.next_multiple_of(2).max(margin_for_levels(1)),
+                "radius={radius}: the margin is the reach on the 2 px grid"
             );
             assert!(
-                min_tile_size_for_levels(levels) <= DEFAULT_TILE_SIZE,
-                "radius={radius}: min_tile_size_for_levels({levels}) = {} > {DEFAULT_TILE_SIZE}",
-                min_tile_size_for_levels(levels)
+                support.min_tile_size() <= DEFAULT_TILE_SIZE,
+                "radius={radius}: min_tile_size {} > {DEFAULT_TILE_SIZE}",
+                support.min_tile_size()
             );
         }
-        let cfg = cfg(max_radius, WEIGHT_EXPONENT_DEFAULT);
-        let levels = algo.tile_levels(&cfg);
-        let minimum = min_tile_size_for_levels(levels);
+        let support = algo.tile_support(&cfg(max_radius, WEIGHT_EXPONENT_DEFAULT));
+        let minimum = support.min_tile_size();
         assert!(
-            TilePlan::new(minimum, minimum, minimum, levels).is_ok(),
+            TilePlan::new(minimum, minimum, minimum, support).is_ok(),
             "radius={max_radius}: the reported minimum tile {minimum} must plan"
         );
         assert!(
             matches!(
-                TilePlan::new(minimum, minimum, minimum - 1, levels),
+                TilePlan::new(minimum, minimum, minimum - 1, support),
                 Err(TileError::NoInterior { min_tile_size, .. }) if min_tile_size == minimum
             ),
             "radius={max_radius}: one pixel below the reported minimum {minimum} must be refused"
@@ -768,11 +782,14 @@ mod tests {
     }
 
     #[test]
-    fn tile_levels_falls_back_to_the_default_radius_when_absent() {
+    fn tile_support_falls_back_to_the_default_radius_when_absent() {
         let algo = WeightedAverage;
         assert_eq!(
-            algo.tile_levels(&ParamValues::new()),
-            levels_for_margin(DETAIL_REACH + RADIUS_DEFAULT as u32)
+            algo.tile_support(&ParamValues::new()),
+            TileSupport {
+                reach_px: DETAIL_REACH + RADIUS_DEFAULT as u32,
+                decimation_levels: 1,
+            }
         );
     }
 }

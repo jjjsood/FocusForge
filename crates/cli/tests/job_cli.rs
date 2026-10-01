@@ -220,12 +220,12 @@ fn stack_output_is_unchanged_under_the_job_engine() {
     let algo = registry::find_stack("laplacian").unwrap();
     let resolved = params::resolve(algo.params(), &ParamValues::new(), &stack_ctx).unwrap();
     let values = params::resolved_values(&resolved);
-    let levels = algo.tile_levels(&values);
+    let support = algo.tile_support(&values);
     let oracle_path = dir.join("oracle.tif");
     let options = {
         let mut o = TileSchedulerOptions::explicit_budget(dir.join("oracle-scratch"), 1 << 30);
+        o.apply_support(support);
         o.tile_size = 512;
-        o.levels = levels;
         o
     };
     let scheduler = TileScheduler::new(&stack, stack_ctx, spp, &options).unwrap();

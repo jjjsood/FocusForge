@@ -278,7 +278,7 @@ pub fn run(
     let resolved = params::resolve(request.algorithm.params(), &request.explicit, &stack_ctx)
         .map_err(|err| PipelineError::Params(err.to_string()))?;
     let values = params::resolved_values(&resolved);
-    let levels = request.algorithm.tile_levels(&values);
+    let support = request.algorithm.tile_support(&values);
 
     let fingerprint = StackFingerprint {
         frames: (0..frame_reader.len())
@@ -286,7 +286,7 @@ pub fn run(
             .collect(),
     };
 
-    options.levels = levels;
+    options.apply_support(support);
     if let Some(tile_size) = request.tile_size {
         options.tile_size = tile_size;
     }
@@ -645,7 +645,7 @@ pub fn run(
             (width, height),
             transforms,
             spp,
-            levels,
+            support.decimation_levels,
             &sink,
         )
     });

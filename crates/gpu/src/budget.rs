@@ -817,15 +817,15 @@ mod tests {
     /// Pins the `--max-vram` ceiling `crates/cli/tests/cli_gpu.rs`'s
     /// `device_peak_in_flight_is_scoped_to_its_own_group` uses (`64MiB`),
     /// against the *ragged* read rects a 512x512 frame plans into at
-    /// `--tile-size 256 --set levels=4` (208/256/240 px per axis via
-    /// `axis_partition`, `margin_for_levels(4) == 48`): every combination of
+    /// `--tile-size 256 --set levels=4` (176/256/208 px per axis via
+    /// `axis_partition`, an 80 px margin at 4 levels): every combination of
     /// those three sizes on each axis is one tile's read rect in that plan's
-    /// 3x3 grid. `spp = 3`, `levels = 4`, `warped = false` (the CLI test runs
+    /// 5x5 grid. `spp = 3`, `levels = 4`, `warped = false` (the CLI test runs
     /// `--no-align`, so the warp flag is false).
     #[test]
     fn max_vram_ceiling_floors_the_heavy_group_at_one_tile_for_every_ragged_rect() {
         const CEILING: u64 = 64 << 20; // the literal `--max-vram` value the CLI test passes
-        const RECT_SIZES: [u32; 3] = [208, 256, 240];
+        const RECT_SIZES: [u32; 3] = [176, 256, 208];
         const SPP: u32 = 3;
         const LEVELS: u32 = 4;
         const CAP: usize = 32;

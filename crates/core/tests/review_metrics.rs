@@ -63,13 +63,11 @@ fn sharpness_ratio_matches_the_golden_composite() {
          max_input={max_input_lapvar:.1} ratio={ratio:.4}"
     );
     // Measured directly against the committed golden file (`golden_pin_matches_byte_for_byte`
-    // in `laplacian_fusion.rs` proves it is byte-identical to a fresh unaligned 448/5 run):
-    // composite 347109.0, sharpest input 285247.1, ratio 1.2169. Pinned exactly as measured on
-    // this fixture's golden (448/5) geometry; the CLI's default 512-tile geometry produces a
-    // different figure (412356.5 / 1.4456) and is not what this test exercises.
+    // in `laplacian_fusion.rs` proves it is byte-identical to a fresh unaligned 448/5 run, which
+    // equals the single-tile run): composite 347107.5, sharpest input 285247.1, ratio 1.2169.
     assert!(
-        (composite_lapvar - 347_109.0).abs() < 1.0,
-        "composite lapvar must reproduce 347109.0: got {composite_lapvar:.1}"
+        (composite_lapvar - 347_107.5).abs() < 1.0,
+        "composite lapvar must reproduce 347107.5: got {composite_lapvar:.1}"
     );
     assert!(
         (max_input_lapvar - 285_247.1).abs() < 1.0,

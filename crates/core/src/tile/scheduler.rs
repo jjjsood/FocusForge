@@ -34,7 +34,7 @@
 //! keep them busy.
 //!
 //! ```text
-//! bytes_per_tile_set = frames * tile_size^2 * samples_per_pixel * 2 B
+//! bytes_per_tile_set = frames * min(tile_size, extent)^2 * samples_per_pixel * 2 B
 //! in_flight_limit = clamp(budget_bytes / bytes_per_tile_set, 1, pool_threads)
 //! pool_threads = available_parallelism()  -- independent of budget_bytes
 //! ```
@@ -77,7 +77,7 @@ use crate::params::{Provenance, StackContext};
 use crate::tile::budget::{HostBudget, HostBudgetGate, HostSources};
 use crate::tile::consumer::{TileConsumer, TileJob};
 use crate::tile::control::{NoControl, TileControl};
-use crate::tile::plan::{DEFAULT_TILE_SIZE, PlannedTile, TilePlan};
+use crate::tile::plan::{DEFAULT_TILE_SIZE, PlannedTile, TilePlan, TileSupport};
 use crate::tile::preprocess::FramePreprocess;
 use crate::tile::scratch::ScratchDir;
 use crate::tile::{Tile, TileError};
@@ -127,6 +127,8 @@ pub const DEFAULT_MAX_BYTES_IN_FLIGHT: usize = 1 << 30;
 pub struct TileSchedulerOptions {
     pub tile_size: u32,
     pub levels: u32,
+    /// The method's reach beyond the pyramid margin (`TileSupport::reach_px`).
+    pub reach_px: u32,
     pub budget: HostBudget,
     pub host: HostSources,
     pub scratch_base: PathBuf,
@@ -137,6 +139,7 @@ impl std::fmt::Debug for TileSchedulerOptions {
         f.debug_struct("TileSchedulerOptions")
             .field("tile_size", &self.tile_size)
             .field("levels", &self.levels)
+            .field("reach_px", &self.reach_px)
             .field("budget", &self.budget)
             .field("host", &"...")
             .field("scratch_base", &self.scratch_base)
@@ -153,6 +156,7 @@ impl TileSchedulerOptions {
         TileSchedulerOptions {
             tile_size: DEFAULT_TILE_SIZE,
             levels: DEFAULT_LEVELS,
+            reach_px: 0,
             budget: HostBudget::host_derived(&crate::host::snapshot()),
             host: HostSources::default(),
             scratch_base: scratch_base.into(),
@@ -166,6 +170,7 @@ impl TileSchedulerOptions {
         TileSchedulerOptions {
             tile_size: DEFAULT_TILE_SIZE,
             levels: DEFAULT_LEVELS,
+            reach_px: 0,
             budget: HostBudget::explicit(max_bytes_in_flight),
             host: HostSources::default(),
             scratch_base: scratch_base.into(),
@@ -179,9 +184,26 @@ impl TileSchedulerOptions {
         TileSchedulerOptions {
             tile_size: DEFAULT_TILE_SIZE,
             levels: DEFAULT_LEVELS,
+            reach_px: 0,
             budget: HostBudget::host_derived(facts),
             host: HostSources::default(),
             scratch_base: scratch_base.into(),
+        }
+    }
+
+    /// Plans for a method's `support`: its reach and depth, and its default
+    /// tile size in place of [`DEFAULT_TILE_SIZE`]. A caller that states a
+    /// tile size sets `tile_size` afterwards.
+    pub fn apply_support(&mut self, support: TileSupport) {
+        self.levels = support.decimation_levels;
+        self.reach_px = support.reach_px;
+        self.tile_size = support.default_tile_size();
+    }
+
+    fn support(&self) -> TileSupport {
+        TileSupport {
+            reach_px: self.reach_px,
+            decimation_levels: self.levels,
         }
     }
 }
@@ -243,22 +265,24 @@ enum RunStop {
     Failed,
 }
 
-/// `bytes_per_tile_set` for `frame_count` frames of `tile_size x tile_size`
-/// read rects at `samples_per_pixel` samples, `u16` (2 bytes) each.
+/// `bytes_per_tile_set` for `frame_count` frames of `width x height` read
+/// rects at `samples_per_pixel` samples, `u16` (2 bytes) each.
 ///
-/// `tile_size` is the **outer** size, and that is the whole subtlety here.
+/// The caller passes the **outer** tile size clamped to the frame, and that
+/// is the whole subtlety here.
 /// [`TilePlan::new`] derives `raw_interior = tile_size - 2 * margin`, then
 /// gives each tile a read rect of `interior + margin` on every side -- so
 /// the read rect reconstitutes `tile_size` and never exceeds it. A margin
 /// term added here would be counting the same margin twice.
 ///
-/// Measured over the reference partition (8192x5464, tile 512, 5 levels:
-/// 442 tiles, interior stride 320) the largest read rect is exactly
-/// 512x512. Ragged strides absorbed into a previous stride are always
-/// terminal, so they are clamped at the frame edge and come out smaller,
-/// not larger.
-fn bytes_per_tile_set(frame_count: usize, tile_size: u32, samples_per_pixel: u32) -> u64 {
-    frame_count as u64 * tile_size as u64 * tile_size as u64 * samples_per_pixel as u64 * 2
+/// A trailing remainder smaller than the margin is absorbed into the
+/// previous stride, and that stride is terminal: the frame edge clamps its
+/// far side, so its read rect stays within `tile_size` too
+/// (`tile::plan::tests::read_rects_never_exceed_the_tile_size`). Measured
+/// over the reference partition (8192x5464, tile 512, 5 levels) the largest
+/// read rect is exactly 512x512.
+fn bytes_per_tile_set(frame_count: usize, width: u32, height: u32, samples_per_pixel: u32) -> u64 {
+    frame_count as u64 * width as u64 * height as u64 * samples_per_pixel as u64 * 2
 }
 
 /// The pure arithmetic behind the budget: how many tile sets can be live at
@@ -311,12 +335,24 @@ impl<'a> TileScheduler<'a> {
         samples_per_pixel: u32,
         options: &TileSchedulerOptions,
     ) -> Result<Self, TileError> {
-        let plan = TilePlan::new(stack.width, stack.height, options.tile_size, options.levels)?;
+        let plan = TilePlan::new(
+            stack.width,
+            stack.height,
+            options.tile_size,
+            options.support(),
+        )?;
         let pool_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let bytes = bytes_per_tile_set(stack.frame_count, options.tile_size, samples_per_pixel)
-            + reader.read_scratch_bytes(options.tile_size, options.tile_size);
+        // A read rect never exceeds the frame, whatever the tile size.
+        let read_width = options.tile_size.min(stack.width);
+        let read_height = options.tile_size.min(stack.height);
+        let bytes = bytes_per_tile_set(
+            stack.frame_count,
+            read_width,
+            read_height,
+            samples_per_pixel,
+        ) + reader.read_scratch_bytes(read_width, read_height);
 
         if options.budget.refuses_below_one_tile_set()
             && bytes > 0
@@ -699,7 +735,7 @@ mod tests {
     #[test]
     fn budget_arithmetic_at_the_reference_scale() {
         // 61 frames, 512x512 read rects, 3 samples/pixel, u16.
-        let bytes = bytes_per_tile_set(61, 512, 3);
+        let bytes = bytes_per_tile_set(61, 512, 512, 3);
         assert_eq!(bytes, 95_944_704);
         // A 1 GiB budget divided by ~91.5 MiB per tile set floors to 11,
         // and 11 live tile sets are 0.98 GiB -- just under the budget,
@@ -710,7 +746,7 @@ mod tests {
 
     #[test]
     fn budget_below_one_tile_set_floors_at_one_never_zero() {
-        let bytes = bytes_per_tile_set(61, 512, 3);
+        let bytes = bytes_per_tile_set(61, 512, 512, 3);
         let in_flight = in_flight_for_budget(bytes, 1, 32);
         assert_eq!(in_flight, 1);
     }
@@ -719,7 +755,7 @@ mod tests {
     fn in_flight_never_exceeds_available_parallelism() {
         // A tiny tile set (so the budget alone would allow hundreds live)
         // must still be capped by the host's reported parallelism.
-        let bytes = bytes_per_tile_set(1, 4, 1);
+        let bytes = bytes_per_tile_set(1, 4, 4, 1);
         let in_flight = in_flight_for_budget(bytes, u64::MAX, 4);
         assert_eq!(in_flight, 4);
     }

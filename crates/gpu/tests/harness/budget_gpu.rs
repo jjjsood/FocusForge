@@ -18,9 +18,7 @@ use focusforge_core::align::Transform;
 use focusforge_core::gpu::TileBackend;
 use focusforge_core::io::TiffStack;
 use focusforge_core::params::StackContext;
-use focusforge_core::tile::{
-    NoopPreprocess, Rect, TileConsumer, TileJob, TileScheduler, TileSchedulerOptions,
-};
+use focusforge_core::tile::{NoopPreprocess, Rect, TileConsumer, TileJob, TileScheduler};
 use focusforge_gpu::budget::device_bytes_per_tile;
 use focusforge_gpu::harness::{GpuBackend, gpu_backend};
 
@@ -80,8 +78,8 @@ fn scratch_base(label: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("budget_gpu_scratch_{label}"))
 }
 
-/// Runs the whole `fixtures/mantis-512` plan (4 tiles at `tile_size = 512,
-/// levels = 5` -- the same geometry `parity_pipeline.rs`'s `run_gpu`
+/// Runs the whole `fixtures/mantis-512` plan (2x2 tiles at `tile_size = 512,
+/// levels = 5`, 160 px margin -- the same geometry `parity_pipeline.rs`'s `run_gpu`
 /// establishes) through `backend`, returning every tile's composite samples
 /// and Z-Map keyed by its read rect.
 fn run_plan(backend: &dyn TileBackend, label: &str) -> BTreeMap<TileKey, TileOutputSamples> {
@@ -91,8 +89,7 @@ fn run_plan(backend: &dyn TileBackend, label: &str) -> BTreeMap<TileKey, TileOut
     let frame_count = stack.len();
     let stack_ctx = StackContext::new(frame_count, width, height, spp);
 
-    let mut options = TileSchedulerOptions::new(scratch_base(label));
-    options.levels = LEVELS;
+    let options = crate::parity_pipeline::laplacian_options(scratch_base(label));
     let scheduler =
         TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
 

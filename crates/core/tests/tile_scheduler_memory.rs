@@ -358,6 +358,27 @@ fn pool_decouples_from_the_in_flight_limit_at_scale() {
     );
 }
 
+/// A tile size beyond the frame never reads more than the frame, so a tile
+/// set is accounted at the frame's extent, not at `tile_size^2`.
+#[test]
+fn a_tile_larger_than_the_frame_is_accounted_at_the_frame_extent() {
+    let scratch_base =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_small_frame");
+    let mut options = TileSchedulerOptions::explicit_budget(scratch_base, 1 << 30);
+    options.tile_size = 2000;
+    options.levels = 0;
+
+    let reader = ZeroReader;
+    let frame_count = 8usize;
+    let stack_ctx = StackContext::new(frame_count, 100, 60, 3);
+    let scheduler =
+        TileScheduler::new(&reader, stack_ctx, 3, &options).expect("scheduler must build");
+    assert_eq!(
+        scheduler.bytes_per_tile_set(),
+        frame_count as u64 * 100 * 60 * 3 * 2
+    );
+}
+
 /// A host-derived, uncapped budget below one tile set is refused by name --
 /// never floored, never a hang.
 #[test]

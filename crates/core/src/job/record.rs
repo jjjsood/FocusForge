@@ -29,7 +29,12 @@ use crate::tile::Rect;
 /// already "no resumable state, start over"
 /// (`super::ledger::ResumeStore::find`), so the bump is safe by
 /// construction.
-pub const JOB_RECORD_FORMAT: u32 = 2;
+///
+/// `2 -> 3`: the Laplacian read margin grew to cover the composite's whole
+/// dependency cone. The record names `tile_size` and `levels`, and the
+/// margin is derived from them, so a format-2 record's finished tiles were
+/// fused at a narrower overlap than the plan this build derives.
+pub const JOB_RECORD_FORMAT: u32 = 3;
 
 /// Everything a resume must agree with before it is allowed to continue: the
 /// stack's identity, the geometry that gives a `PlannedTile::index()` its

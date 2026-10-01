@@ -123,15 +123,15 @@ fn library_composite() -> &'static LibraryComposite {
         let resolved = params::resolve(algo.params(), &ParamValues::new(), &stack_ctx)
             .expect("resolve must succeed");
         let values = params::resolved_values(&resolved);
-        let levels = algo.tile_levels(&values);
+        let support = algo.tile_support(&values);
 
         let dir = common::tmp_dir("export_cli_oracle");
         let composite_path = dir.join("oracle.tif");
         let zmap_path = dir.join("oracle-zmap.tif");
         let options = {
             let mut o = TileSchedulerOptions::explicit_budget(dir.join("scratch"), 1 << 30);
+            o.apply_support(support);
             o.tile_size = 512;
-            o.levels = levels;
             o
         };
         let scheduler =

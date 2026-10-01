@@ -189,7 +189,7 @@ fn library_oracle() -> &'static OracleResult {
         let resolved = params::resolve(algo.params(), &ParamValues::new(), &stack_ctx)
             .expect("resolve must succeed");
         let values = params::resolved_values(&resolved);
-        let levels = algo.tile_levels(&values);
+        let support = algo.tile_support(&values);
 
         // This function spawns nothing, so `dir` need not outlive the
         // closure: both TIFFs below are read into `Vec<u16>` before it
@@ -199,8 +199,8 @@ fn library_oracle() -> &'static OracleResult {
         let composite_path = dir.join("oracle.tif");
         let zmap_path = dir.join("oracle-zmap.tif");
         let mut options = TileSchedulerOptions::explicit_budget(dir.join("scratch"), 1 << 30);
+        options.apply_support(support);
         options.tile_size = 512;
-        options.levels = levels;
         let scheduler =
             TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
         let consumer = FusionConsumer::create(
@@ -373,8 +373,8 @@ fn out_of_range_parameter_is_rejected() {
     assert!(!out.stderr.contains(missing_dir), "stderr: {}", out.stderr);
 }
 
-/// `levels=7` is in schema range (`[1, 16]`) but deeper than the shipped
-/// 512 px tile can plan (margin sized for 5): `laplacian::fuse` and the
+/// `levels=7` is in schema range (`[1, 16]`) but deeper than a 512 px tile
+/// can plan (margin sized for 5): `laplacian::fuse` and the
 /// scheduler's margin must agree, so this must reach
 /// `TileError::NoInterior`, naming the tile size that would work, before
 /// any tile is read.
@@ -396,6 +396,8 @@ fn refuses_levels_the_tile_geometry_cannot_plan() {
             "laplacian",
             "--set",
             "levels=7",
+            "--tile-size",
+            "512",
             "--no-align",
             "--no-crop",
             "--no-gpu",

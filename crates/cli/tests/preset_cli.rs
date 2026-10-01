@@ -538,6 +538,8 @@ fn dry_run_json_is_not_a_stack_report() {
             "laplacian",
             "--align-algo",
             "pyramidal-ecc",
+            "--tile-size",
+            "512",
             "--dry-run",
             "--json",
         ]),
