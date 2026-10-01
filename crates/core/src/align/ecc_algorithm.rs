@@ -36,6 +36,7 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus};
+use crate::align::ecc::{EccTemplate, solve_prepared};
 use crate::align::{
     AlignPyramid, EccIteration, EccMode, EccParams, EccResult, EccStatus, LumaAssembler, Transform,
 };
@@ -43,6 +44,7 @@ use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, 
 use crate::registry::AlignRegistration;
 use crate::tile::plan::{DEFAULT_TILE_SIZE, MAX_LEVELS};
 use crate::tile::{Rect, Tile};
+use crate::timing::{TimingCounter, measurement_scope, record_timing};
 
 /// Solver-robustness threshold, not a user setting -- the same class as
 /// `crate::align`'s own `PIVOT_EPS` and `CORRELATION_SLACK`. `0.75` keeps
@@ -235,6 +237,27 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     ]
 });
 
+/// Bytes of reference templates a run retains, over every level the
+/// pyramid can have (`ceil(dim / 2^k)`, `k` up to [`MAX_LEVELS`]): per
+/// solve-region pixel a value (4 B), a four-column Jacobian (32 B) and the
+/// full-overlap term (8 B), the rotation-scale mode being the larger one.
+pub(crate) fn retained_template_bytes(width: u32, height: u32) -> u64 {
+    (0..=MAX_LEVELS)
+        .map(|k| {
+            let region =
+                PyramidalEcc::solve_region(width.div_ceil(1 << k), height.div_ceil(1 << k));
+            region.width as u64 * region.height as u64 * (4 + 8 * 4 + 8)
+        })
+        .sum()
+}
+
+/// Bytes one solve allocates besides the templates: three 8-byte-per-pixel
+/// vectors over the level-0 solve region, the largest of any level.
+pub(crate) fn solve_scratch_bytes(width: u32, height: u32) -> u64 {
+    let region = PyramidalEcc::solve_region(width, height);
+    region.width as u64 * region.height as u64 * 24
+}
+
 /// The Pyramidal ECC alignment algorithm. See the module docs for the
 /// coarse-to-fine loop and the solve region.
 pub struct PyramidalEcc;
@@ -289,27 +312,41 @@ impl PyramidalEcc {
         frame: usize,
         depth: u32,
     ) -> Result<AlignPyramid, AlgorithmError> {
+        let _scope = measurement_scope("pyramid_prepare");
         let stack = ctx.stack();
         let (width, height, spp) = (stack.width, stack.height, stack.samples_per_pixel);
         let mut assembler = LumaAssembler::new(width, height);
 
+        // One buffer sized for the first (tallest) band serves every band;
+        // the last, shorter one only shrinks it.
+        let band_len = |rows: u32| width as usize * rows as usize * spp as usize;
+        let mut tile = Tile {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: DEFAULT_TILE_SIZE.min(height),
+            },
+            samples_per_pixel: spp,
+            samples: vec![0u16; band_len(DEFAULT_TILE_SIZE.min(height))],
+        };
+        let band_bytes = tile.samples.capacity() * std::mem::size_of::<u16>();
+        if band_bytes != 0 {
+            record_timing(TimingCounter::AllocationBytes, band_bytes as u64);
+            record_timing(TimingCounter::AllocationOperations, 1);
+        }
+
         let mut y = 0u32;
         while y < height {
             let band_height = DEFAULT_TILE_SIZE.min(height - y);
-            let rect = Rect {
+            tile.rect = Rect {
                 x: 0,
                 y,
                 width,
                 height: band_height,
             };
-            let needed = width as usize * band_height as usize * spp as usize;
-            let mut band = vec![0u16; needed];
-            ctx.read_tile_into(frame, rect, &mut band)?;
-            let tile = Tile {
-                rect,
-                samples_per_pixel: spp,
-                samples: band,
-            };
+            tile.samples.truncate(band_len(band_height));
+            ctx.read_tile_into(frame, tile.rect, &mut tile.samples)?;
             assembler.push_tile(&tile).map_err(wrap_error)?;
             y += band_height;
         }
@@ -332,11 +369,23 @@ impl PyramidalEcc {
         self.run(ctx, frame, cfg, Some(levels))
     }
 
+    /// The `mode` parameter as the solver's degrees of freedom.
+    fn mode(cfg: &ParamValues) -> Result<EccMode, AlgorithmError> {
+        match cfg.get("mode").and_then(ParamValue::as_enum) {
+            Some("translation") => Ok(EccMode::Translation),
+            Some("rotation-scale") => Ok(EccMode::Similarity),
+            Some(other) => Err(AlgorithmError::Failed {
+                algorithm: "pyramidal-ecc".to_string(),
+                detail: format!("unknown `mode` value `{other}`"),
+            }),
+            None => Err(missing_key("mode")),
+        }
+    }
+
     /// The coarse-to-fine loop shared by [`AlignAlgorithm::align_frame`] and
     /// [`PyramidalEcc::align_frame_traced`]. `levels` is `None` on the
-    /// shipped path, so it allocates nothing and calls [`crate::align::solve_level`];
-    /// `Some` calls [`crate::align::solve_level_traced`] instead and records
-    /// one [`EccLevelRecord`] per level solved.
+    /// shipped path, so it allocates no trace; `Some` records the per-iteration
+    /// trace and one [`EccLevelRecord`] per level solved.
     fn run(
         &self,
         ctx: &AlignContext<'_>,
@@ -356,17 +405,7 @@ impl PyramidalEcc {
             });
         }
 
-        let mode = match cfg.get("mode").and_then(ParamValue::as_enum) {
-            Some("translation") => EccMode::Translation,
-            Some("rotation-scale") => EccMode::Similarity,
-            Some(other) => {
-                return Err(AlgorithmError::Failed {
-                    algorithm: "pyramidal-ecc".to_string(),
-                    detail: format!("unknown `mode` value `{other}`"),
-                });
-            }
-            None => return Err(missing_key("mode")),
-        };
+        let mode = Self::mode(cfg)?;
         let max_iterations = cfg
             .get("max-iterations")
             .and_then(ParamValue::as_i64)
@@ -387,21 +426,24 @@ impl PyramidalEcc {
         };
 
         let stack = ctx.stack();
-        // Accept a driver-prepared reference pyramid only when it is the
-        // right thing: the right concrete type, built at the same
-        // `pyramid-depth`, at this stack's own dimensions. Any miss falls
-        // back to a rebuild, so a mismatch costs speed and never
-        // correctness -- see the module docs on `AlignContext::prepared`.
+        // Accept a driver-prepared reference only when it is the right
+        // thing: the right concrete type, prepared for this reference frame
+        // and mode, built at the same `pyramid-depth`, at this stack's own
+        // dimensions. Any miss falls back to a rebuild, so a mismatch costs
+        // speed and never correctness -- see the module docs on
+        // `AlignContext::prepared`.
         let prepared = ctx
             .prepared()
-            .and_then(|p| p.downcast_ref::<AlignPyramid>())
+            .and_then(|p| p.downcast_ref::<PreparedReference>())
             .filter(|p| {
-                p.level_count() == depth as usize + 1
-                    && p.dimensions() == (stack.width, stack.height)
+                p.reference == ctx.reference()
+                    && p.mode == mode
+                    && p.pyramid.level_count() == depth as usize + 1
+                    && p.pyramid.dimensions() == (stack.width, stack.height)
             });
         let built;
         let reference_pyramid: &AlignPyramid = match prepared {
-            Some(shared) => shared,
+            Some(shared) => &shared.pyramid,
             None => {
                 built = Self::build_pyramid(ctx, ctx.reference(), depth)?;
                 &built
@@ -418,24 +460,29 @@ impl PyramidalEcc {
         let mut final_status = AlignStatus::Converged;
         let mut final_residual = 1.0f64;
 
+        let _scope = measurement_scope("ecc_solve");
         for k in (0..=depth).rev() {
             let level_ref = reference_pyramid.level(k as usize);
             let level_frame = frame_pyramid.level(k as usize);
             let region = Self::solve_region(level_ref.width(), level_ref.height());
 
+            let own_template;
+            let template = match prepared
+                .and_then(|p| p.templates[k as usize].as_ref())
+                .filter(|t| t.region() == region)
+            {
+                Some(shared) => shared,
+                None => {
+                    own_template =
+                        EccTemplate::prepare(level_ref, region, mode).map_err(wrap_error)?;
+                    &own_template
+                }
+            };
+
             let result = match levels.as_deref_mut() {
                 Some(recs) => {
                     let mut t = Vec::new();
-                    let r = crate::align::solve_level_traced(
-                        level_ref,
-                        region,
-                        level_frame,
-                        &seed,
-                        mode,
-                        &params,
-                        &mut t,
-                    )
-                    .map_err(wrap_error)?;
+                    let r = solve_prepared(template, level_frame, &seed, &params, Some(&mut t));
                     recs.push(EccLevelRecord {
                         level: k,
                         result: r,
@@ -443,10 +490,7 @@ impl PyramidalEcc {
                     });
                     r
                 }
-                None => {
-                    crate::align::solve_level(level_ref, region, level_frame, &seed, mode, &params)
-                        .map_err(wrap_error)?
-                }
+                None => solve_prepared(template, level_frame, &seed, &params, None),
             };
             total_iterations += result.iterations;
             final_residual = result.correlation;
@@ -479,6 +523,16 @@ impl PyramidalEcc {
             residual: final_residual,
         })
     }
+}
+
+/// What [`AlignAlgorithm::prepare_run`] shares across a run's registrations:
+/// the reference frame's pyramid and, per level, the solver template over that
+/// level's solve region.
+struct PreparedReference {
+    reference: usize,
+    mode: EccMode,
+    pyramid: AlignPyramid,
+    templates: Vec<Option<EccTemplate>>,
 }
 
 /// One pyramid level of one [`PyramidalEcc::align_frame_traced`] call.
@@ -515,26 +569,37 @@ impl AlignAlgorithm for PyramidalEcc {
         self.run(ctx, frame, cfg, None)
     }
 
-    /// Builds the reference frame's pyramid once, for the driver to hand
-    /// back to every [`AlignAlgorithm::align_frame`] call of this run
-    /// through [`AlignContext::prepared`]. Uses `build_pyramid`
-    /// unchanged -- the same call `run` itself falls back to when the
-    /// prepared value is missing or does not match.
+    /// Builds the reference frame's pyramid and, per level, its solver
+    /// template once, for the driver to hand back to every
+    /// [`AlignAlgorithm::align_frame`] call of this run through
+    /// [`AlignContext::prepared`]. A level whose solve region is invalid
+    /// gets no template, so `run` reports that error itself, per frame,
+    /// exactly as it does without a prepared value.
     fn prepare_run(
         &self,
         ctx: &AlignContext<'_>,
         cfg: &ParamValues,
     ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, AlgorithmError> {
         crate::params::validate(self.params(), cfg)?;
+        let mode = Self::mode(cfg)?;
         let depth = cfg
             .get("pyramid-depth")
             .and_then(ParamValue::as_i64)
             .ok_or_else(|| missing_key("pyramid-depth"))? as u32;
-        Ok(Some(Arc::new(Self::build_pyramid(
-            ctx,
-            ctx.reference(),
-            depth,
-        )?)))
+        let pyramid = Self::build_pyramid(ctx, ctx.reference(), depth)?;
+        let templates = (0..pyramid.level_count())
+            .map(|k| {
+                let level = pyramid.level(k);
+                let region = Self::solve_region(level.width(), level.height());
+                EccTemplate::prepare(level, region, mode).ok()
+            })
+            .collect();
+        Ok(Some(Arc::new(PreparedReference {
+            reference: ctx.reference(),
+            mode,
+            pyramid,
+            templates,
+        })))
     }
 }
 
@@ -636,6 +701,17 @@ mod tests {
                 height: 384,
             }
         );
+    }
+
+    #[test]
+    fn retained_templates_sum_the_solve_regions_of_every_level() {
+        // Level regions at 8192x5464: 1253x836 on levels 0-2 (the sample
+        // budget binds), then the 0.75 share of each halved level; 44 bytes
+        // per pixel (values, Jacobian, full-overlap terms).
+        assert_eq!(retained_template_bytes(8192, 5464), 161_361_640);
+        assert_eq!(retained_template_bytes(512, 512), 8_650_400);
+        assert_eq!(solve_scratch_bytes(512, 512), 24 * 384 * 384);
+        assert_eq!(solve_scratch_bytes(8192, 5464), 24 * 1253 * 836);
     }
 
     #[test]

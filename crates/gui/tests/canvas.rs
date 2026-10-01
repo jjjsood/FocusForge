@@ -1275,6 +1275,265 @@ fn pane_label_too_long_keeps_its_tail() {
     );
 }
 
+// ---------------------------------------------------------------------
+// Display resource reuse and content-coverage skipping through
+// `CanvasRenderer`, with a real GPU device.
+// ---------------------------------------------------------------------
+
+/// The one composite/Z-Map golden pair under `fixtures/mantis-512/golden`.
+fn golden_plane_files() -> (PathBuf, PathBuf) {
+    let dir = common::workspace_root().join("fixtures/mantis-512/golden");
+    let mut composite = None;
+    let mut zmap = None;
+    for entry in fs::read_dir(&dir).expect("golden directory opens") {
+        let path = entry.expect("golden directory entry reads").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tif") {
+            continue;
+        }
+        if focusforge_core::zmap::ZMapReader::open(&path).is_ok() {
+            assert!(zmap.replace(path).is_none(), "one Z-Map golden is required");
+        } else {
+            assert!(
+                composite.replace(path).is_none(),
+                "one composite golden is required"
+            );
+        }
+    }
+    (
+        composite.expect("composite golden exists"),
+        zmap.expect("Z-Map golden exists"),
+    )
+}
+
+/// A warmup draw, then redraws covering every reuse/skip rule: an identical
+/// draw, a `dst`-only shift, a pan, a zoom, a plane switch to Z-Map and
+/// back, and a `set_planes`/`set_frame` on the unchanged draw -- asserting
+/// each step's own counter deltas, exactly one plane's bytes wherever a
+/// step reads. The golden draw's `src` has an odd width, decimated by a
+/// `step` of 2.
+#[test]
+fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
+    use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
+    use focusforge_gui::canvas::PaneSource;
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+    use focusforge_gui::viewport::PaneDraw;
+    use std::num::NonZeroU32;
+
+    // Timing accounting is process-global, so this runs alone in a child.
+    const CHILD: &str = "FOCUSFORGE_GUI_CANVAS_DISPLAY_REUSE_ACCOUNTING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args([
+            "--exact",
+            "display_resources_are_reused_and_unchanged_content_is_not_reread",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .status()
+        .expect("the isolated accounting test starts");
+        assert!(
+            status.success(),
+            "the isolated accounting test passes: {status}"
+        );
+        return;
+    }
+
+    enable_trace_accounting();
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+
+    let (composite_path, zmap_path) = golden_plane_files();
+    let frame_path = common::fixture_frame("mantis-64", 0);
+
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    renderer
+        .set_planes(&composite_path, &zmap_path)
+        .expect("golden planes open");
+    renderer
+        .set_frame(&frame_path, None, job::host_budget())
+        .expect("fixture frame opens");
+
+    let golden = PaneDraw {
+        src: (3, 5, 37, 23),
+        dst: (0.0, 0.0, 37.0, 23.0),
+        pixelated: false,
+        step: NonZeroU32::new(2).unwrap(),
+    };
+    assert!(
+        golden.src.2 % 2 == 1,
+        "the golden draw must carry an odd width"
+    );
+
+    let samples_per_pixel = |path: &Path| {
+        let stack = focusforge_core::io::TiffStack::open_files(&[path.to_path_buf()])
+            .expect("fixture TIFF opens");
+        u64::from(stack.header(0).samples_per_pixel)
+    };
+    let composite_spp = samples_per_pixel(&composite_path);
+    let frame_spp = samples_per_pixel(&frame_path);
+    let zmap_spp = 1;
+
+    let counters = || {
+        let s = timing_snapshot().expect("trace accounting is enabled");
+        (
+            s.pipeline_creations,
+            s.allocation_operations,
+            s.sample_bytes,
+            s.converted_bytes,
+            s.upload_bytes,
+        )
+    };
+    type Counters = (u64, u64, u64, u64, u64);
+    let assert_steady = |before: Counters, after: Counters, label: &str| {
+        assert_eq!(
+            after.0 - before.0,
+            0,
+            "{label}: pipeline_creations must not grow"
+        );
+        assert_eq!(
+            after.1 - before.1,
+            0,
+            "{label}: allocation_operations must not grow"
+        );
+        assert_eq!(after.2 - before.2, 0, "{label}: sample_bytes must not grow");
+    };
+    let assert_nothing_read = |before: Counters, after: Counters, label: &str| {
+        assert_eq!(
+            after.3 - before.3,
+            0,
+            "{label}: converted_bytes must not grow"
+        );
+        assert_eq!(after.4 - before.4, 0, "{label}: upload_bytes must not grow");
+    };
+    // Exactly one plane's `draw.extent()` read as `u16` samples and uploaded
+    // packed two per `u32` word, the odd tail padded to a whole word.
+    let assert_one_plane =
+        |before: Counters, after: Counters, draw: &PaneDraw, spp: u64, label: &str| {
+            let (width, height) = draw.extent();
+            let samples = u64::from(width) * u64::from(height) * spp;
+            assert_eq!(
+                after.0 - before.0,
+                0,
+                "{label}: pipeline_creations must not grow"
+            );
+            assert_eq!(
+                after.3 - before.3,
+                samples * 2,
+                "{label}: converted_bytes must be exactly one plane's samples"
+            );
+            assert_eq!(
+                after.4 - before.4,
+                samples.div_ceil(2) * 4,
+                "{label}: upload_bytes must be exactly one plane's packed words"
+            );
+        };
+
+    // Warmup: builds the retained pipeline/buffers/scratch and both panes'
+    // own coverage.
+    assert!(renderer.redraw_planes(&golden, None, None).is_some());
+    assert!(renderer.redraw_frame(&golden).is_some());
+
+    // 1. An identical draw: no read, no upload, no allocation.
+    let before = counters();
+    assert!(renderer.redraw_planes(&golden, None, None).is_some());
+    assert!(renderer.redraw_frame(&golden).is_some());
+    let after = counters();
+    assert_steady(before, after, "identical draw");
+    assert_nothing_read(before, after, "identical draw");
+
+    // 2. A dst-only shift: same src/step, different placement -- still no
+    // read/upload, whatever dst/pixelated now are.
+    let shifted = PaneDraw {
+        dst: (10.0, 4.0, 37.0, 23.0),
+        pixelated: true,
+        ..golden
+    };
+    let before = counters();
+    assert!(renderer.redraw_planes(&shifted, None, None).is_some());
+    assert!(renderer.redraw_frame(&shifted).is_some());
+    let after = counters();
+    assert_steady(before, after, "dst-only shift");
+    assert_nothing_read(before, after, "dst-only shift");
+
+    // 3. A pan to a different src of the same extent: reads and uploads
+    // exactly the selected (composite) plane, then exactly the frame.
+    let panned = PaneDraw {
+        src: (4, 6, 37, 23),
+        dst: golden.dst,
+        ..golden
+    };
+    let before = counters();
+    assert!(renderer.redraw_planes(&panned, None, None).is_some());
+    let after = counters();
+    assert_one_plane(before, after, &panned, composite_spp, "pan");
+
+    let before = counters();
+    assert!(renderer.redraw_frame(&panned).is_some());
+    let after = counters();
+    assert_one_plane(before, after, &panned, frame_spp, "pan (frame)");
+
+    // 4. A zoom to a different step: reads and uploads again.
+    let zoomed = PaneDraw {
+        step: NonZeroU32::new(1).unwrap(),
+        ..panned
+    };
+    let before = counters();
+    assert!(renderer.redraw_planes(&zoomed, None, None).is_some());
+    let after = counters();
+    assert_one_plane(before, after, &zoomed, composite_spp, "zoom");
+
+    // 5. Selecting the Z-Map plane for the first time at this content reads
+    // and uploads exactly it.
+    renderer.select_plane(PaneSource::ZMap);
+    let before = counters();
+    let (_, plane) = renderer
+        .redraw_planes(&zoomed, None, None)
+        .expect("Z-Map plane draws");
+    assert_eq!(plane, PaneSource::ZMap);
+    let after = counters();
+    assert_one_plane(before, after, &zoomed, zmap_spp, "first Z-Map select");
+
+    // Selecting back to Composite at the same content is a no-op: its own
+    // coverage is still current, and the Z-Map is not touched either.
+    renderer.select_plane(PaneSource::Composite);
+    let before = counters();
+    let (_, plane) = renderer
+        .redraw_planes(&zoomed, None, None)
+        .expect("composite plane draws");
+    assert_eq!(plane, PaneSource::Composite);
+    let after = counters();
+    assert_steady(before, after, "select back to composite");
+    assert_nothing_read(before, after, "select back to composite");
+
+    // 6. `set_planes` on the unchanged draw invalidates both panes' own
+    // coverage; the next draw (composite still selected) re-reads exactly
+    // that one plane.
+    renderer
+        .set_planes(&composite_path, &zmap_path)
+        .expect("golden planes re-open");
+    let before = counters();
+    let (_, plane) = renderer
+        .redraw_planes(&zoomed, None, None)
+        .expect("composite plane draws again");
+    assert_eq!(plane, PaneSource::Composite);
+    let after = counters();
+    assert_one_plane(before, after, &zoomed, composite_spp, "post set_planes");
+
+    // 7. `set_frame` on the frame's unchanged draw invalidates its coverage;
+    // the next frame draw re-reads exactly the frame.
+    renderer
+        .set_frame(&frame_path, None, job::host_budget())
+        .expect("fixture frame re-opens");
+    let before = counters();
+    assert!(renderer.redraw_frame(&panned).is_some());
+    let after = counters();
+    assert_one_plane(before, after, &panned, frame_spp, "post set_frame");
+}
+
 #[test]
 fn pane_label_at_the_budget_passes_through_unchanged() {
     let at_budget = "829-IMG_9800.tif";
@@ -1287,6 +1546,149 @@ fn pane_label_at_the_budget_passes_through_unchanged() {
 
     let one_over = "0829-IMG_9800.tif";
     assert_eq!(truncate_pane_label(one_over), "\u{2026}29-IMG_9800.tif");
+}
+
+// ---------------------------------------------------------------------
+// The off-thread preparer: one active read, one newest pending request,
+// one completed slot; and the freshness floor that refuses stale results.
+// ---------------------------------------------------------------------
+
+mod preparing {
+    use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use focusforge_core::tile::Rect;
+    use focusforge_gui::canvas::{Pane, PaneJob, PaneReadError, PaneReader, Prepared, Preparer};
+    use focusforge_gui::viewport::PaneDraw;
+
+    pub const WAIT: Duration = Duration::from_secs(10);
+
+    /// One read the fake served: when it began and, once released, ended.
+    pub struct Served {
+        pub rect: Rect,
+        pub started: Instant,
+        pub ended: Option<Instant>,
+    }
+
+    /// A reader that logs every read and blocks each one until the test
+    /// sends a token.
+    pub struct FakeReader {
+        spp: u32,
+        pub log: Mutex<Vec<Served>>,
+        gate: Mutex<Receiver<()>>,
+    }
+
+    impl FakeReader {
+        pub fn new(spp: u32) -> (Arc<Self>, Sender<()>) {
+            let (release, gate) = channel();
+            let reader = Arc::new(Self {
+                spp,
+                log: Mutex::new(Vec::new()),
+                gate: Mutex::new(gate),
+            });
+            (reader, release)
+        }
+
+        pub fn reads(&self) -> usize {
+            self.log.lock().unwrap().len()
+        }
+
+        pub fn finished(&self) -> usize {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|served| served.ended.is_some())
+                .count()
+        }
+    }
+
+    impl PaneReader for FakeReader {
+        fn samples_per_pixel(&self) -> u32 {
+            self.spp
+        }
+
+        fn read_step_into(
+            &self,
+            rect: Rect,
+            _step: NonZeroU32,
+            out: &mut [u16],
+        ) -> Result<(), PaneReadError> {
+            self.log.lock().unwrap().push(Served {
+                rect,
+                started: Instant::now(),
+                ended: None,
+            });
+            self.gate
+                .lock()
+                .unwrap()
+                .recv()
+                .expect("the test keeps the release sender alive");
+            out.fill(rect.width as u16);
+            self.log.lock().unwrap().last_mut().unwrap().ended = Some(Instant::now());
+            Ok(())
+        }
+    }
+
+    /// A one-job request whose source width is `width` and whose stamp is
+    /// `stamp`, so a completion says which submit it came from.
+    pub fn job(reader: &Arc<FakeReader>, width: u32, stamp: u64) -> PaneJob {
+        PaneJob {
+            pane: Pane::Frame,
+            draw: PaneDraw {
+                src: (0, 0, width, 8),
+                dst: (0.0, 0.0, width as f32, 8.0),
+                pixelated: false,
+                step: NonZeroU32::MIN,
+            },
+            stamp,
+            reader: reader.clone(),
+            index_scale: 0,
+            indices: None,
+            state: Default::default(),
+        }
+    }
+
+    pub fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + WAIT;
+        while !ready() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Polls `take` until a completion carrying `stamp` shows up; older
+    /// completions taken on the way go back to the pool.
+    pub fn take_stamp(preparer: &Preparer, stamp: u64) -> Vec<Prepared> {
+        let mut found = None;
+        wait_for("a completion", || {
+            let Some(done) = preparer.take() else {
+                return false;
+            };
+            if done.iter().any(|p| p.job.stamp == stamp) {
+                found = Some(done);
+                true
+            } else {
+                preparer.recycle(done);
+                false
+            }
+        });
+        found.unwrap()
+    }
+
+    pub fn counter() -> (Arc<AtomicUsize>, impl Fn() + Send + Sync + 'static) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let wake = {
+            let count = count.clone();
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        (count, wake)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1441,6 +1843,464 @@ fn resident_tiles_allocate_only_the_tiles_a_region_meets() {
             assert_eq!(&samples[i..i + 3], expected, "({x}, {y})");
         }
     }
+}
+
+#[test]
+fn preparer_keeps_one_active_and_the_newest_pending_request() {
+    use preparing::*;
+    let (reader, release) = FakeReader::new(1);
+    let preparer = focusforge_gui::canvas::Preparer::new(|| {});
+
+    preparer.submit(vec![job(&reader, 1, 1)]);
+    wait_for("the first read to start", || reader.reads() == 1);
+
+    let started = std::time::Instant::now();
+    for width in 2..=100 {
+        preparer.submit(vec![job(&reader, width, u64::from(width))]);
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "submitting while a read is blocked returns at once"
+    );
+
+    release.send(()).unwrap();
+    release.send(()).unwrap();
+    let done = take_stamp(&preparer, 100);
+
+    assert_eq!(reader.reads(), 2, "one active read plus the newest pending");
+    assert_eq!(done.len(), 1);
+    assert_eq!(
+        done[0].job.draw.src.2, 100,
+        "the second read is the last submit"
+    );
+    assert_eq!(reader.log.lock().unwrap()[1].rect.width, 100);
+}
+
+#[test]
+fn preparer_wakes_once_per_unconsumed_completion() {
+    use preparing::*;
+    let (reader, release) = FakeReader::new(1);
+    for _ in 0..3 {
+        release.send(()).unwrap();
+    }
+    let (wakes, wake) = counter();
+    let preparer = focusforge_gui::canvas::Preparer::new(wake);
+
+    preparer.submit(vec![job(&reader, 1, 1)]);
+    wait_for("the first wake", || {
+        wakes.load(std::sync::atomic::Ordering::SeqCst) == 1
+    });
+    preparer.submit(vec![job(&reader, 2, 2)]);
+    wait_for("the second read", || reader.finished() == 2);
+
+    let done = take_stamp(&preparer, 2);
+    assert_eq!(done.len(), 1, "take yields only the newest completion");
+    assert_eq!(
+        wakes.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a completion landing on a full slot wakes nobody"
+    );
+    assert!(preparer.take().is_none(), "the slot is empty after take");
+
+    preparer.submit(vec![job(&reader, 3, 3)]);
+    wait_for("the wake for an emptied slot", || {
+        wakes.load(std::sync::atomic::Ordering::SeqCst) == 2
+    });
+    take_stamp(&preparer, 3);
+}
+
+/// Timing accounting is process-global, so this runs alone in a child.
+#[test]
+fn preparer_reuses_its_buffers_across_a_burst() {
+    use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
+    use preparing::*;
+
+    const CHILD: &str = "FOCUSFORGE_GUI_PREPARER_BUFFER_ACCOUNTING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args([
+            "--exact",
+            "preparer_reuses_its_buffers_across_a_burst",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .status()
+        .expect("the isolated accounting test starts");
+        assert!(
+            status.success(),
+            "the isolated accounting test passes: {status}"
+        );
+        return;
+    }
+
+    enable_trace_accounting();
+    let sample_bytes = || {
+        timing_snapshot()
+            .expect("trace accounting is enabled")
+            .sample_bytes
+    };
+    let preparer = focusforge_gui::canvas::Preparer::new(|| {});
+    let mut stamp = 0;
+    for spp in [3, 1] {
+        let (reader, release) = FakeReader::new(spp);
+        for _ in 0..200 {
+            release.send(()).unwrap();
+        }
+        let request = |stamp: &mut u64, width: u32| {
+            *stamp += 1;
+            preparer.submit(vec![
+                job(&reader, width, *stamp),
+                job(&reader, width, *stamp),
+            ]);
+        };
+        let settle = |stamp: u64| preparer.recycle(take_stamp(&preparer, stamp));
+
+        // Warm-up reaches the full pipeline depth: a completion parked in
+        // the slot while a second one replaces it.
+        for round in 1..=2 {
+            request(&mut stamp, 64);
+            wait_for("the warm-up reads", || reader.finished() == 2 * round);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        settle(stamp);
+        let warm = sample_bytes();
+
+        for _ in 0..20 {
+            request(&mut stamp, 64);
+            settle(stamp);
+        }
+        for _ in 0..20 {
+            request(&mut stamp, 64);
+        }
+        settle(stamp);
+        assert_eq!(
+            sample_bytes() - warm,
+            0,
+            "spp {spp}: a burst of same-extent requests allocates no sample bytes"
+        );
+    }
+}
+
+#[test]
+fn preparer_starts_the_newest_request_without_delay() {
+    use preparing::*;
+    use std::time::{Duration, Instant};
+
+    let (reader, release) = FakeReader::new(1);
+    let preparer = focusforge_gui::canvas::Preparer::new(|| {});
+
+    let submitted = Instant::now();
+    preparer.submit(vec![job(&reader, 1, 1)]);
+    wait_for("the idle read to start", || reader.reads() == 1);
+    let idle_start = reader.log.lock().unwrap()[0].started;
+    assert!(
+        idle_start - submitted < Duration::from_millis(50),
+        "an idle worker starts at once: {:?}",
+        idle_start - submitted
+    );
+
+    preparer.submit(vec![job(&reader, 2, 2)]);
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(reader.reads(), 1, "the busy worker starts nothing else");
+    release.send(()).unwrap();
+    release.send(()).unwrap();
+    wait_for("the newest read to finish", || reader.finished() == 2);
+
+    let log = reader.log.lock().unwrap();
+    let first_end = log[0].ended.expect("the first read finished");
+    let gap = log[1].started.saturating_duration_since(first_end);
+    assert!(
+        log[1].started >= first_end && gap < Duration::from_millis(50),
+        "the newest read follows the active one's end: {gap:?}"
+    );
+}
+
+#[test]
+fn preparer_dropped_during_a_slow_read_wakes_nobody() {
+    use preparing::*;
+    let (reader, release) = FakeReader::new(1);
+    let (wakes, wake) = counter();
+    let preparer = focusforge_gui::canvas::Preparer::new(wake);
+
+    preparer.submit(vec![job(&reader, 1, 1)]);
+    wait_for("the read to start", || reader.reads() == 1);
+    drop(preparer);
+    release.send(()).unwrap();
+    wait_for("the read to finish", || reader.finished() == 1);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn stale_stamps_are_refused_in_any_arrival_order() {
+    use focusforge_gui::canvas::StampFloor;
+
+    let accepted = |floor: &mut StampFloor, stamps: &[u64]| -> Vec<u64> {
+        stamps
+            .iter()
+            .copied()
+            .filter(|&stamp| floor.accept(stamp))
+            .collect()
+    };
+    assert_eq!(accepted(&mut StampFloor::default(), &[1, 2, 3]), [1, 2, 3]);
+    assert_eq!(accepted(&mut StampFloor::default(), &[3, 2, 1]), [3]);
+    assert_eq!(
+        accepted(&mut StampFloor::default(), &[2, 1, 4, 3, 5, 5]),
+        [2, 4, 5]
+    );
+
+    let mut floor = StampFloor::default();
+    assert_eq!(accepted(&mut floor, &[1, 2]), [1, 2]);
+    floor.reset(10);
+    assert_eq!(
+        accepted(&mut floor, &[9, 10, 11, 8, 12]),
+        [11, 12],
+        "work issued before a reset is refused, whatever its order"
+    );
+}
+
+#[test]
+fn prepared_samples_match_a_direct_read() {
+    use focusforge_core::io::TiffStack;
+    use focusforge_core::tile::Rect;
+    use focusforge_core::zmap::ZMapReader;
+    use focusforge_gui::canvas::{Pane, PaneJob, PaneReader, Preparer};
+    use focusforge_gui::viewport::PaneDraw;
+    use preparing::take_stamp;
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+
+    let (composite_path, zmap_path) = golden_plane_files();
+    let frame_path = common::fixture_frame("mantis-64", 0);
+    let frame = Arc::new(TiffStack::open_files(&[frame_path]).expect("frame opens"));
+    let composite = Arc::new(TiffStack::open_files(&[composite_path]).expect("composite opens"));
+    let zmap = Arc::new(ZMapReader::open(&zmap_path).expect("Z-Map opens"));
+
+    let preparer = Preparer::new(|| {});
+    let mut stamp = 0;
+    let mut check = |pane: Pane,
+                     reader: Arc<dyn PaneReader>,
+                     size: (u32, u32),
+                     index_scale: u32,
+                     direct: &dyn Fn(Rect, NonZeroU32, &mut [u16])| {
+        let odd = |extent: u32| (extent - 4) | 1;
+        let rects = [(1, 3, odd(size.0), odd(size.1)), (0, 0, size.0, size.1)];
+        for (x, y, width, height) in rects {
+            for step in 1..=3 {
+                let step = NonZeroU32::new(step).unwrap();
+                let draw = PaneDraw {
+                    src: (x, y, width, height),
+                    dst: (0.0, 0.0, width as f32, height as f32),
+                    pixelated: false,
+                    step,
+                };
+                let (tex_w, tex_h) = draw.extent();
+                let mut expected =
+                    vec![
+                        0u16;
+                        tex_w as usize * tex_h as usize * reader.samples_per_pixel() as usize
+                    ];
+                let rect = Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                };
+                direct(rect, step, &mut expected);
+                stamp += 1;
+                preparer.submit(vec![PaneJob {
+                    pane,
+                    draw,
+                    stamp,
+                    reader: reader.clone(),
+                    index_scale,
+                    indices: None,
+                    state: Default::default(),
+                }]);
+                let done = take_stamp(&preparer, stamp);
+                assert_eq!(
+                    done[0].samples, expected,
+                    "{pane:?} {:?} step {step}: worker samples equal a direct read",
+                    draw.src
+                );
+                preparer.recycle(done);
+            }
+        }
+    };
+
+    check(
+        Pane::Frame,
+        frame.clone(),
+        frame.dimensions(),
+        0,
+        &|rect, step, out| frame.read_tile_step_into(0, rect, step, out).unwrap(),
+    );
+    let composite_size = composite.dimensions();
+    check(
+        Pane::Composite,
+        composite.clone(),
+        composite_size,
+        0,
+        &|rect, step, out| composite.read_tile_step_into(0, rect, step, out).unwrap(),
+    );
+    check(
+        Pane::ZMap,
+        zmap.clone(),
+        composite_size,
+        1,
+        &|rect, step, out| zmap.read_tile_step_into(rect, step, out).unwrap(),
+    );
+}
+
+/// A job requested before a source switch, close, plane selection, device
+/// change or a newer publish renders and uploads nothing. Upload accounting
+/// is process-global, so this runs alone in a child.
+#[test]
+fn stale_results_render_nothing() {
+    use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
+    use focusforge_gui::canvas::{PaneJob, PaneSource};
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+    use focusforge_gui::viewport::PaneDraw;
+    use std::num::NonZeroU32;
+
+    const CHILD: &str = "FOCUSFORGE_GUI_STALE_RESULTS_ACCOUNTING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args([
+            "--exact",
+            "stale_results_render_nothing",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .status()
+        .expect("the isolated accounting test starts");
+        assert!(
+            status.success(),
+            "the isolated accounting test passes: {status}"
+        );
+        return;
+    }
+
+    enable_trace_accounting();
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let (composite_path, zmap_path) = golden_plane_files();
+    let frame_path = common::fixture_frame("mantis-64", 0);
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_frame(&frame_path, None, job::host_budget())
+        .unwrap();
+
+    let draw = |x: u32| PaneDraw {
+        src: (x, 5, 37, 23),
+        dst: (0.0, 0.0, 37.0, 23.0),
+        pixelated: false,
+        step: NonZeroU32::new(2).unwrap(),
+    };
+    let uploaded = || {
+        timing_snapshot()
+            .expect("trace accounting is enabled")
+            .upload_bytes
+    };
+    let samples = |job: &PaneJob| {
+        let (width, height) = job.draw.extent();
+        let mut samples =
+            vec![0u16; width as usize * height as usize * job.reader.samples_per_pixel() as usize];
+        let (x, y, w, h) = job.draw.src;
+        let rect = focusforge_core::tile::Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        job.reader
+            .read_step_into(rect, job.draw.step, &mut samples)
+            .expect("the fixture reads");
+        samples
+    };
+    let refused = |renderer: &mut CanvasRenderer, job: &PaneJob, label: &str| {
+        let before = uploaded();
+        assert!(
+            renderer.publish(job, &samples(job)).is_none(),
+            "{label}: the stale job is refused"
+        );
+        assert_eq!(uploaded(), before, "{label}: nothing is uploaded");
+    };
+    let accepted = |renderer: &mut CanvasRenderer, job: &PaneJob, label: &str| {
+        let before = uploaded();
+        assert!(
+            renderer.publish(job, &samples(job)).is_some(),
+            "{label}: the fresh job is accepted"
+        );
+        assert!(uploaded() > before, "{label}: the accepted job uploads");
+    };
+
+    // Older than a published view.
+    let older = renderer.request_frame(&draw(4)).expect("frame job");
+    let newer = renderer.request_frame(&draw(5)).expect("frame job");
+    accepted(&mut renderer, &newer, "newer frame view");
+    refused(&mut renderer, &older, "older frame view");
+
+    // Requesting a view the pane already shows retires work in flight.
+    let in_flight = renderer.request_frame(&draw(6)).expect("frame job");
+    assert!(renderer.request_frame(&draw(5)).is_none(), "already shown");
+    refused(
+        &mut renderer,
+        &in_flight,
+        "view retired by a covered request",
+    );
+
+    // A source switch.
+    let before_frame_switch = renderer.request_frame(&draw(7)).expect("frame job");
+    renderer
+        .set_frame(&frame_path, None, job::host_budget())
+        .unwrap();
+    refused(&mut renderer, &before_frame_switch, "set_frame");
+    let before_frame_close = renderer.request_frame(&draw(7)).expect("frame job");
+    renderer.clear_frame();
+    renderer
+        .set_frame(&frame_path, None, job::host_budget())
+        .unwrap();
+    refused(&mut renderer, &before_frame_close, "clear_frame");
+
+    let before_planes = renderer
+        .request_planes(&draw(7), None, None)
+        .expect("plane job");
+    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    refused(&mut renderer, &before_planes, "set_planes");
+    let before_clear = renderer
+        .request_planes(&draw(7), None, None)
+        .expect("plane job");
+    renderer.clear_planes();
+    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    refused(&mut renderer, &before_clear, "clear_planes");
+
+    // A plane selection.
+    let before_select = renderer
+        .request_planes(&draw(7), None, None)
+        .expect("plane job");
+    renderer.select_plane(PaneSource::ZMap);
+    refused(&mut renderer, &before_select, "select_plane");
+    let zmap_job = renderer
+        .request_planes(&draw(7), None, None)
+        .expect("Z-Map job");
+    accepted(&mut renderer, &zmap_job, "Z-Map after the selection");
+
+    // A device change.
+    let before_device = renderer
+        .request_planes(&draw(8), None, None)
+        .expect("plane job");
+    renderer.detach_device();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    refused(&mut renderer, &before_device, "detach and attach");
 }
 
 #[test]

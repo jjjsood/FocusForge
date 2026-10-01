@@ -17,12 +17,22 @@ use slint::winit_030::{CustomApplicationHandler, EventResult, WinitWindowAccesso
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
-use crate::canvas::{CanvasFeed, RepaintGate, truncate_pane_label};
+use crate::canvas::{
+    CanvasFeed, EditedView, OverlayDraw, Pane, PaneJob, PaneSource, Preparer, RepaintGate,
+    truncate_pane_label,
+};
 use crate::controller::{
     AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, OpenOutcome,
     SettingsSection, ShellEvent, ShellMode,
 };
-use crate::diagnostics::DiagnosticsStatus;
+use crate::diagnostics::{
+    DiagnosticsStatus, InputBatch, InputSurface, finish_input_batches, input_trace_incomplete,
+    record_coalesced_input, record_destroyed_window, record_input, record_shared_input,
+    take_published_input,
+};
+use crate::diagnostics::{
+    TimingCounter, measurement_scope, measurement_scope_with_fields, record_timing,
+};
 use crate::generated::{
     AppWindow, FFManifestRow, ImageRowView as GeneratedImageRow,
     ProjectCardView as GeneratedProjectCard, ProjectTabView, RecentRowView as GeneratedRecentRow,
@@ -31,8 +41,9 @@ use crate::generated::{
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
 use crate::job;
-use crate::settings_panel::{HeadingState, RowKind};
-use crate::viewport::PaneRect;
+use crate::overlay::Thumbnail;
+use crate::settings_panel::{HeadingState, PanelModel, RowKind};
+use crate::viewport::{PaneDraw, PaneRect};
 
 /// `slint::platform::PointerEventButton` -> `input_map::Button` -- the only
 /// place in the crate that names the Slint type.
@@ -80,6 +91,8 @@ pub struct Installed {
 #[derive(Default)]
 pub struct Canvas {
     renderer: Option<CanvasRenderer>,
+    /// Reads the panes' samples off the event loop; set by [`install`].
+    preparer: Option<Preparer>,
     tab: Option<usize>,
     /// The frame reader's own refusal, kept until a different frame opens
     /// or the same one succeeds -- the left `FFPane`'s message line reads
@@ -171,22 +184,182 @@ impl Canvas {
             Err(err) => self.frame_error = Some(err.to_string()),
         }
     }
+
+    /// Hands the worker one request for every pane whose texture does not
+    /// yet show its draw; a request still pending is replaced by it.
+    fn request_reads(
+        &mut self,
+        frame: Option<&PaneDraw>,
+        plane: Option<&PaneDraw>,
+        generation: Option<u64>,
+        overlay: Option<&OverlayDraw>,
+    ) {
+        let (Some(renderer), Some(preparer)) = (self.renderer.as_mut(), self.preparer.as_ref())
+        else {
+            return;
+        };
+        let jobs: Vec<PaneJob> = frame
+            .and_then(|draw| renderer.request_frame(draw))
+            .into_iter()
+            .chain(plane.and_then(|draw| renderer.request_planes(draw, generation, overlay)))
+            .collect();
+        if !jobs.is_empty() {
+            preparer.submit(jobs);
+        }
+    }
+
+    /// Renders whatever the worker completed into the panes' textures, the
+    /// live `edited` session applied over the sealed reads; `false` when
+    /// nothing had completed.
+    fn publish_prepared(&mut self, edited: Option<&EditedView>) -> bool {
+        let Some(done) = self.preparer.as_ref().and_then(Preparer::take) else {
+            return false;
+        };
+        if let Some(renderer) = self.renderer.as_mut() {
+            for prepared in &done {
+                let stamp = prepared.job.stamp;
+                let _scope = measurement_scope_with_fields(
+                    "gui_canvas_publish",
+                    stamp,
+                    stamp,
+                    1,
+                    0,
+                    false,
+                    0,
+                );
+                renderer.publish_edited(
+                    &prepared.job,
+                    &prepared.samples,
+                    &prepared.indices,
+                    edited,
+                );
+            }
+        }
+        if let Some(preparer) = self.preparer.as_ref() {
+            preparer.recycle(done);
+        }
+        true
+    }
+}
+
+thread_local! {
+    /// What the worker's wake runs on the event loop: publish, then show.
+    static PREPARED_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// Publishes the worker's completed reads and shows every pane where the
+/// controller's current view puts it.
+fn publish_completed(
+    app: &AppWindow,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+) {
+    let (frame_draw, plane_draw) = {
+        let controller = controller.lock().unwrap();
+        if !canvas
+            .borrow_mut()
+            .publish_prepared(controller.edited_view().as_ref())
+        {
+            return;
+        }
+        (controller.frame_draw(), controller.plane_draw())
+    };
+    show_panes(app, &canvas.borrow(), frame_draw, plane_draw);
+    // The textures were rendered into in place; Slint sees no property change.
+    app.window().request_redraw();
+}
+
+/// Sets each pane's source and placement from the texture it already holds,
+/// scaled and offset to `frame_draw`/`plane_draw`; a pane holding nothing is
+/// cleared rather than left showing the previous tab.
+fn show_panes(
+    app: &AppWindow,
+    canvas: &Canvas,
+    frame_draw: Option<PaneDraw>,
+    plane_draw: Option<PaneDraw>,
+) {
+    let renderer = canvas.renderer.as_ref();
+    let frame = frame_draw.and_then(|draw| {
+        let placed = renderer?.placement(Pane::Frame, &draw)?;
+        Some((draw, placed))
+    });
+    match frame {
+        Some((draw, (image, dst))) => {
+            app.set_frame_source(image);
+            app.set_frame_image_x(dst.0);
+            app.set_frame_image_y(dst.1);
+            app.set_frame_image_w(dst.2);
+            app.set_frame_image_h(dst.3);
+            app.set_pixelated(draw.pixelated);
+        }
+        None => {
+            app.set_frame_source(slint::Image::default());
+            app.set_frame_image_x(0.0);
+            app.set_frame_image_y(0.0);
+            app.set_frame_image_w(0.0);
+            app.set_frame_image_h(0.0);
+        }
+    }
+
+    let planes = plane_draw.and_then(|draw| {
+        let renderer = renderer?;
+        let plane = renderer.plane();
+        let placed = renderer.placement(plane.into(), &draw)?;
+        Some((draw, plane, placed))
+    });
+    match planes {
+        Some((draw, plane, (image, dst))) => {
+            match plane {
+                PaneSource::Composite => {
+                    app.set_composite_source(image);
+                    app.set_zmap_source(slint::Image::default());
+                }
+                PaneSource::ZMap => {
+                    app.set_zmap_source(image);
+                    app.set_composite_source(slint::Image::default());
+                }
+            }
+            app.set_image_x(dst.0);
+            app.set_image_y(dst.1);
+            app.set_image_w(dst.2);
+            app.set_image_h(dst.3);
+            app.set_pixelated(draw.pixelated);
+        }
+        None => {
+            app.set_composite_source(slint::Image::default());
+            app.set_zmap_source(slint::Image::default());
+            app.set_image_x(0.0);
+            app.set_image_y(0.0);
+            app.set_image_w(0.0);
+            app.set_image_h(0.0);
+        }
+    }
 }
 
 /// Reconciles the open renderer cell with the active tab
-/// ([`AppController::canvas_feed`]) and the selected frame, then draws both
-/// panes: the left pane's re-rendered frame with its own label and refusal
-/// text, the right pane's re-rendered composite/Z-Map pair, each with its
-/// own placement, plus `zoom-readout` and `project-loaded`. The one place a
-/// gesture, an active-tab change or a completed run becomes a repaint. With
-/// nothing to draw, a pane's source and placement are cleared rather than
-/// left showing the previous tab.
+/// ([`AppController::canvas_feed`]) and the selected frame, then places both
+/// panes from the textures they hold, scaled and offset to the new view, plus
+/// the frame label, `zoom-readout` and `project-loaded`. Exact samples are
+/// read on the worker and shown by publish_completed; nothing here reads a
+/// source. A pane holding nothing is cleared, not left on the previous tab.
 pub fn repaint(
     app: &AppWindow,
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
 ) {
     controller.lock().unwrap().flush_live_stroke();
+    let _repaint = measurement_scope("gui_repaint");
+    let _publication = take_published_input(InputSurface::Canvas).map(|batch| {
+        measurement_scope_with_fields(
+            "gui_canvas_publication",
+            batch.first,
+            batch.last,
+            batch.count,
+            batch.coalesced,
+            batch.incomplete,
+            batch.publication,
+        )
+    });
     let feed = {
         let loaded = canvas.borrow().tab();
         let mut controller = controller.lock().unwrap();
@@ -203,7 +376,17 @@ pub fn repaint(
         } => canvas.borrow_mut().load(tab, &composite, &zmap),
     }
 
-    let (frame_path, frame_view, frame_label, frame_draw, plane_draw, readout, project_loaded) = {
+    let (
+        frame_path,
+        frame_view,
+        frame_label,
+        frame_draw,
+        plane_draw,
+        readout,
+        project_loaded,
+        generation,
+        overlay,
+    ) = {
         let controller = controller.lock().unwrap();
         (
             controller.selected_frame_path(),
@@ -213,6 +396,8 @@ pub fn repaint(
             controller.plane_draw(),
             controller.zoom_readout(),
             controller.active_project().is_some(),
+            controller.edited_view().map(|view| view.tiles.generation()),
+            controller.overlay_draw(),
         )
     };
     canvas
@@ -225,59 +410,146 @@ pub fn repaint(
     app.set_frame_message(canvas.borrow().frame_error().unwrap_or("").into());
     push_brush_cursor(app, &controller.lock().unwrap());
 
-    let frame_redrawn = frame_draw.and_then(|draw| {
-        let mut canvas = canvas.borrow_mut();
-        let renderer = canvas.renderer.as_mut()?;
-        Some((draw, renderer.redraw_frame(&draw)?))
-    });
-    match frame_redrawn {
-        Some((draw, frame_image)) => {
-            app.set_frame_source(frame_image);
-            app.set_frame_image_x(draw.dst.0);
-            app.set_frame_image_y(draw.dst.1);
-            app.set_frame_image_w(draw.dst.2);
-            app.set_frame_image_h(draw.dst.3);
-            app.set_pixelated(draw.pixelated);
-        }
-        None => {
-            app.set_frame_source(slint::Image::default());
-            app.set_frame_image_x(0.0);
-            app.set_frame_image_y(0.0);
-            app.set_frame_image_w(0.0);
-            app.set_frame_image_h(0.0);
-        }
-    }
+    canvas.borrow_mut().request_reads(
+        frame_draw.as_ref(),
+        plane_draw.as_ref(),
+        generation,
+        overlay.as_ref(),
+    );
+    show_panes(app, &canvas.borrow(), frame_draw, plane_draw);
+}
 
-    let redrawn = plane_draw.and_then(|draw| {
-        let controller = controller.lock().unwrap();
-        let edited = controller.edited_view();
-        let overlay = controller.overlay_draw();
-        let mut canvas = canvas.borrow_mut();
-        let renderer = canvas.renderer.as_mut()?;
-        Some((
-            draw,
-            renderer.redraw_planes(&draw, edited, overlay.as_ref())?,
-        ))
-    });
-    match redrawn {
-        Some((draw, (composite_image, zmap_image))) => {
-            app.set_composite_source(composite_image);
-            app.set_zmap_source(zmap_image);
-            app.set_image_x(draw.dst.0);
-            app.set_image_y(draw.dst.1);
-            app.set_image_w(draw.dst.2);
-            app.set_image_h(draw.dst.3);
-            app.set_pixelated(draw.pixelated);
-        }
-        None => {
-            app.set_composite_source(slint::Image::default());
-            app.set_zmap_source(slint::Image::default());
-            app.set_image_x(0.0);
-            app.set_image_y(0.0);
-            app.set_image_w(0.0);
-            app.set_image_h(0.0);
-        }
+/// Emits the final pending input batch before diagnostics closes its trace.
+pub fn finish_input_trace() {
+    for batch in finish_input_batches().into_iter().flatten() {
+        let _scope = measurement_scope_with_fields(
+            "gui_publication_pending",
+            batch.first,
+            batch.last,
+            batch.count,
+            batch.coalesced,
+            batch.incomplete,
+            batch.publication,
+        );
     }
+}
+
+fn terminal_input_scope(kind: &'static str, batch: InputBatch) {
+    let _scope = measurement_scope_with_fields(
+        kind,
+        batch.first,
+        batch.last,
+        batch.count,
+        batch.coalesced,
+        batch.incomplete,
+        batch.publication,
+    );
+}
+
+fn direct_publication_scope(surface: InputSurface) {
+    if let Some(batch) = take_published_input(surface) {
+        terminal_input_scope("gui_direct_publication", batch);
+    }
+}
+
+fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::MeasurementScope> {
+    let surface = match event {
+        ShellEvent::WindowMaximizeToggled(_)
+        | ShellEvent::ModeChanged(_)
+        | ShellEvent::DockTabSelected(_)
+        | ShellEvent::DiagnosticsWriteFinished(_)
+        | ShellEvent::DiagnosticsScanFinished { .. }
+        | ShellEvent::JobChanged
+        | ShellEvent::LoadStarted
+        | ShellEvent::LoadReady
+        | ShellEvent::ImportReady => InputSurface::Other,
+        ShellEvent::ProjectsChanged
+        | ShellEvent::TabScrollChanged
+        | ShellEvent::QuestionRaised(_)
+        | ShellEvent::EntryRefused(_)
+        | ShellEvent::OverlayChanged
+        | ShellEvent::GalleryScrolled => InputSurface::Gallery,
+        ShellEvent::SettingsChanged | ShellEvent::SettingsScrolled => InputSurface::Settings,
+        ShellEvent::ImagesChanged | ShellEvent::ImagesScrolled => InputSurface::Images,
+        ShellEvent::EditorChanged => InputSurface::Other,
+        ShellEvent::WindowDragRequested
+        | ShellEvent::WindowMinimizeRequested
+        | ShellEvent::WindowCloseRequested
+        | ShellEvent::CheckpointExportRequested
+        | ShellEvent::PaneUndockRequested(_)
+        | ShellEvent::Input(_)
+        | ShellEvent::LoadProgress { .. } => return None,
+    };
+    take_published_input(surface).map(|batch| {
+        measurement_scope_with_fields(
+            "gui_model_publication",
+            batch.first,
+            batch.last,
+            batch.count,
+            batch.coalesced,
+            batch.incomplete,
+            batch.publication,
+        )
+    })
+}
+
+fn record_direct_input() {
+    let _scope = measurement_scope("gui_input_origin_unavailable");
+}
+
+fn record_settings_input() {
+    record_surface_input(InputSurface::Settings);
+}
+
+fn record_images_input() {
+    record_surface_input(InputSurface::Images);
+}
+
+fn record_gallery_input() {
+    record_surface_input(InputSurface::Gallery);
+}
+
+fn record_surface_input(surface: InputSurface) {
+    let sequence = record_input(surface);
+    let _scope = measurement_scope_with_fields(
+        "gui_input_callback",
+        sequence,
+        sequence,
+        1,
+        0,
+        input_trace_incomplete(),
+        0,
+    );
+}
+
+fn record_shared_surface_input(primary: InputSurface, secondary: InputSurface) {
+    let sequence = record_shared_input(primary, secondary);
+    let _scope = measurement_scope_with_fields(
+        "gui_input_callback",
+        sequence,
+        sequence,
+        1,
+        0,
+        input_trace_incomplete(),
+        0,
+    );
+}
+
+fn record_native_surface_input(surface: InputSurface) {
+    let sequence = record_input(surface);
+    let _scope = measurement_scope_with_fields(
+        "gui_native_callback",
+        sequence,
+        sequence,
+        1,
+        0,
+        input_trace_incomplete(),
+        0,
+    );
+}
+
+fn record_layout_callback() {
+    let _scope = measurement_scope("gui_layout_callback");
 }
 
 /// Locks `controller`, runs `mutate` against it, then repaints if the
@@ -288,9 +560,52 @@ fn dispatch(
     app_weak: &slint::Weak<AppWindow>,
     mutate: impl FnOnce(&mut AppController),
 ) {
+    let sequence = record_input(InputSurface::Canvas);
+    let _input = measurement_scope_with_fields(
+        "gui_input",
+        sequence,
+        sequence,
+        1,
+        0,
+        input_trace_incomplete(),
+        0,
+    );
     mutate(&mut controller.lock().unwrap());
     if let Some(app) = app_weak.upgrade() {
         repaint(&app, controller, canvas);
+    } else {
+        for batch in record_destroyed_window().into_iter().flatten() {
+            terminal_input_scope("gui_input_window_destroyed", batch);
+        }
+    }
+}
+
+fn dispatch_gallery(
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+    app_weak: &slint::Weak<AppWindow>,
+    mutate: impl FnOnce(&mut AppController),
+) {
+    dispatch_shared(InputSurface::Gallery, controller, canvas, app_weak, mutate);
+}
+
+/// [`dispatch`] for a callback whose input belongs to `surface` as well as
+/// the canvas it repaints.
+fn dispatch_shared(
+    surface: InputSurface,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+    app_weak: &slint::Weak<AppWindow>,
+    mutate: impl FnOnce(&mut AppController),
+) {
+    record_shared_surface_input(surface, InputSurface::Canvas);
+    mutate(&mut controller.lock().unwrap());
+    if let Some(app) = app_weak.upgrade() {
+        repaint(&app, controller, canvas);
+    } else {
+        for batch in record_destroyed_window().into_iter().flatten() {
+            terminal_input_scope("gui_input_window_destroyed", batch);
+        }
     }
 }
 
@@ -304,8 +619,19 @@ fn dispatch_coalesced(
     gate: &Rc<RepaintGate>,
     mutate: impl FnOnce(&mut AppController),
 ) {
+    let sequence = record_input(InputSurface::Canvas);
+    let _input = measurement_scope_with_fields(
+        "gui_input",
+        sequence,
+        sequence,
+        1,
+        0,
+        input_trace_incomplete(),
+        0,
+    );
     mutate(&mut controller.lock().unwrap());
     if !gate.request() {
+        record_coalesced_input(InputSurface::Canvas);
         return;
     }
     let (controller, canvas, app_weak, gate) = (
@@ -319,6 +645,10 @@ fn dispatch_coalesced(
             && let Some(app) = app_weak.upgrade()
         {
             repaint(&app, &controller, &canvas);
+        } else {
+            for batch in record_destroyed_window().into_iter().flatten() {
+                terminal_input_scope("gui_input_window_destroyed", batch);
+            }
         }
     });
 }
@@ -362,6 +692,7 @@ fn dispatch_manifest_scroll(
     };
     if let Some(app) = app_weak.upgrade() {
         app.set_diagnostics_manifest_scroll_offset(offset);
+        direct_publication_scope(InputSurface::Other);
     }
 }
 
@@ -569,9 +900,11 @@ fn start_job_timer(
     let timer = slint::Timer::default();
     let timer_slot = job_timer.clone();
     timer.start(slint::TimerMode::Repeated, job::POLL, move || {
+        let _poll = measurement_scope("gui_job_poll");
         let Some(app) = app_weak.upgrade() else {
             return;
         };
+        record_timing(TimingCounter::JobPolls, 1);
         let settled = controller.lock().unwrap().settle_job();
         if settled.is_some() {
             push_projects(&app, &controller);
@@ -663,60 +996,106 @@ fn heading_state_str(state: HeadingState) -> &'static str {
     }
 }
 
-/// Updates the settings panel's row model with `set_row_data` when the row
-/// count did not change, instead of handing `app` a freshly built
-/// `VecModel` every time: a fresh model resets the `for` loop's whole
-/// element tree, which drops a `TouchArea` mid-gesture and kills a slider
-/// drag after its first tick, where `set_row_data` keeps every element's
-/// identity. A row count change (a tab switch, an algorithm pick) still
-/// needs the fresh model, since the tree itself must grow or shrink. The
-/// one place `ShellEvent::SettingsChanged` is performed; also called from
+/// Brings the live `VecModel` behind `existing` to `rows` in place: trims or
+/// extends its tail and calls `set_row_data` only where a row differs, so an
+/// unchanged row keeps its element tree -- a fresh model would rebuild every
+/// row's tree and drop a `TouchArea` mid-gesture. Any other model is replaced
+/// through `install`. Returns how many rows were notified.
+fn sync_rows<T: Clone + PartialEq + 'static>(
+    existing: slint::ModelRc<T>,
+    rows: Vec<T>,
+    install: impl FnOnce(slint::ModelRc<T>),
+) -> usize {
+    let Some(model) = existing.as_any().downcast_ref::<slint::VecModel<T>>() else {
+        let count = rows.len();
+        install(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+        return count;
+    };
+    let mut updates = 0;
+    while model.row_count() > rows.len() {
+        model.remove(model.row_count() - 1);
+        updates += 1;
+    }
+    for (i, row) in rows.into_iter().enumerate() {
+        if i >= model.row_count() {
+            model.push(row);
+            updates += 1;
+        } else if model.row_data(i).as_ref() != Some(&row) {
+            model.set_row_data(i, row);
+            updates += 1;
+        }
+    }
+    updates
+}
+
+/// `live` when it already lists exactly `strings`, a fresh model otherwise:
+/// `ModelRc` equality is model identity, so only a kept model lets its row
+/// compare equal.
+fn retained_strings(
+    live: Option<slint::ModelRc<slint::SharedString>>,
+    strings: &[String],
+) -> slint::ModelRc<slint::SharedString> {
+    match live {
+        Some(model)
+            if model.row_count() == strings.len()
+                && model.iter().zip(strings).all(|(a, b)| a.as_str() == b) =>
+        {
+            model
+        }
+        _ => std::rc::Rc::new(slint::VecModel::from(
+            strings
+                .iter()
+                .map(slint::SharedString::from)
+                .collect::<Vec<_>>(),
+        ))
+        .into(),
+    }
+}
+
+/// Pushes the settings panel's rows through `sync_rows`, reusing each live
+/// row's choice models while their strings are unchanged. The one place
+/// `ShellEvent::SettingsChanged` is performed; also called from
 /// `push_projects` so a tab switch or close rebuilds the panel for the
 /// newly active tab. `pub` so a test can push a real, unmodified row set
 /// and then edit one row's own text without going through a live event.
 pub fn push_settings_panel(app: &AppWindow, controller: &AppController) {
+    let _scope = measurement_scope("gui_settings_rows");
     let panel = controller.settings_panel();
+    let existing = app.get_settings_rows();
     let rows: Vec<GeneratedSettingsRow> = panel
         .rows
         .iter()
-        .map(|row| GeneratedSettingsRow {
-            kind: row_kind_str(row.kind).into(),
-            section: row.section.clone().into(),
-            id: row.id.clone().into(),
-            label: row.label.clone().into(),
-            value_text: row.value_text.clone().into(),
-            fraction: row.fraction,
-            choices: std::rc::Rc::new(slint::VecModel::from(
-                row.choices
-                    .iter()
-                    .map(|s| s.clone().into())
-                    .collect::<Vec<slint::SharedString>>(),
-            ))
-            .into(),
-            choice_ids: std::rc::Rc::new(slint::VecModel::from(
-                row.choice_ids
-                    .iter()
-                    .map(|s| s.clone().into())
-                    .collect::<Vec<slint::SharedString>>(),
-            ))
-            .into(),
-            selected: row.selected.clone().into(),
-            menu_open: row.menu_open,
-            heading_state: heading_state_str(row.heading_state).into(),
-            top: row.top,
+        .enumerate()
+        .map(|(i, row)| {
+            let live = existing.row_data(i);
+            GeneratedSettingsRow {
+                kind: row_kind_str(row.kind).into(),
+                section: row.section.clone().into(),
+                id: row.id.clone().into(),
+                label: row.label.clone().into(),
+                value_text: row.value_text.clone().into(),
+                fraction: row.fraction,
+                choices: retained_strings(live.as_ref().map(|r| r.choices.clone()), &row.choices),
+                choice_ids: retained_strings(live.map(|r| r.choice_ids), &row.choice_ids),
+                selected: row.selected.clone().into(),
+                menu_open: row.menu_open,
+                heading_state: heading_state_str(row.heading_state).into(),
+                top: row.top,
+            }
         })
         .collect();
-    let existing = app.get_settings_rows();
-    if existing.row_count() == rows.len() {
-        for (i, row) in rows.into_iter().enumerate() {
-            existing.set_row_data(i, row);
-        }
-    } else {
-        app.set_settings_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
-    }
+    let updates = sync_rows(existing, rows, |model| app.set_settings_rows(model));
+    record_timing(TimingCounter::RowUpdates, updates as u64);
     app.set_settings_content_height(panel.content_height);
-    app.set_settings_scroll_y(panel.scroll_y);
+    push_settings_scroll(app, &panel);
+    app.set_settings_enabled(!controller.job_running());
+}
 
+/// Pushes the settings panel's scroll offset and sticky heading alone -- the
+/// one place `ShellEvent::SettingsScrolled` is performed. Rows sit in content
+/// space, so a scroll moves no row.
+pub fn push_settings_scroll(app: &AppWindow, panel: &PanelModel) {
+    app.set_settings_scroll_y(panel.scroll_y);
     let sticky = panel.sticky.map(|i| &panel.rows[i]);
     app.set_settings_sticky(SectionHeadView {
         visible: sticky.is_some(),
@@ -731,12 +1110,12 @@ pub fn push_settings_panel(app: &AppWindow, controller: &AppController) {
             .into(),
         push: panel.sticky_push,
     });
-    app.set_settings_enabled(!controller.job_running());
 }
 
 /// Pushes the `Images` panel's whole state -- [`push_settings_panel`]'s
 /// twin.
 pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
+    let _scope = measurement_scope("gui_image_rows");
     app.set_editor_enabled(controller.editor_enabled());
     let panel = controller.images_panel();
     let rows: Vec<GeneratedImageRow> = panel
@@ -748,22 +1127,16 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
             time_text: row.trailing_text.clone().into(),
             excluded: row.excluded,
             unresolved: row.unresolved,
-            top: row.top,
             selected: row.selected,
         })
         .collect();
-    let existing = app.get_images_rows();
-    if existing.row_count() == rows.len() {
-        for (i, row) in rows.into_iter().enumerate() {
-            existing.set_row_data(i, row);
-        }
-    } else {
-        app.set_images_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
-    }
+    let updates = sync_rows(app.get_images_rows(), rows, |model| {
+        app.set_images_rows(model)
+    });
+    record_timing(TimingCounter::RowUpdates, updates as u64);
     app.set_images_header_text(panel.header_text.into());
+    app.set_images_list_viewport_y(-controller.images_scroll_y());
     app.set_images_no_source_row(panel.no_source_row);
-    app.set_images_content_height(panel.content_height);
-    app.set_images_scroll_y(panel.scroll_y);
     let sort = match controller.frame_sort() {
         Some(crate::images::FrameSort::Name) => "name",
         Some(crate::images::FrameSort::CaptureTime) => "capture-time",
@@ -842,50 +1215,89 @@ fn push_divergence(app: &AppWindow, controller: &AppController) {
     }
 }
 
-/// A card picture, converted into an actual Slint image -- the one place
-/// `crate::overlay::Thumbnail` crosses into `slint::Image`. A blank 1x1
-/// image with no picture yet -- `FFProjectCard` only draws it when
-/// `has-picture` is set, so its content never shows.
-fn thumbnail_image(thumbnail: Option<&crate::overlay::Thumbnail>) -> slint::Image {
+/// A converted card picture per thumbnail, keyed by the thumbnail's `Arc`:
+/// a thumbnail changes only by being replaced, and the held `Weak` keeps its
+/// address from being reused while it is cached.
+type PictureCache = Vec<(std::sync::Weak<Thumbnail>, slint::Image)>;
+
+thread_local! {
+    /// The pictures of the cards the open overlay last showed.
+    static PICTURES: RefCell<PictureCache> = const { RefCell::new(Vec::new()) };
+}
+
+/// A card picture as a Slint image -- the one place
+/// `crate::overlay::Thumbnail` crosses into `slint::Image`: the `cached`
+/// handle when this same thumbnail was converted before, a fresh conversion
+/// otherwise. A blank 1x1 image with no picture yet -- `FFProjectCard` only
+/// draws it when `has-picture` is set, so its content never shows.
+fn thumbnail_image(thumbnail: Option<&Arc<Thumbnail>>, cached: &PictureCache) -> slint::Image {
     let Some(thumbnail) = thumbnail else {
         return slint::Image::default();
     };
+    if let Some((_, image)) = cached
+        .iter()
+        .find(|(weak, _)| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(thumbnail)))
+    {
+        return image.clone();
+    }
+    let _scope = measurement_scope("gui_thumbnail");
     let mut buffer =
         slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(thumbnail.width, thumbnail.height);
     buffer.make_mut_bytes().copy_from_slice(&thumbnail.rgba);
+    record_timing(TimingCounter::ThumbnailBytes, thumbnail.rgba.len() as u64);
     slint::Image::from_rgba8(buffer)
 }
 
 /// Pushes the projects overlay's whole state -- the one place
-/// `ShellEvent::OverlayChanged` is performed.
+/// `ShellEvent::OverlayChanged` is performed. A closed overlay publishes
+/// only that it is closed; opening it pushes again. Cards and Recent rows
+/// go through `sync_rows`, and each picture keeps its handle until its
+/// thumbnail is replaced or its card leaves.
 pub fn push_projects_overlay(app: &AppWindow, controller: &AppController) {
-    app.set_projects_overlay_open(controller.projects_overlay_open());
+    let _scope = measurement_scope("gui_projects_overlay");
+    let open = controller.projects_overlay_open();
+    app.set_projects_overlay_open(open);
+    if !open {
+        return;
+    }
     app.set_projects_save_enabled(controller.save_enabled());
     app.set_gallery_heading(controller.gallery_heading().into());
     app.set_gallery_count_text(controller.gallery_count_text().into());
+    let cached = PICTURES.take();
+    let mut pictures = PictureCache::new();
     let cards: Vec<GeneratedProjectCard> = controller
         .project_cards()
         .into_iter()
-        .map(|c| GeneratedProjectCard {
-            kind: c.kind.into(),
-            opened: c.opened,
-            current: c.current,
-            unsaved: c.unsaved,
-            fusing: c.fusing,
-            fusing_fraction: c.fusing_fraction,
-            project_name: c.project_name.into(),
-            meta_text: c.meta_text.into(),
-            headline: c.headline.into(),
-            stage: c.stage.into(),
-            reason: c.reason.into(),
-            action_label: c.action_label.into(),
-            has_picture: c.picture.is_some(),
-            picture: thumbnail_image(c.picture.as_deref()),
-            x: c.x,
-            y: c.y,
+        .map(|c| {
+            let picture = thumbnail_image(c.picture.as_ref(), &cached);
+            if let Some(thumbnail) = &c.picture {
+                pictures.push((Arc::downgrade(thumbnail), picture.clone()));
+            }
+            GeneratedProjectCard {
+                kind: c.kind.into(),
+                opened: c.opened,
+                current: c.current,
+                unsaved: c.unsaved,
+                fusing: c.fusing,
+                fusing_fraction: c.fusing_fraction,
+                project_name: c.project_name.into(),
+                meta_text: c.meta_text.into(),
+                headline: c.headline.into(),
+                stage: c.stage.into(),
+                reason: c.reason.into(),
+                action_label: c.action_label.into(),
+                has_picture: c.picture.is_some(),
+                picture,
+                x: c.x,
+                y: c.y,
+            }
         })
         .collect();
-    app.set_project_cards(std::rc::Rc::new(slint::VecModel::from(cards)).into());
+    PICTURES.set(pictures);
+    let updates = sync_rows(app.get_project_cards(), cards, |model| {
+        app.set_project_cards(model)
+    });
+    record_timing(TimingCounter::RowUpdates, updates as u64);
     app.set_gallery_content_height(controller.gallery_content_height_px());
     app.set_gallery_scroll_y(controller.gallery_scroll_y());
 
@@ -902,7 +1314,10 @@ pub fn push_projects_overlay(app: &AppWindow, controller: &AppController) {
             date_text: r.date_text.into(),
         })
         .collect();
-    app.set_recent_rows(std::rc::Rc::new(slint::VecModel::from(recent)).into());
+    let updates = sync_rows(app.get_recent_rows(), recent, |model| {
+        app.set_recent_rows(model)
+    });
+    record_timing(TimingCounter::RowUpdates, updates as u64);
 }
 
 /// Pushes a raised [`GroupingQuestion`] into `app`'s dialog properties.
@@ -963,6 +1378,7 @@ impl CustomApplicationHandler for DropHandler {
         event: &winit::event::WindowEvent,
     ) -> EventResult {
         if let winit::event::WindowEvent::DroppedFile(path) = event {
+            record_gallery_input();
             self.pending.push(path.clone());
         }
         EventResult::Propagate
@@ -1073,6 +1489,7 @@ fn save_project(
         );
     }
     push_projects(&app, controller);
+    direct_publication_scope(InputSurface::Gallery);
     repaint(&app, controller, canvas);
 }
 
@@ -1107,24 +1524,54 @@ pub fn install(
         }));
     }
 
+    {
+        let app_weak = app.as_weak();
+        let controller = controller.clone();
+        let canvas_for_handler = canvas.clone();
+        PREPARED_HANDLER.with(|slot| {
+            *slot.borrow_mut() = Some(Rc::new(move || {
+                if let Some(app) = app_weak.upgrade() {
+                    publish_completed(&app, &controller, &canvas_for_handler);
+                }
+            }));
+        });
+        // Errors are ignored like the sink's: no event loop, nobody to wake.
+        canvas.borrow_mut().preparer = Some(Preparer::new(|| {
+            let _ = slint::invoke_from_event_loop(|| {
+                if let Some(handler) = PREPARED_HANDLER.with(|slot| slot.borrow().clone()) {
+                    handler();
+                }
+            });
+        }));
+    }
+
     app.on_window_drag_requested({
         let controller = controller.clone();
-        move || controller.lock().unwrap().tab_strip_pressed()
+        move || {
+            record_direct_input();
+            controller.lock().unwrap().tab_strip_pressed()
+        }
     });
     app.on_window_minimize_requested({
         let controller = controller.clone();
-        move || controller.lock().unwrap().window_minimize()
+        move || {
+            record_direct_input();
+            controller.lock().unwrap().window_minimize()
+        }
     });
     app.on_window_maximize_toggled({
         let controller = controller.clone();
-        move || controller.lock().unwrap().window_maximize_toggle()
+        move || {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().window_maximize_toggle()
+        }
     });
     app.on_window_close_requested({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
+            dispatch_gallery(&controller, &canvas, &app_weak, |controller| {
                 controller.window_close();
             });
         }
@@ -1137,6 +1584,7 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
+            record_native_surface_input(InputSurface::Gallery);
             let keep_shown = {
                 let mut controller = controller.lock().unwrap();
                 controller.window_close();
@@ -1155,6 +1603,7 @@ pub fn install(
     app.on_mode_selected({
         let controller = controller.clone();
         move |mode| {
+            record_surface_input(InputSurface::Other);
             let mode = if mode.as_str() == "editor" {
                 ShellMode::Editor
             } else {
@@ -1166,6 +1615,7 @@ pub fn install(
     app.on_dock_tab_selected({
         let controller = controller.clone();
         move |tab| {
+            record_surface_input(InputSurface::Other);
             let tab = if tab.as_str() == "settings" {
                 DockTab::Settings
             } else {
@@ -1176,7 +1626,10 @@ pub fn install(
     });
     app.on_checkpoint_export_requested({
         let controller = controller.clone();
-        move || controller.lock().unwrap().checkpoint_export_requested()
+        move || {
+            record_direct_input();
+            controller.lock().unwrap().checkpoint_export_requested()
+        }
     });
     // The editor toolbar: each callback is a single forward into the
     // controller method already driving the matching input-map row.
@@ -1242,6 +1695,7 @@ pub fn install(
         let toast_timer = toast_timer.clone();
         let app_weak = app.as_weak();
         move || {
+            record_surface_input(InputSurface::Other);
             let started = controller.lock().unwrap().start_fuse();
             if started {
                 start_job_timer(
@@ -1256,11 +1710,17 @@ pub fn install(
     });
     app.on_pause_or_resume_requested({
         let controller = controller.clone();
-        move || controller.lock().unwrap().pause_or_resume()
+        move || {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().pause_or_resume()
+        }
     });
     app.on_cancel_requested({
         let controller = controller.clone();
-        move || controller.lock().unwrap().cancel_fuse()
+        move || {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().cancel_fuse()
+        }
     });
     app.on_retry_requested({
         let controller = controller.clone();
@@ -1269,6 +1729,7 @@ pub fn install(
         let toast_timer = toast_timer.clone();
         let app_weak = app.as_weak();
         move || {
+            record_surface_input(InputSurface::Other);
             let started = controller.lock().unwrap().retry_fuse();
             if started {
                 start_job_timer(
@@ -1284,6 +1745,7 @@ pub fn install(
     app.on_composite_undock_requested({
         let controller = controller.clone();
         move || {
+            record_direct_input();
             controller
                 .lock()
                 .unwrap()
@@ -1293,24 +1755,26 @@ pub fn install(
     app.on_zmap_undock_requested({
         let controller = controller.clone();
         move || {
+            record_direct_input();
             controller
                 .lock()
                 .unwrap()
                 .undock_requested(crate::canvas::PaneSource::ZMap)
         }
     });
+    let pointer_repaint = Rc::new(RepaintGate::default());
     app.on_canvas_scrolled({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let gate = pointer_repaint.clone();
         move |delta_x, delta_y, x, y, ctrl, shift, alt| {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
+            dispatch_coalesced(&controller, &canvas, &app_weak, &gate, |controller| {
                 let mods = modifiers(controller, ctrl, shift, alt);
                 controller.wheel(delta_x, delta_y, x, y, mods);
             });
         }
     });
-    let pointer_repaint = Rc::new(RepaintGate::default());
     app.on_canvas_pointer({
         let controller = controller.clone();
         let canvas = canvas.clone();
@@ -1355,6 +1819,7 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
+            record_layout_callback();
             if let Some(app) = app_weak.upgrade() {
                 let (left, right) = read_pane_geometry(&app);
                 controller.lock().unwrap().set_pane_geometry(left, right);
@@ -1399,22 +1864,29 @@ pub fn install(
                 ChromeKey::None => dispatch(&controller, &canvas, &app_weak, |controller| {
                     controller.key(true, text.as_str(), mods);
                 }),
-                ChromeKey::Consumed => {}
-                ChromeKey::NewProject => open_from_picker(
-                    &controller,
-                    &canvas,
-                    &app_weak,
-                    &load_timer,
-                    crate::picker::pick_entry(),
-                ),
-                ChromeKey::OpenProject => open_from_picker(
-                    &controller,
-                    &canvas,
-                    &app_weak,
-                    &load_timer,
-                    crate::picker::pick_project(),
-                ),
+                ChromeKey::Consumed => record_gallery_input(),
+                ChromeKey::NewProject => {
+                    record_surface_input(InputSurface::Other);
+                    open_from_picker(
+                        &controller,
+                        &canvas,
+                        &app_weak,
+                        &load_timer,
+                        crate::picker::pick_entry(),
+                    )
+                }
+                ChromeKey::OpenProject => {
+                    record_surface_input(InputSurface::Other);
+                    open_from_picker(
+                        &controller,
+                        &canvas,
+                        &app_weak,
+                        &load_timer,
+                        crate::picker::pick_project(),
+                    )
+                }
                 ChromeKey::SaveProject => {
+                    record_gallery_input();
                     save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
                         c.save_active_project(crate::picker::pick_save_project)
                     })
@@ -1425,6 +1897,7 @@ pub fn install(
     app.on_canvas_key_released({
         let controller = controller.clone();
         move |text, ctrl, shift, alt| {
+            record_direct_input();
             let mut controller = controller.lock().unwrap();
             let mods = modifiers(&controller, ctrl, shift, alt);
             controller.key(false, text.as_str(), mods);
@@ -1432,16 +1905,21 @@ pub fn install(
     });
     app.on_canvas_focus_changed({
         let controller = controller.clone();
-        move || controller.lock().unwrap().clear_input_modifiers()
+        move || {
+            record_direct_input();
+            controller.lock().unwrap().clear_input_modifiers()
+        }
     });
     app.on_settings_open_requested({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
+            record_settings_input();
             let open = controller.lock().unwrap().open_settings();
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_open(open);
+                direct_publication_scope(InputSurface::Settings);
                 repaint(&app, &controller, &canvas);
             }
         }
@@ -1451,9 +1929,11 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
+            record_settings_input();
             let open = controller.lock().unwrap().close_settings();
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_open(open);
+                direct_publication_scope(InputSurface::Settings);
                 repaint(&app, &controller, &canvas);
             }
         }
@@ -1462,6 +1942,7 @@ pub fn install(
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move |section| {
+            record_settings_input();
             let parsed = match section.as_str() {
                 "general" => SettingsSection::General,
                 "performance" => SettingsSection::Performance,
@@ -1473,6 +1954,7 @@ pub fn install(
             controller.lock().unwrap().select_settings_section(parsed);
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_section(section);
+                direct_publication_scope(InputSurface::Settings);
             }
         }
     });
@@ -1480,12 +1962,14 @@ pub fn install(
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move |include| {
+            record_surface_input(InputSurface::Other);
             // Detached: the rescan's own outcome reaches the window through
             // the sink, the same way `on_diagnostics_primary_clicked`'s
             // write does below.
             let _ = controller.lock().unwrap().set_include_minidumps(include);
             if let Some(app) = app_weak.upgrade() {
                 push_diagnostics_view(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
             }
         }
     });
@@ -1493,9 +1977,11 @@ pub fn install(
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move |text| {
+            record_surface_input(InputSurface::Other);
             controller.lock().unwrap().set_destination(text.as_str());
             if let Some(app) = app_weak.upgrade() {
                 push_diagnostics_view(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
             }
         }
     });
@@ -1503,12 +1989,14 @@ pub fn install(
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move |cursor_x, viewport_width| {
+            record_surface_input(InputSurface::Other);
             controller
                 .lock()
                 .unwrap()
                 .diagnostics_destination_cursor_moved(cursor_x, viewport_width);
             if let Some(app) = app_weak.upgrade() {
                 push_diagnostics_view(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
             }
         }
     });
@@ -1524,6 +2012,7 @@ pub fn install(
                 2 => PointerKind::Move,
                 _ => PointerKind::Up,
             };
+            record_surface_input(InputSurface::Other);
             dispatch_manifest_scroll(&controller, &app_weak, |c| {
                 c.manifest_scrollbar_pointer(kind, y)
             });
@@ -1533,6 +2022,7 @@ pub fn install(
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move |y| {
+            record_surface_input(InputSurface::Other);
             dispatch_manifest_scroll(&controller, &app_weak, |c| c.manifest_scrollbar_dragged(y));
         }
     });
@@ -1540,6 +2030,7 @@ pub fn install(
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move |height| {
+            record_layout_callback();
             dispatch_manifest_scroll(&controller, &app_weak, |c| {
                 c.set_manifest_viewport_height(height)
             });
@@ -1549,6 +2040,7 @@ pub fn install(
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move |delta| {
+            record_surface_input(InputSurface::Other);
             dispatch_manifest_scroll(&controller, &app_weak, |c| c.manifest_scrolled(delta));
         }
     });
@@ -1556,6 +2048,7 @@ pub fn install(
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move || {
+            record_surface_input(InputSurface::Other);
             // Detached: the write's own outcome reaches the window through
             // the sink, not through this handle. Every click starts a write
             // -- a finished bundle re-derives a fresh timestamped
@@ -1563,6 +2056,7 @@ pub fn install(
             let _ = controller.lock().unwrap().start_bundle_write();
             if let Some(app) = app_weak.upgrade() {
                 push_diagnostics_view(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
             }
         }
     });
@@ -1571,9 +2065,11 @@ pub fn install(
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move || {
+            record_surface_input(InputSurface::Other);
             controller.lock().unwrap().dismiss_crash_notice();
             if let Some(app) = app_weak.upgrade() {
                 push_crash_notice(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
             }
         }
     });
@@ -1581,12 +2077,14 @@ pub fn install(
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move || {
+            record_surface_input(InputSurface::Other);
             let open = controller.lock().unwrap().review_crashes();
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_open(open);
                 app.set_settings_section("diagnostics".into());
                 push_crash_notice(&app, &controller);
                 push_diagnostics_view(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
             }
         }
     });
@@ -1600,6 +2098,7 @@ pub fn install(
         let app_weak = app.as_weak();
         let load_timer = load_timer.clone();
         move || {
+            record_surface_input(InputSurface::Other);
             open_from_picker(
                 &controller,
                 &canvas,
@@ -1637,15 +2136,24 @@ pub fn install(
     });
     app.on_tab_scroll_left({
         let controller = controller.clone();
-        move || controller.lock().unwrap().scroll_tabs(-1)
+        move || {
+            record_gallery_input();
+            controller.lock().unwrap().scroll_tabs(-1)
+        }
     });
     app.on_tab_scroll_right({
         let controller = controller.clone();
-        move || controller.lock().unwrap().scroll_tabs(1)
+        move || {
+            record_gallery_input();
+            controller.lock().unwrap().scroll_tabs(1)
+        }
     });
     app.on_tab_region_width_changed({
         let controller = controller.clone();
-        move |width| controller.lock().unwrap().set_tab_region_width(width)
+        move |width| {
+            record_layout_callback();
+            controller.lock().unwrap().set_tab_region_width(width)
+        }
     });
     // A `changed` handler never fires for the initial value, so the
     // viewport's first measurement is read here once.
@@ -1659,6 +2167,7 @@ pub fn install(
         let app_weak = app.as_weak();
         let load_timer = load_timer.clone();
         move || {
+            record_gallery_input();
             let _ = controller
                 .lock()
                 .unwrap()
@@ -1669,6 +2178,7 @@ pub fn install(
             // and the next `push_projects` reopens the dialog.
             if let Some(app) = app_weak.upgrade() {
                 app.set_question_open(false);
+                direct_publication_scope(InputSurface::Gallery);
                 repaint(&app, &controller, &canvas);
             }
             start_load_timer(
@@ -1686,12 +2196,14 @@ pub fn install(
         let app_weak = app.as_weak();
         let load_timer = load_timer.clone();
         move || {
+            record_gallery_input();
             let _ = controller
                 .lock()
                 .unwrap()
                 .answer_question(OpenAs::NProjects);
             if let Some(app) = app_weak.upgrade() {
                 app.set_question_open(false);
+                direct_publication_scope(InputSurface::Gallery);
                 repaint(&app, &controller, &canvas);
             }
             start_load_timer(
@@ -1708,9 +2220,11 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
+            record_gallery_input();
             controller.lock().unwrap().cancel_question();
             if let Some(app) = app_weak.upgrade() {
                 app.set_question_open(false);
+                direct_publication_scope(InputSurface::Gallery);
                 repaint(&app, &controller, &canvas);
             }
         }
@@ -1721,9 +2235,11 @@ pub fn install(
         let app_weak = app.as_weak();
         let load_timer = load_timer.clone();
         move || {
+            record_gallery_input();
             controller.lock().unwrap().dismiss_refusal();
             if let Some(app) = app_weak.upgrade() {
                 app.set_refusal_open(false);
+                direct_publication_scope(InputSurface::Gallery);
                 repaint(&app, &controller, &canvas);
             }
             open_from_picker(
@@ -1739,17 +2255,21 @@ pub fn install(
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move || {
+            record_gallery_input();
             controller.lock().unwrap().dismiss_notice();
             if let Some(app) = app_weak.upgrade() {
                 app.set_skipped_notice("".into());
+                direct_publication_scope(InputSurface::Gallery);
             }
         }
     });
     app.on_job_toast_dismissed({
         let app_weak = app.as_weak();
         move || {
+            record_surface_input(InputSurface::Other);
             if let Some(app) = app_weak.upgrade() {
                 app.set_job_toast_open(false);
+                direct_publication_scope(InputSurface::Other);
             }
         }
     });
@@ -1760,6 +2280,7 @@ pub fn install(
     app.on_settings_param_changed({
         let controller = controller.clone();
         move |section, id, fraction| {
+            record_settings_input();
             controller
                 .lock()
                 .unwrap()
@@ -1769,6 +2290,7 @@ pub fn install(
     app.on_settings_param_text_edited({
         let controller = controller.clone();
         move |section, id, text| {
+            record_settings_input();
             controller
                 .lock()
                 .unwrap()
@@ -1778,6 +2300,7 @@ pub fn install(
     app.on_settings_algorithm_selected({
         let controller = controller.clone();
         move |section, id| {
+            record_settings_input();
             let mut controller = controller.lock().unwrap();
             if section.as_str() == "align" {
                 controller.set_align_algorithm(id.as_str());
@@ -1788,11 +2311,15 @@ pub fn install(
     });
     app.on_settings_reset_all({
         let controller = controller.clone();
-        move || controller.lock().unwrap().reset_all_sections()
+        move || {
+            record_settings_input();
+            controller.lock().unwrap().reset_all_sections()
+        }
     });
     app.on_settings_menu_toggled({
         let controller = controller.clone();
         move |section, id| {
+            record_settings_input();
             controller
                 .lock()
                 .unwrap()
@@ -1801,11 +2328,15 @@ pub fn install(
     });
     app.on_settings_scrolled({
         let controller = controller.clone();
-        move |delta| controller.lock().unwrap().scroll_settings_panel(delta)
+        move |delta| {
+            record_settings_input();
+            controller.lock().unwrap().scroll_settings_panel(delta)
+        }
     });
     app.on_settings_scrollbar_pointer({
         let controller = controller.clone();
         move |kind, y| {
+            record_settings_input();
             // `ui/components/ff_scrollbar.slint`'s own fold of
             // `PointerEventKind`, the same convention as `canvas.slint`'s:
             // 0 = Down, 1 = Up or Cancel, 2 = Move.
@@ -1819,11 +2350,15 @@ pub fn install(
     });
     app.on_settings_scrollbar_dragged({
         let controller = controller.clone();
-        move |y| controller.lock().unwrap().scrollbar_dragged(y)
+        move |y| {
+            record_settings_input();
+            controller.lock().unwrap().scrollbar_dragged(y)
+        }
     });
     app.on_settings_viewport_height_changed({
         let controller = controller.clone();
         move |height| {
+            record_layout_callback();
             controller
                 .lock()
                 .unwrap()
@@ -1831,6 +2366,18 @@ pub fn install(
         }
     });
 
+    // The `Images` panel's own scroll -- `FFScrollbar`'s twin wiring above.
+    // The list scrolls itself; the controller mirrors the offset. A move
+    // the scrollbar path already caused is not counted as a second input.
+    app.on_images_viewport_scrolled({
+        let controller = controller.clone();
+        move |offset| {
+            if controller.lock().unwrap().images_viewport_scrolled(offset) {
+                record_images_input();
+                direct_publication_scope(InputSurface::Images);
+            }
+        }
+    });
     // A plain wheel over the `Images` list steps the selected/brush-source
     // frame -- the same effect `Ctrl + Wheel` over the canvas has, so this
     // also needs a repaint.
@@ -1847,6 +2394,7 @@ pub fn install(
     app.on_images_scrollbar_pointer({
         let controller = controller.clone();
         move |kind, y| {
+            record_images_input();
             let kind = match kind {
                 0 => PointerKind::Down,
                 2 => PointerKind::Move,
@@ -1857,11 +2405,15 @@ pub fn install(
     });
     app.on_images_scrollbar_dragged({
         let controller = controller.clone();
-        move |y| controller.lock().unwrap().images_scrollbar_dragged(y)
+        move |y| {
+            record_images_input();
+            controller.lock().unwrap().images_scrollbar_dragged(y)
+        }
     });
     app.on_images_viewport_height_changed({
         let controller = controller.clone();
         move |height| {
+            record_layout_callback();
             controller
                 .lock()
                 .unwrap()
@@ -1874,6 +2426,7 @@ pub fn install(
         let app_weak = app.as_weak();
         let toast_timer = toast_timer.clone();
         move || {
+            record_images_input();
             if let Some(paths) = crate::picker::pick_frames() {
                 let mut refused = None;
                 dispatch(&controller, &canvas, &app_weak, |controller| {
@@ -1889,13 +2442,17 @@ pub fn install(
     });
     app.on_images_sort_menu_toggled({
         let controller = controller.clone();
-        move || controller.lock().unwrap().toggle_images_sort_menu()
+        move || {
+            record_images_input();
+            controller.lock().unwrap().toggle_images_sort_menu()
+        }
     });
     app.on_images_sort_selected({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move |id| {
+            record_images_input();
             let sort = match id.as_str() {
                 "capture-time" => crate::images::FrameSort::CaptureTime,
                 _ => crate::images::FrameSort::Name,
@@ -1907,7 +2464,10 @@ pub fn install(
     });
     app.on_images_frame_excluded_toggled({
         let controller = controller.clone();
-        move |i| controller.lock().unwrap().toggle_frame_excluded(i as usize)
+        move |i| {
+            record_images_input();
+            controller.lock().unwrap().toggle_frame_excluded(i as usize)
+        }
     });
     app.on_images_frame_selected({
         let controller = controller.clone();
@@ -1934,9 +2494,15 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
-                controller.cancel_frame_change();
-            });
+            dispatch_shared(
+                InputSurface::Images,
+                &controller,
+                &canvas,
+                &app_weak,
+                |controller| {
+                    controller.cancel_frame_change();
+                },
+            );
         }
     });
     app.on_frame_warning_confirmed({
@@ -1955,10 +2521,13 @@ pub fn install(
             let mut controller = controller.lock().unwrap();
             let copy = controller.pending_frame_change();
             if copy.as_ref().is_some_and(|c| c.keep_existing_button) {
+                record_images_input();
                 controller.keep_existing();
             } else if copy.is_some_and(|c| c.exclude_instead_button) {
+                record_images_input();
                 controller.exclude_instead();
             } else {
+                record_gallery_input();
                 controller.new_project_instead();
             }
         }
@@ -1992,7 +2561,7 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
+            dispatch_gallery(&controller, &canvas, &app_weak, |controller| {
                 controller.close_guard_cancelled();
             });
         }
@@ -2003,6 +2572,7 @@ pub fn install(
         let app_weak = app.as_weak();
         let toast_timer = toast_timer.clone();
         move || {
+            record_gallery_input();
             save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
                 c.close_guard_secondary_pressed(crate::picker::pick_save_project)
             })
@@ -2013,7 +2583,7 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
-            dispatch(
+            dispatch_gallery(
                 &controller,
                 &canvas,
                 &app_weak,
@@ -2029,7 +2599,7 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
+            dispatch_gallery(&controller, &canvas, &app_weak, |controller| {
                 controller.toggle_projects_overlay();
             });
         }
@@ -2042,6 +2612,7 @@ pub fn install(
         let app_weak = app.as_weak();
         let load_timer = load_timer.clone();
         move || {
+            record_gallery_input();
             open_from_picker(
                 &controller,
                 &canvas,
@@ -2057,6 +2628,7 @@ pub fn install(
         let app_weak = app.as_weak();
         let load_timer = load_timer.clone();
         move || {
+            record_gallery_input();
             open_from_picker(
                 &controller,
                 &canvas,
@@ -2072,6 +2644,7 @@ pub fn install(
         let app_weak = app.as_weak();
         let toast_timer = toast_timer.clone();
         move || {
+            record_gallery_input();
             save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
                 c.save_active_project(crate::picker::pick_save_project)
             })
@@ -2082,7 +2655,7 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
+            dispatch_gallery(&controller, &canvas, &app_weak, |controller| {
                 if let Some(i) = controller.active_project() {
                     controller.request_close(i);
                 }
@@ -2094,7 +2667,7 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move |i| {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
+            dispatch_gallery(&controller, &canvas, &app_weak, |controller| {
                 controller.select_gallery_card(i as usize);
             })
         }
@@ -2105,6 +2678,7 @@ pub fn install(
         let app_weak = app.as_weak();
         let load_timer = load_timer.clone();
         move |i| {
+            record_gallery_input();
             open_recent(&controller, &canvas, &app_weak, &load_timer, i as usize);
         }
     });
@@ -2113,7 +2687,7 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move |i| {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
+            dispatch_gallery(&controller, &canvas, &app_weak, |controller| {
                 controller.request_close(i as usize);
             })
         }
@@ -2133,11 +2707,13 @@ pub fn install(
             let kind = controller.lock().unwrap().gallery_failure_kind(i);
             match kind {
                 Some("sources-missing") => {
+                    record_gallery_input();
                     if let Some(folder) = crate::picker::pick_entry() {
                         controller.lock().unwrap().locate_missing_sources(i, folder);
                     }
                 }
                 Some("failed") | Some("cancelled") => {
+                    record_surface_input(InputSurface::Other);
                     let started = controller.lock().unwrap().run_gallery_action(i);
                     if started {
                         start_job_timer(
@@ -2149,17 +2725,21 @@ pub fn install(
                         );
                     }
                 }
-                _ => {}
+                _ => record_direct_input(),
             }
         }
     });
     app.on_gallery_scrolled({
         let controller = controller.clone();
-        move |delta| controller.lock().unwrap().scroll_gallery(delta)
+        move |delta| {
+            record_gallery_input();
+            controller.lock().unwrap().scroll_gallery(delta)
+        }
     });
     app.on_gallery_scrollbar_pointer({
         let controller = controller.clone();
         move |kind, y| {
+            record_gallery_input();
             let kind = match kind {
                 0 => PointerKind::Down,
                 2 => PointerKind::Move,
@@ -2173,11 +2753,15 @@ pub fn install(
     });
     app.on_gallery_scrollbar_dragged({
         let controller = controller.clone();
-        move |y| controller.lock().unwrap().gallery_scrollbar_dragged(y)
+        move |y| {
+            record_gallery_input();
+            controller.lock().unwrap().gallery_scrollbar_dragged(y)
+        }
     });
     app.on_gallery_viewport_height_changed({
         let controller = controller.clone();
         move |height| {
+            record_layout_callback();
             controller
                 .lock()
                 .unwrap()
@@ -2188,6 +2772,7 @@ pub fn install(
         let controller = controller.clone();
         let app_weak = app.as_weak();
         move |width| {
+            record_layout_callback();
             controller.lock().unwrap().set_gallery_width(width);
             if let Some(app) = app_weak.upgrade() {
                 push_projects_overlay(&app, &controller.lock().unwrap());
@@ -2205,6 +2790,7 @@ pub fn install(
     app.on_images_frame_grip_pointer({
         let controller = controller.clone();
         move |i, kind, y| {
+            record_images_input();
             let kind = match kind {
                 0 => PointerKind::Down,
                 2 => PointerKind::Move,
@@ -2227,6 +2813,7 @@ pub fn install(
 /// Performs one [`ShellEvent`] against the window. The only function in the
 /// crate that names `winit`.
 fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: ShellEvent) {
+    let _publication = model_publication_scope(&event);
     match event {
         ShellEvent::WindowDragRequested => {
             // Both results discarded deliberately: `with_winit_window`
@@ -2313,6 +2900,9 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::QuestionRaised(question) => push_question(app, &question),
         ShellEvent::EntryRefused(_) => app.set_refusal_open(true),
         ShellEvent::SettingsChanged => push_settings_panel(app, &controller.lock().unwrap()),
+        ShellEvent::SettingsScrolled => {
+            push_settings_scroll(app, &controller.lock().unwrap().settings_panel());
+        }
         ShellEvent::JobChanged => {
             let controller = controller.lock().unwrap();
             push_job(app, &controller.job_view());
@@ -2328,8 +2918,14 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             push_divergence(app, &controller);
         }
         ShellEvent::ImagesChanged => push_images_panel(app, &controller.lock().unwrap()),
+        ShellEvent::ImagesScrolled => {
+            app.set_images_list_viewport_y(-controller.lock().unwrap().images_scroll_y());
+        }
         ShellEvent::EditorChanged => push_editor_toolbar(app, &controller.lock().unwrap()),
         ShellEvent::OverlayChanged => push_projects_overlay(app, &controller.lock().unwrap()),
+        ShellEvent::GalleryScrolled => {
+            app.set_gallery_scroll_y(controller.lock().unwrap().gallery_scroll_y());
+        }
         // A background load's own three events (`AppController::open_paths`).
         // The indicator's threshold and fade are the Slint region's own
         // state, driven by `load-active` alone -- it shows no other part of
@@ -2365,5 +2961,206 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             controller.settle_import();
             push_images_panel(app, &controller);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use crate::diagnostics::{enable_trace_accounting, timing_snapshot};
+
+    use super::{
+        AppController, DockTab, ShellEvent, finish_input_trace, model_publication_scope,
+        record_gallery_input, record_images_input, record_settings_input, record_surface_input,
+    };
+    use crate::diagnostics::{
+        InputSurface, finish_input_batches, record_coalesced_input, record_destroyed_window,
+        record_input, take_published_input,
+    };
+
+    #[test]
+    fn controller_events_publish_matching_batches_and_finish_flushes_pending_input() {
+        const CHILD: &str = "FOCUSFORGE_GUI_INPUT_TRACE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("the test binary has a path"),
+            )
+            .args([
+                "--exact",
+                "bridge::tests::controller_events_publish_matching_batches_and_finish_flushes_pending_input",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("the isolated accounting test starts");
+            assert!(
+                status.success(),
+                "the isolated accounting test passes: {status}"
+            );
+            return;
+        }
+
+        assert!(timing_snapshot().is_none());
+        assert_eq!(record_input(InputSurface::Settings), 0);
+        record_coalesced_input(InputSurface::Settings);
+        record_images_input();
+        record_settings_input();
+        record_images_input();
+        record_gallery_input();
+        assert_eq!(take_published_input(InputSurface::Settings), None);
+        assert_eq!(record_destroyed_window(), [None, None, None, None, None]);
+        assert_eq!(finish_input_batches(), [None, None, None, None, None]);
+
+        enable_trace_accounting();
+        let _ = finish_input_batches();
+        let before = timing_snapshot().expect("trace accounting is enabled");
+
+        assert_ne!(record_input(InputSurface::Canvas), 0);
+        record_coalesced_input(InputSurface::Canvas);
+        record_coalesced_input(InputSurface::Canvas);
+        let burst = take_published_input(InputSurface::Canvas).expect("the first canvas drain");
+        assert_eq!((burst.count, burst.coalesced), (1, 2));
+        assert_ne!(record_input(InputSurface::Canvas), 0);
+        record_coalesced_input(InputSurface::Canvas);
+        let pending = finish_input_batches()[0].expect("the terminal canvas drain");
+        assert_eq!((pending.count, pending.coalesced), (1, 1));
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        record_images_input();
+        assert!(
+            model_publication_scope(&ShellEvent::ImagesChanged).is_some(),
+            "an Images callback must drain when its Images update is published"
+        );
+        let mut controller = AppController::new();
+        controller.set_sink(Arc::new({
+            let events = events.clone();
+            move |event| {
+                assert!(model_publication_scope(&event).is_some());
+                events.lock().unwrap().push(event);
+            }
+        }));
+        record_surface_input(InputSurface::Other);
+        controller.select_dock_tab(DockTab::Images);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[ShellEvent::DockTabSelected(DockTab::Images)]
+        );
+        assert_eq!(finish_input_batches(), [None, None, None, None, None]);
+
+        record_settings_input();
+        record_images_input();
+        record_gallery_input();
+        assert!(model_publication_scope(&ShellEvent::SettingsChanged).is_some());
+        assert_eq!(
+            finish_input_batches(),
+            [
+                None,
+                None,
+                Some(crate::diagnostics::InputBatch {
+                    first: 6,
+                    last: 6,
+                    count: 1,
+                    coalesced: 0,
+                    incomplete: false,
+                    publication: 0,
+                }),
+                Some(crate::diagnostics::InputBatch {
+                    first: 7,
+                    last: 7,
+                    count: 1,
+                    coalesced: 0,
+                    incomplete: false,
+                    publication: 0,
+                }),
+                None,
+            ]
+        );
+
+        record_gallery_input();
+        finish_input_trace();
+        assert_eq!(finish_input_batches(), [None, None, None, None, None]);
+        let after = timing_snapshot().expect("trace accounting remains enabled");
+        assert_eq!(after.admitted, before.admitted + 10);
+    }
+
+    /// Drives the real generated Images callbacks through an installed,
+    /// headless window, so a misrouted callback (e.g. to `Other`) fails it.
+    #[test]
+    fn images_callbacks_invoked_through_the_real_window_record_the_images_surface() {
+        const CHILD: &str = "FOCUSFORGE_GUI_IMAGES_CALLBACK_TRACE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("the test binary has a path"),
+            )
+            .args([
+                "--exact",
+                "bridge::tests::images_callbacks_invoked_through_the_real_window_record_the_images_surface",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("the isolated callback-routing test starts");
+            assert!(
+                status.success(),
+                "the isolated callback-routing test passes: {status}"
+            );
+            return;
+        }
+
+        i_slint_backend_testing::init_no_event_loop();
+        enable_trace_accounting();
+
+        let app = super::AppWindow::new().unwrap();
+        let mut opened = AppController::new();
+        let frames = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/mantis-512/frames");
+        if let Some(load) = opened.open_paths(&[frames]) {
+            load.join().expect("the load worker did not panic");
+        }
+        opened.settle_open().expect("the fixture load settles");
+        opened.set_images_viewport_height(crate::images::ROW_HEIGHT);
+        let controller = Arc::new(Mutex::new(opened));
+        let canvas = std::rc::Rc::new(std::cell::RefCell::new(super::Canvas::default()));
+        let _installed = super::install(
+            &app,
+            controller.clone(),
+            canvas,
+            std::rc::Rc::new(std::cell::RefCell::new(None)),
+        );
+
+        app.invoke_images_frame_excluded_toggled(0);
+        app.invoke_frame_warning_cancelled();
+
+        let batches = finish_input_batches();
+        let images = batches[2].expect("both real callbacks must record under the Images surface");
+        assert_eq!(images.count, 2);
+        assert!(
+            batches[0].is_none()
+                && batches[1].is_none()
+                && batches[3].is_none()
+                && batches[4].is_none(),
+            "neither callback may be recorded under any other surface: {batches:?}"
+        );
+
+        // A list scroll that moved is one Images input, published at once;
+        // the offset the controller already holds is no input at all.
+        app.invoke_images_viewport_scrolled(crate::images::ROW_HEIGHT);
+        app.invoke_images_viewport_scrolled(crate::images::ROW_HEIGHT);
+        app.invoke_images_frame_excluded_toggled(0);
+        let batches = finish_input_batches();
+        let toggle = batches[2].expect("the toggle records under the Images surface");
+        assert_eq!(
+            (toggle.count, toggle.first),
+            (1, images.last + 2),
+            "exactly one input between the two toggles: {batches:?}"
+        );
+        assert!(
+            batches[0].is_none()
+                && batches[1].is_none()
+                && batches[3].is_none()
+                && batches[4].is_none(),
+            "the scroll records under no other surface: {batches:?}"
+        );
     }
 }

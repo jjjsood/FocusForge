@@ -13,14 +13,19 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
+use focusforge_core::TiffError;
 use focusforge_core::algorithm::{AlgorithmError, read_tile_step_into};
 use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::display::alpha_from_opacity;
-use focusforge_core::io::{FrameError, FrameReader, open_frame_set};
+use focusforge_core::io::{FrameError, FrameReader, TiffStack, open_frame_set};
 use focusforge_core::retouch::{RetouchError, Sources, recomposite as recomposite_region};
 use focusforge_core::tile::{HostBudget, Rect};
-use focusforge_core::zmap::overlay_table;
+use focusforge_core::timing::{TimingCounter, record_timing};
+use focusforge_core::zmap::{ZMapError, ZMapReader, overlay_table};
+
+use crate::viewport::PaneDraw;
 
 /// What the open renderer cell should do for the frame about to draw --
 /// [`crate::controller::AppController::canvas_feed`]'s answer, decided with
@@ -125,7 +130,7 @@ pub struct FrameView {
 /// fuse itself would read it, not narrowed to the mmap fast path.
 #[derive(Default)]
 pub struct FrameSource {
-    open: Option<(PathBuf, Box<dyn FrameReader>, Option<FrameView>)>,
+    open: Option<(PathBuf, Arc<dyn FrameReader>, Option<FrameView>)>,
 }
 
 impl FrameSource {
@@ -140,7 +145,7 @@ impl FrameSource {
     ) -> Result<(), FrameError> {
         self.open = None;
         let set = open_frame_set(std::slice::from_ref(&path.to_path_buf()), budget)?;
-        self.open = Some((path.to_path_buf(), set.reader, view));
+        self.open = Some((path.to_path_buf(), Arc::from(set.reader), view));
         Ok(())
     }
 
@@ -175,6 +180,17 @@ impl FrameSource {
             .map(|(_, reader, _)| reader.frame(0).samples_per_pixel)
     }
 
+    /// The open frame as [`Self::read_into`] reads it -- warped by the
+    /// recorded view -- shared with a preparation worker's reads.
+    pub fn reader(&self) -> Option<Arc<dyn PaneReader>> {
+        self.open.as_ref().map(|(_, reader, view)| {
+            Arc::new(WarpedFrame {
+                reader: reader.clone(),
+                view: *view,
+            }) as Arc<dyn PaneReader>
+        })
+    }
+
     /// Reads every `step`-th row and column of `rect` into `out`, warped by
     /// the recorded view's transform and offset by its crop origin -- an
     /// identity transform at origin `(0, 0)` with no view set. Callers check
@@ -190,22 +206,59 @@ impl FrameSource {
             .open
             .as_ref()
             .expect("read_into is only called once a frame is confirmed open");
-        let (transform, origin) = view
-            .map(|v| (v.transform, v.origin))
-            .unwrap_or((Transform::identity(), (0, 0)));
-        let samples_per_pixel = reader.frame(0).samples_per_pixel;
-        let warped = WarpingReader::new(
-            &**reader,
-            reader.dimensions(),
-            samples_per_pixel,
-            vec![transform],
-        );
-        let shifted = Rect {
-            x: rect.x + origin.0,
-            y: rect.y + origin.1,
-            ..rect
-        };
-        read_tile_step_into(&warped, 0, shifted, step, samples_per_pixel, out)
+        read_warped(&**reader, *view, rect, step, out)
+    }
+}
+
+/// Reads every `step`-th row and column of `rect` from `reader`'s frame 0,
+/// warped by `view`'s transform and offset by its crop origin. Without a
+/// `view` the frame is read directly: an identity warp returns the same
+/// samples but reads and converts about twice the data.
+fn read_warped(
+    reader: &dyn FrameReader,
+    view: Option<FrameView>,
+    rect: Rect,
+    step: NonZeroU32,
+    out: &mut [u16],
+) -> Result<(), AlgorithmError> {
+    let samples_per_pixel = reader.frame(0).samples_per_pixel;
+    let Some(view) = view else {
+        return reader.read_tile_step_into(0, rect, step, samples_per_pixel, out);
+    };
+    let (transform, origin) = (view.transform, view.origin);
+    let warped = WarpingReader::new(
+        reader,
+        reader.dimensions(),
+        samples_per_pixel,
+        vec![transform],
+    );
+    let shifted = Rect {
+        x: rect.x + origin.0,
+        y: rect.y + origin.1,
+        ..rect
+    };
+    read_tile_step_into(&warped, 0, shifted, step, samples_per_pixel, out)
+}
+
+/// One open frame plus the view it is warped through, readable from a
+/// worker thread with exactly [`FrameSource::read_into`]'s semantics.
+struct WarpedFrame {
+    reader: Arc<dyn FrameReader>,
+    view: Option<FrameView>,
+}
+
+impl PaneReader for WarpedFrame {
+    fn samples_per_pixel(&self) -> u32 {
+        self.reader.frame(0).samples_per_pixel
+    }
+
+    fn read_step_into(
+        &self,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [u16],
+    ) -> Result<(), PaneReadError> {
+        Ok(read_warped(&*self.reader, self.view, rect, step, out)?)
     }
 }
 
@@ -260,6 +313,346 @@ pub fn truncate_pane_label(label: &str) -> String {
     let kept = PANE_LABEL_MAX_CHARS - 1;
     let tail: String = chars[chars.len() - kept..].iter().collect();
     format!("\u{2026}{tail}")
+}
+
+/// Grows `scratch` to at least `len` elements, recording [`SampleBytes`]
+/// only when its capacity actually grows -- a draw whose sample count stays
+/// within an already-reached capacity costs nothing here.
+///
+/// [`SampleBytes`]: TimingCounter::SampleBytes
+pub(crate) fn grow_scratch(scratch: &mut Vec<u16>, len: usize) -> &mut [u16] {
+    let capacity_before = scratch.capacity();
+    scratch.resize(len, 0);
+    if scratch.capacity() > capacity_before {
+        record_timing(
+            TimingCounter::SampleBytes,
+            (scratch.capacity() * std::mem::size_of::<u16>()) as u64,
+        );
+    }
+    &mut scratch[..len]
+}
+
+/// What went wrong reading one pane's samples.
+#[derive(Debug, thiserror::Error)]
+pub enum PaneReadError {
+    #[error(transparent)]
+    Tiff(#[from] TiffError),
+    #[error(transparent)]
+    ZMap(#[from] ZMapError),
+    #[error(transparent)]
+    Frame(#[from] AlgorithmError),
+}
+
+/// A source one pane draws from, readable from a worker thread.
+pub trait PaneReader: Send + Sync {
+    /// Samples per pixel of what [`Self::read_step_into`] writes.
+    fn samples_per_pixel(&self) -> u32;
+
+    /// Reads every `step`-th row and column of `rect` into `out`
+    /// (`rect.width.div_ceil(step) * rect.height.div_ceil(step)` pixels).
+    fn read_step_into(
+        &self,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [u16],
+    ) -> Result<(), PaneReadError>;
+}
+
+impl PaneReader for TiffStack {
+    fn samples_per_pixel(&self) -> u32 {
+        self.header(0).samples_per_pixel
+    }
+
+    fn read_step_into(
+        &self,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [u16],
+    ) -> Result<(), PaneReadError> {
+        Ok(self.read_tile_step_into(0, rect, step, out)?)
+    }
+}
+
+impl PaneReader for ZMapReader {
+    fn samples_per_pixel(&self) -> u32 {
+        1
+    }
+
+    fn read_step_into(
+        &self,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [u16],
+    ) -> Result<(), PaneReadError> {
+        Ok(self.read_tile_step_into(rect, step, out)?)
+    }
+}
+
+/// The canvas surfaces that draw from a [`PaneReader`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Frame,
+    Composite,
+    ZMap,
+}
+
+impl From<PaneSource> for Pane {
+    fn from(plane: PaneSource) -> Self {
+        match plane {
+            PaneSource::Composite => Pane::Composite,
+            PaneSource::ZMap => Pane::ZMap,
+        }
+    }
+}
+
+/// One pane's view to read: what to read, the stamp it was issued under and
+/// what the display needs to render it.
+#[derive(Clone)]
+pub struct PaneJob {
+    pub pane: Pane,
+    pub draw: PaneDraw,
+    pub stamp: u64,
+    pub reader: Arc<dyn PaneReader>,
+    /// Z-Map index scale for the display kernel; 0 for image sources.
+    pub index_scale: u32,
+    /// The sealed Z-Map, read alongside a composite whose edit generation or
+    /// overlay [`Self::state`] names; `None` when the sealed pixels draw as is.
+    pub indices: Option<Arc<dyn PaneReader>>,
+    /// The edit generation and overlay this job's result is drawn under.
+    pub state: EditState,
+}
+
+/// What besides `src`/`step` a pane's content depends on: the edit session's
+/// generation and the composite overlay. Equal states draw equal pixels.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EditState {
+    pub generation: Option<u64>,
+    pub overlay: Option<OverlayDraw>,
+}
+
+impl PaneJob {
+    /// Sizes `samples` to the draw's texture and reads the job's source into it.
+    pub(crate) fn read_into(&self, samples: &mut Vec<u16>) -> Result<(), PaneReadError> {
+        let (x, y, width, height) = self.draw.src;
+        let (tex_w, tex_h) = self.draw.extent();
+        let len = tex_w as usize * tex_h as usize * self.reader.samples_per_pixel() as usize;
+        let out = grow_scratch(samples, len);
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        self.reader.read_step_into(rect, self.draw.step, out)
+    }
+
+    /// Sizes `indices` to the draw's texture and reads the sealed Z-Map into
+    /// it; empties it when the job carries no index source.
+    pub(crate) fn read_sealed_indices(&self, indices: &mut Vec<u16>) -> Result<(), PaneReadError> {
+        let Some(reader) = &self.indices else {
+            indices.clear();
+            return Ok(());
+        };
+        let (x, y, width, height) = self.draw.src;
+        let (tex_w, tex_h) = self.draw.extent();
+        let out = grow_scratch(indices, tex_w as usize * tex_h as usize);
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        reader.read_step_into(rect, self.draw.step, out)
+    }
+}
+
+/// A [`PaneJob`] with its samples read.
+pub struct Prepared {
+    pub job: PaneJob,
+    pub samples: Vec<u16>,
+    /// The sealed Z-Map over the same texels; empty when the job has none.
+    pub indices: Vec<u16>,
+}
+
+/// Accepts only stamps above the newest one it has seen or been reset to,
+/// so a result issued before a newer publish or a reset is refused whatever
+/// order results arrive in.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StampFloor(u64);
+
+impl StampFloor {
+    /// Whether `stamp` is above the floor; raises the floor to it if so.
+    pub fn accept(&mut self, stamp: u64) -> bool {
+        let fresh = stamp > self.0;
+        if fresh {
+            self.0 = stamp;
+        }
+        fresh
+    }
+
+    /// Refuses every stamp up to and including `stamp`.
+    pub fn reset(&mut self, stamp: u64) {
+        self.0 = self.0.max(stamp);
+    }
+}
+
+/// Buffers kept for reuse: one active request's worth plus the completed
+/// slot's, two panes each plus the composite's sealed indices.
+const POOLED_BUFFERS: usize = 6;
+
+#[derive(Default)]
+struct PreparerState {
+    pending: Option<Vec<PaneJob>>,
+    done: Option<Vec<Prepared>>,
+    pool: Vec<Vec<u16>>,
+    shutdown: bool,
+    spawned: bool,
+}
+
+impl PreparerState {
+    fn pool_buffer(&mut self, buffer: Vec<u16>) {
+        if self.pool.len() < POOLED_BUFFERS {
+            self.pool.push(buffer);
+        }
+    }
+}
+
+struct PreparerShared {
+    state: Mutex<PreparerState>,
+    wakeup: Condvar,
+}
+
+impl PreparerShared {
+    fn lock(&self) -> MutexGuard<'_, PreparerState> {
+        self.state
+            .lock()
+            .expect("no code panics while holding the preparer lock")
+    }
+}
+
+/// Reads panes' samples off the calling thread: one active request, one
+/// replaceable newest pending request and one completed slot, all bounded.
+/// Dropping it stops the worker after its current read without waiting for
+/// it and without a wake.
+pub struct Preparer {
+    shared: Arc<PreparerShared>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Preparer {
+    /// `wake` runs on the worker thread each time the completed slot goes
+    /// from empty to full.
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            shared: Arc::new(PreparerShared {
+                state: Mutex::new(PreparerState::default()),
+                wakeup: Condvar::new(),
+            }),
+            wake: Arc::new(wake),
+        }
+    }
+
+    /// Replaces the pending request with `jobs`; never blocks on a read.
+    pub fn submit(&self, jobs: Vec<PaneJob>) {
+        let mut state = self.shared.lock();
+        state.pending = Some(jobs);
+        if !state.spawned {
+            state.spawned = true;
+            let shared = self.shared.clone();
+            let wake = self.wake.clone();
+            std::thread::Builder::new()
+                .name("canvas-prepare".into())
+                .spawn(move || prepare_loop(&shared, &*wake))
+                .expect("the OS starts the canvas preparation thread");
+        }
+        self.shared.wakeup.notify_one();
+    }
+
+    /// The newest completed request, if one landed since the last call.
+    pub fn take(&self) -> Option<Vec<Prepared>> {
+        self.shared.lock().done.take()
+    }
+
+    /// Hands consumed buffers back for the next request to read into.
+    pub fn recycle(&self, spent: Vec<Prepared>) {
+        let mut state = self.shared.lock();
+        for prepared in spent {
+            state.pool_buffer(prepared.samples);
+            if prepared.indices.capacity() > 0 {
+                state.pool_buffer(prepared.indices);
+            }
+        }
+    }
+}
+
+impl Drop for Preparer {
+    fn drop(&mut self) {
+        self.shared.lock().shutdown = true;
+        self.shared.wakeup.notify_all();
+    }
+}
+
+fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
+    loop {
+        let (jobs, mut buffers) = {
+            let mut state = shared.lock();
+            let jobs = loop {
+                if state.shutdown {
+                    return;
+                }
+                if let Some(jobs) = state.pending.take() {
+                    break jobs;
+                }
+                state = shared
+                    .wakeup
+                    .wait(state)
+                    .expect("no code panics while holding the preparer lock");
+            };
+            let wanted: usize = jobs
+                .iter()
+                .map(|job| 1 + usize::from(job.indices.is_some()))
+                .sum();
+            let keep = state.pool.len().saturating_sub(wanted);
+            let buffers = state.pool.split_off(keep);
+            (jobs, buffers)
+        };
+        let prepared: Vec<Prepared> = jobs
+            .into_iter()
+            .filter_map(|job| {
+                let samples = buffers.pop().unwrap_or_default();
+                let indices = if job.indices.is_some() {
+                    buffers.pop().unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                read_job(job, samples, indices)
+            })
+            .collect();
+
+        let mut state = shared.lock();
+        if state.shutdown {
+            return;
+        }
+        if prepared.is_empty() {
+            continue;
+        }
+        let was_empty = match state.done.replace(prepared) {
+            Some(replaced) => {
+                for stale in replaced {
+                    state.pool_buffer(stale.samples);
+                    if stale.indices.capacity() > 0 {
+                        state.pool_buffer(stale.indices);
+                    }
+                }
+                false
+            }
+            None => true,
+        };
+        drop(state);
+        if was_empty {
+            wake();
+        }
+    }
 }
 
 /// The rectangle common to `a` and `b`, or `None` when they do not overlap.
@@ -402,6 +795,7 @@ impl ResidentTiles {
 /// The renderer's view of an open edit session: the whole map's edited
 /// indices, the map's width (for indexing them), and the resident cache
 /// [`ResidentTiles::recomposite`] filled.
+#[derive(Clone, Copy)]
 pub struct EditedView<'a> {
     pub indices: &'a [u16],
     pub map_width: u32,
@@ -423,6 +817,23 @@ impl OverlayDraw {
         Self {
             table: overlay_table(sources, None),
             alpha: alpha_from_opacity(opacity),
+        }
+    }
+}
+
+fn read_job(job: PaneJob, mut samples: Vec<u16>, mut indices: Vec<u16>) -> Option<Prepared> {
+    match job
+        .read_into(&mut samples)
+        .and_then(|()| job.read_sealed_indices(&mut indices))
+    {
+        Ok(()) => Some(Prepared {
+            job,
+            samples,
+            indices,
+        }),
+        Err(error) => {
+            tracing::warn!(%error, pane = ?job.pane, "pane read failed");
+            None
         }
     }
 }

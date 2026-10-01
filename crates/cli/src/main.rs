@@ -315,6 +315,17 @@ enum Command {
         write_warped: Option<PathBuf>,
         #[command(flatten)]
         set: set::SetArgs,
+        /// A **ceiling only** on the adaptive host-memory budget the
+        /// alignment workers are sized from: it can lower the budget the
+        /// host-derived estimate resolved to, and can never raise it. Omit
+        /// it entirely and the budget is derived from the host. Accepts
+        /// suffixed sizes (`8GiB`, `512MiB`, `4096`).
+        #[arg(
+            long = "max-host-memory",
+            value_name = "SIZE",
+            value_parser = crate::bytes::parse_byte_size
+        )]
+        max_host_memory: Option<u64>,
         /// Print no progress at all. `align` has no fuse-tile units to
         /// count: this suppresses only the one stage line `align`
         /// otherwise prints.
@@ -533,6 +544,7 @@ fn main() -> ExitCode {
             lax,
             write_warped,
             set,
+            max_host_memory,
             quiet,
             preset,
             write_preset,
@@ -551,6 +563,7 @@ fn main() -> ExitCode {
                 lax,
                 write_warped.as_deref(),
                 &set,
+                max_host_memory,
                 quiet,
                 &preset::PresetOptions {
                     preset: preset.as_deref(),

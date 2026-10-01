@@ -2885,7 +2885,7 @@ fn plain_wheel_over_the_images_list_steps_the_source_frame_in_both_modes() {
 // ---------------------------------------------------------------------
 
 use focusforge_gui::canvas::OverlayDraw;
-use focusforge_gui::images::{FrameSort, ROW_HEIGHT};
+use focusforge_gui::images::FrameSort;
 
 #[test]
 fn legend_rows_carry_the_z_map_palette() {
@@ -2939,8 +2939,13 @@ fn legend_header_states() {
 
     // `images_panel()` runs a fused tab through this same pure builder --
     // the singular form at `n = 1` needs no real fuse to prove.
-    let one =
-        focusforge_gui::images::build_model(&[PathBuf::from("00.tif")], &[false], None, 0.0, true);
+    let one = focusforge_gui::images::build_model(
+        &[PathBuf::from("00.tif")],
+        &[false],
+        None,
+        true,
+        &std::collections::HashMap::new(),
+    );
     assert_eq!(one.header_text, "1 frame");
 }
 
@@ -2963,7 +2968,6 @@ fn legend_no_source_entry_is_pinned_and_unpaintable() {
         "the legend pins a NO_SOURCE entry below the list"
     );
     assert_eq!(panel.rows.len(), 3, "NO_SOURCE is not one of rows");
-    assert_eq!(panel.content_height, 3.0 * ROW_HEIGHT);
 
     let before = c.brush_source();
     c.select_frame(3);

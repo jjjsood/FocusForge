@@ -7,10 +7,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::algorithm::{AlgorithmError, TileReader};
-use crate::align::Transform;
 use crate::align::warp::warp_tile;
+use crate::align::{SourceFootprint, Transform};
 use crate::job::stage_cache::{transform_from_bits, transform_to_bits};
 use crate::tile::Rect;
+use crate::timing::{TimingCounter, measurement_scope, record_timing};
 
 /// A stack's alignment: every frame's reference-to-frame [`Transform`] and
 /// the crop rect the fuse applied, if any. `transforms` is stored as each
@@ -105,12 +106,45 @@ impl<'a> WarpingReader<'a> {
 }
 
 impl TileReader for WarpingReader<'_> {
+    /// The largest of the inner reader's own scratch and, per non-identity
+    /// transform, a warped read of a rect this size centred in the frame:
+    /// the source buffer over the footprint, the warped samples with their
+    /// coverage, and the inner scratch at that footprint. Translations and
+    /// similarities need the same footprint at every position, and clamping
+    /// only shrinks it.
+    fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
+        let spp = u64::from(self.samples_per_pixel);
+        let (width, height) = (width.min(self.frame.0), height.min(self.frame.1));
+        let dst = Rect {
+            x: (self.frame.0 - width) / 2,
+            y: (self.frame.1 - height) / 2,
+            width,
+            height,
+        };
+        let warped = u64::from(width) * u64::from(height) * (spp * 2 + 1);
+        let mut largest = self.inner.read_scratch_bytes(width, height);
+        for transform in &self.transforms {
+            if *transform == Transform::identity() {
+                continue;
+            }
+            if let Ok(SourceFootprint::Covers { read, .. }) =
+                transform.source_footprint(dst, self.frame)
+            {
+                let pixels = u64::from(read.width) * u64::from(read.height);
+                let inner = self.inner.read_scratch_bytes(read.width, read.height);
+                largest = largest.max(pixels * spp * 2 + warped + inner);
+            }
+        }
+        largest
+    }
+
     fn read_tile_into(
         &self,
         frame: usize,
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), AlgorithmError> {
+        let _scope = measurement_scope("warp_read");
         let t = self
             .transforms
             .get(frame)
@@ -155,6 +189,10 @@ impl TileReader for WarpingReader<'_> {
             });
         }
         out.copy_from_slice(&warped.tile.samples);
+        let bytes = std::mem::size_of_val(out) as u64;
+        record_timing(TimingCounter::WarpBytes, bytes);
+        record_timing(TimingCounter::CopyBytes, bytes);
+        record_timing(TimingCounter::CopyOperations, 1);
         Ok(())
     }
 }

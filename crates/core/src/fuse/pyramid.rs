@@ -309,6 +309,18 @@ impl Plane {
         height: u32,
         samples_per_pixel: u32,
     ) -> Result<Self, PyramidError> {
+        Self::from_f32_vec(samples.to_vec(), width, height, samples_per_pixel)
+    }
+
+    /// [`Self::from_f32`] taking ownership of the buffer: the plane's storage
+    /// is `samples` itself, never a copy. The refusals and their order are
+    /// the same.
+    pub fn from_f32_vec(
+        samples: Vec<f32>,
+        width: u32,
+        height: u32,
+        samples_per_pixel: u32,
+    ) -> Result<Self, PyramidError> {
         if width == 0 || height == 0 {
             return Err(PyramidError::EmptyExtent { width, height });
         }
@@ -326,7 +338,7 @@ impl Plane {
             width,
             height,
             samples_per_pixel,
-            data: samples.to_vec(),
+            data: samples,
         })
     }
 }

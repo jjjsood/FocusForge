@@ -49,11 +49,10 @@ export component FFDock inherits Rectangle {
     // `FFImagesPanel`.
     in property <[ImageRowView]> images-rows: [];
     in property <string> images-header-text: "";
+    in-out property <length> images-list-viewport-y: 0px;
     // The editor's read-only legend: the pinned `NO_SOURCE` entry shows
     // below the list.
     in property <bool> images-no-source-row: false;
-    in property <length> images-scroll-y: 0px;
-    in property <length> images-content-height: 0px;
     in property <string> images-sort: "";
     in property <bool> images-sort-menu-open: false;
     in property <int> images-dragging-row: -1;
@@ -67,6 +66,7 @@ export component FFDock inherits Rectangle {
     callback images-frame-excluded-toggled(int);
     callback images-frame-remove-requested(int);
     callback images-frame-grip-pointer(int, int, length);
+    callback images-viewport-scrolled(length);
     callback images-frame-wheel(length);
     callback images-scrollbar-pointer(int, length);
     callback images-scrollbar-dragged(length);
@@ -146,9 +146,8 @@ export component FFDock inherits Rectangle {
         visible: root.project-loaded && (root.mode == "editor" || root.dock-tab == "images");
         rows: root.images-rows;
         header-text: root.images-header-text;
+        list-viewport-y <=> root.images-list-viewport-y;
         no-source-row: root.images-no-source-row;
-        scroll-y: root.images-scroll-y;
-        content-height: root.images-content-height;
         mutable: root.mode == "stacking" && root.images-enabled;
         enabled: root.images-enabled;
         legend: root.mode == "editor";
@@ -164,6 +163,7 @@ export component FFDock inherits Rectangle {
         frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
         frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
         frame-grip-pointer(i, kind, y) => { root.images-frame-grip-pointer(i, kind, y); }
+        viewport-scrolled(offset) => { root.images-viewport-scrolled(offset); }
         frame-wheel(delta) => { root.images-frame-wheel(delta); }
         scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
         scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }

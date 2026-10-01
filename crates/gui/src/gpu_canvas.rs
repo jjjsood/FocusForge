@@ -7,36 +7,72 @@
 //! tile-shaped off the mmap'd TIFF/Z-Map for whichever rect the viewport is
 //! currently showing and re-uploads a *sub*-rect per gesture.
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use focusforge_core::timing::measurement_scope;
 
 use focusforge_core::TiffError;
 use focusforge_core::display::zmap_index_scale;
 use focusforge_core::io::{FrameError, TiffStack};
 use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::{ZMapError, ZMapReader};
-use focusforge_gpu::display::{DisplayTexture, render, render_overlay};
+use focusforge_gpu::display::{DisplayRenderer, DisplayTexture, render_overlay};
 use slint::wgpu_29::wgpu;
 
-use crate::canvas::{FrameView, OverlayDraw, TextureSpec};
+use crate::canvas::{
+    EditState, EditedView, FrameView, OverlayDraw, Pane, PaneJob, PaneReader, PaneSource,
+    StampFloor, TextureSpec,
+};
 use crate::viewport::PaneDraw;
 
-/// One pane's wgpu-owned state: the display texture, and the `slint::Image`
+/// The exact content a [`PaneTexture`] was last drawn from: `draw.src`,
+/// `draw.step` and the edit state, never `dst`/`pixelated` (placement,
+/// applied by the caller regardless of whether this pane actually
+/// re-rendered).
+type Coverage = ((u32, u32, u32, u32), NonZeroU32, EditState);
+
+/// One pane's wgpu-owned state: the display texture, the `slint::Image`
 /// wrapping it -- re-created only when the texture is (re)allocated
 /// (`crate::canvas::needs_realloc`), never every frame: `try_from` takes
 /// the texture by value, so the image property is set once at setup and
-/// never again.
+/// never again -- and the content coverage it was last drawn from, plus the
+/// stamp floor that refuses results issued before its content last changed.
 #[derive(Default)]
 pub struct PaneTexture {
     display_texture: Option<DisplayTexture>,
     spec: Option<TextureSpec>,
     image: Option<slint::Image>,
+    coverage: Option<Coverage>,
+    floor: StampFloor,
 }
 
 impl PaneTexture {
+    /// An empty pane that refuses every stamp up to `stamp`.
+    fn fresh(stamp: u64) -> Self {
+        let mut pane = Self::default();
+        pane.floor.reset(stamp);
+        pane
+    }
+
     /// The `slint::Image` to bind to `FFPane::source` -- a default (empty)
     /// image before the first render.
     pub fn image(&self) -> slint::Image {
         self.image.clone().unwrap_or_default()
+    }
+
+    /// Whether this pane was last drawn from exactly `src`/`step` under
+    /// `state` -- a match means the caller can skip its own source read and
+    /// this pane's upload/render entirely, whatever `dst`/`pixelated` now are.
+    fn covers(&self, src: (u32, u32, u32, u32), step: NonZeroU32, state: &EditState) -> bool {
+        self.coverage
+            .as_ref()
+            .is_some_and(|(s, t, e)| *s == src && *t == step && e == state)
+    }
+
+    fn mark_covered(&mut self, src: (u32, u32, u32, u32), step: NonZeroU32, state: EditState) {
+        self.coverage = Some((src, step, state));
     }
 
     /// (Re)allocates this pane's texture for `width` x `height` if needed,
@@ -56,8 +92,14 @@ impl PaneTexture {
         }
         let wanted = TextureSpec { width, height };
         if crate::canvas::needs_realloc(self.spec, wanted) {
-            let texture = DisplayTexture::new(device, width, height);
-            let imported = slint::Image::try_from(texture.texture().clone());
+            let texture = {
+                let _scope = measurement_scope("gui_display_texture_allocate");
+                DisplayTexture::new(device, width, height)
+            };
+            let imported = {
+                let _scope = measurement_scope("gui_display_texture_import");
+                slint::Image::try_from(texture.texture().clone())
+            };
             self.apply_import(imported, texture, wanted);
         }
         self.display_texture.as_ref()
@@ -70,6 +112,7 @@ impl PaneTexture {
     #[allow(clippy::too_many_arguments)]
     fn ensure_and_render(
         &mut self,
+        renderer: &mut DisplayRenderer,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         width: u32,
@@ -81,7 +124,7 @@ impl PaneTexture {
         let Some(texture) = self.ensure_texture(device, width, height) else {
             return;
         };
-        render(device, queue, texture, src, samples_per_pixel, index_scale);
+        renderer.render(device, queue, texture, src, samples_per_pixel, index_scale);
     }
 
     /// [`Self::ensure_and_render`]'s overlay-blend twin: the composite pane's
@@ -142,7 +185,6 @@ impl PaneTexture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZeroU32;
 
     fn golden_plane_files(fixtures: &std::path::Path) -> (PathBuf, PathBuf) {
         let mut composite = None;
@@ -217,10 +259,14 @@ mod tests {
             .expect("this GPU lifecycle test requires a device");
 
         let mut empty = CanvasRenderer::new();
+        assert!(empty.display_renderer.is_none());
         empty.attach_device(shared.device().clone(), shared.queue().clone());
+        assert!(empty.display_renderer.is_some());
         empty.detach_device();
+        assert!(empty.display_renderer.is_none());
         empty.detach_device();
         assert!(empty.device_queue().is_none());
+        assert!(empty.display_renderer.is_none());
 
         let mut frame_only = CanvasRenderer::new();
         frame_only
@@ -234,7 +280,7 @@ mod tests {
         assert_eq!(frame_only.frame_path(), Some(frame.as_path()));
         assert!(frame_only.frame_pane.display_texture.is_none());
         assert!(frame_only.frame_pane.image.is_none());
-        assert!(frame_only.last_frame.is_none());
+        assert!(frame_only.frame_pane.coverage.is_none());
         frame_only.attach_device(shared.device().clone(), shared.queue().clone());
         assert!(frame_only.redraw_frame(&draw).is_some());
 
@@ -261,8 +307,9 @@ mod tests {
         assert!(planes_and_frame.zmap_pane.image.is_none());
         assert!(planes_and_frame.frame_pane.display_texture.is_none());
         assert!(planes_and_frame.frame_pane.image.is_none());
-        assert!(planes_and_frame.last_planes.is_none());
-        assert!(planes_and_frame.last_frame.is_none());
+        assert!(planes_and_frame.composite_pane.coverage.is_none());
+        assert!(planes_and_frame.zmap_pane.coverage.is_none());
+        assert!(planes_and_frame.frame_pane.coverage.is_none());
         planes_and_frame.attach_device(shared.device().clone(), shared.queue().clone());
         assert!(planes_and_frame.redraw_frame(&draw).is_some());
         assert!(planes_and_frame.redraw_planes(&draw, None, None).is_some());
@@ -280,6 +327,210 @@ mod tests {
         assert!(
             planes_and_frame.redraw_planes(&draw, None, None).is_some(),
             "and turning it back off"
+        );
+    }
+
+    fn fixture_frame() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mantis-64/frames/00.tif")
+    }
+
+    /// A step-1 draw of the `side`x`side` square at the source origin.
+    fn square_draw(side: u32) -> PaneDraw {
+        PaneDraw {
+            src: (0, 0, side, side),
+            dst: (0.0, 0.0, side as _, side as _),
+            pixelated: false,
+            step: NonZeroU32::MIN,
+        }
+    }
+
+    /// Re-runs the test `name` alone in a child process, because timing
+    /// accounting and device loss are process-global; returns `true` only
+    /// inside that child, where the test body then runs.
+    fn in_isolated_child(name: &str) -> bool {
+        const CHILD: &str = "FOCUSFORGE_GUI_GPU_CANVAS_ISOLATED_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args([
+            "--exact",
+            &format!("gpu_canvas::tests::{name}"),
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .expect("the isolated test starts");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the isolated test {name} must run and pass:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    fn accounting_snapshot() -> focusforge_core::timing::TimingSnapshot {
+        focusforge_core::timing::timing_snapshot().expect("trace accounting is enabled")
+    }
+
+    #[test]
+    fn a_resize_or_source_replacement_releases_the_superseded_texture() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let (composite, zmap) =
+            golden_plane_files(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures"));
+        let mut renderer = CanvasRenderer::new();
+        renderer.attach_device(shared.device().clone(), shared.queue().clone());
+        renderer
+            .set_frame(&fixture_frame(), None, crate::job::host_budget())
+            .expect("fixture frame opens");
+
+        assert!(renderer.redraw_frame(&square_draw(64)).is_some());
+        assert!(renderer.redraw_frame(&square_draw(8)).is_some());
+        let texture = renderer
+            .frame_pane
+            .display_texture
+            .as_ref()
+            .expect("the resized pane holds a texture");
+        assert_eq!(
+            (texture.width(), texture.height()),
+            (8, 8),
+            "the pane holds only the texture of the new size"
+        );
+
+        renderer
+            .set_frame(&fixture_frame(), None, crate::job::host_budget())
+            .expect("fixture frame re-opens");
+        assert!(renderer.frame_pane.display_texture.is_none());
+        assert!(renderer.frame_pane.image.is_none());
+
+        renderer
+            .set_planes(&composite, &zmap)
+            .expect("fixture planes open");
+        assert!(
+            renderer
+                .redraw_planes(&square_draw(8), None, None)
+                .is_some()
+        );
+        assert!(renderer.composite_pane.display_texture.is_some());
+        renderer
+            .set_planes(&composite, &zmap)
+            .expect("fixture planes re-open");
+        assert!(renderer.composite_pane.display_texture.is_none());
+        assert!(renderer.composite_pane.image.is_none());
+    }
+
+    #[test]
+    fn each_attach_builds_one_display_renderer_whose_source_buffer_follows_the_draw() {
+        if !in_isolated_child(
+            "each_attach_builds_one_display_renderer_whose_source_buffer_follows_the_draw",
+        ) {
+            return;
+        }
+        focusforge_core::timing::enable_trace_accounting();
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let mut renderer = CanvasRenderer::new();
+        renderer
+            .set_frame(&fixture_frame(), None, crate::job::host_budget())
+            .expect("fixture frame opens");
+        let spp = renderer.frame.samples_per_pixel().expect("a frame is open");
+        let packed_bytes = |side: u32| u64::from(side * side * spp).div_ceil(2) * 4;
+
+        for attach in 0..2 {
+            let before = accounting_snapshot();
+            renderer.attach_device(shared.device().clone(), shared.queue().clone());
+            let after = accounting_snapshot();
+            assert!(renderer.display_renderer.is_some());
+            assert_eq!(
+                after.pipeline_creations - before.pipeline_creations,
+                1,
+                "attach {attach} builds exactly one display pipeline"
+            );
+            assert_eq!(
+                after.allocation_operations - before.allocation_operations,
+                1,
+                "attach {attach} allocates only the params buffer"
+            );
+
+            // (side, whether the source buffer is re-created): the first
+            // draw creates it; 8 needs under a quarter of 64's, so it shrinks;
+            // 4 needs exactly a quarter of 8's, so it is kept; 3 needs under
+            // a quarter again; 5 needs more than 3's, so it grows.
+            for (side, recreated) in [(64, true), (8, true), (4, false), (3, true), (5, true)] {
+                let before = accounting_snapshot();
+                assert!(renderer.redraw_frame(&square_draw(side)).is_some());
+                let after = accounting_snapshot();
+                assert_eq!(
+                    after.pipeline_creations - before.pipeline_creations,
+                    0,
+                    "side {side}: no pipeline is rebuilt"
+                );
+                assert_eq!(
+                    after.allocation_operations - before.allocation_operations,
+                    u64::from(recreated),
+                    "side {side}: source buffer re-created = {recreated}"
+                );
+                assert_eq!(
+                    after.allocation_bytes - before.allocation_bytes,
+                    if recreated { packed_bytes(side) } else { 0 },
+                    "side {side}: a re-created source buffer is sized to the draw"
+                );
+            }
+
+            renderer.detach_device();
+            assert!(renderer.display_renderer.is_none());
+        }
+    }
+
+    #[test]
+    fn a_lost_device_creates_no_texture_buffer_or_render() {
+        if !in_isolated_child("a_lost_device_creates_no_texture_buffer_or_render") {
+            return;
+        }
+        focusforge_core::timing::enable_trace_accounting();
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let mut renderer = CanvasRenderer::new();
+        renderer.attach_device(shared.device().clone(), shared.queue().clone());
+        renderer
+            .set_frame(&fixture_frame(), None, crate::job::host_budget())
+            .expect("fixture frame opens");
+
+        focusforge_gpu::errors::install_handlers(shared.device());
+        shared.device().destroy();
+        let _ = shared.device().poll(wgpu::PollType::Poll);
+        assert!(
+            focusforge_gpu::errors::device_lost(),
+            "a destroyed device reports itself lost"
+        );
+
+        let before = accounting_snapshot();
+        let _ = renderer.redraw_frame(&square_draw(8));
+        let after = accounting_snapshot();
+        assert!(renderer.frame_pane.display_texture.is_none());
+        assert!(renderer.frame_pane.image.is_none());
+        assert_eq!(
+            after.allocation_operations - before.allocation_operations,
+            0,
+            "no buffer is created on a lost device"
+        );
+        assert_eq!(
+            after.packed_bytes - before.packed_bytes,
+            0,
+            "no render runs on a lost device"
+        );
+        assert_eq!(
+            after.upload_bytes - before.upload_bytes,
+            0,
+            "nothing is uploaded to a lost device"
         );
     }
 }
@@ -302,33 +553,30 @@ pub enum CanvasRendererError {
     },
 }
 
-/// The two planes' GPU-owned state, the frame pane's own, and the last
-/// [`PaneDraw`] rendered per pane -- `redraw_planes`/`redraw_frame` are
-/// no-ops when nothing changed. Reads pixels tile-shaped off the mmap'd
-/// TIFF/Z-Map/frame for whichever rect its own pane's viewport is currently
-/// showing, re-uploading only the visible rect rather than the whole image.
-/// The planes are optional: a tab with nothing sealed yet still gets a
-/// renderer, for its frame pane alone.
+/// The two planes' GPU-owned state, the frame pane's own, the one
+/// [`DisplayRenderer`] every pane renders through, and the CPU scratch the
+/// synchronous redraws read into. A pane's read is a [`PaneJob`] (none when
+/// its [`PaneTexture`] already covers the draw) that [`Self::publish`] renders
+/// once its samples exist; the `redraw_*` methods do both in place. The planes
+/// are optional: a tab with nothing sealed still gets a frame pane.
 pub struct CanvasRenderer {
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
-    composite: Option<TiffStack>,
-    zmap: Option<ZMapReader>,
+    display_renderer: Option<DisplayRenderer>,
+    sample_scratch: Vec<u16>,
+    composite: Option<Arc<TiffStack>>,
+    zmap: Option<Arc<ZMapReader>>,
     composite_pane: PaneTexture,
     zmap_pane: PaneTexture,
     index_scale: Option<u32>,
-    last_planes: Option<PaneDraw>,
-    /// The edited view's own generation at `last_planes`' redraw -- `None`
-    /// both when no edited view was drawn and when none is drawn now, so a
-    /// tab with no edit session still short-circuits a repeat draw.
-    last_planes_generation: Option<u64>,
-    /// The overlay drawn at `last_planes` -- part of the same short-circuit
-    /// key, since turning the overlay on/off or changing its opacity must
-    /// redraw even when nothing else about `draw` changed.
-    last_overlay: Option<OverlayDraw>,
+    /// Which plane [`Self::redraw_planes`] reads and renders; default
+    /// [`PaneSource::Composite`], changed only through [`Self::select_plane`].
+    plane: PaneSource,
     frame: crate::canvas::FrameSource,
     frame_pane: PaneTexture,
-    last_frame: Option<PaneDraw>,
+    /// The last stamp issued: every job takes the next one, and a reset
+    /// refuses everything up to the current value.
+    stamp: u64,
 }
 
 impl Default for CanvasRenderer {
@@ -343,36 +591,83 @@ impl CanvasRenderer {
         Self {
             device: None,
             queue: None,
+            display_renderer: None,
+            sample_scratch: Vec::new(),
             composite: None,
             zmap: None,
             composite_pane: PaneTexture::default(),
             zmap_pane: PaneTexture::default(),
             index_scale: None,
-            last_planes: None,
-            last_planes_generation: None,
-            last_overlay: None,
+            plane: PaneSource::Composite,
             frame: crate::canvas::FrameSource::default(),
             frame_pane: PaneTexture::default(),
-            last_frame: None,
+            stamp: 0,
         }
     }
 
-    /// Uses Slint's surface-compatible device for future canvas draws.
+    fn next_stamp(&mut self) -> u64 {
+        self.stamp += 1;
+        self.stamp
+    }
+
+    /// Empties both plane panes and refuses every job issued so far for them.
+    fn reset_planes(&mut self) {
+        let stamp = self.next_stamp();
+        self.composite_pane = PaneTexture::fresh(stamp);
+        self.zmap_pane = PaneTexture::fresh(stamp);
+    }
+
+    /// Empties the frame pane and refuses every job issued so far for it.
+    fn reset_frame(&mut self) {
+        let stamp = self.next_stamp();
+        self.frame_pane = PaneTexture::fresh(stamp);
+    }
+
+    fn pane_mut(&mut self, pane: Pane) -> &mut PaneTexture {
+        match pane {
+            Pane::Frame => &mut self.frame_pane,
+            Pane::Composite => &mut self.composite_pane,
+            Pane::ZMap => &mut self.zmap_pane,
+        }
+    }
+
+    fn pane_ref(&self, pane: Pane) -> &PaneTexture {
+        match pane {
+            Pane::Frame => &self.frame_pane,
+            Pane::Composite => &self.composite_pane,
+            Pane::ZMap => &self.zmap_pane,
+        }
+    }
+
+    /// The plane [`Self::redraw_planes`] and [`Self::request_planes`] draw.
+    pub fn plane(&self) -> PaneSource {
+        self.plane
+    }
+
+    /// Selects which plane [`Self::redraw_planes`] reads and renders; jobs
+    /// issued for either plane before this call are refused.
+    pub fn select_plane(&mut self, plane: PaneSource) {
+        let stamp = self.next_stamp();
+        self.composite_pane.floor.reset(stamp);
+        self.zmap_pane.floor.reset(stamp);
+        self.plane = plane;
+    }
+
+    /// Uses Slint's surface-compatible device for future canvas draws,
+    /// building the one shared [`DisplayRenderer`] every pane renders
+    /// through.
     pub fn attach_device(&mut self, device: wgpu::Device, queue: wgpu::Queue) {
         self.detach_device();
+        self.display_renderer = Some(DisplayRenderer::new(&device));
         self.device = Some(device);
         self.queue = Some(queue);
     }
 
     /// Releases resources bound to Slint's device while keeping source readers.
     pub fn detach_device(&mut self) {
-        self.composite_pane = PaneTexture::default();
-        self.zmap_pane = PaneTexture::default();
-        self.frame_pane = PaneTexture::default();
-        self.last_planes = None;
-        self.last_planes_generation = None;
-        self.last_overlay = None;
-        self.last_frame = None;
+        self.reset_planes();
+        self.reset_frame();
+        self.display_renderer = None;
         self.device = None;
         self.queue = None;
     }
@@ -400,13 +695,9 @@ impl CanvasRenderer {
             source,
         })?;
         self.index_scale = Some(zmap_index_scale(zmap.frame_count()));
-        self.composite = Some(composite);
-        self.zmap = Some(zmap);
-        self.composite_pane = PaneTexture::default();
-        self.zmap_pane = PaneTexture::default();
-        self.last_planes = None;
-        self.last_planes_generation = None;
-        self.last_overlay = None;
+        self.composite = Some(Arc::new(composite));
+        self.zmap = Some(Arc::new(zmap));
+        self.reset_planes();
         Ok(())
     }
 
@@ -415,11 +706,7 @@ impl CanvasRenderer {
         self.composite = None;
         self.zmap = None;
         self.index_scale = None;
-        self.composite_pane = PaneTexture::default();
-        self.zmap_pane = PaneTexture::default();
-        self.last_planes = None;
-        self.last_planes_generation = None;
-        self.last_overlay = None;
+        self.reset_planes();
     }
 
     /// The frame pane's currently open path, if any.
@@ -433,8 +720,8 @@ impl CanvasRenderer {
     }
 
     /// Opens `path` as the frame pane's source under `budget`, dropping
-    /// whatever was open first, and records `view` for the next
-    /// [`Self::redraw_frame`] to warp through. `Err` leaves nothing open.
+    /// whatever was open first, and records `view` for the frame pane's
+    /// reads to warp through. `Err` leaves nothing open.
     pub fn set_frame(
         &mut self,
         path: &Path,
@@ -442,176 +729,307 @@ impl CanvasRenderer {
         budget: HostBudget,
     ) -> Result<(), FrameError> {
         let result = self.frame.set(path, view, budget);
-        self.frame_pane = PaneTexture::default();
-        self.last_frame = None;
+        self.reset_frame();
         result
     }
 
     /// Drops the open frame, if any.
     pub fn clear_frame(&mut self) {
         self.frame.clear();
-        self.frame_pane = PaneTexture::default();
-        self.last_frame = None;
+        self.reset_frame();
     }
 
-    /// Re-reads and re-uploads `draw.src` for both planes, decimated into a
-    /// `draw.extent()`-sized texture. `edited`, present, overlays the
-    /// composite with the resident tiles' gathered pixel wherever its index
-    /// differs, and uploads indices for the Z-Map. `overlay`, present on a
-    /// three-sample composite, blends the rainbow overlay in place of the
-    /// plain render. `None` on an out-of-range/unopened read or no device.
-    pub fn redraw_planes(
+    /// The job that brings the selected plane's pane to `draw`, `None` when
+    /// that pane already covers `draw.src`/`draw.step` under the same edit
+    /// generation and overlay (whatever `dst` and `pixelated` now are; work
+    /// still in flight for it is retired), with no planes or device, or an
+    /// out-of-bounds `draw.src`. The unselected plane is never requested. A
+    /// composite drawn under an edit session or a three-sample overlay also
+    /// reads the sealed Z-Map indices.
+    pub fn request_planes(
         &mut self,
         draw: &PaneDraw,
-        edited: Option<crate::canvas::EditedView>,
+        generation: Option<u64>,
         overlay: Option<&OverlayDraw>,
-    ) -> Option<(slint::Image, slint::Image)> {
-        let (device, queue) = self.device_queue()?;
-        if self.composite.is_none() || self.zmap.is_none() {
-            return None;
+    ) -> Option<PaneJob> {
+        self.device.as_ref()?;
+        let composite = self.composite.as_ref()?.clone();
+        let zmap = self.zmap.as_ref()?.clone();
+        let pane = Pane::from(self.plane);
+        let header = composite.header(0);
+        let size = (header.width, header.height);
+        if pane == Pane::ZMap {
+            let state = EditState {
+                generation,
+                overlay: None,
+            };
+            let index_scale = self.index_scale?;
+            return self.request(pane, draw, size, zmap, index_scale, None, state);
         }
-        let generation = edited.as_ref().map(|view| view.tiles.generation());
-        if self.last_planes.as_ref() == Some(draw)
-            && self.last_planes_generation == generation
-            && self.last_overlay.as_ref() == overlay
-        {
-            return Some((self.composite_pane.image(), self.zmap_pane.image()));
-        }
-        let composite = self.composite.as_ref()?;
-        let zmap = self.zmap.as_ref()?;
-        let index_scale = self.index_scale?;
-
-        let (x, y, width, height) = draw.src;
-        let (frame_size, samples_per_pixel) = {
-            let header = composite.header(0);
-            ((header.width, header.height), header.samples_per_pixel)
+        let overlay = overlay.filter(|_| header.samples_per_pixel == 3);
+        let indices =
+            (generation.is_some() || overlay.is_some()).then_some(zmap as Arc<dyn PaneReader>);
+        let state = EditState {
+            generation,
+            overlay: overlay.cloned(),
         };
-        if !crate::canvas::draw_rect_fits(frame_size, draw.src) {
+        self.request(pane, draw, size, composite, 0, indices, state)
+    }
+
+    /// The job that brings the frame pane to `draw`; `None` as
+    /// [`Self::request_planes`], with no frame open in place of no planes.
+    pub fn request_frame(&mut self, draw: &PaneDraw) -> Option<PaneJob> {
+        self.device.as_ref()?;
+        let frame_size = self.frame.dimensions()?;
+        let reader = self.frame.reader()?;
+        self.request(
+            Pane::Frame,
+            draw,
+            frame_size,
+            reader,
+            0,
+            None,
+            EditState::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request(
+        &mut self,
+        pane: Pane,
+        draw: &PaneDraw,
+        source_size: (u32, u32),
+        reader: Arc<dyn PaneReader>,
+        index_scale: u32,
+        indices: Option<Arc<dyn PaneReader>>,
+        state: EditState,
+    ) -> Option<PaneJob> {
+        let stamp = self.next_stamp();
+        let texture = self.pane_mut(pane);
+        if texture.covers(draw.src, draw.step, &state) {
+            texture.floor.reset(stamp);
             return None;
         }
+        if !crate::canvas::draw_rect_fits(source_size, draw.src) {
+            return None;
+        }
+        Some(PaneJob {
+            pane,
+            draw: *draw,
+            stamp,
+            reader,
+            index_scale,
+            indices,
+            state,
+        })
+    }
+
+    /// Renders `samples` (read for `job`) into the job's pane and returns
+    /// the pane's image, as [`Self::publish_edited`] with no edit session.
+    pub fn publish(&mut self, job: &PaneJob, samples: &[u16]) -> Option<slint::Image> {
+        self.publish_edited(job, samples, &[], None)
+    }
+
+    /// Renders `samples` (read for `job`) into the job's pane and returns
+    /// the pane's image. `sealed_indices` is the sealed Z-Map over the same
+    /// texels (empty when the job read none). `edited`, present on a job
+    /// issued under an edit generation, overlays the composite with the
+    /// resident tiles' gathered pixel wherever its index differs and draws
+    /// the Z-Map pane from the edited indices; the job's own overlay blends
+    /// the rainbow over a three-sample composite. `None`, with nothing
+    /// rendered or uploaded, when the job is stale -- issued before a source,
+    /// plane or device change or before a newer job for the pane published --
+    /// or when there is no device.
+    pub fn publish_edited(
+        &mut self,
+        job: &PaneJob,
+        samples: &[u16],
+        sealed_indices: &[u16],
+        edited: Option<&EditedView>,
+    ) -> Option<slint::Image> {
+        let (device, queue) = self.device_queue()?;
+        if !self.pane_mut(job.pane).floor.accept(job.stamp) {
+            return None;
+        }
+        let renderer = self.display_renderer.as_mut()?;
+        let (width, height) = job.draw.extent();
+        let texture = match job.pane {
+            Pane::Frame => &mut self.frame_pane,
+            Pane::Composite => &mut self.composite_pane,
+            Pane::ZMap => &mut self.zmap_pane,
+        };
+        if texture.covers(job.draw.src, job.draw.step, &job.state) {
+            return Some(texture.image());
+        }
+        let samples_per_pixel = job.reader.samples_per_pixel();
+        let (x, y, src_width, src_height) = job.draw.src;
         let rect = Rect {
             x,
             y,
-            width,
-            height,
+            width: src_width,
+            height: src_height,
         };
-
-        let (tex_w, tex_h) = draw.extent();
-        let texels = tex_w as usize * tex_h as usize;
-
-        let mut samples = vec![0u16; texels * samples_per_pixel as usize];
-        composite
-            .read_tile_step_into(0, rect, draw.step, &mut samples)
-            .ok()?;
-
-        let mut sealed_indices = vec![0u16; texels];
-        zmap.read_tile_step_into(rect, draw.step, &mut sealed_indices)
-            .ok()?;
-
-        let zmap_indices = match &edited {
-            Some(view) => {
-                let mut edited_indices = vec![0u16; texels];
-                crate::canvas::step_copy(
-                    view.indices,
-                    view.map_width,
-                    rect,
-                    draw.step,
-                    &mut edited_indices,
-                );
-                crate::canvas::overlay_edited(
-                    &mut samples,
-                    &sealed_indices,
-                    &edited_indices,
-                    rect,
-                    draw.step,
-                    samples_per_pixel,
-                    view.tiles,
-                );
-                edited_indices
-            }
-            None => sealed_indices,
-        };
-
-        match overlay {
-            Some(overlay) if samples_per_pixel == 3 => {
-                self.composite_pane.ensure_and_render_overlay(
+        let step = job.draw.step;
+        let edited = edited.filter(|_| job.state.generation.is_some());
+        let edited_indices = edited.map(|view| {
+            let mut out = vec![0u16; width as usize * height as usize];
+            crate::canvas::step_copy(view.indices, view.map_width, rect, step, &mut out);
+            out
+        });
+        match job.pane {
+            Pane::ZMap => match edited_indices.as_deref() {
+                Some(indices) => texture.ensure_and_render(
+                    renderer,
                     &device,
                     &queue,
-                    tex_w,
-                    tex_h,
-                    &samples,
-                    &zmap_indices,
-                    overlay,
-                );
-            }
-            _ => {
-                self.composite_pane.ensure_and_render(
+                    width,
+                    height,
+                    indices,
+                    1,
+                    job.index_scale,
+                ),
+                None => texture.ensure_and_render(
+                    renderer,
                     &device,
                     &queue,
-                    tex_w,
-                    tex_h,
-                    &samples,
+                    width,
+                    height,
+                    samples,
                     samples_per_pixel,
-                    0,
-                );
+                    job.index_scale,
+                ),
+            },
+            Pane::Composite if !sealed_indices.is_empty() => {
+                let merged = edited
+                    .zip(edited_indices.as_deref())
+                    .map(|(view, indices)| {
+                        let mut merged = samples.to_vec();
+                        crate::canvas::overlay_edited(
+                            &mut merged,
+                            sealed_indices,
+                            indices,
+                            rect,
+                            step,
+                            samples_per_pixel,
+                            view.tiles,
+                        );
+                        merged
+                    });
+                let composite = merged.as_deref().unwrap_or(samples);
+                let indices = edited_indices.as_deref().unwrap_or(sealed_indices);
+                match &job.state.overlay {
+                    Some(overlay) => texture.ensure_and_render_overlay(
+                        &device, &queue, width, height, composite, indices, overlay,
+                    ),
+                    None => texture.ensure_and_render(
+                        renderer,
+                        &device,
+                        &queue,
+                        width,
+                        height,
+                        composite,
+                        samples_per_pixel,
+                        0,
+                    ),
+                }
             }
+            _ => texture.ensure_and_render(
+                renderer,
+                &device,
+                &queue,
+                width,
+                height,
+                samples,
+                samples_per_pixel,
+                job.index_scale,
+            ),
         }
-        self.zmap_pane.ensure_and_render(
-            &device,
-            &queue,
-            tex_w,
-            tex_h,
-            &zmap_indices,
-            1,
-            index_scale,
-        );
+        texture.mark_covered(job.draw.src, job.draw.step, job.state.clone());
+        Some(texture.image())
+    }
 
-        self.last_planes = Some(*draw);
-        self.last_planes_generation = generation;
-        self.last_overlay = overlay.cloned();
-        Some((self.composite_pane.image(), self.zmap_pane.image()))
+    /// The image `pane` currently holds and where it lands under `draw`:
+    /// the texture drawn at its own last `src`, scaled and offset to the new
+    /// view. `None` while the pane holds nothing.
+    pub fn placement(
+        &self,
+        pane: Pane,
+        draw: &PaneDraw,
+    ) -> Option<(slint::Image, (f32, f32, f32, f32))> {
+        let texture = self.pane_ref(pane);
+        let (src, ..) = texture.coverage.as_ref()?;
+        texture.image.as_ref()?;
+        Some((texture.image(), draw.place(*src)))
+    }
+
+    /// Reads a job's samples into the shared scratch and publishes them.
+    fn read_and_publish(
+        &mut self,
+        job: PaneJob,
+        edited: Option<&EditedView>,
+    ) -> Option<slint::Image> {
+        let mut scratch = std::mem::take(&mut self.sample_scratch);
+        let mut indices = Vec::new();
+        let image = job
+            .read_into(&mut scratch)
+            .and_then(|()| job.read_sealed_indices(&mut indices))
+            .ok()
+            .and_then(|()| self.publish_edited(&job, &scratch, &indices, edited));
+        self.sample_scratch = scratch;
+        image
+    }
+
+    /// Re-reads and re-uploads `draw.src` for the currently selected plane
+    /// alone, returning its `slint::Image` and which plane it is. A no-op
+    /// when that pane already covers `draw.src`/`draw.step` under the same
+    /// edit generation and overlay, whatever `dst`/`pixelated` now are; the
+    /// unselected plane is never read. `edited`, present, overlays the
+    /// composite with the resident tiles' gathered pixel wherever its index
+    /// differs and draws the Z-Map from the edited indices; `overlay`,
+    /// present on a three-sample composite, blends the rainbow overlay in
+    /// place of the plain render. `None` with no planes open, an
+    /// out-of-bounds `draw.src`, or a failed read (coverage stays untouched
+    /// on that path).
+    pub fn redraw_planes(
+        &mut self,
+        draw: &PaneDraw,
+        edited: Option<EditedView>,
+        overlay: Option<&OverlayDraw>,
+    ) -> Option<(slint::Image, PaneSource)> {
+        let _scope = measurement_scope("gui_plane_redraw");
+        let plane = self.plane;
+        let generation = edited.as_ref().map(|view| view.tiles.generation());
+        let image = match self.request_planes(draw, generation, overlay) {
+            Some(job) => self.read_and_publish(job, edited.as_ref())?,
+            None => self.covered_image(plane.into(), draw)?,
+        };
+        Some((image, plane))
     }
 
     /// Re-reads and re-uploads `draw.src` for the frame pane, decimated as in
     /// [`Self::redraw_planes`], returning the
     /// `slint::Image` to bind to `FFPane::source`. `None` with no frame
-    /// open, when `draw.src` falls outside it, or the read fails;
-    /// `self.last_frame` stays untouched on that path so a later, valid
-    /// rect still renders. The same display path [`Self::redraw_planes`]
+    /// open, when `draw.src` falls outside it, or the read fails; the frame
+    /// pane's coverage stays untouched on that path so a later, valid rect
+    /// still renders. A no-op when the frame pane already covers
+    /// `draw.src`/`draw.step`. The same display path [`Self::redraw_planes`]
     /// uses, at an index scale of 0 -- a source frame carries no Z-Map
     /// indices.
     pub fn redraw_frame(&mut self, draw: &PaneDraw) -> Option<slint::Image> {
-        let (device, queue) = self.device_queue()?;
-        let frame_size = self.frame.dimensions()?;
-        let samples_per_pixel = self.frame.samples_per_pixel()?;
-        if self.last_frame.as_ref() == Some(draw) {
-            return Some(self.frame_pane.image());
+        let _scope = measurement_scope("gui_frame_redraw");
+        match self.request_frame(draw) {
+            Some(job) => self.read_and_publish(job, None),
+            None => self.covered_image(Pane::Frame, draw),
         }
-        if !crate::canvas::draw_rect_fits(frame_size, draw.src) {
-            return None;
-        }
-        let (x, y, width, height) = draw.src;
-        let rect = Rect {
-            x,
-            y,
-            width,
-            height,
-        };
+    }
 
-        let (tex_w, tex_h) = draw.extent();
-        let mut samples = vec![0u16; tex_w as usize * tex_h as usize * samples_per_pixel as usize];
-        self.frame.read_into(rect, draw.step, &mut samples).ok()?;
-        self.frame_pane.ensure_and_render(
-            &device,
-            &queue,
-            tex_w,
-            tex_h,
-            &samples,
-            samples_per_pixel,
-            0,
-        );
-
-        self.last_frame = Some(*draw);
-        Some(self.frame_pane.image())
+    /// The pane's image when it already covers `draw`, `None` otherwise.
+    fn covered_image(&self, pane: Pane, draw: &PaneDraw) -> Option<slint::Image> {
+        let texture = self.pane_ref(pane);
+        texture
+            .coverage
+            .as_ref()
+            .is_some_and(|(src, step, _)| *src == draw.src && *step == draw.step)
+            .then(|| texture.image())
     }
 }

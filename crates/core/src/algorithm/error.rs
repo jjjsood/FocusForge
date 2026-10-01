@@ -35,6 +35,20 @@ pub enum AlgorithmError {
     #[error("{algorithm}: {detail}")]
     Failed { algorithm: String, detail: String },
 
+    /// A host-derived, uncapped memory budget cannot hold the alignment's
+    /// shared reference data plus one registration -- refused by name before
+    /// any registration starts. An explicit or `--max-host-memory` budget
+    /// still floors to one worker and runs.
+    #[error(
+        "the host-derived memory budget of {budget_bytes} B cannot hold the alignment's shared \
+         reference data and one registration ({required_bytes} B); free memory on this machine \
+         or align fewer or smaller frames"
+    )]
+    HostMemoryTooSmall {
+        budget_bytes: u64,
+        required_bytes: u64,
+    },
+
     /// The run's control requested a cancel before every frame was
     /// registered; the driver started no registration after reading it.
     #[error("alignment cancelled")]

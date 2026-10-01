@@ -16,7 +16,7 @@
 //! `Action`. They read `crate::input_map`'s types only -- no `use slint::`
 //! here either.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -26,7 +26,7 @@ use crate::brush;
 use crate::canvas::{FrameView, OverlayDraw};
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
-    DiagnosticsView, clamp_manifest_scroll, manifest_content_height, size_text,
+    DiagnosticsView, clamp_manifest_scroll, manifest_content_height, measurement_scope, size_text,
 };
 use crate::entry;
 use crate::images;
@@ -127,9 +127,12 @@ pub enum ShellEvent {
     /// asked once.
     QuestionRaised(GroupingQuestion),
     /// The settings panel's own state moved: a value, an algorithm choice,
-    /// a reset, an open menu or the scroll offset -- never a tab switch,
-    /// which `ProjectsChanged` already rebuilds the panel for.
+    /// a reset or an open menu -- never a tab switch, which
+    /// `ProjectsChanged` already rebuilds the panel for.
     SettingsChanged,
+    /// Only the settings panel's scroll offset or viewport height moved; no
+    /// row changed.
+    SettingsScrolled,
     /// An open attempt was refused. Carries its already-rendered message:
     /// `perform` (`crate::bridge`) must not format user-facing text.
     EntryRefused(String),
@@ -137,16 +140,21 @@ pub enum ShellEvent {
     /// cancelled, failed or completed.
     JobChanged,
     /// The `Images` panel's own state moved: a row's exclusion, the frame
-    /// order, the sort selection, the scroll offset, or a frame-set-change
-    /// warning opened or closed -- never a tab switch, which
-    /// `ProjectsChanged` already rebuilds the panel for.
+    /// order, the sort selection, or a frame-set-change warning opened or
+    /// closed -- never a tab switch, which `ProjectsChanged` already
+    /// rebuilds the panel for.
     ImagesChanged,
+    /// Only the `Images` list's scroll offset moved; no row changed.
+    ImagesScrolled,
     /// The editor toolbar's own state moved: the brush size, its softness,
     /// the pipette's armed state, or undo/redo availability.
     EditorChanged,
     /// The projects overlay's own state moved: opened, closed, its gallery
     /// scrolled, or its failure cards changed.
     OverlayChanged,
+    /// Only the gallery's scroll offset or viewport height moved; no card
+    /// changed.
+    GalleryScrolled,
     /// A background load ([`AppController::open_paths`]) started.
     LoadStarted,
     /// A background load ticked: how many frames its worker has read of how
@@ -415,6 +423,9 @@ struct ProjectTab {
     /// neither `Name` nor `Capture time` is checked. Cleared by a manual
     /// drag.
     frame_sort: Option<images::FrameSort>,
+    /// Existence and capture time per source path, read when the path joins
+    /// the tab and refreshed only by an explicit relink or a refused use.
+    meta: HashMap<PathBuf, images::FrameMeta>,
     /// This tab's own card picture -- primed once, right here for a fresh
     /// tab and again in [`AppController::settle_job`] from each fused
     /// composite. `Arc`-shared rather than cloned per
@@ -467,7 +478,13 @@ impl ProjectTab {
     /// `thumbnail` reports what the load's own worker already did for this
     /// project. [`ThumbnailSource::NotAttempted`] falls back to decoding it
     /// right here; a worker's own failed decode opens the tab with none.
-    fn new(mut project: GuiProject, id: u64, thumbnail: ThumbnailSource) -> Self {
+    /// `meta` is the frames' metadata when already read; `None` reads it here.
+    fn new(
+        mut project: GuiProject,
+        id: u64,
+        thumbnail: ThumbnailSource,
+        meta: Option<HashMap<PathBuf, images::FrameMeta>>,
+    ) -> Self {
         let title = entry::tab_title(&project);
         let ctx = entry::tab_stack_context(&project);
         let image =
@@ -487,6 +504,7 @@ impl ProjectTab {
                 overlay::render_thumbnail(&mut project, &frames).map(Arc::new)
             }
         };
+        let meta = meta.unwrap_or_else(|| images::read_metadata(&frames));
         ProjectTab {
             id,
             project,
@@ -508,6 +526,7 @@ impl ProjectTab {
             excluded,
             selected,
             frame_sort: None,
+            meta,
             thumbnail,
             run: job::RunState::Idle,
             request: None,
@@ -555,6 +574,17 @@ impl ProjectTab {
             return false;
         };
         self.frames == fused
+    }
+
+    /// Reads the metadata of every frame `meta` does not hold yet.
+    fn read_missing_meta(&mut self) {
+        let missing: Vec<PathBuf> = self
+            .frames
+            .iter()
+            .filter(|path| !self.meta.contains_key(*path))
+            .cloned()
+            .collect();
+        self.meta.extend(images::read_metadata(&missing));
     }
 
     /// The sources and registration behind this tab's newest composite --
@@ -805,17 +835,25 @@ struct LoadSlot {
 /// pixels on the event-loop thread.
 struct LoadResult {
     outcome: OpenOutcome,
-    thumbnails: Vec<Option<Arc<overlay::Thumbnail>>>,
+    thumbnails: Vec<Preloaded>,
 }
 
-/// Decodes one thumbnail per project, in order -- what [`AppController::open_paths`]
-/// and [`AppController::answer_question`] both run on their own worker thread.
-fn decode_thumbnails(projects: &mut [GuiProject]) -> Vec<Option<Arc<overlay::Thumbnail>>> {
+/// One project's thumbnail and frame metadata, read on a load worker.
+type Preloaded = (
+    Option<Arc<overlay::Thumbnail>>,
+    HashMap<PathBuf, images::FrameMeta>,
+);
+
+/// Decodes one thumbnail and reads the frame metadata per project, in
+/// order -- what [`AppController::open_paths`] and
+/// [`AppController::answer_question`] both run on their own worker thread.
+fn decode_thumbnails(projects: &mut [GuiProject]) -> Vec<Preloaded> {
     projects
         .iter_mut()
         .map(|project| {
             let frames = entry::project_frames(project);
-            overlay::render_thumbnail(project, &frames).map(Arc::new)
+            let thumbnail = overlay::render_thumbnail(project, &frames).map(Arc::new);
+            (thumbnail, images::read_metadata(&frames))
         })
         .collect()
 }
@@ -2274,6 +2312,7 @@ impl AppController {
     /// Returns the worker's join handle; `None` when nothing started -- a
     /// load already in flight, or `paths` failed to classify.
     pub fn open_paths(&mut self, paths: &[PathBuf]) -> Option<std::thread::JoinHandle<()>> {
+        let _scope = measurement_scope("gui_open_paths");
         if self.state.load.in_flight {
             return None;
         }
@@ -2338,6 +2377,7 @@ impl AppController {
     /// / [`ShellEvent::EntryRefused`]. Clears the in-flight flag. `None` when
     /// nothing is parked (called with no load having settled).
     pub fn settle_open(&mut self) -> Option<OpenOutcome> {
+        let _scope = measurement_scope("gui_settle_open");
         let result = self
             .state
             .load
@@ -2427,11 +2467,7 @@ impl AppController {
     /// for `outcome`'s own projects -- both [`Self::open_paths`] and
     /// [`Self::answer_question`] decode on their worker before parking the
     /// outcome here, so [`ProjectTab::new`] never decodes one of its own.
-    fn resolve_open(
-        &mut self,
-        outcome: OpenOutcome,
-        thumbnails: Vec<Option<Arc<overlay::Thumbnail>>>,
-    ) -> OpenOutcome {
+    fn resolve_open(&mut self, outcome: OpenOutcome, thumbnails: Vec<Preloaded>) -> OpenOutcome {
         match outcome {
             OpenOutcome::Opened(opened) => {
                 let skipped = opened.skipped.clone();
@@ -2457,7 +2493,7 @@ impl AppController {
     /// project whose sources do not all resolve gets a `Sources missing`
     /// failure on its own tab; a path that opens successfully clears any
     /// `Not a project` card already held for it.
-    fn accept(&mut self, opened: Opened, thumbnails: Vec<Option<Arc<overlay::Thumbnail>>>) {
+    fn accept(&mut self, opened: Opened, thumbnails: Vec<Preloaded>) {
         self.state.notice = notice_line(&opened.skipped);
         self.state.last_refusal = None;
         for skipped in &opened.skipped {
@@ -2484,13 +2520,13 @@ impl AppController {
                 } else {
                     false
                 };
-                let source = match thumbnails.next() {
-                    Some(decoded) => ThumbnailSource::Decoded(decoded),
-                    None => ThumbnailSource::NotAttempted,
+                let (source, meta) = match thumbnails.next() {
+                    Some((decoded, meta)) => (ThumbnailSource::Decoded(decoded), Some(meta)),
+                    None => (ThumbnailSource::NotAttempted, None),
                 };
                 self.next_tab_id += 1;
                 let id = self.next_tab_id;
-                let mut tab = ProjectTab::new(project, id, source);
+                let mut tab = ProjectTab::new(project, id, source, meta);
                 if sources_missing {
                     tab.failure = Some(TabFailure {
                         kind: FailureKind::SourcesMissing,
@@ -3057,6 +3093,7 @@ impl AppController {
             .collect();
         if candidates.iter().all(|p| p.is_file()) {
             let tab = &mut self.state.projects[index];
+            tab.meta.extend(images::read_metadata(&candidates));
             tab.excluded = vec![false; candidates.len()];
             tab.frames = candidates;
             tab.selected = images::first_included(&tab.excluded);
@@ -3083,7 +3120,7 @@ impl AppController {
         let offset = settings_panel::clamp_panel_scroll(offset_px, content_height, viewport_height);
         if offset != self.state.gallery_scroll_y {
             self.state.gallery_scroll_y = offset;
-            self.emit(ShellEvent::OverlayChanged);
+            self.emit(ShellEvent::GalleryScrolled);
         }
     }
 
@@ -3143,7 +3180,7 @@ impl AppController {
             content_height,
             self.state.gallery_viewport_height,
         );
-        self.emit(ShellEvent::OverlayChanged);
+        self.emit(ShellEvent::GalleryScrolled);
     }
 
     pub fn gallery_scroll_y(&self) -> f32 {
@@ -3358,7 +3395,7 @@ impl AppController {
         let offset = settings_panel::clamp_panel_scroll(offset_px, content_height, viewport_height);
         if offset != self.state.settings_scroll_y {
             self.state.settings_scroll_y = offset;
-            self.emit(ShellEvent::SettingsChanged);
+            self.emit(ShellEvent::SettingsScrolled);
         }
     }
 
@@ -3426,7 +3463,7 @@ impl AppController {
             content_height,
             self.state.settings_viewport_height,
         );
-        self.emit(ShellEvent::SettingsChanged);
+        self.emit(ShellEvent::SettingsScrolled);
     }
 
     pub fn settings_scroll_y(&self) -> f32 {
@@ -3441,24 +3478,23 @@ impl AppController {
     /// Builds the whole `Images` panel for the active tab -- empty with no
     /// tab active ("+" selected).
     pub fn images_panel(&self) -> images::ImagesModel {
-        let viewport_height = self.state.images_viewport_height;
         let legend = self.mode() == ShellMode::Editor;
         let Some(tab) = self.state.active() else {
-            return images::build_model(&[], &[], None, 0.0, legend);
+            return images::build_model(&[], &[], None, legend, &HashMap::new());
         };
-        let content_height = tab.frames.len() as f32 * images::ROW_HEIGHT;
-        let scroll_y = settings_panel::clamp_panel_scroll(
-            self.state.images_scroll_y,
-            content_height,
-            viewport_height,
-        );
         images::build_model(
             &tab.frames,
             &tab.excluded,
             Some(tab.selected),
-            scroll_y,
             legend,
+            &tab.meta,
         )
+    }
+
+    fn images_content_height(&self) -> f32 {
+        self.state
+            .active()
+            .map_or(0.0, |tab| tab.frames.len() as f32 * images::ROW_HEIGHT)
     }
 
     /// The active tab's checkpoint count, `0` with none active -- what every
@@ -3675,6 +3711,7 @@ impl AppController {
         tab.excluded
             .extend(std::iter::repeat_n(false, plan.add.len()));
         tab.frame_sort = None;
+        tab.read_missing_meta();
     }
 
     /// Removes the frame at `index` -- immediately, before the first
@@ -3816,14 +3853,24 @@ impl AppController {
     /// drag there; `Up` commits it, moving the row by however many whole
     /// [`images::ROW_HEIGHT`] steps `mouse_y` has travelled from the press;
     /// `Move` updates [`Self::drag_offset`], the floating copy's live
-    /// position. A no-op outside stacking mode or while this tab's own job
-    /// is running.
+    /// position. `Move` and `Up` belong to the drag in progress whatever
+    /// their `index`. A no-op outside stacking mode or while this tab's own
+    /// job is running; `Down` on an unresolved row or past the end starts
+    /// nothing.
     pub fn frame_drag_pointer(&mut self, index: usize, kind: PointerKind, mouse_y: f32) {
         if self.mode() != ShellMode::Stacking || self.job_running() {
             return;
         }
         match kind {
             PointerKind::Down => {
+                let draggable = self.state.active().is_some_and(|tab| {
+                    tab.frames
+                        .get(index)
+                        .is_some_and(|path| tab.meta.get(path).is_some_and(|meta| !meta.unresolved))
+                });
+                if !draggable {
+                    return;
+                }
                 self.state.drag_row = Some(DragRow {
                     from: index,
                     press_y: mouse_y,
@@ -3835,9 +3882,6 @@ impl AppController {
                 let Some(drag) = self.state.drag_row.as_mut() else {
                     return;
                 };
-                if drag.from != index {
-                    return;
-                }
                 drag.current_y = mouse_y;
                 self.emit(ShellEvent::ImagesChanged);
             }
@@ -3868,7 +3912,7 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        let order = images::sort_order(&tab.frames, sort);
+        let order = images::sort_order(&tab.frames, sort, &tab.meta);
         tab.reorder(&order);
         tab.frame_sort = Some(sort);
     }
@@ -4191,6 +4235,7 @@ impl AppController {
             entry::duplicate_as_unsaved(dir, name, tab.frames.clone()),
             id,
             ThumbnailSource::NotAttempted,
+            Some(tab.meta.clone()),
         );
         new_tab.fuse_id = tab.fuse_id.clone();
         new_tab.align_id = tab.align_id.clone();
@@ -4203,19 +4248,28 @@ impl AppController {
     }
 
     fn set_images_scroll(&mut self, offset_px: f32) {
-        let content_height = self.images_panel().content_height;
-        let viewport_height = self.state.images_viewport_height;
-        let offset = settings_panel::clamp_panel_scroll(offset_px, content_height, viewport_height);
-        if offset != self.state.images_scroll_y {
-            self.state.images_scroll_y = offset;
-            self.emit(ShellEvent::ImagesChanged);
+        if self.images_viewport_scrolled(offset_px) {
+            self.emit(ShellEvent::ImagesScrolled);
         }
+    }
+
+    /// Mirrors the `Images` list's own scroll offset, clamped, with no event
+    /// -- the list already shows it. Returns whether the offset moved.
+    pub fn images_viewport_scrolled(&mut self, offset_px: f32) -> bool {
+        let offset = settings_panel::clamp_panel_scroll(
+            offset_px,
+            self.images_content_height(),
+            self.state.images_viewport_height,
+        );
+        let moved = offset != self.state.images_scroll_y;
+        self.state.images_scroll_y = offset;
+        moved
     }
 
     /// The `Images` panel scrollbar thumb's current `(top, height)` in
     /// track-pixel space -- [`Self::settings_scrollbar_thumb`]'s twin.
     fn images_scrollbar_thumb(&self) -> (f32, f32) {
-        let content_height = self.images_panel().content_height;
+        let content_height = self.images_content_height();
         let viewport_height = self.state.images_viewport_height;
         if content_height <= 0.0 {
             return (0.0, viewport_height);
@@ -4235,7 +4289,7 @@ impl AppController {
                     self.state.images_scrollbar_drag = Some(mouse_y - thumb_top);
                 } else {
                     let viewport_height = self.state.images_viewport_height.max(1.0);
-                    let content_height = self.images_panel().content_height;
+                    let content_height = self.images_content_height();
                     let target_top = mouse_y - thumb_height / 2.0;
                     self.set_images_scroll(target_top * content_height / viewport_height);
                     self.state.images_scrollbar_drag = Some(thumb_height / 2.0);
@@ -4253,7 +4307,7 @@ impl AppController {
             return;
         };
         let viewport_height = self.state.images_viewport_height.max(1.0);
-        let content_height = self.images_panel().content_height;
+        let content_height = self.images_content_height();
         let target_top = mouse_y - grab_offset;
         self.set_images_scroll(target_top * content_height / viewport_height);
     }
@@ -4262,17 +4316,17 @@ impl AppController {
     /// and on every resize; re-clamps the scroll offset.
     pub fn set_images_viewport_height(&mut self, height: f32) {
         self.state.images_viewport_height = height.max(0.0);
-        let content_height = self.images_panel().content_height;
-        self.state.images_scroll_y = settings_panel::clamp_panel_scroll(
-            self.state.images_scroll_y,
-            content_height,
-            self.state.images_viewport_height,
-        );
-        self.emit(ShellEvent::ImagesChanged);
+        self.images_viewport_scrolled(self.state.images_scroll_y);
+        self.emit(ShellEvent::ImagesScrolled);
     }
 
+    /// The `Images` list's scroll offset, clamped to the active tab's rows.
     pub fn images_scroll_y(&self) -> f32 {
-        self.state.images_scroll_y
+        settings_panel::clamp_panel_scroll(
+            self.state.images_scroll_y,
+            self.images_content_height(),
+            self.state.images_viewport_height,
+        )
     }
 
     /// The current index of the tab carrying id `id`, if it is still open --
@@ -4393,12 +4447,19 @@ impl AppController {
 
     /// Refuses a run whose recorded frame is no longer on disk, naming it
     /// in the message -- shared by [`Self::start_fuse`] and the queue
-    /// promotion [`Self::settle_job`] runs.
+    /// promotion [`Self::settle_job`] runs. Every tab holding that frame
+    /// shows it unresolved from then on.
     fn refuse_missing_frame(&mut self, missing: &Path) {
         self.refuse_message(format!(
             "{} is no longer on disk. This project cannot be fused again until it is back.",
             missing.display()
         ));
+        for tab in &mut self.state.projects {
+            if let Some(meta) = tab.meta.get_mut(missing) {
+                meta.unresolved = true;
+            }
+        }
+        self.emit(ShellEvent::ImagesChanged);
     }
 
     /// If another run is live, enqueues tab `id` unless it already holds
@@ -4788,6 +4849,7 @@ impl AppController {
         tab.excluded = vec![false; tab.frames.len()];
         tab.selected = images::first_included(&tab.excluded);
         tab.frame_sort = None;
+        tab.read_missing_meta();
         tab.edit = None;
         tab.thumbnail = overlay::render_thumbnail_from_frame(&held.composite).map(Arc::new);
         tab.failure = None;
@@ -4897,6 +4959,7 @@ impl AppController {
         index: usize,
         pick: impl FnOnce(&Path) -> Option<PathBuf>,
     ) -> bool {
+        let _scope = measurement_scope("gui_save_project");
         let Some(tab) = self.state.projects.get(index) else {
             return false;
         };
@@ -4944,6 +5007,7 @@ impl AppController {
     /// active tab's own planes and answers `Load`, or `Clear` when it has
     /// none (no tab active, `+` selected, or nothing fused yet).
     pub fn canvas_feed(&mut self, loaded: Option<usize>) -> crate::canvas::CanvasFeed {
+        let _scope = measurement_scope("gui_canvas_feed");
         if loaded == self.state.active && !self.state.canvas_dirty {
             return crate::canvas::CanvasFeed::Keep;
         }

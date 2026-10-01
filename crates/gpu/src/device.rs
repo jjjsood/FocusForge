@@ -40,11 +40,18 @@ pub enum GpuError {
     #[error("failed to create wgpu device: {0}")]
     RequestDevice(#[from] wgpu::RequestDeviceError),
 
-    /// A tile's own largest single buffer would exceed a hard device limit
-    /// (`crate::budget::buffer_limit_shortfalls`), refused before dispatch
-    /// rather than surfacing as a wgpu validation panic.
-    #[error("tile needs a buffer this device cannot allocate: {detail}")]
+    /// A tile's largest single buffer or its dispatch would exceed a hard
+    /// device limit (`crate::budget::buffer_limit_shortfalls`,
+    /// `crate::budget::dispatch_limit_shortfall`), refused before any read or
+    /// allocation rather than surfacing as a wgpu validation error.
+    #[error("tile exceeds a device limit: {detail}")]
     TileTooLarge { detail: String },
+
+    /// A dispatch failed wgpu validation inside
+    /// [`crate::errors::with_validation_scope`], so its output buffers were
+    /// never written.
+    #[error("kernel {kernel} failed validation: {detail}")]
+    KernelValidation { kernel: String, detail: String },
 
     /// A readback (`crate::transfer::download_buffer`/`download_f32`)
     /// failed: `device.poll` failed, the `map_async` callback never fired,
@@ -86,10 +93,12 @@ impl GpuError {
         GpuError::TileTooLarge {
             detail: format!(
                 "{}; the adapter itself allows up to max_storage_buffer_binding_size={} \
-                 max_buffer_size={} -- raise crate::limits::required_limits() to use more",
+                 max_buffer_size={} max_compute_workgroups_per_dimension={} -- raise \
+                 crate::limits::required_limits() to use more",
                 describe_shortfalls(shortfalls),
                 adapter_limits.max_storage_buffer_binding_size,
                 adapter_limits.max_buffer_size,
+                adapter_limits.max_compute_workgroups_per_dimension,
             ),
         }
     }

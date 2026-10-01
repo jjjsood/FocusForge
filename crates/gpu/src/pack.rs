@@ -16,10 +16,20 @@
 //! the odd-sample-count case (5 samples -> 3 words -> 12 bytes: a multiple
 //! of 4, not of 8, which is also legal).
 
-/// Packs `samples` two-per-word, low half first, into little-endian bytes.
-/// An odd sample count pads the final word's high half with `0`.
+/// [`pack_samples_into`] into a freshly allocated `Vec`.
 pub fn pack_samples(samples: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(packed_len(samples.len()));
+    pack_samples_into(samples, &mut out);
+    out
+}
+
+/// Packs `samples` two-per-word, low half first, into little-endian bytes,
+/// written into `out`. An odd sample count pads the final word's high half
+/// with `0`. `out` is cleared first and its capacity kept, so a caller
+/// reusing the same `Vec` across calls reallocates only when a pack grows
+/// past its current capacity.
+pub fn pack_samples_into(samples: &[u16], out: &mut Vec<u8>) {
+    out.clear();
     let mut pairs = samples.chunks_exact(2);
     for pair in &mut pairs {
         let word = u32::from(pair[0]) | (u32::from(pair[1]) << 16);
@@ -29,7 +39,6 @@ pub fn pack_samples(samples: &[u16]) -> Vec<u8> {
         let word = u32::from(*last);
         out.extend_from_slice(&word.to_le_bytes());
     }
-    out
 }
 
 /// The inverse of [`pack_samples`]: unpacks exactly `sample_count` samples
@@ -99,5 +108,33 @@ mod tests {
     fn packed_len_of_an_even_word_count() {
         assert_eq!(packed_len(4), 8);
         assert_eq!(packed_len(0), 0);
+    }
+
+    #[test]
+    fn pack_samples_into_matches_pack_samples_for_even_and_odd_counts() {
+        for samples in [&[0u16, 1, 65535, 12345][..], &[10, 20, 30, 40, 50][..]] {
+            let mut out = Vec::new();
+            pack_samples_into(samples, &mut out);
+            assert_eq!(out, pack_samples(samples));
+        }
+    }
+
+    #[test]
+    fn pack_samples_into_a_shorter_refill_leaves_no_stale_tail() {
+        let long: Vec<u16> = (0..20).collect();
+        let short: Vec<u16> = vec![1, 2, 3];
+
+        let mut out = Vec::new();
+        pack_samples_into(&long, &mut out);
+        let capacity_after_long = out.capacity();
+
+        pack_samples_into(&short, &mut out);
+
+        assert_eq!(out, pack_samples(&short));
+        assert_eq!(
+            out.capacity(),
+            capacity_after_long,
+            "refilling shorter must keep the capacity from the longer pack"
+        );
     }
 }

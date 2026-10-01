@@ -93,6 +93,10 @@ pub struct AlignReport {
     /// `stack --json`.
     pub align_workers: Option<usize>,
     pub peak_align_workers: Option<usize>,
+    /// The bytes the alignment accounted for: the shared reference data plus
+    /// one registration per worker. An explicit budget below one
+    /// registration still runs one worker, so this can exceed the budget.
+    pub align_accounted_bytes: u64,
 }
 
 /// One frame's row in [`AlignReport::alignments`]: `#[serde(flatten)]`ed
@@ -151,6 +155,7 @@ pub fn run(
     lax: bool,
     write_warped: Option<&Path>,
     set: &SetArgs,
+    max_host_memory: Option<u64>,
     quiet: bool,
     preset_opts: &PresetOptions<'_>,
     no_gpu: bool,
@@ -213,7 +218,10 @@ pub fn run(
         Ok(paths) => paths,
         Err(err) => return sink.fail(err),
     };
-    let opened = match open_frame_set(&paths, TileSchedulerOptions::new(".scratch").budget) {
+    let budget = TileSchedulerOptions::new(".scratch")
+        .budget
+        .capped_to(max_host_memory);
+    let opened = match open_frame_set(&paths, budget) {
         Ok(opened) => opened,
         Err(err) => return sink.fail(err),
     };
@@ -249,7 +257,10 @@ pub fn run(
         frame_reader,
         &values,
         policy,
-        &AlignDriverOptions::default(),
+        &AlignDriverOptions {
+            budget: opened.scheduler_budget,
+            ..Default::default()
+        },
     ) {
         Ok(run) => run,
         Err(err) => return sink.fail(err),
@@ -328,6 +339,7 @@ pub fn run(
         align_source: "computed".to_string(),
         align_workers: Some(run.worker_limit),
         peak_align_workers: Some(run.peak_workers),
+        align_accounted_bytes: run.accounted_bytes,
     };
 
     if json {

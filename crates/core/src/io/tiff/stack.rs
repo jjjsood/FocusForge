@@ -17,6 +17,7 @@ use super::super::paths::scan_frames;
 use super::super::{TIFF_EXTENSIONS, has_extension};
 use super::header::{TAG_STRIP_OFFSETS, TiffHeader};
 use crate::tile::{Rect, Tile};
+use crate::timing::{TimingCounter, measurement_scope, record_timing};
 
 /// A directory of TIFF frames, opened once, mapped lazily per frame.
 ///
@@ -157,6 +158,7 @@ impl TiffStack {
         step: NonZeroU32,
         out: &mut [u16],
     ) -> Result<(), TiffError> {
+        let _scope = measurement_scope("tiff_read");
         let header = &self.headers[frame];
         let path = &header.path;
 
@@ -261,6 +263,10 @@ impl TiffStack {
             out_off += out_row_len;
         }
 
+        record_timing(
+            TimingCounter::ConvertedBytes,
+            std::mem::size_of_val(out) as u64,
+        );
         Ok(())
     }
 }
