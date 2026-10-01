@@ -37,29 +37,14 @@ use focusforge_core::io::TiffStack;
 use focusforge_core::io::test_frames::write_frame_with_capture_time;
 use raw_dng::{DngSpec, write_dng};
 
+use common::CliOutput;
+
 fn bin() -> Command {
     common::cli_bin("groups_cli")
 }
 
-struct CliOutput {
-    success: bool,
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
-    let output = bin()
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("failed to run binary");
-    CliOutput {
-        success: output.status.success(),
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    common::run_in(&mut bin(), dir, args)
 }
 
 fn frame(dir: &Path, name: &str, when: Option<&str>) {

@@ -277,8 +277,8 @@ pub trait StackAlgorithm: Send + Sync + 'static {
     ///    parameter, so `cfg` (which `crate::params::resolve` fills with
     ///    exactly one entry per *declared* parameter, nothing else) never
     ///    carries that key -- the default answers `0`, i.e. no margin, with
-    ///    no work from the algorithm's author. Weighted Average and the
-    ///    Depth Map inherit this without ever thinking about margins.
+    ///    no work from the algorithm's author. (Weighted Average and the
+    ///    Depth Map override it with a margin derived from their radii.)
     /// 2. **An algorithm that does build a pyramid and spells its depth
     ///    parameter `"levels"`** (`laplacian` does) gets the right answer
     ///    from this same default, reading the identical resolved map `fuse`

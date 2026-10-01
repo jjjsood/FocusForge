@@ -10,30 +10,35 @@ pub(crate) struct Pipeline {
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
-pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+fn entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
+        ty,
         count: None,
     }
 }
 
-pub(crate) fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
+pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+    entry(
         binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
+        wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+    )
+}
+
+pub(crate) fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    entry(
+        binding,
+        wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Uniform,
             has_dynamic_offset: false,
             min_binding_size: None,
         },
-        count: None,
-    }
+    )
 }
 
 /// A write-only `Rgba8Unorm` storage-texture binding -- the display kernel's
@@ -42,16 +47,14 @@ pub(crate) fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 /// textures per stage (inherited from `defaults()`), so the device limits
 /// carry this unchanged.
 pub(crate) fn storage_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
+    entry(
         binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::StorageTexture {
+        wgpu::BindingType::StorageTexture {
             access: wgpu::StorageTextureAccess::WriteOnly,
             format: wgpu::TextureFormat::Rgba8Unorm,
             view_dimension: wgpu::TextureViewDimension::D2,
         },
-        count: None,
-    }
+    )
 }
 
 /// Builds one [`Pipeline`]: shader module, bind group layout, pipeline

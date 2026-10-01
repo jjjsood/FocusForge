@@ -12,43 +12,20 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::process::Command;
+
+use common::{CliOutput, mantis_512_dir, tmp_dir};
 
 fn bin() -> Command {
     common::cli_bin("align_cli")
 }
 
-fn mantis_512_dir() -> PathBuf {
-    common::fixtures_dir().join("mantis-512")
-}
-
-fn tmp_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
-}
-
-fn tmp_dir(name: &str) -> PathBuf {
-    let dir = tmp_path(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-struct CliOutput {
-    success: bool,
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
 fn run_cli(args: &[&str]) -> CliOutput {
-    let output = bin().args(args).output().expect("failed to run binary");
-    CliOutput {
-        success: output.status.success(),
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    bin()
+        .args(args)
+        .output()
+        .expect("failed to run binary")
+        .into()
 }
 
 #[test]

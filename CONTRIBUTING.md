@@ -63,7 +63,7 @@ fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the tes
 - `focusforge-diagnostics`: `tracing`/`tracing-subscriber` (with the
   `tracing-log` bridge, so `log`-crate records from `wgpu`/`naga` land in
   the same sinks), `directories`, `crash-handler`/`minidumper` (the
-  native-crash sidecar), `zip` (diagnostics bundle). `tracing-tracy` and
+  native-crash sidecar), `thiserror`, `zip` (diagnostics bundle). `tracing-tracy` and
   `tracing-chrome` are pulled in only behind its own `trace` Cargo feature,
   which `focusforge-cli` and `focusforge-gui` forward.
 - Every dependency's license is checked against an allowlist in

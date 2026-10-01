@@ -16,10 +16,21 @@ pub fn all_frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
     let mut extensions = Vec::with_capacity(TIFF_EXTENSIONS.len() + RAW_EXTENSIONS.len());
     extensions.extend_from_slice(TIFF_EXTENSIONS);
     extensions.extend_from_slice(RAW_EXTENSIONS);
-    let paths = frame_paths_for_extensions(dir, &extensions)?;
-    let paths: Vec<_> = paths
+    scan_frames(dir, &extensions, |path| {
+        !has_extension(path, TIFF_EXTENSIONS) || is_frame_path(path)
+    })
+}
+
+/// [`frame_paths_for_extensions`] narrowed to the paths `keep` accepts;
+/// `NoFrames` when nothing survives, naming `dir/frames` when it exists.
+pub(crate) fn scan_frames(
+    dir: &Path,
+    extensions: &[&str],
+    keep: impl Fn(&Path) -> bool,
+) -> Result<Vec<PathBuf>, TiffError> {
+    let paths: Vec<_> = frame_paths_for_extensions(dir, extensions)?
         .into_iter()
-        .filter(|path| !has_extension(path, TIFF_EXTENSIONS) || is_frame_path(path))
+        .filter(|path| keep(path))
         .collect();
     if paths.is_empty() {
         let frames = dir.join("frames");

@@ -12,25 +12,10 @@ use focusforge_core::zmap::{NO_SOURCE, ZMapReader, overlay_table};
 use focusforge_gpu::device::shared_device_or_skip;
 use focusforge_gpu::display::{DisplayTexture, read_display_texture, render, render_overlay};
 
-use crate::common;
+use crate::common::{self, worst_delta};
 
 fn golden_dir() -> std::path::PathBuf {
     common::mantis_512_dir().join("golden")
-}
-
-/// Worst absolute `u8` delta between two equal-length RGBA8 byte buffers,
-/// plus the byte index it occurred at.
-fn worst_delta(gpu: &[u8], cpu: &[u8]) -> (i32, usize) {
-    let mut worst = 0i32;
-    let mut worst_index = 0usize;
-    for (i, (&g, &c)) in gpu.iter().zip(cpu.iter()).enumerate() {
-        let delta = (i32::from(g) - i32::from(c)).abs();
-        if delta > worst {
-            worst = delta;
-            worst_index = i;
-        }
-    }
-    (worst, worst_index)
 }
 
 #[test]

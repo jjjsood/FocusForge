@@ -39,6 +39,26 @@ pub struct Rect {
     pub height: u32,
 }
 
+impl Rect {
+    /// The overlap of `self` and `other`, both in the same coordinate space.
+    /// `None` when the overlap is empty, including rects that only touch.
+    pub fn intersect(self, other: Rect) -> Option<Rect> {
+        let x0 = self.x.max(other.x);
+        let y0 = self.y.max(other.y);
+        let x1 = (self.x + self.width).min(other.x + other.width);
+        let y1 = (self.y + self.height).min(other.y + other.height);
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some(Rect {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        })
+    }
+}
+
 /// An owned crop of one frame's pixels.
 ///
 /// `samples` is chunky, row-major, native-endian `u16`, with length exactly
@@ -177,6 +197,28 @@ mod tests {
             Err(TileError::CropOutOfBounds { .. }) => {}
             other => panic!("expected CropOutOfBounds, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rect_intersect_clips_overlap_and_rejects_touching_or_disjoint() {
+        let rect = |x, y, width, height| Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let a = rect(10, 20, 8, 6);
+        // Partial overlap clips to the shared window, in either order.
+        assert_eq!(a.intersect(rect(14, 22, 10, 10)), Some(rect(14, 22, 4, 4)));
+        assert_eq!(rect(14, 22, 10, 10).intersect(a), Some(rect(14, 22, 4, 4)));
+        // Containment yields the inner rect.
+        assert_eq!(a.intersect(rect(11, 21, 2, 2)), Some(rect(11, 21, 2, 2)));
+        assert_eq!(rect(11, 21, 2, 2).intersect(a), Some(rect(11, 21, 2, 2)));
+        // Edge-touching rects share no pixels.
+        assert_eq!(a.intersect(rect(18, 20, 4, 6)), None);
+        assert_eq!(a.intersect(rect(10, 26, 8, 3)), None);
+        // Disjoint rects.
+        assert_eq!(a.intersect(rect(40, 50, 4, 4)), None);
     }
 
     #[test]

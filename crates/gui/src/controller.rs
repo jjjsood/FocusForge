@@ -1287,10 +1287,6 @@ impl AppController {
         u16::try_from(self.state.active()?.selected).ok()
     }
 
-    pub fn dock_tab(&self) -> DockTab {
-        self.state.dock_tab
-    }
-
     pub fn select_dock_tab(&mut self, tab: DockTab) {
         self.state.dock_tab = tab;
         self.emit(ShellEvent::DockTabSelected(tab));
@@ -2197,7 +2193,7 @@ impl AppController {
         }
     }
 
-    pub fn set_space_held(&mut self, held: bool) {
+    fn set_space_held(&mut self, held: bool) {
         self.state.input.space_held = held;
     }
 
@@ -2234,10 +2230,6 @@ impl AppController {
 
     pub fn unimplemented_actions(&self) -> &[Action] {
         &self.state.input.unimplemented
-    }
-
-    pub fn settings_open(&self) -> bool {
-        self.state.settings_open
     }
 
     pub fn open_settings(&mut self) -> bool {
@@ -3316,7 +3308,7 @@ impl AppController {
 
     /// Opens or closes one picker/enum menu, `key` being the row's own
     /// `"<section>:<id>"` -- only one menu is ever open at a time.
-    pub fn toggle_param_menu(&mut self, key: &str) {
+    fn toggle_param_menu(&mut self, key: &str) {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -3328,7 +3320,7 @@ impl AppController {
         self.emit(ShellEvent::SettingsChanged);
     }
 
-    /// [`Self::toggle_param_menu`], composing the row key from its own
+    /// `toggle_param_menu`, composing the row key from its own
     /// section and id -- what a picker/enum row's own callback reaches
     /// through, so the `"<section>:<id>"` format stays this module's alone.
     pub fn toggle_param_menu_for(&mut self, section: &str, id: &str) {
@@ -3774,7 +3766,7 @@ impl AppController {
     }
 
     /// Opens or closes the sort menu -- the same externally-driven
-    /// convention [`Self::toggle_param_menu`] uses for a settings row. A
+    /// convention `toggle_param_menu` uses for a settings row. A
     /// no-op outside stacking mode.
     pub fn toggle_images_sort_menu(&mut self) {
         if self.mode() != ShellMode::Stacking {
@@ -3976,7 +3968,7 @@ impl AppController {
         }
     }
 
-    /// `Save and close`: saves the asking tab as [`Self::save_project_at`]
+    /// `Save and close`: saves the asking tab as `save_project_at`
     /// does, then closes it only if the save wrote. Returns whether it wrote;
     /// the question is cleared either way.
     pub fn save_and_close(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> bool {
@@ -4035,7 +4027,7 @@ impl AppController {
     }
 
     /// `Save all and quit`: saves every tab holding checkpoints no `.ffp`
-    /// contains, in order, as [`Self::save_project_at`] does. The first save
+    /// contains, in order, as `save_project_at` does. The first save
     /// that does not write stops the loop and cancels the quit -- whatever
     /// already saved stays saved. Returns whether every save wrote.
     pub fn save_all_and_quit(&mut self, pick: impl Fn(&Path) -> Option<PathBuf>) -> bool {
@@ -4323,7 +4315,7 @@ impl AppController {
     /// (`Fuse stack` or, on a failed tab, `Retry`) were pressed right now:
     /// another run is live and this tab holds none of it -- neither the
     /// live run, a place in the queue, nor a pause.
-    pub fn would_queue(&self, index: usize) -> bool {
+    fn would_queue(&self, index: usize) -> bool {
         self.any_job_running()
             && self.state.projects.get(index).is_some_and(|tab| {
                 !matches!(tab.run, job::RunState::Running | job::RunState::Paused)
@@ -4890,7 +4882,7 @@ impl AppController {
         !self.held_checkpoints().is_empty()
     }
 
-    /// [`Self::save_project_at`] on the active tab; `false` with none active.
+    /// `save_project_at` on the active tab; `false` with none active.
     pub fn save_active_project(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> bool {
         self.active_project()
             .is_some_and(|index| self.save_project_at(index, pick))
@@ -4900,7 +4892,7 @@ impl AppController {
     /// tab asks `pick`, proposing `<frames dir>/<group name>.ffp`; an opened
     /// one appends to its own file. A failed write keeps everything held and
     /// leaves [`Self::take_settled_failure`] a message. Returns whether it wrote.
-    pub fn save_project_at(
+    fn save_project_at(
         &mut self,
         index: usize,
         pick: impl FnOnce(&Path) -> Option<PathBuf>,

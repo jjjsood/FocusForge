@@ -23,17 +23,9 @@ mod common;
 
 use std::path::Path;
 
+use common::full_rect;
 use focusforge_core::fuse::metrics::{block_mean_ssim, laplacian_variance, psnr};
-use focusforge_core::io::{Rect, TiffStack};
-
-fn full_rect(width: u32, height: u32) -> Rect {
-    Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    }
-}
+use focusforge_core::io::TiffStack;
 
 /// Whole-image read: samples, width, height, samples-per-pixel,
 /// bits-per-sample. This reader opens the `MM`/`RowsPerStrip = 8`

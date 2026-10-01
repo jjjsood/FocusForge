@@ -13,8 +13,9 @@ use memmap2::Mmap;
 
 use super::super::error::TiffError;
 use super::super::frame::{FrameDesc, FrameReader};
-use super::super::{TIFF_EXTENSIONS, frame_paths_for_extensions, has_extension};
-use super::header::{ByteOrder, TAG_STRIP_OFFSETS, TiffHeader};
+use super::super::paths::scan_frames;
+use super::super::{TIFF_EXTENSIONS, has_extension};
+use super::header::{TAG_STRIP_OFFSETS, TiffHeader};
 use crate::tile::{Rect, Tile};
 
 /// A directory of TIFF frames, opened once, mapped lazily per frame.
@@ -245,7 +246,7 @@ impl TiffStack {
             if step == 1 {
                 // The CPU pipeline's hot path: one flat per-sample loop.
                 for (i, chunk) in row_slice.chunks_exact(2).enumerate() {
-                    out_row[i] = decode_sample(header.byte_order, chunk);
+                    out_row[i] = header.byte_order.u16_from([chunk[0], chunk[1]]);
                 }
             } else {
                 let pixels = row_slice
@@ -253,7 +254,7 @@ impl TiffStack {
                     .step_by(step as usize);
                 for (dst, pixel) in out_row.chunks_exact_mut(spp).zip(pixels) {
                     for (d, chunk) in dst.iter_mut().zip(pixel.chunks_exact(2)) {
-                        *d = decode_sample(header.byte_order, chunk);
+                        *d = header.byte_order.u16_from([chunk[0], chunk[1]]);
                     }
                 }
             }
@@ -278,14 +279,6 @@ impl FrameReader for TiffStack {
     }
 }
 
-#[inline(always)]
-fn decode_sample(order: ByteOrder, chunk: &[u8]) -> u16 {
-    match order {
-        ByteOrder::Little => u16::from_le_bytes([chunk[0], chunk[1]]),
-        ByteOrder::Big => u16::from_be_bytes([chunk[0], chunk[1]]),
-    }
-}
-
 fn past_eof(path: &Path) -> TiffError {
     TiffError::ValuePastEof {
         path: path.to_path_buf(),
@@ -300,22 +293,7 @@ fn past_eof(path: &Path) -> TiffError {
 /// enumerated the same way by both, by construction rather than by a second
 /// copy of the rule.
 pub fn frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
-    let paths = frame_paths_for_extensions(dir, TIFF_EXTENSIONS)?;
-    let paths: Vec<_> = paths
-        .into_iter()
-        .filter(|path| is_frame_path(path))
-        .collect();
-    if paths.is_empty() {
-        let frames = dir.join("frames");
-        return Err(TiffError::NoFrames {
-            path: if frames.is_dir() {
-                frames
-            } else {
-                dir.to_path_buf()
-            },
-        });
-    }
-    Ok(paths)
+    scan_frames(dir, TIFF_EXTENSIONS, is_frame_path)
 }
 
 /// The composite plane every fuse writes beside its source frames.

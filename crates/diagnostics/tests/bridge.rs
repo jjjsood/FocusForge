@@ -39,7 +39,7 @@ fn tracing_events_and_log_records_both_reach_the_file_sink() {
     });
     let log_path = diagnostics.log_path().expect("file sink must have opened");
 
-    log::warn!(target: "some_third_party_crate", "a log-crate warning");
+    tracing_log::log::warn!(target: "some_third_party_crate", "a log-crate warning");
     tracing::warn!(target: "focusforge_core", "a tracing warning");
 
     let lines = read_lines(log_path);

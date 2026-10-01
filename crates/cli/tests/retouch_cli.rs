@@ -11,6 +11,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use common::CliOutput;
 use focusforge_core::display::tonemap_cpu;
 use focusforge_core::io::TiffStack;
 use focusforge_core::project::Op;
@@ -22,23 +23,8 @@ fn bin(test_name: &str) -> Command {
     common::cli_bin(test_name)
 }
 
-struct CliOutput {
-    success: bool,
-    stdout: String,
-    stderr: String,
-}
-
 fn run_cli(dir: &Path, cmd: &mut Command, args: &[&str]) -> CliOutput {
-    let output = cmd
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("failed to run binary");
-    CliOutput {
-        success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    common::run_in(cmd, dir, args)
 }
 
 /// A 37x23, 10-frame synthetic map: `(x + y) % 10` per pixel, so its content

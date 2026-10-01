@@ -409,9 +409,8 @@ pub fn validate(schema: &[ParamDesc], values: &ParamValues) -> Result<(), ParamE
 /// kind — an `Int` accepted against a `Float` descriptor is stored as
 /// `Float`, so no consumer has to know the widening rule existed.
 ///
-/// A thin wrapper over [`resolve_in`], kept so every existing call site
-/// compiles unchanged: `resolve_in(schema, values, Some(ctx),
-/// &crate::host::snapshot())`.
+/// Resolves against the current host snapshot; equivalent to
+/// `resolve_in(schema, values, Some(ctx), &crate::host::snapshot())`.
 pub fn resolve(
     schema: &[ParamDesc],
     values: &ParamValues,

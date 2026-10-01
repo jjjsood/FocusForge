@@ -11,27 +11,12 @@ use focusforge_core::zmap::{NO_SOURCE, ZMapReader};
 use focusforge_gpu::device::shared_device_or_skip;
 use focusforge_gpu::recomposite::recomposite as recomposite_gpu;
 
-use crate::common;
+use crate::common::{self, worst_delta};
 
 fn golden_zmap_path() -> std::path::PathBuf {
     common::mantis_512_dir()
         .join("golden")
         .join("laplacian-zmap.tif")
-}
-
-/// Worst absolute `u16` delta between two equal-length sample buffers, plus
-/// the sample index it occurred at.
-fn worst_delta(gpu: &[u16], cpu: &[u16]) -> (i32, usize) {
-    let mut worst = 0i32;
-    let mut worst_index = 0usize;
-    for (i, (&g, &c)) in gpu.iter().zip(cpu.iter()).enumerate() {
-        let delta = (i32::from(g) - i32::from(c)).abs();
-        if delta > worst {
-            worst = delta;
-            worst_index = i;
-        }
-    }
-    (worst, worst_index)
 }
 
 fn run_both(

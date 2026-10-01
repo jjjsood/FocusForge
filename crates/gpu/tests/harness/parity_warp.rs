@@ -18,26 +18,7 @@ use focusforge_gpu::device::shared_device_or_skip;
 use focusforge_gpu::harness::gpu_backend;
 use focusforge_gpu::warp::{WarpPipelines, warp_from_tile_gpu};
 
-use crate::common;
-
-fn open_stack() -> TiffStack {
-    TiffStack::open(common::mantis_512_dir()).expect("open mantis-512 fixture")
-}
-
-/// Worst absolute `u16` delta between two equal-length sample vectors, plus
-/// the sample index it occurred at.
-fn worst_delta(gpu: &[u16], cpu: &[u16]) -> (i32, usize) {
-    let mut worst = 0i32;
-    let mut worst_index = 0usize;
-    for (i, (&g, &c)) in gpu.iter().zip(cpu.iter()).enumerate() {
-        let delta = (i32::from(g) - i32::from(c)).abs();
-        if delta > worst {
-            worst = delta;
-            worst_index = i;
-        }
-    }
-    (worst, worst_index)
-}
+use crate::common::{open_stack, worst_delta};
 
 /// A [`TileReader`] that counts calls, for asserting "no read attempted" --
 /// the same shape `crates/core/tests/warp.rs`'s own `CountingReader` uses.

@@ -19,31 +19,12 @@ use focusforge_gui::overlay::CardView;
 use focusforge_gui::recent::RecentEntry;
 use focusforge_gui::{AppController, ChromeKey, OpenOutcome};
 
+use common::{controller_with_frames, copy_frame, tree};
+
 // ---------------------------------------------------------------------
 // Fixture helpers -- copies only, mirroring `tests/job.rs` and
 // `tests/entry.rs`.
 // ---------------------------------------------------------------------
-
-fn mantis_frame(index: usize) -> PathBuf {
-    common::workspace_root()
-        .join("fixtures")
-        .join("mantis-512")
-        .join("frames")
-        .join(format!("{index:02}.tif"))
-}
-
-fn tree(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp tree must be creatable");
-    dir
-}
-
-fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
-    std::fs::create_dir_all(dest_dir).unwrap();
-    std::fs::copy(mantis_frame(source_index), dest_dir.join(name))
-        .expect("fixture frame must copy");
-}
 
 /// A fresh directory of `count` copied fixture frames, opened as one
 /// unsaved project on `controller`. Returns the frames' own directory --
@@ -58,15 +39,6 @@ fn open_frames(controller: &mut AppController, name: &str, count: usize) -> Path
         OpenOutcome::Opened(_)
     ));
     root
-}
-
-/// A controller with one unsaved project over `count` copied fixture
-/// frames, its own scratch root under `CARGO_TARGET_TMPDIR`.
-fn controller_with_frames(name: &str, count: usize) -> AppController {
-    let mut controller = AppController::new();
-    open_frames(&mut controller, name, count);
-    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
-    controller
 }
 
 /// [`controller_with_frames`], plus the frames directory itself -- for a
@@ -102,7 +74,7 @@ fn seal_as_given_project(name: &str) -> PathBuf {
 
     let staging = tree(&format!("{name}_staging"));
     let composite = staging.join("composite.tif");
-    std::fs::copy(mantis_frame(0), &composite).unwrap();
+    std::fs::copy(common::fixture_frame("mantis-512", 0), &composite).unwrap();
     let zmap = staging.join("zmap.tif");
     let mut writer = ZMapWriter::create(&zmap, ZMapInfo::new(4, 4, 2).unwrap()).unwrap();
     writer
@@ -633,7 +605,11 @@ fn run_again_stays_on_one_card_until_success() {
         "a repeated failure updates the same card, not a new one"
     );
 
-    std::fs::copy(mantis_frame(1), fail_dir.join("01.tif")).unwrap();
+    std::fs::copy(
+        common::fixture_frame("mantis-512", 1),
+        fail_dir.join("01.tif"),
+    )
+    .unwrap();
     assert!(controller.run_gallery_action(1));
     wait_for_settle(&mut controller, Duration::from_secs(60));
     let cards = controller.project_cards();

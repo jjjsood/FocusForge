@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Pyramid math errors; no path fields. `AlgorithmError` is
+//! Pyramid math errors, and the helpers that wrap errors as an algorithm's own
+//! failure. The pyramid errors carry no path fields. `AlgorithmError` is
 //! `#[non_exhaustive]` with a `Failed { algorithm, detail }` shape, so a
 //! caller wraps a `PyramidError` into that without a breaking change.
+
+use crate::algorithm::AlgorithmError;
 
 /// Everything that can go wrong building a [`super::pyramid::Plane`] or a
 /// [`super::pyramid::Pyramid`].
@@ -35,4 +38,27 @@ pub enum PyramidError {
         width: u32,
         height: u32,
     },
+}
+
+/// Wraps any displayable `source` as `algorithm`'s own
+/// [`AlgorithmError::Failed`]. `PyramidError` is not one of
+/// [`AlgorithmError`]'s `#[from]` variants by design: a bare conversion would
+/// drop the algorithm id from the message.
+pub(crate) fn algorithm_error<E: std::fmt::Display>(
+    algorithm: &str,
+) -> impl Fn(E) -> AlgorithmError {
+    move |source| AlgorithmError::Failed {
+        algorithm: algorithm.to_string(),
+        detail: source.to_string(),
+    }
+}
+
+/// The error for a resolved-values map that lacks `key`.
+pub(crate) fn missing_key(algorithm: &str, key: &str) -> AlgorithmError {
+    AlgorithmError::Failed {
+        algorithm: algorithm.to_string(),
+        detail: format!(
+            "resolved values are missing `{key}`; call crate::params::resolve before fuse"
+        ),
+    }
 }
