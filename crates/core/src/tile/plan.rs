@@ -7,9 +7,10 @@
 //! [`crate::algorithm::TileReader`] is asked for.
 //!
 //! Memory formula (restated at the scheduler, which is what actually bounds
-//! it): `frames x tile_w x tile_h x spp x 2 B x in_flight` -- the bytes held
-//! by `in_flight` simultaneously-live frame-tile sets, each `tile_w x tile_h`
-//! (the *read* rect, not the interior) across every frame, `u16` samples.
+//! it): `tile_w x tile_h x (spp x 2 B + 1 B + working) x in_flight` -- the
+//! bytes held by `in_flight` simultaneously-live tiles, each `tile_w x tile_h`
+//! (the *read* rect, not the interior): one `u16` frame tile, one coverage
+//! mask and the method's working bytes. No term scales with the frame count.
 
 use crate::tile::{Rect, TileError};
 

@@ -628,8 +628,8 @@ pub(crate) fn fuse_planes_gpu(
 /// Z-Map -- the WGSL twin of
 /// `focusforge_core::fuse::laplacian::Laplacian::fuse`. Reads and uploads
 /// every frame directly. `coverage[i]` is frame `i`'s coverage mask over
-/// `rect` with `TileCtx::coverage` semantics: missing or `None` means every
-/// pixel is covered; [`crate::stack_tile::warp_fuse_tile_gpu`] is the
+/// `rect` with `TileCtx::for_each_frame` semantics: missing or `None` means
+/// every pixel is covered; [`crate::stack_tile::warp_fuse_tile_gpu`] is the
 /// warp-then-fuse twin that keeps a warped frame resident instead.
 #[allow(clippy::too_many_arguments)]
 pub fn fuse_tile_gpu(

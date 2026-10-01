@@ -64,7 +64,7 @@ pub struct StackReport {
     /// The host in-flight-byte budget actually in force for this run.
     pub max_bytes_in_flight: u64,
     /// The bytes the scheduler accounted for at its in-flight limit
-    /// (`in_flight_limit` tile sets, reader scratch included): the figure
+    /// (`in_flight_limit` tiles, reader scratch included): the figure
     /// compared with `max_bytes_in_flight`, never with resident memory.
     pub accounted_bytes_in_flight: u64,
     /// Where that budget came from: `Host` (adaptive), `HostFallback` (the

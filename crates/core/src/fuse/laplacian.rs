@@ -19,7 +19,7 @@
 //! described below, and no state carries from one pixel to the next.
 //!
 //! A frame takes part in level `k` at pixel `p` only if its coverage mask
-//! ([`crate::algorithm::TileCtx::coverage`]), eroded by that level's reach
+//! ([`crate::algorithm::TileCtx::for_each_frame`]), eroded by that level's reach
 //! `2*(2^(k+1) - 1) + 2^k * r_k` (`sharpness::eligible`), is
 //! true at level-0 position `(2^k x, 2^k y)`. An ineligible frame's score is
 //! `-inf`: it never wins and never seeds the running best, so the first
@@ -148,7 +148,7 @@ use std::sync::{Arc, LazyLock};
 use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
 use crate::fuse::error::{algorithm_error, missing_key};
 use crate::fuse::sharpness::eligible;
-use crate::fuse::{Plane, build, collapse, max_levels};
+use crate::fuse::{Plane, Pyramid, build, collapse, max_levels};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
 use crate::registry::StackRegistration;
 use crate::tile::Tile;
@@ -338,6 +338,16 @@ impl EligibleMasks {
     }
 }
 
+/// The per-tile state carried from frame to frame: the running best pyramid,
+/// its per-level scores and winners, and the residual sum and count.
+struct Running {
+    best: Pyramid,
+    best_scores: Vec<Vec<f32>>,
+    winner: Vec<Vec<u16>>,
+    residual_sum: Vec<f32>,
+    residual_count: Vec<u32>,
+}
+
 /// The Laplacian Pyramid fusion algorithm. See the module docs for the
 /// selection rule, the residual rule and the Z-Map semantics.
 pub struct Laplacian;
@@ -377,93 +387,106 @@ impl StackAlgorithm for Laplacian {
         }
 
         let frame_count = ctx.frame_count();
-        let frame0 = ctx.frame(0)?;
-        let spp = frame0.samples_per_pixel;
+        let spp = ctx.samples_per_pixel()?;
         let spp_usize = spp as usize;
 
-        // Frame 0's pyramid is the running best -- streaming, never
+        // Frame 0's pyramid seeds the running best -- streaming, never
         // `frame_count` pyramids at once.
-        let mut best = build(&frame0.samples, width, height, spp, levels)
-            .map_err(algorithm_error("laplacian"))?;
-        let mut best_scores: Vec<Vec<f32>> = best
-            .levels()
-            .iter()
-            .enumerate()
-            .map(|(k, plane)| score_plane(plane, score_radius(levels, k as u32)))
-            .collect();
-        let mut winner: Vec<Vec<u16>> = best_scores
-            .iter()
-            .map(|scores| vec![0u16; scores.len()])
-            .collect();
-
-        // Ascending frame order, `f32`, per the residual rule above.
-        // Frame 0's own contribution is the seed.
-        let mut residual_sum: Vec<f32> = best.residual().data().to_vec();
-        let mut residual_count = vec![1u32; residual_sum.len()];
-
-        // An ineligible frame 0 must not seed the running best: its pixels
-        // start as "no source" with zero coefficients and a `-inf` score.
-        if let Some(masks) = ctx
-            .coverage(0)
-            .map(|covered| EligibleMasks::new(covered, width, height, levels))
-        {
-            for k in 0..levels as usize {
-                for (p, &ok) in masks.levels[k].iter().enumerate() {
-                    if !ok {
-                        best_scores[k][p] = f32::NEG_INFINITY;
-                        winner[k][p] = NO_SOURCE;
-                        best.level_mut(k).data_mut()[p * spp_usize..(p + 1) * spp_usize].fill(0.0);
-                    }
-                }
-            }
-            for (i, count) in residual_count.iter_mut().enumerate() {
-                if !masks.residual[i / spp_usize] {
-                    residual_sum[i] = 0.0;
-                    *count = 0;
-                }
-            }
-        }
-
-        for f in 1..frame_count {
-            let tile = ctx.frame(f)?;
+        let mut running: Option<Running> = None;
+        ctx.for_each_frame(|f, tile, covered| {
             let current = build(&tile.samples, width, height, spp, levels)
                 .map_err(algorithm_error("laplacian"))?;
-            let masks = ctx
-                .coverage(f)
-                .map(|covered| EligibleMasks::new(covered, width, height, levels));
+            let masks = covered.map(|covered| EligibleMasks::new(covered, width, height, levels));
 
-            for (i, (sum, &value)) in residual_sum
+            let Some(run) = running.as_mut() else {
+                let mut best = current;
+                let mut best_scores: Vec<Vec<f32>> = best
+                    .levels()
+                    .iter()
+                    .enumerate()
+                    .map(|(k, plane)| score_plane(plane, score_radius(levels, k as u32)))
+                    .collect();
+                let mut winner: Vec<Vec<u16>> = best_scores
+                    .iter()
+                    .map(|scores| vec![0u16; scores.len()])
+                    .collect();
+
+                // Ascending frame order, `f32`, per the residual rule above.
+                // Frame 0's own contribution is the seed.
+                let mut residual_sum: Vec<f32> = best.residual().data().to_vec();
+                let mut residual_count = vec![1u32; residual_sum.len()];
+
+                // An ineligible frame 0 must not seed the running best: its
+                // pixels start as "no source" with zero coefficients and a
+                // `-inf` score.
+                if let Some(masks) = &masks {
+                    for k in 0..levels as usize {
+                        for (p, &ok) in masks.levels[k].iter().enumerate() {
+                            if !ok {
+                                best_scores[k][p] = f32::NEG_INFINITY;
+                                winner[k][p] = NO_SOURCE;
+                                best.level_mut(k).data_mut()[p * spp_usize..(p + 1) * spp_usize]
+                                    .fill(0.0);
+                            }
+                        }
+                    }
+                    for (i, count) in residual_count.iter_mut().enumerate() {
+                        if !masks.residual[i / spp_usize] {
+                            residual_sum[i] = 0.0;
+                            *count = 0;
+                        }
+                    }
+                }
+                running = Some(Running {
+                    best,
+                    best_scores,
+                    winner,
+                    residual_sum,
+                    residual_count,
+                });
+                return Ok(());
+            };
+
+            for (i, (sum, &value)) in run
+                .residual_sum
                 .iter_mut()
                 .zip(current.residual().data().iter())
                 .enumerate()
             {
                 if masks.as_ref().is_none_or(|m| m.residual[i / spp_usize]) {
                     *sum += value;
-                    residual_count[i] += 1;
+                    run.residual_count[i] += 1;
                 }
             }
 
             for k in 0..levels as usize {
                 let current_level = &current.levels()[k];
                 let current_score = score_plane(current_level, score_radius(levels, k as u32));
-                let pixel_count = current_score.len();
-                for p in 0..pixel_count {
+                for (p, &score) in current_score.iter().enumerate() {
                     if masks.as_ref().is_some_and(|m| !m.levels[k][p]) {
                         continue;
                     }
                     // Strictly greater: frame 0 (or the lowest-indexed
                     // frame reaching this score first) wins an exact tie.
-                    if current_score[p] > best_scores[k][p] {
+                    if score > run.best_scores[k][p] {
                         let src = &current_level.data()[p * spp_usize..(p + 1) * spp_usize];
-                        let dst_level = best.level_mut(k);
+                        let dst_level = run.best.level_mut(k);
                         dst_level.data_mut()[p * spp_usize..(p + 1) * spp_usize]
                             .copy_from_slice(src);
-                        best_scores[k][p] = current_score[p];
-                        winner[k][p] = f as u16;
+                        run.best_scores[k][p] = score;
+                        run.winner[k][p] = f as u16;
                     }
                 }
             }
-        }
+            Ok(())
+        })?;
+        let Running {
+            mut best,
+            winner,
+            residual_sum,
+            residual_count,
+            ..
+        } = running.expect("samples_per_pixel succeeded, so frame 0 seeded the running best");
 
         for (out, (sum, &count)) in best
             .residual_mut()
@@ -497,6 +520,14 @@ impl StackAlgorithm for Laplacian {
             },
             zmap,
         })
+    }
+
+    /// Two `f32` pyramids (the running best and the current frame's, `4/3`
+    /// for the levels), the collapsed plane and `u16` output, then per level
+    /// a score, a winner, the current score and an eligibility byte, plus the
+    /// Z-Map.
+    fn working_bytes_per_pixel(&self, _cfg: &ParamValues, samples_per_pixel: u32) -> u64 {
+        17 * u64::from(samples_per_pixel) + 17
     }
 
     /// The composite's dependency cone (`composite_reach`) on the `levels`
@@ -780,6 +811,13 @@ mod tests {
                 .flat_map(|_| (0..w).map(move |x| x >= border))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn working_bytes_per_pixel_are_pinned() {
+        let cfg = cfg_with_levels(5);
+        assert_eq!(Laplacian.working_bytes_per_pixel(&cfg, 3), 68);
+        assert_eq!(Laplacian.working_bytes_per_pixel(&cfg, 1), 34);
     }
 
     #[test]

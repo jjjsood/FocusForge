@@ -32,7 +32,7 @@
 //! # Coverage
 //!
 //! The argmax runs over eligible frames: those whose coverage mask
-//! ([`crate::algorithm::TileCtx::coverage`]), eroded by the full reach of its score,
+//! ([`crate::algorithm::TileCtx::for_each_frame`]), eroded by the full reach of its score,
 //! `DETAIL_REACH + score-radius + smoothing-radius` (`4 + 4 + 8` at the
 //! defaults; `sharpness::eligible`), is true at `p`. A pixel with no eligible frame is
 //! [`crate::zmap::NO_SOURCE`] with zero samples.
@@ -168,8 +168,7 @@ impl StackAlgorithm for DepthMap {
         let rect = ctx.rect();
         let (width, height) = (rect.width, rect.height);
         let frame_count = ctx.frame_count();
-        let frame0 = ctx.frame(0)?;
-        let spp = frame0.samples_per_pixel;
+        let spp = ctx.samples_per_pixel()?;
         let spp_usize = spp as usize;
         let pixel_count = width as usize * height as usize;
 
@@ -177,13 +176,12 @@ impl StackAlgorithm for DepthMap {
         let mut winner = vec![NO_SOURCE; pixel_count];
         let mut out = vec![0u16; pixel_count * spp_usize];
 
-        for f in 0..frame_count {
-            let tile = ctx.frame(f)?;
+        ctx.for_each_frame(|f, tile, covered| {
             let detail = detail_plane(&tile.samples, width, height, spp)
                 .map_err(algorithm_error("depth-map"))?;
             let raw_score = score_plane(&detail, score_radius);
             let smoothed = box_smooth(&raw_score, width, height, smoothing_radius);
-            let eligible = ctx.coverage(f).map(|covered| {
+            let eligible = covered.map(|covered| {
                 sharpness_eligible(
                     covered,
                     width,
@@ -207,7 +205,8 @@ impl StackAlgorithm for DepthMap {
                         .copy_from_slice(&tile.samples[base..base + spp_usize]);
                 }
             }
-        }
+            Ok(())
+        })?;
 
         crate::zmap::validate_tile(&winner, frame_count as u32)
             .map_err(algorithm_error("depth-map"))?;
@@ -220,6 +219,15 @@ impl StackAlgorithm for DepthMap {
             },
             zmap: winner,
         })
+    }
+
+    /// The `u16` output (2 B per sample), the detail plane's one-level
+    /// pyramid with its cloned level (9 B per sample at the peak), and per
+    /// pixel the `f32` best and `u16` winner (6 B) plus the per-frame `f32`
+    /// detail, raw score and smoothed planes with the eligibility mask and
+    /// its erosion scratch (14 B).
+    fn working_bytes_per_pixel(&self, _cfg: &ParamValues, samples_per_pixel: u32) -> u64 {
+        11 * u64::from(samples_per_pixel) + 20
     }
 
     /// `4 + score-radius + smoothing-radius` on the one-level decimation
@@ -540,6 +548,13 @@ mod tests {
             "score-radius={max_score_radius} smoothing-radius={max_smoothing_radius}: \
              one pixel below the reported minimum {minimum} must be refused"
         );
+    }
+
+    #[test]
+    fn working_bytes_per_pixel_are_pinned() {
+        let cfg = ParamValues::new();
+        assert_eq!(DepthMap.working_bytes_per_pixel(&cfg, 3), 53);
+        assert_eq!(DepthMap.working_bytes_per_pixel(&cfg, 1), 31);
     }
 
     #[test]

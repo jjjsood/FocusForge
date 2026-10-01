@@ -201,8 +201,8 @@ pub fn bytes_shared_reference(stack: StackContext) -> u64 {
 
 /// The bytes one anchor-mode registration holds live **on top of** the
 /// shared term ([`bytes_shared_reference`]) -- the sibling of
-/// `crate::tile::scheduler::bytes_per_tile_set`, `pub` because the memory
-/// test sizes its budgets from it.
+/// the scheduler's per-tile accounting, `pub` because the memory test sizes
+/// its budgets from it.
 ///
 /// ```text
 /// plane      = width * height * 4                      // f32 luma
@@ -469,7 +469,7 @@ pub fn align_stack_with(
             let registrations = stack.frame_count.saturating_sub(1);
             registration_bytes += reader.read_scratch_bytes(stack.width, DEFAULT_TILE_SIZE);
             let budget_bytes = options.budget.bytes();
-            if options.budget.refuses_below_one_tile_set()
+            if options.budget.refuses_below_one_tile()
                 && budget_bytes < shared_bytes + registration_bytes
             {
                 return Err(AlgorithmError::HostMemoryTooSmall {

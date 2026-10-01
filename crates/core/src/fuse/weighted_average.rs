@@ -72,7 +72,7 @@
 //! `den(p) == 0.0` can only mean every term was `0.0`, checked exactly.
 //!
 //! A frame is eligible at `p` when its coverage mask
-//! ([`crate::algorithm::TileCtx::coverage`]), eroded by the full reach of its
+//! ([`crate::algorithm::TileCtx::for_each_frame`]), eroded by the full reach of its
 //! weight, `DETAIL_REACH + radius` (`sharpness::eligible`), is true there. An
 //! ineligible frame adds nothing; a pixel with no eligible frame is
 //! [`crate::zmap::NO_SOURCE`] with zero samples.
@@ -213,8 +213,7 @@ impl StackAlgorithm for WeightedAverage {
         let rect = ctx.rect();
         let (width, height) = (rect.width, rect.height);
         let frame_count = ctx.frame_count();
-        let frame0 = ctx.frame(0)?;
-        let spp = frame0.samples_per_pixel;
+        let spp = ctx.samples_per_pixel()?;
         let spp_usize = spp as usize;
         let pixel_count = width as usize * height as usize;
 
@@ -229,13 +228,11 @@ impl StackAlgorithm for WeightedAverage {
         let mut winner = vec![NO_SOURCE; pixel_count];
         let mut eligible_frames = vec![0u32; pixel_count];
 
-        for f in 0..frame_count {
-            let tile = ctx.frame(f)?;
+        ctx.for_each_frame(|f, tile, covered| {
             let detail = detail_plane(&tile.samples, width, height, spp)
                 .map_err(algorithm_error("weighted-average"))?;
             let scores = score_plane(&detail, radius);
-            let eligible = ctx
-                .coverage(f)
+            let eligible = covered
                 .map(|covered| sharpness_eligible(covered, width, height, DETAIL_REACH + radius));
 
             for p in 0..pixel_count {
@@ -259,7 +256,8 @@ impl StackAlgorithm for WeightedAverage {
                     winner[p] = f as u16;
                 }
             }
-        }
+            Ok(())
+        })?;
 
         let mut blended = vec![0.0f32; pixel_count * spp_usize];
         for p in 0..pixel_count {
@@ -309,6 +307,14 @@ impl StackAlgorithm for WeightedAverage {
             },
             zmap: winner,
         })
+    }
+
+    /// Two `f64` sums per sample, and per pixel the `f64` weight and best,
+    /// the winner and the eligible count (22 B); then, live with the sums,
+    /// the blended `f32` plane, its `Plane` copy, the zero-filled `u16`
+    /// seed and the `u16` output (12 B per sample).
+    fn working_bytes_per_pixel(&self, _cfg: &ParamValues, samples_per_pixel: u32) -> u64 {
+        28 * u64::from(samples_per_pixel) + 22
     }
 
     /// The windowed weight's reach (`crate::fuse::sharpness::DETAIL_REACH +
@@ -779,6 +785,13 @@ mod tests {
             ),
             "radius={max_radius}: one pixel below the reported minimum {minimum} must be refused"
         );
+    }
+
+    #[test]
+    fn working_bytes_per_pixel_are_pinned() {
+        let cfg = ParamValues::new();
+        assert_eq!(WeightedAverage.working_bytes_per_pixel(&cfg, 3), 106);
+        assert_eq!(WeightedAverage.working_bytes_per_pixel(&cfg, 1), 50);
     }
 
     #[test]

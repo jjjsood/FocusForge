@@ -183,12 +183,11 @@ fn run_under_root(root: &'static str, label: &str, max_bytes_in_flight: u64) -> 
     planned
 }
 
-/// One tile set in flight and eight: the same `max_bytes_in_flight` pair
+/// One tile in flight and eight: the same `max_bytes_in_flight` pair
 /// the scheduler's own budget tests use.
 fn budgets() -> (u64, u64) {
-    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
-    let bytes_per_tile_set = stack.len() as u64 * 200 * 200 * 3 * 2;
-    (bytes_per_tile_set, bytes_per_tile_set * 8)
+    let bytes_per_tile = 200u64 * 200 * (3 * 2 + 1);
+    (bytes_per_tile, bytes_per_tile * 8)
 }
 
 #[test]

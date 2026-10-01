@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use focusforge_core::algorithm::AlgorithmError;
+use focusforge_core::algorithm::{AlgorithmError, TileReader};
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::StackContext;
 use focusforge_core::tile::{
@@ -72,15 +72,19 @@ impl PassthroughWriter {
 
 impl TileConsumer for PassthroughWriter {
     fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
-        let frame0 = job.ctx().frame(0)?;
         let interior = job.interior();
         let mut cropped = vec![0u16; (interior.width * interior.height * 3) as usize];
-        frame0
-            .crop_into(interior, &mut cropped)
-            .map_err(|source| AlgorithmError::Failed {
-                algorithm: "passthrough-writer".to_string(),
-                detail: source.to_string(),
-            })?;
+        job.ctx().for_each_frame(|f, tile, _| {
+            if f == 0 {
+                tile.crop_into(interior, &mut cropped).map_err(|source| {
+                    AlgorithmError::Failed {
+                        algorithm: "passthrough-writer".to_string(),
+                        detail: source.to_string(),
+                    }
+                })?;
+            }
+            Ok(())
+        })?;
         self.writer
             .lock()
             .unwrap()
@@ -144,14 +148,13 @@ fn passthrough_roundtrip_is_bit_identical() {
 
 #[test]
 fn output_is_thread_count_independent() {
-    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
-    let bytes_per_tile_set = stack.len() as u64 * 200 * 200 * 3 * 2;
+    let bytes_per_tile = 200u64 * 200 * (3 * 2 + 1);
 
     let out_1 = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("thread_count_1.tif");
     run_passthrough(&out_1, &options("thread1", 1));
 
     let out_8 = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("thread_count_8.tif");
-    run_passthrough(&out_8, &options("thread8", bytes_per_tile_set * 8));
+    run_passthrough(&out_8, &options("thread8", bytes_per_tile * 8));
 
     let bytes_1 = std::fs::read(&out_1).unwrap();
     let bytes_8 = std::fs::read(&out_8).unwrap();
@@ -363,6 +366,60 @@ fn consumer_error_names_its_tile() {
     );
 }
 
+/// Serves ones, except that `frame` of the tile at the frame's origin fails.
+struct FailsAtOneFrame {
+    frame: usize,
+}
+
+impl TileReader for FailsAtOneFrame {
+    fn read_tile_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        if frame == self.frame && rect.x == 0 && rect.y == 0 {
+            return Err(AlgorithmError::Failed {
+                algorithm: "fails-at-one-frame".to_string(),
+                detail: format!("frame {frame} is unreadable"),
+            });
+        }
+        out.fill(1);
+        Ok(())
+    }
+}
+
+#[test]
+fn a_failing_frame_read_fails_the_run_with_the_readers_error() {
+    let stack_ctx = StackContext::new(8, 512, 512, 3);
+    let opts = options("failing-read", 1 << 30);
+    let reader = FailsAtOneFrame { frame: 5 };
+    let scheduler = TileScheduler::new(&reader, stack_ctx, 3, &opts).expect("scheduler must build");
+
+    struct VisitsEveryFrame;
+    impl TileConsumer for VisitsEveryFrame {
+        fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
+            job.ctx().for_each_frame(|_, _, _| Ok(()))
+        }
+    }
+
+    let err = scheduler
+        .run(&NoopPreprocess, &VisitsEveryFrame)
+        .expect_err("one unreadable frame must fail the run");
+    match &err {
+        TileError::Consumer {
+            source: AlgorithmError::Failed { algorithm, detail },
+            ..
+        } => {
+            assert_eq!(algorithm, "fails-at-one-frame");
+            assert_eq!(detail, "frame 5 is unreadable");
+        }
+        other => {
+            panic!("expected the reader's own error inside TileError::Consumer, got {other:?}")
+        }
+    }
+}
+
 /// `#[ignore]`d: reads the 16 GB reference stack. Run with `--nocapture` to
 /// see the wall clock and `VmHWM`.
 #[test]
@@ -416,10 +473,7 @@ fn schedules_over_the_reference_stack() {
     struct ChecksumConsumer;
     impl TileConsumer for ChecksumConsumer {
         fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
-            for i in 0..job.ctx().frame_count() {
-                let _ = job.ctx().frame(i)?;
-            }
-            Ok(())
+            job.ctx().for_each_frame(|_, _, _| Ok(()))
         }
     }
 

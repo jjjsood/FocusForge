@@ -92,7 +92,15 @@ impl StackAlgorithm for DummyStack {
 
     fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError> {
         crate::params::validate(self.params(), cfg)?;
-        let tile = ctx.frame(0)?.clone();
+        ctx.samples_per_pixel()?;
+        let mut first = None;
+        ctx.for_each_frame(|f, tile, _| {
+            if f == 0 {
+                first = Some(tile.clone());
+            }
+            Ok(())
+        })?;
+        let tile = first.expect("a context with a frame 0 visits it");
         let zmap = vec![0u16; (tile.rect.width * tile.rect.height) as usize];
         Ok(TileOutput { tile, zmap })
     }

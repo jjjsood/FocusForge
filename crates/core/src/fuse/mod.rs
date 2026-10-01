@@ -28,7 +28,7 @@
 //! - **Ties.** Comparisons are strictly greater, so the lowest eligible
 //!   frame index wins an exact tie or a flat region.
 //! - **Eligibility.** A frame whose warp leaves part of a tile without a
-//!   source supplies a coverage mask ([`crate::algorithm::TileCtx::coverage`]).
+//!   source supplies a coverage mask ([`crate::algorithm::TileCtx::for_each_frame`]).
 //!   A frame takes part at a pixel only if its mask, eroded by the reach of
 //!   the method's score there, is true: uncovered samples never score,
 //!   weigh or get copied. Unaligned frames and frames whose warp covers the

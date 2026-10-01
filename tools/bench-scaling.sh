@@ -9,14 +9,12 @@
 # (~20-30s at 8 frames), so the concurrency signal is a delta on that floor.
 #
 #   Budget axis: --max-host-memory (CPU) / --max-vram (GPU) swept to 6
-#              points that are exact multiples of bytes_per_tile_set /
-#              device_bytes_per_tile AS MEASURED AT 8 FRAMES
-#              (8 * 512 * 512 * 3 * 2 = 12,582,912 B; the GPU figure,
-#              measured, is 254,661,632 B). The byte VALUES stay fixed
-#              across the frame axis on purpose -- that is what makes the
-#              frame axis show anything: the same fixed ceiling, applied to
-#              a tile-set that gets bigger as frame_count grows, must fit
-#              fewer tiles.
+#              points that are exact multiples of one tile's accounted host
+#              bytes (a probe run's accounted_bytes_in_flight / in_flight_limit)
+#              / device_bytes_per_tile (GPU: 254,661,632 B at 8 frames).
+#              The byte VALUES stay fixed across the frame axis; a host
+#              tile's bytes do not depend on frame count, so the CPU
+#              in-flight limit must be the same at 8, 16 and 32 frames.
 #   Frame axis: 8 (the real fixture), 16, 32 frames -- 16/32 built by
 #              duplicating the 8 real fixtures/mantis-512 frames cyclically
 #              into $OUT/frames-{16,32}/frames/ (bytewise-sorted names,
@@ -28,7 +26,7 @@
 # The summary flags any grid cell where that happened instead of quietly
 # plotting a wrong number. If fixtures/mantis-512's geometry ever changes
 # (frame count, tile size, algorithm), the 8-frame byte values need
-# re-deriving from the formulas above, not guessing.
+# re-deriving (the CPU unit is probed on every run; the GPU one is not).
 #
 # Each run's own frozen `--json` report already carries everything this
 # needs (wall_seconds, max_bytes_in_flight, budget_provenance,
@@ -86,9 +84,20 @@ dir_for() {
   esac
 }
 
+echo "Probing one tile's accounted host bytes ..." >&2
+run cpu-probe "$FIXTURE" --no-gpu
+cpu_unit=$(python3 - "$OUT/cpu-probe.json" <<'PY'
+import json
+import sys
+
+r = json.load(open(sys.argv[1]))
+print(r["accounted_bytes_in_flight"] // r["in_flight_limit"])
+PY
+)
+
 echo "Running CPU grid (6 budget points x 3 frame counts) ..." >&2
 for target in 1 2 4 8 16 32; do
-  bytes=$((12582912 * target))
+  bytes=$((cpu_unit * target))
   for frames in 8 16 32; do
     dir="$(dir_for "$frames")"
     run "cpu-${target}-f${frames}" "$dir" --no-gpu --max-host-memory "${bytes}"
@@ -148,10 +157,9 @@ def print_cpu_grid():
         f32 = cells[(target, 32)]["peak_in_flight"]
         if f8 != f32:
             print(
-                f"  target={target}: peak_in_flight shrinks with frame count "
-                f"({f8} at 8 frames -> {f32} at 32 frames) -- same fixed byte "
-                "ceiling, bigger tile-set, fewer tiles fit: graceful "
-                "degradation, not a collapse"
+                f"  target={target}: peak_in_flight changes with frame count "
+                f"({f8} at 8 frames -> {f32} at 32 frames) -- a host tile's "
+                "accounted bytes should not depend on the frame count"
             )
     return total
 

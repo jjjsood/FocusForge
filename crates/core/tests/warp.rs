@@ -752,9 +752,8 @@ fn expected_warp_scratch(t: &Transform, frame: (u32, u32), spp: u64, rect: (u32,
     };
     let footprint = u64::from(read.width) * u64::from(read.height);
     let rect_pixels = u64::from(rect.0) * u64::from(rect.1);
-    // The warped tile with its coverage, the footprint's own inner scratch, and
-    // the coverage mask kept for the (single) warped frame.
-    footprint * spp * 2 + rect_pixels * (spp * 2 + 1) + footprint + rect_pixels
+    // The warped tile with its coverage, and the footprint's own inner scratch.
+    footprint * spp * 2 + rect_pixels * (spp * 2 + 1) + footprint
 }
 
 #[test]
@@ -806,6 +805,6 @@ fn warp_scratch_footprint_is_clamped_to_the_frame() {
     let frame_pixels = 64u64 * 64;
     assert_eq!(
         reader.read_scratch_bytes(64, 64),
-        frame_pixels * 3 * 2 + frame_pixels * (3 * 2 + 1) + frame_pixels + frame_pixels
+        frame_pixels * 3 * 2 + frame_pixels * (3 * 2 + 1) + frame_pixels
     );
 }

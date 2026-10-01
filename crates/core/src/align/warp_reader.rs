@@ -111,8 +111,7 @@ impl TileReader for WarpingReader<'_> {
     /// the source buffer over the footprint, the warped samples with their
     /// coverage, and the inner scratch at that footprint. Translations and
     /// similarities need the same footprint at every position, and clamping
-    /// only shrinks it. Plus one coverage byte per pixel for every
-    /// non-identity frame, held across the whole tile set.
+    /// only shrinks it. The one live coverage mask is the scheduler's.
     fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
         let spp = u64::from(self.samples_per_pixel);
         let (width, height) = (width.min(self.frame.0), height.min(self.frame.1));
@@ -124,12 +123,10 @@ impl TileReader for WarpingReader<'_> {
         };
         let warped = u64::from(width) * u64::from(height) * (spp * 2 + 1);
         let mut largest = self.inner.read_scratch_bytes(width, height);
-        let mut warped_frames = 0u64;
         for transform in &self.transforms {
             if *transform == Transform::identity() {
                 continue;
             }
-            warped_frames += 1;
             if let Ok(SourceFootprint::Covers { read, .. }) =
                 transform.source_footprint(dst, self.frame)
             {
@@ -138,7 +135,7 @@ impl TileReader for WarpingReader<'_> {
                 largest = largest.max(pixels * spp * 2 + warped + inner);
             }
         }
-        largest + warped_frames * u64::from(width) * u64::from(height)
+        largest
     }
 
     fn read_tile_into(

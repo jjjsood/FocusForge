@@ -852,3 +852,75 @@ fn laplacian_default_tile_geometry_is_tile_invariant() {
     assert_eq!(tiled.zmap, single.zmap, "Z-Maps differ");
     assert_eq!(tiled.composite, single.composite, "composites differ");
 }
+
+/// An on-demand context over a warping reader fuses a non-square rect at an
+/// odd origin, which reaches the uncovered band, to the same bytes as a
+/// resident context over the same tiles and masks.
+#[test]
+fn streamed_context_matches_the_resident_context() {
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let frame_count = stack.len();
+    let reader = WarpingReader::new(
+        &stack,
+        (width, height),
+        spp,
+        shifted_transforms(frame_count),
+    );
+    let rect = Rect {
+        x: 1,
+        y: 3,
+        width: 301,
+        height: 187,
+    };
+    let len = (rect.width * rect.height * spp) as usize;
+
+    let mut tiles = Vec::new();
+    let mut coverage = Vec::new();
+    for f in 0..frame_count {
+        let mut samples = vec![0u16; len];
+        coverage.push(
+            reader
+                .read_tile_coverage_into(f, rect, &mut samples)
+                .expect("warped read"),
+        );
+        tiles.push(focusforge_core::tile::Tile {
+            rect,
+            samples_per_pixel: spp,
+            samples,
+        });
+    }
+    assert!(
+        coverage[SHIFTED_FRAME]
+            .as_ref()
+            .is_some_and(|mask| mask.contains(&false)),
+        "the rect must reach the uncovered band"
+    );
+
+    let stack_ctx = stack_context(&stack);
+    for algo_id in ["laplacian", "weighted-average", "depth-map"] {
+        let algo = registry::find_stack(algo_id).expect("method must resolve");
+        let mut explicit = ParamValues::new();
+        if algo_id == "laplacian" {
+            explicit.insert("levels".to_string(), ParamValue::Int(3));
+        }
+        let resolved = params::resolve(algo.params(), &explicit, &stack_ctx).expect("resolve");
+        let values = params::resolved_values(&resolved);
+
+        let resident = TileCtx::new(rect, &tiles).with_coverage(&coverage);
+        let streamed = TileCtx::on_demand(rect, frame_count, spp, &reader, &NoopPreprocess);
+        let expected = algo.fuse(&resident, &values).expect("resident fuse");
+        let actual = algo.fuse(&streamed, &values).expect("streamed fuse");
+
+        assert_eq!(streamed.frames_read(), frame_count, "{algo_id}");
+        assert!(
+            actual.zmap == expected.zmap,
+            "{algo_id}: Z-Maps differ between streamed and resident contexts"
+        );
+        assert!(
+            actual.tile == expected.tile,
+            "{algo_id}: composites differ between streamed and resident contexts"
+        );
+    }
+}

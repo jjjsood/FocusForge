@@ -140,7 +140,8 @@ pub struct FuseReport {
     pub in_flight_limit: usize,
     pub max_bytes_in_flight: u64,
     /// The bytes the scheduler accounted for at its in-flight limit:
-    /// `in_flight_limit` tile sets, reader scratch included.
+    /// `in_flight_limit` tiles, each counted with the method's working bytes
+    /// and reader scratch.
     pub accounted_bytes_in_flight: u64,
     pub budget_provenance: Provenance,
     pub backed_off: bool,
@@ -287,6 +288,7 @@ pub fn run(
     };
 
     options.apply_support(support);
+    options.working_bytes_per_pixel = request.algorithm.working_bytes_per_pixel(&values, spp);
     if let Some(tile_size) = request.tile_size {
         options.tile_size = tile_size;
     }
@@ -804,7 +806,7 @@ pub fn run(
         frame_tiles_read,
         in_flight_limit,
         max_bytes_in_flight: scheduler.budget().bytes(),
-        accounted_bytes_in_flight: in_flight_limit as u64 * scheduler.bytes_per_tile_set(),
+        accounted_bytes_in_flight: in_flight_limit as u64 * scheduler.bytes_per_tile(),
         budget_provenance: scheduler.budget().provenance(),
         backed_off: scheduler.final_in_flight_limit() < in_flight_limit,
         output_width: applied_crop.map(|r| r.width).unwrap_or(width),
