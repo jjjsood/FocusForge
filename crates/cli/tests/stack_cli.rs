@@ -600,6 +600,31 @@ fn algo_is_required() {
 }
 
 #[test]
+fn working_space_names_the_encoding_of_a_tiff_stack() {
+    let cwd = tmp_dir("working_space");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mantis_64 = common::fixtures_dir().join("mantis-64");
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_64.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--json",
+            "--no-align",
+            "--no-crop",
+        ],
+    );
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    assert_eq!(report["working_space"], "encoded-unknown-transfer");
+}
+
+#[test]
 fn report_json_has_every_field() {
     let cwd = tmp_dir("report_json_has_every_field");
     let out_dir = cwd.join("out");
@@ -627,6 +652,7 @@ fn report_json_has_every_field() {
         "width",
         "height",
         "samples_per_pixel",
+        "working_space",
         "algorithm",
         "display_name",
         "params",

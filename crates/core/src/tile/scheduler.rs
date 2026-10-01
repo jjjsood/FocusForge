@@ -489,7 +489,7 @@ impl<'a> TileScheduler<'a> {
         let install_result: Result<(), RunStop> = pool.install(|| {
             tiles.par_iter().try_for_each_init(
                 || {
-                    (0..frame_count)
+                    let tiles = (0..frame_count)
                         .map(|_| Tile {
                             rect: crate::tile::Rect {
                                 x: 0,
@@ -500,9 +500,12 @@ impl<'a> TileScheduler<'a> {
                             samples_per_pixel: spp,
                             samples: Vec::new(),
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    (tiles, vec![None; frame_count])
                 },
-                |buf: &mut Vec<Tile>, planned: &PlannedTile| -> Result<(), RunStop> {
+                |(buf, coverage): &mut (Vec<Tile>, Vec<Option<Vec<bool>>>),
+                 planned: &PlannedTile|
+                 -> Result<(), RunStop> {
                     // The budget admission permit is acquired first, above
                     // the control check below: the rayon pool's own thread
                     // count is independent of the budget (`pool_threads` is
@@ -565,8 +568,8 @@ impl<'a> TileScheduler<'a> {
                                 );
                                 record_timing(TimingCounter::AllocationOperations, 1);
                             }
-                            reader
-                                .read_tile_into(frame, read_rect, &mut tile.samples)
+                            coverage[frame] = reader
+                                .read_tile_coverage_into(frame, read_rect, &mut tile.samples)
                                 .map_err(|source| TileError::Read {
                                     frame,
                                     rect: read_rect,
@@ -589,7 +592,7 @@ impl<'a> TileScheduler<'a> {
                             })?;
                         }
 
-                        let ctx = TileCtx::new(read_rect, buf);
+                        let ctx = TileCtx::new(read_rect, buf).with_coverage(coverage);
                         let job = TileJob::new(planned, ctx, &scratch_path);
                         let _consume = measurement_scope("fusion_consume");
                         consumer
@@ -615,6 +618,7 @@ impl<'a> TileScheduler<'a> {
                     for tile in buf.iter_mut() {
                         tile.samples = Vec::new();
                     }
+                    coverage.fill(None);
 
                     match outcome {
                         Ok(()) => {

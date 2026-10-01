@@ -43,6 +43,10 @@ pub struct StackReport {
     pub width: u32,
     pub height: u32,
     pub samples_per_pixel: u32,
+    /// The intensity encoding fusion operates on: `encoded-srgb` for RAW
+    /// input, `encoded-unknown-transfer` for TIFF. Code values are used as
+    /// delivered, never converted.
+    pub working_space: &'static str,
     pub algorithm: String,
     pub display_name: String,
     pub params: Vec<ParamReport>,
@@ -1320,6 +1324,7 @@ fn build_stack_report(
         width: report.width,
         height: report.height,
         samples_per_pixel: report.samples_per_pixel,
+        working_space: report.working_space,
         algorithm: algo.id().to_string(),
         display_name: algo.display_name().to_string(),
         params: report
@@ -1443,6 +1448,7 @@ fn render(report: &StackReport) -> String {
         report.budget_provenance,
         report.backed_off,
     ));
+    lines.push(format!("working_space={}", report.working_space));
     lines.push(format!("backend: {}", report.backend));
     if let (
         Some(max_device_bytes_in_flight),
@@ -1557,6 +1563,7 @@ mod tests {
             width: 512,
             height: 512,
             samples_per_pixel: 3,
+            working_space: "encoded-unknown-transfer",
             // A fictional id on purpose: no algorithm id appears anywhere in
             // `crates/cli/src`, test data included.
             algorithm: "example-stack".to_string(),
@@ -1623,6 +1630,7 @@ mod tests {
             "accounted_bytes_in_flight=536870912",
             "budget=Host",
             "backed_off=false",
+            "working_space=encoded-unknown-transfer",
             "wrote: mantis-512.ffp",
             "wall: 1.500s",
             "backend: cpu",

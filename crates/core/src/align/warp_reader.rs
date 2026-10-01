@@ -111,7 +111,8 @@ impl TileReader for WarpingReader<'_> {
     /// the source buffer over the footprint, the warped samples with their
     /// coverage, and the inner scratch at that footprint. Translations and
     /// similarities need the same footprint at every position, and clamping
-    /// only shrinks it.
+    /// only shrinks it. Plus one coverage byte per pixel for every
+    /// non-identity frame, held across the whole tile set.
     fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
         let spp = u64::from(self.samples_per_pixel);
         let (width, height) = (width.min(self.frame.0), height.min(self.frame.1));
@@ -123,10 +124,12 @@ impl TileReader for WarpingReader<'_> {
         };
         let warped = u64::from(width) * u64::from(height) * (spp * 2 + 1);
         let mut largest = self.inner.read_scratch_bytes(width, height);
+        let mut warped_frames = 0u64;
         for transform in &self.transforms {
             if *transform == Transform::identity() {
                 continue;
             }
+            warped_frames += 1;
             if let Ok(SourceFootprint::Covers { read, .. }) =
                 transform.source_footprint(dst, self.frame)
             {
@@ -135,7 +138,7 @@ impl TileReader for WarpingReader<'_> {
                 largest = largest.max(pixels * spp * 2 + warped + inner);
             }
         }
-        largest
+        largest + warped_frames * u64::from(width) * u64::from(height)
     }
 
     fn read_tile_into(
@@ -144,6 +147,17 @@ impl TileReader for WarpingReader<'_> {
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), AlgorithmError> {
+        self.read_tile_coverage_into(frame, rect, out).map(drop)
+    }
+
+    /// `None` for an identity transform and for a warp that covered every
+    /// pixel of `rect`; otherwise the mask [`warp_tile`] produced.
+    fn read_tile_coverage_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<Option<Vec<bool>>, AlgorithmError> {
         let _scope = measurement_scope("warp_read");
         let t = self
             .transforms
@@ -162,7 +176,7 @@ impl TileReader for WarpingReader<'_> {
         // during an aligned one, bit-identical to a direct `TiffStack`
         // read.
         if *t == Transform::identity() {
-            return self.inner.read_tile_into(frame, rect, out);
+            return self.inner.read_tile_into(frame, rect, out).map(|()| None);
         }
 
         let warped = warp_tile(
@@ -193,6 +207,6 @@ impl TileReader for WarpingReader<'_> {
         record_timing(TimingCounter::WarpBytes, bytes);
         record_timing(TimingCounter::CopyBytes, bytes);
         record_timing(TimingCounter::CopyOperations, 1);
-        Ok(())
+        Ok(warped.covered.contains(&false).then_some(warped.covered))
     }
 }

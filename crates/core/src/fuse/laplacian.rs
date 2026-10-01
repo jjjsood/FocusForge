@@ -18,6 +18,14 @@
 //! rule is not iterative -- there is no pass count to pin beyond the two
 //! described below, and no state carries from one pixel to the next.
 //!
+//! A frame takes part in level `k` at pixel `p` only if its coverage mask
+//! ([`crate::algorithm::TileCtx::coverage`]), eroded by that level's reach
+//! `2*(2^(k+1) - 1) + 2^k * r_k` (`sharpness::eligible`), is
+//! true at level-0 position `(2^k x, 2^k y)`. An ineligible frame's score is
+//! `-inf`: it never wins and never seeds the running best, so the first
+//! eligible frame (not frame 0 as such) wins ties. With no coverage mask every
+//! frame is eligible everywhere and the rule is unchanged.
+//!
 //! The score window is **per-level radius `r_k`**, wider than a fixed 3x3,
 //! for the anti-speckle property it buys: a single-pixel
 //! impulse in one frame's Laplacian makes that frame win a
@@ -82,17 +90,19 @@
 //! # The Z-Map
 //!
 //! The per-pixel Z-Map is the **level-0 winner** -- the finest level, one
-//! index per pixel, never per sample -- carved so `laplacian` never emits
-//! [`crate::zmap::NO_SOURCE`] (a selection algorithm always has a winner),
-//! while still passing every map through [`crate::zmap::validate_tile`] so
-//! a map round-tripped through a future blending algorithm still validates.
+//! index per pixel, never per sample. It is [`crate::zmap::NO_SOURCE`] only
+//! where no frame is eligible at level 0 (the pixel's detail coefficients are
+//! then zero); with no coverage mask every pixel has a winner. Every map
+//! passes through [`crate::zmap::validate_tile`].
 //!
 //! # The residual
 //!
 //! The coarsest Gaussian (the pyramid's residual, carrying no detail to select on) is the
-//! **arithmetic mean of every frame's residual, in ascending frame order, accumulated in
-//! `f32`** -- pinned because `f32` addition is not associative and a GPU twin must reproduce
-//! the exact sum. At 5 levels the residual is 1/32 resolution, so
+//! **arithmetic mean of the eligible frames' residuals, in ascending frame order, accumulated in
+//! `f32`**. A frame is eligible at a residual pixel when its coverage mask, eroded by `2*(2^N - 1)`,
+//! is true at level-0 position `(2^N x, 2^N y)`; a pixel with no eligible frame is `0`. With no
+//! coverage mask this is the mean of every frame. The order is pinned because `f32` addition is
+//! not associative and a GPU twin must reproduce the exact sum. At 5 levels the residual is 1/32 resolution, so
 //! uncorrected frame drift is a fraction of one residual pixel -- too small
 //! to ghost visibly.
 //!
@@ -180,12 +190,14 @@ use std::sync::{Arc, LazyLock};
 
 use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
 use crate::fuse::error::{algorithm_error, missing_key};
-use crate::fuse::{Plane, build, collapse, max_levels};
+use crate::fuse::sharpness::eligible;
+use crate::fuse::{Plane, Pyramid, build, collapse, max_levels};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
 use crate::registry::StackRegistration;
 use crate::tile::Tile;
 use crate::tile::plan::{DEFAULT_TILE_SIZE, MAX_LEVELS, margin_for_levels, max_levels_for_tile};
 use crate::tile::scheduler::DEFAULT_LEVELS;
+use crate::zmap::NO_SOURCE;
 
 /// `auto_levels(ctx) = min(fuse::max_levels(ctx.width, ctx.height),
 /// tile::plan::max_levels_for_tile(DEFAULT_TILE_SIZE)).max(1)` -- the hook
@@ -304,6 +316,53 @@ pub fn score_plane(level: &Plane, radius: u32) -> Vec<f32> {
     scores
 }
 
+/// The level-0 distance within which level `k`'s selection of a `levels`-deep
+/// pyramid reads samples: `build`'s reach for `k + 1` levels plus the level's
+/// score window, `2*(2^(k+1) - 1) + 2^k * r_k`.
+fn level_reach(levels: u32, k: u32) -> u32 {
+    2 * ((1u32 << (k + 1)) - 1) + (score_radius(levels, k) << k)
+}
+
+/// The level-0 distance within which the residual of a `levels`-deep pyramid
+/// reads samples: `build`'s reach, `2*(2^N - 1)`.
+fn residual_reach(levels: u32) -> u32 {
+    2 * ((1u32 << levels) - 1)
+}
+
+/// Where one frame takes part, per pyramid level and for the residual: its
+/// coverage mask eroded by that level's reach, read at each level pixel's
+/// level-0 position `(2^k x, 2^k y)`.
+struct EligibleMasks {
+    levels: Vec<Vec<bool>>,
+    residual: Vec<bool>,
+}
+
+impl EligibleMasks {
+    fn new(covered: &[bool], width: u32, height: u32, levels: u32, shape: &Pyramid) -> Self {
+        let sampled = |reach: u32, k: u32, plane: &Plane| {
+            let eroded = eligible(covered, width, height, reach);
+            let mut out = Vec::with_capacity(plane.width() as usize * plane.height() as usize);
+            for y in 0..plane.height() {
+                let row = clamp_edge(i64::from(y) << k, height) as usize * width as usize;
+                out.extend(
+                    (0..plane.width())
+                        .map(|x| eroded[row + clamp_edge(i64::from(x) << k, width) as usize]),
+                );
+            }
+            out
+        };
+        Self {
+            levels: shape
+                .levels()
+                .iter()
+                .enumerate()
+                .map(|(k, plane)| sampled(level_reach(levels, k as u32), k as u32, plane))
+                .collect(),
+            residual: sampled(residual_reach(levels), levels, shape.residual()),
+        }
+    }
+}
+
 /// The Laplacian Pyramid fusion algorithm. See the module docs for the
 /// selection rule, the residual rule and the Z-Map semantics.
 pub struct Laplacian;
@@ -345,12 +404,12 @@ impl StackAlgorithm for Laplacian {
         let frame_count = ctx.frame_count();
         let frame0 = ctx.frame(0)?;
         let spp = frame0.samples_per_pixel;
+        let spp_usize = spp as usize;
 
         // Frame 0's pyramid is the running best -- streaming, never
         // `frame_count` pyramids at once.
         let mut best = build(&frame0.samples, width, height, spp, levels)
             .map_err(algorithm_error("laplacian"))?;
-
         let mut best_scores: Vec<Vec<f32>> = best
             .levels()
             .iter()
@@ -365,18 +424,48 @@ impl StackAlgorithm for Laplacian {
         // Ascending frame order, `f32`, per the residual rule above.
         // Frame 0's own contribution is the seed.
         let mut residual_sum: Vec<f32> = best.residual().data().to_vec();
+        let mut residual_count = vec![1u32; residual_sum.len()];
 
-        let spp_usize = spp as usize;
+        // An ineligible frame 0 must not seed the running best: its pixels
+        // start as "no source" with zero coefficients and a `-inf` score.
+        if let Some(masks) = ctx
+            .coverage(0)
+            .map(|covered| EligibleMasks::new(covered, width, height, levels, &best))
+        {
+            for k in 0..levels as usize {
+                for (p, &ok) in masks.levels[k].iter().enumerate() {
+                    if !ok {
+                        best_scores[k][p] = f32::NEG_INFINITY;
+                        winner[k][p] = NO_SOURCE;
+                        best.level_mut(k).data_mut()[p * spp_usize..(p + 1) * spp_usize].fill(0.0);
+                    }
+                }
+            }
+            for (i, count) in residual_count.iter_mut().enumerate() {
+                if !masks.residual[i / spp_usize] {
+                    residual_sum[i] = 0.0;
+                    *count = 0;
+                }
+            }
+        }
+
         for f in 1..frame_count {
             let tile = ctx.frame(f)?;
             let current = build(&tile.samples, width, height, spp, levels)
                 .map_err(algorithm_error("laplacian"))?;
+            let masks = ctx
+                .coverage(f)
+                .map(|covered| EligibleMasks::new(covered, width, height, levels, &current));
 
-            for (sum, &value) in residual_sum
+            for (i, (sum, &value)) in residual_sum
                 .iter_mut()
                 .zip(current.residual().data().iter())
+                .enumerate()
             {
-                *sum += value;
+                if masks.as_ref().is_none_or(|m| m.residual[i / spp_usize]) {
+                    *sum += value;
+                    residual_count[i] += 1;
+                }
             }
 
             for k in 0..levels as usize {
@@ -384,6 +473,9 @@ impl StackAlgorithm for Laplacian {
                 let current_score = score_plane(current_level, score_radius(levels, k as u32));
                 let pixel_count = current_score.len();
                 for p in 0..pixel_count {
+                    if masks.as_ref().is_some_and(|m| !m.levels[k][p]) {
+                        continue;
+                    }
                     // Strictly greater: frame 0 (or the lowest-indexed
                     // frame reaching this score first) wins an exact tie.
                     if current_score[p] > best_scores[k][p] {
@@ -398,15 +490,13 @@ impl StackAlgorithm for Laplacian {
             }
         }
 
-        let frame_count_f32 = frame_count as f32;
-        for value in best
+        for (out, (sum, &count)) in best
             .residual_mut()
             .data_mut()
             .iter_mut()
-            .zip(residual_sum.iter())
+            .zip(residual_sum.iter().zip(&residual_count))
         {
-            let (out, sum) = value;
-            *out = *sum / frame_count_f32;
+            *out = if count == 0 { 0.0 } else { *sum / count as f32 };
         }
 
         let collapsed = collapse(&best);
@@ -682,6 +772,120 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn fuse_masked(
+        tiles: &[Tile],
+        coverage: &[Option<Vec<bool>>],
+        levels: i64,
+        w: u32,
+        h: u32,
+    ) -> TileOutput {
+        let ctx = TileCtx::new(rect(w, h), tiles).with_coverage(coverage);
+        Laplacian.fuse(&ctx, &cfg_with_levels(levels)).unwrap()
+    }
+
+    fn columns_uncovered_below(w: u32, h: u32, border: u32) -> Option<Vec<bool>> {
+        Some(
+            (0..h)
+                .flat_map(|_| (0..w).map(move |x| x >= border))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn level_reaches_follow_the_cone_derivation() {
+        let reaches: Vec<u32> = (0..5).map(|k| level_reach(5, k)).collect();
+        assert_eq!(reaches, vec![10, 14, 22, 38, 78]);
+        assert_eq!(residual_reach(5), 62);
+        let reaches: Vec<u32> = (0..3).map(|k| level_reach(3, k)).collect();
+        assert_eq!(reaches, vec![10, 14, 22]);
+    }
+
+    #[test]
+    fn a_frame_with_an_uncovered_border_wins_only_beyond_the_reach() {
+        let (w, h, spp, border) = (160u32, 128u32, 1u32, 20u32);
+        for levels in [3i64, 5] {
+            let tiles = [
+                tile_of(w, h, spp, flat(w, h, spp, 30000)),
+                tile_of(w, h, spp, checkerboard(w, h, spp)),
+            ];
+            let masks = [None, columns_uncovered_below(w, h, border)];
+            let out = fuse_masked(&tiles, &masks, levels, w, h);
+            let reach = level_reach(levels as u32, 0);
+            for y in 0..h {
+                for x in 0..w {
+                    let expected = u16::from(x >= border + reach);
+                    assert_eq!(
+                        out.zmap[(y * w + x) as usize],
+                        expected,
+                        "levels {levels} at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_residual_averages_only_the_eligible_frames() {
+        let (w, h, spp) = (256u32, 128u32, 1u32);
+        let tiles = [
+            tile_of(w, h, spp, flat(w, h, spp, 10000)),
+            tile_of(w, h, spp, flat(w, h, spp, 50000)),
+        ];
+        let masks = [None, columns_uncovered_below(w, h, 16)];
+        let out = fuse_masked(&tiles, &masks, 5, w, h);
+        let at = |x: u32| out.tile.samples[(64 * w + x) as usize];
+        for x in 0..16 {
+            assert!(at(x).abs_diff(10000) <= 1, "uncovered edge at x {x}");
+        }
+        for x in 160..w {
+            assert!(at(x).abs_diff(30000) <= 1, "both frames at x {x}");
+        }
+    }
+
+    #[test]
+    fn an_ineligible_first_frame_does_not_seed_the_selection() {
+        let (w, h, spp) = (16u32, 16u32, 3u32);
+        let content = checkerboard(w, h, spp);
+        let tiles = [
+            tile_of(w, h, spp, flat(w, h, spp, 12345)),
+            tile_of(w, h, spp, content.clone()),
+        ];
+        let none = Some(vec![false; (w * h) as usize]);
+        let out = fuse_masked(&tiles, &[none, None], 2, w, h);
+        assert!(out.zmap.iter().all(|&z| z == 1));
+        assert_eq!(out.tile.samples, content);
+    }
+
+    #[test]
+    fn a_pixel_with_no_eligible_frame_is_no_source_with_zero_samples() {
+        let (w, h, spp) = (16u32, 16u32, 3u32);
+        let tiles = [
+            tile_of(w, h, spp, checkerboard(w, h, spp)),
+            tile_of(w, h, spp, flat(w, h, spp, 999)),
+        ];
+        let none = Some(vec![false; (w * h) as usize]);
+        let out = fuse_masked(&tiles, &[none.clone(), none], 2, w, h);
+        assert!(out.zmap.iter().all(|&z| z == crate::zmap::NO_SOURCE));
+        assert!(out.tile.samples.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn full_coverage_masks_reproduce_the_unmasked_output() {
+        let (w, h, spp) = (32u32, 32u32, 3u32);
+        let tiles = [
+            tile_of(w, h, spp, checkerboard(w, h, spp)),
+            tile_of(w, h, spp, flat(w, h, spp, 31000)),
+            tile_of(w, h, spp, checkerboard(w, h, spp)),
+        ];
+        let plain = Laplacian
+            .fuse(&TileCtx::new(rect(w, h), &tiles), &cfg_with_levels(3))
+            .unwrap();
+        let full = Some(vec![true; (w * h) as usize]);
+        let masked = fuse_masked(&tiles, &[full.clone(), full.clone(), full], 3, w, h);
+        assert_eq!(masked.tile.samples, plain.tile.samples);
+        assert_eq!(masked.zmap, plain.zmap);
     }
 
     #[test]

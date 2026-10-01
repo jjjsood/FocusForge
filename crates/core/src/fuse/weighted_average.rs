@@ -66,18 +66,23 @@
 //! neighbourhood in every frame --
 //! reachable, and exercised by
 //! `tests::flat_stack_falls_back_to_the_plain_mean`), the blend is the plain
-//! arithmetic mean over frames in ascending order, and the Z-Map index is
-//! `0`. Never [`crate::zmap::NO_SOURCE`], never a division by zero, never a
-//! panic -- `weight_f(p) >= 0.0` for every `f` (a sum of absolute values
-//! raised to a positive power), so `den(p) == 0.0` can only mean every term
-//! was `0.0`, and it is checked for exactly, not approximated.
+//! arithmetic mean over the eligible frames in ascending order, and the
+//! Z-Map index is the lowest eligible frame (`0` with no coverage masks).
+//! Never a division by zero -- `weight_f(p) >= 0.0` for every `f`, so
+//! `den(p) == 0.0` can only mean every term was `0.0`, checked exactly.
+//!
+//! A frame is eligible at `p` when its coverage mask
+//! ([`crate::algorithm::TileCtx::coverage`]), eroded by `DETAIL_REACH +
+//! radius` (`sharpness::eligible`), is true there. An
+//! ineligible frame adds nothing; a pixel with no eligible frame is
+//! [`crate::zmap::NO_SOURCE`] with zero samples.
 //!
 //! # The Z-Map
 //!
 //! **The composite is a blend; the Z-Map is not the blend's provenance in
 //! full.** It records the pixel's **dominant contributor**: `argmax_f
-//! weight_f(p)`, **strictly greater** so the **lowest index wins an exact
-//! tie** -- identical to `laplacian`'s tie-break. Retouch recomposites from
+//! weight_f(p)` over the eligible frames, **strictly greater** so the
+//! **lowest index wins an exact tie** -- identical to `laplacian`'s tie-break. Retouch recomposites from
 //! the Z-Map plus source textures; that reconstruction recovers exactly one
 //! frame's pixels, never the blend the user actually saw, so this Z-Map is
 //! *not* sufficient to reconstruct this algorithm's own composite -- the
@@ -111,10 +116,13 @@ use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
 use crate::fuse::error::{algorithm_error, missing_key};
 use crate::fuse::laplacian::score_plane;
 use crate::fuse::pyramid::Plane;
-use crate::fuse::sharpness::{DETAIL_REACH, detail_plane, levels_for_margin};
+use crate::fuse::sharpness::{
+    DETAIL_REACH, detail_plane, eligible as sharpness_eligible, levels_for_margin,
+};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues};
 use crate::registry::StackRegistration;
 use crate::tile::Tile;
+use crate::zmap::NO_SOURCE;
 
 const RADIUS_DEFAULT: i64 = 8;
 
@@ -221,15 +229,23 @@ impl StackAlgorithm for WeightedAverage {
         let mut sample_sum = vec![0.0f64; pixel_count * spp_usize];
         let mut den = vec![0.0f64; pixel_count];
         let mut best = vec![f64::NEG_INFINITY; pixel_count];
-        let mut winner = vec![0u16; pixel_count];
+        let mut winner = vec![NO_SOURCE; pixel_count];
+        let mut eligible_frames = vec![0u32; pixel_count];
 
         for f in 0..frame_count {
             let tile = ctx.frame(f)?;
             let detail = detail_plane(&tile.samples, width, height, spp)
                 .map_err(algorithm_error("weighted-average"))?;
             let scores = score_plane(&detail, radius);
+            let eligible = ctx
+                .coverage(f)
+                .map(|covered| sharpness_eligible(covered, width, height, DETAIL_REACH + radius));
 
             for p in 0..pixel_count {
+                if eligible.as_ref().is_some_and(|e| !e[p]) {
+                    continue;
+                }
+                eligible_frames[p] += 1;
                 let w = f64::from(scores[p]).powf(f64::from(weight_exponent));
                 let base = p * spp_usize;
                 for c in 0..spp_usize {
@@ -248,10 +264,13 @@ impl StackAlgorithm for WeightedAverage {
             }
         }
 
-        let frame_count_f64 = frame_count as f64;
         let mut blended = vec![0.0f32; pixel_count * spp_usize];
         for p in 0..pixel_count {
             let base = p * spp_usize;
+            if eligible_frames[p] == 0 {
+                // No frame has real samples in reach: zero samples, `NO_SOURCE`.
+                continue;
+            }
             if den[p] > 0.0 {
                 for c in 0..spp_usize {
                     // The one narrowing: every weight and every sum above is
@@ -259,14 +278,15 @@ impl StackAlgorithm for WeightedAverage {
                     blended[base + c] = (num[base + c] / den[p]) as f32;
                 }
             } else {
-                // Degenerate rule: every frame's weight was exactly zero at
-                // this pixel. Fall back to the plain arithmetic mean, and
-                // record the Z-Map index as 0 -- never `NO_SOURCE`, never a
-                // division by zero.
+                // Degenerate rule: every eligible frame's weight was exactly
+                // zero at this pixel. Fall back to the plain arithmetic mean
+                // over the eligible frames; `winner` already holds the lowest
+                // eligible index, since a first weight of `0.0` beats the
+                // initial `-inf`. Never a division by zero.
+                let eligible_count = f64::from(eligible_frames[p]);
                 for c in 0..spp_usize {
-                    blended[base + c] = (sample_sum[base + c] / frame_count_f64) as f32;
+                    blended[base + c] = (sample_sum[base + c] / eligible_count) as f32;
                 }
-                winner[p] = 0;
             }
         }
 
@@ -321,6 +341,131 @@ mod tests {
             width,
             height,
         }
+    }
+
+    fn masked_tile(w: u32, h: u32, spp: u32, f: impl Fn(u32, u32, u32) -> u16) -> Tile {
+        let mut samples = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..spp {
+                    samples.push(f(x, y, c));
+                }
+            }
+        }
+        Tile {
+            rect: rect(w, h),
+            samples_per_pixel: spp,
+            samples,
+        }
+    }
+
+    fn fuse_masked(tiles: &[Tile], coverage: &[Option<Vec<bool>>], w: u32, h: u32) -> TileOutput {
+        let ctx = TileCtx::new(rect(w, h), tiles).with_coverage(coverage);
+        let mut cfg = ParamValues::new();
+        cfg.insert("radius".to_string(), ParamValue::Int(2));
+        cfg.insert("weight-exponent".to_string(), ParamValue::Float(2.0));
+        WeightedAverage.fuse(&ctx, &cfg).unwrap()
+    }
+
+    fn texture(seed: u32) -> impl Fn(u32, u32, u32) -> u16 {
+        move |x, y, c| ((x * 7 + y * 13 + c * 5 + seed).wrapping_mul(2654435761u32) >> 16) as u16
+    }
+
+    #[test]
+    fn a_masked_frame_contributes_nothing() {
+        let (w, h) = (24u32, 20u32);
+        let all = [
+            masked_tile(w, h, 3, texture(1)),
+            masked_tile(w, h, 3, texture(2)),
+            masked_tile(w, h, 3, texture(3)),
+        ];
+        let masks = [None, Some(vec![false; (w * h) as usize]), None];
+        let masked = fuse_masked(&all, &masks, w, h);
+        let without = fuse_masked(&[all[0].clone(), all[2].clone()], &[], w, h);
+        assert_eq!(masked.tile.samples, without.tile.samples);
+        assert!(
+            masked.zmap.iter().all(|&z| z == 0 || z == 2),
+            "never the masked frame"
+        );
+    }
+
+    #[test]
+    fn flat_pixels_resolve_to_the_lowest_eligible_frame_and_the_eligible_mean() {
+        let (w, h) = (16u32, 16u32);
+        for spp in [1u32, 3] {
+            let tiles: Vec<Tile> = [100u16, 200, 400]
+                .iter()
+                .map(|&v| masked_tile(w, h, spp, move |_, _, _| v))
+                .collect();
+            let masks = [Some(vec![false; (w * h) as usize]), None, None];
+            let out = fuse_masked(&tiles, &masks, w, h);
+            assert!(out.zmap.iter().all(|&z| z == 1), "spp {spp}");
+            assert!(out.tile.samples.iter().all(|&s| s == 300), "spp {spp}");
+        }
+    }
+
+    #[test]
+    fn a_pixel_with_no_eligible_frame_is_no_source_with_zero_samples() {
+        let (w, h) = (16u32, 16u32);
+        let tiles = [
+            masked_tile(w, h, 3, texture(1)),
+            masked_tile(w, h, 3, texture(2)),
+        ];
+        let none = Some(vec![false; (w * h) as usize]);
+        let out = fuse_masked(&tiles, &[none.clone(), none], w, h);
+        assert!(out.zmap.iter().all(|&z| z == crate::zmap::NO_SOURCE));
+        assert!(out.tile.samples.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn every_channel_is_blended_with_the_same_weight() {
+        let (w, h) = (32u32, 16u32);
+        // A: red edge, constant green. B: constant green, blue edge. Green
+        // alone fixes each pixel's blend fraction; red and blue must follow it.
+        let a = masked_tile(w, h, 3, |x, _, c| match c {
+            0 => {
+                if x < 16 {
+                    10_000
+                } else {
+                    40_000
+                }
+            }
+            1 => 2_000,
+            _ => 1_000,
+        });
+        let b = masked_tile(w, h, 3, |x, _, c| match c {
+            0 => 20_000,
+            1 => 3_000,
+            _ => {
+                if x < 16 {
+                    5_000
+                } else {
+                    30_000
+                }
+            }
+        });
+        let out = fuse_masked(&[a.clone(), b.clone()], &[], w, h);
+        let mut checked = 0;
+        for p in 0..(w * h) as usize {
+            let t = (f64::from(out.tile.samples[p * 3 + 1]) - 3_000.0) / (2_000.0 - 3_000.0);
+            if !(0.05..0.95).contains(&t) {
+                continue;
+            }
+            checked += 1;
+            for c in [0usize, 2] {
+                let (sa, sb) = (
+                    f64::from(a.samples[p * 3 + c]),
+                    f64::from(b.samples[p * 3 + c]),
+                );
+                let expected = t * sa + (1.0 - t) * sb;
+                let got = f64::from(out.tile.samples[p * 3 + c]);
+                assert!(
+                    (got - expected).abs() < 40.0,
+                    "pixel {p} channel {c}: {got} vs {expected}"
+                );
+            }
+        }
+        assert!(checked > 0, "no pixel blended both frames");
     }
 
     fn tile_of(width: u32, height: u32, spp: u32, samples: Vec<u16>) -> Tile {

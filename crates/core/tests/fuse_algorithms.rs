@@ -11,7 +11,8 @@ mod common;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use focusforge_core::algorithm::TileCtx;
+use focusforge_core::algorithm::{TileCtx, TileReader};
+use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::fuse::{FusionConsumer, FusionGeometry, Plane, build, metrics};
 use focusforge_core::io::{Rect, TiffStack};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
@@ -42,6 +43,28 @@ fn run_fusion(
     levels_override: Option<u32>,
 ) -> FusionResult {
     let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
+    run_fusion_over(
+        &stack,
+        &stack,
+        algo_id,
+        label,
+        tile_size,
+        explicit,
+        levels_override,
+    )
+}
+
+/// [`run_fusion`] over `reader`, which serves the frames `stack` describes
+/// (the same stack, or a warping reader wrapped around it).
+fn run_fusion_over(
+    stack: &TiffStack,
+    reader: &dyn TileReader,
+    algo_id: &str,
+    label: &str,
+    tile_size: u32,
+    explicit: &ParamValues,
+    levels_override: Option<u32>,
+) -> FusionResult {
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
     let frame_count = stack.len();
@@ -69,7 +92,7 @@ fn run_fusion(
     options.tile_size = tile_size;
     options.levels = levels;
     let scheduler =
-        TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
+        TileScheduler::new(reader, stack_ctx, spp, &options).expect("scheduler must build");
     let consumer = FusionConsumer::create(
         algo,
         values,
@@ -495,4 +518,135 @@ fn sharpness_is_recorded_for_each() {
         "depth-map's composite must be strictly sharper than weighted-average's: \
          depth-map={lapvar_dm:.1}, weighted-average={lapvar_wa:.1}"
     );
+}
+
+/// Frame 3 of `fixtures/mantis-512` translated by `(-12.5, 0)` through a
+/// [`WarpingReader`], no crop: the frame's left columns have no source.
+const SHIFTED_FRAME: usize = 3;
+
+fn shifted_transforms(frame_count: usize) -> Vec<Transform> {
+    let mut transforms = vec![Transform::identity(); frame_count];
+    transforms[SHIFTED_FRAME] = Transform::translation(-12.5, 0.0);
+    transforms
+}
+
+fn run_shifted(algo_id: &str, label: &str, tile_size: u32) -> FusionResult {
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let reader = WarpingReader::new(
+        &stack,
+        (width, height),
+        spp,
+        shifted_transforms(stack.len()),
+    );
+    run_fusion_over(
+        &stack,
+        &reader,
+        algo_id,
+        label,
+        tile_size,
+        &no_explicit(),
+        None,
+    )
+}
+
+/// Every frame as the warping reader serves it, with its coverage mask
+/// (`None`: covered everywhere).
+fn warped_frames() -> (Vec<Vec<u16>>, Vec<Option<Vec<bool>>>) {
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let reader = WarpingReader::new(
+        &stack,
+        (width, height),
+        spp,
+        shifted_transforms(stack.len()),
+    );
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let mut frames = Vec::new();
+    let mut coverage = Vec::new();
+    for f in 0..stack.len() {
+        let mut samples = vec![0u16; (width * height * spp) as usize];
+        coverage.push(
+            reader
+                .read_tile_coverage_into(f, rect, &mut samples)
+                .expect("warped read"),
+        );
+        frames.push(samples);
+    }
+    (frames, coverage)
+}
+
+/// Mean over pixels with an uncovered source of how far the composite's
+/// luma (channel mean) falls below the darkest covered source's.
+fn border_pull(result: &FusionResult, frames: &[Vec<u16>], coverage: &[Option<Vec<bool>>]) -> f64 {
+    let spp = result.spp as usize;
+    let luma = |samples: &[u16], p: usize| {
+        samples[p * spp..(p + 1) * spp]
+            .iter()
+            .map(|&s| f64::from(s))
+            .sum::<f64>()
+            / spp as f64
+    };
+    let (mut total, mut count) = (0.0, 0u64);
+    for p in 0..(result.width * result.height) as usize {
+        let covered = |f: usize| coverage[f].as_ref().is_none_or(|c| c[p]);
+        if (0..frames.len()).all(covered) {
+            continue;
+        }
+        let darkest = (0..frames.len())
+            .filter(|&f| covered(f))
+            .map(|f| luma(&frames[f], p))
+            .fold(f64::INFINITY, f64::min);
+        total += (darkest - luma(&result.composite, p)).max(0.0);
+        count += 1;
+    }
+    assert!(count > 0, "the shifted frame must leave pixels uncovered");
+    total / count as f64
+}
+
+#[test]
+fn uncovered_border_never_wins_or_darkens() {
+    let (frames, coverage) = warped_frames();
+    for algo_id in ["laplacian", "weighted-average", "depth-map"] {
+        let result = run_shifted(algo_id, &format!("{algo_id}-shifted"), 512);
+        for (p, &f) in result.zmap.iter().enumerate() {
+            assert!(
+                f != NO_SOURCE && coverage[f as usize].as_ref().is_none_or(|c| c[p]),
+                "{algo_id}: pixel {p} names frame {f}, which has no source there"
+            );
+        }
+        let pull = border_pull(&result, &frames, &coverage);
+        println!("uncovered_border_never_wins_or_darkens: {algo_id} border_pull={pull:.1}");
+        assert!(pull <= 200.0, "{algo_id}: border_pull {pull:.1} counts");
+        if algo_id == "depth-map" {
+            let spp = result.spp as usize;
+            for (p, &f) in result.zmap.iter().enumerate() {
+                assert_eq!(
+                    result.composite[p * spp..(p + 1) * spp],
+                    frames[f as usize][p * spp..(p + 1) * spp],
+                    "depth-map: pixel {p} must copy its winner"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn masked_tiled_matches_single_tile() {
+    for algo_id in ["weighted-average", "depth-map"] {
+        let small = run_shifted(algo_id, &format!("{algo_id}-shifted-448"), 448);
+        let large = run_shifted(algo_id, &format!("{algo_id}-shifted-1024"), 1024);
+        assert_eq!(small.zmap, large.zmap, "{algo_id}: Z-Maps differ");
+        assert_eq!(
+            small.composite, large.composite,
+            "{algo_id}: composites differ"
+        );
+    }
 }

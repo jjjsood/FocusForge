@@ -26,7 +26,8 @@ use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use crate::gpu::TileBackend;
 use crate::io::{
-    COMPOSITE_FILENAME, FrameDesc, FrameReader, Rect, TiffStack, ZMAP_FILENAME, open_frame_set,
+    COMPOSITE_FILENAME, FrameDesc, FrameReader, ReaderKind, Rect, TiffStack, ZMAP_FILENAME,
+    open_frame_set,
 };
 use crate::job::{
     AlignIdentity, ControlState, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobControl, JobOutcome,
@@ -127,6 +128,9 @@ pub struct FuseReport {
     pub width: u32,
     pub height: u32,
     pub samples_per_pixel: u32,
+    /// The intensity encoding fusion operates on, as delivered by the reader
+    /// (see [`working_space`]); no conversion happens.
+    pub working_space: &'static str,
     pub stack_params: ResolvedParams,
     pub tile_size: u32,
     pub levels: u32,
@@ -155,6 +159,16 @@ pub struct FuseReport {
     pub stages: StageTimings,
     pub wall_seconds: f64,
     pub metrics: Metrics,
+}
+
+/// The intensity encoding of the code values a reader delivers: RAW frames
+/// are developed to sRGB-encoded values; TIFF frames are 16-bit unsigned
+/// samples whose transfer function is not read from the file.
+pub fn working_space(kind: ReaderKind) -> &'static str {
+    match kind {
+        ReaderKind::Raw => "encoded-srgb",
+        ReaderKind::Mmap | ReaderKind::Decoded => "encoded-unknown-transfer",
+    }
 }
 
 /// What one run's align stage carries the moment it starts, reported once
@@ -781,6 +795,7 @@ pub fn run(
         width,
         height,
         samples_per_pixel: spp,
+        working_space: working_space(opened.kind),
         stack_params: resolved,
         tile_size: plan.tile_size(),
         levels: plan.levels(),
@@ -1131,6 +1146,17 @@ pub fn uniform_check(frames: &[(&str, &FrameDesc)]) -> (bool, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn working_space_names_the_transfer_each_reader_delivers() {
+        for (kind, expected) in [
+            (ReaderKind::Raw, "encoded-srgb"),
+            (ReaderKind::Mmap, "encoded-unknown-transfer"),
+            (ReaderKind::Decoded, "encoded-unknown-transfer"),
+        ] {
+            assert_eq!(working_space(kind), expected, "{kind:?}");
+        }
+    }
 
     fn desc(label: &str, signature: &[&str]) -> FrameDesc {
         FrameDesc {

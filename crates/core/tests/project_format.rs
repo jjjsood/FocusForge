@@ -760,3 +760,57 @@ fn checkpoint_id_is_deterministic() {
     assert_ne!(id(10), id(11));
     assert_eq!(id(10).len(), 32);
 }
+
+/// One project per method, written when `FORMAT_VERSION` was 1 and never
+/// regenerated (see `fixtures/projects-v1/README.md`).
+#[test]
+fn frozen_format_1_projects_open_with_their_recorded_settings() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/projects-v1");
+    let cases: [(&str, Vec<(&str, ParamValue)>); 3] = [
+        ("laplacian", vec![("levels", ParamValue::Int(3))]),
+        (
+            "weighted-average",
+            vec![
+                ("radius", ParamValue::Int(4)),
+                ("weight-exponent", ParamValue::Float(3.0)),
+            ],
+        ),
+        (
+            "depth-map",
+            vec![
+                ("score-radius", ParamValue::Int(2)),
+                ("smoothing-radius", ParamValue::Int(5)),
+            ],
+        ),
+    ];
+    for (id, expected) in cases {
+        let path = dir.join(format!("{id}.ffp"));
+        let mut project = Project::open(&path).unwrap_or_else(|err| panic!("{id}: {err}"));
+        let manifest = project.manifest();
+        assert_eq!(manifest.format_version, 1, "{id}");
+        assert_eq!(manifest.algorithm, id);
+        assert_eq!(
+            manifest.params.len(),
+            expected.len(),
+            "{id}: {:?}",
+            manifest.params
+        );
+        for (key, value) in &expected {
+            assert_eq!(manifest.params.get(*key), Some(value), "{id} {key}");
+        }
+        assert_eq!(manifest.sources.len(), 3, "{id}");
+        assert_eq!(project.unresolved_sources().count(), 0, "{id}");
+        assert_eq!(project.checkpoint().algorithm, id);
+
+        let frame_count = project.plane(Plane::ZMap).frame_count;
+        assert_eq!(frame_count, 3, "{id}");
+        let mut checked = 0usize;
+        project
+            .read_plane_into(Plane::ZMap, &mut |samples, _| {
+                assert!(samples.iter().all(|&s| (s as u32) < frame_count), "{id}");
+                checked += samples.len();
+            })
+            .unwrap_or_else(|err| panic!("{id}: {err}"));
+        assert_eq!(checked, 60 * 60, "{id}");
+    }
+}

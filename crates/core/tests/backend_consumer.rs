@@ -8,12 +8,13 @@
 mod common;
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use focusforge_core::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput, TileReader};
 use focusforge_core::align::WarpingReader;
 use focusforge_core::align::warp::WarpedTile;
-use focusforge_core::align::{AlignError, Transform};
+use focusforge_core::align::{AlignError, SourceFootprint, Transform};
 use focusforge_core::fuse::laplacian::Laplacian;
 use focusforge_core::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use focusforge_core::gpu::{BackendInfo, TileBackend};
@@ -329,6 +330,21 @@ fn abort_drops_the_sinks_writers_through_the_backend_consumer() {
 struct LosingBackend {
     dispatches: AtomicUsize,
     lost: AtomicBool,
+    /// How many dispatches succeed before the device is lost.
+    healthy: usize,
+    /// The read rect of every `warp_fuse_tile` call, in call order.
+    rects: Mutex<Vec<Rect>>,
+}
+
+impl LosingBackend {
+    fn new(healthy: usize) -> Self {
+        LosingBackend {
+            dispatches: AtomicUsize::new(0),
+            lost: AtomicBool::new(false),
+            healthy,
+            rects: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 const HEALTHY_TILES: usize = 2;
@@ -390,7 +406,8 @@ impl TileBackend for LosingBackend {
         samples_per_pixel: u32,
         levels: u32,
     ) -> Result<TileOutput, AlgorithmError> {
-        if self.dispatches.fetch_add(1, Ordering::SeqCst) >= HEALTHY_TILES {
+        self.rects.lock().unwrap().push(rect);
+        if self.dispatches.fetch_add(1, Ordering::SeqCst) >= self.healthy {
             self.lost.store(true, Ordering::SeqCst);
             return Err(AlgorithmError::Failed {
                 algorithm: "laplacian".to_string(),
@@ -490,16 +507,29 @@ fn device_loss_finishes_the_run_on_the_host() {
         "the plan must hold more tiles than the backend serves, got {planned}"
     );
 
-    let fallback_tiles = {
+    let (fallback_tiles, partially_covered) = {
         let scheduler =
             TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
+        // Tiles with a partly covered footprint never reach the backend, so
+        // they count as fallbacks only when they come after the loss.
+        let partially_covered = scheduler
+            .plan()
+            .tiles()
+            .iter()
+            .filter(|tile| {
+                transforms.iter().any(|t| {
+                    *t != Transform::identity()
+                        && !matches!(
+                            t.source_footprint(tile.read(), (width, height)),
+                            Ok(SourceFootprint::Covers { clamped: false, .. })
+                        )
+                })
+            })
+            .count();
         let sink =
             FusionConsumer::create(&Laplacian, values.clone(), &fallback_path, None, geometry)
                 .expect("create must succeed");
-        let backend = LosingBackend {
-            dispatches: AtomicUsize::new(0),
-            lost: AtomicBool::new(false),
-        };
+        let backend = LosingBackend::new(HEALTHY_TILES);
         let consumer = BackendFusionConsumer::new(
             &backend,
             &stack,
@@ -515,17 +545,122 @@ fn device_loss_finishes_the_run_on_the_host() {
         let fallback_tiles = consumer.fallback_tiles();
         drop(consumer);
         sink.finish().expect("finish must succeed");
-        fallback_tiles
+        (fallback_tiles, partially_covered)
     };
 
-    assert_eq!(
-        fallback_tiles,
-        planned - HEALTHY_TILES,
-        "every tile past the two the backend served must have been read on the host"
+    let after_loss = planned - HEALTHY_TILES;
+    assert!(
+        (after_loss - partially_covered..=after_loss).contains(&fallback_tiles),
+        "every tile past the two the backend served must have been read on the host \
+         ({fallback_tiles} fallbacks, {after_loss} tiles after the loss, \
+         {partially_covered} of them routed to the host regardless)"
     );
     assert_eq!(
         std::fs::read(&host_path).expect("read host composite"),
         std::fs::read(&fallback_path).expect("read fallback composite"),
         "a run finished on the host after a device loss must equal a pure host run"
+    );
+}
+
+/// A tile whose warped footprint reaches past a frame edge is fused on the
+/// host with its coverage mask; the backend only ever sees fully covered
+/// tiles, and that routing is not a device-loss fallback.
+#[test]
+fn tiles_with_a_clamped_footprint_are_fused_on_the_host() {
+    let stack = open_stack();
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let frame_count = stack.len();
+    let stack_ctx = StackContext::new(frame_count, width, height, spp);
+    let mut transforms = vec![Transform::identity(); frame_count];
+    transforms[3] = Transform::translation(-12.5, 0.0);
+
+    const LEVELS: u32 = 3;
+    let mut values = ParamValues::new();
+    values.insert("levels".to_string(), ParamValue::Int(LEVELS as i64));
+    let mut options = TileSchedulerOptions::new(scratch_base("clamped_footprint"));
+    options.tile_size = 200;
+    options.levels = LEVELS;
+    let geometry = FusionGeometry {
+        width,
+        height,
+        samples_per_pixel: spp,
+        frame_count: frame_count as u32,
+        crop: None,
+        description: None,
+    };
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let host_path = tmp.join("backend_consumer_clamped_host.tif");
+    let routed_path = tmp.join("backend_consumer_clamped_routed.tif");
+
+    let planned = {
+        let warping = WarpingReader::new(&stack, (width, height), spp, transforms.clone());
+        let scheduler =
+            TileScheduler::new(&warping, stack_ctx, spp, &options).expect("scheduler must build");
+        let planned = scheduler.plan().len();
+        let consumer = FusionConsumer::create(
+            &Laplacian,
+            values.clone(),
+            &host_path,
+            None,
+            geometry.clone(),
+        )
+        .expect("create must succeed");
+        scheduler
+            .run(&focusforge_core::tile::NoopPreprocess, &consumer)
+            .expect("run must succeed");
+        consumer.finish().expect("finish must succeed");
+        planned
+    };
+
+    let scheduler =
+        TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
+    let sink = FusionConsumer::create(&Laplacian, values, &routed_path, None, geometry)
+        .expect("create must succeed");
+    let backend = LosingBackend::new(usize::MAX);
+    let consumer = BackendFusionConsumer::new(
+        &backend,
+        &stack,
+        (width, height),
+        transforms.clone(),
+        spp,
+        LEVELS,
+        &sink,
+    );
+    scheduler
+        .run(&focusforge_core::tile::NoopPreprocess, &consumer)
+        .expect("run must succeed");
+    assert_eq!(
+        consumer.fallback_tiles(),
+        0,
+        "host routing is not a device loss"
+    );
+    drop(consumer);
+    sink.finish().expect("finish must succeed");
+
+    let rects = backend.rects.lock().unwrap();
+    assert!(
+        !rects.is_empty() && rects.len() < planned,
+        "some tiles reach the backend and some do not: {} of {planned}",
+        rects.len()
+    );
+    for rect in rects.iter() {
+        for t in &transforms {
+            if *t == Transform::identity() {
+                continue;
+            }
+            assert!(
+                matches!(
+                    t.source_footprint(*rect, (width, height)),
+                    Ok(SourceFootprint::Covers { clamped: false, .. })
+                ),
+                "the backend was handed a partially covered tile {rect:?}"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read(&host_path).unwrap(),
+        std::fs::read(&routed_path).unwrap(),
+        "host-routed edge tiles must reproduce the pure host run"
     );
 }

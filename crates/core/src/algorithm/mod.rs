@@ -55,6 +55,7 @@ pub struct TileOutput {
 pub struct TileCtx<'a> {
     rect: Rect,
     tiles: &'a [Tile],
+    coverage: &'a [Option<Vec<bool>>],
 }
 
 impl<'a> TileCtx<'a> {
@@ -69,7 +70,32 @@ impl<'a> TileCtx<'a> {
             tiles.iter().all(|tile| tile.rect == rect),
             "every frame-tile handed to TileCtx::new must cover the same rect"
         );
-        TileCtx { rect, tiles }
+        TileCtx {
+            rect,
+            tiles,
+            coverage: &[],
+        }
+    }
+
+    /// Attaches per-frame coverage masks, index == frame index. `None` (or a
+    /// frame past the end of `coverage`) means the frame has a real sample
+    /// at every pixel.
+    pub fn with_coverage(mut self, coverage: &'a [Option<Vec<bool>>]) -> Self {
+        debug_assert!(
+            coverage
+                .iter()
+                .flatten()
+                .all(|mask| { mask.len() == self.rect.width as usize * self.rect.height as usize }),
+            "every coverage mask must have one entry per pixel of the tile rect"
+        );
+        self.coverage = coverage;
+        self
+    }
+
+    /// Frame `i`'s coverage mask over this tile's rect, `None` when the frame
+    /// is covered everywhere.
+    pub fn coverage(&self, i: usize) -> Option<&[bool]> {
+        self.coverage.get(i).and_then(|mask| mask.as_deref())
     }
 
     pub fn rect(&self) -> Rect {
@@ -106,6 +132,21 @@ pub trait TileReader: Send + Sync {
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), AlgorithmError>;
+
+    /// [`Self::read_tile_into`], also returning which pixels of `rect` carry
+    /// real samples. `None` means every pixel does; a reader that can leave
+    /// pixels without a source (a warp reaching past the frame) returns the
+    /// per-pixel mask, row-major, `rect.width * rect.height` long. Uncovered
+    /// pixels read as zero in `out`.
+    fn read_tile_coverage_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<Option<Vec<bool>>, AlgorithmError> {
+        self.read_tile_into(frame, rect, out)?;
+        Ok(None)
+    }
 
     /// The heap bytes one [`Self::read_tile_into`] of a `width x height` rect
     /// allocates besides `out`: decode buffers, warp sources and the like.

@@ -29,6 +29,14 @@
 //! dimensions, then [`Plane::data_mut`] overwritten with the real `f32`
 //! values.
 //!
+//! # Coverage
+//!
+//! The argmax runs over eligible frames: those whose coverage mask
+//! ([`crate::algorithm::TileCtx::coverage`]), eroded by `DETAIL_REACH +
+//! score-radius + smoothing-radius` (`sharpness::eligible`),
+//! is true at `p`. A pixel with no eligible frame is
+//! [`crate::zmap::NO_SOURCE`] with zero samples.
+//!
 //! # The composite *is* the Z-Map
 //!
 //! Unlike `weighted-average`'s blend, this algorithm's composite is a raw
@@ -59,10 +67,13 @@ use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
 use crate::fuse::error::{algorithm_error, missing_key};
 use crate::fuse::laplacian::score_plane;
 use crate::fuse::pyramid::Plane;
-use crate::fuse::sharpness::{DETAIL_REACH, detail_plane, levels_for_margin};
+use crate::fuse::sharpness::{
+    DETAIL_REACH, detail_plane, eligible as sharpness_eligible, levels_for_margin,
+};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues};
 use crate::registry::StackRegistration;
 use crate::tile::Tile;
+use crate::zmap::NO_SOURCE;
 
 const SCORE_RADIUS_DEFAULT: i64 = 4;
 const SMOOTHING_RADIUS_DEFAULT: i64 = 8;
@@ -167,7 +178,7 @@ impl StackAlgorithm for DepthMap {
         let pixel_count = width as usize * height as usize;
 
         let mut best = vec![f32::NEG_INFINITY; pixel_count];
-        let mut winner = vec![0u16; pixel_count];
+        let mut winner = vec![NO_SOURCE; pixel_count];
         let mut out = vec![0u16; pixel_count * spp_usize];
 
         for f in 0..frame_count {
@@ -176,8 +187,19 @@ impl StackAlgorithm for DepthMap {
                 .map_err(algorithm_error("depth-map"))?;
             let raw_score = score_plane(&detail, score_radius);
             let smoothed = box_smooth(&raw_score, width, height, smoothing_radius);
+            let eligible = ctx.coverage(f).map(|covered| {
+                sharpness_eligible(
+                    covered,
+                    width,
+                    height,
+                    DETAIL_REACH + score_radius + smoothing_radius,
+                )
+            });
 
             for p in 0..pixel_count {
+                if eligible.as_ref().is_some_and(|e| !e[p]) {
+                    continue;
+                }
                 // Strictly greater: the lowest-indexed frame reaching a
                 // score first wins an exact tie, identical to `laplacian`'s
                 // tie-break.
@@ -232,6 +254,69 @@ mod tests {
             width,
             height,
         }
+    }
+
+    fn masked_tile(w: u32, h: u32, f: impl Fn(u32, u32) -> u16) -> Tile {
+        let samples = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| f(x, y));
+        Tile {
+            rect: rect(w, h),
+            samples_per_pixel: 1,
+            samples: samples.collect(),
+        }
+    }
+
+    fn fuse_masked(tiles: &[Tile], coverage: &[Option<Vec<bool>>], w: u32, h: u32) -> TileOutput {
+        let ctx = TileCtx::new(rect(w, h), tiles).with_coverage(coverage);
+        let mut cfg = ParamValues::new();
+        cfg.insert("score-radius".to_string(), ParamValue::Int(2));
+        cfg.insert("smoothing-radius".to_string(), ParamValue::Int(3));
+        DepthMap.fuse(&ctx, &cfg).unwrap()
+    }
+
+    #[test]
+    fn a_masked_frame_wins_only_beyond_its_eroded_band() {
+        let (w, h) = (48u32, 16u32);
+        let flat = masked_tile(w, h, |_, _| 1_000);
+        let checker = masked_tile(w, h, |x, y| if (x + y) % 2 == 0 { 0 } else { 60_000 });
+        let uncovered_columns = 8u32;
+        let mask: Vec<bool> = (0..h)
+            .flat_map(|_| (0..w).map(|x| x >= uncovered_columns))
+            .collect();
+        let out = fuse_masked(&[flat, checker.clone()], &[None, Some(mask)], w, h);
+        let reach = DETAIL_REACH + 2 + 3;
+        let first_eligible = uncovered_columns + reach;
+        for y in 4..12 {
+            for x in 0..w {
+                let p = (y * w + x) as usize;
+                let expected = if x < first_eligible { 0 } else { 1 };
+                assert_eq!(out.zmap[p], expected, "({x}, {y})");
+                let source = if expected == 1 {
+                    &checker
+                } else {
+                    &masked_tile(w, h, |_, _| 1_000)
+                };
+                assert_eq!(
+                    out.tile.samples[p], source.samples[p],
+                    "composite copies the winner"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_saturated_plateau_resolves_to_the_lowest_eligible_frame() {
+        let (w, h) = (16u32, 16u32);
+        let tiles = [
+            masked_tile(w, h, |_, _| 65_535),
+            masked_tile(w, h, |_, _| 65_535),
+            masked_tile(w, h, |_, _| 65_535),
+        ];
+        let masks = [Some(vec![false; (w * h) as usize]), None, None];
+        let out = fuse_masked(&tiles, &masks, w, h);
+        assert!(out.zmap.iter().all(|&z| z == 1));
+        assert!(out.tile.samples.iter().all(|&s| s == 65_535));
     }
 
     fn tile_of(width: u32, height: u32, spp: u32, samples: Vec<u16>) -> Tile {

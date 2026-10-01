@@ -373,6 +373,67 @@ fn warping_reader_clamps_at_the_frame_edge() {
 }
 
 #[test]
+fn coverage_is_none_for_identity_and_for_an_unclamped_translation() {
+    let stack = open_fixture();
+    let spp = stack.header(0).samples_per_pixel;
+    let mut transforms = vec![Transform::identity(); stack.len()];
+    transforms[1] = Transform::translation(0.25, 0.0);
+    let reader = WarpingReader::new(&stack, (512, 512), spp, transforms);
+
+    let rect = Rect {
+        x: 100,
+        y: 100,
+        width: 64,
+        height: 8,
+    };
+    let mut out = vec![0u16; 64 * 8 * spp as usize];
+    for frame in [0, 1] {
+        assert_eq!(
+            reader
+                .read_tile_coverage_into(frame, rect, &mut out)
+                .unwrap(),
+            None,
+            "frame {frame}"
+        );
+    }
+}
+
+#[test]
+fn coverage_names_exactly_the_uncovered_columns_and_leaves_samples_untouched() {
+    let stack = open_fixture();
+    let spp = stack.header(0).samples_per_pixel as usize;
+    let mut transforms = vec![Transform::identity(); stack.len()];
+    transforms[2] = Transform::translation(5.5, 0.0);
+    let reader = WarpingReader::new(&stack, (512, 512), spp as u32, transforms);
+
+    // A destination pixel is covered while its source x = x + 5.5 stays within
+    // 0..=511, so the last six columns of the frame (x >= 506) are uncovered.
+    for width in [64u32, 37] {
+        let rect = Rect {
+            x: 512 - width,
+            y: 100,
+            width,
+            height: 8,
+        };
+        let len = width as usize * 8 * spp;
+        let mut via_coverage = vec![0u16; len];
+        let covered = reader
+            .read_tile_coverage_into(2, rect, &mut via_coverage)
+            .unwrap()
+            .expect("the right edge is uncovered");
+        assert_eq!(covered.len(), width as usize * 8);
+        for (i, &c) in covered.iter().enumerate() {
+            let column = i % width as usize;
+            assert_eq!(c, column < width as usize - 6, "width {width} pixel {i}");
+        }
+
+        let mut via_read = vec![0u16; len];
+        reader.read_tile_into(2, rect, &mut via_read).unwrap();
+        assert_eq!(via_coverage, via_read, "width {width}");
+    }
+}
+
+#[test]
 fn source_tile_too_small_is_an_error() {
     // A source tile exactly the size of the destination rect has no margin
     // for the kernel's taps, even under an identity transform.
@@ -690,7 +751,10 @@ fn expected_warp_scratch(t: &Transform, frame: (u32, u32), spp: u64, rect: (u32,
         panic!("the centred rect must land inside the frame");
     };
     let footprint = u64::from(read.width) * u64::from(read.height);
-    footprint * spp * 2 + u64::from(rect.0) * u64::from(rect.1) * (spp * 2 + 1) + footprint
+    let rect_pixels = u64::from(rect.0) * u64::from(rect.1);
+    // The warped tile with its coverage, the footprint's own inner scratch, and
+    // the coverage mask kept for the (single) warped frame.
+    footprint * spp * 2 + rect_pixels * (spp * 2 + 1) + footprint + rect_pixels
 }
 
 #[test]
@@ -742,6 +806,6 @@ fn warp_scratch_footprint_is_clamped_to_the_frame() {
     let frame_pixels = 64u64 * 64;
     assert_eq!(
         reader.read_scratch_bytes(64, 64),
-        frame_pixels * 3 * 2 + frame_pixels * (3 * 2 + 1) + frame_pixels
+        frame_pixels * 3 * 2 + frame_pixels * (3 * 2 + 1) + frame_pixels + frame_pixels
     );
 }
