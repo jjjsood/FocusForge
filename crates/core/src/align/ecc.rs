@@ -756,10 +756,10 @@ fn solve_on_backend<const K: usize>(
     if data.singular {
         return Ok(None);
     }
-    // Sums over values minus the template mean keep a single-precision
-    // accumulation well conditioned; the moments are mean-centred again here.
-    let mean = data.values.iter().map(|&v| f64::from(v)).sum::<f64>() / data.values.len() as f64;
-    let shift = mean;
+    // The backend sums values minus the template mean, which keeps a
+    // single-precision accumulation well conditioned. Relative to that shift
+    // the template mean is zero.
+    let shift = data.values.iter().map(|&v| f64::from(v)).sum::<f64>() / data.values.len() as f64;
     let request = EccSessionRequest {
         template_id,
         region,
@@ -784,7 +784,7 @@ fn solve_on_backend<const K: usize>(
         |w: &Transform| {
             session
                 .moments(w)
-                .map(|m| reduction_from_moments(&m, data, mean - shift, params))
+                .map(|m| reduction_from_moments(&m, data, 0.0, params))
         },
     )
     .map(Some)
