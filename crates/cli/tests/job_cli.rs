@@ -183,9 +183,10 @@ fn interruptible_stack_args<'a>(dir: &'a str, output: &'a str) -> Vec<&'a str> {
 #[test]
 fn stack_output_is_unchanged_under_the_job_engine() {
     use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
-    use focusforge_core::io::TiffStack;
+    use focusforge_core::io::{Rect, TiffStack};
     use focusforge_core::params::{self, ParamValues, StackContext};
     use focusforge_core::registry;
+    use focusforge_core::retouch::{Sources, recomposite};
     use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 
     let dir = tmp_dir("job_cli_output_unchanged");
@@ -222,6 +223,7 @@ fn stack_output_is_unchanged_under_the_job_engine() {
     let values = params::resolved_values(&resolved);
     let support = algo.tile_support(&values);
     let oracle_path = dir.join("oracle.tif");
+    let oracle_zmap_path = dir.join("oracle-zmap.tif");
     let options = {
         let mut o = TileSchedulerOptions::explicit_budget(dir.join("oracle-scratch"), 1 << 30);
         o.apply_support(support);
@@ -233,7 +235,7 @@ fn stack_output_is_unchanged_under_the_job_engine() {
         algo,
         values,
         &oracle_path,
-        None,
+        Some(&oracle_zmap_path),
         FusionGeometry {
             width,
             height,
@@ -247,12 +249,41 @@ fn stack_output_is_unchanged_under_the_job_engine() {
     scheduler.run(&NoopPreprocess, &consumer).unwrap();
     consumer.finish().unwrap();
 
+    // `export -o` writes a Z-Map gather over the stack's sources, not the
+    // stored `laplacian` blend, so the oracle here is the same gather run
+    // over the library's own Z-Map.
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let indices = TiffStack::open_files(&[oracle_zmap_path])
+        .unwrap()
+        .read_tile(0, whole)
+        .unwrap()
+        .samples;
+    let sources = Sources {
+        reader: &stack,
+        frame_count: stack.len() as u32,
+        samples_per_pixel: spp,
+        origin: (0, 0),
+    };
+    let mut expected_gather = vec![0u16; indices.len() * spp as usize];
+    recomposite(&indices, whole, &sources, &mut expected_gather).unwrap();
+
     // The composite lives inside the project, so the comparison goes
-    // through `export`.
+    // through `export`, then decoded the same way the oracle's own gather is.
+    let exported = export_composite(&dir, &output);
+    let exported_samples = TiffStack::open_files(&[exported])
+        .unwrap()
+        .read_tile(0, whole)
+        .unwrap()
+        .samples;
     assert_eq!(
-        read_pixels(&export_composite(&dir, &output)),
-        read_pixels(&oracle_path),
-        "stack must produce the same bytes through the job engine as the library oracle"
+        exported_samples, expected_gather,
+        "stack must produce the same pixels through the job engine as the library oracle's \
+         Z-Map gathered over the stack's frames"
     );
 }
 

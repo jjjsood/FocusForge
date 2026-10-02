@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // A dialog's own button row: the quiet cancel button at the left, an
-// optional secondary button and the confirm button grouped at the right.
+// optional secondary button and the confirm button grouped at the right. An
+// empty `confirm-label` leaves the cancel button alone.
 
 import { Theme } from "../theme.slint";
 import { FFButton } from "ff_button.slint";
@@ -12,11 +13,16 @@ export component FFDialogFooter inherits Rectangle {
     in property <string> confirm-label: "Confirm";
     // "primary" | "danger" -- the confirm button's own tone.
     in property <string> confirm-kind: "primary";
+    // Halves the footer's opacity without touching its buttons' own
+    // `enabled` state -- a dialog mid-write still takes a click on either
+    // button, just visually recessed while it does.
+    in property <bool> dimmed: false;
     callback cancelled();
     callback secondary-pressed();
     callback confirmed();
 
     height: 34px;
+    opacity: root.dimmed ? 0.5 : 1.0;
 
     HorizontalLayout {
         alignment: space-between;
@@ -37,7 +43,7 @@ export component FFDialogFooter inherits Rectangle {
                 text: root.secondary-label;
                 clicked => { root.secondary-pressed(); }
             }
-            FFButton {
+            if root.confirm-label != "": FFButton {
                 width: 160px;
                 kind: root.confirm-kind;
                 text: root.confirm-label;

@@ -603,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn equalization_round_trips_through_json_and_registration_defaults_to_none() {
+    fn equalization_round_trips_through_json_and_an_absent_one_stays_none() {
         let eq = Equalization {
             max_gain: 1.37,
             gains: vec![UNIT_GAIN, 52_429, 81_920, 1, 131_072],
@@ -616,8 +616,8 @@ mod tests {
         assert_eq!(plain.gain(3), UNIT_GAIN);
         let json = serde_json::to_string(&plain).unwrap();
         assert!(!json.contains("equalization"), "{json}");
-        let old: Registration = serde_json::from_str(&json).unwrap();
-        assert!(old.equalization.is_none());
+        let back_plain: Registration = serde_json::from_str(&json).unwrap();
+        assert!(back_plain.equalization.is_none());
 
         let with = Registration {
             equalization: Some(eq.clone()),

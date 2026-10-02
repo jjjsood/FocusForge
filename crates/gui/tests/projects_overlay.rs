@@ -59,9 +59,11 @@ fn open_unreadable_frames(controller: &mut AppController, name: &str) -> PathBuf
     root
 }
 
-/// A sealed project whose sources live outside its own directory --
-/// `AsGiven`, which `Project::unresolved_sources` always reports regardless
-/// of whether the frames are still on disk.
+/// A sealed project whose sources live outside its own directory
+/// (`AsGiven`) and are then deleted from that location, so the GUI's own
+/// counted `missing_sources` -- which counts only what is actually
+/// unreachable, not core's `AsGiven`-inclusive `unresolved_sources` --
+/// genuinely reports them missing rather than merely `AsGiven`.
 fn seal_as_given_project(name: &str) -> PathBuf {
     let project_dir = tree(&format!("{name}_project"));
     let frames_dir = tree(&format!("{name}_source_frames"));
@@ -105,6 +107,9 @@ fn seal_as_given_project(name: &str) -> PathBuf {
         metrics: project::Metrics::default(),
     })
     .expect("seal must succeed");
+    for source in &sources {
+        std::fs::remove_file(source).unwrap();
+    }
     project_path
 }
 
@@ -768,9 +773,50 @@ fn sources_missing_is_located_on_its_own_card() {
     ));
 
     assert_eq!(controller.gallery_failure_kind(0), Some("sources-missing"));
-    controller.locate_missing_sources(0, frames_dir);
+
+    // The right folder, byte-identical to what the project was sealed
+    // over -- `copy_frame` always copies from the same golden fixture, so
+    // recreating it here reproduces the same content hash.
+    std::fs::create_dir_all(&frames_dir).unwrap();
+    for i in 0..2 {
+        copy_frame(&frames_dir, &format!("{i:02}.tif"), i);
+    }
+    let tab_id = controller.tab_id_at(0).unwrap();
+    common::locate_and_settle(
+        &mut controller,
+        focusforge_gui::entry::LocateTarget::Tab(tab_id),
+        frames_dir,
+    );
     assert_eq!(controller.gallery_failure_kind(0), None);
     assert_eq!(controller.project_cards()[0].kind, "open");
+}
+
+#[test]
+fn locate_frames_refuses_a_folder_of_different_content() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("sources_missing_wrong_scratch"));
+    let project_path = seal_as_given_project("sources_missing_wrong");
+    let wrong_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("sources_missing_wrong_folder");
+    std::fs::create_dir_all(&wrong_dir).unwrap();
+    std::fs::write(wrong_dir.join("00.tif"), b"not the right bytes").unwrap();
+    std::fs::write(wrong_dir.join("01.tif"), b"not the right bytes either").unwrap();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[project_path]),
+        OpenOutcome::Opened(_)
+    ));
+
+    let tab_id = controller.tab_id_at(0).unwrap();
+    common::locate_and_settle(
+        &mut controller,
+        focusforge_gui::entry::LocateTarget::Tab(tab_id),
+        wrong_dir,
+    );
+    assert_eq!(
+        controller.gallery_failure_kind(0),
+        Some("sources-missing"),
+        "a folder of different content must not clear the card"
+    );
+    assert!(controller.last_refusal().is_some());
 }
 
 // ---------------------------------------------------------------------
@@ -1042,7 +1088,7 @@ fn recent_list_persists_and_caps_at_five() {
     assert!(recent::load(&missing_dir).is_empty());
 
     let corrupt_dir = tree("recent_corrupt");
-    std::fs::write(corrupt_dir.join("recent.toml"), b"not valid toml {{{").unwrap();
+    std::fs::write(corrupt_dir.join("settings.toml"), b"not valid toml {{{").unwrap();
     assert!(
         recent::load(&corrupt_dir).is_empty(),
         "an unparsable file must read as an empty list, not a panic"
@@ -1065,7 +1111,7 @@ fn recent_row_opens_its_target() {
         vec![RecentEntry {
             name: "demo".to_string(),
             folder: project_path.parent().unwrap().to_path_buf(),
-            path: Some(project_path.clone()),
+            path: project_path.clone(),
             opened_at: 0,
         }],
         tree("recent_open_target_config"),
@@ -1109,7 +1155,7 @@ fn recent_row_switches_to_an_open_tab() {
         vec![RecentEntry {
             name: "first".to_string(),
             folder: first_dir.clone(),
-            path: Some(first_dir),
+            path: first_dir,
             opened_at: 0,
         }],
         tree("recent_switch_config"),
@@ -1145,7 +1191,7 @@ fn recent_row_missing_target_is_refused() {
         vec![RecentEntry {
             name: "gone".to_string(),
             folder: missing_dir.clone(),
-            path: Some(missing_dir.clone()),
+            path: missing_dir.clone(),
             opened_at: 0,
         }],
         tree("recent_missing_target_config"),
@@ -1181,11 +1227,12 @@ fn recent_row_missing_target_is_refused() {
 #[test]
 fn recent_row_out_of_range_or_busy_is_ignored() {
     let mut controller = controller_with_frames("recent_out_of_range", 1);
+    let only_dir = tree("recent_out_of_range_folder");
     controller.install_recent(
         vec![RecentEntry {
             name: "only".to_string(),
-            folder: tree("recent_out_of_range_folder"),
-            path: None,
+            folder: only_dir.clone(),
+            path: only_dir,
             opened_at: 0,
         }],
         tree("recent_out_of_range_config"),
@@ -1210,7 +1257,7 @@ fn recent_row_out_of_range_or_busy_is_ignored() {
         vec![RecentEntry {
             name: "second".to_string(),
             folder: second_dir.clone(),
-            path: Some(second_dir),
+            path: second_dir,
             opened_at: 0,
         }],
         tree("recent_out_of_range_busy_config"),
@@ -1233,42 +1280,40 @@ fn recent_row_out_of_range_or_busy_is_ignored() {
 }
 
 #[test]
-fn recent_file_without_path_still_opens() {
+fn recent_row_opens_its_path_not_its_folder() {
     use focusforge_gui::recent;
 
-    let frames_dir = tree("recent_no_path_frames");
+    let frames_dir = tree("recent_path_frames");
     copy_frame(&frames_dir, "00.tif", 0);
 
-    let config_dir = tree("recent_no_path_config");
-    std::fs::write(
-        config_dir.join("recent.toml"),
-        format!(
-            "[[entries]]\nname = \"legacy\"\nfolder = {:?}\nopened_at = 0\n",
-            frames_dir
-        ),
+    let config_dir = tree("recent_path_config");
+    recent::save(
+        &config_dir,
+        &[RecentEntry {
+            name: "demo".to_string(),
+            folder: config_dir.join("no_such_folder"),
+            path: frames_dir,
+            opened_at: 0,
+        }],
     )
     .unwrap();
 
     let entries = recent::load(&config_dir);
-    assert_eq!(entries.len(), 1, "an old-format file still loads its row");
-    assert_eq!(
-        entries[0].path, None,
-        "no `path` field means `None`, not a parse failure"
-    );
+    assert_eq!(entries.len(), 1, "the saved row loads back");
 
     let mut controller = AppController::new();
-    controller.set_scratch_root_for_test(tree("recent_no_path_scratch"));
+    controller.set_scratch_root_for_test(tree("recent_path_scratch"));
     controller.install_recent(entries, config_dir);
     controller.toggle_projects_overlay();
 
     let handle = controller
         .open_recent(0)
-        .expect("a row with no `path` still starts a load, by `folder`");
+        .expect("the row's `path` starts a load although its `folder` does not exist");
     handle.join().expect("the load worker did not panic");
     let outcome = controller.settle_open();
     assert!(
         matches!(outcome, Some(OpenOutcome::Opened(_))),
-        "the folder opens the same as any other target"
+        "the path opens the same as any other target"
     );
     assert_eq!(controller.project_tabs().len(), 1);
 }

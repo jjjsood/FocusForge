@@ -395,6 +395,7 @@ fn test_header(
         width,
         height,
         byte_order,
+        ifd_offset: 0,
         bits_per_sample: vec![16; samples_per_pixel as usize].into_boxed_slice(),
         samples_per_pixel,
         compression: 1,

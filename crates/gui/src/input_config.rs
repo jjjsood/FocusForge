@@ -1,24 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The input table's file format: TOML at `<config_dir>/input.toml`. Reads
-//! and writes that one file -- the fourth file in the crate with a
-//! legitimate reason to touch storage
+//! The input table's file format: the `[input]` table of
+//! `<config_dir>/settings.toml`. Reads and writes that one file -- the
+//! fourth file in the crate with a legitimate reason to touch storage
 //! (`crates/gui/tests/shell.rs`'s `checkpoint_panel_touches_no_storage`
 //! exclusion list). No `use slint::` anywhere in this file
 //! (`input_modules_are_slint_free`).
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use toml::Spanned;
 
 use crate::input_map::{Action, Binding, DEFAULT_BINDINGS, InputTable, Trigger};
-
-/// The only `version` this build accepts. A file naming a higher version is
-/// refused by name; a file naming a lower one is unreachable today and
-/// refused the same way.
-pub const SUPPORTED_VERSION: u32 = 1;
+use crate::settings;
 
 /// Where the active table came from, shown as the settings modal's one
 /// section-level provenance line.
@@ -43,14 +38,11 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
-    #[error(
-        "{path}:{line}: unsupported version {found} -- this build supports version {supported}"
-    )]
-    UnsupportedVersion {
+    #[error("{path}: could not be read: {source}")]
+    CouldNotRead {
         path: PathBuf,
-        line: usize,
-        found: u32,
-        supported: u32,
+        #[source]
+        source: std::io::Error,
     },
     #[error("{path}:{line}: unknown trigger {spelling:?}")]
     UnknownTrigger {
@@ -77,13 +69,12 @@ pub enum ConfigError {
     CouldNotWrite {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: Box<settings::WriteError>,
     },
 }
 
 #[derive(Debug, Deserialize)]
 struct ConfigFile {
-    version: Spanned<u32>,
     #[serde(default)]
     bindings: Vec<Spanned<ConfigBinding>>,
 }
@@ -118,41 +109,48 @@ fn defaults_with(problems: Vec<ConfigError>) -> Loaded {
     }
 }
 
-/// Loads the input table from `<config_dir>/input.toml`. A missing file is
-/// the normal case, not an error. Any problem at all -- a parse error, an
-/// unsupported version, an unknown trigger or action, a duplicate trigger --
-/// refuses the **whole** file: the table falls back to
-/// [`InputTable::default`] wholesale, never half-applied.
-pub fn load(config_dir: &Path) -> Loaded {
-    let path = config_dir.join("input.toml");
+#[derive(Debug, Default, Deserialize)]
+struct SettingsWrapper {
+    #[serde(default)]
+    input: Option<ConfigFile>,
+}
 
-    let src = match fs::read_to_string(&path) {
-        Ok(src) => src,
-        Err(_) => return defaults_with(Vec::new()),
+/// Loads the input table from `settings.toml`'s `[input]` table. A missing
+/// table is the normal case, not an error. Any problem at all -- a parse
+/// error, an unknown trigger or action, a duplicate trigger -- refuses the
+/// table **whole**: it falls back to [`InputTable::default`] wholesale,
+/// never half-applied.
+pub fn load(config_dir: &Path) -> Loaded {
+    let (path, read_result) = settings::read(config_dir);
+    let src = match read_result {
+        Ok(text) => text.unwrap_or_default(),
+        // The file exists but could not be read (permissions, non-UTF-8
+        // bytes, a directory in its place) -- refused like an unparseable
+        // file.
+        Err(source) => return defaults_with(vec![ConfigError::CouldNotRead { path, source }]),
     };
 
-    let parsed: ConfigFile = match toml::from_str(&src) {
-        Ok(parsed) => parsed,
+    let wrapper: SettingsWrapper = match toml::from_str(&src) {
+        Ok(wrapper) => wrapper,
         Err(source) => return defaults_with(vec![ConfigError::Parse { path, source }]),
     };
 
-    let version = *parsed.version.get_ref();
-    if version > SUPPORTED_VERSION || version < 1 {
-        let line = line_of(&src, parsed.version.span().start);
-        return defaults_with(vec![ConfigError::UnsupportedVersion {
-            path,
-            line,
-            found: version,
-            supported: SUPPORTED_VERSION,
-        }]);
+    match wrapper.input {
+        Some(parsed) => validate(parsed, &src, path),
+        None => defaults_with(Vec::new()),
     }
+}
 
+/// The validation rules the `[input]` table of `settings.toml` must pass.
+/// `path` is the file every [`ConfigError`] and the success [`Provenance`]
+/// report.
+fn validate(parsed: ConfigFile, src: &str, path: PathBuf) -> Loaded {
     let mut problems = Vec::new();
     let mut bindings = InputTable::default().bindings;
     let mut seen: Vec<(Trigger, usize)> = Vec::new();
 
     for row in parsed.bindings.iter() {
-        let row_line = line_of(&src, row.span().start);
+        let row_line = line_of(src, row.span().start);
         let inner = row.get_ref();
 
         let trigger = match inner.trigger.get_ref().parse::<Trigger>() {
@@ -160,7 +158,7 @@ pub fn load(config_dir: &Path) -> Loaded {
             Err(_) => {
                 problems.push(ConfigError::UnknownTrigger {
                     path: path.clone(),
-                    line: line_of(&src, inner.trigger.span().start),
+                    line: line_of(src, inner.trigger.span().start),
                     spelling: inner.trigger.get_ref().clone(),
                 });
                 continue;
@@ -173,10 +171,10 @@ pub fn load(config_dir: &Path) -> Loaded {
         // and a partial or out-of-order file must never shift or delete an
         // unrelated row.
         //
-        // A trigger that parses but names none of the table's ten known
+        // A trigger that parses but names none of the table's nine known
         // triggers is refused the same way an unparseable spelling is: this
         // table's rows are display-indexed (`InputTable::display_rows`,
-        // `DEFAULT_BINDINGS`'s fixed ten-slot layout), so a trigger this
+        // `DEFAULT_BINDINGS`'s fixed nine-slot layout), so a trigger this
         // table has no row for cannot be shown in the settings modal, and
         // silently accepting it would show a table that does not match the
         // active bindings. Refusing is final -- "rebind" means reassigning
@@ -185,7 +183,7 @@ pub fn load(config_dir: &Path) -> Loaded {
         let Some(default_index) = DEFAULT_BINDINGS.iter().position(|b| b.trigger == trigger) else {
             problems.push(ConfigError::UnknownTrigger {
                 path: path.clone(),
-                line: line_of(&src, inner.trigger.span().start),
+                line: line_of(src, inner.trigger.span().start),
                 spelling: inner.trigger.get_ref().clone(),
             });
             continue;
@@ -199,7 +197,7 @@ pub fn load(config_dir: &Path) -> Loaded {
                     Err(_) => {
                         problems.push(ConfigError::UnknownAction {
                             path: path.clone(),
-                            line: line_of(&src, s.span().start),
+                            line: line_of(src, s.span().start),
                             spelling: s.get_ref().clone(),
                         });
                         Err(())
@@ -252,7 +250,6 @@ pub fn load(config_dir: &Path) -> Loaded {
 
 #[derive(Debug, Serialize)]
 struct SerializedConfig {
-    version: u32,
     bindings: Vec<SerializedBinding>,
 }
 
@@ -269,7 +266,6 @@ impl SerializedConfig {
     fn defaults() -> Self {
         let table = InputTable::default();
         SerializedConfig {
-            version: SUPPORTED_VERSION,
             bindings: table
                 .bindings
                 .iter()
@@ -287,34 +283,27 @@ const HEADER: &str = "\
 # FocusForge input map.
 #
 # Each `trigger` must be one of the bindings listed below; rebind by
-# changing its actions. A trigger this file does not already list is
+# changing its actions. A trigger this table does not already list is
 # refused.
 #
-# Accepted actions: zoom-at-cursor, step-source-frame, pan-horizontal,
-# overlay-opacity, pan, brush-size, brush-softness, undo, redo,
-# pick-source-under-pointer, paint.
+# Accepted actions: zoom-at-cursor, step-source-frame, pan-horizontal, pan,
+# brush-size, brush-softness, undo, redo, pick-source-under-pointer, paint.
 #
 # Omit `stacking` or `editor` to leave that mode with no binding.
 ";
 
-/// Writes the shipped defaults to `<config_dir>/input.toml`, creating
-/// `config_dir` if needed. An I/O failure here is **not** fatal to the
-/// caller -- it returns `Err` so the caller can record one
+/// Writes the shipped defaults as `settings.toml`'s `[input]` table,
+/// creating `config_dir` if needed. An I/O failure here is **not** fatal
+/// to the caller -- it returns `Err` so the caller can record one
 /// [`ConfigError::CouldNotWrite`] and keep running on the in-memory
 /// defaults.
 pub fn write_defaults(config_dir: &Path) -> Result<PathBuf, ConfigError> {
-    fs::create_dir_all(config_dir).map_err(|source| ConfigError::CouldNotWrite {
-        path: config_dir.to_path_buf(),
-        source,
-    })?;
-    let path = config_dir.join("input.toml");
-    let body = toml::to_string_pretty(&SerializedConfig::defaults())
-        .expect("SerializedConfig::defaults always serialises");
-    fs::write(&path, format!("{HEADER}{body}")).map_err(|source| ConfigError::CouldNotWrite {
-        path: path.clone(),
-        source,
-    })?;
-    Ok(path)
+    let mut table = settings::to_table(&SerializedConfig::defaults());
+    table.decor_mut().set_prefix(HEADER);
+    settings::write_table(config_dir, "input", table).map_err(|source| ConfigError::CouldNotWrite {
+        path: config_dir.join(settings::FILE_NAME),
+        source: Box::new(source),
+    })
 }
 
 /// `directories::ProjectDirs::from("", "", "focusforge").config_dir()` --

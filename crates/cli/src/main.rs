@@ -26,6 +26,7 @@ mod export;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod groups;
+mod history;
 mod job;
 mod preset;
 mod progress;
@@ -219,22 +220,32 @@ enum Command {
         #[arg(long = "no-cache", action = clap::ArgAction::SetFalse)]
         cache: bool,
     },
-    /// Turn a project into an image file: the composite with `-o`, the
+    /// Turn a project into an image file: the image with `-o`, the
     /// Z-Map with `--zmap`, either or both in one invocation. At least one
     /// of the two is required. This is the only command that writes an
     /// image.
     Export {
         /// The `.ffp` project to read.
         project: PathBuf,
-        /// Write the composite to this path.
+        /// Write the image to this path.
         #[arg(short = 'o', long = "output", value_name = "FILE")]
         output: Option<PathBuf>,
         /// Write the Z-Map to this path.
         #[arg(long, value_name = "FILE")]
         zmap: Option<PathBuf>,
+        /// A checkpoint id or unique id prefix. Defaults to the head. Every
+        /// image export re-reads and verifies the nearest fused ancestor's
+        /// source frames; `--zmap` alone needs none.
+        #[arg(long, value_name = "ID")]
+        checkpoint: Option<String>,
+        /// `--format` and its per-format flags: what `-o`'s image is
+        /// encoded as.
+        #[command(flatten)]
+        format: export::FormatArgs,
         /// Write this source frame "as fused" -- warped by its recorded
-        /// transform and offset by the applied crop, at the composite's own
-        /// width and height. Requires `--frame-output`.
+        /// transform and offset by the applied crop, at the resolved
+        /// checkpoint's own composite width and height. Requires
+        /// `--frame-output`.
         #[arg(long, value_name = "INDEX", requires = "frame_output")]
         frame: Option<usize>,
         /// Where to write the frame `--frame` names.
@@ -289,6 +300,17 @@ enum Command {
         /// Emit the frozen JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
+    },
+    /// List, materialize, apply an op list onto, or delete a project's
+    /// checkpoints. Every history operation is reachable through this
+    /// command, headless.
+    History {
+        /// Accept a project whose recorded source frames' content changed
+        /// since it was written, printing a warning instead of refusing.
+        #[arg(long = "accept-changed-sources", global = true)]
+        accept_changed_sources: bool,
+        #[command(subcommand)]
+        command: history::HistoryCommand,
     },
     /// Compute and report the per-frame transforms for a stack: readable
     /// text by default, a frozen `--json` document on request, and an
@@ -401,6 +423,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Stack { .. } => "stack",
         Command::Export { .. } => "export",
         Command::Retouch { .. } => "retouch",
+        Command::History { .. } => "history",
         Command::Align { .. } => "align",
         Command::Review { .. } => "review",
         Command::Cache { .. } => "cache",
@@ -501,6 +524,8 @@ fn main() -> ExitCode {
             project,
             output,
             zmap,
+            checkpoint,
+            format,
             frame,
             frame_output,
             json,
@@ -508,6 +533,8 @@ fn main() -> ExitCode {
             &project,
             output.as_deref(),
             zmap.as_deref(),
+            checkpoint.as_deref(),
+            &format,
             frame,
             frame_output.as_deref(),
             json,
@@ -537,6 +564,10 @@ fn main() -> ExitCode {
             solo,
             json,
         ),
+        Command::History {
+            command,
+            accept_changed_sources,
+        } => history::run(command, accept_changed_sources),
         Command::Align {
             dir,
             algo,
@@ -778,14 +809,14 @@ fn info_frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
 /// as one report line instead of failing the whole command.
 fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> InfoReport {
     enum Probe {
-        Tiff(TiffHeader),
-        Raw(RawMetadata, Box<FrameDesc>),
+        Tiff(Box<TiffHeader>),
+        Raw(Box<RawMetadata>, Box<FrameDesc>),
     }
 
     impl Probe {
         fn desc(&self) -> FrameDesc {
             match self {
-                Self::Tiff(header) => FrameDesc::from(header),
+                Self::Tiff(header) => FrameDesc::from(header.as_ref()),
                 Self::Raw(_, desc) => (**desc).clone(),
             }
         }
@@ -814,12 +845,12 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                         let desc = stack.frame(0).cloned().ok_or(
                             focusforge_core::io::RawError::FrameIndex { index: 0, count: 0 },
                         )?;
-                        Ok(Probe::Raw(metadata, Box::new(desc)))
+                        Ok(Probe::Raw(Box::new(metadata), Box::new(desc)))
                     })
                     .map_err(|error| error.to_string())
             } else {
                 TiffHeader::open(p)
-                    .map(Probe::Tiff)
+                    .map(|header| Probe::Tiff(Box::new(header)))
                     .map_err(|error| error.to_string())
             },
         })
@@ -890,7 +921,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 mmap_fast_path: None,
                 reader: Some("RawStack".to_string()),
                 refusal: None,
-                raw: Some(RawRecord::from(metadata)),
+                raw: Some(RawRecord::from(metadata.as_ref())),
                 error: None,
             },
             Err(e) => FileReport {
@@ -1039,6 +1070,12 @@ fn fail(message: impl std::fmt::Display) -> ExitCode {
     ExitCode::FAILURE
 }
 
+fn fail_with_code(message: impl std::fmt::Display, code: u8) -> ExitCode {
+    eprintln!("error: {message}");
+    tracing::error!(target: MIRRORED_OUTPUT_TARGET, "error: {message}");
+    ExitCode::from(code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,5 +1125,76 @@ mod tests {
             .as_bool()
             .expect("auto-crop's default must be a bool");
         assert_eq!(crop, expected);
+    }
+
+    /// clap's own consistency check over the whole parser: every subcommand
+    /// and flag it declares actually builds into a valid `Command`.
+    #[test]
+    fn parser_is_consistent() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    /// Every export `ParamDesc` id is a `--<id>` flag on `export` whose help
+    /// text names its default and every choice or numeric range -- the
+    /// same one-source-of-truth check `no_crop_flag_reads_the_project_schema`
+    /// runs for `auto-crop`.
+    #[test]
+    fn export_flags_read_the_export_schema() {
+        use clap::CommandFactory;
+        use focusforge_core::params::ParamKind;
+        use focusforge_core::project::export::{JPEG_PARAMS, PNG_PARAMS, TIFF_PARAMS};
+
+        let export_cmd = Cli::command()
+            .find_subcommand("export")
+            .expect("export subcommand must exist")
+            .clone();
+        for schema in [&*TIFF_PARAMS, &*PNG_PARAMS, &*JPEG_PARAMS] {
+            for desc in schema.iter() {
+                let arg = export_cmd
+                    .get_arguments()
+                    .find(|a| a.get_long() == Some(desc.id.as_str()))
+                    .unwrap_or_else(|| panic!("no --{} flag on export", desc.id));
+                let help = arg
+                    .get_help()
+                    .unwrap_or_else(|| panic!("--{} needs help text", desc.id))
+                    .to_string();
+                match &desc.kind {
+                    ParamKind::Enum { variants } => {
+                        for variant in variants {
+                            assert!(
+                                help.contains(&variant.id),
+                                "--{}'s help is missing choice {:?}: {help:?}",
+                                desc.id,
+                                variant.id
+                            );
+                        }
+                        let default = desc.default.as_enum().expect("enum default");
+                        assert!(
+                            help.contains(default),
+                            "--{}'s help is missing its default {:?}: {help:?}",
+                            desc.id,
+                            default
+                        );
+                    }
+                    ParamKind::Int { min, max } => {
+                        for bound in [min, max] {
+                            assert!(
+                                help.contains(&bound.to_string()),
+                                "--{}'s help is missing bound {bound}: {help:?}",
+                                desc.id
+                            );
+                        }
+                        let default = desc.default.as_i64().expect("int default");
+                        assert!(
+                            help.contains(&default.to_string()),
+                            "--{}'s help is missing its default {default}: {help:?}",
+                            desc.id
+                        );
+                    }
+                    other => panic!("unexpected export param kind for {}: {other:?}", desc.id),
+                }
+            }
+        }
     }
 }

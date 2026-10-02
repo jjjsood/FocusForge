@@ -9,8 +9,9 @@ mod common;
 use std::fs;
 use std::sync::{Arc, Mutex};
 
+use focusforge_core::align::Registration;
 use focusforge_core::io::Rect;
-use focusforge_core::project::{Op, Point};
+use focusforge_core::project::{self, Op, Point, Project};
 use focusforge_core::zmap::ZMapReader;
 use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode};
 
@@ -665,8 +666,8 @@ fn edit_session_is_per_tab_and_survives_mode_switches() {
     save_to_proposed(&mut controller);
     assert_eq!(
         controller.edit_session().map(|session| session.op_count()),
-        Some(1),
-        "a save keeps the session"
+        Some(0),
+        "a save keeps the session, rebased onto the checkpoint it wrote"
     );
     assert!(controller.editor_enabled(), "a saved tab stays editable");
 }
@@ -684,7 +685,8 @@ fn edit_session_follows_the_newest_planes() {
 
     assert!(controller.set_mode(ShellMode::Stacking));
     controller.toggle_frame_excluded(2);
-    assert!(controller.start_fuse());
+    assert!(!controller.start_fuse(), "a dab in live asks first");
+    controller.close_guard_confirmed();
     settle_all(&mut controller);
     assert_eq!(controller.checkpoint_count(), Some(2));
 
@@ -767,6 +769,9 @@ fn controller_events_reach_an_installed_sink() {
     controller.window_minimize();
     controller.window_maximize_toggle();
     controller.select_dock_tab(DockTab::Settings);
+    // `checkpoint_export_requested` is a no-op (no `CheckpointExportRequested`
+    // raised) with no active tab; its positive case is
+    // `tests/checkpoint_export.rs::export_button_opens_the_modal_for_the_current_position`.
     controller.checkpoint_export_requested();
     controller.window_close();
 
@@ -778,10 +783,118 @@ fn controller_events_reach_an_installed_sink() {
             ShellEvent::WindowMinimizeRequested,
             ShellEvent::WindowMaximizeToggled(true),
             ShellEvent::DockTabSelected(DockTab::Settings),
-            ShellEvent::CheckpointExportRequested,
             ShellEvent::WindowCloseRequested,
         ],
         "events must reach the sink in the order they were raised"
+    );
+}
+
+/// A press on the drawn `Checkpoints` scrollbar thumb grabs it at the press
+/// offset instead of jumping the list: the thumb math reads the content
+/// height `checkpoints_panel()` builds, the same number the list draws
+/// with. Only a press on the track outside the thumb may jump.
+#[test]
+fn pressing_the_checkpoints_scrollbar_thumb_grabs_it_without_jumping() {
+    use focusforge_core::io::{TiffSpec, TiffWriter};
+    use focusforge_core::params::ParamValues;
+    use focusforge_core::project::{Metrics, SealRequest, ZMapStorage, append_ops_at, seal_at};
+    use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+
+    let dir = common::tree("checkpoints_scrollbar_thumb");
+    let composite = dir.join("composite.tif");
+    let zmap = dir.join("zmap.tif");
+    let full = Rect {
+        x: 0,
+        y: 0,
+        width: 4,
+        height: 4,
+    };
+    let mut writer = TiffWriter::create(
+        &composite,
+        TiffSpec {
+            width: 4,
+            height: 4,
+            samples_per_pixel: 3,
+            description: Some("staged".to_string()),
+        },
+    )
+    .unwrap();
+    writer.write_tile(full, &[0u16; 4 * 4 * 3]).unwrap();
+    writer.finish().unwrap();
+    let mut map = ZMapWriter::create(&zmap, ZMapInfo::new(4, 4, 1).unwrap()).unwrap();
+    map.write_tile(full, &[0u16; 4 * 4]).unwrap();
+    map.finish().unwrap();
+
+    // Ten same-day checkpoints -- no day separator, so `content_height` is
+    // exactly 10 * 40px = 400px, the fixed number the math below assumes.
+    let project_path = dir.join("scrollbar.ffp");
+    let noon = 1_756_468_800; // an arbitrary local noon
+    seal_at(
+        SealRequest {
+            project_path: &project_path,
+            staged_composite: &composite,
+            staged_zmap: &zmap,
+            sources: &[],
+            algorithm: "laplacian-pyramid",
+            params: &ParamValues::new(),
+            align: None,
+            registration: Registration::default(),
+            composite_description: "staged".to_string(),
+            label: None,
+            metrics: Metrics::default(),
+        },
+        noon,
+    )
+    .unwrap();
+    for i in 1..10i64 {
+        let op = Op::BrushStroke {
+            source_id: 0,
+            path: vec![Point { x: 1, y: 1 }],
+            radius: 0.5,
+            softness: 0.0,
+        };
+        append_ops_at(
+            &project_path,
+            vec![op],
+            None,
+            noon + i * 60,
+            ZMapStorage::Bounded,
+        )
+        .unwrap_or_else(|err| panic!("checkpoint {i} must append: {err}"));
+    }
+
+    let mut controller = AppController::new();
+    common::open_and_settle(&mut controller, &[project_path]);
+    assert_eq!(controller.checkpoints_panel().content_height, 400.0);
+
+    // A 400px list in a 100px viewport, scrolled to its midpoint: thumb
+    // height 100*100/400 = 25px, thumb top 150*100/400 = 37.5px, so the
+    // thumb spans [37.5, 62.5).
+    controller.set_checkpoints_viewport_height(100.0);
+    controller.scroll_checkpoints_panel(150.0);
+    assert_eq!(controller.checkpoints_scroll_y(), 150.0);
+
+    // Press inside the thumb: no jump.
+    controller.checkpoints_scrollbar_pointer(PointerKind::Down, 50.0);
+    assert_eq!(
+        controller.checkpoints_scroll_y(),
+        150.0,
+        "a press on the thumb itself must not move the list"
+    );
+
+    // Dragging from there moves the list smoothly, by the drag delta.
+    controller.checkpoints_scrollbar_dragged(70.0);
+    assert_eq!(controller.checkpoints_scroll_y(), 230.0);
+    controller.checkpoints_scrollbar_pointer(PointerKind::Up, 70.0);
+
+    // A press on the track outside the thumb may jump.
+    controller.scroll_checkpoints_panel(150.0 - controller.checkpoints_scroll_y());
+    assert_eq!(controller.checkpoints_scroll_y(), 150.0);
+    controller.checkpoints_scrollbar_pointer(PointerKind::Down, 90.0);
+    assert_eq!(
+        controller.checkpoints_scroll_y(),
+        300.0,
+        "a press on the bare track may jump, clamped to the list's end"
     );
 }
 
@@ -2410,6 +2523,20 @@ const ALT: Modifiers = Modifiers {
     ..Modifiers::NONE
 };
 
+/// Binds `Alt + Wheel` to the brush softness in editor mode; the shipped
+/// table leaves softness without a wheel binding.
+fn bind_softness_to_alt_wheel(controller: &mut AppController) {
+    use focusforge_gui::input_config::Provenance;
+    use focusforge_gui::input_map::{Action, Binding, InputTable, Trigger};
+    let mut table = InputTable::default();
+    table.bindings.push(Binding {
+        trigger: Trigger::Wheel(ALT),
+        stacking: None,
+        editor: Some(Action::BrushSoftness),
+    });
+    controller.install_input_table(table, Provenance::Defaults);
+}
+
 /// The active tab's whole fused map.
 fn map_rect(controller: &AppController) -> Rect {
     controller.edit_session().unwrap().tile()
@@ -2512,6 +2639,22 @@ struct Sealed {
 
 impl Sealed {
     fn read(controller: &mut AppController, root: &Path) -> Self {
+        let registration = controller
+            .held_checkpoints()
+            .last()
+            .expect("a fused tab holds at least one checkpoint")
+            .registration
+            .clone();
+        Self::read_with(controller, root, registration)
+    }
+
+    /// [`Self::read`] for a tab whose checkpoints are saved, so the
+    /// registration of the row in view is given.
+    fn read_with(
+        controller: &mut AppController,
+        root: &Path,
+        registration: job::Registration,
+    ) -> Self {
         let map = map_rect(controller);
         let frame = Rect {
             x: 0,
@@ -2519,12 +2662,6 @@ impl Sealed {
             width: FRAME,
             height: FRAME,
         };
-        let registration = controller
-            .held_checkpoints()
-            .last()
-            .expect("a fused tab holds at least one checkpoint")
-            .registration
-            .clone();
         let (composite, zmap) = controller.materialize_active_tab_planes().unwrap();
         Sealed {
             map,
@@ -2817,6 +2954,15 @@ fn brush_controls_convert_to_storage_units() {
     c.wheel(0.0, -60.0, 0.0, 0.0, SHIFT);
     assert_eq!(size(&c), 1.0, "clamped at 1 px");
 
+    assert_eq!(
+        {
+            c.wheel(0.0, 60.0, 0.0, 0.0, ALT);
+            soft(&c)
+        },
+        30.0,
+        "the shipped table binds no wheel to softness"
+    );
+    bind_softness_to_alt_wheel(&mut c);
     c.wheel(0.0, 60.0, 0.0, 0.0, ALT);
     assert_eq!(soft(&c), 35.0);
     c.set_brush_softness_fraction(1.0);
@@ -2857,6 +3003,7 @@ fn brush_controls_convert_to_storage_units() {
     let held = narrow
         .held_checkpoints()
         .last()
+        .cloned()
         .expect("the narrow tab fuses");
     let narrow_ceiling = held.width.min(held.height);
     assert!(held.width > held.height, "a non-square fused image");
@@ -2968,24 +3115,13 @@ fn legend_header_states() {
 }
 
 #[test]
-fn legend_no_source_entry_is_pinned_and_unpaintable() {
+fn legend_lists_only_frames_and_rejects_a_position_past_them() {
     let mut c = controller_with_scratch("legend_no_source");
     open_fused_tab(&mut c, "legend_no_source", 3);
-    // A fuse now auto-enters Editor on the viewed tab; back out to Stacking
-    // so the "before" half of this test observes the Stacking-mode legend.
     c.set_mode(ShellMode::Stacking);
-    assert!(
-        !c.images_panel().no_source_row,
-        "stacking mode has no pinned entry"
-    );
-
     assert!(c.set_mode(ShellMode::Editor));
     let panel = c.images_panel();
-    assert!(
-        panel.no_source_row,
-        "the legend pins a NO_SOURCE entry below the list"
-    );
-    assert_eq!(panel.rows.len(), 3, "NO_SOURCE is not one of rows");
+    assert_eq!(panel.rows.len(), 3, "the legend holds one row per frame");
 
     let before = c.brush_source();
     c.select_frame(3);
@@ -3095,14 +3231,106 @@ fn legend_has_no_mutation_affordances() {
     assert!(c.pending_frame_change().is_none());
 }
 
+/// The `Composite` overlay's draw for `sources` fused sources at `opacity`.
+fn overlay_for(sources: u32, opacity: f32) -> OverlayDraw {
+    OverlayDraw {
+        table: focusforge_core::zmap::overlay_table(sources, None),
+        alpha: focusforge_core::display::alpha_from_opacity(opacity),
+    }
+}
+
+#[test]
+fn overlay_draws_in_stacking_on_a_fused_tab() {
+    let mut c = controller_with_scratch("overlay_stacking");
+    open_fused_tab(&mut c, "overlay_stacking", 3);
+    assert!(c.set_mode(ShellMode::Editor));
+    c.set_overlay_opacity_fraction(0.3);
+    c.set_overlay_on(true);
+    let in_editor = c.overlay_draw();
+
+    assert!(c.set_mode(ShellMode::Stacking));
+    assert_eq!(c.mode(), ShellMode::Stacking);
+    assert!(c.overlay_available());
+    assert_eq!(c.overlay_draw(), Some(overlay_for(3, 0.3)));
+    assert_eq!(
+        c.overlay_draw(),
+        in_editor,
+        "stacking draws what editor mode draws for the same state"
+    );
+}
+
+#[test]
+fn overlay_unavailable_without_a_finished_fuse() {
+    let mut c = controller_with_scratch("overlay_unavailable");
+    c.set_overlay_on(true);
+    assert!(!c.overlay_available(), "no tab");
+    assert_eq!(c.overlay_draw(), None, "no tab, toggle on");
+
+    open_mantis64_tab(&mut c, "overlay_unavailable", 3);
+    assert_eq!(c.checkpoint_count(), Some(0));
+    assert!(!c.overlay_available(), "frames added, never fused");
+    assert_eq!(c.overlay_draw(), None, "no checkpoint, toggle on");
+
+    assert!(c.start_fuse());
+    assert!(!c.overlay_available(), "the first fuse is still running");
+    assert_eq!(c.overlay_draw(), None, "first fuse running, toggle on");
+    settle_all(&mut c);
+    assert!(c.overlay_available(), "the fuse finished");
+    assert!(c.overlay_draw().is_some());
+}
+
+#[test]
+fn overlay_follows_the_active_tab() {
+    let mut c = controller_with_scratch("overlay_tabs");
+    open_fused_tab(&mut c, "overlay_tabs_fused", 3);
+    assert!(c.set_mode(ShellMode::Stacking));
+    c.set_overlay_on(true);
+    assert_eq!(c.overlay_draw(), Some(overlay_for(3, 0.65)));
+
+    open_mantis64_tab(&mut c, "overlay_tabs_unfused", 2);
+    assert_eq!(c.active_project(), Some(1));
+    assert!(!c.overlay_available());
+    assert_eq!(c.overlay_draw(), None, "the unfused tab draws nothing");
+    assert!(c.overlay_view().on, "the toggle is untouched");
+
+    c.select_project(0);
+    assert!(c.overlay_available());
+    assert_eq!(
+        c.overlay_draw(),
+        Some(overlay_for(3, 0.65)),
+        "back on the fused tab the overlay draws again"
+    );
+}
+
+#[test]
+fn overlay_counts_fused_sources_not_frames() {
+    let mut c = controller_with_scratch("overlay_sources");
+    open_fused_tab(&mut c, "overlay_sources", 2);
+    assert!(c.set_mode(ShellMode::Stacking));
+    c.set_overlay_on(true);
+
+    common::add_and_settle(&mut c, &[common::fixture_frame("mantis-64", 2)])
+        .expect("the add must not refuse");
+    assert!(c.pending_frame_change().is_some(), "a checkpoint exists");
+    assert!(c.confirm_frame_change());
+    assert_eq!(c.images_panel().rows.len(), 3, "the frame was added");
+    assert_eq!(
+        c.overlay_draw(),
+        Some(overlay_for(2, 0.65)),
+        "the table stays sized by the fused sources"
+    );
+}
+
 #[test]
 fn overlay_controls_match_the_render_parameters() {
     let mut c = controller_with_scratch("overlay_params");
     open_fused_tab(&mut c, "overlay_params", 3);
+    assert!(c.set_mode(ShellMode::Stacking));
+    assert_eq!(c.mode(), ShellMode::Stacking);
     assert_eq!(
         c.overlay_draw(),
         None,
-        "stacking mode never draws the overlay"
+        "stacking mode draws nothing until the toggle is on"
     );
     assert!(
         !c.overlay_view().on,
@@ -3757,6 +3985,7 @@ fn live_stroke_previews_each_new_segment() {
             s.can_redo(),
         )
     };
+    bind_softness_to_alt_wheel(&mut c);
     let before = session(&c);
     assert!(before.2, "one stroke waits on the redo stack");
     let before_indices = indices(&c);
@@ -4385,6 +4614,484 @@ fn refusal_dialog_counts_as_modal() {
     controller.dismiss_refusal();
     assert!(!controller.modal_open(), "answering clears it");
     assert!(!controller.canvas_blocked());
+}
+
+// ---------------------------------------------------------------------
+// In-memory checkpoints and the project save.
+// ---------------------------------------------------------------------
+
+/// The active tab's current checkpoint row, by its list id.
+fn current_row(controller: &AppController) -> Option<String> {
+    controller
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .find(|entry| entry.selected)
+        .and_then(|entry| entry.id.clone())
+}
+
+fn row_index(controller: &AppController, id: &str) -> usize {
+    controller
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .position(|entry| entry.id.as_deref() == Some(id))
+        .unwrap_or_else(|| panic!("no row for {id}"))
+}
+
+/// A stroke at column `x` that changes the map there: the source the pixel
+/// does not show yet.
+fn paint(controller: &mut AppController, x: i32) {
+    let session = controller
+        .edit_session_mut()
+        .expect("the tab has an edit session");
+    let width = session.tile().width as usize;
+    let shown = session.indices()[20 * width + x as usize];
+    session
+        .append(Op::BrushStroke {
+            source_id: u16::from(shown == 0),
+            path: vec![Point { x, y: 20 }],
+            radius: 4.0,
+            softness: 0.0,
+        })
+        .expect("a dab inside the map applies");
+}
+
+/// `set_mode(Editor)`, waiting out the render an op-bearing row needs first.
+fn enter_editor(controller: &mut AppController) {
+    let start = std::time::Instant::now();
+    while !controller.set_mode(ShellMode::Editor) {
+        assert!(start.elapsed() < SETTLE, "the editor did not open");
+        controller.settle_checkpoint_render();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn reopen(path: &Path, name: &str) -> AppController {
+    let mut controller = controller_with_scratch(name);
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[path.to_path_buf()]),
+        OpenOutcome::Opened(_)
+    ));
+    controller
+}
+
+fn saved(path: &Path) -> Project {
+    Project::open(path).expect("the saved project opens")
+}
+
+/// `id`'s Z-Map as a saved project materializes it.
+fn saved_map(path: &Path, id: &str, name: &str) -> Vec<u16> {
+    let mut project = saved(path);
+    let checkpoint = project
+        .history()
+        .get(id)
+        .expect("the checkpoint is saved")
+        .clone();
+    let out = common::tree(name).join("zmap.tif");
+    project::materialize_zmap(&mut project, &checkpoint, &out).expect("the Z-Map materializes");
+    read_whole_zmap(&out)
+}
+
+fn saved_ids(path: &Path) -> Vec<String> {
+    saved(path)
+        .history()
+        .all()
+        .iter()
+        .map(|c| c.id.clone())
+        .collect()
+}
+
+/// The one saved checkpoint of `path` that is not in `known`.
+fn added_checkpoint(path: &Path, known: &[String]) -> project::Checkpoint {
+    let project = saved(path);
+    let added: Vec<&project::Checkpoint> = project
+        .history()
+        .all()
+        .into_iter()
+        .filter(|c| !known.contains(&c.id))
+        .collect();
+    assert_eq!(added.len(), 1, "exactly one checkpoint is new");
+    added[0].clone()
+}
+
+/// Fuses two frames, saves, then paints and saves once more per entry of
+/// `strokes`. Returns the project file and its checkpoint ids, oldest first.
+fn saved_chain(name: &str, strokes: &[i32]) -> (PathBuf, Vec<String>) {
+    let mut controller = controller_with_scratch(name);
+    open_fused_tab(&mut controller, &format!("{name}_frames"), 2);
+    let path = save_to_proposed(&mut controller);
+    let mut chain = vec![saved(&path).checkpoint().id.clone()];
+    for &x in strokes {
+        paint(&mut controller, x);
+        assert!(controller.save_active_project(|_| None));
+        chain.push(saved(&path).checkpoint().id.clone());
+    }
+    (path, chain)
+}
+
+#[test]
+fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
+    // A never-saved project: fuse, paint, save.
+    let mut controller = controller_with_scratch("auto_checkpoint_new");
+    open_fused_tab(&mut controller, "auto_checkpoint_new_frames", 2);
+    paint(&mut controller, 20);
+    let painted = controller.edit_session().unwrap().indices().to_vec();
+    let path = save_to_proposed(&mut controller);
+
+    let project = saved(&path);
+    assert_eq!(project.history().all().len(), 2, "root plus one child");
+    let child = project.checkpoint().clone();
+    let root = project
+        .history()
+        .get(child.parent.as_deref().unwrap())
+        .unwrap();
+    assert!(root.parent.is_none() && root.ops.is_empty());
+    assert_eq!(
+        child.ops.len(),
+        1,
+        "the automatic checkpoint carries the stroke"
+    );
+    assert_eq!(
+        saved_map(&path, &child.id, "auto_checkpoint_new_map"),
+        painted
+    );
+    assert_eq!(current_row(&controller), Some(child.id.clone()));
+    let session = controller.edit_session().expect("the session survives");
+    assert_eq!(
+        (session.op_count(), session.indices()),
+        (0, painted.as_slice())
+    );
+    assert!(!controller.save_enabled());
+
+    // An opened project painted on its older, non-head row.
+    let (path, chain) = saved_chain("auto_checkpoint_older", &[20]);
+    let mut controller = reopen(&path, "auto_checkpoint_older_reopened");
+    assert_eq!(current_row(&controller), Some(chain[1].clone()));
+    let root_row = row_index(&controller, &chain[0]);
+    controller.select_checkpoint_row(root_row);
+    enter_editor(&mut controller);
+    paint(&mut controller, 40);
+    let painted = controller.edit_session().unwrap().indices().to_vec();
+    assert!(controller.save_enabled());
+    assert!(controller.save_active_project(|_| None));
+
+    let added = added_checkpoint(&path, &chain);
+    assert_eq!(
+        added.parent.as_deref(),
+        Some(chain[0].as_str()),
+        "not the head"
+    );
+    assert_eq!(
+        saved_map(&path, &added.id, "auto_checkpoint_older_map"),
+        painted
+    );
+    assert_eq!(current_row(&controller), Some(added.id));
+    let session = controller.edit_session().expect("the session survives");
+    assert_eq!(
+        (session.op_count(), session.indices()),
+        (0, painted.as_slice())
+    );
+    assert!(!controller.save_enabled());
+}
+
+#[test]
+fn a_fuse_records_the_current_row_as_its_parent() {
+    let (path, chain) = saved_chain("fuse_parent", &[20]);
+    let mut controller = reopen(&path, "fuse_parent_reopened");
+    controller.set_align_algorithm("dummy-align");
+    let root_row = row_index(&controller, &chain[0]);
+    controller.select_checkpoint_row(root_row);
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    assert_eq!(controller.held_checkpoints().len(), 1);
+    assert!(controller.save_active_project(|_| None));
+
+    let fused = added_checkpoint(&path, &chain);
+    assert!(fused.ops.is_empty());
+    assert_eq!(
+        fused.parent.as_deref(),
+        Some(chain[0].as_str()),
+        "not the head"
+    );
+    let project = saved(&path);
+    assert_eq!(
+        project.history().get(&chain[1]).unwrap().parent.as_deref(),
+        Some(chain[0].as_str())
+    );
+}
+
+#[test]
+fn save_is_enabled_only_with_something_to_write() {
+    let mut controller = controller_with_scratch("save_enabled_rule");
+    open_mantis64_tab(&mut controller, "save_enabled_rule_frames", 2);
+    assert!(!controller.save_enabled(), "never fused");
+
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    assert!(controller.save_enabled(), "the first fuse has finished");
+    let path = save_to_proposed(&mut controller);
+    assert!(!controller.save_enabled(), "nothing left to write");
+
+    let mut opened = reopen(&path, "save_enabled_rule_reopened");
+    assert!(!opened.save_enabled(), "an unmodified opened project");
+    enter_editor(&mut opened);
+    assert!(!opened.save_enabled(), "an open session with no stroke");
+    paint(&mut opened, 20);
+    assert!(opened.save_enabled(), "a modified live");
+    assert!(opened.edit_session_mut().unwrap().undo().is_some());
+    assert!(!opened.save_enabled(), "undo brought live back to zero ops");
+}
+
+#[test]
+fn a_pending_delete_is_applied_by_the_project_save() {
+    let (path, chain) = saved_chain("pending_delete", &[20, 40]);
+    let b = &chain[2];
+    let mut controller = reopen(&path, "pending_delete_reopened");
+    assert_eq!(current_row(&controller), Some(b.clone()));
+    assert!(!controller.save_enabled());
+
+    assert!(!controller.queue_checkpoint_delete("no-such-checkpoint"));
+    assert!(!controller.save_enabled(), "refusals change nothing");
+
+    assert!(controller.queue_checkpoint_delete(b));
+    assert!(!controller.queue_checkpoint_delete(b), "already queued");
+    assert!(
+        controller.save_enabled(),
+        "a pending delete is something to write"
+    );
+    let before = fs::read(&path).unwrap();
+
+    // A save that cannot write keeps the delete and leaves the file alone.
+    let mut blocker = path.clone().into_os_string();
+    blocker.push(".saving");
+    let blocker = PathBuf::from(blocker);
+    fs::create_dir(&blocker).unwrap();
+    assert!(!controller.save_active_project(|_| None));
+    assert_eq!(fs::read(&path).unwrap(), before, "the file is untouched");
+    assert!(controller.save_enabled(), "the delete is still queued");
+    fs::remove_dir(&blocker).unwrap();
+
+    // The current row's delete leaves it stored hidden and unlisted.
+    assert!(controller.save_active_project(|_| None));
+    assert_eq!(saved_ids(&path).len(), 3);
+    let project = saved(&path);
+    assert!(project.history().get(b).unwrap().hidden);
+    assert!(project.history().visible().iter().all(|c| &c.id != b));
+    assert_eq!(current_row(&controller), None);
+    assert!(!controller.save_enabled());
+
+    // The root is deletable; the last listed row is not.
+    let (path, chain) = saved_chain("pending_delete_root", &[20, 40]);
+    let mut controller = reopen(&path, "pending_delete_root_reopened");
+    assert!(controller.queue_checkpoint_delete(&chain[0]));
+    assert!(controller.queue_checkpoint_delete(&chain[1]));
+    assert!(
+        !controller.queue_checkpoint_delete(&chain[2]),
+        "the last listed row stays"
+    );
+    assert!(controller.save_active_project(|_| None));
+    assert_eq!(saved_ids(&path).len(), 3);
+    let project = saved(&path);
+    let visible: Vec<&str> = project
+        .history()
+        .visible()
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    assert_eq!(visible, [chain[2].as_str()]);
+
+    // A delete leaves the edit session open.
+    let (path, chain) = saved_chain("pending_delete_session", &[20]);
+    let mut controller = reopen(&path, "pending_delete_session_reopened");
+    enter_editor(&mut controller);
+    assert!(controller.queue_checkpoint_delete(&chain[1]));
+    assert!(controller.save_active_project(|_| None));
+    assert!(controller.edit_session().is_some());
+    assert_eq!(current_row(&controller), None);
+    // Live still stands on the deleted row: a stroke lands under it.
+    paint(&mut controller, 50);
+    assert!(controller.save_active_project(|_| None));
+    assert_eq!(
+        saved(&path).checkpoint().parent.as_deref(),
+        Some(chain[1].as_str())
+    );
+
+    // A checkpoint an in-memory entry sits under is deletable; the save
+    // writes the entry under it.
+    let (path, chain) = saved_chain("pending_delete_entry", &[20, 40]);
+    let mut controller = reopen(&path, "pending_delete_entry_reopened");
+    enter_editor(&mut controller);
+    paint(&mut controller, 30);
+    assert!(controller.snapshot_live(0));
+    assert!(controller.queue_checkpoint_delete(&chain[1]));
+    assert!(controller.save_active_project(|_| None));
+    assert_eq!(saved_ids(&path).len(), 4);
+    assert!(saved(&path).history().get(&chain[1]).unwrap().hidden);
+
+    // A fuse finishing on a pending-deleted row lands under it; the save
+    // hides the row and keeps it.
+    let (path, chain) = saved_chain("pending_delete_fuse", &[20]);
+    let mut controller = reopen(&path, "pending_delete_fuse_reopened");
+    controller.set_align_algorithm("dummy-align");
+    assert!(controller.queue_checkpoint_delete(&chain[1]));
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    assert!(controller.save_active_project(|_| None));
+    let project = saved(&path);
+    assert_eq!(project.history().all().len(), 3);
+    assert!(
+        project.history().get(&chain[1]).unwrap().hidden,
+        "the delete applied and the row stays stored"
+    );
+    assert_eq!(
+        project.checkpoint().parent.as_deref(),
+        Some(chain[1].as_str())
+    );
+}
+
+#[test]
+fn edits_on_a_row_queued_for_delete_are_saved_under_it() {
+    let (path, chain) = saved_chain("deleted_origin", &[20, 40]);
+    let mut controller = reopen(&path, "deleted_origin_reopened");
+    enter_editor(&mut controller);
+    assert!(controller.queue_checkpoint_delete(&chain[2]));
+    paint(&mut controller, 50);
+    let painted = controller.edit_session().unwrap().indices().to_vec();
+    assert!(controller.save_active_project(|_| None));
+
+    let project = saved(&path);
+    assert!(
+        project.history().get(&chain[2]).unwrap().hidden,
+        "the origin is hidden and stays stored"
+    );
+    assert!(project.history().visible().iter().all(|c| c.id != chain[2]));
+    assert_eq!(project.history().all().len(), 4);
+    let added = project.checkpoint().clone();
+    assert_eq!(added.parent.as_deref(), Some(chain[2].as_str()));
+    assert!(!added.ops.is_empty(), "an op list over the hidden row");
+    assert_eq!(saved_map(&path, &added.id, "deleted_origin_map"), painted);
+    assert_eq!(current_row(&controller), Some(added.id));
+    assert_eq!(controller.edit_session().unwrap().op_count(), 0);
+}
+
+#[test]
+fn a_snapshot_during_a_fuse_holds_no_files() {
+    let (path, chain) = saved_chain("snapshot_during_fuse", &[20]);
+    let mut controller = reopen(&path, "snapshot_during_fuse_reopened");
+    controller.set_align_algorithm("dummy-align");
+    enter_editor(&mut controller);
+    assert!(controller.queue_checkpoint_delete(&chain[1]));
+
+    assert!(controller.start_fuse());
+    paint(&mut controller, 40);
+    assert!(controller.snapshot_live(0), "an op-bearing entry is taken");
+    settle_all(&mut controller);
+
+    let held = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("snapshot_during_fuse_reopened_scratch")
+        .join("held");
+    let tab_dirs: Vec<_> = fs::read_dir(&held)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(tab_dirs.len(), 1, "one tab holds files");
+    assert_eq!(
+        fs::read_dir(&tab_dirs[0]).unwrap().count(),
+        1,
+        "only the fuse owns a directory"
+    );
+}
+
+#[test]
+fn a_save_that_does_not_write_loses_nothing() {
+    let mut controller = controller_with_scratch("save_loses_nothing");
+    open_fused_tab(&mut controller, "save_loses_nothing_frames", 2);
+    paint(&mut controller, 20);
+    let painted = controller.edit_session().unwrap().indices().to_vec();
+
+    assert!(!controller.save_active_project(|_| None));
+    assert_eq!(
+        controller.checkpoint_count(),
+        Some(1),
+        "no automatic checkpoint"
+    );
+    assert_eq!(controller.edit_session().unwrap().op_count(), 1);
+    assert!(controller.save_enabled());
+
+    let missing = common::tree("save_loses_nothing_target")
+        .join("gone")
+        .join("p.ffp");
+    assert!(!controller.save_active_project(|_| Some(missing.clone())));
+    assert!(controller.take_settled_failure().is_some());
+    assert_eq!(
+        controller.checkpoint_count(),
+        Some(2),
+        "the automatic checkpoint stays"
+    );
+    assert_eq!(current_row(&controller), Some("held:1".to_string()));
+    let session = controller.edit_session().unwrap();
+    assert_eq!(
+        (session.op_count(), session.indices()),
+        (0, painted.as_slice())
+    );
+    assert!(controller.save_enabled());
+
+    let path = save_to_proposed(&mut controller);
+    assert_eq!(saved_ids(&path).len(), 2, "a retry writes the same history");
+}
+
+/// Editing from an older, non-head checkpoint recomposites through that
+/// checkpoint's own registration: the head here was fused without alignment
+/// or crop, the root with both.
+#[test]
+fn an_older_checkpoint_edits_through_its_own_registration() {
+    let name = "older_registration";
+    let mut controller = controller_with_scratch(name);
+    let frames = open_fused_tab(&mut controller, name, 3);
+    let path = save_to_proposed(&mut controller);
+    let mut controller = reopen(&path, "older_registration_reopened");
+    controller.set_align_algorithm("pyramidal-ecc");
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    // The real aligner cannot register these frames, so its result waits on
+    // the Keep/Discard question.
+    assert!(controller.pending_divergence().is_some());
+    controller.keep_fused().expect("the parked result is kept");
+    assert!(controller.save_active_project(|_| None));
+
+    let project = saved(&path);
+    let head = project.checkpoint().clone();
+    let root = head.parent.clone().expect("the second fuse is a child");
+    let root_registration = project.fuse_state(&root).unwrap().registration;
+    let head_registration = project.fuse_state(&head.id).unwrap().registration;
+    assert_ne!(
+        root_registration, head_registration,
+        "the two checkpoints are registered apart"
+    );
+
+    controller.set_resident_tile_size_for_test(16);
+    controller.set_pane_geometry(LEFT, RIGHT);
+    controller.select_checkpoint_row(row_index(&controller, &root));
+    controller.fit();
+    enter_editor(&mut controller);
+    assert_eq!(map_rect(&controller).width, MAP_WIDTH, "the root's own map");
+    controller.select_frame(1);
+    let view = controller.selected_frame_view().unwrap();
+    assert_eq!(view.origin, root_registration.origin());
+
+    let sealed = Sealed::read_with(&mut controller, &frames, root_registration);
+    set_size(&mut controller, 6.0);
+    drag(&mut controller, &[(10.0, 10.0), (30.0, 20.0)]);
+    assert_ne!(indices(&controller), sealed.indices, "the stroke painted");
+    sealed.assert_shown(&controller, "an older checkpoint's edit");
+
+    // The head's registration would have drawn something else.
+    let wrong = Sealed::read_with(&mut controller, &frames, head_registration);
+    assert!(
+        wrong.displayed(&controller) != wrong.expected(&indices(&controller)),
+        "the check can tell the two registrations apart"
+    );
 }
 
 /// The fuse row `id`'s shown value on the active tab.

@@ -33,9 +33,10 @@ use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::{self, ParamValues, StackContext};
 use focusforge_core::registry;
+use focusforge_core::retouch::{Sources, recomposite};
 use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 
-use common::{CliOutput, TmpDir, mantis_512_dir, read_whole, tmp_dir};
+use common::{CliOutput, TmpDir, full_rect, mantis_512_dir, read_whole, tmp_dir};
 
 fn bin() -> Command {
     common::cli_bin("stack_cli")
@@ -172,7 +173,6 @@ fn shared_laplacian_run() -> &'static SharedRun {
 /// output against. This, plus [`shared_laplacian_run`], is the whole cost of
 /// this file: `laplacian` runs exactly twice.
 struct OracleResult {
-    composite: Vec<u16>,
     zmap: Vec<u16>,
 }
 
@@ -223,9 +223,8 @@ fn library_oracle() -> &'static OracleResult {
             .expect("run must succeed");
         consumer.finish().expect("finish must succeed");
 
-        let (composite, ..) = read_whole(&composite_path);
         let (zmap, ..) = read_whole(&zmap_path);
-        OracleResult { composite, zmap }
+        OracleResult { zmap }
     })
 }
 
@@ -245,10 +244,28 @@ fn cli_output_matches_the_library_result() {
     let run = shared_laplacian_run();
     let oracle = library_oracle();
 
-    let (cli_composite, ..) = read_whole(&run.output);
+    // `export -o` writes a Z-Map gather over the stack's sources, not the
+    // stored `laplacian` blend, so the oracle here is the same gather run
+    // over the library's own Z-Map.
+    let (cli_composite, w, h, spp) = read_whole(&run.output);
+    let mantis = TiffStack::open(mantis_512_dir()).expect("mantis-512 must open");
+    let sources = Sources {
+        reader: &mantis,
+        frame_count: mantis.len() as u32,
+        samples_per_pixel: spp,
+        origin: (0, 0),
+    };
+    let mut expected_gather = vec![0u16; oracle.zmap.len() * spp as usize];
+    recomposite(
+        &oracle.zmap,
+        full_rect(w, h),
+        &sources,
+        &mut expected_gather,
+    )
+    .expect("recomposite must succeed");
     assert_eq!(
-        cli_composite, oracle.composite,
-        "the CLI composite must equal a library run driven at the CLI's own geometry"
+        cli_composite, expected_gather,
+        "the CLI's `export -o` output must be the library oracle's Z-Map gathered over the stack's frames"
     );
 
     let (cli_zmap, ..) = read_whole(&run.zmap);

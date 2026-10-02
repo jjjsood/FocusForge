@@ -64,6 +64,9 @@ pub struct RawMetadata {
     pub cfa_height: Option<u16>,
     /// Decoder-native XYZ-to-camera row-major matrix; DNG exposes its file matrix and other formats may expose a camera-table matrix.
     pub color_matrix: Option<Vec<f32>>,
+    /// The decoder's typed EXIF, the one field set every RAW format exposes
+    /// it through (only the DNG decoder surfaces a raw EXIF IFD directly).
+    pub exif: rawler::exif::Exif,
 }
 
 /// Failures while opening or reading a RAW frame set.
@@ -616,6 +619,7 @@ fn open_dng_inner(path: &Path) -> Result<RawFrame, RawError> {
             .get_entry(33421_u16)
             .map(|entry| entry.value.force_u16(1)),
         color_matrix: values_f32(raw.get_entry(50721_u16)),
+        exif: general.exif,
     };
     let desc = raw_desc(&metadata);
     Ok(RawFrame { metadata, desc })
@@ -695,6 +699,7 @@ fn open_dummy_inner(path: &Path) -> Result<RawFrame, RawError> {
         color_matrix: image
             .color_matrix_find_first([rawler::imgop::xyz::Illuminant::D65])
             .map(|(_, matrix)| matrix),
+        exif: general.exif,
     };
     let desc = raw_desc(&metadata);
     Ok(RawFrame { metadata, desc })

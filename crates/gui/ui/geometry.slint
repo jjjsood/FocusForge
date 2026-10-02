@@ -58,7 +58,11 @@ export global ShellGeometry {
     out property <length> strip-cluster-gap: Theme.space-8;
 
     // Dock rows.
+    // The checkpoint panel's heading row: `CHECKPOINTS` and `Export image`.
+    out property <length> checkpoint-heading-height: 28px;
     out property <length> checkpoint-row-height: 40px;
+    // A day separator's own row: an uppercase label over a hairline rule.
+    out property <length> day-separator-height: 16px;
     out property <length> tab-width: 224px;
     out property <length> tab-pitch: 228px;
 
@@ -108,17 +112,14 @@ export global ShellGeometry {
     out property <length> progress-step-x: 166px;
     out property <length> progress-bar-x: 250px;
     out property <length> progress-bar-height: 4px;
-    // The ETA's left edge, measured from the bottom bar's own right edge.
-    out property <length> progress-eta-inset: 376px;
-    // In editor mode the track ends well short of that, clearing the
-    // overlay cluster below; the ETA then sits right after the shortened
-    // track instead of at a fixed inset.
-    out property <length> progress-bar-editor-width-inset: 532px;
+    // The track ends this far short of the bottom bar's right edge, clearing
+    // the overlay cluster below; the ETA sits right after the track.
+    out property <length> progress-bar-width-inset: 532px;
 
-    // The bottom bar's overlay cluster, editor-mode only, right of the
-    // (shortened) progress track and left of the zoom cluster. Its left edge
-    // sits at this inset from the bar's right edge; everything else in the
-    // cluster is an offset from that edge: toggle 60 | 12 | track
+    // The bottom bar's overlay cluster, right of the progress track and left
+    // of the zoom cluster. Its left edge sits at this inset from the bar's
+    // right edge; everything else in the cluster is an offset from that edge:
+    // toggle 60 | 12 | track
     // (`overlay-track-width` wide) with the readout after it, then a 1 px
     // rule 266 past the cluster's left edge, 21 px before the zoom cluster.
     out property <length> overlay-cluster-inset: 516px;
@@ -137,6 +138,6 @@ export global ShellGeometry {
     out property <length> editor-toolbar-undo-x: 436px;
     out property <length> editor-toolbar-redo-x: 468px;
     out property <length> editor-toolbar-icon-width: 27px;
-    out property <length> editor-toolbar-save-checkpoint-x: 1004px;
+    out property <length> editor-toolbar-save-checkpoint-right-inset: 13px;
     out property <length> editor-toolbar-save-checkpoint-width: 163px;
 }

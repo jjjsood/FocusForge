@@ -176,14 +176,12 @@ impl fmt::Display for Trigger {
     }
 }
 
-/// The eleven actions the table can name. Every action but `OverlayOpacity`
-/// is implemented.
+/// The ten actions the table can name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     ZoomAtCursor,
     StepSourceFrame,
     PanHorizontal,
-    OverlayOpacity,
     Pan,
     BrushSize,
     BrushSoftness,
@@ -194,11 +192,10 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 11] = [
+    pub const ALL: [Action; 10] = [
         Action::ZoomAtCursor,
         Action::StepSourceFrame,
         Action::PanHorizontal,
-        Action::OverlayOpacity,
         Action::Pan,
         Action::BrushSize,
         Action::BrushSoftness,
@@ -207,18 +204,13 @@ impl Action {
         Action::PickSourceUnderPointer,
         Action::Paint,
     ];
-
-    /// `true` for every action but `OverlayOpacity`.
-    pub fn implemented(&self) -> bool {
-        !matches!(self, Action::OverlayOpacity)
-    }
 }
 
 /// An action spelling `Action::from_str` refused, by name.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
     "unknown action {spelling:?} -- accepted actions: zoom-at-cursor, step-source-frame, \
-     pan-horizontal, overlay-opacity, pan, brush-size, brush-softness, undo, redo, \
+     pan-horizontal, pan, brush-size, brush-softness, undo, redo, \
      pick-source-under-pointer, paint"
 )]
 pub struct ActionParseError {
@@ -233,7 +225,6 @@ impl FromStr for Action {
             "zoom-at-cursor" => Ok(Action::ZoomAtCursor),
             "step-source-frame" => Ok(Action::StepSourceFrame),
             "pan-horizontal" => Ok(Action::PanHorizontal),
-            "overlay-opacity" => Ok(Action::OverlayOpacity),
             "pan" => Ok(Action::Pan),
             "brush-size" => Ok(Action::BrushSize),
             "brush-softness" => Ok(Action::BrushSoftness),
@@ -254,7 +245,6 @@ impl fmt::Display for Action {
             Action::ZoomAtCursor => "zoom-at-cursor",
             Action::StepSourceFrame => "step-source-frame",
             Action::PanHorizontal => "pan-horizontal",
-            Action::OverlayOpacity => "overlay-opacity",
             Action::Pan => "pan",
             Action::BrushSize => "brush-size",
             Action::BrushSoftness => "brush-softness",
@@ -277,10 +267,10 @@ pub struct Binding {
 
 const M: Modifiers = Modifiers::NONE;
 
-/// Ten trigger-keyed entries, presented as seven display rows -- the tenth
+/// Nine trigger-keyed entries, presented as six display rows -- the ninth
 /// (`Paint`'s drag) is a hidden row, absent from `DISPLAY_GROUPS`.
 /// `defaults_match_the_settled_table` asserts the mapping row for row.
-pub const DEFAULT_BINDINGS: [Binding; 10] = [
+pub const DEFAULT_BINDINGS: [Binding; 9] = [
     Binding {
         trigger: Trigger::Wheel(M),
         stacking: Some(Action::ZoomAtCursor),
@@ -295,11 +285,6 @@ pub const DEFAULT_BINDINGS: [Binding; 10] = [
         trigger: Trigger::Wheel(Modifiers { shift: true, ..M }),
         stacking: Some(Action::PanHorizontal),
         editor: Some(Action::BrushSize),
-    },
-    Binding {
-        trigger: Trigger::Wheel(Modifiers { alt: true, ..M }),
-        stacking: Some(Action::OverlayOpacity),
-        editor: Some(Action::BrushSoftness),
     },
     Binding {
         trigger: Trigger::Drag {
@@ -355,7 +340,7 @@ pub const DEFAULT_BINDINGS: [Binding; 10] = [
     },
 ];
 
-/// The seven display rows the settings table shows, `—` where the column is
+/// The six display rows the settings table shows, `—` where the column is
 /// `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputRowView {
@@ -364,10 +349,10 @@ pub struct InputRowView {
     pub editor: String,
 }
 
-/// The `DEFAULT_BINDINGS` indices each of the seven display rows groups --
-/// `[6, 7]` (Ctrl+Z / Ctrl+Shift+Z) is the one row whose two triggers name
+/// The `DEFAULT_BINDINGS` indices each of the six display rows groups --
+/// `[5, 6]` (Ctrl+Z / Ctrl+Shift+Z) is the one row whose two triggers name
 /// *different* actions per mode column.
-const DISPLAY_GROUPS: [&[usize]; 7] = [&[0], &[1], &[2], &[3], &[4, 5], &[6, 7], &[8]];
+const DISPLAY_GROUPS: [&[usize]; 6] = [&[0], &[1], &[2], &[3, 4], &[5, 6], &[7]];
 
 fn column(
     bindings: &[Binding],
@@ -417,7 +402,7 @@ impl InputTable {
         }
     }
 
-    /// The seven display rows the settings table shows.
+    /// The six display rows the settings table shows.
     pub fn display_rows(&self) -> Vec<InputRowView> {
         DISPLAY_GROUPS
             .iter()

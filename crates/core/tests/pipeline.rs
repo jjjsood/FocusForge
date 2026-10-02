@@ -53,6 +53,16 @@ fn scratch(label: &str) -> PathBuf {
     dir
 }
 
+/// Seals `held` as the root of a new project at `target`.
+fn seal_chain_alone(target: &Path, held: &project::HeldCheckpoint) {
+    let entry = project::InMemoryCheckpoint {
+        kind: project::InMemoryKind::Fused(held.clone()),
+        parent: None,
+    };
+    project::seal_in_memory(target, &[entry], &[], None, false)
+        .expect("the held checkpoint must seal");
+}
+
 /// A request over `frames`, no alignment, the golden tile geometry unless
 /// overridden by the caller.
 fn base_request(label: &str, frames: Vec<PathBuf>, explicit: ParamValues) -> FuseRequest {
@@ -650,9 +660,16 @@ fn align_progress_counts_every_frame() {
 #[test]
 fn a_held_run_seals_to_the_same_project() {
     let frames = mantis_frames(3);
+    let align = AlignRequest {
+        algorithm: registry::find_align("dummy-align").expect("dummy-align must be registered"),
+        explicit: ParamValues::new(),
+        lax: false,
+    };
 
     let hold_dir = scratch("held_run_hold");
     let mut held_request = base_request("held_run", frames.clone(), ParamValues::new());
+    held_request.align = Some(align);
+    held_request.crop = true;
     held_request.output = FuseOutput::Hold(hold_dir.clone());
     let staging = held_request
         .scratch_root
@@ -677,10 +694,15 @@ fn a_held_run_seals_to_the_same_project() {
     );
 
     let target = scratch("held_run_saved").join("held.ffp");
-    project::seal_held(&target, std::slice::from_ref(&held), false)
-        .expect("the held checkpoint must seal");
+    seal_chain_alone(&target, &held);
 
-    let direct_request = base_request("direct_run", frames, ParamValues::new());
+    let mut direct_request = base_request("direct_run", frames, ParamValues::new());
+    direct_request.align = Some(AlignRequest {
+        algorithm: registry::find_align("dummy-align").expect("dummy-align must be registered"),
+        explicit: ParamValues::new(),
+        lax: false,
+    });
+    direct_request.crop = true;
     let outcome =
         focusforge_core::pipeline::run(&direct_request, &NoopObserver, JobControl::new(), None)
             .expect("a direct run must complete");
@@ -693,6 +715,19 @@ fn a_held_run_seals_to_the_same_project() {
 
     let from_held = Project::open(&target).unwrap().manifest().clone();
     let direct = Project::open(&sealed.path).unwrap().manifest().clone();
+    assert_eq!(
+        from_held.registration.transforms.len(),
+        3,
+        "one transform per frame"
+    );
+    assert_eq!(
+        from_held.registration.crop, direct.registration.crop,
+        "the same crop either way"
+    );
+    assert!(
+        from_held.registration.crop.is_some(),
+        "the aligned frames must crop"
+    );
     assert_eq!(from_held.algorithm, direct.algorithm);
     assert_eq!(from_held.params, direct.params);
     assert_eq!(from_held.sources, direct.sources);
@@ -807,8 +842,7 @@ fn registration_persists_through_seal_and_hold() {
     assert_eq!(held.registration.crop, Some(held_expected_crop));
 
     let target = scratch("registration_hold_saved").join("held.ffp");
-    project::seal_held(&target, std::slice::from_ref(&held), false)
-        .expect("the held checkpoint must seal");
+    seal_chain_alone(&target, &held);
     let sealed_from_held = Project::open(&target).expect("reopen").manifest().clone();
     assert_transforms_bit_eq(
         &sealed_from_held.registration.transforms,
@@ -1561,7 +1595,7 @@ fn equalization_is_recorded_on_seal_and_hold() {
     };
     assert_eq!(held.registration.equalization.as_ref(), Some(&recorded));
     let target = scratch("eq_record_saved").join("held.ffp");
-    project::seal_held(&target, std::slice::from_ref(&held), false).expect("the held run seals");
+    seal_chain_alone(&target, &held);
     let reopened = Project::open(&target).expect("reopen");
     assert_eq!(
         reopened.manifest().registration.equalization.as_ref(),

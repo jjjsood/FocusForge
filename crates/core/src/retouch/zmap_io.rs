@@ -11,7 +11,7 @@ use crate::project::Op;
 use crate::tile::Rect;
 use crate::zmap::{ZMapError, ZMapInfo, ZMapReader, ZMapWriter};
 
-use super::{EditSession, RetouchError, brush};
+use super::{RetouchError, brush};
 
 /// The union of every op's footprint over `info`. `Err` carries the
 /// 0-based index of the first op that refuses, before any tile is read or
@@ -36,7 +36,7 @@ pub fn session_tile(ops: &[Op], info: ZMapInfo) -> Result<Rect, (usize, RetouchE
     }))
 }
 
-fn union_rect(a: Rect, b: Rect) -> Rect {
+pub(super) fn union_rect(a: Rect, b: Rect) -> Rect {
     let x0 = a.x.min(b.x);
     let y0 = a.y.min(b.y);
     let x1 = (a.x + a.width).max(b.x + b.width);
@@ -50,14 +50,15 @@ fn union_rect(a: Rect, b: Rect) -> Rect {
 }
 
 /// Streams `base` in full-width bands of `rows_per_pass` rows, splicing in
-/// `session`'s tile wherever a band overlaps it, and writes each band to
+/// `tile`'s `indices` wherever a band overlaps it, and writes each band to
 /// `out`. Returns how many pixels changed; `rows_per_pass == 0` is
-/// [`ZMapError::RowsPerPassZero`]. Precondition: `session` was opened over
-/// `base`'s own [`ZMapInfo`] -- `EditSession` has no `info()` to check
-/// that against.
+/// [`ZMapError::RowsPerPassZero`]. Precondition: `tile` lies within `base`'s
+/// own [`ZMapInfo`] and `indices.len() == info.tile_len(tile)` -- an edit
+/// session's own tile and indices satisfy both by construction.
 pub fn write_edited<W: Write + Seek>(
     base: &ZMapReader,
-    session: &EditSession,
+    tile: Rect,
+    session_indices: &[u16],
     rows_per_pass: u32,
     out: &mut ZMapWriter<W>,
 ) -> Result<u64, ZMapError> {
@@ -67,8 +68,6 @@ pub fn write_edited<W: Write + Seek>(
     let info = base.info();
     let width = info.width();
     let height = info.height();
-    let tile = session.tile();
-    let session_indices = session.indices();
 
     let mut buf = vec![0u16; width as usize * rows_per_pass as usize];
     let mut changed = 0u64;
@@ -109,6 +108,7 @@ pub fn write_edited<W: Write + Seek>(
 mod tests {
     use super::*;
     use crate::project::Point;
+    use crate::retouch::EditSession;
 
     fn info_37x23() -> ZMapInfo {
         ZMapInfo::new(37, 23, 10).unwrap()
@@ -244,7 +244,14 @@ mod tests {
 
             let out_path = dir.path().join(format!("out-{rows_per_pass}.tif"));
             let mut writer = ZMapWriter::create(&out_path, info).unwrap();
-            let changed = write_edited(&reader, &session, rows_per_pass, &mut writer).unwrap();
+            let changed = write_edited(
+                &reader,
+                session.tile(),
+                session.indices(),
+                rows_per_pass,
+                &mut writer,
+            )
+            .unwrap();
             writer.finish().unwrap();
             assert_eq!(changed, expected_changed, "rows_per_pass={rows_per_pass}");
 
@@ -264,20 +271,15 @@ mod tests {
         let indices = vec![0u16; 16];
         let base_path = write_base(dir.path(), "base.tif", info, &indices);
         let reader = ZMapReader::open(&base_path).unwrap();
-        let session = EditSession::new(
-            info,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 4,
-                height: 4,
-            },
-            indices,
-        )
-        .unwrap();
+        let tile = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
         let out_path = dir.path().join("out.tif");
         let mut writer = ZMapWriter::create(&out_path, info).unwrap();
-        match write_edited(&reader, &session, 0, &mut writer) {
+        match write_edited(&reader, tile, &indices, 0, &mut writer) {
             Err(ZMapError::RowsPerPassZero) => {}
             other => panic!("expected RowsPerPassZero, got {other:?}"),
         }

@@ -13,8 +13,9 @@ focusforge-cli <COMMAND>
 | [`info`](#info) | prints TIFF or RAW metadata for a file or a directory of frames |
 | [`algorithms`](#algorithms) | lists registered algorithms, or prints one's full parameter schema |
 | [`stack`](#stack) | fuses a directory's frames into one project per detected stack |
-| [`export`](#export) | turns a project into a composite, Z-Map and/or single-frame TIFF |
+| [`export`](#export) | renders a checkpoint to a TIFF, PNG or JPEG image, and/or writes its Z-Map or one source frame |
 | [`retouch`](#retouch) | applies an op list to a Z-Map and writes the edited map |
+| [`history`](#history) | lists, materializes, extends and deletes a project's checkpoints |
 | [`align`](#align) | computes and reports each frame's transform, without fusing |
 | [`review`](#review) | reports one record per project found under a directory or a run's output |
 | [`cache`](#cache) | manages the stage cache under `.scratch/stage-cache/` |
@@ -697,50 +698,107 @@ later versions, matching `info --json`'s own compatibility promise.
 focusforge-cli export [OPTIONS] <PROJECT>
 ```
 
-Turns a project a `stack` run wrote into image files: the composite with
-`-o`, the Z-Map with `--zmap`, one source frame warped and cropped to the
-composite's own extent (with the recorded brightness gain, when the run equalized) with `--frame`/`--frame-output` — any combination,
-at least one required. The composite it writes is byte-identical to the
-plane the run staged. See
+Turns a checkpoint of a project into image files: the image with `-o`, the
+Z-Map with `--zmap`, one source frame warped and cropped to the composite's
+own extent (with the recorded brightness gain, when the run equalized) with
+`--frame`/`--frame-output` — any combination, at least one required. The image
+is always rendered from the checkpoint's Z-Map, gathering each pixel from the
+source frame its index names, read through the recorded brightness gains when
+the run equalized, so an edited checkpoint exports as edited. Rendering
+re-reads the source frames and checks each against the hash recorded in the
+project. See
 [`reference/project-format.md`](project-format.md) for what `<PROJECT>` (a
 `.ffp` file) holds.
 
 | flag | meaning |
 |---|---|
-| `-o, --output <FILE>` | write the composite to this path |
-| `--zmap <FILE>` | write the Z-Map to this path |
-| `--frame <INDEX>` | write this 0-based source frame "as fused" — warped by its recorded alignment transform and offset by the applied crop, at the composite's own width and height. Requires `--frame-output` |
+| `-o, --output <FILE>` | write the image to this path |
+| `--zmap <FILE>` | write the Z-Map to this path (as TIFF); needs no source frames |
+| `--checkpoint <ID>` | the checkpoint to export, an id or a unique id prefix; defaults to the head |
+| `--format <FORMAT>` | `tiff`, `png` or `jpeg`. Inferred from `-o`'s extension when omitted: `.tif`/`.tiff`, `.png`, `.jpg`/`.jpeg`; no extension means TIFF. An unrecognised extension needs `--format`; a `--format` that contradicts a recognised extension is refused |
+| `--tiff-bits <BITS>` | TIFF bit depth: `16` (default) or `8` |
+| `--tiff-compression <NAME>` | TIFF compression: `none` (default), `lzw` or `deflate` |
+| `--png-bits <BITS>` | PNG bit depth: `16` (default) or `8` |
+| `--png-compression <NAME>` | PNG compression effort: `fast`, `default` (default) or `best` |
+| `--jpeg-quality <N>` | JPEG quality, 1-100 (default `95`) |
+| `--jpeg-subsampling <SPEC>` | JPEG chroma subsampling: `420` (default) or `444` |
+| `--exif <on\|off>` | carry the alignment reference frame's EXIF (default `on`) |
+| `--icc <on\|off>` | embed an ICC profile (default `on`) |
+| `--xmp <on\|off>` | carry the source frame's XMP packet verbatim (default `off`) |
+| `--iptc <on\|off>` | carry the source frame's IPTC block verbatim (default `off`; never written to PNG) |
+| `--frame <INDEX>` | write this 0-based source frame "as fused" — warped by its recorded alignment transform and offset by the applied crop, at the checkpoint's composite width and height. Requires `--frame-output` |
 | `--frame-output <FILE>` | where to write the frame `--frame` names |
 | `--json` | emit the frozen JSON report instead of human-readable text |
 
+A format option that belongs to another format (`--png-bits` with a JPEG
+output) is refused by name, and a value outside its range is refused with the
+range. PNG and JPEG hold grey or RGB images only; JPEG is limited to 65,535
+pixels per side.
+
 ```
-$ focusforge-cli export .scratch/out/mantis-64.ffp -o .scratch/out.tif --zmap .scratch/zmap.tif
-warning: 3 source frame(s) unresolved -- not reachable from this project, either because the path was recorded as given or because it is no longer there. The export below is unaffected; re-fusing or retouching would not be:
-  .../fixtures/mantis-64/frames/00.tif
-  .../fixtures/mantis-64/frames/01.tif
-  .../fixtures/mantis-64/frames/02.tif
-.scratch/out/mantis-64.ffp
-60x60 3ch, 3 frames
-algorithm: laplacian
-unresolved sources: 3
-wrote: .scratch/out.tif
-wrote: .scratch/zmap.tif
-wall: 0.010s
+focusforge-cli export mantis-64.ffp -o out.jpg --jpeg-quality 90
+focusforge-cli export mantis-64.ffp -o out.tif --tiff-compression lzw --zmap zmap.tif
+focusforge-cli export mantis-64.ffp --checkpoint 5b71 --zmap zmap-5b71.tif
 ```
 
-A source frame path the project cannot resolve is not a hard error: a
-warning naming every unresolved source prints before the write, and the
-export still happens — it reads the plane data stored inside the project,
-not the original frames.
+A source frame that cannot be found, or whose content changed since the
+project was written, makes `-o` and `--frame-output` refuse, naming every
+such frame; nothing is written. `--zmap` alone never reads a source frame.
+The `.partial` file a run writes into is renamed only when the write
+completes.
 
 ### `--json`
 
 Frozen, additive-only, the same discipline as every other `--json` shape in
 this reference: `project`, `wrote` (final paths only), `unresolved_sources`
 (present and empty when every source resolved, not an omission), `width`,
-`height`, `samples_per_pixel`, `frame_count`, `algorithm`, `frame` (the
-`--frame` index written, `null` when the flag was omitted) and
+`height`, `samples_per_pixel`, `frame_count`, `algorithm`, `checkpoint` (the
+resolved checkpoint id), `format` (`null` without `-o`), `format_options`
+(every option of that format with its resolved value, defaults included;
+`null` without `-o`), `frame` (the `--frame` index written, `null` when the
+flag was omitted), `metadata` (what EXIF, ICC, XMP and IPTC carry-over did
+for the `-o` image: `exif`, `icc`, `xmp`, `iptc` each a status string, plus
+`frame`, `frame_path` and `warnings`; `null` without `-o`) and
 `wall_seconds`.
+
+## `history`
+
+```
+focusforge-cli history [--accept-changed-sources] <COMMAND>
+```
+
+Reads and changes a project's checkpoint tree without a window. Every
+checkpoint argument is an id or a unique prefix of one; an ambiguous prefix
+names every match. See [`reference/project-format.md`](project-format.md)
+for what a checkpoint is and how hidden checkpoints are handled.
+
+A project is validated when it is opened. A damaged one is refused by name
+with its own exit code (3 not a project, 4 truncated, 6 a missing entry, 7 a
+blob hash mismatch, 8 a broken link between checkpoints, `1` anything
+else). If a source frame's content changed since the project was written,
+every subcommand refuses with exit 9 naming the frames;
+`--accept-changed-sources` proceeds with a warning instead. Frames that
+cannot be found only produce a warning: the history and Z-Maps are intact.
+
+| subcommand | does |
+|---|---|
+| `list <PROJECT> [--json]` | prints every visible checkpoint, newest first: id, parent, algorithm and creation time. `--json` emits `{"checkpoints": [{"id", "parent", "algorithm", "created_at"}]}`, `created_at` in Unix seconds |
+| `materialize <PROJECT> --checkpoint <ID> -o <FILE> [--json]` | writes that checkpoint's Z-Map as a TIFF; never overwrites the project |
+| `apply <PROJECT> --ops <FILE> [--from <ID>] [--save] [-o <FILE>] [--json]` | applies an op list read from `--ops` (`{"ops": [...]}`, the shape described in [`guide/retouch.md`](../guide/retouch.md)) onto `--from` (default: the head). `--save` seals the result as a new child checkpoint, which branches the tree when `--from` is not the head; `-o` writes the edited Z-Map. At least one of the two is required; with both, the map written is the sealed checkpoint's |
+| `delete <PROJECT> --checkpoint <ID> [--json]` | hides a checkpoint and removes it from the file once no visible checkpoint is built on it. Refuses the last visible checkpoint |
+
+```
+focusforge-cli history list mantis-64.ffp
+focusforge-cli history apply mantis-64.ffp --ops ops.json --save
+focusforge-cli history delete mantis-64.ffp --checkpoint 5b71
+```
+
+`apply --json` reports `project`, `from`, `checkpoint` (the sealed id, `null`
+without `--save`), `wrote`, `ops` and `wall_seconds`; `materialize --json`
+reports `project`, `checkpoint`, `wrote` and `wall_seconds`; `delete --json`
+reports `project`, `hidden`, `removed` (every checkpoint taken out of the
+file) and `head`. The list's JSON carries no version field, like every
+project and op file.
 
 ## `retouch`
 

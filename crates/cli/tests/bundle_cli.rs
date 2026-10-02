@@ -239,7 +239,7 @@ fn config_has_provenance() {
     let config_root = dir.join("config");
     std::fs::create_dir_all(config_root.join("focusforge")).unwrap();
     std::fs::write(
-        config_root.join("focusforge").join("input.toml"),
+        config_root.join("focusforge").join("settings.toml"),
         "# input map\n",
     )
     .unwrap();
@@ -276,7 +276,7 @@ fn config_has_provenance() {
         config["input_map"]["path"]
             .as_str()
             .unwrap()
-            .ends_with("input.toml"),
+            .ends_with("settings.toml"),
         "{config}"
     );
 }

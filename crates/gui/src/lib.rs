@@ -49,10 +49,16 @@ pub mod picker;
 /// `tests/input_map.rs` reaches its types directly.
 pub mod input_map;
 
-/// The input table's file format: load/write `input.toml`, no
-/// `use slint::`. `pub` so `src/main.rs` and `tests/input_map.rs` reach it
-/// directly.
+/// The input table's file format: load/write the `[input]` table of
+/// `settings.toml`, no `use slint::`. `pub` so `src/main.rs` and
+/// `tests/input_map.rs` reach it directly.
 pub mod input_config;
+
+/// The one settings file every table saves through: `settings.toml`,
+/// shared by `recent` and `input_config`. No `use slint::`. `pub` because
+/// `settings::WriteError` appears in `recent::save`'s return type and in
+/// `input_config::ConfigError::CouldNotWrite`.
+pub mod settings;
 
 /// The viewport as pure arithmetic: no `use slint::`, no `use wgpu::`, and no
 /// dependency on the core algorithm crate. `pub` so `tests/viewport.rs` and
@@ -100,7 +106,14 @@ pub mod images;
 /// directly.
 pub mod overlay;
 
+pub mod export_settings;
+
 /// The `Recent` list's own file format, mirroring `crate::input_config`. No
 /// `use slint::` anywhere in it. `pub` so `src/main.rs` and
 /// `tests/projects_overlay.rs` reach it directly.
 pub mod recent;
+
+/// The checkpoint dock panel's own view model -- day-grouped rows built from
+/// a project's saved history. No `use slint::` anywhere in it. `pub` so
+/// `tests/checkpoint_panel.rs` reaches its types directly.
+pub mod checkpoints;

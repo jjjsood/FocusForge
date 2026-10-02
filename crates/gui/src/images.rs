@@ -40,9 +40,6 @@ pub struct ImageRow {
 pub struct ImagesModel {
     pub rows: Vec<ImageRow>,
     pub header_text: String,
-    /// Legend mode only: the pinned `NO_SOURCE` entry shows below `rows`,
-    /// outside the scrolled list.
-    pub no_source_row: bool,
 }
 
 /// What the `Images` list shows about one source file, read once from disk
@@ -185,11 +182,7 @@ pub fn build_model(
             excluded_count
         )
     };
-    ImagesModel {
-        rows,
-        header_text,
-        no_source_row: legend,
-    }
+    ImagesModel { rows, header_text }
 }
 
 /// The `Name` / `Capture time` sort menu's two entries -- and nothing else.

@@ -15,7 +15,9 @@ use std::collections::BTreeMap;
 // fields and `resolve_in`/`registry`/`Family` stay private to this module,
 // the only place that resolves a schema.
 use focusforge_core::params::{ParamDesc, ParamKind, ResolvedParams, resolve_in};
-pub(crate) use focusforge_core::params::{ParamValue, ParamValues, ParamViolation, StackContext};
+pub(crate) use focusforge_core::params::{
+    ParamValue, ParamValues, ParamViolation, StackContext, validate,
+};
 use focusforge_core::registry;
 
 use crate::entry::GuiProject;
@@ -632,7 +634,12 @@ fn section_rows(
 
 /// One parameter's own row, its shape ([`control_kind`]) driving which of
 /// `value_text`/`fraction`/`choices`/`selected` carries the value.
-fn field_row(section: &str, desc: &ParamDesc, value: &ParamValue, menu_open: bool) -> SettingsRow {
+pub(crate) fn field_row(
+    section: &str,
+    desc: &ParamDesc,
+    value: &ParamValue,
+    menu_open: bool,
+) -> SettingsRow {
     let kind = control_kind(&desc.kind);
     let mut row = SettingsRow {
         kind,

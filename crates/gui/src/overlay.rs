@@ -57,6 +57,43 @@ impl FailureKind {
     }
 }
 
+/// The `Sources missing` card's reason and the missing-sources dialog's
+/// first body sentence -- one counted string, built once, read by both.
+pub fn sources_missing_sentence(missing: usize, total: usize) -> String {
+    format!(
+        "A project remembers its frames by path. {missing} of {total} cannot be found in this location."
+    )
+}
+
+/// The missing-sources dialog's own title.
+pub const SOURCES_MISSING_TITLE: &str = "The frames are no longer there";
+
+/// The missing-sources dialog's full body: [`sources_missing_sentence`]
+/// plus what still works -- a fused checkpoint's stored composite still
+/// shows without its sources, so the second paragraph never claims there
+/// is nothing to show.
+pub fn sources_missing_body(missing: usize, total: usize) -> String {
+    format!(
+        "{}\n\nHistory and Z-Map are complete. Fused results still show; edited checkpoints and \
+         re-fusing need the frames.",
+        sources_missing_sentence(missing, total)
+    )
+}
+
+/// The fingerprint-mismatch dialog's own title.
+pub const MISMATCH_TITLE: &str = "The source frames are not the same";
+
+/// The fingerprint-mismatch dialog's full body: the recorded frame count
+/// plus the fixed Z-Map-consequence paragraph.
+pub fn mismatch_body(frame_count: usize) -> String {
+    format!(
+        "The project was made over {frame_count} frames. The frames in this location give a \
+         different fingerprint.\n\nThe Z-Map records, for every pixel, which frame it came from \
+         — by that frame's place in the row. If the row is wrong, every retouch points at the \
+         wrong frame."
+    )
+}
+
 /// One `Not a project` card: a path with no open project behind it at all.
 /// `path` is what a later successful open of the same path clears the card
 /// by.

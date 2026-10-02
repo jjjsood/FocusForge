@@ -18,7 +18,10 @@ use focusforge_core::io::{
     propose_with_progress,
 };
 use focusforge_core::params::StackContext;
-use focusforge_core::project::{PROJECT_EXTENSION, Project, ProjectError, hash_file};
+use focusforge_core::project::{
+    Opened as CoreOpened, PROJECT_EXTENSION, PendingProject, Project, ProjectError, SourceRef,
+    check_sources, hash_file,
+};
 // Re-exported so `controller.rs` can carry a `Proposal` in its own
 // pending-question state without naming `focusforge_core` itself.
 pub use focusforge_core::io::Proposal;
@@ -69,13 +72,78 @@ pub struct Opened {
     pub skipped: Vec<PathBuf>,
 }
 
-/// The three shapes opening a path set can take. `Question` carries the
+/// A saved project blocked by a fingerprint mismatch: the [`PendingProject`]
+/// core produced, the `.ffp` path, its file name and its recorded sources.
+/// `pending` is `None` only on the cheap echo handed back once the state
+/// has moved the original in; [`Self::proceed`] is called only on that
+/// original.
+pub struct PendingOpen {
+    pending: Option<PendingProject>,
+    pub path: PathBuf,
+    pub file_name: String,
+    /// The manifest's own recorded sources -- `PendingProject` exposes none
+    /// of its manifest, only its mismatch, so `Locate frames…` on this
+    /// dialog verifies against this copy instead ([`verify_folder`]).
+    pub sources: Vec<SourceRef>,
+}
+
+impl PendingOpen {
+    fn new(path: PathBuf, pending: PendingProject) -> Self {
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        // A second, cheap reopen just for the manifest's own sources --
+        // `PendingProject` exposes no manifest access, only its mismatch.
+        let sources = Project::open(&path)
+            .map(|p| p.manifest().sources.clone())
+            .unwrap_or_default();
+        PendingOpen {
+            pending: Some(pending),
+            path,
+            file_name,
+            sources,
+        }
+    }
+
+    /// How many frames the project was recorded over.
+    pub fn frame_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// A cheap echo of `self`, carrying no live [`PendingProject`] -- what
+    /// the controller hands back once it has moved the real one into its
+    /// own state.
+    pub(crate) fn echo(&self) -> Self {
+        PendingOpen {
+            pending: None,
+            path: self.path.clone(),
+            file_name: self.file_name.clone(),
+            sources: self.sources.clone(),
+        }
+    }
+
+    /// Accepts the mismatch and opens the project unchanged.
+    pub fn proceed(self) -> GuiProject {
+        GuiProject::Opened(Box::new(
+            self.pending
+                .expect("proceed is only called on the state-held pending mismatch")
+                .proceed(),
+        ))
+    }
+}
+
+/// The four shapes opening a path set can take. `Question` carries the
 /// [`Proposal`] behind it alongside the question's own rendering summary,
 /// so the controller can answer it later without re-walking the directory
 /// (`pending: Option<(GroupingQuestion, Proposal)>`).
 pub enum OpenOutcome {
     Opened(Opened),
     Question(GroupingQuestion, Proposal),
+    /// A saved project whose source content no longer matches the
+    /// fingerprint it was recorded with -- blocked until the mismatch is
+    /// resolved. Boxed: a live [`Project`] dwarfs every other variant.
+    Mismatch(Box<PendingOpen>),
     Refused(EntryError),
 }
 
@@ -100,9 +168,11 @@ pub enum EntryError {
         #[source]
         source: TiffError,
     },
-    /// A path with the project extension that will not open as a project.
-    #[error("{}: not a FocusForge project ({source})", path.display())]
-    NotAProject {
+    /// A path with the project extension that will not open as a project,
+    /// its message worded for the actual cause rather than one fixed
+    /// sentence for every failure.
+    #[error("{}", refusal_message(source))]
+    ProjectRefused {
         path: PathBuf,
         #[source]
         source: ProjectError,
@@ -111,6 +181,27 @@ pub enum EntryError {
     /// TIFF frames.
     #[error("{}: not a folder of frames or a FocusForge project", path.display())]
     Unreadable { path: PathBuf },
+}
+
+/// [`EntryError::ProjectRefused`]'s own cause text: one sentence per group
+/// of [`ProjectError`] causes, none naming a zip entry, a blob, a delta or a
+/// snapshot -- the user is told what is wrong, not how the container is
+/// laid out. `ProjectError` is `#[non_exhaustive]`, so every cause this
+/// match does not name falls back to the damaged-history sentence, the
+/// safest thing to say about an unrecognised failure.
+fn refusal_message(source: &ProjectError) -> String {
+    match source {
+        ProjectError::NotAProject { .. } => "This file is not a FocusForge project.".to_string(),
+        ProjectError::Truncated { .. } => {
+            "The file was cut short — it ends before the project does.".to_string()
+        }
+        ProjectError::Io { source, .. } => {
+            format!("The file could not be read: {source}")
+        }
+        _ => "The project file is damaged: part of its saved history no longer reads back as it \
+              was written."
+            .to_string(),
+    }
 }
 
 /// Why an additive import refused, each carrying an already-rendered
@@ -283,12 +374,15 @@ pub fn open(target: OpenTarget, mut progress: impl FnMut(usize, usize)) -> OpenO
         }
         OpenTarget::Project(path) => {
             progress(1, 1);
-            match Project::open(&path) {
-                Ok(project) => OpenOutcome::Opened(Opened {
+            match Project::open_checked(&path) {
+                Ok(CoreOpened::Ready(project)) => OpenOutcome::Opened(Opened {
                     projects: vec![GuiProject::Opened(Box::new(project))],
                     skipped: Vec::new(),
                 }),
-                Err(source) => OpenOutcome::Refused(EntryError::NotAProject { path, source }),
+                Ok(CoreOpened::NeedsChoice(pending)) => {
+                    OpenOutcome::Mismatch(Box::new(PendingOpen::new(path, pending)))
+                }
+                Err(source) => OpenOutcome::Refused(EntryError::ProjectRefused { path, source }),
             }
         }
     }
@@ -414,4 +508,102 @@ pub fn duplicate_as_unsaved(dir: PathBuf, name: String, frames: Vec<PathBuf>) ->
         first_time: None,
         last_time: None,
     })
+}
+
+/// `folder`'s own candidate path for `source`, by recorded file name -- the
+/// one place a located folder's file names are joined against.
+fn candidate_path(source: &SourceRef, folder: &Path) -> PathBuf {
+    let name = Path::new(&source.path)
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&source.path));
+    folder.join(name)
+}
+
+/// Why a located folder was refused: how many of `total` sources it could
+/// not find at all, and how many it found but whose content no longer
+/// hashes to what was recorded.
+pub struct LocateRefused {
+    pub missing: usize,
+    pub changed: usize,
+    pub total: usize,
+}
+
+impl LocateRefused {
+    /// The refused-locate sentence, preferring the changed count when both
+    /// are nonzero -- a same-named but different file is a stronger signal
+    /// than one simply missing.
+    pub fn message(&self) -> String {
+        if self.changed > 0 {
+            format!(
+                "{} of {} frames in this folder differ from the ones this project was made over",
+                self.changed, self.total
+            )
+        } else {
+            format!(
+                "{} of {} cannot be found in this folder",
+                self.missing, self.total
+            )
+        }
+    }
+}
+
+/// What a `Locate frames…` resolution verifies against: the pending
+/// mismatch's own recorded sources, or an already-open tab's -- named by
+/// its own stable id, never a strip index that a close or reorder can
+/// shift out from under a verification still running on its own thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocateTarget {
+    Mismatch,
+    Tab(u64),
+}
+
+/// Reopens `path` plain and relocates its sources to `folder` -- what a
+/// verified `Locate frames…` resolution applies to a pending mismatch: a
+/// folder [`verify_folder`] accepted matches the project's own recorded
+/// content, only at a different location, so nothing is recorded as a
+/// mismatch.
+pub fn reopen_relocated(path: &Path, folder: PathBuf) -> Option<GuiProject> {
+    let mut project = Project::open(path).ok()?;
+    project.relocate_sources(folder);
+    Some(GuiProject::Opened(Box::new(project)))
+}
+
+/// Verifies `folder` against `sources` by content hash
+/// ([`check_sources`]) -- never by file name alone, so a folder holding
+/// same-named but different frames is refused rather than silently
+/// accepted. `Ok` only once every source resolves and hashes unchanged,
+/// giving back each source's own path inside `folder`, in source order.
+pub fn verify_folder(sources: &[SourceRef], folder: &Path) -> Result<Vec<PathBuf>, LocateRefused> {
+    let total = sources.len();
+    let check =
+        check_sources(sources, |s| candidate_path(s, folder)).map_err(|_| LocateRefused {
+            missing: total,
+            changed: 0,
+            total,
+        })?;
+    if check.unresolved.is_empty() && check.changed.is_empty() {
+        Ok(sources.iter().map(|s| candidate_path(s, folder)).collect())
+    } else {
+        Err(LocateRefused {
+            missing: check.unresolved.len(),
+            changed: check.changed.len(),
+            total,
+        })
+    }
+}
+
+/// How many of `project`'s sources this open cannot resolve to a file on
+/// disk, out of how many it has in total -- the honest, counted fact behind
+/// the missing-sources card and dialog. Counts only what is actually
+/// unreachable, unlike [`Project::unresolved_sources`], which also counts
+/// every source recorded [`focusforge_core::project::SourceResolution::AsGiven`]
+/// whether or not it is still reachable from here.
+pub fn missing_sources(project: &Project) -> (usize, usize) {
+    let sources = &project.manifest().sources;
+    let missing = sources
+        .iter()
+        .filter(|s| !project.source_path(s).is_file())
+        .count();
+    (missing, sources.len())
 }
