@@ -40,20 +40,6 @@ pub enum ProjectError {
         actual: String,
     },
 
-    /// The manifest declares a `format_version` newer than this build
-    /// understands. Both versions are named: "too new" without saying how
-    /// new leaves a user with nothing to act on.
-    #[error(
-        "{}: project format_version {found} is newer than this build understands \
-         (it writes and reads format_version {supported})",
-        path.display()
-    )]
-    FormatVersion {
-        path: PathBuf,
-        found: u32,
-        supported: u32,
-    },
-
     /// An op refused before or during replay: its own 0-based index in the
     /// list, and why.
     #[error("op #{index}: {source}")]
@@ -123,17 +109,6 @@ pub enum ProjectError {
         path.display()
     )]
     LastVisibleDelete { path: PathBuf, checkpoint: String },
-
-    /// `checkpoint`'s nearest fused ancestor carries no [`FuseRecord`] of
-    /// its own and is not the project's current head's fused ancestor, so
-    /// its composite, alignment, crop and sources cannot be recovered.
-    ///
-    /// [`FuseRecord`]: super::checkpoint::FuseRecord
-    #[error(
-        "{}: checkpoint {checkpoint}'s fuse state is unrecorded and cannot be recovered",
-        path.display()
-    )]
-    FuseStateUnknown { path: PathBuf, checkpoint: String },
 
     /// `path` is not a FocusForge project: not a zip at all, or a zip with
     /// no `manifest.json`.

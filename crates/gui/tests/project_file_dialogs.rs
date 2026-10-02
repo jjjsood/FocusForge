@@ -495,20 +495,6 @@ fn refusals_report_their_cause_and_open_nothing() {
     std::fs::write(&foreign, b"not a zip container at all").unwrap();
     check("foreign", foreign);
 
-    let mut bumped = manifest.clone();
-    bumped["format_version"] = serde_json::json!(999_999);
-    let future = dir.join("future.ffp");
-    mutate_container(
-        &project_path,
-        &future,
-        &[(
-            "manifest.json".to_string(),
-            serde_json::to_vec(&bumped).unwrap(),
-        )],
-        &[],
-    );
-    check("future_version", future);
-
     let tampered = dir.join("tampered.ffp");
     mutate_container(
         &project_path,
@@ -523,11 +509,8 @@ fn refusals_report_their_cause_and_open_nothing() {
     check("missing_entry", missing_entry);
 
     assert_ne!(seen["truncated"], seen["foreign"]);
-    assert_ne!(seen["truncated"], seen["future_version"]);
-    assert_ne!(seen["foreign"], seen["future_version"]);
     assert_ne!(seen["truncated"], seen["tampered_zmap"]);
     assert_ne!(seen["foreign"], seen["tampered_zmap"]);
-    assert_ne!(seen["future_version"], seen["tampered_zmap"]);
     assert_eq!(
         seen["tampered_zmap"], seen["missing_entry"],
         "hash, missing-entry and structural damage share one sentence"

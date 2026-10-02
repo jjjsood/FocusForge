@@ -58,7 +58,7 @@ pub enum RetouchError {
     Source(#[from] crate::algorithm::AlgorithmError),
 
     /// A [`crate::project::Op::ResetRegion`] rect lies outside the map --
-    /// including the zero-size `#[serde(default)]` rect.
+    /// including an empty rect.
     #[error("reset region {rect:?} lies outside the map")]
     RegionOutsideMap { rect: Rect },
 

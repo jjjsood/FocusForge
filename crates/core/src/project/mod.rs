@@ -21,24 +21,22 @@
 //! Nothing outside those three paths is ever written, and a test asserts it
 //! (`container_layout_is_exactly_the_named_entries`).
 //!
-//! # The format is frozen from its first write
+//! # Format commitments
 //!
-//! Every project file has to open in every later release, so the format
-//! enumerates four commitments rather than leaving them to whoever built
-//! the writer. Each is pinned by a named test in
+//! The format enumerates four commitments rather than leaving them to
+//! whoever built the writer. Each is pinned by a named test in
 //! `crates/core/tests/project_format.rs`:
 //!
 //! | Commitment | Where it lives | Test |
 //! |---|---|---|
-//! | 1. the layout plus a `format_version` | [`Manifest::format_version`] | `manifest_carries_a_format_version` |
+//! | 1. the entry layout | [`container`] | `container_layout_is_exactly_the_named_entries` |
 //! | 2. a blob kind field | [`BlobRecord::kind`] | `blob_kind_is_recorded_and_required` |
 //! | 3. a hash over uncompressed content, algorithm named | [`blob::stage_plane`], [`Manifest::hash_algorithm`] | `hash_is_over_uncompressed_content` |
 //! | 4. a fully serialized `Checkpoint` with all four `Op` variants | [`Checkpoint`], [`Op`] | `checkpoint_serializes_every_field_with_no_parent_and_no_ops`, `every_op_variant_round_trips` |
 //!
-//! Three of the four are **invisible** failures rather than loud ones -- a
-//! missing `format_version`, an absent blob kind, or a hash taken over
-//! compressed bytes all produce a project that opens without error and
-//! cannot be extended later.
+//! Two of the four are **invisible** failures rather than loud ones -- an
+//! absent blob kind or a hash taken over compressed bytes produces a
+//! project that opens without error and cannot be extended later.
 //!
 //! # What this format deliberately does not do
 //!
@@ -201,21 +199,15 @@ fn stream_bands<W: PlaneWriter>(
     }
 }
 
-/// `id`'s fused ancestor's composite extent, or `None` when `id` predates
-/// any fuse.
-pub(super) fn fused_extent(
-    project: &Project,
-    id: &str,
-) -> Result<Option<(u32, u32, u32)>, ProjectError> {
-    match project.fuse_state(id) {
-        Ok(record) => Ok(Some((
-            record.composite.width,
-            record.composite.height,
-            record.composite.frame_count,
-        ))),
-        Err(ProjectError::FuseStateUnknown { .. }) => Ok(None),
-        Err(err) => Err(err),
-    }
+/// The composite extent (width, height, frame count) of `id`'s fused
+/// ancestor.
+pub(super) fn fused_extent(project: &Project, id: &str) -> Result<(u32, u32, u32), ProjectError> {
+    let record = project.fuse_state(id)?;
+    Ok((
+        record.composite.width,
+        record.composite.height,
+        record.composite.frame_count,
+    ))
 }
 
 /// Streams a Z-Map that is not necessarily the project's head: `checkpoint`
@@ -231,11 +223,8 @@ pub fn materialize_zmap(
     path: &Path,
 ) -> Result<(), ProjectError> {
     let mut plane_ref = project.manifest().zmap.clone();
-    if let Some((width, height, frame_count)) = fused_extent(project, &checkpoint.id)? {
-        plane_ref.width = width;
-        plane_ref.height = height;
-        plane_ref.frame_count = frame_count;
-    }
+    (plane_ref.width, plane_ref.height, plane_ref.frame_count) =
+        fused_extent(project, &checkpoint.id)?;
     let blobs = project.manifest().blobs.clone();
     let (base, deltas) = resolve_chain(&blobs, &checkpoint.zmap_blob, project.path())?;
 
@@ -389,28 +378,6 @@ pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     }]
 });
 
-/// The on-disk format version this build writes and reads. A project
-/// declaring a **higher** one is refused by name rather than
-/// half-understood; a lower one is accepted.
-pub const FORMAT_VERSION: u32 = 2;
-
-/// The format version a project keeps writing as long as every blob it
-/// holds is [`BlobKind::Full`] -- what stays openable by a build that has
-/// never heard of [`BlobKind::SparseDelta`].
-pub const FULL_ONLY_FORMAT_VERSION: u32 = 1;
-
-/// [`FULL_ONLY_FORMAT_VERSION`] while `blobs` holds only [`BlobKind::Full`]
-/// records, [`FORMAT_VERSION`] the moment any of them is not -- the format
-/// version decision folded into one place so every writer stamps the same
-/// answer.
-pub(crate) fn format_version_for(blobs: &[BlobRecord]) -> u32 {
-    if blobs.iter().all(|b| b.kind == BlobKind::Full) {
-        FULL_ONLY_FORMAT_VERSION
-    } else {
-        FORMAT_VERSION
-    }
-}
-
 /// The project file's extension.
 pub const PROJECT_EXTENSION: &str = "ffp";
 
@@ -442,19 +409,11 @@ pub struct Project {
     relocated: Option<PathBuf>,
 }
 
-/// `manifest.json`'s `format_version` field alone, probed before the full
-/// [`Manifest`] parse so a future manifest that also renamed or dropped a
-/// field still gets [`ProjectError::FormatVersion`] rather than a generic
-/// parse failure.
-#[derive(serde::Deserialize)]
-struct ManifestVersionProbe {
-    format_version: u32,
-}
-
 impl Project {
-    /// Opens `path`: refuses a foreign file, a truncated container or an
-    /// unsupported `format_version`; refuses a structurally broken history
-    /// (a missing blob, an unresolvable Z-Map chain, a `stack_fingerprint`
+    /// Opens `path`: refuses a foreign file, a truncated container or a
+    /// manifest or checkpoint that does not parse; refuses a structurally
+    /// broken history (a missing blob, an unresolvable Z-Map chain, an
+    /// op-less checkpoint without a fuse record, a `stack_fingerprint`
     /// disagreeing with its sources); verifies the head's own Z-Map chain
     /// by hash. Never reads a source frame.
     pub fn open(path: &Path) -> Result<Self, ProjectError> {
@@ -492,15 +451,6 @@ impl Project {
             .read_to_string(&mut manifest_text)
             .map_err(|source| ProjectError::io(path, source))?;
 
-        if let Ok(probe) = serde_json::from_str::<ManifestVersionProbe>(&manifest_text)
-            && probe.format_version > FORMAT_VERSION
-        {
-            return Err(ProjectError::FormatVersion {
-                path: path.to_path_buf(),
-                found: probe.format_version,
-                supported: FORMAT_VERSION,
-            });
-        }
         let manifest: Manifest = serde_json::from_str(&manifest_text)
             .map_err(|err| ProjectError::container(path, format!("manifest.json: {err}")))?;
 
@@ -540,10 +490,15 @@ impl Project {
                         });
                     }
                 }
-                // A checkpoint with no fuse record and no ops is a fused
-                // checkpoint written before `Checkpoint::fuse` existed --
-                // its own fingerprint cannot be checked against anything.
-                None if c.ops.is_empty() => {}
+                None if c.ops.is_empty() => {
+                    return Err(ProjectError::container(
+                        path,
+                        format!(
+                            "checkpoints/{}.json: an op-less checkpoint has no fuse record",
+                            c.id
+                        ),
+                    ));
+                }
                 None => {
                     let Some(parent_id) = c.parent.as_deref() else {
                         return Err(ProjectError::OpsWithoutParent {
@@ -639,29 +594,13 @@ impl Project {
 
     /// The composite, alignment, crop, sources and metrics of the fuse
     /// `checkpoint` sits under: the nearest op-less ancestor's own
-    /// [`Checkpoint::fuse`] record, or -- only when that ancestor is also
-    /// the project's current head's fused ancestor -- the manifest's own
-    /// cached copy, for a project written before that field existed.
-    /// [`ProjectError::FuseStateUnknown`] otherwise.
+    /// [`Checkpoint::fuse`] record.
     pub fn fuse_state(&self, checkpoint: &str) -> Result<FuseRecord, ProjectError> {
-        let ancestor = self.fused_ancestor(checkpoint)?;
-        if let Some(record) = &ancestor.fuse {
-            return Ok(record.clone());
-        }
-        let head_ancestor = self.fused_ancestor(&self.checkpoint.id)?;
-        if ancestor.id == head_ancestor.id {
-            return Ok(FuseRecord {
-                composite: self.manifest.composite.clone(),
-                align: self.manifest.align.clone(),
-                registration: self.manifest.registration.clone(),
-                sources: self.manifest.sources.clone(),
-                metrics: self.manifest.metrics,
-            });
-        }
-        Err(ProjectError::FuseStateUnknown {
-            path: self.path.clone(),
-            checkpoint: checkpoint.to_string(),
-        })
+        Ok(self
+            .fused_ancestor(checkpoint)?
+            .fuse
+            .clone()
+            .expect("open refuses an op-less checkpoint without a fuse record"))
     }
 
     /// The nearest ancestor of `id` (self included) whose `ops` is empty --
@@ -679,8 +618,8 @@ impl Project {
     /// The path from `checkpoint`'s own Z-Map back to its nearest full
     /// snapshot: the snapshot's own compressed size, and the count and
     /// total compressed size of the deltas resolved on top of it. Never
-    /// refuses on length -- a chain longer than today's cap, written by an
-    /// older or newer build, must still open.
+    /// refuses on length -- the chain-length cap applies when writing, not
+    /// when reading.
     pub fn zmap_chain(&self, checkpoint: &Checkpoint) -> Result<ZMapChain, ProjectError> {
         let (base, deltas) =
             resolve_chain(&self.manifest.blobs, &checkpoint.zmap_blob, &self.path)?;

@@ -62,7 +62,7 @@ pub struct MaterializeArgs {
 pub struct ApplyArgs {
     /// The project to apply onto.
     project: PathBuf,
-    /// The op list to apply: `{"format":1,"ops":[...]}`.
+    /// The op list to apply: `{"ops":[...]}`.
     #[arg(long, value_name = "FILE")]
     ops: PathBuf,
     /// The checkpoint to apply onto -- any unique prefix of its id. Defaults
@@ -121,16 +121,14 @@ pub fn run(command: HistoryCommand, accept_changed_sources: bool) -> ExitCode {
     }
 }
 
-/// Maps a refusal to its own exit code: 3 not a project, 4 truncated, 5 a
-/// `format_version` this build does not understand, 6 a missing entry, 7 a
-/// blob hash mismatch, 8 a structural link failure (a dangling parent, a
+/// Maps a refusal to its own exit code: 3 not a project, 4 truncated, 6 a
+/// missing entry, 7 a blob hash mismatch, 8 a structural link failure (a dangling parent, a
 /// parent cycle, a fingerprint disagreement, a missing patch base, ops with
 /// no parent to record them against). Anything else stays the generic 1.
 fn exit_code_for(err: &ProjectError) -> u8 {
     match err {
         ProjectError::NotAProject { .. } => 3,
         ProjectError::Truncated { .. } => 4,
-        ProjectError::FormatVersion { .. } => 5,
         ProjectError::MissingEntry { .. } => 6,
         ProjectError::HashMismatch { .. } => 7,
         ProjectError::DanglingParent { .. }
@@ -261,11 +259,9 @@ struct CheckpointRecord {
     created_at: i64,
 }
 
-/// `{"format":1,"checkpoints":[...]}`, matching `review`'s and `export`'s
-/// own wrapped-document convention.
+/// `{"checkpoints":[...]}`.
 #[derive(Serialize)]
 struct ListDocument {
-    format: u32,
     checkpoints: Vec<CheckpointRecord>,
 }
 
@@ -291,10 +287,7 @@ fn list(project_path: &Path, json: bool, accept_changed_sources: bool) -> ExitCo
             created_at: c.created_at,
         })
         .collect();
-    let document = ListDocument {
-        format: 1,
-        checkpoints,
-    };
+    let document = ListDocument { checkpoints };
     if json {
         match serde_json::to_string_pretty(&document) {
             Ok(text) => println!("{text}"),
@@ -364,32 +357,18 @@ fn materialize(
     ExitCode::SUCCESS
 }
 
-/// The op file's wrapped shape: `{"format":1,"ops":[...]}`. `format`
-/// defaults to 1, so a checkpoint's own JSON -- which carries an `ops` field
-/// among others -- reads as one; any other value, or a bare array (which
-/// does not deserialize as this struct at all), is refused by name.
+/// The op file's wrapped shape: `{"ops":[...]}`. A checkpoint's own JSON --
+/// which carries an `ops` field among others -- reads as one; a bare array
+/// does not deserialize as this struct and is refused.
 #[derive(Deserialize)]
 struct OpFile {
-    #[serde(default = "default_op_file_format")]
-    format: u32,
     ops: Vec<Op>,
-}
-
-fn default_op_file_format() -> u32 {
-    1
 }
 
 fn read_op_file(path: &Path) -> Result<Vec<Op>, String> {
     let file = std::fs::File::open(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let doc: OpFile = serde_json::from_reader(std::io::BufReader::new(file))
         .map_err(|err| format!("{}: {err}", path.display()))?;
-    if doc.format != 1 {
-        return Err(format!(
-            "{}: op file format {} is not supported (expected 1)",
-            path.display(),
-            doc.format
-        ));
-    }
     Ok(doc.ops)
 }
 

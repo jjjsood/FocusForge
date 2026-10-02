@@ -145,7 +145,7 @@ fn three_strokes() -> Vec<Op> {
 }
 
 fn op_file(body: &Value) -> Value {
-    serde_json::json!({"format": 1, "ops": body})
+    serde_json::json!({"ops": body})
 }
 
 #[test]
@@ -180,7 +180,7 @@ fn list_prints_one_record_per_checkpoint() {
     );
     assert!(output.success, "stderr: {}", output.stderr);
     let doc: Value = serde_json::from_str(&output.stdout).expect("valid JSON");
-    assert_eq!(doc["format"], 1);
+    assert!(doc.get("format").is_none());
     let checkpoints = doc["checkpoints"].as_array().unwrap();
     assert_eq!(checkpoints.len(), 2);
     // Newest first: the just-sealed child before its parent.
@@ -835,13 +835,11 @@ fn invalid_op_file_is_refused_before_writing() {
         },
     }])
     .unwrap();
-    let bad_format = serde_json::json!({"format": 2, "ops": []});
 
     for (name, body) in [
         ("bad-source-id.json", bad_source_id),
         ("bad-rect.json", bad_rect),
         ("bare-array.json", bare_array),
-        ("bad-format.json", bad_format),
     ] {
         let ops_path = write_op_file(&dir, name, &body);
         let out = dir.join(format!("{name}.out.tif"));
@@ -1262,13 +1260,17 @@ fn validation_states_are_reported() {
     assert_eq!(output.exit_code, Some(4));
     assert!(output.stdout.is_empty());
 
-    // Exit 5: a format_version newer than this build understands.
+    // Exit 1: a manifest of another shape fails like any broken manifest.
     let mut manifest = read_manifest_value(&project_path);
-    manifest["format_version"] = serde_json::json!(9999);
-    let future = dir.join("future.ffp");
+    manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("registration")
+        .expect("the sealed manifest carries a registration key");
+    let reshaped = dir.join("reshaped.ffp");
     mutate_container(
         &project_path,
-        &future,
+        &reshaped,
         &[],
         &[(
             "manifest.json".to_string(),
@@ -1276,9 +1278,10 @@ fn validation_states_are_reported() {
         )],
         &[],
     );
-    let output = run(&dir, &["history", "list", future.to_str().unwrap()]);
-    assert_eq!(output.exit_code, Some(5));
+    let output = run(&dir, &["history", "list", reshaped.to_str().unwrap()]);
+    assert_eq!(output.exit_code, Some(1));
     assert!(output.stdout.is_empty());
+    assert!(output.stderr.contains("manifest.json"), "{}", output.stderr);
 
     // Exit 6: a blob a record names, absent from the container.
     let head_hash = Project::open(&project_path)

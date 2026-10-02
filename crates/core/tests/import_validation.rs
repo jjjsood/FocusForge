@@ -3,8 +3,8 @@
 //! A damaged project fails loudly: the three severities `Project::open` and
 //! `Project::open_checked` produce -- refuse, block on a choice, warn -- and
 //! the specific condition each covers. Every fixture is a good project,
-//! damaged programmatically: truncated, tampered, rewritten with a bumped
-//! `format_version`, or missing an entry a record names.
+//! damaged programmatically: truncated, tampered, or missing an entry a
+//! record names.
 
 mod common;
 
@@ -15,8 +15,8 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::{
-    self, AppendRequest, BlobKind, BlobRecord, FORMAT_VERSION, Metrics, Op, Opened, Plane, Point,
-    Project, ProjectError, SealRequest, ZMapStorage, blob,
+    self, AppendRequest, BlobKind, BlobRecord, Metrics, Op, Opened, Plane, Point, Project,
+    ProjectError, SealRequest, ZMapStorage, blob,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
@@ -559,53 +559,6 @@ fn foreign_file_is_refused() {
     assert!(matches!(
         err(Project::open(&no_manifest)),
         ProjectError::NotAProject { .. }
-    ));
-}
-
-#[test]
-fn future_format_version_is_refused() {
-    let (dir, project_path) = sealed("import_validation_future_version", 32, 24, 3);
-    let mut manifest = read_manifest_value(&project_path);
-    manifest["format_version"] = serde_json::json!(FORMAT_VERSION + 1);
-    let bumped = dir.join("bumped.ffp");
-    mutate_container(
-        &project_path,
-        &bumped,
-        &[(
-            "manifest.json".to_string(),
-            serde_json::to_vec_pretty(&manifest).unwrap(),
-        )],
-        &[],
-        &[],
-    );
-    match err(Project::open(&bumped)) {
-        ProjectError::FormatVersion {
-            found, supported, ..
-        } => {
-            assert_eq!(found, FORMAT_VERSION + 1);
-            assert_eq!(supported, FORMAT_VERSION);
-        }
-        other => panic!("expected FormatVersion, got {other:?}"),
-    }
-
-    // A future manifest that also dropped a field this build's `Manifest`
-    // requires still gets the named refusal, not a generic parse failure.
-    let mut dropped = manifest.clone();
-    dropped.as_object_mut().unwrap().remove("hash_algorithm");
-    let bumped_and_dropped = dir.join("bumped-dropped.ffp");
-    mutate_container(
-        &project_path,
-        &bumped_and_dropped,
-        &[(
-            "manifest.json".to_string(),
-            serde_json::to_vec_pretty(&dropped).unwrap(),
-        )],
-        &[],
-        &[],
-    );
-    assert!(matches!(
-        err(Project::open(&bumped_and_dropped)),
-        ProjectError::FormatVersion { .. }
     ));
 }
 

@@ -7,12 +7,6 @@
 //! checkpoint of a project indexed by id, answering the questions the rest
 //! of the crate asks of the tree: enumerate, resolve, walk ancestors, find
 //! children and descendants.
-//!
-//! The extension rule runs the opposite way from [`super::manifest`]:
-//! **every op field carries `#[serde(default)]`**, so a new field on a
-//! variant does not make an existing project unreadable, while the
-//! manifest's own commitment fields deliberately refuse rather than
-//! default.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -45,14 +39,11 @@ pub struct Checkpoint {
     pub label: Option<String>,
     /// The composite, alignment, crop, sources and metrics this checkpoint's
     /// own fuse produced -- `Some` on the checkpoint a seal root or a
-    /// re-fuse writes, `None` on one `append_ops` seals. A project written
-    /// before this field carries `None` on every fused checkpoint it holds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// re-fuse writes, `null` on one `append_ops` seals. Open refuses an
+    /// op-less checkpoint without it.
     pub fuse: Option<FuseRecord>,
     /// Set by a delete: the checkpoint no longer shows in a listing, but
-    /// stays stored while a visible checkpoint is built on it. A project
-    /// written before this field has every checkpoint visible.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// stays stored while a visible checkpoint is built on it.
     pub hidden: bool,
 }
 
@@ -129,51 +120,26 @@ pub enum Op {
     /// Paint `source_id` along `path`. The Z-Map is the document: this
     /// writes indices, never pixels.
     BrushStroke {
-        #[serde(default)]
         source_id: u16,
-        #[serde(default)]
         path: Vec<Point>,
-        #[serde(default)]
         radius: f32,
-        #[serde(default)]
         softness: f32,
     },
     /// Flood `source_id` outward from `seed` while the map stays within
     /// `tolerance`.
     FloodFill {
-        #[serde(default)]
         seed: Point,
-        #[serde(default)]
         source_id: u16,
-        #[serde(default)]
         tolerance: f32,
     },
     /// Put `rect` back to what fusion computed.
-    ResetRegion {
-        /// `crate::tile::Rect` deliberately derives no `Default` (an empty
-        /// rect is not a meaningful geometry anywhere else in the
-        /// workspace), so the op-field default is spelled here instead.
-        #[serde(default = "empty_rect")]
-        rect: Rect,
-    },
+    ResetRegion { rect: Rect },
     /// Re-fuse `rect`-free: run `algorithm` with `params` again over this
     /// checkpoint's state.
     Refuse {
-        #[serde(default)]
         algorithm: String,
-        #[serde(default)]
         params: ParamValues,
     },
-}
-
-/// The zero rect, for [`Op::ResetRegion`]'s `#[serde(default)]`.
-fn empty_rect() -> Rect {
-    Rect {
-        x: 0,
-        y: 0,
-        width: 0,
-        height: 0,
-    }
 }
 
 /// Every checkpoint of a project, indexed by id, with each one's parent and
@@ -350,17 +316,8 @@ mod tests {
     }
 
     #[test]
-    fn an_op_with_no_fields_still_deserializes() {
-        let op: Op = serde_json::from_str(r#"{"brush-stroke":{}}"#).unwrap();
-        assert_eq!(
-            op,
-            Op::BrushStroke {
-                source_id: 0,
-                path: Vec::new(),
-                radius: 0.0,
-                softness: 0.0,
-            }
-        );
+    fn an_op_with_no_fields_is_refused() {
+        assert!(serde_json::from_str::<Op>(r#"{"brush-stroke":{}}"#).is_err());
     }
 
     #[test]
@@ -512,12 +469,14 @@ mod tests {
     }
 
     #[test]
-    fn the_hidden_flag_is_written_only_when_set_and_defaults_to_visible() {
+    fn the_hidden_flag_is_always_written_and_required() {
         let mut checkpoint = bare("a", None, 1);
         let visible = serde_json::to_string(&checkpoint).unwrap();
-        assert!(!visible.contains("hidden"));
+        assert!(visible.contains(r#""hidden":false"#));
         let read: Checkpoint = serde_json::from_str(&visible).unwrap();
         assert!(!read.hidden);
+        let without = visible.replace(r#","hidden":false"#, "");
+        assert!(serde_json::from_str::<Checkpoint>(&without).is_err());
 
         checkpoint.hidden = true;
         let hidden = serde_json::to_string(&checkpoint).unwrap();

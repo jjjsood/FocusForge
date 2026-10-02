@@ -104,8 +104,7 @@ impl CheckpointImage {
     }
 
     /// The view render. Resolves `id` against `project`, refusing an unknown
-    /// id ([`ProjectError::UnknownCheckpoint`]) or a fuse ancestor with no
-    /// recorded state ([`ProjectError::FuseStateUnknown`]). A fused
+    /// id ([`ProjectError::UnknownCheckpoint`]). A fused
     /// checkpoint needs no source frames; an op-bearing one is also refused
     /// for unrecorded alignment ([`ProjectError::RenderAlignmentUnrecorded`])
     /// or sources missing or changed on disk

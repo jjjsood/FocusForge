@@ -12,11 +12,11 @@
 //! resume path, the coverage refusal or the cancel semantics, and it is
 //! the only shape the format allows.
 //!
-//! This function is where all four format commitments are made concrete at
-//! once: the [`Manifest::format_version`] it stamps, the [`BlobKind`] it
-//! records on every blob, the hash it takes over *uncompressed* bytes with
-//! its algorithm named, and the fully serialized [`Checkpoint`] --
-//! `parent: None`, `ops: []` -- it writes beside them.
+//! This function is where the format commitments are made concrete at once:
+//! the entry layout, the [`BlobKind`] it records on every blob, the hash it
+//! takes over *uncompressed* bytes with its algorithm named, and the fully
+//! serialized [`Checkpoint`] -- `parent: None`, `ops: []` -- it writes
+//! beside them.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,7 +29,7 @@ use super::manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
     SourceResolution,
 };
-use super::{HASH_ALGORITHM, Project, format_version_for};
+use super::{HASH_ALGORITHM, Project};
 use crate::align::Registration;
 use crate::params::ParamValues;
 
@@ -129,7 +129,6 @@ fn seal_staged(
     let blobs = blob_records(&composite_record, &zmap_record);
 
     let manifest = Manifest {
-        format_version: format_version_for(&blobs),
         producer: format!("FocusForge {}", env!("CARGO_PKG_VERSION")),
         created_at,
         hash_algorithm: HASH_ALGORITHM.to_string(),

@@ -6,9 +6,8 @@
 //! rather than embedded, container reproducibility and the Z-Map blob's
 //! measured compression.
 //!
-//! Every one of these pins a **permanent on-disk promise**: a project
-//! written today has to keep opening in every later release, so each of
-//! the four format commitments gets a test here.
+//! Every one of these pins an on-disk rule of the format: each of the four
+//! format commitments gets a test here.
 
 mod common;
 
@@ -17,8 +16,8 @@ use std::path::{Path, PathBuf};
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::{
-    self, BlobKind, Checkpoint, FORMAT_VERSION, FULL_ONLY_FORMAT_VERSION, HASH_ALGORITHM, Metrics,
-    Op, Plane, Point, Project, SealRequest, SourceResolution, blob,
+    self, BlobKind, Checkpoint, HASH_ALGORITHM, Metrics, Op, Plane, Point, Project, SealRequest,
+    SourceResolution, blob,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
@@ -232,15 +231,8 @@ fn container_layout_is_exactly_the_named_entries() {
 }
 
 #[test]
-fn manifest_carries_a_format_version() {
-    let (_dir, project_path) = sealed("project_format_version");
-    let project = Project::open(&project_path).unwrap();
-    // A fresh seal writes only `full` blobs, so it stays at the version an
-    // older, delta-unaware build still understands.
-    assert_eq!(project.manifest().format_version, FULL_ONLY_FORMAT_VERSION);
-
-    // Present as a real JSON key, not merely as a Rust field: the promise
-    // is about the bytes on disk.
+fn manifest_carries_no_format_version() {
+    let (_dir, project_path) = sealed("project_format_no_version");
     let file = std::fs::File::open(&project_path).unwrap();
     let mut archive = zip::ZipArchive::new(file).unwrap();
     let mut text = String::new();
@@ -253,9 +245,9 @@ fn manifest_carries_a_format_version() {
             .unwrap();
     }
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(
-        value["format_version"],
-        serde_json::json!(FULL_ONLY_FORMAT_VERSION)
+    assert!(
+        value.get("format_version").is_none(),
+        "the manifest must carry no version key: {text}"
     );
     assert_eq!(value["hash_algorithm"], serde_json::json!(HASH_ALGORITHM));
 }
@@ -328,6 +320,8 @@ fn checkpoint_serializes_every_field_with_no_parent_and_no_ops() {
         "params",
         "created_at",
         "label",
+        "fuse",
+        "hidden",
     ] {
         assert!(
             json.get(field).is_some(),
@@ -374,11 +368,25 @@ fn every_op_variant_round_trips() {
             "externally-tagged {tag} missing: {text}"
         );
     }
+}
 
-    // `#[serde(default)]` on every op field is what lets the format extend
-    // additively: an op recorded with no fields at all still deserializes.
-    let bare: Op = serde_json::from_str(r#"{"flood-fill":{}}"#).unwrap();
-    assert!(matches!(bare, Op::FloodFill { source_id: 0, .. }));
+#[test]
+fn op_with_a_missing_field_is_refused() {
+    for (text, field) in [
+        (r#"{"flood-fill":{}}"#, "seed"),
+        (r#"{"reset-region":{}}"#, "rect"),
+        (
+            r#"{"brush-stroke":{"source_id":1,"path":[],"radius":2.0}}"#,
+            "softness",
+        ),
+        (r#"{"refuse":{"algorithm":"laplacian"}}"#, "params"),
+    ] {
+        let err = serde_json::from_str::<Op>(text).unwrap_err();
+        assert!(
+            err.to_string().contains(field),
+            "the refusal of {text} must name `{field}`: {err}"
+        );
+    }
 }
 
 #[test]
@@ -671,28 +679,8 @@ fn the_container_is_reproducible() {
 }
 
 #[test]
-fn a_future_format_version_is_refused_by_name() {
-    let (_dir, project_path) = sealed("project_format_future_version");
-    let future = project_path.with_extension("future.ffp");
-    rewrite_entry(&project_path, &future, "manifest.json", |bytes| {
-        let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-        value["format_version"] = serde_json::json!(FORMAT_VERSION + 1);
-        serde_json::to_vec_pretty(&value).unwrap()
-    });
-    let text = match Project::open(&future) {
-        Ok(_) => panic!("a future format must be refused"),
-        Err(err) => err.to_string(),
-    };
-    assert!(
-        text.contains(&(FORMAT_VERSION + 1).to_string())
-            && text.contains(&FORMAT_VERSION.to_string()),
-        "the refusal must name both versions: {text}"
-    );
-}
-
-#[test]
-fn registration_missing_from_the_manifest_opens_as_default() {
-    let (_dir, project_path) = sealed("project_format_registration_default");
+fn registration_missing_from_the_manifest_is_refused() {
+    let (_dir, project_path) = sealed("project_format_registration_required");
     let without = project_path.with_extension("no-registration.ffp");
     rewrite_entry(&project_path, &without, "manifest.json", |bytes| {
         let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
@@ -703,11 +691,18 @@ fn registration_missing_from_the_manifest_opens_as_default() {
             .expect("the sealed manifest must carry a registration key to remove");
         serde_json::to_vec_pretty(&value).unwrap()
     });
-    let project = Project::open(&without).expect("a manifest without registration must still open");
-    assert_eq!(
-        project.manifest().registration,
-        focusforge_core::align::Registration::default(),
-        "a manifest written without the field must default it, not refuse the project"
+    let err = match Project::open(&without) {
+        Ok(_) => panic!("a manifest without registration must be refused"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(&err, project::ProjectError::Container { .. }),
+        "expected a container error: {err:?}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("manifest.json") && text.contains("registration"),
+        "the refusal must name the manifest and the field: {text}"
     );
 }
 

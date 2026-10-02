@@ -195,12 +195,6 @@ fn refusal_message(source: &ProjectError) -> String {
         ProjectError::Truncated { .. } => {
             "The file was cut short — it ends before the project does.".to_string()
         }
-        ProjectError::FormatVersion {
-            found, supported, ..
-        } => format!(
-            "This project was saved by a newer FocusForge (project format {found}; this version \
-             reads {supported})."
-        ),
         ProjectError::Io { source, .. } => {
             format!("The file could not be read: {source}")
         }

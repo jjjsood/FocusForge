@@ -679,11 +679,6 @@ fn full_only_project_is_not_rewritten() {
     }
 
     let mut project = Project::open(&project_path).unwrap();
-    assert_eq!(
-        project.manifest().format_version,
-        project::FULL_ONLY_FORMAT_VERSION,
-        "all-full blobs, any chain length: still the full-only format version"
-    );
     let head = project.checkpoint().clone();
     let chain = project.zmap_chain(&head).unwrap();
     assert_eq!(

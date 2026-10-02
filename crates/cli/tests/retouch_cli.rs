@@ -272,7 +272,7 @@ fn refused_op_names_its_position_and_writes_nothing() {
         assert!(!dir.join("source-out-of-range-out.tif.partial").exists());
     }
 
-    // A misspelled field name leaves `radius` at its serde default, 0.0.
+    // A misspelled field name leaves `radius` missing.
     {
         let zmap = synthetic_map(&dir, "typo-base.tif");
         let ops = write_ops(
@@ -296,9 +296,7 @@ fn refused_op_names_its_position_and_writes_nothing() {
         );
         assert!(!output.success);
         assert!(
-            output
-                .stderr
-                .contains("op #0: radius 0 is not a positive finite value"),
+            output.stderr.contains("missing field `radius`"),
             "stderr: {}",
             output.stderr
         );

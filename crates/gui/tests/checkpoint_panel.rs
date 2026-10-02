@@ -1191,9 +1191,9 @@ fn switching_to_a_rendering_tab_keeps_editor_mode() {
 #[test]
 fn other_render_failures_show_the_generic_line() {
     let generic = vec!["Cannot show this checkpoint.".to_string()];
-    let err = job::PlaneCacheError::Project(ProjectError::FuseStateUnknown {
+    let err = job::PlaneCacheError::Project(ProjectError::Container {
         path: PathBuf::from("p.ffp"),
-        checkpoint: "abc".to_string(),
+        message: "abc".to_string(),
     });
     assert_eq!(job::render_refusal_lines(&err), generic);
     assert_eq!(

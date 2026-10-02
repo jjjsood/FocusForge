@@ -14,8 +14,8 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::{
-    self, BlobKind, BlobRecord, FORMAT_VERSION, FULL_ONLY_FORMAT_VERSION, Metrics, Op, Plane,
-    Point, Project, ProjectError, SealRequest, ZMapStorage, blob, partial_path,
+    self, BlobKind, BlobRecord, Metrics, Op, Plane, Point, Project, ProjectError, SealRequest,
+    ZMapStorage, blob, partial_path,
 };
 use focusforge_core::retouch::replay;
 use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader, ZMapWriter};
@@ -742,53 +742,5 @@ fn whole_map_change_falls_back_to_full() {
     assert!(
         pixels.iter().all(|&v| v == 7),
         "every pixel must have been repainted"
-    );
-}
-
-#[test]
-fn format_version_rises_only_with_a_delta() {
-    let (dir, project_path) = sealed("delta_blob_ac11", 64, 48, 8);
-    assert_eq!(
-        Project::open(&project_path)
-            .unwrap()
-            .manifest()
-            .format_version,
-        FULL_ONLY_FORMAT_VERSION
-    );
-
-    let full_forced = dir.join("full-forced.ffp");
-    std::fs::copy(&project_path, &full_forced).unwrap();
-    project::append_ops_at(
-        &full_forced,
-        vec![small_stroke(1, 5, 5)],
-        None,
-        1,
-        ZMapStorage::Full,
-    )
-    .expect("full-storage append must succeed");
-    assert_eq!(
-        Project::open(&full_forced)
-            .unwrap()
-            .manifest()
-            .format_version,
-        FULL_ONLY_FORMAT_VERSION,
-        "an append forced to Full must not raise the format version"
-    );
-
-    let with_delta = dir.join("with-delta.ffp");
-    std::fs::copy(&project_path, &with_delta).unwrap();
-    let sealed_ops = project::append_ops(&with_delta, vec![small_stroke(2, 40, 30)], None)
-        .expect("append_ops must succeed");
-    assert_eq!(
-        sealed_ops.zmap.kind,
-        BlobKind::SparseDelta,
-        "test edit must land as a delta to exercise the version rise"
-    );
-    assert_eq!(
-        Project::open(&with_delta)
-            .unwrap()
-            .manifest()
-            .format_version,
-        FORMAT_VERSION
     );
 }

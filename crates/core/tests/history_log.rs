@@ -396,12 +396,11 @@ fn alignment_and_crop_are_recorded() {
     assert_eq!(after.align, manifest.align);
     assert_eq!(after.registration, manifest.registration);
 
-    // A manifest JSON with the field missing still opens, defaulted.
+    // A manifest JSON with the field missing is refused.
     let mut value = serde_json::to_value(&manifest).unwrap();
-    let object = value.as_object_mut().unwrap();
-    object.remove("registration");
-    let reopened: focusforge_core::project::Manifest = serde_json::from_value(value).unwrap();
-    assert_eq!(reopened.registration, Registration::default());
+    value.as_object_mut().unwrap().remove("registration");
+    let err = serde_json::from_value::<focusforge_core::project::Manifest>(value).unwrap_err();
+    assert!(err.to_string().contains("registration"), "{err}");
 }
 
 /// Reads a checkpoint's Z-Map blob into a full-map index buffer.

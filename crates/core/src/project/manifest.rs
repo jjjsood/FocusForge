@@ -2,18 +2,13 @@
 
 //! `manifest.json`: the one entry every reader of a project opens first.
 //!
-//! **Frozen from the first write.** Three format commitments live in this
-//! file's field set -- `format_version`, the blob `kind`, and
-//! `hash_algorithm` naming the hash rather than leaving it implied -- each
-//! with its own test in `crates/core/tests/project_format.rs`.
+//! Two format commitments live in this file's field set -- the blob `kind`
+//! and `hash_algorithm` naming the hash rather than leaving it implied --
+//! each with its own test in `crates/core/tests/project_format.rs`.
 //!
-//! **Open refuses, it does not default.** [`Manifest::format_version`],
-//! [`Manifest::hash_algorithm`] and [`BlobRecord::kind`] deliberately carry
-//! no `#[serde(default)]`: a record missing one fails deserialization.
-//! `deny_unknown_fields` is just as deliberately **absent** -- a field a
-//! later build adds must not make its project unopenable by this one for no
-//! reason. The `format_version` gate is what refuses a genuinely future
-//! format.
+//! **Open refuses, it does not default.** Every field is required except
+//! the optional-by-meaning ones ([`BlobRecord::base`] and
+//! [`BlobRecord::target`]): a manifest missing one fails deserialization. `deny_unknown_fields` is deliberately absent.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,8 +19,6 @@ use crate::tile::Rect;
 /// A project's `manifest.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
-    /// The format-version commitment. Never `#[serde(default)]`.
-    pub format_version: u32,
     /// `"FocusForge <CARGO_PKG_VERSION>"`.
     pub producer: String,
     /// Unix seconds, UTC. Not a formatted timestamp: the workspace has no
@@ -43,9 +36,7 @@ pub struct Manifest {
     /// `None` when the run was `--no-align`.
     pub align: Option<AlignRecord>,
     /// Every frame's transform and the applied crop, so a frame can be read
-    /// "as fused" without re-deriving either. Additive: a manifest written
-    /// before this field existed opens with [`Registration::default`].
-    #[serde(default)]
+    /// "as fused" without re-deriving either.
     pub registration: Registration,
     pub sources: Vec<SourceRef>,
     pub composite: PlaneRef,
@@ -114,8 +105,8 @@ pub struct BlobRecord {
     pub uncompressed_len: u64,
     pub compressed_len: u64,
     /// [`BlobKind::SparseDelta`] only: the content hash of the map this
-    /// blob is a patch against. Additive, so a `full` record's JSON carries
-    /// neither this nor [`Self::target`].
+    /// blob is a patch against. A `full` record's JSON carries neither this
+    /// nor [`Self::target`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
     /// [`BlobKind::SparseDelta`] only: the content hash of the map this

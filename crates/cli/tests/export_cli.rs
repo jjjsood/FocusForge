@@ -973,8 +973,8 @@ fn read_checkpoint_json(path: &Path, id: &str) -> serde_json::Value {
 
 /// Copies `src` to `dst`, dropping the entries named in `drop` and replacing
 /// the entries in `replace` -- a raw rewrite of a real container, so a test
-/// can inject a record the production writer would never produce (an older
-/// fuse whose `fuse` record was stripped).
+/// can inject a record the production writer would never produce (a fused
+/// checkpoint whose `fuse` record was stripped).
 fn mutate_container(src: &Path, dst: &Path, drop: &[&str], replace: &[(String, Vec<u8>)]) {
     use std::io::{Read, Write};
     let mut archive = zip::ZipArchive::new(std::fs::File::open(src).unwrap()).unwrap();
@@ -1017,10 +1017,9 @@ fn assert_refused(dir: &Path, args: &[&str], out: &Path) {
     );
 }
 
-/// A fuse record naming an algorithm but carrying no per-frame transforms
-/// (`AlignRecord::transforms` is `#[serde(default)]`, so an older record can
-/// legally omit it), plus one op-bearing child. Returns the fused root's id
-/// and the child's.
+/// A fuse record naming an algorithm whose `Registration` is the identity
+/// (no per-frame transforms), plus one op-bearing child. Returns the fused
+/// root's id and the child's.
 fn build_unrecorded_alignment(name: &str) -> (common::TmpDir, PathBuf, String, String) {
     let dir = common::tmp_dir(name);
     let staging = dir.join("staging");
@@ -1119,10 +1118,9 @@ fn refused_checkpoint_export_leaves_nothing() {
         &out,
     );
 
-    // FuseStateUnknown: after the re-fuse moved the head's fused ancestor
-    // to `refuse`, `root`'s own `fuse` record is stripped -- root is still
-    // fused (empty ops) but no longer the head's ancestor, so the manifest
-    // fallback cannot recover it either.
+    // A fused checkpoint without its `fuse` record is refused at open:
+    // `root`'s own record is stripped after the re-fuse moved the head's
+    // fused ancestor to `refuse`.
     let fuse_unknown = build_branched("export_cli_refused_fuse_unknown");
     let mut stripped = read_checkpoint_json(&fuse_unknown.project_path, &fuse_unknown.root);
     stripped.as_object_mut().unwrap().remove("fuse");

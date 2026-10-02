@@ -17,8 +17,8 @@ type FusedRead<'a> = dyn FnMut(Rect, &mut [u16]) -> Result<(), ZMapError> + 'a;
 /// The one bounds-checking entry point for all four [`Op`] variants.
 /// `BrushStroke` clips to the map exactly as [`brush::footprint`] already
 /// does. `ResetRegion`'s rect must lie inside the map or it is
-/// [`RetouchError::RegionOutsideMap`] -- which also catches the zero-size
-/// `#[serde(default)]` rect. `FloodFill`'s seed must lie inside the map
+/// [`RetouchError::RegionOutsideMap`] -- which also catches the empty
+/// rect. `FloodFill`'s seed must lie inside the map
 /// ([`RetouchError::SeedOutsideMap`] otherwise), but even a valid seed ends
 /// in [`RetouchError::FloodFillNotReplayable`]: flood fill has no defined
 /// replay semantics. `Refuse` is always

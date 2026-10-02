@@ -29,8 +29,7 @@ use super::manifest::{
 use super::read_json;
 use super::seal::{now_unix, record, source_ref};
 use super::{
-    HASH_ALGORITHM, Op, Project, SealedProject, format_version_for, fused_extent, materialize_zmap,
-    resolve_chain,
+    HASH_ALGORITHM, Op, Project, SealedProject, fused_extent, materialize_zmap, resolve_chain,
 };
 use crate::align::Registration;
 use crate::params::ParamValues;
@@ -205,7 +204,6 @@ fn write_fused(write: FusedWrite<'_>) -> Result<SealedProject, ProjectError> {
     }
 
     let manifest = Manifest {
-        format_version: format_version_for(&blobs),
         producer: format!("FocusForge {}", env!("CARGO_PKG_VERSION")),
         created_at,
         hash_algorithm: HASH_ALGORITHM.to_string(),
@@ -304,9 +302,8 @@ pub(super) fn verify_blobs_present(
 
 /// Copies every existing zip entry except `manifest.json` and any name
 /// `keep` refuses, byte for byte, preserving names and archive order. The
-/// append-only discipline: a re-serialize through serde would silently
-/// rewrite an old checkpoint's bytes the moment a new `#[serde(default)]`
-/// field is added.
+/// append-only discipline: re-serializing would rewrite an existing
+/// checkpoint's bytes.
 fn copy_forward(
     old_archive: &mut zip::ZipArchive<File>,
     writer: &mut ProjectWriter,
@@ -605,11 +602,7 @@ fn open_at_checkpoint(
     let project = Project::open(project_path)?;
     let head = project.history().get(parent)?.clone();
     let manifest = project.manifest().clone();
-    let (width, height, frame_count) = fused_extent(&project, parent)?.unwrap_or((
-        manifest.zmap.width,
-        manifest.zmap.height,
-        manifest.zmap.frame_count,
-    ));
+    let (width, height, frame_count) = fused_extent(&project, parent)?;
     let info = ZMapInfo::new(width, height, frame_count)
         .map_err(|err| ProjectError::container(project_path, err))?;
     Ok((project, head, manifest, info))
@@ -691,7 +684,6 @@ fn append_ops_staged(
     let fuse = project.fuse_state(parent)?;
 
     let new_manifest = Manifest {
-        format_version: format_version_for(&blobs),
         producer: manifest.producer.clone(),
         created_at,
         hash_algorithm: manifest.hash_algorithm.clone(),
@@ -922,7 +914,6 @@ pub(super) fn hide_and_collect(
     };
 
     let final_manifest = Manifest {
-        format_version: format_version_for(&kept_blobs),
         blobs: kept_blobs,
         ..new_manifest
     };

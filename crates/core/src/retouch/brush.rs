@@ -692,13 +692,6 @@ mod tests {
             other => panic!("expected EmptyPath, got {other:?}"),
         }
 
-        // The all-default op.
-        let default_op: Op = serde_json::from_str(r#"{"brush-stroke":{}}"#).unwrap();
-        match footprint(&default_op, info) {
-            Err(RetouchError::EmptyPath) => {}
-            other => panic!("expected EmptyPath for the all-default op, got {other:?}"),
-        }
-
         // A single-point path, and repeated identical points, both act as a disc.
         let single = stroke_op(2, vec![pt(10, 10)], 3.0, 0.0);
         let repeated = stroke_op(2, vec![pt(10, 10), pt(10, 10), pt(10, 10)], 3.0, 0.0);

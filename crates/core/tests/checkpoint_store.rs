@@ -874,34 +874,86 @@ fn unrecorded_fuse_is_refused_by_name() {
     let staging = dir.join("refuse-staging");
     std::fs::create_dir_all(&staging).unwrap();
     let (composite2, zmap2) = stage_planes(&staging, "refuse", 48, 32, 6, 43);
-    let refuse = project::append_at(
+    project::append_at(
         append_request(&project_path, &composite2, &zmap2, &sources, &values),
         1_700_000_050,
     )
     .unwrap();
 
-    // Simulate a project written before the per-fuse field: strip the
-    // root's own recorded planes.
-    let mut root_without_fuse = read_checkpoint_json(&project_path, &root_id);
+    // Strip the root's own recorded planes, once with a re-fuse above it and
+    // once with only an op append above it (the head's own fused ancestor).
+    let refused_without_fuse = |name: &str| {
+        let mut root_without_fuse = read_checkpoint_json(&project_path, &root_id);
+        root_without_fuse.as_object_mut().unwrap().remove("fuse");
+        let stripped = dir.join(name);
+        mutate_container(
+            &project_path,
+            &stripped,
+            &[(
+                format!("checkpoints/{root_id}.json"),
+                serde_json::to_vec_pretty(&root_without_fuse).unwrap(),
+            )],
+            &[],
+        );
+        let before = read_whole_file(&stripped);
+        let e = match Project::open(&stripped) {
+            Ok(_) => panic!("an op-less checkpoint without a fuse record must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(before, read_whole_file(&stripped));
+        e
+    };
+    let after_refuse = refused_without_fuse("stripped-refuse.ffp");
+    assert_fuse_record_refusal(&after_refuse, &root_id);
+
+    let (dir2, project_path2) = sealed("checkpoint_store_unrecorded_fuse_head", 48, 32, 6);
+    let root_created_at = Project::open(&project_path2)
+        .unwrap()
+        .checkpoint()
+        .created_at;
+    append_bounded(
+        &project_path2,
+        vec![stroke(1, 5, 5, 1.0)],
+        root_created_at + 10,
+    );
+    let root2 = root_id_of(&project_path2);
+    let mut root_without_fuse = read_checkpoint_json(&project_path2, &root2);
     root_without_fuse.as_object_mut().unwrap().remove("fuse");
-    let stripped = dir.join("stripped.ffp");
+    let stripped = dir2.join("stripped-head.ffp");
     mutate_container(
-        &project_path,
+        &project_path2,
         &stripped,
         &[(
-            format!("checkpoints/{root_id}.json"),
+            format!("checkpoints/{root2}.json"),
             serde_json::to_vec_pretty(&root_without_fuse).unwrap(),
         )],
         &[],
     );
-
     let before = read_whole_file(&stripped);
-    let e = err(project::delete_checkpoint(&stripped, &refuse.checkpoint));
-    assert!(matches!(
-        e,
-        ProjectError::FuseStateUnknown { checkpoint, .. } if checkpoint == root_id
-    ));
+    let e = match Project::open(&stripped) {
+        Ok(_) => panic!("the head's fused ancestor without a fuse record must be refused"),
+        Err(e) => e,
+    };
+    assert_fuse_record_refusal(&e, &root2);
     assert_eq!(before, read_whole_file(&stripped));
+}
+
+fn assert_fuse_record_refusal(e: &ProjectError, id: &str) {
+    match e {
+        ProjectError::Container { message, .. } => assert!(
+            message.contains(&format!("checkpoints/{id}.json"))
+                && message.contains("no fuse record"),
+            "the refusal must name the checkpoint file and the missing record: {message}"
+        ),
+        other => panic!("expected a container error, got {other:?}"),
+    }
+}
+
+/// The id of the project's oldest checkpoint, the sealed root.
+fn root_id_of(path: &Path) -> String {
+    let project = Project::open(path).unwrap();
+    let chain = project.checkpoint_chain().unwrap();
+    chain.last().unwrap().id.clone()
 }
 
 /// Every zip entry but the manifest, by name: what a delete must leave
@@ -1215,14 +1267,34 @@ fn hidden_checkpoints_survive_a_reopen() {
             .as_bool()
             .unwrap()
     );
-    assert!(
-        read_checkpoint_json(&project_path, &child)
-            .get("hidden")
-            .is_none()
+    for id in [&child, &root_id] {
+        assert_eq!(
+            read_checkpoint_json(&project_path, id)["hidden"],
+            serde_json::json!(false)
+        );
+    }
+
+    let mut child_without_hidden = read_checkpoint_json(&project_path, &child);
+    child_without_hidden
+        .as_object_mut()
+        .unwrap()
+        .remove("hidden");
+    let without = dir.join("without-hidden.ffp");
+    mutate_container(
+        &project_path,
+        &without,
+        &[(
+            format!("checkpoints/{child}.json"),
+            serde_json::to_vec_pretty(&child_without_hidden).unwrap(),
+        )],
+        &[],
     );
+    let e = match Project::open(&without) {
+        Ok(_) => panic!("a checkpoint without `hidden` must be refused"),
+        Err(e) => e,
+    };
     assert!(
-        read_checkpoint_json(&project_path, &root_id)
-            .get("hidden")
-            .is_none()
+        e.to_string().contains(&format!("checkpoints/{child}.json")),
+        "the refusal must name the checkpoint file: {e}"
     );
 }
