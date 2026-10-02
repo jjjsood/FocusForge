@@ -239,7 +239,7 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 |---|---|
 | `-o, --output <DIR>` | directory to collect this run's projects into; omit to write each project beside its own frames |
 | `--algo <ALGO>` | registered stacking algorithm id (required; see `algorithms` below for the list) |
-| `--set <KEY=VALUE>` | set one algorithm parameter, repeatable; a repeated key keeps the last value |
+| `--set <KEY=VALUE>` | set one algorithm parameter or one project setting (`auto-crop`, `equalize`, `equalize-max-gain`; see below), repeatable; a repeated key keeps the last value |
 | `--json` | emit the frozen JSON report instead of human-readable text |
 | `--groups <PATH>` | group the frames as this TOML file says instead of proposing a grouping |
 | `--write-groups <PATH>` | write the proposed grouping to this path in the format `--groups` reads, then carry on with the run |
@@ -259,6 +259,26 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | `--dry-run` | resolve everything and print what would happen, without computing or writing anything |
 | `--no-gpu` | force the CPU path even when a usable GPU adapter is present; absent when the binary was built `--no-default-features` |
 | `--no-cache` | skip the stage cache: recompute the alignment even when a valid entry exists, and store no new entry |
+
+**Project settings.** Beside the algorithm's own parameters, `--set` and a
+preset's `[stack]` table accept the settings that belong to the whole run
+(`algorithms --json` lists them under `project_params`):
+
+| key | kind | default | meaning |
+|---|---|---|---|
+| `auto-crop` | bool | `true` | trim the result to the area every aligned frame covers; `--no-crop` or `auto-crop=false` keeps the full frame |
+| `equalize` | bool | `false` | opt-in brightness equalization: one gain per frame, the same on every channel, matching the reference frame's (the alignment's, otherwise the middle one) mid-tone brightness |
+| `equalize-max-gain` | float, 1.01 to 2.0 | `1.25` | the bound on the gain: with 1.25 a frame's gain stays between 0.8 and 1.25 |
+
+Equalization scales the encoded code values as delivered and is not a
+linear-light correction; it is off unless `equalize=true` is set, for every
+kind of input. A frame that would need a gain beyond the bound gets the bound
+and the run prints a notice naming the frame, the gain it needed and the
+smallest bound that would cover it; a frame with fewer than 1000 usable
+mid-tone samples keeps gain 1 and says so. The applied gains are recorded in
+the project, so `export --frame` writes the gained frame, and a `--resume`
+with a different equalization is refused naming `equalization`.
+`--write-preset` writes the project settings back into `[stack]`.
 
 Every project carries a **Z-Map**: a single-channel 16-bit TIFF, stored
 inside the project alongside the composite, with one value per output pixel
@@ -351,6 +371,12 @@ output extent — equal to `width`/`height` unless a crop was applied),
 otherwise the alignment algorithm's id, display name, parameters,
 reference frame, reference policy, failure policy, failure count and every
 frame's transform, in the same shape `align --json` reports (see below).
+Additive field from brightness equalization: `equalization` — `null` unless
+`equalize` is on, otherwise `{max_gain, reference, frames}`, where
+`reference` is the frame the others are matched to and `frames` holds, per
+frame, `estimated` (the gain that would match the reference), `applied` (the
+gain used, after the bound), `clamped`, `thin` and `samples` (the number of
+samples the estimate used).
 Additive field from the GPU path: `backend` — `"cpu"`, or the selected
 adapter's name and driver info.
 
@@ -627,10 +653,12 @@ anything else runs, since there is no schema to validate against.
 ### Listing
 
 With no `ID`, human output is one line per algorithm — id, display name,
-family — or the literal line `no algorithms registered` when the registry is
-empty. `--json` emits `{"algorithms": [...]}`, one element per registered
-algorithm, each already carrying its full parameter list (see below); there
-is no separate summary shape for the listing.
+family — followed by the project settings `stack --set` also accepts, or the
+literal line `no algorithms registered` when the registry is empty. `--json`
+emits `{"algorithms": [...], "project_params": [...]}`, one `algorithms`
+element per registered algorithm, each already carrying its full parameter
+list (see below), and `project_params` carrying the project settings in the
+same per-parameter shape; there is no separate summary shape for the listing.
 
 ### One algorithm's schema
 
@@ -671,7 +699,7 @@ focusforge-cli export [OPTIONS] <PROJECT>
 
 Turns a project a `stack` run wrote into image files: the composite with
 `-o`, the Z-Map with `--zmap`, one source frame warped and cropped to the
-composite's own extent with `--frame`/`--frame-output` — any combination,
+composite's own extent (with the recorded brightness gain, when the run equalized) with `--frame`/`--frame-output` — any combination,
 at least one required. The composite it writes is byte-identical to the
 plane the run staged. See
 [`reference/project-format.md`](project-format.md) for what `<PROJECT>` (a

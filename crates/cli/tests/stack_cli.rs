@@ -1397,3 +1397,136 @@ fn refuses_an_output_path_that_is_an_existing_file() {
         "the refusal must not have touched the frame"
     );
 }
+
+// ---------------------------------------------------------------------
+// Opt-in brightness equalization (project parameters through `--set`).
+// ---------------------------------------------------------------------
+
+/// A `weighted-average` stack of the fixture, unaligned and uncropped,
+/// reported as JSON, with `extra` arguments appended.
+fn equalization_run(label: &str, extra: &[&str]) -> serde_json::Value {
+    let cwd = tmp_dir(label);
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let input = mantis_512_dir();
+    let mut args = vec![
+        "stack",
+        input.to_str().unwrap(),
+        "-o",
+        out_dir.to_str().unwrap(),
+        "--algo",
+        "weighted-average",
+        "--json",
+        "--no-align",
+        "--no-crop",
+    ];
+    args.extend_from_slice(extra);
+    let out = run_cli_in(&cwd, &common::push_no_gpu(args));
+    assert!(out.success, "stderr: {}", out.stderr);
+    serde_json::from_str(&out.stdout).expect("--json must parse")
+}
+
+#[test]
+fn equalization_is_null_without_the_setting() {
+    assert!(
+        shared_laplacian_run()
+            .report
+            .get("equalization")
+            .is_some_and(serde_json::Value::is_null),
+        "the key is present and null"
+    );
+}
+
+#[test]
+fn equalize_set_enables_it_and_reports_every_frames_gain() {
+    let report = equalization_run("stack_cli_equalize_set", &["--set", "equalize=true"]);
+    let eq = &report["equalization"];
+    assert_eq!(eq["max_gain"], 1.25);
+    assert_eq!(eq["reference"], 3, "the middle frame of eight");
+    let frames = eq["frames"].as_array().expect("one entry per frame");
+    assert_eq!(
+        frames.len(),
+        report["frame_count"].as_u64().unwrap() as usize
+    );
+    for frame in frames {
+        for key in ["estimated", "applied", "clamped", "thin", "samples"] {
+            assert!(frame.get(key).is_some(), "{key} in {frame}");
+        }
+        assert_eq!(frame["clamped"], false, "{frame}");
+        assert_eq!(frame["thin"], false, "{frame}");
+        let applied = frame["applied"].as_f64().unwrap();
+        assert!((0.9..1.1).contains(&applied), "{frame}");
+    }
+    assert_eq!(frames[3]["applied"], 1.0, "the reference keeps unit gain");
+}
+
+#[test]
+fn equalize_preset_key_enables_it_and_write_preset_writes_it_back() {
+    let cwd = tmp_dir("stack_cli_equalize_preset");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let written = cwd.join("written.toml");
+    let dry = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "weighted-average",
+            "--dry-run",
+            "--set",
+            "equalize=true",
+            "--set",
+            "equalize-max-gain=1.5",
+            "--write-preset",
+            written.to_str().unwrap(),
+        ],
+    );
+    assert!(dry.success, "stderr: {}", dry.stderr);
+    let text = std::fs::read_to_string(&written).expect("the preset is written");
+    assert!(text.contains("equalize = true"), "{text}");
+    assert!(text.contains("equalize-max-gain = 1.5"), "{text}");
+
+    let report = equalization_run(
+        "stack_cli_equalize_preset_run",
+        &["--preset", written.to_str().unwrap()],
+    );
+    assert_eq!(report["equalization"]["max_gain"], 1.5);
+}
+
+#[test]
+fn equalize_settings_out_of_range_or_of_the_wrong_kind_are_refused_before_any_frame_is_read() {
+    let missing_dir = "/definitely/does/not/exist/xyz-stack-cli-equalize";
+    let cwd = tmp_dir("stack_cli_equalize_refused");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    for (setting, names) in [
+        ("equalize-max-gain=3", ["equalize-max-gain", "3", "2"]),
+        ("equalize=maybe", ["equalize", "maybe", "bool"]),
+    ] {
+        let out = run_cli_in(
+            &cwd,
+            &common::push_no_gpu(vec![
+                "stack",
+                missing_dir,
+                "-o",
+                out_dir.to_str().unwrap(),
+                "--algo",
+                "weighted-average",
+                "--set",
+                setting,
+            ]),
+        );
+        assert!(!out.success, "{setting}: stdout {}", out.stdout);
+        for name in names {
+            assert!(
+                out.stderr.contains(name),
+                "{setting}: {name} in {}",
+                out.stderr
+            );
+        }
+        assert!(!out.stderr.contains(missing_dir), "{}", out.stderr);
+    }
+}

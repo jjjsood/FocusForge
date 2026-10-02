@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::align::FailurePolicy;
+use crate::equalize::Equalization;
 use crate::job::fingerprint::StackFingerprint;
 use crate::params::ParamValues;
 use crate::tile::Rect;
@@ -34,7 +35,10 @@ use crate::tile::Rect;
 /// dependency cone. The record names `tile_size` and `levels`, and the
 /// margin is derived from them, so a format-2 record's finished tiles were
 /// fused at a narrower overlap than the plan this build derives.
-pub const JOB_RECORD_FORMAT: u32 = 3;
+///
+/// `3 -> 4`: the record names the brightness equalization the tiles were
+/// fused under; a format-3 build would resume gained tiles as ungained.
+pub const JOB_RECORD_FORMAT: u32 = 4;
 
 /// Everything a resume must agree with before it is allowed to continue: the
 /// stack's identity, the geometry that gives a `PlannedTile::index()` its
@@ -67,6 +71,9 @@ pub struct JobRecord {
     pub backend: String,
     pub align: Option<AlignIdentity>,
     pub crop: Option<Rect>,
+    /// The bound and per-frame gains the fused tiles were read through;
+    /// `None` when equalization was off.
+    pub equalization: Option<Equalization>,
     pub composite_output: PathBuf,
     pub zmap_output: Option<PathBuf>,
 }
@@ -114,6 +121,7 @@ mod tests {
             backend: "cpu".to_string(),
             align: None,
             crop: None,
+            equalization: None,
             composite_output: PathBuf::from("out.tif"),
             zmap_output: None,
         }

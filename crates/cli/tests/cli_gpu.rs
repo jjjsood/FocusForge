@@ -861,6 +861,65 @@ fn device_lost_falls_back() {
     );
 }
 
+/// An equalized run on a real adapter applies the same gains as with
+/// `--no-gpu`. Near-tie winners move single samples by hundreds of LSB, so
+/// parity is judged on the mean level equalization shifts each composite
+/// by; a path whose reader lacks the gain shifts by zero.
+#[test]
+fn equalized_stack_gpu_matches_no_gpu() {
+    /// Per-sample bound between the two equalized composites, the same
+    /// measured near-tie bound as `stack_gpu_matches_stack_no_gpu`.
+    const TOLERANCE: i32 = 512;
+    /// The CPU path's equalized mean sat 153.8 LSB above its unequalized one
+    /// (mean 36 455.95 to 36 609.72); a shift under this is not equalization.
+    const MIN_SHIFT: f64 = 100.0;
+    /// How far the two paths' shifts may differ, as a share of the CPU's.
+    const SHIFT_AGREEMENT: f64 = 0.1;
+
+    let cwd = common::tmp_dir("cli_gpu_equalized_cwd");
+    let dir = common::tmp_dir("cli_gpu_equalized");
+    let composite = |name: &str, extra: &[&str]| {
+        let out = out_dir(&dir, name);
+        let result = run_owned(&cwd, &device_loss_stack_args(&out, extra));
+        assert!(result.success, "{name} run stderr: {}", result.stderr);
+        let report: serde_json::Value =
+            serde_json::from_str(&result.stdout).expect("--json must parse");
+        let (samples, ..) = read_whole(&export_composite(&cwd, &out.join("mantis-512.ffp")));
+        (samples, report)
+    };
+    let mean =
+        |samples: &[u16]| samples.iter().map(|&s| f64::from(s)).sum::<f64>() / samples.len() as f64;
+
+    let (gpu_off, gpu_off_report) = composite("gpu-off", &[]);
+    let (gpu_on, gpu_on_report) = composite("gpu-on", &["--set", "equalize=true"]);
+    let (cpu_off, _) = composite("cpu-off", &["--no-gpu"]);
+    let (cpu_on, cpu_on_report) = composite("cpu-on", &["--no-gpu", "--set", "equalize=true"]);
+
+    assert_ne!(gpu_on_report["backend"], "cpu", "{gpu_on_report}");
+    assert_ne!(gpu_off_report["backend"], "cpu", "{gpu_off_report}");
+    assert!(!gpu_on_report["equalization"].is_null(), "{gpu_on_report}");
+    assert_eq!(gpu_on_report["equalization"], cpu_on_report["equalization"]);
+
+    let shift_cpu = mean(&cpu_on) - mean(&cpu_off);
+    let shift_gpu = mean(&gpu_on) - mean(&gpu_off);
+    eprintln!(
+        "equalization shifts the composite mean by {shift_cpu:.2} (cpu), {shift_gpu:.2} (gpu)"
+    );
+    assert!(
+        shift_cpu.abs() >= MIN_SHIFT,
+        "the cpu run's equalization shifted its composite by only {shift_cpu:.2}"
+    );
+    assert!(
+        (shift_gpu - shift_cpu).abs() <= SHIFT_AGREEMENT * shift_cpu.abs(),
+        "equalization shifted the gpu composite by {shift_gpu:.2}, the cpu one by {shift_cpu:.2}"
+    );
+    let worst = max_abs_diff(&gpu_on, &cpu_on);
+    assert!(
+        worst <= TOLERANCE,
+        "equalized gpu and cpu composites differ by up to {worst} LSB, tolerance is {TOLERANCE}"
+    );
+}
+
 /// The adapter and its limits are recorded once per process, whatever the
 /// number of stacks, and neither record reaches stderr -- the one
 /// `adapter selected: ` line stays the whole of a run's adapter output

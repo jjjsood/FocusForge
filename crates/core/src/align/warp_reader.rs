@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::align::warp::warp_tile;
 use crate::align::{SourceFootprint, Transform};
+use crate::equalize::{Equalization, UNIT_GAIN};
 use crate::job::stage_cache::{transform_from_bits, transform_to_bits};
 use crate::tile::Rect;
 use crate::timing::{TimingCounter, measurement_scope, record_timing};
@@ -22,9 +23,22 @@ pub struct Registration {
     #[serde(with = "transform_bits")]
     pub transforms: Vec<Transform>,
     pub crop: Option<Rect>,
+    /// The brightness gains the fuse applied to each frame, `None` when
+    /// equalization was off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equalization: Option<Equalization>,
 }
 
 impl Registration {
+    /// Frame `i`'s Q16 brightness gain, unit when the fuse applied none.
+    pub fn gain(&self, i: usize) -> u32 {
+        self.equalization
+            .as_ref()
+            .and_then(|e| e.gains.get(i))
+            .copied()
+            .unwrap_or(UNIT_GAIN)
+    }
+
     /// Frame `i`'s transform, [`Transform::identity`] past the end.
     pub fn transform(&self, i: usize) -> Transform {
         self.transforms

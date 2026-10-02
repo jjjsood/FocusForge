@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use focusforge_core::algorithm::{AlignAlgorithm, StackAlgorithm};
 use focusforge_core::align::WarpingReader;
+use focusforge_core::equalize::GainReader;
 use focusforge_core::gpu::TileBackend;
 use focusforge_core::io::{
     COMPOSITE_FILENAME, FrameError, FrameReader, ZMAP_FILENAME, open_frame_set,
@@ -31,6 +32,7 @@ use focusforge_core::zmap::{ZMapError, ZMapReader};
 /// Re-exported so `crate::controller` -- which names no algorithm crate --
 /// can hold and drive these through the `job::` path alone.
 pub use focusforge_core::align::{Registration, Transform};
+pub use focusforge_core::equalize::UNIT_GAIN;
 pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 pub use focusforge_core::project::HeldCheckpoint;
@@ -127,6 +129,8 @@ pub struct JobRequest {
     pub align_values: ParamValues,
     pub align_lax: bool,
     pub crop: bool,
+    /// The gain bound brightness equalization runs with, `None` when off.
+    pub equalize: Option<f64>,
     /// Whether this run may use the headless GPU backend at all -- resolved
     /// against the real device only inside [`spawn`], on the worker thread,
     /// never here.
@@ -236,6 +240,7 @@ pub fn spawn(
             explicit: request.fuse_values,
             align,
             crop: request.crop,
+            equalize: request.equalize,
             tile_size: None,
             max_host_memory: None,
             backend,
@@ -612,7 +617,13 @@ impl EditState {
         let frame = self.sources.dimensions();
         let samples_per_pixel = self.sources.frame(0).samples_per_pixel;
         let transforms = self.registration.transforms(self.sources.len());
-        let warped = WarpingReader::new(&*self.sources, frame, samples_per_pixel, transforms);
+        let gains = self
+            .registration
+            .equalization
+            .as_ref()
+            .map_or(&[][..], |e| &e.gains);
+        let gained = GainReader::new(&*self.sources, gains);
+        let warped = WarpingReader::new(&gained, frame, samples_per_pixel, transforms);
         let sources = Sources {
             reader: &warped,
             frame_count: self.sources.len() as u32,

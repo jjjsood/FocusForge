@@ -22,6 +22,7 @@ use crate::align::{
     AlignDriverOptions, FailurePolicy, FrameAlignment, ReferencePolicy, Registration,
     StackAlignment, Transform, WarpingReader, align_stack_with, auto_crop,
 };
+use crate::equalize::{self, EqualizationReport, GainReader};
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use crate::gpu::TileBackend;
@@ -69,6 +70,9 @@ pub struct FuseRequest {
     pub explicit: ParamValues,
     pub align: Option<AlignRequest>,
     pub crop: bool,
+    /// The bound of the opt-in brightness equalization (gains stay within
+    /// `1/bound..=bound`); `None` leaves the frames as delivered.
+    pub equalize: Option<f64>,
     pub tile_size: Option<u32>,
     pub max_host_memory: Option<u64>,
     pub backend: Option<&'static dyn TileBackend>,
@@ -154,6 +158,8 @@ pub struct FuseReport {
     pub crop: Option<Rect>,
     pub description: Option<String>,
     pub align: Option<FuseAlignReport>,
+    /// The brightness equalization's estimate; `None` when it was off.
+    pub equalization: Option<EqualizationReport>,
     pub align_cached: bool,
     pub align_source: String,
     pub align_workers: Option<usize>,
@@ -504,11 +510,46 @@ pub fn run(
         .iter()
         .map(|f| f.transform)
         .collect();
+    let equalization = match request.equalize {
+        Some(max_gain) => {
+            let reference = alignment_result
+                .as_ref()
+                .map_or((frame_reader.len() - 1) / 2, |(_, _, _, a)| a.reference);
+            let warped = WarpingReader::new(frame_reader, (width, height), spp, transforms.clone());
+            let frames = equalize::estimate(
+                &warped,
+                frame_reader.len(),
+                (width, height),
+                spp,
+                reference,
+                max_gain,
+            )?;
+            for (index, estimate) in frames.iter().enumerate() {
+                if let Some(message) = estimate.notice(index, max_gain) {
+                    observer.notice(&message);
+                }
+            }
+            Some(EqualizationReport {
+                max_gain,
+                reference,
+                frames,
+            })
+        }
+        None => None,
+    };
+    let recorded = equalization.as_ref().map(EqualizationReport::recorded);
     let registration = Registration {
         transforms: transforms.clone(),
         crop: applied_crop,
+        equalization: recorded.clone(),
     };
-    let warping_reader = WarpingReader::new(frame_reader, (width, height), spp, transforms.clone());
+    // Every reader of a frame beneath this point -- host fuse, device
+    // upload and the device-loss fallback -- sees the gained samples.
+    let gain_reader = GainReader::new(
+        frame_reader,
+        recorded.as_ref().map_or(&[], |e| e.gains.as_slice()),
+    );
+    let warping_reader = WarpingReader::new(&gain_reader, (width, height), spp, transforms.clone());
 
     // The scheduler's own per-tile rect: the largest read rect it plans.
     let gpu_fallback = request.backend.and_then(|b| {
@@ -526,7 +567,7 @@ pub fn run(
     let backend = request.backend.filter(|_| gpu_fallback.is_none());
 
     let reader: &dyn TileReader = match &backend {
-        Some(_) => frame_reader,
+        Some(_) => &gain_reader,
         None => &warping_reader,
     };
     let scheduler = TileScheduler::new(reader, stack_ctx, spp, &options)?;
@@ -575,6 +616,7 @@ pub fn run(
                 failure_policy: *policy,
             }),
         crop: applied_crop,
+        equalization: recorded.clone(),
         composite_output: staged_composite.clone(),
         zmap_output: Some(staged_zmap.clone()),
     };
@@ -661,7 +703,7 @@ pub fn run(
     let backend_consumer = backend.map(|b| {
         BackendFusionConsumer::new(
             b,
-            frame_reader,
+            &gain_reader,
             (width, height),
             transforms,
             spp,
@@ -717,7 +759,7 @@ pub fn run(
     }
 
     observer.stage(RunStage::Seal);
-    let metrics = measure_metrics(&staged_composite, frame_reader);
+    let metrics = measure_metrics(&staged_composite, frame_reader, &gain_reader);
     let align_record =
         alignment_result
             .as_ref()
@@ -833,6 +875,7 @@ pub fn run(
         crop: applied_crop,
         description,
         align: align_report,
+        equalization,
         align_cached,
         align_source,
         align_workers,
@@ -1050,8 +1093,14 @@ const LAPVAR_WINDOW: u32 = 2048;
 /// The composite's and the sharpest source frame's Laplacian variance over
 /// one central window, measured identically on both. Every failure is
 /// silence rather than a refusal: a metric that could not be measured must
-/// not turn a completed run into a failed one.
-fn measure_metrics(composite: &Path, sources: &dyn FrameReader) -> Metrics {
+/// not turn a completed run into a failed one. `gained` reads `sources` with
+/// the run's equalization gains applied, so the comparison is against the
+/// frames the fuse used.
+fn measure_metrics(
+    composite: &Path,
+    sources: &dyn FrameReader,
+    gained: &dyn TileReader,
+) -> Metrics {
     let Ok(stack) = TiffStack::open_files(std::slice::from_ref(&composite.to_path_buf())) else {
         return Metrics::default();
     };
@@ -1070,7 +1119,7 @@ fn measure_metrics(composite: &Path, sources: &dyn FrameReader) -> Metrics {
         }
         let fspp = sources.frame(index).samples_per_pixel;
         let rect = centered(fw, fh, side_w, side_h);
-        if let Some(value) = lapvar(sources, index, rect, fspp) {
+        if let Some(value) = lapvar(gained, index, rect, fspp) {
             max_input_lapvar = Some(max_input_lapvar.map_or(value, |m: f64| m.max(value)));
         }
     }

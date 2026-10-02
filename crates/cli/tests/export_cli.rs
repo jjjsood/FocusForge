@@ -517,3 +517,84 @@ fn export_frame_output_alone_is_refused_by_name() {
     );
     assert!(!out.exists());
 }
+
+#[test]
+fn export_frame_applies_the_recorded_equalization() {
+    let cwd = common::tmp_dir("export_cli_equalized_frame");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let input = common::fixtures_dir().join("mantis-512");
+    let stacked = run_cli_in(
+        &cwd,
+        &common::push_no_gpu(vec![
+            "stack",
+            input.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "weighted-average",
+            "--no-align",
+            "--no-crop",
+            "--set",
+            "equalize=true",
+        ]),
+    );
+    assert!(stacked.success, "stderr: {}", stacked.stderr);
+    let project_path = only_project(&out_dir);
+    let project = Project::open(&project_path).expect("open project");
+    let gains = project
+        .manifest()
+        .registration
+        .equalization
+        .clone()
+        .expect("the project records the equalization")
+        .gains;
+    let unit = 1u32 << 16;
+    let (frame, gain) = gains
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by_key(|&(_, g)| g.abs_diff(unit))
+        .unwrap();
+    assert_ne!(gain, unit, "the fixture's frames differ in brightness");
+
+    let out = cwd.join("frame.tif");
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "export",
+            project_path.to_str().unwrap(),
+            "--frame",
+            &frame.to_string(),
+            "--frame-output",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(result.success, "stderr: {}", result.stderr);
+
+    let source = project.source_path(&project.manifest().sources[frame]);
+    let raw = TiffStack::open_files(std::slice::from_ref(&source)).expect("open the source frame");
+    let exported = TiffStack::open_files(std::slice::from_ref(&out)).expect("open the export");
+    let (width, height) = raw.dimensions();
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let want: Vec<u16> = raw
+        .read_tile(0, whole)
+        .expect("read the source")
+        .samples
+        .iter()
+        .map(|&s| ((u64::from(s) * u64::from(gain) + 32_768) >> 16).min(65_535) as u16)
+        .collect();
+    let got = exported
+        .read_tile(0, whole)
+        .expect("read the export")
+        .samples;
+    assert!(
+        got == want,
+        "frame {frame} must be its source times gain {gain}/65536"
+    );
+}

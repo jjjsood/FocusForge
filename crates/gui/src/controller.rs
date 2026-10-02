@@ -3571,14 +3571,15 @@ impl AppController {
         let tab = self.state.active()?;
         let (sources, registration) = tab.fused()?;
         let path = tab.selected_frame()?;
-        let transform = sources
-            .iter()
-            .position(|source| source == path)
+        let position = sources.iter().position(|source| source == path);
+        let transform = position
             .map(|i| registration.transform(i))
             .unwrap_or_else(job::Transform::identity);
+        let gain = position.map_or(job::UNIT_GAIN, |i| registration.gain(i));
         let extent = display_image(tab)?;
         Some(FrameView {
             transform,
+            gain,
             origin: registration.origin(),
             extent: (extent.width, extent.height),
         })
@@ -4451,6 +4452,7 @@ impl AppController {
             align_values: tab.align_values.clone(),
             align_lax: true,
             crop: settings_panel::auto_crop_enabled(&tab.project_values),
+            equalize: settings_panel::equalization_bound(&tab.project_values),
             gpu: self.gpu_fusion,
         })
     }

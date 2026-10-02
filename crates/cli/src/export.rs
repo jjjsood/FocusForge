@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use focusforge_core::algorithm::TileReader;
 use focusforge_core::align::WarpingReader;
+use focusforge_core::equalize::GainReader;
 use focusforge_core::host;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter, open_frame_set};
 use focusforge_core::project::{self, Plane, Project};
@@ -213,12 +214,12 @@ fn export_frame(project: &Project, index: usize, path: &Path) -> Result<(), Stri
     let frame_set = open_frame_set(&paths, budget).map_err(|err| err.to_string())?;
     let frame_dims = frame_set.reader.dimensions();
     let transforms = registration.transforms(frame_set.reader.len());
-    let reader = WarpingReader::new(
-        frame_set.reader.as_ref(),
-        frame_dims,
-        composite.samples_per_pixel,
-        transforms,
-    );
+    let gains = registration
+        .equalization
+        .as_ref()
+        .map_or(&[][..], |e| e.gains.as_slice());
+    let gained = GainReader::new(frame_set.reader.as_ref(), gains);
+    let reader = WarpingReader::new(&gained, frame_dims, composite.samples_per_pixel, transforms);
     let origin = registration.origin();
 
     let partial = project::container::PartialFile::new(path);

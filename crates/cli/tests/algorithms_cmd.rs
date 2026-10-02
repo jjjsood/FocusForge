@@ -263,3 +263,52 @@ fn json_carries_help_and_advanced_per_parameter() {
         }
     }
 }
+
+/// The project-level descriptors reach `algorithms --json` as an additive
+/// `project_params` array, help included.
+#[test]
+fn project_params_json_lists_every_project_descriptor() {
+    let output = bin()
+        .args(["algorithms", "--json"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "{:?}", output.status);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    let params = report["project_params"]
+        .as_array()
+        .expect("a project_params array");
+    let ids: Vec<&str> = params.iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["auto-crop", "equalize", "equalize-max-gain"]);
+    for (json, desc) in params
+        .iter()
+        .zip(focusforge_core::project::PROJECT_PARAMS.iter())
+    {
+        assert_eq!(json["help"], desc.help.as_str(), "{}", desc.id);
+        assert_eq!(json["advanced"], desc.advanced, "{}", desc.id);
+        assert_eq!(json["value"], serde_json::to_value(&desc.default).unwrap());
+    }
+    let help = params[1]["help"].as_str().unwrap();
+    assert!(help.contains("not a linear-light correction"), "{help}");
+}
+
+#[test]
+fn project_params_text_listing_names_them_after_the_algorithms() {
+    let output = bin()
+        .arg("algorithms")
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "{:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first_project = stdout.find("equalize - ").expect("equalize is listed");
+    for entry in registry::algorithms() {
+        let at = stdout.find(entry.id()).expect("every algorithm is listed");
+        assert!(
+            at < first_project,
+            "{} precedes the project settings",
+            entry.id()
+        );
+    }
+    for id in ["auto-crop", "equalize-max-gain"] {
+        assert!(stdout.contains(&format!("{id} - ")), "{id} in {stdout}");
+    }
+}

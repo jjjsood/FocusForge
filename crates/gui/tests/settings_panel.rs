@@ -438,6 +438,7 @@ fn reopened_cropped_project_shows_auto_crop_on() {
             width: 2,
             height: 2,
         }),
+        equalization: None,
     };
     let project = seal_with_registration(
         "reopened_cropped",
@@ -450,6 +451,57 @@ fn reopened_cropped_project_shows_auto_crop_on() {
         OpenOutcome::Opened(_)
     ));
     assert_eq!(auto_crop_selected(&controller), "true");
+}
+
+#[test]
+fn reopened_equalized_project_seeds_equalize_and_its_bound() {
+    use focusforge_core::align::Registration;
+    use focusforge_core::equalize::Equalization;
+
+    let registration = |equalization| Registration {
+        transforms: Vec::new(),
+        crop: None,
+        equalization,
+    };
+    let row = |controller: &AppController, id: &str| {
+        controller
+            .settings_panel()
+            .rows
+            .into_iter()
+            .find(|r| r.section == "crop" && r.id == id)
+            .unwrap_or_else(|| panic!("the crop section has a {id} row"))
+    };
+
+    let mut controller = AppController::new();
+    let project = seal_with_registration(
+        "reopened_equalized",
+        "laplacian",
+        &ParamValues::new(),
+        registration(Some(Equalization {
+            max_gain: 1.5,
+            gains: vec![65536, 66000],
+        })),
+    );
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[project]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(row(&controller, "equalize").selected, "true");
+    assert_eq!(row(&controller, "equalize-max-gain").value_text, "1.5");
+
+    let mut plain = AppController::new();
+    let project = seal_with_registration(
+        "reopened_unequalized",
+        "laplacian",
+        &ParamValues::new(),
+        registration(None),
+    );
+    assert!(matches!(
+        common::open_and_settle(&mut plain, &[project]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(row(&plain, "equalize").selected, "false");
+    assert_eq!(row(&plain, "equalize-max-gain").value_text, "1.25");
 }
 
 #[test]

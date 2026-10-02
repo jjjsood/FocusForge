@@ -489,8 +489,8 @@ fn fusion_and_crop_help_is_one_plain_sentence() {
     }
     assert_eq!(
         described.len(),
-        1 + 1 + 2 + 2,
-        "auto-crop plus the three schemas"
+        3 + 1 + 2 + 2,
+        "the three project parameters plus the three schemas"
     );
     for (owner, p) in described {
         let help = p.help.as_str();

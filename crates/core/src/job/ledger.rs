@@ -505,6 +505,12 @@ impl ResumeStore {
                 candidate.align,
                 record.align
             );
+            check_identity!(
+                candidate.composite_output,
+                "equalization",
+                candidate.equalization,
+                record.equalization
+            );
 
             let ledger = Ledger::open(dir)?;
             return Ok(Resumable::Ledger(ledger));
@@ -576,6 +582,7 @@ mod tests {
             backend: "cpu".to_string(),
             align: None,
             crop: None,
+            equalization: None,
             composite_output: output,
             zmap_output: None,
         }

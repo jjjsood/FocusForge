@@ -14,11 +14,12 @@ use std::time::Instant;
 
 use focusforge_core::algorithm::StackAlgorithm;
 use focusforge_core::align::ReferencePolicy;
+use focusforge_core::equalize::EqualizationReport;
 use focusforge_core::gpu::TileBackend;
 use focusforge_core::io::{FrameReader, Group, Proposal, Rect, open_frame_set, propose};
 use focusforge_core::job::{JobControl, StageCache};
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance};
-use focusforge_core::project::{self, PROJECT_EXTENSION};
+use focusforge_core::project::{self, PROJECT_EXTENSION, PROJECT_PARAMS};
 use focusforge_core::registry;
 use focusforge_core::tile::{TileScheduler, TileSchedulerOptions};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
@@ -86,6 +87,8 @@ pub struct StackReport {
     pub crop: Option<Rect>,
     pub description: Option<String>,
     pub align: Option<StackAlignReport>,
+    /// The brightness equalization's estimate; `null` when it was off.
+    pub equalization: Option<EqualizationReport>,
     /// `"cpu"`, or the selected adapter's [`focusforge_core::gpu::BackendInfo`]
     /// display -- additive, so which path ran is machine-readable and not
     /// only a stderr line.
@@ -330,14 +333,24 @@ pub fn run(
     let device_budget_report = choice.device_budget;
     let device_peak = choice.device_peak;
 
-    // Parse `--set` against that schema and overlay it on the
-    // preset's `[stack]` table. An unknown key or an out-of-range value is
-    // refused here -- from either source, with the same `ParamViolation`
-    // rendering -- with the input directory still unread.
-    let explicit = match parse_settings(algo.params(), &set.set)
-        .and_then(|cli| merge_preset(algo.params(), &file.stack, cli))
+    // Parse `--set` against the algorithm's schema chained with the project
+    // parameters and overlay it on the preset's `[stack]` table. An unknown
+    // key or an out-of-range value is refused here -- from either source,
+    // with the same `ParamViolation` rendering -- with the input directory
+    // still unread. The project keys are split off before resolution: they
+    // belong to the run, not to the algorithm's own schema.
+    let schema: Vec<_> = algo
+        .params()
+        .iter()
+        .chain(PROJECT_PARAMS.iter())
+        .cloned()
+        .collect();
+    let (project_values, explicit) = match parse_settings(&schema, &set.set)
+        .and_then(|cli| merge_preset(&schema, &file.stack, cli))
     {
-        Ok(values) => values,
+        Ok(values) => values
+            .into_iter()
+            .partition::<ParamValues, _>(|(id, _)| PROJECT_PARAMS.iter().any(|d| &d.id == id)),
         Err(violations) => {
             return refuse(
                 violations
@@ -440,6 +453,7 @@ pub fn run(
         device_budget_report,
         device_peak,
         explicit,
+        project_values,
         file,
         align_opts,
         job_opts,
@@ -534,6 +548,8 @@ struct RunSetup<'a> {
     /// `device_budget_report`.
     device_peak: Option<&'static dyn DevicePeak>,
     explicit: ParamValues,
+    /// The explicitly set project parameters (`PROJECT_PARAMS`).
+    project_values: ParamValues,
     file: preset::Preset,
     align_opts: &'a AlignOptions<'a>,
     job_opts: &'a JobOptions,
@@ -855,6 +871,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         device_budget_report,
         device_peak,
         explicit,
+        project_values,
         file,
         align_opts,
         job_opts,
@@ -996,7 +1013,11 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         let written = preset::Preset {
             algo: Some(algo.id().to_string()),
             align_algo: align_prepared.as_ref().map(|(a, ..)| a.id().to_string()),
-            stack: explicit.clone(),
+            stack: explicit
+                .iter()
+                .chain(project_values.iter())
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
             align: align_prepared
                 .as_ref()
                 .map(|(_, e, _)| e.clone())
@@ -1103,7 +1124,12 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         algorithm: algo,
         explicit,
         align: align_request,
-        crop: align_opts.crop,
+        crop: align_opts.crop
+            && project_values
+                .get("auto-crop")
+                .and_then(ParamValue::as_bool)
+                .unwrap_or(true),
+        equalize: project::equalization_bound(project_values),
         tile_size: job_opts.tile_size,
         max_host_memory,
         backend,
@@ -1372,6 +1398,7 @@ fn build_stack_report(
         crop: report.crop,
         description: report.description,
         align,
+        equalization: report.equalization,
         backend: backend_id,
         max_device_bytes_in_flight: device_budget_report.as_ref().map(|r| r.max_device_bytes),
         device_budget_provenance: device_budget_report.as_ref().map(|r| r.provenance),
@@ -1462,6 +1489,16 @@ fn render(report: &StackReport) -> String {
         report.backed_off,
     ));
     lines.push(format!("working_space={}", report.working_space));
+    lines.push(match &report.equalization {
+        None => "equalization=off".to_string(),
+        Some(eq) => format!(
+            "equalization=on max_gain={} reference={} clamped={} thin={} (scales encoded code values, not a linear-light correction)",
+            eq.max_gain,
+            eq.reference,
+            eq.frames.iter().filter(|f| f.clamped).count(),
+            eq.frames.iter().filter(|f| f.thin).count(),
+        ),
+    });
     lines.push(format!("backend: {}", report.backend));
     if let (
         Some(max_device_bytes_in_flight),
@@ -1604,6 +1641,7 @@ mod tests {
             crop: None,
             description: None,
             align: None,
+            equalization: None,
             backend: "cpu".to_string(),
             max_device_bytes_in_flight: None,
             device_budget_provenance: None,

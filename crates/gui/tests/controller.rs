@@ -3908,6 +3908,123 @@ fn stroke_matches_left_pane() {
     );
 }
 
+/// Fuses `count` mantis-64 frames on `depth-map` with equalization on, then
+/// opens the editor over the run.
+fn open_equalized_editor(name: &str, count: usize) -> AppController {
+    use focusforge_core::params::ParamValue;
+
+    let mut controller = controller_with_scratch(name);
+    open_mantis64_tab(&mut controller, name, count);
+    controller.set_fuse_algorithm("depth-map");
+    controller.set_param_value("crop", "equalize", ParamValue::Bool(true));
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    assert_eq!(controller.checkpoint_count(), Some(1), "{name} must fuse");
+    controller.set_resident_tile_size_for_test(16);
+    controller.set_pane_geometry(LEFT, RIGHT);
+    assert!(controller.set_mode(ShellMode::Editor));
+    controller
+}
+
+/// The crop section lists the equalization switch (off) and its bound, and
+/// turning the switch on reaches the run with the bound the panel holds.
+#[test]
+fn equalize_rows_reach_the_run() {
+    use focusforge_core::params::ParamValue;
+
+    let mut controller = common::controller_with_frames("equalize_rows", 3);
+    let rows: Vec<_> = controller
+        .settings_panel()
+        .rows
+        .into_iter()
+        .filter(|r| r.section == "crop")
+        .collect();
+    let row = |id: &str| {
+        rows.iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("no {id} row"))
+    };
+    assert_eq!(row("equalize").selected, "false", "off by default");
+    assert_eq!(row("equalize-max-gain").value_text, "1.25");
+
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
+    let off = controller.held_checkpoints().last().cloned().unwrap();
+    assert_eq!(
+        off.registration.equalization, None,
+        "a default run is not equalized"
+    );
+
+    controller.set_param_value("crop", "equalize", ParamValue::Bool(true));
+    controller.set_param_value("crop", "equalize-max-gain", ParamValue::Float(1.5));
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
+    let on = controller.held_checkpoints().last().cloned().unwrap();
+    let recorded = on.registration.equalization.expect("the run was equalized");
+    assert_eq!(recorded.max_gain, 1.5);
+    assert_eq!(recorded.gains.len(), 3, "one gain per frame");
+}
+
+/// On an equalized `depth-map` tab a stroke's recomposited pixel is the left
+/// pane's read of that frame, and that read carries the frame's gain.
+#[test]
+fn equalized_stroke_matches_left_pane() {
+    use focusforge_core::equalize::UNIT_GAIN;
+    use focusforge_gui::canvas::{FrameSource, FrameView};
+
+    let mut c = open_equalized_editor("equalized_stroke", 3);
+    let held = c.held_checkpoints().last().cloned().unwrap();
+    let gains = held.registration.equalization.expect("equalized run").gains;
+    assert_ne!(gains[2], UNIT_GAIN, "frame 2 has a gain to apply");
+
+    // A point the fuse took from another frame, so the stroke has to
+    // recomposite it rather than keep the sealed pixel.
+    let root = held.sources[0].parent().unwrap().to_path_buf();
+    let sealed = Sealed::read(&mut c, &root);
+    let width = sealed.map.width as usize;
+    let at_index = sealed
+        .indices
+        .iter()
+        .position(|&i| i != 2)
+        .expect("the fuse took some pixel from another frame");
+    let (px, py) = (at_index % width, at_index / width);
+    c.select_frame(2);
+    set_size(&mut c, 8.0);
+    drag(&mut c, &[(px as f32, py as f32)]);
+    let recomposited = sealed.displayed(&c)[at_index * 3..at_index * 3 + 3].to_vec();
+
+    let view = c
+        .selected_frame_view()
+        .expect("a fused tab's frame has a view");
+    let read = |view: FrameView| {
+        let mut source = FrameSource::default();
+        source
+            .set(
+                &c.selected_frame_path().unwrap(),
+                Some(view),
+                job::host_budget(),
+            )
+            .expect("the selected frame opens");
+        let mut pixel = vec![0u16; 3];
+        let rect = Rect {
+            x: px as u32,
+            y: py as u32,
+            width: 1,
+            height: 1,
+        };
+        source
+            .read_into(rect, NonZeroU32::MIN, &mut pixel)
+            .expect("the point reads");
+        pixel
+    };
+    assert_eq!(recomposited, read(view), "stroke and left pane agree");
+    let ungained = read(FrameView {
+        gain: UNIT_GAIN,
+        ..view
+    });
+    assert_ne!(recomposited, ungained, "the pixel carries the frame's gain");
+}
+
 // ---------------------------------------------------------------------
 // A modal or the Projects overlay hides the brush cursor and blocks the
 // canvas beneath it.

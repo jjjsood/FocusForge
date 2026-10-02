@@ -19,6 +19,7 @@ use std::time::Duration;
 use focusforge_core::algorithm::AlgorithmError;
 use focusforge_core::algorithm::AlignStatus;
 use focusforge_core::align::{FrameAlignment, ReferencePolicy, StackAlignment, Transform};
+use focusforge_core::equalize::{Equalization, UNIT_GAIN};
 use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
 use focusforge_core::io::{FrameReader, TiffStack};
 use focusforge_core::job::fingerprint::{FrameFingerprint, StackFingerprint};
@@ -101,6 +102,7 @@ fn job_record(
         stack_params: values.clone(),
         align: None,
         crop: None,
+        equalization: None,
         composite_output: composite_path.to_path_buf(),
         zmap_output: zmap_path.map(|p| p.to_path_buf()),
     }
@@ -531,6 +533,52 @@ fn resume_refuses_changed_params() {
         other => panic!("expected Resumable::Mismatch, got {other:?}"),
     }
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn resume_refuses_changed_equalization() {
+    let stack = open_stack();
+    let (width, height) = stack.dimensions();
+    let stack_ctx = StackContext::new(stack.len(), width, height, 3);
+    let values = resolved_laplacian_values(stack_ctx);
+
+    let scratch = scratch_base("changed-equalization");
+    let composite_path = scratch.join("out.tif");
+    std::fs::create_dir_all(&scratch).unwrap();
+    std::fs::write(&composite_path, b"partial").unwrap();
+
+    let store = ResumeStore::open(&scratch).unwrap();
+    let mut record = job_record(&stack, &values, &composite_path, None);
+    record.equalization = Some(Equalization {
+        max_gain: 1.25,
+        gains: vec![UNIT_GAIN; stack.len()],
+    });
+    store.begin(&record).unwrap();
+
+    let same = record.clone();
+    assert!(
+        matches!(store.find(&same).unwrap(), Resumable::Ledger(_)),
+        "the recorded equalization resumes"
+    );
+
+    let mut off = record.clone();
+    off.equalization = None;
+    let mut other_gain = record.clone();
+    other_gain.equalization.as_mut().unwrap().gains[0] = UNIT_GAIN + 1;
+    let mut other_bound = record.clone();
+    other_bound.equalization.as_mut().unwrap().max_gain = 1.5;
+    for changed in [off, other_gain, other_bound] {
+        match store.find(&changed).unwrap() {
+            Resumable::Mismatch(mismatch) => assert_eq!(mismatch.field, "equalization"),
+            other => panic!("expected Resumable::Mismatch, got {other:?}"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn job_records_carry_the_equalization_format() {
+    assert_eq!(JOB_RECORD_FORMAT, 4);
 }
 
 #[test]
@@ -1185,6 +1233,7 @@ fn resume_on_the_reference_stack() {
             stack_params: values.clone(),
             align: None,
             crop: None,
+            equalization: None,
             composite_output: composite_path.clone(),
             zmap_output: None,
         };
@@ -1245,6 +1294,7 @@ fn resume_on_the_reference_stack() {
         stack_params: values.clone(),
         align: None,
         crop: None,
+        equalization: None,
         composite_output: composite_path.clone(),
         zmap_output: None,
     };

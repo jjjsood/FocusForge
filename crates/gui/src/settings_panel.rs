@@ -41,7 +41,8 @@ pub(crate) struct ActiveTabParams<'a> {
 /// no values for an unsaved project, the sealed manifest's own for a
 /// reopened one (every key resolves `Explicit`). A manifest with no `align`
 /// seeds the registry default there; one whose run applied no crop seeds
-/// `auto-crop` off.
+/// `auto-crop` off, one whose run was equalized seeds `equalize` on with the
+/// bound it ran with.
 pub(crate) fn seed_algorithm_state(
     project: &GuiProject,
 ) -> (String, ParamValues, String, ParamValues, ParamValues) {
@@ -63,6 +64,13 @@ pub(crate) fn seed_algorithm_state(
             if manifest.registration.crop.is_none() {
                 project_values.insert("auto-crop".to_string(), ParamValue::Bool(false));
             }
+            if let Some(equalization) = &manifest.registration.equalization {
+                project_values.insert("equalize".to_string(), ParamValue::Bool(true));
+                project_values.insert(
+                    "equalize-max-gain".to_string(),
+                    ParamValue::Float(equalization.max_gain),
+                );
+            }
             (
                 manifest.algorithm.clone(),
                 manifest.params.clone(),
@@ -83,6 +91,12 @@ pub(crate) fn auto_crop_enabled(project_values: &ParamValues) -> bool {
         .unwrap_or(&schema.default)
         .as_bool()
         .expect("auto-crop is a Bool parameter")
+}
+
+/// The gain bound a run's brightness equalization uses, `None` while the
+/// `equalize` switch is off.
+pub(crate) fn equalization_bound(project_values: &ParamValues) -> Option<f64> {
+    focusforge_core::project::equalization_bound(project_values)
 }
 
 /// [`registry::default_stack`]'s id, empty when the registry refuses to name
