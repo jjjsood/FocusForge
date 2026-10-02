@@ -30,13 +30,16 @@ pub struct Registration {
 }
 
 impl Registration {
-    /// Frame `i`'s Q16 brightness gain, unit when the fuse applied none.
-    pub fn gain(&self, i: usize) -> u32 {
+    /// Every frame's Q16 brightness gain, empty when the fuse applied none.
+    pub fn gains(&self) -> &[u32] {
         self.equalization
             .as_ref()
-            .and_then(|e| e.gains.get(i))
-            .copied()
-            .unwrap_or(UNIT_GAIN)
+            .map_or(&[], |e| e.gains.as_slice())
+    }
+
+    /// Frame `i`'s Q16 brightness gain, unit when the fuse applied none.
+    pub fn gain(&self, i: usize) -> u32 {
+        self.gains().get(i).copied().unwrap_or(UNIT_GAIN)
     }
 
     /// Frame `i`'s transform, [`Transform::identity`] past the end.

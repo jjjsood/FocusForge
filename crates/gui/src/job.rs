@@ -617,12 +617,7 @@ impl EditState {
         let frame = self.sources.dimensions();
         let samples_per_pixel = self.sources.frame(0).samples_per_pixel;
         let transforms = self.registration.transforms(self.sources.len());
-        let gains = self
-            .registration
-            .equalization
-            .as_ref()
-            .map_or(&[][..], |e| &e.gains);
-        let gained = GainReader::new(&*self.sources, gains);
+        let gained = GainReader::new(&*self.sources, self.registration.gains());
         let warped = WarpingReader::new(&gained, frame, samples_per_pixel, transforms);
         let sources = Sources {
             reader: &warped,

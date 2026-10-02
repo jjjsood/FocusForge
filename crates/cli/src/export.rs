@@ -214,11 +214,7 @@ fn export_frame(project: &Project, index: usize, path: &Path) -> Result<(), Stri
     let frame_set = open_frame_set(&paths, budget).map_err(|err| err.to_string())?;
     let frame_dims = frame_set.reader.dimensions();
     let transforms = registration.transforms(frame_set.reader.len());
-    let gains = registration
-        .equalization
-        .as_ref()
-        .map_or(&[][..], |e| e.gains.as_slice());
-    let gained = GainReader::new(frame_set.reader.as_ref(), gains);
+    let gained = GainReader::new(frame_set.reader.as_ref(), registration.gains());
     let reader = WarpingReader::new(&gained, frame_dims, composite.samples_per_pixel, transforms);
     let origin = registration.origin();
 
