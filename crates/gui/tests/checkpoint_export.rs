@@ -63,7 +63,7 @@ fn open_fused_tab(controller: &mut AppController, name: &str, count: usize) {
 /// Saves the active, never-saved tab to the path the save dialog proposes.
 fn save_to_proposed(controller: &mut AppController) -> PathBuf {
     let mut target = None;
-    assert!(controller.save_active_project(|proposed| {
+    assert!(common::save_and_settle(controller, |proposed| {
         target = Some(proposed.to_path_buf());
         target.clone()
     }));

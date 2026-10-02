@@ -541,6 +541,8 @@ export component AppWindow inherits Window {
     // Whether a background stack load is in flight
     // (`AppController::open_paths`), pushed on every `LoadStarted`/`LoadReady`.
     in property <bool> load-active: false;
+    // The loading indicator's wording: "Loading…" for a load, "Saving…" for a save.
+    in property <string> load-caption: "Loading…";
     // Whether the loading indicator's own show threshold has let it become
     // visible -- read by a headless test, with no running window.
     out property <bool> load-indicator-visible: loading-indicator.load-visible;
@@ -925,6 +927,7 @@ export component AppWindow inherits Window {
         width: canvas-ground.width;
         height: canvas-ground.height;
         load-active: root.load-active;
+        caption: root.load-caption;
     }
 
     // `no-frame: true` above means the compositor draws no OS chrome, so

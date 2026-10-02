@@ -236,6 +236,27 @@ pub fn open_and_settle(controller: &mut AppController, paths: &[PathBuf]) -> Ope
         .expect("a load was started, so one outcome is parked")
 }
 
+/// Starts the active tab's save, blocks until its worker finishes and
+/// settles it -- `AppController::start_save_active_project` writes
+/// off-thread, so a test that needs the outcome synchronously waits for it
+/// here. A save that keeps a modified live as a checkpoint may start the
+/// row's background render; it is waited out too, so no render outlives the
+/// test. `true` when the save started and wrote.
+#[allow(dead_code)]
+pub fn save_and_settle(
+    controller: &mut AppController,
+    pick: impl FnOnce(&Path) -> Option<PathBuf>,
+) -> bool {
+    let wrote = controller.start_save_active_project(pick) && {
+        controller.join_save();
+        controller.settle_save() == Some(true)
+    };
+    while !controller.settle_checkpoint_render() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    wrote
+}
+
 /// Answers the pending grouping question, blocks until its worker finishes,
 /// and settles it -- `AppController::answer_question` runs off-thread too,
 /// the same as [`open_and_settle`].

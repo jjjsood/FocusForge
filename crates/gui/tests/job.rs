@@ -1093,7 +1093,7 @@ fn fuse_stack_is_refused_while_a_field_is_in_violation() {
 /// and returns that path.
 fn save_to_proposed(controller: &mut AppController) -> PathBuf {
     let mut target = None;
-    assert!(controller.save_active_project(|proposed| {
+    assert!(common::save_and_settle(controller, |proposed| {
         target = Some(proposed.to_path_buf());
         target.clone()
     }));
@@ -3771,14 +3771,8 @@ fn a_fuse_asks_before_dropping_unsaved_ops() {
     let mut c = painted_tab("fuse_asks_run_again", 2, 1);
     assert!(!c.start_fuse());
     c.close_guard_confirmed();
-    let start = Instant::now();
-    while c.job_view().fraction <= 0.0 {
-        assert!(
-            start.elapsed() < Duration::from_secs(60),
-            "the run never ticked"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    // Held before the run can reach its last boundary: a two-frame run
+    // that is only paused once it has ticked can finish first.
     c.pause_or_resume();
     c.cancel_fuse();
     settle_all(&mut c);
@@ -4929,4 +4923,524 @@ mod gpu_fusion {
     fn gpu_fusion_matches_cpu_with_one_frame_excluded() {
         assert_gpu_matches_cpu("gpu_fusion_excluded", 8, Some(3));
     }
+}
+
+// ---------------------------------------------------------------------
+// Saving writes on a worker: the write, the frozen history, and what close
+// and quit wait for.
+// ---------------------------------------------------------------------
+
+/// A save target beneath a regular file -- a write there fails on every
+/// filesystem, with no permission change.
+fn unwritable_target(name: &str) -> PathBuf {
+    let file = common::tree(name).join("plain");
+    std::fs::write(&file, b"not a directory").unwrap();
+    file.join("saved.ffp")
+}
+
+/// The composite and Z-Map of every fused checkpoint the active tab holds in
+/// memory, oldest first.
+fn held_paths(controller: &AppController) -> Vec<PathBuf> {
+    controller
+        .held_checkpoints()
+        .iter()
+        .flat_map(|h| [h.composite.clone(), h.zmap.clone()])
+        .collect()
+}
+
+/// The selected flag of every listed row, in order.
+fn selected_rows(controller: &AppController) -> Vec<bool> {
+    controller
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .filter(|entry| entry.id.is_some())
+        .map(|entry| entry.selected)
+        .collect()
+}
+
+/// The flat panel index of the first listed row that is not selected.
+fn unselected_row(controller: &AppController) -> usize {
+    controller
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .position(|entry| entry.id.is_some() && !entry.selected)
+        .expect("a listed row other than the selected one")
+}
+
+#[test]
+fn the_write_runs_on_the_worker() {
+    for opened in [false, true] {
+        let name = format!("write_on_worker_{opened}");
+        let mut controller = controller_with_frames(&name, 2);
+        fuse_and_settle(&mut controller);
+        let target = common::tree(&format!("{name}_target")).join("saved.ffp");
+        if opened {
+            assert!(common::save_and_settle(&mut controller, |_| Some(
+                target.clone()
+            )));
+            fuse_and_settle(&mut controller);
+        }
+        let before = std::fs::metadata(&target).ok().map(|m| m.len());
+
+        assert!(controller.start_save_active_project(|_| Some(target.clone())));
+        assert!(controller.save_in_flight());
+        controller.join_save();
+        let after = std::fs::metadata(&target)
+            .expect("the worker wrote before anything settled")
+            .len();
+        assert_ne!(Some(after), before, "the worker wrote the new checkpoint");
+        assert!(
+            controller.project_tabs()[0].unsaved,
+            "nothing is applied until the outcome is settled"
+        );
+
+        let started = Instant::now();
+        assert_eq!(controller.settle_save(), Some(true));
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "settling only applies a computed result: {:?}",
+            started.elapsed()
+        );
+        assert!(!controller.project_tabs()[0].unsaved);
+        assert!(!controller.save_in_flight());
+        assert_eq!(controller.settle_save(), None, "nothing is parked twice");
+    }
+}
+
+#[test]
+fn the_bridge_never_calls_the_blocking_save_entries() {
+    let bridge = std::fs::read_to_string(common::src_dir().join("bridge.rs")).unwrap();
+    let code = common::strip_line_comments(&bridge);
+    for blocking in [
+        ".save_active_project(",
+        ".save_and_close(",
+        ".save_all_and_quit(",
+        ".close_guard_secondary_pressed(",
+        ".join_save(",
+        ".finish_saves(",
+    ] {
+        assert!(!code.contains(blocking), "bridge.rs calls {blocking}");
+    }
+}
+
+#[test]
+fn a_running_save_reads_saving_on_the_loading_indicator() {
+    use std::sync::Arc;
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+
+    let mut controller = controller_with_frames("saving_caption", 2);
+    fuse_and_settle(&mut controller);
+    // Saved once first, so the next save appends onto its own file and never
+    // opens a file dialog.
+    let target = common::tree("saving_caption_target").join("saved.ffp");
+    assert!(common::save_and_settle(&mut controller, |_| Some(
+        target.clone()
+    )));
+    fuse_and_settle(&mut controller);
+
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    assert_eq!(app.get_load_caption(), "Loading…");
+
+    app.invoke_projects_save_project_requested();
+    assert!(app.get_load_active(), "a running save shows the indicator");
+    assert_eq!(app.get_load_caption(), "Saving…");
+
+    let mut controller = controller.lock().unwrap();
+    controller.join_save();
+    assert_eq!(controller.settle_save(), Some(true));
+    focusforge_gui::bridge::push_busy(&app, &controller);
+    assert!(!app.get_load_active());
+    assert_eq!(app.get_load_caption(), "Loading…");
+}
+
+#[test]
+fn a_saving_tab_history_is_frozen() {
+    let mut c = controller_with_two_tabs("history_frozen");
+    let fused = Instant::now();
+    fuse_and_settle(&mut c);
+    let fuse_time = fused.elapsed();
+    paint_strokes(&mut c, 1);
+    assert!(c.save_checkpoint());
+    c.set_mode(ShellMode::Stacking);
+    let rows = c.checkpoints_panel().row_count;
+    assert_eq!(rows, 2);
+    let selected = selected_rows(&c);
+    let target = common::tree("history_frozen_target").join("saved.ffp");
+
+    assert!(c.start_save_active_project(|_| Some(target.clone())));
+    assert!(c.start_fuse(), "a run may start on the saving tab");
+    c.join_save();
+
+    // Every history change is refused.
+    let row = unselected_row(&c);
+    let id = c.checkpoints_panel().entries[row].id.clone().unwrap();
+    c.select_checkpoint_row(row);
+    assert!(c.pending_restore_copy().is_none());
+    assert_eq!(selected_rows(&c), selected, "no row was restored");
+    c.request_checkpoint_delete(row);
+    assert!(c.pending_checkpoint_delete_copy().is_none());
+    assert!(!c.queue_checkpoint_delete(&id));
+    assert_eq!(c.checkpoints_panel().row_count, rows);
+    c.request_close(0);
+    assert_eq!(c.project_tabs().len(), 2, "the saving tab stays open");
+    assert!(c.pending_close().is_none());
+
+    // A run that finished on the saving tab waits for the save.
+    // Twice the time the first run took is long enough for this one to end.
+    let waited = Instant::now();
+    while waited.elapsed() < fuse_time * 2 {
+        assert!(
+            c.settle_job().is_none(),
+            "a run settled on the saving tab mid-save"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(c.settle_save(), Some(true));
+    common::wait_for_settle(&mut c, Duration::from_secs(60))
+        .expect("the run commits once the save settled");
+    assert_eq!(c.held_checkpoints().len(), 1);
+
+    // A stroke applies while saving; keeping it as a checkpoint does not.
+    assert!(c.start_save_active_project(|_| panic!("an opened tab never asks where")));
+    common::enter_editor(&mut c);
+    common::paint(&mut c, dab(30));
+    assert!(!c.save_checkpoint());
+    assert_eq!(live_ops(&c), 1, "the stroke stays live");
+    c.join_save();
+    assert_eq!(c.settle_save(), Some(true));
+    c.set_mode(ShellMode::Stacking);
+
+    // Another tab stays live while this one saves again.
+    assert!(c.start_save_active_project(|_| panic!("an opened tab never asks where")));
+    c.select_project(1);
+    fuse_and_settle(&mut c);
+    fuse_and_settle(&mut c);
+    assert_eq!(c.checkpoint_count(), Some(2));
+    let before = selected_rows(&c);
+    let older = unselected_row(&c);
+    c.select_checkpoint_row(older);
+    assert_ne!(selected_rows(&c), before, "another tab still selects rows");
+    assert!(c.save_in_flight());
+    c.finish_saves();
+}
+
+#[test]
+fn a_saving_tab_cannot_keep_or_discard_a_parked_run() {
+    let (mut c, _) = parked_controller("frozen_parked");
+    c.keep_fused().expect("the first parked run is kept");
+    assert!(c.start_fuse());
+    assert!(
+        common::wait_for_settle(&mut c, Duration::from_secs(60)).is_none(),
+        "the second run parks too"
+    );
+    assert!(c.pending_divergence().is_some());
+    let target = common::tree("frozen_parked_target").join("saved.ffp");
+
+    assert!(c.start_save_active_project(|_| Some(target.clone())));
+    assert!(c.keep_fused().is_none(), "Keep is refused while saving");
+    c.discard_fused();
+    assert!(
+        c.pending_divergence().is_some(),
+        "Discard is refused while saving"
+    );
+    c.finish_saves();
+    assert!(c.keep_fused().is_some(), "Keep works once the save settled");
+}
+
+#[test]
+fn a_save_leaves_only_later_strokes_unsaved() {
+    for opened in [false, true] {
+        let name = format!("later_strokes_{opened}");
+        let target = common::tree(&format!("{name}_target")).join("saved.ffp");
+        let mut c = painted_tab(&name, 2, 1);
+        if opened {
+            assert!(common::save_and_settle(&mut c, |_| Some(target.clone())));
+            fuse_and_settle(&mut c);
+            paint_strokes(&mut c, 1);
+            c.set_mode(ShellMode::Stacking);
+        }
+        assert!(c.save_checkpoint(), "a checkpoint in memory");
+        common::paint(&mut c, dab(40));
+        let written = held_paths(&c);
+        assert!(!written.is_empty());
+
+        assert!(c.start_save_active_project(|_| Some(target.clone())));
+        common::paint(&mut c, dab(50));
+        c.join_save();
+        assert_eq!(c.settle_save(), Some(true));
+
+        assert!(c.held_checkpoints().is_empty(), "nothing stays in memory");
+        assert!(
+            written.iter().all(|p| !p.exists()),
+            "the written files are gone"
+        );
+        assert!(
+            !c.checkpoints_panel().entries.iter().any(is_held),
+            "no row is in memory"
+        );
+        assert_eq!(live_ops(&c), 1, "only the stroke made meanwhile is live");
+        assert!(c.project_tabs()[0].unsaved);
+        let saved = saved_rows(&target).len();
+
+        assert!(common::save_and_settle(&mut c, |_| panic!(
+            "an opened tab never asks where"
+        )));
+        let rows = saved_rows(&target);
+        assert_eq!(rows.len(), saved + 1, "the later stroke is written");
+        assert!(rows.iter().any(|row| row.2 == 1 && !row.3));
+        assert_eq!(live_ops(&c), 0);
+    }
+}
+
+#[test]
+fn a_failed_save_under_a_file_keeps_everything_held() {
+    let mut controller = controller_with_frames("failed_under_file", 2);
+    fuse_and_settle(&mut controller);
+    let held_before = held_paths(&controller);
+    let rows = controller.checkpoints_panel().row_count;
+    let target = unwritable_target("failed_under_file_target");
+
+    assert!(!common::save_and_settle(&mut controller, |_| Some(
+        target.clone()
+    )));
+    let notification = controller
+        .take_settled_failure()
+        .expect("a failed save says why");
+    assert_eq!(notification.operation, job::FailedOperation::Save);
+    assert_eq!(notification.target, Some(target.clone()));
+    assert!(
+        notification.message.contains(&target.display().to_string()),
+        "{}",
+        notification.message
+    );
+    assert_eq!(held_paths(&controller), held_before);
+    assert!(held_before.iter().all(|p| p.is_file()));
+    assert_eq!(controller.checkpoints_panel().row_count, rows);
+    assert!(!target.exists());
+    assert!(controller.project_tabs()[0].unsaved);
+    assert!(controller.save_enabled(), "the save can be tried again");
+    assert!(!controller.save_in_flight());
+
+    controller.request_close(0);
+    assert!(controller.pending_close().is_some());
+    assert!(controller.start_save_and_close(|_| Some(target.clone())));
+    controller.finish_saves();
+    assert!(controller.pending_close().is_none(), "no question is left");
+    assert_eq!(controller.project_tabs().len(), 1, "the tab stays open");
+    assert_eq!(held_paths(&controller), held_before);
+    assert_eq!(controller.checkpoints_panel().row_count, rows);
+    let notification = controller
+        .take_settled_failure()
+        .expect("Save and close says why too");
+    assert_eq!(notification.target, Some(target));
+}
+
+#[test]
+fn a_second_save_is_refused_while_one_runs() {
+    let mut controller = controller_with_two_tabs("second_save_refused");
+    fuse_and_settle(&mut controller);
+    controller.select_project(1);
+    fuse_and_settle(&mut controller);
+    let target = common::tree("second_save_refused_target").join("first.ffp");
+
+    controller.select_project(0);
+    assert!(controller.start_save_active_project(|_| Some(target.clone())));
+    assert!(controller.save_in_flight());
+    assert!(!controller.save_enabled());
+    assert!(
+        !controller.start_save_active_project(|_| panic!("refused before asking")),
+        "the saving tab cannot save twice"
+    );
+    controller.select_project(1);
+    assert!(!controller.save_enabled(), "no tab can start a second save");
+    assert!(!controller.start_save_active_project(|_| panic!("refused before asking")));
+
+    controller.finish_saves();
+    assert!(
+        controller.save_enabled(),
+        "the other tab can save afterwards"
+    );
+}
+
+#[test]
+fn save_and_close_closes_only_after_the_write() {
+    let mut controller = controller_with_frames("close_after_write", 2);
+    fuse_and_settle(&mut controller);
+    let target = common::tree("close_after_write_target").join("saved.ffp");
+
+    controller.request_close(0);
+    assert!(controller.pending_close().is_some());
+    assert!(controller.start_save_and_close(|_| Some(target.clone())));
+    assert!(
+        controller.pending_close().is_none(),
+        "the question closes at once"
+    );
+    controller.request_close_at(0, Instant::now());
+    assert!(
+        controller.pending_close().is_none(),
+        "the saving tab is not asked"
+    );
+    controller.close_project(0);
+    assert_eq!(controller.project_tabs().len(), 1, "nor closed");
+    assert!(!controller.save_enabled());
+
+    controller.join_save();
+    assert_eq!(controller.project_tabs().len(), 1, "open until settled");
+    assert_eq!(controller.settle_save(), Some(true));
+    assert!(controller.project_tabs().is_empty());
+    let chain = Project::open(&target).unwrap().checkpoint_chain().unwrap();
+    assert_eq!(chain.len(), 1);
+
+    // A stroke painted meanwhile is unsaved work: the question comes back.
+    let mut controller = controller_with_frames("close_asks_again", 2);
+    fuse_and_settle(&mut controller);
+    common::enter_editor(&mut controller);
+    let target = common::tree("close_asks_again_target").join("saved.ffp");
+    controller.request_close(0);
+    assert!(controller.start_save_and_close(|_| Some(target.clone())));
+    common::paint(&mut controller, dab(20));
+    controller.finish_saves();
+    assert_eq!(controller.project_tabs().len(), 1, "new work keeps the tab");
+    assert!(
+        controller.pending_close().is_some(),
+        "the question is raised again"
+    );
+    assert_eq!(live_ops(&controller), 1);
+}
+
+#[test]
+fn save_all_and_quit_quits_only_after_every_write() {
+    let outer = "quit_after_writes";
+    let mut controller = controller_with_two_tabs(outer);
+    fuse_and_settle(&mut controller);
+    controller.select_project(1);
+    fuse_and_settle(&mut controller);
+    let events = record_events(&mut controller);
+    let dir = common::tree(outer);
+    let (a, b) = (dir.join("a.ffp"), dir.join("b.ffp"));
+    let asked = std::cell::Cell::new(0);
+    controller.window_close();
+    assert!(controller.start_save_all_and_quit(|_| {
+        asked.set(asked.get() + 1);
+        Some(if asked.get() == 1 {
+            a.clone()
+        } else {
+            b.clone()
+        })
+    }));
+    assert_eq!(
+        asked.get(),
+        2,
+        "every picker answers before the first write"
+    );
+    assert_eq!(count_of(&events, ShellEvent::WindowCloseRequested), 0);
+    controller.join_save();
+    assert_eq!(controller.settle_save(), Some(true));
+    assert_eq!(
+        count_of(&events, ShellEvent::WindowCloseRequested),
+        0,
+        "one write of two"
+    );
+    controller.join_save();
+    assert_eq!(controller.settle_save(), Some(true));
+    assert_eq!(count_of(&events, ShellEvent::WindowCloseRequested), 1);
+    assert!(a.is_file() && b.is_file());
+
+    let outer = "quit_after_writes_failing";
+    let mut controller = controller_with_two_tabs(outer);
+    fuse_and_settle(&mut controller);
+    controller.select_project(1);
+    fuse_and_settle(&mut controller);
+    let held_b = held_paths(&controller);
+    let events = record_events(&mut controller);
+    let a = common::tree(outer).join("a.ffp");
+    let blocked = unwritable_target(&format!("{outer}_blocked"));
+    let asked = std::cell::Cell::new(0);
+    controller.window_close();
+    assert!(controller.start_save_all_and_quit(|_| {
+        asked.set(asked.get() + 1);
+        Some(if asked.get() == 1 {
+            a.clone()
+        } else {
+            blocked.clone()
+        })
+    }));
+    controller.finish_saves();
+    assert_eq!(
+        count_of(&events, ShellEvent::WindowCloseRequested),
+        0,
+        "a failed write cancels the quit"
+    );
+    assert!(a.is_file(), "the first tab is saved");
+    controller.select_project(0);
+    assert!(controller.held_checkpoints().is_empty());
+    controller.select_project(1);
+    assert_eq!(held_paths(&controller), held_b);
+    assert!(held_b.iter().all(|p| p.is_file()));
+
+    // A declined pick cancels the quit and keeps the saves already queued.
+    let outer = "quit_after_writes_declined";
+    let mut controller = controller_with_two_tabs(outer);
+    fuse_and_settle(&mut controller);
+    controller.select_project(1);
+    fuse_and_settle(&mut controller);
+    let held_b = held_paths(&controller);
+    let events = record_events(&mut controller);
+    let a = common::tree(outer).join("a.ffp");
+    let asked = std::cell::Cell::new(0);
+    controller.window_close();
+    assert!(!controller.start_save_all_and_quit(|_| {
+        asked.set(asked.get() + 1);
+        (asked.get() == 1).then(|| a.clone())
+    }));
+    controller.finish_saves();
+    assert!(
+        a.is_file(),
+        "the first tab saved before the pick was declined"
+    );
+    assert_eq!(count_of(&events, ShellEvent::WindowCloseRequested), 0);
+    assert!(controller.pending_quit_copy().is_none());
+    assert_eq!(
+        held_paths(&controller),
+        held_b,
+        "the second tab keeps its checkpoint"
+    );
+}
+
+#[test]
+fn closing_the_window_during_a_save_all_quit_raises_no_second_question() {
+    let outer = "quit_then_close_again";
+    let mut controller = controller_with_two_tabs(outer);
+    fuse_and_settle(&mut controller);
+    controller.select_project(1);
+    fuse_and_settle(&mut controller);
+    let dir = common::tree(outer);
+    let (a, b) = (dir.join("a.ffp"), dir.join("b.ffp"));
+    let asked = std::cell::Cell::new(0);
+    controller.window_close();
+    assert!(controller.start_save_all_and_quit(|_| {
+        asked.set(asked.get() + 1);
+        Some(if asked.get() == 1 {
+            a.clone()
+        } else {
+            b.clone()
+        })
+    }));
+    controller.window_close();
+    assert!(
+        controller.pending_quit_copy().is_none(),
+        "the quit is already under way"
+    );
+    controller.finish_saves();
 }

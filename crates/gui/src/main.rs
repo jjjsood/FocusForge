@@ -558,6 +558,10 @@ fn run_window<T: ComponentHandle + 'static>(
     }
 
     let run_result = app.run();
+    // Quitting never interrupts a write in progress.
+    if let Some(controller) = &controller {
+        controller.lock().unwrap().finish_saves();
+    }
     if let Some(app) = app_handle.and_then(|app| app.upgrade()) {
         app.set_frame_source(slint::Image::default());
         app.set_composite_source(slint::Image::default());

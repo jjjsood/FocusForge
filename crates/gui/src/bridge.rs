@@ -259,6 +259,17 @@ impl Canvas {
 thread_local! {
     /// What the worker's wake runs on the event loop: publish, then show.
     static PREPARED_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+    /// What a save worker's wake runs on the event loop: settle the save,
+    /// then show its outcome.
+    static SAVE_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// Shows the loading indicator while a load or a save is running, worded
+/// for a save whenever one is.
+pub fn push_busy(app: &AppWindow, controller: &AppController) {
+    let saving = controller.save_in_flight();
+    app.set_load_caption(if saving { "Saving…" } else { "Loading…" }.into());
+    app.set_load_active(controller.load_in_flight() || saving);
 }
 
 /// Publishes the worker's completed reads and shows every pane where the
@@ -547,6 +558,7 @@ fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::Mea
         | ShellEvent::LoadStarted
         | ShellEvent::LoadReady
         | ShellEvent::ImportReady
+        | ShellEvent::SaveReady
         | ShellEvent::CheckpointsChanged => InputSurface::Other,
         ShellEvent::ProjectsChanged
         | ShellEvent::TabScrollChanged
@@ -1624,19 +1636,21 @@ fn open_recent(
     );
 }
 
-/// Runs one of the controller's saves -- `Save project`, its `Ctrl+S` twin
-/// and the close question's `Save and close`. A failed save closes the
-/// projects overlay before opening the failure toast.
+/// Starts one of the controller's saves -- `Save project`, its `Ctrl+S` twin
+/// and the close question's `Save and close` -- and shows the busy
+/// indicator. A save that cannot start closes the projects overlay before
+/// opening the failure toast; [`publish_saved`] shows the outcome of one
+/// that does.
 fn save_project(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
     app_weak: &slint::Weak<AppWindow>,
     toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
-    save: impl FnOnce(&mut AppController) -> bool,
+    start: impl FnOnce(&mut AppController) -> bool,
 ) {
     let failure = {
         let mut controller = controller.lock().unwrap();
-        if save(&mut controller) {
+        if start(&mut controller) {
             None
         } else {
             controller.take_settled_failure()
@@ -1645,17 +1659,46 @@ fn save_project(
     let Some(app) = app_weak.upgrade() else {
         return;
     };
+    show_save_state(&app, controller, canvas, toast_timer, failure);
+}
+
+/// Publishes a save worker's result: settles it, then shows what it changed
+/// and any failure it noted.
+fn publish_saved(
+    app: &AppWindow,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+    toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
+) {
+    let failure = {
+        let mut controller = controller.lock().unwrap();
+        controller.settle_save();
+        controller.take_settled_failure()
+    };
+    show_save_state(app, controller, canvas, toast_timer, failure);
+}
+
+/// Toasts a failed save over a closed projects overlay, then refreshes the
+/// busy indicator, the tabs and the canvas.
+fn show_save_state(
+    app: &AppWindow,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+    toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
+    failure: Option<job::Notification>,
+) {
     if let Some(notification) = failure {
         controller.lock().unwrap().close_projects_overlay();
         open_job_toast(
-            &app,
+            app,
             notification.operation.summary().to_string(),
             toast_timer,
         );
     }
-    push_projects(&app, controller);
+    push_busy(app, &controller.lock().unwrap());
+    push_projects(app, controller);
     direct_publication_scope(InputSurface::Gallery);
-    repaint(&app, controller, canvas);
+    repaint(app, controller, canvas);
 }
 
 /// Wires every callback in `app` to `controller`, and returns [`Installed`]
@@ -1708,6 +1751,20 @@ pub fn install(
                 }
             });
         }));
+    }
+
+    {
+        let app_weak = app.as_weak();
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let toast_timer = toast_timer.clone();
+        SAVE_HANDLER.with(|slot| {
+            *slot.borrow_mut() = Some(Rc::new(move || {
+                if let Some(app) = app_weak.upgrade() {
+                    publish_saved(&app, &controller, &canvas, &toast_timer);
+                }
+            }));
+        });
     }
 
     app.on_window_drag_requested({
@@ -2140,7 +2197,7 @@ pub fn install(
                 ChromeKey::SaveProject => {
                     record_gallery_input();
                     save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
-                        c.save_active_project(crate::picker::pick_save_project)
+                        c.start_save_active_project(crate::picker::pick_save_project)
                     })
                 }
             }
@@ -2965,7 +3022,7 @@ pub fn install(
         move || {
             record_gallery_input();
             save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
-                c.close_guard_secondary_pressed(crate::picker::pick_save_project)
+                c.start_close_guard_secondary(crate::picker::pick_save_project)
             });
             poll_if_work_pending(&app_weak, &controller, &canvas, &job_timer, &toast_timer);
         }
@@ -3041,7 +3098,7 @@ pub fn install(
         move || {
             record_gallery_input();
             save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
-                c.save_active_project(crate::picker::pick_save_project)
+                c.start_save_active_project(crate::picker::pick_save_project)
             })
         }
     });
@@ -3455,7 +3512,7 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         // The indicator's threshold and fade are the Slint region's own
         // state, driven by `load-active` alone -- it shows no other part of
         // a load's progress, so a tick has nothing to push.
-        ShellEvent::LoadStarted => app.set_load_active(true),
+        ShellEvent::LoadStarted => push_busy(app, &controller.lock().unwrap()),
         ShellEvent::LoadProgress { .. } => {}
         ShellEvent::LoadReady => {
             let outcome = controller.lock().unwrap().settle_open();
@@ -3484,7 +3541,14 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
                 }
                 None => {}
             }
-            app.set_load_active(false);
+            push_busy(app, &controller.lock().unwrap());
+        }
+        // A save worker's result is ready; the handler installed with the
+        // window settles it, since only it reaches the canvas and the toast.
+        ShellEvent::SaveReady => {
+            if let Some(handler) = SAVE_HANDLER.with(|slot| slot.borrow().clone()) {
+                handler();
+            }
         }
         // An import scan (`AppController::add_frames`) is ready to settle.
         // Never touches the canvas: an add either stages a question or

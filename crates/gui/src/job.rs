@@ -1003,6 +1003,9 @@ pub fn open_edit_session(
     })
 }
 
+/// A written project, opened, with the id written per kept entry.
+pub type SavedProject = (Project, Vec<String>);
+
 /// Writes `entries`, each under its own parent, and applies `deletes` at
 /// `target` -- onto the project already there when `onto_existing` -- then
 /// opens the result. `keep` stays stored even when deleted. Returns it with
@@ -1014,7 +1017,7 @@ pub fn save_in_memory(
     deletes: &[ParentRef],
     keep: Option<&ParentRef>,
     onto_existing: bool,
-) -> Result<(Project, Vec<String>), ProjectError> {
+) -> Result<SavedProject, ProjectError> {
     let ids = project::seal_in_memory(target, entries, deletes, keep, onto_existing)?;
     Ok((Project::open(target)?, ids))
 }
