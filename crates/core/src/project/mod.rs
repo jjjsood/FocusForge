@@ -187,7 +187,7 @@ pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     vec![
         ParamDesc {
             id: "align".to_string(),
-            label: "Align frames".to_string(),
+            label: "Enabled".to_string(),
             help: "Registers every frame onto the reference before fusing. \
                    Off fuses the frames as read."
                 .to_string(),
@@ -470,7 +470,7 @@ mod tests {
     fn project_params_holds_the_align_and_auto_crop_bool_descriptors() {
         assert_eq!(PROJECT_PARAMS.len(), 2);
         for (desc, id, label) in [
-            (&PROJECT_PARAMS[0], "align", "Align frames"),
+            (&PROJECT_PARAMS[0], "align", "Enabled"),
             (&PROJECT_PARAMS[1], "auto-crop", "Auto-crop"),
         ] {
             assert_eq!(desc.id, id);

@@ -471,6 +471,12 @@ impl LazyAlignBackend {
         &self.adapter
     }
 
+    /// Whether the device a level already opened is lost. `false` before any
+    /// level has opened it: asking never brings the adapter up.
+    pub fn lost(&self) -> bool {
+        matches!(self.selected.get(), Some(Some(backend)) if backend.device_lost())
+    }
+
     /// Brings the backend up on first call and reports the outcome to
     /// `announce` once, as one line.
     fn resolve(&self) -> Option<&'static GpuBackend> {
@@ -546,7 +552,7 @@ fn cpu_fallback_line(reason: &GpuError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{align_backend_for, backend_for, cpu_fallback_line};
+    use super::{LazyAlignBackend, align_backend_for, backend_for, cpu_fallback_line};
     use crate::device::GpuError;
     use focusforge_core::algorithm::{AlignAlgorithm, StackAlgorithm};
     use focusforge_core::align::PyramidalEcc;
@@ -585,6 +591,19 @@ mod tests {
                 assert!(message.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn a_lazy_align_backend_is_not_lost_before_bring_up() {
+        let lazy = LazyAlignBackend {
+            max_vram: None,
+            announce: |_| panic!("asking whether the device is lost must not bring it up"),
+            selected: std::sync::OnceLock::new(),
+            adapter: std::sync::OnceLock::new(),
+        };
+        assert!(!lazy.lost());
+        assert!(lazy.selected.get().is_none(), "no adapter was opened");
+        assert!(lazy.adapter().get().is_none());
     }
 
     #[test]

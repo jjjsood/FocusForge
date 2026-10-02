@@ -855,6 +855,18 @@ fn open_job_toast(
     message: String,
     toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
 ) {
+    open_toast(app, message, "failure", toast_timer);
+}
+
+/// [`open_job_toast`] with `FFToast`'s own `tone`: `"failure"` or the plain
+/// `"info"` notice.
+fn open_toast(
+    app: &AppWindow,
+    message: String,
+    tone: &str,
+    toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
+) {
+    app.set_job_toast_tone(tone.into());
     app.set_job_toast_message(message.into());
     app.set_job_toast_open(true);
     let timer = slint::Timer::default();
@@ -1081,6 +1093,7 @@ pub fn push_settings_panel(app: &AppWindow, controller: &AppController) {
                 menu_open: row.menu_open,
                 heading_state: heading_state_str(row.heading_state).into(),
                 top: row.top,
+                disabled: row.disabled,
             }
         })
         .collect();
@@ -2545,14 +2558,22 @@ pub fn install(
         }
     });
     app.on_divergence_kept({
+        let toast_timer = toast_timer.clone();
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
-            controller.lock().unwrap().keep_fused();
+            let notice = {
+                let mut controller = controller.lock().unwrap();
+                controller.keep_fused();
+                controller.unaligned_notice()
+            };
             if let Some(app) = app_weak.upgrade() {
                 push_projects(&app, &controller);
                 repaint(&app, &controller, &canvas);
+                if let Some(notice) = notice {
+                    open_toast(&app, notice, "info", &toast_timer);
+                }
             }
         }
     });

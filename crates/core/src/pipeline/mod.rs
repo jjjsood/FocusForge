@@ -205,6 +205,11 @@ pub trait StageObserver: Sync {
     fn notice(&self, _message: &str) {}
 }
 
+/// The tail of the [`StageObserver::notice`] raised when the align stage
+/// reran on the CPU after its accelerator failed; the text before it is the
+/// reason.
+pub const ALIGN_RERUN_NOTICE: &str = "; the align stage reran on the CPU";
+
 /// Every early exit from the spine, typed by the stage that raised it.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -430,7 +435,7 @@ pub fn run(
                 align_accounted_bytes = Some(solved.accounted_bytes);
                 align_backend_used = solved.backend_used;
                 if let Some(reason) = &solved.rerun_reason {
-                    observer.notice(&format!("{reason}; the align stage reran on the CPU"));
+                    observer.notice(&format!("{reason}{ALIGN_RERUN_NOTICE}"));
                 }
                 let alignment = solved.alignment;
                 if !align_req.lax && alignment.failure_count() > 0 {

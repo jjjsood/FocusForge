@@ -36,6 +36,7 @@ export struct SettingsRow {
     menu-open: bool,
     heading-state: string,
     top: length,
+    disabled: bool,
 }
 
 /// The section heading currently stuck to the panel's own top edge, drawn
@@ -121,13 +122,14 @@ export component FFSettingsPanel inherits Rectangle {
                     width: 100%;
                     height: 100%;
                     label-text: row.label;
+                    disabled: row.disabled;
                     FFMenu {
                         label: row.value-text;
                         choices: row.choices;
                         choice-ids: row.choice-ids;
                         selected: row.selected;
                         open: row.menu-open;
-                        disabled: !root.enabled;
+                        disabled: !root.enabled || row.disabled;
                         external-list: true;
                         toggled => { root.menu-toggled(row.section, row.id); }
                         option-selected(picked) => { root.algorithm-selected(row.section, picked); }
@@ -138,13 +140,14 @@ export component FFSettingsPanel inherits Rectangle {
                     width: 100%;
                     height: 100%;
                     label-text: row.label;
+                    disabled: row.disabled;
                     FFMenu {
                         label: row.value-text;
                         choices: row.choices;
                         choice-ids: row.choice-ids;
                         selected: row.selected;
                         open: row.menu-open;
-                        disabled: !root.enabled;
+                        disabled: !root.enabled || row.disabled;
                         external-list: true;
                         toggled => { root.menu-toggled(row.section, row.id); }
                         option-selected(picked) => { root.param-text-edited(row.section, row.id, picked); }
@@ -155,11 +158,12 @@ export component FFSettingsPanel inherits Rectangle {
                     width: 100%;
                     height: 100%;
                     label-text: row.label;
+                    disabled: row.disabled;
                     FFSlider {
                         scale: "linear";
                         fraction: row.fraction;
                         value-text: row.value-text;
-                        disabled: !root.enabled;
+                        disabled: !root.enabled || row.disabled;
                         fraction-changed(f) => { root.param-changed(row.section, row.id, f); }
                     }
                 }
@@ -168,11 +172,12 @@ export component FFSettingsPanel inherits Rectangle {
                     width: 100%;
                     height: 100%;
                     label-text: row.label;
+                    disabled: row.disabled;
                     FFSlider {
                         scale: "logarithmic";
                         fraction: row.fraction;
                         value-text: row.value-text;
-                        disabled: !root.enabled;
+                        disabled: !root.enabled || row.disabled;
                         fraction-changed(f) => { root.param-changed(row.section, row.id, f); }
                     }
                 }
@@ -188,7 +193,7 @@ export component FFSettingsPanel inherits Rectangle {
                         alignment: center;
                         FFToggle {
                             on: row.selected == "true";
-                            disabled: !root.enabled;
+                            disabled: !root.enabled || row.disabled;
                             toggled => {
                                 root.param-text-edited(row.section, row.id, row.selected == "true" ? "false" : "true");
                             }
