@@ -176,7 +176,7 @@ fn user_file_overrides_a_default() {
     let dir = tempfile::tempdir().unwrap();
     let defaults = InputTable::default();
 
-    let mut toml = String::from("[input]\nversion = 1\n");
+    let mut toml = String::from("[input]\n");
     for (i, binding) in defaults.bindings.iter().enumerate() {
         if i == 7 {
             // Left absent on purpose -- must keep its default.
@@ -248,7 +248,7 @@ fn partial_out_of_order_single_row_config_leaves_other_rows_at_default() {
     // clobber `bindings[0]` (the wheel row) regardless of which trigger
     // the lone row actually named.
     let dir = tempfile::tempdir().unwrap();
-    let toml = "[input]\nversion = 1\n\n[[input.bindings]]\ntrigger = \"shift+wheel\"\nstacking = \"pan\"\neditor = \"brush-size\"\n";
+    let toml = "[input]\n\n[[input.bindings]]\ntrigger = \"shift+wheel\"\nstacking = \"pan\"\neditor = \"brush-size\"\n";
     fs::write(dir.path().join("settings.toml"), toml).unwrap();
 
     let loaded = input_config::load(dir.path());
@@ -320,51 +320,6 @@ fn partial_out_of_order_single_row_config_leaves_other_rows_at_default() {
 }
 
 #[test]
-fn alt_wheel_row_is_ignored() {
-    // A file carrying an `alt+wheel` row loads without an error, its other
-    // rows apply, and `Alt + Wheel` stays unbound.
-    let dir = tempfile::tempdir().unwrap();
-    let toml = format!(
-        "[input]\nversion = 1\n{}{}",
-        "\n[[input.bindings]]\ntrigger = \"alt+wheel\"\nstacking = \"pan\"\neditor = \"brush-softness\"\n",
-        row_toml(
-            "shift+wheel",
-            Some(Action::Pan),
-            Some(Action::BrushSoftness)
-        ),
-    );
-    fs::write(dir.path().join("settings.toml"), toml).unwrap();
-
-    let loaded = input_config::load(dir.path());
-    assert!(
-        loaded.problems.is_empty(),
-        "unexpected problems: {:?}",
-        loaded
-            .problems
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-    );
-    let shift_wheel = Trigger::Wheel(Modifiers {
-        shift: true,
-        ..NONE
-    });
-    assert_eq!(
-        loaded.table.action(&shift_wheel, ShellMode::Stacking),
-        Some(Action::Pan)
-    );
-    assert_eq!(
-        loaded.table.action(&shift_wheel, ShellMode::Editor),
-        Some(Action::BrushSoftness)
-    );
-    let alt_wheel = Trigger::Wheel(Modifiers { alt: true, ..NONE });
-    for mode in [ShellMode::Stacking, ShellMode::Editor] {
-        assert_eq!(loaded.table.action(&alt_wheel, mode), None, "{mode:?}");
-    }
-    assert_eq!(loaded.table.display_rows().len(), 6);
-}
-
-#[test]
 fn missing_config_is_not_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let loaded = input_config::load(dir.path());
@@ -389,7 +344,7 @@ fn first_run_writes_the_defaults() {
     assert!(written.exists());
     let contents = fs::read_to_string(&written).unwrap();
     assert!(contents.contains("[input]"));
-    assert!(contents.contains("version = 1"));
+    assert!(!contents.contains("version"), "{contents}");
     assert!(contents.contains("trigger = \"wheel\""));
     assert!(
         contents.contains("# FocusForge input map."),
@@ -426,37 +381,6 @@ fn written_defaults_round_trip() {
     }
 }
 
-#[test]
-fn unsupported_version_is_refused_and_not_rewritten() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("settings.toml");
-    let original = "[input]\nversion = 2\n\n[[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\neditor = \"zoom-at-cursor\"\n";
-    fs::write(&path, original).unwrap();
-
-    let loaded = input_config::load(dir.path());
-    assert_eq!(loaded.table, InputTable::default());
-    assert_eq!(loaded.problems.len(), 1);
-    match &loaded.problems[0] {
-        input_config::ConfigError::UnsupportedVersion {
-            path: p,
-            line,
-            found,
-            supported,
-        } => {
-            assert_eq!(p, &path);
-            assert_eq!(*line, 2);
-            assert_eq!(*found, 2);
-            assert_eq!(*supported, 1);
-        }
-        other => panic!("expected UnsupportedVersion, got {other}"),
-    }
-    let message = loaded.problems[0].to_string();
-    assert!(message.contains(&path.display().to_string()), "{message}");
-
-    let after = fs::read_to_string(&path).unwrap();
-    assert_eq!(after, original, "the user's file must not be rewritten");
-}
-
 #[cfg(unix)]
 #[test]
 fn unwritable_config_dir_is_not_fatal() {
@@ -482,8 +406,7 @@ fn unwritable_config_dir_is_not_fatal() {
     assert_eq!(loaded.table, InputTable::default());
 }
 
-/// Writes `toml` (the bare top-level shape: `version = ...`,
-/// `[[bindings]]`) as `settings.toml`'s `[input]` table, loads it, and
+/// Writes `toml` (the bare top-level shape: `[[bindings]]` rows) as `settings.toml`'s `[input]` table, loads it, and
 /// asserts the load fell back to the defaults with exactly one problem --
 /// the common shape every case below shares. Returns that problem alongside
 /// the path it was written to, so a caller can still check a path- or
@@ -516,16 +439,15 @@ fn expect_one_problem(toml: &str) -> (PathBuf, input_config::ConfigError) {
 fn bad_config_is_refused_by_name() {
     // Malformed TOML syntax.
     {
-        let (path, problem) = expect_one_problem("version = 1\n[[bindings]\n");
+        let (path, problem) = expect_one_problem("[[bindings]\n");
         assert!(matches!(problem, input_config::ConfigError::Parse { .. }));
         assert!(problem.to_string().contains(&path.display().to_string()));
     }
 
     // Unknown action name.
     {
-        let (path, problem) = expect_one_problem(
-            "version = 1\n\n[[bindings]]\ntrigger = \"wheel\"\nstacking = \"levitate\"\n",
-        );
+        let (path, problem) =
+            expect_one_problem("[[bindings]]\ntrigger = \"wheel\"\nstacking = \"levitate\"\n");
         match problem {
             input_config::ConfigError::UnknownAction {
                 spelling, path: p, ..
@@ -539,9 +461,8 @@ fn bad_config_is_refused_by_name() {
 
     // Unknown trigger spelling.
     {
-        let (_, problem) = expect_one_problem(
-            "version = 1\n\n[[bindings]]\ntrigger = \"banana-drag\"\nstacking = \"pan\"\n",
-        );
+        let (_, problem) =
+            expect_one_problem("[[bindings]]\ntrigger = \"banana-drag\"\nstacking = \"pan\"\n");
         match problem {
             input_config::ConfigError::UnknownTrigger { spelling, .. } => {
                 assert_eq!(spelling, "banana-drag");
@@ -554,9 +475,8 @@ fn bad_config_is_refused_by_name() {
     // triggers -- the table's rows are display-indexed, so a trigger it has
     // no row for cannot be shown.
     {
-        let (_, problem) = expect_one_problem(
-            "version = 1\n\n[[bindings]]\ntrigger = \"right-click\"\nstacking = \"pan\"\n",
-        );
+        let (_, problem) =
+            expect_one_problem("[[bindings]]\ntrigger = \"right-click\"\nstacking = \"pan\"\n");
         match problem {
             input_config::ConfigError::UnknownTrigger { spelling, .. } => {
                 assert_eq!(spelling, "right-click");
@@ -565,10 +485,26 @@ fn bad_config_is_refused_by_name() {
         }
     }
 
+    // An `alt+wheel` row is a trigger the table has no row for: it refuses
+    // the whole table, the valid `shift+wheel` row before it included.
+    {
+        let (_, problem) = expect_one_problem(
+            "[[bindings]]\ntrigger = \"shift+wheel\"\nstacking = \"pan\"\n\n\
+             [[bindings]]\ntrigger = \"alt+wheel\"\nstacking = \"pan\"\n",
+        );
+        match problem {
+            input_config::ConfigError::UnknownTrigger { spelling, line, .. } => {
+                assert_eq!(spelling, "alt+wheel");
+                assert_eq!(line, 7, "the line of the trigger key in the whole file");
+            }
+            other => panic!("expected UnknownTrigger, got {other}"),
+        }
+    }
+
     // Duplicate trigger within one mode.
     {
         let (_, problem) = expect_one_problem(
-            "version = 1\n\n[[bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\n\n\
+            "[[bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\n\n\
              [[bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n",
         );
         assert!(matches!(
@@ -1024,7 +960,7 @@ fn edit_mode_overrides_are_table_driven() {
     // reachable by rebinding, one detent moving Soft by 5.
     let dir = tempfile::tempdir().unwrap();
     let toml = format!(
-        "[input]\nversion = 1\n{}",
+        "[input]\n{}",
         row_toml(
             &Trigger::Wheel(shift).to_string(),
             Some(Action::PanHorizontal),

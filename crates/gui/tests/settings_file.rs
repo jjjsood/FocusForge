@@ -2,8 +2,8 @@
 
 //! `settings.toml`'s own mechanics: per-table defaults, per-table isolation
 //! on a broken table, saving one table without disturbing another, an
-//! unparseable file left untouched, an unwritable directory not being
-//! fatal, and the one-time migration from `recent.toml` / `input.toml`.
+//! unparseable file left untouched and an unwritable directory not being
+//! fatal.
 
 use std::fs;
 
@@ -23,7 +23,7 @@ fn absent_tables_read_as_defaults() {
 
     // `[input]` present, `[recent]` absent.
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("settings.toml"), "[input]\nversion = 1\n").unwrap();
+    fs::write(dir.path().join("settings.toml"), "[input]\n").unwrap();
     assert!(recent::load(dir.path()).is_empty());
     let loaded = input_config::load(dir.path());
     assert!(loaded.problems.is_empty());
@@ -33,7 +33,7 @@ fn absent_tables_read_as_defaults() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("settings.toml"),
-        "[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\nopened_at = 1\n",
+        "[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\npath = \"/a\"\nopened_at = 1\n",
     )
     .unwrap();
     let entries = recent::load(dir.path());
@@ -51,7 +51,7 @@ fn broken_table_resets_only_itself() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("settings.toml"),
-        "[input]\nversion = 1\n\n[[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n\n\
+        "[input]\n\n[[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n\n\
          [recent]\nentries = 3\n",
     )
     .unwrap();
@@ -81,8 +81,8 @@ fn broken_table_resets_only_itself() {
     // Unknown trigger: "banana-drag" is on line 11.
     {
         let dir = tempfile::tempdir().unwrap();
-        let src = "[recent]\n[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\nopened_at = 1\n\n\
-                   [input]\nversion = 1\n\n[[input.bindings]]\ntrigger = \"banana-drag\"\nstacking = \"pan\"\n";
+        let src = "[recent]\n[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\npath = \"/a\"\nopened_at = 1\n\n\
+                   [input]\n\n[[input.bindings]]\ntrigger = \"banana-drag\"\nstacking = \"pan\"\n";
         fs::write(dir.path().join("settings.toml"), src).unwrap();
         let entries = recent::load(dir.path());
         assert_eq!(entries.len(), 1);
@@ -104,34 +104,12 @@ fn broken_table_resets_only_itself() {
         }
     }
 
-    // Unsupported version: "version = 2" is on line 8.
-    {
-        let dir = tempfile::tempdir().unwrap();
-        let src = "[recent]\n[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\nopened_at = 1\n\n\
-                   [input]\nversion = 2\n\n[[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n";
-        fs::write(dir.path().join("settings.toml"), src).unwrap();
-        let entries = recent::load(dir.path());
-        assert_eq!(entries.len(), 1);
-        let loaded = input_config::load(dir.path());
-        assert_eq!(loaded.problems.len(), 1);
-        match &loaded.problems[0] {
-            input_config::ConfigError::UnsupportedVersion {
-                path, line, found, ..
-            } => {
-                assert_eq!(path, &settings_path_for(dir.path()));
-                assert_eq!(*found, 2);
-                assert_eq!(*line, 8, "must report the line within the whole file");
-            }
-            other => panic!("expected UnsupportedVersion, got {other}"),
-        }
-    }
-
     // Duplicate trigger: two `[[input.bindings]]` rows naming "wheel"; the
     // first row's span starts on line 10, the duplicate's on line 14.
     {
         let dir = tempfile::tempdir().unwrap();
-        let src = "[recent]\n[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\nopened_at = 1\n\n\
-                   [input]\nversion = 1\n\n[[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\n\n\
+        let src = "[recent]\n[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\npath = \"/a\"\nopened_at = 1\n\n\
+                   [input]\n\n[[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\n\n\
                    [[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n";
         fs::write(dir.path().join("settings.toml"), src).unwrap();
         let entries = recent::load(dir.path());
@@ -161,10 +139,9 @@ fn broken_table_resets_only_itself() {
 fn saving_recent_keeps_hand_edited_input() {
     for input_first in [true, false] {
         let dir = tempfile::tempdir().unwrap();
-        let input_block = "[input]\n# a hand edit\nversion = 1\n\n[[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n";
+        let input_block = "[input]\n# a hand edit\n\n[[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n";
         let export_block = "[export]\nformat = \"tiff\"\n";
-        let recent_block =
-            "[recent]\n[[recent.entries]]\nname = \"old\"\nfolder = \"/old\"\nopened_at = 1\n";
+        let recent_block = "[recent]\n[[recent.entries]]\nname = \"old\"\nfolder = \"/old\"\npath = \"/old\"\nopened_at = 1\n";
         let src = if input_first {
             format!("{input_block}\n{export_block}\n{recent_block}")
         } else {
@@ -178,13 +155,13 @@ fn saving_recent_keeps_hand_edited_input() {
                 RecentEntry {
                     name: "one".into(),
                     folder: "/one".into(),
-                    path: None,
+                    path: "/one".into(),
                     opened_at: 10,
                 },
                 RecentEntry {
                     name: "two".into(),
                     folder: "/two".into(),
-                    path: None,
+                    path: "/two".into(),
                     opened_at: 20,
                 },
             ],
@@ -235,9 +212,6 @@ fn unparseable_file_is_never_overwritten() {
             other => panic!("expected Parse, got {other}"),
         }
 
-        assert!(!dir.path().join("recent.toml").exists());
-        assert!(!dir.path().join("input.toml").exists());
-
         let result = recent::save(dir.path(), &[]);
         assert!(result.is_err(), "{original:?}");
 
@@ -253,7 +227,7 @@ fn non_utf8_file_is_never_overwritten() {
     // table on the very next `[recent]` save.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("settings.toml");
-    let original: &[u8] = b"[input]\nversion = 1\n# \xff\xfe garbage\n";
+    let original: &[u8] = b"[input]\n# \xff\xfe garbage\n";
     fs::write(&path, original).unwrap();
 
     assert!(recent::load(dir.path()).is_empty());
@@ -294,7 +268,7 @@ fn unwritable_config_dir_is_not_fatal() {
         &[RecentEntry {
             name: "a".into(),
             folder: "/a".into(),
-            path: None,
+            path: "/a".into(),
             opened_at: 1,
         }],
     );
@@ -307,7 +281,7 @@ fn unwritable_config_dir_is_not_fatal() {
     let mut controller = focusforge_gui::AppController::new();
     controller.install_recent(recent::load(&sub), sub.clone());
     fs::set_permissions(&sub, fs::Permissions::from_mode(0o500)).unwrap();
-    controller.record_recent_for_test("b".into(), "/b".into(), None, 2);
+    controller.record_recent_for_test("b".into(), "/b".into(), "/b".into(), 2);
     assert_eq!(controller.recent_rows(0).len(), 1);
     fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
 
@@ -326,7 +300,7 @@ fn unwritable_config_dir_is_not_fatal() {
         &[RecentEntry {
             name: "a".into(),
             folder: "/a".into(),
-            path: None,
+            path: "/a".into(),
             opened_at: 1,
         }],
     );
@@ -334,102 +308,58 @@ fn unwritable_config_dir_is_not_fatal() {
 }
 
 #[test]
-fn migrates_old_files_once_and_leaves_them() {
-    let dir = tempfile::tempdir().unwrap();
-    let old_recent = "[[entries]]\nname = \"legacy\"\nfolder = \"/legacy\"\nopened_at = 5\n";
-    let old_input =
-        "# a hand comment\nversion = 1\n\n[[bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n";
-    fs::write(dir.path().join("recent.toml"), old_recent).unwrap();
-    fs::write(dir.path().join("input.toml"), old_input).unwrap();
+fn old_recent_and_input_files_are_not_read() {
+    let old_recent = "[[entries]]\nname = \"old\"\nfolder = \"/old\"\nopened_at = 5\n";
+    let old_input = "[[bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n";
+    let export_only = "[export]\nformat = \"tiff\"\n";
 
-    let entries = recent::load(dir.path());
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].name, "legacy");
+    for settings in [None, Some(export_only)] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("recent.toml"), old_recent).unwrap();
+        fs::write(dir.path().join("input.toml"), old_input).unwrap();
+        if let Some(text) = settings {
+            fs::write(dir.path().join("settings.toml"), text).unwrap();
+        }
 
-    let loaded = input_config::load(dir.path());
-    assert!(loaded.problems.is_empty());
-    assert_eq!(
-        loaded.table.bindings[0].stacking,
-        Some(focusforge_gui::input_map::Action::Pan)
-    );
-    match loaded.provenance {
-        Provenance::File { path, .. } => assert_eq!(path, dir.path().join("settings.toml")),
-        other => panic!("expected Provenance::File, got {other:?}"),
+        assert!(recent::load(dir.path()).is_empty());
+        let loaded = input_config::load(dir.path());
+        assert!(loaded.problems.is_empty());
+        assert_eq!(loaded.table, InputTable::default());
+        assert_eq!(loaded.provenance, Provenance::Defaults);
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("recent.toml")).unwrap(),
+            old_recent
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("input.toml")).unwrap(),
+            old_input
+        );
+        match settings {
+            None => assert!(!dir.path().join("settings.toml").exists()),
+            Some(text) => assert_eq!(
+                fs::read_to_string(dir.path().join("settings.toml")).unwrap(),
+                text
+            ),
+        }
     }
-
-    let settings = fs::read_to_string(dir.path().join("settings.toml")).unwrap();
-    assert!(settings.contains("[recent]"));
-    assert!(settings.contains("legacy"));
-    assert!(settings.contains("[input]"));
-    assert!(settings.contains("# a hand comment"));
-
-    // The old files are left exactly as they were.
-    assert_eq!(
-        fs::read_to_string(dir.path().join("recent.toml")).unwrap(),
-        old_recent
-    );
-    assert_eq!(
-        fs::read_to_string(dir.path().join("input.toml")).unwrap(),
-        old_input
-    );
-
-    // A second load reads settings.toml only: editing the old files after
-    // migration changes nothing.
-    fs::write(
-        dir.path().join("recent.toml"),
-        "[[entries]]\nname = \"ignored\"\nfolder = \"/x\"\nopened_at = 9\n",
-    )
-    .unwrap();
-    fs::write(
-        dir.path().join("input.toml"),
-        "version = 1\n\n[[bindings]]\ntrigger = \"wheel\"\nstacking = \"undo\"\n",
-    )
-    .unwrap();
-    let entries_again = recent::load(dir.path());
-    assert_eq!(entries_again.len(), 1);
-    assert_eq!(entries_again[0].name, "legacy");
-    let loaded_again = input_config::load(dir.path());
-    assert!(loaded_again.problems.is_empty());
-    assert_eq!(
-        loaded_again.table.bindings[0].stacking,
-        Some(focusforge_gui::input_map::Action::Pan),
-        "the edited input.toml must be ignored -- settings.toml already holds [input]"
-    );
 }
 
 #[test]
-fn refused_old_input_is_not_migrated() {
+fn recent_row_without_path_reads_as_empty() {
     let dir = tempfile::tempdir().unwrap();
-    let old_path = dir.path().join("input.toml");
-    fs::write(
-        &old_path,
-        "version = 1\n\n[[bindings]]\ntrigger = \"banana-drag\"\nstacking = \"pan\"\n",
-    )
-    .unwrap();
+    let path = dir.path().join("settings.toml");
+    let src = "[input]\n\n[[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n\n\
+               [[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\npath = \"/a\"\nopened_at = 1\n\n\
+               [[recent.entries]]\nname = \"b\"\nfolder = \"/b\"\nopened_at = 2\n";
+    fs::write(&path, src).unwrap();
 
-    let loaded = input_config::load(dir.path());
-    assert_eq!(loaded.table, InputTable::default());
-    assert_eq!(loaded.problems.len(), 1);
-    match &loaded.problems[0] {
-        input_config::ConfigError::UnknownTrigger { path, .. } => assert_eq!(path, &old_path),
-        other => panic!("expected UnknownTrigger, got {other}"),
-    }
-    assert!(
-        !dir.path().join("settings.toml").exists(),
-        "a refused old file must not be migrated"
-    );
-
-    // Fixing the old file migrates it on the next load.
-    fs::write(
-        &old_path,
-        "version = 1\n\n[[bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n",
-    )
-    .unwrap();
+    assert!(recent::load(dir.path()).is_empty());
     let loaded = input_config::load(dir.path());
     assert!(loaded.problems.is_empty());
     assert_eq!(
         loaded.table.bindings[0].stacking,
         Some(focusforge_gui::input_map::Action::Pan)
     );
-    assert!(dir.path().join("settings.toml").exists());
+    assert_eq!(fs::read_to_string(&path).unwrap(), src);
 }

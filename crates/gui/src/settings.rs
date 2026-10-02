@@ -19,8 +19,8 @@ pub const FILE_NAME: &str = "settings.toml";
 /// The file's path and raw text. `Ok(None)` means the file does not exist
 /// yet -- the normal first run, not an error. Any other read failure
 /// (permissions, non-UTF-8 bytes, a directory where the file should be) is
-/// `Err`: it must never be read as "absent", which would migrate an old
-/// file or overwrite bytes that are not safe to touch.
+/// `Err`: it must never be read as "absent", which would overwrite bytes
+/// that are not safe to touch.
 pub fn read(config_dir: &Path) -> (PathBuf, std::io::Result<Option<String>>) {
     let path = config_dir.join(FILE_NAME);
     let text = match fs::read_to_string(&path) {
@@ -29,17 +29,6 @@ pub fn read(config_dir: &Path) -> (PathBuf, std::io::Result<Option<String>>) {
         Err(e) => Err(e),
     };
     (path, text)
-}
-
-/// Whether `key` names a top-level table in `src`. Text that does not
-/// parse as TOML at all answers `true` for every key: a broken file must
-/// never be read as "table absent" -- that would migrate an old file or
-/// write first-run defaults onto bytes that are not safe to touch.
-pub fn has_table(src: &str, key: &str) -> bool {
-    match src.parse::<DocumentMut>() {
-        Ok(doc) => doc.contains_key(key),
-        Err(_) => true,
-    }
 }
 
 /// Turns a `Serialize` value into a `toml_edit::Table` by way of `toml`'s
@@ -57,10 +46,9 @@ pub fn to_table<T: Serialize>(value: &T) -> Table {
 
 /// Clears `position` on `table` and everything nested under it.
 /// `toml_edit` prints top-level tables in `position` order, so a table
-/// lifted whole from another parsed document (a freshly serialised value,
-/// or an old file's own root during migration) carries that document's
-/// positions and would interleave with the host document's tables unless
-/// cleared first.
+/// lifted whole from another parsed document (a freshly serialised value)
+/// carries that document's positions and would interleave with the host
+/// document's tables unless cleared first.
 fn clear_positions(table: &mut Table) {
     table.set_position(None);
     for (_, item) in table.iter_mut() {

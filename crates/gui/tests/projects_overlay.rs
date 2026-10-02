@@ -1111,7 +1111,7 @@ fn recent_row_opens_its_target() {
         vec![RecentEntry {
             name: "demo".to_string(),
             folder: project_path.parent().unwrap().to_path_buf(),
-            path: Some(project_path.clone()),
+            path: project_path.clone(),
             opened_at: 0,
         }],
         tree("recent_open_target_config"),
@@ -1155,7 +1155,7 @@ fn recent_row_switches_to_an_open_tab() {
         vec![RecentEntry {
             name: "first".to_string(),
             folder: first_dir.clone(),
-            path: Some(first_dir),
+            path: first_dir,
             opened_at: 0,
         }],
         tree("recent_switch_config"),
@@ -1191,7 +1191,7 @@ fn recent_row_missing_target_is_refused() {
         vec![RecentEntry {
             name: "gone".to_string(),
             folder: missing_dir.clone(),
-            path: Some(missing_dir.clone()),
+            path: missing_dir.clone(),
             opened_at: 0,
         }],
         tree("recent_missing_target_config"),
@@ -1227,11 +1227,12 @@ fn recent_row_missing_target_is_refused() {
 #[test]
 fn recent_row_out_of_range_or_busy_is_ignored() {
     let mut controller = controller_with_frames("recent_out_of_range", 1);
+    let only_dir = tree("recent_out_of_range_folder");
     controller.install_recent(
         vec![RecentEntry {
             name: "only".to_string(),
-            folder: tree("recent_out_of_range_folder"),
-            path: None,
+            folder: only_dir.clone(),
+            path: only_dir,
             opened_at: 0,
         }],
         tree("recent_out_of_range_config"),
@@ -1256,7 +1257,7 @@ fn recent_row_out_of_range_or_busy_is_ignored() {
         vec![RecentEntry {
             name: "second".to_string(),
             folder: second_dir.clone(),
-            path: Some(second_dir),
+            path: second_dir,
             opened_at: 0,
         }],
         tree("recent_out_of_range_busy_config"),
@@ -1279,42 +1280,40 @@ fn recent_row_out_of_range_or_busy_is_ignored() {
 }
 
 #[test]
-fn recent_file_without_path_still_opens() {
+fn recent_row_opens_its_path_not_its_folder() {
     use focusforge_gui::recent;
 
-    let frames_dir = tree("recent_no_path_frames");
+    let frames_dir = tree("recent_path_frames");
     copy_frame(&frames_dir, "00.tif", 0);
 
-    let config_dir = tree("recent_no_path_config");
-    std::fs::write(
-        config_dir.join("recent.toml"),
-        format!(
-            "[[entries]]\nname = \"legacy\"\nfolder = {:?}\nopened_at = 0\n",
-            frames_dir
-        ),
+    let config_dir = tree("recent_path_config");
+    recent::save(
+        &config_dir,
+        &[RecentEntry {
+            name: "demo".to_string(),
+            folder: config_dir.join("no_such_folder"),
+            path: frames_dir,
+            opened_at: 0,
+        }],
     )
     .unwrap();
 
     let entries = recent::load(&config_dir);
-    assert_eq!(entries.len(), 1, "an old-format file still loads its row");
-    assert_eq!(
-        entries[0].path, None,
-        "no `path` field means `None`, not a parse failure"
-    );
+    assert_eq!(entries.len(), 1, "the saved row loads back");
 
     let mut controller = AppController::new();
-    controller.set_scratch_root_for_test(tree("recent_no_path_scratch"));
+    controller.set_scratch_root_for_test(tree("recent_path_scratch"));
     controller.install_recent(entries, config_dir);
     controller.toggle_projects_overlay();
 
     let handle = controller
         .open_recent(0)
-        .expect("a row with no `path` still starts a load, by `folder`");
+        .expect("the row's `path` starts a load although its `folder` does not exist");
     handle.join().expect("the load worker did not panic");
     let outcome = controller.settle_open();
     assert!(
         matches!(outcome, Some(OpenOutcome::Opened(_))),
-        "the folder opens the same as any other target"
+        "the path opens the same as any other target"
     );
     assert_eq!(controller.project_tabs().len(), 1);
 }

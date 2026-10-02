@@ -7,20 +7,13 @@
 //! exclusion list). No `use slint::` anywhere in this file
 //! (`input_modules_are_slint_free`).
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use toml::Spanned;
-use toml_edit::DocumentMut;
 
-use crate::input_map::{Action, Binding, DEFAULT_BINDINGS, InputTable, Modifiers, Trigger};
+use crate::input_map::{Action, Binding, DEFAULT_BINDINGS, InputTable, Trigger};
 use crate::settings;
-
-/// The only `version` this build accepts. A file naming a higher version is
-/// refused by name; a file naming a lower one is unreachable today and
-/// refused the same way.
-pub const SUPPORTED_VERSION: u32 = 1;
 
 /// Where the active table came from, shown as the settings modal's one
 /// section-level provenance line.
@@ -50,15 +43,6 @@ pub enum ConfigError {
         path: PathBuf,
         #[source]
         source: std::io::Error,
-    },
-    #[error(
-        "{path}:{line}: unsupported version {found} -- this build supports version {supported}"
-    )]
-    UnsupportedVersion {
-        path: PathBuf,
-        line: usize,
-        found: u32,
-        supported: u32,
     },
     #[error("{path}:{line}: unknown trigger {spelling:?}")]
     UnknownTrigger {
@@ -91,7 +75,6 @@ pub enum ConfigError {
 
 #[derive(Debug, Deserialize)]
 struct ConfigFile {
-    version: Spanned<u32>,
     #[serde(default)]
     bindings: Vec<Spanned<ConfigBinding>>,
 }
@@ -134,22 +117,16 @@ struct SettingsWrapper {
 
 /// Loads the input table from `settings.toml`'s `[input]` table. A missing
 /// table is the normal case, not an error. Any problem at all -- a parse
-/// error, an unsupported version, an unknown trigger or action, a
-/// duplicate trigger -- refuses the table **whole**: it falls back to
-/// [`InputTable::default`] wholesale, never half-applied.
-///
-/// A user who already has `input.toml` and no `[input]` table yet keeps
-/// their bindings: read once against the same rules, and, if accepted,
-/// written into `settings.toml` as `[input]` (comments carried over) with
-/// its problems -- if any -- reported against `input.toml`, the old file
-/// left untouched either way.
+/// error, an unknown trigger or action, a duplicate trigger -- refuses the
+/// table **whole**: it falls back to [`InputTable::default`] wholesale,
+/// never half-applied.
 pub fn load(config_dir: &Path) -> Loaded {
     let (path, read_result) = settings::read(config_dir);
     let src = match read_result {
         Ok(text) => text.unwrap_or_default(),
         // The file exists but could not be read (permissions, non-UTF-8
-        // bytes, a directory in its place) -- treated the same as an
-        // unparseable file: refused, never migrated onto.
+        // bytes, a directory in its place) -- refused like an unparseable
+        // file.
         Err(source) => return defaults_with(vec![ConfigError::CouldNotRead { path, source }]),
     };
 
@@ -158,57 +135,16 @@ pub fn load(config_dir: &Path) -> Loaded {
         Err(source) => return defaults_with(vec![ConfigError::Parse { path, source }]),
     };
 
-    if let Some(parsed) = wrapper.input {
-        return validate(parsed, &src, path);
+    match wrapper.input {
+        Some(parsed) => validate(parsed, &src, path),
+        None => defaults_with(Vec::new()),
     }
-
-    if !settings::has_table(&src, "input")
-        && let Ok(old_src) = fs::read_to_string(config_dir.join("input.toml"))
-    {
-        let old_path = config_dir.join("input.toml");
-        return match toml::from_str::<ConfigFile>(&old_src) {
-            Ok(old_parsed) => {
-                let loaded = validate(old_parsed, &old_src, old_path.clone());
-                let Provenance::File { overridden, .. } = loaded.provenance else {
-                    // Refused: `loaded.problems` already names `old_path`.
-                    return loaded;
-                };
-                if let Ok(doc) = old_src.parse::<DocumentMut>() {
-                    let _ = settings::write_table(config_dir, "input", doc.into_table());
-                }
-                Loaded {
-                    table: loaded.table,
-                    provenance: Provenance::File { path, overridden },
-                    problems: Vec::new(),
-                }
-            }
-            Err(source) => defaults_with(vec![ConfigError::Parse {
-                path: old_path,
-                source,
-            }]),
-        };
-    }
-
-    defaults_with(Vec::new())
 }
 
-/// The validation rules a parsed `ConfigFile` must pass, shared by a
-/// `[input]` table read straight from `settings.toml` and an old
-/// `input.toml` being considered for migration. `path` names whichever
-/// file the caller wants every [`ConfigError`] and the success
-/// [`Provenance`] to report.
+/// The validation rules the `[input]` table of `settings.toml` must pass.
+/// `path` is the file every [`ConfigError`] and the success [`Provenance`]
+/// report.
 fn validate(parsed: ConfigFile, src: &str, path: PathBuf) -> Loaded {
-    let version = *parsed.version.get_ref();
-    if version > SUPPORTED_VERSION || version < 1 {
-        let line = line_of(src, parsed.version.span().start);
-        return defaults_with(vec![ConfigError::UnsupportedVersion {
-            path,
-            line,
-            found: version,
-            supported: SUPPORTED_VERSION,
-        }]);
-    }
-
     let mut problems = Vec::new();
     let mut bindings = InputTable::default().bindings;
     let mut seen: Vec<(Trigger, usize)> = Vec::new();
@@ -244,16 +180,6 @@ fn validate(parsed: ConfigFile, src: &str, path: PathBuf) -> Loaded {
         // active bindings. Refusing is final -- "rebind" means reassigning
         // one of the shipped triggers' action, not naming a device none of
         // them already uses.
-        // An `alt+wheel` row is skipped without an error, so the rest of the
-        // file still applies.
-        if trigger
-            == Trigger::Wheel(Modifiers {
-                alt: true,
-                ..Modifiers::NONE
-            })
-        {
-            continue;
-        }
         let Some(default_index) = DEFAULT_BINDINGS.iter().position(|b| b.trigger == trigger) else {
             problems.push(ConfigError::UnknownTrigger {
                 path: path.clone(),
@@ -324,7 +250,6 @@ fn validate(parsed: ConfigFile, src: &str, path: PathBuf) -> Loaded {
 
 #[derive(Debug, Serialize)]
 struct SerializedConfig {
-    version: u32,
     bindings: Vec<SerializedBinding>,
 }
 
@@ -341,7 +266,6 @@ impl SerializedConfig {
     fn defaults() -> Self {
         let table = InputTable::default();
         SerializedConfig {
-            version: SUPPORTED_VERSION,
             bindings: table
                 .bindings
                 .iter()

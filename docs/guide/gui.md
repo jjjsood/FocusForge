@@ -112,6 +112,4 @@ bound to it, and where that binding came from — the shipped defaults or a
 config file. The bindings themselves live in `settings.toml`'s `[input]`
 table, next to the window's other configuration, and are edited by hand
 rather than through the window; the panel is the read-only view of what took
-effect. A window that still has an old `input.toml` and no `[input]` table
-yet reads it once and carries its bindings into `settings.toml`, leaving the
-old file in place.
+effect.

@@ -3403,7 +3403,7 @@ impl AppController {
                 self.record_recent(
                     entry::tab_title(&project),
                     recent_folder(&project),
-                    Some(project_identity_path(&project)),
+                    project_identity_path(&project),
                     opened_at,
                 );
                 let missing = if let GuiProject::Opened(p) = &project {
@@ -3712,13 +3712,7 @@ impl AppController {
     /// persists it, if a config directory resolved at startup. A write
     /// failure is logged but never a reason to interrupt an open: the
     /// `Recent` list stays correct in memory for the rest of the session.
-    fn record_recent(
-        &mut self,
-        name: String,
-        folder: PathBuf,
-        path: Option<PathBuf>,
-        opened_at: i64,
-    ) {
+    fn record_recent(&mut self, name: String, folder: PathBuf, path: PathBuf, opened_at: i64) {
         recent::record(&mut self.state.recent, name, folder, path, opened_at);
         if let Some(dir) = &self.state.config_dir
             && let Err(e) = recent::save(dir, &self.state.recent)
@@ -3733,7 +3727,7 @@ impl AppController {
         &mut self,
         name: String,
         folder: PathBuf,
-        path: Option<PathBuf>,
+        path: PathBuf,
         opened_at: i64,
     ) {
         self.record_recent(name, folder, path, opened_at);
@@ -3750,7 +3744,7 @@ impl AppController {
             return None;
         }
         let entry = self.state.recent.get(index)?;
-        let target = entry.path.clone().unwrap_or_else(|| entry.folder.clone());
+        let target = entry.path.clone();
         if let Some(tab_index) = self
             .state
             .projects
