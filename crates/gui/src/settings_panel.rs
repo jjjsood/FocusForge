@@ -43,8 +43,8 @@ pub(crate) struct ActiveTabParams<'a> {
 /// no values for an unsaved project, the sealed manifest's own for a
 /// reopened one (every key resolves `Explicit`). A manifest with no `align`
 /// seeds the registry default there; one whose run applied no crop seeds
-/// `auto-crop` off, one whose run was equalized seeds `equalize` on with the
-/// bound it ran with.
+/// `auto-crop` off; `equalize` is seeded only where the run differs from its
+/// method's default, on with the bound it ran with or off.
 pub(crate) fn seed_algorithm_state(
     project: &GuiProject,
 ) -> (String, ParamValues, String, ParamValues, ParamValues) {
@@ -66,8 +66,16 @@ pub(crate) fn seed_algorithm_state(
             if manifest.registration.crop.is_none() {
                 project_values.insert("auto-crop".to_string(), ParamValue::Bool(false));
             }
-            if let Some(equalization) = &manifest.registration.equalization {
-                project_values.insert("equalize".to_string(), ParamValue::Bool(true));
+            let equalization = manifest.registration.equalization.as_ref();
+            let equalized_by_default =
+                equalization_bound(&manifest.algorithm, &ParamValues::new()).is_some();
+            if equalization.is_some() != equalized_by_default {
+                project_values.insert(
+                    "equalize".to_string(),
+                    ParamValue::Bool(equalization.is_some()),
+                );
+            }
+            if let Some(equalization) = equalization {
                 project_values.insert(
                     "equalize-max-gain".to_string(),
                     ParamValue::Float(equalization.max_gain),
@@ -95,10 +103,19 @@ pub(crate) fn auto_crop_enabled(project_values: &ParamValues) -> bool {
         .expect("auto-crop is a Bool parameter")
 }
 
-/// The gain bound a run's brightness equalization uses, `None` while the
+/// The project parameter schema for a run fused by `fuse_id`; the shared
+/// schema while the id names no registered method.
+fn project_schema(fuse_id: &str) -> Vec<ParamDesc> {
+    registry::find_stack(fuse_id).map_or_else(
+        |_| focusforge_core::project::PROJECT_PARAMS.clone(),
+        focusforge_core::project::params_for,
+    )
+}
+
+/// The gain bound a run fused by `fuse_id` equalizes with, `None` while the
 /// `equalize` switch is off.
-pub(crate) fn equalization_bound(project_values: &ParamValues) -> Option<f64> {
-    focusforge_core::project::equalization_bound(project_values)
+pub(crate) fn equalization_bound(fuse_id: &str, project_values: &ParamValues) -> Option<f64> {
+    focusforge_core::project::equalization_bound(&project_schema(fuse_id), project_values)
 }
 
 /// [`registry::default_stack`]'s id, empty when the registry refuses to name
@@ -511,7 +528,7 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
     rows.extend(section_rows(
         "crop",
         "CROP",
-        &focusforge_core::project::PROJECT_PARAMS,
+        &project_schema(fuse_id),
         project_values,
         &section_ctx,
         None,

@@ -28,7 +28,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 import zlib
+from compression import zstd
 
 import numpy as np
 
@@ -49,6 +51,11 @@ EPS_BASE, EPS_DET = 0.3, 1e-6
 GLINT_RING = (2, 8)  # annulus of the glint metrics, px outside the disc edge
 GLINT_R, GLINT_DEPTH, GLINT_DEPTH_R = 3, 3.0, 14
 FULL = 65535.0
+IMAGE_METRICS = os.path.join(ROOT, "tools", "image-metrics.py")
+PATCH_JOIN = 100.0  # counts: neighbouring components whose mean luma differs by less than this form one visible patch
+PATCH_EDGES = (64, 1000, 16000, 100000)  # px: the size buckets of the patch shares
+HEAD_BAND = 3000.0  # counts: a pixel is background when its luma is this close to its row median
+ABOVE_HEAD = {(3584, 2220): (0, 400)}  # crop origin -> crop rows of the background above the subject
 
 
 # ---------------------------------------------------------------- metrics
@@ -100,6 +107,16 @@ def border_pull(comp, src):
     return float(np.maximum(0, lo - comp.astype(np.float64).mean(2))[sel].mean()) if sel.any() else 0.0
 
 
+def valid_area(src, shape):
+    """Pixels with at least one valid source frame."""
+    valid = np.ones(shape, bool)
+    if src is not None and src.has_masks:
+        valid = np.zeros_like(valid)
+        for k in range(src.n):
+            valid |= src.read(k)[1]
+    return valid
+
+
 def metrics(comp, ref, meta, src=None):
     """Every metric the case's regions define, over pixels with at least one valid source.
 
@@ -107,11 +124,7 @@ def metrics(comp, ref, meta, src=None):
     them); `glint_ring` is the luma RMS against the truth in the annuli around them.
     """
     c, r = comp.astype(np.float64), ref.astype(np.float64)
-    valid = np.ones(c.shape[:2], bool)
-    if src is not None and src.has_masks:
-        valid = np.zeros_like(valid)
-        for k in range(src.n):
-            valid |= src.read(k)[1]
+    valid = valid_area(src, c.shape[:2])
     Lc, Lr = c.mean(2), r.mean(2)
     mse = ((c - r) ** 2)[valid].mean()
     psnr = lambda e: float("inf") if e == 0 else float(10 * np.log10(FULL**2 / e))  # noqa: E731
@@ -140,6 +153,125 @@ def metrics(comp, ref, meta, src=None):
         m["glint_ring"] = float(np.sqrt(((Lc - Lr)[ring] ** 2).mean()))
     if src is not None and src.has_masks:
         m["border_pull"] = border_pull(comp, src)
+    return m
+
+
+# ---------------------------------------------------------------- source-map measures
+
+
+def read_zmap(path):
+    return np.rint(read_u16(path)[..., 0]).astype(np.int64)
+
+
+def truth_index(depth, n):
+    """The source index a depth value names: nearest frame, clamped to the stack."""
+    return np.clip(np.rint(depth), 0, n - 1).astype(np.uint16)
+
+
+def index_scores(z, truth, valid):
+    """Exact fraction and mean absolute error of source indices against truth, over valid pixels."""
+    d = np.abs(z.astype(np.int64) - truth.astype(np.int64))[valid]
+    return float((d == 0).mean()), float(d.mean())
+
+
+def patchiness(comp, zmap):
+    """1 minus the Z-Map coherence `tools/image-metrics.py` reports for the composite."""
+    out = run([sys.executable, IMAGE_METRICS, comp, "--zmap", zmap, "--json"]).stdout
+    return 1.0 - json.loads(out)["zmap"]["coherence"]
+
+
+def components(z, keep=None):
+    """4-connected components of equal index: (label map, count). Pixels outside `keep` get -1 and join nothing."""
+    h, w = z.shape
+    flat, live = z.ravel().tolist(), (keep.ravel().tolist() if keep is not None else [True] * (h * w))
+    lab, n = [-1] * (h * w), 0
+    for s0 in range(h * w):
+        if lab[s0] >= 0 or not live[s0]:
+            continue
+        v, lab[s0], stack = flat[s0], n, [s0]
+        while stack:
+            i = stack.pop()
+            x = i % w
+            for j in ((i - w) if i >= w else -1, (i + w) if i < h * w - w else -1, (i - 1) if x else -1, (i + 1) if x < w - 1 else -1):
+                if j >= 0 and lab[j] < 0 and live[j] and flat[j] == v:
+                    lab[j] = n
+                    stack.append(j)
+        n += 1
+    return np.array(lab, np.int64).reshape(h, w), n
+
+
+def islands_per_mp(z):
+    return components(z)[1] / (z.size / 1e6)
+
+
+def patch_measures(z, luma, keep=None, join=PATCH_JOIN, prefix=""):
+    """Source-switch steps and visible patches of a Z-Map over its composite's luma.
+
+    A switch is a pair of 4-adjacent components (one pair counted once); its step is the difference
+    of their mean luma. Components whose step is below `join` are merged transitively into visible
+    patches. `patch_median_px` is the patch size at which half of the pixels are reached counting
+    patches from small to large; `patch_px_*` are the pixel shares of the `PATCH_EDGES` buckets.
+    """
+    lab, n = components(z, keep)
+    ok = lab >= 0
+    area = np.bincount(lab[ok], minlength=n)
+    mean = np.bincount(lab[ok], weights=luma[ok], minlength=n) / np.maximum(area, 1)
+    a = np.r_[lab[:, :-1].ravel(), lab[:-1].ravel()]
+    b = np.r_[lab[:, 1:].ravel(), lab[1:].ravel()]
+    sel = (a >= 0) & (b >= 0) & (a != b)
+    pairs = np.unique(np.minimum(a, b)[sel] * n + np.maximum(a, b)[sel])
+    lo, hi = pairs // n, pairs % n
+    step = np.abs(mean[lo] - mean[hi])
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, j in zip(lo[step < join].tolist(), hi[step < join].tolist()):
+        parent[find(i)] = find(j)
+    size = np.bincount([find(i) for i in range(n)], weights=area, minlength=n).astype(np.int64)
+    size = np.sort(size[size > 0])
+    share = np.cumsum(size) / max(size.sum(), 1)
+    edges = (0, *PATCH_EDGES, np.inf)
+    names = ("lt64", "64_1k", "1k_16k", "16k_100k", "gt100k")
+    m = {"switch_step_p50": float(np.percentile(step, 50)) if step.size else 0.0,
+         "switch_step_p90": float(np.percentile(step, 90)) if step.size else 0.0,
+         "visible_patches": int(size.size),
+         "patch_median_px": int(size[np.searchsorted(share, 0.5)]) if size.size else 0,
+         "patch_largest_px": int(size[-1]) if size.size else 0}
+    for name, e0, e1 in zip(names, edges, edges[1:]):
+        m[f"patch_px_{name}"] = float(size[(size >= e0) & (size < e1)].sum() / max(size.sum(), 1))
+    return {prefix + k: v for k, v in m.items()}
+
+
+def background_mask(luma, rows):
+    """Pixels of crop rows [y0, y1) whose luma is within `HEAD_BAND` counts of their row's median."""
+    r = luma[rows[0] : rows[1]]
+    return np.abs(r - np.median(r, axis=1, keepdims=True)) <= HEAD_BAND
+
+
+def zmap_measures(row, meta, src, mask_comp):
+    """The source-map measures of one depth-map row; real crops add the step and patch measures.
+
+    The above-the-head region's background mask is taken from `mask_comp` (a composite that does
+    not depend on the arm), so before and after measure the same pixels.
+    """
+    z = read_zmap(row["zmap"])
+    m = dict(patchiness=patchiness(row["comp"], row["zmap"]), islands_per_mp=islands_per_mp(z))
+    truth = os.path.join(meta["dir"], "truth-zmap.tif")
+    if meta["reference"] and os.path.exists(truth):
+        m["index_exact"], m["index_mae"] = index_scores(z, read_zmap(truth), valid_area(src, z.shape))
+    if not meta["reference"]:
+        luma = read_u16(row["comp"]).mean(2)
+        m.update(patch_measures(z, luma))
+        rows = ABOVE_HEAD.get(tuple(meta.get("rect", ())[:2]))
+        if rows:
+            keep = np.zeros(z.shape, bool)
+            keep[rows[0] : rows[1]] = background_mask(read_u16(mask_comp).mean(2), rows)
+            m.update(patch_measures(z, luma, keep, prefix="head_"))
     return m
 
 
@@ -218,6 +350,29 @@ def write_u16(path, arr):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     a = np.clip(np.rint(arr), 0, 65535).astype("<u2")
     rawtiff.write_tiff(path, a.shape[1], a.shape[0], a.tobytes(), bits=16, spp=a.shape[2])
+
+
+def stored_composite(project, out):
+    """Writes a project's own stored composite (what the fusion produced) to a 16-bit TIFF.
+
+    `focusforge-cli export` renders from the Z-Map, so a blending method's export is a hard pick;
+    the stored blob is the zstd-compressed row-major little-endian samples named by the manifest.
+    """
+    with zipfile.ZipFile(project) as z:
+        plane = json.loads(z.read("manifest.json"))["composite"]
+        raw = zstd.decompress(z.read(f"blobs/{plane['blob']}.zst"))
+    assert plane["byte_order"] == "little" and len(raw) == plane["width"] * plane["height"] * plane["samples_per_pixel"] * 2
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    rawtiff.write_tiff(out, plane["width"], plane["height"], raw, bits=16, spp=plane["samples_per_pixel"])
+
+
+def source_share(comp, frame_paths):
+    """Share of `comp`'s samples equal to the same sample of at least one frame (1.0 for a pure pick)."""
+    c = read_u16(comp)
+    hit = np.zeros(c.shape, bool)
+    for p in frame_paths:
+        hit |= read_u16(p) == c
+    return float(hit.mean())
 
 
 def equalize(d, out_dir, brk=None):
@@ -516,6 +671,68 @@ def self_check_commands():
     return all(checks.values())
 
 
+def self_check_zmap():
+    """Source-map measures against maps whose answers are known by construction."""
+    h = w = 8
+    uniform = np.zeros((h, w), np.int64)
+    board = (np.indices((h, w)).sum(0) % 2).astype(np.int64)
+    bands = np.repeat([0, 1, 2], [3, 2, 3])[None].repeat(h, 0)  # components of 24, 16 and 24 px
+    luma = np.repeat([0.0, 50.0, 400.0], [3, 2, 3])[None].repeat(h, 0)
+    off = uniform.copy()
+    off[0, :4] = 3
+    steps, apart = patch_measures(bands, luma), patch_measures(bands, luma, join=10.0)
+    keep = background_mask(np.array([[10000.0, 10001.0, 40000.0, 10002.0]]), (0, 1))
+    with tempfile.TemporaryDirectory() as t:
+        comp, zm = os.path.join(t, "c.tif"), os.path.join(t, "z.tif")
+        write_u16(comp, np.zeros((h, w, 3)))
+        patchy = []
+        for z in (board, uniform):
+            rawtiff.write_tiff(zm, w, h, z.astype("<u2").tobytes(), bits=16, spp=1)
+            patchy.append(patchiness(comp, zm))
+        hairs = read_zmap(os.path.join(build_case("hairs", 11, 8, t)["dir"], "truth-zmap.tif"))
+        glints = read_zmap(os.path.join(build_case("glints", 11, 8, t)["dir"], "truth-zmap.tif"))
+        panel = lambda lo, hi: np.where(np.indices((4, 4)).sum(0) % 2, hi, lo)  # noqa: E731
+        for k, (lo, hi) in enumerate([(0, 60000), (0, 1000), (0, 1000), (0, 1000), (0, 1000)]):
+            write_u16(os.path.join(t, f"p{k}.tif"), np.repeat(panel(lo, hi)[..., None], 3, 2))
+        sheet = montage_image((0, 4, 0, 4), [os.path.join(t, f"p{k}.tif") for k in range(5)], 2)
+        a, b = np.random.default_rng(1).integers(0, 60000, (2, 4, 4, 3)).astype("<u2")
+        frames = [os.path.join(t, f"f{k}.tif") for k in range(2)]
+        for p, x in zip(frames, (a, b)):
+            write_u16(p, x)
+        blend = ((a.astype(np.uint32) + b) // 2).astype("<u2")
+        project = os.path.join(t, "p.ffp")
+        with zipfile.ZipFile(project, "w") as z:
+            z.writestr("manifest.json", json.dumps(dict(composite=dict(blob="ab", width=4, height=4, samples_per_pixel=3, byte_order="little"))))
+            z.writestr("blobs/ab.zst", zstd.compress(blend.tobytes()))
+        stored_composite(project, os.path.join(t, "stored.tif"))
+        stored = read_u16(os.path.join(t, "stored.tif"))
+        pick_share, blend_share = source_share(frames[0], frames), source_share(os.path.join(t, "stored.tif"), frames)
+    exact, mae = index_scores(off, uniform, np.ones((h, w), bool))
+    checks = dict(
+        islands_uniform=components(uniform)[1] == 1,
+        islands_checkerboard=components(board)[1] == h * w,
+        islands_bands=components(bands)[1] == 3,
+        islands_keep_mask=components(uniform, keep=board == 0)[1] == h * w // 2,
+        islands_per_mp=islands_per_mp(board) == h * w / (h * w / 1e6),
+        index_exact=abs(exact - 60 / 64) < 1e-12,
+        index_mae=abs(mae - 12 / 64) < 1e-12,
+        patchiness_checkerboard_uniform=patchy == [1.0, 0.0],
+        step_percentiles=(steps["switch_step_p50"], steps["switch_step_p90"]) == (200.0, 320.0),
+        patches_merge=(steps["visible_patches"], steps["patch_median_px"], steps["patch_largest_px"]) == (2, 40, 40),
+        patches_apart=(apart["visible_patches"], apart["patch_median_px"]) == (3, 24),
+        patch_buckets=steps["patch_px_lt64"] == 1.0 and steps["patch_px_64_1k"] == 0.0 and steps["patch_px_gt100k"] == 0.0,
+        head_mask=keep.tolist() == [[True, True, False, True]],
+        truth_hairs=(hairs[460, 100], hairs[450, 110]) == (2, 6),
+        truth_glints=glints[230, 40] == 3,
+        export_zmap="--zmap" in export_cmd("p", "o.tif", "z.tif") and "--zmap" not in export_cmd("p", "o.tif"),
+        stored_composite=np.allclose(stored, blend, atol=1e-6),
+        source_share=pick_share == 1.0 and blend_share < 0.2,
+        montage_rows=sheet.shape == (4 * 3 + 4 * 2, 4 * 2 + 4, 3) and sheet[:4, 4 + 4:].max() < 20 and sheet[8:12, :4].max() == 255)
+    for k, v in checks.items():
+        print(f"zmap  {k:32} {'ok  ' if v else 'FAIL'}")
+    return all(checks.values())
+
+
 def self_check():
     """Every detector must stay silent on the honest prototype and fire on its broken variant."""
     fires = lambda m: {  # noqa: E731
@@ -552,6 +769,7 @@ def self_check():
     ok &= self_check_equalizer()
     ok &= self_check_level()
     ok &= self_check_commands()
+    ok &= self_check_zmap()
     print("self-check", "passed" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -584,6 +802,11 @@ def stack_cmd(d, algo, tile, out, sets=(), align=False):
     cmd += ["--align-algo", "pyramidal-ecc", "--align-set", "mode=rotation-scale"] if align else ["--no-align"]
     cmd += ["--no-crop", "--no-gpu", "--tile-size", tile, "--json", "-o", out]
     return cmd + [x for kv in sets for x in ("--set", kv)]
+
+
+def export_cmd(project, out, zmap=None):
+    """The `export` command line of a project's composite, with its Z-Map when `zmap` is given."""
+    return [CLI, "export", project, "-o", out, "--json"] + (["--zmap", zmap] if zmap else [])
 
 
 def synth(scene, noise, seed, n, out):
@@ -666,6 +889,7 @@ def build_case(name, seed, n, root):
             for k, f in enumerate(ss.render(src, depth, 0.45, noise, seed, n)):
                 write_u16(os.path.join(d, "frames", f"{k:02d}.tif"), f)
             write_u16(meta["reference"], src)
+            ss.write_depth(os.path.join(d, "truth-zmap.tif"), truth_index(depth, n))
             meta["hairs"] = HAIRS_512
         elif name == "glints":
             src = ss.SCENES["hard"]()
@@ -679,6 +903,7 @@ def build_case(name, seed, n, root):
             for k, f in enumerate(ss.render(src, depth, 0.45, noise, seed, n)):
                 write_u16(os.path.join(d, "frames", f"{k:02d}.tif"), f)
             write_u16(meta["reference"], src)
+            ss.write_depth(os.path.join(d, "truth-zmap.tif"), truth_index(depth, n))
         else:
             synth(scene, noise, seed, n, d)
         paths = frame_paths(d)
@@ -730,8 +955,9 @@ def real_cases(names, root, rect, nframes):
 def run_baseline(d, algo, tile, work, sets=(), align=False):
     """`stack` then `export` on the CPU path; peak RSS from the time wrapper.
 
-    The row carries the report's `equalization` when `--set equalize=true` ran and, with `align`,
-    the report's `align` block under `align`.
+    A depth-map row carries its exported Z-Map under `zmap`. The row carries the report's
+    `equalization` when `--set equalize=true` ran and, with `align`, the report's `align` block
+    under `align`.
     """
     o = os.path.join(work, f"{algo}-t{tile}")
     shutil.rmtree(o, ignore_errors=True)
@@ -740,8 +966,8 @@ def run_baseline(d, algo, tile, work, sets=(), align=False):
     p = run(cmd)
     rss = int(next(ln for ln in p.stderr.splitlines() if "Maximum resident set size" in ln).split()[-1])
     rep = json.loads(p.stdout)
-    run([CLI, "export", rep["outputs"][0], "-o", f"{o}.tif", "--json"])
-    row = dict(comp=f"{o}.tif", rss_kb=rss, wall_s=rep["wall_seconds"], tiles=rep["tiles"],
+    run(export_cmd(rep["outputs"][0], f"{o}.tif", f"{o}-zmap.tif" if algo == "depth-map" else None))
+    row = dict(comp=f"{o}.tif", **(dict(zmap=f"{o}-zmap.tif") if algo == "depth-map" else {}), rss_kb=rss, wall_s=rep["wall_seconds"], tiles=rep["tiles"],
                reads_per_frame=rep["frame_tiles_read"] / rep["frame_count"], accounted_bytes=rep["accounted_bytes_in_flight"],
                cmd=" ".join(str(c) for c in cmd[2:]))
     if rep["equalization"]:
@@ -844,6 +1070,8 @@ def cmd_cases(a):
                     r["equalize"] = os.path.join(d, "equalize.json")
                 if meta["reference"]:
                     r["metrics"] = metrics(read_u16(r["comp"]).astype(np.uint16), read_u16(meta["reference"]).astype(np.uint16), meta, src)
+                if r.get("zmap"):
+                    r.setdefault("metrics", {}).update(zmap_measures(r, meta, src, comps.get("laplacian" + tag, r["comp"])))
                 if arm == "on" and "off" in arms:
                     off = read_u16(comps[r["algo"]])
                     diff = np.rint(np.abs(read_u16(r["comp"]) - off))
@@ -869,20 +1097,33 @@ def cmd_cases(a):
 # ---------------------------------------------------------------- fuse / score / montage
 
 
-def montage(path, rect, files):
-    """Side-by-side 8-bit crops (contrast taken from the first image) written as PNG."""
+def montage_image(rect, files, columns=None):
+    """Side-by-side 8-bit crops as an array; `columns` wraps the files into rows of that many panels.
+
+    Each row takes its contrast from its own first file; a short last row is padded white.
+    """
     y0, y1, x0, x1 = rect
-    tiles = [TiffSource([f]).read(0, rect)[0] for f in files]
-    lo, hi = np.percentile(tiles[0], [0.5, 99.5])
-    img8 = [np.clip((t - lo) / max(hi - lo, 1e-9), 0, 1) * 255 for t in tiles]
-    gap = np.full((y1 - y0, 4, img8[0].shape[2]), 255.0)
-    row = np.concatenate([x for t in img8 for x in (t, gap)][:-1], axis=1).astype(np.uint8)
-    if row.shape[2] == 1:
-        row = np.repeat(row, 3, axis=2)
-    raw = b"".join(b"\0" + r.tobytes() for r in row)
+    columns = columns or len(files)
+    gap_v, gap_h = 4, 4
+    rows = []
+    for i in range(0, len(files), columns):
+        tiles = [TiffSource([f]).read(0, rect)[0] for f in files[i : i + columns]]
+        lo, hi = np.percentile(tiles[0], [0.5, 99.5])
+        img8 = [np.repeat(t, 3, axis=2) if t.shape[2] == 1 else t for t in (np.clip((t - lo) / max(hi - lo, 1e-9), 0, 1) * 255 for t in tiles)]
+        img8 += [np.full_like(img8[0], 255.0)] * (columns - len(img8))
+        gap = np.full((y1 - y0, gap_h, 3), 255.0)
+        rows.append(np.concatenate([x for t in img8 for x in (t, gap)][:-1], axis=1))
+    bar = np.full((gap_v, rows[0].shape[1], 3), 255.0)
+    return np.concatenate([x for r in rows for x in (r, bar)][:-1], axis=0).astype(np.uint8)
+
+
+def montage(path, rect, files, columns=None):
+    """`montage_image` written as a PNG."""
+    img = montage_image(rect, files, columns)
+    raw = b"".join(b"\0" + r.tobytes() for r in img)
     chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))  # noqa: E731
     with open(path, "wb") as fh:
-        fh.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", row.shape[1], row.shape[0], 8, 2, 0, 0, 0))
+        fh.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", img.shape[1], img.shape[0], 8, 2, 0, 0, 0))
                  + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
 
@@ -918,8 +1159,8 @@ def cmd_score(a):
 
 def cmd_montage(a):
     rect = tuple(int(x) for x in a.rect.split(","))
-    montage(a.out, rect, a.files)
-    print(json.dumps(dict(cmd=sys.argv, out=a.out, order=a.files, rect=list(rect))))
+    montage(a.out, rect, a.files, a.columns)
+    print(json.dumps(dict(cmd=sys.argv, out=a.out, order=a.files, rect=list(rect), columns=a.columns)))
 
 
 # ---------------------------------------------------------------- reach / scale
@@ -1001,6 +1242,7 @@ def main():
     m = sub.add_parser("montage", help="side-by-side 8-bit crop as PNG")
     m.add_argument("out")
     m.add_argument("--rect", required=True, help="Y0,Y1,X0,X1")
+    m.add_argument("--columns", type=int, help="panels per row; the files wrap into rows (default: one row)")
     m.add_argument("files", nargs="+")
     r = sub.add_parser("reach", help="measure the weight support with an impulse")
     r.add_argument("--size", type=int, default=512)

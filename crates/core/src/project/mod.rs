@@ -355,7 +355,8 @@ pub(super) fn resolve_chain<'a>(
     ))
 }
 
-use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues};
+use crate::algorithm::StackAlgorithm;
+use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, validate};
 use crate::tile::Rect;
 
 /// The project-level parameter schema: values that describe how a project
@@ -381,11 +382,11 @@ pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "equalize".to_string(),
             label: "Equalize brightness".to_string(),
-            help: "Off by default; gives every frame one gain, the same on every \
-                   channel, matching the reference frame's (the alignment's, \
-                   otherwise the middle one) mid-tone brightness; \
-                   scales encoded code values as delivered and is not a \
-                   linear-light correction."
+            help: "Gives every frame one gain, the same on every channel, \
+                   matching the reference frame's (the alignment's, otherwise \
+                   the middle one) mid-tone brightness; the default depends on \
+                   the fusion method; scales encoded code values as delivered \
+                   and is not a linear-light correction."
                 .to_string(),
             kind: ParamKind::Bool,
             default: ParamValue::Bool(false),
@@ -396,10 +397,10 @@ pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "equalize-max-gain".to_string(),
             label: "Max brightness gain".to_string(),
-            help: "Only used when brightness equalization is on (off by default); \
-                   limits a frame's gain on both sides, so 1.25 allows gains \
-                   from 0.8 to 1.25; scales encoded code values as delivered \
-                   and is not a linear-light correction."
+            help: "Only used when brightness equalization is on; limits a \
+                   frame's gain on both sides, so 1.25 allows gains from 0.8 \
+                   to 1.25; scales encoded code values as delivered and is \
+                   not a linear-light correction."
                 .to_string(),
             kind: ParamKind::Float {
                 min: 1.01,
@@ -415,11 +416,37 @@ pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     ]
 });
 
+/// The project parameter schema for a run fused by `method`:
+/// [`PROJECT_PARAMS`] with the defaults the method declares through
+/// [`StackAlgorithm::project_defaults`]. Every front end resolves project
+/// parameters against this schema, so a default is the same in the settings
+/// panel, on the command line and in a listing.
+pub fn params_for(method: &dyn StackAlgorithm) -> Vec<ParamDesc> {
+    let declared: ParamValues = method
+        .project_defaults()
+        .iter()
+        .map(|(id, value)| (id.to_string(), value.clone()))
+        .collect();
+    validate(&PROJECT_PARAMS, &declared)
+        .expect("a method's project defaults satisfy the project schema");
+    PROJECT_PARAMS
+        .iter()
+        .map(|desc| {
+            let mut desc = desc.clone();
+            if let Some(default) = declared.get(&desc.id) {
+                desc.default = default.clone();
+            }
+            desc
+        })
+        .collect()
+}
+
 /// The gain bound brightness equalization runs with, `None` when the
-/// `equalize` switch is off. An absent key reads as its schema default.
-pub fn equalization_bound(values: &ParamValues) -> Option<f64> {
+/// `equalize` switch is off. An absent key reads as its default in `schema`,
+/// the schema [`params_for`] returns for the run's fusion method.
+pub fn equalization_bound(schema: &[ParamDesc], values: &ParamValues) -> Option<f64> {
     let read = |id: &str| {
-        let desc = PROJECT_PARAMS
+        let desc = schema
             .iter()
             .find(|d| d.id == id)
             .expect("the project schema declares the equalization parameters");
@@ -1009,26 +1036,79 @@ mod tests {
     fn the_equalization_help_states_what_it_is_and_is_not() {
         for id in ["equalize", "equalize-max-gain"] {
             let help = desc(id).help.to_lowercase();
-            assert!(help.contains("off by default"), "{id}: {help}");
             assert!(help.contains("encoded code values"), "{id}: {help}");
             assert!(
                 help.contains("not a linear-light correction"),
                 "{id}: {help}"
             );
         }
+        let switch = desc("equalize").help.to_lowercase();
+        assert!(
+            switch.contains("default depends on the fusion method"),
+            "{switch}"
+        );
         let bound = &desc("equalize-max-gain").help;
         assert!(bound.contains("0.8") && bound.contains("1.25"), "{bound}");
     }
 
+    fn schema_for(id: &str) -> Vec<ParamDesc> {
+        params_for(crate::registry::find_stack(id).expect("a registered fusion method"))
+    }
+
+    fn default_of(schema: &[ParamDesc], id: &str) -> ParamValue {
+        schema
+            .iter()
+            .find(|d| d.id == id)
+            .unwrap_or_else(|| panic!("no project parameter {id}"))
+            .default
+            .clone()
+    }
+
     #[test]
-    fn equalization_bound_is_none_when_off_and_the_schema_default_when_the_key_is_absent() {
+    fn equalize_defaults_on_for_the_focus_map_only() {
+        assert_eq!(
+            default_of(&schema_for("depth-map"), "equalize"),
+            ParamValue::Bool(true)
+        );
+        for id in ["laplacian", "weighted-average"] {
+            assert_eq!(
+                default_of(&schema_for(id), "equalize"),
+                ParamValue::Bool(false),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_method_changes_only_the_defaults_it_declares() {
+        for algorithm in crate::registry::stack_algorithms() {
+            let schema = params_for(algorithm);
+            assert_eq!(schema.len(), PROJECT_PARAMS.len(), "{}", algorithm.id());
+            let declared = algorithm.project_defaults();
+            for (own, base) in schema.iter().zip(PROJECT_PARAMS.iter()) {
+                let expected = declared
+                    .iter()
+                    .find(|(id, _)| *id == base.id)
+                    .map_or(&base.default, |(_, value)| value);
+                assert_eq!(&own.default, expected, "{}/{}", algorithm.id(), base.id);
+                assert_eq!(own.kind, base.kind, "{}/{}", algorithm.id(), base.id);
+            }
+        }
+    }
+
+    #[test]
+    fn equalization_bound_follows_the_method_and_an_explicit_value_wins() {
+        let focus_map = schema_for("depth-map");
+        let details = schema_for("laplacian");
         let mut values = ParamValues::new();
-        assert_eq!(equalization_bound(&values), None);
-        values.insert("equalize".into(), ParamValue::Bool(true));
-        assert_eq!(equalization_bound(&values), Some(1.25));
-        values.insert("equalize-max-gain".into(), ParamValue::Float(1.4));
-        assert_eq!(equalization_bound(&values), Some(1.4));
+        assert_eq!(equalization_bound(&focus_map, &values), Some(1.25));
+        assert_eq!(equalization_bound(&details, &values), None);
+
         values.insert("equalize".into(), ParamValue::Bool(false));
-        assert_eq!(equalization_bound(&values), None);
+        assert_eq!(equalization_bound(&focus_map, &values), None);
+        values.insert("equalize".into(), ParamValue::Bool(true));
+        assert_eq!(equalization_bound(&details, &values), Some(1.25));
+        values.insert("equalize-max-gain".into(), ParamValue::Float(1.4));
+        assert_eq!(equalization_bound(&details, &values), Some(1.4));
     }
 }

@@ -5833,7 +5833,7 @@ impl AppController {
             align_values: tab.align_values.clone(),
             align_lax: true,
             crop: settings_panel::auto_crop_enabled(&tab.project_values),
-            equalize: settings_panel::equalization_bound(&tab.project_values),
+            equalize: settings_panel::equalization_bound(&tab.fuse_id, &tab.project_values),
             gpu: self.gpu_fusion,
         })
     }

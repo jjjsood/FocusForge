@@ -504,6 +504,99 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
     assert_eq!(row(&plain, "equalize-max-gain").value_text, "1.25");
 }
 
+fn equalize_selected(controller: &AppController) -> String {
+    controller
+        .settings_panel()
+        .rows
+        .into_iter()
+        .find(|r| r.section == "crop" && r.id == "equalize")
+        .expect("the crop section has an equalize row")
+        .selected
+}
+
+#[test]
+fn the_equalize_row_shows_the_selected_methods_default() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+
+    for (method, shown) in [
+        ("depth-map", "true"),
+        ("laplacian", "false"),
+        ("weighted-average", "false"),
+        ("depth-map", "true"),
+    ] {
+        controller.set_fuse_algorithm(method);
+        assert_eq!(equalize_selected(&controller), shown, "{method}");
+    }
+}
+
+#[test]
+fn an_explicit_equalize_choice_and_each_methods_values_survive_switching() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+
+    controller.set_fuse_algorithm("depth-map");
+    controller.set_param_value("fuse", "score-radius", ParamValue::Int(7));
+    controller.set_param_value("crop", "equalize", ParamValue::Bool(false));
+    controller.set_fuse_algorithm("laplacian");
+    controller.set_param_value("fuse", "levels", ParamValue::Int(3));
+    assert_eq!(equalize_selected(&controller), "false");
+
+    controller.set_fuse_algorithm("depth-map");
+    assert_eq!(equalize_selected(&controller), "false", "the choice stays");
+    assert_eq!(fuse_value(&controller, "score-radius"), "7");
+    controller.set_fuse_algorithm("laplacian");
+    assert_eq!(fuse_value(&controller, "levels"), "3");
+
+    controller.reset_all_sections();
+    controller.set_fuse_algorithm("depth-map");
+    assert_eq!(equalize_selected(&controller), "true", "reset restores it");
+}
+
+#[test]
+fn a_reopened_focus_map_project_shows_how_its_run_was_equalized() {
+    use focusforge_core::align::Registration;
+    use focusforge_core::equalize::Equalization;
+
+    let registration = |equalization| Registration {
+        transforms: Vec::new(),
+        crop: None,
+        equalization,
+    };
+    let mut equalized = AppController::new();
+    let project = seal_with_registration(
+        "reopened_focus_map_equalized",
+        "depth-map",
+        &ParamValues::new(),
+        registration(Some(Equalization {
+            max_gain: 1.5,
+            gains: vec![65536, 66000],
+        })),
+    );
+    assert!(matches!(
+        common::open_and_settle(&mut equalized, &[project]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(equalize_selected(&equalized), "true");
+
+    let mut plain = AppController::new();
+    let project = seal_with_registration(
+        "reopened_focus_map_unequalized",
+        "depth-map",
+        &ParamValues::new(),
+        registration(None),
+    );
+    assert!(matches!(
+        common::open_and_settle(&mut plain, &[project]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(
+        equalize_selected(&plain),
+        "false",
+        "a run that was not equalized does not reopen as equalized"
+    );
+}
+
 #[test]
 fn seeded_ids_are_never_test_only() {
     let is_test_only = |id: &str| {

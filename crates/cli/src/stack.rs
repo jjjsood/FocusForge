@@ -339,10 +339,11 @@ pub fn run(
     // with the same `ParamViolation` rendering -- with the input directory
     // still unread. The project keys are split off before resolution: they
     // belong to the run, not to the algorithm's own schema.
+    let project_schema = project::params_for(algo);
     let schema: Vec<_> = algo
         .params()
         .iter()
-        .chain(PROJECT_PARAMS.iter())
+        .chain(project_schema.iter())
         .cloned()
         .collect();
     let (project_values, explicit) = match parse_settings(&schema, &set.set)
@@ -453,6 +454,7 @@ pub fn run(
         device_budget_report,
         device_peak,
         explicit,
+        equalize: project::equalization_bound(&project_schema, &project_values),
         project_values,
         file,
         align_opts,
@@ -550,6 +552,9 @@ struct RunSetup<'a> {
     explicit: ParamValues,
     /// The explicitly set project parameters (`PROJECT_PARAMS`).
     project_values: ParamValues,
+    /// The gain bound brightness equalization runs with, `None` when off:
+    /// resolved against the fusion method's own project defaults.
+    equalize: Option<f64>,
     file: preset::Preset,
     align_opts: &'a AlignOptions<'a>,
     job_opts: &'a JobOptions,
@@ -872,6 +877,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         device_peak,
         explicit,
         project_values,
+        equalize,
         file,
         align_opts,
         job_opts,
@@ -1129,7 +1135,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 .get("auto-crop")
                 .and_then(ParamValue::as_bool)
                 .unwrap_or(true),
-        equalize: project::equalization_bound(project_values),
+        equalize: *equalize,
         tile_size: job_opts.tile_size,
         max_host_memory,
         backend,

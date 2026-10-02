@@ -1416,12 +1416,12 @@ fn refuses_an_output_path_that_is_an_existing_file() {
 }
 
 // ---------------------------------------------------------------------
-// Opt-in brightness equalization (project parameters through `--set`).
+// Brightness equalization (project parameters, method defaults and `--set`).
 // ---------------------------------------------------------------------
 
-/// A `weighted-average` stack of the fixture, unaligned and uncropped,
-/// reported as JSON, with `extra` arguments appended.
-fn equalization_run(label: &str, extra: &[&str]) -> serde_json::Value {
+/// An `algo` stack of the fixture, unaligned and uncropped, reported as
+/// JSON, with `extra` arguments appended.
+fn equalization_run(label: &str, algo: &str, extra: &[&str]) -> serde_json::Value {
     let cwd = tmp_dir(label);
     let out_dir = cwd.join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
@@ -1432,7 +1432,7 @@ fn equalization_run(label: &str, extra: &[&str]) -> serde_json::Value {
         "-o",
         out_dir.to_str().unwrap(),
         "--algo",
-        "weighted-average",
+        algo,
         "--json",
         "--no-align",
         "--no-crop",
@@ -1456,7 +1456,11 @@ fn equalization_is_null_without_the_setting() {
 
 #[test]
 fn equalize_set_enables_it_and_reports_every_frames_gain() {
-    let report = equalization_run("stack_cli_equalize_set", &["--set", "equalize=true"]);
+    let report = equalization_run(
+        "stack_cli_equalize_set",
+        "weighted-average",
+        &["--set", "equalize=true"],
+    );
     let eq = &report["equalization"];
     assert_eq!(eq["max_gain"], 1.25);
     assert_eq!(eq["reference"], 3, "the middle frame of eight");
@@ -1508,9 +1512,77 @@ fn equalize_preset_key_enables_it_and_write_preset_writes_it_back() {
 
     let report = equalization_run(
         "stack_cli_equalize_preset_run",
+        "weighted-average",
         &["--preset", written.to_str().unwrap()],
     );
     assert_eq!(report["equalization"]["max_gain"], 1.5);
+}
+
+#[test]
+fn equalization_default_follows_the_fusion_method() {
+    let on = equalization_run("stack_cli_equalize_default_focus_map", "depth-map", &[]);
+    assert_eq!(on["equalization"]["max_gain"], 1.25, "{on}");
+    for algo in ["weighted-average", "laplacian"] {
+        let off = equalization_run(&format!("stack_cli_equalize_default_{algo}"), algo, &[]);
+        assert!(off["equalization"].is_null(), "{algo}: {off}");
+    }
+}
+
+#[test]
+fn an_explicit_equalize_false_wins_over_the_focus_map_default() {
+    let report = equalization_run(
+        "stack_cli_equalize_false_focus_map",
+        "depth-map",
+        &["--set", "equalize=false"],
+    );
+    assert!(report["equalization"].is_null(), "{report}");
+}
+
+/// A preset written by a run reproduces that run's equalization, whether it
+/// followed the method's default (nothing is written) or overrode it.
+#[test]
+fn a_written_preset_reproduces_the_focus_map_equalization_choice() {
+    let cwd = tmp_dir("stack_cli_equalize_preset_focus_map");
+    let input = mantis_512_dir();
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    for (name, extra, equalized) in [
+        ("default", vec![], true),
+        ("off", vec!["--set", "equalize=false"], false),
+    ] {
+        let written = cwd.join(format!("{name}.toml"));
+        let mut args = vec![
+            "stack",
+            input.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "depth-map",
+            "--dry-run",
+            "--write-preset",
+            written.to_str().unwrap(),
+        ];
+        args.extend(extra);
+        let dry = run_cli_in(&cwd, &args);
+        assert!(dry.success, "{name}: stderr: {}", dry.stderr);
+        let text = std::fs::read_to_string(&written).expect("the preset is written");
+        assert_eq!(
+            text.contains("equalize = false"),
+            !equalized,
+            "{name}: {text}"
+        );
+
+        let report = equalization_run(
+            &format!("stack_cli_equalize_preset_focus_map_{name}"),
+            "depth-map",
+            &["--preset", written.to_str().unwrap()],
+        );
+        assert_eq!(
+            report["equalization"].is_null(),
+            !equalized,
+            "{name}: {report}"
+        );
+    }
 }
 
 #[test]

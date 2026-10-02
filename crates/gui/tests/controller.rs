@@ -4194,6 +4194,29 @@ fn equalize_rows_reach_the_run() {
     assert_eq!(recorded.gains.len(), 3, "one gain per frame");
 }
 
+/// A `depth-map` run equalizes without the switch being touched; turning the
+/// switch off records an unequalized run.
+#[test]
+fn focus_map_run_equalizes_by_default_and_an_explicit_off_wins() {
+    use focusforge_core::params::ParamValue;
+
+    let mut controller = common::controller_with_frames("focus_map_equalize_default", 3);
+    controller.set_fuse_algorithm("depth-map");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
+    let on = controller.held_checkpoints().last().cloned().unwrap();
+    assert!(
+        on.registration.equalization.is_some(),
+        "equalized by default"
+    );
+
+    controller.set_param_value("crop", "equalize", ParamValue::Bool(false));
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
+    let off = controller.held_checkpoints().last().cloned().unwrap();
+    assert_eq!(off.registration.equalization, None, "an explicit off wins");
+}
+
 /// On an equalized `depth-map` tab a stroke's recomposited pixel is the left
 /// pane's read of that frame, and that read carries the frame's gain.
 #[test]

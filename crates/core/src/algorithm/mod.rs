@@ -439,6 +439,15 @@ pub trait StackAlgorithm: Send + Sync + 'static {
         false
     }
 
+    /// Defaults this method sets for run-level parameters
+    /// (`crate::project::PROJECT_PARAMS`) where the shared default does not
+    /// suit it, as `(parameter id, default)` pairs. Read through
+    /// `crate::project::params_for`, never directly: that is the one place a
+    /// project parameter's effective default is computed.
+    fn project_defaults(&self) -> &[(&'static str, ParamValue)] {
+        &[]
+    }
+
     /// What the tile scheduler must plan around a tile for this algorithm's
     /// fully resolved `cfg` (`crate::params::resolve` plus
     /// `crate::params::resolved_values`, same as `fuse` receives): the pixel

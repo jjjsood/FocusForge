@@ -291,6 +291,49 @@ fn project_params_json_lists_every_project_descriptor() {
     assert!(help.contains("not a linear-light correction"), "{help}");
 }
 
+/// Each fusion method's entry carries the project defaults a run with that
+/// method resolves; an alignment algorithm carries none.
+#[test]
+fn project_defaults_json_follow_the_fusion_method() {
+    let output = bin()
+        .args(["algorithms", "--json"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "{:?}", output.status);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    for algorithm in report["algorithms"].as_array().expect("algorithms array") {
+        let id = algorithm["id"].as_str().unwrap();
+        let entry = registry::find(id).expect("registered");
+        match entry {
+            registry::AlgorithmRef::Align(_) => {
+                assert!(algorithm.get("project_defaults").is_none(), "{id}");
+            }
+            registry::AlgorithmRef::Stack(method) => {
+                let defaults = &algorithm["project_defaults"];
+                for desc in focusforge_core::project::params_for(method) {
+                    assert_eq!(
+                        defaults[desc.id.as_str()],
+                        serde_json::to_value(&desc.default).unwrap(),
+                        "{id}/{}",
+                        desc.id
+                    );
+                }
+            }
+        }
+    }
+    let equalize = |id: &str| {
+        report["algorithms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == id)
+            .unwrap_or_else(|| panic!("no {id} entry"))["project_defaults"]["equalize"]
+            .clone()
+    };
+    assert_eq!(equalize("depth-map"), true);
+    assert_eq!(equalize("laplacian"), false);
+}
+
 #[test]
 fn project_params_text_listing_names_them_after_the_algorithms() {
     let output = bin()

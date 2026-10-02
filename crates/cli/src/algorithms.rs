@@ -10,10 +10,11 @@
 //! through `focusforge_core::params::resolve_in(..., None, &host_facts)`. An
 //! `auto` hook is reported as present but unevaluated instead of being run.
 
+use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use focusforge_core::params::{ParamDesc, ParamKind, ParamValue, ParamValues, Provenance};
-use focusforge_core::project::PROJECT_PARAMS;
+use focusforge_core::project::{self, PROJECT_PARAMS};
 use focusforge_core::registry::{self, AlgorithmRef};
 use serde::Serialize;
 
@@ -23,7 +24,9 @@ use crate::set::{SetArgs, parse_settings};
 /// the single-id form (a one-element `algorithms` array). Additive only: a
 /// field added to `ParamDesc` appears in `params` without an edit here,
 /// because the descriptor is `#[serde(flatten)]`ed. `project_params` lists
-/// the run-level settings `stack --set` accepts beside an algorithm's own.
+/// the run-level settings `stack --set` accepts beside an algorithm's own,
+/// with the default that holds unless a fusion method declares its own
+/// (`project_defaults` on that method's entry).
 #[derive(Serialize)]
 struct AlgorithmsReport<'a> {
     algorithms: Vec<AlgorithmReport<'a>>,
@@ -36,6 +39,10 @@ struct AlgorithmReport<'a> {
     display_name: String,
     family: String,
     params: Vec<ParamReport<'a>>,
+    /// The default of every project setting in a run fused by this method;
+    /// absent for an alignment algorithm, which no run is fused by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_defaults: Option<BTreeMap<String, ParamValue>>,
 }
 
 #[derive(Serialize)]
@@ -125,6 +132,15 @@ fn build_report(
                 id: entry.id().to_string(),
                 display_name: entry.display_name().to_string(),
                 family: entry.family().to_string(),
+                project_defaults: match entry {
+                    AlgorithmRef::Stack(method) => Some(
+                        project::params_for(*method)
+                            .into_iter()
+                            .map(|desc| (desc.id, desc.default))
+                            .collect(),
+                    ),
+                    AlgorithmRef::Align(_) => None,
+                },
                 params: entry
                     .params()
                     .iter()
@@ -213,6 +229,15 @@ fn render_schema(algo: &AlgorithmReport<'_>) -> String {
         if p.has_host_default {
             lines.push("    host default: present, evaluated".to_string());
         }
+    }
+    if let Some(defaults) = &algo.project_defaults {
+        lines.push("  project settings default:".to_string());
+        lines.extend(defaults.iter().map(|(id, value)| {
+            format!(
+                "    {id}: {}",
+                serde_json::to_string(value).unwrap_or_else(|_| "?".to_string())
+            )
+        }));
     }
     lines.join("\n")
 }
