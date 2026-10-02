@@ -3319,6 +3319,31 @@ impl AppController {
         tab.viewport.as_ref()?.draw(image, right)
     }
 
+    /// The low-detail whole-image draw behind the left pane's exact
+    /// texture, over the same image and pane as [`Self::frame_draw`].
+    pub fn frame_backdrop_draw(&self) -> Option<PaneDraw> {
+        let image = display_image(self.state.active()?)?;
+        let (left, _) = self.state.panes?;
+        crate::viewport::backdrop_draw(image, left)
+    }
+
+    /// The right pane's counterpart of [`Self::frame_backdrop_draw`], over
+    /// the image [`Self::plane_draw`] draws.
+    pub fn plane_backdrop_draw(&self) -> Option<PaneDraw> {
+        let image = display_image(self.state.active()?)?;
+        let (_, right) = self.state.panes?;
+        crate::viewport::backdrop_draw(image, right)
+    }
+
+    /// Whether the active tab's edits have settled: no live stroke and no
+    /// recomposite queued or in flight. `true` with no edit session.
+    pub fn edits_settled(&self) -> bool {
+        self.state
+            .active()
+            .and_then(|tab| tab.edit.as_ref())
+            .is_none_or(job::EditState::is_settled)
+    }
+
     /// The one wheel entry point. Axis normalisation first: an unmodified
     /// `delta_x`-dominant event resolves to the same row as
     /// `shift + delta_y`, because platforms commonly deliver a shifted

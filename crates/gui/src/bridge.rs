@@ -200,11 +200,14 @@ impl Canvas {
     }
 
     /// Hands the worker one request for every pane whose texture does not
-    /// yet show its draw; a request still pending is replaced by it.
+    /// yet show its draw; a request still pending is replaced by it. Each
+    /// pane's backdrop read is queued behind it, once per content change;
+    /// `None` for a backdrop draw skips that pane's.
     fn request_reads(
         &mut self,
         frame: Option<&PaneDraw>,
         plane: Option<&PaneDraw>,
+        backdrops: (Option<&PaneDraw>, Option<&PaneDraw>),
         generation: Option<u64>,
         overlay: Option<&OverlayDraw>,
     ) {
@@ -220,6 +223,18 @@ impl Canvas {
         if !jobs.is_empty() {
             preparer.submit(jobs);
         }
+        let (frame_backdrop, plane_backdrop) = backdrops;
+        let backdrop_jobs: Vec<PaneJob> = frame_backdrop
+            .and_then(|draw| renderer.request_frame_backdrop(draw))
+            .into_iter()
+            .chain(
+                plane_backdrop
+                    .and_then(|draw| renderer.request_plane_backdrop(draw, generation, overlay)),
+            )
+            .collect();
+        if !backdrop_jobs.is_empty() {
+            preparer.submit_backdrop(backdrop_jobs);
+        }
     }
 
     /// Renders whatever the worker completed into the panes' textures, the
@@ -233,7 +248,11 @@ impl Canvas {
             for prepared in &done {
                 let stamp = prepared.job.stamp;
                 let _scope = measurement_scope_with_fields(
-                    "gui_canvas_publish",
+                    if prepared.job.backdrop {
+                        "gui_canvas_backdrop_publish"
+                    } else {
+                        "gui_canvas_publish"
+                    },
                     stamp,
                     stamp,
                     1,
@@ -328,6 +347,29 @@ fn show_panes(
             app.set_frame_image_h(0.0);
         }
     }
+
+    // The backdrop shows wherever it exists, whether or not the exact
+    // texture does; only a pane with neither is cleared.
+    let (backdrop, rect) = frame_draw
+        .and_then(|draw| renderer?.backdrop_placement(Pane::Frame, &draw))
+        .unwrap_or_default();
+    app.set_frame_backdrop(backdrop);
+    app.set_frame_backdrop_x(rect.0);
+    app.set_frame_backdrop_y(rect.1);
+    app.set_frame_backdrop_w(rect.2);
+    app.set_frame_backdrop_h(rect.3);
+    let (backdrop, rect) = plane_draw
+        .and_then(|draw| {
+            let renderer = renderer?;
+            (renderer.plane() == PaneSource::Composite)
+                .then(|| renderer.backdrop_placement(Pane::Composite, &draw))?
+        })
+        .unwrap_or_default();
+    app.set_backdrop(backdrop);
+    app.set_backdrop_x(rect.0);
+    app.set_backdrop_y(rect.1);
+    app.set_backdrop_w(rect.2);
+    app.set_backdrop_h(rect.3);
 
     let planes = plane_draw.and_then(|draw| {
         let renderer = renderer?;
@@ -479,9 +521,22 @@ pub fn repaint(
     }
     push_brush_cursor(app, &controller.lock().unwrap());
 
+    let (frame_backdrop, plane_backdrop) = {
+        let controller = controller.lock().unwrap();
+        // A live stroke or an unfinished recomposite changes the edit
+        // generation every tick; the composite backdrop waits for them.
+        (
+            controller.frame_backdrop_draw(),
+            controller
+                .edits_settled()
+                .then(|| controller.plane_backdrop_draw())
+                .flatten(),
+        )
+    };
     canvas.borrow_mut().request_reads(
         frame_draw.as_ref(),
         plane_draw.as_ref(),
+        (frame_backdrop.as_ref(), plane_backdrop.as_ref()),
         generation,
         overlay.as_ref(),
     );

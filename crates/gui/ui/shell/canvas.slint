@@ -73,6 +73,13 @@ export component FFPane inherits Rectangle {
     in property <length> image-w;
     in property <length> image-h;
     in property <bool> pixelated;
+    // A low-detail view of the whole image, drawn beneath `source` so that
+    // part of the pane `source` does not cover still shows image content.
+    in property <image> backdrop;
+    in property <length> backdrop-x;
+    in property <length> backdrop-y;
+    in property <length> backdrop-w;
+    in property <length> backdrop-h;
     // Set on the right pane only, while editor mode is active -- marks it
     // as the paint target.
     in property <bool> accent-border: false;
@@ -83,6 +90,16 @@ export component FFPane inherits Rectangle {
     border-width: root.accent-border ? 1px : 0px;
     border-color: Theme.accent-default;
     clip: true;
+
+    Image {
+        source: root.backdrop;
+        x: root.backdrop-x;
+        y: root.backdrop-y;
+        width: root.backdrop-w;
+        height: root.backdrop-h;
+        image-fit: fill;
+        image-rendering: ImageRendering.smooth;
+    }
 
     Image {
         source: root.source;
@@ -151,6 +168,17 @@ export component FFCanvas inherits Rectangle {
     in property <length> frame-image-y;
     in property <length> frame-image-w;
     in property <length> frame-image-h;
+    // Each pane's low-detail backdrop -- see `FFPane::backdrop`.
+    in property <image> frame-backdrop;
+    in property <length> frame-backdrop-x;
+    in property <length> frame-backdrop-y;
+    in property <length> frame-backdrop-w;
+    in property <length> frame-backdrop-h;
+    in property <image> backdrop;
+    in property <length> backdrop-x;
+    in property <length> backdrop-y;
+    in property <length> backdrop-w;
+    in property <length> backdrop-h;
     in property <bool> pixelated;
     // Whether editor mode is active -- the right pane's accent border and
     // the brush cursor both show only then.
@@ -266,6 +294,11 @@ export component FFCanvas inherits Rectangle {
         image-y: root.frame-image-y;
         image-w: root.frame-image-w;
         image-h: root.frame-image-h;
+        backdrop: root.frame-backdrop;
+        backdrop-x: root.frame-backdrop-x;
+        backdrop-y: root.frame-backdrop-y;
+        backdrop-w: root.frame-backdrop-w;
+        backdrop-h: root.frame-backdrop-h;
         pixelated: root.pixelated;
         undock-requested => { root.composite-undock-requested(); }
     }
@@ -294,6 +327,11 @@ export component FFCanvas inherits Rectangle {
         image-y: root.image-y;
         image-w: root.image-w;
         image-h: root.image-h;
+        backdrop: root.backdrop;
+        backdrop-x: root.backdrop-x;
+        backdrop-y: root.backdrop-y;
+        backdrop-w: root.backdrop-w;
+        backdrop-h: root.backdrop-h;
         pixelated: root.pixelated;
         undock-requested => { root.zmap-undock-requested(); }
     }

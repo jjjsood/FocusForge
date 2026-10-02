@@ -1006,6 +1006,12 @@ impl EditState {
         }
     }
 
+    /// Whether no stroke is live and no recomposite is queued or in flight,
+    /// so the resident tiles hold every edit the indices do.
+    pub fn is_settled(&self) -> bool {
+        self.stroke.is_none() && self.recomposites.queued.is_empty() && !self.recomposites.in_flight
+    }
+
     /// Installs the batch a worker has parked, in the order its regions were
     /// queued, then dispatches whatever queued meanwhile. A region whose
     /// read failed is logged and leaves its tiles as they were. Returns

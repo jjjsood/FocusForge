@@ -57,6 +57,34 @@ pub fn fit_scale(image: ImageSize, pane: PaneRect) -> f64 {
     sx.min(sy)
 }
 
+/// The whole image read at the smallest step whose decimated extent fits
+/// `pane` on both axes -- the low-detail view that backs a pane while its
+/// exact texture covers only part of the image. Only `src` and `step` are
+/// meaningful: the texture is placed through the viewport's own
+/// [`PaneDraw::place`], never through this draw's `dst`, which is the
+/// texture's own extent. `None` for an empty image or pane.
+pub fn backdrop_draw(image: ImageSize, pane: PaneRect) -> Option<PaneDraw> {
+    if image.width == 0 || image.height == 0 || pane.width <= 0.0 || pane.height <= 0.0 {
+        return None;
+    }
+    let axis = |image: u32, pane: f32| (image as f64 / pane as f64).ceil() as u32;
+    let step = axis(image.width, pane.width)
+        .max(axis(image.height, pane.height))
+        .max(1);
+    let step = NonZeroU32::new(step).expect("step is clamped to at least 1");
+    let draw = PaneDraw {
+        src: (0, 0, image.width, image.height),
+        dst: (0.0, 0.0, 0.0, 0.0),
+        pixelated: false,
+        step,
+    };
+    let (width, height) = draw.extent();
+    Some(PaneDraw {
+        dst: (0.0, 0.0, width as f32, height as f32),
+        ..draw
+    })
+}
+
 /// Wheel zoom moves through this fixed stop ladder.
 pub const FIXED_STOPS: [f64; 11] = [0.125, 0.25, 0.33, 0.50, 0.67, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0];
 

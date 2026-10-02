@@ -284,6 +284,18 @@ export component AppWindow inherits Window {
     in property <length> frame-image-y;
     in property <length> frame-image-w;
     in property <length> frame-image-h;
+    // Each pane's low-detail whole-image backdrop and its placement, set
+    // from Rust like the sources above.
+    in property <image> frame-backdrop;
+    in property <length> frame-backdrop-x;
+    in property <length> frame-backdrop-y;
+    in property <length> frame-backdrop-w;
+    in property <length> frame-backdrop-h;
+    in property <image> backdrop;
+    in property <length> backdrop-x;
+    in property <length> backdrop-y;
+    in property <length> backdrop-w;
+    in property <length> backdrop-h;
     in property <bool> pixelated;
     callback canvas-resized();
     out property <length> canvas-pane-left-x: canvas.pane-left-x;
@@ -334,6 +346,16 @@ export component AppWindow inherits Window {
             frame-image-y: root.frame-image-y;
             frame-image-w: root.frame-image-w;
             frame-image-h: root.frame-image-h;
+            frame-backdrop: root.frame-backdrop;
+            frame-backdrop-x: root.frame-backdrop-x;
+            frame-backdrop-y: root.frame-backdrop-y;
+            frame-backdrop-w: root.frame-backdrop-w;
+            frame-backdrop-h: root.frame-backdrop-h;
+            backdrop: root.backdrop;
+            backdrop-x: root.backdrop-x;
+            backdrop-y: root.backdrop-y;
+            backdrop-w: root.backdrop-w;
+            backdrop-h: root.backdrop-h;
             pixelated: root.pixelated;
             show-empty-state: root.show-empty-state;
             load-active: root.load-active;

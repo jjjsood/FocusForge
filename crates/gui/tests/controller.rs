@@ -4594,6 +4594,50 @@ fn a_stroke_recomposites_off_the_ui_thread() {
     sealed.assert_shown(&c, "after the undo settles");
 }
 
+/// Edits count as settled only with no live stroke and no recomposite
+/// queued or in flight; a settle after the last install makes them settled.
+#[test]
+fn edits_settle_after_the_last_recomposite() {
+    let (mut c, _root) = open_editor("edits_settle");
+    let gate = Gate::install(&mut c);
+    set_size(&mut c, 12.0);
+    c.select_frame(1);
+    assert!(c.edits_settled(), "an untouched session is settled");
+
+    let path: Vec<(f32, f32)> = (0..12)
+        .map(|i| (8.0 + 3.0 * i as f32, 20.0 + i as f32))
+        .collect();
+    let screen: Vec<(f32, f32)> = path.iter().map(|&(x, y)| at(x, y)).collect();
+    press(&mut c, screen[0]);
+    assert!(!c.edits_settled(), "a live stroke is not settled");
+    for &(x, y) in &screen[1..] {
+        c.pointer_moved(x, y);
+    }
+    c.flush_live_stroke();
+    assert!(
+        !c.edits_settled(),
+        "a stroke tick with its recomposite in flight is not settled"
+    );
+
+    release(&mut c, *screen.last().unwrap());
+    assert!(
+        !c.edits_settled(),
+        "a committed stroke whose recomposite is unfinished is not settled"
+    );
+    assert!(
+        !c.settle_recomposites(),
+        "the gated worker has not parked its result"
+    );
+    assert!(!c.edits_settled(), "still in flight after a settle poll");
+
+    gate.open();
+    common::settle_recomposites(&mut c);
+    assert!(c.edits_settled(), "settled after the last install");
+
+    drag(&mut c, &[(10.0, 10.0), (30.0, 20.0)]);
+    assert!(c.edits_settled(), "a settled drag leaves nothing pending");
+}
+
 #[test]
 fn background_recomposite_matches_the_synchronous_one() {
     let name = "recomposite_matches_sync";

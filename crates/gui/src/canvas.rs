@@ -22,7 +22,7 @@ use focusforge_core::display::alpha_from_opacity;
 use focusforge_core::io::{FrameError, FrameReader, TiffStack, open_frame_set};
 use focusforge_core::retouch::{RetouchError, Sources, recomposite as recomposite_region};
 use focusforge_core::tile::{HostBudget, Rect};
-use focusforge_core::timing::{TimingCounter, record_timing};
+use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
 use focusforge_core::zmap::{ZMapError, ZMapReader, overlay_table};
 
 use crate::viewport::PaneDraw;
@@ -420,6 +420,9 @@ pub struct PaneJob {
     pub indices: Option<Arc<dyn PaneReader>>,
     /// The edit generation and overlay this job's result is drawn under.
     pub state: EditState,
+    /// Whether this is the low-detail whole-image read behind the pane's
+    /// exact texture rather than the exact view.
+    pub backdrop: bool,
 }
 
 /// What besides `src`/`step` a pane's content depends on: the edit session's
@@ -503,7 +506,11 @@ const POOLED_BUFFERS: usize = 6;
 #[derive(Default)]
 struct PreparerState {
     pending: Option<Vec<PaneJob>>,
+    /// Backdrop reads, served only while `pending` is empty.
+    pending_backdrop: Vec<PaneJob>,
     done: Option<Vec<Prepared>>,
+    /// Finished backdrop reads, one per pane at most; never replaces `done`.
+    done_backdrop: Vec<Prepared>,
     pool: Vec<Vec<u16>>,
     shutdown: bool,
     spawned: bool,
@@ -556,6 +563,24 @@ impl Preparer {
     pub fn submit(&self, jobs: Vec<PaneJob>) {
         let mut state = self.shared.lock();
         state.pending = Some(jobs);
+        self.start_worker(&mut state);
+    }
+
+    /// Queues low-priority backdrop reads: the worker takes them only while
+    /// no exact request is pending. A job replaces a pending one for the
+    /// same pane and leaves the other panes' alone; never blocks on a read.
+    pub fn submit_backdrop(&self, jobs: Vec<PaneJob>) {
+        let mut state = self.shared.lock();
+        for job in jobs {
+            state
+                .pending_backdrop
+                .retain(|queued| queued.pane != job.pane);
+            state.pending_backdrop.push(job);
+        }
+        self.start_worker(&mut state);
+    }
+
+    fn start_worker(&self, state: &mut PreparerState) {
         if !state.spawned {
             state.spawned = true;
             let shared = self.shared.clone();
@@ -568,9 +593,13 @@ impl Preparer {
         self.shared.wakeup.notify_one();
     }
 
-    /// The newest completed request, if one landed since the last call.
+    /// The newest completed exact request, then any completed backdrop
+    /// reads, if some landed since the last call.
     pub fn take(&self) -> Option<Vec<Prepared>> {
-        self.shared.lock().done.take()
+        let mut state = self.shared.lock();
+        let mut done = state.done.take().unwrap_or_default();
+        done.append(&mut state.done_backdrop);
+        (!done.is_empty()).then_some(done)
     }
 
     /// Hands consumed buffers back for the next request to read into.
@@ -594,14 +623,17 @@ impl Drop for Preparer {
 
 fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
     loop {
-        let (jobs, mut buffers) = {
+        let (jobs, backdrop, mut buffers) = {
             let mut state = shared.lock();
-            let jobs = loop {
+            let (jobs, backdrop) = loop {
                 if state.shutdown {
                     return;
                 }
                 if let Some(jobs) = state.pending.take() {
-                    break jobs;
+                    break (jobs, false);
+                }
+                if !state.pending_backdrop.is_empty() {
+                    break (std::mem::take(&mut state.pending_backdrop), true);
                 }
                 state = shared
                     .wakeup
@@ -614,7 +646,7 @@ fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
                 .sum();
             let keep = state.pool.len().saturating_sub(wanted);
             let buffers = state.pool.split_off(keep);
-            (jobs, buffers)
+            (jobs, backdrop, buffers)
         };
         let prepared: Vec<Prepared> = jobs
             .into_iter()
@@ -625,6 +657,7 @@ fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
                 } else {
                     Vec::new()
                 };
+                let _scope = backdrop.then(|| measurement_scope("gui_canvas_backdrop_read"));
                 read_job(job, samples, indices)
             })
             .collect();
@@ -636,18 +669,25 @@ fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
         if prepared.is_empty() {
             continue;
         }
-        let was_empty = match state.done.replace(prepared) {
-            Some(replaced) => {
-                for stale in replaced {
-                    state.pool_buffer(stale.samples);
-                    if stale.indices.capacity() > 0 {
-                        state.pool_buffer(stale.indices);
-                    }
+        let was_empty = state.done.is_none() && state.done_backdrop.is_empty();
+        let mut stale = Vec::new();
+        if backdrop {
+            for fresh in prepared {
+                let parked = &mut state.done_backdrop;
+                if let Some(at) = parked.iter().position(|p| p.job.pane == fresh.job.pane) {
+                    stale.push(parked.swap_remove(at));
                 }
-                false
+                parked.push(fresh);
             }
-            None => true,
-        };
+        } else {
+            stale.extend(state.done.replace(prepared).into_iter().flatten());
+        }
+        for spent in stale {
+            state.pool_buffer(spent.samples);
+            if spent.indices.capacity() > 0 {
+                state.pool_buffer(spent.indices);
+            }
+        }
         drop(state);
         if was_empty {
             wake();
