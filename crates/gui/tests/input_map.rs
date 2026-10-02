@@ -406,11 +406,11 @@ fn unwritable_config_dir_is_not_fatal() {
     assert_eq!(loaded.table, InputTable::default());
 }
 
-/// Writes `toml` (the bare top-level shape: `[[bindings]]` rows) as `settings.toml`'s `[input]` table, loads it, and
-/// asserts the load fell back to the defaults with exactly one problem --
-/// the common shape every case below shares. Returns that problem alongside
-/// the path it was written to, so a caller can still check a path- or
-/// spelling-specific field.
+/// Writes `toml` (the bare top-level shape: `[[bindings]]` rows) as
+/// `settings.toml`'s `[input]` table, loads it, and asserts the load fell
+/// back to the defaults with exactly one problem -- the common shape every
+/// case below shares. Returns that problem alongside the path it was written
+/// to, so a caller can still check a path- or spelling-specific field.
 fn expect_one_problem(toml: &str) -> (PathBuf, input_config::ConfigError) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("settings.toml");
