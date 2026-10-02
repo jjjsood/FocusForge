@@ -53,21 +53,23 @@ pub fn resolve_backend(algorithm_id: &str, no_gpu: bool, max_vram: Option<u64>) 
 }
 
 /// [`resolve_backend`] for the align stage: prints the one-line reason to
-/// stderr (also under `--quiet`) and returns the accelerator with the
-/// adapter's display, or [`AlignBackendChoice::cpu`].
+/// stderr (also under `--quiet`) when the CPU is chosen up front, and
+/// otherwise returns an accelerator that opens the adapter on the first level
+/// it serves and prints its selection line then.
 pub fn resolve_align_backend(
     algorithm_id: &str,
     no_gpu: bool,
     max_vram: Option<u64>,
 ) -> AlignBackendChoice {
-    let (backend, message) = align_backend_for(algorithm_id, no_gpu, max_vram);
+    let (backend, message) =
+        align_backend_for(algorithm_id, no_gpu, max_vram, |line| eprintln!("{line}"));
     if !message.is_empty() {
         eprintln!("{message}");
     }
     match backend {
         Some(backend) => AlignBackendChoice {
             backend: Some(backend as &dyn AlignBackend),
-            adapter: Some(backend.info().to_string()),
+            adapter: Some(backend.adapter()),
         },
         None => AlignBackendChoice::cpu(),
     }

@@ -351,7 +351,7 @@ impl TileBackend for GpuBackend {
         .and_then(std::convert::identity);
 
         #[cfg(feature = "gpu-tests")]
-        forced_device_loss(device);
+        forced_device_loss(self.device);
 
         result
     }
@@ -385,10 +385,9 @@ impl GpuBackend {
 
 /// Destroys the shared device once `FF_FORCE_DEVICE_LOST` GPU operations have
 /// run -- fused tiles and ECC iterations alike; an absent or unparsable value
-/// does nothing. The poll is what makes the loss observable: wgpu runs the
-/// device-lost callback from a poll, not from `destroy`.
+/// does nothing. The destroying call returns once the loss is observable.
 #[cfg(feature = "gpu-tests")]
-pub(crate) fn forced_device_loss(device: &wgpu::Device) {
+pub(crate) fn forced_device_loss(device: &SharedDevice) {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static GPU_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -400,8 +399,7 @@ pub(crate) fn forced_device_loss(device: &wgpu::Device) {
         return;
     };
     if GPU_OPERATIONS.fetch_add(1, Ordering::SeqCst) + 1 == after {
-        device.destroy();
-        let _ = device.poll(wgpu::PollType::Poll);
+        device.force_loss();
     }
 }
 
@@ -454,17 +452,76 @@ pub fn backend_for(
     }
 }
 
+/// The align stage's accelerator, opened on the first ECC level routed to it:
+/// the adapter, device and budget come up inside the first
+/// [`AlignBackend::open_ecc`] call, so a run whose levels all fall below the
+/// offload threshold never touches the GPU. A failed bring-up declines that
+/// level and every later one, which then run on the CPU.
+pub struct LazyAlignBackend {
+    max_vram: Option<u64>,
+    announce: fn(&str),
+    selected: OnceLock<Option<&'static GpuBackend>>,
+    adapter: OnceLock<String>,
+}
+
+impl LazyAlignBackend {
+    /// The adapter's display once a level has opened it; empty before, and
+    /// when the bring-up failed.
+    pub fn adapter(&self) -> &OnceLock<String> {
+        &self.adapter
+    }
+
+    /// Brings the backend up on first call and reports the outcome to
+    /// `announce` once, as one line.
+    fn resolve(&self) -> Option<&'static GpuBackend> {
+        *self.selected.get_or_init(|| {
+            let (backend, line) = match gpu_backend_capped(self.max_vram) {
+                Ok(backend) => (
+                    Some(backend),
+                    format!(
+                        "alignment offloads large levels to {}; device budget {} bytes",
+                        backend.info(),
+                        backend.device_budget().bytes()
+                    ),
+                ),
+                Err(err) => (None, cpu_fallback_line(err)),
+            };
+            if let Some(backend) = backend {
+                let _ = self.adapter.set(backend.info().to_string());
+            }
+            (self.announce)(&line);
+            backend
+        })
+    }
+}
+
+impl AlignBackend for LazyAlignBackend {
+    fn open_ecc(
+        &self,
+        request: &EccSessionRequest<'_>,
+    ) -> Result<Option<Box<dyn EccMomentSession>>, AlgorithmError> {
+        match self.resolve() {
+            Some(backend) => backend.open_ecc(request),
+            None => Ok(None),
+        }
+    }
+}
+
+static LAZY_ALIGN_BACKEND: OnceLock<LazyAlignBackend> = OnceLock::new();
+
 /// [`backend_for`] for the align stage: only the pyramidal ECC aligner has a
-/// GPU path, so every other `algorithm_id` stays on the CPU with an empty
-/// reason and no adapter probe. The backend is the same
-/// [`gpu_backend_capped`] singleton the fuse path uses. The reason line never
-/// carries the `adapter selected: ` prefix [`backend_for`] prints, so a run
-/// that resolves both paths logs that prefix once.
+/// GPU path, so any other `algorithm_id` stays on the CPU with an empty reason
+/// and `no_gpu` with its reason, neither probing an adapter. Otherwise the
+/// [`LazyAlignBackend`] shares the [`gpu_backend_capped`] singleton and passes
+/// its selection line to `announce` on first use. The line never starts with
+/// [`backend_for`]'s `adapter selected: `. The first call's `max_vram` and
+/// `announce` win.
 pub fn align_backend_for(
     algorithm_id: &str,
     no_gpu: bool,
     max_vram: Option<u64>,
-) -> (Option<&'static GpuBackend>, String) {
+    announce: fn(&str),
+) -> (Option<&'static LazyAlignBackend>, String) {
     use focusforge_core::algorithm::AlignAlgorithm;
     if algorithm_id != focusforge_core::align::PyramidalEcc.id() {
         return (None, String::new());
@@ -472,17 +529,13 @@ pub fn align_backend_for(
     if no_gpu {
         return (None, "--no-gpu given: aligning on the CPU".to_string());
     }
-    match gpu_backend_capped(max_vram) {
-        Ok(backend) => (
-            Some(backend),
-            format!(
-                "alignment offloads large levels to {}; device budget {} bytes",
-                backend.info(),
-                backend.device_budget().bytes()
-            ),
-        ),
-        Err(err) => (None, cpu_fallback_line(err)),
-    }
+    let lazy = LAZY_ALIGN_BACKEND.get_or_init(|| LazyAlignBackend {
+        max_vram,
+        announce,
+        selected: OnceLock::new(),
+        adapter: OnceLock::new(),
+    });
+    (Some(lazy), String::new())
 }
 
 /// Reason-led, because [`GpuError::VramExhausted`] (an adapter that cannot
@@ -537,13 +590,13 @@ mod tests {
     #[test]
     fn align_backend_for_cpu_selection() {
         for max_vram in [None, Some(0)] {
-            let (backend, message) = align_backend_for(PyramidalEcc.id(), true, max_vram);
+            let (backend, message) = align_backend_for(PyramidalEcc.id(), true, max_vram, |_| {});
             assert!(backend.is_none());
             assert_eq!(message, "--no-gpu given: aligning on the CPU");
             assert!(!message.contains("adapter selected: "));
 
             for no_gpu in [false, true] {
-                let (backend, message) = align_backend_for("unsupported", no_gpu, max_vram);
+                let (backend, message) = align_backend_for("unsupported", no_gpu, max_vram, |_| {});
                 assert!(backend.is_none());
                 assert!(message.is_empty());
             }

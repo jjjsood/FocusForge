@@ -938,7 +938,11 @@ fn align_reruns_on_cpu_after_device_loss() {
         "a lost device must still finish: {}",
         lost.stderr
     );
-    assert_eq!(lost_report["align_backend"], "cpu");
+    assert_eq!(
+        lost_report["align_backend"], "cpu",
+        "stderr: {}\nreport: {lost_report}",
+        lost.stderr
+    );
     assert!(
         lost.stderr.contains("reran on the CPU"),
         "stderr must give the loss reason: {}",
@@ -988,19 +992,55 @@ fn align_no_gpu_never_probes_an_adapter() {
     );
 }
 
+/// A run with no level reaching the GPU threshold never opens the adapter:
+/// the log holds no adapter record and stderr no selection line.
+#[test]
+fn align_without_eligible_region_never_probes_an_adapter() {
+    let cwd = common::tmp_dir("cli_gpu_align_small_cwd");
+    let mut cmd = bin();
+    let data_dir = common::data_dir_of(&cmd);
+    cmd.args([
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--json",
+    ]);
+    let out = CliOutput::from(
+        cmd.current_dir(&*cwd)
+            .output()
+            .expect("failed to run binary"),
+    );
+    assert!(out.success, "stderr: {}", out.stderr);
+    let log = std::fs::read_to_string(log_path(&data_dir)).unwrap_or_default();
+    assert!(
+        !log.contains("graphics adapter selected"),
+        "a run with no eligible region must not probe an adapter: {log}"
+    );
+    assert!(
+        !out.stderr.contains("(backend="),
+        "stderr must carry no adapter line: {}",
+        out.stderr
+    );
+}
+
 /// With no adapter the alignment runs on the CPU and says why.
 #[test]
 fn align_without_adapter_runs_on_cpu() {
     let cwd = common::tmp_dir("cli_gpu_align_no_adapter_cwd");
+    let input = large_synthetic_stack("cli_gpu_align_no_adapter_in");
     let Some(out) = run_with_no_adapter(
         &cwd,
         &[
             "align",
-            mantis_512_dir().to_str().unwrap(),
+            input.to_str().unwrap(),
             "--algo",
             "pyramidal-ecc",
             "--lax",
             "--json",
+            "--set",
+            "mode=translation",
         ],
     ) else {
         return;
@@ -1033,21 +1073,34 @@ fn align_max_vram_caps_the_gpu_backend() {
     assert_ne!(report["align_backend"], "cpu", "report: {report}");
 }
 
-/// A stack with no eligible region reports `cpu` even though an adapter was
-/// selected, and the selection line names that adapter.
+/// The selection line is printed once, at first use, and names the adapter
+/// the report names; a stack with no eligible region reports `cpu`.
 #[test]
 fn align_report_names_the_backend() {
     let cwd = common::tmp_dir("cli_gpu_align_names_cwd");
-    let (out, report) = align_json(bin(), &cwd, &mantis_512_dir(), &[]);
+    let input = large_synthetic_stack("cli_gpu_align_names_in");
+    let (out, report) = align_json(bin(), &cwd, &input, &TRANSLATION);
     assert!(out.success, "stderr: {}", out.stderr);
-    let line = out
+    let lines: Vec<&str> = out
         .stderr
         .lines()
-        .find(|line| line.contains("(backend="))
-        .unwrap_or_else(|| panic!("stderr must name the adapter: {}", out.stderr));
+        .filter(|line| line.contains("(backend="))
+        .collect();
+    assert_eq!(lines.len(), 1, "one selection line: {}", out.stderr);
     assert!(
-        !line.contains("adapter selected: "),
-        "the selection line must not repeat the fuse path's prefix: {line}"
+        !lines[0].contains("adapter selected: "),
+        "the selection line must not repeat the fuse path's prefix: {}",
+        lines[0]
     );
-    assert_eq!(report["align_backend"], "cpu");
+    let adapter = report["align_backend"].as_str().expect("align_backend");
+    assert_ne!(adapter, "cpu");
+    assert!(
+        lines[0].contains(adapter),
+        "the line must name {adapter}: {}",
+        lines[0]
+    );
+
+    let (small, small_report) = align_json(bin(), &cwd, &mantis_512_dir(), &[]);
+    assert!(small.success, "stderr: {}", small.stderr);
+    assert_eq!(small_report["align_backend"], "cpu");
 }

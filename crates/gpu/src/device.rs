@@ -186,14 +186,21 @@ impl SharedDevice {
         crate::errors::compute_device_lost()
     }
 
-    /// Destroys the device and polls once, so the device-lost callback --
-    /// queued rather than run synchronously by `destroy` -- has already
-    /// fired by the time this returns. For driving a loss in a test session
-    /// that never dispatches a kernel, where nothing else would ever poll.
+    /// Destroys the device and polls until the loss flag is set, so the loss
+    /// is observable on return. Panics if the flag is still unset after 1000
+    /// polls, 1 ms apart.
     #[cfg(feature = "gpu-tests")]
     pub fn force_loss(&self) {
+        const POLLS: u32 = 1000;
         self.device.destroy();
-        let _ = self.device.poll(wgpu::PollType::Poll);
+        for _ in 0..POLLS {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            if crate::errors::compute_device_lost() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("forced device loss was not observed after {POLLS} polls");
     }
 }
 

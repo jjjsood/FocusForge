@@ -582,7 +582,7 @@ impl EccMomentSession for Session {
 
         #[cfg(feature = "gpu-tests")]
         {
-            crate::harness::forced_device_loss(self.device.device());
+            crate::harness::forced_device_loss(self.device);
             if outcome.is_ok() && self.device.lost() {
                 return Err(AlgorithmError::BackendLost {
                     detail: "the device was lost during an ECC iteration".to_string(),

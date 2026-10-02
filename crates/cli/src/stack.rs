@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use focusforge_core::algorithm::StackAlgorithm;
@@ -173,11 +173,11 @@ impl BackendChoice {
 }
 
 /// `resolve_align_backend`'s return value: the align stage's accelerator and
-/// the adapter's display, which the reports name only when a level actually
-/// ran on it.
+/// the cell holding the adapter's display once the accelerator opens it, which
+/// the reports name only when a level actually ran on it.
 pub struct AlignBackendChoice {
     pub backend: Option<&'static dyn AlignBackend>,
-    pub adapter: Option<String>,
+    pub adapter: Option<&'static OnceLock<String>>,
 }
 
 impl AlignBackendChoice {
@@ -192,7 +192,7 @@ impl AlignBackendChoice {
     /// The report's `align_backend` value for a run whose accelerator was
     /// used (or not).
     pub fn report_name(&self, used: bool) -> String {
-        match (&self.adapter, used) {
+        match (self.adapter.and_then(OnceLock::get), used) {
             (Some(adapter), true) => adapter.clone(),
             _ => "cpu".to_string(),
         }
