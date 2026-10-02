@@ -7,7 +7,9 @@ crates/core/   TIFF and RAW I/O, tiles, stacking and alignment algorithms, the
                Z-Map and its retouch op log (brush strokes, undo/redo, the
                rainbow overlay palette), the job engine (pause/resume/cancel
                over tile-sized work units), the stage cache, grouping
-               proposals and the `.ffp` project container
+               proposals, the `.ffp` project container and its
+               checkpoint history (op log replay, sparse delta blobs,
+               image export in TIFF, PNG and JPEG)
 crates/gpu/    the shared wgpu device, WGSL fusion/warp kernels and the
                tile-scheduler pipeline that runs them, behind the `gpu`
                feature (on by default). An allocate-and-back-off probe at
@@ -15,7 +17,8 @@ crates/gpu/    the shared wgpu device, WGSL fusion/warp kernels and the
                `crates/core`'s own host-memory budget one crate over
 crates/cli/    focusforge-cli, the headless interface: every algorithm,
                every batch-run control (grouping, presets, resume, review,
-               the stage cache) and the retouch op list are reachable here
+               the stage cache), the retouch op list, `history` and `export`
+               are reachable here
 crates/diagnostics/ the shared `tracing` subscriber (stderr sink, rotating
                JSON Lines file), the panic hook and its in-memory flight
                recorder, the native-crash monitor process and the
@@ -41,7 +44,8 @@ fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the tes
   hashing), `zip`/`zstd` for the `.ffp` container (compression backends and
   `zip`'s clock feature both off, so two seals of the same inputs produce
   identical container bytes), `sysinfo` (host memory for the adaptive
-  tile-scheduler budget), and `rawler` for RAW metadata and development.
+  tile-scheduler budget), and `rawler` for RAW metadata and development, and `png` and `jpeg-encoder`
+  (image export).
 - `focusforge-gpu`: `wgpu = "29.0.4"`, gated behind its own `gpu` Cargo
   feature, on by default on both `focusforge-gpu` and `focusforge-cli`;
   `--no-default-features` excludes it, so `cargo build --workspace
@@ -57,7 +61,7 @@ fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the tes
   declares, and `unstable-winit-030`), `slint-build` (build dependency),
   `i-slint-backend-testing` (dev dependency), `clap`, `rfd` (native
   folder/file picker), `toml`/`toml_edit`/`serde` (`settings.toml`'s
-  `[recent]` and `[input]` tables), `directories` (per-platform data/config
+  `[recent]`, `[input]` and `[export]` tables), `directories` (per-platform data/config
   paths), `png`
   (`--screenshot`), `tracing`. Inter ships bundled under `assets/fonts/`;
   the icon set is vendored from Lucide under `assets/icons/`.
@@ -86,8 +90,10 @@ and its warp and auto-crop stages, the job engine's pause/resume/cancel
 control loop, the stage cache, grouping proposals and the `.ffp` project
 container's read/write round trip, the retouch op log (brush strokes,
 undo/redo, the rainbow overlay palette) replayed against a whole-map
-oracle, and the `focusforge-cli
-stack`/`align`/`algorithms`/`export`/`retouch`/`review`/`cache`/`diagnostics`
+oracle, the checkpoint history (sparse delta blobs, snapshot cadence,
+branching, delete and import validation, the export formats), and the
+`focusforge-cli
+stack`/`align`/`algorithms`/`export`/`retouch`/`history`/`review`/`cache`/`diagnostics`
 commands end to end -- including a forced panic, a forced native crash and
 the crash notice on the next start, each driven by spawning the built
 binary as a child process so a deliberate crash never takes down the test
@@ -97,6 +103,7 @@ arithmetic, the input-binding table and its `settings.toml` file format,
 classifying a folder, a dropped set of frames or a saved project into tabs,
 the `Images` and `Settings` dock panels, editor mode's brush, pipette,
 undo/redo and overlay controls and its dual-pane cursor mirroring, the
+checkpoint panel and export dialog, the settings file, the
 projects overlay's gallery and failure cards, and the fuse worker's
 pause/resume/cancel/retry states all run headlessly through
 `i-slint-backend-testing`, with no real window; a separate windowed

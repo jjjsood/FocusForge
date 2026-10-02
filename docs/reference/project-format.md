@@ -18,25 +18,87 @@ Every entry is stored, not deflated — the blobs are already zstd-compressed
 the system clock. Two seals of the same inputs therefore produce byte-
 identical archives.
 
-- `manifest.json` — the algorithm, its resolved parameters, the source frame
-  paths, dimensions, each frame's solved alignment transform and the applied
-  crop, and a `format_version` for forward compatibility. `export --frame`
-  reads the transform and crop back to warp one source frame to the
-  composite's own extent.
-- `blobs/<hash>.zst` — the composite plane and the Z-Map plane, each named
-  by a `blake3` hash taken over its uncompressed content, so a blob's name
-  attests to what it holds.
-- `checkpoints/<hash>.json` — the project's op log; a freshly written
-  project carries one checkpoint with no parent and no ops.
+The container carries no format version. A project written by an older
+build that lacks a field the current reader needs is refused when opened
+(see [Refusals](#refusals)); re-stack the frames to get a current one.
 
-Nothing outside those three paths is ever written. A project is read by
-`focusforge-cli export` (turning it into a composite and/or Z-Map TIFF) and
-`focusforge-cli review` (reporting the outcome and parameters the manifest
-already recorded, streaming the Z-Map blob only to compute its coherence
-metric). `focusforge-cli cache` never touches a project — its `clear`
+- `manifest.json` — the algorithm, its resolved parameters, the source frame
+  paths with each file's content hash, dimensions, each frame's solved
+  alignment transform and the applied crop, and the id of the head
+  checkpoint.
+- `blobs/<hash>.zst` — the composite plane and the Z-Map planes, each named
+  by a `blake3` hash taken over its uncompressed content, so a blob's name
+  attests to what it holds. A Z-Map is stored either in full or as a sparse
+  delta: the one rectangle that differs from the map it was edited from,
+  plus the hash of that base. A retouched checkpoint therefore costs the
+  size of its edit, not of the whole map.
+- `checkpoints/<hash>.json` — one file per checkpoint: its parent, its op
+  log, the Z-Map blob it resolves to, the algorithm and parameters, a
+  creation time and a hidden flag. A checkpoint a fuse produced also
+  records that fuse's composite, alignment, crop, sources and metrics.
+
+## Checkpoints
+
+Checkpoints form a tree. A fresh stack writes one with no parent and no
+ops; saving retouch ops (`focusforge-cli history apply --save`, or the
+window's **Save checkpoint**) adds a child holding those ops. Applying ops
+onto an older checkpoint starts a new branch from it. A checkpoint's Z-Map
+is replayed from its op log over its parent's map.
+
+Deltas are chained, so a full snapshot is written again once 32 deltas
+follow the last one, or once the deltas outweigh that snapshot's own
+compressed size. Opening a deep history never replays more than that.
+
+Deleting a checkpoint hides it. A hidden checkpoint stays in the file for as
+long as a visible checkpoint is built on it, and is removed together with
+its blobs once none is. The last visible checkpoint cannot be deleted. When
+the deleted checkpoint was the head, the newest visible checkpoint becomes the
+head.
+
+Nothing outside the three paths above is ever written.
+
+## Who reads it
+
+`focusforge-cli export` renders a checkpoint to an image or writes its
+Z-Map; `focusforge-cli history` lists, materializes, extends and prunes
+checkpoints; `focusforge-cli review` reports the outcome and parameters the
+manifest recorded, streaming the Z-Map blob only to compute its coherence
+metric. `focusforge-cli cache` never touches a project — its `clear`
 subcommand only empties the stage cache under `.scratch/stage-cache/`.
 
-A source frame path a project cannot resolve relative to the project's own
-location is not a hard error: `export` and `review` name every unresolved
-source and continue — the composite and Z-Map are unaffected, since they are
-stored inside the container, not re-read from the sources.
+## Source frames
+
+A project stores the Z-Map, not pixels from the sources, so rendering an
+image from a checkpoint re-reads its source frames. Each is checked against
+the content hash recorded when the project was written:
+
+- A frame that cannot be found makes `export -o` refuse, naming every
+  missing frame. `export --zmap` alone and the `history` subcommands need no
+  frames.
+- A frame whose content changed makes `export -o` refuse, naming it. The Z-Map
+  indices would select pixels from frames the project was not stacked from.
+  `history` subcommands refuse the same way with exit code 9 unless
+  `--accept-changed-sources` is passed, which prints a warning and proceeds.
+- In the window, a project with changed frames asks before opening and
+  offers **Locate frames…** to point at the originals, or **Open anyway**.
+  A project whose frames are not where it recorded them opens with a notice
+  and the same **Locate frames…** action. A folder chosen there is accepted
+  only when its files hash to what the project recorded; otherwise it is
+  refused as not the project's frames.
+
+## Refusals
+
+A project is checked as a whole when opened, and a damaged one is refused by
+name rather than opened partially:
+
+| refusal | exit code |
+|---|---|
+| not a FocusForge project | 3 |
+| truncated or incomplete file | 4 |
+| a referenced entry is missing | 6 |
+| a blob fails its hash check | 7 |
+| a dangling parent, a parent cycle, a stack fingerprint that disagrees with the recorded sources, a delta whose base is absent, or a checkpoint with ops but no parent | 8 |
+
+A checkpoint with no ops must carry the record of its own fuse; one without
+it is refused as a damaged container. Any other failure exits 1. The
+exit codes above are those of `focusforge-cli history`.

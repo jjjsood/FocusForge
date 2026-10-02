@@ -72,6 +72,39 @@ already opened from a project writes back to that same file without asking.
 A failed save keeps every held checkpoint and reports why the write did not
 happen — nothing is lost.
 
+## Checkpoints
+
+The dock's **CHECKPOINTS** panel lists every checkpoint of the active tab,
+newest first. Click a row to restore it, hover one for its delete icon, and
+use the editor toolbar's **Save checkpoint** to keep unsaved strokes as a new
+row. Fusing, closing a tab and quitting each ask before they would drop
+unsaved strokes. See [`guide/history.md`](history.md).
+
+## Exporting an image
+
+The panel's **Export image** button is enabled once the tab shows a fused
+or retouched result, and exports the position you are looking at: a saved
+checkpoint, an unsaved fuse result, or your current unsaved edits. The
+dialog offers:
+
+- **Format** — TIFF, PNG or JPEG.
+- That format's settings, listed from the same descriptors `focusforge-cli
+  export` takes: bit depth and compression for TIFF and PNG, quality and
+  chroma subsampling for JPEG (4:2:0 by default).
+- **Metadata** — one switch. On carries the EXIF and ICC profile of the
+  reference frame; off carries nothing.
+
+**Export** then opens the system save dialog and writes the image, with
+progress shown in the dialog. The format and each format's last settings are remembered in
+`settings.toml`'s `[export]` table once an export succeeds. The image is
+rendered from the Z-Map, so the source frames are read again and checked;
+an export that cannot proceed says why instead of writing, naming each
+missing or changed frame, an image too large for the format (JPEG is limited
+to 65,535 pixels per side), or a format the image cannot be saved in (PNG
+and JPEG hold grey or RGB images only). A refusal for missing or changed
+frames offers **Locate frames…**, after which the export is retried at the
+same path.
+
 ## Retouching a result
 
 Once a tab has fused, the **STACKING / EDITOR** switch in the dock lights up
@@ -98,8 +131,8 @@ window, not only with the overlay open: Ctrl+N (**New project**), Ctrl+O
 project**). They are not part of the rebindable input map, and they do
 nothing while the settings panel or a close or quit question is open.
 
-Closing a tab that holds unsaved checkpoints asks **Save this state first?**
-and offers **Save and close** or **Close without saving**. Quitting the
+Closing a tab that holds unsaved checkpoints or strokes asks **Save this
+state first?** and offers **Save and close** or **Close anyway**. Quitting the
 window with unsaved work — including through the window manager, e.g.
 Alt+F4 — asks **Quit without saving?** and offers **Save all and quit** or
 **Quit without saving**. Dismissing either question leaves everything open.
@@ -108,8 +141,21 @@ Alt+F4 — asks **Quit without saving?** and offers **Save all and quit** or
 
 The gear at the bottom of the window opens a settings panel whose **Input
 map** section lists every stacking and editor action alongside the input
-bound to it, and where that binding came from — the shipped defaults or a
-config file. The bindings themselves live in `settings.toml`'s `[input]`
-table, next to the window's other configuration, and are edited by hand
-rather than through the window; the panel is the read-only view of what took
-effect.
+bound to it, and where that binding came from — the shipped defaults or the
+settings file. The bindings live in the `[input]` table of `settings.toml`,
+edited by hand rather than through the window; the panel is the read-only
+view of what took effect. A table with any problem is refused whole and the
+defaults apply, with the problem named: an unknown trigger or action, a
+duplicate trigger, or a trigger the map has no row for such as `alt+wheel`.
+Alt is not a wheel modifier; it is only the pipette.
+
+## The settings file
+
+`settings.toml` in the platform's per-user config directory holds
+everything the window remembers, one table per concern: `[recent]` (the
+rail's recent projects, up to five, each row needing its `path`), `[input]`
+(the bindings above) and `[export]` (the export dialog's last choice). The
+file has no version. Writing one table leaves the others, and any comments
+in them, as they were; a file that is not valid TOML is left untouched
+rather than overwritten. `--config-dir <DIR>` makes the window read and
+write `<DIR>/focusforge/settings.toml` instead.

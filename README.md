@@ -27,9 +27,13 @@ GNU General Public License v3.
 - Three stacking algorithms — Laplacian-pyramid coefficient selection,
   sharpness-weighted blending, and depth-map selection — each producing a
   Z-Map naming the source frame behind every output pixel
-- Turns a stacked project into an image file on request (`focusforge-cli
-  export`), separately from the run that produced it, so exporting is never
-  bundled into a batch you didn't ask to also render
+- Exports any checkpoint of a project as a TIFF, PNG or JPEG image
+  (`focusforge-cli export`), with per-format bit depth, compression, JPEG
+  quality and chroma subsampling, and EXIF, ICC, XMP and IPTC carried over;
+  rendered from the Z-Map, separately from the run that produced it
+- Keeps every retouch as a checkpoint in a branching history: list,
+  restore, branch from, export and delete checkpoints in the window or with
+  `focusforge-cli history`
 - Reports outcome, sharpness and Z-Map coverage per stack after a run
   (`focusforge-cli review`), so a failed stack in a batch is a visible record
   rather than a missing file
@@ -62,7 +66,8 @@ GNU General Public License v3.
   project into a tab, view the selected source frame beside the composite or Z-Map,
   choose an algorithm and edit its parameters from the same schema
   `focusforge-cli algorithms` prints, run, pause, cancel or retry a fuse,
-  and switch into editor mode to retouch the result
+  and switch into editor mode to retouch the result, browse its
+  checkpoints and export an image in the format you choose
 
 ## Quick start
 
@@ -97,7 +102,7 @@ target/release/focusforge-cli info path/to/frames/
 ```
 
 Prints one block per frame in the directory. TIFF entries show size, depth,
-byte order, compression, strip layout and whether the mmap fast path applies;
+byte order, compression and strip layout;
 RAW entries show decoder metadata without developing pixels. The report ends
 with a frame count, total size and a uniform-layout verdict. Add `--json` for
 the same report as machine-readable JSON.
@@ -113,8 +118,9 @@ target/release/focusforge-cli export path/to/frames/frames.ffp -o out.tif --zmap
 ```
 
 `stack` aligns the frames and fuses them into a project beside the frames
-(one `.ffp` file per detected stack); `export` then turns that project
-into `out.tif` and its per-pixel source map `zmap.tif`. Alignment and the
+(one `.ffp` file per detected stack); `export` then renders that project
+into `out.tif` and writes its per-pixel source map `zmap.tif`. Name the
+output `out.png` or `out.jpg` for those formats. Alignment and the
 auto-crop that precedes fusion are both on by default (`--no-align` /
 `--no-crop` turn them off); `focusforge-cli align` reports the same
 transforms on their own, before any fusion runs. See
@@ -133,9 +139,10 @@ per detected stack. See [`docs/guide/gui.md`](docs/guide/gui.md).
 
 ## Documentation
 
-See [`docs/`](docs/README.md) for the full guide and reference, including
-every `focusforge-cli` subcommand, supported RAW input, and the TIFF layouts
-it reads and writes.
+See [`docs/`](docs/README.md) for the guides (the window, stacking,
+alignment, retouching, checkpoint history, batch runs, diagnostics) and the
+reference for every `focusforge-cli` subcommand, the project format and the
+TIFF layouts it reads and writes.
 
 ## Contributing
 
