@@ -50,7 +50,7 @@ use crate::align::Transform;
 use crate::align::ecc_algorithm::{
     retained_template_bytes, seed_scratch_bytes, solve_scratch_bytes,
 };
-use crate::gpu::AlignBackend;
+use crate::gpu::{AlignBackend, EccMomentSession, EccSessionRequest};
 use crate::job::{ControlState, JobControl};
 use crate::params::{ParamValue, ParamValues, StackContext};
 use crate::tile::HostBudget;
@@ -294,6 +294,12 @@ pub struct AlignRun {
     /// `worker_limit` registrations. An explicit budget below one
     /// registration still runs one worker, so this can exceed the budget.
     pub accounted_bytes: u64,
+    /// Whether the accelerator opened at least one session and the result is
+    /// its run's, not a CPU rerun's.
+    pub backend_used: bool,
+    /// Why the whole stage reran on the CPU after the accelerator was lost;
+    /// `None` when it did not.
+    pub rerun_reason: Option<String>,
 }
 
 fn reference_policy_from_cfg(cfg: &ParamValues) -> ReferencePolicy {
@@ -470,7 +476,96 @@ pub fn align_stack(
 ///
 /// Chain mode is **serial by construction** -- see the module docs -- and
 /// always reports `worker_limit: 1, peak_workers: 1`.
+///
+/// When `options.align_backend` loses its device or runs out of memory
+/// mid-run ([`AlgorithmError::BackendLost`]), every result computed so far is
+/// discarded and the whole stage reruns on the CPU, so one alignment never
+/// mixes backends; [`AlignRun::rerun_reason`] carries the loss.
 pub fn align_stack_with(
+    algorithm: &dyn AlignAlgorithm,
+    stack: StackContext,
+    reader: &dyn TileReader,
+    cfg: &ParamValues,
+    failure: FailurePolicy,
+    options: &AlignDriverOptions<'_>,
+) -> Result<AlignRun, AlgorithmError> {
+    let Some(backend) = options.align_backend else {
+        return align_stack_once(algorithm, stack, reader, cfg, failure, options);
+    };
+    let counting = CountingBackend {
+        inner: backend,
+        opened: AtomicUsize::new(0),
+    };
+    match align_stack_once(
+        algorithm,
+        stack,
+        reader,
+        cfg,
+        failure,
+        &rebound(options, Some(&counting)),
+    ) {
+        Ok(run) => Ok(AlignRun {
+            backend_used: counting.opened.load(Ordering::SeqCst) > 0,
+            ..run
+        }),
+        Err(lost @ AlgorithmError::BackendLost { .. }) => {
+            let reason = lost.to_string();
+            tracing::warn!(%reason, "rerunning the whole align stage on the CPU");
+            if let Some(done) = &options.frames_done {
+                done.store(0, Ordering::SeqCst);
+            }
+            align_stack_once(
+                algorithm,
+                stack,
+                reader,
+                cfg,
+                failure,
+                &rebound(options, None),
+            )
+            .map(|run| AlignRun {
+                rerun_reason: Some(reason),
+                ..run
+            })
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// `options` with its accelerator replaced by `backend`.
+fn rebound<'a>(
+    options: &AlignDriverOptions<'a>,
+    backend: Option<&'a dyn AlignBackend>,
+) -> AlignDriverOptions<'a> {
+    AlignDriverOptions {
+        budget: options.budget,
+        frames_done: options.frames_done.clone(),
+        control: options.control.clone(),
+        on_pause: options.on_pause,
+        align_backend: backend,
+    }
+}
+
+/// Delegates to an accelerator and counts the sessions it opens.
+struct CountingBackend<'a> {
+    inner: &'a dyn AlignBackend,
+    opened: AtomicUsize,
+}
+
+impl AlignBackend for CountingBackend<'_> {
+    fn open_ecc(
+        &self,
+        request: &EccSessionRequest<'_>,
+    ) -> Result<Option<Box<dyn EccMomentSession>>, AlgorithmError> {
+        let session = self.inner.open_ecc(request)?;
+        if session.is_some() {
+            self.opened.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(session)
+    }
+}
+
+/// One pass over the stack with `options.align_backend` as given.
+fn align_stack_once(
     algorithm: &dyn AlignAlgorithm,
     stack: StackContext,
     reader: &dyn TileReader,
@@ -612,6 +707,16 @@ pub fn align_stack_with(
                                 .collect()
                         });
 
+                    // A device loss reaches concurrent workers in different
+                    // shapes; any frame that saw it as one makes the whole
+                    // batch rerunnable, whichever frame failed first.
+                    let mut outcomes = outcomes;
+                    if let Some(lost) = outcomes.iter().position(|outcome| {
+                        matches!(outcome, Some(Err(AlgorithmError::BackendLost { .. })))
+                    }) && let Some(Err(err)) = outcomes.swap_remove(lost)
+                    {
+                        return Err(err);
+                    }
                     let mut next_pending = Vec::new();
                     for (&i, outcome) in pending.iter().zip(outcomes) {
                         match outcome {
@@ -680,6 +785,8 @@ pub fn align_stack_with(
         worker_limit,
         peak_workers,
         accounted_bytes: shared_bytes + worker_limit as u64 * registration_bytes,
+        backend_used: false,
+        rerun_reason: None,
     })
 }
 
@@ -1548,5 +1655,78 @@ mod tests {
                 assert_eq!(chain_counter.load(Ordering::SeqCst), frame_count);
             }
         }
+    }
+
+    /// Fails frame 1 with a plain error and frame 2 with a backend loss while
+    /// an accelerator is attached, as two pooled workers do when one device
+    /// loss reaches them in different shapes; converges every frame without
+    /// one.
+    struct LossReachesTwoFramesAlign;
+
+    impl AlignAlgorithm for LossReachesTwoFramesAlign {
+        fn id(&self) -> &str {
+            "loss-reaches-two-frames"
+        }
+        fn display_name(&self) -> &str {
+            "Loss Reaches Two Frames"
+        }
+        fn params(&self) -> &[ParamDesc] {
+            &[]
+        }
+        fn align_frame(
+            &self,
+            ctx: &AlignContext<'_>,
+            frame: usize,
+            _cfg: &ParamValues,
+        ) -> Result<AlignOutcome, AlgorithmError> {
+            if ctx.align_backend().is_some() {
+                match frame {
+                    1 => {
+                        return Err(AlgorithmError::Failed {
+                            algorithm: "stub".to_string(),
+                            detail: "readback failed".to_string(),
+                        });
+                    }
+                    2 => {
+                        return Err(AlgorithmError::BackendLost {
+                            detail: "device lost".to_string(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(converged(Transform::identity()))
+        }
+    }
+
+    struct DecliningBackend;
+
+    impl AlignBackend for DecliningBackend {
+        fn open_ecc(
+            &self,
+            _request: &EccSessionRequest<'_>,
+        ) -> Result<Option<Box<dyn EccMomentSession>>, AlgorithmError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn a_backend_loss_in_a_pooled_batch_reruns_the_stage_whatever_frame_failed_first() {
+        let reader = NullReader;
+        let stack = StackContext::new(4, 8, 8, 1);
+        let run = align_stack_with(
+            &LossReachesTwoFramesAlign,
+            stack,
+            &reader,
+            &cfg_with("anchor", "first"),
+            FailurePolicy::Strict,
+            &AlignDriverOptions {
+                align_backend: Some(&DecliningBackend),
+                ..Default::default()
+            },
+        )
+        .expect("a loss anywhere in the batch reruns the stage on the CPU");
+        assert!(run.rerun_reason.is_some());
+        assert!(!run.backend_used);
     }
 }

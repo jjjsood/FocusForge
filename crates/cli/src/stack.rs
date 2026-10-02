@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use focusforge_core::algorithm::StackAlgorithm;
 use focusforge_core::align::ReferencePolicy;
-use focusforge_core::gpu::TileBackend;
+use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{FrameReader, Group, Proposal, Rect, open_frame_set, propose};
 use focusforge_core::job::{JobControl, StageCache};
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance};
@@ -126,6 +126,9 @@ pub struct StackReport {
     /// registration per worker) -- `None` unless the alignment was computed
     /// this run.
     pub align_accounted_bytes: Option<u64>,
+    /// `"cpu"`, or the adapter's display when at least one alignment level
+    /// ran on it -- `null` unless the alignment was computed this run.
+    pub align_backend: Option<String>,
 }
 
 /// A narrow, `crates/gpu`-free handle on a `GpuBackend`'s realized tile
@@ -165,6 +168,33 @@ impl BackendChoice {
             backend: None,
             device_budget: None,
             device_peak: None,
+        }
+    }
+}
+
+/// `resolve_align_backend`'s return value: the align stage's accelerator and
+/// the adapter's display, which the reports name only when a level actually
+/// ran on it.
+pub struct AlignBackendChoice {
+    pub backend: Option<&'static dyn AlignBackend>,
+    pub adapter: Option<String>,
+}
+
+impl AlignBackendChoice {
+    /// The CPU path: no accelerator, no adapter.
+    pub fn cpu() -> Self {
+        AlignBackendChoice {
+            backend: None,
+            adapter: None,
+        }
+    }
+
+    /// The report's `align_backend` value for a run whose accelerator was
+    /// used (or not).
+    pub fn report_name(&self, used: bool) -> String {
+        match (&self.adapter, used) {
+            (Some(adapter), true) => adapter.clone(),
+            _ => "cpu".to_string(),
         }
     }
 }
@@ -321,6 +351,18 @@ pub fn run(
     let device_budget_report = choice.device_budget;
     let device_peak = choice.device_peak;
 
+    // The align accelerator is resolved only for a run that aligns. An
+    // unknown align algorithm is refused later, per group, with the usual
+    // message; here it only means no accelerator.
+    let align_choice = if align_opts.align {
+        match resolve_align_algo(align_opts.algo.or(file.align_algo.as_deref())) {
+            Ok(align_algo) => crate::resolve_align_backend(align_algo.id(), no_gpu, max_vram),
+            Err(_) => AlignBackendChoice::cpu(),
+        }
+    } else {
+        AlignBackendChoice::cpu()
+    };
+
     // Parse `--set` against that schema and overlay it on the
     // preset's `[stack]` table. An unknown key or an out-of-range value is
     // refused here -- from either source, with the same `ParamViolation`
@@ -430,6 +472,7 @@ pub fn run(
         backend,
         device_budget_report,
         device_peak,
+        align_choice,
         explicit,
         file,
         align_opts,
@@ -524,6 +567,8 @@ struct RunSetup<'a> {
     /// `DevicePeak` handle -- `None` on the CPU path, mirroring
     /// `device_budget_report`.
     device_peak: Option<&'static dyn DevicePeak>,
+    /// The align stage's accelerator, resolved once beside `backend`.
+    align_choice: AlignBackendChoice,
     explicit: ParamValues,
     file: preset::Preset,
     align_opts: &'a AlignOptions<'a>,
@@ -845,6 +890,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         backend,
         device_budget_report,
         device_peak,
+        align_choice,
         explicit,
         file,
         align_opts,
@@ -1098,7 +1144,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         tile_size: job_opts.tile_size,
         max_host_memory,
         backend,
-        align_backend: None,
+        align_backend: align_choice.backend,
         resume: job_opts.resume,
         cache: job_opts.cache,
         poll: job::POLL,
@@ -1163,6 +1209,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 device_budget_report,
                 device_peak,
                 align_opts,
+                align_choice,
                 *report,
             );
             GroupResult::Completed(Box::new(stack_report))
@@ -1280,6 +1327,7 @@ fn sealed_path(report: &focusforge_core::pipeline::FuseReport) -> String {
 /// [`focusforge_core::pipeline::FuseReport`] plus the facts only this crate
 /// knows: the input directory as the user wrote it, and the GPU-only device
 /// budget/peak (`crates/core` never learns what VRAM is).
+#[allow(clippy::too_many_arguments)]
 fn build_stack_report(
     dir: &Path,
     algo: &'static dyn StackAlgorithm,
@@ -1287,6 +1335,7 @@ fn build_stack_report(
     device_budget_report: Option<DeviceBudgetReport>,
     device_peak: Option<&'static dyn DevicePeak>,
     align_opts: &AlignOptions<'_>,
+    align_choice: &AlignBackendChoice,
     report: focusforge_core::pipeline::FuseReport,
 ) -> StackReport {
     let outputs = vec![sealed_path(&report)];
@@ -1314,6 +1363,8 @@ fn build_stack_report(
             alignments,
         }
     });
+    let align_backend = (report.align_source == "computed")
+        .then(|| align_choice.report_name(report.align_backend_used));
     StackReport {
         input: dir.display().to_string(),
         frame_count: report.frame_count,
@@ -1366,6 +1417,7 @@ fn build_stack_report(
         align_workers: report.align_workers,
         peak_align_workers: report.peak_align_workers,
         align_accounted_bytes: report.align_accounted_bytes,
+        align_backend,
     }
 }
 
@@ -1601,6 +1653,7 @@ mod tests {
             align_workers: Some(3),
             peak_align_workers: Some(3),
             align_accounted_bytes: Some(1 << 28),
+            align_backend: Some("cpu".to_string()),
         }
     }
 

@@ -154,6 +154,10 @@ pub struct FuseReport {
     /// The bytes the align stage accounted for (shared reference data plus
     /// one registration per worker); `None` when no alignment was computed.
     pub align_accounted_bytes: Option<u64>,
+    /// Whether an accelerator ran at least one level of the alignment this
+    /// run computed; `false` for a cached, resumed or skipped alignment and
+    /// for a stage that reran on the CPU.
+    pub align_backend_used: bool,
     pub stages: StageTimings,
     pub wall_seconds: f64,
     pub metrics: Metrics,
@@ -296,6 +300,7 @@ pub fn run(
     let mut align_workers: Option<usize> = None;
     let mut peak_align_workers: Option<usize> = None;
     let mut align_accounted_bytes: Option<u64> = None;
+    let mut align_backend_used = false;
 
     if let Some(align_req) = &request.align {
         timer.enter(Stage::Align);
@@ -427,6 +432,10 @@ pub fn run(
                 align_workers = Some(solved.worker_limit);
                 peak_align_workers = Some(solved.peak_workers);
                 align_accounted_bytes = Some(solved.accounted_bytes);
+                align_backend_used = solved.backend_used;
+                if let Some(reason) = &solved.rerun_reason {
+                    observer.notice(&format!("{reason}; the align stage reran on the CPU"));
+                }
                 let alignment = solved.alignment;
                 if !align_req.lax && alignment.failure_count() > 0 {
                     return Err(PipelineError::Align(describe_align_failure(
@@ -805,6 +814,7 @@ pub fn run(
         align_workers,
         peak_align_workers,
         align_accounted_bytes,
+        align_backend_used,
         stages,
         wall_seconds,
         metrics,

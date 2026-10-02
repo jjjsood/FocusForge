@@ -31,8 +31,8 @@ pub use driver::{
     bytes_per_registration, bytes_shared_reference,
 };
 pub use ecc::{
-    DivergenceReason, EccIteration, EccMode, EccParams, EccResult, EccStatus, solve_level,
-    solve_level_traced,
+    CpuMomentSession, DivergenceReason, EccIteration, EccMode, EccParams, EccResult, EccStatus,
+    solve_level, solve_level_traced,
 };
 pub use ecc_algorithm::{EccLevelRecord, PyramidalEcc};
 pub use error::AlignError;

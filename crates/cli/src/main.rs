@@ -55,6 +55,26 @@ fn resolve_backend(
     }
 }
 
+/// Resolves whether the align stage takes the GPU path or the CPU one, as
+/// [`resolve_backend`] does for fusion: `#[cfg(feature = "gpu")]` delegates to
+/// [`gpu::resolve_align_backend`]; with the feature off, always
+/// [`stack::AlignBackendChoice::cpu()`].
+fn resolve_align_backend(
+    algorithm_id: &str,
+    no_gpu: bool,
+    max_vram: Option<u64>,
+) -> stack::AlignBackendChoice {
+    #[cfg(feature = "gpu")]
+    {
+        gpu::resolve_align_backend(algorithm_id, no_gpu, max_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (algorithm_id, no_gpu, max_vram);
+        stack::AlignBackendChoice::cpu()
+    }
+}
+
 /// FocusForge command-line interface.
 #[derive(Parser)]
 #[command(
@@ -326,6 +346,18 @@ enum Command {
             value_parser = crate::bytes::parse_byte_size
         )]
         max_host_memory: Option<u64>,
+        /// A **ceiling only** on the adaptive device (VRAM) budget, for the
+        /// alignment's GPU levels and the `--write-warped` fuse backend: it
+        /// can lower the budget the startup probe settled on, and can never
+        /// raise it. Accepts the same suffixed sizes as `--max-host-memory`.
+        /// Only present when the `gpu` feature is compiled in.
+        #[cfg(feature = "gpu")]
+        #[arg(
+            long = "max-vram",
+            value_name = "SIZE",
+            value_parser = crate::bytes::parse_byte_size
+        )]
+        max_vram: Option<u64>,
         /// Print no progress at all. `align` has no fuse-tile units to
         /// count: this suppresses only the one stage line `align`
         /// otherwise prints.
@@ -344,10 +376,10 @@ enum Command {
         /// Append one NDJSON status record for this run to this path.
         #[arg(long, value_name = "PATH")]
         status: Option<PathBuf>,
-        /// Force the CPU path even when a usable GPU adapter is available.
-        /// Only present when the `gpu` feature is compiled in. Meaningful
-        /// only with `--write-warped`: plain `align` has nothing on the
-        /// GPU-shaped path (its ECC solver is CPU-only).
+        /// Force the CPU path even when a usable GPU adapter is available:
+        /// the alignment's large levels and the `--write-warped` fuse
+        /// backend both stay on the CPU. Only present when the `gpu` feature
+        /// is compiled in.
         #[cfg(feature = "gpu")]
         #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
         gpu: bool,
@@ -545,6 +577,8 @@ fn main() -> ExitCode {
             write_warped,
             set,
             max_host_memory,
+            #[cfg(feature = "gpu")]
+            max_vram,
             quiet,
             preset,
             write_preset,
@@ -556,6 +590,8 @@ fn main() -> ExitCode {
             let no_gpu = !gpu;
             #[cfg(not(feature = "gpu"))]
             let no_gpu = false;
+            #[cfg(not(feature = "gpu"))]
+            let max_vram: Option<u64> = None;
             align::run(
                 &dir,
                 algo.as_deref(),
@@ -572,6 +608,7 @@ fn main() -> ExitCode {
                     dry_run: false,
                 },
                 no_gpu,
+                max_vram,
             )
         }
         Command::Review { dir, json } => review::run(&dir, json),

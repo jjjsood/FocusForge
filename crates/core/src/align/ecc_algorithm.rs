@@ -1345,7 +1345,8 @@ mod tests {
     use crate::align::feature_seed::test_scene::blob_scene;
     use crate::align::pyramid::max_levels;
     use crate::align::{AlignDriverOptions, FailurePolicy, align_stack_with};
-    use crate::gpu::{AlignBackend, EccMomentSession, EccSessionRequest};
+    use crate::gpu::{AlignBackend, ECC_MOMENTS, EccMomentSession, EccSessionRequest};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn schema_declares_every_parameter() {
@@ -2218,5 +2219,78 @@ mod tests {
         let m = chained.frames[1].transform.m;
         assert!((m[0][2] - shift.0).abs() < 0.05, "x {}", m[0][2]);
         assert!((m[1][2] - shift.1).abs() < 0.05, "y {}", m[1][2]);
+    }
+
+    /// Opens sessions whose first `moments` call reports a lost device.
+    struct LosingBackend;
+
+    struct LostSession;
+
+    impl EccMomentSession for LostSession {
+        fn moments(&mut self, _warp: &Transform) -> Result<[f64; ECC_MOMENTS], AlgorithmError> {
+            Err(AlgorithmError::BackendLost {
+                detail: "the device was lost".to_string(),
+            })
+        }
+    }
+
+    impl AlignBackend for LosingBackend {
+        fn open_ecc(
+            &self,
+            _request: &EccSessionRequest<'_>,
+        ) -> Result<Option<Box<dyn EccMomentSession>>, AlgorithmError> {
+            Ok(Some(Box::new(LostSession)))
+        }
+    }
+
+    #[test]
+    fn align_stage_reruns_on_cpu_after_a_backend_loss() {
+        const BIG_W: u32 = 1700;
+        const BIG_H: u32 = 1100;
+        let shifts = [(0.0, 0.0), (0.6, -0.2), (-0.35, 0.45)];
+        let mem = reader(BIG_W, BIG_H, &shifts, false);
+        let stack = StackContext::new(3, BIG_W, BIG_H, 1);
+        let mut cfg = crate::params::resolved_values(
+            &crate::params::resolve(PyramidalEcc.params(), &ParamValues::new(), &stack).unwrap(),
+        );
+        cfg.insert("pyramid-depth".to_string(), ParamValue::Int(1));
+        cfg.insert("max-iterations".to_string(), ParamValue::Int(8));
+        cfg.insert(
+            "mode".to_string(),
+            ParamValue::Enum("translation".to_string()),
+        );
+        let run = |backend: Option<&dyn AlignBackend>, done: &Arc<AtomicUsize>| {
+            align_stack_with(
+                &PyramidalEcc,
+                stack,
+                &mem,
+                &cfg,
+                FailurePolicy::Strict,
+                &AlignDriverOptions {
+                    align_backend: backend,
+                    frames_done: Some(Arc::clone(done)),
+                    ..AlignDriverOptions::default()
+                },
+            )
+            .unwrap()
+        };
+
+        let plain_done = Arc::new(AtomicUsize::new(0));
+        let plain = run(None, &plain_done);
+        assert!(!plain.backend_used);
+        assert_eq!(plain.rerun_reason, None);
+
+        let done = Arc::new(AtomicUsize::new(0));
+        let rerun = run(Some(&LosingBackend), &done);
+        assert_eq!(rerun.alignment, plain.alignment);
+        assert!(!rerun.backend_used);
+        let reason = rerun.rerun_reason.expect("the loss is reported");
+        assert!(reason.contains("the device was lost"), "{reason}");
+        assert_eq!(done.load(Ordering::SeqCst), stack.frame_count);
+
+        let accepting = RecordingBackend::new(true);
+        let accepted = run(Some(&accepting), &Arc::new(AtomicUsize::new(0)));
+        assert!(accepted.backend_used);
+        assert_eq!(accepted.rerun_reason, None);
     }
 }

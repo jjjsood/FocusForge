@@ -38,6 +38,8 @@ pub mod device;
 #[cfg(feature = "gpu")]
 pub mod display;
 #[cfg(feature = "gpu")]
+pub(crate) mod ecc;
+#[cfg(feature = "gpu")]
 pub mod errors;
 #[cfg(feature = "gpu")]
 pub mod fuse;

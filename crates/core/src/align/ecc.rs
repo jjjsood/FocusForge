@@ -1375,9 +1375,9 @@ fn reduction_from_moments<const K: usize>(
     })
 }
 
-/// A session summing the moments on the CPU from copies of a request's data.
-#[cfg(test)]
-pub(crate) struct CpuMomentSession {
+/// A session summing the moments on the CPU from copies of a request's data:
+/// the per-kernel twin an accelerated session is compared against.
+pub struct CpuMomentSession {
     template: Vec<f32>,
     jacobian: Vec<f64>,
     columns: usize,
@@ -1387,9 +1387,8 @@ pub(crate) struct CpuMomentSession {
     moving_origin: (u32, u32),
 }
 
-#[cfg(test)]
 impl CpuMomentSession {
-    pub(crate) fn new(request: &EccSessionRequest<'_>) -> Self {
+    pub fn new(request: &EccSessionRequest<'_>) -> Self {
         let (width, height) = request.moving_dims;
         Self {
             template: request.template.to_vec(),
@@ -1402,38 +1401,41 @@ impl CpuMomentSession {
             moving_origin: request.moving_origin,
         }
     }
+
+    /// The bicubic Catmull-Rom sample of the moving window at `warp(x)` for
+    /// every `x` in the region, row-major; `None` where any of the 4x4 taps
+    /// leaves the window.
+    pub fn samples(&self, warp: &Transform) -> Vec<Option<f32>> {
+        let region = self.region;
+        (region.y..region.y + region.height)
+            .flat_map(|y| (region.x..region.x + region.width).map(move |x| (x, y)))
+            .map(|(x, y)| sample_plane(&self.moving, self.moving_origin, warp, x as f64, y as f64))
+            .collect()
+    }
 }
 
-#[cfg(test)]
 impl crate::gpu::EccMomentSession for CpuMomentSession {
     fn moments(&mut self, w: &Transform) -> Result<[f64; ECC_MOMENTS], AlgorithmError> {
         let mut m = [0.0f64; ECC_MOMENTS];
-        let region = self.region;
-        let mut n = 0usize;
-        for y in region.y..region.y + region.height {
-            for x in region.x..region.x + region.width {
-                let i = n;
-                n += 1;
-                let Some(s) = sample_plane(&self.moving, self.moving_origin, w, x as f64, y as f64)
-                else {
-                    continue;
-                };
-                let s = f64::from(s) - self.shift;
-                let t = f64::from(self.template[i]) - self.shift;
-                m[0] += 1.0;
-                m[1] += s;
-                m[2] += s * s;
-                m[3] += t * s;
-                m[8] += t;
-                m[9] += t * t;
-                for (k, &g) in self.jacobian[i * self.columns..][..self.columns]
-                    .iter()
-                    .enumerate()
-                {
-                    m[4 + k] += g * s;
-                    m[10 + k] += g * t;
-                    m[14 + k] += g;
-                }
+        for (i, sample) in self.samples(w).into_iter().enumerate() {
+            let Some(s) = sample else {
+                continue;
+            };
+            let s = f64::from(s) - self.shift;
+            let t = f64::from(self.template[i]) - self.shift;
+            m[0] += 1.0;
+            m[1] += s;
+            m[2] += s * s;
+            m[3] += t * s;
+            m[8] += t;
+            m[9] += t * t;
+            for (k, &g) in self.jacobian[i * self.columns..][..self.columns]
+                .iter()
+                .enumerate()
+            {
+                m[4 + k] += g * s;
+                m[10 + k] += g * t;
+                m[14 + k] += g;
             }
         }
         Ok(m)
@@ -2430,5 +2432,42 @@ mod tests {
                 TemplateKind::Similarity(data) => assert_moments_match_cpu(data, region, moving),
             }
         }
+    }
+
+    #[test]
+    fn cpu_session_samples_follow_region_order_and_the_moment_count() {
+        let template = textured(48, 36, 0.0);
+        let moving = window(&textured(48, 36, 0.9), (4, 3), (40, 30));
+        let region = Rect {
+            x: 8,
+            y: 6,
+            width: 25,
+            height: 17,
+        };
+        let prepared = EccTemplate::prepare(&template, (0, 0), region, EccMode::Translation)
+            .expect("region inside the plane");
+        let TemplateKind::Translation(data) = &prepared.kind else {
+            panic!("translation mode prepares a translation template");
+        };
+        let request = EccSessionRequest {
+            template_id: 0,
+            region,
+            columns: 2,
+            template: &data.values,
+            jacobian: data.g_centered.as_flattened(),
+            shift: 0.0,
+            moving: moving.data(),
+            moving_dims: (moving.width(), moving.height()),
+            moving_origin: (4, 3),
+        };
+        let mut session = CpuMomentSession::new(&request);
+        let warp = Transform::translation(18.0, 0.4);
+        let samples = session.samples(&warp);
+        assert_eq!(samples.len(), 25 * 17);
+        let valid = samples.iter().filter(|s| s.is_some()).count();
+        assert!(valid > 0 && valid < samples.len(), "partial overlap");
+        assert_eq!(valid as f64, session.moments(&warp).unwrap()[0]);
+        let expected = sample_plane(&moving, (4, 3), &warp, 10.0, 7.0);
+        assert_eq!(samples[25 + 2], expected, "row 1, column 2 of the region");
     }
 }

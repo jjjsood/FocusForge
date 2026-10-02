@@ -174,7 +174,10 @@ pub trait EccMomentSession: Send {
     /// invalid) and sums over the valid samples `s`, template values `t` and
     /// Jacobian columns `g_k`, all minus the request's `shift`:
     /// `[n, Σs, Σs², Σt·s, Σg_k·s (4), Σt, Σt², Σg_k·t (4), Σg_k (4)]`.
-    /// Entries for columns at and past the request's `columns` are zero.
+    /// Entries for columns at and past the request's `columns` are zero. The
+    /// template-side moments (indices 8..18) are summed only under partial
+    /// overlap and are zero under full overlap, where the solver reads its
+    /// own statistics.
     fn moments(&mut self, warp: &Transform) -> Result<[f64; ECC_MOMENTS], AlgorithmError>;
 }
 

@@ -7,12 +7,14 @@
 //! `include_str!`, never a Rust string literal --
 //! [`harness_gain.wgsl`](../src/harness_gain.wgsl) is the example.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
 use focusforge_core::align::warp::WarpedTile;
 use focusforge_core::align::{AlignError, Transform};
-use focusforge_core::gpu::{BackendInfo, TileBackend};
+use focusforge_core::gpu::{
+    AlignBackend, BackendInfo, EccMomentSession, EccSessionRequest, TileBackend,
+};
 use focusforge_core::tile::{Rect, Tile};
 
 use crate::budget::{
@@ -20,6 +22,7 @@ use crate::budget::{
     dispatch_limit_shortfall, largest_buffer_bytes, max_tile_side, probe_budget,
 };
 use crate::device::{GpuError, SharedDevice, block_on, shared_device};
+use crate::ecc::{self, EccState};
 use crate::errors;
 use crate::fuse::{self, FusionPipelines};
 use crate::pack::{packed_len, unpack_samples};
@@ -44,10 +47,12 @@ pub struct GpuBackend {
     /// each call takes the calling tile's own byte cost. See
     /// [`Self::with_max_device_bytes`] for the non-singleton constructor a
     /// test uses to drive a deliberately tiny ceiling.
-    budget: VramBudget,
+    budget: Arc<VramBudget>,
     /// The settled budget and its provenance, reported through
     /// [`Self::device_budget`].
     device_budget: DeviceBudget,
+    /// The ECC alignment kernels and the templates their sessions share.
+    ecc: EccState,
 }
 
 impl GpuBackend {
@@ -57,8 +62,9 @@ impl GpuBackend {
             pipeline: OnceLock::new(),
             fuse_pipelines: FusionPipelines::new(),
             warp_pipelines: WarpPipelines::new(),
-            budget: VramBudget::new(device_budget.bytes()),
+            budget: Arc::new(VramBudget::new(device_budget.bytes())),
             device_budget,
+            ecc: EccState::default(),
         }
     }
 
@@ -355,15 +361,37 @@ impl TileBackend for GpuBackend {
     }
 }
 
-/// Destroys the shared device once `FF_FORCE_DEVICE_LOST` tiles have been
-/// fused; an absent or unparsable value does nothing. The poll is what makes
-/// the loss observable: wgpu runs the device-lost callback from a poll, not
-/// from `destroy`.
+impl AlignBackend for GpuBackend {
+    fn open_ecc(
+        &self,
+        request: &EccSessionRequest<'_>,
+    ) -> Result<Option<Box<dyn EccMomentSession>>, AlgorithmError> {
+        ecc::open(self.device, &self.budget, &self.ecc, request)
+    }
+}
+
 #[cfg(feature = "gpu-tests")]
-fn forced_device_loss(device: &wgpu::Device) {
+impl GpuBackend {
+    /// The ECC sampler read back: every sample of `request`'s region through
+    /// `warp`, `None` where its taps leave the window. For the parity tests.
+    pub fn ecc_sample_values(
+        &self,
+        request: &EccSessionRequest<'_>,
+        warp: &Transform,
+    ) -> Result<Vec<Option<f32>>, AlgorithmError> {
+        ecc::sample_values(self.device, &self.ecc, request, warp)
+    }
+}
+
+/// Destroys the shared device once `FF_FORCE_DEVICE_LOST` GPU operations have
+/// run -- fused tiles and ECC iterations alike; an absent or unparsable value
+/// does nothing. The poll is what makes the loss observable: wgpu runs the
+/// device-lost callback from a poll, not from `destroy`.
+#[cfg(feature = "gpu-tests")]
+pub(crate) fn forced_device_loss(device: &wgpu::Device) {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static FUSED_TILES: AtomicUsize = AtomicUsize::new(0);
+    static GPU_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
 
     let Some(after) = std::env::var("FF_FORCE_DEVICE_LOST")
         .ok()
@@ -371,7 +399,7 @@ fn forced_device_loss(device: &wgpu::Device) {
     else {
         return;
     };
-    if FUSED_TILES.fetch_add(1, Ordering::SeqCst) + 1 == after {
+    if GPU_OPERATIONS.fetch_add(1, Ordering::SeqCst) + 1 == after {
         device.destroy();
         let _ = device.poll(wgpu::PollType::Poll);
     }
@@ -426,6 +454,37 @@ pub fn backend_for(
     }
 }
 
+/// [`backend_for`] for the align stage: only the pyramidal ECC aligner has a
+/// GPU path, so every other `algorithm_id` stays on the CPU with an empty
+/// reason and no adapter probe. The backend is the same
+/// [`gpu_backend_capped`] singleton the fuse path uses. The reason line never
+/// carries the `adapter selected: ` prefix [`backend_for`] prints, so a run
+/// that resolves both paths logs that prefix once.
+pub fn align_backend_for(
+    algorithm_id: &str,
+    no_gpu: bool,
+    max_vram: Option<u64>,
+) -> (Option<&'static GpuBackend>, String) {
+    use focusforge_core::algorithm::AlignAlgorithm;
+    if algorithm_id != focusforge_core::align::PyramidalEcc.id() {
+        return (None, String::new());
+    }
+    if no_gpu {
+        return (None, "--no-gpu given: aligning on the CPU".to_string());
+    }
+    match gpu_backend_capped(max_vram) {
+        Ok(backend) => (
+            Some(backend),
+            format!(
+                "alignment offloads large levels to {}; device budget {} bytes",
+                backend.info(),
+                backend.device_budget().bytes()
+            ),
+        ),
+        Err(err) => (None, cpu_fallback_line(err)),
+    }
+}
+
 /// Reason-led, because [`GpuError::VramExhausted`] (an adapter that cannot
 /// serve the minimum budget) falls back here exactly like a missing adapter.
 fn cpu_fallback_line(reason: &GpuError) -> String {
@@ -434,9 +493,10 @@ fn cpu_fallback_line(reason: &GpuError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{backend_for, cpu_fallback_line};
+    use super::{align_backend_for, backend_for, cpu_fallback_line};
     use crate::device::GpuError;
-    use focusforge_core::algorithm::StackAlgorithm;
+    use focusforge_core::algorithm::{AlignAlgorithm, StackAlgorithm};
+    use focusforge_core::align::PyramidalEcc;
     use focusforge_core::fuse::laplacian::Laplacian;
 
     #[test]
@@ -468,6 +528,22 @@ mod tests {
 
             for no_gpu in [false, true] {
                 let (backend, message) = backend_for("unsupported", no_gpu, max_vram);
+                assert!(backend.is_none());
+                assert!(message.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn align_backend_for_cpu_selection() {
+        for max_vram in [None, Some(0)] {
+            let (backend, message) = align_backend_for(PyramidalEcc.id(), true, max_vram);
+            assert!(backend.is_none());
+            assert_eq!(message, "--no-gpu given: aligning on the CPU");
+            assert!(!message.contains("adapter selected: "));
+
+            for no_gpu in [false, true] {
+                let (backend, message) = align_backend_for("unsupported", no_gpu, max_vram);
                 assert!(backend.is_none());
                 assert!(message.is_empty());
             }
