@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! A written history survives being closed: random op sequences over
-//! synthetic Z-Maps are sealed (and branched and deleted) through each of the
-//! two project writers, the file is reopened, and every checkpoint must
-//! materialize to the map an in-memory model computed when it was sealed. The
-//! model replays over plain `Vec<u16>` maps and shares nothing with the
-//! container, the delta encoding or the snapshot cadence.
-//!
-//! A failing case prints its shrunk action list; no failure file is kept, so
-//! that printout is the reproduction.
+//! Random op sequences over synthetic Z-Maps are sealed, branched and deleted
+//! through both project writers; after reopening the file, every checkpoint
+//! must materialize to the map an in-memory model computed. The model replays
+//! over plain `Vec<u16>` maps and shares nothing with the container, the delta
+//! encoding or the snapshot cadence. A failing case prints its shrunk action
+//! list; no failure file is kept.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
