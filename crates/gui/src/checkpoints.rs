@@ -5,6 +5,8 @@
 //! slint::`; `crate::controller` builds a [`CheckpointsModel`](crate::checkpoints::CheckpointsModel) and hands it
 //! to `ui/shell/dock/checkpoint_panel.slint`'s `for` loop.
 
+use std::cmp::Ordering;
+
 use chrono::{Local, NaiveDate, TimeZone};
 
 use focusforge_core::project::Checkpoint;
@@ -240,10 +242,11 @@ fn held_algorithm(index: usize, held: &[InMemoryCheckpoint], saved: &[&Checkpoin
 
 /// Builds the panel's flat entry list: `checkpoints` merged with `held`
 /// (in memory since the last save, not yet in any `.ffp`), ordered by
-/// `created_at` descending with a held row first on a tie. A hidden saved
-/// checkpoint and every row `pending` names are left out (`checkpoints` and
-/// `held` stay whole for the parent lookups). Day separators
-/// appear only when the merged list spans more than one local day, `today`
+/// `created_at` descending. On a tie a held row comes before a saved one, a
+/// newer held row (higher index) before an older one, and saved rows keep
+/// their order in `checkpoints`. A hidden saved checkpoint and every row
+/// `pending` names are left out (`checkpoints` and `held` stay whole for the
+/// parent lookups). Day separators appear only when the merged list spans more than one local day, `today`
 /// being the caller's local date. `selected` matches a row's own id (a
 /// saved row's stored id, a held row's `"held:<index>"`).
 pub fn build_model(
@@ -269,12 +272,17 @@ pub fn build_model(
                 algorithm: held_algorithm(index, held, checkpoints),
             }),
     );
-    // A held row sorts before a saved one at the same `created_at`: `false <
-    // true`, so a held row's `0` rank stays ahead of `Row::Saved`'s `1`.
+    // On a `created_at` tie a held row sorts before a saved one (`false <
+    // true`), and a newer held row (higher index) before an older one. Saved
+    // rows compare equal there, so the stable sort keeps their input order.
     rows.sort_by(|a, b| {
         b.created_at()
             .cmp(&a.created_at())
             .then_with(|| matches!(a, Row::Saved(_)).cmp(&matches!(b, Row::Saved(_))))
+            .then_with(|| match (a, b) {
+                (Row::Held { index: x, .. }, Row::Held { index: y, .. }) => y.cmp(x),
+                _ => Ordering::Equal,
+            })
     });
 
     let dates: Vec<NaiveDate> = rows
@@ -518,6 +526,46 @@ mod tests {
             rows[1].algorithm, "hidden-algorithm",
             "an op row names its hidden parent's algorithm"
         );
+    }
+
+    #[test]
+    fn same_second_in_memory_checkpoints_list_newest_first() {
+        use ParentRef::Entry;
+        let held = [
+            fused_entry(),
+            ops_entry(Vec::new(), Some(Entry(0))),
+            fused_entry(),
+            ops_entry(Vec::new(), Some(Entry(2))),
+        ];
+        let (z, y, x) = (checkpoint("z", 0), checkpoint("y", 0), checkpoint("x", 1));
+        let saved = [&z, &y, &x];
+        let today = local_datetime(0).unwrap().date_naive();
+        let ids = |pending: &[ParentRef], selected: Option<&str>| {
+            let model = build_model(&saved, &held, pending, today, selected, 0.0);
+            model
+                .entries
+                .into_iter()
+                .filter(|e| e.separator_label.is_none())
+                .map(|e| (e.id.unwrap(), e.selected))
+                .collect::<Vec<_>>()
+        };
+        let keys = |rows: &[(String, bool)]| rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>();
+
+        assert_eq!(
+            keys(&ids(&[], None)),
+            ["x", "held:3", "held:2", "held:1", "held:0", "z", "y"]
+        );
+        let pending = ids(&[Entry(2)], Some("held:1"));
+        assert_eq!(
+            keys(&pending),
+            ["x", "held:3", "held:1", "held:0", "z", "y"]
+        );
+        let marked: Vec<&str> = pending
+            .iter()
+            .filter(|r| r.1)
+            .map(|r| r.0.as_str())
+            .collect();
+        assert_eq!(marked, ["held:1"]);
     }
 
     fn stroke(x: i32) -> Op {

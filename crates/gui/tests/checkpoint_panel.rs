@@ -162,8 +162,8 @@ fn write_chain(project_path: &Path, times: &[i64]) {
 /// The saved rows are `History::all()`'s ids in its order over a branched
 /// history -- two children of the root and a grandchild, all three at one
 /// `created_at`, so both the depth and the id tie-break decide -- the tab's
-/// count equals the row count, and a held checkpoint merges by time, first
-/// on a tie.
+/// count equals the row count, and a held checkpoint merges by time, held
+/// rows newest first on a tie.
 #[test]
 fn rows_match_the_core_listing() {
     // `build_edited`'s root at t0 and its child at t0 + 60; a grandchild and
@@ -210,6 +210,21 @@ fn rows_match_the_core_listing() {
         "held:0",
         "a held row goes first on a tie"
     );
+    let two = [held_at(t0 + 60), held_at(t0 + 60)];
+    let ids = row_ids(&checkpoints::build_model(
+        &saved,
+        &two,
+        &[],
+        today,
+        None,
+        0.0,
+    ));
+    assert_eq!(
+        ids[..2],
+        ["held:1", "held:0"],
+        "the newer held row is first"
+    );
+    assert_eq!(ids[2..], listing, "saved rows keep History::all()'s order");
     let between = checkpoints::build_model(&saved, &[held_at(t0 + 30)], &[], today, None, 0.0);
     let ids = row_ids(&between);
     assert_eq!(ids[..3], listing[..3]);
@@ -579,6 +594,23 @@ fn record_events(controller: &mut AppController) -> Arc<Mutex<Vec<ShellEvent>>> 
     let sink = events.clone();
     controller.set_sink(Arc::new(move |event| sink.lock().unwrap().push(event)));
     events
+}
+
+/// Two `Save checkpoint` presses inside one second list the second one
+/// first, selected and the only fresh row.
+#[test]
+fn two_checkpoints_in_one_second_list_newest_first() {
+    let (_project, mut controller) = editor_on_head("checkpoint_panel_same_second");
+    paint(&mut controller, stroke(1, 1, 0));
+    assert!(controller.save_checkpoint());
+    paint(&mut controller, stroke(3, 1, 1));
+    assert!(controller.save_checkpoint());
+
+    let panel = controller.checkpoints_panel();
+    let top = panel.entries.iter().position(|e| e.id.is_some()).unwrap();
+    assert_eq!(row_ids(&panel)[..2], ["held:1", "held:0"]);
+    assert_eq!(selected_rows(&controller), vec![top]);
+    assert_eq!(only_fresh(&controller).0, "held:1");
 }
 
 /// Saving a checkpoint keeps live's image, makes the new row the origin and
