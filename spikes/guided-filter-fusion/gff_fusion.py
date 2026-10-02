@@ -56,6 +56,9 @@ PATCH_JOIN = 100.0  # counts: neighbouring components whose mean luma differs by
 PATCH_EDGES = (64, 1000, 16000, 100000)  # px: the size buckets of the patch shares
 HEAD_BAND = 3000.0  # counts: a pixel is background when its luma is this close to its row median
 ABOVE_HEAD = {(3584, 2220): (0, 400)}  # crop origin -> crop rows of the background above the subject
+GLOW_EDGE = 2000.0  # counts: a pixel is a strong edge when its 3x3-box luma gradient magnitude reaches this (the top 1.5 % of the aligned crops' composites)
+GLOW_BANDS = ((0, 3), (4, 11), (12, 24), (25, 48))  # px from the nearest strong edge; beyond the last is the far band
+GLOW_BOX = 31  # px: the window whose mean separates a pixel's dark side from its bright side
 
 
 # ---------------------------------------------------------------- metrics
@@ -272,6 +275,68 @@ def zmap_measures(row, meta, src, mask_comp):
             keep = np.zeros(z.shape, bool)
             keep[rows[0] : rows[1]] = background_mask(read_u16(mask_comp).mean(2), rows)
             m.update(patch_measures(z, luma, keep, prefix="head_"))
+    return m
+
+
+# ---------------------------------------------------------------- glow measures
+
+
+def box_mean(a, k):
+    """Mean over the k x k window (k odd) around every pixel, edge pixels repeated."""
+    r = k // 2
+    c = np.pad(np.pad(a, r, mode="edge").cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+    return (c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]) / (k * k)
+
+
+def edge_distance(edge, limit):
+    """4-connected distance of every pixel from the set `edge`, and the flat index of its nearest edge pixel.
+
+    Pixels more than `limit` steps away get distance -1.
+    """
+    dist = np.where(edge, 0, -1)
+    near = np.arange(edge.size).reshape(edge.shape)
+    for d in range(1, limit + 1):
+        reached = dist >= 0
+        r, n = np.pad(reached, 1), np.pad(near, 1)
+        nb =((r[:-2, 1:-1], n[:-2, 1:-1]), (r[2:, 1:-1], n[2:, 1:-1]), (r[1:-1, :-2], n[1:-1, :-2]), (r[1:-1, 2:], n[1:-1, 2:]))
+        new = ~reached & (nb[0][0] | nb[1][0] | nb[2][0] | nb[3][0])
+        if not new.any():
+            break
+        src = np.select([b[0] for b in nb], [b[1] for b in nb])
+        near, dist = np.where(new, src, near), np.where(new, d, dist)
+    return dist, near
+
+
+def glow_measures(comp, ref, comp_zmap=None, ref_zmap=None):
+    """Glow and wash-out of `comp` around the strong edges of `ref` (both H x W x C counts).
+
+    Edges are the pixels where the gradient magnitude of `ref`'s 3x3-box luma reaches `GLOW_EDGE`;
+    distance is 4-connected from them and the dark (bright) side is where `ref`'s luma lies below
+    (above) its `GLOW_BOX` box mean. `glow` is the mean of comp - ref luma on the dark side 4 to 24 px
+    from an edge minus the same mean beyond 48 px, which removes a global level offset; `washout` is
+    the mean of ref - comp on the bright side 0 to 3 px from an edge minus its far value. Either is
+    None when one of its two pixel sets is empty. `dark_<a>_<b>` are the dark side's mean differences
+    per band. With both Z-Maps, `zdist_median` and `zdist_gt2` are the median and the share above 2 of
+    |comp index - ref index at the nearest edge pixel| over the same 4 to 24 px dark pixels.
+    """
+    lc, lr = comp.mean(2), ref.mean(2)
+    edge = np.hypot(*np.gradient(box_mean(lr, 3))) >= GLOW_EDGE
+    dist, near = edge_distance(edge, GLOW_BANDS[-1][1])
+    mean = lambda v, sel: float(v[sel].mean()) if sel.any() else None  # noqa: E731
+    dark, bright, far = lr < box_mean(lr, GLOW_BOX), lr > box_mean(lr, GLOW_BOX), dist < 0
+    near_dark = (dist >= GLOW_BANDS[1][0]) & (dist <= GLOW_BANDS[2][1]) & dark
+    near_bright = (dist >= GLOW_BANDS[0][0]) & (dist <= GLOW_BANDS[0][1]) & bright
+    minus = lambda a, b: None if a is None or b is None else a - b  # noqa: E731
+    far_dark = mean(lc - lr, dark & far)
+    m = dict(glow=minus(mean(lc - lr, near_dark), far_dark), washout=minus(mean(lr - lc, near_bright), mean(lr - lc, bright & far)),
+             edge_px=int(edge.sum()), near_dark_px=int(near_dark.sum()), far_dark_px=int((dark & far).sum()), dark_far=far_dark)
+    for lo, hi in GLOW_BANDS:
+        m[f"dark_{lo}_{hi}"] = mean(lc - lr, dark & (dist >= lo) & (dist <= hi))
+    if comp_zmap is not None and ref_zmap is not None and near_dark.any():
+        d = np.abs(comp_zmap[near_dark] - ref_zmap.ravel()[near[near_dark]])
+        m.update(zdist_median=float(np.median(d)), zdist_gt2=float((d > 2).mean()))
+    else:
+        m.update(zdist_median=None, zdist_gt2=None)
     return m
 
 
@@ -724,12 +789,41 @@ def self_check_zmap():
         head_mask=keep.tolist() == [[True, True, False, True]],
         truth_hairs=(hairs[460, 100], hairs[450, 110]) == (2, 6),
         truth_glints=glints[230, 40] == 3,
-        export_zmap="--zmap" in export_cmd("p", "o.tif", "z.tif") and "--zmap" not in export_cmd("p", "o.tif"),
+        export_zmap_only="--zmap" in zmap_export_cmd("p", "z.tif") and "-o" not in zmap_export_cmd("p", "z.tif"),
         stored_composite=np.allclose(stored, blend, atol=1e-6),
         source_share=pick_share == 1.0 and blend_share < 0.2,
         montage_rows=sheet.shape == (4 * 3 + 4 * 2, 4 * 2 + 4, 3) and sheet[:4, 4 + 4:].max() < 20 and sheet[8:12, :4].max() == 255)
     for k, v in checks.items():
         print(f"zmap  {k:32} {'ok  ' if v else 'FAIL'}")
+    return all(checks.values())
+
+
+def self_check_glow():
+    """Glow and wash-out against composites whose answers are known by construction."""
+    h, w, x0 = 48, 192, 80
+    x = np.arange(w)
+    texture = 100.0 * np.where(np.indices((h, w)).sum(0) % 2, 1, -1)  # puts half of every flat region below its box mean
+    ref = np.where(x < x0, 40000.0, 10000.0)[None].repeat(h, 0) + texture
+    rgb = lambda luma: np.repeat(luma[..., None], 3, 2)  # noqa: E731
+    fringe = np.where(x >= x0, 3000.0 * np.exp(-(x - x0) / 5.0), 0.0)[None]
+    wash = np.where(x < x0, 3000.0 * np.exp(-(x0 - 1 - x) / 5.0), 0.0)[None]
+    measure = lambda comp, **kw: glow_measures(rgb(comp), rgb(ref), **kw)  # noqa: E731
+    same, offset, fringed, washed = measure(ref), measure(ref + 500), measure(ref + fringe), measure(ref - wash)
+    narrow = glow_measures(rgb(ref[:, 48:112]), rgb(ref[:, 48:112]))  # no pixel lies 48 px from the edge
+    flat = glow_measures(rgb(texture), rgb(texture))
+    zref = np.where(x < 85, 7, 0)[None].repeat(h, 0)
+    zfar, zsame = (measure(ref, comp_zmap=np.full((h, w), c), ref_zmap=zref) for c in (10, 7))
+    checks = dict(
+        identical=same["glow"] == 0 and same["washout"] == 0,
+        uniform_offset=abs(offset["glow"]) < 1e-9 and abs(offset["washout"]) < 1e-9,
+        blurred_step_glows=fringed["glow"] > 100 and abs(fringed["washout"]) < 1,
+        washed_edge=washed["washout"] > 100,
+        empty_far_band=narrow["glow"] is None and narrow["washout"] is None,
+        no_edges=flat["edge_px"] == 0 and flat["glow"] is None,
+        edge_pixels=same["edge_px"] == 4 * h,
+        nearest_edge_index=(zfar["zdist_median"], zfar["zdist_gt2"], zsame["zdist_median"], zsame["zdist_gt2"]) == (3.0, 1.0, 0.0, 0.0))
+    for k, v in checks.items():
+        print(f"glow  {k:32} {'ok  ' if v else 'FAIL'}")
     return all(checks.values())
 
 
@@ -770,6 +864,7 @@ def self_check():
     ok &= self_check_level()
     ok &= self_check_commands()
     ok &= self_check_zmap()
+    ok &= self_check_glow()
     print("self-check", "passed" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -804,9 +899,9 @@ def stack_cmd(d, algo, tile, out, sets=(), align=False):
     return cmd + [x for kv in sets for x in ("--set", kv)]
 
 
-def export_cmd(project, out, zmap=None):
-    """The `export` command line of a project's composite, with its Z-Map when `zmap` is given."""
-    return [CLI, "export", project, "-o", out, "--json"] + (["--zmap", zmap] if zmap else [])
+def zmap_export_cmd(project, zmap):
+    """The `export` command line that writes a project's Z-Map and nothing else."""
+    return [CLI, "export", project, "--zmap", zmap, "--json"]
 
 
 def synth(scene, noise, seed, n, out):
@@ -953,11 +1048,11 @@ def real_cases(names, root, rect, nframes):
 
 
 def run_baseline(d, algo, tile, work, sets=(), align=False):
-    """`stack` then `export` on the CPU path; peak RSS from the time wrapper.
+    """`stack` on the CPU path, then the run's stored composite and its exported Z-Map; peak RSS from the time wrapper.
 
-    A depth-map row carries its exported Z-Map under `zmap`. The row carries the report's
-    `equalization` when `--set equalize=true` ran and, with `align`, the report's `align` block
-    under `align`.
+    `comp` is the composite the fusion produced (`stored_composite`), `zmap` its Z-Map. The row
+    carries the report's `equalization` when `--set equalize=true` ran and, with `align`, the
+    report's `align` block under `align`.
     """
     o = os.path.join(work, f"{algo}-t{tile}")
     shutil.rmtree(o, ignore_errors=True)
@@ -966,8 +1061,9 @@ def run_baseline(d, algo, tile, work, sets=(), align=False):
     p = run(cmd)
     rss = int(next(ln for ln in p.stderr.splitlines() if "Maximum resident set size" in ln).split()[-1])
     rep = json.loads(p.stdout)
-    run(export_cmd(rep["outputs"][0], f"{o}.tif", f"{o}-zmap.tif" if algo == "depth-map" else None))
-    row = dict(comp=f"{o}.tif", **(dict(zmap=f"{o}-zmap.tif") if algo == "depth-map" else {}), rss_kb=rss, wall_s=rep["wall_seconds"], tiles=rep["tiles"],
+    stored_composite(rep["outputs"][0], f"{o}.tif")
+    run(zmap_export_cmd(rep["outputs"][0], f"{o}-zmap.tif"))
+    row = dict(comp=f"{o}.tif", zmap=f"{o}-zmap.tif", rss_kb=rss, wall_s=rep["wall_seconds"], tiles=rep["tiles"],
                reads_per_frame=rep["frame_tiles_read"] / rep["frame_count"], accounted_bytes=rep["accounted_bytes_in_flight"],
                cmd=" ".join(str(c) for c in cmd[2:]))
     if rep["equalization"]:
@@ -978,10 +1074,12 @@ def run_baseline(d, algo, tile, work, sets=(), align=False):
 
 
 def aggregate(rows):
+    """Per-seed lines for every metric a row has a value for (a measure with no pixels to read is None and is left out)."""
     g = {}
     for r in rows:
         for k, v in r["metrics"].items():
-            g.setdefault((r["case"], k, r["algo"], r["arm"]), []).append(v)
+            if v is not None:
+                g.setdefault((r["case"], k, r["algo"], r["arm"]), []).append(v)
     lines = ["case metric algo arm | per seed | mean spread(max-min) sd"]
     for (case, k, algo, arm), v in sorted(g.items()):
         v = np.array(v)
@@ -998,7 +1096,8 @@ def aggregate_delta(rows):
     g = {}
     for o, n in pairs:
         for k, v in n.get("metrics", {}).items():
-            g.setdefault((n["case"], k, n["algo"]), []).append(v - o["metrics"][k])
+            if v is not None and o["metrics"][k] is not None:
+                g.setdefault((n["case"], k, n["algo"]), []).append(v - o["metrics"][k])
     lines = ["case metric algo | on minus off per seed | mean"]
     for (case, k, algo), v in sorted(g.items()):
         lines.append(f"{case:11} {k:11} {algo:17} | " + " ".join(f"{x:+10.4f}" for x in v) + f" | {np.mean(v):+10.4f}")
@@ -1022,6 +1121,23 @@ def product_coverage(meta, align, project, out):
     src = TiffSource(frame_paths(out))
     src.masks, src.has_masks = product_masks(entries, src.h, src.w), True
     return src, float(diff)
+
+
+def row_glow(row, arm_rows, meta):
+    """The row's glow measures against the same run's Focus map composite (no suffix), its Details
+    composite (`_lap`) and, on a synthetic case, the truth (`_truth`); a method is not measured against itself.
+
+    `arm_rows` maps method to row for the run's arm.
+    """
+    comp, zmap = read_u16(row["comp"]), row.get("zmap") and read_zmap(row["zmap"])
+    refs = [("", arm_rows.get("depth-map")), ("_lap", arm_rows.get("laplacian"))]
+    out = {}
+    for suffix, ref in refs:
+        if ref is not None and ref is not row:
+            out.update({k + suffix: v for k, v in glow_measures(comp, read_u16(ref["comp"]), zmap, read_zmap(ref["zmap"])).items()})
+    if meta["reference"]:
+        out.update({k + "_truth": v for k, v in glow_measures(comp, read_u16(meta["reference"])).items()})
+    return out
 
 
 def cmd_cases(a):
@@ -1066,12 +1182,15 @@ def cmd_cases(a):
                                      uncovered=int((~cov).sum()), wall_s=round(time.time() - t0, 3)))
             for r in arm_rows:
                 r["comp"] = comps[r["algo"] + tag]
+            by_algo = {r["algo"]: r for r in arm_rows}
+            for r in arm_rows:
                 if arm == "on":
                     r["equalize"] = os.path.join(d, "equalize.json")
                 if meta["reference"]:
                     r["metrics"] = metrics(read_u16(r["comp"]).astype(np.uint16), read_u16(meta["reference"]).astype(np.uint16), meta, src)
-                if r.get("zmap"):
+                if r["algo"] == "depth-map":
                     r.setdefault("metrics", {}).update(zmap_measures(r, meta, src, comps.get("laplacian" + tag, r["comp"])))
+                r.setdefault("metrics", {}).update(row_glow(r, by_algo, meta))
                 if arm == "on" and "off" in arms:
                     off = read_u16(comps[r["algo"]])
                     diff = np.rint(np.abs(read_u16(r["comp"]) - off))

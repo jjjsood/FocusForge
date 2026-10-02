@@ -1298,7 +1298,7 @@ fn switching_methods_remembers_each_methods_values() {
     controller.set_fuse_algorithm("laplacian");
     controller.set_param_value("fuse", "levels", ParamValue::Int(3));
     controller.set_fuse_algorithm("weighted-average");
-    controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(4.0));
+    controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(3.0));
     controller.set_fuse_algorithm("depth-map");
     controller.set_param_value("fuse", "score-radius", ParamValue::Int(7));
 
@@ -1306,7 +1306,7 @@ fn switching_methods_remembers_each_methods_values() {
         controller.set_fuse_algorithm("laplacian");
         assert_eq!(fuse_value(&controller, "levels"), "3");
         controller.set_fuse_algorithm("weighted-average");
-        assert_eq!(fuse_value(&controller, "weight-exponent"), "4");
+        assert_eq!(fuse_value(&controller, "weight-exponent"), "3");
         assert_eq!(
             fuse_value(&controller, "radius"),
             fuse_default_text("weighted-average", "radius"),
@@ -1374,7 +1374,7 @@ fn reset_all_forgets_remembered_methods() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
     controller.set_fuse_algorithm("weighted-average");
-    controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(4.0));
+    controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(3.0));
     controller.set_fuse_algorithm("laplacian");
 
     assert_eq!(

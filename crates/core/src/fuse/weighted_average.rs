@@ -121,15 +121,21 @@ use crate::tile::Tile;
 use crate::tile::plan::TileSupport;
 use crate::zmap::NO_SOURCE;
 
-const RADIUS_DEFAULT: i64 = 8;
+/// `16`. A defocused frame's spread edge energy reaches past a narrow window,
+/// so a wide window keeps the sharp edge's score dominant. With exponent 4.0,
+/// 16 px against 8 px takes the dark-side brightening next to strong edges on
+/// two aligned 1024 x 1024 crops (counts against a per-pixel sharpest-frame
+/// pick) from 147.6 / -81.1 to -62.8 / -193.0; at exponent 2.0 it alone loses
+/// hair detail (retention 0.8108 against 0.8644).
+const RADIUS_DEFAULT: i64 = 16;
 
-/// `2.0`. Measured over `fixtures/mantis-512` (single-tile, 704 px):
-/// composite Laplacian variance is 83,079.4 at `1.0`, 169,581.2 at `2.0`
-/// and 218,923.3 at `4.0` -- `2.0` already captures most of the exponent's
-/// benefit (roughly 2x `1.0`'s variance), while `4.0` buys only a further
-/// ~29% over `2.0` for walking twice as far toward selection, which is
-/// what "weighted average" is meant not to be.
-const WEIGHT_EXPONENT_DEFAULT: f64 = 2.0;
+/// `4.0`. With the 16 px window it takes the dark-side brightening next to
+/// strong edges on the two crops from 729.9 / 250.6 (radius 8, exponent 2.0)
+/// to -62.8 / -193.0 counts and raises hair retention from 0.8644 to 0.9163.
+/// It stays a blend: hair retention and glint core (0.9611) stay below
+/// Details (0.9927, 0.9985) by more than 0.07 and 0.03, where exponent 6.0 at
+/// radius 8 comes within 0.015 on hair retention.
+const WEIGHT_EXPONENT_DEFAULT: f64 = 4.0;
 
 static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     vec![
@@ -570,6 +576,20 @@ mod tests {
     }
 
     #[test]
+    fn shipped_defaults_are_a_16_px_window_and_exponent_4() {
+        let default_of = |id: &str| {
+            PARAMS
+                .iter()
+                .find(|parameter| parameter.id == id)
+                .unwrap_or_else(|| panic!("{id} must be declared"))
+                .default
+                .clone()
+        };
+        assert_eq!(default_of("radius"), ParamValue::Int(16));
+        assert_eq!(default_of("weight-exponent"), ParamValue::Float(4.0));
+    }
+
+    #[test]
     fn every_parameter_the_implementation_reads_is_declared() {
         let algo = WeightedAverage;
         let (w, h, spp) = (8u32, 8u32, 3u32);
@@ -711,8 +731,8 @@ mod tests {
     /// The top of the declared parameter range must produce a real pixel,
     /// not a silently black one.
     ///
-    /// A radius-8 window over a full 0..65535 checkerboard gives a score
-    /// around 1e6. At `weight-exponent = 8.0` -- the declared maximum --
+    /// A radius-16 window over a full 0..65535 checkerboard gives a score
+    /// of several million. At `weight-exponent = 8.0` -- the declared maximum --
     /// `1e6^8` is about `1e48`, which is infinity in `f32` (max ~3.4e38).
     /// Before the weight was widened to `f64` this produced `inf / inf` in
     /// the normalisation, i.e. `NaN`, which rounds to 0: a black pixel at
@@ -730,7 +750,7 @@ mod tests {
         let ctx = TileCtx::new(rect(w, h), &tiles);
 
         let out = WeightedAverage
-            .fuse(&ctx, &cfg(8, 8.0))
+            .fuse(&ctx, &cfg(16, 8.0))
             .expect("the declared maximum exponent must fuse, not fail");
 
         // Interior pixel, away from the clamp-to-edge border.
