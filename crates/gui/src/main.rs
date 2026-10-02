@@ -56,7 +56,8 @@ struct Args {
     toolbar_state: Option<String>,
     /// Opens the export modal at startup with literal preview text, for
     /// inspecting a state no click sequence quickly reaches: `ready`,
-    /// `writing` or `refused`.
+    /// `ready-png`, `ready-jpeg`, `ready-menu`, `writing`, `refused` or
+    /// `refused-format`.
     #[arg(long)]
     export_dialog_preview: Option<String>,
     /// Opens the `Images` panel's sort menu at startup, for inspecting it
@@ -133,7 +134,22 @@ fn apply_toolbar_state_preview(app: &AppWindow, state: &str) {
 /// Sets the export modal's own state directly, with no controller or
 /// worker behind it -- `apply_toolbar_state_preview`'s twin, for inspecting
 /// the writing/refused states no click sequence quickly reaches.
-fn apply_export_dialog_preview(app: &AppWindow, stage: &str) {
+fn apply_export_dialog_preview(app: &AppWindow, spec: &str) {
+    use focusforge_gui::job::ExportFormat;
+    // `ready`, `ready-png`, `ready-jpeg`, `ready-menu` (TIFF compression
+    // list open), `writing`, `refused` or `refused-format` (a format cause,
+    // no `Locate frames…`).
+    let (stage, variant) = spec.split_once('-').unwrap_or((spec, ""));
+    let choice = focusforge_gui::export_settings::ExportChoice {
+        format: match variant {
+            "png" => ExportFormat::Png,
+            "jpeg" => ExportFormat::Jpeg,
+            _ => ExportFormat::Tiff,
+        },
+        ..Default::default()
+    };
+    let open = (variant == "menu").then_some("tiff-compression");
+    focusforge_gui::bridge::push_export_view(app, &choice.view(open));
     app.set_export_open(true);
     app.set_export_context("mantis-512.ffp · ORB · 2026-09-28 14:32".into());
     app.set_export_what("Exporting the saved checkpoint you selected.".into());
@@ -143,7 +159,13 @@ fn apply_export_dialog_preview(app: &AppWindow, stage: &str) {
     } else {
         slint::SharedString::default()
     });
-    let lines: Vec<slint::SharedString> = if stage == "refused" {
+    app.set_export_can_locate(!(stage == "refused" && variant == "format"));
+    let lines: Vec<slint::SharedString> = if stage == "refused" && variant == "format" {
+        vec![
+            "JPEG can't be bigger than 65,535 pixels on a side. This image is 70,000 × 40,000."
+                .into(),
+        ]
+    } else if stage == "refused" {
         vec![
             "mantis_014.tif — missing".into(),
             "mantis_037.tif — changed since this checkpoint was fused".into(),
@@ -657,10 +679,10 @@ fn install_recent(
         return;
     };
     let entries = focusforge_gui::recent::load(&config_dir);
-    controller
-        .lock()
-        .unwrap()
-        .install_recent(entries, config_dir);
+    let choice = focusforge_gui::export_settings::load(&config_dir);
+    let mut controller = controller.lock().unwrap();
+    controller.install_export_choice(choice);
+    controller.install_recent(entries, config_dir);
 }
 
 fn main() -> ExitCode {

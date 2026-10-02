@@ -146,6 +146,55 @@ export component ThemeSheet inherits Window {
         spacing: Theme.space-3;
         alignment: start;
 
+        GroupHeading { text: "Export dialog: format settings"; }
+        FFSegmented { width: 252px; segments: ["TIFF", "PNG", "JPEG"]; selected: "PNG"; }
+        Rectangle {
+            width: 528px;
+            height: 150px;
+
+            FFRowText { x: 0px; y: 0px; width: 120px; height: 28px; text: "Quality"; }
+            FFSlider { x: 128px; y: 1px; width: 210px; fraction: 0.94; value-text: "95"; }
+
+            FFRowText { x: 0px; y: 36px; width: 120px; height: 28px; text: "Chroma subsampling"; }
+            FFSegmented { x: 128px; y: 36px; width: 168px; segments: ["4:4:4", "4:2:0"]; selected: "4:2:0"; }
+
+            FFRowText { x: 0px; y: 72px; width: 120px; height: 28px; text: "Compression"; }
+            FFMenu {
+                x: 128px;
+                y: 72px;
+                width: 110px;
+                label: "None";
+                external-list: true;
+                open: true;
+            }
+
+            FFSectionHeading {
+                x: 0px;
+                y: 108px;
+                width: 528px;
+                compact: true;
+                opaque: false;
+                provenance: "explicit";
+                label: "METADATA";
+            }
+            FFRowText { x: 0px; y: 122px; width: 120px; height: 24px; text: "Metadata"; }
+
+            FFMenuList {
+                x: 128px;
+                y: 100px;
+                width: 110px;
+                choices: ["None", "LZW", "Deflate"];
+                choice-ids: ["none", "lzw", "deflate"];
+                show-choice-ids: false;
+                selected: "none";
+            }
+        }
+        FFDialogFooter {
+            width: 528px;
+            cancel-label: "Close";
+            confirm-label: "";
+        }
+
         GroupHeading { text: "Surfaces / Borders"; }
         HorizontalLayout {
             spacing: Theme.space-3;

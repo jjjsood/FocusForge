@@ -258,7 +258,7 @@ pub static JPEG_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
                     },
                 ],
             },
-            default: ParamValue::Enum("444".to_string()),
+            default: ParamValue::Enum("420".to_string()),
             auto: None,
             host_default: None,
         },
@@ -1261,7 +1261,7 @@ mod tests {
             jpeg,
             ExportOptions::Jpeg {
                 quality: 95,
-                subsampling: JpegSubsampling::S444,
+                subsampling: JpegSubsampling::S420,
             }
         );
     }

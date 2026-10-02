@@ -18,9 +18,14 @@ use focusforge_core::gpu::TileBackend;
 use focusforge_core::io::{
     COMPOSITE_FILENAME, FrameError, FrameReader, ZMAP_FILENAME, open_frame_set,
 };
+pub use focusforge_core::io::{JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 use focusforge_core::params::ParamValues;
 use focusforge_core::pipeline::{
     self, AlignRequest, FuseOutput, FuseProduct, FuseRequest, RunStage, StageObserver,
+};
+pub use focusforge_core::project::export::{
+    ExportFormat, ExportOptions, JpegSubsampling, MetadataOptions, PngBits, PngCompression,
+    params_for,
 };
 use focusforge_core::project::{self, Project, ProjectError};
 use focusforge_core::registry::{self, LookupError};
@@ -717,13 +722,16 @@ static NEXT_EXPORT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// changes nothing about the project: no checkpoint is written, no `.ffp`
 /// touched, and a live export's temp Z-Map is removed whether the write
 /// finishes or fails.
-pub fn export_position(source: ExportSource, path: &Path) -> Result<(), ExportError> {
-    let options = project::export::ExportOptions::default();
-    let metadata = project::export::MetadataOptions::default();
+pub fn export_position(
+    source: ExportSource,
+    path: &Path,
+    options: &project::export::ExportOptions,
+    metadata: &project::export::MetadataOptions,
+) -> Result<(), ExportError> {
     match source {
         ExportSource::Saved { project_path, id } => {
             let mut project = Project::open(&project_path)?;
-            project::export_checkpoint(&mut project, &id, path, &options, &metadata)?;
+            project::export_checkpoint(&mut project, &id, path, options, metadata)?;
         }
         ExportSource::Held(held) => {
             let zmap_source = project::ZmapSource {
@@ -732,7 +740,7 @@ pub fn export_position(source: ExportSource, path: &Path) -> Result<(), ExportEr
                 registration: held.registration,
                 description: held.composite_description,
             };
-            project::export_zmap(&held.zmap, &zmap_source, path, &options, &metadata)?;
+            project::export_zmap(&held.zmap, &zmap_source, path, options, metadata)?;
         }
         ExportSource::Live {
             width,
@@ -756,7 +764,7 @@ pub fn export_position(source: ExportSource, path: &Path) -> Result<(), ExportEr
                     reference,
                     description,
                 };
-                project::export_zmap(&temp, &zmap_source, path, &options, &metadata)?;
+                project::export_zmap(&temp, &zmap_source, path, options, metadata)?;
                 Ok(())
             })();
             let _ = std::fs::remove_file(&temp);
@@ -796,15 +804,48 @@ pub fn write_zmap(
 /// modal writing forever.
 pub fn export_outcome(
     result: std::thread::Result<Result<(), ExportError>>,
-) -> Result<(), Vec<String>> {
+) -> Result<(), ExportRefusal> {
     match result {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(export_refusal_lines(&err)),
+        Ok(Err(err)) => Err(ExportRefusal {
+            lines: export_refusal_lines(&err),
+            locate: matches!(
+                err,
+                ExportError::Project(
+                    ProjectError::RenderSourcesUnavailable { .. }
+                        | ProjectError::ExportSourcesUnavailable { .. }
+                )
+            ),
+        }),
         Err(_) => {
             eprintln!("an export panicked");
-            Err(vec!["Cannot export this position.".to_string()])
+            Err(ExportRefusal {
+                lines: vec!["Cannot export this position.".to_string()],
+                locate: false,
+            })
         }
     }
+}
+
+/// A refused export as the modal shows it: its lines, and whether
+/// `Locate frames…` can help (only a missing or changed source).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportRefusal {
+    pub lines: Vec<String>,
+    pub locate: bool,
+}
+
+/// `n` with a comma between every group of three digits.
+fn thousands(n: u32) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// One `"<name> — missing"` / `"<name> — changed"` line -- [`frame_line`]'s
@@ -833,6 +874,26 @@ pub fn export_refusal_lines(err: &ExportError) -> Vec<String> {
         }
         ExportError::Project(ProjectError::ExportWriteFailed { path, source }) => {
             vec![format!("Can't write {}: {source}", path.display())]
+        }
+        ExportError::Project(ProjectError::ExportTooLarge {
+            format,
+            width,
+            height,
+            limit,
+            ..
+        }) => vec![format!(
+            "{} can't be bigger than {} pixels on a side. This image is {} × {}.",
+            format.to_uppercase(),
+            thousands(*limit),
+            thousands(*width),
+            thousands(*height)
+        )],
+        ExportError::Project(ProjectError::ExportUnsupportedSamples { .. }) => vec![
+            "PNG and JPEG can only save grey or colour (RGB) images; this one has extra channels."
+                .to_string(),
+        ],
+        ExportError::Project(ProjectError::ExportOptions { source }) => {
+            vec![format!("Some export settings aren't valid: {source}.")]
         }
         _ => {
             eprintln!("failed to export a checkpoint: {err}");
@@ -1038,5 +1099,75 @@ pub fn settle(result: std::thread::Result<Result<FuseOutcome, PipelineError>>) -
             diverged: Vec::new(),
             operation: Some(FailedOperation::Fusion),
         },
+    }
+}
+
+#[cfg(test)]
+mod export_refusal_tests {
+    use super::*;
+    use focusforge_core::params::ParamValue;
+    use focusforge_core::project::export::{ExportFormat, ExportOptions};
+
+    fn too_large(width: u32, height: u32) -> ExportError {
+        ExportError::Project(ProjectError::ExportTooLarge {
+            path: PathBuf::from("out.jpg"),
+            format: "jpeg".to_string(),
+            width,
+            height,
+            limit: 65_535,
+        })
+    }
+
+    #[test]
+    fn too_large_names_the_limit_and_the_size() {
+        assert_eq!(
+            export_refusal_lines(&too_large(70_000, 40_000)),
+            vec![
+                "JPEG can't be bigger than 65,535 pixels on a side. This image is 70,000 × 40,000."
+            ]
+        );
+        let one_over = export_refusal_lines(&too_large(65_536, 12));
+        assert_eq!(
+            one_over,
+            vec!["JPEG can't be bigger than 65,535 pixels on a side. This image is 65,536 × 12."]
+        );
+    }
+
+    #[test]
+    fn unsupported_samples_name_the_cause() {
+        let err = ExportError::Project(ProjectError::ExportUnsupportedSamples {
+            path: PathBuf::from("out.png"),
+            format: "png".to_string(),
+            samples_per_pixel: 4,
+        });
+        assert_eq!(
+            export_refusal_lines(&err),
+            vec![
+                "PNG and JPEG can only save grey or colour (RGB) images; this one has extra channels."
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_options_name_the_setting() {
+        let mut values = ParamValues::new();
+        values.insert("jpeg-quality".to_string(), ParamValue::Int(0));
+        let err = ExportOptions::from_values(ExportFormat::Jpeg, &values).unwrap_err();
+        let lines = export_refusal_lines(&ExportError::Project(err));
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with("Some export settings aren't valid: ") && lines[0].ends_with('.'),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("jpeg-quality"), "{lines:?}");
+    }
+
+    #[test]
+    fn only_a_missing_source_offers_locate() {
+        let refusal = export_outcome(Ok(Err(too_large(70_000, 1)))).unwrap_err();
+        assert!(!refusal.locate);
+        let panicked = export_outcome(Err(Box::new("boom"))).unwrap_err();
+        assert!(!panicked.locate);
+        assert_eq!(panicked.lines, vec!["Cannot export this position."]);
     }
 }

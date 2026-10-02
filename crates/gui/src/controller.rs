@@ -30,16 +30,17 @@ use crate::diagnostics::{
     DiagnosticsView, clamp_manifest_scroll, manifest_content_height, measurement_scope, size_text,
 };
 use crate::entry;
+use crate::export_settings::{self, ExportChoice, ExportView};
 use crate::images;
 use crate::input_config::Provenance;
 use crate::input_map::{
     Action, ActionEvent, Button, InputRowView, InputTable, Modifiers, PointerKind, Trigger,
 };
-use crate::job;
+use crate::job::{self, ExportFormat, ExportOptions, params_for};
 use crate::overlay::{self, CardView, FailureCard, FailureKind};
 use crate::recent;
 use crate::settings_panel::{
-    self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext,
+    self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext, slider_value,
 };
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
 
@@ -533,6 +534,11 @@ struct ExportDialog {
     /// same path once `Locate frames…` resolves its sources, without
     /// prompting the save dialog again.
     destination: Option<PathBuf>,
+    /// The format and settings the modal shows; copied into
+    /// `AppState::export_choice` and saved only once an export succeeds.
+    choice: ExportChoice,
+    /// The descriptor id whose list is open.
+    open_menu: Option<String>,
 }
 
 /// Which position an export modal names -- the three kinds its own
@@ -572,12 +578,12 @@ fn export_copy_for(
 enum ExportStage {
     Ready,
     Writing,
-    Refused(Vec<String>),
+    Refused { lines: Vec<String>, locate: bool },
 }
 
 /// An export write's own outcome, as [`ExportSlot`] parks it: written, or
 /// the modal's own refusal lines.
-type ExportOutcome = Result<(), Vec<String>>;
+type ExportOutcome = Result<(), job::ExportRefusal>;
 
 /// The one export write in flight, if any, and where its worker parks the
 /// result -- [`RenderSlot`]'s twin for [`job::export_position`].
@@ -1194,6 +1200,9 @@ struct ShellState {
     render: RenderSlot,
     /// The open export modal, if any -- [`AppController::checkpoint_export_requested`].
     export_dialog: Option<ExportDialog>,
+    /// The last confirmed export format and settings, which the next modal
+    /// opens on.
+    export_choice: ExportChoice,
     /// The in-flight export write, if any.
     export: ExportSlot,
     /// The in-flight additive import scan, if any.
@@ -1982,7 +1991,7 @@ impl AppController {
         let Some(tab) = self.state.active() else {
             return;
         };
-        let Some(dialog) = export_dialog_for(tab) else {
+        let Some(dialog) = export_dialog_for(tab, &self.state.export_choice) else {
             return;
         };
         self.state.export_dialog = Some(dialog);
@@ -2015,6 +2024,7 @@ impl AppController {
             return;
         }
         let tab_id = dialog.tab_id;
+        let choice = dialog.choice.clone();
         let Some(tab) = self.state.projects.iter().find(|t| t.id == tab_id) else {
             self.state.export_dialog = None;
             return;
@@ -2023,7 +2033,7 @@ impl AppController {
             self.state.export_dialog = None;
             return;
         };
-        let proposed = export_proposed_path(tab);
+        let proposed = export_proposed_path(tab, choice.format);
         let Some(path) = pick(&proposed) else {
             return;
         };
@@ -2036,7 +2046,7 @@ impl AppController {
             dialog.destination_name = destination_name;
             dialog.destination = Some(path.clone());
         }
-        self.start_export(tab_id, source, path);
+        self.start_export(tab_id, source, path, &choice);
         self.emit(ShellEvent::CheckpointExportRequested);
     }
 
@@ -2048,7 +2058,7 @@ impl AppController {
     /// verification is still running.
     pub fn export_locate_frames(&mut self, folder: PathBuf) -> Option<std::thread::JoinHandle<()>> {
         let dialog = self.state.export_dialog.as_ref()?;
-        if !matches!(dialog.stage, ExportStage::Refused(_)) {
+        if !matches!(dialog.stage, ExportStage::Refused { locate: true, .. }) {
             return None;
         }
         let tab_id = dialog.tab_id;
@@ -2061,11 +2071,11 @@ impl AppController {
     /// position or the destination it started from is gone by the time this
     /// runs.
     fn retry_export(&mut self, tab_id: u64) {
-        let Some(destination) = self
+        let Some((destination, choice)) = self
             .state
             .export_dialog
             .as_ref()
-            .and_then(|dialog| dialog.destination.clone())
+            .and_then(|dialog| Some((dialog.destination.clone()?, dialog.choice.clone())))
         else {
             return;
         };
@@ -2080,7 +2090,7 @@ impl AppController {
         if let Some(dialog) = self.state.export_dialog.as_mut() {
             dialog.stage = ExportStage::Writing;
         }
-        self.start_export(tab_id, source, destination);
+        self.start_export(tab_id, source, destination, &choice);
         self.emit(ShellEvent::CheckpointExportRequested);
     }
 
@@ -2089,14 +2099,21 @@ impl AppController {
     /// slot: a worker left running past its own dialog's Cancel keeps
     /// writing, but a later export's `settle_export` reads only the slot its
     /// own worker was handed, never a still-running one's stale result.
-    fn start_export(&mut self, tab_id: u64, source: job::ExportSource, path: PathBuf) {
+    fn start_export(
+        &mut self,
+        tab_id: u64,
+        source: job::ExportSource,
+        path: PathBuf,
+        choice: &ExportChoice,
+    ) {
+        let (options, metadata) = (choice.options(), choice.metadata_options());
         self.state.export.in_flight = Some(tab_id);
         self.state.export.started = true;
         self.state.export.outcome = Arc::new(Mutex::new(None));
         let outcome = Arc::clone(&self.state.export.outcome);
         std::thread::spawn(move || {
             let result = job::export_outcome(std::panic::catch_unwind(|| {
-                job::export_position(source, &path)
+                job::export_position(source, &path, &options, &metadata)
             }));
             *outcome
                 .lock()
@@ -2120,10 +2137,14 @@ impl AppController {
         };
         self.state.export.in_flight = None;
         match outcome {
-            Ok(()) => self.state.export_dialog = None,
-            Err(lines) => {
+            Ok(()) => {
+                if let Some(dialog) = self.state.export_dialog.take() {
+                    self.remember_export_choice(dialog.choice);
+                }
+            }
+            Err(job::ExportRefusal { lines, locate }) => {
                 if let Some(dialog) = self.state.export_dialog.as_mut() {
-                    dialog.stage = ExportStage::Refused(lines);
+                    dialog.stage = ExportStage::Refused { lines, locate };
                 }
             }
         }
@@ -2135,6 +2156,121 @@ impl AppController {
     /// cue to start polling [`Self::settle_export`].
     pub fn take_export_started(&mut self) -> bool {
         std::mem::take(&mut self.state.export.started)
+    }
+
+    /// Whether a refused export modal offers `Locate frames…`.
+    pub fn export_can_locate(&self) -> bool {
+        matches!(
+            self.state.export_dialog.as_ref().map(|d| &d.stage),
+            Some(ExportStage::Refused { locate: true, .. })
+        )
+    }
+
+    /// The open modal's format, TIFF while it is closed.
+    pub fn export_format(&self) -> ExportFormat {
+        self.state
+            .export_dialog
+            .as_ref()
+            .map_or_else(|| ExportChoice::default().format, |d| d.choice.format)
+    }
+
+    /// The open modal's settings section; `None` when it is closed.
+    pub fn export_view(&self) -> Option<ExportView> {
+        let dialog = self.state.export_dialog.as_ref()?;
+        Some(dialog.choice.view(dialog.open_menu.as_deref()))
+    }
+
+    /// Switches the ready modal to the format `label` names.
+    pub fn export_select_format(&mut self, label: &str) {
+        if let Some(dialog) = self.ready_export_dialog()
+            && let Some(format) = export_settings::FORMATS
+                .into_iter()
+                .find(|f| f.id().eq_ignore_ascii_case(label))
+        {
+            dialog.choice.format = format;
+            dialog.open_menu = None;
+        }
+    }
+
+    /// Opens the list of descriptor `id`, or closes it when already open.
+    pub fn export_toggle_menu(&mut self, id: &str) {
+        if let Some(dialog) = self.ready_export_dialog() {
+            let already = dialog.open_menu.as_deref() == Some(id);
+            dialog.open_menu = (!already).then(|| id.to_string());
+        }
+    }
+
+    /// Sets the enum descriptor `id` to its variant `variant_id`.
+    pub fn export_choose(&mut self, id: &str, variant_id: &str) {
+        self.set_export_value(id, ParamValue::Enum(variant_id.to_string()));
+    }
+
+    /// [`Self::export_choose`] for a control that names its variant by
+    /// label.
+    pub fn export_choose_label(&mut self, id: &str, label: &str) {
+        let variant = self.export_view().and_then(|view| {
+            let row = view.rows.into_iter().find(|r| r.id == id)?;
+            let at = row.choices.iter().position(|c| c == label)?;
+            row.choice_ids.get(at).cloned()
+        });
+        if let Some(variant) = variant {
+            self.export_choose(id, &variant);
+        }
+    }
+
+    /// Moves the JPEG quality slider to `fraction` of its range.
+    pub fn export_set_quality_fraction(&mut self, fraction: f32) {
+        let Some(desc) = params_for(ExportFormat::Jpeg)
+            .iter()
+            .find(|d| d.id == "jpeg-quality")
+        else {
+            return;
+        };
+        self.set_export_value("jpeg-quality", slider_value(fraction, &desc.kind));
+    }
+
+    /// Flips the `Metadata` switch.
+    pub fn export_toggle_metadata(&mut self) {
+        if let Some(dialog) = self.ready_export_dialog() {
+            dialog.choice.metadata = !dialog.choice.metadata;
+        }
+    }
+
+    fn ready_export_dialog(&mut self) -> Option<&mut ExportDialog> {
+        self.state
+            .export_dialog
+            .as_mut()
+            .filter(|d| matches!(d.stage, ExportStage::Ready))
+    }
+
+    /// Writes one descriptor value into the selected format's options
+    /// through core's validation; a value core refuses changes nothing.
+    fn set_export_value(&mut self, id: &str, value: ParamValue) {
+        let Some(dialog) = self.ready_export_dialog() else {
+            return;
+        };
+        let mut values = dialog.choice.options().values();
+        values.insert(id.to_string(), value);
+        if let Ok(options) = ExportOptions::from_values(dialog.choice.format, &values) {
+            dialog.choice.set_options(options);
+        }
+        dialog.open_menu = None;
+    }
+
+    /// Keeps `choice` for the next modal and saves it when a config
+    /// directory is installed; a failed save is logged, never an error.
+    fn remember_export_choice(&mut self, choice: ExportChoice) {
+        if let Some(dir) = &self.state.config_dir
+            && let Err(e) = export_settings::save(dir, &choice)
+        {
+            tracing::warn!(error = %e, "the export choice could not be saved");
+        }
+        self.state.export_choice = choice;
+    }
+
+    /// Installs the export choice loaded at startup.
+    pub fn install_export_choice(&mut self, choice: ExportChoice) {
+        self.state.export_choice = choice;
     }
 
     /// Whether the export modal is open.
@@ -2155,7 +2291,7 @@ impl AppController {
         match self.state.export_dialog.as_ref().map(|d| &d.stage) {
             Some(ExportStage::Ready) | None => "ready",
             Some(ExportStage::Writing) => "writing",
-            Some(ExportStage::Refused(_)) => "refused",
+            Some(ExportStage::Refused { .. }) => "refused",
         }
     }
 
@@ -2171,7 +2307,7 @@ impl AppController {
     /// its last write refused.
     pub fn export_refusal_lines(&self) -> &[String] {
         match self.state.export_dialog.as_ref().map(|d| &d.stage) {
-            Some(ExportStage::Refused(lines)) => lines,
+            Some(ExportStage::Refused { lines, .. }) => lines,
             _ => &[],
         }
     }
@@ -4129,7 +4265,7 @@ impl AppController {
                         }
                         self.emit(ShellEvent::OverlayChanged);
                     }
-                    if matches!(&self.state.export_dialog, Some(d) if d.tab_id == id && matches!(d.stage, ExportStage::Refused(_)))
+                    if matches!(&self.state.export_dialog, Some(d) if d.tab_id == id && matches!(d.stage, ExportStage::Refused { .. }))
                     {
                         self.retry_export(id);
                     }
@@ -7381,7 +7517,7 @@ fn saved_row_export_info(tab: &ProjectTab, id: &str) -> Option<RowExportInfo> {
 
 /// The export modal's own state for `tab`'s current position, `None` when
 /// it has none.
-fn export_dialog_for(tab: &ProjectTab) -> Option<ExportDialog> {
+fn export_dialog_for(tab: &ProjectTab, choice: &ExportChoice) -> Option<ExportDialog> {
     let editing = tab
         .edit
         .as_ref()
@@ -7405,6 +7541,8 @@ fn export_dialog_for(tab: &ProjectTab) -> Option<ExportDialog> {
         stage: ExportStage::Ready,
         destination_name: String::new(),
         destination: None,
+        choice: choice.clone(),
+        open_menu: None,
     })
 }
 
@@ -7464,9 +7602,10 @@ fn export_source_for(tab: &ProjectTab) -> Option<job::ExportSource> {
 }
 
 /// The export save dialog's own starting point: `<project dir>/<tab
-/// title>.tif` -- built from the tab's own title, not the project file's
-/// name, so no extension of the identity path is ever touched.
-fn export_proposed_path(tab: &ProjectTab) -> PathBuf {
+/// title>.<format's extension>` -- built from the tab's own title, not the
+/// project file's name, so no extension of the identity path is ever
+/// touched.
+fn export_proposed_path(tab: &ProjectTab, format: ExportFormat) -> PathBuf {
     let dir = match &tab.project {
         GuiProject::Unsaved(group) => group.dir.clone(),
         GuiProject::Opened(project) => project
@@ -7474,7 +7613,11 @@ fn export_proposed_path(tab: &ProjectTab) -> PathBuf {
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
     };
-    dir.join(format!("{}.tif", tab.title))
+    dir.join(format!(
+        "{}.{}",
+        tab.title,
+        crate::picker::default_extension(format)
+    ))
 }
 
 /// A path's own identity for a project or a card: an `Unsaved` tab's own

@@ -106,6 +106,8 @@ pub mod images;
 /// directly.
 pub mod overlay;
 
+pub mod export_settings;
+
 /// The `Recent` list's own file format, mirroring `crate::input_config`. No
 /// `use slint::` anywhere in it. `pub` so `src/main.rs` and
 /// `tests/projects_overlay.rs` reach it directly.

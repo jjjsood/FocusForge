@@ -112,12 +112,13 @@ fn full() -> Rect {
 }
 
 fn write_rgb(path: &Path, samples: &[u16]) {
+    let samples_per_pixel = (samples.len() / (MW * MH) as usize) as u32;
     let mut writer = TiffWriter::create(
         path,
         TiffSpec {
             width: MW,
             height: MH,
-            samples_per_pixel: 3,
+            samples_per_pixel,
             description: Some("staged".to_string()),
         },
     )
@@ -126,8 +127,8 @@ fn write_rgb(path: &Path, samples: &[u16]) {
     writer.finish().unwrap();
 }
 
-fn frame_samples(seed: usize) -> Vec<u16> {
-    (0..(MW * MH * 3) as usize)
+fn frame_samples(seed: usize, samples_per_pixel: u32) -> Vec<u16> {
+    (0..(MW * MH * samples_per_pixel) as usize)
         .map(|j| ((j * 131 + seed * 977) % 65_535) as u16)
         .collect()
 }
@@ -145,16 +146,23 @@ struct Edited {
 }
 
 fn build_edited(name: &str) -> Edited {
+    build_edited_with_samples(name, 3)
+}
+
+fn build_edited_with_samples(name: &str, samples_per_pixel: u32) -> Edited {
     let dir = common::tree(name);
     let sources: Vec<PathBuf> = (0..FRAMES)
         .map(|i| {
             let path = dir.join(format!("frame-{i:02}.tif"));
-            write_rgb(&path, &frame_samples(i));
+            write_rgb(&path, &frame_samples(i, samples_per_pixel));
             path
         })
         .collect();
     let composite = dir.join("composite.tif");
-    write_rgb(&composite, &vec![9000; (MW * MH * 3) as usize]);
+    write_rgb(
+        &composite,
+        &vec![9000; (MW * MH * samples_per_pixel) as usize],
+    );
     let zmap = dir.join("zmap.tif");
     let indices: Vec<u16> = (0..(MW * MH) as usize)
         .map(|i| (i % FRAMES) as u16)
@@ -580,6 +588,10 @@ fn refused_export_is_shown_in_the_modal() {
     wait_export(&mut controller);
 
     assert_eq!(controller.export_stage(), "refused");
+    assert!(
+        controller.export_can_locate(),
+        "a missing source offers Locate frames…"
+    );
     let lines = controller.export_refusal_lines();
     // One bare `"<name> — missing"` line per source, no heading of its own --
     // `dialogs.slint`'s static heading is the only heading. `frame-00.tif`
@@ -661,4 +673,410 @@ fn unwritable_destination_names_the_cause_in_the_modal() {
         "the line must say what went wrong: {lines:?}"
     );
     assert!(!out.exists());
+}
+
+// ---- format, settings and refusal tests ------------------------------------
+
+use focusforge_core::params::ParamKind;
+use focusforge_core::project::export::{
+    JpegSubsampling, PngBits, PngCompression, TiffBits, TiffCompression, params_for,
+};
+use focusforge_gui::export_settings::{self, ExportChoice};
+
+/// A fresh controller with the edited checkpoint's row selected and the
+/// export modal open.
+fn open_edited_modal(name: &str) -> (AppController, Edited) {
+    let edited = build_edited(name);
+    let mut controller = scratch_controller(name);
+    common::open_and_settle(&mut controller, std::slice::from_ref(&edited.project));
+    let row = row_index(&controller, &edited.edited);
+    controller.select_checkpoint_row(row);
+    controller.checkpoint_export_requested();
+    (controller, edited)
+}
+
+/// Confirms the open modal at `path` and waits for the write to settle.
+fn export_to(controller: &mut AppController, path: &Path) {
+    let picked = path.to_path_buf();
+    controller.export_confirmed(move |_| Some(picked));
+    wait_export(controller);
+}
+
+fn quality_fraction(quality: i64) -> f32 {
+    (quality - 1) as f32 / 99.0
+}
+
+fn metadata_off() -> MetadataOptions {
+    MetadataOptions {
+        exif: false,
+        icc: false,
+        xmp: false,
+        iptc: false,
+    }
+}
+
+#[test]
+fn format_switch_shows_only_that_formats_settings() {
+    let (mut controller, _edited) = open_edited_modal("export_format_switch");
+    for format in export_settings::FORMATS {
+        let label = format.id().to_uppercase();
+        controller.export_select_format(&label);
+        let view = controller.export_view().expect("the modal is open");
+        assert_eq!(view.segments, ["TIFF", "PNG", "JPEG"]);
+        assert_eq!(view.selected, label);
+        assert_eq!(view.heading, format!("{label} SETTINGS"));
+        assert!(view.metadata, "Metadata is on at first open");
+        assert_eq!(view.slider_group, format == ExportFormat::Jpeg);
+        let schema = params_for(format);
+        assert_eq!(view.rows.len(), schema.len(), "exactly {label}'s rows");
+        for (row, desc) in view.rows.iter().zip(schema) {
+            assert_eq!(row.id, desc.id);
+            assert_eq!(row.label, desc.label);
+            if let ParamKind::Enum { variants } = &desc.kind {
+                let ids: Vec<&str> = variants.iter().map(|v| v.id.as_str()).collect();
+                let labels: Vec<&str> = variants.iter().map(|v| v.label.as_str()).collect();
+                assert_eq!(row.choice_ids, ids);
+                assert_eq!(row.choices, labels);
+            }
+        }
+    }
+
+    // The quality slider's fraction maps back to the same integer.
+    controller.export_select_format("JPEG");
+    for quality in [1, 50, 85, 95, 100] {
+        controller.export_set_quality_fraction(quality_fraction(quality));
+        let view = controller.export_view().unwrap();
+        assert_eq!(view.rows[0].value_text, quality.to_string());
+        controller.export_set_quality_fraction(view.rows[0].fraction);
+        assert_eq!(
+            controller.export_view().unwrap().rows[0].value_text,
+            quality.to_string(),
+            "fraction {} maps back",
+            view.rows[0].fraction
+        );
+    }
+}
+
+#[test]
+fn modal_export_equals_cli_export_for_every_format() {
+    let edited = build_edited("export_every_format");
+    let mut controller = scratch_controller("export_every_format");
+    common::open_and_settle(&mut controller, std::slice::from_ref(&edited.project));
+    let row = row_index(&controller, &edited.edited);
+    controller.select_checkpoint_row(row);
+    let mut project = Project::open(&edited.project).unwrap();
+    let dir = common::tree("export_every_format_out");
+
+    struct Case {
+        format: &'static str,
+        sets: Vec<(&'static str, &'static str)>,
+        quality: Option<i64>,
+        metadata: bool,
+        literal: ExportOptions,
+    }
+    let tiff = |bits: &'static str, compression: &'static str, b, c| Case {
+        format: "TIFF",
+        sets: vec![("tiff-bits", bits), ("tiff-compression", compression)],
+        quality: None,
+        metadata: true,
+        literal: ExportOptions::Tiff {
+            bits: b,
+            compression: c,
+        },
+    };
+    let png = |bits: &'static str, compression: &'static str, b, c| Case {
+        format: "PNG",
+        sets: vec![("png-bits", bits), ("png-compression", compression)],
+        quality: None,
+        metadata: true,
+        literal: ExportOptions::Png {
+            bits: b,
+            compression: c,
+        },
+    };
+    let jpeg = |quality: i64, subsampling: &'static str, s| Case {
+        format: "JPEG",
+        sets: vec![("jpeg-subsampling", subsampling)],
+        quality: Some(quality),
+        metadata: true,
+        literal: ExportOptions::Jpeg {
+            quality,
+            subsampling: s,
+        },
+    };
+    let mut cases = vec![
+        tiff("8", "none", TiffBits::Eight, TiffCompression::None),
+        tiff("8", "lzw", TiffBits::Eight, TiffCompression::Lzw),
+        tiff("8", "deflate", TiffBits::Eight, TiffCompression::Deflate),
+        tiff("16", "none", TiffBits::Sixteen, TiffCompression::None),
+        tiff("16", "lzw", TiffBits::Sixteen, TiffCompression::Lzw),
+        tiff("16", "deflate", TiffBits::Sixteen, TiffCompression::Deflate),
+        png("8", "fast", PngBits::Eight, PngCompression::Fast),
+        png("8", "default", PngBits::Eight, PngCompression::Default),
+        png("8", "best", PngBits::Eight, PngCompression::Best),
+        png("16", "fast", PngBits::Sixteen, PngCompression::Fast),
+        png("16", "default", PngBits::Sixteen, PngCompression::Default),
+        png("16", "best", PngBits::Sixteen, PngCompression::Best),
+    ];
+    for quality in [1, 85, 100] {
+        cases.push(jpeg(quality, "444", JpegSubsampling::S444));
+        cases.push(jpeg(quality, "420", JpegSubsampling::S420));
+    }
+    let mut no_metadata = tiff("16", "none", TiffBits::Sixteen, TiffCompression::None);
+    no_metadata.metadata = false;
+    cases.push(no_metadata);
+
+    for (i, case) in cases.iter().enumerate() {
+        controller.checkpoint_export_requested();
+        controller.export_select_format(case.format);
+        for (id, variant) in &case.sets {
+            controller.export_choose(id, variant);
+        }
+        if let Some(quality) = case.quality {
+            controller.export_set_quality_fraction(quality_fraction(quality));
+        }
+        if controller.export_view().unwrap().metadata != case.metadata {
+            controller.export_toggle_metadata();
+        }
+        let extension = case.literal.format().id();
+        let extension = if extension == "jpeg" {
+            "jpg"
+        } else {
+            extension
+        };
+        let gui_out = dir.join(format!("gui-{i}.{extension}"));
+        export_to(&mut controller, &gui_out);
+        assert!(
+            controller.export_copy().is_none(),
+            "case {i} closes the modal"
+        );
+
+        let core_out = dir.join(format!("core-{i}.{extension}"));
+        let metadata = if case.metadata {
+            MetadataOptions::default()
+        } else {
+            metadata_off()
+        };
+        export_checkpoint(
+            &mut project,
+            &edited.edited,
+            &core_out,
+            &case.literal,
+            &metadata,
+        )
+        .unwrap_or_else(|e| panic!("case {i} {:?}: {e}", case.literal));
+        assert_eq!(
+            fs::read(&gui_out).unwrap(),
+            fs::read(&core_out).unwrap(),
+            "case {i}: {:?}",
+            case.literal
+        );
+    }
+
+    // The opening defaults are the CLI's defaults, 4:2:0 JPEG included.
+    controller.checkpoint_export_requested();
+    controller.export_select_format("JPEG");
+    let fresh = ExportChoice::default();
+    assert_eq!(
+        fresh.jpeg,
+        ExportOptions::Jpeg {
+            quality: 95,
+            subsampling: JpegSubsampling::S420,
+        }
+    );
+    controller.cancel_export();
+}
+
+#[test]
+fn destination_extension_follows_the_format() {
+    let (mut controller, _edited) = open_edited_modal("export_extension");
+    for (label, extension) in [("TIFF", "tif"), ("PNG", "png"), ("JPEG", "jpg")] {
+        controller.export_select_format(label);
+        let mut proposed = None;
+        controller.export_confirmed(|p| {
+            proposed = Some(p.to_path_buf());
+            None
+        });
+        let proposed = proposed.expect("the picker is asked for a destination");
+        assert_eq!(
+            proposed.extension().and_then(|e| e.to_str()),
+            Some(extension),
+            "{label}: {proposed:?}"
+        );
+    }
+}
+
+fn settings_text(dir: &Path) -> String {
+    fs::read_to_string(dir.join("settings.toml")).unwrap_or_default()
+}
+
+#[test]
+fn last_choice_is_restored_and_cancel_stores_nothing() {
+    let (mut controller, edited) = open_edited_modal("export_last_choice");
+    let cfg = common::tree("export_last_choice_cfg");
+    let original = "# hand note\n[input]\nzoom = 1\n";
+    fs::write(cfg.join("settings.toml"), original).unwrap();
+    controller.install_recent(Vec::new(), cfg.clone());
+
+    // Cancelling the modal stores nothing and the next one opens as before.
+    controller.export_select_format("PNG");
+    controller.cancel_export();
+    assert_eq!(settings_text(&cfg), original);
+    controller.checkpoint_export_requested();
+    assert_eq!(controller.export_view().unwrap().selected, "TIFF");
+
+    // A successful export stores the whole choice.
+    controller.export_select_format("JPEG");
+    controller.export_set_quality_fraction(quality_fraction(90));
+    controller.export_choose("jpeg-subsampling", "444");
+    controller.export_toggle_metadata();
+    let out = common::tree("export_last_choice_out").join("a.jpg");
+    export_to(&mut controller, &out);
+    let stored = settings_text(&cfg);
+    assert!(stored.starts_with(original), "{stored}");
+    assert!(stored.contains("[export]"), "{stored}");
+
+    let expect_restored = |controller: &AppController| {
+        let view = controller.export_view().expect("the modal is open");
+        assert_eq!(view.selected, "JPEG");
+        assert_eq!(view.rows[0].value_text, "90");
+        assert_eq!(view.rows[1].value_text, "4:4:4");
+        assert!(!view.metadata);
+    };
+    controller.checkpoint_export_requested();
+    expect_restored(&controller);
+    controller.cancel_export();
+
+    // After a restart: a new controller reads the file from disk.
+    let mut restarted = scratch_controller("export_last_choice_restart");
+    common::open_and_settle(&mut restarted, std::slice::from_ref(&edited.project));
+    restarted.install_export_choice(export_settings::load(&cfg));
+    let row = row_index(&restarted, &edited.edited);
+    restarted.select_checkpoint_row(row);
+    restarted.checkpoint_export_requested();
+    expect_restored(&restarted);
+}
+
+#[test]
+fn retry_after_locate_exports_the_dialogs_choice_and_a_refusal_stores_nothing() {
+    let (mut controller, edited) = open_edited_modal("export_retry_choice");
+    let cfg = common::tree("export_retry_choice_cfg");
+    controller.install_recent(Vec::new(), cfg.clone());
+
+    controller.export_select_format("JPEG");
+    controller.export_set_quality_fraction(quality_fraction(90));
+    let original = fs::read(&edited.sources[0]).unwrap();
+    fs::remove_file(&edited.sources[0]).unwrap();
+    let out = common::tree("export_retry_choice_out").join("retry.jpg");
+    export_to(&mut controller, &out);
+    assert_eq!(controller.export_stage(), "refused");
+    assert!(controller.export_can_locate());
+    assert!(
+        !cfg.join("settings.toml").exists(),
+        "a refused export stores nothing"
+    );
+
+    fs::write(&edited.sources[0], original).unwrap();
+    let folder = edited.sources[0].parent().unwrap().to_path_buf();
+    controller
+        .export_locate_frames(folder)
+        .expect("a verification starts")
+        .join()
+        .expect("the locate worker did not panic");
+    controller.settle_locate();
+    wait_export(&mut controller);
+    assert!(controller.export_copy().is_none(), "the retry succeeded");
+
+    let mut project = Project::open(&edited.project).unwrap();
+    let core_out = out.with_file_name("core.jpg");
+    export_checkpoint(
+        &mut project,
+        &edited.edited,
+        &core_out,
+        &ExportOptions::Jpeg {
+            quality: 90,
+            subsampling: JpegSubsampling::S420,
+        },
+        &MetadataOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(&out).unwrap(),
+        fs::read(&core_out).unwrap(),
+        "the retry wrote the dialog's JPEG choice, not the defaults"
+    );
+    assert!(
+        settings_text(&cfg).contains("jpeg"),
+        "the success stores it"
+    );
+}
+
+#[test]
+fn broken_settings_file_falls_back_to_defaults() {
+    // An out-of-range quality and an unknown format drop alone.
+    let cfg = common::tree("export_broken_cfg");
+    fs::write(
+        cfg.join("settings.toml"),
+        "[export]\nformat = \"webp\"\n[export.jpeg]\njpeg-quality = 0\njpeg-subsampling = \"444\"\n",
+    )
+    .unwrap();
+    let (mut controller, _edited) = open_edited_modal("export_broken");
+    controller.cancel_export();
+    controller.install_export_choice(export_settings::load(&cfg));
+    controller.checkpoint_export_requested();
+    assert_eq!(controller.export_view().unwrap().selected, "TIFF");
+    controller.export_select_format("JPEG");
+    let view = controller.export_view().unwrap();
+    assert_eq!(view.rows[0].value_text, "95", "quality falls back alone");
+    assert_eq!(view.rows[1].value_text, "4:4:4", "the valid chroma stays");
+    controller.cancel_export();
+
+    // A settings file that does not parse stays byte-unchanged and the
+    // export still succeeds.
+    let broken_cfg = common::tree("export_broken_cfg2");
+    let broken = "[export\nformat = ";
+    fs::write(broken_cfg.join("settings.toml"), broken).unwrap();
+    controller.install_recent(Vec::new(), broken_cfg.clone());
+    controller.checkpoint_export_requested();
+    let out = common::tree("export_broken_out").join("a.tif");
+    export_to(&mut controller, &out);
+    assert!(out.exists(), "the export succeeds");
+    assert_eq!(settings_text(&broken_cfg), broken);
+
+    // An unwritable config directory leaves the export successful.
+    let blocker = common::tree("export_broken_blocker").join("file");
+    fs::write(&blocker, "x").unwrap();
+    controller.install_recent(Vec::new(), blocker.join("sub"));
+    controller.checkpoint_export_requested();
+    let out = out.with_file_name("b.tif");
+    export_to(&mut controller, &out);
+    assert!(out.exists(), "the choice is simply unremembered");
+}
+
+#[test]
+fn a_format_refusal_names_its_cause_and_offers_close_only() {
+    let edited = build_edited_with_samples("export_four_samples", 4);
+    let mut controller = scratch_controller("export_four_samples");
+    common::open_and_settle(&mut controller, std::slice::from_ref(&edited.project));
+    let row = row_index(&controller, &edited.edited);
+    controller.select_checkpoint_row(row);
+    controller.checkpoint_export_requested();
+    controller.export_select_format("JPEG");
+    let out = common::tree("export_four_samples_out").join("a.jpg");
+    export_to(&mut controller, &out);
+
+    assert_eq!(controller.export_stage(), "refused");
+    assert_eq!(
+        controller.export_refusal_lines(),
+        &[
+            "PNG and JPEG can only save grey or colour (RGB) images; this one has extra channels."
+                .to_string()
+        ]
+    );
+    assert!(
+        !controller.export_can_locate(),
+        "a format refusal offers Close only"
+    );
+    assert!(!out.exists());
+    controller.cancel_export();
 }

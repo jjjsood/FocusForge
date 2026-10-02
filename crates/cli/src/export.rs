@@ -69,7 +69,7 @@ pub struct FormatArgs {
     /// JPEG quality, 1-100, default 95. JPEG only.
     #[arg(long = "jpeg-quality", value_name = "N")]
     jpeg_quality: Option<String>,
-    /// JPEG chroma subsampling: `444` (default) or `420`. JPEG only.
+    /// JPEG chroma subsampling: `420` (default) or `444`. JPEG only.
     #[arg(long = "jpeg-subsampling", value_name = "SPEC")]
     jpeg_subsampling: Option<String>,
     /// Carry the alignment reference frame's EXIF: `on` (default) or `off`.
@@ -664,6 +664,118 @@ mod tests {
                 quality: 80,
                 subsampling: JpegSubsampling::S420,
             }
+        );
+    }
+
+    #[test]
+    fn export_flags_parse_to_the_modal_literals() {
+        use focusforge_core::project::export::{
+            PngBits, PngCompression, TiffBits, TiffCompression,
+        };
+        let s = |v: &str| Some(v.to_string());
+        let jpeg = |quality: &str, subsampling: Option<String>| FormatArgs {
+            format: s("jpeg"),
+            jpeg_quality: s(quality),
+            jpeg_subsampling: subsampling,
+            ..Default::default()
+        };
+        let cases = [
+            (
+                FormatArgs {
+                    format: s("tiff"),
+                    tiff_bits: s("8"),
+                    tiff_compression: s("lzw"),
+                    ..Default::default()
+                },
+                ExportOptions::Tiff {
+                    bits: TiffBits::Eight,
+                    compression: TiffCompression::Lzw,
+                },
+            ),
+            (
+                FormatArgs {
+                    format: s("tiff"),
+                    tiff_bits: s("16"),
+                    tiff_compression: s("deflate"),
+                    ..Default::default()
+                },
+                ExportOptions::Tiff {
+                    bits: TiffBits::Sixteen,
+                    compression: TiffCompression::Deflate,
+                },
+            ),
+            (
+                FormatArgs {
+                    format: s("png"),
+                    png_bits: s("8"),
+                    png_compression: s("fast"),
+                    ..Default::default()
+                },
+                ExportOptions::Png {
+                    bits: PngBits::Eight,
+                    compression: PngCompression::Fast,
+                },
+            ),
+            (
+                FormatArgs {
+                    format: s("png"),
+                    png_bits: s("16"),
+                    png_compression: s("best"),
+                    ..Default::default()
+                },
+                ExportOptions::Png {
+                    bits: PngBits::Sixteen,
+                    compression: PngCompression::Best,
+                },
+            ),
+            (
+                jpeg("1", s("444")),
+                ExportOptions::Jpeg {
+                    quality: 1,
+                    subsampling: JpegSubsampling::S444,
+                },
+            ),
+            (
+                jpeg("85", s("420")),
+                ExportOptions::Jpeg {
+                    quality: 85,
+                    subsampling: JpegSubsampling::S420,
+                },
+            ),
+            (
+                jpeg("100", None),
+                ExportOptions::Jpeg {
+                    quality: 100,
+                    subsampling: JpegSubsampling::S420,
+                },
+            ),
+        ];
+        for (args, literal) in cases {
+            assert_eq!(
+                resolve_export_options(Path::new("out"), &args).expect("valid flags resolve"),
+                literal
+            );
+        }
+
+        let off = FormatArgs {
+            exif: s("off"),
+            icc: s("off"),
+            xmp: s("off"),
+            iptc: s("off"),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_metadata_options(&off).expect("valid flags resolve"),
+            MetadataOptions {
+                exif: false,
+                icc: false,
+                xmp: false,
+                iptc: false,
+            }
+        );
+        assert_eq!(
+            resolve_metadata_options(&FormatArgs::default()).expect("no flags resolve"),
+            MetadataOptions::default()
         );
     }
 

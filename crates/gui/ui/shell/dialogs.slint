@@ -12,6 +12,8 @@ import { FFDialogFooter } from "../components/ff_dialog_footer.slint";
 import { FFRowText } from "../components/ff_row_text.slint";
 import { FFSectionHeading } from "../components/ff_section_heading.slint";
 import { FFMenu } from "../components/ff_menu.slint";
+import { FFMenuList } from "../components/ff_menu_list.slint";
+import { FFSlider } from "../components/ff_slider.slint";
 import { FFToggle } from "../components/ff_toggle.slint";
 import { FFSpinner } from "../components/ff_spinner.slint";
 import { FFProgressBar } from "../components/ff_progress_bar.slint";
@@ -281,12 +283,25 @@ export component FFSourcesMissing inherits FFDialog {
     confirm-kind: "default";
 }
 
+/// One descriptor row of the export modal's settings group, from
+/// `crate::export_settings::ExportView`.
+export struct ExportRowView {
+    id: string,
+    label: string,
+    value-text: string,
+    fraction: float,
+    choices: [string],
+    choice-ids: [string],
+    selected: string,
+    open: bool,
+}
+
 // The checkpoint panel's `Export image` modal: the tab's current position
-// as a TIFF, no destination field of its own -- confirming opens the OS
-// save dialog directly. Its content is richer than `FFDialog`'s one string
-// body, so it composes `FFModalPanel` directly rather than `FFDialog`. The
-// three states share one fixed-height content slot, so the panel never
-// resizes across them.
+// as a TIFF, PNG or JPEG image, no destination field of its own --
+// confirming opens the OS save dialog directly. Its content is richer than
+// `FFDialog`'s one string body, so it composes `FFModalPanel` directly
+// rather than `FFDialog`. The three states share one fixed-height content
+// slot, so the panel never resizes across them.
 export component FFExportDialog inherits FFModalPanel {
     in property <bool> export-open: false;
     in property <string> context: "";
@@ -296,8 +311,23 @@ export component FFExportDialog inherits FFModalPanel {
     // The chosen destination's own file name, named only while writing.
     in property <string> writing-file-name: "";
     in property <[string]> refusal-lines: [];
+    in property <[string]> format-segments: [];
+    in property <string> format-selected: "";
+    in property <string> settings-heading: "";
+    in property <[ExportRowView]> rows: [];
+    // The group is a slider row then a segmented row, not menus.
+    in property <bool> slider-group: false;
+    in property <bool> metadata-on: true;
+    // Whether the refused state offers `Locate frames…`; without it `Close` stands alone.
+    in property <bool> can-locate: true;
     callback cancelled();
     callback confirmed();
+    callback format-chosen(string);
+    callback menu-toggled(string);
+    callback option-chosen(string, string);
+    callback quality-changed(float);
+    callback chroma-chosen(string, string);
+    callback metadata-toggled();
 
     modal-open: root.export-open;
     panel-width: 560px;
@@ -363,61 +393,101 @@ export component FFExportDialog inherits FFModalPanel {
         format-label := FFRowText {
             x: 0px;
             y: 0px;
-            width: 100px;
+            width: 120px;
             height: 28px;
             text: "Format";
         }
         FFSegmented {
-            x: 78px;
+            x: 128px;
             y: 0px;
-            width: 168px;
-            segments: ["TIFF", "JPEG"];
-            selected: "TIFF";
+            width: 252px;
+            segments: root.format-segments;
+            selected: root.format-selected;
+            segment-selected(label) => { root.format-chosen(label); }
         }
 
-        tiff-settings-heading := FFSectionHeading {
+        settings-heading := FFSectionHeading {
             x: 0px;
             y: format-label.y + format-label.height + Theme.space-2;
             width: 528px;
             compact: true;
             opaque: false;
             provenance: "explicit";
-            label: "TIFF SETTINGS";
+            label: root.settings-heading;
         }
 
         // 2px: `FFSectionHeading`'s own compact height leaves no
         // token-sized gap to the row below it.
-        bitdepth-label := FFRowText {
+        rows-top := Rectangle {
             x: 0px;
-            y: tiff-settings-heading.y + tiff-settings-heading.height + 2px;
-            width: 100px;
-            height: 28px;
-            text: "Bit depth";
-        }
-        FFMenu {
-            x: 78px;
-            y: bitdepth-label.y;
-            width: 110px;
-            label: "16-bit";
+            y: settings-heading.y + settings-heading.height + 2px;
+            width: 0px;
+            height: 0px;
         }
 
-        compression-label := FFRowText {
-            x: 0px;
-            y: bitdepth-label.y + bitdepth-label.height + Theme.space-2;
-            width: 100px;
-            height: 28px;
-            text: "Compression";
+        if !root.slider-group: Rectangle {
+            for row[i] in root.rows: Rectangle {
+                x: 0px;
+                y: rows-top.y + i * (28px + Theme.space-2);
+                width: 528px;
+                height: 28px;
+
+                FFRowText {
+                    x: 0px;
+                    width: 120px;
+                    height: 28px;
+                    text: row.label;
+                }
+                FFMenu {
+                    x: 128px;
+                    width: 110px;
+                    label: row.value-text;
+                    choices: row.choices;
+                    choice-ids: row.choice-ids;
+                    selected: row.selected;
+                    open: row.open;
+                    external-list: true;
+                    toggled => { root.menu-toggled(row.id); }
+                }
+            }
         }
-        FFMenu {
-            x: 78px;
-            y: compression-label.y;
-            width: 110px;
-            label: "None";
+
+        if root.slider-group: Rectangle {
+            FFRowText {
+                x: 0px;
+                y: rows-top.y;
+                width: 120px;
+                height: 28px;
+                text: root.rows[0].label;
+            }
+            FFSlider {
+                x: 128px;
+                y: rows-top.y + 1px;
+                width: 210px;
+                fraction: root.rows[0].fraction;
+                value-text: root.rows[0].value-text;
+                fraction-changed(fraction) => { root.quality-changed(fraction); }
+            }
+            FFRowText {
+                x: 0px;
+                y: rows-top.y + 28px + Theme.space-2;
+                width: 120px;
+                height: 28px;
+                text: root.rows[1].label;
+            }
+            FFSegmented {
+                x: 128px;
+                y: rows-top.y + 28px + Theme.space-2;
+                width: 168px;
+                segments: root.rows[1].choices;
+                selected: root.rows[1].value-text;
+                segment-selected(label) => { root.chroma-chosen(root.rows[1].id, label); }
+            }
         }
 
         metadata-heading := FFSectionHeading {
             x: 0px;
-            y: compression-label.y + compression-label.height + Theme.space-3;
+            y: rows-top.y + 2 * (28px + Theme.space-2) - Theme.space-2 + Theme.space-3;
             width: 528px;
             compact: true;
             opaque: false;
@@ -425,7 +495,7 @@ export component FFExportDialog inherits FFModalPanel {
             label: "METADATA";
         }
 
-        // 2px, the same leftover as `tiff-settings-heading`'s own.
+        // 2px, the same leftover as `settings-heading`'s own.
         metadata-label := FFRowText {
             x: 44px;
             y: metadata-heading.y + metadata-heading.height + 2px;
@@ -438,8 +508,25 @@ export component FFExportDialog inherits FFModalPanel {
             // 2px above the label's own top: a toggle's knob sits taller
             // than a text row's cap-height, so this aligns their centers.
             y: metadata-label.y - 2px;
-            on: true;
-            disabled: true;
+            on: root.metadata-on;
+            toggled => { root.metadata-toggled(); }
+        }
+
+        // Drawn last so an open list paints over the rows and heading
+        // below its menu.
+        if !root.slider-group: Rectangle {
+            for row[i] in root.rows: Rectangle {
+                if row.open: FFMenuList {
+                    x: 128px;
+                    y: rows-top.y + i * (28px + Theme.space-2) + 28px;
+                    width: 110px;
+                    choices: row.choices;
+                    choice-ids: row.choice-ids;
+                    show-choice-ids: false;
+                    selected: row.selected;
+                    option-selected(variant) => { root.option-chosen(row.id, variant); }
+                }
+            }
         }
     }
 
@@ -508,7 +595,7 @@ export component FFExportDialog inherits FFModalPanel {
         width: 528px;
         dimmed: root.stage == "writing";
         cancel-label: root.stage == "refused" ? "Close" : "Cancel";
-        confirm-label: root.stage == "refused" ? "Locate frames…" : "Export";
+        confirm-label: root.stage == "refused" ? (root.can-locate ? "Locate frames…" : "") : "Export";
         confirm-kind: root.stage == "refused" ? "default" : "primary";
         cancelled => { root.cancelled(); }
         confirmed => { root.confirmed(); }

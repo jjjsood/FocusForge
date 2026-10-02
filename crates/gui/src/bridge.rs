@@ -34,7 +34,7 @@ use crate::diagnostics::{
     TimingCounter, measurement_scope, measurement_scope_with_fields, record_timing,
 };
 use crate::generated::{
-    AppWindow, CheckpointEntryView as GeneratedCheckpointEntry, FFManifestRow,
+    AppWindow, CheckpointEntryView as GeneratedCheckpointEntry, ExportRowView, FFManifestRow,
     ImageRowView as GeneratedImageRow, ProjectCardView as GeneratedProjectCard, ProjectTabView,
     RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
 };
@@ -1817,7 +1817,10 @@ pub fn install(
             }
             let started = {
                 let mut controller = controller.lock().unwrap();
-                controller.export_confirmed(crate::picker::pick_save_image);
+                let format = controller.export_format();
+                controller.export_confirmed(move |proposed| {
+                    crate::picker::pick_save_image(proposed, format)
+                });
                 controller.take_export_started()
             };
             if let Some(app) = app_weak.upgrade() {
@@ -1831,6 +1834,44 @@ pub fn install(
     app.on_export_cancelled({
         let controller = controller.clone();
         move || controller.lock().unwrap().cancel_export()
+    });
+    app.on_export_format_chosen({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |label| export_edit(&app_weak, &controller, |c| c.export_select_format(&label))
+    });
+    app.on_export_menu_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |id| export_edit(&app_weak, &controller, |c| c.export_toggle_menu(&id))
+    });
+    app.on_export_option_chosen({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |id, variant| export_edit(&app_weak, &controller, |c| c.export_choose(&id, &variant))
+    });
+    app.on_export_quality_changed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |fraction| {
+            export_edit(&app_weak, &controller, |c| {
+                c.export_set_quality_fraction(fraction)
+            })
+        }
+    });
+    app.on_export_chroma_chosen({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |id, label| {
+            export_edit(&app_weak, &controller, |c| {
+                c.export_choose_label(&id, &label)
+            })
+        }
+    });
+    app.on_export_metadata_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || export_edit(&app_weak, &controller, |c| c.export_toggle_metadata())
     });
     // The editor toolbar: each callback is a single forward into the
     // controller method already driving the matching input-map row.
@@ -3219,6 +3260,7 @@ pub fn push_export_dialog(app: &AppWindow, controller: &AppController) {
     app.set_export_context(context.into());
     app.set_export_what(what.into());
     app.set_export_stage(controller.export_stage().into());
+    app.set_export_can_locate(controller.export_can_locate());
     app.set_export_writing_file_name(controller.export_destination_name().into());
     let lines: Vec<slint::SharedString> = controller
         .export_refusal_lines()
@@ -3226,6 +3268,51 @@ pub fn push_export_dialog(app: &AppWindow, controller: &AppController) {
         .map(|line| line.as_str().into())
         .collect();
     app.set_export_refusal_lines(slint::ModelRc::new(slint::VecModel::from(lines)));
+    if let Some(view) = controller.export_view() {
+        push_export_view(app, &view);
+    }
+}
+
+/// Applies one edit to the open export modal, then pushes it.
+fn export_edit(
+    app_weak: &slint::Weak<AppWindow>,
+    controller: &Arc<Mutex<AppController>>,
+    edit: impl FnOnce(&mut AppController),
+) {
+    edit(&mut controller.lock().unwrap());
+    if let Some(app) = app_weak.upgrade() {
+        push_export_dialog(&app, &controller.lock().unwrap());
+    }
+}
+
+fn string_model(items: &[String]) -> slint::ModelRc<slint::SharedString> {
+    let items: Vec<slint::SharedString> = items.iter().map(|s| s.as_str().into()).collect();
+    slint::ModelRc::new(slint::VecModel::from(items))
+}
+
+/// Pushes the export modal's format control, settings group and `Metadata`
+/// switch. `pub` so the startup preview shares it.
+pub fn push_export_view(app: &AppWindow, view: &crate::export_settings::ExportView) {
+    app.set_export_format_segments(string_model(&view.segments));
+    app.set_export_format_selected(view.selected.as_str().into());
+    app.set_export_settings_heading(view.heading.as_str().into());
+    let rows: Vec<ExportRowView> = view
+        .rows
+        .iter()
+        .map(|row| ExportRowView {
+            id: row.id.as_str().into(),
+            label: row.label.as_str().into(),
+            value_text: row.value_text.as_str().into(),
+            fraction: row.fraction,
+            choices: string_model(&row.choices),
+            choice_ids: string_model(&row.choice_ids),
+            selected: row.selected.as_str().into(),
+            open: row.menu_open,
+        })
+        .collect();
+    app.set_export_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
+    app.set_export_slider_group(view.slider_group);
+    app.set_export_metadata_on(view.metadata);
 }
 
 /// Performs one [`ShellEvent`] against the window. The only function in the
