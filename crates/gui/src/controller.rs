@@ -447,12 +447,15 @@ struct ProjectTab {
     /// Existence and capture time per source path, read when the path joins
     /// the tab and refreshed only by an explicit relink or a refused use.
     meta: HashMap<PathBuf, images::FrameMeta>,
-    /// This tab's own card picture -- primed once, right here for a fresh
-    /// tab and again in [`AppController::settle_job`] from each fused
-    /// composite. `Arc`-shared rather than cloned per
-    /// push, since [`AppController::project_cards`] rebuilds far more often
-    /// than a picture actually changes.
+    /// This tab's own card picture, decoded off the UI thread: by the load
+    /// worker for an opened project, by [`AppController::request_thumbnail`]
+    /// for a new tab and each fused composite. `Arc`-shared rather than
+    /// cloned per push, since [`AppController::project_cards`] rebuilds far
+    /// more often than a picture actually changes.
     thumbnail: Option<Arc<overlay::Thumbnail>>,
+    /// The newest decode requested for [`Self::thumbnail`]; a result for an
+    /// earlier one is dropped.
+    thumbnail_generation: u64,
     /// This tab's own run: `Idle` until a fuse starts on it, and whatever it
     /// last settled to afterward -- read by every bottom-bar and card
     /// surface for the tab that owns it, regardless of which tab is active.
@@ -491,8 +494,8 @@ struct SourcesNotice {
 
 /// A saved row's planes, as far as they have got.
 enum RowPlanes {
-    /// An op-bearing row rendering on a worker; the canvas keeps what it
-    /// showed until it settles.
+    /// A saved row whose planes are not cached yet; the canvas keeps what
+    /// it showed until they are.
     Pending,
     Ready(PathBuf, PathBuf),
     /// The right pane's refusal text, one entry per line.
@@ -506,8 +509,8 @@ enum TabPlanes {
     None,
 }
 
-/// The one op-bearing checkpoint render in flight, if any, and where its
-/// worker parks the result -- [`LoadSlot`]'s shape.
+/// The one checkpoint render in flight, op-bearing or fused, if any, and
+/// where its worker parks the result -- [`LoadSlot`]'s shape.
 #[derive(Default)]
 struct RenderSlot {
     /// The tab (by id) and row the running worker renders.
@@ -518,6 +521,19 @@ struct RenderSlot {
 }
 
 type RenderOutcome = Result<(PathBuf, PathBuf), Vec<String>>;
+
+/// The card-picture decodes in flight and where their workers park the
+/// results: tab id, the generation the decode was requested for, and the
+/// picture (`None` for a failed decode).
+#[derive(Default)]
+struct ThumbnailSlot {
+    in_flight: usize,
+    /// Set when a worker starts, until [`AppController::take_thumbnails_started`].
+    started: bool,
+    parked: Arc<Mutex<Vec<ParkedPicture>>>,
+}
+
+type ParkedPicture = (u64, u64, Option<overlay::Thumbnail>);
 
 /// The export modal's own state: which tab it names, the context/what
 /// lines already composed for its row (per-kind prose, not a separate
@@ -618,25 +634,13 @@ struct ParkedRun {
     diverged: Vec<String>,
 }
 
-/// Whether a project's own load worker attempted to decode its thumbnail --
-/// [`ProjectTab::new`] must tell "no worker ran" from "a worker ran and the
-/// decode failed" apart, since only the first retries synchronously.
-enum ThumbnailSource {
-    /// No worker ran for this project's own load.
-    NotAttempted,
-    /// A worker ran; `None` is a failed decode, not a missing attempt.
-    Decoded(Option<Arc<overlay::Thumbnail>>),
-}
-
 impl ProjectTab {
-    /// `thumbnail` reports what the load's own worker already did for this
-    /// project. [`ThumbnailSource::NotAttempted`] falls back to decoding it
-    /// right here; a worker's own failed decode opens the tab with none.
+    /// `thumbnail` is the picture the load worker already decoded, if any.
     /// `meta` is the frames' metadata when already read; `None` reads it here.
     fn new(
-        mut project: GuiProject,
+        project: GuiProject,
         id: u64,
-        thumbnail: ThumbnailSource,
+        thumbnail: Option<Arc<overlay::Thumbnail>>,
         meta: Option<HashMap<PathBuf, images::FrameMeta>>,
     ) -> Self {
         let title = entry::tab_title(&project);
@@ -652,12 +656,6 @@ impl ProjectTab {
         let frames = entry::project_frames(&project);
         let excluded = vec![false; frames.len()];
         let selected = images::first_included(&excluded);
-        let thumbnail = match thumbnail {
-            ThumbnailSource::Decoded(thumbnail) => thumbnail,
-            ThumbnailSource::NotAttempted => {
-                overlay::render_thumbnail(&mut project, &frames).map(Arc::new)
-            }
-        };
         let meta = meta.unwrap_or_else(|| images::read_metadata(&frames));
         ProjectTab {
             id,
@@ -686,6 +684,7 @@ impl ProjectTab {
             frame_sort: None,
             meta,
             thumbnail,
+            thumbnail_generation: 0,
             run: job::RunState::Idle,
             request: None,
             edit: None,
@@ -1201,6 +1200,7 @@ struct ShellState {
     /// The in-flight background load, if any.
     load: LoadSlot,
     render: RenderSlot,
+    thumbnails: ThumbnailSlot,
     /// The open export modal, if any -- [`AppController::checkpoint_export_requested`].
     export_dialog: Option<ExportDialog>,
     /// The last confirmed export format and settings, which the next modal
@@ -1966,6 +1966,86 @@ impl AppController {
             self.ensure_edit_session();
         }
         true
+    }
+
+    /// Decodes the picture of tab `index` with `render` on a spawned worker,
+    /// parking the result for [`Self::settle_thumbnails`]. A decode requested
+    /// later for the same tab supersedes this one.
+    fn request_thumbnail(
+        &mut self,
+        index: usize,
+        render: impl FnOnce() -> Option<overlay::Thumbnail> + Send + 'static,
+    ) {
+        let tab = &mut self.state.projects[index];
+        tab.thumbnail_generation += 1;
+        let (tab_id, generation) = (tab.id, tab.thumbnail_generation);
+        let slot = &mut self.state.thumbnails;
+        slot.in_flight += 1;
+        slot.started = true;
+        let parked = Arc::clone(&slot.parked);
+        std::thread::spawn(move || {
+            let picture =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(render)).unwrap_or(None);
+            parked
+                .lock()
+                .expect("no thread panicked while holding the parked pictures")
+                .push((tab_id, generation, picture));
+        });
+    }
+
+    /// Requests the picture of tab `index` from its own project: the stored
+    /// composite of an opened one, the first frame of an unsaved one.
+    fn request_tab_thumbnail(&mut self, index: usize) {
+        let tab = &self.state.projects[index];
+        match &tab.project {
+            GuiProject::Opened(project) => {
+                let path = project.path().to_path_buf();
+                self.request_thumbnail(index, move || overlay::render_thumbnail_from_file(&path));
+            }
+            GuiProject::Unsaved(_) => {
+                let first = tab.frames.first().cloned();
+                self.request_thumbnail(index, move || {
+                    overlay::render_thumbnail_from_frame(&first?)
+                });
+            }
+        }
+    }
+
+    /// Applies the decoded pictures workers have parked: a picture lands only
+    /// on a tab that still exists and whose newest request it answers; a
+    /// failed decode keeps the previous picture and is not retried. Returns
+    /// `true` once no decode is in flight -- the poll's cue to stop. Never
+    /// waits on a worker.
+    pub fn settle_thumbnails(&mut self) -> bool {
+        let parked = std::mem::take(
+            &mut *self
+                .state
+                .thumbnails
+                .parked
+                .lock()
+                .expect("no thread panicked while holding the parked pictures"),
+        );
+        self.state.thumbnails.in_flight -= parked.len();
+        let mut stored = false;
+        for (tab_id, generation, picture) in parked {
+            if let Some(tab) = self.state.projects.iter_mut().find(|tab| tab.id == tab_id)
+                && tab.thumbnail_generation == generation
+                && let Some(picture) = picture
+            {
+                tab.thumbnail = Some(Arc::new(picture));
+                stored = true;
+            }
+        }
+        if stored {
+            self.emit(ShellEvent::OverlayChanged);
+        }
+        self.state.thumbnails.in_flight == 0
+    }
+
+    /// Whether a picture decode started since the last call -- the bridge's
+    /// cue to start polling [`Self::settle_thumbnails`].
+    pub fn take_thumbnails_started(&mut self) -> bool {
+        std::mem::take(&mut self.state.thumbnails.started)
     }
 
     /// Whether a checkpoint render started since the last call -- the
@@ -3601,13 +3681,15 @@ impl AppController {
                     None
                 };
                 let file_name = entry::tab_title(&project);
-                let (source, meta) = match thumbnails.next() {
-                    Some((decoded, meta)) => (ThumbnailSource::Decoded(decoded), Some(meta)),
-                    None => (ThumbnailSource::NotAttempted, None),
+                let preloaded = thumbnails.next();
+                let decode = preloaded.is_none();
+                let (picture, meta) = match preloaded {
+                    Some((decoded, meta)) => (decoded, Some(meta)),
+                    None => (None, None),
                 };
                 self.next_tab_id += 1;
                 let id = self.next_tab_id;
-                let mut tab = ProjectTab::new(project, id, source, meta);
+                let mut tab = ProjectTab::new(project, id, picture, meta);
                 if let Some((missing, total, accepted_mismatch)) = missing {
                     tab.failure = Some(TabFailure {
                         kind: FailureKind::SourcesMissing,
@@ -3627,6 +3709,9 @@ impl AppController {
                     }
                 }
                 self.state.projects.push(tab);
+                if decode {
+                    self.request_tab_thumbnail(self.state.projects.len() - 1);
+                }
             }
         }
         self.settle_tab_scroll();
@@ -3954,20 +4039,9 @@ impl AppController {
     }
 
     /// Opens the overlay, or closes it if it is already open -- the
-    /// four-square button's own toggle, and `Esc`'s. Opening also primes any
-    /// tab whose picture never got a chance to (a fresh tab and a fuse
-    /// settling already prime their own), the exception rather than the
-    /// rule.
+    /// four-square button's own toggle, and `Esc`'s.
     pub fn toggle_projects_overlay(&mut self) {
         self.state.overlay_open = !self.state.overlay_open;
-        if self.state.overlay_open {
-            for tab in &mut self.state.projects {
-                if tab.thumbnail.is_none() {
-                    tab.thumbnail =
-                        overlay::render_thumbnail(&mut tab.project, &tab.frames).map(Arc::new);
-                }
-            }
-        }
         self.set_gallery_scroll(self.state.gallery_scroll_y);
         self.emit(ShellEvent::OverlayChanged);
     }
@@ -5626,7 +5700,7 @@ impl AppController {
         let mut new_tab = ProjectTab::new(
             entry::duplicate_as_unsaved(dir, name, tab.frames.clone()),
             id,
-            ThumbnailSource::NotAttempted,
+            None,
             Some(tab.meta.clone()),
         );
         new_tab.fuse_id = tab.fuse_id.clone();
@@ -5634,7 +5708,9 @@ impl AppController {
         new_tab.fuse_values = tab.fuse_values.clone();
         new_tab.align_values = tab.align_values.clone();
         self.state.projects.push(new_tab);
-        self.set_active_tab(Some(self.state.projects.len() - 1));
+        let index = self.state.projects.len() - 1;
+        self.request_tab_thumbnail(index);
+        self.set_active_tab(Some(index));
         self.emit(ShellEvent::ProjectsChanged);
         true
     }
@@ -6369,7 +6445,6 @@ impl AppController {
         tab.frame_sort = None;
         tab.read_missing_meta();
         tab.edit = None;
-        tab.thumbnail = overlay::render_thumbnail_from_frame(&held.composite).map(Arc::new);
         tab.failure = None;
         let planes = (held.composite.clone(), held.zmap.clone());
         tab.selected_checkpoint = Some(checkpoints::held_key(tab.held.len()));
@@ -6386,6 +6461,10 @@ impl AppController {
         tab.viewport = None;
         self.mark_fresh_checkpoint(index);
         self.enter_editor_if_viewing(index);
+        let composite = planes.0.clone();
+        self.request_thumbnail(index, move || {
+            overlay::render_thumbnail_from_frame(&composite)
+        });
         planes
     }
 
@@ -6474,7 +6553,8 @@ impl AppController {
 
     /// The active tab's current row's composite and Z-Map paths: a held
     /// row's own files, a saved row's pair in the plane cache. `None` with
-    /// no current row, while an op-bearing row renders, or once it refused.
+    /// no current row, while a saved row's cache is not fresh, or once it
+    /// refused.
     pub fn materialize_active_tab_planes(&mut self) -> Option<(PathBuf, PathBuf)> {
         match self.active_tab_planes() {
             TabPlanes::Ready(composite, zmap) => Some((composite, zmap)),
@@ -6483,9 +6563,9 @@ impl AppController {
     }
 
     /// [`Self::materialize_active_tab_planes`], telling a pending render
-    /// apart. A fused row is written synchronously -- a stored-composite
-    /// read. An op-bearing row starts the one background render, or waits
-    /// for the running one to settle first.
+    /// apart. A saved row whose cache pair is fresh answers at once; any
+    /// other starts the one background render, or waits for the running one
+    /// to settle first. Never writes a plane.
     fn active_tab_planes(&mut self) -> TabPlanes {
         let scratch_root = self.scratch_root();
         let render_free = self.state.render.in_flight.is_none();
@@ -6532,7 +6612,7 @@ impl AppController {
         let GuiProject::Opened(project) = &mut tab.project else {
             return TabPlanes::None;
         };
-        match job::fused_checkpoint_planes(project, &scratch_root, &key) {
+        match job::cached_checkpoint_planes(project, &scratch_root, &key) {
             Ok(job::CheckpointPlanes::Ready(composite, zmap)) => {
                 tab.note_viewed(&scratch_root, &key);
                 tab.row_planes = Some(RowPlanes::Ready(composite.clone(), zmap.clone()));
@@ -7049,11 +7129,12 @@ impl AppController {
     /// What the open renderer cell should do for the frame about to draw,
     /// given which tab it currently holds (`None` before anything has
     /// loaded). `Keep` when the owner already matches the active tab and
-    /// nothing changed underneath it since; otherwise materializes the
-    /// active tab's own planes and answers `Load`; `Keep` too while the
-    /// active tab's current row renders over that tab's previous image, or
-    /// `Clear` when it has none (no tab active, `+` selected, nothing fused
-    /// yet, or its current row refused).
+    /// nothing changed underneath it since; otherwise `Load` at once when
+    /// the active row's cached planes are fresh. A saved row not cached yet
+    /// renders on the `RenderSlot` worker meanwhile: `Keep` over that tab's
+    /// previous image, or `Clear` when it has none (no tab active, `+`
+    /// selected, nothing fused yet, or its current row refused). The feed
+    /// never writes planes.
     pub fn canvas_feed(&mut self, loaded: Option<usize>) -> crate::canvas::CanvasFeed {
         let _scope = measurement_scope("gui_canvas_feed");
         if loaded == self.state.active && !self.state.canvas_dirty {

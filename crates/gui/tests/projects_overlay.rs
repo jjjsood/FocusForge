@@ -130,10 +130,10 @@ fn open_folder_with_a_skipped_subfolder(controller: &mut AppController, name: &s
 fn wait_for_settle(controller: &mut AppController, timeout: Duration) {
     let start = std::time::Instant::now();
     loop {
-        if controller.settle_job().is_some() {
-            return;
-        }
-        if !focusforge_gui::job::is_live(&controller.job_view().state) {
+        if controller.settle_job().is_some()
+            || !focusforge_gui::job::is_live(&controller.job_view().state)
+        {
+            common::settle_thumbnails(controller);
             return;
         }
         assert!(start.elapsed() < timeout, "job did not settle in time");
@@ -1562,6 +1562,7 @@ fn gallery_scrolling_and_progress_reuse_every_picture() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(saw_progress, "a push showed the running card");
+    common::settle_thumbnails(&mut controller.lock().unwrap());
     push();
     let settled = shown_pictures(&app);
     let thumbnail = u64::from(

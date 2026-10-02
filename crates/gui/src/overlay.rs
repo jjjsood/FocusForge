@@ -235,6 +235,13 @@ fn render_thumbnail_from_project(
     ))
 }
 
+/// The picture of the sealed project at `path`, opened on the calling
+/// thread; `None` when it cannot be opened or read.
+pub(crate) fn render_thumbnail_from_file(path: &Path) -> Option<Thumbnail> {
+    let mut project = focusforge_core::project::Project::open(path).ok()?;
+    render_thumbnail_from_project(&mut project)
+}
+
 /// A loose TIFF -- an unfused tab's first frame or a held composite --
 /// downsampled and tone-mapped the same way, read band by band via
 /// [`TiffStack::read_tile_into`], never as a whole image. `None` on any read

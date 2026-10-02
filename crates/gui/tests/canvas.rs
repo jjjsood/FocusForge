@@ -8,7 +8,7 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use focusforge_core::io::TiffHeader;
 use focusforge_gui::AppWindow;
@@ -261,10 +261,21 @@ fn two_sealed_tabs(name: &str) -> AppController {
 /// Calls `canvas_feed(loaded)`, panicking with the actual answer unless it
 /// is `Load`, and returns the composite path it carries -- what most of
 /// these tests use to confirm which tab's own planes just got loaded.
+/// A saved row answers `Clear` or `Keep` until its render settles, so the
+/// feed is repeated after each settle for up to a minute.
 fn load_path(controller: &mut AppController, loaded: Option<usize>) -> PathBuf {
-    match controller.canvas_feed(loaded) {
-        CanvasFeed::Load { composite, .. } => composite,
-        other => panic!("expected CanvasFeed::Load, got {other:?}"),
+    let start = Instant::now();
+    loop {
+        match controller.canvas_feed(loaded) {
+            CanvasFeed::Load { composite, .. } => return composite,
+            other if start.elapsed() > Duration::from_secs(60) => {
+                panic!("expected CanvasFeed::Load, got {other:?}")
+            }
+            _ => {
+                controller.settle_checkpoint_render();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 }
 
@@ -547,15 +558,139 @@ fn opening_a_saved_project_feeds_its_own_planes() {
         OpenOutcome::Opened(_)
     ));
     assert_eq!(controller.active_project(), Some(2));
-    match controller.canvas_feed(Some(1)) {
-        CanvasFeed::Load { tab, composite, .. } => {
-            assert_eq!(tab, 2);
-            assert!(composite.is_file());
-        }
-        other => {
-            panic!("opening a saved project mid-session must load its own planes, got {other:?}")
-        }
+    let composite = load_path(&mut controller, Some(1));
+    assert!(composite.is_file());
+    assert!(matches!(
+        controller.canvas_feed(Some(1)),
+        CanvasFeed::Load { tab: 2, .. }
+    ));
+}
+
+/// A fused and saved `.ffp` of `set`'s first `count` frames, written by a
+/// throwaway controller whose scratch root nobody else reads.
+fn sealed_project(name: &str, set: &str, count: usize) -> PathBuf {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree(&format!("{name}_{set}_writer")));
+    open_fixture_tab(&mut controller, name, set, count);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120))
+        .expect("the fixture must fuse");
+    let mut target = None;
+    assert!(common::save_and_settle(&mut controller, |proposed| {
+        target = Some(proposed.to_path_buf());
+        target.clone()
+    }));
+    target.expect("a never-saved tab asks where to save")
+}
+
+fn head_of(ffp: &Path) -> String {
+    focusforge_core::project::Project::open(ffp)
+        .unwrap()
+        .checkpoint()
+        .id
+        .clone()
+}
+
+/// A controller over its own scratch root, with `ffps` opened in order.
+fn controller_over(scratch: &Path, ffps: &[&Path]) -> AppController {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(scratch.to_path_buf());
+    for ffp in ffps {
+        assert!(matches!(
+            common::open_and_settle(&mut controller, &[ffp.to_path_buf()]),
+            OpenOutcome::Opened(_)
+        ));
     }
+    controller
+}
+
+#[test]
+fn an_opened_project_feeds_its_planes_once_the_render_settles() {
+    let ffp = sealed_project("render_settles", "mantis-512", 3);
+    let scratch = common::tree("render_settles_scratch");
+    let mut controller = controller_over(&scratch, &[&ffp]);
+
+    assert!(matches!(controller.canvas_feed(None), CanvasFeed::Clear));
+    assert!(controller.take_render_started());
+    assert!(controller.materialize_active_tab_planes().is_none());
+    common::settle_render(&mut controller);
+    let dir = job::checkpoint_plane_dir(&scratch, &ffp, &head_of(&ffp));
+    match controller.canvas_feed(None) {
+        CanvasFeed::Load {
+            composite, zmap, ..
+        } => {
+            assert!(composite.starts_with(&dir) && zmap.starts_with(&dir));
+            assert!(composite.is_file() && zmap.is_file());
+        }
+        other => panic!("the settled render must load, got {other:?}"),
+    }
+
+    let mut second = controller_over(&scratch, &[&ffp]);
+    assert!(matches!(
+        second.canvas_feed(None),
+        CanvasFeed::Load { tab: 0, .. }
+    ));
+    assert!(
+        !second.take_render_started(),
+        "a fresh cache needs no render"
+    );
+}
+
+#[test]
+fn a_saved_rows_planes_never_feed_a_tab_switched_to_meanwhile() {
+    let small = sealed_project("switched_meanwhile", "mantis-64", 3);
+    let large = sealed_project("switched_meanwhile", "mantis-512", 3);
+    let scratch = common::tree("switched_meanwhile_scratch");
+    let mut controller = controller_over(&scratch, &[&small, &large]);
+
+    controller.select_project(0);
+    assert!(matches!(controller.canvas_feed(None), CanvasFeed::Clear));
+    assert!(controller.take_render_started());
+    controller.select_project(1);
+    assert!(matches!(controller.canvas_feed(Some(0)), CanvasFeed::Clear));
+    assert!(!controller.take_render_started(), "the one slot is busy");
+
+    common::settle_render(&mut controller);
+    assert!(matches!(controller.canvas_feed(Some(0)), CanvasFeed::Clear));
+    assert!(controller.take_render_started());
+    common::settle_render(&mut controller);
+    match controller.canvas_feed(Some(0)) {
+        CanvasFeed::Load { tab, composite, .. } => {
+            assert_eq!(tab, 1);
+            let dir = job::checkpoint_plane_dir(&scratch, &large, &head_of(&large));
+            assert!(composite.starts_with(dir));
+        }
+        other => panic!("the active tab's own render must load, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_refused_saved_row_is_not_rendered_again() {
+    let ffp = sealed_project("refused_row", "mantis-64", 3);
+    let scratch = common::tree("refused_row_scratch");
+    let blocked = job::checkpoint_plane_dir(&scratch, &ffp, &head_of(&ffp));
+    fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+    fs::write(&blocked, b"not a directory").unwrap();
+    let mut controller = controller_over(&scratch, &[&ffp]);
+
+    assert!(matches!(controller.canvas_feed(None), CanvasFeed::Clear));
+    assert!(controller.take_render_started());
+    common::settle_render(&mut controller);
+    assert!(matches!(controller.canvas_feed(None), CanvasFeed::Clear));
+    assert!(!controller.composite_message_lines().is_empty());
+    assert!(matches!(controller.canvas_feed(None), CanvasFeed::Clear));
+    assert!(!controller.take_render_started(), "a refusal is final");
+
+    let row = controller
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .position(|entry| entry.id.is_some())
+        .expect("the project lists its checkpoint");
+    controller.select_checkpoint_row(row);
+    assert!(matches!(controller.canvas_feed(None), CanvasFeed::Clear));
+    assert!(controller.take_render_started(), "re-selecting tries again");
+    common::settle_render(&mut controller);
 }
 
 /// Both panes draw at the sealed composite's own extent once a tab holds

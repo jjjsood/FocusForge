@@ -461,7 +461,7 @@ fn editor_mode_enters_on_a_fused_tab() {
         reopened.editor_enabled(),
         "a reopened project with a checkpoint is editable"
     );
-    assert!(reopened.set_mode(ShellMode::Editor));
+    common::enter_editor(&mut reopened);
     assert_eq!(reopened.mode(), ShellMode::Editor);
     assert_eq!(
         *events.lock().unwrap(),
@@ -1424,6 +1424,102 @@ fn a_failed_worker_thumbnail_decode_is_not_retried_on_settle() {
         cards[0].picture.is_none(),
         "a retry would succeed against the now-repaired file -- \
          the worker's own failure must be final, never retried"
+    );
+    controller.toggle_projects_overlay();
+    common::settle_thumbnails(&mut controller);
+    assert!(
+        controller.project_cards()[0].picture.is_none(),
+        "opening the overlay must not decode the picture again"
+    );
+}
+
+/// The card of the last open tab.
+fn last_open_card(controller: &AppController) -> focusforge_gui::overlay::CardView {
+    controller
+        .project_cards()
+        .into_iter()
+        .rfind(|card| card.kind == "open")
+        .expect("an open tab has a card")
+}
+
+/// Settles the running fuse without applying its picture.
+fn settle_fuse_only(controller: &mut AppController) {
+    let start = Instant::now();
+    while controller.work_pending() {
+        controller.settle_job();
+        assert!(start.elapsed() < SETTLE, "the fuse did not settle");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_duplicated_tab_gets_its_picture_off_thread() {
+    let mut controller = controller_with_scratch("dup_picture");
+    open_fused_tab(&mut controller, "dup_picture", 3);
+    assert!(controller.set_mode(ShellMode::Stacking));
+    controller.remove_frame(0);
+    assert!(controller.new_project_instead());
+
+    assert!(
+        last_open_card(&controller).picture.is_none(),
+        "the picture is decoded off the UI thread, not while the tab opens"
+    );
+    common::settle_thumbnails(&mut controller);
+    let picture = last_open_card(&controller)
+        .picture
+        .expect("the settled decode gives the new tab its first frame's picture");
+    assert!(picture.rgba.iter().any(|&b| b != 0));
+}
+
+#[test]
+fn a_fused_checkpoint_picture_is_dropped_for_a_closed_tab() {
+    let mut controller = controller_with_scratch("closed_picture");
+    open_mantis64_tab(&mut controller, "closed_picture_a", 2);
+    let before = last_open_card(&controller)
+        .picture
+        .expect("an unfused tab carries its first frame");
+    open_mantis64_tab(&mut controller, "closed_picture_b", 3);
+    assert!(controller.start_fuse());
+    settle_fuse_only(&mut controller);
+
+    controller.close_project(1);
+    common::settle_thumbnails(&mut controller);
+    assert_eq!(controller.project_tabs().len(), 1);
+    assert_eq!(
+        last_open_card(&controller).picture.as_deref(),
+        Some(&*before),
+        "the closed tab's picture must not land on the remaining one"
+    );
+}
+
+#[test]
+fn an_older_picture_never_replaces_a_newer_one() {
+    let fused_picture = |name: &str, frames: usize| {
+        let mut controller = controller_with_scratch(name);
+        open_fused_tab(&mut controller, name, frames);
+        common::settle_thumbnails(&mut controller);
+        last_open_card(&controller)
+            .picture
+            .expect("a fused tab has a picture")
+    };
+    let first = fused_picture("older_picture_first", 3);
+    let second = fused_picture("older_picture_second", 2);
+    assert_ne!(first.rgba, second.rgba, "the two fuses must look different");
+
+    let mut controller = controller_with_scratch("older_picture");
+    open_mantis64_tab(&mut controller, "older_picture", 3);
+    assert!(controller.start_fuse());
+    settle_fuse_only(&mut controller);
+    assert!(controller.set_mode(ShellMode::Stacking));
+    controller.toggle_frame_excluded(2);
+    assert!(controller.start_fuse());
+    settle_fuse_only(&mut controller);
+
+    common::settle_thumbnails(&mut controller);
+    assert_eq!(
+        last_open_card(&controller).picture.as_deref(),
+        Some(&*second),
+        "the newer fuse's picture must win whatever order the decodes finish in"
     );
 }
 

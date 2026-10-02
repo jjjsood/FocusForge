@@ -226,14 +226,9 @@ fn gui_run_matches_the_cli_run() {
     let pipeline::FuseProduct::Sealed(sealed) = &report.product else {
         panic!("a seal request must report a sealed project");
     };
-    let mut project = Project::open(&sealed.path).unwrap();
-    let head = project.checkpoint().id.clone();
-    let job::CheckpointPlanes::Ready(composite_path, _zmap_path) =
-        job::fused_checkpoint_planes(&mut project, &scratch, &head)
-            .expect("the sealed project's composite must materialize")
-    else {
-        panic!("a freshly fused head must need no render");
-    };
+    let head = Project::open(&sealed.path).unwrap().checkpoint().id.clone();
+    let (composite_path, _zmap_path) = job::render_checkpoint_planes(&sealed.path, &scratch, &head)
+        .expect("the sealed project's composite must materialize");
     let sealed = focusforge_core::io::TiffStack::open_files(&[composite_path]).unwrap();
     let sealed_samples = sealed
         .read_tile(
@@ -5443,4 +5438,48 @@ fn closing_the_window_during_a_save_all_quit_raises_no_second_question() {
         "the quit is already under way"
     );
     controller.finish_saves();
+}
+
+#[test]
+fn a_save_makes_the_previous_plane_files_stale() {
+    let mut controller = controller_with_frames("stale_planes", 2);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    let project_path = save_to_proposed(&mut controller);
+    let scratch = common::tree("stale_planes_cache");
+    let first = Project::open(&project_path).unwrap();
+    let first_id = first.checkpoint_chain().unwrap()[0].id.clone();
+    assert!(matches!(
+        job::cached_checkpoint_planes(&first, &scratch, &first_id).unwrap(),
+        job::CheckpointPlanes::NeedsRender
+    ));
+    job::render_checkpoint_planes(&project_path, &scratch, &first_id).unwrap();
+    assert!(matches!(
+        job::cached_checkpoint_planes(&first, &scratch, &first_id).unwrap(),
+        job::CheckpointPlanes::Ready(..)
+    ));
+
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert!(controller.save_active_project(|_| panic!("a saved tab never asks where")));
+    let saved = Project::open(&project_path).unwrap();
+    let chain = saved.checkpoint_chain().unwrap();
+    assert_eq!(chain.len(), 2);
+    let second_id = chain
+        .iter()
+        .map(|c| c.id.clone())
+        .find(|id| *id != first_id)
+        .expect("the second save adds a checkpoint");
+    assert_ne!(
+        job::checkpoint_plane_dir(&scratch, &project_path, &first_id),
+        job::checkpoint_plane_dir(&scratch, &project_path, &second_id),
+        "every checkpoint has its own plane directory"
+    );
+    assert!(
+        matches!(
+            job::cached_checkpoint_planes(&saved, &scratch, &first_id).unwrap(),
+            job::CheckpointPlanes::NeedsRender
+        ),
+        "a save leaves the earlier files older than the project"
+    );
 }

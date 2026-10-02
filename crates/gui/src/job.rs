@@ -575,17 +575,18 @@ fn checkpoint_plane_paths(
 pub enum CheckpointPlanes {
     /// Its composite and Z-Map, on disk.
     Ready(PathBuf, PathBuf),
-    /// An op-bearing checkpoint: [`render_checkpoint_planes`] must run
-    /// first, off the event-loop thread, since it re-hashes every source.
+    /// Not cached yet: [`render_checkpoint_planes`] must run first, off the
+    /// event-loop thread, since it decompresses planes and an op-bearing
+    /// checkpoint re-hashes every source.
     NeedsRender,
 }
 
-/// A fused checkpoint's stored composite and its Z-Map, written into the
-/// plane cache unless both are already newer than the `.ffp`; an op-bearing
-/// checkpoint answers [`CheckpointPlanes::NeedsRender`] without reading any
+/// A fused checkpoint's plane cache pair when both files are already newer
+/// than the `.ffp`; any other checkpoint, or a stale or missing pair,
+/// answers [`CheckpointPlanes::NeedsRender`]. Reads metadata only, never a
 /// plane.
-pub fn fused_checkpoint_planes(
-    project: &mut Project,
+pub fn cached_checkpoint_planes(
+    project: &Project,
     scratch_root: &Path,
     id: &str,
 ) -> Result<CheckpointPlanes, PlaneCacheError> {
@@ -594,10 +595,11 @@ pub fn fused_checkpoint_planes(
     }
     let (composite, zmap) = checkpoint_plane_paths(scratch_root, project.path(), id);
     let ffp_modified = std::fs::metadata(project.path())?.modified()?;
-    if !(is_fresh(&composite, ffp_modified) && is_fresh(&zmap, ffp_modified)) {
-        write_checkpoint_planes(project, id, &composite, &zmap)?;
+    if is_fresh(&composite, ffp_modified) && is_fresh(&zmap, ffp_modified) {
+        Ok(CheckpointPlanes::Ready(composite, zmap))
+    } else {
+        Ok(CheckpointPlanes::NeedsRender)
     }
-    Ok(CheckpointPlanes::Ready(composite, zmap))
 }
 
 /// Renders checkpoint `id` of the project at `project_path` into its plane

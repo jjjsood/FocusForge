@@ -417,6 +417,9 @@ pub fn repaint(
     if render_started {
         poll_checkpoint_render(app.as_weak(), controller.clone(), canvas.clone());
     }
+    if controller.lock().unwrap().take_thumbnails_started() {
+        poll_thumbnails(app.as_weak(), controller.clone());
+    }
     if let Some(lines) = changed_lines(app.get_composite_message_lines(), &message_lines) {
         app.set_composite_message_lines(lines);
     }
@@ -509,6 +512,20 @@ fn poll_checkpoint_render(
             repaint(&app, &controller, &canvas);
         } else {
             poll_checkpoint_render(app_weak, controller, canvas);
+        }
+    });
+}
+
+/// Polls [`AppController::settle_thumbnails`] every [`job::POLL`] until no
+/// picture decode is in flight; the pictures reach the cards through the
+/// `OverlayChanged` event the settle emits.
+fn poll_thumbnails(app_weak: slint::Weak<AppWindow>, controller: Arc<Mutex<AppController>>) {
+    slint::Timer::single_shot(job::POLL, move || {
+        if app_weak.upgrade().is_none() {
+            return;
+        }
+        if !controller.lock().unwrap().settle_thumbnails() {
+            poll_thumbnails(app_weak, controller);
         }
     });
 }

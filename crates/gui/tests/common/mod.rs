@@ -404,6 +404,32 @@ pub fn paint(controller: &mut AppController, op: Op) {
         .expect("a stroke inside the map applies");
 }
 
+/// Polls `settle_checkpoint_render` until the checkpoint render has settled.
+#[allow(dead_code)]
+pub fn settle_render(controller: &mut AppController) {
+    let start = Instant::now();
+    while !controller.settle_checkpoint_render() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the checkpoint render did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Polls `settle_thumbnails` until every picture decode has been applied.
+#[allow(dead_code)]
+pub fn settle_thumbnails(controller: &mut AppController) {
+    let start = Instant::now();
+    while !controller.settle_thumbnails() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the thumbnail decodes did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// `set_mode(Editor)`, waiting out the render an op-bearing row needs first.
 #[allow(dead_code)]
 pub fn enter_editor(controller: &mut AppController) {

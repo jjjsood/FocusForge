@@ -428,11 +428,21 @@ fn selected_rows(controller: &AppController) -> Vec<usize> {
         .collect()
 }
 
-fn loaded_composite(feed: CanvasFeed) -> PathBuf {
-    match feed {
-        CanvasFeed::Load { composite, .. } => composite,
-        CanvasFeed::Keep => panic!("expected planes to load, got Keep"),
-        CanvasFeed::Clear => panic!("expected planes to load, got Clear"),
+/// The composite the next feed loads, settling the saved-row render the
+/// feed answers `Keep` or `Clear` for first.
+fn loaded_composite(controller: &mut AppController, loaded: Option<usize>) -> PathBuf {
+    let start = Instant::now();
+    loop {
+        match controller.canvas_feed(loaded) {
+            CanvasFeed::Load { composite, .. } => return composite,
+            other if start.elapsed() > Duration::from_secs(60) => {
+                panic!("expected planes to load, got {other:?}")
+            }
+            _ => {
+                controller.settle_checkpoint_render();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 }
 
@@ -469,7 +479,7 @@ fn selecting_a_row_materializes_and_marks_it() {
     // A fused row loads at once.
     controller.select_checkpoint_row(root_row);
     assert_eq!(selected_rows(&controller), vec![root_row]);
-    let composite = loaded_composite(controller.canvas_feed(None));
+    let composite = loaded_composite(&mut controller, None);
     assert_eq!(samples(&composite), expected_root);
 
     // An op-bearing row answers before its render settles, keeping the
@@ -478,13 +488,13 @@ fn selecting_a_row_materializes_and_marks_it() {
     assert_eq!(selected_rows(&controller), vec![edited_row]);
     assert!(matches!(controller.canvas_feed(Some(0)), CanvasFeed::Keep));
     wait_for_render(&mut controller);
-    let composite = loaded_composite(controller.canvas_feed(Some(0)));
+    let composite = loaded_composite(&mut controller, Some(0));
     assert_eq!(samples(&composite), expected_edited);
 
     // A changed source: the op-bearing row refuses, naming that frame.
     write_rgb(&project.sources[1], &frame_samples(7));
     controller.select_checkpoint_row(root_row);
-    loaded_composite(controller.canvas_feed(Some(0)));
+    loaded_composite(&mut controller, Some(0));
     controller.select_checkpoint_row(edited_row);
     assert!(matches!(controller.canvas_feed(Some(0)), CanvasFeed::Keep));
     wait_for_render(&mut controller);
@@ -506,7 +516,7 @@ fn selecting_a_row_materializes_and_marks_it() {
         fs::remove_file(source).unwrap();
     }
     controller.select_checkpoint_row(root_row);
-    let composite = loaded_composite(controller.canvas_feed(Some(0)));
+    let composite = loaded_composite(&mut controller, Some(0));
     assert_eq!(samples(&composite), expected_root);
     assert!(controller.composite_message_lines().is_empty());
 }
@@ -543,9 +553,12 @@ fn current_row(controller: &AppController) -> Option<String> {
         .and_then(|entry| entry.id.clone())
 }
 
+/// Selects row `id`, then waits out the render an editor-mode restore of a
+/// saved row starts before its session can open.
 fn click(controller: &mut AppController, id: &str) {
     let row = row_index(controller, id);
     controller.select_checkpoint_row(row);
+    common::settle_render(controller);
 }
 
 fn saved_ids(project: &Path) -> Vec<String> {
@@ -585,7 +598,7 @@ fn editor_on_head(name: &str) -> (Edited, AppController) {
     let mut controller = scratch_controller(name);
     common::open_and_settle(&mut controller, std::slice::from_ref(&project.project));
     enter_editor(&mut controller);
-    loaded_composite(controller.canvas_feed(None));
+    loaded_composite(&mut controller, None);
     (project, controller)
 }
 
@@ -939,7 +952,7 @@ fn restoring_an_unsaved_stroke_checkpoint_shows_its_image() {
     assert_eq!(session.indices(), x_indices.as_slice());
     assert_eq!(session.op_count(), 0);
     assert!(!session.can_undo() && !session.can_redo());
-    let composite = loaded_composite(controller.canvas_feed(None));
+    let composite = loaded_composite(&mut controller, None);
     assert_eq!(samples(&composite), head_image, "the base's planes load");
     assert_eq!(current_row(&controller).as_deref(), Some(x));
 
@@ -1044,20 +1057,20 @@ fn live_keeps_its_own_planes_when_the_highlight_moves() {
     let head_image = rendered(&project.project, &project.edited, &out.join("head.tif"));
     let root_image = rendered(&project.project, &project.root, &out.join("root.tif"));
     assert_ne!(head_image, root_image);
-    loaded_composite(controller.canvas_feed(None));
+    loaded_composite(&mut controller, None);
 
     paint(&mut controller, stroke(1, 1, 0));
     paint(&mut controller, stroke(3, 1, 1));
     let live = live_indices(&controller);
     assert!(controller.save_checkpoint());
     assert_eq!(current_row(&controller).as_deref(), Some("held:0"));
-    let composite = loaded_composite(controller.canvas_feed(None));
+    let composite = loaded_composite(&mut controller, None);
     assert_eq!(samples(&composite), head_image, "live's planes, not Clear");
     assert_eq!(live_indices(&controller), live);
 
     controller.select_project(1);
     controller.select_project(0);
-    let composite = loaded_composite(controller.canvas_feed(None));
+    let composite = loaded_composite(&mut controller, None);
     assert_eq!(samples(&composite), head_image, "after a tab round trip");
     assert_eq!(live_indices(&controller), live);
     enter_editor(&mut controller);
@@ -1072,7 +1085,7 @@ fn live_keeps_its_own_planes_when_the_highlight_moves() {
     assert!(controller.set_mode(ShellMode::Stacking));
     click(&mut controller, &x);
     wait_for_render(&mut controller);
-    let composite = loaded_composite(controller.canvas_feed(None));
+    let composite = loaded_composite(&mut controller, None);
     assert_eq!(samples(&composite), root_image);
     assert_eq!(current_row(&controller).as_deref(), Some(x.as_str()));
 }
@@ -1086,7 +1099,7 @@ fn clicking_the_current_row_with_ops_asks_to_restore_it() {
     enter_editor(&mut controller);
     let (_, zmap) = controller.materialize_active_tab_planes().unwrap();
     let root_map = read_zmap(&zmap);
-    loaded_composite(controller.canvas_feed(None));
+    loaded_composite(&mut controller, None);
 
     // Zero ops: nothing happens, nothing is emitted.
     let events = record_events(&mut controller);
@@ -1173,7 +1186,7 @@ fn switching_to_a_rendering_tab_keeps_editor_mode() {
     common::open_and_settle(&mut controller, std::slice::from_ref(&second.project));
     controller.select_project(0);
     controller.select_checkpoint_row(row_index(&controller, &first.root));
-    assert!(controller.set_mode(ShellMode::Editor));
+    enter_editor(&mut controller);
 
     controller.select_project(1);
     assert_eq!(controller.mode(), ShellMode::Editor);
@@ -1744,7 +1757,7 @@ fn deleting_never_changes_live_or_the_canvas() {
     let (project, child, mut controller) = open_three(name);
     controller.set_resident_tile_size_for_test(2);
     enter_editor(&mut controller);
-    loaded_composite(controller.canvas_feed(None));
+    loaded_composite(&mut controller, None);
     paint(&mut controller, stroke(1, 1, 0));
     paint(&mut controller, stroke(3, 1, 1));
     let indices = live_indices(&controller);
@@ -1803,7 +1816,7 @@ fn deleting_never_changes_live_or_the_canvas() {
     let mut stacking = fused_tab("checkpoint_panel_delete_live_stacking", 2);
     assert!(stacking.set_mode(ShellMode::Stacking));
     let events = record_events(&mut stacking);
-    loaded_composite(stacking.canvas_feed(None));
+    loaded_composite(&mut stacking, None);
     stacking.take_render_started();
     confirm(&mut stacking, "held:1");
     assert!(matches!(stacking.canvas_feed(Some(0)), CanvasFeed::Keep));
