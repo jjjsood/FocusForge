@@ -156,8 +156,7 @@ class _Channel:
 class _Pair:
     """Absolute difference of one channel of two composites, fed row by row."""
 
-    def __init__(self, width: int):
-        self.width = width
+    def __init__(self):
         self.samples = self.total = self.biggest = self.differing = 0
 
     def push(self, a, b) -> None:
@@ -258,7 +257,7 @@ def measure(path: str, zmap: str | None = None, vs: str | None = None, band_rows
 
     w, spp = info.width, info.samples_per_pixel
     chans = [_Channel(w, (1 << info.bits_per_sample[0]) - 1) for _ in range(spp)]
-    pairs = [_Pair(w) for _ in range(spp)] if vinfo else None
+    pairs = [_Pair() for _ in range(spp)] if vinfo else None
     coh = _Coherence(w) if zinfo else None
     others = zip(
         _bands(path, info, band_rows),
