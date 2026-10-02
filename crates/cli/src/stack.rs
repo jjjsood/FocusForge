@@ -1098,6 +1098,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         tile_size: job_opts.tile_size,
         max_host_memory,
         backend,
+        align_backend: None,
         resume: job_opts.resume,
         cache: job_opts.cache,
         poll: job::POLL,

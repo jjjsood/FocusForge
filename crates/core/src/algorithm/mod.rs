@@ -18,6 +18,7 @@ mod error;
 
 use std::num::NonZeroU32;
 
+use crate::gpu::AlignBackend;
 pub use crate::params::StackContext;
 use crate::params::{ParamDesc, ParamValue, ParamValues};
 use crate::tile::{Rect, Tile};
@@ -201,6 +202,7 @@ pub struct AlignContext<'a> {
     reference: usize,
     reader: &'a dyn TileReader,
     prepared: Option<&'a (dyn std::any::Any + Send + Sync)>,
+    align_backend: Option<&'a dyn AlignBackend>,
 }
 
 impl<'a> AlignContext<'a> {
@@ -210,7 +212,20 @@ impl<'a> AlignContext<'a> {
             reference,
             reader,
             prepared: None,
+            align_backend: None,
         }
+    }
+
+    /// Attaches the optional accelerator the registration may offer its
+    /// large solves to; `None` keeps every solve on the CPU.
+    pub fn with_align_backend(mut self, backend: Option<&'a dyn AlignBackend>) -> Self {
+        self.align_backend = backend;
+        self
+    }
+
+    /// The accelerator attached with [`Self::with_align_backend`], if any.
+    pub fn align_backend(&self) -> Option<&'a dyn AlignBackend> {
+        self.align_backend
     }
 
     /// Attaches the driver's [`AlignAlgorithm::prepare_run`] output, if any.

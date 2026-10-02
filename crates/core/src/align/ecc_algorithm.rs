@@ -56,7 +56,7 @@
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus};
-use crate::align::ecc::{EccTemplate, solve_prepared};
+use crate::align::ecc::{EccTemplate, solve_prepared, solve_prepared_on};
 use crate::align::feature_seed::{MAX_FEATURES, SEED_PROXY_LONG_SIDE};
 use crate::align::pyramid::StreamError;
 use crate::align::{
@@ -129,6 +129,11 @@ const REGION_FRACTION: f64 = 0.75;
 /// 8192x5464 this turns a naive 6144x4098 (75%) rect into ~1253x836, a 43x
 /// reduction in per-iteration taps.
 const MAX_REGION_PIXELS: u32 = 1 << 20;
+
+/// The fewest solve-region pixels at which a level is offered to an align
+/// backend. Smaller levels cost less to solve than to hand over.
+const ECC_BACKEND_MIN_REGION_PX: u64 = 1_000_000;
+const _: () = assert!(ECC_BACKEND_MIN_REGION_PX <= MAX_REGION_PIXELS as u64);
 
 /// The floor on a pyramid level's shorter dimension the `auto`
 /// pyramid-depth closure refuses to go below. Below ~64px the solve region
@@ -758,14 +763,15 @@ impl PyramidalEcc {
                 window_misses += solved.misses;
                 solved.result
             } else {
-                solve_prepared(
+                solve_routed(
+                    ctx,
                     template,
                     frame_pyramid.level(k as usize),
                     (0, 0),
                     &seed,
                     &coarse_params,
                     trace.as_mut(),
-                )
+                )?
             };
             if traced {
                 records.push(EccLevelRecord {
@@ -1009,6 +1015,45 @@ fn read_luma_window(
     assembler.finish().map_err(wrap_error)
 }
 
+/// Solves one pyramid level. A template region of at least
+/// [`ECC_BACKEND_MIN_REGION_PX`] pixels is offered to the context's align
+/// backend; a level with no backend, a declined one or a smaller region runs on
+/// the CPU. The off-centre patch checks call [`solve_prepared`] directly and
+/// are never offered.
+fn solve_routed(
+    ctx: &AlignContext<'_>,
+    template: &EccTemplate,
+    moving: &Plane,
+    moving_origin: (u32, u32),
+    seed: &Transform,
+    params: &EccParams,
+    mut trace: Option<&mut Vec<EccIteration>>,
+) -> Result<EccResult, AlgorithmError> {
+    let region = template.region();
+    let offered = u64::from(region.width) * u64::from(region.height) >= ECC_BACKEND_MIN_REGION_PX;
+    if let Some(backend) = ctx.align_backend().filter(|_| offered)
+        && let Some(result) = solve_prepared_on(
+            template,
+            moving,
+            moving_origin,
+            seed,
+            params,
+            trace.as_deref_mut(),
+            backend,
+        )?
+    {
+        return Ok(result);
+    }
+    Ok(solve_prepared(
+        template,
+        moving,
+        moving_origin,
+        seed,
+        params,
+        trace,
+    ))
+}
+
 /// One level-0 solve and the window misses it took.
 struct Level0Solve {
     result: EccResult,
@@ -1038,14 +1083,15 @@ fn solve_level0(
     let window = level0_window(seed_fp, region, margin, dims);
     let plane = read_luma_window(ctx, frame, window)?;
     let mut first_trace = trace.is_some().then(Vec::new);
-    let result = solve_prepared(
+    let result = solve_routed(
+        ctx,
         template,
         &plane,
         (window.x, window.y),
         seed,
         params,
         first_trace.as_mut(),
-    );
+    )?;
     drop(plane);
 
     let mut misses = 0;
@@ -1057,14 +1103,15 @@ fn solve_level0(
         if regrown != window {
             let plane = read_luma_window(ctx, frame, regrown)?;
             let mut second_trace = trace.is_some().then(Vec::new);
-            let result = solve_prepared(
+            let result = solve_routed(
+                ctx,
                 template,
                 &plane,
                 (regrown.x, regrown.y),
                 seed,
                 params,
                 second_trace.as_mut(),
-            );
+            )?;
             if escaped(&result.transform, regrown) {
                 misses += 1;
             }
@@ -1294,8 +1341,11 @@ inventory::submit! { AlignRegistration::new(&PyramidalEcc) }
 mod tests {
     use super::*;
     use crate::algorithm::TileReader;
+    use crate::align::ecc::CpuMomentSession;
     use crate::align::feature_seed::test_scene::blob_scene;
     use crate::align::pyramid::max_levels;
+    use crate::align::{AlignDriverOptions, FailurePolicy, align_stack_with};
+    use crate::gpu::{AlignBackend, EccMomentSession, EccSessionRequest};
 
     #[test]
     fn schema_declares_every_parameter() {
@@ -2077,5 +2127,96 @@ mod tests {
             with.status,
             AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
         ));
+    }
+
+    /// Records every region offered to it; declines each, or opens a session
+    /// that sums the moments on the CPU.
+    struct RecordingBackend {
+        offered: std::sync::Mutex<Vec<Rect>>,
+        accept: bool,
+    }
+
+    impl RecordingBackend {
+        fn new(accept: bool) -> Self {
+            Self {
+                offered: std::sync::Mutex::new(Vec::new()),
+                accept,
+            }
+        }
+
+        fn offered(&self) -> Vec<Rect> {
+            self.offered.lock().unwrap().clone()
+        }
+    }
+
+    impl AlignBackend for RecordingBackend {
+        fn open_ecc(
+            &self,
+            request: &EccSessionRequest<'_>,
+        ) -> Result<Option<Box<dyn EccMomentSession>>, AlgorithmError> {
+            self.offered.lock().unwrap().push(request.region);
+            Ok(self
+                .accept
+                .then(|| Box::new(CpuMomentSession::new(request)) as Box<dyn EccMomentSession>))
+        }
+    }
+
+    #[test]
+    fn ecc_level_routing_skips_small_regions() {
+        const BIG_W: u32 = 1700;
+        const BIG_H: u32 = 1100;
+        let region0 = PyramidalEcc::solve_region(BIG_W, BIG_H);
+        let region1 = PyramidalEcc::solve_region(BIG_W / 2, BIG_H / 2);
+        let pixels = |r: Rect| u64::from(r.width) * u64::from(r.height);
+        assert!(pixels(region0) >= ECC_BACKEND_MIN_REGION_PX);
+        assert!(pixels(region1) < ECC_BACKEND_MIN_REGION_PX);
+
+        let shift = (0.4, -0.3);
+        let mem = reader(BIG_W, BIG_H, &[(0.0, 0.0), shift], false);
+        let stack = StackContext::new(2, BIG_W, BIG_H, 1);
+        let config = |policy: &str| {
+            let mut cfg = crate::params::resolved_values(
+                &crate::params::resolve(PyramidalEcc.params(), &ParamValues::new(), &stack)
+                    .unwrap(),
+            );
+            cfg.insert("pyramid-depth".to_string(), ParamValue::Int(1));
+            cfg.insert("max-iterations".to_string(), ParamValue::Int(8));
+            cfg.insert(
+                "mode".to_string(),
+                ParamValue::Enum("translation".to_string()),
+            );
+            cfg.insert(
+                "reference-policy".to_string(),
+                ParamValue::Enum(policy.to_string()),
+            );
+            cfg
+        };
+        let run = |policy: &str, backend: Option<&dyn AlignBackend>| {
+            align_stack_with(
+                &PyramidalEcc,
+                stack,
+                &mem,
+                &config(policy),
+                FailurePolicy::Strict,
+                &AlignDriverOptions {
+                    align_backend: backend,
+                    ..AlignDriverOptions::default()
+                },
+            )
+            .unwrap()
+            .alignment
+        };
+
+        let plain = run("anchor", None);
+        let declining = RecordingBackend::new(false);
+        assert_eq!(run("anchor", Some(&declining)), plain);
+        assert_eq!(declining.offered(), vec![region0]);
+
+        let accepting = RecordingBackend::new(true);
+        let chained = run("chain", Some(&accepting));
+        assert_eq!(accepting.offered(), vec![region0]);
+        let m = chained.frames[1].transform.m;
+        assert!((m[0][2] - shift.0).abs() < 0.05, "x {}", m[0][2]);
+        assert!((m[1][2] - shift.1).abs() < 0.05, "y {}", m[1][2]);
     }
 }

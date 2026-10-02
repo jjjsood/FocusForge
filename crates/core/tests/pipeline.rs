@@ -66,6 +66,7 @@ fn base_request(label: &str, frames: Vec<PathBuf>, explicit: ParamValues) -> Fus
         tile_size: Some(448),
         max_host_memory: None,
         backend: None,
+        align_backend: None,
         resume: false,
         cache: true,
         poll: Duration::from_millis(5),

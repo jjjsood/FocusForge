@@ -239,6 +239,7 @@ pub fn spawn(
             tile_size: None,
             max_host_memory: None,
             backend,
+            align_backend: None,
             resume: false,
             cache: true,
             poll: POLL,

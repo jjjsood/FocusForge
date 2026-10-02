@@ -114,10 +114,15 @@
 //! serial, not rayon: `f64` summation order is what makes a recovered
 //! transform reproducible run to run, matching `crate::fuse::pyramid`.
 
+use std::convert::Infallible;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::algorithm::AlgorithmError;
 use crate::align::error::AlignError;
 use crate::align::transform::Transform;
 use crate::align::warp::catmull_rom_weights;
 use crate::fuse::pyramid::Plane;
+use crate::gpu::{AlignBackend, ECC_MOMENTS, EccSessionRequest};
 use crate::tile::Rect;
 use crate::timing::{TimingCounter, mark_timing_saturated, measurement_scope, record_timing};
 
@@ -468,9 +473,14 @@ enum TemplateKind {
 /// normal matrix and full-overlap statistics, all pure functions of those
 /// inputs. Built once, it serves every solve against any moving plane.
 pub(crate) struct EccTemplate {
+    /// Unique per prepared template for the life of the process, so a backend
+    /// can cache by it; an address would be reused once a template drops.
+    id: u64,
     region: Rect,
     kind: TemplateKind,
 }
+
+static NEXT_TEMPLATE_ID: AtomicU64 = AtomicU64::new(0);
 
 impl EccTemplate {
     /// Prepares `template` over `region`, after the region checks
@@ -515,7 +525,11 @@ impl EccTemplate {
                 ))
             }
         };
-        Ok(Self { region, kind })
+        Ok(Self {
+            id: NEXT_TEMPLATE_ID.fetch_add(1, Ordering::Relaxed),
+            region,
+            kind,
+        })
     }
 
     pub(crate) fn region(&self) -> Rect {
@@ -655,15 +669,15 @@ pub(crate) fn solve_prepared(
     trace: Option<&mut Vec<EccIteration>>,
 ) -> EccResult {
     let region = template.region;
-    match &template.kind {
-        TemplateKind::Translation(data) => solve_generic::<2>(
+    let solved = match &template.kind {
+        TemplateKind::Translation(data) => solve_generic::<2, Infallible>(
             data,
             region,
-            (moving, moving_origin),
             initial,
             params,
             |dp: &[f64; 2]| Transform::translation(dp[0], dp[1]),
             trace,
+            cpu_provider(data, region, (moving, moving_origin), params),
         ),
         TemplateKind::Similarity(data) => {
             // The Jacobian was centred on `region`'s own centre, not
@@ -672,17 +686,108 @@ pub(crate) fn solve_prepared(
             // recovered increment is conjugated back to image coordinates
             // about the same centre.
             let (cx, cy) = similarity_centre(region);
-            solve_generic::<4>(
+            solve_generic::<4, Infallible>(
                 data,
                 region,
-                (moving, moving_origin),
                 initial,
                 params,
                 move |dp: &[f64; 4]| similarity_delta(dp, cx, cy),
                 trace,
+                cpu_provider(data, region, (moving, moving_origin), params),
+            )
+        }
+    };
+    solved.unwrap_or_else(|never| match never {})
+}
+
+/// [`solve_prepared`] with each iteration's moments supplied by a session of
+/// `backend`. `Ok(None)` when the template is singular (the CPU path reports
+/// that at once) or the backend declines the level; the caller then solves it
+/// on the CPU. A session error is returned as it is.
+pub(crate) fn solve_prepared_on(
+    template: &EccTemplate,
+    moving: &Plane,
+    moving_origin: (u32, u32),
+    initial: &Transform,
+    params: &EccParams,
+    trace: Option<&mut Vec<EccIteration>>,
+    backend: &dyn AlignBackend,
+) -> Result<Option<EccResult>, AlgorithmError> {
+    let region = template.region;
+    let moving = (moving, moving_origin);
+    match &template.kind {
+        TemplateKind::Translation(data) => solve_on_backend::<2>(
+            data,
+            (template.id, region),
+            moving,
+            initial,
+            params,
+            |dp: &[f64; 2]| Transform::translation(dp[0], dp[1]),
+            trace,
+            backend,
+        ),
+        TemplateKind::Similarity(data) => {
+            let (cx, cy) = similarity_centre(region);
+            solve_on_backend::<4>(
+                data,
+                (template.id, region),
+                moving,
+                initial,
+                params,
+                move |dp: &[f64; 4]| similarity_delta(dp, cx, cy),
+                trace,
+                backend,
             )
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_on_backend<const K: usize>(
+    data: &TemplateData<K>,
+    (template_id, region): (u64, Rect),
+    (moving, moving_origin): (&Plane, (u32, u32)),
+    initial: &Transform,
+    params: &EccParams,
+    build_delta: impl Fn(&[f64; K]) -> Transform,
+    trace: Option<&mut Vec<EccIteration>>,
+    backend: &dyn AlignBackend,
+) -> Result<Option<EccResult>, AlgorithmError> {
+    if data.singular {
+        return Ok(None);
+    }
+    // Sums over values minus the template mean keep a single-precision
+    // accumulation well conditioned; the moments are mean-centred again here.
+    let mean = data.values.iter().map(|&v| f64::from(v)).sum::<f64>() / data.values.len() as f64;
+    let shift = mean;
+    let request = EccSessionRequest {
+        template_id,
+        region,
+        columns: K,
+        template: &data.values,
+        jacobian: data.g_centered.as_flattened(),
+        shift,
+        moving: moving.data(),
+        moving_dims: (moving.width(), moving.height()),
+        moving_origin,
+    };
+    let Some(mut session) = backend.open_ecc(&request)? else {
+        return Ok(None);
+    };
+    solve_generic(
+        data,
+        region,
+        initial,
+        params,
+        build_delta,
+        trace,
+        |w: &Transform| {
+            session
+                .moments(w)
+                .map(|m| reduction_from_moments(&m, data, mean - shift, params))
+        },
+    )
+    .map(Some)
 }
 
 /// One (uncentred-argument, internally coordinate-centred) row of the
@@ -820,24 +925,24 @@ fn prepare_data<const K: usize>(
 
 /// The shared solve against a prepared template, for `K` degrees of freedom.
 /// `build_delta(&Δp)` builds `ΔW` from a solved increment (conjugated back
-/// where the Jacobian was centred, see [`similarity_delta`]). The
-/// per-iteration working vectors are allocated once, before the loop, and
-/// overwritten in full on every iteration. The module docs give every
-/// equation.
-fn solve_generic<const K: usize>(
+/// where the Jacobian was centred, see [`similarity_delta`]). Each iteration's
+/// sampling and masked sums come from `reduce`, called with the current
+/// warp; everything after them, the update and the termination test, is
+/// shared by every provider. A provider error ends the solve at once. The
+/// module docs give every equation.
+fn solve_generic<const K: usize, E>(
     data: &TemplateData<K>,
     region: Rect,
-    (moving, moving_origin): (&Plane, (u32, u32)),
     initial: &Transform,
     params: &EccParams,
     build_delta: impl Fn(&[f64; K]) -> Transform,
     mut trace: Option<&mut Vec<EccIteration>>,
-) -> EccResult {
-    let region_pixel_count = data.values.len();
+    mut reduce: impl FnMut(&Transform) -> Result<Reduced<K>, E>,
+) -> Result<EccResult, E> {
     let c = data.c;
 
     if data.singular {
-        return EccResult {
+        return Ok(EccResult {
             transform: *initial,
             status: EccStatus::Diverged(DivergenceReason::SingularHessian),
             iterations: 0,
@@ -845,16 +950,8 @@ fn solve_generic<const K: usize>(
             valid_samples: 0,
             valid_fraction: 0.0,
             final_step: None,
-        };
+        });
     }
-
-    let mut allocated = TimingBytes::new(TimingCounter::AllocationBytes);
-    let mut iw_value: Vec<Option<f32>> = vec![None; region_pixel_count];
-    let mut iw_zero = vec![0.0f64; region_pixel_count];
-    let mut ir_zero_partial = vec![0.0f64; region_pixel_count];
-    allocated.add(iw_value.capacity() * std::mem::size_of::<Option<f32>>());
-    allocated.add(iw_zero.capacity() * std::mem::size_of::<f64>());
-    allocated.add(ir_zero_partial.capacity() * std::mem::size_of::<f64>());
 
     // ---- iteration state -------------------------------------------------
     let mut w = *initial;
@@ -873,7 +970,7 @@ fn solve_generic<const K: usize>(
 
     macro_rules! diverge {
         ($reason:expr, $valid_samples:expr, $valid_fraction:expr) => {
-            return EccResult {
+            return Ok(EccResult {
                 transform: best_transform,
                 status: EccStatus::Diverged($reason),
                 iterations: iterations_done,
@@ -881,88 +978,27 @@ fn solve_generic<const K: usize>(
                 valid_samples: $valid_samples,
                 valid_fraction: $valid_fraction,
                 final_step: last_step,
-            };
+            });
         };
     }
 
     for _ in 0..params.max_iterations {
-        // ---- sample the moving plane at W(x) for every x in region -----
-        let mut valid_count = 0usize;
-        let mut n = 0usize;
-        for y in region.y..region.y + region.height {
-            for x in region.x..region.x + region.width {
-                let s = sample_plane(moving, moving_origin, &w, x as f64, y as f64);
-                if s.is_some() {
-                    valid_count += 1;
-                }
-                iw_value[n] = s;
-                n += 1;
+        let Reduction {
+            valid_count,
+            valid_fraction,
+            gt,
+            v,
+            num,
+            ir_ss,
+            gw,
+            iw_ss,
+            cross,
+        } = match reduce(&w)? {
+            Ok(reduction) => reduction,
+            Err((reason, valid_samples, valid_fraction)) => {
+                diverge!(reason, valid_samples, valid_fraction);
             }
-        }
-        let valid_fraction = valid_count as f64 / region_pixel_count as f64;
-
-        if valid_fraction < params.min_valid_fraction {
-            diverge!(
-                DivergenceReason::TooFewValidSamples,
-                valid_count,
-                valid_fraction
-            );
-        }
-
-        let full = has_full_overlap(valid_count, region_pixel_count);
-
-        // ---- ī_r, Gt, v, num: borrowed under guaranteed full overlap ----
-        let (ir_zero, gt, v, num, ir_ss): (&[f64], _, _, _, _) = if full {
-            let Some(stats) = &data.full_overlap else {
-                diverge!(
-                    DivergenceReason::SingularHessian,
-                    valid_count,
-                    valid_fraction
-                );
-            };
-            (&stats.ir_zero, stats.gt, stats.v, stats.num, stats.ir_ss)
-        } else {
-            let computed = compute_ir_stats(
-                &data.values,
-                &data.g_centered,
-                Some(&iw_value),
-                c,
-                &mut ir_zero_partial,
-            );
-            let Some((gt, v, num, ir_ss)) = computed else {
-                diverge!(
-                    DivergenceReason::SingularHessian,
-                    valid_count,
-                    valid_fraction
-                );
-            };
-            (&ir_zero_partial, gt, v, num, ir_ss)
         };
-
-        // ---- ī_w, Gw, cross ---------------------------------------------
-        let mut iw_sum = 0.0f64;
-        for s in iw_value.iter().flatten() {
-            iw_sum += f64::from(*s);
-        }
-        let iw_mean = iw_sum / valid_count as f64;
-
-        for (zero, s) in iw_zero.iter_mut().zip(&iw_value) {
-            *zero = s.map_or(0.0, |v| f64::from(v) - iw_mean);
-        }
-
-        let mut gw = [0.0f64; K];
-        let mut iw_ss = 0.0f64;
-        let mut cross = 0.0f64;
-        for n in 0..region_pixel_count {
-            if iw_value[n].is_none() {
-                continue;
-            }
-            for (acc, g) in gw.iter_mut().zip(&data.g_centered[n]) {
-                *acc += g * iw_zero[n];
-            }
-            iw_ss += iw_zero[n] * iw_zero[n];
-            cross += ir_zero[n] * iw_zero[n];
-        }
 
         let rho = cross / (ir_ss.sqrt() * iw_ss.sqrt());
         if !rho.is_finite() {
@@ -1070,7 +1106,7 @@ fn solve_generic<const K: usize>(
         iterations_done += 1;
 
         if step < params.epsilon_px {
-            return EccResult {
+            return Ok(EccResult {
                 transform: w,
                 status: EccStatus::Converged,
                 iterations: iterations_done,
@@ -1078,12 +1114,12 @@ fn solve_generic<const K: usize>(
                 valid_samples: valid_count,
                 valid_fraction,
                 final_step: Some(step),
-            };
+            });
         }
 
         if iterations_done == params.max_iterations {
             let stalled = iterations_done as usize >= STALL_WINDOW && is_stalled(&recent_steps);
-            return EccResult {
+            return Ok(EccResult {
                 transform: if stalled { best_transform } else { w },
                 status: if stalled {
                     EccStatus::Stalled
@@ -1095,11 +1131,313 @@ fn solve_generic<const K: usize>(
                 valid_samples: valid_count,
                 valid_fraction,
                 final_step: Some(step),
-            };
+            });
         }
     }
 
     unreachable!("the loop above always returns by max_iterations")
+}
+
+/// What one iteration's sampling and masked sums hand the shared update.
+struct Reduction<const K: usize> {
+    valid_count: usize,
+    valid_fraction: f64,
+    gt: [f64; K],
+    v: [f64; K],
+    num: f64,
+    ir_ss: f64,
+    gw: [f64; K],
+    iw_ss: f64,
+    cross: f64,
+}
+
+/// Why a reduction ended the solve: the reason, the valid samples and the
+/// valid fraction.
+type Divergence = (DivergenceReason, usize, f64);
+
+type Reduced<const K: usize> = Result<Reduction<K>, Divergence>;
+
+/// The per-iteration working vectors of the CPU reduction, overwritten in full
+/// on every iteration.
+struct CpuScratch {
+    iw_value: Vec<Option<f32>>,
+    iw_zero: Vec<f64>,
+    ir_zero_partial: Vec<f64>,
+}
+
+impl CpuScratch {
+    fn new(region_pixel_count: usize) -> Self {
+        let mut allocated = TimingBytes::new(TimingCounter::AllocationBytes);
+        let scratch = Self {
+            iw_value: vec![None; region_pixel_count],
+            iw_zero: vec![0.0f64; region_pixel_count],
+            ir_zero_partial: vec![0.0f64; region_pixel_count],
+        };
+        allocated.add(scratch.iw_value.capacity() * std::mem::size_of::<Option<f32>>());
+        allocated.add(scratch.iw_zero.capacity() * std::mem::size_of::<f64>());
+        allocated.add(scratch.ir_zero_partial.capacity() * std::mem::size_of::<f64>());
+        scratch
+    }
+}
+
+/// The CPU moment provider for [`solve_generic`]. Its working vectors are
+/// allocated on the first iteration, so a solve that never iterates allocates
+/// none.
+fn cpu_provider<'a, const K: usize>(
+    data: &'a TemplateData<K>,
+    region: Rect,
+    moving: (&'a Plane, (u32, u32)),
+    params: &'a EccParams,
+) -> impl FnMut(&Transform) -> Result<Reduced<K>, Infallible> + 'a {
+    let mut scratch: Option<CpuScratch> = None;
+    move |w| {
+        let scratch = scratch.get_or_insert_with(|| CpuScratch::new(data.values.len()));
+        Ok(cpu_reduction(data, region, moving, w, params, scratch))
+    }
+}
+
+/// Samples the moving plane at `w(x)` for every `x` in `region` and reduces
+/// the masked sums, the full-overlap path borrowing the template statistics.
+fn cpu_reduction<const K: usize>(
+    data: &TemplateData<K>,
+    region: Rect,
+    (moving, moving_origin): (&Plane, (u32, u32)),
+    w: &Transform,
+    params: &EccParams,
+    scratch: &mut CpuScratch,
+) -> Reduced<K> {
+    let region_pixel_count = data.values.len();
+    let c = data.c;
+    let CpuScratch {
+        iw_value,
+        iw_zero,
+        ir_zero_partial,
+    } = scratch;
+
+    // ---- sample the moving plane at W(x) for every x in region -----
+    let mut valid_count = 0usize;
+    let mut n = 0usize;
+    for y in region.y..region.y + region.height {
+        for x in region.x..region.x + region.width {
+            let s = sample_plane(moving, moving_origin, w, x as f64, y as f64);
+            if s.is_some() {
+                valid_count += 1;
+            }
+            iw_value[n] = s;
+            n += 1;
+        }
+    }
+    let valid_fraction = valid_count as f64 / region_pixel_count as f64;
+
+    if valid_fraction < params.min_valid_fraction {
+        return Err((
+            DivergenceReason::TooFewValidSamples,
+            valid_count,
+            valid_fraction,
+        ));
+    }
+
+    let full = has_full_overlap(valid_count, region_pixel_count);
+    let singular = (
+        DivergenceReason::SingularHessian,
+        valid_count,
+        valid_fraction,
+    );
+
+    // ---- ī_r, Gt, v, num: borrowed under guaranteed full overlap ----
+    let (ir_zero, gt, v, num, ir_ss): (&[f64], _, _, _, _) = if full {
+        let Some(stats) = &data.full_overlap else {
+            return Err(singular);
+        };
+        (&stats.ir_zero, stats.gt, stats.v, stats.num, stats.ir_ss)
+    } else {
+        let computed = compute_ir_stats(
+            &data.values,
+            &data.g_centered,
+            Some(iw_value.as_slice()),
+            c,
+            ir_zero_partial,
+        );
+        let Some((gt, v, num, ir_ss)) = computed else {
+            return Err(singular);
+        };
+        (ir_zero_partial.as_slice(), gt, v, num, ir_ss)
+    };
+
+    // ---- ī_w, Gw, cross ---------------------------------------------
+    let mut iw_sum = 0.0f64;
+    for s in iw_value.iter().flatten() {
+        iw_sum += f64::from(*s);
+    }
+    let iw_mean = iw_sum / valid_count as f64;
+
+    for (zero, s) in iw_zero.iter_mut().zip(iw_value.iter()) {
+        *zero = s.map_or(0.0, |v| f64::from(v) - iw_mean);
+    }
+
+    let mut gw = [0.0f64; K];
+    let mut iw_ss = 0.0f64;
+    let mut cross = 0.0f64;
+    for n in 0..region_pixel_count {
+        if iw_value[n].is_none() {
+            continue;
+        }
+        for (acc, g) in gw.iter_mut().zip(&data.g_centered[n]) {
+            *acc += g * iw_zero[n];
+        }
+        iw_ss += iw_zero[n] * iw_zero[n];
+        cross += ir_zero[n] * iw_zero[n];
+    }
+    Ok(Reduction {
+        valid_count,
+        valid_fraction,
+        gt,
+        v,
+        num,
+        ir_ss,
+        gw,
+        iw_ss,
+        cross,
+    })
+}
+
+/// The same reduction from the [`ECC_MOMENTS`] a backend summed over values
+/// minus its shift. `template_mean` is the full template's mean minus that
+/// shift. Under full overlap the template statistics are borrowed; under
+/// partial overlap they derive from the masked template sums.
+fn reduction_from_moments<const K: usize>(
+    m: &[f64; ECC_MOMENTS],
+    data: &TemplateData<K>,
+    template_mean: f64,
+    params: &EccParams,
+) -> Reduced<K> {
+    let region_pixel_count = data.values.len();
+    let n = m[0];
+    let valid_count = n.round() as usize;
+    let valid_fraction = valid_count as f64 / region_pixel_count as f64;
+    if valid_fraction < params.min_valid_fraction {
+        return Err((
+            DivergenceReason::TooFewValidSamples,
+            valid_count,
+            valid_fraction,
+        ));
+    }
+    let singular = (
+        DivergenceReason::SingularHessian,
+        valid_count,
+        valid_fraction,
+    );
+    let s_mean = m[1] / n;
+    let iw_ss = m[2] - n * s_mean * s_mean;
+
+    let (gt, v, num, ir_ss, cross, g_sum) = if has_full_overlap(valid_count, region_pixel_count) {
+        let Some(stats) = &data.full_overlap else {
+            return Err(singular);
+        };
+        let cross = m[3] - template_mean * m[1];
+        (
+            stats.gt,
+            stats.v,
+            stats.num,
+            stats.ir_ss,
+            cross,
+            [0.0f64; K],
+        )
+    } else {
+        let t_mean = m[8] / n;
+        let ir_ss = m[9] - n * t_mean * t_mean;
+        let mut gt = [0.0f64; K];
+        let mut g_sum = [0.0f64; K];
+        for k in 0..K {
+            g_sum[k] = m[14 + k];
+            gt[k] = m[10 + k] - t_mean * g_sum[k];
+        }
+        let Some(v) = solve_linear(data.c, gt) else {
+            return Err(singular);
+        };
+        let num = ir_ss - dot(&gt, &v);
+        (gt, v, num, ir_ss, m[3] - n * t_mean * s_mean, g_sum)
+    };
+    let mut gw = [0.0f64; K];
+    for k in 0..K {
+        gw[k] = m[4 + k] - s_mean * g_sum[k];
+    }
+    Ok(Reduction {
+        valid_count,
+        valid_fraction,
+        gt,
+        v,
+        num,
+        ir_ss,
+        gw,
+        iw_ss,
+        cross,
+    })
+}
+
+/// A session summing the moments on the CPU from copies of a request's data.
+#[cfg(test)]
+pub(crate) struct CpuMomentSession {
+    template: Vec<f32>,
+    jacobian: Vec<f64>,
+    columns: usize,
+    region: Rect,
+    shift: f64,
+    moving: Plane,
+    moving_origin: (u32, u32),
+}
+
+#[cfg(test)]
+impl CpuMomentSession {
+    pub(crate) fn new(request: &EccSessionRequest<'_>) -> Self {
+        let (width, height) = request.moving_dims;
+        Self {
+            template: request.template.to_vec(),
+            jacobian: request.jacobian.to_vec(),
+            columns: request.columns,
+            region: request.region,
+            shift: request.shift,
+            moving: Plane::from_f32(request.moving, width, height, 1)
+                .expect("the request's moving window is a single-channel plane"),
+            moving_origin: request.moving_origin,
+        }
+    }
+}
+
+#[cfg(test)]
+impl crate::gpu::EccMomentSession for CpuMomentSession {
+    fn moments(&mut self, w: &Transform) -> Result<[f64; ECC_MOMENTS], AlgorithmError> {
+        let mut m = [0.0f64; ECC_MOMENTS];
+        let region = self.region;
+        let mut n = 0usize;
+        for y in region.y..region.y + region.height {
+            for x in region.x..region.x + region.width {
+                let i = n;
+                n += 1;
+                let Some(s) = sample_plane(&self.moving, self.moving_origin, w, x as f64, y as f64)
+                else {
+                    continue;
+                };
+                let s = f64::from(s) - self.shift;
+                let t = f64::from(self.template[i]) - self.shift;
+                m[0] += 1.0;
+                m[1] += s;
+                m[2] += s * s;
+                m[3] += t * s;
+                m[8] += t;
+                m[9] += t * t;
+                for (k, &g) in self.jacobian[i * self.columns..][..self.columns]
+                    .iter()
+                    .enumerate()
+                {
+                    m[4 + k] += g * s;
+                    m[10 + k] += g * t;
+                    m[14 + k] += g;
+                }
+            }
+        }
+        Ok(m)
+    }
 }
 
 /// Fills `ir_zero` with the zero-mean template vector and computes
@@ -1149,6 +1487,7 @@ fn compute_ir_stats<const K: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::EccMomentSession;
 
     #[test]
     fn validation_failed_round_trips_as_kebab_case() {
@@ -1976,6 +2315,120 @@ mod tests {
         ) {
             Err(AlignError::PlaneMismatch { .. }) => {}
             other => panic!("expected PlaneMismatch, got {other:?}"),
+        }
+    }
+
+    fn textured(width: u32, height: u32, dx: f64) -> Plane {
+        let mut data = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let (fx, fy) = (f64::from(x) - dx, f64::from(y));
+                data.push(
+                    (1000.0 + 200.0 * (fx * 0.3).sin() + 150.0 * (fy * 0.25).cos() + fx * 3.0)
+                        as f32,
+                );
+            }
+        }
+        Plane::from_f32(&data, width, height, 1).unwrap()
+    }
+
+    /// The window of `plane` whose top-left pixel is `(x0, y0)`.
+    fn window(plane: &Plane, (x0, y0): (u32, u32), (w, h): (u32, u32)) -> Plane {
+        let stride = plane.width() as usize;
+        let mut data = Vec::with_capacity((w * h) as usize);
+        for y in y0..y0 + h {
+            let row = y as usize * stride + x0 as usize;
+            data.extend_from_slice(&plane.data()[row..row + w as usize]);
+        }
+        Plane::from_f32(&data, w, h, 1).unwrap()
+    }
+
+    /// The raw moments a backend sums, in `f64` from the CPU sampler.
+    fn cpu_moments<const K: usize>(
+        data: &TemplateData<K>,
+        region: Rect,
+        (moving, origin): (&Plane, (u32, u32)),
+        w: &Transform,
+        shift: f64,
+    ) -> [f64; ECC_MOMENTS] {
+        let request = EccSessionRequest {
+            template_id: 0,
+            region,
+            columns: K,
+            template: &data.values,
+            jacobian: data.g_centered.as_flattened(),
+            shift,
+            moving: moving.data(),
+            moving_dims: (moving.width(), moving.height()),
+            moving_origin: origin,
+        };
+        CpuMomentSession::new(&request)
+            .moments(w)
+            .expect("the cpu session cannot fail")
+    }
+
+    fn close(a: f64, b: f64, what: &str) {
+        let tol = 1e-8 * (1.0 + a.abs().max(b.abs()));
+        assert!((a - b).abs() <= tol, "{what}: moments {a} against cpu {b}");
+    }
+
+    fn assert_moments_match_cpu<const K: usize>(
+        data: &TemplateData<K>,
+        region: Rect,
+        moving: (&Plane, (u32, u32)),
+    ) {
+        let params = EccParams {
+            max_iterations: 10,
+            epsilon_px: 1e-4,
+            min_valid_fraction: 0.3,
+        };
+        let n = data.values.len();
+        let mean = data.values.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64;
+        let mut scratch = CpuScratch::new(n);
+        let cases = [
+            (Transform::translation(1.3, -0.7), true),
+            (Transform::translation(18.0, 0.4), false),
+        ];
+        for (w, full) in cases {
+            let cpu = cpu_reduction(data, region, moving, &w, &params, &mut scratch)
+                .expect("cpu reduction");
+            assert_eq!(cpu.valid_count == n, full, "overlap of {w:?}");
+            for shift in [0.0, mean] {
+                let m = cpu_moments(data, region, moving, &w, shift);
+                let got = reduction_from_moments(&m, data, mean - shift, &params)
+                    .expect("moment reduction");
+                assert_eq!(got.valid_count, cpu.valid_count);
+                close(got.num, cpu.num, "num");
+                close(got.ir_ss, cpu.ir_ss, "ir_ss");
+                close(got.iw_ss, cpu.iw_ss, "iw_ss");
+                close(got.cross, cpu.cross, "cross");
+                for k in 0..K {
+                    close(got.gt[k], cpu.gt[k], "gt");
+                    close(got.v[k], cpu.v[k], "v");
+                    close(got.gw[k], cpu.gw[k], "gw");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn backend_moments_reproduce_the_cpu_reduction() {
+        let template = textured(48, 36, 0.0);
+        let moving = window(&textured(48, 36, 0.9), (4, 3), (40, 30));
+        let region = Rect {
+            x: 8,
+            y: 6,
+            width: 25,
+            height: 17,
+        };
+        let moving = (&moving, (4, 3));
+        for mode in [EccMode::Translation, EccMode::Similarity] {
+            let prepared = EccTemplate::prepare(&template, (0, 0), region, mode)
+                .expect("region inside the plane");
+            match &prepared.kind {
+                TemplateKind::Translation(data) => assert_moments_match_cpu(data, region, moving),
+                TemplateKind::Similarity(data) => assert_moments_match_cpu(data, region, moving),
+            }
         }
     }
 }

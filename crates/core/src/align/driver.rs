@@ -50,6 +50,7 @@ use crate::align::Transform;
 use crate::align::ecc_algorithm::{
     retained_template_bytes, seed_scratch_bytes, solve_scratch_bytes,
 };
+use crate::gpu::AlignBackend;
 use crate::job::{ControlState, JobControl};
 use crate::params::{ParamValue, ParamValues, StackContext};
 use crate::tile::HostBudget;
@@ -168,6 +169,9 @@ pub struct AlignDriverOptions<'a> {
     /// **on the thread that called [`align_stack_with`]** -- never from a
     /// pool worker.
     pub on_pause: Option<&'a (dyn Fn(&JobControl) + Sync)>,
+    /// An accelerator the registration may offer its large solves to; `None`
+    /// solves everything on the CPU.
+    pub align_backend: Option<&'a dyn AlignBackend>,
 }
 
 impl Default for AlignDriverOptions<'_> {
@@ -177,6 +181,7 @@ impl Default for AlignDriverOptions<'_> {
             frames_done: None,
             control: None,
             on_pause: None,
+            align_backend: None,
         }
     }
 }
@@ -403,7 +408,8 @@ fn run_chain_leg(
     let mut prefix = Transform::identity();
     for i in indices {
         wait_at_boundary(options)?;
-        let ctx = AlignContext::new(stack, previous, reader);
+        let ctx =
+            AlignContext::new(stack, previous, reader).with_align_backend(options.align_backend);
         let outcome = algorithm.align_frame(&ctx, i, cfg)?;
         let diverged = matches!(outcome.status, AlignStatus::Diverged(_));
         let fallback = diverged && failure == FailurePolicy::IdentityFallback;
@@ -514,7 +520,8 @@ pub fn align_stack_with(
             // same prepared reference pyramid from this single line. The
             // `Arc` binding lives in this stack frame and drops when this
             // function returns.
-            let ctx = AlignContext::new(stack, reference, reader);
+            let ctx = AlignContext::new(stack, reference, reader)
+                .with_align_backend(options.align_backend);
             let prepared = {
                 let _prepare = measurement_scope("align_prepare");
                 algorithm.prepare_run(&ctx, cfg)?

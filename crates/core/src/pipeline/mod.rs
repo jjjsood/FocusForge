@@ -24,7 +24,7 @@ use crate::align::{
 };
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
-use crate::gpu::TileBackend;
+use crate::gpu::{AlignBackend, TileBackend};
 use crate::io::{
     COMPOSITE_FILENAME, FrameDesc, FrameReader, Rect, TiffStack, ZMAP_FILENAME, open_frame_set,
 };
@@ -71,6 +71,8 @@ pub struct FuseRequest {
     pub tile_size: Option<u32>,
     pub max_host_memory: Option<u64>,
     pub backend: Option<&'static dyn TileBackend>,
+    /// An accelerator the align stage may offer its large ECC solves to.
+    pub align_backend: Option<&'static dyn AlignBackend>,
     pub resume: bool,
     pub cache: bool,
     /// How often the poll thread this module owns calls
@@ -403,6 +405,7 @@ pub fn run(
                             frames_done: Some(frames_done),
                             control: Some(Arc::clone(&control)),
                             on_pause: Some(&|control| observer.paused(control)),
+                            align_backend: request.align_backend,
                         },
                     );
                     done.store(true, Ordering::SeqCst);
