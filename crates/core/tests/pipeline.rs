@@ -887,6 +887,79 @@ fn no_align_registration_is_identity_transforms_and_the_kernel_inset_crop() {
     );
 }
 
+/// Registers every frame it is asked about a full frame width to the right,
+/// so no pixel of the shifted frame overlaps the reference.
+struct ShiftPastTheFrame;
+
+impl AlignAlgorithm for ShiftPastTheFrame {
+    fn id(&self) -> &str {
+        "shift-past-the-frame"
+    }
+    fn display_name(&self) -> &str {
+        "Shift Past The Frame"
+    }
+    fn params(&self) -> &[ParamDesc] {
+        registry::find_align("pyramidal-ecc")
+            .expect("pyramidal-ecc must be registered")
+            .params()
+    }
+    fn align_frame(
+        &self,
+        ctx: &AlignContext<'_>,
+        _frame: usize,
+        _cfg: &ParamValues,
+    ) -> Result<AlignOutcome, AlgorithmError> {
+        let width = f64::from(ctx.stack().width);
+        Ok(AlignOutcome {
+            transform: Transform::similarity(1.0, 0.0, width + 8.0, 0.0),
+            status: AlignStatus::Converged,
+            iterations: 1,
+            residual: 1.0,
+        })
+    }
+}
+
+#[test]
+fn an_empty_overlap_with_crop_names_the_remedy() {
+    static SHIFT: ShiftPastTheFrame = ShiftPastTheFrame;
+    let align = || AlignRequest {
+        algorithm: &SHIFT,
+        explicit: ParamValues::new(),
+        lax: false,
+    };
+
+    let mut request = base_request("empty_overlap_crop", mantis_frames(2), ParamValues::new());
+    request.align = Some(align());
+    request.crop = true;
+    let Err(PipelineError::Align(message)) =
+        focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+    else {
+        panic!("an empty overlap with auto-crop on must fail with PipelineError::Align");
+    };
+    assert!(
+        message.contains("turn off auto-crop"),
+        "the error must name the remedy: {message}"
+    );
+
+    let mut request = base_request(
+        "empty_overlap_no_crop",
+        mantis_frames(2),
+        ParamValues::new(),
+    );
+    request.align = Some(align());
+    request.crop = false;
+    let outcome = focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+        .expect("the same run without auto-crop completes");
+    let FuseOutcome::Completed(report) = outcome else {
+        panic!("expected a completed run");
+    };
+    assert_eq!(
+        (report.output_width, report.output_height),
+        (report.width, report.height),
+        "without auto-crop the output keeps the full frame extent"
+    );
+}
+
 /// The pipeline divides its capped host budget into alignment workers: a
 /// larger cap runs more workers, the alignment and the composite bytes do
 /// not depend on the cap, and the reported accounted bytes follow the worker count.

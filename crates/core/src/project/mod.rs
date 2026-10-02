@@ -178,23 +178,36 @@ use crate::params::{ParamDesc, ParamKind, ParamValue};
 use crate::tile::Rect;
 
 /// The project-level parameter schema: values that describe how a project
-/// was prepared rather than any one algorithm's own settings. One
-/// descriptor today, `auto-crop`, a project value rather than an algorithm
-/// parameter -- rendered by the GUI's settings panel through the same
-/// generator every algorithm's schema goes through, and read by
-/// `focusforge-cli stack`'s `--no-crop` flag so the two never drift.
+/// was prepared rather than any one algorithm's own settings: `align`, then
+/// `auto-crop`. Project values, not algorithm parameters -- rendered by the
+/// GUI's settings panel through the same generator every algorithm's schema
+/// goes through, and read by `focusforge-cli stack`'s `--no-align` and
+/// `--no-crop` flags so the two never drift.
 pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
-    vec![ParamDesc {
-        id: "auto-crop".to_string(),
-        label: "Auto-crop".to_string(),
-        help: "Trims the composite and Z-Map to the region every aligned \
-               frame actually covers. Off keeps the full frame extent."
-            .to_string(),
-        kind: ParamKind::Bool,
-        default: ParamValue::Bool(true),
-        auto: None,
-        host_default: None,
-    }]
+    vec![
+        ParamDesc {
+            id: "align".to_string(),
+            label: "Align frames".to_string(),
+            help: "Registers every frame onto the reference before fusing. \
+                   Off fuses the frames as read."
+                .to_string(),
+            kind: ParamKind::Bool,
+            default: ParamValue::Bool(true),
+            auto: None,
+            host_default: None,
+        },
+        ParamDesc {
+            id: "auto-crop".to_string(),
+            label: "Auto-crop".to_string(),
+            help: "Trims the composite and Z-Map to the region every aligned \
+                   frame actually covers. Off keeps the full frame extent."
+                .to_string(),
+            kind: ParamKind::Bool,
+            default: ParamValue::Bool(true),
+            auto: None,
+            host_default: None,
+        },
+    ]
 });
 
 /// The on-disk format version this build writes and reads. A project
@@ -454,14 +467,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_params_holds_exactly_one_auto_crop_bool_descriptor() {
-        assert_eq!(PROJECT_PARAMS.len(), 1);
-        let desc = &PROJECT_PARAMS[0];
-        assert_eq!(desc.id, "auto-crop");
-        assert_eq!(desc.label, "Auto-crop");
-        assert_eq!(desc.kind, ParamKind::Bool);
-        assert_eq!(desc.default, ParamValue::Bool(true));
-        assert!(desc.auto.is_none());
-        assert!(desc.host_default.is_none());
+    fn project_params_holds_the_align_and_auto_crop_bool_descriptors() {
+        assert_eq!(PROJECT_PARAMS.len(), 2);
+        for (desc, id, label) in [
+            (&PROJECT_PARAMS[0], "align", "Align frames"),
+            (&PROJECT_PARAMS[1], "auto-crop", "Auto-crop"),
+        ] {
+            assert_eq!(desc.id, id);
+            assert_eq!(desc.label, label);
+            assert_eq!(desc.kind, ParamKind::Bool);
+            assert_eq!(desc.default, ParamValue::Bool(true));
+            assert!(desc.auto.is_none());
+            assert!(desc.host_default.is_none());
+        }
     }
 }

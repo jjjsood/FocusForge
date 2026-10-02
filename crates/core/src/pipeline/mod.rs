@@ -321,11 +321,7 @@ pub fn run(
         } else {
             FailurePolicy::Strict
         };
-        let identity = AlignIdentity {
-            algorithm: align_req.algorithm.id().to_string(),
-            params: align_values.clone(),
-            failure_policy: policy,
-        };
+        let identity = AlignIdentity::new(align_req.algorithm.id(), align_values.clone(), policy);
 
         let peeked = if request.resume {
             peek_resumable_alignment(
@@ -468,7 +464,8 @@ pub fn run(
         .map_err(|err| PipelineError::Align(err.to_string()))?;
     if request.crop && crop_rect_value.is_none() {
         return Err(PipelineError::Align(
-            "the aligned frames' overlap leaves no interior once the kernel margin is trimmed"
+            "the aligned frames' overlap leaves no interior once the kernel margin is trimmed; \
+             turn off auto-crop to keep the full frame extent"
                 .to_string(),
         ));
     }
@@ -547,10 +544,12 @@ pub fn run(
         backend: backend_id.clone(),
         align: alignment_result
             .as_ref()
-            .map(|(align_algo, align_resolved, policy, _)| AlignIdentity {
-                algorithm: align_algo.id().to_string(),
-                params: params::resolved_values(align_resolved),
-                failure_policy: *policy,
+            .map(|(align_algo, align_resolved, policy, _)| {
+                AlignIdentity::new(
+                    align_algo.id(),
+                    params::resolved_values(align_resolved),
+                    *policy,
+                )
             }),
         crop: applied_crop,
         composite_output: staged_composite.clone(),
