@@ -178,6 +178,9 @@ pub enum ShellEvent {
     /// A save's worker has parked its outcome
     /// ([`AppController::settle_save`]).
     SaveReady,
+    /// A recomposite worker has parked its gathered regions
+    /// ([`AppController::settle_recomposites`]).
+    RecompositeReady,
 }
 
 /// One live drag: which action it started and the last position seen, so
@@ -1637,9 +1640,41 @@ impl AppController {
         self.resident_tile_size_for_test = Some(size);
     }
 
-    /// Drains the active tab's log of every region recomposited into its
-    /// resident display tiles since the last call; empty with no edit
-    /// session.
+    /// Test-only: the active tab's live editor state, to swap its frame
+    /// reader.
+    pub fn edit_state_mut_for_test(&mut self) -> Option<&mut job::EditState> {
+        self.state.active_mut()?.edit.as_mut()
+    }
+
+    /// Installs the regions recomposite workers have parked, on the tab each
+    /// was queued for -- active or not -- and dispatches what queued behind
+    /// them. Returns `true` once no tab has a recomposite in flight.
+    pub fn settle_recomposites(&mut self) -> bool {
+        let wake = self.recomposite_wake();
+        let mut idle = true;
+        for tab in &mut self.state.projects {
+            if let Some(edit) = tab.edit.as_mut() {
+                idle &= edit.settle_recomposite(&wake);
+            }
+        }
+        idle
+    }
+
+    /// What a recomposite worker runs once it has parked a batch: the
+    /// [`ShellEvent::RecompositeReady`] on this controller's sink.
+    fn recomposite_wake(&self) -> job::RecompositeWake {
+        let sink = self.sink.clone();
+        Arc::new(move || {
+            if let Some(sink) = &sink {
+                sink(ShellEvent::RecompositeReady);
+            }
+        })
+    }
+
+    /// Drains the active tab's log of every region installed into its
+    /// resident display tiles since the last call -- a queued region is
+    /// logged once [`Self::settle_recomposites`] installs it; empty with no
+    /// edit session.
     pub fn take_recomposited(&mut self) -> Vec<job::Rect> {
         self.state
             .active_mut()
@@ -2850,13 +2885,15 @@ impl AppController {
     }
 
     /// `Ctrl + Z`: steps the active tab's edit session back one op and
-    /// recomposites the region it returns. Ignored while a stroke is live.
+    /// queues the region it returns for recompositing. Ignored while a
+    /// stroke is live.
     pub fn undo(&mut self) {
         self.undo_or_redo(job::EditSession::undo);
     }
 
     /// `Ctrl + Shift + Z`: re-applies the most recently undone op and
-    /// recomposites the region it returns. Ignored while a stroke is live.
+    /// queues the region it returns for recompositing. Ignored while a
+    /// stroke is live.
     pub fn redo(&mut self) {
         self.undo_or_redo(job::EditSession::redo);
     }
@@ -2866,6 +2903,7 @@ impl AppController {
     /// `None` when there was nothing to step. A no-op while a stroke is
     /// live.
     fn undo_or_redo(&mut self, step: fn(&mut job::EditSession) -> Option<Option<job::Rect>>) {
+        let wake = self.recomposite_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -2879,10 +2917,8 @@ impl AppController {
         let Some(region) = step(&mut edit.session) else {
             return;
         };
-        if let Some(region) = region
-            && let Err(err) = edit.recomposite(region)
-        {
-            tracing::error!(error = %err, "undo/redo recomposite failed");
+        if let Some(region) = region {
+            edit.queue_recomposite(region, &wake);
         }
         if tab.unsaved() != was_unsaved {
             self.emit(ShellEvent::ProjectsChanged);
@@ -2994,10 +3030,11 @@ impl AppController {
 
     /// Called by every repaint before it reads anything else: takes the
     /// active tab's live stroke's newest segment, if any, previews it and
-    /// recomposites exactly that segment's footprint into the resident
-    /// tiles -- one tick per repaint, never per motion event. A no-op with
-    /// no live stroke or no motion since the last flush.
+    /// queues exactly that segment's footprint for recompositing into the
+    /// resident tiles -- one tick per repaint, never per motion event. A
+    /// no-op with no live stroke or no motion since the last flush.
     pub fn flush_live_stroke(&mut self) {
+        let wake = self.recomposite_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -3023,10 +3060,7 @@ impl AppController {
         let Some(region) = region else {
             return;
         };
-        if let Err(err) = edit.recomposite(region) {
-            tracing::error!(error = %err, "live-stroke preview recomposite failed");
-            return;
-        }
+        edit.queue_recomposite(region, &wake);
         edit.stroke
             .as_mut()
             .expect("the stroke that produced this tick is still live")
@@ -3036,10 +3070,12 @@ impl AppController {
 
     /// `Paint`'s `End`: flushes remaining motion, discards the preview, then
     /// appends the stroke's resampled path unless its footprint is empty or
-    /// off-image. Recomposites the tick rects (dilated), or the appended
-    /// region itself when no tick fired (a press-release with no motion).
+    /// off-image. Queues the tick rects (dilated) for recompositing, or the
+    /// appended region itself when no tick fired (a press-release with no
+    /// motion).
     fn paint_end(&mut self) {
         self.flush_live_stroke();
+        let wake = self.recomposite_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -3081,16 +3117,12 @@ impl AppController {
         };
         let map = edit.session.tile();
         if tick_rects.is_empty() {
-            if let Err(err) = edit.recomposite(region) {
-                tracing::error!(error = %err, "brush-stroke commit recomposite failed");
-            }
+            edit.queue_recomposite(region, &wake);
         } else {
             let margin = (radius / 8.0).ceil() as u32 + 2;
             for rect in tick_rects {
                 let dilated = dilate_rect(rect, margin, map.width, map.height);
-                if let Err(err) = edit.recomposite(dilated) {
-                    tracing::error!(error = %err, "brush-stroke commit recomposite failed");
-                }
+                edit.queue_recomposite(dilated, &wake);
             }
         }
         if lit {

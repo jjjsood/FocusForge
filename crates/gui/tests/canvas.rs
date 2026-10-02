@@ -1945,9 +1945,9 @@ fn resident_tiles_allocate_only_the_tiles_a_region_meets() {
     assert!(tiles.take_recomposited().is_empty(), "the log drains");
 
     // Every index differs from the sealed one, so the overlay shows each
-    // texel's resident pixel wherever a tile exists: the gather inside the
-    // region, the zeroed allocation elsewhere in the four tiles, and the
-    // sealed sentinel outside them.
+    // texel's resident pixel wherever one was installed: the gather inside
+    // the region, and the sealed sentinel everywhere else, including the
+    // rest of the four tiles the region met.
     const SENTINEL: u16 = 7777;
     let mut samples = vec![SENTINEL; (MAP * MAP * 3) as usize];
     overlay_edited(
@@ -1959,24 +1959,123 @@ fn resident_tiles_allocate_only_the_tiles_a_region_meets() {
         3,
         &tiles,
     );
-    let four_tiles = Rect {
-        x: 0,
-        y: 13,
-        width: 26,
-        height: 26,
-    };
     for y in 0..MAP {
         for x in 0..MAP {
             let i = ((y * MAP + x) * 3) as usize;
             let expected: &[u16] = if contains(region, x, y) {
                 &planes[1][i..i + 3]
-            } else if contains(four_tiles, x, y) {
-                &[0, 0, 0]
             } else {
                 &[SENTINEL; 3]
             };
             assert_eq!(&samples[i..i + 3], expected, "({x}, {y})");
         }
+    }
+}
+
+#[test]
+fn a_pending_region_never_shows_unfilled_tile_samples() {
+    let stack = mantis64_stack();
+    let planes = frame_planes(&stack);
+    // A 13 px grid: `first` spans tiles (0..=1, 1..=2); `pending` reaches
+    // untouched texels of tiles (1, 1) and (1, 2) and the fresh tiles (2, 1)
+    // and (2, 2).
+    let mut tiles = ResidentTiles::new(13, MAP, MAP, 3);
+    let sealed = vec![0u16; (MAP * MAP) as usize];
+    let first = Rect {
+        x: 10,
+        y: 20,
+        width: 10,
+        height: 10,
+    };
+    let pending = Rect {
+        x: 18,
+        y: 24,
+        width: 14,
+        height: 10,
+    };
+    let mut edited = sealed.clone();
+    for y in first.y..first.y + first.height {
+        for x in first.x..first.x + first.width {
+            edited[(y * MAP + x) as usize] = 1;
+        }
+    }
+    tiles.recomposite(first, &edited, &sources(&stack)).unwrap();
+    for y in pending.y..pending.y + pending.height {
+        for x in pending.x..pending.x + pending.width {
+            edited[(y * MAP + x) as usize] = 2;
+        }
+    }
+    let generation = tiles.generation();
+    tiles.touch();
+    assert_eq!(
+        tiles.generation(),
+        generation + 1,
+        "touch is the renderer's cue"
+    );
+
+    const SENTINEL: u16 = 7777;
+    let shown = |step: u32, tiles: &ResidentTiles| {
+        let step = NonZeroU32::new(step).unwrap();
+        let out_w = MAP.div_ceil(step.get());
+        let texels = (out_w * out_w) as usize;
+        let mut sealed_step = vec![0u16; texels];
+        let mut edited_step = vec![0u16; texels];
+        step_copy(&sealed, MAP, whole_map(), step, &mut sealed_step);
+        step_copy(&edited, MAP, whole_map(), step, &mut edited_step);
+        let mut samples = vec![SENTINEL; texels * 3];
+        overlay_edited(
+            &mut samples,
+            &sealed_step,
+            &edited_step,
+            whole_map(),
+            step,
+            3,
+            tiles,
+        );
+        (step.get(), out_w, samples)
+    };
+    let check = |step: u32, tiles: &ResidentTiles, expected: &dyn Fn(u32, u32) -> Vec<u16>| {
+        let (step, out_w, samples) = shown(step, tiles);
+        for ty in 0..out_w {
+            for tx in 0..out_w {
+                let (x, y) = (tx * step, ty * step);
+                let t = ((ty * out_w + tx) * 3) as usize;
+                assert_eq!(
+                    &samples[t..t + 3],
+                    &expected(x, y)[..],
+                    "step {step} ({x}, {y})"
+                );
+            }
+        }
+    };
+    let plane_pixel = |frame: usize, x: u32, y: u32| {
+        let i = ((y * MAP + x) * 3) as usize;
+        planes[frame][i..i + 3].to_vec()
+    };
+
+    let before = |x: u32, y: u32| {
+        if contains(first, x, y) {
+            plane_pixel(1, x, y)
+        } else {
+            vec![SENTINEL; 3]
+        }
+    };
+    for step in [1, 2] {
+        check(step, &tiles, &before);
+    }
+
+    tiles
+        .recomposite(pending, &edited, &sources(&stack))
+        .unwrap();
+    let after = |x: u32, y: u32| {
+        if contains(pending, x, y) {
+            plane_pixel(2, x, y)
+        } else {
+            before(x, y)
+        }
+    };
+    for step in [1, 2] {
+        check(step, &tiles, &after);
     }
 }
 
