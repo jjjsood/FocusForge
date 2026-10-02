@@ -122,9 +122,10 @@ pub fn run(command: HistoryCommand, accept_changed_sources: bool) -> ExitCode {
 }
 
 /// Maps a refusal to its own exit code: 3 not a project, 4 truncated, 6 a
-/// missing entry, 7 a blob hash mismatch, 8 a structural link failure (a dangling parent, a
-/// parent cycle, a fingerprint disagreement, a missing patch base, ops with
-/// no parent to record them against). Anything else stays the generic 1.
+/// missing entry, 7 a blob hash mismatch, 8 a structural link failure (a
+/// dangling parent, a parent cycle, a fingerprint disagreement, a missing
+/// patch base, ops with no parent to record them against). Anything else
+/// stays the generic 1.
 fn exit_code_for(err: &ProjectError) -> u8 {
     match err {
         ProjectError::NotAProject { .. } => 3,

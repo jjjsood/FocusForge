@@ -8,7 +8,8 @@
 //!
 //! **Open refuses, it does not default.** Every field is required except
 //! the optional-by-meaning ones ([`BlobRecord::base`] and
-//! [`BlobRecord::target`]): a manifest missing one fails deserialization. `deny_unknown_fields` is deliberately absent.
+//! [`BlobRecord::target`]): a manifest missing one fails deserialization.
+//! `deny_unknown_fields` is deliberately absent.
 
 use serde::{Deserialize, Serialize};
 
