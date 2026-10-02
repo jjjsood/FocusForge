@@ -19,7 +19,7 @@ use focusforge_core::gpu::TileBackend;
 use focusforge_core::io::{FrameReader, Group, Proposal, Rect, open_frame_set, propose};
 use focusforge_core::job::{JobControl, StageCache};
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance};
-use focusforge_core::project::{self, PROJECT_EXTENSION, PROJECT_PARAMS};
+use focusforge_core::project::{self, PROJECT_EXTENSION};
 use focusforge_core::registry;
 use focusforge_core::tile::{TileScheduler, TileSchedulerOptions};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
@@ -351,7 +351,7 @@ pub fn run(
     {
         Ok(values) => values
             .into_iter()
-            .partition::<ParamValues, _>(|(id, _)| PROJECT_PARAMS.iter().any(|d| &d.id == id)),
+            .partition::<ParamValues, _>(|(id, _)| project_schema.iter().any(|d| &d.id == id)),
         Err(violations) => {
             return refuse(
                 violations
