@@ -463,10 +463,7 @@ fn editor_mode_enters_on_a_fused_tab() {
     );
     common::enter_editor(&mut reopened);
     assert_eq!(reopened.mode(), ShellMode::Editor);
-    assert_eq!(
-        *events.lock().unwrap(),
-        vec![ShellEvent::ModeChanged(ShellMode::Editor)]
-    );
+    assert_eq!(take_mode_changes(&events), vec![ShellMode::Editor]);
 }
 
 #[test]
@@ -3542,7 +3539,7 @@ fn pipette_reads_and_appends_nothing() {
     writer.write_tile(map, &sealed).unwrap();
     writer.finish().unwrap();
     c.set_pane_geometry(LEFT, RIGHT);
-    assert!(c.set_mode(ShellMode::Editor));
+    common::enter_editor(&mut c);
 
     set_size(&mut c, 4.0);
     c.select_frame(1);
@@ -4616,16 +4613,6 @@ fn paint(controller: &mut AppController, x: i32) {
         .expect("a dab inside the map applies");
 }
 
-/// `set_mode(Editor)`, waiting out the render an op-bearing row needs first.
-fn enter_editor(controller: &mut AppController) {
-    let start = std::time::Instant::now();
-    while !controller.set_mode(ShellMode::Editor) {
-        assert!(start.elapsed() < SETTLE, "the editor did not open");
-        controller.settle_checkpoint_render();
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
 fn reopen(path: &Path, name: &str) -> AppController {
     let mut controller = controller_with_scratch(name);
     assert!(matches!(
@@ -4729,7 +4716,7 @@ fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
     assert_eq!(current_row(&controller), Some(chain[1].clone()));
     let root_row = row_index(&controller, &chain[0]);
     controller.select_checkpoint_row(root_row);
-    enter_editor(&mut controller);
+    common::enter_editor(&mut controller);
     paint(&mut controller, 40);
     let painted = controller.edit_session().unwrap().indices().to_vec();
     assert!(controller.save_enabled());
@@ -4794,7 +4781,7 @@ fn save_is_enabled_only_with_something_to_write() {
 
     let mut opened = reopen(&path, "save_enabled_rule_reopened");
     assert!(!opened.save_enabled(), "an unmodified opened project");
-    enter_editor(&mut opened);
+    common::enter_editor(&mut opened);
     assert!(!opened.save_enabled(), "an open session with no stroke");
     paint(&mut opened, 20);
     assert!(opened.save_enabled(), "a modified live");
@@ -4863,7 +4850,7 @@ fn a_pending_delete_is_applied_by_the_project_save() {
     // A delete leaves the edit session open.
     let (path, chain) = saved_chain("pending_delete_session", &[20]);
     let mut controller = reopen(&path, "pending_delete_session_reopened");
-    enter_editor(&mut controller);
+    common::enter_editor(&mut controller);
     assert!(controller.queue_checkpoint_delete(&chain[1]));
     assert!(controller.save_active_project(|_| None));
     assert!(controller.edit_session().is_some());
@@ -4880,7 +4867,7 @@ fn a_pending_delete_is_applied_by_the_project_save() {
     // writes the entry under it.
     let (path, chain) = saved_chain("pending_delete_entry", &[20, 40]);
     let mut controller = reopen(&path, "pending_delete_entry_reopened");
-    enter_editor(&mut controller);
+    common::enter_editor(&mut controller);
     paint(&mut controller, 30);
     assert!(controller.snapshot_live(0));
     assert!(controller.queue_checkpoint_delete(&chain[1]));
@@ -4913,7 +4900,7 @@ fn a_pending_delete_is_applied_by_the_project_save() {
 fn edits_on_a_row_queued_for_delete_are_saved_under_it() {
     let (path, chain) = saved_chain("deleted_origin", &[20, 40]);
     let mut controller = reopen(&path, "deleted_origin_reopened");
-    enter_editor(&mut controller);
+    common::enter_editor(&mut controller);
     assert!(controller.queue_checkpoint_delete(&chain[2]));
     paint(&mut controller, 50);
     let painted = controller.edit_session().unwrap().indices().to_vec();
@@ -4939,7 +4926,7 @@ fn a_snapshot_during_a_fuse_holds_no_files() {
     let (path, chain) = saved_chain("snapshot_during_fuse", &[20]);
     let mut controller = reopen(&path, "snapshot_during_fuse_reopened");
     controller.set_align_algorithm("dummy-align");
-    enter_editor(&mut controller);
+    common::enter_editor(&mut controller);
     assert!(controller.queue_checkpoint_delete(&chain[1]));
 
     assert!(controller.start_fuse());
@@ -5033,7 +5020,7 @@ fn an_older_checkpoint_edits_through_its_own_registration() {
     controller.set_pane_geometry(LEFT, RIGHT);
     controller.select_checkpoint_row(row_index(&controller, &root));
     controller.fit();
-    enter_editor(&mut controller);
+    common::enter_editor(&mut controller);
     assert_eq!(map_rect(&controller).width, MAP_WIDTH, "the root's own map");
     controller.select_frame(1);
     let view = controller.selected_frame_view().unwrap();
@@ -5051,4 +5038,199 @@ fn an_older_checkpoint_edits_through_its_own_registration() {
         wrong.displayed(&controller) != wrong.expected(&indices(&controller)),
         "the check can tell the two registrations apart"
     );
+}
+
+/// Fuses `name`'s frames twice, then selects the older held row in
+/// Stacking: a fused row whose session is dropped and not reopened.
+fn fused_twice_without_session(controller: &mut AppController, name: &str) {
+    open_fused_tab(controller, name, 2);
+    assert!(controller.start_fuse());
+    settle_all(controller);
+    assert!(controller.set_mode(ShellMode::Stacking));
+    controller.select_checkpoint_row(row_index(controller, "held:0"));
+    assert!(
+        controller.edit_session().is_none(),
+        "{name}: no session yet"
+    );
+}
+
+/// How many times `events` holds an `EditorChanged`.
+fn editor_changes(events: &Mutex<Vec<ShellEvent>>) -> usize {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, ShellEvent::EditorChanged))
+        .count()
+}
+
+#[test]
+fn entering_the_editor_opens_its_session_off_thread() {
+    let name = "session_off_thread";
+    let mut controller = controller_with_scratch(name);
+    controller.set_resident_tile_size_for_test(16);
+    fused_twice_without_session(&mut controller, name);
+    let (_, zmap) = controller
+        .materialize_active_tab_planes()
+        .expect("a held fused row has planes");
+    let events = record_events(&mut controller);
+
+    // A plain fused row: the click switches, the settle installs.
+    assert!(controller.set_mode(ShellMode::Editor));
+    assert_eq!(controller.mode(), ShellMode::Editor);
+    assert_eq!(take_mode_changes(&events), vec![ShellMode::Editor]);
+    assert!(
+        controller.edit_session().is_none(),
+        "the session is not open until the settle"
+    );
+    common::settle_session(&mut controller);
+    let session = controller.edit_session().expect("the settle installs it");
+    assert_eq!(session.indices(), read_whole_zmap(&zmap).as_slice());
+    assert_eq!(session.op_count(), 0);
+
+    // Two op-bearing rows, the second built on the first, strokes either
+    // side of a 16 px tile edge.
+    paint(&mut controller, 14);
+    assert!(controller.save_checkpoint());
+    paint(&mut controller, 33);
+    assert!(controller.save_checkpoint());
+    let chained = controller.edit_session().unwrap().indices().to_vec();
+    assert_ne!(
+        chained,
+        read_whole_zmap(&zmap),
+        "the strokes changed the map"
+    );
+    assert!(controller.set_mode(ShellMode::Stacking));
+    controller.select_checkpoint_row(row_index(&controller, "held:0"));
+    assert!(controller.edit_session().is_none());
+    take_mode_changes(&events);
+
+    controller.select_checkpoint_row(row_index(&controller, "held:3"));
+    assert!(
+        controller.edit_session().is_none(),
+        "an op-bearing row opens off the selecting call too"
+    );
+    assert!(controller.set_mode(ShellMode::Editor));
+    assert_eq!(take_mode_changes(&events), vec![ShellMode::Editor]);
+    assert!(controller.edit_session().is_none());
+    common::settle_session(&mut controller);
+    let session = controller.edit_session().expect("the settle installs it");
+    assert_eq!(
+        session.indices(),
+        chained.as_slice(),
+        "the chain is applied"
+    );
+    assert_eq!(session.op_count(), 0, "the replay is rebased away");
+    assert!(
+        !controller.take_recomposited().is_empty(),
+        "the replay filled the resident tiles"
+    );
+}
+
+#[test]
+fn a_session_lands_only_on_its_own_tab_and_generation() {
+    // Closing the tab mid-open drops the result.
+    let name = "session_closed_tab";
+    let mut controller = controller_with_scratch(name);
+    fused_twice_without_session(&mut controller, name);
+    let events = record_events(&mut controller);
+    assert!(controller.set_mode(ShellMode::Editor));
+    controller.close_project(0);
+    common::settle_session(&mut controller);
+    assert!(controller.edit_session().is_none());
+    assert_eq!(editor_changes(&events), 0, "nothing was installed");
+
+    // Restoring another row mid-open drops the result; the replacement
+    // installs.
+    let name = "session_restored_row";
+    let mut controller = controller_with_scratch(name);
+    open_fused_tab(&mut controller, name, 2);
+    paint(&mut controller, 20);
+    assert!(controller.save_checkpoint());
+    let painted = controller.edit_session().unwrap().indices().to_vec();
+    assert!(controller.set_mode(ShellMode::Stacking));
+    controller.select_checkpoint_row(row_index(&controller, "held:0"));
+    let events = record_events(&mut controller);
+    assert!(controller.set_mode(ShellMode::Editor));
+    controller.select_checkpoint_row(row_index(&controller, "held:1"));
+    assert!(controller.edit_session().is_none());
+    common::settle_session(&mut controller);
+    assert_eq!(
+        controller
+            .edit_session()
+            .expect("the replacement lands")
+            .indices(),
+        painted.as_slice(),
+        "the row selected last owns the session"
+    );
+    assert_eq!(
+        editor_changes(&events),
+        1,
+        "the overtaken result is dropped"
+    );
+
+    // A tab switch mid-open leaves the new tab without a session; the first
+    // tab keeps its own.
+    let name = "session_switched_tab";
+    let mut controller = controller_with_scratch(name);
+    fused_twice_without_session(&mut controller, name);
+    open_mantis64_tab(&mut controller, &format!("{name}_unfused"), 2);
+    controller.select_project(0);
+    assert!(controller.set_mode(ShellMode::Editor));
+    controller.select_project(1);
+    common::settle_session(&mut controller);
+    assert!(
+        controller.edit_session().is_none(),
+        "the newly active tab got nothing"
+    );
+    controller.select_project(0);
+    assert!(
+        controller.edit_session().is_some(),
+        "the first tab kept its own"
+    );
+}
+
+#[test]
+fn a_failed_session_open_drops_back_to_stacking() {
+    let name = "session_open_fails";
+    let mut controller = controller_with_scratch(name);
+    fused_twice_without_session(&mut controller, name);
+    let (_, zmap) = controller
+        .materialize_active_tab_planes()
+        .expect("a held fused row has planes");
+    let len = fs::metadata(&zmap).unwrap().len();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&zmap)
+        .unwrap()
+        .set_len(len / 2)
+        .unwrap();
+    let events = record_events(&mut controller);
+
+    assert!(controller.set_mode(ShellMode::Editor));
+    common::settle_session(&mut controller);
+    assert_eq!(controller.mode(), ShellMode::Stacking);
+    assert!(controller.edit_session().is_none());
+    assert_eq!(
+        take_mode_changes(&events),
+        vec![ShellMode::Editor, ShellMode::Stacking]
+    );
+}
+
+#[test]
+fn a_save_settling_mid_open_restarts_the_session() {
+    let name = "session_save_mid_open";
+    let mut controller = controller_with_scratch(name);
+    fused_twice_without_session(&mut controller, name);
+    let events = record_events(&mut controller);
+    assert!(controller.set_mode(ShellMode::Editor));
+    save_to_proposed(&mut controller);
+
+    common::settle_session(&mut controller);
+    assert_eq!(controller.mode(), ShellMode::Editor);
+    assert!(
+        controller.edit_session().is_some(),
+        "the restarted open reads the saved row"
+    );
+    assert_eq!(editor_changes(&events), 1, "the overtaken open is dropped");
 }

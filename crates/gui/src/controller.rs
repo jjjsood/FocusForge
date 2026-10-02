@@ -463,10 +463,15 @@ struct ProjectTab {
     /// The request behind this tab's own last run, kept for `Retry` --
     /// `None` until a run is started on this tab.
     request: Option<job::JobRequest>,
-    /// This tab's own editor session, opened over its fused Z-Map on first
-    /// entry into editor mode -- `None` until then, and cleared whenever a
-    /// newer checkpoint replaces the planes it was opened over.
+    /// This tab's own editor session, opened on a worker over the selected
+    /// row's Z-Map and stroke chain when editor mode is entered or an
+    /// op-bearing row is selected -- `None` until it lands, and cleared
+    /// whenever the selected row or planes are replaced (a restore, a new
+    /// checkpoint).
     edit: Option<job::EditState>,
+    /// Bumped whenever the session this tab holds, or is opening, is dropped:
+    /// an opening session lands only while its generation is still this one.
+    session_generation: u64,
     /// This tab's own failed, cancelled or sources-missing run, if its most
     /// recent attempt did not succeed -- `None` once a later success clears
     /// it. Keyed by tab rather than by path so it survives an Unsaved ->
@@ -534,6 +539,33 @@ struct ThumbnailSlot {
 }
 
 type ParkedPicture = (u64, u64, Option<overlay::Thumbnail>);
+
+/// The editor sessions being opened and where their workers park the
+/// results: tab id, the session generation each was started for, and the
+/// opened session or why it failed. Two tabs may open at once.
+#[derive(Default)]
+struct EditSlot {
+    in_flight: Vec<(u64, u64)>,
+    /// Set when a worker starts, until [`AppController::take_session_started`].
+    started: bool,
+    parked: Arc<Mutex<Vec<ParkedSession>>>,
+}
+
+type ParkedSession = (u64, u64, Result<job::EditState, String>);
+
+impl EditSlot {
+    fn opening(&self, tab_id: u64, generation: u64) -> bool {
+        self.in_flight.contains(&(tab_id, generation))
+    }
+}
+
+/// Whether the active tab has an editor session, is opening one, or cannot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionOpen {
+    Open,
+    Opening,
+    Unavailable,
+}
 
 /// The export modal's own state: which tab it names, the context/what
 /// lines already composed for its row (per-kind prose, not a separate
@@ -688,6 +720,7 @@ impl ProjectTab {
             run: job::RunState::Idle,
             request: None,
             edit: None,
+            session_generation: 0,
             failure: None,
         }
     }
@@ -885,6 +918,14 @@ impl ProjectTab {
             Some(RowBase::Saved(id)) if on_entry => Some(id),
             _ => Some(key.to_string()),
         }
+    }
+
+    /// Drops the installed session, if any, and starts a new session
+    /// generation so one still opening for the old state is dropped when it
+    /// lands. Returns whether an installed session was dropped.
+    fn drop_session(&mut self) -> bool {
+        self.session_generation += 1;
+        self.edit.take().is_some()
     }
 
     /// Whether the selected row is an in-memory entry holding ops.
@@ -1201,6 +1242,7 @@ struct ShellState {
     load: LoadSlot,
     render: RenderSlot,
     thumbnails: ThumbnailSlot,
+    edits: EditSlot,
     /// The open export modal, if any -- [`AppController::checkpoint_export_requested`].
     export_dialog: Option<ExportDialog>,
     /// The last confirmed export format and settings, which the next modal
@@ -1637,12 +1679,16 @@ impl AppController {
     }
 
     /// Returns `false` and emits nothing for [`ShellMode::Editor`] unless
-    /// [`Self::editor_enabled`] is `true`. Entering editor mode opens the
-    /// active tab's own edit session on first entry -- a failure to
-    /// materialize or open its Z-Map also returns `false` and emits nothing,
-    /// leaving the mode unchanged.
+    /// [`Self::editor_enabled`] is `true` and the active tab's Z-Map has
+    /// planes to open over. Entering editor mode switches at once and starts
+    /// opening the session on a worker when the tab has none, as after a
+    /// restore dropped it: strokes do nothing until
+    /// [`Self::settle_edit_session`] installs it, and a session that fails to
+    /// open drops the window back to stacking with one more `ModeChanged`.
     pub fn set_mode(&mut self, mode: ShellMode) -> bool {
-        if mode == ShellMode::Editor && !(self.editor_enabled() && self.ensure_edit_session()) {
+        if mode == ShellMode::Editor
+            && !(self.editor_enabled() && self.ensure_edit_session() != SessionOpen::Unavailable)
+        {
             return false;
         }
         if mode != ShellMode::Editor {
@@ -1653,61 +1699,117 @@ impl AppController {
         true
     }
 
-    /// Opens the active tab's edit session over its whole Z-Map and its own
-    /// frames unless the tab already holds one. `false` with no active tab,
-    /// or when its Z-Map or its frames fail to materialize or open.
-    fn ensure_edit_session(&mut self) -> bool {
-        if self.state.active().is_some_and(|tab| tab.edit.is_some()) {
-            return true;
+    /// Opens the active tab's edit session over its row's Z-Map and its own
+    /// frames on a worker unless the tab already holds or is opening one,
+    /// replaying an op-bearing row's stroke chain there. `Opening` also
+    /// while the row's planes still render, in which case the render's
+    /// settle asks again; `Unavailable` with no active tab, no fused row or
+    /// no planes to open over.
+    fn ensure_edit_session(&mut self) -> SessionOpen {
+        let Some(tab) = self.state.active() else {
+            return SessionOpen::Unavailable;
+        };
+        if tab.edit.is_some() {
+            return SessionOpen::Open;
         }
-        let Some((_, zmap)) = self.materialize_active_tab_planes() else {
-            return false;
+        if self.state.edits.opening(tab.id, tab.session_generation) {
+            return SessionOpen::Opening;
+        }
+        let zmap = match self.active_tab_planes() {
+            TabPlanes::Ready(_, zmap) => zmap,
+            TabPlanes::Pending => return SessionOpen::Opening,
+            TabPlanes::None => return SessionOpen::Unavailable,
         };
         let Some(tab) = self.state.active() else {
-            return false;
+            return SessionOpen::Unavailable;
         };
-        let frames = tab.frames.clone();
         // `can_edit` guarantees `tab.frames` equals the fused sources, in
         // the same order, by the time editor mode is entered -- so indexing
         // `registration`'s per-frame transforms by position here matches.
         let Some((_, registration)) = tab.fused() else {
-            return false;
+            return SessionOpen::Unavailable;
         };
-        let tile_size = self
-            .resident_tile_size_for_test
-            .unwrap_or(job::RESIDENT_TILE_SIZE);
-        let Ok(mut edit) =
-            job::open_edit_session(&zmap, &frames, registration, tile_size, job::host_budget())
-        else {
-            return false;
-        };
-        let Some(tab) = self.state.active_mut() else {
-            return false;
-        };
-        if let Some(chain) = tab
+        let frames = tab.frames.clone();
+        let chain = tab
             .selected_checkpoint
             .as_deref()
             .and_then(checkpoints::held_index)
             .and_then(|index| checkpoints::stroke_chain(&tab.held, index))
-        {
-            for op in chain {
-                match edit.session.append(op) {
-                    Ok(Some(region)) => {
-                        if let Err(err) = edit.recomposite(region) {
-                            tracing::error!(error = %err, "restored stroke recomposite failed");
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::error!(error = %err, "restored stroke could not be applied");
-                        break;
+            .unwrap_or_default();
+        let (tab_id, generation) = (tab.id, tab.session_generation);
+        let tile_size = self
+            .resident_tile_size_for_test
+            .unwrap_or(job::RESIDENT_TILE_SIZE);
+        let slot = &mut self.state.edits;
+        slot.in_flight.push((tab_id, generation));
+        slot.started = true;
+        let parked = Arc::clone(&slot.parked);
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| {
+                job::open_edit_session(
+                    &zmap,
+                    &frames,
+                    registration,
+                    tile_size,
+                    job::host_budget(),
+                    chain,
+                )
+            })
+            .map_err(|_| "the session worker panicked".to_string())
+            .and_then(|opened| opened.map_err(|err| err.to_string()));
+            parked
+                .lock()
+                .expect("no thread panicked while holding the parked sessions")
+                .push((tab_id, generation, result));
+        });
+        SessionOpen::Opening
+    }
+
+    /// Installs the parked sessions without waiting on a worker. A session
+    /// lands, with `EditorChanged`, only on a tab that still exists at the
+    /// generation it was started for; a failed open is logged and, in the
+    /// active tab in editor mode, drops the window to stacking. Returns
+    /// `true` once no session is being opened -- the poll's cue to stop.
+    pub fn settle_edit_session(&mut self) -> bool {
+        let parked = std::mem::take(
+            &mut *self
+                .state
+                .edits
+                .parked
+                .lock()
+                .expect("no thread panicked while holding the parked sessions"),
+        );
+        for (tab_id, generation, result) in parked {
+            let started = (tab_id, generation);
+            self.state.edits.in_flight.retain(|open| *open != started);
+            let Some(index) = self.tab_index(tab_id) else {
+                continue;
+            };
+            let tab = &mut self.state.projects[index];
+            if tab.session_generation != generation {
+                continue;
+            }
+            self.state.canvas_dirty = true;
+            match result {
+                Ok(edit) => {
+                    tab.edit = Some(edit);
+                    self.emit(ShellEvent::EditorChanged);
+                }
+                Err(reason) => {
+                    tracing::error!(error = %reason, "the editor session could not be opened");
+                    if self.state.active == Some(index) && self.state.mode == ShellMode::Editor {
+                        self.drop_to_stacking();
                     }
                 }
             }
-            edit.session.rebase();
         }
-        tab.edit = Some(edit);
-        true
+        self.state.edits.in_flight.is_empty()
+    }
+
+    /// Whether an editor session started opening since the last call -- the
+    /// bridge's cue to start polling [`Self::settle_edit_session`].
+    pub fn take_session_started(&mut self) -> bool {
+        std::mem::take(&mut self.state.edits.started)
     }
 
     /// Discards the active tab's own in-progress stroke, if any: restores
@@ -1733,7 +1835,8 @@ impl AppController {
         self.state.active().is_some_and(ProjectTab::can_edit)
     }
 
-    /// The active tab's own edit session, once editor mode has opened one.
+    /// The active tab's own edit session, once its worker has opened and
+    /// [`Self::settle_edit_session`] installed it.
     pub fn edit_session(&self) -> Option<&job::EditSession> {
         Some(&self.state.active()?.edit.as_ref()?.session)
     }
@@ -1799,20 +1902,24 @@ impl AppController {
     /// In editor mode, gives a newly active editable tab its own edit
     /// session; drops the window back to stacking, with exactly one
     /// `ModeChanged(Stacking)`, when the active tab no longer satisfies
-    /// [`Self::editor_enabled`] or its session cannot open -- a switch away
-    /// from a fused tab, that tab's own run starting or being promoted, or a
-    /// confirmed frame-set change. A tab whose current row still renders
-    /// keeps editor mode; its session opens once the render settles.
+    /// [`Self::editor_enabled`] or has no planes its session could open over
+    /// -- a switch away from a fused tab, that tab's own run starting or
+    /// being promoted, a confirmed frame-set change or a refused render. A
+    /// tab whose current row still renders keeps editor mode; its session
+    /// opens once the render settles.
     fn leave_editor_if_unfit(&mut self) {
         if self.state.mode == ShellMode::Editor
-            && !(self.editor_enabled()
-                && (self.ensure_edit_session()
-                    || matches!(self.active_tab_planes(), TabPlanes::Pending)))
+            && !(self.editor_enabled() && self.ensure_edit_session() != SessionOpen::Unavailable)
         {
-            self.discard_live_stroke();
-            self.state.mode = ShellMode::Stacking;
-            self.emit(ShellEvent::ModeChanged(ShellMode::Stacking));
+            self.drop_to_stacking();
         }
+    }
+
+    /// Leaves editor mode for stacking with one `ModeChanged(Stacking)`.
+    fn drop_to_stacking(&mut self) {
+        self.discard_live_stroke();
+        self.state.mode = ShellMode::Stacking;
+        self.emit(ShellEvent::ModeChanged(ShellMode::Stacking));
     }
 
     /// The brush's source index: the active tab's `selected` position, or
@@ -1912,7 +2019,7 @@ impl AppController {
             return;
         };
         let unchanged = tab.selected_checkpoint.as_deref() == Some(key.as_str());
-        let dropped_session = tab.edit.take().is_some();
+        let dropped_session = tab.drop_session();
         tab.selected_checkpoint = Some(key);
         tab.free_unneeded_held();
         let on_ops_row = tab.on_ops_row();
@@ -1961,8 +2068,9 @@ impl AppController {
             });
         }
         self.state.canvas_dirty = true;
-        let on_ops_row = self.state.active().is_some_and(ProjectTab::on_ops_row);
-        if self.state.mode == ShellMode::Editor || on_ops_row {
+        if self.state.mode == ShellMode::Editor {
+            self.leave_editor_if_unfit();
+        } else if self.state.active().is_some_and(ProjectTab::on_ops_row) {
             self.ensure_edit_session();
         }
         true
@@ -6444,7 +6552,7 @@ impl AppController {
         tab.selected = images::first_included(&tab.excluded);
         tab.frame_sort = None;
         tab.read_missing_meta();
-        tab.edit = None;
+        tab.drop_session();
         tab.failure = None;
         let planes = (held.composite.clone(), held.zmap.clone());
         tab.selected_checkpoint = Some(checkpoints::held_key(tab.held.len()));
@@ -7106,7 +7214,15 @@ impl AppController {
             if tab.edit.is_none() {
                 self.state.canvas_dirty = true;
             }
+            // A session still opening read held files this save removed.
+            let reopen = self.state.edits.opening(tab.id, tab.session_generation);
+            if reopen {
+                tab.session_generation += 1;
+            }
             self.emit(ShellEvent::ProjectsChanged);
+            if reopen && self.state.active == Some(index) {
+                self.leave_editor_if_unfit();
+            }
         }
         Some(self.advance_saves())
     }
@@ -7131,10 +7247,11 @@ impl AppController {
     /// loaded). `Keep` when the owner already matches the active tab and
     /// nothing changed underneath it since; otherwise `Load` at once when
     /// the active row's cached planes are fresh. A saved row not cached yet
-    /// renders on the `RenderSlot` worker meanwhile: `Keep` over that tab's
-    /// previous image, or `Clear` when it has none (no tab active, `+`
-    /// selected, nothing fused yet, or its current row refused). The feed
-    /// never writes planes.
+    /// renders on the `RenderSlot` worker meanwhile, and an op-bearing row
+    /// waits for its session the same way: `Keep` over that tab's previous
+    /// image, or `Clear` when it has none (no tab active, `+` selected,
+    /// nothing fused yet, or its current row refused). The feed never writes
+    /// planes.
     pub fn canvas_feed(&mut self, loaded: Option<usize>) -> crate::canvas::CanvasFeed {
         let _scope = measurement_scope("gui_canvas_feed");
         if loaded == self.state.active && !self.state.canvas_dirty {
@@ -7144,7 +7261,17 @@ impl AppController {
         let Some(tab) = self.state.active else {
             return crate::canvas::CanvasFeed::Clear;
         };
-        match self.active_tab_planes() {
+        // An op-bearing row's pane waits for its session, so the base
+        // pictures never show under the edited row's label.
+        let opening_ops_row = self.state.active().is_some_and(|tab| {
+            tab.on_ops_row() && self.state.edits.opening(tab.id, tab.session_generation)
+        });
+        let planes = if opening_ops_row {
+            TabPlanes::Pending
+        } else {
+            self.active_tab_planes()
+        };
+        match planes {
             TabPlanes::Ready(composite, zmap) => crate::canvas::CanvasFeed::Load {
                 tab,
                 composite,

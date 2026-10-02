@@ -440,12 +440,14 @@ fn loaded_composite(controller: &mut AppController, loaded: Option<usize>) -> Pa
             }
             _ => {
                 controller.settle_checkpoint_render();
+                controller.settle_edit_session();
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
     }
 }
 
+/// Waits out the render, then the session it may start opening.
 fn wait_for_render(controller: &mut AppController) {
     let start = Instant::now();
     while !controller.settle_checkpoint_render() {
@@ -455,6 +457,7 @@ fn wait_for_render(controller: &mut AppController) {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+    common::settle_session(controller);
 }
 
 fn scratch_controller(name: &str) -> AppController {
@@ -554,11 +557,12 @@ fn current_row(controller: &AppController) -> Option<String> {
 }
 
 /// Selects row `id`, then waits out the render an editor-mode restore of a
-/// saved row starts before its session can open.
+/// saved row starts and the session that opens after it.
 fn click(controller: &mut AppController, id: &str) {
     let row = row_index(controller, id);
     controller.select_checkpoint_row(row);
     common::settle_render(controller);
+    common::settle_session(controller);
 }
 
 fn saved_ids(project: &Path) -> Vec<String> {
@@ -1124,6 +1128,7 @@ fn clicking_the_current_row_with_ops_asks_to_restore_it() {
         format!("Restoring {} · {}", target.algorithm, target.time_text)
     );
     controller.close_guard_confirmed();
+    common::settle_session(&mut controller);
     assert_eq!(live_ops(&controller), 0);
     assert_eq!(live_indices(&controller), root_map);
     assert_eq!(
@@ -1135,6 +1140,7 @@ fn clicking_the_current_row_with_ops_asks_to_restore_it() {
     paint(&mut controller, stroke(1, 1, 0));
     click(&mut controller, &project.root);
     assert!(!controller.close_guard_secondary_pressed(|_| None));
+    common::settle_session(&mut controller);
     assert_eq!(controller.checkpoints_panel().row_count, 3);
     assert_eq!(
         current_row(&controller).as_deref(),
@@ -1193,6 +1199,34 @@ fn switching_to_a_rendering_tab_keeps_editor_mode() {
     wait_for_render(&mut controller);
     assert_eq!(controller.mode(), ShellMode::Editor);
     assert!(controller.edit_session().is_some());
+}
+
+/// An Editor entry waiting on a render the sources then refuse drops back to
+/// Stacking with one more `ModeChanged`.
+#[test]
+fn a_refused_render_under_a_pending_editor_entry_drops_to_stacking() {
+    let project = build_edited("checkpoint_panel_refused_entry");
+    let mut controller = scratch_controller("checkpoint_panel_refused_entry");
+    common::open_and_settle(&mut controller, std::slice::from_ref(&project.project));
+    click(&mut controller, &project.root);
+    write_rgb(&project.sources[1], &frame_samples(7));
+    controller.select_checkpoint_row(row_index(&controller, &project.edited));
+    let events = record_events(&mut controller);
+
+    assert!(controller.set_mode(ShellMode::Editor));
+    wait_for_render(&mut controller);
+    assert_eq!(controller.mode(), ShellMode::Stacking);
+    assert!(controller.edit_session().is_none());
+    let modes: Vec<ShellMode> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            ShellEvent::ModeChanged(mode) => Some(*mode),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(modes, vec![ShellMode::Editor, ShellMode::Stacking]);
 }
 
 // ---------------------------------------------------------------------

@@ -166,9 +166,11 @@ pub fn wait_for_settle(
     let start = Instant::now();
     loop {
         if let Some(planes) = controller.settle_job() {
+            settle_session(controller);
             return Some(planes);
         }
         if !controller.work_pending() {
+            settle_session(controller);
             return None;
         }
         assert!(
@@ -417,6 +419,19 @@ pub fn settle_render(controller: &mut AppController) {
     }
 }
 
+/// Polls `settle_edit_session` until no editor session is being opened.
+#[allow(dead_code)]
+pub fn settle_session(controller: &mut AppController) {
+    let start = Instant::now();
+    while !controller.settle_edit_session() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the editor session did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Polls `settle_thumbnails` until every picture decode has been applied.
 #[allow(dead_code)]
 pub fn settle_thumbnails(controller: &mut AppController) {
@@ -430,16 +445,27 @@ pub fn settle_thumbnails(controller: &mut AppController) {
     }
 }
 
-/// `set_mode(Editor)`, waiting out the render an op-bearing row needs first.
+/// `set_mode(Editor)`, then waits out the render an op-bearing row needs and
+/// the session's open.
 #[allow(dead_code)]
 pub fn enter_editor(controller: &mut AppController) {
+    assert!(
+        controller.set_mode(ShellMode::Editor),
+        "the editor did not open"
+    );
     let start = Instant::now();
-    while !controller.set_mode(ShellMode::Editor) {
+    while controller.edit_session().is_none() {
+        assert_eq!(
+            controller.mode(),
+            ShellMode::Editor,
+            "the session failed to open"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(60),
-            "the editor did not open"
+            "the editor session did not open"
         );
         controller.settle_checkpoint_render();
+        controller.settle_edit_session();
         std::thread::sleep(Duration::from_millis(5));
     }
 }

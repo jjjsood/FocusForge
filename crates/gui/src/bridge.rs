@@ -403,7 +403,7 @@ pub fn repaint(
             batch.publication,
         )
     });
-    let (feed, render_started, message_lines) = {
+    let (feed, render_started, session_started, message_lines) = {
         let loaded = canvas.borrow().tab();
         let mut controller = controller.lock().unwrap();
         controller.fit_if_unfitted();
@@ -411,11 +411,15 @@ pub fn repaint(
         (
             feed,
             controller.take_render_started(),
+            controller.take_session_started(),
             controller.composite_message_lines(),
         )
     };
     if render_started {
         poll_checkpoint_render(app.as_weak(), controller.clone(), canvas.clone());
+    }
+    if session_started {
+        poll_edit_session(app.as_weak(), controller.clone(), canvas.clone());
     }
     if controller.lock().unwrap().take_thumbnails_started() {
         poll_thumbnails(app.as_weak(), controller.clone());
@@ -512,6 +516,26 @@ fn poll_checkpoint_render(
             repaint(&app, &controller, &canvas);
         } else {
             poll_checkpoint_render(app_weak, controller, canvas);
+        }
+    });
+}
+
+/// Polls [`AppController::settle_edit_session`] every [`job::POLL`] until no
+/// editor session is being opened, then repaints -- the worker cannot reach
+/// the canvas, and an installed session changes what the panes show.
+fn poll_edit_session(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+) {
+    slint::Timer::single_shot(job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().settle_edit_session() {
+            repaint(&app, &controller, &canvas);
+        } else {
+            poll_edit_session(app_weak, controller, canvas);
         }
     });
 }
@@ -1845,6 +1869,8 @@ pub fn install(
     });
     app.on_mode_selected({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move |mode| {
             record_surface_input(InputSurface::Other);
             let mode = if mode.as_str() == "editor" {
@@ -1853,6 +1879,10 @@ pub fn install(
                 ShellMode::Stacking
             };
             controller.lock().unwrap().set_mode(mode);
+            // Arms the poll of a session or render the switch started.
+            if let Some(app) = app_weak.upgrade() {
+                repaint(&app, &controller, &canvas);
+            }
         }
     });
     app.on_dock_tab_selected({

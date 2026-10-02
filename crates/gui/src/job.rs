@@ -968,13 +968,18 @@ impl EditState {
 /// map: an [`EditSession`] seeded from every pixel, `frames` opened through
 /// [`open_frame_set`] as the frame set a stroke recomposites against
 /// (warped by `registration` at recomposite time), and an empty resident
-/// display cache gridded at `tile_size` px.
+/// display cache gridded at `tile_size` px. `chain` -- the ops an op-bearing
+/// row stacks over its fused base, oldest first -- is then applied and
+/// recomposited and the session rebased onto it, so it opens with no ops of
+/// its own. A chain op that cannot be applied ends the replay; a region that
+/// cannot be recomposited is skipped.
 pub fn open_edit_session(
     zmap: &Path,
     frames: &[PathBuf],
     registration: Registration,
     tile_size: u32,
     budget: HostBudget,
+    chain: Vec<Op>,
 ) -> Result<EditState, EditSessionError> {
     let reader = ZMapReader::open(zmap)?;
     let info = reader.info();
@@ -996,13 +1001,29 @@ pub fn open_edit_session(
         info.height(),
         samples_per_pixel,
     );
-    Ok(EditState {
+    let mut edit = EditState {
         session,
         sources,
         registration,
         tiles,
         stroke: None,
-    })
+    };
+    for op in chain {
+        match edit.session.append(op) {
+            Ok(Some(region)) => {
+                if let Err(err) = edit.recomposite(region) {
+                    tracing::error!(error = %err, "restored stroke recomposite failed");
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(error = %err, "restored stroke could not be applied");
+                break;
+            }
+        }
+    }
+    edit.session.rebase();
+    Ok(edit)
 }
 
 /// A written project, opened, with the id written per kept entry.
