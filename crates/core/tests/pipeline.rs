@@ -1092,16 +1092,103 @@ fn held_run_observed(
     else {
         panic!("expected a completed run");
     };
+    Ok(held_run_of(report))
+}
+
+fn held_run_of(report: Box<FuseReport>) -> HeldRun {
     let FuseProduct::Held(held) = &report.product else {
         panic!("a hold request must report a held checkpoint");
     };
     let composite = std::fs::read(&held.composite).expect("composite must be readable");
     let zmap = std::fs::read(&held.zmap).expect("z-map must be readable");
-    Ok(HeldRun {
+    HeldRun {
         report,
         composite,
         zmap,
-    })
+    }
+}
+
+/// Cancels the run on the first progress snapshot that shows a fuse unit done.
+struct CancelAfterFirstUnit(Arc<JobControl>);
+impl StageObserver for CancelAfterFirstUnit {
+    fn tick(&self, progress: &JobProgress) {
+        if progress.stage == JobStage::Fuse && progress.units_done > 0 {
+            self.0.cancel();
+        }
+    }
+}
+
+#[test]
+fn cancel_mid_fusion_then_resume_matches_an_uninterrupted_run() {
+    for method in ["laplacian", "weighted-average", "depth-map"] {
+        let request = |label: &str| {
+            let label = format!("{label}_{method}");
+            // Five levels need a 448 px tile; three fit the 256 px tile that plans several.
+            let mut explicit = ParamValues::new();
+            if method == "laplacian" {
+                explicit.insert("levels".to_string(), ParamValue::Int(3));
+            }
+            let mut request = base_request(&label, mantis_frames(3), explicit);
+            request.algorithm = registry::find_stack(method).expect("method must be registered");
+            request.output = FuseOutput::Hold(scratch(&format!("{label}_hold")));
+            request.tile_size = Some(256);
+            // One tile in flight, so units finish one at a time and the cancel lands before the last.
+            request.max_host_memory = Some(1);
+            request.poll = Duration::from_millis(1);
+            request
+        };
+        let whole = request("uninterrupted");
+        let FuseOutcome::Completed(report) =
+            focusforge_core::pipeline::run(&whole, &NoopObserver, JobControl::new(), None)
+                .unwrap_or_else(|err| panic!("{method}: the uninterrupted run failed: {err}"))
+        else {
+            panic!("{method}: the uninterrupted run must complete");
+        };
+        let whole = held_run_of(report);
+        assert!(
+            whole.report.tiles > 2,
+            "{method}: {} tiles",
+            whole.report.tiles
+        );
+
+        let mut interrupted = request("interrupted");
+        let control = JobControl::new();
+        let outcome = focusforge_core::pipeline::run(
+            &interrupted,
+            &CancelAfterFirstUnit(Arc::clone(&control)),
+            control,
+            None,
+        )
+        .unwrap_or_else(|err| panic!("{method}: a cancel must not take the error path: {err}"));
+        let FuseOutcome::Cancelled {
+            units_done,
+            unit_total,
+        } = outcome
+        else {
+            panic!("{method}: the cancelled run must end as cancelled");
+        };
+        assert!(
+            0 < units_done && units_done < unit_total,
+            "{method}: {units_done} of {unit_total} units done at the cancel"
+        );
+
+        interrupted.resume = true;
+        let FuseOutcome::Completed(report) =
+            focusforge_core::pipeline::run(&interrupted, &NoopObserver, JobControl::new(), None)
+                .unwrap_or_else(|err| panic!("{method}: the resumed run failed: {err}"))
+        else {
+            panic!("{method}: the resumed run must complete");
+        };
+        let resumed = held_run_of(report);
+        assert!(
+            resumed.composite == whole.composite,
+            "{method}: the resumed composite must equal the uninterrupted one"
+        );
+        assert!(
+            resumed.zmap == whole.zmap,
+            "{method}: the resumed Z-Map must equal the uninterrupted one"
+        );
+    }
 }
 
 #[test]

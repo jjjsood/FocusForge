@@ -4,7 +4,8 @@
 Subcommands (run from the repository root, workspace built):
 
     cases    build synthetic/real cases, run the three baselines, score them
-             (--equalize off|on|both adds per-frame brightness equalization before fusion)
+             (--equalize off|on|both|product adds per-frame brightness equalization before fusion;
+             --product-coverage, --stack-set KEY=VAL)
     fuse     fuse one frame directory with the guided-filter prototype
     score    score a composite against a case's reference
     reach    measure the prototype's filter support with an impulse
@@ -45,6 +46,8 @@ BREAKS = ["uniform-weights", "ignore-mask", "per-channel-guide"]
 EQ_BREAKS = ["wrong-reference", "ignore-mask", "unbounded-gain"]
 EQ_BAND, EQ_BOUND, EQ_MIN_SAMPLES = (0.05, 0.95), (0.8, 1.25), 1000
 EPS_BASE, EPS_DET = 0.3, 1e-6
+GLINT_RING = (2, 8)  # annulus of the glint metrics, px outside the disc edge
+GLINT_R, GLINT_DEPTH, GLINT_DEPTH_R = 3, 3.0, 14
 FULL = 65535.0
 
 
@@ -74,6 +77,17 @@ def band_mask(shape, rect, r=8):
     return m
 
 
+def glint_masks(shape, discs):
+    """Union of the disc cores and of the annuli `GLINT_RING` px outside them; a disc is (cy, cx, r)."""
+    y, x = np.mgrid[0 : shape[0], 0 : shape[1]]
+    core, ring = np.zeros(shape, bool), np.zeros(shape, bool)
+    for cy, cx, r in discs:
+        d2 = (y - cy) ** 2 + (x - cx) ** 2
+        core |= d2 <= r * r
+        ring |= (d2 >= (r + GLINT_RING[0]) ** 2) & (d2 <= (r + GLINT_RING[1]) ** 2)
+    return core, ring
+
+
 def border_pull(comp, src):
     """Mean shortfall below the darkest valid source, over pixels with valid and invalid sources."""
     lo = np.full(comp.shape[:2], np.inf)
@@ -87,7 +101,11 @@ def border_pull(comp, src):
 
 
 def metrics(comp, ref, meta, src=None):
-    """Every metric the case's regions define, over pixels with at least one valid source."""
+    """Every metric the case's regions define, over pixels with at least one valid source.
+
+    `glint_core` is the composite's mean luma over the glint discs divided by the truth's (1 keeps
+    them); `glint_ring` is the luma RMS against the truth in the annuli around them.
+    """
     c, r = comp.astype(np.float64), ref.astype(np.float64)
     valid = np.ones(c.shape[:2], bool)
     if src is not None and src.has_masks:
@@ -116,6 +134,10 @@ def metrics(comp, ref, meta, src=None):
         m["chroma_err"] = float(np.abs(c / Lc[..., None] - r / Lr[..., None])[ok].mean())
     if meta.get("hairs"):
         m["hair_ret"] = float((hair_contrast(Lc, meta["hairs"]) / hair_contrast(Lr, meta["hairs"])).mean())
+    if meta.get("glints"):
+        core, ring = (k & valid for k in glint_masks(valid.shape, meta["glints"]))
+        m["glint_core"] = float(Lc[core].mean() / Lr[core].mean())
+        m["glint_ring"] = float(np.sqrt(((Lc - Lr)[ring] ** 2).mean()))
     if src is not None and src.has_masks:
         m["border_pull"] = border_pull(comp, src)
     return m
@@ -371,9 +393,12 @@ def fuse_tiled(src, tile, margin, scale=1.0, brk=None):
 # Thresholds sit between the honest value and the value of the variant that must trip
 # them, measured at SELF_SCALE on the stacks below.
 SELF_SCALE = 0.03
-SELF = dict(ssim_min=0.98, hair_min=0.9, chroma_max=0.0105, pull_max=100.0)
+SELF = dict(ssim_min=0.98, hair_min=0.9, chroma_max=0.0105, pull_max=100.0, glint_min=0.9, ring_max=800.0)
 SELF_HAIRS = [("h", (24, 25), (18, 20), (28, 30), (22, 30)), ("h", (24, 25), (18, 20), (28, 30), (36, 42)),
               ("v", (32, 34), (26, 28), (38, 40), (8, 18)), ("v", (32, 34), (26, 28), (38, 40), (28, 38))]
+
+
+SELF_GLINTS = [(12, 27, 2), (36, 27, 2)]
 
 
 def tiny_stack(kind):
@@ -381,6 +406,7 @@ def tiny_stack(kind):
 
     `plain`: noise-free, for the blur and invalid-source detectors. `tint`: a flat
     noisy third and per-frame gain/tint, where winners can disagree between channels.
+    `glint`: `plain` with two saturated discs at the depth of the middle frame.
     """
     h, w, n = 48, 64, 3
     rng = np.random.default_rng(5)
@@ -390,6 +416,8 @@ def tiny_stack(kind):
         src[:, 43:] = np.array([28000, 30000, 32000])
     src[24, 4:60] -= 12000
     src[6:42, 32:34] -= 12000
+    if kind == "glint":
+        src[glint_masks((h, w), SELF_GLINTS)[0]] = 65535
     depth = np.where(np.arange(w) < 21, 0, np.where(np.arange(w) < 43, 1, 2))[None, :].repeat(h, 0)
     bank = {s: ss.blur(src, s) for s in (0.0, 1.5, 3.0)}
     gain, noise = (np.array([1.15, 0.85, 1.0]), 100.0) if kind == "tint" else (np.ones(n), 0.0)
@@ -406,7 +434,7 @@ def tiny_stack(kind):
     frames[1, :, 0:6] = 0
     masks[1, :, 0:6] = False
     ref = np.clip(np.rint(src), 0, 65535).astype(np.uint16)
-    return ArraySource(frames, masks), ref, dict(hairs=SELF_HAIRS)
+    return ArraySource(frames, masks), ref, dict(hairs=SELF_HAIRS, glints=SELF_GLINTS if kind == "glint" else None)
 
 
 # Correction factors that bring each frame of `eq_stack` to the reference frame (index 2).
@@ -469,18 +497,40 @@ def self_check_level():
     return ok
 
 
+def self_check_commands():
+    """Baselines run on registered input unless asked; `--set` pairs are forwarded; coverage masks follow the transforms; every case has an in-frame crop."""
+    base = stack_cmd("d", "laplacian", "448", "o")
+    fwd = stack_cmd("d", "laplacian", "448", "o", sets=["levels=3", "equalize=true"])
+    cov = stack_cmd("raw", "depth-map", "1024", "o", align=True)
+    shift = [dict(transform=dict(m=[[1, 0, 10], [0, 1, 0], [0, 0, 1]]))]
+    ident = [dict(transform=dict(m=[[1, 0, 0], [0, 1, 0], [0, 0, 1]]))]
+    mk = product_masks(shift + ident, 48, 64)
+    checks = dict(
+        registered="--no-align" in base and "--set" not in base and "--no-gpu" in base,
+        forwarded=[fwd[i + 1] for i, c in enumerate(fwd) if c == "--set"] == ["levels=3", "equalize=true"],
+        coverage="--no-align" not in cov and "pyramidal-ecc" in cov and "--no-crop" in cov and "--no-gpu" in cov,
+        masks=bool(mk[1].all()) and int((~mk[0]).sum()) == 10 * 48 and bool(mk[0][:, :54].all()),
+        crops=all(0 <= y0 < y1 <= 512 and 0 <= x0 < x1 <= 512 for y0, y1, x0, x1 in map(crop_rect, [*CASES, "align-border"])))
+    for k, v in checks.items():
+        print(f"cmd   {k:18} {'ok  ' if v else 'FAIL'}")
+    return all(checks.values())
+
+
 def self_check():
     """Every detector must stay silent on the honest prototype and fire on its broken variant."""
     fires = lambda m: {  # noqa: E731
         k for k, v in dict(
             blur_ssim=m["ssim"] < SELF["ssim_min"], blur_hair=m["hair_ret"] < SELF["hair_min"],
-            chroma=m["chroma_err"] > SELF["chroma_max"], pull=m["border_pull"] > SELF["pull_max"]).items() if v}
+            chroma=m["chroma_err"] > SELF["chroma_max"], pull=m["border_pull"] > SELF["pull_max"],
+            glint_core=m.get("glint_core", 1.0) < SELF["glint_min"], glint_ring=m.get("glint_ring", 0.0) > SELF["ring_max"]).items() if v}
     # (stack kind, variant, detectors that count, detectors that must fire; the honest run fires none)
     plan = [("plain", None, {"blur_ssim", "blur_hair", "pull"}, set()),
             ("plain", "uniform-weights", {"blur_ssim", "blur_hair", "pull"}, {"blur_ssim", "blur_hair"}),
             ("plain", "ignore-mask", {"blur_ssim", "blur_hair", "pull"}, {"pull"}),
             ("tint", None, {"chroma"}, set()),
-            ("tint", "per-channel-guide", {"chroma"}, {"chroma"})]
+            ("tint", "per-channel-guide", {"chroma"}, {"chroma"}),
+            ("glint", None, {"glint_core", "glint_ring"}, set()),
+            ("glint", "uniform-weights", {"glint_core", "glint_ring"}, {"glint_core", "glint_ring"})]
     ok = True
     for kind, brk, counted, expect in plan:
         src, ref, meta = tiny_stack(kind)
@@ -501,6 +551,7 @@ def self_check():
         print(f"{name:5} identical frames  {'ok  ' if dev <= 1 else 'FAIL'} max deviation {dev} counts")
     ok &= self_check_equalizer()
     ok &= self_check_level()
+    ok &= self_check_commands()
     print("self-check", "passed" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -508,7 +559,7 @@ def self_check():
 # ---------------------------------------------------------------- cases
 
 CASES = {"halo": ("hard", 250), "flat": ("hard", 1000), "easy": ("easy", 250),
-         "hairs": ("hard", 250), "tint": ("hard", 250), "border": ("hard", 250),
+         "hairs": ("hard", 250), "glints": ("hard", 250), "tint": ("hard", 250), "border": ("hard", 250),
          "gain-ramp": ("hard", 250), "gain-offset": ("hard", 250), "flicker": ("hard", 250)}
 DEFAULT_CASES = "halo,flat,easy,hairs,tint,border"
 HAIRS_512 = [("h", (460, 461), (454, 456), (464, 466), (30, 100)), ("h", (460, 461), (454, 456), (464, 466), (130, 190)),
@@ -523,6 +574,18 @@ def run(cmd):
     return p
 
 
+def stack_cmd(d, algo, tile, out, sets=(), align=False):
+    """The `stack` command line of a baseline: registered input and CPU only.
+
+    `align` runs the product's own alignment instead (rotation-scale, uncropped, so coverage
+    applies at the borders); `sets` are `KEY=VAL` pairs for `--set`.
+    """
+    cmd = [CLI, "stack", d, "--algo", algo]
+    cmd += ["--align-algo", "pyramidal-ecc", "--align-set", "mode=rotation-scale"] if align else ["--no-align"]
+    cmd += ["--no-crop", "--no-gpu", "--tile-size", tile, "--json", "-o", out]
+    return cmd + [x for kv in sets for x in ("--set", kv)]
+
+
 def synth(scene, noise, seed, n, out):
     run([sys.executable, SYNTH, "--frames-only", "--scene", scene, "--frames", n, "--noise", noise, "--seed", seed, "--out", out])
 
@@ -534,6 +597,22 @@ def transform_mask(m, h, w):
     with np.errstate(divide="ignore", invalid="ignore"):
         ux, uy = (m[0][0] * x + m[0][1] * y + m[0][2]) / d, (m[1][0] * x + m[1][1] * y + m[1][2]) / d
     return (d > 1e-6) & (ux >= 0) & (ux <= w - 1) & (uy >= 0) & (uy <= h - 1)
+
+
+def product_masks(entries, h, w):
+    """Per-frame coverage masks of a report's `alignments` entries."""
+    return np.stack([transform_mask(e["transform"]["m"], h, w) for e in entries])
+
+
+# Rectangle [y0, y1, x0, x1] of each case's class crop; `halo`'s covers its +/-8 px band.
+HALO_CROP = [72, 208, 292, 478]
+CROPS = {"halo": HALO_CROP, "tint": HALO_CROP, "gain-ramp": HALO_CROP, "gain-offset": HALO_CROP, "flicker": HALO_CROP,
+         "flat": [432, 508, 4, 80], "hairs": [400, 500, 20, 200], "glints": [206, 254, 16, 156],
+         "border": [0, 128, 0, 128], "align-border": [0, 128, 0, 128]}
+
+
+def crop_rect(name):
+    return CROPS.get(name, [0, 256, 0, 256])
 
 
 def drift(name, seed, n):
@@ -568,7 +647,7 @@ def build_case(name, seed, n, root):
         os.makedirs(os.path.join(d, "frames"))
         rep = json.loads(run([CLI, "align", raw, "--json", "--no-gpu", "--algo", "pyramidal-ecc", "--set", "mode=rotation-scale",
                               "--write-warped", os.path.join(d, "frames")]).stdout)
-        masks = np.stack([transform_mask(e["transform"]["m"], h, w) for e in rep["alignments"]])
+        masks = product_masks(rep["alignments"], h, w)
         zero = [bool((read_u16(os.path.join(d, "frames", e["name"])) == 0).all(2)[~mk].all()) for e, mk in zip(rep["alignments"], masks)]
         meta["mask_check"] = dict(invalid_fraction=float(1 - masks.mean()), invalid_pixels_all_zero=all(zero))
         np.save(os.path.join(d, "masks.npy"), masks)
@@ -588,6 +667,18 @@ def build_case(name, seed, n, root):
                 write_u16(os.path.join(d, "frames", f"{k:02d}.tif"), f)
             write_u16(meta["reference"], src)
             meta["hairs"] = HAIRS_512
+        elif name == "glints":
+            src = ss.SCENES["hard"]()
+            depth = ss.depth_map(n, "standard")
+            meta["glints"] = [[cy, cx, GLINT_R] for cy in (230, 290, 350) for cx in (40, 130, 220, 330)]
+            y, x = np.mgrid[0:h, 0:w]
+            for cy, cx, r in meta["glints"]:
+                d2 = (y - cy) ** 2 + (x - cx) ** 2
+                src[d2 <= r * r] = 65535
+                depth[d2 <= GLINT_DEPTH_R**2] = GLINT_DEPTH
+            for k, f in enumerate(ss.render(src, depth, 0.45, noise, seed, n)):
+                write_u16(os.path.join(d, "frames", f"{k:02d}.tif"), f)
+            write_u16(meta["reference"], src)
         else:
             synth(scene, noise, seed, n, d)
         paths = frame_paths(d)
@@ -636,20 +727,28 @@ def real_cases(names, root, rect, nframes):
     return out
 
 
-def run_baseline(d, algo, tile, work):
-    """`stack` then `export` on the CPU path; peak RSS from the time wrapper."""
+def run_baseline(d, algo, tile, work, sets=(), align=False):
+    """`stack` then `export` on the CPU path; peak RSS from the time wrapper.
+
+    The row carries the report's `equalization` when `--set equalize=true` ran and, with `align`,
+    the report's `align` block under `align`.
+    """
     o = os.path.join(work, f"{algo}-t{tile}")
     shutil.rmtree(o, ignore_errors=True)
     os.makedirs(o)
-    cmd = ["/usr/bin/time", "-v", CLI, "stack", d, "--algo", algo, "--no-align", "--no-crop", "--no-gpu",
-           "--tile-size", tile, "--json", "-o", o]
+    cmd = ["/usr/bin/time", "-v"] + stack_cmd(d, algo, tile, o, sets, align)
     p = run(cmd)
     rss = int(next(ln for ln in p.stderr.splitlines() if "Maximum resident set size" in ln).split()[-1])
     rep = json.loads(p.stdout)
     run([CLI, "export", rep["outputs"][0], "-o", f"{o}.tif", "--json"])
-    return dict(comp=f"{o}.tif", rss_kb=rss, wall_s=rep["wall_seconds"], tiles=rep["tiles"],
-                reads_per_frame=rep["frame_tiles_read"] / rep["frame_count"], accounted_bytes=rep["accounted_bytes_in_flight"],
-                cmd=" ".join(str(c) for c in cmd[2:]))
+    row = dict(comp=f"{o}.tif", rss_kb=rss, wall_s=rep["wall_seconds"], tiles=rep["tiles"],
+               reads_per_frame=rep["frame_tiles_read"] / rep["frame_count"], accounted_bytes=rep["accounted_bytes_in_flight"],
+               cmd=" ".join(str(c) for c in cmd[2:]))
+    if rep["equalization"]:
+        row["equalization"] = rep["equalization"]
+    if align:
+        row["align"], row["project"] = rep["align"], rep["outputs"][0]
+    return row
 
 
 def aggregate(rows):
@@ -683,6 +782,22 @@ def aggregate_delta(rows):
     return "\n".join(lines)
 
 
+def product_coverage(meta, align, project, out):
+    """Source of the product's own alignment run: its frames as fused (`export --frame`) and the
+    coverage masks of the same run's transforms, plus the largest difference of those transforms from
+    the ones the case's own `align` pass recorded (the two passes need not agree).
+    """
+    entries = align["alignments"]
+    os.makedirs(out, exist_ok=True)
+    for k in range(len(entries)):
+        run([CLI, "export", project, "--frame", k, "--frame-output", os.path.join(out, f"{k:02d}.tif"), "--json"])
+    ref = json.load(open(os.path.join(meta["dir"], "align.json")))["alignments"]
+    diff = max(abs(np.array(e["transform"]["m"]) - np.array(r["transform"]["m"])).max() for e, r in zip(entries, ref))
+    src = TiffSource(frame_paths(out))
+    src.masks, src.has_masks = product_masks(entries, src.h, src.w), True
+    return src, float(diff)
+
+
 def cmd_cases(a):
     os.makedirs(a.out, exist_ok=True)
     names = a.cases.split(",")
@@ -695,18 +810,27 @@ def cmd_cases(a):
         work = meta["dir"] if meta["reference"] else os.path.join(a.out, meta["case"])
         os.makedirs(work, exist_ok=True)
         comps, case_rows = {}, []
+        cover = a.product_coverage and meta["case"] == "align-border"
         for arm in arms:
-            d, awork, tag = meta["dir"], work, ""
+            d, awork, tag, sets = meta["dir"], work, "", list(a.stack_set)
             if arm == "on":
                 d = awork = os.path.join(work, "equalized")
                 equalize(meta["dir"], d)
                 tag = "-eq"
+            if arm == "product":
+                sets.append("equalize=true")
             src = open_source(d)
             arm_rows = []
             for algo in a.methods.split(","):
-                b = run_baseline(d, algo, a.tile_size, awork)
+                b = run_baseline(os.path.join(d, "raw") if cover else d, algo, a.tile_size, awork, sets, cover)
+                if cover:
+                    align = b.pop("align")
+                    src, align_diff = product_coverage(meta, align, b.pop("project"), os.path.join(awork, f"{algo}-frames"))
+                    b.update(coverage="product", align_reference=align["reference"], align_vs_align_command=align_diff)
                 comps[algo + tag] = b.pop("comp")
                 arm_rows.append(dict(case=meta["case"], seed=meta["seed"], algo=algo, arm=arm, tile=a.tile_size, **b))
+                if sets:
+                    arm_rows[-1]["stack_set"] = sets
             if a.candidate:
                 t0 = time.time()
                 out, cov = fuse_stack(src, a.scale, a.brk)
@@ -728,11 +852,14 @@ def cmd_cases(a):
                 print(json.dumps(r), flush=True)
             case_rows += arm_rows
         rows += case_rows
-        if not meta["reference"]:
+        if meta["reference"]:
+            rect, files, order = crop_rect(meta["case"]), [meta["reference"], *comps.values()], ["truth", *comps]
+        else:
             rect = (0, min(src.h, 256), 0, min(src.w, 256)) if src.h < 700 else (src.h // 2 - 128, src.h // 2 + 128, src.w // 2 - 128, src.w // 2 + 128)
-            png = os.path.join(work, "montage.png")
-            montage(png, rect, list(comps.values()))
-            print(json.dumps(dict(case=meta["case"], montage=png, order=list(comps), rect=list(rect))), flush=True)
+            files, order = list(comps.values()), list(comps)
+        png = os.path.join(work, "montage.png")
+        montage(png, rect, files)
+        print(json.dumps(dict(case=meta["case"], montage=png, order=order, rect=list(rect))), flush=True)
     json.dump(rows, open(os.path.join(a.out, "results.json"), "w"), indent=1)
     print("# aggregate\n" + aggregate([r for r in rows if r.get("metrics")]))
     if "on" in arms and "off" in arms:
@@ -847,7 +974,11 @@ def main():
     c = sub.add_parser("cases", help="build cases, run the baselines (and with --candidate the prototype), score them")
     c.add_argument("--out", required=True)
     c.add_argument("--cases", default=DEFAULT_CASES, help=f"{','.join(CASES)},align-border,mantis,stack-crop")
-    c.add_argument("--equalize", choices=["off", "on", "both"], default="off", help="per-frame brightness equalization before fusion")
+    c.add_argument("--equalize", choices=["off", "on", "both", "product"], default="off",
+                   help="per-frame brightness equalization before fusion; `product` is the product's own (`stack --set equalize=true`) on the unequalized frames")
+    c.add_argument("--product-coverage", action="store_true",
+                   help="align-border: stack the raw frames with the product's alignment, masks from that run's own transforms")
+    c.add_argument("--stack-set", action="append", default=[], metavar="KEY=VAL", help="forwarded to every baseline as --set (repeatable)")
     c.add_argument("--seeds", default="11,12,13")
     c.add_argument("--frames", type=int, default=8)
     c.add_argument("--methods", default=",".join(ALGOS))

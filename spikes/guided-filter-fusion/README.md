@@ -40,11 +40,13 @@ python3 spikes/guided-filter-fusion/gff_fusion.py montage OUT.png --rect Y0,Y1,X
 ```
 
 - `--self-check` builds a 48x64, N = 3 stack and requires every detector (blur, invalid-source pull,
-  channel disagreement) to stay silent on the honest prototype and fire on its broken variant
-  (`--break uniform-weights`, `ignore-mask`, `per-channel-guide`). It also fuses identical constant and
+  channel disagreement, glint loss) to stay silent on the honest prototype and fire on its broken variant
+  (`--break uniform-weights`, `ignore-mask`, `per-channel-guide`; the glint detectors run on a stack with two saturated discs).
+  It also checks the baseline command line (registered input, `--set` forwarding, the coverage arm's alignment flags),
+  the coverage masks derived from transforms and that every case's crop rectangle lies inside the frame. It also fuses identical constant and
   edge stacks, which must come back unchanged. Exit 0 means every run behaved.
 - `cases` builds registered synthetic stacks with `spikes/synthetic-ground-truth/synth_stack.py --frames-only`
-  (cases `halo`, `flat`, `easy`, `hairs`, `tint`, `border`, the brightness-drift cases `gain-ramp`, `gain-offset`, `flicker`, and
+  (cases `halo`, `flat`, `easy`, `hairs`, `glints`, `tint`, `border`, the brightness-drift cases `gain-ramp`, `gain-offset`, `flicker`, and
   `align-border`, whose invalid-border mask comes from `focusforge-cli align --json` transforms), runs each baseline as
   `stack ... --no-align --no-crop --no-gpu` then `export`, scores every composite and prints per-metric spread over the
   seeds. `--tile-size` is the size of the read rectangle; the tile margins (160/80/40 px for Laplacian, 12 and 16 px for
@@ -52,12 +54,26 @@ python3 spikes/guided-filter-fusion/gff_fusion.py montage OUT.png --rect Y0,Y1,X
   512x512 (interior 704) and `2048` at a 1024x1024 crop stay one-tile controls.
   `--candidate` adds the prototype. `mantis` runs `fixtures/mantis-512` and `stack-crop` a crop of the large reference
   stack (`--rect X,Y,W,H`, `--crop-frames`); neither has a truth image, so they write a side-by-side `montage.png`
-  instead of metrics.
-- `--equalize off|on|both` (default `off`) adds a per-frame brightness equalization before fusion. `on` writes
+  instead of metrics. A synthetic case writes a `montage.png` too: the truth first, then each method, at full resolution
+  over the case's class rectangle (`CROPS`: the `halo` band, the flat patch, the hair region, two glints, a border corner).
+- `--stack-set KEY=VAL` (repeatable) is forwarded to every baseline as `stack --set KEY=VAL`, which runs a method at a
+  neighbouring parameter value; a method that does not declare the key makes the run stop with the CLI's error, so pass
+  `--methods` with it. The row records the pairs under `stack_set`.
+- `--product-coverage` turns `align-border` into an end-to-end coverage arm: the baselines stack `raw/` with the product's
+  own alignment (`--align-algo pyramidal-ecc --align-set mode=rotation-scale --no-crop`) instead of `--no-align`, and the
+  row's masks come from that run's own `align.alignments[].transform.m`, scored against that run's own frames as fused
+  (`export --frame`), so frames and masks share one set of transforms. The row carries `coverage: "product"`, the run's
+  `align_reference` and `align_vs_align_command`, the largest difference of its transforms from those of the `align`
+  command on the same frames (the two need not agree); `psnr` and `ssim` then depend on the alignment and on which frame it chose as reference, and
+  `border_pull` does not. Without the flag the case runs `--no-align` on the warped frames with the rig's own masks, which
+  the product never sees, so its baselines pull at the borders.
+- `--equalize off|on|both|product` (default `off`) adds a per-frame brightness equalization before fusion. `on` writes
   `equalized/` beside each case (frames, `masks.npy` copy and `equalize.json`) and every method reads it; `both` runs the
   two arms on identical frames, tags each row with its `arm`, adds `vs_off` (max absolute difference, differing samples,
   mean absolute difference over the OFF mean) to each ON row and prints an ON-minus-OFF table. The default leaves cases,
-  commands and outputs unchanged.
+  commands and outputs unchanged. `product` runs the product's own equalization (`stack --set equalize=true`) on the
+  unequalized frames, tags its rows `product` and stores the report's `equalization` block beside each row; the rig's
+  equalizer is not involved.
 - `fuse --tile T --margin M` assembles the result tile by tile with `M` px of context; compare it with the
   whole-image output using `tools/tiff-diff.py`.
 - `reach` puts an impulse in one frame of a constant two-frame stack and prints the farthest pixel whose weight
@@ -86,7 +102,8 @@ Every subcommand prints JSON with the command line it ran.
 
 All against the case's `reference.tif`, over pixels with at least one valid source: `psnr` and block `ssim` as in
 `synth_stack.py`; `halo_rms` (+/-8 px band around the depth step), `flat_std` (flat patch), `hair_ret` (line contrast
-retained against the reference), `chroma_err` (mean `|channel/luma - reference channel/luma|` over unclipped pixels),
+retained against the reference), `glint_core` (mean luma over the glint discs divided by the truth's, 1 keeps them) and
+`glint_ring` (luma RMS against the truth in the annuli 2 to 8 px outside the discs), `chroma_err` (mean `|channel/luma - reference channel/luma|` over unclipped pixels),
 `border_pull` (shortfall below the darkest valid source at pixels that also have an invalid source), `psnr_lvl` (`psnr`
 after the one global gain that best fits the composite to the reference, so a level offset does not count).
 
