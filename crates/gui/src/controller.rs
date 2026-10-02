@@ -2970,9 +2970,10 @@ impl AppController {
     /// `Paint`'s `Start`. With the pipette armed, this is a pick that also
     /// disarms it, and the rest of the drag is ignored (no
     /// [`job::EditState::stroke`] is opened, so [`Self::paint_update`] has
-    /// nothing to push into). Otherwise, inside
-    /// the right pane only, opens a stroke at the pointer's source position,
-    /// freezing the brush's source, radius and softness for the stroke.
+    /// nothing to push into). Otherwise, over either pane, opens a stroke at
+    /// the pointer's source position, freezing the brush's source, radius and
+    /// softness for the stroke. Both panes share one viewport, so the stroke
+    /// is the same whichever pane the press lands in.
     fn paint_start(&mut self, x: f32, y: f32) {
         if self.state.brush.picking {
             let local = self.anchor();
@@ -2981,17 +2982,14 @@ impl AppController {
             self.emit(ShellEvent::EditorChanged);
             return;
         }
-        let Some((_, right)) = self.state.panes else {
+        let Some(pane) = self.pane_at(x, y) else {
             return;
         };
-        if !pane_contains(right, x, y) {
-            return;
-        }
         let Some(source) = self.brush_source() else {
             return;
         };
         let (radius, softness) = self.brush_radius_softness();
-        let local = (x - right.x, y - right.y);
+        let local = (x - pane.x, y - pane.y);
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -3013,7 +3011,7 @@ impl AppController {
 
     /// `Paint`'s `Update`: integrates a screen-space delta into the live
     /// stroke's image-space trace. A no-op with no live stroke (a pipette
-    /// pick's drag, or a stroke that started outside the right pane).
+    /// pick's drag, or a stroke that started outside both panes).
     fn paint_update(&mut self, dx: f32, dy: f32) {
         let Some(tab) = self.state.active_mut() else {
             return;
@@ -3160,18 +3158,23 @@ impl AppController {
         let Some((left, right)) = self.state.panes else {
             return (x, y);
         };
-        let pane = if pane_contains(left, x, y) {
-            left
-        } else if pane_contains(right, x, y) {
-            right
-        } else {
+        let pane = self.pane_at(x, y).unwrap_or_else(|| {
             let mid = (left.x + left.width + right.x) / 2.0;
             if x < mid { left } else { right }
-        };
+        });
         (
             x.clamp(pane.x, pane.x + pane.width) - pane.x,
             y.clamp(pane.y, pane.y + pane.height) - pane.y,
         )
+    }
+
+    /// The pane whose rect contains `(x, y)`, left first; `None` over the
+    /// gutter, the divider, outside both, or with no panes installed.
+    fn pane_at(&self, x: f32, y: f32) -> Option<PaneRect> {
+        let (left, right) = self.state.panes?;
+        [left, right]
+            .into_iter()
+            .find(|&pane| pane_contains(pane, x, y))
     }
 
     /// Installs both panes' current geometry, pushed by `ui/shell/canvas.slint`'s

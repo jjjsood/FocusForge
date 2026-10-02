@@ -2676,9 +2676,20 @@ fn release(controller: &mut AppController, point: (f32, f32)) {
     controller.pointer(PointerKind::Up, Button::Left, point.0, point.1, NO_MODS);
 }
 
-/// A left drag through image points `path`, one motion event per point.
+/// A left drag through image points `path`, one motion event per point, over
+/// the right pane.
 fn drag(controller: &mut AppController, path: &[(f32, f32)]) {
-    let screen: Vec<(f32, f32)> = path.iter().map(|&(x, y)| at(x, y)).collect();
+    drag_on(controller, RIGHT, path);
+}
+
+/// A left drag through image points `path` as drawn over `pane`.
+fn drag_on(controller: &mut AppController, pane: PaneRect, path: &[(f32, f32)]) {
+    let screen: Vec<(f32, f32)> = path.iter().map(|&(x, y)| at_pane(pane, x, y)).collect();
+    drag_screen(controller, &screen);
+}
+
+/// A left drag through screen points, one motion event per point.
+fn drag_screen(controller: &mut AppController, screen: &[(f32, f32)]) {
     press(controller, screen[0]);
     for &(x, y) in &screen[1..] {
         controller.pointer_moved(x, y);
@@ -2890,13 +2901,18 @@ fn drag_produces_one_brush_stroke() {
         "a press-release with no motion is a one-point op"
     );
     assert_eq!(ops(&c).len(), 2);
-    let before = indices(&c);
 
     press(&mut c, (100.0, 100.0));
     c.pointer_moved(RIGHT.x + 50.0, 100.0);
     c.flush_live_stroke();
     release(&mut c, (RIGHT.x + 50.0, 100.0));
-    assert_eq!(ops(&c).len(), 2, "a drag starting on the left pane");
+    common::settle_recomposites(&mut c);
+    assert_eq!(ops(&c).len(), 3, "a drag starting on the left pane");
+    assert!(
+        matches!(ops(&c).last(), Some(Op::BrushStroke { source_id: 2, .. })),
+        "it paints the selected source"
+    );
+    let before = indices(&c);
 
     // In the band above the image, with a 1 px brush.
     set_size(&mut c, 1.0);
@@ -2904,7 +2920,7 @@ fn drag_produces_one_brush_stroke() {
     c.pointer_moved(RIGHT.x + 140.0, 20.0);
     c.flush_live_stroke();
     release(&mut c, (RIGHT.x + 140.0, 20.0));
-    assert_eq!(ops(&c).len(), 2, "a stroke wholly off the image");
+    assert_eq!(ops(&c).len(), 3, "a stroke wholly off the image");
     assert_eq!(indices(&c), before);
 }
 
@@ -3763,6 +3779,129 @@ fn mirrored_cursor_tracks_the_same_scene_point() {
     check_stage(&mut c, right, "a wider gutter");
 }
 
+/// The selected frame's pixel at image `(x, y)`, read as the left pane draws it.
+fn selected_frame_pixel(c: &AppController, x: u32, y: u32) -> Vec<u16> {
+    let view = c
+        .selected_frame_view()
+        .expect("a fused, editable tab's selected frame always has a view");
+    let mut source = focusforge_gui::canvas::FrameSource::default();
+    source
+        .set(
+            &c.selected_frame_path().unwrap(),
+            Some(view),
+            job::host_budget(),
+        )
+        .expect("the selected frame opens");
+    let mut pixel = vec![0u16; 3];
+    source
+        .read_into(
+            Rect {
+                x,
+                y,
+                width: 1,
+                height: 1,
+            },
+            NonZeroU32::MIN,
+            &mut pixel,
+        )
+        .expect("the selected frame's point reads");
+    pixel
+}
+
+/// A drag over the left pane and the same drag shifted by `mirror_dx` over
+/// the right pane append equal ops and leave equal indices, at fit, one zoom
+/// step in, after a pan and with a wider gutter; the left pane's frame is
+/// never written.
+#[test]
+fn mirrored_brush_paints_the_same_stroke_from_either_pane() {
+    let (mut c, _) = open_editor("mirrored_brush_either_pane");
+    set_size(&mut c, 6.0);
+    c.select_frame(2);
+
+    let check_stage = |c: &mut AppController, stage: &str| {
+        let start = at_pane(LEFT, 29.0, 30.0);
+        c.pointer(PointerKind::Move, Button::Left, start.0, start.1, NO_MODS);
+        let mirror_dx = c.brush_cursor_view().unwrap().mirror_dx;
+        let left_path: Vec<(f32, f32)> = (0..4)
+            .map(|i| (start.0 + 6.0 * i as f32, start.1 + 3.0 * i as f32))
+            .collect();
+        let right_path: Vec<(f32, f32)> =
+            left_path.iter().map(|&(x, y)| (x + mirror_dx, y)).collect();
+        let ops_before = ops(c).len();
+
+        drag_screen(c, &right_path);
+        let right_ops = ops(c);
+        let right_indices = indices(c);
+        assert_eq!(
+            right_ops.len(),
+            ops_before + 1,
+            "{stage}: the right-pane stroke"
+        );
+        c.undo();
+        common::settle_recomposites(c);
+        assert_eq!(ops(c).len(), ops_before, "{stage}: undo");
+
+        let frame_before = selected_frame_pixel(c, 29, 30);
+        drag_screen(c, &left_path);
+        assert_eq!(ops(c), right_ops, "{stage}: the left pane's op");
+        assert_eq!(
+            indices(c),
+            right_indices,
+            "{stage}: the left pane's indices"
+        );
+        assert_eq!(
+            selected_frame_pixel(c, 29, 30),
+            frame_before,
+            "{stage}: the left pane's frame is unchanged"
+        );
+        c.undo();
+        common::settle_recomposites(c);
+    };
+
+    check_stage(&mut c, "at fit");
+    c.zoom_in();
+    check_stage(&mut c, "one zoom step in");
+    c.wheel(0.0, 60.0, 0.0, 0.0, SHIFT);
+    check_stage(&mut c, "after a pan");
+    c.set_pane_geometry(
+        LEFT,
+        PaneRect {
+            x: RIGHT.x + 16.0,
+            ..RIGHT
+        },
+    );
+    check_stage(&mut c, "a wider gutter");
+}
+
+/// A press in the gutter or outside both panes opens no stroke, even when the
+/// drag then moves into a pane.
+#[test]
+fn a_press_between_the_panes_opens_no_stroke() {
+    let (mut c, _) = open_editor("press_between_panes");
+    set_size(&mut c, 8.0);
+    c.select_frame(2);
+    let before_ops = ops(&c);
+    let before_indices = indices(&c);
+    let inside = at(30.0, 30.0);
+
+    for (case, start) in [
+        ("the gutter", (LEFT.x + LEFT.width + 4.0, 160.0)),
+        ("below both panes", (RIGHT.x + 50.0, 330.0)),
+        (
+            "right of the right pane",
+            (RIGHT.x + RIGHT.width + 4.0, 160.0),
+        ),
+    ] {
+        press(&mut c, start);
+        c.pointer_moved(inside.0, inside.1);
+        c.flush_live_stroke();
+        release(&mut c, inside);
+        common::settle_recomposites(&mut c);
+        assert_eq!(ops(&c), before_ops, "a press in {case}");
+        assert_eq!(indices(&c), before_indices, "a press in {case}");
+    }
+}
+
 /// The one `BrushCursorView` carries both cursors' geometry: size, softness
 /// and zoom change its extent/ring/core, but `mirror_dx` follows only the
 /// installed pane rects, not the brush or the pointer.
@@ -3878,6 +4017,31 @@ fn mirrored_cursor_marks_the_pipette_point() {
         "the preview matches the source the click commits"
     );
     assert_eq!(ops(&c), before, "the pick itself opens no stroke");
+
+    // An Alt + click leaves the pipette armed; a plain press picks and disarms.
+    assert!(c.brush_cursor_view().unwrap().picking, "still armed");
+    let other_point = at_pane(LEFT, 5.0, 50.0);
+    c.pointer(
+        PointerKind::Move,
+        Button::Left,
+        other_point.0,
+        other_point.1,
+        NO_MODS,
+    );
+    let other_hover = c.brush_cursor_view().unwrap();
+    press(&mut c, other_point);
+    release(&mut c, other_point);
+    let picked = c.brush_source().expect("a left-pane press commits a pick");
+    assert_eq!(
+        other_hover.pick_color,
+        job::source_color(picked, c.frame_count().unwrap()),
+        "the left-pane press commits the previewed source"
+    );
+    assert!(
+        !c.brush_cursor_view().unwrap().picking,
+        "the pick disarms the pipette"
+    );
+    assert_eq!(ops(&c), before, "a left-pane pick opens no stroke");
 }
 
 /// `brush_cursor_view` is `None` with no active tab, and stays `None` once a
