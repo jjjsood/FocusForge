@@ -246,9 +246,10 @@ fn held_algorithm(index: usize, held: &[InMemoryCheckpoint], saved: &[&Checkpoin
 /// newer held row (higher index) before an older one, and saved rows keep
 /// their order in `checkpoints`. A hidden saved checkpoint and every row
 /// `pending` names are left out (`checkpoints` and `held` stay whole for the
-/// parent lookups). Day separators appear only when the merged list spans more than one local day, `today`
-/// being the caller's local date. `selected` matches a row's own id (a
-/// saved row's stored id, a held row's `"held:<index>"`).
+/// parent lookups). Day separators appear only when the merged list spans
+/// more than one local day, `today` being the caller's local date.
+/// `selected` matches a row's own id (a saved row's stored id, a held row's
+/// `"held:<index>"`).
 pub fn build_model(
     checkpoints: &[&Checkpoint],
     held: &[InMemoryCheckpoint],
