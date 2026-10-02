@@ -11,7 +11,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use focusforge_gui::{AppController, OpenAs, OpenOutcome};
+use focusforge_gui::job::Op;
+use focusforge_gui::{AppController, OpenAs, OpenOutcome, ShellMode};
 
 #[path = "../../../core/tests/common/reference_stack.rs"]
 mod reference_stack;
@@ -265,6 +266,22 @@ pub fn add_and_settle(
     Ok(())
 }
 
+/// Starts a `Locate frames…` verification, blocks until its worker
+/// finishes, and settles it -- `AppController::locate_frames` runs
+/// off-thread too, the same as [`open_and_settle`]. A no-op with nothing to
+/// verify against.
+#[allow(dead_code)]
+pub fn locate_and_settle(
+    controller: &mut AppController,
+    target: focusforge_gui::entry::LocateTarget,
+    folder: PathBuf,
+) {
+    if let Some(handle) = controller.locate_frames(target, folder) {
+        handle.join().expect("the locate worker did not panic");
+    }
+    controller.settle_locate();
+}
+
 /// A directory built with `tempfile`, which honours `TMPDIR` and so lives on
 /// a filesystem where a mode change actually takes effect. Restores a
 /// writable mode before its own `TempDir` removes it.
@@ -354,4 +371,28 @@ pub fn seed_large_diagnostics_dir(root: &Path, total_log_bytes: usize) -> PathBu
     )
     .unwrap();
     data
+}
+
+/// Appends `op` to the active tab's edit session.
+#[allow(dead_code)]
+pub fn paint(controller: &mut AppController, op: Op) {
+    controller
+        .edit_session_mut()
+        .expect("the tab has an edit session")
+        .append(op)
+        .expect("a stroke inside the map applies");
+}
+
+/// `set_mode(Editor)`, waiting out the render an op-bearing row needs first.
+#[allow(dead_code)]
+pub fn enter_editor(controller: &mut AppController) {
+    let start = Instant::now();
+    while !controller.set_mode(ShellMode::Editor) {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the editor did not open"
+        );
+        controller.settle_checkpoint_render();
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }

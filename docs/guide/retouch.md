@@ -77,13 +77,20 @@ capture time.
   before the last op; a fresh op after an undo discards whatever redo
   history followed it.
 - **Overlay** — the bottom bar's toggle turns the rainbow legend on over
-  the composite pane; its slider sets opacity, matching `retouch
-  --overlay --opacity` exactly.
+  the composite pane, in stacking mode as well as in the editor; its slider
+  sets opacity, matching `retouch --overlay --opacity` exactly. It starts
+  off and stays disabled until the tab has a fuse to show. Alt is only the
+  pipette: no wheel gesture is bound to overlay opacity.
 - **Cursor mirroring** — the brush cursor and pipette crosshair, wherever
   the pointer sits in one pane, are echoed onto the other pane at the same
   underlying scene point, so the source frame and the composite stay in
   visual sync while editing.
 
+Saving strokes as a checkpoint, restoring an earlier one and branching are
+covered in [checkpoints](history.md).
+
 Editing in the window paints the tab's own held Z-Map and recomposites the
-composite pane live; `focusforge-cli retouch` is what writes an edited
-Z-Map, and its `--render`/`--overlay` outputs, to disk.
+composite pane live. Saving the project keeps the edits as checkpoints in
+its `.ffp`; **Export image** writes the result as an image, and
+`focusforge-cli retouch` writes an edited Z-Map and its
+`--render`/`--overlay` outputs to disk.

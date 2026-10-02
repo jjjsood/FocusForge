@@ -427,7 +427,7 @@ fn configuration(config_dir: Option<&Path>) -> serde_json::Value {
         })
         .collect();
 
-    let input_map = config_dir.map(|dir| dir.join("input.toml"));
+    let input_map = config_dir.map(|dir| dir.join("settings.toml"));
     serde_json::json!({
         "algorithms": algorithms,
         "input_map": {
@@ -944,10 +944,10 @@ mod tests {
             entry["input_map"]["path"]
                 .as_str()
                 .unwrap()
-                .ends_with("input.toml")
+                .ends_with("settings.toml")
         );
 
-        std::fs::write(config.join("input.toml"), "").unwrap();
+        std::fs::write(config.join("settings.toml"), "").unwrap();
         let present = manifest(&Options {
             config_dir: Some(config),
             ..Options::default()

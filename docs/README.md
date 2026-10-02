@@ -11,16 +11,21 @@ retouching the result.
 
 - [`guide/gui.md`](guide/gui.md) — opening a folder or a project in the
   window, the dock's `Images` and `Settings` panels, running and controlling
-  a fuse, saving the held result, and switching between open projects
+  a fuse, saving the held result, exporting an image, switching between open
+  projects and the settings file
 - [`guide/stacking.md`](guide/stacking.md) — stacking TIFF or supported RAW
-  frames, choosing an algorithm, getting an image back with `export`, and
-  getting the Z-Map
+  frames, choosing an algorithm, getting a TIFF, PNG or JPEG image back with
+  `export` and its format options, and getting the Z-Map
 - [`guide/alignment.md`](guide/alignment.md) — how `focusforge-cli
   align`/`stack` register frames before fusing, choosing a mode, and
   checking a result before committing to a full run
 - [`guide/retouch.md`](guide/retouch.md) — editing a stack's Z-Map by hand,
   from the op list `focusforge-cli retouch` applies to the window's brush,
   pipette, overlay and undo/redo
+- [`guide/history.md`](guide/history.md) — a project's checkpoint tree: the
+  window's checkpoint list, saving, restoring, branching and deleting, the
+  same from `focusforge-cli history`, and what a damaged or moved project
+  does
 - [`guide/batch-runs.md`](guide/batch-runs.md) — stacking a folder that holds
   more than one stack: the grouping proposal and overriding it, presets,
   re-running one stack, cancelling and resuming a run, the stage cache, and
@@ -33,11 +38,12 @@ retouching the result.
 
 - [`reference/cli.md`](reference/cli.md) — every `focusforge-cli` subcommand
   and flag, and the `info --json`, `algorithms --json`, `stack --json`,
-  `export --json`, `retouch --json` and `review --json` schemas
+  `export --json`, `retouch --json`, `history` and `review --json` schemas
 - [`reference/tiff-fast-path.md`](reference/tiff-fast-path.md) — the TIFF
   layout the reader accepts and the writer emits
 - [`reference/project-format.md`](reference/project-format.md) — the
-  `.ffp` project container `stack` writes and `export`/`review` read
+  `.ffp` project container: checkpoints, stored Z-Maps, source frame checks
+  and the refusals a damaged project gets
 
 Building from source, the repository layout and the test suite are in
 [`../CONTRIBUTING.md`](../CONTRIBUTING.md), not here — this tree is for using

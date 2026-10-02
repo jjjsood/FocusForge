@@ -204,6 +204,7 @@ fn absent_capture_time_is_shown_as_absent() {
         OpenOutcome::Question(_, _) => {
             common::answer_and_settle(&mut controller, OpenAs::OneProject);
         }
+        OpenOutcome::Mismatch(_) => panic!("opening a folder must never raise a mismatch"),
         OpenOutcome::Refused(_) => panic!("opening two tiny synthetic frames must not be refused"),
     }
     let panel = controller.images_panel();
@@ -214,7 +215,6 @@ fn absent_capture_time_is_shown_as_absent() {
     let ImagesModel {
         rows: _,
         header_text: _,
-        no_source_row: _,
     } = panel;
 }
 
@@ -1288,15 +1288,13 @@ fn relinking_refreshes_the_rows_metadata() {
         })
         .collect();
     let project_path = seal_project_with_sources(&dir, &sources);
-    std::fs::remove_dir_all(&old_dir).unwrap();
+    // A relink is verified by content hash, so the moved frames are the
+    // sealed ones, byte for byte.
     let new_dir = tree("images_relink_new_sources");
-    for i in 0..2 {
-        write_timed(
-            &new_dir,
-            &format!("{i:02}.tif"),
-            Some(&format!("2026:08:29 11:00:0{i}")),
-        );
+    for source in &sources {
+        std::fs::copy(source, new_dir.join(source.file_name().unwrap())).unwrap();
     }
+    std::fs::remove_dir_all(&old_dir).unwrap();
 
     let mut controller = AppController::new();
     assert!(matches!(
@@ -1306,14 +1304,19 @@ fn relinking_refreshes_the_rows_metadata() {
     assert!(controller.images_panel().rows.iter().all(|r| r.unresolved));
 
     // The open tab itself carries the `Sources missing` failure.
-    controller.locate_missing_sources(0, new_dir);
+    let tab_id = controller.tab_id_at(0).expect("the opened tab");
+    common::locate_and_settle(
+        &mut controller,
+        focusforge_gui::entry::LocateTarget::Tab(tab_id),
+        new_dir,
+    );
     let rows = controller.images_panel().rows;
     assert!(rows.iter().all(|r| !r.unresolved), "{rows:?}");
     assert_eq!(
         rows.iter()
             .map(|r| r.trailing_text.as_str())
             .collect::<Vec<_>>(),
-        vec!["11:00:00", "11:00:01"]
+        vec!["10:00:00", "10:00:01"]
     );
 }
 
@@ -2541,7 +2544,7 @@ fn the_frame_set_warnings_footer_sits_at_the_panels_bottom_edge() {
     focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
 
     let panel = ElementQuery::from_root(&app)
-        .match_id("FFDialog::panel")
+        .match_id("FFModalPanel::panel")
         .find_first()
         .expect("the frame-set warning's own panel must be in the tree while it is open");
     let footer = ElementQuery::from_root(&app)
@@ -2596,4 +2599,45 @@ fn write_the_61_frame_manual_evidence_tree() {
     // that grouping question as "open as one project" would, without the
     // composite/Z-Map ever sitting beside the source frames.
     seal_project_with_sources(&dir.join("sealed"), &sources);
+}
+
+/// Confirming a frame-set change in the window starts a re-fuse that settles
+/// through the window's own job timer.
+#[test]
+fn confirming_a_frame_change_in_the_window_settles_its_refuse() {
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    let mut controller = controller_with_frames("frame_change_refuse_window", 3);
+    controller.set_align_algorithm("dummy-align");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120)).expect("the fuse settles");
+    controller.set_mode(ShellMode::Stacking);
+    controller.remove_frame(1);
+    assert!(controller.pending_frame_change().is_some());
+
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+    assert!(app.get_frame_warning_open());
+
+    app.invoke_frame_warning_confirmed();
+    assert!(controller.lock().unwrap().any_job_running());
+    let start = Instant::now();
+    while controller.lock().unwrap().any_job_running() {
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "the window's job timer never settled the re-fuse"
+        );
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(controller.lock().unwrap().checkpoint_count(), Some(2));
 }

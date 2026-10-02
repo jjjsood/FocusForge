@@ -22,8 +22,8 @@ use crate::canvas::{
     truncate_pane_label,
 };
 use crate::controller::{
-    AppController, ChromeKey, DockTab, GroupingQuestion, JobView, OpenAs, OpenOutcome,
-    SettingsSection, ShellEvent, ShellMode,
+    AppController, ChromeKey, DockTab, GroupingQuestion, JobView, LocateTarget, OpenAs,
+    OpenOutcome, SettingsSection, ShellEvent, ShellMode,
 };
 use crate::diagnostics::{
     DiagnosticsStatus, InputBatch, InputSurface, finish_input_batches, input_trace_incomplete,
@@ -34,9 +34,9 @@ use crate::diagnostics::{
     TimingCounter, measurement_scope, measurement_scope_with_fields, record_timing,
 };
 use crate::generated::{
-    AppWindow, FFManifestRow, ImageRowView as GeneratedImageRow,
-    ProjectCardView as GeneratedProjectCard, ProjectTabView, RecentRowView as GeneratedRecentRow,
-    SectionHeadView, SettingsRow as GeneratedSettingsRow,
+    AppWindow, CheckpointEntryView as GeneratedCheckpointEntry, ExportRowView, FFManifestRow,
+    ImageRowView as GeneratedImageRow, ProjectCardView as GeneratedProjectCard, ProjectTabView,
+    RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
 };
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
@@ -94,10 +94,12 @@ pub struct Canvas {
     /// Reads the panes' samples off the event loop; set by [`install`].
     preparer: Option<Preparer>,
     tab: Option<usize>,
-    /// The frame reader's own refusal, kept until a different frame opens
-    /// or the same one succeeds -- the left `FFPane`'s message line reads
-    /// this.
-    frame_error: Option<String>,
+    /// The left `FFPane`'s refusal lines, kept until a different frame opens
+    /// or the same one succeeds; empty while the frame shows.
+    frame_refusal: Vec<String>,
+    /// The frame that last failed to open; not retried until the selection
+    /// moves off it.
+    failed_frame: Option<PathBuf>,
 }
 
 impl Canvas {
@@ -106,10 +108,10 @@ impl Canvas {
         self.tab
     }
 
-    /// The open frame reader's own refusal text, if the last [`Self::set_frame`]
-    /// failed.
-    pub fn frame_error(&self) -> Option<&str> {
-        self.frame_error.as_deref()
+    /// Why the last [`Self::set_frame`] could not open its frame, one entry
+    /// per line; empty when it opened.
+    pub fn frame_refusal(&self) -> &[String] {
+        &self.frame_refusal
     }
 
     /// Drops the planes and forgets the owning tab; the frame half is left
@@ -165,23 +167,35 @@ impl Canvas {
 
     /// Opens `path` as the left pane's source, creating the renderer first
     /// when this tab has never had planes to draw. A no-op when `path` and
-    /// `view` are both already open -- so a new fuse over the same selected
-    /// path still reloads through its own, changed view. `None` drops
-    /// whatever frame was open. Keeps the reader's own refusal text on
-    /// failure rather than a generic message.
+    /// `view` are both already open, or `path` is the frame that last
+    /// failed -- so a new fuse over the same selected path still reloads
+    /// through its own, changed view. `None` drops whatever frame was open.
+    /// A failed open names the frame as missing or changed
+    /// ([`job::frame_refusal_lines`]).
     pub fn set_frame(&mut self, path: Option<&Path>, view: Option<crate::canvas::FrameView>) {
+        if path.is_some() && self.failed_frame.as_deref() == path {
+            return;
+        }
         let renderer = self.renderer_mut();
         let Some(path) = path else {
             renderer.clear_frame();
-            self.frame_error = None;
+            self.frame_refusal.clear();
+            self.failed_frame = None;
             return;
         };
         if renderer.frame_path() == Some(path) && renderer.frame_view() == view {
             return;
         }
         match renderer.set_frame(path, view, job::host_budget()) {
-            Ok(()) => self.frame_error = None,
-            Err(err) => self.frame_error = Some(err.to_string()),
+            Ok(()) => {
+                self.frame_refusal.clear();
+                self.failed_frame = None;
+            }
+            Err(err) => {
+                eprintln!("failed to open the frame: {err}");
+                self.frame_refusal = job::frame_refusal_lines(path);
+                self.failed_frame = Some(path.to_path_buf());
+            }
         }
     }
 
@@ -336,6 +350,24 @@ fn show_panes(
     }
 }
 
+/// A fresh model for `lines`, or `None` when `current` already holds them:
+/// a pane's message lines are replaced only on a change, since a fresh model
+/// re-mounts every line.
+fn changed_lines(
+    current: slint::ModelRc<slint::SharedString>,
+    lines: &[String],
+) -> Option<slint::ModelRc<slint::SharedString>> {
+    if current
+        .iter()
+        .map(|line| line.to_string())
+        .eq(lines.iter().cloned())
+    {
+        return None;
+    }
+    let lines: Vec<slint::SharedString> = lines.iter().map(|line| line.as_str().into()).collect();
+    Some(slint::ModelRc::new(slint::VecModel::from(lines)))
+}
+
 /// Reconciles the open renderer cell with the active tab
 /// ([`AppController::canvas_feed`]) and the selected frame, then places both
 /// panes from the textures they hold, scaled and offset to the new view, plus
@@ -360,12 +392,23 @@ pub fn repaint(
             batch.publication,
         )
     });
-    let feed = {
+    let (feed, render_started, message_lines) = {
         let loaded = canvas.borrow().tab();
         let mut controller = controller.lock().unwrap();
         controller.fit_if_unfitted();
-        controller.canvas_feed(loaded)
+        let feed = controller.canvas_feed(loaded);
+        (
+            feed,
+            controller.take_render_started(),
+            controller.composite_message_lines(),
+        )
     };
+    if render_started {
+        poll_checkpoint_render(app.as_weak(), controller.clone(), canvas.clone());
+    }
+    if let Some(lines) = changed_lines(app.get_composite_message_lines(), &message_lines) {
+        app.set_composite_message_lines(lines);
+    }
     match feed {
         CanvasFeed::Keep => {}
         CanvasFeed::Clear => canvas.borrow_mut().clear(),
@@ -407,7 +450,12 @@ pub fn repaint(
     app.set_zoom_readout(readout.into());
     app.set_project_loaded(project_loaded);
     app.set_frame_label(truncate_pane_label(&frame_label).into());
-    app.set_frame_message(canvas.borrow().frame_error().unwrap_or("").into());
+    if let Some(lines) = changed_lines(
+        app.get_frame_message_lines(),
+        canvas.borrow().frame_refusal(),
+    ) {
+        app.set_frame_message_lines(lines);
+    }
     push_brush_cursor(app, &controller.lock().unwrap());
 
     canvas.borrow_mut().request_reads(
@@ -432,6 +480,42 @@ pub fn finish_input_trace() {
             batch.publication,
         );
     }
+}
+
+/// Polls [`AppController::settle_checkpoint_render`] every [`job::POLL`]
+/// until the background render settles, then repaints -- the render's
+/// worker cannot reach the canvas.
+fn poll_checkpoint_render(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+) {
+    slint::Timer::single_shot(job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().settle_checkpoint_render() {
+            repaint(&app, &controller, &canvas);
+        } else {
+            poll_checkpoint_render(app_weak, controller, canvas);
+        }
+    });
+}
+
+/// Polls [`AppController::settle_export`] every [`job::POLL`] until the
+/// background export write settles, then pushes the modal's own state --
+/// [`poll_checkpoint_render`]'s twin for [`job::export_position`].
+fn poll_export(app_weak: slint::Weak<AppWindow>, controller: Arc<Mutex<AppController>>) {
+    slint::Timer::single_shot(job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().settle_export() {
+            push_export_dialog(&app, &controller.lock().unwrap());
+        } else {
+            poll_export(app_weak, controller);
+        }
+    });
 }
 
 fn terminal_input_scope(kind: &'static str, batch: InputBatch) {
@@ -462,11 +546,14 @@ fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::Mea
         | ShellEvent::JobChanged
         | ShellEvent::LoadStarted
         | ShellEvent::LoadReady
-        | ShellEvent::ImportReady => InputSurface::Other,
+        | ShellEvent::ImportReady
+        | ShellEvent::CheckpointsChanged => InputSurface::Other,
         ShellEvent::ProjectsChanged
         | ShellEvent::TabScrollChanged
         | ShellEvent::QuestionRaised(_)
         | ShellEvent::EntryRefused(_)
+        | ShellEvent::MismatchRaised
+        | ShellEvent::LocateReady
         | ShellEvent::OverlayChanged
         | ShellEvent::GalleryScrolled => InputSurface::Gallery,
         ShellEvent::SettingsChanged | ShellEvent::SettingsScrolled => InputSurface::Settings,
@@ -767,7 +854,7 @@ pub fn install_crash_notice(controller: &Arc<Mutex<AppController>>, app: &AppWin
 /// so a test can call it directly without a real event loop (`install`'s
 /// sink needs one; this function does not).
 pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
-    let controller = controller.lock().unwrap();
+    let mut controller = controller.lock().unwrap();
     push_tab_rows(app, &controller);
     push_tab_scroll(app, &controller);
     app.set_show_empty_state(controller.active_project().is_none());
@@ -779,6 +866,8 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     match controller
         .pending_close()
         .or_else(|| controller.pending_quit_copy())
+        .or_else(|| controller.pending_restore_copy())
+        .or_else(|| controller.pending_fuse_copy())
     {
         Some(copy) => {
             app.set_close_guard_title(copy.title.into());
@@ -791,12 +880,21 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
         }
         None => app.set_close_guard_open(false),
     }
+    match controller.pending_checkpoint_delete_copy() {
+        Some((context, body)) => {
+            app.set_checkpoint_delete_context(context.into());
+            app.set_checkpoint_delete_body(body.into());
+            app.set_checkpoint_delete_open(true);
+        }
+        None => app.set_checkpoint_delete_open(false),
+    }
     // The dock's own gate for the tab row, the settings panel and the
     // "No project open." note (`ui/shell/dock.slint`) -- otherwise stuck at
     // whatever a canvas gesture (`repaint`, above) last set it to, since a
     // tab switch or close never fires one of its own.
     app.set_project_loaded(controller.active_project().is_some());
     app.set_composite_ready(controller.composite_ready());
+    push_overlay_controls(app, &controller);
     app.set_checkpoint_line(controller.checkpoint_panel_line().into());
     app.set_plus_selected(controller.plus_selected());
     app.set_skipped_notice(controller.notice().unwrap_or_default().into());
@@ -806,6 +904,7 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     push_job(app, &controller.job_view());
     push_settings_panel(app, &controller);
     push_images_panel(app, &controller);
+    push_checkpoint_panel(app, &mut controller);
     push_projects_overlay(app, &controller);
     push_divergence(app, &controller);
 }
@@ -933,6 +1032,26 @@ fn start_job_timer(
         }
     });
     *job_timer.borrow_mut() = Some(timer);
+}
+
+/// Starts the job poll timer when an answer to a dialog left a run live or
+/// queued -- the fuse question's answers start one from a dialog callback.
+fn poll_if_work_pending(
+    app_weak: &slint::Weak<AppWindow>,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+    job_timer: &Rc<RefCell<Option<slint::Timer>>>,
+    toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
+) {
+    if controller.lock().unwrap().work_pending() {
+        start_job_timer(
+            app_weak.clone(),
+            controller.clone(),
+            canvas.clone(),
+            job_timer.clone(),
+            toast_timer.clone(),
+        );
+    }
 }
 
 /// Polls [`AppController::load_in_flight`], opening each `queued` path once
@@ -1136,7 +1255,6 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     record_timing(TimingCounter::RowUpdates, updates as u64);
     app.set_images_header_text(panel.header_text.into());
     app.set_images_list_viewport_y(-controller.images_scroll_y());
-    app.set_images_no_source_row(panel.no_source_row);
     let sort = match controller.frame_sort() {
         Some(crate::images::FrameSort::Name) => "name",
         Some(crate::images::FrameSort::CaptureTime) => "capture-time",
@@ -1163,6 +1281,46 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     }
 }
 
+/// Pushes the `Checkpoints` panel's whole state -- [`push_images_panel`]'s
+/// twin.
+pub fn push_checkpoint_panel(app: &AppWindow, controller: &mut AppController) {
+    app.set_checkpoint_export_enabled(controller.export_enabled());
+    let panel = controller.checkpoints_panel();
+    let flash = controller.take_checkpoint_flash();
+    let rows: Vec<GeneratedCheckpointEntry> = panel
+        .entries
+        .iter()
+        .map(|entry| GeneratedCheckpointEntry {
+            kind: if entry.separator_label.is_some() {
+                "separator".into()
+            } else {
+                "row".into()
+            },
+            label: entry.separator_label.clone().unwrap_or_default().into(),
+            algorithm: entry.algorithm.clone().into(),
+            time_text: entry.time_text.clone().into(),
+            top: entry.top,
+            selected: entry.selected,
+            flash: flash.is_some() && entry.fresh == flash,
+            deletable: panel.row_count > 1,
+            // No next separator sticks solid once reached; a value far
+            // past any real content height so the "pushed out" comparison
+            // never trips.
+            next_separator_top: entry.next_separator_top.unwrap_or(1.0e7),
+        })
+        .collect();
+    let existing = app.get_checkpoint_rows();
+    if existing.row_count() == rows.len() {
+        for (i, row) in rows.into_iter().enumerate() {
+            existing.set_row_data(i, row);
+        }
+    } else {
+        app.set_checkpoint_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    }
+    app.set_checkpoint_content_height(panel.content_height);
+    app.set_checkpoint_scroll_y(panel.scroll_y);
+}
+
 /// Pushes the editor toolbar's own state -- `AppController::brush_toolbar_view`
 /// -- the one place `ShellEvent::EditorChanged` is performed. Numeric
 /// readouts are formatted here, never in `.slint`.
@@ -1176,8 +1334,15 @@ pub fn push_editor_toolbar(app: &AppWindow, controller: &AppController) {
     app.set_brush_picking(view.picking);
     app.set_can_undo(view.can_undo);
     app.set_can_redo(view.can_redo);
+    app.set_can_save_checkpoint(view.can_save_checkpoint);
+    push_overlay_controls(app, controller);
+}
 
+/// Pushes the bottom bar's overlay controls: state, opacity readout and
+/// whether the active tab has a fuse to draw over.
+fn push_overlay_controls(app: &AppWindow, controller: &AppController) {
     let overlay = controller.overlay_view();
+    app.set_overlay_available(controller.overlay_available());
     app.set_overlay_on(overlay.on);
     app.set_overlay_fraction(overlay.opacity);
     app.set_overlay_text(format!("{:.0}%", overlay.opacity * 100.0).into());
@@ -1588,7 +1753,11 @@ pub fn install(
             let keep_shown = {
                 let mut controller = controller.lock().unwrap();
                 controller.window_close();
-                controller.pending_close().is_some() || controller.pending_quit_copy().is_some()
+                controller.pending_close().is_some()
+                    || controller.pending_quit_copy().is_some()
+                    || controller.pending_restore_copy().is_some()
+                    || controller.pending_fuse_copy().is_some()
+                    || controller.pending_checkpoint_delete_copy().is_some()
             };
             if let Some(app) = app_weak.upgrade() {
                 repaint(&app, &controller, &canvas);
@@ -1630,6 +1799,79 @@ pub fn install(
             record_direct_input();
             controller.lock().unwrap().checkpoint_export_requested()
         }
+    });
+    app.on_export_confirmed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            // The refused state's confirm button reads "Locate frames…" and
+            // needs a folder, not a save destination -- the same
+            // locate-by-hash flow the missing-sources notice already runs,
+            // re-attempting the export once it settles
+            // (`AppController::settle_locate`).
+            if controller.lock().unwrap().export_stage() == "refused" {
+                if let Some(folder) = crate::picker::pick_entry() {
+                    controller.lock().unwrap().export_locate_frames(folder);
+                }
+                return;
+            }
+            let started = {
+                let mut controller = controller.lock().unwrap();
+                let format = controller.export_format();
+                controller.export_confirmed(move |proposed| {
+                    crate::picker::pick_save_image(proposed, format)
+                });
+                controller.take_export_started()
+            };
+            if let Some(app) = app_weak.upgrade() {
+                push_export_dialog(&app, &controller.lock().unwrap());
+            }
+            if started {
+                poll_export(app_weak.clone(), controller.clone());
+            }
+        }
+    });
+    app.on_export_cancelled({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().cancel_export()
+    });
+    app.on_export_format_chosen({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |label| export_edit(&app_weak, &controller, |c| c.export_select_format(&label))
+    });
+    app.on_export_menu_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |id| export_edit(&app_weak, &controller, |c| c.export_toggle_menu(&id))
+    });
+    app.on_export_option_chosen({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |id, variant| export_edit(&app_weak, &controller, |c| c.export_choose(&id, &variant))
+    });
+    app.on_export_quality_changed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |fraction| {
+            export_edit(&app_weak, &controller, |c| {
+                c.export_set_quality_fraction(fraction)
+            })
+        }
+    });
+    app.on_export_chroma_chosen({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |id, label| {
+            export_edit(&app_weak, &controller, |c| {
+                c.export_choose_label(&id, &label)
+            })
+        }
+    });
+    app.on_export_metadata_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || export_edit(&app_weak, &controller, |c| c.export_toggle_metadata())
     });
     // The editor toolbar: each callback is a single forward into the
     // controller method already driving the matching input-map row.
@@ -1677,6 +1919,16 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || dispatch(&controller, &canvas, &app_weak, AppController::undo)
+    });
+    app.on_save_checkpoint_requested({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.save_checkpoint();
+            });
+        }
     });
     app.on_redo_requested({
         let controller = controller.clone();
@@ -1847,7 +2099,7 @@ pub fn install(
     });
     // The five chrome keys are consulted before the rebindable table on
     // every key press, whether or not the projects overlay is open, so none
-    // of them can be shadowed by a user's `input.toml`.
+    // of them can be shadowed by a user's `settings.toml` `[input]` table.
     app.on_canvas_key_pressed({
         let controller = controller.clone();
         let canvas = canvas.clone();
@@ -2236,19 +2488,75 @@ pub fn install(
         let load_timer = load_timer.clone();
         move || {
             record_gallery_input();
+            // Only the folder-empty refusal offers a folder picker; every
+            // other refusal's button just closes, read before
+            // `dismiss_refusal` would clear it.
+            let is_folder_empty = controller.lock().unwrap().refusal_title().is_none();
             controller.lock().unwrap().dismiss_refusal();
             if let Some(app) = app_weak.upgrade() {
                 app.set_refusal_open(false);
                 direct_publication_scope(InputSurface::Gallery);
                 repaint(&app, &controller, &canvas);
             }
-            open_from_picker(
-                &controller,
-                &canvas,
-                &app_weak,
-                &load_timer,
-                crate::picker::pick_entry(),
-            )
+            if is_folder_empty {
+                open_from_picker(
+                    &controller,
+                    &canvas,
+                    &app_weak,
+                    &load_timer,
+                    crate::picker::pick_entry(),
+                )
+            }
+        }
+    });
+    app.on_mismatch_open_anyway({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().open_anyway();
+            if let Some(app) = app_weak.upgrade() {
+                push_projects(&app, &controller);
+                push_project_dialogs(&app, &controller.lock().unwrap());
+            }
+        }
+    });
+    app.on_mismatch_locate_frames({
+        let controller = controller.clone();
+        move || {
+            if let Some(folder) = crate::picker::pick_entry() {
+                controller
+                    .lock()
+                    .unwrap()
+                    .locate_frames(LocateTarget::Mismatch, folder);
+            }
+        }
+    });
+    app.on_mismatch_cancelled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().cancel_mismatch();
+            if let Some(app) = app_weak.upgrade() {
+                push_project_dialogs(&app, &controller.lock().unwrap());
+            }
+        }
+    });
+    app.on_sources_missing_locate_frames({
+        let controller = controller.clone();
+        move || {
+            if let Some(folder) = crate::picker::pick_entry() {
+                controller.lock().unwrap().locate_sources_notice(folder);
+            }
+        }
+    });
+    app.on_sources_missing_closed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().close_sources_notice();
+            if let Some(app) = app_weak.upgrade() {
+                push_project_dialogs(&app, &controller.lock().unwrap());
+            }
         }
     });
     app.on_skipped_notice_dismissed({
@@ -2420,6 +2728,85 @@ pub fn install(
                 .set_images_viewport_height(height)
         }
     });
+    // The `Checkpoints` panel's own scroll and selection -- `FFScrollbar`'s
+    // twin wiring above.
+    app.on_checkpoint_scrolled({
+        let controller = controller.clone();
+        move |delta| controller.lock().unwrap().scroll_checkpoints_panel(delta)
+    });
+    app.on_checkpoint_scrollbar_pointer({
+        let controller = controller.clone();
+        move |kind, y| {
+            let kind = match kind {
+                0 => PointerKind::Down,
+                2 => PointerKind::Move,
+                _ => PointerKind::Up,
+            };
+            controller
+                .lock()
+                .unwrap()
+                .checkpoints_scrollbar_pointer(kind, y);
+        }
+    });
+    app.on_checkpoint_scrollbar_dragged({
+        let controller = controller.clone();
+        move |y| controller.lock().unwrap().checkpoints_scrollbar_dragged(y)
+    });
+    app.on_checkpoint_viewport_height_changed({
+        let controller = controller.clone();
+        move |height| {
+            controller
+                .lock()
+                .unwrap()
+                .set_checkpoints_viewport_height(height)
+        }
+    });
+    controller
+        .lock()
+        .unwrap()
+        .set_checkpoints_viewport_height(app.get_checkpoint_viewport_height());
+    app.on_checkpoint_selected({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |c| {
+                c.select_checkpoint_row(i as usize)
+            })
+        }
+    });
+
+    app.on_checkpoint_delete_requested({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |i| {
+            dispatch(&controller, &canvas, &app_weak, |c| {
+                c.request_checkpoint_delete(i as usize)
+            })
+        }
+    });
+    app.on_checkpoint_delete_cancelled({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch_gallery(&controller, &canvas, &app_weak, |c| {
+                c.cancel_checkpoint_delete()
+            })
+        }
+    });
+    app.on_checkpoint_delete_confirmed({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch_gallery(&controller, &canvas, &app_weak, |c| {
+                c.confirm_checkpoint_delete()
+            })
+        }
+    });
+
     app.on_images_add_frames_requested({
         let controller = controller.clone();
         let canvas = canvas.clone();
@@ -2509,10 +2896,13 @@ pub fn install(
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let job_timer = job_timer.clone();
+        let toast_timer = toast_timer.clone();
         move || {
             dispatch(&controller, &canvas, &app_weak, |controller| {
                 controller.confirm_frame_change();
             });
+            poll_if_work_pending(&app_weak, &controller, &canvas, &job_timer, &toast_timer);
         }
     });
     app.on_frame_warning_secondary_pressed({
@@ -2570,25 +2960,30 @@ pub fn install(
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let job_timer = job_timer.clone();
         let toast_timer = toast_timer.clone();
         move || {
             record_gallery_input();
             save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
                 c.close_guard_secondary_pressed(crate::picker::pick_save_project)
-            })
+            });
+            poll_if_work_pending(&app_weak, &controller, &canvas, &job_timer, &toast_timer);
         }
     });
     app.on_close_guard_confirmed({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
+        let job_timer = job_timer.clone();
+        let toast_timer = toast_timer.clone();
         move || {
             dispatch_gallery(
                 &controller,
                 &canvas,
                 &app_weak,
                 AppController::close_guard_confirmed,
-            )
+            );
+            poll_if_work_pending(&app_weak, &controller, &canvas, &job_timer, &toast_timer);
         }
     });
     // The projects overlay: the tab strip's own toggle, the gallery's
@@ -2708,8 +3103,12 @@ pub fn install(
             match kind {
                 Some("sources-missing") => {
                     record_gallery_input();
-                    if let Some(folder) = crate::picker::pick_entry() {
-                        controller.lock().unwrap().locate_missing_sources(i, folder);
+                    let tab_id = controller.lock().unwrap().tab_id_at(i);
+                    if let (Some(tab_id), Some(folder)) = (tab_id, crate::picker::pick_entry()) {
+                        controller
+                            .lock()
+                            .unwrap()
+                            .locate_frames(LocateTarget::Tab(tab_id), folder);
                     }
                 }
                 Some("failed") | Some("cancelled") => {
@@ -2810,6 +3209,112 @@ pub fn install(
     }
 }
 
+/// Pushes the refusal, fingerprint-mismatch and missing-sources dialogs'
+/// own state -- every place any of the three can newly show or close.
+fn push_project_dialogs(app: &AppWindow, controller: &AppController) {
+    match controller.mismatch_copy() {
+        Some((_, body, file_name)) => {
+            app.set_mismatch_context(file_name.into());
+            app.set_mismatch_body(body.into());
+            app.set_mismatch_open(true);
+        }
+        None => app.set_mismatch_open(false),
+    }
+    match controller.sources_notice() {
+        Some((_, body, file_name)) => {
+            app.set_sources_missing_context(file_name.into());
+            app.set_sources_missing_body(body.into());
+            app.set_sources_missing_open(true);
+        }
+        None => app.set_sources_missing_open(false),
+    }
+    let folder_empty_refusal = controller.refusal_title().is_none();
+    app.set_refusal_title(
+        controller
+            .refusal_title()
+            .unwrap_or("No frames here")
+            .into(),
+    );
+    app.set_refusal_body(
+        controller
+            .last_refusal()
+            .unwrap_or("FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.")
+            .into(),
+    );
+    app.set_refusal_button_label(
+        if folder_empty_refusal {
+            "Pick another folder…"
+        } else {
+            "Close"
+        }
+        .into(),
+    );
+}
+
+/// Pushes the export modal's own state -- every place it can newly open,
+/// change stage or close. `pub` so a test can call it directly, the same
+/// reason [`push_projects`] is.
+pub fn push_export_dialog(app: &AppWindow, controller: &AppController) {
+    app.set_export_open(controller.export_open());
+    let (context, what) = controller.export_copy().unwrap_or(("", ""));
+    app.set_export_context(context.into());
+    app.set_export_what(what.into());
+    app.set_export_stage(controller.export_stage().into());
+    app.set_export_can_locate(controller.export_can_locate());
+    app.set_export_writing_file_name(controller.export_destination_name().into());
+    let lines: Vec<slint::SharedString> = controller
+        .export_refusal_lines()
+        .iter()
+        .map(|line| line.as_str().into())
+        .collect();
+    app.set_export_refusal_lines(slint::ModelRc::new(slint::VecModel::from(lines)));
+    if let Some(view) = controller.export_view() {
+        push_export_view(app, &view);
+    }
+}
+
+/// Applies one edit to the open export modal, then pushes it.
+fn export_edit(
+    app_weak: &slint::Weak<AppWindow>,
+    controller: &Arc<Mutex<AppController>>,
+    edit: impl FnOnce(&mut AppController),
+) {
+    edit(&mut controller.lock().unwrap());
+    if let Some(app) = app_weak.upgrade() {
+        push_export_dialog(&app, &controller.lock().unwrap());
+    }
+}
+
+fn string_model(items: &[String]) -> slint::ModelRc<slint::SharedString> {
+    let items: Vec<slint::SharedString> = items.iter().map(|s| s.as_str().into()).collect();
+    slint::ModelRc::new(slint::VecModel::from(items))
+}
+
+/// Pushes the export modal's format control, settings group and `Metadata`
+/// switch. `pub` so the startup preview shares it.
+pub fn push_export_view(app: &AppWindow, view: &crate::export_settings::ExportView) {
+    app.set_export_format_segments(string_model(&view.segments));
+    app.set_export_format_selected(view.selected.as_str().into());
+    app.set_export_settings_heading(view.heading.as_str().into());
+    let rows: Vec<ExportRowView> = view
+        .rows
+        .iter()
+        .map(|row| ExportRowView {
+            id: row.id.as_str().into(),
+            label: row.label.as_str().into(),
+            value_text: row.value_text.as_str().into(),
+            fraction: row.fraction,
+            choices: string_model(&row.choices),
+            choice_ids: string_model(&row.choice_ids),
+            selected: row.selected.as_str().into(),
+            open: row.menu_open,
+        })
+        .collect();
+    app.set_export_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
+    app.set_export_slider_group(view.slider_group);
+    app.set_export_metadata_on(view.metadata);
+}
+
 /// Performs one [`ShellEvent`] against the window. The only function in the
 /// crate that names `winit`.
 fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: ShellEvent) {
@@ -2861,19 +3366,19 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             };
             app.set_dock_tab(tab.into());
         }
-        // Never reachable while `export_enabled()` is always `false` --
-        // but the window has nothing to do with it either way.
-        ShellEvent::CheckpointExportRequested => {}
+        // Every place the export modal opens, changes stage or closes.
+        ShellEvent::CheckpointExportRequested => {
+            push_export_dialog(app, &controller.lock().unwrap());
+        }
         // Never reachable while `undock_enabled()` is always `true` with
         // both panes docked.
         ShellEvent::PaneUndockRequested(_) => {}
-        // A no-op here regardless of `Action::implemented()`: the viewport
-        // mutation itself already happened synchronously inside
-        // `AppController::emit_action` before this event was even raised,
-        // and the repaint it needs runs on the
-        // *callback* path (`repaint`, above), not through the sink --
-        // `perform` runs off a `Send + Sync` closure that can hold neither
-        // an `Rc` nor the GPU state `CanvasRenderer` needs.
+        // A no-op here: the viewport mutation already happened synchronously
+        // inside `AppController::emit_action` before this event was raised,
+        // and the repaint it needs runs on the callback path (`repaint`,
+        // above), not through the sink -- `perform` runs off a
+        // `Send + Sync` closure that can hold neither an `Rc` nor the GPU
+        // state `CanvasRenderer` needs.
         ShellEvent::Input(_) => {}
         // A write's outcome updates the controller's own state first -- the
         // thread that produced it holds no lock on `self` -- then rebuilds
@@ -2895,10 +3400,17 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         // The three entry-path events. `EntryRefused`'s
         // message is already rendered by `AppController::refuse`, never
         // formatted here.
-        ShellEvent::ProjectsChanged => push_projects(app, controller),
+        ShellEvent::ProjectsChanged => {
+            push_projects(app, controller);
+            push_project_dialogs(app, &controller.lock().unwrap());
+        }
         ShellEvent::TabScrollChanged => push_tab_scroll(app, &controller.lock().unwrap()),
         ShellEvent::QuestionRaised(question) => push_question(app, &question),
-        ShellEvent::EntryRefused(_) => app.set_refusal_open(true),
+        ShellEvent::MismatchRaised => push_project_dialogs(app, &controller.lock().unwrap()),
+        ShellEvent::EntryRefused(_) => {
+            app.set_refusal_open(true);
+            push_project_dialogs(app, &controller.lock().unwrap());
+        }
         ShellEvent::SettingsChanged => push_settings_panel(app, &controller.lock().unwrap()),
         ShellEvent::SettingsScrolled => {
             push_settings_scroll(app, &controller.lock().unwrap().settings_panel());
@@ -2921,8 +3433,21 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::ImagesScrolled => {
             app.set_images_list_viewport_y(-controller.lock().unwrap().images_scroll_y());
         }
-        ShellEvent::EditorChanged => push_editor_toolbar(app, &controller.lock().unwrap()),
-        ShellEvent::OverlayChanged => push_projects_overlay(app, &controller.lock().unwrap()),
+        ShellEvent::CheckpointsChanged => {
+            let mut controller = controller.lock().unwrap();
+            push_checkpoint_panel(app, &mut controller);
+            app.set_projects_save_enabled(controller.save_enabled());
+        }
+        ShellEvent::EditorChanged => {
+            let controller = controller.lock().unwrap();
+            push_editor_toolbar(app, &controller);
+            app.set_projects_save_enabled(controller.save_enabled());
+        }
+        ShellEvent::OverlayChanged => {
+            let controller = controller.lock().unwrap();
+            push_projects_overlay(app, &controller);
+            push_project_dialogs(app, &controller);
+        }
         ShellEvent::GalleryScrolled => {
             app.set_gallery_scroll_y(controller.lock().unwrap().gallery_scroll_y());
         }
@@ -2944,9 +3469,18 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
                     push_question(app, &question);
                     push_brush_cursor(app, &controller.lock().unwrap());
                 }
+                // A fingerprint mismatch opens no tab: `pending_mismatch`
+                // carries what the mismatch dialog needs.
+                Some(OpenOutcome::Mismatch(_)) => {
+                    let controller = controller.lock().unwrap();
+                    push_project_dialogs(app, &controller);
+                    push_brush_cursor(app, &controller);
+                }
                 Some(OpenOutcome::Refused(_)) => {
                     app.set_refusal_open(true);
-                    push_brush_cursor(app, &controller.lock().unwrap());
+                    let controller = controller.lock().unwrap();
+                    push_project_dialogs(app, &controller);
+                    push_brush_cursor(app, &controller);
                 }
                 None => {}
             }
@@ -2960,6 +3494,25 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             let mut controller = controller.lock().unwrap();
             controller.settle_import();
             push_images_panel(app, &controller);
+        }
+        // A `Locate frames…` verification (`AppController::locate_frames`)
+        // is ready to settle -- relocates the target's frames, or raises
+        // the refusal dialog through `settle_locate`'s own
+        // `refuse_message`, which raises its own `EntryRefused` event.
+        ShellEvent::LocateReady => {
+            let started = {
+                let mut controller = controller.lock().unwrap();
+                controller.settle_locate();
+                push_projects_overlay(app, &controller);
+                push_project_dialogs(app, &controller);
+                // A refused export waiting on this same verification may
+                // have just been retried (`AppController::retry_export`).
+                push_export_dialog(app, &controller);
+                controller.take_export_started()
+            };
+            if started {
+                poll_export(app.as_weak(), controller.clone());
+            }
         }
     }
 }

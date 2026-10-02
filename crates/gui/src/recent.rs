@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The `Recent` list's own file: TOML at `<config_dir>/recent.toml`, capped
-//! at [`MAX_ENTRIES`](crate::recent::MAX_ENTRIES), most recent first. No
-//! `use slint::` anywhere in this file, mirroring `crate::input_config`.
+//! The `Recent` list's own table: `[recent]` in `<config_dir>/settings.toml`,
+//! capped at [`MAX_ENTRIES`](crate::recent::MAX_ENTRIES), most recent first.
+//! No `use slint::` anywhere in this file, mirroring `crate::input_config`.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::settings;
 
 /// The most entries the file ever holds.
 pub const MAX_ENTRIES: usize = 5;
@@ -18,10 +19,8 @@ pub struct RecentEntry {
     pub name: String,
     pub folder: PathBuf,
     /// The exact path a click on this row reopens: a project's own `.ffp`,
-    /// or an unsaved group's source folder. `None` for a row written before
-    /// this field existed, which a click reopens by `folder` instead.
-    #[serde(default)]
-    pub path: Option<PathBuf>,
+    /// or an unsaved group's source folder.
+    pub path: PathBuf,
     /// Unix seconds.
     pub opened_at: i64,
 }
@@ -32,46 +31,53 @@ struct RecentFile {
     entries: Vec<RecentEntry>,
 }
 
-/// Loads the list from `<config_dir>/recent.toml`. A missing file or a
-/// parse failure both read as an empty list -- there is nothing here worth
-/// refusing a whole file over, unlike `input_config::load`'s bindings.
-pub fn load(config_dir: &Path) -> Vec<RecentEntry> {
-    let path = config_dir.join("recent.toml");
-    let Ok(src) = fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    toml::from_str::<RecentFile>(&src)
-        .map(|f| f.entries)
-        .unwrap_or_default()
+#[derive(Debug, Default, Deserialize)]
+struct SettingsWrapper {
+    #[serde(default)]
+    recent: Option<RecentFile>,
 }
 
-/// Writes `entries` to `<config_dir>/recent.toml`, creating `config_dir` if
-/// needed.
-pub fn save(config_dir: &Path, entries: &[RecentEntry]) -> std::io::Result<()> {
-    fs::create_dir_all(config_dir)?;
-    let path = config_dir.join("recent.toml");
-    let body = toml::to_string_pretty(&RecentFile {
+/// Loads `[recent]` from `settings.toml`. Any failure -- the table absent,
+/// broken (a row without `path` included), or the file unreadable -- reads
+/// as an empty list; there is nothing here worth refusing a whole file over,
+/// unlike `input_config::load`'s bindings.
+pub fn load(config_dir: &Path) -> Vec<RecentEntry> {
+    let (_, read_result) = settings::read(config_dir);
+    let src = match read_result {
+        Ok(text) => text.unwrap_or_default(),
+        // The file exists but could not be read (permissions, non-UTF-8
+        // bytes, a directory in its place) -- treated the same as broken.
+        Err(_) => return Vec::new(),
+    };
+
+    match toml::from_str::<SettingsWrapper>(&src) {
+        Ok(SettingsWrapper {
+            recent: Some(file), ..
+        }) => file.entries,
+        _ => Vec::new(),
+    }
+}
+
+/// Writes `entries` as `settings.toml`'s `[recent]` table, creating
+/// `config_dir` if needed. Every other table in the file is left as it was.
+pub fn save(config_dir: &Path, entries: &[RecentEntry]) -> Result<PathBuf, settings::WriteError> {
+    let table = settings::to_table(&RecentFile {
         entries: entries.to_vec(),
-    })
-    .expect("RecentFile always serialises");
-    fs::write(path, body)
+    });
+    settings::write_table(config_dir, "recent", table)
 }
 
 /// Records a fresh open at the front of `entries`, dropping any existing
 /// entry for the same target and capping the result at [`MAX_ENTRIES`].
-/// Two entries name the same target when both carry a `path` and those
-/// match; otherwise their `folder`s are compared.
+/// Two entries name the same target when their `path`s match.
 pub fn record(
     entries: &mut Vec<RecentEntry>,
     name: String,
     folder: PathBuf,
-    path: Option<PathBuf>,
+    path: PathBuf,
     opened_at: i64,
 ) {
-    entries.retain(|e| match (&path, &e.path) {
-        (Some(p), Some(ep)) => ep != p,
-        _ => e.folder != folder,
-    });
+    entries.retain(|e| e.path != path);
     entries.insert(
         0,
         RecentEntry {
@@ -94,7 +100,7 @@ const MONTH_NAMES: [&str; 12] = [
 ];
 
 /// Days since the Unix epoch -> `(year, month, day)`, proleptic Gregorian --
-/// a compact public-domain day-to-calendar conversion, since this workspace
+/// a compact public-domain day-to-calendar algorithm, since this workspace
 /// carries no date crate.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;

@@ -12,24 +12,24 @@
 //! resume path, the coverage refusal or the cancel semantics, and it is
 //! the only shape the format allows.
 //!
-//! This function is where all four format commitments are made concrete at
-//! once: the [`Manifest::format_version`] it stamps, the [`BlobKind`] it
-//! records on every blob, the hash it takes over *uncompressed* bytes with
-//! its algorithm named, and the fully serialized [`Checkpoint`] --
-//! `parent: None`, `ops: []` -- it writes beside them.
+//! This function is where the format commitments are made concrete at once:
+//! the entry layout, the [`BlobKind`] it records on every blob, the hash it
+//! takes over *uncompressed* bytes with its algorithm named, and the fully
+//! serialized [`Checkpoint`] -- `parent: None`, `ops: []` -- it writes
+//! beside them.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::blob::{self, Plane, StagedBlob, ZSTD_LEVEL};
-use super::checkpoint::Checkpoint;
+use super::checkpoint::{Checkpoint, FuseRecord, Op};
 use super::container::ProjectWriter;
 use super::error::ProjectError;
 use super::manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
     SourceResolution,
 };
-use super::{FORMAT_VERSION, HASH_ALGORITHM};
+use super::{HASH_ALGORITHM, Project};
 use crate::align::Registration;
 use crate::params::ParamValues;
 
@@ -48,8 +48,8 @@ pub struct SealRequest<'a> {
     pub align: Option<AlignRecord>,
     /// Every frame's transform and the applied crop.
     pub registration: Registration,
-    /// Exactly the `ImageDescription` the staged composite carries, so
-    /// `export` re-emits a byte-identical TIFF.
+    /// The `ImageDescription` an export of the fused checkpoint's own
+    /// gather writes into its TIFF's IFD.
     pub composite_description: String,
     pub label: Option<String>,
     pub metrics: Metrics,
@@ -126,9 +126,9 @@ fn seal_staged(
     let composite_record = record(&composite);
     let zmap_record = record(&zmap);
     let checkpoint_id = Checkpoint::derive_id(&stack_fingerprint, &zmap.hash, created_at);
+    let blobs = blob_records(&composite_record, &zmap_record);
 
     let manifest = Manifest {
-        format_version: FORMAT_VERSION,
         producer: format!("FocusForge {}", env!("CARGO_PKG_VERSION")),
         created_at,
         hash_algorithm: HASH_ALGORITHM.to_string(),
@@ -156,7 +156,7 @@ fn seal_staged(
             description: request.composite_description.clone(),
             frame_count,
         },
-        blobs: blob_records(&composite_record, &zmap_record),
+        blobs,
         metrics: request.metrics,
         checkpoint: checkpoint_id.clone(),
     };
@@ -171,6 +171,14 @@ fn seal_staged(
         params: request.params.clone(),
         created_at,
         label: request.label.clone(),
+        fuse: Some(FuseRecord {
+            composite: manifest.composite.clone(),
+            align: manifest.align.clone(),
+            registration: manifest.registration.clone(),
+            sources: manifest.sources.clone(),
+            metrics: manifest.metrics,
+        }),
+        hidden: false,
     };
 
     let mut writer = ProjectWriter::create(request.project_path)?;
@@ -218,84 +226,265 @@ pub struct HeldCheckpoint {
     pub created_at: i64,
 }
 
-/// Writes `held`, in order and each with its own `created_at`, as one chain
-/// at `target` -- onto the project there when `onto_existing`. Built at a
-/// sibling temporary path, so relative sources resolve as at `target`, and
-/// renamed over it once; on error `target` is left as it was.
-pub fn seal_held(
-    target: &Path,
-    held: &[HeldCheckpoint],
-    onto_existing: bool,
-) -> Result<SealedProject, ProjectError> {
-    if held.is_empty() {
-        return Err(ProjectError::container(target, "no checkpoint to save"));
+/// Where an in-memory checkpoint is recorded: under a checkpoint the project
+/// file already holds, or under an earlier entry of the same list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParentRef {
+    Saved(String),
+    /// Index of an earlier entry of the list being written.
+    Entry(usize),
+}
+
+/// What an in-memory checkpoint holds.
+#[derive(Debug, Clone)]
+// A project holds a handful of entries; boxing the fuse would touch every constructor.
+#[allow(clippy::large_enum_variant)]
+pub enum InMemoryKind {
+    /// A finished fuse's planes.
+    Fused(HeldCheckpoint),
+    /// Ops replayed over the parent's Z-Map.
+    Ops { ops: Vec<Op>, created_at: i64 },
+}
+
+/// One checkpoint kept outside any container, with the parent it is written
+/// under. Only a never-saved project's first entry has no parent.
+#[derive(Debug, Clone)]
+pub struct InMemoryCheckpoint {
+    pub kind: InMemoryKind,
+    pub parent: Option<ParentRef>,
+}
+
+impl InMemoryCheckpoint {
+    /// Unix seconds, UTC, stamped when the checkpoint was taken.
+    pub fn created_at(&self) -> i64 {
+        match &self.kind {
+            InMemoryKind::Fused(held) => held.created_at,
+            InMemoryKind::Ops { created_at, .. } => *created_at,
+        }
     }
+}
+
+/// Which of `entries` [`seal_in_memory`] writes: every one except an entry
+/// `deletes` names that is not `keep` and that no written entry is recorded
+/// under.
+pub fn kept_entries(
+    entries: &[InMemoryCheckpoint],
+    deletes: &[ParentRef],
+    keep: Option<&ParentRef>,
+) -> Vec<bool> {
+    let mut written = vec![true; entries.len()];
+    for i in (0..entries.len()).rev() {
+        let this = ParentRef::Entry(i);
+        written[i] = !deletes.contains(&this)
+            || keep == Some(&this)
+            || entries[i + 1..]
+                .iter()
+                .zip(&written[i + 1..])
+                .any(|(entry, written)| *written && entry.parent.as_ref() == Some(&this));
+    }
+    written
+}
+
+/// Writes the [`kept_entries`], each under its own parent, hides `deletes`
+/// (see [`super::delete_checkpoint`]) and removes hidden checkpoints nothing
+/// visible is built on, sparing `keep` and its ancestors: one rename over
+/// `target` (onto the project there when `onto_existing`). Returns the id
+/// written per written entry. On error `target` is left as it was; bad
+/// references and unknown deletes are refused before any write.
+pub fn seal_in_memory(
+    target: &Path,
+    entries: &[InMemoryCheckpoint],
+    deletes: &[ParentRef],
+    keep: Option<&ParentRef>,
+    onto_existing: bool,
+) -> Result<Vec<String>, ProjectError> {
+    plan_in_memory(target, entries, deletes, keep, onto_existing)?;
     let mut name = target
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_default();
     name.push(".saving");
     let temp = target.with_file_name(name);
-    let result = seal_chain(target, &temp, held, onto_existing).and_then(|mut sealed| {
-        std::fs::rename(&temp, target).map_err(|source| ProjectError::io(target, source))?;
-        sealed.path = target.to_path_buf();
-        Ok(sealed)
-    });
+    let result =
+        write_in_memory(target, &temp, entries, deletes, keep, onto_existing).and_then(|ids| {
+            std::fs::rename(&temp, target).map_err(|source| ProjectError::io(target, source))?;
+            Ok(ids)
+        });
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
     result
 }
 
-fn seal_chain(
+fn plan_in_memory(
+    target: &Path,
+    entries: &[InMemoryCheckpoint],
+    deletes: &[ParentRef],
+    keep: Option<&ParentRef>,
+    onto_existing: bool,
+) -> Result<(), ProjectError> {
+    let refuse = |message: String| ProjectError::container(target, message);
+    if entries.is_empty() && (deletes.is_empty() || !onto_existing) {
+        return Err(refuse("no checkpoint to save".to_string()));
+    }
+    let opened = if onto_existing {
+        Some(Project::open(target)?)
+    } else {
+        None
+    };
+
+    for (i, entry) in entries.iter().enumerate() {
+        let root = !onto_existing && i == 0;
+        if root && (entry.parent.is_some() || !matches!(entry.kind, InMemoryKind::Fused(_))) {
+            return Err(refuse(
+                "the first checkpoint of a new project must be a fuse with no parent".to_string(),
+            ));
+        }
+        match &entry.parent {
+            None if !root => {
+                return Err(refuse(format!("checkpoint {i} has no parent")));
+            }
+            None => {}
+            Some(ParentRef::Entry(j)) if *j >= i => {
+                return Err(refuse(format!(
+                    "checkpoint {i} names checkpoint {j} as its parent, which is not before it"
+                )));
+            }
+            Some(ParentRef::Entry(_)) => {}
+            Some(ParentRef::Saved(id)) => match &opened {
+                Some(project) => {
+                    project.history().get(id)?;
+                }
+                None => {
+                    return Err(refuse(format!(
+                        "checkpoint {i} names saved checkpoint {id}, but there is no saved project"
+                    )));
+                }
+            },
+        }
+    }
+
+    for reference in deletes.iter().chain(keep) {
+        match (reference, &opened) {
+            (ParentRef::Entry(i), _) if *i >= entries.len() => {
+                return Err(refuse(format!("checkpoint {i} is not in the list")));
+            }
+            (ParentRef::Entry(_), _) => {}
+            (ParentRef::Saved(id), Some(project)) => {
+                project.history().get(id)?;
+            }
+            (ParentRef::Saved(id), None) => {
+                return Err(refuse(format!(
+                    "saved checkpoint {id} is named, but there is no saved project"
+                )));
+            }
+        }
+    }
+    if !onto_existing && !kept_entries(entries, deletes, keep)[0] {
+        return Err(refuse("no checkpoint to save".to_string()));
+    }
+    Ok(())
+}
+
+fn write_in_memory(
     target: &Path,
     temp: &Path,
-    held: &[HeldCheckpoint],
+    entries: &[InMemoryCheckpoint],
+    deletes: &[ParentRef],
+    keep: Option<&ParentRef>,
     onto_existing: bool,
-) -> Result<SealedProject, ProjectError> {
+) -> Result<Vec<String>, ProjectError> {
     if onto_existing {
         std::fs::copy(target, temp).map_err(|source| ProjectError::io(target, source))?;
     }
-    let mut sealed = None;
-    for (i, checkpoint) in held.iter().enumerate() {
-        let written = if i == 0 && !onto_existing {
-            seal_at(
-                SealRequest {
-                    project_path: temp,
-                    staged_composite: &checkpoint.composite,
-                    staged_zmap: &checkpoint.zmap,
-                    sources: &checkpoint.sources,
-                    algorithm: &checkpoint.algorithm,
-                    params: &checkpoint.params,
-                    align: checkpoint.align.clone(),
-                    registration: checkpoint.registration.clone(),
-                    composite_description: checkpoint.composite_description.clone(),
-                    label: None,
-                    metrics: checkpoint.metrics,
-                },
-                checkpoint.created_at,
-            )?
-        } else {
-            super::append_at(
-                super::AppendRequest {
-                    project_path: temp,
-                    staged_composite: &checkpoint.composite,
-                    staged_zmap: &checkpoint.zmap,
-                    sources: &checkpoint.sources,
-                    algorithm: &checkpoint.algorithm,
-                    params: &checkpoint.params,
-                    align: checkpoint.align.clone(),
-                    registration: checkpoint.registration.clone(),
-                    composite_description: checkpoint.composite_description.clone(),
-                    label: None,
-                    metrics: checkpoint.metrics,
-                },
-                checkpoint.created_at,
-            )?
+    let kept = kept_entries(entries, deletes, keep);
+    let mut ids: Vec<Option<String>> = vec![None; entries.len()];
+    for (i, entry) in entries.iter().enumerate().filter(|(i, _)| kept[*i]) {
+        let parent: Option<String> = match &entry.parent {
+            None => None,
+            Some(ParentRef::Saved(id)) => Some(id.clone()),
+            Some(ParentRef::Entry(j)) => Some(
+                ids[*j]
+                    .clone()
+                    .expect("an entry kept for its child is written before it"),
+            ),
         };
-        sealed = Some(written);
+        let id = match &entry.kind {
+            InMemoryKind::Fused(held) => write_fused(temp, held, parent.as_deref())?,
+            InMemoryKind::Ops { ops, created_at } => {
+                super::append_ops_onto(
+                    temp,
+                    parent.as_deref().expect("an ops entry has a parent"),
+                    ops.clone(),
+                    None,
+                    *created_at,
+                    super::ZMapStorage::Bounded,
+                )?
+                .checkpoint
+            }
+        };
+        ids[i] = Some(id);
     }
-    Ok(sealed.expect("held is non-empty"))
+    let keep_id: Option<&str> = keep.map(|reference| match reference {
+        ParentRef::Saved(id) => id.as_str(),
+        ParentRef::Entry(i) => ids[*i].as_deref().expect("the pinned entry is written"),
+    });
+    for delete in deletes {
+        let id = match delete {
+            ParentRef::Saved(id) => Some(id.as_str()),
+            ParentRef::Entry(i) => ids[*i].as_deref(),
+        };
+        if let Some(id) = id {
+            super::append::hide_and_collect(temp, Some(id), keep_id)?;
+        }
+    }
+    super::append::hide_and_collect(temp, None, keep_id)?;
+    Ok(ids.into_iter().flatten().collect())
+}
+
+/// Writes one fused checkpoint into `temp`: as a new project's root when
+/// `parent` is `None`, else under `parent`.
+fn write_fused(
+    temp: &Path,
+    held: &HeldCheckpoint,
+    parent: Option<&str>,
+) -> Result<String, ProjectError> {
+    let written = match parent {
+        None => seal_at(
+            SealRequest {
+                project_path: temp,
+                staged_composite: &held.composite,
+                staged_zmap: &held.zmap,
+                sources: &held.sources,
+                algorithm: &held.algorithm,
+                params: &held.params,
+                align: held.align.clone(),
+                registration: held.registration.clone(),
+                composite_description: held.composite_description.clone(),
+                label: None,
+                metrics: held.metrics,
+            },
+            held.created_at,
+        )?,
+        Some(_) => super::append::append_onto(
+            super::AppendRequest {
+                project_path: temp,
+                staged_composite: &held.composite,
+                staged_zmap: &held.zmap,
+                sources: &held.sources,
+                algorithm: &held.algorithm,
+                params: &held.params,
+                align: held.align.clone(),
+                registration: held.registration.clone(),
+                composite_description: held.composite_description.clone(),
+                label: None,
+                metrics: held.metrics,
+            },
+            parent,
+            held.created_at,
+        )?,
+    };
+    Ok(written.checkpoint)
 }
 
 /// The manifest's blob list: one record per **distinct** hash, in the order
@@ -316,6 +505,8 @@ pub(super) fn record(blob: &StagedBlob) -> BlobRecord {
         compression: "zstd".to_string(),
         uncompressed_len: blob.uncompressed_len,
         compressed_len: blob.compressed_len,
+        base: None,
+        target: None,
     }
 }
 

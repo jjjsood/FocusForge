@@ -10,7 +10,7 @@ use rayon::prelude::*;
 
 use crate::algorithm::TileReader;
 use crate::tile::Rect;
-use crate::zmap::NO_SOURCE;
+use crate::zmap::{NO_SOURCE, ZMapReader};
 
 use super::RetouchError;
 
@@ -96,6 +96,40 @@ pub fn recomposite(
                     out_px.copy_from_slice(src_px);
                 }
             });
+    }
+    Ok(())
+}
+
+/// Reads `zmap` in `rows`-row, full-width bands and recomposites each
+/// through `sources`, handing `sink` the band's rect, indices and gathered
+/// samples in top-to-bottom order. The index and sample buffers are sized
+/// once, to `rows`, and reused for every band, so peak memory is bounded by
+/// `rows` rather than by `zmap`'s full height.
+pub fn recomposite_bands<E: From<RetouchError>>(
+    zmap: &ZMapReader,
+    sources: &Sources,
+    rows: u32,
+    mut sink: impl FnMut(Rect, &[u16], &[u16]) -> Result<(), E>,
+) -> Result<(), E> {
+    let (width, height) = zmap.dimensions();
+    let spp = sources.samples_per_pixel as usize;
+    let mut indices = vec![0u16; width as usize * rows as usize];
+    let mut samples = vec![0u16; width as usize * rows as usize * spp];
+    let mut y = 0u32;
+    while y < height {
+        let band_height = rows.min(height - y);
+        let band = Rect {
+            x: 0,
+            y,
+            width,
+            height: band_height,
+        };
+        let len = (width * band_height) as usize;
+        zmap.read_tile_into(band, &mut indices[..len])
+            .map_err(RetouchError::Fused)?;
+        recomposite(&indices[..len], band, sources, &mut samples[..len * spp])?;
+        sink(band, &indices[..len], &samples[..len * spp])?;
+        y += band_height;
     }
     Ok(())
 }

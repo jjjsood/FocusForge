@@ -15,11 +15,11 @@ use std::time::{Duration, Instant};
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::pipeline::{self, FuseOutcome, FuseOutput, FuseRequest, StageObserver};
-use focusforge_core::project::{self, Project};
+use focusforge_core::project::{self, Point, Project};
 use focusforge_core::registry;
-use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 use focusforge_gui::canvas::CanvasFeed;
-use focusforge_gui::input_map::Modifiers;
+use focusforge_gui::input_map::{Button, Modifiers, PointerKind};
 use focusforge_gui::job;
 use focusforge_gui::viewport::PaneRect;
 use focusforge_gui::{AppController, ChromeKey, OpenOutcome, ShellEvent, ShellMode};
@@ -227,8 +227,13 @@ fn gui_run_matches_the_cli_run() {
         panic!("a seal request must report a sealed project");
     };
     let mut project = Project::open(&sealed.path).unwrap();
-    let (composite_path, _zmap_path) = job::materialize_planes(&mut project, &scratch)
-        .expect("the sealed project's composite must materialize");
+    let head = project.checkpoint().id.clone();
+    let job::CheckpointPlanes::Ready(composite_path, _zmap_path) =
+        job::fused_checkpoint_planes(&mut project, &scratch, &head)
+            .expect("the sealed project's composite must materialize")
+    else {
+        panic!("a freshly fused head must need no render");
+    };
     let sealed = focusforge_core::io::TiffStack::open_files(&[composite_path]).unwrap();
     let sealed_samples = sealed
         .read_tile(
@@ -656,7 +661,7 @@ fn keep_commits_a_parked_run_like_a_clean_one() {
         job::RunState::Fused { .. }
     ));
     assert!(controller.pending_divergence().is_none());
-    let held = controller.held_checkpoints().last().unwrap();
+    let held = controller.held_checkpoints().last().cloned().unwrap();
     assert_eq!(planes, (held.composite.clone(), held.zmap.clone()));
     assert_eq!(controller.materialize_active_tab_planes(), Some(planes));
 }
@@ -1191,7 +1196,7 @@ fn checkpoint_panel_line_without_a_tab() {
 }
 
 #[test]
-fn checkpoint_panel_line_counts_each_run() {
+fn checkpoint_panel_rows_count_each_run() {
     let mut controller = controller_with_frames("panel_line_counts", 2);
     assert_eq!(
         controller.checkpoint_panel_line(),
@@ -1200,32 +1205,30 @@ fn checkpoint_panel_line_counts_each_run() {
 
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
-    assert_eq!(controller.checkpoint_panel_line(), "1 checkpoint");
+    assert_eq!(controller.checkpoints_panel().row_count, 1);
     assert!(
         controller.project_cards()[0]
             .meta_text
-            .ends_with(&controller.checkpoint_panel_line()),
-        "the panel and the card must quote the same count phrase"
+            .ends_with("1 checkpoint")
     );
 
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
-    assert_eq!(controller.checkpoint_panel_line(), "2 checkpoints");
+    assert_eq!(controller.checkpoints_panel().row_count, 2);
     assert!(
         controller.project_cards()[0]
             .meta_text
-            .ends_with(&controller.checkpoint_panel_line()),
-        "the panel and the card must quote the same count phrase"
+            .ends_with("2 checkpoints")
     );
 }
 
 #[test]
-fn checkpoint_panel_line_follows_the_active_tab() {
+fn checkpoint_panel_rows_follow_the_active_tab() {
     let mut controller = controller_with_two_tabs("panel_line_follows");
     controller.select_project(1);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
-    assert_eq!(controller.checkpoint_panel_line(), "1 checkpoint");
+    assert_eq!(controller.checkpoints_panel().row_count, 1);
 
     controller.select_project(0);
     assert_eq!(
@@ -1234,7 +1237,7 @@ fn checkpoint_panel_line_follows_the_active_tab() {
     );
 
     controller.select_project(1);
-    assert_eq!(controller.checkpoint_panel_line(), "1 checkpoint");
+    assert_eq!(controller.checkpoints_panel().row_count, 1);
 }
 
 #[test]
@@ -1251,10 +1254,11 @@ fn checkpoint_panel_is_pushed_with_the_projects() {
     let controller = std::sync::Arc::new(std::sync::Mutex::new(controller));
 
     focusforge_gui::bridge::push_projects(&app, &controller);
-    assert_eq!(app.get_checkpoint_line(), "1 checkpoint");
+    assert_eq!(slint::Model::row_count(&app.get_checkpoint_rows()), 1);
 
     controller.lock().unwrap().select_project(1);
     focusforge_gui::bridge::push_projects(&app, &controller);
+    assert_eq!(slint::Model::row_count(&app.get_checkpoint_rows()), 0);
     assert_eq!(app.get_checkpoint_line(), "None yet — fuse a stack");
 }
 
@@ -1421,7 +1425,7 @@ fn a_second_run_reports_its_own_completion_time() {
 
     let project_path = save_to_proposed(&mut controller);
     let project = Project::open(&project_path).unwrap();
-    let expected = job::format_utc_hhmm(project.checkpoint().created_at);
+    let expected = focusforge_gui::checkpoints::local_hhmm(project.checkpoint().created_at);
     assert_eq!(
         at, expected,
         "the idle line must reflect the head checkpoint's own time"
@@ -3009,7 +3013,7 @@ fn every_close_path_asks_the_same_question() {
         .expect("Ctrl+W on the active, fused tab asks");
     assert_eq!(copy.context, format!("Closing {title1}"));
     assert!(
-        copy.body.starts_with("2 checkpoints have been fused"),
+        copy.body.starts_with("2 unsaved checkpoints"),
         "{}",
         copy.body
     );
@@ -3022,7 +3026,7 @@ fn every_close_path_asks_the_same_question() {
         .expect("request_close on the inactive, fused tab asks");
     assert_eq!(copy.context, format!("Closing {title0}"));
     assert!(
-        copy.body.starts_with("1 checkpoint has been fused"),
+        copy.body.starts_with("1 unsaved checkpoint"),
         "{}",
         copy.body
     );
@@ -3532,6 +3536,614 @@ fn quit_and_close_questions_cannot_overlap() {
         "request_close_at is a no-op while a quit question is pending"
     );
     assert_eq!(controller.project_tabs().len(), tabs_before);
+}
+
+// ---------------------------------------------------------------------
+// Unsaved strokes: the fuse, close and quit questions, the unsaved mark
+// and the Projects card's checkpoint count.
+// ---------------------------------------------------------------------
+
+/// A one-dab brush stroke of source 1 at `(x, 10)`.
+fn dab(x: i32) -> job::Op {
+    job::Op::BrushStroke {
+        source_id: 1,
+        path: vec![Point { x, y: 10 }],
+        radius: 0.5,
+        softness: 0.0,
+    }
+}
+
+/// Enters the editor on the active tab and paints `strokes` dabs.
+fn paint_strokes(controller: &mut AppController, strokes: i32) {
+    common::enter_editor(controller);
+    for i in 0..strokes {
+        common::paint(controller, dab(10 + 4 * i));
+    }
+}
+
+fn live_ops(controller: &AppController) -> usize {
+    controller.edit_session().map_or(0, |s| s.op_count())
+}
+
+/// An unsaved fused tab over `frames` frames, back in Stacking mode with
+/// `strokes` strokes in live.
+fn painted_tab(name: &str, frames: usize, strokes: i32) -> AppController {
+    let mut controller = controller_with_frames(name, frames);
+    fuse_and_settle(&mut controller);
+    paint_strokes(&mut controller, strokes);
+    controller.set_mode(ShellMode::Stacking);
+    controller
+}
+
+/// An opened tab holding two saved checkpoints and nothing else, in
+/// Stacking mode.
+fn two_saved(name: &str) -> (AppController, PathBuf) {
+    let mut controller = controller_with_frames(name, 2);
+    fuse_and_settle(&mut controller);
+    let path = save_to_proposed(&mut controller);
+    fuse_and_settle(&mut controller);
+    assert!(controller.save_active_project(|_| panic!("a saved tab never asks where")));
+    assert_eq!(controller.checkpoints_panel().row_count, 2);
+    (controller, path)
+}
+
+/// Queues the delete of the first listed row `pick` accepts.
+fn delete_listed(
+    controller: &mut AppController,
+    pick: impl Fn(&focusforge_gui::checkpoints::CheckpointEntry) -> bool,
+) {
+    let row = controller
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .position(|entry| entry.id.is_some() && pick(entry))
+        .expect("a listed row matches");
+    controller.request_checkpoint_delete(row);
+    assert!(controller.pending_checkpoint_delete_copy().is_some());
+    controller.confirm_checkpoint_delete();
+}
+
+fn is_held(entry: &focusforge_gui::checkpoints::CheckpointEntry) -> bool {
+    entry
+        .id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("held:"))
+}
+
+/// `(id, parent, op count, fused)` of every checkpoint `.ffp` holds.
+fn saved_rows(path: &Path) -> Vec<(String, Option<String>, usize, bool)> {
+    Project::open(path)
+        .unwrap()
+        .history()
+        .all()
+        .iter()
+        .map(|c| {
+            (
+                c.id.clone(),
+                c.parent.clone(),
+                c.ops.len(),
+                c.fuse.is_some(),
+            )
+        })
+        .collect()
+}
+
+fn record_events(controller: &mut AppController) -> std::sync::Arc<Mutex<Vec<ShellEvent>>> {
+    let events = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    controller.set_sink(std::sync::Arc::new(move |event| {
+        sink.lock().unwrap().push(event)
+    }));
+    events
+}
+
+fn count_of(events: &Mutex<Vec<ShellEvent>>, wanted: ShellEvent) -> usize {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| **e == wanted)
+        .count()
+}
+
+/// The Projects card of the active tab.
+fn active_card(controller: &AppController) -> focusforge_gui::overlay::CardView {
+    let title = controller.project_tabs()[controller.active_project().unwrap()]
+        .title
+        .clone();
+    controller
+        .project_cards()
+        .into_iter()
+        .find(|card| card.opened && card.project_name == title)
+        .expect("the active tab has a card")
+}
+
+fn settle_all(controller: &mut AppController) {
+    while common::wait_for_settle(controller, Duration::from_secs(120)).is_some() {}
+}
+
+#[test]
+fn a_fuse_asks_before_dropping_unsaved_ops() {
+    // One stroke: the question, its copy, and no close or quit over it.
+    let mut c = painted_tab("fuse_asks_one", 2, 1);
+    assert!(!c.start_fuse(), "a press over a stroke starts nothing");
+    let copy = c.pending_fuse_copy().expect("the press asks");
+    assert_eq!(copy.title, "Save your edits first?");
+    assert_eq!(
+        copy.context,
+        format!("Fusing {}", c.project_tabs()[0].title)
+    );
+    assert_eq!(copy.body, "1 unsaved brush stroke will be lost.");
+    assert_eq!(copy.info, "");
+    assert_eq!(copy.secondary_label, "Save and fuse");
+    assert_eq!(copy.confirm_label, "Fuse anyway");
+    assert!(!c.any_job_running());
+    c.window_close();
+    c.request_close(0);
+    assert!(c.pending_quit_copy().is_none() && c.pending_close().is_none());
+    assert_eq!(c.project_tabs().len(), 1);
+    assert!(!c.start_fuse());
+    assert!(
+        !c.any_job_running(),
+        "a second press under the question starts nothing"
+    );
+
+    // Cancel keeps the stroke and starts nothing.
+    c.close_guard_cancelled();
+    assert!(c.pending_fuse_copy().is_none());
+    assert_eq!(live_ops(&c), 1);
+    assert!(!c.any_job_running());
+
+    // The save answer keeps the stroke as one checkpoint of the origin, then
+    // fuses on top of it.
+    assert!(!c.start_fuse());
+    let rows = c.checkpoints_panel().row_count;
+    assert!(c.close_guard_secondary_pressed(|_| None));
+    assert!(c.any_job_running());
+    assert_eq!(c.checkpoints_panel().row_count, rows + 1);
+    assert_eq!(live_ops(&c), 0);
+    settle_all(&mut c);
+    let path = save_to_proposed(&mut c);
+    let rows = saved_rows(&path);
+    assert_eq!(rows.len(), 3);
+    let origin = rows.iter().find(|r| r.1.is_none()).expect("the origin");
+    let snapshot = rows
+        .iter()
+        .find(|r| r.2 == 1)
+        .expect("the strokes' checkpoint");
+    assert_eq!(snapshot.1.as_deref(), Some(origin.0.as_str()));
+    let result = rows
+        .iter()
+        .find(|r| r.3 && r.1.is_some())
+        .expect("the fused result");
+    assert_eq!(result.1.as_deref(), Some(snapshot.0.as_str()));
+
+    // The destructive answer fuses and the strokes are gone once it commits.
+    let mut c = painted_tab("fuse_asks_confirm", 2, 3);
+    assert!(!c.start_fuse());
+    assert_eq!(
+        c.pending_fuse_copy().unwrap().body,
+        "3 unsaved brush strokes will be lost."
+    );
+    c.close_guard_confirmed();
+    assert!(c.any_job_running());
+    settle_all(&mut c);
+    assert_eq!(live_ops(&c), 0);
+    assert_eq!(
+        c.held_checkpoints().len(),
+        2,
+        "no checkpoint of the strokes"
+    );
+
+    // No strokes: both a never-fused and a fused tab start at once.
+    let mut c = controller_with_frames("fuse_asks_none", 2);
+    assert!(c.start_fuse());
+    assert!(c.pending_fuse_copy().is_none());
+    settle_all(&mut c);
+    assert!(c.start_fuse());
+    assert!(c.pending_fuse_copy().is_none());
+    settle_all(&mut c);
+
+    // Retry asks the same question.
+    let mut c = painted_tab("fuse_asks_retry", 2, 1);
+    assert!(!c.retry_fuse());
+    assert!(c.pending_fuse_copy().is_some());
+    c.close_guard_cancelled();
+    assert!(!c.any_job_running());
+    assert!(!c.retry_fuse());
+    assert!(c.close_guard_secondary_pressed(|_| None));
+    assert!(c.any_job_running());
+    settle_all(&mut c);
+
+    // A confirmed frame-set change asks before its re-fuse; Cancel leaves
+    // the frames changed.
+    let mut c = painted_tab("fuse_asks_frames", 3, 1);
+    c.remove_frame(1);
+    assert!(c.pending_frame_change().is_some());
+    assert!(!c.confirm_frame_change());
+    assert!(c.pending_fuse_copy().is_some());
+    c.close_guard_cancelled();
+    assert!(!c.any_job_running());
+    assert_eq!(live_ops(&c), 1);
+    assert_eq!(c.images_panel().rows.len(), 2);
+
+    // `Run again` after a cancelled run asks.
+    let mut c = painted_tab("fuse_asks_run_again", 2, 1);
+    assert!(!c.start_fuse());
+    c.close_guard_confirmed();
+    let start = Instant::now();
+    while c.job_view().fraction <= 0.0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the run never ticked"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    c.pause_or_resume();
+    c.cancel_fuse();
+    settle_all(&mut c);
+    assert_eq!(live_ops(&c), 1, "a cancelled run keeps the strokes");
+    let card = c
+        .project_cards()
+        .iter()
+        .position(|card| card.kind == "cancelled")
+        .expect("the cancelled card");
+    assert!(!c.run_gallery_action(card));
+    assert!(c.pending_fuse_copy().is_some());
+    c.close_guard_cancelled();
+    assert!(!c.any_job_running());
+    assert!(!c.run_gallery_action(card));
+    assert!(c.close_guard_secondary_pressed(|_| None));
+    assert!(c.any_job_running());
+    settle_all(&mut c);
+
+    // While another tab's run is live the question still comes first and no
+    // queue slot is taken until it is answered.
+    let mut c = controller_with_two_tabs("fuse_asks_other_run");
+    fuse_and_settle(&mut c);
+    paint_strokes(&mut c, 1);
+    c.set_mode(ShellMode::Stacking);
+    c.select_project(1);
+    assert!(c.start_fuse());
+    c.select_project(0);
+    assert!(!c.start_fuse());
+    assert!(c.pending_fuse_copy().is_some());
+    assert_eq!(c.project_tabs()[0].run_mark_icon, "");
+    c.close_guard_cancelled();
+    assert_eq!(c.project_tabs()[0].run_mark_icon, "");
+    assert!(!c.start_fuse());
+    c.close_guard_confirmed();
+    assert_eq!(c.project_tabs()[0].run_mark_icon, "ellipsis");
+    settle_all(&mut c);
+
+    // A save that makes no checkpoint starts no run.
+    let mut c = painted_tab("fuse_asks_no_checkpoint", 2, 1);
+    assert!(!c.start_fuse());
+    c.set_mode(ShellMode::Editor);
+    c.undo();
+    assert_eq!(live_ops(&c), 0);
+    assert!(!c.close_guard_secondary_pressed(|_| None));
+    assert!(!c.any_job_running());
+}
+
+#[test]
+fn a_close_asks_with_unsaved_ops() {
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+
+    // An opened tab with two strokes and nothing in memory asks.
+    let mut c = controller_with_frames("close_asks_opened", 2);
+    fuse_and_settle(&mut c);
+    let path = save_to_proposed(&mut c);
+    let file = path.file_name().unwrap().to_string_lossy().into_owned();
+    paint_strokes(&mut c, 2);
+    c.request_close(0);
+    let copy = c.pending_close().expect("two strokes ask");
+    assert_eq!(copy.body, "2 unsaved brush strokes.");
+    assert_eq!(copy.info, format!("Saving adds them to {file}."));
+    assert_eq!(copy.secondary_label, "Save and close");
+    assert_eq!(copy.confirm_label, "Close anyway");
+    c.cancel_close();
+    assert_eq!(c.chrome_key("w", ctrl), ChromeKey::Consumed);
+    assert_eq!(c.pending_close().expect("Ctrl+W asks").body, copy.body);
+    c.cancel_close();
+
+    // Undoing every stroke lets it close at once.
+    c.undo();
+    c.undo();
+    assert_eq!(live_ops(&c), 0);
+    c.request_close(0);
+    assert!(c.pending_close().is_none());
+    assert!(c.project_tabs().is_empty());
+
+    // A never-saved tab counts its checkpoint beside the stroke.
+    let mut c = controller_with_frames("close_asks_unsaved", 2);
+    fuse_and_settle(&mut c);
+    paint_strokes(&mut c, 1);
+    c.request_close(0);
+    let copy = c.pending_close().expect("a stroke and a checkpoint ask");
+    assert_eq!(copy.body, "1 unsaved brush stroke, 1 unsaved checkpoint.");
+    assert_eq!(copy.info, "Saving asks where to write the project file.");
+
+    // A queued delete alone asks.
+    let (mut c, path) = two_saved("close_asks_delete");
+    let file = path.file_name().unwrap().to_string_lossy().into_owned();
+    delete_listed(&mut c, |entry| !entry.selected);
+    c.request_close(0);
+    let copy = c.pending_close().expect("a queued delete asks");
+    assert_eq!(copy.body, "1 checkpoint to delete.");
+    assert_eq!(copy.info, format!("Saving writes these changes to {file}."));
+
+    // A deleted in-memory row is neither a checkpoint nor a delete.
+    let mut c = controller_with_frames("close_asks_deleted_held", 2);
+    fuse_and_settle(&mut c);
+    save_to_proposed(&mut c);
+    paint_strokes(&mut c, 1);
+    assert!(c.save_checkpoint());
+    delete_listed(&mut c, is_held);
+    c.request_close(0);
+    assert!(c.pending_close().is_none());
+    assert!(c.project_tabs().is_empty());
+}
+
+#[test]
+fn quit_asks_with_unsaved_ops() {
+    let mut c = controller_with_two_tabs("quit_asks_unsaved");
+    fuse_and_settle(&mut c);
+    let path0 = save_to_proposed(&mut c);
+    paint_strokes(&mut c, 1);
+    c.select_project(1);
+    fuse_and_settle(&mut c);
+    paint_strokes(&mut c, 1);
+    let events = record_events(&mut c);
+
+    c.window_close();
+    let copy = c.pending_quit_copy().expect("two tabs hold unsaved work");
+    assert!(
+        copy.body.starts_with("2 projects have unsaved work"),
+        "{}",
+        copy.body
+    );
+    let target = common::tree("quit_asks_unsaved_out").join("tab1.ffp");
+    assert!(c.close_guard_secondary_pressed(|_| Some(target.clone())));
+    assert_eq!(count_of(&events, ShellEvent::WindowCloseRequested), 1);
+
+    let rows = saved_rows(&path0);
+    assert_eq!(rows.len(), 2);
+    let origin = rows.iter().find(|r| r.1.is_none()).unwrap();
+    let child = rows
+        .iter()
+        .find(|r| r.2 == 1)
+        .expect("the strokes' checkpoint");
+    assert_eq!(child.1.as_deref(), Some(origin.0.as_str()));
+    let rows = saved_rows(&target);
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter().any(|r| r.2 == 1),
+        "the second tab's strokes were written"
+    );
+}
+
+#[test]
+fn save_and_close_seals_unsaved_ops() {
+    let (mut c, path) = two_saved("save_close_seals");
+    let before = saved_rows(&path);
+    let root = before.iter().find(|r| r.1.is_none()).unwrap().0.clone();
+    let row = c
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .position(|entry| entry.id.as_deref() == Some(root.as_str()))
+        .expect("the older row is listed");
+    c.select_checkpoint_row(row);
+    paint_strokes(&mut c, 2);
+    let live = c.edit_session().unwrap().indices().to_vec();
+
+    c.request_close(0);
+    assert!(c.pending_close().is_some());
+    assert!(c.save_and_close(|_| panic!("an opened tab never asks where")));
+    assert!(c.project_tabs().is_empty());
+
+    let after = saved_rows(&path);
+    assert_eq!(after.len(), before.len() + 1);
+    let added = after
+        .iter()
+        .find(|r| !before.iter().any(|b| b.0 == r.0))
+        .expect("one checkpoint is new");
+    assert_eq!(
+        added.1.as_deref(),
+        Some(root.as_str()),
+        "a child of the row painted on"
+    );
+    assert_eq!(added.2, 2);
+
+    let mut project = Project::open(&path).unwrap();
+    let checkpoint = project.history().get(&added.0).unwrap().clone();
+    let out = common::tree("save_close_seals_out").join("zmap.ffz");
+    project::materialize_zmap(&mut project, &checkpoint, &out).unwrap();
+    let reader = ZMapReader::open(&out).unwrap();
+    let info = reader.info();
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: info.width(),
+        height: info.height(),
+    };
+    let mut saved = vec![0u16; info.tile_len(whole)];
+    reader.read_tile_into(whole, &mut saved).unwrap();
+    assert_eq!(saved, live);
+}
+
+#[test]
+fn a_failed_save_keeps_the_tab_and_its_ops() {
+    let mut c = controller_with_frames("failed_save_keeps", 2);
+    fuse_and_settle(&mut c);
+    paint_strokes(&mut c, 1);
+    let rows = c.checkpoints_panel().row_count;
+
+    // A declined picker changes nothing.
+    c.request_close(0);
+    assert!(c.pending_close().is_some());
+    assert!(!c.save_and_close(|_| None));
+    assert_eq!(c.project_tabs().len(), 1);
+    assert_eq!(live_ops(&c), 1);
+    assert_eq!(c.checkpoints_panel().row_count, rows);
+
+    // A failed write keeps the strokes in live or in memory and says so.
+    let missing = common::tree("failed_save_keeps_out")
+        .join("absent")
+        .join("x.ffp");
+    c.request_close(0);
+    assert!(!c.save_and_close(|_| Some(missing.clone())));
+    assert_eq!(c.project_tabs().len(), 1);
+    let note = c.take_settled_failure().expect("the failure is reported");
+    assert!(
+        note.message.contains(&missing.display().to_string()),
+        "{}",
+        note.message
+    );
+    let accounted = (live_ops(&c), c.checkpoints_panel().row_count);
+    assert!(
+        accounted == (1, rows) || accounted == (0, rows + 1),
+        "the stroke is in live or in memory: {accounted:?}"
+    );
+    assert!(!missing.exists());
+
+    // `Save all and quit` over the same failure quits nothing.
+    let events = record_events(&mut c);
+    c.window_close();
+    assert!(!c.close_guard_secondary_pressed(|_| Some(missing.clone())));
+    assert_eq!(count_of(&events, ShellEvent::WindowCloseRequested), 0);
+    assert!(c.pending_quit_copy().is_none());
+    assert_eq!(c.project_tabs().len(), 1);
+}
+
+#[test]
+fn unsaved_op_guards_share_the_switch_guards_count() {
+    let mut c = controller_with_frames("guards_share_count", 2);
+    fuse_and_settle(&mut c);
+    fuse_and_settle(&mut c);
+    paint_strokes(&mut c, 3);
+
+    let row = c
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .position(|entry| entry.id.is_some() && !entry.selected)
+        .expect("another row");
+    c.select_checkpoint_row(row);
+    let restore = c.pending_restore_copy().expect("the switch asks");
+    assert!(restore.body.contains("3 brush strokes"), "{}", restore.body);
+    c.close_guard_cancelled();
+
+    assert!(!c.start_fuse());
+    let fuse = c.pending_fuse_copy().expect("the press asks");
+    assert!(
+        fuse.body.contains("3 unsaved brush strokes"),
+        "{}",
+        fuse.body
+    );
+    assert_eq!(fuse.info, "");
+    c.close_guard_cancelled();
+
+    c.request_close(0);
+    let close = c.pending_close().expect("the close asks");
+    assert!(
+        close.body.contains("3 unsaved brush strokes"),
+        "{}",
+        close.body
+    );
+    assert!(!close.body.contains("fused"), "{}", close.body);
+    c.cancel_close();
+
+    for copy in [&restore, &fuse, &close] {
+        for text in [&copy.title, &copy.context, &copy.body, &copy.info] {
+            let text = text.to_lowercase();
+            for word in ["delta", "snapshot", "blob", "stored"] {
+                assert!(!text.contains(word), "{word} in {text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_unsaved_mark_follows_unsealed_ops() {
+    let (mut c, _path) = two_saved("mark_follows_ops");
+    let marks = |c: &AppController| (c.project_tabs()[0].unsaved, active_card(c).unsaved);
+    assert_eq!(marks(&c), (false, false));
+
+    common::enter_editor(&mut c);
+    let map = c.edit_session().unwrap().tile();
+    let (w, h) = (map.width as f32, map.height as f32);
+    let left = PaneRect {
+        x: 0.0,
+        y: 0.0,
+        width: w,
+        height: h,
+    };
+    let right = PaneRect {
+        x: w + 8.0,
+        y: 0.0,
+        width: w,
+        height: h,
+    };
+    c.set_pane_geometry(left, right);
+    let events = record_events(&mut c);
+    let stroke = |c: &mut AppController, dx: f32| {
+        let (x, y) = (right.x + w / 2.0 + dx, h / 2.0);
+        c.pointer(PointerKind::Down, Button::Left, x, y, Modifiers::NONE);
+        c.pointer(PointerKind::Up, Button::Left, x, y, Modifiers::NONE);
+    };
+
+    stroke(&mut c, 0.0);
+    assert_eq!(live_ops(&c), 1);
+    assert_eq!(marks(&c), (true, true));
+    assert_eq!(count_of(&events, ShellEvent::ProjectsChanged), 1);
+
+    stroke(&mut c, 20.0);
+    assert_eq!(live_ops(&c), 2);
+    assert_eq!(
+        count_of(&events, ShellEvent::ProjectsChanged),
+        1,
+        "a second stroke changes no mark"
+    );
+
+    c.undo();
+    assert_eq!(marks(&c), (true, true));
+    assert_eq!(count_of(&events, ShellEvent::ProjectsChanged), 1);
+    c.undo();
+    assert_eq!(marks(&c), (false, false));
+    assert_eq!(count_of(&events, ShellEvent::ProjectsChanged), 2);
+
+    delete_listed(&mut c, |entry| !entry.selected);
+    assert_eq!(marks(&c), (true, true), "a queued delete lights the mark");
+}
+
+#[test]
+fn the_card_counts_the_listed_checkpoints() {
+    let (mut c, _path) = two_saved("card_counts_rows");
+    fuse_and_settle(&mut c);
+    fuse_and_settle(&mut c);
+    let agrees = |c: &AppController, rows: usize| {
+        assert_eq!(c.checkpoints_panel().row_count, rows);
+        let phrase = if rows == 1 {
+            "1 checkpoint".to_string()
+        } else {
+            format!("{rows} checkpoints")
+        };
+        let meta = active_card(c).meta_text;
+        assert!(meta.ends_with(&phrase), "{meta} vs {phrase}");
+    };
+    agrees(&c, 4);
+
+    delete_listed(&mut c, |entry| !entry.selected && !is_held(entry));
+    agrees(&c, 3);
+    delete_listed(&mut c, |entry| !entry.selected && is_held(entry));
+    agrees(&c, 2);
+    assert!(c.save_active_project(|_| panic!("a saved tab never asks where")));
+    agrees(&c, 2);
 }
 
 // ---------------------------------------------------------------------

@@ -163,8 +163,10 @@ fn checkpoint_panel_shows_its_empty_state() {
 
 #[test]
 fn checkpoint_panel_touches_no_storage() {
+    // Rows come only from an open project's history; with no tab there are
+    // none. A tab with a project shows its rows (`tests/checkpoint_panel.rs`).
     let controller = focusforge_gui::AppController::new();
-    assert!(controller.checkpoints().is_empty());
+    assert!(controller.checkpoints_panel().entries.is_empty());
     assert!(!controller.export_enabled());
 
     // The canvas legitimately touches storage (a project's TIFFs),
@@ -172,10 +174,13 @@ fn checkpoint_panel_touches_no_storage() {
     // module allowed to name the schema/registry crate, and `diagnostics.rs`
     // is the one module allowed to name the timing/measurement API --
     // every other file reaches it through `crate::diagnostics`, never
-    // `focusforge_core` directly; `brush.rs` builds the stored stroke's path
-    // in core's own point type. Excluded by name: this test's own subject
-    // is the checkpoint panel, not the whole crate.
+    // `focusforge_core` directly. `checkpoints.rs` reads the history the
+    // panel lists, beside `job.rs`, which reads its planes, and `brush.rs`,
+    // which builds the stored stroke's path in core's own point type.
+    // Excluded by name: this test's own subject is the checkpoint panel,
+    // not the whole crate.
     let canvas_files = [
+        "checkpoints.rs",
         "brush.rs",
         "canvas.rs",
         "gpu_canvas.rs",
@@ -187,6 +192,7 @@ fn checkpoint_panel_touches_no_storage() {
         "images.rs",
         "overlay.rs",
         "recent.rs",
+        "settings.rs",
     ];
     for path in common::find_rust_files(&common::src_dir()) {
         if path
@@ -871,7 +877,7 @@ fn dock_without_a_project_says_so() {
     let app = app_at(1440, 900);
 
     assert_eq!(
-        label(&app, "FFCheckpointPanel::checkpoint-note"),
+        label(&app, "FFCheckpointPanel::empty-note"),
         "None yet — fuse a stack"
     );
     assert_eq!(
@@ -959,10 +965,10 @@ fn bottom_bar_progress() {
     assert_rect(
         &app,
         "FFBottomBar::progress-bar",
-        (250.0, 876.0, 798.0, 4.0),
+        (250.0, 876.0, 642.0, 4.0),
     );
     let (eta_x, eta_y, _, _) = rect(&app, "FFBottomBar::eta-text");
-    assert_eq!((eta_x, eta_y), (1064.0, 856.0));
+    assert_eq!((eta_x, eta_y), (908.0, 856.0));
 
     let app_min = app_at(1200, 760);
     app_min.set_project_loaded(true);
@@ -976,10 +982,10 @@ fn bottom_bar_progress() {
     assert_rect(
         &app_min,
         "FFBottomBar::progress-bar",
-        (250.0, 736.0, 558.0, 4.0),
+        (250.0, 736.0, 402.0, 4.0),
     );
     let (eta_x, eta_y, _, _) = rect(&app_min, "FFBottomBar::eta-text");
-    assert_eq!((eta_x, eta_y), (824.0, 716.0));
+    assert_eq!((eta_x, eta_y), (668.0, 716.0));
 }
 
 /// The loading indicator's show threshold: still hidden 100ms short of the
@@ -1026,13 +1032,11 @@ fn loading_indicator_never_shows_for_a_load_that_ends_before_the_threshold() {
     );
 }
 
-/// The bottom bar's overlay caption, toggle and slider are absent in
-/// stacking mode -- no element matches their ids at all, rather than merely
-/// hidden -- and all three appear in editor mode, the slider staying
-/// present (greyed by its own `disabled` binding) whether the overlay is on
-/// or off.
+/// The bottom bar's overlay caption, toggle and slider exist in stacking and
+/// in editor mode, with or without a project, and the slider stays present
+/// (greyed by its own `disabled` binding) whether the overlay is on or off.
 #[test]
-fn overlay_controls_exist_in_editor_only() {
+fn overlay_controls_exist_in_both_modes() {
     let app = app_at(1440, 900);
     app.set_show_empty_state(false);
 
@@ -1048,29 +1052,56 @@ fn overlay_controls_exist_in_editor_only() {
         "FFBottomBar::overlay-slider",
     ];
 
-    for id in ids {
-        assert!(!present(id), "{id}: stacking mode has no overlay controls");
+    for mode in ["stacking", "editor"] {
+        app.set_mode(mode.into());
+        for loaded in [false, true] {
+            app.set_project_loaded(loaded);
+            for on in [false, true] {
+                app.set_overlay_on(on);
+                for id in ids {
+                    assert!(
+                        present(id),
+                        "{id}: {mode} mode, project {loaded}, overlay {on}"
+                    );
+                }
+            }
+        }
     }
+}
 
-    app.set_mode("editor".into());
-    for id in ids {
-        assert!(present(id), "{id}: editor mode shows the overlay controls");
-    }
-
-    app.set_overlay_on(false);
-    assert!(
-        present("FFBottomBar::overlay-slider"),
-        "the slider stays present, greyed, while the overlay is off"
-    );
-
-    app.set_overlay_on(true);
-    assert!(present("FFBottomBar::overlay-slider"));
-
+/// With `overlay-available` false the toggle takes no click in stacking mode;
+/// with it true the same click fires `overlay-toggled` once.
+#[test]
+fn overlay_toggle_is_inert_while_disabled() {
+    let app = app_at(1440, 900);
+    app.set_show_empty_state(false);
     app.set_mode("stacking".into());
-    for id in ids {
-        assert!(
-            !present(id),
-            "{id}: leaving editor mode removes the controls rather than disabling them"
-        );
-    }
+    let fired = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    app.on_overlay_toggled({
+        let fired = fired.clone();
+        move |_| fired.set(fired.get() + 1)
+    });
+
+    let (x, y, w, h) = rect(&app, "FFBottomBar::overlay-toggle");
+    let position = slint::LogicalPosition::new(x + w / 2.0, y + h / 2.0);
+    let click = || {
+        app.window()
+            .dispatch_event(slint::platform::WindowEvent::PointerPressed {
+                position,
+                button: slint::platform::PointerEventButton::Left,
+            });
+        app.window()
+            .dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                position,
+                button: slint::platform::PointerEventButton::Left,
+            });
+    };
+
+    app.set_overlay_available(false);
+    click();
+    assert_eq!(fired.get(), 0, "a disabled toggle takes no click");
+
+    app.set_overlay_available(true);
+    click();
+    assert_eq!(fired.get(), 1, "an enabled toggle fires once");
 }

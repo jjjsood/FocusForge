@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! The input table, the loader and the one dispatch point, driven through
-//! `AppController` with no window and no fixture images. `Ctrl + Wheel`,
-//! `Shift + Wheel` and `Alt + Wheel` are proven here rather than through a
-//! window: slint 1.17.1's testing backend can synthesize a wheel or a drag
-//! but neither carries keyboard modifiers (slint-ui/slint#13244).
+//! `AppController` with no window and no fixture images. `Ctrl + Wheel`
+//! and `Shift + Wheel` are proven here rather than through a window: slint
+//! 1.17.1's testing backend can synthesize a wheel or a drag but neither
+//! carries keyboard modifiers (slint-ui/slint#13244).
 
 mod common;
 
@@ -38,8 +38,8 @@ fn sink() -> (Arc<Mutex<Vec<ShellEvent>>>, EventSink) {
 #[test]
 fn defaults_match_the_settled_table() {
     // Written out literally rather than derived from the code under test:
-    // seven displayed rows map to the first nine trigger keys, row for row,
-    // and the tenth (the paint drag) is a hidden row.
+    // six displayed rows map to the first eight trigger keys, and the ninth
+    // (the paint drag) is a hidden row.
     let expected = [
         (
             Trigger::Wheel(NONE),
@@ -58,11 +58,6 @@ fn defaults_match_the_settled_table() {
             }),
             Some(Action::PanHorizontal),
             Some(Action::BrushSize),
-        ),
-        (
-            Trigger::Wheel(Modifiers { alt: true, ..NONE }),
-            Some(Action::OverlayOpacity),
-            Some(Action::BrushSoftness),
         ),
         (
             Trigger::Drag {
@@ -133,10 +128,10 @@ fn defaults_match_the_settled_table() {
 
 #[test]
 fn modes_differ_only_by_declared_overrides() {
-    // Only the two wheel rows (Shift/Alt), the undo/redo row and the paint
-    // drag differ -- the table's explicit overrides. Every other row's
-    // stacking and editor columns must match.
-    let overridden = [2usize, 3, 6, 7, 9];
+    // Only the Shift wheel row, the undo/redo rows and the paint drag
+    // differ -- the table's explicit overrides. Every other row's stacking
+    // and editor columns must match.
+    let overridden = [2usize, 5, 6, 8];
     let table = InputTable::default();
     for (i, binding) in table.bindings.iter().enumerate() {
         if overridden.contains(&i) {
@@ -158,7 +153,7 @@ fn modes_differ_only_by_declared_overrides() {
 // ---------------------------------------------------------------------
 
 fn row_toml(trigger: &str, stacking: Option<Action>, editor: Option<Action>) -> String {
-    let mut s = format!("\n[[bindings]]\ntrigger = \"{trigger}\"\n");
+    let mut s = format!("\n[[input.bindings]]\ntrigger = \"{trigger}\"\n");
     if let Some(a) = stacking {
         s.push_str(&format!("stacking = \"{a}\"\n"));
     }
@@ -181,13 +176,13 @@ fn user_file_overrides_a_default() {
     let dir = tempfile::tempdir().unwrap();
     let defaults = InputTable::default();
 
-    let mut toml = String::from("version = 1\n");
+    let mut toml = String::from("[input]\n");
     for (i, binding) in defaults.bindings.iter().enumerate() {
-        if i == 8 {
+        if i == 7 {
             // Left absent on purpose -- must keep its default.
             continue;
         }
-        let (stacking, editor) = if i == 4 {
+        let (stacking, editor) = if i == 3 {
             // Override the `middle-drag` row's action assignment -- still
             // its default trigger, a different action.
             (Some(Action::PickSourceUnderPointer), Some(Action::Pan))
@@ -196,7 +191,7 @@ fn user_file_overrides_a_default() {
         };
         toml.push_str(&row_toml(&binding.trigger.to_string(), stacking, editor));
     }
-    fs::write(dir.path().join("input.toml"), &toml).unwrap();
+    fs::write(dir.path().join("settings.toml"), &toml).unwrap();
 
     let loaded = input_config::load(dir.path());
     assert!(
@@ -253,8 +248,8 @@ fn partial_out_of_order_single_row_config_leaves_other_rows_at_default() {
     // clobber `bindings[0]` (the wheel row) regardless of which trigger
     // the lone row actually named.
     let dir = tempfile::tempdir().unwrap();
-    let toml = "version = 1\n\n[[bindings]]\ntrigger = \"alt+wheel\"\nstacking = \"pan\"\neditor = \"brush-softness\"\n";
-    fs::write(dir.path().join("input.toml"), toml).unwrap();
+    let toml = "[input]\n\n[[input.bindings]]\ntrigger = \"shift+wheel\"\nstacking = \"pan\"\neditor = \"brush-size\"\n";
+    fs::write(dir.path().join("settings.toml"), toml).unwrap();
 
     let loaded = input_config::load(dir.path());
     assert!(
@@ -272,7 +267,10 @@ fn partial_out_of_order_single_row_config_leaves_other_rows_at_default() {
     // The touched row: `stacking` changed, `editor` unchanged.
     assert_eq!(
         loaded.table.action(
-            &Trigger::Wheel(Modifiers { alt: true, ..NONE }),
+            &Trigger::Wheel(Modifiers {
+                shift: true,
+                ..NONE
+            }),
             ShellMode::Stacking
         ),
         Some(Action::Pan),
@@ -280,17 +278,25 @@ fn partial_out_of_order_single_row_config_leaves_other_rows_at_default() {
     );
     assert_eq!(
         loaded.table.action(
-            &Trigger::Wheel(Modifiers { alt: true, ..NONE }),
+            &Trigger::Wheel(Modifiers {
+                shift: true,
+                ..NONE
+            }),
             ShellMode::Editor
         ),
-        Some(Action::BrushSoftness)
+        Some(Action::BrushSize)
     );
 
     // Every other default trigger, including `wheel` itself, must resolve
     // exactly as the defaults do: the file's one custom row names
-    // `alt+wheel`, leaving plain `wheel` still bound to its default action.
+    // `shift+wheel`, leaving plain `wheel` still bound to its default action.
     for binding in defaults.bindings.iter() {
-        if binding.trigger == (Trigger::Wheel(Modifiers { alt: true, ..NONE })) {
+        if binding.trigger
+            == (Trigger::Wheel(Modifiers {
+                shift: true,
+                ..NONE
+            }))
+        {
             continue;
         }
         assert_eq!(
@@ -325,15 +331,29 @@ fn missing_config_is_not_an_error() {
 #[test]
 fn first_run_writes_the_defaults() {
     let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("input.toml");
-    assert!(!target.exists());
+    let target = dir.path().join("settings.toml");
+    // An `[recent]` table already in the file must survive the write.
+    fs::write(
+        &target,
+        "[recent]\n[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\nopened_at = 1\n",
+    )
+    .unwrap();
 
     let written = input_config::write_defaults(dir.path()).unwrap();
     assert_eq!(written, target);
     assert!(written.exists());
     let contents = fs::read_to_string(&written).unwrap();
-    assert!(contents.contains("version = 1"));
+    assert!(contents.contains("[input]"));
+    assert!(!contents.contains("version"), "{contents}");
     assert!(contents.contains("trigger = \"wheel\""));
+    assert!(
+        contents.contains("# FocusForge input map."),
+        "the header comment block must be written: {contents}"
+    );
+    assert!(
+        contents.contains("[recent]") && contents.contains("name = \"a\""),
+        "an existing [recent] table must survive: {contents}"
+    );
 }
 
 #[test]
@@ -353,40 +373,12 @@ fn written_defaults_round_trip() {
     );
     assert_eq!(loaded.table, InputTable::default());
     match loaded.provenance {
-        input_config::Provenance::File { overridden, .. } => assert_eq!(overridden, 0),
+        input_config::Provenance::File { path, overridden } => {
+            assert_eq!(overridden, 0);
+            assert_eq!(path, dir.path().join("settings.toml"));
+        }
         other => panic!("expected Provenance::File, got {other:?}"),
     }
-}
-
-#[test]
-fn unsupported_version_is_refused_and_not_rewritten() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("input.toml");
-    let original = "version = 2\n\n[[bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\neditor = \"zoom-at-cursor\"\n";
-    fs::write(&path, original).unwrap();
-
-    let loaded = input_config::load(dir.path());
-    assert_eq!(loaded.table, InputTable::default());
-    assert_eq!(loaded.problems.len(), 1);
-    match &loaded.problems[0] {
-        input_config::ConfigError::UnsupportedVersion {
-            path: p,
-            line,
-            found,
-            supported,
-        } => {
-            assert_eq!(p, &path);
-            assert_eq!(*line, 1);
-            assert_eq!(*found, 2);
-            assert_eq!(*supported, 1);
-        }
-        other => panic!("expected UnsupportedVersion, got {other}"),
-    }
-    let message = loaded.problems[0].to_string();
-    assert!(message.contains(&path.display().to_string()), "{message}");
-
-    let after = fs::read_to_string(&path).unwrap();
-    assert_eq!(after, original, "the user's file must not be rewritten");
 }
 
 #[cfg(unix)]
@@ -414,15 +406,19 @@ fn unwritable_config_dir_is_not_fatal() {
     assert_eq!(loaded.table, InputTable::default());
 }
 
-/// Writes `toml` to a fresh `input.toml`, loads it, and asserts the load
-/// fell back to the defaults with exactly one problem -- the common shape
-/// every case below shares. Returns that problem alongside the path it was
-/// written to, so a caller can still check a path- or spelling-specific
-/// field.
+/// Writes `toml` (the bare top-level shape: `[[bindings]]` rows) as
+/// `settings.toml`'s `[input]` table, loads it, and asserts the load fell
+/// back to the defaults with exactly one problem -- the common shape every
+/// case below shares. Returns that problem alongside the path it was written
+/// to, so a caller can still check a path- or spelling-specific field.
 fn expect_one_problem(toml: &str) -> (PathBuf, input_config::ConfigError) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("input.toml");
-    fs::write(&path, toml).unwrap();
+    let path = dir.path().join("settings.toml");
+    let body = format!(
+        "[input]\n{}",
+        toml.replace("[[bindings]]", "[[input.bindings]]")
+    );
+    fs::write(&path, body).unwrap();
     let loaded = input_config::load(dir.path());
     assert_eq!(loaded.table, InputTable::default());
     assert_eq!(
@@ -443,16 +439,15 @@ fn expect_one_problem(toml: &str) -> (PathBuf, input_config::ConfigError) {
 fn bad_config_is_refused_by_name() {
     // Malformed TOML syntax.
     {
-        let (path, problem) = expect_one_problem("version = 1\n[[bindings]\n");
+        let (path, problem) = expect_one_problem("[[bindings]\n");
         assert!(matches!(problem, input_config::ConfigError::Parse { .. }));
         assert!(problem.to_string().contains(&path.display().to_string()));
     }
 
     // Unknown action name.
     {
-        let (path, problem) = expect_one_problem(
-            "version = 1\n\n[[bindings]]\ntrigger = \"wheel\"\nstacking = \"levitate\"\n",
-        );
+        let (path, problem) =
+            expect_one_problem("[[bindings]]\ntrigger = \"wheel\"\nstacking = \"levitate\"\n");
         match problem {
             input_config::ConfigError::UnknownAction {
                 spelling, path: p, ..
@@ -466,9 +461,8 @@ fn bad_config_is_refused_by_name() {
 
     // Unknown trigger spelling.
     {
-        let (_, problem) = expect_one_problem(
-            "version = 1\n\n[[bindings]]\ntrigger = \"banana-drag\"\nstacking = \"pan\"\n",
-        );
+        let (_, problem) =
+            expect_one_problem("[[bindings]]\ntrigger = \"banana-drag\"\nstacking = \"pan\"\n");
         match problem {
             input_config::ConfigError::UnknownTrigger { spelling, .. } => {
                 assert_eq!(spelling, "banana-drag");
@@ -481,9 +475,8 @@ fn bad_config_is_refused_by_name() {
     // triggers -- the table's rows are display-indexed, so a trigger it has
     // no row for cannot be shown.
     {
-        let (_, problem) = expect_one_problem(
-            "version = 1\n\n[[bindings]]\ntrigger = \"right-click\"\nstacking = \"pan\"\n",
-        );
+        let (_, problem) =
+            expect_one_problem("[[bindings]]\ntrigger = \"right-click\"\nstacking = \"pan\"\n");
         match problem {
             input_config::ConfigError::UnknownTrigger { spelling, .. } => {
                 assert_eq!(spelling, "right-click");
@@ -492,10 +485,26 @@ fn bad_config_is_refused_by_name() {
         }
     }
 
+    // An `alt+wheel` row is a trigger the table has no row for: it refuses
+    // the whole table, the valid `shift+wheel` row before it included.
+    {
+        let (_, problem) = expect_one_problem(
+            "[[bindings]]\ntrigger = \"shift+wheel\"\nstacking = \"pan\"\n\n\
+             [[bindings]]\ntrigger = \"alt+wheel\"\nstacking = \"pan\"\n",
+        );
+        match problem {
+            input_config::ConfigError::UnknownTrigger { spelling, line, .. } => {
+                assert_eq!(spelling, "alt+wheel");
+                assert_eq!(line, 7, "the line of the trigger key in the whole file");
+            }
+            other => panic!("expected UnknownTrigger, got {other}"),
+        }
+    }
+
     // Duplicate trigger within one mode.
     {
         let (_, problem) = expect_one_problem(
-            "version = 1\n\n[[bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\n\n\
+            "[[bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\n\n\
              [[bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n",
         );
         assert!(matches!(
@@ -794,10 +803,6 @@ fn undo_and_redo_are_blocked_under_the_settings_modal() {
         events.lock().unwrap().is_empty(),
         "the default undo/redo chords must raise no event under Settings"
     );
-    assert!(
-        editor.unimplemented_actions().is_empty(),
-        "a blocked fire is not recorded as unimplemented either"
-    );
 
     // A custom binding of undo is blocked too, whatever key it is bound to.
     let mut table = InputTable::default();
@@ -812,7 +817,6 @@ fn undo_and_redo_are_blocked_under_the_settings_modal() {
     editor.install_input_table(table, input_config::Provenance::Defaults);
     editor.key(true, "y", Modifiers { ctrl: true, ..NONE });
     assert!(events.lock().unwrap().is_empty());
-    assert!(editor.unimplemented_actions().is_empty());
 
     editor.close_settings();
     editor.key(true, "z", Modifiers { ctrl: true, ..NONE });
@@ -848,68 +852,55 @@ fn undo_and_redo_are_blocked_under_the_settings_modal() {
 }
 
 #[test]
-fn unimplemented_actions_are_named_not_silent() {
-    // Every action but `OverlayOpacity` is implemented and must not be
-    // recorded; `OverlayOpacity` must be, by name.
-    let mut stacking = AppController::new();
-    stacking.set_sink(Arc::new(|_| {}));
-    stacking.wheel(0.0, 5.0, 0.0, 0.0, NONE); // ZoomAtCursor -- implemented
-    stacking.wheel(0.0, 5.0, 0.0, 0.0, Modifiers { ctrl: true, ..NONE }); // StepSourceFrame
-    stacking.wheel(
-        0.0,
-        5.0,
-        0.0,
-        0.0,
-        Modifiers {
-            shift: true,
-            ..NONE
-        },
-    ); // PanHorizontal -- implemented
-    stacking.wheel(0.0, 5.0, 0.0, 0.0, Modifiers { alt: true, ..NONE }); // OverlayOpacity
-    stacking.pointer(PointerKind::Down, Button::Middle, 0.0, 0.0, NONE); // Pan -- implemented
-    stacking.pointer(PointerKind::Up, Button::Middle, 0.0, 0.0, NONE);
-    stacking.pointer(
-        PointerKind::Down,
-        Button::Left,
-        0.0,
-        0.0,
-        Modifiers { alt: true, ..NONE },
-    ); // PickSourceUnderPointer
+fn alt_is_only_the_pipette() {
+    let alt = Modifiers { alt: true, ..NONE };
+    let alt_wheel = Trigger::Wheel(alt);
+    let alt_click = Trigger::Click {
+        button: Button::Left,
+        mods: alt,
+    };
 
-    let mut editor = AppController::new_with_mode_for_test(ShellMode::Editor);
-    editor.set_sink(Arc::new(|_| {}));
-    editor.wheel(
-        0.0,
-        5.0,
-        0.0,
-        0.0,
-        Modifiers {
-            shift: true,
-            ..NONE
-        },
-    ); // BrushSize
-    editor.wheel(0.0, 5.0, 0.0, 0.0, Modifiers { alt: true, ..NONE }); // BrushSoftness
-    editor.key(true, "z", Modifiers { ctrl: true, ..NONE }); // Undo
-    editor.key(
-        true,
-        "z",
-        Modifiers {
-            ctrl: true,
-            shift: true,
-            ..NONE
-        },
-    ); // Redo
-    editor.pointer(PointerKind::Down, Button::Left, 0.0, 0.0, NONE); // Paint
-    editor.pointer_moved(4.0, 4.0);
-    editor.pointer(PointerKind::Up, Button::Left, 4.0, 4.0, NONE);
+    let table = InputTable::default();
+    for mode in [ShellMode::Stacking, ShellMode::Editor] {
+        assert_eq!(table.action(&alt_wheel, mode), None, "{mode:?}");
+        assert_eq!(
+            table.action(&alt_click, mode),
+            Some(Action::PickSourceUnderPointer),
+            "{mode:?}"
+        );
+    }
+    assert!(DEFAULT_BINDINGS.iter().all(|b| b.trigger != alt_wheel));
 
-    let mut got: Vec<Action> = stacking.unimplemented_actions().to_vec();
-    got.extend_from_slice(editor.unimplemented_actions());
-    assert_eq!(
-        got,
-        vec![Action::OverlayOpacity],
-        "only the overlay opacity wheel is unimplemented, recorded once"
+    let rows = table.display_rows();
+    assert_eq!(rows.len(), 6);
+    assert!(
+        rows.iter()
+            .all(|row| !row.input.to_lowercase().contains("alt + wheel")
+                && !row.input.to_lowercase().contains("alt+wheel")),
+        "no row names Alt + Wheel: {rows:?}"
     );
+    assert!("overlay-opacity".parse::<Action>().is_err());
+
+    for mode in [ShellMode::Stacking, ShellMode::Editor] {
+        let mut controller = match mode {
+            ShellMode::Stacking => AppController::new(),
+            ShellMode::Editor => AppController::new_with_mode_for_test(mode),
+        };
+        let (events, cb) = sink();
+        controller.set_sink(cb);
+        controller.wheel(0.0, 60.0, 0.0, 0.0, alt);
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "{mode:?}: Alt + Wheel raises no event"
+        );
+        controller.pointer(PointerKind::Down, Button::Left, 0.0, 0.0, alt);
+        controller.pointer(PointerKind::Up, Button::Left, 0.0, 0.0, alt);
+        assert_eq!(
+            fired(&events),
+            vec![Action::PickSourceUnderPointer],
+            "{mode:?}: Alt + click is the pipette"
+        );
+    }
 }
 
 /// The brush's `(size, soft)` as the editor toolbar reads them.
@@ -938,67 +929,45 @@ fn edit_mode_overrides_are_table_driven() {
         shift: true,
         ..NONE
     };
-    let alt = Modifiers { alt: true, ..NONE };
-
+    // The editor's `Shift + Wheel` default is the brush size, and no default
+    // wheel moves Soft.
     let mut editor = AppController::new_with_mode_for_test(ShellMode::Editor);
     let (events, cb) = sink();
     editor.set_sink(cb);
     let (_, soft) = brush(&editor);
-    editor.wheel(0.0, 60.0, 0.0, 0.0, alt);
-    assert_eq!(brush(&editor).1, soft + 5.0, "one detent moves Soft by 5");
-    editor.wheel(0.0, 30.0, 0.0, 0.0, alt);
-    assert_eq!(brush(&editor).1, soft + 5.0, "half a detent does nothing");
-    editor.wheel(0.0, 30.0, 0.0, 0.0, alt);
-    assert_eq!(
-        brush(&editor).1,
-        soft + 10.0,
-        "the second half completes it"
-    );
-    editor.wheel(0.0, -60.0, 0.0, 0.0, shift);
+    editor.wheel(0.0, 60.0, 0.0, 0.0, shift);
     editor.wheel(0.0, 60.0, 0.0, 0.0, ctrl);
-    assert_eq!(brush(&editor).1, soft + 10.0, "size and source leave Soft");
+    assert_eq!(brush(&editor).1, soft, "size and source leave Soft");
     assert_eq!(
         fired(&events),
-        vec![
-            Action::BrushSoftness,
-            Action::BrushSoftness,
-            Action::BrushSoftness,
-            Action::BrushSize,
-            Action::StepSourceFrame,
-        ]
+        vec![Action::BrushSize, Action::StepSourceFrame]
     );
-    assert!(editor.unimplemented_actions().is_empty());
 
     let mut view = AppController::new();
     let (events, cb) = sink();
     view.set_sink(cb);
     let before = brush(&view);
     view.wheel(0.0, 60.0, 0.0, 0.0, shift);
-    view.wheel(0.0, 60.0, 0.0, 0.0, alt);
     view.wheel(0.0, 60.0, 0.0, 0.0, ctrl);
     assert_eq!(brush(&view), before, "no view-mode wheel touches the brush");
     assert_eq!(
         fired(&events),
-        vec![
-            Action::PanHorizontal,
-            Action::OverlayOpacity,
-            Action::StepSourceFrame
-        ]
+        vec![Action::PanHorizontal, Action::StepSourceFrame]
     );
-    assert_eq!(view.unimplemented_actions(), [Action::OverlayOpacity]);
 
     // A user file that rebinds `shift+wheel` in the editor column changes
-    // what the wheel does there, and nothing else.
+    // what the wheel does there, and nothing else: `brush-softness` stays
+    // reachable by rebinding, one detent moving Soft by 5.
     let dir = tempfile::tempdir().unwrap();
     let toml = format!(
-        "version = 1\n{}",
+        "[input]\n{}",
         row_toml(
             &Trigger::Wheel(shift).to_string(),
             Some(Action::PanHorizontal),
             Some(Action::BrushSoftness),
         )
     );
-    fs::write(dir.path().join("input.toml"), toml).unwrap();
+    fs::write(dir.path().join("settings.toml"), toml).unwrap();
     let loaded = input_config::load(dir.path());
     assert!(loaded.problems.is_empty());
     let mut rebound = AppController::new_with_mode_for_test(ShellMode::Editor);
@@ -1007,8 +976,20 @@ fn edit_mode_overrides_are_table_driven() {
     rebound.install_input_table(loaded.table, loaded.provenance);
     let (size, soft) = brush(&rebound);
     rebound.wheel(0.0, 60.0, 0.0, 0.0, shift);
-    assert_eq!(brush(&rebound), (size, soft + 5.0));
-    assert_eq!(fired(&events), vec![Action::BrushSoftness]);
+    assert_eq!(
+        brush(&rebound),
+        (size, soft + 5.0),
+        "one detent moves Soft by 5"
+    );
+    rebound.wheel(0.0, 30.0, 0.0, 0.0, shift);
+    assert_eq!(brush(&rebound).1, soft + 5.0, "half a detent does nothing");
+    rebound.wheel(0.0, 30.0, 0.0, 0.0, shift);
+    assert_eq!(
+        brush(&rebound).1,
+        soft + 10.0,
+        "the second half completes it"
+    );
+    assert_eq!(fired(&events), vec![Action::BrushSoftness; 3]);
 }
 
 #[test]
@@ -1025,7 +1006,7 @@ fn paint_drag_is_a_hidden_table_row() {
     assert_eq!(table.action(&left_drag, ShellMode::Stacking), None);
 
     let rows = table.display_rows();
-    assert_eq!(rows.len(), 7, "the settings table keeps its seven rows");
+    assert_eq!(rows.len(), 6, "the settings table has six rows");
     assert!(
         rows.iter()
             .all(|row| !format!("{} {} {}", row.input, row.stacking, row.editor).contains("paint")),
@@ -1042,7 +1023,6 @@ fn paint_drag_is_a_hidden_table_row() {
         events.lock().unwrap().is_empty(),
         "a view-mode left drag does nothing"
     );
-    assert!(view.unimplemented_actions().is_empty());
 
     let mut editor = AppController::new_with_mode_for_test(ShellMode::Editor);
     let (events, cb) = sink();
@@ -1089,12 +1069,12 @@ const RAW_GESTURE_CALLBACK_EXCEPTIONS: &[&str] = &[
     "ff_scrollbar.slint",
     "settings_panel.slint",
     "images_panel.slint",
+    "checkpoint_panel.slint",
     "ff_image_row.slint",
     "gallery.slint",
     "ff_manifest_list.slint",
-    "ff_dialog.slint",
+    "ff_modal_panel.slint",
     "settings_modal.slint",
-    "dialogs.slint",
     "projects_overlay.slint",
 ];
 
@@ -1178,7 +1158,7 @@ fn canvas_ground_receives_forward_focus() {
 
 #[test]
 fn input_modules_are_slint_free() {
-    for file in ["input_map.rs", "input_config.rs"] {
+    for file in ["input_map.rs", "input_config.rs", "settings.rs"] {
         let path = common::src_dir().join(file);
         let contents = fs::read_to_string(&path).unwrap();
         let code = common::strip_line_comments(&contents);
