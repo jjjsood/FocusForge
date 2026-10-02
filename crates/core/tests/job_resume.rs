@@ -808,7 +808,7 @@ fn a_record_from_another_solver_revision_is_not_resumable() {
         other => panic!("expected Resumable::Mismatch, got {other:?}"),
     }
 
-    // A record written without the field no longer parses and is skipped.
+    // A record written without the field does not parse and is skipped.
     let job_json = walk(&scratch.join("resume"))
         .into_iter()
         .find(|p| p.file_name().is_some_and(|n| n == "job.json"))
