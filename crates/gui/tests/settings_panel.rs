@@ -1744,6 +1744,83 @@ fn more_lists_focus_map_in_the_picker() {
     );
 }
 
+/// Per method: pick it (Focus map only once Fuse's `More...` lists it), change
+/// the one field only `More...` shows, switch away and back, and read
+/// the equalization switch each method starts with.
+#[test]
+fn settings_journey_per_method() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    let more_open = |c: &AppController, section: &str| {
+        more_rows(&c.settings_panel().rows, section)[0].selected == "true"
+    };
+    let has_field = |c: &AppController, id: &str| {
+        field_ids(&c.settings_panel().rows, "fuse").contains(&id.to_string())
+    };
+    let methods = [
+        ("laplacian", "levels", ParamValue::Int(4), "4"),
+        ("weighted-average", "radius", ParamValue::Int(6), "6"),
+        ("depth-map", "score-radius", ParamValue::Int(5), "5"),
+    ];
+
+    assert!(
+        !picker_ids(&controller.settings_panel().rows, "fuse").contains(&"depth-map".to_string()),
+        "Focus map is not listed before Fuse's More..."
+    );
+    for (id, field, value, text) in &methods {
+        if more_open(&controller, "fuse") {
+            controller.toggle_section_more("fuse");
+        }
+        let display = registry::find(id).expect("registered").display_name();
+        if *id != "depth-map" {
+            controller.set_fuse_algorithm(id);
+        } else {
+            controller.toggle_section_more("fuse");
+            controller.set_fuse_algorithm(id);
+            controller.toggle_section_more("fuse");
+        }
+        assert!(!has_field(&controller, field), "{id}: {field} hides");
+
+        controller.toggle_section_more("fuse");
+        assert!(has_field(&controller, field), "{id}: {field} shows");
+        assert_ne!(
+            fuse_value(&controller, field),
+            *text,
+            "{id}: the planned value is off the default"
+        );
+        controller.set_param_value("fuse", field, value.clone());
+        assert_eq!(fuse_value(&controller, field), *text, "{id}");
+
+        let other = if *id == "laplacian" {
+            "weighted-average"
+        } else {
+            "laplacian"
+        };
+        controller.set_fuse_algorithm(other);
+        controller.set_fuse_algorithm(id);
+        assert_eq!(fuse_value(&controller, field), *text, "{id} kept");
+        assert!(more_open(&controller, "fuse"), "{id}: fold-out kept");
+        let rows = controller.settings_panel().rows;
+        let picker = rows
+            .iter()
+            .find(|r| r.kind == RowKind::Picker && r.section == "fuse")
+            .unwrap();
+        assert_eq!(picker.selected, *id);
+        assert_eq!(picker.value_text, display);
+
+        controller.toggle_section_more("crop");
+        let equalize = controller
+            .settings_panel()
+            .rows
+            .into_iter()
+            .find(|r| r.section == "crop" && r.id == "equalize")
+            .expect("the crop fold-out lists equalize");
+        let expected = if *id == "depth-map" { "true" } else { "false" };
+        assert_eq!(equalize.selected, expected, "{id}: equalize");
+        controller.toggle_section_more("crop");
+    }
+}
+
 #[test]
 fn more_keeps_a_selected_advanced_method_named() {
     let mut controller = AppController::new();

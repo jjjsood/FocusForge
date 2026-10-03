@@ -4195,6 +4195,118 @@ fn equalize_rows_reach_the_run() {
     assert_eq!(recorded.gains.len(), 3, "one gain per frame");
 }
 
+/// A frame the equalization bound clamps is reported on the window's info
+/// toast, naming the frame, the bound and the bound that would cover it; a
+/// bound wide enough for the stack raises nothing.
+#[test]
+fn settings_journey_equalization_reports_a_clamped_frame() {
+    use focusforge_core::equalize::UNIT_GAIN;
+    use focusforge_core::params::ParamValue;
+
+    let mut controller = common::controller_with_frames("equalize_clamped_notice", 8);
+    // The default aligner parks eight mantis frames on a diverged one; a run
+    // that always converges keeps the held checkpoint this test reads.
+    controller.set_align_algorithm("dummy-align");
+    controller.set_param_value("crop", "equalize", ParamValue::Bool(true));
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
+    assert_eq!(
+        controller.held_checkpoints().len(),
+        1,
+        "the default run holds"
+    );
+    assert_eq!(
+        controller.notice(),
+        None,
+        "the default bound 1.25 covers the stack"
+    );
+
+    controller.set_param_value("crop", "equalize-max-gain", ParamValue::Float(1.01));
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
+    assert_eq!(
+        controller.held_checkpoints().len(),
+        2,
+        "the tight run holds"
+    );
+    let notice = controller.notice().expect("a clamped frame is reported");
+    assert!(notice.contains("frame "), "{notice}");
+    assert!(notice.contains("1.01"), "{notice}");
+    assert!(notice.contains("would cover it"), "{notice}");
+    assert!(
+        notice.contains(" (and ") && notice.ends_with(" more)"),
+        "several clamped frames collapse to the first plus a count: {notice}"
+    );
+
+    let named: usize = notice
+        .strip_prefix("frame ")
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|index| index.parse().ok())
+        .unwrap_or_else(|| panic!("the notice starts with its frame: {notice}"));
+    let recorded = controller
+        .held_checkpoints()
+        .last()
+        .and_then(|held| held.registration.equalization.clone())
+        .expect("the tight run was equalized");
+    let gain = f64::from(recorded.gains[named]) / f64::from(UNIT_GAIN);
+    assert!(
+        (gain - 1.01).abs() < 1e-3 || (gain - 1.0 / 1.01).abs() < 1e-3,
+        "frame {named} sits at the bound, got {gain}"
+    );
+
+    controller.dismiss_notice();
+    assert_eq!(controller.notice(), None);
+}
+
+/// Three fuses on one tab, one per method: each held checkpoint carries its
+/// own method, its own advanced value and the equalization bound, and no
+/// method's value leaks into another's run.
+#[test]
+fn settings_journey_fuses_each_method_with_its_settings() {
+    use focusforge_core::params::ParamValue;
+
+    let mut controller = common::controller_with_frames("journey_each_method", 3);
+    controller.set_align_algorithm("dummy-align");
+    controller.toggle_section_more("fuse");
+    controller.toggle_section_more("crop");
+    let methods = [
+        ("laplacian", "levels", ParamValue::Int(4)),
+        ("weighted-average", "radius", ParamValue::Int(6)),
+        ("depth-map", "score-radius", ParamValue::Int(5)),
+    ];
+
+    for (index, (id, field, value)) in methods.iter().enumerate() {
+        controller.set_fuse_algorithm(id);
+        controller.set_param_value("fuse", field, value.clone());
+        if *id != "depth-map" {
+            controller.set_param_value("crop", "equalize", ParamValue::Bool(true));
+        }
+        controller.set_param_value("crop", "equalize-max-gain", ParamValue::Float(1.01));
+        assert!(controller.start_fuse(), "{id} starts");
+        common::wait_for_settle(&mut controller, SETTLE);
+        let held = controller.held_checkpoints();
+        assert_eq!(held.len(), index + 1, "{id} holds one more checkpoint");
+        let run = held.last().unwrap();
+        assert_eq!(run.algorithm, *id);
+        assert_eq!(run.params.get(*field), Some(value), "{id}: {field}");
+        for (other, other_field, _) in &methods {
+            if other != id {
+                assert_eq!(
+                    run.params.get(*other_field),
+                    None,
+                    "{id} has no {other_field}"
+                );
+            }
+        }
+        let recorded = run
+            .registration
+            .equalization
+            .as_ref()
+            .unwrap_or_else(|| panic!("{id} was equalized"));
+        assert_eq!(recorded.max_gain, 1.01, "{id}");
+    }
+}
+
 /// A `depth-map` run equalizes without the switch being touched; turning the
 /// switch off records an unequalized run.
 #[test]

@@ -1085,7 +1085,8 @@ struct ShellState {
     /// [`AppController::cancel_mismatch`] -- no tab exists for it while
     /// this is `Some`.
     pending_mismatch: Option<PendingOpen>,
-    /// The skipped-subfolder notice from the most recent open, if any.
+    /// The info notice: the most recent open's skipped-subfolder line or the
+    /// most recent finished run's notices, if any.
     notice: Option<String>,
     /// The most recent refusal's already-rendered message, if any.
     last_refusal: Option<String>,
@@ -3384,12 +3385,14 @@ impl AppController {
         self.state.pending.as_ref().map(|(question, _)| question)
     }
 
-    /// The skipped-subfolder notice from the most recent open, if any.
+    /// The info notice the window shows, if any: the skipped-subfolder line
+    /// of the most recent open, or the notices of the most recent finished
+    /// run (a clamped equalization frame among them).
     pub fn notice(&self) -> Option<&str> {
         self.state.notice.as_deref()
     }
 
-    /// Clears the skipped-subfolder notice. Manual dismiss only -- unlike
+    /// Clears the info notice. Manual dismiss only -- unlike
     /// the run-failure toast, this one names something already finished,
     /// not a live status to time out on its own, so it waits for its own
     /// `x`. Clearing `self.state.notice` here, not only the Slint-side
@@ -6193,6 +6196,12 @@ impl AppController {
         // stage line names.
         let progress = self.job.observer.as_ref().and_then(|o| o.last_progress());
         let phase = job::progress_phase(progress.as_ref());
+        let run_notices = self
+            .job
+            .observer
+            .as_ref()
+            .map(|o| o.notices())
+            .unwrap_or_default();
         let tab_index = self.job.tab_id.take().and_then(|id| self.tab_index(id));
         let owner = tab_index.and_then(|i| self.state.projects.get(i));
         let was_cancelling = owner.is_some_and(|tab| tab.run == job::RunState::Cancelling);
@@ -6250,6 +6259,12 @@ impl AppController {
         }
 
         let owner = tab_index.filter(|&i| i < self.state.projects.len());
+        if settled.held.is_some()
+            && let Some(line) = run_notice_line(&run_notices)
+        {
+            self.state.notice = Some(line);
+            self.emit(ShellEvent::ProjectsChanged);
+        }
         let planes = match (settled.held, owner) {
             (None, _) => None,
             (Some(held), None) => {
@@ -7731,8 +7746,18 @@ fn open_card_meta(frame_count: u32, checkpoints: usize, phase_line: Option<&str>
     )
 }
 
-/// The skipped-subfolder notice's text, `None` when nothing was skipped --
-/// not an error, its toast's own copy (`ui/shell/dialogs.slint`'s
+/// The info notice's text for a finished run: the first pipeline notice,
+/// plus ` (and N more)` when it raised several; `None` when it raised none.
+fn run_notice_line(notices: &[String]) -> Option<String> {
+    let (first, rest) = notices.split_first()?;
+    Some(match rest.len() {
+        0 => first.clone(),
+        more => format!("{first} (and {more} more)"),
+    })
+}
+
+/// The info notice's text for a skipped-subfolder open, `None` when nothing
+/// was skipped -- not an error, its toast's own copy (`ui/shell/dialogs.slint`'s
 /// `FFToast`, `tone: "info"`). Short enough to stay on the toast's one
 /// line regardless of how many subfolders it names.
 fn notice_line(skipped: &[PathBuf]) -> Option<String> {

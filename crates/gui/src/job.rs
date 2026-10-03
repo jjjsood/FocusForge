@@ -270,6 +270,8 @@ pub struct GuiObserver {
     /// [`resolve_backend`]'s own account of this run's processing backend,
     /// set once from the worker thread before the pipeline starts.
     backend_line: Mutex<Option<String>>,
+    /// Every [`StageObserver::notice`] the run raised, in order.
+    notices: Mutex<Vec<String>>,
 }
 
 impl GuiObserver {
@@ -279,7 +281,16 @@ impl GuiObserver {
             pause_gate: Mutex::new(false),
             condvar: Condvar::new(),
             backend_line: Mutex::new(None),
+            notices: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The notices the pipeline raised so far, in order.
+    pub fn notices(&self) -> Vec<String> {
+        self.notices
+            .lock()
+            .expect("no thread panicked while holding the notices lock")
+            .clone()
     }
 
     /// The most recent [`JobProgress`] snapshot `tick` recorded, or `None`
@@ -333,6 +344,13 @@ impl StageObserver for GuiObserver {
             .last_progress
             .lock()
             .expect("no thread panicked while holding the progress lock") = Some(*progress);
+    }
+
+    fn notice(&self, message: &str) {
+        self.notices
+            .lock()
+            .expect("no thread panicked while holding the notices lock")
+            .push(message.to_string());
     }
 
     fn paused(&self, control: &JobControl) {

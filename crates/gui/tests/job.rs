@@ -351,6 +351,76 @@ fn pause_then_resume_continues() {
     );
 }
 
+/// Per method: a run paused and resumed, and a run fused again after a
+/// cancel, both complete with the composite an uninterrupted run holds; the
+/// cancel adds no checkpoint and leaves the tab idle.
+#[test]
+fn settings_journey_pause_resume_and_cancel() {
+    let timeout = Duration::from_secs(120);
+    let mut controller = controller_with_frames("journey_run_control", 3);
+    let methods = [
+        ("laplacian", "levels", ParamValue::Int(4)),
+        ("weighted-average", "radius", ParamValue::Int(6)),
+        ("depth-map", "score-radius", ParamValue::Int(5)),
+    ];
+    let newest_composite = |c: &AppController| {
+        std::fs::read(&c.held_checkpoints().last().expect("a held run").composite)
+            .expect("the held composite reads")
+    };
+
+    for (id, field, value) in methods {
+        controller.set_fuse_algorithm(id);
+        controller.set_param_value("fuse", field, value);
+
+        assert!(controller.start_fuse(), "{id}: the reference run starts");
+        common::wait_for_settle(&mut controller, timeout);
+        let reference = newest_composite(&controller);
+        let held = controller.held_checkpoints().len();
+
+        start_and_hold_at_pause(&mut controller, timeout);
+        controller.pause_or_resume();
+        common::wait_for_settle(&mut controller, timeout);
+        assert_eq!(
+            controller.held_checkpoints().len(),
+            held + 1,
+            "{id}: resumed"
+        );
+        assert_eq!(newest_composite(&controller), reference, "{id}: resumed");
+
+        controller.dismiss_notice();
+        start_and_hold_at_pause(&mut controller, timeout);
+        controller.cancel_fuse();
+        common::wait_for_settle(&mut controller, timeout);
+        assert_eq!(
+            controller.notice(),
+            None,
+            "{id}: a cancelled run reports nothing"
+        );
+        assert_eq!(controller.job_view().state, job::RunState::Idle, "{id}");
+        assert_eq!(
+            controller.held_checkpoints().len(),
+            held + 1,
+            "{id}: cancelled"
+        );
+
+        assert!(
+            controller.start_fuse(),
+            "{id}: fuses again after the cancel"
+        );
+        common::wait_for_settle(&mut controller, timeout);
+        assert_eq!(
+            controller.held_checkpoints().len(),
+            held + 2,
+            "{id}: fused again"
+        );
+        assert_eq!(
+            newest_composite(&controller),
+            reference,
+            "{id}: after cancel"
+        );
+    }
+}
+
 #[test]
 fn resume_does_not_reset_the_unit_total() {
     let request = no_align_request("resume_unit_total", 2);
