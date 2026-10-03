@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "slint-second-window"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+focusforge-gpu = { path = "../../crates/gpu" }
+image = "0.25"
+slint = { version = "=1.17.1", default-features = false, features = [
+    "std", "compat-1-2", "backend-winit", "renderer-femtovg-wgpu",
+    "unstable-wgpu-29", "unstable-winit-030",
+] }
+winit = "=0.30.13"
