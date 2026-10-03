@@ -6,8 +6,8 @@
 //! trait object, and the *policy* -- what "stop" means, who requested it --
 //! lives in `core::job`, which `core::tile` never names.
 
-/// How often a waiter re-reads an [`TileControl::admission_cap`] that is the
-/// binding term; lifting a cap wakes nobody.
+/// How often a waiter re-reads [`TileControl::admission_cap`] while the cap is
+/// the binding term; lifting a cap wakes nobody.
 pub(crate) const ADMISSION_RECHECK: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Consulted once, as the first statement of every tile's work
