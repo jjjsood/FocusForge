@@ -3147,6 +3147,38 @@ fn preparer_serves_exact_before_backdrop() {
     }
 }
 
+/// Exact reads are idle only once nothing is queued, none is running and the
+/// result has been taken; a backdrop read does not count.
+#[test]
+fn preparer_is_exact_idle_only_once_the_exact_read_is_taken() {
+    use focusforge_gui::canvas::Preparer;
+    use preparing::*;
+
+    let (reader, release) = FakeReader::new(1);
+    let preparer = Preparer::new(|| {});
+    assert!(preparer.exact_idle(), "a fresh preparer has no exact work");
+
+    preparer.submit(vec![job(&reader, 1, 1)]);
+    wait_for("the exact read to start", || reader.reads() == 1);
+    assert!(!preparer.exact_idle(), "an exact read is running");
+
+    release.send(()).unwrap();
+    wait_for("the exact read to finish", || reader.finished() == 1);
+    assert!(!preparer.exact_idle(), "the result is not taken yet");
+
+    take_stamp(&preparer, 1);
+    assert!(preparer.exact_idle(), "taken: nothing exact is left");
+
+    let (reader, release) = FakeReader::new(1);
+    let preparer = Preparer::new(|| {});
+    let mut fill = job(&reader, 22, 2);
+    fill.backdrop = true;
+    preparer.submit_backdrop(vec![fill]);
+    wait_for("the backdrop read to start", || reader.reads() == 1);
+    assert!(preparer.exact_idle(), "a backdrop read never holds the cap");
+    release.send(()).unwrap();
+}
+
 #[test]
 fn overlay_keeps_sealed_pixels_where_index_unchanged() {
     let stack = mantis64_stack();

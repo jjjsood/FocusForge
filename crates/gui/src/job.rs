@@ -144,6 +144,17 @@ pub struct JobRequest {
 /// own frame clock.
 pub const POLL: Duration = Duration::from_millis(100);
 
+/// How long the canvas must see no action before a run's interactive
+/// admission cap may lift.
+pub const INTERACTION_QUIET: Duration = Duration::from_millis(250);
+
+/// The most tile sets or registrations a run may hold in flight while the
+/// canvas is being used: a quarter of the host's threads, at least one.
+pub fn interactive_cap() -> usize {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (threads / 4).max(1)
+}
+
 /// The host budget the frame pane and the edit session each open their
 /// readers against.
 pub fn host_budget() -> HostBudget {

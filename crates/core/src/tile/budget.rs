@@ -43,6 +43,7 @@ use std::time::Instant;
 
 use crate::host::{FactsOrigin, HostFacts, HostProbe};
 use crate::params::Provenance;
+use crate::tile::control::{ADMISSION_RECHECK, TileControl};
 use crate::tile::scheduler::{DEFAULT_MAX_BYTES_IN_FLIGHT, in_flight_for_budget};
 
 /// The share of `HostFacts::usable_available()` a host-derived budget
@@ -354,17 +355,29 @@ impl HostBudgetGate {
         }
     }
 
-    /// Blocks until fewer than [`Self::limit`] tile sets are in-flight, then
-    /// admits one and returns its RAII permit. Polls pressure first (subject
-    /// to its own cadence and CAS), so a limit shrink is visible to this
-    /// very call's own admission check.
-    pub fn acquire(&self) -> HostPermit<'_> {
+    /// Blocks until fewer than the smaller of [`Self::limit`] and the
+    /// control's admission cap tile sets are in flight, then admits one.
+    /// Polls pressure first, so a limit shrink is visible to this call.
+    /// The cap is never written into the limit, so it cannot raise it or hide
+    /// a back-off. While the cap binds, the wait re-checks every 10 ms.
+    pub fn acquire(&self, control: &dyn TileControl) -> HostPermit<'_> {
         if self.arms_back_off {
             self.maybe_poll_pressure();
         }
         let mut state = self.state.lock().unwrap();
-        while state.in_flight >= state.limit {
-            state = self.condvar.wait(state).unwrap();
+        loop {
+            let cap = control.admission_cap();
+            if state.in_flight < state.limit.min(cap) {
+                break;
+            }
+            state = if cap < state.limit {
+                self.condvar
+                    .wait_timeout(state, ADMISSION_RECHECK)
+                    .unwrap()
+                    .0
+            } else {
+                self.condvar.wait(state).unwrap()
+            };
         }
         state.in_flight += 1;
         self.peak.fetch_max(state.in_flight, Ordering::SeqCst);
@@ -435,6 +448,7 @@ impl HostBudgetGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tile::control::NoControl;
     use std::sync::Mutex as StdMutex;
 
     fn probed_facts(available: u64, process_rss: Option<u64>) -> HostFacts {
@@ -580,24 +594,24 @@ mod tests {
         // clock=0, so their own polls are skipped by the cadence check
         // (elapsed 0 < PRESSURE_POLL_INTERVAL_MS) rather than consuming the
         // script.
-        let held_a = gate.acquire();
-        let held_b = gate.acquire();
+        let held_a = gate.acquire(&NoControl);
+        let held_b = gate.acquire(&NoControl);
         assert_eq!(gate.limit(), 8);
 
         // Poll 1: hit, but only the first of two confirmations.
         clock.advance(PRESSURE_POLL_INTERVAL_MS);
-        drop(gate.acquire());
+        drop(gate.acquire(&NoControl));
         assert_eq!(gate.limit(), 8, "a single confirming poll must not shrink");
 
         // Poll 2: hit again, shrinks 8 -> 4.
         clock.advance(PRESSURE_POLL_INTERVAL_MS);
-        drop(gate.acquire());
+        drop(gate.acquire(&NoControl));
         assert_eq!(gate.limit(), 4);
         assert!(gate.backed_off());
 
         // Poll 3: recovers (rss back to start); must not raise the limit.
         clock.advance(PRESSURE_POLL_INTERVAL_MS);
-        drop(gate.acquire());
+        drop(gate.acquire(&NoControl));
         assert_eq!(
             gate.limit(),
             4,
@@ -606,7 +620,7 @@ mod tests {
 
         // Poll 4: hit, first of two confirmations again.
         clock.advance(PRESSURE_POLL_INTERVAL_MS);
-        drop(gate.acquire());
+        drop(gate.acquire(&NoControl));
         assert_eq!(gate.limit(), 4);
 
         // Poll 5: the confirming hit that shrinks 4 -> 2 -- exactly the two
@@ -616,7 +630,7 @@ mod tests {
         clock.advance(PRESSURE_POLL_INTERVAL_MS);
         let gate_bg = gate.clone();
         let handle = std::thread::spawn(move || {
-            drop(gate_bg.acquire());
+            drop(gate_bg.acquire(&NoControl));
         });
 
         // Wait for the background thread's own poll to have performed the
@@ -654,7 +668,7 @@ mod tests {
         assert_eq!(gate.initial_limit(), 8);
         clock.advance(10 * PRESSURE_POLL_INTERVAL_MS);
         for _ in 0..10 {
-            drop(gate.acquire());
+            drop(gate.acquire(&NoControl));
         }
         assert_eq!(gate.limit(), 8);
         assert!(!gate.backed_off());
@@ -672,7 +686,7 @@ mod tests {
         for _ in 0..12 {
             let gate = gate.clone();
             handles.push(std::thread::spawn(move || {
-                let _permit = gate.acquire();
+                let _permit = gate.acquire(&NoControl);
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }));
         }
@@ -681,5 +695,154 @@ mod tests {
         }
         assert!(gate.peak_in_flight() <= gate.initial_limit());
         assert!(gate.peak_in_flight() >= 1);
+    }
+
+    /// A control whose admission cap a test sets and lifts while acquirers
+    /// are already waiting.
+    struct CapControl(AtomicUsize);
+
+    impl CapControl {
+        fn new(cap: usize) -> Self {
+            CapControl(AtomicUsize::new(cap))
+        }
+    }
+
+    impl TileControl for CapControl {
+        fn should_stop(&self) -> bool {
+            false
+        }
+
+        fn admission_cap(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_cap_below_the_limit_bounds_in_flight_and_lifting_it_restores_admission() {
+        let gate = Arc::new(HostBudgetGate::new(
+            HostBudget::explicit(6),
+            1,
+            6,
+            HostSources::default(),
+        ));
+        assert_eq!(gate.initial_limit(), 6);
+        let control = Arc::new(CapControl::new(2));
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let (gate, control, admitted, release) = (
+                    gate.clone(),
+                    control.clone(),
+                    admitted.clone(),
+                    release.clone(),
+                );
+                std::thread::spawn(move || {
+                    let _permit = gate.acquire(&*control);
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                    while !release.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                })
+            })
+            .collect();
+
+        wait_until("two acquirers admitted under the cap", || {
+            admitted.load(Ordering::SeqCst) >= 2
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            admitted.load(Ordering::SeqCst),
+            2,
+            "a cap of 2 must hold the other four waiting"
+        );
+        assert_eq!(gate.peak_in_flight(), 2);
+
+        // No notify: the gate must notice the lifted cap on its own.
+        control.0.store(usize::MAX, Ordering::SeqCst);
+        wait_until("all six admitted once the cap lifts", || {
+            admitted.load(Ordering::SeqCst) == 6
+        });
+        assert_eq!(gate.peak_in_flight(), 6);
+
+        release.store(true, Ordering::SeqCst);
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_cap_never_raises_a_shrunk_limit() {
+        let script = vec![
+            probed_facts(1_000, Some(1_000)), // consumed at construction
+            probed_facts(1_000, Some(2_000)), // poll 1: hit, 1/2 confirmations
+            probed_facts(1_000, Some(2_500)), // poll 2: hit, shrinks 8 -> 4
+            probed_facts(1_000, Some(2_500)), // poll 3: hit, 1/2 confirmations
+            probed_facts(1_000, Some(2_500)), // poll 4: hit, shrinks 4 -> 2
+        ];
+        let clock = Arc::new(ManualClock::new());
+        let sources = HostSources {
+            probe: Arc::new(ScriptedProbe::new(script)),
+            clock: clock.clone(),
+        };
+        let budget = HostBudget::host_derived(&probed_facts(1_000, Some(1_000)));
+        let gate = Arc::new(HostBudgetGate::new(budget, 1, 8, sources));
+        assert_eq!(gate.initial_limit(), 8);
+        let control = Arc::new(CapControl::new(4));
+
+        let held_a = gate.acquire(&*control);
+        let held_b = gate.acquire(&*control);
+
+        clock.advance(PRESSURE_POLL_INTERVAL_MS);
+        drop(gate.acquire(&*control));
+        assert_eq!(gate.limit(), 8);
+        clock.advance(PRESSURE_POLL_INTERVAL_MS);
+        drop(gate.acquire(&*control));
+        assert_eq!(gate.limit(), 4, "back-off halves while a cap is set");
+        clock.advance(PRESSURE_POLL_INTERVAL_MS);
+        drop(gate.acquire(&*control));
+        assert_eq!(gate.limit(), 4);
+
+        // Shrinking to the two permits already held: this acquirer waits
+        // until one of them is released.
+        clock.advance(PRESSURE_POLL_INTERVAL_MS);
+        let shrinker = {
+            let (gate, control) = (gate.clone(), control.clone());
+            std::thread::spawn(move || drop(gate.acquire(&*control)))
+        };
+        wait_until("the shrink to 2", || gate.limit() == 2);
+        drop(held_b);
+        shrinker.join().unwrap();
+        drop(held_a);
+
+        // The cap of 4 sits above the shrunk limit and must not raise it.
+        let live = Arc::new(AtomicUsize::new(0));
+        let widest = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (gate, control, live, widest) =
+                    (gate.clone(), control.clone(), live.clone(), widest.clone());
+                std::thread::spawn(move || {
+                    let _permit = gate.acquire(&*control);
+                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    widest.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    live.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(gate.limit(), 2);
+        assert!(widest.load(Ordering::SeqCst) <= 2);
     }
 }

@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slint::ComponentHandle;
 use slint::Model as _;
@@ -103,6 +103,12 @@ pub struct Canvas {
 }
 
 impl Canvas {
+    /// Whether no exact pane read is queued, running or waiting to be taken;
+    /// `true` without a preparer.
+    pub fn exact_idle(&self) -> bool {
+        self.preparer.as_ref().is_none_or(Preparer::exact_idle)
+    }
+
     /// Which tab's planes the renderer currently holds.
     pub fn tab(&self) -> Option<usize> {
         self.tab
@@ -1116,6 +1122,11 @@ fn start_job_timer(
             return;
         };
         record_timing(TimingCounter::JobPolls, 1);
+        let exact_idle = canvas.borrow().exact_idle();
+        controller
+            .lock()
+            .unwrap()
+            .relax_admission(exact_idle, Instant::now());
         let settled = controller.lock().unwrap().settle_job();
         if settled.is_some() {
             push_projects(&app, &controller);

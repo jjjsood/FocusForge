@@ -508,6 +508,9 @@ struct PreparerState {
     pending: Option<Vec<PaneJob>>,
     /// Backdrop reads, served only while `pending` is empty.
     pending_backdrop: Vec<PaneJob>,
+    /// An exact read is running: set when the worker takes `pending`, cleared
+    /// under the lock that stores its result.
+    reading_exact: bool,
     done: Option<Vec<Prepared>>,
     /// Finished backdrop reads, one per pane at most; never replaces `done`.
     done_backdrop: Vec<Prepared>,
@@ -602,6 +605,13 @@ impl Preparer {
         (!done.is_empty()).then_some(done)
     }
 
+    /// Whether no exact work is left: nothing queued, no exact read running
+    /// and its result taken. Backdrop reads are ignored.
+    pub fn exact_idle(&self) -> bool {
+        let state = self.shared.lock();
+        state.pending.is_none() && !state.reading_exact && state.done.is_none()
+    }
+
     /// Hands consumed buffers back for the next request to read into.
     pub fn recycle(&self, spent: Vec<Prepared>) {
         let mut state = self.shared.lock();
@@ -630,6 +640,7 @@ fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
                     return;
                 }
                 if let Some(jobs) = state.pending.take() {
+                    state.reading_exact = true;
                     break (jobs, false);
                 }
                 if !state.pending_backdrop.is_empty() {
@@ -663,6 +674,9 @@ fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
             .collect();
 
         let mut state = shared.lock();
+        if !backdrop {
+            state.reading_exact = false;
+        }
         if state.shutdown {
             return;
         }

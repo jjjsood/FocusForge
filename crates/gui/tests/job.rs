@@ -5483,3 +5483,180 @@ fn a_save_makes_the_previous_plane_files_stale() {
         "a save leaves the earlier files older than the project"
     );
 }
+
+// ---------------------------------------------------------------------
+// Interactive admission: a canvas action caps the live run's tile sets and
+// registrations; the cap lifts once the view has settled.
+// ---------------------------------------------------------------------
+
+const NO_CAP: usize = usize::MAX;
+
+/// Fits both panes of `controller`'s active tab, as a window would.
+fn set_fitted_panes(controller: &mut AppController) {
+    let pane = |x: f32| PaneRect {
+        x,
+        y: 0.0,
+        width: 566.0,
+        height: 748.0,
+    };
+    controller.set_pane_geometry(pane(0.0), pane(566.0));
+    controller.fit_if_unfitted();
+}
+
+#[test]
+fn a_canvas_action_caps_the_live_run_until_the_view_settles() {
+    // Tab 0 is fused and edited while tab 1's run is live.
+    let mut controller = controller_with_two_tabs("canvas_cap");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120))
+        .expect("the first run fuses tab 0");
+    controller.select_project(1);
+    assert!(controller.start_fuse());
+    controller.select_project(0);
+
+    common::enter_editor(&mut controller);
+    let map = controller.edit_session().unwrap().tile();
+    let (w, h) = (map.width as f32, map.height as f32);
+    let pane = |x: f32| PaneRect {
+        x,
+        y: 0.0,
+        width: w,
+        height: h,
+    };
+    controller.set_pane_geometry(pane(0.0), pane(w + 8.0));
+
+    assert_eq!(
+        controller.admission_cap_for_test(),
+        Some(NO_CAP),
+        "tab 1's run is live and uncapped"
+    );
+
+    // A live stroke keeps the edits unsettled.
+    let (x, y) = (w + 8.0 + w / 2.0, h / 2.0);
+    controller.pointer(PointerKind::Down, Button::Left, x, y, Modifiers::NONE);
+    assert!(!controller.edits_settled());
+
+    controller.wheel(0.0, 60.0, x, y, Modifiers::NONE);
+    assert_eq!(
+        controller.admission_cap_for_test(),
+        Some(job::interactive_cap())
+    );
+
+    let acted = Instant::now();
+    controller.relax_admission(true, acted);
+    assert_eq!(
+        controller.admission_cap_for_test(),
+        Some(job::interactive_cap()),
+        "no quiet window has passed"
+    );
+    let quiet = acted + job::INTERACTION_QUIET;
+    controller.relax_admission(false, quiet);
+    assert_eq!(
+        controller.admission_cap_for_test(),
+        Some(job::interactive_cap()),
+        "the exact read is still busy"
+    );
+    controller.relax_admission(true, quiet);
+    assert_eq!(
+        controller.admission_cap_for_test(),
+        Some(job::interactive_cap()),
+        "the stroke has not settled"
+    );
+
+    controller.pointer(PointerKind::Up, Button::Left, x, y, Modifiers::NONE);
+    common::settle_recomposites(&mut controller);
+    assert!(controller.edits_settled());
+    // Releasing the stroke was itself a canvas action: the window restarts.
+    controller.relax_admission(true, quiet);
+    assert_eq!(
+        controller.admission_cap_for_test(),
+        Some(job::interactive_cap()),
+        "the release restarted the quiet window"
+    );
+    controller.relax_admission(true, Instant::now() + job::INTERACTION_QUIET);
+    assert_eq!(controller.admission_cap_for_test(), Some(NO_CAP));
+}
+
+#[test]
+fn a_capped_run_still_completes() {
+    let mut controller = controller_with_frames("capped_completes", 3);
+    set_fitted_panes(&mut controller);
+    assert!(controller.start_fuse());
+    controller.wheel(0.0, 60.0, 100.0, 100.0, Modifiers::NONE);
+    assert_eq!(
+        controller.admission_cap_for_test(),
+        Some(job::interactive_cap())
+    );
+
+    common::wait_for_settle(&mut controller, Duration::from_secs(120))
+        .expect("a capped run still hands back its planes");
+    match controller.job_view().state {
+        job::RunState::Fused { .. } => {}
+        other => panic!("expected a completed fuse, got {other:?}"),
+    }
+}
+
+#[test]
+fn cancelling_a_capped_run_settles() {
+    let mut controller = controller_with_frames("capped_cancel", 3);
+    set_fitted_panes(&mut controller);
+    assert!(controller.start_fuse());
+    controller.wheel(0.0, 60.0, 100.0, 100.0, Modifiers::NONE);
+    assert_eq!(
+        controller.admission_cap_for_test(),
+        Some(job::interactive_cap())
+    );
+
+    controller.cancel_fuse();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert!(!controller.job_running());
+    assert_eq!(controller.job_view().state, job::RunState::Idle);
+}
+
+#[test]
+fn a_burst_of_ticks_keeps_only_the_newest_progress() {
+    const THREADS: usize = 4;
+    const TICKS: usize = 2_000;
+    let observer = job::GuiObserver::new();
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let observer = &observer;
+            scope.spawn(move || {
+                for tick in 0..TICKS {
+                    let progress = fuse_progress(thread * TICKS + tick, THREADS * TICKS);
+                    StageObserver::tick(observer, &progress);
+                }
+            });
+        }
+    });
+    let last = observer.last_progress().expect("a tick was recorded");
+    assert_eq!(
+        last.units_done % TICKS,
+        TICKS - 1,
+        "what remains is some thread's final tick, not an earlier one"
+    );
+}
+
+#[test]
+fn a_cancelled_run_reports_its_terminal_state_after_a_progress_burst() {
+    let request = no_align_request("cancel_after_burst", 2);
+    let control = focusforge_core::job::JobControl::new();
+    let observer = job::GuiObserver::new();
+    std::thread::scope(|scope| {
+        for _ in 0..3 {
+            let observer = &observer;
+            scope.spawn(move || {
+                for tick in 0..2_000 {
+                    StageObserver::tick(observer, &fuse_progress(tick, 2_000));
+                }
+            });
+        }
+        control.cancel();
+        let outcome = pipeline::run(&request, &observer, control, None)
+            .expect("a cancelled run is not an error");
+        assert!(
+            matches!(outcome, FuseOutcome::Cancelled { .. }),
+            "the cancel must survive the burst"
+        );
+    });
+}

@@ -1589,6 +1589,9 @@ struct JobSlot {
     /// Tab ids waiting for the live run to settle, in press order. The live
     /// run itself is position 1; the head of this queue is position 2.
     queue: VecDeque<u64>,
+    /// When the canvas last acted; the interactive admission cap lifts only
+    /// [`job::INTERACTION_QUIET`] after it.
+    last_canvas_action: Option<Instant>,
 }
 
 /// The toolbar/bottom-bar surfaces' plain-Rust view of the active run --
@@ -2626,6 +2629,10 @@ impl AppController {
     /// Applies `event` ([`Self::apply_action`]) and raises
     /// [`ShellEvent::Input`].
     fn emit_action(&mut self, event: ActionEvent) {
+        self.job.last_canvas_action = Some(Instant::now());
+        if let Some(control) = &self.job.control {
+            control.set_admission_cap(Some(job::interactive_cap()));
+        }
         self.apply_action(&event);
         self.emit(ShellEvent::Input(event));
     }
@@ -3342,6 +3349,32 @@ impl AppController {
             .active()
             .and_then(|tab| tab.edit.as_ref())
             .is_none_or(job::EditState::is_settled)
+    }
+
+    /// Lifts the live run's interactive admission cap once the canvas has
+    /// seen no action for [`job::INTERACTION_QUIET`] as of `now`, the exact
+    /// read is idle (`exact_idle`) and the edits have settled.
+    pub fn relax_admission(&mut self, exact_idle: bool, now: Instant) {
+        let quiet = self
+            .job
+            .last_canvas_action
+            .is_none_or(|acted| now.saturating_duration_since(acted) >= job::INTERACTION_QUIET);
+        if quiet
+            && exact_idle
+            && self.edits_settled()
+            && let Some(control) = &self.job.control
+        {
+            control.set_admission_cap(None);
+        }
+    }
+
+    /// The live run's admission cap; `None` without a run, `usize::MAX`
+    /// uncapped.
+    pub fn admission_cap_for_test(&self) -> Option<usize> {
+        self.job
+            .control
+            .as_ref()
+            .map(|control| control.admission_cap())
     }
 
     /// The one wheel entry point. Axis normalisation first: an unmodified
