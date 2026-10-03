@@ -4145,7 +4145,7 @@ fn open_equalized_editor(name: &str, count: usize) -> AppController {
     let mut controller = controller_with_scratch(name);
     open_mantis64_tab(&mut controller, name, count);
     controller.set_fuse_algorithm("depth-map");
-    controller.set_param_value("crop", "equalize", ParamValue::Bool(true));
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
     assert!(controller.start_fuse());
     settle_all(&mut controller);
     assert_eq!(controller.checkpoint_count(), Some(1), "{name} must fuse");
@@ -4155,19 +4155,19 @@ fn open_equalized_editor(name: &str, count: usize) -> AppController {
     controller
 }
 
-/// The crop section lists the equalization switch (off) and its bound, and
+/// The prepare section lists the equalization switch (off) and its bound, and
 /// turning the switch on reaches the run with the bound the panel holds.
 #[test]
 fn equalize_rows_reach_the_run() {
     use focusforge_core::params::ParamValue;
 
     let mut controller = common::controller_with_frames("equalize_rows", 3);
-    controller.toggle_section_more("crop");
+    controller.toggle_section_more("prepare");
     let rows: Vec<_> = controller
         .settings_panel()
         .rows
         .into_iter()
-        .filter(|r| r.section == "crop")
+        .filter(|r| r.section == "prepare")
         .collect();
     let row = |id: &str| {
         rows.iter()
@@ -4185,8 +4185,8 @@ fn equalize_rows_reach_the_run() {
         "a default run is not equalized"
     );
 
-    controller.set_param_value("crop", "equalize", ParamValue::Bool(true));
-    controller.set_param_value("crop", "equalize-max-gain", ParamValue::Float(1.5));
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
+    controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.5));
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
     let on = controller.held_checkpoints().last().cloned().unwrap();
@@ -4207,7 +4207,7 @@ fn settings_journey_equalization_reports_a_clamped_frame() {
     // The default aligner parks eight mantis frames on a diverged one; a run
     // that always converges keeps the held checkpoint this test reads.
     controller.set_align_algorithm("dummy-align");
-    controller.set_param_value("crop", "equalize", ParamValue::Bool(true));
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
     assert_eq!(
@@ -4221,7 +4221,7 @@ fn settings_journey_equalization_reports_a_clamped_frame() {
         "the default bound 1.25 covers the stack"
     );
 
-    controller.set_param_value("crop", "equalize-max-gain", ParamValue::Float(1.01));
+    controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.01));
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
     assert_eq!(
@@ -4268,7 +4268,7 @@ fn settings_journey_fuses_each_method_with_its_settings() {
     let mut controller = common::controller_with_frames("journey_each_method", 3);
     controller.set_align_algorithm("dummy-align");
     controller.toggle_section_more("fuse");
-    controller.toggle_section_more("crop");
+    controller.toggle_section_more("prepare");
     let methods = [
         ("laplacian", "levels", ParamValue::Int(4)),
         ("weighted-average", "radius", ParamValue::Int(6)),
@@ -4279,9 +4279,9 @@ fn settings_journey_fuses_each_method_with_its_settings() {
         controller.set_fuse_algorithm(id);
         controller.set_param_value("fuse", field, value.clone());
         if *id != "depth-map" {
-            controller.set_param_value("crop", "equalize", ParamValue::Bool(true));
+            controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
         }
-        controller.set_param_value("crop", "equalize-max-gain", ParamValue::Float(1.01));
+        controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.01));
         assert!(controller.start_fuse(), "{id} starts");
         common::wait_for_settle(&mut controller, SETTLE);
         let held = controller.held_checkpoints();
@@ -4323,7 +4323,7 @@ fn focus_map_run_equalizes_by_default_and_an_explicit_off_wins() {
         "equalized by default"
     );
 
-    controller.set_param_value("crop", "equalize", ParamValue::Bool(false));
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(false));
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
     let off = controller.held_checkpoints().last().cloned().unwrap();
@@ -5241,14 +5241,14 @@ fn active_fuse_value(controller: &AppController, id: &str) -> String {
         .value_text
 }
 
-/// The crop section's `auto-crop` toggle on the active tab.
+/// The finish section's `auto-crop` toggle on the active tab.
 fn active_crop_selected(controller: &AppController) -> String {
     controller
         .settings_panel()
         .rows
         .into_iter()
-        .find(|r| r.section == "crop" && r.id == "auto-crop")
-        .expect("the crop section has an auto-crop row")
+        .find(|r| r.section == "finish" && r.id == "auto-crop")
+        .expect("the finish section has an auto-crop row")
         .selected
 }
 
@@ -5261,7 +5261,7 @@ fn duplicated_tab_keeps_crop_and_remembered_values() {
     controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(4.0));
     controller.set_fuse_algorithm("depth-map");
     controller.set_param_value("fuse", "score-radius", ParamValue::Int(7));
-    controller.set_param_value("crop", "auto-crop", ParamValue::Bool(false));
+    controller.set_param_value("finish", "auto-crop", ParamValue::Bool(false));
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, std::time::Duration::from_secs(120));
 

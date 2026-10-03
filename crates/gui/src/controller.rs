@@ -4402,7 +4402,7 @@ impl AppController {
     // section per family, one field per `ParamDesc`" true by construction
     // rather than by an incremental patch that could drift from it. --
 
-    /// Builds the whole panel: Fuse, Align, Crop, in that order, each
+    /// Builds the whole panel: Prepare, Fuse, Align, Finish, in that order, each
     /// section's rows flattened from `AlgorithmRef::params()`'s own
     /// declaration order. With no tab active ("+" selected) the panel still
     /// renders -- the default algorithm of each family, with no explicit
@@ -4453,7 +4453,10 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        tab_values_mut(tab, section).insert(id.to_string(), value);
+        let Some(values) = tab_values_mut(tab, section) else {
+            return;
+        };
+        values.insert(id.to_string(), value);
         tab.errors.remove(&settings_panel::menu_key(section, id));
         self.emit(ShellEvent::SettingsChanged);
     }
@@ -4471,9 +4474,15 @@ impl AppController {
             return;
         };
         let key = settings_panel::menu_key(section, id);
+        if tab.menu_open.as_deref() == Some(&key) {
+            tab.menu_open = None;
+        }
         match ParamValue::parse(desc, text) {
             Ok(value) => {
-                tab_values_mut(tab, section).insert(id.to_string(), value);
+                let Some(values) = tab_values_mut(tab, section) else {
+                    return;
+                };
+                values.insert(id.to_string(), value);
                 tab.errors.remove(&key);
             }
             Err(err) => {
@@ -4492,8 +4501,8 @@ impl AppController {
     /// with the algorithm they were set on: switching away stashes them and
     /// switching back restores them, while an algorithm never selected
     /// before resolves its own schema from scratch. The section's errors do
-    /// not follow the switch. Selecting the current algorithm changes
-    /// nothing.
+    /// not follow the switch. Selecting the current algorithm changes no
+    /// value. Either way the open choice list closes.
     pub fn set_fuse_algorithm(&mut self, id: &str) {
         self.set_algorithm("fuse", id);
     }
@@ -4511,16 +4520,19 @@ impl AppController {
             "align" => &mut tab.align_id,
             _ => return,
         };
+        tab.menu_open = None;
         if current == id {
+            self.emit(ShellEvent::SettingsChanged);
             return;
         }
         let previous = std::mem::replace(current, id.to_string());
-        let stashed = std::mem::take(tab_values_mut(tab, section));
+        let values = tab_values_mut(tab, section).expect("the section matched above has a map");
+        let stashed = std::mem::take(values);
         let restored = tab
             .remembered
             .remove(&settings_panel::menu_key(section, id))
             .unwrap_or_default();
-        *tab_values_mut(tab, section) = restored;
+        *tab_values_mut(tab, section).expect("the section matched above has a map") = restored;
         if !stashed.is_empty() {
             tab.remembered
                 .insert(settings_panel::menu_key(section, &previous), stashed);
@@ -7429,12 +7441,14 @@ pub fn tab_scroll_into_view(
     s.clamp(0.0, max)
 }
 
-/// The `ParamValues` map `section` mutates on this tab.
-fn tab_values_mut<'a>(tab: &'a mut ProjectTab, section: &str) -> &'a mut ParamValues {
+/// The `ParamValues` map `section` mutates on this tab, `None` for a section
+/// the panel does not have.
+fn tab_values_mut<'a>(tab: &'a mut ProjectTab, section: &str) -> Option<&'a mut ParamValues> {
     match section {
-        "align" => &mut tab.align_values,
-        "crop" => &mut tab.project_values,
-        _ => &mut tab.fuse_values,
+        "prepare" | "finish" => Some(&mut tab.project_values),
+        "fuse" => Some(&mut tab.fuse_values),
+        "align" => Some(&mut tab.align_values),
+        _ => None,
     }
 }
 

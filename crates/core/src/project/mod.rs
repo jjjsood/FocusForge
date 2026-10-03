@@ -359,26 +359,28 @@ use crate::algorithm::StackAlgorithm;
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, validate};
 use crate::tile::Rect;
 
-/// The project-level parameter schema: values that describe how a project
-/// was prepared rather than any one algorithm's own settings: `auto-crop`
-/// and the two brightness-equalization parameters. The GUI's settings panel
-/// renders them through the same generator every algorithm's schema goes
-/// through, and `focusforge-cli stack` reads them (`--no-crop`, `--set`) so
-/// the two never drift.
-pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
-    vec![
-        ParamDesc {
-            id: "auto-crop".to_string(),
-            label: "Auto-crop".to_string(),
-            help: "Trims the result to the area every aligned frame covers; turn \
+/// The project parameters that act after fusing: `auto-crop`. The settings
+/// panel's finish section renders exactly this schema.
+pub static FINISH_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
+    vec![ParamDesc {
+        id: "auto-crop".to_string(),
+        label: "Auto-crop".to_string(),
+        help: "Trims the result to the area every aligned frame covers; turn \
                    it off to keep the full frame."
-                .to_string(),
-            kind: ParamKind::Bool,
-            default: ParamValue::Bool(true),
-            advanced: false,
-            auto: None,
-            host_default: None,
-        },
+            .to_string(),
+        kind: ParamKind::Bool,
+        default: ParamValue::Bool(true),
+        advanced: false,
+        auto: None,
+        host_default: None,
+    }]
+});
+
+/// The project parameters that change the frames before fusing: the two
+/// brightness-equalization parameters. The settings panel's prepare section
+/// renders exactly this schema.
+pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
+    vec![
         ParamDesc {
             id: "equalize".to_string(),
             label: "Equalize brightness".to_string(),
@@ -416,12 +418,32 @@ pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     ]
 });
 
+/// The project-level parameter schema, [`FINISH_PARAMS`] then
+/// [`PREPARE_PARAMS`]: values that describe how a project was prepared rather
+/// than any one algorithm's own settings. `focusforge-cli stack` reads it
+/// (`--no-crop`, `--set`) and the `algorithms` listing prints it.
+pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
+    FINISH_PARAMS
+        .iter()
+        .chain(PREPARE_PARAMS.iter())
+        .cloned()
+        .collect()
+});
+
 /// The project parameter schema for a run fused by `method`:
 /// [`PROJECT_PARAMS`] with the defaults the method declares through
 /// [`StackAlgorithm::project_defaults`]. Every front end resolves project
 /// parameters against this schema, so a default is the same in the settings
 /// panel, on the command line and in a listing.
 pub fn params_for(method: &dyn StackAlgorithm) -> Vec<ParamDesc> {
+    params_for_group(&PROJECT_PARAMS, method)
+}
+
+/// `group` ([`PREPARE_PARAMS`], [`FINISH_PARAMS`] or [`PROJECT_PARAMS`]) with
+/// the defaults `method` declares through [`StackAlgorithm::project_defaults`].
+/// The declarations are checked against the whole project schema, so one for a
+/// parameter outside `group` is still validated.
+pub fn params_for_group(group: &[ParamDesc], method: &dyn StackAlgorithm) -> Vec<ParamDesc> {
     let declared: ParamValues = method
         .project_defaults()
         .iter()
@@ -429,7 +451,7 @@ pub fn params_for(method: &dyn StackAlgorithm) -> Vec<ParamDesc> {
         .collect();
     validate(&PROJECT_PARAMS, &declared)
         .expect("a method's project defaults satisfy the project schema");
-    PROJECT_PARAMS
+    group
         .iter()
         .map(|desc| {
             let mut desc = desc.clone();
@@ -1077,6 +1099,43 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    fn ids(group: &[ParamDesc]) -> Vec<&str> {
+        group.iter().map(|d| d.id.as_str()).collect()
+    }
+
+    #[test]
+    fn prepare_and_finish_partition_the_project_params() {
+        assert_eq!(ids(&PREPARE_PARAMS), ["equalize", "equalize-max-gain"]);
+        assert_eq!(ids(&FINISH_PARAMS), ["auto-crop"]);
+        assert_eq!(
+            ids(&PROJECT_PARAMS),
+            ["auto-crop", "equalize", "equalize-max-gain"]
+        );
+        for d in PROJECT_PARAMS.iter() {
+            let groups = [&*PREPARE_PARAMS, &*FINISH_PARAMS]
+                .into_iter()
+                .filter(|group| group.iter().any(|g| g.id == d.id))
+                .count();
+            assert_eq!(groups, 1, "{} sits in exactly one group", d.id);
+        }
+        assert_eq!(
+            PREPARE_PARAMS.len() + FINISH_PARAMS.len(),
+            PROJECT_PARAMS.len()
+        );
+
+        let focus_map = crate::registry::find_stack("depth-map").expect("a registered method");
+        let prepare = params_for_group(&PREPARE_PARAMS, focus_map);
+        let finish = params_for_group(&FINISH_PARAMS, focus_map);
+        assert_eq!(ids(&prepare), ["equalize", "equalize-max-gain"]);
+        assert_eq!(ids(&finish), ["auto-crop"]);
+        assert_eq!(default_of(&prepare, "equalize"), ParamValue::Bool(true));
+        assert_eq!(default_of(&finish, "auto-crop"), ParamValue::Bool(true));
+        assert_eq!(
+            default_of(&prepare, "equalize-max-gain"),
+            ParamValue::Float(1.25)
+        );
     }
 
     #[test]

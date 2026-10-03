@@ -419,7 +419,7 @@ fn auto_crop_selected(controller: &AppController) -> String {
         .settings_panel()
         .rows
         .into_iter()
-        .find(|r| r.section == "crop" && r.id == "auto-crop")
+        .find(|r| r.section == "finish" && r.id == "auto-crop")
         .expect("the crop section has an auto-crop row")
         .selected
 }
@@ -479,8 +479,8 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
             .settings_panel()
             .rows
             .into_iter()
-            .find(|r| r.section == "crop" && r.id == id)
-            .unwrap_or_else(|| panic!("the crop section has a {id} row"))
+            .find(|r| r.section == "prepare" && r.id == id)
+            .unwrap_or_else(|| panic!("the prepare section has a {id} row"))
     };
 
     let mut controller = AppController::new();
@@ -497,7 +497,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
         common::open_and_settle(&mut controller, &[project]),
         OpenOutcome::Opened(_)
     ));
-    controller.toggle_section_more("crop");
+    controller.toggle_section_more("prepare");
     assert_eq!(row(&controller, "equalize").selected, "true");
     assert_eq!(row(&controller, "equalize-max-gain").value_text, "1.5");
 
@@ -512,7 +512,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
         common::open_and_settle(&mut plain, &[project]),
         OpenOutcome::Opened(_)
     ));
-    plain.toggle_section_more("crop");
+    plain.toggle_section_more("prepare");
     assert_eq!(row(&plain, "equalize").selected, "false");
     assert_eq!(row(&plain, "equalize-max-gain").value_text, "1.25");
 }
@@ -522,8 +522,8 @@ fn equalize_selected(controller: &AppController) -> String {
         .settings_panel()
         .rows
         .into_iter()
-        .find(|r| r.section == "crop" && r.id == "equalize")
-        .expect("the crop section has an equalize row")
+        .find(|r| r.section == "prepare" && r.id == "equalize")
+        .expect("the prepare section has an equalize row")
         .selected
 }
 
@@ -531,7 +531,7 @@ fn equalize_selected(controller: &AppController) -> String {
 fn the_equalize_row_shows_the_selected_methods_default() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
-    controller.toggle_section_more("crop");
+    controller.toggle_section_more("prepare");
 
     for (method, shown) in [
         ("depth-map", "true"),
@@ -549,11 +549,11 @@ fn an_explicit_equalize_choice_and_each_methods_values_survive_switching() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
     controller.toggle_section_more("fuse");
-    controller.toggle_section_more("crop");
+    controller.toggle_section_more("prepare");
 
     controller.set_fuse_algorithm("depth-map");
     controller.set_param_value("fuse", "score-radius", ParamValue::Int(7));
-    controller.set_param_value("crop", "equalize", ParamValue::Bool(false));
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(false));
     controller.set_fuse_algorithm("laplacian");
     controller.set_param_value("fuse", "levels", ParamValue::Int(3));
     assert_eq!(equalize_selected(&controller), "false");
@@ -593,7 +593,7 @@ fn a_reopened_focus_map_project_shows_how_its_run_was_equalized() {
         common::open_and_settle(&mut equalized, &[project]),
         OpenOutcome::Opened(_)
     ));
-    equalized.toggle_section_more("crop");
+    equalized.toggle_section_more("prepare");
     assert_eq!(equalize_selected(&equalized), "true");
 
     let mut plain = AppController::new();
@@ -607,7 +607,7 @@ fn a_reopened_focus_map_project_shows_how_its_run_was_equalized() {
         common::open_and_settle(&mut plain, &[project]),
         OpenOutcome::Opened(_)
     ));
-    plain.toggle_section_more("crop");
+    plain.toggle_section_more("prepare");
     assert_eq!(
         equalize_selected(&plain),
         "false",
@@ -1094,24 +1094,24 @@ fn auto_crop_defaults_on_and_is_a_reversible_flag() {
     open_mantis_512(&mut controller);
 
     let panel = controller.settings_panel();
-    let crop_row = field_rows(&panel.rows, "crop")
+    let crop_row = field_rows(&panel.rows, "finish")
         .into_iter()
         .find(|r| r.id == "auto-crop")
         .expect("auto-crop row must be present");
     assert_eq!(crop_row.kind, RowKind::Bool);
     assert_eq!(crop_row.selected, "true", "auto-crop must default on");
 
-    controller.set_param_value("crop", "auto-crop", ParamValue::Bool(false));
+    controller.set_param_value("finish", "auto-crop", ParamValue::Bool(false));
     let panel = controller.settings_panel();
-    let crop_row = field_rows(&panel.rows, "crop")
+    let crop_row = field_rows(&panel.rows, "finish")
         .into_iter()
         .find(|r| r.id == "auto-crop")
         .unwrap();
     assert_eq!(crop_row.selected, "false");
 
-    controller.set_param_value("crop", "auto-crop", ParamValue::Bool(true));
+    controller.set_param_value("finish", "auto-crop", ParamValue::Bool(true));
     let panel = controller.settings_panel();
-    let crop_row = field_rows(&panel.rows, "crop")
+    let crop_row = field_rows(&panel.rows, "finish")
         .into_iter()
         .find(|r| r.id == "auto-crop")
         .unwrap();
@@ -1544,8 +1544,17 @@ fn sections_start_collapsed_with_one_adjustment_at_most() {
         let rows = controller.settings_panel().rows;
         assert_eq!(field_ids(&rows, "fuse"), visible, "{method}");
         assert_eq!(field_ids(&rows, "align"), Vec::<String>::new(), "{method}");
-        assert_eq!(field_ids(&rows, "crop"), ["auto-crop"], "{method}");
-        for section in ["fuse", "align", "crop"] {
+        assert_eq!(
+            field_ids(&rows, "prepare"),
+            Vec::<String>::new(),
+            "{method}"
+        );
+        assert_eq!(field_ids(&rows, "finish"), ["auto-crop"], "{method}");
+        assert!(
+            more_rows(&rows, "finish").is_empty(),
+            "{method}: Finish has no More row"
+        );
+        for section in ["prepare", "fuse", "align"] {
             let more = more_rows(&rows, section);
             assert_eq!(more.len(), 1, "{method}: one More row in {section}");
             assert_eq!(
@@ -1608,20 +1617,24 @@ fn more_reveals_that_sections_advanced_rows() {
     );
 
     controller.set_fuse_algorithm("depth-map");
-    controller.toggle_section_more("crop");
+    controller.toggle_section_more("prepare");
     let rows = controller.settings_panel().rows;
     assert_eq!(
-        field_ids(&rows, "crop"),
-        ["auto-crop", "equalize", "equalize-max-gain"]
+        field_ids(&rows, "prepare"),
+        ["equalize", "equalize-max-gain"]
     );
+    assert_eq!(field_ids(&rows, "finish"), ["auto-crop"]);
     assert_eq!(
-        rows[row_index(&rows, "crop", "equalize")].selected,
+        rows[row_index(&rows, "prepare", "equalize")].selected,
         "true",
         "Focus map equalizes by default"
     );
     controller.set_fuse_algorithm("laplacian");
     let rows = controller.settings_panel().rows;
-    assert_eq!(rows[row_index(&rows, "crop", "equalize")].selected, "false");
+    assert_eq!(
+        rows[row_index(&rows, "prepare", "equalize")].selected,
+        "false"
+    );
 }
 
 #[test]
@@ -1675,7 +1688,7 @@ fn more_state_is_per_tab_and_per_section() {
 
     let open_sections = |controller: &AppController| -> Vec<String> {
         let rows = controller.settings_panel().rows;
-        ["fuse", "align", "crop"]
+        ["prepare", "fuse", "align"]
             .into_iter()
             .filter(|s| more_rows(&rows, s)[0].selected == "true")
             .map(str::to_string)
@@ -1708,13 +1721,13 @@ fn more_state_survives_method_switch_and_reset_all() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
     controller.toggle_section_more("fuse");
-    controller.toggle_section_more("crop");
+    controller.toggle_section_more("prepare");
 
     controller.set_fuse_algorithm("weighted-average");
     controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(3.0));
     controller.reset_all_sections();
     let rows = controller.settings_panel().rows;
-    for section in ["fuse", "crop"] {
+    for section in ["fuse", "prepare"] {
         assert_eq!(more_rows(&rows, section)[0].selected, "true", "{section}");
     }
     assert_eq!(more_rows(&rows, "align")[0].selected, "false");
@@ -1808,16 +1821,16 @@ fn settings_journey_per_method() {
         assert_eq!(picker.selected, *id);
         assert_eq!(picker.value_text, display);
 
-        controller.toggle_section_more("crop");
+        controller.toggle_section_more("prepare");
         let equalize = controller
             .settings_panel()
             .rows
             .into_iter()
-            .find(|r| r.section == "crop" && r.id == "equalize")
-            .expect("the crop fold-out lists equalize");
+            .find(|r| r.section == "prepare" && r.id == "equalize")
+            .expect("the prepare fold-out lists equalize");
         let expected = if *id == "depth-map" { "true" } else { "false" };
         assert_eq!(equalize.selected, expected, "{id}: equalize");
-        controller.toggle_section_more("crop");
+        controller.toggle_section_more("prepare");
     }
 }
 
@@ -1870,53 +1883,239 @@ fn hidden_violation_opens_its_section() {
 }
 
 #[test]
-fn hidden_rows_with_no_tab_render_collapsed() {
-    let rows = AppController::new().settings_panel().rows;
-    for section in ["fuse", "align", "crop"] {
-        assert_eq!(more_rows(&rows, section).len(), 1, "{section}");
-        assert_eq!(more_rows(&rows, section)[0].selected, "false", "{section}");
+fn prepare_and_finish_sections_hold_the_project_settings() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+
+    for method in every_fuse_id() {
+        controller.set_fuse_algorithm(&method);
+        let rows = controller.settings_panel().rows;
+        let headings: Vec<(&str, &str)> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::SectionHeading)
+            .map(|r| (r.section.as_str(), r.label.as_str()))
+            .collect();
+        assert_eq!(
+            headings,
+            [
+                ("prepare", "PREPARE"),
+                ("fuse", "FUSE"),
+                ("align", "ALIGN"),
+                ("finish", "FINISH"),
+            ],
+            "{method}"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.section != "crop" && r.label != "CROP"),
+            "{method}: no crop section or CROP label remains"
+        );
+        assert_eq!(
+            field_ids(&rows, "prepare"),
+            Vec::<String>::new(),
+            "{method}"
+        );
+        assert_eq!(more_rows(&rows, "prepare")[0].selected, "false", "{method}");
+        assert_eq!(field_ids(&rows, "finish"), ["auto-crop"], "{method}");
+
+        controller.toggle_section_more("prepare");
+        let rows = controller.settings_panel().rows;
+        assert_eq!(
+            field_ids(&rows, "prepare"),
+            ["equalize", "equalize-max-gain"],
+            "{method}"
+        );
+        let expected = if method == "depth-map" {
+            "true"
+        } else {
+            "false"
+        };
+        assert_eq!(
+            rows[row_index(&rows, "prepare", "equalize")].selected,
+            expected,
+            "{method}: equalize starts as the method declares"
+        );
+        assert_eq!(field_ids(&rows, "finish"), ["auto-crop"], "{method}");
+        controller.toggle_section_more("prepare");
     }
-    assert_eq!(field_ids(&rows, "align"), Vec::<String>::new());
-    assert_eq!(field_ids(&rows, "crop"), ["auto-crop"]);
 }
 
 #[test]
-fn more_row_click_toggles_its_section() {
-    use slint::ComponentHandle;
-    use slint::platform::{PointerEventButton, WindowEvent};
-    use std::sync::{Arc, Mutex};
+fn section_membership_comes_from_core() {
+    use focusforge_core::project::{FINISH_PARAMS, PREPARE_PARAMS};
 
-    init_window_backend();
-    let app = focusforge_gui::AppWindow::new().unwrap();
-    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let ids = |group: &[focusforge_core::params::ParamDesc]| -> Vec<String> {
+        group.iter().map(|d| d.id.clone()).collect()
+    };
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
-    let controller = Arc::new(Mutex::new(controller));
-    let _installed = focusforge_gui::bridge::install(
-        &app,
-        controller.clone(),
-        common::empty_canvas(),
-        std::rc::Rc::new(std::cell::RefCell::new(None)),
-    );
-    app.set_project_loaded(true);
-    app.set_dock_tab("settings".into());
-    let push = || {
-        focusforge_gui::bridge::push_settings_panel(&app, &controller.lock().unwrap());
-        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
-    };
-    push();
+    controller.toggle_section_more("prepare");
 
-    let crop_fields = || field_ids(&controller.lock().unwrap().settings_panel().rows, "crop");
-    assert_eq!(crop_fields(), ["auto-crop"]);
-    for expected in [
-        vec!["auto-crop", "equalize", "equalize-max-gain"],
-        vec!["auto-crop"],
-    ] {
-        let toggles = i_slint_backend_testing::ElementQuery::from_root(&app)
-            .match_id("FFMoreToggle::header-area")
-            .find_all();
-        assert_eq!(toggles.len(), 3, "Fuse, Align and Crop each mount one");
-        let position = element_center(&toggles[2]);
+    for method in every_fuse_id() {
+        controller.set_fuse_algorithm(&method);
+        let rows = controller.settings_panel().rows;
+        assert_eq!(
+            field_ids(&rows, "prepare"),
+            ids(&PREPARE_PARAMS),
+            "{method}"
+        );
+        assert_eq!(field_ids(&rows, "finish"), ids(&FINISH_PARAMS), "{method}");
+    }
+
+    controller.set_param_value("finish", "auto-crop", ParamValue::Bool(false));
+    let rows = controller.settings_panel().rows;
+    assert_eq!(
+        heading(&rows, "finish").heading_state,
+        HeadingState::Explicit
+    );
+    assert_eq!(
+        heading(&rows, "prepare").heading_state,
+        HeadingState::Default,
+        "a Finish value leaves Prepare's heading alone"
+    );
+}
+
+#[test]
+fn hidden_rows_with_no_tab_render_collapsed() {
+    let rows = AppController::new().settings_panel().rows;
+    for section in ["prepare", "fuse", "align"] {
+        assert_eq!(more_rows(&rows, section).len(), 1, "{section}");
+        assert_eq!(more_rows(&rows, section)[0].selected, "false", "{section}");
+    }
+    assert!(
+        more_rows(&rows, "finish").is_empty(),
+        "Finish has no More row"
+    );
+    assert_eq!(field_ids(&rows, "prepare"), Vec::<String>::new());
+    assert_eq!(field_ids(&rows, "align"), Vec::<String>::new());
+    assert_eq!(field_ids(&rows, "finish"), ["auto-crop"]);
+    for section in ["prepare", "finish"] {
+        assert_eq!(
+            heading(&rows, section).heading_state,
+            HeadingState::Pending,
+            "{section}"
+        );
+    }
+}
+
+#[test]
+fn picking_from_a_list_closes_it() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("align");
+    let open_menus = |controller: &AppController| -> Vec<String> {
+        controller
+            .settings_panel()
+            .rows
+            .iter()
+            .filter(|r| r.menu_open)
+            .map(|r| format!("{}:{}", r.section, r.id))
+            .collect()
+    };
+
+    controller.toggle_param_menu_for("fuse", "algorithm");
+    assert_eq!(open_menus(&controller), ["fuse:algorithm"]);
+    controller.set_fuse_algorithm("weighted-average");
+    assert!(
+        open_menus(&controller).is_empty(),
+        "a new method closes the list"
+    );
+
+    controller.toggle_param_menu_for("fuse", "algorithm");
+    controller.set_fuse_algorithm("weighted-average");
+    assert!(
+        open_menus(&controller).is_empty(),
+        "picking the current method closes the list too"
+    );
+
+    let rows = controller.settings_panel().rows;
+    let mode = &rows[row_index(&rows, "align", "mode")];
+    assert_eq!(mode.kind, RowKind::Enum);
+    let other = mode
+        .choice_ids
+        .iter()
+        .find(|id| **id != mode.selected)
+        .expect("the enum has a second choice")
+        .clone();
+    controller.toggle_param_menu_for("align", "mode");
+    assert_eq!(open_menus(&controller), ["align:mode"]);
+    controller.set_param_text("align", "mode", &other);
+    assert!(
+        open_menus(&controller).is_empty(),
+        "an enum pick closes its list"
+    );
+}
+
+/// The window mounted the way the application runs it: controller events are
+/// captured through a sink and replayed as the event loop does, so every click
+/// reaches the panel through `ShellEvent::SettingsChanged`.
+struct MountedPanel {
+    app: focusforge_gui::AppWindow,
+    controller: std::sync::Arc<std::sync::Mutex<AppController>>,
+    events: std::sync::Arc<std::sync::Mutex<Vec<focusforge_gui::ShellEvent>>>,
+    _installed: focusforge_gui::bridge::Installed,
+}
+
+impl MountedPanel {
+    fn open() -> Self {
+        use slint::ComponentHandle;
+        use std::sync::{Arc, Mutex};
+
+        init_window_backend();
+        let app = focusforge_gui::AppWindow::new().unwrap();
+        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        let mut controller = AppController::new();
+        open_mantis_512(&mut controller);
+        let controller = Arc::new(Mutex::new(controller));
+        let installed = focusforge_gui::bridge::install(
+            &app,
+            controller.clone(),
+            common::empty_canvas(),
+            std::rc::Rc::new(std::cell::RefCell::new(None)),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        controller.lock().unwrap().set_sink(Arc::new({
+            let events = events.clone();
+            move |event| events.lock().unwrap().push(event)
+        }));
+        app.set_project_loaded(true);
+        app.set_dock_tab("settings".into());
+        focusforge_gui::bridge::push_settings_panel(&app, &controller.lock().unwrap());
+        let panel = MountedPanel {
+            app,
+            controller,
+            events,
+            _installed: installed,
+        };
+        panel.perform();
+        panel
+    }
+
+    /// What the event loop does with each captured event.
+    fn perform(&self) {
+        use focusforge_gui::ShellEvent;
+
+        let drained: Vec<ShellEvent> = self.events.lock().unwrap().drain(..).collect();
+        for event in &drained {
+            let controller = self.controller.lock().unwrap();
+            match event {
+                ShellEvent::SettingsScrolled => focusforge_gui::bridge::push_settings_scroll(
+                    &self.app,
+                    &controller.settings_panel(),
+                ),
+                ShellEvent::SettingsChanged => {
+                    focusforge_gui::bridge::push_settings_panel(&self.app, &controller)
+                }
+                _ => {}
+            }
+        }
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
+    }
+
+    fn click(&self, position: slint::LogicalPosition) {
+        use slint::ComponentHandle;
+        use slint::platform::{PointerEventButton, WindowEvent};
+
         for event in [
             WindowEvent::PointerMoved { position },
             WindowEvent::PointerPressed {
@@ -1928,9 +2127,151 @@ fn more_row_click_toggles_its_section() {
                 button: PointerEventButton::Left,
             },
         ] {
-            app.window().dispatch_event(event);
+            self.app.window().dispatch_event(event);
+            self.perform();
         }
-        push();
-        assert_eq!(crop_fields(), expected);
+    }
+
+    fn elements(&self, id: &str) -> Vec<i_slint_backend_testing::ElementHandle> {
+        i_slint_backend_testing::ElementQuery::from_root(&self.app)
+            .match_id(id)
+            .find_all()
+    }
+
+    fn rows(&self) -> Vec<SettingsRow> {
+        self.controller.lock().unwrap().settings_panel().rows
+    }
+
+    /// The mounted `More...` strip of `section`; the mounted strips follow the
+    /// panel's `More` rows in order.
+    fn strip(&self, section: &str) -> i_slint_backend_testing::ElementHandle {
+        let index = self
+            .rows()
+            .iter()
+            .filter(|r| r.kind == RowKind::More)
+            .position(|r| r.section == section)
+            .unwrap_or_else(|| panic!("{section} has a More row"));
+        self.elements("FFMoreToggle::root").remove(index)
+    }
+
+    /// Clicks the middle of the strip's header band, where the label sits,
+    /// however tall the strip is while open.
+    fn click_strip(&self, section: &str) {
+        let strip = self.strip(section);
+        let top_left = strip.absolute_position();
+        self.click(slint::LogicalPosition::new(
+            top_left.x + strip.size().width / 2.0,
+            top_left.y + MORE_HEIGHT / 2.0,
+        ));
+    }
+
+    fn is_open(&self, section: &str) -> bool {
+        more_rows(&self.rows(), section)[0].selected == "true"
+    }
+}
+
+#[test]
+fn more_strip_closes_after_opening_in_every_section() {
+    let panel = MountedPanel::open();
+    let assert_toggles = |when: &str| {
+        for section in ["prepare", "fuse", "align"] {
+            for round in 0..2 {
+                assert!(!panel.is_open(section), "{when}: {section} starts closed");
+                panel.click_strip(section);
+                assert!(
+                    panel.is_open(section),
+                    "{when}: {section} opens, round {round}"
+                );
+                assert!(
+                    !field_ids(&panel.rows(), section).is_empty(),
+                    "{when}: {section} lists its rows when open"
+                );
+                panel.click_strip(section);
+                assert!(
+                    !panel.is_open(section),
+                    "{when}: {section} closes again, round {round}"
+                );
+            }
+        }
+    };
+    assert_toggles("fresh panel");
+
+    // Open Fuse's picker and pick a method from its list, as a user does.
+    panel.click(element_center(&panel.elements("FFMenu::area")[0]));
+    let rows = panel.rows();
+    let wanted = rows
+        .iter()
+        .find(|r| r.kind == RowKind::Picker && r.section == "fuse")
+        .expect("Fuse has a picker")
+        .choice_ids
+        .iter()
+        .position(|id| id == "weighted-average")
+        .expect("the picker lists Weighted average");
+    let options = panel.elements("FFMenuList::option-area");
+    panel.click(element_center(&options[wanted]));
+    let rows = panel.rows();
+    let picked = rows
+        .iter()
+        .find(|r| r.kind == RowKind::Picker && r.section == "fuse")
+        .expect("Fuse has a picker");
+    assert_eq!(
+        picked.selected, "weighted-average",
+        "the list option was picked"
+    );
+    assert_toggles("after a list pick");
+
+    // Wheel the panel a few steps, then toggle again.
+    panel
+        .controller
+        .lock()
+        .unwrap()
+        .set_settings_viewport_height(300.0);
+    panel.perform();
+    let hit = element_center(&panel.elements("FFSettingsPanel::hit-area")[0]);
+    for _ in 0..3 {
+        use slint::ComponentHandle;
+        panel
+            .app
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                position: hit,
+                delta_x: 0.0,
+                delta_y: -4.0,
+            });
+        panel.perform();
+    }
+    assert!(
+        panel.controller.lock().unwrap().settings_scroll_y() > 0.0,
+        "the wheel moved the panel"
+    );
+    for round in 0..2 {
+        panel.click_strip("fuse");
+        assert!(
+            panel.is_open("fuse"),
+            "after a scroll: Fuse opens, round {round}"
+        );
+        panel.click_strip("fuse");
+        assert!(
+            !panel.is_open("fuse"),
+            "after a scroll: Fuse closes, round {round}"
+        );
+    }
+}
+
+#[test]
+fn more_strip_is_disabled_while_running() {
+    let panel = MountedPanel::open();
+    panel.app.set_settings_enabled(false);
+    for section in ["prepare", "fuse", "align"] {
+        panel.click_strip(section);
+        assert!(
+            !panel.is_open(section),
+            "{section}'s strip ignores clicks while the panel is disabled"
+        );
+    }
+    panel.app.set_settings_enabled(true);
+    for section in ["prepare", "fuse", "align"] {
+        panel.click_strip(section);
+        assert!(panel.is_open(section), "{section} opens once enabled again");
     }
 }

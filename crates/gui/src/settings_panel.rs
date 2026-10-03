@@ -105,19 +105,23 @@ pub(crate) fn auto_crop_enabled(project_values: &ParamValues) -> bool {
         .expect("auto-crop is a Bool parameter")
 }
 
-/// The project parameter schema for a run fused by `fuse_id`; the shared
-/// schema while the id names no registered method.
-fn project_schema(fuse_id: &str) -> Vec<ParamDesc> {
+/// `group` of the project schema (`PREPARE_PARAMS`, `FINISH_PARAMS` or
+/// `PROJECT_PARAMS`) for a run fused by `fuse_id`; the group as declared while
+/// the id names no registered method.
+fn project_schema(group: &[ParamDesc], fuse_id: &str) -> Vec<ParamDesc> {
     registry::find_stack(fuse_id).map_or_else(
-        |_| focusforge_core::project::PROJECT_PARAMS.clone(),
-        focusforge_core::project::params_for,
+        |_| group.to_vec(),
+        |method| focusforge_core::project::params_for_group(group, method),
     )
 }
 
 /// The gain bound a run fused by `fuse_id` equalizes with, `None` while the
 /// `equalize` switch is off.
 pub(crate) fn equalization_bound(fuse_id: &str, project_values: &ParamValues) -> Option<f64> {
-    focusforge_core::project::equalization_bound(&project_schema(fuse_id), project_values)
+    focusforge_core::project::equalization_bound(
+        &project_schema(&focusforge_core::project::PREPARE_PARAMS, fuse_id),
+        project_values,
+    )
 }
 
 /// [`registry::default_stack`]'s id, empty when the registry refuses to name
@@ -144,7 +148,7 @@ fn default_align_id() -> String {
 /// shared render is not a shared kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
-    /// A section's own heading row: `FUSE` / `ALIGN` / `CROP`, carrying
+    /// A section's own heading row: `PREPARE` / `FUSE` / `ALIGN` / `FINISH`, carrying
     /// [`HeadingState`] and the `DEFAULT` badge.
     SectionHeading,
     /// The Fuse/Align algorithm picker -- not a `ParamKind`, a pseudo-row
@@ -192,10 +196,11 @@ pub enum HeadingState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsRow {
     pub kind: RowKind,
-    /// Which of the three `ParamValues` maps a mutation on this row targets
-    /// -- `"fuse"`, `"align"` or `"crop"`. Param ids are unique only
-    /// *within* one algorithm's own schema, never across the whole panel,
-    /// so a callback needs this alongside `id` to know which map to write.
+    /// Which section a mutation on this row targets -- `"prepare"`,
+    /// `"fuse"`, `"align"` or `"finish"`; `"prepare"` and `"finish"` write the
+    /// tab's one project map. Param ids are unique only *within* one
+    /// schema, never across the whole panel, so a callback needs this
+    /// alongside `id` to know which map to write.
     pub section: String,
     /// The parameter id (`"algorithm"` for a [`RowKind::Picker`] row, the
     /// section name for a [`RowKind::SectionHeading`] row).
@@ -458,10 +463,10 @@ pub fn menu_key(section: &str, id: &str) -> String {
     format!("{section}:{id}")
 }
 
-/// The `&'static ParamDesc` `section`'s current algorithm (or, for `"crop"`,
-/// the project schema) declares for `id` -- `None` when the section is
-/// unknown or the algorithm behind `fuse_id`/`align_id` carries no such
-/// parameter, which a mid-drag algorithm switch can produce.
+/// The `&'static ParamDesc` `section`'s current algorithm (or, for
+/// `"prepare"` and `"finish"`, the project group) declares for `id` -- `None`
+/// when the section is unknown or the algorithm behind `fuse_id`/`align_id`
+/// carries no such parameter, which a mid-drag algorithm switch can produce.
 pub fn find_desc(
     section: &str,
     fuse_id: &str,
@@ -471,7 +476,8 @@ pub fn find_desc(
     let schema: &'static [ParamDesc] = match section {
         "fuse" => registry::find_stack(fuse_id).ok()?.params(),
         "align" => registry::find_align(align_id).ok()?.params(),
-        "crop" => &focusforge_core::project::PROJECT_PARAMS,
+        "prepare" => &focusforge_core::project::PREPARE_PARAMS,
+        "finish" => &focusforge_core::project::FINISH_PARAMS,
         _ => return None,
     };
     schema.iter().find(|desc| desc.id == id)
@@ -497,7 +503,7 @@ struct PickerOption {
     advanced: bool,
 }
 
-/// Builds the whole panel's flat row list, Fuse then Align then Crop: each
+/// Builds the whole panel's flat row list, Prepare, Fuse, Align, then Finish: each
 /// section's heading, its algorithm picker (Fuse/Align only), one row per
 /// plain [`ParamDesc`] in declaration order with a [`RowKind::Error`] row
 /// trailing any field in violation, then a `More...` header over the advanced
@@ -553,7 +559,14 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
         menu_open,
         expanded,
     };
-    let mut rows = Vec::new();
+    let mut rows = section_rows(
+        "prepare",
+        "PREPARE",
+        &project_schema(&focusforge_core::project::PREPARE_PARAMS, fuse_id),
+        project_values,
+        &section_ctx,
+        None,
+    );
 
     if let Ok(fuse) = registry::find_stack(fuse_id) {
         let mut methods = registry::stack_algorithms();
@@ -594,9 +607,9 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
         ));
     }
     rows.extend(section_rows(
-        "crop",
-        "CROP",
-        &project_schema(fuse_id),
+        "finish",
+        "FINISH",
+        &project_schema(&focusforge_core::project::FINISH_PARAMS, fuse_id),
         project_values,
         &section_ctx,
         None,
@@ -646,7 +659,9 @@ fn section_rows(
         .any(|desc| desc.advanced && errors.contains_key(&menu_key(section, &desc.id)));
     let open = expanded.contains(section) || hidden_violation;
 
-    let heading_state = if !values.is_empty() {
+    // A map can be shared by several sections, so only keys this schema
+    // declares make its heading explicit.
+    let heading_state = if schema.iter().any(|desc| values.contains_key(&desc.id)) {
         HeadingState::Explicit
     } else if ctx.is_some() {
         HeadingState::Default

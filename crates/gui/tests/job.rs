@@ -2244,7 +2244,7 @@ fn a_queued_run_reads_the_settings_current_when_it_starts() {
 /// shifts every frame but the reference, with `auto-crop` set as given.
 fn held_after_fuse(name: &str, count: usize, auto_crop: bool) -> job::HeldCheckpoint {
     let mut controller = controller_with_frames(name, count);
-    controller.set_param_value("crop", "auto-crop", ParamValue::Bool(auto_crop));
+    controller.set_param_value("finish", "auto-crop", ParamValue::Bool(auto_crop));
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
     controller
