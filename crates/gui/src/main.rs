@@ -454,6 +454,7 @@ fn run_window<T: ComponentHandle + 'static>(
                         *device.borrow_mut() = None;
                     });
                 }
+                slint::RenderingState::AfterRendering => bridge::record_frame_rendered(),
                 _ => {}
             })
         {

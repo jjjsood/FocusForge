@@ -564,6 +564,11 @@ pub fn finish_input_trace() {
     }
 }
 
+/// Stamps one rendered frame in the trace; free without trace accounting.
+pub fn record_frame_rendered() {
+    let _scope = measurement_scope("gui_frame_rendered");
+}
+
 /// Polls [`AppController::settle_checkpoint_render`] every [`job::POLL`]
 /// until the background render settles, then repaints -- the render's
 /// worker cannot reach the canvas.
@@ -1885,7 +1890,10 @@ pub fn install(
         RECOMPOSITE_HANDLER.with(|slot| {
             *slot.borrow_mut() = Some(Rc::new(move || {
                 if let Some(app) = app_weak.upgrade() {
-                    controller.lock().unwrap().settle_recomposites();
+                    {
+                        let _settle = measurement_scope("gui_recomposite_settle");
+                        controller.lock().unwrap().settle_recomposites();
+                    }
                     repaint(&app, &controller, &canvas);
                 }
             }));
@@ -2920,11 +2928,15 @@ pub fn install(
     // twin wiring above.
     app.on_checkpoint_scrolled({
         let controller = controller.clone();
-        move |delta| controller.lock().unwrap().scroll_checkpoints_panel(delta)
+        move |delta| {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().scroll_checkpoints_panel(delta)
+        }
     });
     app.on_checkpoint_scrollbar_pointer({
         let controller = controller.clone();
         move |kind, y| {
+            record_surface_input(InputSurface::Other);
             let kind = match kind {
                 0 => PointerKind::Down,
                 2 => PointerKind::Move,
@@ -2938,7 +2950,10 @@ pub fn install(
     });
     app.on_checkpoint_scrollbar_dragged({
         let controller = controller.clone();
-        move |y| controller.lock().unwrap().checkpoints_scrollbar_dragged(y)
+        move |y| {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().checkpoints_scrollbar_dragged(y)
+        }
     });
     app.on_checkpoint_viewport_height_changed({
         let controller = controller.clone();
@@ -3727,7 +3742,8 @@ mod tests {
 
     use super::{
         AppController, DockTab, ShellEvent, finish_input_trace, model_publication_scope,
-        record_gallery_input, record_images_input, record_settings_input, record_surface_input,
+        record_frame_rendered, record_gallery_input, record_images_input, record_settings_input,
+        record_surface_input,
     };
     use crate::diagnostics::{
         InputSurface, finish_input_batches, record_coalesced_input, record_destroyed_window,
@@ -3757,6 +3773,11 @@ mod tests {
         }
 
         assert!(timing_snapshot().is_none());
+        record_frame_rendered();
+        assert!(
+            timing_snapshot().is_none(),
+            "a frame stamp records nothing while accounting is off"
+        );
         assert_eq!(record_input(InputSurface::Settings), 0);
         record_coalesced_input(InputSurface::Settings);
         record_images_input();
@@ -3771,6 +3792,12 @@ mod tests {
         let _ = finish_input_batches();
         let before = timing_snapshot().expect("trace accounting is enabled");
 
+        record_frame_rendered();
+        assert_eq!(
+            timing_snapshot().expect("accounting stays on").admitted,
+            before.admitted + 1,
+            "one frame stamp admits exactly one span"
+        );
         assert_ne!(record_input(InputSurface::Canvas), 0);
         record_coalesced_input(InputSurface::Canvas);
         record_coalesced_input(InputSurface::Canvas);
@@ -3836,7 +3863,7 @@ mod tests {
         finish_input_trace();
         assert_eq!(finish_input_batches(), [None, None, None, None, None]);
         let after = timing_snapshot().expect("trace accounting remains enabled");
-        assert_eq!(after.admitted, before.admitted + 10);
+        assert_eq!(after.admitted, before.admitted + 11);
     }
 
     /// Drives the real generated Images callbacks through an installed,
@@ -3916,6 +3943,65 @@ mod tests {
                 && batches[3].is_none()
                 && batches[4].is_none(),
             "the scroll records under no other surface: {batches:?}"
+        );
+    }
+
+    /// Drives the three real checkpoint-list scroll callbacks through an
+    /// installed, headless window: each is one `Other` input, and the list
+    /// has nothing to scroll, so none is drained by a publication.
+    #[test]
+    fn checkpoint_scroll_callbacks_invoked_through_the_real_window_record_an_input() {
+        const CHILD: &str = "FOCUSFORGE_GUI_CHECKPOINT_SCROLL_TRACE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("the test binary has a path"),
+            )
+            .args([
+                "--exact",
+                "bridge::tests::checkpoint_scroll_callbacks_invoked_through_the_real_window_record_an_input",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("the isolated callback-routing test starts");
+            assert!(
+                status.success(),
+                "the isolated callback-routing test passes: {status}"
+            );
+            return;
+        }
+
+        i_slint_backend_testing::init_no_event_loop();
+        enable_trace_accounting();
+
+        let app = super::AppWindow::new().unwrap();
+        let mut opened = AppController::new();
+        let frames = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/mantis-512/frames");
+        if let Some(load) = opened.open_paths(&[frames]) {
+            load.join().expect("the load worker did not panic");
+        }
+        opened.settle_open().expect("the fixture load settles");
+        let controller = Arc::new(Mutex::new(opened));
+        let canvas = std::rc::Rc::new(std::cell::RefCell::new(super::Canvas::default()));
+        let _installed = super::install(
+            &app,
+            controller.clone(),
+            canvas,
+            std::rc::Rc::new(std::cell::RefCell::new(None)),
+        );
+        let _ = finish_input_batches();
+
+        app.invoke_checkpoint_scrolled(40.0);
+        app.invoke_checkpoint_scrollbar_pointer(0, 5.0);
+        app.invoke_checkpoint_scrollbar_dragged(9.0);
+
+        let batches = finish_input_batches();
+        let other = batches[4].expect("every checkpoint scroll callback records an Other input");
+        assert_eq!(other.count, 3);
+        assert!(
+            batches[..4].iter().all(Option::is_none),
+            "no checkpoint scroll callback records under another surface: {batches:?}"
         );
     }
 }
