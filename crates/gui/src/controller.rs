@@ -3861,20 +3861,11 @@ impl AppController {
         if !opened.projects.is_empty() {
             self.set_active_tab(Some(self.state.projects.len()));
             self.close_projects_overlay();
-            let opened_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
             let mut thumbnails = thumbnails.into_iter();
             for project in opened.projects {
                 self.clear_failure(&project_identity_path(&project));
-                self.record_recent(
-                    entry::tab_title(&project),
-                    recent_folder(&project),
-                    project_identity_path(&project),
-                    opened_at,
-                );
                 let missing = if let GuiProject::Opened(p) = &project {
+                    self.record_saved_project(p.path());
                     let (missing, total) = entry::missing_sources(p);
                     (missing > 0)
                         .then(|| (missing, total, p.validation().accepted_mismatch.is_some()))
@@ -4187,7 +4178,7 @@ impl AppController {
 
     /// Records `name`/`folder`/`path` at the front of the `Recent` list and
     /// persists it, if a config directory resolved at startup. A write
-    /// failure is logged but never a reason to interrupt an open: the
+    /// failure is logged but never a reason to interrupt an open or a save: the
     /// `Recent` list stays correct in memory for the rest of the session.
     fn record_recent(&mut self, name: String, folder: PathBuf, path: PathBuf, opened_at: i64) {
         recent::record(&mut self.state.recent, name, folder, path, opened_at);
@@ -4196,6 +4187,22 @@ impl AppController {
         {
             tracing::warn!(error = %e, "the Recent list could not be saved");
         }
+    }
+
+    /// Records the saved project at `path` as opened now: its stem for a
+    /// name, its parent directory for a folder. Shared by an open of a
+    /// `.ffp` and a save that wrote one.
+    fn record_saved_project(&mut self, path: &Path) {
+        let opened_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.record_recent(
+            entry::project_title(path),
+            path.parent().unwrap_or(path).to_path_buf(),
+            path.to_path_buf(),
+            opened_at,
+        );
     }
 
     /// Test-only wrapper to exercise a save failure without driving a
@@ -7253,7 +7260,8 @@ impl AppController {
     }
 
     /// Applies the result a save worker parked, never blocking: a write that
-    /// succeeded opens the tab on its file and clears what it wrote; a failed
+    /// succeeded records the file in `Recent`, opens the tab on it and clears
+    /// what it wrote; a failed
     /// one leaves everything in memory, notes why, and drops the saves and
     /// the close or quit that waited on it. `None` while no result is
     /// parked; otherwise whether the write succeeded and the save queued
@@ -7284,6 +7292,7 @@ impl AppController {
                 return Some(false);
             }
         };
+        self.record_saved_project(project.path());
         if let Some(index) = index {
             let keep = running.keep;
             let tab = &mut self.state.projects[index];
@@ -8247,20 +8256,6 @@ fn project_identity_path(project: &GuiProject) -> PathBuf {
     match project {
         GuiProject::Unsaved(group) => group.dir.clone(),
         GuiProject::Opened(project) => project.path().to_path_buf(),
-    }
-}
-
-/// The folder a `Recent` entry names for `project`: the source folder for
-/// an `Unsaved` group, the sealed `.ffp`'s own parent directory once opened
-/// -- a folder either way, never a file path.
-fn recent_folder(project: &GuiProject) -> PathBuf {
-    match project {
-        GuiProject::Unsaved(group) => group.dir.clone(),
-        GuiProject::Opened(project) => project
-            .path()
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| project.path().to_path_buf()),
     }
 }
 

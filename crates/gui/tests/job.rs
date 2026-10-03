@@ -5660,3 +5660,150 @@ fn a_cancelled_run_reports_its_terminal_state_after_a_progress_burst() {
         );
     });
 }
+
+// ---------------------------------------------------------------------
+// A written project is recorded in `Recent`, a save that wrote nothing is
+// not, and a project saved away from its frames reopens clean.
+// ---------------------------------------------------------------------
+
+/// The `(name, folder)` a `Recent` row shows for a project saved at `path`.
+fn saved_row(path: &Path) -> (String, String) {
+    (
+        path.file_stem().unwrap().to_string_lossy().into_owned(),
+        path.parent().unwrap().display().to_string(),
+    )
+}
+
+fn recent_pairs(controller: &AppController) -> Vec<(String, String)> {
+    controller
+        .recent_rows(0)
+        .into_iter()
+        .map(|row| (row.name, row.folder))
+        .collect()
+}
+
+/// A fresh controller loading `config` shows the rows `controller` shows,
+/// and the file names exactly `paths`.
+fn assert_recent_persisted(controller: &AppController, config: &Path, paths: &[&Path]) {
+    let loaded = focusforge_gui::recent::load(config);
+    let on_file: Vec<&Path> = loaded.iter().map(|e| e.path.as_path()).collect();
+    assert_eq!(on_file, paths);
+    let mut fresh = AppController::new();
+    fresh.install_recent(loaded, config.to_path_buf());
+    assert_eq!(fresh.recent_rows(0), controller.recent_rows(0));
+}
+
+#[test]
+fn a_saved_project_is_recorded_in_recent() {
+    let out = common::tree("saved_recent_out");
+    let (alpha, beta) = (out.join("alpha.ffp"), out.join("beta.ffp"));
+    let config = common::tree("saved_recent_config");
+    let mut c = controller_with_two_tabs("saved_recent");
+    c.install_recent(vec![], config.clone());
+
+    // A never-saved tab saved away from its frames folder.
+    fuse_and_settle(&mut c);
+    assert!(common::save_and_settle(&mut c, |_| Some(alpha.clone())));
+    assert_eq!(recent_pairs(&c), [saved_row(&alpha)]);
+
+    // A second tab saved by Save and close goes in front.
+    c.select_project(1);
+    fuse_and_settle(&mut c);
+    c.request_close(1);
+    assert!(c.save_and_close(|_| Some(beta.clone())));
+    assert_eq!(recent_pairs(&c), [saved_row(&beta), saved_row(&alpha)]);
+
+    // A re-save of the opened project moves its one row to the front.
+    c.select_project(0);
+    fuse_and_settle(&mut c);
+    assert!(common::save_and_settle(&mut c, |_| {
+        panic!("an opened tab never asks where")
+    }));
+    assert_eq!(recent_pairs(&c), [saved_row(&alpha), saved_row(&beta)]);
+    assert_recent_persisted(&c, &config, &[&alpha, &beta]);
+
+    // Save all and quit records every tab it wrote, the last one first.
+    let (gamma, delta) = (out.join("gamma.ffp"), out.join("delta.ffp"));
+    let quit_config = common::tree("saved_recent_quit_config");
+    let mut q = controller_with_two_tabs("saved_recent_quit");
+    q.install_recent(vec![], quit_config.clone());
+    fuse_and_settle(&mut q);
+    q.select_project(1);
+    fuse_and_settle(&mut q);
+    q.select_project(0);
+    let first_tab = frames_dir("saved_recent_quit_a");
+    q.window_close();
+    assert!(q.save_all_and_quit(|proposed| {
+        Some(if proposed.starts_with(&first_tab) {
+            gamma.clone()
+        } else {
+            delta.clone()
+        })
+    }));
+    assert_eq!(recent_pairs(&q), [saved_row(&delta), saved_row(&gamma)]);
+    assert_recent_persisted(&q, &quit_config, &[&delta, &gamma]);
+}
+
+#[test]
+fn a_save_that_does_not_write_leaves_recent_unchanged() {
+    let config = common::tree("no_write_recent_config");
+    let seeded = vec![focusforge_gui::recent::RecentEntry {
+        name: "seeded".to_string(),
+        folder: config.join("elsewhere"),
+        path: config.join("elsewhere").join("seeded.ffp"),
+        opened_at: 1_700_000_000,
+    }];
+    focusforge_gui::recent::save(&config, &seeded).unwrap();
+    let mut c = controller_with_frames("no_write_recent", 2);
+    c.install_recent(seeded, config.clone());
+    fuse_and_settle(&mut c);
+    let rows = c.recent_rows(0);
+    let bytes = std::fs::read(config.join("settings.toml")).unwrap();
+
+    assert!(!common::save_and_settle(&mut c, |_| None));
+    let absent = common::tree("no_write_recent_out")
+        .join("absent")
+        .join("x.ffp");
+    assert!(!common::save_and_settle(&mut c, |_| Some(absent.clone())));
+
+    assert_eq!(c.recent_rows(0), rows);
+    assert_eq!(std::fs::read(config.join("settings.toml")).unwrap(), bytes);
+}
+
+#[test]
+fn an_unwritable_recent_list_does_not_fail_the_save() {
+    let config = common::tree("unwritable_recent").join("config");
+    std::fs::write(&config, b"a file where the directory belongs").unwrap();
+    let target = common::tree("unwritable_recent_out").join("kept.ffp");
+    let mut c = controller_with_frames("unwritable_recent_tab", 2);
+    c.install_recent(vec![], config);
+    fuse_and_settle(&mut c);
+
+    assert!(common::save_and_settle(&mut c, |_| Some(target.clone())));
+    assert!(target.is_file());
+    assert_eq!(c.project_tabs()[0].title, "kept");
+    assert_eq!(recent_pairs(&c), [saved_row(&target)]);
+}
+
+#[test]
+fn a_project_saved_outside_its_frames_reopens_without_a_missing_card() {
+    let mut c = controller_with_frames("saved_outside", 3);
+    fuse_and_settle(&mut c);
+    let target = common::tree("saved_outside_out").join("away.ffp");
+    assert!(common::save_and_settle(&mut c, |_| Some(target.clone())));
+    for source in &Project::open(&target).unwrap().manifest().sources {
+        assert_eq!(source.resolution, project::SourceResolution::AsGiven);
+    }
+
+    let mut whole = AppController::new();
+    common::open_and_settle(&mut whole, std::slice::from_ref(&target));
+    assert_eq!(whole.project_tabs().len(), 1);
+    assert!(whole.sources_notice().is_none());
+    assert!(whole.gallery_failure_kind(0).is_none());
+
+    std::fs::remove_file(frames_dir("saved_outside").join("00.tif")).unwrap();
+    let mut short = AppController::new();
+    common::open_and_settle(&mut short, std::slice::from_ref(&target));
+    assert!(short.sources_notice().is_some());
+    assert_eq!(short.gallery_failure_kind(0), Some("sources-missing"));
+}

@@ -8,18 +8,17 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::settings;
+use crate::{entry, settings};
 
 /// The most entries the file ever holds.
 pub const MAX_ENTRIES: usize = 5;
 
-/// One opened folder or project, as the file and the rail both hold it.
+/// One saved project, as the file and the rail both hold it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecentEntry {
     pub name: String,
     pub folder: PathBuf,
-    /// The exact path a click on this row reopens: a project's own `.ffp`,
-    /// or an unsaved group's source folder.
+    /// The exact path a click on this row reopens: the project's own `.ffp`.
     pub path: PathBuf,
     /// Unix seconds.
     pub opened_at: i64,
@@ -37,10 +36,11 @@ struct SettingsWrapper {
     recent: Option<RecentFile>,
 }
 
-/// Loads `[recent]` from `settings.toml`. Any failure -- the table absent,
-/// broken (a row without `path` included), or the file unreadable -- reads
-/// as an empty list; there is nothing here worth refusing a whole file over,
-/// unlike `input_config::load`'s bindings.
+/// Loads `[recent]` from `settings.toml`, keeping only rows whose `path`
+/// has the project extension; whether the file exists is not checked. Any
+/// failure -- the table absent, broken (a row without `path` included), or
+/// the file unreadable -- reads as an empty list; there is nothing here
+/// worth refusing a whole file over, unlike `input_config::load`'s bindings.
 pub fn load(config_dir: &Path) -> Vec<RecentEntry> {
     let (_, read_result) = settings::read(config_dir);
     let src = match read_result {
@@ -53,7 +53,11 @@ pub fn load(config_dir: &Path) -> Vec<RecentEntry> {
     match toml::from_str::<SettingsWrapper>(&src) {
         Ok(SettingsWrapper {
             recent: Some(file), ..
-        }) => file.entries,
+        }) => file
+            .entries
+            .into_iter()
+            .filter(|e| entry::has_project_extension(&e.path))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -67,7 +71,7 @@ pub fn save(config_dir: &Path, entries: &[RecentEntry]) -> Result<PathBuf, setti
     settings::write_table(config_dir, "recent", table)
 }
 
-/// Records a fresh open at the front of `entries`, dropping any existing
+/// Records an open or a save at the front of `entries`, dropping any existing
 /// entry for the same target and capping the result at [`MAX_ENTRIES`].
 /// Two entries name the same target when their `path`s match.
 pub fn record(

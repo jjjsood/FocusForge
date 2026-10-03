@@ -1070,11 +1070,17 @@ fn recent_list_persists_and_caps_at_five() {
     controller.set_scratch_root_for_test(tree("recent_scratch"));
 
     for i in 0..6 {
-        open_frames(&mut controller, &format!("recent_open_{i}"), 1);
+        let project = seal_as_given_project(&format!("recent_open_{i}"));
+        common::open_and_settle(&mut controller, &[project]);
     }
 
     let rows = controller.recent_rows(0);
     assert_eq!(rows.len(), 5, "the list caps at five entries");
+    assert!(
+        rows[0].folder.contains("recent_open_5_project"),
+        "the newest open is first: {}",
+        rows[0].folder
+    );
 
     let mut fresh = AppController::new();
     fresh.install_recent(recent::load(&config_dir), config_dir.clone());
@@ -1096,6 +1102,52 @@ fn recent_list_persists_and_caps_at_five() {
     let mut after_corrupt = AppController::new();
     after_corrupt.install_recent(recent::load(&corrupt_dir), corrupt_dir);
     assert!(after_corrupt.recent_rows(0).is_empty());
+}
+
+#[test]
+fn opening_a_folder_group_records_nothing_in_recent() {
+    use focusforge_gui::recent;
+
+    let config_dir = tree("recent_folder_group_config");
+    let mut controller = AppController::new();
+    controller.install_recent(recent::load(&config_dir), config_dir.clone());
+    open_frames(&mut controller, "recent_folder_group", 2);
+    assert!(controller.recent_rows(0).is_empty());
+    assert!(!config_dir.join("settings.toml").exists());
+
+    let project = seal_as_given_project("recent_folder_group_sealed");
+    common::open_and_settle(&mut controller, std::slice::from_ref(&project));
+    assert_eq!(controller.recent_rows(0).len(), 1);
+    let loaded = recent::load(&config_dir);
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].path, project);
+}
+
+#[test]
+fn old_folder_entries_are_dropped_when_recent_loads() {
+    use focusforge_gui::recent;
+
+    let config_dir = tree("recent_old_folders_config");
+    let entry = |name: &str, path: &str| RecentEntry {
+        name: name.to_string(),
+        folder: config_dir.clone(),
+        path: config_dir.join(path),
+        opened_at: 0,
+    };
+    let written = [
+        entry("frames", "frames"),
+        entry("lower", "lower.ffp"),
+        entry("upper", "UPPER.FFP"),
+        entry("gone", "gone/missing.ffp"),
+        entry("other", "notes.txt"),
+    ];
+    recent::save(&config_dir, &written).unwrap();
+
+    let names: Vec<String> = recent::load(&config_dir)
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, ["lower", "upper", "gone"]);
 }
 
 // ---------------------------------------------------------------------
@@ -1283,8 +1335,7 @@ fn recent_row_out_of_range_or_busy_is_ignored() {
 fn recent_row_opens_its_path_not_its_folder() {
     use focusforge_gui::recent;
 
-    let frames_dir = tree("recent_path_frames");
-    copy_frame(&frames_dir, "00.tif", 0);
+    let project_path = seal_as_given_project("recent_path_project");
 
     let config_dir = tree("recent_path_config");
     recent::save(
@@ -1292,7 +1343,7 @@ fn recent_row_opens_its_path_not_its_folder() {
         &[RecentEntry {
             name: "demo".to_string(),
             folder: config_dir.join("no_such_folder"),
-            path: frames_dir,
+            path: project_path,
             opened_at: 0,
         }],
     )
@@ -1607,6 +1658,17 @@ fn a_hidden_overlay_publishes_nothing_until_reopened() {
         return;
     }
     let recent_dir = tree("hidden_overlay_recent");
+    let project = seal_as_given_project("hidden_overlay_recent_project");
+    focusforge_gui::recent::save(
+        &recent_dir,
+        &[RecentEntry {
+            name: "demo".to_string(),
+            folder: project.parent().unwrap().to_path_buf(),
+            path: project,
+            opened_at: 0,
+        }],
+    )
+    .unwrap();
     let (app, controller, _events, _installed) =
         overlay_window("hidden_overlay", Some(&recent_dir));
     let push = || {
@@ -1672,6 +1734,6 @@ fn a_hidden_overlay_publishes_nothing_until_reopened() {
         .into_iter()
         .map(|r| (r.name, r.folder, r.date_text))
         .collect();
-    assert!(!want.is_empty(), "the opened projects are recent");
+    assert!(!want.is_empty(), "the seeded project is recent");
     assert_eq!(recent, want);
 }
