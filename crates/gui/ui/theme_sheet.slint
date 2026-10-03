@@ -25,14 +25,18 @@ import { FFPanePlaceholder } from "components/ff_pane_placeholder.slint";
 import { FFSpinner } from "components/ff_spinner.slint";
 import { FFLoadingPanel } from "components/ff_loading_panel.slint";
 import { FFImageRow } from "components/ff_image_row.slint";
-import { FFNoSourceRow } from "components/ff_no_source_row.slint";
+import { FFCheckpointRow } from "components/ff_checkpoint_row.slint";
 import { FFDialog } from "components/ff_dialog.slint";
 import { FFDialogFooter } from "components/ff_dialog_footer.slint";
 import { FFChip } from "components/ff_chip.slint";
 import { FFProjectCard } from "components/ff_project_card.slint";
 import { FFManifestList } from "components/ff_manifest_list.slint";
 import { FFBrushCursor } from "components/ff_brush_cursor.slint";
-import { FFToast } from "shell/dialogs.slint";
+import { FFStatusGlyph } from "components/ff_status_glyph.slint";
+import { FFHeading } from "components/ff_heading.slint";
+import { FFDivider } from "components/ff_divider.slint";
+import { FFSegmented } from "components/ff_segmented.slint";
+import { FFToast, FFCheckpointDelete } from "shell/dialogs.slint";
 
 component ColourSwatch inherits Rectangle {
     in property <color> swatch;
@@ -141,6 +145,55 @@ export component ThemeSheet inherits Window {
         padding: Theme.space-4;
         spacing: Theme.space-3;
         alignment: start;
+
+        GroupHeading { text: "Export dialog: format settings"; }
+        FFSegmented { width: 252px; segments: ["TIFF", "PNG", "JPEG"]; selected: "PNG"; }
+        Rectangle {
+            width: 528px;
+            height: 150px;
+
+            FFRowText { x: 0px; y: 0px; width: 120px; height: 28px; text: "Quality"; }
+            FFSlider { x: 128px; y: 1px; width: 210px; fraction: 0.94; value-text: "95"; }
+
+            FFRowText { x: 0px; y: 36px; width: 120px; height: 28px; text: "Chroma subsampling"; }
+            FFSegmented { x: 128px; y: 36px; width: 168px; segments: ["4:4:4", "4:2:0"]; selected: "4:2:0"; }
+
+            FFRowText { x: 0px; y: 72px; width: 120px; height: 28px; text: "Compression"; }
+            FFMenu {
+                x: 128px;
+                y: 72px;
+                width: 110px;
+                label: "None";
+                external-list: true;
+                open: true;
+            }
+
+            FFSectionHeading {
+                x: 0px;
+                y: 108px;
+                width: 528px;
+                compact: true;
+                opaque: false;
+                provenance: "explicit";
+                label: "METADATA";
+            }
+            FFRowText { x: 0px; y: 122px; width: 120px; height: 24px; text: "Metadata"; }
+
+            FFMenuList {
+                x: 128px;
+                y: 100px;
+                width: 110px;
+                choices: ["None", "LZW", "Deflate"];
+                choice-ids: ["none", "lzw", "deflate"];
+                show-choice-ids: false;
+                selected: "none";
+            }
+        }
+        FFDialogFooter {
+            width: 528px;
+            cancel-label: "Close";
+            confirm-label: "";
+        }
 
         GroupHeading { text: "Surfaces / Borders"; }
         HorizontalLayout {
@@ -593,6 +646,68 @@ export component ThemeSheet inherits Window {
             }
         }
 
+        GroupHeading { text: "Checkpoints list: row"; }
+        VerticalLayout {
+            spacing: 0px;
+            FFSectionHeading {
+                width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-content-inset;
+                label: "TODAY";
+                compact: true;
+                opaque: false;
+            }
+            FFCheckpointRow {
+                algorithm: "Laplacian Pyramid";
+                time-text: "16:42:08";
+                selected: true;
+            }
+            FFCheckpointRow {
+                algorithm: "dwt-wavelet";
+                time-text: "15:58:30";
+                deletable: true;
+                hovered: true;
+            }
+            FFCheckpointRow {
+                algorithm: "dwt-wavelet";
+                time-text: "15:12:44";
+                deletable: true;
+            }
+            FFSectionHeading {
+                width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-content-inset;
+                label: "YESTERDAY";
+                compact: true;
+                opaque: false;
+            }
+            FFCheckpointRow {
+                algorithm: "Laplacian Pyramid";
+                time-text: "21:08:12";
+            }
+        }
+
+        GroupHeading { text: "Checkpoints list: fresh row, tint at its peak"; }
+        VerticalLayout {
+            spacing: 0px;
+            FFCheckpointRow {
+                algorithm: "Laplacian Pyramid";
+                time-text: "16:43:01";
+                selected: true;
+                flash-held: true;
+            }
+            FFCheckpointRow {
+                algorithm: "dwt-wavelet";
+                time-text: "15:58:30";
+                deletable: true;
+            }
+        }
+
+        GroupHeading { text: "Checkpoints list: last row, hovered"; }
+        FFCheckpointRow {
+            algorithm: "Laplacian Pyramid";
+            time-text: "16:42:08";
+            selected: true;
+            hovered: true;
+            deletable: false;
+        }
+
         GroupHeading { text: "Images list: legend row"; }
         VerticalLayout {
             spacing: 0px;
@@ -631,7 +746,6 @@ export component ThemeSheet inherits Window {
                 time-text: "6";
                 selected: true;
             }
-            FFNoSourceRow { width: 248px; }
         }
 
         Rectangle {
@@ -696,6 +810,64 @@ export component ThemeSheet inherits Window {
             }
         }
 
+        GroupHeading { text: "Dialog: caution"; }
+        Rectangle {
+            width: 560px;
+            height: 350px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "caution";
+                panel-width: 540px;
+                panel-height: 330px;
+                title: "The frames are no longer there";
+                context: "demo.ffp";
+                body: "A project remembers its frames by path. 2 of 3 cannot be found in this location.\n\nHistory and Z-Map are complete. Fused results still show; edited checkpoints and re-fusing need the frames.";
+                info: "The Projects overlay shows the same condition as a \"Sources missing\" card.";
+                cancel-label: "Close";
+                confirm-label: "Locate frames…";
+                confirm-kind: "default";
+            }
+        }
+
+        GroupHeading { text: "Dialog: warning, danger confirm (600×362)"; }
+        Rectangle {
+            width: 620px;
+            height: 382px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "warning";
+                panel-width: 600px;
+                panel-height: 362px;
+                title: "The source frames are not the same";
+                context: "demo.ffp";
+                body: "The project was made over 3 frames. The frames in this location give a different fingerprint.\n\nThe Z-Map records, for every pixel, which frame it came from — by that frame's place in the row. If the row is wrong, every retouch points at the wrong frame.";
+                info: "Finding the original frames again opens the project unchanged.";
+                secondary-label: "Locate frames…";
+                confirm-label: "Open anyway";
+                confirm-kind: "danger";
+            }
+        }
+
+        GroupHeading { text: "Dialog: delete a checkpoint"; }
+        Rectangle {
+            width: 580px;
+            height: 336px;
+            clip: true;
+            FFCheckpointDelete {
+                width: 100%;
+                height: 100%;
+                open: true;
+                context: "Laplacian Pyramid · 15:47:02";
+                body: "The other 3 checkpoints are untouched, and the stack is not fused again.";
+            }
+        }
+
         GroupHeading { text: "Dialog: save, with a context line"; }
         Rectangle {
             width: 500px;
@@ -715,6 +887,26 @@ export component ThemeSheet inherits Window {
                 confirm-kind: "danger";
             }
         }
+
+        GroupHeading { text: "Dialog: header status glyph"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFStatusGlyph { kind: "swatch"; }
+            FFStatusGlyph { kind: "circle"; }
+        }
+
+        GroupHeading { text: "Dialog: heading"; }
+        VerticalLayout {
+            spacing: Theme.space-2;
+            FFHeading { text: "Export image"; }
+            FFHeading { text: "Can't export this position"; tone: "failure"; size: "body"; }
+        }
+
+        GroupHeading { text: "Dialog: divider"; }
+        FFDivider { width: 300px; }
+
+        GroupHeading { text: "Dialog: segmented selector"; }
+        FFSegmented { width: 168px; segments: ["TIFF", "JPEG"]; selected: "TIFF"; }
 
         GroupHeading { text: "Projects overlay: chip"; }
         HorizontalLayout {

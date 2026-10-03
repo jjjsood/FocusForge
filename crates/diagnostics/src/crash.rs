@@ -149,7 +149,7 @@ pub(crate) fn utc_stamp(unix_seconds: i64) -> String {
 }
 
 /// The same instant as an RFC 3339 UTC timestamp.
-pub(crate) fn rfc3339(unix_seconds: i64) -> String {
+pub fn rfc3339(unix_seconds: i64) -> String {
     let (year, month, day) = civil_from_unix(unix_seconds);
     let (hour, minute, second) = time_of_day(unix_seconds);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")

@@ -6,7 +6,8 @@
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
 import { FFModeSwitch } from "dock/mode_switch.slint";
-import { FFCheckpointPanel } from "dock/checkpoint_panel.slint";
+import { FFCheckpointPanel, CheckpointEntryView } from "dock/checkpoint_panel.slint";
+export { CheckpointEntryView }
 import { FFDockTabs } from "dock/dock_tabs.slint";
 import { FFSettingsPanel, SettingsRow, SectionHeadView } from "dock/settings_panel.slint";
 export { SettingsRow, SectionHeadView }
@@ -24,9 +25,22 @@ export component FFDock inherits Rectangle {
     // has nothing to show, and draws the line `No project open.` in its
     // place instead.
     in property <bool> project-loaded: false;
-    // The checkpoints panel's own line -- the active tab's checkpoint count,
-    // or the empty-state wording. Set from Rust in `src/bridge.rs`.
+    // The checkpoints panel's own empty-state line, shown in place of the
+    // row list below while it is empty. Set from Rust in `src/bridge.rs`.
     in property <string> checkpoint-line: "None yet — fuse a stack";
+    in property <bool> checkpoint-export-enabled: false;
+    // The checkpoints panel's own list, forwarded the same way as the
+    // `Images` panel's rows below.
+    in property <[CheckpointEntryView]> checkpoint-rows: [];
+    in property <length> checkpoint-scroll-y: 0px;
+    in property <length> checkpoint-content-height: 0px;
+    callback checkpoint-selected(int);
+    callback checkpoint-delete-requested(int);
+    callback checkpoint-scrolled(length);
+    callback checkpoint-scrollbar-pointer(int, length);
+    callback checkpoint-scrollbar-dragged(length);
+    callback checkpoint-viewport-height-changed(length);
+    out property <length> checkpoint-viewport-height: checkpoint-panel.viewport-height;
 
     // The settings panel: generated entirely from the row list Rust hands
     // it, forwarded one line into `FFSettingsPanel`.
@@ -50,9 +64,6 @@ export component FFDock inherits Rectangle {
     in property <[ImageRowView]> images-rows: [];
     in property <string> images-header-text: "";
     in-out property <length> images-list-viewport-y: 0px;
-    // The editor's read-only legend: the pinned `NO_SOURCE` entry shows
-    // below the list.
-    in property <bool> images-no-source-row: false;
     in property <string> images-sort: "";
     in property <bool> images-sort-menu-open: false;
     in property <int> images-dragging-row: -1;
@@ -97,7 +108,17 @@ export component FFDock inherits Rectangle {
 
         checkpoint-panel := FFCheckpointPanel {
             line: root.checkpoint-line;
+            export-enabled: root.checkpoint-export-enabled;
+            rows: root.checkpoint-rows;
+            scroll-y: root.checkpoint-scroll-y;
+            content-height: root.checkpoint-content-height;
             checkpoint-export-requested => { root.checkpoint-export-requested(); }
+            checkpoint-selected(i) => { root.checkpoint-selected(i); }
+            checkpoint-delete-requested(i) => { root.checkpoint-delete-requested(i); }
+            checkpoint-scrolled(delta) => { root.checkpoint-scrolled(delta); }
+            checkpoint-scrollbar-pointer(kind, y) => { root.checkpoint-scrollbar-pointer(kind, y); }
+            checkpoint-scrollbar-dragged(y) => { root.checkpoint-scrollbar-dragged(y); }
+            checkpoint-viewport-height-changed(h) => { root.checkpoint-viewport-height-changed(h); }
         }
 
         dock-tabs := FFDockTabs {
@@ -147,7 +168,6 @@ export component FFDock inherits Rectangle {
         rows: root.images-rows;
         header-text: root.images-header-text;
         list-viewport-y <=> root.images-list-viewport-y;
-        no-source-row: root.images-no-source-row;
         mutable: root.mode == "stacking" && root.images-enabled;
         enabled: root.images-enabled;
         legend: root.mode == "editor";

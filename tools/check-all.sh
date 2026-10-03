@@ -140,7 +140,7 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   mkdir -p "$TEST_TMP"
   run_gate "cargo nextest"  tools/with-lock.sh build -- \
                               env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" TMPDIR="$TEST_TMP" \
-                              cargo nextest run --workspace
+                              cargo nextest run --workspace --no-fail-fast
   run_gate "test tmp residue" test_tmp_residue "$TEST_TMP"
   run_gate "cargo test --doc" tools/with-lock.sh build -- \
                               env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" cargo test --doc --workspace

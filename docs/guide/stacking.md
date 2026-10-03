@@ -37,10 +37,28 @@ error; FocusForge has no alternate RAW decoder.
 focusforge-cli export path/to/frames/frames.ffp -o out.tif --zmap zmap.tif
 ```
 
-`export` reads a project and writes the composite (`-o`), the Z-Map
+`export` reads a project and writes the image (`-o`), the Z-Map
 (`--zmap`), or both in one invocation — at least one of the two is required.
-The composite it writes is byte-identical to the plane the `stack` run
-produced.
+The image is rendered from the project's Z-Map, so it always reflects the
+checkpoint you ask for (the head by default; `--checkpoint <id>` picks
+another). Rendering reads the source frames again and checks them against
+the hashes recorded when the project was written; a missing or changed
+frame is named and nothing is written.
+
+The format follows `-o`'s extension: `.tif`, `.png` or `.jpg`. Each format
+has its own options:
+
+```bash
+focusforge-cli export frames.ffp -o out.png --png-bits 8 --png-compression best
+focusforge-cli export frames.ffp -o out.jpg --jpeg-quality 90 --jpeg-subsampling 444
+focusforge-cli export frames.ffp -o out.tif --tiff-bits 16 --tiff-compression lzw
+```
+
+TIFF and PNG default to 16 bits and JPEG to quality 95 with 4:2:0 chroma
+subsampling. EXIF from the alignment reference frame and an ICC profile are
+carried into the image by default; `--xmp on` and `--iptc on` carry those
+too (IPTC is never written to PNG), and `--exif off` / `--icc off` leave
+them out. [`reference/cli.md`](../reference/cli.md#export) lists every flag.
 
 ## Choosing an algorithm
 

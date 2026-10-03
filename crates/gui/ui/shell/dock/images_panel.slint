@@ -7,7 +7,6 @@ import { ListView } from "std-widgets.slint";
 import { Theme } from "../../theme.slint";
 import { ShellGeometry } from "../../geometry.slint";
 import { FFImageRow } from "../../components/ff_image_row.slint";
-import { FFNoSourceRow } from "../../components/ff_no_source_row.slint";
 import { FFScrollbar } from "../../components/ff_scrollbar.slint";
 import { FFMenuList } from "../../components/ff_menu_list.slint";
 import { FFIconButton } from "../../components/ff_icon_button.slint";
@@ -36,10 +35,8 @@ export component FFImagesPanel inherits Rectangle {
     // to the same disabled look `FFSettingsPanel` uses during a job.
     in property <bool> enabled: true;
     // The editor's read-only legend: every row is a mode of `FFImageRow`
-    // rather than the mutable stacking-mode row, and the pinned `NO_SOURCE`
-    // entry shows below the scrolled list.
+    // rather than the mutable stacking-mode row.
     in property <bool> legend: false;
-    in property <bool> no-source-row: false;
     // The sort menu's own selection ("" | "name" | "capture-time") and
     // whether it is open.
     in property <string> sort: "";
@@ -134,20 +131,6 @@ export component FFImagesPanel inherits Rectangle {
                 exclude-toggled => { root.frame-excluded-toggled(i); }
                 remove-requested => { root.frame-remove-requested(i); }
                 wheel(delta) => { root.frame-wheel(delta); }
-            }
-        }
-
-        // Pinned below the scrolled list -- `NO_SOURCE` never scrolls away.
-        if root.no-source-row: VerticalLayout {
-            width: ShellGeometry.image-row-band-width;
-
-            Rectangle {
-                height: 1px;
-                background: Theme.border-default;
-            }
-
-            FFNoSourceRow {
-                width: ShellGeometry.image-row-band-width;
             }
         }
     }

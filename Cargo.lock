@@ -1687,9 +1687,11 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "tempfile",
+ "tiff",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
  "zip",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1698,10 +1700,13 @@ version = "0.1.0"
 dependencies = [
  "akaze",
  "blake3",
+ "chrono",
  "flate2",
  "focusforge-core",
  "inventory",
+ "jpeg-encoder",
  "memmap2",
+ "png",
  "proptest",
  "rawler",
  "rayon",
@@ -1754,6 +1759,7 @@ dependencies = [
 name = "focusforge-gui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "directories",
  "focusforge-core",
@@ -1769,8 +1775,10 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "toml 1.1.6+spec-1.1.0",
+ "toml_edit 0.25.15+spec-1.1.0",
  "tracing",
  "zip",
+ "zstd",
 ]
 
 [[package]]
@@ -3070,6 +3078,12 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
 ]
+
+[[package]]
+name = "jpeg-encoder"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0370574b86f7eca156b9f298392b5e69a23f8c86f3f865add60bbc2e79467a6"
 
 [[package]]
 name = "js-sys"

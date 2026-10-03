@@ -29,10 +29,12 @@ focusforge-core = { path = "../core" }
 focusforge-diagnostics = { path = "../diagnostics" }
 focusforge-gpu = { path = "../gpu", features = ["gpu"] }
 toml = "1"
+toml_edit = "0.25"
 serde = { version = "1", features = ["derive"] }
 directories = "6"
 rfd = "0.17.2"
 tracing = "0.1.44"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [build-dependencies]
 slint-build = "~1.17"
@@ -45,3 +47,5 @@ tempfile = "3"
 # Reading a written bundle back, with the same pinned feature set the
 # writer uses.
 zip = { version = "8.6.0", default-features = false }
+# Corrupting a blob's compressed bytes without breaking its zstd framing.
+zstd = "0.14"

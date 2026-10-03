@@ -24,26 +24,29 @@ use std::time::{Duration, Instant};
 
 use crate::brush;
 use crate::canvas::{FrameView, OverlayDraw};
+use crate::checkpoints;
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
     DiagnosticsView, clamp_manifest_scroll, manifest_content_height, measurement_scope, size_text,
 };
 use crate::entry;
+use crate::export_settings::{self, ExportChoice, ExportView};
 use crate::images;
 use crate::input_config::Provenance;
 use crate::input_map::{
     Action, ActionEvent, Button, InputRowView, InputTable, Modifiers, PointerKind, Trigger,
 };
-use crate::job;
+use crate::job::{self, ExportFormat, ExportOptions, params_for};
 use crate::overlay::{self, CardView, FailureCard, FailureKind};
 use crate::recent;
 use crate::settings_panel::{
-    self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext,
+    self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext, slider_value,
 };
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
 
 pub use crate::entry::{
-    EntryError, GroupingQuestion, GuiProject, ImportRefused, OpenAs, OpenOutcome, Opened, Proposal,
+    EntryError, GroupingQuestion, GuiProject, ImportRefused, LocateTarget, OpenAs, OpenOutcome,
+    Opened, PendingOpen, Proposal,
 };
 
 /// The stacking/editor mode switch's two positions. Editor is reachable only
@@ -76,14 +79,6 @@ pub enum SettingsSection {
     InputMap,
     Diagnostics,
     About,
-}
-
-/// The two fields a checkpoint row shows: the fusion algorithm used and when
-/// it ran. Left unpopulated until real checkpoint history exists.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckpointRow {
-    pub algorithm: String,
-    pub created_at: String,
 }
 
 /// Every event the shell can raise, reaching an installed sink through
@@ -126,6 +121,9 @@ pub enum ShellEvent {
     /// A folder read as more than one stack -- the one grouping question,
     /// asked once.
     QuestionRaised(GroupingQuestion),
+    /// A saved project's source content no longer matches the fingerprint
+    /// it was recorded with -- the mismatch dialog, raised once.
+    MismatchRaised,
     /// The settings panel's own state moved: a value, an algorithm choice,
     /// a reset or an open menu -- never a tab switch, which
     /// `ProjectsChanged` already rebuilds the panel for.
@@ -146,6 +144,10 @@ pub enum ShellEvent {
     ImagesChanged,
     /// Only the `Images` list's scroll offset moved; no row changed.
     ImagesScrolled,
+    /// The `Checkpoints` panel's own state moved: a row selected or the
+    /// scroll offset -- never a tab switch, which `ProjectsChanged` already
+    /// rebuilds the panel for.
+    CheckpointsChanged,
     /// The editor toolbar's own state moved: the brush size, its softness,
     /// the pipette's armed state, or undo/redo availability.
     EditorChanged,
@@ -170,6 +172,9 @@ pub enum ShellEvent {
     /// An import scan ([`AppController::add_frames`]) is ready to settle
     /// ([`AppController::settle_import`]).
     ImportReady,
+    /// A `Locate frames…` verification ([`AppController::locate_frames`]) is
+    /// ready to settle ([`AppController::settle_locate`]).
+    LocateReady,
 }
 
 /// One live drag: which action it started and the last position seen, so
@@ -196,7 +201,6 @@ struct InputState {
     /// while held; it arms nothing.
     alt_held: bool,
     drag: Option<DragState>,
-    unimplemented: Vec<Action>,
     last_pointer: (f32, f32),
     /// Accumulated wheel delta not yet spent into a ladder step -- one stop
     /// per accumulated 60 px. Reset on a sign change so reversing direction
@@ -289,6 +293,8 @@ pub struct BrushToolbarView {
     /// Whether the active tab's edit session has an op to undo/redo.
     pub can_undo: bool,
     pub can_redo: bool,
+    /// Whether the active tab's session holds ops: what `Save checkpoint` keeps.
+    pub can_save_checkpoint: bool,
 }
 
 /// The bottom bar's overlay controls -- [`AppController::overlay_view`]'s
@@ -394,15 +400,27 @@ struct ProjectTab {
     errors: BTreeMap<String, ParamViolation>,
     /// The one open picker/enum menu's `"<section>:<id>"` key, if any.
     menu_open: Option<String>,
-    /// The project's real checkpoint count -- `0` for an `Unsaved` tab, the
-    /// reopened project's own on-disk chain length for an `Opened` one,
-    /// incremented on every successful run ([`AppController::settle_job`])
-    /// rather than inferred from which [`GuiProject`] variant the tab
-    /// happens to be in. Counts held checkpoints too.
-    checkpoints: usize,
-    /// Every checkpoint fused since the last save, oldest first -- in no
-    /// `.ffp` until [`AppController::save_active_project`] writes them.
-    held: Vec<job::HeldCheckpoint>,
+    /// Every checkpoint kept in memory since the last save, oldest first --
+    /// fused and op-bearing ones alike, in no `.ffp` until
+    /// [`AppController::save_active_project`] writes them. A parent is an
+    /// index into this list or a saved checkpoint's id.
+    held: Vec<job::InMemoryCheckpoint>,
+    /// Rows (saved or in memory) whose deletion waits for the next project
+    /// save; the list already leaves them out.
+    pending_deletes: Vec<job::ParentRef>,
+    /// Saved checkpoint ids whose planes sit in the plane cache, newest last.
+    viewed: Vec<String>,
+    /// The checkpoint list's own current row, by its `checkpoints::
+    /// CheckpointEntry` id -- seeded to the newest saved checkpoint on open,
+    /// `None` for an `Unsaved` tab with nothing fused yet.
+    selected_checkpoint: Option<String>,
+    /// The row a checkpoint creation just added while this tab was in view,
+    /// by list id, with the creation's generation. A save rewrites the id
+    /// and keeps the generation.
+    fresh_checkpoint: Option<(String, u64)>,
+    /// The current saved row's planes once asked for; reset whenever the
+    /// current row changes. Held rows never use it: they carry their own.
+    row_planes: Option<RowPlanes>,
     /// A completed run whose alignment left frames unregistered, waiting for
     /// [`AppController::keep_fused`] or [`AppController::discard_fused`];
     /// not counted in `checkpoints` or `held` until kept.
@@ -460,6 +478,139 @@ struct TabFailure {
     reason: String,
 }
 
+/// The missing-sources dialog's own payload: which tab it names, its
+/// counts ([`overlay::sources_missing_body`]) and the project's file name
+/// for its context line.
+struct SourcesNotice {
+    tab_id: u64,
+    missing: usize,
+    total: usize,
+    file_name: String,
+}
+
+/// A saved row's planes, as far as they have got.
+enum RowPlanes {
+    /// An op-bearing row rendering on a worker; the canvas keeps what it
+    /// showed until it settles.
+    Pending,
+    Ready(PathBuf, PathBuf),
+    /// The right pane's refusal text, one entry per line.
+    Refused(Vec<String>),
+}
+
+/// What the active tab can show in the right pane right now.
+enum TabPlanes {
+    Ready(PathBuf, PathBuf),
+    Pending,
+    None,
+}
+
+/// The one op-bearing checkpoint render in flight, if any, and where its
+/// worker parks the result -- [`LoadSlot`]'s shape.
+#[derive(Default)]
+struct RenderSlot {
+    /// The tab (by id) and row the running worker renders.
+    in_flight: Option<(u64, String)>,
+    /// Set when a worker starts, until [`AppController::take_render_started`].
+    started: bool,
+    outcome: Arc<Mutex<Option<RenderOutcome>>>,
+}
+
+type RenderOutcome = Result<(PathBuf, PathBuf), Vec<String>>;
+
+/// The export modal's own state: which tab it names, the context/what
+/// lines already composed for its row (per-kind prose, not a separate
+/// "kind" label -- the kind is named through this prose, never through its
+/// own badge), and how far the write itself has got.
+struct ExportDialog {
+    tab_id: u64,
+    context: String,
+    what: String,
+    stage: ExportStage,
+    /// The chosen destination's own file name -- set once the picker
+    /// returns a path, empty before then; the writing state's caption
+    /// names it.
+    destination_name: String,
+    /// The chosen destination's full path, set alongside
+    /// `destination_name` -- kept so a refused export can be retried at the
+    /// same path once `Locate frames…` resolves its sources, without
+    /// prompting the save dialog again.
+    destination: Option<PathBuf>,
+    /// The format and settings the modal shows; copied into
+    /// `AppState::export_choice` and saved only once an export succeeds.
+    choice: ExportChoice,
+    /// The descriptor id whose list is open.
+    open_menu: Option<String>,
+}
+
+/// Which position an export modal names -- the three kinds its own
+/// context/what copy tells apart.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportKind {
+    Saved,
+    Held,
+    Live,
+}
+
+/// The export modal's own context/what copy for `kind`: a saved or live
+/// row names its algorithm and local time, a held row does not -- it has
+/// neither yet, only its own "just fused" state.
+fn export_copy_for(
+    kind: ExportKind,
+    project_file: &str,
+    algorithm: &str,
+    timestamp: &str,
+) -> (String, String) {
+    match kind {
+        ExportKind::Saved => (
+            format!("{project_file} · {algorithm} · {timestamp}"),
+            "Exporting the saved checkpoint you selected.".to_string(),
+        ),
+        ExportKind::Held => (
+            format!("{project_file} · unsaved fuse result, held in this tab"),
+            "Exporting the unsaved fuse result held in this tab.".to_string(),
+        ),
+        ExportKind::Live => (
+            format!("{project_file} · unsaved edits on {algorithm} · {timestamp}"),
+            "Exporting your current unsaved retouch edits.".to_string(),
+        ),
+    }
+}
+
+enum ExportStage {
+    Ready,
+    Writing,
+    Refused { lines: Vec<String>, locate: bool },
+}
+
+/// An export write's own outcome, as [`ExportSlot`] parks it: written, or
+/// the modal's own refusal lines.
+type ExportOutcome = Result<(), job::ExportRefusal>;
+
+/// The one export write in flight, if any, and where its worker parks the
+/// result -- [`RenderSlot`]'s twin for [`job::export_position`].
+#[derive(Default)]
+struct ExportSlot {
+    in_flight: Option<u64>,
+    started: bool,
+    outcome: Arc<Mutex<Option<ExportOutcome>>>,
+}
+
+/// What an in-memory row's planes and fuse state come from.
+enum RowBase {
+    /// The fused in-memory entry at this index.
+    Held(usize),
+    Saved(String),
+}
+
+/// The finished fuse `entry` holds, if it is one.
+fn fused_of(entry: &job::InMemoryCheckpoint) -> Option<&job::HeldCheckpoint> {
+    match &entry.kind {
+        job::InMemoryKind::Fused(held) => Some(held),
+        _ => None,
+    }
+}
+
 /// A held checkpoint whose run diverged on `diverged`, by frame file name.
 struct ParkedRun {
     held: job::HeldCheckpoint,
@@ -494,9 +645,9 @@ impl ProjectTab {
         let (fuse_id, fuse_values, align_id, align_values) =
             settings_panel::seed_algorithm_state(&project);
         let project_values = settings_panel::seed_project_values(&project);
-        let checkpoints = match &mut project {
-            GuiProject::Unsaved(_) => 0,
-            GuiProject::Opened(p) => p.checkpoint_chain().map(|chain| chain.len()).unwrap_or(1),
+        let selected_checkpoint = match &project {
+            GuiProject::Unsaved(_) => None,
+            GuiProject::Opened(p) => p.history().visible().first().map(|c| c.id.clone()),
         };
         let frames = entry::project_frames(&project);
         let excluded = vec![false; frames.len()];
@@ -522,8 +673,12 @@ impl ProjectTab {
             project_values,
             errors: BTreeMap::new(),
             menu_open: None,
-            checkpoints,
             held: Vec::new(),
+            pending_deletes: Vec::new(),
+            viewed: Vec::new(),
+            selected_checkpoint,
+            fresh_checkpoint: None,
+            row_planes: None,
             parked: None,
             alignment: None,
             frames,
@@ -539,16 +694,39 @@ impl ProjectTab {
         }
     }
 
-    /// Whether this tab holds work no `.ffp` contains: a never-saved
-    /// project, or any checkpoint fused since the last save.
-    fn unsaved(&self) -> bool {
-        matches!(self.project, GuiProject::Unsaved(_)) || !self.held.is_empty()
+    /// What closing this tab would lose besides a modified live: the
+    /// in-memory checkpoints the list still shows, and the queued deletes of
+    /// saved checkpoints.
+    fn unsaved_parts(&self) -> (usize, usize) {
+        let listed = (0..self.held.len())
+            .filter(|&index| !self.pending_deletes.contains(&job::ParentRef::Entry(index)))
+            .count();
+        let deletes = self
+            .pending_deletes
+            .iter()
+            .filter(|parent| matches!(parent, job::ParentRef::Saved(_)))
+            .count();
+        (listed, deletes)
     }
 
-    /// Whether quitting now would lose a run of this tab: a held checkpoint,
-    /// or a parked run still waiting for Keep or Discard.
+    /// Whether closing this tab loses something the user can see: a modified
+    /// live, a listed in-memory checkpoint or a queued delete of a saved one.
+    fn loses_on_close(&self) -> bool {
+        let (listed, deletes) = self.unsaved_parts();
+        self.live_modified() || listed > 0 || deletes > 0
+    }
+
+    /// Whether this tab holds work no `.ffp` contains: a never-saved
+    /// project, or anything [`Self::loses_on_close`] names.
+    fn unsaved(&self) -> bool {
+        matches!(self.project, GuiProject::Unsaved(_)) || self.loses_on_close()
+    }
+
+    /// Whether quitting now would lose work of this tab: what
+    /// [`Self::loses_on_close`] names, or a parked run still waiting for Keep
+    /// or Discard.
     fn quit_loses_work(&self) -> bool {
-        !self.held.is_empty() || self.parked.is_some()
+        self.loses_on_close() || self.parked.is_some()
     }
 
     /// The frames a fuse of this tab would actually use -- `frames` with
@@ -562,13 +740,37 @@ impl ProjectTab {
             .collect()
     }
 
+    /// This tab's own checkpoint count: every visible checkpoint in the
+    /// project's history (`History::visible`, branch-complete rather than one
+    /// lineage) plus every checkpoint fused since the last save. `0` for an
+    /// `Unsaved` tab with nothing fused yet.
+    fn checkpoint_count(&self) -> usize {
+        let saved = match &self.project {
+            GuiProject::Opened(project) => project.history().visible().len(),
+            GuiProject::Unsaved(_) => 0,
+        };
+        saved + self.held.len()
+    }
+
+    /// The number of rows the checkpoint list shows: visible saved
+    /// checkpoints less the queued deletes of saved ones, plus the listed
+    /// in-memory ones.
+    fn listed_checkpoint_count(&self) -> usize {
+        let saved = match &self.project {
+            GuiProject::Opened(project) => project.history().visible().len(),
+            GuiProject::Unsaved(_) => 0,
+        };
+        let (listed, deletes) = self.unsaved_parts();
+        saved.saturating_sub(deletes) + listed
+    }
+
     /// Whether this tab can enter editor mode: at least one checkpoint, its
     /// own run neither live nor waiting in the queue, and `frames` still
     /// naming the frame set the fused planes were built from -- the newest
     /// held checkpoint's own `sources`, or a reopened project's own manifest
     /// when nothing is held.
     fn can_edit(&self) -> bool {
-        if self.checkpoints == 0 {
+        if self.checkpoint_count() == 0 {
             return false;
         }
         if job::is_live(&self.run) || matches!(self.run, job::RunState::Queued { .. }) {
@@ -591,21 +793,168 @@ impl ProjectTab {
         self.meta.extend(images::read_metadata(&missing));
     }
 
-    /// The sources and registration behind this tab's newest composite --
-    /// the newest held checkpoint's own `sources`/`registration`, or a
-    /// reopened project's own manifest when nothing is held. `None` for an
-    /// unsaved, never-fused tab.
+    /// The sources and registration behind this tab's *selected* row --
+    /// a held row's own `sources`/`registration`, or a saved checkpoint's
+    /// own fuse state (`Project::fuse_state`), never the project head's
+    /// when a different row is selected. `None` for an unsaved, never-fused
+    /// tab, or when the selected row does not resolve.
     fn fused(&self) -> Option<(Vec<PathBuf>, job::Registration)> {
-        match self.held.last() {
-            Some(held) => Some((held.sources.clone(), held.registration.clone())),
-            None => match &self.project {
-                GuiProject::Opened(project) => Some((
-                    entry::project_frames(&self.project),
-                    project.manifest().registration.clone(),
-                )),
-                GuiProject::Unsaved(_) => None,
-            },
+        let key = self.selected_checkpoint.as_deref()?;
+        if checkpoints::held_index(key).is_none() {
+            return self.saved_fused(key);
         }
+        match self.resolve_row(key)? {
+            RowBase::Held(base) => {
+                let held = fused_of(self.held.get(base)?)?;
+                Some((held.sources.clone(), held.registration.clone()))
+            }
+            RowBase::Saved(id) => self.saved_fused(&id),
+        }
+    }
+
+    /// [`Self::fused`] for saved checkpoint `id`: its fuse state's sources,
+    /// resolved against the project's own location, and registration.
+    fn saved_fused(&self, id: &str) -> Option<(Vec<PathBuf>, job::Registration)> {
+        let GuiProject::Opened(project) = &self.project else {
+            return None;
+        };
+        let record = project.fuse_state(id).ok()?;
+        let sources = record
+            .sources
+            .iter()
+            .map(|source| project.source_path(source))
+            .collect();
+        Some((sources, record.registration))
+    }
+
+    /// The nearest fused in-memory entry or saved checkpoint row `key`
+    /// descends from, following parents; `None` when the chain does not
+    /// resolve.
+    fn resolve_row(&self, key: &str) -> Option<RowBase> {
+        let Some(mut index) = checkpoints::held_index(key) else {
+            return Some(RowBase::Saved(key.to_string()));
+        };
+        loop {
+            let entry = self.held.get(index)?;
+            if fused_of(entry).is_some() {
+                return Some(RowBase::Held(index));
+            }
+            match entry.parent.as_ref()? {
+                job::ParentRef::Entry(parent) => index = *parent,
+                job::ParentRef::Saved(id) => return Some(RowBase::Saved(id.clone())),
+            }
+        }
+    }
+
+    /// The id list row `row` carries once a save wrote this tab's held
+    /// entries as `ids`: a held row's saved id, a saved row's own. `None`
+    /// for a held row the save did not write.
+    fn saved_row_key(
+        &self,
+        row: &str,
+        ids: &[String],
+        keep: Option<&job::ParentRef>,
+    ) -> Option<String> {
+        let Some(entry) = checkpoints::held_index(row) else {
+            return Some(row.to_string());
+        };
+        // `ids` holds one id per written entry.
+        let kept = job::kept_entries(&self.held, &self.pending_deletes, keep);
+        ids.get(kept[..entry].iter().filter(|written| **written).count())
+            .cloned()
+    }
+
+    /// Where a checkpoint taken from the current row is recorded: under the
+    /// row itself, a saved checkpoint or an in-memory entry. `None` with no
+    /// current row.
+    fn row_parent(&self) -> Option<job::ParentRef> {
+        let key = self.selected_checkpoint.as_deref()?;
+        Some(match checkpoints::held_index(key) {
+            Some(index) => job::ParentRef::Entry(index),
+            None => job::ParentRef::Saved(key.to_string()),
+        })
+    }
+
+    /// The key the selected row's planes are rendered and cached under: an
+    /// op-bearing in-memory row shows its nearest saved ancestor's planes,
+    /// every other row its own.
+    fn plane_key(&self) -> Option<String> {
+        let key = self.selected_checkpoint.as_deref()?;
+        let on_entry = checkpoints::held_index(key)
+            .and_then(|index| self.held.get(index))
+            .is_some_and(|entry| fused_of(entry).is_none());
+        match self.resolve_row(key) {
+            Some(RowBase::Saved(id)) if on_entry => Some(id),
+            _ => Some(key.to_string()),
+        }
+    }
+
+    /// Whether the selected row is an in-memory entry holding ops.
+    fn on_ops_row(&self) -> bool {
+        self.selected_checkpoint
+            .as_deref()
+            .and_then(checkpoints::held_index)
+            .and_then(|index| self.held.get(index))
+            .is_some_and(|entry| matches!(entry.kind, job::InMemoryKind::Ops { .. }))
+    }
+
+    /// Whether the edit session holds ops its origin does not.
+    fn live_modified(&self) -> bool {
+        self.edit
+            .as_ref()
+            .is_some_and(|edit| edit.session.op_count() > 0)
+    }
+
+    /// Removes the files of every fused in-memory entry a project save would
+    /// not write: deleted, not the current row and no written entry's parent.
+    fn free_unneeded_held(&self) {
+        let kept = job::kept_entries(
+            &self.held,
+            &self.pending_deletes,
+            self.row_parent().as_ref(),
+        );
+        for (entry, kept) in self.held.iter().zip(kept) {
+            if let (false, job::InMemoryKind::Fused(held)) = (kept, &entry.kind) {
+                remove_hold_dir_of(&held.composite);
+            }
+        }
+    }
+
+    /// Plane-cache directories kept per tab: the current row's and the last
+    /// three viewed.
+    const VIEWED_PLANES: usize = 4;
+
+    /// Records that saved checkpoint `id`'s planes sit in the plane cache and
+    /// removes the oldest viewed ones past [`Self::VIEWED_PLANES`].
+    fn note_viewed(&mut self, scratch_root: &Path, id: &str) {
+        self.viewed.retain(|viewed| viewed != id);
+        self.viewed.push(id.to_string());
+        while self.viewed.len() > Self::VIEWED_PLANES {
+            let oldest = self.viewed.remove(0);
+            self.remove_cached_planes(scratch_root, &oldest);
+        }
+    }
+
+    /// Removes saved checkpoint `id`'s cached planes unless they are the
+    /// current row's.
+    fn remove_cached_planes(&mut self, scratch_root: &Path, id: &str) {
+        if self.plane_key().as_deref() == Some(id) {
+            return;
+        }
+        self.viewed.retain(|viewed| viewed != id);
+        if let GuiProject::Opened(project) = &self.project {
+            let _ = std::fs::remove_dir_all(job::checkpoint_plane_dir(
+                scratch_root,
+                project.path(),
+                id,
+            ));
+        }
+    }
+
+    /// Whether a project save has anything to write: an in-memory
+    /// checkpoint, a pending delete or a modified live.
+    fn has_unsaved_write(&self) -> bool {
+        !self.held.is_empty() || !self.pending_deletes.is_empty() || self.live_modified()
     }
 
     /// Permutes `frames` and `excluded` together by `order` (each entry the
@@ -672,6 +1021,14 @@ pub enum ChromeKey {
     SaveProject,
 }
 
+/// The press a fuse question interrupted -- what its answers start again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FuseEntry {
+    Fuse,
+    Retry,
+    RunAgain,
+}
+
 /// The close question's copy -- [`AppController::pending_close`]'s and
 /// [`AppController::pending_quit_copy`]'s return type. A single-tab close
 /// and a whole-window quit share one dialog, so the wording each proposes
@@ -695,7 +1052,9 @@ pub struct CloseGuardCopy {
 struct ShellState {
     mode: ShellMode,
     dock_tab: DockTab,
-    checkpoints: Vec<CheckpointRow>,
+    checkpoints_scroll_y: f32,
+    checkpoints_viewport_height: f32,
+    checkpoints_scrollbar_drag: Option<f32>,
     maximized: bool,
     input: InputState,
     /// The editor toolbar's own brush state -- shared by every tab, so a
@@ -718,14 +1077,28 @@ struct ShellState {
     /// [`AppController::cancel_question`], which is what makes "asked once"
     /// a property of the state machine rather than of the dialog.
     pending: Option<(GroupingQuestion, Proposal)>,
+    /// A fingerprint mismatch raised by [`AppController::open_paths`],
+    /// blocking until [`AppController::open_anyway`] or
+    /// [`AppController::cancel_mismatch`] -- no tab exists for it while
+    /// this is `Some`.
+    pending_mismatch: Option<PendingOpen>,
     /// The skipped-subfolder notice from the most recent open, if any.
     notice: Option<String>,
     /// The most recent refusal's already-rendered message, if any.
     last_refusal: Option<String>,
+    /// The most recent refusal's own title, `Some` only for a project or
+    /// locate refusal -- `None` keeps the folder-empty dialog's fixed
+    /// "No frames here" title and `Pick another folder…` action.
+    refusal_title: Option<String>,
     /// Whether the "No frames here" refusal dialog is open -- raised by
     /// [`AppController::refuse_message`], cleared by
     /// [`AppController::dismiss_refusal`].
     refusal_open: bool,
+    /// A missing-sources notice: which tab it's about, its counted sentence
+    /// and file name -- set by [`AppController::accept`] when an opened
+    /// project's sources are missing and no mismatch was just accepted.
+    /// Cleared by [`AppController::close_sources_notice`].
+    sources_notice: Option<SourcesNotice>,
     /// The tab strip's scroll offset in pixels, always within
     /// [`clamp_tab_scroll`]'s range for the current tabs and viewport.
     tab_scroll_x: f32,
@@ -780,14 +1153,25 @@ struct ShellState {
     /// Whether the projects overlay is open.
     overlay_open: bool,
     /// The tab, by id, whose close waits on the "save first?" answer --
-    /// raised by [`AppController::request_close`] only when that tab holds
-    /// checkpoints no `.ffp` contains.
+    /// raised by [`AppController::request_close`] only when closing that tab
+    /// loses something ([`ProjectTab::loses_on_close`]).
     pending_close: Option<u64>,
     /// Whether a window quit waits on the "quit without saving?" answer --
-    /// raised by [`AppController::window_close`] only when some tab holds
-    /// checkpoints no `.ffp` contains. Mutually exclusive with
+    /// raised by [`AppController::window_close`] only when some tab would
+    /// lose work ([`ProjectTab::quit_loses_work`]). Mutually exclusive with
     /// `pending_close`: each is a no-op while the other question is open.
     pending_quit: bool,
+    /// The tab, by id, and the press a fuse waits on while the "save your
+    /// edits first?" answer is open -- raised only when that tab's live holds
+    /// ops.
+    pending_fuse: Option<(u64, FuseEntry)>,
+    /// The tab, by id, and the row key a click on a checkpoint waits to
+    /// restore while the "save this state first?" answer is open -- raised
+    /// only when that tab's live holds ops.
+    pending_restore: Option<(u64, String)>,
+    /// The tab, by id, and the row key whose delete waits on the quiet
+    /// "Delete this checkpoint?" answer.
+    pending_checkpoint_delete: Option<(u64, String)>,
     /// Every `Not a project` card -- a path with no open project behind it
     /// at all, cleared the moment that same path opens successfully. A
     /// failed, cancelled or sources-missing run instead lives on its own
@@ -807,7 +1191,9 @@ struct ShellState {
     /// successful open. `None` config dir (its own resolution failed) means
     /// entries are tracked in memory for the session but never persisted.
     recent: Vec<recent::RecentEntry>,
-    recent_config_dir: Option<PathBuf>,
+    /// The directory every table's save writes `settings.toml` into,
+    /// installed once at startup for every table alongside `[recent]`.
+    config_dir: Option<PathBuf>,
     /// The active tab's planes changed underneath the open renderer cell --
     /// a background run settling on it or a close renumbering the tabs --
     /// so the next [`AppController::canvas_feed`] reloads even though the
@@ -815,8 +1201,18 @@ struct ShellState {
     canvas_dirty: bool,
     /// The in-flight background load, if any.
     load: LoadSlot,
+    render: RenderSlot,
+    /// The open export modal, if any -- [`AppController::checkpoint_export_requested`].
+    export_dialog: Option<ExportDialog>,
+    /// The last confirmed export format and settings, which the next modal
+    /// opens on.
+    export_choice: ExportChoice,
+    /// The in-flight export write, if any.
+    export: ExportSlot,
     /// The in-flight additive import scan, if any.
     import: ImportSlot,
+    /// The in-flight `Locate frames…` verification, if any.
+    locate: LocateSlot,
     /// The `Composite` pane's rainbow overlay -- window-wide (see
     /// [`OverlayState`]).
     overlay: OverlayState,
@@ -878,6 +1274,23 @@ struct ImportScan {
     frames: Vec<PathBuf>,
     add: Vec<PathBuf>,
     replace: Vec<(usize, PathBuf)>,
+}
+
+/// One `Locate frames…` verification's own in-flight slot -- [`ImportSlot`]'s
+/// twin for [`AppController::locate_frames`]: every content hash it runs
+/// happens on this worker, never the event loop.
+#[derive(Default)]
+struct LocateSlot {
+    in_flight: bool,
+    outcome: Arc<Mutex<Option<LocateScan>>>,
+}
+
+/// [`AppController::locate_frames`]'s worker outcome: what it verified
+/// against, the folder it verified and what `entry::verify_folder` found.
+struct LocateScan {
+    target: entry::LocateTarget,
+    folder: PathBuf,
+    result: Result<Vec<PathBuf>, entry::LocateRefused>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -989,7 +1402,7 @@ fn dilate_rect(rect: job::Rect, margin: u32, width: u32, height: u32) -> job::Re
 /// The extent of `tab`'s newest composite/Z-Map -- its newest held
 /// checkpoint's, else its opened project's; `None` before any fuse.
 fn fused_image_size(tab: &ProjectTab) -> Option<ImageSize> {
-    match (tab.held.last(), &tab.project) {
+    match (tab.held.iter().rev().find_map(fused_of), &tab.project) {
         (Some(held), _) => Some(ImageSize {
             width: held.width,
             height: held.height,
@@ -1062,6 +1475,10 @@ pub struct AppController {
     /// The last id handed to a [`ProjectTab`] -- incremented before each
     /// use, so ids start at 1 and no two tabs ever share one.
     next_tab_id: u64,
+    /// The generation of the newest checkpoint creation on a tab in view.
+    checkpoint_generation: u64,
+    /// The newest generation [`Self::take_checkpoint_flash`] handed out.
+    checkpoint_flash_played: u64,
     /// Whether a fuse run may use the headless GPU backend at all -- `false`
     /// by default, so a headless test controller never probes an adapter;
     /// [`main`](crate) turns this on for the real window.
@@ -1213,7 +1630,7 @@ impl AppController {
         let tile_size = self
             .resident_tile_size_for_test
             .unwrap_or(job::RESIDENT_TILE_SIZE);
-        let Ok(edit) =
+        let Ok(mut edit) =
             job::open_edit_session(&zmap, &frames, registration, tile_size, job::host_budget())
         else {
             return false;
@@ -1221,6 +1638,28 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return false;
         };
+        if let Some(chain) = tab
+            .selected_checkpoint
+            .as_deref()
+            .and_then(checkpoints::held_index)
+            .and_then(|index| checkpoints::stroke_chain(&tab.held, index))
+        {
+            for op in chain {
+                match edit.session.append(op) {
+                    Ok(Some(region)) => {
+                        if let Err(err) = edit.recomposite(region) {
+                            tracing::error!(error = %err, "restored stroke recomposite failed");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::error!(error = %err, "restored stroke could not be applied");
+                        break;
+                    }
+                }
+            }
+            edit.session.rebase();
+        }
         tab.edit = Some(edit);
         true
     }
@@ -1278,6 +1717,12 @@ impl AppController {
         }
     }
 
+    /// Whether the overlay can be drawn: the active tab's selected row
+    /// resolves to a fuse. The bottom bar greys the controls otherwise.
+    pub fn overlay_available(&self) -> bool {
+        self.state.active().is_some_and(|tab| tab.fused().is_some())
+    }
+
     /// Turns the `Composite` pane's rainbow overlay on or off.
     pub fn set_overlay_on(&mut self, on: bool) {
         self.state.overlay.on = on;
@@ -1291,17 +1736,16 @@ impl AppController {
     }
 
     /// The `Composite` pane's overlay draw parameters, matching
-    /// `focusforge-cli retouch --overlay --opacity`'s own blend -- `None`
-    /// outside editor mode, with the overlay off, or before an edit session
-    /// has opened.
+    /// `focusforge-cli retouch --overlay --opacity`'s own blend, in either
+    /// mode -- `None` with the overlay off or when the active tab's selected
+    /// row has no fuse. The table spans that fuse's sources.
     pub fn overlay_draw(&self) -> Option<OverlayDraw> {
-        if self.mode() != ShellMode::Editor || !self.state.overlay.on {
+        if !self.state.overlay.on {
             return None;
         }
-        let tab = self.state.active()?;
-        tab.edit.as_ref()?;
+        let sources = self.state.active()?.fused()?.0.len();
         Some(OverlayDraw::for_opacity(
-            tab.frames.len() as u32,
+            sources as u32,
             self.state.overlay.opacity,
         ))
     }
@@ -1311,10 +1755,13 @@ impl AppController {
     /// `ModeChanged(Stacking)`, when the active tab no longer satisfies
     /// [`Self::editor_enabled`] or its session cannot open -- a switch away
     /// from a fused tab, that tab's own run starting or being promoted, or a
-    /// confirmed frame-set change.
+    /// confirmed frame-set change. A tab whose current row still renders
+    /// keeps editor mode; its session opens once the render settles.
     fn leave_editor_if_unfit(&mut self) {
         if self.state.mode == ShellMode::Editor
-            && !(self.editor_enabled() && self.ensure_edit_session())
+            && !(self.editor_enabled()
+                && (self.ensure_edit_session()
+                    || matches!(self.active_tab_planes(), TabPlanes::Pending)))
         {
             self.discard_live_stroke();
             self.state.mode = ShellMode::Stacking;
@@ -1334,14 +1781,168 @@ impl AppController {
         self.emit(ShellEvent::DockTabSelected(tab));
     }
 
-    /// Always empty -- the checkpoint panel's frame reads no storage.
-    pub fn checkpoints(&self) -> &[CheckpointRow] {
-        &self.state.checkpoints
+    /// Builds the whole `Checkpoints` panel for the active tab -- empty with
+    /// no tab active.
+    pub fn checkpoints_panel(&self) -> checkpoints::CheckpointsModel {
+        let today = checkpoints::today();
+        let viewport_height = self.state.checkpoints_viewport_height;
+        let Some(tab) = self.state.active() else {
+            return checkpoints::build_model(&[], &[], &[], today, None, 0.0);
+        };
+        let saved = match &tab.project {
+            GuiProject::Opened(project) => project.history().all(),
+            GuiProject::Unsaved(_) => Vec::new(),
+        };
+        let selected = tab.selected_checkpoint.as_deref();
+        let pending = &tab.pending_deletes;
+        let content_height =
+            checkpoints::build_model(&saved, &tab.held, pending, today, selected, 0.0)
+                .content_height;
+        let scroll_y = settings_panel::clamp_panel_scroll(
+            self.state.checkpoints_scroll_y,
+            content_height,
+            viewport_height,
+        );
+        let mut model =
+            checkpoints::build_model(&saved, &tab.held, pending, today, selected, scroll_y);
+        if let Some((key, generation)) = &tab.fresh_checkpoint {
+            for entry in &mut model.entries {
+                if entry.id.as_ref() == Some(key) {
+                    entry.fresh = Some(*generation);
+                }
+            }
+        }
+        model
     }
 
-    /// Always `false` -- the checkpoint panel's `Export` stays disabled.
+    /// Restores flat entry `index` of [`Self::checkpoints_panel`]: it becomes
+    /// the current row and live a copy of it. While live holds ops the restore
+    /// waits on [`Self::pending_restore_copy`]'s answer, the current row
+    /// included. A no-op on a separator, past the
+    /// end, while a dialog is open, and on the current row when live has no
+    /// ops (unless its planes were refused).
+    pub fn select_checkpoint_row(&mut self, index: usize) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(id) = self
+            .checkpoints_panel()
+            .entries
+            .get(index)
+            .and_then(|entry| entry.id.clone())
+        else {
+            return;
+        };
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        if checkpoints::held_index(&id).is_some_and(|index| {
+            !matches!(
+                tab.held.get(index).map(|entry| &entry.kind),
+                Some(job::InMemoryKind::Fused(_) | job::InMemoryKind::Ops { .. })
+            )
+        }) {
+            return;
+        }
+        if tab.live_modified() {
+            self.state.pending_restore = Some((tab.id, id));
+            self.emit(ShellEvent::ProjectsChanged);
+            return;
+        }
+        if tab.selected_checkpoint.as_deref() == Some(id.as_str())
+            && !matches!(tab.row_planes, Some(RowPlanes::Refused(_)))
+        {
+            return;
+        }
+        self.restore_row(id);
+    }
+
+    /// Makes row `key` of the active tab the current row, drops its session
+    /// and, in editor mode or on an op-bearing row, opens it over the row's
+    /// planes. The planes already known are kept when the row is unchanged.
+    fn restore_row(&mut self, key: String) {
+        let editing = self.state.mode == ShellMode::Editor;
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let unchanged = tab.selected_checkpoint.as_deref() == Some(key.as_str());
+        let dropped_session = tab.edit.take().is_some();
+        tab.selected_checkpoint = Some(key);
+        tab.free_unneeded_held();
+        let on_ops_row = tab.on_ops_row();
+        if !unchanged || matches!(tab.row_planes, Some(RowPlanes::Refused(_))) {
+            tab.row_planes = None;
+        }
+        self.state.canvas_dirty = true;
+        if editing || on_ops_row {
+            self.ensure_edit_session();
+        }
+        self.emit(ShellEvent::CheckpointsChanged);
+        if dropped_session {
+            self.emit(ShellEvent::EditorChanged);
+        }
+    }
+
+    /// Picks up a settled background checkpoint render: the current row's
+    /// planes or its refusal, dropped when the row changed while it ran.
+    /// Returns `false` while the render is still running -- the poll's cue
+    /// to keep going.
+    pub fn settle_checkpoint_render(&mut self) -> bool {
+        let Some(outcome) = self
+            .state
+            .render
+            .outcome
+            .lock()
+            .expect("no thread panicked while holding the render outcome")
+            .take()
+        else {
+            return self.state.render.in_flight.is_none();
+        };
+        let Some((tab_id, key)) = self.state.render.in_flight.take() else {
+            return true;
+        };
+        let scratch_root = self.scratch_root();
+        if let Some(tab) = self.state.projects.iter_mut().find(|tab| tab.id == tab_id)
+            && tab.plane_key().as_deref() == Some(key.as_str())
+            && matches!(tab.row_planes, Some(RowPlanes::Pending))
+        {
+            tab.row_planes = Some(match outcome {
+                Ok((composite, zmap)) => {
+                    tab.note_viewed(&scratch_root, &key);
+                    RowPlanes::Ready(composite, zmap)
+                }
+                Err(lines) => RowPlanes::Refused(lines),
+            });
+        }
+        self.state.canvas_dirty = true;
+        let on_ops_row = self.state.active().is_some_and(ProjectTab::on_ops_row);
+        if self.state.mode == ShellMode::Editor || on_ops_row {
+            self.ensure_edit_session();
+        }
+        true
+    }
+
+    /// Whether a checkpoint render started since the last call -- the
+    /// bridge's cue to start polling [`Self::settle_checkpoint_render`].
+    pub fn take_render_started(&mut self) -> bool {
+        std::mem::take(&mut self.state.render.started)
+    }
+
+    /// The right pane's refusal text for the active tab's current row, one
+    /// entry per line; empty while it shows, or is rendering, an image.
+    pub fn composite_message_lines(&self) -> Vec<String> {
+        match self.state.active().and_then(|tab| tab.row_planes.as_ref()) {
+            Some(RowPlanes::Refused(lines)) => lines.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether the active tab has a current position to export: a saved
+    /// row, a held row (including in a never-saved tab), or a tab with
+    /// unsealed edits over one -- exactly when its own `ProjectTab::fused`
+    /// resolves.
     pub fn export_enabled(&self) -> bool {
-        false
+        self.state.active().is_some_and(|tab| tab.fused().is_some())
     }
 
     /// The tab strip's pointer-down, forwarded from `window-drag-requested`.
@@ -1365,11 +1966,16 @@ impl AppController {
         self.emit(ShellEvent::WindowMaximizeToggled(self.state.maximized));
     }
 
-    /// Quits the window: with no tab holding a checkpoint or a parked run,
-    /// closes it at once. Otherwise raises [`Self::pending_quit_copy`] and
-    /// touches no tab. A no-op while a close question is open.
+    /// Quits the window: with no tab holding unsaved work or a parked run
+    /// waiting for Keep or Discard, closes it at once. Otherwise raises
+    /// [`Self::pending_quit_copy`] and touches no tab. A no-op while a close,
+    /// fuse or restore question is open.
     pub fn window_close(&mut self) {
-        if self.state.pending_close.is_some() {
+        if self.state.pending_close.is_some()
+            || self.state.pending_fuse.is_some()
+            || self.state.pending_restore.is_some()
+            || self.state.pending_checkpoint_delete.is_some()
+        {
             return;
         }
         if !self.state.projects.iter().any(ProjectTab::quit_loses_work) {
@@ -1380,10 +1986,334 @@ impl AppController {
         }
     }
 
-    /// Never reachable while [`Self::export_enabled`] is always `false`,
-    /// but declared so the seam exists to wire without moving anything.
-    pub fn checkpoint_export_requested(&self) {
+    /// Opens the export modal for the active tab's current position:
+    /// `tab.edit` with unsealed ops, else its selected held row, else its
+    /// selected saved row -- the same precedence row-selection locking
+    /// already relies on (`ProjectTab::edit` is cleared on any row
+    /// change). A no-op with nothing to export.
+    pub fn checkpoint_export_requested(&mut self) {
+        let Some(tab) = self.state.active() else {
+            return;
+        };
+        let Some(dialog) = export_dialog_for(tab, &self.state.export_choice) else {
+            return;
+        };
+        self.state.export_dialog = Some(dialog);
         self.emit(ShellEvent::CheckpointExportRequested);
+    }
+
+    /// Closes the export modal without writing anything -- its own Cancel.
+    pub fn cancel_export(&mut self) {
+        if self.state.export_dialog.take().is_some() {
+            self.emit(ShellEvent::CheckpointExportRequested);
+        }
+    }
+
+    /// Confirms the open export modal: asks `pick` for a destination (the
+    /// OS save dialog, `picker::pick_save_image`'s own pattern, mirroring
+    /// [`Self::save_active_project`]), then starts the write on a worker.
+    /// A no-op with no dialog open; the dialog stays exactly as it was when
+    /// `pick` returns `None` (the user cancelled the save dialog).
+    pub fn export_confirmed(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) {
+        let Some(dialog) = self.state.export_dialog.as_ref() else {
+            return;
+        };
+        if !matches!(dialog.stage, ExportStage::Ready) {
+            // Reached only for the writing state: its confirm button is
+            // dimmed but still clickable, so this closes the modal rather
+            // than starting a second write. The refused state's confirm is
+            // routed to `export_locate_frames` before this method is ever
+            // called.
+            self.cancel_export();
+            return;
+        }
+        let tab_id = dialog.tab_id;
+        let choice = dialog.choice.clone();
+        let Some(tab) = self.state.projects.iter().find(|t| t.id == tab_id) else {
+            self.state.export_dialog = None;
+            return;
+        };
+        let Some(source) = export_source_for(tab) else {
+            self.state.export_dialog = None;
+            return;
+        };
+        let proposed = export_proposed_path(tab, choice.format);
+        let Some(path) = pick(&proposed) else {
+            return;
+        };
+        let destination_name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        if let Some(dialog) = self.state.export_dialog.as_mut() {
+            dialog.stage = ExportStage::Writing;
+            dialog.destination_name = destination_name;
+            dialog.destination = Some(path.clone());
+        }
+        self.start_export(tab_id, source, path, &choice);
+        self.emit(ShellEvent::CheckpointExportRequested);
+    }
+
+    /// The refused export modal's own `Locate frames…`: verifies `folder`
+    /// against the exporting tab's recorded sources the same way the
+    /// missing-sources notice does ([`Self::locate_sources_notice`]), so
+    /// [`Self::settle_locate`] can re-attempt the export once they resolve.
+    /// `None` with no refused export dialog open, or while a previous
+    /// verification is still running.
+    pub fn export_locate_frames(&mut self, folder: PathBuf) -> Option<std::thread::JoinHandle<()>> {
+        let dialog = self.state.export_dialog.as_ref()?;
+        if !matches!(dialog.stage, ExportStage::Refused { locate: true, .. }) {
+            return None;
+        }
+        let tab_id = dialog.tab_id;
+        self.locate_frames(entry::LocateTarget::Tab(tab_id), folder)
+    }
+
+    /// Re-attempts a refused export at the same destination path once
+    /// `Locate frames…` ([`Self::export_locate_frames`]) has resolved
+    /// `tab_id`'s sources. Closes the modal instead if the tab, its current
+    /// position or the destination it started from is gone by the time this
+    /// runs.
+    fn retry_export(&mut self, tab_id: u64) {
+        let Some((destination, choice)) = self
+            .state
+            .export_dialog
+            .as_ref()
+            .and_then(|dialog| Some((dialog.destination.clone()?, dialog.choice.clone())))
+        else {
+            return;
+        };
+        let Some(tab) = self.state.projects.iter().find(|t| t.id == tab_id) else {
+            self.state.export_dialog = None;
+            return;
+        };
+        let Some(source) = export_source_for(tab) else {
+            self.state.export_dialog = None;
+            return;
+        };
+        if let Some(dialog) = self.state.export_dialog.as_mut() {
+            dialog.stage = ExportStage::Writing;
+        }
+        self.start_export(tab_id, source, destination, &choice);
+        self.emit(ShellEvent::CheckpointExportRequested);
+    }
+
+    /// Starts `source`'s export to `path` on a spawned worker, parking the
+    /// result for [`Self::settle_export`]. Always starts a fresh outcome
+    /// slot: a worker left running past its own dialog's Cancel keeps
+    /// writing, but a later export's `settle_export` reads only the slot its
+    /// own worker was handed, never a still-running one's stale result.
+    fn start_export(
+        &mut self,
+        tab_id: u64,
+        source: job::ExportSource,
+        path: PathBuf,
+        choice: &ExportChoice,
+    ) {
+        let (options, metadata) = (choice.options(), choice.metadata_options());
+        self.state.export.in_flight = Some(tab_id);
+        self.state.export.started = true;
+        self.state.export.outcome = Arc::new(Mutex::new(None));
+        let outcome = Arc::clone(&self.state.export.outcome);
+        std::thread::spawn(move || {
+            let result = job::export_outcome(std::panic::catch_unwind(|| {
+                job::export_position(source, &path, &options, &metadata)
+            }));
+            *outcome
+                .lock()
+                .expect("no thread panicked while holding the export outcome") = Some(result);
+        });
+    }
+
+    /// Picks up a settled export worker: closes the modal on success, or
+    /// moves it into its refused state with the cause. `false` while still
+    /// writing -- the poll's cue to keep going.
+    pub fn settle_export(&mut self) -> bool {
+        let Some(outcome) = self
+            .state
+            .export
+            .outcome
+            .lock()
+            .expect("no thread panicked while holding the export outcome")
+            .take()
+        else {
+            return self.state.export.in_flight.is_none();
+        };
+        self.state.export.in_flight = None;
+        match outcome {
+            Ok(()) => {
+                if let Some(dialog) = self.state.export_dialog.take() {
+                    self.remember_export_choice(dialog.choice);
+                }
+            }
+            Err(job::ExportRefusal { lines, locate }) => {
+                if let Some(dialog) = self.state.export_dialog.as_mut() {
+                    dialog.stage = ExportStage::Refused { lines, locate };
+                }
+            }
+        }
+        self.emit(ShellEvent::CheckpointExportRequested);
+        true
+    }
+
+    /// Whether an export write started since the last call -- the bridge's
+    /// cue to start polling [`Self::settle_export`].
+    pub fn take_export_started(&mut self) -> bool {
+        std::mem::take(&mut self.state.export.started)
+    }
+
+    /// Whether a refused export modal offers `Locate frames…`.
+    pub fn export_can_locate(&self) -> bool {
+        matches!(
+            self.state.export_dialog.as_ref().map(|d| &d.stage),
+            Some(ExportStage::Refused { locate: true, .. })
+        )
+    }
+
+    /// The open modal's format, TIFF while it is closed.
+    pub fn export_format(&self) -> ExportFormat {
+        self.state
+            .export_dialog
+            .as_ref()
+            .map_or_else(|| ExportChoice::default().format, |d| d.choice.format)
+    }
+
+    /// The open modal's settings section; `None` when it is closed.
+    pub fn export_view(&self) -> Option<ExportView> {
+        let dialog = self.state.export_dialog.as_ref()?;
+        Some(dialog.choice.view(dialog.open_menu.as_deref()))
+    }
+
+    /// Switches the ready modal to the format `label` names.
+    pub fn export_select_format(&mut self, label: &str) {
+        if let Some(dialog) = self.ready_export_dialog()
+            && let Some(format) = export_settings::FORMATS
+                .into_iter()
+                .find(|f| f.id().eq_ignore_ascii_case(label))
+        {
+            dialog.choice.format = format;
+            dialog.open_menu = None;
+        }
+    }
+
+    /// Opens the list of descriptor `id`, or closes it when already open.
+    pub fn export_toggle_menu(&mut self, id: &str) {
+        if let Some(dialog) = self.ready_export_dialog() {
+            let already = dialog.open_menu.as_deref() == Some(id);
+            dialog.open_menu = (!already).then(|| id.to_string());
+        }
+    }
+
+    /// Sets the enum descriptor `id` to its variant `variant_id`.
+    pub fn export_choose(&mut self, id: &str, variant_id: &str) {
+        self.set_export_value(id, ParamValue::Enum(variant_id.to_string()));
+    }
+
+    /// [`Self::export_choose`] for a control that names its variant by
+    /// label.
+    pub fn export_choose_label(&mut self, id: &str, label: &str) {
+        let variant = self.export_view().and_then(|view| {
+            let row = view.rows.into_iter().find(|r| r.id == id)?;
+            let at = row.choices.iter().position(|c| c == label)?;
+            row.choice_ids.get(at).cloned()
+        });
+        if let Some(variant) = variant {
+            self.export_choose(id, &variant);
+        }
+    }
+
+    /// Moves the JPEG quality slider to `fraction` of its range.
+    pub fn export_set_quality_fraction(&mut self, fraction: f32) {
+        let Some(desc) = params_for(ExportFormat::Jpeg)
+            .iter()
+            .find(|d| d.id == "jpeg-quality")
+        else {
+            return;
+        };
+        self.set_export_value("jpeg-quality", slider_value(fraction, &desc.kind));
+    }
+
+    /// Flips the `Metadata` switch.
+    pub fn export_toggle_metadata(&mut self) {
+        if let Some(dialog) = self.ready_export_dialog() {
+            dialog.choice.metadata = !dialog.choice.metadata;
+        }
+    }
+
+    fn ready_export_dialog(&mut self) -> Option<&mut ExportDialog> {
+        self.state
+            .export_dialog
+            .as_mut()
+            .filter(|d| matches!(d.stage, ExportStage::Ready))
+    }
+
+    /// Writes one descriptor value into the selected format's options
+    /// through core's validation; a value core refuses changes nothing.
+    fn set_export_value(&mut self, id: &str, value: ParamValue) {
+        let Some(dialog) = self.ready_export_dialog() else {
+            return;
+        };
+        let mut values = dialog.choice.options().values();
+        values.insert(id.to_string(), value);
+        if let Ok(options) = ExportOptions::from_values(dialog.choice.format, &values) {
+            dialog.choice.set_options(options);
+        }
+        dialog.open_menu = None;
+    }
+
+    /// Keeps `choice` for the next modal and saves it when a config
+    /// directory is installed; a failed save is logged, never an error.
+    fn remember_export_choice(&mut self, choice: ExportChoice) {
+        if let Some(dir) = &self.state.config_dir
+            && let Err(e) = export_settings::save(dir, &choice)
+        {
+            tracing::warn!(error = %e, "the export choice could not be saved");
+        }
+        self.state.export_choice = choice;
+    }
+
+    /// Installs the export choice loaded at startup.
+    pub fn install_export_choice(&mut self, choice: ExportChoice) {
+        self.state.export_choice = choice;
+    }
+
+    /// Whether the export modal is open.
+    pub fn export_open(&self) -> bool {
+        self.state.export_dialog.is_some()
+    }
+
+    /// The open export modal's own context and what lines, already
+    /// composed for its row -- `None` when it is closed.
+    pub fn export_copy(&self) -> Option<(&str, &str)> {
+        let dialog = self.state.export_dialog.as_ref()?;
+        Some((dialog.context.as_str(), dialog.what.as_str()))
+    }
+
+    /// The open export modal's own stage: `"ready"` / `"writing"` /
+    /// `"refused"` -- `"ready"` (the harmless default) when it is closed.
+    pub fn export_stage(&self) -> &'static str {
+        match self.state.export_dialog.as_ref().map(|d| &d.stage) {
+            Some(ExportStage::Ready) | None => "ready",
+            Some(ExportStage::Writing) => "writing",
+            Some(ExportStage::Refused { .. }) => "refused",
+        }
+    }
+
+    /// The chosen destination's own file name, named only while writing.
+    pub fn export_destination_name(&self) -> &str {
+        self.state
+            .export_dialog
+            .as_ref()
+            .map_or("", |d| d.destination_name.as_str())
+    }
+
+    /// The export modal's refusal text, one entry per line; empty unless
+    /// its last write refused.
+    pub fn export_refusal_lines(&self) -> &[String] {
+        match self.state.export_dialog.as_ref().map(|d| &d.stage) {
+            Some(ExportStage::Refused { lines, .. }) => lines,
+            _ => &[],
+        }
     }
 
     /// `"Composite"` / `"Z-Map"` -- the label's geometry is fixed
@@ -1423,18 +2353,10 @@ impl AppController {
         self.state.input.provenance = provenance;
     }
 
-    /// Records `event`'s action as unimplemented (by name, never silently)
-    /// when there is no implementation for it; an implemented one is
-    /// applied instead ([`Self::apply_action`]). Either way
-    /// [`ShellEvent::Input`] is raised -- nothing is both dropped and
-    /// unrecorded, and nothing stops being emitted.
+    /// Applies `event` ([`Self::apply_action`]) and raises
+    /// [`ShellEvent::Input`].
     fn emit_action(&mut self, event: ActionEvent) {
-        let action = event.action();
-        if action.implemented() {
-            self.apply_action(&event);
-        } else if !self.state.input.unimplemented.contains(&action) {
-            self.state.input.unimplemented.push(action);
-        }
+        self.apply_action(&event);
         self.emit(ShellEvent::Input(event));
     }
 
@@ -1601,7 +2523,7 @@ impl AppController {
         self.emit(ShellEvent::EditorChanged);
     }
 
-    /// `Alt + Wheel` in editor mode: one detent moves `Soft` by 5 points,
+    /// The `BrushSoftness` wheel action: one detent moves `Soft` by 5 points,
     /// clamped to `0..=100`.
     fn adjust_brush_softness(&mut self, steps: f32) {
         let detents = self.wheel_detents(Action::BrushSoftness, steps);
@@ -1625,6 +2547,7 @@ impl AppController {
             picking: self.state.brush.picking,
             can_undo: self.edit_session().is_some_and(job::EditSession::can_undo),
             can_redo: self.edit_session().is_some_and(job::EditSession::can_redo),
+            can_save_checkpoint: self.edit_session().is_some_and(|s| s.op_count() > 0),
         }
     }
 
@@ -1711,6 +2634,7 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
+        let was_unsaved = tab.unsaved();
         let Some(edit) = tab.edit.as_mut() else {
             return;
         };
@@ -1724,6 +2648,9 @@ impl AppController {
             && let Err(err) = edit.recomposite(region)
         {
             tracing::error!(error = %err, "undo/redo recomposite failed");
+        }
+        if tab.unsaved() != was_unsaved {
+            self.emit(ShellEvent::ProjectsChanged);
         }
         self.emit(ShellEvent::EditorChanged);
     }
@@ -1881,6 +2808,7 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
+        let was_unsaved = tab.unsaved();
         let Some(edit) = tab.edit.as_mut() else {
             return;
         };
@@ -1907,7 +2835,15 @@ impl AppController {
             .session
             .append(op)
             .expect("a live stroke's own points are pre-clamped to what validate accepts");
-        let Some(region) = region else { return };
+        // Only the stroke that lights the unsaved mark changes what the tab
+        // strip and the project card show.
+        let lit = !was_unsaved;
+        let Some(region) = region else {
+            if lit {
+                self.emit(ShellEvent::ProjectsChanged);
+            }
+            return;
+        };
         let map = edit.session.tile();
         if tick_rects.is_empty() {
             if let Err(err) = edit.recomposite(region) {
@@ -1921,6 +2857,9 @@ impl AppController {
                     tracing::error!(error = %err, "brush-stroke commit recomposite failed");
                 }
             }
+        }
+        if lit {
+            self.emit(ShellEvent::ProjectsChanged);
         }
         self.emit(ShellEvent::EditorChanged);
     }
@@ -2270,10 +3209,6 @@ impl AppController {
         }
     }
 
-    pub fn unimplemented_actions(&self) -> &[Action] {
-        &self.state.input.unimplemented
-    }
-
     pub fn open_settings(&mut self) -> bool {
         self.state.settings_open = true;
         true
@@ -2284,14 +3219,17 @@ impl AppController {
         false
     }
 
-    /// Whether one of the six dialogs that block the chrome accelerators is
-    /// open: Settings, the close/quit guard, the frame-set warning, the
-    /// Keep/Discard divergence dialog, the grouping question or the refusal
-    /// dialog.
+    /// Whether one of the dialogs that block the chrome accelerators is
+    /// open: Settings, the close/quit guard, the fuse and restore questions,
+    /// the frame-set warning, the Keep/Discard divergence dialog, the
+    /// grouping question or the refusal dialog.
     pub fn modal_open(&self) -> bool {
         self.state.settings_open
             || self.state.pending_close.is_some()
             || self.state.pending_quit
+            || self.state.pending_fuse.is_some()
+            || self.state.pending_restore.is_some()
+            || self.state.pending_checkpoint_delete.is_some()
             || self.state.pending_frame_change.is_some()
             || self.pending_divergence().is_some()
             || self.state.pending.is_some()
@@ -2354,7 +3292,9 @@ impl AppController {
             // ~5s synchronously.
             let thumbnails = match &mut outcome {
                 OpenOutcome::Opened(opened) => decode_thumbnails(&mut opened.projects),
-                OpenOutcome::Question(..) | OpenOutcome::Refused(_) => Vec::new(),
+                OpenOutcome::Question(..) | OpenOutcome::Mismatch(_) | OpenOutcome::Refused(_) => {
+                    Vec::new()
+                }
             };
             *outcome_slot
                 .lock()
@@ -2462,7 +3402,16 @@ impl AppController {
         self.state.last_refusal.as_deref()
     }
 
-    /// Closes the refusal dialog -- its own "Pick another folder…" button.
+    /// The active refusal's own title, `None` while the folder-empty
+    /// refusal is showing -- it keeps its own fixed "No frames here" title
+    /// and `Pick another folder…` action; every other refusal shows this
+    /// title with a `Close` button instead.
+    pub fn refusal_title(&self) -> Option<&str> {
+        self.state.refusal_title.as_deref()
+    }
+
+    /// Closes the refusal dialog -- its own "Pick another folder…" button,
+    /// or `Close` for every other refusal.
     pub fn dismiss_refusal(&mut self) {
         self.state.refusal_open = false;
     }
@@ -2486,8 +3435,86 @@ impl AppController {
                 self.emit(ShellEvent::QuestionRaised(question.clone()));
                 OpenOutcome::Question(question, proposal)
             }
+            OpenOutcome::Mismatch(pending_open) => {
+                let echo = Box::new(pending_open.echo());
+                self.state.pending_mismatch = Some(*pending_open);
+                self.emit(ShellEvent::MismatchRaised);
+                OpenOutcome::Mismatch(echo)
+            }
             OpenOutcome::Refused(err) => self.refuse(err),
         }
+    }
+
+    /// The pending fingerprint mismatch, if [`Self::open_paths`] raised one
+    /// -- what the mismatch dialog reads before the user chooses.
+    pub fn pending_mismatch(&self) -> Option<&PendingOpen> {
+        self.state.pending_mismatch.as_ref()
+    }
+
+    /// The pending mismatch's own copy, if one is raised: title, body and
+    /// file name -- what the mismatch dialog reads.
+    pub fn mismatch_copy(&self) -> Option<(&'static str, String, &str)> {
+        self.state.pending_mismatch.as_ref().map(|p| {
+            (
+                overlay::MISMATCH_TITLE,
+                overlay::mismatch_body(p.frame_count()),
+                p.file_name.as_str(),
+            )
+        })
+    }
+
+    /// `Open anyway`: accepts the pending mismatch and opens the project
+    /// unchanged, the same way a fresh open lands a tab. A no-op with
+    /// nothing pending.
+    pub fn open_anyway(&mut self) {
+        let Some(pending) = self.state.pending_mismatch.take() else {
+            return;
+        };
+        let project = pending.proceed();
+        self.accept(
+            Opened {
+                projects: vec![project],
+                skipped: Vec::new(),
+            },
+            Vec::new(),
+        );
+    }
+
+    /// Dismisses the mismatch dialog with no project opened: `PendingProject`
+    /// never proceeds without an explicit choice.
+    pub fn cancel_mismatch(&mut self) {
+        self.state.pending_mismatch = None;
+        self.emit(ShellEvent::OverlayChanged);
+    }
+
+    /// The pending missing-sources notice's own copy, if accepting an open
+    /// raised one: title, body and file name -- what the missing-sources
+    /// dialog reads.
+    pub fn sources_notice(&self) -> Option<(&'static str, String, &str)> {
+        self.state.sources_notice.as_ref().map(|n| {
+            (
+                overlay::SOURCES_MISSING_TITLE,
+                overlay::sources_missing_body(n.missing, n.total),
+                n.file_name.as_str(),
+            )
+        })
+    }
+
+    /// The missing-sources dialog's own `Close`: dismisses the notice; the
+    /// project stays open exactly as it is.
+    pub fn close_sources_notice(&mut self) {
+        self.state.sources_notice = None;
+        self.emit(ShellEvent::OverlayChanged);
+    }
+
+    /// `Locate frames…` on the missing-sources dialog itself, for the tab
+    /// [`Self::sources_notice`] names. A no-op with no notice pending.
+    pub fn locate_sources_notice(
+        &mut self,
+        folder: PathBuf,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        let tab_id = self.state.sources_notice.as_ref()?.tab_id;
+        self.locate_frames(entry::LocateTarget::Tab(tab_id), folder)
     }
 
     /// Places every opened project in a tab, selects the first of them, and
@@ -2516,14 +3543,17 @@ impl AppController {
                 self.record_recent(
                     entry::tab_title(&project),
                     recent_folder(&project),
-                    Some(project_identity_path(&project)),
+                    project_identity_path(&project),
                     opened_at,
                 );
-                let sources_missing = if let GuiProject::Opened(p) = &project {
-                    p.unresolved_sources().next().is_some()
+                let missing = if let GuiProject::Opened(p) = &project {
+                    let (missing, total) = entry::missing_sources(p);
+                    (missing > 0)
+                        .then(|| (missing, total, p.validation().accepted_mismatch.is_some()))
                 } else {
-                    false
+                    None
                 };
+                let file_name = entry::tab_title(&project);
                 let (source, meta) = match thumbnails.next() {
                     Some((decoded, meta)) => (ThumbnailSource::Decoded(decoded), Some(meta)),
                     None => (ThumbnailSource::NotAttempted, None),
@@ -2531,13 +3561,23 @@ impl AppController {
                 self.next_tab_id += 1;
                 let id = self.next_tab_id;
                 let mut tab = ProjectTab::new(project, id, source, meta);
-                if sources_missing {
+                if let Some((missing, total, accepted_mismatch)) = missing {
                     tab.failure = Some(TabFailure {
                         kind: FailureKind::SourcesMissing,
                         stage: "NOTHING TO SHOW".to_string(),
-                        reason: "The project points at frames that are not where it left them."
-                            .to_string(),
+                        reason: overlay::sources_missing_sentence(missing, total),
                     });
+                    // A project that just landed through `Open anyway` shows no
+                    // second modal for the same open -- its card still carries
+                    // the sentence.
+                    if !accepted_mismatch {
+                        self.state.sources_notice = Some(SourcesNotice {
+                            tab_id: id,
+                            missing,
+                            total,
+                            file_name,
+                        });
+                    }
                 }
                 self.state.projects.push(tab);
             }
@@ -2562,14 +3602,20 @@ impl AppController {
             _ => {}
         }
         self.refuse_message(message);
+        if matches!(&err, EntryError::ProjectRefused { .. }) {
+            self.state.refusal_title = Some("This project cannot be opened".to_string());
+        }
         OpenOutcome::Refused(err)
     }
 
     /// Refuses with an already-rendered message and no [`EntryError`] behind
     /// it -- what a re-fuse's own frame-reachability check uses, since
-    /// nothing there is an entry-path failure.
+    /// nothing there is an entry-path failure. Clears any earlier refusal's
+    /// own title, so a caller with one of its own sets it right after this
+    /// call; every other refusal keeps the folder-empty dialog's fixed copy.
     pub fn refuse_message(&mut self, message: String) {
         self.state.last_refusal = Some(message.clone());
+        self.state.refusal_title = None;
         self.state.refusal_open = true;
         self.emit(ShellEvent::EntryRefused(message));
     }
@@ -2672,12 +3718,17 @@ impl AppController {
         self.request_close_at(index, Instant::now());
     }
 
-    /// Asks to close tab `index` as of `now`: a tab holding checkpoints no
-    /// `.ffp` contains raises [`Self::pending_close`] and stays open; any
-    /// other tab closes at once. A no-op out of range, inside
-    /// [`Self::CLOSE_DEBOUNCE`], or while a quit question is open.
+    /// Asks to close tab `index` as of `now`: a tab with a modified live, an
+    /// in-memory checkpoint or a queued delete raises [`Self::pending_close`]
+    /// and stays open; any other tab closes at once. A no-op out of range,
+    /// inside [`Self::CLOSE_DEBOUNCE`], or while a quit, fuse or restore
+    /// question is open.
     pub fn request_close_at(&mut self, index: usize, now: Instant) {
-        if self.state.pending_quit {
+        if self.state.pending_quit
+            || self.state.pending_fuse.is_some()
+            || self.state.pending_restore.is_some()
+            || self.state.pending_checkpoint_delete.is_some()
+        {
             return;
         }
         let Some(tab) = self.state.projects.get(index) else {
@@ -2686,7 +3737,7 @@ impl AppController {
         if self.close_debounced(now) {
             return;
         }
-        if tab.held.is_empty() {
+        if !tab.loses_on_close() {
             self.remove_tab(index, now);
         } else {
             self.state.pending_close = Some(tab.id);
@@ -2708,11 +3759,34 @@ impl AppController {
         if self.state.pending_close == Some(closed.id) {
             self.state.pending_close = None;
         }
+        if self
+            .state
+            .pending_fuse
+            .is_some_and(|(id, _)| id == closed.id)
+        {
+            self.state.pending_fuse = None;
+        }
+        if self
+            .state
+            .pending_restore
+            .as_ref()
+            .is_some_and(|(id, _)| *id == closed.id)
+        {
+            self.state.pending_restore = None;
+        }
+        if self
+            .state
+            .pending_checkpoint_delete
+            .as_ref()
+            .is_some_and(|(id, _)| *id == closed.id)
+        {
+            self.state.pending_checkpoint_delete = None;
+        }
         if let GuiProject::Opened(project) = &closed.project {
             let _ =
                 std::fs::remove_dir_all(job::plane_cache_dir(&self.scratch_root(), project.path()));
         }
-        remove_held(&closed.held);
+        remove_in_memory(&closed.held);
         if let Some(parked) = &closed.parked {
             remove_held(std::slice::from_ref(&parked.held));
         }
@@ -2749,14 +3823,15 @@ impl AppController {
     // -- The projects overlay: its toggle, its gallery and the rail's
     // actions the overlay itself does not draw. --
 
-    /// Installs the `Recent` list loaded at startup and the directory it
-    /// persists to -- `main.rs`'s own read, mirroring
-    /// `install_input_table`; this crate's one exception to "no fs touch in
-    /// `controller.rs`" is [`recent::save`]/[`recent::load`] themselves,
-    /// which live in `crate::recent`, not here.
+    /// Installs the `Recent` list loaded at startup and the config
+    /// directory every table's save writes `settings.toml` into --
+    /// `main.rs`'s own read, mirroring `install_input_table`; this crate's
+    /// one exception to "no fs touch in `controller.rs`" is
+    /// [`recent::save`]/[`recent::load`] themselves, which live in
+    /// `crate::recent`, not here.
     pub fn install_recent(&mut self, entries: Vec<recent::RecentEntry>, config_dir: PathBuf) {
         self.state.recent = entries;
-        self.state.recent_config_dir = Some(config_dir);
+        self.state.config_dir = Some(config_dir);
     }
 
     /// The rail's own `Recent` rows, dates rendered against `now_unix` --
@@ -2775,19 +3850,27 @@ impl AppController {
 
     /// Records `name`/`folder`/`path` at the front of the `Recent` list and
     /// persists it, if a config directory resolved at startup. A write
-    /// failure is silent: the `Recent` list is a convenience, never a
-    /// reason to interrupt an open.
-    fn record_recent(
+    /// failure is logged but never a reason to interrupt an open: the
+    /// `Recent` list stays correct in memory for the rest of the session.
+    fn record_recent(&mut self, name: String, folder: PathBuf, path: PathBuf, opened_at: i64) {
+        recent::record(&mut self.state.recent, name, folder, path, opened_at);
+        if let Some(dir) = &self.state.config_dir
+            && let Err(e) = recent::save(dir, &self.state.recent)
+        {
+            tracing::warn!(error = %e, "the Recent list could not be saved");
+        }
+    }
+
+    /// Test-only wrapper to exercise a save failure without driving a
+    /// whole project open.
+    pub fn record_recent_for_test(
         &mut self,
         name: String,
         folder: PathBuf,
-        path: Option<PathBuf>,
+        path: PathBuf,
         opened_at: i64,
     ) {
-        recent::record(&mut self.state.recent, name, folder, path, opened_at);
-        if let Some(dir) = &self.state.recent_config_dir {
-            let _ = recent::save(dir, &self.state.recent);
-        }
+        self.record_recent(name, folder, path, opened_at);
     }
 
     /// Opens the `Recent` row at `index`: an already-open tab for that
@@ -2801,7 +3884,7 @@ impl AppController {
             return None;
         }
         let entry = self.state.recent.get(index)?;
-        let target = entry.path.clone().unwrap_or_else(|| entry.folder.clone());
+        let target = entry.path.clone();
         if let Some(tab_index) = self
             .state
             .projects
@@ -2963,7 +4046,11 @@ impl AppController {
                     0.0
                 },
                 project_name: tab.title.clone(),
-                meta_text: open_card_meta(frame_count, tab.checkpoints, phase_line.as_deref()),
+                meta_text: open_card_meta(
+                    frame_count,
+                    tab.listed_checkpoint_count(),
+                    phase_line.as_deref(),
+                ),
                 headline,
                 stage,
                 reason,
@@ -3044,8 +4131,16 @@ impl AppController {
     /// `Run again` on a `Did not stack`/`Cancelled` card: re-runs that tab's
     /// own kept request. Never more than one card's worth of work: a no-op
     /// while any run is already live, or with no matching failure, or with
-    /// no request kept for it. Returns whether a run started.
+    /// no request kept for it. A tab whose live holds ops raises
+    /// [`Self::pending_fuse_copy`] instead and returns `false`. Returns
+    /// whether a run started.
     pub fn run_gallery_action(&mut self, index: usize) -> bool {
+        self.run_gallery_action_at(index, false)
+    }
+
+    /// [`Self::run_gallery_action`]; `confirmed` skips the question about
+    /// unsaved ops.
+    fn run_gallery_action_at(&mut self, index: usize, confirmed: bool) -> bool {
         if self.any_job_running() {
             return false;
         }
@@ -3061,48 +4156,129 @@ impl AppController {
         let Some(request) = tab.request.clone() else {
             return false;
         };
+        if !confirmed && self.ask_before_fuse(index, FuseEntry::RunAgain) {
+            return false;
+        }
         self.state.active = Some(index);
         self.run_request(index, request);
         true
     }
 
-    /// `Locate frames…` on a `Sources missing` card: re-resolves that tab's
-    /// own frames against `folder` in memory only -- no write, and no touch
-    /// of the sealed `.ffp`'s own fingerprint. Clears the tab's failure only
-    /// once every source resolves; a folder missing some of them changes
-    /// nothing, silently.
-    pub fn locate_missing_sources(&mut self, index: usize, folder: PathBuf) {
-        let Some(tab) = self.state.projects.get(index) else {
-            return;
-        };
-        let sources_missing =
-            matches!(&tab.failure, Some(f) if f.kind == FailureKind::SourcesMissing);
-        let GuiProject::Opened(project) = &tab.project else {
-            return;
-        };
-        if !sources_missing {
-            return;
+    /// Verifies `folder` against `target`'s recorded sources by content
+    /// hash, off the event loop (a reference-scale stack is tens of
+    /// gigabytes). [`Self::settle_locate`] applies a verified folder or
+    /// raises the refusal dialog for a refused one. `None` with nothing to
+    /// verify against, or while a previous verification is still running.
+    pub fn locate_frames(
+        &mut self,
+        target: entry::LocateTarget,
+        folder: PathBuf,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        if self.state.locate.in_flight {
+            return None;
         }
-        let candidates: Vec<PathBuf> = project
-            .manifest()
-            .sources
-            .iter()
-            .map(|source| {
-                let name = Path::new(&source.path)
-                    .file_name()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(&source.path));
-                folder.join(name)
-            })
-            .collect();
-        if candidates.iter().all(|p| p.is_file()) {
-            let tab = &mut self.state.projects[index];
-            tab.meta.extend(images::read_metadata(&candidates));
-            tab.excluded = vec![false; candidates.len()];
-            tab.frames = candidates;
-            tab.selected = images::first_included(&tab.excluded);
-            tab.failure = None;
-            self.emit(ShellEvent::OverlayChanged);
+        let sources = match target {
+            entry::LocateTarget::Mismatch => self.state.pending_mismatch.as_ref()?.sources.clone(),
+            entry::LocateTarget::Tab(id) => {
+                let index = self.tab_index(id)?;
+                let tab = &self.state.projects[index];
+                let GuiProject::Opened(project) = &tab.project else {
+                    return None;
+                };
+                project.manifest().sources.clone()
+            }
+        };
+        self.state.locate.in_flight = true;
+        let sink = self.sink.clone();
+        let outcome_slot = Arc::clone(&self.state.locate.outcome);
+        Some(std::thread::spawn(move || {
+            let result = entry::verify_folder(&sources, &folder);
+            *outcome_slot
+                .lock()
+                .expect("no thread panicked while holding the locate outcome") = Some(LocateScan {
+                target,
+                folder,
+                result,
+            });
+            if let Some(sink) = &sink {
+                sink(ShellEvent::LocateReady);
+            }
+        }))
+    }
+
+    /// Whether a background `Locate frames…` verification is still running.
+    pub fn locate_in_flight(&self) -> bool {
+        self.state.locate.in_flight
+    }
+
+    /// Picks up the parked outcome of a settled [`Self::locate_frames`] and
+    /// applies it: a verified folder relocates the target's frames and
+    /// clears its failure and notice; a refused one raises the refusal
+    /// dialog, leaving the card, frames and pending mismatch untouched.
+    pub fn settle_locate(&mut self) {
+        let Some(scan) = self
+            .state
+            .locate
+            .outcome
+            .lock()
+            .expect("no thread panicked while holding the locate outcome")
+            .take()
+        else {
+            return;
+        };
+        self.state.locate.in_flight = false;
+        match scan.result {
+            Ok(paths) => match scan.target {
+                entry::LocateTarget::Mismatch => {
+                    if let Some(pending) = self.state.pending_mismatch.take() {
+                        match entry::reopen_relocated(&pending.path, scan.folder) {
+                            Some(project) => {
+                                self.accept(
+                                    Opened {
+                                        projects: vec![project],
+                                        skipped: Vec::new(),
+                                    },
+                                    Vec::new(),
+                                );
+                            }
+                            None => {
+                                self.refuse_message(format!(
+                                    "{} could not be reopened after its frames were located.",
+                                    pending.file_name
+                                ));
+                                self.state.refusal_title =
+                                    Some("This project cannot be opened".to_string());
+                            }
+                        }
+                    }
+                }
+                entry::LocateTarget::Tab(id) => {
+                    if let Some(index) = self.tab_index(id)
+                        && let Some(tab) = self.state.projects.get_mut(index)
+                    {
+                        if let GuiProject::Opened(project) = &mut tab.project {
+                            project.relocate_sources(scan.folder);
+                        }
+                        tab.meta.extend(images::read_metadata(&paths));
+                        tab.excluded = vec![false; paths.len()];
+                        tab.frames = paths;
+                        tab.selected = images::first_included(&tab.excluded);
+                        tab.failure = None;
+                        if matches!(&self.state.sources_notice, Some(n) if n.tab_id == id) {
+                            self.state.sources_notice = None;
+                        }
+                        self.emit(ShellEvent::OverlayChanged);
+                    }
+                    if matches!(&self.state.export_dialog, Some(d) if d.tab_id == id && matches!(d.stage, ExportStage::Refused { .. }))
+                    {
+                        self.retry_export(id);
+                    }
+                }
+            },
+            Err(refused) => {
+                self.refuse_message(refused.message());
+                self.state.refusal_title = Some("These are not the project's frames".to_string());
+            }
         }
     }
 
@@ -3952,47 +5128,141 @@ impl AppController {
         ))
     }
 
-    /// The close question still open, if any: which tab, how many
-    /// checkpoints closing it loses, and where saving it would write.
+    /// The close question still open, if any: which tab, what closing it
+    /// loses -- strokes in live, in-memory checkpoints, queued deletes -- and
+    /// where saving it would write.
     pub fn pending_close(&self) -> Option<CloseGuardCopy> {
         let id = self.state.pending_close?;
         let tab = self.state.projects.iter().find(|tab| tab.id == id)?;
-        let n = tab.held.len();
-        let (body, them) = if n == 1 {
-            (
-                "1 checkpoint has been fused since the last save. It belongs to no saved \
-                 project.\n\nClosing without saving loses it."
-                    .to_string(),
-                "it",
-            )
+        let (listed, deletes) = tab.unsaved_parts();
+        let ops: Vec<&job::Op> = tab
+            .edit
+            .as_ref()
+            .map(|edit| edit.session.ops().collect())
+            .unwrap_or_default();
+        let mut parts = Vec::new();
+        if !ops.is_empty() {
+            parts.push(unsaved_ops(ops.iter().copied()));
+        }
+        if listed > 0 {
+            parts.push(format!(
+                "{listed} unsaved checkpoint{}",
+                if listed == 1 { "" } else { "s" }
+            ));
+        }
+        if deletes > 0 {
+            parts.push(format!(
+                "{deletes} checkpoint{} to delete",
+                if deletes == 1 { "" } else { "s" }
+            ));
+        }
+        let them = if ops.len() + listed == 1 {
+            "it"
         } else {
-            (
-                format!(
-                    "{n} checkpoints have been fused since the last save. They belong to no \
-                     saved project.\n\nClosing without saving loses them."
-                ),
-                "them",
-            )
+            "them"
         };
         let info = match &tab.project {
             GuiProject::Unsaved(_) => "Saving asks where to write the project file.".to_string(),
-            GuiProject::Opened(project) => format!(
-                "Saving adds {them} to {}.",
-                project
+            GuiProject::Opened(project) => {
+                let file = project
                     .path()
                     .file_name()
                     .unwrap_or(project.path().as_os_str())
-                    .to_string_lossy()
-            ),
+                    .to_string_lossy();
+                if deletes > 0 {
+                    format!("Saving writes these changes to {file}.")
+                } else {
+                    format!("Saving adds {them} to {file}.")
+                }
+            }
         };
         Some(CloseGuardCopy {
             title: "Save this state first?".to_string(),
             context: format!("Closing {}", tab.title),
-            body,
+            body: format!("{}.", parts.join(", ")),
             info,
             secondary_label: "Save and close".to_string(),
-            confirm_label: "Close without saving".to_string(),
+            confirm_label: "Close anyway".to_string(),
         })
+    }
+
+    /// The fuse question still open, if any: the ops a fuse would lose and
+    /// what each answer does.
+    pub fn pending_fuse_copy(&self) -> Option<CloseGuardCopy> {
+        let (id, _) = self.state.pending_fuse?;
+        let tab = self.state.projects.iter().find(|tab| tab.id == id)?;
+        let ops: Vec<&job::Op> = tab.edit.as_ref()?.session.ops().collect();
+        Some(CloseGuardCopy {
+            title: "Save your edits first?".to_string(),
+            context: format!("Fusing {}", tab.title),
+            body: format!("{} will be lost.", unsaved_ops(ops)),
+            info: String::new(),
+            secondary_label: "Save and fuse".to_string(),
+            confirm_label: "Fuse anyway".to_string(),
+        })
+    }
+
+    /// Clears the fuse question, returning its tab's index -- `None` when the
+    /// tab is gone -- and the press it interrupted.
+    fn take_pending_fuse(&mut self) -> Option<(Option<usize>, FuseEntry)> {
+        let (id, entry) = self.state.pending_fuse.take()?;
+        self.emit(ShellEvent::ProjectsChanged);
+        let index = self.state.projects.iter().position(|tab| tab.id == id);
+        Some((index, entry))
+    }
+
+    /// Repeats `entry` on tab `index` without asking again. Returns whether
+    /// a run started or was enqueued.
+    fn resume_fuse(&mut self, index: usize, entry: FuseEntry) -> bool {
+        match entry {
+            FuseEntry::Fuse => self.start_fuse_at(index, true),
+            FuseEntry::Retry => self.retry_fuse_at(index, true),
+            FuseEntry::RunAgain => self.run_gallery_action_at(index, true),
+        }
+    }
+
+    /// The restore question still open, if any: the ops it would drop, the
+    /// row it would restore and what each answer does.
+    pub fn pending_restore_copy(&self) -> Option<CloseGuardCopy> {
+        let (id, key) = self.state.pending_restore.as_ref()?;
+        let tab = self.state.active().filter(|tab| tab.id == *id)?;
+        let ops: Vec<&job::Op> = tab.edit.as_ref()?.session.ops().collect();
+        let panel = self.checkpoints_panel();
+        let target = panel
+            .entries
+            .iter()
+            .find(|entry| entry.id.as_deref() == Some(key.as_str()))?;
+        let (happened, belongs, them) = if ops.len() == 1 {
+            ("has", "It belongs", "it")
+        } else {
+            ("have", "They belong", "them")
+        };
+        Some(CloseGuardCopy {
+            title: "Save this state first?".to_string(),
+            context: format!("Restoring {} · {}", target.algorithm, target.time_text),
+            body: format!(
+                "{} {happened} happened since the last checkpoint. {belongs} to no saved \
+                 state.\n\nSave {them} as a checkpoint first, then restore — or restore \
+                 and discard your changes, which loses {them}.",
+                checkpoints::op_summary(ops)
+            ),
+            info: "A saved state lands at the top of the list, like any other.".to_string(),
+            secondary_label: "Save first, then restore".to_string(),
+            confirm_label: "Discard and restore".to_string(),
+        })
+    }
+
+    /// Clears the restore question, returning the index of its tab -- `None`
+    /// when that tab is no longer the active one, so no answer restores
+    /// anything -- and its row key.
+    fn take_pending_restore(&mut self) -> Option<(Option<usize>, String)> {
+        let (id, key) = self.state.pending_restore.take()?;
+        self.emit(ShellEvent::ProjectsChanged);
+        let index = self
+            .state
+            .active
+            .filter(|&i| self.state.projects.get(i).is_some_and(|tab| tab.id == id));
+        Some((index, key))
     }
 
     /// The pending close's tab index, clearing the question either way.
@@ -4032,8 +5302,9 @@ impl AppController {
         true
     }
 
-    /// The quit question still open, if any: how many tabs hold checkpoints
-    /// no `.ffp` contains or a parked run nobody decided on.
+    /// The quit question still open, if any: how many tabs hold unsaved work
+    /// -- a modified live, an in-memory checkpoint, a queued delete -- or a
+    /// parked run nobody decided on.
     pub fn pending_quit_copy(&self) -> Option<CloseGuardCopy> {
         if !self.state.pending_quit {
             return None;
@@ -4074,8 +5345,8 @@ impl AppController {
         self.emit(ShellEvent::WindowCloseRequested);
     }
 
-    /// `Save all and quit`: saves every tab holding checkpoints no `.ffp`
-    /// contains, in order, as `save_project_at` does. The first save
+    /// `Save all and quit`: saves every tab that would lose work on close, in
+    /// order, as `save_project_at` does. The first save
     /// that does not write stops the loop and cancels the quit -- whatever
     /// already saved stays saved. Returns whether every save wrote.
     pub fn save_all_and_quit(&mut self, pick: impl Fn(&Path) -> Option<PathBuf>) -> bool {
@@ -4084,7 +5355,7 @@ impl AppController {
             .projects
             .iter()
             .enumerate()
-            .filter(|(_, tab)| !tab.held.is_empty())
+            .filter(|(_, tab)| tab.loses_on_close())
             .map(|(index, _)| index)
             .collect();
         for index in indices {
@@ -4100,11 +5371,15 @@ impl AppController {
         true
     }
 
-    /// The close guard's `Cancel`, whichever question is open -- a close
-    /// question if one is pending, otherwise a quit question. A no-op with
-    /// neither open.
+    /// The close guard's `Cancel`, whichever question is open -- the fuse or
+    /// restore question, a close question, otherwise a quit question. A no-op
+    /// with none open.
     pub fn close_guard_cancelled(&mut self) {
-        if self.state.pending_close.is_some() {
+        if self.state.pending_fuse.is_some() {
+            self.take_pending_fuse();
+        } else if self.state.pending_restore.is_some() {
+            self.take_pending_restore();
+        } else if self.state.pending_close.is_some() {
             self.cancel_close();
         } else if self.state.pending_quit {
             self.cancel_quit();
@@ -4112,13 +5387,27 @@ impl AppController {
     }
 
     /// The close guard's secondary answer, whichever question is open --
-    /// [`Self::save_and_close`] for a close question, [`Self::save_all_and_quit`]
-    /// for a quit question. `false` with neither open.
+    /// [`Self::snapshot_live`] then the interrupted fuse for the fuse
+    /// question, [`Self::save_and_close`] for a close question,
+    /// [`Self::save_all_and_quit`] for a quit question. `false` with none
+    /// open, and for a fuse question when no run started or was queued.
     pub fn close_guard_secondary_pressed(
         &mut self,
         pick: impl Fn(&Path) -> Option<PathBuf>,
     ) -> bool {
-        if self.state.pending_close.is_some() {
+        if let Some((index, entry)) = self.take_pending_fuse() {
+            match index {
+                Some(index) if self.snapshot_live(index) => self.resume_fuse(index, entry),
+                _ => false,
+            }
+        } else if let Some((tab, key)) = self.take_pending_restore() {
+            if let Some(index) = tab
+                && self.snapshot_live(index)
+            {
+                self.restore_row(key);
+            }
+            false
+        } else if self.state.pending_close.is_some() {
             self.save_and_close(pick)
         } else if self.state.pending_quit {
             self.save_all_and_quit(pick)
@@ -4128,11 +5417,20 @@ impl AppController {
     }
 
     /// The close guard's destructive answer, whichever question is open --
+    /// the interrupted fuse for the fuse question,
     /// [`Self::close_without_saving`] for a close question,
-    /// [`Self::quit_without_saving`] for a quit question. A no-op with
-    /// neither open.
+    /// [`Self::quit_without_saving`] for a quit question. A no-op with none
+    /// open.
     pub fn close_guard_confirmed(&mut self) {
-        if self.state.pending_close.is_some() {
+        if let Some((index, entry)) = self.take_pending_fuse() {
+            if let Some(index) = index {
+                self.resume_fuse(index, entry);
+            }
+        } else if let Some((tab, key)) = self.take_pending_restore() {
+            if tab.is_some() {
+                self.restore_row(key);
+            }
+        } else if self.state.pending_close.is_some() {
             self.close_without_saving();
         } else if self.state.pending_quit {
             self.quit_without_saving();
@@ -4333,11 +5631,101 @@ impl AppController {
         )
     }
 
+    /// Scrolls the `Checkpoints` list by `delta_px`, clamped to its current
+    /// content/viewport -- the Images list's own scroll handler's twin.
+    pub fn scroll_checkpoints_panel(&mut self, delta_px: f32) {
+        self.set_checkpoints_scroll(self.state.checkpoints_scroll_y + delta_px);
+    }
+
+    /// [`Self::set_images_scroll`]'s twin.
+    fn set_checkpoints_scroll(&mut self, offset_px: f32) {
+        let content_height = self.checkpoints_panel().content_height;
+        let viewport_height = self.state.checkpoints_viewport_height;
+        let offset = settings_panel::clamp_panel_scroll(offset_px, content_height, viewport_height);
+        if offset != self.state.checkpoints_scroll_y {
+            self.state.checkpoints_scroll_y = offset;
+            self.emit(ShellEvent::CheckpointsChanged);
+        }
+    }
+
+    /// The `Checkpoints` panel scrollbar thumb's current `(top, height)` in
+    /// track-pixel space -- [`Self::images_scrollbar_thumb`]'s twin.
+    fn checkpoints_scrollbar_thumb(&self) -> (f32, f32) {
+        let content_height = self.checkpoints_panel().content_height;
+        let viewport_height = self.state.checkpoints_viewport_height;
+        if content_height <= 0.0 {
+            return (0.0, viewport_height);
+        }
+        let height = (viewport_height * viewport_height / content_height).max(16.0);
+        let top = self.state.checkpoints_scroll_y * viewport_height / content_height;
+        (top, height)
+    }
+
+    /// A press on the `Checkpoints` scrollbar -- [`Self::images_scrollbar_pointer`]'s
+    /// twin.
+    pub fn checkpoints_scrollbar_pointer(&mut self, kind: PointerKind, mouse_y: f32) {
+        match kind {
+            PointerKind::Down => {
+                let (thumb_top, thumb_height) = self.checkpoints_scrollbar_thumb();
+                if mouse_y >= thumb_top && mouse_y < thumb_top + thumb_height {
+                    self.state.checkpoints_scrollbar_drag = Some(mouse_y - thumb_top);
+                } else {
+                    let viewport_height = self.state.checkpoints_viewport_height.max(1.0);
+                    let content_height = self.checkpoints_panel().content_height;
+                    let target_top = mouse_y - thumb_height / 2.0;
+                    self.set_checkpoints_scroll(target_top * content_height / viewport_height);
+                    self.state.checkpoints_scrollbar_drag = Some(thumb_height / 2.0);
+                }
+            }
+            PointerKind::Up => self.state.checkpoints_scrollbar_drag = None,
+            PointerKind::Move => {}
+        }
+    }
+
+    /// The live `Checkpoints` scrollbar drag, if any -- [`Self::images_scrollbar_dragged`]'s
+    /// twin.
+    pub fn checkpoints_scrollbar_dragged(&mut self, mouse_y: f32) {
+        let Some(grab_offset) = self.state.checkpoints_scrollbar_drag else {
+            return;
+        };
+        let viewport_height = self.state.checkpoints_viewport_height.max(1.0);
+        let content_height = self.checkpoints_panel().content_height;
+        let target_top = mouse_y - grab_offset;
+        self.set_checkpoints_scroll(target_top * content_height / viewport_height);
+    }
+
+    /// The `Checkpoints` panel viewport's measured height -- pushed on
+    /// install and on every resize; re-clamps the scroll offset --
+    /// [`Self::set_images_viewport_height`]'s twin.
+    pub fn set_checkpoints_viewport_height(&mut self, height: f32) {
+        self.state.checkpoints_viewport_height = height.max(0.0);
+        let content_height = self.checkpoints_panel().content_height;
+        self.state.checkpoints_scroll_y = settings_panel::clamp_panel_scroll(
+            self.state.checkpoints_scroll_y,
+            content_height,
+            self.state.checkpoints_viewport_height,
+        );
+        self.emit(ShellEvent::CheckpointsChanged);
+    }
+
+    /// [`Self::images_scroll_y`]'s twin.
+    pub fn checkpoints_scroll_y(&self) -> f32 {
+        self.state.checkpoints_scroll_y
+    }
+
     /// The current index of the tab carrying id `id`, if it is still open --
     /// what lets the live-run slot and the queue outlive a close that shifts
     /// every later index down.
     fn tab_index(&self, id: u64) -> Option<usize> {
         self.state.projects.iter().position(|tab| tab.id == id)
+    }
+
+    /// The id of the tab currently at tab-strip index `index`, if any --
+    /// resolved once, before starting a `Locate frames…` verification whose
+    /// own worker thread must survive a later close or reorder shifting
+    /// that index.
+    pub fn tab_id_at(&self, index: usize) -> Option<u64> {
+        self.state.projects.get(index).map(|tab| tab.id)
     }
 
     /// The tab a worker thread is actually running against, if any --
@@ -4412,18 +5800,11 @@ impl AppController {
     fn fuse_request_for(&self, index: usize) -> Option<job::JobRequest> {
         let tab = self.state.projects.get(index)?;
         let frames = tab.included_frames();
-        let project_path = match &tab.project {
-            GuiProject::Unsaved(group) => group.dir.join(format!("{}.ffp", group.name)),
-            GuiProject::Opened(project) => project.path().to_path_buf(),
-        };
-        let staging_key = format!("{}-{:x}", tab.title, path_digest(&project_path));
         let scratch_root = self.scratch_root();
+        let (staging_key, hold_dir) = hold_dir_for(tab, &scratch_root);
         Some(job::JobRequest {
             frames,
-            hold_dir: scratch_root
-                .join("held")
-                .join(&staging_key)
-                .join(tab.checkpoints.to_string()),
+            hold_dir,
             scratch_root,
             staging_key,
             fuse_id: tab.fuse_id.clone(),
@@ -4467,6 +5848,29 @@ impl AppController {
         self.emit(ShellEvent::ImagesChanged);
     }
 
+    /// Whether tab `id` holds the live run or a place in the queue.
+    fn holds_run_slot(&self, id: u64) -> bool {
+        self.any_job_running() && (self.job.tab_id == Some(id) || self.job.queue.contains(&id))
+    }
+
+    /// Raises the fuse question when a press of `entry` on tab `index` would
+    /// start or queue a run over a modified live. `true` when the press is
+    /// handled -- asked, or swallowed while another question is open -- and
+    /// nothing may start.
+    fn ask_before_fuse(&mut self, index: usize, entry: FuseEntry) -> bool {
+        let Some(tab) = self.state.projects.get(index) else {
+            return false;
+        };
+        if !tab.live_modified() || self.holds_run_slot(tab.id) {
+            return false;
+        }
+        if !self.modal_open() {
+            self.state.pending_fuse = Some((tab.id, entry));
+            self.emit(ShellEvent::ProjectsChanged);
+        }
+        true
+    }
+
     /// If another run is live, enqueues tab `id` unless it already holds
     /// the live run or a queue slot -- the shared tail of [`Self::start_fuse`]
     /// and [`Self::retry_fuse`]. `None` when no run is live, so the caller
@@ -4475,7 +5879,7 @@ impl AppController {
         if !self.any_job_running() {
             return None;
         }
-        if self.job.tab_id == Some(id) || self.job.queue.contains(&id) {
+        if self.holds_run_slot(id) {
             return Some(false);
         }
         self.job.queue.push_back(id);
@@ -4490,29 +5894,41 @@ impl AppController {
     /// missing, checked before anything else so an invalid tab is never
     /// queued. A completed run adds a held checkpoint to the tab and writes
     /// no project. While another run is live, a valid press enqueues
-    /// the tab instead. Returns whether a run started or was enqueued.
+    /// the tab instead. A tab whose live holds ops raises
+    /// [`Self::pending_fuse_copy`] instead and returns `false`; its answers
+    /// start the run. Returns whether a run started or was enqueued.
     pub fn start_fuse(&mut self) -> bool {
-        let Some(active) = self.state.active else {
-            return false;
-        };
-        let Some(tab) = self.state.active() else {
+        match self.state.active {
+            Some(active) => self.start_fuse_at(active, false),
+            None => false,
+        }
+    }
+
+    /// [`Self::start_fuse`] on tab `index`; `confirmed` skips the question
+    /// about unsaved ops.
+    fn start_fuse_at(&mut self, index: usize, confirmed: bool) -> bool {
+        let Some(tab) = self.state.projects.get(index) else {
             return false;
         };
         if !tab.errors.is_empty() {
             return false;
         }
+        let id = tab.id;
         let frames = tab.included_frames();
         if let Some(missing) = frames.iter().find(|path| !path.is_file()) {
             self.refuse_missing_frame(missing);
             return false;
         }
-        if let Some(enqueued) = self.try_enqueue(tab.id) {
+        if !confirmed && self.ask_before_fuse(index, FuseEntry::Fuse) {
+            return false;
+        }
+        if let Some(enqueued) = self.try_enqueue(id) {
             return enqueued;
         }
-        let Some(request) = self.fuse_request_for(active) else {
+        let Some(request) = self.fuse_request_for(index) else {
             return false;
         };
-        self.run_request(active, request)
+        self.run_request(index, request)
     }
 
     /// Pauses a running job, or resumes a paused one -- a no-op while the
@@ -4587,22 +6003,32 @@ impl AppController {
     /// no notion of retry. Enqueues behind another live run rather than
     /// refusing, same as [`Self::start_fuse`]; the stored request is reused
     /// unchanged, since a failed run's own request was valid enough to have
-    /// started once.
+    /// started once. A tab whose live holds ops raises
+    /// [`Self::pending_fuse_copy`] instead and returns `false`.
     pub fn retry_fuse(&mut self) -> bool {
-        let Some(active) = self.state.active else {
-            return false;
-        };
-        let Some(tab) = self.state.projects.get(active) else {
+        match self.state.active {
+            Some(active) => self.retry_fuse_at(active, false),
+            None => false,
+        }
+    }
+
+    /// [`Self::retry_fuse`] on tab `index`; `confirmed` skips the question
+    /// about unsaved ops.
+    fn retry_fuse_at(&mut self, index: usize, confirmed: bool) -> bool {
+        let Some(tab) = self.state.projects.get(index) else {
             return false;
         };
         let Some(request) = tab.request.clone() else {
             return false;
         };
         let id = tab.id;
+        if !confirmed && self.ask_before_fuse(index, FuseEntry::Retry) {
+            return false;
+        }
         if let Some(enqueued) = self.try_enqueue(id) {
             return enqueued;
         }
-        self.run_request(active, request)
+        self.run_request(index, request)
     }
 
     /// Starts `request` on tab `tab_index`, off the UI thread, discarding a
@@ -4699,17 +6125,13 @@ impl AppController {
     /// The active tab's checkpoint count -- real, incrementing on every
     /// successful run, `None` while no tab is active.
     pub fn checkpoint_count(&self) -> Option<usize> {
-        self.state.active().map(|tab| tab.checkpoints)
+        self.state.active().map(ProjectTab::checkpoint_count)
     }
 
-    /// The checkpoints panel's own line: the active tab's checkpoint count in
-    /// the shared wording, or the empty-state line while no tab is active or
-    /// it holds none yet.
+    /// The checkpoints panel's own empty-state line, shown in place of the
+    /// row list while no tab is active or it holds no checkpoint yet.
     pub fn checkpoint_panel_line(&self) -> String {
-        match self.checkpoint_count() {
-            Some(count) if count > 0 => checkpoint_phrase(count),
-            _ => "None yet — fuse a stack".to_string(),
-        }
+        "None yet — fuse a stack".to_string()
     }
 
     /// Whether the active tab has a composite to show: at least one
@@ -4850,7 +6272,7 @@ impl AppController {
     /// when `index` is the tab currently in view.
     fn commit_held(&mut self, index: usize, held: job::HeldCheckpoint) -> (PathBuf, PathBuf) {
         let tab = &mut self.state.projects[index];
-        tab.checkpoints += 1;
+        let parent = tab.row_parent();
         if let Some(request) = &tab.request {
             tab.frames = request.frames.clone();
         }
@@ -4862,14 +6284,48 @@ impl AppController {
         tab.thumbnail = overlay::render_thumbnail_from_frame(&held.composite).map(Arc::new);
         tab.failure = None;
         let planes = (held.composite.clone(), held.zmap.clone());
-        tab.held.push(held);
+        tab.selected_checkpoint = Some(checkpoints::held_key(tab.held.len()));
+        tab.row_planes = None;
+        tab.held.push(job::InMemoryCheckpoint {
+            kind: job::InMemoryKind::Fused(held),
+            parent,
+        });
+        tab.free_unneeded_held();
         // The new checkpoint's own extent may differ from what the viewport
         // was fitted to (a first fuse's crop, a re-fuse over a changed frame
         // set) -- refit on the next `fit_if_unfitted` rather than keep
         // drawing the old extent's zoom/pan.
         tab.viewport = None;
+        self.mark_fresh_checkpoint(index);
         self.enter_editor_if_viewing(index);
         planes
+    }
+
+    /// Marks tab `index`'s selected row as just created, with a generation
+    /// above every earlier one. Does nothing for a tab not in view, which
+    /// then never flashes.
+    fn mark_fresh_checkpoint(&mut self, index: usize) {
+        if self.state.active != Some(index) {
+            return;
+        }
+        let Some(key) = self.state.projects[index].selected_checkpoint.clone() else {
+            return;
+        };
+        self.checkpoint_generation += 1;
+        self.state.projects[index].fresh_checkpoint = Some((key, self.checkpoint_generation));
+    }
+
+    /// The generation of the active tab's fresh row when the panel has not
+    /// shown it yet, once: every later call returns `None` until a new
+    /// checkpoint is created.
+    pub fn take_checkpoint_flash(&mut self) -> Option<u64> {
+        let (_, generation) = self.state.active()?.fresh_checkpoint.as_ref()?;
+        let generation = *generation;
+        if generation <= self.checkpoint_flash_played {
+            return None;
+        }
+        self.checkpoint_flash_played = generation;
+        Some(generation)
     }
 
     /// Switches into Editor mode when `index` is the tab currently in view --
@@ -4909,7 +6365,7 @@ impl AppController {
     pub fn keep_fused(&mut self) -> Option<(PathBuf, PathBuf)> {
         let index = self.state.active?;
         let parked = self.state.projects.get_mut(index)?.parked.take()?;
-        let at = job::format_utc_hhmm(parked.held.created_at);
+        let at = checkpoints::local_hhmm(parked.held.created_at);
         let unaligned = parked.diverged.len();
         let planes = self.commit_held(index, parked.held);
         self.state.projects[index].run = job::RunState::Fused { at, unaligned };
@@ -4938,34 +6394,272 @@ impl AppController {
         }
     }
 
-    /// The active tab's composite and Z-Map paths: its newest held
-    /// checkpoint's, else an opened project's planes materialized into its
-    /// cache directory. `None` for an [`GuiProject::Unsaved`] tab that holds
-    /// nothing yet.
+    /// The active tab's current row's composite and Z-Map paths: a held
+    /// row's own files, a saved row's pair in the plane cache. `None` with
+    /// no current row, while an op-bearing row renders, or once it refused.
     pub fn materialize_active_tab_planes(&mut self) -> Option<(PathBuf, PathBuf)> {
+        match self.active_tab_planes() {
+            TabPlanes::Ready(composite, zmap) => Some((composite, zmap)),
+            TabPlanes::Pending | TabPlanes::None => None,
+        }
+    }
+
+    /// [`Self::materialize_active_tab_planes`], telling a pending render
+    /// apart. A fused row is written synchronously -- a stored-composite
+    /// read. An op-bearing row starts the one background render, or waits
+    /// for the running one to settle first.
+    fn active_tab_planes(&mut self) -> TabPlanes {
         let scratch_root = self.scratch_root();
-        let tab = self.state.active_mut()?;
-        if let Some(held) = tab.held.last() {
-            return Some((held.composite.clone(), held.zmap.clone()));
+        let render_free = self.state.render.in_flight.is_none();
+        let Some(tab) = self.state.active_mut() else {
+            return TabPlanes::None;
+        };
+        let Some(mut key) = tab.selected_checkpoint.clone() else {
+            return TabPlanes::None;
+        };
+        if let Some(index) = checkpoints::held_index(&key) {
+            let Some(entry) = tab.held.get(index) else {
+                return TabPlanes::None;
+            };
+            if let Some(held) = fused_of(entry) {
+                return TabPlanes::Ready(held.composite.clone(), held.zmap.clone());
+            }
+            // An op-bearing row shows the planes it was taken
+            // from; the session's resident tiles carry its edits.
+            if let Some(RowPlanes::Ready(composite, zmap)) = &tab.row_planes {
+                return TabPlanes::Ready(composite.clone(), zmap.clone());
+            }
+            match tab.resolve_row(&key) {
+                Some(RowBase::Held(base)) => {
+                    return tab
+                        .held
+                        .get(base)
+                        .and_then(fused_of)
+                        .map_or(TabPlanes::None, |held| {
+                            TabPlanes::Ready(held.composite.clone(), held.zmap.clone())
+                        });
+                }
+                Some(RowBase::Saved(id)) => key = id,
+                None => return TabPlanes::None,
+            }
+        }
+        match &tab.row_planes {
+            Some(RowPlanes::Ready(composite, zmap)) => {
+                return TabPlanes::Ready(composite.clone(), zmap.clone());
+            }
+            Some(RowPlanes::Pending) => return TabPlanes::Pending,
+            Some(RowPlanes::Refused(_)) => return TabPlanes::None,
+            None => {}
         }
         let GuiProject::Opened(project) = &mut tab.project else {
-            return None;
+            return TabPlanes::None;
         };
-        job::materialize_planes(project, &scratch_root).ok()
+        match job::fused_checkpoint_planes(project, &scratch_root, &key) {
+            Ok(job::CheckpointPlanes::Ready(composite, zmap)) => {
+                tab.note_viewed(&scratch_root, &key);
+                tab.row_planes = Some(RowPlanes::Ready(composite.clone(), zmap.clone()));
+                TabPlanes::Ready(composite, zmap)
+            }
+            Err(err) => {
+                tab.row_planes = Some(RowPlanes::Refused(job::render_refusal_lines(&err)));
+                TabPlanes::None
+            }
+            Ok(job::CheckpointPlanes::NeedsRender) => {
+                if render_free {
+                    let project_path = project.path().to_path_buf();
+                    tab.row_planes = Some(RowPlanes::Pending);
+                    let tab_id = tab.id;
+                    self.start_checkpoint_render(tab_id, key, project_path, scratch_root);
+                }
+                TabPlanes::Pending
+            }
+        }
     }
 
-    /// The active tab's checkpoints fused since its last save, oldest first;
-    /// empty with no active tab.
-    pub fn held_checkpoints(&self) -> &[job::HeldCheckpoint] {
+    /// Renders `key` of the project at `project_path` on a spawned worker,
+    /// parking the result for [`Self::settle_checkpoint_render`].
+    fn start_checkpoint_render(
+        &mut self,
+        tab_id: u64,
+        key: String,
+        project_path: PathBuf,
+        scratch_root: PathBuf,
+    ) {
+        self.state.render.in_flight = Some((tab_id, key.clone()));
+        self.state.render.started = true;
+        let outcome = Arc::clone(&self.state.render.outcome);
+        std::thread::spawn(move || {
+            let result = job::render_outcome(std::panic::catch_unwind(|| {
+                job::render_checkpoint_planes(&project_path, &scratch_root, &key)
+            }));
+            *outcome
+                .lock()
+                .expect("no thread panicked while holding the render outcome") = Some(result);
+        });
+    }
+
+    /// The active tab's fused checkpoints kept in memory since its last
+    /// save, oldest first; empty with no active tab.
+    pub fn held_checkpoints(&self) -> Vec<job::HeldCheckpoint> {
         self.active_project()
             .and_then(|i| self.state.projects.get(i))
-            .map_or(&[], |tab| tab.held.as_slice())
+            .map_or_else(Vec::new, |tab| {
+                tab.held.iter().filter_map(fused_of).cloned().collect()
+            })
     }
 
-    /// Whether the active tab holds checkpoints no `.ffp` contains yet --
-    /// what enables `Save project` and its `Ctrl+S`.
+    /// Whether the active tab has something a project save would write: an
+    /// in-memory checkpoint, a pending delete or a modified live -- what
+    /// enables `Save project` and its `Ctrl+S`.
     pub fn save_enabled(&self) -> bool {
-        !self.held_checkpoints().is_empty()
+        self.active_project()
+            .and_then(|i| self.state.projects.get(i))
+            .is_some_and(ProjectTab::has_unsaved_write)
+    }
+
+    /// Keeps tab `index`'s live -- its origin's Z-Map with the session's ops
+    /// -- as an op-bearing checkpoint in memory under the current row. The
+    /// session is rebased onto it and it becomes the current row. `false`,
+    /// changing nothing, when live is unmodified or the checkpoint cannot be
+    /// taken.
+    pub fn snapshot_live(&mut self, index: usize) -> bool {
+        let shown = if self.state.active == Some(index) {
+            match self.active_tab_planes() {
+                TabPlanes::Ready(composite, zmap) => Some(RowPlanes::Ready(composite, zmap)),
+                TabPlanes::Pending | TabPlanes::None => None,
+            }
+        } else {
+            None
+        };
+        let Some(tab) = self.state.projects.get_mut(index) else {
+            return false;
+        };
+        let Some(edit) = tab.edit.as_ref() else {
+            return false;
+        };
+        if edit.session.op_count() == 0 {
+            return false;
+        }
+        let Some(parent) = tab.row_parent() else {
+            return false;
+        };
+        let kind = job::InMemoryKind::Ops {
+            ops: edit.session.ops().cloned().collect(),
+            created_at: job::now_unix(),
+        };
+        if let Some(edit) = tab.edit.as_mut() {
+            edit.session.rebase();
+        }
+        tab.held.push(job::InMemoryCheckpoint {
+            kind,
+            parent: Some(parent),
+        });
+        tab.selected_checkpoint = Some(checkpoints::held_key(tab.held.len() - 1));
+        tab.row_planes = shown;
+        self.mark_fresh_checkpoint(index);
+        self.emit(ShellEvent::CheckpointsChanged);
+        self.emit(ShellEvent::EditorChanged);
+        true
+    }
+
+    /// Queues the deletion of listed row `id` (a saved id or `held:<n>`) on
+    /// the active tab, removing exactly that row from the list; the next
+    /// project save applies it. `false`, changing nothing, for a key the list
+    /// does not show (unknown, hidden or already queued) and for the last
+    /// listed row.
+    pub fn queue_checkpoint_delete(&mut self, id: &str) -> bool {
+        let panel = self.checkpoints_panel();
+        if panel.row_count <= 1 || !panel.entries.iter().any(|e| e.id.as_deref() == Some(id)) {
+            return false;
+        }
+        let Some(tab) = self.state.active_mut() else {
+            return false;
+        };
+        tab.pending_deletes.push(match checkpoints::held_index(id) {
+            Some(index) => job::ParentRef::Entry(index),
+            None => job::ParentRef::Saved(id.to_string()),
+        });
+        self.emit(ShellEvent::CheckpointsChanged);
+        true
+    }
+
+    /// Opens the delete question for flat entry `index` of
+    /// [`Self::checkpoints_panel`]. A no-op on a separator, past the end,
+    /// with one row listed and while a dialog is open.
+    pub fn request_checkpoint_delete(&mut self, index: usize) {
+        if self.modal_open() {
+            return;
+        }
+        let panel = self.checkpoints_panel();
+        let Some(id) = panel.entries.get(index).and_then(|entry| entry.id.clone()) else {
+            return;
+        };
+        let Some(tab) = self.state.active() else {
+            return;
+        };
+        if panel.row_count <= 1 {
+            return;
+        }
+        self.state.pending_checkpoint_delete = Some((tab.id, id));
+        self.emit(ShellEvent::ProjectsChanged);
+    }
+
+    /// The delete question still open, if any: the row's `algorithm · time`
+    /// and the sentence on what stays.
+    pub fn pending_checkpoint_delete_copy(&self) -> Option<(String, String)> {
+        let (id, key) = self.state.pending_checkpoint_delete.as_ref()?;
+        self.state.active().filter(|tab| tab.id == *id)?;
+        let panel = self.checkpoints_panel();
+        let row = panel
+            .entries
+            .iter()
+            .find(|entry| entry.id.as_deref() == Some(key.as_str()))?;
+        let others = panel.row_count - 1;
+        let body = if others == 1 {
+            "The other checkpoint is untouched, and the stack is not fused again.".to_string()
+        } else {
+            format!(
+                "The other {others} checkpoints are untouched, and the stack is not fused again."
+            )
+        };
+        Some((format!("{} · {}", row.algorithm, row.time_text), body))
+    }
+
+    /// Closes the delete question without changing anything.
+    pub fn cancel_checkpoint_delete(&mut self) {
+        if self.state.pending_checkpoint_delete.take().is_some() {
+            self.emit(ShellEvent::ProjectsChanged);
+        }
+    }
+
+    /// Answers the delete question: queues the row's deletion and frees what
+    /// nothing needs any more. The canvas, the edit session and the render
+    /// are left alone.
+    pub fn confirm_checkpoint_delete(&mut self) {
+        let Some((tab_id, key)) = self.state.pending_checkpoint_delete.take() else {
+            return;
+        };
+        self.emit(ShellEvent::ProjectsChanged);
+        if self.state.active().is_none_or(|tab| tab.id != tab_id)
+            || !self.queue_checkpoint_delete(&key)
+        {
+            return;
+        }
+        let scratch_root = self.scratch_root();
+        let tab = self
+            .state
+            .active_mut()
+            .expect("the delete was queued on the active tab");
+        tab.free_unneeded_held();
+        if checkpoints::held_index(&key).is_none() {
+            tab.remove_cached_planes(&scratch_root, &key);
+        }
+    }
+
+    /// [`Self::snapshot_live`] on the active tab; `false` with none active.
+    pub fn save_checkpoint(&mut self) -> bool {
+        self.active_project()
+            .is_some_and(|index| self.snapshot_live(index))
     }
 
     /// `save_project_at` on the active tab; `false` with none active.
@@ -4974,10 +6668,13 @@ impl AppController {
             .is_some_and(|index| self.save_project_at(index, pick))
     }
 
-    /// Writes tab `index`'s held checkpoints into one `.ffp`: a never-saved
-    /// tab asks `pick`, proposing `<frames dir>/<group name>.ffp`; an opened
-    /// one appends to its own file. A failed write keeps everything held and
-    /// leaves [`Self::take_settled_failure`] a message. Returns whether it wrote.
+    /// Writes tab `index`'s in-memory checkpoints and pending deletes into
+    /// one `.ffp`, after keeping a modified live as a checkpoint. A never-saved
+    /// tab asks `pick` (proposing `<frames dir>/<group name>.ffp`); an opened
+    /// one rewrites its own file. The edit session survives, rebased, and the
+    /// current row stays stored even when it was deleted. A failed write keeps
+    /// everything in memory and leaves [`Self::take_settled_failure`] a
+    /// message. Returns whether it wrote.
     fn save_project_at(
         &mut self,
         index: usize,
@@ -4987,7 +6684,7 @@ impl AppController {
         let Some(tab) = self.state.projects.get(index) else {
             return false;
         };
-        if tab.held.is_empty() {
+        if !tab.has_unsaved_write() {
             return false;
         }
         let (target, onto_existing) = match &tab.project {
@@ -4999,37 +6696,78 @@ impl AppController {
                 }
             }
         };
-        let project = match job::save_held(&target, &tab.held, onto_existing) {
-            Ok(project) => project,
+        if tab.live_modified() && !self.snapshot_live(index) {
+            self.report_failed_save(
+                index,
+                &target,
+                "the unsaved edits could not be kept as a checkpoint".to_string(),
+            );
+            return false;
+        }
+        let tab = &self.state.projects[index];
+        let keep = tab.row_parent();
+        let (project, ids) = match job::save_in_memory(
+            &target,
+            &tab.held,
+            &tab.pending_deletes,
+            keep.as_ref(),
+            onto_existing,
+        ) {
+            Ok(saved) => saved,
             Err(err) => {
-                let notification = job::Notification {
-                    operation: job::FailedOperation::Save,
-                    message: format!("Could not save {}: {err}", target.display()),
-                    project_title: Some(tab.title.clone()),
-                    project_path: Some(project_identity_path(&tab.project)),
-                    target: Some(target.clone()),
-                };
-                self.notifications.push(notification.clone());
-                self.settled_failure = Some(notification);
+                self.report_failed_save(index, &target, err.to_string());
+                self.emit(ShellEvent::CheckpointsChanged);
                 return false;
             }
         };
         let tab = &mut self.state.projects[index];
+        let next = tab
+            .selected_checkpoint
+            .as_deref()
+            .and_then(|row| tab.saved_row_key(row, &ids, keep.as_ref()));
+        if let Some((row, generation)) = tab.fresh_checkpoint.clone()
+            && let Some(saved) = tab.saved_row_key(&row, &ids, keep.as_ref())
+        {
+            tab.fresh_checkpoint = Some((saved, generation));
+        }
+        tab.selected_checkpoint =
+            next.or_else(|| project.history().visible().first().map(|c| c.id.clone()));
+        tab.row_planes = None;
         tab.project = GuiProject::Opened(Box::new(project));
         tab.title = entry::tab_title(&tab.project);
-        remove_held(&tab.held);
+        remove_in_memory(&tab.held);
         tab.held.clear();
-        self.state.canvas_dirty = true;
+        tab.pending_deletes.clear();
+        if tab.edit.is_none() {
+            self.state.canvas_dirty = true;
+        }
         self.emit(ShellEvent::ProjectsChanged);
         true
+    }
+
+    /// Records a failed save of tab `index` to `target` as a notification
+    /// and the settled failure.
+    fn report_failed_save(&mut self, index: usize, target: &Path, cause: String) {
+        let tab = &self.state.projects[index];
+        let notification = job::Notification {
+            operation: job::FailedOperation::Save,
+            message: format!("Could not save {}: {cause}", target.display()),
+            project_title: Some(tab.title.clone()),
+            project_path: Some(project_identity_path(&tab.project)),
+            target: Some(target.to_path_buf()),
+        };
+        self.notifications.push(notification.clone());
+        self.settled_failure = Some(notification);
     }
 
     /// What the open renderer cell should do for the frame about to draw,
     /// given which tab it currently holds (`None` before anything has
     /// loaded). `Keep` when the owner already matches the active tab and
     /// nothing changed underneath it since; otherwise materializes the
-    /// active tab's own planes and answers `Load`, or `Clear` when it has
-    /// none (no tab active, `+` selected, or nothing fused yet).
+    /// active tab's own planes and answers `Load`; `Keep` too while the
+    /// active tab's current row renders over that tab's previous image, or
+    /// `Clear` when it has none (no tab active, `+` selected, nothing fused
+    /// yet, or its current row refused).
     pub fn canvas_feed(&mut self, loaded: Option<usize>) -> crate::canvas::CanvasFeed {
         let _scope = measurement_scope("gui_canvas_feed");
         if loaded == self.state.active && !self.state.canvas_dirty {
@@ -5039,13 +6777,14 @@ impl AppController {
         let Some(tab) = self.state.active else {
             return crate::canvas::CanvasFeed::Clear;
         };
-        match self.materialize_active_tab_planes() {
-            Some((composite, zmap)) => crate::canvas::CanvasFeed::Load {
+        match self.active_tab_planes() {
+            TabPlanes::Ready(composite, zmap) => crate::canvas::CanvasFeed::Load {
                 tab,
                 composite,
                 zmap,
             },
-            None => crate::canvas::CanvasFeed::Clear,
+            TabPlanes::Pending if loaded == Some(tab) => crate::canvas::CanvasFeed::Keep,
+            TabPlanes::Pending | TabPlanes::None => crate::canvas::CanvasFeed::Clear,
         }
     }
 
@@ -5672,8 +7411,8 @@ fn frame_word(count: usize) -> &'static str {
     if count == 1 { "frame" } else { "frames" }
 }
 
-/// `"1 checkpoint"` / `"N checkpoints"` -- the open card's meta line and the
-/// checkpoints panel share this wording for a non-zero count.
+/// `"1 checkpoint"` / `"N checkpoints"` -- the open card's meta line's own
+/// wording for a non-zero count.
 fn checkpoint_phrase(count: usize) -> String {
     let word = if count == 1 {
         "checkpoint"
@@ -5683,18 +7422,226 @@ fn checkpoint_phrase(count: usize) -> String {
     format!("{count} {word}")
 }
 
-/// Removes each held checkpoint's own directory, and the tab's directory
-/// above it once that is empty.
-fn remove_held(held: &[job::HeldCheckpoint]) {
-    for checkpoint in held {
-        if let Some(dir) = checkpoint.composite.parent() {
-            let _ = std::fs::remove_dir_all(dir);
-            if let Some(tab_dir) = dir.parent() {
-                // Fails, and so keeps the directory, while anything is left.
-                let _ = std::fs::remove_dir(tab_dir);
-            }
+/// The staging key and the directory under `scratch_root` where the next
+/// fused in-memory checkpoint on `tab` holds its files.
+fn hold_dir_for(tab: &ProjectTab, scratch_root: &Path) -> (String, PathBuf) {
+    let project_path = match &tab.project {
+        GuiProject::Unsaved(group) => group.dir.join(format!("{}.ffp", group.name)),
+        GuiProject::Opened(project) => project.path().to_path_buf(),
+    };
+    let staging_key = format!("{}-{:x}", tab.title, path_digest(&project_path));
+    let hold_dir = scratch_root
+        .join("held")
+        .join(&staging_key)
+        .join(format!("fused-{}", tab.checkpoint_count()));
+    (staging_key, hold_dir)
+}
+
+/// Removes the directory `file` sits in, and the tab's directory above it
+/// once that is empty.
+fn remove_hold_dir_of(file: &Path) {
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::remove_dir_all(dir);
+        if let Some(tab_dir) = dir.parent() {
+            // Fails, and so keeps the directory, while anything is left.
+            let _ = std::fs::remove_dir(tab_dir);
         }
     }
+}
+
+/// Removes each held checkpoint's own directory.
+fn remove_held(held: &[job::HeldCheckpoint]) {
+    for checkpoint in held {
+        remove_hold_dir_of(&checkpoint.composite);
+    }
+}
+
+/// [`remove_held`] for every in-memory entry that keeps files: a fused
+/// entry's planes.
+fn remove_in_memory(entries: &[job::InMemoryCheckpoint]) {
+    for entry in entries {
+        match &entry.kind {
+            job::InMemoryKind::Fused(held) => remove_hold_dir_of(&held.composite),
+            job::InMemoryKind::Ops { .. } => {}
+        }
+    }
+}
+
+/// The selected row's own kind, algorithm, created-at, EXIF/ICC reference
+/// index and composite description -- everything [`export_dialog_for`] and
+/// [`export_source_for`] both need before either branches on whether the
+/// tab has unsealed edits on top of it.
+struct RowExportInfo {
+    held: bool,
+    /// An op-bearing in-memory row: exported from the edit
+    /// session, never from a file.
+    live: bool,
+    algorithm: String,
+    created_at: i64,
+    reference: usize,
+    description: String,
+}
+
+fn row_export_info(tab: &ProjectTab) -> Option<RowExportInfo> {
+    let key = tab.selected_checkpoint.as_deref()?;
+    let Some(index) = checkpoints::held_index(key) else {
+        return saved_row_export_info(tab, key);
+    };
+    let entry = tab.held.get(index)?;
+    let created_at = entry.created_at();
+    if let Some(held) = fused_of(entry) {
+        return Some(RowExportInfo {
+            held: true,
+            live: false,
+            algorithm: held.algorithm.clone(),
+            created_at,
+            reference: held.align.as_ref().map_or(0, |a| a.reference),
+            description: held.composite_description.clone(),
+        });
+    }
+    let live = |algorithm: String, reference: usize, description: String| RowExportInfo {
+        held: false,
+        live: true,
+        algorithm,
+        created_at,
+        reference,
+        description,
+    };
+    match tab.resolve_row(key)? {
+        RowBase::Held(base) => {
+            let held = fused_of(tab.held.get(base)?)?;
+            Some(live(
+                held.algorithm.clone(),
+                held.align.as_ref().map_or(0, |a| a.reference),
+                held.composite_description.clone(),
+            ))
+        }
+        RowBase::Saved(id) => {
+            let info = saved_row_export_info(tab, &id)?;
+            Some(live(info.algorithm, info.reference, info.description))
+        }
+    }
+}
+
+fn saved_row_export_info(tab: &ProjectTab, id: &str) -> Option<RowExportInfo> {
+    let GuiProject::Opened(project) = &tab.project else {
+        return None;
+    };
+    let checkpoint = project.history().get(id).ok()?;
+    let record = project.fuse_state(id).ok()?;
+    Some(RowExportInfo {
+        held: false,
+        live: false,
+        algorithm: checkpoint.algorithm.clone(),
+        created_at: checkpoint.created_at,
+        reference: record.align.as_ref().map_or(0, |a| a.reference),
+        description: record.composite.description.clone(),
+    })
+}
+
+/// The export modal's own state for `tab`'s current position, `None` when
+/// it has none.
+fn export_dialog_for(tab: &ProjectTab, choice: &ExportChoice) -> Option<ExportDialog> {
+    let editing = tab
+        .edit
+        .as_ref()
+        .is_some_and(|edit| edit.session.op_count() > 0);
+    let info = row_export_info(tab)?;
+    let kind = if editing || info.live {
+        ExportKind::Live
+    } else if info.held {
+        ExportKind::Held
+    } else {
+        ExportKind::Saved
+    };
+    let project_file = export_project_label(&tab.project);
+    let algorithm = checkpoints::algorithm_label(&info.algorithm);
+    let timestamp = checkpoints::local_date_and_time(info.created_at);
+    let (context, what) = export_copy_for(kind, &project_file, &algorithm, &timestamp);
+    Some(ExportDialog {
+        tab_id: tab.id,
+        context,
+        what,
+        stage: ExportStage::Ready,
+        destination_name: String::new(),
+        destination: None,
+        choice: choice.clone(),
+        open_menu: None,
+    })
+}
+
+/// The export modal's own project-file name: an opened project's `.ffp`
+/// file name with its extension, or a never-saved tab's own group name (no
+/// extension -- there is no file yet).
+fn export_project_label(project: &GuiProject) -> String {
+    match project {
+        GuiProject::Unsaved(group) => group.name.clone(),
+        GuiProject::Opened(project) => project
+            .path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| project.path().display().to_string()),
+    }
+}
+
+/// The worker's own export source for `tab`'s current position -- unsealed
+/// edits over the selected row's Z-Map when the edit session holds any op,
+/// otherwise the row itself, held or saved.
+fn export_source_for(tab: &ProjectTab) -> Option<job::ExportSource> {
+    let info = row_export_info(tab)?;
+    if let Some(edit) = tab
+        .edit
+        .as_ref()
+        .filter(|edit| edit.session.op_count() > 0 || info.live)
+    {
+        let (sources, registration) = tab.fused()?;
+        let tile = edit.session.tile();
+        return Some(job::ExportSource::Live {
+            width: tile.width,
+            height: tile.height,
+            indices: edit.session.indices().to_vec(),
+            sources,
+            registration,
+            reference: info.reference,
+            description: info.description,
+        });
+    }
+    if info.live {
+        return None;
+    }
+    let key = tab.selected_checkpoint.as_deref()?;
+    if info.held {
+        let index = checkpoints::held_index(key)?;
+        return Some(job::ExportSource::Held(
+            fused_of(tab.held.get(index)?)?.clone(),
+        ));
+    }
+    let GuiProject::Opened(project) = &tab.project else {
+        return None;
+    };
+    Some(job::ExportSource::Saved {
+        project_path: project.path().to_path_buf(),
+        id: key.to_string(),
+    })
+}
+
+/// The export save dialog's own starting point: `<project dir>/<tab
+/// title>.<format's extension>` -- built from the tab's own title, not the
+/// project file's name, so no extension of the identity path is ever
+/// touched.
+fn export_proposed_path(tab: &ProjectTab, format: ExportFormat) -> PathBuf {
+    let dir = match &tab.project {
+        GuiProject::Unsaved(group) => group.dir.clone(),
+        GuiProject::Opened(project) => project
+            .path()
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+    };
+    dir.join(format!(
+        "{}.{}",
+        tab.title,
+        crate::picker::default_extension(format)
+    ))
 }
 
 /// A path's own identity for a project or a card: an `Unsaved` tab's own
@@ -5736,6 +7683,16 @@ fn not_a_project_card(path: PathBuf) -> FailureCard {
         reason: "This folder holds something else. Nothing was read and nothing was changed."
             .to_string(),
         meta: "not read · not changed".to_string(),
+    }
+}
+
+/// [`checkpoints::op_summary`] with "unsaved" after the first count:
+/// "2 unsaved brush strokes".
+fn unsaved_ops<'a>(ops: impl IntoIterator<Item = &'a job::Op>) -> String {
+    let summary = checkpoints::op_summary(ops);
+    match summary.split_once(' ') {
+        Some((count, rest)) => format!("{count} unsaved {rest}"),
+        None => summary,
     }
 }
 

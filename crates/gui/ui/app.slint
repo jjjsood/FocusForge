@@ -17,15 +17,15 @@ export { ProjectTabView }
 import { FFToolbar } from "shell/toolbar.slint";
 import { FFEditorToolbar } from "shell/editor_toolbar.slint";
 import { FFCanvas } from "shell/canvas.slint";
-import { FFDock, SettingsRow, SectionHeadView, ImageRowView } from "shell/dock.slint";
-export { SettingsRow, SectionHeadView, ImageRowView }
+import { FFDock, SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView } from "shell/dock.slint";
+export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFSettingsModal, InputRow, FFManifestRow } from "shell/settings_modal.slint";
 export { InputRow, FFManifestRow }
-import { FFCloseGuard, FFDivergenceWarning, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFToast } from "shell/dialogs.slint";
+import { FFCheckpointDelete, FFCloseGuard, FFDivergenceWarning, ExportRowView, FFExportDialog, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing, FFToast } from "shell/dialogs.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
-export { ProjectCardView, RecentRowView }
+export { ProjectCardView, RecentRowView, ExportRowView }
 
 export component AppWindow inherits Window {
     // Every callback forwards one-for-one into `AppController` via
@@ -48,6 +48,7 @@ export component AppWindow inherits Window {
     callback pipette-toggled();
     callback undo-requested();
     callback redo-requested();
+    callback save-checkpoint-requested();
 
     // Every piece of state the shell shows is an `in` property set from
     // Rust, never computed here.
@@ -71,6 +72,7 @@ export component AppWindow inherits Window {
     in property <bool> brush-picking: false;
     in property <bool> can-undo: false;
     in property <bool> can-redo: false;
+    in property <bool> can-save-checkpoint: false;
     // The brush cursor's own `Path` geometry, pushed alongside the toolbar
     // state above on every repaint (it also depends on the viewport's
     // current zoom, which the toolbar state does not).
@@ -198,12 +200,14 @@ export component AppWindow inherits Window {
         picking: root.brush-picking;
         can-undo: root.can-undo;
         can-redo: root.can-redo;
+        can-save-checkpoint: root.can-save-checkpoint;
 
         brush-size-fraction-changed(f) => { root.brush-size-fraction-changed(f); }
         brush-softness-fraction-changed(f) => { root.brush-softness-fraction-changed(f); }
         pipette-toggled => { root.pipette-toggled(); }
         undo-requested => { root.undo-requested(); }
         redo-requested => { root.redo-requested(); }
+        save-checkpoint-requested => { root.save-checkpoint-requested(); }
     }
 
     // Both images are `in` properties set from Rust
@@ -216,7 +220,10 @@ export component AppWindow inherits Window {
     // composite/Z-Map pair above.
     in property <image> frame-source;
     in property <string> frame-label: "";
-    in property <string> frame-message: "";
+    // Each pane's refusal, one entry per line: the selected frame's on the
+    // left, the current checkpoint's on the right.
+    in property <[string]> frame-message-lines: [];
+    in property <[string]> composite-message-lines: [];
     in property <bool> canvas-undock-enabled: true;
     // Whether a project is open -- governs the pane chrome (label, undock)
     // and the bottom bar's zoom cluster together, so nothing offers an
@@ -231,6 +238,20 @@ export component AppWindow inherits Window {
     // count, or the empty-state wording. Set from Rust alongside
     // `composite-ready` in `src/bridge.rs::push_projects`.
     in property <string> checkpoint-line: "None yet — fuse a stack";
+    in property <bool> checkpoint-export-enabled: false;
+    // The `Checkpoints` panel: pushed from `AppController::checkpoints_panel`
+    // (`src/bridge.rs`) on every `ShellEvent::CheckpointsChanged`, forwarded
+    // one line into `FFDock`.
+    in property <[CheckpointEntryView]> checkpoint-rows: [];
+    in property <length> checkpoint-scroll-y: 0px;
+    in property <length> checkpoint-content-height: 0px;
+    callback checkpoint-selected(int);
+    callback checkpoint-delete-requested(int);
+    callback checkpoint-scrolled(length);
+    callback checkpoint-scrollbar-pointer(int, length);
+    callback checkpoint-scrollbar-dragged(length);
+    callback checkpoint-viewport-height-changed(length);
+    out property <length> checkpoint-viewport-height: dock.checkpoint-viewport-height;
     callback composite-undock-requested();
     callback zmap-undock-requested();
     // Forwarded from `FFCanvas`'s own callbacks of the same shape -- the
@@ -300,7 +321,8 @@ export component AppWindow inherits Window {
             zmap-source: root.zmap-source;
             frame-source: root.frame-source;
             frame-label: root.frame-label;
-            frame-message: root.frame-message;
+            frame-message-lines: root.frame-message-lines;
+            composite-message-lines: root.composite-message-lines;
             undock-enabled: root.canvas-undock-enabled;
             project-loaded: root.project-loaded;
             composite-ready: root.composite-ready;
@@ -361,7 +383,6 @@ export component AppWindow inherits Window {
     in property <[ImageRowView]> images-rows: [];
     in property <string> images-header-text: "";
     in-out property <length> images-list-viewport-y: 0px;
-    in property <bool> images-no-source-row: false;
     in property <string> images-sort: "";
     in property <bool> images-sort-menu-open: false;
     in property <int> images-dragging-row: -1;
@@ -393,6 +414,10 @@ export component AppWindow inherits Window {
         dock-tab: root.dock-tab;
         project-loaded: root.project-loaded;
         checkpoint-line: root.checkpoint-line;
+        checkpoint-export-enabled: root.checkpoint-export-enabled;
+        checkpoint-rows: root.checkpoint-rows;
+        checkpoint-scroll-y: root.checkpoint-scroll-y;
+        checkpoint-content-height: root.checkpoint-content-height;
         settings-rows: root.settings-rows;
         settings-sticky: root.settings-sticky;
         settings-scroll-y: root.settings-scroll-y;
@@ -401,7 +426,6 @@ export component AppWindow inherits Window {
         images-rows: root.images-rows;
         images-header-text: root.images-header-text;
         images-list-viewport-y <=> root.images-list-viewport-y;
-        images-no-source-row: root.images-no-source-row;
         images-sort: root.images-sort;
         images-sort-menu-open: root.images-sort-menu-open;
         images-dragging-row: root.images-dragging-row;
@@ -412,6 +436,12 @@ export component AppWindow inherits Window {
         mode-selected(m) => { root.mode-selected(m); }
         dock-tab-selected(t) => { root.dock-tab-selected(t); }
         checkpoint-export-requested => { root.checkpoint-export-requested(); }
+        checkpoint-selected(i) => { root.checkpoint-selected(i); }
+        checkpoint-delete-requested(i) => { root.checkpoint-delete-requested(i); }
+        checkpoint-scrolled(delta) => { root.checkpoint-scrolled(delta); }
+        checkpoint-scrollbar-pointer(kind, y) => { root.checkpoint-scrollbar-pointer(kind, y); }
+        checkpoint-scrollbar-dragged(y) => { root.checkpoint-scrollbar-dragged(y); }
+        checkpoint-viewport-height-changed(h) => { root.checkpoint-viewport-height-changed(h); }
         settings-param-changed(section, id, f) => { root.settings-param-changed(section, id, f); }
         settings-param-text-edited(section, id, text) => { root.settings-param-text-edited(section, id, text); }
         settings-algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
@@ -500,7 +530,8 @@ export component AppWindow inherits Window {
     in property <string> bar-tone: "running";
     in property <string> eta-text: "";
 
-    // The bottom bar's overlay controls, editor mode only.
+    // The bottom bar's overlay controls; disabled without a finished fuse.
+    in property <bool> overlay-available: false;
     in property <bool> overlay-on: false;
     in property <float> overlay-fraction: 0.0;
     in property <string> overlay-text: "";
@@ -526,7 +557,7 @@ export component AppWindow inherits Window {
         bar-fraction: root.bar-fraction;
         bar-tone: root.bar-tone;
         eta-text: root.eta-text;
-        editor-mode: root.mode == "editor";
+        overlay-available: root.overlay-available;
         overlay-on: root.overlay-on;
         overlay-fraction: root.overlay-fraction;
         overlay-text: root.overlay-text;
@@ -635,9 +666,51 @@ export component AppWindow inherits Window {
     callback question-open-as-many();
     callback question-cancelled();
     in property <bool> refusal-open: false;
+    in property <string> refusal-title: "No frames here";
+    in property <string> refusal-body: "FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.";
+    in property <string> refusal-button-label: "Pick another folder…";
     callback refusal-pick-another-folder();
+
+    // A saved project's source content disagrees with its recorded
+    // fingerprint; the project stays unopened until a choice is made.
+    in property <bool> mismatch-open: false;
+    in property <string> mismatch-context: "";
+    in property <string> mismatch-body: "";
+    callback mismatch-open-anyway();
+    callback mismatch-locate-frames();
+    callback mismatch-cancelled();
+
+    // An opened project's sources cannot all be resolved from here.
+    in property <bool> sources-missing-open: false;
+    in property <string> sources-missing-context: "";
+    in property <string> sources-missing-body: "";
+    callback sources-missing-locate-frames();
+    callback sources-missing-closed();
     in property <string> skipped-notice: "";
     callback skipped-notice-dismissed();
+
+    // The checkpoint panel's `Export image` modal.
+    in property <bool> export-open: false;
+    in property <string> export-context: "";
+    in property <string> export-what: "";
+    in property <string> export-stage: "ready";
+    in property <string> export-writing-file-name: "";
+    in property <[string]> export-refusal-lines: [];
+    in property <[string]> export-format-segments: [];
+    in property <string> export-format-selected: "";
+    in property <string> export-settings-heading: "";
+    in property <[ExportRowView]> export-rows: [];
+    in property <bool> export-slider-group: false;
+    in property <bool> export-metadata-on: true;
+    in property <bool> export-can-locate: true;
+    callback export-confirmed();
+    callback export-cancelled();
+    callback export-format-chosen(string);
+    callback export-menu-toggled(string);
+    callback export-option-chosen(string, string);
+    callback export-quality-changed(float);
+    callback export-chroma-chosen(string, string);
+    callback export-metadata-toggled();
 
     // The failed run's own notice, over the canvas rather than in the
     // bottom bar -- a job failure and a "some subfolders were skipped"
@@ -676,6 +749,11 @@ export component AppWindow inherits Window {
     callback close-guard-cancelled();
     callback close-guard-secondary-pressed();
     callback close-guard-confirmed();
+    in property <bool> checkpoint-delete-open: false;
+    in property <string> checkpoint-delete-context: "";
+    in property <string> checkpoint-delete-body: "";
+    callback checkpoint-delete-cancelled();
+    callback checkpoint-delete-confirmed();
 
     grouping-question := FFGroupingQuestion {
         x: 0px;
@@ -690,12 +768,72 @@ export component AppWindow inherits Window {
         cancelled => { root.question-cancelled(); }
     }
 
+    mismatch-dialog := FFFingerprintMismatch {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.mismatch-open;
+        context: root.mismatch-context;
+        body: root.mismatch-body;
+        confirmed => { root.mismatch-open-anyway(); }
+        secondary-pressed => { root.mismatch-locate-frames(); }
+        cancelled => { root.mismatch-cancelled(); }
+    }
+
+    sources-missing-dialog := FFSourcesMissing {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.sources-missing-open;
+        context: root.sources-missing-context;
+        body: root.sources-missing-body;
+        confirmed => { root.sources-missing-locate-frames(); }
+        cancelled => { root.sources-missing-closed(); }
+    }
+
+    export-dialog := FFExportDialog {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        export-open: root.export-open;
+        context: root.export-context;
+        what: root.export-what;
+        stage: root.export-stage;
+        writing-file-name: root.export-writing-file-name;
+        refusal-lines: root.export-refusal-lines;
+        format-segments: root.export-format-segments;
+        format-selected: root.export-format-selected;
+        settings-heading: root.export-settings-heading;
+        rows: root.export-rows;
+        slider-group: root.export-slider-group;
+        metadata-on: root.export-metadata-on;
+        can-locate: root.export-can-locate;
+        confirmed => { root.export-confirmed(); }
+        cancelled => { root.export-cancelled(); }
+        format-chosen(label) => { root.export-format-chosen(label); }
+        menu-toggled(id) => { root.export-menu-toggled(id); }
+        option-chosen(id, variant) => { root.export-option-chosen(id, variant); }
+        quality-changed(fraction) => { root.export-quality-changed(fraction); }
+        chroma-chosen(id, label) => { root.export-chroma-chosen(id, label); }
+        metadata-toggled => { root.export-metadata-toggled(); }
+    }
+
+    // Declared after the mismatch and sources-missing dialogs so a refusal
+    // raised by a failed `Locate frames…` (either one's own trigger) always
+    // paints on top of whichever dialog is still open underneath it, rather
+    // than being fully occluded by it.
     refusal-dialog := FFRefusalDialog {
         x: 0px;
         y: 0px;
         width: root.width;
         height: root.height;
         refusal-open: root.refusal-open;
+        title: root.refusal-title;
+        body: root.refusal-body;
+        button-label: root.refusal-button-label;
         pick-another-folder => { root.refusal-pick-another-folder(); }
     }
 
@@ -770,6 +908,18 @@ export component AppWindow inherits Window {
         cancelled => { root.close-guard-cancelled(); }
         secondary-pressed => { root.close-guard-secondary-pressed(); }
         confirmed => { root.close-guard-confirmed(); }
+    }
+
+    checkpoint-delete := FFCheckpointDelete {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.checkpoint-delete-open;
+        context: root.checkpoint-delete-context;
+        body: root.checkpoint-delete-body;
+        cancelled => { root.checkpoint-delete-cancelled(); }
+        confirmed => { root.checkpoint-delete-confirmed(); }
     }
 
     loading-indicator := FFLoadingIndicator {

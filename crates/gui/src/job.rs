@@ -18,24 +18,31 @@ use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{
     COMPOSITE_FILENAME, FrameError, FrameReader, ZMAP_FILENAME, open_frame_set,
 };
+pub use focusforge_core::io::{JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 use focusforge_core::job::StageCache;
 use focusforge_core::params::ParamValues;
 use focusforge_core::pipeline::{
     self, AlignRequest, FuseOutput, FuseProduct, FuseReport, FuseRequest, RunStage, StageObserver,
 };
-use focusforge_core::project::{self, Plane, Project, ProjectError};
+pub use focusforge_core::project::export::{
+    ExportFormat, ExportOptions, JpegSubsampling, MetadataOptions, PngBits, PngCompression,
+    params_for,
+};
+use focusforge_core::project::{self, Project, ProjectError};
 use focusforge_core::registry::{self, LookupError};
 use focusforge_core::retouch::{RetouchError, Sources};
 pub use focusforge_core::tile::{HostBudget, Rect};
-use focusforge_core::zmap::{ZMapError, ZMapReader};
+use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader, ZMapWriter};
 
 /// Re-exported so `crate::controller` -- which names no algorithm crate --
 /// can hold and drive these through the `job::` path alone.
 pub use focusforge_core::align::{Registration, Transform};
 pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
-pub use focusforge_core::project::HeldCheckpoint;
 pub use focusforge_core::project::Op;
+pub use focusforge_core::project::{
+    HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, kept_entries, now_unix,
+};
 pub use focusforge_core::retouch::{EditSession, footprint};
 pub use focusforge_core::zmap::{NO_SOURCE, source_color};
 
@@ -602,13 +609,6 @@ pub fn bar_fraction(progress: Option<&JobProgress>) -> f32 {
     }
 }
 
-/// `unix_secs` as `"HH:MM"` UTC -- no date crate in this workspace, and a
-/// checkpoint's own creation time never needs more than the clock face.
-pub fn format_utc_hhmm(unix_secs: i64) -> String {
-    let secs_of_day = unix_secs.rem_euclid(86_400);
-    format!("{:02}:{:02}", secs_of_day / 3600, (secs_of_day % 3600) / 60)
-}
-
 /// A failure preparing a tab's plane cache directory, or one of the two
 /// planes `focusforge_core` materializes into it.
 #[derive(Debug, thiserror::Error)]
@@ -639,26 +639,364 @@ fn is_fresh(path: &Path, ffp_modified: SystemTime) -> bool {
         .unwrap_or(false)
 }
 
-/// Materializes `project`'s composite and Z-Map into its own plane cache
-/// directory ([`plane_cache_dir`]), skipping either file already newer than
-/// the project's own `.ffp` -- a reopened, previously-materialized project
-/// costs nothing.
-pub fn materialize_planes(
+/// The directory holding checkpoint `id`'s planes in the project's plane cache.
+pub fn checkpoint_plane_dir(scratch_root: &Path, project_path: &Path, id: &str) -> PathBuf {
+    plane_cache_dir(scratch_root, project_path).join(id)
+}
+
+/// Checkpoint `id`'s own composite and Z-Map paths in the project's plane
+/// cache: one directory per checkpoint, so showing another row never
+/// overwrites the planes already on screen.
+fn checkpoint_plane_paths(
+    scratch_root: &Path,
+    project_path: &Path,
+    id: &str,
+) -> (PathBuf, PathBuf) {
+    let dir = checkpoint_plane_dir(scratch_root, project_path, id);
+    (dir.join(COMPOSITE_FILENAME), dir.join(ZMAP_FILENAME))
+}
+
+/// What a saved checkpoint needs before the canvas can show it.
+pub enum CheckpointPlanes {
+    /// Its composite and Z-Map, on disk.
+    Ready(PathBuf, PathBuf),
+    /// An op-bearing checkpoint: [`render_checkpoint_planes`] must run
+    /// first, off the event-loop thread, since it re-hashes every source.
+    NeedsRender,
+}
+
+/// A fused checkpoint's stored composite and its Z-Map, written into the
+/// plane cache unless both are already newer than the `.ffp`; an op-bearing
+/// checkpoint answers [`CheckpointPlanes::NeedsRender`] without reading any
+/// plane.
+pub fn fused_checkpoint_planes(
     project: &mut Project,
     scratch_root: &Path,
-) -> Result<(PathBuf, PathBuf), PlaneCacheError> {
-    let dir = plane_cache_dir(scratch_root, project.path());
-    std::fs::create_dir_all(&dir)?;
-    let composite = dir.join(COMPOSITE_FILENAME);
-    let zmap = dir.join(ZMAP_FILENAME);
+    id: &str,
+) -> Result<CheckpointPlanes, PlaneCacheError> {
+    if !project.history().get(id)?.ops.is_empty() {
+        return Ok(CheckpointPlanes::NeedsRender);
+    }
+    let (composite, zmap) = checkpoint_plane_paths(scratch_root, project.path(), id);
     let ffp_modified = std::fs::metadata(project.path())?.modified()?;
-    if !is_fresh(&composite, ffp_modified) {
-        project::materialize_plane(project, Plane::Composite, &composite)?;
+    if !(is_fresh(&composite, ffp_modified) && is_fresh(&zmap, ffp_modified)) {
+        write_checkpoint_planes(project, id, &composite, &zmap)?;
     }
-    if !is_fresh(&zmap, ffp_modified) {
-        project::materialize_plane(project, Plane::ZMap, &zmap)?;
-    }
+    Ok(CheckpointPlanes::Ready(composite, zmap))
+}
+
+/// Renders checkpoint `id` of the project at `project_path` into its plane
+/// cache pair, over a project opened on the calling thread. An op-bearing
+/// checkpoint re-hashes its sources on every call and refuses on any
+/// missing or changed frame.
+pub fn render_checkpoint_planes(
+    project_path: &Path,
+    scratch_root: &Path,
+    id: &str,
+) -> Result<(PathBuf, PathBuf), PlaneCacheError> {
+    let mut project = Project::open(project_path)?;
+    let (composite, zmap) = checkpoint_plane_paths(scratch_root, project_path, id);
+    write_checkpoint_planes(&mut project, id, &composite, &zmap)?;
     Ok((composite, zmap))
+}
+
+fn write_checkpoint_planes(
+    project: &mut Project,
+    id: &str,
+    composite: &Path,
+    zmap: &Path,
+) -> Result<(), PlaneCacheError> {
+    if let Some(dir) = composite.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    project::render_checkpoint(project, id, composite)?;
+    let checkpoint = project.history().get(id)?.clone();
+    project::materialize_zmap(project, &checkpoint, zmap)?;
+    Ok(())
+}
+
+/// One `"missing: <path>"` / `"changed: <path> (found at <path>)"` detail
+/// line cut down to its state and the frame's file name, which a pane-wide
+/// line would otherwise elide.
+fn frame_line(line: &str) -> String {
+    let Some((state, rest)) = line.split_once(": ") else {
+        return line.to_string();
+    };
+    let path = rest.split(" (found at ").next().unwrap_or(rest);
+    let name = Path::new(path)
+        .file_name()
+        .map_or(path.into(), |name| name.to_string_lossy());
+    format!("{state}: {name}")
+}
+
+/// The right pane's text for a checkpoint it cannot show, one entry per
+/// line: a heading, then each missing or changed frame. Never names the
+/// checkpoint.
+pub fn render_refusal_lines(err: &PlaneCacheError) -> Vec<String> {
+    match err {
+        PlaneCacheError::Project(ProjectError::RenderSourcesUnavailable { detail, .. }) => {
+            std::iter::once(
+                "Cannot show this checkpoint — these frames are missing or changed:".to_string(),
+            )
+            .chain(detail.lines().map(frame_line))
+            .collect()
+        }
+        _ => {
+            eprintln!("failed to render a checkpoint: {err}");
+            vec!["Cannot show this checkpoint.".to_string()]
+        }
+    }
+}
+
+/// A checkpoint render worker's result as the controller keeps it: the
+/// planes, or the right pane's refusal lines. A panicked worker refuses with
+/// the generic line rather than leaving its row pending.
+pub fn render_outcome(
+    result: std::thread::Result<Result<(PathBuf, PathBuf), PlaneCacheError>>,
+) -> Result<(PathBuf, PathBuf), Vec<String>> {
+    match result {
+        Ok(rendered) => rendered.map_err(|err| render_refusal_lines(&err)),
+        Err(_) => {
+            eprintln!("a checkpoint render panicked");
+            Err(vec!["Cannot show this checkpoint.".to_string()])
+        }
+    }
+}
+
+/// What the export modal writes: the tab's current position, resolved on
+/// the calling thread so the worker needs nothing but this and a
+/// destination.
+pub enum ExportSource {
+    /// A saved checkpoint: reopens `project_path` and calls
+    /// [`project::export_checkpoint`].
+    Saved { project_path: PathBuf, id: String },
+    /// A held row's own state -- not yet in any `.ffp`.
+    Held(HeldCheckpoint),
+    /// The active tab's edit session applied over its current row: a clone
+    /// of `EditSession::indices()`, the map's own shape, and the row's own
+    /// sources/registration/reference/description (`ProjectTab::fused()`
+    /// for the first two).
+    Live {
+        width: u32,
+        height: u32,
+        indices: Vec<u16>,
+        sources: Vec<PathBuf>,
+        registration: Registration,
+        reference: usize,
+        description: String,
+    },
+}
+
+/// [`export_position`]'s own error: a project/render failure, or writing a
+/// live export's temp Z-Map.
+#[derive(Debug, thiserror::Error)]
+pub enum ExportError {
+    #[error(transparent)]
+    Project(#[from] ProjectError),
+    #[error(transparent)]
+    ZMap(#[from] ZMapError),
+}
+
+/// A process-wide counter, so two live exports started in the same process
+/// never share a temp Z-Map path.
+static NEXT_EXPORT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Writes `source`'s image to `path` as the default TIFF (16-bit
+/// uncompressed, EXIF and ICC on) -- the export modal's own worker body,
+/// run off the UI thread. A held row's or a live edit session's export
+/// changes nothing about the project: no checkpoint is written, no `.ffp`
+/// touched, and a live export's temp Z-Map is removed whether the write
+/// finishes or fails.
+pub fn export_position(
+    source: ExportSource,
+    path: &Path,
+    options: &project::export::ExportOptions,
+    metadata: &project::export::MetadataOptions,
+) -> Result<(), ExportError> {
+    match source {
+        ExportSource::Saved { project_path, id } => {
+            let mut project = Project::open(&project_path)?;
+            project::export_checkpoint(&mut project, &id, path, options, metadata)?;
+        }
+        ExportSource::Held(held) => {
+            let zmap_source = project::ZmapSource {
+                reference: held.align.as_ref().map_or(0, |a| a.reference),
+                sources: held.sources,
+                registration: held.registration,
+                description: held.composite_description,
+            };
+            project::export_zmap(&held.zmap, &zmap_source, path, options, metadata)?;
+        }
+        ExportSource::Live {
+            width,
+            height,
+            indices,
+            sources,
+            registration,
+            reference,
+            description,
+        } => {
+            let temp = std::env::temp_dir().join(format!(
+                "focusforge-export-{}-{}.tif",
+                std::process::id(),
+                NEXT_EXPORT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let write = (|| -> Result<(), ExportError> {
+                write_zmap(&temp, width, height, sources.len() as u32, &indices)?;
+                let zmap_source = project::ZmapSource {
+                    sources,
+                    registration,
+                    reference,
+                    description,
+                };
+                project::export_zmap(&temp, &zmap_source, path, options, metadata)?;
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(&temp);
+            write?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes `indices`, a whole `width` x `height` map over `frame_count`
+/// sources, as the Z-Map file at `path`.
+pub fn write_zmap(
+    path: &Path,
+    width: u32,
+    height: u32,
+    frame_count: u32,
+    indices: &[u16],
+) -> Result<(), ZMapError> {
+    let info = ZMapInfo::new(width, height, frame_count)?;
+    let mut writer = ZMapWriter::create(path, info)?;
+    writer.write_tile(
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
+        indices,
+    )?;
+    writer.finish()?;
+    Ok(())
+}
+
+/// An export worker's result as the controller keeps it: `Ok` once written,
+/// or the modal's own refusal lines -- [`render_outcome`]'s counterpart. A
+/// panicked worker refuses with the generic line rather than leaving the
+/// modal writing forever.
+pub fn export_outcome(
+    result: std::thread::Result<Result<(), ExportError>>,
+) -> Result<(), ExportRefusal> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(ExportRefusal {
+            lines: export_refusal_lines(&err),
+            locate: matches!(
+                err,
+                ExportError::Project(
+                    ProjectError::RenderSourcesUnavailable { .. }
+                        | ProjectError::ExportSourcesUnavailable { .. }
+                )
+            ),
+        }),
+        Err(_) => {
+            eprintln!("an export panicked");
+            Err(ExportRefusal {
+                lines: vec!["Cannot export this position.".to_string()],
+                locate: false,
+            })
+        }
+    }
+}
+
+/// A refused export as the modal shows it: its lines, and whether
+/// `Locate frames…` can help (only a missing or changed source).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportRefusal {
+    pub lines: Vec<String>,
+    pub locate: bool,
+}
+
+/// `n` with a comma between every group of three digits.
+fn thousands(n: u32) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// One `"<name> — missing"` / `"<name> — changed"` line -- [`frame_line`]'s
+/// counterpart for the export modal, which shows no `state: ` prefix.
+fn export_frame_line(line: &str) -> String {
+    let Some((state, rest)) = line.split_once(": ") else {
+        return line.to_string();
+    };
+    let path = rest.split(" (found at ").next().unwrap_or(rest);
+    let name = Path::new(path)
+        .file_name()
+        .map_or(path.into(), |name| name.to_string_lossy());
+    format!("{name} — {state}")
+}
+
+/// The export modal's own refusal lines: one per source for a missing or
+/// changed frame (a saved checkpoint's own recorded sources, or a held/live
+/// export's plain paths, which can only ever be `missing`), naming the
+/// underlying cause for anything else -- an unwritable destination above
+/// all.
+pub fn export_refusal_lines(err: &ExportError) -> Vec<String> {
+    match err {
+        ExportError::Project(ProjectError::RenderSourcesUnavailable { detail, .. })
+        | ExportError::Project(ProjectError::ExportSourcesUnavailable { detail, .. }) => {
+            detail.lines().map(export_frame_line).collect()
+        }
+        ExportError::Project(ProjectError::ExportWriteFailed { path, source }) => {
+            vec![format!("Can't write {}: {source}", path.display())]
+        }
+        ExportError::Project(ProjectError::ExportTooLarge {
+            format,
+            width,
+            height,
+            limit,
+            ..
+        }) => vec![format!(
+            "{} can't be bigger than {} pixels on a side. This image is {} × {}.",
+            format.to_uppercase(),
+            thousands(*limit),
+            thousands(*width),
+            thousands(*height)
+        )],
+        ExportError::Project(ProjectError::ExportUnsupportedSamples { .. }) => vec![
+            "PNG and JPEG can only save grey or colour (RGB) images; this one has extra channels."
+                .to_string(),
+        ],
+        ExportError::Project(ProjectError::ExportOptions { source }) => {
+            vec![format!("Some export settings aren't valid: {source}.")]
+        }
+        _ => {
+            eprintln!("failed to export a checkpoint: {err}");
+            vec!["Cannot export this position.".to_string()]
+        }
+    }
+}
+
+/// The left pane's text for a frame it cannot open, in
+/// [`render_refusal_lines`]' form: a heading, then `missing: <file name>`
+/// when no file is at `path`, `changed: <file name>` when the file there no
+/// longer reads as a frame.
+pub fn frame_refusal_lines(path: &Path) -> Vec<String> {
+    let state = if path.is_file() { "changed" } else { "missing" };
+    vec![
+        "Cannot show this frame:".to_string(),
+        frame_line(&format!("{state}: {}", path.display())),
+    ]
 }
 
 /// What can go wrong opening a tab's editor state: its Z-Map or the source
@@ -750,16 +1088,20 @@ pub fn open_edit_session(
     })
 }
 
-/// Writes `held`, in order, as one checkpoint chain at `target` -- onto the
-/// project already there when `onto_existing` -- and opens the result. On
-/// failure `target` is left exactly as it was.
-pub fn save_held(
+/// Writes `entries`, each under its own parent, and applies `deletes` at
+/// `target` -- onto the project already there when `onto_existing` -- then
+/// opens the result. `keep` stays stored even when deleted. Returns it with
+/// the id written per entry [`kept_entries`] keeps. On failure `target` is
+/// left exactly as it was.
+pub fn save_in_memory(
     target: &Path,
-    held: &[HeldCheckpoint],
+    entries: &[InMemoryCheckpoint],
+    deletes: &[ParentRef],
+    keep: Option<&ParentRef>,
     onto_existing: bool,
-) -> Result<Project, ProjectError> {
-    project::seal_held(target, held, onto_existing)?;
-    Project::open(target)
+) -> Result<(Project, Vec<String>), ProjectError> {
+    let ids = project::seal_in_memory(target, entries, deletes, keep, onto_existing)?;
+    Ok((Project::open(target)?, ids))
 }
 
 /// One completed worker thread's result, boiled down to the shell's next
@@ -879,7 +1221,7 @@ pub fn settle(
             };
             Settled {
                 state: RunState::Fused {
-                    at: format_utc_hhmm(held.created_at),
+                    at: crate::checkpoints::local_hhmm(held.created_at),
                     unaligned: alignment.unaligned,
                 },
                 held: Some(held),
@@ -912,5 +1254,75 @@ pub fn settle(
             alignment: None,
             operation: Some(FailedOperation::Fusion),
         },
+    }
+}
+
+#[cfg(test)]
+mod export_refusal_tests {
+    use super::*;
+    use focusforge_core::params::ParamValue;
+    use focusforge_core::project::export::{ExportFormat, ExportOptions};
+
+    fn too_large(width: u32, height: u32) -> ExportError {
+        ExportError::Project(ProjectError::ExportTooLarge {
+            path: PathBuf::from("out.jpg"),
+            format: "jpeg".to_string(),
+            width,
+            height,
+            limit: 65_535,
+        })
+    }
+
+    #[test]
+    fn too_large_names_the_limit_and_the_size() {
+        assert_eq!(
+            export_refusal_lines(&too_large(70_000, 40_000)),
+            vec![
+                "JPEG can't be bigger than 65,535 pixels on a side. This image is 70,000 × 40,000."
+            ]
+        );
+        let one_over = export_refusal_lines(&too_large(65_536, 12));
+        assert_eq!(
+            one_over,
+            vec!["JPEG can't be bigger than 65,535 pixels on a side. This image is 65,536 × 12."]
+        );
+    }
+
+    #[test]
+    fn unsupported_samples_name_the_cause() {
+        let err = ExportError::Project(ProjectError::ExportUnsupportedSamples {
+            path: PathBuf::from("out.png"),
+            format: "png".to_string(),
+            samples_per_pixel: 4,
+        });
+        assert_eq!(
+            export_refusal_lines(&err),
+            vec![
+                "PNG and JPEG can only save grey or colour (RGB) images; this one has extra channels."
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_options_name_the_setting() {
+        let mut values = ParamValues::new();
+        values.insert("jpeg-quality".to_string(), ParamValue::Int(0));
+        let err = ExportOptions::from_values(ExportFormat::Jpeg, &values).unwrap_err();
+        let lines = export_refusal_lines(&ExportError::Project(err));
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with("Some export settings aren't valid: ") && lines[0].ends_with('.'),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("jpeg-quality"), "{lines:?}");
+    }
+
+    #[test]
+    fn only_a_missing_source_offers_locate() {
+        let refusal = export_outcome(Ok(Err(too_large(70_000, 1)))).unwrap_err();
+        assert!(!refusal.locate);
+        let panicked = export_outcome(Err(Box::new("boom"))).unwrap_err();
+        assert!(!panicked.locate);
+        assert_eq!(panicked.lines, vec!["Cannot export this position."]);
     }
 }

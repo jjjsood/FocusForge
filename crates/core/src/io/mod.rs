@@ -18,6 +18,7 @@ mod error;
 mod frame;
 mod frame_set;
 mod grouping;
+mod metadata;
 mod paths;
 pub mod raw;
 #[cfg(feature = "test-algorithms")]
@@ -32,12 +33,18 @@ pub use grouping::{
     CaptureTime, GROUP_GAP, Group, GroupSignal, Proposal, capture_time, one_group, propose,
     propose_with_progress,
 };
+pub(crate) use metadata::{
+    IccOrigin, MetadataPlan, XMP_APP1_HEADER, exif_blob, icc_tag_entry, iptc_tag_entry,
+    photoshop_iptc_segment, resolve_plan, xmp_tag_entry,
+};
+pub use metadata::{MetadataTags, SourceKind, SourceMetadata, TagEntry, read_source_metadata};
 pub use paths::{
-    RAW_EXTENSIONS, TIFF_EXTENSIONS, all_frame_paths, frame_paths_for_extensions, has_extension,
+    JPEG_EXTENSIONS, PNG_EXTENSIONS, RAW_EXTENSIONS, TIFF_EXTENSIONS, all_frame_paths,
+    frame_paths_for_extensions, has_extension,
 };
 pub use raw::{DEFAULT_RAW_CACHE_BYTES, RawError, RawMetadata, RawStack};
 pub use tiff::decoded::{CacheStats, DecodedTiffStack};
 pub use tiff::header::{ByteOrder, TiffHeader};
 pub use tiff::segment::{DecodedSegment, SegmentOrigin, TiffSegmentDecoder, TiffSegmentReader};
 pub use tiff::stack::{COMPOSITE_FILENAME, TiffStack, ZMAP_FILENAME, frame_paths, is_frame_path};
-pub use tiff::writer::{TiffSpec, TiffWriter};
+pub use tiff::writer::{StripCompression, StripSpec, StripWriter, TiffSpec, TiffWriter};

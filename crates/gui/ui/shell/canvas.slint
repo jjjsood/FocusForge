@@ -55,9 +55,9 @@ component FFUndockControl inherits Rectangle {
 export component FFPane inherits Rectangle {
     in property <image> source;
     in property <string> label: "";
-    // The reader's own refusal text for `source`, if it could not be drawn
-    // -- shown centred in place of the image while non-empty.
-    in property <string> message: "";
+    // Why `source` could not be drawn, one entry per line -- shown centred
+    // in place of the image while non-empty.
+    in property <[string]> message-lines: [];
     in property <bool> undock-enabled: true;
     // Whether a project is open -- the label and the undock control have
     // nothing to name or to undock before one is, so they are hidden rather
@@ -94,12 +94,16 @@ export component FFPane inherits Rectangle {
         image-rendering: root.pixelated ? ImageRendering.pixelated : ImageRendering.smooth;
     }
 
-    if root.message != "" : pane-message := FFErrorRow {
+    if root.message-lines.length > 0 : VerticalLayout {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         width: parent.width - 2 * Theme.space-6;
-        message: root.message;
-        horizontal-alignment: center;
+        height: self.preferred-height;
+
+        for line in root.message-lines : FFErrorRow {
+            message: line;
+            horizontal-alignment: center;
+        }
     }
 
     pane-label := FFPaneLabel {
@@ -121,11 +125,13 @@ export component FFPane inherits Rectangle {
 export component FFCanvas inherits Rectangle {
     in property <image> composite-source;
     in property <image> zmap-source;
-    // The left pane's own source, label and refusal text -- see
-    // `FFPane::message`.
+    // The left pane's own source, label and refusal -- see
+    // `FFPane::message-lines`.
     in property <image> frame-source;
     in property <string> frame-label: "";
-    in property <string> frame-message: "";
+    in property <[string]> frame-message-lines: [];
+    // The right pane's refusal -- see `FFPane::message-lines`.
+    in property <[string]> composite-message-lines: [];
     in property <bool> undock-enabled: true;
     // Forwarded to both panes' chrome -- see `FFPane::project-loaded`.
     in property <bool> project-loaded: false;
@@ -253,7 +259,7 @@ export component FFCanvas inherits Rectangle {
         height: parent.height - 2 * ShellGeometry.pane-gutter;
         source: root.frame-source;
         label: root.frame-label;
-        message: root.frame-message;
+        message-lines: root.frame-message-lines;
         undock-enabled: root.undock-enabled;
         project-loaded: root.project-loaded;
         image-x: root.frame-image-x;
@@ -281,6 +287,7 @@ export component FFCanvas inherits Rectangle {
         height: pane-left.height;
         source: root.composite-source;
         label: "Composite";
+        message-lines: root.composite-message-lines;
         undock-enabled: root.undock-enabled;
         project-loaded: root.project-loaded;
         image-x: root.image-x;
