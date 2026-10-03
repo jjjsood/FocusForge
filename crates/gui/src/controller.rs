@@ -7261,11 +7261,10 @@ impl AppController {
 
     /// Applies the result a save worker parked, never blocking: a write that
     /// succeeded records the file in `Recent`, opens the tab on it and clears
-    /// what it wrote; a failed
-    /// one leaves everything in memory, notes why, and drops the saves and
-    /// the close or quit that waited on it. `None` while no result is
-    /// parked; otherwise whether the write succeeded and the save queued
-    /// behind it, if any, started.
+    /// what it wrote; a failed one leaves everything in memory, notes why, and
+    /// drops the saves and the close or quit that waited on it. `None` while
+    /// no result is parked; otherwise whether the write succeeded and the save
+    /// queued behind it, if any, started.
     pub fn settle_save(&mut self) -> Option<bool> {
         let result = self
             .state
