@@ -357,7 +357,7 @@ impl StackAlgorithm for Laplacian {
     }
 
     fn display_name(&self) -> &str {
-        "Details (Laplacian pyramid)"
+        "Details"
     }
 
     fn is_default(&self) -> bool {

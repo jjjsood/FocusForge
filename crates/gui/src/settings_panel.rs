@@ -8,7 +8,7 @@
 //! `crate::controller` never names that crate directly. [`crate::settings_panel::control_kind`] is
 //! the crate's only `match` on `ParamKind`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // Re-exported (`pub(crate)`) so `crate::controller` can name the types it
 // stores on a project tab and passes to a mutator -- `ParamDesc`'s own
@@ -29,6 +29,8 @@ pub(crate) struct ActiveTabParams<'a> {
     pub ctx: Option<&'a StackContext>,
     pub errors: &'a BTreeMap<String, ParamViolation>,
     pub menu_open: Option<&'a str>,
+    /// The sections whose `More...` fold-out the user opened.
+    pub expanded: &'a BTreeSet<String>,
     pub fuse_id: &'a str,
     pub fuse_values: &'a ParamValues,
     pub align_id: &'a str,
@@ -161,6 +163,14 @@ pub enum RowKind {
     /// enabled state, the same convention [`RowKind::Bool`] uses for its own
     /// value.
     ResetAll,
+    /// A section's `More...` header: the band that opens and closes the
+    /// advanced rows below it. `SettingsRow::selected` carries
+    /// `"true"`/`"false"` for open, and `SettingsRow::extent` the height of
+    /// the band including the rows it holds.
+    More,
+    /// The empty space closing an open fold-out; an open fold-out's rows are
+    /// the nested rows between its [`RowKind::More`] and this row.
+    MoreEnd,
 }
 
 /// A section heading's provenance axis. `Default` carries the `DEFAULT`
@@ -211,23 +221,39 @@ pub struct SettingsRow {
     /// non-uniform-pitch shape the tab strip's fixed `tab-pitch` does not
     /// need.
     pub top: f32,
+    /// Whether the row sits inside an open `More...` fold-out, on its tint.
+    pub nested: bool,
+    /// A [`RowKind::More`] row's band height, its own header while closed and
+    /// the header plus every nested row while open; `0` on any other kind.
+    pub extent: f32,
 }
 
 impl SettingsRow {
-    pub(crate) fn heading(section: &str, label: &str, state: HeadingState) -> Self {
+    /// A row of `kind` with every field at its type's default.
+    pub(crate) fn new(kind: RowKind, section: &str, id: &str) -> Self {
         SettingsRow {
-            kind: RowKind::SectionHeading,
+            kind,
             section: section.to_string(),
-            id: section.to_string(),
-            label: label.to_string(),
+            id: id.to_string(),
+            label: String::new(),
             value_text: String::new(),
             fraction: 0.0,
             choices: Vec::new(),
             choice_ids: Vec::new(),
             selected: String::new(),
             menu_open: false,
-            heading_state: state,
+            heading_state: HeadingState::Default,
             top: 0.0,
+            nested: false,
+            extent: 0.0,
+        }
+    }
+
+    pub(crate) fn heading(section: &str, label: &str, state: HeadingState) -> Self {
+        SettingsRow {
+            label: label.to_string(),
+            heading_state: state,
+            ..SettingsRow::new(RowKind::SectionHeading, section, section)
         }
     }
 }
@@ -275,9 +301,11 @@ pub const PARAM_ROW_LOG: f32 = 60.0;
 /// its trailing gap.
 pub const PARAM_ROW_FIELD: f32 = 45.0;
 /// `ShellGeometry.param-row-bool`: `FFToggle`'s own row, label and control
-/// on one line. Always the last row of a section, so it carries no trailing
-/// gap of its own.
+/// on one line; [`PARAM_ROW_BOOL_GAP`] follows it.
 pub const PARAM_ROW_BOOL: f32 = 20.0;
+/// `ShellGeometry.param-row-bool-gap`: the space under a toggle row, so the
+/// next row or `More...` header starts one grid step below the toggle.
+pub const PARAM_ROW_BOOL_GAP: f32 = 12.0;
 /// `ShellGeometry.param-row-enum`: `FFMenu`'s closed row plus its trailing
 /// gap.
 pub const PARAM_ROW_ENUM: f32 = 43.0;
@@ -312,6 +340,12 @@ pub const PANEL_BOTTOM_BUFFER: f32 = 16.0;
 pub const RESET_ALL_TOP_GAP: f32 = 32.0;
 /// `ShellGeometry.reset-all-height`: the reset-all control's own height.
 pub const RESET_ALL_HEIGHT: f32 = 32.0;
+/// `ShellGeometry.more-height`: a `More...` header band.
+pub const MORE_HEIGHT: f32 = 32.0;
+/// `ShellGeometry.more-gap`: the space under a `More...` header, between it
+/// and its first row (open) or the next section (closed), and under an open
+/// fold-out's last row.
+pub const MORE_GAP: f32 = 12.0;
 
 /// The one match on [`ParamKind`] in the crate. `Float { logarithmic: true
 /// }` and `Float { logarithmic: false }` are separate arms -- the flag
@@ -451,42 +485,65 @@ struct SectionContext<'a> {
     host: &'a focusforge_core::host::HostFacts,
     errors: &'a BTreeMap<String, ParamViolation>,
     menu_open: Option<&'a str>,
+    expanded: &'a BTreeSet<String>,
+}
+
+/// One entry of a section's algorithm picker.
+struct PickerOption {
+    id: String,
+    label: String,
+    /// Listed only while the section's `More...` fold-out is open, or while
+    /// it is the selected method.
+    advanced: bool,
 }
 
 /// Builds the whole panel's flat row list, Fuse then Align then Crop: each
-/// section's heading, its algorithm picker (Fuse/Align only), then one row
-/// per [`ParamDesc`] in declaration order with an [`RowKind::Error`] row
-/// trailing any field in violation. With no tab active the panel still
-/// renders, seeded like a fresh unsaved tab but with no [`StackContext`].
+/// section's heading, its algorithm picker (Fuse/Align only), one row per
+/// plain [`ParamDesc`] in declaration order with a [`RowKind::Error`] row
+/// trailing any field in violation, then a `More...` header over the advanced
+/// ones. With no tab active the panel still renders, collapsed, seeded like a
+/// fresh unsaved tab but with no [`StackContext`].
 pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow> {
     let empty_values = ParamValues::new();
     let empty_errors = BTreeMap::new();
+    let empty_expanded = BTreeSet::new();
     let default_fuse_id = default_fuse_id();
     let default_align_id = default_align_id();
 
-    let (ctx, errors, menu_open, fuse_id, fuse_values, align_id, align_values, project_values) =
-        match &active {
-            Some(a) => (
-                a.ctx,
-                a.errors,
-                a.menu_open,
-                a.fuse_id,
-                a.fuse_values,
-                a.align_id,
-                a.align_values,
-                a.project_values,
-            ),
-            None => (
-                None,
-                &empty_errors,
-                None,
-                default_fuse_id.as_str(),
-                &empty_values,
-                default_align_id.as_str(),
-                &empty_values,
-                &empty_values,
-            ),
-        };
+    let (
+        ctx,
+        errors,
+        menu_open,
+        expanded,
+        fuse_id,
+        fuse_values,
+        align_id,
+        align_values,
+        project_values,
+    ) = match &active {
+        Some(a) => (
+            a.ctx,
+            a.errors,
+            a.menu_open,
+            a.expanded,
+            a.fuse_id,
+            a.fuse_values,
+            a.align_id,
+            a.align_values,
+            a.project_values,
+        ),
+        None => (
+            None,
+            &empty_errors,
+            None,
+            &empty_expanded,
+            default_fuse_id.as_str(),
+            &empty_values,
+            default_align_id.as_str(),
+            &empty_values,
+            &empty_values,
+        ),
+    };
 
     let host = focusforge_core::host::snapshot();
     let section_ctx = SectionContext {
@@ -494,13 +551,20 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
         host: &host,
         errors,
         menu_open,
+        expanded,
     };
     let mut rows = Vec::new();
 
     if let Ok(fuse) = registry::find_stack(fuse_id) {
-        let picker: Vec<(String, String)> = registry::stack_algorithms()
+        let mut methods = registry::stack_algorithms();
+        methods.sort_by_key(|a| (!a.is_default(), a.advanced()));
+        let picker = methods
             .iter()
-            .map(|a| (a.id().to_string(), a.display_name().to_string()))
+            .map(|a| PickerOption {
+                id: a.id().to_string(),
+                label: a.display_name().to_string(),
+                advanced: a.advanced(),
+            })
             .collect();
         rows.extend(section_rows(
             "fuse",
@@ -512,9 +576,13 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
         ));
     }
     if let Ok(align) = registry::find_align(align_id) {
-        let picker: Vec<(String, String)> = registry::align_algorithms()
+        let picker = registry::align_algorithms()
             .iter()
-            .map(|a| (a.id().to_string(), a.display_name().to_string()))
+            .map(|a| PickerOption {
+                id: a.id().to_string(),
+                label: a.display_name().to_string(),
+                advanced: false,
+            })
             .collect();
         rows.extend(section_rows(
             "align",
@@ -539,40 +607,44 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
         .any(|r| r.kind == RowKind::SectionHeading && r.heading_state == HeadingState::Explicit)
         || active.as_ref().is_some_and(|a| !a.remembered.is_empty());
     rows.push(SettingsRow {
-        kind: RowKind::ResetAll,
-        section: String::new(),
-        id: String::new(),
-        label: String::new(),
-        value_text: String::new(),
-        fraction: 0.0,
-        choices: Vec::new(),
-        choice_ids: Vec::new(),
         selected: any_explicit.to_string(),
-        menu_open: false,
         heading_state: HeadingState::Pending,
-        top: 0.0,
+        ..SettingsRow::new(RowKind::ResetAll, "", "")
     });
 
     rows
 }
 
 /// One section's own rows: its heading, its algorithm picker when `picker`
-/// is `Some`, and one row (plus a trailing [`RowKind::Error`] row on a
-/// violation) per entry of `schema`, in declaration order.
+/// is `Some`, one row (plus a trailing [`RowKind::Error`] row on a violation)
+/// per plain entry of `schema` in declaration order, then -- when the section
+/// has advanced content -- a [`RowKind::More`] header, and while it is open
+/// the advanced entries as nested rows and the closing [`RowKind::MoreEnd`].
+/// A section opens when the user opened it or a hidden field is in violation.
 fn section_rows(
     section: &str,
     heading_label: &str,
     schema: &[ParamDesc],
     values: &ParamValues,
     section_ctx: &SectionContext<'_>,
-    picker: Option<(&str, Vec<(String, String)>)>,
+    picker: Option<(&str, Vec<PickerOption>)>,
 ) -> Vec<SettingsRow> {
     let SectionContext {
         ctx,
         host,
         errors,
         menu_open,
+        expanded,
     } = *section_ctx;
+
+    let advanced_picker = picker
+        .as_ref()
+        .is_some_and(|(_, options)| options.iter().any(|o| o.advanced));
+    let has_more = advanced_picker || schema.iter().any(|desc| desc.advanced);
+    let hidden_violation = schema
+        .iter()
+        .any(|desc| desc.advanced && errors.contains_key(&menu_key(section, &desc.id)));
+    let open = expanded.contains(section) || hidden_violation;
 
     let heading_state = if !values.is_empty() {
         HeadingState::Explicit
@@ -588,23 +660,22 @@ fn section_rows(
         let key = menu_key(section, "algorithm");
         let value_text = options
             .iter()
-            .find(|(id, _)| id == selected_id)
-            .map(|(_, label)| label.clone())
+            .find(|o| o.id == selected_id)
+            .map(|o| o.label.clone())
             .unwrap_or_default();
-        let (choice_ids, choices): (Vec<String>, Vec<String>) = options.into_iter().unzip();
+        let (choice_ids, choices): (Vec<String>, Vec<String>) = options
+            .into_iter()
+            .filter(|o| open || !o.advanced || o.id == selected_id)
+            .map(|o| (o.id, o.label))
+            .unzip();
         rows.push(SettingsRow {
-            kind: RowKind::Picker,
-            section: section.to_string(),
-            id: "algorithm".to_string(),
             label: "Algorithm".to_string(),
             value_text,
-            fraction: 0.0,
             choices,
             choice_ids,
             selected: selected_id.to_string(),
             menu_open: menu_open == Some(key.as_str()),
-            heading_state: HeadingState::Default,
-            top: 0.0,
+            ..SettingsRow::new(RowKind::Picker, section, "algorithm")
         });
     }
 
@@ -616,33 +687,47 @@ fn section_rows(
     // losing every other field in the section.
     let resolved: ResolvedParams = resolve_in(schema, values, ctx, host).unwrap_or_default();
 
-    for desc in schema {
+    let param_rows = |desc: &ParamDesc, nested: bool| {
         let key = menu_key(section, &desc.id);
         let value = resolved
             .get(&desc.id)
             .map(|r| r.value.clone())
             .unwrap_or_else(|| desc.default.clone());
-        rows.push(field_row(
+        let mut rows = vec![field_row(
             section,
             desc,
             &value,
             menu_open == Some(key.as_str()),
-        ));
+        )];
         if let Some(violation) = errors.get(&key) {
             rows.push(SettingsRow {
-                kind: RowKind::Error,
-                section: section.to_string(),
-                id: desc.id.clone(),
-                label: String::new(),
                 value_text: violation_text(violation),
-                fraction: 0.0,
-                choices: Vec::new(),
-                choice_ids: Vec::new(),
-                selected: String::new(),
-                menu_open: false,
-                heading_state: HeadingState::Default,
-                top: 0.0,
+                ..SettingsRow::new(RowKind::Error, section, &desc.id)
             });
+        }
+        for row in &mut rows {
+            row.nested = nested;
+        }
+        rows
+    };
+
+    for desc in schema.iter().filter(|desc| !desc.advanced) {
+        rows.extend(param_rows(desc, false));
+    }
+    if has_more {
+        let more = rows.len();
+        rows.push(SettingsRow {
+            selected: open.to_string(),
+            extent: MORE_HEIGHT,
+            ..SettingsRow::new(RowKind::More, section, "more")
+        });
+        if open {
+            for desc in schema.iter().filter(|desc| desc.advanced) {
+                rows.extend(param_rows(desc, true));
+            }
+            let drawer: f32 = rows[more + 1..].iter().map(row_total_height).sum();
+            rows[more].extent = MORE_HEIGHT + MORE_GAP + drawer;
+            rows.push(SettingsRow::new(RowKind::MoreEnd, section, "more-end"));
         }
     }
 
@@ -659,18 +744,8 @@ pub(crate) fn field_row(
 ) -> SettingsRow {
     let kind = control_kind(&desc.kind);
     let mut row = SettingsRow {
-        kind,
-        section: section.to_string(),
-        id: desc.id.clone(),
         label: desc.label.clone(),
-        value_text: String::new(),
-        fraction: 0.0,
-        choices: Vec::new(),
-        choice_ids: Vec::new(),
-        selected: String::new(),
-        menu_open: false,
-        heading_state: HeadingState::Default,
-        top: 0.0,
+        ..SettingsRow::new(kind, section, &desc.id)
     };
     match kind {
         RowKind::LinearFloat | RowKind::LogFloat => {
@@ -702,7 +777,12 @@ pub(crate) fn field_row(
             row.selected = selected;
             row.menu_open = menu_open;
         }
-        RowKind::SectionHeading | RowKind::Picker | RowKind::Error | RowKind::ResetAll => {
+        RowKind::SectionHeading
+        | RowKind::Picker
+        | RowKind::Error
+        | RowKind::ResetAll
+        | RowKind::More
+        | RowKind::MoreEnd => {
             unreachable!("control_kind never returns a pseudo-row kind")
         }
     }
@@ -723,9 +803,11 @@ pub fn row_height(kind: RowKind) -> f32 {
         RowKind::LinearFloat | RowKind::Int => PARAM_LABEL_HEIGHT + PARAM_ROW_LINEAR,
         RowKind::LogFloat => PARAM_LABEL_HEIGHT + PARAM_ROW_LOG,
         RowKind::Enum => PARAM_LABEL_HEIGHT + PARAM_ROW_ENUM,
-        RowKind::Bool => PARAM_ROW_BOOL,
+        RowKind::Bool => PARAM_ROW_BOOL + PARAM_ROW_BOOL_GAP,
         RowKind::Error => PARAM_ERROR_HEIGHT,
         RowKind::ResetAll => RESET_ALL_TOP_GAP + RESET_ALL_HEIGHT,
+        RowKind::More => MORE_HEIGHT + MORE_GAP,
+        RowKind::MoreEnd => MORE_GAP,
     }
 }
 
@@ -947,18 +1029,8 @@ mod tests {
 
     fn linear_row(id: &str) -> SettingsRow {
         SettingsRow {
-            kind: RowKind::LinearFloat,
-            section: "fuse".to_string(),
-            id: id.to_string(),
             label: id.to_string(),
-            value_text: String::new(),
-            fraction: 0.0,
-            choices: Vec::new(),
-            choice_ids: Vec::new(),
-            selected: String::new(),
-            menu_open: false,
-            heading_state: HeadingState::Default,
-            top: 0.0,
+            ..SettingsRow::new(RowKind::LinearFloat, "fuse", id)
         }
     }
 

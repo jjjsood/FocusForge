@@ -194,7 +194,7 @@ impl StackAlgorithm for WeightedAverage {
     }
 
     fn display_name(&self) -> &str {
-        "Soft transitions (weighted average)"
+        "Soft transitions"
     }
 
     fn params(&self) -> &[ParamDesc] {

@@ -13,10 +13,10 @@ use std::time::Duration;
 use focusforge_core::params::{ParamKind, ParamValue, ParamValues, ParamViolation};
 use focusforge_core::registry;
 use focusforge_gui::settings_panel::{
-    HeadingState, PANEL_CONTENT_WIDTH, PARAM_ERROR_HEIGHT, PARAM_LABEL_HEIGHT, PARAM_ROW_BOOL,
-    PARAM_ROW_ENUM, PARAM_ROW_FIELD, PARAM_ROW_LINEAR, PARAM_ROW_LOG, RESET_ALL_HEIGHT,
-    RESET_ALL_TOP_GAP, RowKind, SECTION_HEADING_BOTTOM_GAP, SECTION_HEADING_HEIGHT, SettingsRow,
-    control_kind, slider_fraction,
+    HeadingState, MORE_GAP, MORE_HEIGHT, PANEL_CONTENT_WIDTH, PARAM_ERROR_HEIGHT,
+    PARAM_LABEL_HEIGHT, PARAM_ROW_BOOL, PARAM_ROW_BOOL_GAP, PARAM_ROW_ENUM, PARAM_ROW_FIELD,
+    PARAM_ROW_LINEAR, PARAM_ROW_LOG, RESET_ALL_HEIGHT, RESET_ALL_TOP_GAP, RowKind,
+    SECTION_HEADING_BOTTOM_GAP, SECTION_HEADING_HEIGHT, SettingsRow, control_kind, slider_fraction,
 };
 use focusforge_gui::{AppController, OpenOutcome};
 
@@ -33,8 +33,8 @@ fn open_mantis_512(controller: &mut AppController) {
     );
 }
 
-/// Every field row of `section` (no heading, no picker, no error rows), in
-/// panel order -- which is declaration order by construction.
+/// Every field row of `section` (no heading, picker, error or fold-out rows),
+/// in panel order.
 fn field_rows<'a>(rows: &'a [SettingsRow], section: &str) -> Vec<&'a SettingsRow> {
     let mut out = Vec::new();
     let mut in_section = false;
@@ -43,7 +43,16 @@ fn field_rows<'a>(rows: &'a [SettingsRow], section: &str) -> Vec<&'a SettingsRow
             in_section = row.section == section;
             continue;
         }
-        if in_section && row.kind != RowKind::Error && row.kind != RowKind::Picker {
+        if in_section
+            && !matches!(
+                row.kind,
+                RowKind::Error
+                    | RowKind::Picker
+                    | RowKind::More
+                    | RowKind::MoreEnd
+                    | RowKind::ResetAll
+            )
+        {
             out.push(row);
         }
     }
@@ -125,6 +134,7 @@ fn logarithmic_float_positions_by_decade() {
 fn pyramidal_ecc_renders_in_declaration_order() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
+    controller.toggle_section_more("align");
     controller.set_align_algorithm("pyramidal-ecc");
 
     let ecc = registry::find_align("pyramidal-ecc").expect("pyramidal-ecc must be registered");
@@ -216,6 +226,7 @@ fn auto_before_a_stack_is_unevaluated() {
 fn a_loaded_stack_resolves_its_auto_hooks() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
+    controller.toggle_section_more("align");
     controller.set_align_algorithm("pyramidal-ecc");
 
     let ecc = registry::find_align("pyramidal-ecc").unwrap();
@@ -486,6 +497,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
         common::open_and_settle(&mut controller, &[project]),
         OpenOutcome::Opened(_)
     ));
+    controller.toggle_section_more("crop");
     assert_eq!(row(&controller, "equalize").selected, "true");
     assert_eq!(row(&controller, "equalize-max-gain").value_text, "1.5");
 
@@ -500,6 +512,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
         common::open_and_settle(&mut plain, &[project]),
         OpenOutcome::Opened(_)
     ));
+    plain.toggle_section_more("crop");
     assert_eq!(row(&plain, "equalize").selected, "false");
     assert_eq!(row(&plain, "equalize-max-gain").value_text, "1.25");
 }
@@ -518,6 +531,7 @@ fn equalize_selected(controller: &AppController) -> String {
 fn the_equalize_row_shows_the_selected_methods_default() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
+    controller.toggle_section_more("crop");
 
     for (method, shown) in [
         ("depth-map", "true"),
@@ -534,6 +548,8 @@ fn the_equalize_row_shows_the_selected_methods_default() {
 fn an_explicit_equalize_choice_and_each_methods_values_survive_switching() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
+    controller.toggle_section_more("fuse");
+    controller.toggle_section_more("crop");
 
     controller.set_fuse_algorithm("depth-map");
     controller.set_param_value("fuse", "score-radius", ParamValue::Int(7));
@@ -577,6 +593,7 @@ fn a_reopened_focus_map_project_shows_how_its_run_was_equalized() {
         common::open_and_settle(&mut equalized, &[project]),
         OpenOutcome::Opened(_)
     ));
+    equalized.toggle_section_more("crop");
     assert_eq!(equalize_selected(&equalized), "true");
 
     let mut plain = AppController::new();
@@ -590,6 +607,7 @@ fn a_reopened_focus_map_project_shows_how_its_run_was_equalized() {
         common::open_and_settle(&mut plain, &[project]),
         OpenOutcome::Opened(_)
     ));
+    plain.toggle_section_more("crop");
     assert_eq!(
         equalize_selected(&plain),
         "false",
@@ -634,19 +652,11 @@ fn pickers_list_the_registry() {
     open_mantis_512(&mut controller);
     let panel = controller.settings_panel();
 
-    let fuse_picker = panel
-        .rows
-        .iter()
-        .find(|r| r.kind == RowKind::Picker && r.section == "fuse")
-        .expect("fuse picker row must exist");
-    let mut expected: Vec<String> = registry::stack_algorithms()
-        .iter()
-        .map(|a| a.id().to_string())
-        .collect();
-    expected.sort();
-    let mut got = fuse_picker.choice_ids.clone();
-    got.sort();
-    assert_eq!(got, expected);
+    assert_eq!(
+        picker_ids(&panel.rows, "fuse"),
+        collapsed_fuse_ids(),
+        "the collapsed fuse picker lists the registry's plain methods, the default first"
+    );
 
     let align_picker = panel
         .rows
@@ -693,6 +703,7 @@ fn layout_survives_a_long_label() {
 
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
+    controller.toggle_section_more("align");
     // A default-seeded id-sorted pick would land on `dummy-align` under a
     // feature-unified workspace build, whose synthetic schema carries no
     // enum field at all -- pin the real one explicitly, the way every
@@ -819,6 +830,7 @@ fn settings_scrolling_notifies_no_row_and_edits_notify_only_changed_rows() {
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
+    controller.toggle_section_more("align");
     controller.set_align_algorithm("pyramidal-ecc");
     let controller = Arc::new(Mutex::new(controller));
     let _installed = focusforge_gui::bridge::install(
@@ -1000,6 +1012,7 @@ fn a_slider_drag_survives_a_panel_push() {
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
+    controller.toggle_section_more("align");
     controller.set_align_algorithm("pyramidal-ecc");
     let controller = Arc::new(Mutex::new(controller));
     let _installed = focusforge_gui::bridge::install(
@@ -1164,6 +1177,9 @@ fn panel_metrics_mirror_the_slint_geometry() {
         (PARAM_ROW_LOG, "param-row-log: 60px"),
         (PARAM_ROW_FIELD, "param-row-field: 45px"),
         (PARAM_ROW_BOOL, "param-row-bool: 20px"),
+        (PARAM_ROW_BOOL_GAP, "param-row-bool-gap: 12px"),
+        (MORE_HEIGHT, "more-height: 32px"),
+        (MORE_GAP, "more-gap: 12px"),
         (PARAM_ROW_ENUM, "param-row-enum: 43px"),
         (PARAM_ERROR_HEIGHT, "param-error-height: 16px"),
         (SECTION_HEADING_HEIGHT, "section-heading-height: 41px"),
@@ -1294,6 +1310,7 @@ fn new_tab_and_empty_panel_default_to_details() {
 fn switching_methods_remembers_each_methods_values() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
+    controller.toggle_section_more("fuse");
 
     controller.set_fuse_algorithm("laplacian");
     controller.set_param_value("fuse", "levels", ParamValue::Int(3));
@@ -1325,6 +1342,7 @@ fn switching_methods_remembers_each_methods_values() {
 fn a_violation_is_not_remembered_with_a_method() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
+    controller.toggle_section_more("fuse");
     let has_error = |c: &AppController| {
         c.settings_panel()
             .rows
@@ -1357,6 +1375,7 @@ fn a_violation_is_not_remembered_with_a_method() {
 fn reselecting_the_current_method_keeps_its_values() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
+    controller.toggle_section_more("fuse");
     controller.set_fuse_algorithm("weighted-average");
     controller.set_param_value("fuse", "radius", ParamValue::Int(3));
 
@@ -1407,6 +1426,7 @@ fn reopened_project_remembers_only_its_sealed_method() {
         OpenOutcome::Opened(_)
     ));
 
+    controller.toggle_section_more("fuse");
     assert_eq!(picked_ids(&controller).0, "weighted-average");
     assert_eq!(fuse_value(&controller, "weight-exponent"), "5");
 
@@ -1427,4 +1447,413 @@ fn reopened_project_remembers_only_its_sealed_method() {
         "5",
         "the sealed method's values come back"
     );
+}
+
+// -- The per-section `More...` fold-out. --
+
+/// The ids of `section`'s picker options, in shown order.
+fn picker_ids(rows: &[SettingsRow], section: &str) -> Vec<String> {
+    rows.iter()
+        .find(|r| r.kind == RowKind::Picker && r.section == section)
+        .unwrap_or_else(|| panic!("no {section} picker"))
+        .choice_ids
+        .clone()
+}
+
+/// Every stack method's id, the default first and the advanced ones last --
+/// what an open Fuse picker lists.
+fn every_fuse_id() -> Vec<String> {
+    let mut methods = registry::stack_algorithms();
+    methods.sort_by_key(|a| (!a.is_default(), a.advanced()));
+    methods.iter().map(|a| a.id().to_string()).collect()
+}
+
+/// The fuse picker's ids while Fuse is collapsed: every registered method not
+/// marked advanced, the default first.
+fn collapsed_fuse_ids() -> Vec<String> {
+    every_fuse_id()
+        .into_iter()
+        .filter(|id| !registry::find(id).expect("registered").advanced())
+        .collect()
+}
+
+fn more_rows<'a>(rows: &'a [SettingsRow], section: &str) -> Vec<&'a SettingsRow> {
+    rows.iter()
+        .filter(|r| r.kind == RowKind::More && r.section == section)
+        .collect()
+}
+
+fn field_ids(rows: &[SettingsRow], section: &str) -> Vec<String> {
+    field_rows(rows, section)
+        .iter()
+        .map(|r| r.id.clone())
+        .collect()
+}
+
+fn row_index(rows: &[SettingsRow], section: &str, id: &str) -> usize {
+    rows.iter()
+        .position(|r| r.section == section && r.id == id && r.kind != RowKind::Error)
+        .unwrap_or_else(|| panic!("no {section}:{id} row"))
+}
+
+fn schema_ids(method: &str) -> Vec<String> {
+    registry::find(method)
+        .expect("registered")
+        .params()
+        .iter()
+        .map(|d| d.id.clone())
+        .collect()
+}
+
+#[test]
+fn more_toggle_is_a_shared_primitive() {
+    let contents = fs::read_to_string(
+        common::ui_dir()
+            .join("components")
+            .join("ff_more_toggle.slint"),
+    )
+    .unwrap();
+    let code = common::strip_line_comments(&contents);
+    assert_eq!(
+        code.matches("export component").count(),
+        1,
+        "ff_more_toggle.slint must export exactly one component"
+    );
+    assert!(code.contains("export component FFMoreToggle"));
+    for shell_import in ["shell/", "\"../shell"] {
+        assert!(
+            !code.contains(shell_import),
+            "a primitive must import no shell file"
+        );
+    }
+    assert!(!code.contains('#'), "a primitive holds no colour literal");
+}
+
+#[test]
+fn sections_start_collapsed_with_one_adjustment_at_most() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.set_align_algorithm("pyramidal-ecc");
+
+    for (method, visible) in [
+        ("laplacian", &[][..]),
+        ("weighted-average", &["weight-exponent"][..]),
+        ("depth-map", &[][..]),
+    ] {
+        controller.set_fuse_algorithm(method);
+        let rows = controller.settings_panel().rows;
+        assert_eq!(field_ids(&rows, "fuse"), visible, "{method}");
+        assert_eq!(field_ids(&rows, "align"), Vec::<String>::new(), "{method}");
+        assert_eq!(field_ids(&rows, "crop"), ["auto-crop"], "{method}");
+        for section in ["fuse", "align", "crop"] {
+            let more = more_rows(&rows, section);
+            assert_eq!(more.len(), 1, "{method}: one More row in {section}");
+            assert_eq!(
+                more[0].selected, "false",
+                "{method}: {section} starts closed"
+            );
+            let last_other = rows
+                .iter()
+                .rposition(|r| r.section == section && r.kind != RowKind::More)
+                .expect("the section has rows");
+            assert!(
+                row_index(&rows, section, "more") > last_other,
+                "{method}: {section}'s More row comes after its visible rows"
+            );
+        }
+    }
+
+    controller.set_fuse_algorithm("laplacian");
+    let fuse_picker = picker_ids(&controller.settings_panel().rows, "fuse");
+    assert_eq!(fuse_picker, collapsed_fuse_ids());
+    assert_eq!(fuse_picker[0], "laplacian", "the default comes first");
+    assert!(fuse_picker.contains(&"weighted-average".to_string()));
+    assert!(!fuse_picker.contains(&"depth-map".to_string()));
+}
+
+#[test]
+fn more_reveals_that_sections_advanced_rows() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.set_align_algorithm("pyramidal-ecc");
+
+    controller.toggle_section_more("fuse");
+    let rows = controller.settings_panel().rows;
+    let mut shown = field_ids(&rows, "fuse");
+    shown.sort();
+    let mut declared = schema_ids("laplacian");
+    declared.sort();
+    assert_eq!(shown, declared, "Fuse on Details shows every descriptor");
+    let more = rows
+        .iter()
+        .position(|r| r.kind == RowKind::More && r.section == "fuse")
+        .unwrap();
+    assert_eq!(rows[more].selected, "true");
+    assert!(
+        row_index(&rows, "fuse", "levels") > more,
+        "levels is advanced"
+    );
+    assert_eq!(
+        field_ids(&rows, "align"),
+        Vec::<String>::new(),
+        "other sections stay collapsed"
+    );
+
+    controller.toggle_section_more("align");
+    let rows = controller.settings_panel().rows;
+    assert_eq!(
+        field_ids(&rows, "align"),
+        schema_ids("pyramidal-ecc"),
+        "Align opens to every parameter, in declaration order"
+    );
+
+    controller.set_fuse_algorithm("depth-map");
+    controller.toggle_section_more("crop");
+    let rows = controller.settings_panel().rows;
+    assert_eq!(
+        field_ids(&rows, "crop"),
+        ["auto-crop", "equalize", "equalize-max-gain"]
+    );
+    assert_eq!(
+        rows[row_index(&rows, "crop", "equalize")].selected,
+        "true",
+        "Focus map equalizes by default"
+    );
+    controller.set_fuse_algorithm("laplacian");
+    let rows = controller.settings_panel().rows;
+    assert_eq!(rows[row_index(&rows, "crop", "equalize")].selected, "false");
+}
+
+#[test]
+fn more_row_covers_its_drawer() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+
+    let rows = controller.settings_panel().rows;
+    let closed = rows
+        .iter()
+        .position(|r| r.kind == RowKind::More && r.section == "fuse")
+        .unwrap();
+    assert_eq!(rows[closed].extent, MORE_HEIGHT);
+    assert_eq!(
+        rows[closed + 1].top - rows[closed].top,
+        MORE_HEIGHT + MORE_GAP
+    );
+    assert!(rows.iter().all(|r| !r.nested));
+
+    controller.toggle_section_more("fuse");
+    let rows = controller.settings_panel().rows;
+    let more = rows
+        .iter()
+        .position(|r| r.kind == RowKind::More && r.section == "fuse")
+        .unwrap();
+    let end = rows
+        .iter()
+        .position(|r| r.kind == RowKind::MoreEnd && r.section == "fuse")
+        .expect("an open fold-out ends in a closing row");
+    assert!(end > more + 1, "the drawer holds rows");
+    assert!(rows[more + 1..end].iter().all(|r| r.nested));
+    assert!(rows[..=more].iter().chain(&rows[end..]).all(|r| !r.nested));
+    assert_eq!(
+        rows[more].extent,
+        rows[end].top - rows[more].top,
+        "the band reaches the closing row"
+    );
+    assert_eq!(rows[end + 1].top - rows[end].top, MORE_GAP);
+}
+
+#[test]
+fn more_state_is_per_tab_and_per_section() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    let second = seal_without_align("more_second_tab", "laplacian");
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[second]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(controller.project_tabs().len(), 2);
+
+    let open_sections = |controller: &AppController| -> Vec<String> {
+        let rows = controller.settings_panel().rows;
+        ["fuse", "align", "crop"]
+            .into_iter()
+            .filter(|s| more_rows(&rows, s)[0].selected == "true")
+            .map(str::to_string)
+            .collect()
+    };
+
+    controller.select_project(0);
+    controller.toggle_section_more("fuse");
+    assert_eq!(open_sections(&controller), ["fuse"]);
+    controller.select_project(1);
+    assert!(
+        open_sections(&controller).is_empty(),
+        "the other tab is collapsed"
+    );
+    controller.select_project(0);
+    assert_eq!(
+        open_sections(&controller),
+        ["fuse"],
+        "the first tab kept its state"
+    );
+    controller.toggle_section_more("fuse");
+    assert!(
+        open_sections(&controller).is_empty(),
+        "a second toggle closes it"
+    );
+}
+
+#[test]
+fn more_state_survives_method_switch_and_reset_all() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("fuse");
+    controller.toggle_section_more("crop");
+
+    controller.set_fuse_algorithm("weighted-average");
+    controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(3.0));
+    controller.reset_all_sections();
+    let rows = controller.settings_panel().rows;
+    for section in ["fuse", "crop"] {
+        assert_eq!(more_rows(&rows, section)[0].selected, "true", "{section}");
+    }
+    assert_eq!(more_rows(&rows, "align")[0].selected, "false");
+    assert!(!field_ids(&rows, "fuse").is_empty());
+}
+
+#[test]
+fn more_lists_focus_map_in_the_picker() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    let collapsed = picker_ids(&controller.settings_panel().rows, "fuse");
+    assert!(!collapsed.contains(&"depth-map".to_string()));
+
+    controller.toggle_section_more("fuse");
+    let rows = controller.settings_panel().rows;
+    let open = picker_ids(&rows, "fuse");
+    assert_eq!(open, every_fuse_id(), "the open picker lists every method");
+    assert_eq!(open.last().map(String::as_str), Some("depth-map"));
+    let picker = rows
+        .iter()
+        .find(|r| r.kind == RowKind::Picker && r.section == "fuse")
+        .unwrap();
+    assert_eq!(
+        picker.choices.last().map(String::as_str),
+        Some("Focus map"),
+        "the picker shows the plain display name"
+    );
+}
+
+#[test]
+fn more_keeps_a_selected_advanced_method_named() {
+    let mut controller = AppController::new();
+    let project = seal_without_align("more_sealed_focus_map", "depth-map");
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[project]),
+        OpenOutcome::Opened(_)
+    ));
+    let rows = controller.settings_panel().rows;
+    assert_eq!(more_rows(&rows, "fuse")[0].selected, "false");
+    let picker = rows
+        .iter()
+        .find(|r| r.kind == RowKind::Picker && r.section == "fuse")
+        .unwrap();
+    assert!(picker.choice_ids.contains(&"depth-map".to_string()));
+    assert_eq!(picker.value_text, "Focus map");
+    assert_eq!(picker.selected, "depth-map");
+}
+
+#[test]
+fn hidden_explicit_values_keep_the_heading_explicit() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.set_param_value("fuse", "levels", ParamValue::Int(3));
+
+    let rows = controller.settings_panel().rows;
+    assert!(field_ids(&rows, "fuse").is_empty(), "levels is hidden");
+    assert_eq!(heading(&rows, "fuse").heading_state, HeadingState::Explicit);
+    assert!(reset_all_enabled(&controller));
+}
+
+#[test]
+fn hidden_violation_opens_its_section() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.set_fuse_algorithm("depth-map");
+    controller.set_param_text("fuse", "score-radius", "not-a-number");
+
+    let rows = controller.settings_panel().rows;
+    assert!(
+        rows.iter()
+            .any(|r| r.kind == RowKind::Error && r.section == "fuse" && r.id == "score-radius"),
+        "the error row shows although the section was never opened"
+    );
+    assert_eq!(more_rows(&rows, "fuse")[0].selected, "true");
+    assert_eq!(more_rows(&rows, "align")[0].selected, "false");
+}
+
+#[test]
+fn hidden_rows_with_no_tab_render_collapsed() {
+    let rows = AppController::new().settings_panel().rows;
+    for section in ["fuse", "align", "crop"] {
+        assert_eq!(more_rows(&rows, section).len(), 1, "{section}");
+        assert_eq!(more_rows(&rows, section)[0].selected, "false", "{section}");
+    }
+    assert_eq!(field_ids(&rows, "align"), Vec::<String>::new());
+    assert_eq!(field_ids(&rows, "crop"), ["auto-crop"]);
+}
+
+#[test]
+fn more_row_click_toggles_its_section() {
+    use slint::ComponentHandle;
+    use slint::platform::{PointerEventButton, WindowEvent};
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    app.set_dock_tab("settings".into());
+    let push = || {
+        focusforge_gui::bridge::push_settings_panel(&app, &controller.lock().unwrap());
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
+    };
+    push();
+
+    let crop_fields = || field_ids(&controller.lock().unwrap().settings_panel().rows, "crop");
+    assert_eq!(crop_fields(), ["auto-crop"]);
+    for expected in [
+        vec!["auto-crop", "equalize", "equalize-max-gain"],
+        vec!["auto-crop"],
+    ] {
+        let toggles = i_slint_backend_testing::ElementQuery::from_root(&app)
+            .match_id("FFMoreToggle::header-area")
+            .find_all();
+        assert_eq!(toggles.len(), 3, "Fuse, Align and Crop each mount one");
+        let position = element_center(&toggles[2]);
+        for event in [
+            WindowEvent::PointerMoved { position },
+            WindowEvent::PointerPressed {
+                position,
+                button: PointerEventButton::Left,
+            },
+            WindowEvent::PointerReleased {
+                position,
+                button: PointerEventButton::Left,
+            },
+        ] {
+            app.window().dispatch_event(event);
+        }
+        push();
+        assert_eq!(crop_fields(), expected);
+    }
 }

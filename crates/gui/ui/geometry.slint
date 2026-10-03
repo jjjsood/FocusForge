@@ -86,6 +86,8 @@ export global ShellGeometry {
     out property <length> param-row-log: 60px;
     out property <length> param-row-field: 45px;
     out property <length> param-row-bool: 20px;
+    // The space under a toggle row, one grid step below the toggle.
+    out property <length> param-row-bool-gap: 12px;
     out property <length> param-row-enum: 43px;
     out property <length> param-error-height: 16px;
     out property <length> section-heading-height: 41px;
@@ -98,6 +100,10 @@ export global ShellGeometry {
     // it, clear of CROP's own last field, its own height below.
     out property <length> reset-all-top-gap: 32px;
     out property <length> reset-all-height: 32px;
+    // A section's `More...` header band, and the space under it, under an
+    // open fold-out's last row and above the next section.
+    out property <length> more-height: 32px;
+    out property <length> more-gap: 12px;
 
     // Two primitive sizes shared wherever something else needs to lay out
     // against them, rather than assuming the primitive's own literal.

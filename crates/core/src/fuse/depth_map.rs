@@ -141,7 +141,7 @@ impl StackAlgorithm for DepthMap {
     }
 
     fn display_name(&self) -> &str {
-        "Focus map (depth map)"
+        "Focus map"
     }
 
     fn advanced(&self) -> bool {

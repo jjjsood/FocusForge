@@ -16,6 +16,8 @@ export component FFSectionHeading inherits Rectangle {
     // A copy drawn over scrolled rows needs the opaque dock ground to cover
     // them; an in-flow day boundary is transparent.
     in property <bool> opaque: true;
+    // Space kept clear of the label and badge on both sides.
+    in property <length> inset: 0px;
 
     background: root.opaque ? Theme.surface-raised : transparent;
     // The label/badge band's own height -- every child below positions
@@ -27,7 +29,7 @@ export component FFSectionHeading inherits Rectangle {
     height: root.head-height + (root.compact ? 0px : ShellGeometry.section-heading-bottom-gap);
 
     Text {
-        x: 0px;
+        x: root.inset;
         // Centered the same way the badge below centers its own text: by the
         // glyph's own natural height against `head-height`, not by handing a
         // tall box to `vertical-alignment: center`, which centers the font's
@@ -43,7 +45,7 @@ export component FFSectionHeading inherits Rectangle {
     }
 
     if !root.compact && root.provenance == "default": badge := Rectangle {
-        x: parent.width - self.width;
+        x: parent.width - self.width - root.inset;
         y: (root.head-height - self.height) / 2;
         width: badge-text.width + 2 * Theme.space-2;
         height: 14px;

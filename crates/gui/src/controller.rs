@@ -16,7 +16,7 @@
 //! `Action`. They read `crate::input_map`'s types only -- no `use slint::`
 //! here either.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -403,6 +403,8 @@ struct ProjectTab {
     errors: BTreeMap<String, ParamViolation>,
     /// The one open picker/enum menu's `"<section>:<id>"` key, if any.
     menu_open: Option<String>,
+    /// The sections whose `More...` fold-out is open.
+    expanded: BTreeSet<String>,
     /// Every checkpoint kept in memory since the last save, oldest first --
     /// fused and op-bearing ones alike, in no `.ffp` until
     /// [`AppController::save_active_project`] writes them. A parent is an
@@ -674,6 +676,7 @@ impl ProjectTab {
             remembered: BTreeMap::new(),
             errors: BTreeMap::new(),
             menu_open: None,
+            expanded: BTreeSet::new(),
             held: Vec::new(),
             pending_deletes: Vec::new(),
             viewed: Vec::new(),
@@ -4411,6 +4414,7 @@ impl AppController {
                 ctx: tab.ctx.as_ref(),
                 errors: &tab.errors,
                 menu_open: tab.menu_open.as_deref(),
+                expanded: &tab.expanded,
                 fuse_id: &tab.fuse_id,
                 fuse_values: &tab.fuse_values,
                 align_id: &tab.align_id,
@@ -4559,6 +4563,19 @@ impl AppController {
     /// through, so the `"<section>:<id>"` format stays this module's alone.
     pub fn toggle_param_menu_for(&mut self, section: &str, id: &str) {
         self.toggle_param_menu(&settings_panel::menu_key(section, id));
+    }
+
+    /// Opens or closes `section`'s `More...` fold-out on the active tab, in
+    /// memory only: it is neither saved with the project nor copied to a
+    /// duplicated tab.
+    pub fn toggle_section_more(&mut self, section: &str) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        if !tab.expanded.remove(section) {
+            tab.expanded.insert(section.to_string());
+        }
+        self.emit(ShellEvent::SettingsChanged);
     }
 
     /// Converts a slider's thumb position back into this field's own value

@@ -4162,6 +4162,7 @@ fn equalize_rows_reach_the_run() {
     use focusforge_core::params::ParamValue;
 
     let mut controller = common::controller_with_frames("equalize_rows", 3);
+    controller.toggle_section_more("crop");
     let rows: Vec<_> = controller
         .settings_panel()
         .rows
@@ -5164,6 +5165,7 @@ fn duplicated_tab_keeps_crop_and_remembered_values() {
         "false",
         "the copy keeps the crop choice"
     );
+    controller.toggle_section_more("fuse");
     assert_eq!(active_fuse_value(&controller, "score-radius"), "7");
     controller.set_fuse_algorithm("weighted-average");
     assert_eq!(
@@ -5174,6 +5176,7 @@ fn duplicated_tab_keeps_crop_and_remembered_values() {
     controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(6.0));
 
     controller.select_project(0);
+    controller.toggle_section_more("fuse");
     assert_eq!(active_fuse_value(&controller, "score-radius"), "7");
     controller.set_fuse_algorithm("weighted-average");
     assert_eq!(

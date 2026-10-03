@@ -461,12 +461,9 @@ fn every_alignment_parameter_is_advanced() {
 #[test]
 fn role_first_display_names() {
     let name = |id: &str| find(id).expect("registered").display_name().to_string();
-    assert_eq!(name("laplacian"), "Details (Laplacian pyramid)");
-    assert_eq!(
-        name("weighted-average"),
-        "Soft transitions (weighted average)"
-    );
-    assert_eq!(name("depth-map"), "Focus map (depth map)");
+    assert_eq!(name("laplacian"), "Details");
+    assert_eq!(name("weighted-average"), "Soft transitions");
+    assert_eq!(name("depth-map"), "Focus map");
     let exponent = find("weighted-average")
         .expect("registered")
         .params()
