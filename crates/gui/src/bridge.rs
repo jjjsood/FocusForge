@@ -562,8 +562,10 @@ fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::Mea
         ShellEvent::WindowDragRequested
         | ShellEvent::WindowMinimizeRequested
         | ShellEvent::WindowCloseRequested
+        | ShellEvent::DetachedWindowCloseRequested
         | ShellEvent::CheckpointExportRequested
         | ShellEvent::PaneUndockRequested(_)
+        | ShellEvent::PaneDocked(_)
         | ShellEvent::Input(_)
         | ShellEvent::LoadProgress { .. } => return None,
     };
@@ -2074,7 +2076,17 @@ pub fn install(
             record_layout_callback();
             if let Some(app) = app_weak.upgrade() {
                 let (left, right) = read_pane_geometry(&app);
-                controller.lock().unwrap().set_pane_geometry(left, right);
+                let mut guard = controller.lock().unwrap();
+                match guard.detached_pane() {
+                    Some(PaneSource::Composite) => {
+                        guard.set_pane_geometry_for(PaneSource::ZMap, right)
+                    }
+                    Some(PaneSource::ZMap) => {
+                        guard.set_pane_geometry_for(PaneSource::Composite, left)
+                    }
+                    None => guard.set_pane_geometry(left, right),
+                }
+                drop(guard);
                 repaint(&app, &controller, &canvas);
             }
         }
@@ -3370,9 +3382,9 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::CheckpointExportRequested => {
             push_export_dialog(app, &controller.lock().unwrap());
         }
-        // Never reachable while `undock_enabled()` is always `true` with
-        // both panes docked.
-        ShellEvent::PaneUndockRequested(_) => {}
+        ShellEvent::PaneUndockRequested(_)
+        | ShellEvent::PaneDocked(_)
+        | ShellEvent::DetachedWindowCloseRequested => {}
         // A no-op here: the viewport mutation already happened synchronously
         // inside `AppController::emit_action` before this event was raised,
         // and the repaint it needs runs on the callback path (`repaint`,

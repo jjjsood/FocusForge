@@ -14,11 +14,9 @@
 use std::num::NonZeroU32;
 
 /// One pane in canvas-ground logical pixels -- the coordinate space
-/// `TouchArea::mouse-x` reports in. Both panes are always the same size,
-/// differing only in `x`/`y` (`ui/shell/canvas.slint`), so every function
-/// below that takes a `PaneRect` only reads its `width`/`height`; the
-/// controller (`crate::controller::AppController::anchor`) is what picks
-/// *which* pane's `x`/`y` a raw cursor position is relative to.
+/// `TouchArea::mouse-x` reports in. A shared viewport projects its source
+/// centre into each pane's own centre, so only `width` and `height` affect
+/// the arithmetic here.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PaneRect {
     pub x: f32,
@@ -34,14 +32,13 @@ pub struct ImageSize {
     pub height: u32,
 }
 
-/// `scale` is screen logical px per source px; `origin` is the source-space
-/// point drawn at the pane's **top-left**. Offset-form rather than
-/// centre-form because every rule below (clamp, the visible rect, the
-/// anchor) is one subtraction in it.
+/// `scale` is screen logical px per source px; `centre` is the source-space
+/// point drawn at every pane's geometric centre.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Viewport {
     scale: f64,
-    origin: (f64, f64),
+    centre: (f64, f64),
+    reference: PaneRect,
     /// Whether this viewport is exactly the one `fit` last produced and has
     /// not been zoomed or panned away from since -- distinct from "does
     /// `scale` currently equal `fit_scale`", which a zoom can land on by
@@ -57,6 +54,12 @@ pub fn fit_scale(image: ImageSize, pane: PaneRect) -> f64 {
     sx.min(sy)
 }
 
+/// The shared Fit scale: the smaller pane Fit keeps the complete image in
+/// both panes.
+pub fn fit_scale_two(image: ImageSize, left: PaneRect, right: PaneRect) -> f64 {
+    fit_scale(image, left).min(fit_scale(image, right))
+}
+
 /// Wheel zoom moves through this fixed stop ladder.
 pub const FIXED_STOPS: [f64; 11] = [0.125, 0.25, 0.33, 0.50, 0.67, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0];
 
@@ -68,32 +71,45 @@ pub const FIT_STEP_DOWN: f64 = 0.5;
 /// strictly greater than `fit`, ascending. A fixed stop *below* fit is
 /// dropped, so the minimum is always `fit * FIT_STEP_DOWN`.
 pub fn stops(image: ImageSize, pane: PaneRect) -> Vec<f64> {
-    let fit = fit_scale(image, pane);
+    stops_two(image, pane, pane)
+}
+
+/// The shared wheel ladder for two panes.
+pub fn stops_two(image: ImageSize, left: PaneRect, right: PaneRect) -> Vec<f64> {
+    let fit = fit_scale_two(image, left, right);
     let mut out = vec![fit * FIT_STEP_DOWN, fit];
     out.extend(FIXED_STOPS.iter().copied().filter(|&s| s > fit));
     out
 }
 
-/// A viewport showing the whole image, centred in `pane`.
+/// A viewport showing the whole image in one pane.
 pub fn fit(image: ImageSize, pane: PaneRect) -> Viewport {
-    let scale = fit_scale(image, pane);
-    let origin = centred_origin(image, pane, scale);
+    fit_two(image, pane, pane)
+}
+
+/// A viewport showing the whole image in both panes.
+pub fn fit_two(image: ImageSize, left: PaneRect, right: PaneRect) -> Viewport {
+    let scale = fit_scale_two(image, left, right);
     Viewport {
         scale,
-        origin,
+        centre: (image.width as f64 / 2.0, image.height as f64 / 2.0),
+        reference: reference_pane(image, left, right),
         at_fit: true,
     }
 }
 
-/// The origin that centres the visible rect (`pane.size / scale`) over
-/// `image` on both axes -- shared by [`fit`] and [`Viewport::clamp`], whose
-/// "image smaller than the pane" branch is the same formula.
-fn centred_origin(image: ImageSize, pane: PaneRect, scale: f64) -> (f64, f64) {
-    let visible_w = pane.width as f64 / scale;
-    let visible_h = pane.height as f64 / scale;
+fn reference_pane(image: ImageSize, left: PaneRect, right: PaneRect) -> PaneRect {
+    if fit_scale(image, left) <= fit_scale(image, right) {
+        left
+    } else {
+        right
+    }
+}
+
+fn origin_for(centre: (f64, f64), pane: PaneRect, scale: f64) -> (f64, f64) {
     (
-        (image.width as f64 - visible_w) / 2.0,
-        (image.height as f64 - visible_h) / 2.0,
+        centre.0 - pane.width as f64 / (2.0 * scale),
+        centre.1 - pane.height as f64 / (2.0 * scale),
     )
 }
 
@@ -180,15 +196,21 @@ impl Viewport {
         self.scale
     }
 
-    /// The source-space point drawn at the pane's top-left.
+    /// The source-space point drawn at this viewport's reference pane's
+    /// top-left. Pane-specific callers use [`Self::to_source_in`].
     pub fn origin(&self) -> (f64, f64) {
-        self.origin
+        origin_for(self.centre, self.reference, self.scale)
     }
 
     /// The source-space point under a pane-local point: `origin() + local /
     /// scale()`.
     pub fn to_source(&self, local: (f32, f32)) -> (f64, f64) {
-        let (ox, oy) = self.origin;
+        self.to_source_in(local, self.reference)
+    }
+
+    /// The source-space point under `local` in `pane`.
+    pub fn to_source_in(&self, local: (f32, f32), pane: PaneRect) -> (f64, f64) {
+        let (ox, oy) = origin_for(self.centre, pane, self.scale);
         (
             ox + f64::from(local.0) / self.scale,
             oy + f64::from(local.1) / self.scale,
@@ -199,7 +221,20 @@ impl Viewport {
     /// current one (saturating at both ends), `anchor` (pane-local) held
     /// fixed in source space across the change.
     pub fn zoom_steps(&mut self, delta: i32, anchor: (f32, f32), image: ImageSize, pane: PaneRect) {
-        let ladder = stops(image, pane);
+        self.zoom_steps_in(delta, anchor, image, pane, pane);
+    }
+
+    /// A wheel zoom from `gesture_pane`, anchored in that pane while both
+    /// pane bounds constrain the resulting shared centre.
+    pub fn zoom_steps_in(
+        &mut self,
+        delta: i32,
+        anchor: (f32, f32),
+        image: ImageSize,
+        gesture_pane: PaneRect,
+        other_pane: PaneRect,
+    ) {
+        let ladder = stops_two(image, gesture_pane, other_pane);
         if ladder.is_empty() {
             return;
         }
@@ -207,44 +242,58 @@ impl Viewport {
         let new_idx = (idx as i32 + delta).clamp(0, ladder.len() as i32 - 1) as usize;
         let new_scale = ladder[new_idx];
 
-        let ax = anchor.0 as f64;
-        let ay = anchor.1 as f64;
-        let src = (
-            self.origin.0 + ax / self.scale,
-            self.origin.1 + ay / self.scale,
-        );
+        let src = self.to_source_in(anchor, gesture_pane);
         self.scale = new_scale;
-        self.origin = (src.0 - ax / new_scale, src.1 - ay / new_scale);
+        self.centre = (
+            src.0 - (anchor.0 as f64 - gesture_pane.width as f64 / 2.0) / new_scale,
+            src.1 - (anchor.1 as f64 - gesture_pane.height as f64 / 2.0) / new_scale,
+        );
+        self.reference = reference_pane(image, gesture_pane, other_pane);
         self.at_fit = false;
-        self.clamp(image, pane);
+        self.clamp_two(image, gesture_pane, other_pane);
     }
 
     /// A screen-pixel pan. Sign convention: the image follows the pointer,
     /// so a drag right moves the view left.
     pub fn pan_by(&mut self, dx: f32, dy: f32, image: ImageSize, pane: PaneRect) {
-        self.origin.0 -= dx as f64 / self.scale;
-        self.origin.1 -= dy as f64 / self.scale;
+        self.pan_by_two(dx, dy, image, pane, pane);
+    }
+
+    /// A screen-pixel pan constrained by both panes.
+    pub fn pan_by_two(
+        &mut self,
+        dx: f32,
+        dy: f32,
+        image: ImageSize,
+        left: PaneRect,
+        right: PaneRect,
+    ) {
+        self.centre.0 -= dx as f64 / self.scale;
+        self.centre.1 -= dy as f64 / self.scale;
         self.at_fit = false;
-        self.clamp(image, pane);
+        self.clamp_two(image, left, right);
     }
 
     /// Per axis: when the visible rect is at least as big as the image, the
     /// image is centred and un-pannable on that axis; otherwise `origin` is
     /// clamped into `[0, image - visible]`. "Panning cannot lose the image
     /// off-screen" in two lines.
-    fn clamp(&mut self, image: ImageSize, pane: PaneRect) {
-        let visible_w = pane.width as f64 / self.scale;
-        let visible_h = pane.height as f64 / self.scale;
-        let (cx, cy) = centred_origin(image, pane, self.scale);
-        self.origin.0 = if visible_w >= image.width as f64 {
-            cx
+    fn clamp_two(&mut self, image: ImageSize, left: PaneRect, right: PaneRect) {
+        let visible_w = left.width.max(right.width) as f64 / self.scale;
+        let visible_h = left.height.max(right.height) as f64 / self.scale;
+        self.centre.0 = if visible_w >= image.width as f64 {
+            image.width as f64 / 2.0
         } else {
-            self.origin.0.clamp(0.0, image.width as f64 - visible_w)
+            self.centre
+                .0
+                .clamp(visible_w / 2.0, image.width as f64 - visible_w / 2.0)
         };
-        self.origin.1 = if visible_h >= image.height as f64 {
-            cy
+        self.centre.1 = if visible_h >= image.height as f64 {
+            image.height as f64 / 2.0
         } else {
-            self.origin.1.clamp(0.0, image.height as f64 - visible_h)
+            self.centre
+                .1
+                .clamp(visible_h / 2.0, image.height as f64 - visible_h / 2.0)
         };
     }
 
@@ -262,7 +311,12 @@ impl Viewport {
     /// Whether `scale` is the ladder's first entry (the minimum: fit-to-window
     /// with one step below it).
     pub fn at_min(&self, image: ImageSize, pane: PaneRect) -> bool {
-        stops(image, pane)
+        self.at_min_two(image, pane, pane)
+    }
+
+    /// Whether the shared scale is at its shared ladder minimum.
+    pub fn at_min_two(&self, image: ImageSize, left: PaneRect, right: PaneRect) -> bool {
+        stops_two(image, left, right)
             .first()
             .is_some_and(|&s| (s - self.scale).abs() < 1e-9)
     }
@@ -270,7 +324,12 @@ impl Viewport {
     /// Whether `scale` is the ladder's last entry (the maximum: 500 % when
     /// fit does not already exceed it).
     pub fn at_max(&self, image: ImageSize, pane: PaneRect) -> bool {
-        stops(image, pane)
+        self.at_max_two(image, pane, pane)
+    }
+
+    /// Whether the shared scale is at its shared ladder maximum.
+    pub fn at_max_two(&self, image: ImageSize, left: PaneRect, right: PaneRect) -> bool {
+        stops_two(image, left, right)
             .last()
             .is_some_and(|&s| (s - self.scale).abs() < 1e-9)
     }
@@ -284,13 +343,14 @@ impl Viewport {
         if image.width == 0 || image.height == 0 || pane.width <= 0.0 || pane.height <= 0.0 {
             return None;
         }
+        let (origin_x, origin_y) = origin_for(self.centre, pane, self.scale);
         let visible_w = pane.width as f64 / self.scale;
         let visible_h = pane.height as f64 / self.scale;
 
-        let x0 = self.origin.0.max(0.0);
-        let y0 = self.origin.1.max(0.0);
-        let x1 = (self.origin.0 + visible_w).min(image.width as f64);
-        let y1 = (self.origin.1 + visible_h).min(image.height as f64);
+        let x0 = origin_x.max(0.0);
+        let y0 = origin_y.max(0.0);
+        let x1 = (origin_x + visible_w).min(image.width as f64);
+        let y1 = (origin_y + visible_h).min(image.height as f64);
         if x1 <= x0 || y1 <= y0 {
             return None;
         }
@@ -307,8 +367,8 @@ impl Viewport {
             (sy1 - sy0) as u32,
         );
         let dst = (
-            ((sx0 - self.origin.0) * self.scale) as f32,
-            ((sy0 - self.origin.1) * self.scale) as f32,
+            ((sx0 - origin_x) * self.scale) as f32,
+            ((sy0 - origin_y) * self.scale) as f32,
             ((sx1 - sx0) * self.scale) as f32,
             ((sy1 - sy0) * self.scale) as f32,
         );
@@ -327,15 +387,21 @@ impl Viewport {
     /// new minimum if the new pane made it fall below one -- and the offset
     /// is re-clamped.
     pub fn resize(&mut self, image: ImageSize, pane: PaneRect) {
+        self.resize_two(image, pane, pane);
+    }
+
+    /// Reconciles a shared viewport after either pane changes geometry.
+    pub fn resize_two(&mut self, image: ImageSize, left: PaneRect, right: PaneRect) {
         if self.at_fit {
-            *self = fit(image, pane);
+            *self = fit_two(image, left, right);
             return;
         }
-        if let Some(&min) = stops(image, pane).first()
+        if let Some(&min) = stops_two(image, left, right).first()
             && self.scale < min
         {
             self.scale = min;
         }
-        self.clamp(image, pane);
+        self.reference = reference_pane(image, left, right);
+        self.clamp_two(image, left, right);
     }
 }

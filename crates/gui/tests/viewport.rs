@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use focusforge_gui::AppController;
 use focusforge_gui::input_map::{Button, Modifiers, PointerKind};
-use focusforge_gui::viewport::{ImageSize, PaneRect, fit, stops};
+use focusforge_gui::viewport::{ImageSize, PaneRect, fit, fit_two, stops};
 
 const NONE: Modifiers = Modifiers::NONE;
 
@@ -34,6 +34,152 @@ fn source_point(vp: &focusforge_gui::viewport::Viewport, anchor: (f32, f32)) -> 
         ox + anchor.0 as f64 / vp.scale(),
         oy + anchor.1 as f64 / vp.scale(),
     )
+}
+
+#[test]
+fn unequal_panes_share_centre_scale_and_bounds() {
+    let image = image(1000, 1000);
+    let left = pane(400.0, 800.0);
+    let right = pane(900.0, 500.0);
+    let mut viewport = fit_two(image, left, right);
+
+    viewport.zoom_steps_in(3, (200.0, 400.0), image, left, right);
+    assert!((viewport.scale() - 1.0).abs() < 1e-9);
+
+    viewport.pan_by_two(-100_000.0, -100_000.0, image, left, right);
+    let left_centre = viewport.to_source_in((200.0, 400.0), left);
+    let right_centre = viewport.to_source_in((450.0, 250.0), right);
+    assert_eq!(
+        left_centre, right_centre,
+        "both pane centres map to one source centre"
+    );
+    assert!((left_centre.0 - 550.0).abs() < 1e-6);
+    assert!((left_centre.1 - 600.0).abs() < 1e-6);
+
+    let left_draw = viewport.draw(image, left).unwrap();
+    let right_draw = viewport.draw(image, right).unwrap();
+    assert!((left_draw.dst.2 as f64 / left_draw.src.2 as f64 - 1.0).abs() < 1e-6);
+    assert!((right_draw.dst.2 as f64 / right_draw.src.2 as f64 - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn unequal_projection_roundtrips_and_boundary_zoom_uses_both_bounds() {
+    let image = image(1000, 1000);
+    let a = pane(400.0, 800.0);
+    let b = pane(900.0, 500.0);
+    for (left, right) in [(a, b), (b, a)] {
+        for (gesture, other) in [(left, right), (right, left)] {
+            let mut lower = fit_two(image, left, right);
+            lower.zoom_steps_in(3, (0.0, 0.0), image, gesture, other);
+            assert!((lower.scale() - 1.0).abs() < 1e-9);
+            let lower_centre = lower.to_source_in((left.width / 2.0, left.height / 2.0), left);
+            assert_eq!(lower_centre, (450.0, 400.0));
+
+            let mut upper = fit_two(image, left, right);
+            upper.zoom_steps_in(3, (gesture.width, gesture.height), image, gesture, other);
+            let upper_centre = upper.to_source_in((right.width / 2.0, right.height / 2.0), right);
+            assert_eq!(upper_centre, (550.0, 600.0));
+
+            for pane in [left, right] {
+                let draw = upper.draw(image, pane).unwrap();
+                let source = (
+                    draw.src.0 as f32 + (draw.src.2.saturating_sub(1).min(17)) as f32,
+                    draw.src.1 as f32 + (draw.src.3.saturating_sub(1).min(19)) as f32,
+                );
+                let local = (
+                    draw.dst.0
+                        + (source.0 + 0.5 - draw.src.0 as f32) * draw.dst.2 / draw.src.2 as f32,
+                    draw.dst.1
+                        + (source.1 + 0.5 - draw.src.1 as f32) * draw.dst.3 / draw.src.3 as f32,
+                );
+                let roundtrip = upper.to_source_in(local, pane);
+                assert!(
+                    (roundtrip.0 - f64::from(source.0 + 0.5)).abs() < 1e-5
+                        && (roundtrip.1 - f64::from(source.1 + 0.5)).abs() < 1e-5,
+                    "{pane:?}: {source:?} -> {local:?} -> {roundtrip:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn opposite_aspect_panes_use_the_smaller_fit_ladder_and_sticky_resize() {
+    let image = image(1000, 1000);
+    let tall = pane(200.0, 800.0);
+    let wide = pane(800.0, 200.0);
+    let mut viewport = fit_two(image, tall, wide);
+    assert!((viewport.scale() - 0.2).abs() < 1e-9);
+    assert!((focusforge_gui::viewport::stops_two(image, tall, wide)[0] - 0.1).abs() < 1e-9);
+    viewport.resize_two(image, pane(400.0, 800.0), wide);
+    assert!(
+        (viewport.scale() - 0.2).abs() < 1e-9,
+        "wide pane remains reference"
+    );
+    viewport.resize_two(image, pane(400.0, 800.0), pane(800.0, 400.0));
+    assert!(
+        (viewport.scale() - 0.4).abs() < 1e-9,
+        "sticky Fit follows new smaller Fit"
+    );
+}
+
+#[test]
+fn unequal_pane_matrix_covers_both_anchors_bounds_and_pan_distance() {
+    let left = pane(200.0, 300.0);
+    let right = pane(400.0, 250.0);
+    for image in [image(1000, 1000), image(1200, 1000), image(1000, 1200)] {
+        for (gesture, other) in [(left, right), (right, left)] {
+            let mut viewport = fit_two(image, left, right);
+            let anchor = (gesture.width * 0.52, gesture.height * 0.52);
+            let before = viewport.to_source_in(anchor, gesture);
+            viewport.zoom_steps_in(3, anchor, image, gesture, other);
+            let after = viewport.to_source_in(anchor, gesture);
+            assert!(
+                ((after.0 - before.0) * viewport.scale()).abs() < 1.0
+                    && ((after.1 - before.1) * viewport.scale()).abs() < 1.0,
+                "{image:?}, {gesture:?}: cursor anchor drifted from {before:?} to {after:?}"
+            );
+
+            let left_centre = viewport.to_source_in((left.width / 2.0, left.height / 2.0), left);
+            let right_centre =
+                viewport.to_source_in((right.width / 2.0, right.height / 2.0), right);
+            assert_eq!(left_centre, right_centre);
+            viewport.pan_by_two(-5.0, 7.0, image, left, right);
+            let moved = viewport.to_source_in((left.width / 2.0, left.height / 2.0), left);
+            assert!((moved.0 - left_centre.0 - 5.0 / viewport.scale()).abs() < 1e-6);
+            assert!((moved.1 - left_centre.1 + 7.0 / viewport.scale()).abs() < 1e-6);
+
+            viewport.pan_by_two(-100_000.0, -100_000.0, image, left, right);
+            let upper = viewport.to_source_in((right.width / 2.0, right.height / 2.0), right);
+            let scale = viewport.scale();
+            assert!(
+                (upper.0 - (image.width as f64 - right.width as f64 / (2.0 * scale))).abs() < 1e-6
+            );
+            assert!(
+                (upper.1 - (image.height as f64 - left.height as f64 / (2.0 * scale))).abs() < 1e-6
+            );
+            viewport.pan_by_two(100_000.0, 100_000.0, image, left, right);
+            let lower = viewport.to_source_in((left.width / 2.0, left.height / 2.0), left);
+            assert!((lower.0 - right.width as f64 / (2.0 * scale)).abs() < 1e-6);
+            assert!((lower.1 - left.height as f64 / (2.0 * scale)).abs() < 1e-6);
+        }
+    }
+
+    let narrow_image = image(300, 1000);
+    let mut below_fit = fit_two(narrow_image, left, right);
+    below_fit.zoom_steps_in(
+        -1,
+        (left.width / 2.0, left.height / 2.0),
+        narrow_image,
+        left,
+        right,
+    );
+    below_fit.pan_by_two(-100_000.0, 100_000.0, narrow_image, left, right);
+    let centre = below_fit.to_source_in((left.width / 2.0, left.height / 2.0), left);
+    assert_eq!(
+        centre.0, 150.0,
+        "an axis containing the image stays centred"
+    );
 }
 
 fn mantis_512_dir() -> PathBuf {
@@ -223,6 +369,33 @@ fn reaching_a_bound_is_visible() {
     controller.wheel(0.0, 60.0, 283.0, 374.0, NONE);
     assert_eq!(controller.zoom_readout(), max_bound);
     assert!(controller.at_max_zoom());
+}
+
+#[test]
+fn unequal_panes_use_smaller_fit_for_controller_readout_and_bounds() {
+    let mut controller = opened_controller();
+    let tall = pane(200.0, 800.0);
+    let wide = pane(800.0, 200.0);
+    controller.set_pane_geometry(tall, wide);
+    controller.fit();
+
+    assert_eq!(controller.zoom_readout(), "39.1 %");
+    assert!(!controller.at_min_zoom());
+    assert!(!controller.at_max_zoom());
+
+    controller.zoom_out();
+    assert!(controller.at_min_zoom());
+    let minimum = controller.zoom_readout();
+    controller.zoom_out();
+    assert_eq!(controller.zoom_readout(), minimum);
+
+    for _ in 0..40 {
+        controller.zoom_in();
+    }
+    assert!(controller.at_max_zoom());
+    let maximum = controller.zoom_readout();
+    controller.zoom_in();
+    assert_eq!(controller.zoom_readout(), maximum);
 }
 
 #[test]
