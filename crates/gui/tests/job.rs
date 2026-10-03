@@ -3779,16 +3779,15 @@ fn a_fuse_asks_before_dropping_unsaved_ops() {
     // `Run again` after a cancelled run asks.
     let mut c = painted_tab("fuse_asks_run_again", 2, 1);
     assert!(!c.start_fuse());
+    // The first fuse cached the alignment; a re-fuse that reuses it would
+    // be too short to cancel.
+    let scratch =
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("fuse_asks_run_again_scratch");
+    std::fs::remove_dir_all(scratch.join("stage-cache"))
+        .expect("the first fuse cached its alignment");
     c.close_guard_confirmed();
-    let start = Instant::now();
-    while c.job_view().fraction <= 0.0 {
-        assert!(
-            start.elapsed() < Duration::from_secs(60),
-            "the run never ticked"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    c.pause_or_resume();
+    // Cancel in the same breath as the start, with no poll in between: the
+    // worker still has real alignment and fusion ahead of it.
     c.cancel_fuse();
     settle_all(&mut c);
     assert_eq!(live_ops(&c), 1, "a cancelled run keeps the strokes");
