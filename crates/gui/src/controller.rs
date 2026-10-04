@@ -4794,28 +4794,11 @@ impl AppController {
     }
 
     /// The left pane's label: the selected frame's file name, or empty with
-    /// no tab active or nothing selected. In editor mode, appends the
-    /// brush source's own position, 1-based, out of the tab's frame count
-    /// (`tab.selected` is also the brush source).
+    /// no tab active or nothing selected.
     pub fn frame_pane_label(&self) -> String {
-        let Some(name) = self
-            .selected_frame_path()
+        self.selected_frame_path()
             .map(|path| images::file_name(&path))
-        else {
-            return String::new();
-        };
-        if self.mode() != ShellMode::Editor {
-            return name;
-        }
-        let tab = self
-            .state
-            .active()
-            .expect("selected_frame_path returned Some, so an active tab exists");
-        format!(
-            "{name} · source {} of {}",
-            tab.selected + 1,
-            tab.frames.len()
-        )
+            .unwrap_or_default()
     }
 
     /// Adds `paths` to the active tab: hashes on a worker thread, then

@@ -386,12 +386,11 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             label: "Equalize brightness".to_string(),
             help: "Gives every frame one gain, the same on every channel, \
                    matching the reference frame's (the alignment's, otherwise \
-                   the middle one) mid-tone brightness; the default depends on \
-                   the fusion method; scales encoded code values as delivered \
-                   and is not a linear-light correction."
+                   the middle one) mid-tone brightness; scales encoded code \
+                   values as delivered and is not a linear-light correction."
                 .to_string(),
             kind: ParamKind::Bool,
-            default: ParamValue::Bool(false),
+            default: ParamValue::Bool(true),
             advanced: true,
             auto: None,
             host_default: None,
@@ -1019,7 +1018,7 @@ mod tests {
         let on = desc("equalize");
         assert_eq!(on.label, "Equalize brightness");
         assert_eq!(on.kind, ParamKind::Bool);
-        assert_eq!(on.default, ParamValue::Bool(false));
+        assert_eq!(on.default, ParamValue::Bool(true));
 
         let bound = desc("equalize-max-gain");
         assert_eq!(bound.label, "Max brightness gain");
@@ -1065,10 +1064,7 @@ mod tests {
             );
         }
         let switch = desc("equalize").help.to_lowercase();
-        assert!(
-            switch.contains("default depends on the fusion method"),
-            "{switch}"
-        );
+        assert!(!switch.contains("depends on the fusion method"), "{switch}");
         let bound = &desc("equalize-max-gain").help;
         assert!(bound.contains("0.8") && bound.contains("1.25"), "{bound}");
     }
@@ -1087,16 +1083,13 @@ mod tests {
     }
 
     #[test]
-    fn equalize_defaults_on_for_the_focus_map_only() {
-        assert_eq!(
-            default_of(&schema_for("depth-map"), "equalize"),
-            ParamValue::Bool(true)
-        );
-        for id in ["laplacian", "weighted-average"] {
+    fn equalize_defaults_on_for_every_method() {
+        for algorithm in crate::registry::stack_algorithms() {
             assert_eq!(
-                default_of(&schema_for(id), "equalize"),
-                ParamValue::Bool(false),
-                "{id}"
+                default_of(&params_for(algorithm), "equalize"),
+                ParamValue::Bool(true),
+                "{}",
+                algorithm.id()
             );
         }
     }
@@ -1156,17 +1149,17 @@ mod tests {
     }
 
     #[test]
-    fn equalization_bound_follows_the_method_and_an_explicit_value_wins() {
+    fn equalization_bound_follows_the_default_and_an_explicit_value_wins() {
         let focus_map = schema_for("depth-map");
         let details = schema_for("laplacian");
         let mut values = ParamValues::new();
         assert_eq!(equalization_bound(&focus_map, &values), Some(1.25));
-        assert_eq!(equalization_bound(&details, &values), None);
+        assert_eq!(equalization_bound(&details, &values), Some(1.25));
 
         values.insert("equalize".into(), ParamValue::Bool(false));
         assert_eq!(equalization_bound(&focus_map, &values), None);
+        assert_eq!(equalization_bound(&details, &values), None);
         values.insert("equalize".into(), ParamValue::Bool(true));
-        assert_eq!(equalization_bound(&details, &values), Some(1.25));
         values.insert("equalize-max-gain".into(), ParamValue::Float(1.4));
         assert_eq!(equalization_bound(&details, &values), Some(1.4));
     }

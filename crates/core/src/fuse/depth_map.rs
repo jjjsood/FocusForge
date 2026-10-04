@@ -152,12 +152,6 @@ impl StackAlgorithm for DepthMap {
         &PARAMS
     }
 
-    /// A pure pick keeps seams wherever frames differ in brightness, so this
-    /// method equalizes brightness unless told otherwise.
-    fn project_defaults(&self) -> &[(&'static str, ParamValue)] {
-        &[("equalize", ParamValue::Bool(true))]
-    }
-
     fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError> {
         crate::params::validate(self.params(), cfg)?;
         let score_radius =

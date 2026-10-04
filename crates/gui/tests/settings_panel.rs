@@ -528,19 +528,14 @@ fn equalize_selected(controller: &AppController) -> String {
 }
 
 #[test]
-fn the_equalize_row_shows_the_selected_methods_default() {
+fn the_equalize_row_is_on_for_every_method() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
     controller.toggle_section_more("prepare");
 
-    for (method, shown) in [
-        ("depth-map", "true"),
-        ("laplacian", "false"),
-        ("weighted-average", "false"),
-        ("depth-map", "true"),
-    ] {
+    for method in ["depth-map", "laplacian", "weighted-average", "depth-map"] {
         controller.set_fuse_algorithm(method);
-        assert_eq!(equalize_selected(&controller), shown, "{method}");
+        assert_eq!(equalize_selected(&controller), "true", "{method}");
     }
 }
 
@@ -654,8 +649,8 @@ fn pickers_list_the_registry() {
 
     assert_eq!(
         picker_ids(&panel.rows, "fuse"),
-        collapsed_fuse_ids(),
-        "the collapsed fuse picker lists the registry's plain methods, the default first"
+        every_fuse_id(),
+        "the collapsed fuse picker lists every registered method, the default first"
     );
 
     let align_picker = panel
@@ -1461,20 +1456,11 @@ fn picker_ids(rows: &[SettingsRow], section: &str) -> Vec<String> {
 }
 
 /// Every stack method's id, the default first and the advanced ones last --
-/// what an open Fuse picker lists.
+/// what the Fuse picker lists, `More...` open or not.
 fn every_fuse_id() -> Vec<String> {
     let mut methods = registry::stack_algorithms();
     methods.sort_by_key(|a| (!a.is_default(), a.advanced()));
     methods.iter().map(|a| a.id().to_string()).collect()
-}
-
-/// The fuse picker's ids while Fuse is collapsed: every registered method not
-/// marked advanced, the default first.
-fn collapsed_fuse_ids() -> Vec<String> {
-    every_fuse_id()
-        .into_iter()
-        .filter(|id| !registry::find(id).expect("registered").advanced())
-        .collect()
 }
 
 fn more_rows<'a>(rows: &'a [SettingsRow], section: &str) -> Vec<&'a SettingsRow> {
@@ -1574,10 +1560,10 @@ fn sections_start_collapsed_with_one_adjustment_at_most() {
 
     controller.set_fuse_algorithm("laplacian");
     let fuse_picker = picker_ids(&controller.settings_panel().rows, "fuse");
-    assert_eq!(fuse_picker, collapsed_fuse_ids());
+    assert_eq!(fuse_picker, every_fuse_id());
     assert_eq!(fuse_picker[0], "laplacian", "the default comes first");
     assert!(fuse_picker.contains(&"weighted-average".to_string()));
-    assert!(!fuse_picker.contains(&"depth-map".to_string()));
+    assert!(fuse_picker.contains(&"depth-map".to_string()));
 }
 
 #[test]
@@ -1633,7 +1619,8 @@ fn more_reveals_that_sections_advanced_rows() {
     let rows = controller.settings_panel().rows;
     assert_eq!(
         rows[row_index(&rows, "prepare", "equalize")].selected,
-        "false"
+        "true",
+        "Details equalizes by default"
     );
 }
 
@@ -1735,17 +1722,21 @@ fn more_state_survives_method_switch_and_reset_all() {
 }
 
 #[test]
-fn more_lists_focus_map_in_the_picker() {
+fn fuse_picker_lists_every_method_in_both_more_states() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
     let collapsed = picker_ids(&controller.settings_panel().rows, "fuse");
-    assert!(!collapsed.contains(&"depth-map".to_string()));
+    assert_eq!(
+        collapsed,
+        every_fuse_id(),
+        "More... closed lists every method"
+    );
+    assert_eq!(collapsed.last().map(String::as_str), Some("depth-map"));
 
     controller.toggle_section_more("fuse");
     let rows = controller.settings_panel().rows;
     let open = picker_ids(&rows, "fuse");
-    assert_eq!(open, every_fuse_id(), "the open picker lists every method");
-    assert_eq!(open.last().map(String::as_str), Some("depth-map"));
+    assert_eq!(open, collapsed, "More... open lists the same methods");
     let picker = rows
         .iter()
         .find(|r| r.kind == RowKind::Picker && r.section == "fuse")
@@ -1757,9 +1748,8 @@ fn more_lists_focus_map_in_the_picker() {
     );
 }
 
-/// Per method: pick it (Focus map only once Fuse's `More...` lists it), change
-/// the one field only `More...` shows, switch away and back, and read
-/// the equalization switch each method starts with.
+/// Per method: pick it, change the one field only `More...` shows, switch away
+/// and back, and read the equalization switch each method starts with.
 #[test]
 fn settings_journey_per_method() {
     let mut controller = AppController::new();
@@ -1776,22 +1766,16 @@ fn settings_journey_per_method() {
         ("depth-map", "score-radius", ParamValue::Int(5), "5"),
     ];
 
-    assert!(
-        !picker_ids(&controller.settings_panel().rows, "fuse").contains(&"depth-map".to_string()),
-        "Focus map is not listed before Fuse's More..."
-    );
     for (id, field, value, text) in &methods {
         if more_open(&controller, "fuse") {
             controller.toggle_section_more("fuse");
         }
         let display = registry::find(id).expect("registered").display_name();
-        if *id != "depth-map" {
-            controller.set_fuse_algorithm(id);
-        } else {
-            controller.toggle_section_more("fuse");
-            controller.set_fuse_algorithm(id);
-            controller.toggle_section_more("fuse");
-        }
+        assert!(
+            picker_ids(&controller.settings_panel().rows, "fuse").contains(&id.to_string()),
+            "{id}: listed with Fuse's More... closed"
+        );
+        controller.set_fuse_algorithm(id);
         assert!(!has_field(&controller, field), "{id}: {field} hides");
 
         controller.toggle_section_more("fuse");
@@ -1828,14 +1812,13 @@ fn settings_journey_per_method() {
             .into_iter()
             .find(|r| r.section == "prepare" && r.id == "equalize")
             .expect("the prepare fold-out lists equalize");
-        let expected = if *id == "depth-map" { "true" } else { "false" };
-        assert_eq!(equalize.selected, expected, "{id}: equalize");
+        assert_eq!(equalize.selected, "true", "{id}: equalize");
         controller.toggle_section_more("prepare");
     }
 }
 
 #[test]
-fn more_keeps_a_selected_advanced_method_named() {
+fn a_sealed_focus_map_is_named_with_more_closed() {
     let mut controller = AppController::new();
     let project = seal_without_align("more_sealed_focus_map", "depth-map");
     assert!(matches!(
@@ -1925,15 +1908,10 @@ fn prepare_and_finish_sections_hold_the_project_settings() {
             ["equalize", "equalize-max-gain"],
             "{method}"
         );
-        let expected = if method == "depth-map" {
-            "true"
-        } else {
-            "false"
-        };
         assert_eq!(
             rows[row_index(&rows, "prepare", "equalize")].selected,
-            expected,
-            "{method}: equalize starts as the method declares"
+            "true",
+            "{method}: equalize starts on"
         );
         assert_eq!(field_ids(&rows, "finish"), ["auto-crop"], "{method}");
         controller.toggle_section_more("prepare");

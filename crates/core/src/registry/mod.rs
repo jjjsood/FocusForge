@@ -140,9 +140,9 @@ impl AlgorithmRef {
         }
     }
 
-    /// Whether a front end may keep this algorithm out of its first view.
-    /// Alignment algorithms are never advanced as a whole; their parameters
-    /// carry the flag.
+    /// Whether this algorithm is a specialist choice: front ends list it after
+    /// the others. Alignment algorithms are never advanced as a whole; their
+    /// parameters carry the flag.
     pub fn advanced(&self) -> bool {
         match self {
             AlgorithmRef::Stack(a) => a.advanced(),

@@ -268,14 +268,13 @@ preset's `[stack]` table accept the settings that belong to the whole run
 | key | kind | default | meaning |
 |---|---|---|---|
 | `auto-crop` | bool | `true` | trim the result to the area every aligned frame covers; `--no-crop` or `auto-crop=false` keeps the full frame |
-| `equalize` | bool | `true` with `--algo depth-map`, `false` otherwise | brightness equalization: one gain per frame, the same on every channel, matching the reference frame's (the alignment's, otherwise the middle one) mid-tone brightness |
+| `equalize` | bool | `true` | brightness equalization: one gain per frame, the same on every channel, matching the reference frame's (the alignment's, otherwise the middle one) mid-tone brightness |
 | `equalize-max-gain` | float, 1.01 to 2.0 | `1.25` | the bound on the gain: with 1.25 a frame's gain stays between 0.8 and 1.25 |
 
 Equalization scales the encoded code values as delivered and is not a
-linear-light correction; it is on unless `equalize=false` is set with
-`--algo depth-map`, and off unless `equalize=true` is set with any other
-algorithm, for every kind of input; `algorithms --json` lists each fusion
-method's defaults under `project_defaults`. A frame that would need a gain
+linear-light correction; it is on for every algorithm and every kind of input unless
+`equalize=false` is set; `algorithms --json` lists each fusion method's
+defaults under `project_defaults`. A frame that would need a gain
 beyond the bound gets the bound and the run prints a notice naming the
 frame, the gain it needed and the
 smallest bound that would cover it; a frame with fewer than 1000 usable

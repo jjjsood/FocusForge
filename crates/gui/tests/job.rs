@@ -388,7 +388,12 @@ fn settings_journey_pause_resume_and_cancel() {
         assert_eq!(newest_composite(&controller), reference, "{id}: resumed");
 
         controller.dismiss_notice();
-        start_and_hold_at_pause(&mut controller, timeout);
+        // Paused straight after the start, not after a progress tick: the
+        // worker parks at its first boundary, so a short run cannot finish
+        // while the test thread waits for a tick and the cancel lands on it.
+        assert!(controller.start_fuse(), "{id}: the cancelled run starts");
+        controller.pause_or_resume();
+        assert_eq!(controller.job_view().state, job::RunState::Paused);
         controller.cancel_fuse();
         common::wait_for_settle(&mut controller, timeout);
         assert_eq!(

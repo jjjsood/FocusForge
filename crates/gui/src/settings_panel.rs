@@ -498,9 +498,6 @@ struct SectionContext<'a> {
 struct PickerOption {
     id: String,
     label: String,
-    /// Listed only while the section's `More...` fold-out is open, or while
-    /// it is the selected method.
-    advanced: bool,
 }
 
 /// Builds the whole panel's flat row list, Prepare, Fuse, Align, then Finish: each
@@ -576,7 +573,6 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
             .map(|a| PickerOption {
                 id: a.id().to_string(),
                 label: a.display_name().to_string(),
-                advanced: a.advanced(),
             })
             .collect();
         rows.extend(section_rows(
@@ -594,7 +590,6 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
             .map(|a| PickerOption {
                 id: a.id().to_string(),
                 label: a.display_name().to_string(),
-                advanced: false,
             })
             .collect();
         rows.extend(section_rows(
@@ -650,10 +645,7 @@ fn section_rows(
         expanded,
     } = *section_ctx;
 
-    let advanced_picker = picker
-        .as_ref()
-        .is_some_and(|(_, options)| options.iter().any(|o| o.advanced));
-    let has_more = advanced_picker || schema.iter().any(|desc| desc.advanced);
+    let has_more = schema.iter().any(|desc| desc.advanced);
     let hidden_violation = schema
         .iter()
         .any(|desc| desc.advanced && errors.contains_key(&menu_key(section, &desc.id)));
@@ -678,11 +670,8 @@ fn section_rows(
             .find(|o| o.id == selected_id)
             .map(|o| o.label.clone())
             .unwrap_or_default();
-        let (choice_ids, choices): (Vec<String>, Vec<String>) = options
-            .into_iter()
-            .filter(|o| open || !o.advanced || o.id == selected_id)
-            .map(|o| (o.id, o.label))
-            .unzip();
+        let (choice_ids, choices): (Vec<String>, Vec<String>) =
+            options.into_iter().map(|o| (o.id, o.label)).unzip();
         rows.push(SettingsRow {
             label: "Algorithm".to_string(),
             value_text,

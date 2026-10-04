@@ -120,6 +120,8 @@ fn shared_laplacian_run() -> &'static SharedRun {
             "--json".to_string(),
             "--no-align".to_string(),
             "--no-crop".to_string(),
+            "--set".to_string(),
+            "equalize=false".to_string(),
         ];
         // Verifies CLI plumbing reproduces `library_oracle`'s in-process,
         // CPU-only call exactly, not GPU-vs-CPU numerics (that's the
@@ -1444,7 +1446,7 @@ fn equalization_run(label: &str, algo: &str, extra: &[&str]) -> serde_json::Valu
 }
 
 #[test]
-fn equalization_is_null_without_the_setting() {
+fn equalization_is_null_when_switched_off() {
     assert!(
         shared_laplacian_run()
             .report
@@ -1519,23 +1521,23 @@ fn equalize_preset_key_enables_it_and_write_preset_writes_it_back() {
 }
 
 #[test]
-fn equalization_default_follows_the_fusion_method() {
-    let on = equalization_run("stack_cli_equalize_default_focus_map", "depth-map", &[]);
-    assert_eq!(on["equalization"]["max_gain"], 1.25, "{on}");
-    for algo in ["weighted-average", "laplacian"] {
-        let off = equalization_run(&format!("stack_cli_equalize_default_{algo}"), algo, &[]);
-        assert!(off["equalization"].is_null(), "{algo}: {off}");
+fn equalization_is_on_by_default_for_every_fusion_method() {
+    for algo in ["depth-map", "weighted-average", "laplacian"] {
+        let on = equalization_run(&format!("stack_cli_equalize_default_{algo}"), algo, &[]);
+        assert_eq!(on["equalization"]["max_gain"], 1.25, "{algo}: {on}");
     }
 }
 
 #[test]
-fn an_explicit_equalize_false_wins_over_the_focus_map_default() {
-    let report = equalization_run(
-        "stack_cli_equalize_false_focus_map",
-        "depth-map",
-        &["--set", "equalize=false"],
-    );
-    assert!(report["equalization"].is_null(), "{report}");
+fn an_explicit_equalize_false_wins_over_the_default() {
+    for algo in ["depth-map", "laplacian"] {
+        let report = equalization_run(
+            &format!("stack_cli_equalize_false_{algo}"),
+            algo,
+            &["--set", "equalize=false"],
+        );
+        assert!(report["equalization"].is_null(), "{algo}: {report}");
+    }
 }
 
 /// A preset written by a run reproduces that run's equalization, whether it

@@ -433,8 +433,8 @@ pub trait StackAlgorithm: Send + Sync + 'static {
         false
     }
 
-    /// Whether a front end may keep this algorithm out of its first-view
-    /// choices. The registry default is never advanced.
+    /// Whether this algorithm is a specialist choice: front ends list it after
+    /// the others. The registry default is never advanced.
     fn advanced(&self) -> bool {
         false
     }

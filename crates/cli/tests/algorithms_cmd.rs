@@ -331,7 +331,7 @@ fn project_defaults_json_follow_the_fusion_method() {
             .clone()
     };
     assert_eq!(equalize("depth-map"), true);
-    assert_eq!(equalize("laplacian"), false);
+    assert_eq!(equalize("laplacian"), true);
 }
 
 #[test]

@@ -370,6 +370,12 @@ fn open_fused_tab_on(
     if let Some(method) = method {
         controller.set_fuse_algorithm(method);
     }
+    // `Sealed`'s reference reads the raw frames, so the run applies no gains.
+    controller.set_param_value(
+        "prepare",
+        "equalize",
+        focusforge_core::params::ParamValue::Bool(false),
+    );
     assert!(controller.start_fuse());
     settle_all(controller);
     assert_eq!(controller.checkpoint_count(), Some(1), "{name} must fuse");
@@ -3040,7 +3046,7 @@ fn plain_wheel_over_the_images_list_steps_the_source_frame_in_both_modes() {
     editor.images_list_wheel(60.0);
     assert_eq!(
         editor.frame_pane_label(),
-        "01.tif \u{b7} source 2 of 3",
+        "01.tif",
         "the same wheel steps the source in editor mode too, with no Ctrl needed"
     );
 }
@@ -4155,8 +4161,9 @@ fn open_equalized_editor(name: &str, count: usize) -> AppController {
     controller
 }
 
-/// The prepare section lists the equalization switch (off) and its bound, and
-/// turning the switch on reaches the run with the bound the panel holds.
+/// The prepare section lists the equalization switch (on) and its bound; a
+/// default run is equalized, switching it off records an unequalized run, and
+/// the bound the panel holds reaches the run.
 #[test]
 fn equalize_rows_reach_the_run() {
     use focusforge_core::params::ParamValue;
@@ -4174,15 +4181,25 @@ fn equalize_rows_reach_the_run() {
             .find(|r| r.id == id)
             .unwrap_or_else(|| panic!("no {id} row"))
     };
-    assert_eq!(row("equalize").selected, "false", "off by default");
+    assert_eq!(row("equalize").selected, "true", "on by default");
     assert_eq!(row("equalize-max-gain").value_text, "1.25");
 
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
+    let default_run = controller.held_checkpoints().last().cloned().unwrap();
+    assert_eq!(
+        default_run.registration.equalization.map(|e| e.max_gain),
+        Some(1.25),
+        "a default run is equalized with the default bound"
+    );
+
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(false));
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
     let off = controller.held_checkpoints().last().cloned().unwrap();
     assert_eq!(
         off.registration.equalization, None,
-        "a default run is not equalized"
+        "switched off, the run is not equalized"
     );
 
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));

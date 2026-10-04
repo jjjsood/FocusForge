@@ -81,6 +81,8 @@ fn shared_project() -> &'static SharedProject {
             "laplacian".to_string(),
             "--no-align".to_string(),
             "--no-crop".to_string(),
+            "--set".to_string(),
+            "equalize=false".to_string(),
         ];
         // The GPU path's ±1 LSB budget would break the exact-byte equality
         // this file asserts against a CPU library oracle -- the same reason
@@ -714,6 +716,8 @@ fn aligned_project() -> &'static AlignedProject {
             "laplacian".to_string(),
             "--align-algo".to_string(),
             "dummy-align".to_string(),
+            "--set".to_string(),
+            "equalize=false".to_string(),
         ];
         if cfg!(feature = "gpu") {
             args.push("--no-gpu".to_string());

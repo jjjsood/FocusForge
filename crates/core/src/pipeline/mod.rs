@@ -70,7 +70,7 @@ pub struct FuseRequest {
     pub explicit: ParamValues,
     pub align: Option<AlignRequest>,
     pub crop: bool,
-    /// The bound of the opt-in brightness equalization (gains stay within
+    /// The bound of the brightness equalization (gains stay within
     /// `1/bound..=bound`); `None` leaves the frames as delivered.
     pub equalize: Option<f64>,
     pub tile_size: Option<u32>,
