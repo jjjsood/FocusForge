@@ -3828,11 +3828,13 @@ mod tests {
         let before = timing_snapshot().expect("trace accounting is enabled");
 
         record_frame_rendered();
+        let stamped = timing_snapshot().expect("accounting stays on");
         assert_eq!(
-            timing_snapshot().expect("accounting stays on").admitted,
-            before.admitted + 1,
+            stamped.gui_admitted,
+            before.gui_admitted + 1,
             "one frame stamp admits exactly one span"
         );
+        assert_eq!(stamped.admitted, before.admitted);
         assert_ne!(record_input(InputSurface::Canvas), 0);
         record_coalesced_input(InputSurface::Canvas);
         record_coalesced_input(InputSurface::Canvas);
@@ -3898,7 +3900,8 @@ mod tests {
         finish_input_trace();
         assert_eq!(finish_input_batches(), [None, None, None, None, None]);
         let after = timing_snapshot().expect("trace accounting remains enabled");
-        assert_eq!(after.admitted, before.admitted + 11);
+        assert_eq!(after.gui_admitted, before.gui_admitted + 11);
+        assert_eq!(after.admitted, before.admitted);
     }
 
     /// Drives the real generated Images callbacks through an installed,
