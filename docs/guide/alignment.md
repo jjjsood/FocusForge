@@ -52,12 +52,60 @@ iteration cap, convergence epsilon, pyramid depth, which frame is the
 reference, and whether every frame registers against one anchor or chains
 hop-by-hop through its neighbours.
 
+## Frame status
+
+Each frame's row ends in the status its solve reached:
+
+- `converged` — the step size fell below `epsilon-px`.
+- `hit-cap` — `max-iterations` ran out while the steps were still shrinking.
+- `stalled` — `max-iterations` ran out with the steps flat or oscillating; the
+  best-correlation transform is kept.
+- `diverged(<reason>)` — the frame did not register. `validation-failed`
+  (JSON) is one reason: the fit converged, but the same transform leaves a
+  large residual at most of the usable patches away from the fit region, so
+  it is rejected rather than trusted. The other reasons are in
+  [`reference/cli.md`](../reference/cli.md#align).
+
+A pyramid level whose status is worse than the others sets the frame's
+status.
+
 ## Failure is strict by default
 
-A frame the solver cannot register fails the whole run: `stack` and `align`
-both exit non-zero and name every frame that failed, rather than silently
-falling back to an unregistered frame. `focusforge-cli align --help` and
-`focusforge-cli stack --help` list the option to soften that policy.
+A frame that ends `diverged` fails the whole run: `stack` and `align` both
+exit 1 and name every frame that failed, rather than silently falling back to
+an unregistered frame. `--lax` on either command softens each failed frame to
+an identity transform, exits 0 and reports the failure count on stderr.
+
+If the aligned frames share no usable overlap, `stack` stops with an error
+that says so; `--no-crop` keeps the full frame extent instead.
+
+## Limits
+
+Alignment reports a failure rather than guessing, and some inputs still
+produce one:
+
+- Heavy defocus, where frames are blurred past the point that carries
+  alignment detail, can leave frames `diverged` (`correlation-decreased`).
+- Long series (on the order of 64 frames) can leave several frames
+  `diverged`, because drift accumulates across the stack.
+- Strongly periodic scenes (repeating patterns) can register to the wrong
+  period.
+
+For such a stack use `--lax` to fuse anyway, or `--no-align` when the frames
+are already registered.
+
+## Reuse and hardware
+
+`stack` stores each computed alignment in the stage cache, keyed on the
+frames, the alignment parameters, the failure policy and the solver revision,
+so a repeated run, or a re-fuse in the window with only fusion settings
+changed, skips the solve. `--no-cache` forces a recompute.
+
+Large pyramid levels run on the GPU when a usable adapter is present; the
+rest of the solve is on the CPU. `--no-gpu` keeps everything on the CPU and
+`--max-vram <SIZE>` lowers the device memory budget. If the device is lost
+mid-run, the whole alignment is redone on the CPU, so every frame comes from
+one backend. Both JSON reports name the backend in `align_backend`.
 
 ## Checking a result visually
 
@@ -77,5 +125,6 @@ focusforge-cli stack path/to/frames/ --algo laplacian --no-align
 
 `--no-align` fuses the raw frames unwarped; `--no-crop` keeps alignment on
 but leaves the output at the full frame extent instead of cropping to the
-common region. See [`reference/cli.md`](../reference/cli.md#stack) for every
+common region. In the window the same two choices are the **Enabled** switch
+and **Auto-crop** (see [`guide/gui.md`](gui.md#aligning-in-the-window)). See [`reference/cli.md`](../reference/cli.md#stack) for every
 `stack` and `align` flag.
