@@ -2068,6 +2068,72 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_whose_features_cluster_converges_seeded() {
+        // Texture only inside one rectangle of the reference (and the same
+        // content, moved by the shift, in the frame): the matches fall in a
+        // few grid cells but are nearly all right.
+        let shift = (150.0, -90.0);
+        let keep = |x0: u32, y0: u32| {
+            move |i: usize| {
+                let (x, y) = (i as u32 % W, i as u32 / W);
+                (x0..x0 + 400).contains(&x) && (y0..y0 + 300).contains(&y)
+            }
+        };
+        let mut mem = blob_reader(&[(0.0, 0.0), shift]);
+        for (frame, (x0, y0)) in mem.frames.iter_mut().zip([(300, 200), (450, 110)]) {
+            let inside = keep(x0, y0);
+            for (i, v) in frame.iter_mut().enumerate() {
+                if !inside(i) {
+                    *v = 32768;
+                }
+            }
+        }
+        let depth = 3;
+
+        let ctx = AlignContext::new(StackContext::new(2, W, H, 1), 0, &mem);
+        let reference = PreparedReference::build(&ctx, 0, EccMode::Similarity, depth).unwrap();
+        let frame_pyramid = PyramidalEcc::build_pyramid(&ctx, 1, depth).unwrap();
+        let level = seed_level(W, H, depth).expect("a seed level");
+        let frame_features = detect_level(&ctx, 1, &frame_pyramid, level)
+            .unwrap()
+            .expect("features");
+        let reference_features = detect_level(&ctx, 0, &reference.pyramid, level)
+            .unwrap()
+            .expect("features");
+        let dims = (W.div_ceil(1 << level), H.div_ceil(1 << level));
+        let fit = fit_between(&reference_features, &frame_features, dims).expect("a fit");
+        assert!(
+            (2..6).contains(&fit.occupied_cells),
+            "the matches must cluster: {fit:?}"
+        );
+
+        let first = unseeded(&mem, EccMode::Similarity, depth, 1);
+        assert!(
+            matches!(first.status, AlignStatus::Diverged(_)),
+            "{first:?}"
+        );
+        let (_, attempt, escalation) = registered(&mem, EccMode::Similarity, depth, 1);
+        assert_eq!(
+            escalation,
+            Escalation {
+                attempted: true,
+                rerun: true,
+                accepted: true
+            },
+            "{fit:?}"
+        );
+        assert!(
+            !matches!(attempt.status, AlignStatus::Diverged(_)),
+            "{attempt:?}"
+        );
+        let (_, _, tx, ty) = attempt.transform.similarity_parts();
+        assert!(
+            (tx - shift.0).abs() < 0.05 && (ty - shift.1).abs() < 0.05,
+            "({tx}, {ty})"
+        );
+    }
+
+    #[test]
     fn a_quasi_periodic_scene_keeps_its_identity_start_outcome() {
         // The smooth sinusoid scene matches a half-turn of itself on a
         // fifth of the matches: not a seed.
@@ -2121,6 +2187,124 @@ mod tests {
                 first.residual
             )
         );
+    }
+
+    /// Frames of the reference stack solved from their own feature seed,
+    /// with the shipped defaults, against the transform their identity-start
+    /// solve ends at: whether a clustered seed leads the solve to the same fit
+    /// or to a wrong one the floor and the off-centre check let through.
+    #[test]
+    #[ignore = "reads the 16 GB reference stack"]
+    fn reference_stack_frames_solved_from_their_feature_seed_match_the_shipped_fit() {
+        let Some(dir) = std::env::var_os("FOCUSFORGE_REFERENCE_STACK")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_dir())
+        else {
+            println!("FOCUSFORGE_REFERENCE_STACK does not name a directory; skipped");
+            return;
+        };
+        let paths: Vec<_> = crate::io::frame_paths(&dir)
+            .expect("the stack directory enumerates")
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("IMG_"))
+            })
+            .collect();
+        let stack = crate::io::TiffStack::open_files(&paths).expect("the stack opens");
+        let (width, height) = stack.dimensions();
+        let stack_ctx = StackContext::new(
+            stack.len(),
+            width,
+            height,
+            stack.header(0).samples_per_pixel,
+        );
+        let algo = crate::registry::find_align("pyramidal-ecc").expect("registered");
+        let resolved = crate::params::resolve(algo.params(), &ParamValues::new(), &stack_ctx)
+            .expect("the defaults resolve");
+        let cfg = crate::params::resolved_values(&resolved);
+        let reference_frame = (stack.len() - 1) / 2;
+        let ctx = AlignContext::new(stack_ctx, reference_frame, &stack);
+
+        let mode = PyramidalEcc::mode(&cfg).unwrap();
+        let depth = cfg
+            .get("pyramid-depth")
+            .and_then(ParamValue::as_i64)
+            .unwrap() as u32;
+        let params = EccParams {
+            max_iterations: cfg
+                .get("max-iterations")
+                .and_then(ParamValue::as_i64)
+                .unwrap() as u32,
+            epsilon_px: cfg.get("epsilon-px").and_then(ParamValue::as_f64).unwrap(),
+            min_valid_fraction: MIN_VALID_FRACTION,
+        };
+        let reference = PreparedReference::build(&ctx, reference_frame, mode, depth).unwrap();
+        let level = seed_level(width, height, depth).expect("a seed level");
+        let dims = (width.div_ceil(1 << level), height.div_ceil(1 << level));
+        let (w, h) = (f64::from(width), f64::from(height));
+        let spots = [[0.0, 0.0], [w, 0.0], [0.0, h], [w, h], [w / 2.0, h / 2.0]];
+        let moved = |a: &Transform, b: &Transform| {
+            spots
+                .iter()
+                .map(|p| {
+                    let at = |t: &Transform| {
+                        [
+                            t.m[0][0] * p[0] + t.m[0][1] * p[1] + t.m[0][2],
+                            t.m[1][0] * p[0] + t.m[1][1] * p[1] + t.m[1][2],
+                        ]
+                    };
+                    let (x, y) = (at(a), at(b));
+                    (x[0] - y[0]).hypot(x[1] - y[1])
+                })
+                .fold(0.0, f64::max)
+        };
+
+        for frame in [0usize, 15, 45, 60] {
+            let shipped = PyramidalEcc.align_frame(&ctx, frame, &cfg).unwrap();
+            let pyramid = PyramidalEcc::build_pyramid(&ctx, frame, depth).unwrap();
+            let mut escalation = Escalation::default();
+            let seed = PyramidalEcc::feature_seed(
+                &ctx,
+                frame,
+                &reference,
+                &pyramid,
+                depth,
+                &mut escalation,
+            )
+            .unwrap();
+            let fit = {
+                let r = reference.features.get().unwrap().as_ref().unwrap().as_ref();
+                let f = detect_level(&ctx, frame, &pyramid, level).unwrap();
+                r.zip(f.as_ref()).and_then(|(r, f)| fit_between(r, f, dims))
+            };
+            let Some(seed) = seed else {
+                panic!("frame {frame}: no accepted seed, fit={fit:?}");
+            };
+            let started = std::time::Instant::now();
+            let attempt = PyramidalEcc::solve_from(
+                &ctx, frame, &reference, &pyramid, depth, &params, seed, false,
+            )
+            .unwrap();
+            let off = moved(&attempt.transform, &shipped.transform);
+            println!(
+                "seeded frame={frame} level={level} fit={fit:?} shipped={:?} shipped_corr={:.4} \
+                 seeded={:?} seeded_corr={:.4} floor={MIN_FINAL_CORRELATION} iterations={} \
+                 moved_from_shipped_px={off:.3} secs={:.1}",
+                shipped.status,
+                shipped.residual,
+                attempt.status,
+                attempt.residual,
+                attempt.iterations,
+                started.elapsed().as_secs_f64(),
+            );
+            assert!(
+                !matches!(attempt.status, AlignStatus::Diverged(_)) && off < 1.0,
+                "frame {frame}: {:?}, {off} px from the shipped fit",
+                attempt.status
+            );
+        }
     }
 
     #[test]
