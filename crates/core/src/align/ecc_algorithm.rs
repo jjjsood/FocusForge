@@ -2189,10 +2189,9 @@ mod tests {
         );
     }
 
-    /// Frames of the reference stack solved from their own feature seed,
-    /// with the shipped defaults, against the transform their identity-start
-    /// solve ends at: whether a clustered seed leads the solve to the same fit
-    /// or to a wrong one the floor and the off-centre check let through.
+    /// Frames of the reference stack solved from their own feature seed with
+    /// the default parameters must end within a pixel of the transform their
+    /// identity-start solve ends at.
     #[test]
     #[ignore = "reads the 16 GB reference stack"]
     fn reference_stack_frames_solved_from_their_feature_seed_match_the_shipped_fit() {
