@@ -449,7 +449,7 @@ fn capped_admission_is_byte_identical() {
     let job_opts = options("capped-engine", 1 << 30);
     let job_scheduler = build_scheduler(&stack, &job_opts);
     if job_scheduler.in_flight_limit() < 2 {
-        eprintln!("host reports too little parallelism to admit several tile sets; skipping");
+        eprintln!("host reports too little parallelism to admit several tiles; skipping");
         return;
     }
     let mut job = Job::new(&job_scheduler);
@@ -469,7 +469,7 @@ fn capped_admission_is_byte_identical() {
     let peak = tracked.peak.load(Ordering::SeqCst);
     job_consumer.finish().expect("engine finish must succeed");
 
-    assert_eq!(peak, 1, "a cap of 1 admits one tile set at a time");
+    assert_eq!(peak, 1, "a cap of 1 admits one tile at a time");
     assert_eq!(
         std::fs::read(&ref_composite).unwrap(),
         std::fs::read(&job_composite).unwrap(),
@@ -520,8 +520,8 @@ fn pause_lands_within_the_unit_bound() {
 
     // More than one worker: at most `in_flight_limit` further units
     // complete.
-    let bytes_per_tile_set = stack.len() as u64 * 200 * 200 * 3 * 2;
-    let opts2 = options("pause-bound-many", (bytes_per_tile_set * 4) as usize);
+    let bytes_per_tile = 200u64 * 200 * (3 * 2 + 1);
+    let opts2 = options("pause-bound-many", (bytes_per_tile * 4) as usize);
     let scheduler2 = build_scheduler(&stack, &opts2);
     let limit = scheduler2.in_flight_limit();
     if limit < 2 {
@@ -571,8 +571,8 @@ fn pause_lands_within_the_unit_bound() {
 #[test]
 fn error_wins_over_a_racing_pause_request() {
     let stack = open_stack();
-    let bytes_per_tile_set = stack.len() as u64 * 200 * 200 * 3 * 2;
-    let opts = options("error-wins-over-pause", (bytes_per_tile_set * 4) as usize);
+    let bytes_per_tile = 200u64 * 200 * (3 * 2 + 1);
+    let opts = options("error-wins-over-pause", (bytes_per_tile * 4) as usize);
     let scheduler = build_scheduler(&stack, &opts);
     if scheduler.in_flight_limit() < 2 {
         eprintln!("host reports too little parallelism for this race; skipping");

@@ -16,6 +16,8 @@ export component FFSlider inherits Rectangle {
     in property <bool> disabled: false;
     in property <bool> invalid: false;
     in property <bool> compact: false;
+    // Sits on a tint as light as its own track: draws the stronger border tone.
+    in property <bool> recessed: false;
     // `compact`'s own track width; ignored outside `compact`.
     in property <length> track-width: 72px;
     callback fraction-changed(float);
@@ -33,7 +35,7 @@ export component FFSlider inherits Rectangle {
             width: root.compact ? root.track-width : parent.width - 70px;
             height: root.compact ? 2px : 4px;
             border-radius: self.height / 2;
-            background: Theme.surface-overlay;
+            background: root.recessed ? Theme.border-strong : Theme.surface-overlay;
 
             fill := Rectangle {
                 x: 0px;
@@ -75,6 +77,7 @@ export component FFSlider inherits Rectangle {
             text: root.value-text;
             disabled: root.disabled;
             invalid: root.invalid;
+            recessed: root.recessed;
             text-alignment: right;
         }
         if root.compact: Text {

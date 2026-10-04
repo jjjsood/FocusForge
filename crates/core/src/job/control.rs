@@ -105,7 +105,7 @@ impl JobControl {
         })
     }
 
-    /// Caps the units this job may hold in flight (fusion tile sets and
+    /// Caps the units this job may hold in flight (fusion tiles and
     /// alignment registrations alike), floored at one so a capped run still
     /// progresses; `None` lifts the cap. Takes effect at the next admission
     /// check of either stage.

@@ -9,12 +9,13 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use focusforge_core::algorithm::StackAlgorithm;
 use focusforge_core::align::ReferencePolicy;
-use focusforge_core::gpu::TileBackend;
+use focusforge_core::equalize::EqualizationReport;
+use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{FrameReader, Group, Proposal, Rect, open_frame_set, propose};
 use focusforge_core::job::{JobControl, StageCache};
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance};
@@ -43,6 +44,10 @@ pub struct StackReport {
     pub width: u32,
     pub height: u32,
     pub samples_per_pixel: u32,
+    /// The intensity encoding fusion operates on: `encoded-srgb` for RAW
+    /// input, `encoded-unknown-transfer` for TIFF. Code values are used as
+    /// delivered, never converted.
+    pub working_space: &'static str,
     pub algorithm: String,
     pub display_name: String,
     pub params: Vec<ParamReport>,
@@ -60,7 +65,7 @@ pub struct StackReport {
     /// The host in-flight-byte budget actually in force for this run.
     pub max_bytes_in_flight: u64,
     /// The bytes the scheduler accounted for at its in-flight limit
-    /// (`in_flight_limit` tile sets, reader scratch included): the figure
+    /// (`in_flight_limit` tiles, reader scratch included): the figure
     /// compared with `max_bytes_in_flight`, never with resident memory.
     pub accounted_bytes_in_flight: u64,
     /// Where that budget came from: `Host` (adaptive), `HostFallback` (the
@@ -82,6 +87,8 @@ pub struct StackReport {
     pub crop: Option<Rect>,
     pub description: Option<String>,
     pub align: Option<StackAlignReport>,
+    /// The brightness equalization's estimate; `null` when it was off.
+    pub equalization: Option<EqualizationReport>,
     /// `"cpu"`, or the selected adapter's [`focusforge_core::gpu::BackendInfo`]
     /// display -- additive, so which path ran is machine-readable and not
     /// only a stderr line.
@@ -97,6 +104,11 @@ pub struct StackReport {
     /// this group (per group, never a running maximum). `0` when no tile
     /// went through the device; `null` on the CPU path.
     pub device_peak_in_flight: Option<usize>,
+    /// Why the run fused on the host although a device was available: the
+    /// message naming the tile that did not fit the device budget. `null`
+    /// when the device ran, or no device was in use. On a fallback `backend`
+    /// is `cpu` and the three device fields above are `null`.
+    pub gpu_fallback: Option<String>,
     /// `true` only when the alignment came out of the stage cache;
     /// `false` for a computed one, a `--resume` ledger-peeked one, or a
     /// `--no-align` run.
@@ -126,6 +138,9 @@ pub struct StackReport {
     /// registration per worker) -- `None` unless the alignment was computed
     /// this run.
     pub align_accounted_bytes: Option<u64>,
+    /// `"cpu"`, or the adapter's display when at least one alignment level
+    /// ran on it -- `null` unless the alignment was computed this run.
+    pub align_backend: Option<String>,
 }
 
 /// A narrow, `crates/gpu`-free handle on a `GpuBackend`'s realized tile
@@ -165,6 +180,33 @@ impl BackendChoice {
             backend: None,
             device_budget: None,
             device_peak: None,
+        }
+    }
+}
+
+/// `resolve_align_backend`'s return value: the align stage's accelerator and
+/// the cell holding the adapter's display once the accelerator opens it, which
+/// the reports name only when a level actually ran on it.
+pub struct AlignBackendChoice {
+    pub backend: Option<&'static dyn AlignBackend>,
+    pub adapter: Option<&'static OnceLock<String>>,
+}
+
+impl AlignBackendChoice {
+    /// The CPU path: no accelerator, no adapter.
+    pub fn cpu() -> Self {
+        AlignBackendChoice {
+            backend: None,
+            adapter: None,
+        }
+    }
+
+    /// The report's `align_backend` value for a run whose accelerator was
+    /// used (or not).
+    pub fn report_name(&self, used: bool) -> String {
+        match (self.adapter.and_then(OnceLock::get), used) {
+            (Some(adapter), true) => adapter.clone(),
+            _ => "cpu".to_string(),
         }
     }
 }
@@ -321,14 +363,25 @@ pub fn run(
     let device_budget_report = choice.device_budget;
     let device_peak = choice.device_peak;
 
-    // Parse `--set` against that schema and overlay it on the
-    // preset's `[stack]` table. An unknown key or an out-of-range value is
-    // refused here -- from either source, with the same `ParamViolation`
-    // rendering -- with the input directory still unread.
-    let explicit = match parse_settings(algo.params(), &set.set)
-        .and_then(|cli| merge_preset(algo.params(), &file.stack, cli))
+    // Parse `--set` against the algorithm's schema chained with the project
+    // parameters and overlay it on the preset's `[stack]` table. An unknown
+    // key or an out-of-range value is refused here -- from either source,
+    // with the same `ParamViolation` rendering -- with the input directory
+    // still unread. The project keys are split off before resolution: they
+    // belong to the run, not to the algorithm's own schema.
+    let project_schema = project::params_for(algo);
+    let schema: Vec<_> = algo
+        .params()
+        .iter()
+        .chain(project_schema.iter())
+        .cloned()
+        .collect();
+    let (project_values, explicit) = match parse_settings(&schema, &set.set)
+        .and_then(|cli| merge_preset(&schema, &file.stack, cli))
     {
-        Ok(values) => values,
+        Ok(values) => values
+            .into_iter()
+            .partition::<ParamValues, _>(|(id, _)| project_schema.iter().any(|d| &d.id == id)),
         Err(violations) => {
             return refuse(
                 violations
@@ -338,6 +391,30 @@ pub fn run(
                     .join("\n"),
             );
         }
+    };
+
+    // The `align` project value (`--set align=false`, a preset's `[stack]`
+    // table) switches alignment off like `--no-align`.
+    let aligns = align_opts.align
+        && project_values
+            .get("align")
+            .and_then(ParamValue::as_bool)
+            .unwrap_or(true);
+    let align_opts = &AlignOptions {
+        align: aligns,
+        ..*align_opts
+    };
+
+    // The align accelerator is resolved only for a run that aligns. An
+    // unknown align algorithm is refused later, per group, with the usual
+    // message; here it only means no accelerator.
+    let align_choice = if align_opts.align {
+        match resolve_align_algo(align_opts.algo.or(file.align_algo.as_deref())) {
+            Ok(align_algo) => crate::resolve_align_backend(align_algo.id(), no_gpu, max_vram),
+            Err(_) => AlignBackendChoice::cpu(),
+        }
+    } else {
+        AlignBackendChoice::cpu()
     };
 
     // The zmap-flag and `-o` refusals fire **before** the input directory is
@@ -430,7 +507,10 @@ pub fn run(
         backend,
         device_budget_report,
         device_peak,
+        align_choice,
         explicit,
+        equalize: project::equalization_bound(&project_schema, &project_values),
+        project_values,
         file,
         align_opts,
         job_opts,
@@ -524,7 +604,14 @@ struct RunSetup<'a> {
     /// `DevicePeak` handle -- `None` on the CPU path, mirroring
     /// `device_budget_report`.
     device_peak: Option<&'static dyn DevicePeak>,
+    /// The align stage's accelerator, resolved once beside `backend`.
+    align_choice: AlignBackendChoice,
     explicit: ParamValues,
+    /// The explicitly set project parameters (`PROJECT_PARAMS`).
+    project_values: ParamValues,
+    /// The gain bound brightness equalization runs with, `None` when off:
+    /// resolved against the fusion method's own project defaults.
+    equalize: Option<f64>,
     file: preset::Preset,
     align_opts: &'a AlignOptions<'a>,
     job_opts: &'a JobOptions,
@@ -845,7 +932,10 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         backend,
         device_budget_report,
         device_peak,
+        align_choice,
         explicit,
+        project_values,
+        equalize,
         file,
         align_opts,
         job_opts,
@@ -987,7 +1077,11 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         let written = preset::Preset {
             algo: Some(algo.id().to_string()),
             align_algo: align_prepared.as_ref().map(|(a, ..)| a.id().to_string()),
-            stack: explicit.clone(),
+            stack: explicit
+                .iter()
+                .chain(project_values.iter())
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
             align: align_prepared
                 .as_ref()
                 .map(|(_, e, _)| e.clone())
@@ -1003,9 +1097,9 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // created anywhere. `TileScheduler::new` is pure: it builds a `TilePlan`
     // and divides the byte budget, touching no file.
     if preset_opts.dry_run {
-        let levels = algo.tile_levels(&params::resolved_values(&resolved));
+        let support = algo.tile_support(&params::resolved_values(&resolved));
         let mut options = TileSchedulerOptions::new(".scratch");
-        options.levels = levels;
+        options.apply_support(support);
         if let Some(tile_size) = job_opts.tile_size {
             options.tile_size = tile_size;
         }
@@ -1094,10 +1188,16 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         algorithm: algo,
         explicit,
         align: align_request,
-        crop: align_opts.crop,
+        crop: align_opts.crop
+            && project_values
+                .get("auto-crop")
+                .and_then(ParamValue::as_bool)
+                .unwrap_or(true),
+        equalize: *equalize,
         tile_size: job_opts.tile_size,
         max_host_memory,
         backend,
+        align_backend: align_choice.backend,
         resume: job_opts.resume,
         cache: job_opts.cache,
         poll: job::POLL,
@@ -1162,6 +1262,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 device_budget_report,
                 device_peak,
                 align_opts,
+                align_choice,
                 *report,
             );
             GroupResult::Completed(Box::new(stack_report))
@@ -1279,6 +1380,7 @@ fn sealed_path(report: &focusforge_core::pipeline::FuseReport) -> String {
 /// [`focusforge_core::pipeline::FuseReport`] plus the facts only this crate
 /// knows: the input directory as the user wrote it, and the GPU-only device
 /// budget/peak (`crates/core` never learns what VRAM is).
+#[allow(clippy::too_many_arguments)]
 fn build_stack_report(
     dir: &Path,
     algo: &'static dyn StackAlgorithm,
@@ -1286,9 +1388,17 @@ fn build_stack_report(
     device_budget_report: Option<DeviceBudgetReport>,
     device_peak: Option<&'static dyn DevicePeak>,
     align_opts: &AlignOptions<'_>,
+    align_choice: &AlignBackendChoice,
     report: focusforge_core::pipeline::FuseReport,
 ) -> StackReport {
     let outputs = vec![sealed_path(&report)];
+    // A run that fell back never touched the device: its budget and peak
+    // describe a path that did not run.
+    let (backend_id, device_budget_report, device_peak) = if report.gpu_fallback.is_some() {
+        ("cpu".to_string(), None, None)
+    } else {
+        (backend_id, device_budget_report, device_peak)
+    };
     let align = report.align.map(|a| {
         let failure_count = a.alignment.failure_count();
         let reference = a.alignment.reference;
@@ -1313,6 +1423,8 @@ fn build_stack_report(
             alignments,
         }
     });
+    let align_backend = (report.align_source == "computed")
+        .then(|| align_choice.report_name(report.align_backend_used));
     StackReport {
         input: dir.display().to_string(),
         frame_count: report.frame_count,
@@ -1320,6 +1432,7 @@ fn build_stack_report(
         width: report.width,
         height: report.height,
         samples_per_pixel: report.samples_per_pixel,
+        working_space: report.working_space,
         algorithm: algo.id().to_string(),
         display_name: algo.display_name().to_string(),
         params: report
@@ -1355,16 +1468,19 @@ fn build_stack_report(
         crop: report.crop,
         description: report.description,
         align,
+        equalization: report.equalization,
         backend: backend_id,
         max_device_bytes_in_flight: device_budget_report.as_ref().map(|r| r.max_device_bytes),
         device_budget_provenance: device_budget_report.as_ref().map(|r| r.provenance),
         device_peak_in_flight: device_peak.map(|p| p.peak_in_flight()),
+        gpu_fallback: report.gpu_fallback,
         align_cached: report.align_cached,
         stages: report.stages,
         align_source: report.align_source,
         align_workers: report.align_workers,
         peak_align_workers: report.peak_align_workers,
         align_accounted_bytes: report.align_accounted_bytes,
+        align_backend,
     }
 }
 
@@ -1443,6 +1559,17 @@ fn render(report: &StackReport) -> String {
         report.budget_provenance,
         report.backed_off,
     ));
+    lines.push(format!("working_space={}", report.working_space));
+    lines.push(match &report.equalization {
+        None => "equalization=off".to_string(),
+        Some(eq) => format!(
+            "equalization=on max_gain={} reference={} clamped={} thin={} (scales encoded code values, not a linear-light correction)",
+            eq.max_gain,
+            eq.reference,
+            eq.frames.iter().filter(|f| f.clamped).count(),
+            eq.frames.iter().filter(|f| f.thin).count(),
+        ),
+    });
     lines.push(format!("backend: {}", report.backend));
     if let (
         Some(max_device_bytes_in_flight),
@@ -1557,6 +1684,7 @@ mod tests {
             width: 512,
             height: 512,
             samples_per_pixel: 3,
+            working_space: "encoded-unknown-transfer",
             // A fictional id on purpose: no algorithm id appears anywhere in
             // `crates/cli/src`, test data included.
             algorithm: "example-stack".to_string(),
@@ -1584,10 +1712,12 @@ mod tests {
             crop: None,
             description: None,
             align: None,
+            equalization: None,
             backend: "cpu".to_string(),
             max_device_bytes_in_flight: None,
             device_budget_provenance: None,
             device_peak_in_flight: None,
+            gpu_fallback: None,
             align_cached: false,
             stages: focusforge_core::timing::StageTimings {
                 setup: Some(0.012),
@@ -1600,6 +1730,7 @@ mod tests {
             align_workers: Some(3),
             peak_align_workers: Some(3),
             align_accounted_bytes: Some(1 << 28),
+            align_backend: Some("cpu".to_string()),
         }
     }
 
@@ -1623,6 +1754,7 @@ mod tests {
             "accounted_bytes_in_flight=536870912",
             "budget=Host",
             "backed_off=false",
+            "working_space=encoded-unknown-transfer",
             "wrote: mantis-512.ffp",
             "wall: 1.500s",
             "backend: cpu",

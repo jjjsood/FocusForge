@@ -66,44 +66,47 @@
 //! neighbourhood in every frame --
 //! reachable, and exercised by
 //! `tests::flat_stack_falls_back_to_the_plain_mean`), the blend is the plain
-//! arithmetic mean over frames in ascending order, and the Z-Map index is
-//! `0`. Never [`crate::zmap::NO_SOURCE`], never a division by zero, never a
-//! panic -- `weight_f(p) >= 0.0` for every `f` (a sum of absolute values
-//! raised to a positive power), so `den(p) == 0.0` can only mean every term
-//! was `0.0`, and it is checked for exactly, not approximated.
+//! arithmetic mean over the eligible frames in ascending order, and the
+//! Z-Map index is the lowest eligible frame (`0` with no coverage masks).
+//! Never a division by zero -- `weight_f(p) >= 0.0` for every `f`, so
+//! `den(p) == 0.0` can only mean every term was `0.0`, checked exactly.
+//!
+//! A frame is eligible at `p` when its coverage mask
+//! ([`crate::algorithm::TileCtx::for_each_frame`]), eroded by the full reach of its
+//! weight, `DETAIL_REACH + radius` (`sharpness::eligible`), is true there. An
+//! ineligible frame adds nothing; a pixel with no eligible frame is
+//! [`crate::zmap::NO_SOURCE`] with zero samples.
 //!
 //! # The Z-Map
 //!
 //! **The composite is a blend; the Z-Map is not the blend's provenance in
 //! full.** It records the pixel's **dominant contributor**: `argmax_f
-//! weight_f(p)`, **strictly greater** so the **lowest index wins an exact
-//! tie** -- identical to `laplacian`'s tie-break. Retouch recomposites from
+//! weight_f(p)` over the eligible frames, **strictly greater** so the
+//! **lowest index wins an exact tie** -- identical to `laplacian`'s tie-break. Retouch recomposites from
 //! the Z-Map plus source textures; that reconstruction recovers exactly one
 //! frame's pixels, never the blend the user actually saw, so this Z-Map is
 //! *not* sufficient to reconstruct this algorithm's own composite -- the
 //! one place in the project where that gap is real rather than
 //! theoretical.
 //!
-//! # Reach and `tile_levels`
+//! # Reach and `tile_support`
 //!
 //! A windowed weight of radius `r` reads `r` px of its own neighbourhood
-//! plus `crate::fuse::sharpness::DETAIL_REACH` (`2`) for the one-level
-//! build-plus-expand underneath it: `2 + r`. [`WeightedAverage::tile_levels`]
-//! overrides the trait's default (which would answer `0`, since this
-//! schema declares no key named `"levels"`) with
-//! `crate::fuse::sharpness::levels_for_margin(2 + radius)` -- `2` at the
-//! default `radius = 8`.
+//! plus `crate::fuse::sharpness::DETAIL_REACH` (`4`) for the one-level
+//! reduce-and-expand underneath it: `4 + r`. [`WeightedAverage::tile_support`]
+//! reports that reach on a one-level (2 px) decimation grid, overriding the
+//! trait's default (no reach, since this schema declares no key named
+//! `"levels"`): the planned margin is `4 + radius` rounded up to the grid.
 //!
 //! # Tiling
 //!
 //! Neither a pyramid nor `collapse` survives past the per-pixel blend --
 //! every output sample is a weighted combination of samples the read rect
-//! already holds, all within `2 + radius` px of `p`. Where that reach sits
-//! inside the scheduler's margin (always, given the override above), the
-//! composite **and** the Z-Map are bit-exact between a tiled and an
-//! untiled run -- unlike `laplacian`'s composite, which additionally passes
-//! through `collapse` and is therefore not (see
-//! `crate::fuse::laplacian`'s "Tiling and the composite seam" section).
+//! already holds, all within `4 + radius` px of `p`. That reach sits inside
+//! the planned margin, so the composite **and** the Z-Map are bit-exact
+//! between a tiled and an untiled run; `laplacian` reaches the same
+//! guarantee with a margin that also covers `collapse` (see
+//! `crate::fuse::laplacian`'s "Tiling" section).
 
 use std::sync::LazyLock;
 
@@ -111,45 +114,49 @@ use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
 use crate::fuse::error::{algorithm_error, missing_key};
 use crate::fuse::laplacian::score_plane;
 use crate::fuse::pyramid::Plane;
-use crate::fuse::sharpness::{DETAIL_REACH, detail_plane, levels_for_margin};
+use crate::fuse::sharpness::{DETAIL_REACH, detail_plane, eligible as sharpness_eligible};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues};
 use crate::registry::StackRegistration;
 use crate::tile::Tile;
+use crate::tile::plan::TileSupport;
+use crate::zmap::NO_SOURCE;
 
-const RADIUS_DEFAULT: i64 = 8;
+/// `16`. A defocused frame's spread edge energy reaches past a narrow window,
+/// so a wide window keeps the sharp edge's score dominant. With exponent 4.0,
+/// 16 px against 8 px takes the dark-side brightening next to strong edges on
+/// two aligned 1024 x 1024 crops (counts against a per-pixel sharpest-frame
+/// pick) from 147.6 / -81.1 to -62.8 / -193.0; at exponent 2.0 it alone loses
+/// hair detail (retention 0.8108 against 0.8644).
+const RADIUS_DEFAULT: i64 = 16;
 
-/// `2.0`. Measured over `fixtures/mantis-512` (single-tile, 704 px):
-/// composite Laplacian variance is 83,079.4 at `1.0`, 169,581.2 at `2.0`
-/// and 218,923.3 at `4.0` -- `2.0` already captures most of the exponent's
-/// benefit (roughly 2x `1.0`'s variance), while `4.0` buys only a further
-/// ~29% over `2.0` for walking twice as far toward selection, which is
-/// what "weighted average" is meant not to be.
-const WEIGHT_EXPONENT_DEFAULT: f64 = 2.0;
+/// `4.0`. With the 16 px window it takes the dark-side brightening next to
+/// strong edges on the two crops from 729.9 / 250.6 (radius 8, exponent 2.0)
+/// to -62.8 / -193.0 counts and raises hair retention from 0.8644 to 0.9163.
+/// It stays a blend: hair retention and glint core (0.9611) stay below
+/// Details (0.9927, 0.9985) by more than 0.07 and 0.03, where exponent 6.0 at
+/// radius 8 comes within 0.015 on hair retention.
+const WEIGHT_EXPONENT_DEFAULT: f64 = 4.0;
 
 static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     vec![
         ParamDesc {
             id: "radius".to_string(),
             label: "Radius".to_string(),
-            help: "Sharpness-window radius, in level-0 pixels: how far the \
-                   per-pixel weight looks for local detail before blending. \
-                   A detail-scale property, not resolution-derived -- no \
-                   `auto` hook, like `laplacian`'s own `SCORE_RADIUS` \
-                   constant."
+            help: "How far, in pixels, each pixel looks around itself to judge \
+                   how sharp it is."
                 .to_string(),
             kind: ParamKind::Int { min: 0, max: 16 },
             default: ParamValue::Int(RADIUS_DEFAULT),
+            advanced: true,
             auto: None,
             host_default: None,
         },
         ParamDesc {
             id: "weight-exponent".to_string(),
-            label: "Weight Exponent".to_string(),
-            help: "How aggressively the blend favours locally sharper \
-                   frames: `1.0` is the plainest reading of \"weighted \
-                   average\", higher values walk the blend toward \
-                   selection. A taste knob, not resolution-derived -- no \
-                   `auto` hook."
+            label: "Sharp-source preference".to_string(),
+            help: "How strongly the sharpest frame is preferred where frames \
+                   overlap: low values blend smoothly, high values lean \
+                   toward picking the sharpest source."
                 .to_string(),
             kind: ParamKind::Float {
                 min: 1.0,
@@ -158,6 +165,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
                 logarithmic: false,
             },
             default: ParamValue::Float(WEIGHT_EXPONENT_DEFAULT),
+            advanced: false,
             auto: None,
             host_default: None,
         },
@@ -170,7 +178,7 @@ pub struct WeightedAverage;
 
 impl WeightedAverage {
     /// `radius`, read out of `cfg` with the descriptor's own default as the
-    /// fallback -- `tile_levels` has no `Result`, so it cannot report a
+    /// fallback -- `tile_support` has no `Result`, so it cannot report a
     /// missing key the way `fuse` does.
     fn radius(cfg: &ParamValues) -> u32 {
         cfg.get("radius")
@@ -186,7 +194,7 @@ impl StackAlgorithm for WeightedAverage {
     }
 
     fn display_name(&self) -> &str {
-        "Weighted Average"
+        "Soft transitions"
     }
 
     fn params(&self) -> &[ParamDesc] {
@@ -208,8 +216,7 @@ impl StackAlgorithm for WeightedAverage {
         let rect = ctx.rect();
         let (width, height) = (rect.width, rect.height);
         let frame_count = ctx.frame_count();
-        let frame0 = ctx.frame(0)?;
-        let spp = frame0.samples_per_pixel;
+        let spp = ctx.samples_per_pixel()?;
         let spp_usize = spp as usize;
         let pixel_count = width as usize * height as usize;
 
@@ -221,15 +228,21 @@ impl StackAlgorithm for WeightedAverage {
         let mut sample_sum = vec![0.0f64; pixel_count * spp_usize];
         let mut den = vec![0.0f64; pixel_count];
         let mut best = vec![f64::NEG_INFINITY; pixel_count];
-        let mut winner = vec![0u16; pixel_count];
+        let mut winner = vec![NO_SOURCE; pixel_count];
+        let mut eligible_frames = vec![0u32; pixel_count];
 
-        for f in 0..frame_count {
-            let tile = ctx.frame(f)?;
+        ctx.for_each_frame(|f, tile, covered| {
             let detail = detail_plane(&tile.samples, width, height, spp)
                 .map_err(algorithm_error("weighted-average"))?;
             let scores = score_plane(&detail, radius);
+            let eligible = covered
+                .map(|covered| sharpness_eligible(covered, width, height, DETAIL_REACH + radius));
 
             for p in 0..pixel_count {
+                if eligible.as_ref().is_some_and(|e| !e[p]) {
+                    continue;
+                }
+                eligible_frames[p] += 1;
                 let w = f64::from(scores[p]).powf(f64::from(weight_exponent));
                 let base = p * spp_usize;
                 for c in 0..spp_usize {
@@ -246,12 +259,16 @@ impl StackAlgorithm for WeightedAverage {
                     winner[p] = f as u16;
                 }
             }
-        }
+            Ok(())
+        })?;
 
-        let frame_count_f64 = frame_count as f64;
         let mut blended = vec![0.0f32; pixel_count * spp_usize];
         for p in 0..pixel_count {
             let base = p * spp_usize;
+            if eligible_frames[p] == 0 {
+                // No frame has real samples in reach: zero samples, `NO_SOURCE`.
+                continue;
+            }
             if den[p] > 0.0 {
                 for c in 0..spp_usize {
                     // The one narrowing: every weight and every sum above is
@@ -259,14 +276,15 @@ impl StackAlgorithm for WeightedAverage {
                     blended[base + c] = (num[base + c] / den[p]) as f32;
                 }
             } else {
-                // Degenerate rule: every frame's weight was exactly zero at
-                // this pixel. Fall back to the plain arithmetic mean, and
-                // record the Z-Map index as 0 -- never `NO_SOURCE`, never a
-                // division by zero.
+                // Degenerate rule: every eligible frame's weight was exactly
+                // zero at this pixel. Fall back to the plain arithmetic mean
+                // over the eligible frames; `winner` already holds the lowest
+                // eligible index, since a first weight of `0.0` beats the
+                // initial `-inf`. Never a division by zero.
+                let eligible_count = f64::from(eligible_frames[p]);
                 for c in 0..spp_usize {
-                    blended[base + c] = (sample_sum[base + c] / frame_count_f64) as f32;
+                    blended[base + c] = (sample_sum[base + c] / eligible_count) as f32;
                 }
-                winner[p] = 0;
             }
         }
 
@@ -294,13 +312,21 @@ impl StackAlgorithm for WeightedAverage {
         })
     }
 
-    /// This algorithm builds no pyramid at all, but its windowed weight
-    /// still has a nonzero reach (`crate::fuse::sharpness::DETAIL_REACH +
-    /// radius`), so it cannot inherit the trait's default (which would
-    /// answer `0`, since this schema declares no `"levels"` key).
-    fn tile_levels(&self, cfg: &ParamValues) -> u32 {
-        let radius = Self::radius(cfg);
-        levels_for_margin(DETAIL_REACH + radius)
+    /// Two `f64` sums per sample, and per pixel the `f64` weight and best,
+    /// the winner and the eligible count (22 B); then, live with the sums,
+    /// the blended `f32` plane, its `Plane` copy, the zero-filled `u16`
+    /// seed and the `u16` output (12 B per sample).
+    fn working_bytes_per_pixel(&self, _cfg: &ParamValues, samples_per_pixel: u32) -> u64 {
+        28 * u64::from(samples_per_pixel) + 22
+    }
+
+    /// The windowed weight's reach (`crate::fuse::sharpness::DETAIL_REACH +
+    /// radius`) on the one-level decimation grid of its detail plane.
+    fn tile_support(&self, cfg: &ParamValues) -> TileSupport {
+        TileSupport {
+            reach_px: DETAIL_REACH + Self::radius(cfg),
+            decimation_levels: 1,
+        }
     }
 }
 
@@ -309,9 +335,7 @@ inventory::submit! { StackRegistration::new(&WeightedAverage) }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tile::plan::{
-        DEFAULT_TILE_SIZE, TilePlan, margin_for_levels, min_tile_size_for_levels,
-    };
+    use crate::tile::plan::{DEFAULT_TILE_SIZE, TilePlan, margin_for_levels};
     use crate::tile::{Rect, TileError};
 
     fn rect(width: u32, height: u32) -> Rect {
@@ -321,6 +345,151 @@ mod tests {
             width,
             height,
         }
+    }
+
+    fn masked_tile(w: u32, h: u32, spp: u32, f: impl Fn(u32, u32, u32) -> u16) -> Tile {
+        let mut samples = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..spp {
+                    samples.push(f(x, y, c));
+                }
+            }
+        }
+        Tile {
+            rect: rect(w, h),
+            samples_per_pixel: spp,
+            samples,
+        }
+    }
+
+    fn fuse_masked(tiles: &[Tile], coverage: &[Option<Vec<bool>>], w: u32, h: u32) -> TileOutput {
+        let ctx = TileCtx::new(rect(w, h), tiles).with_coverage(coverage);
+        let mut cfg = ParamValues::new();
+        cfg.insert("radius".to_string(), ParamValue::Int(2));
+        cfg.insert("weight-exponent".to_string(), ParamValue::Float(2.0));
+        WeightedAverage.fuse(&ctx, &cfg).unwrap()
+    }
+
+    fn texture(seed: u32) -> impl Fn(u32, u32, u32) -> u16 {
+        move |x, y, c| ((x * 7 + y * 13 + c * 5 + seed).wrapping_mul(2654435761u32) >> 16) as u16
+    }
+
+    #[test]
+    fn a_masked_frame_contributes_nothing() {
+        let (w, h) = (24u32, 20u32);
+        let all = [
+            masked_tile(w, h, 3, texture(1)),
+            masked_tile(w, h, 3, texture(2)),
+            masked_tile(w, h, 3, texture(3)),
+        ];
+        let masks = [None, Some(vec![false; (w * h) as usize]), None];
+        let masked = fuse_masked(&all, &masks, w, h);
+        let without = fuse_masked(&[all[0].clone(), all[2].clone()], &[], w, h);
+        assert_eq!(masked.tile.samples, without.tile.samples);
+        assert!(
+            masked.zmap.iter().all(|&z| z == 0 || z == 2),
+            "never the masked frame"
+        );
+    }
+
+    #[test]
+    fn flat_pixels_resolve_to_the_lowest_eligible_frame_and_the_eligible_mean() {
+        let (w, h) = (16u32, 16u32);
+        for spp in [1u32, 3] {
+            let tiles: Vec<Tile> = [100u16, 200, 400]
+                .iter()
+                .map(|&v| masked_tile(w, h, spp, move |_, _, _| v))
+                .collect();
+            let masks = [Some(vec![false; (w * h) as usize]), None, None];
+            let out = fuse_masked(&tiles, &masks, w, h);
+            assert!(out.zmap.iter().all(|&z| z == 1), "spp {spp}");
+            assert!(out.tile.samples.iter().all(|&s| s == 300), "spp {spp}");
+        }
+    }
+
+    #[test]
+    fn a_masked_frame_is_eligible_only_beyond_its_detail_reach_and_radius() {
+        let (w, h) = (48u32, 16u32);
+        let flat = masked_tile(w, h, 1, |_, _, _| 1_000);
+        let checker = masked_tile(w, h, 1, |x, y, _| if (x + y) % 2 == 0 { 0 } else { 60_000 });
+        let uncovered_columns = 8u32;
+        let mask: Vec<bool> = (0..h)
+            .flat_map(|_| (0..w).map(|x| x >= uncovered_columns))
+            .collect();
+        let out = fuse_masked(&[flat, checker], &[None, Some(mask)], w, h);
+        // The detail plane reads 4 px (reduce plus expand), the weight window 2 (radius).
+        let first_eligible = uncovered_columns + 4 + 2;
+        for y in 4..12 {
+            for x in 0..w {
+                let expected = if x < first_eligible { 0 } else { 1 };
+                assert_eq!(out.zmap[(y * w + x) as usize], expected, "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pixel_with_no_eligible_frame_is_no_source_with_zero_samples() {
+        let (w, h) = (16u32, 16u32);
+        let tiles = [
+            masked_tile(w, h, 3, texture(1)),
+            masked_tile(w, h, 3, texture(2)),
+        ];
+        let none = Some(vec![false; (w * h) as usize]);
+        let out = fuse_masked(&tiles, &[none.clone(), none], w, h);
+        assert!(out.zmap.iter().all(|&z| z == crate::zmap::NO_SOURCE));
+        assert!(out.tile.samples.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn every_channel_is_blended_with_the_same_weight() {
+        let (w, h) = (32u32, 16u32);
+        // A: red edge, constant green. B: constant green, blue edge. Green
+        // alone fixes each pixel's blend fraction; red and blue must follow it.
+        let a = masked_tile(w, h, 3, |x, _, c| match c {
+            0 => {
+                if x < 16 {
+                    10_000
+                } else {
+                    40_000
+                }
+            }
+            1 => 2_000,
+            _ => 1_000,
+        });
+        let b = masked_tile(w, h, 3, |x, _, c| match c {
+            0 => 20_000,
+            1 => 3_000,
+            _ => {
+                if x < 16 {
+                    5_000
+                } else {
+                    30_000
+                }
+            }
+        });
+        let out = fuse_masked(&[a.clone(), b.clone()], &[], w, h);
+        let mut checked = 0;
+        for p in 0..(w * h) as usize {
+            let t = (f64::from(out.tile.samples[p * 3 + 1]) - 3_000.0) / (2_000.0 - 3_000.0);
+            if !(0.05..0.95).contains(&t) {
+                continue;
+            }
+            checked += 1;
+            for c in [0usize, 2] {
+                let (sa, sb) = (
+                    f64::from(a.samples[p * 3 + c]),
+                    f64::from(b.samples[p * 3 + c]),
+                );
+                let expected = t * sa + (1.0 - t) * sb;
+                let got = f64::from(out.tile.samples[p * 3 + c]);
+                assert!(
+                    (got - expected).abs() < 40.0,
+                    "pixel {p} channel {c}: {got} vs {expected}"
+                );
+            }
+        }
+        assert!(checked > 0, "no pixel blended both frames");
     }
 
     fn tile_of(width: u32, height: u32, spp: u32, samples: Vec<u16>) -> Tile {
@@ -404,6 +573,20 @@ mod tests {
                 .contains("radius: value 17 is outside the allowed range [0, 16]"),
             "error: {error}"
         );
+    }
+
+    #[test]
+    fn shipped_defaults_are_a_16_px_window_and_exponent_4() {
+        let default_of = |id: &str| {
+            PARAMS
+                .iter()
+                .find(|parameter| parameter.id == id)
+                .unwrap_or_else(|| panic!("{id} must be declared"))
+                .default
+                .clone()
+        };
+        assert_eq!(default_of("radius"), ParamValue::Int(16));
+        assert_eq!(default_of("weight-exponent"), ParamValue::Float(4.0));
     }
 
     #[test]
@@ -548,8 +731,8 @@ mod tests {
     /// The top of the declared parameter range must produce a real pixel,
     /// not a silently black one.
     ///
-    /// A radius-8 window over a full 0..65535 checkerboard gives a score
-    /// around 1e6. At `weight-exponent = 8.0` -- the declared maximum --
+    /// A radius-16 window over a full 0..65535 checkerboard gives a score
+    /// of several million. At `weight-exponent = 8.0` -- the declared maximum --
     /// `1e6^8` is about `1e48`, which is infinity in `f32` (max ~3.4e38).
     /// Before the weight was widened to `f64` this produced `inf / inf` in
     /// the normalisation, i.e. `NaN`, which rounds to 0: a black pixel at
@@ -567,7 +750,7 @@ mod tests {
         let ctx = TileCtx::new(rect(w, h), &tiles);
 
         let out = WeightedAverage
-            .fuse(&ctx, &cfg(8, 8.0))
+            .fuse(&ctx, &cfg(16, 8.0))
             .expect("the declared maximum exponent must fuse, not fail");
 
         // Interior pixel, away from the clamp-to-edge border.
@@ -592,30 +775,29 @@ mod tests {
         let algo = WeightedAverage;
         let max_radius = declared_int_max("radius");
         for radius in 0..=max_radius {
-            let cfg = cfg(radius, 2.0);
-            let levels = algo.tile_levels(&cfg);
+            let support = algo.tile_support(&cfg(radius, 2.0));
             let reach = DETAIL_REACH + radius as u32;
-            assert!(
-                margin_for_levels(levels) >= reach,
-                "radius={radius}: margin_for_levels({levels}) = {} < reach {reach}",
-                margin_for_levels(levels)
+            assert_eq!(support.reach_px, reach);
+            assert_eq!(
+                support.margin(),
+                reach.next_multiple_of(2).max(margin_for_levels(1)),
+                "radius={radius}: the margin is the reach on the 2 px grid"
             );
             assert!(
-                min_tile_size_for_levels(levels) <= DEFAULT_TILE_SIZE,
-                "radius={radius}: min_tile_size_for_levels({levels}) = {} > {DEFAULT_TILE_SIZE}",
-                min_tile_size_for_levels(levels)
+                support.min_tile_size() <= DEFAULT_TILE_SIZE,
+                "radius={radius}: min_tile_size {} > {DEFAULT_TILE_SIZE}",
+                support.min_tile_size()
             );
         }
-        let cfg = cfg(max_radius, WEIGHT_EXPONENT_DEFAULT);
-        let levels = algo.tile_levels(&cfg);
-        let minimum = min_tile_size_for_levels(levels);
+        let support = algo.tile_support(&cfg(max_radius, WEIGHT_EXPONENT_DEFAULT));
+        let minimum = support.min_tile_size();
         assert!(
-            TilePlan::new(minimum, minimum, minimum, levels).is_ok(),
+            TilePlan::new(minimum, minimum, minimum, support).is_ok(),
             "radius={max_radius}: the reported minimum tile {minimum} must plan"
         );
         assert!(
             matches!(
-                TilePlan::new(minimum, minimum, minimum - 1, levels),
+                TilePlan::new(minimum, minimum, minimum - 1, support),
                 Err(TileError::NoInterior { min_tile_size, .. }) if min_tile_size == minimum
             ),
             "radius={max_radius}: one pixel below the reported minimum {minimum} must be refused"
@@ -623,11 +805,21 @@ mod tests {
     }
 
     #[test]
-    fn tile_levels_falls_back_to_the_default_radius_when_absent() {
+    fn working_bytes_per_pixel_are_pinned() {
+        let cfg = ParamValues::new();
+        assert_eq!(WeightedAverage.working_bytes_per_pixel(&cfg, 3), 106);
+        assert_eq!(WeightedAverage.working_bytes_per_pixel(&cfg, 1), 50);
+    }
+
+    #[test]
+    fn tile_support_falls_back_to_the_default_radius_when_absent() {
         let algo = WeightedAverage;
         assert_eq!(
-            algo.tile_levels(&ParamValues::new()),
-            levels_for_margin(DETAIL_REACH + RADIUS_DEFAULT as u32)
+            algo.tile_support(&ParamValues::new()),
+            TileSupport {
+                reach_px: DETAIL_REACH + RADIUS_DEFAULT as u32,
+                decimation_levels: 1,
+            }
         );
     }
 }

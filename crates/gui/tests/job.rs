@@ -180,9 +180,11 @@ fn gui_run_matches_the_cli_run() {
         explicit,
         align: None,
         crop: false,
+        equalize: None,
         tile_size: Some(448),
         max_host_memory: None,
         backend: None,
+        align_backend: None,
         resume: false,
         cache: true,
         poll: Duration::from_millis(5),
@@ -313,9 +315,11 @@ fn no_align_request(label: &str, frame_count: usize) -> FuseRequest {
         explicit: ParamValues::new(),
         align: None,
         crop: false,
+        equalize: None,
         tile_size: None,
         max_host_memory: None,
         backend: None,
+        align_backend: None,
         resume: false,
         cache: true,
         poll: Duration::from_millis(5),
@@ -342,6 +346,81 @@ fn pause_then_resume_continues() {
         1,
         "paused must fire exactly once for the one segment that paused"
     );
+}
+
+/// Per method: a run paused and resumed, and a run fused again after a
+/// cancel, both complete with the composite an uninterrupted run holds; the
+/// cancel adds no checkpoint and leaves the tab idle.
+#[test]
+fn settings_journey_pause_resume_and_cancel() {
+    let timeout = Duration::from_secs(120);
+    let mut controller = controller_with_frames("journey_run_control", 3);
+    let methods = [
+        ("laplacian", "levels", ParamValue::Int(4)),
+        ("weighted-average", "radius", ParamValue::Int(6)),
+        ("depth-map", "score-radius", ParamValue::Int(5)),
+    ];
+    let newest_composite = |c: &AppController| {
+        std::fs::read(&c.held_checkpoints().last().expect("a held run").composite)
+            .expect("the held composite reads")
+    };
+
+    for (id, field, value) in methods {
+        controller.set_fuse_algorithm(id);
+        controller.set_param_value("fuse", field, value);
+
+        assert!(controller.start_fuse(), "{id}: the reference run starts");
+        common::wait_for_settle(&mut controller, timeout);
+        let reference = newest_composite(&controller);
+        let held = controller.held_checkpoints().len();
+
+        start_and_hold_at_pause(&mut controller, timeout);
+        controller.pause_or_resume();
+        common::wait_for_settle(&mut controller, timeout);
+        assert_eq!(
+            controller.held_checkpoints().len(),
+            held + 1,
+            "{id}: resumed"
+        );
+        assert_eq!(newest_composite(&controller), reference, "{id}: resumed");
+
+        controller.dismiss_notice();
+        // Paused straight after the start, not after a progress tick: the
+        // worker parks at its first boundary, so a short run cannot finish
+        // while the test thread waits for a tick and the cancel lands on it.
+        assert!(controller.start_fuse(), "{id}: the cancelled run starts");
+        controller.pause_or_resume();
+        assert_eq!(controller.job_view().state, job::RunState::Paused);
+        controller.cancel_fuse();
+        common::wait_for_settle(&mut controller, timeout);
+        assert_eq!(
+            controller.notice(),
+            None,
+            "{id}: a cancelled run reports nothing"
+        );
+        assert_eq!(controller.job_view().state, job::RunState::Idle, "{id}");
+        assert_eq!(
+            controller.held_checkpoints().len(),
+            held + 1,
+            "{id}: cancelled"
+        );
+
+        assert!(
+            controller.start_fuse(),
+            "{id}: fuses again after the cancel"
+        );
+        common::wait_for_settle(&mut controller, timeout);
+        assert_eq!(
+            controller.held_checkpoints().len(),
+            held + 2,
+            "{id}: fused again"
+        );
+        assert_eq!(
+            newest_composite(&controller),
+            reference,
+            "{id}: after cancel"
+        );
+    }
 }
 
 #[test]
@@ -399,9 +478,8 @@ fn pause_during_alignment_holds_align_progress() {
     let mut controller = controller_with_frames("pause_align", 8);
     // `dummy-align` (`controller_with_frames`'s own default) finishes in
     // microseconds; a real solver is what gives the hold something to
-    // catch mid-stage. Translation-only chain registration converges on
-    // every one of this fixture's eight frames, so the run fuses cleanly
-    // rather than parking on a diverged frame.
+    // catch mid-stage. Translation-only chain registration flags two of this
+    // fixture's frames as validation-failed, so the run parks and is kept.
     controller.set_align_algorithm("pyramidal-ecc");
     controller.set_param_value("align", "mode", ParamValue::Enum("translation".to_string()));
     controller.set_param_value(
@@ -442,9 +520,14 @@ fn pause_during_alignment_holds_align_progress() {
         "Aligning",
         "the hold must have landed in the align stage"
     );
-    common::wait_for_settle(&mut controller, Duration::from_secs(120))
-        .expect("a resumed run must hand back its fused planes");
+    assert!(
+        common::wait_for_settle(&mut controller, Duration::from_secs(120)).is_none(),
+        "the resumed run parks on the frames the check flags"
+    );
     assert!(!controller.job_running());
+    controller
+        .keep_fused()
+        .expect("a resumed run must hand back its fused planes");
     match controller.job_view().state {
         job::RunState::Fused { .. } => {}
         other => panic!("a resumed run must settle as fused, got {other:?}"),
@@ -1015,6 +1098,7 @@ fn progress_text_never_names_a_step() {
         RunState::Failed("stopped".to_string()),
         RunState::Fused {
             at: "12:00".to_string(),
+            unaligned: 0,
         },
         RunState::Queued { position: 2 },
     ];
@@ -1414,7 +1498,7 @@ fn a_second_run_reports_its_own_completion_time() {
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
 
-    let job::RunState::Fused { at } = controller.job_view().state else {
+    let job::RunState::Fused { at, unaligned: _ } = controller.job_view().state else {
         panic!("expected a completed fuse");
     };
 
@@ -1479,7 +1563,7 @@ fn a_fused_tab_keeps_its_own_completion_after_a_later_run() {
     let mut controller = controller_with_two_tabs("fused_keeps");
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
-    let job::RunState::Fused { at } = controller.job_view().state else {
+    let job::RunState::Fused { at, unaligned: _ } = controller.job_view().state else {
         panic!("expected tab 0 to complete");
     };
 
@@ -1494,7 +1578,7 @@ fn a_fused_tab_keeps_its_own_completion_after_a_later_run() {
     controller.select_project(0);
     assert_eq!(
         controller.job_view().state,
-        job::RunState::Fused { at },
+        job::RunState::Fused { at, unaligned: 0 },
         "tab 0's own completion must survive tab 1's later run"
     );
 }
@@ -2136,6 +2220,7 @@ fn a_queued_run_reads_the_settings_current_when_it_starts() {
     start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
 
     controller.select_project(1);
+    controller.set_fuse_algorithm("depth-map");
     assert!(controller.start_fuse());
     assert_eq!(
         controller.job_view().state,
@@ -2160,6 +2245,85 @@ fn a_queued_run_reads_the_settings_current_when_it_starts() {
         Some(&ParamValue::Int(7)),
         "the queued run must use the settings current when it started, not when it was queued"
     );
+}
+
+/// Fuses `count` frames on the default method under `dummy-align`, which
+/// shifts every frame but the reference, with `auto-crop` set as given.
+fn held_after_fuse(name: &str, count: usize, auto_crop: bool) -> job::HeldCheckpoint {
+    let mut controller = controller_with_frames(name, count);
+    controller.set_param_value("finish", "auto-crop", ParamValue::Bool(auto_crop));
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    controller
+        .held_checkpoints()
+        .last()
+        .cloned()
+        .expect("a completed run is held until saved")
+}
+
+#[test]
+fn auto_crop_off_runs_at_full_extent() {
+    use focusforge_core::io::TiffStack;
+
+    for count in [2, 3] {
+        let off = held_after_fuse(&format!("crop_off_{count}"), count, false);
+        let on = held_after_fuse(&format!("crop_on_{count}"), count, true);
+        let (width, height) = TiffStack::open_files(&off.sources).unwrap().dimensions();
+
+        assert_eq!(
+            (off.width, off.height),
+            (width, height),
+            "{count} frames, crop off: the composite keeps the frame extent"
+        );
+        assert_eq!(off.registration.crop, None, "{count} frames, crop off");
+        assert!(
+            u64::from(on.width) * u64::from(on.height) < u64::from(width) * u64::from(height),
+            "{count} frames, crop on: the composite is the interior of the aligned frames"
+        );
+        let rect = on
+            .registration
+            .crop
+            .expect("a cropped run records its rect");
+        assert_eq!((rect.width, rect.height), (on.width, on.height));
+    }
+}
+
+#[test]
+fn alignment_values_reach_the_request() {
+    let mut controller = controller_with_frames("align_values_reach_request", 2);
+    controller.set_param_value("align", "max-shift", ParamValue::Int(3));
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+
+    let held_all = controller.held_checkpoints();
+    let held = held_all.last().unwrap();
+    let align = held.align.as_ref().expect("the run records its alignment");
+    assert_eq!(align.algorithm, "dummy-align");
+    assert_eq!(align.params.get("max-shift"), Some(&ParamValue::Int(3)));
+}
+
+#[test]
+fn editor_opens_over_every_method() {
+    use focusforge_core::zmap::NO_SOURCE;
+
+    for method in ["laplacian", "weighted-average", "depth-map"] {
+        let mut controller = controller_with_frames(&format!("editor_over_{method}"), 3);
+        controller.set_fuse_algorithm(method);
+        assert!(controller.start_fuse());
+        common::wait_for_settle(&mut controller, Duration::from_secs(120));
+
+        assert_eq!(controller.mode(), ShellMode::Editor, "{method}");
+        let session = controller
+            .edit_session()
+            .unwrap_or_else(|| panic!("{method}: the editor owns the run's Z-Map"));
+        assert!(
+            session
+                .indices()
+                .iter()
+                .all(|&i| i == NO_SOURCE || usize::from(i) < 3),
+            "{method}: every index names one of the three frames or NO_SOURCE"
+        );
+    }
 }
 
 #[test]
@@ -2470,6 +2634,8 @@ fn closing_the_owning_tab_mid_run_promotes_nothing() {
         common::open_and_settle(&mut controller, &[survivor_root]),
         OpenOutcome::Opened(_)
     ));
+    // An algorithm that always converges keeps the survivor's fuse clean.
+    controller.set_align_algorithm("dummy-align");
 
     controller.select_project(0);
     assert!(controller.start_fuse());
@@ -3765,6 +3931,12 @@ fn a_fuse_asks_before_dropping_unsaved_ops() {
     // `Run again` after a cancelled run asks.
     let mut c = painted_tab("fuse_asks_run_again", 2, 1);
     assert!(!c.start_fuse());
+    // The first fuse cached the alignment; a re-fuse that reuses it would
+    // be too short to cancel.
+    let scratch =
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("fuse_asks_run_again_scratch");
+    std::fs::remove_dir_all(scratch.join("stage-cache"))
+        .expect("the first fuse cached its alignment");
     c.close_guard_confirmed();
     // Held before the run can reach its last boundary: a two-frame run
     // that is only paused once it has ticked can finish first.
@@ -4138,8 +4310,8 @@ fn the_card_counts_the_listed_checkpoints() {
 // ---------------------------------------------------------------------
 // `job::resolve_backend`'s own wording, and `AppController::fusion_backend`
 // reporting the same line from every entry point that reaches `job::spawn`.
-// No GPU needed: every tab here keeps the registry's default `depth-map`
-// algorithm, which `backend_for` refuses before ever probing an adapter.
+// No GPU needed: every tab here selects `depth-map`, which `backend_for`
+// refuses before ever probing an adapter.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -4191,6 +4363,7 @@ const DEPTH_MAP_CPU_LINE: &str = "fusion backend: cpu — depth-map has no GPU i
 fn fusion_backend_reports_on_a_paused_direct_start() {
     let mut controller = controller_with_frames("fusion_backend_direct", 2);
     controller.set_gpu_fusion(true);
+    controller.set_fuse_algorithm("depth-map");
     start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
     assert_eq!(
         wait_for_backend_line(&controller, Duration::from_secs(30)),
@@ -4202,9 +4375,11 @@ fn fusion_backend_reports_on_a_paused_direct_start() {
 fn fusion_backend_reports_on_queue_promotion() {
     let mut controller = controller_with_two_tabs("fusion_backend_queue");
     controller.set_gpu_fusion(true);
+    controller.set_fuse_algorithm("depth-map");
     start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
 
     controller.select_project(1);
+    controller.set_fuse_algorithm("depth-map");
     assert!(
         controller.start_fuse(),
         "a press on the second tab while the first runs must enqueue it"
@@ -4227,6 +4402,7 @@ fn fusion_backend_reports_on_queue_promotion() {
 fn fusion_backend_reports_on_retry() {
     let mut controller = controller_with_an_unreadable_frame("fusion_backend_retry");
     controller.set_gpu_fusion(true);
+    controller.set_fuse_algorithm("depth-map");
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60));
 
@@ -4242,6 +4418,7 @@ fn fusion_backend_reports_on_retry() {
 fn fusion_backend_reports_on_run_gallery_action() {
     let mut controller = controller_with_an_unreadable_frame("fusion_backend_gallery_action");
     controller.set_gpu_fusion(true);
+    controller.set_fuse_algorithm("depth-map");
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60));
 
@@ -4254,6 +4431,107 @@ fn fusion_backend_reports_on_run_gallery_action() {
         DEPTH_MAP_CPU_LINE
     );
     common::wait_for_settle(&mut controller, Duration::from_secs(60));
+}
+
+// ---------------------------------------------------------------------
+// The run's alignment account: the notice text, the logged line, the
+// reuse of a cached alignment and the backend a small GPU-on stack reports.
+// ---------------------------------------------------------------------
+
+#[test]
+fn the_unaligned_notice_names_the_count() {
+    assert_eq!(job::unaligned_notice(0), None);
+    assert_eq!(
+        job::unaligned_notice(1).as_deref(),
+        Some("1 frame unaligned")
+    );
+    assert_eq!(
+        job::unaligned_notice(4).as_deref(),
+        Some("4 frames unaligned")
+    );
+}
+
+#[test]
+fn the_alignment_line_names_source_backend_counts_and_rerun() {
+    let mut summary = job::AlignSummary {
+        source: "computed".to_string(),
+        backend: "cpu".to_string(),
+        converged: 55,
+        hit_cap: 1,
+        stalled: 1,
+        unaligned: 4,
+        rerun: None,
+    };
+    assert_eq!(
+        summary.line(),
+        "alignment computed on cpu: 55 converged, 1 hit cap, 1 stalled, 4 unaligned"
+    );
+    summary.rerun = Some("the device was lost".to_string());
+    assert_eq!(
+        summary.line(),
+        "alignment computed on cpu: 55 converged, 1 hit cap, 1 stalled, 4 unaligned, \
+         reran on the cpu: the device was lost"
+    );
+}
+
+#[test]
+fn the_observer_keeps_the_cpu_rerun_reason_of_the_align_stage() {
+    let observer = job::GuiObserver::new();
+    observer.notice("warning: a cache write failed");
+    assert_eq!(observer.rerun_reason(), None);
+    observer.notice(&format!(
+        "the device was lost{}",
+        pipeline::ALIGN_RERUN_NOTICE
+    ));
+    assert_eq!(
+        observer.rerun_reason().as_deref(),
+        Some("the device was lost")
+    );
+}
+
+#[test]
+fn a_fusion_only_change_reuses_the_alignment() {
+    let mut controller = controller_with_frames("fusion_only_reuse", 3);
+    let align_source = |controller: &mut AppController| {
+        assert!(controller.start_fuse());
+        common::wait_for_settle(controller, Duration::from_secs(120));
+        controller
+            .last_alignment()
+            .expect("a completed run")
+            .source
+            .clone()
+    };
+    assert_eq!(align_source(&mut controller), "computed");
+
+    controller.set_param_value("fuse", "score-radius", ParamValue::Int(3));
+    assert_eq!(
+        align_source(&mut controller),
+        "cached",
+        "a fusion parameter is not part of the alignment identity"
+    );
+
+    controller.set_param_value("align", "max-shift", ParamValue::Int(8));
+    assert_eq!(
+        align_source(&mut controller),
+        "computed",
+        "an alignment parameter is"
+    );
+}
+
+#[test]
+fn a_small_stack_with_gpu_on_aligns_on_the_cpu() {
+    let mut controller = common::controller_with_frames("small_stack_gpu_on", 3);
+    controller.set_align_algorithm("pyramidal-ecc");
+    controller.set_gpu_fusion(true);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(300));
+    assert!(controller.job_failure_message().is_none());
+    let summary = controller.last_alignment().expect("a completed run");
+    assert_eq!(
+        summary.backend, "cpu",
+        "no level is large enough to offload"
+    );
+    assert_eq!(summary.rerun, None);
 }
 
 // A Laplacian run with GPU fusion on matches the same frames' CPU run: every
@@ -5485,7 +5763,7 @@ fn a_save_makes_the_previous_plane_files_stale() {
 }
 
 // ---------------------------------------------------------------------
-// Interactive admission: a canvas action caps the live run's tile sets and
+// Interactive admission: a canvas action caps the live run's tiles and
 // registrations; the cap lifts once the view has settled.
 // ---------------------------------------------------------------------
 

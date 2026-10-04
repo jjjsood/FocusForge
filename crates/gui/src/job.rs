@@ -9,19 +9,21 @@
 //! canvas files allowed to name `focusforge_core`.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use focusforge_core::algorithm::{AlignAlgorithm, StackAlgorithm};
+use focusforge_core::algorithm::{AlignAlgorithm, AlignStatus, StackAlgorithm};
 use focusforge_core::align::WarpingReader;
-use focusforge_core::gpu::TileBackend;
+use focusforge_core::equalize::GainReader;
+use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{
     COMPOSITE_FILENAME, FrameError, FrameReader, ZMAP_FILENAME, open_frame_set,
 };
 pub use focusforge_core::io::{JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
+use focusforge_core::job::StageCache;
 use focusforge_core::params::ParamValues;
 use focusforge_core::pipeline::{
-    self, AlignRequest, FuseOutput, FuseProduct, FuseRequest, RunStage, StageObserver,
+    self, AlignRequest, FuseOutput, FuseProduct, FuseReport, FuseRequest, RunStage, StageObserver,
 };
 pub use focusforge_core::project::export::{
     ExportFormat, ExportOptions, JpegSubsampling, MetadataOptions, PngBits, PngCompression,
@@ -36,6 +38,7 @@ use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader, ZMapWriter};
 /// Re-exported so `crate::controller` -- which names no algorithm crate --
 /// can hold and drive these through the `job::` path alone.
 pub use focusforge_core::align::{Registration, Transform};
+pub use focusforge_core::equalize::UNIT_GAIN;
 pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 pub use focusforge_core::project::Op;
@@ -109,6 +112,8 @@ pub enum RunState {
     Failed(String),
     Fused {
         at: String,
+        /// Frames the run's alignment could not register and fused as read.
+        unaligned: usize,
     },
     /// Waiting for the live run to settle -- `position` counts the live run
     /// as 1, so the first waiting tab is `2`.
@@ -134,6 +139,8 @@ pub struct JobRequest {
     pub align_values: ParamValues,
     pub align_lax: bool,
     pub crop: bool,
+    /// The gain bound brightness equalization runs with, `None` when off.
+    pub equalize: Option<f64>,
     /// Whether this run may use the headless GPU backend at all -- resolved
     /// against the real device only inside [`spawn`], on the worker thread,
     /// never here.
@@ -148,7 +155,7 @@ pub const POLL: Duration = Duration::from_millis(100);
 /// admission cap may lift.
 pub const INTERACTION_QUIET: Duration = Duration::from_millis(250);
 
-/// The most tile sets or registrations a run may hold in flight while the
+/// The most tiles or registrations a run may hold in flight while the
 /// canvas is being used: a quarter of the host's threads, at least one.
 pub fn interactive_cap() -> usize {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -227,7 +234,9 @@ pub fn resolve_backend(fuse_id: &str, gpu: bool) -> (Option<&'static dyn TileBac
 /// `focusforge_core::pipeline::run` with `algorithms` (from
 /// [`resolve_request`]), reporting through `observer`. Resolves the
 /// processing backend first thing on this thread ([`resolve_backend`]), so
-/// the first adapter probe never runs on the UI thread. Returns the join
+/// the first adapter probe never runs on the UI thread, and opens the stage
+/// cache under the run's scratch root so an unchanged alignment is reused
+/// (a cache that cannot open is logged and the run goes uncached). Returns the join
 /// handle; the caller is expected to read progress through `observer` rather
 /// than by joining eagerly.
 pub fn spawn(
@@ -240,6 +249,14 @@ pub fn spawn(
         let (backend, backend_line) = resolve_backend(&request.fuse_id, request.gpu);
         tracing::info!("{backend_line}");
         observer.set_backend_line(backend_line);
+        let align_backend = resolve_align_backend(&request, &algorithms, &observer);
+        let stage_cache = match StageCache::open(&request.scratch_root) {
+            Ok(cache) => Some(cache),
+            Err(err) => {
+                tracing::warn!("alignment cache unavailable, running uncached: {err}");
+                None
+            }
+        };
         let align = algorithms.align.map(|algorithm| AlignRequest {
             algorithm,
             explicit: request.align_values,
@@ -254,15 +271,46 @@ pub fn spawn(
             explicit: request.fuse_values,
             align,
             crop: request.crop,
+            equalize: request.equalize,
             tile_size: None,
             max_host_memory: None,
             backend,
+            align_backend,
             resume: false,
             cache: true,
             poll: POLL,
         };
-        pipeline::run(&fuse_request, observer.as_ref(), control, None)
+        pipeline::run(
+            &fuse_request,
+            observer.as_ref(),
+            control,
+            stage_cache.as_ref(),
+        )
     })
+}
+
+/// The accelerator a run's align stage may use: the lazy GPU backend when GPU
+/// processing is on and the aligner has a GPU path, unless its device was
+/// lost earlier this session. The adapter comes up only when a level is
+/// large enough to offload; the observer reads its name back for the run's
+/// alignment summary.
+fn resolve_align_backend(
+    request: &JobRequest,
+    algorithms: &Algorithms,
+    observer: &GuiObserver,
+) -> Option<&'static dyn AlignBackend> {
+    let algorithm = algorithms.align.filter(|_| request.gpu)?;
+    let (lazy, _) =
+        focusforge_gpu::harness::align_backend_for(algorithm.id(), false, None, |line| {
+            tracing::info!("{line}")
+        });
+    let lazy = lazy?;
+    if lazy.lost() {
+        tracing::info!("alignment backend: cpu — the GPU device was lost earlier in this session");
+        return None;
+    }
+    observer.set_align_adapter(lazy.adapter());
+    Some(lazy)
 }
 
 /// The GUI's [`StageObserver`]: no terminal, no signal -- `paused` parks on
@@ -276,6 +324,13 @@ pub struct GuiObserver {
     /// [`resolve_backend`]'s own account of this run's processing backend,
     /// set once from the worker thread before the pipeline starts.
     backend_line: Mutex<Option<String>>,
+    /// Every [`StageObserver::notice`] the run raised, in order.
+    notices: Mutex<Vec<String>>,
+    /// Where the align backend names the adapter once a level opens it; unset
+    /// for a run with no accelerator on offer.
+    align_adapter: OnceLock<&'static OnceLock<String>>,
+    /// Why the align stage reran on the CPU, when it did.
+    rerun_reason: Mutex<Option<String>>,
 }
 
 impl GuiObserver {
@@ -285,7 +340,31 @@ impl GuiObserver {
             pause_gate: Mutex::new(false),
             condvar: Condvar::new(),
             backend_line: Mutex::new(None),
+            notices: Mutex::new(Vec::new()),
+            align_adapter: OnceLock::new(),
+            rerun_reason: Mutex::new(None),
         }
+    }
+
+    /// The notices the pipeline raised so far, in order.
+    pub fn notices(&self) -> Vec<String> {
+        self.notices
+            .lock()
+            .expect("no thread panicked while holding the notices lock")
+            .clone()
+    }
+
+    /// Why the align stage reran on the CPU after its accelerator failed;
+    /// `None` when it did not.
+    pub fn rerun_reason(&self) -> Option<String> {
+        self.rerun_reason
+            .lock()
+            .expect("no thread panicked while holding the rerun lock")
+            .clone()
+    }
+
+    fn set_align_adapter(&self, adapter: &'static OnceLock<String>) {
+        let _ = self.align_adapter.set(adapter);
     }
 
     /// The most recent [`JobProgress`] snapshot `tick` recorded, or `None`
@@ -333,6 +412,24 @@ impl Default for GuiObserver {
 
 impl StageObserver for GuiObserver {
     fn stage(&self, _stage: RunStage) {}
+
+    fn notice(&self, message: &str) {
+        tracing::warn!("{message}");
+        // The CPU rerun reaches the user through the alignment toast, so it
+        // stays out of the run's own notice list.
+        if let Some(reason) = message.strip_suffix(pipeline::ALIGN_RERUN_NOTICE) {
+            *self
+                .rerun_reason
+                .lock()
+                .expect("no thread panicked while holding the rerun lock") =
+                Some(reason.to_string());
+            return;
+        }
+        self.notices
+            .lock()
+            .expect("no thread panicked while holding the notices lock")
+            .push(message.to_string());
+    }
 
     fn tick(&self, progress: &JobProgress) {
         *self
@@ -419,10 +516,21 @@ pub fn stage_word(state: &RunState, progress: Option<&JobProgress>) -> String {
         RunState::Cancelling => "Cancelling".to_string(),
         RunState::Failed(_) => "Failed".to_string(),
         RunState::Idle => String::new(),
-        RunState::Fused { at } => format!("fused {at}"),
+        RunState::Fused { at, .. } => format!("fused {at}"),
         RunState::Queued { position } => format!("Queued ({position})"),
         RunState::Running => progress_phase(progress).name().to_string(),
     }
+}
+
+/// The notice a kept run with unregistered frames raises, `None` for none:
+/// `"4 frames unaligned"`, `"1 frame unaligned"`.
+pub fn unaligned_notice(unaligned: usize) -> Option<String> {
+    let frames = match unaligned {
+        0 => return None,
+        1 => "frame",
+        _ => "frames",
+    };
+    Some(format!("{unaligned} {frames} unaligned"))
 }
 
 /// The toolbar's own run-state vocabulary for `state`: a completed run reads
@@ -983,7 +1091,8 @@ fn with_registered_sources<R>(
     let frame = reader.dimensions();
     let samples_per_pixel = reader.frame(0).samples_per_pixel;
     let transforms = registration.transforms(reader.len());
-    let warped = WarpingReader::new(reader, frame, samples_per_pixel, transforms);
+    let gained = GainReader::new(reader, registration.gains());
+    let warped = WarpingReader::new(&gained, frame, samples_per_pixel, transforms);
     f(&Sources {
         reader: &warped,
         frame_count: reader.len() as u32,
@@ -1184,7 +1293,67 @@ pub struct Settled {
     pub state: RunState,
     pub held: Option<HeldCheckpoint>,
     pub diverged: Vec<String>,
+    /// What this run's alignment did, `Some` for a completed run.
+    pub alignment: Option<AlignSummary>,
     pub operation: Option<FailedOperation>,
+}
+
+/// What one completed run's alignment did: where its transforms came from,
+/// which backend solved them, how each frame ended up, and why a whole-stage
+/// rerun happened, if one did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlignSummary {
+    /// `computed`, `cached`, `resumed` or `skipped`.
+    pub source: String,
+    /// `cpu`, or the adapter's display when a level of the solve ran on it.
+    pub backend: String,
+    pub converged: usize,
+    pub hit_cap: usize,
+    pub stalled: usize,
+    /// Frames fused as read because registration failed.
+    pub unaligned: usize,
+    pub rerun: Option<String>,
+}
+
+impl AlignSummary {
+    fn of(report: &FuseReport, observer: &GuiObserver) -> Self {
+        let adapter = observer.align_adapter.get().and_then(|cell| cell.get());
+        let mut summary = AlignSummary {
+            source: report.align_source.clone(),
+            backend: match adapter {
+                Some(adapter) if report.align_backend_used => adapter.clone(),
+                _ => "cpu".to_string(),
+            },
+            converged: 0,
+            hit_cap: 0,
+            stalled: 0,
+            unaligned: 0,
+            rerun: observer.rerun_reason(),
+        };
+        for frame in report.align.iter().flat_map(|a| &a.alignment.frames) {
+            match frame.status {
+                AlignStatus::Converged => summary.converged += 1,
+                AlignStatus::HitCap => summary.hit_cap += 1,
+                AlignStatus::Stalled => summary.stalled += 1,
+                AlignStatus::Diverged(_) => summary.unaligned += 1,
+                _ => {}
+            }
+        }
+        summary
+    }
+
+    /// The one line a run logs.
+    pub fn line(&self) -> String {
+        let rerun = self
+            .rerun
+            .as_ref()
+            .map(|reason| format!(", reran on the cpu: {reason}"))
+            .unwrap_or_default();
+        format!(
+            "alignment {} on {}: {} converged, {} hit cap, {} stalled, {} unaligned{rerun}",
+            self.source, self.backend, self.converged, self.hit_cap, self.stalled, self.unaligned
+        )
+    }
 }
 
 /// The divergence dialog's body, naming the frames alignment could not
@@ -1214,9 +1383,14 @@ pub(crate) fn divergence_body(names: &[String]) -> String {
 /// [`RunState::Idle`] (the engine already preserved its own resumable state
 /// on disk, per its own "reported, never controlled" contract), and a
 /// completion hands back the held checkpoint.
-pub fn settle(result: std::thread::Result<Result<FuseOutcome, PipelineError>>) -> Settled {
+pub fn settle(
+    result: std::thread::Result<Result<FuseOutcome, PipelineError>>,
+    observer: &GuiObserver,
+) -> Settled {
     match result {
         Ok(Ok(FuseOutcome::Completed(report))) => {
+            let alignment = AlignSummary::of(&report, observer);
+            tracing::info!("{}", alignment.line());
             let diverged = report
                 .align
                 .iter()
@@ -1229,9 +1403,11 @@ pub fn settle(result: std::thread::Result<Result<FuseOutcome, PipelineError>>) -
             Settled {
                 state: RunState::Fused {
                     at: crate::checkpoints::local_hhmm(held.created_at),
+                    unaligned: alignment.unaligned,
                 },
                 held: Some(held),
                 diverged,
+                alignment: Some(alignment),
                 operation: None,
             }
         }
@@ -1239,6 +1415,7 @@ pub fn settle(result: std::thread::Result<Result<FuseOutcome, PipelineError>>) -
             state: RunState::Idle,
             held: None,
             diverged: Vec::new(),
+            alignment: None,
             operation: None,
         },
         Ok(Err(err)) => {
@@ -1247,6 +1424,7 @@ pub fn settle(result: std::thread::Result<Result<FuseOutcome, PipelineError>>) -
                 state: RunState::Failed(err.to_string()),
                 held: None,
                 diverged: Vec::new(),
+                alignment: None,
                 operation: Some(operation),
             }
         }
@@ -1254,6 +1432,7 @@ pub fn settle(result: std::thread::Result<Result<FuseOutcome, PipelineError>>) -
             state: RunState::Failed("the fuse worker stopped unexpectedly".to_string()),
             held: None,
             diverged: Vec::new(),
+            alignment: None,
             operation: Some(FailedOperation::Fusion),
         },
     }

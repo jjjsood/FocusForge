@@ -56,6 +56,26 @@ fn resolve_backend(
     }
 }
 
+/// Resolves whether the align stage takes the GPU path or the CPU one, as
+/// [`resolve_backend`] does for fusion: `#[cfg(feature = "gpu")]` delegates to
+/// [`gpu::resolve_align_backend`]; with the feature off, always
+/// [`stack::AlignBackendChoice::cpu()`].
+fn resolve_align_backend(
+    algorithm_id: &str,
+    no_gpu: bool,
+    max_vram: Option<u64>,
+) -> stack::AlignBackendChoice {
+    #[cfg(feature = "gpu")]
+    {
+        gpu::resolve_align_backend(algorithm_id, no_gpu, max_vram)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (algorithm_id, no_gpu, max_vram);
+        stack::AlignBackendChoice::cpu()
+    }
+}
+
 /// FocusForge command-line interface.
 #[derive(Parser)]
 #[command(
@@ -348,6 +368,18 @@ enum Command {
             value_parser = crate::bytes::parse_byte_size
         )]
         max_host_memory: Option<u64>,
+        /// A **ceiling only** on the adaptive device (VRAM) budget, for the
+        /// alignment's GPU levels and the `--write-warped` fuse backend: it
+        /// can lower the budget the startup probe settled on, and can never
+        /// raise it. Accepts the same suffixed sizes as `--max-host-memory`.
+        /// Only present when the `gpu` feature is compiled in.
+        #[cfg(feature = "gpu")]
+        #[arg(
+            long = "max-vram",
+            value_name = "SIZE",
+            value_parser = crate::bytes::parse_byte_size
+        )]
+        max_vram: Option<u64>,
         /// Print no progress at all. `align` has no fuse-tile units to
         /// count: this suppresses only the one stage line `align`
         /// otherwise prints.
@@ -366,10 +398,10 @@ enum Command {
         /// Append one NDJSON status record for this run to this path.
         #[arg(long, value_name = "PATH")]
         status: Option<PathBuf>,
-        /// Force the CPU path even when a usable GPU adapter is available.
-        /// Only present when the `gpu` feature is compiled in. Meaningful
-        /// only with `--write-warped`: plain `align` has nothing on the
-        /// GPU-shaped path (its ECC solver is CPU-only).
+        /// Force the CPU path even when a usable GPU adapter is available:
+        /// the alignment's large levels and the `--write-warped` fuse
+        /// backend both stay on the CPU. Only present when the `gpu` feature
+        /// is compiled in.
         #[cfg(feature = "gpu")]
         #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
         gpu: bool,
@@ -576,6 +608,8 @@ fn main() -> ExitCode {
             write_warped,
             set,
             max_host_memory,
+            #[cfg(feature = "gpu")]
+            max_vram,
             quiet,
             preset,
             write_preset,
@@ -587,6 +621,8 @@ fn main() -> ExitCode {
             let no_gpu = !gpu;
             #[cfg(not(feature = "gpu"))]
             let no_gpu = false;
+            #[cfg(not(feature = "gpu"))]
+            let max_vram: Option<u64> = None;
             align::run(
                 &dir,
                 algo.as_deref(),
@@ -603,6 +639,7 @@ fn main() -> ExitCode {
                     dry_run: false,
                 },
                 no_gpu,
+                max_vram,
             )
         }
         Command::Review { dir, json } => review::run(&dir, json),
@@ -1107,6 +1144,16 @@ mod tests {
         );
     }
 
+    fn project_default(id: &str) -> bool {
+        focusforge_core::project::PROJECT_PARAMS
+            .iter()
+            .find(|d| d.id == id)
+            .unwrap_or_else(|| panic!("PROJECT_PARAMS must declare a `{id}` descriptor"))
+            .default
+            .as_bool()
+            .unwrap_or_else(|| panic!("`{id}`'s default must be a bool"))
+    }
+
     /// `--no-crop`'s clap default and `PROJECT_PARAMS`'s `auto-crop`
     /// descriptor default are one source of truth. This test fails the
     /// moment either one moves without the other.
@@ -1117,14 +1164,18 @@ mod tests {
         let Command::Stack { crop, .. } = cli.command else {
             panic!("expected a Command::Stack");
         };
-        let expected = focusforge_core::project::PROJECT_PARAMS
-            .iter()
-            .find(|d| d.id == "auto-crop")
-            .expect("PROJECT_PARAMS must declare an auto-crop descriptor")
-            .default
-            .as_bool()
-            .expect("auto-crop's default must be a bool");
-        assert_eq!(crop, expected);
+        assert_eq!(crop, project_default("auto-crop"));
+    }
+
+    /// `--no-align` and the `align` descriptor are one source of truth.
+    #[test]
+    fn no_align_flag_reads_the_project_schema() {
+        let cli = Cli::try_parse_from(["focusforge-cli", "stack", "dir", "--algo", "x"])
+            .expect("a minimal `stack` invocation must parse");
+        let Command::Stack { align, .. } = cli.command else {
+            panic!("expected a Command::Stack");
+        };
+        assert_eq!(align, project_default("align"));
     }
 
     /// clap's own consistency check over the whole parser: every subcommand

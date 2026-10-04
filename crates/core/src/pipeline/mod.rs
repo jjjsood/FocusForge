@@ -22,11 +22,13 @@ use crate::align::{
     AlignDriverOptions, FailurePolicy, FrameAlignment, ReferencePolicy, Registration,
     StackAlignment, Transform, WarpingReader, align_stack_with, auto_crop,
 };
+use crate::equalize::{self, EqualizationReport, GainReader};
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
-use crate::gpu::TileBackend;
+use crate::gpu::{AlignBackend, TileBackend};
 use crate::io::{
-    COMPOSITE_FILENAME, FrameDesc, FrameReader, Rect, TiffStack, ZMAP_FILENAME, open_frame_set,
+    COMPOSITE_FILENAME, FrameDesc, FrameReader, ReaderKind, Rect, TiffStack, ZMAP_FILENAME,
+    open_frame_set,
 };
 use crate::job::{
     AlignIdentity, ControlState, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobControl, JobOutcome,
@@ -68,9 +70,14 @@ pub struct FuseRequest {
     pub explicit: ParamValues,
     pub align: Option<AlignRequest>,
     pub crop: bool,
+    /// The bound of the brightness equalization (gains stay within
+    /// `1/bound..=bound`); `None` leaves the frames as delivered.
+    pub equalize: Option<f64>,
     pub tile_size: Option<u32>,
     pub max_host_memory: Option<u64>,
     pub backend: Option<&'static dyn TileBackend>,
+    /// An accelerator the align stage may offer its large ECC solves to.
+    pub align_backend: Option<&'static dyn AlignBackend>,
     pub resume: bool,
     pub cache: bool,
     /// How often the poll thread this module owns calls
@@ -127,6 +134,9 @@ pub struct FuseReport {
     pub width: u32,
     pub height: u32,
     pub samples_per_pixel: u32,
+    /// The intensity encoding fusion operates on, as delivered by the reader
+    /// (see [`working_space`]); no conversion happens.
+    pub working_space: &'static str,
     pub stack_params: ResolvedParams,
     pub tile_size: u32,
     pub levels: u32,
@@ -136,15 +146,22 @@ pub struct FuseReport {
     pub in_flight_limit: usize,
     pub max_bytes_in_flight: u64,
     /// The bytes the scheduler accounted for at its in-flight limit:
-    /// `in_flight_limit` tile sets, reader scratch included.
+    /// `in_flight_limit` tiles, each counted with the method's working bytes
+    /// and reader scratch.
     pub accounted_bytes_in_flight: u64,
     pub budget_provenance: Provenance,
     pub backed_off: bool,
+    /// Why the run fused on the host although the request carried a backend:
+    /// the backend's own account of the tile that did not fit its device.
+    /// `None` when the backend ran, or the request carried none.
+    pub gpu_fallback: Option<String>,
     pub output_width: u32,
     pub output_height: u32,
     pub crop: Option<Rect>,
     pub description: Option<String>,
     pub align: Option<FuseAlignReport>,
+    /// The brightness equalization's estimate; `None` when it was off.
+    pub equalization: Option<EqualizationReport>,
     pub align_cached: bool,
     pub align_source: String,
     pub align_workers: Option<usize>,
@@ -152,9 +169,23 @@ pub struct FuseReport {
     /// The bytes the align stage accounted for (shared reference data plus
     /// one registration per worker); `None` when no alignment was computed.
     pub align_accounted_bytes: Option<u64>,
+    /// Whether an accelerator ran at least one level of the alignment this
+    /// run computed; `false` for a cached, resumed or skipped alignment and
+    /// for a stage that reran on the CPU.
+    pub align_backend_used: bool,
     pub stages: StageTimings,
     pub wall_seconds: f64,
     pub metrics: Metrics,
+}
+
+/// The intensity encoding of the code values a reader delivers: RAW frames
+/// are developed to sRGB-encoded values; TIFF frames are 16-bit unsigned
+/// samples whose transfer function is not read from the file.
+pub fn working_space(kind: ReaderKind) -> &'static str {
+    match kind {
+        ReaderKind::Raw => "encoded-srgb",
+        ReaderKind::Mmap | ReaderKind::Decoded => "encoded-unknown-transfer",
+    }
 }
 
 /// What one run's align stage carries the moment it starts, reported once
@@ -198,6 +229,11 @@ pub trait StageObserver: Sync {
     /// crate and never decides how (or whether) a message is displayed.
     fn notice(&self, _message: &str) {}
 }
+
+/// The tail of the [`StageObserver::notice`] raised when the align stage
+/// reran on the CPU after its accelerator failed; the text before it is the
+/// reason.
+pub const ALIGN_RERUN_NOTICE: &str = "; the align stage reran on the CPU";
 
 /// Every early exit from the spine, typed by the stage that raised it.
 #[derive(Debug, thiserror::Error)]
@@ -264,7 +300,7 @@ pub fn run(
     let resolved = params::resolve(request.algorithm.params(), &request.explicit, &stack_ctx)
         .map_err(|err| PipelineError::Params(err.to_string()))?;
     let values = params::resolved_values(&resolved);
-    let levels = request.algorithm.tile_levels(&values);
+    let support = request.algorithm.tile_support(&values);
 
     let fingerprint = StackFingerprint {
         frames: (0..frame_reader.len())
@@ -272,7 +308,8 @@ pub fn run(
             .collect(),
     };
 
-    options.levels = levels;
+    options.apply_support(support);
+    options.working_bytes_per_pixel = request.algorithm.working_bytes_per_pixel(&values, spp);
     if let Some(tile_size) = request.tile_size {
         options.tile_size = tile_size;
     }
@@ -294,6 +331,7 @@ pub fn run(
     let mut align_workers: Option<usize> = None;
     let mut peak_align_workers: Option<usize> = None;
     let mut align_accounted_bytes: Option<u64> = None;
+    let mut align_backend_used = false;
 
     if let Some(align_req) = &request.align {
         timer.enter(Stage::Align);
@@ -314,11 +352,7 @@ pub fn run(
         } else {
             FailurePolicy::Strict
         };
-        let identity = AlignIdentity {
-            algorithm: align_req.algorithm.id().to_string(),
-            params: align_values.clone(),
-            failure_policy: policy,
-        };
+        let identity = AlignIdentity::new(align_req.algorithm.id(), align_values.clone(), policy);
 
         let peeked = if request.resume {
             peek_resumable_alignment(
@@ -403,6 +437,7 @@ pub fn run(
                             frames_done: Some(frames_done),
                             control: Some(Arc::clone(&control)),
                             on_pause: Some(&|control| observer.paused(control)),
+                            align_backend: request.align_backend,
                         },
                     );
                     done.store(true, Ordering::SeqCst);
@@ -424,6 +459,10 @@ pub fn run(
                 align_workers = Some(solved.worker_limit);
                 peak_align_workers = Some(solved.peak_workers);
                 align_accounted_bytes = Some(solved.accounted_bytes);
+                align_backend_used = solved.backend_used;
+                if let Some(reason) = &solved.rerun_reason {
+                    observer.notice(&format!("{reason}{ALIGN_RERUN_NOTICE}"));
+                }
                 let alignment = solved.alignment;
                 if !align_req.lax && alignment.failure_count() > 0 {
                     return Err(PipelineError::Align(describe_align_failure(
@@ -456,7 +495,8 @@ pub fn run(
         .map_err(|err| PipelineError::Align(err.to_string()))?;
     if request.crop && crop_rect_value.is_none() {
         return Err(PipelineError::Align(
-            "the aligned frames' overlap leaves no interior once the kernel margin is trimmed"
+            "the aligned frames' overlap leaves no interior once the kernel margin is trimmed; \
+             turn off auto-crop to keep the full frame extent"
                 .to_string(),
         ));
     }
@@ -484,14 +524,64 @@ pub fn run(
         .iter()
         .map(|f| f.transform)
         .collect();
+    let equalization = match request.equalize {
+        Some(max_gain) => {
+            let reference = alignment_result
+                .as_ref()
+                .map_or((frame_reader.len() - 1) / 2, |(_, _, _, a)| a.reference);
+            let warped = WarpingReader::new(frame_reader, (width, height), spp, transforms.clone());
+            let frames = equalize::estimate(
+                &warped,
+                frame_reader.len(),
+                (width, height),
+                spp,
+                reference,
+                max_gain,
+            )?;
+            for (index, estimate) in frames.iter().enumerate() {
+                if let Some(message) = estimate.notice(index, max_gain) {
+                    observer.notice(&message);
+                }
+            }
+            Some(EqualizationReport {
+                max_gain,
+                reference,
+                frames,
+            })
+        }
+        None => None,
+    };
+    let recorded = equalization.as_ref().map(EqualizationReport::recorded);
     let registration = Registration {
         transforms: transforms.clone(),
         crop: applied_crop,
+        equalization: recorded.clone(),
     };
-    let warping_reader = WarpingReader::new(frame_reader, (width, height), spp, transforms.clone());
+    // Every reader of a frame beneath this point -- host fuse, device
+    // upload and the device-loss fallback -- sees the gained samples.
+    let gain_reader = GainReader::new(
+        frame_reader,
+        recorded.as_ref().map_or(&[], |e| e.gains.as_slice()),
+    );
+    let warping_reader = WarpingReader::new(&gain_reader, (width, height), spp, transforms.clone());
 
-    let reader: &dyn TileReader = match &request.backend {
-        Some(_) => frame_reader,
+    // The scheduler's own per-tile rect: the largest read rect it plans.
+    let gpu_fallback = request.backend.and_then(|b| {
+        b.tile_budget_shortfall(
+            options.tile_size.min(width),
+            options.tile_size.min(height),
+            spp,
+            support.decimation_levels,
+            &transforms,
+        )
+    });
+    if let Some(message) = &gpu_fallback {
+        observer.notice(message);
+    }
+    let backend = request.backend.filter(|_| gpu_fallback.is_none());
+
+    let reader: &dyn TileReader = match &backend {
+        Some(_) => &gain_reader,
         None => &warping_reader,
     };
     let scheduler = TileScheduler::new(reader, stack_ctx, spp, &options)?;
@@ -516,8 +606,7 @@ pub fn run(
     let composite_description = description
         .clone()
         .unwrap_or_else(crate::io::TiffSpec::default_description);
-    let backend_id = request
-        .backend
+    let backend_id = backend
         .map(|b| b.info().to_string())
         .unwrap_or_else(|| "cpu".to_string());
 
@@ -535,12 +624,15 @@ pub fn run(
         backend: backend_id.clone(),
         align: alignment_result
             .as_ref()
-            .map(|(align_algo, align_resolved, policy, _)| AlignIdentity {
-                algorithm: align_algo.id().to_string(),
-                params: params::resolved_values(align_resolved),
-                failure_policy: *policy,
+            .map(|(align_algo, align_resolved, policy, _)| {
+                AlignIdentity::new(
+                    align_algo.id(),
+                    params::resolved_values(align_resolved),
+                    *policy,
+                )
             }),
         crop: applied_crop,
+        equalization: recorded.clone(),
         composite_output: staged_composite.clone(),
         zmap_output: Some(staged_zmap.clone()),
     };
@@ -624,14 +716,14 @@ pub fn run(
     );
     observer.stage(RunStage::Fuse);
 
-    let backend_consumer = request.backend.map(|b| {
+    let backend_consumer = backend.map(|b| {
         BackendFusionConsumer::new(
             b,
-            frame_reader,
+            &gain_reader,
             (width, height),
             transforms,
             spp,
-            levels,
+            support.decimation_levels,
             &sink,
         )
     });
@@ -683,7 +775,7 @@ pub fn run(
     }
 
     observer.stage(RunStage::Seal);
-    let metrics = measure_metrics(&staged_composite, frame_reader);
+    let metrics = measure_metrics(&staged_composite, frame_reader, &gain_reader);
     let align_record =
         alignment_result
             .as_ref()
@@ -781,6 +873,7 @@ pub fn run(
         width,
         height,
         samples_per_pixel: spp,
+        working_space: working_space(opened.kind),
         stack_params: resolved,
         tile_size: plan.tile_size(),
         levels: plan.levels(),
@@ -789,19 +882,22 @@ pub fn run(
         frame_tiles_read,
         in_flight_limit,
         max_bytes_in_flight: scheduler.budget().bytes(),
-        accounted_bytes_in_flight: in_flight_limit as u64 * scheduler.bytes_per_tile_set(),
+        accounted_bytes_in_flight: in_flight_limit as u64 * scheduler.bytes_per_tile(),
         budget_provenance: scheduler.budget().provenance(),
         backed_off: scheduler.final_in_flight_limit() < in_flight_limit,
+        gpu_fallback,
         output_width: applied_crop.map(|r| r.width).unwrap_or(width),
         output_height: applied_crop.map(|r| r.height).unwrap_or(height),
         crop: applied_crop,
         description,
         align: align_report,
+        equalization,
         align_cached,
         align_source,
         align_workers,
         peak_align_workers,
         align_accounted_bytes,
+        align_backend_used,
         stages,
         wall_seconds,
         metrics,
@@ -917,6 +1013,9 @@ fn divergence_phrase(reason: crate::align::DivergenceReason) -> &'static str {
         DivergenceReason::CorrelationDecreased => "the match grew worse instead of better",
         DivergenceReason::TooFewValidSamples => "too few pixels overlapped to measure a match",
         DivergenceReason::NonFiniteUpdate => "the computation produced an invalid result",
+        DivergenceReason::ValidationFailed => {
+            "the alignment does not hold away from the centre of the frame"
+        }
     }
 }
 
@@ -1014,8 +1113,14 @@ const LAPVAR_WINDOW: u32 = 2048;
 /// The composite's and the sharpest source frame's Laplacian variance over
 /// one central window, measured identically on both. Every failure is
 /// silence rather than a refusal: a metric that could not be measured must
-/// not turn a completed run into a failed one.
-fn measure_metrics(composite: &Path, sources: &dyn FrameReader) -> Metrics {
+/// not turn a completed run into a failed one. `gained` reads `sources` with
+/// the run's equalization gains applied, so the comparison is against the
+/// frames the fuse used.
+fn measure_metrics(
+    composite: &Path,
+    sources: &dyn FrameReader,
+    gained: &dyn TileReader,
+) -> Metrics {
     let Ok(stack) = TiffStack::open_files(std::slice::from_ref(&composite.to_path_buf())) else {
         return Metrics::default();
     };
@@ -1034,7 +1139,7 @@ fn measure_metrics(composite: &Path, sources: &dyn FrameReader) -> Metrics {
         }
         let fspp = sources.frame(index).samples_per_pixel;
         let rect = centered(fw, fh, side_w, side_h);
-        if let Some(value) = lapvar(sources, index, rect, fspp) {
+        if let Some(value) = lapvar(gained, index, rect, fspp) {
             max_input_lapvar = Some(max_input_lapvar.map_or(value, |m: f64| m.max(value)));
         }
     }
@@ -1131,6 +1236,35 @@ pub fn uniform_check(frames: &[(&str, &FrameDesc)]) -> (bool, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn working_space_names_the_transfer_each_reader_delivers() {
+        for (kind, expected) in [
+            (ReaderKind::Raw, "encoded-srgb"),
+            (ReaderKind::Mmap, "encoded-unknown-transfer"),
+            (ReaderKind::Decoded, "encoded-unknown-transfer"),
+        ] {
+            assert_eq!(working_space(kind), expected, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn validation_failed_has_its_own_phrase() {
+        use crate::align::DivergenceReason;
+
+        let phrase = divergence_phrase(DivergenceReason::ValidationFailed);
+        for other in [
+            DivergenceReason::SingularHessian,
+            DivergenceReason::LemmaOneRegion,
+            DivergenceReason::NonInvertibleIncrement,
+            DivergenceReason::CorrelationDecreased,
+            DivergenceReason::TooFewValidSamples,
+            DivergenceReason::NonFiniteUpdate,
+        ] {
+            assert_ne!(phrase, divergence_phrase(other));
+        }
+        assert!(phrase.contains("away from the centre"), "{phrase}");
+    }
 
     fn desc(label: &str, signature: &[&str]) -> FrameDesc {
         FrameDesc {

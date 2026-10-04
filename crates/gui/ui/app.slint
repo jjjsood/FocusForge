@@ -394,6 +394,7 @@ export component AppWindow inherits Window {
     callback settings-algorithm-selected(string, string);
     callback settings-reset-all();
     callback settings-menu-toggled(string, string);
+    callback settings-more-toggled(string);
     callback settings-scrolled(length);
     callback settings-scrollbar-pointer(int, length);
     callback settings-scrollbar-dragged(length);
@@ -469,6 +470,7 @@ export component AppWindow inherits Window {
         settings-algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
         settings-reset-all => { root.settings-reset-all(); }
         settings-menu-toggled(section, id) => { root.settings-menu-toggled(section, id); }
+        settings-more-toggled(section) => { root.settings-more-toggled(section); }
         settings-scrolled(delta) => { root.settings-scrolled(delta); }
         settings-scrollbar-pointer(kind, y) => { root.settings-scrollbar-pointer(kind, y); }
         settings-scrollbar-dragged(y) => { root.settings-scrollbar-dragged(y); }
@@ -742,6 +744,8 @@ export component AppWindow inherits Window {
     // own the moment a run fails; there is no button that reveals it.
     in property <bool> job-toast-open: false;
     in property <string> job-toast-message: "";
+    // "failure" | "info", `FFToast`'s own tone vocabulary.
+    in property <string> job-toast-tone: "failure";
     callback job-toast-dismissed();
 
     // The one warning a frame-set change (add/reorder/remove) raises once
@@ -884,6 +888,7 @@ export component AppWindow inherits Window {
             : canvas-ground.y + Theme.space-3;
         toast-open: root.job-toast-open;
         message: root.job-toast-message;
+        tone: root.job-toast-tone;
         dismissed => { root.job-toast-dismissed(); }
     }
 

@@ -13,16 +13,19 @@ import { FFSectionHeading } from "../../components/ff_section_heading.slint";
 import { FFErrorRow } from "../../components/ff_error_row.slint";
 import { FFScrollbar } from "../../components/ff_scrollbar.slint";
 import { FFResetAll } from "../../components/ff_reset_all.slint";
+import { FFMoreToggle } from "../../components/ff_more_toggle.slint";
 import { FFRowLabel } from "../../components/ff_row_label.slint";
 import { FFRowText } from "../../components/ff_row_text.slint";
 
 /// One row of the panel's flat list -- the `.slint` twin of
 /// `crate::settings_panel::SettingsRow`. `kind` is one of `"heading"`,
 /// `"picker"`, `"linear-float"`, `"log-float"`, `"int"`, `"bool"`,
-/// `"enum"`, `"error"` or `"reset-all"`; `heading-state` is one of
+/// `"enum"`, `"error"`, `"reset-all"`, `"more"` or `"more-end"`; `heading-state` is one of
 /// `"default"`, `"explicit"` or `"pending"`, meaningless off a `"heading"`
 /// row. `"reset-all"` carries its own enabled state in `selected`
-/// (`"true"`/`"false"`), the same convention a `"bool"` row's value uses.
+/// (`"true"`/`"false"`), the same convention a `"bool"` row's value uses; a
+/// `"more"` row carries its open state the same way and, in `extent`, the
+/// height of its band including the rows it holds, which are `nested`.
 export struct SettingsRow {
     kind: string,
     section: string,
@@ -36,6 +39,9 @@ export struct SettingsRow {
     menu-open: bool,
     heading-state: string,
     top: length,
+    disabled: bool,
+    nested: bool,
+    extent: length,
 }
 
 /// The section heading currently stuck to the panel's own top edge, drawn
@@ -64,6 +70,7 @@ export component FFSettingsPanel inherits Rectangle {
     callback algorithm-selected(string, string);
     callback reset-all();
     callback menu-toggled(string, string);
+    callback more-toggled(string);
     callback scrolled(length);
     callback scrollbar-pointer(int, length);
     callback scrollbar-dragged(length);
@@ -72,9 +79,9 @@ export component FFSettingsPanel inherits Rectangle {
     opacity: root.enabled ? 1.0 : 0.5;
 
     clip-area := Rectangle {
-        x: 0px;
+        x: -ShellGeometry.dock-content-inset;
         y: 0px;
-        width: ShellGeometry.panel-content-width + Theme.space-2 + ShellGeometry.scrollbar-width;
+        width: ShellGeometry.dock-width;
         height: parent.height;
         clip: true;
 
@@ -91,7 +98,7 @@ export component FFSettingsPanel inherits Rectangle {
         }
 
         content := Rectangle {
-            x: 0px;
+            x: ShellGeometry.dock-content-inset;
             y: -root.scroll-y;
             width: ShellGeometry.panel-content-width;
             height: root.content-height;
@@ -103,11 +110,13 @@ export component FFSettingsPanel inherits Rectangle {
                 height: row.kind == "heading"
                     ? ShellGeometry.section-heading-height
                     : row.kind == "error" ? ShellGeometry.param-error-height
-                    : row.kind == "bool" ? ShellGeometry.param-row-bool
+                    : row.kind == "bool" ? ShellGeometry.param-row-bool + ShellGeometry.param-row-bool-gap
                     : row.kind == "picker" ? ShellGeometry.param-label-height + ShellGeometry.param-row-field
                     : row.kind == "enum" ? ShellGeometry.param-label-height + ShellGeometry.param-row-enum
                     : row.kind == "log-float" ? ShellGeometry.param-label-height + ShellGeometry.param-row-log
                     : row.kind == "reset-all" ? ShellGeometry.reset-all-top-gap + ShellGeometry.reset-all-height
+                    : row.kind == "more" ? ShellGeometry.more-height + ShellGeometry.more-gap
+                    : row.kind == "more-end" ? ShellGeometry.more-gap
                     : ShellGeometry.param-label-height + ShellGeometry.param-row-linear;
 
                 if row.kind == "heading": FFSectionHeading {
@@ -121,13 +130,14 @@ export component FFSettingsPanel inherits Rectangle {
                     width: 100%;
                     height: 100%;
                     label-text: row.label;
+                    disabled: row.disabled;
                     FFMenu {
                         label: row.value-text;
                         choices: row.choices;
                         choice-ids: row.choice-ids;
                         selected: row.selected;
                         open: row.menu-open;
-                        disabled: !root.enabled;
+                        disabled: !root.enabled || row.disabled;
                         external-list: true;
                         toggled => { root.menu-toggled(row.section, row.id); }
                         option-selected(picked) => { root.algorithm-selected(row.section, picked); }
@@ -138,13 +148,15 @@ export component FFSettingsPanel inherits Rectangle {
                     width: 100%;
                     height: 100%;
                     label-text: row.label;
+                    disabled: row.disabled;
                     FFMenu {
                         label: row.value-text;
                         choices: row.choices;
                         choice-ids: row.choice-ids;
                         selected: row.selected;
                         open: row.menu-open;
-                        disabled: !root.enabled;
+                        disabled: !root.enabled || row.disabled;
+                        recessed: row.nested;
                         external-list: true;
                         toggled => { root.menu-toggled(row.section, row.id); }
                         option-selected(picked) => { root.param-text-edited(row.section, row.id, picked); }
@@ -155,11 +167,13 @@ export component FFSettingsPanel inherits Rectangle {
                     width: 100%;
                     height: 100%;
                     label-text: row.label;
+                    disabled: row.disabled;
                     FFSlider {
                         scale: "linear";
                         fraction: row.fraction;
                         value-text: row.value-text;
-                        disabled: !root.enabled;
+                        disabled: !root.enabled || row.disabled;
+                        recessed: row.nested;
                         fraction-changed(f) => { root.param-changed(row.section, row.id, f); }
                     }
                 }
@@ -168,18 +182,20 @@ export component FFSettingsPanel inherits Rectangle {
                     width: 100%;
                     height: 100%;
                     label-text: row.label;
+                    disabled: row.disabled;
                     FFSlider {
                         scale: "logarithmic";
                         fraction: row.fraction;
                         value-text: row.value-text;
-                        disabled: !root.enabled;
+                        disabled: !root.enabled || row.disabled;
+                        recessed: row.nested;
                         fraction-changed(f) => { root.param-changed(row.section, row.id, f); }
                     }
                 }
 
                 if row.kind == "bool": HorizontalLayout {
                     width: 100%;
-                    height: 100%;
+                    height: ShellGeometry.param-row-bool;
                     alignment: space-between;
                     FFRowText {
                         text: row.label;
@@ -188,7 +204,8 @@ export component FFSettingsPanel inherits Rectangle {
                         alignment: center;
                         FFToggle {
                             on: row.selected == "true";
-                            disabled: !root.enabled;
+                            disabled: !root.enabled || row.disabled;
+                            recessed: row.nested;
                             toggled => {
                                 root.param-text-edited(row.section, row.id, row.selected == "true" ? "false" : "true");
                             }
@@ -209,6 +226,16 @@ export component FFSettingsPanel inherits Rectangle {
                     height: ShellGeometry.reset-all-height;
                     enabled: row.selected == "true";
                     clicked => { root.reset-all(); }
+                }
+
+                if row.kind == "more": FFMoreToggle {
+                    x: -ShellGeometry.dock-content-inset;
+                    y: 0px;
+                    width: ShellGeometry.dock-width;
+                    height: row.extent;
+                    open: row.selected == "true";
+                    disabled: !root.enabled || row.disabled;
+                    toggled => { root.more-toggled(row.section); }
                 }
             }
 
@@ -251,7 +278,8 @@ export component FFSettingsPanel inherits Rectangle {
         if root.sticky.visible: FFSectionHeading {
             x: 0px;
             y: -root.sticky.push;
-            width: ShellGeometry.panel-content-width;
+            width: parent.width;
+            inset: ShellGeometry.dock-content-inset;
             label: root.sticky.label;
             provenance: root.sticky.provenance;
         }

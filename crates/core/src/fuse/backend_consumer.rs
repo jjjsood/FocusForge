@@ -15,7 +15,7 @@ use crate::algorithm::{AlgorithmError, TileCtx, TileReader};
 use crate::align::{Transform, WarpingReader};
 use crate::fuse::FusionConsumer;
 use crate::gpu::TileBackend;
-use crate::tile::{Tile, TileConsumer, TileJob};
+use crate::tile::{NoopPreprocess, TileConsumer, TileJob};
 
 /// Joins a [`TileBackend`] to a [`FusionConsumer`] sink: `consume` calls
 /// [`TileBackend::warp_fuse_tile`] over the **raw** `reader` (never a
@@ -24,7 +24,7 @@ use crate::tile::{Tile, TileConsumer, TileJob};
 ///
 /// A tile whose backend reports its device lost is finished on the host
 /// instead, through [`WarpingReader`] and the sink's own
-/// [`TileConsumer::consume`].
+/// [`TileConsumer::consume`], and counts in [`Self::fallback_tiles`].
 pub struct BackendFusionConsumer<'a> {
     backend: &'a dyn TileBackend,
     reader: &'a dyn TileReader,
@@ -66,33 +66,30 @@ impl<'a> BackendFusionConsumer<'a> {
         self.fallback_tiles.load(Ordering::Relaxed)
     }
 
-    /// Reads this tile's frame tiles through the warping reader and lets the
-    /// sink fuse and write them. [`TileConsumer::consume`], not
+    /// Lets the sink fuse this tile from the host, its frames read one at a
+    /// time through the warping reader. [`TileConsumer::consume`], not
     /// [`FusionConsumer::write_output`]: the sink owns the algorithm and the
     /// resolved parameter values, and reaching them through `consume` is
     /// what makes a tile finished here equal to the same tile on a run that
     /// never had a backend at all.
+    ///
+    /// The context reads through [`TileReader::read_tile_coverage_into`], so
+    /// the sink sees the coverage a warp leaves.
     fn consume_on_host(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
-        let rect = job.read_rect();
-        let len = rect.width as usize * rect.height as usize * self.samples_per_pixel as usize;
         let warping = WarpingReader::new(
             self.reader,
             self.frame,
             self.samples_per_pixel,
             self.transforms.clone(),
         );
-        let mut tiles = Vec::with_capacity(self.transforms.len());
-        for frame in 0..self.transforms.len() {
-            let mut samples = vec![0u16; len];
-            warping.read_tile_into(frame, rect, &mut samples)?;
-            tiles.push(Tile {
-                rect,
-                samples_per_pixel: self.samples_per_pixel,
-                samples,
-            });
-        }
         self.fallback_tiles.fetch_add(1, Ordering::Relaxed);
-        let ctx = TileCtx::new(rect, &tiles);
+        let ctx = TileCtx::on_demand(
+            job.read_rect(),
+            self.transforms.len(),
+            self.samples_per_pixel,
+            &warping,
+            &NoopPreprocess,
+        );
         self.sink
             .consume(&TileJob::new(job.tile(), ctx, job.scratch()))
     }

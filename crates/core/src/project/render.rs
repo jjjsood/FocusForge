@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::align::{Registration, WarpingReader};
+use crate::equalize::GainReader;
 use crate::io::{FrameSet, TiffSpec, TiffWriter, open_frame_set};
 use crate::retouch::{RetouchError, Sources, recomposite, recomposite_bands};
 use crate::tile::{HostBudget, Rect};
@@ -299,18 +300,19 @@ fn open_checkpoint_sources(
     Ok(set)
 }
 
-/// `set`'s frames under `registration`'s per-frame alignment (identity when
-/// there is none), for a stack of `frame_count` frames each holding
-/// `samples_per_pixel` samples.
+/// `set`'s frames, read through `gained` (its brightness gains applied), under
+/// `registration`'s per-frame alignment (identity when there is none), for a
+/// stack of `frame_count` frames each holding `samples_per_pixel` samples.
 fn warp<'a>(
-    set: &'a FrameSet,
+    set: &FrameSet,
+    gained: &'a GainReader<'a>,
     registration: &Registration,
     frame_count: usize,
     samples_per_pixel: u32,
 ) -> WarpingReader<'a> {
     let transforms = registration.transforms(frame_count);
     WarpingReader::new(
-        &*set.reader,
+        gained,
         set.reader.dimensions(),
         samples_per_pixel,
         transforms,
@@ -397,8 +399,10 @@ fn render_gather(
             .map(|s| project.source_path(s))
             .collect();
         let set = open_checkpoint_sources(project, checkpoint, &paths, record)?;
+        let gained = GainReader::new(&*set.reader, record.registration.gains());
         let warping = warp(
             &set,
+            &gained,
             &record.registration,
             record.sources.len(),
             record.composite.samples_per_pixel,
@@ -434,8 +438,10 @@ fn render_external_body(
         ZMapReader::open(zmap_path).map_err(|err| ProjectError::container(zmap_path, err))?;
     let set = open_sources(&source.sources, zmap_path)?;
     let samples_per_pixel = set.reader.stack_context().samples_per_pixel;
+    let gained = GainReader::new(&*set.reader, source.registration.gains());
     let warping = warp(
         &set,
+        &gained,
         &source.registration,
         source.sources.len(),
         samples_per_pixel,
@@ -484,8 +490,10 @@ fn render_op_bearing(
             .map(|s| project.source_path(s))
             .collect();
         let set = open_checkpoint_sources(project, checkpoint, &paths, ancestor)?;
+        let gained = GainReader::new(&*set.reader, ancestor.registration.gains());
         let warping = warp(
             &set,
+            &gained,
             &ancestor.registration,
             ancestor.sources.len(),
             ancestor.composite.samples_per_pixel,

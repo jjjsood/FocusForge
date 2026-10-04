@@ -86,6 +86,8 @@ export global ShellGeometry {
     out property <length> param-row-log: 60px;
     out property <length> param-row-field: 45px;
     out property <length> param-row-bool: 20px;
+    // The space under a toggle row, one grid step below the toggle.
+    out property <length> param-row-bool-gap: 12px;
     out property <length> param-row-enum: 43px;
     out property <length> param-error-height: 16px;
     out property <length> section-heading-height: 41px;
@@ -95,9 +97,13 @@ export global ShellGeometry {
     out property <length> section-heading-bottom-gap: 8px;
     out property <length> panel-content-width: 228px;
     // The panel's own bottom-of-list reset control -- two grid steps above
-    // it, clear of CROP's own last field, its own height below.
+    // it, clear of FINISH's own last field, its own height below.
     out property <length> reset-all-top-gap: 32px;
     out property <length> reset-all-height: 32px;
+    // A section's `More...` header band, and the space under it, under an
+    // open fold-out's last row and above the next section.
+    out property <length> more-height: 32px;
+    out property <length> more-gap: 12px;
 
     // Two primitive sizes shared wherever something else needs to lay out
     // against them, rather than assuming the primitive's own literal.
@@ -112,9 +118,9 @@ export global ShellGeometry {
     out property <length> progress-step-x: 166px;
     out property <length> progress-bar-x: 250px;
     out property <length> progress-bar-height: 4px;
-    // The track ends this far short of the bottom bar's right edge, clearing
-    // the overlay cluster below; the ETA sits right after the track.
-    out property <length> progress-bar-width-inset: 532px;
+    // The ETA's slot, right-bounded by the overlay cluster below; the track
+    // ends before it, and a longer readout is elided.
+    out property <length> eta-width: 80px;
 
     // The bottom bar's overlay cluster, right of the progress track and left
     // of the zoom cluster. Its left edge sits at this inset from the bar's

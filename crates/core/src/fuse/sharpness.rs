@@ -3,30 +3,64 @@
 //! The one thing `weighted_average` and `depth_map` genuinely share: the
 //! level-0 detail plane both take their per-pixel sharpness measure from
 //! (via [`crate::fuse::laplacian::score_plane`], `pub` so `crates/gpu`'s
-//! parity tests can call it too), its pinned reach constant, and the
-//! inversion of
-//! [`crate::tile::plan::margin_for_levels`] both algorithms' `tile_levels`
-//! overrides need. Nothing algorithm-specific lives here -- no weight
-//! formula, no tie-break, no degenerate-input rule.
+//! parity tests can call it too), and its pinned reach constant. Nothing
+//! algorithm-specific lives here -- no weight formula, no tie-break, no
+//! degenerate-input rule.
 
 use crate::fuse::PyramidError;
 use crate::fuse::pyramid::Plane;
-use crate::tile::plan::{MAX_LEVELS, margin_for_levels};
 
-/// The build-plus-expand reach of a **one**-level pyramid: `2 * (2^1 - 1)`,
-/// the same expression [`crate::fuse::laplacian::score_radius`] evaluates at
-/// `levels = 1`. Both algorithms build no deeper than one level --
-/// `L_0 = base - expand(reduce(base))` does not depend on how many further
-/// levels a caller would go on to build -- so this is always the detail
-/// plane's own reach, never a function of anything else.
-pub(crate) const DETAIL_REACH: u32 = 2; // 2 * (2^1 - 1)
+/// How far a pixel of the detail plane reads in the source: the one-level
+/// reduce (`2`) plus the expand it is subtracted from (`2`). Coverage erosion
+/// and tile planning both start from this reach.
+pub(crate) const DETAIL_REACH: u32 = 4;
+
+/// Which pixels of a `width x height` tile keep a frame eligible: those with
+/// no uncovered pixel within `reach` (Chebyshev) of them, i.e. the coverage
+/// mask eroded by a `(2 * reach + 1)`-square box. Pixels past the tile's
+/// edge are not looked at; the scheduler's margin already holds real samples
+/// there.
+pub(crate) fn eligible(covered: &[bool], width: u32, height: u32, reach: u32) -> Vec<bool> {
+    let (w, h, r) = (width as usize, height as usize, reach as usize);
+    debug_assert_eq!(covered.len(), w * h);
+    // Marks each slot of `line` whose `r`-neighbourhood holds a `true`, by prefix counts.
+    fn smear(line: &mut [bool], r: usize, prefix: &mut Vec<u32>) {
+        prefix.clear();
+        let mut count = 0;
+        prefix.push(count);
+        for &uncovered in line.iter() {
+            count += u32::from(uncovered);
+            prefix.push(count);
+        }
+        for (i, slot) in line.iter_mut().enumerate() {
+            let (lo, hi) = (i.saturating_sub(r), (i + r + 1).min(prefix.len() - 1));
+            *slot = prefix[hi] > prefix[lo];
+        }
+    }
+    let mut prefix = Vec::new();
+    let mut bad: Vec<bool> = covered.iter().map(|&c| !c).collect();
+    for row in bad.chunks_mut(w) {
+        smear(row, r, &mut prefix);
+    }
+    let mut column = vec![false; h];
+    for x in 0..w {
+        for y in 0..h {
+            column[y] = bad[y * w + x];
+        }
+        smear(&mut column, r, &mut prefix);
+        for y in 0..h {
+            bad[y * w + x] = column[y];
+        }
+    }
+    bad.iter().map(|&b| !b).collect()
+}
 
 /// The level-0 Laplacian detail plane of one frame's tile: `build(samples,
-/// width, height, spp, 1).levels()[0]`. A deeper pyramid is pointless here --
-/// see [`DETAIL_REACH`] -- so this always builds to exactly one level and
-/// takes that level by value (`Plane` has no cheaper move out of a
-/// [`crate::fuse::pyramid::Pyramid`], and the pyramid itself, residual
-/// included, is dropped immediately after).
+/// width, height, spp, 1).levels()[0]`. `L_0 = base - expand(reduce(base))`
+/// is the whole detail plane, with reach [`DETAIL_REACH`], so one level
+/// suffices. The level is cloned out of the pyramid (`Plane` has no cheaper
+/// move out of a [`crate::fuse::pyramid::Pyramid`]) and the pyramid,
+/// residual included, is dropped immediately after.
 pub(crate) fn detail_plane(
     samples: &[u16],
     width: u32,
@@ -37,93 +71,35 @@ pub(crate) fn detail_plane(
     Ok(pyramid.levels()[0].clone())
 }
 
-/// The inversion of [`margin_for_levels`] both `tile_levels` overrides need:
-/// the smallest pyramid-level count `n <= MAX_LEVELS` whose margin covers a
-/// reach of `px` pixels, saturating at [`MAX_LEVELS`] rather than panicking
-/// or overflowing when no level count in range covers `px`.
-///
-/// `margin_for_levels` is monotone non-decreasing over
-/// [`crate::fuse::pyramid::MEASURED_MARGIN`] and the analytic tail past it,
-/// so a linear scan from `0` is both correct and cheap (`MAX_LEVELS + 1`
-/// iterations at worst, `16`).
-///
-/// `tile_levels` returns a level count, but what both overriding
-/// algorithms actually know is a pixel margin. This function is the
-/// lossy conversion from the second to the first.
-pub(crate) fn levels_for_margin(px: u32) -> u32 {
-    for n in 0..=MAX_LEVELS {
-        if margin_for_levels(n) >= px {
-            return n;
-        }
-    }
-    MAX_LEVELS
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn flat(width: u32, height: u32, spp: u32, value: u16) -> Vec<u16> {
-        vec![value; width as usize * height as usize * spp as usize]
-    }
-
     #[test]
-    fn levels_for_margin_matches_the_two_algorithms_own_derivations() {
-        // weighted-average at its default radius (8): reach = 2 + 8 = 10,
-        // which inverts to 2 levels.
-        assert_eq!(levels_for_margin(2 + 8), 2);
-        // depth-map at its defaults (score-radius 4, smoothing-radius 8):
-        // reach = 2 + 4 + 8 = 14, which inverts to 3 levels.
-        assert_eq!(levels_for_margin(2 + 4 + 8), 3);
-        // weighted-average's worst legal setting (radius = 16): reach = 18,
-        // inverts to 3 levels, and `min_tile_size_for_levels(3) == 160`.
-        assert_eq!(levels_for_margin(2 + 16), 3);
-        // depth-map's worst legal setting (score-radius = smoothing-radius
-        // = 16): reach = 34, inverts to 4 levels, and
-        // `min_tile_size_for_levels(4) == 256`.
-        assert_eq!(levels_for_margin(2 + 16 + 16), 4);
-    }
-
-    #[test]
-    fn levels_for_margin_is_the_smallest_level_count_that_covers_the_reach() {
-        assert_eq!(levels_for_margin(0), 0);
-        // margin_for_levels(0) == 0 < 1, margin_for_levels(1) == 4 >= 1.
-        assert_eq!(levels_for_margin(1), 1);
-        for px in 0..200u32 {
-            let n = levels_for_margin(px);
-            assert!(
-                margin_for_levels(n) >= px,
-                "levels_for_margin({px}) = {n}, but margin_for_levels({n}) = {} < {px}",
-                margin_for_levels(n)
-            );
-            if n > 0 {
-                assert!(
-                    margin_for_levels(n - 1) < px,
-                    "levels_for_margin({px}) = {n} is not the smallest: \
-                     margin_for_levels({}) = {} already covers {px}",
-                    n - 1,
-                    margin_for_levels(n - 1)
-                );
+    fn eligible_erodes_by_exactly_the_reach() {
+        let (w, h) = (40u32, 23u32);
+        for reach in [0u32, 3, 14] {
+            let mut covered = vec![true; (w * h) as usize];
+            covered[(7 * w + 10) as usize] = false;
+            covered[((h - 1) * w) as usize] = false;
+            let got = eligible(&covered, w, h, reach);
+            for y in 0..h {
+                for x in 0..w {
+                    let near =
+                        |cx: u32, cy: u32| x.abs_diff(cx) <= reach && y.abs_diff(cy) <= reach;
+                    let expected = !(near(10, 7) || near(0, h - 1));
+                    assert_eq!(
+                        got[(y * w + x) as usize],
+                        expected,
+                        "reach {reach} at ({x}, {y})"
+                    );
+                }
             }
         }
     }
 
-    #[test]
-    fn levels_for_margin_is_monotone() {
-        let mut previous = 0u32;
-        for px in 0..600u32 {
-            let n = levels_for_margin(px);
-            assert!(
-                n >= previous,
-                "levels_for_margin must be non-decreasing: px={px} gave {n}, previous was {previous}"
-            );
-            previous = n;
-        }
-    }
-
-    #[test]
-    fn levels_for_margin_saturates_at_max_levels_rather_than_overflowing() {
-        assert_eq!(levels_for_margin(u32::MAX), MAX_LEVELS);
+    fn flat(width: u32, height: u32, spp: u32, value: u16) -> Vec<u16> {
+        vec![value; width as usize * height as usize * spp as usize]
     }
 
     #[test]

@@ -88,6 +88,13 @@ pub enum TimingCounter {
     BufferCreations,
     /// Bytes copied from GPU buffers back to the host.
     ReadbackBytes,
+    /// Registrations whose level-0 result left the bounded frame window the
+    /// solve read.
+    Level0WindowMisses,
+    /// Diverged registrations that ran the feature detector for a seeded re-run.
+    FeatureSeedAttempts,
+    /// Feature-seeded re-runs whose outcome replaced the identity-start one.
+    FeatureSeedsAccepted,
 }
 
 impl TimingCounter {
@@ -115,6 +122,9 @@ impl TimingCounter {
             Self::CpuSubmissions => "cpu_submissions",
             Self::BufferCreations => "buffer_creations",
             Self::ReadbackBytes => "readback_bytes",
+            Self::Level0WindowMisses => "level0_window_misses",
+            Self::FeatureSeedAttempts => "feature_seed_attempts",
+            Self::FeatureSeedsAccepted => "feature_seeds_accepted",
         }
     }
 }
@@ -146,6 +156,9 @@ pub struct TimingSnapshot {
     pub cpu_submissions: u64,
     pub buffer_creations: u64,
     pub readback_bytes: u64,
+    pub level0_window_misses: u64,
+    pub feature_seed_attempts: u64,
+    pub feature_seeds_accepted: u64,
     pub gpu_execution_available: bool,
     pub presentation_available: bool,
     pub saturated: bool,
@@ -177,6 +190,9 @@ struct TimingState {
     cpu_submissions: AtomicU64,
     buffer_creations: AtomicU64,
     readback_bytes: AtomicU64,
+    level0_window_misses: AtomicU64,
+    feature_seed_attempts: AtomicU64,
+    feature_seeds_accepted: AtomicU64,
     saturated: AtomicBool,
     summary_emitted: AtomicBool,
 }
@@ -209,6 +225,9 @@ impl TimingState {
             cpu_submissions: AtomicU64::new(0),
             buffer_creations: AtomicU64::new(0),
             readback_bytes: AtomicU64::new(0),
+            level0_window_misses: AtomicU64::new(0),
+            feature_seed_attempts: AtomicU64::new(0),
+            feature_seeds_accepted: AtomicU64::new(0),
             saturated: AtomicBool::new(false),
             summary_emitted: AtomicBool::new(false),
         }
@@ -254,6 +273,9 @@ impl TimingState {
             TimingCounter::CpuSubmissions => &self.cpu_submissions,
             TimingCounter::BufferCreations => &self.buffer_creations,
             TimingCounter::ReadbackBytes => &self.readback_bytes,
+            TimingCounter::Level0WindowMisses => &self.level0_window_misses,
+            TimingCounter::FeatureSeedAttempts => &self.feature_seed_attempts,
+            TimingCounter::FeatureSeedsAccepted => &self.feature_seeds_accepted,
         };
         saturating_add(slot, value, &self.saturated);
     }
@@ -296,6 +318,9 @@ impl TimingState {
             cpu_submissions: self.cpu_submissions.load(Ordering::Relaxed),
             buffer_creations: self.buffer_creations.load(Ordering::Relaxed),
             readback_bytes: self.readback_bytes.load(Ordering::Relaxed),
+            level0_window_misses: self.level0_window_misses.load(Ordering::Relaxed),
+            feature_seed_attempts: self.feature_seed_attempts.load(Ordering::Relaxed),
+            feature_seeds_accepted: self.feature_seeds_accepted.load(Ordering::Relaxed),
             gpu_execution_available: false,
             presentation_available: false,
             saturated: self.saturated.load(Ordering::Relaxed),
@@ -398,6 +423,17 @@ pub fn record_timing(counter: TimingCounter, value: u64) {
     }
 }
 
+/// Records the solver iterations one pyramid level spent and how the level
+/// ended, as a trace span nested under the frame being solved.
+pub fn record_level_iterations(level: u32, iterations: u32, status: &str) {
+    let Some(state) = timing() else {
+        return;
+    };
+    if state.admit() {
+        let _record = tracing::debug_span!("timing_level", level, iterations, status).entered();
+    }
+}
+
 /// Records the largest observed worker value for a processing run.
 pub fn observe_timing_max(counter: TimingCounter, value: u64) {
     let Some(state) = timing() else {
@@ -458,6 +494,9 @@ pub fn emit_timing_summary() {
         cpu_submissions = snapshot.cpu_submissions,
         buffer_creations = snapshot.buffer_creations,
         readback_bytes = snapshot.readback_bytes,
+        level0_window_misses = snapshot.level0_window_misses,
+        feature_seed_attempts = snapshot.feature_seed_attempts,
+        feature_seeds_accepted = snapshot.feature_seeds_accepted,
         gpu_execution_available = snapshot.gpu_execution_available,
         presentation_available = snapshot.presentation_available,
         saturated = snapshot.saturated,
@@ -688,6 +727,26 @@ mod accounting_tests {
     }
 
     #[test]
+    fn the_feature_seed_counters_accumulate_and_snapshot() {
+        let state = TimingState::new(2);
+
+        state.add(TimingCounter::FeatureSeedAttempts, 3);
+        state.add(TimingCounter::FeatureSeedAttempts, 1);
+        state.add(TimingCounter::FeatureSeedsAccepted, 2);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.feature_seed_attempts, 4);
+        assert_eq!(snapshot.feature_seeds_accepted, 2);
+        assert_eq!(
+            TimingCounter::FeatureSeedAttempts.name(),
+            "feature_seed_attempts"
+        );
+        assert_eq!(
+            TimingCounter::FeatureSeedsAccepted.name(),
+            "feature_seeds_accepted"
+        );
+    }
+
+    #[test]
     fn buffer_creations_and_readback_bytes_accumulate_and_saturate() {
         let state = TimingState::new(2);
 
@@ -702,6 +761,9 @@ mod accounting_tests {
         state.add(TimingCounter::ReadbackBytes, u64::MAX);
         let snapshot = state.snapshot();
         assert_eq!(snapshot.readback_bytes, u64::MAX);
+
+        state.add(TimingCounter::Level0WindowMisses, 2);
+        assert_eq!(state.snapshot().level0_window_misses, 2);
         assert_eq!(snapshot.buffer_creations, 5);
         assert!(snapshot.saturated);
     }

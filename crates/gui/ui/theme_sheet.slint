@@ -17,6 +17,7 @@ import { FFSectionHeading } from "components/ff_section_heading.slint";
 import { FFErrorRow } from "components/ff_error_row.slint";
 import { FFScrollbar } from "components/ff_scrollbar.slint";
 import { FFResetAll } from "components/ff_reset_all.slint";
+import { FFMoreToggle } from "components/ff_more_toggle.slint";
 import { FFRowLabel } from "components/ff_row_label.slint";
 import { FFRowText } from "components/ff_row_text.slint";
 import { FFButton } from "components/ff_button.slint";
@@ -479,9 +480,10 @@ export component ThemeSheet inherits Window {
         GroupHeading { text: "Settings panel: section heading"; }
         HorizontalLayout {
             spacing: Theme.space-6;
-            FFSectionHeading { width: 220px; label: "FUSE"; provenance: "default"; }
-            FFSectionHeading { width: 220px; label: "ALIGN"; provenance: "explicit"; }
-            FFSectionHeading { width: 220px; label: "CROP"; provenance: "pending"; }
+            FFSectionHeading { width: 160px; label: "PREPARE"; provenance: "pending"; }
+            FFSectionHeading { width: 160px; label: "FUSE"; provenance: "default"; }
+            FFSectionHeading { width: 160px; label: "ALIGN"; provenance: "explicit"; }
+            FFSectionHeading { width: 160px; label: "FINISH"; provenance: "pending"; }
         }
 
         GroupHeading { text: "Settings panel: slider"; }
@@ -493,6 +495,7 @@ export component ThemeSheet inherits Window {
         FFRowLabel {
             width: 320px;
             label-text: "Score Radius (disabled)";
+            disabled: true;
             FFSlider { scale: "linear"; fraction: 0.4; value-text: "4"; disabled: true; }
         }
         FFRowLabel {
@@ -550,6 +553,41 @@ export component ThemeSheet inherits Window {
             FFToggle { on: true; }
         }
         FFErrorRow { width: 320px; message: "epsilon-px: out of range"; }
+
+        GroupHeading { text: "Settings panel: more fold-out"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            for state in ["default", "hover", "focus", "disabled"]: VerticalLayout {
+                width: 260px;
+                spacing: Theme.space-3;
+                FFMoreToggle {
+                    height: ShellGeometry.more-height;
+                    hovered: state == "hover";
+                    focused: state == "focus";
+                    disabled: state == "disabled";
+                }
+                FFMoreToggle {
+                    open: true;
+                    height: ShellGeometry.more-height + ShellGeometry.more-gap + ShellGeometry.param-label-height + ShellGeometry.param-row-linear;
+                    hovered: state == "hover";
+                    focused: state == "focus";
+                    disabled: state == "disabled";
+                    FFRowLabel {
+                        x: ShellGeometry.dock-content-inset;
+                        y: ShellGeometry.more-height + ShellGeometry.more-gap;
+                        width: ShellGeometry.panel-content-width;
+                        label-text: "Levels";
+                        FFSlider {
+                            scale: "linear";
+                            fraction: 0.4;
+                            value-text: "5";
+                            recessed: true;
+                            disabled: state == "disabled";
+                        }
+                    }
+                }
+            }
+        }
 
         GroupHeading { text: "Settings panel: scrollbar + reset-all"; }
         HorizontalLayout {

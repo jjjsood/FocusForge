@@ -359,62 +359,75 @@ fn preset_supplies_the_algorithm_id() {
 
 #[test]
 fn written_preset_round_trips() {
-    let dir = tmp_dir("preset_cli_write_round_trip");
     let mantis = mantis_512_dir();
-    let written = dir.join("written.toml");
-    let first_dir = dir.join("first-out");
-    std::fs::create_dir_all(&first_dir).unwrap();
-    let first = first_dir.join("mantis-512.ffp");
-    let out = run_cli_in(
-        &dir,
-        &common::push_no_gpu(vec![
+    // Each method with a value off its default, one of them with equalization on.
+    let cases: [(&str, &[&str]); 3] = [
+        ("laplacian", &["levels=3"]),
+        (
+            "weighted-average",
+            &["weight-exponent=3.5", "equalize=true"],
+        ),
+        ("depth-map", &["score-radius=2"]),
+    ];
+    for (algo, sets) in cases {
+        let dir = tmp_dir(&format!("preset_cli_write_round_trip_{algo}"));
+        let written = dir.join("written.toml");
+        let first_dir = dir.join("first-out");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        let first = first_dir.join("mantis-512.ffp");
+        let mut args = vec![
             "stack",
             mantis.to_str().unwrap(),
             "-o",
-            first.parent().unwrap().to_str().unwrap(),
+            first_dir.to_str().unwrap(),
             "--algo",
-            "laplacian",
-            "--set",
-            "levels=3",
+            algo,
             "--write-preset",
             written.to_str().unwrap(),
             "--no-align",
             "--no-crop",
-        ]),
-    );
-    assert!(out.success, "stderr: {}", out.stderr);
+        ];
+        for set in sets {
+            args.extend(["--set", set]);
+        }
+        let out = run_cli_in(&dir, &common::push_no_gpu(args));
+        assert!(out.success, "{algo}: stderr: {}", out.stderr);
 
-    let text = std::fs::read_to_string(&written).expect("--write-preset must write the file");
-    let algo_line = text.find("algo =").expect("algo must be written");
-    let first_table = text.find('[').expect("a [stack] table must be written");
-    assert!(
-        algo_line < first_table,
-        "the scalar keys must precede the table headers:\n{text}"
-    );
-    assert!(text.contains("levels = 3"), "written preset:\n{text}");
+        let text = std::fs::read_to_string(&written).expect("--write-preset must write the file");
+        let algo_line = text.find("algo =").expect("algo must be written");
+        let first_table = text.find('[').expect("a [stack] table must be written");
+        assert!(
+            algo_line < first_table,
+            "{algo}: the scalar keys must precede the table headers:\n{text}"
+        );
+        for set in sets {
+            let line = set.replace('=', " = ");
+            assert!(text.contains(&line), "{algo}: written preset:\n{text}");
+        }
 
-    let second_dir = dir.join("second-out");
-    std::fs::create_dir_all(&second_dir).unwrap();
-    let second = second_dir.join("mantis-512.ffp");
-    let out = run_cli_in(
-        &dir,
-        &common::push_no_gpu(vec![
-            "stack",
-            mantis.to_str().unwrap(),
-            "-o",
-            second.parent().unwrap().to_str().unwrap(),
-            "--preset",
-            written.to_str().unwrap(),
-            "--no-align",
-            "--no-crop",
-        ]),
-    );
-    assert!(out.success, "stderr: {}", out.stderr);
-    assert_eq!(
-        read_bytes(&export_composite(&dir, &first)),
-        read_bytes(&export_composite(&dir, &second)),
-        "a written preset must reproduce the composite it came from"
-    );
+        let second_dir = dir.join("second-out");
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let second = second_dir.join("mantis-512.ffp");
+        let out = run_cli_in(
+            &dir,
+            &common::push_no_gpu(vec![
+                "stack",
+                mantis.to_str().unwrap(),
+                "-o",
+                second_dir.to_str().unwrap(),
+                "--preset",
+                written.to_str().unwrap(),
+                "--no-align",
+                "--no-crop",
+            ]),
+        );
+        assert!(out.success, "{algo}: stderr: {}", out.stderr);
+        assert_eq!(
+            read_bytes(&export_composite(&dir, &first)),
+            read_bytes(&export_composite(&dir, &second)),
+            "{algo}: a written preset must reproduce the composite it came from"
+        );
+    }
 }
 
 #[test]
@@ -538,6 +551,8 @@ fn dry_run_json_is_not_a_stack_report() {
             "laplacian",
             "--align-algo",
             "pyramidal-ecc",
+            "--tile-size",
+            "512",
             "--dry-run",
             "--json",
         ]),
@@ -806,5 +821,42 @@ fn written_preset_holds_explicit_values_only() {
     assert!(
         !text.contains("levels"),
         "an Auto-resolved value must not be frozen into the preset:\n{text}"
+    );
+}
+
+/// A preset naming `depth-map` resolves that algorithm's own schema: an
+/// explicit value is reported as such and an untouched one keeps its default.
+#[test]
+fn a_preset_naming_depth_map_runs_its_schema() {
+    let dir = tmp_dir("preset_cli_depth_map_schema");
+    let preset = write_preset(
+        &dir,
+        "p.toml",
+        "algo = \"depth-map\"\n[stack]\nscore-radius = 9\n",
+    );
+    let out = run_cli_in(
+        &dir,
+        &common::push_no_gpu(vec![
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            dir.to_str().unwrap(),
+            "--preset",
+            preset.to_str().unwrap(),
+            "--align-algo",
+            "pyramidal-ecc",
+            "--dry-run",
+        ]),
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(
+        out.stdout.contains("score-radius = 9 (Explicit)"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("smoothing-radius = 8"),
+        "stdout: {}",
+        out.stdout
     );
 }

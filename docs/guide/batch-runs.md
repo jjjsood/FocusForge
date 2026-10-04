@@ -74,6 +74,8 @@ align-algo = "pyramidal-ecc"
 
 [stack]
 levels = 5
+align = true
+equalize = true
 
 [align]
 max-iterations = 40
@@ -88,7 +90,9 @@ focusforge-cli stack path/to/frames/ --algo laplacian --write-preset macro.toml
 resolved algorithm ids and the values actually chosen, never a value left to
 an `auto` closure. A flag on the command line always beats the file:
 `--set`/`--align-set` override the file's tables, `--algo`/`--align-algo`
-override its keys. `focusforge-cli align` reads the same file, using only
+override its keys. The `[stack]` table also carries the project settings (`align`, `auto-crop`,
+`equalize`, `equalize-max-gain`); `align = false` in a preset fuses the frames
+as read. `focusforge-cli align` reads the same file, using only
 its `align-algo` key and `[align]` table.
 
 ## Pausing, cancelling and resuming

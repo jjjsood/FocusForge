@@ -21,8 +21,8 @@
 //! eaten more than
 //! [`PRESSURE_SHARE_PERCENT`] of the headroom the host reported available
 //! when the run started (the RSS half), *and* the scheduler's own
-//! self-accounted reserved bytes exceed one tile set (the "this pressure is
-//! ours to answer" half) -- with only one tile set reserved, shrinking
+//! self-accounted reserved bytes exceed one tile (the "this pressure is
+//! ours to answer" half) -- with only one tile reserved, shrinking
 //! cannot give anything back, so pressure that is not this run's own is not
 //! acted on.
 //!
@@ -47,7 +47,7 @@ use crate::tile::control::{ADMISSION_RECHECK, TileControl};
 use crate::tile::scheduler::{DEFAULT_MAX_BYTES_IN_FLIGHT, in_flight_for_budget};
 
 /// The share of `HostFacts::usable_available()` a host-derived budget
-/// claims. Frame-tile sets are not the process's only live bytes -- at
+/// claims. Frame tiles are not the process's only live bytes -- at
 /// fixture scale a 2 MiB budget measures under a 5 MiB peak live heap once
 /// the fusion consumer's per-worker pyramids are counted, roughly 2.5x, so
 /// claiming 40% of what the host currently reports available keeps the
@@ -186,7 +186,7 @@ impl HostBudget {
         }
     }
 
-    /// A caller-supplied budget: never probes, always floors at 1 tile set
+    /// A caller-supplied budget: never probes, always floors at 1 tile
     /// rather than refusing.
     pub fn explicit(bytes: u64) -> Self {
         HostBudget {
@@ -239,11 +239,11 @@ impl HostBudget {
         self.provenance
     }
 
-    /// Whether a budget below one tile set should refuse the run outright
+    /// Whether a budget below one tile should refuse the run outright
     /// rather than floor at 1: only when this budget is host-derived *and*
     /// uncapped. An explicitly supplied or flag-capped budget always floors
     /// instead.
-    pub fn refuses_below_one_tile_set(&self) -> bool {
+    pub fn refuses_below_one_tile(&self) -> bool {
         self.provenance == Provenance::Host
     }
 
@@ -265,14 +265,14 @@ fn back_off_now(
     rss_at_start: Option<u64>,
     available_at_start: u64,
     reserved_bytes: u64,
-    bytes_per_tile_set: u64,
+    bytes_per_tile: u64,
 ) -> bool {
     let (Some(rss_now), Some(rss_at_start)) = (rss_now, rss_at_start) else {
         return false;
     };
     let grown = rss_now.saturating_sub(rss_at_start);
     let threshold = available_at_start * PRESSURE_SHARE_PERCENT / 100;
-    grown > threshold && reserved_bytes > bytes_per_tile_set
+    grown > threshold && reserved_bytes > bytes_per_tile
 }
 
 struct GateState {
@@ -296,7 +296,7 @@ impl Drop for HostPermit<'_> {
     }
 }
 
-/// The admission gate: how many frame-tile sets may be live at once, and the
+/// The admission gate: how many frame tiles may be live at once, and the
 /// pressure state that can shrink that limit during a run. Blocking a rayon
 /// worker inside [`Self::acquire`] cannot deadlock: every permit is released
 /// by an RAII guard on the same thread, and nothing re-enters the pool
@@ -305,7 +305,7 @@ pub struct HostBudgetGate {
     state: Mutex<GateState>,
     condvar: Condvar,
     initial_limit: usize,
-    bytes_per_tile_set: u64,
+    bytes_per_tile: u64,
     peak: AtomicUsize,
     sources: HostSources,
     arms_back_off: bool,
@@ -318,15 +318,10 @@ pub struct HostBudgetGate {
 impl HostBudgetGate {
     /// `cap` is the pool's own thread count
     /// (`std::thread::available_parallelism`, the same source
-    /// `TileScheduler::new` already reads) -- never more in-flight tile sets
+    /// `TileScheduler::new` already reads) -- never more in-flight tiles
     /// than there are workers to hold them.
-    pub fn new(
-        budget: HostBudget,
-        bytes_per_tile_set: u64,
-        cap: usize,
-        sources: HostSources,
-    ) -> Self {
-        let initial_limit = in_flight_for_budget(bytes_per_tile_set, budget.bytes(), cap);
+    pub fn new(budget: HostBudget, bytes_per_tile: u64, cap: usize, sources: HostSources) -> Self {
+        let initial_limit = in_flight_for_budget(bytes_per_tile, budget.bytes(), cap);
         let arms_back_off = budget.arms_back_off();
         // Only a host-derived, uncapped budget probes at all -- an
         // `explicit`/flag-capped budget never reads `sources.probe`, so a
@@ -344,7 +339,7 @@ impl HostBudgetGate {
             }),
             condvar: Condvar::new(),
             initial_limit,
-            bytes_per_tile_set,
+            bytes_per_tile,
             peak: AtomicUsize::new(0),
             sources,
             arms_back_off,
@@ -356,10 +351,12 @@ impl HostBudgetGate {
     }
 
     /// Blocks until fewer than the smaller of [`Self::limit`] and the
-    /// control's admission cap tile sets are in flight, then admits one.
-    /// Polls pressure first, so a limit shrink is visible to this call.
-    /// The cap is never written into the limit, so it cannot raise it or hide
-    /// a back-off. While the cap binds, the wait re-checks every 10 ms.
+    /// control's admission cap tiles are in flight, then admits one and
+    /// returns its RAII permit. Polls pressure first (subject to its own
+    /// cadence and CAS), so a limit shrink is visible to this very call's
+    /// own admission check. The cap is never written into the limit, so it
+    /// cannot raise it or hide a back-off. While the cap binds, the wait
+    /// re-checks every 10 ms.
     pub fn acquire(&self, control: &dyn TileControl) -> HostPermit<'_> {
         if self.arms_back_off {
             self.maybe_poll_pressure();
@@ -395,7 +392,7 @@ impl HostBudgetGate {
         self.initial_limit
     }
 
-    /// The high-water mark of tile sets admitted at once since construction.
+    /// The high-water mark of tiles admitted at once since construction.
     pub fn peak_in_flight(&self) -> usize {
         self.peak.load(Ordering::SeqCst)
     }
@@ -423,14 +420,14 @@ impl HostBudgetGate {
         let facts = self.sources.probe.facts();
         let reserved_bytes = {
             let state = self.state.lock().unwrap();
-            state.in_flight as u64 * self.bytes_per_tile_set
+            state.in_flight as u64 * self.bytes_per_tile
         };
         let hit = back_off_now(
             facts.process_rss(),
             self.rss_at_start,
             self.available_at_start,
             reserved_bytes,
-            self.bytes_per_tile_set,
+            self.bytes_per_tile,
         );
         if hit {
             let hits = self.consecutive_hits.fetch_add(1, Ordering::SeqCst) + 1;
@@ -461,7 +458,7 @@ mod tests {
         let budget = HostBudget::host_derived(&facts);
         assert_eq!(budget.bytes(), 10_000_000 * HOST_BUDGET_SHARE_PERCENT / 100);
         assert_eq!(budget.provenance(), Provenance::Host);
-        assert!(budget.refuses_below_one_tile_set());
+        assert!(budget.refuses_below_one_tile());
         assert!(budget.arms_back_off());
         assert_ne!(budget.bytes(), DEFAULT_MAX_BYTES_IN_FLIGHT as u64);
     }
@@ -471,7 +468,7 @@ mod tests {
         let budget = HostBudget::host_derived(&HostFacts::fallback());
         assert_eq!(budget.bytes(), DEFAULT_MAX_BYTES_IN_FLIGHT as u64);
         assert_eq!(budget.provenance(), Provenance::HostFallback);
-        assert!(!budget.refuses_below_one_tile_set());
+        assert!(!budget.refuses_below_one_tile());
         assert!(!budget.arms_back_off());
     }
 
@@ -480,7 +477,7 @@ mod tests {
         let budget = HostBudget::explicit(1);
         assert_eq!(budget.bytes(), 1);
         assert_eq!(budget.provenance(), Provenance::Explicit);
-        assert!(!budget.refuses_below_one_tile_set());
+        assert!(!budget.refuses_below_one_tile());
         assert!(!budget.arms_back_off());
     }
 
@@ -510,14 +507,14 @@ mod tests {
 
     #[test]
     fn back_off_now_rss_half_alone_is_not_enough() {
-        // Grown past threshold, but reserved_bytes == bytes_per_tile_set
+        // Grown past threshold, but reserved_bytes == bytes_per_tile
         // (not strictly greater): the second half must fail.
         assert!(!back_off_now(Some(2_000), Some(1_000), 1_000, 10, 10));
     }
 
     #[test]
     fn back_off_now_reserved_half_alone_is_not_enough() {
-        // reserved_bytes exceeds one tile set, but RSS growth stays under
+        // reserved_bytes exceeds one tile, but RSS growth stays under
         // threshold: the first half must fail.
         assert!(!back_off_now(Some(1_100), Some(1_000), 1_000, 20, 10));
     }
@@ -562,7 +559,7 @@ mod tests {
     /// Drives the gate through a scripted rising-then-recovering RSS signal
     /// under an explicit `ManualClock`. The workload is modelled by two
     /// permits held throughout (`reserved_bytes = 2 * 1 = 2 >
-    /// bytes_per_tile_set(1)`, the "this pressure is ours" half of
+    /// bytes_per_tile = 1`, the "this pressure is ours" half of
     /// [`back_off_now`]); every poll-triggering acquire is released right
     /// after. The final shrink (4 -> 2) brings the limit down to exactly the
     /// two held baseline permits, so the call that causes it cannot itself

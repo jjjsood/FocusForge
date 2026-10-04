@@ -2,54 +2,55 @@
 
 //! The out-of-core tile scheduler: walks a [`TilePlan`] in parallel with a
 //! **scheduler-owned** rayon thread pool (never the global default, which is
-//! sized from the machine and from `RAYON_NUM_THREADS`), reading every
-//! frame's matching tile through a [`TileReader`], running the (currently
-//! empty) [`FramePreprocess`] hook per frame-tile, and handing the set to a
-//! [`TileConsumer`].
+//! sized from the machine and from `RAYON_NUM_THREADS`), and hands every tile
+//! to a [`TileConsumer`] as an on-demand [`TileCtx`]: frame `f`'s matching
+//! tile is read through a [`TileReader`] when the consumer reaches it, passed
+//! through the [`FramePreprocess`] hook, and overwritten by
+//! the next frame. A tile therefore holds one frame-tile and one coverage
+//! mask, never one per frame.
 //!
 //! # A consumer that supplies its own pixels
 //!
 //! A [`TileConsumer`] answering [`TileConsumer::supplies_own_pixels`] `true`
-//! (a GPU-backed consumer, for instance) skips this host read loop entirely -- it pulls
-//! its own, possibly footprint-grown, source rects instead of the
-//! scheduler's own destination read rect. Two consequences follow, both
-//! deliberate rather than papered over: [`TileRunReport::frame_tiles_read`]
-//! is `0` on that path, because the scheduler genuinely read no frame-tile;
-//! and the (currently empty) [`FramePreprocess`] hook is never called for
-//! that tile, since there is no frame-tile to run it over.
+//! (a GPU-backed consumer, for instance) is handed an empty context and reads
+//! nothing here -- it pulls its own, possibly footprint-grown, source rects
+//! instead of the scheduler's own destination read rect. Two consequences
+//! follow: [`TileRunReport::frame_tiles_read`] is `0` on that path, because
+//! the scheduler genuinely read no frame-tile; and the [`FramePreprocess`]
+//! hook is never called for that tile.
 //!
 //! # Memory budget: an admission gate, not the thread count
 //!
 //! The rayon pool is sized from `std::thread::available_parallelism()`
 //! unconditionally, independent of the memory budget. Concurrency
 //! is instead bounded by a [`crate::tile::budget::HostBudgetGate`]: every
-//! worker acquires a [`crate::tile::budget::HostPermit`] before it reads a
-//! frame-tile and releases the tile-set buffer before the permit drops, so
-//! a pool much larger than the admission limit never holds more live
-//! frame-tile sets than the limit allows -- a full-size pool behind a
-//! small gate blocks the excess workers in the gate's own `Condvar`, not by
-//! never having been spawned. Coupling the pool size to the byte budget
-//! instead would shrink concurrency as frame count grows, leaving most of a
-//! large machine's cores idle even though the machine has the memory to
-//! keep them busy.
+//! worker acquires a [`crate::tile::budget::HostPermit`] before it touches a
+//! tile and the tile's buffers are gone before the permit drops, so a pool
+//! much larger than the admission limit never holds more live tiles than the
+//! limit allows -- a full-size pool behind a small gate blocks the excess
+//! workers in the gate's own `Condvar`, not by never having been spawned.
 //!
 //! ```text
-//! bytes_per_tile_set = frames * tile_size^2 * samples_per_pixel * 2 B
-//! in_flight_limit = clamp(budget_bytes / bytes_per_tile_set, 1, pool_threads)
+//! bytes_per_tile = min(tile_size, extent)^2 * (samples_per_pixel * 2 + 1 + working_bytes_per_pixel)
+//!                  + reader scratch
+//! in_flight_limit = clamp(budget_bytes / bytes_per_tile, 1, pool_threads)
 //! pool_threads = available_parallelism()  -- independent of budget_bytes
 //! ```
+//!
+//! The terms are one `u16` frame tile, one coverage byte per pixel, the
+//! method's live heap per pixel
+//! ([`TileSchedulerOptions::working_bytes_per_pixel`]) and the reader's
+//! per-read allocation. The frame count enters nowhere: 8 and 600 frames
+//! admit the same number of tiles.
 //!
 //! `tile_size` is the outer size: `TilePlan` cuts the interior down by
 //! `2 * margin` and then reads it back with `margin` on every side, so a
 //! read rect is `tile_size` and never more. Adding a margin term here
-//! counts the same margin twice -- which was tried, and over-reserved by
-//! 1.89x until the arithmetic was checked against the real partition.
+//! counts the same margin twice.
 //!
-//! Worked example: 61 frames * 512^2 * 3 samples * 2 B/sample is
-//! ~91.5 MiB per tile set, so a budget of 1 GiB bounds `in_flight_limit` to
-//! a small, fixed number of simultaneously-live frame-tile sets --
-//! independent of how many worker threads the pool actually has, unlike the
-//! old coupled scheme.
+//! Worked example: a 512^2 tile of 3 samples costs 7 B/px for the frame tile
+//! and mask, 1.75 MiB; a method holding 70 B/px more brings it to 19.25 MiB,
+//! so a budget of 1 GiB admits 53 tiles, further capped by the pool.
 //!
 //! The budget itself is [`crate::tile::budget::HostBudget`]: host-derived by
 //! default (`Provenance::Host`, a share of what the host currently reports
@@ -57,9 +58,9 @@
 //! [`DEFAULT_MAX_BYTES_IN_FLIGHT`] constant when the host probe degrades
 //! (`Provenance::HostFallback`), or whatever a caller supplies explicitly
 //! (`Provenance::Explicit`, via [`TileSchedulerOptions::explicit_budget`]).
-//! A host-derived budget below one tile set refuses the run outright
+//! A host-derived budget below one tile refuses the run outright
 //! (`TileError::HostMemoryTooSmall`); an explicit or flag-capped budget
-//! floors at 1 tile set instead. During a run, the gate
+//! floors at 1 tile instead. During a run, the gate
 //! watches this process's own RSS and shrinks the limit -- never raises it
 //! back -- when observed pressure says the starting estimate was too
 //! optimistic; see `crate::tile::budget`'s own module doc for the signal and
@@ -74,14 +75,14 @@ use rayon::prelude::*;
 use crate::algorithm::{TileCtx, TileReader};
 use crate::host::HostFacts;
 use crate::params::{Provenance, StackContext};
+use crate::tile::TileError;
 use crate::tile::budget::{HostBudget, HostBudgetGate, HostSources};
 use crate::tile::consumer::{TileConsumer, TileJob};
 use crate::tile::control::{NoControl, TileControl};
-use crate::tile::plan::{DEFAULT_TILE_SIZE, PlannedTile, TilePlan};
+use crate::tile::plan::{DEFAULT_TILE_SIZE, PlannedTile, TilePlan, TileSupport};
 use crate::tile::preprocess::FramePreprocess;
 use crate::tile::scratch::ScratchDir;
-use crate::tile::{Tile, TileError};
-use crate::timing::{TimingCounter, measurement_scope, record_timing};
+use crate::timing::measurement_scope;
 
 /// The default pyramid depth: **5, a default, never a cap**. `levels` stays
 /// a live parameter -- a caller (`ParamDesc`, or a direct
@@ -108,8 +109,7 @@ use crate::timing::{TimingCounter, measurement_scope, record_timing};
 /// width fast.
 pub const DEFAULT_LEVELS: u32 = 5;
 
-/// The default in-flight memory budget: 1 GiB of frame-tile sets, before
-/// per-worker pyramid allocations on top.
+/// The default in-flight memory budget: 1 GiB of accounted tile bytes.
 pub const DEFAULT_MAX_BYTES_IN_FLIGHT: usize = 1 << 30;
 
 /// Tile geometry and the memory budget, as scheduler constants plus
@@ -127,6 +127,12 @@ pub const DEFAULT_MAX_BYTES_IN_FLIGHT: usize = 1 << 30;
 pub struct TileSchedulerOptions {
     pub tile_size: u32,
     pub levels: u32,
+    /// The method's reach beyond the pyramid margin (`TileSupport::reach_px`).
+    pub reach_px: u32,
+    /// The method's own live heap per pixel of a read rect
+    /// (`StackAlgorithm::working_bytes_per_pixel`), counted in each tile's
+    /// accounted bytes. 0 for a consumer that holds nothing of its own.
+    pub working_bytes_per_pixel: u64,
     pub budget: HostBudget,
     pub host: HostSources,
     pub scratch_base: PathBuf,
@@ -137,6 +143,8 @@ impl std::fmt::Debug for TileSchedulerOptions {
         f.debug_struct("TileSchedulerOptions")
             .field("tile_size", &self.tile_size)
             .field("levels", &self.levels)
+            .field("reach_px", &self.reach_px)
+            .field("working_bytes_per_pixel", &self.working_bytes_per_pixel)
             .field("budget", &self.budget)
             .field("host", &"...")
             .field("scratch_base", &self.scratch_base)
@@ -153,6 +161,8 @@ impl TileSchedulerOptions {
         TileSchedulerOptions {
             tile_size: DEFAULT_TILE_SIZE,
             levels: DEFAULT_LEVELS,
+            reach_px: 0,
+            working_bytes_per_pixel: 0,
             budget: HostBudget::host_derived(&crate::host::snapshot()),
             host: HostSources::default(),
             scratch_base: scratch_base.into(),
@@ -160,12 +170,14 @@ impl TileSchedulerOptions {
     }
 
     /// A caller-stated budget in bytes: never probes, never arms the
-    /// runtime back-off, and floors at 1 tile set rather than refusing.
+    /// runtime back-off, and floors at 1 tile rather than refusing.
     /// What every existing test site uses.
     pub fn explicit_budget(scratch_base: impl Into<PathBuf>, max_bytes_in_flight: u64) -> Self {
         TileSchedulerOptions {
             tile_size: DEFAULT_TILE_SIZE,
             levels: DEFAULT_LEVELS,
+            reach_px: 0,
+            working_bytes_per_pixel: 0,
             budget: HostBudget::explicit(max_bytes_in_flight),
             host: HostSources::default(),
             scratch_base: scratch_base.into(),
@@ -179,9 +191,27 @@ impl TileSchedulerOptions {
         TileSchedulerOptions {
             tile_size: DEFAULT_TILE_SIZE,
             levels: DEFAULT_LEVELS,
+            reach_px: 0,
+            working_bytes_per_pixel: 0,
             budget: HostBudget::host_derived(facts),
             host: HostSources::default(),
             scratch_base: scratch_base.into(),
+        }
+    }
+
+    /// Plans for a method's `support`: its reach and depth, and its default
+    /// tile size in place of [`DEFAULT_TILE_SIZE`]. A caller that states a
+    /// tile size sets `tile_size` afterwards.
+    pub fn apply_support(&mut self, support: TileSupport) {
+        self.levels = support.decimation_levels;
+        self.reach_px = support.reach_px;
+        self.tile_size = support.default_tile_size();
+    }
+
+    fn support(&self) -> TileSupport {
+        TileSupport {
+            reach_px: self.reach_px,
+            decimation_levels: self.levels,
         }
     }
 }
@@ -243,42 +273,52 @@ enum RunStop {
     Failed,
 }
 
-/// `bytes_per_tile_set` for `frame_count` frames of `tile_size x tile_size`
-/// read rects at `samples_per_pixel` samples, `u16` (2 bytes) each.
+/// Bytes one in-flight tile is accounted at, for a `width x height` read rect
+/// at `samples_per_pixel` samples, `u16` (2 bytes) each: the frame tile being
+/// fused, its coverage mask (1 byte per pixel) and the method's own
+/// `working_bytes_per_pixel`. The frame count does not enter: frames are read
+/// one at a time into the same buffer.
 ///
-/// `tile_size` is the **outer** size, and that is the whole subtlety here.
+/// The caller passes the **outer** tile size clamped to the frame.
 /// [`TilePlan::new`] derives `raw_interior = tile_size - 2 * margin`, then
 /// gives each tile a read rect of `interior + margin` on every side -- so
 /// the read rect reconstitutes `tile_size` and never exceeds it. A margin
 /// term added here would be counting the same margin twice.
 ///
-/// Measured over the reference partition (8192x5464, tile 512, 5 levels:
-/// 442 tiles, interior stride 320) the largest read rect is exactly
-/// 512x512. Ragged strides absorbed into a previous stride are always
-/// terminal, so they are clamped at the frame edge and come out smaller,
-/// not larger.
-fn bytes_per_tile_set(frame_count: usize, tile_size: u32, samples_per_pixel: u32) -> u64 {
-    frame_count as u64 * tile_size as u64 * tile_size as u64 * samples_per_pixel as u64 * 2
+/// A trailing remainder smaller than the margin is absorbed into the
+/// previous stride, and that stride is terminal: the frame edge clamps its
+/// far side, so its read rect stays within `tile_size` too
+/// (`tile::plan::tests::read_rects_never_exceed_the_tile_size`). Measured
+/// over the reference partition (8192x5464, tile 512, 5 levels) the largest
+/// read rect is exactly 512x512.
+fn bytes_per_tile(
+    width: u32,
+    height: u32,
+    samples_per_pixel: u32,
+    working_bytes_per_pixel: u64,
+) -> u64 {
+    let pixels = width as u64 * height as u64;
+    pixels * (samples_per_pixel as u64 * 2 + 1 + working_bytes_per_pixel)
 }
 
-/// The pure arithmetic behind the budget: how many tile sets can be live at
+/// The pure arithmetic behind the budget: how many tiles can be live at
 /// once under `max_bytes_in_flight`, floored at 1 (never 0, so a budget
-/// smaller than one tile set still makes forward progress) and capped at
+/// smaller than one tile still makes forward progress) and capped at
 /// `available_parallelism` (never more workers than the host has, and never
 /// scaling with it either -- the cap is a ceiling, not a target).
 ///
 /// `pub(crate)`, not private: `crate::tile::budget::HostBudgetGate` calls
 /// this directly to compute its own initial limit.
 pub(crate) fn in_flight_for_budget(
-    bytes_per_tile_set: u64,
+    bytes_per_tile: u64,
     max_bytes_in_flight: u64,
     available_parallelism: usize,
 ) -> usize {
     let available_parallelism = available_parallelism.max(1);
-    if bytes_per_tile_set == 0 {
+    if bytes_per_tile == 0 {
         return available_parallelism;
     }
-    let raw = (max_bytes_in_flight / bytes_per_tile_set).max(1);
+    let raw = (max_bytes_in_flight / bytes_per_tile).max(1);
     (raw.min(available_parallelism as u64)) as usize
 }
 
@@ -294,7 +334,7 @@ pub struct TileScheduler<'a> {
     scratch_base: PathBuf,
     in_flight: usize,
     pool_threads: usize,
-    bytes_per_tile_set: u64,
+    bytes_per_tile: u64,
     budget: HostBudget,
     gate: HostBudgetGate,
 }
@@ -304,28 +344,36 @@ impl<'a> TileScheduler<'a> {
     /// field: `StackContext` is `#[non_exhaustive]` with a three-argument
     /// `new`, and `TileReader` exposes no geometry of its own. A value that
     /// disagrees with the reader surfaces on the first tile as that
-    /// reader's own error, wrapped in [`TileError::Read`].
+    /// reader's own error, wrapped in [`TileError::Consumer`].
     pub fn new(
         reader: &'a dyn TileReader,
         stack: StackContext,
         samples_per_pixel: u32,
         options: &TileSchedulerOptions,
     ) -> Result<Self, TileError> {
-        let plan = TilePlan::new(stack.width, stack.height, options.tile_size, options.levels)?;
+        let plan = TilePlan::new(
+            stack.width,
+            stack.height,
+            options.tile_size,
+            options.support(),
+        )?;
         let pool_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let bytes = bytes_per_tile_set(stack.frame_count, options.tile_size, samples_per_pixel)
-            + reader.read_scratch_bytes(options.tile_size, options.tile_size);
+        // A read rect never exceeds the frame, whatever the tile size.
+        let read_width = options.tile_size.min(stack.width);
+        let read_height = options.tile_size.min(stack.height);
+        let bytes = bytes_per_tile(
+            read_width,
+            read_height,
+            samples_per_pixel,
+            options.working_bytes_per_pixel,
+        ) + reader.read_scratch_bytes(read_width, read_height);
 
-        if options.budget.refuses_below_one_tile_set()
-            && bytes > 0
-            && options.budget.bytes() < bytes
-        {
+        if options.budget.refuses_below_one_tile() && bytes > 0 && options.budget.bytes() < bytes {
             return Err(TileError::HostMemoryTooSmall {
                 budget_bytes: options.budget.bytes(),
-                bytes_per_tile_set: bytes,
-                frame_count: stack.frame_count,
+                bytes_per_tile: bytes,
                 tile_size: options.tile_size,
             });
         }
@@ -341,7 +389,7 @@ impl<'a> TileScheduler<'a> {
             scratch_base: options.scratch_base.clone(),
             in_flight,
             pool_threads,
-            bytes_per_tile_set: bytes,
+            bytes_per_tile: bytes,
             budget: options.budget,
             gate,
         })
@@ -351,18 +399,19 @@ impl<'a> TileScheduler<'a> {
         &self.plan
     }
 
-    /// The number of frame-tile sets the scheduler allows to be live at
-    /// once at the start of a run, derived from the memory budget at
+    /// The number of tiles the scheduler allows to be in flight at once at
+    /// the start of a run, derived from the memory budget at
     /// construction. The runtime back-off may shrink the *actual* admission
     /// limit during a run -- see `TileRunReport::final_in_flight_limit`.
     pub fn in_flight_limit(&self) -> usize {
         self.in_flight
     }
 
-    /// The bytes one in-flight tile set is accounted at: every frame's tile
-    /// plus the reader's per-read scratch.
-    pub fn bytes_per_tile_set(&self) -> u64 {
-        self.bytes_per_tile_set
+    /// The bytes one in-flight tile is accounted at: one frame tile, its
+    /// coverage mask, the method's working bytes and the reader's per-read
+    /// scratch.
+    pub fn bytes_per_tile(&self) -> u64 {
+        self.bytes_per_tile
     }
 
     /// The rayon pool's own thread count -- `available_parallelism()`,
@@ -487,22 +536,9 @@ impl<'a> TileScheduler<'a> {
         let parent = tracing::Span::current();
 
         let install_result: Result<(), RunStop> = pool.install(|| {
-            tiles.par_iter().try_for_each_init(
-                || {
-                    (0..frame_count)
-                        .map(|_| Tile {
-                            rect: crate::tile::Rect {
-                                x: 0,
-                                y: 0,
-                                width: 0,
-                                height: 0,
-                            },
-                            samples_per_pixel: spp,
-                            samples: Vec::new(),
-                        })
-                        .collect::<Vec<_>>()
-                },
-                |buf: &mut Vec<Tile>, planned: &PlannedTile| -> Result<(), RunStop> {
+            tiles
+                .par_iter()
+                .try_for_each(|planned: &PlannedTile| -> Result<(), RunStop> {
                     // The budget admission permit is acquired first, above
                     // the control check below: the rayon pool's own thread
                     // count is independent of the budget (`pool_threads` is
@@ -551,70 +587,19 @@ impl<'a> TileScheduler<'a> {
                                 });
                         }
 
-                        let len =
-                            read_rect.width as usize * read_rect.height as usize * spp as usize;
-
-                        for (frame, tile) in buf.iter_mut().enumerate() {
-                            tile.rect = read_rect;
-                            let capacity = tile.samples.capacity();
-                            tile.samples.resize(len, 0);
-                            if tile.samples.capacity() > capacity {
-                                record_timing(
-                                    TimingCounter::AllocationBytes,
-                                    (tile.samples.capacity() * std::mem::size_of::<u16>()) as u64,
-                                );
-                                record_timing(TimingCounter::AllocationOperations, 1);
-                            }
-                            reader
-                                .read_tile_into(frame, read_rect, &mut tile.samples)
-                                .map_err(|source| TileError::Read {
-                                    frame,
-                                    rect: read_rect,
-                                    source,
-                                })?;
-                            frame_tiles_read.fetch_add(1, Ordering::Relaxed);
-
-                            // Preprocess errors carry the same {frame, rect}
-                            // shape as a read failure: both happen while
-                            // preparing one frame's tile before the
-                            // consumer ever sees it, and NoopPreprocess (the
-                            // hook's only implementation) never
-                            // fails.
-                            preprocess.preprocess(frame, tile).map_err(|source| {
-                                TileError::Read {
-                                    frame,
-                                    rect: read_rect,
-                                    source,
-                                }
-                            })?;
-                        }
-
-                        let ctx = TileCtx::new(read_rect, buf);
+                        let ctx =
+                            TileCtx::on_demand(read_rect, frame_count, spp, reader, preprocess);
                         let job = TileJob::new(planned, ctx, &scratch_path);
                         let _consume = measurement_scope("fusion_consume");
-                        consumer
-                            .consume(&job)
-                            .map_err(|source| TileError::Consumer {
-                                rect: planned.interior(),
-                                source,
-                            })?;
-                        Ok(())
+                        let consumed = consumer.consume(&job);
+                        frame_tiles_read.fetch_add(job.ctx().frames_read(), Ordering::Relaxed);
+                        consumed.map_err(|source| TileError::Consumer {
+                            rect: planned.interior(),
+                            source,
+                        })
                     })();
 
                     live.fetch_sub(1, Ordering::SeqCst);
-
-                    // Release this job's frame-tile buffer before the
-                    // permit drops (`_permit`'s `Drop` runs at the end of
-                    // this closure): `try_for_each_init`'s init closure is
-                    // reused "per job, not per thread" (rayon 1.12.0), so
-                    // leaving `buf` live in the init value would let a pool
-                    // much larger than the admission limit hold up to one
-                    // full tile set per job -- reintroducing, as resident
-                    // memory, exactly the overcommit the budget exists to
-                    // prevent.
-                    for tile in buf.iter_mut() {
-                        tile.samples = Vec::new();
-                    }
 
                     match outcome {
                         Ok(()) => {
@@ -637,8 +622,7 @@ impl<'a> TileScheduler<'a> {
                             Err(RunStop::Failed)
                         }
                     }
-                },
-            )
+                })
         });
 
         // A recorded genuine error always wins over a mere stop request.
@@ -694,28 +678,28 @@ mod tests {
 
     #[test]
     fn budget_arithmetic_at_the_reference_scale() {
-        // 61 frames, 512x512 read rects, 3 samples/pixel, u16.
-        let bytes = bytes_per_tile_set(61, 512, 3);
-        assert_eq!(bytes, 95_944_704);
-        // A 1 GiB budget divided by ~91.5 MiB per tile set floors to 11,
-        // and 11 live tile sets are 0.98 GiB -- just under the budget,
-        // which is what a budget is supposed to do.
-        let in_flight = in_flight_for_budget(bytes, 1u64 << 30, 32);
-        assert_eq!(in_flight, 11);
+        // 512x512 read rects, 3 samples/pixel, u16, plus one mask byte per
+        // pixel: 7 B/px for the frame tile, whatever the frame count.
+        let bytes = bytes_per_tile(512, 512, 3, 0);
+        assert_eq!(bytes, 1_835_008);
+        // A method holding 70 B/px more floors a 1 GiB budget to 53 tiles.
+        let in_flight = in_flight_for_budget(bytes_per_tile(512, 512, 3, 70), 1u64 << 30, 64);
+        assert_eq!(in_flight, 53);
+        assert_eq!(in_flight_for_budget(bytes, 1u64 << 30, 32), 32);
     }
 
     #[test]
-    fn budget_below_one_tile_set_floors_at_one_never_zero() {
-        let bytes = bytes_per_tile_set(61, 512, 3);
+    fn budget_below_one_tile_floors_at_one_never_zero() {
+        let bytes = bytes_per_tile(512, 512, 3, 0);
         let in_flight = in_flight_for_budget(bytes, 1, 32);
         assert_eq!(in_flight, 1);
     }
 
     #[test]
     fn in_flight_never_exceeds_available_parallelism() {
-        // A tiny tile set (so the budget alone would allow hundreds live)
+        // A tiny tile (so the budget alone would allow hundreds live)
         // must still be capped by the host's reported parallelism.
-        let bytes = bytes_per_tile_set(1, 4, 1);
+        let bytes = bytes_per_tile(4, 4, 1, 0);
         let in_flight = in_flight_for_budget(bytes, u64::MAX, 4);
         assert_eq!(in_flight, 4);
     }

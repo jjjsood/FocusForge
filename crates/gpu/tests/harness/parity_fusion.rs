@@ -9,13 +9,16 @@
 //! `TilePlan::new` rather than guessed.
 
 use focusforge_core::algorithm::{StackAlgorithm, TileCtx, TileReader};
-use focusforge_core::fuse::laplacian::{Laplacian, score_plane, score_radius};
+use focusforge_core::fuse::laplacian::{EligibleMasks, Laplacian, score_plane, score_radius};
 use focusforge_core::fuse::pyramid::{self, Plane};
 use focusforge_core::gpu::TileBackend;
 use focusforge_core::io::TiffStack;
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::tile::{Rect, Tile};
-use focusforge_gpu::fuse::{FusionPipelines, convert, pyramid as gpu_pyramid, select};
+use focusforge_core::zmap::NO_SOURCE;
+use focusforge_gpu::fuse::{
+    FusionPipelines, convert, fuse_tile_gpu, pyramid as gpu_pyramid, select,
+};
 use focusforge_gpu::harness::gpu_backend;
 use focusforge_gpu::pack::{packed_len, unpack_samples};
 use focusforge_gpu::transfer::{create_storage_buffer, download_buffer, download_f32, upload_f32};
@@ -561,4 +564,162 @@ fn interior_tile_matches_cpu() {
         "interior composite parity exceeded 1 LSB: worst={worst} at index {worst_index}"
     );
     assert_zmap_exact_or_near_tie(&cmp);
+}
+
+/// Frames 0, 2, 4, 5 and 7 of `mantis-512`, cropped to a non-square
+/// `352x224` rect, with the coverage cases the eligibility rule has to
+/// honour: frame 0 uncovered in a 20-column left band (so it cannot seed the
+/// selection), frame 1 uncovered everywhere, frame 2 uncovered in a 20-column
+/// right band, and a bottom-right block no frame covers.
+fn masked_case() -> (InMemoryFrames, Rect, Vec<Option<Vec<bool>>>) {
+    let (width, height) = (352u32, 224u32);
+    let reader = InMemoryFrames::repeating_mantis(&[0, 2, 4, 5, 7], width, height);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let mask = |uncovered: &dyn Fn(u32, u32) -> bool| -> Option<Vec<bool>> {
+        Some(
+            (0..height)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .map(|(x, y)| !(uncovered(x, y) || x >= width - 40 && y >= height - 40))
+                .collect(),
+        )
+    };
+    let coverage = vec![
+        mask(&|x, _| x < 20),
+        mask(&|_, _| true),
+        mask(&|x, _| x >= width - 20),
+        mask(&|_, _| false),
+        mask(&|_, _| false),
+    ];
+    (reader, rect, coverage)
+}
+
+#[test]
+fn masked_fuse_matches_cpu() {
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let (reader, rect, coverage) = masked_case();
+    let (spp, levels, frame_count) = (reader.spp, 5u32, reader.frames.len());
+    let tiles: Vec<Tile> = (0..frame_count)
+        .map(|frame| {
+            let mut samples = vec![0u16; (rect.width * rect.height * spp) as usize];
+            reader
+                .read_tile_into(frame, rect, &mut samples)
+                .expect("read in-memory tile");
+            Tile {
+                rect,
+                samples_per_pixel: spp,
+                samples,
+            }
+        })
+        .collect();
+    let mut cfg = ParamValues::new();
+    cfg.insert("levels".to_string(), ParamValue::Int(i64::from(levels)));
+    let cpu = Laplacian
+        .fuse(&TileCtx::new(rect, &tiles).with_coverage(&coverage), &cfg)
+        .expect("cpu fuse");
+    let gpu = fuse_tile_gpu(
+        shared,
+        &reader,
+        &FusionPipelines::new(),
+        frame_count,
+        rect,
+        spp,
+        levels,
+        &coverage,
+    )
+    .expect("gpu fuse_tile_gpu");
+
+    let uncovered = cpu.zmap.iter().filter(|&&z| z == NO_SOURCE).count();
+    assert!(
+        uncovered > 0,
+        "the corner block must leave pixels without a source"
+    );
+
+    // A pixel may differ only where the two best frames eligible there score
+    // within the near-tie bound.
+    let radius = score_radius(levels, 0);
+    let eligible: Vec<Vec<bool>> = coverage
+        .iter()
+        .map(|mask| {
+            let covered = mask.clone().expect("every frame carries a mask");
+            EligibleMasks::new(&covered, rect.width, rect.height, levels).levels[0].clone()
+        })
+        .collect();
+    let scores: Vec<Vec<f32>> = tiles
+        .iter()
+        .map(|tile| {
+            let pyr =
+                pyramid::build(&tile.samples, rect.width, rect.height, spp, levels).expect("build");
+            score_plane(&pyr.levels()[0], radius)
+        })
+        .collect();
+    let mut near_ties = std::collections::HashSet::new();
+    for (pixel, (&c, &g)) in cpu.zmap.iter().zip(&gpu.zmap).enumerate() {
+        if c == g {
+            continue;
+        }
+        let mut at: Vec<f32> = (0..frame_count)
+            .filter(|&f| eligible[f][pixel])
+            .map(|f| scores[f][pixel])
+            .collect();
+        at.sort_by(|a, b| b.partial_cmp(a).expect("scores are always finite"));
+        assert!(
+            at.len() >= 2 && at[0] - at[1] <= NEAR_TIE_REL * at[0],
+            "pixel {pixel} differs (gpu={g}, cpu={c}) but is not a proven near-tie among the \
+             eligible frames: {at:?}"
+        );
+        near_ties.insert(pixel);
+    }
+    println!(
+        "masked parity: {uncovered} pixels without a source, {} near-tie index(es)",
+        near_ties.len()
+    );
+
+    let worst = cpu
+        .tile
+        .samples
+        .chunks_exact(spp as usize)
+        .zip(gpu.tile.samples.chunks_exact(spp as usize))
+        .enumerate()
+        .filter(|(pixel, _)| !near_ties.contains(pixel))
+        .flat_map(|(_, (cpu, gpu))| cpu.iter().zip(gpu))
+        .map(|(&c, &g)| (i32::from(c) - i32::from(g)).abs())
+        .max()
+        .expect("a non-empty composite");
+    println!("masked composite parity: worst |delta|={worst} outside near-tie pixels");
+    assert!(worst <= 1, "composite parity exceeded 1 LSB: worst={worst}");
+}
+
+#[test]
+fn masked_fuse_with_full_coverage_matches_unmasked() {
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let (reader, rect, _) = masked_case();
+    let frame_count = reader.frames.len();
+    let pipelines = FusionPipelines::new();
+    let full = vec![Some(vec![true; (rect.width * rect.height) as usize]); frame_count];
+    let run = |coverage: &[Option<Vec<bool>>]| {
+        fuse_tile_gpu(
+            shared,
+            &reader,
+            &pipelines,
+            frame_count,
+            rect,
+            reader.spp,
+            5,
+            coverage,
+        )
+        .expect("gpu fuse_tile_gpu")
+    };
+    let unmasked = run(&[]);
+    let masked = run(&full);
+    assert_eq!(masked.tile.samples, unmasked.tile.samples);
+    assert_eq!(masked.zmap, unmasked.zmap);
 }
