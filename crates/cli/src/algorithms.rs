@@ -10,9 +10,11 @@
 //! through `focusforge_core::params::resolve_in(..., None, &host_facts)`. An
 //! `auto` hook is reported as present but unevaluated instead of being run.
 
+use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use focusforge_core::params::{ParamDesc, ParamKind, ParamValue, ParamValues, Provenance};
+use focusforge_core::project::{self, PROJECT_PARAMS};
 use focusforge_core::registry::{self, AlgorithmRef};
 use serde::Serialize;
 
@@ -21,10 +23,14 @@ use crate::set::{SetArgs, parse_settings};
 /// The frozen `algorithms --json` schema: one envelope for the listing and
 /// the single-id form (a one-element `algorithms` array). Additive only: a
 /// field added to `ParamDesc` appears in `params` without an edit here,
-/// because the descriptor is `#[serde(flatten)]`ed.
+/// because the descriptor is `#[serde(flatten)]`ed. `project_params` lists
+/// the run-level settings `stack --set` accepts beside an algorithm's own,
+/// with the default that holds unless a fusion method declares its own
+/// (`project_defaults` on that method's entry).
 #[derive(Serialize)]
 struct AlgorithmsReport<'a> {
     algorithms: Vec<AlgorithmReport<'a>>,
+    project_params: Vec<ParamReport<'a>>,
 }
 
 #[derive(Serialize)]
@@ -33,6 +39,10 @@ struct AlgorithmReport<'a> {
     display_name: String,
     family: String,
     params: Vec<ParamReport<'a>>,
+    /// The default of every project setting in a run fused by this method;
+    /// absent for an alignment algorithm, which no run is fused by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_defaults: Option<BTreeMap<String, ParamValue>>,
 }
 
 #[derive(Serialize)]
@@ -93,7 +103,10 @@ pub fn run(id: Option<&str>, json: bool, set: &SetArgs) -> ExitCode {
     } else if id.is_some() {
         println!("{}", render_schema(&report.algorithms[0]));
     } else {
-        println!("{}", render_listing(&report.algorithms));
+        println!(
+            "{}",
+            render_listing(&report.algorithms, &report.project_params)
+        );
     }
 
     ExitCode::SUCCESS
@@ -119,6 +132,15 @@ fn build_report(
                 id: entry.id().to_string(),
                 display_name: entry.display_name().to_string(),
                 family: entry.family().to_string(),
+                project_defaults: match entry {
+                    AlgorithmRef::Stack(method) => Some(
+                        project::params_for(*method)
+                            .into_iter()
+                            .map(|desc| (desc.id, desc.default))
+                            .collect(),
+                    ),
+                    AlgorithmRef::Align(_) => None,
+                },
                 params: entry
                     .params()
                     .iter()
@@ -136,28 +158,51 @@ fn build_report(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(AlgorithmsReport { algorithms })
+    let project_params = PROJECT_PARAMS
+        .iter()
+        .map(|desc| ParamReport {
+            desc,
+            has_auto: false,
+            has_host_default: false,
+            value: desc.default.clone(),
+            provenance: Provenance::Default,
+        })
+        .collect();
+    Ok(AlgorithmsReport {
+        algorithms,
+        project_params,
+    })
 }
 
-/// One line per registered algorithm (id, display name, family), or the
-/// literal line `no algorithms registered` when nothing is registered.
-/// Returns a `String` so the empty case is unit-testable without capturing
-/// stdout.
-fn render_listing(algorithms: &[AlgorithmReport<'_>]) -> String {
+/// One line per registered algorithm (id, display name, family), then the
+/// project settings `stack --set` also accepts, or the literal line `no
+/// algorithms registered` when nothing is registered. Returns a `String` so
+/// the empty case is unit-testable without capturing stdout.
+fn render_listing(algorithms: &[AlgorithmReport<'_>], project: &[ParamReport<'_>]) -> String {
     if algorithms.is_empty() {
         return "no algorithms registered".to_string();
     }
-    algorithms
+    let mut lines: Vec<String> = algorithms
         .iter()
         .map(|a| format!("{} - {} ({})", a.id, a.display_name, a.family))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    if !project.is_empty() {
+        lines.push(String::new());
+        lines.push("project settings (stack --set):".to_string());
+        lines.extend(
+            project
+                .iter()
+                .map(|p| format!("  {} - {}", p.desc.id, p.desc.label)),
+        );
+    }
+    lines.join("\n")
 }
 
 /// One block per parameter: kind (range or variants), default, the resolved
-/// value/provenance pair, and whether an `auto` hook exists. `has_auto` is
-/// reported as `auto: present, not evaluated` or `auto: none` — never as a
-/// resolved value, since no `auto` hook is ever invoked here.
+/// value/provenance pair, its help sentence on its own line, and whether an
+/// `auto` hook exists. `has_auto` is reported as `auto: present, not
+/// evaluated` or `auto: none` — never as a resolved value, since no `auto`
+/// hook is ever invoked here.
 fn render_schema(algo: &AlgorithmReport<'_>) -> String {
     let mut lines = vec![format!(
         "{} - {} ({})",
@@ -172,6 +217,7 @@ fn render_schema(algo: &AlgorithmReport<'_>) -> String {
             serde_json::to_string(&p.value).unwrap_or_else(|_| "?".to_string()),
             p.provenance,
         ));
+        lines.push(format!("    {}", p.desc.help));
         lines.push(format!(
             "    auto: {}",
             if p.has_auto {
@@ -183,6 +229,15 @@ fn render_schema(algo: &AlgorithmReport<'_>) -> String {
         if p.has_host_default {
             lines.push("    host default: present, evaluated".to_string());
         }
+    }
+    if let Some(defaults) = &algo.project_defaults {
+        lines.push("  project settings default:".to_string());
+        lines.extend(defaults.iter().map(|(id, value)| {
+            format!(
+                "    {id}: {}",
+                serde_json::to_string(value).unwrap_or_else(|_| "?".to_string())
+            )
+        }));
     }
     lines.join("\n")
 }
@@ -222,13 +277,16 @@ mod tests {
 
     #[test]
     fn empty_listing_renders_the_placeholder_line() {
-        assert_eq!(render_listing(&[]), "no algorithms registered");
+        assert_eq!(render_listing(&[], &[]), "no algorithms registered");
     }
 
     #[test]
     fn empty_listing_serializes_to_an_empty_array() {
-        let report = AlgorithmsReport { algorithms: vec![] };
+        let report = AlgorithmsReport {
+            algorithms: vec![],
+            project_params: vec![],
+        };
         let json = serde_json::to_string(&report).unwrap();
-        assert_eq!(json, r#"{"algorithms":[]}"#);
+        assert_eq!(json, r#"{"algorithms":[],"project_params":[]}"#);
     }
 }

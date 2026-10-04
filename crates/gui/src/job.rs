@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use focusforge_core::algorithm::{AlignAlgorithm, AlignStatus, StackAlgorithm};
 use focusforge_core::align::WarpingReader;
+use focusforge_core::equalize::GainReader;
 use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{
     COMPOSITE_FILENAME, FrameError, FrameReader, ZMAP_FILENAME, open_frame_set,
@@ -37,6 +38,7 @@ use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader, ZMapWriter};
 /// Re-exported so `crate::controller` -- which names no algorithm crate --
 /// can hold and drive these through the `job::` path alone.
 pub use focusforge_core::align::{Registration, Transform};
+pub use focusforge_core::equalize::UNIT_GAIN;
 pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 pub use focusforge_core::project::Op;
@@ -137,6 +139,8 @@ pub struct JobRequest {
     pub align_values: ParamValues,
     pub align_lax: bool,
     pub crop: bool,
+    /// The gain bound brightness equalization runs with, `None` when off.
+    pub equalize: Option<f64>,
     /// Whether this run may use the headless GPU backend at all -- resolved
     /// against the real device only inside [`spawn`], on the worker thread,
     /// never here.
@@ -256,6 +260,7 @@ pub fn spawn(
             explicit: request.fuse_values,
             align,
             crop: request.crop,
+            equalize: request.equalize,
             tile_size: None,
             max_host_memory: None,
             backend,
@@ -308,6 +313,8 @@ pub struct GuiObserver {
     /// [`resolve_backend`]'s own account of this run's processing backend,
     /// set once from the worker thread before the pipeline starts.
     backend_line: Mutex<Option<String>>,
+    /// Every [`StageObserver::notice`] the run raised, in order.
+    notices: Mutex<Vec<String>>,
     /// Where the align backend names the adapter once a level opens it; unset
     /// for a run with no accelerator on offer.
     align_adapter: OnceLock<&'static OnceLock<String>>,
@@ -322,9 +329,18 @@ impl GuiObserver {
             pause_gate: Mutex::new(false),
             condvar: Condvar::new(),
             backend_line: Mutex::new(None),
+            notices: Mutex::new(Vec::new()),
             align_adapter: OnceLock::new(),
             rerun_reason: Mutex::new(None),
         }
+    }
+
+    /// The notices the pipeline raised so far, in order.
+    pub fn notices(&self) -> Vec<String> {
+        self.notices
+            .lock()
+            .expect("no thread panicked while holding the notices lock")
+            .clone()
     }
 
     /// Why the align stage reran on the CPU after its accelerator failed;
@@ -388,13 +404,20 @@ impl StageObserver for GuiObserver {
 
     fn notice(&self, message: &str) {
         tracing::warn!("{message}");
+        // The CPU rerun reaches the user through the alignment toast, so it
+        // stays out of the run's own notice list.
         if let Some(reason) = message.strip_suffix(pipeline::ALIGN_RERUN_NOTICE) {
             *self
                 .rerun_reason
                 .lock()
                 .expect("no thread panicked while holding the rerun lock") =
                 Some(reason.to_string());
+            return;
         }
+        self.notices
+            .lock()
+            .expect("no thread panicked while holding the notices lock")
+            .push(message.to_string());
     }
 
     fn tick(&self, progress: &JobProgress) {
@@ -1035,7 +1058,8 @@ impl EditState {
         let frame = self.sources.dimensions();
         let samples_per_pixel = self.sources.frame(0).samples_per_pixel;
         let transforms = self.registration.transforms(self.sources.len());
-        let warped = WarpingReader::new(&*self.sources, frame, samples_per_pixel, transforms);
+        let gained = GainReader::new(&*self.sources, self.registration.gains());
+        let warped = WarpingReader::new(&gained, frame, samples_per_pixel, transforms);
         let sources = Sources {
             reader: &warped,
             frame_count: self.sources.len() as u32,

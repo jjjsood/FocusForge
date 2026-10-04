@@ -129,5 +129,5 @@ focusforge-cli stack path/to/frames/ --algo laplacian --no-align
 `--no-align` fuses the raw frames unwarped; `--no-crop` keeps alignment on
 but leaves the output at the full frame extent instead of cropping to the
 common region. In the window the same two choices are the **Enabled** switch
-and **Auto-crop** (see [`guide/gui.md`](gui.md#aligning-in-the-window)). See [`reference/cli.md`](../reference/cli.md#stack) for every
+and **Auto-crop** (see [`guide/gui.md`](gui.md#settings)). See [`reference/cli.md`](../reference/cli.md#stack) for every
 `stack` and `align` flag.

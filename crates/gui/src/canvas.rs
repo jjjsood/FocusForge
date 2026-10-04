@@ -19,6 +19,7 @@ use focusforge_core::TiffError;
 use focusforge_core::algorithm::{AlgorithmError, read_tile_step_into};
 use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::display::alpha_from_opacity;
+use focusforge_core::equalize::GainReader;
 use focusforge_core::io::{FrameError, FrameReader, TiffStack, open_frame_set};
 use focusforge_core::retouch::{RetouchError, Sources, recomposite as recomposite_region};
 use focusforge_core::tile::{HostBudget, Rect};
@@ -112,12 +113,14 @@ pub fn check_pane_dimensions(composite: (u32, u32), zmap: (u32, u32)) -> Result<
 }
 
 /// A frame's reference-to-frame [`Transform`], crop origin and composite
-/// extent, as recorded by the fuse. [`FrameSource::read_into`] warps every
-/// read through this so the left pane lines up with the composite. `None`
-/// means the raw frame, read through identity at `(0, 0)`.
+/// extent and equalization gain (Q16, unit when the run was not equalized),
+/// as recorded by the fuse. [`FrameSource::read_into`] warps every read
+/// through this so the left pane lines up with the composite. `None` means
+/// the raw frame, read through identity at `(0, 0)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameView {
     pub transform: Transform,
+    pub gain: u32,
     pub origin: (u32, u32),
     pub extent: (u32, u32),
 }
@@ -226,8 +229,10 @@ fn read_warped(
         return reader.read_tile_step_into(0, rect, step, samples_per_pixel, out);
     };
     let (transform, origin) = (view.transform, view.origin);
+    let gains = [view.gain];
+    let gained = GainReader::new(reader, &gains);
     let warped = WarpingReader::new(
-        reader,
+        &gained,
         reader.dimensions(),
         samples_per_pixel,
         vec![transform],

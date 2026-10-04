@@ -136,6 +136,11 @@ pub struct ParamDesc {
     pub help: String,
     pub kind: ParamKind,
     pub default: ParamValue,
+    /// Whether a front end may keep this setting out of its first view. A
+    /// real stack schema declares at most one parameter with
+    /// `advanced == false`.
+    #[serde(default)]
+    pub advanced: bool,
     /// Not data, so never serialized: dropped to `None` on deserialize.
     #[serde(skip)]
     pub auto: Option<AutoFn>,
@@ -154,6 +159,7 @@ impl fmt::Debug for ParamDesc {
             .field("help", &self.help)
             .field("kind", &self.kind)
             .field("default", &self.default)
+            .field("advanced", &self.advanced)
             .field("auto", &self.auto.as_ref().map(|_| "..."))
             .field("host_default", &self.host_default.as_ref().map(|_| "..."))
             .finish()
@@ -167,6 +173,7 @@ impl PartialEq for ParamDesc {
             && self.help == other.help
             && self.kind == other.kind
             && self.default == other.default
+            && self.advanced == other.advanced
     }
 }
 
@@ -538,6 +545,7 @@ mod tests {
                 logarithmic: false,
             },
             default: ParamValue::Float(default),
+            advanced: false,
             auto: None,
             host_default: None,
         }
@@ -550,6 +558,7 @@ mod tests {
             help: format!("{id} help"),
             kind: ParamKind::Int { min, max },
             default: ParamValue::Int(default),
+            advanced: false,
             auto: None,
             host_default: None,
         }
@@ -562,6 +571,7 @@ mod tests {
             help: format!("{id} help"),
             kind: ParamKind::Bool,
             default: ParamValue::Bool(default),
+            advanced: false,
             auto: None,
             host_default: None,
         }
@@ -582,6 +592,7 @@ mod tests {
                     .collect(),
             },
             default: ParamValue::Enum(default.to_string()),
+            advanced: false,
             auto: None,
             host_default: None,
         }

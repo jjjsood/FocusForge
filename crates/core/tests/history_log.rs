@@ -166,6 +166,7 @@ fn sealed_with_align_and_crop(name: &str) -> (PathBuf, PathBuf, Vec<PathBuf>) {
         registration: Registration {
             transforms,
             crop: Some(full(10, 8)),
+            equalization: None,
         },
         composite_description: "staged composite".to_string(),
         label: None,

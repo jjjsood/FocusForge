@@ -54,6 +54,7 @@ export component FFDock inherits Rectangle {
     callback settings-algorithm-selected(string, string);
     callback settings-reset-all();
     callback settings-menu-toggled(string, string);
+    callback settings-more-toggled(string);
     callback settings-scrolled(length);
     callback settings-scrollbar-pointer(int, length);
     callback settings-scrollbar-dragged(length);
@@ -152,6 +153,7 @@ export component FFDock inherits Rectangle {
         algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
         reset-all => { root.settings-reset-all(); }
         menu-toggled(section, id) => { root.settings-menu-toggled(section, id); }
+        more-toggled(section) => { root.settings-more-toggled(section); }
         scrolled(delta) => { root.settings-scrolled(delta); }
         scrollbar-pointer(kind, y) => { root.settings-scrollbar-pointer(kind, y); }
         scrollbar-dragged(y) => { root.settings-scrollbar-dragged(y); }

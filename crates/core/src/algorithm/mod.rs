@@ -17,11 +17,14 @@
 mod error;
 
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::gpu::AlignBackend;
 pub use crate::params::StackContext;
 use crate::params::{ParamDesc, ParamValue, ParamValues};
-use crate::tile::{Rect, Tile};
+use crate::tile::plan::TileSupport;
+use crate::tile::{FramePreprocess, Rect, Tile};
+use crate::timing::{TimingCounter, record_timing};
 
 pub use error::AlgorithmError;
 
@@ -46,16 +49,29 @@ pub struct TileOutput {
 /// The per-tile view across every frame of a stack that
 /// [`StackAlgorithm::fuse`] reads from.
 ///
-/// Opaque on purpose: today's backing is a materialized slice of
-/// already-read [`Tile`]s, and a future scheduler may swap it for memmap'd
-/// scratch or a streaming source without touching a single algorithm body,
-/// because every call site below is identical either way. The field is
-/// named `tiles`, not `frames` -- these are frame-*tiles*, and [`Tile`]
-/// itself carries no frame index, so this context is what supplies one by
-/// position.
+/// A visitor, not random access: [`Self::for_each_frame`] hands every frame's
+/// tile to a callback in ascending frame order. [`Self::new`] borrows
+/// frame-tiles that were already read; [`Self::on_demand`] reads each frame
+/// from a [`TileReader`] only when the visitor reaches it, into one reused
+/// buffer, so a method with running accumulators fuses an N-frame stack in the
+/// memory of one frame-tile. [`Tile`] carries no frame index.
 pub struct TileCtx<'a> {
     rect: Rect,
-    tiles: &'a [Tile],
+    backing: Backing<'a>,
+    frames_read: AtomicUsize,
+}
+
+enum Backing<'a> {
+    Resident {
+        tiles: &'a [Tile],
+        coverage: &'a [Option<Vec<bool>>],
+    },
+    OnDemand {
+        frame_count: usize,
+        samples_per_pixel: u32,
+        reader: &'a dyn TileReader,
+        preprocess: &'a dyn FramePreprocess,
+    },
 }
 
 impl<'a> TileCtx<'a> {
@@ -70,7 +86,55 @@ impl<'a> TileCtx<'a> {
             tiles.iter().all(|tile| tile.rect == rect),
             "every frame-tile handed to TileCtx::new must cover the same rect"
         );
-        TileCtx { rect, tiles }
+        TileCtx {
+            rect,
+            backing: Backing::Resident {
+                tiles,
+                coverage: &[],
+            },
+            frames_read: AtomicUsize::new(0),
+        }
+    }
+
+    /// A context that reads `frame_count` frames of `rect` from `reader` as
+    /// the visitor reaches them, runs `preprocess` over each, and reports the
+    /// reader's per-frame coverage. `samples_per_pixel` sizes the one tile
+    /// buffer.
+    pub fn on_demand(
+        rect: Rect,
+        frame_count: usize,
+        samples_per_pixel: u32,
+        reader: &'a dyn TileReader,
+        preprocess: &'a dyn FramePreprocess,
+    ) -> Self {
+        TileCtx {
+            rect,
+            backing: Backing::OnDemand {
+                frame_count,
+                samples_per_pixel,
+                reader,
+                preprocess,
+            },
+            frames_read: AtomicUsize::new(0),
+        }
+    }
+
+    /// Attaches per-frame coverage masks to a context built by [`Self::new`],
+    /// index == frame index. `None` (or a frame past the end of `coverage`)
+    /// means the frame has a real sample at every pixel.
+    pub fn with_coverage(mut self, coverage: &'a [Option<Vec<bool>>]) -> Self {
+        debug_assert!(
+            coverage
+                .iter()
+                .flatten()
+                .all(|mask| { mask.len() == self.rect.width as usize * self.rect.height as usize }),
+            "every coverage mask must have one entry per pixel of the tile rect"
+        );
+        let Backing::Resident { coverage: slot, .. } = &mut self.backing else {
+            unreachable!("with_coverage follows TileCtx::new, which builds a resident backing");
+        };
+        *slot = coverage;
+        self
     }
 
     pub fn rect(&self) -> Rect {
@@ -78,16 +142,86 @@ impl<'a> TileCtx<'a> {
     }
 
     pub fn frame_count(&self) -> usize {
-        self.tiles.len()
+        match &self.backing {
+            Backing::Resident { tiles, .. } => tiles.len(),
+            Backing::OnDemand { frame_count, .. } => *frame_count,
+        }
     }
 
-    /// The tile for frame `i`. A `Result`, not an `Option`, so an
-    /// algorithm's `?` carries the failure straight out unchanged.
-    pub fn frame(&self, i: usize) -> Result<&Tile, AlgorithmError> {
-        self.tiles.get(i).ok_or(AlgorithmError::FrameOutOfRange {
-            frame: i,
-            frame_count: self.tiles.len(),
-        })
+    /// Samples per pixel of the stack's frames. A `Result`, so an
+    /// algorithm's `?` carries the failure straight out unchanged: a context
+    /// with no frames is [`AlgorithmError::FrameOutOfRange`] for frame 0.
+    pub fn samples_per_pixel(&self) -> Result<u32, AlgorithmError> {
+        let empty = AlgorithmError::FrameOutOfRange {
+            frame: 0,
+            frame_count: 0,
+        };
+        match &self.backing {
+            Backing::Resident { tiles, .. } => tiles
+                .first()
+                .map(|tile| tile.samples_per_pixel)
+                .ok_or(empty),
+            Backing::OnDemand {
+                frame_count,
+                samples_per_pixel,
+                ..
+            } => (*frame_count > 0)
+                .then_some(*samples_per_pixel)
+                .ok_or(empty),
+        }
+    }
+
+    /// Calls `visit(frame, tile, coverage)` for every frame in ascending
+    /// order and stops at the first error. `coverage` is the frame's mask
+    /// over [`Self::rect`], `None` when the frame is covered everywhere. The
+    /// tile and mask are only valid for the call; an on-demand context
+    /// overwrites the same tile buffer for the next frame.
+    pub fn for_each_frame(
+        &self,
+        mut visit: impl FnMut(usize, &Tile, Option<&[bool]>) -> Result<(), AlgorithmError>,
+    ) -> Result<(), AlgorithmError> {
+        match &self.backing {
+            Backing::Resident { tiles, coverage } => {
+                for (f, tile) in tiles.iter().enumerate() {
+                    self.frames_read.fetch_add(1, Ordering::Relaxed);
+                    visit(f, tile, coverage.get(f).and_then(|mask| mask.as_deref()))?;
+                }
+            }
+            Backing::OnDemand {
+                frame_count,
+                samples_per_pixel,
+                reader,
+                preprocess,
+            } => {
+                let len = self.rect.width as usize
+                    * self.rect.height as usize
+                    * *samples_per_pixel as usize;
+                let mut tile = Tile {
+                    rect: self.rect,
+                    samples_per_pixel: *samples_per_pixel,
+                    samples: vec![0; len],
+                };
+                record_timing(
+                    TimingCounter::AllocationBytes,
+                    (tile.samples.capacity() * std::mem::size_of::<u16>()) as u64,
+                );
+                record_timing(TimingCounter::AllocationOperations, 1);
+                for f in 0..*frame_count {
+                    let coverage =
+                        reader.read_tile_coverage_into(f, self.rect, &mut tile.samples)?;
+                    self.frames_read.fetch_add(1, Ordering::Relaxed);
+                    preprocess.preprocess(f, &mut tile)?;
+                    visit(f, &tile, coverage.as_deref())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// How many frame-tiles [`Self::for_each_frame`] has produced so far,
+    /// across every call.
+    pub fn frames_read(&self) -> usize {
+        self.frames_read.load(Ordering::Relaxed)
     }
 }
 
@@ -107,6 +241,21 @@ pub trait TileReader: Send + Sync {
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), AlgorithmError>;
+
+    /// [`Self::read_tile_into`], also returning which pixels of `rect` carry
+    /// real samples. `None` means every pixel does; a reader that can leave
+    /// pixels without a source (a warp reaching past the frame) returns the
+    /// per-pixel mask, row-major, `rect.width * rect.height` long. Uncovered
+    /// pixels read as zero in `out`.
+    fn read_tile_coverage_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<Option<Vec<bool>>, AlgorithmError> {
+        self.read_tile_into(frame, rect, out)?;
+        Ok(None)
+    }
 
     /// The heap bytes one [`Self::read_tile_into`] of a `width x height` rect
     /// allocates besides `out`: decode buffers, warp sources and the like.
@@ -299,37 +448,50 @@ pub trait StackAlgorithm: Send + Sync + 'static {
         false
     }
 
-    /// How many pyramid levels the tile scheduler must size its read-rect
-    /// margin for, given this algorithm's fully resolved `cfg`
-    /// (`crate::params::resolve` plus `crate::params::resolved_values`,
-    /// same as `fuse` receives). The CLI asks every algorithm this question
-    /// and feeds the answer straight into
-    /// `crate::tile::TileSchedulerOptions::levels`.
+    /// Whether this algorithm is a specialist choice: front ends list it after
+    /// the others. The registry default is never advanced.
+    fn advanced(&self) -> bool {
+        false
+    }
+
+    /// Defaults this method sets for run-level parameters
+    /// (`crate::project::PROJECT_PARAMS`) where the shared default does not
+    /// suit it, as `(parameter id, default)` pairs. Read through
+    /// `crate::project::params_for`, never directly: that is the one place a
+    /// project parameter's effective default is computed.
+    fn project_defaults(&self) -> &[(&'static str, ParamValue)] {
+        &[]
+    }
+
+    /// What the tile scheduler must plan around a tile for this algorithm's
+    /// fully resolved `cfg` (`crate::params::resolve` plus
+    /// `crate::params::resolved_values`, same as `fuse` receives): the pixel
+    /// reach of its output and its decimation depth. The caller applies it
+    /// with `crate::tile::TileSchedulerOptions::apply_support`.
     ///
-    /// The default reads the well-known key `"levels"` out of `cfg` and
-    /// returns it verbatim, or `0` if `cfg` has no such key. This is exactly
-    /// right for the two cases that matter:
-    ///
-    /// 1. **An algorithm with no pyramid at all** never declares a `"levels"`
-    ///    parameter, so `cfg` (which `crate::params::resolve` fills with
-    ///    exactly one entry per *declared* parameter, nothing else) never
-    ///    carries that key -- the default answers `0`, i.e. no margin, with
-    ///    no work from the algorithm's author. (Weighted Average and the
-    ///    Depth Map override it with a margin derived from their radii.)
-    /// 2. **An algorithm that does build a pyramid and spells its depth
-    ///    parameter `"levels"`** (`laplacian` does) gets the right answer
-    ///    from this same default, reading the identical resolved map `fuse`
-    ///    itself reads its own `"levels"` entry from -- the same number from
-    ///    the same place, which is the whole point: `fuse`'s pyramid depth
-    ///    and the scheduler's margin remain synchronized.
-    ///
-    /// Algorithms whose depth parameter is not `"levels"`, or whose margin
-    /// differs from the pyramid depth, override this method.
-    fn tile_levels(&self, cfg: &ParamValues) -> u32 {
-        cfg.get("levels")
-            .and_then(ParamValue::as_i64)
-            .map(|levels| levels.max(0) as u32)
-            .unwrap_or(0)
+    /// The default reads the well-known key `"levels"` out of `cfg` as the
+    /// decimation depth, with no reach beyond the pyramid margin, or `0` if
+    /// `cfg` has no such key: an algorithm with no pyramid declares no
+    /// `"levels"` parameter and plans no margin, and one that spells its
+    /// depth `"levels"` stays synchronized with `fuse`, which reads the same
+    /// resolved map. Algorithms with a reach of their own override this.
+    fn tile_support(&self, cfg: &ParamValues) -> TileSupport {
+        TileSupport::from(
+            cfg.get("levels")
+                .and_then(ParamValue::as_i64)
+                .map(|levels| levels.max(0) as u32)
+                .unwrap_or(0),
+        )
+    }
+
+    /// Heap bytes per pixel of the read rect that one `fuse` call keeps live
+    /// beyond the frame-tile and coverage mask the scheduler already counts:
+    /// accumulators, per-frame planes and output, for `samples_per_pixel`
+    /// samples per pixel and the resolved `cfg`. The scheduler adds this to
+    /// its per-tile bytes. The default of 0 suits an algorithm that
+    /// allocates nothing of its own.
+    fn working_bytes_per_pixel(&self, _cfg: &ParamValues, _samples_per_pixel: u32) -> u64 {
+        0
     }
 }
 
@@ -512,6 +674,7 @@ mod tests {
                     logarithmic: false,
                 },
                 default: ParamValue::Float(0.0),
+                advanced: false,
                 auto: Some(Arc::new(|ctx: &StackContext| {
                     ParamValue::Float(ctx.frame_count as f64)
                 })),
@@ -534,6 +697,7 @@ mod tests {
                     ],
                 },
                 default: ParamValue::Enum("fast".to_string()),
+                advanced: false,
                 auto: None,
                 host_default: None,
             },
@@ -573,7 +737,15 @@ mod tests {
 
         fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError> {
             crate::params::validate(self.params(), cfg)?;
-            let tile = ctx.frame(0)?.clone();
+            ctx.samples_per_pixel()?;
+            let mut first = None;
+            ctx.for_each_frame(|f, tile, _| {
+                if f == 0 {
+                    first = Some(tile.clone());
+                }
+                Ok(())
+            })?;
+            let tile = first.expect("a context with a frame 0 visits it");
             let zmap = vec![0u16; (tile.rect.width * tile.rect.height) as usize];
             Ok(TileOutput { tile, zmap })
         }
@@ -845,24 +1017,155 @@ mod tests {
     }
 
     #[test]
-    fn frame_out_of_range_names_the_index_and_the_count() {
-        let (rect, tiles) = sample_tiles(3, 2, 2);
-        let ctx = TileCtx::new(rect, &tiles);
-
-        assert!(ctx.frame(2).is_ok());
-        let err = ctx.frame(3).expect_err("frame 3 of 3 must be out of range");
+    fn an_empty_context_has_no_samples_per_pixel() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let empty = TileCtx::new(rect, &[]);
+        let err = empty
+            .samples_per_pixel()
+            .expect_err("an empty context has no frame 0");
         assert!(matches!(
             err,
             AlgorithmError::FrameOutOfRange {
-                frame: 3,
-                frame_count: 3
+                frame: 0,
+                frame_count: 0
             }
         ));
-        let rendered = err.to_string();
-        assert!(
-            rendered.contains('3'),
-            "message must name the index: {rendered}"
+
+        let (rect, tiles) = sample_tiles(3, 2, 2);
+        assert_eq!(TileCtx::new(rect, &tiles).samples_per_pixel().unwrap(), 3);
+    }
+
+    /// Serves frame `f` as `f + 1 + (offset within the rect)` and leaves the
+    /// pixel at row 1, column 2 of frame 1 uncovered.
+    struct MaskedReader;
+
+    impl TileReader for MaskedReader {
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [u16],
+        ) -> Result<(), AlgorithmError> {
+            for (i, sample) in out.iter_mut().enumerate() {
+                *sample = (frame * 1000 + rect.x as usize + rect.y as usize + i) as u16;
+            }
+            Ok(())
+        }
+
+        fn read_tile_coverage_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [u16],
+        ) -> Result<Option<Vec<bool>>, AlgorithmError> {
+            self.read_tile_into(frame, rect, out)?;
+            Ok((frame == 1).then(|| {
+                let mut mask = vec![true; rect.width as usize * rect.height as usize];
+                mask[rect.width as usize + 2] = false;
+                mask
+            }))
+        }
+    }
+
+    #[test]
+    fn on_demand_visits_every_frame_in_order_with_its_coverage() {
+        let rect = Rect {
+            x: 3,
+            y: 5,
+            width: 37,
+            height: 23,
+        };
+        let frame_count = 4;
+        let len = (rect.width * rect.height) as usize;
+
+        let tiles: Vec<Tile> = (0..frame_count)
+            .map(|f| {
+                let mut samples = vec![0u16; len];
+                MaskedReader.read_tile_into(f, rect, &mut samples).unwrap();
+                Tile {
+                    rect,
+                    samples_per_pixel: 1,
+                    samples,
+                }
+            })
+            .collect();
+        let coverage: Vec<Option<Vec<bool>>> = (0..frame_count)
+            .map(|f| {
+                MaskedReader
+                    .read_tile_coverage_into(f, rect, &mut vec![0u16; len])
+                    .unwrap()
+            })
+            .collect();
+        let resident = TileCtx::new(rect, &tiles).with_coverage(&coverage);
+        let on_demand = TileCtx::on_demand(
+            rect,
+            frame_count,
+            1,
+            &MaskedReader,
+            &crate::tile::NoopPreprocess,
         );
+        assert_eq!(on_demand.frame_count(), frame_count);
+        assert_eq!(on_demand.samples_per_pixel().unwrap(), 1);
+
+        type Seen = Vec<(usize, Vec<u16>, Option<Vec<bool>>)>;
+        let collect = |ctx: &TileCtx<'_>| -> (Seen, Vec<*const u16>) {
+            let mut seen = Seen::new();
+            let mut buffers = Vec::new();
+            ctx.for_each_frame(|f, tile, covered| {
+                assert_eq!(tile.rect, rect);
+                buffers.push(tile.samples.as_ptr());
+                seen.push((f, tile.samples.clone(), covered.map(<[bool]>::to_vec)));
+                Ok(())
+            })
+            .unwrap();
+            (seen, buffers)
+        };
+        let (expected, _) = collect(&resident);
+        let (streamed, buffers) = collect(&on_demand);
+
+        assert_eq!(streamed, expected);
+        assert_eq!(
+            streamed.iter().map(|(f, ..)| *f).collect::<Vec<_>>(),
+            (0..frame_count).collect::<Vec<_>>()
+        );
+        assert!(streamed[1].2.is_some() && streamed[0].2.is_none());
+        assert_eq!(on_demand.frames_read(), frame_count);
+        assert!(
+            buffers.iter().all(|&ptr| ptr == buffers[0]),
+            "one tile buffer serves every frame"
+        );
+    }
+
+    #[test]
+    fn a_visitor_error_stops_the_pass() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 3,
+        };
+        let ctx = TileCtx::on_demand(rect, 5, 1, &MaskedReader, &crate::tile::NoopPreprocess);
+        let mut visited = 0;
+        let err = ctx
+            .for_each_frame(|f, _, _| {
+                visited += 1;
+                if f == 2 {
+                    return Err(AlgorithmError::Failed {
+                        algorithm: "test".to_string(),
+                        detail: "stop".to_string(),
+                    });
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(err, AlgorithmError::Failed { .. }));
+        assert_eq!(visited, 3);
+        assert_eq!(ctx.frames_read(), 3);
     }
 
     #[test]
@@ -909,20 +1212,20 @@ mod tests {
     }
 
     #[test]
-    fn tile_levels_default_is_zero_when_the_schema_declares_no_levels_key() {
+    fn tile_support_default_is_zero_when_the_schema_declares_no_levels_key() {
         // `DummyStack`'s schema is `count-based-threshold` + `mode`, never
         // `levels`, so the resolved map never carries that key -- the
         // default answers "no pyramid, no margin".
         let algo = DummyStack::new();
-        assert_eq!(algo.tile_levels(&ParamValues::new()), 0);
+        assert_eq!(algo.tile_support(&ParamValues::new()), TileSupport::from(0));
     }
 
     #[test]
-    fn tile_levels_default_reads_the_levels_key_when_present() {
+    fn tile_support_default_reads_the_levels_key_when_present() {
         let algo = DummyStack::new();
         let mut cfg = ParamValues::new();
         cfg.insert("levels".to_string(), ParamValue::Int(7));
-        assert_eq!(algo.tile_levels(&cfg), 7);
+        assert_eq!(algo.tile_support(&cfg), TileSupport::from(7));
     }
 
     #[test]

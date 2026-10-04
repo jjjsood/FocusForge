@@ -54,16 +54,8 @@ pub enum TileError {
         min_tile_size: u32,
     },
 
-    /// Reading one frame's tile failed.
-    #[error("reading frame {frame} tile {rect:?}: {source}")]
-    Read {
-        frame: usize,
-        rect: Rect,
-        #[source]
-        source: AlgorithmError,
-    },
-
-    /// The consumer's `consume` call failed for a tile.
+    /// The consumer's `consume` call failed for a tile, including a failed
+    /// read of one of its frame-tiles.
     #[error("consumer failed for tile {rect:?}: {source}")]
     Consumer {
         rect: Rect,
@@ -98,21 +90,20 @@ pub enum TileError {
     CropBufferSize { expected: usize, got: usize },
 
     /// A host-derived, uncapped memory budget (`HostBudget::refuses_below_
-    /// one_tile_set`) is smaller than one tile set -- refused by name rather
+    /// one_tile`) is smaller than one tile -- refused by name rather
     /// than silently floored or deadlocked. An
     /// explicitly supplied budget or a `--max-host-memory` ceiling still
     /// floors at 1 and runs -- this variant is host-derived-only. The
     /// message deliberately does not name `--max-host-memory`, which only
     /// lowers the budget and can never fix this.
     #[error(
-        "the host-derived memory budget of {budget_bytes} B is smaller than one tile set \
-         ({bytes_per_tile_set} B for {frame_count} frames at tile_size {tile_size}); free \
-         memory on this machine, stack fewer frames, or use a smaller tile_size"
+        "the host-derived memory budget of {budget_bytes} B is smaller than one tile \
+         ({bytes_per_tile} B at tile_size {tile_size}); free memory on this machine or use a \
+         smaller tile_size"
     )]
     HostMemoryTooSmall {
         budget_bytes: u64,
-        bytes_per_tile_set: u64,
-        frame_count: usize,
+        bytes_per_tile: u64,
         tile_size: u32,
     },
 }

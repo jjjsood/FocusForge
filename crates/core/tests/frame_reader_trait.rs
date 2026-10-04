@@ -193,16 +193,22 @@ impl StackAlgorithm for SourceSelector {
 
     fn fuse(&self, ctx: &TileCtx<'_>, _: &ParamValues) -> Result<TileOutput, AlgorithmError> {
         let rect = ctx.rect();
-        let spp = ctx.frame(0)?.samples_per_pixel as usize;
+        let spp = ctx.samples_per_pixel()? as usize;
         let mut samples = vec![0; rect.width as usize * rect.height as usize * spp];
         let mut zmap = Vec::with_capacity(rect.width as usize * rect.height as usize);
         for pixel in 0..rect.width as usize * rect.height as usize {
             let source = (rect.x as usize + pixel % rect.width as usize) % ctx.frame_count();
-            let start = pixel * spp;
-            samples[start..start + spp]
-                .copy_from_slice(&ctx.frame(source)?.samples[start..start + spp]);
             zmap.push(source as u16);
         }
+        ctx.for_each_frame(|f, tile, _| {
+            for (pixel, &source) in zmap.iter().enumerate() {
+                if source as usize == f {
+                    let start = pixel * spp;
+                    samples[start..start + spp].copy_from_slice(&tile.samples[start..start + spp]);
+                }
+            }
+            Ok(())
+        })?;
         Ok(TileOutput {
             tile: Tile {
                 rect,

@@ -139,6 +139,16 @@ impl AlgorithmRef {
             AlgorithmRef::Align(a) => a.is_default(),
         }
     }
+
+    /// Whether this algorithm is a specialist choice: front ends list it after
+    /// the others. Alignment algorithms are never advanced as a whole; their
+    /// parameters carry the flag.
+    pub fn advanced(&self) -> bool {
+        match self {
+            AlgorithmRef::Stack(a) => a.advanced(),
+            AlgorithmRef::Align(_) => false,
+        }
+    }
 }
 
 /// The algorithm of `family` to use when a caller names none: among the

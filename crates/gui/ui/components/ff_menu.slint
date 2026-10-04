@@ -15,6 +15,8 @@ export component FFMenu inherits Rectangle {
     in property <string> selected: "";
     in property <bool> open: false;
     in property <bool> disabled: false;
+    // Sits on a tint as light as its own field: draws the base surface.
+    in property <bool> recessed: false;
     // A caller that stacks several menus in a paint-ordered list (so a
     // later sibling would otherwise be drawn over this one's open list)
     // draws the list itself, over everything, and sets this so this
@@ -34,6 +36,7 @@ export component FFMenu inherits Rectangle {
         text: root.label;
         focused: root.open;
         disabled: root.disabled;
+        recessed: root.recessed;
     }
 
     chevron := Text {

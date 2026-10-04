@@ -19,8 +19,10 @@ use focusforge_core::algorithm::{
 };
 use focusforge_core::align::warp::WarpedTile;
 use focusforge_core::align::{AlignError, Transform};
+use focusforge_core::equalize::UNIT_GAIN;
 use focusforge_core::fuse::laplacian::Laplacian;
 use focusforge_core::gpu::{BackendInfo, TileBackend};
+use focusforge_core::io::{TiffSpec, TiffWriter};
 use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage, StageCache};
 use focusforge_core::params::{ParamDesc, ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{
@@ -30,6 +32,7 @@ use focusforge_core::pipeline::{
 use focusforge_core::project::{self, Project};
 use focusforge_core::registry;
 use focusforge_core::tile::{Rect, Tile, TileError};
+use focusforge_core::zmap::ZMapReader;
 
 fn mantis_frames(count: usize) -> Vec<PathBuf> {
     let dir = common::mantis_512_dir().join("frames");
@@ -73,6 +76,7 @@ fn base_request(label: &str, frames: Vec<PathBuf>, explicit: ParamValues) -> Fus
         explicit,
         align: None,
         crop: false,
+        equalize: None,
         tile_size: Some(448),
         max_host_memory: None,
         backend: None,
@@ -1060,9 +1064,15 @@ fn the_host_cap_sets_the_alignment_workers_but_not_the_alignment() {
 // ---------------------------------------------------------------------
 
 /// A host-fusion [`TileBackend`] that accepts read rects up to `cap` pixels
-/// on a side.
+/// on a side. With a `shortfall` it reports that message for every tile it is
+/// asked about and fails any fuse call, so a run that reaches it is a bug;
+/// `asked` records the rects it was asked about.
 struct CappedBackend {
     cap: u32,
+    shortfall: Option<String>,
+    asked: Mutex<Vec<(u32, u32)>>,
+    /// Reports the device as lost, so every tile finishes on the host.
+    lost: bool,
 }
 
 impl TileBackend for CappedBackend {
@@ -1077,6 +1087,22 @@ impl TileBackend for CappedBackend {
 
     fn max_tile_size(&self, _samples_per_pixel: u32) -> u32 {
         self.cap
+    }
+
+    fn device_lost(&self) -> bool {
+        self.lost
+    }
+
+    fn tile_budget_shortfall(
+        &self,
+        width: u32,
+        height: u32,
+        _samples_per_pixel: u32,
+        _levels: u32,
+        _transforms: &[Transform],
+    ) -> Option<String> {
+        self.asked.lock().unwrap().push((width, height));
+        self.shortfall.clone()
     }
 
     fn self_check(
@@ -1123,6 +1149,10 @@ impl TileBackend for CappedBackend {
         levels: u32,
     ) -> Result<TileOutput, AlgorithmError> {
         assert!(
+            self.shortfall.is_none(),
+            "a backend that reports a shortfall must never fuse"
+        );
+        assert!(
             rect.width <= self.cap && rect.height <= self.cap,
             "a read rect of {}x{} exceeds the backend's cap of {}",
             rect.width,
@@ -1147,8 +1177,29 @@ impl TileBackend for CappedBackend {
     }
 }
 
+fn leaked_backend(cap: u32, shortfall: Option<&str>) -> &'static CappedBackend {
+    Box::leak(Box::new(CappedBackend {
+        cap,
+        shortfall: shortfall.map(str::to_string),
+        asked: Mutex::new(Vec::new()),
+        lost: false,
+    }))
+}
+
 fn capped_backend(cap: u32) -> &'static dyn TileBackend {
-    Box::leak(Box::new(CappedBackend { cap }))
+    leaked_backend(cap, None)
+}
+
+/// Collects every notice a run raises.
+#[derive(Default)]
+struct NoticeObserver {
+    notices: Mutex<Vec<String>>,
+}
+
+impl StageObserver for NoticeObserver {
+    fn notice(&self, message: &str) {
+        self.notices.lock().unwrap().push(message.to_string());
+    }
 }
 
 /// A held run's report with the bytes of the composite and Z-Map it wrote.
@@ -1165,6 +1216,16 @@ fn held_run(
     levels: i64,
     backend: Option<&'static dyn TileBackend>,
 ) -> Result<HeldRun, PipelineError> {
+    held_run_observed(label, tile_size, levels, backend, &NoopObserver)
+}
+
+fn held_run_observed(
+    label: &str,
+    tile_size: u32,
+    levels: i64,
+    backend: Option<&'static dyn TileBackend>,
+    observer: &dyn StageObserver,
+) -> Result<HeldRun, PipelineError> {
     let mut explicit = ParamValues::new();
     explicit.insert("levels".to_string(), ParamValue::Int(levels));
     let mut request = base_request(label, mantis_frames(3), explicit);
@@ -1172,20 +1233,107 @@ fn held_run(
     request.tile_size = Some(tile_size);
     request.backend = backend;
     let FuseOutcome::Completed(report) =
-        focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)?
+        focusforge_core::pipeline::run(&request, observer, JobControl::new(), None)?
     else {
         panic!("expected a completed run");
     };
+    Ok(held_run_of(report))
+}
+
+fn held_run_of(report: Box<FuseReport>) -> HeldRun {
     let FuseProduct::Held(held) = &report.product else {
         panic!("a hold request must report a held checkpoint");
     };
     let composite = std::fs::read(&held.composite).expect("composite must be readable");
     let zmap = std::fs::read(&held.zmap).expect("z-map must be readable");
-    Ok(HeldRun {
+    HeldRun {
         report,
         composite,
         zmap,
-    })
+    }
+}
+
+/// Cancels the run on the first progress snapshot that shows a fuse unit done.
+struct CancelAfterFirstUnit(Arc<JobControl>);
+impl StageObserver for CancelAfterFirstUnit {
+    fn tick(&self, progress: &JobProgress) {
+        if progress.stage == JobStage::Fuse && progress.units_done > 0 {
+            self.0.cancel();
+        }
+    }
+}
+
+#[test]
+fn cancel_mid_fusion_then_resume_matches_an_uninterrupted_run() {
+    for method in ["laplacian", "weighted-average", "depth-map"] {
+        let request = |label: &str| {
+            let label = format!("{label}_{method}");
+            // Five levels need a 448 px tile; three fit the 256 px tile that plans several.
+            let mut explicit = ParamValues::new();
+            if method == "laplacian" {
+                explicit.insert("levels".to_string(), ParamValue::Int(3));
+            }
+            let mut request = base_request(&label, mantis_frames(3), explicit);
+            request.algorithm = registry::find_stack(method).expect("method must be registered");
+            request.output = FuseOutput::Hold(scratch(&format!("{label}_hold")));
+            request.tile_size = Some(256);
+            // One tile in flight, so units finish one at a time and the cancel lands before the last.
+            request.max_host_memory = Some(1);
+            request.poll = Duration::from_millis(1);
+            request
+        };
+        let whole = request("uninterrupted");
+        let FuseOutcome::Completed(report) =
+            focusforge_core::pipeline::run(&whole, &NoopObserver, JobControl::new(), None)
+                .unwrap_or_else(|err| panic!("{method}: the uninterrupted run failed: {err}"))
+        else {
+            panic!("{method}: the uninterrupted run must complete");
+        };
+        let whole = held_run_of(report);
+        assert!(
+            whole.report.tiles > 2,
+            "{method}: {} tiles",
+            whole.report.tiles
+        );
+
+        let mut interrupted = request("interrupted");
+        let control = JobControl::new();
+        let outcome = focusforge_core::pipeline::run(
+            &interrupted,
+            &CancelAfterFirstUnit(Arc::clone(&control)),
+            control,
+            None,
+        )
+        .unwrap_or_else(|err| panic!("{method}: a cancel must not take the error path: {err}"));
+        let FuseOutcome::Cancelled {
+            units_done,
+            unit_total,
+        } = outcome
+        else {
+            panic!("{method}: the cancelled run must end as cancelled");
+        };
+        assert!(
+            0 < units_done && units_done < unit_total,
+            "{method}: {units_done} of {unit_total} units done at the cancel"
+        );
+
+        interrupted.resume = true;
+        let FuseOutcome::Completed(report) =
+            focusforge_core::pipeline::run(&interrupted, &NoopObserver, JobControl::new(), None)
+                .unwrap_or_else(|err| panic!("{method}: the resumed run failed: {err}"))
+        else {
+            panic!("{method}: the resumed run must complete");
+        };
+        let resumed = held_run_of(report);
+        assert!(
+            resumed.composite == whole.composite,
+            "{method}: the resumed composite must equal the uninterrupted one"
+        );
+        assert!(
+            resumed.zmap == whole.zmap,
+            "{method}: the resumed Z-Map must equal the uninterrupted one"
+        );
+    }
 }
 
 #[test]
@@ -1230,4 +1378,415 @@ fn a_cap_below_the_levels_minimum_fails_with_no_interior() {
         ),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+fn gpu_fallback_runs_on_the_host_and_reports_why() {
+    let message = "one 256x256 tile needs more than the device holds; continuing on the CPU path";
+    let plain = held_run("fallback_plain", 256, 3, None).expect("a backend-free run at 256");
+    assert!(plain.report.gpu_fallback.is_none());
+
+    let short = leaked_backend(u32::MAX, Some(message));
+    let observer = NoticeObserver::default();
+    let run = held_run_observed("fallback_256", 256, 3, Some(short), &observer)
+        .expect("a run the backend cannot hold falls back to the host");
+    assert_eq!(run.report.gpu_fallback.as_deref(), Some(message));
+    assert_eq!(*observer.notices.lock().unwrap(), [message]);
+    assert!(run.report.tiles > 1, "ragged tiles: {}", run.report.tiles);
+    assert!(run.composite == plain.composite, "composite on the host");
+    assert!(run.zmap == plain.zmap, "Z-Map on the host");
+    assert_eq!(*short.asked.lock().unwrap(), [(256, 256)]);
+
+    let wide = leaked_backend(u32::MAX, Some(message));
+    held_run("fallback_704", 704, 3, Some(wide)).expect("a 704 tile on a 512 px frame");
+    assert_eq!(*wide.asked.lock().unwrap(), [(512, 512)]);
+
+    let fits = leaked_backend(u32::MAX, None);
+    let run = held_run("fallback_fits", 256, 3, Some(fits)).expect("a backend that fits");
+    assert!(run.report.gpu_fallback.is_none());
+    assert_eq!(*fits.asked.lock().unwrap(), [(256, 256)]);
+    assert!(run.composite == plain.composite);
+}
+
+// ---------------------------------------------------------------------
+// Opt-in brightness equalization.
+// ---------------------------------------------------------------------
+
+const EQ_SIZE: u32 = 300;
+
+/// A deterministic texture in 15000..45000, tinted per channel when `spp` is 3.
+fn eq_texture(spp: u32) -> Vec<u16> {
+    let mut state = 0x9e37_79b9_u32;
+    let mut samples = Vec::with_capacity((EQ_SIZE * EQ_SIZE * spp) as usize);
+    for _ in 0..EQ_SIZE * EQ_SIZE {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let base = 15_000 + (state >> 16) % 30_000;
+        for c in 0..spp {
+            samples.push((base * (10 + c) / 12).clamp(1, 65_535) as u16);
+        }
+    }
+    samples
+}
+
+/// One TIFF per factor: the texture scaled by it, rounded, saturating.
+fn brightness_stack(label: &str, spp: u32, factors: &[f64]) -> Vec<PathBuf> {
+    let dir = scratch(&format!("{label}_frames"));
+    let texture = eq_texture(spp);
+    let full = Rect {
+        x: 0,
+        y: 0,
+        width: EQ_SIZE,
+        height: EQ_SIZE,
+    };
+    factors
+        .iter()
+        .enumerate()
+        .map(|(i, factor)| {
+            let path = dir.join(format!("{i:02}.tif"));
+            let samples: Vec<u16> = texture
+                .iter()
+                .map(|&s| (f64::from(s) * factor).round().min(65_535.0) as u16)
+                .collect();
+            let mut writer = TiffWriter::create(
+                &path,
+                TiffSpec {
+                    width: EQ_SIZE,
+                    height: EQ_SIZE,
+                    samples_per_pixel: spp,
+                    description: None,
+                },
+            )
+            .expect("writer must create the frame");
+            writer.write_tile(full, &samples).expect("frame samples");
+            writer.finish().expect("frame must finish");
+            path
+        })
+        .collect()
+}
+
+/// Holds one run over `frames` with `algorithm` at tile size 256.
+fn eq_run(
+    label: &str,
+    frames: &[PathBuf],
+    algorithm: &str,
+    equalize: Option<f64>,
+    backend: Option<&'static dyn TileBackend>,
+    observer: &dyn StageObserver,
+) -> HeldRun {
+    let mut explicit = ParamValues::new();
+    if algorithm == "laplacian" {
+        explicit.insert("levels".to_string(), ParamValue::Int(3));
+    }
+    let mut request = base_request(label, frames.to_vec(), explicit);
+    request.algorithm = registry::find_stack(algorithm).expect("a registered algorithm");
+    request.output = FuseOutput::Hold(scratch(&format!("{label}_hold")));
+    request.tile_size = Some(256);
+    request.equalize = equalize;
+    request.backend = backend;
+    let FuseOutcome::Completed(report) =
+        focusforge_core::pipeline::run(&request, observer, JobControl::new(), None)
+            .expect("the run must complete")
+    else {
+        panic!("expected a completed run");
+    };
+    let FuseProduct::Held(held) = &report.product else {
+        panic!("a hold request must report a held checkpoint");
+    };
+    let composite = std::fs::read(&held.composite).expect("composite must be readable");
+    let zmap = std::fs::read(&held.zmap).expect("z-map must be readable");
+    HeldRun {
+        report,
+        composite,
+        zmap,
+    }
+}
+
+fn q16(gains: impl IntoIterator<Item = f64>) -> Vec<u32> {
+    gains
+        .into_iter()
+        .map(|g| (g * f64::from(UNIT_GAIN)).round() as u32)
+        .collect()
+}
+
+#[test]
+fn equalization_is_off_by_default_and_records_nothing() {
+    let frames = brightness_stack("eq_off", 3, &[0.9, 1.0, 1.1]);
+    let run = eq_run(
+        "eq_off_run",
+        &frames,
+        "laplacian",
+        None,
+        None,
+        &NoopObserver,
+    );
+    assert!(run.report.equalization.is_none());
+    let FuseProduct::Held(held) = &run.report.product else {
+        panic!("held run");
+    };
+    assert!(held.registration.equalization.is_none());
+}
+
+#[test]
+fn equalizing_repeated_frames_changes_nothing() {
+    for spp in [3, 1] {
+        let frames = brightness_stack(&format!("eq_repeat_{spp}"), spp, &[1.0, 1.0, 1.0]);
+        let off = eq_run(
+            &format!("eq_repeat_off_{spp}"),
+            &frames,
+            "laplacian",
+            None,
+            None,
+            &NoopObserver,
+        );
+        let on = eq_run(
+            &format!("eq_repeat_on_{spp}"),
+            &frames,
+            "laplacian",
+            Some(1.25),
+            None,
+            &NoopObserver,
+        );
+        let estimate = on.report.equalization.as_ref().expect("estimate reported");
+        assert!(
+            estimate
+                .frames
+                .iter()
+                .all(|f| f.applied == 1.0 && !f.clamped),
+            "spp {spp}"
+        );
+        let FuseProduct::Held(held) = &on.report.product else {
+            panic!("held run");
+        };
+        assert_eq!(
+            held.registration.equalization.as_ref().unwrap().gains,
+            vec![UNIT_GAIN; 3],
+            "spp {spp}"
+        );
+        assert!(on.composite == off.composite, "composite, spp {spp}");
+        assert!(on.zmap == off.zmap, "z-map, spp {spp}");
+    }
+}
+
+#[test]
+fn equalization_matches_the_reference_frames_brightness() {
+    let frames = brightness_stack("eq_levels", 3, &[0.9, 1.0, 1.1]);
+    let on = eq_run(
+        "eq_levels_run",
+        &frames,
+        "laplacian",
+        Some(1.25),
+        None,
+        &NoopObserver,
+    );
+    let estimate = on.report.equalization.as_ref().unwrap();
+    assert_eq!(estimate.max_gain, 1.25);
+    assert_eq!(estimate.reference, 1, "the middle frame of three");
+    for (frame, want) in estimate.frames.iter().zip([1.0 / 0.9, 1.0, 1.0 / 1.1]) {
+        assert!(
+            (frame.applied - want).abs() < 5e-4,
+            "gain {} vs {want}",
+            frame.applied
+        );
+    }
+    let off = eq_run(
+        "eq_levels_off",
+        &frames,
+        "laplacian",
+        None,
+        None,
+        &NoopObserver,
+    );
+    assert!(on.composite != off.composite, "the gains reach the fuse");
+}
+
+#[test]
+fn equalized_run_measures_its_input_sharpness_on_the_gained_frames() {
+    let frames = brightness_stack("eq_metrics", 3, &[0.85, 1.0, 1.15]);
+    let run = |label: &str, equalize| {
+        let held = eq_run(label, &frames, "laplacian", equalize, None, &NoopObserver);
+        held.report
+            .metrics
+            .max_input_lapvar
+            .expect("the sharpness window fits the frames")
+    };
+    let off = run("eq_metrics_off", None);
+    let on = run("eq_metrics_on", Some(1.25));
+    // Variance scales with the square of brightness: the brightest frame is
+    // 1.15x the reference raw and the reference once gained.
+    let want = off / (1.15 * 1.15);
+    assert!(
+        (on - want).abs() < 0.05 * want,
+        "equalized max input lapvar {on} vs {want}"
+    );
+}
+
+#[test]
+fn equalization_clamps_a_frame_beyond_the_bound_with_a_notice() {
+    let frames = brightness_stack("eq_clamp", 3, &[0.6, 1.0, 1.0]);
+    let observer = NoticeObserver::default();
+    let run = eq_run(
+        "eq_clamp_run",
+        &frames,
+        "laplacian",
+        Some(1.25),
+        None,
+        &observer,
+    );
+    let estimate = run.report.equalization.as_ref().unwrap();
+    assert!(estimate.frames[0].clamped && !estimate.frames[1].clamped);
+    assert_eq!(estimate.frames[0].applied, 1.25);
+    let notices = observer.notices.lock().unwrap();
+    let clamp: Vec<_> = notices.iter().filter(|n| n.contains("frame 0")).collect();
+    assert_eq!(
+        clamp.len(),
+        1,
+        "one notice for the one clamped frame: {notices:?}"
+    );
+    for part in ["1.667", "1.25", "1.67"] {
+        assert!(clamp[0].contains(part), "{part} in {:?}", clamp[0]);
+    }
+}
+
+#[test]
+fn equalization_keeps_the_depth_map_on_source_frames() {
+    let frames = brightness_stack("eq_depth", 3, &[0.9, 1.0, 1.1]);
+    let run = eq_run(
+        "eq_depth_run",
+        &frames,
+        "depth-map",
+        Some(1.25),
+        None,
+        &NoopObserver,
+    );
+    let FuseProduct::Held(held) = &run.report.product else {
+        panic!("held run");
+    };
+    let zmap = ZMapReader::open(&held.zmap).expect("the Z-Map opens");
+    assert_eq!(zmap.frame_count(), 3);
+    zmap.validate_all(64)
+        .expect("every Z-Map value is a source frame index");
+}
+
+#[test]
+fn equalization_is_recorded_on_seal_and_hold() {
+    let frames = brightness_stack("eq_record", 3, &[0.9, 1.0, 1.1]);
+    let mut request = base_request("eq_record_seal", frames, ParamValues::new());
+    request.equalize = Some(1.25);
+    let FuseOutcome::Completed(report) =
+        focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+            .expect("a sealed equalized run must complete")
+    else {
+        panic!("expected a completed run");
+    };
+    let estimate = report.equalization.as_ref().expect("estimate reported");
+    let want = q16(estimate.frames.iter().map(|f| f.applied));
+    assert_ne!(want, vec![UNIT_GAIN; 3]);
+    let FuseProduct::Sealed(sealed) = &report.product else {
+        panic!("expected a sealed project");
+    };
+    let recorded = Project::open(&sealed.path)
+        .expect("reopen")
+        .manifest()
+        .registration
+        .equalization
+        .clone()
+        .expect("the manifest records the equalization");
+    assert_eq!(recorded.max_gain, 1.25);
+    assert_eq!(recorded.gains, want);
+
+    request.output = FuseOutput::Hold(scratch("eq_record_hold"));
+    let FuseOutcome::Completed(held_report) =
+        focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+            .expect("a held equalized run must complete")
+    else {
+        panic!("expected a completed run");
+    };
+    let FuseProduct::Held(held) = held_report.product else {
+        panic!("expected a held checkpoint");
+    };
+    assert_eq!(held.registration.equalization.as_ref(), Some(&recorded));
+    let target = scratch("eq_record_saved").join("held.ffp");
+    seal_chain_alone(&target, &held);
+    let reopened = Project::open(&target).expect("reopen");
+    assert_eq!(
+        reopened.manifest().registration.equalization.as_ref(),
+        Some(&recorded)
+    );
+}
+
+#[test]
+fn equalization_reaches_every_fusion_path() {
+    let frames = brightness_stack("eq_backend", 3, &[0.9, 1.0, 1.1]);
+    let host = eq_run(
+        "eq_backend_host",
+        &frames,
+        "laplacian",
+        Some(1.25),
+        None,
+        &NoopObserver,
+    );
+    let ungained = eq_run(
+        "eq_backend_off",
+        &frames,
+        "laplacian",
+        None,
+        None,
+        &NoopObserver,
+    );
+    assert!(host.composite != ungained.composite);
+
+    let lost: &'static CappedBackend = Box::leak(Box::new(CappedBackend {
+        cap: 256,
+        shortfall: None,
+        asked: Mutex::new(Vec::new()),
+        lost: true,
+    }));
+    let short = leaked_backend(u32::MAX, Some("one tile does not fit"));
+    let paths: [(&str, &'static dyn TileBackend); 3] = [
+        ("device", capped_backend(256)),
+        ("device lost", lost),
+        ("host fallback", short),
+    ];
+    for (name, backend) in paths {
+        let run = eq_run(
+            &format!("eq_backend_{}", name.replace(' ', "_")),
+            &frames,
+            "laplacian",
+            Some(1.25),
+            Some(backend),
+            &NoopObserver,
+        );
+        assert!(run.composite == host.composite, "{name}: composite");
+        assert!(run.zmap == host.zmap, "{name}: Z-Map");
+    }
+}
+
+#[test]
+fn toggling_equalization_reuses_the_cached_alignment() {
+    let frames = brightness_stack("eq_cache", 3, &[0.9, 1.0, 1.1]);
+    let root = scratch("eq_cache_root");
+    let cache = StageCache::open(&root.join("scratch")).expect("the stage cache opens");
+    let run_once = |label: &str, equalize: Option<f64>| {
+        let mut request = base_request(label, frames.clone(), ParamValues::new());
+        request.scratch_root = root.join("scratch");
+        request.align = Some(dummy_align_request());
+        request.equalize = equalize;
+        request.output = FuseOutput::Hold(root.join(label));
+        let FuseOutcome::Completed(report) = focusforge_core::pipeline::run(
+            &request,
+            &NoopObserver,
+            JobControl::new(),
+            Some(&cache),
+        )
+        .expect("the run must complete") else {
+            panic!("expected a completed run");
+        };
+        report
+    };
+    let first = run_once("eq_cache_off", None);
+    assert!(!first.align_cached);
+    let second = run_once("eq_cache_on", Some(1.25));
+    assert!(second.align_cached, "an equalized run reuses the alignment");
+    assert_eq!(second.align_source, "cached");
+    assert!(second.equalization.is_some());
 }

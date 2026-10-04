@@ -118,25 +118,24 @@ export component FFBottomBar inherits Rectangle {
     }
 
     // Stretches with the window so its right edge stays `Theme.space-4`
-    // before the ETA at every width, never a fixed literal. The track ends
-    // short of the window edge, clearing the overlay cluster.
+    // before the ETA at every width, never a fixed literal.
     progress-bar := FFProgressBar {
         x: ShellGeometry.progress-bar-x;
         y: (parent.height - self.height) / 2;
-        width: parent.width
-            - ShellGeometry.progress-bar-width-inset
-            - Theme.space-4 - ShellGeometry.progress-bar-x;
+        width: eta-text.x - Theme.space-4 - ShellGeometry.progress-bar-x;
         visible: root.project-loaded;
         fraction: root.bar-fraction;
         tone: root.bar-tone;
     }
 
     eta-text := Text {
-        x: progress-bar.x + progress-bar.width + Theme.space-4;
+        x: overlay-caption.x - Theme.space-4 - ShellGeometry.eta-width;
         y: 0px;
+        width: ShellGeometry.eta-width;
         height: parent.height;
         visible: root.project-loaded && root.eta-text != "";
         text: root.eta-text;
+        overflow: elide;
         color: Theme.text-secondary;
         font-size: Theme.text-value.size;
         font-weight: Theme.text-value.weight;

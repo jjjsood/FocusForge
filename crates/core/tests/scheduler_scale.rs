@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! The scheduler-scale test binary: the mantis stack replayed with
-//! small synthetic offsets into 300- and 600-frame inputs, exercising
+//! small synthetic offsets into 61-, 300- and 600-frame inputs, exercising
 //! memory behaviour, pause/resume and progress reporting at frame counts no
 //! real test data covers.
 //!
@@ -22,14 +22,11 @@
 //! (strip tables, `job.json`, mmaps -- none of it inside the frame-tile
 //! buffers a small run already exercises) scales to 300 and 600 frames
 //! without breaking pause, resume or progress reporting, and that peak
-//! live heap at both counts stays under the **same frame-count-independent
-//! ceiling** (`2 x DEFAULT_MAX_BYTES_IN_FLIGHT`) because the scheduler's own
-//! budget trades concurrency for it -- `in_flight_limit` collapses from 11
-//! (61 frames) to 2 (300 frames) to 1 (600 frames). This is **not**
-//! flat memory: the measured delta between the two counts is ~492 MB, within
-//! ~1.22% of one *uncancelled* `bytes_per_tile_set(300)` **plus** the
-//! 300-extra-frame strip-table delta (`300 x 87,424 B`) -- the budget
-//! bounds the peak, it does not cancel the frame-count term entirely.
+//! live heap at 61, 300 and 600 frames stays under the **same
+//! frame-count-independent ceiling** (`2 x DEFAULT_MAX_BYTES_IN_FLIGHT`).
+//! A tile's bytes do not depend on the frame count, so the in-flight limit
+//! is the same at every count; the fast test pins that. Each leg prints
+//! `frame_tiles_read` and the decoded bytes the frame cache produced.
 //!
 //! # Its own global allocator
 //!
@@ -58,7 +55,7 @@ use std::time::{Duration, Instant};
 use focusforge_core::algorithm::{AlgorithmError, StackAlgorithm};
 use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
-use focusforge_core::io::{FrameReader, TiffStack};
+use focusforge_core::io::{DecodedTiffStack, FrameReader, TiffStack};
 use focusforge_core::job::fingerprint::{FrameFingerprint, StackFingerprint};
 use focusforge_core::job::record::{JOB_RECORD_FORMAT, JobRecord};
 use focusforge_core::job::{Job, JobOutcome, RecordingConsumer, Resumable, ResumeStore};
@@ -68,6 +65,7 @@ use focusforge_core::tile::scheduler::DEFAULT_MAX_BYTES_IN_FLIGHT;
 use focusforge_core::tile::{
     NoopPreprocess, TileConsumer, TileJob, TileScheduler, TileSchedulerOptions,
 };
+use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
@@ -254,6 +252,7 @@ fn job_record(
         stack_params: values.clone(),
         align: None,
         crop: None,
+        equalization: None,
         composite_output: composite_path.to_path_buf(),
         zmap_output: zmap_path.map(|p| p.to_path_buf()),
     }
@@ -412,25 +411,24 @@ fn replay_transform_identity_at_replica_zero_translation_after() {
     assert_eq!(replay_transform(122, 61), Transform::translation(1.5, -1.0));
 }
 
+/// The admission limit the budget predicts for `scheduler`: the budget over
+/// one tile's bytes, clamped to `[1, pool_threads]`.
+fn predicted_in_flight(scheduler: &TileScheduler<'_>) -> usize {
+    (DEFAULT_MAX_BYTES_IN_FLIGHT as u64 / scheduler.bytes_per_tile())
+        .clamp(1, scheduler.pool_threads() as u64) as usize
+}
+
 #[test]
-fn in_flight_limit_matches_the_budget_prediction_at_300_and_600_frames() {
+fn in_flight_limit_is_the_same_at_61_300_and_600_frames() {
     let _guard = SERIAL.lock().unwrap();
-    let available = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
     // No frames are ever read: `TileScheduler::new` never touches its
     // reader, so a fixture stack stands in even though its own geometry
     // (512x512, 8 frames) disagrees with the reference geometry passed via
-    // `StackContext` -- pure arithmetic over `bytes_per_tile_set`.
+    // `StackContext` -- pure arithmetic over the per-tile bytes.
     let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
 
-    for &(frames, expected) in &[(300usize, 2usize), (600usize, 1usize)] {
-        if expected > available {
-            eprintln!(
-                "host reports only {available} logical cores; skipping the {frames}-frame case"
-            );
-            continue;
-        }
+    let mut seen = Vec::new();
+    for frames in [61usize, 300, 600] {
         let scratch_base = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("scheduler_scale_in_flight_{frames}"));
         let options = {
@@ -447,10 +445,15 @@ fn in_flight_limit_matches_the_budget_prediction_at_300_and_600_frames() {
             TileScheduler::new(&stack, stack_ctx, 3, &options).expect("scheduler must build");
         assert_eq!(
             scheduler.in_flight_limit(),
-            expected,
-            "budget arithmetic must predict in_flight_limit={expected} at {frames} frames"
+            predicted_in_flight(&scheduler),
+            "budget arithmetic must predict the in-flight limit at {frames} frames"
         );
+        seen.push((scheduler.in_flight_limit(), scheduler.bytes_per_tile()));
     }
+    assert!(
+        seen.windows(2).all(|pair| pair[0] == pair[1]),
+        "per-tile bytes and the in-flight limit must not depend on the frame count: {seen:?}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -459,19 +462,31 @@ fn in_flight_limit_matches_the_budget_prediction_at_300_and_600_frames() {
 // been approved -- never inside a red-green loop.
 // ---------------------------------------------------------------------
 
-/// Runs `SCALE_TILES` tiles of the real engine, unchanged, over a
+/// What one bounded scale leg measured.
+struct ScaleLeg {
+    in_flight_limit: usize,
+    peak_heap: usize,
+    wall: Duration,
+    vmhwm: String,
+    /// Frames the fusion visited, summed over the run's tiles.
+    frame_tiles_read: usize,
+    /// Decoded sample bytes the frame cache produced during the run.
+    decoded_bytes: u64,
+}
+
+/// Decoded-segment cache of the scale legs, small against the heap ceiling.
+const SCALE_CACHE_BYTES: u64 = 256 << 20;
+
+/// Runs the first `SCALE_TILES` tiles of the real engine, unchanged, over a
 /// `frame_count`-frame replay of the 61 real mantis frames warped through
 /// synthetic per-frame offsets. Never calls `consumer.finish()` -- coverage
 /// is deliberately incomplete (only `SCALE_TILES` of the plan's 442 tiles
 /// are ever written), and `finish()` would refuse exactly as it does after a
-/// real cancel. Returns `Some((in_flight_limit, peak live heap, wall clock,
-/// VmHWM line))`, or `None` when the reference stack is unreachable.
-fn run_scale_leg(
-    frame_count: usize,
-    expected_in_flight: usize,
-) -> Option<(usize, usize, Duration, String)> {
+/// real cancel. `None` when the reference stack is unreachable.
+fn run_scale_leg(frame_count: usize) -> Option<ScaleLeg> {
     let (paths, transforms) = build_replay(frame_count)?;
-    let stack = TiffStack::open_files(&paths).expect("replay stack must open");
+    let stack =
+        DecodedTiffStack::open_files(&paths, SCALE_CACHE_BYTES).expect("replay stack must open");
     let (width, height) = stack.dimensions();
     assert_eq!((width, height), (8192, 5464), "reference frame geometry");
     let reader = WarpingReader::new(&stack, (width, height), 3, transforms);
@@ -490,8 +505,8 @@ fn run_scale_leg(
         TileScheduler::new(&reader, stack_ctx, 3, &options).expect("scheduler must build");
     assert_eq!(
         scheduler.in_flight_limit(),
-        expected_in_flight,
-        "budget arithmetic must predict in_flight_limit={expected_in_flight} at {frame_count} frames"
+        predicted_in_flight(&scheduler),
+        "budget arithmetic must predict the in-flight limit at {frame_count} frames"
     );
 
     let (algo, values) = laplacian_algo_and_values(stack_ctx);
@@ -506,85 +521,102 @@ fn run_scale_leg(
     )
     .expect("consumer must create");
 
-    let plan_len = scheduler.plan().len();
-    let pre_credited: Vec<usize> = (SCALE_TILES..plan_len).collect();
-    let mut job = Job::resuming(&scheduler, &pre_credited);
-
+    enable_trace_accounting();
+    let decoded_before = timing_snapshot()
+        .expect("accounting is enabled")
+        .decoded_bytes;
     reset_peak();
     let start = Instant::now();
-    let outcome = job
-        .run(&NoopPreprocess, &consumer)
+    let report = scheduler
+        .run_tiles(
+            &scheduler.plan().tiles()[..SCALE_TILES],
+            &NoopPreprocess,
+            &consumer,
+        )
         .expect("bounded run must succeed");
-    let elapsed = start.elapsed();
-    let peak = peak_since_reset();
+    let wall = start.elapsed();
+    let peak_heap = peak_since_reset();
+    let decoded_bytes = timing_snapshot()
+        .expect("accounting is enabled")
+        .decoded_bytes
+        - decoded_before;
     assert_eq!(
-        outcome,
-        JobOutcome::Completed,
-        "a bounded run over exactly SCALE_TILES units must complete, never stop early"
+        report.tiles, SCALE_TILES,
+        "the bounded run submits exactly SCALE_TILES units"
     );
 
     let vmhwm = read_vmhwm();
     drop(consumer);
     let _ = std::fs::remove_file(&composite_path);
 
-    Some((scheduler.in_flight_limit(), peak, elapsed, vmhwm))
+    Some(ScaleLeg {
+        in_flight_limit: scheduler.in_flight_limit(),
+        peak_heap,
+        wall,
+        vmhwm,
+        frame_tiles_read: report.frame_tiles_read,
+        decoded_bytes,
+    })
 }
 
-#[test]
-#[ignore = "reads the 16 GB reference stack"]
-fn scale_300_frames() {
+/// Runs one scale leg and checks it against the frame-count-independent
+/// heap ceiling, which sits below a full load of `frame_count` frames.
+fn check_scale_leg(name: &str, frame_count: usize) {
     let _guard = SERIAL.lock().unwrap();
     // Derived, not pinned: `2 * DEFAULT_MAX_BYTES_IN_FLIGHT` is a function
     // of the budget, not of the frame count, so the same ceiling applies at
     // 61, 300 and 600 frames.
     let ceiling = 2 * DEFAULT_MAX_BYTES_IN_FLIGHT;
-    let full_load_bytes = 300u64 * 8192 * 5464 * 3 * 2;
+    let full_load_bytes = frame_count as u64 * 8192 * 5464 * 3 * 2;
     assert!(
         (ceiling as u64) < full_load_bytes,
         "ceiling ({ceiling} B) must be below a full load ({full_load_bytes} B), or this test \
          cannot discriminate a tiled implementation from a full-load one"
     );
 
-    let Some((in_flight, peak, elapsed, vmhwm)) = run_scale_leg(300, 2) else {
+    let Some(leg) = run_scale_leg(frame_count) else {
         return;
     };
-    let extrapolated = elapsed.as_secs_f64() * 442.0 / SCALE_TILES as f64;
+    let extrapolated = leg.wall.as_secs_f64() * 442.0 / SCALE_TILES as f64;
     println!(
-        "scale_300_frames: in_flight_limit={in_flight} peak_live_heap={peak} B (ceiling \
-         {ceiling} B) wall={elapsed:?} ({SCALE_TILES} of 442 tiles) \
-         extrapolated_442_tiles={extrapolated:.1}s {vmhwm}"
+        "{name}: in_flight_limit={} peak_live_heap={} B (ceiling {ceiling} B) wall={:?} \
+         ({SCALE_TILES} of 442 tiles) extrapolated_442_tiles={extrapolated:.1}s \
+         frame_tiles_read={} decoded_bytes={} {}",
+        leg.in_flight_limit,
+        leg.peak_heap,
+        leg.wall,
+        leg.frame_tiles_read,
+        leg.decoded_bytes,
+        leg.vmhwm
     );
     assert!(
-        peak < ceiling,
-        "peak live heap {peak} B exceeded the {ceiling} B ceiling"
+        leg.peak_heap < ceiling,
+        "peak live heap {} B exceeded the {ceiling} B ceiling",
+        leg.peak_heap
+    );
+    assert!(
+        leg.frame_tiles_read <= SCALE_TILES * frame_count,
+        "frame_tiles_read {} exceeds one visit per frame per tile",
+        leg.frame_tiles_read
     );
 }
 
 #[test]
 #[ignore = "reads the 16 GB reference stack"]
-fn scale_600_frames() {
-    let _guard = SERIAL.lock().unwrap();
-    let ceiling = 2 * DEFAULT_MAX_BYTES_IN_FLIGHT;
-    let full_load_bytes = 600u64 * 8192 * 5464 * 3 * 2;
-    assert!(
-        (ceiling as u64) < full_load_bytes,
-        "ceiling ({ceiling} B) must be below a full load ({full_load_bytes} B), or this test \
-         cannot discriminate a tiled implementation from a full-load one"
-    );
+fn scale_61_frames() {
+    check_scale_leg("scale_61_frames", 61);
+}
 
-    let Some((in_flight, peak, elapsed, vmhwm)) = run_scale_leg(600, 1) else {
-        return;
-    };
-    let extrapolated = elapsed.as_secs_f64() * 442.0 / SCALE_TILES as f64;
-    println!(
-        "scale_600_frames: in_flight_limit={in_flight} peak_live_heap={peak} B (ceiling \
-         {ceiling} B) wall={elapsed:?} ({SCALE_TILES} of 442 tiles) \
-         extrapolated_442_tiles={extrapolated:.1}s {vmhwm}"
-    );
-    assert!(
-        peak < ceiling,
-        "peak live heap {peak} B exceeded the {ceiling} B ceiling"
-    );
+#[test]
+#[ignore = "reads the 16 GB reference stack"]
+fn scale_300_frames() {
+    check_scale_leg("scale_300_frames", 300);
+}
+
+#[test]
+#[ignore = "reads the 16 GB reference stack"]
+fn scale_600_frames() {
+    check_scale_leg("scale_600_frames", 600);
 }
 
 #[test]
@@ -601,8 +633,7 @@ fn scale_600_pause_latency() {
 
     let scratch_base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("scheduler_scale_600_pause");
     let options = {
-        let mut o =
-            TileSchedulerOptions::explicit_budget(scratch_base, DEFAULT_MAX_BYTES_IN_FLIGHT as u64);
+        let mut o = TileSchedulerOptions::explicit_budget(scratch_base, 1_u64);
         o.tile_size = 512;
         o.levels = 5;
         o
@@ -686,10 +717,7 @@ fn scale_600_resume_continues() {
     let (width, height) = stack.dimensions();
     let reader = WarpingReader::new(&stack, (width, height), 3, transforms.clone());
     let options = {
-        let mut o = TileSchedulerOptions::explicit_budget(
-            scratch.clone(),
-            DEFAULT_MAX_BYTES_IN_FLIGHT as u64,
-        );
+        let mut o = TileSchedulerOptions::explicit_budget(scratch.clone(), 1_u64);
         o.tile_size = 512;
         o.levels = 5;
         o
@@ -737,7 +765,7 @@ fn scale_600_resume_continues() {
         };
         let mut job = Job::resuming(&scheduler, &pre_credited);
         let control = job.control();
-        // `in_flight_limit() == 1` at 600 frames: exactly one worker, so
+        // A one-byte budget pins `in_flight_limit()` to 1: exactly one worker, so
         // `wait_for_started` must ask for exactly 1 -- a threshold above the
         // scheduler's own `in_flight_limit` can never be reached, since the
         // one worker blocks *inside* `Gated::consume` and cannot pick up a
@@ -853,7 +881,8 @@ fn scale_600_resume_continues() {
 #[ignore = "reads the 16 GB reference stack"]
 fn scale_progress_reaches_the_total() {
     let _guard = SERIAL.lock().unwrap();
-    for &(frame_count, expected_in_flight) in &[(300usize, 2usize), (600usize, 1usize)] {
+    let mut first_limit = None;
+    for &frame_count in &[300usize, 600usize] {
         let Some((paths, transforms)) = build_replay(frame_count) else {
             return;
         };
@@ -875,7 +904,8 @@ fn scale_progress_reaches_the_total() {
         let stack_ctx = StackContext::new(frame_count, width, height, 3);
         let scheduler =
             TileScheduler::new(&reader, stack_ctx, 3, &options).expect("scheduler must build");
-        assert_eq!(scheduler.in_flight_limit(), expected_in_flight);
+        let limit = scheduler.in_flight_limit();
+        assert_eq!(*first_limit.get_or_insert(limit), limit);
 
         let (algo, values) = laplacian_algo_and_values(stack_ctx);
         let composite_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(

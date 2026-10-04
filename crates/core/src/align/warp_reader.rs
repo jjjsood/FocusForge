@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::align::warp::warp_tile;
 use crate::align::{SourceFootprint, Transform};
+use crate::equalize::{Equalization, UNIT_GAIN};
 use crate::job::stage_cache::{transform_from_bits, transform_to_bits};
 use crate::tile::Rect;
 use crate::timing::{TimingCounter, measurement_scope, record_timing};
@@ -22,9 +23,25 @@ pub struct Registration {
     #[serde(with = "transform_bits")]
     pub transforms: Vec<Transform>,
     pub crop: Option<Rect>,
+    /// The brightness gains the fuse applied to each frame, `None` when
+    /// equalization was off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equalization: Option<Equalization>,
 }
 
 impl Registration {
+    /// Every frame's Q16 brightness gain, empty when the fuse applied none.
+    pub fn gains(&self) -> &[u32] {
+        self.equalization
+            .as_ref()
+            .map_or(&[], |e| e.gains.as_slice())
+    }
+
+    /// Frame `i`'s Q16 brightness gain, unit when the fuse applied none.
+    pub fn gain(&self, i: usize) -> u32 {
+        self.gains().get(i).copied().unwrap_or(UNIT_GAIN)
+    }
+
     /// Frame `i`'s transform, [`Transform::identity`] past the end.
     pub fn transform(&self, i: usize) -> Transform {
         self.transforms
@@ -111,7 +128,7 @@ impl TileReader for WarpingReader<'_> {
     /// the source buffer over the footprint, the warped samples with their
     /// coverage, and the inner scratch at that footprint. Translations and
     /// similarities need the same footprint at every position, and clamping
-    /// only shrinks it.
+    /// only shrinks it. The one live coverage mask is the scheduler's.
     fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
         let spp = u64::from(self.samples_per_pixel);
         let (width, height) = (width.min(self.frame.0), height.min(self.frame.1));
@@ -144,6 +161,17 @@ impl TileReader for WarpingReader<'_> {
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), AlgorithmError> {
+        self.read_tile_coverage_into(frame, rect, out).map(drop)
+    }
+
+    /// `None` for an identity transform and for a warp that covered every
+    /// pixel of `rect`; otherwise the mask [`warp_tile`] produced.
+    fn read_tile_coverage_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<Option<Vec<bool>>, AlgorithmError> {
         let _scope = measurement_scope("warp_read");
         let t = self
             .transforms
@@ -162,7 +190,7 @@ impl TileReader for WarpingReader<'_> {
         // during an aligned one, bit-identical to a direct `TiffStack`
         // read.
         if *t == Transform::identity() {
-            return self.inner.read_tile_into(frame, rect, out);
+            return self.inner.read_tile_into(frame, rect, out).map(|()| None);
         }
 
         let warped = warp_tile(
@@ -193,6 +221,6 @@ impl TileReader for WarpingReader<'_> {
         record_timing(TimingCounter::WarpBytes, bytes);
         record_timing(TimingCounter::CopyBytes, bytes);
         record_timing(TimingCounter::CopyOperations, 1);
-        Ok(())
+        Ok(warped.covered.contains(&false).then_some(warped.covered))
     }
 }

@@ -29,6 +29,14 @@
 //! dimensions, then [`Plane::data_mut`] overwritten with the real `f32`
 //! values.
 //!
+//! # Coverage
+//!
+//! The argmax runs over eligible frames: those whose coverage mask
+//! ([`crate::algorithm::TileCtx::for_each_frame`]), eroded by the full reach of its score,
+//! `DETAIL_REACH + score-radius + smoothing-radius` (`4 + 4 + 8` at the
+//! defaults; `sharpness::eligible`), is true at `p`. A pixel with no eligible frame is
+//! [`crate::zmap::NO_SOURCE`] with zero samples.
+//!
 //! # The composite *is* the Z-Map
 //!
 //! Unlike `weighted-average`'s blend, this algorithm's composite is a raw
@@ -41,17 +49,14 @@
 //! sample already sits inside the read rect the margin guarantees, with
 //! nothing added on top.
 //!
-//! # Reach and `tile_levels`
+//! # Reach and `tile_support`
 //!
 //! The measure's window reads `score-radius` px; the smoothing pass reads a
 //! further `smoothing-radius` px of the *score* plane, which itself needed
-//! `crate::fuse::sharpness::DETAIL_REACH` (`2`) to exist at all: total
-//! reach `2 + score-radius + smoothing-radius`, `14` at the shipped
-//! defaults. [`DepthMap::tile_levels`] overrides the trait's default with
-//! `crate::fuse::sharpness::levels_for_margin` of that reach -- `3` at the
-//! defaults, from a pyramid this algorithm only ever builds to **one**
-//! level. The `levels=3` `focusforge-cli stack --algo depth-map` reports is
-//! therefore a reach-derived override, not a pyramid depth.
+//! `crate::fuse::sharpness::DETAIL_REACH` (`4`) to exist at all: total
+//! reach `4 + score-radius + smoothing-radius`, `16` at the shipped
+//! defaults. [`DepthMap::tile_support`] reports that reach on a one-level
+//! (2 px) decimation grid, the only pyramid depth this algorithm builds.
 
 use std::sync::LazyLock;
 
@@ -59,10 +64,12 @@ use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
 use crate::fuse::error::{algorithm_error, missing_key};
 use crate::fuse::laplacian::score_plane;
 use crate::fuse::pyramid::Plane;
-use crate::fuse::sharpness::{DETAIL_REACH, detail_plane, levels_for_margin};
+use crate::fuse::sharpness::{DETAIL_REACH, detail_plane, eligible as sharpness_eligible};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues};
 use crate::registry::StackRegistration;
 use crate::tile::Tile;
+use crate::tile::plan::TileSupport;
+use crate::zmap::NO_SOURCE;
 
 const SCORE_RADIUS_DEFAULT: i64 = 4;
 const SMOOTHING_RADIUS_DEFAULT: i64 = 8;
@@ -72,26 +79,24 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "score-radius".to_string(),
             label: "Score Radius".to_string(),
-            help: "Sharpness-measure window radius, in level-0 pixels -- the \
-                   same kind of window `laplacian` and `weighted-average` \
-                   use. A detail-scale property, not resolution-derived."
+            help: "How far, in pixels, each pixel looks around itself to judge \
+                   how sharp it is."
                 .to_string(),
             kind: ParamKind::Int { min: 0, max: 16 },
             default: ParamValue::Int(SCORE_RADIUS_DEFAULT),
+            advanced: true,
             auto: None,
             host_default: None,
         },
         ParamDesc {
             id: "smoothing-radius".to_string(),
             label: "Smoothing Radius".to_string(),
-            help: "A second windowed pass, over the sharpness measure \
-                   itself rather than over pixel detail, that makes the \
-                   depth surface -- and therefore the Z-Map -- coherent at \
-                   a larger scale. A detail-scale property, not \
-                   resolution-derived."
+            help: "How far, in pixels, the sharpness map is smoothed so that \
+                   neighbouring pixels agree on which frame is in focus."
                 .to_string(),
             kind: ParamKind::Int { min: 0, max: 16 },
             default: ParamValue::Int(SMOOTHING_RADIUS_DEFAULT),
+            advanced: true,
             auto: None,
             host_default: None,
         },
@@ -136,10 +141,10 @@ impl StackAlgorithm for DepthMap {
     }
 
     fn display_name(&self) -> &str {
-        "Depth Map"
+        "Focus map"
     }
 
-    fn is_default(&self) -> bool {
+    fn advanced(&self) -> bool {
         true
     }
 
@@ -161,23 +166,32 @@ impl StackAlgorithm for DepthMap {
         let rect = ctx.rect();
         let (width, height) = (rect.width, rect.height);
         let frame_count = ctx.frame_count();
-        let frame0 = ctx.frame(0)?;
-        let spp = frame0.samples_per_pixel;
+        let spp = ctx.samples_per_pixel()?;
         let spp_usize = spp as usize;
         let pixel_count = width as usize * height as usize;
 
         let mut best = vec![f32::NEG_INFINITY; pixel_count];
-        let mut winner = vec![0u16; pixel_count];
+        let mut winner = vec![NO_SOURCE; pixel_count];
         let mut out = vec![0u16; pixel_count * spp_usize];
 
-        for f in 0..frame_count {
-            let tile = ctx.frame(f)?;
+        ctx.for_each_frame(|f, tile, covered| {
             let detail = detail_plane(&tile.samples, width, height, spp)
                 .map_err(algorithm_error("depth-map"))?;
             let raw_score = score_plane(&detail, score_radius);
             let smoothed = box_smooth(&raw_score, width, height, smoothing_radius);
+            let eligible = covered.map(|covered| {
+                sharpness_eligible(
+                    covered,
+                    width,
+                    height,
+                    DETAIL_REACH + score_radius + smoothing_radius,
+                )
+            });
 
             for p in 0..pixel_count {
+                if eligible.as_ref().is_some_and(|e| !e[p]) {
+                    continue;
+                }
                 // Strictly greater: the lowest-indexed frame reaching a
                 // score first wins an exact tie, identical to `laplacian`'s
                 // tie-break.
@@ -189,7 +203,8 @@ impl StackAlgorithm for DepthMap {
                         .copy_from_slice(&tile.samples[base..base + spp_usize]);
                 }
             }
-        }
+            Ok(())
+        })?;
 
         crate::zmap::validate_tile(&winner, frame_count as u32)
             .map_err(algorithm_error("depth-map"))?;
@@ -204,14 +219,22 @@ impl StackAlgorithm for DepthMap {
         })
     }
 
-    /// This algorithm's reach is expressible as a level count, but not as
-    /// its own level count -- it builds a one-level pyramid per frame yet
-    /// must report enough levels for `margin_for_levels` to cover
-    /// `2 + score-radius + smoothing-radius`.
-    fn tile_levels(&self, cfg: &ParamValues) -> u32 {
-        let score_radius = Self::score_radius(cfg);
-        let smoothing_radius = Self::smoothing_radius(cfg);
-        levels_for_margin(DETAIL_REACH + score_radius + smoothing_radius)
+    /// The `u16` output (2 B per sample), the detail plane's one-level
+    /// pyramid with its cloned level (9 B per sample at the peak), and per
+    /// pixel the `f32` best and `u16` winner (6 B) plus the per-frame `f32`
+    /// detail, raw score and smoothed planes with the eligibility mask and
+    /// its erosion scratch (14 B).
+    fn working_bytes_per_pixel(&self, _cfg: &ParamValues, samples_per_pixel: u32) -> u64 {
+        11 * u64::from(samples_per_pixel) + 20
+    }
+
+    /// `4 + score-radius + smoothing-radius` on the one-level decimation
+    /// grid of its detail plane.
+    fn tile_support(&self, cfg: &ParamValues) -> TileSupport {
+        TileSupport {
+            reach_px: DETAIL_REACH + Self::score_radius(cfg) + Self::smoothing_radius(cfg),
+            decimation_levels: 1,
+        }
     }
 }
 
@@ -220,9 +243,7 @@ inventory::submit! { StackRegistration::new(&DepthMap) }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tile::plan::{
-        DEFAULT_TILE_SIZE, TilePlan, margin_for_levels, min_tile_size_for_levels,
-    };
+    use crate::tile::plan::{DEFAULT_TILE_SIZE, TilePlan, margin_for_levels};
     use crate::tile::{Rect, TileError};
 
     fn rect(width: u32, height: u32) -> Rect {
@@ -232,6 +253,69 @@ mod tests {
             width,
             height,
         }
+    }
+
+    fn masked_tile(w: u32, h: u32, f: impl Fn(u32, u32) -> u16) -> Tile {
+        let samples = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| f(x, y));
+        Tile {
+            rect: rect(w, h),
+            samples_per_pixel: 1,
+            samples: samples.collect(),
+        }
+    }
+
+    fn fuse_masked(tiles: &[Tile], coverage: &[Option<Vec<bool>>], w: u32, h: u32) -> TileOutput {
+        let ctx = TileCtx::new(rect(w, h), tiles).with_coverage(coverage);
+        let mut cfg = ParamValues::new();
+        cfg.insert("score-radius".to_string(), ParamValue::Int(2));
+        cfg.insert("smoothing-radius".to_string(), ParamValue::Int(3));
+        DepthMap.fuse(&ctx, &cfg).unwrap()
+    }
+
+    #[test]
+    fn a_masked_frame_wins_only_beyond_its_eroded_band() {
+        let (w, h) = (48u32, 16u32);
+        let flat = masked_tile(w, h, |_, _| 1_000);
+        let checker = masked_tile(w, h, |x, y| if (x + y) % 2 == 0 { 0 } else { 60_000 });
+        let uncovered_columns = 8u32;
+        let mask: Vec<bool> = (0..h)
+            .flat_map(|_| (0..w).map(|x| x >= uncovered_columns))
+            .collect();
+        let out = fuse_masked(&[flat, checker.clone()], &[None, Some(mask)], w, h);
+        let reach = 4 + 2 + 3;
+        let first_eligible = uncovered_columns + reach;
+        for y in 4..12 {
+            for x in 0..w {
+                let p = (y * w + x) as usize;
+                let expected = if x < first_eligible { 0 } else { 1 };
+                assert_eq!(out.zmap[p], expected, "({x}, {y})");
+                let source = if expected == 1 {
+                    &checker
+                } else {
+                    &masked_tile(w, h, |_, _| 1_000)
+                };
+                assert_eq!(
+                    out.tile.samples[p], source.samples[p],
+                    "composite copies the winner"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_saturated_plateau_resolves_to_the_lowest_eligible_frame() {
+        let (w, h) = (16u32, 16u32);
+        let tiles = [
+            masked_tile(w, h, |_, _| 65_535),
+            masked_tile(w, h, |_, _| 65_535),
+            masked_tile(w, h, |_, _| 65_535),
+        ];
+        let masks = [Some(vec![false; (w * h) as usize]), None, None];
+        let out = fuse_masked(&tiles, &masks, w, h);
+        assert!(out.zmap.iter().all(|&z| z == 1));
+        assert!(out.tile.samples.iter().all(|&s| s == 65_535));
     }
 
     fn tile_of(width: u32, height: u32, spp: u32, samples: Vec<u16>) -> Tile {
@@ -430,34 +514,33 @@ mod tests {
         let max_smoothing_radius = declared_int_max("smoothing-radius");
         for score_radius in 0..=max_score_radius {
             for smoothing_radius in 0..=max_smoothing_radius {
-                let cfg = cfg(score_radius, smoothing_radius);
-                let levels = algo.tile_levels(&cfg);
+                let support = algo.tile_support(&cfg(score_radius, smoothing_radius));
                 let reach = DETAIL_REACH + score_radius as u32 + smoothing_radius as u32;
-                assert!(
-                    margin_for_levels(levels) >= reach,
+                assert_eq!(support.reach_px, reach);
+                assert_eq!(
+                    support.margin(),
+                    reach.next_multiple_of(2).max(margin_for_levels(1)),
                     "score_radius={score_radius} smoothing_radius={smoothing_radius}: \
-                     margin_for_levels({levels}) = {} < reach {reach}",
-                    margin_for_levels(levels)
+                     the margin is the reach on the 2 px grid"
                 );
                 assert!(
-                    min_tile_size_for_levels(levels) <= DEFAULT_TILE_SIZE,
+                    support.min_tile_size() <= DEFAULT_TILE_SIZE,
                     "score_radius={score_radius} smoothing_radius={smoothing_radius}: \
-                     min_tile_size_for_levels({levels}) = {} > {DEFAULT_TILE_SIZE}",
-                    min_tile_size_for_levels(levels)
+                     min_tile_size {} > {DEFAULT_TILE_SIZE}",
+                    support.min_tile_size()
                 );
             }
         }
-        let cfg = cfg(max_score_radius, max_smoothing_radius);
-        let levels = algo.tile_levels(&cfg);
-        let minimum = min_tile_size_for_levels(levels);
+        let support = algo.tile_support(&cfg(max_score_radius, max_smoothing_radius));
+        let minimum = support.min_tile_size();
         assert!(
-            TilePlan::new(minimum, minimum, minimum, levels).is_ok(),
+            TilePlan::new(minimum, minimum, minimum, support).is_ok(),
             "score-radius={max_score_radius} smoothing-radius={max_smoothing_radius}: \
              the reported minimum tile {minimum} must plan"
         );
         assert!(
             matches!(
-                TilePlan::new(minimum, minimum, minimum - 1, levels),
+                TilePlan::new(minimum, minimum, minimum - 1, support),
                 Err(TileError::NoInterior { min_tile_size, .. }) if min_tile_size == minimum
             ),
             "score-radius={max_score_radius} smoothing-radius={max_smoothing_radius}: \
@@ -466,13 +549,23 @@ mod tests {
     }
 
     #[test]
-    fn tile_levels_falls_back_to_the_default_radii_when_absent() {
+    fn working_bytes_per_pixel_are_pinned() {
+        let cfg = ParamValues::new();
+        assert_eq!(DepthMap.working_bytes_per_pixel(&cfg, 3), 53);
+        assert_eq!(DepthMap.working_bytes_per_pixel(&cfg, 1), 31);
+    }
+
+    #[test]
+    fn tile_support_falls_back_to_the_default_radii_when_absent() {
         let algo = DepthMap;
         assert_eq!(
-            algo.tile_levels(&ParamValues::new()),
-            levels_for_margin(
-                DETAIL_REACH + SCORE_RADIUS_DEFAULT as u32 + SMOOTHING_RADIUS_DEFAULT as u32
-            )
+            algo.tile_support(&ParamValues::new()),
+            TileSupport {
+                reach_px: DETAIL_REACH
+                    + SCORE_RADIUS_DEFAULT as u32
+                    + SMOOTHING_RADIUS_DEFAULT as u32,
+                decimation_levels: 1,
+            }
         );
     }
 }

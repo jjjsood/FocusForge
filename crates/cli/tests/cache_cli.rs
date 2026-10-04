@@ -145,6 +145,7 @@ fn leave_a_cancelled_run_ledger(cwd: &Path) -> PathBuf {
         backend: "cpu".to_string(),
         align: None,
         crop: None,
+        equalization: None,
         composite_output: PathBuf::from("leftover.ffp"),
         zmap_output: None,
     };

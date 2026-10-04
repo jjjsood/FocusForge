@@ -372,6 +372,7 @@ export component AppWindow inherits Window {
     callback settings-algorithm-selected(string, string);
     callback settings-reset-all();
     callback settings-menu-toggled(string, string);
+    callback settings-more-toggled(string);
     callback settings-scrolled(length);
     callback settings-scrollbar-pointer(int, length);
     callback settings-scrollbar-dragged(length);
@@ -447,6 +448,7 @@ export component AppWindow inherits Window {
         settings-algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
         settings-reset-all => { root.settings-reset-all(); }
         settings-menu-toggled(section, id) => { root.settings-menu-toggled(section, id); }
+        settings-more-toggled(section) => { root.settings-more-toggled(section); }
         settings-scrolled(delta) => { root.settings-scrolled(delta); }
         settings-scrollbar-pointer(kind, y) => { root.settings-scrollbar-pointer(kind, y); }
         settings-scrollbar-dragged(y) => { root.settings-scrollbar-dragged(y); }
