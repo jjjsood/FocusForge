@@ -43,14 +43,15 @@ between two tabs of its own:
   range is flagged before the run starts.
 
 Use the icon at the top right of either image to move that pane into a second
-window. The remaining image fills the main canvas. Both images share the same
-visible area, zoom and pan; unused space stays black when the windows have
-different sizes. Drag the second window by its
-title bar; its dock icon or close button returns the image to the main window.
-It can also be minimized or maximized. On Linux, the second window currently
-uses X11 or XWayland when `DISPLAY` is available, otherwise native Wayland
-when `WAYLAND_DISPLAY` is available. Starting with neither display reports a
-clear error instead of choosing a different backend.
+window. Only one pane can be detached, and the remaining pane's icon stays
+hidden until the detached pane returns. The remaining pane fills the main
+canvas. Both images share the same visible area, zoom and pan; unused space
+stays black when the windows have different sizes. Drag the second window by
+its title bar; its dock icon or close button returns the image to the main
+window. It can also be minimized or maximized. On Linux, the second window
+currently uses X11 or XWayland when `DISPLAY` is available, otherwise native
+Wayland when `WAYLAND_DISPLAY` is available. Starting with neither display
+reports a clear error instead of choosing a different backend.
 
 ## Fusing a stack
 
