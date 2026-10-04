@@ -309,6 +309,10 @@ fn show_panes(
             app.set_frame_image_y(dst.1);
             app.set_frame_image_w(dst.2);
             app.set_frame_image_h(dst.3);
+            app.set_frame_crop_x(draw.crop.0);
+            app.set_frame_crop_y(draw.crop.1);
+            app.set_frame_crop_w(draw.crop.2);
+            app.set_frame_crop_h(draw.crop.3);
             app.set_pixelated(draw.pixelated);
         }
         None => {
@@ -317,6 +321,10 @@ fn show_panes(
             app.set_frame_image_y(0.0);
             app.set_frame_image_w(0.0);
             app.set_frame_image_h(0.0);
+            app.set_frame_crop_x(0.0);
+            app.set_frame_crop_y(0.0);
+            app.set_frame_crop_w(0.0);
+            app.set_frame_crop_h(0.0);
         }
     }
 
@@ -342,6 +350,10 @@ fn show_panes(
             app.set_image_y(dst.1);
             app.set_image_w(dst.2);
             app.set_image_h(dst.3);
+            app.set_crop_x(draw.crop.0);
+            app.set_crop_y(draw.crop.1);
+            app.set_crop_w(draw.crop.2);
+            app.set_crop_h(draw.crop.3);
             app.set_pixelated(draw.pixelated);
         }
         None => {
@@ -351,6 +363,10 @@ fn show_panes(
             app.set_image_y(0.0);
             app.set_image_w(0.0);
             app.set_image_h(0.0);
+            app.set_crop_x(0.0);
+            app.set_crop_y(0.0);
+            app.set_crop_w(0.0);
+            app.set_crop_h(0.0);
         }
     }
 }
@@ -429,9 +445,19 @@ fn show_comparison_pane(
                         window.set_image_y(dst.1);
                         window.set_image_w(dst.2);
                         window.set_image_h(dst.3);
+                        window.set_crop_x(draw.crop.0);
+                        window.set_crop_y(draw.crop.1);
+                        window.set_crop_w(draw.crop.2);
+                        window.set_crop_h(draw.crop.3);
                         window.set_pixelated(draw.pixelated);
                     }
-                    None => window.set_source(slint::Image::default()),
+                    None => {
+                        window.set_source(slint::Image::default());
+                        window.set_crop_x(0.0);
+                        window.set_crop_y(0.0);
+                        window.set_crop_w(0.0);
+                        window.set_crop_h(0.0);
+                    }
                 }
             }
             // Historical `ZMap` names the displayed composite pane.
@@ -449,9 +475,19 @@ fn show_comparison_pane(
                         window.set_image_y(dst.1);
                         window.set_image_w(dst.2);
                         window.set_image_h(dst.3);
+                        window.set_crop_x(draw.crop.0);
+                        window.set_crop_y(draw.crop.1);
+                        window.set_crop_w(draw.crop.2);
+                        window.set_crop_h(draw.crop.3);
                         window.set_pixelated(draw.pixelated);
                     }
-                    None => window.set_source(slint::Image::default()),
+                    None => {
+                        window.set_source(slint::Image::default());
+                        window.set_crop_x(0.0);
+                        window.set_crop_y(0.0);
+                        window.set_crop_w(0.0);
+                        window.set_crop_h(0.0);
+                    }
                 }
             }
         }
@@ -999,11 +1035,17 @@ fn open_comparison(
         canvas.clone(),
         ready.clone(),
     );
-    window.window().show()?;
     COMPARISON_WINDOW.with(|slot| *slot.borrow_mut() = Some(window.clone()));
     update_detached_geometry(app, &window, controller);
     controller.lock().unwrap().fit();
     repaint(app, controller, canvas);
+    if let Err(error) = window.window().show() {
+        COMPARISON_WINDOW.with(|slot| {
+            let _ = slot.borrow_mut().take();
+        });
+        return Err(error);
+    }
+    window.window().request_redraw();
     ready.set(true);
     Ok(())
 }

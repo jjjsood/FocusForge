@@ -17,8 +17,13 @@ export component FFPane inherits Rectangle {
     in property <length> image-y;
     in property <length> image-w;
     in property <length> image-h;
+    in property <length> crop-x;
+    in property <length> crop-y;
+    in property <length> crop-w;
+    in property <length> crop-h;
     in property <bool> pixelated;
     in property <bool> accent-border: false;
+    out property <bool> crop-clips: image-crop.clip;
     callback undock-requested();
 
     background: Theme.surface-canvas;
@@ -27,14 +32,22 @@ export component FFPane inherits Rectangle {
     border-color: Theme.accent-default;
     clip: true;
 
-    Image {
-        source: root.source;
-        x: root.image-x;
-        y: root.image-y;
-        width: root.image-w;
-        height: root.image-h;
-        image-fit: fill;
-        image-rendering: root.pixelated ? ImageRendering.pixelated : ImageRendering.smooth;
+    image-crop := Rectangle {
+        x: root.crop-x;
+        y: root.crop-y;
+        width: root.crop-w;
+        height: root.crop-h;
+        clip: true;
+
+        Image {
+            source: root.source;
+            x: root.image-x - root.crop-x;
+            y: root.image-y - root.crop-y;
+            width: root.image-w;
+            height: root.image-h;
+            image-fit: fill;
+            image-rendering: root.pixelated ? ImageRendering.pixelated : ImageRendering.smooth;
+        }
     }
 
     if root.message-lines.length > 0 : VerticalLayout {

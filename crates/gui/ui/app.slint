@@ -283,6 +283,10 @@ export component AppWindow inherits Window {
     in property <length> image-y;
     in property <length> image-w;
     in property <length> image-h;
+    in property <length> crop-x;
+    in property <length> crop-y;
+    in property <length> crop-w;
+    in property <length> crop-h;
     // The left pane's own placement, drawn against the selected frame's
     // extent rather than the composite/Z-Map's -- the two panes share one
     // viewport's scale but not one image size.
@@ -290,6 +294,10 @@ export component AppWindow inherits Window {
     in property <length> frame-image-y;
     in property <length> frame-image-w;
     in property <length> frame-image-h;
+    in property <length> frame-crop-x;
+    in property <length> frame-crop-y;
+    in property <length> frame-crop-w;
+    in property <length> frame-crop-h;
     in property <bool> pixelated;
     callback canvas-resized();
     out property <length> canvas-pane-left-x: canvas.pane-left-x;
@@ -341,10 +349,18 @@ export component AppWindow inherits Window {
             image-y: root.image-y;
             image-w: root.image-w;
             image-h: root.image-h;
+            crop-x: root.crop-x;
+            crop-y: root.crop-y;
+            crop-w: root.crop-w;
+            crop-h: root.crop-h;
             frame-image-x: root.frame-image-x;
             frame-image-y: root.frame-image-y;
             frame-image-w: root.frame-image-w;
             frame-image-h: root.frame-image-h;
+            frame-crop-x: root.frame-crop-x;
+            frame-crop-y: root.frame-crop-y;
+            frame-crop-w: root.frame-crop-w;
+            frame-crop-h: root.frame-crop-h;
             pixelated: root.pixelated;
             show-empty-state: root.show-empty-state;
             load-active: root.load-active;

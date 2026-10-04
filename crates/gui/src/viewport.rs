@@ -145,12 +145,29 @@ pub struct PaneDraw {
     /// image extent: each uses the same source rect, centred inside its own
     /// pane. Extra pane area remains the pane's black background.
     pub dst: (f32, f32, f32, f32),
+    /// `(x, y, width, height)` in pane-local logical px for the exact,
+    /// continuous visible source rect. `FFPane` uses this to clip `dst` and
+    /// retained coverage. It deliberately does not follow `src`'s outward
+    /// rounding, so a subpixel pan cannot make a crop edge jump a pixel.
+    pub crop: (f32, f32, f32, f32),
     /// `pixelated` at or above 100 %, `smooth` below it.
     pub pixelated: bool,
     /// Every `step`-th source row and column of `src` is read:
     /// `max(1, floor(1 / scale))`, so a zoomed-out draw reads at least one
     /// sample per pane pixel and under two per axis, and 1 at or above 100 %.
     pub step: NonZeroU32,
+}
+
+/// Extra output texels retained around a visible draw so ordinary pans can
+/// reuse the current texture while the next source read remains asynchronous.
+pub const DISPLAY_GUARD: u32 = 64;
+
+fn source_rect_fits(image: ImageSize, src: (u32, u32, u32, u32)) -> bool {
+    let (x, y, width, height) = src;
+    width > 0
+        && height > 0
+        && x.checked_add(width).is_some_and(|end| end <= image.width)
+        && y.checked_add(height).is_some_and(|end| end <= image.height)
 }
 
 impl PaneDraw {
@@ -186,6 +203,37 @@ impl PaneDraw {
             (src.1, src.3),
         );
         (x, y, w, h)
+    }
+
+    /// Expands this visible draw to a bounded source rect while keeping its
+    /// output extent within `max_texture_dimension`.
+    pub fn guarded(&self, image: ImageSize, max_texture_dimension: u32) -> Option<Self> {
+        if !source_rect_fits(image, self.src) {
+            return None;
+        }
+        let (texture_width, texture_height) = self.extent();
+        if texture_width > max_texture_dimension || texture_height > max_texture_dimension {
+            return None;
+        }
+        let axis = |pos: u32, len: u32, limit: u32| {
+            let texture_len = len.div_ceil(self.step.get());
+            let guard = DISPLAY_GUARD
+                .min(max_texture_dimension.saturating_sub(texture_len) / 2)
+                .saturating_mul(self.step.get());
+            let guarded_len = len.saturating_add(guard.saturating_mul(2)).min(limit);
+            let start = pos.saturating_sub(guard).min(limit - guarded_len);
+            (start, guarded_len)
+        };
+        let (x, width) = axis(self.src.0, self.src.2, image.width);
+        let (y, height) = axis(self.src.1, self.src.3, image.height);
+        let src = (x, y, width, height);
+        Some(Self {
+            src,
+            dst: self.place(src),
+            crop: self.crop,
+            pixelated: self.pixelated,
+            step: self.step,
+        })
     }
 }
 
@@ -382,11 +430,20 @@ impl Viewport {
             ((sx1 - sx0) * self.scale) as f32,
             ((sy1 - sy0) * self.scale) as f32,
         );
+        let crop = (
+            ((pane.width - self.reference.width) as f64 / 2.0 + (x0 - origin_x) * self.scale)
+                as f32,
+            ((pane.height - self.reference.height) as f64 / 2.0 + (y0 - origin_y) * self.scale)
+                as f32,
+            ((x1 - x0) * self.scale) as f32,
+            ((y1 - y0) * self.scale) as f32,
+        );
         // The epsilon lands the 50 % and 25 % stops on exactly 2 and 4.
         let step = (1.0 / self.scale + 1e-6).floor().max(1.0) as u32;
         Some(PaneDraw {
             src,
             dst,
+            crop,
             pixelated: self.scale >= 1.0,
             step: NonZeroU32::new(step).expect("step is clamped to at least 1"),
         })

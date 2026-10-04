@@ -89,6 +89,34 @@ fn unequal_panes_show_the_same_cropped_source_with_black_margins() {
 }
 
 #[test]
+fn subpixel_pan_keeps_the_visible_crop_stable_when_sample_rect_changes() {
+    let image = image(512, 512);
+    let small = pane(320.0, 320.0);
+    let large = pane(600.0, 600.0);
+    let mut viewport = fit_two(image, small, large);
+    while viewport.scale() < 2.0 {
+        viewport.zoom_steps_in(1, (160.0, 160.0), image, small, large);
+    }
+    assert_eq!(viewport.scale(), 2.0);
+
+    let before = viewport.draw(image, large).expect("the centred view draws");
+    viewport.pan_by_two(0.5, 0.0, image, small, large);
+    let after = viewport.draw(image, large).expect("the subpixel pan draws");
+
+    assert_eq!(before.src.0, 176);
+    assert_eq!(after.src.0, 175, "the read rect expands left by one pixel");
+    assert_eq!(before.crop, (140.0, 140.0, 320.0, 320.0));
+    assert_ne!(
+        before.dst, after.dst,
+        "sample placement follows its rounded rect"
+    );
+    assert_eq!(
+        before.crop, after.crop,
+        "the continuous visible crop must not follow the rounded sample edge"
+    );
+}
+
+#[test]
 fn unequal_projection_roundtrips_and_boundary_zoom_uses_both_bounds() {
     let image = image(1000, 1000);
     let a = pane(400.0, 800.0);
@@ -1005,4 +1033,95 @@ fn place_follows_a_pan_by_whole_pixels() {
         ),
         "the retained rect scales with the zoom",
     );
+}
+
+#[test]
+fn stale_coverage_can_extend_past_the_current_crop_during_a_pan() {
+    let img = image(512, 512);
+    let p = pane(600.0, 400.0);
+    let mut vp = fit(img, p);
+    while (vp.scale() - 2.0).abs() > 1e-9 {
+        vp.zoom_steps(1, (p.width / 2.0, p.height / 2.0), img, p);
+    }
+    let before = vp.draw(img, p).expect("the zoomed viewport draws");
+    vp.pan_by(-16.0, 0.0, img, p);
+    let current = vp.draw(img, p).expect("the panned viewport draws");
+    let retained = current.place(before.src);
+
+    assert!(
+        retained.0 < current.dst.0 || retained.0 + retained.2 > current.dst.0 + current.dst.2,
+        "without a current-crop clip, retained coverage crosses a current crop edge"
+    );
+}
+
+#[test]
+fn guarded_coverage_respects_the_texture_dimension_limit() {
+    use focusforge_gui::viewport::PaneDraw;
+    use std::num::NonZeroU32;
+
+    let draw = PaneDraw {
+        src: (300, 200, 200, 200),
+        dst: (0.0, 0.0, 200.0, 200.0),
+        crop: (0.0, 0.0, 200.0, 200.0),
+        pixelated: true,
+        step: NonZeroU32::MIN,
+    };
+    let guarded = draw
+        .guarded(image(1024, 1024), 256)
+        .expect("the visible texture fits the limit");
+
+    assert_eq!(guarded.extent(), (256, 256));
+    assert!(guarded.src.0 <= draw.src.0 && guarded.src.1 <= draw.src.1);
+    assert!(
+        guarded.src.0 + guarded.src.2 >= draw.src.0 + draw.src.2
+            && guarded.src.1 + guarded.src.3 >= draw.src.1 + draw.src.3
+    );
+
+    let too_wide = PaneDraw {
+        src: (0, 0, 257, 1),
+        dst: (0.0, 0.0, 257.0, 1.0),
+        ..draw
+    };
+    assert!(too_wide.guarded(image(1024, 1024), 256).is_none());
+
+    let edge = PaneDraw {
+        src: (480, 480, 32, 32),
+        dst: (0.0, 0.0, 32.0, 32.0),
+        ..draw
+    }
+    .guarded(image(512, 512), 256)
+    .expect("an image-edge draw remains valid after guard expansion");
+    assert_eq!(
+        (edge.src.0 + edge.src.2, edge.src.1 + edge.src.3),
+        (512, 512),
+        "image-edge coverage ends at, never beyond, the source image"
+    );
+}
+
+#[test]
+fn guarded_coverage_refuses_empty_or_outside_visible_draws() {
+    use focusforge_gui::viewport::PaneDraw;
+    use std::num::NonZeroU32;
+
+    let draw = PaneDraw {
+        src: (0, 0, 16, 16),
+        dst: (0.0, 0.0, 16.0, 16.0),
+        crop: (0.0, 0.0, 16.0, 16.0),
+        pixelated: true,
+        step: NonZeroU32::MIN,
+    };
+    for src in [
+        (0, 0, 0, 16),
+        (0, 0, 16, 0),
+        (512, 0, 1, 1),
+        (600, 0, 10, 10),
+        (500, 500, 20, 20),
+    ] {
+        assert!(
+            PaneDraw { src, ..draw }
+                .guarded(image(512, 512), 256)
+                .is_none(),
+            "invalid visible draw {src:?} must not be clamped into guarded coverage"
+        );
+    }
 }

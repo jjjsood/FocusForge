@@ -24,6 +24,10 @@ export component ComparisonWindow inherits Window {
     in property <length> image-y;
     in property <length> image-w;
     in property <length> image-h;
+    in property <length> crop-x;
+    in property <length> crop-y;
+    in property <length> crop-w;
+    in property <length> crop-h;
     in property <bool> pixelated: false;
     in property <bool> editor-mode: false;
     in property <length> cursor-extent;
@@ -55,6 +59,7 @@ export component ComparisonWindow inherits Window {
     out property <length> pane-width: pane.width;
     out property <length> pane-height: pane.height;
     out property <bool> pane-hovered: input.has-hover;
+    out property <bool> crop-clips: pane.crop-clips;
 
     changed width => { root.pane-resized(); }
     changed height => { root.pane-resized(); }
@@ -124,6 +129,10 @@ export component ComparisonWindow inherits Window {
         image-y: root.image-y;
         image-w: root.image-w;
         image-h: root.image-h;
+        crop-x: root.crop-x;
+        crop-y: root.crop-y;
+        crop-w: root.crop-w;
+        crop-h: root.crop-h;
         pixelated: root.pixelated;
         undock-requested => { root.dock-requested(); }
         dock-back: true;

@@ -40,6 +40,41 @@ fn comparison_window_geometry() {
 }
 
 #[test]
+fn comparison_current_crop_matches_the_visible_draw() {
+    use focusforge_gui::ComparisonWindow;
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+
+    i_slint_backend_testing::init_no_event_loop();
+    let window = ComparisonWindow::new().unwrap();
+    window.window().set_size(slint::PhysicalSize::new(820, 600));
+    window.set_crop_x(18.0);
+    window.set_crop_y(31.0);
+    window.set_crop_w(400.0);
+    window.set_crop_h(250.0);
+    let pane = ElementQuery::from_root(&window)
+        .match_id("ComparisonWindow::pane")
+        .find_first()
+        .expect("comparison pane exists");
+    let crop = ElementQuery::from_root(&window)
+        .match_id("FFPane::image-crop")
+        .find_first()
+        .expect("comparison crop exists");
+    let pane_pos = pane.absolute_position();
+    let crop_pos = crop.absolute_position();
+    let crop_size = crop.size();
+    assert_eq!(
+        (crop_pos.x, crop_pos.y),
+        (pane_pos.x + 18.0, pane_pos.y + 31.0)
+    );
+    assert_eq!((crop_size.width, crop_size.height), (400.0, 250.0));
+    assert!(
+        window.get_crop_clips(),
+        "the visible crop must clip retained texture coverage outside its current draw"
+    );
+}
+
+#[test]
 fn comparison_window_forwards_focused_keys_and_focus_loss() {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
@@ -168,8 +203,8 @@ fn comparison_capture_requires_detached_pane() {
 
 #[test]
 fn both_sides_open_a_real_comparison_window() {
-    if std::env::var_os("DISPLAY").is_none() {
-        println!("SKIP: comparison windows need an X11/XWayland DISPLAY");
+    if !has_display() {
+        println!("SKIP: comparison windows need DISPLAY or WAYLAND_DISPLAY");
         return;
     }
     let dir = common::tree("both_comparison_sides");
@@ -198,8 +233,8 @@ fn both_sides_open_a_real_comparison_window() {
 
 #[test]
 fn comparison_reopens_after_dock_and_main_close_exits() {
-    if std::env::var_os("DISPLAY").is_none() {
-        println!("SKIP: comparison windows need an X11/XWayland DISPLAY");
+    if !has_display() {
+        println!("SKIP: comparison windows need DISPLAY or WAYLAND_DISPLAY");
         return;
     }
     let capture = common::tree("comparison_reopen").join("reopened.png");
@@ -258,8 +293,8 @@ fn comparison_reopens_after_dock_and_main_close_exits() {
 
 #[test]
 fn cancelling_a_guarded_main_quit_keeps_both_real_windows_rendering() {
-    if std::env::var_os("DISPLAY").is_none() {
-        println!("SKIP: comparison windows need an X11/XWayland DISPLAY");
+    if !has_display() {
+        println!("SKIP: comparison windows need DISPLAY or WAYLAND_DISPLAY");
         return;
     }
     let capture = common::tree("comparison_cancelled_main_quit").join("comparison.png");
@@ -340,8 +375,8 @@ fn comparison_chrome_intents_do_not_change_main_chrome() {
 #[cfg(feature = "gpu-tests")]
 #[test]
 fn comparison_device_loss_exits_cleanly() {
-    if std::env::var_os("DISPLAY").is_none() {
-        println!("SKIP: comparison windows need an X11/XWayland DISPLAY");
+    if !has_display() {
+        println!("SKIP: comparison windows need DISPLAY or WAYLAND_DISPLAY");
         return;
     }
     let output = common::gui_bin("comparison_device_loss")
@@ -359,8 +394,8 @@ fn comparison_device_loss_exits_cleanly() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn missing_x11_display_fails_clearly() {
-    let output = common::gui_bin("missing_x11_display")
+fn missing_linux_display_fails_clearly() {
+    let output = common::gui_bin("missing_linux_display")
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
         .output()
@@ -368,7 +403,7 @@ fn missing_x11_display_fails_clearly() {
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("X11/XWayland display unavailable: DISPLAY is not set")
+            .contains("no Linux display is available: set DISPLAY or WAYLAND_DISPLAY")
     );
 }
 
@@ -385,6 +420,75 @@ fn unusable_x11_display_fails_clearly() {
     assert!(
         stderr.contains("display") || stderr.contains("x11"),
         "no display error: {stderr}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unusable_wayland_display_fails_clearly() {
+    let output = common::gui_bin("unusable_wayland_display")
+        .env_remove("DISPLAY")
+        .env("WAYLAND_DISPLAY", "wayland-missing")
+        .output()
+        .expect("launch focusforge-gui");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        stderr.contains("display") || stderr.contains("wayland"),
+        "no Wayland display error: {stderr}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn wayland_only_launch_reports_wayland() {
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        println!("SKIP: Wayland display unavailable");
+        return;
+    }
+    let output = common::gui_bin("wayland_only_backend")
+        .env_remove("DISPLAY")
+        .args(["--exit-after", "1500"])
+        .output()
+        .expect("launch focusforge-gui on Wayland");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("selected backend: winit-wayland"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("resolved native display: winit-wayland"),
+        "{stdout}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn x11_only_launch_reports_x11() {
+    if std::env::var_os("DISPLAY").is_none() {
+        println!("SKIP: X11 display unavailable");
+        return;
+    }
+    let output = common::gui_bin("x11_only_backend")
+        .env_remove("WAYLAND_DISPLAY")
+        .args(["--exit-after", "1500"])
+        .output()
+        .expect("launch focusforge-gui on X11");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("selected backend: winit-x11"), "{stdout}");
+    assert!(
+        stdout.contains("resolved native display: winit-x11"),
+        "{stdout}"
     );
 }
 

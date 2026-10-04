@@ -50,7 +50,9 @@ visible area, zoom and pan; unused space stays black when the windows have
 different sizes. Drag the second window by its
 title bar; its dock icon or close button returns the image to the main window.
 It can also be minimized or maximized. On Linux, the second window currently
-requires X11 or XWayland; launch FocusForge with an X11 display available.
+uses X11 or XWayland when `DISPLAY` is available, otherwise native Wayland
+when `WAYLAND_DISPLAY` is available. Starting with neither display reports a
+clear error instead of choosing a different backend.
 
 ## Fusing a stack
 

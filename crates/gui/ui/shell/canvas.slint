@@ -36,11 +36,19 @@ export component FFCanvas inherits Rectangle {
     in property <length> image-y;
     in property <length> image-w;
     in property <length> image-h;
+    in property <length> crop-x;
+    in property <length> crop-y;
+    in property <length> crop-w;
+    in property <length> crop-h;
     // The left pane's own placement, over the same extent as the right pane.
     in property <length> frame-image-x;
     in property <length> frame-image-y;
     in property <length> frame-image-w;
     in property <length> frame-image-h;
+    in property <length> frame-crop-x;
+    in property <length> frame-crop-y;
+    in property <length> frame-crop-w;
+    in property <length> frame-crop-h;
     in property <bool> pixelated;
     // Whether editor mode is active -- the right pane's accent border and
     // the brush cursor both show only then.
@@ -166,6 +174,10 @@ export component FFCanvas inherits Rectangle {
         image-y: root.frame-image-y;
         image-w: root.frame-image-w;
         image-h: root.frame-image-h;
+        crop-x: root.frame-crop-x;
+        crop-y: root.frame-crop-y;
+        crop-w: root.frame-crop-w;
+        crop-h: root.frame-crop-h;
         pixelated: root.pixelated;
         undock-requested => { root.composite-undock-requested(); }
     }
@@ -200,6 +212,10 @@ export component FFCanvas inherits Rectangle {
         image-y: root.image-y;
         image-w: root.image-w;
         image-h: root.image-h;
+        crop-x: root.crop-x;
+        crop-y: root.crop-y;
+        crop-w: root.crop-w;
+        crop-h: root.crop-h;
         pixelated: root.pixelated;
         undock-requested => { root.zmap-undock-requested(); }
     }

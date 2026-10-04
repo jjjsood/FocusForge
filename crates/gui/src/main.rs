@@ -16,9 +16,11 @@ use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, job, screensh
 use slint::ComponentHandle;
 use slint::wgpu_29::wgpu;
 #[cfg(target_os = "linux")]
+use slint::winit_030::winit::platform::wayland::{EventLoopBuilderExtWayland, WindowExtWayland};
+#[cfg(target_os = "linux")]
 use slint::winit_030::winit::platform::x11::EventLoopBuilderExtX11;
 #[cfg(target_os = "linux")]
-use slint::winit_030::{SlintEvent, winit};
+use slint::winit_030::{SlintEvent, WinitWindowAccessor, winit};
 
 #[derive(Parser)]
 #[command(name = "focusforge-gui")]
@@ -379,16 +381,25 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 }
 
 /// Builds the one device used by Slint and every imported canvas texture.
-fn manual_wgpu_configuration() -> Result<slint::wgpu_29::WGPUConfiguration, String> {
+fn manual_wgpu_configuration(
+    #[cfg(target_os = "linux")] display_backend: LinuxDisplayBackend,
+) -> Result<slint::wgpu_29::WGPUConfiguration, String> {
+    let flags = wgpu::InstanceFlags::from_build_config().with_env();
+    #[cfg(target_os = "linux")]
+    let flags = adjust_manual_wgpu_flags(
+        flags,
+        display_backend,
+        std::env::var_os("WGPU_VALIDATION").is_some(),
+    );
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::from_env().unwrap_or_default(),
-        flags: wgpu::InstanceFlags::from_build_config().with_env(),
+        flags,
         backend_options: wgpu::BackendOptions::from_env_or_default(),
         memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
         display: None,
     });
     let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-        .map_err(|error| format!("no compatible wgpu adapter for the X11 display: {error}"))?;
+        .map_err(|error| format!("no compatible wgpu adapter for the selected display: {error}"))?;
     let limits = focusforge_gpu::limits::device_limits(&adapter.limits());
     let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("focusforge-gui-device"),
@@ -400,9 +411,8 @@ fn manual_wgpu_configuration() -> Result<slint::wgpu_29::WGPUConfiguration, Stri
     }))
     .map_err(|error| format!("could not create FocusForge's shared wgpu device: {error}"))?;
 
-    // Slint's Manual WGPU backend drops its queue from TLS after wgpu's own
-    // TLS has gone away on process exit. Keep one process-lifetime clone so
-    // that destructor never runs in the invalid order.
+    // Slint drops its Manual queue from thread-local backend state at process
+    // shutdown, after wgpu's queue lock trace has already been destroyed.
     let _queue_until_process_exit = Box::leak(Box::new(queue.clone()));
 
     Ok(slint::wgpu_29::WGPUConfiguration::Manual {
@@ -414,9 +424,66 @@ fn manual_wgpu_configuration() -> Result<slint::wgpu_29::WGPUConfiguration, Stri
 }
 
 #[cfg(target_os = "linux")]
-fn x11_event_loop_builder() -> slint::winit_030::EventLoopBuilder {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinuxDisplayBackend {
+    X11,
+    Wayland,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxDisplayBackend {
+    fn from_environment() -> Result<Self, ExitCode> {
+        Self::from_availability(
+            std::env::var_os("DISPLAY").is_some(),
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        )
+        .ok_or_else(|| {
+            tracing::error!("no Linux display is available: set DISPLAY or WAYLAND_DISPLAY");
+            ExitCode::from(1)
+        })
+    }
+
+    fn from_availability(display: bool, wayland: bool) -> Option<Self> {
+        match (display, wayland) {
+            (true, _) => Some(Self::X11),
+            (false, true) => Some(Self::Wayland),
+            (false, false) => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::X11 => "winit-x11",
+            Self::Wayland => "winit-wayland",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn adjust_manual_wgpu_flags(
+    mut flags: wgpu::InstanceFlags,
+    display_backend: LinuxDisplayBackend,
+    validation_explicit: bool,
+) -> wgpu::InstanceFlags {
+    if display_backend == LinuxDisplayBackend::Wayland && !validation_explicit {
+        // WGPU validation registers an EGL callback that can outlive tracing's
+        // thread-local state during native Wayland debug teardown.
+        flags.remove(wgpu::InstanceFlags::VALIDATION);
+    }
+    flags
+}
+
+#[cfg(target_os = "linux")]
+fn linux_event_loop_builder(backend: LinuxDisplayBackend) -> slint::winit_030::EventLoopBuilder {
     let mut builder = winit::event_loop::EventLoop::<SlintEvent>::with_user_event();
-    builder.with_x11();
+    match backend {
+        LinuxDisplayBackend::X11 => {
+            builder.with_x11();
+        }
+        LinuxDisplayBackend::Wayland => {
+            builder.with_wayland();
+        }
+    }
     builder
 }
 
@@ -438,11 +505,11 @@ fn select_backend(
     toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 ) -> Result<(), ExitCode> {
     #[cfg(target_os = "linux")]
-    if std::env::var_os("DISPLAY").is_none() {
-        tracing::error!("X11/XWayland display unavailable: DISPLAY is not set");
-        return Err(ExitCode::from(1));
-    }
-    let config = match manual_wgpu_configuration() {
+    let display_backend = LinuxDisplayBackend::from_environment()?;
+    let config = match manual_wgpu_configuration(
+        #[cfg(target_os = "linux")]
+        display_backend,
+    ) {
         Ok(config) => config,
         Err(error) => {
             tracing::error!("{error}");
@@ -455,7 +522,8 @@ fn select_backend(
     // inside `bridge::install`.
     let selector = slint::BackendSelector::new().backend_name("winit".into());
     #[cfg(target_os = "linux")]
-    let selector = selector.with_winit_event_loop_builder(x11_event_loop_builder());
+    let selector =
+        selector.with_winit_event_loop_builder(linux_event_loop_builder(display_backend));
     let selector = selector
         .require_wgpu_29(config)
         .with_winit_custom_application_handler(bridge::DropHandler::new(
@@ -468,15 +536,36 @@ fn select_backend(
         tracing::error!("{e}");
         return Err(ExitCode::from(1));
     }
+    #[cfg(target_os = "linux")]
     println!(
-        "resolved backend: {}, renderer: renderer-femtovg-wgpu (wgpu 29.0.4, Manual)",
-        if cfg!(target_os = "linux") {
-            "winit-x11"
-        } else {
-            "winit"
-        }
+        "selected backend: {}, renderer: renderer-femtovg-wgpu (wgpu 29.0.4, Manual)",
+        display_backend.label()
     );
+    #[cfg(not(target_os = "linux"))]
+    println!("selected backend: winit, renderer: renderer-femtovg-wgpu (wgpu 29.0.4, Manual)");
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn log_native_display<T: ComponentHandle + 'static>(app: &T) {
+    let app = app.as_weak();
+    slint::Timer::single_shot(Duration::from_millis(150), move || {
+        let resolved = app
+            .upgrade()
+            .and_then(|app| {
+                app.window()
+                    .with_winit_window(|native| native.xdg_toplevel().is_some())
+            })
+            .map(|wayland| {
+                if wayland {
+                    "winit-wayland"
+                } else {
+                    "winit-x11"
+                }
+            })
+            .unwrap_or("unavailable");
+        println!("resolved native display: {resolved}");
+    });
 }
 
 /// Installs the exit-after and resize timers, then runs the event loop.
@@ -676,6 +765,9 @@ fn run_window<T: ComponentHandle + 'static>(
             },
         );
     }
+
+    #[cfg(target_os = "linux")]
+    log_native_display(&app);
 
     let run_result = app.run();
     bridge::shutdown_windows();
@@ -1052,5 +1144,41 @@ mod tests {
         assert_ne!(old_setup, new_setup);
         assert!(!teardown_is_current(&generation, old_setup));
         assert!(teardown_is_current(&generation, new_setup));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_display_selection_prefers_x11_when_available() {
+        assert_eq!(LinuxDisplayBackend::from_availability(false, false), None);
+        assert_eq!(
+            LinuxDisplayBackend::from_availability(true, false),
+            Some(LinuxDisplayBackend::X11)
+        );
+        assert_eq!(
+            LinuxDisplayBackend::from_availability(false, true),
+            Some(LinuxDisplayBackend::Wayland)
+        );
+        assert_eq!(
+            LinuxDisplayBackend::from_availability(true, true),
+            Some(LinuxDisplayBackend::X11)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_wayland_keeps_an_explicit_validation_choice() {
+        let flags = wgpu::InstanceFlags::VALIDATION;
+        assert!(
+            !adjust_manual_wgpu_flags(flags, LinuxDisplayBackend::Wayland, false)
+                .contains(wgpu::InstanceFlags::VALIDATION)
+        );
+        assert!(
+            adjust_manual_wgpu_flags(flags, LinuxDisplayBackend::Wayland, true)
+                .contains(wgpu::InstanceFlags::VALIDATION)
+        );
+        assert!(
+            adjust_manual_wgpu_flags(flags, LinuxDisplayBackend::X11, false)
+                .contains(wgpu::InstanceFlags::VALIDATION)
+        );
     }
 }
