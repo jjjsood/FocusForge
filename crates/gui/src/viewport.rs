@@ -93,16 +93,17 @@ pub fn fit_two(image: ImageSize, left: PaneRect, right: PaneRect) -> Viewport {
     Viewport {
         scale,
         centre: (image.width as f64 / 2.0, image.height as f64 / 2.0),
-        reference: reference_pane(image, left, right),
+        reference: reference_pane(left, right),
         at_fit: true,
     }
 }
 
-fn reference_pane(image: ImageSize, left: PaneRect, right: PaneRect) -> PaneRect {
-    if fit_scale(image, left) <= fit_scale(image, right) {
-        left
-    } else {
-        right
+fn reference_pane(left: PaneRect, right: PaneRect) -> PaneRect {
+    PaneRect {
+        x: 0.0,
+        y: 0.0,
+        width: left.width.min(right.width),
+        height: left.height.min(right.height),
     }
 }
 
@@ -141,10 +142,8 @@ pub struct PaneDraw {
     pub src: (u32, u32, u32, u32),
     /// `(x, y, width, height)` in pane-local logical px -- `FFPane::image-x/
     /// image-y/image-w/image-h`. The two panes share one viewport, not one
-    /// image extent: each is this same viewport's `scale`/`origin` drawn
-    /// against that pane's own [`ImageSize`], so their own `x`/`y` (applied
-    /// by Slint's own layout, not here) and their own `width`/`height` can
-    /// both differ.
+    /// image extent: each uses the same source rect, centred inside its own
+    /// pane. Extra pane area remains the pane's black background.
     pub dst: (f32, f32, f32, f32),
     /// `pixelated` at or above 100 %, `smooth` below it.
     pub pixelated: bool,
@@ -217,6 +216,15 @@ impl Viewport {
         )
     }
 
+    /// The pane-local point where `source` is drawn.
+    pub fn from_source_in(&self, source: (f64, f64), pane: PaneRect) -> (f32, f32) {
+        let (ox, oy) = origin_for(self.centre, pane, self.scale);
+        (
+            ((source.0 - ox) * self.scale) as f32,
+            ((source.1 - oy) * self.scale) as f32,
+        )
+    }
+
     /// The anchor-exact wheel zoom: `delta` ladder positions from the
     /// current one (saturating at both ends), `anchor` (pane-local) held
     /// fixed in source space across the change.
@@ -248,7 +256,7 @@ impl Viewport {
             src.0 - (anchor.0 as f64 - gesture_pane.width as f64 / 2.0) / new_scale,
             src.1 - (anchor.1 as f64 - gesture_pane.height as f64 / 2.0) / new_scale,
         );
-        self.reference = reference_pane(image, gesture_pane, other_pane);
+        self.reference = reference_pane(gesture_pane, other_pane);
         self.at_fit = false;
         self.clamp_two(image, gesture_pane, other_pane);
     }
@@ -279,8 +287,8 @@ impl Viewport {
     /// clamped into `[0, image - visible]`. "Panning cannot lose the image
     /// off-screen" in two lines.
     fn clamp_two(&mut self, image: ImageSize, left: PaneRect, right: PaneRect) {
-        let visible_w = left.width.max(right.width) as f64 / self.scale;
-        let visible_h = left.height.max(right.height) as f64 / self.scale;
+        let visible_w = left.width.min(right.width) as f64 / self.scale;
+        let visible_h = left.height.min(right.height) as f64 / self.scale;
         self.centre.0 = if visible_w >= image.width as f64 {
             image.width as f64 / 2.0
         } else {
@@ -343,9 +351,9 @@ impl Viewport {
         if image.width == 0 || image.height == 0 || pane.width <= 0.0 || pane.height <= 0.0 {
             return None;
         }
-        let (origin_x, origin_y) = origin_for(self.centre, pane, self.scale);
-        let visible_w = pane.width as f64 / self.scale;
-        let visible_h = pane.height as f64 / self.scale;
+        let (origin_x, origin_y) = origin_for(self.centre, self.reference, self.scale);
+        let visible_w = self.reference.width as f64 / self.scale;
+        let visible_h = self.reference.height as f64 / self.scale;
 
         let x0 = origin_x.max(0.0);
         let y0 = origin_y.max(0.0);
@@ -367,8 +375,10 @@ impl Viewport {
             (sy1 - sy0) as u32,
         );
         let dst = (
-            ((sx0 - origin_x) * self.scale) as f32,
-            ((sy0 - origin_y) * self.scale) as f32,
+            ((pane.width - self.reference.width) as f64 / 2.0 + (sx0 - origin_x) * self.scale)
+                as f32,
+            ((pane.height - self.reference.height) as f64 / 2.0 + (sy0 - origin_y) * self.scale)
+                as f32,
             ((sx1 - sx0) * self.scale) as f32,
             ((sy1 - sy0) * self.scale) as f32,
         );
@@ -401,7 +411,7 @@ impl Viewport {
         {
             self.scale = min;
         }
-        self.reference = reference_pane(image, left, right);
+        self.reference = reference_pane(left, right);
         self.clamp_two(image, left, right);
     }
 }

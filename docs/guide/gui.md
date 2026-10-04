@@ -44,6 +44,14 @@ between two tabs of its own:
   editing a value here changes what the next fuse on this tab runs with, and
   a value outside its declared range is flagged before the run starts.
 
+Use the icon at the top right of either image to move that pane into a second
+window. The remaining image fills the main canvas. Both images share the same
+visible area, zoom and pan; unused space stays black when the windows have
+different sizes. Drag the second window by its
+title bar; its dock icon or close button returns the image to the main window.
+It can also be minimized or maximized. On Linux, the second window currently
+requires X11 or XWayland; launch FocusForge with an X11 display available.
+
 ## Fusing a stack
 
 The toolbar's transport button reads **Fuse stack** on a tab with two or

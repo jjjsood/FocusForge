@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFUndockControl inherits Rectangle {
+    in property <bool> enabled: true;
+    in property <bool> hovered: false;
+    in property <bool> dock-back: false;
+    callback triggered();
+
+    width: ShellGeometry.undock-control-width;
+    height: ShellGeometry.undock-control-height;
+    background: (root.hovered || area.has-hover) && root.enabled ? Theme.surface-hover : Theme.surface-overlay;
+    border-radius: Theme.radius-sm;
+    opacity: root.enabled ? 1.0 : 0.5;
+    accessible-role: button;
+    accessible-label: root.dock-back ? "Dock pane" : "Undock pane";
+    accessible-enabled: root.enabled;
+
+    area := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.triggered(); }
+    }
+    Image {
+        source: root.dock-back
+            ? @image-url("../../../../assets/icons/dock-pane.svg")
+            : @image-url("../../../../assets/icons/maximize.svg");
+        colorize: Theme.text-secondary;
+        width: Theme.icon-sm;
+        height: Theme.icon-sm;
+    }
+}

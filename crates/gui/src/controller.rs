@@ -95,6 +95,11 @@ pub enum ShellEvent {
     /// without a second lock on the controller.
     WindowMaximizeToggled(bool),
     WindowCloseRequested,
+    /// A native chrome operation directed at exactly one window.
+    WindowChrome {
+        target: WindowTarget,
+        intent: WindowChromeIntent,
+    },
     CheckpointExportRequested,
     /// A pane left the main window.
     PaneUndockRequested(PaneSource),
@@ -178,6 +183,21 @@ pub enum ShellEvent {
     /// A `Locate frames…` verification ([`AppController::locate_frames`]) is
     /// ready to settle ([`AppController::settle_locate`]).
     LocateReady,
+}
+
+/// The native window that owns a chrome operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowTarget {
+    Main,
+    Comparison,
+}
+
+/// A drawn chrome control's requested native operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowChromeIntent {
+    Drag,
+    Minimize,
+    ToggleMaximize,
 }
 
 /// One live drag: which action it started and the last position seen, so
@@ -326,10 +346,9 @@ pub struct BrushCursorView {
     /// the pointer while `picking`, or the current brush source otherwise --
     /// shown in the cursor's swatch.
     pub pick_color: [u8; 3],
-    /// The right pane's `x` minus the left pane's, logical px: the offset
-    /// that carries a cursor's centre from the pane it is over onto the
-    /// other pane, at the same scene point.
-    pub mirror_dx: f32,
+    /// The shared source point projected into each pane's local coordinates.
+    pub composite_position: (f32, f32),
+    pub zmap_position: (f32, f32),
 }
 
 /// The diagnostics panel's own state: the two directories a bundle is
@@ -1971,6 +1990,19 @@ impl AppController {
         self.emit(ShellEvent::WindowMinimizeRequested);
     }
 
+    /// Sends native chrome to its owning window. Main-window calls retain
+    /// their existing stateful events; the detached window is always native.
+    pub fn window_chrome(&mut self, target: WindowTarget, intent: WindowChromeIntent) {
+        match target {
+            WindowTarget::Main => match intent {
+                WindowChromeIntent::Drag => self.tab_strip_pressed(),
+                WindowChromeIntent::Minimize => self.window_minimize(),
+                WindowChromeIntent::ToggleMaximize => self.window_maximize_toggle(),
+            },
+            WindowTarget::Comparison => self.emit(ShellEvent::WindowChrome { target, intent }),
+        }
+    }
+
     /// The window controls' maximize glyph reads this back
     /// (`AppWindow::window-maximized`, wired in `src/bridge.rs`), so it
     /// looks different maximized than not.
@@ -2596,8 +2628,7 @@ impl AppController {
     /// The brush cursor overlay's own view: extent and path commands built from the current brush
     /// size/softness scaled to on-screen px by the active tab's own viewport, the pipette's own
     /// preview colour -- the Z-Map index under the pointer while armed or while `Alt` is held, the
-    /// selected source otherwise -- and `mirror_dx`, the offset that carries either pane's cursor
-    /// onto the other. `None` with no active tab, viewport or pane geometry, or while
+    /// selected source otherwise -- and projects that source point into both panes. `None` with no active tab, viewport or pane geometry, or while
     /// [`Self::canvas_blocked`] holds.
     pub fn brush_cursor_view(&self) -> Option<BrushCursorView> {
         if self.canvas_blocked() {
@@ -2619,13 +2650,16 @@ impl AppController {
             .flatten()
             .filter(|&source| source != job::NO_SOURCE);
         let source = hovered.unwrap_or_else(|| u16::try_from(tab.selected).unwrap_or(u16::MAX));
+        let (active_pane, local) = self.anchor_pane();
+        let source_point = viewport.to_source_in(local, self.pane_rect(active_pane)?);
         Some(BrushCursorView {
             extent: paths.extent,
             ring_commands: paths.ring,
             core_commands: paths.core,
             picking,
             pick_color: job::source_color(source, sources),
-            mirror_dx: right.x - left.x,
+            composite_position: viewport.from_source_in(source_point, left),
+            zmap_position: viewport.from_source_in(source_point, right),
         })
     }
 

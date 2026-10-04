@@ -1120,7 +1120,7 @@ fn pane_placeholder_shows_only_until_the_first_fuse() {
 
 /// In Editor mode, hovering either pane shows both `FFBrushCursor`s at the
 /// expected centre -- the one under the pointer at the raw hover point, the
-/// other shifted by `cursor-mirror-dx` -- neither shows over the gutter or
+/// other at the projected pane-local point -- neither shows over the gutter or
 /// outside Editor mode, and each cursor's clip container matches its own
 /// pane's rect exactly.
 #[test]
@@ -1139,6 +1139,7 @@ fn both_brush_cursors_follow_either_pane() {
     app.set_project_loaded(true);
     app.set_mode("editor".into());
     app.set_cursor_extent(20.0);
+    app.set_cursor_visible(true);
 
     let rect = |id: &str| {
         let handle = ElementQuery::from_root(&app)
@@ -1149,8 +1150,10 @@ fn both_brush_cursors_follow_either_pane() {
     };
     let (left_pos, left_size) = rect("pane-left");
     let (right_pos, _right_size) = rect("pane-right");
-    let mirror_dx = right_pos.x - left_pos.x;
-    app.set_cursor_mirror_dx(mirror_dx);
+    app.set_cursor_composite_x(40.0);
+    app.set_cursor_composite_y(left_size.height / 2.0);
+    app.set_cursor_zmap_x(40.0);
+    app.set_cursor_zmap_y(left_size.height / 2.0);
 
     // Each clip container matches its own pane's rect exactly.
     for (clip_id, pane_id) in [
@@ -1187,10 +1190,11 @@ fn both_brush_cursors_follow_either_pane() {
     };
 
     // Hovering the left pane: the home cursor sits at the raw pointer, the
-    // mirrored one on the right pane at the pointer plus `mirror_dx`.
+    // mirrored one on the right pane at the same local point.
     let left_point =
         slint::LogicalPosition::new(left_pos.x + 40.0, left_pos.y + left_size.height / 2.0);
     move_to(left_point);
+    assert!(app.get_canvas_pane_hovered());
     let home = find_cursor("brush-cursor-left").expect("shows while hovering its own pane");
     let mirrored = find_cursor("brush-cursor-right").expect("mirrors onto the other pane");
     let (hx, hy) = center(&home);
@@ -1200,15 +1204,16 @@ fn both_brush_cursors_follow_either_pane() {
     );
     let (mx, my) = center(&mirrored);
     assert!(
-        (mx - (left_point.x + mirror_dx)).abs() < GEOMETRY_EPS
+        (mx - (right_pos.x + 40.0)).abs() < GEOMETRY_EPS
             && (my - left_point.y).abs() < GEOMETRY_EPS,
-        "right cursor shifted by mirror_dx, got ({mx}, {my})"
+        "right cursor at the projected point, got ({mx}, {my})"
     );
 
     // Hovering the right pane: the roles (and the sign of the shift) flip.
     let right_point =
         slint::LogicalPosition::new(right_pos.x + 40.0, left_pos.y + left_size.height / 2.0);
     move_to(right_point);
+    assert!(app.get_canvas_pane_hovered());
     let home = find_cursor("brush-cursor-right").expect("shows while hovering its own pane");
     let mirrored = find_cursor("brush-cursor-left").expect("mirrors onto the other pane");
     let (hx, hy) = center(&home);
@@ -1218,17 +1223,19 @@ fn both_brush_cursors_follow_either_pane() {
     );
     let (mx, my) = center(&mirrored);
     assert!(
-        (mx - (right_point.x - mirror_dx)).abs() < GEOMETRY_EPS
+        (mx - (left_pos.x + 40.0)).abs() < GEOMETRY_EPS
             && (my - right_point.y).abs() < GEOMETRY_EPS,
-        "left cursor shifted by -mirror_dx, got ({mx}, {my})"
+        "left cursor at the projected point, got ({mx}, {my})"
     );
 
-    // Over the gutter, neither cursor shows.
+    // The bridge hides both cursors when the pointer leaves either pane.
     let gutter_point = slint::LogicalPosition::new(
         (left_pos.x + left_size.width + right_pos.x) / 2.0,
         left_pos.y + left_size.height / 2.0,
     );
     move_to(gutter_point);
+    assert!(!app.get_canvas_pane_hovered());
+    app.set_cursor_visible(false);
     assert!(
         find_cursor("brush-cursor-left").is_none() && find_cursor("brush-cursor-right").is_none(),
         "both cursors hidden over the gutter"

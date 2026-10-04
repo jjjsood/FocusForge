@@ -4012,11 +4012,11 @@ fn cursor_geometry_follows_radius_softness_and_zoom() {
         250.0,
         NO_MODS,
     );
-    assert_eq!(
-        c.brush_cursor_view().unwrap(),
-        here,
-        "the pointer moves nothing"
-    );
+    let moved = c.brush_cursor_view().unwrap();
+    assert_eq!(moved.extent, here.extent);
+    assert_eq!(moved.ring_commands, here.ring_commands);
+    assert_eq!(moved.core_commands, here.core_commands);
+    assert_ne!(moved.zmap_position, here.zmap_position);
 }
 
 #[test]
@@ -4182,7 +4182,7 @@ fn held_alt_shows_the_pipette_cursor() {
 }
 
 // ---------------------------------------------------------------------
-// The mirrored cursor: both panes' own `BrushCursorView.mirror_dx`.
+// The mirrored cursor: one source point projected into each pane.
 // ---------------------------------------------------------------------
 
 /// The image coordinate `point` (a screen position) maps to through `draw`,
@@ -4200,7 +4200,7 @@ fn image_coord(draw: PaneDraw, pane: PaneRect, point: (f32, f32)) -> (f64, f64) 
 }
 
 /// Hovers `point` (over pane `home`) and proves the mirrored centre --
-/// `point` shifted by `mirror_dx`, signed towards `other` -- lands inside
+/// the projected point in `other` -- lands inside
 /// `other` and maps, through `other`'s own `PaneDraw`, to the same image
 /// coordinate `home`'s own `PaneDraw` gives `point` itself.
 fn assert_scene_point_matches(
@@ -4211,9 +4211,13 @@ fn assert_scene_point_matches(
     case: &str,
 ) {
     c.pointer(PointerKind::Move, Button::Left, point.0, point.1, NO_MODS);
-    let mirror_dx = c.brush_cursor_view().unwrap().mirror_dx;
-    let sign = if other.x > home.x { 1.0 } else { -1.0 };
-    let mirrored = (point.0 + sign * mirror_dx, point.1);
+    let cursor = c.brush_cursor_view().unwrap();
+    let local = if other.x > home.x {
+        cursor.zmap_position
+    } else {
+        cursor.composite_position
+    };
+    let mirrored = (other.x + local.0, other.y + local.1);
     assert!(
         mirrored.0 >= other.x
             && mirrored.0 <= other.x + other.width
@@ -4280,9 +4284,26 @@ fn mirrored_cursor_tracks_the_same_scene_point() {
     check_stage(&mut c, right, "a wider gutter");
 }
 
+#[test]
+fn mirrored_cursor_projects_into_unequal_window_shapes() {
+    let (mut c, _) = open_editor("mirrored_cursor_unequal_windows");
+    for (width, height) in [(80.0, 160.0), (160.0, 80.0)] {
+        let detached = PaneRect {
+            width,
+            height,
+            ..RIGHT
+        };
+        c.set_pane_geometry(LEFT, detached);
+        c.fit();
+        let left_center = (LEFT.x + LEFT.width / 2.0, LEFT.y + LEFT.height / 2.0);
+        let right_center = (detached.x + width / 2.0, detached.y + height / 2.0);
+        assert_scene_point_matches(&mut c, LEFT, detached, left_center, "main to detached");
+        assert_scene_point_matches(&mut c, detached, LEFT, right_center, "detached to main");
+    }
+}
+
 /// The one `BrushCursorView` carries both cursors' geometry: size, softness
-/// and zoom change its extent/ring/core, but `mirror_dx` follows only the
-/// installed pane rects, not the brush or the pointer.
+/// and zoom change its extent/ring/core; both positions follow the pointer.
 #[test]
 fn mirrored_cursor_shares_geometry() {
     let (mut c, _) = open_editor("mirrored_cursor_shares_geometry");
@@ -4294,10 +4315,8 @@ fn mirrored_cursor_shares_geometry() {
         after_size.extent, before.extent,
         "size changes the shared geometry"
     );
-    assert_eq!(
-        after_size.mirror_dx, before.mirror_dx,
-        "mirror_dx is independent of brush size"
-    );
+    assert_eq!(after_size.composite_position, before.composite_position);
+    assert_eq!(after_size.zmap_position, before.zmap_position);
 
     c.set_brush_softness_fraction(0.75);
     let after_soft = c.brush_cursor_view().unwrap();
@@ -4305,10 +4324,8 @@ fn mirrored_cursor_shares_geometry() {
         after_soft.core_commands, after_size.core_commands,
         "softness changes the core"
     );
-    assert_eq!(
-        after_soft.mirror_dx, before.mirror_dx,
-        "mirror_dx is independent of softness"
-    );
+    assert_eq!(after_soft.composite_position, before.composite_position);
+    assert_eq!(after_soft.zmap_position, before.zmap_position);
 
     c.zoom_in();
     let after_zoom = c.brush_cursor_view().unwrap();
@@ -4316,22 +4333,21 @@ fn mirrored_cursor_shares_geometry() {
         after_zoom.extent, after_soft.extent,
         "zoom changes the shared geometry"
     );
-    assert_eq!(
-        after_zoom.mirror_dx, before.mirror_dx,
-        "mirror_dx is independent of zoom"
-    );
 
     let (x, y) = at(5.0, 5.0);
     c.pointer(PointerKind::Move, Button::Left, x, y, NO_MODS);
-    assert_eq!(
-        c.brush_cursor_view().unwrap(),
-        after_zoom,
-        "the pointer moves neither the shared geometry nor mirror_dx"
+    let after_pointer = c.brush_cursor_view().unwrap();
+    assert_eq!(after_pointer.extent, after_zoom.extent);
+    assert_eq!(after_pointer.ring_commands, after_zoom.ring_commands);
+    assert_eq!(after_pointer.core_commands, after_zoom.core_commands);
+    assert_ne!(
+        after_pointer.composite_position,
+        after_zoom.composite_position
     );
 }
 
 /// With the pipette armed, the left pane's hover and the right pane's hover
-/// at that point shifted by `mirror_dx` preview the same colour, the one an
+/// at the projected right-pane point preview the same colour, the one an
 /// Alt + click at the right-pane point then commits; none of arming,
 /// hovering both panes or the commit itself appends a stroke.
 #[test]
@@ -4355,7 +4371,10 @@ fn mirrored_cursor_marks_the_pipette_point() {
         "hovering the left pane previews the pick while armed"
     );
 
-    let right_point = (left_point.0 + left_hover.mirror_dx, left_point.1);
+    let right_point = (
+        RIGHT.x + left_hover.zmap_position.0,
+        RIGHT.y + left_hover.zmap_position.1,
+    );
     c.pointer(
         PointerKind::Move,
         Button::Left,

@@ -161,9 +161,16 @@ fn settings_section_reports_the_stable_backend_line_without_adapter_identity() {
         "the settings window must exit successfully, got {output:?}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let backend = if cfg!(target_os = "linux") {
+        "winit-x11"
+    } else {
+        "winit"
+    };
     assert_eq!(
         stdout.trim(),
-        "resolved backend: winit, renderer: renderer-femtovg-wgpu (wgpu 29.0.4)"
+        format!(
+            "resolved backend: {backend}, renderer: renderer-femtovg-wgpu (wgpu 29.0.4, Manual)"
+        )
     );
     assert!(
         !stdout.contains("adapter"),

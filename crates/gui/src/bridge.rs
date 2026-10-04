@@ -5,7 +5,7 @@
 //! every `AppWindow` callback as a one-line forward, and performs each
 //! `ShellEvent` against the window.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -23,7 +23,7 @@ use crate::canvas::{
 };
 use crate::controller::{
     AppController, ChromeKey, DockTab, GroupingQuestion, JobView, LocateTarget, OpenAs,
-    OpenOutcome, SettingsSection, ShellEvent, ShellMode,
+    OpenOutcome, SettingsSection, ShellEvent, ShellMode, WindowChromeIntent, WindowTarget,
 };
 use crate::diagnostics::{
     DiagnosticsStatus, InputBatch, InputSurface, finish_input_batches, input_trace_incomplete,
@@ -34,9 +34,10 @@ use crate::diagnostics::{
     TimingCounter, measurement_scope, measurement_scope_with_fields, record_timing,
 };
 use crate::generated::{
-    AppWindow, CheckpointEntryView as GeneratedCheckpointEntry, ExportRowView, FFManifestRow,
-    ImageRowView as GeneratedImageRow, ProjectCardView as GeneratedProjectCard, ProjectTabView,
-    RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
+    AppWindow, CheckpointEntryView as GeneratedCheckpointEntry, ComparisonWindow, ExportRowView,
+    FFManifestRow, ImageRowView as GeneratedImageRow, ProjectCardView as GeneratedProjectCard,
+    ProjectTabView, RecentRowView as GeneratedRecentRow, SectionHeadView,
+    SettingsRow as GeneratedSettingsRow,
 };
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
@@ -259,6 +260,9 @@ impl Canvas {
 thread_local! {
     /// What the worker's wake runs on the event loop: publish, then show.
     static PREPARED_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+    /// The one optional detached pane. The source textures stay in `Canvas`;
+    /// this window only binds the matching image on the shared device.
+    static COMPARISON_WINDOW: RefCell<Option<Rc<ComparisonWindow>>> = const { RefCell::new(None) };
 }
 
 /// Publishes the worker's completed reads and shows every pane where the
@@ -279,6 +283,7 @@ fn publish_completed(
         (controller.frame_draw(), controller.plane_draw())
     };
     show_panes(app, &canvas.borrow(), frame_draw, plane_draw);
+    show_comparison_pane(app, controller, &canvas.borrow(), frame_draw, plane_draw);
     // The textures were rendered into in place; Slint sees no property change.
     app.window().request_redraw();
 }
@@ -348,6 +353,110 @@ fn show_panes(
             app.set_image_h(0.0);
         }
     }
+}
+
+/// The editor cursor stays visible while either image pane is hovered.
+fn cursor_hovered(app: &AppWindow) -> bool {
+    app.get_canvas_pane_hovered()
+        || COMPARISON_WINDOW.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|window| window.get_pane_hovered())
+        })
+}
+
+fn show_comparison_pane(
+    app: &AppWindow,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Canvas,
+    frame_draw: Option<PaneDraw>,
+    plane_draw: Option<PaneDraw>,
+) {
+    let cursor_hovered = cursor_hovered(app);
+    let (detached, frame_label, project_loaded, editor_mode, messages, cursor) = {
+        let controller = controller.lock().unwrap();
+        (
+            controller.detached_pane(),
+            truncate_pane_label(&controller.frame_pane_label()),
+            controller.active_project().is_some(),
+            controller.mode() == ShellMode::Editor,
+            controller.composite_message_lines(),
+            controller.brush_cursor_view(),
+        )
+    };
+    let Some(detached) = detached else {
+        return;
+    };
+    COMPARISON_WINDOW.with(|slot| {
+        let Some(window) = slot.borrow().as_ref().cloned() else {
+            return;
+        };
+        window.set_project_loaded(project_loaded);
+        window.set_editor_mode(editor_mode);
+        if let Some(cursor) = cursor {
+            window.set_cursor_extent(cursor.extent);
+            window.set_cursor_ring_commands(cursor.ring_commands.into());
+            window.set_cursor_core_commands(cursor.core_commands.into());
+            window.set_cursor_picking(cursor.picking);
+            window.set_cursor_pick_color(slint::Color::from_rgb_u8(
+                cursor.pick_color[0],
+                cursor.pick_color[1],
+                cursor.pick_color[2],
+            ));
+            window.set_cursor_visible(cursor_hovered);
+            let position = match detached {
+                PaneSource::Composite => cursor.composite_position,
+                PaneSource::ZMap => cursor.zmap_position,
+            };
+            window.set_cursor_x(position.0);
+            window.set_cursor_y(position.1);
+        } else {
+            window.set_cursor_visible(false);
+        }
+        let renderer = canvas.renderer.as_ref();
+        match detached {
+            // Historical `Composite` names the selected-frame pane.
+            PaneSource::Composite => {
+                window.set_pane_label(frame_label.into());
+                window.set_bar_title("FocusForge — Frame".into());
+                window.set_message_lines(string_model(canvas.frame_refusal()));
+                match frame_draw
+                    .and_then(|draw| Some((draw, renderer?.placement(Pane::Frame, &draw)?)))
+                {
+                    Some((draw, (image, dst))) => {
+                        window.set_source(image);
+                        window.set_image_x(dst.0);
+                        window.set_image_y(dst.1);
+                        window.set_image_w(dst.2);
+                        window.set_image_h(dst.3);
+                        window.set_pixelated(draw.pixelated);
+                    }
+                    None => window.set_source(slint::Image::default()),
+                }
+            }
+            // Historical `ZMap` names the displayed composite pane.
+            PaneSource::ZMap => {
+                window.set_pane_label("Composite".into());
+                window.set_bar_title("FocusForge — Composite".into());
+                window.set_message_lines(string_model(&messages));
+                match plane_draw.and_then(|draw| {
+                    let renderer = renderer?;
+                    Some((draw, renderer.placement(renderer.plane().into(), &draw)?))
+                }) {
+                    Some((draw, (image, dst))) => {
+                        window.set_source(image);
+                        window.set_image_x(dst.0);
+                        window.set_image_y(dst.1);
+                        window.set_image_w(dst.2);
+                        window.set_image_h(dst.3);
+                        window.set_pixelated(draw.pixelated);
+                    }
+                    None => window.set_source(slint::Image::default()),
+                }
+            }
+        }
+        window.window().request_redraw();
+    });
 }
 
 /// A fresh model for `lines`, or `None` when `current` already holds them:
@@ -465,6 +574,7 @@ pub fn repaint(
         overlay.as_ref(),
     );
     show_panes(app, &canvas.borrow(), frame_draw, plane_draw);
+    show_comparison_pane(app, controller, &canvas.borrow(), frame_draw, plane_draw);
 }
 
 /// Emits the final pending input batch before diagnostics closes its trace.
@@ -562,6 +672,7 @@ fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::Mea
         ShellEvent::WindowDragRequested
         | ShellEvent::WindowMinimizeRequested
         | ShellEvent::WindowCloseRequested
+        | ShellEvent::WindowChrome { .. }
         | ShellEvent::DetachedWindowCloseRequested
         | ShellEvent::CheckpointExportRequested
         | ShellEvent::PaneUndockRequested(_)
@@ -747,23 +858,313 @@ fn dispatch_coalesced(
 /// `pub` so `src/main.rs`'s startup push reads the same properties through
 /// the same function rather than re-listing them.
 pub fn read_pane_geometry(app: &AppWindow) -> (PaneRect, PaneRect) {
-    let y = app.get_canvas_pane_left_y();
-    let width = app.get_canvas_pane_left_width();
-    let height = app.get_canvas_pane_left_height();
     (
         PaneRect {
             x: app.get_canvas_pane_left_x(),
-            y,
-            width,
-            height,
+            y: app.get_canvas_pane_left_y(),
+            width: app.get_canvas_pane_left_width(),
+            height: app.get_canvas_pane_left_height(),
         },
         PaneRect {
             x: app.get_canvas_pane_right_x(),
-            y,
-            width,
-            height,
+            y: app.get_canvas_pane_right_y(),
+            width: app.get_canvas_pane_right_width(),
+            height: app.get_canvas_pane_right_height(),
         },
     )
+}
+
+fn push_detached_pane(app: &AppWindow, controller: &AppController) {
+    let detached = match controller.detached_pane() {
+        Some(PaneSource::Composite) => "composite",
+        Some(PaneSource::ZMap) => "zmap",
+        None => "",
+    };
+    app.set_detached_pane(detached.into());
+    app.set_canvas_undock_enabled(detached.is_empty());
+}
+
+fn comparison_rect(window: &ComparisonWindow) -> PaneRect {
+    PaneRect {
+        x: window.get_pane_x(),
+        y: window.get_pane_y(),
+        width: window.get_pane_width(),
+        height: window.get_pane_height(),
+    }
+}
+
+/// Reconciles independently-sized panes without resetting manual zoom.
+/// The comparison origin is local to its window, like its input callbacks.
+fn update_detached_geometry(
+    app: &AppWindow,
+    window: &ComparisonWindow,
+    controller: &Arc<Mutex<AppController>>,
+) {
+    push_detached_pane(app, &controller.lock().unwrap());
+    let (left, right) = read_pane_geometry(app);
+    let comparison = comparison_rect(window);
+    let mut controller = controller.lock().unwrap();
+    match controller.detached_pane() {
+        Some(PaneSource::Composite) => {
+            controller.set_pane_geometry_for(PaneSource::ZMap, right);
+            controller.set_pane_geometry_for(PaneSource::Composite, comparison);
+        }
+        Some(PaneSource::ZMap) => {
+            controller.set_pane_geometry_for(PaneSource::Composite, left);
+            controller.set_pane_geometry_for(PaneSource::ZMap, comparison);
+        }
+        None => controller.set_pane_geometry(left, right),
+    }
+}
+
+fn dock_comparison(
+    app: &AppWindow,
+    pane: PaneSource,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+) {
+    controller.lock().unwrap().undocked_window_closed(pane);
+    hide_comparison();
+    push_detached_pane(app, &controller.lock().unwrap());
+    let (left, right) = read_pane_geometry(app);
+    controller.lock().unwrap().set_pane_geometry(left, right);
+    repaint(app, controller, canvas);
+}
+
+fn open_comparison(
+    app: &AppWindow,
+    pane: PaneSource,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+) -> Result<(), slint::PlatformError> {
+    let window = Rc::new(ComparisonWindow::new()?);
+    window.on_dock_requested({
+        let app_weak = app.as_weak();
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        move || {
+            if let Some(app) = app_weak.upgrade() {
+                dock_comparison(&app, pane, &controller, &canvas);
+            }
+        }
+    });
+    let controller_for_chrome = controller.clone();
+    window.on_window_drag_requested(move || {
+        controller_for_chrome
+            .lock()
+            .unwrap()
+            .window_chrome(WindowTarget::Comparison, WindowChromeIntent::Drag);
+    });
+    let controller_for_chrome = controller.clone();
+    window.on_window_minimize_requested(move || {
+        controller_for_chrome
+            .lock()
+            .unwrap()
+            .window_chrome(WindowTarget::Comparison, WindowChromeIntent::Minimize);
+    });
+    let controller_for_chrome = controller.clone();
+    window.on_window_maximize_toggled(move || {
+        controller_for_chrome
+            .lock()
+            .unwrap()
+            .window_chrome(WindowTarget::Comparison, WindowChromeIntent::ToggleMaximize);
+    });
+    window.on_window_close_requested({
+        let app_weak = app.as_weak();
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        move || {
+            if let Some(app) = app_weak.upgrade() {
+                dock_comparison(&app, pane, &controller, &canvas);
+            }
+        }
+    });
+    window.window().on_close_requested({
+        let app_weak = app.as_weak();
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        move || {
+            if let Some(app) = app_weak.upgrade() {
+                dock_comparison(&app, pane, &controller, &canvas);
+            }
+            slint::CloseRequestResponse::HideWindow
+        }
+    });
+    let ready = Rc::new(Cell::new(false));
+    install_comparison_input(
+        &window,
+        pane,
+        app.as_weak(),
+        controller.clone(),
+        canvas.clone(),
+        ready.clone(),
+    );
+    window.window().show()?;
+    COMPARISON_WINDOW.with(|slot| *slot.borrow_mut() = Some(window.clone()));
+    update_detached_geometry(app, &window, controller);
+    controller.lock().unwrap().fit();
+    repaint(app, controller, canvas);
+    ready.set(true);
+    Ok(())
+}
+
+fn hide_comparison() {
+    let window = COMPARISON_WINDOW.with(|slot| slot.borrow_mut().take());
+    if let Some(window) = window {
+        window.window().hide().ok();
+    }
+}
+
+/// Applies native chrome to the currently visible detached window only.
+fn perform_comparison_chrome(intent: WindowChromeIntent) {
+    COMPARISON_WINDOW.with(|slot| {
+        let Some(window) = slot.borrow().as_ref().cloned() else {
+            return;
+        };
+        match intent {
+            WindowChromeIntent::Drag => {
+                window.window().with_winit_window(|native| {
+                    let _ = native.drag_window();
+                });
+            }
+            WindowChromeIntent::Minimize => window.window().set_minimized(true),
+            WindowChromeIntent::ToggleMaximize => {
+                let maximized = window
+                    .window()
+                    .with_winit_window(|native| {
+                        let maximized = !native.is_maximized();
+                        native.set_maximized(maximized);
+                        maximized
+                    })
+                    .unwrap_or(!window.get_window_maximized());
+                window.set_window_maximized(maximized);
+            }
+        }
+    });
+}
+
+/// Releases the detached Slint component while the event loop is still live.
+pub fn shutdown_windows() {
+    hide_comparison();
+}
+
+/// Captures the detached pane when it is visible.
+pub fn comparison_snapshot()
+-> Result<Option<slint::SharedPixelBuffer<slint::Rgba8Pixel>>, slint::PlatformError> {
+    let window = COMPARISON_WINDOW.with(|slot| slot.borrow().as_ref().cloned());
+    window
+        .map(|window| window.window().take_snapshot())
+        .transpose()
+}
+
+/// Uses the detached pane's own dock control path for timed inspection.
+pub fn dock_comparison_for_inspection() {
+    let window = COMPARISON_WINDOW.with(|slot| slot.borrow().as_ref().cloned());
+    if let Some(window) = window {
+        window.invoke_dock_requested();
+    }
+}
+
+/// The detached window reports pane-local coordinates. Its callbacks use the
+/// same controller transitions as the main canvas and repaint both surfaces.
+fn install_comparison_input(
+    window: &ComparisonWindow,
+    pane: PaneSource,
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+    ready: Rc<Cell<bool>>,
+) {
+    let gate = Rc::new(RepaintGate::default());
+    window.on_pane_hover_changed({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app_weak.clone();
+        move || {
+            if let Some(app) = app_weak.upgrade() {
+                repaint(&app, &controller, &canvas);
+            }
+        }
+    });
+    window.on_pane_key_pressed({
+        let app_weak = app_weak.clone();
+        move |text, ctrl, shift, alt| {
+            if let Some(app) = app_weak.upgrade() {
+                app.invoke_canvas_key_pressed(text, ctrl, shift, alt);
+            }
+        }
+    });
+    window.on_pane_key_released({
+        let app_weak = app_weak.clone();
+        move |text, ctrl, shift, alt| {
+            if let Some(app) = app_weak.upgrade() {
+                app.invoke_canvas_key_released(text, ctrl, shift, alt);
+            }
+        }
+    });
+    window.on_pane_focus_changed({
+        let app_weak = app_weak.clone();
+        move || {
+            if let Some(app) = app_weak.upgrade() {
+                app.invoke_canvas_focus_changed();
+            }
+        }
+    });
+    window.on_pane_scrolled({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app_weak.clone();
+        let gate = gate.clone();
+        move |delta_x, delta_y, x, y, ctrl, shift, alt| {
+            dispatch_coalesced(&controller, &canvas, &app_weak, &gate, |controller| {
+                let mods = modifiers(controller, ctrl, shift, alt);
+                controller.wheel_for_pane(pane, delta_x, delta_y, x, y, mods);
+            });
+        }
+    });
+    window.on_pane_pointer({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app_weak.clone();
+        let gate = gate.clone();
+        move |btn, kind, x, y, ctrl, shift, alt| {
+            dispatch_coalesced(&controller, &canvas, &app_weak, &gate, |controller| {
+                let mods = modifiers(controller, ctrl, shift, alt);
+                let kind = match kind {
+                    0 => PointerKind::Down,
+                    2 => PointerKind::Move,
+                    _ => PointerKind::Up,
+                };
+                controller.pointer_for_pane(pane, kind, button(btn), x, y, mods);
+            });
+        }
+    });
+    window.on_pane_dragged({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app_weak.clone();
+        let gate = gate.clone();
+        move |x, y| {
+            dispatch_coalesced(&controller, &canvas, &app_weak, &gate, |controller| {
+                controller.pointer_moved_for_pane(pane, x, y);
+            });
+        }
+    });
+    window.on_pane_resized({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app_weak.clone();
+        let window_weak = window.as_weak();
+        move || {
+            if !ready.get() {
+                return;
+            }
+            if let (Some(app), Some(window)) = (app_weak.upgrade(), window_weak.upgrade()) {
+                update_detached_geometry(&app, &window, &controller);
+                repaint(&app, &controller, &canvas);
+            }
+        }
+    });
 }
 
 /// Locks `controller`, runs `mutate` against it, then pushes the resulting
@@ -1356,6 +1757,7 @@ fn push_overlay_controls(app: &AppWindow, controller: &AppController) {
 fn push_brush_cursor(app: &AppWindow, controller: &AppController) {
     let Some(view) = controller.brush_cursor_view() else {
         app.set_cursor_extent(0.0);
+        app.set_cursor_visible(false);
         return;
     };
     app.set_cursor_extent(view.extent);
@@ -1367,7 +1769,11 @@ fn push_brush_cursor(app: &AppWindow, controller: &AppController) {
         view.pick_color[1],
         view.pick_color[2],
     ));
-    app.set_cursor_mirror_dx(view.mirror_dx);
+    app.set_cursor_visible(cursor_hovered(app));
+    app.set_cursor_composite_x(view.composite_position.0);
+    app.set_cursor_composite_y(view.composite_position.1);
+    app.set_cursor_zmap_x(view.zmap_position.0);
+    app.set_cursor_zmap_y(view.zmap_position.1);
 }
 
 /// Opens the Keep/Discard dialog while the active tab holds a parked run,
@@ -1998,22 +2404,42 @@ pub fn install(
     });
     app.on_composite_undock_requested({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
             record_direct_input();
-            controller
-                .lock()
-                .unwrap()
-                .undock_requested(crate::canvas::PaneSource::Composite)
+            let _undock = measurement_scope("gui_comparison_undock");
+            let pane = PaneSource::Composite;
+            controller.lock().unwrap().undock_requested(pane);
+            if let Some(app) = app_weak.upgrade() {
+                push_detached_pane(&app, &controller.lock().unwrap());
+                if let Err(error) = open_comparison(&app, pane, &controller, &canvas) {
+                    tracing::error!("could not show the comparison window: {error}");
+                    controller.lock().unwrap().undocked_window_closed(pane);
+                    push_detached_pane(&app, &controller.lock().unwrap());
+                    repaint(&app, &controller, &canvas);
+                }
+            }
         }
     });
     app.on_zmap_undock_requested({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move || {
             record_direct_input();
-            controller
-                .lock()
-                .unwrap()
-                .undock_requested(crate::canvas::PaneSource::ZMap)
+            let _undock = measurement_scope("gui_comparison_undock");
+            let pane = PaneSource::ZMap;
+            controller.lock().unwrap().undock_requested(pane);
+            if let Some(app) = app_weak.upgrade() {
+                push_detached_pane(&app, &controller.lock().unwrap());
+                if let Err(error) = open_comparison(&app, pane, &controller, &canvas) {
+                    tracing::error!("could not show the comparison window: {error}");
+                    controller.lock().unwrap().undocked_window_closed(pane);
+                    push_detached_pane(&app, &controller.lock().unwrap());
+                    repaint(&app, &controller, &canvas);
+                }
+            }
         }
     });
     let pointer_repaint = Rc::new(RepaintGate::default());
@@ -2087,6 +2513,16 @@ pub fn install(
                     None => guard.set_pane_geometry(left, right),
                 }
                 drop(guard);
+                repaint(&app, &controller, &canvas);
+            }
+        }
+    });
+    app.on_canvas_hover_changed({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            if let Some(app) = app_weak.upgrade() {
                 repaint(&app, &controller, &canvas);
             }
         }
@@ -3358,6 +3794,14 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::WindowCloseRequested => {
             let _ = app.window().hide();
         }
+        ShellEvent::WindowChrome {
+            target: WindowTarget::Comparison,
+            intent,
+        } => perform_comparison_chrome(intent),
+        ShellEvent::WindowChrome {
+            target: WindowTarget::Main,
+            ..
+        } => unreachable!("main chrome uses its stateful shell events"),
         ShellEvent::ModeChanged(shell_mode) => {
             let mode = match shell_mode {
                 ShellMode::Stacking => "stacking",
@@ -3382,9 +3826,8 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::CheckpointExportRequested => {
             push_export_dialog(app, &controller.lock().unwrap());
         }
-        ShellEvent::PaneUndockRequested(_)
-        | ShellEvent::PaneDocked(_)
-        | ShellEvent::DetachedWindowCloseRequested => {}
+        ShellEvent::DetachedWindowCloseRequested => hide_comparison(),
+        ShellEvent::PaneUndockRequested(_) | ShellEvent::PaneDocked(_) => {}
         // A no-op here: the viewport mutation already happened synchronously
         // inside `AppController::emit_action` before this event was raised,
         // and the repaint it needs runs on the callback path (`repaint`,

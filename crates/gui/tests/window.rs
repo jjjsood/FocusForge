@@ -13,10 +13,380 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(feature = "mcp")]
 use std::process::Stdio;
-#[cfg(feature = "mcp")]
 use std::time::{Duration, Instant};
 
 use common::has_display;
+
+#[test]
+fn comparison_window_geometry() {
+    use focusforge_gui::ComparisonWindow;
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+
+    i_slint_backend_testing::init_no_event_loop();
+    let window = ComparisonWindow::new().unwrap();
+    window.window().set_size(slint::PhysicalSize::new(820, 600));
+    let rect = |id| {
+        let element = ElementQuery::from_root(&window)
+            .match_id(id)
+            .find_first()
+            .unwrap_or_else(|| panic!("missing {id}"));
+        let position = element.absolute_position();
+        let size = element.size();
+        (position.x, position.y, size.width, size.height)
+    };
+    assert_eq!(rect("ComparisonWindow::bar"), (0.0, 0.0, 820.0, 28.0));
+    assert_eq!(rect("ComparisonWindow::pane"), (1.0, 29.0, 818.0, 570.0));
+}
+
+#[test]
+fn comparison_window_forwards_focused_keys_and_focus_loss() {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use focusforge_gui::ComparisonWindow;
+    use slint::ComponentHandle;
+    use slint::platform::WindowEvent;
+
+    i_slint_backend_testing::init_no_event_loop();
+    let window = ComparisonWindow::new().unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let focus_changes = Rc::new(Cell::new(0));
+    window.on_pane_key_pressed({
+        let events = events.clone();
+        move |text, _, _, _| events.borrow_mut().push(format!("down:{text}"))
+    });
+    window.on_pane_key_released({
+        let events = events.clone();
+        move |text, _, _, _| events.borrow_mut().push(format!("up:{text}"))
+    });
+    window.on_pane_focus_changed({
+        let focus_changes = focus_changes.clone();
+        move || focus_changes.set(focus_changes.get() + 1)
+    });
+    window
+        .window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(true));
+    window
+        .window()
+        .dispatch_event(WindowEvent::KeyPressed { text: " ".into() });
+    window
+        .window()
+        .dispatch_event(WindowEvent::KeyReleased { text: " ".into() });
+    window
+        .window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(false));
+    assert_eq!(events.borrow().as_slice(), ["down: ", "up: "]);
+    assert!(focus_changes.get() > 0);
+}
+
+#[test]
+fn comparison_hover_ends_outside_its_pane() {
+    use focusforge_gui::ComparisonWindow;
+    use slint::ComponentHandle;
+    use slint::platform::WindowEvent;
+
+    i_slint_backend_testing::init_no_event_loop();
+    let window = ComparisonWindow::new().unwrap();
+    window.window().set_size(slint::PhysicalSize::new(820, 600));
+    window.window().dispatch_event(WindowEvent::PointerMoved {
+        position: slint::LogicalPosition::new(400.0, 300.0),
+    });
+    assert!(window.get_pane_hovered());
+    window.window().dispatch_event(WindowEvent::PointerMoved {
+        position: slint::LogicalPosition::new(400.0, 10.0),
+    });
+    assert!(!window.get_pane_hovered());
+    window.window().dispatch_event(WindowEvent::PointerExited);
+    assert!(!window.get_pane_hovered());
+}
+
+#[test]
+fn undock_without_project_is_empty() {
+    use focusforge_gui::canvas::PaneSource;
+    use focusforge_gui::{AppController, ComparisonWindow};
+    use i_slint_backend_testing::ElementQuery;
+
+    i_slint_backend_testing::init_no_event_loop();
+    let mut controller = AppController::new();
+    controller.undock_requested(PaneSource::Composite);
+    assert_eq!(controller.detached_pane(), Some(PaneSource::Composite));
+
+    let window = ComparisonWindow::new().unwrap();
+    assert!(!window.get_project_loaded());
+    for id in ["FFPane::pane-label", "FFPane::pane-undock"] {
+        assert!(
+            ElementQuery::from_root(&window)
+                .match_id(id)
+                .find_all()
+                .is_empty(),
+            "{id} appears without a project"
+        );
+    }
+}
+
+#[test]
+fn dock_back_restores_two_panes() {
+    use focusforge_gui::canvas::PaneSource;
+    use focusforge_gui::{AppController, AppWindow};
+    use slint::ComponentHandle;
+
+    i_slint_backend_testing::init_no_event_loop();
+    let app = AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let mut controller = AppController::new();
+    controller.undock_requested(PaneSource::Composite);
+    app.set_detached_pane("composite".into());
+    assert_eq!(app.get_canvas_pane_left_width(), 0.0);
+    assert_eq!(app.get_canvas_pane_right_width(), 1148.0);
+
+    controller.undocked_window_closed(PaneSource::Composite);
+    app.set_detached_pane("".into());
+    assert_eq!(controller.detached_pane(), None);
+    assert_eq!(app.get_canvas_pane_left_width(), 566.0);
+    assert_eq!(app.get_canvas_pane_right_width(), 566.0);
+}
+
+#[test]
+fn comparison_capture_requires_detached_pane() {
+    if !has_display() {
+        println!("SKIP: window tests need DISPLAY or WAYLAND_DISPLAY");
+        return;
+    }
+    let output = common::gui_bin("comparison_capture_requires_detached_pane")
+        .args(["--exit-after", "500", "--screenshot-window", "comparison"])
+        .arg("--screenshot")
+        .arg(common::workspace_root().join(".scratch/gui-screenshots/no-detached-pane.png"))
+        .output()
+        .expect("launch focusforge-gui");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--screenshot-window comparison requires a detached pane")
+    );
+}
+
+#[test]
+fn both_sides_open_a_real_comparison_window() {
+    if std::env::var_os("DISPLAY").is_none() {
+        println!("SKIP: comparison windows need an X11/XWayland DISPLAY");
+        return;
+    }
+    let dir = common::tree("both_comparison_sides");
+    for side in ["frame", "composite"] {
+        let capture = dir.join(format!("{side}.png"));
+        let output = common::gui_bin(&format!("comparison_{side}"))
+            .arg("--open")
+            .arg(common::fixture_frame("mantis-64", 0))
+            .args(["--undock-pane", side, "--exit-after", "8000"])
+            .args(["--screenshot-window", "comparison", "--screenshot"])
+            .arg(&capture)
+            .output()
+            .expect("launch comparison window");
+        assert!(
+            output.status.success(),
+            "{side} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = std::fs::read(&capture).expect("detached window capture");
+        let info = png::Decoder::new(std::io::Cursor::new(bytes))
+            .read_info()
+            .expect("valid detached PNG");
+        assert!(info.info().width >= 820 && info.info().height >= 600);
+    }
+}
+
+#[test]
+fn comparison_reopens_after_dock_and_main_close_exits() {
+    if std::env::var_os("DISPLAY").is_none() {
+        println!("SKIP: comparison windows need an X11/XWayland DISPLAY");
+        return;
+    }
+    let capture = common::tree("comparison_reopen").join("reopened.png");
+    let output = common::gui_bin("comparison_reopen")
+        .arg("--open")
+        .arg(common::fixture_frame("mantis-64", 0))
+        .args([
+            "--undock-pane",
+            "frame",
+            "--dock-after",
+            "500",
+            "--reopen-after",
+            "500",
+            "--exit-after",
+            "8000",
+            "--screenshot-window",
+            "comparison",
+            "--screenshot",
+        ])
+        .arg(&capture)
+        .output()
+        .expect("launch reopened comparison");
+    assert!(
+        output.status.success(),
+        "reopen failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(capture.exists(), "reopened comparison was not captured");
+
+    let watchdog_capture = common::tree("comparison_main_close").join("watchdog.png");
+    let output = common::gui_bin("comparison_main_close")
+        .arg("--open")
+        .arg(common::fixture_frame("mantis-64", 0))
+        .args([
+            "--undock-pane",
+            "frame",
+            "--close-main-after",
+            "500",
+            "--exit-after",
+            "15000",
+            "--screenshot",
+        ])
+        .arg(&watchdog_capture)
+        .output()
+        .expect("launch comparison and close main");
+    assert!(
+        output.status.success(),
+        "main close failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !watchdog_capture.exists(),
+        "main close did not exit before watchdog"
+    );
+}
+
+#[test]
+fn cancelling_a_guarded_main_quit_keeps_both_real_windows_rendering() {
+    if std::env::var_os("DISPLAY").is_none() {
+        println!("SKIP: comparison windows need an X11/XWayland DISPLAY");
+        return;
+    }
+    let capture = common::tree("comparison_cancelled_main_quit").join("comparison.png");
+    let started = Instant::now();
+    let output = common::gui_bin("comparison_cancelled_main_quit")
+        .arg("--open")
+        .arg(common::fixture_frame("mantis-64", 0))
+        .args([
+            "--fuse-tabs",
+            "0",
+            "--undock-pane",
+            "frame",
+            "--cancel-quit-after",
+            "500",
+            "--exit-after",
+            "8000",
+            "--screenshot-window",
+            "comparison",
+            "--screenshot",
+        ])
+        .arg(&capture)
+        .output()
+        .expect("launch comparison and cancel guarded main quit");
+    assert!(
+        output.status.success(),
+        "cancelled main quit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(7),
+        "the main event loop exited before its scheduled inspection end"
+    );
+    let bytes = std::fs::read(&capture).expect("comparison survives the cancelled quit");
+    png::Decoder::new(std::io::Cursor::new(bytes))
+        .read_info()
+        .expect("comparison stays renderable after a cancelled main quit");
+}
+
+#[test]
+fn comparison_chrome_intents_do_not_change_main_chrome() {
+    use focusforge_gui::{AppController, ShellEvent, WindowChromeIntent, WindowTarget};
+    use std::sync::{Arc, Mutex};
+
+    let mut controller = AppController::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = events.clone();
+    controller.set_sink(Arc::new(move |event| {
+        sink_events.lock().unwrap().push(event)
+    }));
+
+    controller.window_chrome(WindowTarget::Comparison, WindowChromeIntent::Minimize);
+    controller.window_chrome(WindowTarget::Comparison, WindowChromeIntent::ToggleMaximize);
+    controller.window_chrome(WindowTarget::Comparison, WindowChromeIntent::ToggleMaximize);
+
+    assert!(
+        !controller.maximized(),
+        "comparison chrome cannot alter main chrome"
+    );
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            ShellEvent::WindowChrome {
+                target: WindowTarget::Comparison,
+                intent: WindowChromeIntent::Minimize,
+            },
+            ShellEvent::WindowChrome {
+                target: WindowTarget::Comparison,
+                intent: WindowChromeIntent::ToggleMaximize,
+            },
+            ShellEvent::WindowChrome {
+                target: WindowTarget::Comparison,
+                intent: WindowChromeIntent::ToggleMaximize,
+            },
+        ]
+    );
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn comparison_device_loss_exits_cleanly() {
+    if std::env::var_os("DISPLAY").is_none() {
+        println!("SKIP: comparison windows need an X11/XWayland DISPLAY");
+        return;
+    }
+    let output = common::gui_bin("comparison_device_loss")
+        .arg("--open")
+        .arg(common::fixture_frame("mantis-64", 0))
+        .args(["--undock-pane", "frame", "--exit-after", "5000"])
+        .env("FF_FORCE_DEVICE_LOST_MS", "1500")
+        .output()
+        .expect("launch comparison and destroy device");
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("graphics device is gone"), "{stderr}");
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_x11_display_fails_clearly() {
+    let output = common::gui_bin("missing_x11_display")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .expect("launch focusforge-gui");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("X11/XWayland display unavailable: DISPLAY is not set")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unusable_x11_display_fails_clearly() {
+    let output = common::gui_bin("unusable_x11_display")
+        .env("DISPLAY", ":99999")
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .expect("launch focusforge-gui");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        stderr.contains("display") || stderr.contains("x11"),
+        "no display error: {stderr}"
+    );
+}
 
 #[test]
 fn screenshot_is_not_uniform() {

@@ -53,13 +53,39 @@ fn unequal_panes_share_centre_scale_and_bounds() {
         left_centre, right_centre,
         "both pane centres map to one source centre"
     );
-    assert!((left_centre.0 - 550.0).abs() < 1e-6);
-    assert!((left_centre.1 - 600.0).abs() < 1e-6);
+    assert!((left_centre.0 - 800.0).abs() < 1e-6);
+    assert!((left_centre.1 - 750.0).abs() < 1e-6);
 
     let left_draw = viewport.draw(image, left).unwrap();
     let right_draw = viewport.draw(image, right).unwrap();
     assert!((left_draw.dst.2 as f64 / left_draw.src.2 as f64 - 1.0).abs() < 1e-6);
     assert!((right_draw.dst.2 as f64 / right_draw.src.2 as f64 - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn unequal_panes_show_the_same_cropped_source_with_black_margins() {
+    let image = image(1000, 1000);
+    let narrow = pane(400.0, 800.0);
+    let wide = pane(900.0, 500.0);
+    let mut viewport = fit_two(image, narrow, wide);
+    viewport.zoom_steps_in(3, (200.0, 400.0), image, narrow, wide);
+
+    let narrow_draw = viewport.draw(image, narrow).unwrap();
+    let wide_draw = viewport.draw(image, wide).unwrap();
+    assert_eq!(narrow_draw.src, wide_draw.src);
+    assert_eq!(narrow_draw.src, (300, 250, 400, 500));
+    assert_eq!(narrow_draw.dst, (0.0, 150.0, 400.0, 500.0));
+    assert_eq!(wide_draw.dst, (250.0, 0.0, 400.0, 500.0));
+
+    viewport.pan_by_two(-100_000.0, -100_000.0, image, narrow, wide);
+    assert_eq!(
+        viewport.draw(image, narrow).unwrap().src,
+        (600, 500, 400, 500)
+    );
+    assert_eq!(
+        viewport.draw(image, wide).unwrap().src,
+        (600, 500, 400, 500)
+    );
 }
 
 #[test]
@@ -73,12 +99,12 @@ fn unequal_projection_roundtrips_and_boundary_zoom_uses_both_bounds() {
             lower.zoom_steps_in(3, (0.0, 0.0), image, gesture, other);
             assert!((lower.scale() - 1.0).abs() < 1e-9);
             let lower_centre = lower.to_source_in((left.width / 2.0, left.height / 2.0), left);
-            assert_eq!(lower_centre, (450.0, 400.0));
+            assert_eq!(lower_centre, (200.0, 250.0));
 
             let mut upper = fit_two(image, left, right);
             upper.zoom_steps_in(3, (gesture.width, gesture.height), image, gesture, other);
             let upper_centre = upper.to_source_in((right.width / 2.0, right.height / 2.0), right);
-            assert_eq!(upper_centre, (550.0, 600.0));
+            assert_eq!(upper_centre, (800.0, 750.0));
 
             for pane in [left, right] {
                 let draw = upper.draw(image, pane).unwrap();
@@ -152,16 +178,12 @@ fn unequal_pane_matrix_covers_both_anchors_bounds_and_pan_distance() {
             viewport.pan_by_two(-100_000.0, -100_000.0, image, left, right);
             let upper = viewport.to_source_in((right.width / 2.0, right.height / 2.0), right);
             let scale = viewport.scale();
-            assert!(
-                (upper.0 - (image.width as f64 - right.width as f64 / (2.0 * scale))).abs() < 1e-6
-            );
-            assert!(
-                (upper.1 - (image.height as f64 - left.height as f64 / (2.0 * scale))).abs() < 1e-6
-            );
+            assert!((upper.0 - (image.width as f64 - 200.0 / (2.0 * scale))).abs() < 1e-6);
+            assert!((upper.1 - (image.height as f64 - 250.0 / (2.0 * scale))).abs() < 1e-6);
             viewport.pan_by_two(100_000.0, 100_000.0, image, left, right);
             let lower = viewport.to_source_in((left.width / 2.0, left.height / 2.0), left);
-            assert!((lower.0 - right.width as f64 / (2.0 * scale)).abs() < 1e-6);
-            assert!((lower.1 - left.height as f64 / (2.0 * scale)).abs() < 1e-6);
+            assert!((lower.0 - 200.0 / (2.0 * scale)).abs() < 1e-6);
+            assert!((lower.1 - 250.0 / (2.0 * scale)).abs() < 1e-6);
         }
     }
 
@@ -586,6 +608,7 @@ fn gestures_come_from_the_input_map() {
     // wheel with a bare `accept`, forwarding nothing.
     let raw_gesture_callback_exceptions = [
         "canvas.slint",
+        "comparison_window.slint",
         "ff_slider.slint",
         "ff_scrollbar.slint",
         "settings_panel.slint",
