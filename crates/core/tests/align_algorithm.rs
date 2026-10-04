@@ -745,7 +745,10 @@ fn each_divergence_reports_its_pyramid_level() {
         let last = levels
             .last()
             .expect("at least the coarsest level is always solved");
-        if outcome.status == AlignStatus::Diverged(DivergenceReason::ValidationFailed) {
+        if matches!(
+            outcome.status,
+            AlignStatus::Diverged(DivergenceReason::ValidationFailed | DivergenceReason::WeakMatch)
+        ) {
             assert!(
                 matches!(
                     AlignStatus::from(last.result.status),

@@ -279,7 +279,12 @@ fn hit_cap_frames_report_their_distance_from_epsilon() {
                     worst = level;
                 }
             }
-            if outcome.status != AlignStatus::Diverged(DivergenceReason::ValidationFailed) {
+            if !matches!(
+                outcome.status,
+                AlignStatus::Diverged(
+                    DivergenceReason::ValidationFailed | DivergenceReason::WeakMatch
+                )
+            ) {
                 assert_eq!(
                     outcome.status, worst,
                     "mode={mode} frame={frame}: the frame reports the worst level status"

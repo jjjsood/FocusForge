@@ -51,7 +51,10 @@
 //! After a frame that did not diverge, `PyramidalEcc::validate`
 //! evaluates the fit at up to eight off-centre patches; a frame where most
 //! usable ones exceed [`VALIDATION_TOLERANCE_PX`] is reported
-//! [`crate::align::DivergenceReason::ValidationFailed`], fit kept.
+//! [`crate::align::DivergenceReason::ValidationFailed`], fit kept. A frame
+//! whose final correlation lies below [`MIN_FINAL_CORRELATION`] is reported
+//! [`crate::align::DivergenceReason::WeakMatch`] instead, fit kept, without
+//! the patch evaluation.
 
 use std::sync::{Arc, LazyLock, OnceLock};
 
@@ -84,6 +87,13 @@ const LEVEL0_WINDOW_LIMIT_PX: u32 = 256;
 /// The largest per-patch residual, in level-0 pixels, a fit may leave at an
 /// off-centre patch and still count as holding there.
 const VALIDATION_TOLERANCE_PX: f64 = 1.0;
+
+/// The lowest final correlation a frame may end on and still count as
+/// registered. A solver-robustness floor for gross wrong optima, not a
+/// quality measure: a wrong fit on a 64-frame synthetic stack ended at 0.061
+/// while the lowest correct synthetic frame reached 0.354 and real frames
+/// 0.7 and above.
+const MIN_FINAL_CORRELATION: f64 = 0.2;
 
 /// Usable patches a frame needs before the off-centre check may flag it.
 const MIN_USABLE_PATCHES: usize = 3;
@@ -809,10 +819,14 @@ impl PyramidalEcc {
         }
 
         if !matches!(final_status, AlignStatus::Diverged(_)) {
-            let _scope = measurement_scope("ecc_validate");
-            let check = reference.validate(ctx, frame, &final_transform, params)?;
-            if check.flagged() {
-                final_status = AlignStatus::Diverged(DivergenceReason::ValidationFailed);
+            if final_residual < MIN_FINAL_CORRELATION {
+                final_status = AlignStatus::Diverged(DivergenceReason::WeakMatch);
+            } else {
+                let _scope = measurement_scope("ecc_validate");
+                let check = reference.validate(ctx, frame, &final_transform, params)?;
+                if check.flagged() {
+                    final_status = AlignStatus::Diverged(DivergenceReason::ValidationFailed);
+                }
             }
         }
 
@@ -1887,8 +1901,15 @@ mod tests {
         (reference, attempt, escalation)
     }
 
-    /// The identity-start attempt alone: what a frame gets with no escalation.
-    fn unseeded(mem: &MemReader, mode: EccMode, depth: u32, frame: usize) -> Attempt {
+    /// One attempt on frame `frame` from `start`, a transform in the coarsest
+    /// level's pixels, with no escalation.
+    fn attempt_from(
+        mem: &MemReader,
+        mode: EccMode,
+        depth: u32,
+        frame: usize,
+        start: Transform,
+    ) -> Attempt {
         let ctx = AlignContext::new(StackContext::new(mem.frames.len(), W, H, 1), 0, mem);
         let reference = PreparedReference::build(&ctx, 0, mode, depth).unwrap();
         let pyramid = PyramidalEcc::build_pyramid(&ctx, frame, depth).unwrap();
@@ -1899,10 +1920,47 @@ mod tests {
             &pyramid,
             depth,
             &test_params(400),
-            Transform::identity(),
+            start,
             false,
         )
         .unwrap()
+    }
+
+    /// The identity-start attempt alone: what a frame gets with no escalation.
+    fn unseeded(mem: &MemReader, mode: EccMode, depth: u32, frame: usize) -> Attempt {
+        attempt_from(mem, mode, depth, frame, Transform::identity())
+    }
+
+    #[test]
+    fn a_fit_that_settles_in_a_wrong_basin_below_the_floor_is_flagged_with_its_fit_kept() {
+        // Frame 1 equals the reference; the start is 15 degrees and 8.5 % off
+        // about the coarsest level's centre, inside a basin the solver settles
+        // in with a correlation near 0.1.
+        let mem = blob_reader(&[(0.0, 0.0), (0.0, 0.0)]);
+        let (cx, cy) = (f64::from(W / 4 - 1) / 2.0, f64::from(H / 4 - 1) / 2.0);
+        let start = Transform::translation(cx, cy)
+            .compose(&Transform::similarity(
+                1.085,
+                (-15.0f64).to_radians(),
+                0.0,
+                0.0,
+            ))
+            .compose(&Transform::translation(-cx, -cy));
+
+        let attempt = attempt_from(&mem, EccMode::Similarity, 2, 1, start);
+
+        assert!(attempt.residual < MIN_FINAL_CORRELATION, "{attempt:?}");
+        assert_eq!(
+            attempt.status,
+            AlignStatus::Diverged(DivergenceReason::WeakMatch),
+            "{attempt:?}"
+        );
+        let (scale, radians, _, _) = attempt.transform.similarity_parts();
+        assert!(
+            (radians.to_degrees() + 15.0).abs() < 3.0 && scale > 1.05,
+            "the wrong fit is kept, not the identity: scale {scale}, {} deg",
+            radians.to_degrees()
+        );
     }
 
     #[test]
