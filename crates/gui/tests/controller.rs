@@ -1580,6 +1580,12 @@ fn an_older_picture_never_replaces_a_newer_one() {
 
     let mut controller = controller_with_scratch("older_picture");
     open_mantis64_tab(&mut controller, "older_picture", 3);
+    // The reference pictures above are fused without gains; fuse the same way.
+    controller.set_param_value(
+        "prepare",
+        "equalize",
+        focusforge_core::params::ParamValue::Bool(false),
+    );
     assert!(controller.start_fuse());
     settle_fuse_only(&mut controller);
     assert!(controller.set_mode(ShellMode::Stacking));
