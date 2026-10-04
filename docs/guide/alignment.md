@@ -81,18 +81,20 @@ that says so; `--no-crop` keeps the full frame extent instead.
 
 ## Limits
 
-Alignment reports a failure rather than guessing, and some inputs still
-produce one:
+Some inputs still defeat the solver:
 
-- Heavy defocus, where frames are blurred past the point that carries
-  alignment detail, can leave frames `diverged` (`correlation-decreased`).
-- Long series (on the order of 64 frames) can leave several frames
-  `diverged`, because drift accumulates across the stack.
+- Heavy defocus and long series (on the order of 64 frames) can leave frames
+  `diverged` (`correlation-decreased`). On the same stacks a frame can also
+  end `converged` with a wrong transform and no warning, off by anything from
+  a pixel to over a hundred, so `converged` does not prove correctness there.
+  Check such a stack with `--write-warped` and look at the result, or compare
+  each frame's transform with its neighbours'.
 - Strongly periodic scenes (repeating patterns) can register to the wrong
   period.
 
-For such a stack use `--lax` to fuse anyway, or `--no-align` when the frames
-are already registered.
+Only `diverged` is a failure: `stalled`, `hit-cap` and `converged` frames
+never fail a strict run. For a stack with `diverged` frames use `--lax` to
+fuse anyway, or `--no-align` when the frames are already registered.
 
 ## Reuse and hardware
 

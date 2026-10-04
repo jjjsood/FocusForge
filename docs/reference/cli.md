@@ -245,8 +245,8 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | `--groups <PATH>` | group the frames as this TOML file says instead of proposing a grouping |
 | `--write-groups <PATH>` | write the proposed grouping to this path in the format `--groups` reads, then carry on with the run |
 | `--only <ID>` | run only the named result(s), repeatable; every unselected group is skipped, its project left untouched |
-| `--no-align` | skip alignment: frame tiles are fused unwarped and the output stays full-frame. Sets the project's `align` value to off |
-| `--no-crop` | skip the auto-crop: the output stays at the full frame extent even with alignment on. Sets the project's `auto-crop` value to off; with the crop on and no interior common to the aligned frames, `stack` stops and names this flag |
+| `--no-align` | skip alignment: frame tiles are fused unwarped and the output stays full-frame. Alignment is on by default, matching the project's `align` value |
+| `--no-crop` | skip the auto-crop: the output stays at the full frame extent even with alignment on. The crop is on by default, matching the project's `auto-crop` value; with the crop on and no interior common to the aligned frames, `stack` stops and names this flag |
 | `--align-algo <ALGO>` | alignment algorithm id; optional, defaults to the sole registered alignment algorithm |
 | `--align-set <KEY=VALUE>` | set one alignment parameter, repeatable; separate from `--set`, which is the stacking algorithm's own |
 | `--resume` | resume a previously cancelled run of this same stack, found by fingerprint under `.scratch/resume/` |
@@ -591,7 +591,9 @@ diverged frame carries `reason`: `singular-hessian`, `lemma-one-region`,
 `non-finite-update` or `validation-failed` (the fit converged but its
 transform leaves a large residual at patches away from the fit region).
 `stalled` means the iteration cap was reached with flat or oscillating steps
-and the best-correlation transform is kept. In the text report a diverged row
+and the best-correlation transform is kept; only `diverged` counts as a
+failure, so a `stalled` frame neither fails a strict run nor adds to
+`failure_count`. In the text report a diverged row
 reads `diverged(<Reason>)`. `align_backend` is `"cpu"`, or the GPU adapter's
 display name when at least one alignment level ran on it; a device lost
 mid-run reruns the whole alignment on the CPU and reports `"cpu"`. The same
