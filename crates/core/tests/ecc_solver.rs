@@ -498,6 +498,32 @@ fn iteration_cap_is_honored() {
     assert_eq!(result.iterations, 2);
 }
 
+/// A frame against its own contrast inversion is anti-correlated: whatever the
+/// solver reports, it is not `Converged`.
+#[test]
+fn an_inverted_contrast_pair_is_not_converged() {
+    let (tile, width, height) = frame_3_tile();
+    let template_plane = luma_plane(&tile, width, height);
+    let inverted = Tile {
+        samples: tile.samples.iter().map(|&s| u16::MAX - s).collect(),
+        ..tile
+    };
+    let moving_plane = luma_plane(&inverted, width, height);
+
+    for mode in [EccMode::Translation, EccMode::Similarity] {
+        let result = solve_level(
+            &template_plane,
+            default_region(),
+            &moving_plane,
+            &Transform::identity(),
+            mode,
+            &default_params(),
+        )
+        .expect("valid solver inputs");
+        assert_ne!(result.status, EccStatus::Converged, "{mode:?}: {result:?}");
+    }
+}
+
 #[test]
 fn result_reports_iterations_and_error() {
     let (tile, width, height) = frame_3_tile();

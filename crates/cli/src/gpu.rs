@@ -7,10 +7,10 @@
 //! off, `crate::main`'s own `resolve_backend` never even calls into this
 //! module, and none of it is compiled.
 
-use focusforge_core::gpu::TileBackend;
-use focusforge_gpu::harness::{GpuBackend, backend_for};
+use focusforge_core::gpu::{AlignBackend, TileBackend};
+use focusforge_gpu::harness::{GpuBackend, align_backend_for, backend_for};
 
-use crate::stack::{BackendChoice, DeviceBudgetReport, DevicePeak};
+use crate::stack::{AlignBackendChoice, BackendChoice, DeviceBudgetReport, DevicePeak};
 
 /// The device budget's own realized high-water tile count for this
 /// `GpuBackend`, scoped to one group: `reset_peak` restarts the interval,
@@ -49,5 +49,28 @@ pub fn resolve_backend(algorithm_id: &str, no_gpu: bool, max_vram: Option<u64>) 
             }
         }
         None => BackendChoice::cpu(),
+    }
+}
+
+/// [`resolve_backend`] for the align stage: prints the one-line reason to
+/// stderr (also under `--quiet`) when the CPU is chosen up front, and
+/// otherwise returns an accelerator that opens the adapter on the first level
+/// it serves and prints its selection line then.
+pub fn resolve_align_backend(
+    algorithm_id: &str,
+    no_gpu: bool,
+    max_vram: Option<u64>,
+) -> AlignBackendChoice {
+    let (backend, message) =
+        align_backend_for(algorithm_id, no_gpu, max_vram, |line| eprintln!("{line}"));
+    if !message.is_empty() {
+        eprintln!("{message}");
+    }
+    match backend {
+        Some(backend) => AlignBackendChoice {
+            backend: Some(backend as &dyn AlignBackend),
+            adapter: Some(backend.adapter()),
+        },
+        None => AlignBackendChoice::cpu(),
     }
 }

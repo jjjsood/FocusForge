@@ -18,6 +18,7 @@ mod error;
 
 use std::num::NonZeroU32;
 
+use crate::gpu::AlignBackend;
 pub use crate::params::StackContext;
 use crate::params::{ParamDesc, ParamValue, ParamValues};
 use crate::tile::{Rect, Tile};
@@ -201,6 +202,7 @@ pub struct AlignContext<'a> {
     reference: usize,
     reader: &'a dyn TileReader,
     prepared: Option<&'a (dyn std::any::Any + Send + Sync)>,
+    align_backend: Option<&'a dyn AlignBackend>,
 }
 
 impl<'a> AlignContext<'a> {
@@ -210,7 +212,20 @@ impl<'a> AlignContext<'a> {
             reference,
             reader,
             prepared: None,
+            align_backend: None,
         }
+    }
+
+    /// Attaches the optional accelerator the registration may offer its
+    /// large solves to; `None` keeps every solve on the CPU.
+    pub fn with_align_backend(mut self, backend: Option<&'a dyn AlignBackend>) -> Self {
+        self.align_backend = backend;
+        self
+    }
+
+    /// The accelerator attached with [`Self::with_align_backend`], if any.
+    pub fn align_backend(&self) -> Option<&'a dyn AlignBackend> {
+        self.align_backend
     }
 
     /// Attaches the driver's [`AlignAlgorithm::prepare_run`] output, if any.
@@ -335,8 +350,12 @@ pub trait StackAlgorithm: Send + Sync + 'static {
 pub enum AlignStatus {
     /// The solver's step measure fell below its convergence threshold.
     Converged,
-    /// The solver's iteration cap was reached with no convergence.
+    /// The solver's iteration cap was reached with no convergence, and the
+    /// last steps were still shrinking.
     HitCap,
+    /// The solver's iteration cap was reached and its last steps were flat or
+    /// oscillating; the best transform found is kept.
+    Stalled,
     /// Registration failed; see [`crate::align::DivergenceReason`].
     Diverged(crate::align::DivergenceReason),
 }
@@ -346,6 +365,7 @@ impl From<crate::align::EccStatus> for AlignStatus {
         match status {
             crate::align::EccStatus::Converged => AlignStatus::Converged,
             crate::align::EccStatus::HitCap => AlignStatus::HitCap,
+            crate::align::EccStatus::Stalled => AlignStatus::Stalled,
             crate::align::EccStatus::Diverged(reason) => AlignStatus::Diverged(reason),
         }
     }
@@ -448,6 +468,18 @@ mod tests {
     use crate::align::Transform;
     use crate::io::{FrameError, TiffError};
     use crate::params::{EnumVariant, ParamKind, ParamValue, Provenance};
+
+    #[test]
+    fn a_stalled_status_serialises_as_its_kebab_name() {
+        let json = serde_json::to_string(&AlignStatus::Stalled).expect("serialise");
+        assert_eq!(json, r#"{"status":"stalled"}"#);
+        let back: AlignStatus = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back, AlignStatus::Stalled);
+        assert_eq!(
+            AlignStatus::from(crate::align::EccStatus::Stalled),
+            AlignStatus::Stalled
+        );
+    }
 
     fn sample_tiles(frame_count: usize, width: u32, height: u32) -> (Rect, Vec<Tile>) {
         let rect = Rect {

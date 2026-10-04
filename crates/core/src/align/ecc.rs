@@ -98,34 +98,31 @@
 //!
 //! ## Termination
 //!
-//! Three signals: **converged** when the step measure -- the maximum, over
-//! `region`'s four corners `x`, of `‖ΔW^-1(x) - x‖` in template pixels --
-//! falls below [`EccParams::epsilon_px`]; **hit the cap** at
-//! [`EccParams::max_iterations`] with no convergence; **diverged**, for a
-//! singular Hessian, the Lemma 1 region, a non-invertible increment, too
-//! few valid samples, a non-finite update, or a correlation that falls
-//! more than a documented slack below the best ρ seen so far
-//! ([`DivergenceReason::CorrelationDecreased`]). The step measure is used
-//! rather than the raw `‖Δp‖`: in similarity mode that norm mixes
-//! dimensionless `c`, `s` against pixel-valued `tx`, `ty`, so one epsilon
-//! would mean two different things per mode, and could not be scaled
-//! between pyramid levels the way a pixel corner displacement can. On
-//! divergence, the returned transform is the **best-ρ transform seen**,
-//! never the last one tried.
+//! **Converged** when the step measure -- the maximum, over `region`'s four
+//! corners `x`, of `‖ΔW^-1(x) - x‖` in template pixels -- falls below
+//! [`EccParams::epsilon_px`]; at [`EccParams::max_iterations`] without that,
+//! **stalled** if the last ten steps are flat or oscillating (best-ρ transform
+//! returned) and **hit the cap** otherwise. **Diverged** (see
+//! [`DivergenceReason`]) returns the best-ρ transform seen, never the last.
 //!
-//! The shipped default, `max-iterations = 400`, converges all 61
-//! reference frames -- none hits the cap, the slowest needing 332
-//! iterations -- for `+31 s` on a `182 s` alignment pass (`+17%`).
+//! The raw `‖Δp‖` is not used: in similarity mode it mixes dimensionless
+//! `c`, `s` with pixel-valued `tx`, `ty` and cannot be scaled between pyramid
+//! levels.
 //!
 //! Sample arithmetic is `f32`; every accumulation (means, dot products,
 //! `C`, `Ḡ^t ·`) and the normal-equation solve are `f64`. The loop is
 //! serial, not rayon: `f64` summation order is what makes a recovered
 //! transform reproducible run to run, matching `crate::fuse::pyramid`.
 
+use std::convert::Infallible;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::algorithm::AlgorithmError;
 use crate::align::error::AlignError;
 use crate::align::transform::Transform;
 use crate::align::warp::catmull_rom_weights;
 use crate::fuse::pyramid::Plane;
+use crate::gpu::{AlignBackend, ECC_MOMENTS, EccSessionRequest};
 use crate::tile::Rect;
 use crate::timing::{TimingCounter, mark_timing_saturated, measurement_scope, record_timing};
 
@@ -175,6 +172,9 @@ pub enum DivergenceReason {
     TooFewValidSamples,
     /// `Δp`, the step measure, or ρ was non-finite.
     NonFiniteUpdate,
+    /// The fit converged, but the same transform leaves a residual above the
+    /// tolerance at most of the usable patches away from the solve region.
+    ValidationFailed,
 }
 
 /// How a [`solve_level`] run ended.
@@ -182,10 +182,39 @@ pub enum DivergenceReason {
 pub enum EccStatus {
     /// The step measure fell below [`EccParams::epsilon_px`].
     Converged,
-    /// [`EccParams::max_iterations`] was reached with no convergence.
+    /// [`EccParams::max_iterations`] was reached with no convergence and the
+    /// steps were not flat or oscillating.
     HitCap,
+    /// [`EccParams::max_iterations`] was reached and the last ten
+    /// steps were flat or oscillating: more iterations would not converge.
+    /// The result is the best-ρ transform seen.
+    Stalled,
     /// Registration failed; see [`DivergenceReason`].
     Diverged(DivergenceReason),
+}
+
+/// Steps a capped level must have behind it before it can be called stalled.
+const STALL_WINDOW: usize = 10;
+
+/// Whether the last [`STALL_WINDOW`] step measures, oldest first, stopped
+/// shrinking: flat (`max / min <= 1.05`) or changing direction at least three
+/// times.
+fn is_stalled(window: &[f64; STALL_WINDOW]) -> bool {
+    let max = window.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let min = window.iter().copied().fold(f64::INFINITY, f64::min);
+    if min > 0.0 && max / min <= 1.05 {
+        return true;
+    }
+    let mut diffs = window.windows(2).map(|w| w[1] - w[0]);
+    let mut previous = diffs.next().expect("a window holds several steps");
+    let mut flips = 0;
+    for d in diffs {
+        if d * previous < 0.0 {
+            flips += 1;
+        }
+        previous = d;
+    }
+    flips >= 3
 }
 
 /// The outcome of one [`solve_level`] call.
@@ -193,13 +222,13 @@ pub enum EccStatus {
 pub struct EccResult {
     /// Reference-to-frame, template as reference: a caller warps the
     /// moving image onto the template with this matrix directly, no
-    /// inversion. On [`EccStatus::Diverged`] this is the **best-ρ
-    /// transform seen**, not the last one tried.
+    /// inversion. On [`EccStatus::Diverged`] and [`EccStatus::Stalled`] this
+    /// is the **best-ρ transform seen**, not the last one tried.
     pub transform: Transform,
     pub status: EccStatus,
     pub iterations: u32,
     /// ρ ∈ `[-1, 1]`, paired with `transform` (the ρ that transform itself
-    /// achieved, or the best-seen ρ on divergence) -- never an RMS.
+    /// achieved, or the best-seen ρ on divergence or a stall) -- never an RMS.
     pub correlation: f64,
     pub valid_samples: usize,
     pub valid_fraction: f64,
@@ -296,14 +325,17 @@ fn dot<const K: usize>(a: &[f64; K], b: &[f64; K]) -> f64 {
 /// horizontal-then-vertical accumulation order. `None` when `t.map_point`
 /// fails or the mapped point's whole 4x4 tap window does not lie entirely
 /// inside `moving` -- see the module docs' "Sampling and out-of-domain
-/// handling".
-fn sample_plane(moving: &Plane, t: &Transform, x: f64, y: f64) -> Option<f32> {
+/// handling". `moving` is a window of the frame whose top-left pixel sits at
+/// `origin` in full-frame coordinates; `(x, y)` and `t` stay full-frame, and
+/// the tap-window test is against the window.
+fn sample_plane(moving: &Plane, origin: (u32, u32), t: &Transform, x: f64, y: f64) -> Option<f32> {
     let (sx, sy) = t.map_point(x, y)?;
     let width = moving.width() as i64;
     let height = moving.height() as i64;
+    let (x0, y0) = (i64::from(origin.0), i64::from(origin.1));
     let ix = sx.floor() as i64;
     let iy = sy.floor() as i64;
-    if ix - 1 < 0 || ix + 2 > width - 1 || iy - 1 < 0 || iy + 2 > height - 1 {
+    if ix - 1 < x0 || ix + 2 > x0 + width - 1 || iy - 1 < y0 || iy + 2 > y0 + height - 1 {
         return None;
     }
 
@@ -314,7 +346,7 @@ fn sample_plane(moving: &Plane, t: &Transform, x: f64, y: f64) -> Option<f32> {
 
     let data = moving.data();
     let stride = width;
-    let sample = |col: i64, row: i64| -> f32 { data[(row * stride + col) as usize] };
+    let sample = |col: i64, row: i64| -> f32 { data[((row - y0) * stride + (col - x0)) as usize] };
 
     let cols = [ix - 1, ix, ix + 1, ix + 2];
     let rows = [iy - 1, iy, iy + 1, iy + 2];
@@ -334,13 +366,14 @@ fn sample_plane(moving: &Plane, t: &Transform, x: f64, y: f64) -> Option<f32> {
 }
 
 /// Central-difference gradient `(T[x+1] - T[x-1]) / 2` on each axis, at
-/// template pixel `(x, y)`. Caller must guarantee `1 <= x <= width - 2` and
-/// `1 <= y <= height - 2` (the valid-region-only discipline
+/// full-frame pixel `(x, y)` of a template window whose top-left pixel sits at
+/// `origin`. Caller must guarantee the pixel and its four neighbours lie in
+/// the window (the valid-region-only discipline
 /// `crate::fuse::metrics::laplacian_variance` already uses).
-fn central_diff_gradient(template: &Plane, x: u32, y: u32) -> (f32, f32) {
+fn central_diff_gradient(template: &Plane, origin: (u32, u32), x: u32, y: u32) -> (f32, f32) {
     let w = template.width() as usize;
     let data = template.data();
-    let idx = |xx: u32, yy: u32| yy as usize * w + xx as usize;
+    let idx = |xx: u32, yy: u32| (yy - origin.1) as usize * w + (xx - origin.0) as usize;
     let gx = (data[idx(x + 1, y)] - data[idx(x - 1, y)]) / 2.0;
     let gy = (data[idx(x, y + 1)] - data[idx(x, y - 1)]) / 2.0;
     (gx, gy)
@@ -440,27 +473,33 @@ enum TemplateKind {
 /// normal matrix and full-overlap statistics, all pure functions of those
 /// inputs. Built once, it serves every solve against any moving plane.
 pub(crate) struct EccTemplate {
+    /// Unique per prepared template for the life of the process, so a backend
+    /// can cache by it; an address would be reused once a template drops.
+    id: u64,
     region: Rect,
     kind: TemplateKind,
 }
 
+static NEXT_TEMPLATE_ID: AtomicU64 = AtomicU64::new(0);
+
 impl EccTemplate {
     /// Prepares `template` over `region`, after the region checks
-    /// [`solve_level`] documents.
+    /// [`solve_level`] documents. `template` is a window of the frame whose
+    /// top-left pixel sits at `origin`; `region` stays in full-frame
+    /// coordinates, so a window and the whole plane prepare identical data.
     pub(crate) fn prepare(
         template: &Plane,
+        origin: (u32, u32),
         region: Rect,
         mode: EccMode,
     ) -> Result<Self, AlignError> {
         if region.width == 0 || region.height == 0 {
             return Err(AlignError::RegionTooSmall { region });
         }
-        let valid_x_hi = template.width().saturating_sub(1);
-        let valid_y_hi = template.height().saturating_sub(1);
-        let region_ok = region.x >= 1
-            && region.y >= 1
-            && region.x + region.width <= valid_x_hi
-            && region.y + region.height <= valid_y_hi;
+        let region_ok = region.x > origin.0
+            && region.y > origin.1
+            && region.x + region.width < origin.0 + template.width()
+            && region.y + region.height < origin.1 + template.height();
         if !region_ok {
             return Err(AlignError::RegionOutOfBounds {
                 region,
@@ -470,19 +509,27 @@ impl EccTemplate {
 
         let _scope = measurement_scope("ecc_template_prepare");
         let kind = match mode {
-            EccMode::Translation => {
-                TemplateKind::Translation(prepare_data::<2>(template, region, |gx, gy, _x, _y| {
-                    [f64::from(gx), f64::from(gy)]
-                }))
-            }
+            EccMode::Translation => TemplateKind::Translation(prepare_data::<2>(
+                template,
+                origin,
+                region,
+                |gx, gy, _x, _y| [f64::from(gx), f64::from(gy)],
+            )),
             EccMode::Similarity => {
                 let (cx, cy) = similarity_centre(region);
-                TemplateKind::Similarity(prepare_data::<4>(template, region, |gx, gy, x, y| {
-                    similarity_jacobian_row(gx, gy, x, y, cx, cy)
-                }))
+                TemplateKind::Similarity(prepare_data::<4>(
+                    template,
+                    origin,
+                    region,
+                    |gx, gy, x, y| similarity_jacobian_row(gx, gy, x, y, cx, cy),
+                ))
             }
         };
-        Ok(Self { region, kind })
+        Ok(Self {
+            id: NEXT_TEMPLATE_ID.fetch_add(1, Ordering::Relaxed),
+            region,
+            kind,
+        })
     }
 
     pub(crate) fn region(&self) -> Rect {
@@ -597,30 +644,40 @@ fn solve_level_dispatch(
             moving_spp: moving.samples_per_pixel(),
         });
     }
-    let prepared = EccTemplate::prepare(template, region, mode)?;
-    Ok(solve_prepared(&prepared, moving, initial, params, trace))
+    let prepared = EccTemplate::prepare(template, (0, 0), region, mode)?;
+    Ok(solve_prepared(
+        &prepared,
+        moving,
+        (0, 0),
+        initial,
+        params,
+        trace,
+    ))
 }
 
 /// Solves against a prepared template. `moving` must be single-channel and
 /// `params` well-formed; [`solve_level`] checks both, and the pyramid's luma
-/// planes satisfy the first by construction.
+/// planes satisfy the first by construction. `moving` is a window whose
+/// top-left pixel sits at `moving_origin` in full-frame coordinates; a sample
+/// whose 4x4 taps leave the window is invalid.
 pub(crate) fn solve_prepared(
     template: &EccTemplate,
     moving: &Plane,
+    moving_origin: (u32, u32),
     initial: &Transform,
     params: &EccParams,
     trace: Option<&mut Vec<EccIteration>>,
 ) -> EccResult {
     let region = template.region;
-    match &template.kind {
-        TemplateKind::Translation(data) => solve_generic::<2>(
+    let solved = match &template.kind {
+        TemplateKind::Translation(data) => solve_generic::<2, Infallible>(
             data,
             region,
-            moving,
             initial,
             params,
             |dp: &[f64; 2]| Transform::translation(dp[0], dp[1]),
             trace,
+            cpu_provider(data, region, (moving, moving_origin), params),
         ),
         TemplateKind::Similarity(data) => {
             // The Jacobian was centred on `region`'s own centre, not
@@ -629,17 +686,108 @@ pub(crate) fn solve_prepared(
             // recovered increment is conjugated back to image coordinates
             // about the same centre.
             let (cx, cy) = similarity_centre(region);
-            solve_generic::<4>(
+            solve_generic::<4, Infallible>(
                 data,
                 region,
+                initial,
+                params,
+                move |dp: &[f64; 4]| similarity_delta(dp, cx, cy),
+                trace,
+                cpu_provider(data, region, (moving, moving_origin), params),
+            )
+        }
+    };
+    solved.unwrap_or_else(|never| match never {})
+}
+
+/// [`solve_prepared`] with each iteration's moments supplied by a session of
+/// `backend`. `Ok(None)` when the template is singular (the CPU path reports
+/// that at once) or the backend declines the level; the caller then solves it
+/// on the CPU. A session error is returned as it is.
+pub(crate) fn solve_prepared_on(
+    template: &EccTemplate,
+    moving: &Plane,
+    moving_origin: (u32, u32),
+    initial: &Transform,
+    params: &EccParams,
+    trace: Option<&mut Vec<EccIteration>>,
+    backend: &dyn AlignBackend,
+) -> Result<Option<EccResult>, AlgorithmError> {
+    let region = template.region;
+    let moving = (moving, moving_origin);
+    match &template.kind {
+        TemplateKind::Translation(data) => solve_on_backend::<2>(
+            data,
+            (template.id, region),
+            moving,
+            initial,
+            params,
+            |dp: &[f64; 2]| Transform::translation(dp[0], dp[1]),
+            trace,
+            backend,
+        ),
+        TemplateKind::Similarity(data) => {
+            let (cx, cy) = similarity_centre(region);
+            solve_on_backend::<4>(
+                data,
+                (template.id, region),
                 moving,
                 initial,
                 params,
                 move |dp: &[f64; 4]| similarity_delta(dp, cx, cy),
                 trace,
+                backend,
             )
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_on_backend<const K: usize>(
+    data: &TemplateData<K>,
+    (template_id, region): (u64, Rect),
+    (moving, moving_origin): (&Plane, (u32, u32)),
+    initial: &Transform,
+    params: &EccParams,
+    build_delta: impl Fn(&[f64; K]) -> Transform,
+    trace: Option<&mut Vec<EccIteration>>,
+    backend: &dyn AlignBackend,
+) -> Result<Option<EccResult>, AlgorithmError> {
+    if data.singular {
+        return Ok(None);
+    }
+    // The backend sums values minus the template mean, which keeps a
+    // single-precision accumulation well conditioned. Relative to that shift
+    // the template mean is zero.
+    let shift = data.values.iter().map(|&v| f64::from(v)).sum::<f64>() / data.values.len() as f64;
+    let request = EccSessionRequest {
+        template_id,
+        region,
+        columns: K,
+        template: &data.values,
+        jacobian: data.g_centered.as_flattened(),
+        shift,
+        moving: moving.data(),
+        moving_dims: (moving.width(), moving.height()),
+        moving_origin,
+    };
+    let Some(mut session) = backend.open_ecc(&request)? else {
+        return Ok(None);
+    };
+    solve_generic(
+        data,
+        region,
+        initial,
+        params,
+        build_delta,
+        trace,
+        |w: &Transform| {
+            session
+                .moments(w)
+                .map(|m| reduction_from_moments(&m, data, 0.0, params))
+        },
+    )
+    .map(Some)
 }
 
 /// One (uncentred-argument, internally coordinate-centred) row of the
@@ -699,6 +847,7 @@ fn similarity_delta(dp: &[f64; 4], cx: f64, cy: f64) -> Transform {
 /// [`similarity_jacobian_row`]). The module docs give every equation.
 fn prepare_data<const K: usize>(
     template: &Plane,
+    origin: (u32, u32),
     region: Rect,
     jacobian_row: impl Fn(f32, f32, f64, f64) -> [f64; K],
 ) -> TemplateData<K> {
@@ -713,8 +862,11 @@ fn prepare_data<const K: usize>(
         for dx in 0..region.width {
             let x = region.x + dx;
             let y = region.y + dy;
-            let (gx, gy) = central_diff_gradient(template, x, y);
-            values.push(template.data()[y as usize * template.width() as usize + x as usize]);
+            let (gx, gy) = central_diff_gradient(template, origin, x, y);
+            values.push(
+                template.data()
+                    [(y - origin.1) as usize * template.width() as usize + (x - origin.0) as usize],
+            );
             g_centered.push(jacobian_row(gx, gy, x as f64, y as f64));
         }
     }
@@ -773,24 +925,24 @@ fn prepare_data<const K: usize>(
 
 /// The shared solve against a prepared template, for `K` degrees of freedom.
 /// `build_delta(&Δp)` builds `ΔW` from a solved increment (conjugated back
-/// where the Jacobian was centred, see [`similarity_delta`]). The
-/// per-iteration working vectors are allocated once, before the loop, and
-/// overwritten in full on every iteration. The module docs give every
-/// equation.
-fn solve_generic<const K: usize>(
+/// where the Jacobian was centred, see [`similarity_delta`]). Each iteration's
+/// sampling and masked sums come from `reduce`, called with the current
+/// warp; everything after them, the update and the termination test, is
+/// shared by every provider. A provider error ends the solve at once. The
+/// module docs give every equation.
+fn solve_generic<const K: usize, E>(
     data: &TemplateData<K>,
     region: Rect,
-    moving: &Plane,
     initial: &Transform,
     params: &EccParams,
     build_delta: impl Fn(&[f64; K]) -> Transform,
     mut trace: Option<&mut Vec<EccIteration>>,
-) -> EccResult {
-    let region_pixel_count = data.values.len();
+    mut reduce: impl FnMut(&Transform) -> Result<Reduced<K>, E>,
+) -> Result<EccResult, E> {
     let c = data.c;
 
     if data.singular {
-        return EccResult {
+        return Ok(EccResult {
             transform: *initial,
             status: EccStatus::Diverged(DivergenceReason::SingularHessian),
             iterations: 0,
@@ -798,16 +950,8 @@ fn solve_generic<const K: usize>(
             valid_samples: 0,
             valid_fraction: 0.0,
             final_step: None,
-        };
+        });
     }
-
-    let mut allocated = TimingBytes::new(TimingCounter::AllocationBytes);
-    let mut iw_value: Vec<Option<f32>> = vec![None; region_pixel_count];
-    let mut iw_zero = vec![0.0f64; region_pixel_count];
-    let mut ir_zero_partial = vec![0.0f64; region_pixel_count];
-    allocated.add(iw_value.capacity() * std::mem::size_of::<Option<f32>>());
-    allocated.add(iw_zero.capacity() * std::mem::size_of::<f64>());
-    allocated.add(ir_zero_partial.capacity() * std::mem::size_of::<f64>());
 
     // ---- iteration state -------------------------------------------------
     let mut w = *initial;
@@ -821,10 +965,12 @@ fn solve_generic<const K: usize>(
     // the macro's body resolves locals at its *definition* site, so
     // `last_step` must already be in scope where `diverge!` is defined.
     let mut last_step: Option<f64> = None;
+    // The last `STALL_WINDOW` step measures, oldest first.
+    let mut recent_steps = [0.0f64; STALL_WINDOW];
 
     macro_rules! diverge {
         ($reason:expr, $valid_samples:expr, $valid_fraction:expr) => {
-            return EccResult {
+            return Ok(EccResult {
                 transform: best_transform,
                 status: EccStatus::Diverged($reason),
                 iterations: iterations_done,
@@ -832,88 +978,27 @@ fn solve_generic<const K: usize>(
                 valid_samples: $valid_samples,
                 valid_fraction: $valid_fraction,
                 final_step: last_step,
-            };
+            });
         };
     }
 
     for _ in 0..params.max_iterations {
-        // ---- sample the moving plane at W(x) for every x in region -----
-        let mut valid_count = 0usize;
-        let mut n = 0usize;
-        for y in region.y..region.y + region.height {
-            for x in region.x..region.x + region.width {
-                let s = sample_plane(moving, &w, x as f64, y as f64);
-                if s.is_some() {
-                    valid_count += 1;
-                }
-                iw_value[n] = s;
-                n += 1;
+        let Reduction {
+            valid_count,
+            valid_fraction,
+            gt,
+            v,
+            num,
+            ir_ss,
+            gw,
+            iw_ss,
+            cross,
+        } = match reduce(&w)? {
+            Ok(reduction) => reduction,
+            Err((reason, valid_samples, valid_fraction)) => {
+                diverge!(reason, valid_samples, valid_fraction);
             }
-        }
-        let valid_fraction = valid_count as f64 / region_pixel_count as f64;
-
-        if valid_fraction < params.min_valid_fraction {
-            diverge!(
-                DivergenceReason::TooFewValidSamples,
-                valid_count,
-                valid_fraction
-            );
-        }
-
-        let full = has_full_overlap(valid_count, region_pixel_count);
-
-        // ---- ī_r, Gt, v, num: borrowed under guaranteed full overlap ----
-        let (ir_zero, gt, v, num, ir_ss): (&[f64], _, _, _, _) = if full {
-            let Some(stats) = &data.full_overlap else {
-                diverge!(
-                    DivergenceReason::SingularHessian,
-                    valid_count,
-                    valid_fraction
-                );
-            };
-            (&stats.ir_zero, stats.gt, stats.v, stats.num, stats.ir_ss)
-        } else {
-            let computed = compute_ir_stats(
-                &data.values,
-                &data.g_centered,
-                Some(&iw_value),
-                c,
-                &mut ir_zero_partial,
-            );
-            let Some((gt, v, num, ir_ss)) = computed else {
-                diverge!(
-                    DivergenceReason::SingularHessian,
-                    valid_count,
-                    valid_fraction
-                );
-            };
-            (&ir_zero_partial, gt, v, num, ir_ss)
         };
-
-        // ---- ī_w, Gw, cross ---------------------------------------------
-        let mut iw_sum = 0.0f64;
-        for s in iw_value.iter().flatten() {
-            iw_sum += f64::from(*s);
-        }
-        let iw_mean = iw_sum / valid_count as f64;
-
-        for (zero, s) in iw_zero.iter_mut().zip(&iw_value) {
-            *zero = s.map_or(0.0, |v| f64::from(v) - iw_mean);
-        }
-
-        let mut gw = [0.0f64; K];
-        let mut iw_ss = 0.0f64;
-        let mut cross = 0.0f64;
-        for n in 0..region_pixel_count {
-            if iw_value[n].is_none() {
-                continue;
-            }
-            for (acc, g) in gw.iter_mut().zip(&data.g_centered[n]) {
-                *acc += g * iw_zero[n];
-            }
-            iw_ss += iw_zero[n] * iw_zero[n];
-            cross += ir_zero[n] * iw_zero[n];
-        }
 
         let rho = cross / (ir_ss.sqrt() * iw_ss.sqrt());
         if !rho.is_finite() {
@@ -1006,6 +1091,8 @@ fn solve_generic<const K: usize>(
             }
         }
         last_step = Some(step);
+        recent_steps.rotate_left(1);
+        recent_steps[STALL_WINDOW - 1] = step;
         if let Some(t) = trace.as_deref_mut() {
             t.push(EccIteration {
                 iteration: iterations_done + 1,
@@ -1019,7 +1106,7 @@ fn solve_generic<const K: usize>(
         iterations_done += 1;
 
         if step < params.epsilon_px {
-            return EccResult {
+            return Ok(EccResult {
                 transform: w,
                 status: EccStatus::Converged,
                 iterations: iterations_done,
@@ -1027,23 +1114,332 @@ fn solve_generic<const K: usize>(
                 valid_samples: valid_count,
                 valid_fraction,
                 final_step: Some(step),
-            };
+            });
         }
 
         if iterations_done == params.max_iterations {
-            return EccResult {
-                transform: w,
-                status: EccStatus::HitCap,
+            let stalled = iterations_done as usize >= STALL_WINDOW && is_stalled(&recent_steps);
+            return Ok(EccResult {
+                transform: if stalled { best_transform } else { w },
+                status: if stalled {
+                    EccStatus::Stalled
+                } else {
+                    EccStatus::HitCap
+                },
                 iterations: iterations_done,
-                correlation: rho,
+                correlation: if stalled { best_correlation } else { rho },
                 valid_samples: valid_count,
                 valid_fraction,
                 final_step: Some(step),
-            };
+            });
         }
     }
 
     unreachable!("the loop above always returns by max_iterations")
+}
+
+/// What one iteration's sampling and masked sums hand the shared update.
+struct Reduction<const K: usize> {
+    valid_count: usize,
+    valid_fraction: f64,
+    gt: [f64; K],
+    v: [f64; K],
+    num: f64,
+    ir_ss: f64,
+    gw: [f64; K],
+    iw_ss: f64,
+    cross: f64,
+}
+
+/// Why a reduction ended the solve: the reason, the valid samples and the
+/// valid fraction.
+type Divergence = (DivergenceReason, usize, f64);
+
+type Reduced<const K: usize> = Result<Reduction<K>, Divergence>;
+
+/// The per-iteration working vectors of the CPU reduction, overwritten in full
+/// on every iteration.
+struct CpuScratch {
+    iw_value: Vec<Option<f32>>,
+    iw_zero: Vec<f64>,
+    ir_zero_partial: Vec<f64>,
+}
+
+impl CpuScratch {
+    fn new(region_pixel_count: usize) -> Self {
+        let mut allocated = TimingBytes::new(TimingCounter::AllocationBytes);
+        let scratch = Self {
+            iw_value: vec![None; region_pixel_count],
+            iw_zero: vec![0.0f64; region_pixel_count],
+            ir_zero_partial: vec![0.0f64; region_pixel_count],
+        };
+        allocated.add(scratch.iw_value.capacity() * std::mem::size_of::<Option<f32>>());
+        allocated.add(scratch.iw_zero.capacity() * std::mem::size_of::<f64>());
+        allocated.add(scratch.ir_zero_partial.capacity() * std::mem::size_of::<f64>());
+        scratch
+    }
+}
+
+/// The CPU moment provider for [`solve_generic`]. Its working vectors are
+/// allocated on the first iteration, so a solve that never iterates allocates
+/// none.
+fn cpu_provider<'a, const K: usize>(
+    data: &'a TemplateData<K>,
+    region: Rect,
+    moving: (&'a Plane, (u32, u32)),
+    params: &'a EccParams,
+) -> impl FnMut(&Transform) -> Result<Reduced<K>, Infallible> + 'a {
+    let mut scratch: Option<CpuScratch> = None;
+    move |w| {
+        let scratch = scratch.get_or_insert_with(|| CpuScratch::new(data.values.len()));
+        Ok(cpu_reduction(data, region, moving, w, params, scratch))
+    }
+}
+
+/// Samples the moving plane at `w(x)` for every `x` in `region` and reduces
+/// the masked sums, the full-overlap path borrowing the template statistics.
+fn cpu_reduction<const K: usize>(
+    data: &TemplateData<K>,
+    region: Rect,
+    (moving, moving_origin): (&Plane, (u32, u32)),
+    w: &Transform,
+    params: &EccParams,
+    scratch: &mut CpuScratch,
+) -> Reduced<K> {
+    let region_pixel_count = data.values.len();
+    let c = data.c;
+    let CpuScratch {
+        iw_value,
+        iw_zero,
+        ir_zero_partial,
+    } = scratch;
+
+    // ---- sample the moving plane at W(x) for every x in region -----
+    let mut valid_count = 0usize;
+    let mut n = 0usize;
+    for y in region.y..region.y + region.height {
+        for x in region.x..region.x + region.width {
+            let s = sample_plane(moving, moving_origin, w, x as f64, y as f64);
+            if s.is_some() {
+                valid_count += 1;
+            }
+            iw_value[n] = s;
+            n += 1;
+        }
+    }
+    let valid_fraction = valid_count as f64 / region_pixel_count as f64;
+
+    if valid_fraction < params.min_valid_fraction {
+        return Err((
+            DivergenceReason::TooFewValidSamples,
+            valid_count,
+            valid_fraction,
+        ));
+    }
+
+    let full = has_full_overlap(valid_count, region_pixel_count);
+    let singular = (
+        DivergenceReason::SingularHessian,
+        valid_count,
+        valid_fraction,
+    );
+
+    // ---- ī_r, Gt, v, num: borrowed under guaranteed full overlap ----
+    let (ir_zero, gt, v, num, ir_ss): (&[f64], _, _, _, _) = if full {
+        let Some(stats) = &data.full_overlap else {
+            return Err(singular);
+        };
+        (&stats.ir_zero, stats.gt, stats.v, stats.num, stats.ir_ss)
+    } else {
+        let computed = compute_ir_stats(
+            &data.values,
+            &data.g_centered,
+            Some(iw_value.as_slice()),
+            c,
+            ir_zero_partial,
+        );
+        let Some((gt, v, num, ir_ss)) = computed else {
+            return Err(singular);
+        };
+        (ir_zero_partial.as_slice(), gt, v, num, ir_ss)
+    };
+
+    // ---- ī_w, Gw, cross ---------------------------------------------
+    let mut iw_sum = 0.0f64;
+    for s in iw_value.iter().flatten() {
+        iw_sum += f64::from(*s);
+    }
+    let iw_mean = iw_sum / valid_count as f64;
+
+    for (zero, s) in iw_zero.iter_mut().zip(iw_value.iter()) {
+        *zero = s.map_or(0.0, |v| f64::from(v) - iw_mean);
+    }
+
+    let mut gw = [0.0f64; K];
+    let mut iw_ss = 0.0f64;
+    let mut cross = 0.0f64;
+    for n in 0..region_pixel_count {
+        if iw_value[n].is_none() {
+            continue;
+        }
+        for (acc, g) in gw.iter_mut().zip(&data.g_centered[n]) {
+            *acc += g * iw_zero[n];
+        }
+        iw_ss += iw_zero[n] * iw_zero[n];
+        cross += ir_zero[n] * iw_zero[n];
+    }
+    Ok(Reduction {
+        valid_count,
+        valid_fraction,
+        gt,
+        v,
+        num,
+        ir_ss,
+        gw,
+        iw_ss,
+        cross,
+    })
+}
+
+/// The same reduction from the [`ECC_MOMENTS`] a backend summed over values
+/// minus its shift. `template_mean` is the full template's mean minus that
+/// shift. Under full overlap the template statistics are borrowed; under
+/// partial overlap they derive from the masked template sums.
+fn reduction_from_moments<const K: usize>(
+    m: &[f64; ECC_MOMENTS],
+    data: &TemplateData<K>,
+    template_mean: f64,
+    params: &EccParams,
+) -> Reduced<K> {
+    let region_pixel_count = data.values.len();
+    let n = m[0];
+    let valid_count = n.round() as usize;
+    let valid_fraction = valid_count as f64 / region_pixel_count as f64;
+    if valid_fraction < params.min_valid_fraction {
+        return Err((
+            DivergenceReason::TooFewValidSamples,
+            valid_count,
+            valid_fraction,
+        ));
+    }
+    let singular = (
+        DivergenceReason::SingularHessian,
+        valid_count,
+        valid_fraction,
+    );
+    let s_mean = m[1] / n;
+    let iw_ss = m[2] - n * s_mean * s_mean;
+
+    let (gt, v, num, ir_ss, cross, g_sum) = if has_full_overlap(valid_count, region_pixel_count) {
+        let Some(stats) = &data.full_overlap else {
+            return Err(singular);
+        };
+        let cross = m[3] - template_mean * m[1];
+        (
+            stats.gt,
+            stats.v,
+            stats.num,
+            stats.ir_ss,
+            cross,
+            [0.0f64; K],
+        )
+    } else {
+        let t_mean = m[8] / n;
+        let ir_ss = m[9] - n * t_mean * t_mean;
+        let mut gt = [0.0f64; K];
+        let mut g_sum = [0.0f64; K];
+        for k in 0..K {
+            g_sum[k] = m[14 + k];
+            gt[k] = m[10 + k] - t_mean * g_sum[k];
+        }
+        let Some(v) = solve_linear(data.c, gt) else {
+            return Err(singular);
+        };
+        let num = ir_ss - dot(&gt, &v);
+        (gt, v, num, ir_ss, m[3] - n * t_mean * s_mean, g_sum)
+    };
+    let mut gw = [0.0f64; K];
+    for k in 0..K {
+        gw[k] = m[4 + k] - s_mean * g_sum[k];
+    }
+    Ok(Reduction {
+        valid_count,
+        valid_fraction,
+        gt,
+        v,
+        num,
+        ir_ss,
+        gw,
+        iw_ss,
+        cross,
+    })
+}
+
+/// A session summing the moments on the CPU from copies of a request's data:
+/// the per-kernel twin an accelerated session is compared against.
+pub struct CpuMomentSession {
+    template: Vec<f32>,
+    jacobian: Vec<f64>,
+    columns: usize,
+    region: Rect,
+    shift: f64,
+    moving: Plane,
+    moving_origin: (u32, u32),
+}
+
+impl CpuMomentSession {
+    pub fn new(request: &EccSessionRequest<'_>) -> Self {
+        let (width, height) = request.moving_dims;
+        Self {
+            template: request.template.to_vec(),
+            jacobian: request.jacobian.to_vec(),
+            columns: request.columns,
+            region: request.region,
+            shift: request.shift,
+            moving: Plane::from_f32(request.moving, width, height, 1)
+                .expect("the request's moving window is a single-channel plane"),
+            moving_origin: request.moving_origin,
+        }
+    }
+
+    /// The bicubic Catmull-Rom sample of the moving window at `warp(x)` for
+    /// every `x` in the region, row-major; `None` where any of the 4x4 taps
+    /// leaves the window.
+    pub fn samples(&self, warp: &Transform) -> Vec<Option<f32>> {
+        let region = self.region;
+        (region.y..region.y + region.height)
+            .flat_map(|y| (region.x..region.x + region.width).map(move |x| (x, y)))
+            .map(|(x, y)| sample_plane(&self.moving, self.moving_origin, warp, x as f64, y as f64))
+            .collect()
+    }
+}
+
+impl crate::gpu::EccMomentSession for CpuMomentSession {
+    fn moments(&mut self, w: &Transform) -> Result<[f64; ECC_MOMENTS], AlgorithmError> {
+        let mut m = [0.0f64; ECC_MOMENTS];
+        for (i, sample) in self.samples(w).into_iter().enumerate() {
+            let Some(s) = sample else {
+                continue;
+            };
+            let s = f64::from(s) - self.shift;
+            let t = f64::from(self.template[i]) - self.shift;
+            m[0] += 1.0;
+            m[1] += s;
+            m[2] += s * s;
+            m[3] += t * s;
+            m[8] += t;
+            m[9] += t * t;
+            for (k, &g) in self.jacobian[i * self.columns..][..self.columns]
+                .iter()
+                .enumerate()
+            {
+                m[4 + k] += g * s;
+                m[10 + k] += g * t;
+                m[14 + k] += g;
+            }
+        }
+        Ok(m)
+    }
 }
 
 /// Fills `ir_zero` with the zero-mean template vector and computes
@@ -1093,6 +1489,15 @@ fn compute_ir_stats<const K: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::EccMomentSession;
+
+    #[test]
+    fn validation_failed_round_trips_as_kebab_case() {
+        let json = serde_json::to_string(&DivergenceReason::ValidationFailed).unwrap();
+        assert_eq!(json, "\"validation-failed\"");
+        let back: DivergenceReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, DivergenceReason::ValidationFailed);
+    }
 
     #[test]
     fn local_aggregate_saturation_is_retained_for_the_summary() {
@@ -1263,7 +1668,7 @@ mod tests {
         let mut template_data = vec![0.0f32; width as usize * height as usize];
         for y in 0..height {
             for x in 0..width {
-                let sampled = sample_plane(&moving, w_true, f64::from(x), f64::from(y));
+                let sampled = sample_plane(&moving, (0, 0), w_true, f64::from(x), f64::from(y));
                 template_data[(y * width + x) as usize] = sampled.unwrap_or(0.0);
             }
         }
@@ -1395,6 +1800,87 @@ mod tests {
             height: 30,
         };
         (template, moving, region, w_true)
+    }
+
+    /// Ten steps shrinking by `ratio` each, from 1.0.
+    fn geometric_window(ratio: f64) -> [f64; STALL_WINDOW] {
+        std::array::from_fn(|i| ratio.powi(i as i32))
+    }
+
+    #[test]
+    fn a_flat_window_is_stalled() {
+        let window: [f64; STALL_WINDOW] = std::array::from_fn(|i| 1.0 + 0.03 * i as f64 / 9.0);
+        assert!(is_stalled(&window));
+    }
+
+    #[test]
+    fn an_oscillating_window_is_stalled_though_magnitudes_decrease() {
+        // Four direction flips, first to last ratio far above the flat band.
+        let window = [1.0, 0.9, 0.95, 0.8, 0.85, 0.7, 0.6, 0.5, 0.4, 0.3];
+        assert!(is_stalled(&window));
+    }
+
+    #[test]
+    fn a_shrinking_window_is_not_stalled() {
+        assert!(!is_stalled(&geometric_window(0.8)));
+    }
+
+    #[test]
+    fn a_shrinking_window_with_one_uptick_is_not_stalled() {
+        let mut window = geometric_window(0.8);
+        window[5] = window[4] * 1.1;
+        assert!(!is_stalled(&window));
+    }
+
+    /// A template that no translation of the moving plane reproduces (fixed
+    /// pseudo-random speckle) and an epsilon of zero for all practical
+    /// purposes: the steps settle at a floor and stop shrinking, so the level
+    /// reports `Stalled` and returns the best correlation it saw.
+    #[test]
+    fn a_capped_level_whose_steps_stop_shrinking_is_stalled() {
+        let (width, height) = (SINUSOID_WIDTH, SINUSOID_HEIGHT);
+        let (clean, moving, region, _w_true) = hit_cap_setup();
+        let speckled: Vec<f32> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let clean = sample_plane(
+                    &clean,
+                    (0, 0),
+                    &Transform::identity(),
+                    f64::from(x),
+                    f64::from(y),
+                )
+                .unwrap_or(0.0);
+                let hash =
+                    ((f64::from(x) * 12.9898 + f64::from(y) * 78.233).sin() * 43758.5453).fract();
+                clean + 150.0 * hash as f32
+            })
+            .collect();
+        let template = Plane::from_f32(&speckled, width, height, 1).unwrap();
+        let params = EccParams {
+            max_iterations: 60,
+            epsilon_px: 1e-300,
+            min_valid_fraction: 0.99,
+        };
+        let mut trace = Vec::new();
+        let result = solve_level_traced(
+            &template,
+            region,
+            &moving,
+            &Transform::identity(),
+            EccMode::Translation,
+            &params,
+            &mut trace,
+        )
+        .expect("valid solver inputs");
+        assert_eq!(result.status, EccStatus::Stalled, "{result:?}");
+        assert_eq!(result.iterations, 60);
+        let best = trace
+            .iter()
+            .map(|i| i.correlation)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert_eq!(result.correlation, best, "{result:?}");
+        assert_eq!(trace.last().map(|i| i.step), result.final_step);
     }
 
     /// The bracketing check: pins [`EccResult::final_step`] as *the operand
@@ -1832,5 +2318,156 @@ mod tests {
             Err(AlignError::PlaneMismatch { .. }) => {}
             other => panic!("expected PlaneMismatch, got {other:?}"),
         }
+    }
+
+    fn textured(width: u32, height: u32, dx: f64) -> Plane {
+        let mut data = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let (fx, fy) = (f64::from(x) - dx, f64::from(y));
+                data.push(
+                    (1000.0 + 200.0 * (fx * 0.3).sin() + 150.0 * (fy * 0.25).cos() + fx * 3.0)
+                        as f32,
+                );
+            }
+        }
+        Plane::from_f32(&data, width, height, 1).unwrap()
+    }
+
+    /// The window of `plane` whose top-left pixel is `(x0, y0)`.
+    fn window(plane: &Plane, (x0, y0): (u32, u32), (w, h): (u32, u32)) -> Plane {
+        let stride = plane.width() as usize;
+        let mut data = Vec::with_capacity((w * h) as usize);
+        for y in y0..y0 + h {
+            let row = y as usize * stride + x0 as usize;
+            data.extend_from_slice(&plane.data()[row..row + w as usize]);
+        }
+        Plane::from_f32(&data, w, h, 1).unwrap()
+    }
+
+    /// The raw moments a backend sums, in `f64` from the CPU sampler.
+    fn cpu_moments<const K: usize>(
+        data: &TemplateData<K>,
+        region: Rect,
+        (moving, origin): (&Plane, (u32, u32)),
+        w: &Transform,
+        shift: f64,
+    ) -> [f64; ECC_MOMENTS] {
+        let request = EccSessionRequest {
+            template_id: 0,
+            region,
+            columns: K,
+            template: &data.values,
+            jacobian: data.g_centered.as_flattened(),
+            shift,
+            moving: moving.data(),
+            moving_dims: (moving.width(), moving.height()),
+            moving_origin: origin,
+        };
+        CpuMomentSession::new(&request)
+            .moments(w)
+            .expect("the cpu session cannot fail")
+    }
+
+    fn close(a: f64, b: f64, what: &str) {
+        let tol = 1e-8 * (1.0 + a.abs().max(b.abs()));
+        assert!((a - b).abs() <= tol, "{what}: moments {a} against cpu {b}");
+    }
+
+    fn assert_moments_match_cpu<const K: usize>(
+        data: &TemplateData<K>,
+        region: Rect,
+        moving: (&Plane, (u32, u32)),
+    ) {
+        let params = EccParams {
+            max_iterations: 10,
+            epsilon_px: 1e-4,
+            min_valid_fraction: 0.3,
+        };
+        let n = data.values.len();
+        let mean = data.values.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64;
+        let mut scratch = CpuScratch::new(n);
+        let cases = [
+            (Transform::translation(1.3, -0.7), true),
+            (Transform::translation(18.0, 0.4), false),
+        ];
+        for (w, full) in cases {
+            let cpu = cpu_reduction(data, region, moving, &w, &params, &mut scratch)
+                .expect("cpu reduction");
+            assert_eq!(cpu.valid_count == n, full, "overlap of {w:?}");
+            for shift in [0.0, mean] {
+                let m = cpu_moments(data, region, moving, &w, shift);
+                let got = reduction_from_moments(&m, data, mean - shift, &params)
+                    .expect("moment reduction");
+                assert_eq!(got.valid_count, cpu.valid_count);
+                close(got.num, cpu.num, "num");
+                close(got.ir_ss, cpu.ir_ss, "ir_ss");
+                close(got.iw_ss, cpu.iw_ss, "iw_ss");
+                close(got.cross, cpu.cross, "cross");
+                for k in 0..K {
+                    close(got.gt[k], cpu.gt[k], "gt");
+                    close(got.v[k], cpu.v[k], "v");
+                    close(got.gw[k], cpu.gw[k], "gw");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn backend_moments_reproduce_the_cpu_reduction() {
+        let template = textured(48, 36, 0.0);
+        let moving = window(&textured(48, 36, 0.9), (4, 3), (40, 30));
+        let region = Rect {
+            x: 8,
+            y: 6,
+            width: 25,
+            height: 17,
+        };
+        let moving = (&moving, (4, 3));
+        for mode in [EccMode::Translation, EccMode::Similarity] {
+            let prepared = EccTemplate::prepare(&template, (0, 0), region, mode)
+                .expect("region inside the plane");
+            match &prepared.kind {
+                TemplateKind::Translation(data) => assert_moments_match_cpu(data, region, moving),
+                TemplateKind::Similarity(data) => assert_moments_match_cpu(data, region, moving),
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_session_samples_follow_region_order_and_the_moment_count() {
+        let template = textured(48, 36, 0.0);
+        let moving = window(&textured(48, 36, 0.9), (4, 3), (40, 30));
+        let region = Rect {
+            x: 8,
+            y: 6,
+            width: 25,
+            height: 17,
+        };
+        let prepared = EccTemplate::prepare(&template, (0, 0), region, EccMode::Translation)
+            .expect("region inside the plane");
+        let TemplateKind::Translation(data) = &prepared.kind else {
+            panic!("translation mode prepares a translation template");
+        };
+        let request = EccSessionRequest {
+            template_id: 0,
+            region,
+            columns: 2,
+            template: &data.values,
+            jacobian: data.g_centered.as_flattened(),
+            shift: 0.0,
+            moving: moving.data(),
+            moving_dims: (moving.width(), moving.height()),
+            moving_origin: (4, 3),
+        };
+        let mut session = CpuMomentSession::new(&request);
+        let warp = Transform::translation(18.0, 0.4);
+        let samples = session.samples(&warp);
+        assert_eq!(samples.len(), 25 * 17);
+        let valid = samples.iter().filter(|s| s.is_some()).count();
+        assert!(valid > 0 && valid < samples.len(), "partial overlap");
+        assert_eq!(valid as f64, session.moments(&warp).unwrap()[0]);
+        let expected = sample_plane(&moving, (4, 3), &warp, 10.0, 7.0);
+        assert_eq!(samples[25 + 2], expected, "row 1, column 2 of the region");
     }
 }

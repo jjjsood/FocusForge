@@ -19,8 +19,8 @@
 //! [`StageKey`] is the **path-free projection** of a [`StackFingerprint`] (every
 //! [`super::fingerprint::FrameFingerprint`] field except `path`, so a moved or renamed input
 //! directory still hits) plus the align stage's own [`super::record::AlignIdentity`] --
-//! `AlignAlgorithm::params()` plus exactly one named driver policy, and nothing else.
-
+//! `AlignAlgorithm::params()` plus the named driver fields, and nothing else.
+//!
 //! No `f64` ever reaches the key's bytes as a JSON float: `KeyParamValue::FloatBits` carries
 //! `f64::to_bits()` instead, since `serde_json` 1.0.151's float formatter does not guarantee a
 //! 17-significant-digit `f64` round-trips without the non-default `float_roundtrip` feature.
@@ -175,6 +175,7 @@ struct KeyMirror<'a> {
     algorithm: &'a str,
     params: std::collections::BTreeMap<String, KeyParamValue>,
     failure_policy: crate::align::FailurePolicy,
+    solver_version: u32,
 }
 
 /// A stage's cache key: the path-free projection of a [`StackFingerprint`]
@@ -183,16 +184,21 @@ struct KeyMirror<'a> {
 ///
 /// **In the key:** every [`FrameFingerprint`] field except `path` (via
 /// [`FrameKey`]), [`AlignIdentity::algorithm`], `AlignIdentity::params`
-/// (`AlignAlgorithm::params()`'s resolved values, nothing else), and
-/// exactly one named driver policy, `AlignIdentity::failure_policy`
-/// ([`DRIVER_POLICY_FIELDS`](super::record::DRIVER_POLICY_FIELDS)).
+/// (`AlignAlgorithm::params()`'s resolved values, nothing else), and the
+/// named driver fields, `AlignIdentity::failure_policy` and
+/// `AlignIdentity::solver_version`
+/// ([`DRIVER_POLICY_FIELDS`](super::record::DRIVER_POLICY_FIELDS)). An entry
+/// stores only the key's digest, so the solver revision lets an alignment
+/// computed by another revision miss.
 ///
 /// **Deliberately not in the key**, by name: `path` and `mtime` (a moved, renamed or touched
 /// input frame still hits); tile geometry (`tile_size`, `levels` -- the align stage reads
-/// neither); `backend` (the ECC solver is CPU-only either way, unlike
-/// [`super::record::JobRecord::backend`], which guards already-written fuse tiles); the stacking
-/// algorithm and its parameters (a fusion-only parameter change stays cheap this way); and the
-/// output path (not part of what a result is computed from).
+/// neither); `backend` (an alignment is one backend's whole-stage result, and the CPU and GPU
+/// solves agree within the geometric parity budget, so a hit survives switching the GPU on or
+/// off; unlike [`super::record::JobRecord::backend`], which guards already-written fuse tiles;
+/// a run without the cache recomputes); the stacking algorithm and its parameters (a
+/// fusion-only parameter change stays cheap this way); and the output path (not part of what a
+/// result is computed from).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StageKey {
     pub format: u32,
@@ -203,8 +209,8 @@ pub struct StageKey {
 
 impl StageKey {
     /// Builds the align stage's key: `fingerprint`'s path-free projection
-    /// plus `identity` (`AlignAlgorithm::params()` plus exactly one named
-    /// driver policy).
+    /// plus `identity` (`AlignAlgorithm::params()` plus the named driver
+    /// fields).
     pub fn align(fingerprint: &StackFingerprint, identity: &AlignIdentity) -> Self {
         StageKey {
             format: STAGE_CACHE_FORMAT,
@@ -233,6 +239,7 @@ impl StageKey {
             algorithm: &self.align.algorithm,
             params,
             failure_policy: self.align.failure_policy,
+            solver_version: self.align.solver_version,
         };
         serde_json::to_vec(&mirror).expect("KeyMirror serialization cannot fail")
     }

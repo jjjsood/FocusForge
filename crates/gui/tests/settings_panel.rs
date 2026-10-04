@@ -144,7 +144,93 @@ fn pyramidal_ecc_renders_in_declaration_order() {
         .iter()
         .map(|r| r.label.clone())
         .collect();
-    assert_eq!(align_labels, expected);
+    let mut with_switch = vec!["Enabled".to_string()];
+    with_switch.extend(expected);
+    assert_eq!(align_labels, with_switch);
+}
+
+#[test]
+fn align_lists_enabled_first_and_crop_lists_auto_crop_only() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    let panel = controller.settings_panel();
+
+    let align = field_rows(&panel.rows, "align");
+    assert_eq!(
+        (
+            align[0].id.as_str(),
+            align[0].kind,
+            align[0].selected.as_str()
+        ),
+        ("align", RowKind::Bool, "true"),
+        "the switch heads the section and defaults on"
+    );
+    let crop: Vec<&str> = field_rows(&panel.rows, "crop")
+        .iter()
+        .filter(|r| r.kind != RowKind::ResetAll)
+        .map(|r| r.id.as_str())
+        .collect();
+    assert_eq!(crop, ["auto-crop"]);
+}
+
+#[test]
+fn the_enabled_switch_writes_only_the_project_values() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.set_param_value("crop", "align", ParamValue::Bool(false));
+
+    let panel = controller.settings_panel();
+    assert_eq!(field_rows(&panel.rows, "align")[0].selected, "false");
+    assert_eq!(
+        heading(&panel.rows, "align").heading_state,
+        HeadingState::Default,
+        "the switch is not an align parameter"
+    );
+    assert!(
+        !panel
+            .rows
+            .iter()
+            .any(|r| r.kind == RowKind::ResetAll && r.selected == "true")
+    );
+}
+
+#[test]
+fn the_align_rows_are_disabled_exactly_while_the_switch_is_off() {
+    /// `(is the Enabled switch, disabled)` for every row between the ALIGN
+    /// heading and the next heading, the picker included; every other row
+    /// (headings too) is returned apart.
+    fn split(controller: &AppController) -> (Vec<(bool, bool)>, Vec<bool>) {
+        let (mut in_align, mut align, mut others) = (false, Vec::new(), Vec::new());
+        for row in controller.settings_panel().rows {
+            if row.kind == RowKind::SectionHeading {
+                in_align = row.section == "align";
+                others.push(row.disabled);
+            } else if in_align {
+                align.push((row.section == "crop" && row.id == "align", row.disabled));
+            } else {
+                others.push(row.disabled);
+            }
+        }
+        (align, others)
+    }
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+
+    let (align, others) = split(&controller);
+    assert!(align.iter().all(|(_, off)| !off) && others.iter().all(|off| !off));
+
+    controller.set_param_value("crop", "align", ParamValue::Bool(false));
+    let (align, others) = split(&controller);
+    assert!(align.len() > 2, "the section has rows to disable");
+    assert_eq!(align.iter().filter(|(switch, _)| *switch).count(), 1);
+    assert!(
+        align.iter().all(|(switch, off)| *off != *switch),
+        "every ALIGN row but the switch is disabled"
+    );
+    assert!(
+        others.iter().all(|off| !off),
+        "FUSE, CROP and headings stay active"
+    );
 }
 
 #[test]
@@ -949,7 +1035,7 @@ fn panel_metrics_mirror_the_slint_geometry() {
         (PARAM_ROW_LINEAR, "param-row-linear: 43px"),
         (PARAM_ROW_LOG, "param-row-log: 60px"),
         (PARAM_ROW_FIELD, "param-row-field: 45px"),
-        (PARAM_ROW_BOOL, "param-row-bool: 20px"),
+        (PARAM_ROW_BOOL, "param-row-bool: 32px"),
         (PARAM_ROW_ENUM, "param-row-enum: 43px"),
         (PARAM_ERROR_HEIGHT, "param-error-height: 16px"),
         (SECTION_HEADING_HEIGHT, "section-heading-height: 41px"),

@@ -69,6 +69,43 @@ pub(crate) fn seed_algorithm_state(
     }
 }
 
+/// The project values a newly created tab starts with: none for an unsaved
+/// project (every row reads its descriptor default), and for a reopened one
+/// the head manifest's own choices -- `align` is on when the run recorded an
+/// alignment, `auto-crop` when it recorded a crop.
+pub(crate) fn seed_project_values(project: &GuiProject) -> ParamValues {
+    match project {
+        GuiProject::Unsaved(_) => ParamValues::new(),
+        GuiProject::Opened(opened) => {
+            let manifest = opened.manifest();
+            ParamValues::from([
+                (
+                    "align".to_string(),
+                    ParamValue::Bool(manifest.align.is_some()),
+                ),
+                (
+                    "auto-crop".to_string(),
+                    ParamValue::Bool(manifest.registration.crop.is_some()),
+                ),
+            ])
+        }
+    }
+}
+
+/// The bool project value `id` (`align`, `auto-crop`): the explicit value
+/// when set, the descriptor's default otherwise.
+pub(crate) fn project_flag(values: &ParamValues, id: &str) -> bool {
+    let desc = focusforge_core::project::PROJECT_PARAMS
+        .iter()
+        .find(|desc| desc.id == id)
+        .expect("PROJECT_PARAMS declares every project flag the panel reads");
+    values
+        .get(id)
+        .unwrap_or(&desc.default)
+        .as_bool()
+        .expect("a project flag is a bool descriptor")
+}
+
 /// [`registry::default_stack`]'s id, empty when the registry refuses to name
 /// one; a run on an empty id is refused before it starts.
 fn default_fuse_id() -> String {
@@ -162,6 +199,9 @@ pub struct SettingsRow {
     /// non-uniform-pitch shape the tab strip's fixed `tab-pitch` does not
     /// need.
     pub top: f32,
+    /// Whether the row's control is inert and drawn disabled: every row of
+    /// the ALIGN section while its `Enabled` switch is off.
+    pub disabled: bool,
 }
 
 impl SettingsRow {
@@ -179,6 +219,7 @@ impl SettingsRow {
             menu_open: false,
             heading_state: state,
             top: 0.0,
+            disabled: false,
         }
     }
 }
@@ -226,9 +267,9 @@ pub const PARAM_ROW_LOG: f32 = 60.0;
 /// its trailing gap.
 pub const PARAM_ROW_FIELD: f32 = 45.0;
 /// `ShellGeometry.param-row-bool`: `FFToggle`'s own row, label and control
-/// on one line. Always the last row of a section, so it carries no trailing
-/// gap of its own.
-pub const PARAM_ROW_BOOL: f32 = 20.0;
+/// on one line, centred in a slot 12 px taller than the toggle so a bool row
+/// followed by another row keeps the section's row gap.
+pub const PARAM_ROW_BOOL: f32 = 32.0;
 /// `ShellGeometry.param-row-enum`: `FFMenu`'s closed row plus its trailing
 /// gap.
 pub const PARAM_ROW_ENUM: f32 = 43.0;
@@ -467,20 +508,50 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
             .iter()
             .map(|a| (a.id().to_string(), a.display_name().to_string()))
             .collect();
-        rows.extend(section_rows(
+        let mut align_rows = section_rows(
             "align",
             "ALIGN",
             align.params(),
             align_values,
             &section_ctx,
             Some((align_id, picker)),
-        ));
+        );
+        // The on/off switch is the project-level `align` value, written to
+        // the project map, and is the section's first row after its heading.
+        let align_on = project_flag(project_values, "align");
+        for row in align_rows.iter_mut().skip(1) {
+            row.disabled = !align_on;
+        }
+        let enabled = focusforge_core::project::PROJECT_PARAMS
+            .iter()
+            .find(|desc| desc.id == "align")
+            .expect("PROJECT_PARAMS declares the `align` descriptor");
+        align_rows.insert(
+            1,
+            field_row(
+                "crop",
+                enabled,
+                &ParamValue::Bool(project_flag(project_values, &enabled.id)),
+                false,
+            ),
+        );
+        rows.extend(align_rows);
     }
+    let crop_schema: Vec<ParamDesc> = focusforge_core::project::PROJECT_PARAMS
+        .iter()
+        .filter(|desc| desc.id != "align")
+        .cloned()
+        .collect();
+    let crop_values: ParamValues = project_values
+        .iter()
+        .filter(|(id, _)| id.as_str() != "align")
+        .map(|(id, value)| (id.clone(), value.clone()))
+        .collect();
     rows.extend(section_rows(
         "crop",
         "CROP",
-        &focusforge_core::project::PROJECT_PARAMS,
-        project_values,
+        &crop_schema,
+        &crop_values,
         &section_ctx,
         None,
     ));
@@ -501,6 +572,7 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
         menu_open: false,
         heading_state: HeadingState::Pending,
         top: 0.0,
+        disabled: false,
     });
 
     rows
@@ -555,6 +627,7 @@ fn section_rows(
             menu_open: menu_open == Some(key.as_str()),
             heading_state: HeadingState::Default,
             top: 0.0,
+            disabled: false,
         });
     }
 
@@ -592,6 +665,7 @@ fn section_rows(
                 menu_open: false,
                 heading_state: HeadingState::Default,
                 top: 0.0,
+                disabled: false,
             });
         }
     }
@@ -621,6 +695,7 @@ pub(crate) fn field_row(
         menu_open: false,
         heading_state: HeadingState::Default,
         top: 0.0,
+        disabled: false,
     };
     match kind {
         RowKind::LinearFloat | RowKind::LogFloat => {
@@ -909,6 +984,7 @@ mod tests {
             menu_open: false,
             heading_state: HeadingState::Default,
             top: 0.0,
+            disabled: false,
         }
     }
 

@@ -718,6 +718,8 @@ export component AppWindow inherits Window {
     // own the moment a run fails; there is no button that reveals it.
     in property <bool> job-toast-open: false;
     in property <string> job-toast-message: "";
+    // "failure" | "info", `FFToast`'s own tone vocabulary.
+    in property <string> job-toast-tone: "failure";
     callback job-toast-dismissed();
 
     // The one warning a frame-set change (add/reorder/remove) raises once
@@ -860,6 +862,7 @@ export component AppWindow inherits Window {
             : canvas-ground.y + Theme.space-3;
         toast-open: root.job-toast-open;
         message: root.job-toast-message;
+        tone: root.job-toast-tone;
         dismissed => { root.job-toast-dismissed(); }
     }
 

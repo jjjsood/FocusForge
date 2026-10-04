@@ -19,7 +19,7 @@
 //! whole tile. Conservative; the allocator-report test prints the measurement.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use focusforge_core::params::Provenance;
 
@@ -383,9 +383,19 @@ pub struct Permit<'a> {
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
-        let mut in_flight = self.budget.in_flight.lock().unwrap();
-        *in_flight -= 1;
-        self.budget.condvar.notify_all();
+        self.budget.release();
+    }
+}
+
+/// A [`Permit`] that owns its budget, for a holder that outlives the call
+/// that admitted it (an ECC session). Same release-on-drop guarantee.
+pub struct OwnedPermit {
+    budget: Arc<VramBudget>,
+}
+
+impl Drop for OwnedPermit {
+    fn drop(&mut self) {
+        self.budget.release();
     }
 }
 
@@ -436,6 +446,19 @@ impl VramBudget {
     /// recomputed on every call from the entering tile's own byte cost, not
     /// cached from a previous call.
     pub fn acquire(&self, bytes_per_tile: u64) -> Permit<'_> {
+        self.admit(bytes_per_tile);
+        Permit { budget: self }
+    }
+
+    /// [`Self::acquire`] returning a permit that keeps the budget alive.
+    pub fn acquire_owned(self: &Arc<Self>, bytes_per_tile: u64) -> OwnedPermit {
+        self.admit(bytes_per_tile);
+        OwnedPermit {
+            budget: Arc::clone(self),
+        }
+    }
+
+    fn admit(&self, bytes_per_tile: u64) {
         let mut in_flight = self.in_flight.lock().unwrap();
         let limit = self.limit_for(bytes_per_tile);
         while *in_flight >= limit {
@@ -443,7 +466,12 @@ impl VramBudget {
         }
         *in_flight += 1;
         self.peak.fetch_max(*in_flight, Ordering::SeqCst);
-        Permit { budget: self }
+    }
+
+    fn release(&self) {
+        let mut in_flight = self.in_flight.lock().unwrap();
+        *in_flight -= 1;
+        self.condvar.notify_all();
     }
 
     /// The most tiles admitted at once since construction or the last

@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use focusforge_core::io::{Rect, TiffStack};
+use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 
 #[path = "../../../core/tests/common/reference_stack.rs"]
 mod reference_stack;
@@ -267,4 +267,60 @@ pub fn readonly_dir(label: &str, mode: u32, populate: impl FnOnce(&Path)) -> Opt
         return None;
     }
     Some(ReadOnlyDir { dir })
+}
+
+/// Sinusoids of 17 to 751 px wavelength: textured at every scale of the
+/// alignment pyramid and never periodic over a frame. `channel` offsets every
+/// phase, so the three planes differ.
+fn synthetic_scene(x: f64, y: f64, channel: usize) -> f64 {
+    const RIPPLES: [(f64, f64, f64, f64); 10] = [
+        (1.0 / 613.0, 1.0 / 751.0, 0.7, 1.6),
+        (-1.0 / 487.0, 1.0 / 529.0, 2.9, 1.4),
+        (1.0 / 97.0, 1.0 / 131.0, 0.3, 1.0),
+        (1.0 / 61.0, -1.0 / 83.0, 1.7, 0.8),
+        (-1.0 / 47.0, 1.0 / 71.0, 4.1, 0.6),
+        (1.0 / 113.0, 1.0 / 37.0, 2.4, 0.7),
+        (1.0 / 23.0, 1.0 / 29.0, 0.9, 0.5),
+        (-1.0 / 19.0, 1.0 / 17.0, 5.0, 0.4),
+        (1.0 / 31.0, 1.0 / 43.0, 3.3, 0.5),
+        (-1.0 / 41.0, -1.0 / 27.0, 1.1, 0.4),
+    ];
+    RIPPLES
+        .iter()
+        .map(|&(fx, fy, phase, amp)| {
+            amp * (std::f64::consts::TAU * (fx * x + fy * y) + phase + channel as f64).sin()
+        })
+        .sum()
+}
+
+/// Writes 16-bit RGB frames `frame-00.tif`, ... into the existing directory
+/// `dir`: frame `i` is one analytic textured scene translated by `shifts[i]`
+/// pixels, an exact translate of the first at zero shift.
+#[allow(dead_code)]
+pub fn write_synthetic_stack(dir: &Path, width: u32, height: u32, shifts: &[(f64, f64)]) {
+    for (index, &(dx, dy)) in shifts.iter().enumerate() {
+        let mut samples = Vec::with_capacity(width as usize * height as usize * 3);
+        for y in 0..height {
+            for x in 0..width {
+                for channel in 0..3 {
+                    let v = synthetic_scene(f64::from(x) - dx, f64::from(y) - dy, channel);
+                    samples.push((32768.0 + 6000.0 * v).clamp(0.0, 65535.0) as u16);
+                }
+            }
+        }
+        let mut writer = TiffWriter::create(
+            &dir.join(format!("frame-{index:02}.tif")),
+            TiffSpec {
+                width,
+                height,
+                samples_per_pixel: 3,
+                description: None,
+            },
+        )
+        .expect("synthetic frame writer must create");
+        writer
+            .write_tile(full_rect(width, height), &samples)
+            .expect("synthetic frame writer must accept the full tile");
+        writer.finish().expect("synthetic frame writer must finish");
+    }
 }

@@ -848,3 +848,259 @@ fn adapter_logged_once() {
         output.stderr
     );
 }
+
+/// Frame shifts of the synthetic align stacks, in pixels.
+const ALIGN_SHIFTS: [(f64, f64); 3] = [(0.0, 0.0), (3.5, -2.25), (-4.75, 6.5)];
+
+/// A 3-frame 1400x1400 stack: its level-0 solve region clears the 1,000,000 px
+/// threshold for the GPU path.
+fn large_synthetic_stack(name: &str) -> common::TmpDir {
+    let dir = common::tmp_dir(name);
+    common::write_synthetic_stack(&dir, 1400, 1400, &ALIGN_SHIFTS);
+    dir
+}
+
+/// `align --json --lax --algo pyramidal-ecc` over `input` plus `extra`;
+/// `cmd` carries any env the test sets.
+fn align_json(
+    mut cmd: Command,
+    cwd: &Path,
+    input: &Path,
+    extra: &[&str],
+) -> (CliOutput, serde_json::Value) {
+    let mut args = vec![
+        "align",
+        input.to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--json",
+    ];
+    args.extend_from_slice(extra);
+    let out = common::run_in(&mut cmd, cwd, &args);
+    let report = serde_json::from_str(&out.stdout).unwrap_or(serde_json::Value::Null);
+    (out, report)
+}
+
+/// Translation mode keeps the debug-build CPU side of the synthetic runs short.
+const TRANSLATION: [&str; 2] = ["--set", "mode=translation"];
+
+/// A level large enough for the GPU path runs on the adapter, and the
+/// alignment agrees with the CPU run to the geometric budget.
+#[test]
+fn align_large_synthetic_stack_uses_the_gpu() {
+    const CORNER_BUDGET: f64 = 0.04;
+    let cwd = common::tmp_dir("cli_gpu_align_large_cwd");
+    let input = large_synthetic_stack("cli_gpu_align_large_in");
+
+    let (gpu, gpu_report) = align_json(bin(), &cwd, &input, &TRANSLATION);
+    assert!(gpu.success, "gpu align stderr: {}", gpu.stderr);
+    let mut cpu_args = TRANSLATION.to_vec();
+    cpu_args.push("--no-gpu");
+    let (cpu, cpu_report) = align_json(bin(), &cwd, &input, &cpu_args);
+    assert!(cpu.success, "cpu align stderr: {}", cpu.stderr);
+
+    let backend = gpu_report["align_backend"]
+        .as_str()
+        .expect("the report must name the align backend");
+    assert_ne!(backend, "cpu", "a 1400x1400 stack must run on the adapter");
+    assert_eq!(cpu_report["align_backend"], "cpu");
+
+    let (gpu_frames, cpu_frames) = (
+        gpu_report["alignments"].as_array().unwrap(),
+        cpu_report["alignments"].as_array().unwrap(),
+    );
+    assert_eq!(gpu_frames.len(), cpu_frames.len());
+    for (g, c) in gpu_frames.iter().zip(cpu_frames) {
+        assert_eq!(g["status"], c["status"], "statuses must agree: {g} vs {c}");
+        for key in ["tx", "ty"] {
+            let (g, c) = (g[key].as_f64().unwrap(), c[key].as_f64().unwrap());
+            assert!(
+                (g - c).abs() <= CORNER_BUDGET,
+                "{key}: gpu {g} against cpu {c} exceeds {CORNER_BUDGET} px"
+            );
+        }
+    }
+}
+
+/// A device destroyed during the first ECC iteration reruns the whole stage
+/// on the CPU: the result is the `--no-gpu` result, exactly.
+#[test]
+fn align_reruns_on_cpu_after_device_loss() {
+    let cwd = common::tmp_dir("cli_gpu_align_loss_cwd");
+    let input = large_synthetic_stack("cli_gpu_align_loss_in");
+
+    let mut lossy = bin();
+    lossy.env("FF_FORCE_DEVICE_LOST", "1");
+    let (lost, lost_report) = align_json(lossy, &cwd, &input, &TRANSLATION);
+    assert!(
+        lost.success,
+        "a lost device must still finish: {}",
+        lost.stderr
+    );
+    assert_eq!(
+        lost_report["align_backend"], "cpu",
+        "stderr: {}\nreport: {lost_report}",
+        lost.stderr
+    );
+    assert!(
+        lost.stderr.contains("reran on the CPU"),
+        "stderr must give the loss reason: {}",
+        lost.stderr
+    );
+
+    let mut cpu_args = TRANSLATION.to_vec();
+    cpu_args.push("--no-gpu");
+    let (cpu, cpu_report) = align_json(bin(), &cwd, &input, &cpu_args);
+    assert!(cpu.success, "cpu align stderr: {}", cpu.stderr);
+    assert_eq!(
+        lost_report["alignments"], cpu_report["alignments"],
+        "every transform must equal the CPU run's"
+    );
+}
+
+/// `--no-gpu` never brings up an adapter: the log holds no adapter record.
+#[test]
+fn align_no_gpu_never_probes_an_adapter() {
+    let cwd = common::tmp_dir("cli_gpu_align_no_gpu_cwd");
+    let mut cmd = bin();
+    let data_dir = common::data_dir_of(&cmd);
+    cmd.args([
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--no-gpu",
+        "--json",
+    ]);
+    let out = CliOutput::from(
+        cmd.current_dir(&*cwd)
+            .output()
+            .expect("failed to run binary"),
+    );
+    assert!(out.success, "stderr: {}", out.stderr);
+    let log = std::fs::read_to_string(log_path(&data_dir)).unwrap_or_default();
+    assert!(
+        !log.contains("graphics adapter selected"),
+        "--no-gpu must not probe an adapter: {log}"
+    );
+    assert!(
+        out.stderr.contains("--no-gpu given: aligning on the CPU"),
+        "stderr must give the reason: {}",
+        out.stderr
+    );
+}
+
+/// A run with no level reaching the GPU threshold never opens the adapter:
+/// the log holds no adapter record and stderr no selection line.
+#[test]
+fn align_without_eligible_region_never_probes_an_adapter() {
+    let cwd = common::tmp_dir("cli_gpu_align_small_cwd");
+    let mut cmd = bin();
+    let data_dir = common::data_dir_of(&cmd);
+    cmd.args([
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--json",
+    ]);
+    let out = CliOutput::from(
+        cmd.current_dir(&*cwd)
+            .output()
+            .expect("failed to run binary"),
+    );
+    assert!(out.success, "stderr: {}", out.stderr);
+    let log = std::fs::read_to_string(log_path(&data_dir)).unwrap_or_default();
+    assert!(
+        !log.contains("graphics adapter selected"),
+        "a run with no eligible region must not probe an adapter: {log}"
+    );
+    assert!(
+        !out.stderr.contains("(backend="),
+        "stderr must carry no adapter line: {}",
+        out.stderr
+    );
+}
+
+/// With no adapter the alignment runs on the CPU and says why.
+#[test]
+fn align_without_adapter_runs_on_cpu() {
+    let cwd = common::tmp_dir("cli_gpu_align_no_adapter_cwd");
+    let input = large_synthetic_stack("cli_gpu_align_no_adapter_in");
+    let Some(out) = run_with_no_adapter(
+        &cwd,
+        &[
+            "align",
+            input.to_str().unwrap(),
+            "--algo",
+            "pyramidal-ecc",
+            "--lax",
+            "--json",
+            "--set",
+            "mode=translation",
+        ],
+    ) else {
+        return;
+    };
+    assert!(out.success, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("no usable GPU adapter"),
+        "stderr must give the reason: {}",
+        out.stderr
+    );
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("--json must parse");
+    assert_eq!(report["align_backend"], "cpu");
+}
+
+/// `--max-vram` caps the align backend's device budget, and a capped backend
+/// still serves the level.
+#[test]
+fn align_max_vram_caps_the_gpu_backend() {
+    let cwd = common::tmp_dir("cli_gpu_align_cap_cwd");
+    let input = large_synthetic_stack("cli_gpu_align_cap_in");
+    let mut args = TRANSLATION.to_vec();
+    args.extend(["--max-vram", "1MiB"]);
+    let (out, report) = align_json(bin(), &cwd, &input, &args);
+    assert!(out.success, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("device budget 1048576 bytes"),
+        "stderr must name the capped budget: {}",
+        out.stderr
+    );
+    assert_ne!(report["align_backend"], "cpu", "report: {report}");
+}
+
+/// The selection line is printed once, at first use, and names the adapter
+/// the report names; a stack with no eligible region reports `cpu`.
+#[test]
+fn align_report_names_the_backend() {
+    let cwd = common::tmp_dir("cli_gpu_align_names_cwd");
+    let input = large_synthetic_stack("cli_gpu_align_names_in");
+    let (out, report) = align_json(bin(), &cwd, &input, &TRANSLATION);
+    assert!(out.success, "stderr: {}", out.stderr);
+    let lines: Vec<&str> = out
+        .stderr
+        .lines()
+        .filter(|line| line.contains("(backend="))
+        .collect();
+    assert_eq!(lines.len(), 1, "one selection line: {}", out.stderr);
+    assert!(
+        !lines[0].contains("adapter selected: "),
+        "the selection line must not repeat the fuse path's prefix: {}",
+        lines[0]
+    );
+    let adapter = report["align_backend"].as_str().expect("align_backend");
+    assert_ne!(adapter, "cpu");
+    assert!(
+        lines[0].contains(adapter),
+        "the line must name {adapter}: {}",
+        lines[0]
+    );
+
+    let (small, small_report) = align_json(bin(), &cwd, &mantis_512_dir(), &[]);
+    assert!(small.success, "stderr: {}", small.stderr);
+    assert_eq!(small_report["align_backend"], "cpu");
+}

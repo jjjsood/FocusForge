@@ -8,8 +8,8 @@ use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
 
 /// One compute pipeline plus the bind group layout it was built with.
 pub(crate) struct Pipeline {
-    compute: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    pub(crate) compute: wgpu::ComputePipeline,
+    pub(crate) bind_group_layout: wgpu::BindGroupLayout,
 }
 
 fn entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {

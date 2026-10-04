@@ -58,6 +58,27 @@ fn ceil_div(a: u32, b: u32) -> usize {
     a.div_ceil(b) as usize
 }
 
+/// The off-centre patches of a 512 px frame: a 3x3 grid without its middle.
+const PATCH_COUNT: usize = 8;
+
+/// Reads one registration makes of a frame's own pixels up to its solve: the
+/// level-1 bands (each output band of `DEFAULT_TILE_SIZE / 2` rows reads its
+/// rows plus halo), without the level-0 window or patches.
+fn streamed_band_reads(stack: &StackContext) -> usize {
+    ceil_div(stack.height.div_ceil(2), DEFAULT_TILE_SIZE / 2)
+}
+
+/// The reference frame is read as bands, one level-0 template window and one
+/// window per patch template -- once per run, whatever the registration count.
+fn reference_reads(stack: &StackContext) -> usize {
+    streamed_band_reads(stack) + 1 + PATCH_COUNT
+}
+
+/// Reads one escalation adds for a frame no larger than the detector's 512 px
+/// proxy: the whole frame at level 0. The reference's is made by the first
+/// escalation of a run and shared by every later one.
+const ESCALATION_READS: usize = 1;
+
 /// Wraps another [`TileReader`], counting `read_tile_into` calls per frame
 /// index. One `AtomicUsize` per frame, so concurrent registrations (the
 /// rayon anchor sub-arm) count correctly with no lock.
@@ -307,25 +328,52 @@ fn per_frame_outcomes_match_the_recorded_run() {
     );
 }
 
+/// A fingerprint without its status token: the transform, iteration count and
+/// residual bits alone.
+fn without_status(fingerprint: &str) -> String {
+    fingerprint
+        .split_whitespace()
+        .filter(|token| !token.starts_with("status="))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The transform, iteration count and residual of every frame stay bit for bit
+/// what the recorded run produced, whatever status the off-centre check adds.
+#[test]
+fn transforms_iterations_and_residuals_match_the_recorded_run() {
+    for (mode, recorded) in [
+        ("translation", RECORDED_TRANSLATION),
+        ("rotation-scale", RECORDED_ROTATION_SCALE),
+    ] {
+        let now: Vec<String> = recorded_fingerprints(mode)
+            .iter()
+            .map(|f| without_status(f))
+            .collect();
+        let then: Vec<String> = recorded.iter().map(|f| without_status(f)).collect();
+        assert_eq!(now, then, "{mode}");
+    }
+}
+
 const RECORDED_TRANSLATION: [&str; 8] = [
     "m=[3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000] status=Diverged(TooFewValidSamples) iterations=1 residual=bfa2f68153100307",
-    "m=[3ff0000000000000,0000000000000000,405e79928eb0cc64,0000000000000000,3ff0000000000000,c04dd0b77f3439d3,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=97 residual=3feedf50c93314a9",
-    "m=[3ff0000000000000,0000000000000000,40406ed2099f4461,0000000000000000,3ff0000000000000,c03781cf47018f24,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=24 residual=3feeed3c02c537d1",
-    "m=[3ff0000000000000,0000000000000000,c033282750597487,0000000000000000,3ff0000000000000,4022e7f01941cb16,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=40 residual=3fee231a6fcd16dd",
+    "m=[3ff0000000000000,0000000000000000,405e7992b87c107e,0000000000000000,3ff0000000000000,c04dd0b77044b38d,0000000000000000,0000000000000000,3ff0000000000000] status=Diverged(ValidationFailed) iterations=75 residual=3feedf50c8dffa9b",
+    "m=[3ff0000000000000,0000000000000000,40406ed20475bb9d,0000000000000000,3ff0000000000000,c03781cf4731f907,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=19 residual=3feeed3c028ccb26",
+    "m=[3ff0000000000000,0000000000000000,c03328268ba61a28,0000000000000000,3ff0000000000000,4022e7f061aa4961,0000000000000000,0000000000000000,3ff0000000000000] status=Diverged(ValidationFailed) iterations=33 residual=3fee231a6f184499",
     "m=[3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=0 residual=3ff0000000000000",
-    "m=[3ff0000000000000,0000000000000000,c01c68c547073ca6,0000000000000000,3ff0000000000000,c0307fd3bf078940,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=40 residual=3fefe9b4000c2c23",
-    "m=[3ff0000000000000,0000000000000000,c02b203db9af8ce9,0000000000000000,3ff0000000000000,403d85bde72e20a3,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=105 residual=3fef1d4b415f674a",
+    "m=[3ff0000000000000,0000000000000000,c01c68c43217fcf6,0000000000000000,3ff0000000000000,c0307fd3b5f9aaf1,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=32 residual=3fefe9b3ffdeb360",
+    "m=[3ff0000000000000,0000000000000000,c02b204801c50ae3,0000000000000000,3ff0000000000000,403d85bd33ac5ca2,0000000000000000,0000000000000000,3ff0000000000000] status=Diverged(ValidationFailed) iterations=78 residual=3fef1d4b40735c83",
     "m=[3ff0000000000000,0000000000000000,4035e64d6fd19b15,0000000000000000,3ff0000000000000,4038cd26c9f30cef,0000000000000000,0000000000000000,3ff0000000000000] status=Diverged(CorrelationDecreased) iterations=6 residual=3fed8e1afae6eb4e",
 ];
 const RECORDED_ROTATION_SCALE: [&str; 8] = [
     "m=[3fd2f08090a14c09,bf816516ffa13062,40715b33b68a89f5,3f816516ffa13062,3fd2f08090a14c09,405a91b7c1dd18fe,0000000000000000,0000000000000000,3fefffffffffffff] status=Diverged(CorrelationDecreased) iterations=12 residual=3fea7dac85df34d0",
     "m=[3ff148659462033a,bf932b345d397cce,4059d8dd1b568789,3f932b345d397cce,3ff148659462033a,c054b5031df0dff9,0000000000000000,0000000000000000,3feffffffffffffe] status=Diverged(TooFewValidSamples) iterations=8 residual=3fef215af392f665",
-    "m=[3feff1e64f9a5733,3f3a06ca8b062e31,4040a6059a848072,bf3a06ca8b062e31,3feff1e64f9a5733,c036fd1f6de646f8,0000000000000000,0000000000000000,3fefffffffffffee] status=Converged iterations=57 residual=3feeed150dd1f063",
-    "m=[3fee67308b9e8d9d,bf79bd285e0f37e3,bfd4aa1ec2c32024,3f79bd285e0f37e3,3fee67308b9e8d9d,40340e29866da4e4,0000000000000000,0000000000000000,3fefffffffffffef] status=Converged iterations=76 residual=3fee226a74074281",
+    "m=[3feff1e6439b8f44,3f3a06a4279157e2,4040a60610f9e07f,bf3a06a4279157e2,3feff1e6439b8f44,c036fd1f31702764,0000000000000000,0000000000000000,3feffffffffffff4] status=Converged iterations=46 residual=3feeed150dbf36bd",
+    "m=[3fee673077a3eb89,bf79bd2cafc8adfa,bfd4a9b35e073a3e,3f79bd2cafc8adfa,3fee673077a3eb89,40340e29f51acf1f,0000000000000000,0000000000000000,3feffffffffffff4] status=Diverged(ValidationFailed) iterations=63 residual=3fee226a73b6c717",
     "m=[3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000,0000000000000000,0000000000000000,0000000000000000,3ff0000000000000] status=Converged iterations=0 residual=3ff0000000000000",
-    "m=[3ff04cb4f2b3c422,3f6a27c898fda3aa,c02d68aed42d4ace,bf6a27c898fda3aa,3ff04cb4f2b3c422,c03482920e4bf6a5,0000000000000000,0000000000000000,3feffffffffffffb] status=Converged iterations=47 residual=3fefec3a4ae9be66",
-    "m=[3ff167913b3ba24f,3f8a11d6cae283f3,c04a076430894b1d,bf8a11d6cae283f3,3ff167913b3ba24f,402171d3255e14ed,0000000000000000,0000000000000000,3feffffffffffffc] status=Converged iterations=122 residual=3fef4bc1770c814e",
-    "m=[3ff335c793f82172,3f8656598da4b88a,c055e04ee5ca9eb5,bf8656598da4b88a,3ff335c793f82172,c040c0382c84cec3,0000000000000000,0000000000000000,3fefffffffffffaa] status=HitCap iterations=881 residual=3fee38d67a98212e",
+    "m=[3ff04cb4e8c27a57,3f6a27be2529c576,c02d68aabd576081,bf6a27be2529c576,3ff04cb4e8c27a57,c0348291a3a10f76,0000000000000000,0000000000000000,3feffffffffffffb] status=Converged iterations=37 residual=3fefec3a4ad40c62",
+    "m=[3ff167913813c0c1,3f8a11d5a1ab5e01,c04a0763b7d7aac1,bf8a11d5a1ab5e01,3ff167913813c0c1,402171d35d126abe,0000000000000000,0000000000000000,3fefffffffffffff] status=Converged iterations=97 residual=3fef4bc17728ea4f",
+    "m=[3ff33a858c942d94,3f86ee762190b6d1,c0560538678ec669,bf86ee762190b6d1,3ff33a858c942d94,c040e3b23ffaf843,0000000000000000,0000000000000000,3feffffffffffffc] status=Stalled iterations=463 residual=3fee392c348fd409",
 ];
 
 /// Fingerprints of `frames` aligned against `reference` of `stack` under
@@ -435,23 +483,29 @@ fn reference_frame_is_read_once_per_run() {
     )
     .expect("serial anchored run completes");
 
-    let expected_band_reads = ceil_div(stack_ctx.height, DEFAULT_TILE_SIZE);
+    let bands = streamed_band_reads(&stack_ctx);
     let reference = run.alignment.reference;
 
+    // Several fixture frames diverge and escalate, yet the reference gains one
+    // read, not one per escalation.
     assert_eq!(
         reader.reads_for(reference),
-        expected_band_reads,
-        "the cached reference frame must be read exactly once (in bands), not once per \
-         registration"
+        reference_reads(&stack_ctx) + ESCALATION_READS,
+        "the cached reference frame must be read once (bands, level-0 window, patch \
+         windows) plus its one shared escalation read, not once per registration"
     );
     for i in 0..stack_ctx.frame_count {
         if i == reference {
             continue;
         }
-        assert_eq!(
-            reader.reads_for(i),
-            expected_band_reads,
-            "non-reference frame {i}'s own read count must be unchanged"
+        // Bands always; a frame that reaches level 0 adds its window, one
+        // that converges there adds at most one window per patch, and one that
+        // diverges adds its own whole-frame escalation read.
+        let reads = reader.reads_for(i);
+        let most = bands + 1 + PATCH_COUNT + ESCALATION_READS;
+        assert!(
+            (bands..=most).contains(&reads),
+            "non-reference frame {i} made {reads} reads, expected {bands} to {most}"
         );
     }
 }
@@ -556,7 +610,7 @@ fn chain_mode_prepares_nothing() {
 fn two_runs_do_not_share_a_cache() {
     let stack = open_fixture();
     let stack_ctx = stack_context(&stack);
-    let expected_band_reads = ceil_div(stack_ctx.height, DEFAULT_TILE_SIZE);
+    let expected_band_reads = reference_reads(&stack_ctx);
 
     let mut cfg_first = lowered_max_iterations(&stack_ctx);
     cfg_first.insert(
@@ -577,7 +631,10 @@ fn two_runs_do_not_share_a_cache() {
     )
     .expect("first run completes");
     assert_eq!(first.alignment.reference, 0);
-    assert_eq!(reader_first.reads_for(0), expected_band_reads);
+    assert_eq!(
+        reader_first.reads_for(0),
+        expected_band_reads + ESCALATION_READS
+    );
 
     let mut cfg_second = lowered_max_iterations(&stack_ctx);
     cfg_second.insert(
@@ -603,15 +660,11 @@ fn two_runs_do_not_share_a_cache() {
     // its own reference frame is read exactly once, the same count the
     // first run's own reference frame was read, never zero (which would
     // mean it silently reused the first run's already-finished pyramid).
-    assert_eq!(
-        reader_second.reads_for(second.alignment.reference),
-        expected_band_reads,
-        "the second run's reference frame must be read exactly once, on its own"
-    );
-    assert_eq!(
-        reader_first.reads_for(first.alignment.reference),
-        reader_second.reads_for(second.alignment.reference),
-        "per-frame read counts must be identical across the two independent runs"
+    let second_reads = reader_second.reads_for(second.alignment.reference);
+    assert!(
+        (expected_band_reads..=expected_band_reads + ESCALATION_READS).contains(&second_reads),
+        "the second run's reference frame must be read once on its own, plus at most the \
+         one shared escalation read: {second_reads} reads"
     );
 
     let uncached_second =

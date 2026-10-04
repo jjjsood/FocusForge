@@ -49,6 +49,11 @@ pub enum AlgorithmError {
         required_bytes: u64,
     },
 
+    /// An accelerator's device was lost or ran out of memory mid-run; the
+    /// work can be redone on the CPU.
+    #[error("the accelerator failed: {detail}")]
+    BackendLost { detail: String },
+
     /// The run's control requested a cancel before every frame was
     /// registered; the driver started no registration after reading it.
     #[error("alignment cancelled")]

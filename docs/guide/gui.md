@@ -59,6 +59,17 @@ GPU unplugged), the canvas stops updating and the window closes itself a
 moment later rather than hanging; see
 [`guide/diagnostics.md`](diagnostics.md) for where that is logged.
 
+## Aligning in the window
+
+The **ALIGN** section of **Settings** opens with an **Enabled** switch.
+Switched off, it governs the whole section: the alignment algorithm and its
+parameters dim, and the next fuse uses the frames as read. **Auto-crop** sits
+alone in the **CROP** section and is independent of the switch. A fuse does not stop
+at a frame that fails to register: the run finishes with that frame
+unaligned and offers **Keep** or discard. After **Keep**, an info toast reads `N frames unaligned` (`1 frame unaligned`) when any frame fell back to
+identity. A re-fuse that changes only fusion settings reuses the stored
+alignment. See [`guide/alignment.md`](alignment.md).
+
 ## Saving a project
 
 A fuse in the window writes nothing next to the frames: the result is held

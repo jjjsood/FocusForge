@@ -24,7 +24,7 @@ use crate::align::{
 };
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
-use crate::gpu::TileBackend;
+use crate::gpu::{AlignBackend, TileBackend};
 use crate::io::{
     COMPOSITE_FILENAME, FrameDesc, FrameReader, Rect, TiffStack, ZMAP_FILENAME, open_frame_set,
 };
@@ -71,6 +71,8 @@ pub struct FuseRequest {
     pub tile_size: Option<u32>,
     pub max_host_memory: Option<u64>,
     pub backend: Option<&'static dyn TileBackend>,
+    /// An accelerator the align stage may offer its large ECC solves to.
+    pub align_backend: Option<&'static dyn AlignBackend>,
     pub resume: bool,
     pub cache: bool,
     /// How often the poll thread this module owns calls
@@ -152,6 +154,10 @@ pub struct FuseReport {
     /// The bytes the align stage accounted for (shared reference data plus
     /// one registration per worker); `None` when no alignment was computed.
     pub align_accounted_bytes: Option<u64>,
+    /// Whether an accelerator ran at least one level of the alignment this
+    /// run computed; `false` for a cached, resumed or skipped alignment and
+    /// for a stage that reran on the CPU.
+    pub align_backend_used: bool,
     pub stages: StageTimings,
     pub wall_seconds: f64,
     pub metrics: Metrics,
@@ -198,6 +204,11 @@ pub trait StageObserver: Sync {
     /// crate and never decides how (or whether) a message is displayed.
     fn notice(&self, _message: &str) {}
 }
+
+/// The tail of the [`StageObserver::notice`] raised when the align stage
+/// reran on the CPU after its accelerator failed; the text before it is the
+/// reason.
+pub const ALIGN_RERUN_NOTICE: &str = "; the align stage reran on the CPU";
 
 /// Every early exit from the spine, typed by the stage that raised it.
 #[derive(Debug, thiserror::Error)]
@@ -294,6 +305,7 @@ pub fn run(
     let mut align_workers: Option<usize> = None;
     let mut peak_align_workers: Option<usize> = None;
     let mut align_accounted_bytes: Option<u64> = None;
+    let mut align_backend_used = false;
 
     if let Some(align_req) = &request.align {
         timer.enter(Stage::Align);
@@ -314,11 +326,7 @@ pub fn run(
         } else {
             FailurePolicy::Strict
         };
-        let identity = AlignIdentity {
-            algorithm: align_req.algorithm.id().to_string(),
-            params: align_values.clone(),
-            failure_policy: policy,
-        };
+        let identity = AlignIdentity::new(align_req.algorithm.id(), align_values.clone(), policy);
 
         let peeked = if request.resume {
             peek_resumable_alignment(
@@ -403,6 +411,7 @@ pub fn run(
                             frames_done: Some(frames_done),
                             control: Some(Arc::clone(&control)),
                             on_pause: Some(&|control| observer.paused(control)),
+                            align_backend: request.align_backend,
                         },
                     );
                     done.store(true, Ordering::SeqCst);
@@ -424,6 +433,10 @@ pub fn run(
                 align_workers = Some(solved.worker_limit);
                 peak_align_workers = Some(solved.peak_workers);
                 align_accounted_bytes = Some(solved.accounted_bytes);
+                align_backend_used = solved.backend_used;
+                if let Some(reason) = &solved.rerun_reason {
+                    observer.notice(&format!("{reason}{ALIGN_RERUN_NOTICE}"));
+                }
                 let alignment = solved.alignment;
                 if !align_req.lax && alignment.failure_count() > 0 {
                     return Err(PipelineError::Align(describe_align_failure(
@@ -456,7 +469,8 @@ pub fn run(
         .map_err(|err| PipelineError::Align(err.to_string()))?;
     if request.crop && crop_rect_value.is_none() {
         return Err(PipelineError::Align(
-            "the aligned frames' overlap leaves no interior once the kernel margin is trimmed"
+            "the aligned frames' overlap leaves no interior once the kernel margin is trimmed; \
+             turn off auto-crop to keep the full frame extent"
                 .to_string(),
         ));
     }
@@ -535,10 +549,12 @@ pub fn run(
         backend: backend_id.clone(),
         align: alignment_result
             .as_ref()
-            .map(|(align_algo, align_resolved, policy, _)| AlignIdentity {
-                algorithm: align_algo.id().to_string(),
-                params: params::resolved_values(align_resolved),
-                failure_policy: *policy,
+            .map(|(align_algo, align_resolved, policy, _)| {
+                AlignIdentity::new(
+                    align_algo.id(),
+                    params::resolved_values(align_resolved),
+                    *policy,
+                )
             }),
         crop: applied_crop,
         composite_output: staged_composite.clone(),
@@ -802,6 +818,7 @@ pub fn run(
         align_workers,
         peak_align_workers,
         align_accounted_bytes,
+        align_backend_used,
         stages,
         wall_seconds,
         metrics,
@@ -917,6 +934,9 @@ fn divergence_phrase(reason: crate::align::DivergenceReason) -> &'static str {
         DivergenceReason::CorrelationDecreased => "the match grew worse instead of better",
         DivergenceReason::TooFewValidSamples => "too few pixels overlapped to measure a match",
         DivergenceReason::NonFiniteUpdate => "the computation produced an invalid result",
+        DivergenceReason::ValidationFailed => {
+            "the alignment does not hold away from the centre of the frame"
+        }
     }
 }
 
@@ -1131,6 +1151,24 @@ pub fn uniform_check(frames: &[(&str, &FrameDesc)]) -> (bool, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_failed_has_its_own_phrase() {
+        use crate::align::DivergenceReason;
+
+        let phrase = divergence_phrase(DivergenceReason::ValidationFailed);
+        for other in [
+            DivergenceReason::SingularHessian,
+            DivergenceReason::LemmaOneRegion,
+            DivergenceReason::NonInvertibleIncrement,
+            DivergenceReason::CorrelationDecreased,
+            DivergenceReason::TooFewValidSamples,
+            DivergenceReason::NonFiniteUpdate,
+        ] {
+            assert_ne!(phrase, divergence_phrase(other));
+        }
+        assert!(phrase.contains("away from the centre"), "{phrase}");
+    }
 
     fn desc(label: &str, signature: &[&str]) -> FrameDesc {
         FrameDesc {

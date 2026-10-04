@@ -97,6 +97,9 @@ pub struct AlignReport {
     /// one registration per worker. An explicit budget below one
     /// registration still runs one worker, so this can exceed the budget.
     pub align_accounted_bytes: u64,
+    /// `"cpu"`, or the adapter's display when at least one alignment level
+    /// ran on it.
+    pub align_backend: String,
 }
 
 /// One frame's row in [`AlignReport::alignments`]: `#[serde(flatten)]`ed
@@ -159,6 +162,7 @@ pub fn run(
     quiet: bool,
     preset_opts: &PresetOptions<'_>,
     no_gpu: bool,
+    max_vram: Option<u64>,
 ) -> ExitCode {
     let start = Instant::now();
     // One monotonic timer shares `start` with `wall_seconds` below.
@@ -248,6 +252,7 @@ pub fn run(
     } else {
         FailurePolicy::Strict
     };
+    let align_choice = crate::resolve_align_backend(algo.id(), no_gpu, max_vram);
     timer.mark(Stage::Setup);
     timer.enter(Stage::Align);
     renderer.stage(&format!("align {} frames", frame_reader.len()));
@@ -259,12 +264,16 @@ pub fn run(
         policy,
         &AlignDriverOptions {
             budget: opened.scheduler_budget,
+            align_backend: align_choice.backend,
             ..Default::default()
         },
     ) {
         Ok(run) => run,
         Err(err) => return sink.fail(err),
     };
+    if let Some(reason) = &run.rerun_reason {
+        eprintln!("{reason}; the align stage reran on the CPU");
+    }
     let alignment = run.alignment;
     let crop = match auto_crop(&alignment, (width, height)) {
         Ok(crop) => crop,
@@ -274,15 +283,12 @@ pub fn run(
 
     if let Some(write_warped) = write_warped {
         timer.enter(Stage::WarpWrite);
-        // Resolved only here, not for a plain `align` run: plain `align` has
-        // nothing on the GPU-shaped path (its ECC solver is CPU-only), so
-        // probing for an adapter on every run would be noise with nothing to
-        // show for it. `align` also has no `--max-vram` flag of its own, so
-        // there is no ceiling to thread through.
+        // The fuse backend is resolved only for `--write-warped`: the
+        // alignment's own accelerator was chosen above.
         let backend = crate::resolve_backend(
             focusforge_core::fuse::laplacian::Laplacian.id(),
             no_gpu,
-            None,
+            max_vram,
         )
         .backend;
         if let Err(msg) = write_warped_frames(
@@ -340,6 +346,7 @@ pub fn run(
         align_workers: Some(run.worker_limit),
         peak_align_workers: Some(run.peak_workers),
         align_accounted_bytes: run.accounted_bytes,
+        align_backend: align_choice.report_name(run.backend_used),
     };
 
     if json {
@@ -527,6 +534,7 @@ fn status_text(status: &focusforge_core::algorithm::AlignStatus) -> String {
     match status {
         focusforge_core::algorithm::AlignStatus::Converged => "converged".to_string(),
         focusforge_core::algorithm::AlignStatus::HitCap => "hit-cap".to_string(),
+        focusforge_core::algorithm::AlignStatus::Stalled => "stalled".to_string(),
         focusforge_core::algorithm::AlignStatus::Diverged(reason) => {
             format!("diverged({reason:?})")
         }
@@ -599,6 +607,12 @@ pub(crate) fn render(report: &AlignReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stalled_frame_renders_stalled() {
+        use focusforge_core::algorithm::AlignStatus;
+        assert_eq!(status_text(&AlignStatus::Stalled), "stalled");
+    }
 
     #[test]
     fn resolve_align_algo_without_an_id_skips_test_only_registrations() {

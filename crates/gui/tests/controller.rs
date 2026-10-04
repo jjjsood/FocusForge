@@ -363,6 +363,65 @@ fn open_fused_tab(controller: &mut AppController, name: &str, count: usize) -> P
     root
 }
 
+#[test]
+fn alignment_off_and_crop_off_survive_save_and_reopen() {
+    let mut controller = controller_with_scratch("align_crop_off");
+    open_mantis64_tab(&mut controller, "align_crop_off", 3);
+    controller.set_param_value(
+        "crop",
+        "align",
+        focusforge_core::params::ParamValue::Bool(false),
+    );
+    controller.set_param_value(
+        "crop",
+        "auto-crop",
+        focusforge_core::params::ParamValue::Bool(false),
+    );
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    let path = save_to_proposed(&mut controller);
+
+    let head = |path: &Path| {
+        focusforge_core::project::Project::open(path)
+            .expect("the saved project opens")
+            .manifest()
+            .clone()
+    };
+    let manifest = head(&path);
+    assert!(manifest.align.is_none(), "no alignment ran");
+    assert!(manifest.registration.crop.is_none(), "no crop applied");
+    assert_eq!(manifest.composite.width, 64, "the full frame extent");
+
+    let mut reopened = controller_with_scratch("align_crop_off_reopened");
+    assert!(matches!(
+        common::open_and_settle(&mut reopened, std::slice::from_ref(&path)),
+        OpenOutcome::Opened(_)
+    ));
+    let switches = |controller: &AppController| -> (String, String) {
+        let rows = controller.settings_panel().rows;
+        let selected = |id: &str| {
+            rows.iter()
+                .find(|row| row.id == id && row.section == "crop")
+                .unwrap_or_else(|| panic!("no {id} row"))
+                .selected
+                .clone()
+        };
+        (selected("align"), selected("auto-crop"))
+    };
+    assert_eq!(
+        switches(&reopened),
+        ("false".to_string(), "false".to_string())
+    );
+
+    assert!(reopened.start_fuse(), "the reopened project fuses again");
+    settle_all(&mut reopened);
+    assert_eq!(reopened.checkpoint_count(), Some(2));
+    reopened.save_active_project(|_| panic!("a saved tab never asks where"));
+    let manifest = head(&path);
+    assert!(manifest.align.is_none() && manifest.registration.crop.is_none());
+    assert_eq!(manifest.composite.width, 64);
+}
+
 /// Saves the active, never-saved tab to the path the save dialog proposes.
 fn save_to_proposed(controller: &mut AppController) -> PathBuf {
     let mut target = None;
@@ -2270,8 +2329,46 @@ fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
         "a default fuse completes rather than failing"
     );
     assert_eq!(controller.checkpoint_count(), Some(0));
-    let names = ["00.tif", "01.tif", "07.tif"].map(String::from);
+    let names = ["00.tif", "01.tif", "06.tif", "07.tif"].map(String::from);
     assert_eq!(controller.pending_divergence(), Some(&names[..]));
+
+    controller.keep_fused().expect("a parked run keeps");
+    let job::RunState::Fused { at, unaligned } = controller.job_view().state else {
+        panic!("a kept run settles to Fused");
+    };
+    assert_eq!(unaligned, 4);
+    assert_eq!(
+        job::stage_word(&controller.job_view().state, None),
+        format!("fused {at}"),
+        "the bar names the run, the notice names the count"
+    );
+    assert_eq!(
+        controller.unaligned_notice().as_deref(),
+        Some("4 frames unaligned")
+    );
+    let summary = controller.last_alignment().expect("a completed run");
+    assert_eq!(
+        (summary.source.as_str(), summary.backend.as_str()),
+        ("computed", "cpu")
+    );
+    assert_eq!(summary.unaligned, 4);
+    assert_eq!(summary.rerun, None);
+}
+
+#[test]
+fn a_clean_run_raises_no_unaligned_notice() {
+    let mut controller = controller_with_scratch("clean_run_no_notice");
+    open_mantis64_tab(&mut controller, "clean_run_no_notice", 3);
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    assert_eq!(controller.unaligned_notice(), None);
+    assert_eq!(
+        controller
+            .last_alignment()
+            .expect("a completed run")
+            .unaligned,
+        0
+    );
 }
 
 #[test]
