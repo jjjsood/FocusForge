@@ -73,8 +73,8 @@ status.
 
 A frame that ends `diverged` fails the whole run: `stack` and `align` both
 exit 1 and name every frame that failed, rather than silently falling back to
-an unregistered frame. `--lax` on either command softens each failed frame to
-an identity transform, exits 0 and reports the failure count on stderr.
+an unregistered frame. `--no-align` skips the stage when the frames are
+already registered.
 
 If the aligned frames share no usable overlap, `stack` stops with an error
 that says so; `--no-crop` keeps the full frame extent instead.
@@ -93,8 +93,9 @@ Some inputs still defeat the solver:
   period.
 
 Only `diverged` is a failure: `stalled`, `hit-cap` and `converged` frames
-never fail a strict run. For a stack with `diverged` frames use `--lax` to
-fuse anyway, or `--no-align` when the frames are already registered.
+never fail a strict run. For a stack with `diverged` frames, use `--no-align`
+when the frames are already registered, or inspect the result with
+`--write-warped`.
 
 ## Reuse and hardware
 

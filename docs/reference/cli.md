@@ -494,13 +494,12 @@ Options:
 | `--preset <PATH>` | read `align-algo` and the `[align]` table from a TOML preset — see [`guide/batch-runs.md`](../guide/batch-runs.md#presets). A non-empty `[stack]` table or `algo` key in the same file is unused here and says so on stderr |
 | `--write-preset <PATH>` | write the preset that reproduces this run: `align-algo` plus the `[align]` values chosen |
 | `--status <PATH>` | append one NDJSON status record for this run to this path |
-| `--lax` | soften a failed frame to an identity fallback and exit 0, reporting the failure count on stderr |
 | `--max-host-memory <SIZE>` | ceiling on the host-memory budget the alignment workers are sized from; it only lowers the derived budget |
 | `--max-vram <SIZE>` | ceiling on the device-memory budget for the alignment's GPU levels and the `--write-warped` fuse backend; it only lowers the probed budget. Absent when built `--no-default-features` |
 | `--no-gpu` | force the CPU path: the alignment's large levels and the `--write-warped` fuse backend stay on the CPU. Absent when built `--no-default-features` |
 
 A frame whose registration diverges refuses the run, exit 1, naming every
-failed frame; `--lax` softens that to exit 0.
+failed frame.
 
 ```
 $ focusforge-cli align path/to/frames --algo pyramidal-ecc
