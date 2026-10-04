@@ -278,7 +278,7 @@ fn project_params_json_lists_every_project_descriptor() {
         .as_array()
         .expect("a project_params array");
     let ids: Vec<&str> = params.iter().map(|p| p["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["auto-crop", "equalize", "equalize-max-gain"]);
+    assert_eq!(ids, ["align", "auto-crop", "equalize", "equalize-max-gain"]);
     for (json, desc) in params
         .iter()
         .zip(focusforge_core::project::PROJECT_PARAMS.iter())
@@ -287,7 +287,8 @@ fn project_params_json_lists_every_project_descriptor() {
         assert_eq!(json["advanced"], desc.advanced, "{}", desc.id);
         assert_eq!(json["value"], serde_json::to_value(&desc.default).unwrap());
     }
-    let help = params[1]["help"].as_str().unwrap();
+    let equalize = params.iter().find(|p| p["id"] == "equalize").unwrap();
+    let help = equalize["help"].as_str().unwrap();
     assert!(help.contains("not a linear-light correction"), "{help}");
 }
 

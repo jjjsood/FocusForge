@@ -203,7 +203,7 @@ pub enum HeadingState {
 pub struct SettingsRow {
     pub kind: RowKind,
     /// Which section a mutation on this row targets -- `"prepare"`,
-    /// `"fuse"`, `"align"` or `"finish"`, or [`ALIGN_SWITCH_SECTION`] for the
+    /// `"fuse"`, `"align"` or `"finish"`, or `"align-switch"` for the
     /// ALIGN switch row; every project-group section writes the tab's one
     /// project map. Param ids are unique only *within* one
     /// schema, never across the whole panel, so a callback needs this
