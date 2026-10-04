@@ -6,121 +6,9 @@
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
 import { FFEmptyState } from "empty_state.slint";
-import { FFErrorRow } from "../components/ff_error_row.slint";
+import { FFPane } from "../components/ff_pane.slint";
 import { FFPanePlaceholder } from "../components/ff_pane_placeholder.slint";
 import { FFBrushCursor } from "../components/ff_brush_cursor.slint";
-
-component FFPaneLabel inherits Rectangle {
-    in property <string> label: "";
-
-    width: 120px;
-    height: 22px;
-    background: Theme.surface-overlay;
-    border-radius: Theme.radius-sm;
-
-    Text {
-        text: root.label;
-        color: Theme.text-primary;
-        font-size: Theme.text-body.size;
-        font-weight: Theme.text-body.weight;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-        overflow: elide;
-    }
-}
-
-component FFUndockControl inherits Rectangle {
-    // Disabled on the last (single) pane.
-    in property <bool> enabled: true;
-    callback undock-requested();
-
-    width: 26px;
-    height: 22px;
-    background: area.has-hover && root.enabled ? Theme.surface-hover : Theme.surface-overlay;
-    border-radius: Theme.radius-sm;
-    opacity: root.enabled ? 1.0 : 0.5;
-
-    area := TouchArea {
-        enabled: root.enabled;
-        clicked => { root.undock-requested(); }
-    }
-    Image {
-        source: @image-url("../../../../assets/icons/maximize.svg");
-        colorize: Theme.text-secondary;
-        width: Theme.icon-sm;
-        height: Theme.icon-sm;
-    }
-}
-
-export component FFPane inherits Rectangle {
-    in property <image> source;
-    in property <string> label: "";
-    // Why `source` could not be drawn, one entry per line -- shown centred
-    // in place of the image while non-empty.
-    in property <[string]> message-lines: [];
-    in property <bool> undock-enabled: true;
-    // Whether a project is open -- the label and the undock control have
-    // nothing to name or to undock before one is, so they are hidden rather
-    // than shown over an empty pane.
-    in property <bool> project-loaded: false;
-    // The one shared viewport's placement, forwarded identically to both
-    // panes from `FFCanvas`: `image-fit: fill` plus an explicit rect is
-    // what lets a zoom/pan draw a *sub*-rect of the source, which
-    // `image-fit: contain` (whole-image-only) and `source-clip-*` (which
-    // needs the whole composite resident as one texture) both cannot.
-    in property <length> image-x;
-    in property <length> image-y;
-    in property <length> image-w;
-    in property <length> image-h;
-    in property <bool> pixelated;
-    // Set on the right pane only, while editor mode is active -- marks it
-    // as the paint target.
-    in property <bool> accent-border: false;
-    callback undock-requested();
-
-    background: Theme.surface-canvas;
-    border-radius: Theme.radius-md;
-    border-width: root.accent-border ? 1px : 0px;
-    border-color: Theme.accent-default;
-    clip: true;
-
-    Image {
-        source: root.source;
-        x: root.image-x;
-        y: root.image-y;
-        width: root.image-w;
-        height: root.image-h;
-        image-fit: fill;
-        image-rendering: root.pixelated ? ImageRendering.pixelated : ImageRendering.smooth;
-    }
-
-    if root.message-lines.length > 0 : VerticalLayout {
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        width: parent.width - 2 * Theme.space-6;
-        height: self.preferred-height;
-
-        for line in root.message-lines : FFErrorRow {
-            message: line;
-            horizontal-alignment: center;
-        }
-    }
-
-    pane-label := FFPaneLabel {
-        x: 10px;
-        y: 10px;
-        label: root.label;
-        visible: root.project-loaded;
-    }
-
-    pane-undock := FFUndockControl {
-        x: parent.width - 10px - self.width;
-        y: 10px;
-        enabled: root.undock-enabled;
-        visible: root.project-loaded;
-        undock-requested => { root.undock-requested(); }
-    }
-}
 
 export component FFCanvas inherits Rectangle {
     in property <image> composite-source;
@@ -133,6 +21,8 @@ export component FFCanvas inherits Rectangle {
     // The right pane's refusal -- see `FFPane::message-lines`.
     in property <[string]> composite-message-lines: [];
     in property <bool> undock-enabled: true;
+    // "composite" is the selected-frame pane; "zmap" is the composite pane.
+    in property <string> detached-pane: "";
     // Forwarded to both panes' chrome -- see `FFPane::project-loaded`.
     in property <bool> project-loaded: false;
     // Whether the active tab has a composite -- governs the right pane's
@@ -146,11 +36,19 @@ export component FFCanvas inherits Rectangle {
     in property <length> image-y;
     in property <length> image-w;
     in property <length> image-h;
+    in property <length> crop-x;
+    in property <length> crop-y;
+    in property <length> crop-w;
+    in property <length> crop-h;
     // The left pane's own placement, over the same extent as the right pane.
     in property <length> frame-image-x;
     in property <length> frame-image-y;
     in property <length> frame-image-w;
     in property <length> frame-image-h;
+    in property <length> frame-crop-x;
+    in property <length> frame-crop-y;
+    in property <length> frame-crop-w;
+    in property <length> frame-crop-h;
     in property <bool> pixelated;
     // Whether editor mode is active -- the right pane's accent border and
     // the brush cursor both show only then.
@@ -162,9 +60,21 @@ export component FFCanvas inherits Rectangle {
     in property <string> cursor-core-commands;
     in property <bool> cursor-picking: false;
     in property <color> cursor-pick-color;
-    // The offset that carries either pane's cursor onto the other, at the
-    // same scene point.
-    in property <length> cursor-mirror-dx;
+    in property <bool> cursor-visible: false;
+    in property <length> cursor-composite-x;
+    in property <length> cursor-composite-y;
+    in property <length> cursor-zmap-x;
+    in property <length> cursor-zmap-y;
+    out property <bool> pane-hovered: hit-area.has-hover
+        && ((pane-left.visible && hit-area.mouse-x >= pane-left.x
+                && hit-area.mouse-x <= pane-left.x + pane-left.width
+                && hit-area.mouse-y >= pane-left.y
+                && hit-area.mouse-y <= pane-left.y + pane-left.height)
+            || (pane-right.visible && hit-area.mouse-x >= pane-right.x
+                && hit-area.mouse-x <= pane-right.x + pane-right.width
+                && hit-area.mouse-y >= pane-right.y
+                && hit-area.mouse-y <= pane-right.y + pane-right.height));
+    callback pane-hover-changed();
     callback composite-undock-requested();
     callback zmap-undock-requested();
     // The one input dispatch point's gesture forwards. No other `.slint`
@@ -210,25 +120,20 @@ export component FFCanvas inherits Rectangle {
     out property <length> pane-left-y: pane-left.y;
     out property <length> pane-left-width: pane-left.width;
     out property <length> pane-left-height: pane-left.height;
+    out property <length> pane-right-y: pane-right.y;
+    out property <length> pane-right-width: pane-right.width;
+    out property <length> pane-right-height: pane-right.height;
 
     changed width => { root.canvas-resized(); }
     changed height => { root.canvas-resized(); }
+    changed pane-hovered => { root.pane-hover-changed(); }
 
     background: Theme.surface-base;
 
     // Whether the pointer sits over the right or left pane's own rect --
     // both brush cursors' visibility and the hidden system cursor gate on
     // hovering either, not just `has-hover` over the whole canvas.
-    property <bool> pointer-over-right-pane: hit-area.mouse-x >= pane-right.x
-        && hit-area.mouse-x <= pane-right.x + pane-right.width
-        && hit-area.mouse-y >= pane-right.y
-        && hit-area.mouse-y <= pane-right.y + pane-right.height;
-    property <bool> pointer-over-left-pane: hit-area.mouse-x >= pane-left.x
-        && hit-area.mouse-x <= pane-left.x + pane-left.width
-        && hit-area.mouse-y >= pane-left.y
-        && hit-area.mouse-y <= pane-left.y + pane-left.height;
-    property <bool> show-brush-cursor: root.editor-mode && hit-area.has-hover
-        && (root.pointer-over-left-pane || root.pointer-over-right-pane);
+    property <bool> show-brush-cursor: root.editor-mode && root.cursor-visible;
 
     // First child so it spans the whole canvas region while the
     // later-declared panes and their `FFUndockControl` `TouchArea`s keep
@@ -255,8 +160,11 @@ export component FFCanvas inherits Rectangle {
     pane-left := FFPane {
         x: ShellGeometry.pane-gutter;
         y: ShellGeometry.pane-gutter;
-        width: (parent.width - 3 * ShellGeometry.pane-gutter) / 2;
+        width: root.detached-pane == "zmap" ? parent.width - 2 * ShellGeometry.pane-gutter
+            : root.detached-pane == "composite" ? 0px
+            : (parent.width - 3 * ShellGeometry.pane-gutter) / 2;
         height: parent.height - 2 * ShellGeometry.pane-gutter;
+        visible: root.detached-pane != "composite";
         source: root.frame-source;
         label: root.frame-label;
         message-lines: root.frame-message-lines;
@@ -266,6 +174,10 @@ export component FFCanvas inherits Rectangle {
         image-y: root.frame-image-y;
         image-w: root.frame-image-w;
         image-h: root.frame-image-h;
+        crop-x: root.frame-crop-x;
+        crop-y: root.frame-crop-y;
+        crop-w: root.frame-crop-w;
+        crop-h: root.frame-crop-h;
         pixelated: root.pixelated;
         undock-requested => { root.composite-undock-requested(); }
     }
@@ -278,13 +190,19 @@ export component FFCanvas inherits Rectangle {
         width: ShellGeometry.pane-divider;
         height: parent.height - 2 * ShellGeometry.pane-gutter;
         background: Theme.border-default;
+        visible: root.detached-pane == "";
     }
 
     pane-right := FFPane {
-        x: parent.width - ShellGeometry.pane-gutter - pane-left.width;
+        x: root.detached-pane == "composite" ? ShellGeometry.pane-gutter
+            : root.detached-pane == "zmap" ? parent.width
+            : parent.width - ShellGeometry.pane-gutter - pane-left.width;
         y: ShellGeometry.pane-gutter;
-        width: pane-left.width;
+        width: root.detached-pane == "composite" ? parent.width - 2 * ShellGeometry.pane-gutter
+            : root.detached-pane == "zmap" ? 0px
+            : pane-left.width;
         height: pane-left.height;
+        visible: root.detached-pane != "zmap";
         source: root.composite-source;
         label: "Composite";
         message-lines: root.composite-message-lines;
@@ -294,6 +212,10 @@ export component FFCanvas inherits Rectangle {
         image-y: root.image-y;
         image-w: root.image-w;
         image-h: root.image-h;
+        crop-x: root.crop-x;
+        crop-y: root.crop-y;
+        crop-w: root.crop-w;
+        crop-h: root.crop-h;
         pixelated: root.pixelated;
         undock-requested => { root.zmap-undock-requested(); }
     }
@@ -301,7 +223,7 @@ export component FFCanvas inherits Rectangle {
     pane-placeholder := FFPanePlaceholder {
         x: pane-right.x + (pane-right.width - self.width) / 2;
         y: pane-right.y + (pane-right.height - self.height) / 2;
-        visible: root.project-loaded && !root.composite-ready;
+        visible: root.project-loaded && !root.composite-ready && root.detached-pane != "zmap";
     }
 
     brush-cursor-left-clip := Rectangle {
@@ -312,9 +234,8 @@ export component FFCanvas inherits Rectangle {
         clip: true;
 
         brush-cursor-left := FFBrushCursor {
-            x: hit-area.mouse-x - pane-left.x
-                - (root.pointer-over-right-pane ? root.cursor-mirror-dx : 0px) - self.width / 2;
-            y: hit-area.mouse-y - pane-left.y - self.height / 2;
+            x: root.cursor-composite-x - self.width / 2;
+            y: root.cursor-composite-y - self.height / 2;
             visible: root.show-brush-cursor;
             extent: root.cursor-extent;
             ring-commands: root.cursor-ring-commands;
@@ -332,9 +253,8 @@ export component FFCanvas inherits Rectangle {
         clip: true;
 
         brush-cursor-right := FFBrushCursor {
-            x: hit-area.mouse-x - pane-right.x
-                + (root.pointer-over-left-pane ? root.cursor-mirror-dx : 0px) - self.width / 2;
-            y: hit-area.mouse-y - pane-right.y - self.height / 2;
+            x: root.cursor-zmap-x - self.width / 2;
+            y: root.cursor-zmap-y - self.height / 2;
             visible: root.show-brush-cursor;
             extent: root.cursor-extent;
             ring-commands: root.cursor-ring-commands;
