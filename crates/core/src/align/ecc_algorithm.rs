@@ -91,7 +91,7 @@ const VALIDATION_TOLERANCE_PX: f64 = 1.0;
 /// The lowest final correlation a frame may end on and still count as
 /// registered. A solver-robustness floor for gross wrong optima, not a
 /// quality measure: a wrong fit on a 64-frame synthetic stack ended at 0.061
-/// while the lowest correct synthetic frame reached 0.354 and real frames
+/// while the lowest correct synthetic frame reached 0.355 and real frames
 /// 0.7 and above.
 const MIN_FINAL_CORRELATION: f64 = 0.2;
 
