@@ -357,11 +357,92 @@ fn settle_all(controller: &mut AppController) {
 
 /// [`open_mantis64_tab`], then fuses it into one held checkpoint.
 fn open_fused_tab(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
+    open_fused_tab_on(controller, name, count, None)
+}
+
+/// [`open_fused_tab`] on fuse method `method` instead of the default.
+fn open_fused_tab_on(
+    controller: &mut AppController,
+    name: &str,
+    count: usize,
+    method: Option<&str>,
+) -> PathBuf {
     let root = open_mantis64_tab(controller, name, count);
+    if let Some(method) = method {
+        controller.set_fuse_algorithm(method);
+    }
+    // `Sealed`'s reference reads the raw frames, so the run applies no gains.
+    controller.set_param_value(
+        "prepare",
+        "equalize",
+        focusforge_core::params::ParamValue::Bool(false),
+    );
     assert!(controller.start_fuse());
     settle_all(controller);
     assert_eq!(controller.checkpoint_count(), Some(1), "{name} must fuse");
     root
+}
+
+#[test]
+fn alignment_off_and_crop_off_survive_save_and_reopen() {
+    let mut controller = controller_with_scratch("align_crop_off");
+    open_mantis64_tab(&mut controller, "align_crop_off", 3);
+    controller.set_param_value(
+        "align-switch",
+        "align",
+        focusforge_core::params::ParamValue::Bool(false),
+    );
+    controller.set_param_value(
+        "finish",
+        "auto-crop",
+        focusforge_core::params::ParamValue::Bool(false),
+    );
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    let path = save_to_proposed(&mut controller);
+
+    let head = |path: &Path| {
+        focusforge_core::project::Project::open(path)
+            .expect("the saved project opens")
+            .manifest()
+            .clone()
+    };
+    let manifest = head(&path);
+    assert!(manifest.align.is_none(), "no alignment ran");
+    assert!(manifest.registration.crop.is_none(), "no crop applied");
+    assert_eq!(manifest.composite.width, 64, "the full frame extent");
+
+    let mut reopened = controller_with_scratch("align_crop_off_reopened");
+    assert!(matches!(
+        common::open_and_settle(&mut reopened, std::slice::from_ref(&path)),
+        OpenOutcome::Opened(_)
+    ));
+    let switches = |controller: &AppController| -> (String, String) {
+        let rows = controller.settings_panel().rows;
+        let selected = |section: &str, id: &str| {
+            rows.iter()
+                .find(|row| row.id == id && row.section == section)
+                .unwrap_or_else(|| panic!("no {id} row"))
+                .selected
+                .clone()
+        };
+        (
+            selected("align-switch", "align"),
+            selected("finish", "auto-crop"),
+        )
+    };
+    assert_eq!(
+        switches(&reopened),
+        ("false".to_string(), "false".to_string())
+    );
+
+    assert!(reopened.start_fuse(), "the reopened project fuses again");
+    settle_all(&mut reopened);
+    assert_eq!(reopened.checkpoint_count(), Some(2));
+    reopened.save_active_project(|_| panic!("a saved tab never asks where"));
+    let manifest = head(&path);
+    assert!(manifest.align.is_none() && manifest.registration.crop.is_none());
+    assert_eq!(manifest.composite.width, 64);
 }
 
 /// Saves the active, never-saved tab to the path the save dialog proposes.
@@ -2881,8 +2962,46 @@ fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
         "a default fuse completes rather than failing"
     );
     assert_eq!(controller.checkpoint_count(), Some(0));
-    let names = ["00.tif", "01.tif", "07.tif"].map(String::from);
+    let names = ["00.tif", "01.tif", "06.tif", "07.tif"].map(String::from);
     assert_eq!(controller.pending_divergence(), Some(&names[..]));
+
+    controller.keep_fused().expect("a parked run keeps");
+    let job::RunState::Fused { at, unaligned } = controller.job_view().state else {
+        panic!("a kept run settles to Fused");
+    };
+    assert_eq!(unaligned, 4);
+    assert_eq!(
+        job::stage_word(&controller.job_view().state, None),
+        format!("fused {at}"),
+        "the bar names the run, the notice names the count"
+    );
+    assert_eq!(
+        controller.unaligned_notice().as_deref(),
+        Some("4 frames unaligned")
+    );
+    let summary = controller.last_alignment().expect("a completed run");
+    assert_eq!(
+        (summary.source.as_str(), summary.backend.as_str()),
+        ("computed", "cpu")
+    );
+    assert_eq!(summary.unaligned, 4);
+    assert_eq!(summary.rerun, None);
+}
+
+#[test]
+fn a_clean_run_raises_no_unaligned_notice() {
+    let mut controller = controller_with_scratch("clean_run_no_notice");
+    open_mantis64_tab(&mut controller, "clean_run_no_notice", 3);
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    assert_eq!(controller.unaligned_notice(), None);
+    assert_eq!(
+        controller
+            .last_alignment()
+            .expect("a completed run")
+            .unaligned,
+        0
+    );
 }
 
 #[test]
@@ -3159,8 +3278,13 @@ fn at_pane(pane: PaneRect, x: f32, y: f32) -> (f32, f32) {
 /// A fused three-frame mantis-64 tab in editor mode, both panes installed,
 /// its resident display tiles 16 px so strokes cross tile edges.
 fn open_editor(name: &str) -> (AppController, PathBuf) {
+    open_editor_on(name, None)
+}
+
+/// [`open_editor`] over a run of fuse method `method` instead of the default.
+fn open_editor_on(name: &str, method: Option<&str>) -> (AppController, PathBuf) {
     let mut controller = controller_with_scratch(name);
-    let root = open_fused_tab(&mut controller, name, 3);
+    let root = open_fused_tab_on(&mut controller, name, 3, method);
     controller.set_resident_tile_size_for_test(16);
     controller.set_pane_geometry(LEFT, RIGHT);
     assert!(controller.set_mode(ShellMode::Editor));
@@ -3633,7 +3757,7 @@ fn plain_wheel_over_the_images_list_steps_the_source_frame_in_both_modes() {
     editor.images_list_wheel(60.0);
     assert_eq!(
         editor.frame_pane_label(),
-        "01.tif \u{b7} source 2 of 3",
+        "01.tif",
         "the same wheel steps the source in editor mode too, with no Ctrl needed"
     );
 }
@@ -4707,7 +4831,9 @@ fn live_stroke_previews_each_new_segment() {
 /// [`FrameSource`]: focusforge_gui::canvas::FrameSource
 #[test]
 fn stroke_matches_left_pane() {
-    let (mut c, root) = open_editor("stroke_matches_left_pane");
+    // The Z-Map names the source of every pixel only for a method that
+    // selects pixels; a pyramid blend mixes neighbours at coarse levels.
+    let (mut c, root) = open_editor_on("stroke_matches_left_pane", Some("depth-map"));
     c.select_frame(2);
     set_size(&mut c, 8.0);
     drag(&mut c, &[(20.0, 20.0)]);
@@ -4745,6 +4871,276 @@ fn stroke_matches_left_pane() {
         recomposited, left_pixel,
         "the recomposited pixel must equal the left pane's own read at the same point"
     );
+}
+
+/// Fuses `count` mantis-64 frames on `depth-map` with equalization on, then
+/// opens the editor over the run.
+fn open_equalized_editor(name: &str, count: usize) -> AppController {
+    use focusforge_core::params::ParamValue;
+
+    let mut controller = controller_with_scratch(name);
+    open_mantis64_tab(&mut controller, name, count);
+    controller.set_fuse_algorithm("depth-map");
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    assert_eq!(controller.checkpoint_count(), Some(1), "{name} must fuse");
+    controller.set_resident_tile_size_for_test(16);
+    controller.set_pane_geometry(LEFT, RIGHT);
+    assert!(controller.set_mode(ShellMode::Editor));
+    controller
+}
+
+/// The prepare section lists the equalization switch (on) and its bound; a
+/// default run is equalized, switching it off records an unequalized run, and
+/// the bound the panel holds reaches the run.
+#[test]
+fn equalize_rows_reach_the_run() {
+    use focusforge_core::params::ParamValue;
+
+    let mut controller = common::controller_with_frames("equalize_rows", 3);
+    // The default aligner parks these frames on a diverged one; a run that
+    // always converges keeps the held checkpoint this test reads.
+    controller.set_align_algorithm("dummy-align");
+    controller.toggle_section_more("prepare");
+    let rows: Vec<_> = controller
+        .settings_panel()
+        .rows
+        .into_iter()
+        .filter(|r| r.section == "prepare")
+        .collect();
+    let row = |id: &str| {
+        rows.iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("no {id} row"))
+    };
+    assert_eq!(row("equalize").selected, "true", "on by default");
+    assert_eq!(row("equalize-max-gain").value_text, "1.25");
+
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
+    let default_run = controller.held_checkpoints().last().cloned().unwrap();
+    assert_eq!(
+        default_run.registration.equalization.map(|e| e.max_gain),
+        Some(1.25),
+        "a default run is equalized with the default bound"
+    );
+
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(false));
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
+    let off = controller.held_checkpoints().last().cloned().unwrap();
+    assert_eq!(
+        off.registration.equalization, None,
+        "switched off, the run is not equalized"
+    );
+
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
+    controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.5));
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
+    let on = controller.held_checkpoints().last().cloned().unwrap();
+    let recorded = on.registration.equalization.expect("the run was equalized");
+    assert_eq!(recorded.max_gain, 1.5);
+    assert_eq!(recorded.gains.len(), 3, "one gain per frame");
+}
+
+/// A frame the equalization bound clamps is reported on the window's info
+/// toast, naming the frame, the bound and the bound that would cover it; a
+/// bound wide enough for the stack raises nothing.
+#[test]
+fn settings_journey_equalization_reports_a_clamped_frame() {
+    use focusforge_core::equalize::UNIT_GAIN;
+    use focusforge_core::params::ParamValue;
+
+    let mut controller = common::controller_with_frames("equalize_clamped_notice", 8);
+    // The default aligner parks eight mantis frames on a diverged one; a run
+    // that always converges keeps the held checkpoint this test reads.
+    controller.set_align_algorithm("dummy-align");
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
+    assert_eq!(
+        controller.held_checkpoints().len(),
+        1,
+        "the default run holds"
+    );
+    assert_eq!(
+        controller.notice(),
+        None,
+        "the default bound 1.25 covers the stack"
+    );
+
+    controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.01));
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
+    assert_eq!(
+        controller.held_checkpoints().len(),
+        2,
+        "the tight run holds"
+    );
+    let notice = controller.notice().expect("a clamped frame is reported");
+    assert!(notice.contains("frame "), "{notice}");
+    assert!(notice.contains("1.01"), "{notice}");
+    assert!(notice.contains("would cover it"), "{notice}");
+    assert!(
+        notice.contains(" (and ") && notice.ends_with(" more)"),
+        "several clamped frames collapse to the first plus a count: {notice}"
+    );
+
+    let named: usize = notice
+        .strip_prefix("frame ")
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|index| index.parse().ok())
+        .unwrap_or_else(|| panic!("the notice starts with its frame: {notice}"));
+    let recorded = controller
+        .held_checkpoints()
+        .last()
+        .and_then(|held| held.registration.equalization.clone())
+        .expect("the tight run was equalized");
+    let gain = f64::from(recorded.gains[named]) / f64::from(UNIT_GAIN);
+    assert!(
+        (gain - 1.01).abs() < 1e-3 || (gain - 1.0 / 1.01).abs() < 1e-3,
+        "frame {named} sits at the bound, got {gain}"
+    );
+
+    controller.dismiss_notice();
+    assert_eq!(controller.notice(), None);
+}
+
+/// Three fuses on one tab, one per method: each held checkpoint carries its
+/// own method, its own advanced value and the equalization bound, and no
+/// method's value leaks into another's run.
+#[test]
+fn settings_journey_fuses_each_method_with_its_settings() {
+    use focusforge_core::params::ParamValue;
+
+    let mut controller = common::controller_with_frames("journey_each_method", 3);
+    controller.set_align_algorithm("dummy-align");
+    controller.toggle_section_more("fuse");
+    controller.toggle_section_more("prepare");
+    let methods = [
+        ("laplacian", "levels", ParamValue::Int(4)),
+        ("weighted-average", "radius", ParamValue::Int(6)),
+        ("depth-map", "score-radius", ParamValue::Int(5)),
+    ];
+
+    for (index, (id, field, value)) in methods.iter().enumerate() {
+        controller.set_fuse_algorithm(id);
+        controller.set_param_value("fuse", field, value.clone());
+        if *id != "depth-map" {
+            controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
+        }
+        controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.01));
+        assert!(controller.start_fuse(), "{id} starts");
+        common::wait_for_settle(&mut controller, SETTLE);
+        let held = controller.held_checkpoints();
+        assert_eq!(held.len(), index + 1, "{id} holds one more checkpoint");
+        let run = held.last().unwrap();
+        assert_eq!(run.algorithm, *id);
+        assert_eq!(run.params.get(*field), Some(value), "{id}: {field}");
+        for (other, other_field, _) in &methods {
+            if other != id {
+                assert_eq!(
+                    run.params.get(*other_field),
+                    None,
+                    "{id} has no {other_field}"
+                );
+            }
+        }
+        let recorded = run
+            .registration
+            .equalization
+            .as_ref()
+            .unwrap_or_else(|| panic!("{id} was equalized"));
+        assert_eq!(recorded.max_gain, 1.01, "{id}");
+    }
+}
+
+/// A `depth-map` run equalizes without the switch being touched; turning the
+/// switch off records an unequalized run.
+#[test]
+fn focus_map_run_equalizes_by_default_and_an_explicit_off_wins() {
+    use focusforge_core::params::ParamValue;
+
+    let mut controller = common::controller_with_frames("focus_map_equalize_default", 3);
+    // The default aligner parks these frames on a diverged one; a run that
+    // always converges keeps the held checkpoint this test reads.
+    controller.set_align_algorithm("dummy-align");
+    controller.set_fuse_algorithm("depth-map");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
+    let on = controller.held_checkpoints().last().cloned().unwrap();
+    assert!(
+        on.registration.equalization.is_some(),
+        "equalized by default"
+    );
+
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(false));
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
+    let off = controller.held_checkpoints().last().cloned().unwrap();
+    assert_eq!(off.registration.equalization, None, "an explicit off wins");
+}
+
+/// On an equalized `depth-map` tab a stroke's recomposited pixel is the left
+/// pane's read of that frame, and that read carries the frame's gain.
+#[test]
+fn equalized_stroke_matches_left_pane() {
+    use focusforge_core::equalize::UNIT_GAIN;
+    use focusforge_gui::canvas::{FrameSource, FrameView};
+
+    let mut c = open_equalized_editor("equalized_stroke", 3);
+    let held = c.held_checkpoints().last().cloned().unwrap();
+    let gains = held.registration.equalization.expect("equalized run").gains;
+    assert_ne!(gains[2], UNIT_GAIN, "frame 2 has a gain to apply");
+
+    // A point the fuse took from another frame, so the stroke has to
+    // recomposite it rather than keep the sealed pixel.
+    let root = held.sources[0].parent().unwrap().to_path_buf();
+    let sealed = Sealed::read(&mut c, &root);
+    let width = sealed.map.width as usize;
+    let at_index = sealed
+        .indices
+        .iter()
+        .position(|&i| i != 2)
+        .expect("the fuse took some pixel from another frame");
+    let (px, py) = (at_index % width, at_index / width);
+    c.select_frame(2);
+    set_size(&mut c, 8.0);
+    drag(&mut c, &[(px as f32, py as f32)]);
+    let recomposited = sealed.displayed(&c)[at_index * 3..at_index * 3 + 3].to_vec();
+
+    let view = c
+        .selected_frame_view()
+        .expect("a fused tab's frame has a view");
+    let read = |view: FrameView| {
+        let mut source = FrameSource::default();
+        source
+            .set(
+                &c.selected_frame_path().unwrap(),
+                Some(view),
+                job::host_budget(),
+            )
+            .expect("the selected frame opens");
+        let mut pixel = vec![0u16; 3];
+        let rect = Rect {
+            x: px as u32,
+            y: py as u32,
+            width: 1,
+            height: 1,
+        };
+        source
+            .read_into(rect, NonZeroU32::MIN, &mut pixel)
+            .expect("the point reads");
+        pixel
+    };
+    assert_eq!(recomposited, read(view), "stroke and left pane agree");
+    let ungained = read(FrameView {
+        gain: UNIT_GAIN,
+        ..view
+    });
+    assert_ne!(recomposited, ungained, "the pixel carries the frame's gain");
 }
 
 // ---------------------------------------------------------------------
@@ -5584,5 +5980,73 @@ fn an_older_checkpoint_edits_through_its_own_registration() {
     assert!(
         wrong.displayed(&controller) != wrong.expected(&indices(&controller)),
         "the check can tell the two registrations apart"
+    );
+}
+
+/// The fuse row `id`'s shown value on the active tab.
+fn active_fuse_value(controller: &AppController, id: &str) -> String {
+    controller
+        .settings_panel()
+        .rows
+        .into_iter()
+        .find(|r| r.section == "fuse" && r.id == id)
+        .unwrap_or_else(|| panic!("no fuse row {id}"))
+        .value_text
+}
+
+/// The finish section's `auto-crop` toggle on the active tab.
+fn active_crop_selected(controller: &AppController) -> String {
+    controller
+        .settings_panel()
+        .rows
+        .into_iter()
+        .find(|r| r.section == "finish" && r.id == "auto-crop")
+        .expect("the finish section has an auto-crop row")
+        .selected
+}
+
+#[test]
+fn duplicated_tab_keeps_crop_and_remembered_values() {
+    use focusforge_core::params::ParamValue;
+
+    let mut controller = common::controller_with_frames("duplicate_keeps_remembered", 2);
+    controller.set_fuse_algorithm("weighted-average");
+    controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(4.0));
+    controller.set_fuse_algorithm("depth-map");
+    controller.set_param_value("fuse", "score-radius", ParamValue::Int(7));
+    controller.set_param_value("finish", "auto-crop", ParamValue::Bool(false));
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, std::time::Duration::from_secs(120));
+
+    assert_eq!(controller.checkpoint_count(), Some(1), "the run completed");
+    assert!(controller.set_mode(ShellMode::Stacking));
+    controller.remove_frame(0);
+    assert!(controller.pending_frame_change().is_some());
+    assert!(controller.new_project_instead());
+    assert_eq!(controller.project_tabs().len(), 2);
+
+    assert_eq!(
+        active_crop_selected(&controller),
+        "false",
+        "the copy keeps the crop choice"
+    );
+    controller.toggle_section_more("fuse");
+    assert_eq!(active_fuse_value(&controller, "score-radius"), "7");
+    controller.set_fuse_algorithm("weighted-average");
+    assert_eq!(
+        active_fuse_value(&controller, "weight-exponent"),
+        "4",
+        "the copy carries the values remembered for other methods"
+    );
+    controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(6.0));
+
+    controller.select_project(0);
+    controller.toggle_section_more("fuse");
+    assert_eq!(active_fuse_value(&controller, "score-radius"), "7");
+    controller.set_fuse_algorithm("weighted-average");
+    assert_eq!(
+        active_fuse_value(&controller, "weight-exponent"),
+        "4",
+        "editing the copy leaves the original's remembered values alone"
     );
 }

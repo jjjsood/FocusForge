@@ -145,6 +145,7 @@ fn leave_a_cancelled_run_ledger(cwd: &Path) -> PathBuf {
         backend: "cpu".to_string(),
         align: None,
         crop: None,
+        equalization: None,
         composite_output: PathBuf::from("leftover.ffp"),
         zmap_output: None,
     };
@@ -268,6 +269,61 @@ fn fusion_parameter_change_reuses_alignment() {
         "a cache-reused alignment must fuse to the same composite a cold recompute of the same \
          parameters produces"
     );
+}
+
+/// Every input to the alignment misses the cache when it changes: an
+/// alignment parameter, the failure policy and the frame set; the unchanged
+/// rerun hits. Runs over a temp copy of `fixtures/mantis-512`'s frames.
+#[test]
+fn an_alignment_input_change_misses_the_cache() {
+    let cwd = tmp_dir("cache_cli_alignment_input_miss");
+    let frames = cwd.join("frames");
+    std::fs::create_dir_all(&frames).unwrap();
+    let mut sources: Vec<PathBuf> = std::fs::read_dir(mantis_512_dir().join("frames"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    sources.sort();
+    for source in &sources {
+        std::fs::copy(source, frames.join(source.file_name().unwrap())).unwrap();
+    }
+
+    let cached = |label: &str, input: &Path, extra: &[&str]| -> bool {
+        let out = cwd.join(format!("out_{label}"));
+        std::fs::create_dir_all(&out).unwrap();
+        let mut args = vec![
+            "stack",
+            input.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--algo",
+            "laplacian",
+            "--align-algo",
+            "dummy-align",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let run = run_cli_in(&cwd, &common::push_no_gpu(args));
+        assert!(run.success, "{label} stderr: {}", run.stderr);
+        let report: serde_json::Value = serde_json::from_str(&run.stdout).expect("--json");
+        report["align_cached"]
+            .as_bool()
+            .expect("align_cached is a bool")
+    };
+
+    assert!(!cached("first", &frames, &[]), "the first run computes");
+    assert!(cached("again", &frames, &[]), "the unchanged rerun hits");
+    assert!(
+        !cached("param", &frames, &["--align-set", "max-shift=8"]),
+        "an alignment parameter change misses"
+    );
+    assert!(
+        !cached("lax", &frames, &["--lax"]),
+        "a failure policy change misses"
+    );
+    std::fs::remove_file(frames.join(sources.last().unwrap().file_name().unwrap())).unwrap();
+    assert!(!cached("fewer", &frames, &[]), "a changed frame set misses");
 }
 
 /// A stage-cache hit still *enters* the align stage (a fingerprint lookup

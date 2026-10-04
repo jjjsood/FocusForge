@@ -3,7 +3,7 @@
 //! Drives the real 61-frame reference stack through `pyramidal-ecc`'s
 //! shipped defaults under strict alignment.
 //!
-//! Both `#[ignore]`d tests read `FOCUSFORGE_REFERENCE_STACK` through
+//! The `#[ignore]`d tests read `FOCUSFORGE_REFERENCE_STACK` through
 //! [`common::reference_stack_dir`] and skip with a neutral message when it
 //! is unset or does not name a directory.
 
@@ -13,17 +13,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use focusforge_core::algorithm::{AlignContext, AlignStatus};
+use focusforge_core::algorithm::{AlignAlgorithm, AlignContext, AlignStatus};
 use focusforge_core::align::{
-    AlignDriverOptions, AlignRun, EccLevelRecord, FailurePolicy, PyramidalEcc, align_stack_with,
+    AlignDriverOptions, AlignPyramid, AlignRun, EccLevelRecord, FailurePolicy, Features,
+    PyramidalEcc, Transform, align_stack_with, detector_threshold, fit_between,
 };
 use focusforge_core::io::{TiffStack, frame_paths};
 use focusforge_core::params::{self, ParamValues, StackContext};
 use focusforge_core::registry;
+use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 
-/// Serializes this file's two ignored tests: both would otherwise hold the
-/// 16 GB stack's pixels live at once, which the machine this runs on cannot
-/// afford twice over.
+/// Serializes this file's ignored tests so only one reads the 16 GB stack at a
+/// time: run in parallel they would compete for the same disk and for the
+/// per-frame pyramids and templates each holds in memory, and distort each
+/// other's timings.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// `stack_dir`'s frames, `IMG_`-filtered so the checked-in stacked result
@@ -157,6 +160,7 @@ fn the_reference_stack_reports_a_per_frame_alignment_outcome() {
 
     let mut converged = 0usize;
     let mut hit_cap = 0usize;
+    let mut stalled = 0usize;
     let mut diverged = 0usize;
     for (i, frame) in alignment.frames.iter().enumerate() {
         assert_eq!(frame.frame, i, "frames must be recorded in frame order");
@@ -176,6 +180,13 @@ fn the_reference_stack_reports_a_per_frame_alignment_outcome() {
                     frame.iterations, frame.residual
                 );
             }
+            AlignStatus::Stalled => {
+                stalled += 1;
+                println!(
+                    "frame={i} name={name} status=stalled iterations={} residual={:.6}",
+                    frame.iterations, frame.residual
+                );
+            }
             AlignStatus::Diverged(reason) => {
                 diverged += 1;
                 println!(
@@ -189,11 +200,12 @@ fn the_reference_stack_reports_a_per_frame_alignment_outcome() {
     }
     println!(
         "the_reference_stack_reports_a_per_frame_alignment_outcome: wall={elapsed:?} \
-         converged={converged} hit_cap={hit_cap} diverged={diverged} reference={}",
+         converged={converged} hit_cap={hit_cap} stalled={stalled} diverged={diverged} \
+         reference={}",
         alignment.reference
     );
     assert_eq!(
-        converged + hit_cap + diverged,
+        converged + hit_cap + stalled + diverged,
         61,
         "every frame must be accounted for"
     );
@@ -243,6 +255,99 @@ fn the_reference_stack_records_each_divergence_level() {
                 rec.result.iterations,
                 rec.result.final_step,
                 rec.result.correlation
+            );
+        }
+    }
+}
+
+/// Seeds the reference with frames 0, 15, 45 and 60 on pyramid levels 3 to 5
+/// and prints what the feature seed sees there: keypoints, matches, inliers,
+/// occupied cells, how far the seed's corners land from the shipped
+/// registration, and the detector and match-plus-fit times.
+#[test]
+#[ignore = "reads the 16 GB reference stack"]
+fn the_reference_stack_seeds_on_coarse_levels() {
+    let _guard = SERIAL.lock().unwrap();
+    let Some(stack_dir) = common::reference_stack_dir() else {
+        return;
+    };
+    let paths = reference_frame_paths(&stack_dir);
+    let stack = TiffStack::open_files(&paths).expect("reference stack must open");
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let stack_ctx = StackContext::new(stack.len(), width, height, spp);
+    let cfg = resolved_defaults(&stack_ctx);
+    let reference = (stack.len() - 1) / 2;
+    let ctx = AlignContext::new(stack_ctx, reference, &stack);
+
+    let pyramid = |frame: usize| {
+        AlignPyramid::stream(
+            (width, height, spp),
+            5,
+            DEFAULT_TILE_SIZE / 2,
+            |rect, out| ctx.read_tile_into(frame, rect, out),
+        )
+        .unwrap_or_else(|_| panic!("streaming frame {frame}"))
+    };
+    let reference_pyramid = pyramid(reference);
+    let corners = |t: &Transform, w: f64, h: f64| {
+        [[0.0, 0.0], [w, 0.0], [0.0, h], [w, h]].map(|p| {
+            [
+                t.m[0][0] * p[0] + t.m[0][1] * p[1] + t.m[0][2],
+                t.m[1][0] * p[0] + t.m[1][1] * p[1] + t.m[1][2],
+            ]
+        })
+    };
+
+    for frame in [0usize, 15, 45, 60] {
+        let shipped = PyramidalEcc
+            .align_frame(&ctx, frame, &cfg)
+            .expect("the shipped registration of the frame");
+        let frame_pyramid = pyramid(frame);
+        for (level, threshold) in [3usize, 4, 5]
+            .into_iter()
+            .flat_map(|l| [1e-3, 3e-4, 1e-4, 3e-5].map(|t| (l, t)))
+        {
+            let (r, f) = (reference_pyramid.level(level), frame_pyramid.level(level));
+            let t = Instant::now();
+            let reference_features = Features::detect_at(r, threshold).expect("reference features");
+            let frame_features = Features::detect_at(f, threshold).expect("frame features");
+            let detect_ms = t.elapsed().as_secs_f64() * 1e3;
+            let dims = (r.width(), r.height());
+            let t = Instant::now();
+            let fit = fit_between(&reference_features, &frame_features, dims);
+            let fit_ms = t.elapsed().as_secs_f64() * 1e3;
+            let (matches, inliers, cells, accepted, change) =
+                fit.map_or((0, 0, 0, false, f64::NAN), |fit| {
+                    // Level-`level` pixels back to level 0, then against the
+                    // shipped transform at the full frame's corners.
+                    let up = Transform::similarity(2.0, 0.0, 0.0, 0.0);
+                    let down = Transform::similarity(0.5, 0.0, 0.0, 0.0);
+                    let at_level0 =
+                        (0..level).fold(fit.transform, |t, _| up.compose(&t).compose(&down));
+                    let (w, h) = (f64::from(width), f64::from(height));
+                    let change = corners(&at_level0, w, h)
+                        .iter()
+                        .zip(corners(&shipped.transform, w, h))
+                        .map(|(a, b)| (a[0] - b[0]).hypot(a[1] - b[1]))
+                        .fold(0.0, f64::max);
+                    (
+                        fit.matches,
+                        fit.inliers,
+                        fit.occupied_cells,
+                        fit.accepted(),
+                        change,
+                    )
+                });
+            println!(
+                "seed frame={frame} level={level} threshold={threshold:e} default={:?} size={}x{} keypoints={}/{} matches={matches} \
+                 inliers={inliers} cells={cells} accepted={accepted} \
+                 corner_change_px={change:.2} detect_ms={detect_ms:.0} match_fit_ms={fit_ms:.0}",
+                detector_threshold(r),
+                dims.0,
+                dims.1,
+                reference_features.len(),
+                frame_features.len(),
             );
         }
     }

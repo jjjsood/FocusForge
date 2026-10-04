@@ -64,6 +64,23 @@ pub trait TileBackend: Send + Sync {
         u32::MAX
     }
 
+    /// Why one `width` x `height` tile at `samples_per_pixel`, pyramid depth
+    /// `levels` and `transforms` (the shape [`Self::warp_fuse_tile`] takes)
+    /// cannot run on this backend's device, as a message naming the host
+    /// path the run continues on; `None` when it fits. A caller that gets
+    /// `Some` fuses on the host instead of calling this backend. Defaults to
+    /// `None`, for a backend with no budget of its own.
+    fn tile_budget_shortfall(
+        &self,
+        _width: u32,
+        _height: u32,
+        _samples_per_pixel: u32,
+        _levels: u32,
+        _transforms: &[Transform],
+    ) -> Option<String> {
+        None
+    }
+
     /// Read `rect` of `frame` through `reader`, apply a trivial per-sample
     /// gain on the GPU, and return the result. Exists only to exercise the
     /// upload/dispatch/readback path -- this trait's other methods,
@@ -140,6 +157,56 @@ pub trait TileBackend: Send + Sync {
         samples_per_pixel: u32,
         levels: u32,
     ) -> Result<TileOutput, AlgorithmError>;
+}
+
+/// Length of the moment vector an [`EccMomentSession`] returns.
+pub const ECC_MOMENTS: usize = 18;
+
+/// One ECC level's prepared reference and moving plane, as a backend sees
+/// them when it opens a session.
+pub struct EccSessionRequest<'a> {
+    /// Unique per prepared template for the life of the process.
+    pub template_id: u64,
+    /// The template region, in full-frame coordinates.
+    pub region: Rect,
+    /// Jacobian columns: 2 for translation, 4 for similarity.
+    pub columns: usize,
+    /// Template values over `region`, row-major.
+    pub template: &'a [f32],
+    /// `columns` column-centred Jacobian values per `region` pixel, row-major.
+    pub jacobian: &'a [f64],
+    /// Subtracted from every template and moving value before summing.
+    pub shift: f64,
+    /// A window of the moving frame, row-major.
+    pub moving: &'a [f32],
+    pub moving_dims: (u32, u32),
+    /// Full-frame coordinates of the window's top-left pixel.
+    pub moving_origin: (u32, u32),
+}
+
+/// A backend's per-level source of ECC moments.
+pub trait EccMomentSession: Send {
+    /// Samples the moving plane at `warp(x)` for every `x` in the region
+    /// (bicubic Catmull-Rom; a sample whose 4x4 taps leave the window is
+    /// invalid) and sums over the valid samples `s`, template values `t` and
+    /// Jacobian columns `g_k`, all minus the request's `shift`:
+    /// `[n, Σs, Σs², Σt·s, Σg_k·s (4), Σt, Σt², Σg_k·t (4), Σg_k (4)]`.
+    /// Entries for columns at and past the request's `columns` are zero. The
+    /// template-side moments (indices 8..18) are summed only under partial
+    /// overlap and are zero under full overlap, where the solver reads its
+    /// own statistics.
+    fn moments(&mut self, warp: &Transform) -> Result<[f64; ECC_MOMENTS], AlgorithmError>;
+}
+
+/// An optional accelerator for the ECC alignment solver. Object-safe and
+/// `Send + Sync` for the same reason as [`TileBackend`].
+pub trait AlignBackend: Send + Sync {
+    /// Opens a session for one level, or `Ok(None)` to decline it, in which
+    /// case the level runs on the CPU. An error fails the whole alignment.
+    fn open_ecc(
+        &self,
+        request: &EccSessionRequest<'_>,
+    ) -> Result<Option<Box<dyn EccMomentSession>>, AlgorithmError>;
 }
 
 /// The rayon CPU twin of the self-check kernel every [`TileBackend`]
@@ -300,6 +367,43 @@ mod tests {
     fn tile_backend_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync + 'static>() {}
         assert_send_sync::<Box<dyn TileBackend>>();
+    }
+
+    struct DecliningAlign;
+
+    impl AlignBackend for DecliningAlign {
+        fn open_ecc(
+            &self,
+            _request: &EccSessionRequest<'_>,
+        ) -> Result<Option<Box<dyn EccMomentSession>>, AlgorithmError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn align_traits_are_object_safe_send_and_sync() {
+        fn assert_send<T: Send + 'static>() {}
+        fn assert_send_sync<T: Send + Sync + 'static>() {}
+        assert_send_sync::<Box<dyn AlignBackend>>();
+        assert_send::<Box<dyn EccMomentSession>>();
+        let backend: Box<dyn AlignBackend> = Box::new(DecliningAlign);
+        let request = EccSessionRequest {
+            template_id: 0,
+            region: Rect {
+                x: 1,
+                y: 1,
+                width: 1,
+                height: 1,
+            },
+            columns: 2,
+            template: &[],
+            jacobian: &[],
+            shift: 0.0,
+            moving: &[],
+            moving_dims: (0, 0),
+            moving_origin: (0, 0),
+        };
+        assert!(backend.open_ecc(&request).unwrap().is_none());
     }
 
     /// A test-only, in-memory [`TileReader`] over one flat sample buffer per

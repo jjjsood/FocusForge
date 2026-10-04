@@ -120,6 +120,8 @@ fn shared_laplacian_run() -> &'static SharedRun {
             "--json".to_string(),
             "--no-align".to_string(),
             "--no-crop".to_string(),
+            "--set".to_string(),
+            "equalize=false".to_string(),
         ];
         // Verifies CLI plumbing reproduces `library_oracle`'s in-process,
         // CPU-only call exactly, not GPU-vs-CPU numerics (that's the
@@ -189,7 +191,7 @@ fn library_oracle() -> &'static OracleResult {
         let resolved = params::resolve(algo.params(), &ParamValues::new(), &stack_ctx)
             .expect("resolve must succeed");
         let values = params::resolved_values(&resolved);
-        let levels = algo.tile_levels(&values);
+        let support = algo.tile_support(&values);
 
         // This function spawns nothing, so `dir` need not outlive the
         // closure: both TIFFs below are read into `Vec<u16>` before it
@@ -199,8 +201,8 @@ fn library_oracle() -> &'static OracleResult {
         let composite_path = dir.join("oracle.tif");
         let zmap_path = dir.join("oracle-zmap.tif");
         let mut options = TileSchedulerOptions::explicit_budget(dir.join("scratch"), 1 << 30);
+        options.apply_support(support);
         options.tile_size = 512;
-        options.levels = levels;
         let scheduler =
             TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
         let consumer = FusionConsumer::create(
@@ -390,8 +392,8 @@ fn out_of_range_parameter_is_rejected() {
     assert!(!out.stderr.contains(missing_dir), "stderr: {}", out.stderr);
 }
 
-/// `levels=7` is in schema range (`[1, 16]`) but deeper than the shipped
-/// 512 px tile can plan (margin sized for 5): `laplacian::fuse` and the
+/// `levels=7` is in schema range (`[1, 16]`) but deeper than a 512 px tile
+/// can plan (margin sized for 5): `laplacian::fuse` and the
 /// scheduler's margin must agree, so this must reach
 /// `TileError::NoInterior`, naming the tile size that would work, before
 /// any tile is read.
@@ -413,6 +415,8 @@ fn refuses_levels_the_tile_geometry_cannot_plan() {
             "laplacian",
             "--set",
             "levels=7",
+            "--tile-size",
+            "512",
             "--no-align",
             "--no-crop",
             "--no-gpu",
@@ -617,6 +621,31 @@ fn algo_is_required() {
 }
 
 #[test]
+fn working_space_names_the_encoding_of_a_tiff_stack() {
+    let cwd = tmp_dir("working_space");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mantis_64 = common::fixtures_dir().join("mantis-64");
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_64.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--json",
+            "--no-align",
+            "--no-crop",
+        ],
+    );
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    assert_eq!(report["working_space"], "encoded-unknown-transfer");
+}
+
+#[test]
 fn report_json_has_every_field() {
     let cwd = tmp_dir("report_json_has_every_field");
     let out_dir = cwd.join("out");
@@ -644,6 +673,7 @@ fn report_json_has_every_field() {
         "width",
         "height",
         "samples_per_pixel",
+        "working_space",
         "algorithm",
         "display_name",
         "params",
@@ -665,16 +695,15 @@ fn report_json_has_every_field() {
         "peak_align_workers",
         "align_accounted_bytes",
         "device_peak_in_flight",
+        "gpu_fallback",
     ] {
         assert!(report.get(key).is_some(), "missing key {key:?} in {report}");
     }
     // `dummy-stack` never resolves a backend, so this is the CPU half of the
-    // check even on a `gpu` build: the field must be exactly `null`.
-    assert_eq!(
-        report["device_peak_in_flight"],
-        serde_json::Value::Null,
-        "report: {report}"
-    );
+    // check even on a `gpu` build: both fields must be exactly `null`.
+    for key in ["device_peak_in_flight", "gpu_fallback"] {
+        assert_eq!(report[key], serde_json::Value::Null, "report: {report}");
+    }
     let params = report["params"].as_array().expect("params array");
     assert!(!params.is_empty());
     for p in params {
@@ -916,6 +945,32 @@ fn stage_timings_mark_a_skipped_align_as_not_entered() {
         report["align_source"], "skipped",
         "must name the skip rather than leave the null unexplained: {report}"
     );
+}
+
+/// The `align` project value switches alignment off exactly like `--no-align`.
+#[test]
+fn set_align_false_skips_the_align_stage() {
+    let cwd = tmp_dir("set_align_false");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--set",
+            "align=false",
+            "--no-crop",
+            "--json",
+        ],
+    );
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    assert_eq!(report["align_source"], "skipped", "{report}");
 }
 
 /// `align_workers`/`peak_align_workers` are numbers only when
@@ -1386,4 +1441,209 @@ fn refuses_an_output_path_that_is_an_existing_file() {
         frame.metadata().unwrap().len() > 0,
         "the refusal must not have touched the frame"
     );
+}
+
+// ---------------------------------------------------------------------
+// Brightness equalization (project parameters, method defaults and `--set`).
+// ---------------------------------------------------------------------
+
+/// An `algo` stack of the fixture, unaligned and uncropped, reported as
+/// JSON, with `extra` arguments appended.
+fn equalization_run(label: &str, algo: &str, extra: &[&str]) -> serde_json::Value {
+    let cwd = tmp_dir(label);
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let input = mantis_512_dir();
+    let mut args = vec![
+        "stack",
+        input.to_str().unwrap(),
+        "-o",
+        out_dir.to_str().unwrap(),
+        "--algo",
+        algo,
+        "--json",
+        "--no-align",
+        "--no-crop",
+    ];
+    args.extend_from_slice(extra);
+    let out = run_cli_in(&cwd, &common::push_no_gpu(args));
+    assert!(out.success, "stderr: {}", out.stderr);
+    serde_json::from_str(&out.stdout).expect("--json must parse")
+}
+
+#[test]
+fn equalization_is_null_when_switched_off() {
+    assert!(
+        shared_laplacian_run()
+            .report
+            .get("equalization")
+            .is_some_and(serde_json::Value::is_null),
+        "the key is present and null"
+    );
+}
+
+#[test]
+fn equalize_set_enables_it_and_reports_every_frames_gain() {
+    let report = equalization_run(
+        "stack_cli_equalize_set",
+        "weighted-average",
+        &["--set", "equalize=true"],
+    );
+    let eq = &report["equalization"];
+    assert_eq!(eq["max_gain"], 1.25);
+    assert_eq!(eq["reference"], 3, "the middle frame of eight");
+    let frames = eq["frames"].as_array().expect("one entry per frame");
+    assert_eq!(
+        frames.len(),
+        report["frame_count"].as_u64().unwrap() as usize
+    );
+    for frame in frames {
+        for key in ["estimated", "applied", "clamped", "thin", "samples"] {
+            assert!(frame.get(key).is_some(), "{key} in {frame}");
+        }
+        assert_eq!(frame["clamped"], false, "{frame}");
+        assert_eq!(frame["thin"], false, "{frame}");
+        let applied = frame["applied"].as_f64().unwrap();
+        assert!((0.9..1.1).contains(&applied), "{frame}");
+    }
+    assert_eq!(frames[3]["applied"], 1.0, "the reference keeps unit gain");
+}
+
+#[test]
+fn equalize_preset_key_enables_it_and_write_preset_writes_it_back() {
+    let cwd = tmp_dir("stack_cli_equalize_preset");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let written = cwd.join("written.toml");
+    let dry = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "weighted-average",
+            "--dry-run",
+            "--set",
+            "equalize=true",
+            "--set",
+            "equalize-max-gain=1.5",
+            "--write-preset",
+            written.to_str().unwrap(),
+        ],
+    );
+    assert!(dry.success, "stderr: {}", dry.stderr);
+    let text = std::fs::read_to_string(&written).expect("the preset is written");
+    assert!(text.contains("equalize = true"), "{text}");
+    assert!(text.contains("equalize-max-gain = 1.5"), "{text}");
+
+    let report = equalization_run(
+        "stack_cli_equalize_preset_run",
+        "weighted-average",
+        &["--preset", written.to_str().unwrap()],
+    );
+    assert_eq!(report["equalization"]["max_gain"], 1.5);
+}
+
+#[test]
+fn equalization_is_on_by_default_for_every_fusion_method() {
+    for algo in ["depth-map", "weighted-average", "laplacian"] {
+        let on = equalization_run(&format!("stack_cli_equalize_default_{algo}"), algo, &[]);
+        assert_eq!(on["equalization"]["max_gain"], 1.25, "{algo}: {on}");
+    }
+}
+
+#[test]
+fn an_explicit_equalize_false_wins_over_the_default() {
+    for algo in ["depth-map", "laplacian"] {
+        let report = equalization_run(
+            &format!("stack_cli_equalize_false_{algo}"),
+            algo,
+            &["--set", "equalize=false"],
+        );
+        assert!(report["equalization"].is_null(), "{algo}: {report}");
+    }
+}
+
+/// A preset written by a run reproduces that run's equalization, whether it
+/// followed the method's default (nothing is written) or overrode it.
+#[test]
+fn a_written_preset_reproduces_the_focus_map_equalization_choice() {
+    let cwd = tmp_dir("stack_cli_equalize_preset_focus_map");
+    let input = mantis_512_dir();
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    for (name, extra, equalized) in [
+        ("default", vec![], true),
+        ("off", vec!["--set", "equalize=false"], false),
+    ] {
+        let written = cwd.join(format!("{name}.toml"));
+        let mut args = vec![
+            "stack",
+            input.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "depth-map",
+            "--dry-run",
+            "--write-preset",
+            written.to_str().unwrap(),
+        ];
+        args.extend(extra);
+        let dry = run_cli_in(&cwd, &args);
+        assert!(dry.success, "{name}: stderr: {}", dry.stderr);
+        let text = std::fs::read_to_string(&written).expect("the preset is written");
+        assert_eq!(
+            text.contains("equalize = false"),
+            !equalized,
+            "{name}: {text}"
+        );
+
+        let report = equalization_run(
+            &format!("stack_cli_equalize_preset_focus_map_{name}"),
+            "depth-map",
+            &["--preset", written.to_str().unwrap()],
+        );
+        assert_eq!(
+            report["equalization"].is_null(),
+            !equalized,
+            "{name}: {report}"
+        );
+    }
+}
+
+#[test]
+fn equalize_settings_out_of_range_or_of_the_wrong_kind_are_refused_before_any_frame_is_read() {
+    let missing_dir = "/definitely/does/not/exist/xyz-stack-cli-equalize";
+    let cwd = tmp_dir("stack_cli_equalize_refused");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    for (setting, names) in [
+        ("equalize-max-gain=3", ["equalize-max-gain", "3", "2"]),
+        ("equalize=maybe", ["equalize", "maybe", "bool"]),
+    ] {
+        let out = run_cli_in(
+            &cwd,
+            &common::push_no_gpu(vec![
+                "stack",
+                missing_dir,
+                "-o",
+                out_dir.to_str().unwrap(),
+                "--algo",
+                "weighted-average",
+                "--set",
+                setting,
+            ]),
+        );
+        assert!(!out.success, "{setting}: stdout {}", out.stdout);
+        for name in names {
+            assert!(
+                out.stderr.contains(name),
+                "{setting}: {name} in {}",
+                out.stderr
+            );
+        }
+        assert!(!out.stderr.contains(missing_dir), "{}", out.stderr);
+    }
 }

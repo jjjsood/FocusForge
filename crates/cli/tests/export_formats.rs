@@ -1057,6 +1057,7 @@ fn build_metadata_synth(
         Registration {
             transforms: vec![Transform::identity(); frame_paths.len()],
             crop: None,
+            equalization: None,
         }
     } else {
         Registration::default()

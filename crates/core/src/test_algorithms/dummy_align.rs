@@ -18,6 +18,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         help: "dummy per-frame translation bound, in pixels".to_string(),
         kind: ParamKind::Int { min: 0, max: 256 },
         default: ParamValue::Int(16),
+        advanced: false,
         auto: None,
         host_default: None,
     }]

@@ -823,7 +823,13 @@ struct CollectingConsumer {
 impl TileConsumer for CollectingConsumer {
     fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
         let rect = job.read_rect();
-        let samples = job.ctx().frame(0)?.samples.clone();
+        let mut samples = Vec::new();
+        job.ctx().for_each_frame(|f, tile, _| {
+            if f == 0 {
+                samples = tile.samples.clone();
+            }
+            Ok(())
+        })?;
         self.tiles.lock().unwrap().push(((rect.y, rect.x), samples));
         Ok(())
     }

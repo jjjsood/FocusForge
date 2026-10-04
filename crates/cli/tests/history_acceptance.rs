@@ -106,6 +106,8 @@ fn real_history_round_trips() {
         "laplacian",
         "--no-align",
         "--no-crop",
+        "--set",
+        "equalize=false",
     ]);
     run_ok(&cwd, &stack);
     let project = only_project(&out);

@@ -7,9 +7,10 @@
 //! [`crate::algorithm::TileReader`] is asked for.
 //!
 //! Memory formula (restated at the scheduler, which is what actually bounds
-//! it): `frames x tile_w x tile_h x spp x 2 B x in_flight` -- the bytes held
-//! by `in_flight` simultaneously-live frame-tile sets, each `tile_w x tile_h`
-//! (the *read* rect, not the interior) across every frame, `u16` samples.
+//! it): `tile_w x tile_h x (spp x 2 B + 1 B + working) x in_flight` -- the
+//! bytes held by `in_flight` simultaneously-live tiles, each `tile_w x tile_h`
+//! (the *read* rect, not the interior): one `u16` frame tile, one coverage
+//! mask and the method's working bytes. No term scales with the frame count.
 
 use crate::tile::{Rect, TileError};
 
@@ -61,25 +62,14 @@ pub const fn margin_for_levels(levels: u32) -> u32 {
     bound.div_ceil(alignment) * alignment
 }
 
-/// The smallest `tile_size` that plans at `levels` levels --
-/// `max(2 * margin + 2^levels, 4 * margin + 64)`, the same arithmetic
-/// [`TilePlan::new`] enforces, published as one place to read it from. At
-/// `levels == 0` there is no pyramid and no measurement geometry to
-/// respect, so the floor is just `2^0 = 1`.
+/// The smallest `tile_size` that plans at `levels` levels with no reach beyond
+/// the pyramid margin -- [`TileSupport::min_tile_size`] of `levels.into()`.
 pub const fn min_tile_size_for_levels(levels: u32) -> u32 {
-    let margin = margin_for_levels(levels);
-    let alignment = 1u32 << levels;
-    if margin == 0 {
-        2 * margin + alignment
-    } else {
-        let with_alignment = 2 * margin + alignment;
-        let validity_range = 4 * margin + 64;
-        if with_alignment > validity_range {
-            with_alignment
-        } else {
-            validity_range
-        }
+    TileSupport {
+        reach_px: 0,
+        decimation_levels: levels,
     }
+    .min_tile_size()
 }
 
 /// The largest level count `n <= MAX_LEVELS` for which
@@ -98,6 +88,81 @@ pub const fn max_levels_for_tile(tile_size: u32) -> u32 {
         n += 1;
     }
     best
+}
+
+/// What a method needs around a tile: the pixel distance its output at a
+/// pixel depends on (`reach_px`) and the depth of its decimation grid
+/// (`decimation_levels`), the grid every read origin must sit on.
+///
+/// `From<u32>` takes a pyramid depth alone, with no reach beyond the
+/// measured pyramid margin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileSupport {
+    pub reach_px: u32,
+    pub decimation_levels: u32,
+}
+
+impl From<u32> for TileSupport {
+    fn from(decimation_levels: u32) -> Self {
+        TileSupport {
+            reach_px: 0,
+            decimation_levels,
+        }
+    }
+}
+
+impl TileSupport {
+    /// The overlap on every side that has a neighbour:
+    /// `max(margin_for_levels(levels), reach_px)` rounded up to `2^levels`,
+    /// so a read origin stays on the decimation grid.
+    pub const fn margin(self) -> u32 {
+        let pyramid = margin_for_levels(self.decimation_levels);
+        let bound = if self.reach_px > pyramid {
+            self.reach_px
+        } else {
+            pyramid
+        };
+        let alignment = 1u32 << clamp_levels(self.decimation_levels);
+        bound.div_ceil(alignment) * alignment
+    }
+
+    /// The smallest `tile_size` that plans: `max(2 * margin + 2^levels,
+    /// 4 * margin_for_levels(levels) + 64)`. The second term is the geometry
+    /// the pyramid margin was measured in, so it stays on the measured
+    /// margin whatever the reach; it does not apply at `levels == 0`.
+    pub const fn min_tile_size(self) -> u32 {
+        let levels = clamp_levels(self.decimation_levels);
+        let with_alignment = 2 * self.margin() + (1u32 << levels);
+        let measured = margin_for_levels(levels);
+        if measured == 0 {
+            return with_alignment;
+        }
+        let validity_range = 4 * measured + 64;
+        if with_alignment > validity_range {
+            with_alignment
+        } else {
+            validity_range
+        }
+    }
+
+    /// The tile size used when a caller states none:
+    /// `max(DEFAULT_TILE_SIZE, 4 * margin + 64)`.
+    pub const fn default_tile_size(self) -> u32 {
+        let wide = 4 * self.margin() + 64;
+        if wide > DEFAULT_TILE_SIZE {
+            wide
+        } else {
+            DEFAULT_TILE_SIZE
+        }
+    }
+}
+
+const fn clamp_levels(levels: u32) -> u32 {
+    if levels > MAX_LEVELS {
+        MAX_LEVELS
+    } else {
+        levels
+    }
 }
 
 /// One tile of a [`TilePlan`]: the interior rectangle this tile owns in the
@@ -138,17 +203,12 @@ impl PlannedTile {
 /// returning `(start, size)` pairs that cover `0..extent` with no gap and
 /// no overlap.
 ///
-/// A trailing remainder smaller
-/// than `2 * margin` is **absorbed into the previous stride** rather than
-/// becoming a tile of its own. Without this, the default geometry cannot
-/// fuse the reference stack at all -- at `8192x5464`, tile 512, 5 levels
-/// (`interior_size = 320`) the final interior row is `5464 - 17*320 = 24`
-/// px, whose 120 px read rect gives `max_levels(_, 120) = 4 < 5` and
-/// `fuse::build` refuses with `LevelsTooDeep`. Absorbing it instead moves
-/// the last interior's start to `5120` (read origin `5024`, still a
-/// multiple of `2^levels`) and its read rect to `440` px
-/// (`max_levels(_, 440) = 6`). `margin == 0` (no pyramid) never merges,
-/// since `size < 2 * 0` is never true.
+/// A trailing remainder smaller than `margin` is **absorbed into the
+/// previous stride**, so a read rect never exceeds `tile_size` and an
+/// unabsorbed trailing read rect is at least `2 * margin` long (enough for
+/// every level count the margin serves). At `8192x5464`, tile 512, 5 levels
+/// the last interior row would be 24 px, whose 120 px read rect carries only
+/// 4 levels. `margin == 0` never merges.
 fn axis_partition(extent: u32, interior_size: u32, margin: u32) -> Vec<(u32, u32)> {
     let mut strides = Vec::new();
     let mut pos = 0u32;
@@ -159,7 +219,7 @@ fn axis_partition(extent: u32, interior_size: u32, margin: u32) -> Vec<(u32, u32
     }
     if strides.len() > 1 {
         let last = strides.len() - 1;
-        if strides[last].1 < 2 * margin {
+        if strides[last].1 < margin {
             let (_, remainder) = strides.remove(last);
             strides[last - 1].1 += remainder;
         }
@@ -181,15 +241,15 @@ pub struct TilePlan {
 impl TilePlan {
     /// Build a plan over `width x height`, with `tile_size` interpreted as
     /// the size of the *read* rect (so `interior_size = tile_size - 2 *
-    /// margin`), and `levels` the pyramid depth `margin_for_levels`
-    /// converts to an overlap.
+    /// margin`), and `support` the method's reach and decimation depth
+    /// ([`TileSupport::margin`] converts them to an overlap; a bare `u32`
+    /// is a pyramid depth with no extra reach).
     ///
     /// Refuses rather than silently adjusting: a zero extent is
     /// `EmptyExtent`, `tile_size == 0` is `TileSizeZero`, `levels >
     /// MAX_LEVELS` is `LevelsTooDeep`, and a tile too small for the margin's
     /// own validity range is `NoInterior`, naming
-    /// `min_tile_size = max(2 * margin + 2^levels, 4 * margin + 64)` --
-    /// never `2 * margin + 2^levels` alone.
+    /// [`TileSupport::min_tile_size`] -- never `2 * margin + 2^levels` alone.
     /// `crate::fuse::pyramid::MEASURED_MARGIN` is only established in the
     /// geometry it was measured in, a buffer of `4 * margin + 64` per side;
     /// a smaller buffer is, by the same measurement's tails-overlap
@@ -233,7 +293,14 @@ impl TilePlan {
     /// derive, and
     /// `tests::read_origins_land_on_the_decimation_grid` is what holds it
     /// to that.
-    pub fn new(width: u32, height: u32, tile_size: u32, levels: u32) -> Result<Self, TileError> {
+    pub fn new(
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        support: impl Into<TileSupport>,
+    ) -> Result<Self, TileError> {
+        let support = support.into();
+        let levels = support.decimation_levels;
         if width == 0 || height == 0 {
             return Err(TileError::EmptyExtent { width, height });
         }
@@ -247,7 +314,7 @@ impl TilePlan {
             });
         }
 
-        let margin = margin_for_levels(levels);
+        let margin = support.margin();
         // The smallest tile that actually plans. `2 * margin + alignment`
         // alone is not enough: the margin table
         // (`crate::fuse::pyramid::MEASURED_MARGIN`) is only established in
@@ -262,7 +329,7 @@ impl TilePlan {
         // same number, so the advice is never a size that the next guard
         // refuses in turn.
         let alignment: u32 = 1u32 << levels;
-        let min_tile_size = min_tile_size_for_levels(levels);
+        let min_tile_size = support.min_tile_size();
         if tile_size < min_tile_size {
             return Err(TileError::NoInterior {
                 tile_size,
@@ -767,7 +834,7 @@ mod tests {
         );
 
         // The x axis divides differently (8192 = 25*320 + 192, and 192 is
-        // not < 2*margin=192) so it is never absorbed -- both behaviours
+        // not < margin=96) so it is never absorbed -- both behaviours
         // covered by one plan.
         let last_col = plan
             .tiles()
@@ -792,6 +859,102 @@ mod tests {
             assert!(r.x <= i.x && r.y <= i.y);
             assert!(r.x + r.width >= i.x + i.width);
             assert!(r.y + r.height >= i.y + i.height);
+        }
+    }
+    fn support(reach_px: u32, decimation_levels: u32) -> TileSupport {
+        TileSupport {
+            reach_px,
+            decimation_levels,
+        }
+    }
+
+    #[test]
+    fn support_margin_min_and_default_follow_the_reach() {
+        // Laplacian at 5 levels: reach 140 -> margin 160, minimum tile on
+        // the measured margin (448), default 4 * 160 + 64.
+        let laplacian = support(140, 5);
+        assert_eq!(laplacian.margin(), 160);
+        assert_eq!(laplacian.min_tile_size(), 448);
+        assert_eq!(laplacian.default_tile_size(), 704);
+        // Depth 3 and 4: 36 -> 40 and 68 -> 80.
+        assert_eq!(support(36, 3).margin(), 40);
+        assert_eq!(support(68, 4).margin(), 80);
+        // A two-pixel grid: margin is the reach itself.
+        assert_eq!(support(10, 1).margin(), 10);
+        assert_eq!(support(14, 1).margin(), 14);
+        assert_eq!(support(10, 1).default_tile_size(), DEFAULT_TILE_SIZE);
+        // No reach: the measured pyramid margin and its minimum tile.
+        for levels in 0..=7 {
+            let plain = TileSupport::from(levels);
+            assert_eq!(plain.margin(), margin_for_levels(levels));
+            assert_eq!(plain.min_tile_size(), min_tile_size_for_levels(levels));
+        }
+        assert_eq!(TileSupport::from(5).default_tile_size(), DEFAULT_TILE_SIZE);
+    }
+
+    #[test]
+    fn support_margin_covers_the_reach_on_the_decimation_grid() {
+        for levels in 0..=8u32 {
+            for reach in 0..=700u32 {
+                let s = support(reach, levels);
+                let margin = s.margin();
+                assert!(
+                    margin >= reach,
+                    "levels={levels} reach={reach} margin={margin}"
+                );
+                assert!(margin >= margin_for_levels(levels));
+                assert_eq!(margin % (1u32 << levels), 0);
+                assert!(s.min_tile_size() > 2 * margin);
+                assert!(s.default_tile_size() >= s.min_tile_size());
+            }
+        }
+    }
+
+    #[test]
+    fn a_tile_below_the_support_minimum_is_refused_naming_it() {
+        let s = support(140, 5);
+        match TilePlan::new(2000, 2000, s.min_tile_size() - 1, s) {
+            Err(TileError::NoInterior {
+                margin: 160,
+                min_tile_size: 448,
+                ..
+            }) => {}
+            other => panic!("expected NoInterior naming margin 160 / minimum 448, got {other:?}"),
+        }
+        assert!(TilePlan::new(2000, 2000, 448, s).is_ok());
+    }
+
+    #[test]
+    fn read_rects_never_exceed_the_tile_size() {
+        for (reach, levels) in [(0, 0), (0, 3), (0, 5), (140, 5), (36, 3), (10, 1)] {
+            let s = support(reach, levels);
+            let tile_sizes = [
+                s.min_tile_size(),
+                s.min_tile_size() + 37,
+                s.default_tile_size(),
+            ];
+            for tile_size in tile_sizes {
+                for extent in 1..=1300u32 {
+                    let plan = TilePlan::new(extent, extent, tile_size, s)
+                        .unwrap_or_else(|e| panic!("extent {extent}: {e}"));
+                    for tile in plan.tiles() {
+                        let r = tile.read();
+                        assert!(
+                            r.width <= tile_size && r.height <= tile_size,
+                            "reach={reach} levels={levels} tile={tile_size} extent={extent}: \
+                             read {r:?}"
+                        );
+                        // Every read rect is deep enough for the pyramid the
+                        // support's levels ask for.
+                        if extent >= 4 << levels {
+                            assert!(
+                                crate::fuse::pyramid::max_levels(r.width, r.height) >= levels,
+                                "reach={reach} levels={levels} extent={extent}: read {r:?}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }

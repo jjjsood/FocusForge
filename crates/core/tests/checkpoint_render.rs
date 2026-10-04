@@ -130,6 +130,7 @@ fn seal_root(name: &str) -> Root {
         registration: Registration {
             transforms: transforms.clone(),
             crop: Some(CROP),
+            equalization: None,
         },
         composite_description: "staged composite".to_string(),
         label: None,
@@ -220,6 +221,7 @@ fn seal_branched(name: &str) -> Branched {
         registration: Registration {
             transforms: root.transforms.clone(),
             crop: Some(CROP),
+            equalization: None,
         },
         composite_description: "staged composite".to_string(),
         label: None,

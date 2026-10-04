@@ -507,8 +507,8 @@ fn run_fusion(scene: &Scene, algorithm_id: &str, explicit: &ParamValues) -> Fusi
     let composite_path = scratch.join(format!("{algorithm_id}.tif"));
     let zmap_path = scratch.join(format!("{algorithm_id}-zmap.tif"));
     let mut options = TileSchedulerOptions::explicit_budget(scratch.join("scheduler"), 1 << 30);
+    options.apply_support(algorithm.tile_support(&values));
     options.tile_size = 256;
-    options.levels = algorithm.tile_levels(&values);
     let scheduler = TileScheduler::new(&stack, context, scene.samples_per_pixel, &options)
         .expect("scheduler builds");
     let consumer = FusionConsumer::create(

@@ -82,6 +82,22 @@ fn out_dir(parent: &Path, name: &str) -> PathBuf {
     dir
 }
 
+/// Arguments that plan four tiles of the 512x512 fixture, and the
+/// `--max-vram` that admits one such tile on the device at a time, never two,
+/// warped or not, while still covering the rect the run asks the device
+/// about. `focusforge-gpu`'s `budget` tests pin the cap against the model.
+const FOUR_TILE_ARGS: [&str; 4] = ["--tile-size", "576", "--set", "levels=5"];
+const ONE_TILE_CAP: &str = "55MB";
+
+/// `FOUR_TILE_ARGS` followed by `extra`.
+fn four_tile_args<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+    FOUR_TILE_ARGS
+        .iter()
+        .copied()
+        .chain(extra.iter().copied())
+        .collect()
+}
+
 /// The composite of `project`, exported beside it as
 /// `<project-file-name>.composite.tif` for byte comparison.
 fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
@@ -508,7 +524,10 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
 
     // Uncapped GPU run.
     let uncapped_dir = out_dir(&dir, "uncapped");
-    let uncapped = run_owned(&cwd, &max_vram_stack_args(&uncapped_dir, &[]));
+    let uncapped = run_owned(
+        &cwd,
+        &max_vram_stack_args(&uncapped_dir, &four_tile_args(&[])),
+    );
     assert!(uncapped.success, "stderr: {}", uncapped.stderr);
     let uncapped_report: serde_json::Value =
         serde_json::from_str(&uncapped.stdout).expect("--json must parse");
@@ -528,13 +547,13 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
         "device concurrency must never exceed host concurrency: {uncapped_report}"
     );
 
-    // `--max-vram 1MiB` floors the device gate at exactly one tile, on any
-    // machine, without touching the host-side `in_flight_limit` (one
-    // tile's device footprint on this fixture is 254 661 632 bytes).
+    // A cap between one and two tiles' device bytes admits the run to the
+    // device one tile at a time, on any machine, without touching the
+    // host-side `in_flight_limit`.
     let capped_dir = out_dir(&dir, "capped");
     let capped = run_owned(
         &cwd,
-        &max_vram_stack_args(&capped_dir, &["--max-vram", "1MiB"]),
+        &max_vram_stack_args(&capped_dir, &four_tile_args(&["--max-vram", ONE_TILE_CAP])),
     );
     assert!(capped.success, "stderr: {}", capped.stderr);
     let capped_report: serde_json::Value =
@@ -550,7 +569,10 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
 
     // `--no-gpu`: the field is null.
     let cpu_dir = out_dir(&dir, "cpu");
-    let cpu = run_owned(&cwd, &max_vram_stack_args(&cpu_dir, &["--no-gpu"]));
+    let cpu = run_owned(
+        &cwd,
+        &max_vram_stack_args(&cpu_dir, &four_tile_args(&["--no-gpu"])),
+    );
     assert!(cpu.success, "stderr: {}", cpu.stderr);
     let cpu_report: serde_json::Value =
         serde_json::from_str(&cpu.stdout).expect("--json must parse");
@@ -561,53 +583,100 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
     );
 }
 
-/// Builds a two-group `stack` root: `a-two/` (2 frames, cheap per-tile
-/// device footprint) and `b-sixteen/` (16 frames across two copied name
-/// sets, expensive per-tile device footprint), both copied from
-/// `fixtures/mantis-512/frames`. No frame carries a capture time, so
-/// `propose` groups by directory, and its depth-first bytewise walk yields
-/// exactly these two groups, `a-two` first (`"a-two" < "b-sixteen"` bytewise).
+/// One tile above the device budget runs on the host, chosen at plan time: a
+/// run capped at 1 MiB exits 0, reports the CPU backend and no device
+/// figures, names the fallback on stderr and in `gpu_fallback`, and writes
+/// the planes a `--no-gpu` run writes.
+#[test]
+fn a_device_budget_below_one_tile_falls_back_to_the_cpu_path() {
+    let cwd = common::tmp_dir("cli_gpu_budget_fallback_cwd");
+    let dir = common::tmp_dir("cli_gpu_budget_fallback");
+    let capped_dir = out_dir(&dir, "capped");
+    let cpu_dir = out_dir(&dir, "cpu");
+
+    let capped = run_owned(
+        &cwd,
+        &max_vram_stack_args(&capped_dir, &["--max-vram", "1MiB"]),
+    );
+    assert!(capped.success, "stderr: {}", capped.stderr);
+    if !capped.stderr.contains("using the GPU path") {
+        println!("SKIP: no usable adapter on this machine, cannot exercise the device fallback");
+        return;
+    }
+    let report: serde_json::Value =
+        serde_json::from_str(&capped.stdout).expect("--json must parse");
+    assert_eq!(report["backend"], "cpu", "report: {report}");
+    for key in [
+        "max_device_bytes_in_flight",
+        "device_budget_provenance",
+        "device_peak_in_flight",
+    ] {
+        assert_eq!(report[key], serde_json::Value::Null, "{key} in {report}");
+    }
+    let reason = report["gpu_fallback"]
+        .as_str()
+        .expect("a fallback run must name its reason");
+    assert!(reason.contains("CPU path"), "reason: {reason}");
+    assert!(
+        capped.stderr.contains(reason),
+        "stderr must carry the reason: {}",
+        capped.stderr
+    );
+
+    let cpu = run_owned(&cwd, &max_vram_stack_args(&cpu_dir, &["--no-gpu"]));
+    assert!(cpu.success, "cpu run stderr: {}", cpu.stderr);
+    let cpu_report: serde_json::Value =
+        serde_json::from_str(&cpu.stdout).expect("--json must parse");
+    assert_eq!(
+        cpu_report["gpu_fallback"],
+        serde_json::Value::Null,
+        "report: {cpu_report}"
+    );
+
+    let (capped_composite, capped_zmap) = export_both(&cwd, &capped_dir.join("mantis-512.ffp"));
+    let (cpu_composite, cpu_zmap) = export_both(&cwd, &cpu_dir.join("mantis-512.ffp"));
+    assert_eq!(
+        std::fs::read(&capped_composite).expect("read capped composite"),
+        std::fs::read(&cpu_composite).expect("read cpu composite"),
+        "the fallback composite must equal a --no-gpu run's"
+    );
+    assert_eq!(
+        std::fs::read(&capped_zmap).expect("read capped zmap"),
+        std::fs::read(&cpu_zmap).expect("read cpu zmap"),
+        "the fallback Z-Map must equal a --no-gpu run's"
+    );
+}
+
+/// Builds a two-group `stack` root: `a-many-tiles/` (the 8 frames of
+/// `fixtures/mantis-512/frames`, several tiles at the tile size the tests
+/// pass) and `b-one-tile/` (the 3 frames of `fixtures/mantis-64/frames`, one
+/// tile at any tile size). No frame carries a capture time, so `propose`
+/// groups by directory, and its depth-first bytewise walk yields exactly
+/// these two groups, `a-many-tiles` first.
 fn build_two_group_root(parent: &Path) -> PathBuf {
     let root = parent.join("in");
-    std::fs::create_dir_all(&root).expect("root must be creatable");
-
-    let frames_dir = mantis_512_dir().join("frames");
-    let mut frame_files: Vec<PathBuf> = std::fs::read_dir(&frames_dir)
-        .expect("fixture frames dir must exist")
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("tif"))
-        .collect();
-    frame_files.sort();
-
-    let a_two = root.join("a-two");
-    std::fs::create_dir_all(&a_two).expect("a-two must be creatable");
-    for src in frame_files.iter().take(2) {
-        let name = src.file_name().expect("fixture frame must have a name");
-        std::fs::copy(src, a_two.join(name)).expect("copy into a-two must succeed");
-    }
-
-    let b_sixteen = root.join("b-sixteen");
-    std::fs::create_dir_all(&b_sixteen).expect("b-sixteen must be creatable");
-    for prefix in ["s0-", "s1-"] {
-        for src in &frame_files {
-            let name = format!(
-                "{prefix}{}",
-                src.file_name()
-                    .expect("fixture frame must have a name")
-                    .to_string_lossy()
-            );
-            std::fs::copy(src, b_sixteen.join(name)).expect("copy into b-sixteen must succeed");
+    let mantis_64 = mantis_512_dir().with_file_name("mantis-64");
+    for (name, source) in [
+        ("a-many-tiles", mantis_512_dir()),
+        ("b-one-tile", mantis_64),
+    ] {
+        let group = root.join(name);
+        std::fs::create_dir_all(&group).expect("group directory must be creatable");
+        for entry in std::fs::read_dir(source.join("frames")).expect("fixture frames dir") {
+            let src = entry.expect("fixture frame entry").path();
+            if src.extension().and_then(|e| e.to_str()) == Some("tif") {
+                let name = src.file_name().expect("fixture frame must have a name");
+                std::fs::copy(&src, group.join(name)).expect("frame copy must succeed");
+            }
         }
     }
-
     root
 }
 
-/// Two groups in one `stack` invocation report independent device peaks,
-/// not a running maximum. A shared `64MiB` `--max-vram` floors `b-sixteen`
-/// at one device tile while `a-two` (which runs first) admits two or more,
-/// which a prefix maximum could not produce.
+/// Two groups in one `stack` invocation report independent device peaks, not
+/// a running maximum: the many-tile group admits two or more tiles to the
+/// device at once, then the one-tile group, which can never have two in
+/// flight, reports exactly 1.
 #[test]
 fn device_peak_in_flight_is_scoped_to_its_own_group() {
     let cwd = common::tmp_dir("cli_gpu_device_peak_two_group_cwd");
@@ -628,11 +697,7 @@ fn device_peak_in_flight_is_scoped_to_its_own_group() {
             "--no-align",
             "--no-crop",
             "--tile-size",
-            "256",
-            "--set",
-            "levels=4",
-            "--max-vram",
-            "64MiB",
+            "448",
             "--json",
         ],
     );
@@ -653,20 +718,19 @@ fn device_peak_in_flight_is_scoped_to_its_own_group() {
     }
 
     assert_eq!(groups.len(), 2, "doc: {doc}");
-    let light_peak = groups[0]["device_peak_in_flight"]
+    let many_peak = groups[0]["device_peak_in_flight"]
         .as_u64()
-        .expect("the 2-frame group must report a non-null device_peak_in_flight");
-    let heavy_peak = groups[1]["device_peak_in_flight"]
+        .expect("the many-tile group must report a non-null device_peak_in_flight");
+    let one_peak = groups[1]["device_peak_in_flight"]
         .as_u64()
-        .expect("the 16-frame group must report a non-null device_peak_in_flight");
-    assert_eq!(
-        heavy_peak, 1,
-        "the 16-frame group's own peak, not a running maximum: {doc}"
-    );
+        .expect("the one-tile group must report a non-null device_peak_in_flight");
     assert!(
-        light_peak > heavy_peak,
-        "the second group's own peak must be strictly less, which a prefix \
-         maximum over both groups cannot produce: {doc}"
+        many_peak >= 2,
+        "the many-tile group must admit two tiles at once: {doc}"
+    );
+    assert_eq!(
+        one_peak, 1,
+        "the one-tile group's own peak, not a running maximum: {doc}"
     );
 }
 
@@ -712,12 +776,11 @@ fn device_loss_stack_args(output_dir: &Path, extra: &[&str]) -> Vec<String> {
         "--algo".to_string(),
         "laplacian".to_string(),
         "--no-align".to_string(),
-        // 512 px of fixture at a 448 px tile plans four tiles, so destroying
-        // the device after the first leaves work for the host.
-        "--tile-size".to_string(),
-        "448".to_string(),
+        // Four tiles, so destroying the device after the first leaves work
+        // for the host.
         "--json".to_string(),
     ];
+    args.extend(FOUR_TILE_ARGS.iter().map(|s| s.to_string()));
     args.extend(extra.iter().map(|s| s.to_string()));
     args
 }
@@ -735,12 +798,12 @@ fn device_lost_falls_back() {
 
     let mut cmd = common::cli_bin("cli_gpu_device_lost");
     let data_dir = common::data_dir_of(&cmd);
-    // A device budget below one tile's own footprint floors the run at one
-    // tile in flight, so the first tile is genuinely finished -- and the
-    // device genuinely destroyed -- before the second is dispatched. Without
-    // it all four tiles are in flight at once and the destroy lands after
-    // the last of them has already been fused.
-    let gpu_args = device_loss_stack_args(&gpu_dir, &["--max-vram", "1MiB"]);
+    // A device budget between one and two tiles' footprints keeps one tile
+    // in flight, so the first tile is genuinely finished -- and the device
+    // genuinely destroyed -- before the second is dispatched. Without it all
+    // four tiles are in flight at once and the destroy lands after the last
+    // of them has already been fused.
+    let gpu_args = device_loss_stack_args(&gpu_dir, &["--max-vram", ONE_TILE_CAP]);
     let gpu = CliOutput::from(
         cmd.args(gpu_args.iter().map(String::as_str))
             .current_dir(&*cwd)
@@ -798,6 +861,65 @@ fn device_lost_falls_back() {
     );
 }
 
+/// An equalized run on a real adapter applies the same gains as with
+/// `--no-gpu`. Near-tie winners move single samples by hundreds of LSB, so
+/// parity is judged on the mean level equalization shifts each composite
+/// by; a path whose reader lacks the gain shifts by zero.
+#[test]
+fn equalized_stack_gpu_matches_no_gpu() {
+    /// Per-sample bound between the two equalized composites, the same
+    /// measured near-tie bound as `stack_gpu_matches_stack_no_gpu`.
+    const TOLERANCE: i32 = 512;
+    /// The CPU path's equalized mean sat 153.8 LSB above its unequalized one
+    /// (mean 36 455.95 to 36 609.72); a shift under this is not equalization.
+    const MIN_SHIFT: f64 = 100.0;
+    /// How far the two paths' shifts may differ, as a share of the CPU's.
+    const SHIFT_AGREEMENT: f64 = 0.1;
+
+    let cwd = common::tmp_dir("cli_gpu_equalized_cwd");
+    let dir = common::tmp_dir("cli_gpu_equalized");
+    let composite = |name: &str, extra: &[&str]| {
+        let out = out_dir(&dir, name);
+        let result = run_owned(&cwd, &device_loss_stack_args(&out, extra));
+        assert!(result.success, "{name} run stderr: {}", result.stderr);
+        let report: serde_json::Value =
+            serde_json::from_str(&result.stdout).expect("--json must parse");
+        let (samples, ..) = read_whole(&export_composite(&cwd, &out.join("mantis-512.ffp")));
+        (samples, report)
+    };
+    let mean =
+        |samples: &[u16]| samples.iter().map(|&s| f64::from(s)).sum::<f64>() / samples.len() as f64;
+
+    let (gpu_off, gpu_off_report) = composite("gpu-off", &[]);
+    let (gpu_on, gpu_on_report) = composite("gpu-on", &["--set", "equalize=true"]);
+    let (cpu_off, _) = composite("cpu-off", &["--no-gpu"]);
+    let (cpu_on, cpu_on_report) = composite("cpu-on", &["--no-gpu", "--set", "equalize=true"]);
+
+    assert_ne!(gpu_on_report["backend"], "cpu", "{gpu_on_report}");
+    assert_ne!(gpu_off_report["backend"], "cpu", "{gpu_off_report}");
+    assert!(!gpu_on_report["equalization"].is_null(), "{gpu_on_report}");
+    assert_eq!(gpu_on_report["equalization"], cpu_on_report["equalization"]);
+
+    let shift_cpu = mean(&cpu_on) - mean(&cpu_off);
+    let shift_gpu = mean(&gpu_on) - mean(&gpu_off);
+    eprintln!(
+        "equalization shifts the composite mean by {shift_cpu:.2} (cpu), {shift_gpu:.2} (gpu)"
+    );
+    assert!(
+        shift_cpu.abs() >= MIN_SHIFT,
+        "the cpu run's equalization shifted its composite by only {shift_cpu:.2}"
+    );
+    assert!(
+        (shift_gpu - shift_cpu).abs() <= SHIFT_AGREEMENT * shift_cpu.abs(),
+        "equalization shifted the gpu composite by {shift_gpu:.2}, the cpu one by {shift_cpu:.2}"
+    );
+    let worst = max_abs_diff(&gpu_on, &cpu_on);
+    assert!(
+        worst <= TOLERANCE,
+        "equalized gpu and cpu composites differ by up to {worst} LSB, tolerance is {TOLERANCE}"
+    );
+}
+
 /// The adapter and its limits are recorded once per process, whatever the
 /// number of stacks, and neither record reaches stderr -- the one
 /// `adapter selected: ` line stays the whole of a run's adapter output
@@ -847,4 +969,260 @@ fn adapter_logged_once() {
         "stderr must still carry exactly one adapter line: {}",
         output.stderr
     );
+}
+
+/// Frame shifts of the synthetic align stacks, in pixels.
+const ALIGN_SHIFTS: [(f64, f64); 3] = [(0.0, 0.0), (3.5, -2.25), (-4.75, 6.5)];
+
+/// A 3-frame 1400x1400 stack: its level-0 solve region clears the 1,000,000 px
+/// threshold for the GPU path.
+fn large_synthetic_stack(name: &str) -> common::TmpDir {
+    let dir = common::tmp_dir(name);
+    common::write_synthetic_stack(&dir, 1400, 1400, &ALIGN_SHIFTS);
+    dir
+}
+
+/// `align --json --lax --algo pyramidal-ecc` over `input` plus `extra`;
+/// `cmd` carries any env the test sets.
+fn align_json(
+    mut cmd: Command,
+    cwd: &Path,
+    input: &Path,
+    extra: &[&str],
+) -> (CliOutput, serde_json::Value) {
+    let mut args = vec![
+        "align",
+        input.to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--json",
+    ];
+    args.extend_from_slice(extra);
+    let out = common::run_in(&mut cmd, cwd, &args);
+    let report = serde_json::from_str(&out.stdout).unwrap_or(serde_json::Value::Null);
+    (out, report)
+}
+
+/// Translation mode keeps the debug-build CPU side of the synthetic runs short.
+const TRANSLATION: [&str; 2] = ["--set", "mode=translation"];
+
+/// A level large enough for the GPU path runs on the adapter, and the
+/// alignment agrees with the CPU run to the geometric budget.
+#[test]
+fn align_large_synthetic_stack_uses_the_gpu() {
+    const CORNER_BUDGET: f64 = 0.04;
+    let cwd = common::tmp_dir("cli_gpu_align_large_cwd");
+    let input = large_synthetic_stack("cli_gpu_align_large_in");
+
+    let (gpu, gpu_report) = align_json(bin(), &cwd, &input, &TRANSLATION);
+    assert!(gpu.success, "gpu align stderr: {}", gpu.stderr);
+    let mut cpu_args = TRANSLATION.to_vec();
+    cpu_args.push("--no-gpu");
+    let (cpu, cpu_report) = align_json(bin(), &cwd, &input, &cpu_args);
+    assert!(cpu.success, "cpu align stderr: {}", cpu.stderr);
+
+    let backend = gpu_report["align_backend"]
+        .as_str()
+        .expect("the report must name the align backend");
+    assert_ne!(backend, "cpu", "a 1400x1400 stack must run on the adapter");
+    assert_eq!(cpu_report["align_backend"], "cpu");
+
+    let (gpu_frames, cpu_frames) = (
+        gpu_report["alignments"].as_array().unwrap(),
+        cpu_report["alignments"].as_array().unwrap(),
+    );
+    assert_eq!(gpu_frames.len(), cpu_frames.len());
+    for (g, c) in gpu_frames.iter().zip(cpu_frames) {
+        assert_eq!(g["status"], c["status"], "statuses must agree: {g} vs {c}");
+        for key in ["tx", "ty"] {
+            let (g, c) = (g[key].as_f64().unwrap(), c[key].as_f64().unwrap());
+            assert!(
+                (g - c).abs() <= CORNER_BUDGET,
+                "{key}: gpu {g} against cpu {c} exceeds {CORNER_BUDGET} px"
+            );
+        }
+    }
+}
+
+/// A device destroyed during the first ECC iteration reruns the whole stage
+/// on the CPU: the result is the `--no-gpu` result, exactly.
+#[test]
+fn align_reruns_on_cpu_after_device_loss() {
+    let cwd = common::tmp_dir("cli_gpu_align_loss_cwd");
+    let input = large_synthetic_stack("cli_gpu_align_loss_in");
+
+    let mut lossy = bin();
+    lossy.env("FF_FORCE_DEVICE_LOST", "1");
+    let (lost, lost_report) = align_json(lossy, &cwd, &input, &TRANSLATION);
+    assert!(
+        lost.success,
+        "a lost device must still finish: {}",
+        lost.stderr
+    );
+    assert_eq!(
+        lost_report["align_backend"], "cpu",
+        "stderr: {}\nreport: {lost_report}",
+        lost.stderr
+    );
+    assert!(
+        lost.stderr.contains("reran on the CPU"),
+        "stderr must give the loss reason: {}",
+        lost.stderr
+    );
+
+    let mut cpu_args = TRANSLATION.to_vec();
+    cpu_args.push("--no-gpu");
+    let (cpu, cpu_report) = align_json(bin(), &cwd, &input, &cpu_args);
+    assert!(cpu.success, "cpu align stderr: {}", cpu.stderr);
+    assert_eq!(
+        lost_report["alignments"], cpu_report["alignments"],
+        "every transform must equal the CPU run's"
+    );
+}
+
+/// `--no-gpu` never brings up an adapter: the log holds no adapter record.
+#[test]
+fn align_no_gpu_never_probes_an_adapter() {
+    let cwd = common::tmp_dir("cli_gpu_align_no_gpu_cwd");
+    let mut cmd = bin();
+    let data_dir = common::data_dir_of(&cmd);
+    cmd.args([
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--no-gpu",
+        "--json",
+    ]);
+    let out = CliOutput::from(
+        cmd.current_dir(&*cwd)
+            .output()
+            .expect("failed to run binary"),
+    );
+    assert!(out.success, "stderr: {}", out.stderr);
+    let log = std::fs::read_to_string(log_path(&data_dir)).unwrap_or_default();
+    assert!(
+        !log.contains("graphics adapter selected"),
+        "--no-gpu must not probe an adapter: {log}"
+    );
+    assert!(
+        out.stderr.contains("--no-gpu given: aligning on the CPU"),
+        "stderr must give the reason: {}",
+        out.stderr
+    );
+}
+
+/// A run with no level reaching the GPU threshold never opens the adapter:
+/// the log holds no adapter record and stderr no selection line.
+#[test]
+fn align_without_eligible_region_never_probes_an_adapter() {
+    let cwd = common::tmp_dir("cli_gpu_align_small_cwd");
+    let mut cmd = bin();
+    let data_dir = common::data_dir_of(&cmd);
+    cmd.args([
+        "align",
+        mantis_512_dir().to_str().unwrap(),
+        "--algo",
+        "pyramidal-ecc",
+        "--lax",
+        "--json",
+    ]);
+    let out = CliOutput::from(
+        cmd.current_dir(&*cwd)
+            .output()
+            .expect("failed to run binary"),
+    );
+    assert!(out.success, "stderr: {}", out.stderr);
+    let log = std::fs::read_to_string(log_path(&data_dir)).unwrap_or_default();
+    assert!(
+        !log.contains("graphics adapter selected"),
+        "a run with no eligible region must not probe an adapter: {log}"
+    );
+    assert!(
+        !out.stderr.contains("(backend="),
+        "stderr must carry no adapter line: {}",
+        out.stderr
+    );
+}
+
+/// With no adapter the alignment runs on the CPU and says why.
+#[test]
+fn align_without_adapter_runs_on_cpu() {
+    let cwd = common::tmp_dir("cli_gpu_align_no_adapter_cwd");
+    let input = large_synthetic_stack("cli_gpu_align_no_adapter_in");
+    let Some(out) = run_with_no_adapter(
+        &cwd,
+        &[
+            "align",
+            input.to_str().unwrap(),
+            "--algo",
+            "pyramidal-ecc",
+            "--lax",
+            "--json",
+            "--set",
+            "mode=translation",
+        ],
+    ) else {
+        return;
+    };
+    assert!(out.success, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("no usable GPU adapter"),
+        "stderr must give the reason: {}",
+        out.stderr
+    );
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("--json must parse");
+    assert_eq!(report["align_backend"], "cpu");
+}
+
+/// `--max-vram` caps the align backend's device budget, and a capped backend
+/// still serves the level.
+#[test]
+fn align_max_vram_caps_the_gpu_backend() {
+    let cwd = common::tmp_dir("cli_gpu_align_cap_cwd");
+    let input = large_synthetic_stack("cli_gpu_align_cap_in");
+    let mut args = TRANSLATION.to_vec();
+    args.extend(["--max-vram", "1MiB"]);
+    let (out, report) = align_json(bin(), &cwd, &input, &args);
+    assert!(out.success, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("device budget 1048576 bytes"),
+        "stderr must name the capped budget: {}",
+        out.stderr
+    );
+    assert_ne!(report["align_backend"], "cpu", "report: {report}");
+}
+
+/// The selection line is printed once, at first use, and names the adapter
+/// the report names; a stack with no eligible region reports `cpu`.
+#[test]
+fn align_report_names_the_backend() {
+    let cwd = common::tmp_dir("cli_gpu_align_names_cwd");
+    let input = large_synthetic_stack("cli_gpu_align_names_in");
+    let (out, report) = align_json(bin(), &cwd, &input, &TRANSLATION);
+    assert!(out.success, "stderr: {}", out.stderr);
+    let lines: Vec<&str> = out
+        .stderr
+        .lines()
+        .filter(|line| line.contains("(backend="))
+        .collect();
+    assert_eq!(lines.len(), 1, "one selection line: {}", out.stderr);
+    assert!(
+        !lines[0].contains("adapter selected: "),
+        "the selection line must not repeat the fuse path's prefix: {}",
+        lines[0]
+    );
+    let adapter = report["align_backend"].as_str().expect("align_backend");
+    assert_ne!(adapter, "cpu");
+    assert!(
+        lines[0].contains(adapter),
+        "the line must name {adapter}: {}",
+        lines[0]
+    );
+
+    let (small, small_report) = align_json(bin(), &cwd, &mantis_512_dir(), &[]);
+    assert!(small.success, "stderr: {}", small.stderr);
+    assert_eq!(small_report["align_backend"], "cpu");
 }

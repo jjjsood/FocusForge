@@ -448,8 +448,8 @@ fn pause_lands_within_the_unit_bound() {
 
     // More than one worker: at most `in_flight_limit` further units
     // complete.
-    let bytes_per_tile_set = stack.len() as u64 * 200 * 200 * 3 * 2;
-    let opts2 = options("pause-bound-many", (bytes_per_tile_set * 4) as usize);
+    let bytes_per_tile = 200u64 * 200 * (3 * 2 + 1);
+    let opts2 = options("pause-bound-many", (bytes_per_tile * 4) as usize);
     let scheduler2 = build_scheduler(&stack, &opts2);
     let limit = scheduler2.in_flight_limit();
     if limit < 2 {
@@ -499,8 +499,8 @@ fn pause_lands_within_the_unit_bound() {
 #[test]
 fn error_wins_over_a_racing_pause_request() {
     let stack = open_stack();
-    let bytes_per_tile_set = stack.len() as u64 * 200 * 200 * 3 * 2;
-    let opts = options("error-wins-over-pause", (bytes_per_tile_set * 4) as usize);
+    let bytes_per_tile = 200u64 * 200 * (3 * 2 + 1);
+    let opts = options("error-wins-over-pause", (bytes_per_tile * 4) as usize);
     let scheduler = build_scheduler(&stack, &opts);
     if scheduler.in_flight_limit() < 2 {
         eprintln!("host reports too little parallelism for this race; skipping");

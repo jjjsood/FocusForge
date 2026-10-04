@@ -7,19 +7,23 @@
 //! `include_str!`, never a Rust string literal --
 //! [`harness_gain.wgsl`](../src/harness_gain.wgsl) is the example.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
 use focusforge_core::align::warp::WarpedTile;
 use focusforge_core::align::{AlignError, Transform};
-use focusforge_core::gpu::{BackendInfo, TileBackend};
+use focusforge_core::gpu::{
+    AlignBackend, BackendInfo, EccMomentSession, EccSessionRequest, TileBackend,
+};
 use focusforge_core::tile::{Rect, Tile};
 
 use crate::budget::{
     DeviceBudget, ProbeOutcome, VramBudget, buffer_limit_shortfalls, device_bytes_per_tile,
     dispatch_limit_shortfall, largest_buffer_bytes, max_tile_side, probe_budget,
+    tile_shortfall_message,
 };
 use crate::device::{GpuError, SharedDevice, block_on, shared_device};
+use crate::ecc::{self, EccState};
 use crate::errors;
 use crate::fuse::{self, FusionPipelines};
 use crate::pack::{packed_len, unpack_samples};
@@ -44,10 +48,12 @@ pub struct GpuBackend {
     /// each call takes the calling tile's own byte cost. See
     /// [`Self::with_max_device_bytes`] for the non-singleton constructor a
     /// test uses to drive a deliberately tiny ceiling.
-    budget: VramBudget,
+    budget: Arc<VramBudget>,
     /// The settled budget and its provenance, reported through
     /// [`Self::device_budget`].
     device_budget: DeviceBudget,
+    /// The ECC alignment kernels and the templates their sessions share.
+    ecc: EccState,
 }
 
 impl GpuBackend {
@@ -57,8 +63,9 @@ impl GpuBackend {
             pipeline: OnceLock::new(),
             fuse_pipelines: FusionPipelines::new(),
             warp_pipelines: WarpPipelines::new(),
-            budget: VramBudget::new(device_budget.bytes()),
+            budget: Arc::new(VramBudget::new(device_budget.bytes())),
             device_budget,
+            ecc: EccState::default(),
         }
     }
 
@@ -176,6 +183,18 @@ impl TileBackend for GpuBackend {
         )
     }
 
+    fn tile_budget_shortfall(
+        &self,
+        width: u32,
+        height: u32,
+        samples_per_pixel: u32,
+        levels: u32,
+        transforms: &[Transform],
+    ) -> Option<String> {
+        let (bytes, _) = tile_bytes(width, height, samples_per_pixel, levels, transforms);
+        tile_shortfall_message(width, height, bytes, self.device_budget.bytes())
+    }
+
     fn self_check(
         &self,
         reader: &dyn TileReader,
@@ -260,6 +279,7 @@ impl TileBackend for GpuBackend {
             rect,
             samples_per_pixel,
             levels,
+            &[],
         )
     }
 
@@ -294,16 +314,12 @@ impl TileBackend for GpuBackend {
         samples_per_pixel: u32,
         levels: u32,
     ) -> Result<TileOutput, AlgorithmError> {
-        // Same identity test `stack_tile`'s per-frame check makes, folded
-        // into one flag for the whole tile's byte-cost model (`crate::budget`).
-        let warped = transforms.iter().any(|t| *t != Transform::identity());
-        let bytes = device_bytes_per_tile(
-            transforms.len(),
+        let (bytes, warped) = tile_bytes(
             rect.width,
             rect.height,
             samples_per_pixel,
             levels,
-            warped,
+            transforms,
         );
         self.check_tile(rect.width, rect.height, samples_per_pixel, warped)?;
 
@@ -345,7 +361,7 @@ impl TileBackend for GpuBackend {
         .and_then(std::convert::identity);
 
         #[cfg(feature = "gpu-tests")]
-        forced_device_loss(device);
+        forced_device_loss(self.device);
 
         result
     }
@@ -355,15 +371,53 @@ impl TileBackend for GpuBackend {
     }
 }
 
-/// Destroys the shared device once `FF_FORCE_DEVICE_LOST` tiles have been
-/// fused; an absent or unparsable value does nothing. The poll is what makes
-/// the loss observable: wgpu runs the device-lost callback from a poll, not
-/// from `destroy`.
+/// The device bytes of one `width x height` tile, and whether any frame is
+/// warped. The identity test is the one `stack_tile`'s per-frame check makes,
+/// folded into one flag for the whole tile's byte-cost model (`crate::budget`).
+fn tile_bytes(
+    width: u32,
+    height: u32,
+    samples_per_pixel: u32,
+    levels: u32,
+    transforms: &[Transform],
+) -> (u64, bool) {
+    let warped = transforms.iter().any(|t| *t != Transform::identity());
+    (
+        device_bytes_per_tile(width, height, samples_per_pixel, levels, warped),
+        warped,
+    )
+}
+
+impl AlignBackend for GpuBackend {
+    fn open_ecc(
+        &self,
+        request: &EccSessionRequest<'_>,
+    ) -> Result<Option<Box<dyn EccMomentSession>>, AlgorithmError> {
+        ecc::open(self.device, &self.budget, &self.ecc, request)
+    }
+}
+
 #[cfg(feature = "gpu-tests")]
-fn forced_device_loss(device: &wgpu::Device) {
+impl GpuBackend {
+    /// The ECC sampler read back: every sample of `request`'s region through
+    /// `warp`, `None` where its taps leave the window. For the parity tests.
+    pub fn ecc_sample_values(
+        &self,
+        request: &EccSessionRequest<'_>,
+        warp: &Transform,
+    ) -> Result<Vec<Option<f32>>, AlgorithmError> {
+        ecc::sample_values(self.device, &self.ecc, request, warp)
+    }
+}
+
+/// Destroys the shared device once `FF_FORCE_DEVICE_LOST` GPU operations have
+/// run -- fused tiles and ECC iterations alike; an absent or unparsable value
+/// does nothing. The destroying call returns once the loss is observable.
+#[cfg(feature = "gpu-tests")]
+pub(crate) fn forced_device_loss(device: &SharedDevice) {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static FUSED_TILES: AtomicUsize = AtomicUsize::new(0);
+    static GPU_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
 
     let Some(after) = std::env::var("FF_FORCE_DEVICE_LOST")
         .ok()
@@ -371,9 +425,8 @@ fn forced_device_loss(device: &wgpu::Device) {
     else {
         return;
     };
-    if FUSED_TILES.fetch_add(1, Ordering::SeqCst) + 1 == after {
-        device.destroy();
-        let _ = device.poll(wgpu::PollType::Poll);
+    if GPU_OPERATIONS.fetch_add(1, Ordering::SeqCst) + 1 == after {
+        device.force_loss();
     }
 }
 
@@ -426,6 +479,98 @@ pub fn backend_for(
     }
 }
 
+/// The align stage's accelerator, opened on the first ECC level routed to it:
+/// the adapter, device and budget come up inside the first
+/// [`AlignBackend::open_ecc`] call, so a run whose levels all fall below the
+/// offload threshold never touches the GPU. A failed bring-up declines that
+/// level and every later one, which then run on the CPU.
+pub struct LazyAlignBackend {
+    max_vram: Option<u64>,
+    announce: fn(&str),
+    selected: OnceLock<Option<&'static GpuBackend>>,
+    adapter: OnceLock<String>,
+}
+
+impl LazyAlignBackend {
+    /// The adapter's display once a level has opened it; empty before, and
+    /// when the bring-up failed.
+    pub fn adapter(&self) -> &OnceLock<String> {
+        &self.adapter
+    }
+
+    /// Whether the device a level already opened is lost. `false` before any
+    /// level has opened it: asking never brings the adapter up.
+    pub fn lost(&self) -> bool {
+        matches!(self.selected.get(), Some(Some(backend)) if backend.device_lost())
+    }
+
+    /// Brings the backend up on first call and reports the outcome to
+    /// `announce` once, as one line.
+    fn resolve(&self) -> Option<&'static GpuBackend> {
+        *self.selected.get_or_init(|| {
+            let (backend, line) = match gpu_backend_capped(self.max_vram) {
+                Ok(backend) => (
+                    Some(backend),
+                    format!(
+                        "alignment offloads large levels to {}; device budget {} bytes",
+                        backend.info(),
+                        backend.device_budget().bytes()
+                    ),
+                ),
+                Err(err) => (None, cpu_fallback_line(err)),
+            };
+            if let Some(backend) = backend {
+                let _ = self.adapter.set(backend.info().to_string());
+            }
+            (self.announce)(&line);
+            backend
+        })
+    }
+}
+
+impl AlignBackend for LazyAlignBackend {
+    fn open_ecc(
+        &self,
+        request: &EccSessionRequest<'_>,
+    ) -> Result<Option<Box<dyn EccMomentSession>>, AlgorithmError> {
+        match self.resolve() {
+            Some(backend) => backend.open_ecc(request),
+            None => Ok(None),
+        }
+    }
+}
+
+static LAZY_ALIGN_BACKEND: OnceLock<LazyAlignBackend> = OnceLock::new();
+
+/// [`backend_for`] for the align stage: only the pyramidal ECC aligner has a
+/// GPU path, so any other `algorithm_id` stays on the CPU with an empty reason
+/// and `no_gpu` with its reason, neither probing an adapter. Otherwise the
+/// [`LazyAlignBackend`] shares the [`gpu_backend_capped`] singleton and passes
+/// its selection line to `announce` on first use. The line never starts with
+/// [`backend_for`]'s `adapter selected: `. The first call's `max_vram` and
+/// `announce` win.
+pub fn align_backend_for(
+    algorithm_id: &str,
+    no_gpu: bool,
+    max_vram: Option<u64>,
+    announce: fn(&str),
+) -> (Option<&'static LazyAlignBackend>, String) {
+    use focusforge_core::algorithm::AlignAlgorithm;
+    if algorithm_id != focusforge_core::align::PyramidalEcc.id() {
+        return (None, String::new());
+    }
+    if no_gpu {
+        return (None, "--no-gpu given: aligning on the CPU".to_string());
+    }
+    let lazy = LAZY_ALIGN_BACKEND.get_or_init(|| LazyAlignBackend {
+        max_vram,
+        announce,
+        selected: OnceLock::new(),
+        adapter: OnceLock::new(),
+    });
+    (Some(lazy), String::new())
+}
+
 /// Reason-led, because [`GpuError::VramExhausted`] (an adapter that cannot
 /// serve the minimum budget) falls back here exactly like a missing adapter.
 fn cpu_fallback_line(reason: &GpuError) -> String {
@@ -434,9 +579,10 @@ fn cpu_fallback_line(reason: &GpuError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{backend_for, cpu_fallback_line};
+    use super::{LazyAlignBackend, align_backend_for, backend_for, cpu_fallback_line};
     use crate::device::GpuError;
-    use focusforge_core::algorithm::StackAlgorithm;
+    use focusforge_core::algorithm::{AlignAlgorithm, StackAlgorithm};
+    use focusforge_core::align::PyramidalEcc;
     use focusforge_core::fuse::laplacian::Laplacian;
 
     #[test]
@@ -468,6 +614,35 @@ mod tests {
 
             for no_gpu in [false, true] {
                 let (backend, message) = backend_for("unsupported", no_gpu, max_vram);
+                assert!(backend.is_none());
+                assert!(message.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_lazy_align_backend_is_not_lost_before_bring_up() {
+        let lazy = LazyAlignBackend {
+            max_vram: None,
+            announce: |_| panic!("asking whether the device is lost must not bring it up"),
+            selected: std::sync::OnceLock::new(),
+            adapter: std::sync::OnceLock::new(),
+        };
+        assert!(!lazy.lost());
+        assert!(lazy.selected.get().is_none(), "no adapter was opened");
+        assert!(lazy.adapter().get().is_none());
+    }
+
+    #[test]
+    fn align_backend_for_cpu_selection() {
+        for max_vram in [None, Some(0)] {
+            let (backend, message) = align_backend_for(PyramidalEcc.id(), true, max_vram, |_| {});
+            assert!(backend.is_none());
+            assert_eq!(message, "--no-gpu given: aligning on the CPU");
+            assert!(!message.contains("adapter selected: "));
+
+            for no_gpu in [false, true] {
+                let (backend, message) = align_backend_for("unsupported", no_gpu, max_vram, |_| {});
                 assert!(backend.is_none());
                 assert!(message.is_empty());
             }

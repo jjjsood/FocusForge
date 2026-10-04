@@ -16,7 +16,7 @@
 //! `Action`. They read `crate::input_map`'s types only -- no `use slint::`
 //! here either.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -421,11 +421,16 @@ struct ProjectTab {
     fuse_values: ParamValues,
     align_values: ParamValues,
     project_values: ParamValues,
+    /// The explicit values of every method this tab switched away from,
+    /// keyed by `settings_panel::menu_key(section, id)`; in memory only.
+    remembered: BTreeMap<String, ParamValues>,
     /// One violation per offending `"<section>:<id>"` key -- what lets two
     /// fields carry a message at the same time.
     errors: BTreeMap<String, ParamViolation>,
     /// The one open picker/enum menu's `"<section>:<id>"` key, if any.
     menu_open: Option<String>,
+    /// The sections whose `More...` fold-out is open.
+    expanded: BTreeSet<String>,
     /// Every checkpoint kept in memory since the last save, oldest first --
     /// fused and op-bearing ones alike, in no `.ffp` until
     /// [`AppController::save_active_project`] writes them. A parent is an
@@ -451,6 +456,8 @@ struct ProjectTab {
     /// [`AppController::keep_fused`] or [`AppController::discard_fused`];
     /// not counted in `checkpoints` or `held` until kept.
     parked: Option<ParkedRun>,
+    /// What the tab's last completed run's alignment did.
+    alignment: Option<job::AlignSummary>,
     /// The ordered frame set a fuse actually consumes -- session-only, seeded
     /// from [`entry::project_frames`] and re-seeded from the run's own frames
     /// on every successful run, so a fused tab's list always matches what it
@@ -666,7 +673,7 @@ impl ProjectTab {
         let ctx = entry::tab_stack_context(&project);
         let image =
             entry::tab_image_size(&project).map(|(width, height)| ImageSize { width, height });
-        let (fuse_id, fuse_values, align_id, align_values) =
+        let (fuse_id, fuse_values, align_id, align_values, project_values) =
             settings_panel::seed_algorithm_state(&project);
         let selected_checkpoint = match &project {
             GuiProject::Unsaved(_) => None,
@@ -693,9 +700,11 @@ impl ProjectTab {
             align_id,
             fuse_values,
             align_values,
-            project_values: ParamValues::new(),
+            project_values,
+            remembered: BTreeMap::new(),
             errors: BTreeMap::new(),
             menu_open: None,
+            expanded: BTreeSet::new(),
             held: Vec::new(),
             pending_deletes: Vec::new(),
             viewed: Vec::new(),
@@ -703,6 +712,7 @@ impl ProjectTab {
             fresh_checkpoint: None,
             row_planes: None,
             parked: None,
+            alignment: None,
             frames,
             excluded,
             selected,
@@ -1110,7 +1120,8 @@ struct ShellState {
     /// [`AppController::cancel_mismatch`] -- no tab exists for it while
     /// this is `Some`.
     pending_mismatch: Option<PendingOpen>,
-    /// The skipped-subfolder notice from the most recent open, if any.
+    /// The info notice: the most recent open's skipped-subfolder line or the
+    /// most recent finished run's notices, if any.
     notice: Option<String>,
     /// The most recent refusal's already-rendered message, if any.
     last_refusal: Option<String>,
@@ -3592,12 +3603,14 @@ impl AppController {
         self.state.pending.as_ref().map(|(question, _)| question)
     }
 
-    /// The skipped-subfolder notice from the most recent open, if any.
+    /// The info notice the window shows, if any: the skipped-subfolder line
+    /// of the most recent open, or the notices of the most recent finished
+    /// run (a clamped equalization frame among them).
     pub fn notice(&self) -> Option<&str> {
         self.state.notice.as_deref()
     }
 
-    /// Clears the skipped-subfolder notice. Manual dismiss only -- unlike
+    /// Clears the info notice. Manual dismiss only -- unlike
     /// the run-failure toast, this one names something already finished,
     /// not a live status to time out on its own, so it waits for its own
     /// `x`. Clearing `self.state.notice` here, not only the Slint-side
@@ -4607,7 +4620,7 @@ impl AppController {
     // section per family, one field per `ParamDesc`" true by construction
     // rather than by an incremental patch that could drift from it. --
 
-    /// Builds the whole panel: Fuse, Align, Crop, in that order, each
+    /// Builds the whole panel: Prepare, Fuse, Align, Finish, in that order, each
     /// section's rows flattened from `AlgorithmRef::params()`'s own
     /// declaration order. With no tab active ("+" selected) the panel still
     /// renders -- the default algorithm of each family, with no explicit
@@ -4622,11 +4635,13 @@ impl AppController {
                 ctx: tab.ctx.as_ref(),
                 errors: &tab.errors,
                 menu_open: tab.menu_open.as_deref(),
+                expanded: &tab.expanded,
                 fuse_id: &tab.fuse_id,
                 fuse_values: &tab.fuse_values,
                 align_id: &tab.align_id,
                 align_values: &tab.align_values,
                 project_values: &tab.project_values,
+                remembered: &tab.remembered,
             });
         let mut rows = settings_panel::build_rows(active);
         settings_panel::assign_tops(&mut rows);
@@ -4656,7 +4671,10 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        tab_values_mut(tab, section).insert(id.to_string(), value);
+        let Some(values) = tab_values_mut(tab, section) else {
+            return;
+        };
+        values.insert(id.to_string(), value);
         tab.errors.remove(&settings_panel::menu_key(section, id));
         self.emit(ShellEvent::SettingsChanged);
     }
@@ -4674,9 +4692,15 @@ impl AppController {
             return;
         };
         let key = settings_panel::menu_key(section, id);
+        if tab.menu_open.as_deref() == Some(&key) {
+            tab.menu_open = None;
+        }
         match ParamValue::parse(desc, text) {
             Ok(value) => {
-                tab_values_mut(tab, section).insert(id.to_string(), value);
+                let Some(values) = tab_values_mut(tab, section) else {
+                    return;
+                };
+                values.insert(id.to_string(), value);
                 tab.errors.remove(&key);
             }
             Err(err) => {
@@ -4691,10 +4715,12 @@ impl AppController {
         self.emit(ShellEvent::SettingsChanged);
     }
 
-    /// Selects a Fuse or Align algorithm, clearing that section's values
-    /// and errors -- a fresh algorithm resolves its own schema from
-    /// scratch, never carrying over a stray value the previous one
-    /// happened to share an id with.
+    /// Selects a Fuse or Align algorithm. The section's explicit values stay
+    /// with the algorithm they were set on: switching away stashes them and
+    /// switching back restores them, while an algorithm never selected
+    /// before resolves its own schema from scratch. The section's errors do
+    /// not follow the switch. Selecting the current algorithm changes no
+    /// value. Either way the open choice list closes.
     pub fn set_fuse_algorithm(&mut self, id: &str) {
         self.set_algorithm("fuse", id);
     }
@@ -4707,12 +4733,28 @@ impl AppController {
         let Some(tab) = self.state.active_mut() else {
             return;
         };
-        match section {
-            "fuse" => tab.fuse_id = id.to_string(),
-            "align" => tab.align_id = id.to_string(),
+        let current = match section {
+            "fuse" => &mut tab.fuse_id,
+            "align" => &mut tab.align_id,
             _ => return,
+        };
+        tab.menu_open = None;
+        if current == id {
+            self.emit(ShellEvent::SettingsChanged);
+            return;
         }
-        tab_values_mut(tab, section).clear();
+        let previous = std::mem::replace(current, id.to_string());
+        let values = tab_values_mut(tab, section).expect("the section matched above has a map");
+        let stashed = std::mem::take(values);
+        let restored = tab
+            .remembered
+            .remove(&settings_panel::menu_key(section, id))
+            .unwrap_or_default();
+        *tab_values_mut(tab, section).expect("the section matched above has a map") = restored;
+        if !stashed.is_empty() {
+            tab.remembered
+                .insert(settings_panel::menu_key(section, &previous), stashed);
+        }
         let prefix = format!("{section}:");
         tab.errors.retain(|k, _| !k.starts_with(&prefix));
         self.emit(ShellEvent::SettingsChanged);
@@ -4730,6 +4772,7 @@ impl AppController {
         tab.fuse_values.clear();
         tab.align_values.clear();
         tab.project_values.clear();
+        tab.remembered.clear();
         tab.errors.clear();
         self.emit(ShellEvent::SettingsChanged);
     }
@@ -4753,6 +4796,19 @@ impl AppController {
     /// through, so the `"<section>:<id>"` format stays this module's alone.
     pub fn toggle_param_menu_for(&mut self, section: &str, id: &str) {
         self.toggle_param_menu(&settings_panel::menu_key(section, id));
+    }
+
+    /// Opens or closes `section`'s `More...` fold-out on the active tab, in
+    /// memory only: it is neither saved with the project nor copied to a
+    /// duplicated tab.
+    pub fn toggle_section_more(&mut self, section: &str) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        if !tab.expanded.remove(section) {
+            tab.expanded.insert(section.to_string());
+        }
+        self.emit(ShellEvent::SettingsChanged);
     }
 
     /// Converts a slider's thumb position back into this field's own value
@@ -4941,42 +4997,26 @@ impl AppController {
         let tab = self.state.active()?;
         let (sources, registration) = tab.fused()?;
         let path = tab.selected_frame()?;
-        let transform = sources
-            .iter()
-            .position(|source| source == path)
+        let position = sources.iter().position(|source| source == path);
+        let transform = position
             .map(|i| registration.transform(i))
             .unwrap_or_else(job::Transform::identity);
+        let gain = position.map_or(job::UNIT_GAIN, |i| registration.gain(i));
         let extent = display_image(tab)?;
         Some(FrameView {
             transform,
+            gain,
             origin: registration.origin(),
             extent: (extent.width, extent.height),
         })
     }
 
     /// The left pane's label: the selected frame's file name, or empty with
-    /// no tab active or nothing selected. In editor mode, appends the
-    /// brush source's own position, 1-based, out of the tab's frame count
-    /// (`tab.selected` is also the brush source).
+    /// no tab active or nothing selected.
     pub fn frame_pane_label(&self) -> String {
-        let Some(name) = self
-            .selected_frame_path()
+        self.selected_frame_path()
             .map(|path| images::file_name(&path))
-        else {
-            return String::new();
-        };
-        if self.mode() != ShellMode::Editor {
-            return name;
-        }
-        let tab = self
-            .state
-            .active()
-            .expect("selected_frame_path returned Some, so an active tab exists");
-        format!(
-            "{name} · source {} of {}",
-            tab.selected + 1,
-            tab.frames.len()
-        )
+            .unwrap_or_default()
     }
 
     /// Adds `paths` to the active tab: hashes on a worker thread, then
@@ -5761,6 +5801,8 @@ impl AppController {
         new_tab.align_id = tab.align_id.clone();
         new_tab.fuse_values = tab.fuse_values.clone();
         new_tab.align_values = tab.align_values.clone();
+        new_tab.project_values = tab.project_values.clone();
+        new_tab.remembered = tab.remembered.clone();
         self.state.projects.push(new_tab);
         self.set_active_tab(Some(self.state.projects.len() - 1));
         self.emit(ShellEvent::ProjectsChanged);
@@ -6027,10 +6069,12 @@ impl AppController {
             staging_key,
             fuse_id: tab.fuse_id.clone(),
             fuse_values: tab.fuse_values.clone(),
-            align_id: Some(tab.align_id.clone()),
+            align_id: settings_panel::project_flag(&tab.project_values, "align")
+                .then(|| tab.align_id.clone()),
             align_values: tab.align_values.clone(),
             align_lax: true,
-            crop: true,
+            crop: settings_panel::project_flag(&tab.project_values, "auto-crop"),
+            equalize: settings_panel::equalization_bound(&tab.fuse_id, &tab.project_values),
             gpu: self.gpu_fusion,
         })
     }
@@ -6373,17 +6417,26 @@ impl AppController {
         // stage line names.
         let progress = self.job.observer.as_ref().and_then(|o| o.last_progress());
         let phase = job::progress_phase(progress.as_ref());
+        let run_notices = self
+            .job
+            .observer
+            .as_ref()
+            .map(|o| o.notices())
+            .unwrap_or_default();
         let tab_index = self.job.tab_id.take().and_then(|id| self.tab_index(id));
         let owner = tab_index.and_then(|i| self.state.projects.get(i));
         let was_cancelling = owner.is_some_and(|tab| tab.run == job::RunState::Cancelling);
-        let settled = job::settle(handle.join());
+        let observer = self.job.observer.take().unwrap_or_default();
+        let settled = job::settle(handle.join(), &observer);
         self.job.control = None;
-        self.job.observer = None;
         // With the owning tab gone (closed mid-run), this writes nothing --
         // no tab gains a checkpoint, and no outcome lands on whichever tab
         // happens to be active now.
         if let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) {
             tab.run = settled.state.clone();
+            if settled.alignment.is_some() {
+                tab.alignment = settled.alignment.clone();
+            }
         }
         if tab_index == self.state.active {
             // The run's own tab is the active one -- the canvas must reload
@@ -6430,6 +6483,12 @@ impl AppController {
         }
 
         let owner = tab_index.filter(|&i| i < self.state.projects.len());
+        if settled.held.is_some()
+            && let Some(line) = run_notice_line(&run_notices)
+        {
+            self.state.notice = Some(line);
+            self.emit(ShellEvent::ProjectsChanged);
+        }
         let planes = match (settled.held, owner) {
             (None, _) => None,
             (Some(held), None) => {
@@ -6558,6 +6617,21 @@ impl AppController {
         Some(parked.diverged.as_slice())
     }
 
+    /// What the active tab's last completed run's alignment did: its source,
+    /// backend and per-status counts.
+    pub fn last_alignment(&self) -> Option<&job::AlignSummary> {
+        self.state.active()?.alignment.as_ref()
+    }
+
+    /// The toast a kept run with unregistered frames raises, read after
+    /// [`AppController::keep_fused`]; `None` when every frame registered.
+    pub fn unaligned_notice(&self) -> Option<String> {
+        match &self.state.active()?.run {
+            job::RunState::Fused { unaligned, .. } => job::unaligned_notice(*unaligned),
+            _ => None,
+        }
+    }
+
     /// `Keep` on the active tab's parked run: commits it exactly as a run
     /// without divergence commits, returning the planes the canvas reloads
     /// from. `None` with nothing parked.
@@ -6565,8 +6639,9 @@ impl AppController {
         let index = self.state.active?;
         let parked = self.state.projects.get_mut(index)?.parked.take()?;
         let at = checkpoints::local_hhmm(parked.held.created_at);
+        let unaligned = parked.diverged.len();
         let planes = self.commit_held(index, parked.held);
-        self.state.projects[index].run = job::RunState::Fused { at };
+        self.state.projects[index].run = job::RunState::Fused { at, unaligned };
         self.state.canvas_dirty = true;
         self.emit(ShellEvent::JobChanged);
         Some(planes)
@@ -7594,12 +7669,16 @@ pub fn tab_scroll_into_view(
     s.clamp(0.0, max)
 }
 
-/// The `ParamValues` map `section` mutates on this tab.
-fn tab_values_mut<'a>(tab: &'a mut ProjectTab, section: &str) -> &'a mut ParamValues {
+/// The `ParamValues` map `section` mutates on this tab, `None` for a section
+/// the panel does not have.
+fn tab_values_mut<'a>(tab: &'a mut ProjectTab, section: &str) -> Option<&'a mut ParamValues> {
     match section {
-        "align" => &mut tab.align_values,
-        "crop" => &mut tab.project_values,
-        _ => &mut tab.fuse_values,
+        "prepare" | "finish" | settings_panel::ALIGN_SWITCH_SECTION => {
+            Some(&mut tab.project_values)
+        }
+        "fuse" => Some(&mut tab.fuse_values),
+        "align" => Some(&mut tab.align_values),
+        _ => None,
     }
 }
 
@@ -7911,8 +7990,18 @@ fn open_card_meta(frame_count: u32, checkpoints: usize, phase_line: Option<&str>
     )
 }
 
-/// The skipped-subfolder notice's text, `None` when nothing was skipped --
-/// not an error, its toast's own copy (`ui/shell/dialogs.slint`'s
+/// The info notice's text for a finished run: the first pipeline notice,
+/// plus ` (and N more)` when it raised several; `None` when it raised none.
+fn run_notice_line(notices: &[String]) -> Option<String> {
+    let (first, rest) = notices.split_first()?;
+    Some(match rest.len() {
+        0 => first.clone(),
+        more => format!("{first} (and {more} more)"),
+    })
+}
+
+/// The info notice's text for a skipped-subfolder open, `None` when nothing
+/// was skipped -- not an error, its toast's own copy (`ui/shell/dialogs.slint`'s
 /// `FFToast`, `tone: "info"`). Short enough to stay on the toast's one
 /// line regardless of how many subfolders it names.
 fn notice_line(skipped: &[PathBuf]) -> Option<String> {

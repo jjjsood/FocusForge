@@ -2,7 +2,8 @@
 
 //! The align stage cache's key -- both directions (an unrelated
 //! parameter/geometry/backend leaving the digest byte-identical; an align
-//! parameter, the failure policy, or a frame's fingerprint changing it),
+//! parameter, the failure policy, the solver revision, or a frame's
+//! fingerprint changing it),
 //! the path-free projection, the bit-exact round trip, and the four miss
 //! cases: absent, truncated, unrecognised format, digest mismatch.
 
@@ -18,7 +19,8 @@ use focusforge_core::align::{
 };
 use focusforge_core::io::{FrameDesc, RawIdentity, TiffHeader};
 use focusforge_core::job::{
-    AlignIdentity, DRIVER_POLICY_FIELDS, FrameFingerprint, StackFingerprint, StageCache, StageKey,
+    ALIGN_SOLVER_VERSION, AlignIdentity, DRIVER_POLICY_FIELDS, FrameFingerprint, StackFingerprint,
+    StageCache, StageKey,
 };
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::registry;
@@ -52,11 +54,7 @@ fn sample_fingerprint(n: usize) -> StackFingerprint {
 fn sample_identity(algorithm: &str, policy: FailurePolicy) -> AlignIdentity {
     let mut params = ParamValues::new();
     params.insert("max-iterations".to_string(), ParamValue::Int(50));
-    AlignIdentity {
-        algorithm: algorithm.to_string(),
-        params,
-        failure_policy: policy,
-    }
+    AlignIdentity::new(algorithm, params, policy)
 }
 
 fn sample_alignment(n: usize) -> StackAlignment {
@@ -195,11 +193,7 @@ fn every_parameter_the_align_stage_reads_is_in_its_key() {
     let resolved = params::resolve(algo.params(), &ParamValues::new(), &ctx)
         .expect("resolve must succeed with no explicit overrides");
     let values = params::resolved_values(&resolved);
-    let identity = AlignIdentity {
-        algorithm: algo.id().to_string(),
-        params: values,
-        failure_policy: FailurePolicy::Strict,
-    };
+    let identity = AlignIdentity::new(algo.id(), values, FailurePolicy::Strict);
     let fingerprint = sample_fingerprint(2);
     let key = StageKey::align(&fingerprint, &identity);
     let bytes = key.canonical_bytes();
@@ -216,9 +210,8 @@ fn every_parameter_the_align_stage_reads_is_in_its_key() {
 }
 
 #[test]
-fn the_align_key_is_params_plus_exactly_one_driver_policy() {
-    assert_eq!(DRIVER_POLICY_FIELDS.len(), 1);
-    assert_eq!(DRIVER_POLICY_FIELDS[0], "failure_policy");
+fn the_align_key_is_params_plus_the_named_driver_fields() {
+    assert_eq!(DRIVER_POLICY_FIELDS, ["failure_policy", "solver_version"]);
 
     let src = include_str!("../src/job/record.rs");
     let start = src
@@ -235,11 +228,47 @@ fn the_align_key_is_params_plus_exactly_one_driver_policy() {
         .filter(|line| line.trim_start().starts_with("pub "))
         .count();
     assert_eq!(
-        pub_fields, 3,
-        "AlignIdentity must carry exactly 3 `pub` fields (algorithm, params, \
-         failure_policy) -- a field added without updating this test or \
-         DRIVER_POLICY_FIELDS silently widens the cache key:\n{block}"
+        pub_fields, 4,
+        "AlignIdentity must carry exactly 4 `pub` fields (algorithm, params, \
+         failure_policy, solver_version) -- a field added without updating this \
+         test or DRIVER_POLICY_FIELDS silently widens the cache key:\n{block}"
     );
+}
+
+#[test]
+fn the_key_bytes_carry_every_identity_field() {
+    let key = StageKey::align(
+        &sample_fingerprint(2),
+        &sample_identity("ecc", FailurePolicy::Strict),
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&key.canonical_bytes()).expect("canonical bytes are JSON");
+    for field in ["algorithm", "params", "failure_policy", "solver_version"] {
+        assert!(
+            json.get(field).is_some(),
+            "the canonical key bytes must carry `{field}`: {json}"
+        );
+    }
+    assert_eq!(json["solver_version"], ALIGN_SOLVER_VERSION);
+}
+
+#[test]
+fn a_solver_revision_change_is_a_miss() {
+    let fingerprint = sample_fingerprint(3);
+    let identity_a = sample_identity("ecc", FailurePolicy::Strict);
+    let mut identity_b = identity_a.clone();
+    identity_b.solver_version += 1;
+    let key_a = StageKey::align(&fingerprint, &identity_a);
+    let key_b = StageKey::align(&fingerprint, &identity_b);
+    assert_ne!(key_a.digest(), key_b.digest());
+
+    let scratch = tmp_dir("solver-revision");
+    let cache = StageCache::open(scratch.path()).unwrap();
+    cache
+        .put_alignment(&key_a, &[], &sample_alignment(3))
+        .unwrap();
+    assert!(cache.get_alignment(&key_a).is_some());
+    assert!(cache.get_alignment(&key_b).is_none());
 }
 
 #[test]

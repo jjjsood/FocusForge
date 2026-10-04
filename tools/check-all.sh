@@ -88,6 +88,7 @@ run_gate "fixture manifest" tools/check-fixtures.sh
 run_gate "fixture manifest selftest" tools/check-fixtures-selftest.sh
 run_gate "lock directory selftest" tools/with-lock-selftest.sh
 run_gate "tiff-diff selftest" python3 tools/tiff-diff.py --selftest
+run_gate "image-metrics selftest" python3 tools/image-metrics.py --selftest
 run_gate "rawtiff selftest" python3 tools/lib/rawtiff.py --selftest
 
 if [ "$STATIC_ONLY" -eq 0 ]; then

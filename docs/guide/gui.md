@@ -38,11 +38,9 @@ between two tabs of its own:
   a frame that would replace one already in the stack asks before doing so.
   The panel dims while its own tab's fuse is running, the same as
   **Settings**.
-- **Settings** lists the alignment and fusion algorithms and the parameters
-  each one declares, generated from the same parameter schema
-  `focusforge-cli algorithms` prints — choosing a different algorithm or
-  editing a value here changes what the next fuse on this tab runs with, and
-  a value outside its declared range is flagged before the run starts.
+- **Settings** holds every setting of the next fuse on this tab, in four
+  sections; see [Settings](#settings) below. A value outside its declared
+  range is flagged before the run starts.
 
 Use the icon at the top right of either image to move that pane into a second
 window. The remaining image fills the main canvas. Both images share the same
@@ -68,6 +66,37 @@ If the graphics device the window is using disappears (a driver reset, a
 GPU unplugged), the canvas stops updating and the window closes itself a
 moment later rather than hanging; see
 [`guide/diagnostics.md`](diagnostics.md) for where that is logged.
+
+## Settings
+
+The **Settings** tab is generated from the same parameter schema
+`focusforge-cli algorithms` prints. It has four sections, top to bottom:
+
+- **PREPARE** — **Equalize brightness** (on by default) and **Max brightness
+  gain** (1.01 to 2.0, default 1.25). Every frame gets one gain, matching the
+  reference frame's mid-tone brightness, bounded by the max gain.
+- **FUSE** — the fusion method and the parameters it declares. The picker
+  lists every method: **Details** (the default), **Soft transitions** and
+  **Focus map**. Each method remembers its own settings while the tab is open.
+- **ALIGN** — an **Enabled** switch, then the alignment algorithm and its
+  parameters. Switched off, the section dims and the next fuse uses the
+  frames as read.
+- **FINISH** — **Auto-crop**, which trims the result to the area every
+  aligned frame covers.
+
+Rarely changed parameters sit behind a **More...** strip at the foot of a
+section; click it to open the strip and click again to collapse it. Choosing a
+different method or editing a value changes what the next fuse on this tab
+runs with.
+
+A fuse does not stop at a frame that fails to register: the run finishes with
+that frame unaligned and offers **Keep** or discard. After **Keep**, an info
+toast reads `N frames unaligned` (`1 frame unaligned`) when any frame fell
+back to identity. The same toast carries the run's other notices, such as a
+frame whose brightness gain was held at the bound. A re-fuse that changes only
+fusion settings reuses the stored alignment. See
+[`guide/alignment.md`](alignment.md) and
+[`guide/stacking.md`](stacking.md#brightness-equalization).
 
 ## Saving a project
 

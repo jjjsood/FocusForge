@@ -461,6 +461,28 @@ fn crash_notice_placement_and_absence() {
     );
 }
 
+/// With a link, the toast's link row (its touch area and its text) stays
+/// inside the toast's own rectangle, whatever the message length.
+#[test]
+fn toast_link_row_stays_inside_the_toast() {
+    let app = app_at(1440, 900);
+    app.set_crash_notice_visible(true);
+    for message in [
+        "1 crash found",
+        "12 crashes found while the previous session was running in the background",
+    ] {
+        app.set_crash_notice_title(message.into());
+        let (tx, ty, tw, th) = rect(&app, "AppWindow::crash-notice");
+        for id in ["FFToast::link-area", "FFToast::link-text"] {
+            let (x, y, w, h) = rect(&app, id);
+            assert!(
+                x >= tx - EPS && y >= ty - EPS && x + w <= tx + tw + EPS && y + h <= ty + th + EPS,
+                "{id} for {message:?}: ({x}, {y}, {w}, {h}) must lie inside the toast ({tx}, {ty}, {tw}, {th})"
+            );
+        }
+    }
+}
+
 /// The failure toast paints over the gallery's gutter while the Projects
 /// overview is open, at the pane gutter otherwise, and (closed) never blocks
 /// a click on the card underneath it.
@@ -965,10 +987,10 @@ fn bottom_bar_progress() {
     assert_rect(
         &app,
         "FFBottomBar::progress-bar",
-        (250.0, 876.0, 642.0, 4.0),
+        (250.0, 876.0, 562.0, 4.0),
     );
     let (eta_x, eta_y, _, _) = rect(&app, "FFBottomBar::eta-text");
-    assert_eq!((eta_x, eta_y), (908.0, 856.0));
+    assert_eq!((eta_x, eta_y), (828.0, 856.0));
 
     let app_min = app_at(1200, 760);
     app_min.set_project_loaded(true);
@@ -982,10 +1004,36 @@ fn bottom_bar_progress() {
     assert_rect(
         &app_min,
         "FFBottomBar::progress-bar",
-        (250.0, 736.0, 402.0, 4.0),
+        (250.0, 736.0, 322.0, 4.0),
     );
     let (eta_x, eta_y, _, _) = rect(&app_min, "FFBottomBar::eta-text");
-    assert_eq!((eta_x, eta_y), (668.0, 716.0));
+    assert_eq!((eta_x, eta_y), (588.0, 716.0));
+}
+
+/// The ETA readout never reaches the overlay caption to its right, at the
+/// minimum width and wider, even for an hours-long estimate.
+#[test]
+fn bottom_bar_eta_clears_the_overlay_caption() {
+    for width in [1200, 1280, 1440] {
+        let app = app_at(width, 900);
+        app.set_project_loaded(true);
+        app.set_bar_fraction(0.5);
+        app.set_eta_text("ETA 12:34:56".into());
+
+        let (eta_x, _, eta_w, _) = rect(&app, "FFBottomBar::eta-text");
+        let (caption_x, _, _, _) = rect(&app, "FFBottomBar::overlay-caption");
+        assert!(
+            eta_x + eta_w <= caption_x,
+            "{width}px wide: ETA spans {eta_x}..{}, overlay caption starts at {caption_x}",
+            eta_x + eta_w
+        );
+        let (bar_x, _, bar_w, _) = rect(&app, "FFBottomBar::progress-bar");
+        assert!(
+            bar_x + bar_w <= eta_x,
+            "{width}px wide: track ends at {}, ETA starts at {eta_x}",
+            bar_x + bar_w
+        );
+    }
 }
 
 /// The loading indicator's show threshold: still hidden 100ms short of the

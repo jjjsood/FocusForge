@@ -47,7 +47,10 @@ use rayon::prelude::*;
 
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, AlignStatus, TileReader};
 use crate::align::Transform;
-use crate::align::ecc_algorithm::{retained_template_bytes, solve_scratch_bytes};
+use crate::align::ecc_algorithm::{
+    retained_template_bytes, seed_scratch_bytes, solve_scratch_bytes,
+};
+use crate::gpu::{AlignBackend, EccMomentSession, EccSessionRequest};
 use crate::job::{ControlState, JobControl};
 use crate::params::{ParamValue, ParamValues, StackContext};
 use crate::tile::HostBudget;
@@ -166,6 +169,9 @@ pub struct AlignDriverOptions<'a> {
     /// **on the thread that called [`align_stack_with`]** -- never from a
     /// pool worker.
     pub on_pause: Option<&'a (dyn Fn(&JobControl) + Sync)>,
+    /// An accelerator the registration may offer its large solves to; `None`
+    /// solves everything on the CPU.
+    pub align_backend: Option<&'a dyn AlignBackend>,
 }
 
 impl Default for AlignDriverOptions<'_> {
@@ -175,52 +181,72 @@ impl Default for AlignDriverOptions<'_> {
             frames_done: None,
             control: None,
             on_pause: None,
+            align_backend: None,
         }
     }
 }
 
 /// The bytes an anchor run holds live once, however many workers there are:
-/// the reference pyramid and the reference templates the solver retains for
-/// every level.
+/// the reference's coarse pyramid, the reference templates the solver retains
+/// for every level, the off-centre patch templates and the reference's feature
+/// set, detected at most once per run.
 ///
 /// ```text
 /// plane                   = width * height * 4   // f32 luma
-/// pyramid                 = plane * 4 / 3        // level 0 + levels 1..N, ratio 1/4 each
-/// bytes_shared_reference  = pyramid + retained_template_bytes(width, height)
+/// coarse                  = plane / 3            // levels 1..N, ratio 1/4 each
+/// bytes_shared_reference  = coarse + retained_template_bytes(width, height)
 /// ```
 ///
-/// The `4/3` is the infinite geometric sum `1 + 1/4 + 1/16 + ...`, so the
-/// pyramid figure is an upper bound independent of pyramid depth. At
-/// 8192x5464x3 the pyramid is ~238.7 MB and the templates ~161.4 MB, ~400.1 MB
-/// together; at the 512x512x3 fixture ~10.0 MB. The templates are priced in
-/// rotation-scale mode; a translation run retains less.
+/// The `1/3` is the infinite geometric sum `1/4 + 1/16 + ...`, so the
+/// pyramid figure is an upper bound independent of pyramid depth; level 0 is
+/// never resident. At 8192x5464x3 the coarse pyramid is ~59.7 MB, the level
+/// templates ~161.4 MB, the patch templates ~33.0 MB and the feature set
+/// 0.14 MB, ~254.3 MB together; at the 512x512x3 fixture ~15.3 MB. The
+/// templates are priced in rotation-scale mode; a translation run retains
+/// less.
 pub fn bytes_shared_reference(stack: StackContext) -> u64 {
     let plane = stack.width as u64 * stack.height as u64 * 4;
-    plane * 4 / 3 + retained_template_bytes(stack.width, stack.height)
+    plane / 3 + retained_template_bytes(stack.width, stack.height)
 }
 
 /// The bytes one anchor-mode registration holds live **on top of** the
 /// shared term ([`bytes_shared_reference`]) -- the sibling of
-/// `crate::tile::scheduler::bytes_per_tile_set`, `pub` because the memory
-/// test sizes its budgets from it.
+/// the scheduler's per-tile accounting, `pub` because the memory test sizes
+/// its budgets from it.
 ///
 /// ```text
 /// plane      = width * height * 4                      // f32 luma
-/// pyramid    = plane * 4 / 3                           // the frame's own pyramid
-/// band       = width * band_rows * spp * 2             // streamed input rows
-/// scratch    = solve_scratch_bytes(width, height)      // per-solve vectors
-/// bytes_per_registration = pyramid + max(band, scratch)
+/// coarse     = plane / 3                               // the frame's own levels 1..N
+/// rows       = band_rows + 5                           // input rows of one band, with its halo
+/// stream     = width * rows * (2 * spp + 7)            // u16 band, f32 luma band, reduce passes
+/// solve      = solve_scratch_bytes(width, height, spp) // per-solve vectors and windows
+/// seed       = seed_scratch_bytes(width, height, spp)  // detector scale space, frame features
+/// bytes_per_registration = coarse + max(stream, solve, seed)
 /// ```
 ///
-/// `band_rows` is `DEFAULT_TILE_SIZE`, the band height
-/// `PyramidalEcc::build_pyramid` streams with. The luma plane is moved into
-/// the pyramid rather than copied, and the band is dropped before the solve
-/// allocates its scratch, so the two never coexist. At 8192x5464x3 this is
-/// ~263.9 MB; at the 512x512x3 fixture ~4.9 MB.
+/// `band_rows` is `DEFAULT_TILE_SIZE`, the input band height
+/// `PyramidalEcc::build_pyramid` streams with. The streaming buffers are
+/// dropped before the solve allocates its own, so the two never coexist, and
+/// the escalation runs after the solve's buffers are gone. At 8192x5464x3 this
+/// is ~114.7 MB (the detector searches level 4, 512x342, for 33.8 MB); at the
+/// 512x512x3 fixture ~53.4 MB, nearly all of it the detector's scale space on
+/// the whole frame.
 pub fn bytes_per_registration(stack: StackContext, band_rows: u32) -> u64 {
     let plane = stack.width as u64 * stack.height as u64 * 4;
-    let band = stack.width as u64 * band_rows as u64 * stack.samples_per_pixel as u64 * 2;
-    plane * 4 / 3 + band.max(solve_scratch_bytes(stack.width, stack.height))
+    let rows = band_rows as u64 + 5;
+    let stream = stack.width as u64 * rows * (2 * stack.samples_per_pixel as u64 + 7);
+    plane / 3
+        + stream
+            .max(solve_scratch_bytes(
+                stack.width,
+                stack.height,
+                stack.samples_per_pixel,
+            ))
+            .max(seed_scratch_bytes(
+                stack.width,
+                stack.height,
+                stack.samples_per_pixel,
+            ))
 }
 
 /// The pure arithmetic behind the anchor arm's worker count: mirrors
@@ -268,6 +294,12 @@ pub struct AlignRun {
     /// `worker_limit` registrations. An explicit budget below one
     /// registration still runs one worker, so this can exceed the budget.
     pub accounted_bytes: u64,
+    /// Whether the accelerator opened at least one session and the result is
+    /// its run's, not a CPU rerun's.
+    pub backend_used: bool,
+    /// Why the whole stage reran on the CPU after the accelerator was lost;
+    /// `None` when it did not.
+    pub rerun_reason: Option<String>,
 }
 
 fn reference_policy_from_cfg(cfg: &ParamValues) -> ReferencePolicy {
@@ -382,7 +414,8 @@ fn run_chain_leg(
     let mut prefix = Transform::identity();
     for i in indices {
         wait_at_boundary(options)?;
-        let ctx = AlignContext::new(stack, previous, reader);
+        let ctx =
+            AlignContext::new(stack, previous, reader).with_align_backend(options.align_backend);
         let outcome = algorithm.align_frame(&ctx, i, cfg)?;
         let diverged = matches!(outcome.status, AlignStatus::Diverged(_));
         let fallback = diverged && failure == FailurePolicy::IdentityFallback;
@@ -443,7 +476,96 @@ pub fn align_stack(
 ///
 /// Chain mode is **serial by construction** -- see the module docs -- and
 /// always reports `worker_limit: 1, peak_workers: 1`.
+///
+/// When `options.align_backend` loses its device or runs out of memory
+/// mid-run ([`AlgorithmError::BackendLost`]), every result computed so far is
+/// discarded and the whole stage reruns on the CPU, so one alignment never
+/// mixes backends; [`AlignRun::rerun_reason`] carries the loss.
 pub fn align_stack_with(
+    algorithm: &dyn AlignAlgorithm,
+    stack: StackContext,
+    reader: &dyn TileReader,
+    cfg: &ParamValues,
+    failure: FailurePolicy,
+    options: &AlignDriverOptions<'_>,
+) -> Result<AlignRun, AlgorithmError> {
+    let Some(backend) = options.align_backend else {
+        return align_stack_once(algorithm, stack, reader, cfg, failure, options);
+    };
+    let counting = CountingBackend {
+        inner: backend,
+        opened: AtomicUsize::new(0),
+    };
+    match align_stack_once(
+        algorithm,
+        stack,
+        reader,
+        cfg,
+        failure,
+        &rebound(options, Some(&counting)),
+    ) {
+        Ok(run) => Ok(AlignRun {
+            backend_used: counting.opened.load(Ordering::SeqCst) > 0,
+            ..run
+        }),
+        Err(lost @ AlgorithmError::BackendLost { .. }) => {
+            let reason = lost.to_string();
+            tracing::warn!(%reason, "rerunning the whole align stage on the CPU");
+            if let Some(done) = &options.frames_done {
+                done.store(0, Ordering::SeqCst);
+            }
+            align_stack_once(
+                algorithm,
+                stack,
+                reader,
+                cfg,
+                failure,
+                &rebound(options, None),
+            )
+            .map(|run| AlignRun {
+                rerun_reason: Some(reason),
+                ..run
+            })
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// `options` with its accelerator replaced by `backend`.
+fn rebound<'a>(
+    options: &AlignDriverOptions<'a>,
+    backend: Option<&'a dyn AlignBackend>,
+) -> AlignDriverOptions<'a> {
+    AlignDriverOptions {
+        budget: options.budget,
+        frames_done: options.frames_done.clone(),
+        control: options.control.clone(),
+        on_pause: options.on_pause,
+        align_backend: backend,
+    }
+}
+
+/// Delegates to an accelerator and counts the sessions it opens.
+struct CountingBackend<'a> {
+    inner: &'a dyn AlignBackend,
+    opened: AtomicUsize,
+}
+
+impl AlignBackend for CountingBackend<'_> {
+    fn open_ecc(
+        &self,
+        request: &EccSessionRequest<'_>,
+    ) -> Result<Option<Box<dyn EccMomentSession>>, AlgorithmError> {
+        let session = self.inner.open_ecc(request)?;
+        if session.is_some() {
+            self.opened.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(session)
+    }
+}
+
+/// One pass over the stack with `options.align_backend` as given.
+fn align_stack_once(
     algorithm: &dyn AlignAlgorithm,
     stack: StackContext,
     reader: &dyn TileReader,
@@ -469,7 +591,7 @@ pub fn align_stack_with(
             let registrations = stack.frame_count.saturating_sub(1);
             registration_bytes += reader.read_scratch_bytes(stack.width, DEFAULT_TILE_SIZE);
             let budget_bytes = options.budget.bytes();
-            if options.budget.refuses_below_one_tile_set()
+            if options.budget.refuses_below_one_tile()
                 && budget_bytes < shared_bytes + registration_bytes
             {
                 return Err(AlgorithmError::HostMemoryTooSmall {
@@ -493,7 +615,8 @@ pub fn align_stack_with(
             // same prepared reference pyramid from this single line. The
             // `Arc` binding lives in this stack frame and drops when this
             // function returns.
-            let ctx = AlignContext::new(stack, reference, reader);
+            let ctx = AlignContext::new(stack, reference, reader)
+                .with_align_backend(options.align_backend);
             let prepared = {
                 let _prepare = measurement_scope("align_prepare");
                 algorithm.prepare_run(&ctx, cfg)?
@@ -584,6 +707,16 @@ pub fn align_stack_with(
                                 .collect()
                         });
 
+                    // A device loss reaches concurrent workers in different
+                    // shapes; any frame that saw it as one makes the whole
+                    // batch rerunnable, whichever frame failed first.
+                    let mut outcomes = outcomes;
+                    if let Some(lost) = outcomes.iter().position(|outcome| {
+                        matches!(outcome, Some(Err(AlgorithmError::BackendLost { .. })))
+                    }) && let Some(Err(err)) = outcomes.swap_remove(lost)
+                    {
+                        return Err(err);
+                    }
                     let mut next_pending = Vec::new();
                     for (&i, outcome) in pending.iter().zip(outcomes) {
                         match outcome {
@@ -652,6 +785,8 @@ pub fn align_stack_with(
         worker_limit,
         peak_workers,
         accounted_bytes: shared_bytes + worker_limit as u64 * registration_bytes,
+        backend_used: false,
+        rerun_reason: None,
     })
 }
 
@@ -883,19 +1018,20 @@ mod tests {
     }
 
     #[test]
-    fn the_split_sums_to_664_mb_at_the_reference_scale() {
-        // Shared: the reference pyramid plus the retained templates.
-        // Per registration: the frame pyramid plus the larger of the band
-        // buffer and the solve scratch (equal to within 25 KB here).
+    fn the_split_sums_to_369_mb_at_the_reference_scale() {
+        // Shared: the reference's coarse pyramid, the retained level
+        // templates, the patch templates and the feature set. Per registration: the frame's
+        // coarse pyramid plus the streaming band, which outweighs the solve
+        // scratch and windows (54.9 MB).
         let stack = StackContext::new(61, 8192, 5464, 3);
         let shared = bytes_shared_reference(stack);
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
-        assert_eq!(shared, 238_725_802 + 161_361_640);
-        assert_eq!(per_registration, 238_725_802 + 8192 * 512 * 3 * 2);
-        let ratio = (shared + per_registration) as f64 / 664_000_000f64;
+        assert_eq!(shared, 59_681_450 + 161_361_640 + 33_030_144 + 2000 * 72);
+        assert_eq!(per_registration, 59_681_450 + 8192 * 517 * 13);
+        let ratio = (shared + per_registration) as f64 / 369_000_000f64;
         assert!(
             (ratio - 1.0).abs() < 0.01,
-            "shared + per registration = {} is not within 1% of 664 MB",
+            "shared + per registration = {} is not within 1% of 369 MB",
             shared + per_registration
         );
     }
@@ -904,7 +1040,7 @@ mod tests {
     fn worker_budget_at_the_reference_scale() {
         // Pinned with an explicit `available_parallelism` and registration
         // count, so this assertion never depends on the host: the library
-        // default budget yields 6 workers at the reference scale.
+        // default budget yields 16 workers at the reference scale.
         let stack = StackContext::new(61, 8192, 5464, 3);
         let shared = bytes_shared_reference(stack);
         let bytes = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
@@ -915,22 +1051,46 @@ mod tests {
             32,
             60,
         );
-        assert_eq!(workers, 6);
+        assert_eq!(workers, 16);
     }
 
     #[test]
     fn single_sample_stacks_are_priced_by_templates_and_pyramids() {
-        // At 6000x4000x1 the band is 6.1 MB against a 25.2 MB solve scratch,
-        // and the templates and pyramids carry the rest.
+        // At 6000x4000x1 the 1254x836 solve region costs 25.2 MB of scratch,
+        // on top of its window (14.3 MB) and a patch window (6.0 MB); the
+        // 9 B per pixel stream term is 28.0 MB.
         let stack = StackContext::new(20, 6000, 4000, 1);
         let shared = bytes_shared_reference(stack);
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
-        assert_eq!(shared, 128_000_000 + 141_772_400);
-        assert_eq!(per_registration, 128_000_000 + 25_160_256);
-        let band = 6000u64 * DEFAULT_TILE_SIZE as u64 * 2;
-        assert!(band * 4 < per_registration - 128_000_000);
+        let patches = 8 * 384 * 384 * 28;
+        assert_eq!(shared, 32_000_000 + 141_772_400 + patches + 2000 * 72);
+        let solve = 24 * 1254 * 836 + 1766 * 1348 * 6 + 772 * 772 * 6;
+        let stream = 6000 * (DEFAULT_TILE_SIZE as u64 + 5) * 9;
+        assert!(solve > stream);
+        assert_eq!(per_registration, 32_000_000 + solve);
+        assert!(shared < 128_000_000 + 141_772_400);
+        assert!(per_registration < 128_000_000 + 25_160_256);
         let workers = workers_for_budget(shared, per_registration, 2 << 30, 32, 19);
-        assert_eq!(workers, 12);
+        assert_eq!(workers, 19);
+    }
+
+    #[test]
+    fn full_colour_frames_are_priced_by_their_streaming_band() {
+        let stack = StackContext::new(61, 8192, 5464, 3);
+        let shared = bytes_shared_reference(stack);
+        let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
+        let plane = 8192u64 * 5464 * 4;
+        let patches = 8 * 384 * 384 * 28;
+        assert_eq!(shared, plane / 3 + 161_361_640 + patches + 2000 * 72);
+        let stream = 8192 * (DEFAULT_TILE_SIZE as u64 + 5) * 13;
+        let solve = 24 * 1253 * 836 + 1765 * 1348 * 10 + 772 * 772 * 10;
+        assert!(stream > solve);
+        assert_eq!(per_registration, plane / 3 + stream);
+        assert!(shared < 400_100_000, "shared {shared} B");
+        assert!(
+            per_registration < 263_900_000,
+            "per registration {per_registration} B"
+        );
     }
 
     #[test]
@@ -939,22 +1099,32 @@ mod tests {
         let height = 512u32;
         let spp = 3u32;
         let depth = crate::align::max_levels(width, height).min(4);
-        let base = crate::fuse::pyramid::Plane::from_f32(
-            &vec![0.0f32; (width * height) as usize],
-            width,
-            height,
-            1,
+        let samples = vec![0u16; (width * height * spp) as usize];
+        let pyramid = crate::align::AlignPyramid::stream(
+            (width, height, spp),
+            depth,
+            DEFAULT_TILE_SIZE / 2,
+            |rect, out| -> Result<(), ()> {
+                let row = (width * spp) as usize;
+                let start = rect.y as usize * row;
+                out.copy_from_slice(&samples[start..start + rect.height as usize * row]);
+                Ok(())
+            },
         )
-        .unwrap();
-        let pyramid = crate::align::AlignPyramid::from_luma(base, depth).unwrap();
-        let pyramid_bytes: u64 = (0..pyramid.level_count())
+        .unwrap_or_else(|_| panic!("streaming the pyramid"));
+        let pyramid_bytes: u64 = (1..=depth as usize)
             .map(|k| pyramid.level(k).data().len() as u64 * 4)
             .sum();
-        // The solve scratch: three vectors of 24 bytes per pixel over the
-        // 384 x 384 level-0 solve region.
-        let solve_scratch = 24 * 384 * 384u64;
-        let band = width as u64 * DEFAULT_TILE_SIZE as u64 * spp as u64 * 2;
-        let floor = pyramid_bytes + band.max(solve_scratch);
+        // The solve term: three vectors of 24 bytes per pixel over the
+        // 384 x 384 level-0 solve region, the frame window (the whole 512 px
+        // frame) and one 260 px patch window at 10 bytes per pixel.
+        let solve = 24 * 384 * 384u64 + 512 * 512 * 10 + 260 * 260 * 10;
+        let rows = DEFAULT_TILE_SIZE as u64 + 5;
+        let stream = width as u64 * rows * (2 * spp as u64 + 7);
+        // The escalation's detector runs on the whole frame: 192 bytes of
+        // scale space per pixel, the frame read in and 2000 features.
+        let seed = 512 * 512 * (192 + 10) + 2000 * 72;
+        let floor = pyramid_bytes + stream.max(solve).max(seed);
 
         let stack = StackContext::new(8, width, height, spp);
         let bpr = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
@@ -1485,5 +1655,78 @@ mod tests {
                 assert_eq!(chain_counter.load(Ordering::SeqCst), frame_count);
             }
         }
+    }
+
+    /// Fails frame 1 with a plain error and frame 2 with a backend loss while
+    /// an accelerator is attached, as two pooled workers do when one device
+    /// loss reaches them in different shapes; converges every frame without
+    /// one.
+    struct LossReachesTwoFramesAlign;
+
+    impl AlignAlgorithm for LossReachesTwoFramesAlign {
+        fn id(&self) -> &str {
+            "loss-reaches-two-frames"
+        }
+        fn display_name(&self) -> &str {
+            "Loss Reaches Two Frames"
+        }
+        fn params(&self) -> &[ParamDesc] {
+            &[]
+        }
+        fn align_frame(
+            &self,
+            ctx: &AlignContext<'_>,
+            frame: usize,
+            _cfg: &ParamValues,
+        ) -> Result<AlignOutcome, AlgorithmError> {
+            if ctx.align_backend().is_some() {
+                match frame {
+                    1 => {
+                        return Err(AlgorithmError::Failed {
+                            algorithm: "stub".to_string(),
+                            detail: "readback failed".to_string(),
+                        });
+                    }
+                    2 => {
+                        return Err(AlgorithmError::BackendLost {
+                            detail: "device lost".to_string(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(converged(Transform::identity()))
+        }
+    }
+
+    struct DecliningBackend;
+
+    impl AlignBackend for DecliningBackend {
+        fn open_ecc(
+            &self,
+            _request: &EccSessionRequest<'_>,
+        ) -> Result<Option<Box<dyn EccMomentSession>>, AlgorithmError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn a_backend_loss_in_a_pooled_batch_reruns_the_stage_whatever_frame_failed_first() {
+        let reader = NullReader;
+        let stack = StackContext::new(4, 8, 8, 1);
+        let run = align_stack_with(
+            &LossReachesTwoFramesAlign,
+            stack,
+            &reader,
+            &cfg_with("anchor", "first"),
+            FailurePolicy::Strict,
+            &AlignDriverOptions {
+                align_backend: Some(&DecliningBackend),
+                ..Default::default()
+            },
+        )
+        .expect("a loss anywhere in the batch reruns the stage on the CPU");
+        assert!(run.rerun_reason.is_some());
+        assert!(!run.backend_used);
     }
 }
