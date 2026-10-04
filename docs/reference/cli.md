@@ -240,13 +240,13 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 |---|---|
 | `-o, --output <DIR>` | directory to collect this run's projects into; omit to write each project beside its own frames |
 | `--algo <ALGO>` | registered stacking algorithm id (required; see `algorithms` below for the list) |
-| `--set <KEY=VALUE>` | set one algorithm parameter or one project setting (`auto-crop`, `equalize`, `equalize-max-gain`; see below), repeatable; a repeated key keeps the last value |
+| `--set <KEY=VALUE>` | set one algorithm parameter or one project setting (`align`, `auto-crop`, `equalize`, `equalize-max-gain`; see below), repeatable; a repeated key keeps the last value |
 | `--json` | emit the frozen JSON report instead of human-readable text |
 | `--groups <PATH>` | group the frames as this TOML file says instead of proposing a grouping |
 | `--write-groups <PATH>` | write the proposed grouping to this path in the format `--groups` reads, then carry on with the run |
 | `--only <ID>` | run only the named result(s), repeatable; every unselected group is skipped, its project left untouched |
-| `--no-align` | skip alignment: frame tiles are fused unwarped and the output stays full-frame |
-| `--no-crop` | skip the auto-crop: the output stays at the full frame extent even with alignment on |
+| `--no-align` | skip alignment: frame tiles are fused unwarped and the output stays full-frame. Alignment is on by default, matching the project's `align` value |
+| `--no-crop` | skip the auto-crop: the output stays at the full frame extent even with alignment on. The crop is on by default, matching the project's `auto-crop` value; with the crop on and no interior common to the aligned frames, `stack` stops and names this flag |
 | `--align-algo <ALGO>` | alignment algorithm id; optional, defaults to the sole registered alignment algorithm |
 | `--align-set <KEY=VALUE>` | set one alignment parameter, repeatable; separate from `--set`, which is the stacking algorithm's own |
 | `--resume` | resume a previously cancelled run of this same stack, found by fingerprint under `.scratch/resume/` |
@@ -267,6 +267,7 @@ preset's `[stack]` table accept the settings that belong to the whole run
 
 | key | kind | default | meaning |
 |---|---|---|---|
+| `align` | bool | `true` | register every frame onto the reference before fusing; `--no-align` or `align=false` fuses the frames as read |
 | `auto-crop` | bool | `true` | trim the result to the area every aligned frame covers; `--no-crop` or `auto-crop=false` keeps the full frame |
 | `equalize` | bool | `true` | brightness equalization: one gain per frame, the same on every channel, matching the reference frame's (the alignment's, otherwise the middle one) mid-tone brightness |
 | `equalize-max-gain` | float, 1.01 to 2.0 | `1.25` | the bound on the gain: with 1.25 a frame's gain stays between 0.8 and 1.25 |
@@ -522,12 +523,12 @@ Options:
 | `--preset <PATH>` | read `align-algo` and the `[align]` table from a TOML preset — see [`guide/batch-runs.md`](../guide/batch-runs.md#presets). A non-empty `[stack]` table or `algo` key in the same file is unused here and says so on stderr |
 | `--write-preset <PATH>` | write the preset that reproduces this run: `align-algo` plus the `[align]` values chosen |
 | `--status <PATH>` | append one NDJSON status record for this run to this path |
-| `--no-gpu` | force the CPU path even when a usable GPU adapter is present; absent when the binary was built `--no-default-features`. Meaningful only together with `--write-warped` — the ECC solver `align` reports on is CPU-only regardless |
+| `--max-host-memory <SIZE>` | ceiling on the host-memory budget the alignment workers are sized from; it only lowers the derived budget |
+| `--max-vram <SIZE>` | ceiling on the device-memory budget for the alignment's GPU levels and the `--write-warped` fuse backend; it only lowers the probed budget. Absent when built `--no-default-features` |
+| `--no-gpu` | force the CPU path: the alignment's large levels and the `--write-warped` fuse backend stay on the CPU. Absent when built `--no-default-features` |
 
 A frame whose registration diverges refuses the run, exit 1, naming every
-failed frame — this is the default, and it is not a flag; run
-`focusforge-cli align --help` for the full option list, including how to
-soften it.
+failed frame.
 
 ```
 $ focusforge-cli align path/to/frames --algo pyramidal-ecc
@@ -605,14 +606,26 @@ by construction) -- always numbers here, since every `align` run computes.
   "stages": { "setup": 0.021, "align": 8.401, "fuse": null, "warp_write": null, "finalize": 0.075 },
   "align_source": "computed",
   "align_workers": 2,
-  "peak_align_workers": 2
+  "peak_align_workers": 2,
+  "align_backend": "cpu"
 }
 ```
 
 `transform.m` is the raw 3x3 matrix (reference-to-frame); `scale`,
 `rotation_deg`, `tx`, `ty` are its decomposition, exact for both shipped
-modes. `status` is `"converged"`, `"hit-cap"` or `"diverged"`; only a
-diverged frame carries `reason`. `crop` is `null` when the frames' footprints
+modes. `status` is `"converged"`, `"hit-cap"`, `"stalled"` or `"diverged"`; only a
+diverged frame carries `reason`: `singular-hessian`, `lemma-one-region`,
+`non-invertible-increment`, `correlation-decreased`, `too-few-valid-samples`,
+`non-finite-update` or `validation-failed` (the fit converged but its
+transform leaves a large residual at patches away from the fit region).
+`stalled` means the iteration cap was reached with flat or oscillating steps
+and the best-correlation transform is kept; only `diverged` counts as a
+failure, so a `stalled` frame neither fails a strict run nor adds to
+`failure_count`. In the text report a diverged row
+reads `diverged(<Reason>)`. `align_backend` is `"cpu"`, or the GPU adapter's
+display name when at least one alignment level ran on it; a device lost
+mid-run reruns the whole alignment on the CPU and reports `"cpu"`. The same
+field is on `stack --json`, `null` unless the alignment was computed that run. `crop` is `null` when the frames' footprints
 do not intersect.
 
 ### `--write-warped`

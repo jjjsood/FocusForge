@@ -7,12 +7,13 @@ import { ShellGeometry } from "../geometry.slint";
 
 export component FFRowLabel inherits VerticalLayout {
     in property <string> label-text: "";
+    in property <bool> disabled: false;
     spacing: 0px;
 
     Text {
         text: root.label-text;
         height: ShellGeometry.param-label-height;
-        color: Theme.text-secondary;
+        color: root.disabled ? Theme.text-disabled : Theme.text-secondary;
         font-size: Theme.text-body.size;
         font-weight: Theme.text-body.weight;
         vertical-alignment: center;

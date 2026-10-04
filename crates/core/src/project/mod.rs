@@ -359,6 +359,23 @@ use crate::algorithm::StackAlgorithm;
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, validate};
 use crate::tile::Rect;
 
+/// The alignment switch: `align`. The settings panel's align section renders
+/// exactly this schema, ahead of the algorithm's own parameters.
+pub static ALIGN_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
+    vec![ParamDesc {
+        id: "align".to_string(),
+        label: "Enabled".to_string(),
+        help: "Registers every frame onto the reference before fusing; \
+               off fuses the frames as read."
+            .to_string(),
+        kind: ParamKind::Bool,
+        default: ParamValue::Bool(true),
+        advanced: false,
+        auto: None,
+        host_default: None,
+    }]
+});
+
 /// The project parameters that act after fusing: `auto-crop`. The settings
 /// panel's finish section renders exactly this schema.
 pub static FINISH_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
@@ -417,13 +434,14 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     ]
 });
 
-/// The project-level parameter schema, [`FINISH_PARAMS`] then
+/// The project-level parameter schema, [`ALIGN_PARAMS`], [`FINISH_PARAMS`] then
 /// [`PREPARE_PARAMS`]: values that describe how a project was prepared rather
 /// than any one algorithm's own settings. `focusforge-cli stack` reads it
 /// (`--no-crop`, `--set`) and the `algorithms` listing prints it.
 pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
-    FINISH_PARAMS
+    ALIGN_PARAMS
         .iter()
+        .chain(FINISH_PARAMS.iter())
         .chain(PREPARE_PARAMS.iter())
         .cloned()
         .collect()
@@ -438,7 +456,7 @@ pub fn params_for(method: &dyn StackAlgorithm) -> Vec<ParamDesc> {
     params_for_group(&PROJECT_PARAMS, method)
 }
 
-/// `group` ([`PREPARE_PARAMS`], [`FINISH_PARAMS`] or [`PROJECT_PARAMS`]) with
+/// `group` ([`ALIGN_PARAMS`], [`PREPARE_PARAMS`], [`FINISH_PARAMS`] or [`PROJECT_PARAMS`]) with
 /// the defaults `method` declares through [`StackAlgorithm::project_defaults`].
 /// The declarations are checked against the whole project schema, so one for a
 /// parameter outside `group` is still validated.
@@ -1005,9 +1023,18 @@ mod tests {
     }
 
     #[test]
-    fn project_params_hold_auto_crop_and_the_two_equalization_descriptors() {
+    fn project_params_hold_align_auto_crop_and_the_two_equalization_descriptors() {
         let ids: Vec<&str> = PROJECT_PARAMS.iter().map(|d| d.id.as_str()).collect();
-        assert_eq!(ids, vec!["auto-crop", "equalize", "equalize-max-gain"]);
+        assert_eq!(
+            ids,
+            vec!["align", "auto-crop", "equalize", "equalize-max-gain"]
+        );
+
+        let align = desc("align");
+        assert_eq!(align.label, "Enabled");
+        assert_eq!(align.kind, ParamKind::Bool);
+        assert_eq!(align.default, ParamValue::Bool(true));
+        assert!(!align.advanced);
 
         let crop = desc("auto-crop");
         assert_eq!(crop.label, "Auto-crop");
@@ -1099,22 +1126,23 @@ mod tests {
     }
 
     #[test]
-    fn prepare_and_finish_partition_the_project_params() {
+    fn align_prepare_and_finish_partition_the_project_params() {
+        assert_eq!(ids(&ALIGN_PARAMS), ["align"]);
         assert_eq!(ids(&PREPARE_PARAMS), ["equalize", "equalize-max-gain"]);
         assert_eq!(ids(&FINISH_PARAMS), ["auto-crop"]);
         assert_eq!(
             ids(&PROJECT_PARAMS),
-            ["auto-crop", "equalize", "equalize-max-gain"]
+            ["align", "auto-crop", "equalize", "equalize-max-gain"]
         );
         for d in PROJECT_PARAMS.iter() {
-            let groups = [&*PREPARE_PARAMS, &*FINISH_PARAMS]
+            let groups = [&*ALIGN_PARAMS, &*PREPARE_PARAMS, &*FINISH_PARAMS]
                 .into_iter()
                 .filter(|group| group.iter().any(|g| g.id == d.id))
                 .count();
             assert_eq!(groups, 1, "{} sits in exactly one group", d.id);
         }
         assert_eq!(
-            PREPARE_PARAMS.len() + FINISH_PARAMS.len(),
+            ALIGN_PARAMS.len() + PREPARE_PARAMS.len() + FINISH_PARAMS.len(),
             PROJECT_PARAMS.len()
         );
 

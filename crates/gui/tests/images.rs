@@ -331,6 +331,8 @@ fn selection_is_always_exactly_one() {
     // The post-run re-seed: a second fuse must land exactly one selected
     // row again, regardless of what was selected before it started.
     let mut controller = controller_with_frames("selection_always_one_run", 3);
+    // An algorithm that always converges keeps the fuse out of the test.
+    controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
     controller.select_frame(2);

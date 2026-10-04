@@ -438,9 +438,14 @@ fn every_stack_algorithm_shows_at_most_one_parameter_outside_advanced() {
 
 #[test]
 fn a_schema_with_two_non_advanced_params_fails_the_walk() {
-    let mut second = crate::project::PROJECT_PARAMS[0].clone();
+    let crop = crate::project::PROJECT_PARAMS
+        .iter()
+        .find(|d| d.id == "auto-crop")
+        .expect("auto-crop is a project parameter")
+        .clone();
+    let mut second = crop.clone();
     second.id = "second".to_string();
-    let schema = vec![crate::project::PROJECT_PARAMS[0].clone(), second];
+    let schema = vec![crop, second];
     let why = at_most_one_outside_advanced(&schema).expect_err("two shown parameters");
     assert!(why.contains("auto-crop") && why.contains("second"), "{why}");
 }
@@ -454,7 +459,7 @@ fn every_alignment_parameter_is_advanced() {
     }
     assert_eq!(
         outside_advanced(&crate::project::PROJECT_PARAMS),
-        vec!["auto-crop"]
+        vec!["align", "auto-crop"]
     );
 }
 
@@ -486,8 +491,8 @@ fn fusion_and_crop_help_is_one_plain_sentence() {
     }
     assert_eq!(
         described.len(),
-        3 + 1 + 2 + 2,
-        "the three project parameters plus the three schemas"
+        4 + 1 + 2 + 2,
+        "the four project parameters plus the three schemas"
     );
     for (owner, p) in described {
         let help = p.help.as_str();

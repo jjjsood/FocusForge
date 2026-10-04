@@ -343,6 +343,8 @@ fn clicking_a_card_switches_to_it() {
 #[test]
 fn card_picture_is_the_projects_composite() {
     let mut a = controller_with_frames("picture_a", 3);
+    // An algorithm that always converges keeps the alignment check out of the test.
+    a.set_align_algorithm("dummy-align");
     assert!(a.start_fuse());
     wait_for_settle(&mut a, Duration::from_secs(120));
     let picture_a = card_by_kind(&a.project_cards(), "open")
@@ -351,6 +353,8 @@ fn card_picture_is_the_projects_composite() {
         .expect("a fused project must carry a picture");
 
     let mut b = controller_with_frames("picture_b", 4);
+    // An algorithm that always converges keeps the alignment check out of the test.
+    b.set_align_algorithm("dummy-align");
     assert!(b.start_fuse());
     wait_for_settle(&mut b, Duration::from_secs(120));
     let picture_b = card_by_kind(&b.project_cards(), "open")
@@ -367,6 +371,8 @@ fn card_picture_is_the_projects_composite() {
 #[test]
 fn thumbnail_is_downsampled_once_and_cached() {
     let (mut controller, project_dir) = controller_with_frames_and_dir("cached_once", 3);
+    // An algorithm that always converges keeps the alignment check out of the test.
+    controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
 
@@ -412,6 +418,8 @@ fn an_unfused_card_shows_its_first_frame() {
 #[test]
 fn overlay_writes_nothing_to_the_project() {
     let (mut controller, project_dir) = controller_with_frames_and_dir("writes_nothing", 3);
+    // An algorithm that always converges keeps the alignment check out of the test.
+    controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
 

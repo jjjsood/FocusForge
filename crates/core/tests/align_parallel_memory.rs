@@ -20,15 +20,15 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use focusforge_core::algorithm::{AlignAlgorithm, AlignContext};
+use focusforge_core::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, TileReader};
 use focusforge_core::align::{
     AlignDriverOptions, FailurePolicy, PyramidalEcc, align_stack_with, bytes_per_registration,
     bytes_shared_reference,
 };
 use focusforge_core::io::TiffStack;
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
-use focusforge_core::tile::HostBudget;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
+use focusforge_core::tile::{HostBudget, Rect};
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
@@ -278,5 +278,76 @@ fn serial_peak_stays_within_shared_plus_one_registration() {
                 );
             }
         }
+    }
+}
+
+/// In-memory single-sample frames, so a frame large enough that the level-0
+/// window sits strictly inside it needs no fixture.
+struct SyntheticFrames {
+    width: u32,
+    frames: Vec<Vec<u16>>,
+}
+
+impl TileReader for SyntheticFrames {
+    fn read_tile_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        for row in 0..rect.height as usize {
+            let src = (rect.y as usize + row) * self.width as usize + rect.x as usize;
+            out[row * rect.width as usize..][..rect.width as usize]
+                .copy_from_slice(&self.frames[frame][src..src + rect.width as usize]);
+        }
+        Ok(())
+    }
+}
+
+/// The same serial bound on a 1031x777 frame, where the level-0 window
+/// (solve region plus margin) lies strictly inside the frame.
+#[test]
+fn serial_peak_stays_within_the_figure_when_the_level0_window_is_inside_the_frame() {
+    let _guard = SERIAL.lock().unwrap();
+    let (width, height) = (1031u32, 777u32);
+    let texture = |x: u32, y: u32, shift: u32| -> u16 {
+        let (x, y) = (x + shift, y);
+        ((x * 7 + y * 13) % 251 * 200 + (x / 9 + y / 5) % 17 * 1000) as u16
+    };
+    let frames: Vec<Vec<u16>> = (0..3u32)
+        .map(|i| {
+            (0..height)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .map(|(x, y)| texture(x, y, i * 2))
+                .collect()
+        })
+        .collect();
+    let reader = SyntheticFrames { width, frames };
+    let ctx = StackContext::new(3, width, height, 1);
+    let accounted = bytes_shared_reference(ctx) + bytes_per_registration(ctx, DEFAULT_TILE_SIZE);
+    for mode in ["translation", "rotation-scale"] {
+        let mut cfg = config(&ctx, mode, "anchor");
+        cfg.insert("max-iterations".to_string(), ParamValue::Int(6));
+        let options = AlignDriverOptions {
+            budget: HostBudget::explicit(1),
+            ..Default::default()
+        };
+        let before = LIVE.load(Ordering::SeqCst);
+        reset_peak();
+        let run = align_stack_with(
+            &PyramidalEcc,
+            ctx,
+            &reader,
+            &cfg,
+            FailurePolicy::IdentityFallback,
+            &options,
+        )
+        .expect("the run completes");
+        let peak = (peak_since_reset() - before) as u64;
+        assert_eq!(run.worker_limit, 1);
+        assert!(
+            peak <= accounted,
+            "{mode}: peak live heap {peak} B exceeds shared + one registration {accounted} B"
+        );
     }
 }

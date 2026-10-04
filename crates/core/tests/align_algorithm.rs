@@ -412,7 +412,12 @@ fn coarse_to_fine_beats_single_level() {
     let driven = PyramidalEcc
         .align_frame(&ctx, 1, &cfg_with("translation", 3, 100))
         .expect("valid solver inputs");
-    assert_eq!(driven.status, AlignStatus::Converged, "outcome: {driven:?}");
+    // A level that reaches the cap makes the frame `HitCap`; only a divergence
+    // would mean the pyramid failed to recover the shift.
+    assert!(
+        !matches!(driven.status, AlignStatus::Diverged(_)),
+        "outcome: {driven:?}"
+    );
     let error = corner_error(&driven.transform, &w_true, default_region());
     eprintln!("coarse_to_fine_beats_single_level: driven (depth=3) corner error = {error} px");
     assert!(
@@ -740,11 +745,31 @@ fn each_divergence_reports_its_pyramid_level() {
         let last = levels
             .last()
             .expect("at least the coarsest level is always solved");
-        assert_eq!(
-            AlignStatus::from(last.result.status),
-            outcome.status,
-            "frame {frame}: the reported status must be the last solved level's own status"
-        );
+        if outcome.status == AlignStatus::Diverged(DivergenceReason::ValidationFailed) {
+            assert!(
+                matches!(
+                    AlignStatus::from(last.result.status),
+                    AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
+                ),
+                "frame {frame}: only a solve that finished can fail the off-centre check: {levels:?}"
+            );
+        } else {
+            let severity = |s: AlignStatus| match s {
+                AlignStatus::Converged => 0,
+                AlignStatus::HitCap => 1,
+                AlignStatus::Stalled => 2,
+                _ => 3,
+            };
+            let worst = levels
+                .iter()
+                .map(|rec| AlignStatus::from(rec.result.status))
+                .max_by_key(|&s| severity(s))
+                .expect("at least the coarsest level is always solved");
+            assert_eq!(
+                worst, outcome.status,
+                "frame {frame}: the reported status must be the worst level status"
+            );
+        }
         if matches!(last.result.status, EccStatus::Diverged(_)) {
             assert!(
                 levels.iter().all(|rec| rec.level >= last.level),
@@ -755,11 +780,12 @@ fn each_divergence_reports_its_pyramid_level() {
     }
 }
 
-/// The complete eight-frame fixture set at fully resolved defaults under
-/// strict policy. Frames 00, 01 and 07 diverge on this 512x512 crop for
-/// reasons written down beside [`each_divergence_reports_its_pyramid_level`]
-/// -- content the crop does not carry enough of, not a solver defect -- and
-/// every other frame converges.
+/// The complete eight-frame fixture set at fully resolved defaults under the
+/// lenient policy, so every frame is checked. Frames 00, 01 and 07 diverge on
+/// this 512x512 crop for reasons written down beside
+/// [`each_divergence_reports_its_pyramid_level`] -- content the crop does not
+/// carry enough of, not a solver defect. Frame 06 solves with an 11% zoom
+/// the off-centre check rejects; every other frame converges.
 #[test]
 fn the_whole_checked_in_stack_aligns() {
     let (stack, stack_ctx, cfg) = fixture_with_defaults();
@@ -769,7 +795,7 @@ fn the_whole_checked_in_stack_aligns() {
         stack_ctx,
         &stack,
         &cfg,
-        FailurePolicy::Strict,
+        FailurePolicy::IdentityFallback,
     )
     .expect("the run completes even with diverging frames");
 
@@ -783,17 +809,18 @@ fn the_whole_checked_in_stack_aligns() {
         AlignStatus::Converged,
         AlignStatus::Converged,
         AlignStatus::Converged,
-        AlignStatus::Converged,
+        AlignStatus::Diverged(DivergenceReason::ValidationFailed),
         AlignStatus::Diverged(DivergenceReason::CorrelationDecreased),
     ];
 
     for (i, frame) in result.frames.iter().enumerate() {
         assert_eq!(frame.frame, i, "frames must be reported in stack order");
-        assert!(
-            !frame.fallback,
-            "strict policy never substitutes a transform: frame {i}: {frame:?}"
-        );
         assert_eq!(frame.status, expected[i], "frame {i} status: {frame:?}");
+        assert_eq!(
+            frame.fallback,
+            matches!(expected[i], AlignStatus::Diverged(_)),
+            "exactly the diverged frames fall back to identity: frame {i}: {frame:?}"
+        );
     }
 
     let reference_frame = &result.frames[3];
@@ -802,8 +829,8 @@ fn the_whole_checked_in_stack_aligns() {
 
     assert_eq!(
         result.failure_count(),
-        3,
-        "exactly the three documented divergences: {:?}",
+        4,
+        "exactly the four documented divergences: {:?}",
         result.frames
     );
 }
@@ -832,5 +859,37 @@ fn pyramid_depth_beyond_the_resolution_is_a_named_error() {
             );
         }
         other => panic!("expected AlgorithmError::Failed, got {other:?}"),
+    }
+}
+
+/// Texture only in a frame ring, a flat grey where the solve region sits: the
+/// level-0 solve has nothing to register on and reports it, in both modes. The
+/// off-centre check never recovers the pair, because it never re-solves.
+#[test]
+fn an_empty_centre_reports_a_singular_hessian_at_level_0() {
+    let (width, height) = (256u32, 256u32);
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut frame = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let ring = x < 24 || x >= width - 24 || y < 24 || y >= height - 24;
+            frame.push(if ring { (state >> 48) as u16 } else { 30_000 });
+        }
+    }
+    let reader = two_frame_reader(width, height, 1, frame.clone(), frame);
+    let ctx = AlignContext::new(StackContext::new(2, width, height, 1), 0, &reader);
+
+    for mode in ["translation", "rotation-scale"] {
+        let outcome = PyramidalEcc
+            .align_frame(&ctx, 1, &cfg_with(mode, 0, 20))
+            .expect("a flat centre is an outcome, not an error");
+        assert_eq!(
+            outcome.status,
+            AlignStatus::Diverged(DivergenceReason::SingularHessian),
+            "{mode}"
+        );
     }
 }

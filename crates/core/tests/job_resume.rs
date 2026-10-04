@@ -18,13 +18,15 @@ use std::time::Duration;
 
 use focusforge_core::algorithm::AlgorithmError;
 use focusforge_core::algorithm::AlignStatus;
-use focusforge_core::align::{FrameAlignment, ReferencePolicy, StackAlignment, Transform};
+use focusforge_core::align::{
+    FailurePolicy, FrameAlignment, ReferencePolicy, StackAlignment, Transform,
+};
 use focusforge_core::equalize::{Equalization, UNIT_GAIN};
 use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
 use focusforge_core::io::{FrameReader, TiffStack};
 use focusforge_core::job::fingerprint::{FrameFingerprint, StackFingerprint};
 use focusforge_core::job::record::{JOB_RECORD_FORMAT, JobRecord};
-use focusforge_core::job::{Job, JobOutcome, Resumable, ResumeStore};
+use focusforge_core::job::{AlignIdentity, Job, JobOutcome, Resumable, ResumeStore};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::registry;
 use focusforge_core::tile::{
@@ -817,6 +819,61 @@ fn unknown_ledger_format_starts_over() {
     match store.find(&record).unwrap() {
         Resumable::None => {}
         other => panic!("expected Resumable::None for an unrecognised format, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn a_record_from_another_solver_revision_is_not_resumable() {
+    let stack = open_stack();
+    let (width, height) = stack.dimensions();
+    let stack_ctx = StackContext::new(stack.len(), width, height, 3);
+    let values = resolved_laplacian_values(stack_ctx);
+
+    let scratch = scratch_base("solver-revision");
+    let composite_path = scratch.join("out.tif");
+    std::fs::create_dir_all(&scratch).unwrap();
+    std::fs::write(&composite_path, b"partial").unwrap();
+
+    let mut record = job_record(&stack, &values, &composite_path, None);
+    record.align = Some(AlignIdentity::new(
+        "pyramidal-ecc",
+        ParamValues::new(),
+        FailurePolicy::Strict,
+    ));
+    let store = ResumeStore::open(&scratch).unwrap();
+    let _ledger = store.begin(&record).unwrap();
+    assert!(
+        matches!(store.find(&record).unwrap(), Resumable::Ledger(_)),
+        "the unchanged record resumes"
+    );
+
+    // A different revision is a mismatch on the align identity.
+    let mut other = record.clone();
+    other.align.as_mut().unwrap().solver_version += 1;
+    match store.find(&other).unwrap() {
+        Resumable::Mismatch(mismatch) => assert_eq!(mismatch.field, "align"),
+        other => panic!("expected Resumable::Mismatch, got {other:?}"),
+    }
+
+    // A record written without the field does not parse and is skipped.
+    let job_json = walk(&scratch.join("resume"))
+        .into_iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "job.json"))
+        .expect("begin writes a job.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&job_json).unwrap()).unwrap();
+    json["align"]
+        .as_object_mut()
+        .expect("the record carries an align identity")
+        .remove("solver_version")
+        .expect("the identity carries solver_version");
+    std::fs::write(&job_json, serde_json::to_string(&json).unwrap()).unwrap();
+    match store.find(&record).unwrap() {
+        Resumable::None => {}
+        other => {
+            panic!("expected Resumable::None for a record without solver_version, got {other:?}")
+        }
     }
     let _ = std::fs::remove_dir_all(&scratch);
 }

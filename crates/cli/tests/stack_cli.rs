@@ -947,6 +947,32 @@ fn stage_timings_mark_a_skipped_align_as_not_entered() {
     );
 }
 
+/// The `align` project value switches alignment off exactly like `--no-align`.
+#[test]
+fn set_align_false_skips_the_align_stage() {
+    let cwd = tmp_dir("set_align_false");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            mantis_512_dir().to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--set",
+            "align=false",
+            "--no-crop",
+            "--json",
+        ],
+    );
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    assert_eq!(report["align_source"], "skipped", "{report}");
+}
+
 /// `align_workers`/`peak_align_workers` are numbers only when
 /// `align_source == "computed"` -- a cached, resumed or `--no-align` run
 /// never earns a worker count it did not spend.

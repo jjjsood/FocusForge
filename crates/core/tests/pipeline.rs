@@ -80,6 +80,7 @@ fn base_request(label: &str, frames: Vec<PathBuf>, explicit: ParamValues) -> Fus
         tile_size: Some(448),
         max_host_memory: None,
         backend: None,
+        align_backend: None,
         resume: false,
         cache: true,
         poll: Duration::from_millis(5),
@@ -657,6 +658,43 @@ fn align_progress_counts_every_frame() {
     assert_eq!(progress.align_total, 0);
 }
 
+/// Frame 06 of the fixture solves with an 11% zoom against frame 03 that the
+/// off-centre check rejects. The strict default refuses the run and names that
+/// frame with the check's own wording; frames 03..=06 leave it the only failure.
+#[test]
+fn the_strict_default_refuses_a_frame_the_off_centre_check_rejects() {
+    let mut explicit = ParamValues::new();
+    explicit.insert(
+        "reference-frame".to_string(),
+        ParamValue::Enum("first".to_string()),
+    );
+    let mut request = base_request(
+        "strict_off_centre",
+        mantis_frames(8)[3..=6].to_vec(),
+        ParamValues::new(),
+    );
+    request.align = Some(AlignRequest {
+        algorithm: registry::find_align("pyramidal-ecc").expect("pyramidal-ecc registered"),
+        explicit,
+        lax: false,
+    });
+    request.cache = false;
+
+    let result = focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None);
+    let Err(PipelineError::Align(detail)) = result else {
+        panic!("the strict default must refuse the rejected frame");
+    };
+    assert!(detail.contains("06.tif"), "{detail}");
+    assert!(
+        detail.contains("the alignment does not hold away from the centre of the frame"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("frames total"),
+        "only one frame fails: {detail}"
+    );
+}
+
 #[test]
 fn a_held_run_seals_to_the_same_project() {
     let frames = mantis_frames(3);
@@ -884,6 +922,79 @@ fn no_align_registration_is_identity_transforms_and_the_kernel_inset_crop() {
             .iter()
             .all(|t| *t == Transform::identity()),
         "a --no-align run must record identity for every frame"
+    );
+}
+
+/// Registers every frame it is asked about a full frame width to the right,
+/// so no pixel of the shifted frame overlaps the reference.
+struct ShiftPastTheFrame;
+
+impl AlignAlgorithm for ShiftPastTheFrame {
+    fn id(&self) -> &str {
+        "shift-past-the-frame"
+    }
+    fn display_name(&self) -> &str {
+        "Shift Past The Frame"
+    }
+    fn params(&self) -> &[ParamDesc] {
+        registry::find_align("pyramidal-ecc")
+            .expect("pyramidal-ecc must be registered")
+            .params()
+    }
+    fn align_frame(
+        &self,
+        ctx: &AlignContext<'_>,
+        _frame: usize,
+        _cfg: &ParamValues,
+    ) -> Result<AlignOutcome, AlgorithmError> {
+        let width = f64::from(ctx.stack().width);
+        Ok(AlignOutcome {
+            transform: Transform::similarity(1.0, 0.0, width + 8.0, 0.0),
+            status: AlignStatus::Converged,
+            iterations: 1,
+            residual: 1.0,
+        })
+    }
+}
+
+#[test]
+fn an_empty_overlap_with_crop_names_the_remedy() {
+    static SHIFT: ShiftPastTheFrame = ShiftPastTheFrame;
+    let align = || AlignRequest {
+        algorithm: &SHIFT,
+        explicit: ParamValues::new(),
+        lax: false,
+    };
+
+    let mut request = base_request("empty_overlap_crop", mantis_frames(2), ParamValues::new());
+    request.align = Some(align());
+    request.crop = true;
+    let Err(PipelineError::Align(message)) =
+        focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+    else {
+        panic!("an empty overlap with auto-crop on must fail with PipelineError::Align");
+    };
+    assert!(
+        message.contains("turn off auto-crop"),
+        "the error must name the remedy: {message}"
+    );
+
+    let mut request = base_request(
+        "empty_overlap_no_crop",
+        mantis_frames(2),
+        ParamValues::new(),
+    );
+    request.align = Some(align());
+    request.crop = false;
+    let outcome = focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+        .expect("the same run without auto-crop completes");
+    let FuseOutcome::Completed(report) = outcome else {
+        panic!("expected a completed run");
+    };
+    assert_eq!(
+        (report.output_width, report.output_height),
+        (report.width, report.height),
+        "without auto-crop the output keeps the full frame extent"
     );
 }
 

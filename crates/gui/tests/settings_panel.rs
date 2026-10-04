@@ -154,7 +154,102 @@ fn pyramidal_ecc_renders_in_declaration_order() {
         .iter()
         .map(|r| r.label.clone())
         .collect();
-    assert_eq!(align_labels, expected);
+    let mut with_switch = vec!["Enabled".to_string()];
+    with_switch.extend(expected);
+    assert_eq!(align_labels, with_switch);
+}
+
+#[test]
+fn align_lists_enabled_first_and_finish_lists_auto_crop_only() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    let panel = controller.settings_panel();
+
+    let align = field_rows(&panel.rows, "align");
+    assert_eq!(
+        (
+            align[0].id.as_str(),
+            align[0].kind,
+            align[0].selected.as_str()
+        ),
+        ("align", RowKind::Bool, "true"),
+        "the switch heads the section and defaults on"
+    );
+    assert_eq!(
+        align[0].section, "align-switch",
+        "the switch writes the project map"
+    );
+    let finish: Vec<&str> = field_rows(&panel.rows, "finish")
+        .iter()
+        .filter(|r| r.kind != RowKind::ResetAll)
+        .map(|r| r.id.as_str())
+        .collect();
+    assert_eq!(finish, ["auto-crop"]);
+}
+
+#[test]
+fn the_enabled_switch_writes_only_the_project_values() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.set_param_value("align-switch", "align", ParamValue::Bool(false));
+
+    let panel = controller.settings_panel();
+    assert_eq!(field_rows(&panel.rows, "align")[0].selected, "false");
+    assert_eq!(
+        heading(&panel.rows, "align").heading_state,
+        HeadingState::Default,
+        "the switch is not an align parameter"
+    );
+    assert!(
+        !panel
+            .rows
+            .iter()
+            .any(|r| r.kind == RowKind::ResetAll && r.selected == "true")
+    );
+}
+
+#[test]
+fn the_align_rows_are_disabled_exactly_while_the_switch_is_off() {
+    /// `(is the Enabled switch, disabled)` for every row between the ALIGN
+    /// heading and the next heading, the picker included; every other row
+    /// (headings too) is returned apart.
+    fn split(controller: &AppController) -> (Vec<(bool, bool)>, Vec<bool>) {
+        let (mut in_align, mut align, mut others) = (false, Vec::new(), Vec::new());
+        for row in controller.settings_panel().rows {
+            if row.kind == RowKind::SectionHeading {
+                in_align = row.section == "align";
+                others.push(row.disabled);
+            } else if in_align {
+                align.push((
+                    row.section == "align-switch" && row.id == "align",
+                    row.disabled,
+                ));
+            } else {
+                others.push(row.disabled);
+            }
+        }
+        (align, others)
+    }
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    // The open fold-out's `More...` header and nested rows grey as well.
+    controller.toggle_section_more("align");
+
+    let (align, others) = split(&controller);
+    assert!(align.iter().all(|(_, off)| !off) && others.iter().all(|off| !off));
+
+    controller.set_param_value("align-switch", "align", ParamValue::Bool(false));
+    let (align, others) = split(&controller);
+    assert!(align.len() > 2, "the section has rows to disable");
+    assert_eq!(align.iter().filter(|(switch, _)| *switch).count(), 1);
+    assert!(
+        align.iter().all(|(switch, off)| *off != *switch),
+        "every ALIGN row but the switch is disabled"
+    );
+    assert!(
+        others.iter().all(|off| !off),
+        "PREPARE, FUSE, FINISH and headings stay active"
+    );
 }
 
 #[test]
@@ -1529,7 +1624,7 @@ fn sections_start_collapsed_with_one_adjustment_at_most() {
         controller.set_fuse_algorithm(method);
         let rows = controller.settings_panel().rows;
         assert_eq!(field_ids(&rows, "fuse"), visible, "{method}");
-        assert_eq!(field_ids(&rows, "align"), Vec::<String>::new(), "{method}");
+        assert_eq!(field_ids(&rows, "align"), ["align"], "{method}");
         assert_eq!(
             field_ids(&rows, "prepare"),
             Vec::<String>::new(),
@@ -1590,16 +1685,18 @@ fn more_reveals_that_sections_advanced_rows() {
     );
     assert_eq!(
         field_ids(&rows, "align"),
-        Vec::<String>::new(),
-        "other sections stay collapsed"
+        ["align"],
+        "other sections stay collapsed, the Align switch alone showing"
     );
 
     controller.toggle_section_more("align");
     let rows = controller.settings_panel().rows;
+    let mut with_switch = vec!["align".to_string()];
+    with_switch.extend(schema_ids("pyramidal-ecc"));
     assert_eq!(
         field_ids(&rows, "align"),
-        schema_ids("pyramidal-ecc"),
-        "Align opens to every parameter, in declaration order"
+        with_switch,
+        "Align opens to every parameter, in declaration order, after its switch"
     );
 
     controller.set_fuse_algorithm("depth-map");
@@ -1965,7 +2062,7 @@ fn hidden_rows_with_no_tab_render_collapsed() {
         "Finish has no More row"
     );
     assert_eq!(field_ids(&rows, "prepare"), Vec::<String>::new());
-    assert_eq!(field_ids(&rows, "align"), Vec::<String>::new());
+    assert_eq!(field_ids(&rows, "align"), ["align"]);
     assert_eq!(field_ids(&rows, "finish"), ["auto-crop"]);
     for section in ["prepare", "finish"] {
         assert_eq!(

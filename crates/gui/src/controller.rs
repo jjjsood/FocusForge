@@ -430,6 +430,8 @@ struct ProjectTab {
     /// [`AppController::keep_fused`] or [`AppController::discard_fused`];
     /// not counted in `checkpoints` or `held` until kept.
     parked: Option<ParkedRun>,
+    /// What the tab's last completed run's alignment did.
+    alignment: Option<job::AlignSummary>,
     /// The ordered frame set a fuse actually consumes -- session-only, seeded
     /// from [`entry::project_frames`] and re-seeded from the run's own frames
     /// on every successful run, so a fused tab's list always matches what it
@@ -684,6 +686,7 @@ impl ProjectTab {
             fresh_checkpoint: None,
             row_planes: None,
             parked: None,
+            alignment: None,
             frames,
             excluded,
             selected,
@@ -5844,10 +5847,11 @@ impl AppController {
             staging_key,
             fuse_id: tab.fuse_id.clone(),
             fuse_values: tab.fuse_values.clone(),
-            align_id: Some(tab.align_id.clone()),
+            align_id: settings_panel::project_flag(&tab.project_values, "align")
+                .then(|| tab.align_id.clone()),
             align_values: tab.align_values.clone(),
             align_lax: true,
-            crop: settings_panel::auto_crop_enabled(&tab.project_values),
+            crop: settings_panel::project_flag(&tab.project_values, "auto-crop"),
             equalize: settings_panel::equalization_bound(&tab.fuse_id, &tab.project_values),
             gpu: self.gpu_fusion,
         })
@@ -6200,14 +6204,17 @@ impl AppController {
         let tab_index = self.job.tab_id.take().and_then(|id| self.tab_index(id));
         let owner = tab_index.and_then(|i| self.state.projects.get(i));
         let was_cancelling = owner.is_some_and(|tab| tab.run == job::RunState::Cancelling);
-        let settled = job::settle(handle.join());
+        let observer = self.job.observer.take().unwrap_or_default();
+        let settled = job::settle(handle.join(), &observer);
         self.job.control = None;
-        self.job.observer = None;
         // With the owning tab gone (closed mid-run), this writes nothing --
         // no tab gains a checkpoint, and no outcome lands on whichever tab
         // happens to be active now.
         if let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) {
             tab.run = settled.state.clone();
+            if settled.alignment.is_some() {
+                tab.alignment = settled.alignment.clone();
+            }
         }
         if tab_index == self.state.active {
             // The run's own tab is the active one -- the canvas must reload
@@ -6388,6 +6395,21 @@ impl AppController {
         Some(parked.diverged.as_slice())
     }
 
+    /// What the active tab's last completed run's alignment did: its source,
+    /// backend and per-status counts.
+    pub fn last_alignment(&self) -> Option<&job::AlignSummary> {
+        self.state.active()?.alignment.as_ref()
+    }
+
+    /// The toast a kept run with unregistered frames raises, read after
+    /// [`AppController::keep_fused`]; `None` when every frame registered.
+    pub fn unaligned_notice(&self) -> Option<String> {
+        match &self.state.active()?.run {
+            job::RunState::Fused { unaligned, .. } => job::unaligned_notice(*unaligned),
+            _ => None,
+        }
+    }
+
     /// `Keep` on the active tab's parked run: commits it exactly as a run
     /// without divergence commits, returning the planes the canvas reloads
     /// from. `None` with nothing parked.
@@ -6395,8 +6417,9 @@ impl AppController {
         let index = self.state.active?;
         let parked = self.state.projects.get_mut(index)?.parked.take()?;
         let at = checkpoints::local_hhmm(parked.held.created_at);
+        let unaligned = parked.diverged.len();
         let planes = self.commit_held(index, parked.held);
-        self.state.projects[index].run = job::RunState::Fused { at };
+        self.state.projects[index].run = job::RunState::Fused { at, unaligned };
         self.state.canvas_dirty = true;
         self.emit(ShellEvent::JobChanged);
         Some(planes)
@@ -7428,7 +7451,9 @@ pub fn tab_scroll_into_view(
 /// the panel does not have.
 fn tab_values_mut<'a>(tab: &'a mut ProjectTab, section: &str) -> Option<&'a mut ParamValues> {
     match section {
-        "prepare" | "finish" => Some(&mut tab.project_values),
+        "prepare" | "finish" | settings_panel::ALIGN_SWITCH_SECTION => {
+            Some(&mut tab.project_values)
+        }
         "fuse" => Some(&mut tab.fuse_values),
         "align" => Some(&mut tab.align_values),
         _ => None,

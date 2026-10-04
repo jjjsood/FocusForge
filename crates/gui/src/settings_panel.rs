@@ -44,8 +44,8 @@ pub(crate) struct ActiveTabParams<'a> {
 /// project values, a newly created tab starts with: registry defaults and
 /// no values for an unsaved project, the sealed manifest's own for a
 /// reopened one (every key resolves `Explicit`). A manifest with no `align`
-/// seeds the registry default there; one whose run applied no crop seeds
-/// `auto-crop` off; `equalize` is seeded only where the run differs from its
+/// seeds the registry default there and the `align` switch off; one whose run
+/// applied no crop seeds `auto-crop` off; `equalize` is seeded only where the run differs from its
 /// method's default, on with the bound it ran with or off.
 pub(crate) fn seed_algorithm_state(
     project: &GuiProject,
@@ -65,6 +65,9 @@ pub(crate) fn seed_algorithm_state(
                 None => (default_align_id(), ParamValues::new()),
             };
             let mut project_values = ParamValues::new();
+            if manifest.align.is_none() {
+                project_values.insert("align".to_string(), ParamValue::Bool(false));
+            }
             if manifest.registration.crop.is_none() {
                 project_values.insert("auto-crop".to_string(), ParamValue::Bool(false));
             }
@@ -94,20 +97,23 @@ pub(crate) fn seed_algorithm_state(
     }
 }
 
-/// Whether a run trims to the area every aligned frame covers: the explicit
-/// `auto-crop` value, else the project schema's default.
-pub(crate) fn auto_crop_enabled(project_values: &ParamValues) -> bool {
-    let schema = &focusforge_core::project::PROJECT_PARAMS[0];
-    project_values
-        .get(&schema.id)
-        .unwrap_or(&schema.default)
+/// The bool project value `id` (`align`, `auto-crop`): the explicit value
+/// when set, the descriptor's default otherwise.
+pub(crate) fn project_flag(values: &ParamValues, id: &str) -> bool {
+    let desc = focusforge_core::project::PROJECT_PARAMS
+        .iter()
+        .find(|desc| desc.id == id)
+        .expect("PROJECT_PARAMS declares every project flag the panel reads");
+    values
+        .get(id)
+        .unwrap_or(&desc.default)
         .as_bool()
-        .expect("auto-crop is a Bool parameter")
+        .expect("a project flag is a bool descriptor")
 }
 
-/// `group` of the project schema (`PREPARE_PARAMS`, `FINISH_PARAMS` or
-/// `PROJECT_PARAMS`) for a run fused by `fuse_id`; the group as declared while
-/// the id names no registered method.
+/// `group` of the project schema (`ALIGN_PARAMS`, `PREPARE_PARAMS`,
+/// `FINISH_PARAMS` or `PROJECT_PARAMS`) for a run fused by `fuse_id`; the
+/// group as declared while the id names no registered method.
 fn project_schema(group: &[ParamDesc], fuse_id: &str) -> Vec<ParamDesc> {
     registry::find_stack(fuse_id).map_or_else(
         |_| group.to_vec(),
@@ -197,8 +203,9 @@ pub enum HeadingState {
 pub struct SettingsRow {
     pub kind: RowKind,
     /// Which section a mutation on this row targets -- `"prepare"`,
-    /// `"fuse"`, `"align"` or `"finish"`; `"prepare"` and `"finish"` write the
-    /// tab's one project map. Param ids are unique only *within* one
+    /// `"fuse"`, `"align"` or `"finish"`, or [`ALIGN_SWITCH_SECTION`] for the
+    /// ALIGN switch row; every project-group section writes the tab's one
+    /// project map. Param ids are unique only *within* one
     /// schema, never across the whole panel, so a callback needs this
     /// alongside `id` to know which map to write.
     pub section: String,
@@ -226,6 +233,9 @@ pub struct SettingsRow {
     /// non-uniform-pitch shape the tab strip's fixed `tab-pitch` does not
     /// need.
     pub top: f32,
+    /// Whether the row's control is inert and drawn disabled: every row of
+    /// the ALIGN section while its `Enabled` switch is off.
+    pub disabled: bool,
     /// Whether the row sits inside an open `More...` fold-out, on its tint.
     pub nested: bool,
     /// A [`RowKind::More`] row's band height, its own header while closed and
@@ -249,6 +259,7 @@ impl SettingsRow {
             menu_open: false,
             heading_state: HeadingState::Default,
             top: 0.0,
+            disabled: false,
             nested: false,
             extent: 0.0,
         }
@@ -456,6 +467,10 @@ pub fn violation_text(violation: &ParamViolation) -> String {
     }
 }
 
+/// The section key of the ALIGN section's `Enabled` switch row: it renders
+/// under the `align` heading but writes the project map.
+pub(crate) const ALIGN_SWITCH_SECTION: &str = "align-switch";
+
 /// `"<section>:<id>"` -- the one key format the picker's own pseudo-field
 /// (`id == "algorithm"`), an enum's open menu and a field's stored error all
 /// share, so `AppController` never formats it more than once.
@@ -464,7 +479,7 @@ pub fn menu_key(section: &str, id: &str) -> String {
 }
 
 /// The `&'static ParamDesc` `section`'s current algorithm (or, for
-/// `"prepare"` and `"finish"`, the project group) declares for `id` -- `None`
+/// `"prepare"`, `"finish"` and the align switch, the project group) declares for `id` -- `None`
 /// when the section is unknown or the algorithm behind `fuse_id`/`align_id`
 /// carries no such parameter, which a mid-drag algorithm switch can produce.
 pub fn find_desc(
@@ -476,6 +491,7 @@ pub fn find_desc(
     let schema: &'static [ParamDesc] = match section {
         "fuse" => registry::find_stack(fuse_id).ok()?.params(),
         "align" => registry::find_align(align_id).ok()?.params(),
+        ALIGN_SWITCH_SECTION => &focusforge_core::project::ALIGN_PARAMS,
         "prepare" => &focusforge_core::project::PREPARE_PARAMS,
         "finish" => &focusforge_core::project::FINISH_PARAMS,
         _ => return None,
@@ -592,14 +608,29 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
                 label: a.display_name().to_string(),
             })
             .collect();
-        rows.extend(section_rows(
+        let mut align_rows = section_rows(
             "align",
             "ALIGN",
             align.params(),
             align_values,
             &section_ctx,
             Some((align_id, picker)),
-        ));
+        );
+        // The on/off switch is the project-level `align` value, written to
+        // the project map, and is the section's first row after its heading;
+        // every row below it greys while the switch is off. The heading's
+        // provenance reads the algorithm's own values only.
+        let align_on = project_flag(project_values, "align");
+        for row in align_rows.iter_mut().skip(1) {
+            row.disabled = !align_on;
+        }
+        let switch_group = project_schema(&focusforge_core::project::ALIGN_PARAMS, fuse_id);
+        let switch_rows = switch_group.iter().map(|desc| {
+            let value = project_values.get(&desc.id).unwrap_or(&desc.default);
+            field_row(ALIGN_SWITCH_SECTION, desc, value, false)
+        });
+        align_rows.splice(1..1, switch_rows);
+        rows.extend(align_rows);
     }
     rows.extend(section_rows(
         "finish",
