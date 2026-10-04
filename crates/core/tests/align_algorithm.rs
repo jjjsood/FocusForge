@@ -763,9 +763,19 @@ fn each_divergence_reports_its_pyramid_level() {
                 AlignStatus::Stalled => 2,
                 _ => 3,
             };
+            // A middle level's `correlation-decreased` divergence hands its
+            // fit on and counts as `Stalled`.
+            let depth = levels[0].level;
             let worst = levels
                 .iter()
-                .map(|rec| AlignStatus::from(rec.result.status))
+                .map(|rec| match rec.result.status {
+                    EccStatus::Diverged(DivergenceReason::CorrelationDecreased)
+                        if rec.level > 0 && rec.level < depth =>
+                    {
+                        AlignStatus::Stalled
+                    }
+                    status => AlignStatus::from(status),
+                })
                 .max_by_key(|&s| severity(s))
                 .expect("at least the coarsest level is always solved");
             assert_eq!(

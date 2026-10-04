@@ -20,7 +20,11 @@
 //! level ends the loop there (the seed for finer levels would be
 //! worthless), but the best-ρ transform that level found is still rescaled
 //! all the way to level-0 coordinates, so a caller always gets a level-0
-//! answer.
+//! answer. The exception is a `CorrelationDecreased` divergence at a middle
+//! level (`0 < k < pyramid-depth`, a coarser level having finished): its
+//! best-ρ transform seeds level `k - 1` and the level counts as `Stalled`,
+//! since a defocused frame loses correlation there on noise, not on a wrong
+//! seed. The coarsest level and every other reason still end the loop.
 //!
 //! # The solve region
 //!
@@ -809,10 +813,18 @@ impl PyramidalEcc {
                 at_level0 = up.compose(&at_level0).compose(&down);
             }
             final_transform = at_level0;
-            final_status = worse_status(final_status, result.status.into());
+            let handed_on = k > 0
+                && k < depth
+                && result.status == EccStatus::Diverged(DivergenceReason::CorrelationDecreased);
+            let level_status = if handed_on {
+                AlignStatus::Stalled
+            } else {
+                result.status.into()
+            };
+            final_status = worse_status(final_status, level_status);
 
             match result.status {
-                EccStatus::Diverged(_) => break,
+                EccStatus::Diverged(_) if !handed_on => break,
                 _ => {
                     if k > 0 {
                         seed = up.compose(&result.transform).compose(&down);
@@ -1927,7 +1939,7 @@ mod tests {
             depth,
             &test_params(400),
             start,
-            false,
+            true,
         )
         .unwrap()
     }
@@ -1966,6 +1978,92 @@ mod tests {
             (radians.to_degrees() + 15.0).abs() < 3.0 && scale > 1.05,
             "the wrong fit is kept, not the identity: scale {scale}, {} deg",
             radians.to_degrees()
+        );
+    }
+
+    /// Uniform-sum noise of unit variance, a pure function of the pixel and a
+    /// per-frame salt.
+    fn noise(x: u32, y: u32, salt: u64) -> f64 {
+        let mut h = (u64::from(x) << 32 | u64::from(y)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ salt.wrapping_mul(0xD1B5_4A32_D192_ED03);
+        let mut sum = 0.0;
+        for _ in 0..4 {
+            h ^= h >> 29;
+            h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            h ^= h >> 32;
+            sum += (h >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+        }
+        sum * 3.0f64.sqrt()
+    }
+
+    /// Two frames of the defocused scene (long ripples only) at `amplitude`
+    /// times the usual contrast, the second moved by `shift`, each with its
+    /// own sensor noise of standard deviation `noise_sd` grey levels.
+    fn defocused_noisy_reader(shift: (f64, f64), amplitude: f64, noise_sd: f64) -> MemReader {
+        let frame = |shift: (f64, f64), salt: u64| -> Vec<u16> {
+            let mut out = Vec::with_capacity(W as usize * H as usize);
+            for y in 0..H {
+                for x in 0..W {
+                    let v = scene(f64::from(x) - shift.0, f64::from(y) - shift.1, false);
+                    let grey = 32768.0 + 6000.0 * amplitude * v + noise_sd * noise(x, y, salt);
+                    out.push(grey.clamp(0.0, 65535.0) as u16);
+                }
+            }
+            out
+        };
+        MemReader {
+            width: W,
+            frames: vec![frame((0.0, 0.0), 1), frame(shift, 2)],
+        }
+    }
+
+    #[test]
+    fn a_correlation_decrease_at_a_middle_level_hands_its_fit_to_the_next_level() {
+        // Levels 3 and 2 converge; level 1 then diverges after a few
+        // iterations on the noise, with its best-correlation fit kept.
+        let mem = defocused_noisy_reader((9.0, 6.0), 0.01, 250.0);
+        let attempt = unseeded(&mem, EccMode::Similarity, 3, 1);
+
+        let solved: Vec<_> = attempt
+            .records
+            .iter()
+            .map(|r| (r.level, r.result.status))
+            .collect();
+        assert_eq!(
+            solved[..3],
+            [
+                (3, EccStatus::Converged),
+                (2, EccStatus::Converged),
+                (
+                    1,
+                    EccStatus::Diverged(DivergenceReason::CorrelationDecreased)
+                ),
+            ],
+            "{solved:?}"
+        );
+        assert_eq!(
+            solved.last().map(|&(level, _)| level),
+            Some(0),
+            "level 0 is solved from the level-1 fit: {solved:?}"
+        );
+        assert_ne!(attempt.status, AlignStatus::Converged, "{attempt:?}");
+    }
+
+    #[test]
+    fn a_correlation_decrease_at_the_coarsest_level_stops_the_pass() {
+        let mem = defocused_noisy_reader((9.0, 6.0), 0.004, 500.0);
+        let attempt = unseeded(&mem, EccMode::Similarity, 3, 1);
+
+        assert_eq!(
+            attempt.status,
+            AlignStatus::Diverged(DivergenceReason::CorrelationDecreased),
+            "{attempt:?}"
+        );
+        let levels: Vec<u32> = attempt.records.iter().map(|r| r.level).collect();
+        assert_eq!(
+            levels,
+            [3],
+            "no finer level follows a diverged coarsest level"
         );
     }
 
