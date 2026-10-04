@@ -385,12 +385,125 @@ fn the_real_registry_defaults_skip_the_test_only_entries() {
         "pyramidal-ecc"
     );
     assert_eq!(
-        default_stack().expect("depth-map is marked").id(),
-        "depth-map"
+        default_stack().expect("laplacian is marked").id(),
+        "laplacian"
     );
     for entry in algorithms() {
         let expected = matches!(entry.id(), "dummy-align" | "dummy-stack");
         assert_eq!(entry.test_only(), expected, "{}", entry.id());
+    }
+}
+
+/// The ids of `params` a front end shows in its first view.
+fn outside_advanced(params: &[ParamDesc]) -> Vec<&str> {
+    params
+        .iter()
+        .filter(|p| !p.advanced)
+        .map(|p| p.id.as_str())
+        .collect()
+}
+
+/// `Err` naming the ids when a schema shows more than one parameter in the
+/// first view.
+fn at_most_one_outside_advanced(params: &[ParamDesc]) -> Result<(), String> {
+    match outside_advanced(params).as_slice() {
+        [] | [_] => Ok(()),
+        many => Err(format!("more than one first-view parameter: {many:?}")),
+    }
+}
+
+#[test]
+fn every_stack_algorithm_shows_at_most_one_parameter_outside_advanced() {
+    let real: Vec<&dyn StackAlgorithm> = stack_algorithms()
+        .into_iter()
+        .filter(|a| !a.test_only())
+        .collect();
+    assert_eq!(
+        real.iter().map(|a| a.id()).collect::<Vec<_>>(),
+        vec!["depth-map", "laplacian", "weighted-average"]
+    );
+    for entry in &real {
+        at_most_one_outside_advanced(entry.params())
+            .unwrap_or_else(|why| panic!("{}: {why}", entry.id()));
+    }
+    let shown = |id: &str| outside_advanced(find(id).expect("registered").params());
+    assert!(shown("laplacian").is_empty());
+    assert_eq!(shown("weighted-average"), vec!["weight-exponent"]);
+    assert!(find("depth-map").expect("registered").advanced());
+    assert!(
+        !default_stack().expect("a default is marked").advanced(),
+        "the default is never advanced"
+    );
+}
+
+#[test]
+fn a_schema_with_two_non_advanced_params_fails_the_walk() {
+    let crop = crate::project::PROJECT_PARAMS
+        .iter()
+        .find(|d| d.id == "auto-crop")
+        .expect("auto-crop is a project parameter")
+        .clone();
+    let mut second = crop.clone();
+    second.id = "second".to_string();
+    let schema = vec![crop, second];
+    let why = at_most_one_outside_advanced(&schema).expect_err("two shown parameters");
+    assert!(why.contains("auto-crop") && why.contains("second"), "{why}");
+}
+
+#[test]
+fn every_alignment_parameter_is_advanced() {
+    for entry in align_algorithms().iter().filter(|a| !a.test_only()) {
+        for p in entry.params() {
+            assert!(p.advanced, "{}: {} is shown up front", entry.id(), p.id);
+        }
+    }
+    assert_eq!(
+        outside_advanced(&crate::project::PROJECT_PARAMS),
+        vec!["align", "auto-crop"]
+    );
+}
+
+#[test]
+fn role_first_display_names() {
+    let name = |id: &str| find(id).expect("registered").display_name().to_string();
+    assert_eq!(name("laplacian"), "Details");
+    assert_eq!(name("weighted-average"), "Soft transitions");
+    assert_eq!(name("depth-map"), "Focus map");
+    let exponent = find("weighted-average")
+        .expect("registered")
+        .params()
+        .iter()
+        .find(|p| p.id == "weight-exponent")
+        .expect("weight-exponent is declared")
+        .label
+        .clone();
+    assert_eq!(exponent, "Sharp-source preference");
+}
+
+#[test]
+fn fusion_and_crop_help_is_one_plain_sentence() {
+    let mut described: Vec<(String, &ParamDesc)> = crate::project::PROJECT_PARAMS
+        .iter()
+        .map(|p| ("project".to_string(), p))
+        .collect();
+    for entry in stack_algorithms().iter().filter(|a| !a.test_only()) {
+        described.extend(entry.params().iter().map(|p| (entry.id().to_string(), p)));
+    }
+    assert_eq!(
+        described.len(),
+        4 + 1 + 2 + 2,
+        "the four project parameters plus the three schemas"
+    );
+    for (owner, p) in described {
+        let help = p.help.as_str();
+        let at = format!("{owner}/{}: {help:?}", p.id);
+        assert!(!help.trim().is_empty(), "{at}");
+        assert!(!help.contains('`') && !help.contains('\n'), "{at}");
+        assert!(help.ends_with('.'), "{at}");
+        assert!(
+            !help.trim_end_matches('.').contains(". "),
+            "more than one sentence: {at}"
+        );
     }
 }
 

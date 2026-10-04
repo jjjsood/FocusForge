@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Fixture-backed driver tests for `laplacian` over `fixtures/mantis-512`,
-//! run at tile 448 / levels 5 (the golden geometry), plus the seam
-//! comparisons at 704/5 (single-tile reference) and 480/5 (ragged variant).
+//! run at tile 448 / levels 5 (the golden geometry), plus the exact tile
+//! invariance comparisons against a 1024/5 single tile and a 480/5 ragged
+//! variant.
 //!
 //! `metrics_reproduce_the_measured_baselines` is the calibration check:
 //! every floor below is meaningless unless it passes.
@@ -81,8 +82,8 @@ fn run_fusion(
     let scheduler_scratch =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("laplacian_fusion_{label}"));
     let mut options = TileSchedulerOptions::explicit_budget(scheduler_scratch, max_bytes_in_flight);
+    options.apply_support(algo.tile_support(&values));
     options.tile_size = tile_size;
-    options.levels = levels;
     let scheduler =
         TileScheduler::new(reader, stack_ctx, spp, &options).expect("scheduler must build");
     let consumer = FusionConsumer::create(
@@ -159,17 +160,17 @@ fn golden_result() -> &'static FusionResult {
     })
 }
 
-/// 704/5: one tile covering the whole 512x512 fixture -- the seam-free
-/// reference every tiled run is compared against.
+/// 1024/5: one tile covering the whole 512x512 fixture (interior 704) -- the
+/// full-image reference every tiled run is compared against.
 fn single_tile_result() -> &'static FusionResult {
     static ONCE: OnceLock<FusionResult> = OnceLock::new();
     ONCE.get_or_init(|| {
         let (stack, stack_ctx) = open_mantis_512();
-        run_fusion("single-tile", 704, 5, 1 << 30, &stack, stack_ctx, None)
+        run_fusion("single-tile", 1024, 5, 1 << 30, &stack, stack_ctx, None)
     })
 }
 
-/// 480/5: the ragged seam variant (interiors of 288 and 224).
+/// 480/5: the ragged variant (interiors of 160, 160 and 192).
 fn ragged_result() -> &'static FusionResult {
     static ONCE: OnceLock<FusionResult> = OnceLock::new();
     ONCE.get_or_init(|| {
@@ -788,62 +789,70 @@ fn zmap_neighbourhood_is_uniform_well_above_the_random_baseline() {
     );
 }
 
-/// The Z-Map is exactly equal between the tiled (448/5) and single-tile
-/// (704/5) runs: every level's selection cone (at most 78 px) sits inside the
-/// 96 px margin. The composite is not boundable: `collapse` extends a pixel's
-/// dependency to 140 px, outside the margin, where a selection flip is a
-/// full-magnitude difference, so its maximum difference is only printed. Cone
-/// arithmetic: `crate::fuse::laplacian`'s "Tiling and the composite seam".
+/// The composite and the Z-Map of the tiled (448/5) run equal the full-image
+/// (1024/5) run byte for byte: the 160 px margin covers the composite's whole
+/// dependency cone (`crate::fuse::laplacian`'s "Tiling").
 #[test]
-fn tiled_zmap_is_exact_and_composite_seam_difference_is_recorded() {
+fn tiled_composite_and_zmap_are_exact() {
     let tiled = golden_result();
     let single = single_tile_result();
-
     assert_eq!(
         tiled.zmap, single.zmap,
-        "the Z-Map at tile 448/5 must equal the single-tile (704/5) Z-Map element for element"
+        "the Z-Map at tile 448/5 must equal the single-tile (1024/5) Z-Map element for element"
     );
-
-    assert_eq!(tiled.composite.len(), single.composite.len());
-    let max_diff = tiled
-        .composite
-        .iter()
-        .zip(single.composite.iter())
-        .map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs())
-        .max()
-        .unwrap_or(0);
-    println!(
-        "tiled_zmap_is_exact_and_composite_seam_difference_is_recorded: observed composite max diff = {max_diff}"
+    assert_eq!(
+        tiled.composite, single.composite,
+        "the composite at tile 448/5 must equal the single-tile (1024/5) composite sample for sample"
     );
 }
 
+/// 480/5 plans interiors of 160, 160 and 192 (the 32 px remainder is
+/// absorbed): the ragged last tile is exact too.
 #[test]
-fn ragged_tiling_zmap_is_exact_and_composite_difference_is_recorded() {
+fn ragged_tiling_composite_and_zmap_are_exact() {
     let ragged = ragged_result();
     let single = single_tile_result();
     assert_eq!(
         ragged.zmap, single.zmap,
-        "the ragged (480/5) Z-Map must equal the single-tile (704/5) Z-Map element for element"
+        "the ragged (480/5) Z-Map must equal the single-tile (1024/5) Z-Map element for element"
     );
-    let max_diff = ragged
-        .composite
-        .iter()
-        .zip(single.composite.iter())
-        .map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs())
-        .max()
-        .unwrap_or(0);
-    // Recorded, not bounded, like the 448/5 seam test. The observed 0 is luck:
-    // no near-tie falls in this fixture's 96..140 px band at the ragged 480/5
-    // geometry, but another stack may put one there and shift a composite
-    // sample by a full coefficient. A non-zero value is predicted behaviour,
-    // not a regression, so it must not fail this test.
-    //
-    // What still guards the ragged path is the Z-Map equality asserted
-    // above: selection is inside the margin and therefore exact, so a real
-    // last-row bug moves indices and fails loudly.
-    println!(
-        "ragged_tiling_zmap_is_exact_and_composite_difference_is_recorded: observed composite max diff = {max_diff}"
+    assert_eq!(
+        ragged.composite, single.composite,
+        "the ragged (480/5) composite must equal the single-tile (1024/5) composite sample for sample"
     );
+}
+
+/// Levels 3 and 4 plan their own (40 and 80 px) margins, at tile sizes that
+/// leave a ragged last tile of their own (96 and 160 px).
+#[test]
+fn shallower_pyramids_are_exact_under_tiling() {
+    for (levels, tile_size) in [(3u32, 184u32), (4, 340)] {
+        let (stack, ctx) = open_mantis_512();
+        let tiled = run_fusion(
+            &format!("levels-{levels}-tiled"),
+            tile_size,
+            levels,
+            1 << 30,
+            &stack,
+            ctx,
+            None,
+        );
+        let (stack, ctx) = open_mantis_512();
+        let single = run_fusion(
+            &format!("levels-{levels}-single"),
+            1024,
+            levels,
+            1 << 30,
+            &stack,
+            ctx,
+            None,
+        );
+        assert_eq!(tiled.zmap, single.zmap, "levels {levels}: Z-Maps differ");
+        assert_eq!(
+            tiled.composite, single.composite,
+            "levels {levels}: composites differ"
+        );
+    }
 }
 
 #[test]

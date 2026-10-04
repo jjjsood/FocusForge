@@ -25,6 +25,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
                 logarithmic: false,
             },
             default: ParamValue::Float(0.5),
+            advanced: false,
             auto: Some(std::sync::Arc::new(|ctx: &crate::params::StackContext| {
                 ParamValue::Float(1.0 / ctx.frame_count.max(1) as f64)
             })),
@@ -47,6 +48,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
                 ],
             },
             default: ParamValue::Enum("fast".to_string()),
+            advanced: false,
             auto: None,
             host_default: None,
         },
@@ -59,6 +61,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
                 .to_string(),
             kind: ParamKind::Int { min: 1, max: 1024 },
             default: ParamValue::Int(1),
+            advanced: false,
             auto: None,
             host_default: Some(std::sync::Arc::new(|facts: &crate::host::HostFacts| {
                 ParamValue::Int(facts.logical_cores() as i64)
@@ -92,7 +95,15 @@ impl StackAlgorithm for DummyStack {
 
     fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError> {
         crate::params::validate(self.params(), cfg)?;
-        let tile = ctx.frame(0)?.clone();
+        ctx.samples_per_pixel()?;
+        let mut first = None;
+        ctx.for_each_frame(|f, tile, _| {
+            if f == 0 {
+                first = Some(tile.clone());
+            }
+            Ok(())
+        })?;
+        let tile = first.expect("a context with a frame 0 visits it");
         let zmap = vec![0u16; (tile.rect.width * tile.rect.height) as usize];
         Ok(TileOutput { tile, zmap })
     }

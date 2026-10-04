@@ -12,13 +12,15 @@ export component FFField inherits Rectangle {
     in property <bool> focused: false;
     in property <bool> disabled: false;
     in property <bool> invalid: false;
+    // Sits on a tint as light as its own fill: draws the base surface.
+    in property <bool> recessed: false;
     in property <TextHorizontalAlignment> text-alignment: left;
 
     height: ShellGeometry.field-height;
     border-radius: Theme.radius-sm;
     border-width: 1px;
     border-color: root.invalid ? Theme.status-failure : root.focused ? Theme.accent-default : Theme.border-default;
-    background: root.hovered ? Theme.surface-hover : Theme.surface-overlay;
+    background: root.hovered ? Theme.surface-hover : root.recessed ? Theme.surface-base : Theme.surface-overlay;
     opacity: root.disabled ? 0.5 : 1.0;
 
     Text {

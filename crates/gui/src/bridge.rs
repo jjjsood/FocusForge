@@ -1114,6 +1114,8 @@ fn row_kind_str(kind: RowKind) -> &'static str {
         RowKind::Enum => "enum",
         RowKind::Error => "error",
         RowKind::ResetAll => "reset-all",
+        RowKind::More => "more",
+        RowKind::MoreEnd => "more-end",
     }
 }
 
@@ -1213,6 +1215,8 @@ pub fn push_settings_panel(app: &AppWindow, controller: &AppController) {
                 heading_state: heading_state_str(row.heading_state).into(),
                 top: row.top,
                 disabled: row.disabled,
+                nested: row.nested,
+                extent: row.extent,
             }
         })
         .collect();
@@ -2645,6 +2649,16 @@ pub fn install(
                 .lock()
                 .unwrap()
                 .toggle_param_menu_for(section.as_str(), id.as_str());
+        }
+    });
+    app.on_settings_more_toggled({
+        let controller = controller.clone();
+        move |section| {
+            record_settings_input();
+            controller
+                .lock()
+                .unwrap()
+                .toggle_section_more(section.as_str());
         }
     });
     app.on_settings_scrolled({

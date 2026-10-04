@@ -24,9 +24,11 @@ GNU General Public License v3.
 - Aligns handheld or breathing frames before fusing them, recovering shift,
   rotation and scale drift and cropping the result to the region every frame
   covers (`focusforge-cli align` reports the same transforms on their own)
-- Three stacking algorithms — Laplacian-pyramid coefficient selection,
-  sharpness-weighted blending, and depth-map selection — each producing a
-  Z-Map naming the source frame behind every output pixel
+- Three fusion methods — Details, Soft transitions and Focus map — each
+  producing a Z-Map naming the source frame behind every output pixel
+- Evens out brightness differences between frames before fusing, on by
+  default and bounded by a maximum gain, with a notice for any frame held at
+  the bound
 - Exports any checkpoint of a project as a TIFF, PNG or JPEG image
   (`focusforge-cli export`), with per-format bit depth, compression, JPEG
   quality and chroma subsampling, and EXIF, ICC, XMP and IPTC carried over;
@@ -64,8 +66,8 @@ GNU General Public License v3.
   crash tells you it's there
 - A window (`focusforge-gui`) alongside the CLI: open a folder or a saved
   project into a tab, view the selected source frame beside the composite or Z-Map,
-  choose an algorithm and edit its parameters from the same schema
-  `focusforge-cli algorithms` prints, run, pause, cancel or retry a fuse,
+  choose a method and edit its parameters in Prepare, Fuse, Align and
+  Finish sections, switch alignment on or off, run, pause, cancel or retry a fuse,
   and switch into editor mode to retouch the result, browse its
   checkpoints and export an image in the format you choose
 

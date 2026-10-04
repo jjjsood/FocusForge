@@ -187,10 +187,14 @@ export component FFToast inherits Rectangle {
     if root.link-label != "": link-area := TouchArea {
         x: title.x;
         y: title.y + title.height;
+        width: title.width;
+        height: parent.height - self.y - Theme.space-3;
         accessible-role: button;
         clicked => { root.link-activated(); }
 
-        Text {
+        link-text := Text {
+            width: 100%;
+            height: 100%;
             text: root.link-label;
             color: Theme.accent-default;
             font-size: Theme.text-body.size;

@@ -140,7 +140,11 @@ fn seal_fixture_ex(
     map.write_tile(full(out_width, out_height), &zmap).unwrap();
     map.finish().unwrap();
 
-    let registration = Registration { transforms, crop };
+    let registration = Registration {
+        transforms,
+        crop,
+        equalization: None,
+    };
     let project_path = dir.join(format!("fixture.{}", project::PROJECT_EXTENSION));
     let sealed = project::seal(SealRequest {
         project_path: &project_path,

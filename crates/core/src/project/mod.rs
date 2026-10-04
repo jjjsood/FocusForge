@@ -355,41 +355,147 @@ pub(super) fn resolve_chain<'a>(
     ))
 }
 
-use crate::params::{ParamDesc, ParamKind, ParamValue};
+use crate::algorithm::StackAlgorithm;
+use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, validate};
 use crate::tile::Rect;
 
-/// The project-level parameter schema: values that describe how a project
-/// was prepared rather than any one algorithm's own settings: `align`, then
-/// `auto-crop`. Project values, not algorithm parameters -- rendered by the
-/// GUI's settings panel through the same generator every algorithm's schema
-/// goes through, and read by `focusforge-cli stack`'s `--no-align` and
-/// `--no-crop` flags so the two never drift.
-pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
+/// The alignment switch: `align`. The settings panel's align section renders
+/// exactly this schema, ahead of the algorithm's own parameters.
+pub static ALIGN_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
+    vec![ParamDesc {
+        id: "align".to_string(),
+        label: "Enabled".to_string(),
+        help: "Registers every frame onto the reference before fusing; \
+               off fuses the frames as read."
+            .to_string(),
+        kind: ParamKind::Bool,
+        default: ParamValue::Bool(true),
+        advanced: false,
+        auto: None,
+        host_default: None,
+    }]
+});
+
+/// The project parameters that act after fusing: `auto-crop`. The settings
+/// panel's finish section renders exactly this schema.
+pub static FINISH_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
+    vec![ParamDesc {
+        id: "auto-crop".to_string(),
+        label: "Auto-crop".to_string(),
+        help: "Trims the result to the area every aligned frame covers; turn \
+                   it off to keep the full frame."
+            .to_string(),
+        kind: ParamKind::Bool,
+        default: ParamValue::Bool(true),
+        advanced: false,
+        auto: None,
+        host_default: None,
+    }]
+});
+
+/// The project parameters that change the frames before fusing: the two
+/// brightness-equalization parameters. The settings panel's prepare section
+/// renders exactly this schema.
+pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     vec![
         ParamDesc {
-            id: "align".to_string(),
-            label: "Enabled".to_string(),
-            help: "Registers every frame onto the reference before fusing. \
-                   Off fuses the frames as read."
+            id: "equalize".to_string(),
+            label: "Equalize brightness".to_string(),
+            help: "Gives every frame one gain, the same on every channel, \
+                   matching the reference frame's (the alignment's, otherwise \
+                   the middle one) mid-tone brightness; scales encoded code \
+                   values as delivered and is not a linear-light correction."
                 .to_string(),
             kind: ParamKind::Bool,
             default: ParamValue::Bool(true),
+            advanced: true,
             auto: None,
             host_default: None,
         },
         ParamDesc {
-            id: "auto-crop".to_string(),
-            label: "Auto-crop".to_string(),
-            help: "Trims the composite and Z-Map to the region every aligned \
-                   frame actually covers. Off keeps the full frame extent."
+            id: "equalize-max-gain".to_string(),
+            label: "Max brightness gain".to_string(),
+            help: "Only used when brightness equalization is on; limits a \
+                   frame's gain on both sides, so 1.25 allows gains from 0.8 \
+                   to 1.25; scales encoded code values as delivered and is \
+                   not a linear-light correction."
                 .to_string(),
-            kind: ParamKind::Bool,
-            default: ParamValue::Bool(true),
+            kind: ParamKind::Float {
+                min: 1.01,
+                max: 2.0,
+                step: 0.01,
+                logarithmic: false,
+            },
+            default: ParamValue::Float(1.25),
+            advanced: true,
             auto: None,
             host_default: None,
         },
     ]
 });
+
+/// The project-level parameter schema, [`ALIGN_PARAMS`], [`FINISH_PARAMS`] then
+/// [`PREPARE_PARAMS`]: values that describe how a project was prepared rather
+/// than any one algorithm's own settings. `focusforge-cli stack` reads it
+/// (`--no-crop`, `--set`) and the `algorithms` listing prints it.
+pub static PROJECT_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
+    ALIGN_PARAMS
+        .iter()
+        .chain(FINISH_PARAMS.iter())
+        .chain(PREPARE_PARAMS.iter())
+        .cloned()
+        .collect()
+});
+
+/// The project parameter schema for a run fused by `method`:
+/// [`PROJECT_PARAMS`] with the defaults the method declares through
+/// [`StackAlgorithm::project_defaults`]. Every front end resolves project
+/// parameters against this schema, so a default is the same in the settings
+/// panel, on the command line and in a listing.
+pub fn params_for(method: &dyn StackAlgorithm) -> Vec<ParamDesc> {
+    params_for_group(&PROJECT_PARAMS, method)
+}
+
+/// `group` ([`ALIGN_PARAMS`], [`PREPARE_PARAMS`], [`FINISH_PARAMS`] or [`PROJECT_PARAMS`]) with
+/// the defaults `method` declares through [`StackAlgorithm::project_defaults`].
+/// The declarations are checked against the whole project schema, so one for a
+/// parameter outside `group` is still validated.
+pub fn params_for_group(group: &[ParamDesc], method: &dyn StackAlgorithm) -> Vec<ParamDesc> {
+    let declared: ParamValues = method
+        .project_defaults()
+        .iter()
+        .map(|(id, value)| (id.to_string(), value.clone()))
+        .collect();
+    validate(&PROJECT_PARAMS, &declared)
+        .expect("a method's project defaults satisfy the project schema");
+    group
+        .iter()
+        .map(|desc| {
+            let mut desc = desc.clone();
+            if let Some(default) = declared.get(&desc.id) {
+                desc.default = default.clone();
+            }
+            desc
+        })
+        .collect()
+}
+
+/// The gain bound brightness equalization runs with, `None` when the
+/// `equalize` switch is off. An absent key reads as its default in `schema`,
+/// the schema [`params_for`] returns for the run's fusion method.
+pub fn equalization_bound(schema: &[ParamDesc], values: &ParamValues) -> Option<f64> {
+    let read = |id: &str| {
+        let desc = schema
+            .iter()
+            .find(|d| d.id == id)
+            .expect("the project schema declares the equalization parameters");
+        values.get(id).unwrap_or(&desc.default).clone()
+    };
+    read("equalize")
+        .as_bool()
+        .filter(|&on| on)
+        .and_then(|_| read("equalize-max-gain").as_f64())
+}
 
 /// The project file's extension.
 pub const PROJECT_EXTENSION: &str = "ffp";
@@ -909,19 +1015,180 @@ pub(super) fn read_json<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
 
+    fn desc(id: &str) -> &'static ParamDesc {
+        PROJECT_PARAMS
+            .iter()
+            .find(|d| d.id == id)
+            .unwrap_or_else(|| panic!("no project parameter {id}"))
+    }
+
     #[test]
-    fn project_params_holds_the_align_and_auto_crop_bool_descriptors() {
-        assert_eq!(PROJECT_PARAMS.len(), 2);
-        for (desc, id, label) in [
-            (&PROJECT_PARAMS[0], "align", "Enabled"),
-            (&PROJECT_PARAMS[1], "auto-crop", "Auto-crop"),
-        ] {
-            assert_eq!(desc.id, id);
-            assert_eq!(desc.label, label);
-            assert_eq!(desc.kind, ParamKind::Bool);
-            assert_eq!(desc.default, ParamValue::Bool(true));
-            assert!(desc.auto.is_none());
-            assert!(desc.host_default.is_none());
+    fn project_params_hold_align_auto_crop_and_the_two_equalization_descriptors() {
+        let ids: Vec<&str> = PROJECT_PARAMS.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["align", "auto-crop", "equalize", "equalize-max-gain"]
+        );
+
+        let align = desc("align");
+        assert_eq!(align.label, "Enabled");
+        assert_eq!(align.kind, ParamKind::Bool);
+        assert_eq!(align.default, ParamValue::Bool(true));
+        assert!(!align.advanced);
+
+        let crop = desc("auto-crop");
+        assert_eq!(crop.label, "Auto-crop");
+        assert_eq!(crop.kind, ParamKind::Bool);
+        assert_eq!(crop.default, ParamValue::Bool(true));
+        assert!(!crop.advanced);
+
+        let on = desc("equalize");
+        assert_eq!(on.label, "Equalize brightness");
+        assert_eq!(on.kind, ParamKind::Bool);
+        assert_eq!(on.default, ParamValue::Bool(true));
+
+        let bound = desc("equalize-max-gain");
+        assert_eq!(bound.label, "Max brightness gain");
+        assert_eq!(
+            bound.kind,
+            ParamKind::Float {
+                min: 1.01,
+                max: 2.0,
+                step: 0.01,
+                logarithmic: false
+            }
+        );
+        assert_eq!(bound.default, ParamValue::Float(1.25));
+
+        for d in PROJECT_PARAMS.iter() {
+            assert!(d.auto.is_none() && d.host_default.is_none(), "{}", d.id);
         }
+    }
+
+    #[test]
+    fn the_equalization_descriptors_are_advanced_and_no_registered_id_collides() {
+        assert!(desc("equalize").advanced && desc("equalize-max-gain").advanced);
+        for algorithm in crate::registry::stack_algorithms() {
+            for p in algorithm.params() {
+                assert!(
+                    PROJECT_PARAMS.iter().all(|d| d.id != p.id),
+                    "{} declares the project parameter id {}",
+                    algorithm.id(),
+                    p.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_equalization_help_states_what_it_is_and_is_not() {
+        for id in ["equalize", "equalize-max-gain"] {
+            let help = desc(id).help.to_lowercase();
+            assert!(help.contains("encoded code values"), "{id}: {help}");
+            assert!(
+                help.contains("not a linear-light correction"),
+                "{id}: {help}"
+            );
+        }
+        let switch = desc("equalize").help.to_lowercase();
+        assert!(!switch.contains("depends on the fusion method"), "{switch}");
+        let bound = &desc("equalize-max-gain").help;
+        assert!(bound.contains("0.8") && bound.contains("1.25"), "{bound}");
+    }
+
+    fn schema_for(id: &str) -> Vec<ParamDesc> {
+        params_for(crate::registry::find_stack(id).expect("a registered fusion method"))
+    }
+
+    fn default_of(schema: &[ParamDesc], id: &str) -> ParamValue {
+        schema
+            .iter()
+            .find(|d| d.id == id)
+            .unwrap_or_else(|| panic!("no project parameter {id}"))
+            .default
+            .clone()
+    }
+
+    #[test]
+    fn equalize_defaults_on_for_every_method() {
+        for algorithm in crate::registry::stack_algorithms() {
+            assert_eq!(
+                default_of(&params_for(algorithm), "equalize"),
+                ParamValue::Bool(true),
+                "{}",
+                algorithm.id()
+            );
+        }
+    }
+
+    fn ids(group: &[ParamDesc]) -> Vec<&str> {
+        group.iter().map(|d| d.id.as_str()).collect()
+    }
+
+    #[test]
+    fn align_prepare_and_finish_partition_the_project_params() {
+        assert_eq!(ids(&ALIGN_PARAMS), ["align"]);
+        assert_eq!(ids(&PREPARE_PARAMS), ["equalize", "equalize-max-gain"]);
+        assert_eq!(ids(&FINISH_PARAMS), ["auto-crop"]);
+        assert_eq!(
+            ids(&PROJECT_PARAMS),
+            ["align", "auto-crop", "equalize", "equalize-max-gain"]
+        );
+        for d in PROJECT_PARAMS.iter() {
+            let groups = [&*ALIGN_PARAMS, &*PREPARE_PARAMS, &*FINISH_PARAMS]
+                .into_iter()
+                .filter(|group| group.iter().any(|g| g.id == d.id))
+                .count();
+            assert_eq!(groups, 1, "{} sits in exactly one group", d.id);
+        }
+        assert_eq!(
+            ALIGN_PARAMS.len() + PREPARE_PARAMS.len() + FINISH_PARAMS.len(),
+            PROJECT_PARAMS.len()
+        );
+
+        let focus_map = crate::registry::find_stack("depth-map").expect("a registered method");
+        let prepare = params_for_group(&PREPARE_PARAMS, focus_map);
+        let finish = params_for_group(&FINISH_PARAMS, focus_map);
+        assert_eq!(ids(&prepare), ["equalize", "equalize-max-gain"]);
+        assert_eq!(ids(&finish), ["auto-crop"]);
+        assert_eq!(default_of(&prepare, "equalize"), ParamValue::Bool(true));
+        assert_eq!(default_of(&finish, "auto-crop"), ParamValue::Bool(true));
+        assert_eq!(
+            default_of(&prepare, "equalize-max-gain"),
+            ParamValue::Float(1.25)
+        );
+    }
+
+    #[test]
+    fn a_method_changes_only_the_defaults_it_declares() {
+        for algorithm in crate::registry::stack_algorithms() {
+            let schema = params_for(algorithm);
+            assert_eq!(schema.len(), PROJECT_PARAMS.len(), "{}", algorithm.id());
+            let declared = algorithm.project_defaults();
+            for (own, base) in schema.iter().zip(PROJECT_PARAMS.iter()) {
+                let expected = declared
+                    .iter()
+                    .find(|(id, _)| *id == base.id)
+                    .map_or(&base.default, |(_, value)| value);
+                assert_eq!(&own.default, expected, "{}/{}", algorithm.id(), base.id);
+                assert_eq!(own.kind, base.kind, "{}/{}", algorithm.id(), base.id);
+            }
+        }
+    }
+
+    #[test]
+    fn equalization_bound_follows_the_default_and_an_explicit_value_wins() {
+        let focus_map = schema_for("depth-map");
+        let details = schema_for("laplacian");
+        let mut values = ParamValues::new();
+        assert_eq!(equalization_bound(&focus_map, &values), Some(1.25));
+        assert_eq!(equalization_bound(&details, &values), Some(1.25));
+
+        values.insert("equalize".into(), ParamValue::Bool(false));
+        assert_eq!(equalization_bound(&focus_map, &values), None);
+        assert_eq!(equalization_bound(&details, &values), None);
+        values.insert("equalize".into(), ParamValue::Bool(true));
+        values.insert("equalize-max-gain".into(), ParamValue::Float(1.4));
+        assert_eq!(equalization_bound(&details, &values), Some(1.4));
     }
 }

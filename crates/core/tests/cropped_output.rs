@@ -175,6 +175,7 @@ fn frame_as_fused() {
     let registration = Registration {
         transforms: transforms.clone(),
         crop: Some(crop),
+        equalization: None,
     };
     assert_eq!(
         registration.extent(frame_dims),

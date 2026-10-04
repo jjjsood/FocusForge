@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Whole-pipeline parity over `fixtures/mantis-512` (8 frames, 512x512, 4
-//! tiles at `tile_size = 512, levels = 5`): CPU (`FusionConsumer` +
-//! `WarpingReader`) against GPU (`BackendFusionConsumer`), with non-identity
-//! transforms so the warp stage is compared. A differing pixel is exempt only
+//! Whole-pipeline parity over `fixtures/mantis-512` (8 frames, 512x512, 2x2
+//! tiles at `tile_size = 512, levels = 5`, 160 px margin): CPU
+//! (`FusionConsumer` + `WarpingReader`) against GPU (`BackendFusionConsumer`),
+//! with non-identity transforms so the warp stage is compared. A differing pixel is exempt only
 //! when proven: a ±1 LSB-reachable near-tie at some pyramid level, or the
 //! warp's ±1 LSB tolerance propagated through `collapse` (one or two sources).
 
@@ -29,6 +29,22 @@ use crate::common::open_stack;
 const NEAR_TIE_REL: f32 = 128.0 * f32::EPSILON;
 
 const LEVELS: u32 = 5;
+
+fn laplacian_cfg() -> ParamValues {
+    let mut cfg = ParamValues::new();
+    cfg.insert("levels".to_string(), ParamValue::Int(LEVELS as i64));
+    cfg
+}
+
+/// Scheduler options planning the Laplacian's own support (reach and depth)
+/// at the default tile size.
+pub(crate) fn laplacian_options(scratch: PathBuf) -> TileSchedulerOptions {
+    let support = Laplacian.tile_support(&laplacian_cfg());
+    let mut options = TileSchedulerOptions::new(scratch);
+    options.levels = support.decimation_levels;
+    options.reach_px = support.reach_px;
+    options
+}
 
 /// Canvas `(width, height, spp)` as one `Copy` value.
 #[derive(Clone, Copy)]
@@ -121,16 +137,14 @@ fn run_cpu(label: &str, transforms: Vec<Transform>) -> RunOutputs {
     let stack_ctx = StackContext::new(frame_count, width, height, spp);
 
     let reader = WarpingReader::new(&stack, (width, height), spp, transforms);
-    let mut options = TileSchedulerOptions::new(scratch_base(&format!("{label}_cpu")));
-    options.levels = LEVELS;
+    let options = laplacian_options(scratch_base(&format!("{label}_cpu")));
     let scheduler =
         TileScheduler::new(&reader, stack_ctx, spp, &options).expect("scheduler must build");
 
     let composite_path = tmp_path(&format!("parity_pipeline_{label}_cpu_composite.tif"));
     let zmap_path = tmp_path(&format!("parity_pipeline_{label}_cpu_zmap.tif"));
 
-    let mut cfg = ParamValues::new();
-    cfg.insert("levels".to_string(), ParamValue::Int(LEVELS as i64));
+    let cfg = laplacian_cfg();
     let consumer = FusionConsumer::create(
         &Laplacian,
         cfg,
@@ -176,16 +190,14 @@ fn run_gpu(
     let frame_count = stack.len();
     let stack_ctx = StackContext::new(frame_count, width, height, spp);
 
-    let mut options = TileSchedulerOptions::new(scratch_base(&format!("{label}_gpu")));
-    options.levels = LEVELS;
+    let options = laplacian_options(scratch_base(&format!("{label}_gpu")));
     let scheduler =
         TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
 
     let composite_path = tmp_path(&format!("parity_pipeline_{label}_gpu_composite.tif"));
     let zmap_path = tmp_path(&format!("parity_pipeline_{label}_gpu_zmap.tif"));
 
-    let mut cfg = ParamValues::new();
-    cfg.insert("levels".to_string(), ParamValue::Int(LEVELS as i64));
+    let cfg = laplacian_cfg();
     let sink = FusionConsumer::create(
         &Laplacian,
         cfg,
@@ -811,8 +823,7 @@ fn rebuild_composite_pixel_with_perturbations(
         })
         .collect();
     let ctx = TileCtx::new(rect, &tiles);
-    let mut cfg = ParamValues::new();
-    cfg.insert("levels".to_string(), ParamValue::Int(LEVELS as i64));
+    let cfg = laplacian_cfg();
     let output = Laplacian
         .fuse(&ctx, &cfg)
         .expect("cpu fuse must succeed for the warp-noise-propagation probe");
@@ -1040,16 +1051,19 @@ fn assert_zmap_exact_or_near_tie(
 /// `backend` is a parameter so the same comparison runs at two device
 /// budgets ([`gpu_stack_matches_cpu_stack_at_probed_budget`],
 /// [`gpu_stack_matches_cpu_stack_at_a_forced_one_tile_budget`]).
-fn assert_gpu_matches_cpu_stack(label: &str, backend: &dyn TileBackend) {
+fn assert_gpu_matches_cpu_stack(
+    label: &str,
+    backend: &dyn TileBackend,
+    transforms: Vec<Transform>,
+) -> Vec<u16> {
     let stack = open_stack();
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
     let frame_count = stack.len();
-    let transforms = non_identity_transforms(frame_count);
 
     let cpu = run_cpu(&format!("{label}_composite"), transforms.clone());
     let Some(gpu) = run_gpu(&format!("{label}_composite"), transforms.clone(), backend) else {
-        return;
+        return Vec::new();
     };
 
     let (cpu_samples, cw, ch, cspp) = read_composite(&cpu.composite_path);
@@ -1285,6 +1299,7 @@ fn assert_gpu_matches_cpu_stack(label: &str, backend: &dyn TileBackend) {
         "whole-pipeline composite parity exceeded 1 LSB at a pixel that is neither a proven \
          near-tie nor explained by warp-noise propagation: worst={worst} at index {worst_index}"
     );
+    gpu_zmap
 }
 
 #[test]
@@ -1293,7 +1308,8 @@ fn gpu_stack_matches_cpu_stack_at_probed_budget() {
         return;
     }
     let backend = gpu_backend().expect("gpu backend");
-    assert_gpu_matches_cpu_stack("probed_budget", backend);
+    let transforms = non_identity_transforms(open_stack().len());
+    assert_gpu_matches_cpu_stack("probed_budget", backend, transforms);
 }
 
 /// The same comparison, forced onto a one-tile-in-flight `GpuBackend`
@@ -1306,7 +1322,65 @@ fn gpu_stack_matches_cpu_stack_at_a_forced_one_tile_budget() {
         return;
     }
     let backend = GpuBackend::with_max_device_bytes(1).expect("tiny gpu backend");
-    assert_gpu_matches_cpu_stack("tiny_budget", &backend);
+    let transforms = non_identity_transforms(open_stack().len());
+    assert_gpu_matches_cpu_stack("tiny_budget", &backend, transforms);
+}
+
+/// A translation of frame 3 by `(-12.5, 0)` leaves a wide uncovered band at
+/// its right edge, and the similarity leaves thin uncovered rims; in both
+/// the GPU stack matches the CPU stack and never names a frame at a pixel
+/// that frame's warp does not cover.
+#[test]
+fn gpu_stack_matches_cpu_stack_with_uncovered_borders() {
+    if focusforge_gpu::device::shared_device_or_skip().is_none() {
+        return;
+    }
+    let backend = gpu_backend().expect("gpu backend");
+    let stack = open_stack();
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let frame_count = stack.len();
+    let mut shifted = vec![Transform::identity(); frame_count];
+    shifted[3] = Transform::translation(-12.5, 0.0);
+    for (label, transforms) in [
+        ("uncovered_translation", shifted),
+        ("uncovered_similarity", non_identity_transforms(frame_count)),
+    ] {
+        let zmap = assert_gpu_matches_cpu_stack(label, backend, transforms.clone());
+        let reader = WarpingReader::new(&stack, (width, height), spp, transforms);
+        let canvas = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let mut scratch = vec![0u16; (width * height * spp) as usize];
+        let mut uncovered_pixels = 0usize;
+        for frame in 0..frame_count {
+            let Some(covered) = reader
+                .read_tile_coverage_into(frame, canvas, &mut scratch)
+                .expect("read coverage")
+            else {
+                continue;
+            };
+            uncovered_pixels += covered.iter().filter(|&&c| !c).count();
+            let named = zmap
+                .iter()
+                .zip(&covered)
+                .filter(|&(&z, &c)| usize::from(z) == frame && !c)
+                .count();
+            assert_eq!(
+                named, 0,
+                "{label}: the GPU Z-Map names frame {frame} at {named} pixel(s) its warp does \
+                 not cover"
+            );
+        }
+        assert!(
+            uncovered_pixels > 0,
+            "{label}: the transforms must leave pixels uncovered"
+        );
+        println!("{label}: {uncovered_pixels} uncovered frame pixels, none named by the Z-Map");
+    }
 }
 
 /// See [`assert_gpu_matches_cpu_stack`]'s own doc comment: `backend` is a

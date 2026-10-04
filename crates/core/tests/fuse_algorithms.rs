@@ -2,8 +2,8 @@
 
 //! Fixture-backed driver tests for `weighted-average` and `depth-map` over
 //! `fixtures/mantis-512`. The scheduler's `levels` comes from
-//! `algo.tile_levels(&values)`, the same bridge the CLI uses; and
-//! `levels_override` exists solely for the seam demonstration
+//! `algo.tile_support(&values)`, the same bridge the CLI uses; and
+//! `levels_override` exists solely for the halo-free comparison
 //! (`the_trait_default_would_have_seamed`).
 
 mod common;
@@ -11,11 +11,13 @@ mod common;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use focusforge_core::algorithm::TileCtx;
+use focusforge_core::algorithm::{AlgorithmError, TileCtx, TileReader};
+use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::fuse::{FusionConsumer, FusionGeometry, Plane, build, metrics};
 use focusforge_core::io::{Rect, TiffStack};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::registry;
+use focusforge_core::tile::plan::{TilePlan, TileSupport};
 use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 use focusforge_core::zmap::NO_SOURCE;
 use focusforge_core::zmap::metrics::all_eight_identical_fraction;
@@ -32,7 +34,7 @@ struct FusionResult {
 
 /// Runs `algo_id` at `(tile_size, levels)` over `fixtures/mantis-512` into
 /// `.scratch/fuse/<label>.tif` + `-zmap.tif`, and reads both back. `levels`
-/// comes from `algo.tile_levels(&values)` unless `levels_override` is
+/// comes from `algo.tile_support(&values)` unless `levels_override` is
 /// given -- the seam demonstration's only reason to exist.
 fn run_fusion(
     algo_id: &str,
@@ -42,10 +44,32 @@ fn run_fusion(
     levels_override: Option<u32>,
 ) -> FusionResult {
     let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
-    let frame_count = stack.len();
-    let stack_ctx = StackContext::new(frame_count, width, height, spp);
+    run_fusion_over(
+        stack_context(&stack),
+        &stack,
+        algo_id,
+        label,
+        tile_size,
+        explicit,
+        levels_override,
+    )
+}
+
+/// [`run_fusion`] over `reader`, which serves the frames `stack_ctx`
+/// describes (the same stack, a warping reader wrapped around it, or
+/// in-memory frames).
+fn run_fusion_over(
+    stack_ctx: StackContext,
+    reader: &dyn TileReader,
+    algo_id: &str,
+    label: &str,
+    tile_size: u32,
+    explicit: &ParamValues,
+    levels_override: Option<u32>,
+) -> FusionResult {
+    let (width, height) = (stack_ctx.width, stack_ctx.height);
+    let spp = stack_ctx.samples_per_pixel;
+    let frame_count = stack_ctx.frame_count;
 
     let algo =
         registry::find_stack(algo_id).unwrap_or_else(|e| panic!("{algo_id} must resolve: {e}"));
@@ -56,7 +80,9 @@ fn run_fusion(
     // The same bridge `crates/cli/src/stack.rs` uses: the algorithm names
     // its own margin requirement, never a number this test supplies
     // separately.
-    let levels = levels_override.unwrap_or_else(|| algo.tile_levels(&values));
+    let support = levels_override
+        .map(TileSupport::from)
+        .unwrap_or_else(|| algo.tile_support(&values));
 
     let scratch_dir = common::workspace_root().join(".scratch").join("fuse");
     std::fs::create_dir_all(&scratch_dir).expect("scratch dir must be creatable");
@@ -66,10 +92,10 @@ fn run_fusion(
     let scheduler_scratch =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("fuse_algorithms_{label}"));
     let mut options = TileSchedulerOptions::explicit_budget(scheduler_scratch, 1 << 30);
+    options.apply_support(support);
     options.tile_size = tile_size;
-    options.levels = levels;
     let scheduler =
-        TileScheduler::new(&stack, stack_ctx, spp, &options).expect("scheduler must build");
+        TileScheduler::new(reader, stack_ctx, spp, &options).expect("scheduler must build");
     let consumer = FusionConsumer::create(
         algo,
         values,
@@ -121,6 +147,40 @@ fn no_explicit() -> ParamValues {
     ParamValues::new()
 }
 
+fn stack_context(stack: &TiffStack) -> StackContext {
+    let (width, height) = stack.dimensions();
+    StackContext::new(
+        stack.len(),
+        width,
+        height,
+        stack.header(0).samples_per_pixel,
+    )
+}
+
+/// Full frames held in memory, served as a [`TileReader`].
+struct MemoryFrames {
+    ctx: StackContext,
+    frames: Vec<Vec<u16>>,
+}
+
+impl TileReader for MemoryFrames {
+    fn read_tile_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        let spp = self.ctx.samples_per_pixel as usize;
+        let row_len = rect.width as usize * spp;
+        for row in 0..rect.height as usize {
+            let src = ((rect.y as usize + row) * self.ctx.width as usize + rect.x as usize) * spp;
+            out[row * row_len..(row + 1) * row_len]
+                .copy_from_slice(&self.frames[frame][src..src + row_len]);
+        }
+        Ok(())
+    }
+}
+
 fn weighted_average_tiled() -> &'static FusionResult {
     static ONCE: OnceLock<FusionResult> = OnceLock::new();
     ONCE.get_or_init(|| {
@@ -148,7 +208,7 @@ fn weighted_average_single_tile() -> &'static FusionResult {
 }
 
 /// The same tiled (256) run, but with the scheduler forced to the trait
-/// *default* `tile_levels` would answer (`0`, i.e. no halo at all) --
+/// *default* `tile_support` would answer (`0`, i.e. no halo at all) --
 /// the halo-free comparison the rest of this suite checks against.
 fn weighted_average_forced_to_the_default_levels() -> &'static FusionResult {
     static ONCE: OnceLock<FusionResult> = OnceLock::new();
@@ -434,7 +494,7 @@ fn the_trait_default_would_have_seamed() {
 
     assert_eq!(
         own_answer.composite, single.composite,
-        "weighted-average's own tile_levels answer must still match the single-tile reference"
+        "weighted-average's own tile_support answer must still match the single-tile reference"
     );
 
     let differs = forced.composite != single.composite || forced.zmap != single.zmap;
@@ -495,4 +555,372 @@ fn sharpness_is_recorded_for_each() {
         "depth-map's composite must be strictly sharper than weighted-average's: \
          depth-map={lapvar_dm:.1}, weighted-average={lapvar_wa:.1}"
     );
+}
+
+/// Frame 3 of `fixtures/mantis-512` translated by `(-12.5, 0)` through a
+/// [`WarpingReader`], no crop: the frame's left columns have no source.
+const SHIFTED_FRAME: usize = 3;
+
+fn shifted_transforms(frame_count: usize) -> Vec<Transform> {
+    let mut transforms = vec![Transform::identity(); frame_count];
+    transforms[SHIFTED_FRAME] = Transform::translation(-12.5, 0.0);
+    transforms
+}
+
+fn run_shifted(algo_id: &str, label: &str, tile_size: u32) -> FusionResult {
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let reader = WarpingReader::new(
+        &stack,
+        (width, height),
+        spp,
+        shifted_transforms(stack.len()),
+    );
+    run_fusion_over(
+        stack_context(&stack),
+        &reader,
+        algo_id,
+        label,
+        tile_size,
+        &no_explicit(),
+        None,
+    )
+}
+
+/// Every frame as the warping reader serves it, with its coverage mask
+/// (`None`: covered everywhere).
+fn warped_frames() -> (Vec<Vec<u16>>, Vec<Option<Vec<bool>>>) {
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let reader = WarpingReader::new(
+        &stack,
+        (width, height),
+        spp,
+        shifted_transforms(stack.len()),
+    );
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let mut frames = Vec::new();
+    let mut coverage = Vec::new();
+    for f in 0..stack.len() {
+        let mut samples = vec![0u16; (width * height * spp) as usize];
+        coverage.push(
+            reader
+                .read_tile_coverage_into(f, rect, &mut samples)
+                .expect("warped read"),
+        );
+        frames.push(samples);
+    }
+    (frames, coverage)
+}
+
+/// Mean over pixels with an uncovered source of how far the composite's
+/// luma (channel mean) falls below the darkest covered source's.
+fn border_pull(result: &FusionResult, frames: &[Vec<u16>], coverage: &[Option<Vec<bool>>]) -> f64 {
+    let spp = result.spp as usize;
+    let luma = |samples: &[u16], p: usize| {
+        samples[p * spp..(p + 1) * spp]
+            .iter()
+            .map(|&s| f64::from(s))
+            .sum::<f64>()
+            / spp as f64
+    };
+    let (mut total, mut count) = (0.0, 0u64);
+    for p in 0..(result.width * result.height) as usize {
+        let covered = |f: usize| coverage[f].as_ref().is_none_or(|c| c[p]);
+        if (0..frames.len()).all(covered) {
+            continue;
+        }
+        let darkest = (0..frames.len())
+            .filter(|&f| covered(f))
+            .map(|f| luma(&frames[f], p))
+            .fold(f64::INFINITY, f64::min);
+        total += (darkest - luma(&result.composite, p)).max(0.0);
+        count += 1;
+    }
+    assert!(count > 0, "the shifted frame must leave pixels uncovered");
+    total / count as f64
+}
+
+#[test]
+fn uncovered_border_never_wins_or_darkens() {
+    let (frames, coverage) = warped_frames();
+    for algo_id in ["laplacian", "weighted-average", "depth-map"] {
+        let result = run_shifted(algo_id, &format!("{algo_id}-shifted"), 512);
+        for (p, &f) in result.zmap.iter().enumerate() {
+            assert!(
+                f != NO_SOURCE && coverage[f as usize].as_ref().is_none_or(|c| c[p]),
+                "{algo_id}: pixel {p} names frame {f}, which has no source there"
+            );
+        }
+        let pull = border_pull(&result, &frames, &coverage);
+        println!("uncovered_border_never_wins_or_darkens: {algo_id} border_pull={pull:.1}");
+        assert!(pull <= 200.0, "{algo_id}: border_pull {pull:.1} counts");
+        if algo_id == "depth-map" {
+            let spp = result.spp as usize;
+            for (p, &f) in result.zmap.iter().enumerate() {
+                assert_eq!(
+                    result.composite[p * spp..(p + 1) * spp],
+                    frames[f as usize][p * spp..(p + 1) * spp],
+                    "depth-map: pixel {p} must copy its winner"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn masked_tiled_matches_single_tile() {
+    for algo_id in ["laplacian", "weighted-average", "depth-map"] {
+        let large = run_shifted(algo_id, &format!("{algo_id}-shifted-1024"), 1024);
+        for tile_size in [448, 480] {
+            let small = run_shifted(
+                algo_id,
+                &format!("{algo_id}-shifted-{tile_size}"),
+                tile_size,
+            );
+            assert_eq!(
+                small.zmap, large.zmap,
+                "{algo_id} at {tile_size}: Z-Maps differ"
+            );
+            assert_eq!(
+                small.composite, large.composite,
+                "{algo_id} at {tile_size}: composites differ"
+            );
+        }
+    }
+}
+
+const WINDOW: Rect = Rect {
+    x: 1,
+    y: 3,
+    width: 509,
+    height: 437,
+};
+
+/// The mantis-512 frames cut to [`WINDOW`].
+fn mantis_window() -> MemoryFrames {
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
+    let spp = stack.header(0).samples_per_pixel;
+    MemoryFrames {
+        ctx: StackContext::new(stack.len(), WINDOW.width, WINDOW.height, spp),
+        frames: (0..stack.len())
+            .map(|f| stack.read_tile(f, WINDOW).expect("window read").samples)
+            .collect(),
+    }
+}
+
+/// Sets a 16x16 block of one channel of frame 2 to full scale, ending at the
+/// bottom-right pixel of tile 0's read rect for `support` at `tile_size`: an
+/// interior read-rect edge, where the neighbouring tiles' interiors begin.
+fn put_impulse_at_the_first_read_corner(
+    frames: &mut MemoryFrames,
+    support: TileSupport,
+    tile_size: u32,
+) {
+    let spp = frames.ctx.samples_per_pixel;
+    let plan = TilePlan::new(WINDOW.width, WINDOW.height, tile_size, support)
+        .expect("the window must plan");
+    let read = plan.tiles()[0].read();
+    let (right, bottom) = (read.x + read.width, read.y + read.height);
+    assert!(
+        right < WINDOW.width && bottom < WINDOW.height,
+        "the edge must be interior"
+    );
+    for y in bottom - 16..bottom {
+        for x in right - 16..right {
+            frames.frames[2][((y * WINDOW.width + x) * spp + 1) as usize] = u16::MAX;
+        }
+    }
+}
+
+#[test]
+fn odd_window_with_a_boundary_impulse_is_tile_invariant() {
+    for (source, make_frames) in [
+        ("mantis", mantis_window as fn() -> MemoryFrames),
+        ("synthetic", || {
+            synthetic_frames(WINDOW.width, WINDOW.height, 4)
+        }),
+    ] {
+        for algo_id in ["laplacian", "weighted-average", "depth-map"] {
+            let mut frames = make_frames();
+            let algo = registry::find_stack(algo_id).expect("method is registered");
+            let resolved = params::resolve(algo.params(), &no_explicit(), &frames.ctx)
+                .expect("resolve must succeed");
+            let support = algo.tile_support(&params::resolved_values(&resolved));
+            if source == "mantis" {
+                put_impulse_at_the_first_read_corner(&mut frames, support, 448);
+            }
+            let run = |tile_size: u32| {
+                run_fusion_over(
+                    frames.ctx,
+                    &frames,
+                    algo_id,
+                    &format!("{algo_id}-odd-window-{source}-{tile_size}"),
+                    tile_size,
+                    &no_explicit(),
+                    None,
+                )
+            };
+            let tiled = run(448);
+            let single = run(1024);
+            assert_eq!(tiled.zmap, single.zmap, "{source} {algo_id}: Z-Maps differ");
+            assert_eq!(
+                tiled.composite, single.composite,
+                "{source} {algo_id}: composites differ"
+            );
+        }
+    }
+}
+
+/// Deterministic textured frames: every frame carries noise of a similar
+/// amplitude, a little stronger in staggered blocks, so scores are near-tied
+/// almost everywhere and selections change hands across every tile edge.
+fn synthetic_frames(width: u32, height: u32, frame_count: usize) -> MemoryFrames {
+    let spp = 3u32;
+    let hash = |x: u32, y: u32, f: u32, c: u32| {
+        let mut h = x
+            .wrapping_mul(0x9E37_79B1)
+            .wrapping_add(y.wrapping_mul(0x85EB_CA77))
+            .wrapping_add(f.wrapping_mul(0xC2B2_AE3D))
+            .wrapping_add(c.wrapping_mul(0x27D4_EB2F));
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2C1B_3C6D);
+        h ^= h >> 12;
+        h = h.wrapping_mul(0x297A_2D39);
+        h ^= h >> 15;
+        (h & 0xFFFF) as i64 - 32768
+    };
+    let frames = (0..frame_count as u32)
+        .map(|f| {
+            let mut samples = Vec::with_capacity((width * height * spp) as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let sharp = (x / 97 + y / 89 + f) % frame_count as u32 == 0;
+                    let amplitude = if sharp { 4000 } else { 3200 };
+                    for c in 0..spp {
+                        let base = 20000 + (x + 2 * y) as i64 + 3000 * c as i64;
+                        let value = base + hash(x, y, f, c) * amplitude / 32768;
+                        samples.push(value.clamp(0, 65535) as u16);
+                    }
+                }
+            }
+            samples
+        })
+        .collect();
+    MemoryFrames {
+        ctx: StackContext::new(frame_count, width, height, spp),
+        frames,
+    }
+}
+
+/// The shipped default geometry for Laplacian at 5 levels (tile 704, margin
+/// 160) over a frame of 1500x1600: the width leaves a ragged last tile of its
+/// own, the height absorbs its remainder into the previous tile.
+#[test]
+fn laplacian_default_tile_geometry_is_tile_invariant() {
+    let frames = synthetic_frames(1500, 1600, 4);
+    let algo = registry::find_stack("laplacian").expect("laplacian is registered");
+    let resolved =
+        params::resolve(algo.params(), &no_explicit(), &frames.ctx).expect("resolve must succeed");
+    let support = algo.tile_support(&params::resolved_values(&resolved));
+    assert_eq!(support.margin(), 160);
+    let default_tile = support.default_tile_size();
+    assert_eq!(default_tile, 704);
+    let plan = TilePlan::new(1500, 1600, default_tile, support).expect("default tile plans");
+    assert!(plan.len() > 9, "the frame must plan several tiles");
+
+    let run = |label: &str, tile_size: u32| {
+        run_fusion_over(
+            frames.ctx,
+            &frames,
+            "laplacian",
+            label,
+            tile_size,
+            &no_explicit(),
+            None,
+        )
+    };
+    let tiled = run("laplacian-synthetic-default", default_tile);
+    let single = run("laplacian-synthetic-single", 2048);
+    assert_eq!(tiled.zmap, single.zmap, "Z-Maps differ");
+    assert_eq!(tiled.composite, single.composite, "composites differ");
+}
+
+/// An on-demand context over a warping reader fuses a non-square rect at an
+/// odd origin, which reaches the uncovered band, to the same bytes as a
+/// resident context over the same tiles and masks.
+#[test]
+fn streamed_context_matches_the_resident_context() {
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let frame_count = stack.len();
+    let reader = WarpingReader::new(
+        &stack,
+        (width, height),
+        spp,
+        shifted_transforms(frame_count),
+    );
+    let rect = Rect {
+        x: 1,
+        y: 3,
+        width: 301,
+        height: 187,
+    };
+    let len = (rect.width * rect.height * spp) as usize;
+
+    let mut tiles = Vec::new();
+    let mut coverage = Vec::new();
+    for f in 0..frame_count {
+        let mut samples = vec![0u16; len];
+        coverage.push(
+            reader
+                .read_tile_coverage_into(f, rect, &mut samples)
+                .expect("warped read"),
+        );
+        tiles.push(focusforge_core::tile::Tile {
+            rect,
+            samples_per_pixel: spp,
+            samples,
+        });
+    }
+    assert!(
+        coverage[SHIFTED_FRAME]
+            .as_ref()
+            .is_some_and(|mask| mask.contains(&false)),
+        "the rect must reach the uncovered band"
+    );
+
+    let stack_ctx = stack_context(&stack);
+    for algo_id in ["laplacian", "weighted-average", "depth-map"] {
+        let algo = registry::find_stack(algo_id).expect("method must resolve");
+        let mut explicit = ParamValues::new();
+        if algo_id == "laplacian" {
+            explicit.insert("levels".to_string(), ParamValue::Int(3));
+        }
+        let resolved = params::resolve(algo.params(), &explicit, &stack_ctx).expect("resolve");
+        let values = params::resolved_values(&resolved);
+
+        let resident = TileCtx::new(rect, &tiles).with_coverage(&coverage);
+        let streamed = TileCtx::on_demand(rect, frame_count, spp, &reader, &NoopPreprocess);
+        let expected = algo.fuse(&resident, &values).expect("resident fuse");
+        let actual = algo.fuse(&streamed, &values).expect("streamed fuse");
+
+        assert_eq!(streamed.frames_read(), frame_count, "{algo_id}");
+        assert!(
+            actual.zmap == expected.zmap,
+            "{algo_id}: Z-Maps differ between streamed and resident contexts"
+        );
+        assert!(
+            actual.tile == expected.tile,
+            "{algo_id}: composites differ between streamed and resident contexts"
+        );
+    }
 }

@@ -81,6 +81,8 @@ fn shared_project() -> &'static SharedProject {
             "laplacian".to_string(),
             "--no-align".to_string(),
             "--no-crop".to_string(),
+            "--set".to_string(),
+            "equalize=false".to_string(),
         ];
         // The GPU path's ±1 LSB budget would break the exact-byte equality
         // this file asserts against a CPU library oracle -- the same reason
@@ -437,6 +439,7 @@ fn build_branched(name: &str) -> Branched {
                 width: RW,
                 height: RH,
             }),
+            equalization: None,
         },
         composite_description: "re-fused composite".to_string(),
         label: None,
@@ -713,6 +716,8 @@ fn aligned_project() -> &'static AlignedProject {
             "laplacian".to_string(),
             "--align-algo".to_string(),
             "dummy-align".to_string(),
+            "--set".to_string(),
+            "equalize=false".to_string(),
         ];
         if cfg!(feature = "gpu") {
             args.push("--no-gpu".to_string());
@@ -1341,4 +1346,165 @@ fn export_frame_output_alone_is_refused_by_name() {
         result.stderr
     );
     assert!(!out.exists());
+}
+
+#[test]
+fn export_frame_applies_the_recorded_equalization() {
+    let cwd = common::tmp_dir("export_cli_equalized_frame");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let input = common::fixtures_dir().join("mantis-512");
+    let stacked = run_cli_in(
+        &cwd,
+        &common::push_no_gpu(vec![
+            "stack",
+            input.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "weighted-average",
+            "--no-align",
+            "--no-crop",
+            "--set",
+            "equalize=true",
+        ]),
+    );
+    assert!(stacked.success, "stderr: {}", stacked.stderr);
+    let project_path = only_project(&out_dir);
+    let project = Project::open(&project_path).expect("open project");
+    let gains = project
+        .manifest()
+        .registration
+        .equalization
+        .clone()
+        .expect("the project records the equalization")
+        .gains;
+    let unit = 1u32 << 16;
+    let (frame, gain) = gains
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by_key(|&(_, g)| g.abs_diff(unit))
+        .unwrap();
+    assert_ne!(gain, unit, "the fixture's frames differ in brightness");
+
+    let out = cwd.join("frame.tif");
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "export",
+            project_path.to_str().unwrap(),
+            "--frame",
+            &frame.to_string(),
+            "--frame-output",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(result.success, "stderr: {}", result.stderr);
+
+    let source = project.source_path(&project.manifest().sources[frame]);
+    let raw = TiffStack::open_files(std::slice::from_ref(&source)).expect("open the source frame");
+    let exported = TiffStack::open_files(std::slice::from_ref(&out)).expect("open the export");
+    let (width, height) = raw.dimensions();
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let want: Vec<u16> = raw
+        .read_tile(0, whole)
+        .expect("read the source")
+        .samples
+        .iter()
+        .map(|&s| ((u64::from(s) * u64::from(gain) + 32_768) >> 16).min(65_535) as u16)
+        .collect();
+    let got = exported
+        .read_tile(0, whole)
+        .expect("read the export")
+        .samples;
+    assert!(
+        got == want,
+        "frame {frame} must be its source times gain {gain}/65536"
+    );
+}
+
+#[test]
+fn export_image_gathers_through_the_recorded_equalization() {
+    let cwd = common::tmp_dir("export_cli_equalized_gather");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let input = common::fixtures_dir().join("mantis-512");
+    let stacked = run_cli_in(
+        &cwd,
+        &common::push_no_gpu(vec![
+            "stack",
+            input.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "weighted-average",
+            "--no-align",
+            "--no-crop",
+            "--set",
+            "equalize=true",
+        ]),
+    );
+    assert!(stacked.success, "stderr: {}", stacked.stderr);
+    let project_path = only_project(&out_dir);
+    let mut project = Project::open(&project_path).expect("open project");
+    let gains = project
+        .manifest()
+        .registration
+        .equalization
+        .clone()
+        .expect("the project records the equalization")
+        .gains;
+    assert!(
+        gains.iter().any(|&g| g != 1 << 16),
+        "the fixture's frames differ in brightness"
+    );
+
+    let out = cwd.join("image.tif");
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "export",
+            project_path.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(result.success, "stderr: {}", result.stderr);
+
+    let head = project.checkpoint().clone();
+    let zmap_path = cwd.join("head-zmap.tif");
+    project::materialize_zmap(&mut project, &head, &zmap_path).unwrap();
+    let map = ZMapReader::open(&zmap_path).unwrap();
+    let (width, height) = map.dimensions();
+    let whole = branched_full(width, height);
+    let mut indices = vec![0u16; (width * height) as usize];
+    map.read_tile_into(whole, &mut indices).unwrap();
+
+    let stack = TiffStack::open(&input).unwrap();
+    let spp = stack.header(0).samples_per_pixel as usize;
+    let frames: Vec<Vec<u16>> = (0..stack.len())
+        .map(|f| stack.read_tile(f, whole).unwrap().samples)
+        .collect();
+    let mut want = vec![0u16; indices.len() * spp];
+    for (px, &frame) in indices.iter().enumerate() {
+        let frame = usize::from(frame);
+        for c in 0..spp {
+            let sample = u64::from(frames[frame][px * spp + c]);
+            want[px * spp + c] =
+                ((sample * u64::from(gains[frame]) + 32_768) >> 16).min(65_535) as u16;
+        }
+    }
+
+    let exported = TiffStack::open_files(std::slice::from_ref(&out)).unwrap();
+    let got = exported.read_tile(0, whole).unwrap().samples;
+    assert!(
+        got == want,
+        "the exported pixels must be the head's Z-Map gathered over the gained frames"
+    );
 }

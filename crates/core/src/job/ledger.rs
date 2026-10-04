@@ -505,6 +505,12 @@ impl ResumeStore {
                 candidate.align,
                 record.align
             );
+            check_identity!(
+                candidate.composite_output,
+                "equalization",
+                candidate.equalization,
+                record.equalization
+            );
 
             let ledger = Ledger::open(dir)?;
             return Ok(Resumable::Ledger(ledger));
@@ -576,6 +582,7 @@ mod tests {
             backend: "cpu".to_string(),
             align: None,
             crop: None,
+            equalization: None,
             composite_output: output,
             zmap_output: None,
         }
@@ -729,6 +736,28 @@ mod tests {
         match store.find(&record).unwrap() {
             Resumable::None => {}
             other => panic!("expected Resumable::None for an unrecognised format, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn a_record_written_under_the_previous_margin_is_not_resumed() {
+        // Format 2 recorded `tile_size` and `levels` only; the Laplacian
+        // margin is derived, so such a record's tiles were fused at a
+        // narrower overlap than the plan this build derives.
+        let scratch = tmp_dir("previous-margin-format");
+        let store = ResumeStore::open(&scratch).unwrap();
+        let mut record = sample_record(&scratch, "out.tif");
+        let mut previous = record.clone();
+        previous.format = 2;
+        let dir = scratch.join("resume").join("previous-dir");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("job.json"), serde_json::to_vec(&previous).unwrap()).unwrap();
+
+        record.format = super::super::record::JOB_RECORD_FORMAT;
+        match store.find(&record).unwrap() {
+            Resumable::None => {}
+            other => panic!("expected Resumable::None for a format-2 record, got {other:?}"),
         }
         let _ = fs::remove_dir_all(&scratch);
     }

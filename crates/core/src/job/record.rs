@@ -14,22 +14,15 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::align::FailurePolicy;
+use crate::equalize::Equalization;
 use crate::job::fingerprint::StackFingerprint;
 use crate::params::ParamValues;
 use crate::tile::Rect;
 
-/// The current on-disk record format. Bump this, never the field shapes
-/// below, when the record's meaning changes in a way an older reader must
-/// not interpret optimistically.
-///
-/// `1 -> 2`: [`AlignIdentity`] gained `failure_policy`. A `job.json` written
-/// before this build carries no failure policy, and defaulting it to
-/// [`FailurePolicy::Strict`] would let a strict resume adopt a lax run's
-/// tiles -- exactly the bug this bump fixes. An unrecognised format is
-/// already "no resumable state, start over"
-/// (`super::ledger::ResumeStore::find`), so the bump is safe by
-/// construction.
-pub const JOB_RECORD_FORMAT: u32 = 2;
+/// The current on-disk record format. A record whose format number differs is
+/// discarded and a resume starts over; bump it when the meaning of a recorded
+/// tile changes.
+pub const JOB_RECORD_FORMAT: u32 = 4;
 
 /// Everything a resume must agree with before it is allowed to continue: the
 /// stack's identity, the geometry that gives a `PlannedTile::index()` its
@@ -62,6 +55,9 @@ pub struct JobRecord {
     pub backend: String,
     pub align: Option<AlignIdentity>,
     pub crop: Option<Rect>,
+    /// The bound and per-frame gains the fused tiles were read through;
+    /// `None` when equalization was off.
+    pub equalization: Option<Equalization>,
     pub composite_output: PathBuf,
     pub zmap_output: Option<PathBuf>,
 }
@@ -132,6 +128,7 @@ mod tests {
             backend: "cpu".to_string(),
             align: None,
             crop: None,
+            equalization: None,
             composite_output: PathBuf::from("out.tif"),
             zmap_output: None,
         }

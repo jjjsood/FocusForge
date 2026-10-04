@@ -5,6 +5,7 @@
 //! loop in `Laplacian::fuse`.
 
 use crate::fuse::{FusionPipelines, run_pass, upload_params};
+use crate::pipeline::Pipeline;
 use crate::transfer::create_storage_buffer;
 
 fn score_params(width: u32, height: u32, spp: u32, radius: u32) -> [u8; 16] {
@@ -228,4 +229,90 @@ pub fn mean(
         len,
         "focusforge-gpu-fuse-residual-mean-pass",
     );
+}
+
+fn eligibility_params(len: u32, spp: u32, fill: f32) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&len.to_le_bytes());
+    bytes[4..8].copy_from_slice(&spp.to_le_bytes());
+    bytes[8..12].copy_from_slice(&fill.to_le_bytes());
+    bytes
+}
+
+/// Writes `fill` over every sample of the pixels `mask` (one `u32` per pixel)
+/// marks 0, in place -- `-inf` into a score plane or `0.0` into a residual.
+/// The GPU twin of skipping an ineligible frame in `Laplacian::fuse`.
+#[allow(clippy::too_many_arguments)]
+pub fn exclude(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &FusionPipelines,
+    data: &wgpu::Buffer,
+    mask: &wgpu::Buffer,
+    len: u32,
+    spp: u32,
+    fill: f32,
+) {
+    run_eligibility(
+        device,
+        queue,
+        pipelines.eligibility_exclude(device),
+        data,
+        mask,
+        eligibility_params(len, spp, fill),
+        len,
+        "focusforge-gpu-fuse-eligibility-exclude-pass",
+    );
+}
+
+/// `sum /= count` per pixel, in place, 0 where `count` (one `u32` per pixel)
+/// is 0 -- the GPU twin of the masked residual mean in `Laplacian::fuse`.
+pub fn mean_by_count(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &FusionPipelines,
+    sum: &wgpu::Buffer,
+    count: &wgpu::Buffer,
+    len: u32,
+    spp: u32,
+) {
+    run_eligibility(
+        device,
+        queue,
+        pipelines.eligibility_mean_by_count(device),
+        sum,
+        count,
+        eligibility_params(len, spp, 0.0),
+        len,
+        "focusforge-gpu-fuse-eligibility-mean-by-count-pass",
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_eligibility(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &Pipeline,
+    data: &wgpu::Buffer,
+    per_pixel: &wgpu::Buffer,
+    params: [u8; 16],
+    len: u32,
+    label: &str,
+) {
+    let params_buffer = upload_params(device, queue, &params);
+    let entries = [
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: per_pixel.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: data.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: params_buffer.as_entire_binding(),
+        },
+    ];
+    run_pass(device, queue, pipeline, &entries, len, label);
 }

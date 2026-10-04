@@ -10,11 +10,11 @@ Using FocusForge: shooting a stack, loading it, choosing an algorithm,
 retouching the result.
 
 - [`guide/gui.md`](guide/gui.md) — opening a folder or a project in the
-  window, the dock's `Images` and `Settings` panels, running and controlling
+  window, the dock's `Images` panel and the four-section `Settings` panel, running and controlling
   a fuse, saving the held result, exporting an image, switching between open
   projects and the settings file
 - [`guide/stacking.md`](guide/stacking.md) — stacking TIFF or supported RAW
-  frames, choosing an algorithm, getting a TIFF, PNG or JPEG image back with
+  frames, choosing a fusion method, brightness equalization, getting a TIFF, PNG or JPEG image back with
   `export` and its format options, and getting the Z-Map
 - [`guide/alignment.md`](guide/alignment.md) — how `focusforge-cli
   align`/`stack` register frames before fusing, choosing a mode, and

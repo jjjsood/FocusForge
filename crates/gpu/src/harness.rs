@@ -20,6 +20,7 @@ use focusforge_core::tile::{Rect, Tile};
 use crate::budget::{
     DeviceBudget, ProbeOutcome, VramBudget, buffer_limit_shortfalls, device_bytes_per_tile,
     dispatch_limit_shortfall, largest_buffer_bytes, max_tile_side, probe_budget,
+    tile_shortfall_message,
 };
 use crate::device::{GpuError, SharedDevice, block_on, shared_device};
 use crate::ecc::{self, EccState};
@@ -182,6 +183,18 @@ impl TileBackend for GpuBackend {
         )
     }
 
+    fn tile_budget_shortfall(
+        &self,
+        width: u32,
+        height: u32,
+        samples_per_pixel: u32,
+        levels: u32,
+        transforms: &[Transform],
+    ) -> Option<String> {
+        let (bytes, _) = tile_bytes(width, height, samples_per_pixel, levels, transforms);
+        tile_shortfall_message(width, height, bytes, self.device_budget.bytes())
+    }
+
     fn self_check(
         &self,
         reader: &dyn TileReader,
@@ -266,6 +279,7 @@ impl TileBackend for GpuBackend {
             rect,
             samples_per_pixel,
             levels,
+            &[],
         )
     }
 
@@ -300,16 +314,12 @@ impl TileBackend for GpuBackend {
         samples_per_pixel: u32,
         levels: u32,
     ) -> Result<TileOutput, AlgorithmError> {
-        // Same identity test `stack_tile`'s per-frame check makes, folded
-        // into one flag for the whole tile's byte-cost model (`crate::budget`).
-        let warped = transforms.iter().any(|t| *t != Transform::identity());
-        let bytes = device_bytes_per_tile(
-            transforms.len(),
+        let (bytes, warped) = tile_bytes(
             rect.width,
             rect.height,
             samples_per_pixel,
             levels,
-            warped,
+            transforms,
         );
         self.check_tile(rect.width, rect.height, samples_per_pixel, warped)?;
 
@@ -359,6 +369,23 @@ impl TileBackend for GpuBackend {
     fn device_lost(&self) -> bool {
         self.device.lost()
     }
+}
+
+/// The device bytes of one `width x height` tile, and whether any frame is
+/// warped. The identity test is the one `stack_tile`'s per-frame check makes,
+/// folded into one flag for the whole tile's byte-cost model (`crate::budget`).
+fn tile_bytes(
+    width: u32,
+    height: u32,
+    samples_per_pixel: u32,
+    levels: u32,
+    transforms: &[Transform],
+) -> (u64, bool) {
+    let warped = transforms.iter().any(|t| *t != Transform::identity());
+    (
+        device_bytes_per_tile(width, height, samples_per_pixel, levels, warped),
+        warped,
+    )
 }
 
 impl AlignBackend for GpuBackend {

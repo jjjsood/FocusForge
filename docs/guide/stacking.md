@@ -62,23 +62,47 @@ them out. [`reference/cli.md`](../reference/cli.md#export) lists every flag.
 
 ## Choosing an algorithm
 
-Three are available:
+Three are available. The window shows the display name; the CLI takes the id.
 
-- **`laplacian`** — decomposes each frame into a Laplacian pyramid and
-  selects the sharpest coefficient at each level before recombining. Good
-  general-purpose default; its `levels` parameter can be set explicitly or
-  left on `auto`, which derives a depth from the stack's resolution.
-- **`weighted-average`** — blends every frame at each pixel, weighted by
-  local sharpness, rather than selecting a single winner. Smoother
-  transitions between frames, at the cost of some softening versus a hard
-  selection.
-- **`depth-map`** — builds a smoothed sharpness surface across the stack and
-  selects, per pixel, the frame that surface names. Produces the most
-  coherent Z-Map of the three, useful when the map itself will be retouched.
+- **Details** (`laplacian`) — decomposes each frame into a Laplacian pyramid
+  and selects the sharpest coefficient at each level before recombining. The
+  default in the window and a good general-purpose choice; its `levels`
+  parameter can be set explicitly or left on `auto`, which derives a depth
+  from the stack's resolution.
+- **Soft transitions** (`weighted-average`) — blends every frame at each
+  pixel, weighted by local sharpness, rather than selecting a single winner.
+  Smoother transitions between frames, at the cost of some softening versus a
+  hard selection. `radius` (0 to 16, default 16) sets how far a pixel looks
+  around itself; `weight-exponent` (1 to 8, default 4) sets how strongly the
+  sharpest frame is preferred.
+- **Focus map** (`depth-map`) — builds a smoothed sharpness surface across the
+  stack and selects, per pixel, the frame that surface names. Produces the
+  most coherent Z-Map of the three, useful when the map itself will be
+  retouched. `score-radius` (default 4) and `smoothing-radius` (default 8)
+  take 0 to 16.
 
 Every algorithm accepts `--set key=value` to override a declared parameter;
 run `focusforge-cli algorithms <id>` to see what each one exposes, its
 range, and its default.
+
+## Brightness equalization
+
+Frames of one stack often differ slightly in brightness. `stack` equalizes
+them before fusing, on by default for every method: each frame gets one gain,
+the same on every channel, matching the reference frame's mid-tone brightness.
+
+```bash
+focusforge-cli stack path/to/frames/ --algo laplacian --set equalize=false
+focusforge-cli stack path/to/frames/ --algo laplacian --set equalize-max-gain=1.5
+```
+
+`equalize-max-gain` (1.01 to 2.0, default 1.25) bounds the gain both ways: with
+1.25 a frame's gain stays between 0.8 and 1.25. A frame that would need more
+gets the bound, and the run prints a notice naming the frame, the gain it
+needed and the smallest bound that would cover it. The gains are recorded in
+the project, so `export` writes the equalized result. In the window these are
+the **PREPARE** settings. See
+[`reference/cli.md`](../reference/cli.md#stack) for the project settings.
 
 ## Getting the Z-Map
 

@@ -20,9 +20,9 @@ pub mod select;
 use std::sync::OnceLock;
 
 use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
-use focusforge_core::fuse::laplacian::score_radius;
+use focusforge_core::fuse::laplacian::{EligibleMasks, score_radius};
 use focusforge_core::tile::{Rect, Tile};
-use focusforge_core::zmap::validate_tile;
+use focusforge_core::zmap::{NO_SOURCE, validate_tile};
 
 use crate::device::SharedDevice;
 use crate::pack::{packed_len, unpack_samples};
@@ -34,7 +34,7 @@ use crate::transfer::{download_buffer, upload_tile};
 /// Shape A: one storage buffer read, one storage buffer read/write, one
 /// uniform -- `plane_from_u16`, `plane_to_u16`, `reduce::{horizontal,
 /// vertical}`, `expand::{horizontal, vertical}`, `score::{rows, cols}`,
-/// `residual::{accumulate, mean}`.
+/// `residual::accumulate`, `eligibility::{exclude, mean_by_count}`.
 fn shape_a() -> Vec<wgpu::BindGroupLayoutEntry> {
     vec![
         storage_entry(0, true),
@@ -94,6 +94,8 @@ pub struct FusionPipelines {
     select_main: OnceLock<Pipeline>,
     residual_accumulate: OnceLock<Pipeline>,
     residual_mean: OnceLock<Pipeline>,
+    eligibility_exclude: OnceLock<Pipeline>,
+    eligibility_mean_by_count: OnceLock<Pipeline>,
 }
 
 macro_rules! pipeline_getter {
@@ -201,6 +203,20 @@ impl FusionPipelines {
         "focusforge-gpu-fuse-residual-mean",
         "mean",
         shape_d
+    );
+    pipeline_getter!(
+        eligibility_exclude,
+        "eligibility.wgsl",
+        "focusforge-gpu-fuse-eligibility-exclude",
+        "exclude",
+        shape_a
+    );
+    pipeline_getter!(
+        eligibility_mean_by_count,
+        "eligibility.wgsl",
+        "focusforge-gpu-fuse-eligibility-mean-by-count",
+        "mean_by_count",
+        shape_a
     );
 }
 
@@ -318,6 +334,31 @@ fn gaussian_levels_gpu(
     gaussians
 }
 
+/// One frame's resident base plane and, when the frame has uncovered pixels,
+/// its row-major coverage mask over the tile rect.
+pub(crate) type FrameSource = (GpuPlane, Option<Vec<bool>>);
+
+fn upload_u32(device: &wgpu::Device, queue: &wgpu::Queue, values: &[u32]) -> wgpu::Buffer {
+    let buffer = crate::transfer::create_storage_buffer(
+        device,
+        (values.len() * 4) as u64,
+        "focusforge-gpu-fuse-eligibility",
+    );
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    queue.write_buffer(&buffer, 0, &bytes);
+    buffer
+}
+
+/// Whether `mask` excludes no pixel, so the exclude pass would change nothing.
+fn all_true(mask: &[bool]) -> bool {
+    mask.iter().all(|&ok| ok)
+}
+
+fn upload_mask(device: &wgpu::Device, queue: &wgpu::Queue, mask: &[bool]) -> wgpu::Buffer {
+    let values: Vec<u32> = mask.iter().map(|&ok| u32::from(ok)).collect();
+    upload_u32(device, queue, &values)
+}
+
 /// The running best for one Laplacian level across frames: its level data
 /// (in-place-updated by [`select::select`]) and its interleaved
 /// `(score, winner)` plane.
@@ -340,7 +381,7 @@ pub(crate) fn fuse_planes_gpu(
     rect: Rect,
     samples_per_pixel: u32,
     levels: u32,
-    source: &mut dyn FnMut(usize) -> Result<GpuPlane, AlgorithmError>,
+    source: &mut dyn FnMut(usize) -> Result<FrameSource, AlgorithmError>,
 ) -> Result<TileOutput, AlgorithmError> {
     let device = shared.device();
     let queue = shared.queue();
@@ -349,9 +390,22 @@ pub(crate) fn fuse_planes_gpu(
     let mut best_levels: Vec<Option<BestLevel>> = (0..levels).map(|_| None).collect();
     let mut residual_sum: Option<wgpu::Buffer> = None;
     let mut residual_dims = (0u32, 0u32);
+    // Frames contributing at each residual pixel; only read when a frame
+    // carried a coverage mask.
+    let mut residual_counts: Vec<u32> = Vec::new();
+    let mut any_masked = false;
 
     for frame in 0..frame_count {
-        let base = source(frame)?;
+        let (base, covered) = source(frame)?;
+        // A frame whose every eligibility mask is all-true takes the unmasked
+        // path: no upload, no exclude pass, a plain `+1` residual count.
+        let masks = covered
+            .as_deref()
+            .map(|covered| EligibleMasks::new(covered, rect.width, rect.height, levels))
+            .filter(|masks| {
+                !masks.levels.iter().all(|m| all_true(m)) || !all_true(&masks.residual)
+            });
+        any_masked |= masks.is_some();
         let gaussians = gaussian_levels_gpu(device, queue, pipelines, base, levels);
 
         for k in 0..levels as usize {
@@ -388,6 +442,18 @@ pub(crate) fn fuse_planes_gpu(
             let score = select::score(
                 device, queue, pipelines, &laplacian, g_k_width, g_k_height, g_k_spp, radius,
             );
+            if let Some(masks) = masks.as_ref().filter(|masks| !all_true(&masks.levels[k])) {
+                select::exclude(
+                    device,
+                    queue,
+                    pipelines,
+                    &score,
+                    &upload_mask(device, queue, &masks.levels[k]),
+                    g_k_width * g_k_height,
+                    1,
+                    f32::NEG_INFINITY,
+                );
+            }
 
             let slot = best_levels[k].get_or_insert_with(|| BestLevel {
                 level: zeroed_f32_buffer(
@@ -406,7 +472,7 @@ pub(crate) fn fuse_planes_gpu(
                     let mut bytes = Vec::with_capacity(count * 8);
                     for _ in 0..count {
                         bytes.extend_from_slice(&f32::NEG_INFINITY.to_le_bytes());
-                        bytes.extend_from_slice(&0u32.to_le_bytes());
+                        bytes.extend_from_slice(&u32::from(NO_SOURCE).to_le_bytes());
                     }
                     queue.write_buffer(&buffer, 0, &bytes);
                     buffer
@@ -445,20 +511,54 @@ pub(crate) fn fuse_planes_gpu(
                 "focusforge-gpu-fuse-residual-sum",
             )
         });
+        if residual_counts.is_empty() {
+            residual_counts = vec![0; (residual_width * residual_height) as usize];
+        }
+        match masks.as_ref().filter(|masks| !all_true(&masks.residual)) {
+            Some(masks) => {
+                select::exclude(
+                    device,
+                    queue,
+                    pipelines,
+                    residual_buffer,
+                    &upload_mask(device, queue, &masks.residual),
+                    residual_len,
+                    residual_spp,
+                    0.0,
+                );
+                for (count, &ok) in residual_counts.iter_mut().zip(&masks.residual) {
+                    *count += u32::from(ok);
+                }
+            }
+            None => residual_counts.iter_mut().for_each(|count| *count += 1),
+        }
         select::accumulate(device, queue, pipelines, sum, residual_buffer, residual_len);
     }
 
     let sum_buffer =
         residual_sum.expect("frame_count >= 1 guarantees at least one residual accumulated");
     let residual_len = residual_dims.0 * residual_dims.1 * spp;
-    select::mean(
-        device,
-        queue,
-        pipelines,
-        &sum_buffer,
-        residual_len,
-        frame_count as f32,
-    );
+    if any_masked {
+        let counts = upload_u32(device, queue, &residual_counts);
+        select::mean_by_count(
+            device,
+            queue,
+            pipelines,
+            &sum_buffer,
+            &counts,
+            residual_len,
+            spp,
+        );
+    } else {
+        select::mean(
+            device,
+            queue,
+            pipelines,
+            &sum_buffer,
+            residual_len,
+            frame_count as f32,
+        );
+    }
 
     // Collapse: coarsest to finest, `A_k = L_k + expand(A_{k+1})`.
     let mut current_buffer = sum_buffer;
@@ -537,8 +637,11 @@ pub(crate) fn fuse_planes_gpu(
 /// `levels`, entirely on the GPU, returning the composite tile and the
 /// Z-Map -- the WGSL twin of
 /// `focusforge_core::fuse::laplacian::Laplacian::fuse`. Reads and uploads
-/// every frame directly; [`crate::stack_tile::warp_fuse_tile_gpu`] is the
+/// every frame directly. `coverage[i]` is frame `i`'s coverage mask over
+/// `rect` with `TileCtx::for_each_frame` semantics: missing or `None` means
+/// every pixel is covered; [`crate::stack_tile::warp_fuse_tile_gpu`] is the
 /// warp-then-fuse twin that keeps a warped frame resident instead.
+#[allow(clippy::too_many_arguments)]
 pub fn fuse_tile_gpu(
     shared: &SharedDevice,
     reader: &dyn TileReader,
@@ -547,12 +650,13 @@ pub fn fuse_tile_gpu(
     rect: Rect,
     samples_per_pixel: u32,
     levels: u32,
+    coverage: &[Option<Vec<bool>>],
 ) -> Result<TileOutput, AlgorithmError> {
     let device = shared.device();
     let queue = shared.queue();
     let pixel_count = rect.width as usize * rect.height as usize;
 
-    let mut source = |frame: usize| -> Result<GpuPlane, AlgorithmError> {
+    let mut source = |frame: usize| -> Result<FrameSource, AlgorithmError> {
         let mut samples = vec![0u16; pixel_count * samples_per_pixel as usize];
         reader.read_tile_into(frame, rect, &mut samples)?;
         let tile = Tile {
@@ -560,7 +664,8 @@ pub fn fuse_tile_gpu(
             samples_per_pixel,
             samples,
         };
-        Ok(upload_plane(device, queue, pipelines, &tile))
+        let covered = coverage.get(frame).cloned().flatten();
+        Ok((upload_plane(device, queue, pipelines, &tile), covered))
     };
 
     fuse_planes_gpu(
