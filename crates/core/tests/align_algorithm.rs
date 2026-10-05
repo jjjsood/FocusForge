@@ -247,14 +247,12 @@ const TRANSLATION_TOLERANCE_PX: f64 = 1e-4;
 /// headroom over the measured figure.
 const ROTATION_SCALE_TOLERANCE_PX: f64 = 1e-3;
 
-/// Measured 2026-09-13 (`cargo test -p focusforge-core --test align_algorithm
-/// coarse_to_fine_beats_single_level -- --nocapture`), driven path
-/// (`pyramid-depth = 3`, `max-iterations = 100`) recovering an 80px
-/// translation: corner error `6.07e-3` px -- an order of magnitude looser
-/// than [`TRANSLATION_TOLERANCE_PX`], because an 80px displacement is a much
-/// larger normal-equation excursion than the 6.5px pair that tolerance was
-/// measured on. Pinned at ~100x the measured figure.
-const COARSE_TO_FINE_TOLERANCE_PX: f64 = 1.0;
+/// Measured with `cargo test -p focusforge-core --test align_algorithm
+/// an_80px_shift_with_a_clean_border_converges_through_the_pyramid --
+/// --nocapture`, driven path (`pyramid-depth = 3`, `max-iterations = 100`)
+/// recovering an 80px translation over an edge-repeated border: corner error
+/// `8.2e-5` px. Pinned at ~12x the measured figure.
+const LARGE_TRANSLATION_TOLERANCE_PX: f64 = 1e-3;
 
 #[test]
 fn recovers_known_translation_through_the_driver() {
@@ -380,49 +378,41 @@ fn rotation_scale_mode_returns_a_similarity() {
 }
 
 #[test]
-fn coarse_to_fine_beats_single_level() {
+fn an_80px_shift_with_a_clean_border_converges_through_the_pyramid() {
     let (tile, width, height, spp) = frame_3_tile();
     let rect = full_rect(width, height);
     let w_true = Transform::translation(80.0, 0.0);
     let warped = warp_from_tile(&tile, (width, height), rect, &w_true)
         .expect("80px translation stays well inside the frame");
 
-    let reader = two_frame_reader(
-        width,
-        height,
-        spp,
-        warped.tile.samples.clone(),
-        tile.samples.clone(),
-    );
+    // The warp zero-fills columns 432..512. A zero step edge inside the solve
+    // region bleeds through the level-0 smoothing, whereas real frames are
+    // edge-repeated at the frame boundary, so column 431 is repeated instead.
+    let (w, s) = (width as usize, spp as usize);
+    let mut filled = warped.tile.samples;
+    for row in filled.chunks_exact_mut(w * s) {
+        let (content, border) = row.split_at_mut(432 * s);
+        let edge = &content[431 * s..];
+        for px in border.chunks_exact_mut(s) {
+            px.copy_from_slice(edge);
+        }
+    }
+
+    let reader = two_frame_reader(width, height, spp, filled, tile.samples.clone());
     let stack_ctx = StackContext::new(2, width, height, spp);
     let ctx = AlignContext::new(stack_ctx, 0, &reader);
-
-    let single_level = PyramidalEcc
-        .align_frame(&ctx, 1, &cfg_with("translation", 0, 50))
-        .expect("valid solver inputs");
-    let single_ok = single_level.status == AlignStatus::Converged
-        && corner_error(&single_level.transform, &w_true, default_region())
-            < TRANSLATION_TOLERANCE_PX;
-    assert!(
-        !single_ok,
-        "a single level (pyramid-depth = 0) must not recover an 80px translation, \
-         which is beyond the measured 60px single-level capture range: {single_level:?}"
-    );
 
     let driven = PyramidalEcc
         .align_frame(&ctx, 1, &cfg_with("translation", 3, 100))
         .expect("valid solver inputs");
-    // A level that reaches the cap makes the frame `HitCap`; only a divergence
-    // would mean the pyramid failed to recover the shift.
-    assert!(
-        !matches!(driven.status, AlignStatus::Diverged(_)),
-        "outcome: {driven:?}"
-    );
+    assert_eq!(driven.status, AlignStatus::Converged, "outcome: {driven:?}");
     let error = corner_error(&driven.transform, &w_true, default_region());
-    eprintln!("coarse_to_fine_beats_single_level: driven (depth=3) corner error = {error} px");
+    eprintln!(
+        "an_80px_shift_with_a_clean_border_converges_through_the_pyramid: corner error = {error} px"
+    );
     assert!(
-        error < COARSE_TO_FINE_TOLERANCE_PX,
-        "corner error {error} px exceeds {COARSE_TO_FINE_TOLERANCE_PX} px"
+        error < LARGE_TRANSLATION_TOLERANCE_PX,
+        "corner error {error} px exceeds {LARGE_TRANSLATION_TOLERANCE_PX} px"
     );
 }
 
@@ -745,7 +735,10 @@ fn each_divergence_reports_its_pyramid_level() {
         let last = levels
             .last()
             .expect("at least the coarsest level is always solved");
-        if outcome.status == AlignStatus::Diverged(DivergenceReason::ValidationFailed) {
+        if matches!(
+            outcome.status,
+            AlignStatus::Diverged(DivergenceReason::ValidationFailed | DivergenceReason::WeakMatch)
+        ) {
             assert!(
                 matches!(
                     AlignStatus::from(last.result.status),
@@ -760,9 +753,19 @@ fn each_divergence_reports_its_pyramid_level() {
                 AlignStatus::Stalled => 2,
                 _ => 3,
             };
+            // A middle level's `correlation-decreased` divergence hands its
+            // fit on and counts as `Stalled`.
+            let depth = levels[0].level;
             let worst = levels
                 .iter()
-                .map(|rec| AlignStatus::from(rec.result.status))
+                .map(|rec| match rec.result.status {
+                    EccStatus::Diverged(DivergenceReason::CorrelationDecreased)
+                        if rec.level > 0 && rec.level < depth =>
+                    {
+                        AlignStatus::Stalled
+                    }
+                    status => AlignStatus::from(status),
+                })
                 .max_by_key(|&s| severity(s))
                 .expect("at least the coarsest level is always solved");
             assert_eq!(
@@ -890,6 +893,83 @@ fn an_empty_centre_reports_a_singular_hessian_at_level_0() {
             outcome.status,
             AlignStatus::Diverged(DivergenceReason::SingularHessian),
             "{mode}"
+        );
+    }
+}
+
+/// Crossed sinusoid gratings (periods 14 and 18 px) have no unique match once
+/// a shift passes half a period, so each frame must end `Diverged` or inside
+/// its budget of the known motion; a wrong `Converged` fit is the failure.
+#[test]
+fn a_periodic_scene_never_reports_a_wrong_converged_fit() {
+    let (width, height) = (640u32, 480u32);
+    let (cx, cy) = (width as f64 / 2.0, height as f64 / 2.0);
+    let scene = |x: f64, y: f64| {
+        let grating = |p: f64, period: f64| (std::f64::consts::TAU * p / period).sin();
+        0.5 + 0.25 * grating(x, 14.0) + 0.25 * grating(y, 18.0)
+    };
+    // Frame k holds the scene moved by `truth(k)`: it maps frame 0's
+    // coordinates onto frame k's.
+    let truth = |k: usize| {
+        let k = k as f64;
+        Transform::translation(3.5 * k, -2.6 * k).compose(&similarity_about(
+            1.0,
+            (0.3 * k).to_radians(),
+            cx,
+            cy,
+        ))
+    };
+
+    let mut rng = XorShift32(0xBEEF_0042);
+    let frames: Vec<Vec<u16>> = (0..5)
+        .map(|k| {
+            let inverse = truth(k).inverse().expect("a similarity is invertible");
+            let mut samples = Vec::with_capacity((width * height) as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let (sx, sy) = inverse
+                        .map_point(x as f64, y as f64)
+                        .expect("a similarity maps every pixel");
+                    let noise = (rng.next() % 601) as f64 - 300.0;
+                    samples.push((scene(sx, sy) * 65_535.0 + noise).clamp(0.0, 65_535.0) as u16);
+                }
+            }
+            samples
+        })
+        .collect();
+    let reader = FramesReader {
+        width,
+        height,
+        spp: 1,
+        frames,
+    };
+
+    let result = align_stack(
+        &PyramidalEcc,
+        StackContext::new(5, width, height, 1),
+        &reader,
+        &cfg_with("rotation-scale", 3, 400),
+        FailurePolicy::Strict,
+    )
+    .expect("a periodic stack is an outcome, not an error");
+
+    assert_eq!(result.reference, 0);
+    for frame in result.frames.iter().skip(1) {
+        let error = corner_error(
+            &frame.transform,
+            &truth(frame.frame),
+            full_rect(width, height),
+        );
+        eprintln!(
+            "a_periodic_scene_never_reports_a_wrong_converged_fit: frame {} status={:?} error={error} px",
+            frame.frame, frame.status
+        );
+        let budget = 0.04 + 0.03 * frame.frame as f64;
+        assert!(
+            matches!(frame.status, AlignStatus::Diverged(_)) || error <= budget,
+            "frame {} reports {:?} at {error} px against a {budget} px budget",
+            frame.frame,
+            frame.status
         );
     }
 }

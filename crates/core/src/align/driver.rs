@@ -1021,13 +1021,16 @@ mod tests {
     fn the_split_sums_to_369_mb_at_the_reference_scale() {
         // Shared: the reference's coarse pyramid, the retained level
         // templates, the patch templates and the feature set. Per registration: the frame's
-        // coarse pyramid plus the streaming band, which outweighs the solve
-        // scratch and windows (54.9 MB).
+        // coarse pyramid plus the solve scratch and windows (55.3 MB), which
+        // just outweigh the streaming band (55.1 MB).
         let stack = StackContext::new(61, 8192, 5464, 3);
         let shared = bytes_shared_reference(stack);
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
         assert_eq!(shared, 59_681_450 + 161_361_640 + 33_030_144 + 2000 * 72);
-        assert_eq!(per_registration, 59_681_450 + 8192 * 517 * 13);
+        assert_eq!(
+            per_registration,
+            59_681_450 + 24 * 1253 * 836 + 1777 * 1360 * 10 + 772 * 772 * 10
+        );
         let ratio = (shared + per_registration) as f64 / 369_000_000f64;
         assert!(
             (ratio - 1.0).abs() < 0.01,
@@ -1057,14 +1060,14 @@ mod tests {
     #[test]
     fn single_sample_stacks_are_priced_by_templates_and_pyramids() {
         // At 6000x4000x1 the 1254x836 solve region costs 25.2 MB of scratch,
-        // on top of its window (14.3 MB) and a patch window (6.0 MB); the
+        // on top of its window (19.3 MB) and a patch window (3.6 MB); the
         // 9 B per pixel stream term is 28.0 MB.
         let stack = StackContext::new(20, 6000, 4000, 1);
         let shared = bytes_shared_reference(stack);
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
         let patches = 8 * 384 * 384 * 28;
         assert_eq!(shared, 32_000_000 + 141_772_400 + patches + 2000 * 72);
-        let solve = 24 * 1254 * 836 + 1766 * 1348 * 6 + 772 * 772 * 6;
+        let solve = 24 * 1254 * 836 + 1778 * 1360 * 8 + 772 * 772 * 6;
         let stream = 6000 * (DEFAULT_TILE_SIZE as u64 + 5) * 9;
         assert!(solve > stream);
         assert_eq!(per_registration, 32_000_000 + solve);
@@ -1075,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn full_colour_frames_are_priced_by_their_streaming_band() {
+    fn full_colour_frames_are_priced_by_the_larger_of_streaming_band_and_solve() {
         let stack = StackContext::new(61, 8192, 5464, 3);
         let shared = bytes_shared_reference(stack);
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
@@ -1083,9 +1086,9 @@ mod tests {
         let patches = 8 * 384 * 384 * 28;
         assert_eq!(shared, plane / 3 + 161_361_640 + patches + 2000 * 72);
         let stream = 8192 * (DEFAULT_TILE_SIZE as u64 + 5) * 13;
-        let solve = 24 * 1253 * 836 + 1765 * 1348 * 10 + 772 * 772 * 10;
-        assert!(stream > solve);
-        assert_eq!(per_registration, plane / 3 + stream);
+        let solve = 24 * 1253 * 836 + 1777 * 1360 * 10 + 772 * 772 * 10;
+        assert!(solve > stream);
+        assert_eq!(per_registration, plane / 3 + solve);
         assert!(shared < 400_100_000, "shared {shared} B");
         assert!(
             per_registration < 263_900_000,
