@@ -233,18 +233,18 @@ fn resolved_defaults(ctx: &StackContext) -> ParamValues {
     params::resolved_values(&resolved)
 }
 
-/// Measured 2026-09-13: corner error `2.39e-5` px through the four-level
+/// Measured 2026-10-05: corner error `3.10e-5` px through the four-level
 /// driven path (`pyramid-depth = 3`), larger than the single-level
 /// `9.24e-7` px measurement on the same data and quantity
 /// (`crates/core/tests/ecc_solver.rs`) because the driven path enters
 /// level 0 already near the optimum and stops further out than a solve
-/// iterated in from identity. Still well inside the pinned `1e-4` px.
+/// iterated in from identity. About 3x under the pinned `1e-4` px.
 const TRANSLATION_TOLERANCE_PX: f64 = 1e-4;
 
-/// Measured 2026-09-13 the same way,
+/// Measured 2026-10-05 the same way,
 /// `recovers_known_rotation_scale_through_the_driver`: corner error
-/// `5.44e-6` px. Pinned at the single-level test's `1e-3` px -- comfortable
-/// headroom over the measured figure.
+/// `5.51e-4` px, about 1.8x under the single-level test's pinned `1e-3` px.
+/// The figure includes the smoothing pass before the final level-0 solve.
 const ROTATION_SCALE_TOLERANCE_PX: f64 = 1e-3;
 
 /// Measured with `cargo test -p focusforge-core --test align_algorithm
