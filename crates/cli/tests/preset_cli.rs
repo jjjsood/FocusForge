@@ -691,7 +691,7 @@ fn status_record_names_identity_outcome_and_path() {
         "exactly one record per stack: {records:?}"
     );
     let record = &records[0];
-    assert_eq!(record["format"], 1);
+    assert!(record.get("format").is_none());
     assert_eq!(record["identity"], mantis.to_str().unwrap());
     assert_eq!(record["command"], "stack");
     assert_eq!(record["outcome"], "completed");

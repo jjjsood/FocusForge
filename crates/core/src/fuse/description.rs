@@ -6,11 +6,9 @@
 //! default, since crop is applied by default; `cropped=` is what tells
 //! the two apart.
 //!
-//! Grammar follows `crate::zmap::description`'s own pinned precedent
-//! exactly: `FocusForge <version> align=<id> anchor=<index> mode=<id>
+//! Grammar: `FocusForge <version> align=<id> anchor=<index> mode=<id>
 //! [crop=<x>,<y>,<w>,<h> cropped=<bool>]`. Unknown `key=value` tokens are
-//! ignored, which is what makes a later field additive the same way the
-//! `info --json` schema is. `TiffWriter`'s own default description is
+//! ignored. `TiffWriter`'s default description is
 //! `"FocusForge <version>"` (`crate::io::tiff::writer`) -- passing a
 //! `description` replaces that default, so this module re-emits the same
 //! prefix itself rather than dropping it.

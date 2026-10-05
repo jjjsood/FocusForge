@@ -308,13 +308,9 @@ fn write_groups_then_groups_round_trips() {
     assert!(first.success, "stderr: {}", first.stderr);
 
     let text = std::fs::read_to_string(&file).expect("--write-groups must write the file");
-    assert!(text.contains("format = 1"), "{text}");
+    assert!(!text.contains("format ="), "{text}");
     assert!(text.contains("[[group]]"), "{text}");
     assert!(text.contains("IMG_9801.tif"), "{text}");
-    assert!(
-        text.find("format =").unwrap() < text.find('[').unwrap(),
-        "`format` must sit outside every [[group]] block:\n{text}"
-    );
 
     let second = run_cli_in(
         &cwd,
@@ -424,6 +420,43 @@ fn grouping_lines(stderr: &str) -> Vec<String> {
 }
 
 #[test]
+fn groups_file_with_a_format_key_is_refused() {
+    let dump = card_dump("groups_cli_format_key");
+    let out_dir = common::tmp_dir("groups_cli_format_key_out");
+    let cwd = common::tmp_dir("groups_cli_format_key_cwd");
+    let file = out_dir.join("groups.toml");
+    std::fs::write(
+        &file,
+        "format = 1\n\n[[group]]\nname = \"everything\"\nframes = [\"IMG_9801.tif\", \"IMG_9802.tif\", \"IMG_9910.tif\", \"IMG_9911.tif\"]\n",
+    )
+    .unwrap();
+
+    let result = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algo",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--groups",
+            file.to_str().unwrap(),
+        ],
+    );
+    assert!(!result.success);
+    assert_eq!(result.code, Some(1));
+    assert!(
+        result.stderr.contains(file.to_str().unwrap()),
+        "{}",
+        result.stderr
+    );
+    assert!(result.stderr.contains("format"), "{}", result.stderr);
+}
+
+#[test]
 fn groups_file_overrides_the_proposal() {
     let dump = card_dump("groups_cli_override");
     let out_dir = common::tmp_dir("groups_cli_override_out");
@@ -433,7 +466,7 @@ fn groups_file_overrides_the_proposal() {
     // heuristic proposes for this tree.
     std::fs::write(
         &file,
-        "format = 1\n\n[[group]]\nname = \"everything\"\nframes = [\"IMG_9801.tif\", \
+        "[[group]]\nname = \"everything\"\nframes = [\"IMG_9801.tif\", \
          \"IMG_9802.tif\", \"IMG_9910.tif\", \"IMG_9911.tif\"]\n",
     )
     .unwrap();
@@ -474,7 +507,7 @@ fn groups_file_with_a_missing_frame_is_refused() {
     let file = out_dir.join("groups.toml");
     std::fs::write(
         &file,
-        "format = 1\n\n[[group]]\nname = \"a\"\nframes = [\"IMG_9801.tif\", \"IMG_9802.tif\", \
+        "[[group]]\nname = \"a\"\nframes = [\"IMG_9801.tif\", \"IMG_9802.tif\", \
          \"IMG_9910.tif\", \"IMG_9911.tif\", \"IMG_0000.tif\"]\n",
     )
     .unwrap();
@@ -511,7 +544,7 @@ fn groups_file_duplicate_or_orphan_frame_is_refused() {
     let duplicate = out_dir.join("duplicate.toml");
     std::fs::write(
         &duplicate,
-        "format = 1\n\n[[group]]\nname = \"a\"\nframes = [\"IMG_9801.tif\", \"IMG_9802.tif\", \
+        "[[group]]\nname = \"a\"\nframes = [\"IMG_9801.tif\", \"IMG_9802.tif\", \
          \"IMG_9910.tif\", \"IMG_9911.tif\"]\n\n[[group]]\nname = \"b\"\nframes = \
          [\"IMG_9801.tif\"]\n",
     )
@@ -540,7 +573,7 @@ fn groups_file_duplicate_or_orphan_frame_is_refused() {
     let orphan = out_dir.join("orphan.toml");
     std::fs::write(
         &orphan,
-        "format = 1\n\n[[group]]\nname = \"a\"\nframes = [\"IMG_9801.tif\", \"IMG_9802.tif\", \
+        "[[group]]\nname = \"a\"\nframes = [\"IMG_9801.tif\", \"IMG_9802.tif\", \
          \"IMG_9910.tif\"]\n",
     )
     .unwrap();
@@ -638,7 +671,7 @@ fn status_and_manifest_have_one_entry_per_group() {
             .expect("a multi-group run writes one manifest into the -o directory"),
     )
     .expect("the manifest must parse");
-    assert_eq!(manifest["format"], 1);
+    assert!(manifest.get("format").is_none());
     assert_eq!(manifest["groups"].as_array().unwrap().len(), 2);
     assert_eq!(manifest["groups"][0]["name"], "IMG_9801-9802");
     assert_eq!(manifest["groups"][0]["frame_count"], 2);
@@ -772,7 +805,7 @@ fn json_shape_is_unchanged_for_one_group_and_wrapped_for_many() {
     assert!(many.success, "stderr: {}", many.stderr);
     let wrapped: serde_json::Value =
         serde_json::from_str(&many.stdout).expect("one document, never N concatenated");
-    assert_eq!(wrapped["format"], 1);
+    assert!(wrapped.get("format").is_none());
     let groups = wrapped["groups"].as_array().expect("a groups array");
     assert_eq!(groups.len(), 2);
     assert_eq!(groups[0]["frame_count"], 2);
@@ -809,12 +842,10 @@ fn json_shape_is_unchanged_for_one_group_and_wrapped_for_many() {
     );
 }
 
-/// `-o` is a project-writing **directory** for every proposal size, and the two
-/// spellings -- `-o <file>` and `--zmap <file>` -- are refused **by name**,
-/// rather than by clap's generic "unexpected argument". Both refusals are
-/// group-independent, so they fire before the grouping is even computed.
+/// `-o` is a project-writing **directory** for every proposal size, and its
+/// refusal fires before the grouping is computed.
 #[test]
-fn an_output_file_and_a_zmap_are_refused_by_name() {
+fn an_output_file_is_refused_by_name() {
     let dump = card_dump("groups_cli_output_placement");
     let out_dir = common::tmp_dir("groups_cli_output_placement_out");
     let cwd = common::tmp_dir("groups_cli_output_placement_cwd");
@@ -847,33 +878,6 @@ fn an_output_file_and_a_zmap_are_refused_by_name() {
         !as_file.stderr.contains("grouping "),
         "the refusal fires before the grouping is computed: {}",
         as_file.stderr
-    );
-
-    let with_zmap = run_cli_in(
-        &cwd,
-        &[
-            "stack",
-            dump.to_str().unwrap(),
-            "-o",
-            out_dir.to_str().unwrap(),
-            "--zmap",
-            out_dir.join("zmap.tif").to_str().unwrap(),
-            "--algo",
-            "dummy-stack",
-            "--no-align",
-        ],
-    );
-    assert!(!with_zmap.success);
-    assert_eq!(with_zmap.code, Some(1));
-    assert!(
-        with_zmap.stderr.contains("focusforge-cli export") && with_zmap.stderr.contains("--zmap"),
-        "--zmap must be refused loudly, naming its replacement: {}",
-        with_zmap.stderr
-    );
-    assert!(
-        !with_zmap.stderr.contains("unexpected argument"),
-        "clap's generic refusal tells a user nothing: {}",
-        with_zmap.stderr
     );
 }
 
@@ -919,7 +923,7 @@ fn a_one_group_run_writes_a_manifest_too() {
             .expect("a one-group run writes a manifest too"),
     )
     .expect("the manifest must parse");
-    assert_eq!(manifest["format"], 1);
+    assert!(manifest.get("format").is_none());
     let groups = manifest["groups"].as_array().unwrap();
     assert_eq!(groups.len(), 1, "exactly one entry for the one group");
     assert_eq!(groups[0]["outcome"], "completed");

@@ -49,7 +49,7 @@ fn forced_panic_writes_a_report() {
     let report: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&reports[0]).unwrap())
             .expect("the report is one JSON object");
-    assert_eq!(report["format"], 1);
+    assert!(report.get("format").is_none());
     assert_eq!(report["thread"], "main");
     assert!(!report["backtrace"].as_str().unwrap().is_empty());
 }

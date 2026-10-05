@@ -110,7 +110,7 @@ enum Command {
     Info {
         /// Path to a file or directory.
         path: PathBuf,
-        /// Emit the frozen JSON schema instead of human-readable text.
+        /// Emit the JSON document instead of human-readable text.
         #[arg(long)]
         json: bool,
     },
@@ -119,7 +119,7 @@ enum Command {
     Algorithms {
         /// Algorithm id. Omit to list every registered algorithm.
         id: Option<String>,
-        /// Emit the frozen JSON schema instead of human-readable text.
+        /// Emit the JSON document instead of human-readable text.
         #[arg(long)]
         json: bool,
         #[command(flatten)]
@@ -141,11 +141,7 @@ enum Command {
         /// lists them). Required unless a `--preset` supplies `algo`.
         #[arg(long)]
         algo: Option<String>,
-        /// Hidden. Declared only so `stack` can refuse it by name and point
-        /// at `focusforge-cli export`; a project carries its own Z-Map.
-        #[arg(long, hide = true)]
-        zmap: Option<PathBuf>,
-        /// Emit the frozen JSON report instead of human-readable text.
+        /// Emit the JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
         #[command(flatten)]
@@ -271,7 +267,7 @@ enum Command {
         /// Where to write the frame `--frame` names.
         #[arg(long, value_name = "FILE")]
         frame_output: Option<PathBuf>,
-        /// Emit the frozen JSON report instead of human-readable text.
+        /// Emit the JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
     },
@@ -317,7 +313,7 @@ enum Command {
         /// other source, rather than the undivided wheel.
         #[arg(long, value_name = "INDEX")]
         solo: Option<u16>,
-        /// Emit the frozen JSON report instead of human-readable text.
+        /// Emit the JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
     },
@@ -333,7 +329,7 @@ enum Command {
         command: history::HistoryCommand,
     },
     /// Compute and report the per-frame transforms for a stack: readable
-    /// text by default, a frozen `--json` document on request, and an
+    /// text by default, a `--json` document on request, and an
     /// optional per-frame warped-TIFF dump for a visual check.
     Align {
         /// Directory of TIFF frames to align (non-recursive, descending
@@ -343,7 +339,7 @@ enum Command {
         /// sole registered alignment algorithm.
         #[arg(long)]
         algo: Option<String>,
-        /// Emit the frozen JSON report instead of human-readable text.
+        /// Emit the JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
         /// Soften a failed frame to an identity fallback and exit 0,
@@ -424,7 +420,7 @@ enum Command {
     /// `.scratch/stage-cache/`. Never touches `.scratch/resume/` or any
     /// project.
     Cache {
-        /// Emit the frozen JSON report instead of human-readable text.
+        /// Emit the JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
     },
@@ -490,7 +486,6 @@ fn main() -> ExitCode {
             dir,
             output,
             algo,
-            zmap,
             json,
             set,
             group_args,
@@ -523,7 +518,6 @@ fn main() -> ExitCode {
                 &dir,
                 output.as_deref(),
                 algo.as_deref(),
-                zmap.as_deref(),
                 json,
                 &set,
                 &align::AlignOptions {
@@ -652,10 +646,9 @@ fn main() -> ExitCode {
     }
 }
 
-/// The frozen `cache --json` schema.
+/// The `cache --json` report.
 #[derive(Serialize)]
 struct CacheClearReport {
-    format: u32,
     removed: usize,
 }
 
@@ -669,7 +662,7 @@ fn cache_clear(json: bool) -> ExitCode {
         Err(err) => return fail(err.to_string()),
     };
     if json {
-        let report = CacheClearReport { format: 1, removed };
+        let report = CacheClearReport { removed };
         match serde_json::to_string_pretty(&report) {
             Ok(text) => println!("{text}"),
             Err(err) => return fail(format!("failed to serialize JSON: {err}")),
@@ -759,7 +752,7 @@ impl From<&RawMetadata> for RawRecord {
     }
 }
 
-/// The frozen `info --json` schema. One shape for both a file and a
+/// The `info --json` document. One shape for both a file and a
 /// directory: a single-file invocation is `is_directory: false`,
 /// `frame_count: 1`, a one-element `files`.
 #[derive(Serialize)]

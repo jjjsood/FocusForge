@@ -74,8 +74,7 @@ use std::sync::Arc;
 use crate::tile::plan::PlannedTile;
 use crate::tile::{FramePreprocess, TileConsumer, TileError, TileScheduler};
 
-/// A job's current phase, reported as data. `#[non_exhaustive]` so a finer
-/// future breakdown of the fuse stage is additive rather than breaking.
+/// A job's current phase, reported as data.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStage {

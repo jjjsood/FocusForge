@@ -13,8 +13,7 @@
 //! description whose second token is a version number -- the three-token
 //! prefix separates the two unambiguously, and a composite opened as a
 //! Z-Map is [`super::ZMapError::NotAZMap`]. Unknown `key=value` tokens are
-//! ignored, which is what makes a later field additive the same way the
-//! `info --json` schema is.
+//! ignored.
 
 use std::path::Path;
 

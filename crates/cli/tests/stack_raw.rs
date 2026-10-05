@@ -202,7 +202,7 @@ fn forced_mixed_group_is_refused_by_name() {
     let groups = cwd.join("mixed.toml");
     std::fs::write(
         &groups,
-        "format = 1\n\n[[group]]\nname = \"mixed\"\nframes = [\"00.dng\", \"01.tif\"]\n",
+        "[[group]]\nname = \"mixed\"\nframes = [\"00.dng\", \"01.tif\"]\n",
     )
     .expect("write group file");
     let result = run(

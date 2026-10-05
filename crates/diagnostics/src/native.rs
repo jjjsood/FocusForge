@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use crash_handler::{CrashContext, CrashEventResult, CrashHandler};
 use minidumper::{Client, LoopAction, MinidumpBinary, Server, ServerHandler, SocketName};
 
-use crate::crash::{CRASH_REPORT_FORMAT, create_new_numbered, report_stem, rfc3339};
+use crate::crash::{create_new_numbered, report_stem, rfc3339};
 
 /// Set on a re-spawned process to make it the monitor for the socket its
 /// value names. The reserved value [`CAPTURE_OFF`] instead runs the
@@ -202,7 +202,6 @@ impl Monitor {
         };
         let signal = self.signal.load(Ordering::SeqCst);
         let metadata = serde_json::json!({
-            "format": CRASH_REPORT_FORMAT,
             "timestamp": rfc3339(self.crashed_at.load(Ordering::SeqCst)),
             "binary": info.binary,
             "version": info.version,

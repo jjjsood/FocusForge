@@ -771,9 +771,7 @@ mod accounting_tests {
 
 /// One run's stage breakdown, wall-clock seconds -- see the module
 /// documentation for the unit, the disjoint-contiguous contract and what
-/// `None` means. Additive-only on every schema that carries it
-/// (`StackReport`, `AlignReport`): a future stage is a new field, never a
-/// reinterpretation of one of these five.
+/// `None` means.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct StageTimings {
     pub setup: Option<f64>,
