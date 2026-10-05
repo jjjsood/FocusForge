@@ -85,6 +85,9 @@ capture time.
   the pointer sits in one pane, are echoed onto the other pane at the same
   underlying scene point, so the source frame and the composite stay in
   visual sync while editing.
+- **Painting from either pane** — a stroke paints the same pixels whether the
+  press lands in the source-frame pane or the composite pane, including when
+  one of them is detached into its own window.
 
 Saving strokes as a checkpoint, restoring an earlier one and branching are
 covered in [checkpoints](history.md).
