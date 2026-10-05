@@ -17,6 +17,8 @@ export { ProjectTabView }
 import { FFToolbar } from "shell/toolbar.slint";
 import { FFEditorToolbar } from "shell/editor_toolbar.slint";
 import { FFCanvas } from "shell/canvas.slint";
+import { ComparisonWindow } from "comparison_window.slint";
+export { ComparisonWindow }
 import { FFDock, SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView } from "shell/dock.slint";
 export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
@@ -81,9 +83,11 @@ export component AppWindow inherits Window {
     in property <string> cursor-core-commands;
     in property <bool> cursor-picking: false;
     in property <color> cursor-pick-color;
-    // The offset that carries either pane's cursor onto the other, at the
-    // same scene point.
-    in property <length> cursor-mirror-dx;
+    in property <bool> cursor-visible: false;
+    in property <length> cursor-composite-x;
+    in property <length> cursor-composite-y;
+    in property <length> cursor-zmap-x;
+    in property <length> cursor-zmap-y;
 
     no-frame: true;
     resize-border-width: 8px;
@@ -225,6 +229,7 @@ export component AppWindow inherits Window {
     in property <[string]> frame-message-lines: [];
     in property <[string]> composite-message-lines: [];
     in property <bool> canvas-undock-enabled: true;
+    in property <string> detached-pane: "";
     // Whether a project is open -- governs the pane chrome (label, undock)
     // and the bottom bar's zoom cluster together, so nothing offers an
     // action there is nothing yet to act on. Set from Rust alongside
@@ -266,6 +271,7 @@ export component AppWindow inherits Window {
     callback canvas-key-pressed(string, bool, bool, bool);
     callback canvas-key-released(string, bool, bool, bool);
     callback canvas-focus-changed();
+    callback canvas-hover-changed();
     // The one shared viewport's placement: `in`
     // properties set from Rust on every gesture repaint, bound to **both**
     // `FFPane`s below -- "one viewport over two panes" is structural, not a
@@ -277,6 +283,10 @@ export component AppWindow inherits Window {
     in property <length> image-y;
     in property <length> image-w;
     in property <length> image-h;
+    in property <length> crop-x;
+    in property <length> crop-y;
+    in property <length> crop-w;
+    in property <length> crop-h;
     // The left pane's own placement, drawn against the selected frame's
     // extent rather than the composite/Z-Map's -- the two panes share one
     // viewport's scale but not one image size.
@@ -296,6 +306,10 @@ export component AppWindow inherits Window {
     in property <length> backdrop-y;
     in property <length> backdrop-w;
     in property <length> backdrop-h;
+    in property <length> frame-crop-x;
+    in property <length> frame-crop-y;
+    in property <length> frame-crop-w;
+    in property <length> frame-crop-h;
     in property <bool> pixelated;
     callback canvas-resized();
     out property <length> canvas-pane-left-x: canvas.pane-left-x;
@@ -303,6 +317,10 @@ export component AppWindow inherits Window {
     out property <length> canvas-pane-left-y: canvas.pane-left-y;
     out property <length> canvas-pane-left-width: canvas.pane-left-width;
     out property <length> canvas-pane-left-height: canvas.pane-left-height;
+    out property <length> canvas-pane-right-y: canvas.pane-right-y;
+    out property <length> canvas-pane-right-width: canvas.pane-right-width;
+    out property <length> canvas-pane-right-height: canvas.pane-right-height;
+    out property <bool> canvas-pane-hovered: canvas.pane-hovered;
 
     canvas-ground := FocusScope {
         x: 0px;
@@ -336,12 +354,17 @@ export component AppWindow inherits Window {
             frame-message-lines: root.frame-message-lines;
             composite-message-lines: root.composite-message-lines;
             undock-enabled: root.canvas-undock-enabled;
+            detached-pane: root.detached-pane;
             project-loaded: root.project-loaded;
             composite-ready: root.composite-ready;
             image-x: root.image-x;
             image-y: root.image-y;
             image-w: root.image-w;
             image-h: root.image-h;
+            crop-x: root.crop-x;
+            crop-y: root.crop-y;
+            crop-w: root.crop-w;
+            crop-h: root.crop-h;
             frame-image-x: root.frame-image-x;
             frame-image-y: root.frame-image-y;
             frame-image-w: root.frame-image-w;
@@ -356,6 +379,10 @@ export component AppWindow inherits Window {
             backdrop-y: root.backdrop-y;
             backdrop-w: root.backdrop-w;
             backdrop-h: root.backdrop-h;
+            frame-crop-x: root.frame-crop-x;
+            frame-crop-y: root.frame-crop-y;
+            frame-crop-w: root.frame-crop-w;
+            frame-crop-h: root.frame-crop-h;
             pixelated: root.pixelated;
             show-empty-state: root.show-empty-state;
             load-active: root.load-active;
@@ -365,7 +392,11 @@ export component AppWindow inherits Window {
             cursor-core-commands: root.cursor-core-commands;
             cursor-picking: root.cursor-picking;
             cursor-pick-color: root.cursor-pick-color;
-            cursor-mirror-dx: root.cursor-mirror-dx;
+        cursor-visible: root.cursor-visible;
+        cursor-composite-x: root.cursor-composite-x;
+        cursor-composite-y: root.cursor-composite-y;
+        cursor-zmap-x: root.cursor-zmap-x;
+        cursor-zmap-y: root.cursor-zmap-y;
 
             composite-undock-requested => { root.composite-undock-requested(); }
             zmap-undock-requested => { root.zmap-undock-requested(); }
@@ -378,6 +409,7 @@ export component AppWindow inherits Window {
             }
             canvas-dragged(x, y) => { root.canvas-dragged(x, y); }
             canvas-resized => { root.canvas-resized(); }
+            pane-hover-changed => { root.canvas-hover-changed(); }
         }
     }
 

@@ -25,7 +25,7 @@ use crate::canvas::{
     EditState, EditedView, FrameView, OverlayDraw, Pane, PaneJob, PaneReader, PaneSource,
     StampFloor, TextureSpec,
 };
-use crate::viewport::PaneDraw;
+use crate::viewport::{ImageSize, PaneDraw};
 
 /// The exact content a [`PaneTexture`] was last drawn from: `draw.src`,
 /// `draw.step` and the edit state, never `dst`/`pixelated` (placement,
@@ -33,13 +33,16 @@ use crate::viewport::PaneDraw;
 /// re-rendered).
 type Coverage = ((u32, u32, u32, u32), NonZeroU32, EditState);
 
-fn is_content(
-    key: Option<&Coverage>,
-    src: (u32, u32, u32, u32),
-    step: NonZeroU32,
-    state: &EditState,
-) -> bool {
-    key.is_some_and(|(s, t, e)| *s == src && *t == step && e == state)
+fn rect_contains(outer: (u32, u32, u32, u32), inner: (u32, u32, u32, u32)) -> bool {
+    let end = |pos: u32, len: u32| u64::from(pos) + u64::from(len);
+    outer.0 <= inner.0
+        && outer.1 <= inner.1
+        && end(outer.0, outer.2) >= end(inner.0, inner.2)
+        && end(outer.1, outer.3) >= end(inner.1, inner.3)
+}
+
+fn visible_draw_fits(source_size: (u32, u32), draw: &PaneDraw) -> bool {
+    crate::canvas::draw_rect_fits(source_size, draw.src)
 }
 
 /// One pane's wgpu-owned state: the display texture, the `slint::Image`
@@ -74,16 +77,19 @@ impl PaneTexture {
         self.image.clone().unwrap_or_default()
     }
 
-    /// Whether this pane was last drawn from exactly `src`/`step` under
-    /// `state` -- a match means the caller can skip its own source read and
-    /// this pane's upload/render entirely, whatever `dst`/`pixelated` now are.
+    /// Whether this pane's retained source rect contains `src` at the same
+    /// sampling step and edit state.
     fn covers(&self, src: (u32, u32, u32, u32), step: NonZeroU32, state: &EditState) -> bool {
-        is_content(self.coverage.as_ref(), src, step, state)
+        self.coverage
+            .as_ref()
+            .is_some_and(|(s, t, e)| rect_contains(*s, src) && *t == step && e == state)
     }
 
     /// Whether a backdrop read of exactly this content was already issued.
     fn requested(&self, src: (u32, u32, u32, u32), step: NonZeroU32, state: &EditState) -> bool {
-        is_content(self.requested.as_ref(), src, step, state)
+        self.requested
+            .as_ref()
+            .is_some_and(|(s, t, e)| *s == src && *t == step && e == state)
     }
 
     fn mark_covered(&mut self, src: (u32, u32, u32, u32), step: NonZeroU32, state: EditState) {
@@ -267,6 +273,7 @@ mod tests {
         let draw = PaneDraw {
             src: (0, 0, 64, 64),
             dst: (0.0, 0.0, 64.0, 64.0),
+            crop: (0.0, 0.0, 64.0, 64.0),
             pixelated: false,
             step: NonZeroU32::MIN,
         };
@@ -349,11 +356,20 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mantis-64/frames/00.tif")
     }
 
+    fn fixture_512_frame() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mantis-512/frames/00.tif")
+    }
+
     /// A step-1 draw of the `side`x`side` square at the source origin.
     fn square_draw(side: u32) -> PaneDraw {
+        square_draw_at(0, 0, side)
+    }
+
+    fn square_draw_at(x: u32, y: u32, side: u32) -> PaneDraw {
         PaneDraw {
-            src: (0, 0, side, side),
+            src: (x, y, side, side),
             dst: (0.0, 0.0, side as _, side as _),
+            crop: (0.0, 0.0, side as _, side as _),
             pixelated: false,
             step: NonZeroU32::MIN,
         }
@@ -393,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_or_source_replacement_releases_the_superseded_texture() {
+    fn a_guarded_resize_or_source_replacement_releases_the_superseded_texture() {
         let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
             return;
         };
@@ -402,24 +418,38 @@ mod tests {
         let mut renderer = CanvasRenderer::new();
         renderer.attach_device(shared.device().clone(), shared.queue().clone());
         renderer
-            .set_frame(&fixture_frame(), None, crate::job::host_budget())
+            .set_frame(&fixture_512_frame(), None, crate::job::host_budget())
             .expect("fixture frame opens");
 
-        assert!(renderer.redraw_frame(&square_draw(64)).is_some());
-        assert!(renderer.redraw_frame(&square_draw(8)).is_some());
+        // A 64-pixel visible draw retains the 64-pixel guard, yielding a
+        // 192x192 texture. A separate 8-pixel draw gets a 136x136 guarded
+        // texture and must replace that larger allocation.
+        assert!(renderer.redraw_frame(&square_draw_at(0, 160, 64)).is_some());
         let texture = renderer
             .frame_pane
             .display_texture
             .as_ref()
-            .expect("the resized pane holds a texture");
+            .expect("the first guarded draw holds a texture");
+        assert_eq!((texture.width(), texture.height()), (192, 192));
+
+        assert!(
+            renderer
+                .redraw_frame(&square_draw_at(300, 160, 8))
+                .is_some()
+        );
+        let texture = renderer
+            .frame_pane
+            .display_texture
+            .as_ref()
+            .expect("the resized guarded draw holds a texture");
         assert_eq!(
             (texture.width(), texture.height()),
-            (8, 8),
-            "the pane holds only the texture of the new size"
+            (136, 136),
+            "the pane holds only the texture of the new guarded size"
         );
 
         renderer
-            .set_frame(&fixture_frame(), None, crate::job::host_budget())
+            .set_frame(&fixture_512_frame(), None, crate::job::host_budget())
             .expect("fixture frame re-opens");
         assert!(renderer.frame_pane.display_texture.is_none());
         assert!(renderer.frame_pane.image.is_none());
@@ -441,9 +471,9 @@ mod tests {
     }
 
     #[test]
-    fn each_attach_builds_one_display_renderer_whose_source_buffer_follows_the_draw() {
+    fn each_attach_builds_one_display_renderer_whose_source_buffer_follows_guarded_draws() {
         if !in_isolated_child(
-            "each_attach_builds_one_display_renderer_whose_source_buffer_follows_the_draw",
+            "each_attach_builds_one_display_renderer_whose_source_buffer_follows_guarded_draws",
         ) {
             return;
         }
@@ -474,11 +504,11 @@ mod tests {
                 "attach {attach} allocates only the params buffer"
             );
 
-            // (side, whether the source buffer is re-created): the first
-            // draw creates it; 8 needs under a quarter of 64's, so it shrinks;
-            // 4 needs exactly a quarter of 8's, so it is kept; 3 needs under
-            // a quarter again; 5 needs more than 3's, so it grows.
-            for (side, recreated) in [(64, true), (8, true), (4, false), (3, true), (5, true)] {
+            // The 64x64 fixture bounds every guarded draw here to the full
+            // image. The first upload creates the 64x64 source buffer; all
+            // later visible draws are covered by that guarded texture, so
+            // neither a source buffer nor a display texture is replaced.
+            for (side, recreated) in [(64, true), (8, false), (4, false), (3, false), (5, false)] {
                 let before = accounting_snapshot();
                 assert!(renderer.redraw_frame(&square_draw(side)).is_some());
                 let after = accounting_snapshot();
@@ -671,6 +701,16 @@ impl CanvasRenderer {
             Pane::Frame => &self.frame_pane,
             Pane::Composite => &self.composite_pane,
             Pane::ZMap => &self.zmap_pane,
+        }
+    }
+
+    fn source_size(&self, pane: Pane) -> Option<(u32, u32)> {
+        match pane {
+            Pane::Frame => self.frame.dimensions(),
+            Pane::Composite | Pane::ZMap => {
+                let header = self.composite.as_ref()?.header(0);
+                Some((header.width, header.height))
+            }
         }
     }
 
@@ -878,6 +918,10 @@ impl CanvasRenderer {
         indices: Option<Arc<dyn PaneReader>>,
         state: EditState,
     ) -> Option<PaneJob> {
+        let max_texture_dimension = self.device.as_ref()?.limits().max_texture_dimension_2d;
+        if !visible_draw_fits(source_size, draw) {
+            return None;
+        }
         let texture = self.texture_mut(pane, backdrop);
         if backdrop
             && (texture.covers(draw.src, draw.step, &state)
@@ -891,7 +935,14 @@ impl CanvasRenderer {
             texture.floor.reset(stamp);
             return None;
         }
-        if !crate::canvas::draw_rect_fits(source_size, draw.src) {
+        let guarded = draw.guarded(
+            ImageSize {
+                width: source_size.0,
+                height: source_size.1,
+            },
+            max_texture_dimension,
+        )?;
+        if !visible_draw_fits(source_size, &guarded) {
             return None;
         }
         if backdrop {
@@ -899,7 +950,7 @@ impl CanvasRenderer {
         }
         Some(PaneJob {
             pane,
-            draw: *draw,
+            draw: guarded,
             stamp,
             reader,
             index_scale,
@@ -1048,6 +1099,9 @@ impl CanvasRenderer {
         pane: Pane,
         draw: &PaneDraw,
     ) -> Option<(slint::Image, (f32, f32, f32, f32))> {
+        if !visible_draw_fits(self.source_size(pane)?, draw) {
+            return None;
+        }
         Self::placed(self.pane_ref(pane), draw)
     }
 
@@ -1111,6 +1165,9 @@ impl CanvasRenderer {
     ) -> Option<(slint::Image, PaneSource)> {
         let _scope = measurement_scope("gui_plane_redraw");
         let plane = self.plane;
+        if !visible_draw_fits(self.source_size(plane.into())?, draw) {
+            return None;
+        }
         let generation = edited.as_ref().map(|view| view.tiles.generation());
         let image = match self.request_planes(draw, generation, overlay) {
             Some(job) => self.read_and_publish(job, edited.as_ref())?,
@@ -1130,6 +1187,9 @@ impl CanvasRenderer {
     /// indices.
     pub fn redraw_frame(&mut self, draw: &PaneDraw) -> Option<slint::Image> {
         let _scope = measurement_scope("gui_frame_redraw");
+        if !visible_draw_fits(self.source_size(Pane::Frame)?, draw) {
+            return None;
+        }
         match self.request_frame(draw) {
             Some(job) => self.read_and_publish(job, None),
             None => self.covered_image(Pane::Frame, draw),
@@ -1142,7 +1202,7 @@ impl CanvasRenderer {
         texture
             .coverage
             .as_ref()
-            .is_some_and(|(src, step, _)| *src == draw.src && *step == draw.step)
+            .is_some_and(|(src, step, _)| rect_contains(*src, draw.src) && *step == draw.step)
             .then(|| texture.image())
     }
 }

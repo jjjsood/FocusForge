@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::brush;
-use crate::canvas::{FrameView, OverlayDraw};
+use crate::canvas::{FrameView, OverlayDraw, PaneSource};
 use crate::checkpoints;
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
@@ -95,10 +95,18 @@ pub enum ShellEvent {
     /// without a second lock on the controller.
     WindowMaximizeToggled(bool),
     WindowCloseRequested,
+    /// A native chrome operation directed at exactly one window.
+    WindowChrome {
+        target: WindowTarget,
+        intent: WindowChromeIntent,
+    },
     CheckpointExportRequested,
-    /// Unreachable while `AppController::undock_enabled` stays `true`,
-    /// which holds as long as both panes are docked.
-    PaneUndockRequested(crate::canvas::PaneSource),
+    /// A pane left the main window.
+    PaneUndockRequested(PaneSource),
+    /// A detached pane returned to the main window.
+    PaneDocked(PaneSource),
+    /// The main window is closing and its detached pane must close first.
+    DetachedWindowCloseRequested,
     /// Raised by the one input dispatch point (`wheel`, `pointer`,
     /// `pointer_moved`, `key`) every time a trigger resolves to an
     /// `Action`.
@@ -183,6 +191,21 @@ pub enum ShellEvent {
     RecompositeReady,
 }
 
+/// The native window that owns a chrome operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowTarget {
+    Main,
+    Comparison,
+}
+
+/// A drawn chrome control's requested native operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowChromeIntent {
+    Drag,
+    Minimize,
+    ToggleMaximize,
+}
+
 /// One live drag: which action it started and the last position seen, so
 /// `pointer_moved` can difference successive positions into deltas
 /// (slint-ui/slint#13189 -- `PointerEvent` carries no delta of its own).
@@ -190,6 +213,7 @@ pub enum ShellEvent {
 struct DragState {
     action: Action,
     last: (f32, f32),
+    pane: Option<PaneSource>,
 }
 
 /// The one dispatch point's own state: the active table, where it came
@@ -208,6 +232,9 @@ struct InputState {
     alt_held: bool,
     drag: Option<DragState>,
     last_pointer: (f32, f32),
+    /// Set only by an independent window entry point, whose local origin can
+    /// overlap the main window's origin.
+    explicit_pane: Option<PaneSource>,
     /// Accumulated wheel delta not yet spent into a ladder step -- one stop
     /// per accumulated 60 px. Reset on a sign change so reversing direction
     /// never burns a leftover, and whenever the resolved action differs from
@@ -325,10 +352,9 @@ pub struct BrushCursorView {
     /// the pointer while `picking`, or the current brush source otherwise --
     /// shown in the cursor's swatch.
     pub pick_color: [u8; 3],
-    /// The right pane's `x` minus the left pane's, logical px: the offset
-    /// that carries a cursor's centre from the pane it is over onto the
-    /// other pane, at the same scene point.
-    pub mirror_dx: f32,
+    /// The shared source point projected into each pane's local coordinates.
+    pub composite_position: (f32, f32),
+    pub zmap_position: (f32, f32),
 }
 
 /// The diagnostics panel's own state: the two directories a bundle is
@@ -1123,6 +1149,12 @@ struct ShellState {
     /// (`ui/shell/canvas.slint`'s five `out` properties, read once by
     /// `src/main.rs` at startup and again on every `canvas-resized`).
     panes: Option<(PaneRect, PaneRect)>,
+    /// Last valid rect for each side, including a side whose window is
+    /// detached and therefore does not report main-window resize callbacks.
+    composite_pane: Option<PaneRect>,
+    zmap_pane: Option<PaneRect>,
+    /// The one pane outside the main window, if any.
+    detached: Option<PaneSource>,
     /// A grouping question raised by [`AppController::open_paths`], and the
     /// [`Proposal`] behind it -- both cleared by
     /// [`AppController::answer_question`] or
@@ -1468,8 +1500,7 @@ impl ShellState {
     }
 }
 
-/// Whether `(x, y)` falls within `pane`'s rect -- [`AppController::anchor`]'s
-/// only helper.
+/// Whether `(x, y)` falls within `pane`'s rect.
 /// A short, stable digest of a path -- what keeps two different tabs that
 /// happen to propose the same group name from fighting over one staging
 /// directory. Not cryptographic: only uniqueness across concurrent runs on
@@ -1483,6 +1514,15 @@ pub(crate) fn path_digest(path: &std::path::Path) -> u64 {
 
 fn pane_contains(pane: PaneRect, x: f32, y: f32) -> bool {
     x >= pane.x && x <= pane.x + pane.width && y >= pane.y && y <= pane.y + pane.height
+}
+
+fn valid_pane(pane: PaneRect) -> bool {
+    pane.x.is_finite()
+        && pane.y.is_finite()
+        && pane.width.is_finite()
+        && pane.height.is_finite()
+        && pane.width > 0.0
+        && pane.height > 0.0
 }
 
 /// Widens `rect` by `margin` px on every side, clamped to `0..width` /
@@ -2237,6 +2277,19 @@ impl AppController {
         self.emit(ShellEvent::WindowMinimizeRequested);
     }
 
+    /// Sends native chrome to its owning window. Main-window calls retain
+    /// their existing stateful events; the detached window is always native.
+    pub fn window_chrome(&mut self, target: WindowTarget, intent: WindowChromeIntent) {
+        match target {
+            WindowTarget::Main => match intent {
+                WindowChromeIntent::Drag => self.tab_strip_pressed(),
+                WindowChromeIntent::Minimize => self.window_minimize(),
+                WindowChromeIntent::ToggleMaximize => self.window_maximize_toggle(),
+            },
+            WindowTarget::Comparison => self.emit(ShellEvent::WindowChrome { target, intent }),
+        }
+    }
+
     /// The window controls' maximize glyph reads this back
     /// (`AppWindow::window-maximized`, wired in `src/bridge.rs`), so it
     /// looks different maximized than not.
@@ -2263,7 +2316,7 @@ impl AppController {
             return;
         }
         if !self.state.projects.iter().any(ProjectTab::quit_loses_work) {
-            self.emit(ShellEvent::WindowCloseRequested);
+            self.request_window_close();
         } else {
             self.state.pending_quit = true;
             self.emit(ShellEvent::ProjectsChanged);
@@ -2609,9 +2662,14 @@ impl AppController {
         }
     }
 
-    /// Always `true` -- both panes are docked together.
-    pub fn undock_enabled(&self, _pane: crate::canvas::PaneSource) -> bool {
-        true
+    /// A pane can leave the main window only while both panes are docked.
+    pub fn undock_enabled(&self, _pane: PaneSource) -> bool {
+        self.state.detached.is_none()
+    }
+
+    /// The pane currently outside the main window, if any.
+    pub fn detached_pane(&self) -> Option<PaneSource> {
+        self.state.detached
     }
 
     /// The active tab's frame count, once a project is open -- the
@@ -2623,11 +2681,23 @@ impl AppController {
             .map(|tab| entry::tab_frame_count(&tab.project))
     }
 
-    /// Forwards a pane's undock request -- unreachable while
-    /// [`Self::undock_enabled`] is always `true` with both panes docked,
-    /// but declared so the seam exists.
-    pub fn undock_requested(&self, pane: crate::canvas::PaneSource) {
+    /// Sends a pane out once. A second request would leave no pane in the
+    /// main window, so it is ignored.
+    pub fn undock_requested(&mut self, pane: PaneSource) {
+        if self.state.detached.is_some() {
+            return;
+        }
+        self.state.detached = Some(pane);
         self.emit(ShellEvent::PaneUndockRequested(pane));
+    }
+
+    /// Docks `pane` back when its detached window closes. Repeated close
+    /// signals are harmless.
+    pub fn undocked_window_closed(&mut self, pane: PaneSource) {
+        if self.state.detached == Some(pane) {
+            self.state.detached = None;
+            self.emit(ShellEvent::PaneDocked(pane));
+        }
     }
 
     /// Installs the input table `input_config::load` resolved -- called
@@ -2737,10 +2807,18 @@ impl AppController {
     /// One ladder step per accumulated 60 px, about the last known cursor
     /// position.
     fn zoom_wheel(&mut self, steps: f32) {
-        let Some((left, _)) = self.state.panes else {
+        let Some((left, right)) = self.state.panes else {
             return;
         };
-        let anchor = self.anchor();
+        let (pane, anchor) = self.anchor_pane();
+        let gesture_pane = match pane {
+            PaneSource::Composite => left,
+            PaneSource::ZMap => right,
+        };
+        let other_pane = match pane {
+            PaneSource::Composite => right,
+            PaneSource::ZMap => left,
+        };
         let detents = self.wheel_detents(Action::ZoomAtCursor, steps);
         let dir = detents.signum();
         for _ in 0..detents.unsigned_abs() {
@@ -2751,7 +2829,7 @@ impl AppController {
                 return;
             };
             if let Some(viewport) = tab.viewport.as_mut() {
-                viewport.zoom_steps(dir, anchor, image, left);
+                viewport.zoom_steps_in(dir, anchor, image, gesture_pane, other_pane);
             }
         }
     }
@@ -2842,8 +2920,7 @@ impl AppController {
     /// The brush cursor overlay's own view: extent and path commands built from the current brush
     /// size/softness scaled to on-screen px by the active tab's own viewport, the pipette's own
     /// preview colour -- the Z-Map index under the pointer while armed or while `Alt` is held, the
-    /// selected source otherwise -- and `mirror_dx`, the offset that carries either pane's cursor
-    /// onto the other. `None` with no active tab, viewport or pane geometry, or while
+    /// selected source otherwise -- and projects that source point into both panes. `None` with no active tab, viewport or pane geometry, or while
     /// [`Self::canvas_blocked`] holds.
     pub fn brush_cursor_view(&self) -> Option<BrushCursorView> {
         if self.canvas_blocked() {
@@ -2858,17 +2935,23 @@ impl AppController {
         let sources = tab.frames.len().max(1) as u32;
         let picking = self.state.brush.picking || self.state.input.alt_held;
         let hovered = picking
-            .then(|| self.source_index_at(self.anchor()))
+            .then(|| {
+                let (pane, local) = self.anchor_pane();
+                self.source_index_at(pane, local)
+            })
             .flatten()
             .filter(|&source| source != job::NO_SOURCE);
         let source = hovered.unwrap_or_else(|| u16::try_from(tab.selected).unwrap_or(u16::MAX));
+        let (active_pane, local) = self.anchor_pane();
+        let source_point = viewport.to_source_in(local, self.pane_rect(active_pane)?);
         Some(BrushCursorView {
             extent: paths.extent,
             ring_commands: paths.ring,
             core_commands: paths.core,
             picking,
             pick_color: job::source_color(source, sources),
-            mirror_dx: right.x - left.x,
+            composite_position: viewport.from_source_in(source_point, left),
+            zmap_position: viewport.from_source_in(source_point, right),
         })
     }
 
@@ -2949,10 +3032,10 @@ impl AppController {
     /// source) and [`Self::brush_cursor_view`] (which only previews its
     /// colour). `None` off the image, off the active tab's tile, or with
     /// nothing to read; callers decide what `NO_SOURCE` means to them.
-    fn source_index_at(&self, local: (f32, f32)) -> Option<u16> {
+    fn source_index_at(&self, pane: PaneSource, local: (f32, f32)) -> Option<u16> {
         let tab = self.state.active()?;
         let viewport = tab.viewport.as_ref()?;
-        let (sx, sy) = viewport.to_source(local);
+        let (sx, sy) = viewport.to_source_in(local, self.pane_rect(pane)?);
         if sx < 0.0 || sy < 0.0 {
             return None;
         }
@@ -2969,8 +3052,8 @@ impl AppController {
     /// `Alt + click`, or the armed pipette's `Start`: reads the Z-Map index
     /// under `local` (pane-local coordinates) and makes it the brush source.
     /// `NO_SOURCE` and a point off the image leave the source unchanged.
-    fn pick_source_at(&mut self, local: (f32, f32)) {
-        let Some(source) = self.source_index_at(local) else {
+    fn pick_source_at(&mut self, pane: PaneSource, local: (f32, f32)) {
+        let Some(source) = self.source_index_at(pane, local) else {
             return;
         };
         if source == job::NO_SOURCE {
@@ -2981,8 +3064,8 @@ impl AppController {
 
     /// `Alt + click`: picks without arming the pipette.
     fn pick_source_under_pointer(&mut self) {
-        let local = self.anchor();
-        self.pick_source_at(local);
+        let (pane, local) = self.anchor_pane();
+        self.pick_source_at(pane, local);
     }
 
     /// `Paint`'s `Start`. With the pipette armed, this is a pick that also
@@ -2994,27 +3077,36 @@ impl AppController {
     /// is the same whichever pane the press lands in.
     fn paint_start(&mut self, x: f32, y: f32) {
         if self.state.brush.picking {
-            let local = self.anchor();
-            self.pick_source_at(local);
+            let (pane, local) = self.anchor_pane();
+            self.pick_source_at(pane, local);
             self.state.brush.picking = false;
             self.emit(ShellEvent::EditorChanged);
             return;
         }
-        let Some(pane) = self.pane_at(x, y) else {
+        let hit = match self.state.input.explicit_pane {
+            Some(pane) => self
+                .pane_rect(pane)
+                .is_some_and(|rect| x >= 0.0 && x <= rect.width && y >= 0.0 && y <= rect.height),
+            None => self.pane_at(x, y).is_some(),
+        };
+        if !hit {
+            return;
+        }
+        let (pane, local) = self.anchor_pane();
+        let Some(rect) = self.pane_rect(pane) else {
             return;
         };
         let Some(source) = self.brush_source() else {
             return;
         };
         let (radius, softness) = self.brush_radius_softness();
-        let local = (x - pane.x, y - pane.y);
         let Some(tab) = self.state.active_mut() else {
             return;
         };
         let Some(viewport) = tab.viewport.as_ref() else {
             return;
         };
-        let (sx, sy) = viewport.to_source(local);
+        let (sx, sy) = viewport.to_source_in(local, rect);
         let Some(edit) = tab.edit.as_mut() else {
             return;
         };
@@ -3147,11 +3239,9 @@ impl AppController {
         self.emit(ShellEvent::EditorChanged);
     }
 
-    /// A screen-pixel pan on whichever pane the cursor is over -- both
-    /// panes share the one viewport, so only the size (identical for both)
-    /// matters here.
+    /// A screen-pixel pan on either pane, constrained by both extents.
     fn pan_viewport(&mut self, dx: f32, dy: f32) {
-        let Some((left, _)) = self.state.panes else {
+        let Some((left, right)) = self.state.panes else {
             return;
         };
         let Some(tab) = self.state.active_mut() else {
@@ -3163,7 +3253,7 @@ impl AppController {
         let Some(viewport) = tab.viewport.as_mut() else {
             return;
         };
-        viewport.pan_by(dx, dy, image, left);
+        viewport.pan_by_two(dx, dy, image, left, right);
     }
 
     /// The last known cursor position, mapped into pane-local coordinates:
@@ -3171,18 +3261,39 @@ impl AppController {
     /// the gutter, the divider or outside both, clamp it into the nearer
     /// pane's rect. Both panes carry the same viewport, so which pane the
     /// cursor is in does not change the result, only where inside it.
-    fn anchor(&self) -> (f32, f32) {
+    fn anchor_pane(&self) -> (PaneSource, (f32, f32)) {
         let (x, y) = self.state.input.last_pointer;
+        if let Some(pane) = self.state.input.explicit_pane {
+            return (pane, (x, y));
+        }
         let Some((left, right)) = self.state.panes else {
-            return (x, y);
+            return (PaneSource::Composite, (x, y));
         };
-        let pane = self.pane_at(x, y).unwrap_or_else(|| {
-            let mid = (left.x + left.width + right.x) / 2.0;
-            if x < mid { left } else { right }
-        });
+        let (side, pane) =
+            if self.state.detached != Some(PaneSource::Composite) && pane_contains(left, x, y) {
+                (PaneSource::Composite, left)
+            } else if self.state.detached != Some(PaneSource::ZMap) && pane_contains(right, x, y) {
+                (PaneSource::ZMap, right)
+            } else {
+                match self.state.detached {
+                    Some(PaneSource::Composite) => (PaneSource::ZMap, right),
+                    Some(PaneSource::ZMap) => (PaneSource::Composite, left),
+                    None => {
+                        let mid = (left.x + left.width + right.x) / 2.0;
+                        if x < mid {
+                            (PaneSource::Composite, left)
+                        } else {
+                            (PaneSource::ZMap, right)
+                        }
+                    }
+                }
+            };
         (
-            x.clamp(pane.x, pane.x + pane.width) - pane.x,
-            y.clamp(pane.y, pane.y + pane.height) - pane.y,
+            side,
+            (
+                x.clamp(pane.x, pane.x + pane.width) - pane.x,
+                y.clamp(pane.y, pane.y + pane.height) - pane.y,
+            ),
         )
     }
 
@@ -3195,12 +3306,38 @@ impl AppController {
             .find(|&pane| pane_contains(pane, x, y))
     }
 
+    fn pane_rect(&self, pane: PaneSource) -> Option<PaneRect> {
+        let (left, right) = self.state.panes?;
+        Some(match pane {
+            PaneSource::Composite => left,
+            PaneSource::ZMap => right,
+        })
+    }
+
     /// Installs both panes' current geometry, pushed by `ui/shell/canvas.slint`'s
     /// five `out` properties (`src/bridge.rs`'s `canvas-resized` handler and
     /// `src/main.rs`'s startup push). Fits the viewport on the first call
     /// after a project opens (`open_project` cannot, having no pane rect of
     /// its own); every later call re-`resize`s it, so fit stays sticky.
     pub fn set_pane_geometry(&mut self, left: PaneRect, right: PaneRect) {
+        if !valid_pane(left) || !valid_pane(right) {
+            return;
+        }
+        match self.state.detached {
+            Some(PaneSource::Composite) => self.state.zmap_pane = Some(right),
+            Some(PaneSource::ZMap) => self.state.composite_pane = Some(left),
+            None => {
+                self.state.composite_pane = Some(left);
+                self.state.zmap_pane = Some(right);
+            }
+        }
+        self.install_pane_geometry();
+    }
+
+    fn install_pane_geometry(&mut self) {
+        let (Some(left), Some(right)) = (self.state.composite_pane, self.state.zmap_pane) else {
+            return;
+        };
         self.state.panes = Some((left, right));
         let Some(tab) = self.state.active_mut() else {
             return;
@@ -3209,9 +3346,21 @@ impl AppController {
             return;
         };
         match tab.viewport.as_mut() {
-            Some(viewport) => viewport.resize(image, left),
-            None => tab.viewport = Some(crate::viewport::fit(image, left)),
+            Some(viewport) => viewport.resize_two(image, left, right),
+            None => tab.viewport = Some(crate::viewport::fit_two(image, left, right)),
         }
+    }
+
+    /// Updates one pane while preserving the other window's last valid rect.
+    pub fn set_pane_geometry_for(&mut self, pane: PaneSource, rect: PaneRect) {
+        if !valid_pane(rect) {
+            return;
+        }
+        match pane {
+            PaneSource::Composite => self.state.composite_pane = Some(rect),
+            PaneSource::ZMap => self.state.zmap_pane = Some(rect),
+        }
+        self.install_pane_geometry();
     }
 
     /// Fits the active tab's viewport when it has none yet and a pane
@@ -3219,14 +3368,14 @@ impl AppController {
     /// resizing -- a load settling, a tab switch -- gets no
     /// [`Self::set_pane_geometry`] call of its own to fit it.
     pub fn fit_if_unfitted(&mut self) {
-        let Some((left, _)) = self.state.panes else {
+        let Some((left, right)) = self.state.panes else {
             return;
         };
         let Some(tab) = self.state.active_mut() else {
             return;
         };
         if let (Some(image), None) = (display_image(tab), &tab.viewport) {
-            tab.viewport = Some(crate::viewport::fit(image, left));
+            tab.viewport = Some(crate::viewport::fit_two(image, left, right));
         }
     }
 
@@ -3242,7 +3391,7 @@ impl AppController {
     }
 
     fn zoom_button(&mut self, dir: i32) {
-        let Some((left, _)) = self.state.panes else {
+        let Some((left, right)) = self.state.panes else {
             return;
         };
         let Some(tab) = self.state.active_mut() else {
@@ -3255,13 +3404,12 @@ impl AppController {
             return;
         };
         let centre = (left.width / 2.0, left.height / 2.0);
-        viewport.zoom_steps(dir, centre, image, left);
+        viewport.zoom_steps_in(dir, centre, image, left, right);
     }
 
-    /// `Fit`: shows the whole image, centred, in whichever pane geometry is
-    /// current.
+    /// `Fit`: shows the whole image, centred, in both panes.
     pub fn fit(&mut self) {
-        let Some((left, _)) = self.state.panes else {
+        let Some((left, right)) = self.state.panes else {
             return;
         };
         let Some(tab) = self.state.active_mut() else {
@@ -3270,7 +3418,7 @@ impl AppController {
         let Some(image) = display_image(tab) else {
             return;
         };
-        tab.viewport = Some(crate::viewport::fit(image, left));
+        tab.viewport = Some(crate::viewport::fit_two(image, left, right));
     }
 
     /// The zoom cluster's readout string -- empty while no tab is active or
@@ -3289,12 +3437,12 @@ impl AppController {
         let Some(tab) = self.state.active() else {
             return false;
         };
-        let (Some(image), Some((left, _)), Some(viewport)) =
+        let (Some(image), Some((left, right)), Some(viewport)) =
             (display_image(tab), self.state.panes, tab.viewport.as_ref())
         else {
             return false;
         };
-        viewport.at_min(image, left)
+        viewport.at_min_two(image, left, right)
     }
 
     /// Whether the active tab's viewport is at the ladder's maximum --
@@ -3303,12 +3451,12 @@ impl AppController {
         let Some(tab) = self.state.active() else {
             return false;
         };
-        let (Some(image), Some((left, _)), Some(viewport)) =
+        let (Some(image), Some((left, right)), Some(viewport)) =
             (display_image(tab), self.state.panes, tab.viewport.as_ref())
         else {
             return false;
         };
-        viewport.at_max(image, left)
+        viewport.at_max_two(image, left, right)
     }
 
     /// The active tab's viewport's visible source rect and its pane-local
@@ -3395,6 +3543,31 @@ impl AppController {
     /// `x`/`y` are the wheel's own cursor position -- `TouchArea` writes
     /// `mouse-x`/`mouse-y` before `scroll-event` is invoked.
     pub fn wheel(&mut self, delta_x: f32, delta_y: f32, x: f32, y: f32, mods: Modifiers) {
+        self.wheel_for(None, delta_x, delta_y, x, y, mods);
+    }
+
+    /// Wheel input from a pane with its own local coordinate origin.
+    pub fn wheel_for_pane(
+        &mut self,
+        pane: PaneSource,
+        delta_x: f32,
+        delta_y: f32,
+        x: f32,
+        y: f32,
+        mods: Modifiers,
+    ) {
+        self.wheel_for(Some(pane), delta_x, delta_y, x, y, mods);
+    }
+
+    fn wheel_for(
+        &mut self,
+        pane: Option<PaneSource>,
+        delta_x: f32,
+        delta_y: f32,
+        x: f32,
+        y: f32,
+        mods: Modifiers,
+    ) {
         // Every wheel-triggered action -- zoom, pan, anything else a table
         // row binds to `Trigger::Wheel` -- stays off while the canvas is
         // blocked.
@@ -3402,6 +3575,7 @@ impl AppController {
             return;
         }
         self.state.input.last_pointer = (x, y);
+        self.state.input.explicit_pane = pane;
         let (trigger, steps) = if delta_x.abs() > delta_y.abs() && !mods.shift {
             (Trigger::Wheel(mods.with_shift()), delta_x)
         } else {
@@ -3420,7 +3594,33 @@ impl AppController {
     /// drag and fires no click, but `Up` still ends whatever drag was
     /// already live, so nothing sticks on once the modal opened mid-stroke.
     pub fn pointer(&mut self, kind: PointerKind, button: Button, x: f32, y: f32, mods: Modifiers) {
+        self.pointer_for(None, kind, button, x, y, mods);
+    }
+
+    /// Pointer input from a pane with its own local coordinate origin.
+    pub fn pointer_for_pane(
+        &mut self,
+        pane: PaneSource,
+        kind: PointerKind,
+        button: Button,
+        x: f32,
+        y: f32,
+        mods: Modifiers,
+    ) {
+        self.pointer_for(Some(pane), kind, button, x, y, mods);
+    }
+
+    fn pointer_for(
+        &mut self,
+        pane: Option<PaneSource>,
+        kind: PointerKind,
+        button: Button,
+        x: f32,
+        y: f32,
+        mods: Modifiers,
+    ) {
         self.state.input.last_pointer = (x, y);
+        self.state.input.explicit_pane = pane;
         if self.canvas_blocked() && kind != PointerKind::Up {
             return;
         }
@@ -3436,6 +3636,7 @@ impl AppController {
                     self.state.input.drag = Some(DragState {
                         action,
                         last: (x, y),
+                        pane,
                     });
                     self.emit_action(ActionEvent::Start { action, x, y });
                     return;
@@ -3451,7 +3652,14 @@ impl AppController {
                 }
             }
             PointerKind::Up => {
-                if let Some(drag) = self.state.input.drag.take() {
+                if self
+                    .state
+                    .input
+                    .drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.pane == pane)
+                    && let Some(drag) = self.state.input.drag.take()
+                {
                     self.emit_action(ActionEvent::End {
                         action: drag.action,
                     });
@@ -3473,12 +3681,24 @@ impl AppController {
     /// the next `pointer` `Up` still ends it, just with nothing added since
     /// the modal opened.
     pub fn pointer_moved(&mut self, x: f32, y: f32) {
+        self.pointer_moved_for(None, x, y);
+    }
+
+    /// Motion from a pane with its own local coordinate origin.
+    pub fn pointer_moved_for_pane(&mut self, pane: PaneSource, x: f32, y: f32) {
+        self.pointer_moved_for(Some(pane), x, y);
+    }
+
+    fn pointer_moved_for(&mut self, pane: Option<PaneSource>, x: f32, y: f32) {
         if self.canvas_blocked() {
             return;
         }
         let Some(drag) = &mut self.state.input.drag else {
             return;
         };
+        if drag.pane != pane {
+            return;
+        }
         let (last_x, last_y) = drag.last;
         let action = drag.action;
         drag.last = (x, y);
@@ -5724,12 +5944,19 @@ impl AppController {
         self.emit(ShellEvent::ProjectsChanged);
     }
 
+    fn request_window_close(&self) {
+        if self.state.detached.is_some() {
+            self.emit(ShellEvent::DetachedWindowCloseRequested);
+        }
+        self.emit(ShellEvent::WindowCloseRequested);
+    }
+
     /// `Quit without saving`: closes the window, dropping every tab's held
     /// checkpoints.
     pub fn quit_without_saving(&mut self) {
         self.state.pending_quit = false;
         self.remove_parked_runs();
-        self.emit(ShellEvent::WindowCloseRequested);
+        self.request_window_close();
     }
 
     /// `Save all and quit`: asks `pick` now for each tab that would lose work
@@ -7292,7 +7519,7 @@ impl AppController {
                     self.emit(ShellEvent::ProjectsChanged);
                 } else {
                     self.remove_parked_runs();
-                    self.emit(ShellEvent::WindowCloseRequested);
+                    self.request_window_close();
                 }
             }
         }

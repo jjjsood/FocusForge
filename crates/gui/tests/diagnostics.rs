@@ -147,7 +147,7 @@ fn the_settings_section_accepts_input_map_and_diagnostics() {
 }
 
 #[test]
-fn settings_section_reports_the_stable_backend_line_without_adapter_identity() {
+fn settings_section_reports_the_selected_backend_without_adapter_identity() {
     if !common::has_display() {
         println!("SKIP: window tests need DISPLAY or WAYLAND_DISPLAY");
         return;
@@ -161,9 +161,30 @@ fn settings_section_reports_the_stable_backend_line_without_adapter_identity() {
         "the settings window must exit successfully, got {output:?}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let selected_backend = if cfg!(target_os = "linux") {
+        if std::env::var_os("DISPLAY").is_some() {
+            "winit-x11"
+        } else {
+            "winit-wayland"
+        }
+    } else {
+        "winit"
+    };
+    assert!(
+        stdout.contains(&format!(
+            "selected backend: {selected_backend}, renderer: renderer-femtovg-wgpu (wgpu 29.0.4, Manual)"
+        )),
+        "startup output must report the selected backend: {stdout}"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        stdout.contains("resolved native display:"),
+        "startup output must include the native-display diagnostic: {stdout}"
+    );
+    #[cfg(not(target_os = "linux"))]
     assert_eq!(
         stdout.trim(),
-        "resolved backend: winit, renderer: renderer-femtovg-wgpu (wgpu 29.0.4)"
+        "selected backend: winit, renderer: renderer-femtovg-wgpu (wgpu 29.0.4, Manual)"
     );
     assert!(
         !stdout.contains("adapter"),

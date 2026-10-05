@@ -15,6 +15,12 @@ use focusforge_gui::bridge::Canvas;
 use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, job, screenshot};
 use slint::ComponentHandle;
 use slint::wgpu_29::wgpu;
+#[cfg(target_os = "linux")]
+use slint::winit_030::winit::platform::wayland::{EventLoopBuilderExtWayland, WindowExtWayland};
+#[cfg(target_os = "linux")]
+use slint::winit_030::winit::platform::x11::EventLoopBuilderExtX11;
+#[cfg(target_os = "linux")]
+use slint::winit_030::{SlintEvent, WinitWindowAccessor, winit};
 
 #[derive(Parser)]
 #[command(name = "focusforge-gui")]
@@ -26,6 +32,21 @@ struct Args {
     /// `--exit-after` fires.
     #[arg(long)]
     screenshot: Option<PathBuf>,
+    /// Choose the main or detached window for `--screenshot`.
+    #[arg(long, value_enum, default_value = "main", requires = "screenshot")]
+    screenshot_window: ScreenshotWindow,
+    /// Undock a pane once a project loads, for window inspection.
+    #[arg(long, value_enum, requires = "open")]
+    undock_pane: Option<UndockPane>,
+    /// Dock the inspected pane this many milliseconds after undocking.
+    #[arg(long, requires = "undock_pane")]
+    dock_after: Option<u64>,
+    /// Reopen the inspected pane this many milliseconds after docking it.
+    #[arg(long, requires = "dock_after")]
+    reopen_after: Option<u64>,
+    /// Request main-window close this many milliseconds after undocking.
+    #[arg(long, requires = "undock_pane")]
+    close_main_after: Option<u64>,
     /// Resize the window to `WxH` shortly after it is shown.
     #[arg(long)]
     size: Option<String>,
@@ -84,6 +105,10 @@ struct Args {
     /// question with no click.
     #[arg(long, requires = "fuse_tabs")]
     request_quit: bool,
+    /// Cancels the genuine unsaved-work quit question after the last
+    /// `--fuse-tabs` run settles, for observing guarded two-window lifetime.
+    #[arg(long, requires = "fuse_tabs")]
+    cancel_quit_after: Option<u64>,
     /// Selects editor mode once the last `--fuse-tabs` run settles, as
     /// clicking the mode switch's `Editor` segment does -- for inspecting
     /// the editor surface with no click sequence.
@@ -108,6 +133,18 @@ struct Args {
     /// settle before it is pressed again, so `0,0` fuses tab 0 twice.
     #[arg(long, value_delimiter = ',')]
     fuse_tabs: Vec<usize>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ScreenshotWindow {
+    Main,
+    Comparison,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum UndockPane {
+    Frame,
+    Composite,
 }
 
 const TOOLBAR_STATES: [&str; 5] = ["idle", "running", "paused", "cancelling", "failed"];
@@ -184,6 +221,7 @@ struct FuseTabsFollowUp {
     quit: bool,
     overlay: bool,
     enter_editor: bool,
+    cancel_quit_after: Option<u64>,
 }
 
 /// Presses `Fuse stack` on each of `indices` in turn, the moment no
@@ -209,6 +247,7 @@ fn start_fuse_tabs_timer(
         quit,
         overlay,
         enter_editor,
+        cancel_quit_after,
     } = follow_up;
     let timer_slot = slot.clone();
     let mut pending: std::collections::VecDeque<usize> = indices.into();
@@ -232,7 +271,7 @@ fn start_fuse_tabs_timer(
             app.invoke_tab_selected(index as i32);
             app.invoke_fuse_requested();
         }
-        if (save || close || quit || overlay || enter_editor) && {
+        if (save || close || quit || overlay || enter_editor || cancel_quit_after.is_some()) && {
             let controller = controller.lock().unwrap();
             controller.work_pending() || controller.pending_divergence().is_some()
         } {
@@ -255,6 +294,15 @@ fn start_fuse_tabs_timer(
         }
         if quit {
             controller.lock().unwrap().window_close();
+        }
+        if let Some(ms) = cancel_quit_after {
+            controller.lock().unwrap().window_close();
+            let app_weak = app.as_weak();
+            slint::Timer::single_shot(Duration::from_millis(ms), move || {
+                if let Some(app) = app_weak.upgrade() {
+                    app.invoke_close_guard_cancelled();
+                }
+            });
         }
         if overlay && !controller.lock().unwrap().projects_overlay_open() {
             controller.lock().unwrap().toggle_projects_overlay();
@@ -320,13 +368,123 @@ fn parse_size(spec: &str) -> Option<(u32, u32)> {
     Some((w.parse().ok()?, h.parse().ok()?))
 }
 
-/// Configures Slint's surface-compatible wgpu device with the compute limits
-/// the canvas needs.
-fn wgpu_settings() -> slint::wgpu_29::WGPUSettings {
-    let mut settings = slint::wgpu_29::WGPUSettings::default();
-    settings.device_required_features = focusforge_gpu::limits::REQUIRED_FEATURES;
-    settings.device_required_limits = focusforge_gpu::limits::required_limits();
-    settings
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let waker = std::task::Waker::noop();
+    let mut context = std::task::Context::from_waker(waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(result) => return result,
+            std::task::Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+/// Builds the one device used by Slint and every imported canvas texture.
+fn manual_wgpu_configuration(
+    #[cfg(target_os = "linux")] display_backend: LinuxDisplayBackend,
+) -> Result<slint::wgpu_29::WGPUConfiguration, String> {
+    let flags = wgpu::InstanceFlags::from_build_config().with_env();
+    #[cfg(target_os = "linux")]
+    let flags = adjust_manual_wgpu_flags(
+        flags,
+        display_backend,
+        std::env::var_os("WGPU_VALIDATION").is_some(),
+    );
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::from_env().unwrap_or_default(),
+        flags,
+        backend_options: wgpu::BackendOptions::from_env_or_default(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        display: None,
+    });
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        .map_err(|error| format!("no compatible wgpu adapter for the selected display: {error}"))?;
+    let limits = focusforge_gpu::limits::device_limits(&adapter.limits());
+    let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("focusforge-gui-device"),
+        required_features: focusforge_gpu::limits::REQUIRED_FEATURES,
+        required_limits: limits,
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        memory_hints: wgpu::MemoryHints::default(),
+        trace: wgpu::Trace::default(),
+    }))
+    .map_err(|error| format!("could not create FocusForge's shared wgpu device: {error}"))?;
+
+    // Slint drops its Manual queue from thread-local backend state at process
+    // shutdown, after wgpu's queue lock trace has already been destroyed.
+    let _queue_until_process_exit = Box::leak(Box::new(queue.clone()));
+
+    Ok(slint::wgpu_29::WGPUConfiguration::Manual {
+        instance,
+        adapter,
+        device,
+        queue,
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinuxDisplayBackend {
+    X11,
+    Wayland,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxDisplayBackend {
+    fn from_environment() -> Result<Self, ExitCode> {
+        Self::from_availability(
+            std::env::var_os("DISPLAY").is_some(),
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        )
+        .ok_or_else(|| {
+            tracing::error!("no Linux display is available: set DISPLAY or WAYLAND_DISPLAY");
+            ExitCode::from(1)
+        })
+    }
+
+    fn from_availability(display: bool, wayland: bool) -> Option<Self> {
+        match (display, wayland) {
+            (true, _) => Some(Self::X11),
+            (false, true) => Some(Self::Wayland),
+            (false, false) => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::X11 => "winit-x11",
+            Self::Wayland => "winit-wayland",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn adjust_manual_wgpu_flags(
+    mut flags: wgpu::InstanceFlags,
+    display_backend: LinuxDisplayBackend,
+    validation_explicit: bool,
+) -> wgpu::InstanceFlags {
+    if display_backend == LinuxDisplayBackend::Wayland && !validation_explicit {
+        // WGPU validation registers an EGL callback that can outlive tracing's
+        // thread-local state during native Wayland debug teardown.
+        flags.remove(wgpu::InstanceFlags::VALIDATION);
+    }
+    flags
+}
+
+#[cfg(target_os = "linux")]
+fn linux_event_loop_builder(backend: LinuxDisplayBackend) -> slint::winit_030::EventLoopBuilder {
+    let mut builder = winit::event_loop::EventLoop::<SlintEvent>::with_user_event();
+    match backend {
+        LinuxDisplayBackend::X11 => {
+            builder.with_x11();
+        }
+        LinuxDisplayBackend::Wayland => {
+            builder.with_wayland();
+        }
+    }
+    builder
 }
 
 fn begin_lifecycle(generation: &std::cell::Cell<u64>) -> u64 {
@@ -346,28 +504,68 @@ fn select_backend(
     app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>>,
     toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 ) -> Result<(), ExitCode> {
-    let config = slint::wgpu_29::WGPUConfiguration::Automatic(wgpu_settings());
+    #[cfg(target_os = "linux")]
+    let display_backend = LinuxDisplayBackend::from_environment()?;
+    let config = match manual_wgpu_configuration(
+        #[cfg(target_os = "linux")]
+        display_backend,
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!("{error}");
+            return Err(ExitCode::from(1));
+        }
+    };
     // The drop route is installed on this *existing* `BackendSelector`
     // chain, before any window exists, which is why `controller` and
     // `canvas` are both built before `select_backend` runs rather than
     // inside `bridge::install`.
-    if let Err(e) = slint::BackendSelector::new()
+    let selector = slint::BackendSelector::new().backend_name("winit".into());
+    #[cfg(target_os = "linux")]
+    let selector =
+        selector.with_winit_event_loop_builder(linux_event_loop_builder(display_backend));
+    let selector = selector
         .require_wgpu_29(config)
         .with_winit_custom_application_handler(bridge::DropHandler::new(
             controller,
             canvas,
             app_handle,
             toast_timer,
-        ))
-        .select()
-    {
+        ));
+    if let Err(e) = selector.select() {
         tracing::error!("{e}");
         return Err(ExitCode::from(1));
     }
-    // The crate's feature set pins exactly one backend/renderer
-    // combination, so "resolved" is what was compiled in.
-    println!("resolved backend: winit, renderer: renderer-femtovg-wgpu (wgpu 29.0.4)");
+    #[cfg(target_os = "linux")]
+    println!(
+        "selected backend: {}, renderer: renderer-femtovg-wgpu (wgpu 29.0.4, Manual)",
+        display_backend.label()
+    );
+    #[cfg(not(target_os = "linux"))]
+    println!("selected backend: winit, renderer: renderer-femtovg-wgpu (wgpu 29.0.4, Manual)");
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn log_native_display<T: ComponentHandle + 'static>(app: &T) {
+    let app = app.as_weak();
+    slint::Timer::single_shot(Duration::from_millis(150), move || {
+        let resolved = app
+            .upgrade()
+            .and_then(|app| {
+                app.window()
+                    .with_winit_window(|native| native.xdg_toplevel().is_some())
+            })
+            .map(|wayland| {
+                if wayland {
+                    "winit-wayland"
+                } else {
+                    "winit-x11"
+                }
+            })
+            .unwrap_or("unavailable");
+        println!("resolved native display: {resolved}");
+    });
 }
 
 /// Installs the exit-after and resize timers, then runs the event loop.
@@ -496,6 +694,7 @@ fn run_window<T: ComponentHandle + 'static>(
     if let Some(ms) = args.exit_after {
         let app_weak = app.as_weak();
         let screenshot_path = args.screenshot.clone();
+        let screenshot_window = args.screenshot_window;
         let exit_code = exit_code.clone();
         let closing = closing.clone();
         slint::Timer::single_shot(Duration::from_millis(ms), move || {
@@ -505,8 +704,18 @@ fn run_window<T: ComponentHandle + 'static>(
                 if focusforge_gpu::errors::device_lost() {
                     tracing::error!("--screenshot skipped: the graphics device is already lost");
                 } else {
-                    match app.window().take_snapshot() {
-                        Ok(buffer) => {
+                    let snapshot = match screenshot_window {
+                        ScreenshotWindow::Main => app.window().take_snapshot().map(Some),
+                        ScreenshotWindow::Comparison => bridge::comparison_snapshot(),
+                    };
+                    match snapshot {
+                        Ok(None) => {
+                            tracing::error!(
+                                "--screenshot-window comparison requires a detached pane"
+                            );
+                            exit_code.set(1);
+                        }
+                        Ok(Some(buffer)) => {
                             if let Err(e) = screenshot::write_png(&buffer, path) {
                                 tracing::error!("--screenshot failed: {e}");
                                 exit_code.set(1);
@@ -558,7 +767,11 @@ fn run_window<T: ComponentHandle + 'static>(
         );
     }
 
+    #[cfg(target_os = "linux")]
+    log_native_display(&app);
+
     let run_result = app.run();
+    bridge::shutdown_windows();
     // Quitting never interrupts a write in progress.
     if let Some(controller) = &controller {
         controller.lock().unwrap().finish_saves();
@@ -805,6 +1018,63 @@ fn run(args: &Args) -> ExitCode {
             );
         }
 
+        let undock_timer = Rc::new(slint::Timer::default());
+        if let Some(pane) = args.undock_pane {
+            let app_weak = app.as_weak();
+            let timer = undock_timer.clone();
+            let dock_after = args.dock_after;
+            let reopen_after = args.reopen_after;
+            let close_main_after = args.close_main_after;
+            undock_timer.start(
+                slint::TimerMode::Repeated,
+                Duration::from_millis(50),
+                move || {
+                    let Some(app) = app_weak.upgrade() else {
+                        return;
+                    };
+                    if app.get_project_loaded() {
+                        timer.stop();
+                        match pane {
+                            UndockPane::Frame => app.invoke_composite_undock_requested(),
+                            UndockPane::Composite => app.invoke_zmap_undock_requested(),
+                        }
+                        if let Some(ms) = dock_after {
+                            let app_weak = app.as_weak();
+                            slint::Timer::single_shot(Duration::from_millis(ms), move || {
+                                bridge::dock_comparison_for_inspection();
+                                if let Some(reopen_ms) = reopen_after {
+                                    let app_weak = app_weak.clone();
+                                    slint::Timer::single_shot(
+                                        Duration::from_millis(reopen_ms),
+                                        move || {
+                                            if let Some(app) = app_weak.upgrade() {
+                                                match pane {
+                                                    UndockPane::Frame => {
+                                                        app.invoke_composite_undock_requested()
+                                                    }
+                                                    UndockPane::Composite => {
+                                                        app.invoke_zmap_undock_requested()
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    );
+                                }
+                            });
+                        }
+                        if let Some(ms) = close_main_after {
+                            let app_weak = app.as_weak();
+                            slint::Timer::single_shot(Duration::from_millis(ms), move || {
+                                if let Some(app) = app_weak.upgrade() {
+                                    app.invoke_window_close_requested();
+                                }
+                            });
+                        }
+                    }
+                },
+            );
+        }
+
         if let Some(tab) = &args.dock_tab {
             let tab = if tab == "settings" {
                 focusforge_gui::DockTab::Settings
@@ -849,6 +1119,7 @@ fn run(args: &Args) -> ExitCode {
                     quit: args.request_quit,
                     overlay: args.projects_overlay,
                     enter_editor: args.enter_editor,
+                    cancel_quit_after: args.cancel_quit_after,
                 },
             );
         }
@@ -870,41 +1141,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wgpu_settings_change_only_the_required_device_values() {
-        let defaults = slint::wgpu_29::WGPUSettings::default();
-        let settings = wgpu_settings();
-
-        assert_eq!(
-            settings.device_required_features,
-            focusforge_gpu::limits::REQUIRED_FEATURES
-        );
-        assert_eq!(
-            settings.device_required_limits,
-            focusforge_gpu::limits::required_limits()
-        );
-        assert_eq!(settings.backends, defaults.backends);
-        assert_eq!(
-            format!("{:?}", settings.backend_options),
-            format!("{:?}", defaults.backend_options)
-        );
-        assert_eq!(settings.instance_flags, defaults.instance_flags);
-        assert_eq!(
-            format!("{:?}", settings.instance_memory_budget_thresholds),
-            format!("{:?}", defaults.instance_memory_budget_thresholds)
-        );
-        assert_eq!(settings.power_preference, defaults.power_preference);
-        assert_eq!(settings.device_label, defaults.device_label);
-        assert_eq!(
-            format!("{:?}", settings.device_experimental_features),
-            format!("{:?}", defaults.device_experimental_features)
-        );
-        assert_eq!(
-            format!("{:?}", settings.device_memory_hints),
-            format!("{:?}", defaults.device_memory_hints)
-        );
-    }
-
-    #[test]
     fn newer_setup_keeps_a_queued_older_teardown_stale() {
         let generation = std::cell::Cell::new(0);
         let old_setup = begin_lifecycle(&generation);
@@ -913,5 +1149,41 @@ mod tests {
         assert_ne!(old_setup, new_setup);
         assert!(!teardown_is_current(&generation, old_setup));
         assert!(teardown_is_current(&generation, new_setup));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_display_selection_prefers_x11_when_available() {
+        assert_eq!(LinuxDisplayBackend::from_availability(false, false), None);
+        assert_eq!(
+            LinuxDisplayBackend::from_availability(true, false),
+            Some(LinuxDisplayBackend::X11)
+        );
+        assert_eq!(
+            LinuxDisplayBackend::from_availability(false, true),
+            Some(LinuxDisplayBackend::Wayland)
+        );
+        assert_eq!(
+            LinuxDisplayBackend::from_availability(true, true),
+            Some(LinuxDisplayBackend::X11)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_wayland_keeps_an_explicit_validation_choice() {
+        let flags = wgpu::InstanceFlags::VALIDATION;
+        assert!(
+            !adjust_manual_wgpu_flags(flags, LinuxDisplayBackend::Wayland, false)
+                .contains(wgpu::InstanceFlags::VALIDATION)
+        );
+        assert!(
+            adjust_manual_wgpu_flags(flags, LinuxDisplayBackend::Wayland, true)
+                .contains(wgpu::InstanceFlags::VALIDATION)
+        );
+        assert!(
+            adjust_manual_wgpu_flags(flags, LinuxDisplayBackend::X11, false)
+                .contains(wgpu::InstanceFlags::VALIDATION)
+        );
     }
 }

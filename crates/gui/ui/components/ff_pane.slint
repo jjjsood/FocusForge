@@ -1,0 +1,97 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFErrorRow } from "ff_error_row.slint";
+import { FFPaneLabel } from "ff_pane_label.slint";
+import { FFUndockControl } from "ff_undock_control.slint";
+
+export component FFPane inherits Rectangle {
+    in property <image> source;
+    in property <string> label: "";
+    in property <[string]> message-lines: [];
+    in property <bool> undock-enabled: true;
+    in property <bool> dock-back: false;
+    in property <bool> project-loaded: false;
+    in property <length> image-x;
+    in property <length> image-y;
+    in property <length> image-w;
+    in property <length> image-h;
+    in property <length> crop-x;
+    in property <length> crop-y;
+    in property <length> crop-w;
+    in property <length> crop-h;
+    in property <bool> pixelated;
+    // A low-detail view of the whole image, drawn beneath `source` so that
+    // part of the pane `source` does not cover still shows image content.
+    in property <image> backdrop;
+    in property <length> backdrop-x;
+    in property <length> backdrop-y;
+    in property <length> backdrop-w;
+    in property <length> backdrop-h;
+    in property <bool> accent-border: false;
+    out property <bool> crop-clips: image-crop.clip;
+    callback undock-requested();
+
+    background: Theme.surface-canvas;
+    border-radius: Theme.radius-md;
+    border-width: root.accent-border ? 1px : 0px;
+    border-color: Theme.accent-default;
+    clip: true;
+
+    Image {
+        source: root.backdrop;
+        x: root.backdrop-x;
+        y: root.backdrop-y;
+        width: root.backdrop-w;
+        height: root.backdrop-h;
+        image-fit: fill;
+        image-rendering: ImageRendering.smooth;
+    }
+
+    image-crop := Rectangle {
+        x: root.crop-x;
+        y: root.crop-y;
+        width: root.crop-w;
+        height: root.crop-h;
+        clip: true;
+
+        Image {
+            source: root.source;
+            x: root.image-x - root.crop-x;
+            y: root.image-y - root.crop-y;
+            width: root.image-w;
+            height: root.image-h;
+            image-fit: fill;
+            image-rendering: root.pixelated ? ImageRendering.pixelated : ImageRendering.smooth;
+        }
+    }
+
+    if root.message-lines.length > 0 : VerticalLayout {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: parent.width - 2 * Theme.space-6;
+        height: self.preferred-height;
+
+        for line in root.message-lines : FFErrorRow {
+            message: line;
+            horizontal-alignment: center;
+        }
+    }
+
+    pane-label := FFPaneLabel {
+        x: ShellGeometry.pane-chrome-inset;
+        y: ShellGeometry.pane-chrome-inset;
+        label: root.label;
+        visible: root.project-loaded;
+    }
+
+    pane-undock := FFUndockControl {
+        x: parent.width - ShellGeometry.pane-chrome-inset - self.width;
+        y: ShellGeometry.pane-chrome-inset;
+        enabled: root.undock-enabled;
+        dock-back: root.dock-back;
+        visible: root.project-loaded && root.undock-enabled;
+        triggered => { root.undock-requested(); }
+    }
+}

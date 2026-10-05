@@ -1016,6 +1016,7 @@ fn divergence_phrase(reason: crate::align::DivergenceReason) -> &'static str {
         DivergenceReason::ValidationFailed => {
             "the alignment does not hold away from the centre of the frame"
         }
+        DivergenceReason::WeakMatch => "the best match found is too weak to be the right one",
     }
 }
 
@@ -1252,18 +1253,25 @@ mod tests {
     fn validation_failed_has_its_own_phrase() {
         use crate::align::DivergenceReason;
 
-        let phrase = divergence_phrase(DivergenceReason::ValidationFailed);
-        for other in [
+        let reasons = [
             DivergenceReason::SingularHessian,
             DivergenceReason::LemmaOneRegion,
             DivergenceReason::NonInvertibleIncrement,
             DivergenceReason::CorrelationDecreased,
             DivergenceReason::TooFewValidSamples,
             DivergenceReason::NonFiniteUpdate,
-        ] {
-            assert_ne!(phrase, divergence_phrase(other));
+            DivergenceReason::ValidationFailed,
+            DivergenceReason::WeakMatch,
+        ];
+        for (i, &a) in reasons.iter().enumerate() {
+            for &b in &reasons[i + 1..] {
+                assert_ne!(divergence_phrase(a), divergence_phrase(b), "{a:?} {b:?}");
+            }
         }
+        let phrase = divergence_phrase(DivergenceReason::ValidationFailed);
         assert!(phrase.contains("away from the centre"), "{phrase}");
+        let weak = divergence_phrase(DivergenceReason::WeakMatch);
+        assert!(weak.contains("too weak"), "{weak}");
     }
 
     fn desc(label: &str, signature: &[&str]) -> FrameDesc {

@@ -1153,3 +1153,28 @@ fn overlay_toggle_is_inert_while_disabled() {
     click();
     assert_eq!(fired.get(), 1, "an enabled toggle fires once");
 }
+
+#[test]
+fn detached_pane_uses_a_distinct_accessible_dock_control() {
+    let pane = include_str!("../ui/components/ff_pane.slint");
+    let control = include_str!("../ui/components/ff_undock_control.slint");
+    assert!(pane.contains("visible: root.project-loaded && root.undock-enabled"));
+    assert!(control.contains("Dock pane"));
+    assert!(control.contains("dock-pane.svg"));
+}
+
+#[test]
+fn detached_main_pane_fills_the_canvas_on_either_side() {
+    let app = app_at(1440, 900);
+    app.set_show_empty_state(false);
+    for (detached, remaining) in [
+        ("composite", "FFCanvas::pane-right"),
+        ("zmap", "FFCanvas::pane-left"),
+    ] {
+        app.set_detached_pane(detached.into());
+        assert_rect(&app, remaining, (16.0, 92.0, 1148.0, 748.0));
+    }
+    app.set_detached_pane("".into());
+    assert_rect(&app, "FFCanvas::pane-left", (16.0, 92.0, 566.0, 748.0));
+    assert_rect(&app, "FFCanvas::pane-right", (598.0, 92.0, 566.0, 748.0));
+}

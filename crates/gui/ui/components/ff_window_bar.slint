@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+component WindowControl inherits Rectangle {
+    in property <image> icon;
+    in property <string> label: "";
+    in property <bool> enabled: true;
+    in property <bool> hovered: false;
+    callback triggered();
+
+    width: ShellGeometry.comparison-window-control-width;
+    height: ShellGeometry.comparison-window-bar-height;
+    background: (root.hovered || area.has-hover) && root.enabled ? Theme.surface-hover : transparent;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+
+    area := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.triggered(); }
+    }
+    Image {
+        source: root.icon;
+        colorize: root.enabled ? Theme.text-secondary : Theme.text-disabled;
+        width: Theme.icon-sm;
+        height: Theme.icon-sm;
+    }
+}
+
+export component FFWindowBar inherits Rectangle {
+    in property <string> title: "";
+    in property <bool> maximized: false;
+    in property <bool> controls-enabled: true;
+    in property <string> hovered-control: "";
+    callback drag-requested();
+    callback minimize-requested();
+    callback maximize-toggled();
+    callback close-requested();
+
+    height: ShellGeometry.comparison-window-bar-height;
+    background: Theme.surface-canvas;
+    border-width: 1px;
+    border-color: Theme.border-default;
+
+    drag-area := TouchArea {
+        width: parent.width - 3 * ShellGeometry.comparison-window-control-width;
+        height: parent.height;
+        changed pressed => { root.drag-requested(); }
+    }
+
+    Text {
+        x: ShellGeometry.comparison-window-title-inset;
+        width: drag-area.width - ShellGeometry.comparison-window-title-inset;
+        height: parent.height;
+        text: root.title;
+        color: Theme.text-primary;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    minimize := WindowControl {
+        x: parent.width - 3 * self.width;
+        icon: @image-url("../../../../assets/icons/minus.svg");
+        label: "Minimize";
+        enabled: root.controls-enabled;
+        hovered: root.hovered-control == "minimize";
+        triggered => { root.minimize-requested(); }
+    }
+    maximize := WindowControl {
+        x: parent.width - 2 * self.width;
+        icon: root.maximized
+            ? @image-url("../../../../assets/icons/copy.svg")
+            : @image-url("../../../../assets/icons/square.svg");
+        label: root.maximized ? "Restore" : "Maximize";
+        enabled: root.controls-enabled;
+        hovered: root.hovered-control == "maximize";
+        triggered => { root.maximize-toggled(); }
+    }
+    close := WindowControl {
+        x: parent.width - self.width;
+        icon: @image-url("../../../../assets/icons/x.svg");
+        label: "Close";
+        enabled: root.controls-enabled;
+        hovered: root.hovered-control == "close";
+        triggered => { root.close-requested(); }
+    }
+}
