@@ -45,7 +45,6 @@ struct Figure {
     warm: f64,
 }
 
-#[derive(Default)]
 struct NoopObserver;
 impl StageObserver for NoopObserver {}
 
