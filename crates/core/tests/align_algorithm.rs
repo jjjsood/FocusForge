@@ -896,3 +896,80 @@ fn an_empty_centre_reports_a_singular_hessian_at_level_0() {
         );
     }
 }
+
+/// Crossed sinusoid gratings (periods 14 and 18 px) have no unique match once
+/// a shift passes half a period, so each frame must end `Diverged` or inside
+/// its budget of the known motion; a wrong `Converged` fit is the failure.
+#[test]
+fn a_periodic_scene_never_reports_a_wrong_converged_fit() {
+    let (width, height) = (640u32, 480u32);
+    let (cx, cy) = (width as f64 / 2.0, height as f64 / 2.0);
+    let scene = |x: f64, y: f64| {
+        let grating = |p: f64, period: f64| (std::f64::consts::TAU * p / period).sin();
+        0.5 + 0.25 * grating(x, 14.0) + 0.25 * grating(y, 18.0)
+    };
+    // Frame k holds the scene moved by `truth(k)`: it maps frame 0's
+    // coordinates onto frame k's.
+    let truth = |k: usize| {
+        let k = k as f64;
+        Transform::translation(3.5 * k, -2.6 * k).compose(&similarity_about(
+            1.0,
+            (0.3 * k).to_radians(),
+            cx,
+            cy,
+        ))
+    };
+
+    let mut rng = XorShift32(0xBEEF_0042);
+    let frames: Vec<Vec<u16>> = (0..5)
+        .map(|k| {
+            let inverse = truth(k).inverse().expect("a similarity is invertible");
+            let mut samples = Vec::with_capacity((width * height) as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let (sx, sy) = inverse
+                        .map_point(x as f64, y as f64)
+                        .expect("a similarity maps every pixel");
+                    let noise = (rng.next() % 601) as f64 - 300.0;
+                    samples.push((scene(sx, sy) * 65_535.0 + noise).clamp(0.0, 65_535.0) as u16);
+                }
+            }
+            samples
+        })
+        .collect();
+    let reader = FramesReader {
+        width,
+        height,
+        spp: 1,
+        frames,
+    };
+
+    let result = align_stack(
+        &PyramidalEcc,
+        StackContext::new(5, width, height, 1),
+        &reader,
+        &cfg_with("rotation-scale", 3, 400),
+        FailurePolicy::Strict,
+    )
+    .expect("a periodic stack is an outcome, not an error");
+
+    assert_eq!(result.reference, 0);
+    for frame in result.frames.iter().skip(1) {
+        let error = corner_error(
+            &frame.transform,
+            &truth(frame.frame),
+            full_rect(width, height),
+        );
+        eprintln!(
+            "a_periodic_scene_never_reports_a_wrong_converged_fit: frame {} status={:?} error={error} px",
+            frame.frame, frame.status
+        );
+        let budget = 0.04 + 0.03 * frame.frame as f64;
+        assert!(
+            matches!(frame.status, AlignStatus::Diverged(_)) || error <= budget,
+            "frame {} reports {:?} at {error} px against a {budget} px budget",
+            frame.frame,
+            frame.status
+        );
+    }
+}
