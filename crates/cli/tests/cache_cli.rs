@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use focusforge_core::io::test_frames::write_frame_with_capture_time;
-use focusforge_core::job::{JOB_RECORD_FORMAT, JobRecord, ResumeStore, StackFingerprint};
+use focusforge_core::job::{JobRecord, ResumeStore, StackFingerprint};
 use focusforge_core::params::ParamValues;
 
 use common::{CliOutput, mantis_512_dir, tmp_dir};
@@ -132,7 +132,6 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 /// leaves its resumable state on disk. Returns the ledger's own directory.
 fn leave_a_cancelled_run_ledger(cwd: &Path) -> PathBuf {
     let record = JobRecord {
-        format: JOB_RECORD_FORMAT,
         fingerprint: StackFingerprint { frames: Vec::new() },
         width: 8,
         height: 8,

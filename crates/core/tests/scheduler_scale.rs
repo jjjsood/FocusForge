@@ -57,7 +57,7 @@ use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
 use focusforge_core::io::{DecodedTiffStack, FrameReader, TiffStack};
 use focusforge_core::job::fingerprint::{FrameFingerprint, StackFingerprint};
-use focusforge_core::job::record::{JOB_RECORD_FORMAT, JobRecord};
+use focusforge_core::job::record::JobRecord;
 use focusforge_core::job::{Job, JobOutcome, RecordingConsumer, Resumable, ResumeStore};
 use focusforge_core::params::{self, ParamValues, StackContext};
 use focusforge_core::registry;
@@ -239,7 +239,6 @@ fn job_record(
     height: u32,
 ) -> JobRecord {
     JobRecord {
-        format: JOB_RECORD_FORMAT,
         fingerprint: stack_fingerprint(stack),
         width,
         height,

@@ -63,12 +63,9 @@ pub use control::{ControlState, JobControl};
 pub use fingerprint::{FingerprintMismatch, FrameCount, FrameFingerprint, StackFingerprint};
 pub use ledger::{Ledger, RecordingConsumer, Resumable, ResumeError, ResumeStore, read_alignment};
 pub use progress::JobProgress;
-pub use record::{
-    ALIGN_SOLVER_VERSION, AlignIdentity, DRIVER_POLICY_FIELDS, JOB_RECORD_FORMAT, JobRecord,
-};
+pub use record::{ALIGN_SOLVER_VERSION, AlignIdentity, DRIVER_POLICY_FIELDS, JobRecord};
 pub use stage_cache::{
-    CachedAlignment, CachedStage, FrameKey, STAGE_CACHE_FORMAT, StageCache, StageCacheError,
-    StageKey,
+    CachedAlignment, CachedStage, FrameKey, StageCache, StageCacheError, StageKey,
 };
 
 use std::collections::HashSet;

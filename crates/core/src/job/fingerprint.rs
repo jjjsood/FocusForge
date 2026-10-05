@@ -34,7 +34,7 @@ pub struct FrameFingerprint {
     pub samples_per_pixel: u32,
     pub strip_offsets: Vec<u64>,
     pub strip_byte_counts: Vec<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "Option::deserialize")]
     pub raw_identity: Option<RawIdentity>,
 }
 
@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_identity_is_compared_and_omitted_for_tiff() {
+    fn raw_identity_is_compared_and_serialized_for_tiff() {
         let mut a = frame("a.dng", 10);
         a.raw_identity = Some(RawIdentity {
             make: "Test".to_string(),
@@ -214,6 +214,13 @@ mod tests {
             cfa_width: Some(2),
             cfa_height: Some(2),
         });
+        let raw_json = serde_json::to_value(&a).expect("RAW fingerprint serializes");
+        assert!(raw_json["raw_identity"].is_object());
+        assert_eq!(
+            serde_json::from_value::<FrameFingerprint>(raw_json)
+                .expect("RAW fingerprint deserializes"),
+            a
+        );
         let mut b = a.clone();
         b.raw_identity.as_mut().expect("RAW identity").serial_number = Some("two".to_string());
         let error = StackFingerprint { frames: vec![a] }
@@ -222,10 +229,23 @@ mod tests {
         assert_eq!(error.field, "raw_identity");
 
         let tiff = frame("a.tif", 10);
+        let json = serde_json::to_value(&tiff).expect("TIFF fingerprint serializes");
+        assert_eq!(json["raw_identity"], serde_json::Value::Null);
+        assert_eq!(
+            serde_json::from_value::<FrameFingerprint>(json.clone())
+                .expect("TIFF fingerprint deserializes"),
+            tiff
+        );
+        let without_identity = json
+            .as_object()
+            .expect("fingerprint is an object")
+            .iter()
+            .filter(|(name, _)| name.as_str() != "raw_identity")
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
         assert!(
-            !serde_json::to_string(&tiff)
-                .expect("TIFF fingerprint serializes")
-                .contains("raw_identity")
+            serde_json::from_value::<FrameFingerprint>(serde_json::Value::Object(without_identity))
+                .is_err()
         );
     }
 
@@ -263,10 +283,7 @@ mod tests {
             tile_length: None,
             sample_format: Box::new([1, 1, 1]),
             image_description: Some("hello".to_string()),
-            // Read by grouping, deliberately **not** by the
-            // fingerprint: adding it to `FrameFingerprint` would invalidate
-            // every resume ledger already on disk for no benefit. The
-            // assertions below are what pin that field set.
+            // Grouping reads this field; the fingerprint field set excludes it.
             date_time_original: Some("2026:08:29 18:42:41".to_string()),
             file_size: 12345,
             strip_offsets: vec![10, 20, 30, 40],
@@ -286,32 +303,7 @@ mod tests {
         assert_eq!(fp.strip_offsets, vec![10, 20, 30, 40]);
         assert_eq!(fp.strip_byte_counts, vec![1, 2, 3, 4]);
 
-        #[derive(Serialize)]
-        struct LegacyFrameFingerprint {
-            path: PathBuf,
-            file_size: u64,
-            image_description: Option<String>,
-            width: u32,
-            height: u32,
-            samples_per_pixel: u32,
-            strip_offsets: Vec<u64>,
-            strip_byte_counts: Vec<u64>,
-        }
-
-        let legacy = LegacyFrameFingerprint {
-            path: header.path.clone(),
-            file_size: header.file_size,
-            image_description: header.image_description.clone(),
-            width: header.width,
-            height: header.height,
-            samples_per_pixel: header.samples_per_pixel,
-            strip_offsets: header.strip_offsets.clone(),
-            strip_byte_counts: header.strip_byte_counts.clone(),
-        };
-        assert_eq!(
-            serde_json::to_vec(&fp).expect("fingerprint must serialize"),
-            serde_json::to_vec(&legacy).expect("legacy fingerprint must serialize")
-        );
+        assert_eq!(fp.raw_identity, None);
     }
 
     /// This fingerprint is not, and is not convertible to, the project
