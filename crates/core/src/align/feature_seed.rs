@@ -46,6 +46,16 @@ const MIN_OCCUPIED_CELLS: usize = 6;
 /// handful of many matches is a coincidence among near-repeats.
 const MIN_INLIER_SHARE: f64 = 0.3;
 
+/// Fewest occupied cells at which a fit may still seed when it explains
+/// [`MIN_CLUSTERED_SHARE`] of its matches: a defocused frame keeps texture in
+/// only a few cells, and a single cell fixes scale and rotation too loosely.
+const MIN_CLUSTERED_CELLS: usize = 2;
+
+/// The share of the matches a fit in [`MIN_CLUSTERED_CELLS`] to
+/// [`MIN_OCCUPIED_CELLS`] - 1 cells must explain. Correct clustered seeds on a
+/// 64-frame defocus series explained 0.767 to 0.918 of their matches.
+const MIN_CLUSTERED_SHARE: f64 = 0.75;
+
 /// Why a plane cannot be searched for features.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FeatureSeedError {
@@ -167,11 +177,15 @@ pub struct SeedFit {
 }
 
 impl SeedFit {
-    /// Whether the evidence is strong, spread out and a large enough share of the matches to start a solve from.
+    /// Whether the evidence is strong and a large enough share of the matches
+    /// to start a solve from: spread over at least 6 of the grid's cells, or
+    /// clustered in at least 2 of them with an inlier share of at least 0.75.
     pub fn accepted(&self) -> bool {
+        let explains = |share: f64| self.inliers as f64 >= share * self.matches as f64;
         self.inliers >= MIN_INLIERS
-            && self.occupied_cells >= MIN_OCCUPIED_CELLS
-            && self.inliers as f64 >= MIN_INLIER_SHARE * self.matches as f64
+            && explains(MIN_INLIER_SHARE)
+            && (self.occupied_cells >= MIN_OCCUPIED_CELLS
+                || (self.occupied_cells >= MIN_CLUSTERED_CELLS && explains(MIN_CLUSTERED_SHARE)))
     }
 }
 
@@ -518,6 +532,53 @@ mod tests {
         assert!(!few.accepted(), "{few:?}");
         let many = fit_similarity(&field(300, 0.4, 0.2, &t), (W, H)).expect("a fit");
         assert!(many.accepted(), "{many:?}");
+    }
+
+    /// `inliers` exact matches inside the top-left 500x190 px (two grid
+    /// cells) and `outliers` matches from there to unrelated frame points.
+    fn clustered(inliers: usize, outliers: usize, t: &Transform) -> Vec<Correspondence> {
+        let mut pairs: Vec<Correspondence> = field(600, 1.0, 0.0, t)
+            .into_iter()
+            .filter(|(p, _)| p[0] < 500.0 && p[1] < 190.0)
+            .take(inliers)
+            .collect();
+        assert_eq!(pairs.len(), inliers);
+        let mut rng = Rng(0xC1D5);
+        for _ in 0..outliers {
+            pairs.push((
+                [rng.unit() * 500.0, rng.unit() * 190.0],
+                [rng.unit() * f64::from(W - 1), rng.unit() * f64::from(H - 1)],
+            ));
+        }
+        pairs
+    }
+
+    #[test]
+    fn a_clustered_fit_with_a_high_inlier_share_is_accepted() {
+        let t = truth();
+        let fit = fit_similarity(&clustered(45, 5, &t), (W, H)).expect("a fit");
+        assert!((2..6).contains(&fit.occupied_cells), "{fit:?}");
+        assert!(fit.inliers >= 45, "{fit:?}");
+        assert!(fit.accepted(), "{fit:?}");
+    }
+
+    #[test]
+    fn a_clustered_fit_with_a_moderate_inlier_share_is_refused() {
+        let t = truth();
+        // Half the matches: over MIN_INLIER_SHARE, under the clustered share.
+        let fit = fit_similarity(&clustered(30, 30, &t), (W, H)).expect("a fit");
+        assert!((2..6).contains(&fit.occupied_cells), "{fit:?}");
+        assert!(fit.inliers >= 30, "{fit:?}");
+        assert!(!fit.accepted(), "{fit:?}");
+    }
+
+    #[test]
+    fn a_clustered_fit_under_the_inlier_floor_is_refused() {
+        let t = truth();
+        let fit = fit_similarity(&clustered(11, 0, &t), (W, H)).expect("a fit");
+        assert!((2..6).contains(&fit.occupied_cells), "{fit:?}");
+        assert_eq!(fit.inliers, 11);
+        assert!(!fit.accepted(), "{fit:?}");
     }
 
     const SW: u32 = 400;
