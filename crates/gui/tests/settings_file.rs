@@ -33,7 +33,7 @@ fn absent_tables_read_as_defaults() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("settings.toml"),
-        "[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\npath = \"/a\"\nopened_at = 1\n",
+        "[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\npath = \"/a.ffp\"\nopened_at = 1\n",
     )
     .unwrap();
     let entries = recent::load(dir.path());
@@ -81,7 +81,7 @@ fn broken_table_resets_only_itself() {
     // Unknown trigger: "banana-drag" is on line 11.
     {
         let dir = tempfile::tempdir().unwrap();
-        let src = "[recent]\n[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\npath = \"/a\"\nopened_at = 1\n\n\
+        let src = "[recent]\n[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\npath = \"/a.ffp\"\nopened_at = 1\n\n\
                    [input]\n\n[[input.bindings]]\ntrigger = \"banana-drag\"\nstacking = \"pan\"\n";
         fs::write(dir.path().join("settings.toml"), src).unwrap();
         let entries = recent::load(dir.path());
@@ -108,7 +108,7 @@ fn broken_table_resets_only_itself() {
     // first row's span starts on line 10, the duplicate's on line 14.
     {
         let dir = tempfile::tempdir().unwrap();
-        let src = "[recent]\n[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\npath = \"/a\"\nopened_at = 1\n\n\
+        let src = "[recent]\n[[recent.entries]]\nname = \"a\"\nfolder = \"/a\"\npath = \"/a.ffp\"\nopened_at = 1\n\n\
                    [input]\n\n[[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\n\n\
                    [[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n";
         fs::write(dir.path().join("settings.toml"), src).unwrap();
@@ -155,13 +155,13 @@ fn saving_recent_keeps_hand_edited_input() {
                 RecentEntry {
                     name: "one".into(),
                     folder: "/one".into(),
-                    path: "/one".into(),
+                    path: "/one.ffp".into(),
                     opened_at: 10,
                 },
                 RecentEntry {
                     name: "two".into(),
                     folder: "/two".into(),
-                    path: "/two".into(),
+                    path: "/two.ffp".into(),
                     opened_at: 20,
                 },
             ],

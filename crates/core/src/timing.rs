@@ -47,6 +47,12 @@ use serde::Serialize;
 /// The fixed number of detailed trace-span admissions one process may emit.
 const RECORD_BUDGET: usize = 262_144;
 
+/// The fixed number of trace-span admissions one process may emit for spans
+/// whose kind starts with `gui_`, counted apart from the processing budget.
+/// About 371 such spans per second in the busiest measured 1 s window, over a
+/// 490 s fusion, is 181,790; the next power of two is 262,144.
+const GUI_RECORD_BUDGET: usize = 262_144;
+
 /// A measured quantity produced at a named allocation, copy, or processing
 /// boundary. These counters describe only the sites that report them.
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +140,8 @@ impl TimingCounter {
 pub struct TimingSnapshot {
     pub admitted: u64,
     pub exhausted: u64,
+    pub gui_admitted: u64,
+    pub gui_exhausted: u64,
     pub converted_bytes: u64,
     pub warp_bytes: u64,
     pub allocation_bytes: u64,
@@ -164,10 +172,41 @@ pub struct TimingSnapshot {
     pub saturated: bool,
 }
 
-struct TimingState {
+struct AdmissionBudget {
     remaining: AtomicUsize,
     admitted: AtomicU64,
     exhausted: AtomicU64,
+}
+
+impl AdmissionBudget {
+    fn new(budget: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(budget),
+            admitted: AtomicU64::new(0),
+            exhausted: AtomicU64::new(0),
+        }
+    }
+
+    fn admit(&self, saturated: &AtomicBool) -> bool {
+        if self
+            .remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            saturating_add(&self.admitted, 1, saturated);
+            true
+        } else {
+            saturating_add(&self.exhausted, 1, saturated);
+            false
+        }
+    }
+}
+
+struct TimingState {
+    processing: AdmissionBudget,
+    gui: AdmissionBudget,
     converted_bytes: AtomicU64,
     warp_bytes: AtomicU64,
     allocation_bytes: AtomicU64,
@@ -198,11 +237,10 @@ struct TimingState {
 }
 
 impl TimingState {
-    fn new(budget: usize) -> Self {
+    fn new(processing: usize, gui: usize) -> Self {
         Self {
-            remaining: AtomicUsize::new(budget),
-            admitted: AtomicU64::new(0),
-            exhausted: AtomicU64::new(0),
+            processing: AdmissionBudget::new(processing),
+            gui: AdmissionBudget::new(gui),
             converted_bytes: AtomicU64::new(0),
             warp_bytes: AtomicU64::new(0),
             allocation_bytes: AtomicU64::new(0),
@@ -234,18 +272,16 @@ impl TimingState {
     }
 
     fn admit(&self) -> bool {
-        if self
-            .remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                left.checked_sub(1)
-            })
-            .is_ok()
-        {
-            saturating_add(&self.admitted, 1, &self.saturated);
-            true
+        self.processing.admit(&self.saturated)
+    }
+
+    /// Admits a span of `kind`: `gui_` kinds draw on the graphical budget,
+    /// every other kind on the processing budget.
+    fn admit_kind(&self, kind: &str) -> bool {
+        if kind.starts_with("gui_") {
+            self.gui.admit(&self.saturated)
         } else {
-            saturating_add(&self.exhausted, 1, &self.saturated);
-            false
+            self.admit()
         }
     }
 
@@ -294,8 +330,10 @@ impl TimingState {
 
     fn snapshot(&self) -> TimingSnapshot {
         TimingSnapshot {
-            admitted: self.admitted.load(Ordering::Relaxed),
-            exhausted: self.exhausted.load(Ordering::Relaxed),
+            admitted: self.processing.admitted.load(Ordering::Relaxed),
+            exhausted: self.processing.exhausted.load(Ordering::Relaxed),
+            gui_admitted: self.gui.admitted.load(Ordering::Relaxed),
+            gui_exhausted: self.gui.exhausted.load(Ordering::Relaxed),
             converted_bytes: self.converted_bytes.load(Ordering::Relaxed),
             warp_bytes: self.warp_bytes.load(Ordering::Relaxed),
             allocation_bytes: self.allocation_bytes.load(Ordering::Relaxed),
@@ -347,7 +385,7 @@ static TIMING: OnceLock<TimingState> = OnceLock::new();
 
 /// Enables bounded timing records after a diagnostics trace sink is ready.
 pub fn enable_trace_accounting() {
-    let _ = TIMING.get_or_init(|| TimingState::new(RECORD_BUDGET));
+    let _ = TIMING.get_or_init(|| TimingState::new(RECORD_BUDGET, GUI_RECORD_BUDGET));
 }
 
 fn timing() -> Option<&'static TimingState> {
@@ -374,7 +412,7 @@ pub fn measurement_scope(kind: &'static str) -> MeasurementScope {
     let Some(state) = timing() else {
         return MeasurementScope(None);
     };
-    if !state.admit() {
+    if !state.admit_kind(kind) {
         return MeasurementScope(None);
     }
     MeasurementScope(Some(tracing::debug_span!("timing", kind).entered()))
@@ -393,7 +431,7 @@ pub fn measurement_scope_with_fields(
     let Some(state) = timing() else {
         return MeasurementScope(None);
     };
-    if !state.admit() {
+    if !state.admit_kind(kind) {
         return MeasurementScope(None);
     }
     MeasurementScope(Some(
@@ -472,6 +510,9 @@ pub fn emit_timing_summary() {
         admission_budget = RECORD_BUDGET,
         admitted_spans = snapshot.admitted,
         exhausted_admissions = snapshot.exhausted,
+        gui_admission_budget = GUI_RECORD_BUDGET,
+        gui_admitted_spans = snapshot.gui_admitted,
+        gui_exhausted_admissions = snapshot.gui_exhausted,
         converted_bytes = snapshot.converted_bytes,
         warp_bytes = snapshot.warp_bytes,
         allocation_bytes = snapshot.allocation_bytes,
@@ -688,12 +729,12 @@ impl Default for StageTimer {
 
 #[cfg(test)]
 mod accounting_tests {
-    use super::{RECORD_BUDGET, TimingCounter, TimingState};
+    use super::{GUI_RECORD_BUDGET, RECORD_BUDGET, TimingCounter, TimingState};
 
     #[test]
     fn recording_budget_admits_observed_capture_demand() {
         const OBSERVED_CAPTURE_DEMAND: usize = 220_018;
-        let state = TimingState::new(RECORD_BUDGET);
+        let state = TimingState::new(RECORD_BUDGET, GUI_RECORD_BUDGET);
 
         for _ in 0..OBSERVED_CAPTURE_DEMAND {
             assert!(state.admit());
@@ -707,7 +748,7 @@ mod accounting_tests {
 
     #[test]
     fn finite_admission_reports_exhaustion_without_wrapping_counters() {
-        let state = TimingState::new(2);
+        let state = TimingState::new(2, 2);
 
         assert!(state.admit());
         state.add(TimingCounter::ConvertedBytes, u64::MAX);
@@ -728,7 +769,7 @@ mod accounting_tests {
 
     #[test]
     fn the_feature_seed_counters_accumulate_and_snapshot() {
-        let state = TimingState::new(2);
+        let state = TimingState::new(2, 2);
 
         state.add(TimingCounter::FeatureSeedAttempts, 3);
         state.add(TimingCounter::FeatureSeedAttempts, 1);
@@ -748,7 +789,7 @@ mod accounting_tests {
 
     #[test]
     fn buffer_creations_and_readback_bytes_accumulate_and_saturate() {
-        let state = TimingState::new(2);
+        let state = TimingState::new(2, 2);
 
         state.add(TimingCounter::BufferCreations, 2);
         state.add(TimingCounter::BufferCreations, 3);
@@ -766,6 +807,43 @@ mod accounting_tests {
         assert_eq!(state.snapshot().level0_window_misses, 2);
         assert_eq!(snapshot.buffer_creations, 5);
         assert!(snapshot.saturated);
+    }
+
+    #[test]
+    fn gui_kinds_keep_their_own_budget_after_processing_refuses() {
+        let state = TimingState::new(2, 2);
+
+        assert!(state.admit_kind("gpu_cpu_submit"));
+        assert!(state.admit_kind("gpu_cpu_submit"));
+        assert!(!state.admit_kind("gpu_cpu_submit"));
+        assert!(!state.admit_kind("guide_probe"));
+        assert!(state.admit_kind("gui_frame_rendered"));
+        assert!(state.admit_kind("gui_input"));
+        assert!(!state.admit_kind("gui_input"));
+
+        let snapshot = state.snapshot();
+        assert_eq!((snapshot.admitted, snapshot.exhausted), (2, 2));
+        assert_eq!((snapshot.gui_admitted, snapshot.gui_exhausted), (2, 1));
+    }
+
+    #[test]
+    fn each_budget_counts_only_its_own_refusals() {
+        let state = TimingState::new(3, 2);
+
+        for _ in 0..5 {
+            state.admit_kind("gpu_cpu_submit");
+        }
+        let snapshot = state.snapshot();
+        assert_eq!((snapshot.admitted, snapshot.exhausted), (3, 2));
+        assert_eq!((snapshot.gui_admitted, snapshot.gui_exhausted), (0, 0));
+
+        for _ in 0..5 {
+            state.admit_kind("gui_input");
+        }
+        let snapshot = state.snapshot();
+        assert_eq!((snapshot.admitted, snapshot.exhausted), (3, 2));
+        assert_eq!((snapshot.gui_admitted, snapshot.gui_exhausted), (2, 3));
+        assert!(!snapshot.saturated);
     }
 }
 

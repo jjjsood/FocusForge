@@ -260,7 +260,9 @@ pub fn classify(paths: &[PathBuf]) -> Result<OpenTarget, EntryError> {
     })
 }
 
-fn has_project_extension(path: &Path) -> bool {
+/// Whether `path` ends in the project extension, in any case; the disk is
+/// not consulted.
+pub fn has_project_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION))
@@ -487,12 +489,15 @@ pub fn tab_frame_count(project: &GuiProject) -> u32 {
 pub fn tab_title(project: &GuiProject) -> String {
     match project {
         GuiProject::Unsaved(group) => group.name.clone(),
-        GuiProject::Opened(project) => project
-            .path()
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| project.path().display().to_string()),
+        GuiProject::Opened(project) => project_title(project.path()),
     }
+}
+
+/// The name a saved project at `path` shows: the file's stem.
+pub fn project_title(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// A fresh `Unsaved` project over `frames`, named `name` inside `dir` and

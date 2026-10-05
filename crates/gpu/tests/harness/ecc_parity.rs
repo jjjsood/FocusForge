@@ -4,8 +4,8 @@
 //! (`CpuMomentSession`, which runs the solver's own `f64` sampler and sums),
 //! plus the transfer, synchronisation and admission bounds of a session.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use focusforge_core::algorithm::{AlgorithmError, AlignAlgorithm, AlignStatus, TileReader};
 use focusforge_core::align::{
@@ -84,6 +84,16 @@ fn level(region_size: (u32, u32), columns: usize) -> Level {
 
 static NEXT_TEMPLATE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Every test here drives the device, and three read deltas of the
+/// process-wide timing counters that any device call moves, so the tests must
+/// not overlap.
+fn exclusive() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl Level {
     fn request(&self, template_id: u64) -> EccSessionRequest<'_> {
         EccSessionRequest {
@@ -127,6 +137,7 @@ fn small() -> (u32, u32) {
 
 #[test]
 fn ecc_samples_match_cpu_within_one_lsb() {
+    let _serial = exclusive();
     let Some(_shared) = shared_device_or_skip() else {
         return;
     };
@@ -160,6 +171,7 @@ fn ecc_samples_match_cpu_within_one_lsb() {
 
 #[test]
 fn ecc_valid_mask_matches_cpu_at_window_edges() {
+    let _serial = exclusive();
     let Some(_shared) = shared_device_or_skip() else {
         return;
     };
@@ -275,6 +287,7 @@ fn assert_moments_match(level: &Level, warp: &Transform, label: &str, partial: b
 
 #[test]
 fn ecc_moments_match_f64_reduction() {
+    let _serial = exclusive();
     let Some(_shared) = shared_device_or_skip() else {
         return;
     };
@@ -299,6 +312,7 @@ fn ecc_moments_match_f64_reduction() {
 
 #[test]
 fn ecc_iteration_submits_once_and_reads_back_once() {
+    let _serial = exclusive();
     let Some(_shared) = shared_device_or_skip() else {
         return;
     };
@@ -331,6 +345,7 @@ fn ecc_iteration_submits_once_and_reads_back_once() {
 
 #[test]
 fn ecc_sessions_share_a_resident_template_and_are_admitted() {
+    let _serial = exclusive();
     let Some(_shared) = shared_device_or_skip() else {
         return;
     };
@@ -379,6 +394,7 @@ fn ecc_sessions_share_a_resident_template_and_are_admitted() {
 
 #[test]
 fn ecc_open_declines_a_window_over_the_buffer_limit() {
+    let _serial = exclusive();
     let Some(shared) = shared_device_or_skip() else {
         return;
     };
@@ -535,6 +551,7 @@ fn corner_error(a: &Transform, b: &Transform, (width, height): (u32, u32)) -> f6
 
 #[test]
 fn gpu_ecc_solve_meets_cpu_geometry() {
+    let _serial = exclusive();
     let Some(_shared) = shared_device_or_skip() else {
         return;
     };

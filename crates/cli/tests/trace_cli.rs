@@ -272,6 +272,18 @@ fn chrome_trace_nesting() {
         summary_u64(summary[0], "admitted_spans") <= budget,
         "the detailed span count remains bounded: {summary:?}"
     );
+    assert_eq!(
+        summary_u64(summary[0], "gui_admission_budget"),
+        262_144,
+        "the graphical front end's admission budget is fixed"
+    );
+    for field in ["gui_admitted_spans", "gui_exhausted_admissions"] {
+        assert_eq!(
+            summary_u64(summary[0], field),
+            0,
+            "a command-line run opens no graphical span: {field}"
+        );
+    }
     for field in [
         "exhausted_admissions",
         "converted_bytes",

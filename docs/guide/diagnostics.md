@@ -97,3 +97,27 @@ failure with nothing left behind. The write runs in the background, so the
 window stays responsive while it does. A finished bundle can be exported
 again immediately — a fresh destination is filled in automatically, so
 there is no extra step between one export and the next.
+
+## Profiling the window
+
+The GUI can write a Chrome-trace file of its own activity: input, redraws,
+canvas publication, saves and recomposites. Build it with the `trace`
+feature and name the output file:
+
+```
+cargo build --release -p focusforge-gui --features trace
+FOCUSFORGE_TRACE_FILE=gui-trace.json target/release/focusforge-gui
+```
+
+Open the file in `ui.perfetto.dev` or `chrome://tracing`. Window spans draw
+on their own admission budget, so a long session cannot starve the
+processing spans of a fuse running in the same process. When the run ends,
+a `timing_summary` span records each budget, how many spans it admitted and
+how many it refused.
+
+To see Slint's own frame timing as well, set
+`SLINT_DEBUG_PERFORMANCE=refresh_lazy,console` in the same environment; it
+prints refresh statistics on the console.
+
+`focusforge-cli` takes the same feature and variable; see the repository's
+`CONTRIBUTING.md` for the command.
